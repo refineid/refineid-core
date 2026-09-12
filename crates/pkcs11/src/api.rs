@@ -271,9 +271,9 @@ unsafe extern "C" fn c_get_info(info: CkInfoPtr) -> CkRv {
     }
     let value = CkInfo {
         cryptoki_version: CRYPTOKI_VERSION,
-        manufacturer_id: padded_field("ReFineID"),
+        manufacturer_id: padded_field("RefineID"),
         flags: 0,
-        library_description: padded_field("ReFineID FINEID PKCS11"),
+        library_description: padded_field("RefineID FINEID PKCS11"),
         library_version: LIBRARY_VERSION,
     };
     // SAFETY: caller guarantees info is a writable CK_INFO pointer.
@@ -483,7 +483,7 @@ unsafe extern "C" fn c_get_token_info(slot_id: CkSlotId, info: CkTokenInfoPtr) -
 ///   Finnish  "Perus (PIN 1)"
 ///   Swedish  "Bas (PIN 1)"
 const TOKEN_LABEL_IDENTIFY: &str = "Basic (PIN 1)";
-const TOKEN_LABEL_REMOTE: &str = "ReFineID Remote (PIN 1)";
+const TOKEN_LABEL_REMOTE: &str = "RefineID Remote (PIN 1)";
 
 /// Build the token-info payload. Fixed-width fields are space-padded;
 /// unknown counters use [`CK_UNAVAILABLE_INFORMATION`].
@@ -492,7 +492,7 @@ const TOKEN_LABEL_REMOTE: &str = "ReFineID Remote (PIN 1)";
 /// `serial` comes from the card's own PKCS#15 EF.TokenInfo (the
 /// printed card identifier). The model is the fixed card family,
 /// FINEID (the openssl backend's default URI matches on it). The
-/// manufacturer names this software, `ReFineID`: `C_GetInfo`
+/// manufacturer names this software, `RefineID`: `C_GetInfo`
 /// carries the module identity in principle, but `p11-kit-proxy`
 /// masks it with its own, so the token manufacturer is the only
 /// producer hint that reaches proxy consumers.
@@ -525,7 +525,7 @@ fn token_info_value(serial: &str, pin1_status: PinStatus, is_remote: bool) -> Ck
     };
     CkTokenInfo {
         label,
-        manufacturer_id: padded_field("ReFineID"),
+        manufacturer_id: padded_field("RefineID"),
         model: padded_field("FINEID"),
         serial_number: tail_padded_field(serial),
         flags,
@@ -2108,10 +2108,12 @@ mod tests {
     use refineid_apdu::PinRetries;
     use refineid_auth::PinStatus;
 
-    use super::{FUNCTION_LIST, c_sign, padded_field, user_pin_status_flags};
+    use super::{
+        FUNCTION_LIST, c_get_info, c_sign, padded_field, token_info_value, user_pin_status_flags,
+    };
     use crate::ck::{
-        CKF_USER_PIN_COUNT_LOW, CKF_USER_PIN_FINAL_TRY, CKF_USER_PIN_LOCKED, CkBytePtr, CkRv,
-        CkSessionHandle, CkUlong, CkUlongPtr, CkVersion,
+        CKF_USER_PIN_COUNT_LOW, CKF_USER_PIN_FINAL_TRY, CKF_USER_PIN_LOCKED, CKR_OK, CkBytePtr,
+        CkInfo, CkRv, CkSessionHandle, CkUlong, CkUlongPtr, CkUtf8Char, CkVersion,
     };
 
     #[test]
@@ -2150,6 +2152,18 @@ mod tests {
         assert_eq!(&field, b"AB  ");
         let truncated: [u8; 2] = padded_field("ABCD");
         assert_eq!(&truncated, b"AB");
+    }
+
+    #[test]
+    fn manufacturer_names_refineid() {
+        let expected: [CkUtf8Char; 32] = padded_field("RefineID");
+        let retries =
+            PinRetries::from_nibble(5).expect("test retry count fits the status-word nibble");
+        let token = token_info_value("TEST123", PinStatus::Remaining(retries), false);
+        assert_eq!(token.manufacturer_id, expected);
+        let mut info: CkInfo = unsafe { core::mem::zeroed() };
+        assert_eq!(unsafe { c_get_info(&mut info) }, CKR_OK);
+        assert_eq!(info.manufacturer_id, expected);
     }
 
     #[test]

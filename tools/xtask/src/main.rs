@@ -242,7 +242,7 @@ fn is_ignored_root_path(root: &Path, path: &Path) -> bool {
 }
 
 /// Subtrees admitted before they satisfy the numeric and source-indirection
-/// policy. The RAPP engine arrived from the ReFineID mono repository as the
+/// policy. The RAPP engine arrived from the RefineID mono repository as the
 /// working Android bridge, together with its pinned protocol corpus. The
 /// Apple-native implementation is the only pairing proven live, so the bridge
 /// is admitted as-is instead of being hardened speculatively; it may be

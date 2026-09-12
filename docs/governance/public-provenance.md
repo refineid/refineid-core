@@ -12,7 +12,7 @@ deployment details.
 
 - **Input types.** Publication under Apache-2.0 directed on 2026-07-19 for
   the initial common-core slice (refined credential-input types and the Card
-  Access Number type), first published in the `ReFineID` repository and
+  Access Number type), first published in the `RefineID` repository and
   relocated here into the crates that will own their consuming protocol
   layers. Secret, personal-information, protocol, and dependency scans were
   performed for the initial publication and repeated for the relocation.

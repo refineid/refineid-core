@@ -1,7 +1,7 @@
 # Case Study: Why `<alloc::vec::Vec>::insert` is Bad Code in High-Assurance Systems
 
 This case study documents an architectural and type-theoretic principle of the
-ReFineID project: why partial methods such as `<alloc::vec::Vec>::insert` are
+RefineID project: why partial methods such as `<alloc::vec::Vec>::insert` are
 anti-patterns in high-assurance software, how refinement typing and operational
 semantics enforce correctness by construction, and why AI agents and human
 engineers alike must design for total functions and semantic invariants.
@@ -214,7 +214,7 @@ is replaced by `slice::as_chunks::<N>()`:
 
 ## 5. Guidance for AI Agents & Human Contributors
 
-All AI agents and contributors operating across ReFineID repositories (`refineid-core`,
+All AI agents and contributors operating across RefineID repositories (`refineid-core`,
 `refineid-windows`, `refineid-android`, `refineid-ios`) must adhere to these rules:
 
 1. **Never use partial indexing methods (`Vec::insert`, direct indexing `slice[i]`, `Option::unwrap`, `Result::unwrap`)** in protocol or domain code. Use total operations (`get()`, `match`, `as_chunks`, or refined constructors).

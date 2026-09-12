@@ -1203,7 +1203,7 @@ impl RemoteCardTransport {
         let _ = store.insert(self.pairing_record.clone());
         let mut requester = Requester::new(
             RequesterConfig {
-                display_name: "ReFineID PKCS#11".into(),
+                display_name: "RefineID PKCS#11".into(),
                 platform: "Windows".into(),
             },
             store,
@@ -1376,7 +1376,7 @@ pub(super) fn card_login(
 /// Refuse every PIN-bearing APDU once fewer than three attempts remain.
 /// Firefox does not surface retry warnings, so the module may consume
 /// attempts down to two remaining and no further: a near-last attempt is
-/// never `ReFineID`'s to spend, and only another middleware locks the card.
+/// never `RefineID`'s to spend, and only another middleware locks the card.
 /// Mirrors the `CryptoTokenKit` adapter's retry floor of three.
 const fn pin1_verify_guard(status: PinStatus) -> Result<(), CkRv> {
     match status {

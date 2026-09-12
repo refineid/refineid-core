@@ -1,6 +1,6 @@
 # refineid-pcsc
 
-PC/SC smart card transport adapter and reader backend for ReFineID.
+PC/SC smart card transport adapter and reader backend for RefineID.
 
 This crate provides the platform PC/SC integration over WinSCard on Windows,
 `PCSC.framework` on macOS, and `pcsc-lite` on Linux:

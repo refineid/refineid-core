@@ -604,7 +604,7 @@ impl ModuleState {
 ///
 /// The module owns only FINEID tokens. A card-present reader can host an
 /// unrelated token such as a `YubiKey`, which must never appear under the
-/// `ReFineID` NSS module.
+/// `RefineID` NSS module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FineidCardObservation {
     Present,

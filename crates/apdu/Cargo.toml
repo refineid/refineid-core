@@ -1,6 +1,6 @@
 [package]
 name = "refineid-apdu"
-description = "Typed ISO 7816-4 commands and the ReFineID card transport port"
+description = "Typed ISO 7816-4 commands and the RefineID card transport port"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

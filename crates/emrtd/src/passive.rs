@@ -377,7 +377,7 @@ mod tests {
     // The same committed RSA-2048/SHA-256 CMS fixture the cms crate's
     // tests verify: eContent is a minimal LDSSecurityObject attesting
     // SHA-256 hashes of `FIXTURE_DG1` / `FIXTURE_DG2`, signed by an
-    // embedded self-signed "ReFineID Test DSC RSA" certificate. The
+    // embedded self-signed "RefineID Test DSC RSA" certificate. The
     // self-signed signer doubles as its own anchor here, exercising the
     // full chain: signature, both DG hashes, and the anchor hop.
     const FIXTURE_SOD_HEX: &str = "\

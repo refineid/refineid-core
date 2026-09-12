@@ -163,7 +163,7 @@ impl SignatureAlgorithm {
 pub enum CardOperation {
     /// Read activation and retry state without attempting a credential.
     InspectCard,
-    /// Read the public identity fields displayed by `ReFineID`.
+    /// Read the public identity fields displayed by `RefineID`.
     ReadIdentity,
     /// Read a public certificate.
     ReadCertificate {

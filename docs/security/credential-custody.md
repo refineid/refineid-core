@@ -7,7 +7,7 @@ it does not yet build a credential APDU flow or cache a PIN.
 ## PIN2 qualified-signature convenience window
 
 FINEID S4-1 v4.2 sections 4.1 and 8.1.7 require manual PIN entry for every
-qualified-signature operation. ReFineID's explicit product decision is to give
+qualified-signature operation. RefineID's explicit product decision is to give
 PIN2 a bounded one-minute convenience window so that one signing session --
 for example, a document set signed in a single user action -- does not prompt
 for every signature. This exception must be disclosed as a profile deviation
@@ -30,7 +30,7 @@ output.
 ## PIN1 authentication convenience window
 
 FINEID S4-1 v4.2 sections 4.1 and 8.1.7 require user interaction and manual
-PIN1 entry for every authentication-key signing operation. ReFineID's explicit
+PIN1 entry for every authentication-key signing operation. RefineID's explicit
 product decision is to provide a bounded convenience exception for PIN1
 authentication operations, including TLS client-auth signatures driven by
 CryptoTokenKit. The software re-presents PIN1 to the card for every operation;

@@ -1,6 +1,6 @@
 [package]
 name = "refineid-pcsc"
-description = "PC/SC smart card transport adapter and reader backend for ReFineID"
+description = "PC/SC smart card transport adapter and reader backend for RefineID"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

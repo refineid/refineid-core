@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! ISO 7816-4 status word, decoded into the cases ReFineID handles.
+//! ISO 7816-4 status word, decoded into the cases RefineID handles.
 //!
 //! The two trailing bytes SW1 and SW2 of every response identify how the
 //! card processed the command; ISO 7816-4 section 5.1.3 lists the standard

@@ -14,7 +14,7 @@
 
 //! Typed ISO 7816-4 command builders shared across protocol crates.
 //!
-//! Each struct represents one specific command shape that ReFineID
+//! Each struct represents one specific command shape that RefineID
 //! issues; serialisation happens once, at the `into_apdu` boundary, and
 //! after that point the bytes are an opaque [`CommandApdu`]. This module
 //! hosts only generic commands that more than one protocol issues;

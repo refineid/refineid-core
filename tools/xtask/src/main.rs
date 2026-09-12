@@ -251,6 +251,7 @@ fn is_ignored_root_path(root: &Path, path: &Path) -> bool {
 /// (OASIS Cryptoki v2.40 and PC/SC Workgroup). Remove
 /// an entry when its subtree is brought under policy or replaced.
 const POLICY_EXEMPT_SUBTREES: &[&str] = &[
+    "crates/ccid",
     "crates/pcsc",
     "crates/pkcs11",
     "crates/rapp",

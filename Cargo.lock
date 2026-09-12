@@ -861,6 +861,15 @@ name = "refineid-ber"
 version = "26.9.13"
 
 [[package]]
+name = "refineid-ccid"
+version = "26.9.12"
+dependencies = [
+ "refineid-apdu",
+ "refineid-atr",
+ "zeroize",
+]
+
+[[package]]
 name = "refineid-cms"
 version = "26.9.13"
 dependencies = [

@@ -152,10 +152,14 @@ impl CcidFunctionalDescriptor {
     /// Parse a 54-byte CCID functional descriptor directly.
     ///
     /// # Errors
-    /// Returns `CcidError` if the descriptor is malformed or invalid.
     pub fn parse_functional_descriptor(bytes: &[u8]) -> Result<Self, CcidError> {
         if bytes.len() < CCID_FUNCTIONAL_DESCRIPTOR_LENGTH {
             return Err(CcidError::CcidDescriptorTooShort);
+        }
+        if bytes[DESCRIPTOR_TYPE_OFFSET] != CCID_FUNCTIONAL_DESCRIPTOR_TYPE {
+            return Err(CcidError::InvalidCcidDescriptor(
+                "invalid CCID functional descriptor type".into(),
+            ));
         }
 
         let max_slot_index = bytes[MAX_SLOT_INDEX_OFFSET];

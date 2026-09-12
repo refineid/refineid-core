@@ -127,17 +127,17 @@ fn prepare_command_bytes(
     apdu: &[u8],
     protocol: CardProtocol,
     exchange_level: CcidExchangeLevel,
-) -> Vec<u8> {
-    if protocol == CardProtocol::T0 {
-        if exchange_level == CcidExchangeLevel::Tpdu && apdu.len() == 4 {
-            // Short Case 1 APDU in TPDU mode requires 5th byte P3 = 0x00
-            return alloc::vec![apdu[0], apdu[1], apdu[2], apdu[3], 0x00];
-        }
-        if let Some(case3) = t0_case3_from_short_case4(apdu) {
-            return case3;
-        }
+) -> Result<Vec<u8>, CcidError> {
+    if protocol == CardProtocol::T1 && exchange_level == CcidExchangeLevel::Tpdu {
+        return Err(CcidError::UnsupportedProtocol);
     }
-    apdu.to_vec()
+    if protocol == CardProtocol::T0
+        && exchange_level == CcidExchangeLevel::Tpdu
+        && let Some(case3) = t0_case3_from_short_case4(apdu)
+    {
+        return Ok(case3);
+    }
+    Ok(apdu.to_vec())
 }
 
 /// Smart card transport adapter over USB CCID.
@@ -183,10 +183,8 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
 
         match res {
             OperationResult::PowerOn(atr_bytes) => {
-                transport.protocol = match Atr::new(&atr_bytes) {
-                    Ok(parsed) => CardProtocol::from_atr(&parsed),
-                    Err(_) => CardProtocol::T0,
-                };
+                let parsed = Atr::new(&atr_bytes)?;
+                transport.protocol = CardProtocol::from_atr(&parsed);
                 transport.atr = atr_bytes;
 
                 if !descriptor.automatic_parameter_configuration()
@@ -317,9 +315,8 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
         let index = u16::from(self.engine.interface_number);
 
         let mut empty_data = [];
-        let _ =
-            self.host
-                .control_transfer(0x21, 0x02, value, index, &mut empty_data, self.timeout_ms);
+        self.host
+            .control_transfer(0x21, 0x01, value, index, &mut empty_data, self.timeout_ms)?;
 
         let res = self.execute_op(Operation::Abort)?;
         match res {
@@ -458,7 +455,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                     get_resp.as_bytes(),
                     self.protocol,
                     self.engine.exchange_level,
-                );
+                )?;
                 let chain_op = Operation::TransferBlock {
                     b_wi: 0,
                     w_level_parameter: 0,
@@ -493,6 +490,10 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                     next_le = chained_sw2;
                     continue;
                 }
+                if chained_sw1 == SW1_WRONG_LE {
+                    next_le = chained_sw2;
+                    continue;
+                }
                 break;
             }
             return Ok(TransportOutcome::Response(ResponseApdu {
@@ -518,7 +519,7 @@ impl<H: UsbHostTransport> CardTransport for CcidCardTransport<H> {
             command.as_bytes(),
             self.protocol,
             self.engine.exchange_level,
-        );
+        )?;
         let outcome = self.run_exchange(&prepared)?;
 
         // Wrong-Le single retry on opted-in case-2 commands:
@@ -530,7 +531,7 @@ impl<H: UsbHostTransport> CardTransport for CcidCardTransport<H> {
                 corrected.as_bytes(),
                 self.protocol,
                 self.engine.exchange_level,
-            );
+            )?;
             return self.run_exchange(&retry_bytes);
         }
 
@@ -543,7 +544,7 @@ impl<H: UsbHostTransport> CardTransport for CcidCardTransport<H> {
     ) -> Result<TransportOutcome, Self::Error> {
         command.expose_wire(|wire| {
             let mut prepared =
-                prepare_command_bytes(wire, self.protocol, self.engine.exchange_level);
+                prepare_command_bytes(wire, self.protocol, self.engine.exchange_level)?;
             let outcome = self.run_exchange(&prepared);
             prepared.zeroize();
             outcome
@@ -559,7 +560,7 @@ mod tests {
         PC_TO_RDR_XFR_BLOCK, RDR_TO_PC_DATA_BLOCK, RDR_TO_PC_SLOT_STATUS,
     };
     use crate::descriptor::{
-        AUTOMATIC_ACTIVATION, AUTOMATIC_PARAMETER_CONFIGURATION, SHORT_APDU_EXCHANGE,
+        AUTOMATIC_ACTIVATION, AUTOMATIC_PARAMETER_CONFIGURATION, SHORT_APDU_EXCHANGE, TPDU_EXCHANGE,
     };
     use refineid_apdu::command::{
         ApduClass, CommandApdu, CommandHeader, CredentialBody, CredentialCommand,
@@ -641,6 +642,16 @@ mod tests {
         }
     }
 
+    fn tpdu_descriptor() -> CcidFunctionalDescriptor {
+        CcidFunctionalDescriptor {
+            exchange_level: CcidExchangeLevel::Tpdu,
+            maximum_message_length: 271,
+            max_slot_index: 0,
+            features: TPDU_EXCHANGE | AUTOMATIC_ACTIVATION | AUTOMATIC_PARAMETER_CONFIGURATION,
+            protocols: 3,
+        }
+    }
+
     fn mock_data_block_response(seq: u8, payload: &[u8]) -> Vec<u8> {
         let mut f = Vec::new();
         f.push(RDR_TO_PC_DATA_BLOCK);
@@ -678,7 +689,7 @@ mod tests {
     #[test]
     fn connect_initializes_transport_with_atr() {
         let mut host = MockUsbHost::new();
-        let atr = [0x3B, 0x80, 0x01]; // T=0 ATR
+        let atr = [0x3B, 0x80, 0x00]; // T=0 ATR
         host.push_reply(Ok(mock_data_block_response(0, &atr)));
 
         let desc = test_descriptor();
@@ -697,7 +708,7 @@ mod tests {
     #[test]
     fn transmit_success() {
         let mut host = MockUsbHost::new();
-        let atr = [0x3B, 0x80, 0x01];
+        let atr = [0x3B, 0x80, 0x00];
         host.push_reply(Ok(mock_data_block_response(0, &atr)));
 
         let desc = test_descriptor();
@@ -720,10 +731,10 @@ mod tests {
     #[test]
     fn transmit_t0_case4_strips_trailing_le() {
         let mut host = MockUsbHost::new();
-        let atr = [0x3B, 0x80, 0x01];
+        let atr = [0x3B, 0x80, 0x00];
         host.push_reply(Ok(mock_data_block_response(0, &atr)));
 
-        let desc = test_descriptor();
+        let desc = tpdu_descriptor();
         let mut transport =
             CcidCardTransport::connect(host, &desc, 0, 0, 0x02, 0x82).expect("connect succeeds");
 
@@ -748,7 +759,7 @@ mod tests {
     #[test]
     fn transmit_handles_61xx_chaining() {
         let mut host = MockUsbHost::new();
-        let atr = [0x3B, 0x80, 0x01];
+        let atr = [0x3B, 0x80, 0x00];
         host.push_reply(Ok(mock_data_block_response(0, &atr)));
 
         let desc = test_descriptor();
@@ -779,7 +790,7 @@ mod tests {
     #[test]
     fn transmit_handles_6cxx_wrong_le_single_retry() {
         let mut host = MockUsbHost::new();
-        let atr = [0x3B, 0x80, 0x01];
+        let atr = [0x3B, 0x80, 0x00];
         host.push_reply(Ok(mock_data_block_response(0, &atr)));
 
         let desc = test_descriptor();
@@ -814,7 +825,7 @@ mod tests {
     #[test]
     fn transmit_credential_sends_once_without_retry() {
         let mut host = MockUsbHost::new();
-        let atr = [0x3B, 0x80, 0x01];
+        let atr = [0x3B, 0x80, 0x00];
         host.push_reply(Ok(mock_data_block_response(0, &atr)));
 
         let desc = test_descriptor();
@@ -847,7 +858,7 @@ mod tests {
     #[test]
     fn card_removed_maps_to_no_card_outcome() {
         let mut host = MockUsbHost::new();
-        let atr = [0x3B, 0x80, 0x01];
+        let atr = [0x3B, 0x80, 0x00];
         host.push_reply(Ok(mock_data_block_response(0, &atr)));
 
         let desc = test_descriptor();
@@ -863,7 +874,7 @@ mod tests {
     #[test]
     fn timeout_maps_to_timeout_unknown_state() {
         let mut host = MockUsbHost::new();
-        let atr = [0x3B, 0x80, 0x01];
+        let atr = [0x3B, 0x80, 0x00];
         host.push_reply(Ok(mock_data_block_response(0, &atr)));
 
         let desc = test_descriptor();
@@ -879,7 +890,7 @@ mod tests {
     #[test]
     fn abort_executes_control_and_bulk_abort() {
         let mut host = MockUsbHost::new();
-        let atr = [0x3B, 0x80, 0x01];
+        let atr = [0x3B, 0x80, 0x00];
         host.push_reply(Ok(mock_data_block_response(0, &atr)));
 
         let desc = test_descriptor();
@@ -893,7 +904,7 @@ mod tests {
 
         assert_eq!(transport.host().control_transfers.len(), 1);
         assert_eq!(transport.host().control_transfers[0].0, 0x21); // CLASS | INTERFACE
-        assert_eq!(transport.host().control_transfers[0].1, 0x02); // ABORT
+        assert_eq!(transport.host().control_transfers[0].1, 0x01); // ABORT
         let last_out = transport
             .host()
             .bulk_out_records
@@ -905,7 +916,7 @@ mod tests {
     #[test]
     fn reset_power_cycles_card() {
         let mut host = MockUsbHost::new();
-        let atr = [0x3B, 0x80, 0x01];
+        let atr = [0x3B, 0x80, 0x00];
         host.push_reply(Ok(mock_data_block_response(0, &atr)));
 
         let desc = test_descriptor();
@@ -913,7 +924,7 @@ mod tests {
             CcidCardTransport::connect(host, &desc, 0, 0, 0x02, 0x82).expect("connect succeeds");
 
         // PowerOff returns SlotStatus (seq 1), PowerOn returns DataBlock (seq 2)
-        let fresh_atr = [0x3B, 0x80, 0x02];
+        let fresh_atr = [0x3B, 0x01, 0x42];
         transport
             .host_mut()
             .push_reply(Ok(mock_slot_status_response(1)));

@@ -242,6 +242,10 @@ pub struct CcidEngine {
     pub card_present: bool,
     /// Whether the card has completed ATR power-on activation.
     pub activated: bool,
+    /// Whether the underlying USB CCID device connection is alive.
+    pub connected: bool,
+    /// Whether a timeout or desync occurred requiring slot abort recovery.
+    pub needs_recovery: bool,
     /// Negotiated exchange level from descriptor.
     pub exchange_level: CcidExchangeLevel,
     /// Maximum CCID message length.
@@ -253,8 +257,11 @@ pub struct CcidEngine {
     pending_op: Option<(OperationId, Operation)>,
     expected_response_type: u8,
     expected_seq: u8,
+    expected_bulk_out_len: usize,
     active_deadline_id: u64,
+    current_deadline: Option<Deadline>,
     default_timeout_ms: u64,
+    chain_buffer: Vec<u8>,
 }
 
 impl CcidEngine {
@@ -274,14 +281,19 @@ impl CcidEngine {
             next_seq: 0,
             card_present: false,
             activated: false,
+            connected: true,
+            needs_recovery: false,
             exchange_level: descriptor.exchange_level,
             max_message_length: descriptor.maximum_message_length,
             max_slot_index: descriptor.max_slot_index,
             pending_op: None,
             expected_response_type: 0,
             expected_seq: 0,
+            expected_bulk_out_len: 0,
             active_deadline_id: 0,
+            current_deadline: None,
             default_timeout_ms: 5000,
+            chain_buffer: Vec::new(),
         }
     }
 
@@ -309,10 +321,11 @@ impl CcidEngine {
                         self.card_present = present;
                         self.card_gen = self.card_gen.wrapping_add(1);
 
-                        if !present {
+                        if changed || !present {
                             self.activated = false;
-                            // If an operation was active, abort it with CardRemoved
                             if let Some((op_id, _)) = self.pending_op.take() {
+                                self.current_deadline = None;
+                                actions.push(Action::CancelTransfers);
                                 actions.push(Action::Complete {
                                     id: op_id,
                                     result: Err(CcidError::CardRemoved),
@@ -330,6 +343,30 @@ impl CcidEngine {
             }
 
             InputEvent::Start { id, op } => {
+                if !self.connected {
+                    actions.push(Action::Complete {
+                        id,
+                        result: Err(CcidError::Io("USB CCID connection lost".into())),
+                    });
+                    return Transition {
+                        actions,
+                        next_deadline: None,
+                    };
+                }
+
+                if self.needs_recovery && !matches!(op, Operation::Abort) {
+                    actions.push(Action::Complete {
+                        id,
+                        result: Err(CcidError::ProtocolDesync(
+                            "slot timed out; abort recovery required".into(),
+                        )),
+                    });
+                    return Transition {
+                        actions,
+                        next_deadline: None,
+                    };
+                }
+
                 if self.pending_op.is_some() {
                     actions.push(Action::Complete {
                         id,
@@ -343,6 +380,24 @@ impl CcidEngine {
                     };
                 }
 
+                if let Operation::TransferBlock { ref data, .. } = op
+                    && data.len() > self.max_message_length
+                {
+                    actions.push(Action::Complete {
+                        id,
+                        result: Err(CcidError::ApduTooLong(data.len())),
+                    });
+                    return Transition {
+                        actions,
+                        next_deadline: None,
+                    };
+                }
+
+                if matches!(op, Operation::Abort) {
+                    self.needs_recovery = false;
+                }
+
+                self.chain_buffer.clear();
                 let seq = self.allocate_seq();
                 self.expected_seq = seq;
                 self.pending_op = Some((id, op.clone()));
@@ -398,17 +453,34 @@ impl CcidEngine {
                 };
 
                 self.expected_response_type = expected_resp;
+                self.expected_bulk_out_len = encoded.len();
 
                 self.active_deadline_id = self.active_deadline_id.wrapping_add(1);
-                next_deadline = Some(Deadline {
+                let dl = Deadline {
                     id: DeadlineId(self.active_deadline_id),
                     expires_at: MonotonicTime(now.0 + self.default_timeout_ms),
-                });
+                };
+                self.current_deadline = Some(dl);
+                next_deadline = Some(dl);
 
                 actions.push(Action::SubmitBulkOut { seq, data: encoded });
-                actions.push(Action::SubmitBulkIn {
-                    buffer_size: self.max_message_length.max(CCID_HEADER_SIZE),
-                });
+            }
+
+            InputEvent::IoCompleted(IoCompletion::BulkOut { transferred }) => {
+                if transferred != self.expected_bulk_out_len {
+                    if let Some((op_id, _)) = self.pending_op.take() {
+                        self.current_deadline = None;
+                        actions.push(Action::CancelTransfers);
+                        actions.push(Action::Complete {
+                            id: op_id,
+                            result: Err(CcidError::Io("short Bulk-OUT write".into())),
+                        });
+                    }
+                } else {
+                    actions.push(Action::SubmitBulkIn {
+                        buffer_size: self.max_message_length.max(CCID_HEADER_SIZE),
+                    });
+                }
             }
 
             InputEvent::IoCompleted(IoCompletion::BulkIn(frame)) => {
@@ -420,36 +492,85 @@ impl CcidEngine {
                         self.expected_seq,
                     ) {
                         Ok(crate::codec::CcidResponse::TimeExtension { multiplier, .. }) => {
-                            // Re-arm with extended deadline and submit follow-up Bulk-IN
                             self.pending_op = Some((op_id, op));
                             let extension_ms = (multiplier as u64) * 1000;
                             self.active_deadline_id = self.active_deadline_id.wrapping_add(1);
-                            next_deadline = Some(Deadline {
+                            let dl = Deadline {
                                 id: DeadlineId(self.active_deadline_id),
                                 expires_at: MonotonicTime(now.0 + extension_ms),
-                            });
+                            };
+                            self.current_deadline = Some(dl);
+                            next_deadline = Some(dl);
                             actions.push(Action::SubmitBulkIn {
                                 buffer_size: self.max_message_length.max(CCID_HEADER_SIZE),
                             });
                         }
-                        Ok(crate::codec::CcidResponse::DataBlock { payload, .. }) => {
-                            let result = match op {
-                                Operation::PowerOn { .. } => {
-                                    self.activated = true;
-                                    self.card_present = true;
-                                    Ok(OperationResult::PowerOn(payload))
+                        Ok(crate::codec::CcidResponse::DataBlock {
+                            card_status,
+                            chain_parameter,
+                            payload,
+                        }) => {
+                            if card_status == crate::codec::CardStatus::NotPresent {
+                                self.card_present = false;
+                                self.activated = false;
+                                self.card_gen = self.card_gen.wrapping_add(1);
+                                self.current_deadline = None;
+                                actions.push(Action::Complete {
+                                    id: op_id,
+                                    result: Err(CcidError::CardRemoved),
+                                });
+                            } else {
+                                match chain_parameter {
+                                    crate::codec::ChainParameter::Begin
+                                    | crate::codec::ChainParameter::Continue => {
+                                        self.chain_buffer.extend_from_slice(&payload);
+                                        self.pending_op = Some((op_id, op));
+                                        actions.push(Action::SubmitBulkIn {
+                                            buffer_size: self
+                                                .max_message_length
+                                                .max(CCID_HEADER_SIZE),
+                                        });
+                                    }
+                                    crate::codec::ChainParameter::End
+                                    | crate::codec::ChainParameter::Complete => {
+                                        let mut combined = core::mem::take(&mut self.chain_buffer);
+                                        combined.extend_from_slice(&payload);
+                                        let result = match op {
+                                            Operation::PowerOn { .. } => {
+                                                self.activated = true;
+                                                self.card_present = true;
+                                                Ok(OperationResult::PowerOn(combined))
+                                            }
+                                            Operation::TransferBlock { .. } => {
+                                                Ok(OperationResult::TransferBlock(combined))
+                                            }
+                                            _ => Ok(OperationResult::PowerOn(combined)),
+                                        };
+                                        self.current_deadline = None;
+                                        actions.push(Action::Complete { id: op_id, result });
+                                    }
+                                    crate::codec::ChainParameter::CommandContinuationExpected => {
+                                        self.current_deadline = None;
+                                        actions.push(Action::Complete {
+                                            id: op_id,
+                                            result: Err(CcidError::ProtocolDesync(
+                                                "unexpected CCID command continuation request"
+                                                    .into(),
+                                            )),
+                                        });
+                                    }
                                 }
-                                Operation::TransferBlock { .. } => {
-                                    Ok(OperationResult::TransferBlock(payload))
-                                }
-                                _ => Ok(OperationResult::PowerOn(payload)),
-                            };
-                            actions.push(Action::Complete { id: op_id, result });
+                            }
                         }
                         Ok(crate::codec::CcidResponse::SlotStatus { card_status, .. }) => {
                             let present = card_status == crate::codec::CardStatus::Active
                                 || card_status == crate::codec::CardStatus::Inactive;
+                            if !present && self.card_present {
+                                self.activated = false;
+                                self.card_gen = self.card_gen.wrapping_add(1);
+                            }
                             self.card_present = present;
+                            self.current_deadline = None;
                             let result = match op {
                                 Operation::PowerOff => {
                                     self.activated = false;
@@ -462,7 +583,17 @@ impl CcidEngine {
                             };
                             actions.push(Action::Complete { id: op_id, result });
                         }
-                        Ok(crate::codec::CcidResponse::Parameters { payload, .. }) => {
+                        Ok(crate::codec::CcidResponse::Parameters {
+                            card_status,
+                            payload,
+                            ..
+                        }) => {
+                            if card_status == crate::codec::CardStatus::NotPresent {
+                                self.card_present = false;
+                                self.activated = false;
+                                self.card_gen = self.card_gen.wrapping_add(1);
+                            }
+                            self.current_deadline = None;
                             let result = match op {
                                 Operation::SetParametersT0 { .. } => {
                                     Ok(OperationResult::ParametersSet)
@@ -471,13 +602,23 @@ impl CcidEngine {
                             };
                             actions.push(Action::Complete { id: op_id, result });
                         }
-                        Ok(crate::codec::CcidResponse::CommandFailure { error_code, .. }) => {
+                        Ok(crate::codec::CcidResponse::CommandFailure {
+                            card_status,
+                            error_code,
+                        }) => {
+                            if card_status == crate::codec::CardStatus::NotPresent {
+                                self.card_present = false;
+                                self.activated = false;
+                                self.card_gen = self.card_gen.wrapping_add(1);
+                            }
+                            self.current_deadline = None;
                             actions.push(Action::Complete {
                                 id: op_id,
                                 result: Err(CcidError::CommandFailed { error_code }),
                             });
                         }
                         Err(e) => {
+                            self.current_deadline = None;
                             actions.push(Action::Complete {
                                 id: op_id,
                                 result: Err(e),
@@ -487,16 +628,11 @@ impl CcidEngine {
                 }
             }
 
-            InputEvent::IoCompleted(IoCompletion::BulkOut { .. }) => {
-                // Out write acknowledged; waiting for Bulk-IN response
-            }
-
-            InputEvent::IoCompleted(IoCompletion::Control) => {
-                // Control transfer acknowledged
-            }
+            InputEvent::IoCompleted(IoCompletion::Control) => {}
 
             InputEvent::IoCompleted(IoCompletion::Failure(e)) => {
                 if let Some((op_id, _)) = self.pending_op.take() {
+                    self.current_deadline = None;
                     actions.push(Action::Complete {
                         id: op_id,
                         result: Err(e),
@@ -505,9 +641,13 @@ impl CcidEngine {
             }
 
             InputEvent::DeadlineExpired(id) => {
-                if id.0 == self.active_deadline_id
+                if let Some(dl) = self.current_deadline
+                    && dl.id == id
+                    && now.0 >= dl.expires_at.0
                     && let Some((op_id, _)) = self.pending_op.take()
                 {
+                    self.needs_recovery = true;
+                    self.current_deadline = None;
                     actions.push(Action::CancelTransfers);
                     actions.push(Action::Complete {
                         id: op_id,
@@ -517,9 +657,9 @@ impl CcidEngine {
             }
 
             InputEvent::Cancel(op_id) => {
-                if let Some((cur_id, _)) = self.pending_op.take()
-                    && cur_id == op_id
-                {
+                if self.pending_op.as_ref().is_some_and(|(id, _)| *id == op_id) {
+                    self.pending_op = None;
+                    self.current_deadline = None;
                     actions.push(Action::CancelTransfers);
                     actions.push(Action::Complete {
                         id: op_id,
@@ -529,8 +669,10 @@ impl CcidEngine {
             }
 
             InputEvent::ConnectionLost => {
+                self.connected = false;
                 self.card_present = false;
                 self.activated = false;
+                self.current_deadline = None;
                 if let Some((op_id, _)) = self.pending_op.take() {
                     actions.push(Action::Complete {
                         id: op_id,
@@ -538,6 +680,10 @@ impl CcidEngine {
                     });
                 }
             }
+        }
+
+        if next_deadline.is_none() && self.pending_op.is_some() {
+            next_deadline = self.current_deadline;
         }
 
         Transition {
@@ -595,15 +741,21 @@ mod tests {
             },
         );
 
-        assert_eq!(t1.actions.len(), 2);
+        assert_eq!(t1.actions.len(), 1);
         assert!(matches!(
             t1.actions[0],
             Action::SubmitBulkOut { seq: 0, .. }
         ));
-        assert!(matches!(t1.actions[1], Action::SubmitBulkIn { .. }));
         assert!(t1.next_deadline.is_some());
 
-        let atr = [0x3B, 0x80, 0x01];
+        let t_out = engine.step(
+            MonotonicTime(110),
+            InputEvent::IoCompleted(IoCompletion::BulkOut { transferred: 10 }),
+        );
+        assert_eq!(t_out.actions.len(), 1);
+        assert!(matches!(t_out.actions[0], Action::SubmitBulkIn { .. }));
+
+        let atr = [0x3B, 0x80, 0x00];
         let resp_bytes = make_test_data_block_response(0, &atr);
 
         let t2 = engine.step(
@@ -646,6 +798,13 @@ mod tests {
         let rapdu = [0x90, 0x00];
         let resp_bytes = make_test_data_block_response(0, &rapdu);
 
+        let t_out = engine.step(
+            MonotonicTime(210),
+            InputEvent::IoCompleted(IoCompletion::BulkOut { transferred: 15 }),
+        );
+        assert_eq!(t_out.actions.len(), 1);
+        assert!(matches!(t_out.actions[0], Action::SubmitBulkIn { .. }));
+
         let t = engine.step(
             MonotonicTime(220),
             InputEvent::IoCompleted(IoCompletion::BulkIn(resp_bytes)),
@@ -677,6 +836,11 @@ mod tests {
                     data: vec![0x00, 0x84, 0x00, 0x00, 0x08],
                 },
             },
+        );
+
+        let _ = engine.step(
+            MonotonicTime(310),
+            InputEvent::IoCompleted(IoCompletion::BulkOut { transferred: 15 }),
         );
 
         // Frame reporting time extension: multiplier = 3
@@ -751,15 +915,16 @@ mod tests {
         assert_eq!(engine.card_gen, initial_gen + 1);
 
         // Operation immediately completed with CardRemoved and slot change published
-        assert_eq!(t.actions.len(), 2);
-        match &t.actions[0] {
+        assert_eq!(t.actions.len(), 3);
+        assert_eq!(t.actions[0], Action::CancelTransfers);
+        match &t.actions[1] {
             Action::Complete { id, result } => {
                 assert_eq!(*id, op_id);
                 assert_eq!(result, &Err(CcidError::CardRemoved));
             }
             _ => panic!("expected Complete action"),
         }
-        match &t.actions[1] {
+        match &t.actions[2] {
             Action::PublishSlotChange {
                 card_present,
                 card_gen,

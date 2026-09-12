@@ -479,11 +479,21 @@ pub fn decode_response(
             RDR_TO_PC_PARAMETERS => {
                 let protocol_num = frame[RESPONSE_PARAMETER_OFFSET];
                 let payload = frame[CCID_HEADER_SIZE..].to_vec();
-                Ok(CcidResponse::Parameters {
-                    card_status,
-                    protocol_num,
-                    payload,
-                })
+                match protocol_num {
+                    0 if payload.len() == 5 => Ok(CcidResponse::Parameters {
+                        card_status,
+                        protocol_num,
+                        payload,
+                    }),
+                    1 if payload.len() == 7 => Ok(CcidResponse::Parameters {
+                        card_status,
+                        protocol_num,
+                        payload,
+                    }),
+                    _ => Err(CcidError::ProtocolDesync(
+                        "invalid CCID parameters protocol or length".into(),
+                    )),
+                }
             }
             _ => Err(CcidError::UnexpectedMessageType {
                 expected: expected_msg_type,

@@ -101,6 +101,14 @@ pub enum CcidError {
     Cancelled,
     /// Card was removed.
     CardRemoved,
+    /// Invalid CCID descriptor structure or field.
+    InvalidCcidDescriptor(String),
+    /// APDU payload too long for reader maximum buffer.
+    ApduTooLong(usize),
+    /// Smart card protocol is unsupported by the exchange level.
+    UnsupportedProtocol,
+    /// Card Answer to Reset (ATR) is invalid.
+    Atr(refineid_atr::AtrError),
 }
 
 impl fmt::Display for CcidError {
@@ -172,11 +180,23 @@ impl fmt::Display for CcidError {
             Self::Timeout => write!(f, "CCID operation timed out"),
             Self::Cancelled => write!(f, "CCID operation cancelled"),
             Self::CardRemoved => write!(f, "Smart card was removed from reader"),
+            Self::InvalidCcidDescriptor(msg) => write!(f, "Invalid CCID descriptor: {msg}"),
+            Self::ApduTooLong(len) => write!(f, "APDU too long for CCID transfer: {len} bytes"),
+            Self::UnsupportedProtocol => {
+                write!(f, "Card protocol is unsupported by CCID exchange level")
+            }
+            Self::Atr(e) => write!(f, "Invalid ATR: {e}"),
         }
     }
 }
 
 impl core::error::Error for CcidError {}
+
+impl From<refineid_atr::AtrError> for CcidError {
+    fn from(e: refineid_atr::AtrError) -> Self {
+        Self::Atr(e)
+    }
+}
 
 impl refineid_apdu::TransportErrorExt for CcidError {
     fn kind(&self) -> refineid_apdu::TransportErrorKind {

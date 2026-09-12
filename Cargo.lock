@@ -862,7 +862,7 @@ version = "26.9.13"
 
 [[package]]
 name = "refineid-ccid"
-version = "26.9.12"
+version = "26.9.13"
 dependencies = [
  "refineid-apdu",
  "refineid-atr",

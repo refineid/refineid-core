@@ -18,14 +18,15 @@
 //! Accepts explicit events and monotonic time, returning discrete actions and deadlines.
 
 use crate::codec::{
-    CCID_HEADER_SIZE, RDR_TO_PC_DATA_BLOCK, RDR_TO_PC_PARAMETERS, RDR_TO_PC_SLOT_STATUS,
-    decode_interrupt_slot_change, decode_response, encode_abort, encode_get_parameters,
-    encode_get_slot_status, encode_icc_power_off, encode_icc_power_on, encode_set_parameters_t0,
-    encode_xfr_block,
+    CCID_HEADER_SIZE, MAX_RESPONSE_PAYLOAD_SIZE, RDR_TO_PC_DATA_BLOCK, RDR_TO_PC_PARAMETERS,
+    RDR_TO_PC_SLOT_STATUS, decode_interrupt_slot_change, decode_response, encode_abort,
+    encode_get_parameters, encode_get_slot_status, encode_icc_power_off, encode_icc_power_on,
+    encode_set_parameters_t0, encode_xfr_block,
 };
 use crate::descriptor::{CcidExchangeLevel, CcidFunctionalDescriptor};
 use crate::error::CcidError;
 use alloc::vec::Vec;
+use zeroize::Zeroizing;
 
 /// Opaque identifier for a logical operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -82,7 +83,7 @@ pub enum Operation {
         /// Level parameter.
         w_level_parameter: u16,
         /// Command payload bytes.
-        data: Vec<u8>,
+        data: Zeroizing<Vec<u8>>,
     },
     /// Abort an ongoing or stalled command.
     Abort,
@@ -156,7 +157,7 @@ pub enum Action {
         /// Sequence number for correlation.
         seq: u8,
         /// Message packet.
-        data: Vec<u8>,
+        data: Zeroizing<Vec<u8>>,
     },
     /// Submit read to Bulk-IN endpoint.
     SubmitBulkIn {
@@ -250,6 +251,8 @@ pub struct CcidEngine {
     pub exchange_level: CcidExchangeLevel,
     /// Maximum CCID message length.
     pub max_message_length: usize,
+    /// Maximum APDU/TPDU payload length supported by reader.
+    pub max_payload_length: usize,
     /// Maximum slot index for multi-slot notifications.
     pub max_slot_index: u8,
 
@@ -257,11 +260,13 @@ pub struct CcidEngine {
     pending_op: Option<(OperationId, Operation)>,
     expected_response_type: u8,
     expected_seq: u8,
+    last_issued_seq: u8,
     expected_bulk_out_len: usize,
     active_deadline_id: u64,
     current_deadline: Option<Deadline>,
     default_timeout_ms: u64,
     chain_buffer: Vec<u8>,
+    wtx_count: u32,
 }
 
 impl CcidEngine {
@@ -285,15 +290,18 @@ impl CcidEngine {
             needs_recovery: false,
             exchange_level: descriptor.exchange_level,
             max_message_length: descriptor.maximum_message_length,
+            max_payload_length: descriptor.maximum_transfer_block_length(),
             max_slot_index: descriptor.max_slot_index,
             pending_op: None,
             expected_response_type: 0,
             expected_seq: 0,
+            last_issued_seq: 0,
             expected_bulk_out_len: 0,
             active_deadline_id: 0,
             current_deadline: None,
             default_timeout_ms: 5000,
             chain_buffer: Vec::new(),
+            wtx_count: 0,
         }
     }
 
@@ -301,7 +309,15 @@ impl CcidEngine {
     fn allocate_seq(&mut self) -> u8 {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
+        self.expected_seq = seq;
+        self.last_issued_seq = seq;
         seq
+    }
+
+    /// Returns the sequence number of the currently active or last issued command.
+    #[must_use]
+    pub const fn last_sequence_number(&self) -> u8 {
+        self.last_issued_seq
     }
 
     /// Primary state transition driver.
@@ -381,7 +397,7 @@ impl CcidEngine {
                 }
 
                 if let Operation::TransferBlock { ref data, .. } = op
-                    && data.len() > self.max_message_length
+                    && data.len() > self.max_payload_length
                 {
                     actions.push(Action::Complete {
                         id,
@@ -397,6 +413,7 @@ impl CcidEngine {
                     self.needs_recovery = false;
                 }
 
+                self.wtx_count = 0;
                 self.chain_buffer.clear();
                 let seq = self.allocate_seq();
                 self.expected_seq = seq;
@@ -463,7 +480,10 @@ impl CcidEngine {
                 self.current_deadline = Some(dl);
                 next_deadline = Some(dl);
 
-                actions.push(Action::SubmitBulkOut { seq, data: encoded });
+                actions.push(Action::SubmitBulkOut {
+                    seq,
+                    data: Zeroizing::new(encoded),
+                });
             }
 
             InputEvent::IoCompleted(IoCompletion::BulkOut { transferred }) => {
@@ -492,6 +512,21 @@ impl CcidEngine {
                         self.expected_seq,
                     ) {
                         Ok(crate::codec::CcidResponse::TimeExtension { multiplier, .. }) => {
+                            const MAX_TIME_EXTENSIONS: u32 = 60;
+                            self.wtx_count = self.wtx_count.saturating_add(1);
+                            if self.wtx_count > MAX_TIME_EXTENSIONS {
+                                self.current_deadline = None;
+                                self.needs_recovery = true;
+                                actions.push(Action::CancelTransfers);
+                                actions.push(Action::Complete {
+                                    id: op_id,
+                                    result: Err(CcidError::Timeout),
+                                });
+                                return Transition {
+                                    actions,
+                                    next_deadline: None,
+                                };
+                            }
                             self.pending_op = Some((op_id, op));
                             let extension_ms = (multiplier as u64) * 1000;
                             self.active_deadline_id = self.active_deadline_id.wrapping_add(1);
@@ -523,6 +558,20 @@ impl CcidEngine {
                                 match chain_parameter {
                                     crate::codec::ChainParameter::Begin
                                     | crate::codec::ChainParameter::Continue => {
+                                        let next_len =
+                                            self.chain_buffer.len().saturating_add(payload.len());
+                                        if next_len > MAX_RESPONSE_PAYLOAD_SIZE {
+                                            self.chain_buffer.clear();
+                                            self.current_deadline = None;
+                                            actions.push(Action::Complete {
+                                                id: op_id,
+                                                result: Err(CcidError::ResponseLengthOutOfRange),
+                                            });
+                                            return Transition {
+                                                actions,
+                                                next_deadline: None,
+                                            };
+                                        }
                                         self.chain_buffer.extend_from_slice(&payload);
                                         self.pending_op = Some((op_id, op));
                                         actions.push(Action::SubmitBulkIn {
@@ -539,6 +588,7 @@ impl CcidEngine {
                                             Operation::PowerOn { .. } => {
                                                 self.activated = true;
                                                 self.card_present = true;
+                                                self.needs_recovery = false;
                                                 Ok(OperationResult::PowerOn(combined))
                                             }
                                             Operation::TransferBlock { .. } => {
@@ -632,7 +682,11 @@ impl CcidEngine {
 
             InputEvent::IoCompleted(IoCompletion::Failure(e)) => {
                 if let Some((op_id, _)) = self.pending_op.take() {
+                    if matches!(e, CcidError::Timeout | CcidError::Io(_)) {
+                        self.needs_recovery = true;
+                    }
                     self.current_deadline = None;
+                    actions.push(Action::CancelTransfers);
                     actions.push(Action::Complete {
                         id: op_id,
                         result: Err(e),
@@ -790,7 +844,7 @@ mod tests {
                 op: Operation::TransferBlock {
                     b_wi: 0,
                     w_level_parameter: 0,
-                    data: apdu.to_vec(),
+                    data: Zeroizing::new(apdu.to_vec()),
                 },
             },
         );
@@ -833,7 +887,7 @@ mod tests {
                 op: Operation::TransferBlock {
                     b_wi: 0,
                     w_level_parameter: 0,
-                    data: vec![0x00, 0x84, 0x00, 0x00, 0x08],
+                    data: Zeroizing::new(vec![0x00, 0x84, 0x00, 0x00, 0x08]),
                 },
             },
         );
@@ -898,7 +952,7 @@ mod tests {
                 op: Operation::TransferBlock {
                     b_wi: 0,
                     w_level_parameter: 0,
-                    data: vec![0x00, 0x20, 0x00, 0x80],
+                    data: Zeroizing::new(vec![0x00, 0x20, 0x00, 0x80]),
                 },
             },
         );
@@ -1054,6 +1108,151 @@ mod tests {
             Action::Complete { id, result } => {
                 assert_eq!(*id, op_id);
                 assert!(matches!(result, Err(CcidError::Io(_))));
+            }
+            _ => panic!("expected Complete action"),
+        }
+    }
+
+    #[test]
+    fn wtx_limit_exceeded_fails_with_timeout_and_requires_recovery() {
+        let desc = make_test_descriptor();
+        let mut engine = CcidEngine::new(0, 0, 1, &desc);
+
+        let op_id = OperationId(33);
+        let _ = engine.step(
+            MonotonicTime(300),
+            InputEvent::Start {
+                id: op_id,
+                op: Operation::TransferBlock {
+                    b_wi: 0,
+                    w_level_parameter: 0,
+                    data: Zeroizing::new(vec![0x00, 0x84, 0x00, 0x00, 0x08]),
+                },
+            },
+        );
+
+        let _ = engine.step(
+            MonotonicTime(310),
+            InputEvent::IoCompleted(IoCompletion::BulkOut { transferred: 15 }),
+        );
+
+        let mut time_ext_frame = Vec::new();
+        time_ext_frame.push(RDR_TO_PC_DATA_BLOCK);
+        time_ext_frame.extend_from_slice(&0_u32.to_le_bytes());
+        time_ext_frame.push(0); // slot
+        time_ext_frame.push(0); // seq
+        time_ext_frame.push((COMMAND_STATUS_TIME_EXTENSION << 6) | CARD_STATUS_ACTIVE);
+        time_ext_frame.push(1); // multiplier
+        time_ext_frame.push(0);
+
+        for i in 0..60 {
+            let t = engine.step(
+                MonotonicTime(320 + i as u64),
+                InputEvent::IoCompleted(IoCompletion::BulkIn(time_ext_frame.clone())),
+            );
+            assert!(
+                t.actions
+                    .iter()
+                    .any(|a| matches!(a, Action::SubmitBulkIn { .. }))
+            );
+        }
+
+        let t_exceeded = engine.step(
+            MonotonicTime(400),
+            InputEvent::IoCompleted(IoCompletion::BulkIn(time_ext_frame)),
+        );
+
+        assert!(engine.needs_recovery);
+        assert_eq!(t_exceeded.actions.len(), 2);
+        assert_eq!(t_exceeded.actions[0], Action::CancelTransfers);
+        match &t_exceeded.actions[1] {
+            Action::Complete { id, result } => {
+                assert_eq!(*id, op_id);
+                assert_eq!(result, &Err(CcidError::Timeout));
+            }
+            _ => panic!("expected Complete action"),
+        }
+    }
+
+    #[test]
+    fn chain_buffer_overflow_fails_with_response_length_out_of_range() {
+        let desc = make_test_descriptor();
+        let mut engine = CcidEngine::new(0, 0, 1, &desc);
+
+        let op_id = OperationId(34);
+        let _ = engine.step(
+            MonotonicTime(500),
+            InputEvent::Start {
+                id: op_id,
+                op: Operation::TransferBlock {
+                    b_wi: 0,
+                    w_level_parameter: 0,
+                    data: Zeroizing::new(vec![0x00, 0x84, 0x00, 0x00, 0x08]),
+                },
+            },
+        );
+
+        let _ = engine.step(
+            MonotonicTime(510),
+            InputEvent::IoCompleted(IoCompletion::BulkOut { transferred: 15 }),
+        );
+
+        let large_payload = vec![0xAA; MAX_RESPONSE_PAYLOAD_SIZE + 1];
+        let mut f = Vec::new();
+        f.push(RDR_TO_PC_DATA_BLOCK);
+        f.extend_from_slice(&(large_payload.len() as u32).to_le_bytes());
+        f.push(0);
+        f.push(0);
+        f.push(CARD_STATUS_ACTIVE);
+        f.push(0);
+        f.push(crate::codec::CHAIN_BEGIN);
+        f.extend_from_slice(&large_payload);
+
+        let t = engine.step(
+            MonotonicTime(520),
+            InputEvent::IoCompleted(IoCompletion::BulkIn(f)),
+        );
+
+        assert_eq!(t.actions.len(), 1);
+        match &t.actions[0] {
+            Action::Complete { id, result } => {
+                assert_eq!(*id, op_id);
+                assert_eq!(result, &Err(CcidError::ResponseLengthOutOfRange));
+            }
+            _ => panic!("expected Complete action"),
+        }
+    }
+
+    #[test]
+    fn io_timeout_failure_sets_needs_recovery() {
+        let desc = make_test_descriptor();
+        let mut engine = CcidEngine::new(0, 0, 1, &desc);
+
+        let op_id = OperationId(35);
+        let _ = engine.step(
+            MonotonicTime(600),
+            InputEvent::Start {
+                id: op_id,
+                op: Operation::TransferBlock {
+                    b_wi: 0,
+                    w_level_parameter: 0,
+                    data: Zeroizing::new(vec![0x00, 0x84, 0x00, 0x00, 0x08]),
+                },
+            },
+        );
+
+        let t = engine.step(
+            MonotonicTime(610),
+            InputEvent::IoCompleted(IoCompletion::Failure(CcidError::Timeout)),
+        );
+
+        assert!(engine.needs_recovery);
+        assert_eq!(t.actions.len(), 2);
+        assert_eq!(t.actions[0], Action::CancelTransfers);
+        match &t.actions[1] {
+            Action::Complete { id, result } => {
+                assert_eq!(*id, op_id);
+                assert_eq!(result, &Err(CcidError::Timeout));
             }
             _ => panic!("expected Complete action"),
         }

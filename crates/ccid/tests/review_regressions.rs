@@ -1,9 +1,37 @@
+// Copyright 2026 Petri Koistinen
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Isolated synthetic review probes. Assertions describe required behavior.
+
 use refineid_apdu::{ApduClass, CardTransport, CommandApdu, CommandHeader};
-use refineid_ccid::codec::*;
-use refineid_ccid::descriptor::*;
-use refineid_ccid::*;
+use refineid_ccid::codec::{
+    CARD_STATUS_ACTIVE, CARD_STATUS_NOT_PRESENT, CCID_HEADER_SIZE, CHAIN_BEGIN, CHAIN_COMPLETE,
+    CLOCK_RUNNING, CLOCK_STOPPED_LOW, RDR_TO_PC_DATA_BLOCK, RDR_TO_PC_NOTIFY_SLOT_CHANGE,
+    RDR_TO_PC_PARAMETERS, RDR_TO_PC_SLOT_STATUS, decode_response,
+};
+use refineid_ccid::descriptor::{
+    AUTOMATIC_PARAMETER_CONFIGURATION, AUTOMATIC_PPS, CCID_FUNCTIONAL_DESCRIPTOR_LENGTH,
+    CcidExchangeLevel, CcidFunctionalDescriptor, DESCRIPTOR_TYPE_OFFSET, FEATURES_OFFSET,
+    MAXIMUM_MESSAGE_LENGTH_OFFSET, MINIMUM_SHORT_APDU_MESSAGE_LENGTH, SHORT_APDU_EXCHANGE,
+    USB_INTERFACE_DESCRIPTOR_TYPE,
+};
+use refineid_ccid::{
+    Action, CardProtocol, CcidCardTransport, CcidEngine, CcidError, InputEvent, IoCompletion,
+    MonotonicTime, Operation, OperationId, Transition, UsbHostTransport,
+};
 use std::collections::VecDeque;
+use zeroize::Zeroizing;
 
 const ZERO: u8 = 0;
 const ONE: u8 = 1;
@@ -192,7 +220,7 @@ fn ccid_chain_begin_is_not_a_complete_apdu() {
         Operation::TransferBlock {
             b_wi: ZERO,
             w_level_parameter: u16::from(ZERO),
-            data: b"synthetic".to_vec(),
+            data: Zeroizing::new(b"synthetic".to_vec()),
         },
     );
     let f = frame(
@@ -209,7 +237,7 @@ fn ccid_chain_begin_is_not_a_complete_apdu() {
 #[test]
 fn oversized_block_is_not_sent_to_reader() {
     let mut e = engine(CcidExchangeLevel::ShortApdu);
-    let data = vec![ZERO; e.max_message_length + BYTE_STEP];
+    let data = Zeroizing::new(vec![ZERO; e.max_payload_length + BYTE_STEP]);
     let t = start(
         &mut e,
         Operation::TransferBlock {

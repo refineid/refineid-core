@@ -30,7 +30,7 @@ use refineid_apdu::{
     ApduClass, CardTransport, CommandApdu, CredentialCommand, ResponseApdu, TransportOutcome,
 };
 use refineid_atr::Atr;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::codec::{AUTOMATIC_VOLTAGE_SELECTION, DEFAULT_T0_FIDI, DEFAULT_T0_WAITING_INTEGER};
 use crate::descriptor::{CcidExchangeLevel, CcidFunctionalDescriptor};
@@ -190,13 +190,13 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                 if !descriptor.automatic_parameter_configuration()
                     && transport.protocol == CardProtocol::T0
                 {
-                    let _ = transport.execute_op(Operation::SetParametersT0 {
+                    transport.execute_op(Operation::SetParametersT0 {
                         fi_di: DEFAULT_T0_FIDI,
                         guard_time: 0,
                         waiting_integer: DEFAULT_T0_WAITING_INTEGER,
                         clock_stop: 0,
                         inverse_convention: false,
-                    });
+                    })?;
                 }
 
                 Ok(transport)
@@ -310,7 +310,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
     /// Returns `CcidError` if the abort control transfer or slot status exchange fails.
     pub fn abort(&mut self) -> Result<(), CcidError> {
         let slot = self.engine.b_slot;
-        let seq = self.engine.next_seq;
+        let seq = self.engine.last_sequence_number();
         let value = (u16::from(seq) << 8) | u16::from(slot);
         let index = u16::from(self.engine.interface_number);
 
@@ -403,7 +403,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                     }
                 }
                 Action::CancelTransfers => {
-                    queue.clear();
+                    queue.retain(|a| matches!(a, Action::Complete { .. }));
                 }
                 Action::Complete { id, result } => {
                     if id == op_id {
@@ -425,7 +425,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
         let op = Operation::TransferBlock {
             b_wi: 0,
             w_level_parameter: 0,
-            data: apdu_bytes.to_vec(),
+            data: Zeroizing::new(apdu_bytes.to_vec()),
         };
         let raw_resp = match self.execute_op(op) {
             Ok(OperationResult::TransferBlock(data)) => data,
@@ -445,7 +445,17 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
             let mut next_le = sw2;
             let mut chained_sw1;
             let mut chained_sw2;
+            let mut chain_iterations: usize = 0;
+            let mut consecutive_wrong_le: usize = 0;
+            const MAX_CHAIN_ITERATIONS: usize = 256;
+            const MAX_CONSECUTIVE_WRONG_LE: usize = 2;
             loop {
+                chain_iterations = chain_iterations.saturating_add(1);
+                if chain_iterations > MAX_CHAIN_ITERATIONS {
+                    return Err(CcidError::ProtocolDesync(
+                        "61xx GET RESPONSE chaining iteration limit exceeded".into(),
+                    ));
+                }
                 let get_resp = GetResponse {
                     class: ApduClass::Plain,
                     le: next_le,
@@ -459,7 +469,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                 let chain_op = Operation::TransferBlock {
                     b_wi: 0,
                     w_level_parameter: 0,
-                    data: get_resp_bytes,
+                    data: Zeroizing::new(get_resp_bytes),
                 };
                 let chain_raw = match self.execute_op(chain_op) {
                     Ok(OperationResult::TransferBlock(data)) => data,
@@ -482,6 +492,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                 chained_sw1 = chain_sw[0];
                 chained_sw2 = chain_sw[1];
                 if chained_sw1 == SW1_BYTES_AVAILABLE {
+                    consecutive_wrong_le = 0;
                     if !progressed {
                         return Err(CcidError::ProtocolDesync(
                             "card signalled 61xx but returned no bytes (stalled chain)".into(),
@@ -491,6 +502,12 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                     continue;
                 }
                 if chained_sw1 == SW1_WRONG_LE {
+                    consecutive_wrong_le = consecutive_wrong_le.saturating_add(1);
+                    if consecutive_wrong_le > MAX_CONSECUTIVE_WRONG_LE {
+                        return Err(CcidError::ProtocolDesync(
+                            "repeated 6Cxx wrong-Le during 61xx chaining".into(),
+                        ));
+                    }
                     next_le = chained_sw2;
                     continue;
                 }
@@ -935,5 +952,53 @@ mod tests {
         let new_atr = transport.reset().expect("reset succeeds");
         assert_eq!(new_atr, fresh_atr);
         assert_eq!(transport.atr_bytes(), &fresh_atr);
+    }
+
+    #[test]
+    fn transmit_61xx_repeated_6cxx_trips_cap() {
+        let mut host = MockUsbHost::new();
+        let atr = [0x3B, 0x80, 0x00];
+        host.push_reply(Ok(mock_data_block_response(0, &atr)));
+
+        let desc = test_descriptor();
+        let mut transport =
+            CcidCardTransport::connect(host, &desc, 0, 0, 0x02, 0x82).expect("connect succeeds");
+
+        let cmd = CommandApdu::case_2(test_header(), 0x05);
+        // Reply 1: 61 03 (3 more bytes available via GET RESPONSE)
+        transport
+            .host_mut()
+            .push_reply(Ok(mock_data_block_response(1, &[0x61, 0x03])));
+        // Next 3 replies: all return 6C 03 (repeated wrong Le without progress)
+        transport
+            .host_mut()
+            .push_reply(Ok(mock_data_block_response(2, &[0x6C, 0x03])));
+        transport
+            .host_mut()
+            .push_reply(Ok(mock_data_block_response(3, &[0x6C, 0x03])));
+        transport
+            .host_mut()
+            .push_reply(Ok(mock_data_block_response(4, &[0x6C, 0x03])));
+
+        let err = transport.transmit(&cmd).expect_err("6Cxx cap should trip");
+        assert!(matches!(err, CcidError::ProtocolDesync(_)));
+    }
+
+    #[test]
+    fn cancel_transfers_preserves_complete_action() {
+        let mut host = MockUsbHost::new();
+        let atr = [0x3B, 0x80, 0x00];
+        host.push_reply(Ok(mock_data_block_response(0, &atr)));
+
+        let desc = test_descriptor();
+        let mut transport =
+            CcidCardTransport::connect(host, &desc, 0, 0, 0x02, 0x82).expect("connect succeeds");
+
+        // Inject timeout failure on next bulk_in
+        transport.host_mut().push_reply(Err(CcidError::Timeout));
+
+        let res = transport.execute_op(Operation::GetSlotStatus);
+        // Must return CcidError::Timeout, NOT "CCID engine terminated operation without completion"
+        assert_eq!(res, Err(CcidError::Timeout));
     }
 }

@@ -57,12 +57,12 @@ double-ended queue or a priority list.
 
 1. **Mechanical Cost**: It forces an $O(N)$ block-shift of all succeeding
    elements in memory.
-2. **Semantic Corruption (Index Perturbation)**: If the system maintains fixed
-   object handles or indices into the collection (e.g., mapping `ObjectKind::CaCitizenG4e`
-   to index `0`, `ObjectKind::CaCitizenG4r` to index `1`), prepending an element
-   into the raw vector silently shifts every downstream element. A query for
-   `CaCitizenG4e` now suddenly resolves to the newly prepended on-card certificate,
-   and the final static anchor falls off the end or returns `None`.
+2. **Semantic Corruption (Index Perturbation)**: If the system maintains sequential
+   object handles or indices into the collection (e.g., mapping `ObjectKind::Ca(0)`
+   to index `0`, `ObjectKind::Ca(1)` to index `1`), prepending an element
+   into the raw vector silently shifts every downstream element. A handle query for
+   `Ca(0)` now suddenly resolves to a different certificate than initially discovered,
+   violating handle stability.
 
 Procedural manipulation of raw sequence buffers corrupts domain relationships.
 
@@ -132,7 +132,7 @@ architectural pattern is a refined collection type:
 ```rust
 /// An invariant-preserving trust store that guarantees:
 /// 1. Zero duplicate certificates (enforced at insertion by DER comparison).
-/// 2. Deterministic precedence (on-card overrides static anchor).
+/// 2. Stable discovery order and sequential handle indexing (`OBJ_CA_BASE + index`).
 /// 3. Total operations — no indexing panics, no out-of-bounds states.
 #[derive(Debug, Default, Clone)]
 pub struct RefinedTrustStore {

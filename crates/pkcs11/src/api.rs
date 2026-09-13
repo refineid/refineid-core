@@ -50,11 +50,11 @@ use crate::ck::{
     CKR_RANDOM_SEED_NOT_SUPPORTED, CKR_SESSION_CLOSED, CKR_SESSION_HANDLE_INVALID,
     CKR_SESSION_PARALLEL_NOT_SUPPORTED, CKR_SLOT_ID_INVALID, CKR_TOKEN_NOT_PRESENT,
     CKR_TOKEN_WRITE_PROTECTED, CKR_USER_ALREADY_LOGGED_IN, CKR_USER_NOT_LOGGED_IN,
-    CKR_USER_TYPE_INVALID, CKU_USER, CkAttributePtr, CkBbool, CkBytePtr, CkCInitializeArgs,
-    CkFlags, CkFunctionList, CkFunctionListPtrPtr, CkInfo, CkInfoPtr, CkMechanismInfo,
-    CkMechanismInfoPtr, CkMechanismPtr, CkMechanismType, CkMechanismTypePtr, CkNotify,
-    CkObjectHandle, CkObjectHandlePtr, CkRv, CkSessionHandle, CkSessionHandlePtr, CkSessionInfo,
-    CkSessionInfoPtr, CkSlotId, CkSlotIdPtr, CkSlotInfo, CkSlotInfoPtr, CkTokenInfo,
+    CKR_USER_TYPE_INVALID, CKU_USER, CkAttributePtr, CkAttributeType, CkBbool, CkBytePtr,
+    CkCInitializeArgs, CkFlags, CkFunctionList, CkFunctionListPtrPtr, CkInfo, CkInfoPtr,
+    CkMechanismInfo, CkMechanismInfoPtr, CkMechanismPtr, CkMechanismType, CkMechanismTypePtr,
+    CkNotify, CkObjectHandle, CkObjectHandlePtr, CkRv, CkSessionHandle, CkSessionHandlePtr,
+    CkSessionInfo, CkSessionInfoPtr, CkSlotId, CkSlotIdPtr, CkSlotInfo, CkSlotInfoPtr, CkTokenInfo,
     CkTokenInfoPtr, CkUlong, CkUlongPtr, CkUserType, CkUtf8Char, CkUtf8CharPtr, CkVersion,
     CkVoidPtr,
 };
@@ -904,7 +904,7 @@ unsafe extern "C" fn c_logout(session: CkSessionHandle) -> CkRv {
 unsafe fn read_template(
     template: CkAttributePtr,
     count: CkUlong,
-) -> Vec<(CkMechanismType, Vec<u8>)> {
+) -> Vec<(CkAttributeType, Vec<u8>)> {
     let entries = usize_from_ulong(count);
     let mut out = Vec::with_capacity(entries);
     for index in 0..entries {
@@ -981,9 +981,10 @@ unsafe extern "C" fn c_find_objects_init(
 /// template.
 fn matching_handles(
     token: &TokenObjects,
-    template: &[(CkMechanismType, Vec<u8>)],
+    template: &[(CkAttributeType, Vec<u8>)],
 ) -> Vec<CkObjectHandle> {
-    ObjectKind::ALL
+    token
+        .all_object_kinds()
         .into_iter()
         .filter(|kind| token.matches(*kind, template))
         .map(ObjectKind::handle)
@@ -1083,6 +1084,9 @@ unsafe extern "C" fn c_get_attribute_value(
         Ok(token) => token,
         Err(err) => return err,
     };
+    if !token.object_exists(kind) {
+        return CKR_OBJECT_HANDLE_INVALID;
+    }
     drop(guard);
     // SAFETY: caller guarantees `template`/`count` describe a valid,
     // writable attribute array.

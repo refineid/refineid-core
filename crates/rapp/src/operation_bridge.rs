@@ -209,6 +209,33 @@ impl From<&CardOperation> for RappOperationDescriptor {
     }
 }
 
+/// Advisory progress events exposed to platform callers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+pub enum RappProgressEvent {
+    /// Proxy is waiting for card presentation.
+    WaitingForCard,
+    /// Card presentation wait has ended.
+    CardWaitEnded,
+}
+
+impl From<RappProgressEvent> for super::ProgressEvent {
+    fn from(value: RappProgressEvent) -> Self {
+        match value {
+            RappProgressEvent::WaitingForCard => Self::WaitingForCard,
+            RappProgressEvent::CardWaitEnded => Self::CardWaitEnded,
+        }
+    }
+}
+
+impl From<super::ProgressEvent> for RappProgressEvent {
+    fn from(value: super::ProgressEvent) -> Self {
+        match value {
+            super::ProgressEvent::WaitingForCard => Self::WaitingForCard,
+            super::ProgressEvent::CardWaitEnded => Self::CardWaitEnded,
+        }
+    }
+}
+
 /// Bounded action produced by the authoritative Rust state machine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum RappBridgeActionKind {
@@ -234,6 +261,8 @@ pub enum RappBridgeActionKind {
     AdvisoryCancellation,
     /// Peer acknowledged the completed result.
     ResultAcknowledged,
+    /// Advisory progress update reported by peer.
+    Progress,
     /// Peer already serves a live session for this pairing.
     PeerBusy,
     /// Peer answered a stale reference; a normal race.
@@ -300,6 +329,8 @@ pub struct RappBridgeAction {
     pub terminal_state: Option<String>,
     /// Stable terminal reason.
     pub terminal_reason: Option<RappTerminalReason>,
+    /// Advisory progress event.
+    pub progress_event: Option<RappProgressEvent>,
     /// The session must close after this frame is delivered.
     pub close_session_after_send: bool,
     /// Monotonic time of the next required liveness poll.
@@ -315,6 +346,7 @@ impl RappBridgeAction {
             frame: None,
             terminal_state: None,
             terminal_reason: None,
+            progress_event: None,
             close_session_after_send: false,
             next_poll_at_ms: None,
         }
@@ -340,6 +372,7 @@ impl RappBridgeAction {
             frame: Some(frame.into_bytes()),
             terminal_state: None,
             terminal_reason: None,
+            progress_event: None,
             close_session_after_send,
             next_poll_at_ms: None,
         }
@@ -1005,6 +1038,38 @@ impl RappOperationBridge {
         )
     }
 
+    /// Report authenticated advisory progress on an active operation.
+    ///
+    /// # Errors
+    /// [`RappBindingError`] on invalid input or the wrong protocol phase.
+    pub fn report_progress(
+        &self,
+        operation_id: Vec<u8>,
+        event: RappProgressEvent,
+    ) -> Result<RappBridgeAction, RappBindingError> {
+        let operation_id = decode_operation_id(&operation_id)?;
+        let mut state = self.lock_state()?;
+        let OperationBridgeState::Proxy {
+            runtime, engine, ..
+        } = &mut *state
+        else {
+            return Err(RappBindingError::WrongPhase);
+        };
+        let message = engine
+            .report_progress(operation_id, event.into())
+            .map_err(|_| RappBindingError::WrongPhase)?;
+        let frame = runtime
+            .endpoint_mut()
+            .send(&message)
+            .map_err(|_| RappBindingError::WrongPhase)?;
+        Ok(RappBridgeAction::send(
+            RappBridgeActionKind::SendFrame,
+            Some(operation_id),
+            frame,
+            false,
+        ))
+    }
+
     /// Complete a card inspection with factory and retry state.
     ///
     /// # Errors
@@ -1396,6 +1461,15 @@ fn requester_dispatch(
             RappBridgeActionKind::NoAction,
             operation_id,
         )),
+        RequesterDispatch::Progress {
+            operation_id,
+            event,
+        } => Ok(RappBridgeAction {
+            kind: RappBridgeActionKind::Progress,
+            operation_id: Some(operation_id.as_bytes().to_vec()),
+            progress_event: Some(event.into()),
+            ..RappBridgeAction::simple(RappBridgeActionKind::Progress)
+        }),
         RequesterDispatch::PeerBusy => Ok(RappBridgeAction::simple(RappBridgeActionKind::PeerBusy)),
         RequesterDispatch::PeerUnknownOperation(operation_id) => Ok(operation_id.map_or_else(
             || RappBridgeAction::simple(RappBridgeActionKind::PeerUnknownOperation),

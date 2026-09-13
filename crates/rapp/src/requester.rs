@@ -3,9 +3,9 @@
 use core::fmt;
 
 use super::{
-    CancelMessage, CardOperationError, CardOperationResult, OperationReference, OperationRequest,
-    OperationResultMessage, OperationState, PairId, RequestHash, ResultStatus, SessionId,
-    StatusReport, TypedMessage,
+    CancelMessage, CardOperationError, CardOperationResult, OperationProgressMessage,
+    OperationReference, OperationRequest, OperationResultMessage, OperationState, PairId,
+    ProgressEvent, RequestHash, ResultStatus, SessionId, StatusReport, TypedMessage,
 };
 
 /// Complete non-secret requester journal record.
@@ -270,6 +270,25 @@ impl RequesterOperation {
             return Err(RequesterError::Persistence(error));
         }
         Ok(result)
+    }
+
+    /// Receive an authenticated advisory progress update.
+    ///
+    /// Progress updates do not change durable operation state or lifecycle.
+    ///
+    /// # Errors
+    /// [`RequesterError`] on an unexpected terminal state or a reference mismatch.
+    pub fn receive_progress<E>(
+        &self,
+        progress: &OperationProgressMessage,
+    ) -> Result<ProgressEvent, RequesterError<E>> {
+        if self.record.state.is_terminal() {
+            return Err(RequesterError::WrongState(self.record.state));
+        }
+        if progress.reference != self.reference {
+            return Err(RequesterError::ReferenceMismatch);
+        }
+        Ok(progress.event)
     }
 
     /// Classifies a closed session exactly once from the local commit boundary.

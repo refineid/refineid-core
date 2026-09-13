@@ -16,7 +16,7 @@ use core::fmt;
 use zeroize::ZeroizeOnDrop;
 
 /// RAPP wire version implemented by this module.
-pub const VISIBLE_WIRE_VERSION: (u16, u16) = (26, 9);
+pub const VISIBLE_WIRE_VERSION: (u16, u16, u16) = (26, 9, 13);
 /// Mandatory RAPP 26.9 pairing Noise suite.
 pub const MANDATORY_PAIRING_SUITE: &str = "Noise_XXpsk3_25519_ChaChaPoly_SHA256";
 /// Mandatory RAPP 26.9 session Noise suite.

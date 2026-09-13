@@ -5,9 +5,10 @@ use std::collections::BTreeMap;
 
 use super::{
     CardOperationError, CloseReason, Envelope, GrantsHash, LIVENESS_CHALLENGE_SIZE,
-    MANDATORY_PAIRING_SUITE, MANDATORY_SESSION_SUITE, MessageType, OperationId, OperationReference,
-    OperationRequest, OperationResultMessage, OperationState, PairId, PingChallenge, ProfileName,
-    RequestHash, SESSION_READY_NONCE_SIZE, VISIBLE_WIRE_VERSION, WireValue,
+    MANDATORY_PAIRING_SUITE, MANDATORY_SESSION_SUITE, MessageType, OperationId,
+    OperationProgressMessage, OperationReference, OperationRequest, OperationResultMessage,
+    OperationState, PairId, PingChallenge, ProfileName, RequestHash, SESSION_READY_NONCE_SIZE,
+    VISIBLE_WIRE_VERSION, WireValue,
 };
 
 /// Pairing-channel parameter echo.
@@ -150,6 +151,8 @@ pub enum TypedMessage {
     OperationStatusRequest(OperationId),
     /// Durable status reconciliation answer.
     OperationStatus(StatusReport),
+    /// Advisory operation progress update.
+    OperationProgress(OperationProgressMessage),
     /// Stable generic protocol error.
     Error(ProtocolErrorMessage),
 }
@@ -213,6 +216,10 @@ impl TypedMessage {
                 Self::OperationStatusRequest(status_request_from_body(envelope.body)?)
             }
             MessageType::OperationStatus => Self::OperationStatus(status_from_body(envelope.body)?),
+            MessageType::OperationProgress => Self::OperationProgress(
+                OperationProgressMessage::from_wire_body(envelope.body)
+                    .map_err(MessageError::Operation)?,
+            ),
             MessageType::Error => Self::Error(error_from_body(envelope.body)?),
         };
         Ok(message)
@@ -237,6 +244,7 @@ impl TypedMessage {
             Self::OperationResultAck(_) => MessageType::OperationResultAck,
             Self::OperationStatusRequest(_) => MessageType::OperationStatusRequest,
             Self::OperationStatus(_) => MessageType::OperationStatus,
+            Self::OperationProgress(_) => MessageType::OperationProgress,
             Self::Error(_) => MessageType::Error,
         }
     }
@@ -268,6 +276,7 @@ impl TypedMessage {
                 Ok(body)
             }
             Self::OperationStatus(value) => status_to_body(value),
+            Self::OperationProgress(value) => Ok(value.to_wire_body()),
             Self::Error(value) => Ok(error_to_body(*value)),
         }
     }
@@ -688,6 +697,7 @@ fn version_value() -> WireValue {
     WireValue::Array(vec![
         WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.0)),
         WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.1)),
+        WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.2)),
     ])
 }
 

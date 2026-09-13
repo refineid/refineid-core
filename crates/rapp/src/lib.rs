@@ -53,8 +53,8 @@ mod wire;
 
 pub use authorization::{
     ApprovalOutcome, AuthorizationError, AuthorizationStage, AuthorizationTransaction,
-    AuthorizedCardCommand, AuthorizedSafeRead, OperationReference, ProxyCancelOutcome,
-    UserApproval,
+    AuthorizedCardCommand, AuthorizedSafeRead, OperationProgressMessage, OperationReference,
+    ProgressEvent, ProxyCancelOutcome, UserApproval,
 };
 pub use crypto::{
     CryptoError, HandshakeChannel, HandshakeCompletion, HandshakeRole, OpenError, PairKeyMaterial,

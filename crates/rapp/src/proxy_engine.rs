@@ -5,10 +5,10 @@ use core::fmt;
 use super::{
     ApprovalOutcome, AuthorizationError, AuthorizationStage, AuthorizationTransaction,
     AuthorizedCardCommand, AuthorizedSafeRead, CardOperationError, JournalError,
-    JournalRecoveryStore, JournalStore, OperationId, OperationReference, OperationRequest,
-    OperationResultMessage, OperationState, PendingCardCommand, ProfileName, ProtocolErrorMessage,
-    ProxyCancelOutcome, RecoveredProxyRecord, ResultError, ResultJournalStore, ResultStatus,
-    StatusReport, TypedMessage, UserApproval,
+    JournalRecoveryStore, JournalStore, OperationId, OperationProgressMessage, OperationReference,
+    OperationRequest, OperationResultMessage, OperationState, PendingCardCommand, ProfileName,
+    ProgressEvent, ProtocolErrorMessage, ProxyCancelOutcome, RecoveredProxyRecord, ResultError,
+    ResultJournalStore, ResultStatus, StatusReport, TypedMessage, UserApproval,
 };
 
 /// Operations for one authenticated proxy session. Exactly one may be active.
@@ -271,6 +271,24 @@ impl ProxyOperationEngine {
             ),
             message: TypedMessage::OperationResult(result),
         })
+    }
+
+    /// Create an authenticated advisory progress message for an active operation.
+    ///
+    /// # Errors
+    /// [`ProxyEngineError`] on an unknown operation.
+    pub fn report_progress(
+        &self,
+        operation_id: OperationId,
+        event: ProgressEvent,
+    ) -> Result<TypedMessage, ProxyEngineError<()>> {
+        let op = self
+            .operation(operation_id)
+            .ok_or(ProxyEngineError::UnknownLocalOperation)?;
+        Ok(TypedMessage::OperationProgress(OperationProgressMessage {
+            reference: op.reference(),
+            event,
+        }))
     }
 
     /// Apply authenticated-session closure under every operation boundary.
@@ -549,6 +567,7 @@ const fn referenced_operation_id(message: &TypedMessage) -> Option<OperationId> 
         TypedMessage::OperationResult(result) => Some(result.operation_id),
         TypedMessage::OperationStatusRequest(operation_id) => Some(*operation_id),
         TypedMessage::OperationStatus(report) => Some(report.operation_id),
+        TypedMessage::OperationProgress(progress) => Some(progress.reference.operation_id),
         _ => None,
     }
 }
@@ -671,5 +690,29 @@ mod tests {
             engine.receive_request::<()>(inspection_request()),
             Ok(ProxyDispatch::InspectPrerequisites(_))
         ));
+    }
+
+    #[test]
+    fn authenticated_operation_progress_reports_waiting_for_card() {
+        let mut engine = ProxyOperationEngine::new(vec![ProfileName::CardStatus]);
+        let request = inspection_request();
+        let op_id = request.operation_id;
+        let expected_hash = request.request_hash().expect("valid request hash");
+        assert!(engine.receive_request::<()>(request).is_ok());
+
+        let progress = engine
+            .report_progress(op_id, ProgressEvent::WaitingForCard)
+            .expect("report progress succeeds");
+
+        assert_eq!(
+            progress,
+            TypedMessage::OperationProgress(OperationProgressMessage {
+                reference: OperationReference {
+                    operation_id: op_id,
+                    request_hash: expected_hash,
+                },
+                event: ProgressEvent::WaitingForCard,
+            })
+        );
     }
 }

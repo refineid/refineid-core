@@ -1,7 +1,7 @@
 # WHATSUP
 
-branch: agent/resilient-pcsc
-purpose: Add connect_resilient and single-protocol reconnect to crates/pcsc, document ~/src/wt worktree policy, and add scripts/agent-housekeeping.sh.
-started: 2026-09-12T17:05+03:00 by Antigravity
-heartbeat: 2026-09-12T17:05+03:00
-status: in-progress
+branch: agent/rapp-progress
+purpose: Implement RAPP wire version (26, 9, 13) and operation.progress message signaling.
+started: 2026-09-13T12:31+03:00
+heartbeat: 2026-09-13T12:57+03:00
+status: complete

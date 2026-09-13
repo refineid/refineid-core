@@ -86,6 +86,8 @@ pub enum MessageType {
     OperationStatusRequest,
     /// Durable status reconciliation answer.
     OperationStatus,
+    /// Advisory operation progress update.
+    OperationProgress,
     /// Stable generic protocol error.
     Error,
 }
@@ -110,6 +112,7 @@ impl MessageType {
             Self::OperationResultAck => "operation.result_ack",
             Self::OperationStatusRequest => "operation.status_request",
             Self::OperationStatus => "operation.status",
+            Self::OperationProgress => "operation.progress",
             Self::Error => "error",
         }
     }
@@ -131,6 +134,7 @@ impl MessageType {
             "operation.result_ack" => Ok(Self::OperationResultAck),
             "operation.status_request" => Ok(Self::OperationStatusRequest),
             "operation.status" => Ok(Self::OperationStatus),
+            "operation.progress" => Ok(Self::OperationProgress),
             "error" => Ok(Self::Error),
             _ => Err(WireError::UnknownMessageType),
         }
@@ -192,6 +196,7 @@ impl Envelope {
             WireValue::Array(vec![
                 WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.0)),
                 WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.1)),
+                WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.2)),
             ]),
         );
         map.insert(
@@ -253,6 +258,7 @@ impl Envelope {
             != [
                 WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.0)),
                 WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.1)),
+                WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.2)),
             ]
         {
             return Err(WireError::UnsupportedVersion);
@@ -947,6 +953,23 @@ fn validate_body(
                 name: "request_hash",
                 field_type: REQUEST_HASH,
                 optional: true,
+            },
+        ],
+        M::OperationProgress => &[
+            FieldSpec {
+                name: "operation_id",
+                field_type: OPERATION_ID,
+                optional: false,
+            },
+            FieldSpec {
+                name: "request_hash",
+                field_type: REQUEST_HASH,
+                optional: false,
+            },
+            FieldSpec {
+                name: "event",
+                field_type: F::Text,
+                optional: false,
             },
         ],
         M::Error => &[

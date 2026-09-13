@@ -594,6 +594,72 @@ impl OperationReference {
     }
 }
 
+/// Advisory progress event during credential operation processing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgressEvent {
+    /// Proxy is waiting for card presentation.
+    WaitingForCard,
+    /// Card presentation wait has ended (card presented or removed).
+    CardWaitEnded,
+}
+
+impl ProgressEvent {
+    /// Wire discriminant name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WaitingForCard => "waiting_for_card",
+            Self::CardWaitEnded => "card_wait_ended",
+        }
+    }
+
+    /// Parse wire discriminant name.
+    ///
+    /// # Errors
+    /// [`CardOperationError`] on an unknown event name.
+    pub fn parse(value: &str) -> Result<Self, CardOperationError> {
+        match value {
+            "waiting_for_card" => Ok(Self::WaitingForCard),
+            "card_wait_ended" => Ok(Self::CardWaitEnded),
+            _ => Err(CardOperationError::InvalidField("event")),
+        }
+    }
+}
+
+/// Advisory operation progress update.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OperationProgressMessage {
+    /// Operation identifier and request-hash echo.
+    pub reference: OperationReference,
+    /// Specific progress event.
+    pub event: ProgressEvent,
+}
+
+impl OperationProgressMessage {
+    /// Encode the wire body.
+    #[must_use]
+    pub fn to_wire_body(self) -> BTreeMap<String, WireValue> {
+        let mut body = self.reference.to_wire_body();
+        body.insert("event".into(), WireValue::Text(self.event.as_str().into()));
+        body
+    }
+
+    /// Decode the wire body after envelope schema validation.
+    ///
+    /// # Errors
+    /// [`CardOperationError`] on a missing, mistyped, or extra field.
+    pub fn from_wire_body(
+        mut body: BTreeMap<String, WireValue>,
+    ) -> Result<Self, CardOperationError> {
+        let event = match body.remove("event") {
+            Some(WireValue::Text(value)) => ProgressEvent::parse(&value)?,
+            _ => return Err(CardOperationError::InvalidField("event")),
+        };
+        let reference = OperationReference::from_wire_body(body)?;
+        Ok(Self { reference, event })
+    }
+}
+
 /// Authorization transaction failure.
 #[derive(Debug)]
 pub enum AuthorizationError<E> {

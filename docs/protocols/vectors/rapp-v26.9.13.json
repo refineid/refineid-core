@@ -278,7 +278,7 @@
       "transport_profile": "apple-peer-v1"
     }
   ],
-  "protocol_document_version": "26.9.7.70",
+  "protocol_document_version": "26.9.13",
   "rejected_cbor": [
     {
       "encoded_hex": "1817",

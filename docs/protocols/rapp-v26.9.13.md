@@ -2,13 +2,13 @@
 
 Status: External-review draft  
 Intended status: Experimental  
-Document version: 26.9.7.70  
-Supersedes: 26.9.4.181  
+Document version: 26.9.13  
+Supersedes: 26.9.7.70  
 Protocol wire version: 26.9.13  
-Date: 2026-09-07  
+Date: 2026-09-13  
 Change controller: RefineID project  
-Companion model: [RAPP state machine 26.9.7.70](rapp-state-machine-v26.9.7.70.yaml)  
-Conformance corpus: [RAPP vectors 26.9.7.70](vectors/rapp-v26.9.7.70.json)
+Companion model: [RAPP state machine 26.9.13](rapp-state-machine-v26.9.13.yaml)  
+Conformance corpus: [RAPP vectors 26.9.13](vectors/rapp-v26.9.13.json)
 
 ## Abstract
 
@@ -1600,7 +1600,7 @@ Conformance evidence includes:
 - production-artifact inspection proving unsafe diagnostics are absent.
 
 The machine-readable corpus at
-`vectors/rapp-v26.9.7.70.json` fixes the deterministic CBOR,
+`vectors/rapp-v26.9.13.json` fixes the deterministic CBOR,
 envelope-rejection, sequence, downgrade, grant, hash, and mandatory Noise
 XXpsk3/KK known-answer vectors for this document version. Fields prefixed
 `test_only_` are public deterministic test material and MUST NOT be used as

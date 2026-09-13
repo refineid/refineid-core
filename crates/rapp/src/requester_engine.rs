@@ -160,9 +160,15 @@ impl RequesterOperationEngine {
             return Ok(RequesterDispatch::NotOperation(message));
         };
         let Some(index) = self.index(operation_id) else {
+            if matches!(message, TypedMessage::OperationProgress(_)) {
+                return Ok(RequesterDispatch::IgnoredProgress(operation_id));
+            }
             return Ok(stale(operation_id));
         };
         if self.operations[index].record().state.is_terminal() {
+            if matches!(message, TypedMessage::OperationProgress(_)) {
+                return Ok(RequesterDispatch::IgnoredProgress(operation_id));
+            }
             return Ok(stale(operation_id));
         }
 
@@ -200,13 +206,23 @@ impl RequesterOperationEngine {
                 })
             }
             TypedMessage::OperationProgress(progress) => {
-                let event = self.operations[index]
-                    .receive_progress(&progress)
-                    .map_err(map_requester_error)?;
-                Ok(RequesterDispatch::Progress {
-                    operation_id,
-                    event,
-                })
+                match self.operations[index].receive_progress(&progress) {
+                    Ok(event) => match event {
+                        ProgressEvent::WaitingForCard | ProgressEvent::CardWaitEnded => {
+                            Ok(RequesterDispatch::Progress {
+                                operation_id,
+                                event,
+                            })
+                        }
+                        ProgressEvent::Unknown => {
+                            Ok(RequesterDispatch::IgnoredProgress(operation_id))
+                        }
+                    },
+                    Err(RequesterError::WrongState(_) | RequesterError::ReferenceMismatch) => {
+                        Ok(RequesterDispatch::IgnoredProgress(operation_id))
+                    }
+                    Err(err) => Err(map_requester_error(err)),
+                }
             }
             _ => Err(RequesterEngineError::AuthenticatedProtocolViolation(
                 RequesterViolation::IllegalMessageForActiveOperation,
@@ -358,6 +374,8 @@ pub enum RequesterDispatch {
         /// Specific progress event.
         event: ProgressEvent,
     },
+    /// Stale or advisory progress update; ignore without sending error response.
+    IgnoredProgress(OperationId),
     /// Peer already serves a live session for this pairing.
     PeerBusy,
     /// Peer answered a stale reference; a normal race.
@@ -464,7 +482,7 @@ mod tests {
     use super::*;
     use crate::{
         CardOperation, OperationId, OperationProgressMessage, OperationReference, PairId,
-        ProfileName, ProgressEvent, SessionId,
+        ProfileName, ProgressEvent, RequestHash, SessionId,
     };
 
     struct TestStore(Option<RequesterJournalRecord>);
@@ -526,6 +544,48 @@ mod tests {
         assert_eq!(
             store.0.as_ref().expect("operation record").state,
             OperationState::Requested
+        );
+
+        // Unknown event is tolerated as IgnoredProgress
+        let unknown_event_msg = TypedMessage::OperationProgress(OperationProgressMessage {
+            reference: OperationReference {
+                operation_id: op_id,
+                request_hash,
+            },
+            event: ProgressEvent::Unknown,
+        });
+        let dispatch = engine
+            .receive(&mut store, unknown_event_msg)
+            .expect("receive unknown progress succeeds");
+        assert_eq!(dispatch, RequesterDispatch::IgnoredProgress(op_id));
+
+        // Hash mismatch is tolerated as IgnoredProgress
+        let mismatched_msg = TypedMessage::OperationProgress(OperationProgressMessage {
+            reference: OperationReference {
+                operation_id: op_id,
+                request_hash: RequestHash::from_array([0x99; 32]),
+            },
+            event: ProgressEvent::WaitingForCard,
+        });
+        let dispatch = engine
+            .receive(&mut store, mismatched_msg)
+            .expect("receive mismatched progress succeeds");
+        assert_eq!(dispatch, RequesterDispatch::IgnoredProgress(op_id));
+
+        // Unknown operation ID is tolerated as IgnoredProgress
+        let unknown_op_msg = TypedMessage::OperationProgress(OperationProgressMessage {
+            reference: OperationReference {
+                operation_id: OperationId::from_array([0xee; 16]),
+                request_hash,
+            },
+            event: ProgressEvent::WaitingForCard,
+        });
+        let dispatch = engine
+            .receive(&mut store, unknown_op_msg)
+            .expect("receive unknown op progress succeeds");
+        assert_eq!(
+            dispatch,
+            RequesterDispatch::IgnoredProgress(OperationId::from_array([0xee; 16]))
         );
     }
 }

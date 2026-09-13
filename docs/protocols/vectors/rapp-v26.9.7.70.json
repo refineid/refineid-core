@@ -593,6 +593,29 @@
         0,
         0
       ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "historical-two-element-version",
+      "version": [
+        26,
+        9
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "four-element-version",
+      "version": [
+        26,
+        9,
+        13,
+        1
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "empty-version",
+      "version": []
     }
   ]
 }

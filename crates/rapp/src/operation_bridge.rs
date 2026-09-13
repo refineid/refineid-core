@@ -232,6 +232,7 @@ impl From<super::ProgressEvent> for RappProgressEvent {
         match value {
             super::ProgressEvent::WaitingForCard => Self::WaitingForCard,
             super::ProgressEvent::CardWaitEnded => Self::CardWaitEnded,
+            super::ProgressEvent::Unknown => Self::WaitingForCard,
         }
     }
 }
@@ -1050,24 +1051,29 @@ impl RappOperationBridge {
         let operation_id = decode_operation_id(&operation_id)?;
         let mut state = self.lock_state()?;
         let OperationBridgeState::Proxy {
-            runtime, engine, ..
+            runtime,
+            engine,
+            journal,
+            ..
         } = &mut *state
         else {
             return Err(RappBindingError::WrongPhase);
         };
-        let message = engine
-            .report_progress(operation_id, event.into())
-            .map_err(|_| RappBindingError::WrongPhase)?;
-        let frame = runtime
-            .endpoint_mut()
-            .send(&message)
-            .map_err(|_| RappBindingError::WrongPhase)?;
-        Ok(RappBridgeAction::send(
-            RappBridgeActionKind::SendFrame,
+        let message =
+            engine
+                .report_progress(operation_id, event.into())
+                .map_err(|err| match err {
+                    ProxyEngineError::UnknownLocalOperation => RappBindingError::UnknownOperation,
+                    _ => RappBindingError::WrongPhase,
+                })?;
+        send_proxy(
+            runtime,
+            engine,
+            journal,
             Some(operation_id),
-            frame,
+            &message,
             false,
-        ))
+        )
     }
 
     /// Complete a card inspection with factory and retry state.
@@ -1464,12 +1470,15 @@ fn requester_dispatch(
         RequesterDispatch::Progress {
             operation_id,
             event,
-        } => Ok(RappBridgeAction {
-            kind: RappBridgeActionKind::Progress,
-            operation_id: Some(operation_id.as_bytes().to_vec()),
-            progress_event: Some(event.into()),
-            ..RappBridgeAction::simple(RappBridgeActionKind::Progress)
-        }),
+        } => {
+            let mut action =
+                RappBridgeAction::for_operation(RappBridgeActionKind::Progress, operation_id);
+            action.progress_event = Some(event.into());
+            Ok(action)
+        }
+        RequesterDispatch::IgnoredProgress(_) => {
+            Ok(RappBridgeAction::simple(RappBridgeActionKind::NoAction))
+        }
         RequesterDispatch::PeerBusy => Ok(RappBridgeAction::simple(RappBridgeActionKind::PeerBusy)),
         RequesterDispatch::PeerUnknownOperation(operation_id) => Ok(operation_id.map_or_else(
             || RappBridgeAction::simple(RappBridgeActionKind::PeerUnknownOperation),
@@ -1753,5 +1762,47 @@ const fn operation_state_name(state: OperationState) -> &'static str {
         OperationState::Rejected => "rejected",
         OperationState::CredentialRejected => "credential_rejected",
         OperationState::Ambiguous => "ambiguous",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_action_mapping() {
+        let op_id = OperationId::new([0x11; 16]);
+        let mut action = RappBridgeAction::for_operation(RappBridgeActionKind::Progress, op_id);
+        action.progress_event = Some(RappProgressEvent::WaitingForCard);
+        assert_eq!(action.kind, RappBridgeActionKind::Progress);
+        assert_eq!(action.operation_id, Some(op_id.as_bytes().to_vec()));
+        assert_eq!(
+            action.progress_event,
+            Some(RappProgressEvent::WaitingForCard)
+        );
+    }
+
+    #[test]
+    fn progress_event_bridge_conversions() {
+        assert_eq!(
+            super::ProgressEvent::from(RappProgressEvent::WaitingForCard),
+            super::ProgressEvent::WaitingForCard
+        );
+        assert_eq!(
+            super::ProgressEvent::from(RappProgressEvent::CardWaitEnded),
+            super::ProgressEvent::CardWaitEnded
+        );
+        assert_eq!(
+            RappProgressEvent::from(super::ProgressEvent::WaitingForCard),
+            RappProgressEvent::WaitingForCard
+        );
+        assert_eq!(
+            RappProgressEvent::from(super::ProgressEvent::CardWaitEnded),
+            RappProgressEvent::CardWaitEnded
+        );
+        assert_eq!(
+            RappProgressEvent::from(super::ProgressEvent::Unknown),
+            RappProgressEvent::WaitingForCard
+        );
     }
 }

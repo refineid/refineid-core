@@ -601,6 +601,8 @@ pub enum ProgressEvent {
     WaitingForCard,
     /// Card presentation wait has ended (card presented or removed).
     CardWaitEnded,
+    /// Forward-compatible unknown progress event.
+    Unknown,
 }
 
 impl ProgressEvent {
@@ -610,18 +612,17 @@ impl ProgressEvent {
         match self {
             Self::WaitingForCard => "waiting_for_card",
             Self::CardWaitEnded => "card_wait_ended",
+            Self::Unknown => "unknown",
         }
     }
 
-    /// Parse wire discriminant name.
-    ///
-    /// # Errors
-    /// [`CardOperationError`] on an unknown event name.
-    pub fn parse(value: &str) -> Result<Self, CardOperationError> {
+    /// Parse wire discriminant name. Unknown event strings parse as [`Self::Unknown`].
+    #[must_use]
+    pub fn parse(value: &str) -> Self {
         match value {
-            "waiting_for_card" => Ok(Self::WaitingForCard),
-            "card_wait_ended" => Ok(Self::CardWaitEnded),
-            _ => Err(CardOperationError::InvalidField("event")),
+            "waiting_for_card" => Self::WaitingForCard,
+            "card_wait_ended" => Self::CardWaitEnded,
+            _ => Self::Unknown,
         }
     }
 }
@@ -652,7 +653,7 @@ impl OperationProgressMessage {
         mut body: BTreeMap<String, WireValue>,
     ) -> Result<Self, CardOperationError> {
         let event = match body.remove("event") {
-            Some(WireValue::Text(value)) => ProgressEvent::parse(&value)?,
+            Some(WireValue::Text(value)) => ProgressEvent::parse(&value),
             _ => return Err(CardOperationError::InvalidField("event")),
         };
         let reference = OperationReference::from_wire_body(body)?;
@@ -684,3 +685,88 @@ impl<E: fmt::Debug> fmt::Display for AuthorizationError<E> {
 }
 
 impl<E: fmt::Debug> core::error::Error for AuthorizationError<E> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{OperationId, RequestHash};
+
+    #[test]
+    fn progress_event_round_trip() {
+        assert_eq!(
+            ProgressEvent::parse("waiting_for_card"),
+            ProgressEvent::WaitingForCard
+        );
+        assert_eq!(ProgressEvent::WaitingForCard.as_str(), "waiting_for_card");
+        assert_eq!(
+            ProgressEvent::parse("card_wait_ended"),
+            ProgressEvent::CardWaitEnded
+        );
+        assert_eq!(ProgressEvent::CardWaitEnded.as_str(), "card_wait_ended");
+        assert_eq!(
+            ProgressEvent::parse("future_extension"),
+            ProgressEvent::Unknown
+        );
+    }
+
+    #[test]
+    fn operation_progress_message_round_trip() {
+        let reference = OperationReference {
+            operation_id: OperationId::from_array([0x42; 16]),
+            request_hash: RequestHash::from_array([0x33; 32]),
+        };
+        let msg = OperationProgressMessage {
+            reference,
+            event: ProgressEvent::WaitingForCard,
+        };
+        let wire = msg.to_wire_body();
+        let decoded = OperationProgressMessage::from_wire_body(wire).expect("valid decode");
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn operation_progress_message_adversarial_decoding() {
+        let reference = OperationReference {
+            operation_id: OperationId::from_array([0x42; 16]),
+            request_hash: RequestHash::from_array([0x33; 32]),
+        };
+
+        // Unknown event name parses successfully as ProgressEvent::Unknown
+        let mut body = reference.to_wire_body();
+        body.insert(
+            "event".into(),
+            WireValue::Text("unexpected_future_event".into()),
+        );
+        let decoded =
+            OperationProgressMessage::from_wire_body(body).expect("unknown event tolerant");
+        assert_eq!(decoded.event, ProgressEvent::Unknown);
+        assert_eq!(decoded.reference, reference);
+
+        // Missing event field
+        let body = reference.to_wire_body();
+        assert_eq!(
+            OperationProgressMessage::from_wire_body(body),
+            Err(CardOperationError::InvalidField("event"))
+        );
+
+        // Wrong type event field (integer instead of text)
+        let mut body = reference.to_wire_body();
+        body.insert("event".into(), WireValue::Unsigned(123));
+        assert_eq!(
+            OperationProgressMessage::from_wire_body(body),
+            Err(CardOperationError::InvalidField("event"))
+        );
+
+        // Extra field in body
+        let mut body = reference.to_wire_body();
+        body.insert("event".into(), WireValue::Text("waiting_for_card".into()));
+        body.insert(
+            "extra_bogus_field".into(),
+            WireValue::Text("malicious".into()),
+        );
+        assert_eq!(
+            OperationProgressMessage::from_wire_body(body),
+            Err(CardOperationError::UnexpectedField)
+        );
+    }
+}

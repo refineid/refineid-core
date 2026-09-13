@@ -4,7 +4,7 @@ Status: External-review draft
 Intended status: Experimental  
 Document version: 26.9.7.70  
 Supersedes: 26.9.4.181  
-Protocol wire version: 26.9  
+Protocol wire version: 26.9.13  
 Date: 2026-09-07  
 Change controller: RefineID project  
 Companion model: [RAPP state machine 26.9.7.70](rapp-state-machine-v26.9.7.70.yaml)  
@@ -294,6 +294,7 @@ message-type =
   / "operation.result_ack"
   / "operation.status_request"
   / "operation.status"
+  / "operation.progress"
   / "error"
 ```
 
@@ -915,6 +916,32 @@ annotation that resolves the practical question — whether the card command
 executed — without transitioning any machine. New work requires a new
 `operation_id` and fresh consent in every case.
 
+### 12.7 Operation progress (advisory)
+
+An authorization proxy MAY send `operation.progress` to inform the requester of
+user-visible progress during operation execution:
+
+```cddl
+operation-progress-body = {
+  "operation_id": bstr .size 16,
+  "request_hash": bstr .size 32,
+  "event": "waiting_for_card" / "card_wait_ended" / tstr,
+}
+```
+
+Registered progress event names:
+* `waiting_for_card`: The proxy is waiting for the user to present a physical card to NFC or insert into a reader.
+* `card_wait_ended`: The card presentation wait has ended (e.g. card tapped/inserted or wait timed out).
+
+`operation.progress` is strictly advisory and unidirectional (proxy to requester).
+It MUST NOT mutate durable operation state, advance transaction stages, or alter
+retry/transmission invariants.
+
+To maintain forward compatibility, an unknown or unexpected `event` value MUST
+be ignored as a no-op advisory and MUST NOT terminate the session or revoke the
+pairing. Similarly, progress messages referencing an unknown, completed, or
+cancelled operation MUST be silently ignored without generating an error response.
+
 ## 13. Credential profiles
 
 ### 13.1 Common requirements
@@ -1294,6 +1321,10 @@ Registered `error` names in RAPP 26.9: `busy`, `unknown_operation`.
 | `local_security_shutdown` | none | closes | none | ambiguous if committed |
 
 An ordinary user denial is not an anomaly. It MUST NOT revoke a pairing.
+
+Advisory progress failures (such as unknown event names, stale operation races, or reference mismatches) MUST NOT be treated as protocol violations and MUST NOT revoke pairings.
+
+An authorization proxy MAY enforce a rolling rate limit on inbound operation requests (e.g. 30 requests per minute, sized for human-interactive pace) to weed out broken or looping clients. When the rate limit is exceeded, the proxy answers with `error: busy`, preserving the session and stored pairings intact.
 
 ## 16. Transport profiles
 

@@ -11,12 +11,21 @@ use super::{
     ResultJournalStore, ResultStatus, StatusReport, TypedMessage, UserApproval,
 };
 
+/// Maximum incoming operation requests permitted per rolling minute window.
+/// Sized for reasonable human interaction (e.g. web surfing) while weeding out
+/// broken or malicious client loops.
+pub const MAX_OPERATIONS_PER_MINUTE: usize = 30;
+
+/// Rolling rate limit window duration in milliseconds.
+pub const RATE_LIMIT_WINDOW_MS: u64 = 60_000;
+
 /// Operations for one authenticated proxy session. Exactly one may be active.
 #[derive(Debug)]
 pub struct ProxyOperationEngine {
     granted_profiles: Vec<ProfileName>,
     operations: Vec<AuthorizationTransaction>,
     recovered: Vec<RecoveredProxyRecord>,
+    request_timestamps: Vec<u64>,
 }
 
 impl ProxyOperationEngine {
@@ -29,6 +38,7 @@ impl ProxyOperationEngine {
             granted_profiles,
             operations: Vec::new(),
             recovered: Vec::new(),
+            request_timestamps: Vec::new(),
         }
     }
 
@@ -86,6 +96,7 @@ impl ProxyOperationEngine {
             granted_profiles,
             operations: Vec::new(),
             recovered: records,
+            request_timestamps: Vec::new(),
         })
     }
 
@@ -102,7 +113,7 @@ impl ProxyOperationEngine {
         maximum_lifetime_ms: u64,
     ) -> Result<ProxyDispatch, ProxyEngineError<S::Error>> {
         match message {
-            TypedMessage::OperationRequest(request) => self.receive_request(request),
+            TypedMessage::OperationRequest(request) => self.receive_request(request, now_ms),
             TypedMessage::OperationCommit(reference) => {
                 self.receive_commit(store, reference, now_ms, maximum_lifetime_ms)
             }
@@ -148,6 +159,12 @@ impl ProxyOperationEngine {
                     |operation| status_message(Some(operation), operation_id),
                 );
                 Ok(ProxyDispatch::Send(message))
+            }
+            TypedMessage::OperationProgress(progress) => {
+                // Advisory progress is proxy-to-requester only. Inbound progress is ignored as a no-op advisory.
+                Ok(ProxyDispatch::NotOperation(
+                    TypedMessage::OperationProgress(progress),
+                ))
             }
             other => {
                 let Some(operation_id) = referenced_operation_id(&other) else {
@@ -276,7 +293,7 @@ impl ProxyOperationEngine {
     /// Create an authenticated advisory progress message for an active operation.
     ///
     /// # Errors
-    /// [`ProxyEngineError`] on an unknown operation.
+    /// [`ProxyEngineError`] on an unknown operation or an invalid local transition.
     pub fn report_progress(
         &self,
         operation_id: OperationId,
@@ -285,6 +302,9 @@ impl ProxyOperationEngine {
         let op = self
             .operation(operation_id)
             .ok_or(ProxyEngineError::UnknownLocalOperation)?;
+        if op.operation_state().is_terminal() {
+            return Err(ProxyEngineError::InvalidLocalTransition);
+        }
         Ok(TypedMessage::OperationProgress(OperationProgressMessage {
             reference: op.reference(),
             event,
@@ -336,7 +356,17 @@ impl ProxyOperationEngine {
     fn receive_request<E>(
         &mut self,
         request: OperationRequest,
+        now_ms: u64,
     ) -> Result<ProxyDispatch, ProxyEngineError<E>> {
+        let cutoff = now_ms.saturating_sub(RATE_LIMIT_WINDOW_MS);
+        self.request_timestamps.retain(|&ts| ts >= cutoff);
+        if self.request_timestamps.len() >= MAX_OPERATIONS_PER_MINUTE {
+            return Ok(ProxyDispatch::Send(TypedMessage::Error(
+                ProtocolErrorMessage::Busy,
+            )));
+        }
+        self.request_timestamps.push(now_ms);
+
         if !self.granted_profiles.contains(&request.profile) {
             return Err(ProxyEngineError::AuthenticatedProtocolViolation(
                 ProxyViolation::ProfileNotGranted,
@@ -670,12 +700,41 @@ mod tests {
         .expect("registered card-status request")
     }
 
+    struct TestStore;
+    impl JournalStore for TestStore {
+        type Error = ();
+        fn persist(&mut self, _record: &crate::JournalRecord) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+    impl ResultJournalStore for TestStore {
+        fn persist_result(
+            &mut self,
+            _record: &crate::JournalRecord,
+            _result: &OperationResultMessage,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn retain_uncertain_result(
+            &mut self,
+            _record: &crate::JournalRecord,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn acknowledge_result(
+            &mut self,
+            _record: &crate::JournalRecord,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn authenticated_out_of_grant_request_is_a_protocol_violation() {
         let mut engine = ProxyOperationEngine::new(vec![ProfileName::Authentication]);
 
         assert!(matches!(
-            engine.receive_request::<()>(inspection_request()),
+            engine.receive_request::<()>(inspection_request(), 1_000),
             Err(ProxyEngineError::AuthenticatedProtocolViolation(
                 ProxyViolation::ProfileNotGranted
             ))
@@ -687,7 +746,7 @@ mod tests {
         let mut engine = ProxyOperationEngine::new(vec![ProfileName::CardStatus]);
 
         assert!(matches!(
-            engine.receive_request::<()>(inspection_request()),
+            engine.receive_request::<()>(inspection_request(), 1_000),
             Ok(ProxyDispatch::InspectPrerequisites(_))
         ));
     }
@@ -698,7 +757,7 @@ mod tests {
         let request = inspection_request();
         let op_id = request.operation_id;
         let expected_hash = request.request_hash().expect("valid request hash");
-        assert!(engine.receive_request::<()>(request).is_ok());
+        assert!(engine.receive_request::<()>(request, 1_000).is_ok());
 
         let progress = engine
             .report_progress(op_id, ProgressEvent::WaitingForCard)
@@ -714,5 +773,78 @@ mod tests {
                 event: ProgressEvent::WaitingForCard,
             })
         );
+    }
+
+    #[test]
+    fn terminal_operation_rejects_report_progress() {
+        let mut engine = ProxyOperationEngine::new(vec![ProfileName::CardStatus]);
+        let request = inspection_request();
+        let op_id = request.operation_id;
+        assert!(engine.receive_request::<()>(request, 1_000).is_ok());
+
+        // Session closed cancels the active operation, making it terminal
+        assert!(engine.session_closed(&mut TestStore).is_ok());
+
+        assert!(matches!(
+            engine.report_progress(op_id, ProgressEvent::WaitingForCard),
+            Err(ProxyEngineError::InvalidLocalTransition)
+        ));
+    }
+
+    #[test]
+    fn proxy_rate_limiter_blocks_excessive_requests() {
+        let mut engine = ProxyOperationEngine::new(vec![ProfileName::CardStatus]);
+        for i in 0..MAX_OPERATIONS_PER_MINUTE {
+            let mut req = inspection_request();
+            let mut op_bytes = [0x11; 16];
+            op_bytes[0] = i as u8;
+            req.operation_id = OperationId::from_array(op_bytes);
+            let dispatch = engine.receive_request::<()>(req, 1_000 + i as u64);
+            assert!(dispatch.is_ok());
+            engine.operations.clear();
+        }
+
+        // 31st request at 1_500ms should be rejected as Busy by the rate limiter
+        let mut req_overflow = inspection_request();
+        req_overflow.operation_id = OperationId::from_array([0x99; 16]);
+        let overflow_dispatch = engine.receive_request::<()>(req_overflow, 1_500);
+        assert!(matches!(
+            overflow_dispatch,
+            Ok(ProxyDispatch::Send(TypedMessage::Error(
+                ProtocolErrorMessage::Busy
+            )))
+        ));
+
+        // After window expires (60_000ms later at 61_001ms), requests should be accepted again
+        let mut req_after = inspection_request();
+        req_after.operation_id = OperationId::from_array([0xaa; 16]);
+        let after_dispatch =
+            engine.receive_request::<()>(req_after, 1_000 + RATE_LIMIT_WINDOW_MS + 1);
+        assert!(matches!(
+            after_dispatch,
+            Ok(ProxyDispatch::InspectPrerequisites(_))
+        ));
+    }
+
+    #[test]
+    fn inbound_operation_progress_on_proxy_is_tolerated_as_not_operation() {
+        let mut engine = ProxyOperationEngine::new(vec![ProfileName::CardStatus]);
+        let request = inspection_request();
+        let op_id = request.operation_id;
+        let expected_hash = request.request_hash().expect("valid request hash");
+        assert!(engine.receive_request::<()>(request, 1_000).is_ok());
+
+        let progress_msg = TypedMessage::OperationProgress(OperationProgressMessage {
+            reference: OperationReference {
+                operation_id: op_id,
+                request_hash: expected_hash,
+            },
+            event: ProgressEvent::WaitingForCard,
+        });
+
+        let outcome = engine
+            .receive(&mut TestStore, progress_msg, 1_000, 5_000)
+            .expect("receive succeeds");
+        assert!(matches!(outcome, ProxyDispatch::NotOperation(_)));
     }
 }

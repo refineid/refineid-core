@@ -33,6 +33,12 @@
 //! - The asynchronous background daemon event pump (driving continuous interrupt transfers,
 //!   monotonic deadlines, and concurrent cancellation) will be delivered in the companion
 //!   Android service daemon slice.
+//!
+//! ### Hardware Validation Status
+//! All protocol paths in this crate—including the `0010h` continuation kick requirement, mid-chain
+//! sequence number echoing, extended APDU chained reassembly, and the abort control-bulk handshake—are
+//! verified exclusively via deterministic unit tests and scripted synthetic USB host mock suites.
+//! Observation against physical CCID readers and smart card silicon remains pending live hardware testing.
 
 #![forbid(unsafe_code)]
 
@@ -44,7 +50,10 @@ pub mod engine;
 pub mod error;
 pub mod transport;
 
-pub use codec::{CardStatus, CcidResponse, ChainParameter, ClockStatus, SlotChangeNotification};
+pub use codec::{
+    CardStatus, CcidResponse, ChainParameter, ClockStatus, HardwareErrorNotification,
+    SlotChangeNotification,
+};
 pub use descriptor::{CcidExchangeLevel, CcidFunctionalDescriptor};
 pub use engine::{
     Action, CcidEngine, Deadline, DeadlineId, InputEvent, IoCompletion, MonotonicTime, Operation,

@@ -86,8 +86,7 @@ fn descriptor(level: CcidExchangeLevel) -> CcidFunctionalDescriptor {
 
 fn engine(level: CcidExchangeLevel) -> CcidEngine {
     let mut e = CcidEngine::new(ZERO, ZERO, GENERATION, &descriptor(level));
-    e.card_present = true;
-    e.activated = true;
+    e.set_activated(true);
     e
 }
 
@@ -153,7 +152,7 @@ fn changed_present_revokes_activation_and_pending_operation() {
         LATER,
         InputEvent::InterruptReceived(vec![RDR_TO_PC_NOTIFY_SLOT_CHANGE, CHANGED_PRESENT]),
     );
-    assert!(!e.activated);
+    assert!(!e.is_activated());
     assert!(
         t.actions
             .iter()
@@ -196,7 +195,7 @@ fn timeout_requires_recovery_before_next_command() {
 #[test]
 fn bulk_status_absence_revokes_activation_and_generation() {
     let mut e = engine(CcidExchangeLevel::ShortApdu);
-    let generation = e.card_gen;
+    let generation = e.card_gen();
     start(&mut e, Operation::GetSlotStatus);
     let f = frame(
         RDR_TO_PC_SLOT_STATUS,
@@ -206,7 +205,7 @@ fn bulk_status_absence_revokes_activation_and_generation() {
         &[],
     );
     e.step(LATER, InputEvent::IoCompleted(IoCompletion::BulkIn(f)));
-    assert!(!e.activated && e.card_gen != generation);
+    assert!(!e.is_activated() && e.card_gen() != generation);
 }
 
 #[test]
@@ -255,7 +254,7 @@ fn ccid_chain_begin_is_not_a_complete_apdu() {
 #[test]
 fn oversized_block_is_not_sent_to_reader() {
     let mut e = engine(CcidExchangeLevel::ShortApdu);
-    let data = Zeroizing::new(vec![ZERO; e.max_payload_length + BYTE_STEP]);
+    let data = Zeroizing::new(vec![ZERO; e.max_payload_length() + BYTE_STEP]);
     let t = start(
         &mut e,
         Operation::TransferBlock {
@@ -433,7 +432,7 @@ fn malformed_atr_on_reset_fails_and_revokes_activation() {
         .push_back(Ok(data_frame(ONE, &[TS_DIRECT, TD_FOLLOWS, ONE])));
     let mut t = transport(h, CcidExchangeLevel::ShortApdu, CardProtocol::T0);
     assert!(t.reset().is_err());
-    assert!(!t.engine().activated);
+    assert!(!t.engine().is_activated());
 }
 
 #[test]
@@ -559,7 +558,7 @@ fn short_bulk_out_write_requires_recovery() {
             transferred: usize::from(ZERO),
         }),
     );
-    assert!(e.needs_recovery);
+    assert!(e.needs_recovery());
     assert!(
         transition
             .actions
@@ -576,7 +575,7 @@ fn malformed_response_requires_recovery() {
         NOW,
         InputEvent::IoCompleted(IoCompletion::BulkIn(vec![ZERO; 5])),
     );
-    assert!(e.needs_recovery);
+    assert!(e.needs_recovery());
 }
 
 #[test]
@@ -600,7 +599,7 @@ fn invalid_chain_transition_requires_recovery() {
             &[SW_OK, ZERO],
         ))),
     );
-    assert!(e.needs_recovery);
+    assert!(e.needs_recovery());
     assert!(transition.actions.iter().any(|a| matches!(
         a,
         Action::Complete {
@@ -629,4 +628,18 @@ fn atr2_classified_as_t0_despite_global_interface_bytes() {
     if let Ok(parsed) = refineid_atr::Atr::new(atr2_bytes) {
         assert_eq!(CardProtocol::from_atr(&parsed), CardProtocol::T0);
     }
+}
+
+#[test]
+fn connect_rejects_out_of_range_slot() {
+    let desc = descriptor(CcidExchangeLevel::ShortApdu);
+    let h = Host::default();
+    let err = CcidCardTransport::connect(h, &desc, ZERO, ONE, BULK_OUT, BULK_IN).err();
+    assert_eq!(
+        err,
+        Some(CcidError::UnexpectedSlot {
+            expected: ZERO,
+            actual: ONE,
+        })
+    );
 }

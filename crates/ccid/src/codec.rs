@@ -625,6 +625,43 @@ pub fn decode_interrupt_slot_change(
     })
 }
 
+/// Decoded hardware error notification from Interrupt-IN endpoint (USB-IF CCID Rev 1.1 §6.3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HardwareErrorNotification {
+    /// Slot number where the hardware error occurred.
+    pub slot: u8,
+    /// Sequence number of bulk-OUT command that generated the error.
+    pub seq: u8,
+    /// Hardware error code reported by reader.
+    pub hardware_error_code: u8,
+}
+
+/// Decode an Interrupt-IN `RDR_to_PC_HardwareError` packet (USB-IF CCID Rev 1.1 §6.3.2).
+///
+/// # Errors
+/// Returns `CcidError` if the packet is too short or not a hardware error notification.
+pub fn decode_interrupt_hardware_error(
+    frame: &[u8],
+) -> Result<HardwareErrorNotification, CcidError> {
+    if frame.is_empty() {
+        return Err(CcidError::TruncatedHeader);
+    }
+    if frame[0] != RDR_TO_PC_HARDWARE_ERROR {
+        return Err(CcidError::UnexpectedMessageType {
+            expected: RDR_TO_PC_HARDWARE_ERROR,
+            actual: frame[0],
+        });
+    }
+    if frame.len() < 4 {
+        return Err(CcidError::LengthMismatch);
+    }
+    Ok(HardwareErrorNotification {
+        slot: frame[1],
+        seq: frame[2],
+        hardware_error_code: frame[3],
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -910,5 +947,14 @@ mod tests {
         assert!(!notif.has_slot_changed(0));
         assert!(!notif.is_card_present(1));
         assert!(notif.has_slot_changed(1));
+    }
+
+    #[test]
+    fn decode_interrupt_hardware_error_packet() {
+        let packet = [RDR_TO_PC_HARDWARE_ERROR, 0x02, 0x07, 0x01];
+        let notif = decode_interrupt_hardware_error(&packet).expect("valid hardware error");
+        assert_eq!(notif.slot, 2);
+        assert_eq!(notif.seq, 7);
+        assert_eq!(notif.hardware_error_code, 1);
     }
 }

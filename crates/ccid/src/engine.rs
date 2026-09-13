@@ -20,9 +20,10 @@
 use crate::codec::{
     CCID_CONTROL_REQUEST_ABORT, CCID_CONTROL_REQUEST_TYPE, CCID_HEADER_SIZE,
     CHAIN_COMMAND_CONTINUATION_EXPECTED, MAX_RESPONSE_PAYLOAD_SIZE, RDR_TO_PC_DATA_BLOCK,
-    RDR_TO_PC_PARAMETERS, RDR_TO_PC_SLOT_STATUS, decode_interrupt_slot_change, decode_response,
-    encode_abort, encode_get_parameters, encode_get_slot_status, encode_icc_power_off,
-    encode_icc_power_on, encode_set_parameters_t0, encode_xfr_block,
+    RDR_TO_PC_HARDWARE_ERROR, RDR_TO_PC_PARAMETERS, RDR_TO_PC_SLOT_STATUS,
+    decode_interrupt_hardware_error, decode_interrupt_slot_change, decode_response, encode_abort,
+    encode_get_parameters, encode_get_slot_status, encode_icc_power_off, encode_icc_power_on,
+    encode_set_parameters_t0, encode_xfr_block,
 };
 use crate::descriptor::{CcidExchangeLevel, CcidFunctionalDescriptor};
 use crate::error::CcidError;
@@ -31,6 +32,9 @@ use zeroize::Zeroizing;
 
 /// Default timeout for CCID engine operations in milliseconds.
 pub const DEFAULT_ENGINE_TIMEOUT_MS: u64 = 5000;
+
+/// Maximum attempts to drain stale Bulk-IN packets following an abort handshake (CCID Rev 1.1 §5.3.1).
+pub const MAX_ABORT_DRAIN_ATTEMPTS: u8 = 5;
 
 /// Opaque identifier for a logical operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -366,37 +370,36 @@ impl Transition {
 /// Pure deterministic CCID protocol engine for a single CCID slot.
 pub struct CcidEngine {
     /// Hardware interface index.
-    pub interface_number: u8,
+    interface_number: u8,
     /// Physical CCID slot index (`bSlot`).
-    pub b_slot: u8,
+    b_slot: u8,
     /// Monotonically increasing card generation (bumped on card removal/replacement).
-    pub card_gen: u64,
+    card_gen: u64,
     /// Monotonically increasing connection generation.
-    pub connection_gen: u64,
+    connection_gen: u64,
     /// Next CCID sequence number (0..=255).
-    pub next_seq: u8,
+    next_seq: u8,
     /// Whether a card is currently physically present in the slot.
-    pub card_present: bool,
+    card_present: bool,
     /// Whether the card has completed ATR power-on activation.
-    pub activated: bool,
+    activated: bool,
     /// Whether the underlying USB CCID device connection is alive.
-    pub connected: bool,
+    connected: bool,
     /// Whether a timeout or desync occurred requiring slot abort recovery.
-    pub needs_recovery: bool,
+    needs_recovery: bool,
     /// Negotiated exchange level from descriptor.
-    pub exchange_level: CcidExchangeLevel,
+    exchange_level: CcidExchangeLevel,
     /// Maximum CCID message length.
-    pub max_message_length: usize,
+    max_message_length: usize,
     /// Maximum APDU/TPDU payload length supported by reader.
-    pub max_payload_length: usize,
+    max_payload_length: usize,
     /// Maximum slot index for multi-slot notifications.
-    pub max_slot_index: u8,
+    max_slot_index: u8,
 
     // Internal state tracking
     pending_op: Option<(OperationId, PendingOperation)>,
     expected_response_type: u8,
     expected_seq: u8,
-    last_issued_seq: u8,
     expected_bulk_out_len: usize,
     active_deadline_id: u64,
     current_deadline: Option<Deadline>,
@@ -426,7 +429,6 @@ impl core::fmt::Debug for CcidEngine {
             .field("pending_op", &self.pending_op)
             .field("expected_response_type", &self.expected_response_type)
             .field("expected_seq", &self.expected_seq)
-            .field("last_issued_seq", &self.last_issued_seq)
             .field("expected_bulk_out_len", &self.expected_bulk_out_len)
             .field("active_deadline_id", &self.active_deadline_id)
             .field("current_deadline", &self.current_deadline)
@@ -465,7 +467,6 @@ impl CcidEngine {
             pending_op: None,
             expected_response_type: 0,
             expected_seq: 0,
-            last_issued_seq: 0,
             expected_bulk_out_len: 0,
             active_deadline_id: 0,
             current_deadline: None,
@@ -475,6 +476,97 @@ impl CcidEngine {
             abort_drain_count: 0,
             waiting_unit_ms: 1000,
         }
+    }
+
+    /// USB interface number for control transfers.
+    #[must_use]
+    pub const fn interface_number(&self) -> u8 {
+        self.interface_number
+    }
+
+    /// Target slot number on the reader.
+    #[must_use]
+    pub const fn b_slot(&self) -> u8 {
+        self.b_slot
+    }
+
+    /// Monotonically increasing card generation (bumped on card removal/replacement).
+    #[must_use]
+    pub const fn card_gen(&self) -> u64 {
+        self.card_gen
+    }
+
+    /// Monotonically increasing connection generation.
+    #[must_use]
+    pub const fn connection_gen(&self) -> u64 {
+        self.connection_gen
+    }
+
+    /// Next command sequence number to assign.
+    #[must_use]
+    pub const fn next_seq(&self) -> u8 {
+        self.next_seq
+    }
+
+    /// Whether smart card presence is currently indicated.
+    #[must_use]
+    pub const fn is_card_present(&self) -> bool {
+        self.card_present
+    }
+
+    /// Whether the smart card is powered and activated.
+    #[must_use]
+    pub const fn is_activated(&self) -> bool {
+        self.activated
+    }
+
+    /// Sets card activation state (and updates presence accordingly).
+    pub fn set_activated(&mut self, activated: bool) {
+        self.activated = activated;
+        if activated {
+            self.card_present = true;
+        }
+    }
+
+    /// Mark the card as deactivated.
+    pub fn mark_deactivated(&mut self) {
+        self.activated = false;
+    }
+
+    /// Whether the underlying USB CCID device connection is alive.
+    #[must_use]
+    pub const fn is_connected(&self) -> bool {
+        self.connected
+    }
+
+    /// Whether a timeout or desync occurred requiring slot abort recovery.
+    #[must_use]
+    pub const fn needs_recovery(&self) -> bool {
+        self.needs_recovery
+    }
+
+    /// Negotiated exchange level from descriptor.
+    #[must_use]
+    pub const fn exchange_level(&self) -> CcidExchangeLevel {
+        self.exchange_level
+    }
+
+    /// Maximum CCID message length.
+    #[must_use]
+    pub const fn max_message_length(&self) -> usize {
+        self.max_message_length
+    }
+
+    /// Maximum APDU/TPDU payload length supported by reader.
+    #[must_use]
+    pub const fn max_payload_length(&self) -> usize {
+        self.max_payload_length
+    }
+
+    /// Maximum slot index for multi-slot notifications.
+    #[must_use]
+    pub const fn max_slot_index(&self) -> u8 {
+        self.max_slot_index
     }
 
     /// Configure base waiting unit in milliseconds for time-extension calculations (CCID Rev 1.1 §6.2.6).
@@ -487,16 +579,7 @@ impl CcidEngine {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
         self.expected_seq = seq;
-        self.last_issued_seq = seq;
         seq
-    }
-
-    /// Returns the sequence number of the currently active or last issued command.
-    ///
-    /// Before any command has been issued, this returns 0 (the initial sequence number).
-    #[must_use]
-    pub const fn last_sequence_number(&self) -> u8 {
-        self.last_issued_seq
     }
 
     /// Primary state transition driver.
@@ -506,7 +589,25 @@ impl CcidEngine {
 
         match event {
             InputEvent::InterruptReceived(raw_bytes) => {
-                if let Ok(notification) =
+                if raw_bytes.first() == Some(&RDR_TO_PC_HARDWARE_ERROR) {
+                    if let Ok(hw_err) = decode_interrupt_hardware_error(&raw_bytes)
+                        && hw_err.slot == self.b_slot
+                    {
+                        self.needs_recovery = true;
+                        self.card_present = false;
+                        self.activated = false;
+                        self.current_deadline = None;
+                        if let Some((op_id, _)) = self.pending_op.take() {
+                            actions.push(Action::CancelTransfers);
+                            actions.push(Action::Complete {
+                                id: op_id,
+                                result: Err(CcidError::Io(
+                                    "CCID hardware error notification received".into(),
+                                )),
+                            });
+                        }
+                    }
+                } else if let Ok(notification) =
                     decode_interrupt_slot_change(&raw_bytes, self.max_slot_index)
                 {
                     let present = notification.is_card_present(self.b_slot);
@@ -580,7 +681,7 @@ impl CcidEngine {
                 {
                     actions.push(Action::Complete {
                         id,
-                        result: Err(CcidError::ApduTooLong(data.len())),
+                        result: Err(CcidError::ApduTooLong),
                     });
                     return Transition {
                         actions,
@@ -1031,7 +1132,7 @@ impl CcidEngine {
                         }
                         Err(e) => {
                             if matches!(pending, PendingOperation::Abort)
-                                && self.abort_drain_count < 5
+                                && self.abort_drain_count < MAX_ABORT_DRAIN_ATTEMPTS
                             {
                                 self.abort_drain_count = self.abort_drain_count.saturating_add(1);
                                 self.pending_op = Some((op_id, pending));
@@ -1796,5 +1897,41 @@ mod tests {
                 result: Err(CcidError::Cancelled),
             }
         );
+    }
+
+    #[test]
+    fn hardware_error_interrupt_revokes_card_and_requires_recovery() {
+        let desc = make_test_descriptor();
+        let mut engine = CcidEngine::new(0, 0, 1, &desc);
+        engine.card_present = true;
+        engine.activated = true;
+
+        let op_id = OperationId(102);
+        let _ = engine.step(
+            MonotonicTime(300),
+            InputEvent::Start {
+                id: op_id,
+                op: Operation::GetSlotStatus,
+            },
+        );
+
+        let hw_err_packet = [RDR_TO_PC_HARDWARE_ERROR, 0, 1, 0x42];
+        let t = engine.step(
+            MonotonicTime(310),
+            InputEvent::InterruptReceived(hw_err_packet.to_vec()),
+        );
+
+        assert!(engine.needs_recovery());
+        assert!(!engine.is_card_present());
+        assert!(!engine.is_activated());
+        assert_eq!(t.actions.len(), 2);
+        assert_eq!(t.actions[0], Action::CancelTransfers);
+        assert!(matches!(
+            t.actions[1],
+            Action::Complete {
+                id,
+                result: Err(CcidError::Io(_))
+            } if id == op_id
+        ));
     }
 }

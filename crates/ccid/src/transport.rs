@@ -170,6 +170,12 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
         bulk_out_endpoint: u8,
         bulk_in_endpoint: u8,
     ) -> Result<Self, CcidError> {
+        if b_slot > descriptor.max_slot_index() {
+            return Err(CcidError::UnexpectedSlot {
+                expected: descriptor.max_slot_index(),
+                actual: b_slot,
+            });
+        }
         let engine = CcidEngine::new(interface_number, b_slot, 1, descriptor);
         let mut transport = Self {
             host,
@@ -177,6 +183,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
             descriptor: descriptor.clone(),
             bulk_out_endpoint,
             bulk_in_endpoint,
+            // Transient placeholder ATR; immediately overwritten by the real parsed ATR from PowerOn below.
             atr: Atr::new([0x3B, 0x00])?,
             protocol: CardProtocol::T0,
             next_op_id: 1,
@@ -190,7 +197,20 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
         match res {
             OperationResult::PowerOn(atr_bytes) => {
                 let parsed = Atr::new(&atr_bytes)?;
-                transport.protocol = CardProtocol::from_atr(&parsed);
+                let proto = CardProtocol::from_atr(&parsed);
+                match proto {
+                    CardProtocol::T0 => {
+                        if !descriptor.supports_t0() {
+                            return Err(CcidError::UnsupportedProtocol);
+                        }
+                    }
+                    CardProtocol::T1 => {
+                        if !descriptor.supports_t1() {
+                            return Err(CcidError::UnsupportedProtocol);
+                        }
+                    }
+                }
+                transport.protocol = proto;
                 transport.configure_parameters(&parsed)?;
                 transport.atr = parsed;
                 Ok(transport)
@@ -332,7 +352,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
     /// # Errors
     /// Returns `CcidError` if the abort or card power cycle fails.
     pub fn reset(&mut self) -> Result<Vec<u8>, CcidError> {
-        if self.engine.needs_recovery {
+        if self.engine.needs_recovery() {
             self.abort()?;
         }
         let _ = self.execute_op(Operation::PowerOff);
@@ -342,14 +362,27 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
         match res {
             OperationResult::PowerOn(atr_bytes) => match Atr::new(&atr_bytes) {
                 Ok(parsed) => {
-                    self.protocol = CardProtocol::from_atr(&parsed);
+                    let proto = CardProtocol::from_atr(&parsed);
+                    match proto {
+                        CardProtocol::T0 => {
+                            if !self.descriptor.supports_t0() {
+                                return Err(CcidError::UnsupportedProtocol);
+                            }
+                        }
+                        CardProtocol::T1 => {
+                            if !self.descriptor.supports_t1() {
+                                return Err(CcidError::UnsupportedProtocol);
+                            }
+                        }
+                    }
+                    self.protocol = proto;
                     self.configure_parameters(&parsed)?;
                     let wire = parsed.to_wire_bytes();
                     self.atr = parsed;
                     Ok(wire)
                 }
                 Err(e) => {
-                    self.engine.activated = false;
+                    self.engine.mark_deactivated();
                     Err(CcidError::from(e))
                 }
             },
@@ -546,7 +579,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                 let get_resp_bytes = prepare_command_bytes(
                     get_resp.as_bytes(),
                     self.protocol,
-                    self.engine.exchange_level,
+                    self.engine.exchange_level(),
                 )?;
                 let chain_op = Operation::TransferBlock {
                     b_wi: 0,
@@ -617,7 +650,7 @@ impl<H: UsbHostTransport> CardTransport for CcidCardTransport<H> {
         let prepared = prepare_command_bytes(
             command.as_bytes(),
             self.protocol,
-            self.engine.exchange_level,
+            self.engine.exchange_level(),
         )?;
         let outcome = self.run_exchange(&prepared)?;
 
@@ -629,7 +662,7 @@ impl<H: UsbHostTransport> CardTransport for CcidCardTransport<H> {
             let retry_bytes = prepare_command_bytes(
                 corrected.as_bytes(),
                 self.protocol,
-                self.engine.exchange_level,
+                self.engine.exchange_level(),
             )?;
             return self.run_exchange(&retry_bytes);
         }
@@ -643,7 +676,7 @@ impl<H: UsbHostTransport> CardTransport for CcidCardTransport<H> {
     ) -> Result<TransportOutcome, Self::Error> {
         command.expose_wire(|wire| {
             let mut prepared =
-                prepare_command_bytes(wire, self.protocol, self.engine.exchange_level)?;
+                prepare_command_bytes(wire, self.protocol, self.engine.exchange_level())?;
             let outcome = self.run_exchange(&prepared);
             prepared.zeroize();
             outcome
@@ -1098,7 +1131,7 @@ mod tests {
         transport.host_mut().push_reply(Err(CcidError::Timeout));
         let res = transport.execute_op(Operation::GetSlotStatus);
         assert_eq!(res, Err(CcidError::Timeout));
-        assert!(transport.engine().needs_recovery);
+        assert!(transport.engine().needs_recovery());
 
         // Subsequent reset should issue control abort, bulk abort, then PowerOff and PowerOn
         let fresh_atr = [0x3B, 0x01, 0x42];
@@ -1114,6 +1147,6 @@ mod tests {
 
         let new_atr = transport.reset().expect("reset succeeds with auto-abort");
         assert_eq!(new_atr, fresh_atr);
-        assert!(!transport.engine().needs_recovery);
+        assert!(!transport.engine().needs_recovery());
     }
 }

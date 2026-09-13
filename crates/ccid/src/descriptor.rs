@@ -52,6 +52,11 @@ pub const MAXIMUM_MESSAGE_LENGTH_OFFSET: usize = 44;
 /// Byte offset of `bMaxSlotIndex` in CCID functional descriptor.
 pub const MAX_SLOT_INDEX_OFFSET: usize = 4;
 
+/// Protocol T=0 bit in `dwProtocols` (USB-IF CCID Rev 1.1 §5.1 Table 5-1).
+pub const PROTOCOL_T0: u32 = 0x0000_0001;
+/// Protocol T=1 bit in `dwProtocols` (USB-IF CCID Rev 1.1 §5.1 Table 5-1).
+pub const PROTOCOL_T1: u32 = 0x0000_0002;
+
 /// Feature flag: Automatic parameter configuration based on ATR (USB-IF CCID Rev 1.1 §5.1 Table 5-1 bit 1).
 pub const AUTOMATIC_PARAMETER_CONFIGURATION: u32 = 0x0000_0002;
 /// Feature flag: Automatic activation of ICC on connect (USB-IF CCID Rev 1.1 §5.1 Table 5-1 bit 2).
@@ -183,13 +188,13 @@ impl CcidFunctionalDescriptor {
     /// Whether reader advertises T=0 support in `dwProtocols`.
     #[must_use]
     pub const fn supports_t0(&self) -> bool {
-        (self.protocols & 0x01) != 0
+        (self.protocols & PROTOCOL_T0) != 0
     }
 
     /// Whether reader advertises T=1 support in `dwProtocols`.
     #[must_use]
     pub const fn supports_t1(&self) -> bool {
-        (self.protocols & 0x02) != 0
+        (self.protocols & PROTOCOL_T1) != 0
     }
 
     /// Whether automatic parameter configuration is enabled in `dwFeatures`.
@@ -219,6 +224,10 @@ impl CcidFunctionalDescriptor {
             bytes[PROTOCOLS_OFFSET + 2],
             bytes[PROTOCOLS_OFFSET + 3],
         ]);
+
+        if (protocols & (PROTOCOL_T0 | PROTOCOL_T1)) == 0 {
+            return Err(CcidError::UnsupportedProtocol);
+        }
 
         let features = u32::from_le_bytes([
             bytes[FEATURES_OFFSET],
@@ -441,6 +450,15 @@ mod tests {
         assert_eq!(
             CcidFunctionalDescriptor::parse_functional_descriptor(&bytes),
             Err(CcidError::UnsupportedExchangeLevel)
+        );
+    }
+
+    #[test]
+    fn reject_descriptor_with_no_protocols() {
+        let bytes = build_test_ccid_descriptor(SHORT_APDU_EXCHANGE, 300, 0, 0, 0);
+        assert_eq!(
+            CcidFunctionalDescriptor::parse_functional_descriptor(&bytes),
+            Err(CcidError::UnsupportedProtocol)
         );
     }
 

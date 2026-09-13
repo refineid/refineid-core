@@ -84,6 +84,14 @@ pub const OBJ_CA_ROOT_ECC: CkObjectHandle = 8;
 pub const OBJ_CA_ROOT_RSA: CkObjectHandle = 9;
 
 /// SHA-256 fingerprint constants for authentic DVV intermediate and root CA certificates.
+/// Citing DVV (Digital and Population Data Services Agency) published certificate profiles
+/// and test fixtures in `crates/pkcs11/ca-certs/*.der`:
+/// - DVV Citizen Certificates - G4E (`fineid-intermediate-01-citizen-g4e.der`)
+/// - DVV Citizen Certificates - G4R (`fineid-intermediate-02-citizen-g4r.der`)
+/// - VRK Gov. CA for Citizen Certificates - G3 (`fineid-intermediate-00-citizen-g3.der`)
+/// - DVV Organisational Certificates - G4R (`fineid-intermediate-03-organisation-g4r.der`)
+/// - DVV Gov. Root CA - G3 ECC (`dvv-gov-root-ca-g3-ecc.der`)
+/// - DVV Gov. Root CA - G3 RSA (`dvv-gov-root-ca-g3-rsa.der`)
 const PINNED_DVV_CA_CITIZEN_G4E: [u8; 32] = [
     0xaa, 0xd1, 0xbe, 0xac, 0x46, 0x96, 0x10, 0x2a, 0x88, 0xbf, 0x9d, 0x51, 0x8d, 0x64, 0xf8, 0xb0,
     0x14, 0xf7, 0x8f, 0x9b, 0x15, 0x25, 0x79, 0xc9, 0x59, 0x99, 0x83, 0x13, 0x19, 0x79, 0x24, 0xd7,
@@ -165,17 +173,17 @@ pub enum ObjectKind {
     PublicKey,
     /// The authentication private key ([`CKO_PRIVATE_KEY`]).
     PrivateKey,
-    /// Embedded CA: DVV Citizen Certificates - G4E
+    /// Pinned DVV CA: DVV Citizen Certificates - G4E
     CaCitizenG4e,
-    /// Embedded CA: DVV Citizen Certificates - G4R
+    /// Pinned DVV CA: DVV Citizen Certificates - G4R
     CaCitizenG4r,
-    /// Embedded CA: VRK Gov. CA for Citizen Certificates - G3
+    /// Pinned DVV CA: VRK Gov. CA for Citizen Certificates - G3
     CaCitizenG3,
-    /// Embedded CA: DVV Organisational Certificates - G4R
+    /// Pinned DVV CA: DVV Organisational Certificates - G4R
     CaOrgG4r,
-    /// Embedded CA: DVV Gov. Root CA - G3 ECC
+    /// Pinned DVV CA: DVV Gov. Root CA - G3 ECC
     CaRootEcc,
-    /// Embedded CA: DVV Gov. Root CA - G3 RSA
+    /// Pinned DVV CA: DVV Gov. Root CA - G3 RSA
     CaRootRsa,
 }
 
@@ -353,7 +361,7 @@ impl CaObject {
 
 /// An invariant-preserving trust store that guarantees:
 /// 1. Zero duplicate certificates (enforced at insertion by DER comparison).
-/// 2. Deterministic precedence (on-card overrides static anchor).
+/// 2. Cryptographic identity mapping via pinned DVV CA fingerprints.
 /// 3. Total operations — no indexing panics, no out-of-bounds states.
 #[derive(Debug, Default, Clone)]
 pub struct RefinedTrustStore {
@@ -593,8 +601,8 @@ fn non_empty(bytes: &[u8]) -> Option<&[u8]> {
 
 impl TokenObjects {
     /// Build token objects from the card's leaf authentication certificate
-    /// DER bytes. Loads and verifies all embedded intermediate and root CA
-    /// trust anchors.
+    /// DER bytes. Initializes an empty trust store populated dynamically from
+    /// persisted cache and on-card CA slots.
     ///
     /// # Errors
     /// [`CKR_DEVICE_ERROR`] if the DER does not parse or the key
@@ -997,12 +1005,12 @@ fn is_cert_valid(cert: &OwnedCert) -> bool {
     view.not_before.unix_duration() <= now && now < view.not_after.unix_duration()
 }
 
-/// Check if a certificate is an authentic CA (matches a pinned DVV CA or has basicConstraints CA: true).
+/// Check if a certificate is an authentic CA (matches a pinned DVV CA root or intermediate).
 fn is_authentic_ca(cert: &OwnedCert) -> bool {
     let der = cert.as_der();
     let fp = refineid_digest::Sha256::of(der);
     let fp_bytes = fp.as_bytes();
-    let is_pinned = [
+    [
         PINNED_DVV_CA_CITIZEN_G4E,
         PINNED_DVV_CA_CITIZEN_G4R,
         PINNED_DVV_CA_CITIZEN_G3,
@@ -1011,13 +1019,7 @@ fn is_authentic_ca(cert: &OwnedCert) -> bool {
         PINNED_DVV_CA_ROOT_RSA,
     ]
     .iter()
-    .any(|pinned| pinned == fp_bytes);
-    if is_pinned {
-        return true;
-    }
-    cert.view()
-        .extensions
-        .is_some_and(|exts| refineid_cms::x509::extract_basic_constraints(exts).ca)
+    .any(|pinned| pinned == fp_bytes)
 }
 
 const MAX_CA_CERTS: usize = 16;
@@ -1894,5 +1896,40 @@ mod tests {
         assert!(!objects.object_exists(ObjectKind::CaRootEcc));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn all_six_pinned_dvv_fingerprints_match_published_fixtures() {
+        let fixtures: [(&[u8], [u8; 32]); 6] = [
+            (
+                include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der"),
+                super::PINNED_DVV_CA_CITIZEN_G4E,
+            ),
+            (
+                include_bytes!("../ca-certs/fineid-intermediate-02-citizen-g4r.der"),
+                super::PINNED_DVV_CA_CITIZEN_G4R,
+            ),
+            (
+                include_bytes!("../ca-certs/fineid-intermediate-00-citizen-g3.der"),
+                super::PINNED_DVV_CA_CITIZEN_G3,
+            ),
+            (
+                include_bytes!("../ca-certs/fineid-intermediate-03-organisation-g4r.der"),
+                super::PINNED_DVV_CA_ORG_G4R,
+            ),
+            (
+                include_bytes!("../ca-certs/dvv-gov-root-ca-g3-ecc.der"),
+                super::PINNED_DVV_CA_ROOT_ECC,
+            ),
+            (
+                include_bytes!("../ca-certs/dvv-gov-root-ca-g3-rsa.der"),
+                super::PINNED_DVV_CA_ROOT_RSA,
+            ),
+        ];
+
+        for (der, expected_fp) in fixtures {
+            let fp = refineid_digest::Sha256::of(der);
+            assert_eq!(fp.as_bytes(), &expected_fp);
+        }
     }
 }

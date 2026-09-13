@@ -596,6 +596,7 @@ impl CcidEngine {
                         self.needs_recovery = true;
                         self.card_present = false;
                         self.activated = false;
+                        self.card_gen = self.card_gen.wrapping_add(1);
                         self.current_deadline = None;
                         if let Some((op_id, _)) = self.pending_op.take() {
                             actions.push(Action::CancelTransfers);
@@ -1905,6 +1906,7 @@ mod tests {
         let mut engine = CcidEngine::new(0, 0, 1, &desc);
         engine.card_present = true;
         engine.activated = true;
+        let initial_gen = engine.card_gen();
 
         let op_id = OperationId(102);
         let _ = engine.step(
@@ -1924,6 +1926,7 @@ mod tests {
         assert!(engine.needs_recovery());
         assert!(!engine.is_card_present());
         assert!(!engine.is_activated());
+        assert_eq!(engine.card_gen(), initial_gen + 1);
         assert_eq!(t.actions.len(), 2);
         assert_eq!(t.actions[0], Action::CancelTransfers);
         assert!(matches!(

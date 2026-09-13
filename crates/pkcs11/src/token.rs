@@ -606,7 +606,8 @@ impl TokenObjects {
             CKA_TOKEN => Some(bool_attr(CK_TRUE)),
             // Token CA certificates are intermediate path-building candidates for NSS
             // client-certificate TLS authentication, not ambient trust anchors for
-            // server verification (PKCS#11 v2.40 §4.4: CKA_TRUSTED).
+            // server verification (PKCS#11 v2.40 §4.4: CKA_TRUSTED; NSS lib/pk11wrap/pk11cert.c
+            // imports token certificates into its session cache without requiring CKA_TRUSTED).
             CKA_PRIVATE | CKA_TRUSTED => Some(bool_attr(CK_FALSE)),
             CKA_LABEL => Some(AttrValue::Borrowed(ca.label_bytes())),
             CKA_ID => Some(AttrValue::Borrowed(ca.id_bytes())),
@@ -868,6 +869,10 @@ impl TokenObjects {
 /// lists (ACLs) to prevent unauthorized modification of cached CA certificates
 /// by other users. Local attackers possessing access to the user profile are
 /// out of scope.
+///
+/// The cache is shared across all identity cards inserted for this user profile
+/// and seeded across sessions. Cached certificates are untrusted intermediates
+/// (served with `CKA_TRUSTED = CK_FALSE`), never ambient trust anchors.
 fn persistent_ca_dir() -> Option<std::path::PathBuf> {
     if let Ok(dir) = std::env::var("REFINEID_CA_CACHE_DIR")
         && !dir.is_empty()
@@ -1120,6 +1125,13 @@ pub(super) fn build_token_objects(reader_name: &str) -> Result<TokenObjects, CkR
     }
 
     let leaf_issuer = objects.auth_cert.view().issuer;
+    // Skip on-card CA reads when a cached CA already matches the leaf certificate's
+    // issuer DN. This rests on two assumptions:
+    // (a) Matching issuer DN identifies the necessary issuing CA chain element.
+    //     (A re-issued CA with the same DN but a different key would serve the cached
+    //     intermediate until its expiration).
+    // (b) Presence of the issuing intermediate implies the root CA is also cached,
+    //     as both slots are persisted as a pair and roots outlive intermediates.
     let has_leaf_issuer = cas
         .iter()
         .any(|ca| ca.view().subject.as_der() == leaf_issuer.as_der());
@@ -2011,7 +2023,7 @@ mod tests {
             ObjectKind::from_handle(super::OBJ_CA_BASE + 1),
             Some(ObjectKind::Ca(1))
         );
-        assert_eq!(ObjectKind::from_handle(0), None);
+        assert_eq!(ObjectKind::from_handle(crate::ck::CK_INVALID_HANDLE), None);
         assert_eq!(ObjectKind::Ca(0).handle(), super::OBJ_CA_BASE);
         assert_eq!(ObjectKind::Ca(1).handle(), super::OBJ_CA_BASE + 1);
 

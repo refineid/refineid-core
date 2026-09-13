@@ -427,23 +427,51 @@ pub trait PinOps: CardTransport {
     /// # Errors
     ///
     /// [`AuthError`] on a transport failure or state transition.
-    fn resolve_pin_reference_scheme(&mut self) -> Result<PinReferenceScheme, AuthError<Self::Error>>
+    /// Probe PIN1 retry state and resolve the card's credential numbering in a
+    /// single counter-safe probe when the card uses the citizen numbering.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError`] on a transport failure or state transition.
+    fn pin1_status_and_scheme(
+        &mut self,
+    ) -> Result<(PinReferenceScheme, PinStatus), AuthError<Self::Error>>
     where
         Self: Sized,
     {
         let citizen = self.probe_status_word(PinReferenceScheme::Citizen, PinSlot::Pin1)?;
         if citizen != StatusWord::ReferenceDataNotFound {
-            return Ok(PinReferenceScheme::Citizen);
+            return Ok((PinReferenceScheme::Citizen, classify_pin_status_sw(citizen)));
         }
         let organizational =
             self.probe_status_word(PinReferenceScheme::Organizational, PinSlot::Pin1)?;
-        match classify_pin_status_sw(organizational) {
-            PinStatus::Other(_) => Ok(PinReferenceScheme::Citizen),
+        let status = classify_pin_status_sw(organizational);
+        match status {
+            PinStatus::Other(_) => {
+                Ok((PinReferenceScheme::Citizen, classify_pin_status_sw(citizen)))
+            }
             PinStatus::Verified
             | PinStatus::Remaining(_)
             | PinStatus::NoInfo
-            | PinStatus::Locked => Ok(PinReferenceScheme::Organizational),
+            | PinStatus::Locked => Ok((PinReferenceScheme::Organizational, status)),
         }
+    }
+
+    /// Resolve the card's credential numbering with a counter-safe
+    /// probe. The citizen numbering is tried first; a
+    /// reference-not-found answer re-probes under the organizational
+    /// numbering, and a recognized state there settles it as
+    /// organizational. Nothing but the card is trusted, and no counter
+    /// is touched.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError`] on a transport failure or state transition.
+    fn resolve_pin_reference_scheme(&mut self) -> Result<PinReferenceScheme, AuthError<Self::Error>>
+    where
+        Self: Sized,
+    {
+        self.pin1_status_and_scheme().map(|(scheme, _)| scheme)
     }
 
     /// Probe the retry state of a slot without decrementing any counter,
@@ -456,8 +484,12 @@ pub trait PinOps: CardTransport {
     where
         Self: Sized,
     {
-        let scheme = self.resolve_pin_reference_scheme()?;
-        self.pin_status_with_scheme(scheme, slot)
+        if slot == PinSlot::Pin1 {
+            self.pin1_status_and_scheme().map(|(_, status)| status)
+        } else {
+            let scheme = self.resolve_pin_reference_scheme()?;
+            self.pin_status_with_scheme(scheme, slot)
+        }
     }
 
     /// Probe the retry state of a slot under an explicit numbering.

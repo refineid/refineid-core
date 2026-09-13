@@ -928,24 +928,30 @@ fn persistent_ca_dir() -> Option<std::path::PathBuf> {
 const MAX_CA_CERTS: usize = 16;
 const MAX_CA_CERT_BYTES: u64 = 65536;
 
-/// Check if an X.509 certificate's validity window is currently valid (fail closed).
+/// Check if an X.509 certificate's validity window includes `now` (fail closed).
 ///
 /// Citing RFC 5280 §4.1.2.5: "The validity period for a certificate is the period
 /// of time from notBefore through notAfter, inclusive."
-fn is_cert_valid(cert: &OwnedCert) -> bool {
-    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
-        return false;
-    };
+fn is_cert_valid_at(cert: &OwnedCert, now: std::time::Duration) -> bool {
     let view = cert.view();
     view.not_before.unix_duration() <= now && now <= view.not_after.unix_duration()
 }
 
+/// Check if an X.509 certificate's validity window is currently valid (fail closed).
+fn is_cert_valid(cert: &OwnedCert) -> bool {
+    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return false;
+    };
+    is_cert_valid_at(cert, now)
+}
+
 /// Check if an X.509 certificate asserts certificate authority status via `BasicConstraints` CA:TRUE.
 ///
-/// Citing RFC 5280 §4.2.1.9: "The basic constraints extension serves to delimit the role
-/// of the certified public key and to identify certificate path lengths. If the cA boolean
-/// is not asserted, then the subject certificate MUST NOT be used to verify signatures on
-/// certificates."
+/// Citing RFC 5280 §4.2.1.9: "The cA boolean indicates whether the certified public key
+/// may be used to verify certificate signatures. ... If the basic constraints extension
+/// is not present in a version 3 certificate, or the extension is present but the cA
+/// boolean is not asserted, then the certified public key MUST NOT be used to verify
+/// certificate signatures."
 fn is_ca_cert(cert: &OwnedCert) -> bool {
     let view = cert.view();
     view.extensions
@@ -1108,25 +1114,32 @@ pub(super) fn build_token_objects(reader_name: &str) -> Result<TokenObjects, CkR
         .map_err(|_read_err| CKR_DEVICE_ERROR)?;
 
     let mut cas = load_persisted_ca_certs();
-    let on_card_cas: Vec<OwnedCert> = [CertSlot::IssuingCaEcc, CertSlot::RootCa]
-        .into_iter()
-        .filter_map(|slot| read_optional_ca_cert(&mut card, slot))
-        .filter(meets_ca_persistence_policy)
-        .collect();
-    for ca in &on_card_cas {
-        persist_ca_cert(ca);
-    }
-    for ca in on_card_cas {
-        if !cas.iter().any(|c| c.as_der() == ca.as_der()) {
-            cas.push(ca);
-        }
-    }
-    drop(card);
-
     let mut objects = TokenObjects::from_cert_der(cert.as_bytes().to_vec())?;
     if let Some(serial) = serial {
         objects.token_serial = serial;
     }
+
+    let leaf_issuer = objects.auth_cert.view().issuer;
+    let has_leaf_issuer = cas
+        .iter()
+        .any(|ca| ca.view().subject.as_der() == leaf_issuer.as_der());
+    if !has_leaf_issuer {
+        let on_card_cas: Vec<OwnedCert> = [CertSlot::IssuingCaEcc, CertSlot::RootCa]
+            .into_iter()
+            .filter_map(|slot| read_optional_ca_cert(&mut card, slot))
+            .filter(meets_ca_persistence_policy)
+            .collect();
+        for ca in &on_card_cas {
+            persist_ca_cert(ca);
+        }
+        for ca in on_card_cas {
+            if !cas.iter().any(|c| c.as_der() == ca.as_der()) {
+                cas.push(ca);
+            }
+        }
+    }
+    drop(card);
+
     for ca in cas {
         objects.push_ca_cert(ca);
     }
@@ -1863,22 +1876,27 @@ mod tests {
 
     #[test]
     fn leaf_cert_rejected_by_ca_policy() {
+        // BasicConstraints extension OID (2.5.29.19) DER OBJECT IDENTIFIER TLV
+        const BASIC_CONSTRAINTS_OID_DER: &[u8] = b"\x06\x03\x55\x1d\x13";
+        // Non-CA extension OID (2.5.29.20: CRL Number) DER OBJECT IDENTIFIER TLV
+        const NON_CA_EXTENSION_OID_DER: &[u8] = b"\x06\x03\x55\x1d\x14";
+
         const CA_DER: &[u8] = include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
         let mut leaf_der = CA_DER.to_vec();
-        // Replace BasicConstraints OID (2.5.29.19 -> 06 03 55 1d 13) with CRL Number (06 03 55 1d 14)
         let pos = leaf_der
-            .windows(5)
-            .position(|w| w == b"\x06\x03\x55\x1d\x13")
+            .windows(BASIC_CONSTRAINTS_OID_DER.len())
+            .position(|w| w == BASIC_CONSTRAINTS_OID_DER)
             .expect("BasicConstraints found");
         let rpos = leaf_der
-            .windows(5)
-            .rposition(|w| w == b"\x06\x03\x55\x1d\x13")
+            .windows(BASIC_CONSTRAINTS_OID_DER.len())
+            .rposition(|w| w == BASIC_CONSTRAINTS_OID_DER)
             .expect("BasicConstraints found");
         assert_eq!(
             pos, rpos,
             "BasicConstraints OID must appear uniquely in fixture"
         );
-        leaf_der[pos..pos + 5].copy_from_slice(b"\x06\x03\x55\x1d\x14");
+        leaf_der[pos..pos + BASIC_CONSTRAINTS_OID_DER.len()]
+            .copy_from_slice(NON_CA_EXTENSION_OID_DER);
 
         let leaf = OwnedCert::from_der(&leaf_der).expect("valid leaf cert DER");
         assert!(!super::is_ca_cert(&leaf));
@@ -1905,22 +1923,43 @@ mod tests {
 
     #[test]
     fn expired_ca_cert_purged_from_cache() {
+        use spki::der::Encode as _;
+        use spki::der::asn1::UtcTime;
+
         const CA_DER: &[u8] = include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+        let parsed_fixture = OwnedCert::from_der(CA_DER).expect("valid fixture DER");
+
+        // Dynamically encode the fixture's actual parsed notAfter as ASN.1 UTCTime TLV
+        let original_not_after_tlv = UtcTime::from_date_time(parsed_fixture.view().not_after)
+            .expect("valid fixture notAfter in UTCTime window")
+            .to_der()
+            .expect("UTCTime encodes");
+
+        // Construct an expired timestamp in the past (year 2020)
+        const EXPIRED_YEAR: u16 = 2020;
+        const EXPIRED_MONTH: u8 = 1;
+        const EXPIRED_DAY: u8 = 1;
+        let expired_dt =
+            spki::der::DateTime::new(EXPIRED_YEAR, EXPIRED_MONTH, EXPIRED_DAY, 0, 0, 0)
+                .expect("valid expired DateTime");
+        let expired_not_after_tlv = UtcTime::from_date_time(expired_dt)
+            .expect("valid expired notAfter in UTCTime window")
+            .to_der()
+            .expect("UTCTime encodes");
+        assert_eq!(original_not_after_tlv.len(), expired_not_after_tlv.len());
+
         let mut expired_der = CA_DER.to_vec();
-        // Replace 410520115123Z (2041) with 200101000000Z (2020)
+        let tlv_len = original_not_after_tlv.len();
         let pos = expired_der
-            .windows(13)
-            .position(|w| w == b"410520115123Z")
-            .expect("notAfter found in CA");
+            .windows(tlv_len)
+            .position(|w| w == original_not_after_tlv)
+            .expect("notAfter TLV found in CA");
         let rpos = expired_der
-            .windows(13)
-            .rposition(|w| w == b"410520115123Z")
-            .expect("notAfter found in CA");
-        assert_eq!(
-            pos, rpos,
-            "notAfter timestamp must appear uniquely in fixture"
-        );
-        expired_der[pos..pos + 13].copy_from_slice(b"200101000000Z");
+            .windows(tlv_len)
+            .rposition(|w| w == original_not_after_tlv)
+            .expect("notAfter TLV found in CA");
+        assert_eq!(pos, rpos, "notAfter TLV must appear uniquely in fixture");
+        expired_der[pos..pos + tlv_len].copy_from_slice(&expired_not_after_tlv);
 
         let expired_cert = OwnedCert::from_der(&expired_der).expect("valid DER structure");
         assert!(super::is_ca_cert(&expired_cert));
@@ -1939,7 +1978,7 @@ mod tests {
         assert!(loaded.is_empty());
         assert!(
             !expired_path.exists(),
-            "expired CA must be purged from cache"
+            "expired CA certificate must be purged from cache"
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -1964,18 +2003,25 @@ mod tests {
 
     #[test]
     fn ca_handle_round_trip_and_bounds() {
-        assert_eq!(ObjectKind::from_handle(4), Some(ObjectKind::Ca(0)));
-        assert_eq!(ObjectKind::from_handle(5), Some(ObjectKind::Ca(1)));
+        assert_eq!(
+            ObjectKind::from_handle(super::OBJ_CA_BASE),
+            Some(ObjectKind::Ca(0))
+        );
+        assert_eq!(
+            ObjectKind::from_handle(super::OBJ_CA_BASE + 1),
+            Some(ObjectKind::Ca(1))
+        );
         assert_eq!(ObjectKind::from_handle(0), None);
-        assert_eq!(ObjectKind::Ca(0).handle(), 4);
-        assert_eq!(ObjectKind::Ca(1).handle(), 5);
+        assert_eq!(ObjectKind::Ca(0).handle(), super::OBJ_CA_BASE);
+        assert_eq!(ObjectKind::Ca(1).handle(), super::OBJ_CA_BASE + 1);
 
         const TEST_CA_1_DER: &[u8] =
             include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
         let objects = super::TokenObjects::from_cert_der(TEST_CA_1_DER.to_vec())
             .expect("token objects from cert der");
         assert!(!objects.object_exists(ObjectKind::Ca(0)));
-        assert!(!objects.object_exists(ObjectKind::Ca(9999)));
+        const HIGH_OUT_OF_BOUNDS_INDEX: usize = 9999;
+        assert!(!objects.object_exists(ObjectKind::Ca(HIGH_OUT_OF_BOUNDS_INDEX)));
     }
 
     #[test]
@@ -1987,15 +2033,18 @@ mod tests {
         let not_before = view.not_before.unix_duration();
         let not_after = view.not_after.unix_duration();
 
-        // Boundary assertion per RFC 5280 §4.1.2.5:
-        // "from notBefore through notAfter, inclusive"
-        let at_not_before = not_before;
-        assert!(not_before <= at_not_before && at_not_before <= not_after);
+        // Boundary assertions per RFC 5280 §4.1.2.5:
+        // "The validity period for a certificate is the period of time
+        // from notBefore through notAfter, inclusive."
+        assert!(super::is_cert_valid_at(&cert, not_before));
+        assert!(super::is_cert_valid_at(&cert, not_after));
 
-        let at_not_after = not_after;
-        assert!(not_before <= at_not_after && at_not_after <= not_after);
+        let before_not_before = not_before
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("before notBefore");
+        assert!(!super::is_cert_valid_at(&cert, before_not_before));
 
         let past_not_after = not_after + std::time::Duration::from_secs(1);
-        assert!(!(not_before <= past_not_after && past_not_after <= not_after));
+        assert!(!super::is_cert_valid_at(&cert, past_not_after));
     }
 }

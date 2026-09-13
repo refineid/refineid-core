@@ -46,10 +46,6 @@ const EXTENDED_RESPONSE_DATA_MAX_BYTES: usize = 1 << 16;
 const SW1_BYTES_AVAILABLE: u8 = 0x61;
 /// ISO 7816-4 status word indicating wrong Le length.
 const SW1_WRONG_LE: u8 = 0x6C;
-/// USB CCID Class-Specific Control Request Type: Host-to-Device | Class | Interface (CCID Rev 1.1 §5.3).
-const CCID_CONTROL_REQUEST_TYPE: u8 = 0x21;
-/// USB CCID Class-Specific Request: ABORT (CCID Rev 1.1 §5.3.1).
-const CCID_CONTROL_REQUEST_ABORT: u8 = 0x01;
 /// Default timeout for CCID transport operations in milliseconds.
 const DEFAULT_TRANSPORT_TIMEOUT_MS: u32 = 5000;
 
@@ -196,12 +192,28 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                 if !descriptor.automatic_parameter_configuration()
                     && transport.protocol == CardProtocol::T0
                 {
+                    let (fi_di, guard_time, waiting_integer) =
+                        if let Some(g1) = parsed.interface_groups().first() {
+                            let fi_di = g1.ta().map_or(DEFAULT_T0_FIDI, |ta| ta.as_byte());
+                            let guard_time = g1.tc().map_or(0, |tc| tc.as_byte());
+                            let waiting_integer = parsed
+                                .interface_groups()
+                                .get(1)
+                                .and_then(|g2| g2.tc())
+                                .map_or(DEFAULT_T0_WAITING_INTEGER, |tc| tc.as_byte());
+                            (fi_di, guard_time, waiting_integer)
+                        } else {
+                            (DEFAULT_T0_FIDI, 0, DEFAULT_T0_WAITING_INTEGER)
+                        };
+                    let inverse_convention =
+                        parsed.convention() == refineid_atr::Convention::Inverse;
+
                     transport.execute_op(Operation::SetParametersT0 {
-                        fi_di: DEFAULT_T0_FIDI,
-                        guard_time: 0,
-                        waiting_integer: DEFAULT_T0_WAITING_INTEGER,
+                        fi_di,
+                        guard_time,
+                        waiting_integer,
                         clock_stop: 0,
-                        inverse_convention: false,
+                        inverse_convention,
                     })?;
                 }
 
@@ -304,13 +316,17 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
             voltage: AUTOMATIC_VOLTAGE_SELECTION,
         })?;
         match res {
-            OperationResult::PowerOn(atr_bytes) => {
-                if let Ok(parsed) = Atr::new(&atr_bytes) {
+            OperationResult::PowerOn(atr_bytes) => match Atr::new(&atr_bytes) {
+                Ok(parsed) => {
                     self.protocol = CardProtocol::from_atr(&parsed);
+                    self.atr = atr_bytes.clone();
+                    Ok(atr_bytes)
                 }
-                self.atr = atr_bytes.clone();
-                Ok(atr_bytes)
-            }
+                Err(e) => {
+                    self.engine.activated = false;
+                    Err(CcidError::from(e))
+                }
+            },
             _ => Err(CcidError::ProtocolDesync(
                 "Reset did not return ATR data".into(),
             )),
@@ -325,24 +341,9 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
     /// # Errors
     /// Returns `CcidError` if the abort control transfer or slot status exchange fails.
     pub fn abort(&mut self) -> Result<(), CcidError> {
-        let slot = self.engine.b_slot;
-        let seq = self.engine.last_sequence_number();
-        let value = (u16::from(seq) << 8) | u16::from(slot);
-        let index = u16::from(self.engine.interface_number);
-
-        let mut empty_data = [];
-        self.host.control_transfer(
-            CCID_CONTROL_REQUEST_TYPE,
-            CCID_CONTROL_REQUEST_ABORT,
-            value,
-            index,
-            &mut empty_data,
-            self.timeout_ms,
-        )?;
-
         let res = self.execute_op(Operation::Abort)?;
         match res {
-            OperationResult::Aborted | OperationResult::SlotStatus { .. } => Ok(()),
+            OperationResult::Aborted => Ok(()),
             _ => Err(CcidError::ProtocolDesync(
                 "abort returned unexpected outcome".into(),
             )),
@@ -357,8 +358,14 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
         let op_id = OperationId(self.next_op_id);
         self.next_op_id = self.next_op_id.wrapping_add(1);
 
-        let now = MonotonicTime(0);
+        let start_instant = std::time::Instant::now();
+        let get_now = |start: std::time::Instant| -> MonotonicTime {
+            MonotonicTime(start.elapsed().as_millis() as u64)
+        };
+
+        let now = get_now(start_instant);
         let transition = self.engine.step(now, InputEvent::Start { id: op_id, op });
+        let mut current_deadline = transition.next_deadline;
 
         let mut queue = VecDeque::new();
         for action in transition.actions {
@@ -366,11 +373,30 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
         }
 
         while let Some(action) = queue.pop_front() {
+            let now = get_now(start_instant);
+            if let Some(dl) = current_deadline.filter(|dl| now.0 >= dl.expires_at.0) {
+                let next = self.engine.step(now, InputEvent::DeadlineExpired(dl.id));
+                if next.next_deadline.is_some() {
+                    current_deadline = next.next_deadline;
+                }
+                for a in next.actions {
+                    queue.push_back(a);
+                }
+                continue;
+            }
+
+            let transfer_timeout = if let Some(dl) = current_deadline {
+                let remaining_ms = (dl.expires_at.0.saturating_sub(now.0)) as u32;
+                self.timeout_ms.min(remaining_ms).max(1)
+            } else {
+                self.timeout_ms
+            };
+
             match action {
                 Action::SubmitBulkOut { mut data, .. } => {
                     let res = self
                         .host
-                        .bulk_out(self.bulk_out_endpoint, &data, self.timeout_ms);
+                        .bulk_out(self.bulk_out_endpoint, &data, transfer_timeout);
                     data.zeroize();
                     let ev = match res {
                         Ok(transferred) => {
@@ -378,7 +404,11 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                         }
                         Err(e) => InputEvent::IoCompleted(IoCompletion::Failure(e)),
                     };
+                    let now = get_now(start_instant);
                     let next = self.engine.step(now, ev);
+                    if next.next_deadline.is_some() {
+                        current_deadline = next.next_deadline;
+                    }
                     for a in next.actions {
                         queue.push_back(a);
                     }
@@ -387,7 +417,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                     let mut buf = alloc::vec![0_u8; buffer_size];
                     let res = self
                         .host
-                        .bulk_in(self.bulk_in_endpoint, &mut buf, self.timeout_ms);
+                        .bulk_in(self.bulk_in_endpoint, &mut buf, transfer_timeout);
                     let ev = match res {
                         Ok(len) => {
                             buf.truncate(len);
@@ -395,7 +425,11 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                         }
                         Err(e) => InputEvent::IoCompleted(IoCompletion::Failure(e)),
                     };
+                    let now = get_now(start_instant);
                     let next = self.engine.step(now, ev);
+                    if next.next_deadline.is_some() {
+                        current_deadline = next.next_deadline;
+                    }
                     for a in next.actions {
                         queue.push_back(a);
                     }
@@ -413,18 +447,23 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                         value,
                         index,
                         &mut data,
-                        self.timeout_ms,
+                        transfer_timeout,
                     );
                     let ev = match res {
                         Ok(_) => InputEvent::IoCompleted(IoCompletion::Control),
                         Err(e) => InputEvent::IoCompleted(IoCompletion::Failure(e)),
                     };
+                    let now = get_now(start_instant);
                     let next = self.engine.step(now, ev);
+                    if next.next_deadline.is_some() {
+                        current_deadline = next.next_deadline;
+                    }
                     for a in next.actions {
                         queue.push_back(a);
                     }
                 }
                 Action::CancelTransfers => {
+                    current_deadline = None;
                     queue.retain(|a| matches!(a, Action::Complete { .. }));
                 }
                 Action::Complete { id, result } => {
@@ -670,25 +709,23 @@ mod tests {
     }
 
     fn test_descriptor() -> CcidFunctionalDescriptor {
-        CcidFunctionalDescriptor {
-            exchange_level: CcidExchangeLevel::ShortApdu,
-            maximum_message_length: 271,
-            max_slot_index: 0,
-            features: SHORT_APDU_EXCHANGE
-                | AUTOMATIC_ACTIVATION
-                | AUTOMATIC_PARAMETER_CONFIGURATION,
-            protocols: 3,
-        }
+        CcidFunctionalDescriptor::from_parts_unchecked(
+            CcidExchangeLevel::ShortApdu,
+            271,
+            0,
+            SHORT_APDU_EXCHANGE | AUTOMATIC_ACTIVATION | AUTOMATIC_PARAMETER_CONFIGURATION,
+            3,
+        )
     }
 
     fn tpdu_descriptor() -> CcidFunctionalDescriptor {
-        CcidFunctionalDescriptor {
-            exchange_level: CcidExchangeLevel::Tpdu,
-            maximum_message_length: 271,
-            max_slot_index: 0,
-            features: TPDU_EXCHANGE | AUTOMATIC_ACTIVATION | AUTOMATIC_PARAMETER_CONFIGURATION,
-            protocols: 3,
-        }
+        CcidFunctionalDescriptor::from_parts_unchecked(
+            CcidExchangeLevel::Tpdu,
+            271,
+            0,
+            TPDU_EXCHANGE | AUTOMATIC_ACTIVATION | AUTOMATIC_PARAMETER_CONFIGURATION,
+            3,
+        )
     }
 
     fn mock_data_block_response(seq: u8, payload: &[u8]) -> Vec<u8> {
@@ -944,12 +981,14 @@ mod tests {
         assert_eq!(transport.host().control_transfers.len(), 1);
         assert_eq!(transport.host().control_transfers[0].0, 0x21); // CLASS | INTERFACE
         assert_eq!(transport.host().control_transfers[0].1, 0x01); // ABORT
+        let control_seq = (transport.host().control_transfers[0].2 >> 8) as u8;
         let last_out = transport
             .host()
             .bulk_out_records
             .last()
             .expect("has bulk out record");
         assert_eq!(last_out[0], PC_TO_RDR_ABORT);
+        assert_eq!(last_out[6], control_seq); // wValue.seq == bulkAbort.bSeq per CCID §5.3.1
     }
 
     #[test]

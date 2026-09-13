@@ -51,6 +51,10 @@ pub const PC_TO_RDR_ICC_POWER_OFF: u8 = 0x63;
 pub const PC_TO_RDR_GET_SLOT_STATUS: u8 = 0x65;
 /// Abort command (`PC_to_RDR_Abort`).
 pub const PC_TO_RDR_ABORT: u8 = 0x67;
+/// CCID Class-Specific Control Request Type (Host-to-Device, Class, Interface: 00100001b = 0x21).
+pub const CCID_CONTROL_REQUEST_TYPE: u8 = 0x21;
+/// CCID Class-Specific ABORT Control Request (USB-IF CCID Rev 1.1 §5.3 Table 5.3-1 value 01h).
+pub const CCID_CONTROL_REQUEST_ABORT: u8 = 0x01;
 /// Get parameters command (`PC_to_RDR_GetParameters`).
 pub const PC_TO_RDR_GET_PARAMETERS: u8 = 0x6C;
 /// Transfer block command (`PC_to_RDR_XfrBlock`).
@@ -104,15 +108,20 @@ pub const VOLTAGE_3_0V: u8 = 2;
 /// Voltage selection: 1.8V.
 pub const VOLTAGE_1_8V: u8 = 3;
 
-/// Chain parameter: complete message (USB-IF CCID Rev 1.1 §6.2.6 Table 6-2 value 00h).
+// Note: Per USB-IF CCID Rev 1.1 §6.2.1 (offset 9, Table 6-2), bChainParameter is formally defined
+// for the Extended APDU exchange level. For Character, TPDU, and Short APDU levels, the specification
+// states this field is RFU and =00h. The engine reassembles across all levels for maximum tolerance
+// with real-world readers reporting non-zero chain parameters across exchange levels.
+
+/// Chain parameter: complete message (USB-IF CCID Rev 1.1 §6.2.1 Table 6-2 value 00h).
 pub const CHAIN_COMPLETE: u8 = 0;
-/// Chain parameter: begin of message (USB-IF CCID Rev 1.1 §6.2.6 Table 6-2 value 01h).
+/// Chain parameter: begin of message (USB-IF CCID Rev 1.1 §6.2.1 Table 6-2 value 01h).
 pub const CHAIN_BEGIN: u8 = 1;
-/// Chain parameter: end of message (USB-IF CCID Rev 1.1 §6.2.6 Table 6-2 value 02h).
+/// Chain parameter: end of message (USB-IF CCID Rev 1.1 §6.2.1 Table 6-2 value 02h).
 pub const CHAIN_END: u8 = 2;
-/// Chain parameter: continuation of message (USB-IF CCID Rev 1.1 §6.2.6 Table 6-2 value 03h).
+/// Chain parameter: continuation of message (USB-IF CCID Rev 1.1 §6.2.1 Table 6-2 value 03h).
 pub const CHAIN_CONTINUE: u8 = 3;
-/// Chain parameter: command continuation expected (USB-IF CCID Rev 1.1 §6.2.6 Table 6-2 value 10h).
+/// Chain parameter: command continuation expected (USB-IF CCID Rev 1.1 §6.2.1 Table 6-2 value 10h).
 ///
 /// An empty data block is returned by the reader; the host is expected to send another
 /// `PC_to_RDR_XfrBlock` to continue the command (e.g. character/TPDU procedure continuation).

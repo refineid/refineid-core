@@ -57,13 +57,13 @@ const SW_MORE: u8 = 0x61;
 const SW_WRONG_LE: u8 = 0x6C;
 
 fn descriptor(level: CcidExchangeLevel) -> CcidFunctionalDescriptor {
-    CcidFunctionalDescriptor {
-        exchange_level: level,
-        maximum_message_length: MINIMUM_SHORT_APDU_MESSAGE_LENGTH,
-        max_slot_index: ZERO,
-        features: AUTOMATIC_PARAMETER_CONFIGURATION | AUTOMATIC_PPS,
-        protocols: u32::from(ONE | TWO),
-    }
+    CcidFunctionalDescriptor::from_parts_unchecked(
+        level,
+        MINIMUM_SHORT_APDU_MESSAGE_LENGTH,
+        ZERO,
+        AUTOMATIC_PARAMETER_CONFIGURATION | AUTOMATIC_PPS,
+        u32::from(ONE | TWO),
+    )
 }
 
 fn engine(level: CcidExchangeLevel) -> CcidEngine {
@@ -269,7 +269,7 @@ fn parameters_require_a_known_protocol_and_structure() {
 struct Host {
     writes: Vec<Vec<u8>>,
     replies: VecDeque<Result<Vec<u8>, CcidError>>,
-    controls: Vec<(u8, u8)>,
+    controls: Vec<(u8, u8, u16, u16)>,
     reject_control: bool,
     reject_write: bool,
     reads: usize,
@@ -297,12 +297,12 @@ impl UsbHostTransport for Host {
         &mut self,
         kind: u8,
         request: u8,
-        _: u16,
-        _: u16,
+        value: u16,
+        index: u16,
         _: &mut [u8],
         _: u32,
     ) -> Result<usize, CcidError> {
-        self.controls.push((kind, request));
+        self.controls.push((kind, request, value, index));
         if self.reject_control {
             Err(CcidError::Io("synthetic control failure".into()))
         } else {
@@ -347,10 +347,17 @@ fn abort_uses_abort_request_number() {
     )));
     let mut t = transport(h, CcidExchangeLevel::ShortApdu, CardProtocol::T0);
     t.abort().expect("scripted abort");
-    assert_eq!(
-        t.host().controls.first(),
-        Some(&(CLASS_INTERFACE_OUT, ABORT_REQUEST))
-    );
+    let control = t
+        .host()
+        .controls
+        .first()
+        .expect("recorded control transfer");
+    assert_eq!(control.0, CLASS_INTERFACE_OUT);
+    assert_eq!(control.1, ABORT_REQUEST);
+    let control_seq = (control.2 >> 8) as u8;
+    let bulk_abort = t.host().writes.first().expect("recorded bulk abort");
+    assert_eq!(bulk_abort[0], refineid_ccid::codec::PC_TO_RDR_ABORT);
+    assert_eq!(bulk_abort[6], control_seq); // Exact pairing test: wValue.seq == bulkAbort.bSeq per CCID §5.3.1
 }
 
 #[test]
@@ -397,6 +404,23 @@ fn malformed_atr_prevents_connection() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn malformed_atr_on_reset_fails_and_revokes_activation() {
+    let mut h = Host::default();
+    h.replies.push_back(Ok(frame(
+        RDR_TO_PC_SLOT_STATUS,
+        ZERO,
+        CARD_STATUS_ACTIVE,
+        CLOCK_RUNNING,
+        &[],
+    )));
+    h.replies
+        .push_back(Ok(data_frame(ONE, &[TS_DIRECT, TD_FOLLOWS, ONE])));
+    let mut t = transport(h, CcidExchangeLevel::ShortApdu, CardProtocol::T0);
+    assert!(t.reset().is_err());
+    assert!(!t.engine().activated);
 }
 
 #[test]

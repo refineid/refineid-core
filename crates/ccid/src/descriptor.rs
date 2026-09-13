@@ -102,18 +102,67 @@ pub enum CcidExchangeLevel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CcidFunctionalDescriptor {
     /// Supported APDU/TPDU exchange level.
-    pub exchange_level: CcidExchangeLevel,
+    exchange_level: CcidExchangeLevel,
     /// Maximum CCID message length in bytes declared by reader.
-    pub maximum_message_length: usize,
+    maximum_message_length: usize,
     /// Maximum slot index supported (slot count = max_slot_index + 1).
-    pub max_slot_index: u8,
+    max_slot_index: u8,
     /// Feature flags bitmask (`dwFeatures`).
-    pub features: u32,
+    features: u32,
     /// Supported protocols bitmask (`dwProtocols`). Bit 0: T=0, Bit 1: T=1.
-    pub protocols: u32,
+    protocols: u32,
 }
 
 impl CcidFunctionalDescriptor {
+    /// Supported APDU/TPDU exchange level.
+    #[must_use]
+    pub const fn exchange_level(&self) -> CcidExchangeLevel {
+        self.exchange_level
+    }
+
+    /// Maximum CCID message length in bytes declared by reader.
+    #[must_use]
+    pub const fn maximum_message_length(&self) -> usize {
+        self.maximum_message_length
+    }
+
+    /// Maximum slot index supported (slot count = max_slot_index + 1).
+    #[must_use]
+    pub const fn max_slot_index(&self) -> u8 {
+        self.max_slot_index
+    }
+
+    /// Feature flags bitmask (`dwFeatures`).
+    #[must_use]
+    pub const fn features(&self) -> u32 {
+        self.features
+    }
+
+    /// Supported protocols bitmask (`dwProtocols`). Bit 0: T=0, Bit 1: T=1.
+    #[must_use]
+    pub const fn protocols(&self) -> u32 {
+        self.protocols
+    }
+
+    /// Construct a functional descriptor from validated parts (internal test harnesses only).
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn from_parts_unchecked(
+        exchange_level: CcidExchangeLevel,
+        maximum_message_length: usize,
+        max_slot_index: u8,
+        features: u32,
+        protocols: u32,
+    ) -> Self {
+        Self {
+            exchange_level,
+            maximum_message_length,
+            max_slot_index,
+            features,
+            protocols,
+        }
+    }
+
     /// Returns the maximum allowed payload length in bytes (excluding 10-byte CCID header).
     #[must_use]
     pub const fn maximum_payload_length(&self) -> usize {
@@ -191,6 +240,11 @@ impl CcidFunctionalDescriptor {
         if automatic_negotiation && automatic_pps {
             return Err(CcidError::InvalidApduConfiguration);
         }
+        // USB-IF CCID Rev 1.1 Table 5-1 specifies that APDU-level readers typically declare
+        // automatic parameter configuration (0x00000002) and either automatic negotiation (0x40)
+        // or automatic PPS (0x80). In practice, real-world readers (such as dwFeatures 0x00020430)
+        // omit automatic configuration; the parser deliberately tolerates their absence for
+        // interoperability while strictly rejecting the mutually exclusive combination of 0x40 and 0x80.
 
         let declared_message_length = u32::from_le_bytes([
             bytes[MAXIMUM_MESSAGE_LENGTH_OFFSET],

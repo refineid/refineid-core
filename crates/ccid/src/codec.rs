@@ -49,8 +49,8 @@ pub const PC_TO_RDR_ICC_POWER_ON: u8 = 0x62;
 pub const PC_TO_RDR_ICC_POWER_OFF: u8 = 0x63;
 /// Get slot status command (`PC_to_RDR_GetSlotStatus`).
 pub const PC_TO_RDR_GET_SLOT_STATUS: u8 = 0x65;
-/// Abort command (`PC_to_RDR_Abort`).
-pub const PC_TO_RDR_ABORT: u8 = 0x67;
+/// Abort command (`PC_to_RDR_Abort`, USB-IF CCID Rev 1.1 §6.1.13 Table 6-1 value 72h).
+pub const PC_TO_RDR_ABORT: u8 = 0x72;
 /// CCID Class-Specific Control Request Type (Host-to-Device, Class, Interface: 00100001b = 0x21).
 pub const CCID_CONTROL_REQUEST_TYPE: u8 = 0x21;
 /// CCID Class-Specific ABORT Control Request (USB-IF CCID Rev 1.1 §5.3 Table 5.3-1 value 01h).
@@ -187,7 +187,7 @@ pub enum ChainParameter {
 }
 
 /// Decoded successful or failure CCID response.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum CcidResponse {
     /// Data block reply with card payload (e.g. ATR or R-APDU).
     DataBlock {
@@ -228,6 +228,57 @@ pub enum CcidResponse {
         /// Waiting time multiplier.
         multiplier: u8,
     },
+}
+
+impl core::fmt::Debug for CcidResponse {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::DataBlock {
+                card_status,
+                chain_parameter,
+                ..
+            } => f
+                .debug_struct("DataBlock")
+                .field("card_status", card_status)
+                .field("chain_parameter", chain_parameter)
+                .field("payload", &"[redacted]")
+                .finish(),
+            Self::SlotStatus {
+                card_status,
+                clock_status,
+            } => f
+                .debug_struct("SlotStatus")
+                .field("card_status", card_status)
+                .field("clock_status", clock_status)
+                .finish(),
+            Self::Parameters {
+                card_status,
+                protocol_num,
+                payload,
+            } => f
+                .debug_struct("Parameters")
+                .field("card_status", card_status)
+                .field("protocol_num", protocol_num)
+                .field("payload", payload)
+                .finish(),
+            Self::CommandFailure {
+                card_status,
+                error_code,
+            } => f
+                .debug_struct("CommandFailure")
+                .field("card_status", card_status)
+                .field("error_code", error_code)
+                .finish(),
+            Self::TimeExtension {
+                card_status,
+                multiplier,
+            } => f
+                .debug_struct("TimeExtension")
+                .field("card_status", card_status)
+                .field("multiplier", multiplier)
+                .finish(),
+        }
+    }
 }
 
 impl CcidResponse {

@@ -28,7 +28,7 @@ use refineid_ccid::descriptor::{
 };
 use refineid_ccid::{
     Action, CardProtocol, CcidCardTransport, CcidEngine, CcidError, InputEvent, IoCompletion,
-    MonotonicTime, Operation, OperationId, Transition, UsbHostTransport,
+    MonotonicTime, Operation, OperationId, OperationResult, Transition, UsbHostTransport,
 };
 use std::collections::VecDeque;
 use zeroize::Zeroizing;
@@ -57,13 +57,31 @@ const SW_MORE: u8 = 0x61;
 const SW_WRONG_LE: u8 = 0x6C;
 
 fn descriptor(level: CcidExchangeLevel) -> CcidFunctionalDescriptor {
-    CcidFunctionalDescriptor::from_parts_unchecked(
-        level,
-        MINIMUM_SHORT_APDU_MESSAGE_LENGTH,
-        ZERO,
-        AUTOMATIC_PARAMETER_CONFIGURATION | AUTOMATIC_PPS,
-        u32::from(ONE | TWO),
-    )
+    let level_bits = match level {
+        CcidExchangeLevel::Tpdu => refineid_ccid::descriptor::TPDU_EXCHANGE,
+        CcidExchangeLevel::ShortApdu => refineid_ccid::descriptor::SHORT_APDU_EXCHANGE,
+        CcidExchangeLevel::ShortAndExtendedApdu => {
+            refineid_ccid::descriptor::SHORT_AND_EXTENDED_APDU_EXCHANGE
+        }
+    };
+    let mut d = [ZERO; 54];
+    d[0] = 54;
+    d[1] = 0x21;
+    d[2] = 0x10;
+    d[3] = 0x01;
+    d[5] = 0x07;
+    d[6..10].copy_from_slice(&(u32::from(ONE | TWO)).to_le_bytes());
+    d[10..14].copy_from_slice(&4800_u32.to_le_bytes());
+    d[14..18].copy_from_slice(&4800_u32.to_le_bytes());
+    d[19..23].copy_from_slice(&10752_u32.to_le_bytes());
+    d[23..27].copy_from_slice(&344064_u32.to_le_bytes());
+    d[28..32].copy_from_slice(&254_u32.to_le_bytes());
+    let features = level_bits | AUTOMATIC_PARAMETER_CONFIGURATION | AUTOMATIC_PPS;
+    d[40..44].copy_from_slice(&features.to_le_bytes());
+    let max_len = MINIMUM_SHORT_APDU_MESSAGE_LENGTH as u32;
+    d[44..48].copy_from_slice(&max_len.to_le_bytes());
+    d[53] = ONE;
+    CcidFunctionalDescriptor::parse_functional_descriptor(&d).expect("valid test descriptor")
 }
 
 fn engine(level: CcidExchangeLevel) -> CcidEngine {
@@ -316,14 +334,9 @@ fn transport(
     level: CcidExchangeLevel,
     protocol: CardProtocol,
 ) -> CcidCardTransport<Host> {
-    CcidCardTransport::from_existing(
-        host,
-        engine(level),
-        BULK_OUT,
-        BULK_IN,
-        vec![TS_DIRECT, ZERO],
-        protocol,
-    )
+    let desc = descriptor(level);
+    let atr = refineid_atr::Atr::new([TS_DIRECT, ZERO]).expect("valid test atr");
+    CcidCardTransport::from_existing(host, engine(level), desc, BULK_OUT, BULK_IN, atr, protocol)
 }
 
 fn header() -> CommandHeader {
@@ -534,4 +547,86 @@ fn timer_event_cannot_expire_operation_early() {
             .iter()
             .any(|a| matches!(a, Action::Complete { .. }))
     );
+}
+
+#[test]
+fn short_bulk_out_write_requires_recovery() {
+    let mut e = engine(CcidExchangeLevel::ShortApdu);
+    let _ = start(&mut e, Operation::GetSlotStatus);
+    let transition = e.step(
+        NOW,
+        InputEvent::IoCompleted(IoCompletion::BulkOut {
+            transferred: usize::from(ZERO),
+        }),
+    );
+    assert!(e.needs_recovery);
+    assert!(
+        transition
+            .actions
+            .iter()
+            .any(|a| matches!(a, Action::Complete { .. }))
+    );
+}
+
+#[test]
+fn malformed_response_requires_recovery() {
+    let mut e = engine(CcidExchangeLevel::ShortApdu);
+    let _ = start(&mut e, Operation::GetSlotStatus);
+    let _ = e.step(
+        NOW,
+        InputEvent::IoCompleted(IoCompletion::BulkIn(vec![ZERO; 5])),
+    );
+    assert!(e.needs_recovery);
+}
+
+#[test]
+fn invalid_chain_transition_requires_recovery() {
+    let mut e = engine(CcidExchangeLevel::ShortApdu);
+    let _ = start(
+        &mut e,
+        Operation::TransferBlock {
+            b_wi: ZERO,
+            w_level_parameter: 0,
+            data: Zeroizing::new(vec![]),
+        },
+    );
+    let transition = e.step(
+        NOW,
+        InputEvent::IoCompleted(IoCompletion::BulkIn(frame(
+            RDR_TO_PC_DATA_BLOCK,
+            ZERO,
+            CARD_STATUS_ACTIVE,
+            TWO, // Chain End without preceding Begin
+            &[SW_OK, ZERO],
+        ))),
+    );
+    assert!(e.needs_recovery);
+    assert!(transition.actions.iter().any(|a| matches!(
+        a,
+        Action::Complete {
+            result: Err(CcidError::ProtocolDesync(_)),
+            ..
+        }
+    )));
+}
+
+#[test]
+fn pso_decipher_response_debug_redacted() {
+    let result = OperationResult::TransferBlock(vec![0x42; 32]);
+    let debug_str = format!("{result:?}");
+    assert!(debug_str.contains("[redacted]"));
+    assert!(!debug_str.contains("42"));
+
+    let io = IoCompletion::BulkIn(vec![0x42; 32]);
+    let io_debug = format!("{io:?}");
+    assert!(io_debug.contains("[redacted]"));
+    assert!(!io_debug.contains("42"));
+}
+
+#[test]
+fn atr2_classified_as_t0_despite_global_interface_bytes() {
+    let atr2_bytes = [0x3B, 0x75, 0x13, 0x00, 0x00, 0x9C, 0x02, 0x02, 0x01, 0x02];
+    if let Ok(parsed) = refineid_atr::Atr::new(atr2_bytes) {
+        assert_eq!(CardProtocol::from_atr(&parsed), CardProtocol::T0);
+    }
 }

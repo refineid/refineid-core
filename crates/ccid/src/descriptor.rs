@@ -145,9 +145,9 @@ impl CcidFunctionalDescriptor {
     }
 
     /// Construct a functional descriptor from validated parts (internal test harnesses only).
-    #[doc(hidden)]
+    #[cfg(test)]
     #[must_use]
-    pub const fn from_parts_unchecked(
+    pub(crate) const fn from_parts_unchecked(
         exchange_level: CcidExchangeLevel,
         maximum_message_length: usize,
         max_slot_index: u8,

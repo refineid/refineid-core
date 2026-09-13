@@ -33,7 +33,9 @@ use refineid_atr::Atr;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::codec::{AUTOMATIC_VOLTAGE_SELECTION, DEFAULT_T0_FIDI, DEFAULT_T0_WAITING_INTEGER};
-use crate::descriptor::{CcidExchangeLevel, CcidFunctionalDescriptor};
+use crate::descriptor::{
+    AUTOMATIC_PARAMETER_NEGOTIATION, AUTOMATIC_PPS, CcidExchangeLevel, CcidFunctionalDescriptor,
+};
 use crate::engine::{
     Action, CcidEngine, InputEvent, IoCompletion, MonotonicTime, Operation, OperationId,
     OperationResult,
@@ -68,10 +70,10 @@ pub trait UsbHostTransport {
         timeout_ms: u32,
     ) -> Result<usize, CcidError>;
 
-    /// Execute USB control transfer (e.g. for CCID ABORT §5.3.1).
+    /// Issue USB Control Transfer (used for CCID class-specific requests like ABORT).
     ///
     /// # Errors
-    /// Returns `CcidError` on USB control transfer failure.
+    /// Returns `CcidError` on control transfer failure or timeout.
     fn control_transfer(
         &mut self,
         request_type: u8,
@@ -96,11 +98,11 @@ impl CardProtocol {
     /// Deduce protocol from parsed ATR.
     #[must_use]
     pub fn from_atr(atr: &Atr) -> Self {
-        if atr.supports_non_t0_protocol() {
-            Self::T1
-        } else {
-            Self::T0
-        }
+        let has_t1 = atr
+            .interface_groups()
+            .iter()
+            .any(|g| g.td().is_some_and(|td| td.protocol_indicator() == 1));
+        if has_t1 { Self::T1 } else { Self::T0 }
     }
 }
 
@@ -146,9 +148,10 @@ fn prepare_command_bytes(
 pub struct CcidCardTransport<H: UsbHostTransport> {
     host: H,
     engine: CcidEngine,
+    descriptor: CcidFunctionalDescriptor,
     bulk_out_endpoint: u8,
     bulk_in_endpoint: u8,
-    atr: Vec<u8>,
+    atr: Atr,
     protocol: CardProtocol,
     next_op_id: u64,
     timeout_ms: u32,
@@ -171,9 +174,10 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
         let mut transport = Self {
             host,
             engine,
+            descriptor: descriptor.clone(),
             bulk_out_endpoint,
             bulk_in_endpoint,
-            atr: Vec::new(),
+            atr: Atr::new([0x3B, 0x00])?,
             protocol: CardProtocol::T0,
             next_op_id: 1,
             timeout_ms: DEFAULT_TRANSPORT_TIMEOUT_MS,
@@ -187,36 +191,8 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
             OperationResult::PowerOn(atr_bytes) => {
                 let parsed = Atr::new(&atr_bytes)?;
                 transport.protocol = CardProtocol::from_atr(&parsed);
-                transport.atr = atr_bytes;
-
-                if !descriptor.automatic_parameter_configuration()
-                    && transport.protocol == CardProtocol::T0
-                {
-                    let (fi_di, guard_time, waiting_integer) =
-                        if let Some(g1) = parsed.interface_groups().first() {
-                            let fi_di = g1.ta().map_or(DEFAULT_T0_FIDI, |ta| ta.as_byte());
-                            let guard_time = g1.tc().map_or(0, |tc| tc.as_byte());
-                            let waiting_integer = parsed
-                                .interface_groups()
-                                .get(1)
-                                .and_then(|g2| g2.tc())
-                                .map_or(DEFAULT_T0_WAITING_INTEGER, |tc| tc.as_byte());
-                            (fi_di, guard_time, waiting_integer)
-                        } else {
-                            (DEFAULT_T0_FIDI, 0, DEFAULT_T0_WAITING_INTEGER)
-                        };
-                    let inverse_convention =
-                        parsed.convention() == refineid_atr::Convention::Inverse;
-
-                    transport.execute_op(Operation::SetParametersT0 {
-                        fi_di,
-                        guard_time,
-                        waiting_integer,
-                        clock_stop: 0,
-                        inverse_convention,
-                    })?;
-                }
-
+                transport.configure_parameters(&parsed)?;
+                transport.atr = parsed;
                 Ok(transport)
             }
             _ => Err(CcidError::ProtocolDesync(
@@ -230,14 +206,16 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
     pub fn from_existing(
         host: H,
         engine: CcidEngine,
+        descriptor: CcidFunctionalDescriptor,
         bulk_out_endpoint: u8,
         bulk_in_endpoint: u8,
-        atr: Vec<u8>,
+        atr: Atr,
         protocol: CardProtocol,
     ) -> Self {
         Self {
             host,
             engine,
+            descriptor,
             bulk_out_endpoint,
             bulk_in_endpoint,
             atr,
@@ -247,18 +225,22 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
         }
     }
 
-    /// Borrow the raw ATR bytes.
+    /// Reserialize the validated ATR to wire bytes.
     #[must_use]
-    pub fn atr_bytes(&self) -> &[u8] {
+    pub fn atr_bytes(&self) -> Vec<u8> {
+        self.atr.to_wire_bytes()
+    }
+
+    /// Borrow the validated ATR.
+    #[must_use]
+    pub const fn atr(&self) -> &Atr {
         &self.atr
     }
 
-    /// Parsed ATR.
-    ///
-    /// # Errors
-    /// Returns `AtrError` if the ATR structure is invalid.
-    pub fn atr(&self) -> Result<Atr, refineid_atr::AtrError> {
-        Atr::new(&self.atr)
+    /// Functional descriptor of the CCID reader.
+    #[must_use]
+    pub const fn descriptor(&self) -> &CcidFunctionalDescriptor {
+        &self.descriptor
     }
 
     /// Smart card communication protocol.
@@ -299,6 +281,48 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
         &mut self.engine
     }
 
+    /// Apply communication parameters for T=0 protocol if reader requires manual configuration.
+    fn configure_parameters(&mut self, parsed: &Atr) -> Result<(), CcidError> {
+        if !self.descriptor.automatic_parameter_configuration() && self.protocol == CardProtocol::T0
+        {
+            let (fi_di, guard_time, waiting_integer) =
+                if let Some(g1) = parsed.interface_groups().first() {
+                    let has_pps = self.descriptor.features()
+                        & (AUTOMATIC_PARAMETER_NEGOTIATION | AUTOMATIC_PPS)
+                        != 0;
+                    let in_specific_mode = parsed
+                        .interface_groups()
+                        .get(1)
+                        .and_then(|g2| g2.ta())
+                        .is_some();
+                    let fi_di = if in_specific_mode || has_pps {
+                        g1.ta().map_or(DEFAULT_T0_FIDI, |ta| ta.as_byte())
+                    } else {
+                        DEFAULT_T0_FIDI
+                    };
+                    let guard_time = g1.tc().map_or(0, |tc| tc.as_byte());
+                    let waiting_integer = parsed
+                        .interface_groups()
+                        .get(1)
+                        .and_then(|g2| g2.tc())
+                        .map_or(DEFAULT_T0_WAITING_INTEGER, |tc| tc.as_byte());
+                    (fi_di, guard_time, waiting_integer)
+                } else {
+                    (DEFAULT_T0_FIDI, 0, DEFAULT_T0_WAITING_INTEGER)
+                };
+            let inverse_convention = parsed.convention() == refineid_atr::Convention::Inverse;
+
+            self.execute_op(Operation::SetParametersT0 {
+                fi_di,
+                guard_time,
+                waiting_integer,
+                clock_stop: 0,
+                inverse_convention,
+            })?;
+        }
+        Ok(())
+    }
+
     /// Reset the smart card, returning its fresh ATR.
     ///
     /// If the reader slot previously encountered a timeout or I/O failure requiring recovery,
@@ -319,8 +343,10 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
             OperationResult::PowerOn(atr_bytes) => match Atr::new(&atr_bytes) {
                 Ok(parsed) => {
                     self.protocol = CardProtocol::from_atr(&parsed);
-                    self.atr = atr_bytes.clone();
-                    Ok(atr_bytes)
+                    self.configure_parameters(&parsed)?;
+                    let wire = parsed.to_wire_bytes();
+                    self.atr = parsed;
+                    Ok(wire)
                 }
                 Err(e) => {
                     self.engine.activated = false;
@@ -374,11 +400,12 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
 
         while let Some(action) = queue.pop_front() {
             let now = get_now(start_instant);
-            if let Some(dl) = current_deadline.filter(|dl| now.0 >= dl.expires_at.0) {
+            if let Some(dl) = current_deadline.filter(|dl| {
+                !matches!(action, Action::CancelTransfers | Action::Complete { .. })
+                    && now.0 >= dl.expires_at.0
+            }) {
                 let next = self.engine.step(now, InputEvent::DeadlineExpired(dl.id));
-                if next.next_deadline.is_some() {
-                    current_deadline = next.next_deadline;
-                }
+                current_deadline = next.next_deadline;
                 for a in next.actions {
                     queue.push_back(a);
                 }
@@ -406,9 +433,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                     };
                     let now = get_now(start_instant);
                     let next = self.engine.step(now, ev);
-                    if next.next_deadline.is_some() {
-                        current_deadline = next.next_deadline;
-                    }
+                    current_deadline = next.next_deadline;
                     for a in next.actions {
                         queue.push_back(a);
                     }
@@ -427,9 +452,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                     };
                     let now = get_now(start_instant);
                     let next = self.engine.step(now, ev);
-                    if next.next_deadline.is_some() {
-                        current_deadline = next.next_deadline;
-                    }
+                    current_deadline = next.next_deadline;
                     for a in next.actions {
                         queue.push_back(a);
                     }
@@ -455,9 +478,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                     };
                     let now = get_now(start_instant);
                     let next = self.engine.step(now, ev);
-                    if next.next_deadline.is_some() {
-                        current_deadline = next.next_deadline;
-                    }
+                    current_deadline = next.next_deadline;
                     for a in next.actions {
                         queue.push_back(a);
                     }
@@ -772,7 +793,7 @@ mod tests {
         let transport =
             CcidCardTransport::connect(host, &desc, 0, 0, 0x02, 0x82).expect("connect succeeds");
 
-        assert_eq!(transport.atr_bytes(), &atr);
+        assert_eq!(transport.atr_bytes().as_slice(), &atr);
         assert_eq!(transport.protocol(), CardProtocol::T0);
         assert_eq!(transport.host().bulk_out_records.len(), 1);
         assert_eq!(
@@ -1012,7 +1033,7 @@ mod tests {
 
         let new_atr = transport.reset().expect("reset succeeds");
         assert_eq!(new_atr, fresh_atr);
-        assert_eq!(transport.atr_bytes(), &fresh_atr);
+        assert_eq!(transport.atr_bytes().as_slice(), &fresh_atr);
     }
 
     #[test]

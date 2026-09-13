@@ -144,7 +144,7 @@ impl core::fmt::Debug for Operation {
 }
 
 /// Outcome of a completed logical operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum OperationResult {
     /// Power on succeeded, returning ATR bytes.
     PowerOn(Vec<u8>),
@@ -165,8 +165,28 @@ pub enum OperationResult {
     Aborted,
 }
 
+impl core::fmt::Debug for OperationResult {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::PowerOn(atr) => f.debug_tuple("PowerOn").field(atr).finish(),
+            Self::PowerOff => write!(f, "PowerOff"),
+            Self::SlotStatus { card_present } => f
+                .debug_struct("SlotStatus")
+                .field("card_present", card_present)
+                .finish(),
+            Self::Parameters(p) => f.debug_tuple("Parameters").field(p).finish(),
+            Self::ParametersSet => write!(f, "ParametersSet"),
+            Self::TransferBlock(_) => f
+                .debug_struct("TransferBlock")
+                .field("payload", &"[redacted]")
+                .finish(),
+            Self::Aborted => write!(f, "Aborted"),
+        }
+    }
+}
+
 /// I/O completion report from the platform USB executor.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum IoCompletion {
     /// Bulk-IN read completed with received bytes.
     BulkIn(Vec<u8>),
@@ -179,6 +199,23 @@ pub enum IoCompletion {
     Control,
     /// Hardware I/O failed.
     Failure(CcidError),
+}
+
+impl core::fmt::Debug for IoCompletion {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::BulkIn(_) => f
+                .debug_struct("BulkIn")
+                .field("data", &"[redacted]")
+                .finish(),
+            Self::BulkOut { transferred } => f
+                .debug_struct("BulkOut")
+                .field("transferred", transferred)
+                .finish(),
+            Self::Control => write!(f, "Control"),
+            Self::Failure(e) => f.debug_tuple("Failure").field(e).finish(),
+        }
+    }
 }
 
 /// Input event presented to the engine.
@@ -327,7 +364,6 @@ impl Transition {
 }
 
 /// Pure deterministic CCID protocol engine for a single CCID slot.
-#[derive(Debug)]
 pub struct CcidEngine {
     /// Hardware interface index.
     pub interface_number: u8,
@@ -369,6 +405,38 @@ pub struct CcidEngine {
     wtx_count: u32,
     abort_drain_count: u8,
     waiting_unit_ms: u32,
+}
+
+impl core::fmt::Debug for CcidEngine {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CcidEngine")
+            .field("interface_number", &self.interface_number)
+            .field("b_slot", &self.b_slot)
+            .field("card_gen", &self.card_gen)
+            .field("connection_gen", &self.connection_gen)
+            .field("next_seq", &self.next_seq)
+            .field("card_present", &self.card_present)
+            .field("activated", &self.activated)
+            .field("connected", &self.connected)
+            .field("needs_recovery", &self.needs_recovery)
+            .field("exchange_level", &self.exchange_level)
+            .field("max_message_length", &self.max_message_length)
+            .field("max_payload_length", &self.max_payload_length)
+            .field("max_slot_index", &self.max_slot_index)
+            .field("pending_op", &self.pending_op)
+            .field("expected_response_type", &self.expected_response_type)
+            .field("expected_seq", &self.expected_seq)
+            .field("last_issued_seq", &self.last_issued_seq)
+            .field("expected_bulk_out_len", &self.expected_bulk_out_len)
+            .field("active_deadline_id", &self.active_deadline_id)
+            .field("current_deadline", &self.current_deadline)
+            .field("default_timeout_ms", &self.default_timeout_ms)
+            .field("chain_buffer", &"[redacted]")
+            .field("wtx_count", &self.wtx_count)
+            .field("abort_drain_count", &self.abort_drain_count)
+            .field("waiting_unit_ms", &self.waiting_unit_ms)
+            .finish()
+    }
 }
 
 impl CcidEngine {
@@ -628,6 +696,7 @@ impl CcidEngine {
                 if transferred != self.expected_bulk_out_len {
                     if let Some((op_id, _)) = self.pending_op.take() {
                         self.current_deadline = None;
+                        self.needs_recovery = true;
                         actions.push(Action::CancelTransfers);
                         actions.push(Action::Complete {
                             id: op_id,
@@ -706,8 +775,23 @@ impl CcidEngine {
                                 });
                             } else {
                                 match chain_parameter {
-                                    crate::codec::ChainParameter::Begin
-                                    | crate::codec::ChainParameter::Continue => {
+                                    crate::codec::ChainParameter::Begin => {
+                                        if !self.chain_buffer.is_empty() {
+                                            self.chain_buffer.clear();
+                                            self.current_deadline = None;
+                                            self.needs_recovery = true;
+                                            actions.push(Action::Complete {
+                                                id: op_id,
+                                                result: Err(CcidError::ProtocolDesync(
+                                                    "Chain Begin received while chain already open"
+                                                        .into(),
+                                                )),
+                                            });
+                                            return Transition {
+                                                actions,
+                                                next_deadline: None,
+                                            };
+                                        }
                                         let next_len =
                                             self.chain_buffer.len().saturating_add(payload.len());
                                         if next_len > MAX_RESPONSE_PAYLOAD_SIZE {
@@ -739,8 +823,69 @@ impl CcidEngine {
                                             data: Zeroizing::new(cmd),
                                         });
                                     }
-                                    crate::codec::ChainParameter::End
-                                    | crate::codec::ChainParameter::Complete => {
+                                    crate::codec::ChainParameter::Continue => {
+                                        if self.chain_buffer.is_empty() {
+                                            self.current_deadline = None;
+                                            self.needs_recovery = true;
+                                            actions.push(Action::Complete {
+                                                id: op_id,
+                                                result: Err(CcidError::ProtocolDesync(
+                                                    "Chain Continue received without preceding Begin"
+                                                        .into(),
+                                                )),
+                                            });
+                                            return Transition {
+                                                actions,
+                                                next_deadline: None,
+                                            };
+                                        }
+                                        let next_len =
+                                            self.chain_buffer.len().saturating_add(payload.len());
+                                        if next_len > MAX_RESPONSE_PAYLOAD_SIZE {
+                                            self.chain_buffer.clear();
+                                            self.current_deadline = None;
+                                            actions.push(Action::Complete {
+                                                id: op_id,
+                                                result: Err(CcidError::ResponseLengthOutOfRange),
+                                            });
+                                            return Transition {
+                                                actions,
+                                                next_deadline: None,
+                                            };
+                                        }
+                                        self.chain_buffer.extend_from_slice(&payload);
+                                        let seq = self.allocate_seq();
+                                        self.expected_seq = seq;
+                                        self.pending_op = Some((op_id, pending));
+                                        let cmd = encode_xfr_block(
+                                            self.b_slot,
+                                            seq,
+                                            0,
+                                            u16::from(CHAIN_COMMAND_CONTINUATION_EXPECTED),
+                                            &[],
+                                        );
+                                        self.expected_bulk_out_len = cmd.len();
+                                        actions.push(Action::SubmitBulkOut {
+                                            seq,
+                                            data: Zeroizing::new(cmd),
+                                        });
+                                    }
+                                    crate::codec::ChainParameter::End => {
+                                        if self.chain_buffer.is_empty() {
+                                            self.current_deadline = None;
+                                            self.needs_recovery = true;
+                                            actions.push(Action::Complete {
+                                                id: op_id,
+                                                result: Err(CcidError::ProtocolDesync(
+                                                    "Chain End received without preceding Begin"
+                                                        .into(),
+                                                )),
+                                            });
+                                            return Transition {
+                                                actions,
+                                                next_deadline: None,
+                                            };
+                                        }
                                         let next_len =
                                             self.chain_buffer.len().saturating_add(payload.len());
                                         if next_len > MAX_RESPONSE_PAYLOAD_SIZE {
@@ -767,6 +912,48 @@ impl CcidEngine {
                                                 Ok(OperationResult::TransferBlock(combined))
                                             }
                                             _ => Ok(OperationResult::PowerOn(combined)),
+                                        };
+                                        self.current_deadline = None;
+                                        actions.push(Action::Complete { id: op_id, result });
+                                    }
+                                    crate::codec::ChainParameter::Complete => {
+                                        if !self.chain_buffer.is_empty() {
+                                            self.chain_buffer.clear();
+                                            self.current_deadline = None;
+                                            self.needs_recovery = true;
+                                            actions.push(Action::Complete {
+                                                id: op_id,
+                                                result: Err(CcidError::ProtocolDesync(
+                                                    "Chain Complete received while chain open"
+                                                        .into(),
+                                                )),
+                                            });
+                                            return Transition {
+                                                actions,
+                                                next_deadline: None,
+                                            };
+                                        }
+                                        if payload.len() > MAX_RESPONSE_PAYLOAD_SIZE {
+                                            self.current_deadline = None;
+                                            actions.push(Action::Complete {
+                                                id: op_id,
+                                                result: Err(CcidError::ResponseLengthOutOfRange),
+                                            });
+                                            return Transition {
+                                                actions,
+                                                next_deadline: None,
+                                            };
+                                        }
+                                        let result = match pending {
+                                            PendingOperation::PowerOn => {
+                                                self.activated = true;
+                                                self.card_present = true;
+                                                Ok(OperationResult::PowerOn(payload))
+                                            }
+                                            PendingOperation::TransferBlock => {
+                                                Ok(OperationResult::TransferBlock(payload))
+                                            }
+                                            _ => Ok(OperationResult::PowerOn(payload)),
                                         };
                                         self.current_deadline = None;
                                         actions.push(Action::Complete { id: op_id, result });
@@ -853,6 +1040,7 @@ impl CcidEngine {
                                 });
                             } else {
                                 self.current_deadline = None;
+                                self.needs_recovery = true;
                                 actions.push(Action::Complete {
                                     id: op_id,
                                     result: Err(e),

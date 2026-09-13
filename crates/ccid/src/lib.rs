@@ -23,6 +23,16 @@
 //!   completely from OS threads and physical USB handles.
 //! - [`transport`]: Synchronous smart card transport adapter ([`CcidCardTransport`]) implementing
 //!   [`refineid_apdu::CardTransport`] over a platform [`UsbHostTransport`].
+//!
+//! ### Architecture and Execution Scope
+//! - The core [`CcidEngine`] is designed as a pure deterministic state machine that accepts explicit
+//!   events (such as hardware I/O completions, interrupt notifications, and monotonic deadlines)
+//!   and outputs discrete transitions with zero side effects.
+//! - [`CcidCardTransport`] provides the synchronous reference transport adapter for single-slot
+//!   blocking operations (such as Android USB Host synchronous bulk endpoints or CLI tools).
+//! - The asynchronous background daemon event pump (driving continuous interrupt transfers,
+//!   monotonic deadlines, and concurrent cancellation) will be delivered in the companion
+//!   Android service daemon slice.
 
 #![forbid(unsafe_code)]
 

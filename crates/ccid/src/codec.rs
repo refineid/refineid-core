@@ -104,15 +104,20 @@ pub const VOLTAGE_3_0V: u8 = 2;
 /// Voltage selection: 1.8V.
 pub const VOLTAGE_1_8V: u8 = 3;
 
-/// Chain parameter: complete message.
+/// Chain parameter: complete message (USB-IF CCID Rev 1.1 §6.2.6 Table 6-2 value 00h).
 pub const CHAIN_COMPLETE: u8 = 0;
-/// Chain parameter: begin of message.
+/// Chain parameter: begin of message (USB-IF CCID Rev 1.1 §6.2.6 Table 6-2 value 01h).
 pub const CHAIN_BEGIN: u8 = 1;
-/// Chain parameter: end of message.
+/// Chain parameter: end of message (USB-IF CCID Rev 1.1 §6.2.6 Table 6-2 value 02h).
 pub const CHAIN_END: u8 = 2;
-/// Chain parameter: continuation of message.
+/// Chain parameter: continuation of message (USB-IF CCID Rev 1.1 §6.2.6 Table 6-2 value 03h).
 pub const CHAIN_CONTINUE: u8 = 3;
-/// Chain parameter: command continuation expected.
+/// Chain parameter: command continuation expected (USB-IF CCID Rev 1.1 §6.2.6 Table 6-2 value 10h).
+///
+/// An empty data block is returned by the reader; the host is expected to send another
+/// `PC_to_RDR_XfrBlock` to continue the command (e.g. character/TPDU procedure continuation).
+/// For APDU and TPDU exchanges without character continuation, the engine rejects this with
+/// `CcidError::ProtocolDesync`.
 pub const CHAIN_COMMAND_CONTINUATION_EXPECTED: u8 = 0x10;
 
 /// Clock running.

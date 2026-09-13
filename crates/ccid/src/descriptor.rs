@@ -52,39 +52,39 @@ pub const MAXIMUM_MESSAGE_LENGTH_OFFSET: usize = 44;
 /// Byte offset of `bMaxSlotIndex` in CCID functional descriptor.
 pub const MAX_SLOT_INDEX_OFFSET: usize = 4;
 
-/// Feature flag: Automatic parameter configuration based on ATR.
+/// Feature flag: Automatic parameter configuration based on ATR (USB-IF CCID Rev 1.1 §5.1 Table 5-1 bit 1).
 pub const AUTOMATIC_PARAMETER_CONFIGURATION: u32 = 0x0000_0002;
-/// Feature flag: Automatic activation of ICC on connect.
+/// Feature flag: Automatic activation of ICC on connect (USB-IF CCID Rev 1.1 §5.1 Table 5-1 bit 2).
 pub const AUTOMATIC_ACTIVATION: u32 = 0x0000_0004;
-/// Feature flag: Automatic voltage selection.
+/// Feature flag: Automatic voltage selection (USB-IF CCID Rev 1.1 §5.1 Table 5-1 bit 3).
 pub const AUTOMATIC_VOLTAGE_SELECTION: u32 = 0x0000_0008;
-/// Feature flag: Automatic parameter negotiation (PPS).
+/// Feature flag: Automatic parameter negotiation (PPS) (USB-IF CCID Rev 1.1 §5.1 Table 5-1 bit 6).
 pub const AUTOMATIC_PARAMETER_NEGOTIATION: u32 = 0x0000_0040;
-/// Feature flag: Automatic PPS performed by reader.
+/// Feature flag: Automatic PPS performed by reader (USB-IF CCID Rev 1.1 §5.1 Table 5-1 bit 7).
 pub const AUTOMATIC_PPS: u32 = 0x0000_0080;
 
-/// Mask for CCID exchange level bits in `dwFeatures`.
+/// Mask for CCID exchange level bits in `dwFeatures` (USB-IF CCID Rev 1.1 §5.1 Table 5-1 bits 16..18).
 pub const EXCHANGE_LEVEL_MASK: u32 = 0x0007_0000;
 /// Character level exchange (unsupported).
 pub const CHARACTER_EXCHANGE: u32 = 0x0000_0000;
-/// TPDU level exchange.
+/// TPDU level exchange (USB-IF CCID Rev 1.1 §5.1 Table 5-1 value 00010000h).
 pub const TPDU_EXCHANGE: u32 = 0x0001_0000;
-/// Short APDU level exchange.
+/// Short APDU level exchange (USB-IF CCID Rev 1.1 §5.1 Table 5-1 value 00020000h).
 pub const SHORT_APDU_EXCHANGE: u32 = 0x0002_0000;
-/// Short and extended APDU level exchange.
+/// Short and extended APDU level exchange (USB-IF CCID Rev 1.1 §5.1 Table 5-1 value 00040000h).
 pub const SHORT_AND_EXTENDED_APDU_EXCHANGE: u32 = 0x0004_0000;
 
-/// Maximum ISO 7816-3 T=0 TPDU command payload length.
+/// Maximum ISO 7816-3 T=0 TPDU command payload length (5-byte header + 255 data bytes).
 pub const MAXIMUM_T0_TPDU_LENGTH: usize = 260;
 /// Minimum message length for T=0 TPDU exchange (10-byte header + 260 bytes).
 pub const MINIMUM_T0_TPDU_MESSAGE_LENGTH: usize = 10 + MAXIMUM_T0_TPDU_LENGTH;
-/// Maximum ISO 7816-4 short APDU command payload length.
+/// Maximum ISO 7816-4 short APDU command payload length (4-byte header + 1 Lc + 255 data + 1 Le).
 pub const MAXIMUM_SHORT_APDU_LENGTH: usize = 261;
 /// Minimum message length for Short APDU exchange (10-byte header + 261 bytes).
 pub const MINIMUM_SHORT_APDU_MESSAGE_LENGTH: usize = 10 + MAXIMUM_SHORT_APDU_LENGTH;
-/// Maximum ISO 7816-4 extended APDU command payload length (65544 bytes).
+/// Maximum ISO 7816-4 extended APDU command payload length (65,544 bytes: 4 header + 1 prefix + 2 Lc + 65,535 data + 2 Le).
 pub const MAXIMUM_CCID_COMMAND_PAYLOAD_LENGTH: usize = 65_544;
-/// Absolute maximum CCID message length including 10-byte header (65554 bytes).
+/// Absolute maximum CCID message length including 10-byte header (65,554 bytes).
 pub const MAXIMUM_CCID_MESSAGE_LENGTH: usize = 10 + MAXIMUM_CCID_COMMAND_PAYLOAD_LENGTH;
 
 /// CCID command / exchange level supported by the reader.

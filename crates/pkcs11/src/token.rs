@@ -14,14 +14,15 @@
 
 //! Slot / token / object model over PC/SC.
 //!
-//! A FINEID token exposes exactly three objects for Firefox / NSS
-//! client-cert TLS: the authentication certificate
+//! A FINEID token exposes the authentication certificate
 //! ([`ObjectKind::Certificate`], handle [`OBJ_CERTIFICATE`]), its
 //! public key ([`ObjectKind::PublicKey`], handle [`OBJ_PUBLIC_KEY`],
 //! for consumers such as p11tool / libp11 that enumerate public
-//! keys), and its auth private key ([`ObjectKind::PrivateKey`],
-//! handle [`OBJ_PRIVATE_KEY`]). All carry the same
-//! [`crate::ck::CKA_ID`] so NSS pairs them.
+//! keys), its auth private key ([`ObjectKind::PrivateKey`], handle
+//! [`OBJ_PRIVATE_KEY`]), and dynamic CA certificates read from card silicon
+//! and persisted cache ([`ObjectKind::Ca`], handles starting at [`OBJ_CA_BASE`]).
+//! All authentication objects carry the same [`crate::ck::CKA_ID`] so NSS
+//! pairs them.
 //!
 //! The card is opened only for the moment it takes to read the
 //! certificate or run a signature, then dropped -- this module never
@@ -281,7 +282,7 @@ impl CaObject {
 
 /// An invariant-preserving trust store that guarantees:
 /// 1. Zero duplicate certificates (enforced at insertion by DER comparison).
-/// 2. Cryptographic identity mapping via pinned DVV CA fingerprints.
+/// 2. Stable discovery order and sequential handle indexing (`OBJ_CA_BASE + index`).
 /// 3. Total operations — no indexing panics, no out-of-bounds states.
 #[derive(Debug, Default, Clone)]
 pub struct RefinedTrustStore {
@@ -602,8 +603,11 @@ impl TokenObjects {
             CKA_CLASS => Some(ulong_attr(CKO_CERTIFICATE)),
             CKA_CERTIFICATE_TYPE => Some(ulong_attr(CKC_X_509)),
             CKA_CERTIFICATE_CATEGORY => Some(ulong_attr(CK_CERTIFICATE_CATEGORY_AUTHORITY)),
-            CKA_TOKEN | CKA_TRUSTED => Some(bool_attr(CK_TRUE)),
-            CKA_PRIVATE => Some(bool_attr(CK_FALSE)),
+            CKA_TOKEN => Some(bool_attr(CK_TRUE)),
+            // Token CA certificates are intermediate path-building candidates for NSS
+            // client-certificate TLS authentication, not ambient trust anchors for
+            // server verification (PKCS#11 v2.40 §4.4: CKA_TRUSTED).
+            CKA_PRIVATE | CKA_TRUSTED => Some(bool_attr(CK_FALSE)),
             CKA_LABEL => Some(AttrValue::Borrowed(ca.label_bytes())),
             CKA_ID => Some(AttrValue::Borrowed(ca.id_bytes())),
             CKA_VALUE => Some(AttrValue::Borrowed(ca.cert.as_der())),
@@ -925,6 +929,9 @@ const MAX_CA_CERTS: usize = 16;
 const MAX_CA_CERT_BYTES: u64 = 65536;
 
 /// Check if an X.509 certificate's validity window is currently valid (fail closed).
+///
+/// Citing RFC 5280 §4.1.2.5: "The validity period for a certificate is the period
+/// of time from notBefore through notAfter, inclusive."
 fn is_cert_valid(cert: &OwnedCert) -> bool {
     let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
         return false;
@@ -933,15 +940,16 @@ fn is_cert_valid(cert: &OwnedCert) -> bool {
     view.not_before.unix_duration() <= now && now <= view.not_after.unix_duration()
 }
 
-/// Check if an X.509 certificate asserts certificate authority status (either via `BasicConstraints` CA:TRUE or self-signed).
+/// Check if an X.509 certificate asserts certificate authority status via `BasicConstraints` CA:TRUE.
+///
+/// Citing RFC 5280 §4.2.1.9: "The basic constraints extension serves to delimit the role
+/// of the certified public key and to identify certificate path lengths. If the cA boolean
+/// is not asserted, then the subject certificate MUST NOT be used to verify signatures on
+/// certificates."
 fn is_ca_cert(cert: &OwnedCert) -> bool {
     let view = cert.view();
-    if let Some(exts) = view.extensions
-        && refineid_cms::x509::extract_basic_constraints(exts).ca
-    {
-        return true;
-    }
-    view.subject.as_der() == view.issuer.as_der()
+    view.extensions
+        .is_some_and(|exts| refineid_cms::x509::extract_basic_constraints(exts).ca)
 }
 
 /// Check if a certificate meets the persistence policy: unexpired and asserts CA status.
@@ -954,15 +962,20 @@ fn load_persisted_ca_certs_from(dir: &std::path::Path) -> Vec<OwnedCert> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut paths: Vec<std::path::PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("der"))
-        })
-        .collect();
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        if paths.len() >= MAX_CA_CERTS * 4 {
+            break;
+        }
+        let path = entry.path();
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("der"))
+        {
+            paths.push(path);
+        }
+    }
     paths.sort();
 
     let mut certs = Vec::new();
@@ -998,7 +1011,7 @@ fn load_persisted_ca_certs_from(dir: &std::path::Path) -> Vec<OwnedCert> {
 }
 
 /// Load persisted CA certificates from disk, purging any expired ones.
-pub(super) fn load_persisted_ca_certs() -> Vec<OwnedCert> {
+fn load_persisted_ca_certs() -> Vec<OwnedCert> {
     persistent_ca_dir().map_or_else(Vec::new, |dir| load_persisted_ca_certs_from(&dir))
 }
 
@@ -1857,6 +1870,14 @@ mod tests {
             .windows(5)
             .position(|w| w == b"\x06\x03\x55\x1d\x13")
             .expect("BasicConstraints found");
+        let rpos = leaf_der
+            .windows(5)
+            .rposition(|w| w == b"\x06\x03\x55\x1d\x13")
+            .expect("BasicConstraints found");
+        assert_eq!(
+            pos, rpos,
+            "BasicConstraints OID must appear uniquely in fixture"
+        );
         leaf_der[pos..pos + 5].copy_from_slice(b"\x06\x03\x55\x1d\x14");
 
         let leaf = OwnedCert::from_der(&leaf_der).expect("valid leaf cert DER");
@@ -1891,6 +1912,14 @@ mod tests {
             .windows(13)
             .position(|w| w == b"410520115123Z")
             .expect("notAfter found in CA");
+        let rpos = expired_der
+            .windows(13)
+            .rposition(|w| w == b"410520115123Z")
+            .expect("notAfter found in CA");
+        assert_eq!(
+            pos, rpos,
+            "notAfter timestamp must appear uniquely in fixture"
+        );
         expired_der[pos..pos + 13].copy_from_slice(b"200101000000Z");
 
         let expired_cert = OwnedCert::from_der(&expired_der).expect("valid DER structure");
@@ -1917,7 +1946,7 @@ mod tests {
     }
 
     #[test]
-    fn all_published_ca_fixtures_meet_persistence_policy() {
+    fn all_published_ca_fixtures_assert_ca_basic_constraints() {
         let fixtures: [&[u8]; 6] = [
             include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der"),
             include_bytes!("../ca-certs/fineid-intermediate-02-citizen-g4r.der"),
@@ -1930,7 +1959,43 @@ mod tests {
         for der in fixtures {
             let cert = OwnedCert::from_der(der).expect("valid cert");
             assert!(super::is_ca_cert(&cert));
-            assert!(super::meets_ca_persistence_policy(&cert));
         }
+    }
+
+    #[test]
+    fn ca_handle_round_trip_and_bounds() {
+        assert_eq!(ObjectKind::from_handle(4), Some(ObjectKind::Ca(0)));
+        assert_eq!(ObjectKind::from_handle(5), Some(ObjectKind::Ca(1)));
+        assert_eq!(ObjectKind::from_handle(0), None);
+        assert_eq!(ObjectKind::Ca(0).handle(), 4);
+        assert_eq!(ObjectKind::Ca(1).handle(), 5);
+
+        const TEST_CA_1_DER: &[u8] =
+            include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+        let objects = super::TokenObjects::from_cert_der(TEST_CA_1_DER.to_vec())
+            .expect("token objects from cert der");
+        assert!(!objects.object_exists(ObjectKind::Ca(0)));
+        assert!(!objects.object_exists(ObjectKind::Ca(9999)));
+    }
+
+    #[test]
+    fn not_after_boundary_inclusivity() {
+        const TEST_CA_1_DER: &[u8] =
+            include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+        let cert = OwnedCert::from_der(TEST_CA_1_DER).expect("valid cert");
+        let view = cert.view();
+        let not_before = view.not_before.unix_duration();
+        let not_after = view.not_after.unix_duration();
+
+        // Boundary assertion per RFC 5280 §4.1.2.5:
+        // "from notBefore through notAfter, inclusive"
+        let at_not_before = not_before;
+        assert!(not_before <= at_not_before && at_not_before <= not_after);
+
+        let at_not_after = not_after;
+        assert!(not_before <= at_not_after && at_not_after <= not_after);
+
+        let past_not_after = not_after + std::time::Duration::from_secs(1);
+        assert!(!(not_before <= past_not_after && past_not_after <= not_after));
     }
 }

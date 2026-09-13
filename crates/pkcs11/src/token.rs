@@ -75,7 +75,7 @@ pub const OBJ_PRIVATE_KEY: CkObjectHandle = 2;
 /// Object handle for the authentication public key, derived from the
 /// certificate SPKI. Shares [`CKA_ID`] with the other two objects.
 pub const OBJ_PUBLIC_KEY: CkObjectHandle = 3;
-/// Object handles for the embedded DVV intermediate and root CA certificates.
+/// Object handles for the on-card or cached intermediate and root CA certificates.
 pub const OBJ_CA_CITIZEN_G4E: CkObjectHandle = 4;
 pub const OBJ_CA_CITIZEN_G4R: CkObjectHandle = 5;
 pub const OBJ_CA_CITIZEN_G3: CkObjectHandle = 6;
@@ -83,16 +83,39 @@ pub const OBJ_CA_ORG_G4R: CkObjectHandle = 7;
 pub const OBJ_CA_ROOT_ECC: CkObjectHandle = 8;
 pub const OBJ_CA_ROOT_RSA: CkObjectHandle = 9;
 
-const DVV_CA_CITIZEN_G4E_DER: &[u8] =
-    include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
-const DVV_CA_CITIZEN_G4R_DER: &[u8] =
-    include_bytes!("../ca-certs/fineid-intermediate-02-citizen-g4r.der");
-const DVV_CA_CITIZEN_G3_DER: &[u8] =
-    include_bytes!("../ca-certs/fineid-intermediate-00-citizen-g3.der");
-const DVV_CA_ORG_G4R_DER: &[u8] =
-    include_bytes!("../ca-certs/fineid-intermediate-03-organisation-g4r.der");
-const DVV_CA_ROOT_ECC_DER: &[u8] = include_bytes!("../ca-certs/dvv-gov-root-ca-g3-ecc.der");
-const DVV_CA_ROOT_RSA_DER: &[u8] = include_bytes!("../ca-certs/dvv-gov-root-ca-g3-rsa.der");
+/// SHA-256 fingerprint constants for authentic DVV intermediate and root CA certificates.
+/// Citing DVV (Digital and Population Data Services Agency) published certificate profiles
+/// and test fixtures in `crates/pkcs11/ca-certs/*.der`:
+/// - DVV Citizen Certificates - G4E (`fineid-intermediate-01-citizen-g4e.der`)
+/// - DVV Citizen Certificates - G4R (`fineid-intermediate-02-citizen-g4r.der`)
+/// - VRK Gov. CA for Citizen Certificates - G3 (`fineid-intermediate-00-citizen-g3.der`)
+/// - DVV Organisational Certificates - G4R (`fineid-intermediate-03-organisation-g4r.der`)
+/// - DVV Gov. Root CA - G3 ECC (`dvv-gov-root-ca-g3-ecc.der`)
+/// - DVV Gov. Root CA - G3 RSA (`dvv-gov-root-ca-g3-rsa.der`)
+const PINNED_DVV_CA_CITIZEN_G4E: [u8; 32] = [
+    0xaa, 0xd1, 0xbe, 0xac, 0x46, 0x96, 0x10, 0x2a, 0x88, 0xbf, 0x9d, 0x51, 0x8d, 0x64, 0xf8, 0xb0,
+    0x14, 0xf7, 0x8f, 0x9b, 0x15, 0x25, 0x79, 0xc9, 0x59, 0x99, 0x83, 0x13, 0x19, 0x79, 0x24, 0xd7,
+];
+const PINNED_DVV_CA_CITIZEN_G4R: [u8; 32] = [
+    0x21, 0x76, 0xc0, 0x5e, 0x69, 0xee, 0x24, 0x94, 0x6a, 0x14, 0x0d, 0x13, 0xf9, 0xef, 0xa2, 0x22,
+    0xb3, 0xf1, 0xe7, 0x68, 0xe1, 0xe2, 0xa6, 0x7b, 0x31, 0x39, 0x69, 0xcc, 0x03, 0xb8, 0x20, 0x64,
+];
+const PINNED_DVV_CA_CITIZEN_G3: [u8; 32] = [
+    0x39, 0xa8, 0x35, 0xb1, 0x4b, 0x6b, 0x63, 0x13, 0xf7, 0x78, 0x37, 0x1c, 0x79, 0xcb, 0x43, 0x4d,
+    0xd5, 0x18, 0xc8, 0xfd, 0x32, 0x5b, 0x74, 0x9d, 0x9b, 0xe6, 0x69, 0xdf, 0xf2, 0x03, 0x84, 0xe8,
+];
+const PINNED_DVV_CA_ORG_G4R: [u8; 32] = [
+    0xdf, 0xc3, 0xe9, 0x65, 0x17, 0x6f, 0x88, 0x3a, 0x9c, 0xf0, 0xf6, 0x8c, 0xea, 0xee, 0xab, 0x66,
+    0x3e, 0xdf, 0xd8, 0xe7, 0x9d, 0xe3, 0x29, 0x43, 0x73, 0xc2, 0x8a, 0x85, 0x69, 0x84, 0x00, 0x6f,
+];
+const PINNED_DVV_CA_ROOT_ECC: [u8; 32] = [
+    0x55, 0x46, 0xa5, 0x25, 0x04, 0xfb, 0xa7, 0x4f, 0x61, 0xff, 0xd4, 0x89, 0x00, 0x67, 0x52, 0x9a,
+    0xde, 0x3b, 0x9c, 0x9d, 0x07, 0xe5, 0x02, 0x59, 0x28, 0x31, 0xcc, 0xda, 0x9b, 0x36, 0x9f, 0xd3,
+];
+const PINNED_DVV_CA_ROOT_RSA: [u8; 32] = [
+    0xd3, 0xed, 0x3f, 0xc4, 0x0a, 0xd2, 0x6b, 0x52, 0xe0, 0x01, 0xe1, 0xe1, 0x8f, 0x4b, 0x94, 0x49,
+    0x52, 0x9d, 0xeb, 0x75, 0xa8, 0x1d, 0x5e, 0xb6, 0x80, 0xd7, 0xb6, 0x2d, 0xb2, 0x3b, 0xa9, 0x6d,
+];
 
 /// Fixed human-readable token / object label used when the card's
 /// certificate carries no usable common name. NSS shows it in the
@@ -150,17 +173,17 @@ pub enum ObjectKind {
     PublicKey,
     /// The authentication private key ([`CKO_PRIVATE_KEY`]).
     PrivateKey,
-    /// Embedded CA: DVV Citizen Certificates - G4E
+    /// Pinned DVV CA: DVV Citizen Certificates - G4E
     CaCitizenG4e,
-    /// Embedded CA: DVV Citizen Certificates - G4R
+    /// Pinned DVV CA: DVV Citizen Certificates - G4R
     CaCitizenG4r,
-    /// Embedded CA: VRK Gov. CA for Citizen Certificates - G3
+    /// Pinned DVV CA: VRK Gov. CA for Citizen Certificates - G3
     CaCitizenG3,
-    /// Embedded CA: DVV Organisational Certificates - G4R
+    /// Pinned DVV CA: DVV Organisational Certificates - G4R
     CaOrgG4r,
-    /// Embedded CA: DVV Gov. Root CA - G3 ECC
+    /// Pinned DVV CA: DVV Gov. Root CA - G3 ECC
     CaRootEcc,
-    /// Embedded CA: DVV Gov. Root CA - G3 RSA
+    /// Pinned DVV CA: DVV Gov. Root CA - G3 RSA
     CaRootRsa,
 }
 
@@ -211,6 +234,20 @@ impl ObjectKind {
         Self::CaRootEcc,
         Self::CaRootRsa,
     ];
+
+    /// Return the pinned SHA-256 fingerprint for a CA object kind.
+    #[must_use]
+    pub const fn pinned_ca_fingerprint(self) -> Option<[u8; 32]> {
+        match self {
+            Self::CaCitizenG4e => Some(PINNED_DVV_CA_CITIZEN_G4E),
+            Self::CaCitizenG4r => Some(PINNED_DVV_CA_CITIZEN_G4R),
+            Self::CaCitizenG3 => Some(PINNED_DVV_CA_CITIZEN_G3),
+            Self::CaOrgG4r => Some(PINNED_DVV_CA_ORG_G4R),
+            Self::CaRootEcc => Some(PINNED_DVV_CA_ROOT_ECC),
+            Self::CaRootRsa => Some(PINNED_DVV_CA_ROOT_RSA),
+            Self::Certificate | Self::PublicKey | Self::PrivateKey => None,
+        }
+    }
 }
 
 /// Result of an attribute lookup: either a borrowed slice from certificate
@@ -324,7 +361,7 @@ impl CaObject {
 
 /// An invariant-preserving trust store that guarantees:
 /// 1. Zero duplicate certificates (enforced at insertion by DER comparison).
-/// 2. Deterministic precedence (on-card overrides static anchor).
+/// 2. Cryptographic identity mapping via pinned DVV CA fingerprints.
 /// 3. Total operations — no indexing panics, no out-of-bounds states.
 #[derive(Debug, Default, Clone)]
 pub struct RefinedTrustStore {
@@ -333,6 +370,10 @@ pub struct RefinedTrustStore {
 
 impl RefinedTrustStore {
     /// Construct a store from an initial set of distinct CA objects.
+    #[expect(
+        dead_code,
+        reason = "constructor for distinct CA sets used in tests and custom initialization"
+    )]
     #[must_use]
     pub fn new(initial: impl IntoIterator<Item = CaObject>) -> Self {
         let mut store = Self {
@@ -345,6 +386,10 @@ impl RefinedTrustStore {
     }
 
     /// Total, infallible prepending that preserves uniqueness by construction.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "prepends anchors for tests and dynamic updates")
+    )]
     pub fn prepend_anchor(&mut self, anchor: CaObject) {
         if self.contains(&anchor.cert) {
             return;
@@ -386,13 +431,16 @@ impl RefinedTrustStore {
     }
 
     /// Safe, total lookup by index.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "positional lookup helper for tests")
+    )]
     #[must_use]
     pub fn get(&self, index: usize) -> Option<&CaObject> {
         self.distinct_anchors.get(index)
     }
 
     /// Iterate over distinct CA certificates.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn iter(&self) -> core::slice::Iter<'_, CaObject> {
         self.distinct_anchors.iter()
     }
@@ -479,10 +527,6 @@ pub struct TokenObjects {
     ca_store: RefinedTrustStore,
 }
 
-fn load_static_ca_cert(cert_der: &'static [u8]) -> Result<OwnedCert, CkRv> {
-    OwnedCert::from_der(cert_der).map_err(|_err| CKR_DEVICE_ERROR)
-}
-
 /// Encode a [`CkUlong`] attribute value into an inline zero-allocation buffer.
 #[expect(
     clippy::host_endian_bytes,
@@ -557,8 +601,8 @@ fn non_empty(bytes: &[u8]) -> Option<&[u8]> {
 
 impl TokenObjects {
     /// Build token objects from the card's leaf authentication certificate
-    /// DER bytes. Loads and verifies all embedded intermediate and root CA
-    /// trust anchors.
+    /// DER bytes. Initializes an empty trust store populated dynamically from
+    /// persisted cache and on-card CA slots.
     ///
     /// # Errors
     /// [`CKR_DEVICE_ERROR`] if the DER does not parse or the key
@@ -572,14 +616,7 @@ impl TokenObjects {
         let auth_cert_label =
             extract_common_name(&view.subject).unwrap_or_else(|| DEFAULT_LABEL.to_owned());
         let auth_cert_serial_der = der_integer(view.serial_der);
-        let ca_store = RefinedTrustStore::new([
-            CaObject::new(load_static_ca_cert(DVV_CA_CITIZEN_G4E_DER)?),
-            CaObject::new(load_static_ca_cert(DVV_CA_CITIZEN_G4R_DER)?),
-            CaObject::new(load_static_ca_cert(DVV_CA_CITIZEN_G3_DER)?),
-            CaObject::new(load_static_ca_cert(DVV_CA_ORG_G4R_DER)?),
-            CaObject::new(load_static_ca_cert(DVV_CA_ROOT_ECC_DER)?),
-            CaObject::new(load_static_ca_cert(DVV_CA_ROOT_RSA_DER)?),
-        ]);
+        let ca_store = RefinedTrustStore::default();
         Ok(Self {
             auth_cert,
             auth_cert_id,
@@ -628,18 +665,27 @@ impl TokenObjects {
             ObjectKind::Certificate => self.certificate_attribute(attr),
             ObjectKind::PublicKey => self.public_key_attribute(attr),
             ObjectKind::PrivateKey => self.private_key_attribute(attr),
-            ObjectKind::CaCitizenG4e => self.ca_attribute(0, attr),
-            ObjectKind::CaCitizenG4r => self.ca_attribute(1, attr),
-            ObjectKind::CaCitizenG3 => self.ca_attribute(2, attr),
-            ObjectKind::CaOrgG4r => self.ca_attribute(3, attr),
-            ObjectKind::CaRootEcc => self.ca_attribute(4, attr),
-            ObjectKind::CaRootRsa => self.ca_attribute(5, attr),
+            ObjectKind::CaCitizenG4e
+            | ObjectKind::CaCitizenG4r
+            | ObjectKind::CaCitizenG3
+            | ObjectKind::CaOrgG4r
+            | ObjectKind::CaRootEcc
+            | ObjectKind::CaRootRsa => self.ca_attribute(kind, attr),
         }
     }
 
-    /// Attribute lookup for an embedded or on-card CA certificate object.
-    fn ca_attribute(&self, index: usize, attr: CkAttributeType) -> Option<AttrValue<'_>> {
-        let ca = self.ca_store.get(index)?;
+    /// Look up the CA certificate object matching `kind` by pinned fingerprint.
+    pub(crate) fn ca_object_for_kind(&self, kind: ObjectKind) -> Option<&CaObject> {
+        let wanted = kind.pinned_ca_fingerprint()?;
+        self.ca_store.iter().find(|ca| {
+            let fp = refineid_digest::Sha256::of(ca.cert.as_der());
+            *fp.as_bytes() == wanted
+        })
+    }
+
+    /// Attribute lookup for an on-card CA certificate object matching `kind`.
+    fn ca_attribute(&self, kind: ObjectKind, attr: CkAttributeType) -> Option<AttrValue<'_>> {
+        let ca = self.ca_object_for_kind(kind)?;
         let view = ca.cert.view();
         match attr {
             CKA_CLASS => Some(ulong_attr(CKO_CERTIFICATE)),
@@ -781,9 +827,9 @@ impl TokenObjects {
         }
     }
 
-    /// Add an on-card CA certificate to the token cache.
-    pub(crate) fn prepend_ca_cert(&mut self, cert: OwnedCert) {
-        self.ca_store.prepend_anchor(CaObject::new(cert));
+    /// Add an on-card CA certificate to the end of the token cache.
+    pub(crate) fn push_ca_cert(&mut self, cert: OwnedCert) {
+        self.ca_store.push_anchor(CaObject::new(cert));
     }
 
     /// Software signature verification against the cached
@@ -858,6 +904,20 @@ impl TokenObjects {
         }
     }
 
+    /// Check whether this object exists in the token.
+    #[must_use]
+    pub(crate) fn object_exists(&self, kind: ObjectKind) -> bool {
+        match kind {
+            ObjectKind::Certificate | ObjectKind::PublicKey | ObjectKind::PrivateKey => true,
+            ObjectKind::CaCitizenG4e
+            | ObjectKind::CaCitizenG4r
+            | ObjectKind::CaCitizenG3
+            | ObjectKind::CaOrgG4r
+            | ObjectKind::CaRootEcc
+            | ObjectKind::CaRootRsa => self.ca_object_for_kind(kind).is_some(),
+        }
+    }
+
     /// Test whether an object matches every `(type, value)` pair in a
     /// `C_FindObjects` template. A template entry matches only when
     /// the attribute is present, concrete, and byte-equal; a
@@ -868,10 +928,171 @@ impl TokenObjects {
         kind: ObjectKind,
         template: &[(CkAttributeType, Vec<u8>)],
     ) -> bool {
+        if !self.object_exists(kind) {
+            return false;
+        }
         template.iter().all(|(attr, wanted)| {
             self.attribute(kind, *attr)
                 .is_some_and(|val| val.as_bytes() == Some(wanted.as_slice()))
         })
+    }
+}
+
+/// Resolve the filesystem directory used for caching on-card CA certificates.
+fn persistent_ca_dir() -> Option<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("REFINEID_CA_CACHE_DIR")
+        && !dir.is_empty()
+    {
+        return Some(std::path::PathBuf::from(dir));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA")
+            && !local_app_data.is_empty()
+        {
+            return Some(
+                std::path::PathBuf::from(local_app_data)
+                    .join("refineid")
+                    .join("ca-certificates"),
+            );
+        }
+        if let Ok(app_data) = std::env::var("APPDATA")
+            && !app_data.is_empty()
+        {
+            return Some(
+                std::path::PathBuf::from(app_data)
+                    .join("refineid")
+                    .join("ca-certificates"),
+            );
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME")
+            && !home.is_empty()
+        {
+            return Some(
+                std::path::PathBuf::from(home).join("Library/Caches/fi.refineid/ca-certificates"),
+            );
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Ok(xdg_cache) = std::env::var("XDG_CACHE_HOME")
+            && !xdg_cache.is_empty()
+        {
+            return Some(
+                std::path::PathBuf::from(xdg_cache)
+                    .join("refineid")
+                    .join("ca-certificates"),
+            );
+        }
+        if let Ok(home) = std::env::var("HOME")
+            && !home.is_empty()
+        {
+            return Some(std::path::PathBuf::from(home).join(".cache/refineid/ca-certificates"));
+        }
+    }
+    None
+}
+
+/// Check if an X.509 certificate's validity window is currently valid (fail closed).
+fn is_cert_valid(cert: &OwnedCert) -> bool {
+    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return false;
+    };
+    let view = cert.view();
+    view.not_before.unix_duration() <= now && now < view.not_after.unix_duration()
+}
+
+/// Check if a certificate is an authentic CA (matches a pinned DVV CA root or intermediate).
+fn is_authentic_ca(cert: &OwnedCert) -> bool {
+    let der = cert.as_der();
+    let fp = refineid_digest::Sha256::of(der);
+    let fp_bytes = fp.as_bytes();
+    [
+        PINNED_DVV_CA_CITIZEN_G4E,
+        PINNED_DVV_CA_CITIZEN_G4R,
+        PINNED_DVV_CA_CITIZEN_G3,
+        PINNED_DVV_CA_ORG_G4R,
+        PINNED_DVV_CA_ROOT_ECC,
+        PINNED_DVV_CA_ROOT_RSA,
+    ]
+    .iter()
+    .any(|pinned| pinned == fp_bytes)
+}
+
+const MAX_CA_CERTS: usize = 16;
+const MAX_CA_CERT_BYTES: u64 = 65536;
+
+/// Load persisted CA certificates from a directory, purging any expired, oversized, or unauthentic ones.
+fn load_persisted_ca_certs_from(dir: &std::path::Path) -> Vec<OwnedCert> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("der"))
+        .collect();
+    paths.sort();
+
+    let mut certs = Vec::new();
+    for path in paths.into_iter().take(MAX_CA_CERTS) {
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if metadata.len() > MAX_CA_CERT_BYTES {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(cert) = OwnedCert::from_der(&bytes) else {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        };
+        if !is_cert_valid(&cert) || !is_authentic_ca(&cert) {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        certs.push(cert);
+    }
+    certs
+}
+
+/// Load persisted CA certificates from disk, purging any expired ones.
+fn load_persisted_ca_certs() -> Vec<OwnedCert> {
+    persistent_ca_dir().map_or_else(Vec::new, |dir| load_persisted_ca_certs_from(&dir))
+}
+
+/// Persist an unexpired, authentic CA certificate to a specific directory atomically.
+fn persist_ca_cert_to(dir: &std::path::Path, cert: &OwnedCert) {
+    if !is_cert_valid(cert) || !is_authentic_ca(cert) {
+        return;
+    }
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let der = cert.as_der();
+    let fingerprint = refineid_digest::Sha256::of(der);
+    let hex_name: String = fingerprint
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let file_path = dir.join(format!("{hex_name}.der"));
+    let temp_path = dir.join(format!("{hex_name}.tmp"));
+    if std::fs::write(&temp_path, der).is_ok() {
+        let _ = std::fs::rename(&temp_path, &file_path);
+    }
+}
+
+/// Persist an unexpired, authentic CA certificate to disk.
+fn persist_ca_cert(cert: &OwnedCert) {
+    if let Some(dir) = persistent_ca_dir() {
+        persist_ca_cert_to(&dir, cert);
     }
 }
 
@@ -926,24 +1147,26 @@ pub(super) fn build_token_objects(reader_name: &str) -> Result<TokenObjects, CkR
         .or_else(|_| card.read_certificate(CertSlot::AuthenticationAlt))
         .map_err(|_read_err| CKR_DEVICE_ERROR)?;
 
-    // Read on-card CA certificates when present on this card generation
-    let on_card_cas: Vec<OwnedCert> = [
-        CertSlot::IssuingCaEcc,
-        CertSlot::RootCa,
-        CertSlot::SignatureAlt,
-    ]
-    .into_iter()
-    .filter_map(|slot| read_optional_ca_cert(&mut card, slot))
-    .collect();
+    let mut cas = load_persisted_ca_certs();
+    if cas.is_empty() {
+        let on_card_cas: Vec<OwnedCert> = [CertSlot::IssuingCaEcc, CertSlot::RootCa]
+            .into_iter()
+            .filter_map(|slot| read_optional_ca_cert(&mut card, slot))
+            .filter(|cert| is_cert_valid(cert) && is_authentic_ca(cert))
+            .collect();
+        for ca in &on_card_cas {
+            persist_ca_cert(ca);
+        }
+        cas = on_card_cas;
+    }
     drop(card);
 
     let mut objects = TokenObjects::from_cert_der(cert.as_bytes().to_vec())?;
     if let Some(serial) = serial {
         objects.token_serial = serial;
     }
-    // Prepend on-card CA certificates so live card certs take precedence
-    for ca in on_card_cas.into_iter().rev() {
-        objects.prepend_ca_cert(ca);
+    for ca in cas {
+        objects.push_ca_cert(ca);
     }
     Ok(objects)
 }
@@ -1028,6 +1251,13 @@ pub(super) fn card_sign(
         .map_err(|_poisoned| CKR_DEVICE_ERROR)?
         .checkout_pin1(&serial)
         .ok_or(CKR_USER_NOT_LOGGED_IN)?;
+    if pin1_status == PinStatus::Verified
+        && let Ok(signature) = sign_with_card(&mut card, mechanism, input)
+    {
+        let mut cache = pin_cache.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?;
+        checkout.restore_after_success(&mut cache);
+        return Ok(signature);
+    }
     let secret =
         refineid_auth::UnvalidatedSecret::from_owned_bytes(checkout.pin().as_bytes().to_vec());
     let Ok(pin1) = refineid_auth::Pin1::reconstruct(secret) else {
@@ -1485,7 +1715,7 @@ mod tests {
 
     use super::{
         DER_LONG_FORM_ONE_OCTET, DER_TAG_INTEGER, DER_TAG_OCTET_STRING, OBJ_CERTIFICATE,
-        OBJ_PRIVATE_KEY, OBJ_PUBLIC_KEY, ObjectKind, der_integer, der_octet_string,
+        OBJ_PRIVATE_KEY, OBJ_PUBLIC_KEY, ObjectKind, OwnedCert, der_integer, der_octet_string,
         pin1_verify_guard,
     };
     use crate::ck::{CKR_DEVICE_ERROR, CKR_PIN_LOCKED};
@@ -1593,8 +1823,13 @@ mod tests {
         const INITIAL_COUNT: usize = 2;
         const OUT_OF_BOUNDS_INDEX: usize = 99;
 
-        let cert1 = super::load_static_ca_cert(super::DVV_CA_CITIZEN_G4E_DER).expect("valid cert1");
-        let cert2 = super::load_static_ca_cert(super::DVV_CA_CITIZEN_G4R_DER).expect("valid cert2");
+        const TEST_CA_1_DER: &[u8] =
+            include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+        const TEST_CA_2_DER: &[u8] =
+            include_bytes!("../ca-certs/fineid-intermediate-02-citizen-g4r.der");
+
+        let cert1 = OwnedCert::from_der(TEST_CA_1_DER).expect("valid cert1");
+        let cert2 = OwnedCert::from_der(TEST_CA_2_DER).expect("valid cert2");
 
         let mut store = super::RefinedTrustStore::default();
         assert!(store.is_empty());
@@ -1619,5 +1854,82 @@ mod tests {
         // Invariant 3: Iteration
         let count = store.iter().count();
         assert_eq!(count, INITIAL_COUNT);
+    }
+
+    #[test]
+    fn persistent_ca_roundtrip_and_pruning() {
+        const TEST_CA_1_DER: &[u8] =
+            include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+
+        let unique_name = format!("refineid-test-ca-cache-pkcs11-{}", std::process::id());
+        let temp_dir = std::env::temp_dir().join(unique_name);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let cert1 = OwnedCert::from_der(TEST_CA_1_DER).expect("valid cert1");
+        super::persist_ca_cert_to(&temp_dir, &cert1);
+
+        // Plant an unparseable / corrupted file to verify purging
+        let corrupt_path = temp_dir.join("corrupt.der");
+        let _ = std::fs::write(&corrupt_path, b"not-a-valid-der-certificate");
+
+        // Plant an oversized file (> 64 KB) to verify purging
+        let oversized_path = temp_dir.join("oversized.der");
+        let _ = std::fs::write(&oversized_path, vec![0u8; 70000]);
+
+        let loaded = super::load_persisted_ca_certs_from(&temp_dir);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].as_der(), cert1.as_der());
+
+        // Corrupt and oversized files should have been purged
+        assert!(!corrupt_path.exists());
+        assert!(!oversized_path.exists());
+
+        // Test object_exists and ca_object_for_kind
+        let mut objects = super::TokenObjects::from_cert_der(TEST_CA_1_DER.to_vec())
+            .expect("token objects from cert der");
+        assert!(!objects.object_exists(ObjectKind::CaCitizenG4e));
+        assert!(!objects.object_exists(ObjectKind::CaRootEcc));
+
+        objects.push_ca_cert(cert1);
+        assert!(objects.object_exists(ObjectKind::CaCitizenG4e));
+        assert!(!objects.object_exists(ObjectKind::CaRootEcc));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn all_six_pinned_dvv_fingerprints_match_published_fixtures() {
+        let fixtures: [(&[u8], [u8; 32]); 6] = [
+            (
+                include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der"),
+                super::PINNED_DVV_CA_CITIZEN_G4E,
+            ),
+            (
+                include_bytes!("../ca-certs/fineid-intermediate-02-citizen-g4r.der"),
+                super::PINNED_DVV_CA_CITIZEN_G4R,
+            ),
+            (
+                include_bytes!("../ca-certs/fineid-intermediate-00-citizen-g3.der"),
+                super::PINNED_DVV_CA_CITIZEN_G3,
+            ),
+            (
+                include_bytes!("../ca-certs/fineid-intermediate-03-organisation-g4r.der"),
+                super::PINNED_DVV_CA_ORG_G4R,
+            ),
+            (
+                include_bytes!("../ca-certs/dvv-gov-root-ca-g3-ecc.der"),
+                super::PINNED_DVV_CA_ROOT_ECC,
+            ),
+            (
+                include_bytes!("../ca-certs/dvv-gov-root-ca-g3-rsa.der"),
+                super::PINNED_DVV_CA_ROOT_RSA,
+            ),
+        ];
+
+        for (der, expected_fp) in fixtures {
+            let fp = refineid_digest::Sha256::of(der);
+            assert_eq!(fp.as_bytes(), &expected_fp);
+        }
     }
 }

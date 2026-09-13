@@ -248,9 +248,11 @@ fn is_ignored_root_path(root: &Path, path: &Path) -> bool {
 /// is admitted as-is instead of being hardened speculatively; it may be
 /// simplified against the live-proven behaviour rather than polished.
 /// PC/SC and PKCS#11 subtrees interact with external C ABI specifications
-/// (OASIS Cryptoki v2.40 and PC/SC Workgroup). Remove
-/// an entry when its subtree is brought under policy or replaced.
+/// (OASIS Cryptoki v2.40 and PC/SC Workgroup). USB CCID (`crates/ccid`) interacts
+/// with the external USB Device Class: Smart Card (CCID) Rev 1.1 wire specification
+/// and descriptor tables. Remove an entry when its subtree is brought under policy or replaced.
 const POLICY_EXEMPT_SUBTREES: &[&str] = &[
+    "crates/ccid",
     "crates/pcsc",
     "crates/pkcs11",
     "crates/rapp",

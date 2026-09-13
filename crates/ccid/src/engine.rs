@@ -28,6 +28,9 @@ use crate::error::CcidError;
 use alloc::vec::Vec;
 use zeroize::Zeroizing;
 
+/// Default timeout for CCID engine operations in milliseconds.
+pub const DEFAULT_ENGINE_TIMEOUT_MS: u64 = 5000;
+
 /// Opaque identifier for a logical operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OperationId(pub u64);
@@ -299,7 +302,7 @@ impl CcidEngine {
             expected_bulk_out_len: 0,
             active_deadline_id: 0,
             current_deadline: None,
-            default_timeout_ms: 5000,
+            default_timeout_ms: DEFAULT_ENGINE_TIMEOUT_MS,
             chain_buffer: Vec::new(),
             wtx_count: 0,
         }
@@ -315,6 +318,8 @@ impl CcidEngine {
     }
 
     /// Returns the sequence number of the currently active or last issued command.
+    ///
+    /// Before any command has been issued, this returns 0 (the initial sequence number).
     #[must_use]
     pub const fn last_sequence_number(&self) -> u8 {
         self.last_issued_seq
@@ -588,7 +593,6 @@ impl CcidEngine {
                                             Operation::PowerOn { .. } => {
                                                 self.activated = true;
                                                 self.card_present = true;
-                                                self.needs_recovery = false;
                                                 Ok(OperationResult::PowerOn(combined))
                                             }
                                             Operation::TransferBlock { .. } => {
@@ -682,6 +686,11 @@ impl CcidEngine {
 
             InputEvent::IoCompleted(IoCompletion::Failure(e)) => {
                 if let Some((op_id, _)) = self.pending_op.take() {
+                    if matches!(e, CcidError::CardRemoved) {
+                        self.card_present = false;
+                        self.activated = false;
+                        self.card_gen = self.card_gen.wrapping_add(1);
+                    }
                     if matches!(e, CcidError::Timeout | CcidError::Io(_)) {
                         self.needs_recovery = true;
                     }
@@ -1253,6 +1262,42 @@ mod tests {
             Action::Complete { id, result } => {
                 assert_eq!(*id, op_id);
                 assert_eq!(result, &Err(CcidError::Timeout));
+            }
+            _ => panic!("expected Complete action"),
+        }
+    }
+
+    #[test]
+    fn host_failure_card_removed_revokes_presence_and_activation() {
+        let desc = make_test_descriptor();
+        let mut engine = CcidEngine::new(0, 0, 1, &desc);
+        engine.card_present = true;
+        engine.activated = true;
+        let initial_gen = engine.card_gen;
+
+        let op_id = OperationId(36);
+        let _ = engine.step(
+            MonotonicTime(700),
+            InputEvent::Start {
+                id: op_id,
+                op: Operation::GetSlotStatus,
+            },
+        );
+
+        let t = engine.step(
+            MonotonicTime(710),
+            InputEvent::IoCompleted(IoCompletion::Failure(CcidError::CardRemoved)),
+        );
+
+        assert!(!engine.card_present);
+        assert!(!engine.activated);
+        assert_eq!(engine.card_gen, initial_gen + 1);
+        assert_eq!(t.actions.len(), 2);
+        assert_eq!(t.actions[0], Action::CancelTransfers);
+        match &t.actions[1] {
+            Action::Complete { id, result } => {
+                assert_eq!(*id, op_id);
+                assert_eq!(result, &Err(CcidError::CardRemoved));
             }
             _ => panic!("expected Complete action"),
         }

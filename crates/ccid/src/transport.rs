@@ -46,6 +46,12 @@ const EXTENDED_RESPONSE_DATA_MAX_BYTES: usize = 1 << 16;
 const SW1_BYTES_AVAILABLE: u8 = 0x61;
 /// ISO 7816-4 status word indicating wrong Le length.
 const SW1_WRONG_LE: u8 = 0x6C;
+/// USB CCID Class-Specific Control Request Type: Host-to-Device | Class | Interface (CCID Rev 1.1 §5.3).
+const CCID_CONTROL_REQUEST_TYPE: u8 = 0x21;
+/// USB CCID Class-Specific Request: ABORT (CCID Rev 1.1 §5.3.1).
+const CCID_CONTROL_REQUEST_ABORT: u8 = 0x01;
+/// Default timeout for CCID transport operations in milliseconds.
+const DEFAULT_TRANSPORT_TIMEOUT_MS: u32 = 5000;
 
 /// USB Host Transport interface implemented by platform drivers (Android USB Host, libusb, etc.).
 pub trait UsbHostTransport {
@@ -174,7 +180,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
             atr: Vec::new(),
             protocol: CardProtocol::T0,
             next_op_id: 1,
-            timeout_ms: 5000,
+            timeout_ms: DEFAULT_TRANSPORT_TIMEOUT_MS,
         };
 
         let res = transport.execute_op(Operation::PowerOn {
@@ -225,7 +231,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
             atr,
             protocol,
             next_op_id: 1,
-            timeout_ms: 5000,
+            timeout_ms: DEFAULT_TRANSPORT_TIMEOUT_MS,
         }
     }
 
@@ -283,9 +289,16 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
 
     /// Reset the smart card, returning its fresh ATR.
     ///
+    /// If the reader slot previously encountered a timeout or I/O failure requiring recovery,
+    /// an `abort()` is automatically executed first. Cutting power via `PowerOff` is best-effort
+    /// (e.g. if the card was already inactive or unpowered) before re-activating via `PowerOn`.
+    ///
     /// # Errors
-    /// Returns `CcidError` if the card power cycle fails.
+    /// Returns `CcidError` if the abort or card power cycle fails.
     pub fn reset(&mut self) -> Result<Vec<u8>, CcidError> {
+        if self.engine.needs_recovery {
+            self.abort()?;
+        }
         let _ = self.execute_op(Operation::PowerOff);
         let res = self.execute_op(Operation::PowerOn {
             voltage: AUTOMATIC_VOLTAGE_SELECTION,
@@ -306,6 +319,9 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
 
     /// Abort an ongoing or stalled CCID slot operation per USB-IF CCID §5.3.1.
     ///
+    /// Clears `needs_recovery` on the engine, restoring the slot to an idle state
+    /// capable of accepting fresh commands or power resets.
+    ///
     /// # Errors
     /// Returns `CcidError` if the abort control transfer or slot status exchange fails.
     pub fn abort(&mut self) -> Result<(), CcidError> {
@@ -315,8 +331,14 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
         let index = u16::from(self.engine.interface_number);
 
         let mut empty_data = [];
-        self.host
-            .control_transfer(0x21, 0x01, value, index, &mut empty_data, self.timeout_ms)?;
+        self.host.control_transfer(
+            CCID_CONTROL_REQUEST_TYPE,
+            CCID_CONTROL_REQUEST_ABORT,
+            value,
+            index,
+            &mut empty_data,
+            self.timeout_ms,
+        )?;
 
         let res = self.execute_op(Operation::Abort)?;
         match res {
@@ -1000,5 +1022,38 @@ mod tests {
         let res = transport.execute_op(Operation::GetSlotStatus);
         // Must return CcidError::Timeout, NOT "CCID engine terminated operation without completion"
         assert_eq!(res, Err(CcidError::Timeout));
+    }
+
+    #[test]
+    fn reset_after_timeout_issues_abort_first() {
+        let mut host = MockUsbHost::new();
+        let atr = [0x3B, 0x80, 0x00];
+        host.push_reply(Ok(mock_data_block_response(0, &atr)));
+
+        let desc = test_descriptor();
+        let mut transport =
+            CcidCardTransport::connect(host, &desc, 0, 0, 0x02, 0x82).expect("connect succeeds");
+
+        // Inject timeout failure
+        transport.host_mut().push_reply(Err(CcidError::Timeout));
+        let res = transport.execute_op(Operation::GetSlotStatus);
+        assert_eq!(res, Err(CcidError::Timeout));
+        assert!(transport.engine().needs_recovery);
+
+        // Subsequent reset should issue control abort, bulk abort, then PowerOff and PowerOn
+        let fresh_atr = [0x3B, 0x01, 0x42];
+        transport
+            .host_mut()
+            .push_reply(Ok(mock_slot_status_response(2)));
+        transport
+            .host_mut()
+            .push_reply(Ok(mock_slot_status_response(3)));
+        transport
+            .host_mut()
+            .push_reply(Ok(mock_data_block_response(4, &fresh_atr)));
+
+        let new_atr = transport.reset().expect("reset succeeds with auto-abort");
+        assert_eq!(new_atr, fresh_atr);
+        assert!(!transport.engine().needs_recovery);
     }
 }

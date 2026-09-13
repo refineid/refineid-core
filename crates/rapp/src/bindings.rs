@@ -166,6 +166,8 @@ pub enum RappBindingError {
     LocalStateFailure,
     /// Requested active pair record was not present in device-only storage.
     PairNotFound,
+    /// Referenced operation was not found in the active session.
+    UnknownOperation,
 }
 
 impl core::fmt::Display for RappBindingError {

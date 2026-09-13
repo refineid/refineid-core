@@ -216,6 +216,8 @@ pub enum RappProgressEvent {
     WaitingForCard,
     /// Card presentation wait has ended.
     CardWaitEnded,
+    /// Forward-compatible unknown progress event.
+    Unknown,
 }
 
 impl From<RappProgressEvent> for super::ProgressEvent {
@@ -223,6 +225,7 @@ impl From<RappProgressEvent> for super::ProgressEvent {
         match value {
             RappProgressEvent::WaitingForCard => Self::WaitingForCard,
             RappProgressEvent::CardWaitEnded => Self::CardWaitEnded,
+            RappProgressEvent::Unknown => Self::Unknown,
         }
     }
 }
@@ -232,7 +235,7 @@ impl From<super::ProgressEvent> for RappProgressEvent {
         match value {
             super::ProgressEvent::WaitingForCard => Self::WaitingForCard,
             super::ProgressEvent::CardWaitEnded => Self::CardWaitEnded,
-            super::ProgressEvent::Unknown => Self::WaitingForCard,
+            super::ProgressEvent::Unknown => Self::Unknown,
         }
     }
 }
@@ -1768,10 +1771,11 @@ const fn operation_state_name(state: OperationState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{OperationId, ProgressEvent};
 
     #[test]
     fn progress_action_mapping() {
-        let op_id = OperationId::new([0x11; 16]);
+        let op_id = OperationId::from_array([0x11; 16]);
         let mut action = RappBridgeAction::for_operation(RappBridgeActionKind::Progress, op_id);
         action.progress_event = Some(RappProgressEvent::WaitingForCard);
         assert_eq!(action.kind, RappBridgeActionKind::Progress);
@@ -1785,24 +1789,28 @@ mod tests {
     #[test]
     fn progress_event_bridge_conversions() {
         assert_eq!(
-            super::ProgressEvent::from(RappProgressEvent::WaitingForCard),
-            super::ProgressEvent::WaitingForCard
+            ProgressEvent::from(RappProgressEvent::WaitingForCard),
+            ProgressEvent::WaitingForCard
         );
         assert_eq!(
-            super::ProgressEvent::from(RappProgressEvent::CardWaitEnded),
-            super::ProgressEvent::CardWaitEnded
+            ProgressEvent::from(RappProgressEvent::CardWaitEnded),
+            ProgressEvent::CardWaitEnded
         );
         assert_eq!(
-            RappProgressEvent::from(super::ProgressEvent::WaitingForCard),
+            ProgressEvent::from(RappProgressEvent::Unknown),
+            ProgressEvent::Unknown
+        );
+        assert_eq!(
+            RappProgressEvent::from(ProgressEvent::WaitingForCard),
             RappProgressEvent::WaitingForCard
         );
         assert_eq!(
-            RappProgressEvent::from(super::ProgressEvent::CardWaitEnded),
+            RappProgressEvent::from(ProgressEvent::CardWaitEnded),
             RappProgressEvent::CardWaitEnded
         );
         assert_eq!(
-            RappProgressEvent::from(super::ProgressEvent::Unknown),
-            RappProgressEvent::WaitingForCard
+            RappProgressEvent::from(ProgressEvent::Unknown),
+            RappProgressEvent::Unknown
         );
     }
 }

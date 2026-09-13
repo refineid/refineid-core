@@ -1300,7 +1300,7 @@ error-body = {
 }
 ```
 
-Registered `error` names in RAPP 26.9: `busy`, `unknown_operation`.
+Registered `error` names in RAPP 26.9.13: `busy`, `unknown_operation`.
 
 | Condition | Wire carrier | Session effect | Pairing effect | Credential attempts |
 | --- | --- | --- | --- | --- |

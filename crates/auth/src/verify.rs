@@ -417,16 +417,6 @@ pub trait PinOps: CardTransport {
         verify_digits(self, scheme, PinSlot::Pin2, pin.digits())
     }
 
-    /// Resolve the card's credential numbering with a counter-safe
-    /// probe. The citizen numbering is tried first; a
-    /// reference-not-found answer re-probes under the organizational
-    /// numbering, and a recognized state there settles it as
-    /// organizational. Nothing but the card is trusted, and no counter
-    /// is touched.
-    ///
-    /// # Errors
-    ///
-    /// [`AuthError`] on a transport failure or state transition.
     /// Probe PIN1 retry state and resolve the card's credential numbering in a
     /// single counter-safe probe when the card uses the citizen numbering.
     ///

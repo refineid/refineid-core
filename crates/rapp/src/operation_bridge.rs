@@ -209,6 +209,37 @@ impl From<&CardOperation> for RappOperationDescriptor {
     }
 }
 
+/// Advisory progress events exposed to platform callers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+pub enum RappProgressEvent {
+    /// Proxy is waiting for card presentation.
+    WaitingForCard,
+    /// Card presentation wait has ended.
+    CardWaitEnded,
+    /// Forward-compatible unknown progress event.
+    Unknown,
+}
+
+impl From<RappProgressEvent> for super::ProgressEvent {
+    fn from(value: RappProgressEvent) -> Self {
+        match value {
+            RappProgressEvent::WaitingForCard => Self::WaitingForCard,
+            RappProgressEvent::CardWaitEnded => Self::CardWaitEnded,
+            RappProgressEvent::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<super::ProgressEvent> for RappProgressEvent {
+    fn from(value: super::ProgressEvent) -> Self {
+        match value {
+            super::ProgressEvent::WaitingForCard => Self::WaitingForCard,
+            super::ProgressEvent::CardWaitEnded => Self::CardWaitEnded,
+            super::ProgressEvent::Unknown => Self::Unknown,
+        }
+    }
+}
+
 /// Bounded action produced by the authoritative Rust state machine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum RappBridgeActionKind {
@@ -234,6 +265,8 @@ pub enum RappBridgeActionKind {
     AdvisoryCancellation,
     /// Peer acknowledged the completed result.
     ResultAcknowledged,
+    /// Advisory progress update reported by peer.
+    Progress,
     /// Peer already serves a live session for this pairing.
     PeerBusy,
     /// Peer answered a stale reference; a normal race.
@@ -300,6 +333,8 @@ pub struct RappBridgeAction {
     pub terminal_state: Option<String>,
     /// Stable terminal reason.
     pub terminal_reason: Option<RappTerminalReason>,
+    /// Advisory progress event.
+    pub progress_event: Option<RappProgressEvent>,
     /// The session must close after this frame is delivered.
     pub close_session_after_send: bool,
     /// Monotonic time of the next required liveness poll.
@@ -315,6 +350,7 @@ impl RappBridgeAction {
             frame: None,
             terminal_state: None,
             terminal_reason: None,
+            progress_event: None,
             close_session_after_send: false,
             next_poll_at_ms: None,
         }
@@ -340,6 +376,7 @@ impl RappBridgeAction {
             frame: Some(frame.into_bytes()),
             terminal_state: None,
             terminal_reason: None,
+            progress_event: None,
             close_session_after_send,
             next_poll_at_ms: None,
         }
@@ -1005,6 +1042,43 @@ impl RappOperationBridge {
         )
     }
 
+    /// Report authenticated advisory progress on an active operation.
+    ///
+    /// # Errors
+    /// [`RappBindingError`] on invalid input or the wrong protocol phase.
+    pub fn report_progress(
+        &self,
+        operation_id: Vec<u8>,
+        event: RappProgressEvent,
+    ) -> Result<RappBridgeAction, RappBindingError> {
+        let operation_id = decode_operation_id(&operation_id)?;
+        let mut state = self.lock_state()?;
+        let OperationBridgeState::Proxy {
+            runtime,
+            engine,
+            journal,
+            ..
+        } = &mut *state
+        else {
+            return Err(RappBindingError::WrongPhase);
+        };
+        let message =
+            engine
+                .report_progress(operation_id, event.into())
+                .map_err(|err| match err {
+                    ProxyEngineError::UnknownLocalOperation => RappBindingError::UnknownOperation,
+                    _ => RappBindingError::WrongPhase,
+                })?;
+        send_proxy(
+            runtime,
+            engine,
+            journal,
+            Some(operation_id),
+            &message,
+            false,
+        )
+    }
+
     /// Complete a card inspection with factory and retry state.
     ///
     /// # Errors
@@ -1396,6 +1470,18 @@ fn requester_dispatch(
             RappBridgeActionKind::NoAction,
             operation_id,
         )),
+        RequesterDispatch::Progress {
+            operation_id,
+            event,
+        } => {
+            let mut action =
+                RappBridgeAction::for_operation(RappBridgeActionKind::Progress, operation_id);
+            action.progress_event = Some(event.into());
+            Ok(action)
+        }
+        RequesterDispatch::IgnoredProgress(_) => {
+            Ok(RappBridgeAction::simple(RappBridgeActionKind::NoAction))
+        }
         RequesterDispatch::PeerBusy => Ok(RappBridgeAction::simple(RappBridgeActionKind::PeerBusy)),
         RequesterDispatch::PeerUnknownOperation(operation_id) => Ok(operation_id.map_or_else(
             || RappBridgeAction::simple(RappBridgeActionKind::PeerUnknownOperation),
@@ -1679,5 +1765,52 @@ const fn operation_state_name(state: OperationState) -> &'static str {
         OperationState::Rejected => "rejected",
         OperationState::CredentialRejected => "credential_rejected",
         OperationState::Ambiguous => "ambiguous",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{OperationId, ProgressEvent};
+
+    #[test]
+    fn progress_action_mapping() {
+        let op_id = OperationId::from_array([0x11; 16]);
+        let mut action = RappBridgeAction::for_operation(RappBridgeActionKind::Progress, op_id);
+        action.progress_event = Some(RappProgressEvent::WaitingForCard);
+        assert_eq!(action.kind, RappBridgeActionKind::Progress);
+        assert_eq!(action.operation_id, Some(op_id.as_bytes().to_vec()));
+        assert_eq!(
+            action.progress_event,
+            Some(RappProgressEvent::WaitingForCard)
+        );
+    }
+
+    #[test]
+    fn progress_event_bridge_conversions() {
+        assert_eq!(
+            ProgressEvent::from(RappProgressEvent::WaitingForCard),
+            ProgressEvent::WaitingForCard
+        );
+        assert_eq!(
+            ProgressEvent::from(RappProgressEvent::CardWaitEnded),
+            ProgressEvent::CardWaitEnded
+        );
+        assert_eq!(
+            ProgressEvent::from(RappProgressEvent::Unknown),
+            ProgressEvent::Unknown
+        );
+        assert_eq!(
+            RappProgressEvent::from(ProgressEvent::WaitingForCard),
+            RappProgressEvent::WaitingForCard
+        );
+        assert_eq!(
+            RappProgressEvent::from(ProgressEvent::CardWaitEnded),
+            RappProgressEvent::CardWaitEnded
+        );
+        assert_eq!(
+            RappProgressEvent::from(ProgressEvent::Unknown),
+            RappProgressEvent::Unknown
+        );
     }
 }

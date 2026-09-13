@@ -10,7 +10,7 @@ use refineid_rapp::{
 };
 use serde::Deserialize;
 
-const CORPUS: &str = include_str!("../../../docs/protocols/vectors/rapp-v26.9.7.70.json");
+const CORPUS: &str = include_str!("../../../docs/protocols/vectors/rapp-v26.9.13.json");
 
 #[derive(Deserialize)]
 struct Corpus {
@@ -33,7 +33,7 @@ struct SequenceVector {
 #[derive(Deserialize)]
 struct VersionVector {
     name: String,
-    version: [u16; 2],
+    version: Vec<u16>,
     expected: String,
 }
 
@@ -130,7 +130,7 @@ fn exact_directional_sequence_and_session_binding_match_the_corpus() {
 #[test]
 fn visible_wire_version_rejects_downgrades_and_unknown_upgrades() {
     for vector in corpus().wire_version {
-        let encoded = envelope_with_version(vector.version);
+        let encoded = envelope_with_version(&vector.version);
         match vector.expected.as_str() {
             "accepted" => assert!(Envelope::decode(&encoded).is_ok(), "{}", vector.name),
             "unsupported_version" => assert_eq!(
@@ -206,7 +206,7 @@ fn envelope(session_id: SessionId, sequence: u64) -> Envelope {
     .expect("valid sequence-test envelope")
 }
 
-fn envelope_with_version(version: [u16; 2]) -> Vec<u8> {
+fn envelope_with_version(version: &[u16]) -> Vec<u8> {
     let encoded = envelope(SessionId::from_array([0x44; 16]), 0)
         .encode()
         .expect("valid envelope encodes");
@@ -216,10 +216,14 @@ fn envelope_with_version(version: [u16; 2]) -> Vec<u8> {
     };
     map.insert(
         "version".to_owned(),
-        WireValue::Array(vec![
-            WireValue::Unsigned(u64::from(version[0])),
-            WireValue::Unsigned(u64::from(version[1])),
-        ]),
+        WireValue::Array(
+            version
+                .iter()
+                .copied()
+                .map(u64::from)
+                .map(WireValue::Unsigned)
+                .collect(),
+        ),
     );
     encode_deterministic_cbor(&WireValue::Map(map)).expect("mutated envelope encodes")
 }

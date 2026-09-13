@@ -253,6 +253,7 @@ fn version_value() -> WireValue {
     WireValue::Array(vec![
         WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.0)),
         WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.1)),
+        WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.2)),
     ])
 }
 
@@ -287,6 +288,6 @@ fn encode_hex(bytes: &[u8]) -> String {
 
 fn load_corpus() -> Corpus {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../docs/protocols/vectors/rapp-v26.9.7.70.json");
+        .join("../../docs/protocols/vectors/rapp-v26.9.13.json");
     serde_json::from_slice(&fs::read(path).expect("read RAPP corpus")).expect("decode RAPP corpus")
 }

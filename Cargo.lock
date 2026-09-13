@@ -833,7 +833,7 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "refineid-apdu"
-version = "26.9.12"
+version = "26.9.13"
 dependencies = [
  "serde",
  "trybuild",
@@ -842,11 +842,11 @@ dependencies = [
 
 [[package]]
 name = "refineid-atr"
-version = "26.9.12"
+version = "26.9.13"
 
 [[package]]
 name = "refineid-auth"
-version = "26.9.12"
+version = "26.9.13"
 dependencies = [
  "hmac",
  "refineid-apdu",
@@ -858,11 +858,11 @@ dependencies = [
 
 [[package]]
 name = "refineid-ber"
-version = "26.9.12"
+version = "26.9.13"
 
 [[package]]
 name = "refineid-cms"
-version = "26.9.12"
+version = "26.9.13"
 dependencies = [
  "const-oid",
  "crypto-bigint",
@@ -878,7 +878,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-digest"
-version = "26.9.12"
+version = "26.9.13"
 dependencies = [
  "sha1",
  "sha2 0.11.0",
@@ -886,7 +886,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-emrtd"
-version = "26.9.12"
+version = "26.9.13"
 dependencies = [
  "hex",
  "refineid-apdu",
@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-pace"
-version = "26.9.12"
+version = "26.9.13"
 dependencies = [
  "aes 0.9.2",
  "cbc",
@@ -914,7 +914,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-pcsc"
-version = "26.9.12"
+version = "26.9.13"
 dependencies = [
  "pcsc",
  "refineid-apdu",
@@ -923,7 +923,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-pin-cache"
-version = "26.9.12"
+version = "26.9.13"
 dependencies = [
  "getrandom 0.4.3",
  "refineid-auth",
@@ -934,7 +934,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-pkcs11"
-version = "26.9.12"
+version = "26.9.13"
 dependencies = [
  "getrandom 0.4.3",
  "hex",
@@ -953,7 +953,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-pkcs15"
-version = "26.9.12"
+version = "26.9.13"
 dependencies = [
  "refineid-apdu",
  "refineid-ber",
@@ -962,7 +962,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-rapp"
-version = "26.9.12"
+version = "26.9.13"
 dependencies = [
  "getrandom 0.4.3",
  "serde",
@@ -976,14 +976,14 @@ dependencies = [
 
 [[package]]
 name = "refineid-remote"
-version = "26.9.12"
+version = "26.9.13"
 dependencies = [
  "refineid-digest",
 ]
 
 [[package]]
 name = "refineid-sign"
-version = "26.9.12"
+version = "26.9.13"
 dependencies = [
  "refineid-apdu",
  "zeroize",
@@ -991,7 +991,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-x509"
-version = "26.9.12"
+version = "26.9.13"
 dependencies = [
  "refineid-ber",
 ]
@@ -1616,7 +1616,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "26.9.12"
+version = "26.9.13"
 dependencies = [
  "proc-macro2",
  "rustc_lexer",

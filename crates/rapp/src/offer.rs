@@ -183,6 +183,7 @@ impl PairingOffer {
             != vec![
                 WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.0)),
                 WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.1)),
+                WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.2)),
             ]
         {
             return Err(PairingOfferError::UnsupportedVersion);
@@ -262,6 +263,7 @@ impl PairingOffer {
                 WireValue::Array(vec![
                     WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.0)),
                     WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.1)),
+                    WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.2)),
                 ]),
             ),
             (

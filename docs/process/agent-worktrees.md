@@ -76,6 +76,6 @@ in seconds whether to resume work or clean up. In particular:
 2. Run `./scripts/verify-push.sh` to ensure all pre-push gates pass.
 3. Commit on the task branch (imperative subject and explanatory body only; no attribution trailers) and push.
 4. Open one pull request for the branch.
-5. Merge once CI is green, using merge (not squash) so branch history survives.
+5. Squash-merge once CI is green, so the `main` history stays linear. The pull request preserves the branch history.
 6. Remove the worktree (`git worktree remove`), delete the branch, and
    fast-forward local main.

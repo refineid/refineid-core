@@ -185,9 +185,14 @@ impl CertSlot {
     }
 }
 
-/// Bytes requested per READ BINARY. FINEID published examples assume a
-/// 128-byte chunk against the card's command buffer.
-const READ_CHUNK: u8 = 0x80;
+/// Bytes requested per READ BINARY. Short-APDU responses top out at
+/// 256 bytes and CCID readers move at most their declared message
+/// length, so 224 leaves headroom for status words and transport
+/// framing on every reader while nearly halving round trips against
+/// the 128-byte FINEID published examples. Cards that honor less
+/// answer short reads or wrong-Le, which the read loops and the
+/// transport already absorb.
+const READ_CHUNK: u8 = 0xE0;
 
 /// Hard cap on one object read. FINEID certificates are under two
 /// kibibytes; a sixteen-kibibyte ceiling leaves room for variants while
@@ -525,6 +530,13 @@ pub trait Pkcs15Ops: CardTransport {
     /// reject an overlong final read instead of returning a partial
     /// body.
     ///
+    /// A chunk may also carry more bytes than requested: the T=0 layer
+    /// answers a 61xx status by fetching the card's pending count,
+    /// which under secure messaging accounts the protected framing and
+    /// can exceed the requested length. The loop advances by the actual
+    /// body length and truncates at the declared DER total, so the
+    /// surplus is consumed, never skipped or re-read.
+    ///
     /// # Errors
     ///
     /// Transport failures, an unexpected status word, malformed or
@@ -556,9 +568,6 @@ pub trait Pkcs15Ops: CardTransport {
             let end_of_file = matches!(response.status_word(), StatusWord::EndOfFile);
             if !response.is_ok() && !end_of_file {
                 return Err(Pkcs15Error::Status(response.status_word()));
-            }
-            if response.body.len() > usize::from(want) {
-                return Err(Pkcs15Error::InvalidData(what));
             }
             if response.body.is_empty() {
                 return if collected.is_empty() {

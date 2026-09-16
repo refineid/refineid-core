@@ -29,7 +29,7 @@ use refineid_pkcs15::{
 
 /// Chunk size the read loops request, mirroring the implementation; a
 /// change there must fail these scripts loudly.
-const READ_CHUNK_LEN: u8 = 0xE0;
+const READ_CHUNK_LEN: u8 = 0xDF;
 /// Certificate content length that forces a two-chunk read.
 const TWO_CHUNK_CONTENT_LEN: usize = 300;
 /// Surplus bytes past the requested chunk a T=0 61xx chain may

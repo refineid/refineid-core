@@ -187,12 +187,13 @@ impl CertSlot {
 
 /// Bytes requested per READ BINARY. Short-APDU responses top out at
 /// 256 bytes and CCID readers move at most their declared message
-/// length, so 224 leaves headroom for status words and transport
+/// length, so 223 leaves headroom for status words and transport
 /// framing on every reader while nearly halving round trips against
-/// the 128-byte FINEID published examples. Cards that honor less
-/// answer short reads or wrong-Le, which the read loops and the
-/// transport already absorb.
-const READ_CHUNK: u8 = 0xE0;
+/// the 128-byte FINEID published examples. The same ceiling keeps a
+/// secure-messaging span inside one short-APDU response, so protected
+/// reads never fragment. Cards that honor less answer short reads or
+/// wrong-Le, which the read loops and the transport already absorb.
+const READ_CHUNK: u8 = 0xDF;
 
 /// Hard cap on one object read. FINEID certificates are under two
 /// kibibytes; a sixteen-kibibyte ceiling leaves room for variants while

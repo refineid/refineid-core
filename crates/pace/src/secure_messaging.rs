@@ -66,14 +66,17 @@ const PAD_FILLER: u8 = 0x00;
 const SM_LE_ANY: u8 = 0x00;
 
 /// Largest READ BINARY length the protected channel issues on the
-/// wire. Observed on production hardware against a low-cost TPDU
-/// reader, a 224-byte READ BINARY under secure messaging returns a
-/// 61F2-pending response whose recovered bytes fail framing, while
-/// the same span read at 128 bytes per exchange succeeds; whether
-/// the card or the reader mangles the longer span is unproven.
+/// wire. A wrapped response carries the cryptogram object, the
+/// two-byte protected status, and the eight-byte authentication tag,
+/// so a 224-byte span wraps to 258 response bytes: more than one
+/// short-APDU response holds. The card answers 61F2 and the recovered
+/// span fails framing, observed on production hardware. At 223 bytes
+/// the wrapped response is 242 bytes, inside both the 256-byte
+/// short-APDU response and the smallest CCID payload ceilings, so
+/// every span completes in one staging exchange plus one GET RESPONSE.
 /// Plain transports are unaffected and keep their own chunk sizes;
 /// only the wrapped command fragments here.
-const SM_READ_BINARY_MAX_LE: u8 = 0x80;
+const SM_READ_BINARY_MAX_LE: u8 = 0xDF;
 /// READ BINARY lengths are case-2 commands: the four header bytes
 /// plus the Le byte.
 const CASE2_COMMAND_LEN: usize = 5;
@@ -412,7 +415,7 @@ type FragmentPair = ([u8; CASE2_COMMAND_LEN], [u8; CASE2_COMMAND_LEN]);
 /// [`SM_READ_BINARY_MAX_LE`] into two wire reads covering the same
 /// span: a full first fragment plus the remainder. Every other
 /// command transmits as one exchange. An Le of zero reads all 256
-/// short-form bytes as two full fragments.
+/// short-form bytes as a full fragment plus a 33-byte remainder.
 fn split_protected_read<E>(command: &[u8]) -> Result<Option<FragmentPair>, SmError<E>> {
     if command.len() != CASE2_COMMAND_LEN || command[INS_INDEX] != ReadBinary::INS {
         return Ok(None);
@@ -557,10 +560,10 @@ fn decode_short_apdu(apdu: &[u8]) -> Option<(&[u8], Option<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AES_BLOCK, Aes256Key, PaceSession, SM_READ_BINARY_MAX_LE, SmError, SmTransport, Ssc,
-        TAG_CRYPTOGRAM, TAG_MAC, TAG_PROTECTED_STATUS, aes256_cbc_encrypt_no_padding,
-        aes256_cmac_truncated, aes256_ecb_encrypt_block, decode_short_apdu, iso7816_4_pad,
-        iso7816_4_unpad, split_protected_read,
+        AES_BLOCK, Aes256Key, LE_ALL_BYTES, PaceSession, SM_READ_BINARY_MAX_LE, SmError,
+        SmTransport, Ssc, TAG_CRYPTOGRAM, TAG_MAC, TAG_PROTECTED_STATUS,
+        aes256_cbc_encrypt_no_padding, aes256_cmac_truncated, aes256_ecb_encrypt_block,
+        decode_short_apdu, iso7816_4_pad, iso7816_4_unpad, split_protected_read,
     };
     use refineid_apdu::{
         ApduClass, CardTransport, CommandApdu, CommandHeader, CredentialCommand, ResponseApdu,
@@ -871,8 +874,9 @@ mod tests {
         assert!(matches!(error, SmError::Unprotected(sw) if sw == StatusWord::Success));
     }
 
-    /// Total length the fragmentation tests request, mirroring the
-    /// file-read chunk sizes above this layer.
+    /// Total length the fragmentation tests request: one byte over
+    /// the fragment ceiling, so every split test covers a full first
+    /// fragment plus a remainder.
     const SPLIT_TOTAL_LE: u8 = 0xE0;
     /// Second-fragment length for a full-size split.
     const SECOND_FRAGMENT_LEN: usize = SPLIT_TOTAL_LE as usize - SM_READ_BINARY_MAX_LE as usize;
@@ -884,7 +888,8 @@ mod tests {
     /// fifteen-bit form.
     const OVERFLOW_OFFSET_HIGH: u8 = 0x7F;
     /// P1 whose SFI fragment would leave the eleven-bit form: short
-    /// file identifier 2 at offset high 7 with low byte 128.
+    /// file identifier 2 at offset high 7 with the low byte at the
+    /// fragment ceiling.
     const SFI_OVERFLOW_P1: u8 = 0x97;
     /// Transmit count for one unfragmented exchange.
     const SINGLE_EXCHANGE_COUNT: usize = 1;
@@ -966,13 +971,15 @@ mod tests {
     }
 
     #[test]
-    fn le_zero_reads_all_as_two_full_fragments() {
+    fn le_zero_reads_all_as_full_fragment_plus_remainder() {
         let command = read_command(P_ZERO, P_ZERO, P_ZERO);
         let (first, second) = split_protected_read::<String>(command.as_bytes())
             .expect("splittable")
             .expect("an Le-zero read must split");
+        let remainder = u8::try_from(LE_ALL_BYTES - usize::from(SM_READ_BINARY_MAX_LE))
+            .expect("remainder fits one byte");
         assert_eq!(first[LE_INDEX_TEST], SM_READ_BINARY_MAX_LE);
-        assert_eq!(second[LE_INDEX_TEST], SM_READ_BINARY_MAX_LE);
+        assert_eq!(second[LE_INDEX_TEST], remainder);
         assert_eq!(second[P1_INDEX_TEST], P_ZERO);
         assert_eq!(second[P2_INDEX_TEST], SM_READ_BINARY_MAX_LE);
     }

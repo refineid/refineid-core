@@ -24,7 +24,10 @@ use crate::sfi::Sfi;
 const INS_READ_BINARY: u8 = 0xB0;
 const PARAMETER_ZERO: u8 = 0x00;
 const HEADER_PROBE_LENGTH: u8 = 0x04;
-const READ_CHUNK_MAX_LENGTH: u8 = 0xE0;
+/// Bytes requested per READ BINARY chunk: the largest span whose
+/// secure-messaging response still fits one short-APDU response, so
+/// protected reads never fragment.
+const READ_CHUNK_MAX_LENGTH: u8 = 0xDF;
 const SW_END_OF_FILE_REACHED: u16 = 0x6282;
 
 const MULTI_BYTE_TAG_FLAG: u8 = 0x1F;

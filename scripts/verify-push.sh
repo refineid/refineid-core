@@ -30,6 +30,7 @@ cargo run -q -p xtask -- check-magic-numbers
 if command -v cargo-audit > /dev/null 2>&1; then
     cargo audit
 fi
+cargo vet --locked
 git diff --exit-code --quiet || {
     echo "pre-push: working tree has unstaged modifications"
     exit 1

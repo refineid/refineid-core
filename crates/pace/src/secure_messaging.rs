@@ -31,6 +31,7 @@
 use subtle::ConstantTimeEq as _;
 use zeroize::Zeroizing;
 
+use refineid_apdu::iso7816::ReadBinary;
 use refineid_apdu::{
     ApduClass, CardTransport, CommandApdu, CommandHeader, CredentialCommand, ResponseApdu,
     StatusWord, TransportErrorExt, TransportErrorKind, TransportOutcome,
@@ -63,6 +64,39 @@ const PAD_FILLER: u8 = 0x00;
 
 /// Expected-length byte requesting every available response byte.
 const SM_LE_ANY: u8 = 0x00;
+
+/// Largest READ BINARY length the protected channel issues on the
+/// wire. Observed on production hardware against a low-cost TPDU
+/// reader, a 224-byte READ BINARY under secure messaging returns a
+/// 61F2-pending response whose recovered bytes fail framing, while
+/// the same span read at 128 bytes per exchange succeeds; whether
+/// the card or the reader mangles the longer span is unproven.
+/// Plain transports are unaffected and keep their own chunk sizes;
+/// only the wrapped command fragments here.
+const SM_READ_BINARY_MAX_LE: u8 = 0x80;
+/// READ BINARY lengths are case-2 commands: the four header bytes
+/// plus the Le byte.
+const CASE2_COMMAND_LEN: usize = 5;
+/// Class index in a raw command.
+const CLA_INDEX: usize = 0;
+/// Instruction index in a raw command.
+const INS_INDEX: usize = 1;
+/// P1 index in a raw command.
+const P1_INDEX: usize = 2;
+/// P2 index in a raw command.
+const P2_INDEX: usize = 3;
+/// Le index in a case-2 command.
+const LE_INDEX: usize = 4;
+/// P1 flag selecting the short-file-identifier offset form.
+const P1_SFI_FORM_FLAG: u8 = 0x80;
+/// P1 low bits carrying the offset high bits in the SFI form.
+const P1_SFI_OFFSET_HIGH_MASK: u8 = 0x07;
+/// Short-form Le byte meaning "all", 256 bytes.
+const LE_ALL_BYTES: usize = 256;
+/// Largest direct-form offset: fifteen bits.
+const DIRECT_OFFSET_MAX: u16 = 0x7FFF;
+/// Largest SFI-form offset: eleven bits.
+const SFI_OFFSET_MAX: u16 = 0x07FF;
 
 /// The command-header length in bytes.
 const HEADER_LEN: usize = 4;
@@ -327,15 +361,114 @@ impl<T: CardTransport> SmTransport<T> {
     }
 }
 
-impl<T: CardTransport> CardTransport for SmTransport<T> {
-    type Error = SmError<T::Error>;
-
-    fn transmit(&mut self, command: &CommandApdu) -> Result<TransportOutcome, Self::Error> {
-        let (header, body) = self.wrap(command.as_bytes())?;
+impl<T: CardTransport> SmTransport<T> {
+    /// One protected exchange: wrap, transmit, authenticate.
+    fn transmit_single(&mut self, plain: &[u8]) -> Result<TransportOutcome, SmError<T::Error>> {
+        let (header, body) = self.wrap(plain)?;
         let wrapped = CommandApdu::case_4(header, &body, SM_LE_ANY)
             .map_err(|_too_long| SmError::CommandTooLong)?;
         let raw = self.inner.transmit(&wrapped).map_err(SmError::Transport)?;
         self.finish(raw)
+    }
+
+    /// Two protected reads covering one overlong READ BINARY span.
+    /// The second exchange runs only when the first returns a full
+    /// fragment: a short read is end-of-file and an overlong body is
+    /// the card's 61xx surplus, which the caller above consumes by its
+    /// actual length, so either returns as the outcome without a
+    /// second exchange that would re-read or skip bytes.
+    fn transmit_fragmented_read(
+        &mut self,
+        first: &[u8; CASE2_COMMAND_LEN],
+        second: &[u8; CASE2_COMMAND_LEN],
+    ) -> Result<TransportOutcome, SmError<T::Error>> {
+        let first_response = match self.transmit_single(first)? {
+            TransportOutcome::Response(response) => response,
+            fault => return Ok(fault),
+        };
+        if !first_response.is_ok()
+            || first_response.body.len() != usize::from(SM_READ_BINARY_MAX_LE)
+        {
+            return Ok(TransportOutcome::Response(first_response));
+        }
+        let second_response = match self.transmit_single(second)? {
+            TransportOutcome::Response(response) => response,
+            fault => return Ok(fault),
+        };
+        let mut body = first_response.body;
+        body.extend_from_slice(&second_response.body);
+        Ok(TransportOutcome::Response(ResponseApdu {
+            body,
+            sw1: second_response.sw1,
+            sw2: second_response.sw2,
+        }))
+    }
+}
+
+/// Two case-2 wire reads covering one overlong READ BINARY span.
+type FragmentPair = ([u8; CASE2_COMMAND_LEN], [u8; CASE2_COMMAND_LEN]);
+
+/// Split a case-2 READ BINARY whose Le exceeds
+/// [`SM_READ_BINARY_MAX_LE`] into two wire reads covering the same
+/// span: a full first fragment plus the remainder. Every other
+/// command transmits as one exchange. An Le of zero reads all 256
+/// short-form bytes as two full fragments.
+fn split_protected_read<E>(command: &[u8]) -> Result<Option<FragmentPair>, SmError<E>> {
+    if command.len() != CASE2_COMMAND_LEN || command[INS_INDEX] != ReadBinary::INS {
+        return Ok(None);
+    }
+    let le = command[LE_INDEX];
+    let total = if le == SM_LE_ANY {
+        LE_ALL_BYTES
+    } else {
+        usize::from(le)
+    };
+    let first_len = usize::from(SM_READ_BINARY_MAX_LE);
+    if total <= first_len {
+        return Ok(None);
+    }
+    let p1 = command[P1_INDEX];
+    let p2 = command[P2_INDEX];
+    let offset = if p1 & P1_SFI_FORM_FLAG == 0 {
+        (u16::from(p1) << u8::BITS) | u16::from(p2)
+    } else {
+        (u16::from(p1 & P1_SFI_OFFSET_HIGH_MASK) << u8::BITS) | u16::from(p2)
+    };
+    let ceiling = if p1 & P1_SFI_FORM_FLAG == 0 {
+        DIRECT_OFFSET_MAX
+    } else {
+        SFI_OFFSET_MAX
+    };
+    let second_offset = offset
+        .checked_add(u16::from(SM_READ_BINARY_MAX_LE))
+        .filter(|advanced| *advanced <= ceiling)
+        .ok_or(SmError::Malformed("fragmented read offset out of form"))?;
+    let second_le =
+        u8::try_from(total - first_len).map_err(|_| SmError::Malformed("fragment too long"))?;
+    let (second_p1, second_p2) = if p1 & P1_SFI_FORM_FLAG == 0 {
+        ((second_offset >> u8::BITS) as u8, second_offset as u8)
+    } else {
+        (
+            (p1 & !P1_SFI_OFFSET_HIGH_MASK)
+                | ((second_offset >> u8::BITS) as u8 & P1_SFI_OFFSET_HIGH_MASK),
+            second_offset as u8,
+        )
+    };
+    let class = command[CLA_INDEX];
+    Ok(Some((
+        [class, ReadBinary::INS, p1, p2, SM_READ_BINARY_MAX_LE],
+        [class, ReadBinary::INS, second_p1, second_p2, second_le],
+    )))
+}
+
+impl<T: CardTransport> CardTransport for SmTransport<T> {
+    type Error = SmError<T::Error>;
+
+    fn transmit(&mut self, command: &CommandApdu) -> Result<TransportOutcome, Self::Error> {
+        match split_protected_read(command.as_bytes())? {
+            Some((first, second)) => self.transmit_fragmented_read(&first, &second),
+            None => self.transmit_single(command.as_bytes()),
+        }
     }
 
     fn transmit_credential(
@@ -424,9 +557,10 @@ fn decode_short_apdu(apdu: &[u8]) -> Option<(&[u8], Option<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AES_BLOCK, Aes256Key, PaceSession, SmError, SmTransport, Ssc, TAG_CRYPTOGRAM, TAG_MAC,
-        TAG_PROTECTED_STATUS, aes256_cbc_encrypt_no_padding, aes256_cmac_truncated,
-        aes256_ecb_encrypt_block, decode_short_apdu, iso7816_4_pad, iso7816_4_unpad,
+        AES_BLOCK, Aes256Key, PaceSession, SM_READ_BINARY_MAX_LE, SmError, SmTransport, Ssc,
+        TAG_CRYPTOGRAM, TAG_MAC, TAG_PROTECTED_STATUS, aes256_cbc_encrypt_no_padding,
+        aes256_cmac_truncated, aes256_ecb_encrypt_block, decode_short_apdu, iso7816_4_pad,
+        iso7816_4_unpad, split_protected_read,
     };
     use refineid_apdu::{
         ApduClass, CardTransport, CommandApdu, CommandHeader, CredentialCommand, ResponseApdu,
@@ -735,5 +869,282 @@ mod tests {
             .transmit(&command)
             .expect_err("an unprotected response is refused");
         assert!(matches!(error, SmError::Unprotected(sw) if sw == StatusWord::Success));
+    }
+
+    /// Total length the fragmentation tests request, mirroring the
+    /// file-read chunk sizes above this layer.
+    const SPLIT_TOTAL_LE: u8 = 0xE0;
+    /// Second-fragment length for a full-size split.
+    const SECOND_FRAGMENT_LEN: usize = SPLIT_TOTAL_LE as usize - SM_READ_BINARY_MAX_LE as usize;
+    /// Nonzero direct offset high byte for the split tests.
+    const SPLIT_OFFSET_HIGH: u8 = 0x01;
+    /// P1 selecting short file identifier 2 at offset high 0.
+    const SFI_PROBE_P1: u8 = 0x90;
+    /// Direct offset high byte whose fragment would leave the
+    /// fifteen-bit form.
+    const OVERFLOW_OFFSET_HIGH: u8 = 0x7F;
+    /// P1 whose SFI fragment would leave the eleven-bit form: short
+    /// file identifier 2 at offset high 7 with low byte 128.
+    const SFI_OVERFLOW_P1: u8 = 0x97;
+    /// Transmit count for one unfragmented exchange.
+    const SINGLE_EXCHANGE_COUNT: usize = 1;
+    /// Transmit count for one fragmented exchange.
+    const FRAGMENTED_EXCHANGE_COUNT: usize = 2;
+    /// First-fragment payload filler.
+    const FIRST_FILL: u8 = 0x41;
+    /// Second-fragment payload filler.
+    const SECOND_FILL: u8 = 0x43;
+    /// Bytes past a full fragment a 61xx surplus may add.
+    const SURPLUS_EXTRA_LEN: usize = 12;
+
+    fn read_command(p1: u8, p2: u8, le: u8) -> CommandApdu {
+        CommandApdu::case_2(
+            CommandHeader {
+                class: ApduClass::Plain,
+                instruction: READ_BINARY_INS,
+                p1,
+                p2,
+            },
+            le,
+        )
+    }
+
+    #[test]
+    fn direct_read_splits_at_the_fragment_ceiling() {
+        let command = read_command(SPLIT_OFFSET_HIGH, P_ZERO, SPLIT_TOTAL_LE);
+        let (first, second) = split_protected_read::<String>(command.as_bytes())
+            .expect("splittable")
+            .expect("a 224-byte read must split");
+        assert_eq!(
+            first,
+            [
+                P_ZERO,
+                READ_BINARY_INS,
+                SPLIT_OFFSET_HIGH,
+                P_ZERO,
+                SM_READ_BINARY_MAX_LE
+            ]
+        );
+        assert_eq!(
+            second,
+            [
+                P_ZERO,
+                READ_BINARY_INS,
+                SPLIT_OFFSET_HIGH,
+                SM_READ_BINARY_MAX_LE,
+                SPLIT_TOTAL_LE - SM_READ_BINARY_MAX_LE
+            ]
+        );
+    }
+
+    #[test]
+    fn sfi_read_keeps_its_selector_across_fragments() {
+        let command = read_command(SFI_PROBE_P1, P_ZERO, SPLIT_TOTAL_LE);
+        let (first, second) = split_protected_read::<String>(command.as_bytes())
+            .expect("splittable")
+            .expect("an SFI read must split");
+        assert_eq!(
+            first,
+            [
+                P_ZERO,
+                READ_BINARY_INS,
+                SFI_PROBE_P1,
+                P_ZERO,
+                SM_READ_BINARY_MAX_LE
+            ]
+        );
+        assert_eq!(
+            second,
+            [
+                P_ZERO,
+                READ_BINARY_INS,
+                SFI_PROBE_P1,
+                SM_READ_BINARY_MAX_LE,
+                SPLIT_TOTAL_LE - SM_READ_BINARY_MAX_LE
+            ]
+        );
+    }
+
+    #[test]
+    fn le_zero_reads_all_as_two_full_fragments() {
+        let command = read_command(P_ZERO, P_ZERO, P_ZERO);
+        let (first, second) = split_protected_read::<String>(command.as_bytes())
+            .expect("splittable")
+            .expect("an Le-zero read must split");
+        assert_eq!(first[LE_INDEX_TEST], SM_READ_BINARY_MAX_LE);
+        assert_eq!(second[LE_INDEX_TEST], SM_READ_BINARY_MAX_LE);
+        assert_eq!(second[P1_INDEX_TEST], P_ZERO);
+        assert_eq!(second[P2_INDEX_TEST], SM_READ_BINARY_MAX_LE);
+    }
+
+    /// Le index in a raw case-2 command under test.
+    const LE_INDEX_TEST: usize = 4;
+    /// P1 index in a raw case-2 command under test.
+    const P1_INDEX_TEST: usize = 2;
+    /// P2 index in a raw case-2 command under test.
+    const P2_INDEX_TEST: usize = 3;
+
+    #[test]
+    fn short_reads_and_other_commands_transmit_whole() {
+        for le in [P_ZERO + 1, SM_READ_BINARY_MAX_LE] {
+            let command = read_command(P_ZERO, P_ZERO, le);
+            assert!(
+                split_protected_read::<String>(command.as_bytes())
+                    .expect("decodable")
+                    .is_none(),
+                "Le {le} must not split"
+            );
+        }
+        assert!(
+            split_protected_read::<String>(SELECT_EF_APDU)
+                .expect("decodable")
+                .is_none(),
+            "a SELECT must not split"
+        );
+    }
+
+    #[test]
+    fn fragment_leaving_its_offset_form_is_rejected() {
+        let direct = read_command(OVERFLOW_OFFSET_HIGH, SM_READ_BINARY_MAX_LE, SPLIT_TOTAL_LE);
+        let error = split_protected_read::<String>(direct.as_bytes())
+            .expect_err("a direct overflow must fail");
+        assert!(matches!(error, SmError::Malformed(_)));
+
+        let sfi = read_command(SFI_OVERFLOW_P1, SM_READ_BINARY_MAX_LE, SPLIT_TOTAL_LE);
+        let error =
+            split_protected_read::<String>(sfi.as_bytes()).expect_err("an SFI overflow must fail");
+        assert!(matches!(error, SmError::Malformed(_)));
+    }
+
+    /// A transport replaying scripted outcomes while recording every
+    /// command it receives.
+    struct ScriptedInner {
+        script: Vec<TransportOutcome>,
+        seen: Vec<Vec<u8>>,
+    }
+
+    impl CardTransport for ScriptedInner {
+        type Error = String;
+
+        fn transmit(&mut self, command: &CommandApdu) -> Result<TransportOutcome, Self::Error> {
+            self.seen.push(command.as_bytes().to_vec());
+            self.script
+                .get(self.seen.len() - 1)
+                .cloned()
+                .ok_or_else(|| "script exhausted".to_owned())
+        }
+
+        fn transmit_credential(
+            &mut self,
+            _command: CredentialCommand,
+        ) -> Result<TransportOutcome, Self::Error> {
+            Err("no credential in this test".to_owned())
+        }
+    }
+
+    /// The protected Le byte a wrapped command carries in its
+    /// expected-length object.
+    fn protected_le(wire: &[u8]) -> Option<u8> {
+        const LEN_OCTET_SKIP: usize = 2;
+        let at = wire
+            .iter()
+            .position(|byte| *byte == super::TAG_PROTECTED_LE)?;
+        wire.get(at + LEN_OCTET_SKIP).copied()
+    }
+
+    fn scripted_response(payload: &[u8], steps: u32) -> TransportOutcome {
+        let [sw1, sw2] = success_bytes();
+        TransportOutcome::Response(ResponseApdu {
+            body: card_response(steps, payload, StatusWord::Success),
+            sw1,
+            sw2,
+        })
+    }
+
+    #[test]
+    fn fragmented_read_combines_both_fragments() {
+        let first_payload = vec![FIRST_FILL; SM_READ_BINARY_MAX_LE as usize];
+        let second_payload = vec![SECOND_FILL; SECOND_FRAGMENT_LEN];
+        let mut terminal = SmTransport::new(
+            ScriptedInner {
+                script: vec![
+                    scripted_response(&first_payload, EXCHANGE_STEPS),
+                    scripted_response(&second_payload, EXCHANGE_STEPS + EXCHANGE_STEPS),
+                ],
+                seen: Vec::new(),
+            },
+            session(),
+        );
+        let command = read_command(P_ZERO, P_ZERO, SPLIT_TOTAL_LE);
+        let outcome = terminal.transmit(&command).expect("fragments combine");
+        let response = outcome.into_response().expect("real response");
+        assert!(response.is_ok());
+        let mut combined = first_payload;
+        combined.extend_from_slice(&second_payload);
+        assert_eq!(response.body, combined);
+
+        let seen = terminal.into_inner().seen;
+        assert_eq!(seen.len(), FRAGMENTED_EXCHANGE_COUNT);
+        assert_eq!(
+            protected_le(&seen[0]).expect("first Le"),
+            SM_READ_BINARY_MAX_LE
+        );
+        assert_eq!(
+            protected_le(&seen[1]).expect("second Le"),
+            SPLIT_TOTAL_LE - SM_READ_BINARY_MAX_LE
+        );
+        assert_eq!(seen[1][P1_INDEX_TEST], P_ZERO);
+        assert_eq!(seen[1][P2_INDEX_TEST], SM_READ_BINARY_MAX_LE);
+    }
+
+    #[test]
+    fn short_first_fragment_returns_without_a_second_exchange() {
+        let mut terminal = SmTransport::new(
+            ScriptedInner {
+                script: vec![scripted_response(SHORT_PAYLOAD, EXCHANGE_STEPS)],
+                seen: Vec::new(),
+            },
+            session(),
+        );
+        let command = read_command(P_ZERO, P_ZERO, SPLIT_TOTAL_LE);
+        let outcome = terminal.transmit(&command).expect("short read ends");
+        let response = outcome.into_response().expect("real response");
+        assert_eq!(response.body.as_slice(), SHORT_PAYLOAD);
+        assert_eq!(terminal.into_inner().seen.len(), SINGLE_EXCHANGE_COUNT);
+    }
+
+    #[test]
+    fn overlong_first_fragment_returns_without_a_second_exchange() {
+        let surplus_len = SM_READ_BINARY_MAX_LE as usize + SURPLUS_EXTRA_LEN;
+        let surplus = vec![FIRST_FILL; surplus_len];
+        let mut terminal = SmTransport::new(
+            ScriptedInner {
+                script: vec![scripted_response(&surplus, EXCHANGE_STEPS)],
+                seen: Vec::new(),
+            },
+            session(),
+        );
+        let command = read_command(P_ZERO, P_ZERO, SPLIT_TOTAL_LE);
+        let outcome = terminal
+            .transmit(&command)
+            .expect("a surplus ends the span");
+        let response = outcome.into_response().expect("real response");
+        assert_eq!(response.body, surplus);
+        assert_eq!(terminal.into_inner().seen.len(), SINGLE_EXCHANGE_COUNT);
+    }
+
+    #[test]
+    fn fault_first_fragment_returns_the_fault() {
+        let mut terminal = SmTransport::new(
+            ScriptedInner {
+                script: vec![TransportOutcome::NoCard],
+                seen: Vec::new(),
+            },
+            session(),
+        );
+        let command = read_command(P_ZERO, P_ZERO, SPLIT_TOTAL_LE);
+        let outcome = terminal.transmit(&command).expect("fault passes through");
+        assert!(matches!(outcome, TransportOutcome::NoCard));
+        assert_eq!(terminal.into_inner().seen.len(), SINGLE_EXCHANGE_COUNT);
     }
 }

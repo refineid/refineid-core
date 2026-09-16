@@ -29,9 +29,12 @@ use refineid_pkcs15::{
 
 /// Chunk size the read loops request, mirroring the implementation; a
 /// change there must fail these scripts loudly.
-const READ_CHUNK_LEN: u8 = 0x80;
+const READ_CHUNK_LEN: u8 = 0xE0;
 /// Certificate content length that forces a two-chunk read.
-const TWO_CHUNK_CONTENT_LEN: usize = 200;
+const TWO_CHUNK_CONTENT_LEN: usize = 300;
+/// Surplus bytes past the requested chunk a T=0 61xx chain may
+/// deliver when the pending count exceeds the requested length.
+const OVERLONG_EXTRA_BYTES: usize = 18;
 /// Content length that fits one chunk.
 const ONE_CHUNK_CONTENT_LEN: usize = 60;
 /// Declared content length above the sixteen-kibibyte object cap.
@@ -411,8 +414,16 @@ fn empty_first_read_is_reported_as_empty() {
 }
 
 #[test]
-fn overlong_response_body_is_rejected() {
+fn overlong_first_chunk_is_accepted_and_advanced_past() {
     let der = certificate_fixture(TWO_CHUNK_CONTENT_LEN);
+    let first_len = usize::from(READ_CHUNK_LEN) + OVERLONG_EXTRA_BYTES;
+    let first_chunk = &der[..first_len];
+    let second_chunk = &der[first_len..];
+    let second_len = u8::try_from(second_chunk.len()).expect("remainder fits one read");
+    assert!(
+        first_len < der.len(),
+        "fixture must still span two reads past the surplus"
+    );
 
     let mut transport = ScriptedTransport::new(vec![
         (select_app_wire(), ok_response(&[])),
@@ -420,12 +431,13 @@ fn overlong_response_body_is_rejected() {
             select_ef_wire(CertSlot::Authentication.fid()),
             ok_response(&[]),
         ),
-        (read_wire(0, READ_CHUNK_LEN), ok_response(&der)),
+        (read_wire(0, READ_CHUNK_LEN), ok_response(first_chunk)),
+        (read_wire(first_len, second_len), ok_response(second_chunk)),
     ]);
 
-    let error = transport
+    let cert = transport
         .read_certificate(CertSlot::Authentication)
-        .expect_err("a body longer than requested must not read");
-    assert!(matches!(error, Pkcs15Error::InvalidData(_)));
+        .expect("a 61xx surplus must read");
+    assert_eq!(cert.as_bytes(), der.as_slice());
     transport.assert_drained();
 }

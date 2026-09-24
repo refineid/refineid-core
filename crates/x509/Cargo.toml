@@ -3,7 +3,6 @@ name = "refineid-x509"
 description = "SubjectPublicKeyInfo extraction from FINEID X.509 certificates"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

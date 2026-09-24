@@ -3,7 +3,6 @@ name = "refineid-pkcs15"
 description = "PKCS#15 file-system reads for FINEID cards"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

@@ -3,7 +3,6 @@ name = "refineid-ber"
 description = "Minimal BER-TLV encoder and decoder for card protocol structures"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

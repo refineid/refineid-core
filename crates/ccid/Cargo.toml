@@ -3,7 +3,6 @@ name = "refineid-ccid"
 description = "USB Chip Card Interface Device (CCID) protocol stack and transport engine for ReFineID"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

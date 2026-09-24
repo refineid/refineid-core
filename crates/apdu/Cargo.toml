@@ -3,7 +3,6 @@ name = "refineid-apdu"
 description = "Typed ISO 7816-4 commands and the RefineID card transport port"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

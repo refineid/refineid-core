@@ -48,6 +48,11 @@ use crate::handshake::{PaceSession, Ssc};
 /// Cryptogram object tag: the encrypted, padded command or response
 /// body. The first value byte is the padding-content indicator.
 const TAG_CRYPTOGRAM: u8 = 0x87;
+/// Cryptogram object tag for odd instructions (ISO 7816-4:2020 section 6.2.3.1):
+/// ciphertext directly without padding-content indicator.
+const TAG_CRYPTOGRAM_ODD: u8 = 0x85;
+/// Bit indicating an odd instruction code in ISO/IEC 7816-4 (least significant bit of INS).
+const INS_ODD_MASK: u8 = 0x01;
 /// Protected expected-length object tag.
 const TAG_PROTECTED_LE: u8 = 0x97;
 /// Protected status-word object tag.
@@ -233,11 +238,15 @@ impl<T: CardTransport> SmTransport<T> {
                 .map_err(|_unaligned| {
                 SmError::Malformed("padded plaintext not block-aligned")
             })?;
-            let mut value = Vec::with_capacity(1_usize.saturating_add(cipher.as_bytes().len()));
-            value.push(PADDING_INDICATOR);
-            value.extend_from_slice(cipher.as_bytes());
-            refineid_ber::tlv(TAG_CRYPTOGRAM, &value)
-                .map_err(|_too_long| SmError::CommandTooLong)?
+            let (tag, value) = if (instruction & INS_ODD_MASK) != 0 {
+                (TAG_CRYPTOGRAM_ODD, cipher.as_bytes().to_vec())
+            } else {
+                let mut v = Vec::with_capacity(1_usize.saturating_add(cipher.as_bytes().len()));
+                v.push(PADDING_INDICATOR);
+                v.extend_from_slice(cipher.as_bytes());
+                (TAG_CRYPTOGRAM, v)
+            };
+            refineid_ber::tlv(tag, &value).map_err(|_too_long| SmError::CommandTooLong)?
         };
 
         let protected_le = match le {
@@ -274,15 +283,15 @@ impl<T: CardTransport> SmTransport<T> {
     fn unwrap(&mut self, response: &[u8]) -> Result<(Vec<u8>, StatusWord), SmError<T::Error>> {
         self.ssc.increment();
 
-        let mut cryptogram: Option<Vec<u8>> = None;
+        let mut cryptogram: Option<(u8, Vec<u8>)> = None;
         let mut status: Option<Vec<u8>> = None;
         let mut mac: Option<Vec<u8>> = None;
 
         for parsed in BerTlvIter::new(response) {
             let tlv = parsed.map_err(|_ber| SmError::Malformed("response BER parse"))?;
             let tag = tlv.tag();
-            if tag == u16::from(TAG_CRYPTOGRAM) {
-                cryptogram = Some(tlv.value().to_vec());
+            if tag == u16::from(TAG_CRYPTOGRAM) || tag == u16::from(TAG_CRYPTOGRAM_ODD) {
+                cryptogram = Some((tag as u8, tlv.value().to_vec()));
             } else if tag == u16::from(TAG_PROTECTED_STATUS) {
                 status = Some(tlv.value().to_vec());
             } else if tag == u16::from(TAG_MAC) {
@@ -303,8 +312,8 @@ impl<T: CardTransport> SmTransport<T> {
 
         let mut mac_input = Vec::new();
         mac_input.extend_from_slice(self.ssc.as_bytes());
-        if let Some(ref value) = cryptogram {
-            let object = refineid_ber::tlv(TAG_CRYPTOGRAM, value)
+        if let Some((tag, ref value)) = cryptogram {
+            let object = refineid_ber::tlv(tag, value)
                 .map_err(|_too_long| SmError::Malformed("cryptogram too long to re-encode"))?;
             mac_input.extend_from_slice(&object);
         }
@@ -319,14 +328,18 @@ impl<T: CardTransport> SmTransport<T> {
         }
 
         let body = match cryptogram {
-            Some(value) => {
-                let (indicator, cipher_bytes) = value
-                    .split_first()
-                    .ok_or(SmError::Malformed("cryptogram empty"))?;
-                let indicator_ok = *indicator == PADDING_INDICATOR;
-                if !indicator_ok {
-                    return Err(SmError::Malformed("cryptogram padding indicator"));
-                }
+            Some((tag, value)) => {
+                let cipher_bytes = if tag == TAG_CRYPTOGRAM {
+                    let (indicator, cipher) = value
+                        .split_first()
+                        .ok_or(SmError::Malformed("cryptogram empty"))?;
+                    if *indicator != PADDING_INDICATOR {
+                        return Err(SmError::Malformed("cryptogram padding indicator"));
+                    }
+                    cipher
+                } else {
+                    &value[..]
+                };
                 if !cipher_bytes.len().is_multiple_of(AES_BLOCK) {
                     return Err(SmError::Malformed("cryptogram not whole blocks"));
                 }
@@ -561,7 +574,7 @@ fn decode_short_apdu(apdu: &[u8]) -> Option<(&[u8], Option<u8>)> {
 mod tests {
     use super::{
         AES_BLOCK, Aes256Key, LE_ALL_BYTES, PaceSession, SM_READ_BINARY_MAX_LE, SmError,
-        SmTransport, Ssc, TAG_CRYPTOGRAM, TAG_MAC, TAG_PROTECTED_STATUS,
+        SmTransport, Ssc, TAG_CRYPTOGRAM, TAG_CRYPTOGRAM_ODD, TAG_MAC, TAG_PROTECTED_STATUS,
         aes256_cbc_encrypt_no_padding, aes256_cmac_truncated, aes256_ecb_encrypt_block,
         decode_short_apdu, iso7816_4_pad, iso7816_4_unpad, split_protected_read,
     };
@@ -1153,5 +1166,83 @@ mod tests {
         let outcome = terminal.transmit(&command).expect("fault passes through");
         assert!(matches!(outcome, TransportOutcome::NoCard));
         assert_eq!(terminal.into_inner().seen.len(), SINGLE_EXCHANGE_COUNT);
+    }
+
+    /// Odd instruction GET DATA for test verification.
+    const GET_DATA_ODD_INS: u8 = 0xCB;
+
+    #[test]
+    fn odd_instruction_wraps_with_cryptogram_odd_tag() {
+        let mut terminal = SmTransport::new(Null, session());
+        let command = CommandApdu::case_3(
+            CommandHeader {
+                class: ApduClass::Plain,
+                instruction: GET_DATA_ODD_INS,
+                p1: P_ZERO,
+                p2: P_ZERO,
+            },
+            COMMAND_DATA,
+        )
+        .expect("command encodes");
+        let (header, body) = terminal.wrap(command.as_bytes()).expect("wrap succeeds");
+        assert_eq!(header.class, ApduClass::SecureMessaging);
+        assert_eq!(header.instruction, GET_DATA_ODD_INS);
+        let tlv = refineid_ber::BerTlvIter::new(&body)
+            .next()
+            .expect("first TLV")
+            .expect("valid TLV");
+        assert_eq!(tlv.tag(), u16::from(TAG_CRYPTOGRAM_ODD));
+    }
+
+    fn card_odd_response(counter_steps: u32, payload: &[u8], sw: StatusWord) -> Vec<u8> {
+        let mut ssc = Ssc::INITIAL;
+        for _step in 0..counter_steps {
+            ssc.increment();
+        }
+        let k_enc = [K_ENC_FILL; KEY_LEN];
+        let k_mac = [K_MAC_FILL; KEY_LEN];
+        let padded = iso7816_4_pad(payload);
+        let block_iv = aes256_ecb_encrypt_block(&k_enc, ssc.as_bytes());
+        let cipher = aes256_cbc_encrypt_no_padding(&k_enc, &block_iv, &padded)
+            .expect("padded payload is aligned");
+        let cryptogram = refineid_ber::tlv(TAG_CRYPTOGRAM_ODD, cipher.as_bytes()).expect("encodes");
+        let [sw1, sw2] = sw.as_u16().to_be_bytes();
+        let status = refineid_ber::tlv(TAG_PROTECTED_STATUS, [sw1, sw2]).expect("encodes");
+
+        let mut mac_input = Vec::new();
+        mac_input.extend_from_slice(ssc.as_bytes());
+        mac_input.extend_from_slice(&cryptogram);
+        mac_input.extend_from_slice(&status);
+        let mac_input = iso7816_4_pad(&mac_input);
+        let tag = aes256_cmac_truncated(&k_mac, &mac_input);
+        let mac_object = refineid_ber::tlv(TAG_MAC, tag.as_bytes()).expect("encodes");
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&cryptogram);
+        body.extend_from_slice(&status);
+        body.extend_from_slice(&mac_object);
+        body
+    }
+
+    #[test]
+    fn odd_cryptogram_tag_response_is_unwrapped() {
+        let response_body =
+            card_odd_response(EXCHANGE_STEPS, RESPONSE_PAYLOAD, StatusWord::Success);
+        let [sw1, sw2] = success_bytes();
+        let mut terminal = SmTransport::new(
+            FixedResponse {
+                response: Some(ResponseApdu {
+                    body: response_body,
+                    sw1,
+                    sw2,
+                }),
+            },
+            session(),
+        );
+        let command = CommandApdu::case_2(read_binary_header(), READ_LE_TWO);
+        let outcome = terminal.transmit(&command).expect("round trip succeeds");
+        let response = outcome.into_response().expect("real response");
+        assert!(response.is_ok());
+        assert_eq!(response.body.as_slice(), RESPONSE_PAYLOAD);
     }
 }

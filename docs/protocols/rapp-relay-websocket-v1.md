@@ -70,10 +70,19 @@ Each peer opens one WebSocket leg to `relay_url` and then:
      "RAPP-relay-v1",
      tstr,    ; purpose: "pairing" / "session"
      tstr,    ; role: "requester" / "proxy"
-     bstr     ; purpose "pairing": offer_id, Section 9.2 (16 bytes)
+     bstr     ; purpose "pairing": offer_id (32 bytes, see NOTE below)
               ; purpose "session": rendezvous_token, Section 8.5 (16 bytes)
    ]
    ```
+
+   NOTE: Section 9.2 of the base draft states a 16-byte `offer_id`, but
+   both implementations (the Rust engine's `OFFER_ID_SIZE` and the Apple
+   reference, which sizes from the Rust core) use the full 32-byte
+   SHA-256. Pairing legs therefore present 32 bytes. Session legs
+   present the 16-byte rendezvous token, on which text and code agree.
+   The relay accepts exactly these two lengths and matches tokens,
+   length included, for exact equality. The 16-vs-32 discrepancy needs
+   a draft-maintainer ruling at rollup.
 
 2. Waits for exactly one joined signal, the binary message carrying the
    deterministic-CBOR encoding of `["RAPP-relay-joined-v1"]`. The relay
@@ -113,7 +122,7 @@ fixed offer template, with only `offer_id` varying per pairing:
 relay-offer-template = {
   "scheme": "rapp",
   "version": [uint, uint, uint],   ; current wire version triple
-  "offer_id": bstr .size 16,       ; derived from the code, Section 9.2
+  "offer_id": bstr .size 32,       ; full SHA-256, Section 9.2 as implemented
   "pairing_secret": bstr .size 32, ; derived from the code, Section 9.2
   "suites": ["Noise_XXpsk3_25519_ChaChaPoly_SHA256"],
   "profiles": [                    ; fixed login + signing set

@@ -1348,7 +1348,7 @@ The initial transport profile registry is:
 | `apple-peer-v1` | Apple-native nearby connectivity | defined; implemented |
 | `fi.refineid.stream.v1` | one reliable ordered byte stream, initially TCP | defined in Section 16.1; implemented |
 | `local-quic-v1` | local QUIC | reserved design target |
-| `relay-websocket-v1` | untrusted Internet relay | reserved design target |
+| `relay-websocket-v1` | untrusted Internet relay | defined in [rapp-relay-websocket-v1.md](rapp-relay-websocket-v1.md); folds into Section 16.2 at rollup |
 
 A future ICE-based direct profile using
 [RFC 8445](https://www.rfc-editor.org/rfc/rfc8445.html) is anticipated but

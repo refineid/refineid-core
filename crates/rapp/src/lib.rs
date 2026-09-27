@@ -31,6 +31,7 @@ mod endpoint;
 mod journal;
 mod liveness;
 mod message;
+pub mod noise;
 mod offer;
 mod operation;
 #[cfg(feature = "bindings")]
@@ -119,11 +120,11 @@ pub use types::{
     CANDIDATE_FAILURE_HINT_THRESHOLD, CloseReason, FailureClass, GRANTS_HASH_SIZE, GrantsHash,
     IdentifierError, LIVENESS_CHALLENGE_SIZE, MANDATORY_PAIRING_SUITE, MANDATORY_SESSION_SUITE,
     MAX_ACTIVE_OPERATIONS, MAX_FRAME_PLAINTEXT, MAX_FRAME_SIZE, MAX_TRANSPORT_CANDIDATES,
-    MINIMUM_REMAINING_ATTEMPTS, OFFER_ID_SIZE, OFFER_TTL_MAX_MS, OPERATION_ID_SIZE, OfferId,
-    OperationId, PAIR_ID_SIZE, PAIRING_SECRET_SIZE, PairId, PairingSecret, ProfileName,
+    MINIMUM_REMAINING_ATTEMPTS, NOISE_TAG_SIZE, OFFER_ID_SIZE, OFFER_TTL_MAX_MS, OPERATION_ID_SIZE,
+    OfferId, OperationId, PAIR_ID_SIZE, PAIRING_SECRET_SIZE, PairId, PairingSecret, ProfileName,
     RENDEZVOUS_TOKEN_SIZE, REQUEST_HASH_SIZE, RendezvousToken, RequestHash, RetryDecision,
     SESSION_ID_SIZE, SESSION_READY_NONCE_SIZE, SessionId, VISIBLE_WIRE_VERSION,
-    VisibleConnectionState,
+    VisibleConnectionState, X25519_KEY_SIZE,
 };
 pub use wire::{
     Envelope, MessageType, SequenceGuard, WireError, WireValue, decode_deterministic_cbor,

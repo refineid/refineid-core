@@ -6,8 +6,8 @@
 use std::{fs, path::PathBuf};
 
 use refineid_rapp::{
-    MANDATORY_PAIRING_SUITE, MANDATORY_SESSION_SUITE, VISIBLE_WIRE_VERSION, WireValue,
-    derive_pair_id, derive_rendezvous_token, derive_session_id, encode_deterministic_cbor,
+    VISIBLE_WIRE_VERSION, WireValue, derive_pair_id, derive_rendezvous_token, derive_session_id,
+    encode_deterministic_cbor,
 };
 use serde::Deserialize;
 use snow::{
@@ -57,7 +57,7 @@ fn fixed_noise_transcripts_match_the_versioned_corpus() {
 }
 
 fn verify_pairing(vector: &NoiseVector) {
-    assert_eq!(vector.suite, MANDATORY_PAIRING_SUITE);
+    assert_eq!(vector.suite, "Noise_XXpsk3_25519_ChaChaPoly_SHA256");
     let initiator_static = fixed::<32>(&vector.test_only_initiator_static_private_hex);
     let responder_static = fixed::<32>(&vector.test_only_responder_static_private_hex);
     let initiator_ephemeral = fixed::<32>(&vector.test_only_initiator_ephemeral_private_hex);
@@ -74,14 +74,14 @@ fn verify_pairing(vector: &NoiseVector) {
     let prologue = encode_deterministic_cbor(&WireValue::Array(vec![
         WireValue::Text("RAPP-pairing-v1".to_owned()),
         version_value(),
-        WireValue::Text(MANDATORY_PAIRING_SUITE.to_owned()),
+        WireValue::Text(vector.suite.clone()),
         WireValue::Bytes(offer_hash.to_vec()),
         WireValue::Text(vector.transport_profile.clone()),
     ]))
     .expect("pairing prologue must encode");
     assert_eq!(encode_hex(&prologue), vector.prologue_hex);
 
-    let params: NoiseParams = MANDATORY_PAIRING_SUITE.parse().expect("pairing suite");
+    let params: NoiseParams = vector.suite.parse().expect("pairing suite");
     let mut initiator = Builder::new(params.clone())
         .local_private_key(&initiator_static)
         .expect("builder step")
@@ -123,7 +123,7 @@ fn verify_pairing(vector: &NoiseVector) {
 }
 
 fn verify_session(vector: &NoiseVector) {
-    assert_eq!(vector.suite, MANDATORY_SESSION_SUITE);
+    assert_eq!(vector.suite, "Noise_KK_25519_ChaChaPoly_SHA256");
     let initiator_static = fixed::<32>(&vector.test_only_initiator_static_private_hex);
     let responder_static = fixed::<32>(&vector.test_only_responder_static_private_hex);
     let initiator_ephemeral = fixed::<32>(&vector.test_only_initiator_ephemeral_private_hex);
@@ -136,7 +136,7 @@ fn verify_session(vector: &NoiseVector) {
     let prologue = encode_deterministic_cbor(&WireValue::Array(vec![
         WireValue::Text("RAPP-session-v1".to_owned()),
         version_value(),
-        WireValue::Text(MANDATORY_SESSION_SUITE.to_owned()),
+        WireValue::Text(vector.suite.clone()),
         WireValue::Bytes(pair_id.to_vec()),
         WireValue::Bytes(grants_hash.to_vec()),
         WireValue::Text(vector.transport_profile.clone()),
@@ -144,7 +144,7 @@ fn verify_session(vector: &NoiseVector) {
     .expect("session prologue must encode");
     assert_eq!(encode_hex(&prologue), vector.prologue_hex);
 
-    let params: NoiseParams = MANDATORY_SESSION_SUITE.parse().expect("session suite");
+    let params: NoiseParams = vector.suite.parse().expect("session suite");
     let mut initiator = Builder::new(params.clone())
         .local_private_key(&initiator_static)
         .expect("builder step")

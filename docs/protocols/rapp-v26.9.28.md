@@ -356,18 +356,49 @@ allocation.
 The mandatory suite is:
 
 ```text
-Pairing: CPACE-RISTR255-SHA512 + Noise_XXpsk3_25519_ChaChaPoly_SHA256
-Session: Noise_KK_25519_ChaChaPoly_SHA256
+Pairing: CPACE-RISTR255-SHA512 + Noise_XXpsk3_25519_ChaChaPoly_SHA512
+Session: Noise_KKhfs_25519+MLKEM768_ChaChaPoly_SHA512
 ```
 
 Pairing uses the [CPace PAKE protocol](https://datatracker.ietf.org/doc/draft-irtf-cfrg-cpace/)
 (draft-irtf-cfrg-cpace-21, cipher suite `CPACE-RISTR255-SHA512`) over Ristretto255 with SHA-512 to convert a short 6-digit numeric
 pairing code into a mutual 256-bit pre-shared key (`psk3`) with zero offline
-dictionary vulnerability. The Noise construction follows the [Noise Protocol
-Framework, revision 34](https://noiseprotocol.org/noise.html). X25519 is
-specified by [RFC 7748](https://www.rfc-editor.org/rfc/rfc7748.html),
+dictionary vulnerability.
+
+Session transport uses hybrid post-quantum Noise according to the Noise Protocol
+Framework extension for Hybrid Forward Secrecy (HFS):
+`Noise_KKhfs_25519+MLKEM768_ChaChaPoly_SHA512`. It pairs classical Curve25519
+(RFC 7748) Diffie-Hellman with NIST FIPS 203 ML-KEM-768 key encapsulation to
+provide quantum-resistant forward secrecy against Harvest-Now-Decrypt-Later (HNDL)
+adversaries while preserving mutual static key authentication:
+
+```text
+Noise_KKhfs(s, rs):
+  <- s
+  -> s
+  ...
+  -> e, es, ekem, ss
+  <- e, ee, kemct, se
+```
+
+Where:
+- `ekem`: The initiator generates a fresh ephemeral ML-KEM-768 keypair $(pk_E, sk_E)$
+  and transmits the 1,184-byte public key $pk_E$ encrypted with the current cipher state
+  (1,200 bytes total including 16-byte Poly1305 authentication tag).
+- `kemct`: The responder encapsulates a 32-byte shared secret $ss_{kem}$ against $pk_E$
+  to generate a 1,088-byte ciphertext $ct$, encrypts $ct$ with the current cipher state
+  (1,104 bytes total including 16-byte Poly1305 authentication tag), and mixes $ss_{kem}$
+  into the symmetric key schedule via `MixKey(ss_kem)`.
+
+Total handshake message sizes (with empty payloads):
+- Message 1 (Initiator -> Responder): 1,248 bytes (32-byte ephemeral X25519 public key + 1,200-byte encrypted ML-KEM-768 public key + 16-byte Poly1305 empty payload tag).
+- Message 2 (Responder -> Initiator): 1,152 bytes (32-byte ephemeral X25519 public key + 1,104-byte encrypted ML-KEM-768 ciphertext + 16-byte Poly1305 empty payload tag).
+
+The Noise construction follows the [Noise Protocol Framework, revision 34](https://noiseprotocol.org/noise.html).
+X25519 is specified by [RFC 7748](https://www.rfc-editor.org/rfc/rfc7748.html),
+ML-KEM-768 by [NIST FIPS 203](https://doi.org/10.6028/NIST.FIPS.203),
 ChaCha20-Poly1305 by [RFC 8439](https://www.rfc-editor.org/rfc/rfc8439.html),
-and HKDF-SHA-256 by [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html).
+and HKDF-SHA-512 by [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html).
 
 ### 8.2 Pair-specific keys
 
@@ -438,9 +469,9 @@ Let `h` be the Noise handshake hash of a completed handshake as defined by the
 Noise framework. Both peers derive, in this order:
 
 ```text
-session_id       = first 16 bytes of SHA-256("RAPP-session-id-v1" || h)
-pair_id          = first 16 bytes of SHA-256("RAPP-pair-id-v1" || h)
-rendezvous_token = first 16 bytes of SHA-256("RAPP-rendezvous-v1" || h)
+session_id       = first 16 bytes of SHA-512("RAPP-session-id-v1" || h)
+pair_id          = first 16 bytes of SHA-512("RAPP-pair-id-v1" || h)
+rendezvous_token = first 16 bytes of SHA-512("RAPP-rendezvous-v1" || h)
 ```
 
 `session_id` is derived from every completed handshake, including the pairing
@@ -650,8 +681,8 @@ session.
    trial-processing option, because the requester sends the first handshake
    message; its transport profile MUST indicate the pairing before the
    handshake begins.
-3. The peers run the mandatory `Noise_KK` handshake with their pair-specific
-   static keys, fresh ephemeral keys, the session prologue of Section 8.3, and
+3. The peers run the mandatory `Noise_KKhfs` handshake with their pair-specific
+   static keys, fresh ephemeral keys (X25519 + ML-KEM-768), the session prologue of Section 8.3, and
    empty handshake payloads.
 4. Both peers derive `session_id` (Section 8.5) and each sends an encrypted
    `session.ready`:
@@ -1447,10 +1478,10 @@ closes and no stored state changes.
 
 The preamble is unauthenticated routing metadata, exactly like a relay token
 (Section 17). Possession of a token lets an attacker elicit the first
-`Noise_KK` handshake message, which contains a fresh ephemeral public key and
-no identity, and lets a network observer link the connection to an
-unidentified recurring pairing; it enables nothing else. The requester
-processes one inbound connection's handshake at a time and MAY rate-limit
+`Noise_KKhfs` handshake message, which contains a fresh ephemeral public key,
+encrypted ML-KEM-768 public key, and no identity, and lets a network observer
+link the connection to an unidentified recurring pairing; it enables nothing else.
+The requester processes one inbound connection's handshake at a time and MAY rate-limit
 connection attempts.
 
 **Strictness.** The profile inherits the protocol's single-connection
@@ -1492,7 +1523,7 @@ Each peer opens one WebSocket leg to `relay_url`:
 2. Waits for the joined signal from the relay, the binary message carrying the deterministic-CBOR encoding of `["RAPP-relay-joined-v1"]`. A leg MUST NOT send anything after its join frame until it has received the joined signal.
 3. After the joined signal, the peers exchange protocol frames:
    - For purpose `pairing`: The peers first execute the CPace PAKE exchange ([draft-irtf-cfrg-cpace-21](https://datatracker.ietf.org/doc/draft-irtf-cfrg-cpace/), cipher suite `CPACE-RISTR255-SHA512`) using the 6-digit pairing code as password $P$ and domain string `"RAPP-cpace-v1"`, deriving the mutual 256-bit `pairing_secret`. The peers then execute the `Noise_XXpsk3` pairing handshake (Section 9.3) with `pairing_secret` as `psk3`, the Section 8.3 prologue naming `relay-websocket-v1`, and empty handshake payloads.
-   - For purpose `session`: The peers execute the `Noise_KK` session handshake (Section 10) with the prologue naming `relay-websocket-v1`.
+   - For purpose `session`: The peers execute the `Noise_KKhfs` session handshake (Section 10) with the prologue naming `relay-websocket-v1`.
 4. On close or disconnect of either leg, the relay immediately closes the counterpart leg and purges all ephemeral state for the match. Logical Noise roles are unchanged: the requester initiates every handshake over the joined pipe, regardless of which leg connected first.
 
 **Traffic analysis mitigation (Frame padding).**
@@ -1506,7 +1537,7 @@ relay-offer-template = {
   "scheme": "rapp",
   "version": [uint, uint, uint],   ; [26, 9, 28] wire version triple
   "offer_id": bstr .size 32,       ; fresh 32-byte cryptographically secure random token
-  "suites": ["CPACE-RISTR255-SHA512+Noise_XXpsk3_25519_ChaChaPoly_SHA256"],
+  "suites": ["CPACE-RISTR255-SHA512+Noise_XXpsk3_25519_ChaChaPoly_SHA512"],
   "profiles": [
     "fi.refineid.authentication.v1",
     "fi.refineid.document-signing.v1"

@@ -16,20 +16,18 @@
 
 use std::collections::BTreeMap;
 
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use snow::{Builder, HandshakeState, TransportState, params::NoiseParams};
 use zeroize::ZeroizeOnDrop;
 
 use super::{
     BinaryFrame, Envelope, FrameError, GRANTS_HASH_SIZE, GrantsHash, MANDATORY_PAIRING_SUITE,
-    MANDATORY_SESSION_SUITE, MAX_FRAME_PLAINTEXT, MAX_FRAME_SIZE, MessageType, OperationId,
-    PAIR_ID_SIZE, PairId, PairingSecret, ProfileName, RENDEZVOUS_TOKEN_SIZE, REQUEST_HASH_SIZE,
-    RendezvousToken, RequestHash, SESSION_ID_SIZE, SequenceGuard, SessionId, VISIBLE_WIRE_VERSION,
-    WireError, WireValue, encode_deterministic_cbor,
+    MANDATORY_SESSION_SUITE, MAX_FRAME_PLAINTEXT, MAX_FRAME_SIZE, MessageType, NOISE_TAG_SIZE,
+    OperationId, PAIR_ID_SIZE, PairId, PairingSecret, ProfileName, RENDEZVOUS_TOKEN_SIZE,
+    REQUEST_HASH_SIZE, RendezvousToken, RequestHash, SESSION_ID_SIZE, SequenceGuard, SessionId,
+    VISIBLE_WIRE_VERSION, WireError, WireValue, X25519_KEY_SIZE, encode_deterministic_cbor,
+    noise::{KkHfsHandshakeState, NoiseTransport},
 };
-
-const X25519_KEY_SIZE: usize = 32;
-const NOISE_TAG_SIZE: usize = 16;
 
 /// Local endpoint role in the fixed RAPP Noise patterns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,9 +132,14 @@ impl core::fmt::Debug for SessionHandshakeParameters<'_> {
     }
 }
 
+enum HandshakeChannelState {
+    Snow(Box<HandshakeState>),
+    KkHfs(Box<KkHfsHandshakeState>),
+}
+
 /// Noise handshake plus the values derived on completion.
 pub struct HandshakeChannel {
-    state: HandshakeState,
+    state: HandshakeChannelState,
     derive_pair: bool,
 }
 
@@ -171,9 +174,14 @@ impl core::fmt::Debug for HandshakeCompletion {
     }
 }
 
+enum TransportMode {
+    Snow(Box<TransportState>),
+    Native(NoiseTransport),
+}
+
 /// Mutually authenticated encrypted RAPP transport channel.
 pub struct SecureChannel {
-    noise: TransportState,
+    transport: TransportMode,
     sequence: SequenceGuard,
 }
 
@@ -258,12 +266,12 @@ impl HandshakeChannel {
             .prologue(&prologue)
             .map_err(|_| CryptoError::Configuration)?;
         Ok(Self {
-            state: build(builder, parameters.role)?,
+            state: HandshakeChannelState::Snow(Box::new(build(builder, parameters.role)?)),
             derive_pair: true,
         })
     }
 
-    /// Begin the mandatory pair-specific KK session handshake.
+    /// Begin the mandatory pair-specific KKhfs session handshake.
     ///
     /// # Errors
     /// [`CryptoError`] when the suite, keys, or prologue cannot be
@@ -274,18 +282,14 @@ impl HandshakeChannel {
             parameters.grants_hash,
             parameters.transport_profile,
         )?;
-        let params: NoiseParams = MANDATORY_SESSION_SUITE
-            .parse()
-            .map_err(|_| CryptoError::Configuration)?;
-        let builder = Builder::new(params)
-            .local_private_key(&parameters.local_keys.private_key)
-            .map_err(|_| CryptoError::Configuration)?
-            .remote_public_key(parameters.remote_public_key)
-            .map_err(|_| CryptoError::Configuration)?
-            .prologue(&prologue)
-            .map_err(|_| CryptoError::Configuration)?;
+        let state = KkHfsHandshakeState::new(
+            parameters.role,
+            &parameters.local_keys.private_key,
+            parameters.remote_public_key,
+            &prologue,
+        )?;
         Ok(Self {
-            state: build(builder, parameters.role)?,
+            state: HandshakeChannelState::KkHfs(Box::new(state)),
             derive_pair: false,
         })
     }
@@ -297,10 +301,14 @@ impl HandshakeChannel {
     /// resource limit.
     pub fn write_message(&mut self) -> Result<BinaryFrame, CryptoError> {
         let mut output = vec![0_u8; MAX_FRAME_SIZE];
-        let length = self
-            .state
-            .write_message(&[], &mut output)
-            .map_err(|_| CryptoError::NoiseHandshake)?;
+        let length = match &mut self.state {
+            HandshakeChannelState::Snow(state) => state
+                .write_message(&[], &mut output)
+                .map_err(|_| CryptoError::NoiseHandshake)?,
+            HandshakeChannelState::KkHfs(state) => state
+                .write_message(&[], &mut output)
+                .map_err(|_| CryptoError::NoiseHandshake)?,
+        };
         output.truncate(length);
         BinaryFrame::reconstruct(output).map_err(CryptoError::Frame)
     }
@@ -311,10 +319,14 @@ impl HandshakeChannel {
     /// [`CryptoError`] on a failed handshake message or a non-empty payload.
     pub fn read_message(&mut self, frame: &BinaryFrame) -> Result<(), CryptoError> {
         let mut payload = vec![0_u8; MAX_FRAME_SIZE];
-        let length = self
-            .state
-            .read_message(frame.as_bytes(), &mut payload)
-            .map_err(|_| CryptoError::NoiseHandshake)?;
+        let length = match &mut self.state {
+            HandshakeChannelState::Snow(state) => state
+                .read_message(frame.as_bytes(), &mut payload)
+                .map_err(|_| CryptoError::NoiseHandshake)?,
+            HandshakeChannelState::KkHfs(state) => state
+                .read_message(frame.as_bytes(), &mut payload)
+                .map_err(|_| CryptoError::NoiseHandshake)?,
+        };
         if length != 0 {
             return Err(CryptoError::NonEmptyHandshakePayload);
         }
@@ -324,7 +336,10 @@ impl HandshakeChannel {
     /// Whether the role-specific handshake pattern has completed.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.state.is_handshake_finished()
+        match &self.state {
+            HandshakeChannelState::Snow(state) => state.is_handshake_finished(),
+            HandshakeChannelState::KkHfs(state) => state.is_finished(),
+        }
     }
 
     /// Derive identifiers and enter Noise transport mode.
@@ -333,36 +348,54 @@ impl HandshakeChannel {
     /// [`CryptoError`] when the handshake is incomplete or exposes no
     /// authenticated remote static key.
     pub fn complete(self) -> Result<HandshakeCompletion, CryptoError> {
-        if !self.state.is_handshake_finished() {
+        if !self.is_complete() {
             return Err(CryptoError::HandshakeIncomplete);
         }
-        let session_id = derive_session_id(self.state.get_handshake_hash());
-        let pair_id = self
-            .derive_pair
-            .then(|| derive_pair_id(self.state.get_handshake_hash()));
-        let rendezvous_token = self
-            .derive_pair
-            .then(|| derive_rendezvous_token(self.state.get_handshake_hash()));
-        let remote_static: [u8; X25519_KEY_SIZE] = self
-            .state
-            .get_remote_static()
-            .ok_or(CryptoError::MissingRemoteStatic)?
-            .try_into()
-            .map_err(|_| CryptoError::InvalidKeyLength)?;
-        let noise = self
-            .state
-            .into_transport_mode()
-            .map_err(|_| CryptoError::NoiseHandshake)?;
-        Ok(HandshakeCompletion {
-            secure_channel: SecureChannel {
-                noise,
-                sequence: SequenceGuard::new(session_id),
-            },
-            session_id,
-            pair_id,
-            rendezvous_token,
-            remote_static_key: remote_static,
-        })
+        match self.state {
+            HandshakeChannelState::Snow(state) => {
+                let session_id = derive_session_id(state.get_handshake_hash());
+                let pair_id = self
+                    .derive_pair
+                    .then(|| derive_pair_id(state.get_handshake_hash()));
+                let rendezvous_token = self
+                    .derive_pair
+                    .then(|| derive_rendezvous_token(state.get_handshake_hash()));
+                let remote_static: [u8; X25519_KEY_SIZE] = state
+                    .get_remote_static()
+                    .ok_or(CryptoError::MissingRemoteStatic)?
+                    .try_into()
+                    .map_err(|_| CryptoError::InvalidKeyLength)?;
+                let noise = state
+                    .into_transport_mode()
+                    .map_err(|_| CryptoError::NoiseHandshake)?;
+                Ok(HandshakeCompletion {
+                    secure_channel: SecureChannel {
+                        transport: TransportMode::Snow(Box::new(noise)),
+                        sequence: SequenceGuard::new(session_id),
+                    },
+                    session_id,
+                    pair_id,
+                    rendezvous_token,
+                    remote_static_key: remote_static,
+                })
+            }
+            HandshakeChannelState::KkHfs(state) => {
+                let handshake_hash = state.handshake_hash();
+                let session_id = derive_session_id(&handshake_hash);
+                let remote_static = state.remote_static();
+                let transport = state.into_transport()?;
+                Ok(HandshakeCompletion {
+                    secure_channel: SecureChannel {
+                        transport: TransportMode::Native(transport),
+                        sequence: SequenceGuard::new(session_id),
+                    },
+                    session_id,
+                    pair_id: None,
+                    rendezvous_token: None,
+                    remote_static_key: remote_static,
+                })
+            }
+        }
     }
 }
 
@@ -390,10 +423,14 @@ impl SecureChannel {
             .map_err(CryptoError::Wire)?;
         let plaintext = envelope.encode().map_err(CryptoError::Wire)?;
         let mut output = vec![0_u8; plaintext.len() + NOISE_TAG_SIZE];
-        let length = self
-            .noise
-            .write_message(&plaintext, &mut output)
-            .map_err(|_| CryptoError::NoiseHandshake)?;
+        let length = match &mut self.transport {
+            TransportMode::Snow(s) => s
+                .write_message(&plaintext, &mut output)
+                .map_err(|_| CryptoError::NoiseHandshake)?,
+            TransportMode::Native(n) => n
+                .write_message(&plaintext, &mut output)
+                .map_err(|_| CryptoError::NoiseHandshake)?,
+        };
         output.truncate(length);
         BinaryFrame::reconstruct(output).map_err(CryptoError::Frame)
     }
@@ -406,10 +443,14 @@ impl SecureChannel {
     pub fn open(&mut self, frame: &BinaryFrame) -> Result<Envelope, OpenError> {
         let maximum_plaintext = frame.as_bytes().len().saturating_sub(NOISE_TAG_SIZE);
         let mut plaintext = vec![0_u8; maximum_plaintext.min(MAX_FRAME_PLAINTEXT)];
-        let length = self
-            .noise
-            .read_message(frame.as_bytes(), &mut plaintext)
-            .map_err(|_| OpenError::SessionIntegrityFailure)?;
+        let length = match &mut self.transport {
+            TransportMode::Snow(s) => s
+                .read_message(frame.as_bytes(), &mut plaintext)
+                .map_err(|_| OpenError::SessionIntegrityFailure)?,
+            TransportMode::Native(n) => n
+                .read_message(frame.as_bytes(), &mut plaintext)
+                .map_err(|_| OpenError::SessionIntegrityFailure)?,
+        };
         plaintext.truncate(length);
         let envelope =
             Envelope::decode(&plaintext).map_err(OpenError::AuthenticatedProtocolViolation)?;
@@ -431,24 +472,40 @@ fn build(builder: Builder<'_>, role: HandshakeRole) -> Result<HandshakeState, Cr
 /// Derive a session identifier from a completed Noise transcript.
 #[must_use]
 pub fn derive_session_id(handshake_hash: &[u8]) -> SessionId {
-    let digest = Sha256::new()
-        .chain_update(b"RAPP-session-id-v1")
-        .chain_update(handshake_hash)
-        .finalize();
     let mut bytes = [0_u8; SESSION_ID_SIZE];
-    bytes.copy_from_slice(&digest[..SESSION_ID_SIZE]);
+    if handshake_hash.len() == 64 {
+        let digest = Sha512::new()
+            .chain_update(b"RAPP-session-id-v1")
+            .chain_update(handshake_hash)
+            .finalize();
+        bytes.copy_from_slice(&digest[..SESSION_ID_SIZE]);
+    } else {
+        let digest = Sha256::new()
+            .chain_update(b"RAPP-session-id-v1")
+            .chain_update(handshake_hash)
+            .finalize();
+        bytes.copy_from_slice(&digest[..SESSION_ID_SIZE]);
+    }
     SessionId::from_array(bytes)
 }
 
 /// Derive a permanent pair identifier from a completed pairing transcript.
 #[must_use]
 pub fn derive_pair_id(handshake_hash: &[u8]) -> PairId {
-    let digest = Sha256::new()
-        .chain_update(b"RAPP-pair-id-v1")
-        .chain_update(handshake_hash)
-        .finalize();
     let mut bytes = [0_u8; PAIR_ID_SIZE];
-    bytes.copy_from_slice(&digest[..PAIR_ID_SIZE]);
+    if handshake_hash.len() == 64 {
+        let digest = Sha512::new()
+            .chain_update(b"RAPP-pair-id-v1")
+            .chain_update(handshake_hash)
+            .finalize();
+        bytes.copy_from_slice(&digest[..PAIR_ID_SIZE]);
+    } else {
+        let digest = Sha256::new()
+            .chain_update(b"RAPP-pair-id-v1")
+            .chain_update(handshake_hash)
+            .finalize();
+        bytes.copy_from_slice(&digest[..PAIR_ID_SIZE]);
+    }
     PairId::from_array(bytes)
 }
 
@@ -457,12 +514,20 @@ pub fn derive_pair_id(handshake_hash: &[u8]) -> PairId {
 /// to `pair_id` without the handshake hash.
 #[must_use]
 pub fn derive_rendezvous_token(handshake_hash: &[u8]) -> RendezvousToken {
-    let digest = Sha256::new()
-        .chain_update(b"RAPP-rendezvous-v1")
-        .chain_update(handshake_hash)
-        .finalize();
     let mut bytes = [0_u8; RENDEZVOUS_TOKEN_SIZE];
-    bytes.copy_from_slice(&digest[..RENDEZVOUS_TOKEN_SIZE]);
+    if handshake_hash.len() == 64 {
+        let digest = Sha512::new()
+            .chain_update(b"RAPP-rendezvous-v1")
+            .chain_update(handshake_hash)
+            .finalize();
+        bytes.copy_from_slice(&digest[..RENDEZVOUS_TOKEN_SIZE]);
+    } else {
+        let digest = Sha256::new()
+            .chain_update(b"RAPP-rendezvous-v1")
+            .chain_update(handshake_hash)
+            .finalize();
+        bytes.copy_from_slice(&digest[..RENDEZVOUS_TOKEN_SIZE]);
+    }
     RendezvousToken::from_array(bytes)
 }
 

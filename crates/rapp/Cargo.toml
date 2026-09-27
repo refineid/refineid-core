@@ -20,7 +20,11 @@ bindings = ["dep:uniffi"]
 workspace = true
 
 [dependencies]
+chacha20poly1305.workspace = true
 curve25519-dalek.workspace = true
+getrandom.workspace = true
+hmac.workspace = true
+ml-kem = "0.3.2"
 sha2.workspace = true
 snow.workspace = true
 uniffi = { workspace = true, optional = true, features = ["cli"] }

@@ -344,6 +344,70 @@ fn advance_location(bytes: &[u8], line: &mut usize, column: &mut usize) {
     }
 }
 
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+const RADIX_SPECIFIER_WIDTH: usize = 2;
+
+fn is_binary_literal(bytes: &[u8], at: usize) -> bool {
+    let rest = match bytes.get(at..) {
+        Some(rest) => rest,
+        None => return false,
+    };
+    if !matches!(rest, [b'0', b'b' | b'B', b'0' | b'1', ..]) {
+        return false;
+    }
+    let mut end = at;
+    while end < bytes.len() && is_word_byte(bytes[end]) {
+        end += 1;
+    }
+    let word = &bytes[at..end];
+    let after_prefix = &word[RADIX_SPECIFIER_WIDTH..];
+
+    const SUFFIXES: &[&[u8]] = &[
+        b"usize", b"isize", b"u128", b"i128", b"u64", b"i64", b"u32", b"i32", b"u16", b"i16",
+        b"u8", b"i8",
+    ];
+    let mut digits = after_prefix;
+    for suffix in SUFFIXES {
+        if digits.ends_with(suffix) {
+            digits = &digits[..digits.len() - suffix.len()];
+            break;
+        }
+    }
+    !digits.is_empty() && digits.iter().all(|&b| b == b'0' || b == b'1' || b == b'_')
+}
+
+fn is_octal_literal(bytes: &[u8], at: usize) -> bool {
+    let rest = match bytes.get(at..) {
+        Some(rest) => rest,
+        None => return false,
+    };
+    if !matches!(rest, [b'0', b'o' | b'O', b'0'..=b'7', ..]) {
+        return false;
+    }
+    let mut end = at;
+    while end < bytes.len() && is_word_byte(bytes[end]) {
+        end += 1;
+    }
+    let word = &bytes[at..end];
+    let after_prefix = &word[RADIX_SPECIFIER_WIDTH..];
+
+    const SUFFIXES: &[&[u8]] = &[
+        b"usize", b"isize", b"u128", b"i128", b"u64", b"i64", b"u32", b"i32", b"u16", b"i16",
+        b"u8", b"i8",
+    ];
+    let mut digits = after_prefix;
+    for suffix in SUFFIXES {
+        if digits.ends_with(suffix) {
+            digits = &digits[..digits.len() - suffix.len()];
+            break;
+        }
+    }
+    !digits.is_empty() && digits.iter().all(|&b| matches!(b, b'0'..=b'7' | b'_'))
+}
+
 fn numeric_spelling_at(bytes: &[u8], at: usize) -> Option<(usize, &'static str)> {
     const RADIX_PREFIX_WIDTH: usize = 3;
     const HEX_ESCAPE_WIDTH: usize = 4;
@@ -354,16 +418,24 @@ fn numeric_spelling_at(bytes: &[u8], at: usize) -> Option<(usize, &'static str)>
     const ESCAPE_PREFIX_WIDTH: usize = 2;
 
     let rest = bytes.get(at..)?;
+
+    let at_word_boundary = at == 0 || !is_word_byte(bytes[at - 1]);
+    if at_word_boundary {
+        match rest {
+            [b'0', b'x' | b'X', digit, ..] if digit.is_ascii_hexdigit() => {
+                return Some((RADIX_PREFIX_WIDTH, "radix numeric spelling"));
+            }
+            [b'0', b'b' | b'B', ..] if is_binary_literal(bytes, at) => {
+                return Some((RADIX_PREFIX_WIDTH, "radix numeric spelling"));
+            }
+            [b'0', b'o' | b'O', ..] if is_octal_literal(bytes, at) => {
+                return Some((RADIX_PREFIX_WIDTH, "radix numeric spelling"));
+            }
+            _ => {}
+        }
+    }
+
     match rest {
-        [b'0', b'x' | b'X', digit, ..] if digit.is_ascii_hexdigit() => {
-            Some((RADIX_PREFIX_WIDTH, "radix numeric spelling"))
-        }
-        [b'0', b'b' | b'B', b'0' | b'1', ..] => {
-            Some((RADIX_PREFIX_WIDTH, "radix numeric spelling"))
-        }
-        [b'0', b'o' | b'O', b'0'..=b'7', ..] => {
-            Some((RADIX_PREFIX_WIDTH, "radix numeric spelling"))
-        }
         [b'\\', b'x', high, low, ..] if high.is_ascii_hexdigit() && low.is_ascii_hexdigit() => {
             Some((HEX_ESCAPE_WIDTH, "numeric escape"))
         }
@@ -842,30 +914,22 @@ fn path_is_ident(path: &syn::Path, expected: &str) -> bool {
 }
 
 fn contains_numeric_spelling(spelling: &str) -> bool {
-    const MIN_RADIX_SPELLING_BYTES: usize = 3;
-    const HEX_ESCAPE_PREFIX: &str = "\\x";
-    const UNICODE_ESCAPE_PREFIX: &str = "\\u{";
-    const NUL_ESCAPE: &str = "\\0";
-
-    let has_radix_spelling = spelling
-        .as_bytes()
-        .windows(MIN_RADIX_SPELLING_BYTES)
-        .any(|window| match window {
-            [b'0', b'x' | b'X', digit] => digit.is_ascii_hexdigit(),
-            [b'0', b'b' | b'B', b'0' | b'1'] => true,
-            [b'0', b'o' | b'O', b'0'..=b'7'] => true,
-            _ => false,
-        });
-    if has_radix_spelling {
-        return true;
-    }
-
+    let bytes = spelling.as_bytes();
     let is_raw =
         spelling.starts_with('r') || spelling.starts_with("br") || spelling.starts_with("cr");
-    !is_raw
-        && (spelling.contains(HEX_ESCAPE_PREFIX)
-            || spelling.contains(UNICODE_ESCAPE_PREFIX)
-            || spelling.contains(NUL_ESCAPE))
+
+    let mut at = 0;
+    while at < bytes.len() {
+        if let Some((_, form)) = numeric_spelling_at(bytes, at) {
+            if form == "numeric escape" && is_raw {
+                at += 1;
+                continue;
+            }
+            return true;
+        }
+        at += 1;
+    }
+    false
 }
 
 fn is_tier_zero_literal(literal: &LitInt) -> bool {
@@ -1155,6 +1219,28 @@ mod tests {
         let mut violations = Vec::new();
         inspect_non_rust_bytes(Path::new("fixture.bin"), &bytes, &mut violations);
         assert_eq!(text_issues(violations), ["radix numeric spelling"]);
+    }
+
+    #[test]
+    fn hex_hashes_and_commit_shas_do_not_trigger_false_radix_violations() {
+        assert!(
+            non_rust_issues(
+                "uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1"
+            )
+            .is_empty()
+        );
+        assert!(
+            rust_comment_issues("// commit 3d3c42e5aac5ba805825da76410c181273ba90b1").is_empty()
+        );
+        assert!(non_rust_issues("commit 0b1a2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b").is_empty());
+        assert!(non_rust_issues("hash 1234567890b0abcdef1234567890abcdef123456").is_empty());
+        assert!(non_rust_issues("node0b1 worker0x80 file_0o7").is_empty());
+
+        let genuine_binary = concat!("literal 0", "b10 and 0", "b1");
+        assert_eq!(
+            non_rust_issues(genuine_binary),
+            ["radix numeric spelling", "radix numeric spelling"]
+        );
     }
 
     #[test]

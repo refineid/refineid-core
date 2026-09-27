@@ -25,13 +25,14 @@ use std::{
 };
 
 use super::{
-    BinaryFrame, EndpointRole, EstablishedEndpoint, ExplicitUserIntent, GrantsHash,
-    MANDATORY_PAIRING_SUITE, OfferId, PairId, PairRecord, PairStore, PairStoreError, PairTombstone,
-    PairTransportBinding, PairingConfirmation, PairingHandshake, PairingOffer,
-    PairingOfferDeadline, PairingOfferUri, PairingSecret, ProfileName, RendezvousToken,
-    STREAM_PROFILE, SessionAuthentication, SessionHandshake, SessionId, StreamCandidateParameters,
-    StreamRendezvous, TransportCandidate, WireValue, decode_deterministic_cbor,
-    encode_deterministic_cbor, generate_pair_key_material,
+    BinaryFrame, CpaceState, EndpointRole, EstablishedEndpoint, ExplicitUserIntent, GrantsHash,
+    MANDATORY_PAIRING_SUITE, OfferId, PairId, PairKeyMaterial, PairRecord, PairStore,
+    PairStoreError, PairTombstone, PairTransportBinding, PairingConfirmation, PairingHandshake,
+    PairingOffer, PairingOfferDeadline, PairingOfferUri, PairingSecret, ProfileName,
+    RendezvousToken, STREAM_PROFILE, SessionAuthentication, SessionHandshake, SessionId,
+    StreamCandidateParameters, StreamRendezvous, TransportCandidate, WireValue,
+    decode_deterministic_cbor, derive_manual_offer_id, encode_deterministic_cbor,
+    generate_pair_key_material, pairing_flow::handshake_role,
 };
 
 const PAIR_RECORD_FORMAT_VERSION: u64 = 2;
@@ -52,6 +53,8 @@ pub struct RappRandomByteCounts {
     pub offer_id: u64,
     /// Pairing secret length in bytes.
     pub pairing_secret: u64,
+    /// CPace random scalar entropy length in bytes.
+    pub cpace_random: u64,
     /// Session-ready nonce length in bytes.
     pub session_ready_nonce: u64,
     /// Operation identifier length in bytes.
@@ -67,6 +70,7 @@ pub const fn rapp_random_byte_counts() -> RappRandomByteCounts {
     RappRandomByteCounts {
         offer_id: super::OFFER_ID_SIZE as u64,
         pairing_secret: super::PAIRING_SECRET_SIZE as u64,
+        cpace_random: 64,
         session_ready_nonce: super::SESSION_READY_NONCE_SIZE as u64,
         operation_id: super::OPERATION_ID_SIZE as u64,
         liveness_challenge: super::LIVENESS_CHALLENGE_SIZE as u64,
@@ -184,6 +188,14 @@ enum PairingBridgeState {
         offer: PairingOffer,
         deadline: PairingOfferDeadline,
     },
+    Cpace {
+        role: EndpointRole,
+        cpace: Box<CpaceState>,
+        offer: PairingOffer,
+        candidate_id: String,
+        local_keys: PairKeyMaterial,
+        deadline: PairingOfferDeadline,
+    },
     Handshake {
         role: EndpointRole,
         handshake: Box<PairingHandshake>,
@@ -198,7 +210,9 @@ enum PairingBridgeState {
 impl PairingBridgeState {
     fn require_live_offer(&mut self, now_monotonic_ms: u64) -> Result<(), RappBindingError> {
         let deadline = match self {
-            Self::Offer { deadline, .. } | Self::Handshake { deadline, .. } => *deadline,
+            Self::Offer { deadline, .. }
+            | Self::Cpace { deadline, .. }
+            | Self::Handshake { deadline, .. } => *deadline,
             _ => return Ok(()),
         };
         if deadline.is_live(now_monotonic_ms) {
@@ -221,6 +235,22 @@ impl PairingBridgeState {
             };
         }
         Self::Failed
+    }
+
+    fn after_cpace_failure(
+        role: EndpointRole,
+        offer: PairingOffer,
+        deadline: PairingOfferDeadline,
+    ) -> Self {
+        if role == EndpointRole::Requester {
+            Self::Offer {
+                role,
+                offer,
+                deadline,
+            }
+        } else {
+            Self::Failed
+        }
     }
 }
 
@@ -294,6 +324,92 @@ impl RappPairingBridge {
     ) -> Result<Arc<Self>, RappBindingError> {
         let offer = PairingOffer::from_uri(PairingOfferUri::from_scanned_text(uri))
             .map_err(|_| RappBindingError::InvalidInput)?;
+        let deadline = PairingOfferDeadline::from_offer(&offer, started_at_monotonic_ms)
+            .map_err(|_| RappBindingError::InvalidInput)?;
+        Ok(Arc::new(Self {
+            state: Mutex::new(PairingBridgeState::Offer {
+                role: EndpointRole::Proxy,
+                offer,
+                deadline,
+            }),
+        }))
+    }
+
+    /// Construct a requester-owned pairing offer using a 6-digit numeric pairing code.
+    ///
+    /// # Errors
+    /// [`RappBindingError::InvalidInput`] on an invalid code or offer parameters.
+    #[uniffi::constructor]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "uniffi lowers exported arguments as owned values"
+    )]
+    pub fn create_requester_code_offer(
+        pairing_code: String,
+        profiles: Vec<String>,
+        transports: Vec<RappTransportCandidate>,
+        offer_ttl_ms: u64,
+        started_at_monotonic_ms: u64,
+    ) -> Result<Arc<Self>, RappBindingError> {
+        let offer_id =
+            derive_manual_offer_id(&pairing_code).map_err(|_| RappBindingError::InvalidInput)?;
+        let transports = transports
+            .into_iter()
+            .map(transport_candidate)
+            .collect::<Result<Vec<_>, _>>()?;
+        let dummy_secret = PairingSecret::from_random_bytes([0_u8; super::PAIRING_SECRET_SIZE]);
+        let offer = PairingOffer::reconstruct(
+            offer_id,
+            dummy_secret,
+            vec![MANDATORY_PAIRING_SUITE.to_owned()],
+            profiles,
+            transports,
+            offer_ttl_ms,
+        )
+        .map_err(|_| RappBindingError::InvalidInput)?;
+        let deadline = PairingOfferDeadline::from_offer(&offer, started_at_monotonic_ms)
+            .map_err(|_| RappBindingError::InvalidInput)?;
+        Ok(Arc::new(Self {
+            state: Mutex::new(PairingBridgeState::Offer {
+                role: EndpointRole::Requester,
+                offer,
+                deadline,
+            }),
+        }))
+    }
+
+    /// Construct the proxy offer state from an entered 6-digit numeric pairing code.
+    ///
+    /// # Errors
+    /// [`RappBindingError::InvalidInput`] on an invalid code or offer parameters.
+    #[uniffi::constructor]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "uniffi lowers exported arguments as owned values"
+    )]
+    pub fn from_proxy_code_offer(
+        pairing_code: String,
+        profiles: Vec<String>,
+        transports: Vec<RappTransportCandidate>,
+        offer_ttl_ms: u64,
+        started_at_monotonic_ms: u64,
+    ) -> Result<Arc<Self>, RappBindingError> {
+        let offer_id =
+            derive_manual_offer_id(&pairing_code).map_err(|_| RappBindingError::InvalidInput)?;
+        let transports = transports
+            .into_iter()
+            .map(transport_candidate)
+            .collect::<Result<Vec<_>, _>>()?;
+        let dummy_secret = PairingSecret::from_random_bytes([0_u8; super::PAIRING_SECRET_SIZE]);
+        let offer = PairingOffer::reconstruct(
+            offer_id,
+            dummy_secret,
+            vec![MANDATORY_PAIRING_SUITE.to_owned()],
+            profiles,
+            transports,
+            offer_ttl_ms,
+        )
+        .map_err(|_| RappBindingError::InvalidInput)?;
         let deadline = PairingOfferDeadline::from_offer(&offer, started_at_monotonic_ms)
             .map_err(|_| RappBindingError::InvalidInput)?;
         Ok(Arc::new(Self {
@@ -434,6 +550,153 @@ impl RappPairingBridge {
         }
     }
 
+    /// Begin CPace PAKE key exchange for a selected transport candidate using the 6-digit code.
+    ///
+    /// # Errors
+    /// [`RappBindingError`] on expired offer, wrong phase, or invalid random scalar entropy.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "uniffi lowers exported arguments as owned values"
+    )]
+    pub fn begin_cpace(
+        &self,
+        candidate_id: String,
+        pairing_code: String,
+        random_bytes_64: Vec<u8>,
+        now_monotonic_ms: u64,
+    ) -> Result<(), RappBindingError> {
+        let mut state = self.lock()?;
+        state.require_live_offer(now_monotonic_ms)?;
+        let previous = core::mem::replace(&mut *state, PairingBridgeState::Failed);
+        let PairingBridgeState::Offer {
+            role,
+            offer,
+            deadline,
+        } = previous
+        else {
+            *state = previous;
+            return Err(RappBindingError::WrongPhase);
+        };
+        let random_array: [u8; 64] = random_bytes_64
+            .as_slice()
+            .try_into()
+            .map_err(|_| RappBindingError::InvalidInput)?;
+        let cpace = match CpaceState::new(
+            handshake_role(role),
+            &pairing_code,
+            &offer.offer_id,
+            &random_array,
+        ) {
+            Ok(c) => c,
+            Err(_) => {
+                *state = PairingBridgeState::Offer {
+                    role,
+                    offer,
+                    deadline,
+                };
+                return Err(RappBindingError::InvalidInput);
+            }
+        };
+        let Ok(local_keys) = generate_pair_key_material() else {
+            *state = PairingBridgeState::Offer {
+                role,
+                offer,
+                deadline,
+            };
+            return Err(RappBindingError::ProtocolFailure);
+        };
+        *state = PairingBridgeState::Cpace {
+            role,
+            cpace: Box::new(cpace),
+            offer,
+            candidate_id,
+            local_keys,
+            deadline,
+        };
+        Ok(())
+    }
+
+    /// Produce the local CPace public point frame to send to the peer.
+    ///
+    /// # Errors
+    /// [`RappBindingError`] on wrong phase or framing error.
+    pub fn write_cpace_frame(&self, now_monotonic_ms: u64) -> Result<Vec<u8>, RappBindingError> {
+        let mut state = self.lock()?;
+        state.require_live_offer(now_monotonic_ms)?;
+        let PairingBridgeState::Cpace { cpace, .. } = &*state else {
+            return Err(RappBindingError::WrongPhase);
+        };
+        let frame = cpace
+            .write_message()
+            .map_err(|_| RappBindingError::ProtocolFailure)?;
+        drop(state);
+        Ok(frame.into_bytes())
+    }
+
+    /// Consume the peer's CPace frame, derive the shared pairing secret, and immediately
+    /// begin the Noise XXpsk3 handshake.
+    ///
+    /// # Errors
+    /// [`RappBindingError`] on wrong phase, invalid point, or handshake creation failure.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "uniffi lowers exported arguments as owned values"
+    )]
+    pub fn read_cpace_frame(
+        &self,
+        frame: Vec<u8>,
+        now_monotonic_ms: u64,
+    ) -> Result<(), RappBindingError> {
+        let mut state = self.lock()?;
+        state.require_live_offer(now_monotonic_ms)?;
+        let previous = core::mem::replace(&mut *state, PairingBridgeState::Failed);
+        let PairingBridgeState::Cpace {
+            role,
+            cpace,
+            mut offer,
+            candidate_id,
+            local_keys,
+            deadline,
+        } = previous
+        else {
+            *state = previous;
+            return Err(RappBindingError::WrongPhase);
+        };
+        let binary_frame = match BinaryFrame::reconstruct(frame) {
+            Ok(f) => f,
+            Err(_) => {
+                *state = PairingBridgeState::after_cpace_failure(role, offer, deadline);
+                drop(state);
+                return Err(RappBindingError::ProtocolFailure);
+            }
+        };
+        let secret = match cpace.read_message(&binary_frame) {
+            Ok(s) => s,
+            Err(_) => {
+                *state = PairingBridgeState::after_cpace_failure(role, offer, deadline);
+                drop(state);
+                return Err(RappBindingError::ProtocolFailure);
+            }
+        };
+        offer.set_pairing_secret(secret);
+        match PairingHandshake::begin(role, offer, &candidate_id, local_keys) {
+            Ok(handshake) => {
+                *state = PairingBridgeState::Handshake {
+                    role,
+                    handshake: Box::new(handshake),
+                    deadline,
+                };
+                Ok(())
+            }
+            Err(failure) => {
+                let (_, offer) = failure.into_parts();
+                *state = PairingBridgeState::after_cpace_failure(role, offer, deadline);
+                drop(state);
+                Err(RappBindingError::ProtocolFailure)
+            }
+        }
+    }
+
     /// Discard one unauthenticated transport candidate. A requester retains
     /// the same still-live offer and absolute deadline; a proxy discards its
     /// scanned copy. Returns whether the requester offer remains reusable.
@@ -444,17 +707,30 @@ impl RappPairingBridge {
         let mut state = self.lock()?;
         state.require_live_offer(now_monotonic_ms)?;
         let previous = core::mem::replace(&mut *state, PairingBridgeState::Failed);
-        let PairingBridgeState::Handshake {
-            role,
-            handshake,
-            deadline,
-        } = previous
-        else {
-            *state = previous;
-            return Err(RappBindingError::WrongPhase);
+        let (role, offer, deadline) = match previous {
+            PairingBridgeState::Handshake {
+                role,
+                handshake,
+                deadline,
+            } => {
+                let retained = role == EndpointRole::Requester && !handshake.is_complete();
+                *state = PairingBridgeState::after_handshake_failure(role, *handshake, deadline);
+                drop(state);
+                return Ok(retained);
+            }
+            PairingBridgeState::Cpace {
+                role,
+                offer,
+                deadline,
+                ..
+            } => (role, offer, deadline),
+            _ => {
+                *state = previous;
+                return Err(RappBindingError::WrongPhase);
+            }
         };
-        let retained = role == EndpointRole::Requester && !handshake.is_complete();
-        *state = PairingBridgeState::after_handshake_failure(role, *handshake, deadline);
+        let retained = role == EndpointRole::Requester;
+        *state = PairingBridgeState::after_cpace_failure(role, offer, deadline);
         drop(state);
         Ok(retained)
     }
@@ -472,6 +748,7 @@ impl RappPairingBridge {
         let previous = core::mem::replace(&mut *state, PairingBridgeState::Failed);
         match previous {
             PairingBridgeState::Offer { .. }
+            | PairingBridgeState::Cpace { .. }
             | PairingBridgeState::Handshake { .. }
             | PairingBridgeState::Confirmation(_) => Ok(()),
             PairingBridgeState::Expired | PairingBridgeState::Failed => Ok(()),

@@ -25,6 +25,7 @@ uniffi::setup_scaffolding!();
 mod authorization;
 #[cfg(feature = "bindings")]
 pub mod bindings;
+pub mod cpace;
 mod crypto;
 mod endpoint;
 mod journal;
@@ -56,6 +57,7 @@ pub use authorization::{
     AuthorizedCardCommand, AuthorizedSafeRead, OperationProgressMessage, OperationReference,
     ProgressEvent, ProxyCancelOutcome, UserApproval,
 };
+pub use cpace::{CPACE_POINT_SIZE, CpaceError, CpaceState, derive_manual_offer_id};
 pub use crypto::{
     CryptoError, HandshakeChannel, HandshakeCompletion, HandshakeRole, OpenError, PairKeyMaterial,
     PairingHandshakeParameters, SecureChannel, SessionHandshakeParameters, compute_grants_hash,

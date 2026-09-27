@@ -430,6 +430,7 @@ dependencies = [
  "fiat-crypto",
  "rustc_version",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -973,6 +974,7 @@ dependencies = [
 name = "refineid-rapp"
 version = "26.9.27"
 dependencies = [
+ "curve25519-dalek",
  "getrandom 0.4.3",
  "serde",
  "serde_json",

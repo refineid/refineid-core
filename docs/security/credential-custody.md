@@ -4,6 +4,10 @@ This is the target contract for PIN-bearing code. The public tree currently
 implements the refined input types and the credential-command ownership types;
 it does not yet build a credential APDU flow or cache a PIN.
 
+See also [Security and Usability Balance](security-and-usability-balance.md) for
+the architectural consensus on unattended PIN 1 authentication and explicit
+batch signing for PIN 2.
+
 ## PIN2 qualified-signature convenience window
 
 FINEID S4-1 v4.2 sections 4.1 and 8.1.7 require manual PIN entry for every

@@ -162,7 +162,7 @@ public_identifier!(
 ///
 /// It is non-clonable, always redacted, and zeroized on drop. Only the RAPP
 /// cryptographic layer can borrow its bytes.
-#[derive(ZeroizeOnDrop)]
+#[derive(PartialEq, Eq, ZeroizeOnDrop)]
 pub struct PairingSecret([u8; PAIRING_SECRET_SIZE]);
 
 impl PairingSecret {

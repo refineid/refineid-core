@@ -111,6 +111,11 @@ impl PairingOffer {
         &self.pairing_secret
     }
 
+    /// Update the pairing secret (e.g. after CPace key exchange).
+    pub fn set_pairing_secret(&mut self, secret: PairingSecret) {
+        self.pairing_secret = secret;
+    }
+
     /// Hash the deterministic offer with the bearer secret removed.
     ///
     /// # Errors

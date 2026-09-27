@@ -173,3 +173,17 @@ fn test_snow_supports_xxpsk3_sha512() {
         hs.err()
     );
 }
+
+#[test]
+fn identifier_derivations_use_sha512_over_64_byte_handshake_hash() {
+    let handshake_hash = [0x42_u8; 64];
+    let session_id = refineid_rapp::derive_session_id(&handshake_hash);
+    let pair_id = refineid_rapp::derive_pair_id(&handshake_hash);
+    let rendezvous = refineid_rapp::derive_rendezvous_token(&handshake_hash);
+
+    assert_eq!(session_id.as_bytes().len(), 16);
+    assert_eq!(pair_id.as_bytes().len(), 16);
+    assert_eq!(rendezvous.as_bytes().len(), 16);
+    assert_ne!(session_id.as_bytes(), pair_id.as_bytes());
+    assert_ne!(pair_id.as_bytes(), rendezvous.as_bytes());
+}

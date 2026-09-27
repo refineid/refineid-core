@@ -219,18 +219,18 @@
   ],
   "identifier_derivation": [
     {
-      "handshake_hash_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "handshake_hash_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
       "name": "zero-handshake-hash",
-      "pair_id_hex": "262c3d6d9fdf7ca4c9be464259469045",
-      "rendezvous_token_hex": "32b3fc60ee649ad964e821fef85b8ae6",
-      "session_id_hex": "e8b883f0fe4239ce73fbddf6575e94c9"
+      "pair_id_hex": "8f63480197b7b8b8632248bc1ba99441",
+      "rendezvous_token_hex": "b22ee30598a38df4014e0585a2b97689",
+      "session_id_hex": "271aeed805a28d799b44034449bbb2fb"
     },
     {
-      "handshake_hash_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "handshake_hash_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
       "name": "incrementing-handshake-hash",
-      "pair_id_hex": "da9db64eb9c387df3e7cec15190efccf",
-      "rendezvous_token_hex": "298f9598c56541a56cde67862d11f40e",
-      "session_id_hex": "cfb9f0c0f1bb38ed1213be9e4af20bf3"
+      "pair_id_hex": "8488270ca0a12a5b02b349d39627aa64",
+      "rendezvous_token_hex": "c9f380c7e96504b9c91f110408c5dc5e",
+      "session_id_hex": "0b45ff0cba6b749619c7fc4ef5f389c4"
     }
   ],
   "noise_handshake": [

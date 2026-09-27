@@ -473,19 +473,11 @@ fn build(builder: Builder<'_>, role: HandshakeRole) -> Result<HandshakeState, Cr
 #[must_use]
 pub fn derive_session_id(handshake_hash: &[u8]) -> SessionId {
     let mut bytes = [0_u8; SESSION_ID_SIZE];
-    if handshake_hash.len() == 64 {
-        let digest = Sha512::new()
-            .chain_update(b"RAPP-session-id-v1")
-            .chain_update(handshake_hash)
-            .finalize();
-        bytes.copy_from_slice(&digest[..SESSION_ID_SIZE]);
-    } else {
-        let digest = Sha256::new()
-            .chain_update(b"RAPP-session-id-v1")
-            .chain_update(handshake_hash)
-            .finalize();
-        bytes.copy_from_slice(&digest[..SESSION_ID_SIZE]);
-    }
+    let digest = Sha512::new()
+        .chain_update(b"RAPP-session-id-v1")
+        .chain_update(handshake_hash)
+        .finalize();
+    bytes.copy_from_slice(&digest[..SESSION_ID_SIZE]);
     SessionId::from_array(bytes)
 }
 
@@ -493,19 +485,11 @@ pub fn derive_session_id(handshake_hash: &[u8]) -> SessionId {
 #[must_use]
 pub fn derive_pair_id(handshake_hash: &[u8]) -> PairId {
     let mut bytes = [0_u8; PAIR_ID_SIZE];
-    if handshake_hash.len() == 64 {
-        let digest = Sha512::new()
-            .chain_update(b"RAPP-pair-id-v1")
-            .chain_update(handshake_hash)
-            .finalize();
-        bytes.copy_from_slice(&digest[..PAIR_ID_SIZE]);
-    } else {
-        let digest = Sha256::new()
-            .chain_update(b"RAPP-pair-id-v1")
-            .chain_update(handshake_hash)
-            .finalize();
-        bytes.copy_from_slice(&digest[..PAIR_ID_SIZE]);
-    }
+    let digest = Sha512::new()
+        .chain_update(b"RAPP-pair-id-v1")
+        .chain_update(handshake_hash)
+        .finalize();
+    bytes.copy_from_slice(&digest[..PAIR_ID_SIZE]);
     PairId::from_array(bytes)
 }
 
@@ -515,19 +499,11 @@ pub fn derive_pair_id(handshake_hash: &[u8]) -> PairId {
 #[must_use]
 pub fn derive_rendezvous_token(handshake_hash: &[u8]) -> RendezvousToken {
     let mut bytes = [0_u8; RENDEZVOUS_TOKEN_SIZE];
-    if handshake_hash.len() == 64 {
-        let digest = Sha512::new()
-            .chain_update(b"RAPP-rendezvous-v1")
-            .chain_update(handshake_hash)
-            .finalize();
-        bytes.copy_from_slice(&digest[..RENDEZVOUS_TOKEN_SIZE]);
-    } else {
-        let digest = Sha256::new()
-            .chain_update(b"RAPP-rendezvous-v1")
-            .chain_update(handshake_hash)
-            .finalize();
-        bytes.copy_from_slice(&digest[..RENDEZVOUS_TOKEN_SIZE]);
-    }
+    let digest = Sha512::new()
+        .chain_update(b"RAPP-rendezvous-v1")
+        .chain_update(handshake_hash)
+        .finalize();
+    bytes.copy_from_slice(&digest[..RENDEZVOUS_TOKEN_SIZE]);
     RendezvousToken::from_array(bytes)
 }
 

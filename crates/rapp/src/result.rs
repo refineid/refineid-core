@@ -26,7 +26,9 @@ pub enum ResultStatus {
 }
 
 impl ResultStatus {
-    const fn as_str(self) -> &'static str {
+    /// Wire-format status label per RAPP 26.9.28 § Operation Result Codes.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Completed => "completed",
             Self::Denied => "denied",
@@ -37,7 +39,11 @@ impl ResultStatus {
         }
     }
 
-    fn parse(value: &str) -> Result<Self, CardOperationError> {
+    /// Parse from wire-format status label per RAPP 26.9.28 § Operation Result Codes.
+    ///
+    /// # Errors
+    /// [`CardOperationError::InvalidField`] when the string does not match a registered status.
+    pub fn parse(value: &str) -> Result<Self, CardOperationError> {
         match value {
             "completed" => Ok(Self::Completed),
             "denied" => Ok(Self::Denied),
@@ -72,7 +78,9 @@ pub enum ResultError {
 }
 
 impl ResultError {
-    const fn as_str(self) -> &'static str {
+    /// Wire-format error label per RAPP 26.9.28 § Operation Error Codes.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::UserDenied => "user_denied",
             Self::RequestExpired => "request_expired",
@@ -85,7 +93,11 @@ impl ResultError {
         }
     }
 
-    fn parse(value: &str) -> Result<Self, CardOperationError> {
+    /// Parse from wire-format error label per RAPP 26.9.28 § Operation Error Codes.
+    ///
+    /// # Errors
+    /// [`CardOperationError::InvalidField`] when the string does not match a registered error code.
+    pub fn parse(value: &str) -> Result<Self, CardOperationError> {
         match value {
             "user_denied" => Ok(Self::UserDenied),
             "request_expired" => Ok(Self::RequestExpired),
@@ -443,5 +455,101 @@ fn take_map(
 impl fmt::Display for ResultStatus {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+impl core::str::FromStr for ResultStatus {
+    type Err = CardOperationError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
+impl fmt::Display for ResultError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl core::str::FromStr for ResultError {
+    type Err = CardOperationError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::str::FromStr;
+
+    use super::{ResultError, ResultStatus};
+
+    #[test]
+    fn result_status_wire_labels_bidirectional_round_trip() {
+        let cases = [
+            (ResultStatus::Completed, "completed"),
+            (ResultStatus::Denied, "denied"),
+            (ResultStatus::Cancelled, "cancelled"),
+            (ResultStatus::Rejected, "rejected"),
+            (ResultStatus::CredentialRejected, "credential_rejected"),
+            (ResultStatus::Ambiguous, "ambiguous"),
+        ];
+
+        for (status, expected_label) in cases {
+            assert_eq!(status.as_str(), expected_label);
+            assert_eq!(status.to_string(), expected_label);
+            assert_eq!(
+                ResultStatus::parse(expected_label).expect("registered status label"),
+                status
+            );
+            assert_eq!(
+                ResultStatus::from_str(expected_label).expect("registered status label"),
+                status
+            );
+        }
+
+        assert!(ResultStatus::parse("invalid_status").is_err());
+        assert!(ResultStatus::from_str("unknown").is_err());
+    }
+
+    #[test]
+    fn result_error_wire_labels_bidirectional_round_trip() {
+        let cases = [
+            (ResultError::UserDenied, "user_denied"),
+            (ResultError::RequestExpired, "request_expired"),
+            (ResultError::Cancelled, "cancelled"),
+            (
+                ResultError::RequestInvalidOrUnsupported,
+                "request_invalid_or_unsupported",
+            ),
+            (ResultError::RetryPolicyRefused, "retry_policy_refused"),
+            (ResultError::CredentialRejected, "credential_rejected"),
+            (
+                ResultError::CardRemovedBeforeTransmit,
+                "card_removed_before_transmit",
+            ),
+            (
+                ResultError::CardCompletionAmbiguous,
+                "card_completion_ambiguous",
+            ),
+        ];
+
+        for (error, expected_label) in cases {
+            assert_eq!(error.as_str(), expected_label);
+            assert_eq!(error.to_string(), expected_label);
+            assert_eq!(
+                ResultError::parse(expected_label).expect("registered error label"),
+                error
+            );
+            assert_eq!(
+                ResultError::from_str(expected_label).expect("registered error label"),
+                error
+            );
+        }
+
+        assert!(ResultError::parse("invalid_error").is_err());
+        assert!(ResultError::from_str("unknown").is_err());
     }
 }

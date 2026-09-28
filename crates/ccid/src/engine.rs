@@ -36,13 +36,13 @@ use zeroize::Zeroizing;
 /// Default timeout for CCID engine operations in milliseconds.
 pub const DEFAULT_ENGINE_TIMEOUT_MS: u64 = 5000;
 
-/// Chaining parameter: unfragmented block or default level parameter (USB-IF CCID Rev 1.1 §6.1.4).
+/// Chaining parameter: unfragmented block or default level parameter (USB-IF CCID Rev 1.1 §6.1.4 Table 6-4).
 pub const W_LEVEL_NONE: u16 = 0x0000;
-/// Chaining parameter: command APDU begins and continues in next block (CCID Rev 1.1 §6.1.4 Table 6-4).
+/// Chaining parameter: command APDU begins and continues in next block (USB-IF CCID Rev 1.1 §6.1.4 Table 6-4).
 pub const W_LEVEL_BEGIN: u16 = 0x0001;
-/// Chaining parameter: command APDU ends in this block (CCID Rev 1.1 §6.1.4 Table 6-4).
+/// Chaining parameter: command APDU ends in this block (USB-IF CCID Rev 1.1 §6.1.4 Table 6-4).
 pub const W_LEVEL_END: u16 = 0x0002;
-/// Chaining parameter: command APDU continues and another block follows (CCID Rev 1.1 §6.1.4 Table 6-4).
+/// Chaining parameter: command APDU continues and another block follows (USB-IF CCID Rev 1.1 §6.1.4 Table 6-4).
 pub const W_LEVEL_CONTINUE: u16 = 0x0003;
 
 /// Maximum attempts to drain stale Bulk-IN packets following an abort handshake (CCID Rev 1.1 §5.3.1).
@@ -1376,6 +1376,8 @@ mod tests {
     };
     use crate::descriptor::{AUTOMATIC_ACTIVATION, SHORT_APDU_EXCHANGE};
 
+    const TEST_B_WI: u8 = 0;
+
     fn make_test_descriptor() -> CcidFunctionalDescriptor {
         CcidFunctionalDescriptor::from_parts_unchecked(
             CcidExchangeLevel::ShortApdu,
@@ -1462,7 +1464,7 @@ mod tests {
             InputEvent::Start {
                 id: op_id,
                 op: Operation::TransferBlock {
-                    b_wi: 0,
+                    b_wi: TEST_B_WI,
                     w_level_parameter: W_LEVEL_NONE,
                     data: Zeroizing::new(apdu.to_vec()),
                 },
@@ -1505,7 +1507,7 @@ mod tests {
             InputEvent::Start {
                 id: op_id,
                 op: Operation::TransferBlock {
-                    b_wi: 0,
+                    b_wi: TEST_B_WI,
                     w_level_parameter: W_LEVEL_NONE,
                     data: Zeroizing::new(vec![0x00, 0x84, 0x00, 0x00, 0x08]),
                 },
@@ -1570,7 +1572,7 @@ mod tests {
             InputEvent::Start {
                 id: op_id,
                 op: Operation::TransferBlock {
-                    b_wi: 0,
+                    b_wi: TEST_B_WI,
                     w_level_parameter: W_LEVEL_NONE,
                     data: Zeroizing::new(vec![0x00, 0x20, 0x00, 0x80]),
                 },
@@ -1744,7 +1746,7 @@ mod tests {
             InputEvent::Start {
                 id: op_id,
                 op: Operation::TransferBlock {
-                    b_wi: 0,
+                    b_wi: TEST_B_WI,
                     w_level_parameter: W_LEVEL_NONE,
                     data: Zeroizing::new(vec![0x00, 0x84, 0x00, 0x00, 0x08]),
                 },
@@ -1805,7 +1807,7 @@ mod tests {
             InputEvent::Start {
                 id: op_id,
                 op: Operation::TransferBlock {
-                    b_wi: 0,
+                    b_wi: TEST_B_WI,
                     w_level_parameter: W_LEVEL_NONE,
                     data: Zeroizing::new(vec![0x00, 0x84, 0x00, 0x00, 0x08]),
                 },
@@ -1854,7 +1856,7 @@ mod tests {
             InputEvent::Start {
                 id: op_id,
                 op: Operation::TransferBlock {
-                    b_wi: 0,
+                    b_wi: TEST_B_WI,
                     w_level_parameter: W_LEVEL_NONE,
                     data: Zeroizing::new(vec![0x00, 0x84, 0x00, 0x00, 0x08]),
                 },

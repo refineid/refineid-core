@@ -52,7 +52,7 @@ const SW1_WRONG_LE: u8 = 0x6C;
 const DEFAULT_TRANSPORT_TIMEOUT_MS: u32 = 5000;
 /// Default waiting integer for direct commands (0 = use reader/card default).
 const DEFAULT_B_WI: u8 = 0;
-/// Default level parameter for unfragmented direct commands (0 = complete command).
+/// Default level parameter for unfragmented direct commands (aliases protocol `W_LEVEL_NONE`).
 const DEFAULT_W_LEVEL_PARAMETER: u16 = crate::engine::W_LEVEL_NONE;
 /// Length of ISO 7816-4 status word bytes (SW1, SW2).
 const STATUS_BYTES_LEN: usize = 2;

@@ -540,35 +540,7 @@ impl ModuleState {
             return Ok(cached.clone());
         }
         let reader_name = self.reader_name(slot_id).ok_or(CKR_DEVICE_ERROR)?;
-        #[cfg_attr(
-            not(windows),
-            allow(unused_variables, reason = "RAPP pairing is Windows-only")
-        )]
-        if let Some(hex_id) = reader_name.strip_prefix("rapp:") {
-            #[cfg(windows)]
-            {
-                use refineid_windows_credential_store::CredentialPairingStore;
-                let store = CredentialPairingStore::load().map_err(|_| CKR_DEVICE_ERROR)?;
-                let pair = store
-                    .records()
-                    .iter()
-                    .find(|p| hex::encode(p.pair_id.0) == hex_id)
-                    .cloned()
-                    .ok_or(CKR_DEVICE_ERROR)?;
-
-                let cert_der = pair
-                    .auth_cert
-                    .as_ref()
-                    .ok_or(crate::ck::CKR_TOKEN_NOT_PRESENT)?
-                    .clone();
-
-                let mut objects = TokenObjects::from_cert_der(cert_der)?;
-                let serial = format!("REMOTE-{}", &hex_id[..std::cmp::min(8, hex_id.len())]);
-                objects.set_token_serial(serial);
-                self.token_cache.insert(slot_id, objects.clone());
-                return Ok(objects);
-            }
-            #[cfg(not(windows))]
+        if reader_name.starts_with("rapp:") {
             return Err(CKR_DEVICE_ERROR);
         }
         let objects = build_token_objects(&reader_name)?;

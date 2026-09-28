@@ -559,9 +559,9 @@ impl TokenObjects {
         &self.token_serial
     }
 
-    #[cfg_attr(
-        not(windows),
-        allow(dead_code, reason = "set_token_serial is used on Windows or in tests")
+    #[expect(
+        dead_code,
+        reason = "set_token_serial is an override hook for remote/custom token instances"
     )]
     pub(crate) fn set_token_serial(&mut self, serial: String) {
         self.token_serial = serial;
@@ -1316,9 +1316,9 @@ fn parse_der_len(der: &[u8], idx: &mut usize) -> Option<usize> {
     Some(len)
 }
 
-#[cfg_attr(
-    not(windows),
-    allow(dead_code, reason = "P1363 ECDSA conversion used on Windows/tests")
+#[expect(
+    dead_code,
+    reason = "P1363 ECDSA conversion utility for remote signing"
 )]
 pub fn ecdsa_der_to_p1363(der: &[u8], field_bytes: usize) -> Option<Vec<u8>> {
     if field_bytes == 0 || der.is_empty() || der[0] != 0x30 {
@@ -1378,93 +1378,6 @@ pub fn ecdsa_der_to_p1363(der: &[u8], field_bytes: usize) -> Option<Vec<u8>> {
     Some(out)
 }
 
-#[cfg(windows)]
-pub struct RemoteCardTransport {
-    pub(crate) pair_id: refineid_rapp_core::ids::PairId,
-    pub(crate) pairing_record: refineid_rapp_core::store::PairingRecord,
-}
-
-#[cfg(windows)]
-impl RemoteCardTransport {
-    pub(crate) fn new(
-        pair_id: refineid_rapp_core::ids::PairId,
-        pairing_record: refineid_rapp_core::store::PairingRecord,
-    ) -> Self {
-        Self {
-            pair_id,
-            pairing_record,
-        }
-    }
-
-    fn connect_session_transport(
-        &self,
-    ) -> Result<refineid_rapp_core::transport::TcpFrameTransport, String> {
-        use core::time::Duration;
-        use refineid_rapp_core::stream::{StreamAccept, StreamListener, StreamRendezvous, dial};
-        let timeout = Duration::from_secs(45);
-        let candidate_id = "stream-1";
-        let listen_endpoint = "127.0.0.1:47110";
-        let local_dial_endpoint = "127.0.0.1:47110";
-
-        if let Ok(listener) = StreamListener::bind(listen_endpoint, candidate_id, timeout)
-            && let Ok(StreamAccept::Session {
-                rendezvous_token,
-                transport,
-            }) = listener.accept()
-            && rendezvous_token == self.pairing_record.rendezvous_token
-        {
-            return Ok(transport);
-        }
-
-        dial(
-            &[local_dial_endpoint.to_owned()],
-            candidate_id,
-            timeout,
-            &StreamRendezvous::Session(self.pairing_record.rendezvous_token),
-        )
-        .map_err(|e| format!("dial failed: {e:?}"))
-    }
-
-    pub(crate) fn execute_operation(
-        &self,
-        operation: &refineid_rapp_core::operations::CardOperation,
-    ) -> Result<refineid_rapp_core::operations::CardOperationResult, String> {
-        use refineid_rapp_core::engine::{OperationOutcome, Requester, RequesterConfig};
-        use refineid_rapp_core::message::CloseReason;
-        use refineid_rapp_core::store::{MemoryJournal, MemoryPairingStore, PairingStore};
-
-        let transport = self.connect_session_transport()?;
-        let mut store = MemoryPairingStore::new();
-        let _ = store.insert(self.pairing_record.clone());
-        let mut requester = Requester::new(
-            RequesterConfig {
-                display_name: "RefineID PKCS#11".into(),
-                platform: "Windows".into(),
-            },
-            store,
-            MemoryJournal::new(),
-        );
-
-        let mut session = requester
-            .connect(self.pair_id, transport)
-            .map_err(|e| format!("session connect failed: {e:?}"))?;
-
-        let outcome = requester
-            .execute(&mut session, operation, 30_000)
-            .map_err(|e| format!("operation execute failed: {e:?}"))?;
-
-        requester.disconnect(&mut session, CloseReason::UserDisconnect);
-
-        match outcome {
-            OperationOutcome::Completed(result) => Ok(result),
-            OperationOutcome::Denied => {
-                Err("operation was denied by the user on the remote device".into())
-            }
-            other => Err(format!("operation failed with outcome: {other:?}")),
-        }
-    }
-}
-
 fn remote_card_sign(
     hex_id: &str,
     origin: &str,
@@ -1475,75 +1388,8 @@ fn remote_card_sign(
         crate::diag::diag!("remote_card_sign: invalid or missing RP origin");
         return Err(CKR_ARGUMENTS_BAD);
     }
-    #[cfg(windows)]
-    {
-        use refineid_rapp_core::operations::{
-            CardOperation, CardOperationResult, KeyProfile, SignatureAlgorithm,
-        };
-        use refineid_windows_credential_store::CredentialPairingStore;
-        let store = CredentialPairingStore::load().map_err(|_| CKR_DEVICE_ERROR)?;
-        let pair = store
-            .records()
-            .iter()
-            .find(|p| hex::encode(p.pair_id.0) == hex_id)
-            .cloned()
-            .ok_or(CKR_DEVICE_ERROR)?;
-
-        let (key_profile, algorithm, digest) = match mechanism {
-            Mechanism::Ecdsa => {
-                let digest_bytes = if input.len() == 48 || input.len() == 32 {
-                    input.to_vec()
-                } else {
-                    return Err(CKR_DATA_LEN_RANGE);
-                };
-                let (profile, algo) = if input.len() == 48 {
-                    (KeyProfile::EcdsaP384, SignatureAlgorithm::EcdsaSha384)
-                } else {
-                    (KeyProfile::EcdsaP256, SignatureAlgorithm::EcdsaSha256)
-                };
-                (profile, algo, digest_bytes)
-            }
-            Mechanism::RsaPkcs => (
-                KeyProfile::Rsa3072,
-                SignatureAlgorithm::RsaPkcs1Sha256,
-                input.to_vec(),
-            ),
-        };
-
-        let op = CardOperation::BrowserAuthenticate {
-            origin: origin.into(),
-            key_profile,
-            algorithm,
-            digest,
-        };
-
-        let remote_tx = RemoteCardTransport::new(pair.pair_id, pair);
-        let result = remote_tx.execute_operation(&op).map_err(|err| {
-            crate::diag::diag!("remote_card_sign execute_operation failed: {err}");
-            CKR_DEVICE_ERROR
-        })?;
-
-        match result {
-            CardOperationResult::Signature(signature_bytes) => match mechanism {
-                Mechanism::Ecdsa => {
-                    if signature_bytes.first() == Some(&0x30) {
-                        ecdsa_der_to_p1363(&signature_bytes, 48).ok_or(CKR_DEVICE_ERROR)
-                    } else if signature_bytes.len() == 96 {
-                        Ok(signature_bytes)
-                    } else {
-                        Err(CKR_DEVICE_ERROR)
-                    }
-                }
-                Mechanism::RsaPkcs => Ok(signature_bytes),
-            },
-            _ => Err(CKR_DEVICE_ERROR),
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (hex_id, origin, mechanism, input);
-        Err(CKR_DEVICE_ERROR)
-    }
+    let _ = (hex_id, origin, mechanism, input);
+    Err(CKR_DEVICE_ERROR)
 }
 
 /// Verify and cache a `C_Login` PIN only after the live card accepts it.
@@ -2115,5 +1961,20 @@ mod tests {
             Some("   "),
         );
         assert_eq!(res, Err(crate::ck::CKR_ARGUMENTS_BAD));
+    }
+
+    #[test]
+    fn remote_card_sign_valid_origin_fails_device_error() {
+        let pin_cache = std::sync::Arc::new(std::sync::Mutex::new(
+            super::PinSafetyCache::new().expect("pin safety cache"),
+        ));
+        let res = super::card_sign(
+            "rapp:0123456789abcdef",
+            &pin_cache,
+            crate::sign::Mechanism::Ecdsa,
+            &[0u8; 32],
+            Some("https://auth.example.com"),
+        );
+        assert_eq!(res, Err(crate::ck::CKR_DEVICE_ERROR));
     }
 }

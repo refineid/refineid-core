@@ -19,6 +19,13 @@ if [[ -n "$private_paths" ]]; then
   failed=1
 fi
 
+whatsup_files=$(git ls-files | grep -i -E '(^|/)WHATSUP\.md$' || true)
+if [[ -n "$whatsup_files" ]]; then
+  echo "WHATSUP.md files are forbidden:"
+  printf '%s\n' "$whatsup_files"
+  failed=1
+fi
+
 secret_files=$(git grep -I -l -E \
   'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|AKIA[0-9A-Z]{16}|github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9]{20,}' \
   -- . ':!LICENSE' || true)

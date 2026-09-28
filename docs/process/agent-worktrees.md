@@ -22,51 +22,23 @@ colliding and keeps the main checkout pristine for integration.
 
 1. Update local main: `git checkout main && git pull --ff-only`.
 2. Create the worktree under `~/src/wt/`: `git worktree add ~/src/wt/refineid-core-<topic> -b agent/<topic>`.
-3. Write `WHATSUP.md` in the worktree root (see below).
-4. Run `scripts/agent-housekeeping.sh` and act on what it reports.
-
-## WHATSUP.md
-
-Every worktree carries a `WHATSUP.md` work log in its root: plain Markdown
-so owners and agents can both read it. It records why the worktree was
-born, where the work stopped, and whether it is worth resuming. Work gets
-diverted to another focus at random; that is normal, and the log is what
-makes a diverted worktree evaluable later instead of mysterious.
-
-```markdown
-# WHATSUP
-
-branch: agent/resilient-pcsc
-purpose: Add connect_resilient and single-protocol reconnect to crates/pcsc.
-started: 2026-09-12T17:05+03:00 by Antigravity
-heartbeat: 2026-09-12T17:05+03:00
-status: in-progress
-```
-
-Fields (each value stays on its own single line so tooling can read it):
-
-- `purpose`: why this worktree exists, one or two sentences on one line.
-- `started`: timestamp and owner (session name plus human or agent).
-- `heartbeat`: last time the owner touched the work; refresh it when
-  starting, pausing, or finishing.
-- `status`: `in-progress`, `paused-diverted` (with a note saying what
-  diverted it and how to resume), or `done-pending-merge`.
+3. Run `scripts/agent-housekeeping.sh` and act on what it reports.
 
 ## Housekeeping
 
 `scripts/agent-housekeeping.sh` reports every worktree with its branch,
-merge state, dirty files, unpushed commits, claim freshness, and disk use.
+merge state, dirty files, unpushed commits, activity freshness, and disk use.
 With `--clean` it removes only what is provably done:
 
 - The branch is merged into main, the tree is clean, and nothing is
   unpushed. The work is fully preserved in main, so deleting the worktree
   loses nothing. The branch goes with it.
 
-Everything else is reported, never destroyed, with the `WHATSUP.md`
-purpose and status quoted so the evaluator — owner or agent — can decide
-in seconds whether to resume work or clean up. In particular:
+Everything else is reported, never destroyed, with the latest commit headline
+quoted so the evaluator — owner or agent — can decide in seconds whether to
+resume work or clean up. In particular:
 
-- A fresh claim is hands off, unconditionally.
+- Fresh activity (or dirty working tree) is hands off, unconditionally.
 - Uncommitted changes or unpushed commits are never auto-deleted.
 - Non-compliant worktrees not under `~/src/wt/` are flagged explicitly.
 

@@ -31,7 +31,7 @@ The underlay is WebSocket as defined by RFC 6455. Legs MUST use `wss`
 (TLS); plain `ws` MUST NOT be used. TLS contributes no RAPP security
 (Section 5): it hides frame contents from passive network observers and,
 decisively for browser requesters, a secure-context page cannot open
-plain `ws://` legs at all, since blockable mixed content is defined as
+plain unencrypted `ws` legs at all, since blockable mixed content is defined as
 all mixed content that is not upgradable.
 
 One RAPP frame travels as exactly one WebSocket binary message. A binary

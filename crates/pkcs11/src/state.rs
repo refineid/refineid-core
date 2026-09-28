@@ -36,6 +36,7 @@ use refineid_pcsc::{
 use refineid_pkcs15::{Pkcs15Error, Pkcs15Ops as _};
 
 use crate::pin_cache::PinSafetyCache;
+use crate::slot_kind::SlotKind;
 
 use crate::ck::{
     CKF_RW_SESSION, CKR_DEVICE_ERROR, CKS_RO_PUBLIC_SESSION, CKS_RO_USER_FUNCTIONS,
@@ -64,18 +65,22 @@ pub const PIN1_MAX_DIGITS: usize = 12;
 /// initialiser.
 pub static MODULE: Mutex<Option<ModuleState>> = Mutex::new(None);
 
-/// Per-reader rejection memory survives PKCS#11 finalize/reinitialize for
-/// the lifetime of the hosting process. Finalize clears positive secrets.
+/// Per-device rejection memory survives PKCS#11 finalize/reinitialize
+/// for the lifetime of the hosting process. Keyed by
+/// [`SlotKind::cache_key`], so a local reader and a paired phone can
+/// never share an entry. Finalize clears positive secrets.
 static PROCESS_PIN_CACHES: Mutex<BTreeMap<String, Arc<Mutex<PinSafetyCache>>>> =
     Mutex::new(BTreeMap::new());
 
-/// One PKCS#11 slot, bound to a PC/SC reader by name.
+/// One PKCS#11 slot, bound to a device.
 #[derive(Debug, Clone)]
 pub struct SlotRecord {
-    /// Stable slot id for this reader for the process lifetime.
+    /// Stable slot id for this device for the process lifetime.
     id: CkSlotId,
-    /// PC/SC reader name backing the slot.
-    reader_name: String,
+    /// What kind of device backs the slot, decided at the border that
+    /// admitted it. Nothing downstream re-derives this from a name: a
+    /// reader's driver-chosen name is not evidence of anything.
+    kind: SlotKind,
     /// Whether a validated FINEID card was present at the last
     /// slot-table refresh.
     card_present: bool,
@@ -87,9 +92,14 @@ pub struct SlotRecord {
 }
 
 impl SlotRecord {
-    /// The PC/SC reader name backing this slot.
-    pub(crate) fn reader_name(&self) -> &str {
-        &self.reader_name
+    /// The device this slot is bound to.
+    pub(crate) const fn kind(&self) -> &SlotKind {
+        &self.kind
+    }
+
+    /// The text a caller sees for this slot.
+    pub(crate) fn display_name(&self) -> String {
+        self.kind.display_name()
     }
 
     /// Whether a card was present at the last slot-table refresh.
@@ -294,7 +304,6 @@ impl ModuleState {
             }
         };
         for reader in readers {
-            let name = reader.id.as_str();
             let observation = if reader.card_present {
                 prober.probe(&reader.id)
             } else {
@@ -306,7 +315,11 @@ impl ModuleState {
                 continue;
             }
             let aid_present = matches!(observation, FineidCardObservation::Present);
-            if let Some(pos) = self.slots.iter().position(|s| s.reader_name == name) {
+            if let Some(pos) = self
+                .slots
+                .iter()
+                .position(|s| s.kind.local_reader() == Some(&reader.id))
+            {
                 let (id, was_present) = match self.slots.get(pos) {
                     Some(slot) => (slot.id, slot.card_present),
                     None => continue,
@@ -315,7 +328,7 @@ impl ModuleState {
                     // Transition into presence: demand the
                     // cert-proven objects before the slot reports a
                     // token.
-                    let Ok(objects) = prober.build_objects(name) else {
+                    let Ok(objects) = prober.build_objects(&reader.id) else {
                         continue;
                     };
                     if let Some(slot) = self.slots.get_mut(pos) {
@@ -332,14 +345,16 @@ impl ModuleState {
             } else if aid_present {
                 // New reader with a card: same cert-proven bar
                 // before a slot exists at all.
-                let Ok(objects) = prober.build_objects(name) else {
+                let Ok(objects) = prober.build_objects(&reader.id) else {
                     continue;
                 };
                 let id = self.next_slot_id;
                 self.next_slot_id = self.next_slot_id.saturating_add(1);
                 self.slots.push(SlotRecord {
                     id,
-                    reader_name: name.to_owned(),
+                    kind: SlotKind::Local {
+                        reader: reader.id.clone(),
+                    },
                     card_present: true,
                     reader_identity: prober.reader_identity(&reader.id),
                 });
@@ -349,7 +364,14 @@ impl ModuleState {
         Ok(())
     }
 
-    /// Discover paired remote RAPP mobile readers (iPhone/Android) from the local vault.
+    /// Discover paired remote RAPP mobile readers (iPhone/Android) from
+    /// the local vault.
+    ///
+    /// The vault is the only trust origin that may admit a
+    /// [`SlotKind::Remote`]: a pairing record read here is proof the
+    /// pairing was established, where a reader name reported by a USB
+    /// device would only be a claim. While this admits nothing, no
+    /// remote slot exists and no remote credential path is reachable.
     fn refresh_remote_slots(&mut self) {}
 
     /// Drop cached objects and PIN1 login for a slot (on card
@@ -375,10 +397,10 @@ impl ModuleState {
         self.slots.iter().find(|s| s.id == id)
     }
 
-    /// Reader name backing `slot_id`, if the slot exists.
+    /// The device backing `slot_id`, if the slot exists.
     #[must_use]
-    pub(crate) fn reader_name(&self, slot_id: CkSlotId) -> Option<String> {
-        self.slot(slot_id).map(|s| s.reader_name.clone())
+    pub(crate) fn slot_kind(&self, slot_id: CkSlotId) -> Option<&SlotKind> {
+        self.slot(slot_id).map(|s| s.kind())
     }
 
     /// Open a new session on `slot_id` and return its handle.
@@ -449,15 +471,18 @@ impl ModuleState {
         if let Some(cache) = self.pin_caches.get(&slot_id) {
             return Ok(Arc::clone(cache));
         }
-        let reader_name = self.reader_name(slot_id).ok_or(CKR_DEVICE_ERROR)?;
+        let cache_key = self
+            .slot_kind(slot_id)
+            .map(SlotKind::cache_key)
+            .ok_or(CKR_DEVICE_ERROR)?;
         let mut process_caches = PROCESS_PIN_CACHES.lock().map_err(|_| CKR_DEVICE_ERROR)?;
-        let cache = if let Some(cache) = process_caches.get(&reader_name) {
+        let cache = if let Some(cache) = process_caches.get(&cache_key) {
             Arc::clone(cache)
         } else {
             let cache = Arc::new(Mutex::new(
                 PinSafetyCache::new().map_err(|_| CKR_DEVICE_ERROR)?,
             ));
-            process_caches.insert(reader_name, Arc::clone(&cache));
+            process_caches.insert(cache_key, Arc::clone(&cache));
             cache
         };
         drop(process_caches);
@@ -487,8 +512,13 @@ impl ModuleState {
     /// Whether a user is logged in on `slot_id`.
     #[must_use]
     pub(crate) fn is_logged_in(&self, slot_id: CkSlotId) -> bool {
-        if let Some(slot) = self.slot(slot_id)
-            && slot.reader_name().starts_with("rapp:")
+        // A remote slot's PIN1 is verified on the device, so this
+        // computer holds no secret to check. Reaching that answer
+        // requires holding a vault-proven pairing, which only
+        // `refresh_remote_slots` can mint.
+        if self
+            .slot(slot_id)
+            .is_some_and(|slot| slot.kind().is_remote())
         {
             return true;
         }
@@ -539,11 +569,14 @@ impl ModuleState {
         if let Some(cached) = self.token_cache.get(&slot_id) {
             return Ok(cached.clone());
         }
-        let reader_name = self.reader_name(slot_id).ok_or(CKR_DEVICE_ERROR)?;
-        if reader_name.starts_with("rapp:") {
-            return Err(CKR_DEVICE_ERROR);
-        }
-        let objects = build_token_objects(&reader_name)?;
+        // Token objects are read from a card over PC/SC, so they come
+        // from a local reader or not at all.
+        let reader = self
+            .slot_kind(slot_id)
+            .and_then(SlotKind::local_reader)
+            .ok_or(CKR_DEVICE_ERROR)?
+            .clone();
+        let objects = build_token_objects(&reader)?;
         self.token_cache.insert(slot_id, objects.clone());
         Ok(objects)
     }
@@ -622,7 +655,7 @@ trait SlotProber {
     fn probe(&self, reader: &ReaderId) -> FineidCardObservation;
     /// Strong FINEID proof: read and parse the token objects
     /// (EF.TokenInfo + authentication certificate).
-    fn build_objects(&self, reader_name: &str) -> Result<TokenObjects, CkRv>;
+    fn build_objects(&self, reader: &ReaderId) -> Result<TokenObjects, CkRv>;
     /// The reader's own driver-reported identity attributes.
     fn reader_identity(&self, reader: &ReaderId) -> ReaderIdentity;
 }
@@ -641,8 +674,8 @@ impl SlotProber for PcscProber {
         probe_fineid_card(reader)
     }
 
-    fn build_objects(&self, reader_name: &str) -> Result<TokenObjects, CkRv> {
-        build_token_objects(reader_name)
+    fn build_objects(&self, reader: &ReaderId) -> Result<TokenObjects, CkRv> {
+        build_token_objects(reader)
     }
 
     fn reader_identity(&self, reader: &ReaderId) -> ReaderIdentity {
@@ -671,16 +704,22 @@ mod tests {
         CKS_RW_USER_FUNCTIONS, CkSlotId,
     };
     use crate::pin::PinBytes;
+    use crate::slot_kind::{PAIR_ID_SIZE, RemoteSlotId, SlotKind};
+    use refineid_pcsc::ReaderId;
+    use std::sync::Arc;
 
     /// Build module state without touching hardware by injecting a
-    /// fixed slot table.
+    /// fixed slot table. Every slot is a local PC/SC reader, which is
+    /// the only kind the PC/SC enumeration border can admit.
     fn state_with_slots(names: &[&str]) -> ModuleState {
         let mut slots = Vec::new();
         let mut next: CkSlotId = 1;
         for name in names {
             slots.push(SlotRecord {
                 id: next,
-                reader_name: (*name).to_owned(),
+                kind: SlotKind::Local {
+                    reader: ReaderId::new((*name).to_owned()),
+                },
                 card_present: true,
                 reader_identity: ReaderIdentity::default(),
             });
@@ -689,12 +728,82 @@ mod tests {
         ModuleState::from_parts_for_test(slots, next)
     }
 
+    /// A pairing admitted by the vault, for the remote-slot assertions.
+    fn remote_slot(pair_hex: &str) -> SlotRecord {
+        SlotRecord {
+            id: 1,
+            kind: SlotKind::Remote {
+                pair_id: RemoteSlotId::parse(pair_hex).expect("valid pair id"),
+            },
+            card_present: true,
+            reader_identity: ReaderIdentity::default(),
+        }
+    }
+
     #[test]
     fn slot_ids_are_stable_and_ordered() {
         let state = state_with_slots(&["Reader A", "Reader B"]);
         assert_eq!(state.slot_ids(), vec![1, 2]);
-        assert_eq!(state.reader_name(1).as_deref(), Some("Reader A"));
-        assert_eq!(state.reader_name(2).as_deref(), Some("Reader B"));
+        assert_eq!(
+            state.slot(1).map(SlotRecord::display_name).as_deref(),
+            Some("Reader A")
+        );
+        assert_eq!(
+            state.slot(2).map(SlotRecord::display_name).as_deref(),
+            Some("Reader B")
+        );
+    }
+
+    /// A reader name is a claim, not a proof: the USB device's driver
+    /// chose the string. Naming a reader after a pairing must not buy
+    /// the credential answers that only a vault-proven pairing may
+    /// give.
+    #[test]
+    fn a_local_reader_naming_itself_a_pairing_is_still_local() {
+        let state = state_with_slots(&["rapp:0123456789abcdef"]);
+        let kind = state.slot_kind(1).expect("slot 1 exists");
+        assert!(!kind.is_remote());
+        assert!(kind.local_reader().is_some());
+        // Not logged in until a real C_Login VERIFYs PIN1 on the card.
+        assert!(!state.is_logged_in(1));
+    }
+
+    /// Only a slot minted from a vault pairing record may answer "the
+    /// credential was verified on the device".
+    #[test]
+    fn only_a_vault_pairing_counts_as_logged_in() {
+        let state =
+            ModuleState::from_parts_for_test(vec![remote_slot(&"a5".repeat(PAIR_ID_SIZE))], 2);
+        assert!(state.slot_kind(1).is_some_and(SlotKind::is_remote));
+        assert!(state.is_logged_in(1));
+    }
+
+    /// Token objects are read from card silicon over PC/SC, so a
+    /// remote slot has no local token to build and must not fall
+    /// through to the local reader path.
+    #[test]
+    fn a_remote_slot_yields_no_local_token_objects() {
+        let mut state =
+            ModuleState::from_parts_for_test(vec![remote_slot(&"a5".repeat(PAIR_ID_SIZE))], 2);
+        assert!(matches!(
+            state.ensure_token(1),
+            Err(crate::ck::CKR_DEVICE_ERROR)
+        ));
+    }
+
+    /// A local reader and a paired phone must never share
+    /// process-lifetime PIN-rejection memory, or a rejected PIN on one
+    /// device would throttle the other.
+    #[test]
+    fn local_and_remote_slots_get_separate_pin_caches() {
+        let mut local = state_with_slots(&["rapp:0123456789abcdef"]);
+        let local_cache = local.pin_cache(1).expect("local cache");
+        let mut remote = ModuleState::from_parts_for_test(
+            vec![remote_slot("0123456789abcdef0123456789abcdef")],
+            2,
+        );
+        let remote_cache = remote.pin_cache(1).expect("remote cache");
+        assert!(!Arc::ptr_eq(&local_cache, &remote_cache));
     }
 
     #[test]
@@ -756,7 +865,7 @@ mod tests {
 
         fn build_objects(
             &self,
-            _reader_name: &str,
+            _reader: &refineid_pcsc::ReaderId,
         ) -> Result<crate::token::TokenObjects, super::CkRv> {
             // A scripted prober cannot mint real TokenObjects (they
             // parse a certificate); the tests below only exercise

@@ -45,19 +45,25 @@
 extern crate alloc;
 
 pub mod codec;
+pub mod daemon;
 pub mod descriptor;
 pub mod engine;
 pub mod error;
+pub mod hotplug;
 pub mod transport;
 
 pub use codec::{
     CardStatus, CcidResponse, ChainParameter, ClockStatus, HardwareErrorNotification,
     SlotChangeNotification,
 };
+pub use daemon::{CcidDaemon, CcidEventPoller, CcidSlotEvent, SlotState};
 pub use descriptor::{CcidExchangeLevel, CcidFunctionalDescriptor};
 pub use engine::{
     Action, CcidEngine, Deadline, DeadlineId, InputEvent, IoCompletion, MonotonicTime, Operation,
     OperationId, OperationResult, Transition,
 };
-pub use error::CcidError;
+pub use error::{CcidDescriptorError, CcidError, CcidIoError, CcidProtocolDesync};
+pub use hotplug::{
+    MockHotplugMonitor, PlatformHotplugMonitor, UsbDeviceId, UsbHotplugEvent, UsbHotplugMonitor,
+};
 pub use transport::{CardProtocol, CcidCardTransport, UsbHostTransport};

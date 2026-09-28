@@ -18,7 +18,7 @@
 //! Every CCID interface exposes a 54-byte functional descriptor specifying
 //! its supported exchange level, message size limits, protocols, and feature flags.
 
-use crate::error::CcidError;
+use crate::error::{CcidDescriptorError, CcidError};
 
 /// USB descriptor header length (bLength, bDescriptorType).
 pub const USB_DESCRIPTOR_HEADER_LENGTH: usize = 2;
@@ -51,11 +51,18 @@ pub const FEATURES_OFFSET: usize = 40;
 pub const MAXIMUM_MESSAGE_LENGTH_OFFSET: usize = 44;
 /// Byte offset of `bMaxSlotIndex` in CCID functional descriptor.
 pub const MAX_SLOT_INDEX_OFFSET: usize = 4;
+/// Byte offset of `bPINSupport` in CCID functional descriptor.
+pub const PIN_SUPPORT_OFFSET: usize = 52;
 
 /// Protocol T=0 bit in `dwProtocols` (USB-IF CCID Rev 1.1 §5.1 Table 5-1).
 pub const PROTOCOL_T0: u32 = 0x0000_0001;
 /// Protocol T=1 bit in `dwProtocols` (USB-IF CCID Rev 1.1 §5.1 Table 5-1).
 pub const PROTOCOL_T1: u32 = 0x0000_0002;
+
+/// PIN verification supported bit in `bPINSupport` (USB-IF CCID Rev 1.1 §5.1 Table 5-1).
+pub const PIN_SUPPORT_VERIFY: u8 = 0x01;
+/// PIN modification supported bit in `bPINSupport` (USB-IF CCID Rev 1.1 §5.1 Table 5-1).
+pub const PIN_SUPPORT_MODIFY: u8 = 0x02;
 
 /// Feature flag: Automatic parameter configuration based on ATR (USB-IF CCID Rev 1.1 §5.1 Table 5-1 bit 1).
 pub const AUTOMATIC_PARAMETER_CONFIGURATION: u32 = 0x0000_0002;
@@ -70,7 +77,7 @@ pub const AUTOMATIC_PPS: u32 = 0x0000_0080;
 
 /// Mask for CCID exchange level bits in `dwFeatures` (USB-IF CCID Rev 1.1 §5.1 Table 5-1 bits 16..18).
 pub const EXCHANGE_LEVEL_MASK: u32 = 0x0007_0000;
-/// Character level exchange (unsupported).
+/// Character level exchange (USB-IF CCID Rev 1.1 §5.1 Table 5-1 value 00000000h).
 pub const CHARACTER_EXCHANGE: u32 = 0x0000_0000;
 /// TPDU level exchange (USB-IF CCID Rev 1.1 §5.1 Table 5-1 value 00010000h).
 pub const TPDU_EXCHANGE: u32 = 0x0001_0000;
@@ -79,6 +86,8 @@ pub const SHORT_APDU_EXCHANGE: u32 = 0x0002_0000;
 /// Short and extended APDU level exchange (USB-IF CCID Rev 1.1 §5.1 Table 5-1 value 00040000h).
 pub const SHORT_AND_EXTENDED_APDU_EXCHANGE: u32 = 0x0004_0000;
 
+/// Minimum message length for Character exchange (10-byte header + 1 byte minimum).
+pub const MINIMUM_CHARACTER_MESSAGE_LENGTH: usize = 10 + 1;
 /// Maximum ISO 7816-3 T=0 TPDU command payload length (5-byte header + 255 data bytes).
 pub const MAXIMUM_T0_TPDU_LENGTH: usize = 260;
 /// Minimum message length for T=0 TPDU exchange (10-byte header + 260 bytes).
@@ -95,6 +104,8 @@ pub const MAXIMUM_CCID_MESSAGE_LENGTH: usize = 10 + MAXIMUM_CCID_COMMAND_PAYLOAD
 /// CCID command / exchange level supported by the reader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CcidExchangeLevel {
+    /// Character level: reader accepts raw characters.
+    Character,
     /// TPDU level: reader expects raw T=0/T=1 TPDUs.
     Tpdu,
     /// Short APDU level: reader accepts APDUs up to 261 bytes and handles TPDU framing.
@@ -116,6 +127,8 @@ pub struct CcidFunctionalDescriptor {
     features: u32,
     /// Supported protocols bitmask (`dwProtocols`). Bit 0: T=0, Bit 1: T=1.
     protocols: u32,
+    /// PIN support bitmask (`bPINSupport`).
+    pin_support: u8,
 }
 
 impl CcidFunctionalDescriptor {
@@ -149,6 +162,24 @@ impl CcidFunctionalDescriptor {
         self.protocols
     }
 
+    /// PIN support bitmask (`bPINSupport`).
+    #[must_use]
+    pub const fn pin_support(&self) -> u8 {
+        self.pin_support
+    }
+
+    /// Whether reader advertises PIN verification support on keypad.
+    #[must_use]
+    pub const fn supports_pin_verification(&self) -> bool {
+        (self.pin_support & PIN_SUPPORT_VERIFY) != 0
+    }
+
+    /// Whether reader advertises PIN modification support on keypad.
+    #[must_use]
+    pub const fn supports_pin_modification(&self) -> bool {
+        (self.pin_support & PIN_SUPPORT_MODIFY) != 0
+    }
+
     /// Construct a functional descriptor from validated parts (internal test harnesses only).
     #[cfg(test)]
     #[must_use]
@@ -165,6 +196,7 @@ impl CcidFunctionalDescriptor {
             max_slot_index,
             features,
             protocols,
+            pin_support: 0,
         }
     }
 
@@ -179,7 +211,9 @@ impl CcidFunctionalDescriptor {
     pub fn maximum_transfer_block_length(&self) -> usize {
         let max_payload = self.maximum_payload_length();
         match self.exchange_level {
-            CcidExchangeLevel::Tpdu => max_payload.min(MAXIMUM_T0_TPDU_LENGTH),
+            CcidExchangeLevel::Character | CcidExchangeLevel::Tpdu => {
+                max_payload.min(MAXIMUM_T0_TPDU_LENGTH)
+            }
             CcidExchangeLevel::ShortApdu => max_payload.min(MAXIMUM_SHORT_APDU_LENGTH),
             CcidExchangeLevel::ShortAndExtendedApdu => max_payload,
         }
@@ -212,7 +246,9 @@ impl CcidFunctionalDescriptor {
         }
         if bytes[DESCRIPTOR_TYPE_OFFSET] != CCID_FUNCTIONAL_DESCRIPTOR_TYPE {
             return Err(CcidError::InvalidCcidDescriptor(
-                "invalid CCID functional descriptor type".into(),
+                CcidDescriptorError::InvalidFunctionalDescriptorType {
+                    actual: bytes[DESCRIPTOR_TYPE_OFFSET],
+                },
             ));
         }
 
@@ -237,10 +273,10 @@ impl CcidFunctionalDescriptor {
         ]);
 
         let exchange_level = match features & EXCHANGE_LEVEL_MASK {
+            CHARACTER_EXCHANGE => CcidExchangeLevel::Character,
             TPDU_EXCHANGE => CcidExchangeLevel::Tpdu,
             SHORT_APDU_EXCHANGE => CcidExchangeLevel::ShortApdu,
             SHORT_AND_EXTENDED_APDU_EXCHANGE => CcidExchangeLevel::ShortAndExtendedApdu,
-            CHARACTER_EXCHANGE => return Err(CcidError::UnsupportedExchangeLevel),
             _ => return Err(CcidError::InvalidExchangeLevel),
         };
 
@@ -267,6 +303,7 @@ impl CcidFunctionalDescriptor {
         }
 
         let minimum_message_length = match exchange_level {
+            CcidExchangeLevel::Character => MINIMUM_CHARACTER_MESSAGE_LENGTH,
             CcidExchangeLevel::Tpdu => MINIMUM_T0_TPDU_MESSAGE_LENGTH,
             CcidExchangeLevel::ShortApdu | CcidExchangeLevel::ShortAndExtendedApdu => {
                 MINIMUM_SHORT_APDU_MESSAGE_LENGTH
@@ -277,12 +314,15 @@ impl CcidFunctionalDescriptor {
             return Err(CcidError::TransferMessageBoundTooSmall);
         }
 
+        let pin_support = bytes[PIN_SUPPORT_OFFSET];
+
         Ok(Self {
             exchange_level,
             maximum_message_length: declared_message_length,
             max_slot_index,
             features,
             protocols,
+            pin_support,
         })
     }
 
@@ -445,12 +485,14 @@ mod tests {
     }
 
     #[test]
-    fn reject_character_exchange_level() {
+    fn parse_character_exchange_level() {
         let bytes = build_test_ccid_descriptor(CHARACTER_EXCHANGE, 300, 1, 0, 0);
-        assert_eq!(
-            CcidFunctionalDescriptor::parse_functional_descriptor(&bytes),
-            Err(CcidError::UnsupportedExchangeLevel)
-        );
+        let desc = CcidFunctionalDescriptor::parse_functional_descriptor(&bytes)
+            .expect("valid character-level descriptor");
+        assert_eq!(desc.exchange_level(), CcidExchangeLevel::Character);
+        assert_eq!(desc.maximum_message_length(), 300);
+        assert_eq!(desc.maximum_payload_length(), 290);
+        assert_eq!(desc.maximum_transfer_block_length(), 260);
     }
 
     #[test]

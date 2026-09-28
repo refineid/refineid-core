@@ -40,7 +40,7 @@ use crate::engine::{
     Action, CcidEngine, InputEvent, IoCompletion, MonotonicTime, Operation, OperationId,
     OperationResult,
 };
-use crate::error::CcidError;
+use crate::error::{CcidError, CcidProtocolDesync};
 
 /// Receive-buffer size ceiling for response concatenation (64 KiB).
 const EXTENDED_RESPONSE_DATA_MAX_BYTES: usize = 1 << 16;
@@ -132,11 +132,14 @@ fn prepare_command_bytes(
     protocol: CardProtocol,
     exchange_level: CcidExchangeLevel,
 ) -> Result<Vec<u8>, CcidError> {
-    if protocol == CardProtocol::T1 && exchange_level == CcidExchangeLevel::Tpdu {
+    if (exchange_level == CcidExchangeLevel::Tpdu || exchange_level == CcidExchangeLevel::Character)
+        && protocol == CardProtocol::T1
+    {
         return Err(CcidError::UnsupportedProtocol);
     }
     if protocol == CardProtocol::T0
-        && exchange_level == CcidExchangeLevel::Tpdu
+        && (exchange_level == CcidExchangeLevel::Tpdu
+            || exchange_level == CcidExchangeLevel::Character)
         && let Some(case3) = t0_case3_from_short_case4(apdu)
     {
         return Ok(case3);
@@ -216,7 +219,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                 Ok(transport)
             }
             _ => Err(CcidError::ProtocolDesync(
-                "PowerOn operation did not return ATR data".into(),
+                CcidProtocolDesync::PowerOnMissingAtr,
             )),
         }
     }
@@ -387,7 +390,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                 }
             },
             _ => Err(CcidError::ProtocolDesync(
-                "Reset did not return ATR data".into(),
+                CcidProtocolDesync::ResetMissingAtr,
             )),
         }
     }
@@ -404,9 +407,56 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
         match res {
             OperationResult::Aborted => Ok(()),
             _ => Err(CcidError::ProtocolDesync(
-                "abort returned unexpected outcome".into(),
+                CcidProtocolDesync::UnexpectedAbortOutcome,
             )),
         }
+    }
+
+    /// Explicitly disconnect and power down the active smart card session.
+    ///
+    /// # Errors
+    /// Returns `CcidError` if the power-off operation fails.
+    pub fn disconnect(&mut self) -> Result<(), CcidError> {
+        if self.engine.is_card_active() {
+            self.execute_op(Operation::PowerOff)?;
+        }
+        Ok(())
+    }
+
+    /// Execute a direct PC_to_RDR_Secure PIN verification or modification command.
+    ///
+    /// Preserves protected authentication path semantics per RULE #1 and RULE #2.
+    /// The host never handles plain PIN bytes.
+    ///
+    /// # Errors
+    /// Returns `CcidError` on transmission failure, timeout, reader rejection, or protocol desync.
+    pub fn secure_direct(&mut self, data: &[u8]) -> Result<ResponseApdu, CcidError> {
+        let op = Operation::Secure {
+            b_wi: 0,
+            w_level_parameter: 0,
+            data: Zeroizing::new(data.to_vec()),
+        };
+        let raw_resp = match self.execute_op(op) {
+            Ok(OperationResult::Secure(payload)) | Ok(OperationResult::TransferBlock(payload)) => {
+                payload
+            }
+            Ok(_) => {
+                return Err(CcidError::ProtocolDesync(
+                    CcidProtocolDesync::TerminatedWithoutCompletion,
+                ));
+            }
+            Err(e) => return Err(e),
+        };
+        let Some((body, sw_bytes)) = raw_resp.split_last_chunk::<2>() else {
+            return Err(CcidError::ProtocolDesync(
+                CcidProtocolDesync::TerminatedWithoutCompletion,
+            ));
+        };
+        Ok(ResponseApdu {
+            body: body.to_vec(),
+            sw1: sw_bytes[0],
+            sw2: sw_bytes[1],
+        })
     }
 
     /// Synchronously execute a logical operation through the deterministic CCID engine.
@@ -531,7 +581,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
         }
 
         Err(CcidError::ProtocolDesync(
-            "CCID engine terminated operation without completion".into(),
+            CcidProtocolDesync::TerminatedWithoutCompletion,
         ))
     }
 
@@ -568,7 +618,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                 chain_iterations = chain_iterations.saturating_add(1);
                 if chain_iterations > MAX_CHAIN_ITERATIONS {
                     return Err(CcidError::ProtocolDesync(
-                        "61xx GET RESPONSE chaining iteration limit exceeded".into(),
+                        CcidProtocolDesync::ChainingIterationLimitExceeded,
                     ));
                 }
                 let get_resp = GetResponse {
@@ -600,7 +650,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                 let next_len = combined.len().saturating_add(chain_body.len());
                 if next_len > EXTENDED_RESPONSE_DATA_MAX_BYTES {
                     return Err(CcidError::ProtocolDesync(
-                        "61xx GET RESPONSE chain exceeded 64 KiB".into(),
+                        CcidProtocolDesync::ChainExceededCapacity,
                     ));
                 }
                 combined.extend_from_slice(chain_body);
@@ -609,9 +659,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                 if chained_sw1 == SW1_BYTES_AVAILABLE {
                     consecutive_wrong_le = 0;
                     if !progressed {
-                        return Err(CcidError::ProtocolDesync(
-                            "card signalled 61xx but returned no bytes (stalled chain)".into(),
-                        ));
+                        return Err(CcidError::ProtocolDesync(CcidProtocolDesync::StalledChain));
                     }
                     next_le = chained_sw2;
                     continue;
@@ -620,7 +668,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                     consecutive_wrong_le = consecutive_wrong_le.saturating_add(1);
                     if consecutive_wrong_le > MAX_CONSECUTIVE_WRONG_LE {
                         return Err(CcidError::ProtocolDesync(
-                            "repeated 6Cxx wrong-Le during 61xx chaining".into(),
+                            CcidProtocolDesync::RepeatedWrongLe,
                         ));
                     }
                     next_le = chained_sw2;
@@ -684,6 +732,14 @@ impl<H: UsbHostTransport> CardTransport for CcidCardTransport<H> {
     }
 }
 
+impl<H: UsbHostTransport> Drop for CcidCardTransport<H> {
+    fn drop(&mut self) {
+        if self.engine.is_card_active() {
+            let _ = self.execute_op(Operation::PowerOff);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,6 +750,7 @@ mod tests {
     use crate::descriptor::{
         AUTOMATIC_ACTIVATION, AUTOMATIC_PARAMETER_CONFIGURATION, SHORT_APDU_EXCHANGE, TPDU_EXCHANGE,
     };
+    use crate::error::CcidIoError;
     use refineid_apdu::command::{
         ApduClass, CommandApdu, CommandHeader, CredentialBody, CredentialCommand,
         UnvalidatedCredentialBlock,
@@ -743,7 +800,7 @@ mod tests {
                     Ok(len)
                 }
                 Some(Err(e)) => Err(e),
-                None => Err(CcidError::Io("mock bulk_in underflow".into())),
+                None => Err(CcidError::Io(CcidIoError::BulkInUnderflow)),
             }
         }
 

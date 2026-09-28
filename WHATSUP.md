@@ -1,7 +1,7 @@
 # WHATSUP
 
-branch: agent/ccid
-purpose: Implement refineid-ccid crate in refineid-core with functional descriptor parser, CCID wire codec, card activation, and deterministic state machine.
-started: 2026-09-12T17:32+03:00 by Antigravity
-heartbeat: 2026-09-14T00:04:00+03:00
+branch: agent/ccid-issues
+purpose: Address CCID issues #18-#24 (error refinement, drop teardown, extended APDU chaining, PC_to_RDR_Secure, character exchange, async daemon/poller, and hotplug monitoring).
+started: 2026-09-28T18:25+03:00 by Antigravity
+heartbeat: 2026-09-28T18:48+03:00
 status: in-progress

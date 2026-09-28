@@ -27,8 +27,9 @@ use refineid_ccid::descriptor::{
     USB_INTERFACE_DESCRIPTOR_TYPE,
 };
 use refineid_ccid::{
-    Action, CardProtocol, CcidCardTransport, CcidEngine, CcidError, InputEvent, IoCompletion,
-    MonotonicTime, Operation, OperationId, OperationResult, Transition, UsbHostTransport,
+    Action, CardProtocol, CcidCardTransport, CcidEngine, CcidError, CcidIoError, InputEvent,
+    IoCompletion, MonotonicTime, Operation, OperationId, OperationResult, Transition,
+    UsbHostTransport,
 };
 use std::collections::VecDeque;
 use zeroize::Zeroizing;
@@ -55,9 +56,22 @@ const UNKNOWN_PROTOCOL: u8 = 0x7F;
 const BYTE_STEP: usize = 1;
 const SW_MORE: u8 = 0x61;
 const SW_WRONG_LE: u8 = 0x6C;
+const EXTENDED_PAYLOAD_LEN: usize = 300;
+const SYNTHETIC_ERROR_CODE: u8 = 0x42;
+const DUMMY_VID: u16 = 0x04E6;
+const DUMMY_PID: u16 = 0x5116;
+const INSERTION_BITS: u8 = 0x03;
+const REMOVAL_BITS: u8 = 0x02;
+const CONTINUATION_EXPECTED: u8 = 0x10;
+const LEVEL_BEGIN: u16 = 0x0001;
+const LEVEL_END: u16 = 0x0002;
+const PC_TO_RDR_SECURE_CODE: u8 = 0x69;
+const PIN_VERIFY_INS: u8 = 0x20;
+const TEST_POLL_TIMEOUT_MS: u32 = 100;
 
 fn descriptor(level: CcidExchangeLevel) -> CcidFunctionalDescriptor {
     let level_bits = match level {
+        CcidExchangeLevel::Character => refineid_ccid::descriptor::CHARACTER_EXCHANGE,
         CcidExchangeLevel::Tpdu => refineid_ccid::descriptor::TPDU_EXCHANGE,
         CcidExchangeLevel::ShortApdu => refineid_ccid::descriptor::SHORT_APDU_EXCHANGE,
         CcidExchangeLevel::ShortAndExtendedApdu => {
@@ -295,7 +309,7 @@ struct Host {
 impl UsbHostTransport for Host {
     fn bulk_out(&mut self, _: u8, data: &[u8], _: u32) -> Result<usize, CcidError> {
         if self.reject_write {
-            return Err(CcidError::Io("synthetic write failure".into()));
+            return Err(CcidError::Io(CcidIoError::SyntheticFailure));
         }
         self.writes.push(data.to_vec());
         Ok(data.len())
@@ -305,7 +319,7 @@ impl UsbHostTransport for Host {
         let f = self
             .replies
             .pop_front()
-            .ok_or_else(|| CcidError::Io("synthetic script exhausted".into()))??;
+            .ok_or(CcidError::Io(CcidIoError::SyntheticFailure))??;
         let dest = buffer.get_mut(..f.len()).ok_or(CcidError::LengthMismatch)?;
         dest.copy_from_slice(&f);
         Ok(f.len())
@@ -321,7 +335,7 @@ impl UsbHostTransport for Host {
     ) -> Result<usize, CcidError> {
         self.controls.push((kind, request, value, index));
         if self.reject_control {
-            Err(CcidError::Io("synthetic control failure".into()))
+            Err(CcidError::Io(CcidIoError::SyntheticFailure))
         } else {
             Ok(usize::from(ZERO))
         }
@@ -642,4 +656,259 @@ fn connect_rejects_out_of_range_slot() {
             actual: ONE,
         })
     );
+}
+
+#[test]
+fn outgoing_extended_apdu_chaining_via_wlevelparameter() {
+    let mut e = engine(CcidExchangeLevel::ShortAndExtendedApdu);
+    let large_payload = vec![SYNTHETIC_INS; EXTENDED_PAYLOAD_LEN];
+    let op = Operation::TransferBlock {
+        b_wi: ZERO,
+        w_level_parameter: 0,
+        data: Zeroizing::new(large_payload),
+    };
+    let t1 = start(&mut e, op);
+    let (seq1, first_out) = t1
+        .actions
+        .iter()
+        .find_map(|a| match a {
+            Action::SubmitBulkOut { seq, data } => Some((*seq, data.clone())),
+            _ => None,
+        })
+        .expect("first chunk bulk out");
+    let w_level = u16::from_le_bytes([first_out[8], first_out[9]]);
+    assert_eq!(w_level, LEVEL_BEGIN);
+
+    let t2 = e.step(
+        NOW,
+        InputEvent::IoCompleted(IoCompletion::BulkOut {
+            transferred: first_out.len(),
+        }),
+    );
+    assert!(
+        t2.actions
+            .iter()
+            .any(|a| matches!(a, Action::SubmitBulkIn { .. }))
+    );
+
+    let cont_resp = frame(RDR_TO_PC_DATA_BLOCK, seq1, ZERO, CONTINUATION_EXPECTED, &[]);
+    let t3 = e.step(
+        NOW,
+        InputEvent::IoCompleted(IoCompletion::BulkIn(cont_resp)),
+    );
+
+    let (seq2, second_out) = t3
+        .actions
+        .iter()
+        .find_map(|a| match a {
+            Action::SubmitBulkOut { seq, data } => Some((*seq, data.clone())),
+            _ => None,
+        })
+        .expect("second chunk bulk out");
+    let w_level2 = u16::from_le_bytes([second_out[8], second_out[9]]);
+    assert_eq!(w_level2, LEVEL_END);
+
+    let _ = e.step(
+        NOW,
+        InputEvent::IoCompleted(IoCompletion::BulkOut {
+            transferred: second_out.len(),
+        }),
+    );
+    let ok_resp = frame(RDR_TO_PC_DATA_BLOCK, seq2, ZERO, ZERO, &[SW_OK, ZERO]);
+    let t4 = e.step(NOW, InputEvent::IoCompleted(IoCompletion::BulkIn(ok_resp)));
+    assert!(t4.actions.iter().any(|a| matches!(
+        a,
+        Action::Complete {
+            result: Ok(OperationResult::TransferBlock(_)),
+            ..
+        }
+    )));
+}
+
+#[test]
+fn secure_pin_operation_and_debug_redaction() {
+    let mut e = engine(CcidExchangeLevel::ShortApdu);
+    let pin_template = vec![ZERO, PIN_VERIFY_INS, ZERO, ONE, ZERO];
+    let op = Operation::Secure {
+        b_wi: ZERO,
+        w_level_parameter: 0,
+        data: Zeroizing::new(pin_template),
+    };
+    let op_debug = format!("{op:?}");
+    assert!(op_debug.contains("[redacted]"));
+    assert!(!op_debug.contains("32"));
+
+    let t = start(&mut e, op);
+    let (seq, bulk_out) = t
+        .actions
+        .iter()
+        .find_map(|a| match a {
+            Action::SubmitBulkOut { seq, data } => Some((*seq, data.clone())),
+            _ => None,
+        })
+        .expect("bulk out");
+    assert_eq!(bulk_out[0], PC_TO_RDR_SECURE_CODE);
+
+    let _ = e.step(
+        NOW,
+        InputEvent::IoCompleted(IoCompletion::BulkOut {
+            transferred: bulk_out.len(),
+        }),
+    );
+    let resp = frame(RDR_TO_PC_DATA_BLOCK, seq, ZERO, ZERO, &[SW_OK, ZERO]);
+    let t_complete = e.step(NOW, InputEvent::IoCompleted(IoCompletion::BulkIn(resp)));
+
+    let completed_op = t_complete
+        .actions
+        .iter()
+        .find_map(|a| match a {
+            Action::Complete {
+                result: Ok(res), ..
+            } => Some(res.clone()),
+            _ => None,
+        })
+        .expect("complete");
+    let res_debug = format!("{completed_op:?}");
+    assert!(res_debug.contains("[redacted]"));
+    assert!(matches!(completed_op, OperationResult::Secure(_)));
+}
+
+#[test]
+fn character_exchange_level_support() {
+    let desc = descriptor(CcidExchangeLevel::Character);
+    assert_eq!(desc.exchange_level(), CcidExchangeLevel::Character);
+
+    let mut h = Host::default();
+    h.replies.push_back(Ok(data_frame(ZERO, &[SW_OK, ZERO])));
+    let mut t = transport(h, CcidExchangeLevel::Character, CardProtocol::T0);
+    let command = CommandApdu::case_4(header(), &[ONE, TWO], TEST_LE).expect("case 4");
+    let res = t.transmit(&command);
+    assert!(res.is_ok());
+
+    let h2 = Host::default();
+    let mut t2 = transport(h2, CcidExchangeLevel::Character, CardProtocol::T1);
+    let res2 = t2.transmit(&command);
+    assert_eq!(res2.err(), Some(CcidError::UnsupportedProtocol));
+}
+
+#[test]
+fn structured_error_variants_and_display() {
+    let io_err = CcidError::Io(refineid_ccid::CcidIoError::DeviceDisconnected);
+    assert_eq!(
+        format!("{io_err}"),
+        "CCID USB I/O failure: USB CCID device disconnected"
+    );
+
+    let proto_err = CcidError::ProtocolDesync(refineid_ccid::CcidProtocolDesync::PowerOnMissingAtr);
+    assert_eq!(
+        format!("{proto_err}"),
+        "CCID protocol desync: PowerOn operation did not return ATR data"
+    );
+
+    let desc_err = CcidError::InvalidCcidDescriptor(
+        refineid_ccid::CcidDescriptorError::InvalidFunctionalDescriptorType {
+            actual: SYNTHETIC_ERROR_CODE,
+        },
+    );
+    assert_eq!(
+        format!("{desc_err}"),
+        "Invalid CCID descriptor: invalid CCID functional descriptor type: expected 0x21, got 0x42"
+    );
+}
+
+#[test]
+fn transport_disconnect_and_drop_lifecycle() {
+    let mut h = Host::default();
+    h.replies
+        .push_back(Ok(data_frame(ZERO, &[TS_DIRECT, ZERO])));
+    h.replies
+        .push_back(Ok(frame(RDR_TO_PC_SLOT_STATUS, ONE, ZERO, ZERO, &[])));
+    let desc = descriptor(CcidExchangeLevel::ShortApdu);
+    let mut t =
+        CcidCardTransport::connect(h, &desc, ZERO, ZERO, BULK_OUT, BULK_IN).expect("connect");
+    assert!(t.engine().is_card_active());
+
+    t.disconnect().expect("disconnect");
+    assert!(!t.engine().is_card_active());
+}
+
+#[test]
+fn daemon_event_poller_and_notifications() {
+    use refineid_ccid::codec::{
+        CardStatus, ClockStatus, RDR_TO_PC_HARDWARE_ERROR, RDR_TO_PC_NOTIFY_SLOT_CHANGE,
+    };
+    use refineid_ccid::daemon::{CcidDaemon, CcidEventPoller, CcidSlotEvent};
+
+    let mut poller = CcidEventPoller::new(ZERO);
+    let slot_change_packet = [RDR_TO_PC_NOTIFY_SLOT_CHANGE, INSERTION_BITS];
+    let events = poller
+        .process_interrupt(&slot_change_packet)
+        .expect("process interrupt");
+    assert_eq!(events, vec![CcidSlotEvent::CardInserted { slot: ZERO }]);
+    assert!(poller.slot_state(ZERO).expect("slot state").card_present);
+
+    let slot_remove_packet = [RDR_TO_PC_NOTIFY_SLOT_CHANGE, REMOVAL_BITS];
+    let events2 = poller
+        .process_interrupt(&slot_remove_packet)
+        .expect("process interrupt");
+    assert_eq!(events2, vec![CcidSlotEvent::CardRemoved { slot: ZERO }]);
+    assert!(!poller.slot_state(ZERO).expect("slot state").card_present);
+
+    let hw_err_packet = [RDR_TO_PC_HARDWARE_ERROR, ZERO, ONE, SYNTHETIC_ERROR_CODE];
+    let events3 = poller
+        .process_interrupt(&hw_err_packet)
+        .expect("process hw err");
+    assert_eq!(
+        events3,
+        vec![CcidSlotEvent::HardwareError {
+            slot: ZERO,
+            error_code: SYNTHETIC_ERROR_CODE,
+        }]
+    );
+
+    let event4 = poller.process_slot_status(ZERO, CardStatus::Active, ClockStatus::Running);
+    assert_eq!(event4, Some(CcidSlotEvent::CardInserted { slot: ZERO }));
+
+    let mut h = Host::default();
+    h.replies.push_back(Ok(slot_change_packet.to_vec()));
+    let mut daemon = CcidDaemon::new(h, Some(BULK_IN), ZERO);
+    let daemon_events = daemon
+        .poll_interrupt(TEST_POLL_TIMEOUT_MS)
+        .expect("poll interrupt");
+    assert_eq!(
+        daemon_events,
+        vec![CcidSlotEvent::CardInserted { slot: ZERO }]
+    );
+}
+
+#[test]
+fn hotplug_monitoring_mock_and_platform() {
+    use refineid_ccid::hotplug::{
+        MockHotplugMonitor, PlatformHotplugMonitor, UsbDeviceId, UsbHotplugEvent, UsbHotplugMonitor,
+    };
+
+    let mut mock = MockHotplugMonitor::new();
+    let dev = UsbDeviceId {
+        vendor_id: DUMMY_VID,
+        product_id: DUMMY_PID,
+        bus_number: ONE,
+        device_address: TWO,
+        device_path: Some("/dev/bus/usb/001/002".into()),
+    };
+    mock.push_event(UsbHotplugEvent::DeviceArrived(dev.clone()));
+    let events = mock.poll_events().expect("poll mock");
+    assert_eq!(events, vec![UsbHotplugEvent::DeviceArrived(dev.clone())]);
+
+    let mut platform = PlatformHotplugMonitor::new();
+    assert_eq!(
+        platform.register_arrival(dev.clone()),
+        Some(UsbHotplugEvent::DeviceArrived(dev.clone()))
+    );
+    assert_eq!(platform.register_arrival(dev.clone()), None);
+    assert_eq!(platform.active_devices().len(), usize::from(ONE));
+    assert_eq!(
+        platform.register_removal(&dev),
+        Some(UsbHotplugEvent::DeviceRemoved(dev))
+    );
+    assert_eq!(platform.active_devices().len(), usize::from(ZERO));
 }

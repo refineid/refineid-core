@@ -50,6 +50,12 @@ const SW1_BYTES_AVAILABLE: u8 = 0x61;
 const SW1_WRONG_LE: u8 = 0x6C;
 /// Default timeout for CCID transport operations in milliseconds.
 const DEFAULT_TRANSPORT_TIMEOUT_MS: u32 = 5000;
+/// Default waiting integer for direct commands (0 = use reader/card default).
+const DEFAULT_B_WI: u8 = 0;
+/// Default level parameter for unfragmented direct commands (0 = complete command).
+const DEFAULT_W_LEVEL_PARAMETER: u16 = 0;
+/// Length of ISO 7816-4 status word bytes (SW1, SW2).
+const STATUS_BYTES_LEN: usize = 2;
 
 /// USB Host Transport interface implemented by platform drivers (Android USB Host, libusb, etc.).
 pub trait UsbHostTransport {
@@ -423,7 +429,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
     /// # Errors
     /// Returns `CcidError` if the power-off operation fails.
     pub fn disconnect(&mut self) -> Result<(), CcidError> {
-        if self.engine.is_card_active() {
+        if self.engine.is_activated() {
             self.execute_op(Operation::PowerOff)?;
         }
         Ok(())
@@ -443,14 +449,12 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
             return Err(CcidError::UnsupportedProtocol);
         }
         let op = Operation::Secure {
-            b_wi: 0,
-            w_level_parameter: 0,
+            b_wi: DEFAULT_B_WI,
+            w_level_parameter: DEFAULT_W_LEVEL_PARAMETER,
             data: Zeroizing::new(data.to_vec()),
         };
         let raw_resp = match self.execute_op(op) {
-            Ok(OperationResult::Secure(payload)) | Ok(OperationResult::TransferBlock(payload)) => {
-                payload
-            }
+            Ok(OperationResult::Secure(payload)) => payload,
             Ok(_) => {
                 return Err(CcidError::ProtocolDesync(
                     CcidProtocolDesync::TerminatedWithoutCompletion,
@@ -458,7 +462,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
             }
             Err(e) => return Err(e),
         };
-        let Some((body, sw_bytes)) = raw_resp.split_last_chunk::<2>() else {
+        let Some((body, sw_bytes)) = raw_resp.split_last_chunk::<STATUS_BYTES_LEN>() else {
             return Err(CcidError::ProtocolDesync(
                 CcidProtocolDesync::TerminatedWithoutCompletion,
             ));
@@ -748,9 +752,10 @@ impl<H: UsbHostTransport> CardTransport for CcidCardTransport<H> {
 /// Deterministic teardown should always prefer explicit [`CcidCardTransport::disconnect`].
 /// This [`Drop`] implementation provides defensive fallback cleanup to ensure
 /// the card is powered down if the transport goes out of scope unexpectedly.
+/// Errors during drop are ignored, and USB teardown is skipped during unwinding.
 impl<H: UsbHostTransport> Drop for CcidCardTransport<H> {
     fn drop(&mut self) {
-        if self.engine.is_card_active() {
+        if !std::thread::panicking() && self.engine.is_activated() {
             let _ = self.execute_op(Operation::PowerOff);
         }
     }

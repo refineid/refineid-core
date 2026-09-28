@@ -214,7 +214,10 @@ impl CcidEventPoller {
     }
 }
 
-/// Asynchronous background daemon managing CCID reader events.
+/// Background daemon managing CCID reader events and slot tracking.
+///
+/// Provides cooperative interrupt-driven polling designed to be driven by
+/// an asynchronous runtime task or an OS background worker thread.
 pub struct CcidDaemon<H: UsbHostTransport> {
     transport: H,
     poller: CcidEventPoller,
@@ -263,6 +266,9 @@ impl<H: UsbHostTransport> CcidDaemon<H> {
         };
         let mut buffer = [0_u8; INTERRUPT_BUFFER_SIZE];
         let bytes_read = self.transport.bulk_in(endpoint, &mut buffer, timeout_ms)?;
+        if bytes_read == 0 {
+            return Ok(Vec::new());
+        }
         if bytes_read > buffer.len() {
             return Err(CcidError::LengthMismatch);
         }

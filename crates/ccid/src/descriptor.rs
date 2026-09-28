@@ -206,7 +206,7 @@ impl CcidFunctionalDescriptor {
     /// Returns the maximum allowed payload length in bytes (excluding 10-byte CCID header).
     #[must_use]
     pub const fn maximum_payload_length(&self) -> usize {
-        self.maximum_message_length.saturating_sub(10)
+        self.maximum_message_length.saturating_sub(CCID_HEADER_SIZE)
     }
 
     /// Returns the maximum transfer block length supported for APDU/TPDU packets.

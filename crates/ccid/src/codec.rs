@@ -370,7 +370,8 @@ pub fn encode_xfr_block(
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(CCID_HEADER_SIZE + block.len());
     out.push(PC_TO_RDR_XFR_BLOCK);
-    out.extend_from_slice(&(block.len() as u32).to_le_bytes());
+    let length = u32::try_from(block.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&length.to_le_bytes());
     out.push(slot);
     out.push(seq);
     out.push(b_wi);
@@ -384,7 +385,8 @@ pub fn encode_xfr_block(
 pub fn encode_secure(slot: u8, seq: u8, b_wi: u8, w_level_parameter: u16, data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(CCID_HEADER_SIZE + data.len());
     out.push(PC_TO_RDR_SECURE);
-    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    let length = u32::try_from(data.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&length.to_le_bytes());
     out.push(slot);
     out.push(seq);
     out.push(b_wi);

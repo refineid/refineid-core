@@ -29,9 +29,6 @@ const HEX_RADIX: u32 = 16;
 /// Radix for parsing decimal USB bus/address numbers.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const DEC_RADIX: u32 = 10;
-/// CCID USB Interface Class in hex format ("0b").
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const CCID_INTERFACE_CLASS_STR: &str = "0b";
 
 /// Identity and topology of a discovered USB CCID reader.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -142,6 +139,8 @@ impl PlatformHotplugMonitor {
         use std::fs;
         use std::path::Path;
 
+        use crate::descriptor::CCID_INTERFACE_CLASS;
+
         let sysfs_path = Path::new("/sys/bus/usb/devices");
         let Ok(entries) = fs::read_dir(sysfs_path) else {
             return Ok(Vec::new());
@@ -155,8 +154,10 @@ impl PlatformHotplugMonitor {
             let Ok(class_str) = fs::read_to_string(&b_interface_class_file) else {
                 continue;
             };
-            let trimmed = class_str.trim().to_ascii_lowercase();
-            if trimmed != CCID_INTERFACE_CLASS_STR {
+            let Ok(class_val) = u8::from_str_radix(class_str.trim(), HEX_RADIX) else {
+                continue;
+            };
+            if class_val != CCID_INTERFACE_CLASS {
                 continue;
             }
 
@@ -181,10 +182,18 @@ impl PlatformHotplugMonitor {
                 continue;
             };
 
-            let bus_str = fs::read_to_string(device_dir.join("busnum")).unwrap_or_default();
-            let dev_str = fs::read_to_string(device_dir.join("devnum")).unwrap_or_default();
-            let bus_number = u8::from_str_radix(bus_str.trim(), DEC_RADIX).unwrap_or(0);
-            let device_address = u8::from_str_radix(dev_str.trim(), DEC_RADIX).unwrap_or(0);
+            let Ok(bus_str) = fs::read_to_string(device_dir.join("busnum")) else {
+                continue;
+            };
+            let Ok(dev_str) = fs::read_to_string(device_dir.join("devnum")) else {
+                continue;
+            };
+            let Ok(bus_number) = u8::from_str_radix(bus_str.trim(), DEC_RADIX) else {
+                continue;
+            };
+            let Ok(device_address) = u8::from_str_radix(dev_str.trim(), DEC_RADIX) else {
+                continue;
+            };
 
             let dev = UsbDeviceId {
                 vendor_id,

@@ -119,8 +119,6 @@ pub enum CcidProtocolDesync {
     StalledChain,
     /// Repeated 6Cxx wrong-Le status words encountered during chaining.
     RepeatedWrongLe,
-    /// Outgoing command continuation received when no fragmented transfer is pending.
-    UnexpectedOutgoingContinuation,
 }
 
 impl fmt::Display for CcidProtocolDesync {
@@ -169,12 +167,6 @@ impl fmt::Display for CcidProtocolDesync {
             }
             Self::RepeatedWrongLe => {
                 write!(f, "repeated 6Cxx wrong-Le during 61xx chaining")
-            }
-            Self::UnexpectedOutgoingContinuation => {
-                write!(
-                    f,
-                    "outgoing continuation received without pending chained transfer"
-                )
             }
         }
     }

@@ -23,9 +23,10 @@ use refineid_ccid::codec::{
 use refineid_ccid::descriptor::{
     AUTOMATIC_PARAMETER_CONFIGURATION, AUTOMATIC_PPS, CCID_FUNCTIONAL_DESCRIPTOR_LENGTH,
     CcidExchangeLevel, CcidFunctionalDescriptor, DESCRIPTOR_TYPE_OFFSET, FEATURES_OFFSET,
-    MAXIMUM_MESSAGE_LENGTH_OFFSET, MINIMUM_SHORT_APDU_MESSAGE_LENGTH, PIN_SUPPORT_VERIFY,
-    SHORT_APDU_EXCHANGE, USB_INTERFACE_DESCRIPTOR_TYPE,
+    MAXIMUM_MESSAGE_LENGTH_OFFSET, MINIMUM_SHORT_APDU_MESSAGE_LENGTH, PIN_SUPPORT_OFFSET,
+    PIN_SUPPORT_VERIFY, SHORT_APDU_EXCHANGE, USB_INTERFACE_DESCRIPTOR_TYPE,
 };
+use refineid_ccid::engine::{W_LEVEL_BEGIN, W_LEVEL_END};
 use refineid_ccid::{
     Action, CardProtocol, CcidCardTransport, CcidEngine, CcidError, CcidIoError, InputEvent,
     IoCompletion, MonotonicTime, Operation, OperationId, OperationResult, Transition,
@@ -37,6 +38,7 @@ use zeroize::Zeroizing;
 const ZERO: u8 = 0;
 const ONE: u8 = 1;
 const TWO: u8 = 2;
+const DWORD_SIZE: usize = 4;
 const OP_A: OperationId = OperationId(1);
 const OP_B: OperationId = OperationId(2);
 const GENERATION: u64 = 1;
@@ -63,8 +65,9 @@ const DUMMY_PID: u16 = 0x0001;
 const INSERTION_BITS: u8 = 0x03;
 const REMOVAL_BITS: u8 = 0x02;
 const CONTINUATION_EXPECTED: u8 = 0x10;
-const LEVEL_BEGIN: u16 = 0x0001;
-const LEVEL_END: u16 = 0x0002;
+const W_LEVEL_OFFSET_START: usize = 8;
+const W_LEVEL_OFFSET_END: usize = 10;
+const MAX_DATA_RATES_OFFSET: usize = 53;
 const PC_TO_RDR_SECURE_CODE: u8 = 0x69;
 const PIN_VERIFY_INS: u8 = 0x20;
 const TEST_POLL_TIMEOUT_MS: u32 = 100;
@@ -98,11 +101,12 @@ fn descriptor_with_pin_support(
     d[23..27].copy_from_slice(&344064_u32.to_le_bytes());
     d[28..32].copy_from_slice(&254_u32.to_le_bytes());
     let features = level_bits | AUTOMATIC_PARAMETER_CONFIGURATION | AUTOMATIC_PPS;
-    d[40..44].copy_from_slice(&features.to_le_bytes());
+    d[FEATURES_OFFSET..FEATURES_OFFSET + DWORD_SIZE].copy_from_slice(&features.to_le_bytes());
     let max_len = MINIMUM_SHORT_APDU_MESSAGE_LENGTH as u32;
-    d[44..48].copy_from_slice(&max_len.to_le_bytes());
-    d[52] = pin_support;
-    d[53] = ONE;
+    d[MAXIMUM_MESSAGE_LENGTH_OFFSET..MAXIMUM_MESSAGE_LENGTH_OFFSET + DWORD_SIZE]
+        .copy_from_slice(&max_len.to_le_bytes());
+    d[PIN_SUPPORT_OFFSET] = pin_support;
+    d[MAX_DATA_RATES_OFFSET] = ONE;
     CcidFunctionalDescriptor::parse_functional_descriptor(&d).expect("valid test descriptor")
 }
 
@@ -684,8 +688,12 @@ fn outgoing_extended_apdu_chaining_via_wlevelparameter() {
             _ => None,
         })
         .expect("first chunk bulk out");
-    let w_level = u16::from_le_bytes([first_out[8], first_out[9]]);
-    assert_eq!(w_level, LEVEL_BEGIN);
+    let level_bytes: [u8; 2] = first_out
+        .get(W_LEVEL_OFFSET_START..W_LEVEL_OFFSET_END)
+        .and_then(|slice| slice.try_into().ok())
+        .expect("wLevelParameter slice");
+    let w_level = u16::from_le_bytes(level_bytes);
+    assert_eq!(w_level, W_LEVEL_BEGIN);
 
     let t2 = e.step(
         NOW,
@@ -713,8 +721,12 @@ fn outgoing_extended_apdu_chaining_via_wlevelparameter() {
             _ => None,
         })
         .expect("second chunk bulk out");
-    let w_level2 = u16::from_le_bytes([second_out[8], second_out[9]]);
-    assert_eq!(w_level2, LEVEL_END);
+    let level_bytes2: [u8; 2] = second_out
+        .get(W_LEVEL_OFFSET_START..W_LEVEL_OFFSET_END)
+        .and_then(|slice| slice.try_into().ok())
+        .expect("wLevelParameter slice");
+    let w_level2 = u16::from_le_bytes(level_bytes2);
+    assert_eq!(w_level2, W_LEVEL_END);
 
     let _ = e.step(
         NOW,
@@ -755,7 +767,7 @@ fn secure_pin_operation_and_debug_redaction() {
             _ => None,
         })
         .expect("bulk out");
-    assert_eq!(bulk_out[0], PC_TO_RDR_SECURE_CODE);
+    assert_eq!(bulk_out.first().copied(), Some(PC_TO_RDR_SECURE_CODE));
 
     let _ = e.step(
         NOW,
@@ -881,10 +893,10 @@ fn transport_disconnect_and_drop_lifecycle() {
     let desc = descriptor(CcidExchangeLevel::ShortApdu);
     let mut t =
         CcidCardTransport::connect(h, &desc, ZERO, ZERO, BULK_OUT, BULK_IN).expect("connect");
-    assert!(t.engine().is_card_active());
+    assert!(t.engine().is_activated());
 
     t.disconnect().expect("disconnect");
-    assert!(!t.engine().is_card_active());
+    assert!(!t.engine().is_activated());
 }
 
 #[test]

@@ -561,12 +561,6 @@ impl CcidEngine {
         self.activated
     }
 
-    /// Whether the smart card is powered and active.
-    #[must_use]
-    pub const fn is_card_active(&self) -> bool {
-        self.activated
-    }
-
     /// Sets card activation state (and updates presence accordingly).
     pub fn set_activated(&mut self, activated: bool) {
         self.activated = activated;

@@ -40,7 +40,7 @@ use crate::engine::{
     Action, CcidEngine, InputEvent, IoCompletion, MonotonicTime, Operation, OperationId,
     OperationResult,
 };
-use crate::error::CcidError;
+use crate::error::{CcidError, CcidProtocolDesync};
 
 /// Receive-buffer size ceiling for response concatenation (64 KiB).
 const EXTENDED_RESPONSE_DATA_MAX_BYTES: usize = 1 << 16;
@@ -50,6 +50,12 @@ const SW1_BYTES_AVAILABLE: u8 = 0x61;
 const SW1_WRONG_LE: u8 = 0x6C;
 /// Default timeout for CCID transport operations in milliseconds.
 const DEFAULT_TRANSPORT_TIMEOUT_MS: u32 = 5000;
+/// Default waiting integer for direct commands (0 = use reader/card default).
+const DEFAULT_B_WI: u8 = 0;
+/// Default level parameter for unfragmented direct commands (aliases protocol `W_LEVEL_NONE`).
+const DEFAULT_W_LEVEL_PARAMETER: u16 = crate::engine::W_LEVEL_NONE;
+/// Length of ISO 7816-4 status word bytes (SW1, SW2).
+const STATUS_BYTES_LEN: usize = 2;
 
 /// USB Host Transport interface implemented by platform drivers (Android USB Host, libusb, etc.).
 pub trait UsbHostTransport {
@@ -127,16 +133,25 @@ fn t0_case3_from_short_case4(apdu: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Prepare outgoing command bytes according to card protocol and CCID exchange level.
+///
+/// Per USB-IF CCID Rev 1.1 §6.1.4:
+/// - In TPDU and Character exchange modes, the host formats T=0 command headers (5-byte CLA, INS, P1, P2, P3).
+///   Short Case-4 commands are converted to Case-3 headers for execution, with trailing data read via `GET RESPONSE`.
+/// - T=1 in Character or TPDU mode requires transport-level block framing (NAD, PCB, LEN, EDC) and is
+///   rejected with [`CcidError::UnsupportedProtocol`] unless APDU-level framing is provided by the reader.
 fn prepare_command_bytes(
     apdu: &[u8],
     protocol: CardProtocol,
     exchange_level: CcidExchangeLevel,
 ) -> Result<Vec<u8>, CcidError> {
-    if protocol == CardProtocol::T1 && exchange_level == CcidExchangeLevel::Tpdu {
+    if (exchange_level == CcidExchangeLevel::Tpdu || exchange_level == CcidExchangeLevel::Character)
+        && protocol == CardProtocol::T1
+    {
         return Err(CcidError::UnsupportedProtocol);
     }
     if protocol == CardProtocol::T0
-        && exchange_level == CcidExchangeLevel::Tpdu
+        && (exchange_level == CcidExchangeLevel::Tpdu
+            || exchange_level == CcidExchangeLevel::Character)
         && let Some(case3) = t0_case3_from_short_case4(apdu)
     {
         return Ok(case3);
@@ -216,7 +231,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                 Ok(transport)
             }
             _ => Err(CcidError::ProtocolDesync(
-                "PowerOn operation did not return ATR data".into(),
+                CcidProtocolDesync::PowerOnMissingAtr,
             )),
         }
     }
@@ -387,7 +402,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                 }
             },
             _ => Err(CcidError::ProtocolDesync(
-                "Reset did not return ATR data".into(),
+                CcidProtocolDesync::ResetMissingAtr,
             )),
         }
     }
@@ -404,9 +419,60 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
         match res {
             OperationResult::Aborted => Ok(()),
             _ => Err(CcidError::ProtocolDesync(
-                "abort returned unexpected outcome".into(),
+                CcidProtocolDesync::UnexpectedAbortOutcome,
             )),
         }
+    }
+
+    /// Explicitly disconnect and power down the active smart card session.
+    ///
+    /// # Errors
+    /// Returns `CcidError` if the power-off operation fails.
+    pub fn disconnect(&mut self) -> Result<(), CcidError> {
+        if self.engine.is_activated() {
+            self.execute_op(Operation::PowerOff)?;
+        }
+        Ok(())
+    }
+
+    /// Execute a direct PC_to_RDR_Secure PIN verification or modification command.
+    ///
+    /// Preserves protected authentication path semantics per RULE #1 and RULE #2.
+    /// The host never handles plain PIN bytes.
+    ///
+    /// # Errors
+    /// Returns `CcidError` on transmission failure, timeout, reader rejection, or protocol desync.
+    pub fn secure_direct(&mut self, data: &[u8]) -> Result<ResponseApdu, CcidError> {
+        if !self.descriptor.supports_pin_verification()
+            && !self.descriptor.supports_pin_modification()
+        {
+            return Err(CcidError::UnsupportedProtocol);
+        }
+        let op = Operation::Secure {
+            b_wi: DEFAULT_B_WI,
+            w_level_parameter: DEFAULT_W_LEVEL_PARAMETER,
+            data: Zeroizing::new(data.to_vec()),
+        };
+        let raw_resp = match self.execute_op(op) {
+            Ok(OperationResult::Secure(payload)) => payload,
+            Ok(_) => {
+                return Err(CcidError::ProtocolDesync(
+                    CcidProtocolDesync::TerminatedWithoutCompletion,
+                ));
+            }
+            Err(e) => return Err(e),
+        };
+        let Some((body, sw_bytes)) = raw_resp.split_last_chunk::<STATUS_BYTES_LEN>() else {
+            return Err(CcidError::ProtocolDesync(
+                CcidProtocolDesync::TerminatedWithoutCompletion,
+            ));
+        };
+        let [sw1, sw2] = *sw_bytes;
+        Ok(ResponseApdu {
+            body: body.to_vec(),
+            sw1,
+            sw2,
+        })
     }
 
     /// Synchronously execute a logical operation through the deterministic CCID engine.
@@ -531,15 +597,15 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
         }
 
         Err(CcidError::ProtocolDesync(
-            "CCID engine terminated operation without completion".into(),
+            CcidProtocolDesync::TerminatedWithoutCompletion,
         ))
     }
 
     /// Drive one logical APDU exchange, handling `SW=61xx` `GET RESPONSE` chaining.
     fn run_exchange(&mut self, apdu_bytes: &[u8]) -> Result<TransportOutcome, CcidError> {
         let op = Operation::TransferBlock {
-            b_wi: 0,
-            w_level_parameter: 0,
+            b_wi: DEFAULT_B_WI,
+            w_level_parameter: DEFAULT_W_LEVEL_PARAMETER,
             data: Zeroizing::new(apdu_bytes.to_vec()),
         };
         let raw_resp = match self.execute_op(op) {
@@ -550,7 +616,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
             Err(e) => return Err(e),
         };
 
-        let Some((body, sw_bytes)) = raw_resp.split_last_chunk::<2>() else {
+        let Some((body, sw_bytes)) = raw_resp.split_last_chunk::<STATUS_BYTES_LEN>() else {
             return Ok(TransportOutcome::ProtocolDesync);
         };
         let [sw1, sw2] = *sw_bytes;
@@ -568,7 +634,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                 chain_iterations = chain_iterations.saturating_add(1);
                 if chain_iterations > MAX_CHAIN_ITERATIONS {
                     return Err(CcidError::ProtocolDesync(
-                        "61xx GET RESPONSE chaining iteration limit exceeded".into(),
+                        CcidProtocolDesync::ChainingIterationLimitExceeded,
                     ));
                 }
                 let get_resp = GetResponse {
@@ -582,8 +648,8 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                     self.engine.exchange_level(),
                 )?;
                 let chain_op = Operation::TransferBlock {
-                    b_wi: 0,
-                    w_level_parameter: 0,
+                    b_wi: DEFAULT_B_WI,
+                    w_level_parameter: DEFAULT_W_LEVEL_PARAMETER,
                     data: Zeroizing::new(get_resp_bytes),
                 };
                 let chain_raw = match self.execute_op(chain_op) {
@@ -593,25 +659,23 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                     Err(CcidError::Timeout) => return Ok(TransportOutcome::TimeoutUnknownState),
                     Err(e) => return Err(e),
                 };
-                let Some((chain_body, chain_sw)) = chain_raw.split_last_chunk::<2>() else {
+                let Some((chain_body, chain_sw)) = chain_raw.split_last_chunk::<STATUS_BYTES_LEN>()
+                else {
                     return Ok(TransportOutcome::ProtocolDesync);
                 };
                 let progressed = !chain_body.is_empty();
                 let next_len = combined.len().saturating_add(chain_body.len());
                 if next_len > EXTENDED_RESPONSE_DATA_MAX_BYTES {
                     return Err(CcidError::ProtocolDesync(
-                        "61xx GET RESPONSE chain exceeded 64 KiB".into(),
+                        CcidProtocolDesync::ChainExceededCapacity,
                     ));
                 }
                 combined.extend_from_slice(chain_body);
-                chained_sw1 = chain_sw[0];
-                chained_sw2 = chain_sw[1];
+                [chained_sw1, chained_sw2] = *chain_sw;
                 if chained_sw1 == SW1_BYTES_AVAILABLE {
                     consecutive_wrong_le = 0;
                     if !progressed {
-                        return Err(CcidError::ProtocolDesync(
-                            "card signalled 61xx but returned no bytes (stalled chain)".into(),
-                        ));
+                        return Err(CcidError::ProtocolDesync(CcidProtocolDesync::StalledChain));
                     }
                     next_le = chained_sw2;
                     continue;
@@ -620,7 +684,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                     consecutive_wrong_le = consecutive_wrong_le.saturating_add(1);
                     if consecutive_wrong_le > MAX_CONSECUTIVE_WRONG_LE {
                         return Err(CcidError::ProtocolDesync(
-                            "repeated 6Cxx wrong-Le during 61xx chaining".into(),
+                            CcidProtocolDesync::RepeatedWrongLe,
                         ));
                     }
                     next_le = chained_sw2;
@@ -684,6 +748,20 @@ impl<H: UsbHostTransport> CardTransport for CcidCardTransport<H> {
     }
 }
 
+/// Best-effort card teardown and power-off upon transport disposal (§6.1.2).
+///
+/// Deterministic teardown should always prefer explicit [`CcidCardTransport::disconnect`].
+/// This [`Drop`] implementation provides defensive fallback cleanup to ensure
+/// the card is powered down if the transport goes out of scope unexpectedly.
+/// Errors during drop are ignored, and USB teardown is skipped during unwinding.
+impl<H: UsbHostTransport> Drop for CcidCardTransport<H> {
+    fn drop(&mut self) {
+        if !std::thread::panicking() && self.engine.is_activated() {
+            let _ = self.execute_op(Operation::PowerOff);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,6 +772,7 @@ mod tests {
     use crate::descriptor::{
         AUTOMATIC_ACTIVATION, AUTOMATIC_PARAMETER_CONFIGURATION, SHORT_APDU_EXCHANGE, TPDU_EXCHANGE,
     };
+    use crate::error::CcidIoError;
     use refineid_apdu::command::{
         ApduClass, CommandApdu, CommandHeader, CredentialBody, CredentialCommand,
         UnvalidatedCredentialBlock,
@@ -743,7 +822,7 @@ mod tests {
                     Ok(len)
                 }
                 Some(Err(e)) => Err(e),
-                None => Err(CcidError::Io("mock bulk_in underflow".into())),
+                None => Err(CcidError::Io(CcidIoError::BulkInUnderflow)),
             }
         }
 

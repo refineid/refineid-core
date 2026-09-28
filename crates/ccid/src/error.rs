@@ -14,11 +14,167 @@
 
 //! Error types for CCID descriptor parsing, wire codec, and state machine operations.
 
-use alloc::string::String;
 use core::fmt;
 
+/// Detailed reasons for USB physical I/O failures.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum CcidIoError {
+    /// Connection to the USB device or endpoint was lost.
+    ConnectionLost,
+    /// USB device was disconnected.
+    DeviceDisconnected,
+    /// Short Bulk-OUT write.
+    ShortWrite {
+        /// Expected byte count.
+        expected: usize,
+        /// Actual transferred byte count.
+        transferred: usize,
+    },
+    /// Bulk-IN read underflow or mock queue exhausted.
+    BulkInUnderflow,
+    /// Synthetic test harness failure.
+    SyntheticFailure,
+}
+
+impl fmt::Display for CcidIoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ConnectionLost => write!(f, "USB CCID connection lost"),
+            Self::DeviceDisconnected => write!(f, "USB CCID device disconnected"),
+            Self::ShortWrite {
+                expected,
+                transferred,
+            } => {
+                write!(
+                    f,
+                    "short Bulk-OUT write: expected {expected} bytes, transferred {transferred}"
+                )
+            }
+            Self::BulkInUnderflow => write!(f, "Bulk-IN read underflow"),
+            Self::SyntheticFailure => write!(f, "synthetic test failure"),
+        }
+    }
+}
+
+/// Specific failure modes when parsing CCID descriptors.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum CcidDescriptorError {
+    /// Invalid CCID functional descriptor type byte (expected 0x21).
+    InvalidFunctionalDescriptorType {
+        /// Received descriptor type byte.
+        actual: u8,
+    },
+}
+
+impl fmt::Display for CcidDescriptorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidFunctionalDescriptorType { actual } => {
+                write!(
+                    f,
+                    "invalid CCID functional descriptor type: expected {:#04x}, got {actual:#04x}",
+                    crate::descriptor::CCID_FUNCTIONAL_DESCRIPTOR_TYPE
+                )
+            }
+        }
+    }
+}
+
+/// Specific protocol desynchronization failure modes.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum CcidProtocolDesync {
+    /// Slot encountered an unrecovered error; abort recovery required.
+    SlotRecoveryRequired,
+    /// Another operation is already pending on the slot.
+    OperationAlreadyPending,
+    /// CCID parameters response has invalid protocol or length.
+    InvalidParametersLength {
+        /// Active protocol indicator (0 = T=0, 1 = T=1).
+        protocol: u8,
+        /// Payload byte length.
+        length: usize,
+    },
+    /// Chain Begin block received while chain is already open.
+    ChainBeginAlreadyOpen,
+    /// Chain Continue block received without a preceding Begin.
+    ChainContinueWithoutBegin,
+    /// Chain End block received without a preceding Begin.
+    ChainEndWithoutBegin,
+    /// Chain Complete block received while chain is already open.
+    ChainCompleteWhileOpen,
+    /// Unexpected CCID command continuation requested by reader.
+    UnexpectedCommandContinuation,
+    /// PowerOn operation did not return ATR data.
+    PowerOnMissingAtr,
+    /// Reset operation did not return ATR data.
+    ResetMissingAtr,
+    /// Abort operation returned an unexpected outcome.
+    UnexpectedAbortOutcome,
+    /// CCID engine terminated operation without completing.
+    TerminatedWithoutCompletion,
+    /// Iteration limit exceeded during 61xx GET RESPONSE chaining.
+    ChainingIterationLimitExceeded,
+    /// 61xx GET RESPONSE chain exceeded maximum buffer capacity.
+    ChainExceededCapacity,
+    /// Card signaled 61xx but returned zero payload bytes (stalled chain).
+    StalledChain,
+    /// Repeated 6Cxx wrong-Le status words encountered during chaining.
+    RepeatedWrongLe,
+}
+
+impl fmt::Display for CcidProtocolDesync {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SlotRecoveryRequired => write!(f, "slot timed out; abort recovery required"),
+            Self::OperationAlreadyPending => write!(f, "another operation is already pending"),
+            Self::InvalidParametersLength { protocol, length } => {
+                write!(
+                    f,
+                    "invalid CCID parameters length for protocol {protocol}: {length} bytes"
+                )
+            }
+            Self::ChainBeginAlreadyOpen => {
+                write!(f, "Chain Begin received while chain already open")
+            }
+            Self::ChainContinueWithoutBegin => {
+                write!(f, "Chain Continue received without preceding Begin")
+            }
+            Self::ChainEndWithoutBegin => {
+                write!(f, "Chain End received without preceding Begin")
+            }
+            Self::ChainCompleteWhileOpen => {
+                write!(f, "Chain Complete received while chain open")
+            }
+            Self::UnexpectedCommandContinuation => {
+                write!(f, "unexpected CCID command continuation request")
+            }
+            Self::PowerOnMissingAtr => write!(f, "PowerOn operation did not return ATR data"),
+            Self::ResetMissingAtr => write!(f, "Reset did not return ATR data"),
+            Self::UnexpectedAbortOutcome => write!(f, "abort returned unexpected outcome"),
+            Self::TerminatedWithoutCompletion => {
+                write!(f, "CCID engine terminated operation without completion")
+            }
+            Self::ChainingIterationLimitExceeded => {
+                write!(f, "61xx GET RESPONSE chaining iteration limit exceeded")
+            }
+            Self::ChainExceededCapacity => {
+                write!(f, "61xx GET RESPONSE chain exceeded buffer capacity")
+            }
+            Self::StalledChain => {
+                write!(
+                    f,
+                    "card signalled 61xx but returned no bytes (stalled chain)"
+                )
+            }
+            Self::RepeatedWrongLe => {
+                write!(f, "repeated 6Cxx wrong-Le during 61xx chaining")
+            }
+        }
+    }
+}
+
 /// Errors arising from CCID operations.
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum CcidError {
     /// Descriptor header was truncated.
     TruncatedDescriptorHeader,
@@ -92,9 +248,9 @@ pub enum CcidError {
         multiplier: u8,
     },
     /// Physical USB I/O failure.
-    Io(String),
+    Io(CcidIoError),
     /// Protocol or session desynchronization.
-    ProtocolDesync(String),
+    ProtocolDesync(CcidProtocolDesync),
     /// Operation timed out.
     Timeout,
     /// Operation cancelled.
@@ -102,7 +258,7 @@ pub enum CcidError {
     /// Card was removed.
     CardRemoved,
     /// Invalid CCID descriptor structure or field.
-    InvalidCcidDescriptor(String),
+    InvalidCcidDescriptor(CcidDescriptorError),
     /// APDU payload exceeds maximum buffer length supported by reader.
     ApduTooLong,
     /// Smart card protocol is unsupported by the exchange level.
@@ -175,12 +331,12 @@ impl fmt::Display for CcidError {
             Self::TimeExtension { multiplier } => {
                 write!(f, "CCID time extension requested: {multiplier}")
             }
-            Self::Io(msg) => write!(f, "CCID USB I/O failure: {msg}"),
-            Self::ProtocolDesync(msg) => write!(f, "CCID protocol desync: {msg}"),
+            Self::Io(err) => write!(f, "CCID USB I/O failure: {err}"),
+            Self::ProtocolDesync(err) => write!(f, "CCID protocol desync: {err}"),
             Self::Timeout => write!(f, "CCID operation timed out"),
             Self::Cancelled => write!(f, "CCID operation cancelled"),
             Self::CardRemoved => write!(f, "Smart card was removed from reader"),
-            Self::InvalidCcidDescriptor(msg) => write!(f, "Invalid CCID descriptor: {msg}"),
+            Self::InvalidCcidDescriptor(err) => write!(f, "Invalid CCID descriptor: {err}"),
             Self::ApduTooLong => {
                 write!(
                     f,

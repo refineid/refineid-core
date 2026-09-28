@@ -23,15 +23,27 @@ use crate::codec::{
     RDR_TO_PC_HARDWARE_ERROR, RDR_TO_PC_PARAMETERS, RDR_TO_PC_SLOT_STATUS,
     decode_interrupt_hardware_error, decode_interrupt_slot_change, decode_response, encode_abort,
     encode_get_parameters, encode_get_slot_status, encode_icc_power_off, encode_icc_power_on,
-    encode_set_parameters_t0, encode_xfr_block,
+    encode_secure, encode_set_parameters_t0, encode_xfr_block,
 };
-use crate::descriptor::{CcidExchangeLevel, CcidFunctionalDescriptor};
-use crate::error::CcidError;
+use crate::descriptor::{
+    CcidExchangeLevel, CcidFunctionalDescriptor, MAXIMUM_CCID_COMMAND_PAYLOAD_LENGTH,
+};
+use crate::error::{CcidError, CcidIoError, CcidProtocolDesync};
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use zeroize::Zeroizing;
 
 /// Default timeout for CCID engine operations in milliseconds.
 pub const DEFAULT_ENGINE_TIMEOUT_MS: u64 = 5000;
+
+/// Chaining parameter: unfragmented block or default level parameter (USB-IF CCID Rev 1.1 §6.1.4 Table 6-4).
+pub const W_LEVEL_NONE: u16 = 0x0000;
+/// Chaining parameter: command APDU begins and continues in next block (USB-IF CCID Rev 1.1 §6.1.4 Table 6-4).
+pub const W_LEVEL_BEGIN: u16 = 0x0001;
+/// Chaining parameter: command APDU ends in this block (USB-IF CCID Rev 1.1 §6.1.4 Table 6-4).
+pub const W_LEVEL_END: u16 = 0x0002;
+/// Chaining parameter: command APDU continues and another block follows (USB-IF CCID Rev 1.1 §6.1.4 Table 6-4).
+pub const W_LEVEL_CONTINUE: u16 = 0x0003;
 
 /// Maximum attempts to drain stale Bulk-IN packets following an abort handshake (CCID Rev 1.1 §5.3.1).
 pub const MAX_ABORT_DRAIN_ATTEMPTS: u8 = 5;
@@ -66,6 +78,7 @@ enum PendingOperation {
     GetParameters,
     SetParametersT0,
     TransferBlock,
+    Secure,
     Abort,
 }
 
@@ -105,6 +118,15 @@ pub enum Operation {
         /// Command payload bytes.
         data: Zeroizing<Vec<u8>>,
     },
+    /// Secure PIN verification or modification on reader PIN pad.
+    Secure {
+        /// Waiting integer / block waiting integer.
+        b_wi: u8,
+        /// Level parameter.
+        w_level_parameter: u16,
+        /// Command payload bytes (PIN format and template).
+        data: Zeroizing<Vec<u8>>,
+    },
     /// Abort an ongoing or stalled command.
     Abort,
 }
@@ -142,6 +164,16 @@ impl core::fmt::Debug for Operation {
                 .field("w_level_parameter", w_level_parameter)
                 .field("data", &"[redacted]")
                 .finish(),
+            Self::Secure {
+                b_wi,
+                w_level_parameter,
+                ..
+            } => f
+                .debug_struct("Secure")
+                .field("b_wi", b_wi)
+                .field("w_level_parameter", w_level_parameter)
+                .field("data", &"[redacted]")
+                .finish(),
             Self::Abort => write!(f, "Abort"),
         }
     }
@@ -165,6 +197,8 @@ pub enum OperationResult {
     ParametersSet,
     /// Transfer block succeeded, returning response payload (R-APDU).
     TransferBlock(Vec<u8>),
+    /// Secure PIN operation succeeded, returning response payload.
+    Secure(Vec<u8>),
     /// Abort completed.
     Aborted,
 }
@@ -182,6 +216,10 @@ impl core::fmt::Debug for OperationResult {
             Self::ParametersSet => write!(f, "ParametersSet"),
             Self::TransferBlock(_) => f
                 .debug_struct("TransferBlock")
+                .field("payload", &"[redacted]")
+                .finish(),
+            Self::Secure(_) => f
+                .debug_struct("Secure")
                 .field("payload", &"[redacted]")
                 .finish(),
             Self::Aborted => write!(f, "Aborted"),
@@ -405,6 +443,8 @@ pub struct CcidEngine {
     current_deadline: Option<Deadline>,
     default_timeout_ms: u64,
     chain_buffer: Vec<u8>,
+    outgoing_chain: VecDeque<Zeroizing<Vec<u8>>>,
+    pending_b_wi: u8,
     wtx_count: u32,
     abort_drain_count: u8,
     waiting_unit_ms: u32,
@@ -434,6 +474,7 @@ impl core::fmt::Debug for CcidEngine {
             .field("current_deadline", &self.current_deadline)
             .field("default_timeout_ms", &self.default_timeout_ms)
             .field("chain_buffer", &"[redacted]")
+            .field("outgoing_chain", &"[redacted]")
             .field("wtx_count", &self.wtx_count)
             .field("abort_drain_count", &self.abort_drain_count)
             .field("waiting_unit_ms", &self.waiting_unit_ms)
@@ -472,6 +513,8 @@ impl CcidEngine {
             current_deadline: None,
             default_timeout_ms: DEFAULT_ENGINE_TIMEOUT_MS,
             chain_buffer: Vec::new(),
+            outgoing_chain: VecDeque::new(),
+            pending_b_wi: 0,
             wtx_count: 0,
             abort_drain_count: 0,
             waiting_unit_ms: 1000,
@@ -602,9 +645,7 @@ impl CcidEngine {
                             actions.push(Action::CancelTransfers);
                             actions.push(Action::Complete {
                                 id: op_id,
-                                result: Err(CcidError::Io(
-                                    "CCID hardware error notification received".into(),
-                                )),
+                                result: Err(CcidError::Io(CcidIoError::ConnectionLost)),
                             });
                         }
                     }
@@ -643,7 +684,7 @@ impl CcidEngine {
                 if !self.connected {
                     actions.push(Action::Complete {
                         id,
-                        result: Err(CcidError::Io("USB CCID connection lost".into())),
+                        result: Err(CcidError::Io(CcidIoError::ConnectionLost)),
                     });
                     return Transition {
                         actions,
@@ -655,7 +696,7 @@ impl CcidEngine {
                     actions.push(Action::Complete {
                         id,
                         result: Err(CcidError::ProtocolDesync(
-                            "slot timed out; abort recovery required".into(),
+                            CcidProtocolDesync::SlotRecoveryRequired,
                         )),
                     });
                     return Transition {
@@ -668,7 +709,7 @@ impl CcidEngine {
                     actions.push(Action::Complete {
                         id,
                         result: Err(CcidError::ProtocolDesync(
-                            "another operation is already pending".into(),
+                            CcidProtocolDesync::OperationAlreadyPending,
                         )),
                     });
                     return Transition {
@@ -677,7 +718,26 @@ impl CcidEngine {
                     };
                 }
 
-                if let Operation::TransferBlock { ref data, .. } = op
+                if let Operation::TransferBlock { ref data, .. } = op {
+                    let max_payload_bound = match self.exchange_level {
+                        CcidExchangeLevel::ShortAndExtendedApdu => {
+                            MAXIMUM_CCID_COMMAND_PAYLOAD_LENGTH
+                        }
+                        _ => self.max_payload_length,
+                    };
+                    if data.len() > max_payload_bound {
+                        actions.push(Action::Complete {
+                            id,
+                            result: Err(CcidError::ApduTooLong),
+                        });
+                        return Transition {
+                            actions,
+                            next_deadline: None,
+                        };
+                    }
+                }
+
+                if let Operation::Secure { ref data, .. } = op
                     && data.len() > self.max_payload_length
                 {
                     actions.push(Action::Complete {
@@ -692,6 +752,7 @@ impl CcidEngine {
 
                 self.wtx_count = 0;
                 self.chain_buffer.clear();
+                self.outgoing_chain.clear();
                 let seq = self.allocate_seq();
                 self.expected_seq = seq;
 
@@ -768,9 +829,48 @@ impl CcidEngine {
                         b_wi,
                         w_level_parameter,
                         data,
+                    } => {
+                        let max_block = self.max_payload_length;
+                        if self.exchange_level == CcidExchangeLevel::ShortAndExtendedApdu
+                            && max_block > 0
+                            && data.len() > max_block
+                        {
+                            self.outgoing_chain.clear();
+                            self.pending_b_wi = b_wi;
+                            let first_chunk = &data[..max_block];
+                            let mut offset = max_block;
+                            while offset < data.len() {
+                                let end = (offset + max_block).min(data.len());
+                                self.outgoing_chain
+                                    .push_back(Zeroizing::new(data[offset..end].to_vec()));
+                                offset = end;
+                            }
+                            (
+                                PendingOperation::TransferBlock,
+                                encode_xfr_block(
+                                    self.b_slot,
+                                    seq,
+                                    b_wi,
+                                    W_LEVEL_BEGIN,
+                                    first_chunk,
+                                ),
+                                RDR_TO_PC_DATA_BLOCK,
+                            )
+                        } else {
+                            (
+                                PendingOperation::TransferBlock,
+                                encode_xfr_block(self.b_slot, seq, b_wi, w_level_parameter, &data),
+                                RDR_TO_PC_DATA_BLOCK,
+                            )
+                        }
+                    }
+                    Operation::Secure {
+                        b_wi,
+                        w_level_parameter,
+                        data,
                     } => (
-                        PendingOperation::TransferBlock,
-                        encode_xfr_block(self.b_slot, seq, b_wi, w_level_parameter, &data),
+                        PendingOperation::Secure,
+                        encode_secure(self.b_slot, seq, b_wi, w_level_parameter, &data),
                         RDR_TO_PC_DATA_BLOCK,
                     ),
                     Operation::Abort => unreachable!(),
@@ -802,7 +902,10 @@ impl CcidEngine {
                         actions.push(Action::CancelTransfers);
                         actions.push(Action::Complete {
                             id: op_id,
-                            result: Err(CcidError::Io("short Bulk-OUT write".into())),
+                            result: Err(CcidError::Io(CcidIoError::ShortWrite {
+                                expected: self.expected_bulk_out_len,
+                                transferred,
+                            })),
                         });
                     }
                 } else {
@@ -885,8 +988,7 @@ impl CcidEngine {
                                             actions.push(Action::Complete {
                                                 id: op_id,
                                                 result: Err(CcidError::ProtocolDesync(
-                                                    "Chain Begin received while chain already open"
-                                                        .into(),
+                                                    CcidProtocolDesync::ChainBeginAlreadyOpen,
                                                 )),
                                             });
                                             return Transition {
@@ -932,8 +1034,7 @@ impl CcidEngine {
                                             actions.push(Action::Complete {
                                                 id: op_id,
                                                 result: Err(CcidError::ProtocolDesync(
-                                                    "Chain Continue received without preceding Begin"
-                                                        .into(),
+                                                    CcidProtocolDesync::ChainContinueWithoutBegin,
                                                 )),
                                             });
                                             return Transition {
@@ -979,8 +1080,7 @@ impl CcidEngine {
                                             actions.push(Action::Complete {
                                                 id: op_id,
                                                 result: Err(CcidError::ProtocolDesync(
-                                                    "Chain End received without preceding Begin"
-                                                        .into(),
+                                                    CcidProtocolDesync::ChainEndWithoutBegin,
                                                 )),
                                             });
                                             return Transition {
@@ -1013,6 +1113,9 @@ impl CcidEngine {
                                             PendingOperation::TransferBlock => {
                                                 Ok(OperationResult::TransferBlock(combined))
                                             }
+                                            PendingOperation::Secure => {
+                                                Ok(OperationResult::Secure(combined))
+                                            }
                                             _ => Ok(OperationResult::PowerOn(combined)),
                                         };
                                         self.current_deadline = None;
@@ -1026,8 +1129,7 @@ impl CcidEngine {
                                             actions.push(Action::Complete {
                                                 id: op_id,
                                                 result: Err(CcidError::ProtocolDesync(
-                                                    "Chain Complete received while chain open"
-                                                        .into(),
+                                                    CcidProtocolDesync::ChainCompleteWhileOpen,
                                                 )),
                                             });
                                             return Transition {
@@ -1055,20 +1157,55 @@ impl CcidEngine {
                                             PendingOperation::TransferBlock => {
                                                 Ok(OperationResult::TransferBlock(payload))
                                             }
+                                            PendingOperation::Secure => {
+                                                Ok(OperationResult::Secure(payload))
+                                            }
                                             _ => Ok(OperationResult::PowerOn(payload)),
                                         };
                                         self.current_deadline = None;
                                         actions.push(Action::Complete { id: op_id, result });
                                     }
                                     crate::codec::ChainParameter::CommandContinuationExpected => {
-                                        self.current_deadline = None;
-                                        actions.push(Action::Complete {
-                                            id: op_id,
-                                            result: Err(CcidError::ProtocolDesync(
-                                                "unexpected CCID command continuation request"
-                                                    .into(),
-                                            )),
-                                        });
+                                        if let Some(next_chunk) = self.outgoing_chain.pop_front() {
+                                            let w_level = if self.outgoing_chain.is_empty() {
+                                                W_LEVEL_END
+                                            } else {
+                                                W_LEVEL_CONTINUE
+                                            };
+                                            let seq = self.allocate_seq();
+                                            self.expected_seq = seq;
+                                            self.pending_op = Some((op_id, pending));
+                                            let cmd = encode_xfr_block(
+                                                self.b_slot,
+                                                seq,
+                                                self.pending_b_wi,
+                                                w_level,
+                                                &next_chunk,
+                                            );
+                                            self.expected_bulk_out_len = cmd.len();
+                                            self.active_deadline_id =
+                                                self.active_deadline_id.wrapping_add(1);
+                                            let dl = Deadline {
+                                                id: DeadlineId(self.active_deadline_id),
+                                                expires_at: MonotonicTime(
+                                                    now.0 + self.default_timeout_ms,
+                                                ),
+                                            };
+                                            self.current_deadline = Some(dl);
+                                            next_deadline = Some(dl);
+                                            actions.push(Action::SubmitBulkOut {
+                                                seq,
+                                                data: Zeroizing::new(cmd),
+                                            });
+                                        } else {
+                                            self.current_deadline = None;
+                                            actions.push(Action::Complete {
+                                                id: op_id,
+                                                result: Err(CcidError::ProtocolDesync(
+                                                    CcidProtocolDesync::UnexpectedCommandContinuation,
+                                                )),
+                                            });
+                                        }
                                     }
                                 }
                             }
@@ -1154,6 +1291,7 @@ impl CcidEngine {
             }
 
             InputEvent::IoCompleted(IoCompletion::Failure(e)) => {
+                self.outgoing_chain.clear();
                 if let Some((op_id, _)) = self.pending_op.take() {
                     if matches!(e, CcidError::CardRemoved) {
                         self.card_present = false;
@@ -1178,6 +1316,7 @@ impl CcidEngine {
                     && now.0 >= dl.expires_at.0
                     && let Some((op_id, _)) = self.pending_op.take()
                 {
+                    self.outgoing_chain.clear();
                     self.needs_recovery = true;
                     self.current_deadline = None;
                     actions.push(Action::CancelTransfers);
@@ -1190,6 +1329,7 @@ impl CcidEngine {
 
             InputEvent::Cancel(op_id) => {
                 if self.pending_op.as_ref().is_some_and(|(id, _)| *id == op_id) {
+                    self.outgoing_chain.clear();
                     self.pending_op = None;
                     self.current_deadline = None;
                     self.needs_recovery = true;
@@ -1202,6 +1342,7 @@ impl CcidEngine {
             }
 
             InputEvent::ConnectionLost => {
+                self.outgoing_chain.clear();
                 self.connected = false;
                 self.card_present = false;
                 self.activated = false;
@@ -1209,7 +1350,7 @@ impl CcidEngine {
                 if let Some((op_id, _)) = self.pending_op.take() {
                     actions.push(Action::Complete {
                         id: op_id,
-                        result: Err(CcidError::Io("device disconnected".into())),
+                        result: Err(CcidError::Io(CcidIoError::DeviceDisconnected)),
                     });
                 }
             }
@@ -1234,6 +1375,8 @@ mod tests {
         RDR_TO_PC_NOTIFY_SLOT_CHANGE,
     };
     use crate::descriptor::{AUTOMATIC_ACTIVATION, SHORT_APDU_EXCHANGE};
+
+    const TEST_B_WI: u8 = 0;
 
     fn make_test_descriptor() -> CcidFunctionalDescriptor {
         CcidFunctionalDescriptor::from_parts_unchecked(
@@ -1321,8 +1464,8 @@ mod tests {
             InputEvent::Start {
                 id: op_id,
                 op: Operation::TransferBlock {
-                    b_wi: 0,
-                    w_level_parameter: 0,
+                    b_wi: TEST_B_WI,
+                    w_level_parameter: W_LEVEL_NONE,
                     data: Zeroizing::new(apdu.to_vec()),
                 },
             },
@@ -1364,8 +1507,8 @@ mod tests {
             InputEvent::Start {
                 id: op_id,
                 op: Operation::TransferBlock {
-                    b_wi: 0,
-                    w_level_parameter: 0,
+                    b_wi: TEST_B_WI,
+                    w_level_parameter: W_LEVEL_NONE,
                     data: Zeroizing::new(vec![0x00, 0x84, 0x00, 0x00, 0x08]),
                 },
             },
@@ -1429,8 +1572,8 @@ mod tests {
             InputEvent::Start {
                 id: op_id,
                 op: Operation::TransferBlock {
-                    b_wi: 0,
-                    w_level_parameter: 0,
+                    b_wi: TEST_B_WI,
+                    w_level_parameter: W_LEVEL_NONE,
                     data: Zeroizing::new(vec![0x00, 0x20, 0x00, 0x80]),
                 },
             },
@@ -1603,8 +1746,8 @@ mod tests {
             InputEvent::Start {
                 id: op_id,
                 op: Operation::TransferBlock {
-                    b_wi: 0,
-                    w_level_parameter: 0,
+                    b_wi: TEST_B_WI,
+                    w_level_parameter: W_LEVEL_NONE,
                     data: Zeroizing::new(vec![0x00, 0x84, 0x00, 0x00, 0x08]),
                 },
             },
@@ -1664,8 +1807,8 @@ mod tests {
             InputEvent::Start {
                 id: op_id,
                 op: Operation::TransferBlock {
-                    b_wi: 0,
-                    w_level_parameter: 0,
+                    b_wi: TEST_B_WI,
+                    w_level_parameter: W_LEVEL_NONE,
                     data: Zeroizing::new(vec![0x00, 0x84, 0x00, 0x00, 0x08]),
                 },
             },
@@ -1713,8 +1856,8 @@ mod tests {
             InputEvent::Start {
                 id: op_id,
                 op: Operation::TransferBlock {
-                    b_wi: 0,
-                    w_level_parameter: 0,
+                    b_wi: TEST_B_WI,
+                    w_level_parameter: W_LEVEL_NONE,
                     data: Zeroizing::new(vec![0x00, 0x84, 0x00, 0x00, 0x08]),
                 },
             },

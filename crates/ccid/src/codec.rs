@@ -16,7 +16,7 @@
 //!
 //! Defined by USB-IF Smart Card CCID Specification Revision 1.1 §6.1, §6.2, and §6.3.
 
-use crate::error::CcidError;
+use crate::error::{CcidError, CcidProtocolDesync};
 use alloc::vec::Vec;
 
 /// Standard CCID 10-byte bulk message header size.
@@ -59,6 +59,8 @@ pub const CCID_CONTROL_REQUEST_ABORT: u8 = 0x01;
 pub const PC_TO_RDR_GET_PARAMETERS: u8 = 0x6C;
 /// Transfer block command (`PC_to_RDR_XfrBlock`).
 pub const PC_TO_RDR_XFR_BLOCK: u8 = 0x6F;
+/// Secure command (`PC_to_RDR_Secure`, USB-IF CCID Rev 1.1 §6.1.11 Table 6-1 value 69h).
+pub const PC_TO_RDR_SECURE: u8 = 0x69;
 
 // --- CCID Message Types (Bulk-IN: Reader -> Host) ---
 
@@ -368,12 +370,28 @@ pub fn encode_xfr_block(
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(CCID_HEADER_SIZE + block.len());
     out.push(PC_TO_RDR_XFR_BLOCK);
-    out.extend_from_slice(&(block.len() as u32).to_le_bytes());
+    let length = u32::try_from(block.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&length.to_le_bytes());
     out.push(slot);
     out.push(seq);
     out.push(b_wi);
     out.extend_from_slice(&w_level_parameter.to_le_bytes());
     out.extend_from_slice(block);
+    out
+}
+
+/// Encode a `PC_to_RDR_Secure` message with PIN verification or modification payload.
+#[must_use]
+pub fn encode_secure(slot: u8, seq: u8, b_wi: u8, w_level_parameter: u16, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(CCID_HEADER_SIZE + data.len());
+    out.push(PC_TO_RDR_SECURE);
+    let length = u32::try_from(data.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&length.to_le_bytes());
+    out.push(slot);
+    out.push(seq);
+    out.push(b_wi);
+    out.extend_from_slice(&w_level_parameter.to_le_bytes());
+    out.extend_from_slice(data);
     out
 }
 
@@ -556,7 +574,10 @@ pub fn decode_response(
                         payload,
                     }),
                     _ => Err(CcidError::ProtocolDesync(
-                        "invalid CCID parameters protocol or length".into(),
+                        CcidProtocolDesync::InvalidParametersLength {
+                            protocol: protocol_num,
+                            length: payload.len(),
+                        },
                     )),
                 }
             }

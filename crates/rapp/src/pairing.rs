@@ -9,9 +9,15 @@ use std::collections::BTreeMap;
 
 use zeroize::Zeroizing;
 
-use super::{EndpointRole, GrantsHash, PairId, ProfileName, RendezvousToken, WireValue};
+use super::{
+    EndpointRole, GrantsHash, PairId, ProfileName, RendezvousToken, WireValue,
+    decode_deterministic_cbor, encode_deterministic_cbor,
+};
 
 const X25519_KEY_SIZE: usize = 32;
+
+/// Format version for encoded pairing records.
+pub const PAIR_RECORD_FORMAT_VERSION: u64 = 2;
 
 /// Transport metadata retained after pairing without retaining the QR secret.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -148,7 +154,8 @@ impl PairRecord {
     }
 
     /// Exposes the private key only to sibling protocol machinery and stores.
-    pub(super) fn local_static_private(&self) -> &[u8; X25519_KEY_SIZE] {
+    #[must_use]
+    pub fn local_static_private(&self) -> &[u8; X25519_KEY_SIZE] {
         &self.local_static_private
     }
 }
@@ -242,4 +249,351 @@ pub enum PairStoreError<E> {
     PairNotFound,
     /// Platform-provided storage failed.
     Backend(E),
+}
+
+/// Failure during pair record serialization or deserialization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PairRecordCodecError {
+    /// The input bytes were not valid deterministic CBOR or contained unexpected keys/types.
+    InvalidInput,
+    /// Serialization failed.
+    ProtocolFailure,
+    /// The format version is unsupported.
+    UnsupportedVersion,
+    /// Record invariants failed.
+    InvalidRecord(PairRecordError),
+}
+
+impl fmt::Display for PairRecordCodecError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidInput => formatter.write_str("invalid pairing record input"),
+            Self::ProtocolFailure => formatter.write_str("failed to encode pairing record"),
+            Self::UnsupportedVersion => {
+                formatter.write_str("unsupported pairing record format version")
+            }
+            Self::InvalidRecord(err) => write!(formatter, "invalid record contents: {err}"),
+        }
+    }
+}
+
+impl core::error::Error for PairRecordCodecError {}
+
+/// Serializes a [`PairRecord`] to deterministic CBOR.
+///
+/// # Errors
+/// [`PairRecordCodecError::ProtocolFailure`] if serialization fails.
+pub fn encode_pair_record(record: &PairRecord) -> Result<Vec<u8>, PairRecordCodecError> {
+    let role = match record.role() {
+        EndpointRole::Requester => "requester",
+        EndpointRole::Proxy => "proxy",
+    };
+    let value = WireValue::Map(BTreeMap::from([
+        (
+            "format_version".to_owned(),
+            WireValue::Unsigned(PAIR_RECORD_FORMAT_VERSION),
+        ),
+        (
+            "pair_id".to_owned(),
+            WireValue::Bytes(record.pair_id().as_bytes().to_vec()),
+        ),
+        (
+            "rendezvous_token".to_owned(),
+            WireValue::Bytes(record.rendezvous_token().as_bytes().to_vec()),
+        ),
+        ("role".to_owned(), WireValue::Text(role.to_owned())),
+        (
+            "local_static_private".to_owned(),
+            WireValue::Bytes(record.local_static_private().to_vec()),
+        ),
+        (
+            "local_static_public".to_owned(),
+            WireValue::Bytes(record.local_static_public().to_vec()),
+        ),
+        (
+            "remote_static_public".to_owned(),
+            WireValue::Bytes(record.remote_static_public().to_vec()),
+        ),
+        (
+            "grants_hash".to_owned(),
+            WireValue::Bytes(record.grants_hash().as_bytes().to_vec()),
+        ),
+        (
+            "profiles".to_owned(),
+            WireValue::Array(
+                record
+                    .profiles()
+                    .iter()
+                    .map(|profile| WireValue::Text(profile.as_str().to_owned()))
+                    .collect(),
+            ),
+        ),
+        (
+            "transport_profile".to_owned(),
+            WireValue::Text(record.transport().profile.clone()),
+        ),
+        (
+            "candidate_id".to_owned(),
+            WireValue::Text(record.transport().candidate_id.clone()),
+        ),
+        (
+            "transport_parameters".to_owned(),
+            WireValue::Map(record.transport().parameters.clone()),
+        ),
+        (
+            "created_at_ms".to_owned(),
+            WireValue::Unsigned(record.created_at_ms()),
+        ),
+    ]));
+    encode_deterministic_cbor(&value).map_err(|_| PairRecordCodecError::ProtocolFailure)
+}
+
+/// Deserializes a [`PairRecord`] from deterministic CBOR.
+///
+/// # Errors
+/// [`PairRecordCodecError`] on malformed CBOR, invalid keys, unsupported format version,
+/// or invariant failure.
+pub fn decode_pair_record(bytes: &[u8]) -> Result<PairRecord, PairRecordCodecError> {
+    let WireValue::Map(mut map) =
+        decode_deterministic_cbor(bytes).map_err(|_| PairRecordCodecError::InvalidInput)?
+    else {
+        return Err(PairRecordCodecError::InvalidInput);
+    };
+    let expected = [
+        "format_version",
+        "pair_id",
+        "rendezvous_token",
+        "role",
+        "local_static_private",
+        "local_static_public",
+        "remote_static_public",
+        "grants_hash",
+        "profiles",
+        "transport_profile",
+        "candidate_id",
+        "transport_parameters",
+        "created_at_ms",
+    ];
+    if map.keys().any(|key| !expected.contains(&key.as_str())) {
+        return Err(PairRecordCodecError::InvalidInput);
+    }
+    if take_unsigned(&mut map, "format_version")? != PAIR_RECORD_FORMAT_VERSION {
+        return Err(PairRecordCodecError::UnsupportedVersion);
+    }
+    let pair_id = PairId::reconstruct(&take_bytes(&mut map, "pair_id")?)
+        .map_err(|_| PairRecordCodecError::InvalidInput)?;
+    let rendezvous_token = RendezvousToken::reconstruct(&take_bytes(&mut map, "rendezvous_token")?)
+        .map_err(|_| PairRecordCodecError::InvalidInput)?;
+    let role = match take_text(&mut map, "role")?.as_str() {
+        "requester" => EndpointRole::Requester,
+        "proxy" => EndpointRole::Proxy,
+        _ => return Err(PairRecordCodecError::InvalidInput),
+    };
+    let local_static_private = take_array::<X25519_KEY_SIZE>(&mut map, "local_static_private")?;
+    let local_static_public = take_array::<X25519_KEY_SIZE>(&mut map, "local_static_public")?;
+    let remote_static_public = take_array::<X25519_KEY_SIZE>(&mut map, "remote_static_public")?;
+    let grants_hash = GrantsHash::reconstruct(&take_bytes(&mut map, "grants_hash")?)
+        .map_err(|_| PairRecordCodecError::InvalidInput)?;
+    let profiles = take_text_array(&mut map, "profiles")?
+        .into_iter()
+        .map(|name| ProfileName::parse(&name).ok_or(PairRecordCodecError::InvalidInput))
+        .collect::<Result<Vec<_>, _>>()?;
+    let transport = PairTransportBinding {
+        profile: take_text(&mut map, "transport_profile")?,
+        candidate_id: take_text(&mut map, "candidate_id")?,
+        parameters: take_map(&mut map, "transport_parameters")?,
+    };
+    let created_at_ms = take_unsigned(&mut map, "created_at_ms")?;
+    if !map.is_empty() {
+        return Err(PairRecordCodecError::InvalidInput);
+    }
+    PairRecord::new(
+        pair_id,
+        rendezvous_token,
+        role,
+        local_static_private,
+        local_static_public,
+        remote_static_public,
+        grants_hash,
+        profiles,
+        transport,
+        created_at_ms,
+    )
+    .map_err(PairRecordCodecError::InvalidRecord)
+}
+
+/// Serializes multiple [`PairRecord`]s to deterministic CBOR.
+///
+/// # Errors
+/// [`PairRecordCodecError::ProtocolFailure`] if serialization fails.
+pub fn encode_pair_records(records: &[PairRecord]) -> Result<Vec<u8>, PairRecordCodecError> {
+    let mut entries = Vec::with_capacity(records.len());
+    for record in records {
+        entries.push(WireValue::Bytes(encode_pair_record(record)?));
+    }
+    encode_deterministic_cbor(&WireValue::Array(entries))
+        .map_err(|_| PairRecordCodecError::ProtocolFailure)
+}
+
+/// Deserializes multiple [`PairRecord`]s from deterministic CBOR.
+///
+/// # Errors
+/// [`PairRecordCodecError`] on malformed CBOR or invalid record entries.
+pub fn decode_pair_records(bytes: &[u8]) -> Result<Vec<PairRecord>, PairRecordCodecError> {
+    let WireValue::Array(entries) =
+        decode_deterministic_cbor(bytes).map_err(|_| PairRecordCodecError::InvalidInput)?
+    else {
+        return Err(PairRecordCodecError::InvalidInput);
+    };
+    let mut records = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let WireValue::Bytes(record_bytes) = entry else {
+            return Err(PairRecordCodecError::InvalidInput);
+        };
+        records.push(decode_pair_record(&record_bytes)?);
+    }
+    Ok(records)
+}
+
+fn take_value(
+    map: &mut BTreeMap<String, WireValue>,
+    key: &str,
+) -> Result<WireValue, PairRecordCodecError> {
+    map.remove(key).ok_or(PairRecordCodecError::InvalidInput)
+}
+
+fn take_bytes(
+    map: &mut BTreeMap<String, WireValue>,
+    key: &str,
+) -> Result<Vec<u8>, PairRecordCodecError> {
+    match take_value(map, key)? {
+        WireValue::Bytes(value) => Ok(value),
+        _ => Err(PairRecordCodecError::InvalidInput),
+    }
+}
+
+fn take_array<const SIZE: usize>(
+    map: &mut BTreeMap<String, WireValue>,
+    key: &str,
+) -> Result<[u8; SIZE], PairRecordCodecError> {
+    take_bytes(map, key)?
+        .try_into()
+        .map_err(|_| PairRecordCodecError::InvalidInput)
+}
+
+fn take_text(
+    map: &mut BTreeMap<String, WireValue>,
+    key: &str,
+) -> Result<String, PairRecordCodecError> {
+    match take_value(map, key)? {
+        WireValue::Text(value) => Ok(value),
+        _ => Err(PairRecordCodecError::InvalidInput),
+    }
+}
+
+fn take_unsigned(
+    map: &mut BTreeMap<String, WireValue>,
+    key: &str,
+) -> Result<u64, PairRecordCodecError> {
+    match take_value(map, key)? {
+        WireValue::Unsigned(value) => Ok(value),
+        _ => Err(PairRecordCodecError::InvalidInput),
+    }
+}
+
+fn take_map(
+    map: &mut BTreeMap<String, WireValue>,
+    key: &str,
+) -> Result<BTreeMap<String, WireValue>, PairRecordCodecError> {
+    match take_value(map, key)? {
+        WireValue::Map(value) => Ok(value),
+        _ => Err(PairRecordCodecError::InvalidInput),
+    }
+}
+
+fn take_text_array(
+    map: &mut BTreeMap<String, WireValue>,
+    key: &str,
+) -> Result<Vec<String>, PairRecordCodecError> {
+    let WireValue::Array(values) = take_value(map, key)? else {
+        return Err(PairRecordCodecError::InvalidInput);
+    };
+    values
+        .into_iter()
+        .map(|value| match value {
+            WireValue::Text(value) => Ok(value),
+            _ => Err(PairRecordCodecError::InvalidInput),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{
+        EndpointRole, GrantsHash, PairId, PairRecord, PairTransportBinding, ProfileName,
+        RendezvousToken, decode_pair_record, decode_pair_records, encode_pair_record,
+        encode_pair_records,
+    };
+
+    fn test_record(id_byte: u8) -> PairRecord {
+        PairRecord::new(
+            PairId::from_array([id_byte; 16]),
+            RendezvousToken::from_array([id_byte.wrapping_add(1); 16]),
+            EndpointRole::Requester,
+            [id_byte.wrapping_add(2); 32],
+            [id_byte.wrapping_add(3); 32],
+            [id_byte.wrapping_add(4); 32],
+            GrantsHash::from_array([id_byte.wrapping_add(5); 32]),
+            vec![ProfileName::Authentication, ProfileName::CardStatus],
+            PairTransportBinding {
+                profile: "fi.refineid.stream.v1".into(),
+                candidate_id: "stream-1".into(),
+                parameters: BTreeMap::new(),
+            },
+            1_700_000_000_000,
+        )
+        .expect("valid pair record")
+    }
+
+    #[test]
+    fn single_pair_record_round_trips() {
+        let original = test_record(0x42);
+        let encoded = encode_pair_record(&original).expect("encode succeeds");
+        let decoded = decode_pair_record(&encoded).expect("decode succeeds");
+
+        assert_eq!(original.pair_id(), decoded.pair_id());
+        assert_eq!(original.rendezvous_token(), decoded.rendezvous_token());
+        assert_eq!(original.role(), decoded.role());
+        assert_eq!(
+            original.local_static_private(),
+            decoded.local_static_private()
+        );
+        assert_eq!(
+            original.local_static_public(),
+            decoded.local_static_public()
+        );
+        assert_eq!(
+            original.remote_static_public(),
+            decoded.remote_static_public()
+        );
+        assert_eq!(original.grants_hash(), decoded.grants_hash());
+        assert_eq!(original.profiles(), decoded.profiles());
+        assert_eq!(original.transport(), decoded.transport());
+        assert_eq!(original.created_at_ms(), decoded.created_at_ms());
+    }
+
+    #[test]
+    fn multiple_pair_records_round_trip() {
+        let records = vec![test_record(0x11), test_record(0x22), test_record(0x33)];
+        let encoded = encode_pair_records(&records).expect("encode records succeeds");
+        let decoded = decode_pair_records(&encoded).expect("decode records succeeds");
+
+        assert_eq!(records.len(), decoded.len());
+        for (orig, dec) in records.iter().zip(decoded.iter()) {
+            assert_eq!(orig.pair_id(), dec.pair_id());
+            assert_eq!(orig.local_static_private(), dec.local_static_private());
+        }
+    }
 }

@@ -22,6 +22,19 @@ use super::{MAX_FRAME_PLAINTEXT, SESSION_ID_SIZE, SessionId, VISIBLE_WIRE_VERSIO
 const MAX_NESTING_DEPTH: usize = 8;
 const MAX_TEXT_SIZE: usize = 4_096;
 
+/// Critical extension names this implementation understands.
+///
+/// RAPP v26.9.28 section 7.3: "An implementation MUST reject an unknown
+/// field named in `critical`." Which names are known is fixed by what
+/// this module implements, not chosen per call, so the set is a
+/// constant rather than a parameter: a caller that supplied its own set
+/// could widen it and quietly accept traffic this endpoint cannot act
+/// on. The set is empty because no critical extension is implemented, so
+/// every critical name a peer sends is by definition one this endpoint
+/// must reject. The outgoing path is correspondingly free of critical
+/// names, which keeps both directions consistent.
+pub(crate) const SUPPORTED_CRITICAL_EXTENSIONS: &[&str] = &[];
+
 /// CBOR additional-information values selecting the argument width (RFC 8949 section 3).
 const ARGUMENT_IMMEDIATE_MAX: u8 = 23;
 const ARGUMENT_ONE_BYTE: u8 = 24;
@@ -305,20 +318,23 @@ impl Envelope {
         })
     }
 
-    /// Reject critical extensions unsupported by the local endpoint.
+    /// Reject critical extensions this implementation does not support.
+    ///
+    /// Every authenticated receive path must call this: the peer names a
+    /// critical extension to declare that ignoring it would misrepresent
+    /// the message, so a name this implementation does not support has
+    /// to end the session rather than be processed as if it had not been
+    /// sent. The supported set is the module's own constant, not a
+    /// caller's, so no caller can widen it.
     ///
     /// # Errors
     /// [`WireError::UnsupportedCriticalExtension`] when a critical name is
     /// not supported locally.
-    pub fn require_supported_critical<'a>(
-        &self,
-        supported: impl IntoIterator<Item = &'a str>,
-    ) -> Result<(), WireError> {
-        let supported: BTreeSet<&str> = supported.into_iter().collect();
+    pub fn require_supported_critical(&self) -> Result<(), WireError> {
         if self
             .critical
             .iter()
-            .any(|name| !supported.contains(name.as_str()))
+            .any(|name| !SUPPORTED_CRITICAL_EXTENSIONS.contains(&name.as_str()))
         {
             return Err(WireError::UnsupportedCriticalExtension);
         }

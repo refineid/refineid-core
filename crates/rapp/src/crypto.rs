@@ -454,6 +454,14 @@ impl SecureChannel {
         plaintext.truncate(length);
         let envelope =
             Envelope::decode(&plaintext).map_err(OpenError::AuthenticatedProtocolViolation)?;
+        // The peer named a critical extension to say it must not be
+        // ignored (RAPP v26.9.28 section 7.3). This is inside a frame
+        // that authenticated, so declining to act on it is
+        // attributable and belongs to the revoking arm of the caller's
+        // fail-closed handling, not to the close-only arm.
+        envelope
+            .require_supported_critical()
+            .map_err(OpenError::AuthenticatedProtocolViolation)?;
         self.sequence
             .accept_incoming(&envelope)
             .map_err(OpenError::AuthenticatedProtocolViolation)?;
@@ -592,4 +600,161 @@ fn version_value() -> WireValue {
         WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.1)),
         WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.2)),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BinaryFrame, HandshakeChannel, HandshakeRole, NOISE_TAG_SIZE, OpenError, SecureChannel,
+        SessionHandshakeParameters, generate_pair_key_material,
+    };
+    use crate::types::{LIVENESS_CHALLENGE_SIZE, PAIR_ID_SIZE, PairId, ProfileName, SessionId};
+    use crate::wire::{Envelope, MessageType, WireError, WireValue};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// A critical name no implementation of this version supports.
+    const UNSUPPORTED_CRITICAL: &str = "example.unsupported-critical";
+
+    /// The two channels of a completed session handshake, with the
+    /// session identifier their envelopes must carry.
+    fn established_channels() -> (SessionId, SecureChannel, SecureChannel) {
+        let pair_id = PairId::from_array([0x91; PAIR_ID_SIZE]);
+        let grants_hash =
+            super::compute_grants_hash(&[ProfileName::CardStatus]).expect("the fixed set hashes");
+        let requester_keys = generate_pair_key_material().expect("requester keys");
+        let proxy_keys = generate_pair_key_material().expect("proxy keys");
+        let mut requester = HandshakeChannel::session(&SessionHandshakeParameters {
+            role: HandshakeRole::Initiator,
+            local_keys: &requester_keys,
+            remote_public_key: proxy_keys.public_key(),
+            pair_id,
+            grants_hash,
+            transport_profile: "local-quic-v1",
+        })
+        .expect("requester handshake starts");
+        let mut proxy = HandshakeChannel::session(&SessionHandshakeParameters {
+            role: HandshakeRole::Responder,
+            local_keys: &proxy_keys,
+            remote_public_key: requester_keys.public_key(),
+            pair_id,
+            grants_hash,
+            transport_profile: "local-quic-v1",
+        })
+        .expect("proxy handshake starts");
+        let first = requester.write_message().expect("handshake message one");
+        proxy.read_message(&first).expect("proxy reads message one");
+        let second = proxy.write_message().expect("handshake message two");
+        requester
+            .read_message(&second)
+            .expect("requester reads message two");
+        let requester = requester.complete().expect("requester completes");
+        let proxy = proxy.complete().expect("proxy completes");
+        assert_eq!(requester.session_id, proxy.session_id);
+        (
+            requester.session_id,
+            requester.secure_channel,
+            proxy.secure_channel,
+        )
+    }
+
+    /// A valid `liveness.ping` body.
+    fn ping_body(challenge: [u8; LIVENESS_CHALLENGE_SIZE]) -> BTreeMap<String, WireValue> {
+        BTreeMap::from([
+            ("challenge".to_owned(), WireValue::Bytes(challenge.to_vec())),
+            ("last_received_sequence".to_owned(), WireValue::Unsigned(0)),
+        ])
+    }
+
+    /// Encrypt one envelope carrying `critical`, without advancing the
+    /// local send sequence: the local endpoint never originates a
+    /// critical name, so this stands in for a peer that does.
+    fn seal_critical(
+        channel: &mut SecureChannel,
+        session_id: SessionId,
+        body: BTreeMap<String, WireValue>,
+        critical: BTreeSet<String>,
+    ) -> BinaryFrame {
+        let mut extensions = BTreeMap::new();
+        for name in &critical {
+            extensions.insert(name.clone(), WireValue::Unsigned(0));
+        }
+        let envelope = Envelope::reconstruct(
+            MessageType::LivenessPing,
+            session_id,
+            0,
+            body,
+            critical.into_iter().collect(),
+            extensions,
+        )
+        .expect("the fixture envelope is well formed");
+        let plaintext = envelope.encode().expect("the fixture envelope encodes");
+        let mut output = vec![0_u8; plaintext.len() + NOISE_TAG_SIZE];
+        let length = match &mut channel.transport {
+            super::TransportMode::Snow(state) => state
+                .write_message(&plaintext, &mut output)
+                .expect("the fixture frame encrypts"),
+            super::TransportMode::Native(transport) => transport
+                .write_message(&plaintext, &mut output)
+                .expect("the fixture frame encrypts"),
+        };
+        output.truncate(length);
+        BinaryFrame::reconstruct(output).expect("the fixture frame is bounded")
+    }
+
+    /// RAPP v26.9.28 section 7.3: a name in `critical` states the message
+    /// must not be processed if the recipient does not understand it, so
+    /// an authenticated frame carrying one is refused. The refusal is
+    /// attributable (the frame authenticated) and so maps to the
+    /// revoking arm, not the close-only arm.
+    #[test]
+    fn opening_an_unsupported_critical_extension_is_refused() {
+        let (session_id, mut sender, mut receiver) = established_channels();
+        let frame = seal_critical(
+            &mut sender,
+            session_id,
+            ping_body([0x86; LIVENESS_CHALLENGE_SIZE]),
+            BTreeSet::from([UNSUPPORTED_CRITICAL.to_owned()]),
+        );
+        assert_eq!(
+            receiver.open(&frame),
+            Err(OpenError::AuthenticatedProtocolViolation(
+                WireError::UnsupportedCriticalExtension
+            ))
+        );
+    }
+
+    /// The refusal is attributable to the critical name alone: the same
+    /// message without one is accepted.
+    #[test]
+    fn opening_without_a_critical_extension_succeeds() {
+        let (session_id, mut sender, mut receiver) = established_channels();
+        let frame = seal_critical(
+            &mut sender,
+            session_id,
+            ping_body([0x87; LIVENESS_CHALLENGE_SIZE]),
+            BTreeSet::new(),
+        );
+        let envelope = receiver.open(&frame).expect("the ping is processed");
+        assert_eq!(envelope.message_type, MessageType::LivenessPing);
+        assert!(envelope.critical.is_empty());
+    }
+
+    /// One unsupported name is enough: the check is over every name
+    /// present, not whether some of them are recognised.
+    #[test]
+    fn a_critical_name_alongside_a_valid_body_is_still_refused() {
+        let (session_id, mut sender, mut receiver) = established_channels();
+        let frame = seal_critical(
+            &mut sender,
+            session_id,
+            ping_body([0x88; LIVENESS_CHALLENGE_SIZE]),
+            BTreeSet::from([UNSUPPORTED_CRITICAL.to_owned(), "example.second".to_owned()]),
+        );
+        assert_eq!(
+            receiver.open(&frame),
+            Err(OpenError::AuthenticatedProtocolViolation(
+                WireError::UnsupportedCriticalExtension
+            ))
+        );
+    }
 }

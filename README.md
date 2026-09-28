@@ -99,3 +99,15 @@ cargo test --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo run --locked -p xtask -- check-magic-numbers
 ```
+
+### Managing build cache
+
+Incremental compilation caches and old dependency artifacts in `target/` can grow during local development.
+
+```sh
+# Sweep unused artifacts older than 14 days
+cargo sweep -t 14
+
+# Clean incremental compilation cache if disk space is needed
+find target -type d -name "incremental" -prune -exec rm -rf {} +
+```

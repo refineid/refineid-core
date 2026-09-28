@@ -111,6 +111,34 @@ impl PairingOffer {
         &self.pairing_secret
     }
 
+    /// Deconstruct the offer into its components, transferring ownership of the pairing secret.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        OfferId,
+        PairingSecret,
+        Vec<String>,
+        Vec<String>,
+        Vec<TransportCandidate>,
+        u64,
+    ) {
+        (
+            self.offer_id,
+            self.pairing_secret,
+            self.suites,
+            self.profiles,
+            self.transports,
+            self.offer_ttl_ms,
+        )
+    }
+
+    /// Extract the pairing secret from this offer.
+    #[must_use]
+    pub fn into_secret(self) -> PairingSecret {
+        self.pairing_secret
+    }
+
     /// Update the pairing secret (e.g. after CPace key exchange).
     pub fn set_pairing_secret(&mut self, secret: PairingSecret) {
         self.pairing_secret = secret;

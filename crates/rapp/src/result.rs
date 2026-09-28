@@ -26,7 +26,9 @@ pub enum ResultStatus {
 }
 
 impl ResultStatus {
-    const fn as_str(self) -> &'static str {
+    /// Wire-format status label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Completed => "completed",
             Self::Denied => "denied",
@@ -72,7 +74,9 @@ pub enum ResultError {
 }
 
 impl ResultError {
-    const fn as_str(self) -> &'static str {
+    /// Wire-format error label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::UserDenied => "user_denied",
             Self::RequestExpired => "request_expired",

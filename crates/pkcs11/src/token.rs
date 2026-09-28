@@ -61,8 +61,8 @@ use crate::ck::{
     CKA_NEVER_EXTRACTABLE, CKA_PRIVATE, CKA_PUBLIC_EXPONENT, CKA_SENSITIVE, CKA_SERIAL_NUMBER,
     CKA_SIGN, CKA_SIGN_RECOVER, CKA_SUBJECT, CKA_TOKEN, CKA_TRUSTED, CKA_UNWRAP, CKA_VALUE,
     CKA_VERIFY, CKA_WRAP, CKC_X_509, CKK_EC, CKK_RSA, CKO_CERTIFICATE, CKO_PRIVATE_KEY,
-    CKO_PUBLIC_KEY, CKR_DATA_INVALID, CKR_DATA_LEN_RANGE, CKR_DEVICE_ERROR, CKR_OK,
-    CKR_PIN_INCORRECT, CKR_PIN_LOCKED, CKR_SIGNATURE_INVALID, CKR_SIGNATURE_LEN_RANGE,
+    CKO_PUBLIC_KEY, CKR_ARGUMENTS_BAD, CKR_DATA_INVALID, CKR_DATA_LEN_RANGE, CKR_DEVICE_ERROR,
+    CKR_OK, CKR_PIN_INCORRECT, CKR_PIN_LOCKED, CKR_SIGNATURE_INVALID, CKR_SIGNATURE_LEN_RANGE,
     CKR_USER_NOT_LOGGED_IN, CkAttributeType, CkBbool, CkObjectHandle, CkRv, CkUlong,
 };
 use crate::sign::{Mechanism, sign_with_card};
@@ -1199,9 +1199,27 @@ pub(super) fn card_sign(
     pin_cache: &Arc<Mutex<PinSafetyCache>>,
     mechanism: Mechanism,
     input: &[u8],
+    origin: Option<&str>,
 ) -> Result<Vec<u8>, CkRv> {
     if let Some(hex_id) = reader_name.strip_prefix("rapp:") {
-        return remote_card_sign(hex_id, mechanism, input);
+        let env_origin;
+        let effective_origin = if let Some(o) =
+            origin.filter(|o| !o.trim().is_empty() && o.len() <= 512)
+        {
+            o
+        } else {
+            env_origin = std::env::var("REFINEID_RP_ORIGIN")
+                .ok()
+                .or_else(|| std::env::var("REFINEID_ORIGIN").ok())
+                .filter(|o| !o.trim().is_empty() && o.len() <= 512);
+            if let Some(o) = &env_origin {
+                o.as_str()
+            } else {
+                crate::diag::diag!("card_sign: remote card sign missing required caller RP origin");
+                return Err(CKR_ARGUMENTS_BAD);
+            }
+        };
+        return remote_card_sign(hex_id, effective_origin, mechanism, input);
     }
     let backend = PcscBackend;
     let reader = ReaderId::new(reader_name.to_owned());
@@ -1385,7 +1403,7 @@ impl RemoteCardTransport {
         use refineid_rapp_core::stream::{StreamAccept, StreamListener, StreamRendezvous, dial};
         let timeout = Duration::from_secs(45);
         let candidate_id = "stream-1";
-        let listen_endpoint = "0.0.0.0:47110";
+        let listen_endpoint = "127.0.0.1:47110";
         let local_dial_endpoint = "127.0.0.1:47110";
 
         if let Ok(listener) = StreamListener::bind(listen_endpoint, candidate_id, timeout)
@@ -1447,7 +1465,16 @@ impl RemoteCardTransport {
     }
 }
 
-fn remote_card_sign(hex_id: &str, mechanism: Mechanism, input: &[u8]) -> Result<Vec<u8>, CkRv> {
+fn remote_card_sign(
+    hex_id: &str,
+    origin: &str,
+    mechanism: Mechanism,
+    input: &[u8],
+) -> Result<Vec<u8>, CkRv> {
+    if origin.trim().is_empty() || origin.len() > 512 {
+        crate::diag::diag!("remote_card_sign: invalid or missing RP origin");
+        return Err(CKR_ARGUMENTS_BAD);
+    }
     #[cfg(windows)]
     {
         use refineid_rapp_core::operations::{
@@ -1484,7 +1511,7 @@ fn remote_card_sign(hex_id: &str, mechanism: Mechanism, input: &[u8]) -> Result<
         };
 
         let op = CardOperation::BrowserAuthenticate {
-            origin: "https://card.refineid.fi".into(),
+            origin: origin.into(),
             key_profile,
             algorithm,
             digest,
@@ -1514,7 +1541,7 @@ fn remote_card_sign(hex_id: &str, mechanism: Mechanism, input: &[u8]) -> Result<
     }
     #[cfg(not(windows))]
     {
-        let _ = (hex_id, mechanism, input);
+        let _ = (hex_id, origin, mechanism, input);
         Err(CKR_DEVICE_ERROR)
     }
 }
@@ -2058,5 +2085,35 @@ mod tests {
 
         let past_not_after = not_after + std::time::Duration::from_secs(1);
         assert!(!super::is_cert_valid_at(&cert, past_not_after));
+    }
+
+    #[test]
+    fn remote_card_sign_missing_origin_fails_closed() {
+        let pin_cache = std::sync::Arc::new(std::sync::Mutex::new(
+            super::PinSafetyCache::new().expect("pin safety cache"),
+        ));
+        let res = super::card_sign(
+            "rapp:0123456789abcdef",
+            &pin_cache,
+            crate::sign::Mechanism::Ecdsa,
+            &[0u8; 32],
+            None,
+        );
+        assert_eq!(res, Err(crate::ck::CKR_ARGUMENTS_BAD));
+    }
+
+    #[test]
+    fn remote_card_sign_empty_origin_fails_closed() {
+        let pin_cache = std::sync::Arc::new(std::sync::Mutex::new(
+            super::PinSafetyCache::new().expect("pin safety cache"),
+        ));
+        let res = super::card_sign(
+            "rapp:0123456789abcdef",
+            &pin_cache,
+            crate::sign::Mechanism::Ecdsa,
+            &[0u8; 32],
+            Some("   "),
+        );
+        assert_eq!(res, Err(crate::ck::CKR_ARGUMENTS_BAD));
     }
 }

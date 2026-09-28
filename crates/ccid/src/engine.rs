@@ -36,11 +36,13 @@ use zeroize::Zeroizing;
 /// Default timeout for CCID engine operations in milliseconds.
 pub const DEFAULT_ENGINE_TIMEOUT_MS: u64 = 5000;
 
-/// Chaining parameter: command APDU begins and continues in next block (CCID Rev 1.1 §6.1.4).
+/// Chaining parameter: unfragmented block or no chaining parameter (CCID Rev 1.1 §6.1.4 Table 6-4).
+pub const W_LEVEL_NONE: u16 = 0x0000;
+/// Chaining parameter: command APDU begins and continues in next block (CCID Rev 1.1 §6.1.4 Table 6-4).
 pub const W_LEVEL_BEGIN: u16 = 0x0001;
-/// Chaining parameter: command APDU ends in this block (CCID Rev 1.1 §6.1.4).
+/// Chaining parameter: command APDU ends in this block (CCID Rev 1.1 §6.1.4 Table 6-4).
 pub const W_LEVEL_END: u16 = 0x0002;
-/// Chaining parameter: command APDU continues and another block follows (CCID Rev 1.1 §6.1.4).
+/// Chaining parameter: command APDU continues and another block follows (CCID Rev 1.1 §6.1.4 Table 6-4).
 pub const W_LEVEL_CONTINUE: u16 = 0x0003;
 
 /// Maximum attempts to drain stale Bulk-IN packets following an abort handshake (CCID Rev 1.1 §5.3.1).

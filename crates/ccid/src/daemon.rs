@@ -184,10 +184,10 @@ impl CcidEventPoller {
         card_status: CardStatus,
         clock_status: ClockStatus,
     ) -> Option<CcidSlotEvent> {
-        let idx = usize::from(slot);
-        if idx >= self.slot_states.len() {
-            self.slot_states.resize(idx + 1, SlotState::default());
+        if slot > self.max_slot_index {
+            return None;
         }
+        let idx = usize::from(slot);
         let state = &mut self.slot_states[idx];
         let is_present = card_status == CardStatus::Active || card_status == CardStatus::Inactive;
         let prev_present = state.card_present;

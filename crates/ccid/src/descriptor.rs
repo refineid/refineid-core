@@ -54,6 +54,8 @@ pub const MAXIMUM_MESSAGE_LENGTH_OFFSET: usize = 44;
 pub const MAX_SLOT_INDEX_OFFSET: usize = 4;
 /// Byte offset of `bPINSupport` in CCID functional descriptor.
 pub const PIN_SUPPORT_OFFSET: usize = 52;
+/// Byte offset of `bMaxCCIDBusySlots` in CCID functional descriptor (USB-IF CCID Rev 1.1 §5.1 Table 5-1).
+pub const MAX_BUSY_SLOTS_OFFSET: usize = 53;
 
 /// Protocol T=0 bit in `dwProtocols` (USB-IF CCID Rev 1.1 §5.1 Table 5-1).
 pub const PROTOCOL_T0: u32 = 0x0000_0001;

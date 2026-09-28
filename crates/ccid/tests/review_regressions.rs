@@ -17,16 +17,17 @@
 use refineid_apdu::{ApduClass, CardTransport, CommandApdu, CommandHeader};
 use refineid_ccid::codec::{
     CARD_STATUS_ACTIVE, CARD_STATUS_NOT_PRESENT, CCID_HEADER_SIZE, CHAIN_BEGIN, CHAIN_COMPLETE,
-    CLOCK_RUNNING, CLOCK_STOPPED_LOW, RDR_TO_PC_DATA_BLOCK, RDR_TO_PC_NOTIFY_SLOT_CHANGE,
-    RDR_TO_PC_PARAMETERS, RDR_TO_PC_SLOT_STATUS, decode_response,
+    CLOCK_RUNNING, CLOCK_STOPPED_LOW, PC_TO_RDR_ICC_POWER_OFF, PC_TO_RDR_SECURE,
+    RDR_TO_PC_DATA_BLOCK, RDR_TO_PC_NOTIFY_SLOT_CHANGE, RDR_TO_PC_PARAMETERS,
+    RDR_TO_PC_SLOT_STATUS, decode_response,
 };
 use refineid_ccid::descriptor::{
     AUTOMATIC_PARAMETER_CONFIGURATION, AUTOMATIC_PPS, CCID_FUNCTIONAL_DESCRIPTOR_LENGTH,
     CcidExchangeLevel, CcidFunctionalDescriptor, DESCRIPTOR_TYPE_OFFSET, FEATURES_OFFSET,
-    MAXIMUM_MESSAGE_LENGTH_OFFSET, MINIMUM_SHORT_APDU_MESSAGE_LENGTH, PIN_SUPPORT_OFFSET,
-    PIN_SUPPORT_VERIFY, SHORT_APDU_EXCHANGE, USB_INTERFACE_DESCRIPTOR_TYPE,
+    MAX_BUSY_SLOTS_OFFSET, MAXIMUM_MESSAGE_LENGTH_OFFSET, MINIMUM_SHORT_APDU_MESSAGE_LENGTH,
+    PIN_SUPPORT_OFFSET, PIN_SUPPORT_VERIFY, SHORT_APDU_EXCHANGE, USB_INTERFACE_DESCRIPTOR_TYPE,
 };
-use refineid_ccid::engine::{W_LEVEL_BEGIN, W_LEVEL_END};
+use refineid_ccid::engine::{W_LEVEL_BEGIN, W_LEVEL_END, W_LEVEL_NONE};
 use refineid_ccid::{
     Action, CardProtocol, CcidCardTransport, CcidEngine, CcidError, CcidIoError, InputEvent,
     IoCompletion, MonotonicTime, Operation, OperationId, OperationResult, Transition,
@@ -67,8 +68,6 @@ const REMOVAL_BITS: u8 = 0x02;
 const CONTINUATION_EXPECTED: u8 = 0x10;
 const W_LEVEL_OFFSET_START: usize = 8;
 const W_LEVEL_OFFSET_END: usize = 10;
-const MAX_DATA_RATES_OFFSET: usize = 53;
-const PC_TO_RDR_SECURE_CODE: u8 = 0x69;
 const PIN_VERIFY_INS: u8 = 0x20;
 const TEST_POLL_TIMEOUT_MS: u32 = 100;
 
@@ -106,7 +105,7 @@ fn descriptor_with_pin_support(
     d[MAXIMUM_MESSAGE_LENGTH_OFFSET..MAXIMUM_MESSAGE_LENGTH_OFFSET + DWORD_SIZE]
         .copy_from_slice(&max_len.to_le_bytes());
     d[PIN_SUPPORT_OFFSET] = pin_support;
-    d[MAX_DATA_RATES_OFFSET] = ONE;
+    d[MAX_BUSY_SLOTS_OFFSET] = ONE;
     CcidFunctionalDescriptor::parse_functional_descriptor(&d).expect("valid test descriptor")
 }
 
@@ -351,6 +350,43 @@ impl UsbHostTransport for Host {
         } else {
             Ok(usize::from(ZERO))
         }
+    }
+}
+
+type SharedWrites = std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+type SharedReplies = std::sync::Arc<std::sync::Mutex<VecDeque<Result<Vec<u8>, CcidError>>>>;
+
+#[derive(Clone, Default)]
+struct SharedHost {
+    writes: SharedWrites,
+    replies: SharedReplies,
+}
+
+impl UsbHostTransport for SharedHost {
+    fn bulk_out(&mut self, _: u8, data: &[u8], _: u32) -> Result<usize, CcidError> {
+        let mut guard = self.writes.lock().expect("writes mutex lock");
+        guard.push(data.to_vec());
+        Ok(data.len())
+    }
+    fn bulk_in(&mut self, _: u8, buffer: &mut [u8], _: u32) -> Result<usize, CcidError> {
+        let mut guard = self.replies.lock().expect("replies mutex lock");
+        let f = guard
+            .pop_front()
+            .ok_or(CcidError::Io(CcidIoError::SyntheticFailure))??;
+        let dest = buffer.get_mut(..f.len()).ok_or(CcidError::LengthMismatch)?;
+        dest.copy_from_slice(&f);
+        Ok(f.len())
+    }
+    fn control_transfer(
+        &mut self,
+        _: u8,
+        _: u8,
+        _: u16,
+        _: u16,
+        _: &mut [u8],
+        _: u32,
+    ) -> Result<usize, CcidError> {
+        Ok(usize::from(ZERO))
     }
 }
 
@@ -611,7 +647,7 @@ fn invalid_chain_transition_requires_recovery() {
         &mut e,
         Operation::TransferBlock {
             b_wi: ZERO,
-            w_level_parameter: 0,
+            w_level_parameter: W_LEVEL_NONE,
             data: Zeroizing::new(vec![]),
         },
     );
@@ -676,7 +712,7 @@ fn outgoing_extended_apdu_chaining_via_wlevelparameter() {
     let large_payload = vec![SYNTHETIC_INS; EXTENDED_PAYLOAD_LEN];
     let op = Operation::TransferBlock {
         b_wi: ZERO,
-        w_level_parameter: 0,
+        w_level_parameter: W_LEVEL_NONE,
         data: Zeroizing::new(large_payload),
     };
     let t1 = start(&mut e, op);
@@ -751,7 +787,7 @@ fn secure_pin_operation_and_debug_redaction() {
     let pin_template = vec![ZERO, PIN_VERIFY_INS, ZERO, ONE, ZERO];
     let op = Operation::Secure {
         b_wi: ZERO,
-        w_level_parameter: 0,
+        w_level_parameter: W_LEVEL_NONE,
         data: Zeroizing::new(pin_template),
     };
     let op_debug = format!("{op:?}");
@@ -767,7 +803,7 @@ fn secure_pin_operation_and_debug_redaction() {
             _ => None,
         })
         .expect("bulk out");
-    assert_eq!(bulk_out.first().copied(), Some(PC_TO_RDR_SECURE_CODE));
+    assert_eq!(bulk_out.first().copied(), Some(PC_TO_RDR_SECURE));
 
     let _ = e.step(
         NOW,
@@ -827,7 +863,7 @@ fn oversized_secure_operation_rejected() {
     let oversized_data = Zeroizing::new(vec![ZERO; e.max_payload_length() + BYTE_STEP]);
     let op = Operation::Secure {
         b_wi: ZERO,
-        w_level_parameter: 0,
+        w_level_parameter: W_LEVEL_NONE,
         data: oversized_data,
     };
     let t = start(&mut e, op);
@@ -897,6 +933,38 @@ fn transport_disconnect_and_drop_lifecycle() {
 
     t.disconnect().expect("disconnect");
     assert!(!t.engine().is_activated());
+}
+
+#[test]
+fn transport_drop_while_activated_powers_off_card() {
+    let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let replies = std::sync::Arc::new(std::sync::Mutex::new(VecDeque::new()));
+    replies
+        .lock()
+        .expect("replies lock")
+        .push_back(Ok(data_frame(ZERO, &[TS_DIRECT, ZERO])));
+    replies.lock().expect("replies lock").push_back(Ok(frame(
+        RDR_TO_PC_SLOT_STATUS,
+        ONE,
+        ZERO,
+        ZERO,
+        &[],
+    )));
+
+    let host = SharedHost {
+        writes: writes.clone(),
+        replies,
+    };
+    let desc = descriptor(CcidExchangeLevel::ShortApdu);
+    {
+        let t = CcidCardTransport::connect(host, &desc, ZERO, ZERO, BULK_OUT, BULK_IN)
+            .expect("connect");
+        assert!(t.engine().is_activated());
+    }
+
+    let recorded = writes.lock().expect("writes lock");
+    let last_write = recorded.last().expect("recorded power-off write on drop");
+    assert_eq!(last_write.first().copied(), Some(PC_TO_RDR_ICC_POWER_OFF));
 }
 
 #[test]

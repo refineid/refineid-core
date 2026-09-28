@@ -72,7 +72,8 @@ impl fmt::Display for CcidDescriptorError {
             Self::InvalidFunctionalDescriptorType { actual } => {
                 write!(
                     f,
-                    "invalid CCID functional descriptor type: expected 0x21, got {actual:#04x}"
+                    "invalid CCID functional descriptor type: expected {:#04x}, got {actual:#04x}",
+                    crate::descriptor::CCID_FUNCTIONAL_DESCRIPTOR_TYPE
                 )
             }
         }

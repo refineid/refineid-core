@@ -467,10 +467,11 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                 CcidProtocolDesync::TerminatedWithoutCompletion,
             ));
         };
+        let [sw1, sw2] = *sw_bytes;
         Ok(ResponseApdu {
             body: body.to_vec(),
-            sw1: sw_bytes[0],
-            sw2: sw_bytes[1],
+            sw1,
+            sw2,
         })
     }
 
@@ -603,8 +604,8 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
     /// Drive one logical APDU exchange, handling `SW=61xx` `GET RESPONSE` chaining.
     fn run_exchange(&mut self, apdu_bytes: &[u8]) -> Result<TransportOutcome, CcidError> {
         let op = Operation::TransferBlock {
-            b_wi: 0,
-            w_level_parameter: 0,
+            b_wi: DEFAULT_B_WI,
+            w_level_parameter: DEFAULT_W_LEVEL_PARAMETER,
             data: Zeroizing::new(apdu_bytes.to_vec()),
         };
         let raw_resp = match self.execute_op(op) {
@@ -615,7 +616,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
             Err(e) => return Err(e),
         };
 
-        let Some((body, sw_bytes)) = raw_resp.split_last_chunk::<2>() else {
+        let Some((body, sw_bytes)) = raw_resp.split_last_chunk::<STATUS_BYTES_LEN>() else {
             return Ok(TransportOutcome::ProtocolDesync);
         };
         let [sw1, sw2] = *sw_bytes;
@@ -647,8 +648,8 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                     self.engine.exchange_level(),
                 )?;
                 let chain_op = Operation::TransferBlock {
-                    b_wi: 0,
-                    w_level_parameter: 0,
+                    b_wi: DEFAULT_B_WI,
+                    w_level_parameter: DEFAULT_W_LEVEL_PARAMETER,
                     data: Zeroizing::new(get_resp_bytes),
                 };
                 let chain_raw = match self.execute_op(chain_op) {
@@ -658,7 +659,8 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                     Err(CcidError::Timeout) => return Ok(TransportOutcome::TimeoutUnknownState),
                     Err(e) => return Err(e),
                 };
-                let Some((chain_body, chain_sw)) = chain_raw.split_last_chunk::<2>() else {
+                let Some((chain_body, chain_sw)) = chain_raw.split_last_chunk::<STATUS_BYTES_LEN>()
+                else {
                     return Ok(TransportOutcome::ProtocolDesync);
                 };
                 let progressed = !chain_body.is_empty();

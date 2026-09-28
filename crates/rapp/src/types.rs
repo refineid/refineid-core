@@ -176,12 +176,6 @@ impl PairingSecret {
         Self(bytes)
     }
 
-    /// Expose secret bytes to low-level cryptographic operations.
-    #[must_use]
-    pub const fn as_bytes(&self) -> &[u8; PAIRING_SECRET_SIZE] {
-        &self.0
-    }
-
     pub(super) const fn expose(&self) -> &[u8; PAIRING_SECRET_SIZE] {
         &self.0
     }

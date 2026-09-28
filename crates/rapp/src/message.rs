@@ -449,7 +449,10 @@ fn session_ready_from_body(
     let nonce = take_fixed::<SESSION_READY_NONCE_SIZE>(&mut body, "nonce")?;
     require_empty(&body)?;
     require_version(&mut parameters)?;
-    require_suite(&mut parameters, MANDATORY_SESSION_SUITE)?;
+    let suite = take_text(&mut parameters, "suite")?;
+    if suite != MANDATORY_SESSION_SUITE {
+        return Err(MessageError::InvalidField("suite"));
+    }
     let transport_profile = take_text(&mut parameters, "transport_profile")?;
     let candidate_id = take_text(&mut parameters, "candidate_id")?;
     let grants_bytes = take_bytes(&mut parameters, "grants_hash")?;

@@ -16,11 +16,15 @@ use core::fmt;
 use zeroize::ZeroizeOnDrop;
 
 /// RAPP wire version implemented by this module.
-pub const VISIBLE_WIRE_VERSION: (u16, u16, u16) = (26, 9, 13);
-/// Mandatory RAPP 26.9.13 pairing Noise suite.
-pub const MANDATORY_PAIRING_SUITE: &str = "Noise_XXpsk3_25519_ChaChaPoly_SHA256";
-/// Mandatory RAPP 26.9.13 session Noise suite.
-pub const MANDATORY_SESSION_SUITE: &str = "Noise_KK_25519_ChaChaPoly_SHA256";
+pub const VISIBLE_WIRE_VERSION: (u16, u16, u16) = (26, 9, 28);
+/// Mandatory RAPP pairing Noise suite.
+pub const MANDATORY_PAIRING_SUITE: &str = "Noise_XXpsk3_25519_ChaChaPoly_SHA512";
+/// Mandatory RAPP session Noise suite (hybrid post-quantum).
+pub const MANDATORY_SESSION_SUITE: &str = "Noise_KKhfs_25519+MLKEM768_ChaChaPoly_SHA512";
+/// Byte length of an X25519 public or private key.
+pub const X25519_KEY_SIZE: usize = 32;
+/// Byte length of a Noise ChaCha20Poly1305 authentication tag.
+pub const NOISE_TAG_SIZE: usize = 16;
 /// Maximum encoded Noise frame size.
 pub const MAX_FRAME_SIZE: usize = 65_535;
 /// Maximum plaintext carried by one Noise transport message.
@@ -162,7 +166,7 @@ public_identifier!(
 ///
 /// It is non-clonable, always redacted, and zeroized on drop. Only the RAPP
 /// cryptographic layer can borrow its bytes.
-#[derive(ZeroizeOnDrop)]
+#[derive(PartialEq, Eq, ZeroizeOnDrop)]
 pub struct PairingSecret([u8; PAIRING_SECRET_SIZE]);
 
 impl PairingSecret {

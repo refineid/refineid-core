@@ -2,13 +2,13 @@
 
 Status: External-review draft  
 Intended status: Experimental  
-Document version: 26.9.13  
-Supersedes: 26.9.7.70  
-Protocol wire version: 26.9.13  
-Date: 2026-09-13  
+Document version: 26.9.28  
+Supersedes: 26.9.13  
+Protocol wire version: 26.9.28  
+Date: 2026-09-28  
 Change controller: RefineID project  
 Companion model: [RAPP state machine 26.9.13](rapp-state-machine-v26.9.13.yaml)  
-Conformance corpus: [RAPP vectors 26.9.13](vectors/rapp-v26.9.13.json)
+Conformance corpus: [RAPP vectors 26.9.28](vectors/rapp-v26.9.28.json)
 
 ## Abstract
 
@@ -20,13 +20,18 @@ and an identity card communicating with the phone over NFC. The same protocol
 is intended to support macOS, iOS, Android, Windows, Linux, FreeBSD, local
 networks, and an untrusted Internet relay.
 
-RAPP pairs devices through a manually initiated 6-digit numeric pairing code. It then
-uses end-to-end mutually authenticated sessions independently of the selected
-network transport. Every credential operation is typed, explicitly authorized
-on the proxy, bound to one session and operation identifier, and executed at
-most once. RAPP never exposes CAN, PIN, or PUK values to the requester. A card
-rejection of CAN, PIN 1, or PIN 2 immediately terminates the RAPP session and
-prohibits automatic recovery.
+RAPP pairs devices through a manually initiated 6-digit numeric pairing code
+protected by a Password-Authenticated Key Exchange (CPace, draft-irtf-cfrg-cpace-21) that
+provides mathematical immunity to offline dictionary attacks even across an
+untrusted relay. It then uses end-to-end mutually authenticated sessions
+independently of the selected network transport. Every credential operation
+is typed, bound to one session and operation identifier, and executed at
+most once. Routine web authentication (PIN 1) operates seamlessly when
+authorized in hardware platform storage, while Qualified Electronic Signatures
+(PIN 2) enforce conscious authorization with batch signing. RAPP never exposes
+CAN, PIN, or PUK values to the requester. Card lockouts terminate the session
+without automatic recovery, while ordinary human typos are handled
+proportionately without destructive resets.
 
 Network faults that cannot be attributed to the authenticated peer close at
 most the current session. Destruction of a stored pairing requires either an
@@ -351,19 +356,49 @@ allocation.
 The mandatory suite is:
 
 ```text
-Pairing: Noise_XXpsk3_25519_ChaChaPoly_SHA256
-Session: Noise_KK_25519_ChaChaPoly_SHA256
+Pairing: CPACE-RISTR255-SHA512 + Noise_XXpsk3_25519_ChaChaPoly_SHA512
+Session: Noise_KKhfs_25519+MLKEM768_ChaChaPoly_SHA512
 ```
 
-The construction follows the [Noise Protocol Framework, revision
-34](https://noiseprotocol.org/noise.html). X25519 is specified by
-[RFC 7748](https://www.rfc-editor.org/rfc/rfc7748.html), ChaCha20-Poly1305 by
-[RFC 8439](https://www.rfc-editor.org/rfc/rfc8439.html), and HKDF-SHA-256 by
-[RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html).
+Pairing uses the [CPace PAKE protocol](https://datatracker.ietf.org/doc/draft-irtf-cfrg-cpace/)
+(draft-irtf-cfrg-cpace-21, cipher suite `CPACE-RISTR255-SHA512`) over Ristretto255 with SHA-512 to convert a short 6-digit numeric
+pairing code into a mutual 256-bit pre-shared key (`psk3`) with zero offline
+dictionary vulnerability.
 
-The Noise revision currently labels itself official/unstable. Selection of
-this exact construction is therefore provisional and is an explicit external
-review question, not an assertion of production suitability.
+Session transport uses hybrid post-quantum Noise according to the Noise Protocol
+Framework extension for Hybrid Forward Secrecy (HFS):
+`Noise_KKhfs_25519+MLKEM768_ChaChaPoly_SHA512`. It pairs classical Curve25519
+(RFC 7748) Diffie-Hellman with NIST FIPS 203 ML-KEM-768 key encapsulation to
+provide quantum-resistant forward secrecy against Harvest-Now-Decrypt-Later (HNDL)
+adversaries while preserving mutual static key authentication:
+
+```text
+Noise_KKhfs(s, rs):
+  <- s
+  -> s
+  ...
+  -> e, es, ekem, ss
+  <- e, ee, kemct, se
+```
+
+Where:
+- `ekem`: The initiator generates a fresh ephemeral ML-KEM-768 keypair $(pk_E, sk_E)$
+  and transmits the 1,184-byte public key $pk_E$ encrypted with the current cipher state
+  (1,200 bytes total including 16-byte Poly1305 authentication tag).
+- `kemct`: The responder encapsulates a 32-byte shared secret $ss_{kem}$ against $pk_E$
+  to generate a 1,088-byte ciphertext $ct$, encrypts $ct$ with the current cipher state
+  (1,104 bytes total including 16-byte Poly1305 authentication tag), and mixes $ss_{kem}$
+  into the symmetric key schedule via `MixKey(ss_kem)`.
+
+Total handshake message sizes (with empty payloads):
+- Message 1 (Initiator -> Responder): 1,248 bytes (32-byte ephemeral X25519 public key + 1,200-byte encrypted ML-KEM-768 public key + 16-byte Poly1305 empty payload tag).
+- Message 2 (Responder -> Initiator): 1,152 bytes (32-byte ephemeral X25519 public key + 1,104-byte encrypted ML-KEM-768 ciphertext + 16-byte Poly1305 empty payload tag).
+
+The Noise construction follows the [Noise Protocol Framework, revision 34](https://noiseprotocol.org/noise.html).
+X25519 is specified by [RFC 7748](https://www.rfc-editor.org/rfc/rfc7748.html),
+ML-KEM-768 by [NIST FIPS 203](https://doi.org/10.6028/NIST.FIPS.203),
+ChaCha20-Poly1305 by [RFC 8439](https://www.rfc-editor.org/rfc/rfc8439.html),
+and HKDF-SHA-512 by [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html).
 
 ### 8.2 Pair-specific keys
 
@@ -434,9 +469,9 @@ Let `h` be the Noise handshake hash of a completed handshake as defined by the
 Noise framework. Both peers derive, in this order:
 
 ```text
-session_id       = first 16 bytes of SHA-256("RAPP-session-id-v1" || h)
-pair_id          = first 16 bytes of SHA-256("RAPP-pair-id-v1" || h)
-rendezvous_token = first 16 bytes of SHA-256("RAPP-rendezvous-v1" || h)
+session_id       = first 16 bytes of SHA-512("RAPP-session-id-v1" || h)
+pair_id          = first 16 bytes of SHA-512("RAPP-pair-id-v1" || h)
+rendezvous_token = first 16 bytes of SHA-512("RAPP-rendezvous-v1" || h)
 ```
 
 `session_id` is derived from every completed handshake, including the pairing
@@ -504,9 +539,11 @@ or extend an offer's life.
 The pairing code is a 6-digit decimal number (`000000`–`999999`) generated randomly
 by the initiating peer and entered manually on the other peer.
 
-The offer identifier and pairing secret are deterministically derived from the code:
-- `pairing_secret` = `SHA-256("refineid-rapp-pairing-secret-v1:" || code)`
-- `offer_id` = `SHA-256("refineid-rapp-offer-id-v1:" || code)[0..16]`
+To protect against offline dictionary attacks across untrusted relays, the 6-digit
+code is NEVER hashed directly into a public identifier. Instead:
+- `offer_id` is a fresh, cryptographically secure 32-byte random identifier (`bstr .size 32`) generated by the requester.
+- The 6-digit code serves strictly as the human-entered password $P$ in the CPace PAKE protocol (draft-irtf-cfrg-cpace-21, cipher suite `CPACE-RISTR255-SHA512`).
+- The mutual 256-bit `pairing_secret` is derived from the completed CPace exchange over Ristretto255, providing mathematical immunity to offline exhaustive search.
 
 When serialized for programmatic or URI transport, the offer encodes deterministic CBOR using a `rapp:` URI carrying base64url data without padding, as defined by
 [RFC 4648](https://www.rfc-editor.org/rfc/rfc4648.html). Its logical content is:
@@ -514,9 +551,9 @@ When serialized for programmatic or URI transport, the offer encodes determinist
 ```cddl
 pairing-offer = {
   "scheme": "rapp",
-  "version": [uint, uint],
-  "offer_id": bstr .size 16,
-  "pairing_secret": bstr .size 32,
+  "version": [uint, uint, uint],
+  "offer_id": bstr .size 32,
+  ? "pairing_secret": bstr .size 32, ; present only in direct out-of-band QR transport
   "suites": [1* tstr],
   "profiles": [1* tstr],
   "transports": [1* transport-candidate],
@@ -547,33 +584,36 @@ its use as the handshake pre-shared key ends.
 3. The proxy selects exactly one offered transport candidate and connects.
    Logical Noise roles remain requester-initiator and proxy-responder
    regardless of which side opened the underlying socket.
-4. The peers run the pairing Noise handshake with `pairing_secret` (derived from the code) as the
+4. The peers execute the CPace exchange (draft-irtf-cfrg-cpace-21) using the 6-digit code as password $P$
+   and domain string `"RAPP-cpace-v1"`, establishing the mutual 256-bit `pairing_secret`.
+   An observer or untrusted relay sees only uniform curve points and cannot verify guesses offline.
+5. The peers then run the pairing Noise handshake with `pairing_secret` as the
    `psk3` value, the prologue of Section 8.3, and empty handshake payloads.
-5. When the handshake completes, both peers derive the channel identifiers of
+6. When the handshake completes, both peers derive the channel identifiers of
    Section 8.5, and both destroy the pairing secret. The requester hides the
    pairing code and stops accepting further candidates for this offer.
-6. Both peers exchange `pairing.hello`: the negotiated-parameter echo, a
+7. Both peers exchange `pairing.hello`: the negotiated-parameter echo, a
    display name, a platform description, and the requester's requested
    profiles. Names are labels, not identities.
-7. Both devices display the peer and the proposed grants. The proxy user
+8. Both devices display the peer and the proposed grants. The proxy user
    selects the granted profile set; both devices then display it with an
    explicit confirmation control and exchange `pairing.confirm`. The two
    granted sets MUST be equal.
-8. Only after both confirmations does each endpoint atomically store the
+9. Only after both confirmations does each endpoint atomically store the
    pair-specific keys, `pair_id`, granted profiles, `grants_hash`, and local
    metadata. The pairing channel is then closed; operations use fresh
    sessions.
-9. The requester invalidates the offer on the first completed authenticated
-   handshake, user cancellation, or local monotonic expiry — and on nothing
-   else.
+10. The requester invalidates the offer on the first completed authenticated
+    handshake, user cancellation, or local monotonic expiry — and on nothing
+    else.
 
 A connection attempt that fails the handshake — including any attempt by a
 party that does not know `pairing_secret` — is discarded without consuming
 the offer: the requester returns to `offer_active` and continues to accept
-candidates until the offer expires or is cancelled. The 256-bit secret makes
-exhaustive guessing infeasible; the requester processes at most one handshake
-at a time per offer and MAY rate-limit attempts. A denial or abort during
-confirmation invalidates the offer and requires a new manual offer.
+candidates until the offer expires or is cancelled. The CPace PAKE makes
+offline dictionary attacks mathematically impossible; the requester processes
+at most one handshake at a time per offer with active backoff to bound online attempts.
+A denial or abort during confirmation invalidates the offer and requires a new manual offer.
 
 ### 9.4 Pairing messages
 
@@ -641,8 +681,8 @@ session.
    trial-processing option, because the requester sends the first handshake
    message; its transport profile MUST indicate the pairing before the
    handshake begins.
-3. The peers run the mandatory `Noise_KK` handshake with their pair-specific
-   static keys, fresh ephemeral keys, the session prologue of Section 8.3, and
+3. The peers run the mandatory `Noise_KKhfs` handshake with their pair-specific
+   static keys, fresh ephemeral keys (X25519 + ML-KEM-768), the session prologue of Section 8.3, and
    empty handshake payloads.
 4. Both peers derive `session_id` (Section 8.5) and each sends an encrypted
    `session.ready`:
@@ -987,6 +1027,7 @@ The initial action registry is closed:
 | `read_certificate` | key-matching profile, below | none |
 | `browser_authenticate` | `fi.refineid.authentication.v1` | PIN 1 verify and private-key operation |
 | `sign_document` | `fi.refineid.document-signing.v1` | PIN 2 verify and private-key operation |
+| `batch_sign_documents` | `fi.refineid.document-signing.v1` | PIN 2 verify and batch private-key operations |
 
 `inspect_card` and `read_identity` carry empty context and payload maps.
 `read_certificate` carries exactly one payload field, `kind`, whose registered
@@ -1009,6 +1050,20 @@ three reads are safe reads and omit prepare and commit (Section 12.2).
 `sign_document` under `fi.refineid.document-signing.v1` has the same payload fields
 and carries bounded non-empty `document_name` in its context map instead of
 `origin`. Documents and unhashed browser input MUST NOT cross RAPP.
+
+`batch_sign_documents` under `fi.refineid.document-signing.v1` enables signing a
+declared set of documents under a single human authorization and one PIN 2 entry:
+
+| Map | Field | Type | Meaning |
+| --- | --- | --- | --- |
+| context | `document_names` | [1* tstr] | list of document display names in the batch |
+| payload | `key_profile` | registered text | expected signature-certificate key profile |
+| payload | `algorithm` | registered text | exact signature algorithm |
+| payload | `digests` | [1* bstr] | ordered list of already-hashed document digests |
+
+The number of items in `document_names` and `digests` MUST be equal and MUST NOT
+exceed 64 items. The proxy displays the complete document list, collects PIN 2
+once, and transmits the sequential signature commands to the card.
 
 The initial `key_profile` registry is closed:
 
@@ -1069,24 +1124,24 @@ No retry check makes a credential command safe to repeat. Status reads,
 credential command construction, and physical transmission remain separate
 typed boundaries.
 
-### 13.4 Credential rejection terminates RAPP
+### 13.4 Credential error and lockout handling
 
-If the credential holder reports that PIN 1, PIN 2, or the CAN is bad or
-rejected — during safe prerequisite reads, secure-channel establishment, or
-the consequential command — it is an indication of a critical security violation
-or corrupted credential state. The authorization proxy device MUST:
+RAPP distinguishes between an ordinary human typo and a permanent card lockout:
 
-1. make no further card transmission;
-2. mark the active operation `credential_rejected`;
-3. immediately drop and permanently close all active RAPP connections and sessions;
-4. durably destroy all pairing keys and write tombstones for all pairings on the
-   device, permanently preventing reconnect until explicitly re-paired;
-5. purge all stored local identities, credentials, cached PINs, CANs, and
-   card-derived state;
-6. reset the authorization proxy software on the device to an initial "factory reset" state;
-7. send only the profile's bounded `credential_rejected` result to the active
-   peer if the authenticated channel is still usable prior to closing; and
-8. move the RAPP session immediately to `closing`.
+1. **Typo Handling (Retries Remain):** If the card reports that PIN 1, PIN 2, or
+   CAN was rejected (`SW 63 Cx`), and the remaining retry count is greater
+   than zero, the proxy returns `operation.result` with status `rejected` and
+   error `invalid_credential`, reporting the remaining retry count. The current
+   operation terminates, but stored pairings and vault keys REMAIN INTACT. A
+   mistyped PIN MUST NOT destroy pairings or reset application software.
+2. **Permanent Card Lockout (Zero Retries Remain):** If a counter reaches zero
+   (card blocked/locked) or verified hardware tampering is detected:
+   - Make no further card transmissions;
+   - Mark the active operation `credential_rejected`;
+   - Close active sessions immediately;
+   - Send the profile's bounded `credential_rejected` result to the active
+     peer if the authenticated channel is still usable prior to closing;
+   - Move the RAPP session immediately to `closing`.
 
 The authenticated requester that receives `credential_rejected` MUST also
 durably destroy its pairing keys and write a tombstone before reporting the
@@ -1348,7 +1403,7 @@ The initial transport profile registry is:
 | `apple-peer-v1` | Apple-native nearby connectivity | defined; implemented |
 | `fi.refineid.stream.v1` | one reliable ordered byte stream, initially TCP | defined in Section 16.1; implemented |
 | `local-quic-v1` | local QUIC | reserved design target |
-| `relay-websocket-v1` | untrusted Internet relay | defined in [rapp-relay-websocket-v1.md](rapp-relay-websocket-v1.md); folds into Section 16.2 at rollup |
+| `relay-websocket-v1` | untrusted Internet relay | defined in Section 16.2; implemented |
 
 A future ICE-based direct profile using
 [RFC 8445](https://www.rfc-editor.org/rfc/rfc8445.html) is anticipated but
@@ -1423,10 +1478,10 @@ closes and no stored state changes.
 
 The preamble is unauthenticated routing metadata, exactly like a relay token
 (Section 17). Possession of a token lets an attacker elicit the first
-`Noise_KK` handshake message, which contains a fresh ephemeral public key and
-no identity, and lets a network observer link the connection to an
-unidentified recurring pairing; it enables nothing else. The requester
-processes one inbound connection's handshake at a time and MAY rate-limit
+`Noise_KKhfs` handshake message, which contains a fresh ephemeral public key,
+encrypted ML-KEM-768 public key, and no identity, and lets a network observer
+link the connection to an unidentified recurring pairing; it enables nothing else.
+The requester processes one inbound connection's handshake at a time and MAY rate-limit
 connection attempts.
 
 **Strictness.** The profile inherits the protocol's single-connection
@@ -1436,6 +1491,67 @@ every anomaly fails the connection closed. A requester whose listener address
 has changed since pairing is unreachable until the user pairs anew or a
 reviewed extension defines candidate refresh; the profile deliberately
 prefers breakage to silent endpoint changes.
+
+### 16.2 The relay profile: `relay-websocket-v1`
+
+`relay-websocket-v1` carries RAPP frames between a requester and a proxy that cannot reach each other directly. Both peers open a WebSocket leg to an untrusted relay; the relay joins the two legs by a pair-specific token and then forwards opaque frames. It enables RAPP from browser environments (extensions, web applications) where opening a direct listener is disallowed.
+
+**Underlay.** The underlay is WebSocket ([RFC 6455](https://www.rfc-editor.org/rfc/rfc6455.html)) secured with TLS (`wss://`). TLS provides hop-by-hop transport encryption and web browser mixed-content compliance, but contributes no RAPP end-to-end security (Section 5). One RAPP frame travels as exactly one WebSocket binary message (maximum `NOISE_MAX_MESSAGE` = 65,535 bytes). WebSocket text messages are malformed input.
+
+**Candidate parameters.** The offer's `transport-candidate.parameters` map for this profile is:
+
+```cddl
+relay-parameters = {
+  "relay_url": tstr    ; wss:// URL of the relay, no query or fragment
+}
+```
+
+`candidate_id` is chosen by the requester per offer (Section 9.2) and stored with the pairing. The proxy stores the selected candidate, including `relay_url`, at pairing confirmation and dials it for later sessions.
+
+**Leg lifecycle and framing.**
+Each peer opens one WebSocket leg to `relay_url`:
+1. Sends exactly one join frame as its first binary message, the deterministic-CBOR encoding of:
+   ```cddl
+   relay-join = [
+     "RAPP-relay-v1",
+     tstr,    ; purpose: "pairing" / "session"
+     tstr,    ; role: "requester" / "proxy"
+     bstr     ; purpose "pairing": offer_id (32 bytes)
+              ; purpose "session": rendezvous_token, Section 8.5 (16 bytes)
+   ]
+   ```
+2. Waits for the joined signal from the relay, the binary message carrying the deterministic-CBOR encoding of `["RAPP-relay-joined-v1"]`. A leg MUST NOT send anything after its join frame until it has received the joined signal.
+3. After the joined signal, the peers exchange protocol frames:
+   - For purpose `pairing`: The peers first execute the CPace PAKE exchange ([draft-irtf-cfrg-cpace-21](https://datatracker.ietf.org/doc/draft-irtf-cfrg-cpace/), cipher suite `CPACE-RISTR255-SHA512`) using the 6-digit pairing code as password $P$ and domain string `"RAPP-cpace-v1"`, deriving the mutual 256-bit `pairing_secret`. The peers then execute the `Noise_XXpsk3` pairing handshake (Section 9.3) with `pairing_secret` as `psk3`, the Section 8.3 prologue naming `relay-websocket-v1`, and empty handshake payloads.
+   - For purpose `session`: The peers execute the `Noise_KKhfs` session handshake (Section 10) with the prologue naming `relay-websocket-v1`.
+4. On close or disconnect of either leg, the relay immediately closes the counterpart leg and purges all ephemeral state for the match. Logical Noise roles are unchanged: the requester initiates every handshake over the joined pipe, regardless of which leg connected first.
+
+**Traffic analysis mitigation (Frame padding).**
+Because the untrusted relay observes frame lengths and message timing, implementations SHOULD pad transmitted RAPP binary frames to fixed bucket sizes (e.g. nearest power-of-two or 256-byte bucket boundaries up to `NOISE_MAX_MESSAGE`) using CBOR-level padding or trailing zero bytes inside the Noise AEAD payload.
+
+**Manual-code pairing template.**
+For pairing without QR codes or URI transport over the relay, deployments use the standard 6-digit code entry with the following fixed offer template:
+
+```cddl
+relay-offer-template = {
+  "scheme": "rapp",
+  "version": [uint, uint, uint],   ; [26, 9, 28] wire version triple
+  "offer_id": bstr .size 32,       ; fresh 32-byte cryptographically secure random token
+  "suites": ["CPACE-RISTR255-SHA512+Noise_XXpsk3_25519_ChaChaPoly_SHA512"],
+  "profiles": [
+    "fi.refineid.authentication.v1",
+    "fi.refineid.document-signing.v1"
+  ],
+  "transports": [{
+    "profile": "relay-websocket-v1",
+    "candidate_id": "relay",
+    "parameters": { "relay_url": tstr }  ; deployment default, both peers
+  }],
+  "offer_ttl_ms": 120000
+}
+```
+
+Because CPace PAKE authenticates the exchange over the joined leg, `offer_id` is an independent uniform 32-byte random token rather than a hash of the 6-digit code. The untrusted relay learns zero information about the 6-digit code.
 
 ## 17. Rendezvous relay
 
@@ -1550,9 +1666,11 @@ machine-readable model:
 | `INV-13` | There is no automatic downgrade or mid-operation fallback. |
 | `INV-14` | Session keys and credential buffers are destroyed on close. |
 | `INV-15` | Local policy may be stricter than negotiated policy, never weaker. |
-| `INV-16` | Invalid CAN, PIN 1, or PIN 2 closes the RAPP session. |
+| `INV-16` | Card lockout (zero retries remaining) immediately revokes pairing and closes session. Typo rejections with retries remaining fail the active operation only, preserving pairings. |
 | `INV-17` | Credential rejection never automatically reconnects or repeats. |
 | `INV-18` | Unauthenticated or unattributable input never revokes a stored pairing. |
+| `INV-19` | Relay pairing exchanges use balanced PAKE (CPace) providing mathematical immunity against offline dictionary attacks. |
+| `INV-20` | Document batch signing requires single explicit user authorization per batch without silent auto-approval windows. |
 
 ## 22. Conformance and verification
 
@@ -1600,7 +1718,7 @@ Conformance evidence includes:
 - production-artifact inspection proving unsafe diagnostics are absent.
 
 The machine-readable corpus at
-`vectors/rapp-v26.9.13.json` fixes the deterministic CBOR,
+`vectors/rapp-v26.9.28.json` fixes the deterministic CBOR,
 envelope-rejection, sequence, downgrade, grant, hash, and mandatory Noise
 XXpsk3/KK known-answer vectors for this document version. Fields prefixed
 `test_only_` are public deterministic test material and MUST NOT be used as
@@ -1697,6 +1815,7 @@ An external reviewer should be able to answer:
   34](https://noiseprotocol.org/noise.html).
 - Langley, A., Hamburg, M., and S. Turner, [Elliptic Curves for
   Security](https://www.rfc-editor.org/rfc/rfc7748.html), RFC 7748.
+- Abdalla, M., Haase, B., and J. Hesse, [CPace, a balanced composable PAKE](https://datatracker.ietf.org/doc/draft-irtf-cfrg-cpace/), draft-irtf-cfrg-cpace-21.
 - Nir, Y., and A. Langley, [ChaCha20 and Poly1305 for IETF
   Protocols](https://www.rfc-editor.org/rfc/rfc8439.html), RFC 8439.
 - Krawczyk, H., and P. Eronen, [HMAC-based Extract-and-Expand Key Derivation

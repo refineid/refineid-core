@@ -444,7 +444,7 @@ impl fmt::Debug for PairingConfirmation {
     }
 }
 
-const fn handshake_role(role: EndpointRole) -> HandshakeRole {
+pub(crate) const fn handshake_role(role: EndpointRole) -> HandshakeRole {
     match role {
         EndpointRole::Requester => HandshakeRole::Initiator,
         EndpointRole::Proxy => HandshakeRole::Responder,

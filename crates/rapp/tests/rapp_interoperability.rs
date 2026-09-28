@@ -17,14 +17,14 @@
 use std::collections::BTreeMap;
 
 use refineid_rapp::{
-    AuthenticatedViolation, BinaryFrame, CardOperation, EndpointError, EndpointRole,
+    AuthenticatedViolation, BinaryFrame, CardOperation, CpaceState, EndpointError, EndpointRole,
     EstablishedEndpoint, ExplicitUserIntent, HandshakeChannel, HandshakeRole,
     MANDATORY_PAIRING_SUITE, MessageType, OfferId, OperationId, OperationRequest, OperationState,
     PairRecord, PairStore, PairStoreError, PairTombstone, PairingHandshake, PairingOffer,
     PairingOfferUri, PairingSecret, PairingState, ProfileName, RappState, ReceiveOutcome,
     SecureChannel, SessionHandshake, SessionHandshakeParameters, SessionParameters,
     SessionReadyMessage, SessionState, TransportCandidate, TypedMessage, compute_grants_hash,
-    generate_pair_key_material,
+    derive_manual_offer_id, generate_pair_key_material,
 };
 
 #[derive(Default)]
@@ -428,5 +428,146 @@ fn credential_rejection_durably_revokes_the_pair() {
         outcome
             .actions
             .contains(&refineid_rapp::Action::DestroyPairKeys)
+    );
+}
+
+#[test]
+fn cpace_code_pairing_and_fresh_session_interoperate_end_to_end() {
+    let pairing_code = "789 123";
+    let offer_id = derive_manual_offer_id(pairing_code).expect("valid code");
+
+    // Phase 1: CPace PAKE exchange over the transport
+    let alice_cpace = CpaceState::new(
+        HandshakeRole::Initiator,
+        pairing_code,
+        &offer_id,
+        &[0x33; 64],
+    )
+    .expect("alice cpace init succeeds");
+    let bob_cpace = CpaceState::new(
+        HandshakeRole::Responder,
+        pairing_code,
+        &offer_id,
+        &[0x44; 64],
+    )
+    .expect("bob cpace init succeeds");
+
+    let alice_cpace_frame = alice_cpace
+        .write_message()
+        .expect("alice writes cpace frame");
+    let bob_cpace_frame = bob_cpace.write_message().expect("bob writes cpace frame");
+
+    let alice_secret = alice_cpace
+        .read_message(&bob_cpace_frame)
+        .expect("alice derives secret");
+    let bob_secret = bob_cpace
+        .read_message(&alice_cpace_frame)
+        .expect("bob derives secret");
+
+    assert_eq!(alice_secret, bob_secret);
+
+    // Phase 2: Construct offers with the derived pairing secret
+    let profiles = vec![
+        ProfileName::CardStatus.as_str().to_owned(),
+        ProfileName::Authentication.as_str().to_owned(),
+    ];
+    let requester_offer = PairingOffer::reconstruct(
+        offer_id,
+        alice_secret,
+        vec![MANDATORY_PAIRING_SUITE.to_owned()],
+        profiles.clone(),
+        vec![TransportCandidate {
+            profile: "local-quic-v1".into(),
+            candidate_id: "candidate-1".into(),
+            parameters: BTreeMap::new(),
+        }],
+        60_000,
+    )
+    .expect("requester offer is valid");
+
+    let proxy_offer = PairingOffer::reconstruct(
+        offer_id,
+        bob_secret,
+        vec![MANDATORY_PAIRING_SUITE.to_owned()],
+        profiles,
+        vec![TransportCandidate {
+            profile: "local-quic-v1".into(),
+            candidate_id: "candidate-1".into(),
+            parameters: BTreeMap::new(),
+        }],
+        60_000,
+    )
+    .expect("proxy offer is valid");
+
+    // Phase 3: Noise XXpsk3 Handshake
+    let mut requester = PairingHandshake::begin(
+        EndpointRole::Requester,
+        requester_offer,
+        "candidate-1",
+        generate_pair_key_material().expect("requester key generation succeeds"),
+    )
+    .expect("requester pairing starts");
+    let mut proxy = PairingHandshake::begin(
+        EndpointRole::Proxy,
+        proxy_offer,
+        "candidate-1",
+        generate_pair_key_material().expect("proxy key generation succeeds"),
+    )
+    .expect("proxy pairing starts");
+
+    let msg1 = requester.write_message().expect("msg1 writes");
+    proxy.read_message(&msg1).expect("msg1 reads");
+
+    let msg2 = proxy.write_message().expect("msg2 writes");
+    requester.read_message(&msg2).expect("msg2 reads");
+
+    let msg3 = requester.write_message().expect("msg3 writes");
+    proxy.read_message(&msg3).expect("msg3 reads");
+
+    assert!(requester.is_complete());
+    assert!(proxy.is_complete());
+
+    // Phase 4: Confirmation
+    let mut requester_confirm = requester.into_confirmation().expect("requester confirms");
+    let mut proxy_confirm = proxy.into_confirmation().expect("proxy confirms");
+
+    let req_hello = requester_confirm
+        .send_hello("desktop".into(), "macos".into())
+        .expect("requester hello sends");
+    proxy_confirm
+        .receive_hello(&req_hello, 100)
+        .expect("proxy receives hello");
+
+    let proxy_hello = proxy_confirm
+        .send_hello("phone".into(), "ios".into())
+        .expect("proxy hello sends");
+    requester_confirm
+        .receive_hello(&proxy_hello, 100)
+        .expect("requester receives hello");
+
+    let grants = vec![ProfileName::Authentication];
+    let proxy_confirm_msg = proxy_confirm
+        .send_confirmation(grants.clone())
+        .expect("proxy confirms");
+    requester_confirm
+        .receive_confirmation(&proxy_confirm_msg, 101)
+        .expect("requester receives confirm");
+
+    let req_confirm_msg = requester_confirm
+        .send_confirmation(grants)
+        .expect("requester confirms");
+    proxy_confirm
+        .receive_confirmation(&req_confirm_msg, 101)
+        .expect("proxy receives confirm");
+
+    let requester_record = requester_confirm
+        .into_pair_record(200)
+        .expect("requester finishes");
+    let proxy_record = proxy_confirm.into_pair_record(200).expect("proxy finishes");
+
+    assert_eq!(requester_record.pair_id(), proxy_record.pair_id());
+    assert_eq!(
+        requester_record.rendezvous_token(),
+        proxy_record.rendezvous_token()
     );
 }

@@ -261,7 +261,7 @@ fn ccid_chain_begin_is_not_a_complete_apdu() {
         &mut e,
         Operation::TransferBlock {
             b_wi: ZERO,
-            w_level_parameter: u16::from(ZERO),
+            w_level_parameter: W_LEVEL_NONE,
             data: Zeroizing::new(b"synthetic".to_vec()),
         },
     );
@@ -284,7 +284,7 @@ fn oversized_block_is_not_sent_to_reader() {
         &mut e,
         Operation::TransferBlock {
             b_wi: ZERO,
-            w_level_parameter: u16::from(ZERO),
+            w_level_parameter: W_LEVEL_NONE,
             data,
         },
     );

@@ -143,10 +143,9 @@ impl CcidEventPoller {
                 let is_present = notification.is_card_present(slot_idx);
                 let changed = notification.has_slot_changed(slot_idx);
                 let idx = usize::from(slot_idx);
-                if idx >= self.slot_states.len() {
-                    self.slot_states.resize(idx + 1, SlotState::default());
-                }
-                let state = &mut self.slot_states[idx];
+                let Some(state) = self.slot_states.get_mut(idx) else {
+                    continue;
+                };
                 if changed || state.card_present != is_present {
                     let prev_present = state.card_present;
                     state.card_present = is_present;
@@ -188,7 +187,7 @@ impl CcidEventPoller {
             return None;
         }
         let idx = usize::from(slot);
-        let state = &mut self.slot_states[idx];
+        let state = self.slot_states.get_mut(idx)?;
         let is_present = card_status == CardStatus::Active || card_status == CardStatus::Inactive;
         let prev_present = state.card_present;
         let prev_status = state.card_status;

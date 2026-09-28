@@ -36,7 +36,7 @@ use zeroize::Zeroizing;
 /// Default timeout for CCID engine operations in milliseconds.
 pub const DEFAULT_ENGINE_TIMEOUT_MS: u64 = 5000;
 
-/// Chaining parameter: unfragmented block or no chaining parameter (CCID Rev 1.1 §6.1.4 Table 6-4).
+/// Chaining parameter: unfragmented block or default level parameter (USB-IF CCID Rev 1.1 §6.1.4).
 pub const W_LEVEL_NONE: u16 = 0x0000;
 /// Chaining parameter: command APDU begins and continues in next block (CCID Rev 1.1 §6.1.4 Table 6-4).
 pub const W_LEVEL_BEGIN: u16 = 0x0001;
@@ -1463,7 +1463,7 @@ mod tests {
                 id: op_id,
                 op: Operation::TransferBlock {
                     b_wi: 0,
-                    w_level_parameter: 0,
+                    w_level_parameter: W_LEVEL_NONE,
                     data: Zeroizing::new(apdu.to_vec()),
                 },
             },
@@ -1506,7 +1506,7 @@ mod tests {
                 id: op_id,
                 op: Operation::TransferBlock {
                     b_wi: 0,
-                    w_level_parameter: 0,
+                    w_level_parameter: W_LEVEL_NONE,
                     data: Zeroizing::new(vec![0x00, 0x84, 0x00, 0x00, 0x08]),
                 },
             },
@@ -1571,7 +1571,7 @@ mod tests {
                 id: op_id,
                 op: Operation::TransferBlock {
                     b_wi: 0,
-                    w_level_parameter: 0,
+                    w_level_parameter: W_LEVEL_NONE,
                     data: Zeroizing::new(vec![0x00, 0x20, 0x00, 0x80]),
                 },
             },
@@ -1745,7 +1745,7 @@ mod tests {
                 id: op_id,
                 op: Operation::TransferBlock {
                     b_wi: 0,
-                    w_level_parameter: 0,
+                    w_level_parameter: W_LEVEL_NONE,
                     data: Zeroizing::new(vec![0x00, 0x84, 0x00, 0x00, 0x08]),
                 },
             },
@@ -1806,7 +1806,7 @@ mod tests {
                 id: op_id,
                 op: Operation::TransferBlock {
                     b_wi: 0,
-                    w_level_parameter: 0,
+                    w_level_parameter: W_LEVEL_NONE,
                     data: Zeroizing::new(vec![0x00, 0x84, 0x00, 0x00, 0x08]),
                 },
             },
@@ -1855,7 +1855,7 @@ mod tests {
                 id: op_id,
                 op: Operation::TransferBlock {
                     b_wi: 0,
-                    w_level_parameter: 0,
+                    w_level_parameter: W_LEVEL_NONE,
                     data: Zeroizing::new(vec![0x00, 0x84, 0x00, 0x00, 0x08]),
                 },
             },

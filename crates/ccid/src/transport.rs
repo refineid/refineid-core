@@ -53,7 +53,7 @@ const DEFAULT_TRANSPORT_TIMEOUT_MS: u32 = 5000;
 /// Default waiting integer for direct commands (0 = use reader/card default).
 const DEFAULT_B_WI: u8 = 0;
 /// Default level parameter for unfragmented direct commands (0 = complete command).
-const DEFAULT_W_LEVEL_PARAMETER: u16 = 0;
+const DEFAULT_W_LEVEL_PARAMETER: u16 = crate::engine::W_LEVEL_NONE;
 /// Length of ISO 7816-4 status word bytes (SW1, SW2).
 const STATUS_BYTES_LEN: usize = 2;
 
@@ -671,8 +671,7 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
                     ));
                 }
                 combined.extend_from_slice(chain_body);
-                chained_sw1 = chain_sw[0];
-                chained_sw2 = chain_sw[1];
+                [chained_sw1, chained_sw2] = *chain_sw;
                 if chained_sw1 == SW1_BYTES_AVAILABLE {
                     consecutive_wrong_le = 0;
                     if !progressed {

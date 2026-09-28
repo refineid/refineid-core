@@ -407,7 +407,7 @@ unsafe extern "C" fn c_get_slot_info(slot_id: CkSlotId, info: CkSlotInfoPtr) -> 
         });
     let firmware_version = hardware_version;
     let value = CkSlotInfo {
-        slot_description: padded_field(slot.reader_name()),
+        slot_description: padded_field(&slot.display_name()),
         manufacturer_id: padded_field(&manufacturer),
         flags,
         hardware_version,
@@ -438,7 +438,7 @@ unsafe extern "C" fn c_get_token_info(slot_id: CkSlotId, info: CkTokenInfoPtr) -
         return CKR_SLOT_ID_INVALID;
     };
     let rv = if slot.card_present() {
-        let reader_name = slot.reader_name().to_owned();
+        let kind = slot.kind().clone();
         let serial = match module.ensure_token(slot_id) {
             Ok(objects) => objects.token_serial().to_owned(),
             Err(error) => {
@@ -447,14 +447,14 @@ unsafe extern "C" fn c_get_token_info(slot_id: CkSlotId, info: CkTokenInfoPtr) -
             }
         };
         drop(guard);
-        let pin1_status = match crate::token::card_pin1_status(&reader_name) {
+        let pin1_status = match crate::token::card_pin1_status(&kind) {
             Ok(status) => status,
             Err(error) => {
                 diag!("C_GetTokenInfo slot={slot_id} auth_status error={error:#06x}");
                 return error;
             }
         };
-        let is_remote = reader_name.starts_with("rapp:");
+        let is_remote = kind.is_remote();
         // SAFETY: caller guarantees info is a writable CK_TOKEN_INFO.
         unsafe {
             info.write(token_info_value(&serial, pin1_status, is_remote));
@@ -801,12 +801,14 @@ unsafe extern "C" fn c_login(
         return CKR_SESSION_HANDLE_INVALID;
     };
     let slot_id = session_ref.slot_id();
-    let Some(reader_name) = module.reader_name(slot_id) else {
+    let Some(kind) = module.slot_kind(slot_id).cloned() else {
         return CKR_DEVICE_ERROR;
     };
-    if reader_name.starts_with("rapp:") {
-        // Protected authentication path: PIN1 is never typed on or transmitted by this computer.
-        // The mobile device holds credentials in protected on-device storage.
+    // Protected authentication path: PIN1 is never typed on or
+    // transmitted by this computer; the mobile device holds credentials
+    // in protected on-device storage. Reached only for a slot admitted
+    // from a vault pairing record.
+    if kind.is_remote() {
         module.set_remote_logged_in(slot_id, true);
         diag!("C_Login remote reader session={session} logged in via protected auth path");
         return CKR_OK;
@@ -849,7 +851,7 @@ unsafe extern "C" fn c_login(
         Err(error) => return error,
     };
     drop(guard);
-    let rv = match crate::token::card_login(&reader_name, &pin_cache, pin1) {
+    let rv = match crate::token::card_login(&kind, &pin_cache, pin1) {
         Ok(()) => CKR_OK,
         Err(error) => error,
     };
@@ -1287,7 +1289,7 @@ unsafe extern "C" fn c_sign(
         }
         return CKR_BUFFER_TOO_SMALL;
     }
-    let Some(reader_name) = module.reader_name(slot_id) else {
+    let Some(kind) = module.slot_kind(slot_id).cloned() else {
         clear_sign(module, session);
         return CKR_DEVICE_ERROR;
     };
@@ -1312,7 +1314,7 @@ unsafe extern "C" fn c_sign(
         unsafe { core::slice::from_raw_parts(data, input_len) }.to_vec()
     };
     diag!("C_Sign session={session} data_len={input_len}");
-    let outcome = crate::token::card_sign(&reader_name, &pin_cache, mechanism, &input, None);
+    let outcome = crate::token::card_sign(&kind, &pin_cache, mechanism, &input, None);
     let rv = match outcome {
         Ok(bytes) => {
             // The module lock was dropped across the card round trip,
@@ -1411,7 +1413,7 @@ unsafe extern "C" fn c_set_pin(
         return CKR_SESSION_HANDLE_INVALID;
     };
     let slot_id = session_ref.slot_id();
-    let Some(reader_name) = module.reader_name(slot_id) else {
+    let Some(kind) = module.slot_kind(slot_id).cloned() else {
         return CKR_DEVICE_ERROR;
     };
     // Invalidate the cached login PIN1 *before* the card round trip.
@@ -1425,13 +1427,15 @@ unsafe extern "C" fn c_set_pin(
     // C_Login with the new PIN, so the module never *assumes* a PIN
     // it has not seen the card accept via a real VERIFY.
     module.logout(slot_id);
-    if reader_name.starts_with("rapp:") {
+    // PIN1 for a paired device lives in that device's protected
+    // storage; this computer has no PIN1 to change.
+    let Some(reader) = kind.local_reader().cloned() else {
         return CKR_FUNCTION_NOT_SUPPORTED;
-    }
+    };
     // Drop the lock before card IO (an unrelated PKCS#11 call must
     // not block on the card round trip).
     drop(guard);
-    if let Err(err) = crate::token::card_change_pin1(&ReaderId::new(reader_name), current, new) {
+    if let Err(err) = crate::token::card_change_pin1(&reader, current, new) {
         return err;
     }
     CKR_OK

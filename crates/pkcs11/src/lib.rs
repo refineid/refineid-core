@@ -65,6 +65,7 @@ mod diag;
 pub mod pin;
 pub mod pin_cache;
 mod sign;
+mod slot_kind;
 mod state;
 mod token;
 

@@ -50,6 +50,7 @@ use refineid_pkcs15::{
 
 use crate::pin::PinBytes;
 use crate::pin_cache::PinSafetyCache;
+use crate::slot_kind::{RemoteSlotId, SlotKind};
 
 #[cfg(feature = "pin-change")]
 use crate::ck::CKR_PIN_LEN_RANGE;
@@ -1095,11 +1096,10 @@ fn read_optional_ca_cert(card: &mut PcscCard, slot: CertSlot) -> Option<OwnedCer
     clippy::redundant_pub_crate,
     reason = "private root module helper is used by sibling state module; plain pub would violate the public-surface typing grep"
 )]
-pub(super) fn build_token_objects(reader_name: &str) -> Result<TokenObjects, CkRv> {
+pub(super) fn build_token_objects(reader: &ReaderId) -> Result<TokenObjects, CkRv> {
     let backend = PcscBackend;
-    let reader = ReaderId::new(reader_name.to_owned());
     let mut card = backend
-        .open_session(&reader, ReaderAccessCap::Read)
+        .open_session(reader, ReaderAccessCap::Read)
         .map_err(|_open_err| CKR_DEVICE_ERROR)?;
     let token_info = card.read_token_info().ok();
     let serial = token_info
@@ -1163,14 +1163,16 @@ pub(super) fn build_token_objects(reader_name: &str) -> Result<TokenObjects, CkR
     clippy::redundant_pub_crate,
     reason = "private root module helper is used by sibling api module; plain pub would violate the public-surface typing grep"
 )]
-pub(super) fn card_pin1_status(reader_name: &str) -> Result<PinStatus, CkRv> {
-    if reader_name.starts_with("rapp:") {
+pub(super) fn card_pin1_status(kind: &SlotKind) -> Result<PinStatus, CkRv> {
+    // A remote reader reports its own PIN1 state over an authenticated
+    // pairing, and this computer has no card to ask. Reaching this arm
+    // requires a vault-proven pairing, not a reader name.
+    let Some(reader) = kind.local_reader() else {
         return Ok(PinStatus::Verified);
-    }
+    };
     let backend = PcscBackend;
-    let reader = ReaderId::new(reader_name.to_owned());
     let mut card = backend
-        .open_session(&reader, ReaderAccessCap::Read)
+        .open_session(reader, ReaderAccessCap::Read)
         .map_err(|_open_err| CKR_DEVICE_ERROR)?;
     card.select_pkcs15_application()
         .map_err(|_select_err| CKR_DEVICE_ERROR)?;
@@ -1195,13 +1197,13 @@ pub(super) fn card_pin1_status(reader_name: &str) -> Result<PinStatus, CkRv> {
     reason = "private root module helper is used by sibling api module; plain pub would violate the public-surface typing grep"
 )]
 pub(super) fn card_sign(
-    reader_name: &str,
+    kind: &SlotKind,
     pin_cache: &Arc<Mutex<PinSafetyCache>>,
     mechanism: Mechanism,
     input: &[u8],
     origin: Option<&str>,
 ) -> Result<Vec<u8>, CkRv> {
-    if let Some(hex_id) = reader_name.strip_prefix("rapp:") {
+    if let Some(pair_id) = kind.remote_pair_id() {
         let env_origin;
         let effective_origin = if let Some(o) =
             origin.filter(|o| !o.trim().is_empty() && o.len() <= 512)
@@ -1219,17 +1221,19 @@ pub(super) fn card_sign(
                 return Err(CKR_ARGUMENTS_BAD);
             }
         };
-        return remote_card_sign(hex_id, effective_origin, mechanism, input);
+        return remote_card_sign(pair_id, effective_origin, mechanism, input);
     }
     let backend = PcscBackend;
-    let reader = ReaderId::new(reader_name.to_owned());
+    let reader = kind.local_reader().ok_or(CKR_DEVICE_ERROR)?;
+    // The reader to open is this one; a remote slot has no local
+    // reader and never reaches here.
     // PinSequence: the whole SELECT -> probe -> VERIFY -> PSO span
     // runs inside one held PC/SC transaction, so no concurrent
     // card consumer can interleave and disturb the security state
     // between our APDUs. The PIN is already in the cache -- no
     // prompt or non-card wait happens while the card is open.
     let mut card = backend
-        .open_session(&reader, ReaderAccessCap::PinSequence)
+        .open_session(reader, ReaderAccessCap::PinSequence)
         .map_err(|_open_err| CKR_DEVICE_ERROR)?;
     card.select_pkcs15_application()
         .map_err(|_select_err| CKR_DEVICE_ERROR)?;
@@ -1379,7 +1383,7 @@ pub fn ecdsa_der_to_p1363(der: &[u8], field_bytes: usize) -> Option<Vec<u8>> {
 }
 
 fn remote_card_sign(
-    hex_id: &str,
+    pair_id: &RemoteSlotId,
     origin: &str,
     mechanism: Mechanism,
     input: &[u8],
@@ -1388,7 +1392,11 @@ fn remote_card_sign(
         crate::diag::diag!("remote_card_sign: invalid or missing RP origin");
         return Err(CKR_ARGUMENTS_BAD);
     }
-    let _ = (hex_id, origin, mechanism, input);
+    // The RP origin is the caller's own, not the device's: signing for
+    // a web origin means this computer must prove the request came
+    // from it, which is why the origin is required here rather than
+    // read from the pairing.
+    let _ = (pair_id, origin, mechanism, input);
     Err(CKR_DEVICE_ERROR)
 }
 
@@ -1398,20 +1406,26 @@ fn remote_card_sign(
     reason = "private root module helper is used by sibling api module; plain pub would violate the public-surface typing grep"
 )]
 pub(super) fn card_login(
-    reader_name: &str,
+    kind: &SlotKind,
     pin_cache: &Arc<Mutex<PinSafetyCache>>,
     pin1: PinBytes,
 ) -> Result<(), CkRv> {
-    if reader_name.starts_with("rapp:") {
+    // Protected authentication path: the paired device verifies PIN1 in
+    // its own protected storage, so there is no secret for this
+    // computer to accept or check. Reaching this arm requires a
+    // vault-proven pairing, not a reader name.
+    if kind.is_remote() {
         return Ok(());
     }
     let backend = PcscBackend;
-    let reader = ReaderId::new(reader_name.to_owned());
+    let reader = kind.local_reader().ok_or(CKR_DEVICE_ERROR)?;
+    // The reader to open is this one; a remote slot has no local
+    // reader and never reaches here.
     // PinSequence: SELECT -> probe -> VERIFY is one held
     // transaction; the PIN arrived with the call, so nothing
     // non-card happens while the card is open.
     let mut card = backend
-        .open_session(&reader, ReaderAccessCap::PinSequence)
+        .open_session(reader, ReaderAccessCap::PinSequence)
         .map_err(|_open_err| CKR_DEVICE_ERROR)?;
     card.select_pkcs15_application()
         .map_err(|_select_err| CKR_DEVICE_ERROR)?;
@@ -1933,13 +1947,30 @@ mod tests {
         assert!(!super::is_cert_valid_at(&cert, past_not_after));
     }
 
+    /// A pairing as the vault producer would admit it, for the remote
+    /// sign path.
+    fn remote_kind() -> super::SlotKind {
+        super::SlotKind::Remote {
+            pair_id: super::RemoteSlotId::parse(&"a5".repeat(crate::slot_kind::PAIR_ID_SIZE))
+                .expect("valid pair id"),
+        }
+    }
+
+    /// A reader that names itself after a pairing: local, and so never
+    /// routed to the remote sign path or its origin check.
+    fn impersonating_local_kind() -> super::SlotKind {
+        super::SlotKind::Local {
+            reader: refineid_pcsc::ReaderId::new("rapp:0123456789abcdef".to_owned()),
+        }
+    }
+
     #[test]
     fn remote_card_sign_missing_origin_fails_closed() {
         let pin_cache = std::sync::Arc::new(std::sync::Mutex::new(
             super::PinSafetyCache::new().expect("pin safety cache"),
         ));
         let res = super::card_sign(
-            "rapp:0123456789abcdef",
+            &remote_kind(),
             &pin_cache,
             crate::sign::Mechanism::Ecdsa,
             &[0u8; 32],
@@ -1954,7 +1985,7 @@ mod tests {
             super::PinSafetyCache::new().expect("pin safety cache"),
         ));
         let res = super::card_sign(
-            "rapp:0123456789abcdef",
+            &remote_kind(),
             &pin_cache,
             crate::sign::Mechanism::Ecdsa,
             &[0u8; 32],
@@ -1963,13 +1994,51 @@ mod tests {
         assert_eq!(res, Err(crate::ck::CKR_ARGUMENTS_BAD));
     }
 
+    /// The remote origin check is a property of a vault-proven pairing,
+    /// so a reader that merely names itself one never reaches it. As a
+    /// local reader it fails on the card it cannot open.
+    #[test]
+    fn a_local_reader_naming_itself_a_pairing_never_takes_the_remote_path() {
+        let pin_cache = std::sync::Arc::new(std::sync::Mutex::new(
+            super::PinSafetyCache::new().expect("pin safety cache"),
+        ));
+        let res = super::card_sign(
+            &impersonating_local_kind(),
+            &pin_cache,
+            crate::sign::Mechanism::Ecdsa,
+            &[0u8; 32],
+            None,
+        );
+        assert_eq!(res, Err(crate::ck::CKR_DEVICE_ERROR));
+    }
+
+    /// PIN1 state for a local reader is whatever the card says; only a
+    /// vault-proven pairing reports a state this computer did not read.
+    #[test]
+    fn a_local_reader_naming_itself_a_pairing_has_no_remote_pin_state() {
+        let res = super::card_pin1_status(&impersonating_local_kind());
+        assert_ne!(res, Ok(super::PinStatus::Verified));
+    }
+
+    /// `C_Login` succeeds without a card only for a vault-proven
+    /// pairing, whose PIN1 the device verified itself.
+    #[test]
+    fn a_local_reader_naming_itself_a_pairing_does_not_skip_login() {
+        let pin_cache = std::sync::Arc::new(std::sync::Mutex::new(
+            super::PinSafetyCache::new().expect("pin safety cache"),
+        ));
+        let pin = crate::pin::PinBytes::try_from(*b"1234").expect("valid PIN1");
+        let res = super::card_login(&impersonating_local_kind(), &pin_cache, pin);
+        assert_eq!(res, Err(crate::ck::CKR_DEVICE_ERROR));
+    }
+
     #[test]
     fn remote_card_sign_valid_origin_fails_device_error() {
         let pin_cache = std::sync::Arc::new(std::sync::Mutex::new(
             super::PinSafetyCache::new().expect("pin safety cache"),
         ));
         let res = super::card_sign(
-            "rapp:0123456789abcdef",
+            &remote_kind(),
             &pin_cache,
             crate::sign::Mechanism::Ecdsa,
             &[0u8; 32],

@@ -18,6 +18,7 @@
 //! Every CCID interface exposes a 54-byte functional descriptor specifying
 //! its supported exchange level, message size limits, protocols, and feature flags.
 
+use crate::codec::CCID_HEADER_SIZE;
 use crate::error::{CcidDescriptorError, CcidError};
 
 /// USB descriptor header length (bLength, bDescriptorType).
@@ -86,25 +87,27 @@ pub const SHORT_APDU_EXCHANGE: u32 = 0x0002_0000;
 /// Short and extended APDU level exchange (USB-IF CCID Rev 1.1 §5.1 Table 5-1 value 00040000h).
 pub const SHORT_AND_EXTENDED_APDU_EXCHANGE: u32 = 0x0004_0000;
 
-/// Minimum message length for Character exchange (10-byte header + 1 byte minimum).
-pub const MINIMUM_CHARACTER_MESSAGE_LENGTH: usize = 10 + 1;
+/// Minimum message length for Character exchange (10-byte header + 1 byte minimum per USB-IF CCID Rev 1.1 §5.1).
+pub const MINIMUM_CHARACTER_MESSAGE_LENGTH: usize = CCID_HEADER_SIZE + 1;
 /// Maximum ISO 7816-3 T=0 TPDU command payload length (5-byte header + 255 data bytes).
 pub const MAXIMUM_T0_TPDU_LENGTH: usize = 260;
 /// Minimum message length for T=0 TPDU exchange (10-byte header + 260 bytes).
-pub const MINIMUM_T0_TPDU_MESSAGE_LENGTH: usize = 10 + MAXIMUM_T0_TPDU_LENGTH;
+pub const MINIMUM_T0_TPDU_MESSAGE_LENGTH: usize = CCID_HEADER_SIZE + MAXIMUM_T0_TPDU_LENGTH;
 /// Maximum ISO 7816-4 short APDU command payload length (4-byte header + 1 Lc + 255 data + 1 Le).
 pub const MAXIMUM_SHORT_APDU_LENGTH: usize = 261;
 /// Minimum message length for Short APDU exchange (10-byte header + 261 bytes).
-pub const MINIMUM_SHORT_APDU_MESSAGE_LENGTH: usize = 10 + MAXIMUM_SHORT_APDU_LENGTH;
+pub const MINIMUM_SHORT_APDU_MESSAGE_LENGTH: usize = CCID_HEADER_SIZE + MAXIMUM_SHORT_APDU_LENGTH;
 /// Maximum ISO 7816-4 extended APDU command payload length (65,544 bytes: 4 header + 1 prefix + 2 Lc + 65,535 data + 2 Le).
 pub const MAXIMUM_CCID_COMMAND_PAYLOAD_LENGTH: usize = 65_544;
 /// Absolute maximum CCID message length including 10-byte header (65,554 bytes).
-pub const MAXIMUM_CCID_MESSAGE_LENGTH: usize = 10 + MAXIMUM_CCID_COMMAND_PAYLOAD_LENGTH;
+pub const MAXIMUM_CCID_MESSAGE_LENGTH: usize =
+    CCID_HEADER_SIZE + MAXIMUM_CCID_COMMAND_PAYLOAD_LENGTH;
 
 /// CCID command / exchange level supported by the reader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CcidExchangeLevel {
-    /// Character level: reader accepts raw characters.
+    /// Character level: reader accepts raw character streams (USB-IF CCID Rev 1.1 §5.1 Table 5-1 value 00000000h).
+    /// Legacy mode where character-level smart card protocol bytes are exchanged directly with the reader.
     Character,
     /// TPDU level: reader expects raw T=0/T=1 TPDUs.
     Tpdu,

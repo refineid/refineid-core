@@ -152,30 +152,48 @@ impl PlatformHotplugMonitor {
         for entry in entries.flatten() {
             let path = entry.path();
             let b_interface_class_file = path.join("bInterfaceClass");
-            if let Ok(class_str) = fs::read_to_string(&b_interface_class_file) {
-                let trimmed = class_str.trim().to_ascii_lowercase();
-                if trimmed == CCID_INTERFACE_CLASS_STR {
-                    let parent = path.parent().unwrap_or(&path);
-                    let vid_str = fs::read_to_string(parent.join("idVendor")).unwrap_or_default();
-                    let pid_str = fs::read_to_string(parent.join("idProduct")).unwrap_or_default();
-                    let bus_str = fs::read_to_string(parent.join("busnum")).unwrap_or_default();
-                    let dev_str = fs::read_to_string(parent.join("devnum")).unwrap_or_default();
-
-                    let vendor_id = u16::from_str_radix(vid_str.trim(), HEX_RADIX).unwrap_or(0);
-                    let product_id = u16::from_str_radix(pid_str.trim(), HEX_RADIX).unwrap_or(0);
-                    let bus_number = u8::from_str_radix(bus_str.trim(), DEC_RADIX).unwrap_or(0);
-                    let device_address = u8::from_str_radix(dev_str.trim(), DEC_RADIX).unwrap_or(0);
-
-                    let dev = UsbDeviceId {
-                        vendor_id,
-                        product_id,
-                        bus_number,
-                        device_address,
-                        device_path: Some(path.to_string_lossy().into_owned()),
-                    };
-                    current_devices.push(dev);
-                }
+            let Ok(class_str) = fs::read_to_string(&b_interface_class_file) else {
+                continue;
+            };
+            let trimmed = class_str.trim().to_ascii_lowercase();
+            if trimmed != CCID_INTERFACE_CLASS_STR {
+                continue;
             }
+
+            let file_name_str = entry.file_name();
+            let file_name = file_name_str.to_string_lossy();
+            let device_name = match file_name.split_once(':') {
+                Some((dev, _)) => dev,
+                None => file_name.as_ref(),
+            };
+            let device_dir = sysfs_path.join(device_name);
+
+            let Ok(vid_str) = fs::read_to_string(device_dir.join("idVendor")) else {
+                continue;
+            };
+            let Ok(pid_str) = fs::read_to_string(device_dir.join("idProduct")) else {
+                continue;
+            };
+            let Ok(vendor_id) = u16::from_str_radix(vid_str.trim(), HEX_RADIX) else {
+                continue;
+            };
+            let Ok(product_id) = u16::from_str_radix(pid_str.trim(), HEX_RADIX) else {
+                continue;
+            };
+
+            let bus_str = fs::read_to_string(device_dir.join("busnum")).unwrap_or_default();
+            let dev_str = fs::read_to_string(device_dir.join("devnum")).unwrap_or_default();
+            let bus_number = u8::from_str_radix(bus_str.trim(), DEC_RADIX).unwrap_or(0);
+            let device_address = u8::from_str_radix(dev_str.trim(), DEC_RADIX).unwrap_or(0);
+
+            let dev = UsbDeviceId {
+                vendor_id,
+                product_id,
+                bus_number,
+                device_address,
+                device_path: Some(path.to_string_lossy().into_owned()),
+            };
+            current_devices.push(dev);
         }
 
         let mut events = Vec::new();

@@ -139,9 +139,7 @@ impl CcidEventPoller {
 
         if msg_type == RDR_TO_PC_NOTIFY_SLOT_CHANGE {
             let notification = decode_interrupt_slot_change(frame, self.max_slot_index)?;
-            let count = usize::from(self.max_slot_index).saturating_add(1);
-            let limit = u8::try_from(count).unwrap_or(u8::MAX);
-            for slot_idx in FIRST_SLOT_INDEX..limit {
+            for slot_idx in FIRST_SLOT_INDEX..=self.max_slot_index {
                 let is_present = notification.is_card_present(slot_idx);
                 let changed = notification.has_slot_changed(slot_idx);
                 let idx = usize::from(slot_idx);
@@ -153,7 +151,7 @@ impl CcidEventPoller {
                     let prev_present = state.card_present;
                     state.card_present = is_present;
                     state.card_status = if is_present {
-                        CardStatus::Active
+                        CardStatus::Inactive
                     } else {
                         CardStatus::NotPresent
                     };
@@ -265,6 +263,9 @@ impl<H: UsbHostTransport> CcidDaemon<H> {
         };
         let mut buffer = [0_u8; INTERRUPT_BUFFER_SIZE];
         let bytes_read = self.transport.bulk_in(endpoint, &mut buffer, timeout_ms)?;
+        if bytes_read > buffer.len() {
+            return Err(CcidError::LengthMismatch);
+        }
         self.poller.process_interrupt(&buffer[..bytes_read])
     }
 }

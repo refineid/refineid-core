@@ -127,6 +127,12 @@ fn t0_case3_from_short_case4(apdu: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Prepare outgoing command bytes according to card protocol and CCID exchange level.
+///
+/// Per USB-IF CCID Rev 1.1 §6.1.4:
+/// - In TPDU and Character exchange modes, the host formats T=0 command headers (5-byte CLA, INS, P1, P2, P3).
+///   Short Case-4 commands are converted to Case-3 headers for execution, with trailing data read via `GET RESPONSE`.
+/// - T=1 in Character or TPDU mode requires transport-level block framing (NAD, PCB, LEN, EDC) and is
+///   rejected with [`CcidError::UnsupportedProtocol`] unless APDU-level framing is provided by the reader.
 fn prepare_command_bytes(
     apdu: &[u8],
     protocol: CardProtocol,
@@ -431,6 +437,11 @@ impl<H: UsbHostTransport> CcidCardTransport<H> {
     /// # Errors
     /// Returns `CcidError` on transmission failure, timeout, reader rejection, or protocol desync.
     pub fn secure_direct(&mut self, data: &[u8]) -> Result<ResponseApdu, CcidError> {
+        if !self.descriptor.supports_pin_verification()
+            && !self.descriptor.supports_pin_modification()
+        {
+            return Err(CcidError::UnsupportedProtocol);
+        }
         let op = Operation::Secure {
             b_wi: 0,
             w_level_parameter: 0,
@@ -732,6 +743,11 @@ impl<H: UsbHostTransport> CardTransport for CcidCardTransport<H> {
     }
 }
 
+/// Best-effort card teardown and power-off upon transport disposal (§6.1.2).
+///
+/// Deterministic teardown should always prefer explicit [`CcidCardTransport::disconnect`].
+/// This [`Drop`] implementation provides defensive fallback cleanup to ensure
+/// the card is powered down if the transport goes out of scope unexpectedly.
 impl<H: UsbHostTransport> Drop for CcidCardTransport<H> {
     fn drop(&mut self) {
         if self.engine.is_card_active() {

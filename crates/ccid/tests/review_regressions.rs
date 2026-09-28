@@ -23,8 +23,8 @@ use refineid_ccid::codec::{
 use refineid_ccid::descriptor::{
     AUTOMATIC_PARAMETER_CONFIGURATION, AUTOMATIC_PPS, CCID_FUNCTIONAL_DESCRIPTOR_LENGTH,
     CcidExchangeLevel, CcidFunctionalDescriptor, DESCRIPTOR_TYPE_OFFSET, FEATURES_OFFSET,
-    MAXIMUM_MESSAGE_LENGTH_OFFSET, MINIMUM_SHORT_APDU_MESSAGE_LENGTH, SHORT_APDU_EXCHANGE,
-    USB_INTERFACE_DESCRIPTOR_TYPE,
+    MAXIMUM_MESSAGE_LENGTH_OFFSET, MINIMUM_SHORT_APDU_MESSAGE_LENGTH, PIN_SUPPORT_VERIFY,
+    SHORT_APDU_EXCHANGE, USB_INTERFACE_DESCRIPTOR_TYPE,
 };
 use refineid_ccid::{
     Action, CardProtocol, CcidCardTransport, CcidEngine, CcidError, CcidIoError, InputEvent,
@@ -58,8 +58,8 @@ const SW_MORE: u8 = 0x61;
 const SW_WRONG_LE: u8 = 0x6C;
 const EXTENDED_PAYLOAD_LEN: usize = 300;
 const SYNTHETIC_ERROR_CODE: u8 = 0x42;
-const DUMMY_VID: u16 = 0x04E6;
-const DUMMY_PID: u16 = 0x5116;
+const DUMMY_VID: u16 = 0xFFFF;
+const DUMMY_PID: u16 = 0x0001;
 const INSERTION_BITS: u8 = 0x03;
 const REMOVAL_BITS: u8 = 0x02;
 const CONTINUATION_EXPECTED: u8 = 0x10;
@@ -70,6 +70,13 @@ const PIN_VERIFY_INS: u8 = 0x20;
 const TEST_POLL_TIMEOUT_MS: u32 = 100;
 
 fn descriptor(level: CcidExchangeLevel) -> CcidFunctionalDescriptor {
+    descriptor_with_pin_support(level, ZERO)
+}
+
+fn descriptor_with_pin_support(
+    level: CcidExchangeLevel,
+    pin_support: u8,
+) -> CcidFunctionalDescriptor {
     let level_bits = match level {
         CcidExchangeLevel::Character => refineid_ccid::descriptor::CHARACTER_EXCHANGE,
         CcidExchangeLevel::Tpdu => refineid_ccid::descriptor::TPDU_EXCHANGE,
@@ -94,6 +101,7 @@ fn descriptor(level: CcidExchangeLevel) -> CcidFunctionalDescriptor {
     d[40..44].copy_from_slice(&features.to_le_bytes());
     let max_len = MINIMUM_SHORT_APDU_MESSAGE_LENGTH as u32;
     d[44..48].copy_from_slice(&max_len.to_le_bytes());
+    d[52] = pin_support;
     d[53] = ONE;
     CcidFunctionalDescriptor::parse_functional_descriptor(&d).expect("valid test descriptor")
 }
@@ -774,6 +782,53 @@ fn secure_pin_operation_and_debug_redaction() {
 }
 
 #[test]
+fn secure_direct_requires_pin_support_capability() {
+    let h = Host::default();
+    let mut t = transport(h, CcidExchangeLevel::ShortApdu, CardProtocol::T0);
+    let pin_template = [ZERO, PIN_VERIFY_INS, ZERO, ONE, ZERO];
+    let err = t.secure_direct(&pin_template).err();
+    assert_eq!(err, Some(CcidError::UnsupportedProtocol));
+}
+
+#[test]
+fn secure_direct_succeeds_with_pin_support() {
+    let mut h = Host::default();
+    h.replies.push_back(Ok(data_frame(ZERO, &[SW_OK, ZERO])));
+    let desc = descriptor_with_pin_support(CcidExchangeLevel::ShortApdu, PIN_SUPPORT_VERIFY);
+    let mut e = CcidEngine::new(ZERO, ZERO, GENERATION, &desc);
+    e.set_activated(true);
+    let atr = refineid_atr::Atr::new([TS_DIRECT, ZERO]).expect("valid test atr");
+    let mut t =
+        CcidCardTransport::from_existing(h, e, desc, BULK_OUT, BULK_IN, atr, CardProtocol::T0);
+    let pin_template = [ZERO, PIN_VERIFY_INS, ZERO, ONE, ZERO];
+    let res = t
+        .secure_direct(&pin_template)
+        .expect("secure direct response");
+    assert_eq!(res.sw1, SW_OK);
+    assert_eq!(res.sw2, ZERO);
+    assert!(res.body.is_empty());
+}
+
+#[test]
+fn oversized_secure_operation_rejected() {
+    let mut e = engine(CcidExchangeLevel::ShortApdu);
+    let oversized_data = Zeroizing::new(vec![ZERO; e.max_payload_length() + BYTE_STEP]);
+    let op = Operation::Secure {
+        b_wi: ZERO,
+        w_level_parameter: 0,
+        data: oversized_data,
+    };
+    let t = start(&mut e, op);
+    assert!(t.actions.iter().any(|a| matches!(
+        a,
+        Action::Complete {
+            result: Err(CcidError::ApduTooLong),
+            ..
+        }
+    )));
+}
+
+#[test]
 fn character_exchange_level_support() {
     let desc = descriptor(CcidExchangeLevel::Character);
     assert_eq!(desc.exchange_level(), CcidExchangeLevel::Character);
@@ -846,6 +901,10 @@ fn daemon_event_poller_and_notifications() {
         .expect("process interrupt");
     assert_eq!(events, vec![CcidSlotEvent::CardInserted { slot: ZERO }]);
     assert!(poller.slot_state(ZERO).expect("slot state").card_present);
+    assert_eq!(
+        poller.slot_state(ZERO).expect("slot state").card_status,
+        CardStatus::Inactive
+    );
 
     let slot_remove_packet = [RDR_TO_PC_NOTIFY_SLOT_CHANGE, REMOVAL_BITS];
     let events2 = poller

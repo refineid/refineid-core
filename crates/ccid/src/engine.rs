@@ -472,6 +472,7 @@ impl core::fmt::Debug for CcidEngine {
             .field("current_deadline", &self.current_deadline)
             .field("default_timeout_ms", &self.default_timeout_ms)
             .field("chain_buffer", &"[redacted]")
+            .field("outgoing_chain", &"[redacted]")
             .field("wtx_count", &self.wtx_count)
             .field("abort_drain_count", &self.abort_drain_count)
             .field("waiting_unit_ms", &self.waiting_unit_ms)
@@ -721,13 +722,27 @@ impl CcidEngine {
                     };
                 }
 
-                let max_payload_bound = match self.exchange_level {
-                    CcidExchangeLevel::ShortAndExtendedApdu => MAXIMUM_CCID_COMMAND_PAYLOAD_LENGTH,
-                    _ => self.max_payload_length,
-                };
-                if let Operation::TransferBlock { ref data, .. }
-                | Operation::Secure { ref data, .. } = op
-                    && data.len() > max_payload_bound
+                if let Operation::TransferBlock { ref data, .. } = op {
+                    let max_payload_bound = match self.exchange_level {
+                        CcidExchangeLevel::ShortAndExtendedApdu => {
+                            MAXIMUM_CCID_COMMAND_PAYLOAD_LENGTH
+                        }
+                        _ => self.max_payload_length,
+                    };
+                    if data.len() > max_payload_bound {
+                        actions.push(Action::Complete {
+                            id,
+                            result: Err(CcidError::ApduTooLong),
+                        });
+                        return Transition {
+                            actions,
+                            next_deadline: None,
+                        };
+                    }
+                }
+
+                if let Operation::Secure { ref data, .. } = op
+                    && data.len() > self.max_payload_length
                 {
                     actions.push(Action::Complete {
                         id,
@@ -821,6 +836,7 @@ impl CcidEngine {
                     } => {
                         let max_block = self.max_payload_length;
                         if self.exchange_level == CcidExchangeLevel::ShortAndExtendedApdu
+                            && max_block > 0
                             && data.len() > max_block
                         {
                             self.outgoing_chain.clear();

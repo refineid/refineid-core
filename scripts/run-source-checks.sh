@@ -11,3 +11,4 @@ cargo fmt --check
 cargo run -q -p xtask -- check-magic-numbers
 "$root/scripts/verify-hygiene.sh"
 PYTHONDONTWRITEBYTECODE=1 python3 "$root/scripts/test-check-receipt.py"
+PYTHONDONTWRITEBYTECODE=1 python3 "$root/scripts/test-workflow-policy.py"

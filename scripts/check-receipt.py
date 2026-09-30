@@ -5,7 +5,8 @@
 Usage:
   scripts/check-receipt.py NAME [--tool TOOL ...] -- COMMAND [ARG ...]
 
-Receipts are local performance hints. CI runs the quality gates independently.
+Receipts are local performance hints. The manual Ubuntu workflow runs the
+quality gates independently.
 """
 
 from __future__ import annotations

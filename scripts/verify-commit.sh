@@ -1,10 +1,9 @@
 #!/bin/sh
 # Copyright 2026 Petri Koistinen. Licensed under the Apache License, Version 2.0.
 #
-# Fast quality gates for the pre-commit hook: formatting and the
-# magic-number policy. The full floor -- build, tests, Clippy with
-# warnings denied, rustdoc, and the doctest ban -- runs in the pre-push
-# gate via scripts/verify-push.sh.
+# Fast source checks for the pre-commit hook. The full floor -- build,
+# tests, Clippy with warnings denied, rustdoc, and the doctest ban -- runs
+# in the pre-push gate via scripts/verify-push.sh.
 set -eu
 
 root=$(git rev-parse --show-toplevel)
@@ -19,7 +18,7 @@ if command -v brew > /dev/null 2>&1; then
     fi
 fi
 
-cargo fmt --check
-cargo run -q -p xtask -- check-magic-numbers
-"$root/scripts/verify-hygiene.sh"
+python3 "$root/scripts/check-receipt.py" source-checks \
+    --tool sh --tool cargo --tool rustc --tool rustfmt --tool cargo-fmt --tool git --tool grep \
+    -- "$root/scripts/run-source-checks.sh"
 echo "pre-commit gates passed"

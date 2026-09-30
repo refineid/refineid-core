@@ -20,13 +20,13 @@ if command -v brew > /dev/null 2>&1; then
     fi
 fi
 
-cargo fmt --check
+python3 "$root/scripts/check-receipt.py" source-checks \
+    --tool sh --tool cargo --tool rustc --tool rustfmt --tool cargo-fmt --tool git --tool grep \
+    -- "$root/scripts/run-source-checks.sh"
 cargo build
 cargo test
 cargo clippy --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
-cargo run -q -p xtask -- check-magic-numbers
-"$root/scripts/verify-hygiene.sh"
 if command -v cargo-audit > /dev/null 2>&1; then
     cargo audit
 fi

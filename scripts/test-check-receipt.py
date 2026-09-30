@@ -51,9 +51,7 @@ class CheckReceiptTests(unittest.TestCase):
             "PATH": os.environ["PATH"],
             "HOME": os.environ["HOME"],
         }
-        subprocess.run(
-            ["git", "init", "-q", str(self.root)], check=True, env=self.environment
-        )
+        self._init_repo(self.root)
         self.command_file = self.root / "check.py"
         self.fail_marker = Path(self.temporary.name) / "fail-once"
         self.command_file.write_text(
@@ -78,6 +76,11 @@ class CheckReceiptTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def _init_repo(self, root: Path) -> None:
+        subprocess.run(
+            ["git", "init", "-q", str(root)], check=True, env=self.environment
+        )
 
     def _stage_all(self) -> None:
         subprocess.run(
@@ -288,20 +291,32 @@ class CheckReceiptTests(unittest.TestCase):
                 second = check_receipt.stable_environment_digest()
         self.assertEqual(first, second)
 
-    def test_fixture_git_commands_do_not_write_inherited_hook_index(self) -> None:
-        hook_index = Path(self.temporary.name) / "hook-index"
-        original_index = b"outer hook index sentinel"
-        hook_index.write_bytes(original_index)
+    def test_fixture_git_commands_do_not_write_inherited_hook_repository(self) -> None:
+        outer_repo = Path(self.temporary.name) / "outer-repo"
+        outer_repo.mkdir()
+        self._init_repo(outer_repo)
+        outer_file = outer_repo / "sentinel.txt"
+        outer_file.write_text("outer repository contents\n", encoding="ascii")
+        subprocess.run(
+            ["git", "add", "sentinel.txt"],
+            cwd=outer_repo,
+            check=True,
+            env=self.environment,
+        )
+        config_path = outer_repo / ".git" / "config"
+        index_path = outer_repo / ".git" / "index"
+        original_config = config_path.read_bytes()
+        original_index = index_path.read_bytes()
         nested_repo = Path(self.temporary.name) / "nested-repo"
         nested_repo.mkdir()
-        with patch.dict(os.environ, {"GIT_INDEX_FILE": str(hook_index)}):
-            subprocess.run(
-                ["git", "init", "-q", str(nested_repo)],
-                check=True,
-                env=self.environment,
-            )
+        with patch.dict(
+            os.environ,
+            {"GIT_DIR": str(outer_repo / ".git"), "GIT_INDEX_FILE": str(index_path)},
+        ):
+            self._init_repo(nested_repo)
             self._stage_all()
-        self.assertEqual(hook_index.read_bytes(), original_index)
+        self.assertEqual(config_path.read_bytes(), original_config)
+        self.assertEqual(index_path.read_bytes(), original_index)
 
 
 if __name__ == "__main__":

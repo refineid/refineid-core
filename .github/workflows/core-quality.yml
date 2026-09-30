@@ -35,6 +35,12 @@ jobs:
       - name: Reject anonymous protocol numbers
         run: cargo run --locked -p xtask -- check-magic-numbers
 
+      - name: Exercise local check receipts
+        run: python3 scripts/test-check-receipt.py
+
+      - name: Exercise local check receipts
+        run: python3 scripts/test-check-receipt.py
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 

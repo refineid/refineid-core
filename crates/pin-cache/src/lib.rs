@@ -85,7 +85,11 @@ impl PinSafetyCache {
     #[must_use]
     pub fn is_rejected(&self, serial: &TokenSerial, pin: &impl CachedPin) -> bool {
         let candidate = self.fingerprint(serial, pin);
-        self.rejected(pin.slot())
+        self.contains_fingerprint(pin.slot(), &candidate)
+    }
+
+    fn contains_fingerprint(&self, slot: PinSlot, candidate: &RejectedPinFingerprint) -> bool {
+        self.rejected(slot)
             .iter()
             .any(|known| bool::from(known.0.ct_eq(&candidate.0)))
     }
@@ -95,12 +99,12 @@ impl PinSafetyCache {
     /// already remembered is not stored twice.
     pub fn record_rejected(&mut self, serial: &TokenSerial, pin: &impl CachedPin) {
         let fingerprint = self.fingerprint(serial, pin);
-        let rejected = self.rejected_mut(pin.slot());
-        if !rejected
-            .iter()
-            .any(|known| bool::from(known.0.ct_eq(&fingerprint.0)))
-        {
-            rejected.push(fingerprint);
+        self.record_fingerprint(pin.slot(), fingerprint);
+    }
+
+    fn record_fingerprint(&mut self, slot: PinSlot, fingerprint: RejectedPinFingerprint) {
+        if !self.contains_fingerprint(slot, &fingerprint) {
+            self.rejected_mut(slot).push(fingerprint);
         }
     }
 
@@ -158,6 +162,7 @@ impl PinSafetyCache {
 
 #[cfg(test)]
 mod tests {
+    use refineid_auth::credentials::PIN_MAX_LENGTH;
     use refineid_auth::{Pin1, Pin2, PinSlot, UnvalidatedSecret};
     use refineid_pkcs15::TokenSerial;
 
@@ -166,14 +171,11 @@ mod tests {
     /// Arbitrary fixed fingerprint-key byte, repeated across the key so that
     /// test fingerprints are reproducible without touching the OS random source.
     const TEST_FINGERPRINT_KEY_BYTE: u8 = 0xA5;
+    const DECIMAL_DIGIT_RADIX: u8 = 10;
 
-    /// Two distinct synthetic card serials.
+    /// Distinct synthetic card serials.
     const CARD_A_SERIAL: &str = "CARD-A-FULL-SERIAL";
     const CARD_B_SERIAL: &str = "CARD-B-FULL-SERIAL";
-
-    /// Two distinct synthetic PIN values, each valid for either PIN role.
-    const PIN_VALUE: &str = "135790";
-    const OTHER_PIN_VALUE: &str = "246802";
 
     fn cache() -> PinSafetyCache {
         PinSafetyCache::with_fixed_fingerprint_key(
@@ -185,54 +187,78 @@ mod tests {
         TokenSerial::new(text.to_owned())
     }
 
-    fn pin1(digits: &str) -> Pin1 {
-        Pin1::reconstruct(UnvalidatedSecret::from_owned_bytes(
-            digits.as_bytes().to_vec(),
-        ))
-        .expect("valid PIN1 fixture")
+    fn random_digits() -> Vec<u8> {
+        let mut bytes = vec![0_u8; PIN_MAX_LENGTH];
+        getrandom::fill(&mut bytes).expect("operating system random source is available");
+        for byte in &mut bytes {
+            *byte = b'0' + (*byte % DECIMAL_DIGIT_RADIX);
+        }
+        bytes
     }
 
-    fn pin2(digits: &str) -> Pin2 {
-        Pin2::reconstruct(UnvalidatedSecret::from_owned_bytes(
-            digits.as_bytes().to_vec(),
-        ))
-        .expect("valid PIN2 fixture")
+    fn pin1_with_digits(digits: Vec<u8>) -> Pin1 {
+        Pin1::reconstruct(UnvalidatedSecret::from_owned_bytes(digits))
+            .expect("random local input satisfies credential policy")
+    }
+
+    fn pin2_with_digits(digits: Vec<u8>) -> Pin2 {
+        Pin2::reconstruct(UnvalidatedSecret::from_owned_bytes(digits))
+            .expect("random local input satisfies credential policy")
+    }
+
+    fn pin1() -> Pin1 {
+        pin1_with_digits(random_digits())
     }
 
     #[test]
     fn recorded_value_is_rejected_for_its_serial_and_slot() {
         let mut cache = cache();
-        cache.record_rejected(&serial(CARD_A_SERIAL), &pin1(PIN_VALUE));
-        assert!(cache.is_rejected(&serial(CARD_A_SERIAL), &pin1(PIN_VALUE)));
+        let pin = pin1();
+        cache.record_rejected(&serial(CARD_A_SERIAL), &pin);
+        assert!(cache.is_rejected(&serial(CARD_A_SERIAL), &pin));
     }
 
     #[test]
     fn a_different_value_is_not_rejected() {
         let mut cache = cache();
-        cache.record_rejected(&serial(CARD_A_SERIAL), &pin1(PIN_VALUE));
-        assert!(!cache.is_rejected(&serial(CARD_A_SERIAL), &pin1(OTHER_PIN_VALUE)));
+        let rejected_digits = random_digits();
+        let different_digits = loop {
+            let candidate = random_digits();
+            if candidate != rejected_digits {
+                break candidate;
+            }
+        };
+        let rejected = pin1_with_digits(rejected_digits);
+        let different = pin1_with_digits(different_digits);
+        cache.record_rejected(&serial(CARD_A_SERIAL), &rejected);
+        assert!(!cache.is_rejected(&serial(CARD_A_SERIAL), &different));
     }
 
     #[test]
     fn a_different_slot_is_not_rejected() {
         let mut cache = cache();
-        cache.record_rejected(&serial(CARD_A_SERIAL), &pin1(PIN_VALUE));
-        assert!(!cache.is_rejected(&serial(CARD_A_SERIAL), &pin2(PIN_VALUE)));
+        let digits = random_digits();
+        let pin = pin1_with_digits(digits.clone());
+        let other_slot = pin2_with_digits(digits);
+        cache.record_rejected(&serial(CARD_A_SERIAL), &pin);
+        assert!(!cache.is_rejected(&serial(CARD_A_SERIAL), &other_slot));
     }
 
     #[test]
     fn a_different_serial_is_not_rejected() {
         let mut cache = cache();
-        cache.record_rejected(&serial(CARD_A_SERIAL), &pin1(PIN_VALUE));
-        assert!(!cache.is_rejected(&serial(CARD_B_SERIAL), &pin1(PIN_VALUE)));
+        let pin = pin1();
+        cache.record_rejected(&serial(CARD_A_SERIAL), &pin);
+        assert!(!cache.is_rejected(&serial(CARD_B_SERIAL), &pin));
     }
 
     #[test]
     fn recording_the_same_value_twice_is_deduped() {
         let mut cache = cache();
-        cache.record_rejected(&serial(CARD_A_SERIAL), &pin1(PIN_VALUE));
-        cache.record_rejected(&serial(CARD_A_SERIAL), &pin1(PIN_VALUE));
+        let pin = pin1();
+        cache.record_rejected(&serial(CARD_A_SERIAL), &pin);
+        cache.record_rejected(&serial(CARD_A_SERIAL), &pin);
         assert_eq!(cache.rejected_count(PinSlot::Pin1), 1);
-        assert!(cache.is_rejected(&serial(CARD_A_SERIAL), &pin1(PIN_VALUE)));
+        assert!(cache.is_rejected(&serial(CARD_A_SERIAL), &pin));
     }
 }

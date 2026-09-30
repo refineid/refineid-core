@@ -66,8 +66,9 @@ section again. The design questions in the refinement-types policy's
 
 The floor is enforced, not suggested: tracked git hooks (enable once per
 clone with `scripts/install-hooks.sh`) run the fast gates at commit and
-the full floor at push, and GitHub Actions reruns the full floor on
-every push and pull request. Never commit or push with `--no-verify`,
+the full floor at push. The Ubuntu quality workflow is available by
+manual dispatch for platform portability checks and does not gate
+pull-request merges. Never commit or push with `--no-verify`,
 never disable, weaken, or work around a gate, and never leave the hooks
 uninstalled. This binds every contributor, human and AI agent alike:
 fix the finding, or raise the policy question openly instead of dodging

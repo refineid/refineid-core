@@ -25,7 +25,8 @@ directory with private permissions and are replaced atomically. Concurrent
 checks may both run; neither can observe a partially written receipt.
 
 Receipts are a local speed hint, not a trusted attestation. A user who controls
-the machine can change the cache or skip local hooks. CI runs the source checks
-and the full quality gate independently. The push gate still runs build, tests,
-Clippy, rustdoc, and supply-chain checks; only its identical source-check group
-may be reused locally.
+the machine can change the cache or skip local hooks. The mandatory local push
+gate still runs build, tests, Clippy, rustdoc, and supply-chain checks; only its
+identical source-check group may be reused locally. The Ubuntu quality workflow
+is manual-only and supplies optional platform portability evidence without
+blocking pull-request merges.

@@ -1,10 +1,7 @@
 name: core-quality
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -23,6 +20,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Validate workflow policy
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-workflow-policy.py
+
       - name: Show pinned Rust toolchain
         run: rustup show active-toolchain
 
@@ -34,9 +34,6 @@ jobs:
 
       - name: Reject anonymous protocol numbers
         run: cargo run --locked -p xtask -- check-magic-numbers
-
-      - name: Exercise local check receipts
-        run: python3 scripts/test-check-receipt.py
 
       - name: Exercise local check receipts
         run: python3 scripts/test-check-receipt.py

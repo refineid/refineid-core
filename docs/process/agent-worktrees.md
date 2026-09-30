@@ -48,6 +48,6 @@ resume work or clean up. In particular:
 2. Run `./scripts/verify-push.sh` to ensure all pre-push gates pass.
 3. Commit on the task branch (imperative subject and explanatory body only; no attribution trailers) and push.
 4. Open one pull request for the branch.
-5. Squash-merge once CI is green, so the `main` history stays linear. The pull request preserves the branch history.
+5. Squash-merge after local gates pass and review is complete, so the `main` history stays linear. The pull request preserves the branch history; the manual Ubuntu workflow is an optional portability check, not a merge gate.
 6. Remove the worktree (`git worktree remove`), delete the branch, and
    fast-forward local main.

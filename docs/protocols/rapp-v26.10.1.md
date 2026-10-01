@@ -53,16 +53,16 @@ Per project engineering standards, specification requirements are strictly disti
 
 | Specification Domain | Status | Coverage & Artifact Reference |
 | :--- | :--- | :--- |
-| **BLE GATT Service & Characteristic Layout** (§5.1) | Observed on Physical Hardware | Service UUID, Channel & Bootstrap characteristics, read/write permissions validated over the air. |
-| **GATT Connection & ATT MTU Exchange** (§5.2, §7.1) | Observed on Physical Hardware | Connect timing (735.6 ms) and ATT MTU negotiation (max payload 512 B) verified between Linux Central and iOS Peripheral. |
-| **Over-The-Air Data Transfer** (§7.1) | Observed on Physical Hardware | Synthetic 64-byte write and 256-byte read verified over physical BLE link. |
-| **BLE SAR Framing & State Machine** (§5.3) | Normative Specification | Fully specified with invariant total length, pre-copy capacity checks, and stop-and-wait flow control. Reference implementation in progress. |
-| **Crockford Base32 Canonical Normalization** (§3.1) | Normative Specification | Fully specified 6-step pipeline with Crockford decode alias mapping (`I`/`L` $\to$ `1`, `O` $\to$ `0`). |
-| **CPaceRistretto255 Mathematical Primitives** (§6) | Reference Implementation | Implemented in Rust `crates/rapp/src/cpace.rs` per draft-irtf-cfrg-cpace-21 and RFC 9496; unit-tested with test vectors. (Defensive basepoint fallback on $2^{-252}$ and $PSK = \text{ISK}[0..32]$ truncation noted as RAPP design choices). |
+| **BLE GATT Service & Characteristic Layout** (§5.1) | Partially Observed on Hardware | Service UUID and Channel characteristic properties observed on iOS peripheral hardware (`RappBlePeripheral.swift`). Bootstrap characteristic is Specified (unverified on physical hardware). |
+| **GATT Connection & ATT MTU Exchange** (§5.2, §7.1) | Partially Observed on Hardware | BLE connection duration (~1.2 s setup; 735.6 ms Linux connect call) and 512-byte API update value capacity observed on hardware. Exact ATT MTU exchange and Indication-only path are Specified (unverified on physical hardware). |
+| **Over-The-Air Data Transfer** (§7.1) | Observed on Physical Hardware | Synthetic 64-byte write and 256-byte read on Channel characteristic verified over physical BLE link. |
+| **BLE SAR Framing & State Machine** (§5.3) | Normative Specification | Fully specified with invariant total length, attribute capacity limits, pre-copy capacity checks, and stop-and-wait flow control. |
+| **Crockford Base32 Canonical Normalization** (§3.1) | Normative Specification | Fully specified 7-step pipeline with Crockford decode alias mapping (`I`/`L` $\to$ `1`, `O` $\to$ `0`). |
+| **CPaceRistretto255 Mathematical Primitives** (§6.1) | Reference Implementation | Implemented in Rust `crates/rapp/src/cpace.rs` per draft-irtf-cfrg-cpace-21 and RFC 9496; unit-tested with test vectors. (Defensive basepoint fallback on $2^{-252}$ and $PSK = \text{ISK}[0..32]$ truncation noted as RAPP design choices). |
 | **Attempt Reservation & Disconnect Oracle Protection** (§3.3) | Normative Specification | State machine rules fully defined. |
 | **Advancing-Counter Unbiased SAS Sampling** (§4.5) | Normative Specification | Mathematical algorithm with advancing block counter and exact uniform cutoff fully specified. |
-| **Noise_XXpsk3 & Noise_KKhfs Handshakes** (§4.3) | Normative Specification | Prologues, immediate identifier derivation, and post-quantum framing fully specified. |
-| **Authenticated Envelopes & 17 Registered Messages** (§7, §8) | Normative Specification | Complete CDDL schemas and normative semantics for all 17 registered message types fully specified herein (§7.1). |
+| **Noise_XXpsk3 & Noise_KKhfs Handshakes** (§6.2, §6.3) | Normative Specification | Complete token schedules, ML-KEM-768 encapsulation/decapsulation, directional key splits, and prologues fully specified. |
+| **Authenticated Envelopes & 17 Registered Messages** (§7, §8) | Normative Specification | Complete CDDL discriminated union schemas and normative semantics for all 17 registered message types fully specified herein (§7.1). |
 
 ### 1.3 Terminology and Requirements Language
 
@@ -104,7 +104,7 @@ The BLE transport acts as the underlying point-to-point bearer for RAPP session 
 └──────────────────────────────┬──────────────────────────────┘
                                │
                     Direct BLE 2.4 GHz Link
-       Negotiated ATT MTU >= 512 (Chunk <= MTU - 9, up to 506 B at MTU 515)
+       Negotiated ATT MTU >= 512 (sar_payload_capacity = min(MTU - 3, 512) - 6; max 506 B)
               RAPP Segmentation & Reassembly (SAR) Bearer
                                │
 ┌──────────────────────────────▼──────────────────────────────┐
@@ -190,7 +190,7 @@ To mathematically close this oracle while permitting the final legitimate attemp
    - **Active Attempt Clamping**: An active attempt cannot extend past the offer deadline: per rule 3, the attempt timer is strictly clamped by $\text{attempt\_deadline} = \min(5.0\text{ s}, \text{remaining\_offer\_ttl})$. Reserving an attempt at $t = 59\text{ s}$ yields an attempt deadline of $1.0\text{ s}$, terminating at $t = 60\text{ s}$.
    - **Fail-Stop Lockout and Exponential Backoff**: Triggered strictly upon attempt budget exhaustion (`attempts_failed == 3`). Upon fail-stop lockout:
      1. The Custodian destroys all ephemeral keys, terminates BLE advertising, and surfaces an on-screen notification to the user ("Pairing failed: 3 incorrect attempts. Pairing locked.").
-     2. The Custodian enforces an exponential backoff penalty of $2^n$ seconds before permitting the generation of a new offer, where $n = \text{consecutive\_failed\_offers}$ (capped at 300 seconds, i.e. $n \le 8$).
+     2. The Custodian enforces an exponential backoff penalty of $\text{delay\_seconds} = \min(2^n, 300\text{ s})$ before permitting the generation of a new offer, where $n = \text{consecutive\_failed\_offers}$ (saturating at $n = 9$; $2^8 = 256\text{ s}$, $2^9 \to 300\text{ s}$).
      3. The counter $n$ starts at $0$, increments by $1$ only upon a fail-stop lockout (`attempts_failed == 3`), and resets to $0$ upon any successful pairing completion (Phase 5), upon conscious manual user reset/unlock in the Custodian settings UI, or after 15 minutes of user inactivity. The counter $n$ is held in volatile memory and resets to $0$ across device reboot.
 8. **Single-Flight Serialization & Rate Limiting**:
    The Custodian **MUST NOT** accept concurrent GATT PAKE exchanges. Any secondary Central attempting to initiate CPace while `active_attempt` is true is immediately rejected with an ATT error (`0x80 Application Error`). In addition, pre-authentication connection attempts and invalid $Y_A$ candidate submissions are rate-limited to at most 1 attempt per 500 ms to mitigate serial resource consumption.
@@ -293,6 +293,7 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
 
 5. **Atomic Permanent Key Storage**:
    Only after SAS visual confirmation succeeds AND both `pairing.confirm` messages are processed:
+   - **Fresh Pair-Specific Static Keys**: Each pairing ceremony **MUST** generate a fresh, cryptographically independent static X25519 keypair $(s, s_{pub})$ on each endpoint. Static keys **MUST NOT** be reused across different peer pairings or across distinct pairing ceremonies. This provides pairwise endpoint isolation and prevents correlation across peers. Private keys **MUST** be stored in platform-encrypted secure hardware (Secure Enclave / TPM / OS Keychain), excluded from backups and cloud synchronization, and marked non-exportable.
    - Each endpoint atomically persists the pairing trust record:
      - `pair_id`
      - `rendezvous_token`
@@ -318,13 +319,13 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
    - **Rendezvous Privacy Analysis & Presence Oracle**:
      Using `rendezvous_token` hides `pair_id` (which remains a strictly local identifier) and prevents observers from connecting the session to other pairings or credentials. However, two residual behaviors exist:
      1. *Token Recurrence Correlation*: Because `rendezvous_token` is static per pairing, a radio observer capturing multiple reconnect preambles over time can recognize that token's recurrence and correlate that the same unidentified pairing is reconnecting. Stronger unlinkability across reconnections would require rotating tokens (a separate profile extension); it is not claimed for this static token.
-     2. *Presence Probing Oracle*: An unauthenticated nearby attacker who replays a captured `rendezvous_token` observes that the Custodian does not immediately close the link in `Phase::Routing`, but instead proceeds to `Phase::NoiseSession` (`Noise_KKhfs`). In `Noise_KKhfs`, the Custodian must process handshake message 1 (performing `mix_hash`, DH operations, and ML-KEM decapsulation) before payload AEAD authentication fails and the connection is dropped. The timing difference between an unknown token (immediate link drop in Phase::Routing) and a known token (handshake message 1 processing) constitutes an accepted residual presence oracle for static tokens. This is mitigated by single-flight connection serialization and rate-limiting reconnect attempts from unauthenticated centrals.
+     2. *Presence Probing Oracle*: An unauthenticated nearby attacker who replays a captured `rendezvous_token` observes that the Custodian does not immediately close the link in `Phase::Routing`, but instead proceeds to `Phase::NoiseSession` (`Noise_KKhfs`). In `Noise_KKhfs`, the Custodian processes handshake message 1 (performing `mix_hash`, DH operations, and ML-KEM encapsulation key decryption and parsing; it does not decapsulate) before payload AEAD authentication fails and the connection is dropped. Depending on the input, processing can fail during ephemeral key validation, DH computation, ML-KEM key decryption, static DH, or payload authentication. The timing difference between an unknown token (immediate link drop in Phase::Routing) and a known token (handshake message 1 processing) constitutes an accepted residual presence oracle for static tokens. This is mitigated by single-flight connection serialization and rate-limiting reconnect attempts from unauthenticated centrals.
    - Session Prologue:
      ```cddl
      session-prologue = [
        "RAPP-session-v1",
        [26, 10],                                                        ; wire version [major, minor]
-       "Noise_KKhfs_25519+MLKEM768_ChaChaPoly_SHA512",                 ; suite name
+       "Noise_KKhfs_25519+MLKEM768_ChaChaPoly_SHA512",                  ; suite name
        pair_id,                                                         ; bstr .size 16
        grants_hash,                                                     ; bstr .size 32
        "fi.refineid.rapp.ble.v1"                                        ; transport profile name
@@ -453,18 +454,25 @@ All RAPP messages over the Channel Characteristic **MUST** be encapsulated in th
   - `0x01` (`FIRST`): Initial fragment of a multi-fragment frame.
   - `0x02` (`CONT`): Intermediate fragment.
   - `0x04` (`LAST`): Final fragment.
-  - `0x05` (`SINGLE` = `FIRST | LAST`): Self-contained single-fragment message (payload $\le (\text{negotiated\_mtu} - 9)$ bytes, e.g. $\le 506$ bytes at MTU 515, or $\le 503$ bytes at MTU 512).
+  - `0x05` (`SINGLE` = `FIRST | LAST`): Self-contained single-fragment message (carrying payload $\le \text{sar\_payload\_capacity}$).
   - All other bit patterns are illegal. Any message with non-zero reserved bits (bits 3–7) or illegal flag combinations (e.g., `0x00`, `0x03`, `0x06`, `0x07`) MUST be rejected as an unrecoverable protocol violation.
 - **Reserved** (`u8`, 1 byte): Must be set to `0x00`.
 
 #### Normative SAR Receive State Machine with Invariant Total Length:
-1. **Capacity & MTU Requirement**: Negotiated ATT MTU **MUST** be $\ge 512$ bytes (effective chunk payload capacity is $(\text{negotiated\_mtu} - 9)$ bytes; e.g. at ATT MTU 515 bytes, maximum chunk payload is 506 bytes; at ATT MTU 512 bytes, maximum chunk payload is 503 bytes). If negotiated MTU $< 512$ bytes, connection MUST be dropped.
+1. **Capacity & MTU Requirement**: Negotiated ATT MTU **MUST** be $\ge 512$ bytes.
+   Per Bluetooth Core Specification v5.4, Vol 3, Part F, Section 3.2.9, any attribute value is hard-capped at 512 bytes. Accounting for the 3-byte ATT header and the 6-byte SAR header, the uniform maximum fragment payload capacity for all fragments (`FIRST`, `CONT`, `LAST`, `SINGLE`) is defined as:
+   $$\text{sar\_payload\_capacity} = \min(\text{negotiated\_att\_mtu} - 3, 512) - 6$$
+   Any smaller platform-reported usable value limit (e.g. `maximumUpdateValueLength`) **MUST** also be honored.
+   - At negotiated ATT MTU 512: $\min(509, 512) - 6 = 503\text{ bytes}$.
+   - At negotiated ATT MTU 515: $\min(512, 512) - 6 = 506\text{ bytes}$.
+   - At negotiated ATT MTU 517: $\min(514, 512) - 6 = 506\text{ bytes}$.
+   If negotiated ATT MTU $< 512$ bytes, the connection **MUST** be dropped immediately.
 2. **Initial Fragment Processing (Receiver Idle: `expected_seq == 0` and `accumulated_bytes == 0`)**:
    - The fragment MUST have `flags == FIRST` (`0x01`) or `flags == SINGLE` (`0x05`), and `Chunk Sequence == 0`.
    - Validate `Total Frame Length`:
      - Range: $1 \le \text{Total Frame Length} \le 65{,}535$.
-     - For `SINGLE` (`flags == 0x05`): MUST satisfy $\text{Total Frame Length} == \text{fragment\_payload\_len} \le (\text{negotiated\_mtu} - 9)$.
-     - For `FIRST` (`flags == 0x01`): MUST satisfy $\text{fragment\_payload\_len} \ge 64$ and $\text{fragment\_payload\_len} < \text{Total Frame Length}$.
+     - For `SINGLE` (`flags == 0x05`): MUST satisfy $\text{Total Frame Length} == \text{fragment\_payload\_len} \le \text{sar\_payload\_capacity}$.
+     - For `FIRST` (`flags == 0x01`): MUST satisfy $64 \le \text{fragment\_payload\_len} \le \text{sar\_payload\_capacity}$ and $\text{fragment\_payload\_len} < \text{Total Frame Length}$.
    - Latch `expected_total = fragment.total_frame_length`. This latched value is frozen for the duration of the frame.
    - Arm non-extendable 5.0-second reassembly timer.
 3. **Subsequent Fragment Processing (`expected_seq > 0`)**:
@@ -503,7 +511,7 @@ All RAPP messages over the Channel Characteristic **MUST** be encapsulated in th
    - CPace Step 1 ($Y_A$): raw 32 bytes of compressed Ristretto255 point $Y_A$ encapsulated in a `SINGLE` SAR frame (`Total Frame Length = 32`, `Chunk Sequence = 0`, `Flags = 0x05`).
    - CPace Step 2 ($Y_B, T_B$): raw concatenation $Y_B \parallel T_B$ ($32 + 32 = 64\text{ bytes}$) encapsulated in a `SINGLE` SAR frame (`Total Frame Length = 64`, `Chunk Sequence = 0`, `Flags = 0x05`).
    - CPace Step 3 ($T_A$): raw 32 bytes of confirmation authenticator $T_A$ encapsulated in a `SINGLE` SAR frame (`Total Frame Length = 32`, `Chunk Sequence = 0`, `Flags = 0x05`).
-   - Noise Handshake & Transport Frames: raw Noise ciphertext payloads encapsulated in SAR frames (segmented across multiple chunks if payload exceeds $(\text{negotiated\_mtu} - 9)$ bytes, e.g. $> 506$ bytes at MTU 515, $> 503$ bytes at MTU 512).
+   - Noise Handshake & Transport Frames: raw Noise ciphertext payloads encapsulated in SAR frames (segmented across multiple chunks if payload exceeds $\text{sar\_payload\_capacity} = \min(\text{negotiated\_att\_mtu} - 3, 512) - 6$ bytes, e.g. $> 506$ bytes at MTU $\ge 515$, $> 503$ bytes at MTU 512).
 10. **Phase-Specific Frame Dispatch**:
    - Reassembled complete frames are dispatched strictly according to the internal connection state machine:
      - `Phase::Routing`: Dispatched to connection routing evaluator (Section 5.2).
@@ -514,11 +522,18 @@ All RAPP messages over the Channel Characteristic **MUST** be encapsulated in th
 
 ---
 
-## 6. Normative Cryptographic Protocol: `CPaceRistretto255`
+### 6. Normative Cryptographic Protocols
 
-RAPP v26.10.1 strictly implements **`CPaceRistretto255`** per [draft-irtf-cfrg-cpace-21 Section 7.2 & Appendix A.2](https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-cpace-21) and reference implementation [`crates/rapp/src/cpace.rs`](../../crates/rapp/src/cpace.rs):
+RAPP v26.10.1 specifies three normative cryptographic protocols:
+1. **`CPaceRistretto255`**: Password-Authenticated Key Exchange (PAKE) for initial proximity pairing (§6.1).
+2. **`Noise_XXpsk3`**: Initial mutual pairing authentication handshake (§6.2).
+3. **`Noise_KKhfs`**: Hybrid post-quantum operational session handshake (§6.3).
 
-### 6.1 Cryptographic Suite Definition
+### 6.1 CPaceRistretto255 (draft-irtf-cfrg-cpace-21 & RFC 9496)
+
+RAPP v26.10.1 implements **`CPaceRistretto255`** per [draft-irtf-cfrg-cpace-21 Section 7.2 & Appendix A.2](https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-cpace-21) and reference implementation [`crates/rapp/src/cpace.rs`](../../crates/rapp/src/cpace.rs):
+
+#### 6.1.1 Cryptographic Suite Definition
 - **Group**: Prime-order Ristretto255 group (order $q = 2^{252} + 27742317777372353535851937790883648493$).
 - **Hash Function**: SHA-512 (block size 128 bytes, output 64 bytes).
 - **Domain Separation Identifiers (DSI)**:
@@ -527,14 +542,14 @@ RAPP v26.10.1 strictly implements **`CPaceRistretto255`** per [draft-irtf-cfrg-c
 - **MapToGroup**: Maps 64-byte uniform hash output to a Ristretto255 group element using `RistrettoPoint::from_uniform_bytes` per [RFC 9496 Section 4.3.4](https://www.rfc-editor.org/rfc/rfc9496.html#section-4.3.4) and draft-irtf-cfrg-cpace-21 Appendix A.2. If the mapped point is the group identity $\mathcal{O}$ (probability $2^{-252}$), fallback to `RISTRETTO_BASEPOINT_POINT`. (Note: This fallback to the basepoint constant is an RAPP-specific defensive extension implemented in `crates/rapp/src/cpace.rs` to guarantee non-identity output; it is not defined in draft-21 §8.3 or RFC 9496 §4.3.4).
 - **PAKE Identity Binding & Role Separation**: CPace is executed purely as an anonymous PAKE to exchange ephemeral keys and establish a shared secret $PSK$ under the random session identifier $SID$. Endpoint party identifiers ($\text{ID}_A, \text{ID}_B$) and auxiliary data ($\text{AD}_A, \text{AD}_B$) in CPace are empty ($\emptyset$); mutual endpoint authentication and cryptographic identity binding are deferred to the subsequent `Noise_XXpsk3` handshake. The Requester acts strictly as Initiator ($A$), transmitting via `ATT_WRITE_REQ`, while the Custodian acts strictly as Responder ($B$), transmitting via `ATT_HANDLE_VALUE_IND`. Per draft-irtf-cfrg-cpace-21 Section 10.1, this fixed asymmetric role assignment prevents relay loopback and reflection attacks.
 
-### 6.2 Generator Derivation (draft-21 Appendix A.2)
+#### 6.1.2 Generator Derivation (draft-21 Appendix A.2)
 The generator point $G$ is derived from length-value encoding with single zero-padding:
 $$\text{len\_zpad} = \max(0, 128 - 1 - |\text{prepend\_len}(\text{pw})| - |\text{prepend\_len}(\text{DSI})|)$$
 $$\text{gen\_input} = \text{lv\_cat}(\text{DSI}, \text{pw}, \text{zero\_bytes}(\text{len\_zpad}), \text{CI}=\emptyset, \text{SID})$$
 $$G = \text{MapToGroup}(\text{SHA-512}(\text{gen\_input}))$$
 where $\text{prepend\_len}(x)$ prefixes $x$ with its LEB128 length, and $\text{CI}$ is empty length-value (`&[]`).
 
-### 6.3 Ephemeral Exchange & Validation
+#### 6.1.3 Ephemeral Exchange & Validation
 1. **Initiator (Requester)**:
    - Samples 64 random bytes, derives scalar $x_A = \text{Scalar::from\_bytes\_mod\_order\_wide}(\text{random}_A)$.
    - Verifies $x_A \ne 0$.
@@ -564,8 +579,139 @@ where $\text{prepend\_len}(x)$ prefixes $x$ with its LEB128 length, and $\text{C
    - Upon verification, Custodian clears `active_attempt`, cancels the PAKE attempt timer, and transfers exclusive ownership to `Phase::NoisePairing`.
    - Both parties extract the 32-byte Application Pairing Secret ($PSK$):
      $$PSK = \text{ISK}[0..32]$$
-     (Design Note: Slicing the first 32 bytes of the 64-byte uniform $\text{ISK}$ is an intentional RAPP design choice per draft-irtf-cfrg-cpace-21 Section 7 and Section 10.4, which permits applications to define custom secret derivations and confirmation tags; because SHA-512 yields 512 bits of cryptographically uniform pseudorandom output, truncating the first 256 bits directly into $PSK$ avoids unnecessary KDF overhead while preserving 128-bit post-quantum and 256-bit classical security).
+     (Design Note: Slicing the first 32 bytes of the 64-byte uniform $\text{ISK}$ is an intentional RAPP design choice relative to the general KDF recommendations in draft-irtf-cfrg-cpace-21 Section 10.3 and Section 10.4, directly matching the reference implementation in `crates/rapp/src/cpace.rs`. Under CPace assumptions, security of the PAKE is bounded by the ~252-bit prime order of Ristretto255 (~126 bits of classical security against Pollard's rho) and the online rate limiting of the human pairing code. Classical discrete-log PAKEs are not post-quantum secure against large-scale quantum computers; hybrid post-quantum forward secrecy against future quantum adversaries is established separately during subsequent operational sessions via the `Noise_KKhfs` handshake using ML-KEM-768).
    - $PSK$ is passed directly as the pre-shared key into the `Noise_XXpsk3` pairing handshake.
+
+### 6.2 Noise_XXpsk3 Pairing Handshake (RFC 7748, RFC 8439, RFC 5869)
+
+- **Suite**: `Noise_XXpsk3_25519_ChaChaPoly_SHA512`
+- **Underlying Primitives**:
+  - DH: Curve25519 / X25519 per [RFC 7748](https://www.rfc-editor.org/rfc/rfc7748.html) (32-byte keys).
+  - Cipher: ChaCha20-Poly1305 per [RFC 8439](https://www.rfc-editor.org/rfc/rfc8439.html) (32-byte key, 12-byte nonce, 16-byte tag). Nonce layout: 4 zero bytes (`0x00, 0x00, 0x00, 0x00`) followed by 8 big-endian bytes representing the 64-bit sequence counter.
+  - Hash: SHA-512 per [FIPS 180-4](https://doi.org/10.6028/NIST.FIPS.180-4) (64-byte output, 128-byte block size).
+  - KDF: HKDF-SHA-512 per [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html).
+- **Fresh Static Key Generation Requirement**:
+  Each pairing ceremony **MUST** generate a fresh, cryptographically independent static X25519 keypair $(s, s_{pub})$ on each endpoint. Static keys **MUST NOT** be reused across different peer pairings. Private keys MUST be stored in platform-encrypted secure hardware and marked non-exportable.
+- **Handshake Pattern**:
+  ```text
+  Noise_XXpsk3(s, rs):
+    -> e
+    <- e, ee, s, es
+    -> s, se, psk
+  ```
+- **Pre-messages**: None.
+- **Prologue**: `encode_deterministic_cbor(pairing-prologue)` (§4.3.1).
+- **PSK Input**: The 32-byte $PSK = \text{ISK}[0..32]$ derived from CPace (§6.1.4) is injected as the pre-shared key at token `psk` (`MixKey(psk)`).
+- **Handshake Payload Policy**: All handshake message payloads are empty ($\emptyset$, length 0). Encrypting an empty payload produces a 16-byte Poly1305 authentication tag.
+- **Handshake Messages**:
+  - Message 1 (Initiator -> Responder):
+    Tokens: `e`.
+    Carries unencrypted 32-byte ephemeral public key $e_{pub}$.
+    Total size: 32 bytes.
+  - Message 2 (Responder -> Initiator):
+    Tokens: `e, ee, s, es`.
+    Carries unencrypted 32-byte ephemeral public key $e_{pub}$, encrypted 32-byte static public key $s_{pub}$ (48 bytes including 16-byte Poly1305 tag), and 16-byte empty payload tag.
+    Total size: $32 + 48 + 16 = 96$ bytes.
+  - Message 3 (Initiator -> Responder):
+    Tokens: `s, se, psk`.
+    Carries encrypted 32-byte static public key $s_{pub}$ (48 bytes including 16-byte Poly1305 tag), mixes $psk$, and 16-byte empty payload tag.
+    Total size: $48 + 16 = 64$ bytes.
+- **Immediate Channel Identifier Derivation**:
+  Upon completing Message 3, both endpoints derive channel identifiers from the completed 64-byte handshake hash $h$:
+  ```text
+  session_id       = first 16 bytes of SHA-512("RAPP-session-id-v1" || h)
+  pair_id          = first 16 bytes of SHA-512("RAPP-pair-id-v1" || h)
+  rendezvous_token = first 16 bytes of SHA-512("RAPP-rendezvous-v1" || h)
+  ```
+  Both peers immediately zeroize $PSK$ and ephemeral keys.
+
+### 6.3 Noise_KKhfs Operational Session Handshake (NIST FIPS 203, RFC 7748, RFC 8439, RFC 5869)
+
+- **Suite**: `Noise_KKhfs_25519+MLKEM768_ChaChaPoly_SHA512`
+- **Pinned Cryptographic Standards**:
+  - Noise Protocol Framework: Revision 34 (June 2018), with the Hybrid Forward Secrecy (HFS) extension.
+  - Classical DH: Curve25519 / X25519 per [RFC 7748](https://www.rfc-editor.org/rfc/rfc7748.html) (32-byte keys).
+  - Post-Quantum KEM: ML-KEM-768 per [NIST FIPS 203](https://doi.org/10.6028/NIST.FIPS.203):
+    - Encapsulation key ($ek$ / public key) size: 1,184 bytes.
+    - Decapsulation key ($dk$ / private key) size: 2,400 bytes (or 64-byte seed).
+    - Ciphertext ($ct$) size: 1,088 bytes.
+    - Shared secret ($ss_{kem}$) size: 32 bytes.
+  - AEAD Cipher: ChaCha20-Poly1305 per [RFC 8439](https://www.rfc-editor.org/rfc/rfc8439.html) (32-byte key, 12-byte nonce, 16-byte tag). Nonce layout: 4 zero prefix bytes followed by 8 big-endian sequence counter bytes.
+  - Hash Function: SHA-512 per [FIPS 180-4](https://doi.org/10.6028/NIST.FIPS.180-4) (64-byte output, 128-byte block size).
+  - Key Derivation: HKDF-SHA-512 per [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html).
+- **Handshake Pattern**:
+  ```text
+  Noise_KKhfs(s, rs):
+    <- s
+    -> s
+    ...
+    -> e, es, ekem, ss
+    <- e, ee, kemct, se
+  ```
+- **State Initialization**:
+  1. `protocol_name` = `"Noise_KKhfs_25519+MLKEM768_ChaChaPoly_SHA512"` (46 ASCII bytes).
+  2. Because $|\text{protocol\_name}| \le 64$, $h$ is initialized by right-padding with 18 zero bytes to 64 bytes:
+     $$h = \text{protocol\_name} \parallel 0^{18}$$
+  3. Chaining key initialized to $ck = h$.
+  4. MixHash(prologue): $h = \text{SHA-512}(h \parallel \text{prologue})$ where prologue is `encode_deterministic_cbor(session-prologue)` (§4.3.6).
+  5. Pre-message static point hashing:
+     - Initiator (Requester): $h = \text{SHA-512}(h \parallel s_{local\_pub})$; then $h = \text{SHA-512}(h \parallel s_{remote\_pub})$.
+     - Responder (Custodian): $h = \text{SHA-512}(h \parallel s_{remote\_pub})$; then $h = \text{SHA-512}(h \parallel s_{local\_pub})$.
+- **Message 1 (Initiator -> Responder)**: Tokens `e, es, ekem, ss`
+  1. `e`: Initiator samples fresh ephemeral X25519 private key $e_{priv}$, computes 32-byte public key $e_{pub} = \text{X25519}(e_{priv}, G)$. Appends $e_{pub}$ (32 bytes) unencrypted to message buffer. Calls `MixHash(e_pub)`: $h = \text{SHA-512}(h \parallel e_{pub})$.
+  2. `es`: Initiator computes classical DH shared secret $DH(e_{priv}, rs_{pub})$ (32 bytes). Calls `MixKey`:
+     $$(ck, k) = \text{HKDF-SHA-512}(ck, DH(e_{priv}, rs_{pub}), 2)$$
+     Cipher state rekeyed with $k$, sequence counter reset to 0.
+  3. `ekem`: Initiator generates fresh ephemeral ML-KEM-768 keypair $(dk_E, ek_E)$ per NIST FIPS 203 ($ek_E$ is 1,184 bytes).
+     Calls `EncryptAndHash(ek_E)`: encrypts 1,184-byte $ek_E$ under current cipher state using $h$ as associated data. Produces 1,200 bytes ($1,184 + 16$ Poly1305 tag). Appends encrypted key to message buffer. Updates $h = \text{SHA-512}(h \parallel \text{ciphertext})$.
+  4. `ss`: Initiator computes static DH shared secret $DH(s_{priv}, rs_{pub})$ (32 bytes). Calls `MixKey`:
+     $$(ck, k) = \text{HKDF-SHA-512}(ck, DH(s_{priv}, rs_{pub}), 2)$$
+     Cipher state rekeyed with $k$, sequence counter reset to 0.
+  5. Handshake Payload: Empty ($\emptyset$). Initiator calls `EncryptAndHash("")` with $h$ as associated data, producing a 16-byte Poly1305 authentication tag appended to message buffer. Updates $h = \text{SHA-512}(h \parallel \text{tag})$.
+  **Total Message 1 Length**: $32 + 1{,}200 + 16 = 1{,}248\text{ bytes}$.
+- **Message 1 Processing by Responder (Custodian)**:
+  1. Reads 32 bytes $e_{pub}$. Validates non-zero point. Calls `MixHash(e_pub)`.
+  2. Computes $DH(s_{priv}, e_{pub})$ (32 bytes). Calls `MixKey`.
+  3. Reads 1,200 bytes encrypted ML-KEM key. Calls `DecryptAndHash`: verifies Poly1305 tag with $h$ as associated data and decrypts 1,184-byte $ek_E$. Parses $ek_E$ per NIST FIPS 203. Updates $h = \text{SHA-512}(h \parallel \text{ciphertext})$. (Note: The Responder does NOT decapsulate here).
+  4. Computes $DH(s_{priv}, rs_{pub})$ (32 bytes). Calls `MixKey`.
+  5. Reads 16-byte encrypted empty payload tag. Calls `DecryptAndHash`: verifies Poly1305 tag over empty plaintext with $h$ as associated data. Updates $h = \text{SHA-512}(h \parallel \text{tag})$.
+- **Message 2 (Responder -> Initiator)**: Tokens `e, ee, kemct, se`
+  1. `e`: Responder samples fresh ephemeral X25519 private key $e_{priv}$, computes 32-byte public key $e_{pub}$. Appends $e_{pub}$ (32 bytes) unencrypted to message buffer. Calls `MixHash(e_pub)`.
+  2. `ee`: Responder computes ephemeral DH shared secret $DH(e_{priv}, re_{pub})$ (32 bytes). Calls `MixKey`.
+  3. `kemct`: Responder encapsulates against initiator's ML-KEM-768 public key $ek_E$ per NIST FIPS 203:
+     $$(ct, ss_{kem}) = \text{ML-KEM-768.Encaps}(ek_E)$$
+     producing 1,088-byte ciphertext $ct$ and 32-byte shared secret $ss_{kem}$.
+     Calls `EncryptAndHash(ct)`: encrypts 1,088-byte $ct$ under current cipher state with $h$ as associated data. Produces 1,104 bytes ($1,088 + 16$ Poly1305 tag). Appends to message buffer. Updates $h = \text{SHA-512}(h \parallel \text{ciphertext})$.
+     Then mixes KEM shared secret via `MixKey(ss_kem)`:
+     $$(ck, k) = \text{HKDF-SHA-512}(ck, ss_{kem}, 2)$$
+     Cipher state rekeyed with $k$, sequence counter reset to 0.
+  4. `se`: Responder computes DH shared secret $DH(e_{priv}, rs_{pub})$ (32 bytes). Calls `MixKey`.
+  5. Handshake Payload: Empty ($\emptyset$). Calls `EncryptAndHash("")` with $h$ as associated data, producing a 16-byte Poly1305 authentication tag appended to message buffer. Updates $h = \text{SHA-512}(h \parallel \text{tag})$.
+  **Total Message 2 Length**: $32 + 1{,}104 + 16 = 1{,}152\text{ bytes}$.
+- **Message 2 Processing by Initiator (Requester)**:
+  1. Reads 32 bytes $e_{pub}$. Calls `MixHash(e_pub)`.
+  2. Computes $DH(e_{priv}, re_{pub})$ (32 bytes). Calls `MixKey`.
+  3. Reads 1,104 bytes encrypted ML-KEM ciphertext. Calls `DecryptAndHash`: verifies Poly1305 tag with $h$ as associated data and decrypts 1,088-byte $ct$. Updates $h = \text{SHA-512}(h \parallel \text{ciphertext})$.
+     Initiator decapsulates $ct$ using its ephemeral ML-KEM-768 decapsulation key $dk_E$ per NIST FIPS 203:
+     $$ss_{kem} = \text{ML-KEM-768.Decaps}(dk_E, ct)$$
+     Calls `MixKey(ss_kem)` to mix the recovered 32-byte shared secret.
+  4. Computes $DH(s_{priv}, re_{pub})$ (32 bytes). Calls `MixKey`.
+  5. Reads 16-byte encrypted empty payload tag. Calls `DecryptAndHash`: verifies Poly1305 tag over empty plaintext with $h$ as associated data. Updates $h = \text{SHA-512}(h \parallel \text{tag})$.
+- **Transport Mode Transition & Directional Key Split**:
+  Immediately upon completing Message 2:
+  1. Both endpoints call `Split()` on the final chaining key $ck$:
+     $$PRK = \text{HMAC-SHA-512}(ck, \emptyset)$$
+     $$out1 = \text{HMAC-SHA-512}(PRK, \text{0x01})$$
+     $$out2 = \text{HMAC-SHA-512}(PRK, out1 \parallel \text{0x02})$$
+     $$c_1 = out1[0..32], \quad c_2 = out2[0..32]$$
+  2. Directional Key Assignment:
+     - **Initiator (Requester)**: Transmits using cipher key $c_1$; receives using cipher key $c_2$.
+     - **Responder (Custodian)**: Transmits using cipher key $c_2$; receives using cipher key $c_1$.
+  3. Both cipher states initialize sequence nonces to 0. Nonces increment strictly by 1 for each encrypted frame.
+  4. Operational Session Identifier Derivation:
+     $$\text{session\_id} = \text{SHA-512}(\texttt{"RAPP-session-id-v1"} \parallel h)[0..16]$$
+     This fresh 16-byte `session_id` scopes all envelopes in the operational session.
+  5. Ephemeral handshake state ($e_{priv}, dk_E, ss_{kem}$) is immediately zeroized.
 
 ---
 
@@ -575,53 +721,29 @@ where $\text{prepend\_len}(x)$ prefixes $x$ with its LEB128 length, and $\text{C
 Every message transmitted inside an established pairing channel (`Phase::NoisePairing`) or operational session (`Phase::NoiseSession`) is encapsulated in a deterministic CBOR envelope conforming to the following normative CDDL specification:
 
 ```cddl
-rapp-message = {
-  "version": [26, 10],            ; wire version [major, minor]
-  "type": message-type,           ; registered message type
-  "session_id": bstr .size 16,    ; active channel/session identifier
-  "sequence": uint,               ; 0-based monotonic sequence counter (u64)
-  "body": message-body,           ; typed payload map
-  ? "critical": [* tstr],         ; unrecognized critical fields abort session
-  ? "extensions": { * tstr => any }; forward-compatible non-critical data
-}
+rapp-message =
+    { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "pairing.hello", "body": pairing-hello-body, * common-opt }
+  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "pairing.confirm", "body": pairing-confirm-body, * common-opt }
+  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "pairing.abort", "body": pairing-abort-body, * common-opt }
+  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "session.ready", "body": session-ready-body, * common-opt }
+  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "session.close", "body": session-close-body, * common-opt }
+  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "liveness.ping", "body": liveness-ping-body, * common-opt }
+  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "liveness.pong", "body": liveness-pong-body, * common-opt }
+  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "operation.request", "body": operation-request-body, * common-opt }
+  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "operation.prepared", "body": operation-prepared-body, * common-opt }
+  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "operation.commit", "body": operation-commit-body, * common-opt }
+  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "operation.cancel", "body": operation-cancel-body, * common-opt }
+  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "operation.result", "body": operation-result-body, * common-opt }
+  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "operation.result_ack", "body": operation-result-ack-body, * common-opt }
+  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "operation.status_request", "body": operation-status-request-body, * common-opt }
+  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "operation.status", "body": operation-status-body, * common-opt }
+  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "operation.progress", "body": operation-progress-body, * common-opt }
+  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "error", "body": error-body, * common-opt }
 
-message-type =
-    "pairing.hello"
-  / "pairing.confirm"
-  / "pairing.abort"
-  / "session.ready"
-  / "session.close"
-  / "liveness.ping"
-  / "liveness.pong"
-  / "operation.request"
-  / "operation.prepared"
-  / "operation.commit"
-  / "operation.cancel"
-  / "operation.result"
-  / "operation.result_ack"
-  / "operation.status_request"
-  / "operation.status"
-  / "operation.progress"
-  / "error"
-
-message-body =
-    pairing-hello-body
-  / pairing-confirm-body
-  / pairing-abort-body
-  / session-ready-body
-  / session-close-body
-  / liveness-ping-body
-  / liveness-pong-body
-  / operation-request-body
-  / operation-prepared-body
-  / operation-commit-body
-  / operation-cancel-body
-  / operation-result-body
-  / operation-result-ack-body
-  / operation-status-request-body
-  / operation-status-body
-  / operation-progress-body
-  / error-body
+common-opt = (
+  ? "critical": [* tstr],           ; unrecognized critical fields abort session
+  ? "extensions": { * tstr => any } ; forward-compatible non-critical data
+)
 
 ; 1. Pairing Peer Introduction
 pairing-hello-body = {
@@ -670,7 +792,9 @@ session-close-body = {
 }
 
 close-reason-val =
-    "user_disconnect"
+    "normal"
+  / "complete"
+  / "user_disconnect"
   / "policy"
   / "credential_rejected"
   / "protocol_violation"
@@ -806,6 +930,7 @@ error-body = {
 3. **Sequential Monotonic Sequencing (`sequence`) & Rollover Rules**:
    - The sequence counter starts at `0` independently for each direction (`0, 1, 2, ...`) and is represented as an unsigned 64-bit integer (`u64`).
    - It increases by exactly `1` for each transmitted envelope.
+   - **Initial State & Inbound Sequencing**: Before any inbound envelope has been received on an established transport channel, the expected incoming sequence counter is `0` (`expected_inbound_seq = 0`), and `last_received_sequence` is initialized to an unreceived state (`None` in local state, represented as `0` in outgoing acknowledge fields where sequence 0 has not yet arrived). The very first inbound envelope from a peer on a new session **MUST** have `sequence == 0`. Each accepted inbound envelope advances `expected_inbound_seq = expected_inbound_seq + 1` and updates `last_received_sequence = Some(envelope.sequence)`.
    - **Rollover & Session Lifetime**: If `sequence` approaches $2^{64}-1$, or upon reaching the local policy session limit (e.g. 10,000 messages or 1 hour of continuous inactivity), the endpoints MUST execute an orderly session restart by transmitting `session.close` with reason `"normal"` or `"shutdown"` and dropping the link. Subsequent operations reconnect via `Phase::Routing` with a fresh session and sequence reset to 0. Rollover is an orderly lifecycle transition, NOT a protocol violation or pairing revocation.
    - **Acknowledged Delivery & Invariants**: Because ATT Indications are stop-and-wait acknowledged (`ATT_HANDLE_VALUE_CFM`), and transport nonces are sequential, any confirmed sequence regression (backward jump, duplicate, or gap) observed across the authenticated decrypted stream proves that an authenticated peer tampered with protocol sequencing: close the session immediately and revoke pairing (Class 4). Outbound indication retries at the ATT layer are deduplicated by the underlying BLE controller before delivery to the RAPP layer.
 4. **Cryptographic AEAD Encapsulation**:
@@ -841,18 +966,24 @@ Credential operations (authentication signatures, qualified document signing) in
      This fixed-order array preimage binds the protocol domain label (`"RAPP-request-v1"`), the active `session_id`, the unique `operation_id`, the profile, the action, and all context/payload maps.
    - **`expires_after_ms` Semantics**:
      - `expires_after_ms` is strictly **excluded** from `request_hash` so that local expiry policies do not alter cryptographic commitments.
-     - If present, `expires_after_ms` MUST be $> 0$; a value of 0 is rejected immediately with error `invalid_lifetime`.
-     - Upon receiving `operation.request`, the Custodian derives a monotonic local deadline:
-       $$\text{local\_deadline} = \text{local\_start\_monotonic\_ms} + \min(\text{expires\_after\_ms}, \text{local\_policy\_max\_lifetime})$$
+     - If present, `expires_after_ms` MUST be $> 0$; a value of 0 is rejected immediately with error `invalid_lifetime`. If absent, the Custodian applies a local default lifetime $\text{effective\_expires\_after\_ms} = 300{,}000\text{ ms}$ (5 minutes).
+     - Upon receiving `operation.request`, the Custodian derives a monotonic local deadline using saturating arithmetic:
+       $$\text{local\_deadline} = \text{local\_start\_monotonic\_ms}.\text{saturating\_add}(\min(\text{effective\_expires\_after\_ms}, \text{local\_policy\_max\_lifetime}))$$
      - If `local_deadline` passes before the user authorizes the operation on the phone screen or before `operation.commit` is received, the operation expires. The Custodian transitions the state to `cancelled`, releases held resources, and responds with `operation.result` (`status: "cancelled"`, `error: "operation_expired"`). No card APDU is dispatched.
    - Custodian validates profile grants, parameters, and card state. If the action requires user approval or PIN verification, Custodian presents consent details on the phone screen.
    - Upon successful human authorization, Custodian responds with `operation.prepared` echoing `operation_id` and `request_hash`.
 2. **Phase 2: Commit & Execution**:
-   - Requester verifies `request_hash` and transmits `operation.commit`. Commit is the Requester's point of no return.
-   - **Commit-Time Recomputation & Validation**:
-     Upon receiving `operation.commit`, the Custodian **MUST** recompute `request_hash` from the active prepared request and compare it byte-for-byte against the `request_hash` in `operation.commit` and the journaled entry. If the hashes mismatch, the Custodian MUST reject the commit immediately as an authenticated protocol violation without dispatching any APDU to the smart card.
+   - Requester verifies `request_hash` received in `operation.prepared` and transmits `operation.commit`. Commit is the Requester's point of no return.
+   - **Commit Validation & Journaling Order**:
+     Upon receiving `operation.commit`, the Custodian evaluates the commit in strict sequence:
+     a. Verify that the operation exists in memory and is in state `Prepared`.
+     b. Verify that `commit.operation_id` matches prepared `operation_id`.
+     c. Recompute `request_hash` from the immutable in-memory prepared request fields (§8.2.1) and verify that received `commit.request_hash` matches byte-for-byte. If mismatching, reject immediately with `operation.result` carrying `status: "rejected"`, `error: "invalid_commitment"`; do not dispatch APDUs.
+     d. Before issuing any APDU to the smart card, the Custodian **MUST** write a durable write-ahead journal entry to persistent storage:
+        `[operation_id, session_id, pair_id, request_hash, state: "committed", timestamp]`.
+     e. If the durable journal write fails (e.g. storage I/O error, disk full), the Custodian **MUST NOT** dispatch APDUs to the card; it aborts execution and returns Class 3 `operation_failed`.
+     f. Once durably recorded, the Custodian verifies the retry counter floor (§10.3) and dispatches APDUs to the FINEID card over NFC.
    - Duplicate `operation.commit` frames matching the active `request_hash` are discarded idempotently without re-triggering card commands.
-   - Custodian writes write-ahead journal entry, verifies try counter floor (§10.3), and transmits APDU commands to the FINEID card over NFC.
    - Custodian transmits `operation.result` carrying the outcome.
    - For `status == "completed"`, Requester transmits `operation.result_ack`.
 3. **Safe Reads (Single-Phase Optimization)**:
@@ -899,37 +1030,52 @@ The profile registry defines the operations permitted over authenticated RAPP se
   - Response: `card_present` (`bool`), `atr` (`bstr`), `supported_profiles` (`[* tstr]`).
 - **`read_identity`** (Safe Read):
   - Context & Payload: Empty maps (`{}`).
-  - Response: Holder public metadata (pseudonymous identifier, issuance dates).
+  - Response:
+    ```cddl
+    read-identity-response = {
+      "card_holder_name": tstr .size (1..128),
+      "card_id": tstr .size (1..64),
+      "issuance_date": tstr .size (10..10),     ; "YYYY-MM-DD"
+      "expiration_date": tstr .size (10..10),   ; "YYYY-MM-DD"
+      "certificates": [ + bstr ],               ; Array of DER-encoded X.509 certificates
+      ? "token_display_name": tstr .size (1..64)
+    }
+    ```
 
 ### 9.2 Profile: `"fi.refineid.authentication.v1"`
 - **`read_certificate`** (Safe Read):
   - Payload: `{"kind": "authentication"}`.
   - Response: `certificate` (DER-encoded X.509 certificate bytes).
 - **`browser_authenticate`**:
-  - Context: `origin` (bounded non-empty text, e.g. `"https://login.example.fi"`).
+  - Context: `origin` (`tstr .size (1..256)`, e.g. `"https://login.example.fi"`).
   - Payload:
     - `key_profile` (`tstr`): Registered key profile (`"ecdsa_p256"`, `"ecdsa_p384"`, `"rsa_2048"`, `"rsa_3072"`).
     - `algorithm` (`tstr`): Registered algorithm (`"ecdsa_sha256"`, `"rsa_pkcs1_sha256"`). No other algorithms are defined in v26.10.1.
     - `digest` (`bstr`): Pre-hashed challenge bytes matching algorithm digest length (e.g. 32 bytes for SHA-256).
   - Validation: If a request specifies an unrecognized or unsupported `key_profile` or `algorithm`, the Custodian MUST respond with `operation.result` carrying `status: "rejected"` and `error: "unsupported_parameter"`. This is a semantic rejection, NOT an authenticated protocol violation (Class 4).
-  - Response: `signature` (`bstr`, raw signature bytes).
+  - Signature Wire Format:
+    - For `"ecdsa_sha256"`: The signature MUST be serialized as fixed-width raw IEEE P1363 big-endian concatenation $r \parallel s$. For `"ecdsa_p256"`, exactly 64 bytes (32-byte $r \parallel$ 32-byte $s$); for `"ecdsa_p384"`, exactly 96 bytes (48-byte $r \parallel$ 48-byte $s$). ASN.1 DER encoding is strictly prohibited on the wire.
+    - For `"rsa_pkcs1_sha256"`: The signature MUST be serialized as raw big-endian integer bytes matching the RSA key modulus length (256 bytes for `"rsa_2048"`, 384 bytes for `"rsa_3072"`), computed via RSASSA-PKCS1-v1_5 per RFC 8017 Section 8.2 (EMSA-PKCS1-v1_5 with SHA-256 DigestInfo prefix `3031300d060960864801650304020105000420` followed by 32-byte SHA-256 digest).
+  - Response: `signature` (`bstr`, matching the specified signature wire format).
 
 ### 9.3 Profile: `"fi.refineid.document-signing.v1"`
 - **`read_certificate`** (Safe Read):
   - Payload: `{"kind": "signature"}`.
   - Response: `certificate` (DER-encoded X.509 signature certificate bytes).
 - **`sign_document`**:
-  - Context: `document_name` (bounded text, e.g. `"Employment_Contract_2026.pdf"`).
+  - Context: `document_name` (`tstr .size (1..256)`, e.g. `"Employment_Contract_2026.pdf"`).
   - Payload: `key_profile`, `algorithm`, `digest` (pre-hashed document digest).
   - Consent: Always requires conscious visual confirmation and PIN 2 entry on Custodian screen.
+  - Signature Wire Format: Conforms strictly to the signature wire encoding specified in §9.2.
   - Response: `signature` (`bstr`).
 - **`batch_sign_documents`**:
-  - Context: `document_names` (`[1* tstr]`, list of 1 to 64 document display names).
+  - Context: `document_names` (`[1* tstr .size (1..256)]`, list of 1 to 64 document display names).
   - Payload:
     - `key_profile`, `algorithm`.
     - `digests` (`[1* bstr]`, ordered list of 1 to 64 document digests).
     - Invariant: `len(document_names) == len(digests) <= 64`.
   - Consent: Custodian presents full document list and collects PIN 2 once to authorize the entire batch.
+  - Signature Wire Format: Each entry conforms strictly to the signature wire encoding specified in §9.2.
   - Response: `signatures` (`[1* bstr]`, ordered list of signatures).
   - **Write-Ahead Journal Granularity and Crash Recovery**:
     - For `batch_sign_documents`, the Custodian maintains a durable journal entry recording per-document progress:
@@ -948,9 +1094,9 @@ The profile registry defines the operations permitted over authenticated RAPP se
 
 ### 10.1 Failure Classification
 1. **Pre-Authentication Invalid Input (Class 1)**: Malformed preamble, unknown routing token, invalid MTU, or out-of-order writes prior to Noise authentication. Action: close BLE connection immediately; zero stored state modified.
-2. **Transport Loss and Version Skew (Class 2)**: Radio drop, ATT timeout, link termination, or unexpected wire version on connect/envelope. Action: close active session; active operation marked `cancelled` (if before commit) or `ambiguous` (if committed). Stored pairing trust records and vault keys REMAIN INTACT. Smart card operations are NEVER re-executed.
+2. **Transport Loss, Bearer Disruption, and Version Skew (Class 2)**: Radio drop, ATT timeout, link termination, failed AEAD MAC verification / decryption failure on an established channel, or unexpected wire version on connect/envelope. Because the bearer is untrusted and subject to RF corruption or relay tampering, ciphertext authentication failure cannot establish authenticated peer misconduct. Action: terminate active session and BLE link immediately, zeroize ephemeral session state; active operation marked `cancelled` (if before commit) or `ambiguous` (if committed). Stored pairing trust records and vault keys REMAIN INTACT. Smart card operations are NEVER re-executed.
 3. **Stale-Reference Race and Semantic Rejection (Class 3)**: Decrypted operation message for an unknown or already terminal `operation_id` (e.g. commit arriving after cancel), or unsupported algorithm/parameter. Action: respond with `error` name `"unknown_operation"` or `operation.result` status `"rejected"` with `"unsupported_parameter"`; no pairing revocation.
-4. **Authenticated Protocol Violation (Class 4)**: Cryptographic AEAD MAC failure on established channel, verified sequence regression across confirmed link, parameter echo mismatch in `pairing.hello`, or repeat illegal phase transition from an authenticated paired peer. Action: close session immediately, mark pairing revoked, destroy pairing keys in local storage, and require new manual pairing.
+4. **Authenticated Protocol Violation (Class 4)**: Verified sequence regression across an established authenticated link (where AEAD MAC is valid and sequence < expected), parameter echo mismatch in an authenticated `pairing.hello`, authenticated `pair_id` mismatch, or explicit local user deletion/revocation. Action: close session immediately, mark pairing revoked, destroy pairing keys in local storage, and require new manual pairing.
 
 ### 10.2 Typo Handling vs. Permanent Card Lockout
 - **Ordinary Typo (Retries Remain)**: If the card reports invalid PIN 1, PIN 2, or CAN (`SW 63 Cx`), and remaining retry count $> 0$:
@@ -966,15 +1112,33 @@ The profile registry defines the operations permitted over authenticated RAPP se
 ### 10.3 Retry Floor Protection
 Before transmitting any command that could decrement a PIN try counter, the Custodian **MUST** query the card's remaining try counter. If the counter indicates $\le 1$ attempt remaining, the Custodian MUST enforce the low-retry confirmation workflow (§10.2). If the try counter is 0 or unreadable, the Custodian **MUST** refuse the operation without transmitting verification commands to the card.
 
-### 10.4 Standardized Error Envelope Body Schema
+### 10.4 Standardized Error Envelope Body Schema & Code Mapping
 ```cddl
 error-body = {
   "error_code": uint,
-  "error_name": tstr,
-  "message": tstr,
+  "error_name": tstr .size (1..64),
+  "message": tstr .size (1..512),
   ? "operation_id": bstr .size 16
 }
 ```
+
+| `error_name` | `error_code` | Semantic Description | Failure Class |
+| :--- | :--- | :--- | :--- |
+| `"unknown_operation"` | `1001` | Queried or committed `operation_id` is unknown or already terminal. | Class 3 |
+| `"operation_expired"` | `1002` | Local monotonic operation deadline passed prior to commit. | Class 3 |
+| `"user_cancelled"` | `1003` | User consciously declined or canceled the operation on the screen. | Class 3 |
+| `"unauthorized"` | `1004` | Requested profile or action is not granted in active pairing. | Class 3 |
+| `"unsupported_parameter"` | `1005` | Unsupported key profile, algorithm, or parameter value. | Class 3 |
+| `"card_locked"` | `1006` | Card retry counter exhausted / PIN blocked (`SW 69 83`). | Class 4 |
+| `"pin_blocked"` | `1007` | Specific PIN retry counter exhausted. | Class 4 |
+| `"invalid_credential"` | `1008` | Incorrect PIN entered; retries remain (`SW 63 Cx`). | Class 3 |
+| `"card_error"` | `1009` | APDU transmission failure, NFC loss, or smart card hardware fault. | Class 2 |
+| `"operation_failed"` | `1010` | Consequential hardware execution or durable journal write failed. | Class 3 |
+| `"duplicate_operation"` | `1011` | Non-idempotent attempt to execute an existing operation. | Class 3 |
+| `"user_declined"` | `1012` | User declined proceeding under low-retry warning floor. | Class 3 |
+
+**Normative Error Handling Rule**:
+Semantic error handling is driven exclusively by `error_name`. The numeric `error_code` is informative and provides predictable numeric mappings across language bindings. If an implementation receives an unrecognized `error_code` with a recognized `error_name`, `error_name` takes precedence. If both are unrecognized, the error MUST be handled as a general Class 3 `operation_failed`.
 
 ---
 
@@ -1001,20 +1165,22 @@ error-body = {
 | **Evil Twin / Rogue Beacon** | Attacker broadcasts identical Service UUID. | Requester requires matching code and post-handshake unbiased SAS device confirmation before dispatching operations. |
 | **Transparent Wormhole / Relay** | Attacker relays RF traffic over WAN between distant devices. | Advisory proximity gate limits local discovery; explicit user consent on phone screen displays exact operation details; strict asymmetric ATT and CPace role separation structurally prevents relay loopback and reflection (§4.4, §5.2, §6.3). |
 | **DoS Strike Burning** | Malicious central connects to phone to burn strikes. | Offers are open only upon explicit user trigger for 60 seconds; single-flight pre-authentication serialization limits concurrency. Fail-stop lockout imposes exponential backoff ($2^n$ seconds, up to 300 s) and alerts user with on-screen notification (§3.3.5). |
-| **Rendezvous Token Replay / Presence Probing** | Attacker sniffs static rendezvous_token and replays preamble to probe presence or induce cryptographic work. | Preamble is unauthenticated routing metadata only; knowing rendezvous_token never authenticates caller. Handshake fails payload authentication in Noise_KKhfs message 1 after ML-KEM decapsulation. Timing difference between unknown token and known token is an accepted residual presence oracle for static tokens; mitigated by single-flight connection serialization and reconnect rate-limiting (§4.3.6). |
+| **Rendezvous Token Replay / Presence Probing** | Attacker sniffs static rendezvous_token and replays preamble to probe presence or induce cryptographic work. | Preamble is unauthenticated routing metadata only; knowing rendezvous_token never authenticates caller. Handshake fails at message 1 (during DH computation, ML-KEM key decryption, or payload authentication). Timing difference between unknown token and known token is an accepted residual presence oracle for static tokens; mitigated by single-flight connection serialization and reconnect rate-limiting (§4.3.6). |
 
 ---
 
-## 13. Observed Hardware Evidence
+## 13. Empirical Physical Hardware Observations (Informative)
+
+This section provides informative reference data, observed hardware benchmarks, and implementation notes. Normative protocol requirements are established exclusively in Sections 1 through 12 and 14.
 
 Empirical execution was observed on physical hardware on October 1, 2026:
 - **Central (Requester)**: Linux host (Linux Kernel 7.0, BlueZ 5.85, Intel AX211 Bluetooth 5.4).
 - **Peripheral (Custodian)**: Apple iPhone 15 Pro Max (`RefineID-dev`, iOS 26/27).
 
 ### 13.1 Observed Metrics
-- **Connect Timing**: $735.6\text{ ms}$ (Linux `Device1.Connect()` call duration).
-- **Observed Notification Capacity**: $512\text{ bytes}$ (`maximumUpdateValueLength` on iOS).
-- **Synthetic Frame Transfer**: 64-byte write and 256-byte read verified over the air.
+- **Connect Timing**: $735.6\text{ ms}$ (Linux `Device1.Connect()` call duration; typical full connection establishment ~1.2 s).
+- **Observed Notification/Update Capacity**: $512\text{ bytes}$ (`maximumUpdateValueLength` on iOS peripheral API). Note: This is a platform API buffer capacity observation, not a direct trace of the ATT MTU exchange (which is specified in §5.2 as requiring MTU >= 512).
+- **Synthetic Frame Transfer**: 64-byte write and 256-byte read on Channel characteristic verified over the physical BLE link.
 - **Beacon Privacy**: Advertised standardized service UUID and generic name only; zero pairing code bits in broadcast.
 
 ### 13.2 Implementation Findings for BlueZ & CoreBluetooth
@@ -1029,9 +1195,15 @@ Empirical execution was observed on physical hardware on October 1, 2026:
 
 ## 14. ReFineID Project Security Rules Compliance
 
-1. **Rule #1 Secret Exclusion**:
-   PIN1, PIN2, CAN, and PUK values **MUST NEVER** traverse the Bluetooth radio link. The RAPP GATT protocol schema contains zero representations, fields, or serialization formats for credential secrets.
-2. **Credential Custody and Memory Safety**:
+1. **Inviolable Rule #1: Secret Exclusion over the Wire**:
+   PIN1, PIN2, CAN, and PUK values **MUST NEVER** traverse the Bluetooth radio link. The RAPP GATT protocol wire format contains zero fields, messages, or representations for credential secrets.
+2. **Inviolable Rule #2: Zero PIN and PIN-Length Logging Across All Environments**:
+   PIN codes (PIN1, PIN2), PUK, and CAN **MUST NEVER** be logged, printed, or rendered in any development, test, staging, or production context.
+   Furthermore, PIN lengths and candidate digit counts **MUST NEVER** be logged or rendered in error messages, diagnostic traces, or telemetry.
+   Disclosing candidate digit counts or PIN lengths leaks secret entropy and reduces keyspace security.
+   Diagnostic output (`diag!`), tracing, event logs, and `Display`/`Error` formatting must never include PIN values, PIN lengths, or candidate digit counts.
+   If specialized debugging is ever needed, it is done exclusively via temporary private test harnesses and never checked into the repository.
+3. **Credential Custody and Memory Safety**:
    All pairing codes, private CPace scalars ($x_A, x_B$), generator input buffers, intermediate keys ($\text{ISK}$), and session keys ($PSK, K_{\text{sess}}$) **MUST** implement zeroize-on-drop semantics and **MUST NOT** implement `Debug`, `Display`, or serialization traits.
-3. **Character Encoding Preservation**:
+4. **Character Encoding Preservation**:
    Card APDUs carrying ISO-8859-15 text are losslessly decoded to Unicode at the Custodian NFC layer before encapsulation into UTF-8 CBOR strings. Unmappable bytes trigger explicit validation errors rather than lossy replacement or silent truncation. Display UIs must fully render `§` (U+00A7), `€` (U+20AC), `ä` (U+00E4), `ö` (U+00F6).

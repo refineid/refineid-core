@@ -58,10 +58,10 @@ Per project engineering standards, specification requirements are strictly disti
 | **Over-The-Air Data Transfer** (§7.1) | Observed on Physical Hardware | Synthetic 64-byte write and 256-byte read on Channel characteristic verified over physical BLE link. |
 | **BLE SAR Framing & State Machine** (§5.3) | Normative Specification | Fully specified with invariant total length, attribute capacity limits, pre-copy capacity checks, and stop-and-wait flow control. |
 | **Crockford Base32 Canonical Normalization** (§3.1) | Normative Specification | Fully specified 7-step pipeline with Crockford decode alias mapping (`I`/`L` $\to$ `1`, `O` $\to$ `0`). |
-| **CPaceRistretto255 Mathematical Primitives** (§6.1) | Reference Implementation | Implemented in Rust `crates/rapp/src/cpace.rs` per draft-irtf-cfrg-cpace-21 and RFC 9496; unit-tested with test vectors. (Defensive basepoint fallback on $2^{-252}$ and $PSK = \text{ISK}[0..32]$ truncation noted as RAPP design choices). |
+| **CPaceRistretto255 KC2 Profile & Key Confirmation** (§6.1) | Normative Specification | Fully specified with Context $C$ binding, RFC 5869 HKDF key schedule, HMAC-SHA-512 confirmation tags $T_A, T_B$, and abort-on-identity. Synthetic vectors verified in test harness; workspace implementation in `crates/rapp/src/cpace.rs` pending migration. |
 | **Attempt Reservation & Disconnect Oracle Protection** (§3.3) | Normative Specification | State machine rules fully defined. |
 | **Advancing-Counter Unbiased SAS Sampling** (§4.5) | Normative Specification | Mathematical algorithm with advancing block counter and exact uniform cutoff fully specified. |
-| **Noise_XXpsk3 & Noise_KKhfs Handshakes** (§6.2, §6.3) | Normative Specification | Complete token schedules, ML-KEM-768 encapsulation/decapsulation, directional key splits, and prologues fully specified. |
+| **Noise_XXpsk3 & Noise_KKhfs Handshakes** (§6.2, §6.3) | Normative Specification | Complete token schedules (including 48-byte PSK Message 1 and little-endian sequence nonces), ML-KEM-768 encapsulation/decapsulation, directional key splits, and prologues fully specified. |
 | **Authenticated Envelopes & 17 Registered Messages** (§7, §8) | Normative Specification | Complete CDDL discriminated union schemas and normative semantics for all 17 registered message types fully specified herein (§7.1). |
 
 ### 1.3 Terminology and Requirements Language
@@ -89,7 +89,7 @@ The BLE transport acts as the underlying point-to-point bearer for RAPP session 
 #### Protocol Lifecycle:
 - **Phase 0: Routing (`Phase::Routing`)**: Every connection transmits exactly one `ble-rendezvous` preamble frame via `ATT_WRITE_REQ`. For purpose `"pairing"` with an active offer, the connection transitions to `Phase::CPace`. For purpose `"session"` with a matching stored `rendezvous_token`, the connection transitions to `Phase::NoiseSession`.
 - **Phase 1: Discovery & Bootstrap**: Read fresh random 32-byte `offer_id` (SID) and canonical `pairing-offer` from the Custodian's Bootstrap Characteristic. Compute canonical `offer_hash`.
-- **Phase 2: CPace Key Agreement (`Phase::CPace`)**: Execute `CPaceRistretto255` over GATT SAR frames to agree on $PSK = \text{ISK}[0..32]$. On success, transition to `Phase::NoisePairing`.
+- **Phase 2: CPace Key Agreement & Confirmation (`Phase::CPace`)**: Execute `CPaceRistretto255` KC2 profile over GATT SAR frames with Context $C$ binding, mutually authenticating via HMAC tags $T_B$ and $T_A$ to establish $PSK$ via HKDF-Expand. On success, transition to `Phase::NoisePairing` and consume the offer.
 - **Phase 3: Noise_XXpsk3 Pairing (`Phase::NoisePairing`)**: Perform authenticated pairing handshake with prologue bound to canonical `offer_hash`, wire version `[26, 10]`, suite, and transport profile name. Immediately on handshake completion, derive pairing-channel `session_id`, `pair_id`, and `rendezvous_token`. Exchange `pairing.hello` (parameter echo using `session_id`) and `pairing.confirm` (capability grants), deriving `grants_hash`.
 - **Phase 4: Post-Handshake SAS Confirmation**: Visually verify uniform 4-digit SAS derived from the authenticated Noise pairing handshake hash $h$ using an advancing block counter.
 - **Phase 5: Pair Storage & Operational Session**: Only after SAS confirmation and both grant confirmations succeed, atomically store the pairing trust record (`pair_id`, `rendezvous_token`, `grants_hash`, peer static public key, and local private key). Operational connections start in `Phase::Routing`, verify `rendezvous_token`, and open a fresh post-quantum `Noise_KKhfs` session with an independent operational `session_id`.
@@ -182,8 +182,9 @@ To mathematically close this oracle while permitting the final legitimate attemp
    Reserving the 3rd attempt (`attempts_admitted == 3`) blocks any further admissions (`attempts_admitted >= 3`). However, **ephemeral offer keys remain active during the attempt deadline to allow that 3rd attempt to successfully complete.**
 5. **No Refund on Disconnect or Timeout**:
    If the Requester disconnects, drops the link, or fails to deliver a valid mutual confirmation authenticator $T_A$ before the attempt deadline expires, `active_attempt` is cleared and `attempts_failed` increments. If `attempts_failed == 3`, the offer is permanently destroyed (fail-stop lockout).
-6. **Successful PAKE Completion**:
-   Upon receiving and verifying a valid $T_A$ within the attempt deadline, `active_attempt` is cleared, the PAKE attempt timer is canceled, and the session transitions exclusively to `Phase::NoisePairing`. Subsequent network faults during Noise are session-level events and do not consume PAKE attempts.
+6. **Successful PAKE Completion & Offer Consumption**:
+   Upon receiving and verifying a valid mutual confirmation authenticator $T_A$ within the attempt deadline, `active_attempt` is cleared, the PAKE attempt timer is canceled, the pairing offer is permanently marked **consumed** (disabling any subsequent admissions or attempt reservations under that `offer_id`), and the session transitions exclusively to `Phase::NoisePairing`. Subsequent network faults during Noise or human SAS rejection do not restore the consumed offer or alter PAKE strike accounting; any new pairing ceremony mandates generating a fresh offer and pairing code.
+   - **Multi-Attempt Session Independence**: Although the 32-byte `offer_id` ($SID$) is shared across the up to 3 admitted attempts of a single offer, every attempt generates fresh ephemeral scalars ($x_A, x_B$) drawn independently from CSPRNG ($> 252$ bits entropy). The ephemeral public points ($Y_A, Y_B$) and transcript hash $TH$ are unique across attempts with overwhelming probability ($\ge 1 - 2^{-252}$), cryptographically preventing cross-attempt replay. Offer consumption ensures that a successful key exchange cannot be re-executed or re-bound.
 7. **Offer Lifecycle & Expiry Separation**:
    The pairing offer is valid for exactly 60 seconds from user initiation (`offer_ttl_ms = 60000`).
    - **Clean Offer Expiry**: If the 60-second offer TTL expires without an active attempt or after all admitted attempts have finished with `attempts_failed < 3`, the offer is terminated cleanly: BLE advertising ceases and ephemeral offer keys are zeroized. No strike penalty or exponential backoff is imposed; the user may immediately start a new offer without delay.
@@ -224,7 +225,7 @@ pairing-offer = {
   "version": [26, 10, 1],     ; offer version triple
   "offer_id": bstr .size 32,    ; 32-byte cryptographic random SID
   "suites": [
-    "CPACE-RISTR255-SHA512 + Noise_XXpsk3_25519_ChaChaPoly_SHA512"
+    "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512"
   ],
   "profiles": [
     "fi.refineid.card-status.v1",
@@ -253,6 +254,7 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
 1. The Custodian exposes the **RAPP Bootstrap Characteristic** (`7E39FD03-A6B5-4D78-9E11-37E28E9545F1`, Read-only).
 2. The Requester connects over BLE and performs an `ATT_READ_REQ` on this characteristic to obtain `encode_deterministic_cbor(pairing-offer)`.
 3. The Requester parses `offer_id` (SID) for CPace Step 1 and computes `offer_hash` for the Noise pairing prologue. Both endpoints bind to `candidate_id = "ble-direct-1"`.
+4. The Requester validates that `pairing-offer.suites` contains an acceptable suite. Unsupported suites terminate the pairing flow immediately before CPace; automatic downgrade or fallback to unconfirmed legacy suites is strictly prohibited. (Deterministic CBOR serialization of `pairing-offer` with the KC2 suite is exactly 392 bytes, safely within the 511-byte ATT Read Response value capacity at minimum ATT MTU 512 and under the 512-byte attribute limit).
 
 ### 4.3 Mandatory Noise Binding, Temporal Derivation, and Reconnect Rendezvous
 
@@ -261,10 +263,10 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
    ```cddl
    pairing-prologue = [
      "RAPP-pairing-v1",
-     [26, 10],                                                        ; wire version [major, minor]
-     "CPACE-RISTR255-SHA512 + Noise_XXpsk3_25519_ChaChaPoly_SHA512", ; cryptographic suite name
-     bstr .size 32,                                                   ; offer_hash
-     "fi.refineid.rapp.ble.v1"                                        ; transport profile name
+     [26, 10],                                                            ; wire version [major, minor]
+     "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512", ; cryptographic suite name
+     bstr .size 32,                                                       ; offer_hash
+     "fi.refineid.rapp.ble.v1"                                            ; transport profile name
    ]
    ```
    $$\text{prologue} = \text{encode\_deterministic\_cbor}(\text{pairing-prologue})$$
@@ -529,9 +531,9 @@ RAPP v26.10.1 specifies three normative cryptographic protocols:
 2. **`Noise_XXpsk3`**: Initial mutual pairing authentication handshake (§6.2).
 3. **`Noise_KKhfs`**: Hybrid post-quantum operational session handshake (§6.3).
 
-### 6.1 CPaceRistretto255 (draft-irtf-cfrg-cpace-21 & RFC 9496)
+### 6.1 CPaceRistretto255 KC2 Profile (draft-irtf-cfrg-cpace-21, RFC 9496, RFC 5869)
 
-RAPP v26.10.1 implements **`CPaceRistretto255`** per [draft-irtf-cfrg-cpace-21 Section 7.2 & Appendix A.2](https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-cpace-21) and reference implementation [`crates/rapp/src/cpace.rs`](../../crates/rapp/src/cpace.rs):
+RAPP v26.10.1 specifies the **`CPaceRistretto255-KC2`** application profile over [draft-irtf-cfrg-cpace-21](https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-cpace-21), [RFC 9496](https://www.rfc-editor.org/rfc/rfc9496.html), and [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html):
 
 #### 6.1.1 Cryptographic Suite Definition
 - **Group**: Prime-order Ristretto255 group (order $q = 2^{252} + 27742317777372353535851937790883648493$).
@@ -539,55 +541,79 @@ RAPP v26.10.1 implements **`CPaceRistretto255`** per [draft-irtf-cfrg-cpace-21 S
 - **Domain Separation Identifiers (DSI)**:
   - Base Point DSI: `CPaceRistretto255` (`b"CPaceRistretto255"`)
   - Intermediate Session Key DSI: `CPaceRistretto255_ISK` (`b"CPaceRistretto255_ISK"`)
-- **MapToGroup**: Maps 64-byte uniform hash output to a Ristretto255 group element using `RistrettoPoint::from_uniform_bytes` per [RFC 9496 Section 4.3.4](https://www.rfc-editor.org/rfc/rfc9496.html#section-4.3.4) and draft-irtf-cfrg-cpace-21 Appendix A.2. If the mapped point is the group identity $\mathcal{O}$ (probability $2^{-252}$), fallback to `RISTRETTO_BASEPOINT_POINT`. (Note: This fallback to the basepoint constant is an RAPP-specific defensive extension implemented in `crates/rapp/src/cpace.rs` to guarantee non-identity output; it is not defined in draft-21 §8.3 or RFC 9496 §4.3.4).
-- **PAKE Identity Binding & Role Separation**: CPace is executed purely as an anonymous PAKE to exchange ephemeral keys and establish a shared secret $PSK$ under the random session identifier $SID$. Endpoint party identifiers ($\text{ID}_A, \text{ID}_B$) and auxiliary data ($\text{AD}_A, \text{AD}_B$) in CPace are empty ($\emptyset$); mutual endpoint authentication and cryptographic identity binding are deferred to the subsequent `Noise_XXpsk3` handshake. The Requester acts strictly as Initiator ($A$), transmitting via `ATT_WRITE_REQ`, while the Custodian acts strictly as Responder ($B$), transmitting via `ATT_HANDLE_VALUE_IND`. Per draft-irtf-cfrg-cpace-21 Section 10.1, this fixed asymmetric role assignment prevents relay loopback and reflection attacks.
+- **MapToGroup & Identity Handling**: Maps 64-byte uniform hash output to a Ristretto255 group element using `RistrettoPoint::from_uniform_bytes` per [RFC 9496 Section 4.3.4](https://www.rfc-editor.org/rfc/rfc9496.html#section-4.3.4) and draft-irtf-cfrg-cpace-21 Appendix A.2. If the mapped point is the group identity $\mathcal{O}$ (probability $2^{-252}$), the node **MUST** immediately abort the pairing offer, zeroize all intermediate ephemeral values, and cease pairing advertising. No fallback to a basepoint constant is permitted.
+- **Context $C$ and Protocol Binding**:
+  The Context input `CI` binds the pairing ceremony parameters in deterministic CBOR ([RFC 8949 Section 4.2.1](https://www.rfc-editor.org/rfc/rfc8949.html#section-4.2.1)):
+  ```cddl
+  pairing-context = [
+    "RAPP-PAIRING-CONTEXT-v2",
+    [26, 10],                                                                ; wire version [major, minor]
+    "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512", ; full suite literal
+    "fi.refineid.rapp.ble.v1",                                               ; transport profile
+    "ble-direct-1",                                                          ; candidate identifier
+    bstr .size 32,                                                           ; offer_hash
+    "requester",                                                             ; initiator role A
+    "custodian"                                                              ; responder role B
+  ]
+  ```
+  $$C = \text{encode\_deterministic\_cbor}(\text{pairing-context}) \quad (191\text{ bytes})$$
+  $$\text{CI} = C, \quad \text{AD}_A = \emptyset, \quad \text{AD}_B = \emptyset$$
+  Role strings designate protocol roles, not persistent device identities. The Requester acts strictly as Initiator ($A$), transmitting via `ATT_WRITE_REQ`, while the Custodian acts strictly as Responder ($B$), transmitting via `ATT_HANDLE_VALUE_IND`.
 
 #### 6.1.2 Generator Derivation (draft-21 Appendix A.2)
 The generator point $G$ is derived from length-value encoding with single zero-padding:
-$$\text{len\_zpad} = \max(0, 128 - 1 - |\text{prepend\_len}(\text{pw})| - |\text{prepend\_len}(\text{DSI})|)$$
-$$\text{gen\_input} = \text{lv\_cat}(\text{DSI}, \text{pw}, \text{zero\_bytes}(\text{len\_zpad}), \text{CI}=\emptyset, \text{SID})$$
-$$G = \text{MapToGroup}(\text{SHA-512}(\text{gen\_input}))$$
-where $\text{prepend\_len}(x)$ prefixes $x$ with its LEB128 length, and $\text{CI}$ is empty length-value (`&[]`).
+$$\text{len\_zpad} = \max(0, 128 - 1 - |\text{prepend\_len}(\text{PRS})| - |\text{prepend\_len}(\text{DSI})|) = 102\text{ bytes}$$
+$$\text{gen\_str} = \text{lv\_cat}(\text{DSI}, \text{PRS}, \text{zero\_bytes}(102), C, \text{SID}) \quad (354\text{ bytes})$$
+$$G = \text{MapToGroup}(\text{SHA-512}(\text{gen\_str}))$$
+where $\text{PRS} = \text{UTF-8}(\text{normalized pairing code})$ and $\text{SID} = \text{offer\_id}$. Verify $G \ne \mathcal{O}$.
 
-#### 6.1.3 Ephemeral Exchange & Validation
-1. **Initiator (Requester)**:
-   - Samples 64 random bytes, derives scalar $x_A = \text{Scalar::from\_bytes\_mod\_order\_wide}(\text{random}_A)$.
-   - Verifies $x_A \ne 0$.
-   - Computes $Y_A = x_A \cdot G$. Encodes to 32 bytes via `compress().to_bytes()`.
+#### 6.1.3 Ephemeral Exchange, Key Schedule, and Mutual Confirmation
+1. **Initiator (Requester - Step 1)**:
+   - Samples 64 random bytes from CSPRNG, derives scalar $x_A = \text{Scalar::from\_bytes\_mod\_order\_wide}(\text{random}_A)$. Verifies $x_A \ne 0$.
+   - Computes $Y_A = x_A \cdot G$. Encodes to 32 bytes via canonical Ristretto255 point compression.
    - Transmits 32-byte $Y_A$ in CPace Step 1 via `ATT_WRITE_REQ` in a `SINGLE` SAR frame.
-2. **Responder (Custodian)**:
-   - Receives $Y_A$, decodes and validates $Y_A \ne \mathcal{O}$ and valid Ristretto255 point.
+2. **Responder (Custodian - Step 2)**:
+   - Receives $Y_A$, decodes and validates $Y_A \ne \mathcal{O}$ and canonical Ristretto255 element.
    - Atomically reserves attempt slot ($1 \le \text{attempts\_admitted} \le 3$, `active_attempt = true`).
    - Samples 64 random bytes, derives scalar $x_B \ne 0$.
    - Computes $Y_B = x_B \cdot G$.
    - Computes shared point $K = x_B \cdot Y_A$. Verifies $K \ne \mathcal{O}$.
    - Derives Intermediate Session Key (ISK):
-     $$\text{isk\_input} = \text{lv\_cat}([\text{DSI}_{\text{ISK}}, \text{SID}, K]) \parallel \text{transcript\_ir}(Y_A, \emptyset, Y_B, \emptyset)$$
+     $$\text{transcript\_ir} = \text{lv\_cat}([Y_A, \emptyset]) \parallel \text{lv\_cat}([Y_B, \emptyset])$$
+     $$\text{isk\_input} = \text{lv\_cat}([\text{DSI}_{\text{ISK}}, \text{SID}, K]) \parallel \text{transcript\_ir}$$
      $$\text{ISK} = \text{SHA-512}(\text{isk\_input}) \quad (64\text{ bytes})$$
-   - Computes mutual confirmation authenticator $T_B = \text{SHA-512}(\text{ISK} \parallel \texttt{"CONFIRM-B"} \parallel \text{SID})[0..32]$.
-   - Arms the attempt timer defined in §3.3.3: $\text{attempt\_deadline} = \min(5.0\text{ s}, \text{remaining\_offer\_ttl})$. If $\text{remaining\_offer\_ttl} == 0$, abort without admitting the attempt.
+   - Derives Transcript Hash ($TH$) and Application Key Schedule (RFC 5869 HKDF-SHA-512):
+     $$TH = \text{SHA-512}(\text{lv\_cat}([\text{"RAPP-CPACE-TRANSCRIPT-v2"}, \text{SID}, C, Y_A, Y_B])) \quad (64\text{ bytes})$$
+     $$PRK = \text{HKDF-Extract-SHA512}(\text{salt} = TH, \text{IKM} = \text{ISK}) \quad (64\text{ bytes})$$
+     $$PSK = \text{HKDF-Expand-SHA512}(PRK, \text{info} = \text{"RAPP-NOISE-PSK-v2"}, L = 32)$$
+     $$K_A = \text{HKDF-Expand-SHA512}(PRK, \text{info} = \text{"RAPP-CPACE-CONFIRM-A-KEY-v2"}, L = 32)$$
+     $$K_B = \text{HKDF-Expand-SHA512}(PRK, \text{info} = \text{"RAPP-CPACE-CONFIRM-B-KEY-v2"}, L = 32)$$
+   - Computes mutual confirmation authenticator $T_B$:
+     $$T_B = \text{FIRST32}(\text{HMAC-SHA512}(\text{key} = K_B, \text{data} = \text{lv\_cat}([\text{"RAPP-CPACE-CONFIRM-B-v2"}, TH])))$$
+   - Arms the attempt timer: $\text{attempt\_deadline} = \min(5.0\text{ s}, \text{remaining\_offer\_ttl})$.
    - Transmits 64-byte $Y_B \parallel T_B$ in CPace Step 2 via `ATT_HANDLE_VALUE_IND` in a `SINGLE` SAR frame.
-3. **Key Confirmation (Requester)**:
-   - Requester receives $Y_B$ and $T_B$, validates $Y_B \ne \mathcal{O}$.
+3. **Key Confirmation (Requester - Step 3)**:
+   - Requester receives $Y_B \parallel T_B$, decodes and validates $Y_B \ne \mathcal{O}$ and canonical point.
    - Computes shared point $K = x_A \cdot Y_B$. Verifies $K \ne \mathcal{O}$.
-   - Derives identical $\text{ISK} = \text{SHA-512}(\text{isk\_input})$.
-   - Verifies $T_B$ in constant time.
-   - Computes $T_A = \text{SHA-512}(\text{ISK} \parallel \texttt{"CONFIRM-A"} \parallel \text{SID})[0..32]$.
+   - Derives identical $\text{ISK}, TH, PRK, PSK, K_A, K_B$.
+   - Verifies $T_B$ in constant time against received 32-byte tag. Any mismatch immediately aborts the attempt and destroys temporary state.
+   - Computes mutual confirmation authenticator $T_A$:
+     $$T_A = \text{FIRST32}(\text{HMAC-SHA512}(\text{key} = K_A, \text{data} = \text{lv\_cat}([\text{"RAPP-CPACE-CONFIRM-A-v2"}, TH])))$$
    - Transmits 32-byte $T_A$ in CPace Step 3 via `ATT_WRITE_REQ` in a `SINGLE` SAR frame.
-#### 6.1.4 Finalization & PSK Derivation
-- Custodian verifies $T_A$ in constant time within the clamped attempt deadline.
-- Upon verification, Custodian clears `active_attempt`, cancels the PAKE attempt timer, and transfers exclusive ownership to `Phase::NoisePairing`.
-- Both parties extract the 32-byte Application Pairing Secret ($PSK$):
-  $$PSK = \text{ISK}[0..32]$$
-  (Design Note: Slicing the first 32 bytes of the 64-byte uniform $\text{ISK}$ is an intentional RAPP design choice relative to the general KDF recommendations in draft-irtf-cfrg-cpace-21 Section 10.3 and Section 10.4, directly matching the reference implementation in `crates/rapp/src/cpace.rs`. Under CPace assumptions, security of the PAKE is bounded by the ~252-bit prime order of Ristretto255 (~126 bits of classical security against Pollard's rho) and the online rate limiting of the human pairing code. Classical discrete-log PAKEs are not post-quantum secure against large-scale quantum computers; hybrid post-quantum forward secrecy against future quantum adversaries is established separately during subsequent operational sessions via the `Noise_KKhfs` handshake using ML-KEM-768).
-- $PSK$ is passed directly as the pre-shared key into the `Noise_XXpsk3` pairing handshake (§6.2).
+
+#### 6.1.4 Finalization & PSK Handoff
+- Custodian receives and verifies $T_A$ in constant time within the clamped attempt deadline.
+- Upon successful verification, Custodian clears `active_attempt`, marks the offer **consumed**, cancels the PAKE attempt timer, and transfers exclusive ownership to `Phase::NoisePairing`.
+- Both parties immediately zeroize all intermediate ephemeral values ($\text{ISK}, PRK, K_A, K_B, x_A, x_B, K$).
+- The established 32-byte $PSK$ is passed directly as the pre-shared key into the `Noise_XXpsk3` pairing handshake (§6.2).
+- Security of the pairing ceremony is bounded by the ~252-bit prime order of Ristretto255, the uniform 30-bit entropy of the 6-character code, and the strict 3-attempt rate limit. Classical discrete-log PAKEs are not post-quantum secure against large-scale quantum computers; hybrid post-quantum forward secrecy against future quantum adversaries is established separately during subsequent operational sessions via the `Noise_KKhfs` handshake using ML-KEM-768 (§6.3).
 
 ### 6.2 Noise_XXpsk3 Pairing Handshake (RFC 7748, RFC 8439, RFC 5869)
 
 - **Suite**: `Noise_XXpsk3_25519_ChaChaPoly_SHA512`
 - **Underlying Primitives**:
   - DH: Curve25519 / X25519 per [RFC 7748](https://www.rfc-editor.org/rfc/rfc7748.html) (32-byte keys).
-  - Cipher: ChaCha20-Poly1305 per [RFC 8439](https://www.rfc-editor.org/rfc/rfc8439.html) (32-byte key, 12-byte nonce, 16-byte tag). Nonce layout: 4 zero bytes (`0x00, 0x00, 0x00, 0x00`) followed by 8 big-endian bytes representing the 64-bit sequence counter.
+  - Cipher: ChaCha20-Poly1305 per [RFC 8439](https://www.rfc-editor.org/rfc/rfc8439.html) (32-byte key, 12-byte nonce, 16-byte tag). Nonce layout: 4 zero bytes (`0x00, 0x00, 0x00, 0x00`) followed by 8 little-endian bytes representing the 64-bit sequence counter (per Noise Protocol Framework rev 34 Section 12.3 and reference implementation `crates/rapp/src/noise.rs:97`).
   - Hash: SHA-512 per [FIPS 180-4](https://doi.org/10.6028/NIST.FIPS.180-4) (64-byte output, 128-byte block size).
   - KDF: HKDF-SHA-512 per [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html).
 - **Fresh Static Key Generation Requirement**:
@@ -601,13 +627,13 @@ where $\text{prepend\_len}(x)$ prefixes $x$ with its LEB128 length, and $\text{C
   ```
 - **Pre-messages**: None.
 - **Prologue**: `encode_deterministic_cbor(pairing-prologue)` (§4.3.1).
-- **PSK Input**: The 32-byte $PSK = \text{ISK}[0..32]$ derived from CPace (§6.1.4) is injected as the pre-shared key at token `psk` (`MixKey(psk)`).
+- **PSK Input**: The 32-byte $PSK$ derived from CPace KC2 via HKDF-Expand-SHA512 (§6.1.3, §6.1.4) is injected as the pre-shared key at token `psk` (`MixKey(psk)`).
 - **Handshake Payload Policy**: All handshake message payloads are empty ($\emptyset$, length 0). Encrypting an empty payload produces a 16-byte Poly1305 authentication tag.
 - **Handshake Messages**:
   - Message 1 (Initiator -> Responder):
     Tokens: `e`.
-    Carries unencrypted 32-byte ephemeral public key $e_{pub}$.
-    Total size: 32 bytes.
+    Per Noise revision 34 §9.2 (PSK mode), processing token `e` executes `MixKey(e.public_key)`, keying the CipherState. Encrypting the empty handshake payload produces a 16-byte Poly1305 authentication tag appended after the unencrypted 32-byte ephemeral public key $e_{pub}$.
+    Total size: $32 + 16 = 48\text{ bytes}$.
   - Message 2 (Responder -> Initiator):
     Tokens: `e, ee, s, es`.
     Carries unencrypted 32-byte ephemeral public key $e_{pub}$, encrypted 32-byte static public key $s_{pub}$ (48 bytes including 16-byte Poly1305 tag), and 16-byte empty payload tag.
@@ -636,7 +662,7 @@ where $\text{prepend\_len}(x)$ prefixes $x$ with its LEB128 length, and $\text{C
     - Decapsulation key ($dk$ / private key) size: 2,400 bytes (or 64-byte seed).
     - Ciphertext ($ct$) size: 1,088 bytes.
     - Shared secret ($ss_{kem}$) size: 32 bytes.
-  - AEAD Cipher: ChaCha20-Poly1305 per [RFC 8439](https://www.rfc-editor.org/rfc/rfc8439.html) (32-byte key, 12-byte nonce, 16-byte tag). Nonce layout: 4 zero prefix bytes followed by 8 big-endian sequence counter bytes.
+  - AEAD Cipher: ChaCha20-Poly1305 per [RFC 8439](https://www.rfc-editor.org/rfc/rfc8439.html) (32-byte key, 12-byte nonce, 16-byte tag). Nonce layout: 4 zero prefix bytes followed by 8 little-endian sequence counter bytes.
   - Hash Function: SHA-512 per [FIPS 180-4](https://doi.org/10.6028/NIST.FIPS.180-4) (64-byte output, 128-byte block size).
   - Key Derivation: HKDF-SHA-512 per [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html).
 - **Handshake Pattern**:
@@ -755,7 +781,7 @@ pairing-hello-body = {
 
 negotiated-parameters = {
   "version": [26, 10],
-  "suite": "CPACE-RISTR255-SHA512 + Noise_XXpsk3_25519_ChaChaPoly_SHA512",
+  "suite": "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512",
   "offer_hash": bstr .size 32,
   "transport_profile": "fi.refineid.rapp.ble.v1",
   "candidate_id": "ble-direct-1"
@@ -1154,8 +1180,8 @@ Semantic error handling is driven exclusively by `error_name`. The numeric `erro
 
 | Threat Class | Adversary Vector | RAPP Defense |
 | :--- | :--- | :--- |
-| **Passive Eavesdropper** | Captures 2.4 GHz RF packets using SDR. | Zero hint in beacon. CPace provides mathematical resistance to offline dictionary attacks. Session encrypted with ChaCha20-Poly1305. |
-| **Active MITM** | Injects, modifies, or drops BLE packets. | CPace authenticates possession of the pairing code only; with empty party identifiers it provides no endpoint identity binding (§6.1, draft-21 §10.1). Mutual endpoint identity authentication rests on Noise_XXpsk3 plus visual SAS confirmation (§4.5). Unmatched codes burn strikes and terminate the offer under rate-limiting. |
+| **Passive Eavesdropper** | Captures 2.4 GHz RF packets using SDR. | Zero hint in beacon. CPace KC2 provides mathematical resistance to offline dictionary attacks; intermediate keys separated via RFC 5869 HKDF-SHA-512. Handshake and sessions encrypted with ChaCha20-Poly1305. |
+| **Active MITM** | Injects, modifies, or drops BLE packets. | CPace KC2 binds ceremony context $C$ into generator input $CI$, preventing cross-protocol/cross-channel relay. CPace authenticates possession of the pairing code; mutual endpoint identity authentication rests on Noise_XXpsk3 with fresh pairwise static keys plus visual SAS confirmation (§4.5). Explicit HMAC tags $T_B, T_A$ confirm keys before Noise handoff. Unmatched codes burn strikes and terminate the offer under rate-limiting. |
 | **Disconnect Oracle** | Attacker tests $T_B$ and disconnects before $T_A$. | Atomic attempt reservation increments `attempts_admitted` *before* emitting $Y_B$ and $T_B$; disconnects do not refund the reserved attempt. |
 | **Evil Twin / Rogue Beacon** | Attacker broadcasts identical Service UUID. | Requester requires matching code and post-handshake unbiased SAS device confirmation before dispatching operations. |
 | **Transparent Wormhole / Relay** | Attacker relays RF traffic over WAN between distant devices. | Advisory proximity gate limits local discovery; explicit user consent on phone screen displays exact operation details; strict asymmetric ATT and CPace role separation structurally prevents relay loopback and reflection (§4.4, §5.2, §6.3). |

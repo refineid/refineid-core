@@ -21,11 +21,12 @@ use snow::{Builder, HandshakeState, TransportState, params::NoiseParams};
 use zeroize::ZeroizeOnDrop;
 
 use super::{
-    BinaryFrame, Envelope, FrameError, GRANTS_HASH_SIZE, GrantsHash, MANDATORY_PAIRING_SUITE,
-    MANDATORY_SESSION_SUITE, MAX_FRAME_PLAINTEXT, MAX_FRAME_SIZE, MessageType, NOISE_TAG_SIZE,
-    OperationId, PAIR_ID_SIZE, PairId, PairingSecret, ProfileName, RENDEZVOUS_TOKEN_SIZE,
-    REQUEST_HASH_SIZE, RendezvousToken, RequestHash, SESSION_ID_SIZE, SequenceGuard, SessionId,
-    VISIBLE_WIRE_VERSION, WireError, WireValue, X25519_KEY_SIZE, encode_deterministic_cbor,
+    BinaryFrame, CPACE_KC2_SUITE, Envelope, FrameError, GRANTS_HASH_SIZE, GrantsHash,
+    MANDATORY_PAIRING_SUITE, MANDATORY_SESSION_SUITE, MAX_FRAME_PLAINTEXT, MAX_FRAME_SIZE,
+    MessageType, NOISE_TAG_SIZE, OperationId, PAIR_ID_SIZE, PairId, PairingSecret, ProfileName,
+    RENDEZVOUS_TOKEN_SIZE, REQUEST_HASH_SIZE, RendezvousToken, RequestHash, SESSION_ID_SIZE,
+    SequenceGuard, SessionId, WIRE_VERSION_V26_10_1, WireError, WireValue, X25519_KEY_SIZE,
+    encode_deterministic_cbor,
     noise::{KkHfsHandshakeState, NoiseTransport},
 };
 
@@ -571,7 +572,7 @@ fn pairing_prologue(offer_hash: [u8; 32], transport_profile: &str) -> Result<Vec
     encode_deterministic_cbor(&WireValue::Array(vec![
         WireValue::Text("RAPP-pairing-v1".to_owned()),
         version_value(),
-        WireValue::Text(MANDATORY_PAIRING_SUITE.to_owned()),
+        WireValue::Text(CPACE_KC2_SUITE.to_owned()),
         WireValue::Bytes(offer_hash.to_vec()),
         WireValue::Text(transport_profile.to_owned()),
     ]))
@@ -596,9 +597,9 @@ fn session_prologue(
 
 fn version_value() -> WireValue {
     WireValue::Array(vec![
-        WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.0)),
-        WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.1)),
-        WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.2)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.0)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.1)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.2)),
     ])
 }
 
@@ -756,5 +757,14 @@ mod tests {
                 WireError::UnsupportedCriticalExtension
             ))
         );
+    }
+
+    /// RAPP v26.10.1 §4.3:276: Deterministic CBOR of the pairing prologue is exactly 151 bytes.
+    #[test]
+    fn pairing_prologue_matches_normative_151_byte_length() {
+        const NORMATIVE_PAIRING_PROLOGUE_LENGTH: usize = 151;
+        let prologue = super::pairing_prologue([0xaa; 32], "fi.refineid.rapp.ble.v1")
+            .expect("pairing prologue encodes");
+        assert_eq!(prologue.len(), NORMATIVE_PAIRING_PROLOGUE_LENGTH);
     }
 }

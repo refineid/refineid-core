@@ -17,14 +17,15 @@
 use std::collections::BTreeMap;
 
 use refineid_rapp::{
-    AuthenticatedViolation, BinaryFrame, CardOperation, CpaceState, EndpointError, EndpointRole,
-    EstablishedEndpoint, ExplicitUserIntent, HandshakeChannel, HandshakeRole,
-    MANDATORY_PAIRING_SUITE, MessageType, OfferId, OperationId, OperationRequest, OperationState,
-    PairRecord, PairStore, PairStoreError, PairTombstone, PairingHandshake, PairingOffer,
-    PairingOfferUri, PairingSecret, PairingState, ProfileName, RappState, ReceiveOutcome,
-    SecureChannel, SessionHandshake, SessionHandshakeParameters, SessionParameters,
+    AuthenticatedViolation, BinaryFrame, CardOperation, CpaceKc2Initiator, CpaceKc2Responder,
+    EndpointError, EndpointRole, EstablishedEndpoint, ExplicitUserIntent, HandshakeChannel,
+    HandshakeRole, MANDATORY_PAIRING_SUITE, MessageType, OfferId, OperationId, OperationRequest,
+    OperationState, PairRecord, PairStore, PairStoreError, PairTombstone, PairingHandshake,
+    PairingOffer, PairingOfferUri, PairingSecret, PairingState, ProfileName, RappState,
+    ReceiveOutcome, SecureChannel, SessionHandshake, SessionHandshakeParameters, SessionParameters,
     SessionReadyMessage, SessionState, TransportCandidate, TypedMessage, compute_grants_hash,
-    derive_manual_offer_id, generate_pair_key_material,
+    derive_manual_offer_id, encode_kc2_step1_frame, generate_pair_key_material,
+    standard_pairing_context_v2,
 };
 
 #[derive(Default)]
@@ -439,37 +440,6 @@ fn cpace_code_pairing_and_fresh_session_interoperate_end_to_end() {
     let pairing_code = "789 123";
     let offer_id = derive_manual_offer_id(pairing_code).expect("valid code");
 
-    // Phase 1: CPace PAKE exchange over the transport
-    let alice_cpace = CpaceState::new(
-        HandshakeRole::Initiator,
-        pairing_code,
-        &offer_id,
-        &[0x33; 64],
-    )
-    .expect("alice cpace init succeeds");
-    let bob_cpace = CpaceState::new(
-        HandshakeRole::Responder,
-        pairing_code,
-        &offer_id,
-        &[0x44; 64],
-    )
-    .expect("bob cpace init succeeds");
-
-    let alice_cpace_frame = alice_cpace
-        .write_message()
-        .expect("alice writes cpace frame");
-    let bob_cpace_frame = bob_cpace.write_message().expect("bob writes cpace frame");
-
-    let alice_secret = alice_cpace
-        .read_message(&bob_cpace_frame)
-        .expect("alice derives secret");
-    let bob_secret = bob_cpace
-        .read_message(&alice_cpace_frame)
-        .expect("bob derives secret");
-
-    assert_eq!(alice_secret, bob_secret);
-
-    // Phase 2: Construct offers without secrets
     let profiles = vec![
         ProfileName::CardStatus.as_str().to_owned(),
         ProfileName::Authentication.as_str().to_owned(),
@@ -500,7 +470,34 @@ fn cpace_code_pairing_and_fresh_session_interoperate_end_to_end() {
     )
     .expect("proxy offer is valid");
 
-    // Phase 3: Noise XXpsk3 Handshake
+    let offer_hash = requester_offer.offer_hash().expect("offer hash succeeds");
+    let context = standard_pairing_context_v2(&offer_hash).expect("context succeeds");
+
+    // Phase 1: CPace KC2 3-step mutual confirmation exchange
+    let (initiator, ya) = CpaceKc2Initiator::new(pairing_code, &context, &offer_id, &[0x33; 64])
+        .expect("alice cpace init succeeds");
+    let step1_frame = encode_kc2_step1_frame(&ya).expect("alice writes step 1 frame");
+
+    let (step2_frame, bob_waiting) = CpaceKc2Responder::process_step1_frame(
+        pairing_code,
+        &context,
+        &offer_id,
+        &step1_frame,
+        &[0x44; 64],
+    )
+    .expect("bob processes step 1 frame");
+
+    let (step3_frame, alice_secret) = initiator
+        .process_step2_frame(&step2_frame)
+        .expect("alice processes step 2 frame");
+
+    let bob_secret = bob_waiting
+        .process_step3_frame(&step3_frame)
+        .expect("bob processes step 3 frame");
+
+    assert_eq!(alice_secret, bob_secret);
+
+    // Phase 2: Noise XXpsk3 Handshake
     let mut requester = PairingHandshake::begin(
         EndpointRole::Requester,
         requester_offer,
@@ -530,7 +527,7 @@ fn cpace_code_pairing_and_fresh_session_interoperate_end_to_end() {
     assert!(requester.is_complete());
     assert!(proxy.is_complete());
 
-    // Phase 4: Confirmation
+    // Phase 3: Confirmation
     let mut requester_confirm = requester.into_confirmation().expect("requester confirms");
     let mut proxy_confirm = proxy.into_confirmation().expect("proxy confirms");
 
@@ -573,4 +570,30 @@ fn cpace_code_pairing_and_fresh_session_interoperate_end_to_end() {
         requester_record.rendezvous_token(),
         proxy_record.rendezvous_token()
     );
+
+    // Phase 4: Fresh Session Handshake
+    let mut requester_session =
+        SessionHandshake::begin_requester(&requester_record, ExplicitUserIntent::record())
+            .expect("explicit requester session starts");
+    let mut proxy_session =
+        SessionHandshake::begin_proxy(&proxy_record).expect("proxy session starts");
+
+    let s_msg1 = requester_session.write_message().expect("KK message one");
+    proxy_session
+        .read_message(&s_msg1)
+        .expect("proxy reads KK message one");
+    let s_msg2 = proxy_session.write_message().expect("KK message two");
+    requester_session
+        .read_message(&s_msg2)
+        .expect("requester reads KK message two");
+    assert!(requester_session.is_complete());
+    assert!(proxy_session.is_complete());
+
+    let requester_session = requester_session
+        .into_authentication()
+        .expect("requester derives session");
+    let proxy_session = proxy_session
+        .into_authentication()
+        .expect("proxy derives session");
+    assert_eq!(requester_session.session_id(), proxy_session.session_id());
 }

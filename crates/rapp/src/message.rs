@@ -4,12 +4,14 @@ use core::fmt;
 use std::collections::BTreeMap;
 
 use super::{
-    CardOperationError, CloseReason, Envelope, GrantsHash, LIVENESS_CHALLENGE_SIZE,
-    MANDATORY_PAIRING_SUITE, MANDATORY_SESSION_SUITE, MessageType, OperationId,
-    OperationProgressMessage, OperationReference, OperationRequest, OperationResultMessage,
-    OperationState, PairId, PingChallenge, ProfileName, RequestHash, SESSION_READY_NONCE_SIZE,
-    VISIBLE_WIRE_VERSION, WireValue,
+    CPACE_KC2_SUITE, CardOperationError, CloseReason, Envelope, GrantsHash,
+    LIVENESS_CHALLENGE_SIZE, MANDATORY_PAIRING_SUITE, MANDATORY_SESSION_SUITE, MessageType,
+    OperationId, OperationProgressMessage, OperationReference, OperationRequest,
+    OperationResultMessage, OperationState, PairId, PingChallenge, ProfileName, RequestHash,
+    SESSION_READY_NONCE_SIZE, WIRE_VERSION_V26_10_1, WireValue,
 };
+
+const LEGACY_WIRE_VERSION: (u16, u16, u16) = (26, 9, 28);
 
 /// Pairing-channel parameter echo.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -376,10 +378,7 @@ fn pairing_abort_from_body(
 fn negotiated_parameters_to_map(value: &NegotiatedParameters) -> BTreeMap<String, WireValue> {
     let mut map = BTreeMap::new();
     map.insert("version".into(), version_value());
-    map.insert(
-        "suite".into(),
-        WireValue::Text(MANDATORY_PAIRING_SUITE.into()),
-    );
+    map.insert("suite".into(), WireValue::Text(CPACE_KC2_SUITE.into()));
     map.insert(
         "offer_hash".into(),
         WireValue::Bytes(value.offer_hash.to_vec()),
@@ -399,7 +398,7 @@ fn negotiated_parameters_from_map(
     mut map: BTreeMap<String, WireValue>,
 ) -> Result<NegotiatedParameters, MessageError> {
     require_version(&mut map)?;
-    require_suite(&mut map, MANDATORY_PAIRING_SUITE)?;
+    require_pairing_suite(&mut map)?;
     let offer_hash = take_fixed::<32>(&mut map, "offer_hash")?;
     let transport_profile = take_text(&mut map, "transport_profile")?;
     let candidate_id = take_text(&mut map, "candidate_id")?;
@@ -698,27 +697,39 @@ fn validate_profile_set(profiles: &[ProfileName]) -> Result<(), MessageError> {
 
 fn version_value() -> WireValue {
     WireValue::Array(vec![
-        WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.0)),
-        WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.1)),
-        WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.2)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.0)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.1)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.2)),
     ])
 }
 
 fn require_version(map: &mut BTreeMap<String, WireValue>) -> Result<(), MessageError> {
-    if map.remove("version") != Some(version_value()) {
+    let Some(version) = map.remove("version") else {
         return Err(MessageError::InvalidField("version"));
+    };
+    if version == version_value()
+        || version
+            == WireValue::Array(vec![
+                WireValue::Unsigned(u64::from(LEGACY_WIRE_VERSION.0)),
+                WireValue::Unsigned(u64::from(LEGACY_WIRE_VERSION.1)),
+                WireValue::Unsigned(u64::from(LEGACY_WIRE_VERSION.2)),
+            ])
+    {
+        Ok(())
+    } else {
+        Err(MessageError::InvalidField("version"))
     }
-    Ok(())
 }
 
-fn require_suite(
-    map: &mut BTreeMap<String, WireValue>,
-    expected: &'static str,
-) -> Result<(), MessageError> {
-    if map.remove("suite") != Some(WireValue::Text(expected.into())) {
-        return Err(MessageError::InvalidField("suite"));
+fn require_pairing_suite(map: &mut BTreeMap<String, WireValue>) -> Result<(), MessageError> {
+    match map.remove("suite") {
+        Some(WireValue::Text(suite))
+            if suite == CPACE_KC2_SUITE || suite == MANDATORY_PAIRING_SUITE =>
+        {
+            Ok(())
+        }
+        _ => Err(MessageError::InvalidField("suite")),
     }
-    Ok(())
 }
 
 const fn close_reason_name(value: CloseReason) -> &'static str {

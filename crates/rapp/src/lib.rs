@@ -135,8 +135,8 @@ pub use types::{
     MINIMUM_REMAINING_ATTEMPTS, NOISE_TAG_SIZE, OFFER_ID_SIZE, OFFER_TTL_MAX_MS, OPERATION_ID_SIZE,
     OfferId, OperationId, PAIR_ID_SIZE, PAIRING_SECRET_SIZE, PairId, PairingSecret, ProfileName,
     RENDEZVOUS_TOKEN_SIZE, REQUEST_HASH_SIZE, RendezvousToken, RequestHash, RetryDecision,
-    SESSION_ID_SIZE, SESSION_READY_NONCE_SIZE, SessionId, VISIBLE_WIRE_VERSION,
-    VisibleConnectionState, WIRE_VERSION_V26_10_1, X25519_KEY_SIZE,
+    SESSION_ID_SIZE, SESSION_READY_NONCE_SIZE, SessionId, VisibleConnectionState,
+    WIRE_VERSION_V26_10_1, X25519_KEY_SIZE,
 };
 pub use wire::{
     Envelope, MessageType, SequenceGuard, WireError, WireValue, decode_deterministic_cbor,

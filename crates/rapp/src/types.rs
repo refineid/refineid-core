@@ -15,8 +15,6 @@
 use core::fmt;
 use zeroize::ZeroizeOnDrop;
 
-/// RAPP wire version implemented by this module (legacy v26.9.28).
-pub const VISIBLE_WIRE_VERSION: (u16, u16, u16) = (26, 9, 28);
 /// RAPP v26.10.1 wire version triple [Year, Month, Day].
 pub const WIRE_VERSION_V26_10_1: (u16, u16, u16) = (26, 10, 1);
 /// Mandatory RAPP pairing Noise suite.

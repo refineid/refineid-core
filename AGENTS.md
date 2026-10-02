@@ -164,9 +164,10 @@ before and the correction made the core better.
 - Never put credentials, PIN data or candidate lengths, card secrets,
   personal data, private workspace paths, or persistent device identifiers
   in issue text, logs, screenshots, attachments, or reproduction fixtures.
-  Report security-sensitive findings through the repository's private
-  reporting process; if no safe channel is available, notify the user
-  without publishing sensitive details.
+  Security-sensitive findings may go to a public issue; this repository
+  has no embargo policy. Use the private reporting process only when a
+  reporter offers working exploit detail for an unfixed flaw and publishing
+  it would be gratuitous. Otherwise report and fix.
 - An issue does not excuse a broken gate or incomplete work needed to make
   the current task correct. Fix findings required for the task before handing
   it over; file independently deferred work with a clear scope.

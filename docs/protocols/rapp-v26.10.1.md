@@ -17,7 +17,7 @@ This specification defines the **Bluetooth Low Energy (BLE) Direct Proximity Tra
 
 A user's mobile device acts as a Sovereign Server (GATT Peripheral / Custodian) holding physical custody of the FINEID identity card over Near Field Communication (NFC). The workstation acts as a Requester (GATT Central).
 
-Pairing is established through a 6-character Crockford Base32 human code (`7K X4 M9`, 30.0 bits entropy) executed over `CPaceRistretto255` ([draft-irtf-cfrg-cpace-21](https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-cpace-21)). Advertisements broadcast zero pairing code material, zero ephemeral bucket hints, and zero user identifiers or personal device names. Device discovery is mediated by a standardized 128-bit RAPP Service UUID filtered by an advisory proximity gate ($\ge -55\text{ dBm}$) and finalized through post-handshake mutual Short Authentication String (SAS) device confirmation. Rate limiting enforces a strict 3-attempt budget per 60-second offer lifecycle with atomic attempt reservation preventing disconnect oracles.
+Pairing is established through a 6-character Crockford Base32 human code (`7K X4 M9`, 30.0 bits entropy) executed over `CPaceRistretto255` ([draft-irtf-cfrg-cpace-21](https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-cpace-21)). Advertisements broadcast zero pairing code material, zero ephemeral bucket hints, and zero user identifiers or personal device names. Device discovery is mediated by a standardized 128-bit RAPP Service UUID filtered by an advisory proximity gate ($\ge -55\text{ dBm}$) and finalized through authenticated `Noise_XXpsk3` key exchange. Rate limiting enforces a strict 3-attempt budget per 60-second offer lifecycle with atomic attempt reservation preventing disconnect oracles.
 
 To support the Noise pairing handshake (`Noise_XXpsk3`) and post-quantum hybrid operational session handshake (`Noise_KKhfs`, requiring up to 1,248 bytes) across single ATT transactions, this profile specifies a normative **BLE Segmentation and Reassembly (SAR) Adaptation Layer**, preserving upper-layer session and operation security guarantees without frame truncation.
 
@@ -29,7 +29,7 @@ To support the Noise pairing handshake (`Noise_XXpsk3`) and post-quantum hybrid 
 
 This document defines the complete, standalone normative specification for the **Remote Authorization Proxy Protocol (RAPP) version 26.10.1**. It encompasses:
 - The **Bluetooth Low Energy (BLE) Direct Proximity Transport Profile** (`"fi.refineid.rapp.ble.v1"`).
-- The **Enhanced Human-Factor Proximity Pairing Protocol** utilizing `CPaceRistretto255`, 6-character Crockford Base32 human factors, atomic attempt reservation, and exact unbiased Short Authentication String (SAS) confirmation.
+- The **Enhanced Human-Factor Proximity Pairing Protocol** utilizing `CPaceRistretto255`, 6-character Crockford Base32 human factors, atomic attempt reservation, and authenticated `Noise_XXpsk3` channel binding.
 - The **BLE Segmentation and Reassembly (SAR) Adaptation Layer** with latched invariant total lengths and stop-and-wait flow control.
 - The **Authenticated Message Envelope**, sequential sequencing, and session multiplexing.
 - The **Two-Phase Commit Operation Model** providing strict at-most-once physical card execution.
@@ -60,7 +60,6 @@ Per project engineering standards, specification requirements are strictly disti
 | **Crockford Base32 Canonical Normalization** (§3.1) | Normative Specification | Fully specified 7-step pipeline with Crockford decode alias mapping (`I`/`L` $\to$ `1`, `O` $\to$ `0`). |
 | **CPaceRistretto255 KC2 Profile & Key Confirmation** (§6.1) | Normative Specification | Fully specified with Context $C$ binding, RFC 5869 HKDF key schedule, HMAC-SHA-512 confirmation tags $T_A, T_B$, scalar sampling options, and abort-on-identity. Implemented in `crates/rapp/src/cpace.rs` and verified with in-tree synthetic golden vectors (`cpace_kc2_golden_synthetic_vectors`) as well as standalone research harnesses (`kc2-v2-harness`, `verify_kc2_review.py`). |
 | **Attempt Reservation & Disconnect Oracle Protection** (§3.3) | Normative Specification | State machine rules fully defined. |
-| **Advancing-Counter Unbiased SAS Sampling** (§4.5) | Normative Specification | Mathematical algorithm with advancing block counter and exact uniform cutoff fully specified. |
 | **Noise_XXpsk3 & Noise_KKhfs Handshakes** (§6.2, §6.3) | Normative Specification | Complete token schedules (including 48-byte PSK Message 1 and little-endian sequence nonces), ML-KEM-768 encapsulation/decapsulation, directional key splits, and prologues fully specified. |
 | **Authenticated Envelopes & 17 Registered Messages** (§7, §8) | Normative Specification | Complete CDDL discriminated union schemas and normative semantics for all 17 registered message types fully specified herein (§7.1). |
 
@@ -91,8 +90,8 @@ The BLE transport acts as the underlying point-to-point bearer for RAPP session 
 - **Phase 1: Discovery & Bootstrap**: Read fresh random 32-byte `offer_id` (SID) and canonical `pairing-offer` from the Custodian's Bootstrap Characteristic. Compute canonical `offer_hash`.
 - **Phase 2: CPace Key Agreement & Confirmation (`Phase::CPace`)**: Execute `CPaceRistretto255` KC2 profile over GATT SAR frames with Context $C$ binding, mutually authenticating via HMAC tags $T_B$ and $T_A$ to establish $PSK$ via HKDF-Expand. On success, transition to `Phase::NoisePairing` and consume the offer.
 - **Phase 3: Noise_XXpsk3 Pairing (`Phase::NoisePairing`)**: Perform authenticated pairing handshake with prologue bound to canonical `offer_hash`, wire version `[26, 10, 1]`, suite, and transport profile name. Immediately on handshake completion, derive pairing-channel `session_id`, `pair_id`, and `rendezvous_token`. Exchange `pairing.hello` (parameter echo using `session_id`) and `pairing.confirm` (capability grants), deriving `grants_hash`.
-- **Phase 4: Post-Handshake SAS Confirmation**: Visually verify uniform 4-digit SAS derived from the authenticated Noise pairing handshake hash $h$ using an advancing block counter.
-- **Phase 5: Pair Storage & Operational Session**: Only after SAS confirmation and both grant confirmations succeed, atomically store the pairing trust record (`pair_id`, `rendezvous_token`, `grants_hash`, peer static public key, and local private key). Operational connections start in `Phase::Routing`, verify `rendezvous_token`, and open a fresh post-quantum `Noise_KKhfs` session with an independent operational `session_id`.
+- **Phase 4: Pair Storage**: Atomically store the pairing trust record (`pair_id`, `rendezvous_token`, `grants_hash`, peer static public key, and local private key).
+- **Subsequent Operational Sessions (`Phase::NoiseSession`)**: Operational connections start in `Phase::Routing`, verify `rendezvous_token`, and open a fresh post-quantum `Noise_KKhfs` session with an independent operational `session_id`.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -183,7 +182,7 @@ To mathematically close this oracle while permitting the final legitimate attemp
 5. **No Refund on Disconnect or Timeout**:
    If the Requester disconnects, drops the link, or fails to deliver a valid mutual confirmation authenticator $T_A$ before the attempt deadline expires, `active_attempt` is cleared and `attempts_failed` increments. If `attempts_failed == 3`, the offer is permanently destroyed (fail-stop lockout).
 6. **Successful PAKE Completion & Offer Consumption**:
-   Upon receiving and verifying a valid mutual confirmation authenticator $T_A$ within the attempt deadline, `active_attempt` is cleared, the PAKE attempt timer is canceled, the pairing offer is permanently marked **consumed** (disabling any subsequent admissions or attempt reservations under that `offer_id`), and the session transitions exclusively to `Phase::NoisePairing`. Subsequent network faults during Noise or human SAS rejection do not restore the consumed offer or alter PAKE strike accounting; any new pairing ceremony mandates generating a fresh offer and pairing code.
+   Upon receiving and verifying a valid mutual confirmation authenticator $T_A$ within the attempt deadline, `active_attempt` is cleared, the PAKE attempt timer is canceled, the pairing offer is permanently marked **consumed** (disabling any subsequent admissions or attempt reservations under that `offer_id`), and the session transitions exclusively to `Phase::NoisePairing`. Subsequent network faults during Noise or protocol mismatches do not restore the consumed offer or alter PAKE strike accounting; any new pairing ceremony mandates generating a fresh offer and pairing code.
    - **Multi-Attempt Replay Resistance & Composition Scope**: Although the 32-byte `offer_id` ($SID$) is shared across the up to 3 admitted attempts of a single offer, each honest endpoint draws a fresh independent nonzero scalar ($x_A, x_B$) for every attempt. Transcript-bound confirmation prevents reuse of a prior tag against a different transcript except with the relevant cryptographic failure probabilities. This replay argument does not establish a multi-session UC theorem. Security of the shared-SID, multi-attempt composition remains an explicitly recorded engineering assumption subject to further review, bounded in operation by strict atomic attempt accounting (`attempts_admitted <= 3`), single-flight serialization, monotonic attempt deadlines (5.0 s), and immediate offer consumption upon valid $T_A$.
 7. **Offer Lifecycle, Expiry Separation, and Post-PAKE Deadlines**:
    The pairing offer is valid for exactly 60 seconds from user initiation (`offer_ttl_ms = 60000`).
@@ -191,8 +190,8 @@ To mathematically close this oracle while permitting the final legitimate attemp
    - **Active Attempt Clamping**: An active PAKE attempt cannot extend past the offer deadline: per rule 3, the attempt timer is strictly clamped by $\text{attempt\_deadline} = \min(\text{admission\_time} + 5.0\text{ s}, \text{offer\_deadline})$. Reserving an attempt at $t = 59\text{ s}$ yields an attempt deadline of $1.0\text{ s}$, terminating at $t = 60\text{ s}$.
    - **Handed-Off Lifecycle & Finite Post-PAKE Deadlines**: Once CPace completes successfully and transfers exclusive custody to `Phase::NoisePairing`, the active ceremony is **exempt** from destruction by the original 60-second offer TTL. Instead, the active pairing channel is bounded by finite post-PAKE monotonic deadlines:
      1. **Noise Handshake Completion Deadline**: 10.0 seconds from local CPace handoff.
-     2. **SAS & Grant Confirmation Deadline**: 120.0 seconds from local Noise completion.
-     Any timeout, peer silence, transport disconnect, or SAS rejection destroys candidate trust immediately, erases ephemeral keys, and closes the connection without persisting an unconfirmed pairing. An indefinitely silent peer is terminated upon deadline expiry. Requester enters Noise only after its ATT write of Message 3 completes; an ATT write acknowledgment alone does not prove Custodian acceptance of $T_A$.
+     2. **Grant Echo & Storage Deadline**: 10.0 seconds from local Noise completion.
+     Any timeout, peer silence, transport disconnect, or protocol error destroys candidate trust immediately, erases ephemeral keys, and closes the connection without persisting an unconfirmed pairing. An indefinitely silent peer is terminated upon deadline expiry. Requester enters Noise only after its ATT write of Message 3 completes; an ATT write acknowledgment alone does not prove Custodian acceptance of $T_A$.
    - **Fail-Stop Lockout and Exponential Backoff**: Triggered strictly upon attempt budget exhaustion (`attempts_failed == 3`). Upon fail-stop lockout:
      1. The Custodian destroys all ephemeral keys, terminates BLE advertising, and surfaces an on-screen notification to the user ("Pairing failed: 3 incorrect attempts. Pairing locked.").
      2. The Custodian enforces an exponential backoff penalty of $\text{delay\_seconds} = \min(2^n, 300\text{ s})$ before permitting the generation of a new offer, where $n = \text{consecutive\_failed\_offers}$ (saturating at $n = 9$; $2^8 = 256\text{ s}$, $2^9 \to 300\text{ s}$).
@@ -289,16 +288,13 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
    - Inside the established pairing channel, peers exchange `pairing.hello`.
    - `pairing.hello` echoes `offer_hash`, `candidate_id` (`"ble-direct-1"`), wire version `[26, 10, 1]`, suite name, display name, platform description, and requester's requested profiles.
    - Custodian verifies matching echoes. Any mismatch aborts with an authenticated protocol violation.
-   - Custodian presents proposed grants to the user, and transmits `pairing.confirm` carrying granted profiles. Requester displays and confirms. Both granted sets **MUST** be identical.
-    - Derive `grants_hash` from the confirmed, canonically sorted grant set:
-      $$\text{grants\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{sorted\_profiles}))$$
-      where `sorted_profiles` is a CBOR array of profile identifier strings (`tstr`, CBOR major type 3 with definite-length encoding) sorted in standard canonical byte-wise lexicographical order without duplicates (e.g. `["fi.refineid.authentication.v1", "fi.refineid.card-status.v1"]`).
+   - The Custodian automatically grants the valid requested profiles matching its pairing offer (since possession and entry of the 30-bit pairing code constitutes user authorization), and transmits `pairing.confirm` carrying granted profiles. Requester echoes and confirms. Both granted sets **MUST** be identical.
+   - Derive `grants_hash` from the confirmed, canonically sorted grant set:
+     $$\text{grants\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{sorted\_profiles}))$$
+     where `sorted_profiles` is a CBOR array of profile identifier strings (`tstr`, CBOR major type 3 with definite-length encoding) sorted in standard canonical byte-wise lexicographical order without duplicates (e.g. `["fi.refineid.authentication.v1", "fi.refineid.card-status.v1"]`).
 
-4. **Post-Handshake SAS Confirmation**:
-   Following receipt and verification of `pairing.confirm`, both devices compute and visually confirm the 4-digit SAS derived from handshake hash $h$ using the advancing block counter (Section 4.5).
-
-5. **Atomic Permanent Key Storage**:
-   Only after SAS visual confirmation succeeds AND both `pairing.confirm` messages are processed:
+4. **Atomic Permanent Key Storage**:
+   Immediately upon receipt and verification of matching `pairing.confirm` messages:
    - **Fresh Pair-Specific Static Keys**: Each pairing ceremony **MUST** generate a fresh, cryptographically independent static X25519 keypair $(s, s_{pub})$ on each endpoint. Static keys **MUST NOT** be reused across different peer pairings or across distinct pairing ceremonies. This provides pairwise endpoint isolation and prevents correlation across peers. Private keys **MUST** be stored in platform-encrypted secure hardware (Secure Enclave / TPM / OS Keychain), excluded from backups and cloud synchronization, and marked non-exportable.
    - Each endpoint atomically persists the pairing trust record:
      - `pair_id`
@@ -308,7 +304,7 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
      - Local static private key (stored in platform-encrypted secure hardware / keychain)
    - The pairing channel is then cleanly closed.
 
-6. **Reconnect Rendezvous for Operational Sessions (`Noise_KKhfs`)**:
+5. **Reconnect Rendezvous for Operational Sessions (`Noise_KKhfs`)**:
    Subsequent connections for credential operations (authentication, qualified signing) do not rerun CPace or read bootstrap characteristics.
    - Every connection starts in `Phase::Routing` (Section 5.2).
    - Requester transmits a single `ble-rendezvous` preamble frame with purpose `"session"` (§5.2) over the Channel Characteristic via `ATT_WRITE_REQ`:
@@ -345,32 +341,9 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
 RSSI is treated as an **advisory discovery heuristic** and defense-in-depth barrier, not as a standalone cryptographic proof of proximity:
 1. **Requester Filter**: The Requester **MUST** ignore advertisements whose filtered RSSI falls below $-55\text{ dBm}$ (configurable to $-85\text{ dBm}$ strictly in isolated development environments).
 2. **Temporal Filtering**: To compensate for multipath fading and orientation variance, the Requester **SHOULD** compute the median RSSI over at least 3 advertisement packets with a 3 dB hysteresis before initiating a connection.
-3. **Transparent Relay Analysis**: An adversary utilizing high-gain directional antennas and power amplifiers can increase signal strength at the receiver. A transparent RF wormhole or relay forwarder can tunnel RF packets between distant rooms without decrypting them. While PAKE secrecy prevents an attacker from learning the session key, the physical distance assumption is bypassed. User consent on the Custodian phone screen protects authorized operation semantics/intent; transparent physical RF tunneling remains a physical-layer relay risk that cannot be detected by SAS or RSSI alone.
+3. **Transparent Relay Analysis**: An adversary utilizing high-gain directional antennas and power amplifiers can increase signal strength at the receiver. A transparent RF wormhole or relay forwarder can tunnel RF packets between distant rooms without decrypting them. While PAKE secrecy prevents an attacker from learning the session key, the physical distance assumption is bypassed. Explicit per-operation user authorization on the Custodian phone screen protects authorized operation semantics/intent (e.g. for qualified signing); transparent physical RF tunneling remains a physical-layer relay risk that cannot be detected by RF signal analysis alone.
 4. **Structural Role Separation as Protocol-Level Relay Defense**:
    Under Bluetooth Core Specification v5.4 and this profile (§5.2, §6.3), ATT and CPace roles are strictly asymmetric and immutable: the Requester is Central ($A$), transmitting exclusively via `ATT_WRITE_REQ`, while the Custodian is Peripheral ($B$), replying exclusively via `ATT_HANDLE_VALUE_IND`. Per draft-irtf-cfrg-cpace-21 Section 10.1, strict initiator/responder role separation structurally eliminates relay loopback and reflection attacks: an adversary cannot reflect the Custodian's $Y_B \parallel T_B$ indication back to the Custodian as an initiator write $Y_A$, nor can it relay frames between two peers acting in the same role.
-
-### 4.5 Post-Handshake Mutual Device Confirmation (Exact Unbiased SAS with Advancing Block Counter)
-
-To defeat rogue beacon and Evil Twin attacks:
-1. Upon completing the `Noise_XXpsk3` pairing handshake, both devices compute a 4-digit Short Authentication String (SAS) bound to the authenticated Noise handshake hash $h$.
-2. **Advancing Block Stream Generation**:
-   Candidate streams are derived in sequential 32-byte blocks using HKDF-Expand with SHA-512 over PRK = $h$:
-   For block counter $b \in \{0, 1, 2\}$ encoded as an unsigned 8-bit integer (`u8`):
-   $$\text{info}_b = \texttt{"RAPP-SAS-CONFIRM-v1"} \parallel [b] \quad (19 + 1 = 20\text{ bytes})$$
-   $$\text{BLOCK}_b = \text{HKDF-Expand}(\text{PRK}=h, \text{info}=\text{info}_b, \text{length}=32)$$
-   Because the completed Noise pairing handshake hash $h$ is already a cryptographically uniform 64-byte pseudorandom hash from SHA-512, HKDF-Extract is omitted and HKDF-Expand is applied directly with $\text{PRK} = h$.
-3. **Candidate Integer Parsing**:
-   Each 32-byte block yields eight 32-bit big-endian candidate integers:
-   $$V_{b, i} = \text{u32::from\_be\_bytes}(\text{BLOCK}_b[4i .. 4i+4]) \quad \text{for } i \in \{0..7\}$$
-4. **Rejection Sampling Loop**:
-   Iterate sequentially through $b \in \{0, 1, 2\}$ and $i \in \{0..7\}$ (evaluating up to $3 \times 8 = 24$ candidates):
-   - If $V_{b, i} < 4{,}294{,}960{,}000$ ($429{,}496 \times 10{,}000$):
-     $$\text{SAS\_VAL} = V_{b, i} \pmod{10000}$$
-     Halt search. Format $\text{SAS\_VAL}$ as exactly 4 decimal digits with leading zeros (e.g. `0492`).
-5. **Bounded Candidate Budget & Fail-Safe**:
-   If all 24 candidate integers across all 3 blocks are rejected (probability $(7296 / 2^{32})^{24} \approx 3.3 \times 10^{-139}$), the pairing terminates cleanly as an unrecoverable mathematical anomaly: ephemeral keys are destroyed, the link is closed, and an error is surfaced to the user.
-6. **Visual Confirmation**:
-   Both devices display the resulting 4-digit SAS. The user visually confirms matching digits on both screens before pair storage is finalized.
 
 ---
 
@@ -622,7 +595,7 @@ The generator point $G$ is derived from length-value (LV) encoding with zero-pad
 #### 6.1.4 Finalization, PSK Handoff, and Post-PAKE Lifecycles
 - Custodian receives and verifies $T_A$ in constant time within the clamped attempt deadline.
 - Upon successful verification, Custodian clears `active_attempt`, marks the offer **consumed**, cancels the PAKE attempt timer, and transfers exclusive ownership to `Phase::NoisePairing` under a 10.0-second Noise handshake completion deadline.
-- Subsequent post-Noise human SAS and grant confirmation is bounded by a 120.0-second monotonic deadline from local Noise completion. Active handed-off ceremonies are exempt from destruction by the original 60-second offer TTL; any failure of Noise, SAS rejection, or deadline expiry destroys candidate trust immediately.
+- Subsequent post-Noise parameter echo, grant exchange, and trust storage is bounded by a 10.0-second monotonic deadline from local Noise completion. Active handed-off ceremonies are exempt from destruction by the original 60-second offer TTL; any failure of Noise, protocol mismatch, or deadline expiry destroys candidate trust immediately.
 - Both parties immediately zeroize all intermediate ephemeral values ($\text{ISK}, PRK, K_A, K_B, x_A, x_B, K$).
 - The established 32-byte $PSK$ is passed directly as the pre-shared key into the `Noise_XXpsk3` pairing handshake (§6.2).
 - Security of the pairing ceremony is bounded by the ~252-bit prime order of Ristretto255, the uniform 30-bit entropy of the 6-character code, and the strict 3-attempt rate limit. Classical discrete-log PAKEs are not post-quantum secure against large-scale quantum computers; hybrid post-quantum forward secrecy against future quantum adversaries is established separately during subsequent operational sessions via the `Noise_KKhfs` handshake using ML-KEM-768 (§6.3).
@@ -940,7 +913,7 @@ progress-event-val =
 
 #### Normative Semantics of Registered Message Types:
 1. **`pairing.hello`**: Transmitted by the Requester inside `Phase::NoisePairing` immediately following handshake completion. Echoes negotiated pairing parameters (`version`, `suite`, `offer_hash`, `transport_profile`, `candidate_id`), peer display name, and requested profile names. The Custodian verifies that all echoed parameters match its local offer state; any discrepancy aborts pairing.
-2. **`pairing.confirm`**: Transmitted by the Custodian after displaying the proposed grants to the user and collecting confirmation; subsequently echoed by the Requester. Contains the canonical list of `granted_profiles`. Both peers verify that the sets are identical before deriving `grants_hash` (Section 4.3).
+2. **`pairing.confirm`**: Transmitted by the Custodian to grant the requested profiles matching the active offer; subsequently echoed by the Requester. Contains the canonical list of `granted_profiles`. Both peers verify that the sets are identical before deriving `grants_hash` (Section 4.3).
 3. **`pairing.abort`**: Transmitted by either peer to cancel an in-progress pairing ceremony prior to final trust record storage, providing an advisory reason string. Ephemeral keys are destroyed immediately.
 4. **`session.ready`**: Transmitted by the Custodian upon completing `Phase::NoiseSession` (`Noise_KKhfs`) to prove possession of the operational session key and fresh session state, echoing session parameters and a fresh random 32-byte `nonce`.
 5. **`session.close`**: Transmitted by either peer to signal an orderly, authenticated termination of an operational session, providing a registered `close-reason-val` and acknowledging the `last_received_sequence`.
@@ -1200,10 +1173,10 @@ Semantic error handling is driven exclusively by `error_name`. The numeric `erro
 | Threat Class | Adversary Vector | RAPP Defense |
 | :--- | :--- | :--- |
 | **Passive Eavesdropper** | Captures 2.4 GHz RF packets using SDR. | Zero hint in beacon. CPace KC2 provides mathematical resistance to offline dictionary attacks; intermediate keys separated via RFC 5869 HKDF-SHA-512. Handshake and sessions encrypted with ChaCha20-Poly1305. |
-| **Active MITM** | Injects, modifies, or drops BLE packets. | CPace KC2 binds ceremony context $C$ into generator input $CI$, rejecting mismatched protocol, suite, offer, and channel parameters. CPace authenticates possession of the pairing code; mutual endpoint identity authentication rests on Noise_XXpsk3 with fresh pairwise static keys plus visual SAS confirmation (§4.5). Explicit HMAC tags $T_B, T_A$ confirm keys before Noise handoff. Unmatched codes burn strikes and terminate the offer under rate-limiting. |
+| **Active MITM** | Injects, modifies, or drops BLE packets. | CPace KC2 binds ceremony context $C$ into generator input $CI$, rejecting mismatched protocol, suite, offer, and channel parameters. CPace authenticates possession of the pairing code; mutual endpoint identity authentication rests on Noise_XXpsk3 with fresh pairwise static keys. Explicit HMAC tags $T_B, T_A$ confirm keys before Noise handoff. Unmatched codes burn strikes and terminate the offer under rate-limiting. |
 | **Disconnect Oracle** | Attacker tests $T_B$ and disconnects before $T_A$. | Atomic attempt reservation increments `attempts_admitted` *before* emitting $Y_B$ and $T_B$; disconnects do not refund the reserved attempt. |
-| **Evil Twin / Rogue Beacon** | Attacker broadcasts identical Service UUID. | Requester requires matching code and post-handshake unbiased SAS device confirmation before dispatching operations. |
-| **Transparent Wormhole / Relay** | Attacker relays RF traffic over WAN between distant devices. | Advisory proximity gate limits local discovery, but RSSI and SAS cannot prove physical proximity or detect bit-preserving RF tunneling (§4.4). Strict asymmetric ATT and CPace role separation structurally prevents relay loopback and reflection attacks, while explicit user consent and sovereign phone display enforce authorized operation intent (§4.4, §5.2, §11). |
+| **Evil Twin / Rogue Beacon** | Attacker broadcasts identical Service UUID. | Requester requires matching 30-bit pairing code to derive generator $G$ and verify confirmation tags; rogue beacons lacking the code cannot complete CPace or Noise handshake. |
+| **Transparent Wormhole / Relay** | Attacker relays RF traffic over WAN between distant devices. | Advisory proximity gate limits local discovery, but RSSI cannot prove physical proximity or detect bit-preserving RF tunneling (§4.4). Strict asymmetric ATT and CPace role separation structurally prevents relay loopback and reflection attacks, while explicit user consent and sovereign phone display enforce authorized operation intent at execution time (§4.4, §5.2, §11). |
 | **DoS Strike Burning** | Malicious central connects to phone to burn strikes. | Offers are open only upon explicit user trigger for 60 seconds; single-flight pre-authentication serialization limits concurrency. Fail-stop lockout imposes exponential backoff ($2^n$ seconds, up to 300 s) and alerts user with on-screen notification (§3.3.5). |
 | **Rendezvous Token Replay / Presence Probing** | Attacker sniffs static rendezvous_token and replays preamble to probe presence or induce cryptographic work. | Preamble is unauthenticated routing metadata only; knowing rendezvous_token never authenticates caller. Handshake fails at message 1 (during DH computation, ML-KEM key decryption, or payload authentication). Timing difference between unknown token and known token is an accepted residual presence oracle for static tokens; mitigated by single-flight connection serialization and reconnect rate-limiting (§4.3.6). |
 

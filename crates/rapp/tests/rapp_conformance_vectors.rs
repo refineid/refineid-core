@@ -23,7 +23,7 @@ use refineid_rapp::{
 };
 use serde::Deserialize;
 
-const CORPUS: &str = include_str!("../../../docs/protocols/vectors/rapp-v26.9.28.json");
+const CORPUS: &str = include_str!("../../../docs/protocols/vectors/rapp-v26.10.1.json");
 
 #[derive(Debug, Deserialize)]
 struct Corpus {
@@ -116,7 +116,7 @@ struct RejectedCborVector {
 fn corpus_metadata_and_names_are_stable() {
     let corpus = corpus();
     assert_eq!(corpus.format, "fi.refineid.rapp.conformance-v1");
-    assert_eq!(corpus.protocol_document_version, "26.9.28");
+    assert_eq!(corpus.protocol_document_version, "26.10.1");
     assert_eq!(corpus.deterministic_cbor.len(), 15);
     assert_eq!(corpus.identifier_derivation.len(), 2);
     assert_eq!(corpus.grants_hash.len(), 3);

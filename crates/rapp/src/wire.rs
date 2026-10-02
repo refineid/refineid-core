@@ -19,7 +19,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{MAX_FRAME_PLAINTEXT, SESSION_ID_SIZE, SessionId, WIRE_VERSION_V26_10_1};
 
-const LEGACY_WIRE_VERSION: (u16, u16, u16) = (26, 9, 28);
 const MAX_NESTING_DEPTH: usize = 8;
 const MAX_TEXT_SIZE: usize = 4_096;
 
@@ -268,19 +267,13 @@ impl Envelope {
         )?;
 
         let version = take_array(&mut map, "version")?;
-        let is_v26_10_1 = version.as_slice()
-            == [
+        if version.as_slice()
+            != [
                 WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.0)),
                 WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.1)),
                 WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.2)),
-            ];
-        let is_legacy = version.as_slice()
-            == [
-                WireValue::Unsigned(u64::from(LEGACY_WIRE_VERSION.0)),
-                WireValue::Unsigned(u64::from(LEGACY_WIRE_VERSION.1)),
-                WireValue::Unsigned(u64::from(LEGACY_WIRE_VERSION.2)),
-            ];
-        if !is_v26_10_1 && !is_legacy {
+            ]
+        {
             return Err(WireError::UnsupportedVersion);
         }
         let message_type = MessageType::parse(&take_text(&mut map, "type")?)?;

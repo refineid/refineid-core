@@ -135,12 +135,11 @@ impl fmt::Display for CpaceError {
 impl core::error::Error for CpaceError {}
 
 /// Ephemeral state for one party in the CPace key exchange.
-#[derive(ZeroizeOnDrop)]
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct CpaceState {
     #[zeroize(skip)]
     role: HandshakeRole,
     offer_id: [u8; OFFER_ID_SIZE],
-    #[zeroize(skip)]
     scalar: Scalar,
     my_public: [u8; CPACE_POINT_SIZE],
 }
@@ -691,9 +690,8 @@ pub fn derive_kc2_keys(isk: &[u8; 64], th: &[u8; CPACE_TRANSCRIPT_HASH_SIZE]) ->
 }
 
 /// Ephemeral state for the CPace KC2 Initiator (Requester) after Step 1.
-#[derive(ZeroizeOnDrop)]
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct CpaceKc2Initiator {
-    #[zeroize(skip)]
     scalar: Scalar,
     my_public: [u8; CPACE_POINT_SIZE],
     sid: [u8; OFFER_ID_SIZE],
@@ -1632,5 +1630,25 @@ mod tests {
             CpaceError::ConfirmationTagMismatch.to_string(),
             "CPace confirmation tag mismatch"
         );
+    }
+
+    #[test]
+    fn cpace_ephemeral_states_zeroize_scalar() {
+        let offer_hash = [0x42; 32];
+        let offer_id = OfferId::from_array([0x77; OFFER_ID_SIZE]);
+        let context = standard_pairing_context_v2(&offer_hash).expect("context succeeds");
+        let code = "987 654";
+
+        let (mut alice, _) = CpaceKc2Initiator::new(code, &context, &offer_id, &[0xAA; 64])
+            .expect("alice init succeeds");
+        assert_ne!(alice.scalar, Scalar::ZERO);
+        alice.zeroize();
+        assert_eq!(alice.scalar, Scalar::ZERO);
+
+        let mut legacy = CpaceState::new(HandshakeRole::Initiator, code, &offer_id, &[0xAA; 64])
+            .expect("legacy init succeeds");
+        assert_ne!(legacy.scalar, Scalar::ZERO);
+        legacy.zeroize();
+        assert_eq!(legacy.scalar, Scalar::ZERO);
     }
 }

@@ -724,6 +724,43 @@ The generator point $G$ is derived from length-value (LV) encoding with zero-pad
      This fresh 16-byte `session_id` scopes all envelopes in the operational session.
   5. Ephemeral handshake state ($e_{priv}$) is immediately zeroized.
 
+### 6.4 Independent Standard Noise_KK Interoperability Test Vector
+
+The following normative test vector specifies the exact cryptographic transcript and intermediate values for `Noise_KK_25519_ChaChaPoly_SHA512` adhering strictly to Noise Protocol Framework Revision 34 and Section 6.3. Conforming implementations MUST produce byte-for-byte identical output for these inputs:
+
+- **Static Keypairs**:
+  - Initiator Static Private Key ($s_{i, priv}$): `1111111111111111111111111111111111111111111111111111111111111111`
+  - Initiator Static Public Key ($s_{i, pub}$): `7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13`
+  - Responder Static Private Key ($s_{r, priv}$): `2222222222222222222222222222222222222222222222222222222222222222`
+  - Responder Static Public Key ($s_{r, pub}$): `0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20`
+- **Ephemeral Keypairs**:
+  - Initiator Ephemeral Private Key ($e_{i, priv}$): `3333333333333333333333333333333333333333333333333333333333333333`
+  - Initiator Ephemeral Public Key ($e_{i, pub}$): `7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b14`
+  - Responder Ephemeral Private Key ($e_{r, priv}$): `4444444444444444444444444444444444444444444444444444444444444444`
+  - Responder Ephemeral Public Key ($e_{r, pub}$): `ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b`
+- **Session Prologue (§4.3)**:
+  - Input `pair_id`: `8ab9b8bcde5c6eec845d9b1ca0d3a7be` (16 bytes)
+  - Input `grants_hash`: `7777777777777777777777777777777777777777777777777777777777777777` (32 bytes)
+  - Input `transport_profile`: `"fi.refineid.rapp.ble.v1"`
+  - Encoded `prologue` (deterministic CBOR array, hex):
+    `866f524150502d73657373696f6e2d763183181a0a0178204e6f6973655f4b4b5f32353531395f436861436861506f6c795f534841353132508ab9b8bcde5c6eec845d9b1ca0d3a7be582077777777777777777777777777777777777777777777777777777777777777777766692e726566696e6569642e726170702e626c652e7631`
+- **Handshake Wire Messages**:
+  - **Message 1** (`-> e, es, ss`, 48 bytes: 32 bytes $e_{i, pub} \parallel 16$ bytes empty payload tag):
+    `7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b14b9cb8d7741b7e01e1d22ae0ba8162c7e`
+  - **Message 2** (`<- e, ee, se`, 48 bytes: 32 bytes $e_{r, pub} \parallel 16$ bytes empty payload tag):
+    `ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b09563c45b010a21024391aba48b3e5d5`
+- **Handshake Completion & Split Output**:
+  - Final Handshake Hash ($h$, 64 bytes):
+    `0c9bb02d3c9dad8547295b18abf8fe059d7d05e09db3a80475fba9ecd2845b28a4507940006463e8e68fadf98bde037cfd382d5e2159a9f162e09f7ae5b13f4f`
+  - Initiator-to-Responder Directional Transport Cipher Key ($c_1$, 32 bytes):
+    `787a3019877a460c1eb3a7951a224d890ae8ac3241e2ec0f1d0a6593dc76a7c9`
+  - Responder-to-Initiator Directional Transport Cipher Key ($c_2$, 32 bytes):
+    `8332d92c006c218f67cd57b6b98c9a4be410be334f342d8b8e5b0d5991f48cca`
+  - Operational Session Identifier (`session_id`, 16 bytes):
+    `e5d877e412bfa1cd123552614d4e9c94`
+
+This test vector is also cataloged under entry `"session-kk-fixed-transcript"` in `docs/protocols/vectors/rapp-v26.10.1.json`.
+
 ---
 
 ## 7. Authenticated Message Envelopes and Wire Framing
@@ -931,11 +968,11 @@ Credential operations (authentication signatures, qualified document signing) in
 2. **Write-Ahead Journaling**:
    Before physically dispatching any APDU command that can decrement a try counter or invoke a card private key, the Custodian **MUST** durably record a write-ahead journal entry in platform secure storage:
    - `pair_id` (16 bytes, scoping the entry to the authenticated pairing)
-   - `session_id` (16 bytes, recording the session on which the request arrived)
-   - `operation_id` (16 bytes)
-   - `request_hash` (32 bytes)
+   - `operation_id` (16 bytes, uniquely identifying the operation within the pairing)
+   - `request_hash` (32 bytes, session-independent deterministic commitment)
    - State: `in_flight`
    - Timestamp (UTC / local monotonic milliseconds)
+   - Optional provenance: `session_id` (16 bytes, recording the session on which the request originally arrived; advisory metadata, not bound into `request_hash`)
    - For `batch_sign_documents`: `batch_total` ($1..64$), `completed_signatures` (`[bstr]`), and currently executing document index.
 3. **Ambiguity Protection**:
    If the link drops or the process terminates while an operation is executing on the card, physical card re-execution is strictly prohibited. Recovery and reconciliation occur exclusively through durable journal status inspection (§8.3).
@@ -944,51 +981,76 @@ Credential operations (authentication signatures, qualified document signing) in
 
 1. **Operation Request & Deterministic Commitment**:
    - Requester transmits `operation.request` carrying a fresh 16-byte `operation_id`, profile, action, context map, payload map, and optional `expires_after_ms`.
-   - Both endpoints derive the deterministic request commitment:
-     $$\text{request\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}([\texttt{"RAPP-request-v1"}, \text{session\_id}, \text{operation\_id}, \text{profile}, \text{action}, \text{context}, \text{payload}]))$$
-     This fixed-order array preimage binds the protocol domain label (`"RAPP-request-v1"`), the active `session_id`, the unique `operation_id`, the profile, the action, and all context/payload maps.
+   - Both endpoints derive the deterministic, session-independent request commitment:
+     $$\text{request\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}([\texttt{"RAPP-request-v1"}, \text{pair\_id}, \text{operation\_id}, \text{profile}, \text{action}, \text{context}, \text{payload}]))$$
+     - **Session-Independent Commitment Scope**:
+       This fixed-order array preimage binds the protocol domain label (`"RAPP-request-v1"`), the authenticated `pair_id` (16 bytes), the unique `operation_id` (16 bytes), the profile string, the action string, and all context/payload maps.
+       `pair_id` replaces ephemeral session identifiers in the commitment preimage. This ensures that the commitment is stable across transport disruptions and BLE reconnections: an otherwise identical request retransmitted across session boundaries under the same pairing computes the exact same `request_hash`. Ephemeral session binding is supplied by the outer authenticated envelope (`rapp-message.session_id` and directional AEAD transport encryption).
+       Requests originating from different pairings are cryptographically isolated: because each pairing possesses a distinct `pair_id`, requests from different pairings will never produce matching `request_hash` commitments even if an identical `operation_id` is accidentally or maliciously chosen.
    - **`expires_after_ms` Semantics**:
      - `expires_after_ms` is strictly **excluded** from `request_hash` so that local expiry policies do not alter cryptographic commitments.
      - If present, `expires_after_ms` MUST be $> 0$; a value of 0 is rejected immediately with error `invalid_lifetime`. If absent, the Custodian applies a local default lifetime $\text{effective\_expires\_after\_ms} = 300{,}000\text{ ms}$ (5 minutes).
      - Upon receiving `operation.request`, the Custodian derives a monotonic local deadline using saturating arithmetic:
        $$\text{local\_deadline} = \text{local\_start\_monotonic\_ms}.\text{saturating\_add}(\min(\text{effective\_expires\_after\_ms}, \text{local\_policy\_max\_lifetime}))$$
      - If `local_deadline` passes before the user authorizes the operation on the phone screen, the operation expires. The Custodian transitions the in-memory state to `cancelled`, releases held resources, and responds with `operation.result` (`status: "cancelled"`, `error: "operation_expired"`). No card APDU is dispatched.
-2. **Deduplication and Idempotent In-Flight Handling**:
-   - All operations and journal records are strictly scoped by the authenticated `pair_id`. An `operation_id` is evaluated strictly within the context of the calling pairing.
-   - Upon receiving `operation.request`, the Custodian inspects its persistent journal and active in-memory task table:
-     a. **Already Completed**: If `operation_id` matches an existing journal entry in state `completed`:
-        - If `incoming.request_hash == stored.request_hash`: Custodian immediately re-transmits the cached `operation.result` with cached response payload/status without re-accessing the smart card.
-        - If `incoming.request_hash != stored.request_hash`: Custodian rejects the request with `error` name `"duplicate_operation"` (Class 3), preserving the original completed result and preventing hash collisions or parameter tampering.
-     b. **Currently In-Flight**: If `operation_id` matches an operation actively executing on the smart card or awaiting user authorization:
-        - If `incoming.request_hash == active.request_hash`: Custodian joins the active operation. The retransmitted request awaits card completion and receives `operation.result`.
-        - If `incoming.request_hash != active.request_hash`: Custodian rejects immediately with `error` name `"duplicate_operation"` (Class 3).
-     c. **Ambiguous or Terminal Failure**: If `operation_id` matches an entry in state `ambiguous`, `rejected`, or `credential_rejected`:
-        - If `incoming.request_hash == stored.request_hash`: Custodian re-transmits the cached terminal `operation.result` (e.g. invalid PIN with remaining retries, or partial batch signatures).
-        - If `incoming.request_hash != stored.request_hash`: Custodian rejects with `error` name `"duplicate_operation"` (Class 3).
-        - Under NO circumstances are card APDUs re-dispatched.
-     d. **New Operation**: If `operation_id` is not present in active tasks or persistent journal, the Custodian proceeds to profile validation and user authorization.
+2. **Atomic Admission, In-Flight Reservation, and Content Freezing**:
+   - **Pairing Scope & Cross-Pairing Isolation**: All operations, active task tables, write-ahead journal records, and durable tombstones are strictly scoped by `pair_id`. An `operation_id` is evaluated exclusively within the context of the calling pairing. The Custodian **MUST NEVER** deliver another pairing's cached results, join another pairing's in-flight task, or expose another pairing's journal entries.
+   - **Atomic Admission Transaction**: Upon receiving `operation.request`, the Custodian executes an atomic check-and-reserve transaction against its active in-memory task table, write-ahead journal, and durable tombstones:
+     a. **Existing Operation Match**: If `(pair_id, operation_id)` is found in ANY state (awaiting consent, in-flight, completed, retired, ambiguous, rejected, cancelled):
+        - The Custodian **MUST validate the commitment**:
+          $$\text{incoming.request\_hash} == \text{existing.request\_hash}$$
+        - **Changed-Content Collision**: If $\text{incoming.request\_hash} \ne \text{existing.request\_hash}$:
+          The request is an illegal aliasing or parameter tampering attempt. The Custodian **MUST immediately reject** the request with `error: "duplicate_operation"` (Class 3). The existing operation, active prompt, NFC card execution, or tombstone MUST NOT be replaced, cancelled, mutated, or joined.
+        - **Identical Retransmission**: If $\text{incoming.request\_hash} == \text{existing.request\_hash}$:
+          - `awaiting_consent`: Join the active authorization flow. The retransmitted request attaches as an observer awaiting user confirmation. No duplicate consent dialog is presented to the user.
+          - `in_flight`: Join the active NFC/card transaction. The retransmitted request attaches as an observer awaiting card completion and receives the single `operation.result`. No duplicate card APDUs are dispatched.
+          - `completed`: Re-transmit the cached `operation.result` immediately with cached response payload/status without re-accessing the card.
+          - `retired`: Re-transmit `operation.result` reporting `status: tombstone.terminal_disposition` (e.g. `"completed"`) without re-accessing the card or presenting user prompts (see Durable Tombstones below).
+          - `rejected` / `credential_rejected`: Re-transmit cached terminal error result (e.g. invalid PIN error with remaining retries) without re-accessing the card.
+          - `ambiguous`: Re-transmit terminal `operation.result` (`status: "ambiguous"`). Re-dispatching card APDUs is strictly forbidden.
+          - `cancelled`: Respond with `operation.result` (`status: "cancelled"`, `error: "operation_expired"`).
+     b. **New Operation Admission & Content Freezing**: If `(pair_id, operation_id)` is not present in active tasks, write-ahead journal, or durable tombstones:
+        - The Custodian atomically inserts a reservation entry in `state: "awaiting_consent"`, binding `pair_id`, `operation_id`, and `request_hash`.
+        - **Immutable Request Snapshot**: The Custodian takes an immutable snapshot of all request parameters (`profile`, `action`, `context`, `payload`, `request_hash`, `local_deadline`).
+        - The sovereign user consent UI presented on the phone screen (§11) **MUST** render strictly from this frozen immutable snapshot. Subsequent messages on the connection or other sessions cannot mutate or replace parameters under authorization.
 3. **Authorization and Conscious Consent**:
    - The Custodian validates that the requested profile is present in `granted_profiles` for the active pairing. If not granted, the Custodian responds with `operation.result` (`status: "rejected"`, `error: "unauthorized"`).
    - If the action requires user authorization or PIN entry (e.g. document signing under `"fi.refineid.document-signing.v1"` or browser authentication under `"fi.refineid.authentication.v1"`), the Custodian displays sovereign transaction details on the phone screen (§11).
-   - If the user declines on screen, the operation terminates immediately; the Custodian transmits `operation.result` (`status: "rejected"`, `error: "user_cancelled"`). No card APDUs are dispatched and no journal entry is created.
+   - If the user declines on screen, the operation terminates immediately; the Custodian transitions the reservation slot to `state: "rejected"`, transmits `operation.result` (`status: "rejected"`, `error: "user_cancelled"`), and releases in-memory state. No card APDUs are dispatched and no write-ahead journal entry is created.
 4. **Write-Ahead Journaling & Card Execution**:
-   - Upon human approval, the Custodian **MUST** write a durable write-ahead journal entry to persistent platform secure storage before dispatching any APDU to the smart card:
-     `[operation_id, session_id, pair_id, request_hash, state: "in_flight", timestamp]`.
+   - Upon conscious human approval on the phone screen, the Custodian **MUST** write a durable write-ahead journal entry to persistent platform secure storage before dispatching any APDU to the smart card:
+     `[pair_id, operation_id, request_hash, state: "in_flight", timestamp]`.
    - If the durable journal write fails (e.g. platform storage I/O error), the Custodian **MUST NOT** dispatch APDUs to the card; it aborts execution and returns Class 3 `operation_failed`.
    - Once durably recorded, the Custodian verifies the retry counter floor (§10.3) and dispatches APDUs to the FINEID card over NFC.
    - Upon completing card execution, the Custodian transitions the journal entry to `state: "completed"` (or `state: "rejected"` / `"credential_rejected"` if card SW indicates verification failure) and caches the response payload.
-5. **Result Delivery and Pruning (`operation.result` / `operation.result_ack`)**:
+5. **Result Delivery, Acknowledgment Validation, and Durable Tombstones**:
    - The Custodian transmits `operation.result` carrying `operation_id`, `request_hash`, and final execution status (`"completed"`, `"rejected"`, or `"credential_rejected"`).
    - For `status == "completed"`, the Requester transmits `operation.result_ack`.
-   - Upon receiving `operation.result_ack`, the Custodian prunes the journal entry from persistent storage.
-   - **Journal Retention Window**: If `operation.result_ack` is lost (or the Requester disconnects before acknowledging), completed and terminal journal entries MUST be retained in persistent secure storage for a minimum retention window of $\ge 24\text{ hours}$ (or a FIFO capacity of at least 1,000 entries) to enable post-reconnect status reconciliation. Entries older than the retention window are safely garbage-collected; subsequent status queries for pruned entries report `known: false`.
+   - **Acknowledgment Validation**:
+     Upon receiving `operation.result_ack`, the Custodian validates:
+     a. `pair_id` matches the authenticated pairing owning the operation.
+     b. `operation_id` matches an existing unretired journal entry.
+     c. `request_hash` matches the entry's stored `request_hash`.
+     d. The operation is in an unacknowledged terminal state (`completed`).
+     If validation fails (unknown identifier, hash mismatch, or already retired), the acknowledgment is rejected or safely ignored without altering existing tombstones.
+   - **Durable Tombstone Transition**:
+     Upon receiving a valid `operation.result_ack` (or when storage garbage collection runs on completed entries), the Custodian is permitted to delete the large cached response payload (signatures, certificates, diagnostic payloads) to conserve device storage, **BUT MUST RETAIN A DURABLE TOMBSTONE** in persistent platform secure storage:
+     `[pair_id, operation_id, request_hash, state: "retired", terminal_disposition, timestamp]`
+     where `terminal_disposition` preserves the terminal outcome (`"completed"`, `"rejected"`, `"credential_rejected"`, or `"ambiguous"`).
+   - **Tombstone Retention Contract & Prevention of Silent Re-Admission**:
+     - Durable tombstones MUST be retained in persistent secure storage for a minimum retention window of $\ge 30\text{ days}$ (or a FIFO capacity of at least 10,000 tombstones per pairing).
+     - Tombstones survive application termination, process restarts, and device reboots.
+     - An expired or evicted identifier **MUST NEVER** silently become a new operation. The Custodian maintains a durable monotonic epoch watermark `oldest_retained_timestamp` in persistent storage. Any incoming `operation.request` whose creation or session context is older than `oldest_retained_timestamp` MUST be rejected with error `"stale_operation_id"` (Class 3).
+     - Any subsequent `operation.request` matching a retained tombstone:
+       - If $\text{incoming.request\_hash} == \text{tombstone.request\_hash}$: The Custodian responds with `operation.result` reporting `status: tombstone.terminal_disposition` with an empty response map (or with `error: "operation_already_retired"`). Under NO circumstances are smart card APDUs re-dispatched or user consent prompts presented.
+       - If $\text{incoming.request\_hash} \ne \text{tombstone.request\_hash}$: The Custodian rejects immediately with `error: "duplicate_operation"` (Class 3).
 6. **Safe Reads (Direct Optimization)**:
    - Actions that perform read-only card operations (e.g. `inspect_card`, `read_identity`, `read_certificate`) involve no private-key operations or PIN try decrements.
    - Safe reads omit write-ahead journaling and screen consent prompts, executing card read APDUs directly and responding with `operation.result`.
 
 ### 8.3 Durable Status Reconciliation and Ambiguity Recovery
 
-When a BLE connection drops, a timeout occurs, or the mobile device restarts while an operation is in progress, recovery is governed by strict deterministic reconciliation rules.
+When a BLE connection drops, a timeout occurs, or the mobile device restarts while an operation is in progress, recovery is governed by strict deterministic reconciliation rules. Because `request_hash` is session-independent (§8.2.1) and durable tombstones are preserved (§8.2.5), reconciliation supports two equivalent paths: direct request retransmission and explicit status querying.
 
 1. **Pre-Execution Disconnect (Awaiting Human Consent)**:
    - If the BLE connection drops or `local_deadline` expires while the phone screen is awaiting user confirmation (prior to write-ahead journal commit):
@@ -1003,12 +1065,15 @@ When a BLE connection drops, a timeout occurs, or the mobile device restarts whi
        c. **NFC Field Interrupted / Custodian Crash**: If NFC coupling is dropped, the card is removed mid-command, or the phone restarts before terminal card status can be written: the Custodian transitions the journal record to `state: "ambiguous"`.
      - In all cases, the Custodian **MUST NEVER** automatically re-dispatch the physical card command.
 3. **Reconciliation Protocol (`operation.status_request` / `operation.status`)**:
-   - Upon reconnecting in a fresh operational session (`Phase::NoiseSession`), the Requester transmits `operation.status_request` carrying the queried `operation_id`.
-   - The Custodian consults its durable write-ahead journal for that `pair_id`:
+   - Upon reconnecting in a fresh operational session (`Phase::NoiseSession`), the Requester transmits `operation.status_request` carrying the queried `operation_id` (or retransmits `operation.request` identically).
+   - The Custodian consults its durable write-ahead journal and durable tombstones for that `pair_id`:
      - **Completed Operation**: If `operation_id` is journaled in state `completed`:
        - Custodian responds with `operation.status` (`known: true`, `state: "completed"`, `request_hash: <hash>`).
        - Custodian also re-delivers `operation.result` carrying the cached signature or response bytes without re-accessing the card.
        - Requester completes the exchange with `operation.result_ack`.
+     - **Retired Operation (Acknowledged / Pruned Result)**: If `operation_id` matches a durable tombstone (`state: "retired"`):
+       - Custodian responds with `operation.status` (`known: true`, `state: "completed"`, `request_hash: <hash>`).
+       - If queried via `operation.request`, Custodian responds with `operation.result` (`status: "completed"`, `error: "operation_already_retired"`). Card APDUs are NEVER re-dispatched.
      - **Terminal Rejected Operation**: If `operation_id` is journaled in state `rejected` or `credential_rejected`:
        - Custodian responds with `operation.status` (`known: true`, `state: <state>`, `request_hash: <hash>`).
        - Custodian re-delivers `operation.result` carrying the cached error string and remaining retry count.
@@ -1018,10 +1083,12 @@ When a BLE connection drops, a timeout occurs, or the mobile device restarts whi
      - **Ambiguous Operation**: If `operation_id` is journaled in state `ambiguous`:
        - Custodian responds with `operation.status` (`known: true`, `state: "ambiguous"`, `request_hash: <hash>`).
        - If partial batch progress was recorded (`batch_sign_documents`), `operation.result` returns `response: {"completed_signatures": [sig_0, ..., sig_{k-1}], "completed_count": k}`.
-     - **Unknown Operation**: If `operation_id` is not present in the journal (or was pruned after retention TTL): Custodian responds with `operation.status` (`known: false`).
+     - **Unknown Operation**: If `operation_id` is not present in active tasks, journal, or tombstones (and is not older than `oldest_retained_timestamp`): Custodian responds with `operation.status` (`known: false`).
+     - **Stale Identifier**: If `operation_id` context precedes `oldest_retained_timestamp`: Custodian responds with `error: "stale_operation_id"` (Class 3).
 4. **Terminal Exit from Ambiguous State**:
    - An ambiguous operation is permanently terminal for that `operation_id`. It CANNOT be retried or re-executed under the same identifier.
    - If the application wishes to retry the action after an ambiguous or failed operation, the Requester **MUST** allocate a fresh 16-byte `operation_id` and initiate a completely new operation lifecycle, requiring fresh human consent and authorization on the Custodian phone screen.
+
 
 ---
 
@@ -1147,6 +1214,8 @@ error-body = {
 | `"operation_failed"` | `1010` | Consequential hardware execution or durable journal write failed. | Class 3 |
 | `"duplicate_operation"` | `1011` | Non-idempotent attempt to execute an existing operation. | Class 3 |
 | `"user_declined"` | `1012` | User declined proceeding under low-retry warning floor. | Class 3 |
+| `"stale_operation_id"` | `1013` | Request identifier precedes durable tombstone retention epoch. | Class 3 |
+| `"operation_already_retired"` | `1014` | Operation was already executed, acknowledged, and retired. | Class 3 |
 
 **Normative Error Handling Rule**:
 Semantic error handling is driven exclusively by `error_name`. The numeric `error_code` is informative and provides predictable numeric mappings across language bindings. If an implementation receives an unrecognized `error_code` with a recognized `error_name`, `error_name` takes precedence. If both are unrecognized, the error MUST be handled as a general Class 3 `operation_failed`.

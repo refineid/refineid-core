@@ -305,9 +305,9 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
 6. **Reconnect Rendezvous for Operational Sessions (`Noise_KKhfs`)**:
    Subsequent connections for credential operations (authentication, qualified signing) do not rerun CPace or read bootstrap characteristics.
    - Every connection starts in `Phase::Routing` (Section 5.2).
-   - Requester transmits a single `ble-rendezvous` preamble frame over the Channel Characteristic via `ATT_WRITE_REQ`:
+   - Requester transmits a single `ble-rendezvous` preamble frame with purpose `"session"` (§5.2) over the Channel Characteristic via `ATT_WRITE_REQ`:
      ```cddl
-     ble-rendezvous = [
+     session-reconnect-preamble = [
        "RAPP-ble-v1",
        "session",       ; purpose
        rendezvous_token ; bstr .size 16
@@ -574,13 +574,13 @@ where $\text{prepend\_len}(x)$ prefixes $x$ with its LEB128 length, and $\text{C
    - Verifies $T_B$ in constant time.
    - Computes $T_A = \text{SHA-512}(\text{ISK} \parallel \texttt{"CONFIRM-A"} \parallel \text{SID})[0..32]$.
    - Transmits 32-byte $T_A$ in CPace Step 3 via `ATT_WRITE_REQ` in a `SINGLE` SAR frame.
-4. **Finalization & PSK Derivation**:
-   - Custodian verifies $T_A$ in constant time within the clamped attempt deadline.
-   - Upon verification, Custodian clears `active_attempt`, cancels the PAKE attempt timer, and transfers exclusive ownership to `Phase::NoisePairing`.
-   - Both parties extract the 32-byte Application Pairing Secret ($PSK$):
-     $$PSK = \text{ISK}[0..32]$$
-     (Design Note: Slicing the first 32 bytes of the 64-byte uniform $\text{ISK}$ is an intentional RAPP design choice relative to the general KDF recommendations in draft-irtf-cfrg-cpace-21 Section 10.3 and Section 10.4, directly matching the reference implementation in `crates/rapp/src/cpace.rs`. Under CPace assumptions, security of the PAKE is bounded by the ~252-bit prime order of Ristretto255 (~126 bits of classical security against Pollard's rho) and the online rate limiting of the human pairing code. Classical discrete-log PAKEs are not post-quantum secure against large-scale quantum computers; hybrid post-quantum forward secrecy against future quantum adversaries is established separately during subsequent operational sessions via the `Noise_KKhfs` handshake using ML-KEM-768).
-   - $PSK$ is passed directly as the pre-shared key into the `Noise_XXpsk3` pairing handshake.
+#### 6.1.4 Finalization & PSK Derivation
+- Custodian verifies $T_A$ in constant time within the clamped attempt deadline.
+- Upon verification, Custodian clears `active_attempt`, cancels the PAKE attempt timer, and transfers exclusive ownership to `Phase::NoisePairing`.
+- Both parties extract the 32-byte Application Pairing Secret ($PSK$):
+  $$PSK = \text{ISK}[0..32]$$
+  (Design Note: Slicing the first 32 bytes of the 64-byte uniform $\text{ISK}$ is an intentional RAPP design choice relative to the general KDF recommendations in draft-irtf-cfrg-cpace-21 Section 10.3 and Section 10.4, directly matching the reference implementation in `crates/rapp/src/cpace.rs`. Under CPace assumptions, security of the PAKE is bounded by the ~252-bit prime order of Ristretto255 (~126 bits of classical security against Pollard's rho) and the online rate limiting of the human pairing code. Classical discrete-log PAKEs are not post-quantum secure against large-scale quantum computers; hybrid post-quantum forward secrecy against future quantum adversaries is established separately during subsequent operational sessions via the `Noise_KKhfs` handshake using ML-KEM-768).
+- $PSK$ is passed directly as the pre-shared key into the `Noise_XXpsk3` pairing handshake (§6.2).
 
 ### 6.2 Noise_XXpsk3 Pairing Handshake (RFC 7748, RFC 8439, RFC 5869)
 
@@ -890,13 +890,7 @@ progress-event-val =
   / "card_wait_ended"
   / tstr
 
-; 17. Protocol Error Body
-error-body = {
-  "error_code": uint,
-  "error_name": tstr,
-  "message": tstr,
-  ? "operation_id": bstr .size 16
-}
+; 17. Protocol Error Body: error-body is defined in §10.4
 ```
 
 #### Normative Semantics of Registered Message Types:
@@ -905,17 +899,18 @@ error-body = {
 3. **`pairing.abort`**: Transmitted by either peer to cancel an in-progress pairing ceremony prior to final trust record storage, providing an advisory reason string. Ephemeral keys are destroyed immediately.
 4. **`session.ready`**: Transmitted by the Custodian upon completing `Phase::NoiseSession` (`Noise_KKhfs`) to prove possession of the operational session key and fresh session state, echoing session parameters and a fresh random 32-byte `nonce`.
 5. **`session.close`**: Transmitted by either peer to signal an orderly, authenticated termination of an operational session, providing a registered `close-reason-val` and acknowledging the `last_received_sequence`.
-6. **`liveness.ping` / `liveness.pong`**: Periodic authenticated keepalive exchange. The sender transmits `liveness.ping` with a fresh 32-byte `challenge` and sequence acknowledgment; the receiver responds with `liveness.pong` echoing the exact challenge.
-7. **`operation.request`**: Transmitted by the Requester to initiate a credential action under a registered profile (§8.2, §9).
-8. **`operation.prepared`**: Transmitted by the Custodian to confirm that parameters, profile grants, and user authorization have succeeded, echoing the derived `request_hash` (§8.2).
-9. **`operation.commit`**: Transmitted by the Requester as the definitive point of no return, instructing the Custodian to physically dispatch card APDU commands (§8.2).
-10. **`operation.cancel`**: Transmitted by either peer prior to commit to abort an operation cleanly without executing card commands (§8.2.4).
-11. **`operation.result`**: Transmitted by the Custodian to deliver the final card execution outcome, status, signature/response payload, or credential error (§8.2).
-12. **`operation.result_ack`**: Transmitted by the Requester to acknowledge delivery of a successful (`"completed"`) operation result (§8.2).
-13. **`operation.status_request`**: Transmitted by the Requester after reconnecting to reconcile the terminal outcome of an interrupted or ambiguous operation (§8.3).
-14. **`operation.status`**: Transmitted by the Custodian in response to `operation.status_request`, reporting whether the operation is journaled (`known`) and its terminal state (§8.3).
-15. **`operation.progress`**: Advisory notification transmitted by the Custodian during long-running card transactions (e.g. prompt to present card to NFC antenna).
-16. **`error`**: Application protocol error envelope transmitted upon encountering unexpected conditions (e.g. busy session or unknown operation race).
+6. **`liveness.ping`**: Periodic authenticated keepalive request transmitted by either peer carrying a fresh 32-byte `challenge` and sequence acknowledgment.
+7. **`liveness.pong`**: Periodic authenticated keepalive response echoing the exact 32-byte `challenge` and sequence acknowledgment.
+8. **`operation.request`**: Transmitted by the Requester to initiate a credential action under a registered profile (§8.2, §9).
+9. **`operation.prepared`**: Transmitted by the Custodian to confirm that parameters, profile grants, and user authorization have succeeded, echoing the derived `request_hash` (§8.2).
+10. **`operation.commit`**: Transmitted by the Requester as the definitive point of no return, instructing the Custodian to physically dispatch card APDU commands (§8.2).
+11. **`operation.cancel`**: Transmitted by either peer prior to commit to abort an operation cleanly without executing card commands (§8.2.4).
+12. **`operation.result`**: Transmitted by the Custodian to deliver the final card execution outcome, status, signature/response payload, or credential error (§8.2).
+13. **`operation.result_ack`**: Transmitted by the Requester to acknowledge delivery of a successful (`"completed"`) operation result (§8.2).
+14. **`operation.status_request`**: Transmitted by the Requester after reconnecting to reconcile the terminal outcome of an interrupted or ambiguous operation (§8.3).
+15. **`operation.status`**: Transmitted by the Custodian in response to `operation.status_request`, reporting whether the operation is journaled (`known`) and its terminal state (§8.3).
+16. **`operation.progress`**: Advisory notification transmitted by the Custodian during long-running card transactions (e.g. prompt to present card to NFC antenna).
+17. **`error`**: Application protocol error envelope transmitted upon encountering unexpected conditions (e.g. busy session or unknown operation race); bounded schema and numeric error code mappings are defined in §10.4.
 
 ### 7.2 Field Semantics, Version Precedence, and Sequencing
 1. **Wire Version & Skew Precedence**:

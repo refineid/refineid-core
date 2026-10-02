@@ -64,6 +64,6 @@ fn decode_hex(value: &str) -> Vec<u8> {
 
 fn load_corpus() -> Corpus {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../docs/protocols/vectors/rapp-v26.9.28.json");
+        .join("../../docs/protocols/vectors/rapp-v26.10.1.json");
     serde_json::from_slice(&fs::read(path).expect("read RAPP corpus")).expect("decode RAPP corpus")
 }

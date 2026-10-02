@@ -11,8 +11,6 @@ use super::{
     SESSION_READY_NONCE_SIZE, WIRE_VERSION_V26_10_1, WireValue,
 };
 
-const LEGACY_WIRE_VERSION: (u16, u16, u16) = (26, 9, 28);
-
 /// Pairing-channel parameter echo.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NegotiatedParameters {
@@ -707,14 +705,7 @@ fn require_version(map: &mut BTreeMap<String, WireValue>) -> Result<(), MessageE
     let Some(version) = map.remove("version") else {
         return Err(MessageError::InvalidField("version"));
     };
-    if version == version_value()
-        || version
-            == WireValue::Array(vec![
-                WireValue::Unsigned(u64::from(LEGACY_WIRE_VERSION.0)),
-                WireValue::Unsigned(u64::from(LEGACY_WIRE_VERSION.1)),
-                WireValue::Unsigned(u64::from(LEGACY_WIRE_VERSION.2)),
-            ])
-    {
+    if version == version_value() {
         Ok(())
     } else {
         Err(MessageError::InvalidField("version"))
@@ -889,3 +880,65 @@ impl fmt::Display for MessageError {
 }
 
 impl core::error::Error for MessageError {}
+
+#[cfg(test)]
+mod tests {
+    use super::{MessageError, require_version, version_value};
+    use crate::{WIRE_VERSION_V26_10_1, WireValue};
+    use std::collections::BTreeMap;
+
+    /// Named so the test states which version is being refused. This constant is
+    /// test-only: nothing on a runtime path may admit it.
+    const REFUSED_LEGACY_VERSION: (u16, u16, u16) = (26, 9, 28);
+
+    fn version_triple(version: (u16, u16, u16)) -> WireValue {
+        WireValue::Array(vec![
+            WireValue::Unsigned(u64::from(version.0)),
+            WireValue::Unsigned(u64::from(version.1)),
+            WireValue::Unsigned(u64::from(version.2)),
+        ])
+    }
+
+    fn map_with(version: WireValue) -> BTreeMap<String, WireValue> {
+        BTreeMap::from([("version".to_owned(), version)])
+    }
+
+    #[test]
+    fn current_version_is_accepted() {
+        assert_eq!(require_version(&mut map_with(version_value())), Ok(()));
+    }
+
+    #[test]
+    fn legacy_wire_version_is_refused() {
+        assert_eq!(
+            require_version(&mut map_with(version_triple(REFUSED_LEGACY_VERSION))),
+            Err(MessageError::InvalidField("version"))
+        );
+    }
+
+    #[test]
+    fn unknown_version_is_refused() {
+        assert_eq!(
+            require_version(&mut map_with(version_triple((27, 0, 0)))),
+            Err(MessageError::InvalidField("version"))
+        );
+    }
+
+    #[test]
+    fn absent_version_is_refused() {
+        assert_eq!(
+            require_version(&mut BTreeMap::new()),
+            Err(MessageError::InvalidField("version"))
+        );
+    }
+
+    #[test]
+    fn scalar_version_is_refused() {
+        assert_eq!(
+            require_version(&mut map_with(WireValue::Unsigned(u64::from(
+                WIRE_VERSION_V26_10_1.0
+            )))),
+            Err(MessageError::InvalidField("version"))
+        );
+    }
+}

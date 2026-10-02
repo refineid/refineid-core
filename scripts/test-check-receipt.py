@@ -9,6 +9,7 @@ Usage:
 from __future__ import annotations
 
 import importlib.util
+import io
 import os
 import stat
 import subprocess
@@ -16,7 +17,7 @@ import sys
 import tempfile
 import unittest
 from argparse import Namespace
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -73,6 +74,8 @@ class CheckReceiptTests(unittest.TestCase):
         self.fake_tool.chmod(EXECUTABLE_MODE)
         self._stage_all()
         self.arguments = Namespace(name="source-checks", tool=["sh", str(self.fake_tool)])
+        self.diagnostic = ""
+        self.notice = ""
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -87,17 +90,37 @@ class CheckReceiptTests(unittest.TestCase):
             ["git", "add", "--all"], cwd=self.root, check=True, env=self.environment
         )
 
+    def _invoke(self, command: list[str]) -> int:
+        """Run the checker with its diagnostics captured instead of leaked.
+
+        The checker reports refusal and no-receipt reasons on stderr and
+        receipt reuse on stdout. Exercised deliberately here, those would
+        otherwise appear on the terminal as if a gate had failed.
+        """
+        diagnostics = io.StringIO()
+        notice = io.StringIO()
+        with (
+            patch.dict(os.environ, self.environment, clear=True),
+            working_directory(self.root),
+            redirect_stderr(diagnostics),
+            redirect_stdout(notice),
+        ):
+            status = check_receipt.run(self.arguments, command)
+        self.diagnostic = diagnostics.getvalue()
+        self.notice = notice.getvalue()
+        return status
+
     def _run(self) -> int:
-        command = [str(self.command_file)]
-        with patch.dict(os.environ, self.environment, clear=True), working_directory(self.root):
-            return check_receipt.run(self.arguments, command)
+        return self._invoke([str(self.command_file)])
 
     def _calls(self) -> int:
         return int(self.counter.read_text(encoding="ascii")) if self.counter.exists() else 0
 
     def test_reuses_receipt_for_the_same_indexed_tree(self) -> None:
         self.assertEqual(self._run(), 0)
+        self.assertNotIn("reusing local receipt", self.notice)
         self.assertEqual(self._run(), 0)
+        self.assertIn("reusing local receipt", self.notice)
         self.assertEqual(self._calls(), 1)
 
     def test_changed_indexed_input_invalidates_receipt(self) -> None:
@@ -119,7 +142,7 @@ class CheckReceiptTests(unittest.TestCase):
 
         with patch.dict(os.environ, self.environment, clear=True), working_directory(self.root):
             with patch.object(check_receipt.subprocess, "run", side_effect=report_clean_diff):
-                self.assertEqual(check_receipt.run(self.arguments, [str(self.command_file)]), 0)
+                self.assertEqual(self._invoke([str(self.command_file)]), 0)
         self.assertEqual(self._calls(), 2)
 
     def test_changed_check_script_invalidates_receipt(self) -> None:
@@ -170,7 +193,7 @@ class CheckReceiptTests(unittest.TestCase):
         self.input_file.write_text("unstaged worktree edit\n", encoding="ascii")
         with patch.dict(os.environ, self.environment, clear=True), working_directory(self.root):
             with self.assertRaisesRegex(RuntimeError, "differ from the index"):
-                check_receipt.run(self.arguments, [str(self.command_file)])
+                self._invoke([str(self.command_file)])
         self.assertEqual(self._calls(), 0)
 
     def test_assume_unchanged_entry_is_rejected(self) -> None:
@@ -183,7 +206,7 @@ class CheckReceiptTests(unittest.TestCase):
         self.input_file.write_text("hidden worktree edit\n", encoding="ascii")
         with patch.dict(os.environ, self.environment, clear=True), working_directory(self.root):
             with self.assertRaisesRegex(RuntimeError, "assume-unchanged or skip-worktree"):
-                check_receipt.run(self.arguments, [str(self.command_file)])
+                self._invoke([str(self.command_file)])
         self.assertEqual(self._calls(), 0)
 
     def test_skip_worktree_entry_is_rejected(self) -> None:
@@ -196,7 +219,7 @@ class CheckReceiptTests(unittest.TestCase):
         self.input_file.write_text("hidden worktree edit\n", encoding="ascii")
         with patch.dict(os.environ, self.environment, clear=True), working_directory(self.root):
             with self.assertRaisesRegex(RuntimeError, "assume-unchanged or skip-worktree"):
-                check_receipt.run(self.arguments, [str(self.command_file)])
+                self._invoke([str(self.command_file)])
         self.assertEqual(self._calls(), 0)
 
     def test_receipt_hit_rechecks_index_before_reusing(self) -> None:
@@ -210,7 +233,9 @@ class CheckReceiptTests(unittest.TestCase):
 
         with patch.dict(os.environ, self.environment, clear=True), working_directory(self.root):
             with patch.object(check_receipt, "valid_receipt", side_effect=mutate_before_hit):
-                self.assertEqual(check_receipt.run(self.arguments, [str(self.command_file)]), 1)
+                self.assertEqual(self._invoke([str(self.command_file)]), 1)
+        self.assertIn("inputs changed while reading the receipt", self.diagnostic)
+        self.assertNotIn("reusing local receipt", self.notice)
         self.assertEqual(self._calls(), 1)
 
     def test_receipt_hit_rechecks_tool_before_reusing(self) -> None:
@@ -223,7 +248,7 @@ class CheckReceiptTests(unittest.TestCase):
 
         with patch.dict(os.environ, self.environment, clear=True), working_directory(self.root):
             with patch.object(check_receipt, "valid_receipt", side_effect=mutate_tool_before_hit):
-                self.assertEqual(check_receipt.run(self.arguments, [str(self.command_file)]), 1)
+                self.assertEqual(self._invoke([str(self.command_file)]), 1)
         self.assertEqual(self._calls(), 1)
 
     def test_corrupt_receipt_is_a_miss_and_is_replaced_after_success(self) -> None:
@@ -259,6 +284,7 @@ class CheckReceiptTests(unittest.TestCase):
         self.command_file.chmod(EXECUTABLE_MODE)
         self._stage_all()
         self.assertEqual(self._run(), 1)
+        self.assertIn("indexed inputs changed during the check", self.diagnostic)
         self.assertTrue(self.counter.exists())
 
     def test_referenced_cargo_config_environment_invalidates_receipt(self) -> None:

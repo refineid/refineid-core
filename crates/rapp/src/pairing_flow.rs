@@ -6,8 +6,8 @@ use super::{
     BinaryFrame, CryptoError, EndpointRole, HandshakeChannel, HandshakeRole, MessageError,
     NegotiatedParameters, OpenError, PairKeyMaterial, PairRecord, PairRecordError,
     PairTransportBinding, PairingConfirmMessage, PairingHandshakeParameters, PairingHelloMessage,
-    PairingOffer, PairingOfferError, ProfileName, SecureChannel, TransportCandidate, TypedMessage,
-    compute_grants_hash,
+    PairingOffer, PairingOfferError, PairingSecret, ProfileName, SecureChannel, TransportCandidate,
+    TypedMessage, compute_grants_hash,
 };
 
 /// In-progress mandatory Noise `XXpsk3` handshake.
@@ -37,6 +37,7 @@ impl PairingHandshake {
         offer: PairingOffer,
         candidate_id: &str,
         local_keys: PairKeyMaterial,
+        pairing_secret: &PairingSecret,
     ) -> Result<Self, PairingAttemptFailure> {
         let matches = offer
             .transports
@@ -62,7 +63,7 @@ impl PairingHandshake {
         let channel = match HandshakeChannel::pairing(&PairingHandshakeParameters {
             role: handshake_role(role),
             local_keys: &local_keys,
-            pairing_secret: offer.pairing_secret(),
+            pairing_secret,
             offer_hash,
             transport_profile: &candidate.profile,
         })

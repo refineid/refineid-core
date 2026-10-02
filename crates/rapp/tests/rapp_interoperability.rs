@@ -64,7 +64,6 @@ fn paired_records() -> (PairRecord, PairRecord) {
     ];
     let offer = PairingOffer::reconstruct(
         OfferId::from_array([0x10; 32]),
-        PairingSecret::from_random_bytes([0x20; 32]),
         vec![MANDATORY_PAIRING_SUITE.to_owned()],
         profiles,
         vec![TransportCandidate {
@@ -83,11 +82,14 @@ fn paired_records() -> (PairRecord, PairRecord) {
     let proxy_offer = PairingOffer::from_uri(PairingOfferUri::from_scanned_text(scanned))
         .expect("the QR offer decodes");
 
+    let pairing_secret = PairingSecret::from_random_bytes([0x20; 32]);
+
     let mut requester = PairingHandshake::begin(
         EndpointRole::Requester,
         offer,
         "candidate-1",
         generate_pair_key_material().expect("requester key generation succeeds"),
+        &pairing_secret,
     )
     .expect("requester pairing starts");
     let mut proxy = PairingHandshake::begin(
@@ -95,6 +97,7 @@ fn paired_records() -> (PairRecord, PairRecord) {
         proxy_offer,
         "candidate-1",
         generate_pair_key_material().expect("proxy key generation succeeds"),
+        &pairing_secret,
     )
     .expect("proxy pairing starts");
 
@@ -466,14 +469,13 @@ fn cpace_code_pairing_and_fresh_session_interoperate_end_to_end() {
 
     assert_eq!(alice_secret, bob_secret);
 
-    // Phase 2: Construct offers with the derived pairing secret
+    // Phase 2: Construct offers without secrets
     let profiles = vec![
         ProfileName::CardStatus.as_str().to_owned(),
         ProfileName::Authentication.as_str().to_owned(),
     ];
     let requester_offer = PairingOffer::reconstruct(
         offer_id,
-        alice_secret,
         vec![MANDATORY_PAIRING_SUITE.to_owned()],
         profiles.clone(),
         vec![TransportCandidate {
@@ -487,7 +489,6 @@ fn cpace_code_pairing_and_fresh_session_interoperate_end_to_end() {
 
     let proxy_offer = PairingOffer::reconstruct(
         offer_id,
-        bob_secret,
         vec![MANDATORY_PAIRING_SUITE.to_owned()],
         profiles,
         vec![TransportCandidate {
@@ -505,6 +506,7 @@ fn cpace_code_pairing_and_fresh_session_interoperate_end_to_end() {
         requester_offer,
         "candidate-1",
         generate_pair_key_material().expect("requester key generation succeeds"),
+        &alice_secret,
     )
     .expect("requester pairing starts");
     let mut proxy = PairingHandshake::begin(
@@ -512,6 +514,7 @@ fn cpace_code_pairing_and_fresh_session_interoperate_end_to_end() {
         proxy_offer,
         "candidate-1",
         generate_pair_key_material().expect("proxy key generation succeeds"),
+        &bob_secret,
     )
     .expect("proxy pairing starts");
 

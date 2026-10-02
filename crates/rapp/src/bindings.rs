@@ -186,6 +186,7 @@ enum PairingBridgeState {
     Offer {
         role: EndpointRole,
         offer: PairingOffer,
+        pairing_secret: Option<PairingSecret>,
         deadline: PairingOfferDeadline,
     },
     Cpace {
@@ -231,6 +232,7 @@ impl PairingBridgeState {
             return Self::Offer {
                 role,
                 offer: handshake.abort(),
+                pairing_secret: None,
                 deadline,
             };
         }
@@ -246,6 +248,7 @@ impl PairingBridgeState {
             Self::Offer {
                 role,
                 offer,
+                pairing_secret: None,
                 deadline,
             }
         } else {
@@ -294,7 +297,6 @@ impl RappPairingBridge {
             .collect::<Result<Vec<_>, _>>()?;
         let offer = PairingOffer::reconstruct(
             offer_id,
-            PairingSecret::from_random_bytes(pairing_secret),
             vec![MANDATORY_PAIRING_SUITE.to_owned()],
             profiles,
             transports,
@@ -307,6 +309,7 @@ impl RappPairingBridge {
             state: Mutex::new(PairingBridgeState::Offer {
                 role: EndpointRole::Requester,
                 offer,
+                pairing_secret: Some(PairingSecret::from_random_bytes(pairing_secret)),
                 deadline,
             }),
         }))
@@ -330,6 +333,37 @@ impl RappPairingBridge {
             state: Mutex::new(PairingBridgeState::Offer {
                 role: EndpointRole::Proxy,
                 offer,
+                pairing_secret: None,
+                deadline,
+            }),
+        }))
+    }
+
+    /// Decode a scanned one-use QR offer and attach a pre-shared bearer secret.
+    ///
+    /// # Errors
+    /// [`RappBindingError::InvalidInput`] on a URI that fails structural or
+    /// policy validation, or if the pairing secret length is invalid.
+    #[uniffi::constructor]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "uniffi lowers exported arguments as owned values"
+    )]
+    pub fn from_scanned_offer_with_secret(
+        uri: String,
+        pairing_secret: Vec<u8>,
+        started_at_monotonic_ms: u64,
+    ) -> Result<Arc<Self>, RappBindingError> {
+        let offer = PairingOffer::from_uri(PairingOfferUri::from_scanned_text(uri))
+            .map_err(|_| RappBindingError::InvalidInput)?;
+        let pairing_secret = fixed_array(pairing_secret)?;
+        let deadline = PairingOfferDeadline::from_offer(&offer, started_at_monotonic_ms)
+            .map_err(|_| RappBindingError::InvalidInput)?;
+        Ok(Arc::new(Self {
+            state: Mutex::new(PairingBridgeState::Offer {
+                role: EndpointRole::Proxy,
+                offer,
+                pairing_secret: Some(PairingSecret::from_random_bytes(pairing_secret)),
                 deadline,
             }),
         }))
@@ -357,10 +391,8 @@ impl RappPairingBridge {
             .into_iter()
             .map(transport_candidate)
             .collect::<Result<Vec<_>, _>>()?;
-        let dummy_secret = PairingSecret::from_random_bytes([0_u8; super::PAIRING_SECRET_SIZE]);
         let offer = PairingOffer::reconstruct(
             offer_id,
-            dummy_secret,
             vec![MANDATORY_PAIRING_SUITE.to_owned()],
             profiles,
             transports,
@@ -373,6 +405,7 @@ impl RappPairingBridge {
             state: Mutex::new(PairingBridgeState::Offer {
                 role: EndpointRole::Requester,
                 offer,
+                pairing_secret: None,
                 deadline,
             }),
         }))
@@ -400,10 +433,8 @@ impl RappPairingBridge {
             .into_iter()
             .map(transport_candidate)
             .collect::<Result<Vec<_>, _>>()?;
-        let dummy_secret = PairingSecret::from_random_bytes([0_u8; super::PAIRING_SECRET_SIZE]);
         let offer = PairingOffer::reconstruct(
             offer_id,
-            dummy_secret,
             vec![MANDATORY_PAIRING_SUITE.to_owned()],
             profiles,
             transports,
@@ -416,6 +447,7 @@ impl RappPairingBridge {
             state: Mutex::new(PairingBridgeState::Offer {
                 role: EndpointRole::Proxy,
                 offer,
+                pairing_secret: None,
                 deadline,
             }),
         }))
@@ -514,21 +546,32 @@ impl RappPairingBridge {
         let PairingBridgeState::Offer {
             role,
             offer,
+            pairing_secret,
             deadline,
         } = previous
         else {
             *state = previous;
             return Err(RappBindingError::WrongPhase);
         };
+        let Some(secret) = pairing_secret else {
+            *state = PairingBridgeState::Offer {
+                role,
+                offer,
+                pairing_secret: None,
+                deadline,
+            };
+            return Err(RappBindingError::WrongPhase);
+        };
         let Ok(local_keys) = generate_pair_key_material() else {
             *state = PairingBridgeState::Offer {
                 role,
                 offer,
+                pairing_secret: Some(secret),
                 deadline,
             };
             return Err(RappBindingError::ProtocolFailure);
         };
-        match PairingHandshake::begin(role, offer, &candidate_id, local_keys) {
+        match PairingHandshake::begin(role, offer, &candidate_id, local_keys, &secret) {
             Ok(handshake) => {
                 *state = PairingBridgeState::Handshake {
                     role,
@@ -542,6 +585,7 @@ impl RappPairingBridge {
                 *state = PairingBridgeState::Offer {
                     role,
                     offer,
+                    pairing_secret: Some(secret),
                     deadline,
                 };
                 drop(state);
@@ -571,6 +615,7 @@ impl RappPairingBridge {
         let PairingBridgeState::Offer {
             role,
             offer,
+            pairing_secret: _,
             deadline,
         } = previous
         else {
@@ -592,6 +637,7 @@ impl RappPairingBridge {
                 *state = PairingBridgeState::Offer {
                     role,
                     offer,
+                    pairing_secret: None,
                     deadline,
                 };
                 return Err(RappBindingError::InvalidInput);
@@ -601,6 +647,7 @@ impl RappPairingBridge {
             *state = PairingBridgeState::Offer {
                 role,
                 offer,
+                pairing_secret: None,
                 deadline,
             };
             return Err(RappBindingError::ProtocolFailure);
@@ -653,7 +700,7 @@ impl RappPairingBridge {
         let PairingBridgeState::Cpace {
             role,
             cpace,
-            mut offer,
+            offer,
             candidate_id,
             local_keys,
             deadline,
@@ -678,8 +725,7 @@ impl RappPairingBridge {
                 return Err(RappBindingError::ProtocolFailure);
             }
         };
-        offer.set_pairing_secret(secret);
-        match PairingHandshake::begin(role, offer, &candidate_id, local_keys) {
+        match PairingHandshake::begin(role, offer, &candidate_id, local_keys, &secret) {
             Ok(handshake) => {
                 *state = PairingBridgeState::Handshake {
                     role,
@@ -880,6 +926,7 @@ impl RappPairingBridge {
                     PairingBridgeState::Offer {
                         role,
                         offer,
+                        pairing_secret: None,
                         deadline,
                     }
                 } else {
@@ -1056,6 +1103,33 @@ mod pairing_bridge_tests {
         .expect("requester offer is valid")
     }
 
+    fn proxy_bridge(uri: String) -> Arc<RappPairingBridge> {
+        let counts = rapp_random_byte_counts();
+        RappPairingBridge::from_scanned_offer_with_secret(
+            uri,
+            vec![
+                0x22;
+                usize::try_from(counts.pairing_secret).expect("pairing secret size fits usize")
+            ],
+            STARTED_AT_MS,
+        )
+        .expect("proxy scans the offer with secret")
+    }
+
+    #[test]
+    fn from_scanned_offer_without_secret_fails_begin_directly() {
+        let requester = requester_bridge();
+        let uri = requester
+            .offer_uri(STARTED_AT_MS)
+            .expect("requester exposes its live offer");
+        let proxy = RappPairingBridge::from_scanned_offer(uri, STARTED_AT_MS)
+            .expect("proxy scans the offer");
+        assert!(matches!(
+            proxy.begin(CANDIDATE_ID.into(), STARTED_AT_MS + 1),
+            Err(RappBindingError::WrongPhase)
+        ));
+    }
+
     #[test]
     fn requester_handshake_garbage_retains_offer_and_original_deadline() {
         let requester = requester_bridge();
@@ -1096,8 +1170,7 @@ mod pairing_bridge_tests {
         let uri = requester
             .offer_uri(STARTED_AT_MS)
             .expect("requester exposes its live offer");
-        let proxy = RappPairingBridge::from_scanned_offer(uri, STARTED_AT_MS)
-            .expect("proxy scans the offer");
+        let proxy = proxy_bridge(uri);
 
         proxy
             .begin(CANDIDATE_ID.into(), STARTED_AT_MS + 1)
@@ -1118,8 +1191,7 @@ mod pairing_bridge_tests {
         let uri = requester
             .offer_uri(STARTED_AT_MS)
             .expect("requester exposes its live offer");
-        let proxy = RappPairingBridge::from_scanned_offer(uri, STARTED_AT_MS)
-            .expect("proxy scans the offer");
+        let proxy = proxy_bridge(uri);
         requester
             .begin(CANDIDATE_ID.into(), STARTED_AT_MS + 1)
             .expect("requester candidate starts");
@@ -1166,8 +1238,7 @@ mod pairing_bridge_tests {
         let uri = requester
             .offer_uri(STARTED_AT_MS)
             .expect("requester exposes its live offer");
-        let proxy = RappPairingBridge::from_scanned_offer(uri, STARTED_AT_MS)
-            .expect("proxy scans the offer");
+        let proxy = proxy_bridge(uri);
         requester
             .begin(CANDIDATE_ID.into(), STARTED_AT_MS + 1)
             .expect("requester candidate starts");

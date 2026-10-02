@@ -21,20 +21,19 @@ use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::{
-    MANDATORY_PAIRING_SUITE, MAX_TRANSPORT_CANDIDATES, OFFER_ID_SIZE, OFFER_TTL_MAX_MS, OfferId,
-    PairingSecret, TransportCandidate, VISIBLE_WIRE_VERSION, WireError, WireValue,
+    CPACE_KC2_SUITE, MANDATORY_PAIRING_SUITE, MAX_TRANSPORT_CANDIDATES, OFFER_ID_SIZE,
+    OFFER_TTL_MAX_MS, OfferId, TransportCandidate, WIRE_VERSION_V26_10_1, WireError, WireValue,
     decode_deterministic_cbor, encode_deterministic_cbor,
 };
 
 const MAX_OFFER_SIZE: usize = 1_024;
-const PAIRING_SECRET_SIZE: usize = 32;
 const URI_PREFIX: &str = "rapp:";
 
-/// Validated logical pairing offer.
+/// Validated logical pairing offer per RAPP v26.10.1 §4.2.
+#[derive(Clone, Eq, PartialEq)]
 pub struct PairingOffer {
     /// Random one-off offer identifier.
     pub offer_id: OfferId,
-    pairing_secret: PairingSecret,
     /// Ordered supported cryptographic suites.
     pub suites: Vec<String>,
     /// Ordered requested credential-profile registry names.
@@ -87,7 +86,6 @@ impl PairingOffer {
     /// validation.
     pub fn reconstruct(
         offer_id: OfferId,
-        pairing_secret: PairingSecret,
         suites: Vec<String>,
         profiles: Vec<String>,
         transports: Vec<TransportCandidate>,
@@ -95,7 +93,6 @@ impl PairingOffer {
     ) -> Result<Self, PairingOfferError> {
         let offer = Self {
             offer_id,
-            pairing_secret,
             suites,
             profiles,
             transports,
@@ -105,65 +102,30 @@ impl PairingOffer {
         Ok(offer)
     }
 
-    /// Borrow the one-use secret only for the pairing Noise handshake.
-    #[must_use]
-    pub const fn pairing_secret(&self) -> &PairingSecret {
-        &self.pairing_secret
-    }
-
-    /// Update the pairing secret (e.g. after CPace key exchange).
-    pub fn set_pairing_secret(&mut self, secret: PairingSecret) {
-        self.pairing_secret = secret;
-    }
-
-    /// Hash the deterministic offer with the bearer secret removed.
+    /// Serialize the canonical pairing offer into deterministic CBOR.
     ///
     /// # Errors
-    /// [`PairingOfferError::Wire`] when deterministic encoding fails.
-    pub fn offer_hash(&self) -> Result<[u8; 32], PairingOfferError> {
-        let encoded = encode_deterministic_cbor(&WireValue::Map(self.to_map(false)))?;
-        Ok(Sha256::digest(encoded).into())
-    }
-
-    /// Encode the complete secret-bearing QR payload.
-    ///
-    /// # Errors
-    /// [`PairingOfferError`] on an invalid offer or an encoding above the QR
-    /// size limit.
-    pub fn to_uri(&self) -> Result<PairingOfferUri, PairingOfferError> {
+    /// [`PairingOfferError`] on validation failure or if the encoded length
+    /// exceeds the maximum permitted offer size.
+    pub fn to_cbor(&self) -> Result<Vec<u8>, PairingOfferError> {
         self.validate()?;
-        let encoded = encode_deterministic_cbor(&WireValue::Map(self.to_map(true)))?;
+        let encoded = encode_deterministic_cbor(&WireValue::Map(self.to_map()))?;
         if encoded.len() > MAX_OFFER_SIZE {
             return Err(PairingOfferError::Oversized { got: encoded.len() });
         }
-        let mut uri = String::with_capacity(URI_PREFIX.len() + encoded.len() * 2);
-        uri.push_str(URI_PREFIX);
-        uri.push_str(&base64url_encode(&encoded));
-        Ok(PairingOfferUri(uri))
+        Ok(encoded)
     }
 
-    /// Decode a scanned QR URI into a validated offer.
+    /// Decode a deterministic-CBOR byte slice into a validated offer.
     ///
     /// # Errors
-    /// [`PairingOfferError`] on a wrong scheme, malformed payload, or failed
-    /// structural or policy validation.
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "consumes the one-use secret-bearing URI so it is zeroized after decoding"
-    )]
-    pub fn from_uri(uri: PairingOfferUri) -> Result<Self, PairingOfferError> {
-        let payload = uri
-            .0
-            .strip_prefix(URI_PREFIX)
-            .ok_or(PairingOfferError::WrongScheme)?;
-        let mut decoded = base64url_decode(payload)?;
-        if decoded.len() > MAX_OFFER_SIZE {
-            let got = decoded.len();
-            decoded.zeroize();
-            return Err(PairingOfferError::Oversized { got });
+    /// [`PairingOfferError`] on a wrong scheme, unexpected fields, malformed
+    /// payload, or failed structural or policy validation.
+    pub fn from_cbor(bytes: &[u8]) -> Result<Self, PairingOfferError> {
+        if bytes.len() > MAX_OFFER_SIZE {
+            return Err(PairingOfferError::Oversized { got: bytes.len() });
         }
-        let value = decode_deterministic_cbor(&decoded)?;
-        decoded.zeroize();
+        let value = decode_deterministic_cbor(bytes)?;
         let WireValue::Map(mut map) = value else {
             return Err(PairingOfferError::WrongType);
         };
@@ -171,7 +133,6 @@ impl PairingOffer {
             "scheme",
             "version",
             "offer_id",
-            "pairing_secret",
             "suites",
             "profiles",
             "transports",
@@ -186,9 +147,9 @@ impl PairingOffer {
         let version = take_array(&mut map, "version")?;
         if version
             != vec![
-                WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.0)),
-                WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.1)),
-                WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.2)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.0)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.1)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.2)),
             ]
         {
             return Err(PairingOfferError::UnsupportedVersion);
@@ -200,17 +161,6 @@ impl PairingOffer {
                 expected: OFFER_ID_SIZE,
                 got: offer_id.len(),
             })?;
-        let mut secret = take_bytes(&mut map, "pairing_secret")?;
-        let secret_bytes: [u8; PAIRING_SECRET_SIZE] =
-            secret
-                .as_slice()
-                .try_into()
-                .map_err(|_| PairingOfferError::WrongLength {
-                    field: "pairing_secret",
-                    expected: PAIRING_SECRET_SIZE,
-                    got: secret.len(),
-                })?;
-        secret.zeroize();
         let suites = take_text_array(&mut map, "suites")?;
         let profiles = take_text_array(&mut map, "profiles")?;
         let transport_values = take_array(&mut map, "transports")?;
@@ -219,14 +169,49 @@ impl PairingOffer {
             .map(transport_from_value)
             .collect::<Result<Vec<_>, _>>()?;
         let offer_ttl_ms = take_unsigned(&mut map, "offer_ttl_ms")?;
-        Self::reconstruct(
-            offer_id,
-            PairingSecret::from_random_bytes(secret_bytes),
-            suites,
-            profiles,
-            transports,
-            offer_ttl_ms,
-        )
+        Self::reconstruct(offer_id, suites, profiles, transports, offer_ttl_ms)
+    }
+
+    /// Hash the deterministic offer per RAPP v26.10.1 §4.2.
+    ///
+    /// # Errors
+    /// [`PairingOfferError`] when deterministic encoding fails.
+    pub fn offer_hash(&self) -> Result<[u8; 32], PairingOfferError> {
+        let encoded = self.to_cbor()?;
+        Ok(Sha256::digest(&encoded).into())
+    }
+
+    /// Encode the complete pairing offer into a `rapp:` URI.
+    ///
+    /// # Errors
+    /// [`PairingOfferError`] on an invalid offer or an encoding above the QR
+    /// size limit.
+    pub fn to_uri(&self) -> Result<PairingOfferUri, PairingOfferError> {
+        let encoded = self.to_cbor()?;
+        let mut uri = String::with_capacity(URI_PREFIX.len() + encoded.len() * 2);
+        uri.push_str(URI_PREFIX);
+        uri.push_str(&base64url_encode(&encoded));
+        Ok(PairingOfferUri(uri))
+    }
+
+    /// Decode a scanned QR URI into a validated offer.
+    ///
+    /// # Errors
+    /// [`PairingOfferError`] on a wrong scheme, malformed payload, or failed
+    /// structural or policy validation.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "consumes the URI so it is zeroized after decoding"
+    )]
+    pub fn from_uri(uri: PairingOfferUri) -> Result<Self, PairingOfferError> {
+        let payload = uri
+            .0
+            .strip_prefix(URI_PREFIX)
+            .ok_or(PairingOfferError::WrongScheme)?;
+        let mut decoded = base64url_decode(payload)?;
+        let result = Self::from_cbor(&decoded);
+        decoded.zeroize();
+        result
     }
 
     fn validate(&self) -> Result<(), PairingOfferError> {
@@ -236,7 +221,7 @@ impl PairingOffer {
         if !self
             .suites
             .iter()
-            .any(|suite| suite == MANDATORY_PAIRING_SUITE)
+            .any(|suite| suite == MANDATORY_PAIRING_SUITE || suite == CPACE_KC2_SUITE)
         {
             return Err(PairingOfferError::MandatorySuiteMissing);
         }
@@ -260,15 +245,15 @@ impl PairingOffer {
         Ok(())
     }
 
-    fn to_map(&self, include_secret: bool) -> BTreeMap<String, WireValue> {
-        let mut map = BTreeMap::from([
+    fn to_map(&self) -> BTreeMap<String, WireValue> {
+        BTreeMap::from([
             ("scheme".to_owned(), WireValue::Text("rapp".to_owned())),
             (
                 "version".to_owned(),
                 WireValue::Array(vec![
-                    WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.0)),
-                    WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.1)),
-                    WireValue::Unsigned(u64::from(VISIBLE_WIRE_VERSION.2)),
+                    WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.0)),
+                    WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.1)),
+                    WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.2)),
                 ]),
             ),
             (
@@ -291,14 +276,7 @@ impl PairingOffer {
                 "offer_ttl_ms".to_owned(),
                 WireValue::Unsigned(self.offer_ttl_ms),
             ),
-        ]);
-        if include_secret {
-            map.insert(
-                "pairing_secret".to_owned(),
-                WireValue::Bytes(self.pairing_secret.expose().to_vec()),
-            );
-        }
-        map
+        ])
     }
 }
 
@@ -307,7 +285,6 @@ impl fmt::Debug for PairingOffer {
         formatter
             .debug_struct("PairingOffer")
             .field("offer_id", &self.offer_id)
-            .field("pairing_secret", &"[redacted]")
             .field("suites", &self.suites)
             .field("profiles", &self.profiles)
             .field("transports", &self.transports)
@@ -316,7 +293,7 @@ impl fmt::Debug for PairingOffer {
     }
 }
 
-/// Secret-bearing `rapp:` URI intended only for immediate QR rendering.
+/// Canonical `rapp:` URI intended for QR rendering or bootstrap transport.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct PairingOfferUri(String);
 
@@ -575,35 +552,99 @@ const fn decode_base64url_byte(byte: u8) -> Result<u8, PairingOfferError> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{PairingOffer, PairingOfferDeadline};
-    use crate::{MANDATORY_PAIRING_SUITE, OfferId, PairingSecret, TransportCandidate};
+    use super::{PairingOffer, PairingOfferDeadline, PairingOfferError};
+    use crate::{
+        CPACE_KC2_SUITE, MANDATORY_PAIRING_SUITE, OfferId, TransportCandidate, WireValue,
+        encode_deterministic_cbor,
+    };
 
     #[test]
-    fn offer_uri_round_trip_preserves_secret_and_hash() {
+    fn offer_uri_and_cbor_round_trip_preserves_metadata_and_hash() {
         let offer = PairingOffer::reconstruct(
             OfferId::from_array([1; 32]),
-            PairingSecret::from_random_bytes([2; 32]),
-            vec![MANDATORY_PAIRING_SUITE.to_owned()],
+            vec![CPACE_KC2_SUITE.to_owned()],
             vec!["fi.refineid.card-status.v1".to_owned()],
             vec![TransportCandidate {
-                profile: "local-quic-v1".to_owned(),
-                candidate_id: "candidate".to_owned(),
+                profile: "fi.refineid.rapp.ble.v1".to_owned(),
+                candidate_id: "ble-direct-1".to_owned(),
                 parameters: BTreeMap::new(),
             }],
             60_000,
         )
         .expect("fixture is valid");
         let expected_hash = offer.offer_hash().expect("hash encodes");
-        let decoded =
-            PairingOffer::from_uri(offer.to_uri().expect("URI encodes")).expect("URI decodes");
+        let uri = offer.to_uri().expect("URI encodes");
+        let decoded = PairingOffer::from_uri(uri).expect("URI decodes");
+        assert_eq!(decoded, offer);
         assert_eq!(decoded.offer_hash().expect("hash encodes"), expected_hash);
+
+        let cbor = offer.to_cbor().expect("CBOR encodes");
+        let decoded_cbor = PairingOffer::from_cbor(&cbor).expect("CBOR decodes");
+        assert_eq!(decoded_cbor, offer);
+    }
+
+    #[test]
+    fn offer_with_pairing_secret_is_strictly_rejected() {
+        let offer = PairingOffer::reconstruct(
+            OfferId::from_array([1; 32]),
+            vec![CPACE_KC2_SUITE.to_owned()],
+            vec!["fi.refineid.card-status.v1".to_owned()],
+            vec![TransportCandidate {
+                profile: "fi.refineid.rapp.ble.v1".to_owned(),
+                candidate_id: "ble-direct-1".to_owned(),
+                parameters: BTreeMap::new(),
+            }],
+            60_000,
+        )
+        .expect("fixture is valid");
+        let mut map = offer.to_map();
+        map.insert(
+            "pairing_secret".to_owned(),
+            WireValue::Bytes(vec![0x42; 32]),
+        );
+        let forbidden_cbor = encode_deterministic_cbor(&WireValue::Map(map)).expect("CBOR encodes");
+        assert_eq!(
+            PairingOffer::from_cbor(&forbidden_cbor),
+            Err(PairingOfferError::UnknownField)
+        );
+    }
+
+    #[test]
+    fn offer_deterministic_cbor_matches_kc2_spec_length() {
+        let mut parameters = BTreeMap::new();
+        parameters.insert(
+            "service_uuid".to_owned(),
+            WireValue::Text("7E39FD01-A6B5-4D78-9E11-37E28E9545F1".to_owned()),
+        );
+        let offer = PairingOffer::reconstruct(
+            OfferId::from_array([0x10; 32]),
+            vec![CPACE_KC2_SUITE.to_owned()],
+            vec![
+                "fi.refineid.card-status.v1".to_owned(),
+                "fi.refineid.authentication.v1".to_owned(),
+                "fi.refineid.document-signing.v1".to_owned(),
+            ],
+            vec![TransportCandidate {
+                profile: "fi.refineid.rapp.ble.v1".to_owned(),
+                candidate_id: "ble-direct-1".to_owned(),
+                parameters,
+            }],
+            60_000,
+        )
+        .expect("KC2 spec offer fixture is valid");
+
+        let cbor = offer.to_cbor().expect("CBOR encodes");
+        assert_eq!(
+            cbor.len(),
+            400,
+            "deterministic CBOR length must be exactly 400 bytes per RAPP v26.10.1 §4.2:261"
+        );
     }
 
     #[test]
     fn monotonic_deadline_is_live_only_inside_original_interval() {
         let offer = PairingOffer::reconstruct(
             OfferId::from_array([1; 32]),
-            PairingSecret::from_random_bytes([2; 32]),
             vec![MANDATORY_PAIRING_SUITE.to_owned()],
             vec!["fi.refineid.card-status.v1".to_owned()],
             vec![TransportCandidate {
@@ -627,7 +668,6 @@ mod tests {
     fn monotonic_deadline_rejects_overflow() {
         let offer = PairingOffer::reconstruct(
             OfferId::from_array([1; 32]),
-            PairingSecret::from_random_bytes([2; 32]),
             vec![MANDATORY_PAIRING_SUITE.to_owned()],
             vec!["fi.refineid.card-status.v1".to_owned()],
             vec![TransportCandidate {

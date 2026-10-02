@@ -58,7 +58,7 @@ Per project engineering standards, specification requirements are strictly disti
 | **Over-The-Air Data Transfer** (§7.1) | Observed on Physical Hardware | Synthetic 64-byte write and 256-byte read on Channel characteristic verified over physical BLE link. |
 | **BLE SAR Framing & State Machine** (§5.3) | Normative Specification | Fully specified with invariant total length, attribute capacity limits, pre-copy capacity checks, and stop-and-wait flow control. |
 | **Crockford Base32 Canonical Normalization** (§3.1) | Normative Specification | Fully specified 7-step pipeline with Crockford decode alias mapping (`I`/`L` $\to$ `1`, `O` $\to$ `0`). |
-| **CPaceRistretto255 KC2 Profile & Key Confirmation** (§6.1) | Normative Specification | Fully specified with Context $C$ binding, RFC 5869 HKDF key schedule, HMAC-SHA-512 confirmation tags $T_A, T_B$, and abort-on-identity. Synthetic vectors verified in test harness; workspace implementation in `crates/rapp/src/cpace.rs` pending migration. |
+| **CPaceRistretto255 KC2 Profile & Key Confirmation** (§6.1) | Normative Specification | Fully specified with Context $C$ binding, RFC 5869 HKDF key schedule, HMAC-SHA-512 confirmation tags $T_A, T_B$, scalar sampling options, and abort-on-identity. Synthetic vectors verified in test harness; workspace implementation in `crates/rapp/src/cpace.rs` pending migration. |
 | **Attempt Reservation & Disconnect Oracle Protection** (§3.3) | Normative Specification | State machine rules fully defined. |
 | **Advancing-Counter Unbiased SAS Sampling** (§4.5) | Normative Specification | Mathematical algorithm with advancing block counter and exact uniform cutoff fully specified. |
 | **Noise_XXpsk3 & Noise_KKhfs Handshakes** (§6.2, §6.3) | Normative Specification | Complete token schedules (including 48-byte PSK Message 1 and little-endian sequence nonces), ML-KEM-768 encapsulation/decapsulation, directional key splits, and prologues fully specified. |
@@ -174,21 +174,25 @@ To mathematically close this oracle while permitting the final legitimate attemp
    - `attempts_failed`: count of failed, timed-out, or abandoned attempts (initial: 0, maximum: 3). Fail-stop lockout triggers strictly when `attempts_failed == 3`. (Offer TTL expiration without 3 failed attempts tears down the offer cleanly without triggering fail-stop lockout or backoff).
 2. **Atomic Attempt Reservation**:
    When the Custodian receives $Y_A$, it validates group membership. If `attempts_admitted < 3` and `!active_attempt`, it atomically increments `attempts_admitted`, sets `active_attempt = true`, and derives the shared secret. **This reservation occurs strictly before transmitting $Y_B$ and $T_B$.**
-3. **Attempt Deadline & Offer TTL Clamping**:
-   Transmitting $Y_B$ and $T_B$ arms a non-extendable attempt timer on the Custodian, clamped by the remaining offer TTL:
-   $$\text{attempt\_deadline} = \min(5.0\text{ s}, \text{remaining\_offer\_ttl})$$
-   If $\text{remaining\_offer\_ttl} == 0$, no attempt can be admitted.
+3. **Attempt Deadline & Admission Timing**:
+   Upon validating $Y_A$ and atomically admitting an attempt, the Custodian arms a non-extendable monotonic attempt timer bounded by:
+   $$\text{attempt\_deadline} = \min(\text{admission\_time} + 5.0\text{ s}, \text{offer\_deadline})$$
+   Starting the timer at admission strictly bounds local derivation computation before transmitting $Y_B \parallel T_B$ and guarantees an absolute ceiling on the round-trip completion window. If $\text{offer\_deadline}$ has already elapsed ($\text{remaining\_offer\_ttl} == 0$), no attempt can be admitted.
 4. **Completion of the Third Attempt**:
    Reserving the 3rd attempt (`attempts_admitted == 3`) blocks any further admissions (`attempts_admitted >= 3`). However, **ephemeral offer keys remain active during the attempt deadline to allow that 3rd attempt to successfully complete.**
 5. **No Refund on Disconnect or Timeout**:
    If the Requester disconnects, drops the link, or fails to deliver a valid mutual confirmation authenticator $T_A$ before the attempt deadline expires, `active_attempt` is cleared and `attempts_failed` increments. If `attempts_failed == 3`, the offer is permanently destroyed (fail-stop lockout).
 6. **Successful PAKE Completion & Offer Consumption**:
    Upon receiving and verifying a valid mutual confirmation authenticator $T_A$ within the attempt deadline, `active_attempt` is cleared, the PAKE attempt timer is canceled, the pairing offer is permanently marked **consumed** (disabling any subsequent admissions or attempt reservations under that `offer_id`), and the session transitions exclusively to `Phase::NoisePairing`. Subsequent network faults during Noise or human SAS rejection do not restore the consumed offer or alter PAKE strike accounting; any new pairing ceremony mandates generating a fresh offer and pairing code.
-   - **Multi-Attempt Session Independence**: Although the 32-byte `offer_id` ($SID$) is shared across the up to 3 admitted attempts of a single offer, every attempt generates fresh ephemeral scalars ($x_A, x_B$) drawn independently from CSPRNG ($> 252$ bits entropy). The ephemeral public points ($Y_A, Y_B$) and transcript hash $TH$ are unique across attempts with overwhelming probability ($\ge 1 - 2^{-252}$), cryptographically preventing cross-attempt replay. Offer consumption ensures that a successful key exchange cannot be re-executed or re-bound.
-7. **Offer Lifecycle & Expiry Separation**:
+   - **Multi-Attempt Replay Resistance & Composition Scope**: Although the 32-byte `offer_id` ($SID$) is shared across the up to 3 admitted attempts of a single offer, every attempt generates fresh ephemeral scalars ($x_A, x_B$) drawn independently from CSPRNG ($> 252$ bits entropy). The ephemeral public points ($Y_A, Y_B$) and transcript hash $TH$ are unique across attempts with overwhelming probability ($\ge 1 - 2^{-252}$), cryptographically preventing cross-attempt tag replay (an authenticator $T_B^{(1)}$ from attempt 1 cannot verify against $TH^{(2)}$). However, this transcript replay resistance is an evaluated engineering property of the stateful single-flight protocol, not a formal multi-session Universal Composability (UC) composition theorem; the security of multi-attempt pairing under a shared $SID$ relies on the strict atomic attempt counter (`attempts_admitted <= 3`), single-flight serialization, monotonic attempt deadlines (5.0 s), and immediate offer consumption upon valid $T_A$.
+7. **Offer Lifecycle, Expiry Separation, and Post-PAKE Deadlines**:
    The pairing offer is valid for exactly 60 seconds from user initiation (`offer_ttl_ms = 60000`).
    - **Clean Offer Expiry**: If the 60-second offer TTL expires without an active attempt or after all admitted attempts have finished with `attempts_failed < 3`, the offer is terminated cleanly: BLE advertising ceases and ephemeral offer keys are zeroized. No strike penalty or exponential backoff is imposed; the user may immediately start a new offer without delay.
-   - **Active Attempt Clamping**: An active attempt cannot extend past the offer deadline: per rule 3, the attempt timer is strictly clamped by $\text{attempt\_deadline} = \min(5.0\text{ s}, \text{remaining\_offer\_ttl})$. Reserving an attempt at $t = 59\text{ s}$ yields an attempt deadline of $1.0\text{ s}$, terminating at $t = 60\text{ s}$.
+   - **Active Attempt Clamping**: An active PAKE attempt cannot extend past the offer deadline: per rule 3, the attempt timer is strictly clamped by $\text{attempt\_deadline} = \min(\text{admission\_time} + 5.0\text{ s}, \text{offer\_deadline})$. Reserving an attempt at $t = 59\text{ s}$ yields an attempt deadline of $1.0\text{ s}$, terminating at $t = 60\text{ s}$.
+   - **Handed-Off Lifecycle & Finite Post-PAKE Deadlines**: Once CPace completes successfully and transfers exclusive custody to `Phase::NoisePairing`, the active ceremony is **exempt** from destruction by the original 60-second offer TTL. Instead, the active pairing channel is bounded by finite post-PAKE monotonic deadlines:
+     1. **Noise Handshake Completion Deadline**: 10.0 seconds from local CPace handoff.
+     2. **SAS & Grant Confirmation Deadline**: 120.0 seconds from local Noise completion.
+     Any timeout, peer silence, transport disconnect, or SAS rejection destroys candidate trust immediately, erases ephemeral keys, and closes the connection without persisting an unconfirmed pairing. An indefinitely silent peer is terminated upon deadline expiry. Requester enters Noise only after its ATT write of Message 3 completes; an ATT write acknowledgment alone does not prove Custodian acceptance of $T_A$.
    - **Fail-Stop Lockout and Exponential Backoff**: Triggered strictly upon attempt budget exhaustion (`attempts_failed == 3`). Upon fail-stop lockout:
      1. The Custodian destroys all ephemeral keys, terminates BLE advertising, and surfaces an on-screen notification to the user ("Pairing failed: 3 incorrect attempts. Pairing locked.").
      2. The Custodian enforces an exponential backoff penalty of $\text{delay\_seconds} = \min(2^n, 300\text{ s})$ before permitting the generation of a new offer, where $n = \text{consecutive\_failed\_offers}$ (saturating at $n = 9$; $2^8 = 256\text{ s}$, $2^9 \to 300\text{ s}$).
@@ -254,12 +258,12 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
 1. The Custodian exposes the **RAPP Bootstrap Characteristic** (`7E39FD03-A6B5-4D78-9E11-37E28E9545F1`, Read-only).
 2. The Requester connects over BLE and performs an `ATT_READ_REQ` on this characteristic to obtain `encode_deterministic_cbor(pairing-offer)`.
 3. The Requester parses `offer_id` (SID) for CPace Step 1 and computes `offer_hash` for the Noise pairing prologue. Both endpoints bind to `candidate_id = "ble-direct-1"`.
-4. The Requester validates that `pairing-offer.suites` contains an acceptable suite. Unsupported suites terminate the pairing flow immediately before CPace; automatic downgrade or fallback to unconfirmed legacy suites is strictly prohibited. (Deterministic CBOR serialization of `pairing-offer` with the KC2 suite is exactly 392 bytes, safely within the 511-byte ATT Read Response value capacity at minimum ATT MTU 512 and under the 512-byte attribute limit).
+4. The Requester validates that `pairing-offer.suites` contains an acceptable suite. Unsupported suites terminate the pairing flow immediately before CPace; automatic downgrade or fallback to unconfirmed legacy suites is strictly prohibited. (Deterministic CBOR serialization of `pairing-offer` with the KC2 suite is exactly 400 bytes, safely within the 511-byte ATT Read Response value capacity at minimum ATT MTU 512 and under the 512-byte attribute limit).
 
 ### 4.3 Mandatory Noise Binding, Temporal Derivation, and Reconnect Rendezvous
 
 1. **Noise_XXpsk3 Prologue**:
-   The prologue for the pairing handshake is the deterministic-CBOR encoding of:
+   The prologue for the pairing handshake is the deterministic-CBOR encoding of the 5-element array:
    ```cddl
    pairing-prologue = [
      "RAPP-pairing-v1",
@@ -269,7 +273,7 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
      "fi.refineid.rapp.ble.v1"                                            ; transport profile name
    ]
    ```
-   $$\text{prologue} = \text{encode\_deterministic\_cbor}(\text{pairing-prologue})$$
+   $$\text{prologue} = \text{encode\_deterministic\_cbor}(\text{pairing-prologue}) \quad (150\text{ bytes})$$
 
 2. **Immediate Channel Identifier Derivation**:
    Immediately upon completing the `Noise_XXpsk3` handshake, both peers derive the channel identifiers from the completed handshake hash $h$ in strict order:
@@ -542,6 +546,10 @@ RAPP v26.10.1 specifies the **`CPaceRistretto255-KC2`** application profile over
   - Base Point DSI: `CPaceRistretto255` (`b"CPaceRistretto255"`)
   - Intermediate Session Key DSI: `CPaceRistretto255_ISK` (`b"CPaceRistretto255_ISK"`)
 - **MapToGroup & Identity Handling**: Maps 64-byte uniform hash output to a Ristretto255 group element using `RistrettoPoint::from_uniform_bytes` per [RFC 9496 Section 4.3.4](https://www.rfc-editor.org/rfc/rfc9496.html#section-4.3.4) and draft-irtf-cfrg-cpace-21 Appendix A.2. If the mapped point is the group identity $\mathcal{O}$ (probability $2^{-252}$), the node **MUST** immediately abort the pairing offer, zeroize all intermediate ephemeral values, and cease pairing advertising. No fallback to a basepoint constant is permitted.
+- **Scalar Sampling Profile**:
+  CPace draft-21 §8.3 allows uniform scalar generation in $[1, q-1]$. Conforming RAPP implementations generate non-zero scalars $x \in [1, q-1]$ using either:
+  1. *Option A (Exact Rejection Sampling per draft-21 §8.3)*: Repeatedly draw 32 bytes from CSPRNG, interpret as an unsigned little-endian integer, and accept if $1 \le x < q$; otherwise reject and draw another 32 bytes.
+  2. *Option B (Constant-Time Wide Reduction per `crates/rapp`)*: Draw 64 uniform bytes from CSPRNG, reduce modulo $q$ via wide reduction (`Scalar::from_bytes_mod_order_wide`), and reject if $x == 0$. (Design Note: Because $2^{512} \pmod q \ne 0$, 64-byte wide reduction carries a theoretical statistical bias bounded by $q / 2^{512} \approx 2^{-252}$, which is cryptographically negligible ($< 2^{-128}$) and enables branchless execution in constant time).
 - **Context $C$ and Protocol Binding**:
   The Context input `CI` binds the pairing ceremony parameters in deterministic CBOR ([RFC 8949 Section 4.2.1](https://www.rfc-editor.org/rfc/rfc8949.html#section-4.2.1)):
   ```cddl
@@ -569,13 +577,14 @@ where $\text{PRS} = \text{UTF-8}(\text{normalized pairing code})$ and $\text{SID
 
 #### 6.1.3 Ephemeral Exchange, Key Schedule, and Mutual Confirmation
 1. **Initiator (Requester - Step 1)**:
-   - Samples 64 random bytes from CSPRNG, derives scalar $x_A = \text{Scalar::from\_bytes\_mod\_order\_wide}(\text{random}_A)$. Verifies $x_A \ne 0$.
+   - Samples scalar $x_A \leftarrow \text{Scalar} \setminus \{0\}$ using either Option A or Option B.
    - Computes $Y_A = x_A \cdot G$. Encodes to 32 bytes via canonical Ristretto255 point compression.
    - Transmits 32-byte $Y_A$ in CPace Step 1 via `ATT_WRITE_REQ` in a `SINGLE` SAR frame.
 2. **Responder (Custodian - Step 2)**:
    - Receives $Y_A$, decodes and validates $Y_A \ne \mathcal{O}$ and canonical Ristretto255 element.
    - Atomically reserves attempt slot ($1 \le \text{attempts\_admitted} \le 3$, `active_attempt = true`).
-   - Samples 64 random bytes, derives scalar $x_B \ne 0$.
+   - Arms the attempt timer at admission: $\text{attempt\_deadline} = \min(\text{admission\_time} + 5.0\text{ s}, \text{offer\_deadline})$.
+   - Samples scalar $x_B \leftarrow \text{Scalar} \setminus \{0\}$ using either Option A or Option B.
    - Computes $Y_B = x_B \cdot G$.
    - Computes shared point $K = x_B \cdot Y_A$. Verifies $K \ne \mathcal{O}$.
    - Derives Intermediate Session Key (ISK):
@@ -590,7 +599,6 @@ where $\text{PRS} = \text{UTF-8}(\text{normalized pairing code})$ and $\text{SID
      $$K_B = \text{HKDF-Expand-SHA512}(PRK, \text{info} = \text{"RAPP-CPACE-CONFIRM-B-KEY-v2"}, L = 32)$$
    - Computes mutual confirmation authenticator $T_B$:
      $$T_B = \text{FIRST32}(\text{HMAC-SHA512}(\text{key} = K_B, \text{data} = \text{lv\_cat}([\text{"RAPP-CPACE-CONFIRM-B-v2"}, TH])))$$
-   - Arms the attempt timer: $\text{attempt\_deadline} = \min(5.0\text{ s}, \text{remaining\_offer\_ttl})$.
    - Transmits 64-byte $Y_B \parallel T_B$ in CPace Step 2 via `ATT_HANDLE_VALUE_IND` in a `SINGLE` SAR frame.
 3. **Key Confirmation (Requester - Step 3)**:
    - Requester receives $Y_B \parallel T_B$, decodes and validates $Y_B \ne \mathcal{O}$ and canonical point.
@@ -601,9 +609,10 @@ where $\text{PRS} = \text{UTF-8}(\text{normalized pairing code})$ and $\text{SID
      $$T_A = \text{FIRST32}(\text{HMAC-SHA512}(\text{key} = K_A, \text{data} = \text{lv\_cat}([\text{"RAPP-CPACE-CONFIRM-A-v2"}, TH])))$$
    - Transmits 32-byte $T_A$ in CPace Step 3 via `ATT_WRITE_REQ` in a `SINGLE` SAR frame.
 
-#### 6.1.4 Finalization & PSK Handoff
+#### 6.1.4 Finalization, PSK Handoff, and Post-PAKE Lifecycles
 - Custodian receives and verifies $T_A$ in constant time within the clamped attempt deadline.
-- Upon successful verification, Custodian clears `active_attempt`, marks the offer **consumed**, cancels the PAKE attempt timer, and transfers exclusive ownership to `Phase::NoisePairing`.
+- Upon successful verification, Custodian clears `active_attempt`, marks the offer **consumed**, cancels the PAKE attempt timer, and transfers exclusive ownership to `Phase::NoisePairing` under a 10.0-second Noise handshake completion deadline.
+- Subsequent post-Noise human SAS and grant confirmation is bounded by a 120.0-second monotonic deadline from local Noise completion. Active handed-off ceremonies are exempt from destruction by the original 60-second offer TTL; any failure of Noise, SAS rejection, or deadline expiry destroys candidate trust immediately.
 - Both parties immediately zeroize all intermediate ephemeral values ($\text{ISK}, PRK, K_A, K_B, x_A, x_B, K$).
 - The established 32-byte $PSK$ is passed directly as the pre-shared key into the `Noise_XXpsk3` pairing handshake (§6.2).
 - Security of the pairing ceremony is bounded by the ~252-bit prime order of Ristretto255, the uniform 30-bit entropy of the 6-character code, and the strict 3-attempt rate limit. Classical discrete-log PAKEs are not post-quantum secure against large-scale quantum computers; hybrid post-quantum forward secrecy against future quantum adversaries is established separately during subsequent operational sessions via the `Noise_KKhfs` handshake using ML-KEM-768 (§6.3).
@@ -627,7 +636,7 @@ where $\text{PRS} = \text{UTF-8}(\text{normalized pairing code})$ and $\text{SID
   ```
 - **Pre-messages**: None.
 - **Prologue**: `encode_deterministic_cbor(pairing-prologue)` (§4.3.1).
-- **PSK Input**: The 32-byte $PSK$ derived from CPace KC2 via HKDF-Expand-SHA512 (§6.1.3, §6.1.4) is injected as the pre-shared key at token `psk` (`MixKey(psk)`).
+- **PSK Input**: The 32-byte $PSK$ derived from CPace KC2 via HKDF-Expand-SHA512 (§6.1.3, §6.1.4) is injected as the pre-shared key at token `psk` via `MixKeyAndHash(psk)` per Noise revision 34 Section 9.2.
 - **Handshake Payload Policy**: All handshake message payloads are empty ($\emptyset$, length 0). Encrypting an empty payload produces a 16-byte Poly1305 authentication tag.
 - **Handshake Messages**:
   - Message 1 (Initiator -> Responder):
@@ -1181,10 +1190,10 @@ Semantic error handling is driven exclusively by `error_name`. The numeric `erro
 | Threat Class | Adversary Vector | RAPP Defense |
 | :--- | :--- | :--- |
 | **Passive Eavesdropper** | Captures 2.4 GHz RF packets using SDR. | Zero hint in beacon. CPace KC2 provides mathematical resistance to offline dictionary attacks; intermediate keys separated via RFC 5869 HKDF-SHA-512. Handshake and sessions encrypted with ChaCha20-Poly1305. |
-| **Active MITM** | Injects, modifies, or drops BLE packets. | CPace KC2 binds ceremony context $C$ into generator input $CI$, preventing cross-protocol/cross-channel relay. CPace authenticates possession of the pairing code; mutual endpoint identity authentication rests on Noise_XXpsk3 with fresh pairwise static keys plus visual SAS confirmation (§4.5). Explicit HMAC tags $T_B, T_A$ confirm keys before Noise handoff. Unmatched codes burn strikes and terminate the offer under rate-limiting. |
+| **Active MITM** | Injects, modifies, or drops BLE packets. | CPace KC2 binds ceremony context $C$ into generator input $CI$, rejecting mismatched protocol, suite, offer, and channel parameters. CPace authenticates possession of the pairing code; mutual endpoint identity authentication rests on Noise_XXpsk3 with fresh pairwise static keys plus visual SAS confirmation (§4.5). Explicit HMAC tags $T_B, T_A$ confirm keys before Noise handoff. Unmatched codes burn strikes and terminate the offer under rate-limiting. |
 | **Disconnect Oracle** | Attacker tests $T_B$ and disconnects before $T_A$. | Atomic attempt reservation increments `attempts_admitted` *before* emitting $Y_B$ and $T_B$; disconnects do not refund the reserved attempt. |
 | **Evil Twin / Rogue Beacon** | Attacker broadcasts identical Service UUID. | Requester requires matching code and post-handshake unbiased SAS device confirmation before dispatching operations. |
-| **Transparent Wormhole / Relay** | Attacker relays RF traffic over WAN between distant devices. | Advisory proximity gate limits local discovery; explicit user consent on phone screen displays exact operation details; strict asymmetric ATT and CPace role separation structurally prevents relay loopback and reflection (§4.4, §5.2, §6.3). |
+| **Transparent Wormhole / Relay** | Attacker relays RF traffic over WAN between distant devices. | Advisory proximity gate limits local discovery, but RSSI and SAS cannot prove physical proximity or detect bit-preserving RF tunneling (§4.4). Strict asymmetric ATT and CPace role separation structurally prevents relay loopback and reflection attacks, while explicit user consent and sovereign phone display enforce authorized operation intent (§4.4, §5.2, §11). |
 | **DoS Strike Burning** | Malicious central connects to phone to burn strikes. | Offers are open only upon explicit user trigger for 60 seconds; single-flight pre-authentication serialization limits concurrency. Fail-stop lockout imposes exponential backoff ($2^n$ seconds, up to 300 s) and alerts user with on-screen notification (§3.3.5). |
 | **Rendezvous Token Replay / Presence Probing** | Attacker sniffs static rendezvous_token and replays preamble to probe presence or induce cryptographic work. | Preamble is unauthenticated routing metadata only; knowing rendezvous_token never authenticates caller. Handshake fails at message 1 (during DH computation, ML-KEM key decryption, or payload authentication). Timing difference between unknown token and known token is an accepted residual presence oracle for static tokens; mitigated by single-flight connection serialization and reconnect rate-limiting (§4.3.6). |
 

@@ -1034,6 +1034,7 @@ dependencies = [
  "chacha20poly1305",
  "curve25519-dalek",
  "getrandom 0.4.3",
+ "hex",
  "hmac",
  "ml-kem",
  "serde",
@@ -1041,6 +1042,7 @@ dependencies = [
  "serde_yaml",
  "sha2 0.11.0",
  "snow",
+ "subtle",
  "uniffi",
  "zeroize",
 ]

@@ -3,7 +3,7 @@
 
 Status: Normative Specification / Research Record  
 Document version: 26.10.1  
-Wire version: `[26, 10]` (`[major, minor]`)  
+Wire version: `[26, 10, 1]` (`[Year, Month, Day]`)  
 Offer version: `[26, 10, 1]`  
 Transport Profile: `"fi.refineid.rapp.ble.v1"`  
 Date: 2026-10-01  
@@ -39,10 +39,10 @@ This document defines the complete, standalone normative specification for the *
 This document is completely self-contained: all normative schemas, protocol state machines, cryptographic bindings, error handling rules, and wire formats required to implement, verify, and audit RAPP v26.10.1 are defined herein.
 
 - **Migration and Compatibility**:
-  RAPP v26.10.1 specifies the BLE Direct Proximity Transport Profile (`"fi.refineid.rapp.ble.v1"`). It advances the wire version to `[26, 10]` and offer version to `[26, 10, 1]`. It does not interoperate with legacy RAPP v26.9.28. Implementations must conform strictly to the schemas and state machines defined in this standalone specification.
+  RAPP v26.10.1 specifies the BLE Direct Proximity Transport Profile (`"fi.refineid.rapp.ble.v1"`). It advances both the wire and offer versions to `[26, 10, 1]` (`[Year, Month, Day]`). It does not interoperate with legacy RAPP v26.9.28. Implementations must conform strictly to the schemas and state machines defined in this standalone specification.
 - **Wire and Offer Versioning**:
   - Offer version: `[26, 10, 1]` in `pairing-offer`.
-  - Wire version: `[26, 10]` (`[major, minor]`) in channel envelopes and handshake prologues.
+  - Wire version: `[26, 10, 1]` (`[Year, Month, Day]`) in channel envelopes, pairing context, and handshake prologues.
 - **Role Mapping**:
   - **Requester**: Corresponds to the RAPP Requester, operating as GATT Client (Central).
   - **Custodian**: Corresponds to the Sovereign Server (mobile device) acting as the RAPP Authorization Proxy while holding exclusive physical NFC custody of the Credential Holder (FINEID Card), operating as GATT Server (Peripheral).
@@ -58,7 +58,7 @@ Per project engineering standards, specification requirements are strictly disti
 | **Over-The-Air Data Transfer** (§7.1) | Observed on Physical Hardware | Synthetic 64-byte write and 256-byte read on Channel characteristic verified over physical BLE link. |
 | **BLE SAR Framing & State Machine** (§5.3) | Normative Specification | Fully specified with invariant total length, attribute capacity limits, pre-copy capacity checks, and stop-and-wait flow control. |
 | **Crockford Base32 Canonical Normalization** (§3.1) | Normative Specification | Fully specified 7-step pipeline with Crockford decode alias mapping (`I`/`L` $\to$ `1`, `O` $\to$ `0`). |
-| **CPaceRistretto255 KC2 Profile & Key Confirmation** (§6.1) | Normative Specification | Fully specified with Context $C$ binding, RFC 5869 HKDF key schedule, HMAC-SHA-512 confirmation tags $T_A, T_B$, scalar sampling options, and abort-on-identity. Synthetic vectors verified in standalone research harness (`kc2-v2-harness`, `verify_kc2_review.py`; see `CPACE_KC2_INDEPENDENT_REVIEW.md`); in-tree workspace implementation (`crates/rapp/src/cpace.rs`) and workspace test suite remain on legacy suite pending migration. |
+| **CPaceRistretto255 KC2 Profile & Key Confirmation** (§6.1) | Normative Specification | Fully specified with Context $C$ binding, RFC 5869 HKDF key schedule, HMAC-SHA-512 confirmation tags $T_A, T_B$, scalar sampling options, and abort-on-identity. Implemented in `crates/rapp/src/cpace.rs` and verified with in-tree synthetic golden vectors (`cpace_kc2_golden_synthetic_vectors`) as well as standalone research harnesses (`kc2-v2-harness`, `verify_kc2_review.py`). |
 | **Attempt Reservation & Disconnect Oracle Protection** (§3.3) | Normative Specification | State machine rules fully defined. |
 | **Advancing-Counter Unbiased SAS Sampling** (§4.5) | Normative Specification | Mathematical algorithm with advancing block counter and exact uniform cutoff fully specified. |
 | **Noise_XXpsk3 & Noise_KKhfs Handshakes** (§6.2, §6.3) | Normative Specification | Complete token schedules (including 48-byte PSK Message 1 and little-endian sequence nonces), ML-KEM-768 encapsulation/decapsulation, directional key splits, and prologues fully specified. |
@@ -80,7 +80,7 @@ The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**, **
 
 ### 2.1 Transport Architecture & Protocol Lifecycle
 
-- **Wire Version**: `[26, 10]` (`[major, minor]`)
+- **Wire Version**: `[26, 10, 1]` (`[Year, Month, Day]`)
 - **Offer Version**: `[26, 10, 1]`
 - **Transport Profile Identifier**: `"fi.refineid.rapp.ble.v1"`
 
@@ -90,7 +90,7 @@ The BLE transport acts as the underlying point-to-point bearer for RAPP session 
 - **Phase 0: Routing (`Phase::Routing`)**: Every connection transmits exactly one `ble-rendezvous` preamble frame via `ATT_WRITE_REQ`. For purpose `"pairing"` with an active offer, the connection transitions to `Phase::CPace`. For purpose `"session"` with a matching stored `rendezvous_token`, the connection transitions to `Phase::NoiseSession`.
 - **Phase 1: Discovery & Bootstrap**: Read fresh random 32-byte `offer_id` (SID) and canonical `pairing-offer` from the Custodian's Bootstrap Characteristic. Compute canonical `offer_hash`.
 - **Phase 2: CPace Key Agreement & Confirmation (`Phase::CPace`)**: Execute `CPaceRistretto255` KC2 profile over GATT SAR frames with Context $C$ binding, mutually authenticating via HMAC tags $T_B$ and $T_A$ to establish $PSK$ via HKDF-Expand. On success, transition to `Phase::NoisePairing` and consume the offer.
-- **Phase 3: Noise_XXpsk3 Pairing (`Phase::NoisePairing`)**: Perform authenticated pairing handshake with prologue bound to canonical `offer_hash`, wire version `[26, 10]`, suite, and transport profile name. Immediately on handshake completion, derive pairing-channel `session_id`, `pair_id`, and `rendezvous_token`. Exchange `pairing.hello` (parameter echo using `session_id`) and `pairing.confirm` (capability grants), deriving `grants_hash`.
+- **Phase 3: Noise_XXpsk3 Pairing (`Phase::NoisePairing`)**: Perform authenticated pairing handshake with prologue bound to canonical `offer_hash`, wire version `[26, 10, 1]`, suite, and transport profile name. Immediately on handshake completion, derive pairing-channel `session_id`, `pair_id`, and `rendezvous_token`. Exchange `pairing.hello` (parameter echo using `session_id`) and `pairing.confirm` (capability grants), deriving `grants_hash`.
 - **Phase 4: Post-Handshake SAS Confirmation**: Visually verify uniform 4-digit SAS derived from the authenticated Noise pairing handshake hash $h$ using an advancing block counter.
 - **Phase 5: Pair Storage & Operational Session**: Only after SAS confirmation and both grant confirmations succeed, atomically store the pairing trust record (`pair_id`, `rendezvous_token`, `grants_hash`, peer static public key, and local private key). Operational connections start in `Phase::Routing`, verify `rendezvous_token`, and open a fresh post-quantum `Noise_KKhfs` session with an independent operational `session_id`.
 
@@ -267,13 +267,13 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
    ```cddl
    pairing-prologue = [
      "RAPP-pairing-v1",
-     [26, 10],                                                            ; wire version [major, minor]
+     [26, 10, 1],                                                         ; wire version [Year, Month, Day]
      "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512", ; cryptographic suite name
      bstr .size 32,                                                       ; offer_hash
      "fi.refineid.rapp.ble.v1"                                            ; transport profile name
    ]
    ```
-   $$\text{prologue} = \text{encode\_deterministic\_cbor}(\text{pairing-prologue}) \quad (150\text{ bytes})$$
+   $$\text{prologue} = \text{encode\_deterministic\_cbor}(\text{pairing-prologue}) \quad (151\text{ bytes})$$
 
 2. **Immediate Channel Identifier Derivation**:
    Immediately upon completing the `Noise_XXpsk3` handshake, both peers derive the channel identifiers from the completed handshake hash $h$ in strict order:
@@ -287,7 +287,7 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
 
 3. **Parameter Echo & Mutual Grants**:
    - Inside the established pairing channel, peers exchange `pairing.hello`.
-   - `pairing.hello` echoes `offer_hash`, `candidate_id` (`"ble-direct-1"`), wire version `[26, 10]`, suite name, display name, platform description, and requester's requested profiles.
+   - `pairing.hello` echoes `offer_hash`, `candidate_id` (`"ble-direct-1"`), wire version `[26, 10, 1]`, suite name, display name, platform description, and requester's requested profiles.
    - Custodian verifies matching echoes. Any mismatch aborts with an authenticated protocol violation.
    - Custodian presents proposed grants to the user, and transmits `pairing.confirm` carrying granted profiles. Requester displays and confirms. Both granted sets **MUST** be identical.
     - Derive `grants_hash` from the confirmed, canonically sorted grant set:
@@ -330,7 +330,7 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
      ```cddl
      session-prologue = [
        "RAPP-session-v1",
-       [26, 10],                                                        ; wire version [major, minor]
+       [26, 10, 1],                                                         ; wire version [Year, Month, Day]
        "Noise_KKhfs_25519+MLKEM768_ChaChaPoly_SHA512",                  ; suite name
        pair_id,                                                         ; bstr .size 16
        grants_hash,                                                     ; bstr .size 32
@@ -555,7 +555,7 @@ RAPP v26.10.1 specifies the **`CPaceRistretto255-KC2`** application profile over
   ```cddl
   pairing-context = [
     "RAPP-PAIRING-CONTEXT-v2",
-    [26, 10],                                                                ; wire version [major, minor]
+    [26, 10, 1],                                                              ; wire version [Year, Month, Day]
     "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512", ; full suite literal
     "fi.refineid.rapp.ble.v1",                                               ; transport profile
     "ble-direct-1",                                                          ; candidate identifier
@@ -564,7 +564,7 @@ RAPP v26.10.1 specifies the **`CPaceRistretto255-KC2`** application profile over
     "custodian"                                                              ; responder role B
   ]
   ```
-  $$C = \text{encode\_deterministic\_cbor}(\text{pairing-context}) \quad (191\text{ bytes})$$
+  $$C = \text{encode\_deterministic\_cbor}(\text{pairing-context}) \quad (192\text{ bytes})$$
   $$\text{CI} = C, \quad \text{AD}_A = \emptyset, \quad \text{AD}_B = \emptyset$$
   Role strings designate protocol roles, not persistent device identities. The Requester acts strictly as Initiator ($A$), transmitting via `ATT_WRITE_REQ`, while the Custodian acts strictly as Responder ($B$), transmitting via `ATT_HANDLE_VALUE_IND`.
 
@@ -581,7 +581,7 @@ The generator point $G$ is derived from length-value (LV) encoding with zero-pad
    - Yielding $\text{len\_zpad} = 128 - 1 - 7 - 18 = 102\text{ bytes}$ of zeros.
    *(Note on draft-irtf-cfrg-cpace-21 §8.1: The draft states $\text{len\_zpad} = \max(0, s - \text{len}(\text{prepend\_len}(\text{PRS})) - \text{len}(\text{prepend\_len}(\text{DSI})) - 1)$, where §6.3 defines $\text{prepend\_len}(S) = \text{lv}(S)$ as the entire length-prefixed octet string, not merely the length prefix. An implementer interpreting $\text{prepend\_len}(S)$ as only the 1-byte LEB128 prefix would calculate $128 - 1 - 1 - 1 = 125$, overflowing the first block to 151 bytes and producing a non-conformant generator $G' \ne G$).*
 3. **Generator String & Point Evaluation**:
-   $$\text{gen\_str} = \text{lv\_cat}(\text{DSI}, \text{PRS}, \text{zero\_bytes}(102), C, \text{SID}) \quad (354\text{ bytes})$$
+   $$\text{gen\_str} = \text{lv\_cat}(\text{DSI}, \text{PRS}, \text{zero\_bytes}(102), C, \text{SID}) \quad (355\text{ bytes})$$
    $$G = \text{MapToGroup}(\text{SHA-512}(\text{gen\_str}))$$
    where $\text{PRS} = \text{UTF-8}(\text{normalized pairing code})$ and $\text{SID} = \text{offer\_id}$. Verify $G \ne \mathcal{O}$ (abort on identity).
 
@@ -767,23 +767,23 @@ Every message transmitted inside an established pairing channel (`Phase::NoisePa
 
 ```cddl
 rapp-message =
-    { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "pairing.hello", "body": pairing-hello-body, * common-opt }
-  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "pairing.confirm", "body": pairing-confirm-body, * common-opt }
-  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "pairing.abort", "body": pairing-abort-body, * common-opt }
-  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "session.ready", "body": session-ready-body, * common-opt }
-  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "session.close", "body": session-close-body, * common-opt }
-  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "liveness.ping", "body": liveness-ping-body, * common-opt }
-  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "liveness.pong", "body": liveness-pong-body, * common-opt }
-  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "operation.request", "body": operation-request-body, * common-opt }
-  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "operation.prepared", "body": operation-prepared-body, * common-opt }
-  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "operation.commit", "body": operation-commit-body, * common-opt }
-  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "operation.cancel", "body": operation-cancel-body, * common-opt }
-  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "operation.result", "body": operation-result-body, * common-opt }
-  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "operation.result_ack", "body": operation-result-ack-body, * common-opt }
-  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "operation.status_request", "body": operation-status-request-body, * common-opt }
-  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "operation.status", "body": operation-status-body, * common-opt }
-  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "operation.progress", "body": operation-progress-body, * common-opt }
-  / { "version": [26, 10], "session_id": bstr .size 16, "sequence": uint, "type": "error", "body": error-body, * common-opt }
+    { "version": [26, 10, 1], "session_id": bstr .size 16, "sequence": uint, "type": "pairing.hello", "body": pairing-hello-body, * common-opt }
+  / { "version": [26, 10, 1], "session_id": bstr .size 16, "sequence": uint, "type": "pairing.confirm", "body": pairing-confirm-body, * common-opt }
+  / { "version": [26, 10, 1], "session_id": bstr .size 16, "sequence": uint, "type": "pairing.abort", "body": pairing-abort-body, * common-opt }
+  / { "version": [26, 10, 1], "session_id": bstr .size 16, "sequence": uint, "type": "session.ready", "body": session-ready-body, * common-opt }
+  / { "version": [26, 10, 1], "session_id": bstr .size 16, "sequence": uint, "type": "session.close", "body": session-close-body, * common-opt }
+  / { "version": [26, 10, 1], "session_id": bstr .size 16, "sequence": uint, "type": "liveness.ping", "body": liveness-ping-body, * common-opt }
+  / { "version": [26, 10, 1], "session_id": bstr .size 16, "sequence": uint, "type": "liveness.pong", "body": liveness-pong-body, * common-opt }
+  / { "version": [26, 10, 1], "session_id": bstr .size 16, "sequence": uint, "type": "operation.request", "body": operation-request-body, * common-opt }
+  / { "version": [26, 10, 1], "session_id": bstr .size 16, "sequence": uint, "type": "operation.prepared", "body": operation-prepared-body, * common-opt }
+  / { "version": [26, 10, 1], "session_id": bstr .size 16, "sequence": uint, "type": "operation.commit", "body": operation-commit-body, * common-opt }
+  / { "version": [26, 10, 1], "session_id": bstr .size 16, "sequence": uint, "type": "operation.cancel", "body": operation-cancel-body, * common-opt }
+  / { "version": [26, 10, 1], "session_id": bstr .size 16, "sequence": uint, "type": "operation.result", "body": operation-result-body, * common-opt }
+  / { "version": [26, 10, 1], "session_id": bstr .size 16, "sequence": uint, "type": "operation.result_ack", "body": operation-result-ack-body, * common-opt }
+  / { "version": [26, 10, 1], "session_id": bstr .size 16, "sequence": uint, "type": "operation.status_request", "body": operation-status-request-body, * common-opt }
+  / { "version": [26, 10, 1], "session_id": bstr .size 16, "sequence": uint, "type": "operation.status", "body": operation-status-body, * common-opt }
+  / { "version": [26, 10, 1], "session_id": bstr .size 16, "sequence": uint, "type": "operation.progress", "body": operation-progress-body, * common-opt }
+  / { "version": [26, 10, 1], "session_id": bstr .size 16, "sequence": uint, "type": "error", "body": error-body, * common-opt }
 
 common-opt = (
   ? "critical": [* tstr],           ; unrecognized critical fields abort session
@@ -799,7 +799,7 @@ pairing-hello-body = {
 }
 
 negotiated-parameters = {
-  "version": [26, 10],
+  "version": [26, 10, 1],
   "suite": "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512",
   "offer_hash": bstr .size 32,
   "transport_profile": "fi.refineid.rapp.ble.v1",
@@ -823,7 +823,7 @@ session-ready-body = {
 }
 
 session-parameters = {
-  "version": [26, 10],
+  "version": [26, 10, 1],
   "suite": "Noise_KKhfs_25519+MLKEM768_ChaChaPoly_SHA512",
   "transport_profile": "fi.refineid.rapp.ble.v1",
   "candidate_id": "ble-direct-1",
@@ -959,9 +959,9 @@ progress-event-val =
 
 ### 7.2 Field Semantics, Version Precedence, and Sequencing
 1. **Wire Version & Skew Precedence**:
-   - The envelope wire version is fixed to `[26, 10]` (`[major, minor]`).
+   - The envelope wire version is fixed to `[26, 10, 1]` (`[Year, Month, Day]`).
    - If version skew is observed during handshake prologue negotiation (e.g. mismatched version in the Noise prologue), the handshake fails AEAD decryption and surfaces as a **Class 2 (Transport Loss)** failure; the link drops and stored pairings remain intact.
-   - If an authenticated envelope carrying a version other than `[26, 10]` is received on an establishing or active session, the receiver MUST reject the message and terminate the session as a **Class 2** transport failure without modifying stored pairing records.
+   - If an authenticated envelope carrying a version other than `[26, 10, 1]` is received on an establishing or active session, the receiver MUST reject the message and terminate the session as a **Class 2** transport failure without modifying stored pairing records.
    - **Class 4 (Pairing Revocation)** is strictly NOT triggered by version mismatch; Class 4 is reserved exclusively for authenticated cryptographic tampering, repeat echo mismatches, or sequence manipulation by an established, paired peer.
 2. **Session Scoping (`session_id`)**:
    - For pairing-channel envelopes (`pairing.hello`, `pairing.confirm`), `session_id` MUST equal the 16-byte pairing `session_id` derived immediately from $h$ (Section 4.3).

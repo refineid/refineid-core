@@ -342,8 +342,8 @@ fn test_generate_standard_noise_kk_vector() {
     // ee: DH(resp_e_priv, init_e_pub)
     let ee_dh = MontgomeryPoint(init_e_pub).mul_clamped(resp_e_priv).0;
     resp_state.mix_key(&ee_dh);
-    // se: DH(resp_s_priv, init_e_pub)
-    let se_dh = MontgomeryPoint(init_e_pub).mul_clamped(resp_s_priv).0;
+    // se: DH(resp_e_priv, init_s_pub)
+    let se_dh = MontgomeryPoint(init_s_pub).mul_clamped(resp_e_priv).0;
     resp_state.mix_key(&se_dh);
     // encrypt payload ("")
     let msg2_payload = resp_state.encrypt_and_hash(&[]).expect("msg2 encrypt");
@@ -358,7 +358,7 @@ fn test_generate_standard_noise_kk_vector() {
     let init_ee_dh = MontgomeryPoint(resp_e_pub).mul_clamped(init_e_priv).0;
     assert_eq!(ee_dh, init_ee_dh);
     init_state.mix_key(&init_ee_dh);
-    let init_se_dh = MontgomeryPoint(resp_s_pub).mul_clamped(init_e_priv).0;
+    let init_se_dh = MontgomeryPoint(resp_e_pub).mul_clamped(init_s_priv).0;
     assert_eq!(se_dh, init_se_dh);
     init_state.mix_key(&init_se_dh);
     let decrypted_p2 = init_state
@@ -382,24 +382,144 @@ fn test_generate_standard_noise_kk_vector() {
     );
     assert_eq!(
         hex::encode(msg2_wire),
-        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b09563c45b010a21024391aba48b3e5d5"
+        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6bd8189010df4810686dc04a84a66aa8e9"
     );
     assert_eq!(
         hex::encode(final_h),
-        "0c9bb02d3c9dad8547295b18abf8fe059d7d05e09db3a80475fba9ecd2845b28a4507940006463e8e68fadf98bde037cfd382d5e2159a9f162e09f7ae5b13f4f"
+        "f287112eff978f225d84991c5fb3cbce836b6c9832d4bccf8794042a08265436b90f7b3e7a67df85f5529d62bee5543d49277d565ab9ab2bf809a6064e6e55ae"
     );
     assert_eq!(
         hex::encode(init_c1),
-        "787a3019877a460c1eb3a7951a224d890ae8ac3241e2ec0f1d0a6593dc76a7c9"
+        "271245e9b5ffc357a6d442e04a376531bd3a0f81d69d7b97eaa132cc81d209ab"
     );
     assert_eq!(
         hex::encode(init_c2),
-        "8332d92c006c218f67cd57b6b98c9a4be410be334f342d8b8e5b0d5991f48cca"
+        "f3364ea960fcb3b95518b6029e2fbac8d1f259e630fa53beb63cf647e672ca40"
     );
     assert_eq!(
         hex::encode(session_id.as_bytes()),
-        "e5d877e412bfa1cd123552614d4e9c94"
+        "7c1795d5de43a27ea50681e943fa2599"
     );
+}
+
+#[test]
+fn test_standard_noise_kk_vector_matches_snow_implementation() {
+    use chacha20poly1305::{AeadInPlace, KeyInit};
+
+    let p: snow::params::NoiseParams = "Noise_KK_25519_ChaChaPoly_SHA512"
+        .parse()
+        .expect("parse Noise_KK");
+
+    let pair_id = hex::decode("8ab9b8bcde5c6eec845d9b1ca0d3a7be").expect("valid pair_id hex");
+    let grants_hash = [0x77_u8; 32];
+    let prologue_val = WireValue::Array(vec![
+        WireValue::Text("RAPP-session-v1".to_string()),
+        WireValue::Array(vec![
+            WireValue::Unsigned(26),
+            WireValue::Unsigned(10),
+            WireValue::Unsigned(1),
+        ]),
+        WireValue::Text("Noise_KK_25519_ChaChaPoly_SHA512".to_string()),
+        WireValue::Bytes(pair_id),
+        WireValue::Bytes(grants_hash.to_vec()),
+        WireValue::Text("fi.refineid.rapp.ble.v1".to_string()),
+    ]);
+    let prologue =
+        refineid_rapp::encode_deterministic_cbor(&prologue_val).expect("encode prologue");
+
+    let si = [0x11_u8; 32];
+    let sr = [0x22_u8; 32];
+    let ei = [0x33_u8; 32];
+    let er = [0x44_u8; 32];
+    let spi = hex::decode("7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13")
+        .expect("decode spi");
+    let spr = hex::decode("0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20")
+        .expect("decode spr");
+
+    let mut init = snow::Builder::new(p.clone())
+        .local_private_key(&si)
+        .expect("init priv")
+        .remote_public_key(&spr)
+        .expect("init pub")
+        .fixed_ephemeral_key_for_testing_only(&ei)
+        .prologue(&prologue)
+        .expect("init prologue")
+        .build_initiator()
+        .expect("init build");
+
+    let mut resp = snow::Builder::new(p)
+        .local_private_key(&sr)
+        .expect("resp priv")
+        .remote_public_key(&spi)
+        .expect("resp pub")
+        .fixed_ephemeral_key_for_testing_only(&er)
+        .prologue(&prologue)
+        .expect("resp prologue")
+        .build_responder()
+        .expect("resp build");
+
+    let mut buf = [0u8; 128];
+    let mut payload = [0u8; 128];
+
+    // Message 1
+    let len1 = init
+        .write_message(&[], &mut buf)
+        .expect("snow init write msg1");
+    assert_eq!(len1, 48);
+    assert_eq!(
+        hex::encode(&buf[..len1]),
+        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b14b9cb8d7741b7e01e1d22ae0ba8162c7e"
+    );
+    let plen1 = resp
+        .read_message(&buf[..len1], &mut payload)
+        .expect("snow resp read msg1");
+    assert_eq!(plen1, 0);
+
+    // Message 2
+    let len2 = resp
+        .write_message(&[], &mut buf)
+        .expect("snow resp write msg2");
+    assert_eq!(len2, 48);
+    assert_eq!(
+        hex::encode(&buf[..len2]),
+        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6bd8189010df4810686dc04a84a66aa8e9"
+    );
+    let plen2 = init
+        .read_message(&buf[..len2], &mut payload)
+        .expect("snow init read msg2");
+    assert_eq!(plen2, 0);
+
+    // Handshake hash
+    let snow_hash = init.get_handshake_hash();
+    assert_eq!(
+        hex::encode(snow_hash),
+        "f287112eff978f225d84991c5fb3cbce836b6c9832d4bccf8794042a08265436b90f7b3e7a67df85f5529d62bee5543d49277d565ab9ab2bf809a6064e6e55ae"
+    );
+    assert_eq!(resp.get_handshake_hash(), snow_hash);
+
+    // Transition snow initiator and responder to transport mode
+    let mut snow_init_transport = init.into_transport_mode().expect("init transport");
+    let mut transport_msg = [0u8; 128];
+    let tlen = snow_init_transport
+        .write_message(b"RAPP-TEST", &mut transport_msg)
+        .expect("snow transport write");
+    assert_eq!(tlen, 9 + 16);
+
+    // Decrypt transport message with our derived c1
+    let c1_bytes = hex::decode("271245e9b5ffc357a6d442e04a376531bd3a0f81d69d7b97eaa132cc81d209ab")
+        .expect("decode c1");
+    let cipher =
+        chacha20poly1305::ChaCha20Poly1305::new_from_slice(&c1_bytes).expect("cipher from c1");
+    let mut nonce_bytes = [0u8; 12];
+    nonce_bytes[4..12].copy_from_slice(&0_u64.to_le_bytes());
+    let nonce = chacha20poly1305::Nonce::from_slice(&nonce_bytes);
+
+    let mut ciphertext = transport_msg[..tlen - 16].to_vec();
+    let tag = chacha20poly1305::Tag::from_slice(&transport_msg[tlen - 16..tlen]);
+    cipher
+        .decrypt_in_place_detached(nonce, &[], &mut ciphertext, tag)
+        .expect("decrypt with derived c1");
+    assert_eq!(&ciphertext, b"RAPP-TEST");
 }
 
 #[test]

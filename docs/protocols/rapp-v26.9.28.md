@@ -1433,6 +1433,10 @@ whose holder is about to present the card anyway). Logical Noise roles are
 unchanged: the requester initiates every handshake over the accepted
 connection.
 
+> [!NOTE] Normative Supersession (v26.10.3)
+> The connection direction defined above is superseded by [RAPP Transport and Discovery Hierarchy Specification](rapp-transport-and-discovery-hierarchy.md).
+> To eliminate unauthenticated listening ports and firewall modifications on desktop requesters (Windows, Linux/BSD), the sovereign custodian (phone) runs the listener and advertises via mDNS/DNS-SD (`_refineid-stream._tcp.local.`), while the requester connects strictly via outbound TCP.
+
 **Framing.** Every frame is a 2-byte big-endian length prefix followed by
 exactly that many payload bytes. A declared length of zero is malformed. The
 16-bit prefix cannot express a length above `NOISE_MAX_MESSAGE`, and a

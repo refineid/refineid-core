@@ -46,6 +46,8 @@ This document is completely self-contained: all normative schemas, protocol stat
 - **Role Mapping**:
   - **Requester**: Corresponds to the RAPP Requester, operating as GATT Client (Central).
   - **Custodian**: Corresponds to the Sovereign Server (mobile device) acting as the RAPP Authorization Proxy while holding exclusive physical NFC custody of the Credential Holder (FINEID Card), operating as GATT Server (Peripheral).
+- **Transport Hierarchy**:
+  RAPP v26.10.1 (`"fi.refineid.rapp.ble.v1"`) constitutes **Tier 2 (Bluetooth / BLE Proximity Transport)** within the normative [RAPP Transport and Discovery Hierarchy Specification](rapp-transport-and-discovery-hierarchy.md). It operates alongside Tier 1 (Apple-native direct P2P) and Tier 3 (Local IP stream via mDNS/DNS-SD fallback).
 
 ### 1.2 Implementation and Verification Status Matrix
 

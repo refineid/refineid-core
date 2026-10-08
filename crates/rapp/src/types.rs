@@ -280,6 +280,8 @@ pub enum CloseReason {
     PairingRevoked,
     /// Local process shutdown.
     Shutdown,
+    /// The custodian can no longer serve the card.
+    CardUnavailable,
 }
 
 /// Total unexpected-input classification.

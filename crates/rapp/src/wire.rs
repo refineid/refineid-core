@@ -1054,6 +1054,7 @@ fn validate_discriminants(
                         | "protocol_violation"
                         | "pairing_revoked"
                         | "shutdown"
+                        | "card_unavailable"
                 )
             ) {
                 return Err(WireError::InvalidValue { field: "reason" });

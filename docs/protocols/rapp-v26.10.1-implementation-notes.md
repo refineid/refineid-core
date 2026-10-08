@@ -58,8 +58,7 @@ Section 9.2 registers `ecdsa_sha256` and `rsa_pkcs1_sha256` only. A P-384
 card that signs a TLS 1.3 handshake needs a SHA-384 digest, so custodians
 also accept the earlier registry's `ecdsa_sha224`, `ecdsa_sha384`,
 `ecdsa_sha512`, `rsa_pkcs1_sha384`, `rsa_pkcs1_sha512` and `rsa_pss_sha256`,
-each with the digest length its hash fixes. Requesters send a section 9.2
-name whenever the key and the relying party allow it.
+each with the digest length its hash fixes.
 
 ## 6. `inspect_card` response fields
 

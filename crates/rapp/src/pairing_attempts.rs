@@ -12,14 +12,60 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The custodian's CPace attempt accounting and post-lockout backoff
-//! (RAPP v26.10.9 §3.3).
+//! The pairing ceremony's attempt accounting, post-PAKE deadlines,
+//! pre-authentication rate limit and post-lockout backoff (RAPP v26.10.9
+//! §3.3).
 
 /// Attempts one offer admits.
 pub const MAXIMUM_CPACE_ATTEMPTS: u8 = 3;
 
 /// Non-extendable window from admission to a verified `T_A`.
 pub const CPACE_ATTEMPT_WINDOW_MS: u64 = 5_000;
+
+/// From local CPace handoff to a completed `Noise_XXpsk3` handshake
+/// (§3.3.7).
+pub const POST_PAKE_HANDSHAKE_MS: u64 = 10_000;
+
+/// From local Noise completion to stored trust: hello, confirmation and
+/// storage (§3.3.7).
+pub const POST_PAKE_CONFIRMATION_MS: u64 = 10_000;
+
+/// Minimum spacing of pre-authentication attempts at the custodian
+/// (§3.3.8).
+pub const PRE_AUTHENTICATION_SPACING_MS: u64 = 500;
+
+/// The monotonic deadline `window` milliseconds after `start_ms`.
+#[must_use]
+pub const fn phase_deadline_ms(start_ms: u64, window_ms: u64) -> u64 {
+    start_ms.saturating_add(window_ms)
+}
+
+/// The §3.3.8 limit of one pre-authentication attempt per 500 ms.
+///
+/// The custodian pairing bridge applies it to every CPace start, which
+/// covers repeated invalid `Y_A` submissions; the platform applies its own
+/// instance to accepted pre-authentication connections before reading the
+/// routing preamble. Times are the platform's monotonic milliseconds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PreAuthenticationRateLimit {
+    last_admitted_ms: Option<u64>,
+}
+
+impl PreAuthenticationRateLimit {
+    /// Admit one attempt at `now_ms`, or refuse it when the previous
+    /// admitted attempt is less than 500 ms old. A refused attempt does not
+    /// move the window.
+    pub fn admit(&mut self, now_ms: u64) -> bool {
+        if self
+            .last_admitted_ms
+            .is_some_and(|last| now_ms.saturating_sub(last) < PRE_AUTHENTICATION_SPACING_MS)
+        {
+            return false;
+        }
+        self.last_admitted_ms = Some(now_ms);
+        true
+    }
+}
 
 /// The custodian's attempt accounting for one offer.
 ///
@@ -166,7 +212,25 @@ impl PairingBackoff {
 
 #[cfg(test)]
 mod tests {
-    use super::{CPACE_ATTEMPT_WINDOW_MS, CpaceAttemptLedger, PairingBackoff};
+    use super::{
+        CPACE_ATTEMPT_WINDOW_MS, CpaceAttemptLedger, PRE_AUTHENTICATION_SPACING_MS, PairingBackoff,
+        PreAuthenticationRateLimit, phase_deadline_ms,
+    };
+
+    #[test]
+    fn pre_authentication_attempts_are_spaced_by_500_ms() {
+        let mut limit = PreAuthenticationRateLimit::default();
+        assert!(limit.admit(1_000));
+        assert!(!limit.admit(1_000 + PRE_AUTHENTICATION_SPACING_MS - 1));
+        assert!(limit.admit(1_000 + PRE_AUTHENTICATION_SPACING_MS));
+        assert!(!limit.admit(1_000 + PRE_AUTHENTICATION_SPACING_MS + 1));
+    }
+
+    #[test]
+    fn phase_deadlines_saturate() {
+        assert_eq!(phase_deadline_ms(1_000, 10_000), 11_000);
+        assert_eq!(phase_deadline_ms(u64::MAX - 1, 10_000), u64::MAX);
+    }
 
     const OFFER_END: u64 = 60_000;
 

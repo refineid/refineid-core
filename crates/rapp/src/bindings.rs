@@ -27,11 +27,13 @@ use std::{
 use super::{
     BinaryFrame, CpaceAttemptLedger, CpaceKc2Initiator, CpaceKc2Responder,
     CpaceKc2ResponderWaiting, EndpointRole, EstablishedEndpoint, ExplicitUserIntent, OfferId,
-    PairId, PairKeyMaterial, PairRecord, PairStore, PairStoreError, PairTombstone, PairingBackoff,
-    PairingConfirmation, PairingHandshake, PairingOffer, PairingOfferDeadline, PairingSecret,
-    ProfileName, RendezvousToken, STREAM_PROFILE, SessionAuthentication, SessionHandshake,
-    SessionId, StreamRendezvous, TransportProfile, WireValue, encode_kc2_step1_frame,
-    generate_pair_key_material, standard_pairing_context_v2,
+    POST_PAKE_CONFIRMATION_MS, POST_PAKE_HANDSHAKE_MS, PairId, PairKeyMaterial, PairRecord,
+    PairStore, PairStoreError, PairTombstone, PairingBackoff, PairingConfirmation, PairingError,
+    PairingHandshake, PairingOffer, PairingOfferDeadline, PairingSecret,
+    PreAuthenticationRateLimit, ProfileName, RendezvousToken, STREAM_PROFILE,
+    SessionAuthentication, SessionHandshake, SessionId, StreamRendezvous, TransportProfile,
+    WireValue, encode_kc2_step1_frame, generate_pair_key_material, phase_deadline_ms,
+    standard_pairing_context_v2,
 };
 
 /// Endpoint role fixed by the protocol rather than transport direction.
@@ -153,6 +155,9 @@ pub enum RappBindingError {
     /// Three pairing attempts failed against one offer; the offer is
     /// destroyed (RAPP v26.10.9 §3.3).
     AttemptsExhausted,
+    /// A pre-authentication attempt came within 500 ms of the previous one
+    /// (RAPP v26.10.9 §3.3.8); the caller refuses it and changes nothing.
+    RateLimited,
 }
 
 impl core::fmt::Display for RappBindingError {
@@ -234,12 +239,18 @@ enum PairingBridgeState {
         deadline: PairingOfferDeadline,
     },
     Cpace(Box<CpaceBridgeState>),
+    /// `Noise_XXpsk3` after CPace handoff, bounded by the post-PAKE
+    /// handshake deadline instead of the offer lifetime (§3.3.7).
     Handshake {
-        role: EndpointRole,
         handshake: Box<PairingHandshake>,
-        deadline: PairingOfferDeadline,
+        deadline_ms: u64,
     },
-    Confirmation(Box<PairingConfirmation>),
+    /// Hello, grant confirmation and storage, bounded by the deadline that
+    /// starts at local Noise completion (§3.3.7).
+    Confirmation {
+        confirmation: Box<PairingConfirmation>,
+        deadline_ms: u64,
+    },
     Completed,
     Expired,
     /// Three failed attempts destroyed the custodian's offer (§3.3.5).
@@ -248,9 +259,19 @@ enum PairingBridgeState {
 }
 
 impl PairingBridgeState {
+    /// Enforce the deadline of the current phase: the offer lifetime before
+    /// CPace handoff, the post-PAKE deadlines after it. Any expiry destroys
+    /// the candidate.
     fn require_live_offer(&mut self, now_monotonic_ms: u64) -> Result<(), RappBindingError> {
         let deadline = match self {
-            Self::Offer { deadline, .. } | Self::Handshake { deadline, .. } => *deadline,
+            Self::Offer { deadline, .. } => *deadline,
+            Self::Handshake { deadline_ms, .. } | Self::Confirmation { deadline_ms, .. } => {
+                if now_monotonic_ms < *deadline_ms {
+                    return Ok(());
+                }
+                *self = Self::Expired;
+                return Err(RappBindingError::OfferExpired);
+            }
             Self::Cpace(cpace) => cpace.deadline(),
             Self::Exhausted => return Err(RappBindingError::AttemptsExhausted),
             _ => return Ok(()),
@@ -260,21 +281,6 @@ impl PairingBridgeState {
         }
         *self = Self::Expired;
         Err(RappBindingError::OfferExpired)
-    }
-
-    fn after_handshake_failure(
-        role: EndpointRole,
-        handshake: PairingHandshake,
-        deadline: PairingOfferDeadline,
-    ) -> Self {
-        if role == EndpointRole::Requester && !handshake.is_complete() {
-            return Self::Offer {
-                role,
-                offer: handshake.abort(),
-                deadline,
-            };
-        }
-        Self::Failed
     }
 
     /// The state after a CPace failure that spent no admitted attempt: the
@@ -301,6 +307,7 @@ impl PairingBridgeState {
 pub struct RappPairingBridge {
     state: Mutex<PairingBridgeState>,
     attempts: Mutex<CpaceAttemptLedger>,
+    pre_authentication: Mutex<PreAuthenticationRateLimit>,
 }
 
 #[uniffi::export]
@@ -519,6 +526,21 @@ impl RappPairingBridge {
                 Ok(())
             }
             EndpointRole::Proxy => {
+                // §3.3.8: one pre-authentication attempt per 500 ms, which
+                // also spaces repeated invalid Y_A submissions.
+                let admitted = self
+                    .pre_authentication
+                    .lock()
+                    .map_err(|_| RappBindingError::LocalStateFailure)?
+                    .admit(now_monotonic_ms);
+                if !admitted {
+                    *state = PairingBridgeState::Offer {
+                        role,
+                        offer,
+                        deadline,
+                    };
+                    return Err(RappBindingError::RateLimited);
+                }
                 let ledger = self.lock_attempts()?;
                 if !ledger.accepts_another_attempt() || ledger.has_active_attempt() {
                     let exhausted = ledger.is_exhausted();
@@ -599,9 +621,11 @@ impl RappPairingBridge {
                 ) {
                     Ok(handshake) => {
                         *state = PairingBridgeState::Handshake {
-                            role: EndpointRole::Requester,
                             handshake: Box::new(handshake),
-                            deadline,
+                            deadline_ms: phase_deadline_ms(
+                                now_monotonic_ms,
+                                POST_PAKE_HANDSHAKE_MS,
+                            ),
                         };
                         Ok(bytes)
                     }
@@ -802,9 +826,11 @@ impl RappPairingBridge {
                 ) {
                     Ok(handshake) => {
                         *state = PairingBridgeState::Handshake {
-                            role: EndpointRole::Proxy,
                             handshake: Box::new(handshake),
-                            deadline,
+                            deadline_ms: phase_deadline_ms(
+                                now_monotonic_ms,
+                                POST_PAKE_HANDSHAKE_MS,
+                            ),
                         };
                         Ok(())
                     }
@@ -880,15 +906,11 @@ impl RappPairingBridge {
         state.require_live_offer(now_monotonic_ms)?;
         let previous = core::mem::replace(&mut *state, PairingBridgeState::Failed);
         let (role, offer, deadline) = match previous {
-            PairingBridgeState::Handshake {
-                role,
-                handshake,
-                deadline,
-            } => {
-                let retained = role == EndpointRole::Requester && !handshake.is_complete();
-                *state = PairingBridgeState::after_handshake_failure(role, *handshake, deadline);
+            PairingBridgeState::Handshake { .. } => {
+                // CPace consumed the offer; a lost candidate after handoff
+                // destroys candidate trust (§3.3.6).
                 drop(state);
-                return Ok(retained);
+                return Ok(false);
             }
             PairingBridgeState::Cpace(cpace) if cpace.role() == EndpointRole::Proxy => {
                 let deadline = cpace.deadline();
@@ -938,7 +960,7 @@ impl RappPairingBridge {
             PairingBridgeState::Offer { .. }
             | PairingBridgeState::Cpace(_)
             | PairingBridgeState::Handshake { .. }
-            | PairingBridgeState::Confirmation(_) => Ok(()),
+            | PairingBridgeState::Confirmation { .. } => Ok(()),
             PairingBridgeState::Expired
             | PairingBridgeState::Exhausted
             | PairingBridgeState::Failed => Ok(()),
@@ -963,9 +985,8 @@ impl RappPairingBridge {
         state.require_live_offer(now_monotonic_ms)?;
         let previous = core::mem::replace(&mut *state, PairingBridgeState::Failed);
         let PairingBridgeState::Handshake {
-            role,
             mut handshake,
-            deadline,
+            deadline_ms,
         } = previous
         else {
             *state = previous;
@@ -973,13 +994,11 @@ impl RappPairingBridge {
         };
         if let Ok(frame) = handshake.write_message() {
             *state = PairingBridgeState::Handshake {
-                role,
                 handshake,
-                deadline,
+                deadline_ms,
             };
             Ok(frame.into_bytes())
         } else {
-            *state = PairingBridgeState::after_handshake_failure(role, *handshake, deadline);
             drop(state);
             Err(RappBindingError::ProtocolFailure)
         }
@@ -999,27 +1018,23 @@ impl RappPairingBridge {
         state.require_live_offer(now_monotonic_ms)?;
         let previous = core::mem::replace(&mut *state, PairingBridgeState::Failed);
         let PairingBridgeState::Handshake {
-            role,
             mut handshake,
-            deadline,
+            deadline_ms,
         } = previous
         else {
             *state = previous;
             return Err(RappBindingError::WrongPhase);
         };
         let Ok(frame) = BinaryFrame::reconstruct(bytes) else {
-            *state = PairingBridgeState::after_handshake_failure(role, *handshake, deadline);
             return Err(RappBindingError::InvalidInput);
         };
         if matches!(handshake.read_message(&frame), Ok(())) {
             *state = PairingBridgeState::Handshake {
-                role,
                 handshake,
-                deadline,
+                deadline_ms,
             };
             Ok(())
         } else {
-            *state = PairingBridgeState::after_handshake_failure(role, *handshake, deadline);
             drop(state);
             Err(RappBindingError::ProtocolFailure)
         }
@@ -1040,8 +1055,9 @@ impl RappPairingBridge {
         Ok(complete)
     }
 
-    /// Destroy the QR bearer secret and enter authenticated human
-    /// confirmation after Noise completes.
+    /// Enter authenticated confirmation after Noise completes; hello,
+    /// confirmation and storage must follow within 10 seconds of
+    /// `now_monotonic_ms` (§3.3.7).
     ///
     /// # Errors
     /// [`RappBindingError`] on an expired offer, the wrong phase, or an
@@ -1050,33 +1066,19 @@ impl RappPairingBridge {
         let mut state = self.lock()?;
         state.require_live_offer(now_monotonic_ms)?;
         let previous = core::mem::replace(&mut *state, PairingBridgeState::Failed);
-        let PairingBridgeState::Handshake {
-            role,
-            handshake,
-            deadline,
-        } = previous
-        else {
+        let PairingBridgeState::Handshake { handshake, .. } = previous else {
             *state = previous;
             return Err(RappBindingError::WrongPhase);
         };
         match (*handshake).into_confirmation() {
             Ok(confirmation) => {
-                *state = PairingBridgeState::Confirmation(Box::new(confirmation));
+                *state = PairingBridgeState::Confirmation {
+                    confirmation: Box::new(confirmation),
+                    deadline_ms: phase_deadline_ms(now_monotonic_ms, POST_PAKE_CONFIRMATION_MS),
+                };
                 Ok(())
             }
-            Err(failure) => {
-                let (_, offer) = failure.into_parts();
-                *state = if role == EndpointRole::Requester {
-                    PairingBridgeState::Offer {
-                        role,
-                        offer,
-                        deadline,
-                    }
-                } else {
-                    PairingBridgeState::Failed
-                };
-                Err(RappBindingError::ProtocolFailure)
-            }
+            Err(_) => Err(RappBindingError::ProtocolFailure),
         }
     }
 
@@ -1089,17 +1091,13 @@ impl RappPairingBridge {
         &self,
         display_name: String,
         platform: String,
+        now_monotonic_ms: u64,
     ) -> Result<Vec<u8>, RappBindingError> {
-        let mut state = self.lock()?;
-        let PairingBridgeState::Confirmation(confirmation) = &mut *state else {
-            return Err(RappBindingError::WrongPhase);
-        };
-        let frame = confirmation
-            .send_hello(display_name, platform)
-            .map(BinaryFrame::into_bytes)
-            .map_err(|_| RappBindingError::ProtocolFailure);
-        drop(state);
-        frame
+        self.with_confirmation(now_monotonic_ms, |confirmation| {
+            confirmation
+                .send_hello(display_name, platform)
+                .map(BinaryFrame::into_bytes)
+        })
     }
 
     /// Verify the peer's authenticated label and exact parameter echo.
@@ -1110,28 +1108,23 @@ impl RappPairingBridge {
     pub fn receive_hello(
         &self,
         bytes: Vec<u8>,
-        now_ms: u64,
+        now_monotonic_ms: u64,
     ) -> Result<RappPeerHello, RappBindingError> {
         let frame = BinaryFrame::reconstruct(bytes).map_err(|_| RappBindingError::InvalidInput)?;
-        let mut state = self.lock()?;
-        let PairingBridgeState::Confirmation(confirmation) = &mut *state else {
-            return Err(RappBindingError::WrongPhase);
-        };
-        let hello = confirmation
-            .receive_hello(&frame, now_ms)
-            .map_err(|_| RappBindingError::ProtocolFailure)?;
-        let peer = RappPeerHello {
-            display_name: hello.display_name.clone(),
-            platform: hello.platform.clone(),
-            requested_profiles: hello.requested_profiles.as_ref().map(|profiles| {
-                profiles
-                    .iter()
-                    .map(|profile| profile.as_str().to_owned())
-                    .collect()
-            }),
-        };
-        drop(state);
-        Ok(peer)
+        self.with_confirmation(now_monotonic_ms, |confirmation| {
+            confirmation
+                .receive_hello(&frame, now_monotonic_ms)
+                .map(|hello| RappPeerHello {
+                    display_name: hello.display_name.clone(),
+                    platform: hello.platform.clone(),
+                    requested_profiles: hello.requested_profiles.as_ref().map(|profiles| {
+                        profiles
+                            .iter()
+                            .map(|profile| profile.as_str().to_owned())
+                            .collect()
+                    }),
+                })
+        })
     }
 
     /// Send the exact locally approved grant set.
@@ -1142,18 +1135,14 @@ impl RappPairingBridge {
     pub fn send_confirmation(
         &self,
         granted_profiles: Vec<String>,
+        now_monotonic_ms: u64,
     ) -> Result<Vec<u8>, RappBindingError> {
         let granted_profiles = parse_profiles(granted_profiles)?;
-        let mut state = self.lock()?;
-        let PairingBridgeState::Confirmation(confirmation) = &mut *state else {
-            return Err(RappBindingError::WrongPhase);
-        };
-        let frame = confirmation
-            .send_confirmation(granted_profiles)
-            .map(BinaryFrame::into_bytes)
-            .map_err(|_| RappBindingError::ProtocolFailure);
-        drop(state);
-        frame
+        self.with_confirmation(now_monotonic_ms, |confirmation| {
+            confirmation
+                .send_confirmation(granted_profiles)
+                .map(BinaryFrame::into_bytes)
+        })
     }
 
     /// Verify and return the peer's exact grant set.
@@ -1164,24 +1153,19 @@ impl RappPairingBridge {
     pub fn receive_confirmation(
         &self,
         bytes: Vec<u8>,
-        now_ms: u64,
+        now_monotonic_ms: u64,
     ) -> Result<Vec<String>, RappBindingError> {
         let frame = BinaryFrame::reconstruct(bytes).map_err(|_| RappBindingError::InvalidInput)?;
-        let mut state = self.lock()?;
-        let PairingBridgeState::Confirmation(confirmation) = &mut *state else {
-            return Err(RappBindingError::WrongPhase);
-        };
-        let profiles = confirmation
-            .receive_confirmation(&frame, now_ms)
-            .map(|profiles| {
-                profiles
-                    .iter()
-                    .map(|profile| profile.as_str().to_owned())
-                    .collect()
-            })
-            .map_err(|_| RappBindingError::ProtocolFailure);
-        drop(state);
-        profiles
+        self.with_confirmation(now_monotonic_ms, |confirmation| {
+            confirmation
+                .receive_confirmation(&frame, now_monotonic_ms)
+                .map(|profiles| {
+                    profiles
+                        .iter()
+                        .map(|profile| profile.as_str().to_owned())
+                        .collect()
+                })
+        })
     }
 
     /// Complete equal human confirmation and retain the resulting pair record
@@ -1193,10 +1177,13 @@ impl RappPairingBridge {
     pub fn finish_pairing(
         &self,
         created_at_ms: u64,
+        now_monotonic_ms: u64,
     ) -> Result<Arc<RappPairRecord>, RappBindingError> {
         let mut state = self.lock()?;
+        state.require_live_offer(now_monotonic_ms)?;
         let previous = core::mem::replace(&mut *state, PairingBridgeState::Failed);
-        let PairingBridgeState::Confirmation(confirmation) = previous else {
+        let PairingBridgeState::Confirmation { confirmation, .. } = previous else {
+            *state = previous;
             return Err(RappBindingError::WrongPhase);
         };
         let record = (*confirmation)
@@ -1215,6 +1202,26 @@ impl RappPairingBridge {
         self.state
             .lock()
             .map_err(|_| RappBindingError::LocalStateFailure)
+    }
+
+    /// Run one confirmation step before the post-PAKE deadline; a failed
+    /// step destroys candidate trust (§3.3.7).
+    fn with_confirmation<T>(
+        &self,
+        now_monotonic_ms: u64,
+        step: impl FnOnce(&mut PairingConfirmation) -> Result<T, PairingError>,
+    ) -> Result<T, RappBindingError> {
+        let mut state = self.lock()?;
+        state.require_live_offer(now_monotonic_ms)?;
+        let PairingBridgeState::Confirmation { confirmation, .. } = &mut *state else {
+            return Err(RappBindingError::WrongPhase);
+        };
+        let outcome = step(confirmation);
+        if outcome.is_err() {
+            *state = PairingBridgeState::Failed;
+        }
+        drop(state);
+        outcome.map_err(|_| RappBindingError::ProtocolFailure)
     }
 
     fn lock_attempts(&self) -> Result<MutexGuard<'_, CpaceAttemptLedger>, RappBindingError> {
@@ -1271,6 +1278,7 @@ impl RappPairingBridge {
                 deadline,
             }),
             attempts: Mutex::new(CpaceAttemptLedger::default()),
+            pre_authentication: Mutex::new(PreAuthenticationRateLimit::default()),
         }))
     }
 }
@@ -1296,10 +1304,16 @@ fn pairing_context(
 #[cfg(test)]
 mod pairing_bridge_tests {
     use super::*;
-    use crate::{BLE_CANDIDATE_ID, STREAM_CANDIDATE_ID};
+    use crate::{
+        BLE_CANDIDATE_ID, CPACE_ATTEMPT_WINDOW_MS, PRE_AUTHENTICATION_SPACING_MS,
+        STREAM_CANDIDATE_ID,
+    };
 
     const STARTED_AT_MS: u64 = 1_000;
     const PAIRING_CODE: &str = "7KX4M9";
+    const WRONG_CODE: &str = "7KX4M8";
+    /// Spacing between attempts, beyond the §3.3.8 rate limit.
+    const NEXT_ATTEMPT_MS: u64 = 1_000;
 
     fn custodian(transports: &[TransportProfile]) -> Arc<RappPairingBridge> {
         let counts = rapp_random_byte_counts();
@@ -1318,39 +1332,58 @@ mod pairing_bridge_tests {
     fn requester(
         custodian: &RappPairingBridge,
         transport: TransportProfile,
+        at: u64,
     ) -> Arc<RappPairingBridge> {
         RappPairingBridge::from_bootstrap(
             custodian
-                .bootstrap_bytes(STARTED_AT_MS)
+                .bootstrap_bytes(at)
                 .expect("custodian serves its offer"),
             transport.name().to_owned(),
-            STARTED_AT_MS,
+            at,
         )
         .expect("requester accepts the bootstrap")
     }
 
-    fn begin_both(
-        requester: &RappPairingBridge,
-        requester_candidate: &str,
-        requester_code: &str,
-        custodian: &RappPairingBridge,
-        custodian_candidate: &str,
-        custodian_code: &str,
-    ) {
+    struct Attempt<'a> {
+        requester_candidate: &'a str,
+        requester_code: &'a str,
+        custodian_candidate: &'a str,
+        at: u64,
+    }
+
+    impl Attempt<'_> {
+        const fn honest(at: u64) -> Self {
+            Attempt {
+                requester_candidate: STREAM_CANDIDATE_ID,
+                requester_code: PAIRING_CODE,
+                custodian_candidate: STREAM_CANDIDATE_ID,
+                at,
+            }
+        }
+
+        const fn wrong_code(at: u64) -> Self {
+            Attempt {
+                requester_code: WRONG_CODE,
+                ..Self::honest(at)
+            }
+        }
+    }
+
+    fn begin_both(requester: &RappPairingBridge, custodian: &RappPairingBridge, attempt: &Attempt) {
         requester
             .begin_cpace(
-                requester_candidate.into(),
-                requester_code.into(),
+                attempt.requester_candidate.into(),
+                attempt.requester_code.into(),
                 vec![0x33; 64],
-                STARTED_AT_MS + 1,
+                attempt.at + 1,
             )
             .expect("requester begins cpace");
         custodian
             .begin_cpace(
-                custodian_candidate.into(),
-                custodian_code.into(),
+                attempt.custodian_candidate.into(),
+                PAIRING_CODE.into(),
                 vec![0x44; 64],
-                STARTED_AT_MS + 1,
+                attempt.at + 1,
             )
             .expect("custodian begins cpace");
     }
@@ -1359,17 +1392,69 @@ mod pairing_bridge_tests {
     fn exchange_through_step2(
         requester: &RappPairingBridge,
         custodian: &RappPairingBridge,
+        at: u64,
     ) -> Result<(), RappBindingError> {
         let step1 = requester
-            .write_cpace_frame(STARTED_AT_MS + 2)
+            .write_cpace_frame(at + 2)
             .expect("requester writes step 1");
         custodian
-            .read_cpace_frame(step1, STARTED_AT_MS + 2)
+            .read_cpace_frame(step1, at + 2)
             .expect("custodian reads step 1");
         let step2 = custodian
-            .write_cpace_frame(STARTED_AT_MS + 3)
+            .write_cpace_frame(at + 3)
             .expect("custodian writes step 2");
-        requester.read_cpace_frame(step2, STARTED_AT_MS + 3)
+        requester.read_cpace_frame(step2, at + 3)
+    }
+
+    /// Runs one attempt over the stream transport through T_B.
+    fn attempt_through_step2(
+        custodian: &RappPairingBridge,
+        attempt: &Attempt,
+    ) -> (Arc<RappPairingBridge>, Result<(), RappBindingError>) {
+        let requester = requester(custodian, TransportProfile::Stream, attempt.at);
+        begin_both(&requester, custodian, attempt);
+        let verdict = exchange_through_step2(&requester, custodian, attempt.at);
+        (requester, verdict)
+    }
+
+    /// Completes CPace and Noise from `at`; returns when both entered
+    /// confirmation at `at + 9`.
+    fn pair_into_confirmation(at: u64) -> (Arc<RappPairingBridge>, Arc<RappPairingBridge>) {
+        let custodian = custodian(&[TransportProfile::Ble, TransportProfile::Stream]);
+        let (requester, verdict) = attempt_through_step2(&custodian, &Attempt::honest(at));
+        verdict.expect("T_B verifies");
+        let step3 = requester
+            .write_cpace_frame(at + 4)
+            .expect("requester writes step 3 and enters Noise");
+        assert_eq!(step3.len(), 32);
+        custodian
+            .read_cpace_frame(step3, at + 4)
+            .expect("custodian verifies T_A and enters Noise");
+        let msg1 = requester
+            .write_handshake_frame(at + 5)
+            .expect("requester emits Noise message 1");
+        custodian
+            .read_handshake_frame(msg1, at + 5)
+            .expect("custodian accepts Noise message 1");
+        let msg2 = custodian
+            .write_handshake_frame(at + 6)
+            .expect("custodian emits Noise message 2");
+        requester
+            .read_handshake_frame(msg2, at + 6)
+            .expect("requester accepts Noise message 2");
+        let msg3 = requester
+            .write_handshake_frame(at + 7)
+            .expect("requester emits Noise message 3");
+        custodian
+            .read_handshake_frame(msg3, at + 7)
+            .expect("custodian accepts Noise message 3");
+        requester
+            .enter_confirmation(at + 9)
+            .expect("requester enters confirmation");
+        custodian
+            .enter_confirmation(at + 9)
+            .expect("custodian enters confirmation");
+        (requester, custodian)
     }
 
     #[test]
@@ -1391,7 +1476,7 @@ mod pairing_bridge_tests {
     #[test]
     fn only_the_custodian_serves_bootstrap_bytes() {
         let custodian = custodian(&[TransportProfile::Stream]);
-        let requester = requester(&custodian, TransportProfile::Stream);
+        let requester = requester(&custodian, TransportProfile::Stream, STARTED_AT_MS);
         assert!(matches!(
             requester.bootstrap_bytes(STARTED_AT_MS),
             Err(RappBindingError::WrongPhase)
@@ -1421,156 +1506,146 @@ mod pairing_bridge_tests {
 
     #[test]
     fn cpace_kc2_bridge_3step_exchange_to_pair_records() {
-        let custodian = custodian(&[TransportProfile::Ble, TransportProfile::Stream]);
-        let requester = requester(&custodian, TransportProfile::Stream);
-        begin_both(
-            &requester,
-            STREAM_CANDIDATE_ID,
-            PAIRING_CODE,
-            &custodian,
-            STREAM_CANDIDATE_ID,
-            PAIRING_CODE,
-        );
-        exchange_through_step2(&requester, &custodian).expect("T_B verifies");
-        let step3 = requester
-            .write_cpace_frame(STARTED_AT_MS + 4)
-            .expect("requester writes step 3 and enters Noise");
-        assert_eq!(step3.len(), 32);
-        custodian
-            .read_cpace_frame(step3, STARTED_AT_MS + 4)
-            .expect("custodian verifies T_A and enters Noise");
-
-        let msg1 = requester
-            .write_handshake_frame(STARTED_AT_MS + 5)
-            .expect("requester emits Noise message 1");
-        custodian
-            .read_handshake_frame(msg1, STARTED_AT_MS + 5)
-            .expect("custodian accepts Noise message 1");
-        let msg2 = custodian
-            .write_handshake_frame(STARTED_AT_MS + 6)
-            .expect("custodian emits Noise message 2");
-        requester
-            .read_handshake_frame(msg2, STARTED_AT_MS + 6)
-            .expect("requester accepts Noise message 2");
-        let msg3 = requester
-            .write_handshake_frame(STARTED_AT_MS + 7)
-            .expect("requester emits Noise message 3");
-        custodian
-            .read_handshake_frame(msg3, STARTED_AT_MS + 7)
-            .expect("custodian accepts Noise message 3");
-
-        requester
-            .enter_confirmation(STARTED_AT_MS + 9)
-            .expect("requester enters confirmation");
-        custodian
-            .enter_confirmation(STARTED_AT_MS + 9)
-            .expect("custodian enters confirmation");
+        let at = STARTED_AT_MS;
+        let (requester, custodian) = pair_into_confirmation(at);
         let requester_hello = requester
-            .send_hello("desktop".into(), "macos".into())
+            .send_hello("desktop".into(), "macos".into(), at + 10)
             .expect("requester sends hello");
         let custodian_hello = custodian
-            .send_hello("phone".into(), "ios".into())
+            .send_hello("phone".into(), "ios".into(), at + 10)
             .expect("custodian sends hello");
         custodian
-            .receive_hello(requester_hello, STARTED_AT_MS + 10)
+            .receive_hello(requester_hello, at + 10)
             .expect("custodian receives hello");
         requester
-            .receive_hello(custodian_hello, STARTED_AT_MS + 10)
+            .receive_hello(custodian_hello, at + 10)
             .expect("requester receives hello");
         let grants = vec![ProfileName::Authentication.as_str().to_owned()];
         let requester_confirmation = requester
-            .send_confirmation(grants.clone())
+            .send_confirmation(grants.clone(), at + 11)
             .expect("requester sends confirmation");
         let custodian_confirmation = custodian
-            .send_confirmation(grants)
+            .send_confirmation(grants, at + 11)
             .expect("custodian sends confirmation");
         custodian
-            .receive_confirmation(requester_confirmation, STARTED_AT_MS + 11)
+            .receive_confirmation(requester_confirmation, at + 11)
             .expect("custodian receives confirmation");
         requester
-            .receive_confirmation(custodian_confirmation, STARTED_AT_MS + 11)
+            .receive_confirmation(custodian_confirmation, at + 11)
             .expect("requester receives confirmation");
 
         let requester_record = requester
-            .finish_pairing(STARTED_AT_MS + 12)
+            .finish_pairing(at + 12, at + 12)
             .expect("requester finishes pairing")
             .metadata()
             .expect("requester metadata");
         let custodian_record = custodian
-            .finish_pairing(STARTED_AT_MS + 12)
+            .finish_pairing(at + 12, at + 12)
             .expect("custodian finishes pairing")
             .metadata()
             .expect("custodian metadata");
         assert_eq!(requester_record.pair_id, custodian_record.pair_id);
-        assert_eq!(requester_record.transport_profile, STREAM_PROFILE);
-        assert_eq!(requester_record.candidate_id, STREAM_CANDIDATE_ID);
+    }
+
+    #[test]
+    fn the_handshake_deadline_replaces_the_offer_lifetime() {
+        let custodian = custodian(&[TransportProfile::Stream]);
+        let at = STARTED_AT_MS + crate::OFFER_TTL_MS - 10;
+        let (requester, verdict) = attempt_through_step2(&custodian, &Attempt::honest(at));
+        verdict.expect("T_B verifies inside the offer lifetime");
+        let step3 = requester
+            .write_cpace_frame(at + 4)
+            .expect("requester hands off to Noise");
+        custodian
+            .read_cpace_frame(step3, at + 4)
+            .expect("custodian hands off to Noise");
+        // Past the offer lifetime, inside the 10 s handshake deadline.
+        let msg1 = requester
+            .write_handshake_frame(at + 1_000)
+            .expect("the ceremony survives the offer lifetime");
+        custodian
+            .read_handshake_frame(msg1, at + 1_000)
+            .expect("custodian reads message 1");
+        assert!(matches!(
+            custodian.write_handshake_frame(at + 4 + POST_PAKE_HANDSHAKE_MS),
+            Err(RappBindingError::OfferExpired)
+        ));
+        assert!(matches!(
+            custodian.write_handshake_frame(at + 4),
+            Err(RappBindingError::WrongPhase)
+        ));
+    }
+
+    #[test]
+    fn the_confirmation_deadline_destroys_candidate_trust() {
+        let at = STARTED_AT_MS;
+        let (requester, _custodian) = pair_into_confirmation(at);
+        requester
+            .send_hello("desktop".into(), "macos".into(), at + 9 + 1)
+            .expect("hello inside the deadline");
+        assert!(matches!(
+            requester.send_confirmation(
+                vec![ProfileName::Authentication.as_str().to_owned()],
+                at + 9 + POST_PAKE_CONFIRMATION_MS
+            ),
+            Err(RappBindingError::OfferExpired)
+        ));
+        assert!(matches!(
+            requester.finish_pairing(at, at + 10),
+            Err(RappBindingError::WrongPhase)
+        ));
+    }
+
+    #[test]
+    fn a_failed_confirmation_step_destroys_candidate_trust() {
+        let at = STARTED_AT_MS;
+        let (requester, _custodian) = pair_into_confirmation(at);
+        assert!(matches!(
+            requester.receive_hello(vec![0x00; 16], at + 10),
+            Err(RappBindingError::ProtocolFailure)
+        ));
+        assert!(matches!(
+            requester.send_hello("desktop".into(), "macos".into(), at + 11),
+            Err(RappBindingError::WrongPhase)
+        ));
     }
 
     #[test]
     fn cpace_kc2_bridge_wrong_code_fails_tag_b() {
         let custodian = custodian(&[TransportProfile::Stream]);
-        let requester = requester(&custodian, TransportProfile::Stream);
-        begin_both(
-            &requester,
-            STREAM_CANDIDATE_ID,
-            "7KX4M8",
-            &custodian,
-            STREAM_CANDIDATE_ID,
-            PAIRING_CODE,
-        );
-        assert!(matches!(
-            exchange_through_step2(&requester, &custodian),
-            Err(RappBindingError::ProtocolFailure)
-        ));
+        let (_, verdict) = attempt_through_step2(&custodian, &Attempt::wrong_code(STARTED_AT_MS));
+        assert!(matches!(verdict, Err(RappBindingError::ProtocolFailure)));
     }
 
     #[test]
     fn cpace_binds_the_transport_of_the_connection() {
         let custodian = custodian(&[TransportProfile::Ble, TransportProfile::Stream]);
-        let requester = requester(&custodian, TransportProfile::Stream);
-        begin_both(
-            &requester,
-            STREAM_CANDIDATE_ID,
-            PAIRING_CODE,
+        let (_, verdict) = attempt_through_step2(
             &custodian,
-            BLE_CANDIDATE_ID,
-            PAIRING_CODE,
+            &Attempt {
+                custodian_candidate: BLE_CANDIDATE_ID,
+                ..Attempt::honest(STARTED_AT_MS)
+            },
         );
-        assert!(matches!(
-            exchange_through_step2(&requester, &custodian),
-            Err(RappBindingError::ProtocolFailure)
-        ));
-    }
-
-    fn wrong_code_attempt(custodian: &RappPairingBridge) {
-        let requester = requester(custodian, TransportProfile::Stream);
-        begin_both(
-            &requester,
-            STREAM_CANDIDATE_ID,
-            "7KX4M8",
-            custodian,
-            STREAM_CANDIDATE_ID,
-            PAIRING_CODE,
-        );
-        assert!(matches!(
-            exchange_through_step2(&requester, custodian),
-            Err(RappBindingError::ProtocolFailure)
-        ));
+        assert!(matches!(verdict, Err(RappBindingError::ProtocolFailure)));
     }
 
     #[test]
     fn three_wrong_codes_exhaust_the_custodian_offer() {
         let custodian = custodian(&[TransportProfile::Stream]);
         for attempt in 0..3 {
-            wrong_code_attempt(&custodian);
+            let at = STARTED_AT_MS + attempt * NEXT_ATTEMPT_MS;
+            let (_, verdict) = attempt_through_step2(&custodian, &Attempt::wrong_code(at));
+            assert!(matches!(verdict, Err(RappBindingError::ProtocolFailure)));
             // The requester hangs up after T_B fails; the attempt is spent.
             let retained = custodian
-                .candidate_failed(STARTED_AT_MS + 4)
+                .candidate_failed(at + 4)
                 .expect("custodian classifies the lost candidate");
             assert_eq!(retained, attempt < 2, "attempt {attempt}");
         }
+        let later = STARTED_AT_MS + 3 * NEXT_ATTEMPT_MS;
         assert!(matches!(
-            custodian.bootstrap_bytes(STARTED_AT_MS + 5),
+            custodian.bootstrap_bytes(later),
             Err(RappBindingError::AttemptsExhausted)
         ));
         assert!(matches!(
@@ -1578,7 +1653,7 @@ mod pairing_bridge_tests {
                 STREAM_CANDIDATE_ID.into(),
                 PAIRING_CODE.into(),
                 vec![0x44; 64],
-                STARTED_AT_MS + 5
+                later
             ),
             Err(RappBindingError::AttemptsExhausted)
         ));
@@ -1587,30 +1662,24 @@ mod pairing_bridge_tests {
     #[test]
     fn a_correct_code_on_the_second_attempt_succeeds() {
         let custodian = custodian(&[TransportProfile::Stream]);
-        wrong_code_attempt(&custodian);
+        let (_, verdict) = attempt_through_step2(&custodian, &Attempt::wrong_code(STARTED_AT_MS));
+        assert!(verdict.is_err());
         assert!(
             custodian
                 .candidate_failed(STARTED_AT_MS + 4)
                 .expect("custodian keeps the offer")
         );
-        let right = requester(&custodian, TransportProfile::Stream);
-        begin_both(
-            &right,
-            STREAM_CANDIDATE_ID,
-            PAIRING_CODE,
-            &custodian,
-            STREAM_CANDIDATE_ID,
-            PAIRING_CODE,
-        );
-        exchange_through_step2(&right, &custodian).expect("T_B verifies");
+        let at = STARTED_AT_MS + NEXT_ATTEMPT_MS;
+        let (right, verdict) = attempt_through_step2(&custodian, &Attempt::honest(at));
+        verdict.expect("T_B verifies");
         let step3 = right
-            .write_cpace_frame(STARTED_AT_MS + 4)
+            .write_cpace_frame(at + 4)
             .expect("requester writes step 3");
         custodian
-            .read_cpace_frame(step3, STARTED_AT_MS + 4)
+            .read_cpace_frame(step3, at + 4)
             .expect("the second attempt consumes the offer");
         assert!(matches!(
-            custodian.bootstrap_bytes(STARTED_AT_MS + 5),
+            custodian.bootstrap_bytes(at + 5),
             Err(RappBindingError::WrongPhase)
         ));
     }
@@ -1618,32 +1687,23 @@ mod pairing_bridge_tests {
     #[test]
     fn a_wrong_t_a_on_the_third_attempt_reports_exhaustion() {
         let custodian = custodian(&[TransportProfile::Stream]);
-        for _ in 0..2 {
-            wrong_code_attempt(&custodian);
-            assert!(
-                custodian
-                    .candidate_failed(STARTED_AT_MS + 4)
-                    .expect("offer kept")
-            );
+        for attempt in 0..2 {
+            let at = STARTED_AT_MS + attempt * NEXT_ATTEMPT_MS;
+            let (_, verdict) = attempt_through_step2(&custodian, &Attempt::wrong_code(at));
+            assert!(verdict.is_err());
+            assert!(custodian.candidate_failed(at + 4).expect("offer kept"));
         }
-        let requester = requester(&custodian, TransportProfile::Stream);
-        begin_both(
-            &requester,
-            STREAM_CANDIDATE_ID,
-            PAIRING_CODE,
-            &custodian,
-            STREAM_CANDIDATE_ID,
-            PAIRING_CODE,
-        );
-        exchange_through_step2(&requester, &custodian).expect("T_B verifies");
+        let at = STARTED_AT_MS + 2 * NEXT_ATTEMPT_MS;
+        let (requester, verdict) = attempt_through_step2(&custodian, &Attempt::honest(at));
+        verdict.expect("T_B verifies");
         let mut step3 = requester
-            .write_cpace_frame(STARTED_AT_MS + 4)
+            .write_cpace_frame(at + 4)
             .expect("requester writes step 3");
         if let Some(byte) = step3.last_mut() {
             *byte ^= 0x01;
         }
         assert!(matches!(
-            custodian.read_cpace_frame(step3, STARTED_AT_MS + 4),
+            custodian.read_cpace_frame(step3, at + 4),
             Err(RappBindingError::AttemptsExhausted)
         ));
     }
@@ -1651,39 +1711,66 @@ mod pairing_bridge_tests {
     #[test]
     fn an_attempt_past_its_window_is_spent() {
         let custodian = custodian(&[TransportProfile::Stream]);
-        let requester = requester(&custodian, TransportProfile::Stream);
-        begin_both(
-            &requester,
-            STREAM_CANDIDATE_ID,
-            PAIRING_CODE,
-            &custodian,
-            STREAM_CANDIDATE_ID,
-            PAIRING_CODE,
-        );
-        exchange_through_step2(&requester, &custodian).expect("T_B verifies");
+        let at = STARTED_AT_MS;
+        let (requester, verdict) = attempt_through_step2(&custodian, &Attempt::honest(at));
+        verdict.expect("T_B verifies");
         let step3 = requester
-            .write_cpace_frame(STARTED_AT_MS + 4)
+            .write_cpace_frame(at + 4)
             .expect("requester writes step 3");
         assert!(matches!(
-            custodian.read_cpace_frame(step3, STARTED_AT_MS + 2 + crate::CPACE_ATTEMPT_WINDOW_MS),
+            custodian.read_cpace_frame(step3, at + 2 + CPACE_ATTEMPT_WINDOW_MS),
             Err(RappBindingError::ProtocolFailure)
         ));
-        assert!(custodian.bootstrap_bytes(STARTED_AT_MS + 10_000).is_ok());
+        assert!(custodian.bootstrap_bytes(at + 10_000).is_ok());
+    }
+
+    #[test]
+    fn cpace_starts_inside_500_ms_are_rate_limited() {
+        let custodian = custodian(&[TransportProfile::Stream]);
+        let (_, verdict) = attempt_through_step2(&custodian, &Attempt::wrong_code(STARTED_AT_MS));
+        assert!(verdict.is_err());
+        assert!(
+            custodian
+                .candidate_failed(STARTED_AT_MS + 4)
+                .expect("offer kept")
+        );
+        assert!(matches!(
+            custodian.begin_cpace(
+                STREAM_CANDIDATE_ID.into(),
+                PAIRING_CODE.into(),
+                vec![0x44; 64],
+                STARTED_AT_MS + 1 + PRE_AUTHENTICATION_SPACING_MS - 1
+            ),
+            Err(RappBindingError::RateLimited)
+        ));
+        custodian
+            .begin_cpace(
+                STREAM_CANDIDATE_ID.into(),
+                PAIRING_CODE.into(),
+                vec![0x44; 64],
+                STARTED_AT_MS + 1 + PRE_AUTHENTICATION_SPACING_MS,
+            )
+            .expect("the limit lets the next attempt through");
+    }
+
+    #[test]
+    fn the_platform_limiter_spaces_accepted_connections() {
+        let limiter = RappPreAuthenticationLimiter::new();
+        assert!(limiter.admit(0).expect("lock"));
+        assert!(
+            !limiter
+                .admit(PRE_AUTHENTICATION_SPACING_MS - 1)
+                .expect("lock")
+        );
+        assert!(limiter.admit(PRE_AUTHENTICATION_SPACING_MS).expect("lock"));
     }
 
     #[test]
     fn cpace_kc2_bridge_corrupted_step3_fails_custodian() {
         let custodian = custodian(&[TransportProfile::Stream]);
-        let requester = requester(&custodian, TransportProfile::Stream);
-        begin_both(
-            &requester,
-            STREAM_CANDIDATE_ID,
-            PAIRING_CODE,
-            &custodian,
-            STREAM_CANDIDATE_ID,
-            PAIRING_CODE,
-        );
-        exchange_through_step2(&requester, &custodian).expect("T_B verifies");
+        let (requester, verdict) =
+            attempt_through_step2(&custodian, &Attempt::honest(STARTED_AT_MS));
+        verdict.expect("T_B verifies");
         let mut step3 = requester
             .write_cpace_frame(STARTED_AT_MS + 4)
             .expect("requester writes step 3");
@@ -1746,6 +1833,39 @@ impl RappPairingBackoff {
         self.backoff
             .lock()
             .map_err(|_| RappBindingError::LocalStateFailure)
+    }
+}
+
+/// The §3.3.8 limit of one pre-authentication attempt per 500 ms for a
+/// custodian's connection accepts. The platform calls [`Self::admit`] for
+/// every accepted pairing or session connection before reading its routing
+/// preamble, and closes the connection unanswered when it returns `false`.
+/// The pairing bridge applies its own instance to CPace starts.
+#[derive(Debug, Default, uniffi::Object)]
+pub struct RappPreAuthenticationLimiter {
+    limit: Mutex<PreAuthenticationRateLimit>,
+}
+
+#[uniffi::export]
+impl RappPreAuthenticationLimiter {
+    /// A limiter that has admitted nothing yet.
+    #[uniffi::constructor]
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Admit one pre-authentication attempt at the platform's monotonic
+    /// `now_monotonic_ms`, or refuse it inside the 500 ms spacing.
+    ///
+    /// # Errors
+    /// [`RappBindingError::LocalStateFailure`] on a poisoned lock.
+    pub fn admit(&self, now_monotonic_ms: u64) -> Result<bool, RappBindingError> {
+        Ok(self
+            .limit
+            .lock()
+            .map_err(|_| RappBindingError::LocalStateFailure)?
+            .admit(now_monotonic_ms))
     }
 }
 

@@ -102,7 +102,9 @@ pub use pairing::{
     encode_pair_record, encode_pair_records,
 };
 pub use pairing_attempts::{
-    CPACE_ATTEMPT_WINDOW_MS, CpaceAttemptLedger, MAXIMUM_CPACE_ATTEMPTS, PairingBackoff,
+    CPACE_ATTEMPT_WINDOW_MS, CpaceAttemptLedger, MAXIMUM_CPACE_ATTEMPTS, POST_PAKE_CONFIRMATION_MS,
+    POST_PAKE_HANDSHAKE_MS, PRE_AUTHENTICATION_SPACING_MS, PairingBackoff,
+    PreAuthenticationRateLimit, phase_deadline_ms,
 };
 pub use pairing_flow::{
     PairingAttemptFailure, PairingConfirmation, PairingError, PairingHandshake,

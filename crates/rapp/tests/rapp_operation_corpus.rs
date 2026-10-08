@@ -1,7 +1,7 @@
 // Copyright 2026 Petri Koistinen
 // Licensed under the Apache License, Version 2.0.
 
-//! Byte-exact replay of the RAPP v26.10.1 operation-message corpus.
+//! Byte-exact replay of the RAPP v26.10.9 operation-message corpus.
 //!
 //! Every body decodes into its typed message and re-encodes to the identical
 //! bytes, so an independently written peer and this crate put the same bytes
@@ -16,7 +16,7 @@ use refineid_rapp::{
 };
 use serde::Deserialize;
 
-const CORPUS: &str = include_str!("../../../docs/protocols/vectors/rapp-operation-v26.10.1.json");
+const CORPUS: &str = include_str!("../../../docs/protocols/vectors/rapp-operation-v26.10.9.json");
 
 #[derive(Deserialize)]
 struct Corpus {
@@ -89,7 +89,8 @@ fn typed(vector: &Vector, inputs: &FixedInputs) -> TypedMessage {
 fn corpus_names_this_protocol_version() {
     let corpus = corpus();
     assert_eq!(corpus.format, "fi.refineid.rapp.operation-vectors-v1");
-    assert_eq!(corpus.protocol_document_version, "26.10.1");
+    assert_eq!(corpus.protocol_document_version, "26.10.9");
+    assert_eq!(corpus.vectors.len(), 31);
 }
 
 #[test]
@@ -186,6 +187,13 @@ fn registry_values_decode_to_their_meaning() {
     assert!(tombstone.retired);
     assert_eq!(tombstone.status, ResultStatus::Completed);
     assert_eq!(tombstone.error, Some(ResultError::OperationAlreadyRetired));
+
+    let TypedMessage::OperationResult(typo) = find("result-rejected-invalid-credential") else {
+        panic!("result-rejected-invalid-credential is a result");
+    };
+    assert_eq!(typo.status, ResultStatus::Rejected);
+    assert_eq!(typo.error, Some(ResultError::InvalidCredential));
+    assert_eq!(typo.remaining_retries, Some(2));
 
     let TypedMessage::OperationResult(blocked) = find("result-credential-rejected-card-blocked")
     else {

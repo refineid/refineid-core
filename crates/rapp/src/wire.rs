@@ -17,7 +17,7 @@
 use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{MAX_FRAME_PLAINTEXT, SESSION_ID_SIZE, SessionId, WIRE_VERSION_V26_10_1};
+use super::{MAX_FRAME_PLAINTEXT, SESSION_ID_SIZE, SessionId, WIRE_VERSION_V26_10_9};
 
 const MAX_NESTING_DEPTH: usize = 8;
 const MAX_TEXT_SIZE: usize = 4_096;
@@ -195,9 +195,9 @@ impl Envelope {
         map.insert(
             "version".to_owned(),
             WireValue::Array(vec![
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.0)),
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.1)),
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.2)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_9.0)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_9.1)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_9.2)),
             ]),
         );
         map.insert(
@@ -257,9 +257,9 @@ impl Envelope {
         let version = take_array(&mut map, "version")?;
         if version.as_slice()
             != [
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.0)),
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.1)),
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.2)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_9.0)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_9.1)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_9.2)),
             ]
         {
             return Err(WireError::UnsupportedVersion);
@@ -1235,8 +1235,12 @@ mod tests {
             panic!("missing version in envelope");
         };
 
-        let context_bytes = crate::cpace::standard_pairing_context_v2(&[0xaa; 32])
-            .expect("pairing context encodes");
+        let context_bytes = crate::cpace::standard_pairing_context_v2(
+            &[0xaa; 32],
+            crate::BLE_PROFILE,
+            crate::BLE_CANDIDATE_ID,
+        )
+        .expect("pairing context encodes");
         let WireValue::Array(context_array) =
             decode_deterministic_cbor(&context_bytes).expect("valid CBOR")
         else {
@@ -1248,9 +1252,9 @@ mod tests {
         assert_eq!(
             envelope_version,
             &WireValue::Array(vec![
-                WireValue::Unsigned(u64::from(crate::WIRE_VERSION_V26_10_1.0)),
-                WireValue::Unsigned(u64::from(crate::WIRE_VERSION_V26_10_1.1)),
-                WireValue::Unsigned(u64::from(crate::WIRE_VERSION_V26_10_1.2)),
+                WireValue::Unsigned(u64::from(crate::WIRE_VERSION_V26_10_9.0)),
+                WireValue::Unsigned(u64::from(crate::WIRE_VERSION_V26_10_9.1)),
+                WireValue::Unsigned(u64::from(crate::WIRE_VERSION_V26_10_9.2)),
             ])
         );
     }

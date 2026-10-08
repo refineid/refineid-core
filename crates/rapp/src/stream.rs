@@ -12,17 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The `fi.refineid.stream.v1` transport profile's protocol bytes.
+//! The `fi.refineid.stream.v1` transport profile's routing preamble.
 //!
-//! The stream profile (specification Section 16.1) carries RAPP frames over
-//! one reliable ordered byte stream. The requester listens and the proxy
-//! dials, for both pairing and sessions; Noise roles are unchanged. This
-//! module owns the profile's two byte formats — the plaintext rendezvous
-//! preamble and the offer candidate parameters — so that every platform
-//! produces identical bytes. Socket I/O and the length-prefix framing live
-//! in platform adapters, never here.
+//! The stream profile (RAPP v26.10.9 §2.2.2) carries RAPP frames over one
+//! reliable ordered byte stream, each frame behind a 2-byte big-endian
+//! length. The custodian listens and the requester dials, for both pairing
+//! and sessions, and the requester's first frame is the routing preamble
+//! this module encodes (§2.2.1). Socket I/O and the length-prefix framing
+//! live in platform adapters, never here.
 
-use std::collections::BTreeMap;
+use hmac::{
+    Hmac,
+    digest::{KeyInit, Mac},
+};
+use sha2::Sha256;
 
 use super::{RendezvousToken, WireValue, decode_deterministic_cbor, encode_deterministic_cbor};
 
@@ -38,25 +41,54 @@ const PURPOSE_PAIRING: &str = "pairing";
 /// Preamble purpose naming a session attempt for a stored pairing.
 const PURPOSE_SESSION: &str = "session";
 
+/// HKDF-Expand info naming the discovery-hint key (hierarchy §4.3).
+const DISCOVERY_HINT_INFO: &[u8] = b"RAPP-discovery-hint-v1";
+
+/// The single-block counter byte of HKDF-Expand for a 32-byte output.
+const HKDF_FIRST_BLOCK: u8 = 1;
+
+/// Byte length of one published discovery hint.
+pub const DISCOVERY_HINT_SIZE: usize = 8;
+
+/// Length in seconds of one discovery-hint epoch.
+pub const DISCOVERY_HINT_EPOCH_SECONDS: u64 = 900;
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// The rotating discovery hint a custodian MAY publish for one stored
+/// pairing in `epoch` = floor(unix time / 900) (hierarchy specification
+/// §4.3).
+///
+/// `K_disc` is HKDF-Expand-SHA-256 with the 16-byte `rendezvous_token` as
+/// PRK, info `"RAPP-discovery-hint-v1"`, and 32 output bytes, which is the
+/// single block `HMAC-SHA-256(token, info || 0x01)`; the hint is the first 8
+/// bytes of `HMAC-SHA-256(K_disc, epoch as 8-byte big-endian)`.
+#[must_use]
+pub fn discovery_hint(token: &RendezvousToken, epoch: u64) -> [u8; DISCOVERY_HINT_SIZE] {
+    let mut expand = <HmacSha256 as KeyInit>::new_from_slice(token.as_bytes())
+        .expect("HMAC accepts any key length");
+    expand.update(DISCOVERY_HINT_INFO);
+    expand.update(&[HKDF_FIRST_BLOCK]);
+    let key = expand.finalize().into_bytes();
+    let mut hint =
+        <HmacSha256 as KeyInit>::new_from_slice(&key).expect("HMAC accepts any key length");
+    hint.update(&epoch.to_be_bytes());
+    let digest = hint.finalize().into_bytes();
+    let mut out = [0_u8; DISCOVERY_HINT_SIZE];
+    out.copy_from_slice(&digest[..DISCOVERY_HINT_SIZE]);
+    out
+}
+
 /// Upper bound on an encoded rendezvous preamble frame. The accepting
 /// endpoint rejects a longer preamble before parsing it.
 pub const MAX_STREAM_RENDEZVOUS_FRAME: usize = 64;
 
-/// Candidate parameter key carrying the listener endpoint list.
-const PARAMETER_ENDPOINTS: &str = "endpoints";
-
-/// Maximum listener endpoints one stream candidate may carry.
-pub const MAX_STREAM_ENDPOINTS: usize = 8;
-
-/// Maximum UTF-8 bytes of one `host:port` endpoint literal.
-pub const MAX_STREAM_ENDPOINT_BYTES: usize = 255;
-
-/// One plaintext rendezvous preamble, the first frame the dialing proxy
-/// sends on a fresh stream connection before any Noise message.
+/// One plaintext routing preamble, the first frame the dialing requester
+/// sends on a fresh stream connection.
 ///
 /// The preamble is unauthenticated routing metadata, exactly like a relay
-/// token: it selects which handshake the accepting requester initiates and
-/// enables nothing else.
+/// token: it selects whether the listening custodian serves its offer or
+/// opens a session, and enables nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamRendezvous {
     /// Connect to the listener's currently active pairing offer.
@@ -85,8 +117,8 @@ impl StreamRendezvous {
 
     /// Decode and validate one received preamble frame payload.
     ///
-    /// Every failure is pre-authentication invalid input (specification
-    /// Section 14.5, class 1): the caller closes the connection and changes
+    /// Every failure is pre-authentication invalid input (RAPP v26.10.9
+    /// §10.1, class 1): the caller closes the connection and changes
     /// no stored state.
     ///
     /// # Errors
@@ -128,75 +160,7 @@ impl StreamRendezvous {
     }
 }
 
-/// Validated `fi.refineid.stream.v1` candidate parameters from a pairing
-/// offer: the requester's listener addresses as `host:port` literals.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StreamCandidateParameters {
-    endpoints: Vec<String>,
-}
-
-impl StreamCandidateParameters {
-    /// Validate listener endpoint literals for placement in an offer.
-    ///
-    /// # Errors
-    /// [`StreamError`] on an out-of-bounds endpoint count or literal length.
-    pub fn new(endpoints: Vec<String>) -> Result<Self, StreamError> {
-        if endpoints.is_empty() || endpoints.len() > MAX_STREAM_ENDPOINTS {
-            return Err(StreamError::EndpointCount);
-        }
-        if endpoints
-            .iter()
-            .any(|endpoint| endpoint.is_empty() || endpoint.len() > MAX_STREAM_ENDPOINT_BYTES)
-        {
-            return Err(StreamError::EndpointLength);
-        }
-        Ok(Self { endpoints })
-    }
-
-    /// Listener addresses in the requester's stated preference order.
-    #[must_use]
-    pub fn endpoints(&self) -> &[String] {
-        &self.endpoints
-    }
-
-    /// Candidate `parameters` map for the pairing offer.
-    #[must_use]
-    pub fn to_parameters(&self) -> BTreeMap<String, WireValue> {
-        let endpoints = self
-            .endpoints
-            .iter()
-            .map(|endpoint| WireValue::Text(endpoint.clone()))
-            .collect();
-        let mut parameters = BTreeMap::new();
-        parameters.insert(PARAMETER_ENDPOINTS.to_owned(), WireValue::Array(endpoints));
-        parameters
-    }
-
-    /// Reconstruct and validate parameters scanned from an offer or loaded
-    /// from a stored pairing's transport binding.
-    ///
-    /// # Errors
-    /// [`StreamError`] on unknown keys, wrong types, or out-of-bounds
-    /// endpoints.
-    pub fn from_parameters(parameters: &BTreeMap<String, WireValue>) -> Result<Self, StreamError> {
-        if parameters.len() != 1 {
-            return Err(StreamError::Malformed);
-        }
-        let Some(WireValue::Array(elements)) = parameters.get(PARAMETER_ENDPOINTS) else {
-            return Err(StreamError::Malformed);
-        };
-        let endpoints = elements
-            .iter()
-            .map(|element| match element {
-                WireValue::Text(endpoint) => Ok(endpoint.clone()),
-                _ => Err(StreamError::Malformed),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Self::new(endpoints)
-    }
-}
-
-/// Rejected stream-profile bytes or parameters.
+/// Rejected stream-profile bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamError {
     /// Structure, domain, type, or token length was not exactly as specified.
@@ -205,10 +169,6 @@ pub enum StreamError {
     Oversized,
     /// Purpose string is not registered; the connection closes unanswered.
     UnknownPurpose,
-    /// Candidate carried no endpoint or more than [`MAX_STREAM_ENDPOINTS`].
-    EndpointCount,
-    /// An endpoint literal was empty or exceeded [`MAX_STREAM_ENDPOINT_BYTES`].
-    EndpointLength,
 }
 
 impl core::fmt::Display for StreamError {
@@ -310,41 +270,6 @@ mod tests {
         assert_eq!(
             StreamRendezvous::decode(&oversized),
             Err(StreamError::Oversized)
-        );
-    }
-
-    #[test]
-    fn candidate_parameters_round_trip() {
-        let parameters = StreamCandidateParameters::new(vec![
-            "192.0.2.10:47110".to_owned(),
-            "[2001:db8::10]:47110".to_owned(),
-        ])
-        .expect("candidate");
-        let map = parameters.to_parameters();
-        assert_eq!(
-            StreamCandidateParameters::from_parameters(&map).expect("reconstruct"),
-            parameters
-        );
-    }
-
-    #[test]
-    fn candidate_parameters_reject_unknown_keys() {
-        let parameters =
-            StreamCandidateParameters::new(vec!["192.0.2.10:47110".to_owned()]).expect("candidate");
-        let mut map = parameters.to_parameters();
-        map.insert("relay".to_owned(), WireValue::Null);
-        assert_eq!(
-            StreamCandidateParameters::from_parameters(&map),
-            Err(StreamError::Malformed)
-        );
-    }
-
-    #[test]
-    fn candidate_parameters_bound_endpoint_count() {
-        let endpoints = vec!["192.0.2.10:47110".to_owned(); MAX_STREAM_ENDPOINTS + 1];
-        assert_eq!(
-            StreamCandidateParameters::new(endpoints),
-            Err(StreamError::EndpointCount)
         );
     }
 }

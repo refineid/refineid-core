@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use refineid_rapp::{
-    OperationId, ProfileName, RendezvousToken, SessionId, StreamError, StreamRendezvous, WireValue,
+    OperationId, PairId, ProfileName, RendezvousToken, StreamError, StreamRendezvous, WireValue,
     compute_grants_hash, compute_request_hash, decode_deterministic_cbor, derive_pair_id,
     derive_rendezvous_token, derive_session_id, encode_deterministic_cbor,
 };
@@ -275,9 +275,12 @@ fn grants_hash_normalizes_profile_order_and_matches_golden_values() {
 #[test]
 fn request_hash_preimage_and_digest_match_golden_values() {
     for vector in corpus().request_hash {
-        let session_bytes = decode_hex(&vector.session_id_hex);
+        // The corpus still names the second preimage slot by its earlier
+        // session role; section 8.2.1 binds the pair identifier there, and
+        // the 16 bytes hash identically.
+        let pair_bytes = decode_hex(&vector.session_id_hex);
         let operation_bytes = decode_hex(&vector.operation_id_hex);
-        let session_id = SessionId::reconstruct(&session_bytes).expect("session id length");
+        let pair_id = PairId::reconstruct(&pair_bytes).expect("pair id length");
         let operation_id = OperationId::reconstruct(&operation_bytes).expect("operation id length");
         let profile = ProfileName::parse(&vector.profile).expect("registered profile");
         let context = to_wire_map(vector.context.clone());
@@ -285,7 +288,7 @@ fn request_hash_preimage_and_digest_match_golden_values() {
 
         let preimage = WireValue::Array(vec![
             WireValue::Text("RAPP-request-v1".into()),
-            WireValue::Bytes(session_bytes),
+            WireValue::Bytes(pair_bytes),
             WireValue::Bytes(operation_bytes),
             WireValue::Text(profile.as_str().into()),
             WireValue::Text(vector.action.clone()),
@@ -300,7 +303,7 @@ fn request_hash_preimage_and_digest_match_golden_values() {
         );
 
         let actual = compute_request_hash(
-            session_id,
+            pair_id,
             operation_id,
             profile,
             &vector.action,

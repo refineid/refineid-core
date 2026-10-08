@@ -4,9 +4,9 @@ use core::fmt;
 
 use super::{
     CardOperationError, CardOperationResult, OperationId, OperationRequest, OperationState,
-    ProgressEvent, ProtocolErrorMessage, RequesterCancelAction, RequesterError,
-    RequesterJournalRecord, RequesterJournalStore, RequesterOperation, RequesterRecoveryStore,
-    RequesterResultAction, StatusReport, TypedMessage,
+    ProgressEvent, ProtocolErrorMessage, RequesterError, RequesterJournalRecord,
+    RequesterJournalStore, RequesterOperation, RequesterRecoveryStore, RequesterResultAction,
+    ResultError, ResultStatus, StatusReport, TypedMessage,
 };
 
 /// All live and terminal requester operations for one paired endpoint.
@@ -49,13 +49,15 @@ impl RequesterOperationEngine {
             {
                 return Err(RequesterEngineError::LocalInvariantFailure);
             }
+            // A request that was sent and never answered may have been
+            // executed after consent, so it is ambiguous until reconciled.
             let next = match records[index].state {
-                OperationState::Requested
-                | OperationState::AwaitingConsent
-                | OperationState::Prepared => Some(OperationState::Cancelled),
-                OperationState::Committed | OperationState::Executing => {
-                    Some(OperationState::Ambiguous)
+                OperationState::AwaitingConsent | OperationState::Prepared => {
+                    Some(OperationState::Cancelled)
                 }
+                OperationState::Requested
+                | OperationState::Committed
+                | OperationState::Executing => Some(OperationState::Ambiguous),
                 OperationState::ResultPending => Some(OperationState::DeliveryUncertain),
                 OperationState::None => {
                     return Err(RequesterEngineError::LocalInvariantFailure);
@@ -100,23 +102,7 @@ impl RequesterOperationEngine {
         Ok(message)
     }
 
-    /// Persist requester commit before releasing the exact commit message.
-    ///
-    /// # Errors
-    /// [`RequesterEngineError`] on an unknown operation, an illegal state,
-    /// or a persistence failure.
-    pub fn commit<S: RequesterJournalStore>(
-        &mut self,
-        store: &mut S,
-        operation_id: OperationId,
-    ) -> Result<TypedMessage, RequesterEngineError<S::Error>> {
-        let operation = self
-            .operation_mut(operation_id)
-            .ok_or(RequesterEngineError::UnknownLocalOperation)?;
-        operation.commit(store).map_err(map_requester_error)
-    }
-
-    /// Persist local cancellation and return the exact message to release.
+    /// Abandon one request locally; no message travels.
     ///
     /// # Errors
     /// [`RequesterEngineError`] on an unknown operation, an illegal state,
@@ -125,12 +111,11 @@ impl RequesterOperationEngine {
         &mut self,
         store: &mut S,
         operation_id: OperationId,
-        reason: Option<String>,
-    ) -> Result<RequesterCancelAction, RequesterEngineError<S::Error>> {
+    ) -> Result<OperationState, RequesterEngineError<S::Error>> {
         let operation = self
             .operation_mut(operation_id)
             .ok_or(RequesterEngineError::UnknownLocalOperation)?;
-        operation.cancel(store, reason).map_err(map_requester_error)
+        operation.cancel(store).map_err(map_requester_error)
     }
 
     /// Classify one authenticated inbound message without leaving sequencing
@@ -149,9 +134,12 @@ impl RequesterOperationEngine {
         }
         if let TypedMessage::Error(error) = &message {
             return Ok(match *error {
-                ProtocolErrorMessage::Busy => RequesterDispatch::PeerBusy,
+                ProtocolErrorMessage::OperationFailed(_) => RequesterDispatch::PeerBusy,
                 ProtocolErrorMessage::UnknownOperation(operation_id) => {
                     RequesterDispatch::PeerUnknownOperation(operation_id)
+                }
+                ProtocolErrorMessage::DuplicateOperation(operation_id) => {
+                    RequesterDispatch::PeerUnknownOperation(Some(operation_id))
                 }
             });
         }
@@ -173,12 +161,6 @@ impl RequesterOperationEngine {
         }
 
         match message {
-            TypedMessage::OperationPrepared(reference) => {
-                self.operations[index]
-                    .receive_prepared(store, reference)
-                    .map_err(map_requester_error)?;
-                Ok(RequesterDispatch::Prepared(operation_id))
-            }
             TypedMessage::OperationResult(result) => {
                 let action = self.operations[index]
                     .receive_result(store, result)
@@ -190,19 +172,18 @@ impl RequesterOperationEngine {
                             message,
                         }
                     }
-                    RequesterResultAction::Terminal(state) => RequesterDispatch::Terminal {
+                    RequesterResultAction::Terminal {
+                        state,
+                        status,
+                        error,
+                        remaining_retries,
+                    } => RequesterDispatch::Terminal {
                         operation_id,
                         state,
+                        status,
+                        error,
+                        remaining_retries,
                     },
-                })
-            }
-            TypedMessage::OperationCancel(cancellation) => {
-                let state = self.operations[index]
-                    .receive_cancel(store, &cancellation)
-                    .map_err(map_requester_error)?;
-                Ok(RequesterDispatch::CancellationReceived {
-                    operation_id,
-                    state,
                 })
             }
             TypedMessage::OperationProgress(progress) => {
@@ -342,8 +323,6 @@ impl RequesterOperationEngine {
 /// Required caller action after dispatching an inbound operation message.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RequesterDispatch {
-    /// Proxy is ready; the requester decides whether to commit.
-    Prepared(OperationId),
     /// Release this acknowledgment for the completed result.
     SendResultAcknowledgment {
         /// Acknowledged operation.
@@ -357,13 +336,12 @@ pub enum RequesterDispatch {
         operation_id: OperationId,
         /// Journaled terminal state.
         state: OperationState,
-    },
-    /// Peer cancellation was journaled.
-    CancellationReceived {
-        /// Cancelled operation.
-        operation_id: OperationId,
-        /// Journaled terminal state.
-        state: OperationState,
+        /// Status the result reported.
+        status: ResultStatus,
+        /// Error the result named.
+        error: Option<ResultError>,
+        /// Remaining credential attempts the result reported.
+        remaining_retries: Option<u8>,
     },
     /// Authenticated status report was stored as a journal annotation.
     StatusAnnotated(OperationId),
@@ -376,7 +354,7 @@ pub enum RequesterDispatch {
     },
     /// Stale or advisory progress update; ignore without sending error response.
     IgnoredProgress(OperationId),
-    /// Peer already serves a live session for this pairing.
+    /// The peer could not admit the operation, such as while another runs.
     PeerBusy,
     /// Peer answered a stale reference; a normal race.
     PeerUnknownOperation(Option<OperationId>),
@@ -401,10 +379,8 @@ const fn stale(operation_id: OperationId) -> RequesterDispatch {
 const fn referenced_operation_id(message: &TypedMessage) -> Option<OperationId> {
     match message {
         TypedMessage::OperationRequest(request) => Some(request.operation_id),
-        TypedMessage::OperationPrepared(reference)
-        | TypedMessage::OperationCommit(reference)
-        | TypedMessage::OperationResultAck(reference) => Some(reference.operation_id),
-        TypedMessage::OperationCancel(cancel) => Some(cancel.reference.operation_id),
+        TypedMessage::OperationRequestRefused(refusal) => Some(refusal.reference.operation_id),
+        TypedMessage::OperationResultAck(reference) => Some(reference.operation_id),
         TypedMessage::OperationResult(result) => Some(result.operation_id),
         TypedMessage::OperationStatusRequest(operation_id) => Some(*operation_id),
         TypedMessage::OperationStatus(report) => Some(report.operation_id),
@@ -425,11 +401,6 @@ fn map_requester_error<E>(error: RequesterError<E>) -> RequesterEngineError<E> {
         RequesterError::ReferenceMismatch => RequesterEngineError::AuthenticatedProtocolViolation(
             RequesterViolation::ReferenceMismatch,
         ),
-        RequesterError::UnexpectedPreparedForSafeRead => {
-            RequesterEngineError::AuthenticatedProtocolViolation(
-                RequesterViolation::UnexpectedPreparedForSafeRead,
-            )
-        }
         RequesterError::UnknownOperationRace => RequesterEngineError::LocalRaceClassification,
         RequesterError::MissingResult => RequesterEngineError::LocalInvariantFailure,
     }
@@ -446,8 +417,6 @@ pub enum RequesterViolation {
     IllegalOperationTransition,
     /// Echoed request hash differs from the journal.
     ReferenceMismatch,
-    /// Prepared echo arrived for an action without prepare and commit.
-    UnexpectedPreparedForSafeRead,
 }
 
 /// Requester operation-engine failure.

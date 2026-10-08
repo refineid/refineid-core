@@ -21,13 +21,13 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::{
-    AuthorizedCardCommand, BinaryFrame, CardInspection, CardKeyProfile, CardOperation,
-    CardOperationResult, CertificateKind, EndpointError, EstablishedSessionRuntime, LivenessConfig,
-    OperationId, OperationReference, OperationRequest, OperationResultMessage, OperationState,
-    PairId, PingChallenge, ProfileName, ProxyDispatch, ProxyEngineError, ProxyOperationEngine,
-    RequesterDispatch, RequesterEngineError, RequesterOperationEngine, ResultError, ResultStatus,
-    RuntimeError, RuntimePoll, RuntimeReceive, SessionId, SignatureAlgorithm, TypedMessage,
-    UserApproval,
+    AuthorizedCardCommand, BinaryFrame, CardIdentity, CardInspection, CardKeyProfile,
+    CardOperation, CardOperationResult, CertificateKind, EndpointError, EstablishedSessionRuntime,
+    LivenessConfig, OperationId, OperationReference, OperationRequest, OperationResultMessage,
+    OperationState, PairId, PingChallenge, ProfileName, ProxyDispatch, ProxyEngineError,
+    ProxyFailure, ProxyOperationEngine, RequesterDispatch, RequesterEngineError,
+    RequesterOperationEngine, ResultError, ResultStatus, RuntimeError, RuntimePoll, RuntimeReceive,
+    SessionId, SignatureAlgorithm, TypedMessage, UserApproval,
     bindings::{BindingPairStore, RappBindingError, RappSessionBridge, fixed_array},
     operation_bindings::{BindingOperationStore, RappOperationVault},
 };
@@ -259,19 +259,15 @@ pub enum RappBridgeActionKind {
     Completed,
     /// Operation reached the named terminal state.
     Terminal,
-    /// Operation was safely cancelled.
-    Cancelled,
-    /// Post-commit cancel recorded; the operation continues.
-    AdvisoryCancellation,
     /// Peer acknowledged the completed result.
     ResultAcknowledged,
     /// Advisory progress update reported by peer.
     Progress,
-    /// Peer already serves a live session for this pairing.
+    /// The peer could not admit the operation, such as while another runs.
     PeerBusy,
     /// Peer answered a stale reference; a normal race.
     PeerUnknownOperation,
-    /// Duplicate commit matching the committed hash was discarded.
+    /// An identical retransmission joined the operation already under way.
     IgnoredDuplicate,
     /// Nothing to execute.
     NoAction,
@@ -292,28 +288,44 @@ pub enum RappTerminalReason {
     Cancelled,
     /// Request failed validation or is unsupported.
     RequestInvalidOrUnsupported,
-    /// Fewer than three attempts remained on the decrementable counter.
+    /// The custodian declined to proceed with the card, as its retry floor or
+    /// its storage requires.
     RetryPolicyRefused,
-    /// Card rejected the CAN, PIN 1, or PIN 2.
+    /// The card blocked the credential; the pairing is revoked.
     CredentialRejected,
     /// Card left before transmission provably began.
     CardRemovedBeforeTransmit,
     /// Card completion cannot be proven; retry forbidden.
     CardCompletionAmbiguous,
+    /// The card refused the credential and attempts remain; the pairing
+    /// stays.
+    InvalidCredential,
 }
 
-impl From<ResultError> for RappTerminalReason {
-    fn from(error: ResultError) -> Self {
-        match error {
-            ResultError::UserDenied => Self::UserDenied,
-            ResultError::RequestExpired => Self::RequestExpired,
-            ResultError::Cancelled => Self::Cancelled,
-            ResultError::RequestInvalidOrUnsupported => Self::RequestInvalidOrUnsupported,
-            ResultError::RetryPolicyRefused => Self::RetryPolicyRefused,
-            ResultError::CredentialRejected => Self::CredentialRejected,
-            ResultError::CardRemovedBeforeTransmit => Self::CardRemovedBeforeTransmit,
-            ResultError::CardCompletionAmbiguous => Self::CardCompletionAmbiguous,
+impl RappTerminalReason {
+    /// The reason a failure result names (RAPP v26.10.1 section 10).
+    #[must_use]
+    pub const fn from_result(status: ResultStatus, error: Option<ResultError>) -> Self {
+        match (status, error) {
+            (ResultStatus::Ambiguous, _) => Self::CardCompletionAmbiguous,
+            (ResultStatus::CredentialRejected, _) => Self::CredentialRejected,
+            (ResultStatus::Cancelled, Some(ResultError::CardError)) => {
+                Self::CardRemovedBeforeTransmit
+            }
+            (ResultStatus::Cancelled, _) => Self::RequestExpired,
+            (_, Some(ResultError::UserCancelled | ResultError::UserDeclined)) => Self::UserDenied,
+            (_, Some(ResultError::InvalidCredential)) => Self::InvalidCredential,
+            (_, Some(ResultError::OperationFailed | ResultError::StorageExhausted)) => {
+                Self::RetryPolicyRefused
+            }
+            _ => Self::RequestInvalidOrUnsupported,
         }
+    }
+}
+
+impl From<ProxyFailure> for RappTerminalReason {
+    fn from(failure: ProxyFailure) -> Self {
+        Self::from_result(failure.status(), Some(failure.error()))
     }
 }
 
@@ -329,10 +341,15 @@ pub struct RappBridgeAction {
     pub operation: Option<RappOperationDescriptor>,
     /// Opaque encrypted frame for the transport.
     pub frame: Option<Vec<u8>>,
+    /// Further opaque frames to deliver after `frame`, in order, such as the
+    /// result a status report re-delivers.
+    pub additional_frames: Vec<Vec<u8>>,
     /// Journaled terminal state name.
     pub terminal_state: Option<String>,
     /// Stable terminal reason.
     pub terminal_reason: Option<RappTerminalReason>,
+    /// Remaining credential attempts an invalid-credential result reports.
+    pub remaining_retries: Option<u8>,
     /// Advisory progress event.
     pub progress_event: Option<RappProgressEvent>,
     /// The session must close after this frame is delivered.
@@ -348,8 +365,10 @@ impl RappBridgeAction {
             operation_id: None,
             operation: None,
             frame: None,
+            additional_frames: Vec::new(),
             terminal_state: None,
             terminal_reason: None,
+            remaining_retries: None,
             progress_event: None,
             close_session_after_send: false,
             next_poll_at_ms: None,
@@ -374,8 +393,10 @@ impl RappBridgeAction {
             operation_id: operation_id.map(|id| id.as_bytes().to_vec()),
             operation: None,
             frame: Some(frame.into_bytes()),
+            additional_frames: Vec::new(),
             terminal_state: None,
             terminal_reason: None,
+            remaining_retries: None,
             progress_event: None,
             close_session_after_send,
             next_poll_at_ms: None,
@@ -430,6 +451,9 @@ pub enum RappResultKind {
 pub struct RappOperationResult {
     /// Registered result shape.
     pub kind: RappResultKind,
+    /// The card's answer to reset, or its historical bytes; empty when the
+    /// custodian's platform exposes neither.
+    pub answer_to_reset: Vec<u8>,
     /// Whether PIN 1 is still in factory state.
     pub pin1_factory: Option<bool>,
     /// Whether PIN 2 is still in factory state.
@@ -440,63 +464,67 @@ pub struct RappOperationResult {
     pub pin2_attempts: Option<u8>,
     /// Remaining PUK try counter.
     pub puk_attempts: Option<u8>,
-    /// Cardholder display name.
-    pub display_name: Option<String>,
-    /// Cardholder person identifier.
-    pub person_id: Option<String>,
+    /// Cardholder name (section 9.1 `card_holder_name`).
+    pub holder_name: Option<String>,
+    /// Card identifier (section 9.1 `card_id`).
+    pub card_id: Option<String>,
+    /// Issuance date, `YYYY-MM-DD`.
+    pub issuance_date: Option<String>,
+    /// Expiration date, `YYYY-MM-DD`.
+    pub expiration_date: Option<String>,
+    /// DER-encoded certificates of an identity read.
+    pub certificates: Vec<Vec<u8>>,
     /// Certificate or signature bytes.
     pub bytes: Vec<u8>,
+}
+
+impl RappOperationResult {
+    const fn empty(kind: RappResultKind) -> Self {
+        Self {
+            kind,
+            answer_to_reset: Vec::new(),
+            pin1_factory: None,
+            pin2_factory: None,
+            pin1_attempts: None,
+            pin2_attempts: None,
+            puk_attempts: None,
+            holder_name: None,
+            card_id: None,
+            issuance_date: None,
+            expiration_date: None,
+            certificates: Vec::new(),
+            bytes: Vec::new(),
+        }
+    }
 }
 
 impl From<CardOperationResult> for RappOperationResult {
     fn from(result: CardOperationResult) -> Self {
         match result {
             CardOperationResult::Inspection(value) => Self {
-                kind: RappResultKind::Inspection,
+                answer_to_reset: value.answer_to_reset,
                 pin1_factory: Some(value.pin1_factory),
                 pin2_factory: Some(value.pin2_factory),
                 pin1_attempts: value.pin1_attempts,
                 pin2_attempts: value.pin2_attempts,
                 puk_attempts: value.puk_attempts,
-                display_name: None,
-                person_id: None,
-                bytes: Vec::new(),
+                ..Self::empty(RappResultKind::Inspection)
             },
-            CardOperationResult::Identity {
-                display_name,
-                person_id,
-            } => Self {
-                kind: RappResultKind::Identity,
-                pin1_factory: None,
-                pin2_factory: None,
-                pin1_attempts: None,
-                pin2_attempts: None,
-                puk_attempts: None,
-                display_name: Some(display_name),
-                person_id: Some(person_id),
-                bytes: Vec::new(),
+            CardOperationResult::Identity(identity) => Self {
+                holder_name: Some(identity.holder_name),
+                card_id: Some(identity.card_id),
+                issuance_date: Some(identity.issuance_date),
+                expiration_date: Some(identity.expiration_date),
+                certificates: identity.certificates,
+                ..Self::empty(RappResultKind::Identity)
             },
             CardOperationResult::Certificate(bytes) => Self {
-                kind: RappResultKind::Certificate,
-                pin1_factory: None,
-                pin2_factory: None,
-                pin1_attempts: None,
-                pin2_attempts: None,
-                puk_attempts: None,
-                display_name: None,
-                person_id: None,
                 bytes,
+                ..Self::empty(RappResultKind::Certificate)
             },
             CardOperationResult::Signature(bytes) => Self {
-                kind: RappResultKind::Signature,
-                pin1_factory: None,
-                pin2_factory: None,
-                pin1_attempts: None,
-                pin2_attempts: None,
-                puk_attempts: None,
-                display_name: None,
-                person_id: None,
                 bytes,
+                ..Self::empty(RappResultKind::Signature)
             },
         }
     }
@@ -777,10 +805,6 @@ impl RappOperationBridge {
                         return Ok(action);
                     }
                 };
-                let terminal_reason = match &message {
-                    TypedMessage::OperationResult(result) => result.error.map(Into::into),
-                    _ => None,
-                };
                 let dispatch = match engine.receive(journal, message) {
                     Ok(dispatch) => dispatch,
                     Err(RequesterEngineError::AuthenticatedProtocolViolation(violation)) => {
@@ -792,10 +816,14 @@ impl RappOperationBridge {
                     }
                     Err(_) => return Err(RappBindingError::LocalStateFailure),
                 };
-                let credential_rejected =
-                    terminal_reason == Some(RappTerminalReason::CredentialRejected);
-                let mut action =
-                    requester_dispatch(runtime, journal, engine, dispatch, terminal_reason)?;
+                let credential_rejected = matches!(
+                    dispatch,
+                    RequesterDispatch::Terminal {
+                        status: ResultStatus::CredentialRejected,
+                        ..
+                    }
+                );
+                let mut action = requester_dispatch(runtime, journal, engine, dispatch)?;
                 if credential_rejected {
                     runtime
                         .endpoint_mut()
@@ -836,18 +864,17 @@ impl RappOperationBridge {
                     TypedMessage::OperationRequest(request) => Some(request.clone()),
                     _ => None,
                 };
-                let dispatch =
-                    match engine.receive(journal, message, now_ms, self.maximum_lifetime_ms) {
-                        Ok(dispatch) => dispatch,
-                        Err(ProxyEngineError::AuthenticatedProtocolViolation(violation)) => {
-                            let _ = runtime
-                                .endpoint_mut()
-                                .revoke_proxy_violation(pair_store, now_ms, violation);
-                            *state = OperationBridgeState::Revoked;
-                            return Ok(RappBridgeAction::simple(RappBridgeActionKind::PairRevoked));
-                        }
-                        Err(_) => return Err(RappBindingError::LocalStateFailure),
-                    };
+                let dispatch = match engine.receive(journal, message, now_ms) {
+                    Ok(dispatch) => dispatch,
+                    Err(ProxyEngineError::AuthenticatedProtocolViolation(violation)) => {
+                        let _ = runtime
+                            .endpoint_mut()
+                            .revoke_proxy_violation(pair_store, now_ms, violation);
+                        *state = OperationBridgeState::Revoked;
+                        return Ok(RappBridgeAction::simple(RappBridgeActionKind::PairRevoked));
+                    }
+                    Err(_) => return Err(RappBindingError::LocalStateFailure),
+                };
                 if let Some(request) = incoming_request
                     && matches!(dispatch, ProxyDispatch::InspectPrerequisites(_))
                 {
@@ -916,12 +943,16 @@ impl RappOperationBridge {
             .map_err(|_| RappBindingError::InvalidInput)?;
         let dispatch = engine
             .approve(
+                journal,
                 operation_id,
                 approval,
                 approved_at_ms,
                 self.maximum_lifetime_ms,
             )
-            .map_err(|_| RappBindingError::WrongPhase)?;
+            .map_err(|error| match error {
+                ProxyEngineError::Persistence(_) => RappBindingError::LocalStateFailure,
+                _ => RappBindingError::WrongPhase,
+            })?;
         let action = proxy_dispatch(runtime, journal, engine, requests, dispatch)?;
         if action_closes_session(&action) {
             *state = OperationBridgeState::Closed;
@@ -935,7 +966,7 @@ impl RappOperationBridge {
     /// # Errors
     /// [`RappBindingError`] on invalid input or the wrong protocol phase.
     pub fn deny(&self, operation_id: Vec<u8>) -> Result<RappBridgeAction, RappBindingError> {
-        self.finish_failure(&operation_id, ResultStatus::Denied, ResultError::UserDenied)
+        self.finish_failure(&operation_id, ProxyFailure::UserDenied)
     }
 
     /// Reject a request whose authenticated descriptor is unsupported or
@@ -947,11 +978,7 @@ impl RappOperationBridge {
         &self,
         operation_id: Vec<u8>,
     ) -> Result<RappBridgeAction, RappBindingError> {
-        self.finish_failure(
-            &operation_id,
-            ResultStatus::Rejected,
-            ResultError::RequestInvalidOrUnsupported,
-        )
+        self.finish_failure(&operation_id, ProxyFailure::RequestInvalidOrUnsupported)
     }
 
     /// Reject the operation because fewer than three attempts remain on the
@@ -963,14 +990,30 @@ impl RappOperationBridge {
         &self,
         operation_id: Vec<u8>,
     ) -> Result<RappBridgeAction, RappBindingError> {
+        self.finish_failure(&operation_id, ProxyFailure::RetryPolicyRefused)
+    }
+
+    /// Record an incorrect CAN, PIN 1, or PIN 2 with attempts remaining
+    /// (section 10.2): emit `invalid_credential` with the remaining count.
+    /// The pairing and the session stay.
+    ///
+    /// # Errors
+    /// [`RappBindingError`] on invalid input or the wrong protocol phase.
+    pub fn invalid_credential(
+        &self,
+        operation_id: Vec<u8>,
+        remaining_retries: u8,
+    ) -> Result<RappBridgeAction, RappBindingError> {
+        if remaining_retries == 0 {
+            return Err(RappBindingError::InvalidInput);
+        }
         self.finish_failure(
             &operation_id,
-            ResultStatus::Rejected,
-            ResultError::RetryPolicyRefused,
+            ProxyFailure::InvalidCredential { remaining_retries },
         )
     }
 
-    /// Record a CAN, PIN 1, or PIN 2 rejection: emit the bounded result,
+    /// Record a blocked credential (section 10.2): emit the bounded result,
     /// revoke the pairing, and close the session.
     ///
     /// # Errors
@@ -994,12 +1037,7 @@ impl RappOperationBridge {
             return Err(RappBindingError::WrongPhase);
         };
         let dispatch = engine
-            .finish_failure(
-                journal,
-                operation_id,
-                ResultStatus::CredentialRejected,
-                ResultError::CredentialRejected,
-            )
+            .finish_failure(journal, operation_id, ProxyFailure::CredentialRejected)
             .map_err(|_| RappBindingError::WrongPhase)?;
         let action = proxy_dispatch(runtime, journal, engine, requests, dispatch)?;
         runtime
@@ -1020,11 +1058,7 @@ impl RappOperationBridge {
         &self,
         operation_id: Vec<u8>,
     ) -> Result<RappBridgeAction, RappBindingError> {
-        self.finish_failure(
-            &operation_id,
-            ResultStatus::Cancelled,
-            ResultError::CardRemovedBeforeTransmit,
-        )
+        self.finish_failure(&operation_id, ProxyFailure::CardRemovedBeforeTransmit)
     }
 
     /// Mark the operation ambiguous; the card command is never repeated.
@@ -1035,11 +1069,7 @@ impl RappOperationBridge {
         &self,
         operation_id: Vec<u8>,
     ) -> Result<RappBridgeAction, RappBindingError> {
-        self.finish_failure(
-            &operation_id,
-            ResultStatus::Ambiguous,
-            ResultError::CardCompletionAmbiguous,
-        )
+        self.finish_failure(&operation_id, ProxyFailure::CardCompletionAmbiguous)
     }
 
     /// Report authenticated advisory progress on an active operation.
@@ -1079,13 +1109,22 @@ impl RappOperationBridge {
         )
     }
 
-    /// Complete a card inspection with factory and retry state.
+    /// Complete a card inspection with the card's answer to reset and its
+    /// factory and retry state.
+    ///
+    /// The answer to reset is the card's own, or its historical bytes; it is
+    /// empty when the platform exposes neither.
     ///
     /// # Errors
     /// [`RappBindingError`] on invalid input or the wrong protocol phase.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the inspection answer fixes every field"
+    )]
     pub fn complete_inspection(
         &self,
         operation_id: Vec<u8>,
+        answer_to_reset: Vec<u8>,
         pin1_factory: bool,
         pin2_factory: bool,
         pin1_attempts: Option<u8>,
@@ -1095,6 +1134,7 @@ impl RappOperationBridge {
         self.complete(
             &operation_id,
             CardOperationResult::Inspection(CardInspection {
+                answer_to_reset,
                 pin1_factory,
                 pin2_factory,
                 pin1_attempts,
@@ -1104,23 +1144,32 @@ impl RappOperationBridge {
         )
     }
 
-    /// Complete an identity read with the cardholder name and identifier.
+    /// Complete an identity read (RAPP v26.10.1 section 9.1).
+    ///
+    /// Both dates are `YYYY-MM-DD`; at least one DER certificate travels.
     ///
     /// # Errors
-    /// [`RappBindingError`] on invalid input or the wrong protocol phase.
+    /// [`RappBindingError`] on a field outside its section 9.1 bounds or the
+    /// wrong protocol phase.
     pub fn complete_identity(
         &self,
         operation_id: Vec<u8>,
-        display_name: String,
-        person_id: String,
+        holder_name: String,
+        card_id: String,
+        issuance_date: String,
+        expiration_date: String,
+        certificates: Vec<Vec<u8>>,
     ) -> Result<RappBridgeAction, RappBindingError> {
-        self.complete(
-            &operation_id,
-            CardOperationResult::Identity {
-                display_name,
-                person_id,
-            },
+        let identity = CardIdentity::reconstruct(
+            holder_name,
+            card_id,
+            issuance_date,
+            expiration_date,
+            certificates,
+            None,
         )
+        .map_err(|_| RappBindingError::InvalidInput)?;
+        self.complete(&operation_id, CardOperationResult::Identity(identity))
     }
 
     /// Complete a certificate read with the certificate bytes.
@@ -1354,8 +1403,7 @@ impl RappOperationBridge {
     fn finish_failure(
         &self,
         operation_id: &[u8],
-        status: ResultStatus,
-        error: ResultError,
+        failure: ProxyFailure,
     ) -> Result<RappBridgeAction, RappBindingError> {
         let operation_id = decode_operation_id(operation_id)?;
         let mut state = self.lock_state()?;
@@ -1370,7 +1418,7 @@ impl RappOperationBridge {
             return Err(RappBindingError::WrongPhase);
         };
         let dispatch = engine
-            .finish_failure(journal, operation_id, status, error)
+            .finish_failure(journal, operation_id, failure)
             .map_err(|_| RappBindingError::WrongPhase)?;
         let action = proxy_dispatch(runtime, journal, engine, requests, dispatch)?;
         if action_closes_session(&action) {
@@ -1402,7 +1450,7 @@ impl RappOperationBridge {
             .finish_completed(
                 journal,
                 operation_id,
-                OperationResultMessage::completed(reference, result),
+                OperationResultMessage::completed(reference, &result),
             )
             .map_err(|_| RappBindingError::WrongPhase)?;
         let action = proxy_dispatch(runtime, journal, engine, requests, dispatch)?;
@@ -1419,22 +1467,8 @@ fn requester_dispatch(
     journal: &mut BindingOperationStore,
     engine: &mut RequesterOperationEngine,
     dispatch: RequesterDispatch,
-    terminal_reason: Option<RappTerminalReason>,
 ) -> Result<RappBridgeAction, RappBindingError> {
     match dispatch {
-        RequesterDispatch::Prepared(operation_id) => {
-            let message = engine
-                .commit(journal, operation_id)
-                .map_err(|_| RappBindingError::LocalStateFailure)?;
-            send_requester(
-                runtime,
-                engine,
-                journal,
-                RappBridgeActionKind::SendFrame,
-                Some(operation_id),
-                &message,
-            )
-        }
         RequesterDispatch::SendResultAcknowledgment {
             operation_id,
             message,
@@ -1449,21 +1483,19 @@ fn requester_dispatch(
         RequesterDispatch::Terminal {
             operation_id,
             state,
+            status,
+            error,
+            remaining_retries,
         } => {
+            // A retired completed result reports the completed state with no
+            // reason; its pruned response does not travel (section 8.2.5).
             let mut action =
                 RappBridgeAction::for_operation(RappBridgeActionKind::Terminal, operation_id);
             action.terminal_state = Some(operation_state_name(state).to_owned());
-            action.terminal_reason = terminal_reason;
-            Ok(action)
-        }
-        RequesterDispatch::CancellationReceived {
-            operation_id,
-            state,
-        } => {
-            let mut action =
-                RappBridgeAction::for_operation(RappBridgeActionKind::Terminal, operation_id);
-            action.terminal_state = Some(operation_state_name(state).to_owned());
-            action.terminal_reason = Some(RappTerminalReason::Cancelled);
+            if status != ResultStatus::Completed {
+                action.terminal_reason = Some(RappTerminalReason::from_result(status, error));
+            }
+            action.remaining_retries = remaining_retries;
             Ok(action)
         }
         RequesterDispatch::StatusAnnotated(operation_id) => Ok(RappBridgeAction::for_operation(
@@ -1533,11 +1565,11 @@ fn proxy_dispatch(
             action.operation = Some((&read.operation).into());
             Ok(action)
         }
-        ProxyDispatch::BeginCardCommand(operation_id) => {
-            let pending = engine
-                .begin_card_command(journal, operation_id)
-                .map_err(|_| RappBindingError::LocalStateFailure)?;
-            let operation = pending.execute(|command: AuthorizedCardCommand| command.operation);
+        ProxyDispatch::ExecuteCardCommand {
+            operation_id,
+            command,
+        } => {
+            let operation = command.execute(|command: AuthorizedCardCommand| command.operation);
             let mut action = RappBridgeAction::for_operation(
                 RappBridgeActionKind::ExecuteCardCommand,
                 operation_id,
@@ -1545,14 +1577,6 @@ fn proxy_dispatch(
             action.operation = Some((&operation).into());
             Ok(action)
         }
-        ProxyDispatch::Cancelled(operation_id) => Ok(RappBridgeAction::for_operation(
-            RappBridgeActionKind::Cancelled,
-            operation_id,
-        )),
-        ProxyDispatch::AdvisoryCancellation(operation_id) => Ok(RappBridgeAction::for_operation(
-            RappBridgeActionKind::AdvisoryCancellation,
-            operation_id,
-        )),
         ProxyDispatch::ResultAcknowledged(operation_id) => {
             requests.retain(|request| request.operation_id != operation_id);
             Ok(RappBridgeAction::for_operation(
@@ -1560,7 +1584,7 @@ fn proxy_dispatch(
                 operation_id,
             ))
         }
-        ProxyDispatch::IgnoredDuplicateCommit(operation_id) => Ok(RappBridgeAction::for_operation(
+        ProxyDispatch::IgnoredDuplicate(operation_id) => Ok(RappBridgeAction::for_operation(
             RappBridgeActionKind::IgnoredDuplicate,
             operation_id,
         )),
@@ -1578,6 +1602,31 @@ fn proxy_dispatch(
         ProxyDispatch::Send(message) => {
             let operation_id = referenced_operation_id(&message);
             send_proxy(runtime, engine, journal, operation_id, &message, false)
+        }
+        ProxyDispatch::SendAll(messages) => {
+            let Some((first, rest)) = messages.split_first() else {
+                return Ok(RappBridgeAction::simple(RappBridgeActionKind::NoAction));
+            };
+            let operation_id = referenced_operation_id(first);
+            let mut action = send_proxy(runtime, engine, journal, operation_id, first, false)?;
+            if action.kind != RappBridgeActionKind::SendFrame {
+                return Ok(action);
+            }
+            for message in rest {
+                match runtime.endpoint_mut().send(message) {
+                    Ok(frame) => action.additional_frames.push(frame.into_bytes()),
+                    Err(_) => {
+                        engine
+                            .session_closed(journal)
+                            .map_err(|_| RappBindingError::LocalStateFailure)?;
+                        runtime.close_session();
+                        return Ok(RappBridgeAction::simple(
+                            RappBridgeActionKind::SessionClosed,
+                        ));
+                    }
+                }
+            }
+            Ok(action)
         }
         ProxyDispatch::SendFailure {
             message,
@@ -1738,10 +1787,8 @@ const fn require_lifetime(maximum_lifetime_ms: u64) -> Result<(), RappBindingErr
 const fn referenced_operation_id(message: &TypedMessage) -> Option<OperationId> {
     match message {
         TypedMessage::OperationRequest(request) => Some(request.operation_id),
-        TypedMessage::OperationPrepared(reference)
-        | TypedMessage::OperationCommit(reference)
-        | TypedMessage::OperationResultAck(reference) => Some(reference.operation_id),
-        TypedMessage::OperationCancel(cancel) => Some(cancel.reference.operation_id),
+        TypedMessage::OperationRequestRefused(refusal) => Some(refusal.reference.operation_id),
+        TypedMessage::OperationResultAck(reference) => Some(reference.operation_id),
         TypedMessage::OperationResult(result) => Some(result.operation_id),
         TypedMessage::OperationStatusRequest(operation_id) => Some(*operation_id),
         TypedMessage::OperationStatus(report) => Some(report.operation_id),

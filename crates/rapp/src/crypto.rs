@@ -540,23 +540,47 @@ pub fn compute_grants_hash(profiles: &[ProfileName]) -> Result<GrantsHash, Crypt
     Ok(GrantsHash::from_array(bytes))
 }
 
-/// Bind the exact typed operation request to its secure channel.
+/// Bind the exact typed operation request to its pairing (RAPP v26.10.1
+/// section 8.2.1).
+///
+/// The commitment is session-independent, so an identical request
+/// retransmitted on a later session of the same pairing hashes the same.
 ///
 /// # Errors
 /// [`CryptoError::Wire`] when deterministic encoding fails.
 pub fn compute_request_hash(
-    session_id: SessionId,
+    pair_id: PairId,
     operation_id: OperationId,
     profile: ProfileName,
     action: &str,
     context: BTreeMap<String, WireValue>,
     payload: BTreeMap<String, WireValue>,
 ) -> Result<RequestHash, CryptoError> {
+    compute_wire_request_hash(
+        pair_id,
+        operation_id,
+        profile.as_str(),
+        action,
+        context,
+        payload,
+    )
+}
+
+/// The section 8.2.1 commitment over a request exactly as the wire carries
+/// it, before its profile name is interpreted.
+pub(crate) fn compute_wire_request_hash(
+    pair_id: PairId,
+    operation_id: OperationId,
+    profile: &str,
+    action: &str,
+    context: BTreeMap<String, WireValue>,
+    payload: BTreeMap<String, WireValue>,
+) -> Result<RequestHash, CryptoError> {
     let preimage = WireValue::Array(vec![
         WireValue::Text("RAPP-request-v1".to_owned()),
-        WireValue::Bytes(session_id.as_bytes().to_vec()),
+        WireValue::Bytes(pair_id.as_bytes().to_vec()),
         WireValue::Bytes(operation_id.as_bytes().to_vec()),
-        WireValue::Text(profile.as_str().to_owned()),
+        WireValue::Text(profile.to_owned()),
         WireValue::Text(action.to_owned()),
         WireValue::Map(context),
         WireValue::Map(payload),

@@ -4,9 +4,9 @@ use core::fmt;
 use std::collections::BTreeMap;
 
 use super::{
-    CancelMessage, CardOperation, CardOperationError, JournalError, JournalStore, OperationId,
-    OperationJournal, OperationRequest, OperationResultMessage, OperationState, PendingCardCommand,
-    RequestHash, ResultJournalStore, ResultStatus, WireValue,
+    CardOperation, CardOperationError, JournalError, JournalStore, OperationId, OperationJournal,
+    OperationRequest, OperationResultMessage, OperationState, PendingCardCommand, RequestHash,
+    ResultJournalStore, ResultStatus, WireValue,
 };
 
 /// Explicit local user approval of one exact operation request.
@@ -41,7 +41,8 @@ impl UserApproval {
     }
 }
 
-/// Closed command handed to the card integration after durable commit.
+/// Closed command handed to the card integration after the durable
+/// in-flight journal entry.
 ///
 /// It carries no CAN, PIN, PUK, or raw APDU. The authorizer obtains required
 /// credentials locally and the platform card adapter maps this semantic
@@ -61,6 +62,11 @@ pub struct AuthorizedSafeRead {
 }
 
 /// One operation from request validation through durable terminal state.
+///
+/// The stage is authoritative before approval; afterwards the journal is,
+/// because only the journal survives a restart. Approval of a consequential
+/// action writes the in-flight entry before the card command exists
+/// (RAPP v26.10.1 section 8.1).
 #[derive(Debug)]
 pub struct AuthorizationTransaction {
     request: OperationRequest,
@@ -113,7 +119,7 @@ impl AuthorizationTransaction {
         }
     }
 
-    /// Protocol-visible state. Before durable commit the transaction stage is
+    /// Protocol-visible state. Before approval the transaction stage is
     /// authoritative; after result creation the journal is authoritative.
     #[must_use]
     pub const fn operation_state(&self) -> OperationState {
@@ -122,8 +128,6 @@ impl AuthorizationTransaction {
             AuthorizationStage::AwaitingConsent | AuthorizationStage::ExecutingSafeRead => {
                 OperationState::AwaitingConsent
             }
-            AuthorizationStage::Prepared => OperationState::Prepared,
-            AuthorizationStage::Committed => OperationState::Committed,
             AuthorizationStage::Executing => OperationState::Executing,
             AuthorizationStage::ResultPending => OperationState::ResultPending,
             AuthorizationStage::Terminal => self.journal.record().state,
@@ -149,197 +153,76 @@ impl AuthorizationTransaction {
         Ok(())
     }
 
-    /// Accepts exact local consent and makes `operation.prepared` available.
+    /// Accepts exact local consent.
+    ///
+    /// A consequential action writes the durable in-flight entry before the
+    /// card command is handed out; if that write fails no command exists.
     ///
     /// # Errors
     /// [`AuthorizationError`] on a wrong stage, an approval that does not
-    /// cover the exact request, or an expired validity interval.
-    pub fn approve(
+    /// cover the exact request, an expired validity interval, or a journal
+    /// failure.
+    pub fn approve<S: JournalStore>(
         &mut self,
+        store: &mut S,
         approval: UserApproval,
         now_ms: u64,
         maximum_lifetime_ms: u64,
-    ) -> Result<ApprovalOutcome, AuthorizationError<()>> {
+    ) -> Result<ApprovalOutcome, AuthorizationError<S::Error>> {
         if self.stage != AuthorizationStage::AwaitingConsent {
             return Err(AuthorizationError::WrongStage(self.stage));
         }
         self.validate_approval(approval, now_ms, maximum_lifetime_ms)?;
-        if self.request.operation.is_consequential() {
-            self.stage = AuthorizationStage::Prepared;
-            Ok(ApprovalOutcome::Prepared(OperationReference {
-                operation_id: self.request.operation_id,
-                request_hash: self.request_hash,
-            }))
-        } else {
+        if !self.request.operation.is_consequential() {
             self.stage = AuthorizationStage::ExecutingSafeRead;
-            Ok(ApprovalOutcome::ExecuteSafeRead(AuthorizedSafeRead {
+            return Ok(ApprovalOutcome::ExecuteSafeRead(AuthorizedSafeRead {
                 operation: self.request.operation.clone(),
-            }))
-        }
-    }
-
-    /// Persists the point of no return only after validating exact approval,
-    /// pair/session binding, and expiry.
-    ///
-    /// # Errors
-    /// [`AuthorizationError`] on a wrong stage, a commit-echo mismatch,
-    /// expiry, or a journal failure.
-    pub fn commit<S: JournalStore>(
-        &mut self,
-        store: &mut S,
-        requester_commit: OperationReference,
-        now_ms: u64,
-        maximum_lifetime_ms: u64,
-    ) -> Result<(), AuthorizationError<S::Error>> {
-        if self.stage != AuthorizationStage::Prepared {
-            return Err(AuthorizationError::WrongStage(self.stage));
-        }
-        if requester_commit.operation_id != self.request.operation_id
-            || requester_commit.request_hash != self.request_hash
-        {
-            return Err(AuthorizationError::CommitMismatch);
-        }
-        if now_ms
-            > self
-                .request
-                .local_deadline_ms(maximum_lifetime_ms)
-                .map_err(|_| AuthorizationError::Expired)?
-        {
-            return Err(AuthorizationError::Expired);
-        }
-        self.journal
-            .commit(store, self.request_hash)
-            .map_err(AuthorizationError::Journal)?;
-        self.stage = AuthorizationStage::Committed;
-        Ok(())
-    }
-
-    /// Atomically records transmission number one and returns the only value a
-    /// card adapter is allowed to execute.
-    ///
-    /// # Errors
-    /// [`AuthorizationError`] on a wrong stage or a journal failure.
-    pub fn begin_card_command<S: JournalStore>(
-        &mut self,
-        store: &mut S,
-    ) -> Result<PendingCardCommand<AuthorizedCardCommand>, AuthorizationError<S::Error>> {
-        if self.stage != AuthorizationStage::Committed {
-            return Err(AuthorizationError::WrongStage(self.stage));
+            }));
         }
         let command = AuthorizedCardCommand {
             operation: self.request.operation.clone(),
         };
         let pending = self
             .journal
-            .begin_card_command(store, command)
+            .begin_card_command(store, self.request_hash, command)
             .map_err(|(error, _command)| AuthorizationError::Journal(error))?;
         self.stage = AuthorizationStage::Executing;
-        Ok(pending)
-    }
-
-    /// Persists an unambiguous terminal result after the single card exchange.
-    ///
-    /// # Errors
-    /// [`AuthorizationError`] on a wrong stage or a journal failure.
-    pub fn finish<S: JournalStore>(
-        &mut self,
-        store: &mut S,
-        terminal_state: OperationState,
-    ) -> Result<(), AuthorizationError<S::Error>> {
-        if self.stage != AuthorizationStage::Executing {
-            return Err(AuthorizationError::WrongStage(self.stage));
-        }
-        self.journal
-            .finish(store, terminal_state)
-            .map_err(AuthorizationError::Journal)?;
-        self.stage = AuthorizationStage::Terminal;
-        Ok(())
+        Ok(ApprovalOutcome::ExecuteCardCommand(pending))
     }
 
     /// Validate and persist a stable non-success result from any legal
-    /// pre-result stage. No arbitrary exception text enters the protocol.
+    /// pre-result stage, keeping the result so an identical retransmission
+    /// is answered without the card.
     ///
     /// # Errors
     /// [`AuthorizationError`] on an invalid result, a wrong stage, or a
     /// journal failure.
-    pub fn finish_failure_result<S: JournalStore>(
+    pub fn finish_failure_result<S: ResultJournalStore>(
         &mut self,
         store: &mut S,
         result: &OperationResultMessage,
     ) -> Result<(), AuthorizationError<S::Error>> {
-        let reference = OperationReference {
-            operation_id: self.request.operation_id,
-            request_hash: self.request_hash,
-        };
-        if result.status == ResultStatus::Completed {
+        if result.status == ResultStatus::Completed || result.retired {
             return Err(AuthorizationError::InvalidResult);
         }
         result
-            .validate_for(reference, &self.request.operation)
+            .validate_for(self.reference(), &self.request.operation)
             .map_err(|_| AuthorizationError::InvalidResult)?;
         let terminal_state =
             failure_state(result.status).ok_or(AuthorizationError::InvalidResult)?;
         match self.stage {
             AuthorizationStage::Requested
             | AuthorizationStage::AwaitingConsent
-            | AuthorizationStage::Prepared
-            | AuthorizationStage::ExecutingSafeRead => self
+            | AuthorizationStage::ExecutingSafeRead
+            | AuthorizationStage::Executing => self
                 .journal
-                .finish_safe_read_failure(store, terminal_state)
-                .map_err(AuthorizationError::Journal)?,
-            AuthorizationStage::Committed if terminal_state == OperationState::Cancelled => self
-                .journal
-                .cancel_committed_before_transmission(store)
-                .map_err(AuthorizationError::Journal)?,
-            AuthorizationStage::Executing => self
-                .journal
-                .finish(store, terminal_state)
+                .finish_failure(store, terminal_state, result)
                 .map_err(AuthorizationError::Journal)?,
             stage => return Err(AuthorizationError::WrongStage(stage)),
         }
+        self.retained_result = Some(result.clone());
         self.stage = AuthorizationStage::Terminal;
         Ok(())
-    }
-
-    /// Apply an exact cancellation under the durable commit boundary.
-    ///
-    /// # Errors
-    /// [`AuthorizationError`] on a reference mismatch, a wrong stage, or a
-    /// journal failure.
-    pub fn receive_cancel<S: JournalStore>(
-        &mut self,
-        store: &mut S,
-        cancellation: &CancelMessage,
-        transmission_proven_not_started: bool,
-    ) -> Result<ProxyCancelOutcome, AuthorizationError<S::Error>> {
-        if cancellation.reference.operation_id != self.request.operation_id
-            || cancellation.reference.request_hash != self.request_hash
-        {
-            return Err(AuthorizationError::CommitMismatch);
-        }
-        match self.stage {
-            AuthorizationStage::Requested
-            | AuthorizationStage::AwaitingConsent
-            | AuthorizationStage::Prepared
-            | AuthorizationStage::ExecutingSafeRead => {
-                self.journal
-                    .finish_safe_read_failure(store, OperationState::Cancelled)
-                    .map_err(AuthorizationError::Journal)?;
-                self.stage = AuthorizationStage::Terminal;
-                Ok(ProxyCancelOutcome::Cancelled)
-            }
-            AuthorizationStage::Committed if transmission_proven_not_started => {
-                self.journal
-                    .cancel_committed_before_transmission(store)
-                    .map_err(AuthorizationError::Journal)?;
-                self.stage = AuthorizationStage::Terminal;
-                Ok(ProxyCancelOutcome::Cancelled)
-            }
-            AuthorizationStage::Committed
-            | AuthorizationStage::Executing
-            | AuthorizationStage::ResultPending => Ok(ProxyCancelOutcome::Advisory),
-            stage @ AuthorizationStage::Terminal => Err(AuthorizationError::WrongStage(stage)),
-        }
     }
 
     /// Atomically retain a completed result before it can be sent. This covers
@@ -379,26 +262,8 @@ impl AuthorizationTransaction {
         Ok(())
     }
 
-    /// Persist a non-success registered safe-read result.
-    ///
-    /// # Errors
-    /// [`AuthorizationError`] on a wrong stage or a journal failure.
-    pub fn finish_safe_read_failure<S: JournalStore>(
-        &mut self,
-        store: &mut S,
-        terminal_state: OperationState,
-    ) -> Result<(), AuthorizationError<S::Error>> {
-        if self.stage != AuthorizationStage::ExecutingSafeRead {
-            return Err(AuthorizationError::WrongStage(self.stage));
-        }
-        self.journal
-            .finish_safe_read_failure(store, terminal_state)
-            .map_err(AuthorizationError::Journal)?;
-        self.stage = AuthorizationStage::Terminal;
-        Ok(())
-    }
-
-    /// Exact retained result, available only while acknowledgment is pending.
+    /// Exact retained result: a completed one while acknowledgment is
+    /// pending, or a failure that answers identical retransmissions.
     #[must_use]
     pub const fn retained_result(&self) -> Option<&OperationResultMessage> {
         self.retained_result.as_ref()
@@ -420,7 +285,7 @@ impl AuthorizationTransaction {
         if acknowledgment.operation_id != self.request.operation_id
             || acknowledgment.request_hash != self.request_hash
         {
-            return Err(AuthorizationError::CommitMismatch);
+            return Err(AuthorizationError::ReferenceMismatch);
         }
         self.journal
             .acknowledge_result(store)
@@ -449,8 +314,8 @@ impl AuthorizationTransaction {
         Ok(())
     }
 
-    /// Converts a committed/executing record after process recovery to an
-    /// ambiguous terminal result. It never offers a retransmission.
+    /// Converts an in-flight record after process recovery to an ambiguous
+    /// terminal result. It never offers a retransmission.
     ///
     /// # Errors
     /// [`AuthorizationError`] on an illegal journal state or a journal
@@ -466,12 +331,20 @@ impl AuthorizationTransaction {
         Ok(())
     }
 
-    fn validate_approval(
+    /// Whether the request's local deadline has passed (section 8.2.1).
+    #[must_use]
+    pub fn is_expired(&self, now_ms: u64, maximum_lifetime_ms: u64) -> bool {
+        self.request
+            .local_deadline_ms(maximum_lifetime_ms)
+            .is_ok_and(|deadline| now_ms > deadline)
+    }
+
+    fn validate_approval<E>(
         &self,
         approval: UserApproval,
         now_ms: u64,
         maximum_lifetime_ms: u64,
-    ) -> Result<(), AuthorizationError<()>> {
+    ) -> Result<(), AuthorizationError<E>> {
         if approval.operation_id != self.request.operation_id
             || approval.request_hash != self.request_hash
         {
@@ -498,13 +371,10 @@ pub enum AuthorizationStage {
     Requested,
     /// Safe reads completed and local consent may be requested.
     AwaitingConsent,
-    /// Local user consented; waiting for requester commit.
-    Prepared,
-    /// Registered non-consequential read is executing without prepare/commit.
+    /// Registered non-consequential read is executing without a journal entry.
     ExecutingSafeRead,
-    /// Commit is durable; no physical transmission has started.
-    Committed,
-    /// Exactly one physical command has been handed to the card adapter.
+    /// The in-flight entry is durable and exactly one physical command has
+    /// been handed to the card adapter.
     Executing,
     /// Completed result is durably retained until exact acknowledgment.
     ResultPending,
@@ -513,27 +383,17 @@ pub enum AuthorizationStage {
 }
 
 /// Result of local user approval based on profile consequence classification.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub enum ApprovalOutcome {
-    /// Send `operation.prepared` and wait for the exact requester commit.
-    Prepared(OperationReference),
+    /// The in-flight entry is durable; take the one card command.
+    ExecuteCardCommand(PendingCardCommand<AuthorizedCardCommand>),
     /// Execute this bounded read and answer directly with a result.
     ExecuteSafeRead(AuthorizedSafeRead),
-}
-
-/// Proxy cancellation classification at the durable commit boundary.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProxyCancelOutcome {
-    /// Zero transmissions were proven; the operation is cancelled.
-    Cancelled,
-    /// Commit passed; the cancel is recorded and the operation continues.
-    Advisory,
 }
 
 const fn failure_state(status: ResultStatus) -> Option<OperationState> {
     match status {
         ResultStatus::Completed => None,
-        ResultStatus::Denied => Some(OperationState::Denied),
         ResultStatus::Cancelled => Some(OperationState::Cancelled),
         ResultStatus::Rejected => Some(OperationState::Rejected),
         ResultStatus::CredentialRejected => Some(OperationState::CredentialRejected),
@@ -541,8 +401,8 @@ const fn failure_state(status: ResultStatus) -> Option<OperationState> {
     }
 }
 
-/// Exact operation identifier and request-hash echo used by prepare, commit,
-/// cancel, result acknowledgment, and status messages.
+/// Exact operation identifier and request-hash echo carried by results,
+/// acknowledgments, progress, and status messages.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationReference {
     /// Semantic operation identifier.
@@ -666,8 +526,8 @@ impl OperationProgressMessage {
 pub enum AuthorizationError<E> {
     /// Approval did not cover the exact request.
     ApprovalMismatch,
-    /// Requester commit did not echo the prepared operation and hash.
-    CommitMismatch,
+    /// An acknowledgment did not echo the operation and hash.
+    ReferenceMismatch,
     /// Request or approval was outside its validity interval.
     Expired,
     /// Method was called outside the required protocol phase.

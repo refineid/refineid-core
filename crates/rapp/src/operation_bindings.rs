@@ -22,26 +22,27 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use super::{
-    CardInspection, CardOperationResult, JournalRecord, JournalRecoveryStore, JournalStore,
-    OperationId, OperationResultMessage, OperationState, PairId, RecoveredProxyRecord, RequestHash,
-    RequesterJournalRecord, RequesterJournalStore, RequesterRecoveryStore, ResultJournalStore,
-    SessionId, StatusReport, WireValue,
+    CardIdentity, CardInspection, CardOperationResult, JournalRecord, JournalRecoveryStore,
+    JournalStore, OperationId, OperationResultMessage, OperationState, PairId,
+    RecoveredProxyRecord, RequestHash, RequesterJournalRecord, RequesterJournalStore,
+    RequesterRecoveryStore, ResultJournalStore, SessionId, StatusReport, WireValue,
     bindings::{
         RappBindingError, RappVaultError, take_bytes, take_text, take_unsigned, take_value,
     },
     decode_deterministic_cbor, encode_deterministic_cbor,
 };
 
-const REQUESTER_JOURNAL_FORMAT_VERSION: u64 = 1;
-const PROXY_JOURNAL_FORMAT_VERSION: u64 = 1;
+const REQUESTER_JOURNAL_FORMAT_VERSION: u64 = 2;
+const PROXY_JOURNAL_FORMAT_VERSION: u64 = 2;
 
 /// One proxy recovery entry returned by an atomic platform load.
 #[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
 pub struct RappStoredProxyJournal {
     /// Opaque non-secret operation journal record.
     pub record: Vec<u8>,
-    /// Encrypted-at-rest retained result, when acknowledgment is pending or
-    /// delivery became uncertain.
+    /// Encrypted-at-rest retained result: a completed one while
+    /// acknowledgment is pending or delivery became uncertain, or a failure
+    /// that answers identical retransmissions.
     pub retained_result: Option<Vec<u8>>,
 }
 
@@ -80,8 +81,10 @@ pub trait RappOperationVault: Send + Sync {
         record: Vec<u8>,
     ) -> Result<(), RappVaultError>;
 
-    /// Atomically persist proxy `result_pending` and its complete result before
-    /// releasing the result frame.
+    /// Atomically persist a proxy record and the complete result that reports
+    /// it before releasing the result frame: a completed result pending
+    /// acknowledgment, or a failure kept to answer identical
+    /// retransmissions.
     ///
     /// # Errors
     /// [`RappVaultError`] when the atomic storage transaction fails.
@@ -391,6 +394,10 @@ fn card_result_value(result: &CardOperationResult) -> WireValue {
             let mut map = BTreeMap::from([
                 ("kind".to_owned(), WireValue::Text("inspection".to_owned())),
                 (
+                    "atr".to_owned(),
+                    WireValue::Bytes(inspection.answer_to_reset.clone()),
+                ),
+                (
                     "pin1_factory".to_owned(),
                     WireValue::Bool(inspection.pin1_factory),
                 ),
@@ -404,17 +411,45 @@ fn card_result_value(result: &CardOperationResult) -> WireValue {
             insert_attempt(&mut map, "puk_attempts", inspection.puk_attempts);
             map
         }
-        CardOperationResult::Identity {
-            display_name,
-            person_id,
-        } => BTreeMap::from([
-            ("kind".to_owned(), WireValue::Text("identity".to_owned())),
-            (
-                "display_name".to_owned(),
-                WireValue::Text(display_name.clone()),
-            ),
-            ("person_id".to_owned(), WireValue::Text(person_id.clone())),
-        ]),
+        CardOperationResult::Identity(identity) => {
+            let mut map = BTreeMap::from([
+                ("kind".to_owned(), WireValue::Text("identity".to_owned())),
+                (
+                    "holder_name".to_owned(),
+                    WireValue::Text(identity.holder_name.clone()),
+                ),
+                (
+                    "card_id".to_owned(),
+                    WireValue::Text(identity.card_id.clone()),
+                ),
+                (
+                    "issuance_date".to_owned(),
+                    WireValue::Text(identity.issuance_date.clone()),
+                ),
+                (
+                    "expiration_date".to_owned(),
+                    WireValue::Text(identity.expiration_date.clone()),
+                ),
+                (
+                    "certificates".to_owned(),
+                    WireValue::Array(
+                        identity
+                            .certificates
+                            .iter()
+                            .cloned()
+                            .map(WireValue::Bytes)
+                            .collect(),
+                    ),
+                ),
+            ]);
+            if let Some(name) = &identity.token_display_name {
+                map.insert(
+                    "token_display_name".to_owned(),
+                    WireValue::Text(name.clone()),
+                );
+            }
+            map
+        }
         CardOperationResult::Certificate(bytes) => BTreeMap::from([
             ("kind".to_owned(), WireValue::Text("certificate".to_owned())),
             ("bytes".to_owned(), WireValue::Bytes(bytes.clone())),
@@ -433,16 +468,41 @@ fn parse_card_result(value: WireValue) -> Result<CardOperationResult, RappBindin
     };
     let result = match take_text(&mut map, "kind")?.as_str() {
         "inspection" => CardOperationResult::Inspection(CardInspection {
+            answer_to_reset: take_bytes(&mut map, "atr")?,
             pin1_factory: take_bool(&mut map, "pin1_factory")?,
             pin2_factory: take_bool(&mut map, "pin2_factory")?,
             pin1_attempts: take_optional_attempt(&mut map, "pin1_attempts")?,
             pin2_attempts: take_optional_attempt(&mut map, "pin2_attempts")?,
             puk_attempts: take_optional_attempt(&mut map, "puk_attempts")?,
         }),
-        "identity" => CardOperationResult::Identity {
-            display_name: take_text(&mut map, "display_name")?,
-            person_id: take_text(&mut map, "person_id")?,
-        },
+        "identity" => {
+            let certificates = match take_value(&mut map, "certificates")? {
+                WireValue::Array(values) => values
+                    .into_iter()
+                    .map(|value| match value {
+                        WireValue::Bytes(bytes) => Ok(bytes),
+                        _ => Err(RappBindingError::InvalidInput),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                _ => return Err(RappBindingError::InvalidInput),
+            };
+            let token_display_name = match map.remove("token_display_name") {
+                None => None,
+                Some(WireValue::Text(value)) => Some(value),
+                Some(_) => return Err(RappBindingError::InvalidInput),
+            };
+            CardOperationResult::Identity(
+                CardIdentity::reconstruct(
+                    take_text(&mut map, "holder_name")?,
+                    take_text(&mut map, "card_id")?,
+                    take_text(&mut map, "issuance_date")?,
+                    take_text(&mut map, "expiration_date")?,
+                    certificates,
+                    token_display_name,
+                )
+                .map_err(|_| RappBindingError::InvalidInput)?,
+            )
+        }
         "certificate" => CardOperationResult::Certificate(take_bytes(&mut map, "bytes")?),
         "signature" => CardOperationResult::Signature(take_bytes(&mut map, "bytes")?),
         _ => return Err(RappBindingError::InvalidInput),
@@ -470,6 +530,7 @@ fn status_report_value(report: &StatusReport) -> WireValue {
                 .request_hash
                 .map_or(WireValue::Null, |hash| id_value(hash.as_bytes())),
         ),
+        ("retired".to_owned(), WireValue::Bool(report.retired)),
     ]))
 }
 
@@ -492,12 +553,14 @@ fn parse_status_report(value: WireValue) -> Result<StatusReport, RappBindingErro
         }
         _ => return Err(RappBindingError::InvalidInput),
     };
+    let retired = take_bool(&mut map, "retired")?;
     require_empty(&map)?;
     Ok(StatusReport {
         operation_id,
         known,
         state,
         request_hash,
+        retired,
     })
 }
 

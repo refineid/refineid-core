@@ -199,6 +199,13 @@ pub enum ProfileName {
 }
 
 impl ProfileName {
+    /// Every registered profile, in registry order (section 9).
+    pub const ALL: [Self; 3] = [
+        Self::CardStatus,
+        Self::Authentication,
+        Self::DocumentSigning,
+    ];
+
     /// Stable wire registry name.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -259,6 +266,10 @@ impl RetryDecision {
 /// Stable session-close reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseReason {
+    /// Orderly close, such as a sequence or lifetime restart.
+    Normal,
+    /// The session's work is complete.
+    Complete,
     /// Explicit user disconnect.
     UserDisconnect,
     /// Local policy refusal.

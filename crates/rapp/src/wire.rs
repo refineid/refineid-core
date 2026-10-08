@@ -85,12 +85,6 @@ pub enum MessageType {
     LivenessPong,
     /// Typed credential-operation request.
     OperationRequest,
-    /// Proxy readiness to execute the committed request.
-    OperationPrepared,
-    /// Requester's point of no return.
-    OperationCommit,
-    /// Operation cancellation.
-    OperationCancel,
     /// Profile-defined operation result.
     OperationResult,
     /// Acknowledgment of a completed result.
@@ -118,9 +112,6 @@ impl MessageType {
             Self::LivenessPing => "liveness.ping",
             Self::LivenessPong => "liveness.pong",
             Self::OperationRequest => "operation.request",
-            Self::OperationPrepared => "operation.prepared",
-            Self::OperationCommit => "operation.commit",
-            Self::OperationCancel => "operation.cancel",
             Self::OperationResult => "operation.result",
             Self::OperationResultAck => "operation.result_ack",
             Self::OperationStatusRequest => "operation.status_request",
@@ -140,9 +131,6 @@ impl MessageType {
             "liveness.ping" => Ok(Self::LivenessPing),
             "liveness.pong" => Ok(Self::LivenessPong),
             "operation.request" => Ok(Self::OperationRequest),
-            "operation.prepared" => Ok(Self::OperationPrepared),
-            "operation.commit" => Ok(Self::OperationCommit),
-            "operation.cancel" => Ok(Self::OperationCancel),
             "operation.result" => Ok(Self::OperationResult),
             "operation.result_ack" => Ok(Self::OperationResultAck),
             "operation.status_request" => Ok(Self::OperationStatusRequest),
@@ -771,6 +759,10 @@ struct FieldSpec {
 
 const OPERATION_ID: FieldType = FieldType::Bytes(16);
 const REQUEST_HASH: FieldType = FieldType::Bytes(32);
+/// Byte-length bounds of the error body's `error_name` (section 10.4).
+const ERROR_NAME_LENGTHS: core::ops::RangeInclusive<usize> = 1..=64;
+/// Byte-length bounds of the error body's `message` (section 10.4).
+const ERROR_MESSAGE_LENGTHS: core::ops::RangeInclusive<usize> = 1..=512;
 
 #[allow(
     clippy::too_many_lines,
@@ -868,16 +860,6 @@ fn validate_body(
                 optional: false,
             },
             FieldSpec {
-                name: "request_hash",
-                field_type: REQUEST_HASH,
-                optional: false,
-            },
-            FieldSpec {
-                name: "expires_after_ms",
-                field_type: F::Unsigned,
-                optional: false,
-            },
-            FieldSpec {
                 name: "context",
                 field_type: F::Map,
                 optional: false,
@@ -887,34 +869,22 @@ fn validate_body(
                 field_type: F::Map,
                 optional: false,
             },
-        ],
-        M::OperationPrepared | M::OperationCommit | M::OperationResultAck => &[
             FieldSpec {
-                name: "operation_id",
-                field_type: OPERATION_ID,
-                optional: false,
-            },
-            FieldSpec {
-                name: "request_hash",
-                field_type: REQUEST_HASH,
-                optional: false,
-            },
-        ],
-        M::OperationCancel => &[
-            FieldSpec {
-                name: "operation_id",
-                field_type: OPERATION_ID,
-                optional: false,
-            },
-            FieldSpec {
-                name: "request_hash",
-                field_type: REQUEST_HASH,
-                optional: false,
-            },
-            FieldSpec {
-                name: "reason",
-                field_type: F::Text,
+                name: "expires_after_ms",
+                field_type: F::Unsigned,
                 optional: true,
+            },
+        ],
+        M::OperationResultAck => &[
+            FieldSpec {
+                name: "operation_id",
+                field_type: OPERATION_ID,
+                optional: false,
+            },
+            FieldSpec {
+                name: "request_hash",
+                field_type: REQUEST_HASH,
+                optional: false,
             },
         ],
         M::OperationResult => &[
@@ -934,14 +904,24 @@ fn validate_body(
                 optional: false,
             },
             FieldSpec {
+                name: "response",
+                field_type: F::Map,
+                optional: true,
+            },
+            FieldSpec {
                 name: "error",
                 field_type: F::Text,
                 optional: true,
             },
             FieldSpec {
-                name: "body",
-                field_type: F::Map,
-                optional: false,
+                name: "remaining_retries",
+                field_type: F::Unsigned,
+                optional: true,
+            },
+            FieldSpec {
+                name: "retired",
+                field_type: F::Bool,
+                optional: true,
             },
         ],
         M::OperationStatusRequest => &[FieldSpec {
@@ -970,6 +950,11 @@ fn validate_body(
                 field_type: REQUEST_HASH,
                 optional: true,
             },
+            FieldSpec {
+                name: "retired",
+                field_type: F::Bool,
+                optional: true,
+            },
         ],
         M::OperationProgress => &[
             FieldSpec {
@@ -990,7 +975,17 @@ fn validate_body(
         ],
         M::Error => &[
             FieldSpec {
-                name: "error",
+                name: "error_code",
+                field_type: F::Unsigned,
+                optional: false,
+            },
+            FieldSpec {
+                name: "error_name",
+                field_type: F::Text,
+                optional: false,
+            },
+            FieldSpec {
+                name: "message",
                 field_type: F::Text,
                 optional: false,
             },
@@ -1051,7 +1046,9 @@ fn validate_discriminants(
             if !matches!(
                 text("reason"),
                 Some(
-                    "user_disconnect"
+                    "normal"
+                        | "complete"
+                        | "user_disconnect"
                         | "policy"
                         | "credential_rejected"
                         | "protocol_violation"
@@ -1065,20 +1062,24 @@ fn validate_discriminants(
         MessageType::OperationResult => {
             if !matches!(
                 text("status"),
-                Some(
-                    "completed"
-                        | "denied"
-                        | "cancelled"
-                        | "rejected"
-                        | "credential_rejected"
-                        | "ambiguous"
-                )
+                Some("completed" | "rejected" | "credential_rejected" | "cancelled" | "ambiguous")
             ) {
                 return Err(WireError::InvalidValue { field: "status" });
             }
         }
-        MessageType::Error if !matches!(text("error"), Some("busy" | "unknown_operation")) => {
-            return Err(WireError::InvalidValue { field: "error" });
+        // Any error name is admitted: an unrecognized one is handled as a
+        // general `operation_failed` (section 10.4), so only lengths bind.
+        MessageType::Error => {
+            if !text("error_name").is_some_and(|name| ERROR_NAME_LENGTHS.contains(&name.len())) {
+                return Err(WireError::InvalidValue {
+                    field: "error_name",
+                });
+            }
+            if !text("message")
+                .is_some_and(|message| ERROR_MESSAGE_LENGTHS.contains(&message.len()))
+            {
+                return Err(WireError::InvalidValue { field: "message" });
+            }
         }
         _ => {}
     }

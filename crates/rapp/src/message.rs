@@ -7,8 +7,9 @@ use super::{
     CPACE_KC2_SUITE, CardOperationError, CloseReason, Envelope, GrantsHash,
     LIVENESS_CHALLENGE_SIZE, MANDATORY_PAIRING_SUITE, MANDATORY_SESSION_SUITE, MessageType,
     OperationId, OperationProgressMessage, OperationReference, OperationRequest,
-    OperationResultMessage, OperationState, PairId, PingChallenge, ProfileName, RequestHash,
-    SESSION_READY_NONCE_SIZE, WIRE_VERSION_V26_10_1, WireValue,
+    OperationRequestRefusal, OperationResultMessage, OperationState, PairId, PingChallenge,
+    ProfileName, RequestError, RequestHash, SESSION_READY_NONCE_SIZE, WIRE_VERSION_V26_10_1,
+    WireValue,
 };
 
 /// Pairing-channel parameter echo.
@@ -87,15 +88,6 @@ pub struct LivenessMessage {
     pub last_received_sequence: u64,
 }
 
-/// Advisory operation cancellation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CancelMessage {
-    /// Operation identifier and request-hash echo.
-    pub reference: OperationReference,
-    /// Bounded cancellation reason label.
-    pub reason: Option<String>,
-}
-
 /// Durable status reconciliation answer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StatusReport {
@@ -103,19 +95,74 @@ pub struct StatusReport {
     pub operation_id: OperationId,
     /// Whether the proxy journal holds this operation.
     pub known: bool,
-    /// Journaled terminal state of a known operation.
+    /// Journaled state of a known operation; every stage before a terminal
+    /// outcome travels as `in_flight`.
     pub state: Option<OperationState>,
     /// Journaled request hash of a known operation.
     pub request_hash: Option<RequestHash>,
+    /// Whether the operation is acknowledged and only its tombstone remains.
+    pub retired: bool,
 }
 
-/// Stable generic protocol error.
+/// Protocol-level error (RAPP v26.10.1 section 10.4).
+///
+/// The engine sends three: `unknown_operation` answers a stale reference,
+/// `duplicate_operation` refuses an operation identifier reused with
+/// different content, and `operation_failed` refuses a request while another
+/// is in flight. Any other received name is handled as `operation_failed`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProtocolErrorMessage {
-    /// A live session already serves this pairing.
-    Busy,
     /// Referenced operation is unknown or terminal; a normal race.
     UnknownOperation(Option<OperationId>),
+    /// The identifier is already in use with different content.
+    DuplicateOperation(OperationId),
+    /// The request could not be admitted.
+    OperationFailed(Option<OperationId>),
+}
+
+impl ProtocolErrorMessage {
+    /// Registered `error_name`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::UnknownOperation(_) => "unknown_operation",
+            Self::DuplicateOperation(_) => "duplicate_operation",
+            Self::OperationFailed(_) => "operation_failed",
+        }
+    }
+
+    /// Informative `error_code` the specification pairs with the name.
+    #[must_use]
+    pub const fn code(self) -> u64 {
+        match self {
+            Self::UnknownOperation(_) => 1_001,
+            Self::DuplicateOperation(_) => 1_011,
+            Self::OperationFailed(_) => 1_010,
+        }
+    }
+
+    /// Human-readable `message`.
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::UnknownOperation(_) => "The operation is unknown or already terminal.",
+            Self::DuplicateOperation(_) => {
+                "The operation identifier is already in use with different content."
+            }
+            Self::OperationFailed(_) => "The operation could not be admitted.",
+        }
+    }
+
+    /// Operation the error names, if any.
+    #[must_use]
+    pub const fn operation_id(self) -> Option<OperationId> {
+        match self {
+            Self::UnknownOperation(operation_id) | Self::OperationFailed(operation_id) => {
+                operation_id
+            }
+            Self::DuplicateOperation(operation_id) => Some(operation_id),
+        }
+    }
 }
 
 /// Fully typed authenticated message. No raw map crosses this boundary.
@@ -137,12 +184,9 @@ pub enum TypedMessage {
     LivenessPong(LivenessMessage),
     /// Typed credential-operation request.
     OperationRequest(OperationRequest),
-    /// Proxy is ready to execute exactly the committed request.
-    OperationPrepared(OperationReference),
-    /// Requester's point of no return.
-    OperationCommit(OperationReference),
-    /// Operation cancellation; advisory after commit.
-    OperationCancel(CancelMessage),
+    /// A well-formed request naming something this endpoint cannot serve;
+    /// inbound only, answered with a rejected result.
+    OperationRequestRefused(OperationRequestRefusal),
     /// Profile-defined operation result.
     OperationResult(OperationResultMessage),
     /// Acknowledgment of a completed result.
@@ -186,24 +230,16 @@ impl TypedMessage {
             }
             MessageType::LivenessPing => Self::LivenessPing(liveness_from_body(envelope.body)?),
             MessageType::LivenessPong => Self::LivenessPong(liveness_from_body(envelope.body)?),
-            MessageType::OperationRequest => Self::OperationRequest(
-                OperationRequest::from_wire_body(
-                    envelope.body,
-                    pair_id,
-                    session_id,
-                    local_start_ms,
-                )
-                .map_err(MessageError::Operation)?,
-            ),
-            MessageType::OperationPrepared => Self::OperationPrepared(
-                OperationReference::from_wire_body(envelope.body)
-                    .map_err(MessageError::Operation)?,
-            ),
-            MessageType::OperationCommit => Self::OperationCommit(
-                OperationReference::from_wire_body(envelope.body)
-                    .map_err(MessageError::Operation)?,
-            ),
-            MessageType::OperationCancel => Self::OperationCancel(cancel_from_body(envelope.body)?),
+            MessageType::OperationRequest => match OperationRequest::from_wire_body(
+                envelope.body,
+                pair_id,
+                session_id,
+                local_start_ms,
+            ) {
+                Ok(request) => Self::OperationRequest(request),
+                Err(RequestError::Refused(refusal)) => Self::OperationRequestRefused(refusal),
+                Err(RequestError::Malformed(error)) => return Err(MessageError::Operation(error)),
+            },
             MessageType::OperationResult => Self::OperationResult(
                 OperationResultMessage::from_wire_body(envelope.body)
                     .map_err(MessageError::Operation)?,
@@ -236,10 +272,9 @@ impl TypedMessage {
             Self::SessionClose(_) => MessageType::SessionClose,
             Self::LivenessPing(_) => MessageType::LivenessPing,
             Self::LivenessPong(_) => MessageType::LivenessPong,
-            Self::OperationRequest(_) => MessageType::OperationRequest,
-            Self::OperationPrepared(_) => MessageType::OperationPrepared,
-            Self::OperationCommit(_) => MessageType::OperationCommit,
-            Self::OperationCancel(_) => MessageType::OperationCancel,
+            Self::OperationRequest(_) | Self::OperationRequestRefused(_) => {
+                MessageType::OperationRequest
+            }
             Self::OperationResult(_) => MessageType::OperationResult,
             Self::OperationResultAck(_) => MessageType::OperationResultAck,
             Self::OperationStatusRequest(_) => MessageType::OperationStatusRequest,
@@ -262,10 +297,8 @@ impl TypedMessage {
             Self::SessionClose(value) => Ok(session_close_to_body(*value)),
             Self::LivenessPing(value) | Self::LivenessPong(value) => Ok(liveness_to_body(*value)),
             Self::OperationRequest(value) => value.to_wire_body().map_err(MessageError::Operation),
-            Self::OperationPrepared(value)
-            | Self::OperationCommit(value)
-            | Self::OperationResultAck(value) => Ok(value.to_wire_body()),
-            Self::OperationCancel(value) => cancel_to_body(value),
+            Self::OperationRequestRefused(_) => Err(MessageError::InvalidField("operation")),
+            Self::OperationResultAck(value) => Ok(value.to_wire_body()),
             Self::OperationResult(value) => value.to_wire_body().map_err(MessageError::Operation),
             Self::OperationStatusRequest(operation_id) => {
                 let mut body = BTreeMap::new();
@@ -521,28 +554,6 @@ fn liveness_from_body(
     })
 }
 
-fn cancel_to_body(value: &CancelMessage) -> Result<BTreeMap<String, WireValue>, MessageError> {
-    let mut body = value.reference.to_wire_body();
-    if let Some(reason) = value.reason.as_ref() {
-        validate_label(reason, "reason")?;
-        body.insert("reason".into(), WireValue::Text(reason.clone()));
-    }
-    Ok(body)
-}
-
-fn cancel_from_body(mut body: BTreeMap<String, WireValue>) -> Result<CancelMessage, MessageError> {
-    let reason = match body.remove("reason") {
-        None => None,
-        Some(WireValue::Text(value)) => {
-            validate_label(&value, "reason")?;
-            Some(value)
-        }
-        Some(_) => return Err(MessageError::InvalidField("reason")),
-    };
-    let reference = OperationReference::from_wire_body(body).map_err(MessageError::Operation)?;
-    Ok(CancelMessage { reference, reason })
-}
-
 fn status_request_from_body(
     mut body: BTreeMap<String, WireValue>,
 ) -> Result<OperationId, MessageError> {
@@ -573,6 +584,9 @@ fn status_to_body(value: &StatusReport) -> Result<BTreeMap<String, WireValue>, M
             WireValue::Bytes(hash.as_bytes().to_vec()),
         );
     }
+    if value.known {
+        body.insert("retired".into(), WireValue::Bool(value.retired));
+    }
     Ok(body)
 }
 
@@ -582,7 +596,7 @@ fn status_from_body(mut body: BTreeMap<String, WireValue>) -> Result<StatusRepor
     let known = take_bool(&mut body, "known")?;
     let state = match body.remove("state") {
         None => None,
-        Some(WireValue::Text(value)) => Some(parse_terminal_state(&value)?),
+        Some(WireValue::Text(value)) => Some(parse_wire_state(&value)?),
         Some(_) => return Err(MessageError::InvalidField("state")),
     };
     let request_hash = match body.remove("request_hash") {
@@ -593,12 +607,18 @@ fn status_from_body(mut body: BTreeMap<String, WireValue>) -> Result<StatusRepor
         ),
         Some(_) => return Err(MessageError::InvalidField("request_hash")),
     };
+    let retired = match body.remove("retired") {
+        None => false,
+        Some(WireValue::Bool(value)) => value,
+        Some(_) => return Err(MessageError::InvalidField("retired")),
+    };
     require_empty(&body)?;
     let report = StatusReport {
         operation_id,
         known,
         state,
         request_hash,
+        retired,
     };
     validate_status_report(&report)?;
     Ok(report)
@@ -608,37 +628,33 @@ const fn validate_status_report(value: &StatusReport) -> Result<(), MessageError
     if value.known != (value.state.is_some() && value.request_hash.is_some()) {
         return Err(MessageError::InvalidField("known"));
     }
-    if let Some(state) = value.state
-        && !state.is_terminal()
-    {
-        return Err(MessageError::InvalidField("state"));
+    if value.retired && !value.known {
+        return Err(MessageError::InvalidField("retired"));
     }
     Ok(())
 }
 
 fn error_to_body(value: ProtocolErrorMessage) -> BTreeMap<String, WireValue> {
     let mut body = BTreeMap::new();
-    match value {
-        ProtocolErrorMessage::Busy => {
-            body.insert("error".into(), WireValue::Text("busy".into()));
-        }
-        ProtocolErrorMessage::UnknownOperation(operation_id) => {
-            body.insert("error".into(), WireValue::Text("unknown_operation".into()));
-            if let Some(operation_id) = operation_id {
-                body.insert(
-                    "operation_id".into(),
-                    WireValue::Bytes(operation_id.as_bytes().to_vec()),
-                );
-            }
-        }
+    body.insert("error_code".into(), WireValue::Unsigned(value.code()));
+    body.insert("error_name".into(), WireValue::Text(value.name().into()));
+    body.insert("message".into(), WireValue::Text(value.message().into()));
+    if let Some(operation_id) = value.operation_id() {
+        body.insert(
+            "operation_id".into(),
+            WireValue::Bytes(operation_id.as_bytes().to_vec()),
+        );
     }
     body
 }
 
+/// The error a received body names, by name first (section 10.4).
 fn error_from_body(
     mut body: BTreeMap<String, WireValue>,
 ) -> Result<ProtocolErrorMessage, MessageError> {
-    let name = take_text(&mut body, "error")?;
+    take_unsigned(&mut body, "error_code")?;
+    let name = take_text(&mut body, "error_name")?;
+    take_text(&mut body, "message")?;
     let operation_id = match body.remove("operation_id") {
         None => None,
         Some(WireValue::Bytes(value)) => Some(
@@ -648,11 +664,13 @@ fn error_from_body(
         Some(_) => return Err(MessageError::InvalidField("operation_id")),
     };
     require_empty(&body)?;
-    match name.as_str() {
-        "busy" if operation_id.is_none() => Ok(ProtocolErrorMessage::Busy),
-        "unknown_operation" => Ok(ProtocolErrorMessage::UnknownOperation(operation_id)),
-        _ => Err(MessageError::InvalidField("error")),
-    }
+    Ok(match (name.as_str(), operation_id) {
+        ("unknown_operation", operation_id) => ProtocolErrorMessage::UnknownOperation(operation_id),
+        ("duplicate_operation", Some(operation_id)) => {
+            ProtocolErrorMessage::DuplicateOperation(operation_id)
+        }
+        (_, operation_id) => ProtocolErrorMessage::OperationFailed(operation_id),
+    })
 }
 
 fn profile_array(profiles: &[ProfileName]) -> WireValue {
@@ -725,6 +743,8 @@ fn require_pairing_suite(map: &mut BTreeMap<String, WireValue>) -> Result<(), Me
 
 const fn close_reason_name(value: CloseReason) -> &'static str {
     match value {
+        CloseReason::Normal => "normal",
+        CloseReason::Complete => "complete",
         CloseReason::UserDisconnect => "user_disconnect",
         CloseReason::Policy => "policy",
         CloseReason::CredentialRejected => "credential_rejected",
@@ -736,6 +756,8 @@ const fn close_reason_name(value: CloseReason) -> &'static str {
 
 fn parse_close_reason(value: &str) -> Result<CloseReason, MessageError> {
     match value {
+        "normal" => Ok(CloseReason::Normal),
+        "complete" => Ok(CloseReason::Complete),
         "user_disconnect" => Ok(CloseReason::UserDisconnect),
         "policy" => Ok(CloseReason::Policy),
         "credential_rejected" => Ok(CloseReason::CredentialRejected),
@@ -746,28 +768,38 @@ fn parse_close_reason(value: &str) -> Result<CloseReason, MessageError> {
     }
 }
 
+/// `operation-state-val` (section 7.1) for a journal state.
+///
+/// Every stage before a terminal outcome reads as `in_flight`; a completed
+/// result reads as completed whether or not it was acknowledged, and the
+/// report's `retired` flag tells the two apart.
 const fn operation_state_name(value: OperationState) -> &'static str {
     match value {
-        OperationState::Completed => "completed",
-        OperationState::Denied => "denied",
+        OperationState::None
+        | OperationState::Requested
+        | OperationState::AwaitingConsent
+        | OperationState::Prepared
+        | OperationState::Committed
+        | OperationState::Executing => "in_flight",
+        OperationState::ResultPending
+        | OperationState::Completed
+        | OperationState::DeliveryUncertain => "completed",
+        OperationState::Denied | OperationState::Rejected => "rejected",
         OperationState::Cancelled => "cancelled",
-        OperationState::Rejected => "rejected",
         OperationState::CredentialRejected => "credential_rejected",
         OperationState::Ambiguous => "ambiguous",
-        OperationState::DeliveryUncertain => "delivery_uncertain",
-        _ => "non_terminal",
     }
 }
 
-fn parse_terminal_state(value: &str) -> Result<OperationState, MessageError> {
+/// The journal state a received `operation-state-val` names.
+fn parse_wire_state(value: &str) -> Result<OperationState, MessageError> {
     match value {
+        "in_flight" => Ok(OperationState::Executing),
         "completed" => Ok(OperationState::Completed),
-        "denied" => Ok(OperationState::Denied),
-        "cancelled" => Ok(OperationState::Cancelled),
         "rejected" => Ok(OperationState::Rejected),
+        "cancelled" => Ok(OperationState::Cancelled),
         "credential_rejected" => Ok(OperationState::CredentialRejected),
         "ambiguous" => Ok(OperationState::Ambiguous),
-        "delivery_uncertain" => Ok(OperationState::DeliveryUncertain),
         _ => Err(MessageError::InvalidField("state")),
     }
 }

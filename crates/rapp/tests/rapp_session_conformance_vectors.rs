@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 
 use refineid_rapp::{
     CardOperation, Envelope, JournalRecord, JournalStore, MessageType, OperationId,
-    OperationRequest, OperationResultMessage, PairId, ProfileName, ProxyDispatch, ProxyEngineError,
-    ProxyOperationEngine, ProxyViolation, ResultJournalStore, SequenceGuard, SessionId,
+    OperationRequest, OperationResultMessage, PairId, ProfileName, ProxyDispatch,
+    ProxyOperationEngine, ResultError, ResultJournalStore, ResultStatus, SequenceGuard, SessionId,
     TypedMessage, WireError, WireValue, decode_deterministic_cbor, encode_deterministic_cbor,
 };
 use serde::Deserialize;
@@ -166,12 +166,7 @@ fn proxy_rejects_every_operation_outside_the_authenticated_grant_set() {
         .expect("corpus operation request must be internally valid");
         let mut engine = ProxyOperationEngine::new(granted_profiles);
         let mut store = NoopStore;
-        let result = engine.receive(
-            &mut store,
-            TypedMessage::OperationRequest(request),
-            1_000,
-            5_000,
-        );
+        let result = engine.receive(&mut store, TypedMessage::OperationRequest(request), 1_000);
 
         match vector.expected.as_str() {
             "accepted" => assert!(
@@ -179,12 +174,19 @@ fn proxy_rejects_every_operation_outside_the_authenticated_grant_set() {
                 "{}",
                 vector.name
             ),
+            // Section 8.2.3: an ungranted profile is answered with a
+            // rejected `unauthorized` result, not punished.
             "profile_not_granted" => assert!(
                 matches!(
-                    result,
-                    Err(ProxyEngineError::AuthenticatedProtocolViolation(
-                        ProxyViolation::ProfileNotGranted
-                    ))
+                    &result,
+                    Ok(ProxyDispatch::SendFailure {
+                        message: TypedMessage::OperationResult(OperationResultMessage {
+                            status: ResultStatus::Rejected,
+                            error: Some(ResultError::Unauthorized),
+                            ..
+                        }),
+                        close_session: false,
+                    })
                 ),
                 "{}",
                 vector.name

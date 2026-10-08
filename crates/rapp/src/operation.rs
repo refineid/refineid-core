@@ -8,9 +8,12 @@ use core::fmt;
 use std::collections::BTreeMap;
 
 use super::{
-    OperationId, PairId, ProfileName, RequestHash, SessionId, WireError, WireValue,
-    compute_request_hash,
+    OperationId, OperationReference, PairId, ProfileName, RequestHash, ResultError, SessionId,
+    WireError, WireValue, compute_request_hash, crypto::compute_wire_request_hash,
 };
+
+/// The lifetime a request that names none receives (section 8.2.1).
+pub const DEFAULT_OPERATION_LIFETIME_MS: u64 = 300_000;
 
 /// Card credential selected by an operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -195,8 +198,8 @@ pub enum CardOperation {
 }
 
 impl CardOperation {
-    /// Whether this action crosses the prepare/commit boundary and may consume
-    /// a credential attempt or invoke a private key.
+    /// Whether this action may consume a credential attempt or invoke a
+    /// private key, and so needs the write-ahead journal (section 8.1).
     #[must_use]
     pub const fn is_consequential(&self) -> bool {
         matches!(
@@ -330,21 +333,26 @@ impl CardOperation {
     }
 }
 
-/// Typed request bound to one authenticated pair and session.
+/// Typed request bound to one authenticated pairing and carried by a session.
+///
+/// The request hash covers the pairing and every field a holder is shown and
+/// every field the card acts on, so an approval cannot be moved to a
+/// different request or pairing. The session is provenance only.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationRequest {
     /// Unique at-most-once operation identifier.
     pub operation_id: OperationId,
     /// Long-term pair binding.
     pub pair_id: PairId,
-    /// Current secure-session binding.
+    /// Session the request arrived on; provenance, not hashed.
     pub session_id: SessionId,
     /// Negotiated operation profile.
     pub profile: ProfileName,
     /// Local monotonic receipt/creation time. This is never sent or hashed.
     pub local_start_ms: u64,
-    /// Relative validity interval sent on the wire and independently capped
-    /// by each endpoint's local policy. Wall clocks are not used.
+    /// Relative validity interval sent on the wire, excluded from the hash,
+    /// and independently capped by each endpoint's local policy. Wall clocks
+    /// are not used.
     pub expires_after_ms: u64,
     /// Closed operation body.
     pub operation: CardOperation,
@@ -420,7 +428,7 @@ impl OperationRequest {
         self.validate()?;
         let (action, context, payload) = self.operation.wire_parts();
         compute_request_hash(
-            self.session_id,
+            self.pair_id,
             self.operation_id,
             self.profile,
             action,
@@ -459,10 +467,7 @@ impl OperationRequest {
             WireValue::Text(self.profile.as_str().to_owned()),
         );
         body.insert("action".into(), WireValue::Text(action.to_owned()));
-        body.insert(
-            "request_hash".into(),
-            WireValue::Bytes(self.request_hash()?.as_bytes().to_vec()),
-        );
+        self.validate()?;
         body.insert(
             "expires_after_ms".into(),
             WireValue::Unsigned(self.expires_after_ms),
@@ -472,54 +477,117 @@ impl OperationRequest {
         Ok(body)
     }
 
-    /// Parses an authenticated `operation.request` body and independently
-    /// verifies its deterministic hash.
+    /// Parses an authenticated `operation.request` body; both peers derive
+    /// its hash.
     ///
     /// # Errors
-    /// [`CardOperationError`] on a schema violation, unregistered values, or
-    /// a request-hash mismatch.
+    /// [`RequestError::Malformed`] on a schema violation, and
+    /// [`RequestError::Refused`] when the request is well formed but names a
+    /// lifetime, profile, action, or parameter this endpoint cannot serve.
     pub fn from_wire_body(
         mut body: BTreeMap<String, WireValue>,
         pair_id: PairId,
         session_id: SessionId,
         local_start_ms: u64,
-    ) -> Result<Self, CardOperationError> {
+    ) -> Result<Self, RequestError> {
         let operation_id_bytes = take_bytes(&mut body, "operation_id")?;
         let operation_id = OperationId::reconstruct(&operation_id_bytes)
             .map_err(|_| CardOperationError::InvalidIdentifier)?;
         let profile_text = take_text(&mut body, "profile")?;
-        let profile =
-            ProfileName::parse(&profile_text).ok_or(CardOperationError::UnknownProfile)?;
         let action = take_text(&mut body, "action")?;
-        let claimed_hash_bytes = take_bytes(&mut body, "request_hash")?;
-        let claimed_hash = RequestHash::reconstruct(&claimed_hash_bytes)
-            .map_err(|_| CardOperationError::InvalidIdentifier)?;
-        let expires_after_ms = take_unsigned(&mut body, "expires_after_ms")?;
         let context = take_map(&mut body, "context")?;
         let payload = take_map(&mut body, "payload")?;
+        let expires_after_ms = if body.contains_key("expires_after_ms") {
+            take_unsigned(&mut body, "expires_after_ms")?
+        } else {
+            DEFAULT_OPERATION_LIFETIME_MS
+        };
         if !body.is_empty() {
-            return Err(CardOperationError::UnexpectedField);
+            return Err(CardOperationError::UnexpectedField.into());
         }
-        let operation = CardOperation::from_wire_parts(&action, context, payload)?;
-        let request = Self::reconstruct(
-            operation_id,
+        let request_hash = compute_wire_request_hash(
             pair_id,
-            session_id,
-            profile,
-            local_start_ms,
-            expires_after_ms,
-            operation,
-        )?;
-        if request.request_hash()? != claimed_hash {
-            return Err(CardOperationError::RequestHashMismatch);
+            operation_id,
+            &profile_text,
+            &action,
+            context.clone(),
+            payload.clone(),
+        )
+        .map_err(|_| CardOperationError::HashFailure)?;
+        let refuse = |error| {
+            RequestError::Refused(OperationRequestRefusal {
+                reference: OperationReference {
+                    operation_id,
+                    request_hash,
+                },
+                error,
+            })
+        };
+        if expires_after_ms == 0 {
+            return Err(refuse(ResultError::InvalidLifetime));
+        }
+        let Some(profile) = ProfileName::parse(&profile_text) else {
+            return Err(refuse(ResultError::UnsupportedParameter));
+        };
+        let request = CardOperation::from_wire_parts(&action, context, payload)
+            .and_then(|operation| {
+                Self::reconstruct(
+                    operation_id,
+                    pair_id,
+                    session_id,
+                    profile,
+                    local_start_ms,
+                    expires_after_ms,
+                    operation,
+                )
+            })
+            .map_err(|_| refuse(ResultError::UnsupportedParameter))?;
+        if request.request_hash()? != request_hash {
+            return Err(refuse(ResultError::UnsupportedParameter));
         }
         Ok(request)
     }
 }
 
-/// Public card state returned by `InspectCard`.
+/// A request that parsed as an envelope but names something this endpoint
+/// cannot serve.
+///
+/// It is a semantic rejection answered with a result, not an authenticated
+/// protocol violation (section 9.2), so it carries the reference the result
+/// must echo.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OperationRequestRefusal {
+    /// The identifier and the commitment the refusal result echoes.
+    pub reference: OperationReference,
+    /// The registered rejection error.
+    pub error: ResultError,
+}
+
+/// Why a received `operation.request` body cannot become a request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestError {
+    /// The body violates the registered schema.
+    Malformed(CardOperationError),
+    /// The body is well formed but cannot be served; answer with a result.
+    Refused(OperationRequestRefusal),
+}
+
+impl From<CardOperationError> for RequestError {
+    fn from(error: CardOperationError) -> Self {
+        Self::Malformed(error)
+    }
+}
+
+/// Public card state returned by `InspectCard`.
+///
+/// The `inspect_card` answer (section 9.1) carries the card's answer to
+/// reset; the factory flags and counters travel beside it as this
+/// implementation's own response fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CardInspection {
+    /// The answer to reset, or its historical bytes where the platform hides
+    /// the rest; empty when the platform exposes neither.
+    pub answer_to_reset: Vec<u8>,
     /// Whether PIN 1 still has factory reference data.
     pub pin1_factory: bool,
     /// Whether PIN 2 still has factory reference data.
@@ -537,17 +605,81 @@ pub struct CardInspection {
 pub enum CardOperationResult {
     /// Card status read.
     Inspection(CardInspection),
-    /// Display identity returned as separately labelled values.
-    Identity {
-        /// Cardholder display name.
-        display_name: String,
-        /// Cardholder person identifier.
-        person_id: String,
-    },
+    /// The `read_identity` answer (section 9.1).
+    Identity(CardIdentity),
     /// DER certificate bytes.
     Certificate(Vec<u8>),
     /// Card-produced signature bytes.
     Signature(Vec<u8>),
+}
+
+/// The `read_identity` answer (section 9.1).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CardIdentity {
+    /// Cardholder name, 1 to 128 bytes.
+    pub holder_name: String,
+    /// Card identifier, 1 to 64 bytes.
+    pub card_id: String,
+    /// `YYYY-MM-DD`.
+    pub issuance_date: String,
+    /// `YYYY-MM-DD`.
+    pub expiration_date: String,
+    /// DER-encoded X.509 certificates, at least one.
+    pub certificates: Vec<Vec<u8>>,
+    /// Optional token label, 1 to 64 bytes.
+    pub token_display_name: Option<String>,
+}
+
+/// Byte bounds of the `read_identity` response schema (section 9.1).
+const HOLDER_NAME_BYTES: core::ops::RangeInclusive<usize> = 1..=128;
+const CARD_ID_BYTES: core::ops::RangeInclusive<usize> = 1..=64;
+const DATE_BYTES: usize = 10;
+const TOKEN_DISPLAY_NAME_BYTES: core::ops::RangeInclusive<usize> = 1..=64;
+
+impl CardIdentity {
+    /// Constructs an identity answer within the section 9.1 bounds.
+    ///
+    /// # Errors
+    /// [`CardOperationError::InvalidField`] naming the first field outside
+    /// its bounds.
+    pub fn reconstruct(
+        holder_name: String,
+        card_id: String,
+        issuance_date: String,
+        expiration_date: String,
+        certificates: Vec<Vec<u8>>,
+        token_display_name: Option<String>,
+    ) -> Result<Self, CardOperationError> {
+        if !HOLDER_NAME_BYTES.contains(&holder_name.len()) {
+            return Err(CardOperationError::InvalidField("card_holder_name"));
+        }
+        if !CARD_ID_BYTES.contains(&card_id.len()) {
+            return Err(CardOperationError::InvalidField("card_id"));
+        }
+        if issuance_date.len() != DATE_BYTES {
+            return Err(CardOperationError::InvalidField("issuance_date"));
+        }
+        if expiration_date.len() != DATE_BYTES {
+            return Err(CardOperationError::InvalidField("expiration_date"));
+        }
+        if certificates.is_empty() || certificates.iter().any(Vec::is_empty) {
+            return Err(CardOperationError::InvalidField("certificates"));
+        }
+        if token_display_name
+            .as_ref()
+            .is_some_and(|name| !TOKEN_DISPLAY_NAME_BYTES.contains(&name.len()))
+        {
+            return Err(CardOperationError::InvalidField("token_display_name"));
+        }
+        Ok(Self {
+            holder_name,
+            card_id,
+            issuance_date,
+            expiration_date,
+            certificates,
+            token_display_name,
+        })
+    }
 }
 
 fn validate_named_digest(
@@ -591,7 +723,7 @@ pub enum CardOperationError {
     InvalidField(&'static str),
     /// A typed request contained an additional unregistered field.
     UnexpectedField,
-    /// Echoed request hash did not cover the received request.
+    /// A result echoed a request hash that does not cover the request.
     RequestHashMismatch,
     /// Deterministic request commitment could not be constructed.
     HashFailure,

@@ -27,7 +27,7 @@ use super::{
     RENDEZVOUS_TOKEN_SIZE, REQUEST_HASH_SIZE, RendezvousToken, RequestHash, SESSION_ID_SIZE,
     SequenceGuard, SessionId, WIRE_VERSION_V26_10_1, WireError, WireValue, X25519_KEY_SIZE,
     encode_deterministic_cbor,
-    noise::{KkHfsHandshakeState, NoiseTransport},
+    noise::{KkHandshakeState, NoiseTransport},
 };
 
 /// Local endpoint role in the fixed RAPP Noise patterns.
@@ -135,7 +135,7 @@ impl core::fmt::Debug for SessionHandshakeParameters<'_> {
 
 enum HandshakeChannelState {
     Snow(Box<HandshakeState>),
-    KkHfs(Box<KkHfsHandshakeState>),
+    Kk(Box<KkHandshakeState>),
 }
 
 /// Noise handshake plus the values derived on completion.
@@ -272,7 +272,7 @@ impl HandshakeChannel {
         })
     }
 
-    /// Begin the mandatory pair-specific KKhfs session handshake.
+    /// Begin the mandatory pair-specific `Noise_KK` session handshake.
     ///
     /// # Errors
     /// [`CryptoError`] when the suite, keys, or prologue cannot be
@@ -283,14 +283,14 @@ impl HandshakeChannel {
             parameters.grants_hash,
             parameters.transport_profile,
         )?;
-        let state = KkHfsHandshakeState::new(
+        let state = KkHandshakeState::new(
             parameters.role,
             &parameters.local_keys.private_key,
             parameters.remote_public_key,
             &prologue,
         )?;
         Ok(Self {
-            state: HandshakeChannelState::KkHfs(Box::new(state)),
+            state: HandshakeChannelState::Kk(Box::new(state)),
             derive_pair: false,
         })
     }
@@ -306,7 +306,7 @@ impl HandshakeChannel {
             HandshakeChannelState::Snow(state) => state
                 .write_message(&[], &mut output)
                 .map_err(|_| CryptoError::NoiseHandshake)?,
-            HandshakeChannelState::KkHfs(state) => state
+            HandshakeChannelState::Kk(state) => state
                 .write_message(&[], &mut output)
                 .map_err(|_| CryptoError::NoiseHandshake)?,
         };
@@ -324,7 +324,7 @@ impl HandshakeChannel {
             HandshakeChannelState::Snow(state) => state
                 .read_message(frame.as_bytes(), &mut payload)
                 .map_err(|_| CryptoError::NoiseHandshake)?,
-            HandshakeChannelState::KkHfs(state) => state
+            HandshakeChannelState::Kk(state) => state
                 .read_message(frame.as_bytes(), &mut payload)
                 .map_err(|_| CryptoError::NoiseHandshake)?,
         };
@@ -339,7 +339,7 @@ impl HandshakeChannel {
     pub fn is_complete(&self) -> bool {
         match &self.state {
             HandshakeChannelState::Snow(state) => state.is_handshake_finished(),
-            HandshakeChannelState::KkHfs(state) => state.is_finished(),
+            HandshakeChannelState::Kk(state) => state.is_finished(),
         }
     }
 
@@ -380,7 +380,7 @@ impl HandshakeChannel {
                     remote_static_key: remote_static,
                 })
             }
-            HandshakeChannelState::KkHfs(state) => {
+            HandshakeChannelState::Kk(state) => {
                 let handshake_hash = state.handshake_hash();
                 let session_id = derive_session_id(&handshake_hash);
                 let remote_static = state.remote_static();
@@ -540,23 +540,47 @@ pub fn compute_grants_hash(profiles: &[ProfileName]) -> Result<GrantsHash, Crypt
     Ok(GrantsHash::from_array(bytes))
 }
 
-/// Bind the exact typed operation request to its secure channel.
+/// Bind the exact typed operation request to its pairing (RAPP v26.10.1
+/// section 8.2.1).
+///
+/// The commitment is session-independent, so an identical request
+/// retransmitted on a later session of the same pairing hashes the same.
 ///
 /// # Errors
 /// [`CryptoError::Wire`] when deterministic encoding fails.
 pub fn compute_request_hash(
-    session_id: SessionId,
+    pair_id: PairId,
     operation_id: OperationId,
     profile: ProfileName,
     action: &str,
     context: BTreeMap<String, WireValue>,
     payload: BTreeMap<String, WireValue>,
 ) -> Result<RequestHash, CryptoError> {
+    compute_wire_request_hash(
+        pair_id,
+        operation_id,
+        profile.as_str(),
+        action,
+        context,
+        payload,
+    )
+}
+
+/// The section 8.2.1 commitment over a request exactly as the wire carries
+/// it, before its profile name is interpreted.
+pub(crate) fn compute_wire_request_hash(
+    pair_id: PairId,
+    operation_id: OperationId,
+    profile: &str,
+    action: &str,
+    context: BTreeMap<String, WireValue>,
+    payload: BTreeMap<String, WireValue>,
+) -> Result<RequestHash, CryptoError> {
     let preimage = WireValue::Array(vec![
         WireValue::Text("RAPP-request-v1".to_owned()),
-        WireValue::Bytes(session_id.as_bytes().to_vec()),
+        WireValue::Bytes(pair_id.as_bytes().to_vec()),
         WireValue::Bytes(operation_id.as_bytes().to_vec()),
-        WireValue::Text(profile.as_str().to_owned()),
+        WireValue::Text(profile.to_owned()),
         WireValue::Text(action.to_owned()),
         WireValue::Map(context),
         WireValue::Map(payload),

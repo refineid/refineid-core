@@ -1,29 +1,115 @@
 // Copyright 2026 Petri Koistinen
 // Licensed under the Apache License, Version 2.0.
 
-//! Integration tests for hybrid post-quantum Noise_KKhfs_25519+MLKEM768_ChaChaPoly_SHA256.
+//! Integration tests for the `Noise_KK_25519_ChaChaPoly_SHA512` session handshake.
 
 use std::collections::BTreeMap;
 
 use refineid_rapp::{
     GrantsHash, HandshakeRole, MANDATORY_SESSION_SUITE, MessageType, PairId,
     SessionHandshakeParameters, WireValue, generate_pair_key_material,
-    noise::{MLKEM768_CIPHERTEXT_SIZE, MLKEM768_PUBLIC_KEY_SIZE, MLKEM768_SHARED_SECRET_SIZE},
+    noise::{KK_HANDSHAKE_MESSAGE_SIZE, KkHandshakeState},
 };
 
 #[test]
-fn kkhfs_constants_conform_to_fips203() {
-    assert_eq!(MLKEM768_PUBLIC_KEY_SIZE, 1184);
-    assert_eq!(MLKEM768_CIPHERTEXT_SIZE, 1088);
-    assert_eq!(MLKEM768_SHARED_SECRET_SIZE, 32);
+fn kk_constants_conform_to_the_specification() {
+    assert_eq!(KK_HANDSHAKE_MESSAGE_SIZE, 48);
+    assert_eq!(MANDATORY_SESSION_SUITE, "Noise_KK_25519_ChaChaPoly_SHA512");
+}
+
+#[test]
+fn native_kk_replays_the_fixed_transcript() {
+    let prologue = hex::decode(
+        "866f524150502d73657373696f6e2d763183181a0a0178204e6f6973655f4b4b5f32353531395f436861436861506f6c795f534841353132508ab9b8bcde5c6eec845d9b1ca0d3a7be582077777777777777777777777777777777777777777777777777777777777777777766692e726566696e6569642e726170702e626c652e7631",
+    )
+    .expect("prologue hex");
+    let initiator_static = [0x11_u8; 32];
+    let responder_static = [0x22_u8; 32];
+    let mut initiator = KkHandshakeState::new(
+        HandshakeRole::Initiator,
+        &initiator_static,
+        &refineid_rapp::noise::x25519_public_key(&responder_static),
+        &prologue,
+    )
+    .expect("initiator");
+    initiator.set_fixed_ephemeral_for_testing([0x33_u8; 32]);
+    let mut responder = KkHandshakeState::new(
+        HandshakeRole::Responder,
+        &responder_static,
+        &refineid_rapp::noise::x25519_public_key(&initiator_static),
+        &prologue,
+    )
+    .expect("responder");
+    responder.set_fixed_ephemeral_for_testing([0x44_u8; 32]);
+
+    let mut message = [0_u8; 64];
+    let mut payload = [0_u8; 64];
+    let length = initiator
+        .write_message(&[], &mut message)
+        .expect("message 1");
     assert_eq!(
-        MANDATORY_SESSION_SUITE,
-        "Noise_KKhfs_25519+MLKEM768_ChaChaPoly_SHA512"
+        hex::encode(&message[..length]),
+        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b14b9cb8d7741b7e01e1d22ae0ba8162c7e"
+    );
+    assert_eq!(
+        responder
+            .read_message(&message[..length], &mut payload)
+            .expect("read 1"),
+        0
+    );
+    let length = responder
+        .write_message(&[], &mut message)
+        .expect("message 2");
+    assert_eq!(
+        hex::encode(&message[..length]),
+        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6bd8189010df4810686dc04a84a66aa8e9"
+    );
+    assert_eq!(
+        initiator
+            .read_message(&message[..length], &mut payload)
+            .expect("read 2"),
+        0
+    );
+    let expected_hash = "f287112eff978f225d84991c5fb3cbce836b6c9832d4bccf8794042a08265436b90f7b3e7a67df85f5529d62bee5543d49277d565ab9ab2bf809a6064e6e55ae";
+    assert_eq!(hex::encode(initiator.handshake_hash()), expected_hash);
+    assert_eq!(hex::encode(responder.handshake_hash()), expected_hash);
+    assert_eq!(
+        hex::encode(refineid_rapp::derive_session_id(&initiator.handshake_hash()).as_bytes()),
+        "7c1795d5de43a27ea50681e943fa2599"
+    );
+
+    let mut initiator_transport = initiator.into_transport().expect("initiator transport");
+    let mut responder_transport = responder.into_transport().expect("responder transport");
+    let mut sealed = [0_u8; 64];
+    let mut opened = [0_u8; 64];
+    let length = initiator_transport
+        .write_message(b"RAPP", &mut sealed)
+        .expect("seal");
+    let length = responder_transport
+        .read_message(&sealed[..length], &mut opened)
+        .expect("open");
+    assert_eq!(&opened[..length], b"RAPP");
+}
+
+#[test]
+fn kk_rejects_a_low_order_ephemeral() {
+    let mut responder = KkHandshakeState::new(
+        HandshakeRole::Responder,
+        &[0x22_u8; 32],
+        &refineid_rapp::noise::x25519_public_key(&[0x11_u8; 32]),
+        &[],
+    )
+    .expect("responder");
+    let mut payload = [0_u8; 64];
+    assert!(
+        responder
+            .read_message(&[0_u8; KK_HANDSHAKE_MESSAGE_SIZE], &mut payload)
+            .is_err()
     );
 }
 
 #[test]
-fn kkhfs_handshake_and_transport_round_trip() {
+fn kk_handshake_and_transport_round_trip() {
     let requester_keys = generate_pair_key_material().expect("requester keys");
     let proxy_keys = generate_pair_key_material().expect("proxy keys");
     let pair_id = PairId::from_array([1_u8; 16]);
@@ -54,8 +140,8 @@ fn kkhfs_handshake_and_transport_round_trip() {
     let msg1 = requester.write_message().expect("write message 1");
     assert_eq!(
         msg1.as_bytes().len(),
-        32 + MLKEM768_PUBLIC_KEY_SIZE + 16 + 16,
-        "Message 1 must be 1248 bytes"
+        KK_HANDSHAKE_MESSAGE_SIZE,
+        "Message 1 must be 48 bytes"
     );
     proxy.read_message(&msg1).expect("read message 1");
 
@@ -63,8 +149,8 @@ fn kkhfs_handshake_and_transport_round_trip() {
     let msg2 = proxy.write_message().expect("write message 2");
     assert_eq!(
         msg2.as_bytes().len(),
-        32 + MLKEM768_CIPHERTEXT_SIZE + 16 + 16,
-        "Message 2 must be 1152 bytes"
+        KK_HANDSHAKE_MESSAGE_SIZE,
+        "Message 2 must be 48 bytes"
     );
     requester.read_message(&msg2).expect("read message 2");
 
@@ -116,7 +202,7 @@ fn kkhfs_handshake_and_transport_round_trip() {
 }
 
 #[test]
-fn kkhfs_rejects_tampered_handshake_frame() {
+fn kk_rejects_tampered_handshake_frame() {
     let requester_keys = generate_pair_key_material().expect("requester keys");
     let proxy_keys = generate_pair_key_material().expect("proxy keys");
     let pair_id = PairId::from_array([3_u8; 16]);

@@ -19,7 +19,7 @@ use super::{OperationId, OperationResultMessage, OperationState, PairId, Request
 pub struct JournalRecord {
     /// Stored pairing that authorized the operation.
     pub pair_id: PairId,
-    /// Secure session in which the request was committed.
+    /// Session the request arrived on; advisory provenance.
     pub session_id: SessionId,
     /// Semantic operation identifier.
     pub operation_id: OperationId,
@@ -120,7 +120,7 @@ pub struct OperationJournal {
 }
 
 impl OperationJournal {
-    /// Create a prepared operation with zero transmissions.
+    /// Create an operation with zero transmissions and nothing persisted.
     #[must_use]
     pub const fn prepared(
         pair_id: PairId,
@@ -141,48 +141,36 @@ impl OperationJournal {
         }
     }
 
+    /// Resume the coordinator of a record loaded after a restart.
+    #[must_use]
+    pub const fn recovered(record: JournalRecord) -> Self {
+        Self { record }
+    }
+
     /// Current durable record view.
     #[must_use]
     pub const fn record(&self) -> &JournalRecord {
         &self.record
     }
 
-    /// Persist the point of no return before accepting a card command.
-    ///
-    /// # Errors
-    /// [`JournalError`] on an illegal state, a request-hash mismatch, or a
-    /// persistence failure.
-    pub fn commit<S: JournalStore>(
-        &mut self,
-        store: &mut S,
-        request_hash: RequestHash,
-    ) -> Result<(), JournalError<S::Error>> {
-        if self.record.state != OperationState::Prepared {
-            return Err(JournalError::InvalidState {
-                state: self.record.state,
-            });
-        }
-        if self.record.request_hash != request_hash {
-            return Err(JournalError::RequestHashMismatch);
-        }
-        self.persist_update(store, OperationState::Committed, 0)
-    }
-
-    /// Persist exactly one transmission and consume a non-clonable command.
+    /// Persist the write-ahead in-flight entry, counting the one
+    /// transmission, and consume a non-clonable command (section 8.1).
     ///
     /// The returned wrapper is the only value an APDU/card adapter may accept.
     /// A persistence failure returns the command to the caller and performs no
     /// transmission.
     ///
     /// # Errors
-    /// [`JournalError`] beside the returned command on an illegal state, an
-    /// already-counted transmission, or a persistence failure.
+    /// [`JournalError`] beside the returned command on an illegal state, a
+    /// request-hash mismatch, an already-counted transmission, or a
+    /// persistence failure.
     pub fn begin_card_command<S: JournalStore, C>(
         &mut self,
         store: &mut S,
+        request_hash: RequestHash,
         command: C,
     ) -> Result<PendingCardCommand<C>, (JournalError<S::Error>, C)> {
-        if self.record.state != OperationState::Committed {
+        if self.record.state != OperationState::Prepared {
             return Err((
                 JournalError::InvalidState {
                     state: self.record.state,
@@ -190,31 +178,49 @@ impl OperationJournal {
                 command,
             ));
         }
+        if self.record.request_hash != request_hash {
+            return Err((JournalError::RequestHashMismatch, command));
+        }
         if self.record.transmission_count != 0 {
             return Err((JournalError::AlreadyTransmitted, command));
         }
-
         if let Err(error) = self.persist_update(store, OperationState::Executing, 1) {
             return Err((error, command));
         }
         Ok(PendingCardCommand { command })
     }
 
-    /// Persist a terminal result after the one physical exchange.
+    /// Persist an unsuccessful terminal state with the result that reports
+    /// it.
+    ///
+    /// Legal before any transmission and after the one card exchange; the
+    /// retained result answers an identical retransmission later.
     ///
     /// # Errors
     /// [`JournalError`] on an illegal state or a persistence failure.
-    pub fn finish<S: JournalStore>(
+    pub fn finish_failure<S: ResultJournalStore>(
         &mut self,
         store: &mut S,
         state: OperationState,
+        result: &OperationResultMessage,
     ) -> Result<(), JournalError<S::Error>> {
-        if self.record.state != OperationState::Executing || !is_unacknowledged_terminal(state) {
+        if !matches!(
+            self.record.state,
+            OperationState::Prepared | OperationState::Executing
+        ) || !is_unacknowledged_terminal(state)
+        {
             return Err(JournalError::InvalidState {
                 state: self.record.state,
             });
         }
-        self.persist_update(store, state, self.record.transmission_count)
+        let mut next = self.record;
+        next.state = state;
+        next.automatic_retry_permitted = false;
+        store
+            .persist_result(&next, result)
+            .map_err(JournalError::Persistence)?;
+        self.record = next;
+        Ok(())
     }
 
     /// Atomically retain a successful consequential result before sending it.
@@ -230,7 +236,7 @@ impl OperationJournal {
     }
 
     /// Atomically retain a successful registered safe-read result. Safe reads
-    /// have no credential-command transmission and omit prepare/commit on wire.
+    /// have no credential-command transmission and no in-flight entry.
     ///
     /// # Errors
     /// [`JournalError`] on an illegal state or a persistence failure.
@@ -242,40 +248,11 @@ impl OperationJournal {
         self.persist_completed_from(store, result, OperationState::Prepared)
     }
 
-    /// Persist a non-success safe-read result without a command transmission.
+    /// Persist exact result acknowledgment and erase the retained body,
+    /// leaving the durable tombstone (section 8.2.5).
     ///
-    /// # Errors
-    /// [`JournalError`] on an illegal state or a persistence failure.
-    pub fn finish_safe_read_failure<S: JournalStore>(
-        &mut self,
-        store: &mut S,
-        state: OperationState,
-    ) -> Result<(), JournalError<S::Error>> {
-        if self.record.state != OperationState::Prepared || !is_unacknowledged_terminal(state) {
-            return Err(JournalError::InvalidState {
-                state: self.record.state,
-            });
-        }
-        self.persist_update(store, state, 0)
-    }
-
-    /// Persist a proven cancellation after commit but before transmission.
-    ///
-    /// # Errors
-    /// [`JournalError`] on an illegal state or a persistence failure.
-    pub fn cancel_committed_before_transmission<S: JournalStore>(
-        &mut self,
-        store: &mut S,
-    ) -> Result<(), JournalError<S::Error>> {
-        if self.record.state != OperationState::Committed || self.record.transmission_count != 0 {
-            return Err(JournalError::InvalidState {
-                state: self.record.state,
-            });
-        }
-        self.persist_update(store, OperationState::Cancelled, 0)
-    }
-
-    /// Persist exact result acknowledgment and erase the retained body.
+    /// A result whose delivery became uncertain is still acknowledgeable once
+    /// it is delivered again.
     ///
     /// # Errors
     /// [`JournalError`] on an illegal state or a persistence failure.
@@ -283,7 +260,10 @@ impl OperationJournal {
         &mut self,
         store: &mut S,
     ) -> Result<(), JournalError<S::Error>> {
-        if self.record.state != OperationState::ResultPending {
+        if !matches!(
+            self.record.state,
+            OperationState::ResultPending | OperationState::DeliveryUncertain
+        ) {
             return Err(JournalError::InvalidState {
                 state: self.record.state,
             });
@@ -321,7 +301,7 @@ impl OperationJournal {
         Ok(())
     }
 
-    /// Recover a committed/executing non-terminal record without retrying it.
+    /// Recover an in-flight non-terminal record without retrying it.
     ///
     /// # Errors
     /// [`JournalError`] on an illegal state or a persistence failure.
@@ -384,8 +364,7 @@ impl OperationJournal {
 const fn is_unacknowledged_terminal(state: OperationState) -> bool {
     matches!(
         state,
-        OperationState::Denied
-            | OperationState::Cancelled
+        OperationState::Cancelled
             | OperationState::Rejected
             | OperationState::CredentialRejected
             | OperationState::Ambiguous
@@ -437,19 +416,35 @@ mod tests {
     fn command_is_persisted_before_it_is_exposed_to_transport() {
         let mut journal = journal();
         let mut store = MemoryStore::default();
-        journal
-            .commit(&mut store, RequestHash::from_array([4; 32]))
-            .expect("memory persistence succeeds");
 
         let command = journal
-            .begin_card_command(&mut store, "one-shot")
-            .expect("committed command may start");
+            .begin_card_command(&mut store, RequestHash::from_array([4; 32]), "one-shot")
+            .expect("the in-flight entry is written once");
 
         assert_eq!(
-            store.0.last().map(|record| record.transmission_count),
-            Some(1)
+            store
+                .0
+                .last()
+                .map(|record| (record.state, record.transmission_count)),
+            Some((OperationState::Executing, 1))
         );
+        assert_eq!(store.0.len(), 1);
         assert_eq!(command.execute(|value| value), "one-shot");
+    }
+
+    #[test]
+    fn a_second_command_is_refused() {
+        let mut journal = journal();
+        let mut store = MemoryStore::default();
+        journal
+            .begin_card_command(&mut store, RequestHash::from_array([4; 32]), "one-shot")
+            .expect("the in-flight entry is written once");
+        assert!(
+            journal
+                .begin_card_command(&mut store, RequestHash::from_array([4; 32]), "again")
+                .is_err()
+        );
+        assert_eq!(store.0.len(), 1);
     }
 
     #[test]
@@ -457,11 +452,11 @@ mod tests {
         let mut journal = journal();
         let mut store = MemoryStore::default();
         journal
-            .commit(&mut store, RequestHash::from_array([4; 32]))
-            .expect("memory persistence succeeds");
+            .begin_card_command(&mut store, RequestHash::from_array([4; 32]), "one-shot")
+            .expect("the in-flight entry is written once");
         journal
             .recover_after_crash(&mut store)
-            .expect("committed record becomes ambiguous");
+            .expect("in-flight record becomes ambiguous");
 
         assert_eq!(journal.record().state, OperationState::Ambiguous);
         assert!(!journal.record().automatic_retry_permitted);

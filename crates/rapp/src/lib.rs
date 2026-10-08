@@ -56,7 +56,7 @@ mod wire;
 pub use authorization::{
     ApprovalOutcome, AuthorizationError, AuthorizationStage, AuthorizationTransaction,
     AuthorizedCardCommand, AuthorizedSafeRead, OperationProgressMessage, OperationReference,
-    ProgressEvent, ProxyCancelOutcome, UserApproval,
+    ProgressEvent, UserApproval,
 };
 pub use cpace::{
     CPACE_CONFIRMATION_KEY_SIZE, CPACE_KC2_SUITE, CPACE_POINT_SIZE, CPACE_PRK_SIZE, CPACE_PSK_SIZE,
@@ -85,14 +85,15 @@ pub use liveness::{
     PongDisposition,
 };
 pub use message::{
-    CancelMessage, LivenessMessage, MessageError, NegotiatedParameters, PairingAbortMessage,
+    LivenessMessage, MessageError, NegotiatedParameters, PairingAbortMessage,
     PairingConfirmMessage, PairingHelloMessage, ProtocolErrorMessage, SessionCloseMessage,
     SessionParameters, SessionReadyMessage, StatusReport, TypedMessage,
 };
 pub use offer::{PairingOffer, PairingOfferDeadline, PairingOfferError, PairingOfferUri};
 pub use operation::{
-    CardInspection, CardKeyProfile, CardOperation, CardOperationError, CardOperationResult,
-    CertificateKind, CredentialKind, OperationRequest, SignatureAlgorithm,
+    CardIdentity, CardInspection, CardKeyProfile, CardOperation, CardOperationError,
+    CardOperationResult, CertificateKind, CredentialKind, DEFAULT_OPERATION_LIFETIME_MS,
+    OperationRequest, OperationRequestRefusal, RequestError, SignatureAlgorithm,
 };
 pub use pairing::{
     PAIR_RECORD_FORMAT_VERSION, PairRecord, PairRecordCodecError, PairRecordError, PairStore,
@@ -110,13 +111,13 @@ pub use proxy_engine::{
     ProxyDispatch, ProxyEngineError, ProxyOperationEngine, ProxySessionCloseAction, ProxyViolation,
 };
 pub use requester::{
-    RequesterCancelAction, RequesterError, RequesterJournalRecord, RequesterJournalStore,
-    RequesterOperation, RequesterRecoveryStore, RequesterResultAction,
+    RequesterError, RequesterJournalRecord, RequesterJournalStore, RequesterOperation,
+    RequesterRecoveryStore, RequesterResultAction,
 };
 pub use requester_engine::{
     RequesterDispatch, RequesterEngineError, RequesterOperationEngine, RequesterViolation,
 };
-pub use result::{OperationResultMessage, ResultError, ResultStatus};
+pub use result::{OperationResultMessage, ProxyFailure, ResultError, ResultResponse, ResultStatus};
 pub use runtime::{EstablishedSessionRuntime, RuntimeError, RuntimePoll, RuntimeReceive};
 pub use session_flow::{ExplicitUserIntent, SessionAuthentication, SessionError, SessionHandshake};
 pub use state::{

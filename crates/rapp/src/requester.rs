@@ -3,9 +3,9 @@
 use core::fmt;
 
 use super::{
-    CancelMessage, CardOperationError, CardOperationResult, OperationProgressMessage,
-    OperationReference, OperationRequest, OperationResultMessage, OperationState, PairId,
-    ProgressEvent, RequestHash, ResultStatus, SessionId, StatusReport, TypedMessage,
+    CardOperationError, CardOperationResult, OperationProgressMessage, OperationReference,
+    OperationRequest, OperationResultMessage, OperationState, PairId, ProgressEvent, RequestHash,
+    ResultError, ResultStatus, SessionId, StatusReport, TypedMessage,
 };
 
 /// Complete non-secret requester journal record.
@@ -106,100 +106,44 @@ impl RequesterOperation {
         Ok(TypedMessage::OperationRequest(self.request.clone()))
     }
 
-    /// Accept exact `operation.prepared` and journal it.
+    /// The terminal state an unanswered request reaches when its session
+    /// ends.
     ///
-    /// # Errors
-    /// [`RequesterError`] on a wrong state, a reference mismatch, a prepared
-    /// echo for a safe read, or a persistence failure.
-    pub fn receive_prepared<S: RequesterJournalStore>(
-        &mut self,
-        store: &mut S,
-        reference: OperationReference,
-    ) -> Result<(), RequesterError<S::Error>> {
-        self.require_state(OperationState::Requested)?;
-        self.require_reference(reference)?;
-        if !self.request.operation.is_consequential() {
-            return Err(RequesterError::UnexpectedPreparedForSafeRead);
+    /// The custodian may have acted on a consequential request after
+    /// consent, so its fate is ambiguous until reconciled (section 8.3); a
+    /// safe read touched no credential and simply ends.
+    const fn unanswered_terminal(&self) -> OperationState {
+        if self.request.operation.is_consequential() {
+            OperationState::Ambiguous
+        } else {
+            OperationState::Cancelled
         }
-        self.persist_state(store, OperationState::Prepared)
     }
 
-    /// Persist the requester's point of no return before releasing commit.
+    /// Abandon the request locally; no message travels (section 8.3).
     ///
     /// # Errors
-    /// [`RequesterError`] on a wrong state or a persistence failure.
-    pub fn commit<S: RequesterJournalStore>(
-        &mut self,
-        store: &mut S,
-    ) -> Result<TypedMessage, RequesterError<S::Error>> {
-        self.require_state(OperationState::Prepared)?;
-        self.persist_state(store, OperationState::Committed)?;
-        Ok(TypedMessage::OperationCommit(self.reference))
-    }
-
-    /// Journal and emit an advisory cancellation. Before commit this is a
-    /// terminal cancellation. After commit it cannot prove that the card
-    /// command did not execute, so the operation remains committed.
-    ///
-    /// # Errors
-    /// [`RequesterError`] on a terminal or illegal state or a persistence
-    /// failure.
+    /// [`RequesterError`] when the request is no longer awaiting its result,
+    /// or on a persistence failure.
     pub fn cancel<S: RequesterJournalStore>(
         &mut self,
         store: &mut S,
-        reason: Option<String>,
-    ) -> Result<RequesterCancelAction, RequesterError<S::Error>> {
-        let message = TypedMessage::OperationCancel(CancelMessage {
-            reference: self.reference,
-            reason,
-        });
-        match self.record.state {
-            OperationState::Requested
-            | OperationState::AwaitingConsent
-            | OperationState::Prepared => {
-                self.persist_state(store, OperationState::Cancelled)?;
-                Ok(RequesterCancelAction::Terminal(message))
-            }
-            OperationState::Committed
-            | OperationState::Executing
-            | OperationState::ResultPending => Ok(RequesterCancelAction::Advisory(message)),
-            state if state.is_terminal() => Err(RequesterError::UnknownOperationRace),
-            state => Err(RequesterError::WrongState(state)),
-        }
-    }
-
-    /// Apply a cancellation sent by the proxy under the same commit boundary.
-    ///
-    /// # Errors
-    /// [`RequesterError`] on a reference mismatch, a terminal or illegal
-    /// state, or a persistence failure.
-    pub fn receive_cancel<S: RequesterJournalStore>(
-        &mut self,
-        store: &mut S,
-        cancellation: &CancelMessage,
     ) -> Result<OperationState, RequesterError<S::Error>> {
-        self.require_reference(cancellation.reference)?;
-        match self.record.state {
-            OperationState::Requested
-            | OperationState::AwaitingConsent
-            | OperationState::Prepared => {
-                self.persist_state(store, OperationState::Cancelled)?;
-                Ok(OperationState::Cancelled)
-            }
-            OperationState::Committed
-            | OperationState::Executing
-            | OperationState::ResultPending => Ok(self.record.state),
-            state if state.is_terminal() => Err(RequesterError::UnknownOperationRace),
-            state => Err(RequesterError::WrongState(state)),
-        }
+        self.require_state(OperationState::Requested)?;
+        let terminal = self.unanswered_terminal();
+        self.persist_state(store, terminal)?;
+        Ok(terminal)
     }
 
-    /// Validate and durably retain a result. Completed results require an ack;
-    /// all other statuses become terminal immediately and receive no ack.
+    /// Validate and durably retain a result.
+    ///
+    /// A live completed result is held until the acknowledgment is
+    /// delivered; every other status, and a retired completed one, is
+    /// terminal at once and is never acknowledged.
     ///
     /// # Errors
-    /// [`RequesterError`] on a result that fails typed validation, a status
-    /// illegal for the current state, or a persistence failure.
+    /// [`RequesterError`] on a result that fails typed validation, a result
+    /// for an operation no longer awaiting one, or a persistence failure.
     pub fn receive_result<S: RequesterJournalStore>(
         &mut self,
         store: &mut S,
@@ -208,42 +152,28 @@ impl RequesterOperation {
         result
             .validate_for(self.reference, &self.request.operation)
             .map_err(RequesterError::Operation)?;
-        let legal_state = match result.status {
-            ResultStatus::Completed => {
-                if self.request.operation.is_consequential() {
-                    self.record.state == OperationState::Committed
-                } else {
-                    self.record.state == OperationState::Requested
-                }
-            }
-            ResultStatus::Denied => matches!(
-                self.record.state,
-                OperationState::Requested | OperationState::Prepared
-            ),
-            ResultStatus::Cancelled | ResultStatus::Rejected | ResultStatus::CredentialRejected => {
-                matches!(
-                    self.record.state,
-                    OperationState::Requested
-                        | OperationState::Prepared
-                        | OperationState::Committed
-                )
-            }
-            ResultStatus::Ambiguous => self.record.state == OperationState::Committed,
-        };
-        if !legal_state {
-            return Err(RequesterError::WrongState(self.record.state));
-        }
-        if result.status == ResultStatus::Completed {
-            self.record.retained_result = result.result;
+        self.require_state(OperationState::Requested)?;
+        if let (ResultStatus::Completed, false, Some(response)) =
+            (result.status, result.retired, &result.response)
+        {
+            self.record.retained_result = Some(
+                response
+                    .typed_for(&self.request.operation)
+                    .map_err(RequesterError::Operation)?,
+            );
             self.persist_state(store, OperationState::ResultPending)?;
-            Ok(RequesterResultAction::SendAcknowledgment(
+            return Ok(RequesterResultAction::SendAcknowledgment(
                 TypedMessage::OperationResultAck(self.reference),
-            ))
-        } else {
-            let terminal = result_status_state(result.status);
-            self.persist_state(store, terminal)?;
-            Ok(RequesterResultAction::Terminal(terminal))
+            ));
         }
+        let terminal = result_status_state(result.status);
+        self.persist_state(store, terminal)?;
+        Ok(RequesterResultAction::Terminal {
+            state: terminal,
+            status: result.status,
+            error: result.error,
+            remaining_retries: result.remaining_retries,
+        })
     }
 
     /// Persist successful acknowledgment delivery before releasing the result
@@ -291,7 +221,7 @@ impl RequesterOperation {
         Ok(progress.event)
     }
 
-    /// Classifies a closed session exactly once from the local commit boundary.
+    /// Classifies a closed session exactly once.
     ///
     /// # Errors
     /// [`RequesterError`] on an unclassifiable state or a persistence
@@ -301,10 +231,7 @@ impl RequesterOperation {
         store: &mut S,
     ) -> Result<OperationState, RequesterError<S::Error>> {
         let terminal = match self.record.state {
-            OperationState::Requested
-            | OperationState::AwaitingConsent
-            | OperationState::Prepared => OperationState::Cancelled,
-            OperationState::Committed | OperationState::Executing => OperationState::Ambiguous,
+            OperationState::Requested => self.unanswered_terminal(),
             OperationState::ResultPending => OperationState::DeliveryUncertain,
             state if state.is_terminal() => return Ok(state),
             state => return Err(RequesterError::WrongState(state)),
@@ -351,16 +278,6 @@ impl RequesterOperation {
         }
     }
 
-    fn require_reference<E>(&self, reference: OperationReference) -> Result<(), RequesterError<E>> {
-        if reference == self.reference {
-            Ok(())
-        } else if reference.operation_id != self.reference.operation_id {
-            Err(RequesterError::UnknownOperationRace)
-        } else {
-            Err(RequesterError::ReferenceMismatch)
-        }
-    }
-
     fn persist_state<S: RequesterJournalStore>(
         &mut self,
         store: &mut S,
@@ -382,22 +299,23 @@ pub enum RequesterResultAction {
     /// Send this exact hash acknowledgment, then call `acknowledgment_sent`.
     SendAcknowledgment(TypedMessage),
     /// No acknowledgment is required.
-    Terminal(OperationState),
+    Terminal {
+        /// Journaled terminal state.
+        state: OperationState,
+        /// Status the result reported.
+        status: ResultStatus,
+        /// Error the result named.
+        error: Option<ResultError>,
+        /// Remaining credential attempts the result reported.
+        remaining_retries: Option<u8>,
+    },
 }
 
-/// Requester action after local cancellation is made durable.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RequesterCancelAction {
-    /// Cancellation is terminal because no commit was released.
-    Terminal(TypedMessage),
-    /// Cancellation is advisory because commit was already released.
-    Advisory(TypedMessage),
-}
-
+/// The journal state a non-acknowledged result leaves; a retired completed
+/// result has nothing left to deliver.
 const fn result_status_state(status: ResultStatus) -> OperationState {
     match status {
-        ResultStatus::Completed => OperationState::ResultPending,
-        ResultStatus::Denied => OperationState::Denied,
+        ResultStatus::Completed => OperationState::Completed,
         ResultStatus::Cancelled => OperationState::Cancelled,
         ResultStatus::Rejected => OperationState::Rejected,
         ResultStatus::CredentialRejected => OperationState::CredentialRejected,
@@ -418,8 +336,6 @@ pub enum RequesterError<E> {
     ReferenceMismatch,
     /// Reference to a different or terminal operation; a normal race.
     UnknownOperationRace,
-    /// Prepared echo arrived for an action without prepare and commit.
-    UnexpectedPreparedForSafeRead,
     /// Acknowledged record retains no result body.
     MissingResult,
 }

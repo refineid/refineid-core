@@ -129,6 +129,16 @@ before and the correction made the core better.
 
 - Never poll background commands or set rapid check timers (e.g. 10s-30s). When running builds, tests, or async tasks, execute asynchronously and wait strictly for system completion notifications.
 
+## Protocol specifications
+
+- A specification under `docs/protocols/` states the protocol as it is at
+  its stamped version: rules, schemas, and bytes. It carries no change
+  history -- no "changes from" sections, no "supersedes" lines, no prose
+  about what a revision altered. History belongs in commit messages and
+  pull requests.
+- Document and protocol versions are stamped by the project owner; never
+  invent one.
+
 ## Source comments
 
 - Comments explain what the code does now and the constraints it honors.

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! USB Chip Card Interface Device (CCID) protocol stack and transport engine for ReFineID.
+//! USB Chip Card Interface Device (CCID) protocol stack and transport engine for RefineID.
 //!
 //! Provides:
 //! - [`descriptor`]: USB CCID Functional Descriptor parser (§5.1) validating exchange levels,

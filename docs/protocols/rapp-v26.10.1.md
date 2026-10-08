@@ -1282,7 +1282,7 @@ Empirical execution was observed on physical hardware on October 1, 2026:
 
 ---
 
-## 14. ReFineID Project Security Rules Compliance
+## 14. RefineID Project Security Rules Compliance
 
 1. **Inviolable Rule #1: Secret Exclusion over the Wire**:
    PIN1, PIN2, CAN, and PUK values **MUST NEVER** traverse the Bluetooth radio link. The RAPP GATT protocol wire format contains zero fields, messages, or representations for credential secrets.

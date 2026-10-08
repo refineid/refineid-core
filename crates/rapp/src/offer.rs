@@ -75,6 +75,12 @@ impl PairingOfferDeadline {
         })
     }
 
+    /// Monotonic time at which the offer expires.
+    #[must_use]
+    pub const fn expires_at_ms(self) -> u64 {
+        self.expires_at_ms
+    }
+
     /// Whether the offer is still live on this monotonic clock.
     #[must_use]
     pub const fn is_live(self, now_ms: u64) -> bool {

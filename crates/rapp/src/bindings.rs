@@ -120,10 +120,6 @@ pub struct RappPairMetadata {
     pub role: RappEndpointRole,
     /// Exact mutually confirmed profile registry names.
     pub profiles: Vec<String>,
-    /// Transport profile the pairing ceremony ran over.
-    pub transport_profile: String,
-    /// Candidate identifier the pairing ceremony bound.
-    pub candidate_id: String,
     /// Pair-specific transport rendezvous token bytes.
     pub rendezvous_token: Vec<u8>,
     /// Pair-record creation time supplied by the platform wall clock.
@@ -2445,8 +2441,6 @@ fn pair_metadata(record: &PairRecord) -> RappPairMetadata {
             .iter()
             .map(|profile| profile.as_str().to_owned())
             .collect(),
-        transport_profile: record.transport().profile.clone(),
-        candidate_id: record.transport().candidate_id.clone(),
         rendezvous_token: record.rendezvous_token().as_bytes().to_vec(),
         created_at_ms: record.created_at_ms(),
     }

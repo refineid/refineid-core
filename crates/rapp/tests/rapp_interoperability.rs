@@ -326,8 +326,8 @@ fn pairing_and_fresh_session_interoperate_end_to_end() {
 
     let wrong_phase = TypedMessage::SessionReady(SessionReadyMessage {
         parameters: SessionParameters {
-            transport_profile: requester_record.transport().profile.clone(),
-            candidate_id: requester_record.transport().candidate_id.clone(),
+            transport_profile: TransportProfile::Stream.name().to_owned(),
+            candidate_id: TransportProfile::Stream.candidate_id().to_owned(),
             grants_hash: requester_record.grants_hash(),
         },
         nonce: [0x71; 32],

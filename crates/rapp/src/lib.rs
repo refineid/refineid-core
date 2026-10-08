@@ -98,8 +98,8 @@ pub use operation::{
 };
 pub use pairing::{
     PAIR_RECORD_FORMAT_VERSION, PairRecord, PairRecordCodecError, PairRecordError, PairStore,
-    PairStoreError, PairTombstone, PairTransportBinding, decode_pair_record, decode_pair_records,
-    encode_pair_record, encode_pair_records,
+    PairStoreError, PairTombstone, decode_pair_record, decode_pair_records, encode_pair_record,
+    encode_pair_records,
 };
 pub use pairing_attempts::{
     CPACE_ATTEMPT_WINDOW_MS, CpaceAttemptLedger, MAXIMUM_CPACE_ATTEMPTS, POST_PAKE_CONFIRMATION_MS,

@@ -19,8 +19,8 @@ use zeroize::ZeroizeOnDrop;
 pub const WIRE_VERSION_V26_10_1: (u16, u16, u16) = (26, 10, 1);
 /// Mandatory RAPP pairing Noise suite.
 pub const MANDATORY_PAIRING_SUITE: &str = "Noise_XXpsk3_25519_ChaChaPoly_SHA512";
-/// Mandatory RAPP session Noise suite (hybrid post-quantum).
-pub const MANDATORY_SESSION_SUITE: &str = "Noise_KKhfs_25519+MLKEM768_ChaChaPoly_SHA512";
+/// Mandatory RAPP session Noise suite (RAPP v26.10.1 section 6.3).
+pub const MANDATORY_SESSION_SUITE: &str = "Noise_KK_25519_ChaChaPoly_SHA512";
 /// Byte length of an X25519 public or private key.
 pub const X25519_KEY_SIZE: usize = 32;
 /// Byte length of a Noise ChaCha20Poly1305 authentication tag.

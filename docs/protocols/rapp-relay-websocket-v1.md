@@ -158,7 +158,7 @@ chooses what is granted.
 
 For purpose `session`, both peers dial with the stored
 `rendezvous_token`. The relay joins complementary-role legs with equal
-tokens. The requester then initiates the mandatory `Noise_KKhfs` handshake
+tokens. The requester then initiates the mandatory `Noise_KK` handshake
 (Section 10) with the session prologue naming `relay-websocket-v1`.
 
 The requester initiates the session leg only after explicit user or
@@ -217,7 +217,7 @@ Classes 3 through 6 are transport-independent and unchanged.
   token. Short offer TTLs keep the guessing window small.
 - Possession of a token lets an attacker hold a relay leg and elicit at
   most the first handshake message of the corresponding pattern (an
-  ephemeral public key for `Noise_KKhfs`; nothing peer-identifying), and
+  ephemeral public key for `Noise_KK`; nothing peer-identifying), and
   lets a network observer link the two legs of one match. It enables
   nothing else. Tokens are computationally unlinkable to `pair_id`
   without the handshake hash (Section 8.5).

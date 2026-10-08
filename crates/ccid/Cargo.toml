@@ -1,6 +1,6 @@
 [package]
 name = "refineid-ccid"
-description = "USB Chip Card Interface Device (CCID) protocol stack and transport engine for ReFineID"
+description = "USB Chip Card Interface Device (CCID) protocol stack and transport engine for RefineID"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

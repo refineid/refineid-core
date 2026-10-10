@@ -26,6 +26,7 @@ use hmac::{
     digest::{KeyInit, Mac},
 };
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 
 use super::{RendezvousToken, WireValue, decode_deterministic_cbor, encode_deterministic_cbor};
 
@@ -43,6 +44,9 @@ const PURPOSE_SESSION: &str = "session";
 
 /// HKDF-Expand info naming the discovery-hint key (hierarchy §4.3).
 const DISCOVERY_HINT_INFO: &[u8] = b"RAPP-discovery-hint-v1";
+
+/// Label opening the withdrawal-hint HMAC message, ahead of the epoch.
+const WITHDRAWAL_HINT_LABEL: &[u8] = b"RAPP-withdrawal-v1";
 
 /// The single-block counter byte of HKDF-Expand for a 32-byte output.
 const HKDF_FIRST_BLOCK: u8 = 1;
@@ -65,6 +69,40 @@ type HmacSha256 = Hmac<Sha256>;
 /// bytes of `HMAC-SHA-256(K_disc, epoch as 8-byte big-endian)`.
 #[must_use]
 pub fn discovery_hint(token: &RendezvousToken, epoch: u64) -> [u8; DISCOVERY_HINT_SIZE] {
+    keyed_hint(token, &[], epoch)
+}
+
+/// The withdrawal hint a custodian publishes for one stored pairing when it
+/// deliberately stops serving, in `epoch` = floor(unix time / 900)
+/// (RAPP §4.5).
+///
+/// The key is the pairing's discovery-hint key `K_disc`; the hint is the
+/// first 8 bytes of `HMAC-SHA-256(K_disc, "RAPP-withdrawal-v1" || epoch as
+/// 8-byte big-endian)`. The label keeps it apart from the discovery hint,
+/// whose message is the epoch alone.
+#[must_use]
+pub fn withdrawal_hint(token: &RendezvousToken, epoch: u64) -> [u8; DISCOVERY_HINT_SIZE] {
+    keyed_hint(token, WITHDRAWAL_HINT_LABEL, epoch)
+}
+
+/// Whether `hint` is the withdrawal hint of `token` for `epoch` or an
+/// adjacent epoch, the window a requester accepts (RAPP §4.5).
+#[must_use]
+pub fn withdrawal_hint_matches(
+    token: &RendezvousToken,
+    hint: &[u8; DISCOVERY_HINT_SIZE],
+    epoch: u64,
+) -> bool {
+    [epoch.checked_sub(1), Some(epoch), epoch.checked_add(1)]
+        .into_iter()
+        .flatten()
+        .fold(false, |matched, candidate| {
+            matched | bool::from(withdrawal_hint(token, candidate).ct_eq(hint))
+        })
+}
+
+/// First 8 bytes of `HMAC-SHA-256(K_disc, label || epoch_be64)`.
+fn keyed_hint(token: &RendezvousToken, label: &[u8], epoch: u64) -> [u8; DISCOVERY_HINT_SIZE] {
     let mut expand = <HmacSha256 as KeyInit>::new_from_slice(token.as_bytes())
         .expect("HMAC accepts any key length");
     expand.update(DISCOVERY_HINT_INFO);
@@ -72,6 +110,7 @@ pub fn discovery_hint(token: &RendezvousToken, epoch: u64) -> [u8; DISCOVERY_HIN
     let key = expand.finalize().into_bytes();
     let mut hint =
         <HmacSha256 as KeyInit>::new_from_slice(&key).expect("HMAC accepts any key length");
+    hint.update(label);
     hint.update(&epoch.to_be_bytes());
     let digest = hint.finalize().into_bytes();
     let mut out = [0_u8; DISCOVERY_HINT_SIZE];

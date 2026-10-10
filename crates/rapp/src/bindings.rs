@@ -1298,6 +1298,59 @@ fn pairing_context(
 }
 
 #[cfg(test)]
+mod withdrawal_hint_tests {
+    use super::{RappBindingError, rapp_withdrawal_hint, rapp_withdrawal_hint_matches};
+    use crate::{DISCOVERY_HINT_EPOCH_SECONDS, DISCOVERY_HINT_SIZE, RENDEZVOUS_TOKEN_SIZE};
+
+    /// One synthetic token byte, repeated.
+    const TOKEN_BYTE: u8 = 0x5a;
+    /// A window in which the hint is published.
+    const EPOCH: u64 = 1_990_560;
+
+    fn token() -> Vec<u8> {
+        vec![TOKEN_BYTE; RENDEZVOUS_TOKEN_SIZE]
+    }
+
+    #[test]
+    fn published_hint_matches_in_its_window_and_the_next() {
+        let published = EPOCH * DISCOVERY_HINT_EPOCH_SECONDS;
+        let hint = rapp_withdrawal_hint(token(), published).expect("hint");
+        assert_eq!(
+            rapp_withdrawal_hint_matches(token(), hint.clone(), published),
+            Ok(true)
+        );
+        assert_eq!(
+            rapp_withdrawal_hint_matches(
+                token(),
+                hint.clone(),
+                published + DISCOVERY_HINT_EPOCH_SECONDS
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            rapp_withdrawal_hint_matches(
+                token(),
+                hint,
+                published + 2 * DISCOVERY_HINT_EPOCH_SECONDS
+            ),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn wrong_sizes_are_refused() {
+        assert!(matches!(
+            rapp_withdrawal_hint(vec![TOKEN_BYTE; RENDEZVOUS_TOKEN_SIZE - 1], 0),
+            Err(RappBindingError::InvalidInput)
+        ));
+        assert!(matches!(
+            rapp_withdrawal_hint_matches(token(), vec![TOKEN_BYTE; DISCOVERY_HINT_SIZE - 1], 0),
+            Err(RappBindingError::InvalidInput)
+        ));
+    }
+}
+
+#[cfg(test)]
 mod discovery_hint_tests {
     use super::{RappBindingError, rapp_discovery_hint};
 
@@ -2530,6 +2583,60 @@ pub fn rapp_discovery_hint(
         unix_time_seconds / super::DISCOVERY_HINT_EPOCH_SECONDS,
     )
     .to_vec())
+}
+
+/// Withdrawal hint of one stored pairing for the 15-minute window
+/// containing `unix_time_seconds` (RAPP section 4.5).
+///
+/// A custodian publishes the hints of every pairing it stops serving.
+///
+/// # Errors
+/// [`RappBindingError::InvalidInput`] on a wrong-size token.
+#[uniffi::export]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "uniffi lowers exported arguments as owned values"
+)]
+pub fn rapp_withdrawal_hint(
+    rendezvous_token: Vec<u8>,
+    unix_time_seconds: u64,
+) -> Result<Vec<u8>, RappBindingError> {
+    let token = RendezvousToken::reconstruct(&rendezvous_token)
+        .map_err(|_| RappBindingError::InvalidInput)?;
+    Ok(super::withdrawal_hint(
+        &token,
+        unix_time_seconds / super::DISCOVERY_HINT_EPOCH_SECONDS,
+    )
+    .to_vec())
+}
+
+/// Whether a published `hint` withdraws the stored pairing `rendezvous_token`
+/// names, in the window containing `unix_time_seconds` or an adjacent one
+/// (RAPP section 4.5).
+///
+/// # Errors
+/// [`RappBindingError::InvalidInput`] on a wrong-size token or hint.
+#[uniffi::export]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "uniffi lowers exported arguments as owned values"
+)]
+pub fn rapp_withdrawal_hint_matches(
+    rendezvous_token: Vec<u8>,
+    hint: Vec<u8>,
+    unix_time_seconds: u64,
+) -> Result<bool, RappBindingError> {
+    let token = RendezvousToken::reconstruct(&rendezvous_token)
+        .map_err(|_| RappBindingError::InvalidInput)?;
+    let hint: [u8; super::DISCOVERY_HINT_SIZE] = hint
+        .as_slice()
+        .try_into()
+        .map_err(|_| RappBindingError::InvalidInput)?;
+    Ok(super::withdrawal_hint_matches(
+        &token,
+        &hint,
+        unix_time_seconds / super::DISCOVERY_HINT_EPOCH_SECONDS,
+    ))
 }
 
 fn encode_pair_record(record: &PairRecord) -> Result<Vec<u8>, RappBindingError> {

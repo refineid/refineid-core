@@ -282,6 +282,8 @@ pub enum CloseReason {
     Shutdown,
     /// The custodian can no longer serve the card.
     CardUnavailable,
+    /// The custodian deliberately stopped serving every pairing.
+    ServiceWithdrawn,
 }
 
 /// Total unexpected-input classification.

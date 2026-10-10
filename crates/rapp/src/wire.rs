@@ -1055,6 +1055,7 @@ fn validate_discriminants(
                         | "pairing_revoked"
                         | "shutdown"
                         | "card_unavailable"
+                        | "service_withdrawn"
                 )
             ) {
                 return Err(WireError::InvalidValue { field: "reason" });

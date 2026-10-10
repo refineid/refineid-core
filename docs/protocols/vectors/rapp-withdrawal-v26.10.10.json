@@ -1,0 +1,64 @@
+{
+  "format": "fi.refineid.rapp.withdrawal-vectors-v1",
+  "protocol_document_version": "26.10.10",
+  "provenance": "Generated independently from RAPP v26.10.10 section 4.5 and the session-close-body schema of section 7.1 with Python hmac/hashlib, then checked against crates/rapp. The token is a fixed synthetic value; the discovery key and hint repeat the discovery_hint vectors of rapp-v26.10.9.json, so both hints derive from one key.",
+  "withdrawal_hint": [
+    {
+      "name": "withdrawal-epoch-zero",
+      "rendezvous_token_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "discovery_key_hex": "3ea61ede14b37e10827f43e03719e49171967a77dfaaf57042f722ba3ef2ae67",
+      "epoch": 0,
+      "discovery_hint_hex": "aed3f5d7b0cf0a7c",
+      "withdrawal_hint_hex": "b60e0af4564ed227"
+    },
+    {
+      "name": "withdrawal-epoch-2026-10-09",
+      "rendezvous_token_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "discovery_key_hex": "3ea61ede14b37e10827f43e03719e49171967a77dfaaf57042f722ba3ef2ae67",
+      "epoch": 1990560,
+      "discovery_hint_hex": "96b4d41e75873658",
+      "withdrawal_hint_hex": "582364bd0a7856df"
+    }
+  ],
+  "withdrawal_acceptance": [
+    {
+      "name": "same-epoch",
+      "hint_epoch": 1990560,
+      "requester_epoch": 1990560,
+      "expected": "accepted"
+    },
+    {
+      "name": "previous-epoch",
+      "hint_epoch": 1990560,
+      "requester_epoch": 1990561,
+      "expected": "accepted"
+    },
+    {
+      "name": "next-epoch",
+      "hint_epoch": 1990560,
+      "requester_epoch": 1990559,
+      "expected": "accepted"
+    },
+    {
+      "name": "two-epochs-stale",
+      "hint_epoch": 1990560,
+      "requester_epoch": 1990562,
+      "expected": "rejected"
+    },
+    {
+      "name": "discovery-hint-is-not-a-withdrawal",
+      "hint_epoch": 1990560,
+      "requester_epoch": 1990560,
+      "use_discovery_hint": true,
+      "expected": "rejected"
+    }
+  ],
+  "session_close": [
+    {
+      "name": "service-withdrawn",
+      "reason": "service_withdrawn",
+      "last_received_sequence": 7,
+      "body_cbor_hex": "a266726561736f6e71736572766963655f77697468647261776e766c6173745f72656365697665645f73657175656e636507"
+    }
+  ]
+}

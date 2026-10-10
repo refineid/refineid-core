@@ -752,6 +752,7 @@ const fn close_reason_name(value: CloseReason) -> &'static str {
         CloseReason::PairingRevoked => "pairing_revoked",
         CloseReason::Shutdown => "shutdown",
         CloseReason::CardUnavailable => "card_unavailable",
+        CloseReason::ServiceWithdrawn => "service_withdrawn",
     }
 }
 
@@ -766,6 +767,7 @@ fn parse_close_reason(value: &str) -> Result<CloseReason, MessageError> {
         "pairing_revoked" => Ok(CloseReason::PairingRevoked),
         "shutdown" => Ok(CloseReason::Shutdown),
         "card_unavailable" => Ok(CloseReason::CardUnavailable),
+        "service_withdrawn" => Ok(CloseReason::ServiceWithdrawn),
         _ => Err(MessageError::InvalidField("reason")),
     }
 }
@@ -949,6 +951,18 @@ mod tests {
         assert_eq!(
             parse_close_reason("card_unavailable"),
             Ok(CloseReason::CardUnavailable)
+        );
+    }
+
+    #[test]
+    fn service_withdrawn_close_reason_round_trips() {
+        assert_eq!(
+            close_reason_name(CloseReason::ServiceWithdrawn),
+            "service_withdrawn"
+        );
+        assert_eq!(
+            parse_close_reason("service_withdrawn"),
+            Ok(CloseReason::ServiceWithdrawn)
         );
     }
 

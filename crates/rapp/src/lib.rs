@@ -134,7 +134,7 @@ pub use state::{
 };
 pub use stream::{
     DISCOVERY_HINT_EPOCH_SECONDS, DISCOVERY_HINT_SIZE, MAX_STREAM_RENDEZVOUS_FRAME, STREAM_PROFILE,
-    StreamError, StreamRendezvous, discovery_hint,
+    StreamError, StreamRendezvous, discovery_hint, withdrawal_hint, withdrawal_hint_matches,
 };
 pub use transport::{
     BLE_CANDIDATE_ID, BLE_PROFILE, BLE_SERVICE_UUID, BinaryFrame, FrameError, FrameTransport,

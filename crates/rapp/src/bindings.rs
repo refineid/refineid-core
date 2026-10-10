@@ -1298,59 +1298,6 @@ fn pairing_context(
 }
 
 #[cfg(test)]
-mod withdrawal_hint_tests {
-    use super::{RappBindingError, rapp_withdrawal_hint, rapp_withdrawal_hint_matches};
-    use crate::{DISCOVERY_HINT_EPOCH_SECONDS, DISCOVERY_HINT_SIZE, RENDEZVOUS_TOKEN_SIZE};
-
-    /// One synthetic token byte, repeated.
-    const TOKEN_BYTE: u8 = 0x5a;
-    /// A window in which the hint is published.
-    const EPOCH: u64 = 1_990_560;
-
-    fn token() -> Vec<u8> {
-        vec![TOKEN_BYTE; RENDEZVOUS_TOKEN_SIZE]
-    }
-
-    #[test]
-    fn published_hint_matches_in_its_window_and_the_next() {
-        let published = EPOCH * DISCOVERY_HINT_EPOCH_SECONDS;
-        let hint = rapp_withdrawal_hint(token(), published).expect("hint");
-        assert_eq!(
-            rapp_withdrawal_hint_matches(token(), hint.clone(), published),
-            Ok(true)
-        );
-        assert_eq!(
-            rapp_withdrawal_hint_matches(
-                token(),
-                hint.clone(),
-                published + DISCOVERY_HINT_EPOCH_SECONDS
-            ),
-            Ok(true)
-        );
-        assert_eq!(
-            rapp_withdrawal_hint_matches(
-                token(),
-                hint,
-                published + 2 * DISCOVERY_HINT_EPOCH_SECONDS
-            ),
-            Ok(false)
-        );
-    }
-
-    #[test]
-    fn wrong_sizes_are_refused() {
-        assert!(matches!(
-            rapp_withdrawal_hint(vec![TOKEN_BYTE; RENDEZVOUS_TOKEN_SIZE - 1], 0),
-            Err(RappBindingError::InvalidInput)
-        ));
-        assert!(matches!(
-            rapp_withdrawal_hint_matches(token(), vec![TOKEN_BYTE; DISCOVERY_HINT_SIZE - 1], 0),
-            Err(RappBindingError::InvalidInput)
-        ));
-    }
-}
-
-#[cfg(test)]
 mod discovery_hint_tests {
     use super::{RappBindingError, rapp_discovery_hint};
 
@@ -1990,6 +1937,67 @@ impl RappPairRecord {
         }))
     }
 
+    /// This pairing's withdrawal hint for the advertised service instance
+    /// `instance_name` in the minute containing `unix_time_seconds`
+    /// (RAPP section 4.5).
+    ///
+    /// # Errors
+    /// [`RappBindingError::InvalidInput`] on an instance name that is not one
+    /// DNS label or a degenerate static agreement, and
+    /// [`RappBindingError::WrongPhase`] when the record was revoked.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "uniffi lowers exported arguments as owned values"
+    )]
+    pub fn withdrawal_hint(
+        &self,
+        instance_name: String,
+        unix_time_seconds: u64,
+    ) -> Result<Vec<u8>, RappBindingError> {
+        let instance =
+            super::InstanceName::new(&instance_name).map_err(|_| RappBindingError::InvalidInput)?;
+        let key = self.withdrawal_key()?;
+        Ok(key
+            .hint(&instance, super::withdrawal_counter(unix_time_seconds))
+            .to_vec())
+    }
+
+    /// Whether the TXT attributes `txt` discovered on the service instance
+    /// `instance_name` form a withdrawn record carrying this pairing's hint
+    /// for the minute containing `unix_time_seconds` or an adjacent one
+    /// (RAPP section 4.5). A malformed record or instance name is `false`.
+    ///
+    /// # Errors
+    /// [`RappBindingError::InvalidInput`] on a degenerate static agreement,
+    /// and [`RappBindingError::WrongPhase`] when the record was revoked.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "uniffi lowers exported arguments as owned values"
+    )]
+    pub fn matches_withdrawn_record(
+        &self,
+        instance_name: String,
+        txt: Vec<RappTxtEntry>,
+        unix_time_seconds: u64,
+    ) -> Result<bool, RappBindingError> {
+        let Ok(instance) = super::InstanceName::new(&instance_name) else {
+            return Ok(false);
+        };
+        let pairs: Vec<(&str, &str)> = txt
+            .iter()
+            .map(|entry| (entry.key.as_str(), entry.value.as_str()))
+            .collect();
+        let Ok(record) = super::WithdrawnRecord::parse(&pairs) else {
+            return Ok(false);
+        };
+        let key = self.withdrawal_key()?;
+        Ok(key.matches(
+            &record,
+            &instance,
+            super::withdrawal_counter(unix_time_seconds),
+        ))
+    }
+
     /// Read non-secret metadata suitable for confirmation and connection UI.
     ///
     /// # Errors
@@ -2585,58 +2593,64 @@ pub fn rapp_discovery_hint(
     .to_vec())
 }
 
-/// Withdrawal hint of one stored pairing for the 15-minute window
-/// containing `unix_time_seconds` (RAPP section 4.5).
-///
-/// A custodian publishes the hints of every pairing it stops serving.
-///
-/// # Errors
-/// [`RappBindingError::InvalidInput`] on a wrong-size token.
-#[uniffi::export]
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "uniffi lowers exported arguments as owned values"
-)]
-pub fn rapp_withdrawal_hint(
-    rendezvous_token: Vec<u8>,
-    unix_time_seconds: u64,
-) -> Result<Vec<u8>, RappBindingError> {
-    let token = RendezvousToken::reconstruct(&rendezvous_token)
-        .map_err(|_| RappBindingError::InvalidInput)?;
-    Ok(super::withdrawal_hint(
-        &token,
-        unix_time_seconds / super::DISCOVERY_HINT_EPOCH_SECONDS,
-    )
-    .to_vec())
+impl RappPairRecord {
+    fn withdrawal_key(&self) -> Result<super::WithdrawalKey, RappBindingError> {
+        let guard = self
+            .record
+            .lock()
+            .map_err(|_| RappBindingError::LocalStateFailure)?;
+        let record = guard.as_ref().ok_or(RappBindingError::WrongPhase)?;
+        let key = super::WithdrawalKey::derive(record).map_err(|_| RappBindingError::InvalidInput);
+        drop(guard);
+        key
+    }
 }
 
-/// Whether a published `hint` withdraws the stored pairing `rendezvous_token`
-/// names, in the window containing `unix_time_seconds` or an adjacent one
-/// (RAPP section 4.5).
+/// One DNS-SD TXT attribute, key and value.
+#[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
+pub struct RappTxtEntry {
+    /// Attribute key.
+    pub key: String,
+    /// Attribute value.
+    pub value: String,
+}
+
+/// The TXT attributes of a `mode=withdrawn` record carrying `hints`, the
+/// withdrawal hints of the custodian's stored pairings, padded to eight
+/// entries with random fillers and shuffled (RAPP section 4.5).
 ///
 /// # Errors
-/// [`RappBindingError::InvalidInput`] on a wrong-size token or hint.
+/// [`RappBindingError::InvalidInput`] for more than eight hints or a hint of
+/// the wrong size, and [`RappBindingError::LocalStateFailure`] when the
+/// random source fails.
 #[uniffi::export]
 #[allow(
     clippy::needless_pass_by_value,
     reason = "uniffi lowers exported arguments as owned values"
 )]
-pub fn rapp_withdrawal_hint_matches(
-    rendezvous_token: Vec<u8>,
-    hint: Vec<u8>,
-    unix_time_seconds: u64,
-) -> Result<bool, RappBindingError> {
-    let token = RendezvousToken::reconstruct(&rendezvous_token)
-        .map_err(|_| RappBindingError::InvalidInput)?;
-    let hint: [u8; super::DISCOVERY_HINT_SIZE] = hint
-        .as_slice()
-        .try_into()
-        .map_err(|_| RappBindingError::InvalidInput)?;
-    Ok(super::withdrawal_hint_matches(
-        &token,
-        &hint,
-        unix_time_seconds / super::DISCOVERY_HINT_EPOCH_SECONDS,
-    ))
+pub fn rapp_withdrawn_record(hints: Vec<Vec<u8>>) -> Result<Vec<RappTxtEntry>, RappBindingError> {
+    let hints = hints
+        .iter()
+        .map(|hint| {
+            <[u8; super::WITHDRAWAL_HINT_SIZE]>::try_from(hint.as_slice())
+                .map_err(|_| RappBindingError::InvalidInput)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let record = super::WithdrawnRecord::assemble(&hints, |bytes| {
+        getrandom::fill(bytes).map_err(|_| super::WithdrawalError::RandomUnavailable)
+    })
+    .map_err(|error| match error {
+        super::WithdrawalError::RandomUnavailable => RappBindingError::LocalStateFailure,
+        _ => RappBindingError::InvalidInput,
+    })?;
+    Ok(record
+        .txt_entries()
+        .into_iter()
+        .map(|(key, value)| RappTxtEntry {
+            key: key.to_owned(),
+            value,
+        })
+        .collect())
 }
 
 fn encode_pair_record(record: &PairRecord) -> Result<Vec<u8>, RappBindingError> {

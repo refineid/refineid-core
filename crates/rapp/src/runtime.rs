@@ -1,9 +1,10 @@
 //! Established-session liveness composition.
 
 use super::{
-    AuthenticatedViolation, BinaryFrame, EndpointError, EstablishedEndpoint, LivenessConfig,
-    LivenessDecision, LivenessError, LivenessMessage, LivenessTracker, PairStore, PingChallenge,
-    PongDisposition, ReceiveOutcome, SecurityOutcome, TypedMessage,
+    AuthenticatedViolation, BinaryFrame, CloseReason, EndpointError, EstablishedEndpoint,
+    LivenessConfig, LivenessDecision, LivenessError, LivenessMessage, LivenessTracker, PairStore,
+    PingChallenge, PongDisposition, ReceiveOutcome, SecurityOutcome, SessionCloseMessage,
+    TypedMessage,
 };
 
 /// Established encrypted session with authenticated cryptographic liveness.
@@ -46,6 +47,25 @@ impl EstablishedSessionRuntime {
         self.endpoint.close_session();
     }
 
+    /// Seal an authenticated `session.close` carrying `reason`, then close
+    /// the session; the caller delivers the frame and drops the link.
+    ///
+    /// # Errors
+    /// [`EndpointError`] when the session is already closed or the notice
+    /// cannot be sealed; the session is closed either way.
+    pub fn close_with_reason(
+        &mut self,
+        reason: CloseReason,
+    ) -> Result<BinaryFrame, EndpointError<()>> {
+        let notice = TypedMessage::SessionClose(SessionCloseMessage {
+            reason,
+            last_received_sequence: self.last_received_sequence(),
+        });
+        let sealed = self.endpoint.send(&notice);
+        self.close_session();
+        sealed
+    }
+
     /// Receive one encrypted frame and consume liveness messages centrally.
     ///
     /// # Errors
@@ -78,6 +98,10 @@ impl EstablishedSessionRuntime {
                     }
                     PongDisposition::IgnoredUnmatched => Ok(RuntimeReceive::IgnoredStalePong),
                 }
+            }
+            ReceiveOutcome::Message(TypedMessage::SessionClose(close)) => {
+                self.close_session();
+                Ok(RuntimeReceive::PeerClosed(close.reason))
             }
             ReceiveOutcome::Message(message) => Ok(RuntimeReceive::Message(message)),
             ReceiveOutcome::SessionClosed(outcome) => {
@@ -153,6 +177,8 @@ pub enum RuntimeReceive {
     IgnoredStalePong,
     /// Session closed; ordered effects to execute.
     SessionClosed(SecurityOutcome),
+    /// The peer closed the session with an authenticated notice.
+    PeerClosed(CloseReason),
     /// Pairing revoked after an authenticated violation.
     PairRevoked {
         /// Violation that revoked the pairing.

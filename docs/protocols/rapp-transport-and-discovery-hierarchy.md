@@ -146,7 +146,7 @@ Because mDNS discovery broadcasts on multicast UDP port 5353 (IPv4 `224.0.0.251`
     `refineid-[random_8_hex].local.` (e.g., `refineid-b3d90e15.local.`), preventing leakage of operating system hostnames or user names (e.g. `Petris-iPhone.local`).
 
 ### 4.3 DNS-SD TXT Record Formats and Discovery Modes
-The Custodian publishes two distinct discovery modes:
+The Custodian publishes three distinct discovery modes:
 
 1. **Pairing Mode (`mode=pairing`)**:
    - Active strictly during an explicit user-initiated pairing ceremony on the phone, bounded by the 60-second offer TTL.
@@ -174,6 +174,17 @@ The Custodian publishes two distinct discovery modes:
      - TXT Attribute: `hints=` followed by at most 4 hints, each 16 lowercase hexadecimal digits, separated by commas without spaces (e.g. `hints=96b4d41e75873658,aed3f5d7b0cf0a7c`).
      - The `discovery_hint` vectors of `vectors/rapp-v26.10.9.json` pin the bytes.
      Requesters evaluate candidate hints for the current and adjacent epoch ($\text{epoch} \pm 1$) against their stored pairings before initiating TCP connections.
+
+3. **Withdrawn Mode (`mode=withdrawn`)**:
+   - Published for 2 to 10 seconds on the current service instance after the user turns remote access off or quits the application, once open sessions are closed and connections are no longer accepted; the service is then unregistered (RAPP v26.10.10 §4.5).
+   - TXT Attributes, and no others:
+     ```text
+     v=1
+     mode=withdrawn
+     withdrawn=<entry_1>,<entry_2>,...,<entry_8>
+     ```
+   - Exactly 8 entries of 16 lowercase hexadecimal digits, separated by commas without spaces: the withdrawal hint of each of up to 8 stored pairings, the rest random fillers, all in random order. A withdrawal hint is keyed by the pairing's static X25519 agreement and bound to the service instance label and a one-minute counter; nothing in it derives from `rendezvous_token`.
+   - A Requester honours the record only on the instance it associates with the pairing and only while it holds no open session to it; it then withdraws the Custodian's presence at once and does not dial until it discovers `mode=session` again. Anything else is unannounced loss under the Requester's own hold.
 
 ---
 

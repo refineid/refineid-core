@@ -54,6 +54,7 @@ mod stream;
 mod transport;
 mod types;
 mod wire;
+mod withdrawal;
 
 pub use authorization::{
     ApprovalOutcome, AuthorizationError, AuthorizationStage, AuthorizationTransaction,
@@ -134,7 +135,7 @@ pub use state::{
 };
 pub use stream::{
     DISCOVERY_HINT_EPOCH_SECONDS, DISCOVERY_HINT_SIZE, MAX_STREAM_RENDEZVOUS_FRAME, STREAM_PROFILE,
-    StreamError, StreamRendezvous, discovery_hint, withdrawal_hint, withdrawal_hint_matches,
+    StreamError, StreamRendezvous, discovery_hint,
 };
 pub use transport::{
     BLE_CANDIDATE_ID, BLE_PROFILE, BLE_SERVICE_UUID, BinaryFrame, FrameError, FrameTransport,
@@ -153,4 +154,9 @@ pub use types::{
 pub use wire::{
     Envelope, MessageType, SequenceGuard, WireError, WireValue, decode_deterministic_cbor,
     encode_deterministic_cbor,
+};
+pub use withdrawal::{
+    InstanceName, MAX_INSTANCE_NAME_SIZE, WITHDRAWAL_COUNTER_SECONDS, WITHDRAWAL_HINT_SIZE,
+    WITHDRAWN_RECORD_ENTRIES, WithdrawalError, WithdrawalKey, WithdrawnRecord,
+    WithdrawnRecordError, withdrawal_counter,
 };

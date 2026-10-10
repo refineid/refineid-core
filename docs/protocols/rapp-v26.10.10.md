@@ -34,7 +34,7 @@ This document defines the complete, standalone normative specification for the *
 - The **Authenticated Message Envelope**, sequential sequencing, and session multiplexing.
 - The **Direct Idempotent Operation Model** providing strict at-most-once physical card execution via write-ahead journaling and `operation_id` deduplication.
 - The **Registered Credential Profiles and Actions** for card status inspection, browser authentication, and qualified document signing.
-- **Service Withdrawal** (§4.5): the Custodian's pairing-keyed notice that it has stopped serving, on discovery and on open sessions.
+- **Service Withdrawal** (§4.5): the Custodian's notice, keyed by each pairing's static agreement, that it has stopped serving, on discovery and on open sessions.
 - The **Failure Semantics, Retry Protection, and Human Consent Contracts**.
 
 This document is completely self-contained: all normative schemas, protocol state machines, cryptographic bindings, error handling rules, and wire formats required to implement, verify, and audit RAPP v26.10.10 are defined herein.
@@ -123,7 +123,7 @@ The diagram shows the BLE profile; on the stream transport the Requester dials t
 
 ### 2.2 Transport Profile Registry
 
-Every transport profile defines a candidate identifier, framing, a routing preamble, and an offer bootstrap. CPace messages, Noise handshake messages, and envelopes each occupy exactly one transport frame. Discovery and advertisement for each profile are specified by the [RAPP Transport and Discovery Hierarchy Specification](rapp-transport-and-discovery-hierarchy.md); nothing derived from the pairing code, `offer_id`, `offer_hash`, or `rendezvous_token` is ever advertised.
+Every transport profile defines a candidate identifier, framing, a routing preamble, and an offer bootstrap. CPace messages, Noise handshake messages, and envelopes each occupy exactly one transport frame. Discovery and advertisement for each profile are specified by the [RAPP Transport and Discovery Hierarchy Specification](rapp-transport-and-discovery-hierarchy.md); nothing derived from the pairing code, `offer_id` or `offer_hash` is ever advertised, and nothing derived from `rendezvous_token` except the rotating discovery hints of hierarchy specification §4.3.
 
 | Transport profile | `candidate_id` | Framing | Preamble domain | Offer bootstrap |
 | :--- | :--- | :--- | :--- | :--- |
@@ -237,7 +237,7 @@ To mathematically close this oracle while permitting the final legitimate attemp
 
 ### 4.1 Zero Hint Leakage Over Advertisements
 
-No advertisement on any transport (BLE advertising data, DNS-SD names, TXT records, or other discovery records) may carry pairing code material, offer material (`offer_id`, `offer_hash`), or `rendezvous_token` material, or any value derived from them. The rules below apply to BLE; the hierarchy specification applies the same rule to DNS-SD.
+No advertisement on any transport (BLE advertising data, DNS-SD names, TXT records, or other discovery records) may carry pairing code material, offer material (`offer_id`, `offer_hash`), or `rendezvous_token` material, or any value derived from them; the sole exception is the rotating discovery hints of hierarchy specification §4.3. Withdrawal hints (§4.5) derive from the pairing's static agreement, not from any of these. The rules below apply to BLE; the hierarchy specification applies the same rule to DNS-SD.
 
 The BLE advertisement payload **MUST NOT** contain:
 - Any bits, truncated representations, or hashes of the pairing code.
@@ -369,36 +369,47 @@ RSSI is treated as an **advisory discovery heuristic** and defense-in-depth barr
 
 ### 4.5 Service Withdrawal
 
-A Custodian **withdraws** when it deliberately stops serving every stored pairing: the user turns remote access off, or the application stops serving for a reason it knows. Withdrawal changes no stored pairing; serving resumes with the next advertisement.
+A Custodian **withdraws** when it deliberately stops serving every stored pairing. Exactly two causes are withdrawal: the user turns remote access off, and the user quits the application. Suspension or termination by the operating system, loss of the network, and a session restart with reason `"normal"` or `"shutdown"` (§7.2) are not withdrawal. Withdrawal changes no stored pairing; serving resumes with the next `mode=session` advertisement.
 
-1. **Withdrawal Hint**:
-   For each stored pairing $i$ the Custodian derives
-   $$\text{whint}_i = \text{first 8 bytes of }\text{HMAC-SHA-256}(K_{\text{disc}, i}, \texttt{"RAPP-withdrawal-v1"} \parallel \text{epoch\_be64})$$
-   where $K_{\text{disc}, i}$, $\text{epoch}$ and $\text{epoch\_be64}$ are those of the discovery hint ([hierarchy specification](rapp-transport-and-discovery-hierarchy.md) §4.3). The ASCII label separates the withdrawal hint from the discovery hint, whose HMAC message is the 8-byte epoch alone. The `withdrawal_hint` vectors of `vectors/rapp-withdrawal-v26.10.10.json` pin the bytes.
+1. **Withdrawal Key**:
+   Each stored pairing has a withdrawal key that both endpoints derive from their static keys and that never crosses the wire:
+   $$S = \text{X25519}(\text{local static private}, \text{peer static public})$$
+   $$K_{\text{wd}} = \text{HKDF-SHA-256}(\text{salt} = \text{pair\_id}, \text{IKM} = S, \text{info} = \texttt{"RAPP-withdrawal-v1"}, L = 32)$$
+   HKDF is [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html): $\text{PRK} = \text{HMAC-SHA-256}(\text{pair\_id}, S)$ over the 16-byte `pair_id`, then the single block $K_{\text{wd}} = \text{HMAC-SHA-256}(\text{PRK}, \text{info} \parallel \texttt{0x01})$. An $S$ equal to the X25519 identity (all zero) yields no key; such a pairing is never announced. The Requester may cache $K_{\text{wd}}$ with the pairing.
 
-2. **Stream Discovery Record**:
-   On withdrawal the Custodian replaces the TXT record of its `_refineid-stream._tcp` service instance with
+2. **Withdrawal Hint**:
+   $$\text{whint} = \text{first 8 bytes of }\text{HMAC-SHA-256}(K_{\text{wd}}, \text{len} \parallel \text{instance} \parallel \text{counter\_be64})$$
+   where $\text{instance}$ is the UTF-8 octets of the DNS-SD service instance label the Custodian advertises (1 to 63 octets, hierarchy specification §4.2), $\text{len}$ its length as one octet, and $\text{counter} = \lfloor \text{unix\_time} / 60 \rfloor$ as an unsigned 64-bit big-endian integer. The `withdrawal_key` and `withdrawal_hint` vectors of `vectors/rapp-withdrawal-v26.10.10.json` pin the bytes.
+
+3. **Custodian Order**:
+   On withdrawal the Custodian, in this order:
+   1. sends `session.close` with reason `"service_withdrawn"` (§7.1) on every open operational session and closes its link;
+   2. stops accepting connections;
+   3. replaces the TXT record of its current `_refineid-stream._tcp` service instance with the withdrawn record (item 4);
+   4. unregisters the service after at least 2 and at most 10 seconds.
+
+   Withdrawal does not alter the operation journal: an operation whose card exchange has begun completes or is recorded exactly as §8 requires, and the Requester reconciles it through §8.3 on its next session.
+
+4. **Withdrawn Record**:
    ```text
    v=1
    mode=withdrawn
-   withdrawn=<whint_1>,<whint_2>,...
+   withdrawn=<entry_1>,<entry_2>,...,<entry_8>
    ```
-   carrying the withdrawal hints of at most 8 stored pairings, each 16 lowercase hexadecimal digits, separated by commas without spaces. It keeps the record published for at least 2 and at most 10 seconds, stops accepting connections, then unregisters the service. The record is published even when the Custodian publishes no discovery hints in `mode=session`; it then discloses, for those seconds, how many pairings it holds, up to 8. Pairings beyond the eighth are not announced and fall under unannounced loss (item 5).
+   The `withdrawn` value holds exactly 8 entries, each 16 lowercase hexadecimal digits, separated by commas without spaces. The Custodian places the withdrawal hint, for its current instance and counter, of each of up to 8 stored pairings, fills the remaining entries with independent random 8-byte values, and orders all 8 by fresh random sort keys. The record carries no other attribute. Pairings beyond the eighth are not announced and fall under unannounced loss (item 6).
 
-3. **BLE**:
-   The BLE advertisement carries only the Service UUID (§4.1) and no withdrawal marker. A Requester on BLE learns of withdrawal through an open session (item 4) or as unannounced loss (item 5).
+5. **BLE**:
+   The BLE advertisement carries only the Service UUID (§4.1) and no withdrawal marker. A Requester on BLE learns of withdrawal through an open session or as unannounced loss.
 
-4. **Open Sessions**:
-   Before closing the link of each open operational session, the Custodian sends `session.close` with reason `"service_withdrawn"` (§7.1). Withdrawal does not alter the operation journal: an operation whose card exchange has begun completes or is recorded exactly as §8 requires, and the Requester reconciles it through §8.3 on its next session.
+6. **Requester Behavior**:
+   - **Open session first.** While the Requester holds an established session to the pairing, discovery records do not change its presence. An authenticated `session.close` with reason `"service_withdrawn"` is a **verified withdrawal**; any other close reason, or loss of the session, is not.
+   - **Discovery.** Without an open session, a Requester honours a withdrawn record only on the service instance it currently associates with the pairing: the instance whose discovery hint matched the pairing, or the instance it last established a session to. It parses the record and computes the pairing's hint for that instance and for $\text{counter} - 1$, $\text{counter}$ and $\text{counter} + 1$ of its own clock, comparing every entry in constant time. A match is a **verified withdrawal**.
+   - **Malformed records.** A record with a key other than `v`, `mode` and `withdrawn`, a repeated key, a `v` other than `1`, a `mode` other than `withdrawn`, or a `withdrawn` value that is not exactly 8 lowercase 16-digit entries is malformed, as is a `hints` attribute beside `withdrawn`.
+   - **Effect.** On a verified withdrawal the Requester withdraws the pairing's presence at once: it stops offering the Custodian's credentials to local consumers and does not dial the Custodian again until it discovers it in `mode=session` or sees its BLE advertisement. It changes no stored pairing state and shows no error.
+   - **Unannounced loss.** A malformed record, a withdrawn record without a match, a record on another instance, or a service that disappears without one is unannounced loss; the Requester applies its own hold before withdrawing presence, so that a brief discovery gap does not withdraw a Custodian that is still serving.
 
-5. **Requester Behavior**:
-   - A Requester that sees `mode=withdrawn` on a service instance computes $\text{whint}$ of each of its stored pairings for the current epoch and both adjacent epochs ($\text{epoch} \pm 1$) and compares in constant time. A match is a **verified withdrawal** of that pairing; so is an authenticated `session.close` with reason `"service_withdrawn"`.
-   - On a verified withdrawal the Requester withdraws the pairing's presence at once: it stops offering the Custodian's credentials to local consumers and closes idle connections to it. It changes no stored pairing state and shows no error.
-   - A `mode=withdrawn` record without a matching hint, a malformed record, or a service that disappears without one is **unannounced loss**; the Requester applies its own hold before withdrawing presence, so that a brief discovery gap does not withdraw a Custodian that is still serving.
-   - Presence returns when the Custodian is next discovered in `mode=session` or a session to it is established.
-
-6. **Replay Bound**:
-   The withdrawal hint is unauthenticated discovery data keyed by the pairing. A party without the `rendezvous_token` cannot compute it. A party that observed a genuine withdrawal record can replay it for at most the remainder of its epoch and the next one (at most 30 minutes); the effect is limited to withdrawing presence until the Custodian is next discovered in `mode=session`, which is no more than an on-path party can already cause by suppressing discovery.
+7. **Authenticity and Replay**:
+   Only the two endpoints of a pairing know its static agreement, so no other party can compute a withdrawal hint; observing sessions, routing preambles or discovery records does not help. A party on the local link that recorded a genuine withdrawn record can republish it under the same instance name for at most about three minutes (the counter window), and only while the Requester still associates that instance with the pairing; instance names are fresh on every advertisement start (hierarchy specification §4.2). The effect is the same as a spoofed mDNS goodbye without the Requester's hold: presence is withdrawn until the Custodian is next discovered. Random fillers keep the record the same size whatever the number of stored pairings, and the hints are unlinkable across instances and minutes.
 
 ---
 
@@ -1341,7 +1352,7 @@ Semantic error handling is driven exclusively by `error_name`. The numeric `erro
 | **Transparent Wormhole / Relay** | Attacker relays RF traffic over WAN between distant devices. | Advisory proximity gate limits local discovery, but RSSI cannot prove physical proximity or detect bit-preserving RF tunneling (§4.4). Strict asymmetric ATT and CPace role separation structurally prevents relay loopback and reflection attacks, while explicit user consent and sovereign phone display enforce authorized operation intent at execution time (§4.4, §5.2, §11). |
 | **DoS Strike Burning** | Malicious central connects to phone to burn strikes. | Offers are open only upon explicit user trigger for 60 seconds; single-flight pre-authentication serialization limits concurrency. Fail-stop lockout imposes exponential backoff ($2^n$ seconds, up to 300 s) and alerts user with on-screen notification (§3.3.5). |
 | **Rendezvous Token Replay / Presence Probing** | Attacker sniffs static rendezvous_token and replays preamble to probe presence or induce cryptographic work. | Preamble is unauthenticated routing metadata only; knowing rendezvous_token never authenticates caller. Handshake fails at message 1 (during DH computation or payload authentication). Timing difference between unknown token and known token is an accepted residual presence oracle for static tokens; mitigated by single-flight connection serialization and reconnect rate-limiting (§4.3.6). |
-| **Withdrawal Replay** | Attacker records a genuine `mode=withdrawn` record and republishes it. | The withdrawal hint is keyed by the pairing's `rendezvous_token` and bound to its 15-minute epoch; a Requester accepts it only for that epoch and the next. Its effect is limited to withdrawing presence until the Custodian is next discovered in `mode=session`; no pairing state changes (§4.5). |
+| **Withdrawal Forgery & Replay** | Attacker publishes a forged `mode=withdrawn` record, or republishes a recorded one. | Withdrawal hints are keyed by the pairing's static X25519 agreement, which never crosses the wire, so they cannot be forged. A recorded record is honoured only on the instance the Requester associates with the pairing and within one minute either side of its counter; its effect is limited to withdrawing presence until the Custodian is next discovered. An open session ignores discovery records and ends only on an authenticated `session.close` (§4.5). |
 
 ---
 

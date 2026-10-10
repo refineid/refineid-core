@@ -25,7 +25,7 @@ use super::{
     MANDATORY_PAIRING_SUITE, MANDATORY_SESSION_SUITE, MAX_FRAME_PLAINTEXT, MAX_FRAME_SIZE,
     MessageType, NOISE_TAG_SIZE, OperationId, PAIR_ID_SIZE, PairId, PairingSecret, ProfileName,
     RENDEZVOUS_TOKEN_SIZE, REQUEST_HASH_SIZE, RendezvousToken, RequestHash, SESSION_ID_SIZE,
-    SequenceGuard, SessionId, WIRE_VERSION_V26_10_1, WireError, WireValue, X25519_KEY_SIZE,
+    SequenceGuard, SessionId, WIRE_VERSION_V26_10_9, WireError, WireValue, X25519_KEY_SIZE,
     encode_deterministic_cbor,
     noise::{KkHandshakeState, NoiseTransport},
 };
@@ -540,7 +540,7 @@ pub fn compute_grants_hash(profiles: &[ProfileName]) -> Result<GrantsHash, Crypt
     Ok(GrantsHash::from_array(bytes))
 }
 
-/// Bind the exact typed operation request to its pairing (RAPP v26.10.1
+/// Bind the exact typed operation request to its pairing (RAPP v26.10.9
 /// section 8.2.1).
 ///
 /// The commitment is session-independent, so an identical request
@@ -621,9 +621,9 @@ fn session_prologue(
 
 fn version_value() -> WireValue {
     WireValue::Array(vec![
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.0)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.1)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.2)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_9.0)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_9.1)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_9.2)),
     ])
 }
 
@@ -783,7 +783,7 @@ mod tests {
         );
     }
 
-    /// RAPP v26.10.1 §4.3:276: Deterministic CBOR of the pairing prologue is exactly 151 bytes.
+    /// RAPP v26.10.9 §4.3:276: Deterministic CBOR of the pairing prologue is exactly 151 bytes.
     #[test]
     fn pairing_prologue_matches_normative_151_byte_length() {
         const NORMATIVE_PAIRING_PROLOGUE_LENGTH: usize = 151;

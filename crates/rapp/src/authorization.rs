@@ -66,7 +66,7 @@ pub struct AuthorizedSafeRead {
 /// The stage is authoritative before approval; afterwards the journal is,
 /// because only the journal survives a restart. Approval of a consequential
 /// action writes the in-flight entry before the card command exists
-/// (RAPP v26.10.1 section 8.1).
+/// (RAPP v26.10.9 section 8.1).
 #[derive(Debug)]
 pub struct AuthorizationTransaction {
     request: OperationRequest,

@@ -17,18 +17,7 @@ use super::{
 const X25519_KEY_SIZE: usize = 32;
 
 /// Format version for encoded pairing records.
-pub const PAIR_RECORD_FORMAT_VERSION: u64 = 2;
-
-/// Transport metadata retained after pairing without retaining the QR secret.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PairTransportBinding {
-    /// Negotiated transport profile.
-    pub profile: String,
-    /// Opaque candidate identifier from the pairing offer.
-    pub candidate_id: String,
-    /// Non-secret transport parameters required to reconnect.
-    pub parameters: BTreeMap<String, WireValue>,
-}
+pub const PAIR_RECORD_FORMAT_VERSION: u64 = 3;
 
 /// Active long-term pairing material.
 ///
@@ -45,7 +34,6 @@ pub struct PairRecord {
     remote_static_public: [u8; X25519_KEY_SIZE],
     grants_hash: GrantsHash,
     profiles: Vec<ProfileName>,
-    transport: PairTransportBinding,
     created_at_ms: u64,
 }
 
@@ -53,8 +41,7 @@ impl PairRecord {
     /// Constructs a validated active pairing record.
     ///
     /// # Errors
-    /// [`PairRecordError`] on an all-zero static key, an empty profile set,
-    /// or an empty transport binding.
+    /// [`PairRecordError`] on an all-zero static key or an empty profile set.
     #[allow(
         clippy::too_many_arguments,
         reason = "one atomic constructor takes every field of the record"
@@ -68,7 +55,6 @@ impl PairRecord {
         remote_static_public: [u8; X25519_KEY_SIZE],
         grants_hash: GrantsHash,
         profiles: Vec<ProfileName>,
-        transport: PairTransportBinding,
         created_at_ms: u64,
     ) -> Result<Self, PairRecordError> {
         if local_static_private.iter().all(|byte| *byte == 0)
@@ -80,9 +66,6 @@ impl PairRecord {
         if profiles.is_empty() {
             return Err(PairRecordError::NoNegotiatedProfiles);
         }
-        if transport.profile.is_empty() || transport.candidate_id.is_empty() {
-            return Err(PairRecordError::InvalidTransportBinding);
-        }
 
         Ok(Self {
             pair_id,
@@ -93,7 +76,6 @@ impl PairRecord {
             remote_static_public,
             grants_hash,
             profiles,
-            transport,
             created_at_ms,
         })
     }
@@ -104,8 +86,8 @@ impl PairRecord {
         self.pair_id
     }
 
-    /// Pair-specific rendezvous value for transports that must name this
-    /// pairing on the wire (Sections 16.1 and 17). Never `pair_id`.
+    /// Pair-specific rendezvous value the routing preamble presents
+    /// (RAPP v26.10.9 §2.2.1). Never `pair_id`.
     #[must_use]
     pub const fn rendezvous_token(&self) -> RendezvousToken {
         self.rendezvous_token
@@ -141,12 +123,6 @@ impl PairRecord {
         &self.profiles
     }
 
-    /// Transport binding used for reconnecting.
-    #[must_use]
-    pub const fn transport(&self) -> &PairTransportBinding {
-        &self.transport
-    }
-
     /// Pair creation time supplied by the platform wall clock.
     #[must_use]
     pub const fn created_at_ms(&self) -> u64 {
@@ -172,7 +148,6 @@ impl fmt::Debug for PairRecord {
             .field("remote_static_public", &"[public key]")
             .field("grants_hash", &self.grants_hash)
             .field("profiles", &self.profiles)
-            .field("transport", &self.transport)
             .field("created_at_ms", &self.created_at_ms)
             .finish()
     }
@@ -228,8 +203,6 @@ pub enum PairRecordError {
     InvalidStaticKey,
     /// Pairing completed without any negotiated profile.
     NoNegotiatedProfiles,
-    /// Selected transport profile or candidate identifier was empty.
-    InvalidTransportBinding,
 }
 
 impl fmt::Display for PairRecordError {
@@ -329,18 +302,6 @@ pub fn encode_pair_record(record: &PairRecord) -> Result<Vec<u8>, PairRecordCode
             ),
         ),
         (
-            "transport_profile".to_owned(),
-            WireValue::Text(record.transport().profile.clone()),
-        ),
-        (
-            "candidate_id".to_owned(),
-            WireValue::Text(record.transport().candidate_id.clone()),
-        ),
-        (
-            "transport_parameters".to_owned(),
-            WireValue::Map(record.transport().parameters.clone()),
-        ),
-        (
             "created_at_ms".to_owned(),
             WireValue::Unsigned(record.created_at_ms()),
         ),
@@ -369,9 +330,6 @@ pub fn decode_pair_record(bytes: &[u8]) -> Result<PairRecord, PairRecordCodecErr
         "remote_static_public",
         "grants_hash",
         "profiles",
-        "transport_profile",
-        "candidate_id",
-        "transport_parameters",
         "created_at_ms",
     ];
     if map.keys().any(|key| !expected.contains(&key.as_str())) {
@@ -398,11 +356,6 @@ pub fn decode_pair_record(bytes: &[u8]) -> Result<PairRecord, PairRecordCodecErr
         .into_iter()
         .map(|name| ProfileName::parse(&name).ok_or(PairRecordCodecError::InvalidInput))
         .collect::<Result<Vec<_>, _>>()?;
-    let transport = PairTransportBinding {
-        profile: take_text(&mut map, "transport_profile")?,
-        candidate_id: take_text(&mut map, "candidate_id")?,
-        parameters: take_map(&mut map, "transport_parameters")?,
-    };
     let created_at_ms = take_unsigned(&mut map, "created_at_ms")?;
     if !map.is_empty() {
         return Err(PairRecordCodecError::InvalidInput);
@@ -416,7 +369,6 @@ pub fn decode_pair_record(bytes: &[u8]) -> Result<PairRecord, PairRecordCodecErr
         remote_static_public,
         grants_hash,
         profiles,
-        transport,
         created_at_ms,
     )
     .map_err(PairRecordCodecError::InvalidRecord)
@@ -501,16 +453,6 @@ fn take_unsigned(
     }
 }
 
-fn take_map(
-    map: &mut BTreeMap<String, WireValue>,
-    key: &str,
-) -> Result<BTreeMap<String, WireValue>, PairRecordCodecError> {
-    match take_value(map, key)? {
-        WireValue::Map(value) => Ok(value),
-        _ => Err(PairRecordCodecError::InvalidInput),
-    }
-}
-
 fn take_text_array(
     map: &mut BTreeMap<String, WireValue>,
     key: &str,
@@ -529,12 +471,9 @@ fn take_text_array(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::{
-        EndpointRole, GrantsHash, PairId, PairRecord, PairTransportBinding, ProfileName,
-        RendezvousToken, decode_pair_record, decode_pair_records, encode_pair_record,
-        encode_pair_records,
+        EndpointRole, GrantsHash, PairId, PairRecord, ProfileName, RendezvousToken,
+        decode_pair_record, decode_pair_records, encode_pair_record, encode_pair_records,
     };
 
     fn test_record(id_byte: u8) -> PairRecord {
@@ -547,11 +486,6 @@ mod tests {
             [id_byte.wrapping_add(4); 32],
             GrantsHash::from_array([id_byte.wrapping_add(5); 32]),
             vec![ProfileName::Authentication, ProfileName::CardStatus],
-            PairTransportBinding {
-                profile: "fi.refineid.stream.v1".into(),
-                candidate_id: "stream-1".into(),
-                parameters: BTreeMap::new(),
-            },
             1_700_000_000_000,
         )
         .expect("valid pair record")
@@ -580,7 +514,6 @@ mod tests {
         );
         assert_eq!(original.grants_hash(), decoded.grants_hash());
         assert_eq!(original.profiles(), decoded.profiles());
-        assert_eq!(original.transport(), decoded.transport());
         assert_eq!(original.created_at_ms(), decoded.created_at_ms());
     }
 

@@ -8,7 +8,7 @@ use super::{
     LIVENESS_CHALLENGE_SIZE, MANDATORY_PAIRING_SUITE, MANDATORY_SESSION_SUITE, MessageType,
     OperationId, OperationProgressMessage, OperationReference, OperationRequest,
     OperationRequestRefusal, OperationResultMessage, OperationState, PairId, PingChallenge,
-    ProfileName, RequestError, RequestHash, SESSION_READY_NONCE_SIZE, WIRE_VERSION_V26_10_1,
+    ProfileName, RequestError, RequestHash, SESSION_READY_NONCE_SIZE, WIRE_VERSION_V26_10_9,
     WireValue,
 };
 
@@ -104,7 +104,7 @@ pub struct StatusReport {
     pub retired: bool,
 }
 
-/// Protocol-level error (RAPP v26.10.1 section 10.4).
+/// Protocol-level error (RAPP v26.10.9 section 10.4).
 ///
 /// The engine sends three: `unknown_operation` answers a stale reference,
 /// `duplicate_operation` refuses an operation identifier reused with
@@ -713,9 +713,9 @@ fn validate_profile_set(profiles: &[ProfileName]) -> Result<(), MessageError> {
 
 fn version_value() -> WireValue {
     WireValue::Array(vec![
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.0)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.1)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_1.2)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_9.0)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_9.1)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_9.2)),
     ])
 }
 
@@ -751,6 +751,7 @@ const fn close_reason_name(value: CloseReason) -> &'static str {
         CloseReason::ProtocolViolation => "protocol_violation",
         CloseReason::PairingRevoked => "pairing_revoked",
         CloseReason::Shutdown => "shutdown",
+        CloseReason::CardUnavailable => "card_unavailable",
     }
 }
 
@@ -764,6 +765,7 @@ fn parse_close_reason(value: &str) -> Result<CloseReason, MessageError> {
         "protocol_violation" => Ok(CloseReason::ProtocolViolation),
         "pairing_revoked" => Ok(CloseReason::PairingRevoked),
         "shutdown" => Ok(CloseReason::Shutdown),
+        "card_unavailable" => Ok(CloseReason::CardUnavailable),
         _ => Err(MessageError::InvalidField("reason")),
     }
 }
@@ -915,13 +917,16 @@ impl core::error::Error for MessageError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{MessageError, require_version, version_value};
-    use crate::{WIRE_VERSION_V26_10_1, WireValue};
+    use super::{
+        MessageError, close_reason_name, parse_close_reason, require_version, version_value,
+    };
+    use crate::CloseReason;
+    use crate::{WIRE_VERSION_V26_10_9, WireValue};
     use std::collections::BTreeMap;
 
     /// Named so the test states which version is being refused. This constant is
     /// test-only: nothing on a runtime path may admit it.
-    const REFUSED_LEGACY_VERSION: (u16, u16, u16) = (26, 9, 28);
+    const REFUSED_LEGACY_VERSION: (u16, u16, u16) = (26, 10, 1);
 
     fn version_triple(version: (u16, u16, u16)) -> WireValue {
         WireValue::Array(vec![
@@ -933,6 +938,18 @@ mod tests {
 
     fn map_with(version: WireValue) -> BTreeMap<String, WireValue> {
         BTreeMap::from([("version".to_owned(), version)])
+    }
+
+    #[test]
+    fn card_unavailable_close_reason_round_trips() {
+        assert_eq!(
+            close_reason_name(CloseReason::CardUnavailable),
+            "card_unavailable"
+        );
+        assert_eq!(
+            parse_close_reason("card_unavailable"),
+            Ok(CloseReason::CardUnavailable)
+        );
     }
 
     #[test]
@@ -968,7 +985,7 @@ mod tests {
     fn scalar_version_is_refused() {
         assert_eq!(
             require_version(&mut map_with(WireValue::Unsigned(u64::from(
-                WIRE_VERSION_V26_10_1.0
+                WIRE_VERSION_V26_10_9.0
             )))),
             Err(MessageError::InvalidField("version"))
         );

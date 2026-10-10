@@ -6,7 +6,7 @@ use super::{
     BinaryFrame, CryptoError, EndpointRole, EstablishedEndpoint, HandshakeChannel, HandshakeRole,
     MessageError, OpenError, PairKeyMaterial, PairRecord, PairStore, PairStoreError, PairTombstone,
     PairingState, RappState, SecureChannel, SessionHandshakeParameters, SessionParameters,
-    SessionReadyMessage, SessionState, TypedMessage,
+    SessionReadyMessage, SessionState, TransportProfile, TypedMessage,
 };
 
 /// Evidence supplied by the requester integration that the user explicitly
@@ -32,42 +32,47 @@ pub struct SessionHandshake {
 }
 
 impl SessionHandshake {
-    /// Requester-only explicit session start.
+    /// Requester-only explicit session start over `transport`, the
+    /// transport profile of the connection (RAPP v26.10.9 §4.3).
     ///
     /// # Errors
     /// [`SessionError`] on a role violation or a handshake-construction
     /// failure.
     pub fn begin_requester(
         pair: &PairRecord,
+        transport: TransportProfile,
         _intent: ExplicitUserIntent,
     ) -> Result<Self, SessionError> {
         if pair.role() != EndpointRole::Requester {
             return Err(SessionError::RoleViolation);
         }
-        Self::begin(pair)
+        Self::begin(pair, transport)
     }
 
-    /// Proxy-side response to one incoming transport candidate. This never
+    /// Proxy-side response to one incoming connection over `transport`. This never
     /// initiates a connection or automatic reconnection.
     ///
     /// # Errors
     /// [`SessionError`] on a role violation or a handshake-construction
     /// failure.
-    pub fn begin_proxy(pair: &PairRecord) -> Result<Self, SessionError> {
+    pub fn begin_proxy(
+        pair: &PairRecord,
+        transport: TransportProfile,
+    ) -> Result<Self, SessionError> {
         if pair.role() != EndpointRole::Proxy {
             return Err(SessionError::RoleViolation);
         }
-        Self::begin(pair)
+        Self::begin(pair, transport)
     }
 
-    fn begin(pair: &PairRecord) -> Result<Self, SessionError> {
+    fn begin(pair: &PairRecord, transport: TransportProfile) -> Result<Self, SessionError> {
         let local_keys =
             PairKeyMaterial::reconstruct(*pair.local_static_private(), *pair.local_static_public());
         let role = pair.role();
         let pair_id = pair.pair_id();
         let expected_parameters = SessionParameters {
-            transport_profile: pair.transport().profile.clone(),
-            candidate_id: pair.transport().candidate_id.clone(),
+            transport_profile: transport.name().to_owned(),
+            candidate_id: transport.candidate_id().to_owned(),
             grants_hash: pair.grants_hash(),
         };
         let channel = HandshakeChannel::session(&SessionHandshakeParameters {
@@ -79,7 +84,7 @@ impl SessionHandshake {
             remote_public_key: pair.remote_static_public(),
             pair_id,
             grants_hash: pair.grants_hash(),
-            transport_profile: &pair.transport().profile,
+            transport_profile: transport.name(),
         })
         .map_err(SessionError::Crypto)?;
         Ok(Self {

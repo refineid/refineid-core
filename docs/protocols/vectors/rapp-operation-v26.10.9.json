@@ -1,7 +1,7 @@
 {
   "format": "fi.refineid.rapp.operation-vectors-v1",
-  "protocol_document_version": "26.10.1",
-  "provenance": "Encoded with an independent deterministic CBOR encoder from the RAPP v26.10.1 CDDL (sections 7.1, 8.2.1, 9 and 10.4). Error messages are informative text, not normative; the reference implementations send these exact strings.",
+  "protocol_document_version": "26.10.9",
+  "provenance": "Encoded with an independent deterministic CBOR encoder from the RAPP v26.10.9 CDDL (sections 7.1, 8.2.1, 9 and 10.4). Error messages are informative text, not normative; the reference implementations send these exact strings.",
   "fixed_inputs": {
     "operation_id_request": "11111111111111111111111111111111",
     "operation_id_reference": "22222222222222222222222222222222",
@@ -188,6 +188,11 @@
       "name": "result-retired-completed",
       "message_type": "OperationResult",
       "body_hex": "a5656572726f7278196f7065726174696f6e5f616c72656164795f726574697265646673746174757369636f6d706c657465646772657469726564f56c6f7065726174696f6e5f696450222222222222222222222222222222226c726571756573745f6861736858203333333333333333333333333333333333333333333333333333333333333333"
+    },
+    {
+      "name": "result-rejected-invalid-credential",
+      "message_type": "OperationResult",
+      "body_hex": "a5656572726f7272696e76616c69645f63726564656e7469616c667374617475736872656a65637465646c6f7065726174696f6e5f696450222222222222222222222222222222226c726571756573745f68617368582033333333333333333333333333333333333333333333333333333333333333337172656d61696e696e675f7265747269657302"
     }
   ]
 }

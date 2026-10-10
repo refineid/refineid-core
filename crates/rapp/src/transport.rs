@@ -60,6 +60,76 @@ impl BinaryFrame {
     }
 }
 
+/// Registered transport profile name of the BLE direct proximity profile.
+pub const BLE_PROFILE: &str = "fi.refineid.rapp.ble.v1";
+/// Registered candidate identifier of the BLE profile.
+pub const BLE_CANDIDATE_ID: &str = "ble-direct-1";
+/// 128-bit RAPP service UUID the BLE offer entry carries.
+pub const BLE_SERVICE_UUID: &str = "7E39FD01-A6B5-4D78-9E11-37E28E9545F1";
+/// Offer-entry parameter key naming the BLE service UUID.
+const BLE_SERVICE_UUID_PARAMETER: &str = "service_uuid";
+/// Registered candidate identifier of the stream profile.
+pub const STREAM_CANDIDATE_ID: &str = "stream-1";
+
+/// A registered transport profile (RAPP v26.10.9 §2.2).
+///
+/// Each profile fixes its candidate identifier and the exact offer-entry
+/// parameters, so a valid offer entry is fully determined by its profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TransportProfile {
+    /// `fi.refineid.rapp.ble.v1`.
+    Ble,
+    /// `fi.refineid.stream.v1`.
+    Stream,
+}
+
+impl TransportProfile {
+    /// Registered profile name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Ble => BLE_PROFILE,
+            Self::Stream => super::STREAM_PROFILE,
+        }
+    }
+
+    /// Registered candidate identifier.
+    #[must_use]
+    pub const fn candidate_id(self) -> &'static str {
+        match self {
+            Self::Ble => BLE_CANDIDATE_ID,
+            Self::Stream => STREAM_CANDIDATE_ID,
+        }
+    }
+
+    /// Parse a registered profile name.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            BLE_PROFILE => Some(Self::Ble),
+            super::STREAM_PROFILE => Some(Self::Stream),
+            _ => None,
+        }
+    }
+
+    /// The exact offer entry this profile contributes to `pairing-offer`.
+    #[must_use]
+    pub fn offer_entry(self) -> TransportCandidate {
+        let mut parameters = BTreeMap::new();
+        if self == Self::Ble {
+            parameters.insert(
+                BLE_SERVICE_UUID_PARAMETER.to_owned(),
+                WireValue::Text(BLE_SERVICE_UUID.to_owned()),
+            );
+        }
+        TransportCandidate {
+            profile: self.name().to_owned(),
+            candidate_id: self.candidate_id().to_owned(),
+            parameters,
+        }
+    }
+}
+
 /// Transport candidate advertised in a pairing offer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportCandidate {

@@ -103,7 +103,12 @@ fn kc2_generator_reproduces_pinned_synthetic_vector() {
             .try_into()
             .expect("32-byte offer hash");
 
-    let context = standard_pairing_context_v2(&offer_hash).expect("standard pairing context");
+    let context = standard_pairing_context_v2(
+        &offer_hash,
+        refineid_rapp::BLE_PROFILE,
+        refineid_rapp::BLE_CANDIDATE_ID,
+    )
+    .expect("standard pairing context");
     let sid = from_hex("101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f");
 
     let generator =
@@ -111,6 +116,6 @@ fn kc2_generator_reproduces_pinned_synthetic_vector() {
 
     assert_eq!(
         to_hex(&generator.compress().to_bytes()),
-        "6c94a85a14bcd59f7a698e52cf852cacbe664d68c16c2a0da7b0ac453fb98579"
+        "f8241a0d8b3b96e7e8866a5fcaa7a4551aaa9e8d319814311793ca8d0cb41c07"
     );
 }

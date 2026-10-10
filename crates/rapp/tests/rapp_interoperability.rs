@@ -14,18 +14,15 @@
 
 //! End-to-end cryptographic interoperability through the public RAPP API.
 
-use std::collections::BTreeMap;
-
 use refineid_rapp::{
     AuthenticatedViolation, BinaryFrame, CardOperation, CpaceKc2Initiator, CpaceKc2Responder,
     EndpointError, EndpointRole, EstablishedEndpoint, ExplicitUserIntent, HandshakeChannel,
-    HandshakeRole, MANDATORY_PAIRING_SUITE, MessageType, OfferId, OperationId, OperationRequest,
-    OperationState, PairRecord, PairStore, PairStoreError, PairTombstone, PairingHandshake,
-    PairingOffer, PairingOfferUri, PairingSecret, PairingState, ProfileName, RappState,
-    ReceiveOutcome, SecureChannel, SessionHandshake, SessionHandshakeParameters, SessionParameters,
-    SessionReadyMessage, SessionState, TransportCandidate, TypedMessage, compute_grants_hash,
-    derive_manual_offer_id, encode_kc2_step1_frame, generate_pair_key_material,
-    standard_pairing_context_v2,
+    HandshakeRole, MessageType, OfferId, OperationId, OperationRequest, OperationState, PairRecord,
+    PairStore, PairStoreError, PairTombstone, PairingHandshake, PairingOffer, PairingSecret,
+    PairingState, ProfileName, RappState, ReceiveOutcome, SecureChannel, SessionHandshake,
+    SessionHandshakeParameters, SessionParameters, SessionReadyMessage, SessionState,
+    TransportProfile, TypedMessage, compute_grants_hash, encode_kc2_step1_frame,
+    generate_pair_key_material, standard_pairing_context_v2,
 };
 
 #[derive(Default)]
@@ -63,32 +60,22 @@ fn paired_records() -> (PairRecord, PairRecord) {
         ProfileName::CardStatus.as_str().to_owned(),
         ProfileName::Authentication.as_str().to_owned(),
     ];
-    let offer = PairingOffer::reconstruct(
+    let proxy_offer = PairingOffer::create(
         OfferId::from_array([0x10; 32]),
-        vec![MANDATORY_PAIRING_SUITE.to_owned()],
         profiles,
-        vec![TransportCandidate {
-            profile: "local-quic-v1".into(),
-            candidate_id: "candidate-1".into(),
-            parameters: BTreeMap::new(),
-        }],
-        60_000,
+        &[TransportProfile::Stream],
     )
     .expect("the pairing offer fixture is valid");
-    let scanned = offer
-        .to_uri()
-        .expect("the offer encodes")
-        .expose()
-        .to_owned();
-    let proxy_offer = PairingOffer::from_uri(PairingOfferUri::from_scanned_text(scanned))
-        .expect("the QR offer decodes");
+    let bootstrap = proxy_offer.to_cbor().expect("the offer encodes");
+    let offer = PairingOffer::from_bootstrap(&bootstrap, TransportProfile::Stream)
+        .expect("the bootstrap decodes");
 
     let pairing_secret = PairingSecret::from_random_bytes([0x20; 32]);
 
     let mut requester = PairingHandshake::begin(
         EndpointRole::Requester,
         offer,
-        "candidate-1",
+        refineid_rapp::STREAM_CANDIDATE_ID,
         generate_pair_key_material().expect("requester key generation succeeds"),
         &pairing_secret,
     )
@@ -96,7 +83,7 @@ fn paired_records() -> (PairRecord, PairRecord) {
     let mut proxy = PairingHandshake::begin(
         EndpointRole::Proxy,
         proxy_offer,
-        "candidate-1",
+        refineid_rapp::STREAM_CANDIDATE_ID,
         generate_pair_key_material().expect("proxy key generation succeeds"),
         &pairing_secret,
     )
@@ -241,10 +228,14 @@ const fn healthy_proxy(
 fn pairing_and_fresh_session_interoperate_end_to_end() {
     let (requester_record, proxy_record) = paired_records();
     let pair_id = requester_record.pair_id();
-    let mut requester =
-        SessionHandshake::begin_requester(&requester_record, ExplicitUserIntent::record())
-            .expect("explicit requester session starts");
-    let mut proxy = SessionHandshake::begin_proxy(&proxy_record).expect("proxy session starts");
+    let mut requester = SessionHandshake::begin_requester(
+        &requester_record,
+        TransportProfile::Stream,
+        ExplicitUserIntent::record(),
+    )
+    .expect("explicit requester session starts");
+    let mut proxy = SessionHandshake::begin_proxy(&proxy_record, TransportProfile::Stream)
+        .expect("proxy session starts");
 
     let first = requester.write_message().expect("KK message one");
     proxy
@@ -335,8 +326,8 @@ fn pairing_and_fresh_session_interoperate_end_to_end() {
 
     let wrong_phase = TypedMessage::SessionReady(SessionReadyMessage {
         parameters: SessionParameters {
-            transport_profile: requester_record.transport().profile.clone(),
-            candidate_id: requester_record.transport().candidate_id.clone(),
+            transport_profile: TransportProfile::Stream.name().to_owned(),
+            candidate_id: TransportProfile::Stream.candidate_id().to_owned(),
             grants_hash: requester_record.grants_hash(),
         },
         nonce: [0x71; 32],
@@ -354,8 +345,8 @@ fn first_authenticated_wrong_phase_message_revokes_pairing() {
     let mut store = MemoryPairStore::default();
     let wrong_phase = TypedMessage::SessionReady(SessionReadyMessage {
         parameters: SessionParameters {
-            transport_profile: "local-quic-v1".into(),
-            candidate_id: "candidate-1".into(),
+            transport_profile: refineid_rapp::STREAM_PROFILE.into(),
+            candidate_id: refineid_rapp::STREAM_CANDIDATE_ID.into(),
             grants_hash,
         },
         nonce: [0x82; 32],
@@ -436,42 +427,31 @@ fn credential_rejection_durably_revokes_the_pair() {
 }
 
 #[test]
-fn cpace_code_pairing_and_fresh_session_interoperate_end_to_end() {
-    let pairing_code = "789 123";
-    let offer_id = derive_manual_offer_id(pairing_code).expect("valid code");
+fn cpace_bootstrap_pairing_and_fresh_session_interoperate_end_to_end() {
+    let pairing_code = "7KX4M9";
 
     let profiles = vec![
         ProfileName::CardStatus.as_str().to_owned(),
         ProfileName::Authentication.as_str().to_owned(),
     ];
-    let requester_offer = PairingOffer::reconstruct(
-        offer_id,
-        vec![MANDATORY_PAIRING_SUITE.to_owned()],
-        profiles.clone(),
-        vec![TransportCandidate {
-            profile: "local-quic-v1".into(),
-            candidate_id: "candidate-1".into(),
-            parameters: BTreeMap::new(),
-        }],
-        60_000,
-    )
-    .expect("requester offer is valid");
-
-    let proxy_offer = PairingOffer::reconstruct(
-        offer_id,
-        vec![MANDATORY_PAIRING_SUITE.to_owned()],
+    let proxy_offer = PairingOffer::create(
+        OfferId::from_array([0x21; 32]),
         profiles,
-        vec![TransportCandidate {
-            profile: "local-quic-v1".into(),
-            candidate_id: "candidate-1".into(),
-            parameters: BTreeMap::new(),
-        }],
-        60_000,
+        &[TransportProfile::Ble, TransportProfile::Stream],
     )
-    .expect("proxy offer is valid");
+    .expect("custodian offer is valid");
+    let bootstrap = proxy_offer.to_cbor().expect("the offer encodes");
+    let requester_offer = PairingOffer::from_bootstrap(&bootstrap, TransportProfile::Stream)
+        .expect("the stream bootstrap decodes");
+    let offer_id = requester_offer.offer_id;
 
     let offer_hash = requester_offer.offer_hash().expect("offer hash succeeds");
-    let context = standard_pairing_context_v2(&offer_hash).expect("context succeeds");
+    let context = standard_pairing_context_v2(
+        &offer_hash,
+        TransportProfile::Stream.name(),
+        TransportProfile::Stream.candidate_id(),
+    )
+    .expect("context succeeds");
 
     // Phase 1: CPace KC2 3-step mutual confirmation exchange
     let (initiator, ya) = CpaceKc2Initiator::new(pairing_code, &context, &offer_id, &[0x33; 64])
@@ -501,7 +481,7 @@ fn cpace_code_pairing_and_fresh_session_interoperate_end_to_end() {
     let mut requester = PairingHandshake::begin(
         EndpointRole::Requester,
         requester_offer,
-        "candidate-1",
+        refineid_rapp::STREAM_CANDIDATE_ID,
         generate_pair_key_material().expect("requester key generation succeeds"),
         &alice_secret,
     )
@@ -509,7 +489,7 @@ fn cpace_code_pairing_and_fresh_session_interoperate_end_to_end() {
     let mut proxy = PairingHandshake::begin(
         EndpointRole::Proxy,
         proxy_offer,
-        "candidate-1",
+        refineid_rapp::STREAM_CANDIDATE_ID,
         generate_pair_key_material().expect("proxy key generation succeeds"),
         &bob_secret,
     )
@@ -572,11 +552,14 @@ fn cpace_code_pairing_and_fresh_session_interoperate_end_to_end() {
     );
 
     // Phase 4: Fresh Session Handshake
-    let mut requester_session =
-        SessionHandshake::begin_requester(&requester_record, ExplicitUserIntent::record())
-            .expect("explicit requester session starts");
-    let mut proxy_session =
-        SessionHandshake::begin_proxy(&proxy_record).expect("proxy session starts");
+    let mut requester_session = SessionHandshake::begin_requester(
+        &requester_record,
+        TransportProfile::Stream,
+        ExplicitUserIntent::record(),
+    )
+    .expect("explicit requester session starts");
+    let mut proxy_session = SessionHandshake::begin_proxy(&proxy_record, TransportProfile::Stream)
+        .expect("proxy session starts");
 
     let s_msg1 = requester_session.write_message().expect("KK message one");
     proxy_session

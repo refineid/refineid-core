@@ -1,12 +1,11 @@
 # Remote Authorization Proxy Protocol (RAPP)
 ## Transport and Discovery Hierarchy Specification
 
-- **Document Version**: `26.10.3`
-- **Protocol Versions**: `26.9.28`, `26.10.1`
+- **Document Version**: `26.10.9`
+- **Protocol Versions**: `26.10.9`
 - **Status**: Normative Specification / Architecture Blueprint
 - **Change Controller**: RefineID Project
 - **Applies To**: `refineid-core`, `refineid-unix`, `refineid-windows`, `refineid-apple`, `refineid-android`
-- **Supersedes**: Connection direction in Section 16.1 of `rapp-v26.9.28.md`
 
 ---
 
@@ -14,12 +13,12 @@
 
 The Remote Authorization Proxy Protocol (RAPP) enables a desktop or laptop requester to leverage an identity card (e.g., FINEID Citizen Certificate) held in physical custody by a mobile phone over NFC, without exporting the private keys, PIN codes, or credential secrets.
 
-Earlier iterations of the stream transport profile (`fi.refineid.stream.v1` in `rapp-v26.9.28.md` §16.1) incorrectly specified that the workstation should host the listening TCP socket while the mobile device dials in. On desktop operating systems—most notably Windows and desktop Unix/Linux distributions—requiring an inbound listening port introduces unacceptable security risks:
+The mobile device listens and the workstation dials. On desktop operating systems—most notably Windows and desktop Unix/Linux distributions—an inbound listening port would introduce unacceptable security risks:
 1. It exposes unauthenticated application TCP listening ports on desktop workstations, increasing the attack surface for local network port scans and lateral exploit movement.
 2. It requires administrative UAC elevation and inbound firewall modifications (e.g. Windows Firewall `netsh` rule creation, or `iptables`/`nftables`/`firewalld` rule modifications).
 3. It places the listening socket on the workstation, whereas placing the listener and advertisement on the mobile device (which holds hardware custody of the card and controls per-operation authorization prompts) allows workstations to operate strictly as outbound clients without inbound application firewall holes.
 
-This specification defines the normative **3-Tier Discovery and Transport Hierarchy** and inverts the connection direction for local network stream transport: the phone acts as the listener/advertiser (when explicitly enabled), and workstations connect strictly as outbound clients. Furthermore, it establishes strict **UX Hygiene Rules** ensuring desktop applications function as standard local smart card readers by default.
+This specification defines the normative **3-Tier Discovery and Transport Hierarchy**: for local network stream transport the phone acts as the listener/advertiser (when explicitly enabled), and workstations connect strictly as outbound clients. Furthermore, it establishes strict **UX Hygiene Rules** ensuring desktop applications function as standard local smart card readers by default.
 
 ---
 
@@ -97,13 +96,13 @@ Tier 3: Local IP Stream via mDNS / DNS-SD
 
 ### 3.2 Tier 2: Bluetooth / BLE Proximity Transport (`fi.refineid.rapp.ble.v1`)
 - **Applicability**: Standard cross-platform proximity transport across supported platforms (iOS, Android, Linux/BSD, Windows, macOS).
-- **Normative Specification**: Governed normatively by RAPP v26.10.1 §2–§5.
+- **Normative Specification**: Governed normatively by RAPP v26.10.9 §2–§5.
 - **Wire Profile**: The canonical cross-platform wire profile is GATT-based `fi.refineid.rapp.ble.v1`:
   - Primary Service UUID: `7E39FD01-A6B5-4D78-9E11-37E28E9545F1`
   - Channel Characteristic UUID: `7E39FD02-A6B5-4D78-9E11-37E28E9545F1` (Requester writes via `ATT_WRITE_REQ`; Custodian indicates via `ATT_HANDLE_VALUE_IND`)
   - Bootstrap Characteristic UUID: `7E39FD03-A6B5-4D78-9E11-37E28E9545F1` (Requester reads via `ATT_READ_REQ`)
   - Framing: Mandates ATT MTU Exchange ($\ge 512$ bytes) and RAPP BLE SAR framing (6-byte header: Total Frame Length, Chunk Sequence, Flags, Reserved).
-- **Advisory Proximity Gating (RAPP v26.10.1 §4.4)**:
+- **Advisory Proximity Gating (RAPP v26.10.9 §4.4)**:
   - The Requester enforces an advisory RSSI discovery gate ($\ge -55\text{ dBm}$ filtered median over at least 3 packets, configurable down to $-85\text{ dBm}$ strictly in isolated developer testing).
   - **Threat Model & Non-Guarantee**: RSSI is strictly an **advisory discovery heuristic** and defense-in-depth barrier. It does NOT constitute a cryptographic proof of physical co-location and CANNOT defeat transparent RF wormholes, relays, or directional power amplifiers that preserve authenticated frames. Real-world protection against relay attacks is enforced at Layer 7 by explicit per-operation user authorization on the Custodian phone screen and PACE/CAN boundaries.
 - **Platform Capability Constraints & L2CAP CoC Distinction**:
@@ -121,6 +120,7 @@ Tier 3: Local IP Stream via mDNS / DNS-SD
   - Custodian runs `StreamRelayListener` on a dynamic, ephemeral TCP port (`bind(0)`).
   - Custodian advertises service type `_refineid-stream._tcp.local.` via mDNS.
   - Requester runs `StreamRelayBrowser`, receives the PTR/SRV/TXT records, and initiates an **outbound** TCP `connect()` to the phone's advertised IP and port.
+- **Wire Profile**: Governed normatively by RAPP v26.10.9 §2.2.2. Each frame is a 2-byte unsigned big-endian length followed by 1 to 65535 payload bytes. The Requester's first frame is the routing preamble `["RAPP-stream-v1", purpose, token]` (§2.2.1). After a `"pairing"` preamble the Custodian's first frame is the encoded `pairing-offer` (§4.2); after a `"session"` preamble with a known token the Requester sends `Noise_KK` message 1.
 
 ---
 
@@ -130,7 +130,7 @@ Because mDNS discovery broadcasts on multicast UDP port 5353 (IPv4 `224.0.0.251`
 
 ### 4.1 Separation of Discovery Identifiers and Persistent Routing Tokens
 - **Persistent Reconnect Routing Token (`rendezvous_token`)**:
-  - As defined in RAPP v26.10.1 §4.3, `rendezvous_token` is a 16-byte cryptographically derived value (`first 16 bytes of SHA-512("RAPP-rendezvous-v1" || h)`), stored permanently in the local pairing trust record.
+  - As defined in RAPP v26.10.9 §4.3, `rendezvous_token` is a 16-byte cryptographically derived value (`first 16 bytes of SHA-512("RAPP-rendezvous-v1" || h)`), stored permanently in the local pairing trust record.
   - **Zero Public Broadcast**: The 16-byte `rendezvous_token` **MUST NEVER** be published in mDNS PTR, SRV, or TXT records, nor broadcast in unauthenticated BLE advertising packets.
   - The token is transmitted strictly point-to-point over the established TCP stream (or BLE Channel Characteristic) during initial connection routing in `Phase::Routing` (§5.2).
 
@@ -154,9 +154,8 @@ The Custodian publishes two distinct discovery modes:
      ```text
      v=1
      mode=pairing
-     offer=[16-byte-hex-offer-id]
      ```
-   - `offer` contains the 16-byte random, ephemeral `offer_id` from the active `pairing-offer` (Section 4.1 of RAPP v26.10.1). It is destroyed upon offer completion or timeout, ensuring zero persistent linkage.
+   - Nothing derived from the pairing code or the offer is published. The Requester obtains the offer over the connection (RAPP v26.10.9 §4.2).
 
 2. **Session Reconnect Mode (`mode=session`)**:
    - Active when "Allow Remote Card Reader" is enabled and the phone is ready for operational card requests.
@@ -168,9 +167,12 @@ The Custodian publishes two distinct discovery modes:
      No pairing tokens, hashes, or hints are published. Requesters on the local subnet with "Enable Remote Phone Reader" active connect to the advertised endpoint and present their 16-byte `rendezvous_token` inside the point-to-point stream in `Phase::Routing`. If the Custodian does not recognize the token, the TCP connection is immediately closed.
    - **Optional Rotating Discovery Hints (Multi-Device Coexistence)**:
      To avoid trial connections in high-density enterprise environments with multiple active Custodians, the Custodian MAY publish truncated, rotating HMAC hints for up to 4 stored pairings:
-     $$\text{hint}_i = \text{first 8 bytes of }\text{HMAC-SHA-256}(K_{\text{disc}, i}, \text{epoch})$$
-     where $K_{\text{disc}, i} = \text{HKDF-Expand}(\text{rendezvous\_token}_i, \text{"RAPP-discovery-hint-v1"}, 32)$, and $\text{epoch} = \lfloor \text{unix\_time} / 900 \rfloor$ (15-minute rotation window).
-     TXT Attribute: `hints=[hint1_hex],[hint2_hex]`
+     $$\text{hint}_i = \text{first 8 bytes of }\text{HMAC-SHA-256}(K_{\text{disc}, i}, \text{epoch\_be64})$$
+     where:
+     - $K_{\text{disc}, i}$ = HKDF-Expand-SHA-256 ([RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html) §2.3) with $\text{PRK} = \text{rendezvous\_token}_i$ (16 bytes), $\text{info} = $ `"RAPP-discovery-hint-v1"` (ASCII), and $L = 32$; with $L$ equal to the hash length this is the single block $\text{HMAC-SHA-256}(\text{rendezvous\_token}_i, \text{info} \parallel \texttt{0x01})$. No HKDF-Extract step is applied.
+     - $\text{epoch} = \lfloor \text{unix\_time} / 900 \rfloor$ (15-minute rotation window), and $\text{epoch\_be64}$ is that value as an unsigned 64-bit big-endian integer (8 bytes), the entire HMAC message.
+     - TXT Attribute: `hints=` followed by at most 4 hints, each 16 lowercase hexadecimal digits, separated by commas without spaces (e.g. `hints=96b4d41e75873658,aed3f5d7b0cf0a7c`).
+     - The `discovery_hint` vectors of `vectors/rapp-v26.10.9.json` pin the bytes.
      Requesters evaluate candidate hints for the current and adjacent epoch ($\text{epoch} \pm 1$) against their stored pairings before initiating TCP connections.
 
 ---

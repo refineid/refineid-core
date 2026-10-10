@@ -23,7 +23,7 @@ use refineid_rapp::{
 };
 use serde::Deserialize;
 
-const CORPUS: &str = include_str!("../../../docs/protocols/vectors/rapp-v26.10.1.json");
+const CORPUS: &str = include_str!("../../../docs/protocols/vectors/rapp-v26.10.9.json");
 
 #[derive(Debug, Deserialize)]
 struct Corpus {
@@ -95,7 +95,7 @@ struct GrantsVector {
 #[derive(Debug, Deserialize)]
 struct RequestVector {
     name: String,
-    session_id_hex: String,
+    pair_id_hex: String,
     operation_id_hex: String,
     profile: String,
     action: String,
@@ -116,7 +116,7 @@ struct RejectedCborVector {
 fn corpus_metadata_and_names_are_stable() {
     let corpus = corpus();
     assert_eq!(corpus.format, "fi.refineid.rapp.conformance-v1");
-    assert_eq!(corpus.protocol_document_version, "26.10.1");
+    assert_eq!(corpus.protocol_document_version, "26.10.9");
     assert_eq!(corpus.deterministic_cbor.len(), 15);
     assert_eq!(corpus.identifier_derivation.len(), 2);
     assert_eq!(corpus.grants_hash.len(), 3);
@@ -275,10 +275,7 @@ fn grants_hash_normalizes_profile_order_and_matches_golden_values() {
 #[test]
 fn request_hash_preimage_and_digest_match_golden_values() {
     for vector in corpus().request_hash {
-        // The corpus still names the second preimage slot by its earlier
-        // session role; section 8.2.1 binds the pair identifier there, and
-        // the 16 bytes hash identically.
-        let pair_bytes = decode_hex(&vector.session_id_hex);
+        let pair_bytes = decode_hex(&vector.pair_id_hex);
         let operation_bytes = decode_hex(&vector.operation_id_hex);
         let pair_id = PairId::reconstruct(&pair_bytes).expect("pair id length");
         let operation_id = OperationId::reconstruct(&operation_bytes).expect("operation id length");

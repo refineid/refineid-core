@@ -39,6 +39,7 @@ pub mod operation_bindings;
 #[cfg(feature = "bindings")]
 pub mod operation_bridge;
 mod pairing;
+mod pairing_attempts;
 mod pairing_flow;
 mod policy;
 mod proxy_engine;
@@ -64,10 +65,10 @@ pub use cpace::{
     CPACE_TRANSCRIPT_HASH_SIZE, CpaceError, CpaceKc2Initiator, CpaceKc2Keys, CpaceKc2Responder,
     CpaceKc2ResponderWaiting, CpaceState, calculate_confirmation_tag, calculate_generator_kc2,
     calculate_transcript_hash_v2, decode_kc2_step1_frame, decode_kc2_step2_frame,
-    decode_kc2_step3_frame, derive_kc2_keys, derive_manual_offer_id, encode_kc2_step1_frame,
-    encode_kc2_step2_frame, encode_kc2_step3_frame, encode_pairing_context_v2,
-    hkdf_expand_sha512_32, hkdf_extract_sha512, sample_scalar_canonical, sample_scalar_wide,
-    standard_pairing_context_v2, verify_tag_constant_time,
+    decode_kc2_step3_frame, derive_kc2_keys, encode_kc2_step1_frame, encode_kc2_step2_frame,
+    encode_kc2_step3_frame, encode_pairing_context_v2, hkdf_expand_sha512_32, hkdf_extract_sha512,
+    sample_scalar_canonical, sample_scalar_wide, standard_pairing_context_v2,
+    verify_tag_constant_time,
 };
 pub use crypto::{
     CryptoError, HandshakeChannel, HandshakeCompletion, HandshakeRole, OpenError, PairKeyMaterial,
@@ -89,7 +90,7 @@ pub use message::{
     PairingConfirmMessage, PairingHelloMessage, ProtocolErrorMessage, SessionCloseMessage,
     SessionParameters, SessionReadyMessage, StatusReport, TypedMessage,
 };
-pub use offer::{PairingOffer, PairingOfferDeadline, PairingOfferError, PairingOfferUri};
+pub use offer::{MAX_OFFER_SIZE, PairingOffer, PairingOfferDeadline, PairingOfferError};
 pub use operation::{
     CardIdentity, CardInspection, CardKeyProfile, CardOperation, CardOperationError,
     CardOperationResult, CertificateKind, CredentialKind, DEFAULT_OPERATION_LIFETIME_MS,
@@ -97,8 +98,13 @@ pub use operation::{
 };
 pub use pairing::{
     PAIR_RECORD_FORMAT_VERSION, PairRecord, PairRecordCodecError, PairRecordError, PairStore,
-    PairStoreError, PairTombstone, PairTransportBinding, decode_pair_record, decode_pair_records,
-    encode_pair_record, encode_pair_records,
+    PairStoreError, PairTombstone, decode_pair_record, decode_pair_records, encode_pair_record,
+    encode_pair_records,
+};
+pub use pairing_attempts::{
+    CPACE_ATTEMPT_WINDOW_MS, CpaceAttemptLedger, MAXIMUM_CPACE_ATTEMPTS, POST_PAKE_CONFIRMATION_MS,
+    POST_PAKE_HANDSHAKE_MS, PRE_AUTHENTICATION_SPACING_MS, PairingBackoff,
+    PreAuthenticationRateLimit, phase_deadline_ms,
 };
 pub use pairing_flow::{
     PairingAttemptFailure, PairingConfirmation, PairingError, PairingHandshake,
@@ -125,19 +131,22 @@ pub use state::{
     RappState, SecurityOutcome, SessionEvent, SessionState, Transition, TransitionError,
 };
 pub use stream::{
-    MAX_STREAM_ENDPOINT_BYTES, MAX_STREAM_ENDPOINTS, MAX_STREAM_RENDEZVOUS_FRAME, STREAM_PROFILE,
-    StreamCandidateParameters, StreamError, StreamRendezvous,
+    DISCOVERY_HINT_EPOCH_SECONDS, DISCOVERY_HINT_SIZE, MAX_STREAM_RENDEZVOUS_FRAME, STREAM_PROFILE,
+    StreamError, StreamRendezvous, discovery_hint,
 };
-pub use transport::{BinaryFrame, FrameError, FrameTransport, TransportCandidate};
+pub use transport::{
+    BLE_CANDIDATE_ID, BLE_PROFILE, BLE_SERVICE_UUID, BinaryFrame, FrameError, FrameTransport,
+    STREAM_CANDIDATE_ID, TransportCandidate, TransportProfile,
+};
 pub use types::{
     CANDIDATE_FAILURE_HINT_THRESHOLD, CloseReason, FailureClass, GRANTS_HASH_SIZE, GrantsHash,
     IdentifierError, LIVENESS_CHALLENGE_SIZE, MANDATORY_PAIRING_SUITE, MANDATORY_SESSION_SUITE,
-    MAX_ACTIVE_OPERATIONS, MAX_FRAME_PLAINTEXT, MAX_FRAME_SIZE, MAX_TRANSPORT_CANDIDATES,
-    MINIMUM_REMAINING_ATTEMPTS, NOISE_TAG_SIZE, OFFER_ID_SIZE, OFFER_TTL_MAX_MS, OPERATION_ID_SIZE,
-    OfferId, OperationId, PAIR_ID_SIZE, PAIRING_SECRET_SIZE, PairId, PairingSecret, ProfileName,
-    RENDEZVOUS_TOKEN_SIZE, REQUEST_HASH_SIZE, RendezvousToken, RequestHash, RetryDecision,
-    SESSION_ID_SIZE, SESSION_READY_NONCE_SIZE, SessionId, VisibleConnectionState,
-    WIRE_VERSION_V26_10_1, X25519_KEY_SIZE,
+    MAX_ACTIVE_OPERATIONS, MAX_FRAME_PLAINTEXT, MAX_FRAME_SIZE, MINIMUM_REMAINING_ATTEMPTS,
+    NOISE_TAG_SIZE, OFFER_ID_SIZE, OFFER_TTL_MS, OPERATION_ID_SIZE, OfferId, OperationId,
+    PAIR_ID_SIZE, PAIRING_SECRET_SIZE, PairId, PairingSecret, ProfileName, RENDEZVOUS_TOKEN_SIZE,
+    REQUEST_HASH_SIZE, RendezvousToken, RequestHash, RetryDecision, SESSION_ID_SIZE,
+    SESSION_READY_NONCE_SIZE, SessionId, VisibleConnectionState, WIRE_VERSION_V26_10_9,
+    X25519_KEY_SIZE,
 };
 pub use wire::{
     Envelope, MessageType, SequenceGuard, WireError, WireValue, decode_deterministic_cbor,

@@ -5,9 +5,9 @@ use core::fmt;
 use super::{
     BinaryFrame, CryptoError, EndpointRole, HandshakeChannel, HandshakeRole, MessageError,
     NegotiatedParameters, OpenError, PairKeyMaterial, PairRecord, PairRecordError,
-    PairTransportBinding, PairingConfirmMessage, PairingHandshakeParameters, PairingHelloMessage,
-    PairingOffer, PairingOfferError, PairingSecret, ProfileName, SecureChannel, TransportCandidate,
-    TypedMessage, compute_grants_hash,
+    PairingConfirmMessage, PairingHandshakeParameters, PairingHelloMessage, PairingOffer,
+    PairingOfferError, PairingSecret, ProfileName, SecureChannel, TransportCandidate, TypedMessage,
+    compute_grants_hash,
 };
 
 /// In-progress mandatory Noise `XXpsk3` handshake.
@@ -417,11 +417,6 @@ impl PairingConfirmation {
             self.remote_static_public,
             grants_hash,
             local_grants,
-            PairTransportBinding {
-                profile: self.candidate.profile,
-                candidate_id: self.candidate.candidate_id,
-                parameters: self.candidate.parameters,
-            },
             created_at_ms,
         )
         .map_err(PairingError::PairRecord)

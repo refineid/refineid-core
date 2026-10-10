@@ -14,7 +14,7 @@
 
 //! Native Noise implementation for the operational session handshake.
 //!
-//! Implements `Noise_KK_25519_ChaChaPoly_SHA512` (RAPP v26.10.1 section 6.3):
+//! Implements `Noise_KK_25519_ChaChaPoly_SHA512` (RAPP v26.10.9 section 6.3):
 //! Curve25519 Diffie-Hellman, ChaCha20-Poly1305, and SHA-512 per Noise
 //! Protocol Framework revision 34.
 

@@ -3,14 +3,13 @@
 
 //! Replay of the RAPP v26.10.9 transport-bound corpus sections: pairing
 //! offers, CPace KC2 transcripts per transport, both Noise transcripts per
-//! transport (cross-checked against snow), and discovery hints.
+//! transport (cross-checked against snow).
 
 use refineid_rapp::{
     BinaryFrame, CpaceKc2Initiator, CpaceKc2Responder, HandshakeRole, OfferId, PairingOffer,
-    RendezvousToken, TransportProfile,
+    TransportProfile,
     cpace::calculate_generator_kc2,
-    derive_pair_id, derive_rendezvous_token, derive_session_id, discovery_hint,
-    encode_kc2_step1_frame,
+    derive_pair_id, derive_session_id, encode_kc2_step1_frame,
     noise::{KkHandshakeState, x25519_public_key},
     standard_pairing_context_v2,
 };
@@ -23,7 +22,6 @@ struct Corpus {
     pairing_offer: Vec<OfferVector>,
     cpace_kc2: Vec<Kc2Vector>,
     noise_handshake: Vec<NoiseVector>,
-    discovery_hint: Vec<HintVector>,
 }
 
 #[derive(Deserialize)]
@@ -67,21 +65,11 @@ struct NoiseVector {
     #[serde(default)]
     pair_id_hex: Option<String>,
     #[serde(default)]
-    rendezvous_token_hex: Option<String>,
-    #[serde(default)]
     test_only_pairing_secret_hex: Option<String>,
     test_only_initiator_static_private_hex: String,
     test_only_responder_static_private_hex: String,
     test_only_initiator_ephemeral_private_hex: String,
     test_only_responder_ephemeral_private_hex: String,
-}
-
-#[derive(Deserialize)]
-struct HintVector {
-    name: String,
-    rendezvous_token_hex: String,
-    epoch: u64,
-    hint_hex: String,
 }
 
 fn corpus() -> Corpus {
@@ -302,14 +290,6 @@ fn noise_transcripts_match_snow_and_derive_their_identifiers() {
             "{}",
             vector.name
         );
-        if let Some(pair_id) = &vector.rendezvous_token_hex {
-            assert_eq!(
-                &hex::encode(derive_rendezvous_token(&hash).as_bytes()),
-                pair_id,
-                "{}",
-                vector.name
-            );
-        }
         if let Some(pair_id) = &vector.pair_id_hex
             && vector.test_only_pairing_secret_hex.is_some()
         {
@@ -382,20 +362,6 @@ fn native_kk_replays_the_session_transcripts() {
         assert_eq!(
             hex::encode(initiator.handshake_hash()),
             vector.handshake_hash_hex,
-            "{}",
-            vector.name
-        );
-    }
-}
-
-#[test]
-fn discovery_hints_match_the_corpus() {
-    for vector in corpus().discovery_hint {
-        let token = RendezvousToken::reconstruct(&bytes(&vector.rendezvous_token_hex))
-            .expect("token length");
-        assert_eq!(
-            hex::encode(discovery_hint(&token, vector.epoch)),
-            vector.hint_hex,
             "{}",
             vector.name
         );

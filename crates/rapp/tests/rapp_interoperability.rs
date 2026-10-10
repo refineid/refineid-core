@@ -617,10 +617,6 @@ fn cpace_bootstrap_pairing_and_fresh_session_interoperate_end_to_end() {
     let proxy_record = proxy_confirm.into_pair_record(200).expect("proxy finishes");
 
     assert_eq!(requester_record.pair_id(), proxy_record.pair_id());
-    assert_eq!(
-        requester_record.rendezvous_token(),
-        proxy_record.rendezvous_token()
-    );
 
     // Phase 4: Fresh Session Handshake
     let mut requester_session = SessionHandshake::begin_requester(

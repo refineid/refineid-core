@@ -64,6 +64,10 @@ impl BinaryFrame {
 pub const BLE_PROFILE: &str = "fi.refineid.rapp.ble.v1";
 /// Registered candidate identifier of the BLE profile.
 pub const BLE_CANDIDATE_ID: &str = "ble-direct-1";
+/// Domain string opening every BLE routing preamble.
+const BLE_PREAMBLE_DOMAIN: &str = "RAPP-ble-v1";
+/// Domain string opening every stream routing preamble.
+const STREAM_PREAMBLE_DOMAIN: &str = "RAPP-stream-v1";
 /// 128-bit RAPP service UUID the BLE offer entry carries.
 pub const BLE_SERVICE_UUID: &str = "7E39FD01-A6B5-4D78-9E11-37E28E9545F1";
 /// Offer-entry parameter key naming the BLE service UUID.
@@ -90,6 +94,15 @@ impl TransportProfile {
         match self {
             Self::Ble => BLE_PROFILE,
             Self::Stream => super::STREAM_PROFILE,
+        }
+    }
+
+    /// Domain string opening this profile's routing preamble (§2.2).
+    #[must_use]
+    pub const fn preamble_domain(self) -> &'static str {
+        match self {
+            Self::Ble => BLE_PREAMBLE_DOMAIN,
+            Self::Stream => STREAM_PREAMBLE_DOMAIN,
         }
     }
 

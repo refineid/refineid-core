@@ -24,16 +24,10 @@
 
 use core::fmt;
 
-use curve25519_dalek::{montgomery::MontgomeryPoint, traits::Identity};
-use hmac::{
-    Hmac,
-    digest::{KeyInit, Mac},
-};
-use sha2::Sha256;
 use subtle::{Choice, ConstantTimeEq};
 use zeroize::Zeroizing;
 
-use super::{PairId, PairRecord, X25519_KEY_SIZE};
+use super::{PAIR_KEY_SIZE, PairId, PairRecord, X25519_KEY_SIZE};
 
 /// Byte length of one withdrawal hint.
 pub const WITHDRAWAL_HINT_SIZE: usize = 8;
@@ -49,12 +43,6 @@ pub const MAX_INSTANCE_NAME_SIZE: usize = 63;
 
 /// HKDF-Expand info naming the withdrawal key.
 const WITHDRAWAL_KEY_INFO: &[u8] = b"RAPP-withdrawal-v1";
-
-/// The single-block counter byte of HKDF-Expand for a 32-byte output.
-const HKDF_FIRST_BLOCK: u8 = 1;
-
-/// Byte length of the withdrawal key.
-const WITHDRAWAL_KEY_SIZE: usize = 32;
 
 /// TXT key and value naming the record version.
 const TXT_VERSION_KEY: &str = "v";
@@ -81,8 +69,6 @@ const NIBBLE_BITS: u32 = 4;
 
 /// Low-nibble mask.
 const NIBBLE_MASK: u8 = 0x0f;
-
-type HmacSha256 = Hmac<Sha256>;
 
 /// Why a withdrawal value could not be formed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,7 +126,7 @@ pub const fn withdrawal_counter(unix_time_seconds: u64) -> u64 {
 }
 
 /// One pairing's withdrawal key `K_wd`, equal on both endpoints.
-pub struct WithdrawalKey(Zeroizing<[u8; WITHDRAWAL_KEY_SIZE]>);
+pub struct WithdrawalKey(Zeroizing<[u8; PAIR_KEY_SIZE]>);
 
 impl fmt::Debug for WithdrawalKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -174,22 +160,13 @@ impl WithdrawalKey {
         local_static_private: &[u8; X25519_KEY_SIZE],
         remote_static_public: &[u8; X25519_KEY_SIZE],
     ) -> Result<Self, WithdrawalError> {
-        let agreement = MontgomeryPoint(*remote_static_public).mul_clamped(*local_static_private);
-        if agreement == MontgomeryPoint::identity() {
-            return Err(WithdrawalError::DegenerateAgreement);
-        }
-        let shared = Zeroizing::new(agreement.0);
-        let mut extract = <HmacSha256 as KeyInit>::new_from_slice(pair_id.as_bytes())
-            .expect("HMAC accepts any key length");
-        extract.update(shared.as_slice());
-        let mut prk = Zeroizing::new([0_u8; WITHDRAWAL_KEY_SIZE]);
-        prk.copy_from_slice(&extract.finalize().into_bytes());
-        let mut expand = <HmacSha256 as KeyInit>::new_from_slice(prk.as_slice())
-            .expect("HMAC accepts any key length");
-        expand.update(WITHDRAWAL_KEY_INFO);
-        expand.update(&[HKDF_FIRST_BLOCK]);
-        let mut key = Zeroizing::new([0_u8; WITHDRAWAL_KEY_SIZE]);
-        key.copy_from_slice(&expand.finalize().into_bytes());
+        let key = super::derive_pair_key(
+            pair_id,
+            local_static_private,
+            remote_static_public,
+            WITHDRAWAL_KEY_INFO,
+        )
+        .map_err(|_| WithdrawalError::DegenerateAgreement)?;
         Ok(Self(key))
     }
 
@@ -197,14 +174,9 @@ impl WithdrawalKey {
     /// counter_be64)`, `len` one octet.
     #[must_use]
     pub fn hint(&self, instance: &InstanceName, counter: u64) -> [u8; WITHDRAWAL_HINT_SIZE] {
-        let mut mac = <HmacSha256 as KeyInit>::new_from_slice(self.0.as_slice())
-            .expect("HMAC accepts any key length");
         let name = instance.as_bytes();
         let length = u8::try_from(name.len()).expect("an instance name is one DNS label");
-        mac.update(&[length]);
-        mac.update(name);
-        mac.update(&counter.to_be_bytes());
-        let digest = mac.finalize().into_bytes();
+        let digest = super::pair_key_mac(&self.0, &[&[length], name, &counter.to_be_bytes()]);
         let mut hint = [0_u8; WITHDRAWAL_HINT_SIZE];
         hint.copy_from_slice(&digest[..WITHDRAWAL_HINT_SIZE]);
         hint

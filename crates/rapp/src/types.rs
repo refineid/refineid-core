@@ -44,8 +44,6 @@ pub const OFFER_ID_SIZE: usize = 32;
 pub const PAIR_ID_SIZE: usize = 16;
 /// Byte length of a session identifier.
 pub const SESSION_ID_SIZE: usize = 16;
-/// Byte length of a pair-specific transport rendezvous token.
-pub const RENDEZVOUS_TOKEN_SIZE: usize = 16;
 /// Byte length of an operation identifier.
 pub const OPERATION_ID_SIZE: usize = 16;
 /// Byte length of a request hash.
@@ -138,11 +136,6 @@ public_identifier!(
     SessionId,
     SESSION_ID_SIZE,
     "Derived identifier for one secure channel."
-);
-public_identifier!(
-    RendezvousToken,
-    RENDEZVOUS_TOKEN_SIZE,
-    "Derived pair-specific rendezvous value for transports that must name a pairing on the wire without exposing its identifier."
 );
 public_identifier!(
     OperationId,

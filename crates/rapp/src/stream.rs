@@ -12,28 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The `fi.refineid.stream.v1` transport profile's routing preamble.
+//! The routing preamble every connection opens with, on both transport
+//! profiles (RAPP v26.10.10 §2.2.1), and the stream profile's name.
 //!
-//! The stream profile (RAPP v26.10.9 §2.2.2) carries RAPP frames over one
-//! reliable ordered byte stream, each frame behind a 2-byte big-endian
-//! length. The custodian listens and the requester dials, for both pairing
-//! and sessions, and the requester's first frame is the routing preamble
-//! this module encodes (§2.2.1). Socket I/O and the length-prefix framing
-//! live in platform adapters, never here.
+//! The stream profile (§2.2.2) carries RAPP frames over one reliable ordered
+//! byte stream, each frame behind a 2-byte big-endian length. Socket I/O and
+//! the length-prefix framing live in platform adapters, never here.
 
-use hmac::{
-    Hmac,
-    digest::{KeyInit, Mac},
+use super::{
+    SESSION_ROUTING_SIZE, SessionRouting, TransportProfile, WireValue, decode_deterministic_cbor,
+    encode_deterministic_cbor,
 };
-use sha2::Sha256;
-
-use super::{RendezvousToken, WireValue, decode_deterministic_cbor, encode_deterministic_cbor};
 
 /// Registered transport profile name for the stream profile.
 pub const STREAM_PROFILE: &str = "fi.refineid.stream.v1";
-
-/// Domain string opening every stream rendezvous preamble.
-const STREAM_RENDEZVOUS_DOMAIN: &str = "RAPP-stream-v1";
 
 /// Preamble purpose naming a pairing attempt.
 const PURPOSE_PAIRING: &str = "pairing";
@@ -41,235 +33,232 @@ const PURPOSE_PAIRING: &str = "pairing";
 /// Preamble purpose naming a session attempt for a stored pairing.
 const PURPOSE_SESSION: &str = "session";
 
-/// HKDF-Expand info naming the discovery-hint key (hierarchy §4.3).
-const DISCOVERY_HINT_INFO: &[u8] = b"RAPP-discovery-hint-v1";
-
-/// The single-block counter byte of HKDF-Expand for a 32-byte output.
-const HKDF_FIRST_BLOCK: u8 = 1;
-
-/// Byte length of one published discovery hint.
-pub const DISCOVERY_HINT_SIZE: usize = 8;
-
-/// Length in seconds of one discovery-hint epoch.
-pub const DISCOVERY_HINT_EPOCH_SECONDS: u64 = 900;
-
-type HmacSha256 = Hmac<Sha256>;
-
-/// The rotating discovery hint a custodian MAY publish for one stored
-/// pairing in `epoch` = floor(unix time / 900) (hierarchy specification
-/// §4.3).
-///
-/// `K_disc` is HKDF-Expand-SHA-256 with the 16-byte `rendezvous_token` as
-/// PRK, info `"RAPP-discovery-hint-v1"`, and 32 output bytes, which is the
-/// single block `HMAC-SHA-256(token, info || 0x01)`; the hint is the first 8
-/// bytes of `HMAC-SHA-256(K_disc, epoch as 8-byte big-endian)`.
-#[must_use]
-pub fn discovery_hint(token: &RendezvousToken, epoch: u64) -> [u8; DISCOVERY_HINT_SIZE] {
-    let mut expand = <HmacSha256 as KeyInit>::new_from_slice(token.as_bytes())
-        .expect("HMAC accepts any key length");
-    expand.update(DISCOVERY_HINT_INFO);
-    expand.update(&[HKDF_FIRST_BLOCK]);
-    let key = expand.finalize().into_bytes();
-    let mut hint =
-        <HmacSha256 as KeyInit>::new_from_slice(&key).expect("HMAC accepts any key length");
-    hint.update(&epoch.to_be_bytes());
-    let digest = hint.finalize().into_bytes();
-    let mut out = [0_u8; DISCOVERY_HINT_SIZE];
-    out.copy_from_slice(&digest[..DISCOVERY_HINT_SIZE]);
-    out
-}
-
-/// Upper bound on an encoded rendezvous preamble frame. The accepting
+/// Upper bound on an encoded routing preamble frame. The accepting
 /// endpoint rejects a longer preamble before parsing it.
-pub const MAX_STREAM_RENDEZVOUS_FRAME: usize = 64;
+pub const MAX_ROUTING_PREAMBLE_FRAME: usize = 64;
 
-/// One plaintext routing preamble, the first frame the dialing requester
-/// sends on a fresh stream connection.
+/// One plaintext routing preamble, the first frame the requester sends on
+/// a fresh connection.
 ///
-/// The preamble is unauthenticated routing metadata, exactly like a relay
-/// token: it selects whether the listening custodian serves its offer or
-/// opens a session, and enables nothing else.
+/// The preamble is unauthenticated routing metadata: it selects whether the
+/// custodian serves its offer or opens a session, and enables nothing else.
+/// A session preamble's routing value is fresh per dial and keyed by the
+/// pairing's static agreement, so it names the pairing only to its custodian.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamRendezvous {
-    /// Connect to the listener's currently active pairing offer.
+pub enum RoutingPreamble {
+    /// Connect to the custodian's currently active pairing offer.
     Pairing,
-    /// Connect for a fresh session with the stored pairing this token names.
-    Session(RendezvousToken),
+    /// Connect for a fresh session with the stored pairing that keyed this
+    /// routing value.
+    Session(SessionRouting),
 }
 
-impl StreamRendezvous {
-    /// Encode the preamble frame payload.
+impl RoutingPreamble {
+    /// Encode the preamble frame payload for `profile`.
     ///
     /// # Errors
-    /// [`StreamError::Malformed`] when deterministic encoding fails.
-    pub fn encode(&self) -> Result<Vec<u8>, StreamError> {
-        let (purpose, token_bytes) = match self {
+    /// [`PreambleError::Malformed`] when deterministic encoding fails.
+    pub fn encode(&self, profile: TransportProfile) -> Result<Vec<u8>, PreambleError> {
+        let (purpose, routing) = match self {
             Self::Pairing => (PURPOSE_PAIRING, Vec::new()),
-            Self::Session(token) => (PURPOSE_SESSION, token.as_bytes().to_vec()),
+            Self::Session(routing) => (PURPOSE_SESSION, routing.to_bytes().to_vec()),
         };
         encode_deterministic_cbor(&WireValue::Array(vec![
-            WireValue::Text(STREAM_RENDEZVOUS_DOMAIN.to_owned()),
+            WireValue::Text(profile.preamble_domain().to_owned()),
             WireValue::Text(purpose.to_owned()),
-            WireValue::Bytes(token_bytes),
+            WireValue::Bytes(routing),
         ]))
-        .map_err(|_| StreamError::Malformed)
+        .map_err(|_| PreambleError::Malformed)
     }
 
-    /// Decode and validate one received preamble frame payload.
+    /// Decode and validate one preamble frame payload received on `profile`.
     ///
-    /// Every failure is pre-authentication invalid input (RAPP v26.10.9
-    /// §10.1, class 1): the caller closes the connection and changes
-    /// no stored state.
+    /// Every failure is pre-authentication invalid input (§10.1, class 1):
+    /// the caller closes the connection and changes no stored state.
     ///
     /// # Errors
-    /// [`StreamError`] on an oversized frame, a malformed preamble, or an
-    /// unregistered purpose.
-    pub fn decode(bytes: &[u8]) -> Result<Self, StreamError> {
-        if bytes.len() > MAX_STREAM_RENDEZVOUS_FRAME {
-            return Err(StreamError::Oversized);
+    /// [`PreambleError`] on an oversized frame, a malformed preamble, another
+    /// profile's domain, or an unregistered purpose.
+    pub fn decode(profile: TransportProfile, bytes: &[u8]) -> Result<Self, PreambleError> {
+        if bytes.len() > MAX_ROUTING_PREAMBLE_FRAME {
+            return Err(PreambleError::Oversized);
         }
         let WireValue::Array(elements) =
-            decode_deterministic_cbor(bytes).map_err(|_| StreamError::Malformed)?
+            decode_deterministic_cbor(bytes).map_err(|_| PreambleError::Malformed)?
         else {
-            return Err(StreamError::Malformed);
+            return Err(PreambleError::Malformed);
         };
         let [
             WireValue::Text(domain),
             WireValue::Text(purpose),
-            WireValue::Bytes(token_bytes),
+            WireValue::Bytes(routing),
         ] = elements.as_slice()
         else {
-            return Err(StreamError::Malformed);
+            return Err(PreambleError::Malformed);
         };
-        if domain != STREAM_RENDEZVOUS_DOMAIN {
-            return Err(StreamError::Malformed);
+        if domain != profile.preamble_domain() {
+            return Err(PreambleError::Malformed);
         }
         match purpose.as_str() {
             PURPOSE_PAIRING => {
-                if token_bytes.is_empty() {
+                if routing.is_empty() {
                     Ok(Self::Pairing)
                 } else {
-                    Err(StreamError::Malformed)
+                    Err(PreambleError::Malformed)
                 }
             }
-            PURPOSE_SESSION => RendezvousToken::reconstruct(token_bytes)
+            PURPOSE_SESSION => SessionRouting::from_bytes(routing)
+                .filter(|_| routing.len() == SESSION_ROUTING_SIZE)
                 .map(Self::Session)
-                .map_err(|_| StreamError::Malformed),
-            _ => Err(StreamError::UnknownPurpose),
+                .ok_or(PreambleError::Malformed),
+            _ => Err(PreambleError::UnknownPurpose),
         }
     }
 }
 
-/// Rejected stream-profile bytes.
+/// Rejected routing preamble bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamError {
-    /// Structure, domain, type, or token length was not exactly as specified.
+pub enum PreambleError {
+    /// Structure, domain, type, or routing length was not exactly as specified.
     Malformed,
-    /// Preamble frame exceeded [`MAX_STREAM_RENDEZVOUS_FRAME`].
+    /// Preamble frame exceeded [`MAX_ROUTING_PREAMBLE_FRAME`].
     Oversized,
     /// Purpose string is not registered; the connection closes unanswered.
     UnknownPurpose,
 }
 
-impl core::fmt::Display for StreamError {
+impl core::fmt::Display for PreambleError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(formatter, "{self:?}")
     }
 }
 
-impl core::error::Error for StreamError {}
+impl core::error::Error for PreambleError {}
 
 #[cfg(test)]
 mod tests {
-    use super::super::RENDEZVOUS_TOKEN_SIZE;
+    use super::super::{RandomUnavailable, RoutingKey, X25519_KEY_SIZE};
     use super::*;
 
-    fn token() -> RendezvousToken {
-        RendezvousToken::from_array([0x5a; RENDEZVOUS_TOKEN_SIZE])
+    const PRIVATE_BYTE: u8 = 0x11;
+    const PEER_BYTE: u8 = 0x22;
+    const PAIR_BYTE: u8 = 0x33;
+    const NONCE_BYTE: u8 = 0x44;
+
+    fn routing() -> SessionRouting {
+        let peer = curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(
+            [PEER_BYTE; X25519_KEY_SIZE],
+        )
+        .to_bytes();
+        RoutingKey::from_parts(
+            super::super::PairId::from_array([PAIR_BYTE; super::super::PAIR_ID_SIZE]),
+            &[PRIVATE_BYTE; X25519_KEY_SIZE],
+            &peer,
+        )
+        .expect("key")
+        .route(
+            TransportProfile::Stream,
+            |bytes| -> Result<(), RandomUnavailable> {
+                bytes.fill(NONCE_BYTE);
+                Ok(())
+            },
+        )
+        .expect("route")
     }
 
-    #[test]
-    fn pairing_preamble_round_trips() {
-        let encoded = StreamRendezvous::Pairing.encode().expect("encode");
-        assert!(encoded.len() <= MAX_STREAM_RENDEZVOUS_FRAME);
-        assert_eq!(
-            StreamRendezvous::decode(&encoded).expect("decode"),
-            StreamRendezvous::Pairing
-        );
-    }
-
-    #[test]
-    fn session_preamble_round_trips() {
-        let encoded = StreamRendezvous::Session(token()).encode().expect("encode");
-        assert!(encoded.len() <= MAX_STREAM_RENDEZVOUS_FRAME);
-        assert_eq!(
-            StreamRendezvous::decode(&encoded).expect("decode"),
-            StreamRendezvous::Session(token())
-        );
-    }
-
-    #[test]
-    fn pairing_preamble_with_token_bytes_is_rejected() {
-        let encoded = encode_deterministic_cbor(&WireValue::Array(vec![
-            WireValue::Text(STREAM_RENDEZVOUS_DOMAIN.to_owned()),
-            WireValue::Text(PURPOSE_PAIRING.to_owned()),
-            WireValue::Bytes(vec![0x01]),
+    fn preamble(domain: &str, purpose: &str, routing: Vec<u8>) -> Vec<u8> {
+        encode_deterministic_cbor(&WireValue::Array(vec![
+            WireValue::Text(domain.to_owned()),
+            WireValue::Text(purpose.to_owned()),
+            WireValue::Bytes(routing),
         ]))
-        .expect("encode");
+        .expect("encode")
+    }
+
+    #[test]
+    fn pairing_preamble_round_trips_on_both_profiles() {
+        for profile in [TransportProfile::Ble, TransportProfile::Stream] {
+            let encoded = RoutingPreamble::Pairing.encode(profile).expect("encode");
+            assert!(encoded.len() <= MAX_ROUTING_PREAMBLE_FRAME);
+            assert_eq!(
+                RoutingPreamble::decode(profile, &encoded),
+                Ok(RoutingPreamble::Pairing)
+            );
+        }
+    }
+
+    #[test]
+    fn session_preamble_round_trips_within_the_frame_bound() {
+        for profile in [TransportProfile::Ble, TransportProfile::Stream] {
+            let encoded = RoutingPreamble::Session(routing())
+                .encode(profile)
+                .expect("encode");
+            assert!(encoded.len() <= MAX_ROUTING_PREAMBLE_FRAME);
+            assert_eq!(
+                RoutingPreamble::decode(profile, &encoded),
+                Ok(RoutingPreamble::Session(routing()))
+            );
+        }
+    }
+
+    #[test]
+    fn another_profiles_domain_is_rejected() {
+        let encoded = RoutingPreamble::Pairing
+            .encode(TransportProfile::Ble)
+            .expect("encode");
         assert_eq!(
-            StreamRendezvous::decode(&encoded),
-            Err(StreamError::Malformed)
+            RoutingPreamble::decode(TransportProfile::Stream, &encoded),
+            Err(PreambleError::Malformed)
         );
     }
 
     #[test]
-    fn session_preamble_with_short_token_is_rejected() {
-        let encoded = encode_deterministic_cbor(&WireValue::Array(vec![
-            WireValue::Text(STREAM_RENDEZVOUS_DOMAIN.to_owned()),
-            WireValue::Text(PURPOSE_SESSION.to_owned()),
-            WireValue::Bytes(vec![0x01; RENDEZVOUS_TOKEN_SIZE - 1]),
-        ]))
-        .expect("encode");
+    fn pairing_preamble_with_routing_bytes_is_rejected() {
+        let encoded = preamble(
+            TransportProfile::Stream.preamble_domain(),
+            PURPOSE_PAIRING,
+            routing().to_bytes().to_vec(),
+        );
         assert_eq!(
-            StreamRendezvous::decode(&encoded),
-            Err(StreamError::Malformed)
+            RoutingPreamble::decode(TransportProfile::Stream, &encoded),
+            Err(PreambleError::Malformed)
+        );
+    }
+
+    #[test]
+    fn session_preamble_with_short_routing_is_rejected() {
+        let mut short = routing().to_bytes().to_vec();
+        short.pop();
+        let encoded = preamble(
+            TransportProfile::Stream.preamble_domain(),
+            PURPOSE_SESSION,
+            short,
+        );
+        assert_eq!(
+            RoutingPreamble::decode(TransportProfile::Stream, &encoded),
+            Err(PreambleError::Malformed)
         );
     }
 
     #[test]
     fn unknown_purpose_is_its_own_rejection() {
-        let encoded = encode_deterministic_cbor(&WireValue::Array(vec![
-            WireValue::Text(STREAM_RENDEZVOUS_DOMAIN.to_owned()),
-            WireValue::Text("resume".to_owned()),
-            WireValue::Bytes(Vec::new()),
-        ]))
-        .expect("encode");
-        assert_eq!(
-            StreamRendezvous::decode(&encoded),
-            Err(StreamError::UnknownPurpose)
+        let encoded = preamble(
+            TransportProfile::Stream.preamble_domain(),
+            "resume",
+            Vec::new(),
         );
-    }
-
-    #[test]
-    fn wrong_domain_is_rejected() {
-        let encoded = encode_deterministic_cbor(&WireValue::Array(vec![
-            WireValue::Text("RAPP-relay-v1".to_owned()),
-            WireValue::Text(PURPOSE_PAIRING.to_owned()),
-            WireValue::Bytes(Vec::new()),
-        ]))
-        .expect("encode");
         assert_eq!(
-            StreamRendezvous::decode(&encoded),
-            Err(StreamError::Malformed)
+            RoutingPreamble::decode(TransportProfile::Stream, &encoded),
+            Err(PreambleError::UnknownPurpose)
         );
     }
 
     #[test]
     fn oversized_preamble_is_rejected_before_parsing() {
-        let oversized = vec![0_u8; MAX_STREAM_RENDEZVOUS_FRAME + 1];
+        let oversized = vec![0_u8; MAX_ROUTING_PREAMBLE_FRAME + 1];
         assert_eq!(
-            StreamRendezvous::decode(&oversized),
-            Err(StreamError::Oversized)
+            RoutingPreamble::decode(TransportProfile::Stream, &oversized),
+            Err(PreambleError::Oversized)
         );
     }
 }

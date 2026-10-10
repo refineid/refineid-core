@@ -1298,6 +1298,31 @@ fn pairing_context(
 }
 
 #[cfg(test)]
+mod discovery_hint_tests {
+    use super::{RappBindingError, rapp_discovery_hint};
+
+    /// Seconds into the window the corpus vector names, so the export
+    /// must divide by the window length rather than take an epoch.
+    const SECONDS_INTO_WINDOW: u64 = 899;
+
+    #[test]
+    fn export_matches_the_corpus_window_from_wall_time() {
+        let token = hex::decode("5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a").expect("token hex");
+        let epoch_start = 1_990_560 * crate::DISCOVERY_HINT_EPOCH_SECONDS;
+        let hint = rapp_discovery_hint(token, epoch_start + SECONDS_INTO_WINDOW).expect("hint");
+        assert_eq!(hex::encode(hint), "96b4d41e75873658");
+    }
+
+    #[test]
+    fn wrong_size_token_is_refused() {
+        assert!(matches!(
+            rapp_discovery_hint(vec![0; 15], 0),
+            Err(RappBindingError::InvalidInput)
+        ));
+    }
+}
+
+#[cfg(test)]
 mod pairing_bridge_tests {
     use super::*;
     use crate::{
@@ -2481,6 +2506,32 @@ pub fn rapp_stream_profile_name() -> String {
     STREAM_PROFILE.to_owned()
 }
 
+/// Rotating discovery hint of one stored pairing for the 15-minute window
+/// containing `unix_time_seconds` (hierarchy specification section 4.3).
+///
+/// A custodian publishes the hints of the current window; a requester
+/// compares its own pairings against the current and adjacent windows.
+///
+/// # Errors
+/// [`RappBindingError::InvalidInput`] on a wrong-size token.
+#[uniffi::export]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "uniffi lowers exported arguments as owned values"
+)]
+pub fn rapp_discovery_hint(
+    rendezvous_token: Vec<u8>,
+    unix_time_seconds: u64,
+) -> Result<Vec<u8>, RappBindingError> {
+    let token = RendezvousToken::reconstruct(&rendezvous_token)
+        .map_err(|_| RappBindingError::InvalidInput)?;
+    Ok(super::discovery_hint(
+        &token,
+        unix_time_seconds / super::DISCOVERY_HINT_EPOCH_SECONDS,
+    )
+    .to_vec())
+}
+
 fn encode_pair_record(record: &PairRecord) -> Result<Vec<u8>, RappBindingError> {
     super::encode_pair_record(record).map_err(|_| RappBindingError::ProtocolFailure)
 }
@@ -2524,4 +2575,112 @@ pub(super) fn take_unsigned(
         WireValue::Unsigned(value) => Ok(value),
         _ => Err(RappBindingError::InvalidInput),
     }
+}
+
+/// The BLE segmentation and reassembly receiver for one connection and one
+/// direction (RAPP v26.10.9 §5.3).
+///
+/// Any refused fragment zeroizes the partial frame; the caller then drops
+/// the connection.
+#[derive(Debug, Default, uniffi::Object)]
+pub struct RappBleSarReassembler {
+    inner: Mutex<crate::ble_sar::BleSarReassembler>,
+}
+
+#[uniffi::export]
+impl RappBleSarReassembler {
+    /// A receiver waiting for the first fragment of a frame.
+    #[uniffi::constructor]
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Consume one fragment at the platform's monotonic `now_monotonic_ms`;
+    /// returns the complete message once its last fragment arrives.
+    ///
+    /// # Errors
+    /// [`RappBindingError::ProtocolFailure`] for any fragment §5.3 refuses,
+    /// and [`RappBindingError::LocalStateFailure`] on a poisoned lock.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "uniffi lowers exported arguments as owned values"
+    )]
+    pub fn receive(
+        &self,
+        fragment: Vec<u8>,
+        capacity: u32,
+        now_monotonic_ms: u64,
+    ) -> Result<Option<Vec<u8>>, RappBindingError> {
+        let capacity = usize::try_from(capacity).map_err(|_| RappBindingError::InvalidInput)?;
+        self.inner
+            .lock()
+            .map_err(|_| RappBindingError::LocalStateFailure)?
+            .receive(&fragment, capacity, now_monotonic_ms)
+            .map_err(|_| RappBindingError::ProtocolFailure)
+    }
+
+    /// Refuse a frame whose 5.0-second reassembly timer has run out.
+    ///
+    /// # Errors
+    /// [`RappBindingError::ProtocolFailure`] when the timer expired, and
+    /// [`RappBindingError::LocalStateFailure`] on a poisoned lock.
+    pub fn check_timer(&self, now_monotonic_ms: u64) -> Result<(), RappBindingError> {
+        self.inner
+            .lock()
+            .map_err(|_| RappBindingError::LocalStateFailure)?
+            .check_timer(now_monotonic_ms)
+            .map_err(|_| RappBindingError::ProtocolFailure)
+    }
+
+    /// Zeroize any partial frame and return to idle.
+    ///
+    /// # Errors
+    /// [`RappBindingError::LocalStateFailure`] on a poisoned lock.
+    pub fn reset(&self) -> Result<(), RappBindingError> {
+        self.inner
+            .lock()
+            .map_err(|_| RappBindingError::LocalStateFailure)?
+            .reset();
+        Ok(())
+    }
+}
+
+/// The uniform SAR fragment payload capacity for a negotiated ATT MTU and
+/// any smaller value limit the platform reports (RAPP v26.10.9 §5.3).
+///
+/// # Errors
+/// [`RappBindingError::InvalidInput`] below an MTU of 512 or when the limit
+/// leaves no room for a non-final fragment.
+#[uniffi::export]
+pub fn rapp_ble_sar_payload_capacity(
+    negotiated_att_mtu: u32,
+    platform_value_limit: Option<u32>,
+) -> Result<u32, RappBindingError> {
+    let mtu = usize::try_from(negotiated_att_mtu).map_err(|_| RappBindingError::InvalidInput)?;
+    let limit = platform_value_limit
+        .map(usize::try_from)
+        .transpose()
+        .map_err(|_| RappBindingError::InvalidInput)?;
+    let capacity =
+        crate::ble_sar::payload_capacity(mtu, limit).map_err(|_| RappBindingError::InvalidInput)?;
+    u32::try_from(capacity).map_err(|_| RappBindingError::InvalidInput)
+}
+
+/// Split one message into the SAR fragments that carry it, in order.
+///
+/// # Errors
+/// [`RappBindingError::InvalidInput`] for an empty or oversized message or
+/// a capacity outside the profile's range.
+#[uniffi::export]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "uniffi lowers exported arguments as owned values"
+)]
+pub fn rapp_ble_sar_segment(
+    message: Vec<u8>,
+    capacity: u32,
+) -> Result<Vec<Vec<u8>>, RappBindingError> {
+    let capacity = usize::try_from(capacity).map_err(|_| RappBindingError::InvalidInput)?;
+    crate::ble_sar::segment(&message, capacity).map_err(|_| RappBindingError::InvalidInput)
 }

@@ -558,3 +558,169 @@ fn a_second_request_while_one_is_live_is_refused_with_operation_failed() {
         )))
     ));
 }
+
+fn batch_request(documents: usize) -> OperationRequest {
+    OperationRequest::reconstruct(
+        OperationId::from_array([0x55; 16]),
+        PairId::from_array([0x22; 16]),
+        SessionId::from_array([0x33; 16]),
+        ProfileName::DocumentSigning,
+        1_000,
+        5_000,
+        CardOperation::BatchSignDocuments {
+            document_names: (0..documents)
+                .map(|index| format!("Doc{index}.pdf"))
+                .collect(),
+            key_profile: CardKeyProfile::EcdsaP256,
+            algorithm: SignatureAlgorithm::EcdsaSha256,
+            digests: vec![vec![0x44; 32]; documents],
+        },
+    )
+    .expect("the batch vector is valid")
+}
+
+fn batch_engine(store: &mut MemoryResultStore) -> (ProxyOperationEngine, OperationRequest) {
+    let request = batch_request(3);
+    let mut engine = ProxyOperationEngine::new(vec![ProfileName::DocumentSigning]);
+    engine
+        .receive(
+            store,
+            TypedMessage::OperationRequest(request.clone()),
+            1_000,
+        )
+        .expect("the batch is admitted");
+    engine
+        .prerequisites_complete(request.operation_id)
+        .expect("prerequisites complete");
+    let approval = UserApproval::for_request(&request, 1_100).expect("deterministic hash");
+    let Ok(ProxyDispatch::ExecuteCardCommand { command, .. }) =
+        engine.approve(store, request.operation_id, approval, 1_100, 10_000)
+    else {
+        panic!("approval yields the batch command");
+    };
+    command.execute(|_| ());
+    (engine, request)
+}
+
+#[test]
+fn batch_validation_follows_section_9_3() {
+    assert!(
+        OperationRequest::reconstruct(
+            OperationId::from_array([0x55; 16]),
+            PairId::from_array([0x22; 16]),
+            SessionId::from_array([0x33; 16]),
+            ProfileName::DocumentSigning,
+            1_000,
+            5_000,
+            CardOperation::BatchSignDocuments {
+                document_names: vec!["One.pdf".into()],
+                key_profile: CardKeyProfile::EcdsaP256,
+                algorithm: SignatureAlgorithm::EcdsaSha256,
+                digests: vec![vec![0x44; 32]; 2],
+            },
+        )
+        .is_err(),
+        "names and digests must pair"
+    );
+    assert!(
+        OperationRequest::reconstruct(
+            OperationId::from_array([0x55; 16]),
+            PairId::from_array([0x22; 16]),
+            SessionId::from_array([0x33; 16]),
+            ProfileName::DocumentSigning,
+            1_000,
+            5_000,
+            CardOperation::BatchSignDocuments {
+                document_names: (0..65).map(|index| format!("Doc{index}.pdf")).collect(),
+                key_profile: CardKeyProfile::EcdsaP256,
+                algorithm: SignatureAlgorithm::EcdsaSha256,
+                digests: vec![vec![0x44; 32]; 65],
+            },
+        )
+        .is_err(),
+        "more than 64 documents is refused"
+    );
+    assert!(batch_request(64).operation.is_consequential());
+}
+
+#[test]
+fn each_batch_signature_is_journaled_before_the_next_document() {
+    let mut store = MemoryResultStore::default();
+    let (mut engine, request) = batch_engine(&mut store);
+    let writes = store.events.len();
+    for index in 0..3_u8 {
+        engine
+            .record_batch_signature(&mut store, request.operation_id, vec![index + 1; 64])
+            .expect("signature journaled");
+    }
+    assert_eq!(store.events.len(), writes + 3);
+    assert!(
+        engine
+            .record_batch_signature(&mut store, request.operation_id, vec![9; 64])
+            .is_err(),
+        "no signature past the last document"
+    );
+    let Ok(ProxyDispatch::Send(TypedMessage::OperationResult(result))) =
+        engine.complete_batch(&mut store, request.operation_id)
+    else {
+        panic!("a complete batch answers with its signatures");
+    };
+    assert_eq!(result.status, ResultStatus::Completed);
+    let Ok(CardOperationResult::Signatures(signatures)) = result
+        .response
+        .as_ref()
+        .expect("signatures travel")
+        .typed_for(&request.operation)
+    else {
+        panic!("the result reads as signatures");
+    };
+    assert_eq!(signatures, vec![vec![1; 64], vec![2; 64], vec![3; 64]]);
+}
+
+#[test]
+fn an_unfinished_batch_cannot_complete() {
+    let mut store = MemoryResultStore::default();
+    let (mut engine, request) = batch_engine(&mut store);
+    engine
+        .record_batch_signature(&mut store, request.operation_id, vec![1; 64])
+        .expect("signature journaled");
+    assert!(
+        engine
+            .complete_batch(&mut store, request.operation_id)
+            .is_err()
+    );
+}
+
+#[test]
+fn an_interrupted_batch_answers_ambiguous_with_its_signatures() {
+    let mut store = MemoryResultStore::default();
+    let (mut engine, request) = batch_engine(&mut store);
+    engine
+        .record_batch_signature(&mut store, request.operation_id, vec![1; 64])
+        .expect("signature journaled");
+    let Ok(ProxyDispatch::SendFailure {
+        message: TypedMessage::OperationResult(result),
+        ..
+    }) = engine.finish_failure(
+        &mut store,
+        request.operation_id,
+        ProxyFailure::CardCompletionAmbiguous,
+    )
+    else {
+        panic!("the interruption is reported");
+    };
+    assert_eq!(result.status, ResultStatus::Ambiguous);
+    let reference = OperationReference {
+        operation_id: request.operation_id,
+        request_hash: request.request_hash().expect("hash"),
+    };
+    result
+        .validate_for(reference, &request.operation)
+        .expect("the partial result answers the batch");
+    assert_eq!(
+        result
+            .partial_batch_signatures(&request.operation)
+            .expect("partial progress"),
+        vec![vec![1; 64]]
+    );
+}

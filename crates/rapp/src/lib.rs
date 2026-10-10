@@ -25,6 +25,7 @@ uniffi::setup_scaffolding!();
 mod authorization;
 #[cfg(feature = "bindings")]
 pub mod bindings;
+pub mod ble_sar;
 pub mod cpace;
 mod crypto;
 mod endpoint;
@@ -78,8 +79,8 @@ pub use crypto::{
 };
 pub use endpoint::{AuthenticatedViolation, EndpointError, EstablishedEndpoint, ReceiveOutcome};
 pub use journal::{
-    JournalError, JournalRecord, JournalRecoveryStore, JournalStore, OperationJournal,
-    PendingCardCommand, RecoveredProxyRecord, ResultJournalStore,
+    BatchProgress, JournalError, JournalRecord, JournalRecoveryStore, JournalStore,
+    OperationJournal, PendingCardCommand, RecoveredProxyRecord, ResultJournalStore,
 };
 pub use liveness::{
     LivenessConfig, LivenessDecision, LivenessError, LivenessTracker, PingChallenge,
@@ -92,9 +93,10 @@ pub use message::{
 };
 pub use offer::{MAX_OFFER_SIZE, PairingOffer, PairingOfferDeadline, PairingOfferError};
 pub use operation::{
-    CardIdentity, CardInspection, CardKeyProfile, CardOperation, CardOperationError,
-    CardOperationResult, CertificateKind, CredentialKind, DEFAULT_OPERATION_LIFETIME_MS,
-    OperationRequest, OperationRequestRefusal, RequestError, SignatureAlgorithm,
+    BATCH_DOCUMENTS, CardIdentity, CardInspection, CardKeyProfile, CardOperation,
+    CardOperationError, CardOperationResult, CertificateKind, CredentialKind,
+    DEFAULT_OPERATION_LIFETIME_MS, OperationRequest, OperationRequestRefusal, RequestError,
+    SignatureAlgorithm,
 };
 pub use pairing::{
     PAIR_RECORD_FORMAT_VERSION, PairRecord, PairRecordCodecError, PairRecordError, PairStore,

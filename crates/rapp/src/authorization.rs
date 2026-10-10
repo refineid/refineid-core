@@ -4,9 +4,9 @@ use core::fmt;
 use std::collections::BTreeMap;
 
 use super::{
-    CardOperation, CardOperationError, JournalError, JournalStore, OperationId, OperationJournal,
-    OperationRequest, OperationResultMessage, OperationState, PendingCardCommand, RequestHash,
-    ResultJournalStore, ResultStatus, WireValue,
+    CardOperation, CardOperationError, CardOperationResult, JournalError, JournalStore,
+    OperationId, OperationJournal, OperationRequest, OperationResultMessage, OperationState,
+    PendingCardCommand, RequestHash, ResultJournalStore, ResultStatus, WireValue,
 };
 
 /// Explicit local user approval of one exact operation request.
@@ -184,7 +184,12 @@ impl AuthorizationTransaction {
         };
         let pending = self
             .journal
-            .begin_card_command(store, self.request_hash, command)
+            .begin_card_command(
+                store,
+                self.request_hash,
+                self.request.operation.batch_total(),
+                command,
+            )
             .map_err(|(error, _command)| AuthorizationError::Journal(error))?;
         self.stage = AuthorizationStage::Executing;
         Ok(ApprovalOutcome::ExecuteCardCommand(pending))
@@ -246,6 +251,17 @@ impl AuthorizationTransaction {
         result
             .validate_for(reference, &self.request.operation)
             .map_err(|_| AuthorizationError::InvalidResult)?;
+        if let Some(batch) = &self.journal.record().batch {
+            // A batch completes only with exactly the signatures it journaled.
+            let journaled = CardOperationResult::Signatures(batch.completed_signatures.clone());
+            let answered = result
+                .response
+                .as_ref()
+                .map(|response| response.typed_for(&self.request.operation));
+            if batch.completed_signatures.len() != batch.total || answered != Some(Ok(journaled)) {
+                return Err(AuthorizationError::InvalidResult);
+            }
+        }
         match self.stage {
             AuthorizationStage::Executing => self
                 .journal
@@ -260,6 +276,36 @@ impl AuthorizationTransaction {
         self.retained_result = Some(result);
         self.stage = AuthorizationStage::ResultPending;
         Ok(())
+    }
+
+    /// Records one batch signature as the card makes it, before the next
+    /// document is signed.
+    ///
+    /// # Errors
+    /// [`AuthorizationError`] outside an executing batch or on a journal
+    /// failure.
+    pub fn record_batch_signature<S: JournalStore>(
+        &mut self,
+        store: &mut S,
+        signature: Vec<u8>,
+    ) -> Result<(), AuthorizationError<S::Error>> {
+        if self.stage != AuthorizationStage::Executing {
+            return Err(AuthorizationError::WrongStage(self.stage));
+        }
+        self.journal
+            .record_batch_signature(store, signature)
+            .map_err(AuthorizationError::Journal)
+    }
+
+    /// The signatures a batch has made so far, in document order; empty for
+    /// every other operation.
+    #[must_use]
+    pub fn batch_signatures(&self) -> &[Vec<u8>] {
+        self.journal
+            .record()
+            .batch
+            .as_ref()
+            .map_or(&[], |batch| batch.completed_signatures.as_slice())
     }
 
     /// Exact retained result: a completed one while acknowledgment is

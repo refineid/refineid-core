@@ -14,8 +14,21 @@
 
 use super::{OperationId, OperationResultMessage, OperationState, PairId, RequestHash, SessionId};
 
+/// Per-document progress of a `batch_sign_documents` operation (sections
+/// 8.1 and 9.3).
+///
+/// The document being signed is always the one after the last completed
+/// signature, so the current index is `completed_signatures.len()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchProgress {
+    /// Documents in the batch, 1 to 64.
+    pub total: usize,
+    /// Signatures already made, in document order.
+    pub completed_signatures: Vec<Vec<u8>>,
+}
+
 /// Durable, non-secret operation record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalRecord {
     /// Stored pairing that authorized the operation.
     pub pair_id: PairId,
@@ -31,6 +44,8 @@ pub struct JournalRecord {
     pub transmission_count: u8,
     /// Whether any automatic retry remains legal.
     pub automatic_retry_permitted: bool,
+    /// Progress of a batch; `None` for every other operation.
+    pub batch: Option<BatchProgress>,
 }
 
 /// Adapter boundary for durable write-ahead operation records.
@@ -137,6 +152,7 @@ impl OperationJournal {
                 state: OperationState::Prepared,
                 transmission_count: 0,
                 automatic_retry_permitted: false,
+                batch: None,
             },
         }
     }
@@ -156,6 +172,8 @@ impl OperationJournal {
     /// Persist the write-ahead in-flight entry, counting the one
     /// transmission, and consume a non-clonable command (section 8.1).
     ///
+    /// A batch starts its per-document progress in the same write.
+    ///
     /// The returned wrapper is the only value an APDU/card adapter may accept.
     /// A persistence failure returns the command to the caller and performs no
     /// transmission.
@@ -168,6 +186,7 @@ impl OperationJournal {
         &mut self,
         store: &mut S,
         request_hash: RequestHash,
+        batch_total: Option<usize>,
         command: C,
     ) -> Result<PendingCardCommand<C>, (JournalError<S::Error>, C)> {
         if self.record.state != OperationState::Prepared {
@@ -184,10 +203,51 @@ impl OperationJournal {
         if self.record.transmission_count != 0 {
             return Err((JournalError::AlreadyTransmitted, command));
         }
-        if let Err(error) = self.persist_update(store, OperationState::Executing, 1) {
-            return Err((error, command));
+        let mut next = self.record.clone();
+        next.state = OperationState::Executing;
+        next.transmission_count = 1;
+        next.automatic_retry_permitted = false;
+        next.batch = batch_total.map(|total| BatchProgress {
+            total,
+            completed_signatures: Vec::new(),
+        });
+        if let Err(error) = store.persist(&next) {
+            return Err((JournalError::Persistence(error), command));
         }
+        self.record = next;
         Ok(PendingCardCommand { command })
+    }
+
+    /// Persist one batch signature before the next document is signed, so
+    /// an interruption never signs a journaled document again (section
+    /// 9.3).
+    ///
+    /// # Errors
+    /// [`JournalError`] outside an executing batch, past its last document,
+    /// on an empty signature, or on a persistence failure.
+    pub fn record_batch_signature<S: JournalStore>(
+        &mut self,
+        store: &mut S,
+        signature: Vec<u8>,
+    ) -> Result<(), JournalError<S::Error>> {
+        let open = self.record.state == OperationState::Executing
+            && self
+                .record
+                .batch
+                .as_ref()
+                .is_some_and(|batch| batch.completed_signatures.len() < batch.total);
+        if !open || signature.is_empty() {
+            return Err(JournalError::InvalidState {
+                state: self.record.state,
+            });
+        }
+        let mut next = self.record.clone();
+        if let Some(batch) = next.batch.as_mut() {
+            batch.completed_signatures.push(signature);
+        }
+        store.persist(&next).map_err(JournalError::Persistence)?;
+        self.record = next;
+        Ok(())
     }
 
     /// Persist an unsuccessful terminal state with the result that reports
@@ -213,7 +273,7 @@ impl OperationJournal {
                 state: self.record.state,
             });
         }
-        let mut next = self.record;
+        let mut next = self.record.clone();
         next.state = state;
         next.automatic_retry_permitted = false;
         store
@@ -268,7 +328,7 @@ impl OperationJournal {
                 state: self.record.state,
             });
         }
-        let mut next = self.record;
+        let mut next = self.record.clone();
         next.state = OperationState::Completed;
         next.automatic_retry_permitted = false;
         store
@@ -291,7 +351,7 @@ impl OperationJournal {
                 state: self.record.state,
             });
         }
-        let mut next = self.record;
+        let mut next = self.record.clone();
         next.state = OperationState::DeliveryUncertain;
         next.automatic_retry_permitted = false;
         store
@@ -330,7 +390,7 @@ impl OperationJournal {
         state: OperationState,
         transmission_count: u8,
     ) -> Result<(), JournalError<S::Error>> {
-        let mut next = self.record;
+        let mut next = self.record.clone();
         next.state = state;
         next.transmission_count = transmission_count;
         next.automatic_retry_permitted = false;
@@ -350,7 +410,7 @@ impl OperationJournal {
                 state: self.record.state,
             });
         }
-        let mut next = self.record;
+        let mut next = self.record.clone();
         next.state = OperationState::ResultPending;
         next.automatic_retry_permitted = false;
         store
@@ -398,7 +458,7 @@ mod tests {
         type Error = core::convert::Infallible;
 
         fn persist(&mut self, record: &JournalRecord) -> Result<(), Self::Error> {
-            self.0.push(*record);
+            self.0.push(record.clone());
             Ok(())
         }
     }
@@ -418,7 +478,12 @@ mod tests {
         let mut store = MemoryStore::default();
 
         let command = journal
-            .begin_card_command(&mut store, RequestHash::from_array([4; 32]), "one-shot")
+            .begin_card_command(
+                &mut store,
+                RequestHash::from_array([4; 32]),
+                None,
+                "one-shot",
+            )
             .expect("the in-flight entry is written once");
 
         assert_eq!(
@@ -437,11 +502,16 @@ mod tests {
         let mut journal = journal();
         let mut store = MemoryStore::default();
         journal
-            .begin_card_command(&mut store, RequestHash::from_array([4; 32]), "one-shot")
+            .begin_card_command(
+                &mut store,
+                RequestHash::from_array([4; 32]),
+                None,
+                "one-shot",
+            )
             .expect("the in-flight entry is written once");
         assert!(
             journal
-                .begin_card_command(&mut store, RequestHash::from_array([4; 32]), "again")
+                .begin_card_command(&mut store, RequestHash::from_array([4; 32]), None, "again")
                 .is_err()
         );
         assert_eq!(store.0.len(), 1);
@@ -452,7 +522,12 @@ mod tests {
         let mut journal = journal();
         let mut store = MemoryStore::default();
         journal
-            .begin_card_command(&mut store, RequestHash::from_array([4; 32]), "one-shot")
+            .begin_card_command(
+                &mut store,
+                RequestHash::from_array([4; 32]),
+                None,
+                "one-shot",
+            )
             .expect("the in-flight entry is written once");
         journal
             .recover_after_crash(&mut store)

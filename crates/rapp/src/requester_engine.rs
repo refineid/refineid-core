@@ -177,12 +177,14 @@ impl RequesterOperationEngine {
                         status,
                         error,
                         remaining_retries,
+                        batch_signatures,
                     } => RequesterDispatch::Terminal {
                         operation_id,
                         state,
                         status,
                         error,
                         remaining_retries,
+                        batch_signatures,
                     },
                 })
             }
@@ -342,6 +344,8 @@ pub enum RequesterDispatch {
         error: Option<ResultError>,
         /// Remaining credential attempts the result reported.
         remaining_retries: Option<u8>,
+        /// Signatures an interrupted batch made before it became ambiguous.
+        batch_signatures: Vec<Vec<u8>>,
     },
     /// Authenticated status report was stored as a journal annotation.
     StatusAnnotated(OperationId),

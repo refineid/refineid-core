@@ -22,10 +22,11 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use super::{
-    CardIdentity, CardInspection, CardOperationResult, JournalRecord, JournalRecoveryStore,
-    JournalStore, OperationId, OperationResultMessage, OperationState, PairId,
-    RecoveredProxyRecord, RequestHash, RequesterJournalRecord, RequesterJournalStore,
-    RequesterRecoveryStore, ResultJournalStore, SessionId, StatusReport, WireValue,
+    BATCH_DOCUMENTS, BatchProgress, CardIdentity, CardInspection, CardOperationResult,
+    JournalRecord, JournalRecoveryStore, JournalStore, OperationId, OperationResultMessage,
+    OperationState, PairId, RecoveredProxyRecord, RequestHash, RequesterJournalRecord,
+    RequesterJournalStore, RequesterRecoveryStore, ResultJournalStore, SessionId, StatusReport,
+    WireValue,
     bindings::{
         RappBindingError, RappVaultError, take_bytes, take_text, take_unsigned, take_value,
     },
@@ -33,7 +34,7 @@ use super::{
 };
 
 const REQUESTER_JOURNAL_FORMAT_VERSION: u64 = 2;
-const PROXY_JOURNAL_FORMAT_VERSION: u64 = 2;
+const PROXY_JOURNAL_FORMAT_VERSION: u64 = 3;
 
 /// One proxy recovery entry returned by an atomic platform load.
 #[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
@@ -345,8 +346,67 @@ fn encode_proxy_record(record: &JournalRecord) -> Result<Vec<u8>, RappBindingErr
             "automatic_retry_permitted".to_owned(),
             WireValue::Bool(record.automatic_retry_permitted),
         ),
+        (
+            "batch".to_owned(),
+            record
+                .batch
+                .as_ref()
+                .map_or(WireValue::Null, batch_progress_value),
+        ),
     ])))
     .map_err(|_| RappBindingError::ProtocolFailure)
+}
+
+fn batch_progress_value(batch: &BatchProgress) -> WireValue {
+    WireValue::Map(BTreeMap::from([
+        ("total".to_owned(), WireValue::Unsigned(batch.total as u64)),
+        (
+            "completed_signatures".to_owned(),
+            WireValue::Array(
+                batch
+                    .completed_signatures
+                    .iter()
+                    .cloned()
+                    .map(WireValue::Bytes)
+                    .collect(),
+            ),
+        ),
+    ]))
+}
+
+fn parse_batch_progress(value: WireValue) -> Result<Option<BatchProgress>, RappBindingError> {
+    let mut map = match value {
+        WireValue::Null => return Ok(None),
+        WireValue::Map(map) => map,
+        _ => return Err(RappBindingError::InvalidInput),
+    };
+    let total = usize::try_from(take_unsigned(&mut map, "total")?)
+        .map_err(|_| RappBindingError::InvalidInput)?;
+    let completed_signatures = take_byte_array(&mut map, "completed_signatures")?;
+    require_empty(&map)?;
+    if !BATCH_DOCUMENTS.contains(&total) || completed_signatures.len() > total {
+        return Err(RappBindingError::InvalidInput);
+    }
+    Ok(Some(BatchProgress {
+        total,
+        completed_signatures,
+    }))
+}
+
+fn take_byte_array(
+    map: &mut BTreeMap<String, WireValue>,
+    key: &str,
+) -> Result<Vec<Vec<u8>>, RappBindingError> {
+    let WireValue::Array(values) = take_value(map, key)? else {
+        return Err(RappBindingError::InvalidInput);
+    };
+    values
+        .into_iter()
+        .map(|value| match value {
+            WireValue::Bytes(bytes) if !bytes.is_empty() => Ok(bytes),
+            _ => Err(RappBindingError::InvalidInput),
+        })
+        .collect()
 }
 
 fn decode_proxy_record(bytes: &[u8]) -> Result<JournalRecord, RappBindingError> {
@@ -364,6 +424,7 @@ fn decode_proxy_record(bytes: &[u8]) -> Result<JournalRecord, RappBindingError> 
     let transmission_count = u8::try_from(take_unsigned(&mut map, "transmission_count")?)
         .map_err(|_| RappBindingError::InvalidInput)?;
     let automatic_retry_permitted = take_bool(&mut map, "automatic_retry_permitted")?;
+    let batch = parse_batch_progress(take_value(&mut map, "batch")?)?;
     require_empty(&map)?;
     Ok(JournalRecord {
         pair_id,
@@ -373,6 +434,7 @@ fn decode_proxy_record(bytes: &[u8]) -> Result<JournalRecord, RappBindingError> 
         state,
         transmission_count,
         automatic_retry_permitted,
+        batch,
     })
 }
 
@@ -458,6 +520,13 @@ fn card_result_value(result: &CardOperationResult) -> WireValue {
             ("kind".to_owned(), WireValue::Text("signature".to_owned())),
             ("bytes".to_owned(), WireValue::Bytes(bytes.clone())),
         ]),
+        CardOperationResult::Signatures(signatures) => BTreeMap::from([
+            ("kind".to_owned(), WireValue::Text("signatures".to_owned())),
+            (
+                "signatures".to_owned(),
+                WireValue::Array(signatures.iter().cloned().map(WireValue::Bytes).collect()),
+            ),
+        ]),
     };
     WireValue::Map(map)
 }
@@ -505,6 +574,7 @@ fn parse_card_result(value: WireValue) -> Result<CardOperationResult, RappBindin
         }
         "certificate" => CardOperationResult::Certificate(take_bytes(&mut map, "bytes")?),
         "signature" => CardOperationResult::Signature(take_bytes(&mut map, "bytes")?),
+        "signatures" => CardOperationResult::Signatures(take_byte_array(&mut map, "signatures")?),
         _ => return Err(RappBindingError::InvalidInput),
     };
     require_empty(&map)?;

@@ -195,7 +195,25 @@ pub enum CardOperation {
         /// Already-hashed document bytes.
         digest: Vec<u8>,
     },
+    /// Sign several document digests under one consent and one PIN 2 entry
+    /// (section 9.3).
+    BatchSignDocuments {
+        /// Human-readable document names shown by the authorizer, in
+        /// signing order.
+        document_names: Vec<String>,
+        /// Expected public-key profile, verified again by the authorizer.
+        key_profile: CardKeyProfile,
+        /// Exact signature algorithm.
+        algorithm: SignatureAlgorithm,
+        /// Already-hashed document bytes, paired with `document_names`.
+        digests: Vec<Vec<u8>>,
+    },
 }
+
+/// Documents one `batch_sign_documents` may name (section 9.3).
+pub const BATCH_DOCUMENTS: core::ops::RangeInclusive<usize> = 1..=64;
+/// Byte length of one batch document name (section 9.3).
+const BATCH_DOCUMENT_NAME_BYTES: core::ops::RangeInclusive<usize> = 1..=256;
 
 impl CardOperation {
     /// Whether this action may consume a credential attempt or invoke a
@@ -204,8 +222,19 @@ impl CardOperation {
     pub const fn is_consequential(&self) -> bool {
         matches!(
             self,
-            Self::BrowserAuthenticate { .. } | Self::SignDocument { .. }
+            Self::BrowserAuthenticate { .. }
+                | Self::SignDocument { .. }
+                | Self::BatchSignDocuments { .. }
         )
+    }
+
+    /// How many documents a batch signs; `None` for any other operation.
+    #[must_use]
+    pub fn batch_total(&self) -> Option<usize> {
+        match self {
+            Self::BatchSignDocuments { digests, .. } => Some(digests.len()),
+            _ => None,
+        }
     }
 
     /// Credential profile that owns this closed action schema.
@@ -220,7 +249,8 @@ impl CardOperation {
             Self::ReadCertificate {
                 kind: CertificateKind::Signature,
             }
-            | Self::SignDocument { .. } => ProfileName::DocumentSigning,
+            | Self::SignDocument { .. }
+            | Self::BatchSignDocuments { .. } => ProfileName::DocumentSigning,
         }
     }
 
@@ -238,6 +268,25 @@ impl CardOperation {
                 algorithm,
                 digest,
             } => validate_named_digest(document_name, *key_profile, *algorithm, digest),
+            Self::BatchSignDocuments {
+                document_names,
+                key_profile,
+                algorithm,
+                digests,
+            } => {
+                if !BATCH_DOCUMENTS.contains(&digests.len())
+                    || document_names.len() != digests.len()
+                {
+                    return Err(CardOperationError::InvalidField("digests"));
+                }
+                for (name, digest) in document_names.iter().zip(digests) {
+                    if !BATCH_DOCUMENT_NAME_BYTES.contains(&name.len()) {
+                        return Err(CardOperationError::InvalidDisplayContext);
+                    }
+                    validate_named_digest(name, *key_profile, *algorithm, digest)?;
+                }
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -297,6 +346,36 @@ impl CardOperation {
                 payload.insert("digest".into(), WireValue::Bytes(digest.clone()));
                 ("sign_document", context, payload)
             }
+            Self::BatchSignDocuments {
+                document_names,
+                key_profile,
+                algorithm,
+                digests,
+            } => {
+                context.insert(
+                    "document_names".into(),
+                    WireValue::Array(
+                        document_names
+                            .iter()
+                            .cloned()
+                            .map(WireValue::Text)
+                            .collect(),
+                    ),
+                );
+                payload.insert(
+                    "key_profile".into(),
+                    WireValue::Text(key_profile.wire_name().into()),
+                );
+                payload.insert(
+                    "algorithm".into(),
+                    WireValue::Text(algorithm.wire_name().into()),
+                );
+                payload.insert(
+                    "digests".into(),
+                    WireValue::Array(digests.iter().cloned().map(WireValue::Bytes).collect()),
+                );
+                ("batch_sign_documents", context, payload)
+            }
         }
     }
 
@@ -322,6 +401,24 @@ impl CardOperation {
                 key_profile: CardKeyProfile::parse(&take_text(&mut payload, "key_profile")?)?,
                 algorithm: SignatureAlgorithm::parse(&take_text(&mut payload, "algorithm")?)?,
                 digest: take_bytes(&mut payload, "digest")?,
+            },
+            "batch_sign_documents" => Self::BatchSignDocuments {
+                document_names: take_array(&mut context, "document_names")?
+                    .into_iter()
+                    .map(|value| match value {
+                        WireValue::Text(name) => Ok(name),
+                        _ => Err(CardOperationError::InvalidField("document_names")),
+                    })
+                    .collect::<Result<_, _>>()?,
+                key_profile: CardKeyProfile::parse(&take_text(&mut payload, "key_profile")?)?,
+                algorithm: SignatureAlgorithm::parse(&take_text(&mut payload, "algorithm")?)?,
+                digests: take_array(&mut payload, "digests")?
+                    .into_iter()
+                    .map(|value| match value {
+                        WireValue::Bytes(digest) => Ok(digest),
+                        _ => Err(CardOperationError::InvalidField("digests")),
+                    })
+                    .collect::<Result<_, _>>()?,
             },
             _ => return Err(CardOperationError::UnknownAction),
         };
@@ -611,6 +708,8 @@ pub enum CardOperationResult {
     Certificate(Vec<u8>),
     /// Card-produced signature bytes.
     Signature(Vec<u8>),
+    /// The ordered signatures of a batch, one per document.
+    Signatures(Vec<Vec<u8>>),
 }
 
 /// The `read_identity` answer (section 9.1).
@@ -771,6 +870,16 @@ fn take_unsigned(
 ) -> Result<u64, CardOperationError> {
     match map.remove(field) {
         Some(WireValue::Unsigned(value)) => Ok(value),
+        _ => Err(CardOperationError::InvalidField(field)),
+    }
+}
+
+fn take_array(
+    map: &mut BTreeMap<String, WireValue>,
+    field: &'static str,
+) -> Result<Vec<WireValue>, CardOperationError> {
+    match map.remove(field) {
+        Some(WireValue::Array(value)) => Ok(value),
         _ => Err(CardOperationError::InvalidField(field)),
     }
 }

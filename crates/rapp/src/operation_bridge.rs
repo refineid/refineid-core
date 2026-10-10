@@ -47,6 +47,9 @@ pub enum RappOperationKind {
     BrowserAuthenticate,
     /// PIN 2 verify and private-key operation over a document digest.
     SignDocument,
+    /// One PIN 2 verify and one private-key operation per document digest,
+    /// in order (section 9.3).
+    BatchSignDocuments,
 }
 
 /// Registered public-key profiles; arbitrary key descriptions cannot cross the binding.
@@ -144,6 +147,10 @@ pub struct RappOperationDescriptor {
     pub algorithm: Option<RappSignatureAlgorithm>,
     /// Already-hashed input of the registered length.
     pub digest: Vec<u8>,
+    /// A batch's document names, in signing order; empty otherwise.
+    pub document_names: Vec<String>,
+    /// A batch's digests, paired with `document_names`; empty otherwise.
+    pub digests: Vec<Vec<u8>>,
 }
 
 impl From<&CardOperation> for RappOperationDescriptor {
@@ -155,6 +162,8 @@ impl From<&CardOperation> for RappOperationDescriptor {
                 key_profile: None,
                 algorithm: None,
                 digest: Vec::new(),
+                document_names: Vec::new(),
+                digests: Vec::new(),
             },
             CardOperation::ReadIdentity => Self {
                 kind: RappOperationKind::ReadIdentity,
@@ -162,6 +171,8 @@ impl From<&CardOperation> for RappOperationDescriptor {
                 key_profile: None,
                 algorithm: None,
                 digest: Vec::new(),
+                document_names: Vec::new(),
+                digests: Vec::new(),
             },
             CardOperation::ReadCertificate {
                 kind: CertificateKind::Authentication,
@@ -171,6 +182,8 @@ impl From<&CardOperation> for RappOperationDescriptor {
                 key_profile: None,
                 algorithm: None,
                 digest: Vec::new(),
+                document_names: Vec::new(),
+                digests: Vec::new(),
             },
             CardOperation::ReadCertificate {
                 kind: CertificateKind::Signature,
@@ -180,6 +193,8 @@ impl From<&CardOperation> for RappOperationDescriptor {
                 key_profile: None,
                 algorithm: None,
                 digest: Vec::new(),
+                document_names: Vec::new(),
+                digests: Vec::new(),
             },
             CardOperation::BrowserAuthenticate {
                 origin,
@@ -192,6 +207,8 @@ impl From<&CardOperation> for RappOperationDescriptor {
                 key_profile: Some(exported_key_profile(*key_profile)),
                 algorithm: Some(exported_algorithm(*algorithm)),
                 digest: digest.clone(),
+                document_names: Vec::new(),
+                digests: Vec::new(),
             },
             CardOperation::SignDocument {
                 document_name,
@@ -204,6 +221,22 @@ impl From<&CardOperation> for RappOperationDescriptor {
                 key_profile: Some(exported_key_profile(*key_profile)),
                 algorithm: Some(exported_algorithm(*algorithm)),
                 digest: digest.clone(),
+                document_names: Vec::new(),
+                digests: Vec::new(),
+            },
+            CardOperation::BatchSignDocuments {
+                document_names,
+                key_profile,
+                algorithm,
+                digests,
+            } => Self {
+                kind: RappOperationKind::BatchSignDocuments,
+                display_context: None,
+                key_profile: Some(exported_key_profile(*key_profile)),
+                algorithm: Some(exported_algorithm(*algorithm)),
+                digest: Vec::new(),
+                document_names: document_names.clone(),
+                digests: digests.clone(),
             },
         }
     }
@@ -350,6 +383,9 @@ pub struct RappBridgeAction {
     pub terminal_reason: Option<RappTerminalReason>,
     /// Remaining credential attempts an invalid-credential result reports.
     pub remaining_retries: Option<u8>,
+    /// The signatures an interrupted batch made before it became ambiguous;
+    /// they are delivered and never made again.
+    pub batch_signatures: Vec<Vec<u8>>,
     /// Advisory progress event.
     pub progress_event: Option<RappProgressEvent>,
     /// The session must close after this frame is delivered.
@@ -369,6 +405,7 @@ impl RappBridgeAction {
             terminal_state: None,
             terminal_reason: None,
             remaining_retries: None,
+            batch_signatures: Vec::new(),
             progress_event: None,
             close_session_after_send: false,
             next_poll_at_ms: None,
@@ -397,6 +434,7 @@ impl RappBridgeAction {
             terminal_state: None,
             terminal_reason: None,
             remaining_retries: None,
+            batch_signatures: Vec::new(),
             progress_event: None,
             close_session_after_send,
             next_poll_at_ms: None,
@@ -444,6 +482,8 @@ pub enum RappResultKind {
     Certificate,
     /// Private-key signature.
     Signature,
+    /// The ordered signatures of a batch.
+    Signatures,
 }
 
 /// Profile-defined result body in a stable generated-binding shape.
@@ -476,6 +516,8 @@ pub struct RappOperationResult {
     pub certificates: Vec<Vec<u8>>,
     /// Certificate or signature bytes.
     pub bytes: Vec<u8>,
+    /// The ordered signatures of a batch, one per document.
+    pub signatures: Vec<Vec<u8>>,
 }
 
 impl RappOperationResult {
@@ -494,6 +536,7 @@ impl RappOperationResult {
             expiration_date: None,
             certificates: Vec::new(),
             bytes: Vec::new(),
+            signatures: Vec::new(),
         }
     }
 }
@@ -525,6 +568,10 @@ impl From<CardOperationResult> for RappOperationResult {
             CardOperationResult::Signature(bytes) => Self {
                 bytes,
                 ..Self::empty(RappResultKind::Signature)
+            },
+            CardOperationResult::Signatures(signatures) => Self {
+                signatures,
+                ..Self::empty(RappResultKind::Signatures)
             },
         }
     }
@@ -762,6 +809,38 @@ impl RappOperationBridge {
                 key_profile: key_profile.into(),
                 algorithm: algorithm.into(),
                 digest,
+            },
+        )
+    }
+
+    /// Begin a batch signature over 1 to 64 document digests (section 9.3).
+    ///
+    /// # Errors
+    /// [`RappBindingError`] on invalid input, an ungranted profile, or the
+    /// wrong protocol phase.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the closed action schema fixes every request field"
+    )]
+    pub fn begin_batch_sign_documents(
+        &self,
+        operation_id: Vec<u8>,
+        document_names: Vec<String>,
+        key_profile: RappCardKeyProfile,
+        algorithm: RappSignatureAlgorithm,
+        digests: Vec<Vec<u8>>,
+        local_start_ms: u64,
+        expires_after_ms: u64,
+    ) -> Result<RappBridgeAction, RappBindingError> {
+        self.begin_operation(
+            &operation_id,
+            local_start_ms,
+            expires_after_ms,
+            CardOperation::BatchSignDocuments {
+                document_names,
+                key_profile: key_profile.into(),
+                algorithm: algorithm.into(),
+                digests,
             },
         )
     }
@@ -1196,6 +1275,69 @@ impl RappOperationBridge {
         self.complete(&operation_id, CardOperationResult::Signature(signature))
     }
 
+    /// Durably record one batch signature before the next document is
+    /// signed. A recorded signature is delivered even if the batch is
+    /// interrupted, and its document is never signed again.
+    ///
+    /// # Errors
+    /// [`RappBindingError`] on invalid input, an operation that is not an
+    /// executing batch, or a failed durable write.
+    pub fn record_batch_signature(
+        &self,
+        operation_id: Vec<u8>,
+        signature: Vec<u8>,
+    ) -> Result<(), RappBindingError> {
+        let operation_id = decode_operation_id(&operation_id)?;
+        let mut state = self.lock_state()?;
+        let OperationBridgeState::Proxy {
+            journal, engine, ..
+        } = &mut *state
+        else {
+            return Err(RappBindingError::WrongPhase);
+        };
+        let result = engine
+            .record_batch_signature(journal, operation_id, signature)
+            .map_err(|error| match error {
+                ProxyEngineError::Persistence(_) => RappBindingError::LocalStateFailure,
+                _ => RappBindingError::WrongPhase,
+            });
+        drop(state);
+        result
+    }
+
+    /// Answer a batch once every document's signature is recorded, with
+    /// exactly those signatures.
+    ///
+    /// # Errors
+    /// [`RappBindingError`] on invalid input, a batch with documents left,
+    /// or the wrong protocol phase.
+    pub fn complete_batch(
+        &self,
+        operation_id: Vec<u8>,
+    ) -> Result<RappBridgeAction, RappBindingError> {
+        let operation_id = decode_operation_id(&operation_id)?;
+        let mut state = self.lock_state()?;
+        let OperationBridgeState::Proxy {
+            runtime,
+            journal,
+            engine,
+            requests,
+            ..
+        } = &mut *state
+        else {
+            return Err(RappBindingError::WrongPhase);
+        };
+        let dispatch = engine
+            .complete_batch(journal, operation_id)
+            .map_err(|_| RappBindingError::WrongPhase)?;
+        let action = proxy_dispatch(runtime, journal, engine, requests, dispatch)?;
+        if action_closes_session(&action) {
+            *state = OperationBridgeState::Closed;
+            drop(state);
+        }
+        Ok(action)
+    }
+
     /// Deliver a completed requester result only after its acknowledgment was
     /// successfully released to transport and durably recorded.
     ///
@@ -1486,6 +1628,7 @@ fn requester_dispatch(
             status,
             error,
             remaining_retries,
+            batch_signatures,
         } => {
             // A retired completed result reports the completed state with no
             // reason; its pruned response does not travel (section 8.2.5).
@@ -1496,6 +1639,7 @@ fn requester_dispatch(
                 action.terminal_reason = Some(RappTerminalReason::from_result(status, error));
             }
             action.remaining_retries = remaining_retries;
+            action.batch_signatures = batch_signatures;
             Ok(action)
         }
         RequesterDispatch::StatusAnnotated(operation_id) => Ok(RappBridgeAction::for_operation(

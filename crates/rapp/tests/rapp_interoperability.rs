@@ -15,11 +15,12 @@
 //! End-to-end cryptographic interoperability through the public RAPP API.
 
 use refineid_rapp::{
-    AuthenticatedViolation, BinaryFrame, CardOperation, CpaceKc2Initiator, CpaceKc2Responder,
-    EndpointError, EndpointRole, EstablishedEndpoint, ExplicitUserIntent, HandshakeChannel,
-    HandshakeRole, MessageType, OfferId, OperationId, OperationRequest, OperationState, PairRecord,
-    PairStore, PairStoreError, PairTombstone, PairingHandshake, PairingOffer, PairingSecret,
-    PairingState, ProfileName, RappState, ReceiveOutcome, SecureChannel, SessionHandshake,
+    AuthenticatedViolation, BinaryFrame, CardOperation, CloseReason, CpaceKc2Initiator,
+    CpaceKc2Responder, EndpointError, EndpointRole, EstablishedEndpoint, EstablishedSessionRuntime,
+    ExplicitUserIntent, HandshakeChannel, HandshakeRole, LivenessConfig, MessageType, OfferId,
+    OperationId, OperationRequest, OperationState, PairRecord, PairStore, PairStoreError,
+    PairTombstone, PairingHandshake, PairingOffer, PairingSecret, PairingState, ProfileName,
+    RappState, ReceiveOutcome, RuntimeReceive, SecureChannel, SessionHandshake,
     SessionHandshakeParameters, SessionParameters, SessionReadyMessage, SessionState,
     TransportProfile, TypedMessage, compute_grants_hash, encode_kc2_step1_frame,
     generate_pair_key_material, standard_pairing_context_v2,
@@ -377,6 +378,76 @@ fn first_authenticated_wrong_phase_message_revokes_pairing() {
     ));
 }
 
+/// Liveness timing that never fires within these tests.
+const QUIET_LIVENESS: LivenessConfig = LivenessConfig {
+    base_interval_ms: 60_000,
+    response_timeout_ms: 10_000,
+    maximum_interval_ms: 60_000,
+    maximum_jitter_ms: 0,
+    maximum_misses: 1,
+};
+
+/// Monotonic instant the sessions start at.
+const SESSION_START_MS: u64 = 1_000;
+
+fn established_runtimes() -> (EstablishedSessionRuntime, EstablishedSessionRuntime) {
+    let (pair_id, requester, proxy, _) = raw_established_channels();
+    let requester = EstablishedEndpoint::new(
+        pair_id,
+        requester,
+        RappState {
+            role: EndpointRole::Requester,
+            pairing: PairingState::PairedConnected,
+            session: SessionState::Healthy,
+            operation: OperationState::None,
+            requires_user_intent: false,
+        },
+    );
+    (
+        EstablishedSessionRuntime::new(requester, QUIET_LIVENESS, SESSION_START_MS)
+            .expect("requester runtime starts"),
+        EstablishedSessionRuntime::new(
+            healthy_proxy(pair_id, proxy),
+            QUIET_LIVENESS,
+            SESSION_START_MS,
+        )
+        .expect("proxy runtime starts"),
+    )
+}
+
+#[test]
+fn custodian_withdrawal_close_reaches_the_requester_with_its_reason() {
+    let (mut requester, mut proxy) = established_runtimes();
+    let mut store = MemoryPairStore::default();
+    let frame = proxy
+        .close_with_reason(CloseReason::ServiceWithdrawn)
+        .expect("close notice seals");
+    assert!(matches!(
+        requester
+            .receive(&mut store, &frame, SESSION_START_MS)
+            .expect("close notice opens"),
+        RuntimeReceive::PeerClosed(CloseReason::ServiceWithdrawn)
+    ));
+    assert!(store.revoked.is_empty());
+    assert!(proxy.close_with_reason(CloseReason::Normal).is_err());
+}
+
+#[test]
+fn requester_close_reaches_the_custodian_with_its_reason() {
+    let (mut requester, mut proxy) = established_runtimes();
+    let mut store = MemoryPairStore::default();
+    let frame = requester
+        .close_with_reason(CloseReason::UserDisconnect)
+        .expect("close notice seals");
+    assert!(matches!(
+        proxy
+            .receive(&mut store, &frame, SESSION_START_MS)
+            .expect("close notice opens"),
+        RuntimeReceive::PeerClosed(CloseReason::UserDisconnect)
+    ));
+    assert!(store.revoked.is_empty());
+}
+
 #[test]
 fn unauthenticated_ciphertext_failure_closes_only_session() {
     let (pair_id, mut sender, receiver, _) = raw_established_channels();
@@ -546,10 +617,6 @@ fn cpace_bootstrap_pairing_and_fresh_session_interoperate_end_to_end() {
     let proxy_record = proxy_confirm.into_pair_record(200).expect("proxy finishes");
 
     assert_eq!(requester_record.pair_id(), proxy_record.pair_id());
-    assert_eq!(
-        requester_record.rendezvous_token(),
-        proxy_record.rendezvous_token()
-    );
 
     // Phase 4: Fresh Session Handshake
     let mut requester_session = SessionHandshake::begin_requester(

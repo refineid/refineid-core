@@ -1,0 +1,360 @@
+{
+  "format": "fi.refineid.rapp.routing-vectors-v1",
+  "protocol_document_version": "26.10.10",
+  "provenance": "Generated independently from RAPP v26.10.10 sections 2.2.1 and 4.3 and hierarchy specification section 4.3 with Python hmac/hashlib and an RFC 7748 X25519 ladder checked against RFC 7748 section 6.1, then checked against crates/rapp. The static keys and pair identifier equal those of rapp-withdrawal-v26.10.10.json; private keys, pair identifiers and nonces are fixed synthetic values.",
+  "pair_keys": [
+    {
+      "name": "custodian-and-requester-agree",
+      "pair_id_hex": "33333333333333333333333333333333",
+      "custodian_static_private_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "requester_static_private_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+      "shared_secret_hex": "9e004098efc091d4ec2663b4e9f5cfd4d7064571690b4bea97ab146ab9f35056",
+      "discovery_key_hex": "4d090746267b1303784ab464ae6b145effa657c6fb2dac3735f67f04657975ae",
+      "routing_key_hex": "c031bdd97af66540c19c4367f9d9bdd673f7784fb7d5084eb5633c40d282be76"
+    }
+  ],
+  "discovery_hint": [
+    {
+      "name": "epoch-zero",
+      "unix_time_seconds": 0,
+      "epoch": 0,
+      "discovery_hint_hex": "e4c547fe6a9673b1"
+    },
+    {
+      "name": "epoch-1990560",
+      "unix_time_seconds": 1791504899,
+      "epoch": 1990560,
+      "discovery_hint_hex": "054526c9fdd3b180"
+    }
+  ],
+  "discovery_acceptance": [
+    {
+      "name": "same-epoch",
+      "published_epoch": 1990560,
+      "published_hint_hex": "054526c9fdd3b180",
+      "requester_epoch": 1990560,
+      "expected": "accepted"
+    },
+    {
+      "name": "requester-one-epoch-later",
+      "published_epoch": 1990560,
+      "published_hint_hex": "054526c9fdd3b180",
+      "requester_epoch": 1990561,
+      "expected": "accepted"
+    },
+    {
+      "name": "requester-one-epoch-earlier",
+      "published_epoch": 1990560,
+      "published_hint_hex": "054526c9fdd3b180",
+      "requester_epoch": 1990559,
+      "expected": "accepted"
+    },
+    {
+      "name": "requester-two-epochs-later",
+      "published_epoch": 1990560,
+      "published_hint_hex": "054526c9fdd3b180",
+      "requester_epoch": 1990562,
+      "expected": "rejected"
+    },
+    {
+      "name": "withdrawal-hint-is-not-a-discovery-hint",
+      "published_epoch": 1990560,
+      "published_hint_hex": "3532f1f27d15448a",
+      "requester_epoch": 1990560,
+      "expected": "rejected"
+    }
+  ],
+  "routing_tag": [
+    {
+      "name": "RAPP-stream-v1",
+      "transport_profile": "fi.refineid.stream.v1",
+      "nonce_hex": "44444444444444444444444444444444",
+      "routing_tag_hex": "f073a90d6f9fc979301b3db7eda0551f"
+    },
+    {
+      "name": "RAPP-ble-v1",
+      "transport_profile": "fi.refineid.rapp.ble.v1",
+      "nonce_hex": "44444444444444444444444444444444",
+      "routing_tag_hex": "a57ce4bf96750b26773eab586fb8b7fa"
+    }
+  ],
+  "routing_preamble": [
+    {
+      "name": "RAPP-stream-v1-pairing",
+      "transport_profile": "fi.refineid.stream.v1",
+      "purpose": "pairing",
+      "encoded_hex": "836e524150502d73747265616d2d76316770616972696e6740"
+    },
+    {
+      "name": "RAPP-stream-v1-session",
+      "transport_profile": "fi.refineid.stream.v1",
+      "purpose": "session",
+      "nonce_hex": "44444444444444444444444444444444",
+      "routing_tag_hex": "f073a90d6f9fc979301b3db7eda0551f",
+      "encoded_hex": "836e524150502d73747265616d2d76316773657373696f6e582044444444444444444444444444444444f073a90d6f9fc979301b3db7eda0551f"
+    },
+    {
+      "name": "RAPP-ble-v1-pairing",
+      "transport_profile": "fi.refineid.rapp.ble.v1",
+      "purpose": "pairing",
+      "encoded_hex": "836b524150502d626c652d76316770616972696e6740"
+    },
+    {
+      "name": "RAPP-ble-v1-session",
+      "transport_profile": "fi.refineid.rapp.ble.v1",
+      "purpose": "session",
+      "nonce_hex": "44444444444444444444444444444444",
+      "routing_tag_hex": "a57ce4bf96750b26773eab586fb8b7fa",
+      "encoded_hex": "836b524150502d626c652d76316773657373696f6e582044444444444444444444444444444444a57ce4bf96750b26773eab586fb8b7fa"
+    }
+  ],
+  "routing_lookup": [
+    {
+      "name": "second-of-two-pairings",
+      "transport_profile": "fi.refineid.stream.v1",
+      "routing_hex": "44444444444444444444444444444444f073a90d6f9fc979301b3db7eda0551f",
+      "custodian_pair_ids_hex": [
+        "55555555555555555555555555555555",
+        "33333333333333333333333333333333"
+      ],
+      "expected_index": 1
+    },
+    {
+      "name": "only-pairing",
+      "transport_profile": "fi.refineid.stream.v1",
+      "routing_hex": "44444444444444444444444444444444f073a90d6f9fc979301b3db7eda0551f",
+      "custodian_pair_ids_hex": [
+        "33333333333333333333333333333333"
+      ],
+      "expected_index": 0
+    },
+    {
+      "name": "ble-tag-on-stream",
+      "transport_profile": "fi.refineid.stream.v1",
+      "routing_hex": "44444444444444444444444444444444a57ce4bf96750b26773eab586fb8b7fa",
+      "custodian_pair_ids_hex": [
+        "33333333333333333333333333333333"
+      ],
+      "expected_index": null
+    },
+    {
+      "name": "altered-tag",
+      "transport_profile": "fi.refineid.stream.v1",
+      "routing_hex": "44444444444444444444444444444444f173a90d6f9fc979301b3db7eda0551f",
+      "custodian_pair_ids_hex": [
+        "33333333333333333333333333333333"
+      ],
+      "expected_index": null
+    },
+    {
+      "name": "unknown-pairing",
+      "transport_profile": "fi.refineid.stream.v1",
+      "routing_hex": "44444444444444444444444444444444f073a90d6f9fc979301b3db7eda0551f",
+      "custodian_pair_ids_hex": [
+        "55555555555555555555555555555555"
+      ],
+      "expected_index": null
+    }
+  ],
+  "discovery_record": [
+    {
+      "name": "minimal",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "session"
+        ]
+      ],
+      "hints_hex": [],
+      "expected": "accepted"
+    },
+    {
+      "name": "one-hint",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "session"
+        ],
+        [
+          "hints",
+          "054526c9fdd3b180"
+        ]
+      ],
+      "hints_hex": [
+        "054526c9fdd3b180"
+      ],
+      "expected": "accepted"
+    },
+    {
+      "name": "mixed-case-keys",
+      "txt": [
+        [
+          "V",
+          "1"
+        ],
+        [
+          "MODE",
+          "session"
+        ],
+        [
+          "Hints",
+          "054526c9fdd3b180"
+        ]
+      ],
+      "hints_hex": [
+        "054526c9fdd3b180"
+      ],
+      "expected": "accepted"
+    },
+    {
+      "name": "uppercase-hex",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "session"
+        ],
+        [
+          "hints",
+          "054526C9FDD3B180"
+        ]
+      ],
+      "expected": "rejected"
+    },
+    {
+      "name": "five-hints",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "session"
+        ],
+        [
+          "hints",
+          "054526c9fdd3b180,054526c9fdd3b180,054526c9fdd3b180,054526c9fdd3b180,054526c9fdd3b180"
+        ]
+      ],
+      "expected": "rejected"
+    },
+    {
+      "name": "empty-hint-list",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "session"
+        ],
+        [
+          "hints",
+          ""
+        ]
+      ],
+      "expected": "rejected"
+    },
+    {
+      "name": "unknown-key",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "session"
+        ],
+        [
+          "name",
+          "phone"
+        ]
+      ],
+      "expected": "rejected"
+    },
+    {
+      "name": "pairing-mode",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "pairing"
+        ]
+      ],
+      "expected": "rejected"
+    },
+    {
+      "name": "repeated-key-in-other-case",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "session"
+        ],
+        [
+          "hints",
+          "054526c9fdd3b180"
+        ],
+        [
+          "HINTS",
+          "054526c9fdd3b180"
+        ]
+      ],
+      "expected": "rejected"
+    }
+  ],
+  "announcement_selection": [
+    {
+      "name": "five-pairings-four-announced",
+      "limit": 4,
+      "candidates": [
+        {
+          "hint_hex": "2020202020202020",
+          "last_used_ms": 2000
+        },
+        {
+          "hint_hex": "2121212121212121",
+          "last_used_ms": 2001
+        },
+        {
+          "hint_hex": "2222222222222222",
+          "last_used_ms": 2002
+        },
+        {
+          "hint_hex": "2323232323232323",
+          "last_used_ms": 2003
+        },
+        {
+          "hint_hex": "2424242424242424",
+          "last_used_ms": 2004
+        }
+      ],
+      "announced_hex": [
+        "2424242424242424",
+        "2323232323232323",
+        "2222222222222222",
+        "2121212121212121"
+      ]
+    }
+  ]
+}

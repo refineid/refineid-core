@@ -10,14 +10,14 @@ use std::collections::BTreeMap;
 use zeroize::Zeroizing;
 
 use super::{
-    EndpointRole, GrantsHash, PairId, ProfileName, RendezvousToken, WireValue,
-    decode_deterministic_cbor, encode_deterministic_cbor,
+    EndpointRole, GrantsHash, PairId, ProfileName, WireValue, decode_deterministic_cbor,
+    encode_deterministic_cbor,
 };
 
 const X25519_KEY_SIZE: usize = 32;
 
 /// Format version for encoded pairing records.
-pub const PAIR_RECORD_FORMAT_VERSION: u64 = 3;
+pub const PAIR_RECORD_FORMAT_VERSION: u64 = 4;
 
 /// Active long-term pairing material.
 ///
@@ -27,7 +27,6 @@ pub const PAIR_RECORD_FORMAT_VERSION: u64 = 3;
 /// models, logs, backups, or diagnostics.
 pub struct PairRecord {
     pair_id: PairId,
-    rendezvous_token: RendezvousToken,
     role: EndpointRole,
     local_static_private: Zeroizing<[u8; X25519_KEY_SIZE]>,
     local_static_public: [u8; X25519_KEY_SIZE],
@@ -48,7 +47,6 @@ impl PairRecord {
     )]
     pub fn new(
         pair_id: PairId,
-        rendezvous_token: RendezvousToken,
         role: EndpointRole,
         local_static_private: [u8; X25519_KEY_SIZE],
         local_static_public: [u8; X25519_KEY_SIZE],
@@ -69,7 +67,6 @@ impl PairRecord {
 
         Ok(Self {
             pair_id,
-            rendezvous_token,
             role,
             local_static_private: Zeroizing::new(local_static_private),
             local_static_public,
@@ -84,13 +81,6 @@ impl PairRecord {
     #[must_use]
     pub const fn pair_id(&self) -> PairId {
         self.pair_id
-    }
-
-    /// Pair-specific rendezvous value the routing preamble presents
-    /// (RAPP v26.10.9 §2.2.1). Never `pair_id`.
-    #[must_use]
-    pub const fn rendezvous_token(&self) -> RendezvousToken {
-        self.rendezvous_token
     }
 
     /// Local endpoint role fixed during pairing.
@@ -141,7 +131,6 @@ impl fmt::Debug for PairRecord {
         formatter
             .debug_struct("PairRecord")
             .field("pair_id", &self.pair_id)
-            .field("rendezvous_token", &self.rendezvous_token)
             .field("role", &self.role)
             .field("local_static_private", &"[redacted]")
             .field("local_static_public", &"[public key]")
@@ -270,10 +259,6 @@ pub fn encode_pair_record(record: &PairRecord) -> Result<Vec<u8>, PairRecordCode
             "pair_id".to_owned(),
             WireValue::Bytes(record.pair_id().as_bytes().to_vec()),
         ),
-        (
-            "rendezvous_token".to_owned(),
-            WireValue::Bytes(record.rendezvous_token().as_bytes().to_vec()),
-        ),
         ("role".to_owned(), WireValue::Text(role.to_owned())),
         (
             "local_static_private".to_owned(),
@@ -323,7 +308,6 @@ pub fn decode_pair_record(bytes: &[u8]) -> Result<PairRecord, PairRecordCodecErr
     let expected = [
         "format_version",
         "pair_id",
-        "rendezvous_token",
         "role",
         "local_static_private",
         "local_static_public",
@@ -339,8 +323,6 @@ pub fn decode_pair_record(bytes: &[u8]) -> Result<PairRecord, PairRecordCodecErr
         return Err(PairRecordCodecError::UnsupportedVersion);
     }
     let pair_id = PairId::reconstruct(&take_bytes(&mut map, "pair_id")?)
-        .map_err(|_| PairRecordCodecError::InvalidInput)?;
-    let rendezvous_token = RendezvousToken::reconstruct(&take_bytes(&mut map, "rendezvous_token")?)
         .map_err(|_| PairRecordCodecError::InvalidInput)?;
     let role = match take_text(&mut map, "role")?.as_str() {
         "requester" => EndpointRole::Requester,
@@ -362,7 +344,6 @@ pub fn decode_pair_record(bytes: &[u8]) -> Result<PairRecord, PairRecordCodecErr
     }
     PairRecord::new(
         pair_id,
-        rendezvous_token,
         role,
         local_static_private,
         local_static_public,
@@ -472,14 +453,13 @@ fn take_text_array(
 #[cfg(test)]
 mod tests {
     use super::{
-        EndpointRole, GrantsHash, PairId, PairRecord, ProfileName, RendezvousToken,
-        decode_pair_record, decode_pair_records, encode_pair_record, encode_pair_records,
+        EndpointRole, GrantsHash, PairId, PairRecord, ProfileName, decode_pair_record,
+        decode_pair_records, encode_pair_record, encode_pair_records,
     };
 
     fn test_record(id_byte: u8) -> PairRecord {
         PairRecord::new(
             PairId::from_array([id_byte; 16]),
-            RendezvousToken::from_array([id_byte.wrapping_add(1); 16]),
             EndpointRole::Requester,
             [id_byte.wrapping_add(2); 32],
             [id_byte.wrapping_add(3); 32],
@@ -498,7 +478,6 @@ mod tests {
         let decoded = decode_pair_record(&encoded).expect("decode succeeds");
 
         assert_eq!(original.pair_id(), decoded.pair_id());
-        assert_eq!(original.rendezvous_token(), decoded.rendezvous_token());
         assert_eq!(original.role(), decoded.role());
         assert_eq!(
             original.local_static_private(),

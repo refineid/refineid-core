@@ -1,0 +1,365 @@
+{
+  "format": "fi.refineid.rapp.withdrawal-vectors-v2",
+  "protocol_document_version": "26.10.10",
+  "provenance": "Generated independently from RAPP v26.10.10 section 4.5 and the session-close-body schema of section 7.1 with Python hmac/hashlib and an RFC 7748 X25519 ladder checked against RFC 7748 section 6.1, then checked against crates/rapp. Private keys, pair identifiers, instance names and fillers are fixed synthetic values.",
+  "withdrawal_key": [
+    {
+      "name": "custodian-and-requester-agree",
+      "pair_id_hex": "33333333333333333333333333333333",
+      "custodian_static_private_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "custodian_static_public_hex": "7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13",
+      "requester_static_private_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+      "requester_static_public_hex": "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20",
+      "shared_secret_hex": "9e004098efc091d4ec2663b4e9f5cfd4d7064571690b4bea97ab146ab9f35056",
+      "withdrawal_key_hex": "647bd158a64d3fc0ae974402de45f14bb85eb22bfa92c33e8548df41880936ba"
+    }
+  ],
+  "withdrawal_hint": [
+    {
+      "name": "counter-zero",
+      "instance_name": "refineid-7f2a1c84",
+      "unix_time_seconds": 0,
+      "counter": 0,
+      "withdrawal_hint_hex": "19a17527a8e1d643"
+    },
+    {
+      "name": "counter-2026-10-10",
+      "instance_name": "refineid-7f2a1c84",
+      "unix_time_seconds": 1791590400,
+      "counter": 29859840,
+      "withdrawal_hint_hex": "7cc657a617f7767e"
+    }
+  ],
+  "withdrawal_acceptance": [
+    {
+      "name": "same-minute",
+      "published_instance": "refineid-7f2a1c84",
+      "published_counter": 29859840,
+      "requester_instance": "refineid-7f2a1c84",
+      "requester_counter": 29859840,
+      "requester_pair_id_hex": "33333333333333333333333333333333",
+      "expected": "accepted"
+    },
+    {
+      "name": "requester-one-minute-later",
+      "published_instance": "refineid-7f2a1c84",
+      "published_counter": 29859840,
+      "requester_instance": "refineid-7f2a1c84",
+      "requester_counter": 29859841,
+      "requester_pair_id_hex": "33333333333333333333333333333333",
+      "expected": "accepted"
+    },
+    {
+      "name": "requester-one-minute-earlier",
+      "published_instance": "refineid-7f2a1c84",
+      "published_counter": 29859840,
+      "requester_instance": "refineid-7f2a1c84",
+      "requester_counter": 29859839,
+      "requester_pair_id_hex": "33333333333333333333333333333333",
+      "expected": "accepted"
+    },
+    {
+      "name": "requester-two-minutes-later",
+      "published_instance": "refineid-7f2a1c84",
+      "published_counter": 29859840,
+      "requester_instance": "refineid-7f2a1c84",
+      "requester_counter": 29859842,
+      "requester_pair_id_hex": "33333333333333333333333333333333",
+      "expected": "rejected"
+    },
+    {
+      "name": "other-instance",
+      "published_instance": "refineid-7f2a1c84",
+      "published_counter": 29859840,
+      "requester_instance": "refineid-b3d90e15",
+      "requester_counter": 29859840,
+      "requester_pair_id_hex": "33333333333333333333333333333333",
+      "expected": "rejected"
+    },
+    {
+      "name": "other-pairing",
+      "published_instance": "refineid-7f2a1c84",
+      "published_counter": 29859840,
+      "requester_instance": "refineid-7f2a1c84",
+      "requester_counter": 29859840,
+      "requester_pair_id_hex": "34343434343434343434343434343434",
+      "expected": "rejected"
+    }
+  ],
+  "withdrawn_record": [
+    {
+      "name": "one-pairing-seven-fillers",
+      "instance_name": "refineid-7f2a1c84",
+      "requester_counter": 29859840,
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "withdrawn"
+        ],
+        [
+          "withdrawn",
+          "4040404040404040,4141414141414141,4242424242424242,7cc657a617f7767e,4343434343434343,4444444444444444,4545454545454545,4646464646464646"
+        ]
+      ],
+      "expected": "accepted"
+    },
+    {
+      "name": "mixed-case-keys",
+      "instance_name": "refineid-7f2a1c84",
+      "requester_counter": 29859840,
+      "txt": [
+        [
+          "V",
+          "1"
+        ],
+        [
+          "Mode",
+          "withdrawn"
+        ],
+        [
+          "WITHDRAWN",
+          "4040404040404040,4141414141414141,4242424242424242,7cc657a617f7767e,4343434343434343,4444444444444444,4545454545454545,4646464646464646"
+        ]
+      ],
+      "expected": "accepted"
+    }
+  ],
+  "malformed_record": [
+    {
+      "name": "seven-entries",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "withdrawn"
+        ],
+        [
+          "withdrawn",
+          "4040404040404040,4141414141414141,4242424242424242,7cc657a617f7767e,4343434343434343,4444444444444444,4545454545454545"
+        ]
+      ]
+    },
+    {
+      "name": "nine-entries",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "withdrawn"
+        ],
+        [
+          "withdrawn",
+          "4040404040404040,4141414141414141,4242424242424242,7cc657a617f7767e,4343434343434343,4444444444444444,4545454545454545,4646464646464646,4040404040404040"
+        ]
+      ]
+    },
+    {
+      "name": "uppercase-hex",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "withdrawn"
+        ],
+        [
+          "withdrawn",
+          "4040404040404040,4141414141414141,4242424242424242,7CC657A617F7767E,4343434343434343,4444444444444444,4545454545454545,4646464646464646"
+        ]
+      ]
+    },
+    {
+      "name": "empty-list",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "withdrawn"
+        ],
+        [
+          "withdrawn",
+          ""
+        ]
+      ]
+    },
+    {
+      "name": "hints-alongside",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "withdrawn"
+        ],
+        [
+          "withdrawn",
+          "4040404040404040,4141414141414141,4242424242424242,7cc657a617f7767e,4343434343434343,4444444444444444,4545454545454545,4646464646464646"
+        ],
+        [
+          "hints",
+          "4040404040404040"
+        ]
+      ]
+    },
+    {
+      "name": "session-mode",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "session"
+        ],
+        [
+          "withdrawn",
+          "4040404040404040,4141414141414141,4242424242424242,7cc657a617f7767e,4343434343434343,4444444444444444,4545454545454545,4646464646464646"
+        ]
+      ]
+    },
+    {
+      "name": "repeated-key",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "withdrawn"
+        ],
+        [
+          "withdrawn",
+          "4040404040404040,4141414141414141,4242424242424242,7cc657a617f7767e,4343434343434343,4444444444444444,4545454545454545,4646464646464646"
+        ],
+        [
+          "withdrawn",
+          "4040404040404040,4141414141414141,4242424242424242,7cc657a617f7767e,4343434343434343,4444444444444444,4545454545454545,4646464646464646"
+        ]
+      ]
+    },
+    {
+      "name": "uppercase-mode-value",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "WITHDRAWN"
+        ],
+        [
+          "withdrawn",
+          "4040404040404040,4141414141414141,4242424242424242,7cc657a617f7767e,4343434343434343,4444444444444444,4545454545454545,4646464646464646"
+        ]
+      ]
+    },
+    {
+      "name": "repeated-key-in-other-case",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "withdrawn"
+        ],
+        [
+          "withdrawn",
+          "4040404040404040,4141414141414141,4242424242424242,7cc657a617f7767e,4343434343434343,4444444444444444,4545454545454545,4646464646464646"
+        ],
+        [
+          "Withdrawn",
+          "4040404040404040,4141414141414141,4242424242424242,7cc657a617f7767e,4343434343434343,4444444444444444,4545454545454545,4646464646464646"
+        ]
+      ]
+    }
+  ],
+  "session_close": [
+    {
+      "name": "service-withdrawn",
+      "reason": "service_withdrawn",
+      "last_received_sequence": 7,
+      "body_cbor_hex": "a266726561736f6e71736572766963655f77697468647261776e766c6173745f72656365697665645f73657175656e636507"
+    }
+  ],
+  "announcement_selection": [
+    {
+      "name": "ten-pairings-eight-announced",
+      "record": "withdrawn",
+      "limit": 8,
+      "candidates": [
+        {
+          "hint_hex": "1010101010101010",
+          "last_used_ms": 1000
+        },
+        {
+          "hint_hex": "1111111111111111",
+          "last_used_ms": 1001
+        },
+        {
+          "hint_hex": "1212121212121212",
+          "last_used_ms": 1002
+        },
+        {
+          "hint_hex": "1313131313131313",
+          "last_used_ms": 1003
+        },
+        {
+          "hint_hex": "1414141414141414",
+          "last_used_ms": 1004
+        },
+        {
+          "hint_hex": "1515151515151515",
+          "last_used_ms": 1005
+        },
+        {
+          "hint_hex": "1616161616161616",
+          "last_used_ms": 1006
+        },
+        {
+          "hint_hex": "1717171717171717",
+          "last_used_ms": 1007
+        },
+        {
+          "hint_hex": "1818181818181818",
+          "last_used_ms": 1008
+        },
+        {
+          "hint_hex": "0f0f0f0f0f0f0f0f",
+          "last_used_ms": 1000
+        }
+      ],
+      "announced_hex": [
+        "1111111111111111",
+        "1212121212121212",
+        "1313131313131313",
+        "1414141414141414",
+        "1515151515151515",
+        "1616161616161616",
+        "1717171717171717",
+        "1818181818181818"
+      ]
+    }
+  ]
+}

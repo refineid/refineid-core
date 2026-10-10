@@ -1,7 +1,7 @@
 {
   "format": "fi.refineid.rapp.operation-vectors-v1",
-  "protocol_document_version": "26.10.9",
-  "provenance": "Encoded with an independent deterministic CBOR encoder from the RAPP v26.10.9 CDDL (sections 7.1, 8.2.1, 9 and 10.4). Error messages are informative text, not normative; the reference implementations send these exact strings.",
+  "protocol_document_version": "26.10.10",
+  "provenance": "Encoded with an independent deterministic CBOR encoder from the RAPP v26.10.10 CDDL (sections 7.1, 8.2.1, 9 and 10.4). Error messages are informative text, not normative; the reference implementations send these exact strings.",
   "fixed_inputs": {
     "operation_id_request": "11111111111111111111111111111111",
     "operation_id_reference": "22222222222222222222222222222222",

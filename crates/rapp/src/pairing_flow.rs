@@ -148,17 +148,10 @@ impl PairingHandshake {
                 offer,
             ));
         };
-        let Some(rendezvous_token) = completion.rendezvous_token else {
-            return Err(PairingAttemptFailure::new(
-                PairingError::MissingPairId,
-                offer,
-            ));
-        };
         drop(offer);
         Ok(PairingConfirmation {
             role,
             pair_id,
-            rendezvous_token,
             offer_hash,
             candidate,
             offered_profiles,
@@ -228,7 +221,6 @@ impl fmt::Debug for PairingHandshake {
 pub struct PairingConfirmation {
     role: EndpointRole,
     pair_id: super::PairId,
-    rendezvous_token: super::RendezvousToken,
     offer_hash: [u8; 32],
     candidate: TransportCandidate,
     offered_profiles: Vec<ProfileName>,
@@ -410,7 +402,6 @@ impl PairingConfirmation {
         let local_private = self.local_keys.with_private_key(|bytes| *bytes);
         PairRecord::new(
             self.pair_id,
-            self.rendezvous_token,
             self.role,
             local_private,
             *self.local_keys.public_key(),

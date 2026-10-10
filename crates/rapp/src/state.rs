@@ -380,7 +380,7 @@ pub enum Action {
     SelectOneTransport,
     /// Open the selected transport.
     OpenTransport,
-    /// Associate the connection with a stored pairing via its rendezvous.
+    /// Associate the connection with the stored pairing its routing preamble names.
     AssociatePairingFromRendezvous,
     /// Begin the session Noise handshake as initiator.
     BeginKkInitiator,

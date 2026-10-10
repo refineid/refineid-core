@@ -39,6 +39,7 @@ mod operation;
 pub mod operation_bindings;
 #[cfg(feature = "bindings")]
 pub mod operation_bridge;
+mod pair_keys;
 mod pairing;
 mod pairing_attempts;
 mod pairing_flow;
@@ -47,13 +48,16 @@ mod proxy_engine;
 mod requester;
 mod requester_engine;
 mod result;
+mod routing;
 mod runtime;
 mod session_flow;
 mod state;
 mod stream;
 mod transport;
+mod txt;
 mod types;
 mod wire;
+mod withdrawal;
 
 pub use authorization::{
     ApprovalOutcome, AuthorizationError, AuthorizationStage, AuthorizationTransaction,
@@ -74,8 +78,7 @@ pub use cpace::{
 pub use crypto::{
     CryptoError, HandshakeChannel, HandshakeCompletion, HandshakeRole, OpenError, PairKeyMaterial,
     PairingHandshakeParameters, SecureChannel, SessionHandshakeParameters, compute_grants_hash,
-    compute_request_hash, derive_pair_id, derive_rendezvous_token, derive_session_id,
-    generate_pair_key_material,
+    compute_request_hash, derive_pair_id, derive_session_id, generate_pair_key_material,
 };
 pub use endpoint::{AuthenticatedViolation, EndpointError, EstablishedEndpoint, ReceiveOutcome};
 pub use journal::{
@@ -98,6 +101,8 @@ pub use operation::{
     DEFAULT_OPERATION_LIFETIME_MS, OperationRequest, OperationRequestRefusal, RequestError,
     SignatureAlgorithm,
 };
+pub use pair_keys::{DegenerateAgreement, PAIR_KEY_SIZE};
+pub(crate) use pair_keys::{derive_pair_key, mac as pair_key_mac};
 pub use pairing::{
     PAIR_RECORD_FORMAT_VERSION, PairRecord, PairRecordCodecError, PairRecordError, PairStore,
     PairStoreError, PairTombstone, decode_pair_record, decode_pair_records, encode_pair_record,
@@ -126,31 +131,39 @@ pub use requester_engine::{
     RequesterDispatch, RequesterEngineError, RequesterOperationEngine, RequesterViolation,
 };
 pub use result::{OperationResultMessage, ProxyFailure, ResultError, ResultResponse, ResultStatus};
+pub use routing::{
+    DISCOVERY_HINT_EPOCH_SECONDS, DISCOVERY_HINT_SIZE, DiscoveryKey, DiscoveryRecord,
+    DiscoveryRecordError, MAX_DISCOVERY_HINTS, ROUTING_NONCE_SIZE, ROUTING_REPLAY_WINDOW,
+    ROUTING_TAG_SIZE, RandomUnavailable, RoutingKey, RoutingReplayCache, SESSION_ROUTING_SIZE,
+    SessionRouting, discovery_epoch, route_session,
+};
 pub use runtime::{EstablishedSessionRuntime, RuntimeError, RuntimePoll, RuntimeReceive};
 pub use session_flow::{ExplicitUserIntent, SessionAuthentication, SessionError, SessionHandshake};
 pub use state::{
     Action, EndpointRole, Guards, OperationEvent, OperationState, PairingEvent, PairingState,
     RappState, SecurityOutcome, SessionEvent, SessionState, Transition, TransitionError,
 };
-pub use stream::{
-    DISCOVERY_HINT_EPOCH_SECONDS, DISCOVERY_HINT_SIZE, MAX_STREAM_RENDEZVOUS_FRAME, STREAM_PROFILE,
-    StreamError, StreamRendezvous, discovery_hint,
-};
+pub use stream::{MAX_ROUTING_PREAMBLE_FRAME, PreambleError, RoutingPreamble, STREAM_PROFILE};
 pub use transport::{
     BLE_CANDIDATE_ID, BLE_PROFILE, BLE_SERVICE_UUID, BinaryFrame, FrameError, FrameTransport,
     STREAM_CANDIDATE_ID, TransportCandidate, TransportProfile,
 };
+pub use txt::AnnouncementCandidate;
 pub use types::{
     CANDIDATE_FAILURE_HINT_THRESHOLD, CloseReason, FailureClass, GRANTS_HASH_SIZE, GrantsHash,
     IdentifierError, LIVENESS_CHALLENGE_SIZE, MANDATORY_PAIRING_SUITE, MANDATORY_SESSION_SUITE,
     MAX_ACTIVE_OPERATIONS, MAX_FRAME_PLAINTEXT, MAX_FRAME_SIZE, MINIMUM_REMAINING_ATTEMPTS,
     NOISE_TAG_SIZE, OFFER_ID_SIZE, OFFER_TTL_MS, OPERATION_ID_SIZE, OfferId, OperationId,
-    PAIR_ID_SIZE, PAIRING_SECRET_SIZE, PairId, PairingSecret, ProfileName, RENDEZVOUS_TOKEN_SIZE,
-    REQUEST_HASH_SIZE, RendezvousToken, RequestHash, RetryDecision, SESSION_ID_SIZE,
-    SESSION_READY_NONCE_SIZE, SessionId, VisibleConnectionState, WIRE_VERSION_V26_10_9,
-    X25519_KEY_SIZE,
+    PAIR_ID_SIZE, PAIRING_SECRET_SIZE, PairId, PairingSecret, ProfileName, REQUEST_HASH_SIZE,
+    RequestHash, RetryDecision, SESSION_ID_SIZE, SESSION_READY_NONCE_SIZE, SessionId,
+    VisibleConnectionState, WIRE_VERSION_V26_10_10, X25519_KEY_SIZE,
 };
 pub use wire::{
     Envelope, MessageType, SequenceGuard, WireError, WireValue, decode_deterministic_cbor,
     encode_deterministic_cbor,
+};
+pub use withdrawal::{
+    InstanceName, MAX_INSTANCE_NAME_SIZE, WITHDRAWAL_COUNTER_SECONDS, WITHDRAWAL_HINT_SIZE,
+    WITHDRAWN_RECORD_ENTRIES, WithdrawalError, WithdrawalKey, WithdrawnRecord,
+    WithdrawnRecordError, withdrawal_counter,
 };

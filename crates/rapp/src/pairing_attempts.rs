@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! The pairing ceremony's attempt accounting, post-PAKE deadlines,
-//! pre-authentication rate limit and post-lockout backoff (RAPP v26.10.9
+//! pre-authentication rate limit and post-lockout backoff (RAPP v26.10.10
 //! §3.3).
 
 /// Attempts one offer admits.
@@ -157,7 +157,7 @@ const BACKOFF_UNIT_MS: u64 = 1_000;
 const BACKOFF_INACTIVITY_RESET_MS: u64 = 900_000;
 
 /// The custodian's exponential backoff after locked-out offers
-/// (RAPP v26.10.9 §3.3.7).
+/// (RAPP v26.10.10 §3.3.7).
 ///
 /// After `n` consecutive lockouts a new offer waits `min(2^n, 300)` seconds.
 /// The count is volatile: it resets on a successful pairing, after fifteen

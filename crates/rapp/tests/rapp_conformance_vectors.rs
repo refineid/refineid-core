@@ -17,13 +17,12 @@
 use std::collections::{BTreeMap, HashSet};
 
 use refineid_rapp::{
-    OperationId, PairId, ProfileName, RendezvousToken, StreamError, StreamRendezvous, WireValue,
-    compute_grants_hash, compute_request_hash, decode_deterministic_cbor, derive_pair_id,
-    derive_rendezvous_token, derive_session_id, encode_deterministic_cbor,
+    OperationId, PairId, ProfileName, WireValue, compute_grants_hash, compute_request_hash,
+    decode_deterministic_cbor, derive_pair_id, derive_session_id, encode_deterministic_cbor,
 };
 use serde::Deserialize;
 
-const CORPUS: &str = include_str!("../../../docs/protocols/vectors/rapp-v26.10.9.json");
+const CORPUS: &str = include_str!("../../../docs/protocols/vectors/rapp-v26.10.10.json");
 
 #[derive(Debug, Deserialize)]
 struct Corpus {
@@ -34,7 +33,6 @@ struct Corpus {
     grants_hash: Vec<GrantsVector>,
     request_hash: Vec<RequestVector>,
     rejected_cbor: Vec<RejectedCborVector>,
-    stream_rendezvous: Vec<StreamVector>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,19 +67,6 @@ struct IdentifierVector {
     handshake_hash_hex: String,
     pair_id_hex: String,
     session_id_hex: String,
-    rendezvous_token_hex: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct StreamVector {
-    name: String,
-    purpose: String,
-    #[serde(default)]
-    rendezvous_token_hex: Option<String>,
-    encoded_hex: String,
-    accepted: bool,
-    #[serde(default)]
-    error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,13 +101,12 @@ struct RejectedCborVector {
 fn corpus_metadata_and_names_are_stable() {
     let corpus = corpus();
     assert_eq!(corpus.format, "fi.refineid.rapp.conformance-v1");
-    assert_eq!(corpus.protocol_document_version, "26.10.9");
+    assert_eq!(corpus.protocol_document_version, "26.10.10");
     assert_eq!(corpus.deterministic_cbor.len(), 15);
     assert_eq!(corpus.identifier_derivation.len(), 2);
     assert_eq!(corpus.grants_hash.len(), 3);
     assert_eq!(corpus.request_hash.len(), 1);
     assert_eq!(corpus.rejected_cbor.len(), 8);
-    assert_eq!(corpus.stream_rendezvous.len(), 5);
 
     let names = corpus
         .deterministic_cbor
@@ -144,12 +128,6 @@ fn corpus_metadata_and_names_are_stable() {
         .chain(
             corpus
                 .rejected_cbor
-                .iter()
-                .map(|vector| vector.name.as_str()),
-        )
-        .chain(
-            corpus
-                .stream_rendezvous
                 .iter()
                 .map(|vector| vector.name.as_str()),
         );
@@ -193,54 +171,6 @@ fn derived_identifiers_match_golden_values() {
             "{} session id",
             vector.name
         );
-        assert_eq!(
-            derive_rendezvous_token(&handshake_hash)
-                .as_bytes()
-                .as_slice(),
-            decode_hex(&vector.rendezvous_token_hex),
-            "{} rendezvous token",
-            vector.name
-        );
-    }
-}
-
-#[test]
-fn stream_rendezvous_preambles_match_golden_bytes_and_rejections() {
-    for vector in corpus().stream_rendezvous {
-        let encoded = decode_hex(&vector.encoded_hex);
-        let outcome = StreamRendezvous::decode(&encoded);
-        if vector.accepted {
-            let decoded = outcome.expect("accepted preamble must decode");
-            let expected = match vector.purpose.as_str() {
-                "pairing" => StreamRendezvous::Pairing,
-                "session" => StreamRendezvous::Session(
-                    RendezvousToken::reconstruct(&decode_hex(
-                        vector
-                            .rendezvous_token_hex
-                            .as_deref()
-                            .expect("session token"),
-                    ))
-                    .expect("token length"),
-                ),
-                other => panic!("unregistered accepted purpose {other}"),
-            };
-            assert_eq!(decoded, expected, "{} decoded preamble", vector.name);
-            assert_eq!(
-                decoded.encode().expect("preamble must re-encode"),
-                encoded,
-                "{} canonical re-encoding",
-                vector.name
-            );
-        } else {
-            let error = outcome.expect_err("rejected preamble must not decode");
-            let expected = match vector.error.as_deref().expect("rejection class") {
-                "Malformed" => StreamError::Malformed,
-                "Oversized" => StreamError::Oversized,
-                "UnknownPurpose" => StreamError::UnknownPurpose,
-                other => panic!("unregistered rejection class {other}"),
-            };
-            assert_eq!(error, expected, "{} rejection class", vector.name);
-        }
     }
 }
 

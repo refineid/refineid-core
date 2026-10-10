@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! The `pairing-offer` a custodian serves through the offer bootstrap of
-//! each transport (RAPP v26.10.9 §4.2).
+//! each transport (RAPP v26.10.10 §4.2).
 
 use core::fmt;
 use std::collections::BTreeMap;
@@ -22,15 +22,15 @@ use sha2::{Digest, Sha256};
 
 use super::{
     CPACE_KC2_SUITE, OFFER_ID_SIZE, OFFER_TTL_MS, OfferId, TransportCandidate, TransportProfile,
-    WIRE_VERSION_V26_10_9, WireError, WireValue, decode_deterministic_cbor,
+    WIRE_VERSION_V26_10_10, WireError, WireValue, decode_deterministic_cbor,
     encode_deterministic_cbor,
 };
 
 /// Upper bound on an encoded offer: the 509-byte ATT value capacity at the
-/// minimum ATT MTU of 512 (RAPP v26.10.9 §4.2).
+/// minimum ATT MTU of 512 (RAPP v26.10.10 §4.2).
 pub const MAX_OFFER_SIZE: usize = 509;
 
-/// Validated `pairing-offer` per RAPP v26.10.9 §4.2.
+/// Validated `pairing-offer` per RAPP v26.10.10 §4.2.
 ///
 /// Every transport entry is the registered entry of its profile, the entries
 /// are sorted by profile with no duplicates, and `offer_id` is random.
@@ -191,9 +191,9 @@ impl PairingOffer {
         let version = take_array(&mut map, "version")?;
         if version
             != vec![
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_9.0)),
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_9.1)),
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_9.2)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_10.0)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_10.1)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_10.2)),
             ]
         {
             return Err(PairingOfferError::UnsupportedVersion);
@@ -217,7 +217,7 @@ impl PairingOffer {
     }
 
     /// Decode bootstrap bytes received over the transport `profile`, which
-    /// the offer must list (RAPP v26.10.9 §4.2 step 3).
+    /// the offer must list (RAPP v26.10.10 §4.2 step 3).
     ///
     /// # Errors
     /// [`PairingOfferError`] on any decode or validation failure, or
@@ -234,7 +234,7 @@ impl PairingOffer {
         Ok(offer)
     }
 
-    /// Hash the deterministic offer per RAPP v26.10.9 §4.2.
+    /// Hash the deterministic offer per RAPP v26.10.10 §4.2.
     ///
     /// # Errors
     /// [`PairingOfferError`] when deterministic encoding fails.
@@ -278,9 +278,9 @@ impl PairingOffer {
             (
                 "version".to_owned(),
                 WireValue::Array(vec![
-                    WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_9.0)),
-                    WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_9.1)),
-                    WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_9.2)),
+                    WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_10.0)),
+                    WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_10.1)),
+                    WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_10.2)),
                 ]),
             ),
             (

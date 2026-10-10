@@ -22,10 +22,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::{
     AuthorizedCardCommand, BinaryFrame, CardIdentity, CardInspection, CardKeyProfile,
-    CardOperation, CardOperationResult, CertificateKind, EndpointError, EstablishedSessionRuntime,
-    LivenessConfig, OperationId, OperationReference, OperationRequest, OperationResultMessage,
-    OperationState, PairId, PingChallenge, ProfileName, ProxyDispatch, ProxyEngineError,
-    ProxyFailure, ProxyOperationEngine, RequesterDispatch, RequesterEngineError,
+    CardOperation, CardOperationResult, CertificateKind, CloseReason, EndpointError,
+    EstablishedSessionRuntime, LivenessConfig, OperationId, OperationReference, OperationRequest,
+    OperationResultMessage, OperationState, PairId, PingChallenge, ProfileName, ProxyDispatch,
+    ProxyEngineError, ProxyFailure, ProxyOperationEngine, RequesterDispatch, RequesterEngineError,
     RequesterOperationEngine, ResultError, ResultStatus, RuntimeError, RuntimePoll, RuntimeReceive,
     SessionId, SignatureAlgorithm, TypedMessage, UserApproval,
     bindings::{BindingPairStore, RappBindingError, RappSessionBridge, fixed_array},
@@ -310,6 +310,65 @@ pub enum RappBridgeActionKind {
     PairRevoked,
 }
 
+/// Registered reason of an authenticated session close (RAPP §7.1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+pub enum RappCloseReason {
+    /// Orderly close, or an orderly session restart.
+    Normal,
+    /// The work the session existed for is done.
+    Complete,
+    /// The user disconnected.
+    UserDisconnect,
+    /// Local policy ended the session.
+    Policy,
+    /// The card blocked the credential.
+    CredentialRejected,
+    /// An authenticated protocol violation.
+    ProtocolViolation,
+    /// The pairing was revoked.
+    PairingRevoked,
+    /// The application is shutting down, or restarting the session.
+    Shutdown,
+    /// The custodian can no longer serve the card.
+    CardUnavailable,
+    /// The custodian stopped serving every pairing (RAPP §4.5).
+    ServiceWithdrawn,
+}
+
+impl From<RappCloseReason> for CloseReason {
+    fn from(reason: RappCloseReason) -> Self {
+        match reason {
+            RappCloseReason::Normal => Self::Normal,
+            RappCloseReason::Complete => Self::Complete,
+            RappCloseReason::UserDisconnect => Self::UserDisconnect,
+            RappCloseReason::Policy => Self::Policy,
+            RappCloseReason::CredentialRejected => Self::CredentialRejected,
+            RappCloseReason::ProtocolViolation => Self::ProtocolViolation,
+            RappCloseReason::PairingRevoked => Self::PairingRevoked,
+            RappCloseReason::Shutdown => Self::Shutdown,
+            RappCloseReason::CardUnavailable => Self::CardUnavailable,
+            RappCloseReason::ServiceWithdrawn => Self::ServiceWithdrawn,
+        }
+    }
+}
+
+impl From<CloseReason> for RappCloseReason {
+    fn from(reason: CloseReason) -> Self {
+        match reason {
+            CloseReason::Normal => Self::Normal,
+            CloseReason::Complete => Self::Complete,
+            CloseReason::UserDisconnect => Self::UserDisconnect,
+            CloseReason::Policy => Self::Policy,
+            CloseReason::CredentialRejected => Self::CredentialRejected,
+            CloseReason::ProtocolViolation => Self::ProtocolViolation,
+            CloseReason::PairingRevoked => Self::PairingRevoked,
+            CloseReason::Shutdown => Self::Shutdown,
+            CloseReason::CardUnavailable => Self::CardUnavailable,
+            CloseReason::ServiceWithdrawn => Self::ServiceWithdrawn,
+        }
+    }
+}
+
 /// Stable terminal reason exposed without transport or backend error text.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum RappTerminalReason {
@@ -336,7 +395,7 @@ pub enum RappTerminalReason {
 }
 
 impl RappTerminalReason {
-    /// The reason a failure result names (RAPP v26.10.9 section 10).
+    /// The reason a failure result names (RAPP v26.10.10 section 10).
     #[must_use]
     pub const fn from_result(status: ResultStatus, error: Option<ResultError>) -> Self {
         match (status, error) {
@@ -390,6 +449,9 @@ pub struct RappBridgeAction {
     pub progress_event: Option<RappProgressEvent>,
     /// The session must close after this frame is delivered.
     pub close_session_after_send: bool,
+    /// Registered reason of a session closed by an authenticated notice,
+    /// sent or received.
+    pub close_reason: Option<RappCloseReason>,
     /// Monotonic time of the next required liveness poll.
     pub next_poll_at_ms: Option<u64>,
 }
@@ -408,6 +470,7 @@ impl RappBridgeAction {
             batch_signatures: Vec::new(),
             progress_event: None,
             close_session_after_send: false,
+            close_reason: None,
             next_poll_at_ms: None,
         }
     }
@@ -437,6 +500,7 @@ impl RappBridgeAction {
             batch_signatures: Vec::new(),
             progress_event: None,
             close_session_after_send,
+            close_reason: None,
             next_poll_at_ms: None,
         }
     }
@@ -1223,7 +1287,7 @@ impl RappOperationBridge {
         )
     }
 
-    /// Complete an identity read (RAPP v26.10.9 section 9.1).
+    /// Complete an identity read (RAPP v26.10.10 section 9.1).
     ///
     /// Both dates are `YYYY-MM-DD`; at least one DER certificate travels.
     ///
@@ -1473,6 +1537,58 @@ impl RappOperationBridge {
         drop(state);
         Ok(RappBridgeAction::simple(
             RappBridgeActionKind::SessionClosed,
+        ))
+    }
+
+    /// Close the session with an authenticated `session.close` carrying
+    /// `reason`: classify every in-flight operation, then return the notice
+    /// frame to deliver before dropping the link. A session that is already
+    /// closed yields [`RappBridgeActionKind::SessionClosed`] without a frame.
+    ///
+    /// # Errors
+    /// [`RappBindingError::LocalStateFailure`] when the durable close
+    /// classification fails.
+    pub fn close_with_reason(
+        &self,
+        reason: RappCloseReason,
+    ) -> Result<RappBridgeAction, RappBindingError> {
+        let mut state = self.lock_state()?;
+        let sealed = match &mut *state {
+            OperationBridgeState::Requester {
+                runtime,
+                journal,
+                engine,
+                ..
+            } => {
+                engine
+                    .session_closed(journal)
+                    .map_err(|_| RappBindingError::LocalStateFailure)?;
+                runtime.close_with_reason(reason.into()).ok()
+            }
+            OperationBridgeState::Proxy {
+                runtime,
+                journal,
+                engine,
+                ..
+            } => {
+                engine
+                    .session_closed(journal)
+                    .map_err(|_| RappBindingError::LocalStateFailure)?;
+                runtime.close_with_reason(reason.into()).ok()
+            }
+            OperationBridgeState::Closed => None,
+            OperationBridgeState::Revoked => {
+                return Ok(RappBridgeAction::simple(RappBridgeActionKind::PairRevoked));
+            }
+        };
+        *state = OperationBridgeState::Closed;
+        drop(state);
+        Ok(sealed.map_or_else(
+            || RappBridgeAction::simple(RappBridgeActionKind::SessionClosed),
+            |frame| RappBridgeAction {
+                close_reason: Some(reason),
+                ..RappBridgeAction::send(RappBridgeActionKind::SendFrame, None, frame, true)
+            },
         ))
     }
 }
@@ -1882,6 +1998,13 @@ fn receive_runtime(
             action: RappBridgeAction::simple(RappBridgeActionKind::SessionClosed),
             revoked: false,
         }),
+        RuntimeReceive::PeerClosed(reason) => Ok(RuntimeFrame::Terminal {
+            action: RappBridgeAction {
+                close_reason: Some(reason.into()),
+                ..RappBridgeAction::simple(RappBridgeActionKind::SessionClosed)
+            },
+            revoked: false,
+        }),
         RuntimeReceive::PairRevoked { .. } => Ok(RuntimeFrame::Terminal {
             action: RappBridgeAction::simple(RappBridgeActionKind::PairRevoked),
             revoked: true,
@@ -1975,6 +2098,24 @@ mod tests {
             action.progress_event,
             Some(RappProgressEvent::WaitingForCard)
         );
+    }
+
+    #[test]
+    fn close_reasons_convert_both_ways() {
+        for reason in [
+            RappCloseReason::Normal,
+            RappCloseReason::Complete,
+            RappCloseReason::UserDisconnect,
+            RappCloseReason::Policy,
+            RappCloseReason::CredentialRejected,
+            RappCloseReason::ProtocolViolation,
+            RappCloseReason::PairingRevoked,
+            RappCloseReason::Shutdown,
+            RappCloseReason::CardUnavailable,
+            RappCloseReason::ServiceWithdrawn,
+        ] {
+            assert_eq!(RappCloseReason::from(CloseReason::from(reason)), reason);
+        }
     }
 
     #[test]

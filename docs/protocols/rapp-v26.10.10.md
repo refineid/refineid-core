@@ -1,19 +1,19 @@
-# Remote Authorization Proxy Protocol (RAPP) v26.10.9
+# Remote Authorization Proxy Protocol (RAPP) v26.10.10
 ## Transport-Generic Pairing, BLE Direct Proximity and Stream Transport Specification
 
 Status: Normative Specification / Research Record  
-Document version: 26.10.9  
-Wire version: `[26, 10, 9]` (`[Year, Month, Day]`)  
-Offer version: `[26, 10, 9]`  
+Document version: 26.10.10  
+Wire version: `[26, 10, 10]` (`[Year, Month, Day]`)  
+Offer version: `[26, 10, 10]`  
 Transport Profiles: `"fi.refineid.rapp.ble.v1"`, `"fi.refineid.stream.v1"` (§2.2)  
-Date: 2026-10-09  
+Date: 2026-10-10  
 Change controller: RefineID project  
 
 ---
 
 ## Abstract
 
-This specification defines the **Enhanced Human-Factor Pairing Protocol** and the operational protocol of the Remote Authorization Proxy Protocol (RAPP v26.10.9), carried over any registered transport profile (§2.2): the **Bluetooth Low Energy (BLE) Direct Proximity Transport Profile** (`"fi.refineid.rapp.ble.v1"`) and the **Local IP Stream Transport Profile** (`"fi.refineid.stream.v1"`). Pairing, offer bootstrap, sessions, and operations are identical on every transport; only framing, routing, and discovery differ.
+This specification defines the **Enhanced Human-Factor Pairing Protocol** and the operational protocol of the Remote Authorization Proxy Protocol (RAPP v26.10.10), carried over any registered transport profile (§2.2): the **Bluetooth Low Energy (BLE) Direct Proximity Transport Profile** (`"fi.refineid.rapp.ble.v1"`) and the **Local IP Stream Transport Profile** (`"fi.refineid.stream.v1"`). Pairing, offer bootstrap, sessions, and operations are identical on every transport; only framing, routing, and discovery differ.
 
 A user's mobile device acts as a Sovereign Server (Custodian) holding physical custody of the FINEID identity card over Near Field Communication (NFC). The workstation acts as a Requester. On BLE the Custodian is the GATT Peripheral and the Requester the GATT Central; on the stream transport the Custodian listens and the Requester dials.
 
@@ -27,22 +27,23 @@ To support upper-layer messages (such as X.509 certificate chains or document si
 
 ### 1.1 Scope and Standalone Specification Model
 
-This document defines the complete, standalone normative specification for the **Remote Authorization Proxy Protocol (RAPP) version 26.10.9**. It encompasses:
+This document defines the complete, standalone normative specification for the **Remote Authorization Proxy Protocol (RAPP) version 26.10.10**. It encompasses:
 - The **Transport Profile Registry** (§2.2) with the **Bluetooth Low Energy (BLE) Direct Proximity Transport Profile** (`"fi.refineid.rapp.ble.v1"`) and the **Local IP Stream Transport Profile** (`"fi.refineid.stream.v1"`).
 - The **Enhanced Human-Factor Proximity Pairing Protocol** utilizing `CPaceRistretto255`, 6-character Crockford Base32 human factors, atomic attempt reservation, and authenticated `Noise_XXpsk3` channel binding.
 - The **BLE Segmentation and Reassembly (SAR) Adaptation Layer** with latched invariant total lengths and stop-and-wait flow control.
 - The **Authenticated Message Envelope**, sequential sequencing, and session multiplexing.
 - The **Direct Idempotent Operation Model** providing strict at-most-once physical card execution via write-ahead journaling and `operation_id` deduplication.
 - The **Registered Credential Profiles and Actions** for card status inspection, browser authentication, and qualified document signing.
+- **Service Withdrawal** (§4.5): the Custodian's notice, keyed by each pairing's static agreement, that it has stopped serving, on discovery and on open sessions.
 - The **Failure Semantics, Retry Protection, and Human Consent Contracts**.
 
-This document is completely self-contained: all normative schemas, protocol state machines, cryptographic bindings, error handling rules, and wire formats required to implement, verify, and audit RAPP v26.10.9 are defined herein.
+This document is completely self-contained: all normative schemas, protocol state machines, cryptographic bindings, error handling rules, and wire formats required to implement, verify, and audit RAPP v26.10.10 are defined herein.
 
 - **Migration and Compatibility**:
-  RAPP v26.10.9 runs the same pairing and session protocol over every registered transport profile (§2.2). Its wire and offer versions are `[26, 10, 9]` (`[Year, Month, Day]`). It does not interoperate with other RAPP versions. Implementations must conform strictly to the schemas and state machines defined in this standalone specification.
+  RAPP v26.10.10 runs the same pairing and session protocol over every registered transport profile (§2.2). Its wire and offer versions are `[26, 10, 10]` (`[Year, Month, Day]`). It does not interoperate with other RAPP versions. Implementations must conform strictly to the schemas and state machines defined in this standalone specification.
 - **Wire and Offer Versioning**:
-  - Offer version: `[26, 10, 9]` in `pairing-offer`.
-  - Wire version: `[26, 10, 9]` (`[Year, Month, Day]`) in channel envelopes, pairing context, and handshake prologues.
+  - Offer version: `[26, 10, 10]` in `pairing-offer`.
+  - Wire version: `[26, 10, 10]` (`[Year, Month, Day]`) in channel envelopes, pairing context, and handshake prologues.
 - **Role Mapping**:
   - **Requester**: Corresponds to the RAPP Requester. On BLE it operates as GATT Client (Central); on the stream transport it dials the Custodian.
   - **Custodian**: Corresponds to the Sovereign Server (mobile device) acting as the RAPP Authorization Proxy while holding exclusive physical NFC custody of the Credential Holder (FINEID Card). On BLE it operates as GATT Server (Peripheral); on the stream transport it listens.
@@ -81,19 +82,19 @@ The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**, **
 
 ### 2.1 Transport Architecture & Protocol Lifecycle
 
-- **Wire Version**: `[26, 10, 9]` (`[Year, Month, Day]`)
-- **Offer Version**: `[26, 10, 9]`
+- **Wire Version**: `[26, 10, 10]` (`[Year, Month, Day]`)
+- **Offer Version**: `[26, 10, 10]`
 - **Transport Profiles**: registered in §2.2
 
 The transport acts as the underlying point-to-point bearer for RAPP frames. CPace establishes the 32-byte pre-shared key ($PSK$) that seeds mutual pairing authentication (`Noise_XXpsk3`), replay protection, monotonic sequence counters, and typed at-most-once operation dispatch. Every phase below runs unchanged on every registered transport profile; "transport frame" means one SAR-reassembled message on BLE (§5.3) and one length-prefixed frame on the stream transport (§2.2.2).
 
 #### Protocol Lifecycle:
-- **Phase 0: Routing (`Phase::Routing`)**: Every connection starts with exactly one routing preamble transport frame from the Requester (§2.2). For purpose `"pairing"` with an active offer, the connection proceeds to the offer bootstrap. For purpose `"session"` with a matching stored `rendezvous_token`, the connection transitions to `Phase::NoiseSession`.
+- **Phase 0: Routing (`Phase::Routing`)**: Every connection starts with exactly one routing preamble transport frame from the Requester (§2.2). For purpose `"pairing"` with an active offer, the connection proceeds to the offer bootstrap. For purpose `"session"` whose routing tag a stored pairing keyed (§2.2.1), the connection transitions to `Phase::NoiseSession`.
 - **Phase 1: Offer Bootstrap**: The Requester obtains the canonical `pairing-offer`, carrying a fresh random 32-byte `offer_id` (SID), over the transport in use (§4.2): on BLE by reading the Bootstrap Characteristic, on the stream transport as the Custodian's first transport frame after the pairing preamble. Both peers compute the canonical `offer_hash` and bind the transport entry of the offer that names the transport profile in use.
 - **Phase 2: CPace Key Agreement & Confirmation (`Phase::CPace`)**: Execute the `CPaceRistretto255` KC2 profile, one transport frame per CPace message, with Context $C$ binding, mutually authenticating via HMAC tags $T_B$ and $T_A$ to establish $PSK$ via HKDF-Expand. On success, transition to `Phase::NoisePairing` and consume the offer.
-- **Phase 3: Noise_XXpsk3 Pairing (`Phase::NoisePairing`)**: Perform the authenticated pairing handshake with prologue bound to canonical `offer_hash`, wire version `[26, 10, 9]`, suite, and the transport profile in use. Immediately on handshake completion, derive pairing-channel `session_id`, `pair_id`, and `rendezvous_token`. Exchange `pairing.hello` (parameter echo using `session_id`) and `pairing.confirm` (capability grants), deriving `grants_hash`.
-- **Phase 4: Pair Storage**: Atomically store the pairing trust record (`pair_id`, `rendezvous_token`, `grants_hash`, peer static public key, and local private key). A stored pairing is not bound to the transport it was created on; sessions may use any registered transport.
-- **Subsequent Operational Sessions (`Phase::NoiseSession`)**: Operational connections start in `Phase::Routing`, verify `rendezvous_token`, and open a fresh `Noise_KK` session with an independent operational `session_id`, bound to the transport profile of that connection.
+- **Phase 3: Noise_XXpsk3 Pairing (`Phase::NoisePairing`)**: Perform the authenticated pairing handshake with prologue bound to canonical `offer_hash`, wire version `[26, 10, 10]`, suite, and the transport profile in use. Immediately on handshake completion, derive pairing-channel `session_id` and `pair_id`. Exchange `pairing.hello` (parameter echo using `session_id`) and `pairing.confirm` (capability grants), deriving `grants_hash`.
+- **Phase 4: Pair Storage**: Atomically store the pairing trust record (`pair_id`, `grants_hash`, peer static public key, and local private key). A stored pairing is not bound to the transport it was created on; sessions may use any registered transport.
+- **Subsequent Operational Sessions (`Phase::NoiseSession`)**: Operational connections start in `Phase::Routing`, route by a fresh routing tag (§2.2.1), and open a fresh `Noise_KK` session with an independent operational `session_id`, bound to the transport profile of that connection.
 
 The diagram shows the BLE profile; on the stream transport the Requester dials the Custodian's advertised TCP endpoint instead (§2.2.2).
 
@@ -122,7 +123,7 @@ The diagram shows the BLE profile; on the stream transport the Requester dials t
 
 ### 2.2 Transport Profile Registry
 
-Every transport profile defines a candidate identifier, framing, a routing preamble, and an offer bootstrap. CPace messages, Noise handshake messages, and envelopes each occupy exactly one transport frame. Discovery and advertisement for each profile are specified by the [RAPP Transport and Discovery Hierarchy Specification](rapp-transport-and-discovery-hierarchy.md); nothing derived from the pairing code, `offer_id`, `offer_hash`, or `rendezvous_token` is ever advertised.
+Every transport profile defines a candidate identifier, framing, a routing preamble, and an offer bootstrap. CPace messages, Noise handshake messages, and envelopes each occupy exactly one transport frame. Discovery and advertisement for each profile are specified by the [RAPP Transport and Discovery Hierarchy Specification](rapp-transport-and-discovery-hierarchy.md); nothing derived from the pairing code, `offer_id` or `offer_hash` is ever advertised. Advertised discovery hints (hierarchy specification §4.3) and withdrawal hints (§4.5) are keyed by a pairing's static agreement (§4.3) and identify the pairing only to its two endpoints.
 
 | Transport profile | `candidate_id` | Framing | Preamble domain | Offer bootstrap |
 | :--- | :--- | :--- | :--- | :--- |
@@ -136,16 +137,32 @@ The routing preamble is the deterministic-CBOR encoding of a 3-element array, se
 routing-preamble = [
   preamble-domain,       ; "RAPP-ble-v1" or "RAPP-stream-v1" (§2.2)
   "pairing" / "session", ; purpose
-  bstr                   ; empty for "pairing"; the 16-byte rendezvous_token for "session"
+  bstr                   ; empty for "pairing"; session-routing for "session"
 ]
+session-routing = bstr .size 32   ; nonce (16 bytes) || routing_tag (16 bytes)
 ```
-A preamble that does not decode, names another profile's domain, carries an unregistered purpose, a non-empty token with `"pairing"`, or a token other than 16 bytes with `"session"` is Class 1 invalid input (§10.1): the Custodian closes the connection without changing stored state. An encoded preamble longer than 64 bytes is rejected before parsing.
+For a `"session"` preamble the Requester draws a fresh 16-byte `nonce` from a cryptographically secure random source for every connection and computes
+```text
+K_route     = HKDF-SHA-256(salt = pair_id, IKM = X25519(local static private, peer static public),
+                           info = "RAPP-routing-v1", L = 32)
+routing_tag = first 16 bytes of HMAC-SHA-256(K_route, len(domain) || domain || nonce)
+```
+where `domain` is the preamble domain of the transport profile in use as UTF-8 octets and `len` is one octet. Both endpoints of a pairing derive the same `K_route` (§4.3); no other party can. A Requester never reuses a nonce.
+
+The Custodian routes a `"session"` preamble as follows:
+1. It evaluates the tag against `K_route` of every non-revoked stored pairing, comparing in constant time and without stopping at a match, so the work does not reveal which pairing matched or whether any did. The pre-authentication limiter (§3.3) bounds how often this runs.
+2. No match is Class 1 invalid input: the Custodian closes the connection without changing stored state.
+3. On a match it consults its replay memory: the nonces of the 256 most recently routed sessions. A nonce already there is Class 1 invalid input; otherwise the nonce is added, displacing the oldest, and the connection proceeds to `Phase::NoiseSession` for the matched pairing.
+
+A preamble that does not decode, names another profile's domain, carries an unregistered purpose, a non-empty value with `"pairing"`, or a value other than 32 bytes with `"session"` is Class 1 invalid input (§10.1): the Custodian closes the connection without changing stored state. An encoded preamble longer than 64 bytes is rejected before parsing. A `"session"` preamble encodes to 58 bytes on the stream transport and 55 bytes on BLE. The `routing_tag` and `routing_preamble` vectors of `vectors/rapp-routing-v26.10.10.json` pin the bytes.
+
+The routing tag only selects a pairing; it authenticates nothing. Authentication is established exclusively by the `Noise_KK` handshake that follows.
 
 #### 2.2.2 Stream Transport Profile (`"fi.refineid.stream.v1"`)
 - **Bearer**: one reliable, ordered TCP byte stream per connection. The Custodian listens and advertises the endpoint per the hierarchy specification; the Requester dials. Neither peer accepts inbound pairing or session connections on any other role.
 - **Framing**: each transport frame is a 2-byte unsigned big-endian length $n$ followed by exactly $n$ payload bytes, $1 \le n \le 65535$. A zero length, a truncated frame, or a length above the receiver's limit closes the connection (Class 1 before authentication, Class 2 after).
 - **Offer parameters**: the stream transport entry of `pairing-offer` carries `parameters: {}`; endpoints are learned from discovery, never from the offer.
-- **Ordering**: after a `"pairing"` preamble the Custodian sends the encoded `pairing-offer` as its first frame (§4.2); after a `"session"` preamble with a known token the Requester sends `Noise_KK` message 1.
+- **Ordering**: after a `"pairing"` preamble the Custodian sends the encoded `pairing-offer` as its first frame (§4.2); after a `"session"` preamble the Custodian routed (§2.2.1) the Requester sends `Noise_KK` message 1.
 
 ---
 
@@ -236,7 +253,7 @@ To mathematically close this oracle while permitting the final legitimate attemp
 
 ### 4.1 Zero Hint Leakage Over Advertisements
 
-No advertisement on any transport (BLE advertising data, DNS-SD names, TXT records, or other discovery records) may carry pairing code material, offer material (`offer_id`, `offer_hash`), or `rendezvous_token` material, or any value derived from them. The rules below apply to BLE; the hierarchy specification applies the same rule to DNS-SD.
+No advertisement on any transport (BLE advertising data, DNS-SD names, TXT records, or other discovery records) may carry pairing code material or offer material (`offer_id`, `offer_hash`), or any value derived from them. Discovery hints (hierarchy specification §4.3) and withdrawal hints (§4.5) are keyed by a pairing's static agreement (§4.3), which never crosses the wire. The rules below apply to BLE; the hierarchy specification applies the same rule to DNS-SD.
 
 The BLE advertisement payload **MUST NOT** contain:
 - Any bits, truncated representations, or hashes of the pairing code.
@@ -258,7 +275,7 @@ The Session Identifier (SID) used in CPace **MUST** be an independent 32-byte cr
 ```cddl
 pairing-offer = {
   "scheme": "rapp",
-  "version": [26, 10, 9],       ; offer version triple
+  "version": [26, 10, 10],       ; offer version triple
   "offer_id": bstr .size 32,    ; 32-byte cryptographic random SID
   "suites": [
     "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512"
@@ -284,18 +301,18 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
 #### Bootstrap Read Flow:
 1. **BLE**: the Custodian exposes the **RAPP Bootstrap Characteristic** (`7E39FD03-A6B5-4D78-9E11-37E28E9545F1`, Read-only). The Requester connects, sends the `"pairing"` routing preamble (§5.2), and performs an `ATT_READ_REQ` on this characteristic to obtain `encode_deterministic_cbor(pairing-offer)`.
 2. **Stream**: after receiving the `"pairing"` routing preamble, the Custodian sends `encode_deterministic_cbor(pairing-offer)` as its first transport frame. A Custodian with no active offer closes the connection instead.
-3. The Requester decodes the offer and rejects it unless it is deterministic CBOR matching the schema, carries version `[26, 10, 9]`, lists an acceptable suite, and contains a `transports` entry whose `profile` is the transport profile of the connection. Unsupported suites terminate the pairing flow immediately before CPace; automatic downgrade or fallback to unconfirmed legacy suites is strictly prohibited.
+3. The Requester decodes the offer and rejects it unless it is deterministic CBOR matching the schema, carries version `[26, 10, 10]`, lists an acceptable suite, and contains a `transports` entry whose `profile` is the transport profile of the connection. Unsupported suites terminate the pairing flow immediately before CPace; automatic downgrade or fallback to unconfirmed legacy suites is strictly prohibited.
 4. Both peers bind the `candidate_id` of that entry and the connection's transport profile (§4.3, §6.1.1), use `offer_id` as SID for CPace, and compute `offer_hash` for the Noise pairing prologue.
 5. A deterministic encoding of `pairing-offer` with the KC2 suite, the three registered profiles, and both transport entries stays within the 509-byte ATT value capacity at the minimum ATT MTU of 512.
 
-### 4.3 Mandatory Noise Binding, Temporal Derivation, and Reconnect Rendezvous
+### 4.3 Mandatory Noise Binding, Temporal Derivation, and Reconnect Routing
 
 1. **Noise_XXpsk3 Prologue**:
    The prologue for the pairing handshake is the deterministic-CBOR encoding of the 5-element array:
    ```cddl
    pairing-prologue = [
      "RAPP-pairing-v1",
-     [26, 10, 9],                                                         ; wire version [Year, Month, Day]
+     [26, 10, 10],                                                         ; wire version [Year, Month, Day]
      "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512", ; cryptographic suite name
      bstr .size 32,                                                       ; offer_hash
      tstr                                                                 ; transport profile of the connection (§2.2)
@@ -306,16 +323,15 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
 2. **Immediate Channel Identifier Derivation**:
    Immediately upon completing the `Noise_XXpsk3` handshake, both peers derive the channel identifiers from the completed handshake hash $h$ in strict order:
    ```text
-   session_id       = first 16 bytes of SHA-512("RAPP-session-id-v1" || h)
-   pair_id          = first 16 bytes of SHA-512("RAPP-pair-id-v1" || h)
-   rendezvous_token = first 16 bytes of SHA-512("RAPP-rendezvous-v1" || h)
+   session_id = first 16 bytes of SHA-512("RAPP-session-id-v1" || h)
+   pair_id    = first 16 bytes of SHA-512("RAPP-pair-id-v1" || h)
    ```
    Both peers immediately destroy `pairing_secret` ($PSK$) and all ephemeral handshake keys.
    The derived `session_id` immediately scopes the pairing-channel envelopes for `pairing.hello` and `pairing.confirm`.
 
 3. **Parameter Echo & Mutual Grants**:
    - Inside the established pairing channel, peers exchange `pairing.hello`.
-   - `pairing.hello` echoes `offer_hash`, the bound transport profile and `candidate_id` (§4.2), wire version `[26, 10, 9]`, suite name, display name, platform description, and requester's requested profiles.
+   - `pairing.hello` echoes `offer_hash`, the bound transport profile and `candidate_id` (§4.2), wire version `[26, 10, 10]`, suite name, display name, platform description, and requester's requested profiles.
    - Custodian verifies matching echoes. Any mismatch aborts with an authenticated protocol violation.
    - The Custodian automatically grants the valid requested profiles matching its pairing offer (since possession and entry of the 30-bit pairing code constitutes user authorization), and transmits `pairing.confirm` carrying granted profiles. Requester echoes and confirms. Both granted sets **MUST** be identical.
    - Derive `grants_hash` from the confirmed, canonically sorted grant set:
@@ -327,27 +343,28 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
    - **Fresh Pair-Specific Static Keys**: Each pairing ceremony **MUST** generate a fresh, cryptographically independent static X25519 keypair $(s, s_{pub})$ on each endpoint. Static keys **MUST NOT** be reused across different peer pairings or across distinct pairing ceremonies. This provides pairwise endpoint isolation and prevents correlation across peers. Private keys **MUST** be stored in platform-encrypted secure hardware (Secure Enclave / TPM / OS Keychain), excluded from backups and cloud synchronization, and marked non-exportable.
    - Each endpoint atomically persists the pairing trust record:
      - `pair_id`
-     - `rendezvous_token`
      - `grants_hash` and confirmed granted profiles
      - Remote peer's static public key
      - Local static private key (stored in platform-encrypted secure hardware / keychain)
    - The pairing channel is then cleanly closed.
 
-5. **Reconnect Rendezvous for Operational Sessions (`Noise_KK`)**:
+5. **Reconnect Routing for Operational Sessions (`Noise_KK`)**:
    Subsequent connections for credential operations (authentication, qualified signing) do not rerun CPace or the offer bootstrap, and may use any registered transport.
    - Every connection starts in `Phase::Routing` (§2.2.1).
-   - Requester transmits a single routing preamble with purpose `"session"` and its `rendezvous_token` (§2.2.1). On BLE it is written to the Channel Characteristic via `ATT_WRITE_REQ` in a `SINGLE` SAR frame (§5.2).
-   - The Custodian looks up stored pairing by `rendezvous_token`, retrieves `pair_id`, `grants_hash`, and peer static key, and initiates `Phase::NoiseSession` (`Noise_KK`).
-   - If `rendezvous_token` is unknown or revoked, the Custodian immediately closes the link without altering stored state.
-   - **Rendezvous Privacy Analysis & Presence Oracle**:
-     Using `rendezvous_token` hides `pair_id` (which remains a strictly local identifier) and prevents observers from connecting the session to other pairings or credentials. However, two residual behaviors exist:
-     1. *Token Recurrence Correlation*: Because `rendezvous_token` is static per pairing, a radio observer capturing multiple reconnect preambles over time can recognize that token's recurrence and correlate that the same unidentified pairing is reconnecting. Stronger unlinkability across reconnections would require rotating tokens (a separate profile extension); it is not claimed for this static token.
-     2. *Presence Probing Oracle*: An unauthenticated nearby attacker who replays a captured `rendezvous_token` observes that the Custodian does not immediately close the link in `Phase::Routing`, but instead proceeds to `Phase::NoiseSession` (`Noise_KK`). In `Noise_KK`, the Custodian processes handshake message 1 (performing `mix_hash`, DH operations, and static DH) before payload AEAD authentication fails and the connection is dropped. Depending on the input, processing can fail during ephemeral key validation, DH computation, static DH, or payload authentication. The timing difference between an unknown token (immediate link drop in Phase::Routing) and a known token (handshake message 1 processing) constitutes an accepted residual presence oracle for static tokens. This is mitigated by single-flight connection serialization and rate-limiting reconnect attempts from unauthenticated centrals.
+   - Requester transmits a single routing preamble with purpose `"session"` and a fresh routing tag (§2.2.1). On BLE it is written to the Channel Characteristic via `ATT_WRITE_REQ` in a `SINGLE` SAR frame (§5.2).
+   - The Custodian finds the stored pairing whose `K_route` keyed the tag, retrieves `pair_id`, `grants_hash`, and peer static key, and initiates `Phase::NoiseSession` (`Noise_KK`).
+   - If no non-revoked pairing keyed the tag, or its nonce was already routed, the Custodian immediately closes the link without altering stored state.
+   - **Keys from the static agreement**: Every value that names a pairing outside its encrypted channel is keyed by the pairing's static X25519 agreement, which only its two endpoints can compute:
+     ```text
+     K_x = HKDF-SHA-256(salt = pair_id, IKM = X25519(local static private, peer static public), info, L = 32)
+     ```
+     with `info` `"RAPP-routing-v1"` for routing tags (§2.2.1), `"RAPP-discovery-hint-v2"` for discovery hints (hierarchy specification §4.3), and `"RAPP-withdrawal-v1"` for withdrawal hints (§4.5). Both endpoints obtain the same agreement from their own private key and the peer's public key. An agreement equal to the identity point yields no key; such a pairing is never announced or routed. The `pair_keys` vectors of `vectors/rapp-routing-v26.10.10.json` pin the keys.
+   - **Routing privacy**: A routing tag is fresh for every connection and computationally unlinkable without `K_route`, so an observer of preambles cannot tell whether two connections belong to the same pairing, and no routing value recurs. A replayed preamble is refused in `Phase::Routing` while its nonce is in the Custodian's replay memory; a preamble replayed after its nonce has left the memory reaches `Noise_KK` message 1, which the replaying party cannot complete. That timing difference reveals only that some stored pairing once routed that preamble, which the observer already saw; it is mitigated by single-flight connection serialization and the pre-authentication limiter (§3.3).
    - Session Prologue:
      ```cddl
      session-prologue = [
        "RAPP-session-v1",
-       [26, 10, 9],                                                         ; wire version [Year, Month, Day]
+       [26, 10, 10],                                                         ; wire version [Year, Month, Day]
        "Noise_KK_25519_ChaChaPoly_SHA512",                              ; suite name
        pair_id,                                                         ; bstr .size 16
        grants_hash,                                                     ; bstr .size 32
@@ -365,6 +382,52 @@ RSSI is treated as an **advisory discovery heuristic** and defense-in-depth barr
 3. **Transparent Relay Analysis**: An adversary utilizing high-gain directional antennas and power amplifiers can increase signal strength at the receiver. A transparent RF wormhole or relay forwarder can tunnel RF packets between distant rooms without decrypting them. While PAKE secrecy prevents an attacker from learning the session key, the physical distance assumption is bypassed. Explicit per-operation user authorization on the Custodian phone screen protects authorized operation semantics/intent (e.g. for qualified signing); transparent physical RF tunneling remains a physical-layer relay risk that cannot be detected by RF signal analysis alone.
 4. **Structural Role Separation as Protocol-Level Relay Defense**:
    Under Bluetooth Core Specification v5.4 and this profile (§5.2, §6.3), ATT and CPace roles are strictly asymmetric and immutable: the Requester is Central ($A$), transmitting exclusively via `ATT_WRITE_REQ`, while the Custodian is Peripheral ($B$), replying exclusively via `ATT_HANDLE_VALUE_IND`. Per draft-irtf-cfrg-cpace-21 Section 10.1, strict initiator/responder role separation structurally eliminates relay loopback and reflection attacks: an adversary cannot reflect the Custodian's $Y_B \parallel T_B$ indication back to the Custodian as an initiator write $Y_A$, nor can it relay frames between two peers acting in the same role.
+
+### 4.5 Service Withdrawal
+
+A Custodian **withdraws** when it deliberately stops serving every stored pairing. Exactly two causes are withdrawal: the user turns remote access off, and the user quits the application. Suspension or termination by the operating system, loss of the network, and a session restart with reason `"normal"` or `"shutdown"` (§7.2) are not withdrawal. Withdrawal changes no stored pairing; serving resumes with the next `mode=session` advertisement.
+
+1. **Withdrawal Key**:
+   Each stored pairing has a withdrawal key that both endpoints derive from their static keys and that never crosses the wire:
+   $$S = \text{X25519}(\text{local static private}, \text{peer static public})$$
+   $$K_{\text{wd}} = \text{HKDF-SHA-256}(\text{salt} = \text{pair\_id}, \text{IKM} = S, \text{info} = \texttt{"RAPP-withdrawal-v1"}, L = 32)$$
+   HKDF is [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html): $\text{PRK} = \text{HMAC-SHA-256}(\text{pair\_id}, S)$ over the 16-byte `pair_id`, then the single block $K_{\text{wd}} = \text{HMAC-SHA-256}(\text{PRK}, \text{info} \parallel \texttt{0x01})$. An $S$ equal to the X25519 identity (all zero) yields no key; such a pairing is never announced. The Requester may cache $K_{\text{wd}}$ with the pairing.
+
+2. **Withdrawal Hint**:
+   $$\text{whint} = \text{first 8 bytes of }\text{HMAC-SHA-256}(K_{\text{wd}}, \text{len} \parallel \text{instance} \parallel \text{counter\_be64})$$
+   where $\text{instance}$ is the instance portion of the DNS-SD service instance name the Custodian publishes ([RFC 6763](https://www.rfc-editor.org/rfc/rfc6763.html) §4.1): the name exactly as published, without the service type (`_refineid-stream._tcp`) and the domain (`local.`), as UTF-8 octets, 1 to 63 octets (hierarchy specification §4.2). Instance names may contain dots; a value ending in a service type or domain suffix is a misuse and is refused. $\text{len}$ is its length as one octet, and $\text{counter} = \lfloor \text{unix\_time} / 60 \rfloor$ as an unsigned 64-bit big-endian integer. The `withdrawal_key` and `withdrawal_hint` vectors of `vectors/rapp-withdrawal-v26.10.10.json` pin the bytes.
+
+3. **Custodian Order**:
+   On withdrawal the Custodian, in this order:
+   1. sends `session.close` with reason `"service_withdrawn"` (§7.1) on every open operational session and closes its link;
+   2. stops accepting connections;
+   3. replaces the TXT record of its current `_refineid-stream._tcp` service instance with the withdrawn record (item 4);
+   4. unregisters the service after at least 2 and at most 10 seconds.
+
+   Withdrawal does not alter the operation journal: an operation whose card exchange has begun completes or is recorded exactly as §8 requires, and the Requester reconciles it through §8.3 on its next session.
+
+4. **Withdrawn Record**:
+   ```text
+   v=1
+   mode=withdrawn
+   withdrawn=<entry_1>,<entry_2>,...,<entry_8>
+   ```
+   The `withdrawn` value holds exactly 8 entries, each 16 lowercase hexadecimal digits, separated by commas without spaces. The Custodian places the withdrawal hint, for its current instance and counter, of each of the 8 most recently used stored pairings, fills the remaining entries with independent random 8-byte values, and orders all 8 by fresh random sort keys. A pairing's use time is the start of its most recent established session, or its creation when it has had none; equal times are ordered by the hints' bytes, lowest first. The record carries no other attribute. Pairings beyond the eighth are not announced and fall under unannounced loss (item 6). The `announcement_selection` vectors pin the choice.
+
+   TXT keys compare case-insensitively ([RFC 6763](https://www.rfc-editor.org/rfc/rfc6763.html) §6.4); a key that appears twice in any case is a repeated key. Values compare exactly: `mode` is `withdrawn` in lowercase, and every entry is lowercase hexadecimal.
+
+5. **BLE**:
+   The BLE advertisement carries only the Service UUID (§4.1) and no withdrawal marker. A Requester on BLE learns of withdrawal through an open session or as unannounced loss.
+
+6. **Requester Behavior**:
+   - **Open session first.** While the Requester holds an established session to the pairing, discovery records do not change its presence. An authenticated `session.close` with reason `"service_withdrawn"` is a **verified withdrawal**; any other close reason, or loss of the session, is not.
+   - **Discovery.** Without an open session, a Requester honours a withdrawn record only on the service instance it currently associates with the pairing: the instance whose discovery hint matched the pairing, or the instance it last established a session to. It parses the record and computes the pairing's hint for that instance and for $\text{counter} - 1$, $\text{counter}$ and $\text{counter} + 1$ of its own clock, comparing every entry in constant time. A match is a **verified withdrawal**. Because the window is one counter step either side of $\lfloor t/60 \rfloor$, it tolerates a clock difference of at least 60 seconds and, depending on where both times fall within their minutes, up to just under 120 seconds. Implementations **MUST NOT** widen it.
+   - **Malformed records.** A record with a key other than `v`, `mode` and `withdrawn` (in any case), a repeated key (in any case), a `v` other than `1`, a `mode` other than `withdrawn`, or a `withdrawn` value that is not exactly 8 lowercase 16-digit entries is malformed, as is a `hints` attribute beside `withdrawn`.
+   - **Effect.** On a verified withdrawal the Requester withdraws the pairing's presence at once: it stops offering the Custodian's credentials to local consumers and does not dial the Custodian again until it discovers it in `mode=session` or sees its BLE advertisement. It changes no stored pairing state and shows no error.
+   - **Unannounced loss.** A malformed record, a withdrawn record without a match, a record on another instance, or a service that disappears without one is unannounced loss; the Requester applies its own hold before withdrawing presence, so that a brief discovery gap does not withdraw a Custodian that is still serving.
+
+7. **Authenticity and Replay**:
+   Only the two endpoints of a pairing know its static agreement, so no other party can compute a withdrawal hint; observing sessions, routing preambles or discovery records does not help. A party on the local link that recorded a genuine withdrawn record can republish it under the same instance name for at most about three minutes (the counter window), and only while the Requester still associates that instance with the pairing; instance names are fresh on every advertisement start (hierarchy specification §4.2). The effect is the same as a spoofed mDNS goodbye without the Requester's hold: presence is withdrawn until the Custodian is next discovered. These bounds assume the Requester's clock is not under the attacker's control; an attacker who can move the Requester's time, for example through an unauthenticated NTP source, can stretch the replay window for as long as it controls that clock, with the same effect and no other. Random fillers keep the record the same size whatever the number of stored pairings, and the hints are unlinkable across instances and minutes.
 
 ---
 
@@ -407,29 +470,29 @@ Under Bluetooth Core Specification v5.4, ATT roles are strictly asymmetric:
    The Custodian **MUST NOT** accept routing preambles or emit Indications until Indications are enabled in the CCCD. If a preamble is received before CCCD enablement, the Custodian closes the connection.
 3. **Initial Connection Routing (`Phase::Routing`)**:
 Every newly established BLE connection begins in **`Phase::Routing`**.
-1. The Requester MUST transmit exactly one plaintext `ble-rendezvous` preamble frame, the BLE instance of `routing-preamble` (§2.2.1), over the Channel Characteristic via `ATT_WRITE_REQ` (in a `SINGLE` SAR frame):
+1. The Requester MUST transmit exactly one plaintext `ble-routing-preamble` preamble frame, the BLE instance of `routing-preamble` (§2.2.1), over the Channel Characteristic via `ATT_WRITE_REQ` (in a `SINGLE` SAR frame):
    ```cddl
-   ble-rendezvous = [
+   ble-routing-preamble = [
      "RAPP-ble-v1",
      tstr,                     ; purpose: "pairing" / "session"
      bstr                      ; purpose "pairing": empty (bstr .size 0)
-                               ; purpose "session": rendezvous_token (bstr .size 16)
+                               ; purpose "session": session-routing (bstr .size 32, §2.2.1)
    ]
    ```
 2. The Custodian in `Phase::Routing` decodes and evaluates the preamble:
    - **Purpose `"pairing"`**:
-     - Verify `token.len == 0`.
+     - Verify the value is empty.
      - Check if Custodian has an active pairing offer (within 60-second TTL).
      - If active: the Requester reads the Bootstrap Characteristic (§4.2), and the connection transitions to **`Phase::CPace`**.
      - If no active offer exists: close connection immediately.
    - **Purpose `"session"`**:
-     - Verify `token.len == 16`.
-     - Look up `token` in the local vault of non-revoked stored pairings.
-     - If found: retrieve `pair_id`, `grants_hash`, and peer static public key, and transition connection to **`Phase::NoiseSession`**.
-     - If unknown or revoked: close connection immediately without altering any stored pairing.
+     - Verify the value is 32 bytes.
+     - Route it per §2.2.1 against the non-revoked stored pairings and the replay memory.
+     - If routed: retrieve `pair_id`, `grants_hash`, and peer static public key, and transition connection to **`Phase::NoiseSession`**.
+     - Otherwise: close connection immediately without altering any stored pairing.
    - **Invalid Preamble**:
-     - Unknown purpose, malformed CBOR, non-empty token for `"pairing"`, invalid token length for `"session"`, oversized frame, or any non-preamble frame received in `Phase::Routing` is pre-authentication invalid input: close connection immediately.
-3. Exactly one preamble frame is permitted per connection. Any preamble received after transitioning out of `Phase::Routing` is an unrecoverable protocol violation. Knowing a routing token never authenticates a caller; authentication is established exclusively by the subsequent Noise handshake.
+     - Unknown purpose, malformed CBOR, a non-empty value for `"pairing"`, a value other than 32 bytes for `"session"`, oversized frame, or any non-preamble frame received in `Phase::Routing` is pre-authentication invalid input: close connection immediately.
+3. Exactly one preamble frame is permitted per connection. Any preamble received after transitioning out of `Phase::Routing` is an unrecoverable protocol violation. A routing tag never authenticates a caller; authentication is established exclusively by the subsequent Noise handshake.
 
 ### 5.3 BLE Segmentation and Reassembly (SAR) Adaptation Layer
 
@@ -507,7 +570,7 @@ All RAPP messages over the Channel Characteristic **MUST** be encapsulated in th
    - Custodian permits at most 1 concurrent pre-authentication connection (single-flight peripheral serialization).
    - If reassembly does not complete within the 5.0-second timer, buffer is zeroized and connection is dropped.
 9. **Wire Framing of Channel Messages**:
-   - Routing Preamble: deterministic CBOR `["RAPP-ble-v1", purpose, token]` encapsulated in a `SINGLE` SAR frame.
+   - Routing Preamble: deterministic CBOR `["RAPP-ble-v1", purpose, routing]` encapsulated in a `SINGLE` SAR frame.
    - CPace Step 1 ($Y_A$): raw 32 bytes of compressed Ristretto255 point $Y_A$ encapsulated in a `SINGLE` SAR frame (`Total Frame Length = 32`, `Chunk Sequence = 0`, `Flags = 0x05`).
    - CPace Step 2 ($Y_B, T_B$): raw concatenation $Y_B \parallel T_B$ ($32 + 32 = 64\text{ bytes}$) encapsulated in a `SINGLE` SAR frame (`Total Frame Length = 64`, `Chunk Sequence = 0`, `Flags = 0x05`).
    - CPace Step 3 ($T_A$): raw 32 bytes of confirmation authenticator $T_A$ encapsulated in a `SINGLE` SAR frame (`Total Frame Length = 32`, `Chunk Sequence = 0`, `Flags = 0x05`).
@@ -524,14 +587,14 @@ All RAPP messages over the Channel Characteristic **MUST** be encapsulated in th
 
 ### 6. Normative Cryptographic Protocols
 
-RAPP v26.10.9 specifies three normative cryptographic protocols:
+RAPP v26.10.10 specifies three normative cryptographic protocols:
 1. **`CPaceRistretto255`**: Password-Authenticated Key Exchange (PAKE) for initial proximity pairing (§6.1).
 2. **`Noise_XXpsk3`**: Initial mutual pairing authentication handshake (§6.2).
 3. **`Noise_KK`**: Mutual operational session handshake (§6.3).
 
 ### 6.1 CPaceRistretto255 KC2 Profile (draft-irtf-cfrg-cpace-21, RFC 9496, RFC 5869)
 
-RAPP v26.10.9 specifies the **`CPaceRistretto255-KC2`** application profile over [draft-irtf-cfrg-cpace-21](https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-cpace-21), [RFC 9496](https://www.rfc-editor.org/rfc/rfc9496.html), and [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html):
+RAPP v26.10.10 specifies the **`CPaceRistretto255-KC2`** application profile over [draft-irtf-cfrg-cpace-21](https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-cpace-21), [RFC 9496](https://www.rfc-editor.org/rfc/rfc9496.html), and [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html):
 
 #### 6.1.1 Cryptographic Suite Definition
 - **Group**: Prime-order Ristretto255 group (order $q = 2^{252} + 27742317777372353535851937790883648493$).
@@ -549,7 +612,7 @@ RAPP v26.10.9 specifies the **`CPaceRistretto255-KC2`** application profile over
   ```cddl
   pairing-context = [
     "RAPP-PAIRING-CONTEXT-v2",
-    [26, 10, 9],                                                              ; wire version [Year, Month, Day]
+    [26, 10, 10],                                                              ; wire version [Year, Month, Day]
     "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512", ; full suite literal
     tstr,                                                                    ; transport profile of the connection (§2.2)
     tstr,                                                                    ; candidate_id of its offer entry (§4.2)
@@ -658,9 +721,8 @@ The generator point $G$ is derived from length-value (LV) encoding with zero-pad
 - **Immediate Channel Identifier Derivation**:
   Upon completing Message 3, both endpoints derive channel identifiers from the completed 64-byte handshake hash $h$:
   ```text
-  session_id       = first 16 bytes of SHA-512("RAPP-session-id-v1" || h)
-  pair_id          = first 16 bytes of SHA-512("RAPP-pair-id-v1" || h)
-  rendezvous_token = first 16 bytes of SHA-512("RAPP-rendezvous-v1" || h)
+  session_id = first 16 bytes of SHA-512("RAPP-session-id-v1" || h)
+  pair_id    = first 16 bytes of SHA-512("RAPP-pair-id-v1" || h)
   ```
   Both peers immediately zeroize $PSK$ and ephemeral keys.
 
@@ -764,23 +826,23 @@ The following normative test vector specifies the exact cryptographic transcript
   - Input `grants_hash`: `7777777777777777777777777777777777777777777777777777777777777777` (32 bytes)
   - Input `transport_profile`: `"fi.refineid.rapp.ble.v1"`
   - Encoded `prologue` (deterministic CBOR array, hex):
-    `866f524150502d73657373696f6e2d763183181a0a0978204e6f6973655f4b4b5f32353531395f436861436861506f6c795f534841353132508ab9b8bcde5c6eec845d9b1ca0d3a7be582077777777777777777777777777777777777777777777777777777777777777777766692e726566696e6569642e726170702e626c652e7631`
+    `866f524150502d73657373696f6e2d763183181a0a0a78204e6f6973655f4b4b5f32353531395f436861436861506f6c795f534841353132508ab9b8bcde5c6eec845d9b1ca0d3a7be582077777777777777777777777777777777777777777777777777777777777777777766692e726566696e6569642e726170702e626c652e7631`
 - **Handshake Wire Messages**:
   - **Message 1** (`-> e, es, ss`, 48 bytes: 32 bytes $e_{i, pub} \parallel 16$ bytes empty payload tag):
-    `7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b148c30d38badede403881573a1f023ad78`
+    `7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b149a63e73abf65ea4dec7a3df0025f5b6c`
   - **Message 2** (`<- e, ee, se`, 48 bytes: 32 bytes $e_{r, pub} \parallel 16$ bytes empty payload tag):
-    `ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b51a4403df69f4ff726d545270f37e8f9`
+    `ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b518e03ebb38bc0cc00aad6d71427cdff`
 - **Handshake Completion & Split Output**:
   - Final Handshake Hash ($h$, 64 bytes):
-    `c5fafdf985a18a48d4bf61e8784c34e07838a06bd41a3459bd32f3755fdb5713822fd0f1ada4af0cf13747a5e51158580bd17cb3dce870865ba5d93ecd4fa275`
+    `b054428bd222f4590ede01fa9b58ae0a32a0eb9f209519cc2c682cd6c8fcd70686aa615b02b04c3c6945d356e8c0a25c3134c3b55e5f209be5c3d6ed75df4f70`
   - Initiator-to-Responder Directional Transport Cipher Key ($c_1$, 32 bytes):
     `271245e9b5ffc357a6d442e04a376531bd3a0f81d69d7b97eaa132cc81d209ab`
   - Responder-to-Initiator Directional Transport Cipher Key ($c_2$, 32 bytes):
     `f3364ea960fcb3b95518b6029e2fbac8d1f259e630fa53beb63cf647e672ca40`
   - Operational Session Identifier (`session_id`, 16 bytes):
-    `16b5a8c5ab7a7b9dbc9f08e02a9974fc`
+    `78260a69cecd4931778e59a9e0d2de4e`
 
-This test vector is also cataloged under entry `"session-kk-fixed-transcript-ble"` in `docs/protocols/vectors/rapp-v26.10.9.json`, beside `"session-kk-fixed-transcript-stream"` for the stream transport profile (same keys, prologue naming `"fi.refineid.stream.v1"`).
+This test vector is also cataloged under entry `"session-kk-fixed-transcript-ble"` in `docs/protocols/vectors/rapp-v26.10.10.json`, beside `"session-kk-fixed-transcript-stream"` for the stream transport profile (same keys, prologue naming `"fi.refineid.stream.v1"`).
 
 ---
 
@@ -791,20 +853,20 @@ Every message transmitted inside an established pairing channel (`Phase::NoisePa
 
 ```cddl
 rapp-message =
-    { "version": [26, 10, 9], "session_id": bstr .size 16, "sequence": uint, "type": "pairing.hello", "body": pairing-hello-body, * common-opt }
-  / { "version": [26, 10, 9], "session_id": bstr .size 16, "sequence": uint, "type": "pairing.confirm", "body": pairing-confirm-body, * common-opt }
-  / { "version": [26, 10, 9], "session_id": bstr .size 16, "sequence": uint, "type": "pairing.abort", "body": pairing-abort-body, * common-opt }
-  / { "version": [26, 10, 9], "session_id": bstr .size 16, "sequence": uint, "type": "session.ready", "body": session-ready-body, * common-opt }
-  / { "version": [26, 10, 9], "session_id": bstr .size 16, "sequence": uint, "type": "session.close", "body": session-close-body, * common-opt }
-  / { "version": [26, 10, 9], "session_id": bstr .size 16, "sequence": uint, "type": "liveness.ping", "body": liveness-ping-body, * common-opt }
-  / { "version": [26, 10, 9], "session_id": bstr .size 16, "sequence": uint, "type": "liveness.pong", "body": liveness-pong-body, * common-opt }
-  / { "version": [26, 10, 9], "session_id": bstr .size 16, "sequence": uint, "type": "operation.request", "body": operation-request-body, * common-opt }
-  / { "version": [26, 10, 9], "session_id": bstr .size 16, "sequence": uint, "type": "operation.result", "body": operation-result-body, * common-opt }
-  / { "version": [26, 10, 9], "session_id": bstr .size 16, "sequence": uint, "type": "operation.result_ack", "body": operation-result-ack-body, * common-opt }
-  / { "version": [26, 10, 9], "session_id": bstr .size 16, "sequence": uint, "type": "operation.status_request", "body": operation-status-request-body, * common-opt }
-  / { "version": [26, 10, 9], "session_id": bstr .size 16, "sequence": uint, "type": "operation.status", "body": operation-status-body, * common-opt }
-  / { "version": [26, 10, 9], "session_id": bstr .size 16, "sequence": uint, "type": "operation.progress", "body": operation-progress-body, * common-opt }
-  / { "version": [26, 10, 9], "session_id": bstr .size 16, "sequence": uint, "type": "error", "body": error-body, * common-opt }
+    { "version": [26, 10, 10], "session_id": bstr .size 16, "sequence": uint, "type": "pairing.hello", "body": pairing-hello-body, * common-opt }
+  / { "version": [26, 10, 10], "session_id": bstr .size 16, "sequence": uint, "type": "pairing.confirm", "body": pairing-confirm-body, * common-opt }
+  / { "version": [26, 10, 10], "session_id": bstr .size 16, "sequence": uint, "type": "pairing.abort", "body": pairing-abort-body, * common-opt }
+  / { "version": [26, 10, 10], "session_id": bstr .size 16, "sequence": uint, "type": "session.ready", "body": session-ready-body, * common-opt }
+  / { "version": [26, 10, 10], "session_id": bstr .size 16, "sequence": uint, "type": "session.close", "body": session-close-body, * common-opt }
+  / { "version": [26, 10, 10], "session_id": bstr .size 16, "sequence": uint, "type": "liveness.ping", "body": liveness-ping-body, * common-opt }
+  / { "version": [26, 10, 10], "session_id": bstr .size 16, "sequence": uint, "type": "liveness.pong", "body": liveness-pong-body, * common-opt }
+  / { "version": [26, 10, 10], "session_id": bstr .size 16, "sequence": uint, "type": "operation.request", "body": operation-request-body, * common-opt }
+  / { "version": [26, 10, 10], "session_id": bstr .size 16, "sequence": uint, "type": "operation.result", "body": operation-result-body, * common-opt }
+  / { "version": [26, 10, 10], "session_id": bstr .size 16, "sequence": uint, "type": "operation.result_ack", "body": operation-result-ack-body, * common-opt }
+  / { "version": [26, 10, 10], "session_id": bstr .size 16, "sequence": uint, "type": "operation.status_request", "body": operation-status-request-body, * common-opt }
+  / { "version": [26, 10, 10], "session_id": bstr .size 16, "sequence": uint, "type": "operation.status", "body": operation-status-body, * common-opt }
+  / { "version": [26, 10, 10], "session_id": bstr .size 16, "sequence": uint, "type": "operation.progress", "body": operation-progress-body, * common-opt }
+  / { "version": [26, 10, 10], "session_id": bstr .size 16, "sequence": uint, "type": "error", "body": error-body, * common-opt }
 
 common-opt = (
   ? "critical": [* tstr],           ; unrecognized critical fields abort session
@@ -820,7 +882,7 @@ pairing-hello-body = {
 }
 
 negotiated-parameters = {
-  "version": [26, 10, 9],
+  "version": [26, 10, 10],
   "suite": "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512",
   "offer_hash": bstr .size 32,
   "transport_profile": tstr,   ; transport profile of the connection (§2.2)
@@ -844,7 +906,7 @@ session-ready-body = {
 }
 
 session-parameters = {
-  "version": [26, 10, 9],
+  "version": [26, 10, 10],
   "suite": "Noise_KK_25519_ChaChaPoly_SHA512",
   "transport_profile": tstr,   ; transport profile of the connection (§2.2)
   "candidate_id": tstr,        ; its registered candidate_id (§2.2)
@@ -867,6 +929,7 @@ close-reason-val =
   / "pairing_revoked"
   / "shutdown"
   / "card_unavailable"   ; the Custodian can no longer serve the card
+  / "service_withdrawn"  ; the Custodian stopped serving every pairing (§4.5)
 
 ; 6. Liveness Challenge
 liveness-ping-body = {
@@ -965,9 +1028,9 @@ progress-event-val =
 
 ### 7.2 Field Semantics, Version Precedence, and Sequencing
 1. **Wire Version & Skew Precedence**:
-   - The envelope wire version is fixed to `[26, 10, 9]` (`[Year, Month, Day]`).
+   - The envelope wire version is fixed to `[26, 10, 10]` (`[Year, Month, Day]`).
    - If version skew is observed during handshake prologue negotiation (e.g. mismatched version in the Noise prologue), the handshake fails AEAD decryption and surfaces as a **Class 2 (Transport Loss)** failure; the link drops and stored pairings remain intact.
-   - If an authenticated envelope carrying a version other than `[26, 10, 9]` is received on an establishing or active session, the receiver MUST reject the message and terminate the session as a **Class 2** transport failure without modifying stored pairing records.
+   - If an authenticated envelope carrying a version other than `[26, 10, 10]` is received on an establishing or active session, the receiver MUST reject the message and terminate the session as a **Class 2** transport failure without modifying stored pairing records.
    - **Class 4 (Pairing Revocation)** is strictly NOT triggered by version mismatch; Class 4 is reserved exclusively for authenticated cryptographic tampering, repeat echo mismatches, or sequence manipulation by an established, paired peer.
 2. **Session Scoping (`session_id`)**:
    - For pairing-channel envelopes (`pairing.hello`, `pairing.confirm`), `session_id` MUST equal the 16-byte pairing `session_id` derived immediately from $h$ (Section 4.3).
@@ -1228,7 +1291,7 @@ The profile registry defines the operations permitted over authenticated RAPP se
 ## 10. Failure Semantics, Error Handling, and Retry Protection
 
 ### 10.1 Failure Classification
-1. **Pre-Authentication Invalid Input (Class 1)**: Malformed preamble, unknown routing token, invalid MTU, or out-of-order writes prior to Noise authentication. Action: close BLE connection immediately; zero stored state modified.
+1. **Pre-Authentication Invalid Input (Class 1)**: Malformed preamble, an unrouted or replayed routing tag, invalid MTU, or out-of-order writes prior to Noise authentication. Action: close BLE connection immediately; zero stored state modified.
 2. **Transport Loss, Bearer Disruption, and Version Skew (Class 2)**: Radio drop, ATT timeout, link termination, failed AEAD MAC verification / decryption failure on an established channel, or unexpected wire version on connect/envelope. Because the bearer is untrusted and subject to RF corruption or relay tampering, ciphertext authentication failure cannot establish authenticated peer misconduct. Action: terminate active session and BLE link immediately, zeroize ephemeral session state; active operation marked `cancelled` (if before card execution) or `ambiguous` (if journaled in-flight). Stored pairing trust records and vault keys REMAIN INTACT. Smart card operations are NEVER re-executed.
 3. **Stale-Reference Race and Semantic Rejection (Class 3)**: Decrypted operation message for an unknown or already terminal `operation_id` (e.g. duplicate request for expired operation), or unsupported algorithm/parameter. Action: respond with `error` name `"unknown_operation"` or `operation.result` status `"rejected"` with `"unsupported_parameter"`; no pairing revocation.
 4. **Authenticated Protocol Violation (Class 4)**: Verified sequence regression across an established authenticated link (where AEAD MAC is valid and sequence < expected), parameter echo mismatch in an authenticated `pairing.hello`, authenticated `pair_id` mismatch, or explicit local user deletion/revocation. Action: close session immediately, mark pairing revoked, destroy pairing keys in local storage, and require new manual pairing.
@@ -1305,7 +1368,9 @@ Semantic error handling is driven exclusively by `error_name`. The numeric `erro
 | **Evil Twin / Rogue Beacon** | Attacker broadcasts identical Service UUID. | Requester requires matching 30-bit pairing code to derive generator $G$ and verify confirmation tags; rogue beacons lacking the code cannot complete CPace or Noise handshake. |
 | **Transparent Wormhole / Relay** | Attacker relays RF traffic over WAN between distant devices. | Advisory proximity gate limits local discovery, but RSSI cannot prove physical proximity or detect bit-preserving RF tunneling (§4.4). Strict asymmetric ATT and CPace role separation structurally prevents relay loopback and reflection attacks, while explicit user consent and sovereign phone display enforce authorized operation intent at execution time (§4.4, §5.2, §11). |
 | **DoS Strike Burning** | Malicious central connects to phone to burn strikes. | Offers are open only upon explicit user trigger for 60 seconds; single-flight pre-authentication serialization limits concurrency. Fail-stop lockout imposes exponential backoff ($2^n$ seconds, up to 300 s) and alerts user with on-screen notification (§3.3.5). |
-| **Rendezvous Token Replay / Presence Probing** | Attacker sniffs static rendezvous_token and replays preamble to probe presence or induce cryptographic work. | Preamble is unauthenticated routing metadata only; knowing rendezvous_token never authenticates caller. Handshake fails at message 1 (during DH computation or payload authentication). Timing difference between unknown token and known token is an accepted residual presence oracle for static tokens; mitigated by single-flight connection serialization and reconnect rate-limiting (§4.3.6). |
+| **Passive Tracking & Linking** | Attacker records discovery records and routing preambles over time and across networks to recognise a phone or link a computer's connections. | Discovery hints rotate every 15 minutes and routing tags are fresh per connection; both are keyed by the pairing's static agreement, which never crosses the wire, so an observer can neither recompute nor correlate them (§2.2.1, §4.3, hierarchy specification §4.3). No stable pairing identifier is ever sent in clear. |
+| **Routing Replay / Presence Probing** | Attacker replays a captured routing preamble to probe presence or induce cryptographic work. | The routing tag selects a pairing but authenticates nothing. A replay is refused in `Phase::Routing` while its nonce is in the Custodian's replay memory of 256 routed sessions; an older replay reaches `Noise_KK` message 1 and fails. The residual timing difference reveals only what the captured preamble already showed and is mitigated by single-flight connection serialization and the pre-authentication limiter (§3.3). |
+| **Withdrawal Forgery & Replay** | Attacker publishes a forged `mode=withdrawn` record, or republishes a recorded one. | Withdrawal hints are keyed by the pairing's static X25519 agreement, which never crosses the wire, so they cannot be forged. A recorded record is honoured only on the instance the Requester associates with the pairing and within one minute either side of its counter; its effect is limited to withdrawing presence until the Custodian is next discovered. These bounds assume the Requester's clock is not attacker-controlled; spoofing its time source, for example unauthenticated NTP, extends the replay window, still with no effect beyond the presence drop. The same holds for discovery-hint epochs, where a replayed `hints=` value can only make a Requester dial an endpoint that then fails routing. An open session ignores discovery records and ends only on an authenticated `session.close` (§4.5). |
 
 ---
 

@@ -1,8 +1,8 @@
 # Remote Authorization Proxy Protocol (RAPP)
 ## Transport and Discovery Hierarchy Specification
 
-- **Document Version**: `26.10.9`
-- **Protocol Versions**: `26.10.9`
+- **Document Version**: `26.10.10`
+- **Protocol Versions**: `26.10.10`
 - **Status**: Normative Specification / Architecture Blueprint
 - **Change Controller**: RefineID Project
 - **Applies To**: `refineid-core`, `refineid-unix`, `refineid-windows`, `refineid-apple`, `refineid-android`
@@ -96,13 +96,13 @@ Tier 3: Local IP Stream via mDNS / DNS-SD
 
 ### 3.2 Tier 2: Bluetooth / BLE Proximity Transport (`fi.refineid.rapp.ble.v1`)
 - **Applicability**: Standard cross-platform proximity transport across supported platforms (iOS, Android, Linux/BSD, Windows, macOS).
-- **Normative Specification**: Governed normatively by RAPP v26.10.9 §2–§5.
+- **Normative Specification**: Governed normatively by RAPP v26.10.10 §2–§5.
 - **Wire Profile**: The canonical cross-platform wire profile is GATT-based `fi.refineid.rapp.ble.v1`:
   - Primary Service UUID: `7E39FD01-A6B5-4D78-9E11-37E28E9545F1`
   - Channel Characteristic UUID: `7E39FD02-A6B5-4D78-9E11-37E28E9545F1` (Requester writes via `ATT_WRITE_REQ`; Custodian indicates via `ATT_HANDLE_VALUE_IND`)
   - Bootstrap Characteristic UUID: `7E39FD03-A6B5-4D78-9E11-37E28E9545F1` (Requester reads via `ATT_READ_REQ`)
   - Framing: Mandates ATT MTU Exchange ($\ge 512$ bytes) and RAPP BLE SAR framing (6-byte header: Total Frame Length, Chunk Sequence, Flags, Reserved).
-- **Advisory Proximity Gating (RAPP v26.10.9 §4.4)**:
+- **Advisory Proximity Gating (RAPP v26.10.10 §4.4)**:
   - The Requester enforces an advisory RSSI discovery gate ($\ge -55\text{ dBm}$ filtered median over at least 3 packets, configurable down to $-85\text{ dBm}$ strictly in isolated developer testing).
   - **Threat Model & Non-Guarantee**: RSSI is strictly an **advisory discovery heuristic** and defense-in-depth barrier. It does NOT constitute a cryptographic proof of physical co-location and CANNOT defeat transparent RF wormholes, relays, or directional power amplifiers that preserve authenticated frames. Real-world protection against relay attacks is enforced at Layer 7 by explicit per-operation user authorization on the Custodian phone screen and PACE/CAN boundaries.
 - **Platform Capability Constraints & L2CAP CoC Distinction**:
@@ -120,7 +120,7 @@ Tier 3: Local IP Stream via mDNS / DNS-SD
   - Custodian runs `StreamRelayListener` on a dynamic, ephemeral TCP port (`bind(0)`).
   - Custodian advertises service type `_refineid-stream._tcp.local.` via mDNS.
   - Requester runs `StreamRelayBrowser`, receives the PTR/SRV/TXT records, and initiates an **outbound** TCP `connect()` to the phone's advertised IP and port.
-- **Wire Profile**: Governed normatively by RAPP v26.10.9 §2.2.2. Each frame is a 2-byte unsigned big-endian length followed by 1 to 65535 payload bytes. The Requester's first frame is the routing preamble `["RAPP-stream-v1", purpose, token]` (§2.2.1). After a `"pairing"` preamble the Custodian's first frame is the encoded `pairing-offer` (§4.2); after a `"session"` preamble with a known token the Requester sends `Noise_KK` message 1.
+- **Wire Profile**: Governed normatively by RAPP v26.10.10 §2.2.2. Each frame is a 2-byte unsigned big-endian length followed by 1 to 65535 payload bytes. The Requester's first frame is the routing preamble `["RAPP-stream-v1", purpose, routing]` (RAPP v26.10.10 §2.2.1). After a `"pairing"` preamble the Custodian's first frame is the encoded `pairing-offer` (§4.2); after a `"session"` preamble the Custodian routed the Requester sends `Noise_KK` message 1.
 
 ---
 
@@ -128,11 +128,10 @@ Tier 3: Local IP Stream via mDNS / DNS-SD
 
 Because mDNS discovery broadcasts on multicast UDP port 5353 (IPv4 `224.0.0.251`, IPv6 `ff02::fb`), packets are visible to all devices on the local Layer 2 broadcast domain. In compliance with IETF [RFC 8882](https://www.rfc-editor.org/rfc/rfc8882.html) (*DNS-SD Privacy and Security Requirements*) and RefineID privacy rules:
 
-### 4.1 Separation of Discovery Identifiers and Persistent Routing Tokens
-- **Persistent Reconnect Routing Token (`rendezvous_token`)**:
-  - As defined in RAPP v26.10.9 §4.3, `rendezvous_token` is a 16-byte cryptographically derived value (`first 16 bytes of SHA-512("RAPP-rendezvous-v1" || h)`), stored permanently in the local pairing trust record.
-  - **Zero Public Broadcast**: The 16-byte `rendezvous_token` **MUST NEVER** be published in mDNS PTR, SRV, or TXT records, nor broadcast in unauthenticated BLE advertising packets.
-  - The token is transmitted strictly point-to-point over the established TCP stream (or BLE Channel Characteristic) during initial connection routing in `Phase::Routing` (§5.2).
+### 4.1 No Stable Pairing Identifier on the Wire
+- **Keys from the static agreement**: Every value that names a stored pairing outside its encrypted channel -- discovery hints (§4.3), withdrawal hints (§4.3) and session routing tags -- is keyed by the pairing's static X25519 agreement under its own HKDF label (RAPP v26.10.10 §4.3). Only the pairing's two endpoints can compute or recognise these values.
+- **Fresh per connection**: The Requester's session routing preamble carries a fresh random nonce and the routing tag it keys (RAPP v26.10.10 §2.2.1), sent point-to-point over the established TCP stream or BLE Channel Characteristic in `Phase::Routing`. No routing value recurs across connections, so preambles cannot be linked to one another or to discovery records.
+- **Zero Public Broadcast of stable values**: `pair_id`, static public keys, and any other stable per-pairing value **MUST NEVER** be published in mDNS PTR, SRV, or TXT records, nor broadcast in unauthenticated BLE advertising packets.
 
 ### 4.2 Public DNS-SD Identifiers and Ephemeral Lifecycle
 - **Zero Personally Identifiable Information (PII)**:
@@ -146,7 +145,9 @@ Because mDNS discovery broadcasts on multicast UDP port 5353 (IPv4 `224.0.0.251`
     `refineid-[random_8_hex].local.` (e.g., `refineid-b3d90e15.local.`), preventing leakage of operating system hostnames or user names (e.g. `Petris-iPhone.local`).
 
 ### 4.3 DNS-SD TXT Record Formats and Discovery Modes
-The Custodian publishes two distinct discovery modes:
+TXT keys compare case-insensitively ([RFC 6763](https://www.rfc-editor.org/rfc/rfc6763.html) §6.4); a key that appears twice in any case is a repeated key and makes the record malformed. Values compare exactly, and hint lists are lowercase hexadecimal only. A record whose keys are not exactly those its mode lists is malformed. Records are parsed by `refineid-rapp`, never by platform code.
+
+The Custodian publishes three distinct discovery modes:
 
 1. **Pairing Mode (`mode=pairing`)**:
    - Active strictly during an explicit user-initiated pairing ceremony on the phone, bounded by the 60-second offer TTL.
@@ -155,7 +156,7 @@ The Custodian publishes two distinct discovery modes:
      v=1
      mode=pairing
      ```
-   - Nothing derived from the pairing code or the offer is published. The Requester obtains the offer over the connection (RAPP v26.10.9 §4.2).
+   - Nothing derived from the pairing code or the offer is published. The Requester obtains the offer over the connection (RAPP v26.10.10 §4.2).
 
 2. **Session Reconnect Mode (`mode=session`)**:
    - Active when "Allow Remote Card Reader" is enabled and the phone is ready for operational card requests.
@@ -164,16 +165,27 @@ The Custodian publishes two distinct discovery modes:
      v=1
      mode=session
      ```
-     No pairing tokens, hashes, or hints are published. Requesters on the local subnet with "Enable Remote Phone Reader" active connect to the advertised endpoint and present their 16-byte `rendezvous_token` inside the point-to-point stream in `Phase::Routing`. If the Custodian does not recognize the token, the TCP connection is immediately closed.
+     No pairing values, hashes, or hints are published. Requesters on the local subnet with "Enable Remote Phone Reader" active connect to the advertised endpoint and present a fresh session routing preamble inside the point-to-point stream in `Phase::Routing` (RAPP v26.10.10 §2.2.1). If no stored pairing keyed its tag, the TCP connection is immediately closed.
    - **Optional Rotating Discovery Hints (Multi-Device Coexistence)**:
-     To avoid trial connections in high-density enterprise environments with multiple active Custodians, the Custodian MAY publish truncated, rotating HMAC hints for up to 4 stored pairings:
+     To avoid trial connections in high-density enterprise environments with multiple active Custodians, the Custodian MAY publish truncated, rotating HMAC hints for the 4 most recently used stored pairings (use time and tie order as for withdrawn records, RAPP v26.10.10 §4.5):
      $$\text{hint}_i = \text{first 8 bytes of }\text{HMAC-SHA-256}(K_{\text{disc}, i}, \text{epoch\_be64})$$
      where:
-     - $K_{\text{disc}, i}$ = HKDF-Expand-SHA-256 ([RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html) §2.3) with $\text{PRK} = \text{rendezvous\_token}_i$ (16 bytes), $\text{info} = $ `"RAPP-discovery-hint-v1"` (ASCII), and $L = 32$; with $L$ equal to the hash length this is the single block $\text{HMAC-SHA-256}(\text{rendezvous\_token}_i, \text{info} \parallel \texttt{0x01})$. No HKDF-Extract step is applied.
+     - $K_{\text{disc}, i}$ = HKDF-SHA-256 ([RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html)) with salt $\text{pair\_id}_i$, input keying material the pairing's static X25519 agreement, $\text{info} = $ `"RAPP-discovery-hint-v2"` (ASCII), and $L = 32$ (RAPP v26.10.10 §4.3).
      - $\text{epoch} = \lfloor \text{unix\_time} / 900 \rfloor$ (15-minute rotation window), and $\text{epoch\_be64}$ is that value as an unsigned 64-bit big-endian integer (8 bytes), the entire HMAC message.
-     - TXT Attribute: `hints=` followed by at most 4 hints, each 16 lowercase hexadecimal digits, separated by commas without spaces (e.g. `hints=96b4d41e75873658,aed3f5d7b0cf0a7c`).
-     - The `discovery_hint` vectors of `vectors/rapp-v26.10.9.json` pin the bytes.
-     Requesters evaluate candidate hints for the current and adjacent epoch ($\text{epoch} \pm 1$) against their stored pairings before initiating TCP connections.
+     - TXT Attribute: `hints=` followed by at most 4 hints, each 16 lowercase hexadecimal digits, separated by commas without spaces (e.g. `hints=054526c9fdd3b180`).
+     - The `discovery_hint` vectors of `vectors/rapp-routing-v26.10.10.json` pin the bytes.
+     Requesters evaluate candidate hints for the current and adjacent epoch ($\text{epoch} \pm 1$) against their stored pairings before initiating TCP connections; the window tolerates a clock difference of at least 15 minutes and up to just under 30 minutes, and implementations MUST NOT widen it. A record with `hints` holds 1 to 4 entries; an empty `hints` value is malformed. The `discovery_record` and `announcement_selection` vectors of `vectors/rapp-routing-v26.10.10.json` pin parsing and selection.
+
+3. **Withdrawn Mode (`mode=withdrawn`)**:
+   - Published for 2 to 10 seconds on the current service instance after the user turns remote access off or quits the application, once open sessions are closed and connections are no longer accepted; the service is then unregistered (RAPP v26.10.10 §4.5).
+   - TXT Attributes, and no others:
+     ```text
+     v=1
+     mode=withdrawn
+     withdrawn=<entry_1>,<entry_2>,...,<entry_8>
+     ```
+   - Exactly 8 entries of 16 lowercase hexadecimal digits, separated by commas without spaces: the withdrawal hints of the 8 most recently used stored pairings, the rest random fillers, all in random order. A withdrawal hint is keyed by the pairing's static X25519 agreement and bound to the instance portion of the service instance name and a one-minute counter.
+   - A Requester honours the record only on the instance it associates with the pairing and only while it holds no open session to it; it then withdraws the Custodian's presence at once and does not dial until it discovers `mode=session` again. Anything else is unannounced loss under the Requester's own hold.
 
 ---
 

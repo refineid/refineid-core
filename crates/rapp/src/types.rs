@@ -15,11 +15,11 @@
 use core::fmt;
 use zeroize::ZeroizeOnDrop;
 
-/// RAPP v26.10.9 wire version triple [Year, Month, Day].
-pub const WIRE_VERSION_V26_10_9: (u16, u16, u16) = (26, 10, 9);
+/// RAPP v26.10.10 wire version triple [Year, Month, Day].
+pub const WIRE_VERSION_V26_10_10: (u16, u16, u16) = (26, 10, 10);
 /// Mandatory RAPP pairing Noise suite.
 pub const MANDATORY_PAIRING_SUITE: &str = "Noise_XXpsk3_25519_ChaChaPoly_SHA512";
-/// Mandatory RAPP session Noise suite (RAPP v26.10.9 section 6.3).
+/// Mandatory RAPP session Noise suite (RAPP v26.10.10 section 6.3).
 pub const MANDATORY_SESSION_SUITE: &str = "Noise_KK_25519_ChaChaPoly_SHA512";
 /// Byte length of an X25519 public or private key.
 pub const X25519_KEY_SIZE: usize = 32;
@@ -31,7 +31,7 @@ pub const MAX_FRAME_SIZE: usize = 65_535;
 pub const MAX_FRAME_PLAINTEXT: usize = 65_519;
 /// Maximum simultaneously active operations at an authorization proxy.
 pub const MAX_ACTIVE_OPERATIONS: usize = 1;
-/// Pairing-offer lifetime in milliseconds (RAPP v26.10.9 §3.3, §4.2).
+/// Pairing-offer lifetime in milliseconds (RAPP v26.10.10 §3.3, §4.2).
 pub const OFFER_TTL_MS: u64 = 60_000;
 /// Minimum retry count on the credential that a command can decrement.
 pub const MINIMUM_REMAINING_ATTEMPTS: u8 = 3;
@@ -44,8 +44,6 @@ pub const OFFER_ID_SIZE: usize = 32;
 pub const PAIR_ID_SIZE: usize = 16;
 /// Byte length of a session identifier.
 pub const SESSION_ID_SIZE: usize = 16;
-/// Byte length of a pair-specific transport rendezvous token.
-pub const RENDEZVOUS_TOKEN_SIZE: usize = 16;
 /// Byte length of an operation identifier.
 pub const OPERATION_ID_SIZE: usize = 16;
 /// Byte length of a request hash.
@@ -138,11 +136,6 @@ public_identifier!(
     SessionId,
     SESSION_ID_SIZE,
     "Derived identifier for one secure channel."
-);
-public_identifier!(
-    RendezvousToken,
-    RENDEZVOUS_TOKEN_SIZE,
-    "Derived pair-specific rendezvous value for transports that must name a pairing on the wire without exposing its identifier."
 );
 public_identifier!(
     OperationId,
@@ -282,6 +275,8 @@ pub enum CloseReason {
     Shutdown,
     /// The custodian can no longer serve the card.
     CardUnavailable,
+    /// The custodian deliberately stopped serving every pairing.
+    ServiceWithdrawn,
 }
 
 /// Total unexpected-input classification.

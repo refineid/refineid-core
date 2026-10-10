@@ -24,9 +24,8 @@ use super::{
     BinaryFrame, CPACE_KC2_SUITE, Envelope, FrameError, GRANTS_HASH_SIZE, GrantsHash,
     MANDATORY_PAIRING_SUITE, MANDATORY_SESSION_SUITE, MAX_FRAME_PLAINTEXT, MAX_FRAME_SIZE,
     MessageType, NOISE_TAG_SIZE, OperationId, PAIR_ID_SIZE, PairId, PairingSecret, ProfileName,
-    RENDEZVOUS_TOKEN_SIZE, REQUEST_HASH_SIZE, RendezvousToken, RequestHash, SESSION_ID_SIZE,
-    SequenceGuard, SessionId, WIRE_VERSION_V26_10_9, WireError, WireValue, X25519_KEY_SIZE,
-    encode_deterministic_cbor,
+    REQUEST_HASH_SIZE, RequestHash, SESSION_ID_SIZE, SequenceGuard, SessionId,
+    WIRE_VERSION_V26_10_10, WireError, WireValue, X25519_KEY_SIZE, encode_deterministic_cbor,
     noise::{KkHandshakeState, NoiseTransport},
 };
 
@@ -160,8 +159,6 @@ pub struct HandshakeCompletion {
     pub session_id: SessionId,
     /// Pairing-only identifier derived from the transcript.
     pub pair_id: Option<PairId>,
-    /// Pairing-only transport rendezvous token derived from the transcript.
-    pub rendezvous_token: Option<RendezvousToken>,
     /// Authenticated remote pair-specific static key.
     pub remote_static_key: [u8; X25519_KEY_SIZE],
 }
@@ -358,9 +355,6 @@ impl HandshakeChannel {
                 let pair_id = self
                     .derive_pair
                     .then(|| derive_pair_id(state.get_handshake_hash()));
-                let rendezvous_token = self
-                    .derive_pair
-                    .then(|| derive_rendezvous_token(state.get_handshake_hash()));
                 let remote_static: [u8; X25519_KEY_SIZE] = state
                     .get_remote_static()
                     .ok_or(CryptoError::MissingRemoteStatic)?
@@ -376,7 +370,6 @@ impl HandshakeChannel {
                     },
                     session_id,
                     pair_id,
-                    rendezvous_token,
                     remote_static_key: remote_static,
                 })
             }
@@ -392,7 +385,6 @@ impl HandshakeChannel {
                     },
                     session_id,
                     pair_id: None,
-                    rendezvous_token: None,
                     remote_static_key: remote_static,
                 })
             }
@@ -502,20 +494,6 @@ pub fn derive_pair_id(handshake_hash: &[u8]) -> PairId {
     PairId::from_array(bytes)
 }
 
-/// Derive the pair-specific transport rendezvous token from a completed
-/// pairing transcript. Wire-safe by construction: computationally unlinkable
-/// to `pair_id` without the handshake hash.
-#[must_use]
-pub fn derive_rendezvous_token(handshake_hash: &[u8]) -> RendezvousToken {
-    let mut bytes = [0_u8; RENDEZVOUS_TOKEN_SIZE];
-    let digest = Sha512::new()
-        .chain_update(b"RAPP-rendezvous-v1")
-        .chain_update(handshake_hash)
-        .finalize();
-    bytes.copy_from_slice(&digest[..RENDEZVOUS_TOKEN_SIZE]);
-    RendezvousToken::from_array(bytes)
-}
-
 /// Hash the lexicographically sorted granted-profile registry names.
 ///
 /// # Errors
@@ -540,7 +518,7 @@ pub fn compute_grants_hash(profiles: &[ProfileName]) -> Result<GrantsHash, Crypt
     Ok(GrantsHash::from_array(bytes))
 }
 
-/// Bind the exact typed operation request to its pairing (RAPP v26.10.9
+/// Bind the exact typed operation request to its pairing (RAPP v26.10.10
 /// section 8.2.1).
 ///
 /// The commitment is session-independent, so an identical request
@@ -621,9 +599,9 @@ fn session_prologue(
 
 fn version_value() -> WireValue {
     WireValue::Array(vec![
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_9.0)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_9.1)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_9.2)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_10.0)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_10.1)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_10.2)),
     ])
 }
 
@@ -783,7 +761,7 @@ mod tests {
         );
     }
 
-    /// RAPP v26.10.9 §4.3:276: Deterministic CBOR of the pairing prologue is exactly 151 bytes.
+    /// RAPP v26.10.10 §4.3:276: Deterministic CBOR of the pairing prologue is exactly 151 bytes.
     #[test]
     fn pairing_prologue_matches_normative_151_byte_length() {
         const NORMATIVE_PAIRING_PROLOGUE_LENGTH: usize = 151;

@@ -89,9 +89,9 @@ Pairing must be effortless for humans while cryptographically impenetrable to ne
 RefineID prioritizes clean, accessible **6-character Crockford Base32 pairing codes** (formatted as three 2-character groups: `7K X4 M9`) entered manually. QR codes are treated as optional shortcuts, never mandatory dependencies.
 
 ### 5.2 Elimination of Relay Brute-Force via PAKE
-- The code carries 30 bits of entropy ($2^{30} \approx 1.07 \times 10^9$ codes, RAPP v26.10.9 §3.3). Plain hashing of the code (`SHA256(code)`) over an untrusted relay is still vulnerable to offline dictionary attacks: a single GPU exhausts $2^{30}$ SHA-256 guesses in well under a second.
+- The code carries 30 bits of entropy ($2^{30} \approx 1.07 \times 10^9$ codes, RAPP v26.10.10 §3.3). Plain hashing of the code (`SHA256(code)`) over an untrusted relay is still vulnerable to offline dictionary attacks: a single GPU exhausts $2^{30}$ SHA-256 guesses in well under a second.
 - RAPP adopts **CPace (draft-irtf-cfrg-cpace-21, cipher suite `CPACE-RISTR255-SHA512`)** over Ristretto255 for the 6-character pairing code.
-- **The PAKE Guarantee:** Mathematical immunity to offline dictionary attacks. The untrusted relay sees only uniform, random curve points. The relay learns zero bits of the code and cannot test guesses offline. An attacker can only test guesses through live, online attempts: at most 3 per offer, within a 60-second monotonic offer lifetime (RAPP v26.10.9 §3.3), for a success probability of at most $3 / 2^{30}$ per offer.
+- **The PAKE Guarantee:** Mathematical immunity to offline dictionary attacks. The untrusted relay sees only uniform, random curve points. The relay learns zero bits of the code and cannot test guesses offline. An attacker can only test guesses through live, online attempts: at most 3 per offer, within a 60-second monotonic offer lifetime (RAPP v26.10.10 §3.3), for a success probability of at most $3 / 2^{30}$ per offer.
 
 ### 5.3 Closing Local Network Backdoors
 Pairing is an explicit, mutually authenticated ceremony. Direct unauthenticated LAN/mDNS record exchanges that automatically inject paired keys without user consent or pairing codes are prohibited.

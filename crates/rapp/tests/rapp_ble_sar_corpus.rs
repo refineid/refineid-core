@@ -1,13 +1,13 @@
 // Copyright 2026 Petri Koistinen
 // Licensed under the Apache License, Version 2.0.
 
-//! Byte-exact replay of the RAPP v26.10.9 §5.3 BLE SAR corpus, generated
+//! Byte-exact replay of the RAPP v26.10.10 §5.3 BLE SAR corpus, generated
 //! independently of this crate.
 
 use refineid_rapp::ble_sar::{BleSarError, BleSarReassembler, payload_capacity, segment};
 use serde::Deserialize;
 
-const CORPUS: &str = include_str!("../../../docs/protocols/vectors/rapp-ble-sar-v26.10.9.json");
+const CORPUS: &str = include_str!("../../../docs/protocols/vectors/rapp-ble-sar-v26.10.10.json");
 
 #[derive(Deserialize)]
 struct Corpus {
@@ -87,7 +87,7 @@ fn error_name(error: BleSarError) -> &'static str {
 fn corpus_names_this_profile() {
     let corpus = corpus();
     assert_eq!(corpus.format, "fi.refineid.rapp.ble-sar-vectors-v1");
-    assert_eq!(corpus.protocol_document_version, "26.10.9");
+    assert_eq!(corpus.protocol_document_version, "26.10.10");
     assert_eq!(
         corpus.header_size,
         refineid_rapp::ble_sar::BLE_SAR_HEADER_SIZE

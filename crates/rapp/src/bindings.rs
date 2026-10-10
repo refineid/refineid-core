@@ -30,9 +30,9 @@ use super::{
     POST_PAKE_CONFIRMATION_MS, POST_PAKE_HANDSHAKE_MS, PairId, PairKeyMaterial, PairRecord,
     PairStore, PairStoreError, PairTombstone, PairingBackoff, PairingConfirmation, PairingError,
     PairingHandshake, PairingOffer, PairingOfferDeadline, PairingSecret,
-    PreAuthenticationRateLimit, ProfileName, RendezvousToken, STREAM_PROFILE,
-    SessionAuthentication, SessionHandshake, SessionId, StreamRendezvous, TransportProfile,
-    WireValue, encode_kc2_step1_frame, generate_pair_key_material, phase_deadline_ms,
+    PreAuthenticationRateLimit, ProfileName, RoutingPreamble, STREAM_PROFILE,
+    SessionAuthentication, SessionHandshake, SessionId, TransportProfile, WireValue,
+    encode_kc2_step1_frame, generate_pair_key_material, phase_deadline_ms,
     standard_pairing_context_v2,
 };
 
@@ -120,8 +120,6 @@ pub struct RappPairMetadata {
     pub role: RappEndpointRole,
     /// Exact mutually confirmed profile registry names.
     pub profiles: Vec<String>,
-    /// Pair-specific transport rendezvous token bytes.
-    pub rendezvous_token: Vec<u8>,
     /// Pair-record creation time supplied by the platform wall clock.
     pub created_at_ms: u64,
 }
@@ -149,10 +147,10 @@ pub enum RappBindingError {
     /// Referenced operation was not found in the active session.
     UnknownOperation,
     /// Three pairing attempts failed against one offer; the offer is
-    /// destroyed (RAPP v26.10.9 §3.3).
+    /// destroyed (RAPP v26.10.10 §3.3).
     AttemptsExhausted,
     /// A pre-authentication attempt came within 500 ms of the previous one
-    /// (RAPP v26.10.9 §3.3.8); the caller refuses it and changes nothing.
+    /// (RAPP v26.10.10 §3.3.8); the caller refuses it and changes nothing.
     RateLimited,
 }
 
@@ -308,7 +306,7 @@ pub struct RappPairingBridge {
 
 #[uniffi::export]
 impl RappPairingBridge {
-    /// Create the custodian's offer (RAPP v26.10.9 §4.2) from a fresh
+    /// Create the custodian's offer (RAPP v26.10.10 §4.2) from a fresh
     /// platform-CSPRNG `offer_id`, the offered credential profiles, and the
     /// transport profiles the offer is served on.
     ///
@@ -338,7 +336,7 @@ impl RappPairingBridge {
     }
 
     /// Accept the offer bootstrap the requester received over the
-    /// transport `transport_profile` (RAPP v26.10.9 §4.2): the Bootstrap
+    /// transport `transport_profile` (RAPP v26.10.10 §4.2): the Bootstrap
     /// Characteristic value on BLE, or the custodian's first frame after the
     /// pairing preamble on the stream transport.
     ///
@@ -1280,7 +1278,7 @@ impl RappPairingBridge {
 }
 
 /// The CPace context of `offer` for the connection whose offer entry has
-/// `candidate_id` (RAPP v26.10.9 §6.1.1).
+/// `candidate_id` (RAPP v26.10.10 §6.1.1).
 fn pairing_context(
     offer: &PairingOffer,
     offer_hash: &[u8; 32],
@@ -1295,31 +1293,6 @@ fn pairing_context(
     };
     standard_pairing_context_v2(offer_hash, &entry.profile, &entry.candidate_id)
         .map_err(|_| RappBindingError::ProtocolFailure)
-}
-
-#[cfg(test)]
-mod discovery_hint_tests {
-    use super::{RappBindingError, rapp_discovery_hint};
-
-    /// Seconds into the window the corpus vector names, so the export
-    /// must divide by the window length rather than take an epoch.
-    const SECONDS_INTO_WINDOW: u64 = 899;
-
-    #[test]
-    fn export_matches_the_corpus_window_from_wall_time() {
-        let token = hex::decode("5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a").expect("token hex");
-        let epoch_start = 1_990_560 * crate::DISCOVERY_HINT_EPOCH_SECONDS;
-        let hint = rapp_discovery_hint(token, epoch_start + SECONDS_INTO_WINDOW).expect("hint");
-        assert_eq!(hex::encode(hint), "96b4d41e75873658");
-    }
-
-    #[test]
-    fn wrong_size_token_is_refused() {
-        assert!(matches!(
-            rapp_discovery_hint(vec![0; 15], 0),
-            Err(RappBindingError::InvalidInput)
-        ));
-    }
 }
 
 #[cfg(test)]
@@ -1806,7 +1779,7 @@ mod pairing_bridge_tests {
 }
 
 /// The custodian's process-wide backoff after locked-out offers
-/// (RAPP v26.10.9 §3.3.7), driven by platform monotonic milliseconds.
+/// (RAPP v26.10.10 §3.3.7), driven by platform monotonic milliseconds.
 #[derive(Debug, Default, uniffi::Object)]
 pub struct RappPairingBackoff {
     backoff: Mutex<PairingBackoff>,
@@ -1935,6 +1908,135 @@ impl RappPairRecord {
         Ok(Arc::new(Self {
             record: Mutex::new(Some(record)),
         }))
+    }
+
+    /// A fresh `"session"` routing preamble for one dial on the transport
+    /// profile `profile_name`: a new random nonce and the routing tag this
+    /// pairing keys from it (RAPP section 2.2.1).
+    ///
+    /// # Errors
+    /// [`RappBindingError::InvalidInput`] on an unregistered profile name or
+    /// a degenerate static agreement, [`RappBindingError::WrongPhase`] when
+    /// the record was revoked, and [`RappBindingError::LocalStateFailure`]
+    /// when the random source fails.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "uniffi lowers exported arguments as owned values"
+    )]
+    pub fn session_preamble(&self, profile_name: String) -> Result<Vec<u8>, RappBindingError> {
+        let profile = transport_profile(&profile_name)?;
+        let routing = self
+            .routing_key()?
+            .route(profile, |bytes| {
+                getrandom::fill(bytes).map_err(|_| super::RandomUnavailable)
+            })
+            .map_err(|_| RappBindingError::LocalStateFailure)?;
+        RoutingPreamble::Session(routing)
+            .encode(profile)
+            .map_err(|_| RappBindingError::ProtocolFailure)
+    }
+
+    /// This pairing's discovery hint for the 15-minute window containing
+    /// `unix_time_seconds` (hierarchy specification section 4.3).
+    ///
+    /// # Errors
+    /// [`RappBindingError::InvalidInput`] on a degenerate static agreement,
+    /// and [`RappBindingError::WrongPhase`] when the record was revoked.
+    pub fn discovery_hint(&self, unix_time_seconds: u64) -> Result<Vec<u8>, RappBindingError> {
+        Ok(self
+            .discovery_key()?
+            .hint(super::discovery_epoch(unix_time_seconds))
+            .to_vec())
+    }
+
+    /// Whether the TXT attributes `txt` form a `mode=session` record that
+    /// carries this pairing's discovery hint for the window containing
+    /// `unix_time_seconds` or an adjacent one. A malformed record is `false`.
+    ///
+    /// # Errors
+    /// [`RappBindingError::InvalidInput`] on a degenerate static agreement,
+    /// and [`RappBindingError::WrongPhase`] when the record was revoked.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "uniffi lowers exported arguments as owned values"
+    )]
+    pub fn matches_discovery_record(
+        &self,
+        txt: Vec<RappTxtEntry>,
+        unix_time_seconds: u64,
+    ) -> Result<bool, RappBindingError> {
+        let pairs: Vec<(&str, &str)> = txt
+            .iter()
+            .map(|entry| (entry.key.as_str(), entry.value.as_str()))
+            .collect();
+        let Ok(record) = super::DiscoveryRecord::parse(&pairs) else {
+            return Ok(false);
+        };
+        Ok(self
+            .discovery_key()?
+            .matches_record(&record, super::discovery_epoch(unix_time_seconds)))
+    }
+
+    /// This pairing's withdrawal hint for the advertised service instance
+    /// `instance_name` in the minute containing `unix_time_seconds`
+    /// (RAPP section 4.5).
+    ///
+    /// # Errors
+    /// [`RappBindingError::InvalidInput`] on an instance name that is not the
+    /// instance portion of the published name, or a degenerate static
+    /// agreement, and
+    /// [`RappBindingError::WrongPhase`] when the record was revoked.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "uniffi lowers exported arguments as owned values"
+    )]
+    pub fn withdrawal_hint(
+        &self,
+        instance_name: String,
+        unix_time_seconds: u64,
+    ) -> Result<Vec<u8>, RappBindingError> {
+        let instance =
+            super::InstanceName::new(&instance_name).map_err(|_| RappBindingError::InvalidInput)?;
+        let key = self.withdrawal_key()?;
+        Ok(key
+            .hint(&instance, super::withdrawal_counter(unix_time_seconds))
+            .to_vec())
+    }
+
+    /// Whether the TXT attributes `txt` discovered on the service instance
+    /// `instance_name` form a withdrawn record carrying this pairing's hint
+    /// for the minute containing `unix_time_seconds` or an adjacent one
+    /// (RAPP section 4.5). A malformed record or instance name is `false`.
+    ///
+    /// # Errors
+    /// [`RappBindingError::InvalidInput`] on a degenerate static agreement,
+    /// and [`RappBindingError::WrongPhase`] when the record was revoked.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "uniffi lowers exported arguments as owned values"
+    )]
+    pub fn matches_withdrawn_record(
+        &self,
+        instance_name: String,
+        txt: Vec<RappTxtEntry>,
+        unix_time_seconds: u64,
+    ) -> Result<bool, RappBindingError> {
+        let Ok(instance) = super::InstanceName::new(&instance_name) else {
+            return Ok(false);
+        };
+        let pairs: Vec<(&str, &str)> = txt
+            .iter()
+            .map(|entry| (entry.key.as_str(), entry.value.as_str()))
+            .collect();
+        let Ok(record) = super::WithdrawnRecord::parse(&pairs) else {
+            return Ok(false);
+        };
+        let key = self.withdrawal_key()?;
+        Ok(key.matches(
+            &record,
+            &instance,
+            super::withdrawal_counter(unix_time_seconds),
+        ))
     }
 
     /// Read non-secret metadata suitable for confirmation and connection UI.
@@ -2466,36 +2568,27 @@ fn pair_metadata(record: &PairRecord) -> RappPairMetadata {
             .iter()
             .map(|profile| profile.as_str().to_owned())
             .collect(),
-        rendezvous_token: record.rendezvous_token().as_bytes().to_vec(),
         created_at_ms: record.created_at_ms(),
     }
 }
 
-/// Preamble frame payload the dialing proxy sends to reach the listener's
-/// active pairing offer on the stream profile.
-#[uniffi::export]
-#[must_use]
-pub fn rapp_stream_pairing_preamble() -> Vec<u8> {
-    StreamRendezvous::Pairing.encode().unwrap_or_default()
+fn transport_profile(name: &str) -> Result<TransportProfile, RappBindingError> {
+    TransportProfile::parse(name).ok_or(RappBindingError::InvalidInput)
 }
 
-/// Preamble frame payload the dialing proxy sends to open a fresh session
-/// for the stored pairing this rendezvous token names.
+/// Preamble frame payload the dialing proxy sends to reach the custodian's
+/// active pairing offer on the transport profile `profile_name`.
 ///
 /// # Errors
-/// [`RappBindingError`] on a wrong-size token or an encoding failure.
+/// [`RappBindingError::InvalidInput`] on an unregistered profile name.
 #[uniffi::export]
 #[allow(
     clippy::needless_pass_by_value,
     reason = "uniffi lowers exported arguments as owned values"
 )]
-pub fn rapp_stream_session_preamble(
-    rendezvous_token: Vec<u8>,
-) -> Result<Vec<u8>, RappBindingError> {
-    let token = RendezvousToken::reconstruct(&rendezvous_token)
-        .map_err(|_| RappBindingError::InvalidInput)?;
-    StreamRendezvous::Session(token)
-        .encode()
+pub fn rapp_pairing_preamble(profile_name: String) -> Result<Vec<u8>, RappBindingError> {
+    RoutingPreamble::Pairing
+        .encode(transport_profile(&profile_name)?)
         .map_err(|_| RappBindingError::ProtocolFailure)
 }
 
@@ -2506,30 +2599,206 @@ pub fn rapp_stream_profile_name() -> String {
     STREAM_PROFILE.to_owned()
 }
 
-/// Rotating discovery hint of one stored pairing for the 15-minute window
-/// containing `unix_time_seconds` (hierarchy specification section 4.3).
-///
-/// A custodian publishes the hints of the current window; a requester
-/// compares its own pairings against the current and adjacent windows.
+/// Where a custodian sends one received routing preamble.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+pub enum RappRoute {
+    /// Serve the active pairing offer.
+    Pairing,
+    /// Open a session for the stored pairing at `index` in the list given.
+    Session {
+        /// Position of the matching pair record.
+        index: u32,
+    },
+    /// Close the connection without answering and change no stored state.
+    Refuse,
+}
+
+/// A custodian's router for received routing preambles (RAPP section
+/// 2.2.1). It remembers the nonces of recently routed sessions, so one
+/// router serves every connection the custodian accepts.
+#[derive(Debug, Default, uniffi::Object)]
+pub struct RappSessionRouter {
+    replay: Mutex<super::RoutingReplayCache>,
+}
+
+#[uniffi::export]
+impl RappSessionRouter {
+    /// A router that has routed nothing yet.
+    #[uniffi::constructor]
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Routes the preamble `preamble` received on the transport profile
+    /// `profile_name` against the custodian's non-revoked pair records.
+    ///
+    /// A malformed preamble, a routing value no record keyed, a replayed
+    /// nonce, and an unregistered profile name are all
+    /// [`RappRoute::Refuse`].
+    ///
+    /// # Errors
+    /// [`RappBindingError::LocalStateFailure`] when the replay memory is
+    /// unavailable.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "uniffi lowers exported arguments as owned values"
+    )]
+    pub fn route(
+        &self,
+        profile_name: String,
+        preamble: Vec<u8>,
+        records: Vec<Arc<RappPairRecord>>,
+    ) -> Result<RappRoute, RappBindingError> {
+        let Ok(profile) = transport_profile(&profile_name) else {
+            return Ok(RappRoute::Refuse);
+        };
+        let routing = match RoutingPreamble::decode(profile, &preamble) {
+            Ok(RoutingPreamble::Pairing) => return Ok(RappRoute::Pairing),
+            Ok(RoutingPreamble::Session(routing)) => routing,
+            Err(_) => return Ok(RappRoute::Refuse),
+        };
+        let keys = records
+            .iter()
+            .map(|record| record.routing_key())
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some(index) = super::route_session(&keys, profile, &routing) else {
+            return Ok(RappRoute::Refuse);
+        };
+        let fresh = self
+            .replay
+            .lock()
+            .map_err(|_| RappBindingError::LocalStateFailure)?
+            .admit(routing.nonce());
+        if !fresh {
+            return Ok(RappRoute::Refuse);
+        }
+        Ok(RappRoute::Session {
+            index: u32::try_from(index).map_err(|_| RappBindingError::InvalidInput)?,
+        })
+    }
+}
+
+impl RappPairRecord {
+    fn with_record<T>(
+        &self,
+        use_record: impl FnOnce(&PairRecord) -> Result<T, RappBindingError>,
+    ) -> Result<T, RappBindingError> {
+        let guard = self
+            .record
+            .lock()
+            .map_err(|_| RappBindingError::LocalStateFailure)?;
+        let record = guard.as_ref().ok_or(RappBindingError::WrongPhase)?;
+        let value = use_record(record);
+        drop(guard);
+        value
+    }
+
+    fn routing_key(&self) -> Result<super::RoutingKey, RappBindingError> {
+        self.with_record(|record| {
+            super::RoutingKey::derive(record).map_err(|_| RappBindingError::InvalidInput)
+        })
+    }
+
+    fn discovery_key(&self) -> Result<super::DiscoveryKey, RappBindingError> {
+        self.with_record(|record| {
+            super::DiscoveryKey::derive(record).map_err(|_| RappBindingError::InvalidInput)
+        })
+    }
+
+    fn withdrawal_key(&self) -> Result<super::WithdrawalKey, RappBindingError> {
+        self.with_record(|record| {
+            super::WithdrawalKey::derive(record).map_err(|_| RappBindingError::InvalidInput)
+        })
+    }
+}
+
+/// One DNS-SD TXT attribute, key and value.
+#[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
+pub struct RappTxtEntry {
+    /// Attribute key.
+    pub key: String,
+    /// Attribute value.
+    pub value: String,
+}
+
+/// One stored pairing a custodian could announce: its hint for the record
+/// being published and the time of its most recent established session, or
+/// of its creation when it has had none.
+#[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
+pub struct RappAnnouncementCandidate {
+    /// The pairing's discovery or withdrawal hint.
+    pub hint: Vec<u8>,
+    /// Milliseconds since the Unix epoch of the pairing's last use.
+    pub last_used_ms: u64,
+}
+
+fn announcement_candidates(
+    candidates: &[RappAnnouncementCandidate],
+) -> Result<Vec<super::AnnouncementCandidate>, RappBindingError> {
+    candidates
+        .iter()
+        .map(|candidate| {
+            Ok(super::AnnouncementCandidate {
+                hint: <[u8; super::DISCOVERY_HINT_SIZE]>::try_from(candidate.hint.as_slice())
+                    .map_err(|_| RappBindingError::InvalidInput)?,
+                last_used_ms: candidate.last_used_ms,
+            })
+        })
+        .collect()
+}
+
+fn txt_entries(entries: impl IntoIterator<Item = (&'static str, String)>) -> Vec<RappTxtEntry> {
+    entries
+        .into_iter()
+        .map(|(key, value)| RappTxtEntry {
+            key: key.to_owned(),
+            value,
+        })
+        .collect()
+}
+
+/// The TXT attributes of a `mode=session` record announcing the discovery
+/// hints of the four most recently used `candidates` (hierarchy
+/// specification section 4.3). No candidates give the minimal record.
 ///
 /// # Errors
-/// [`RappBindingError::InvalidInput`] on a wrong-size token.
+/// [`RappBindingError::InvalidInput`] for a hint of the wrong size.
 #[uniffi::export]
 #[allow(
     clippy::needless_pass_by_value,
     reason = "uniffi lowers exported arguments as owned values"
 )]
-pub fn rapp_discovery_hint(
-    rendezvous_token: Vec<u8>,
-    unix_time_seconds: u64,
-) -> Result<Vec<u8>, RappBindingError> {
-    let token = RendezvousToken::reconstruct(&rendezvous_token)
-        .map_err(|_| RappBindingError::InvalidInput)?;
-    Ok(super::discovery_hint(
-        &token,
-        unix_time_seconds / super::DISCOVERY_HINT_EPOCH_SECONDS,
-    )
-    .to_vec())
+pub fn rapp_session_record(
+    candidates: Vec<RappAnnouncementCandidate>,
+) -> Result<Vec<RappTxtEntry>, RappBindingError> {
+    let candidates = announcement_candidates(&candidates)?;
+    Ok(txt_entries(
+        super::DiscoveryRecord::assemble(&candidates).txt_entries(),
+    ))
+}
+
+/// The TXT attributes of a `mode=withdrawn` record announcing the
+/// withdrawal hints of the eight most recently used `candidates`, padded to
+/// eight entries with random fillers and shuffled (RAPP section 4.5).
+///
+/// # Errors
+/// [`RappBindingError::InvalidInput`] for a hint of the wrong size, and
+/// [`RappBindingError::LocalStateFailure`] when the random source fails.
+#[uniffi::export]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "uniffi lowers exported arguments as owned values"
+)]
+pub fn rapp_withdrawn_record(
+    candidates: Vec<RappAnnouncementCandidate>,
+) -> Result<Vec<RappTxtEntry>, RappBindingError> {
+    let candidates = announcement_candidates(&candidates)?;
+    let record = super::WithdrawnRecord::assemble(&candidates, |bytes| {
+        getrandom::fill(bytes).map_err(|_| super::WithdrawalError::RandomUnavailable)
+    })
+    .map_err(|_| RappBindingError::LocalStateFailure)?;
+    Ok(txt_entries(record.txt_entries()))
 }
 
 fn encode_pair_record(record: &PairRecord) -> Result<Vec<u8>, RappBindingError> {
@@ -2578,7 +2847,7 @@ pub(super) fn take_unsigned(
 }
 
 /// The BLE segmentation and reassembly receiver for one connection and one
-/// direction (RAPP v26.10.9 §5.3).
+/// direction (RAPP v26.10.10 §5.3).
 ///
 /// Any refused fragment zeroizes the partial frame; the caller then drops
 /// the connection.
@@ -2647,7 +2916,7 @@ impl RappBleSarReassembler {
 }
 
 /// The uniform SAR fragment payload capacity for a negotiated ATT MTU and
-/// any smaller value limit the platform reports (RAPP v26.10.9 §5.3).
+/// any smaller value limit the platform reports (RAPP v26.10.10 §5.3).
 ///
 /// # Errors
 /// [`RappBindingError::InvalidInput`] below an MTU of 512 or when the limit
@@ -2683,4 +2952,164 @@ pub fn rapp_ble_sar_segment(
 ) -> Result<Vec<Vec<u8>>, RappBindingError> {
     let capacity = usize::try_from(capacity).map_err(|_| RappBindingError::InvalidInput)?;
     crate::ble_sar::segment(&message, capacity).map_err(|_| RappBindingError::InvalidInput)
+}
+
+#[cfg(test)]
+mod routing_binding_tests {
+    use super::{
+        RappAnnouncementCandidate, RappPairRecord, RappRoute, RappSessionRouter,
+        rapp_pairing_preamble, rapp_session_record, rapp_withdrawn_record,
+    };
+    use crate::{
+        BLE_PROFILE, EndpointRole, GrantsHash, PAIR_ID_SIZE, PairId, PairRecord, ProfileName,
+        STREAM_PROFILE, X25519_KEY_SIZE, noise::x25519_public_key,
+    };
+    use std::sync::{Arc, Mutex};
+
+    const CUSTODIAN_BYTE: u8 = 0x11;
+    const REQUESTER_BYTE: u8 = 0x22;
+    const PAIR_BYTE: u8 = 0x33;
+    const OTHER_PAIR_BYTE: u8 = 0x55;
+    const GRANTS_BYTE: u8 = 0x66;
+    const CREATED_AT_MS: u64 = 1;
+    const UNIX_TIME_SECONDS: u64 = 1_791_504_899;
+
+    fn record(own: u8, peer: u8, pair: u8, role: EndpointRole) -> Arc<RappPairRecord> {
+        let own_private = [own; X25519_KEY_SIZE];
+        let record = PairRecord::new(
+            PairId::from_array([pair; PAIR_ID_SIZE]),
+            role,
+            own_private,
+            x25519_public_key(&own_private),
+            x25519_public_key(&[peer; X25519_KEY_SIZE]),
+            GrantsHash::from_array([GRANTS_BYTE; crate::GRANTS_HASH_SIZE]),
+            vec![ProfileName::Authentication],
+            CREATED_AT_MS,
+        )
+        .expect("record");
+        Arc::new(RappPairRecord {
+            record: Mutex::new(Some(record)),
+        })
+    }
+
+    fn requester() -> Arc<RappPairRecord> {
+        record(
+            REQUESTER_BYTE,
+            CUSTODIAN_BYTE,
+            PAIR_BYTE,
+            EndpointRole::Requester,
+        )
+    }
+
+    fn custodian(pair: u8) -> Arc<RappPairRecord> {
+        record(CUSTODIAN_BYTE, REQUESTER_BYTE, pair, EndpointRole::Proxy)
+    }
+
+    #[test]
+    fn a_session_preamble_routes_to_its_pairing_once() {
+        let router = RappSessionRouter::new();
+        let preamble = requester()
+            .session_preamble(STREAM_PROFILE.to_owned())
+            .expect("preamble");
+        let stored = vec![custodian(OTHER_PAIR_BYTE), custodian(PAIR_BYTE)];
+        assert_eq!(
+            router
+                .route(STREAM_PROFILE.to_owned(), preamble.clone(), stored.clone())
+                .expect("route"),
+            RappRoute::Session { index: 1 }
+        );
+        assert_eq!(
+            router
+                .route(STREAM_PROFILE.to_owned(), preamble, stored)
+                .expect("route"),
+            RappRoute::Refuse
+        );
+    }
+
+    #[test]
+    fn each_dial_carries_a_different_preamble() {
+        let first = requester()
+            .session_preamble(BLE_PROFILE.to_owned())
+            .expect("preamble");
+        let second = requester()
+            .session_preamble(BLE_PROFILE.to_owned())
+            .expect("preamble");
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn a_preamble_for_another_profile_or_pairing_is_refused() {
+        let router = RappSessionRouter::new();
+        let preamble = requester()
+            .session_preamble(BLE_PROFILE.to_owned())
+            .expect("preamble");
+        assert_eq!(
+            router
+                .route(
+                    STREAM_PROFILE.to_owned(),
+                    preamble.clone(),
+                    vec![custodian(PAIR_BYTE)]
+                )
+                .expect("route"),
+            RappRoute::Refuse
+        );
+        assert_eq!(
+            router
+                .route(
+                    BLE_PROFILE.to_owned(),
+                    preamble,
+                    vec![custodian(OTHER_PAIR_BYTE)]
+                )
+                .expect("route"),
+            RappRoute::Refuse
+        );
+    }
+
+    #[test]
+    fn a_pairing_preamble_routes_to_the_offer() {
+        let router = RappSessionRouter::new();
+        let preamble = rapp_pairing_preamble(STREAM_PROFILE.to_owned()).expect("preamble");
+        assert_eq!(
+            router
+                .route(STREAM_PROFILE.to_owned(), preamble, Vec::new())
+                .expect("route"),
+            RappRoute::Pairing
+        );
+    }
+
+    #[test]
+    fn discovery_records_match_across_the_pairing() {
+        let hint = custodian(PAIR_BYTE)
+            .discovery_hint(UNIX_TIME_SECONDS)
+            .expect("hint");
+        let txt = rapp_session_record(vec![RappAnnouncementCandidate {
+            hint,
+            last_used_ms: CREATED_AT_MS,
+        }])
+        .expect("record");
+        assert!(
+            requester()
+                .matches_discovery_record(txt.clone(), UNIX_TIME_SECONDS)
+                .expect("match")
+        );
+        assert!(
+            !custodian(OTHER_PAIR_BYTE)
+                .matches_discovery_record(txt, UNIX_TIME_SECONDS)
+                .expect("match")
+        );
+    }
+
+    #[test]
+    fn a_withdrawn_record_announces_at_most_eight_of_many_pairings() {
+        let candidates = (0..=crate::WITHDRAWN_RECORD_ENTRIES)
+            .map(|index| RappAnnouncementCandidate {
+                hint: vec![u8::try_from(index).expect("small"); crate::WITHDRAWAL_HINT_SIZE],
+                last_used_ms: u64::try_from(index).expect("small"),
+            })
+            .collect::<Vec<_>>();
+        let txt = rapp_withdrawn_record(candidates).expect("record");
+        let list = &txt.last().expect("hint list").value;
+        assert_eq!(list.split(',').count(), crate::WITHDRAWN_RECORD_ENTRIES);
+        assert!(!list.contains(&"00".repeat(crate::WITHDRAWAL_HINT_SIZE)));
+    }
 }

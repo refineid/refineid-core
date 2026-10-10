@@ -54,6 +54,7 @@ mod session_flow;
 mod state;
 mod stream;
 mod transport;
+mod txt;
 mod types;
 mod wire;
 mod withdrawal;
@@ -131,9 +132,10 @@ pub use requester_engine::{
 };
 pub use result::{OperationResultMessage, ProxyFailure, ResultError, ResultResponse, ResultStatus};
 pub use routing::{
-    DISCOVERY_HINT_EPOCH_SECONDS, DISCOVERY_HINT_SIZE, DiscoveryKey, ROUTING_NONCE_SIZE,
-    ROUTING_REPLAY_WINDOW, ROUTING_TAG_SIZE, RandomUnavailable, RoutingKey, RoutingReplayCache,
-    SESSION_ROUTING_SIZE, SessionRouting, discovery_epoch, route_session,
+    DISCOVERY_HINT_EPOCH_SECONDS, DISCOVERY_HINT_SIZE, DiscoveryKey, DiscoveryRecord,
+    DiscoveryRecordError, MAX_DISCOVERY_HINTS, ROUTING_NONCE_SIZE, ROUTING_REPLAY_WINDOW,
+    ROUTING_TAG_SIZE, RandomUnavailable, RoutingKey, RoutingReplayCache, SESSION_ROUTING_SIZE,
+    SessionRouting, discovery_epoch, route_session,
 };
 pub use runtime::{EstablishedSessionRuntime, RuntimeError, RuntimePoll, RuntimeReceive};
 pub use session_flow::{ExplicitUserIntent, SessionAuthentication, SessionError, SessionHandshake};
@@ -146,6 +148,7 @@ pub use transport::{
     BLE_CANDIDATE_ID, BLE_PROFILE, BLE_SERVICE_UUID, BinaryFrame, FrameError, FrameTransport,
     STREAM_CANDIDATE_ID, TransportCandidate, TransportProfile,
 };
+pub use txt::AnnouncementCandidate;
 pub use types::{
     CANDIDATE_FAILURE_HINT_THRESHOLD, CloseReason, FailureClass, GRANTS_HASH_SIZE, GrantsHash,
     IdentifierError, LIVENESS_CHALLENGE_SIZE, MANDATORY_PAIRING_SUITE, MANDATORY_SESSION_SUITE,

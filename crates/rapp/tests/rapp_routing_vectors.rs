@@ -16,8 +16,9 @@
 //! against their corpus.
 
 use refineid_rapp::{
-    DiscoveryKey, PairId, RoutingKey, RoutingPreamble, RoutingReplayCache, SessionRouting,
-    TransportProfile, discovery_epoch, noise::x25519_public_key, route_session,
+    AnnouncementCandidate, DiscoveryKey, DiscoveryRecord, PairId, RoutingKey, RoutingPreamble,
+    RoutingReplayCache, SessionRouting, TransportProfile, discovery_epoch,
+    noise::x25519_public_key, route_session,
 };
 use serde::Deserialize;
 
@@ -33,6 +34,30 @@ struct Corpus {
     routing_tag: Vec<TagVector>,
     routing_preamble: Vec<PreambleVector>,
     routing_lookup: Vec<LookupVector>,
+    discovery_record: Vec<RecordVector>,
+    announcement_selection: Vec<SelectionVector>,
+}
+
+#[derive(Deserialize)]
+struct RecordVector {
+    name: String,
+    txt: Vec<(String, String)>,
+    #[serde(default)]
+    hints_hex: Vec<String>,
+    expected: String,
+}
+
+#[derive(Deserialize)]
+struct SelectionVector {
+    name: String,
+    candidates: Vec<CandidateVector>,
+    announced_hex: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct CandidateVector {
+    hint_hex: String,
+    last_used_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -266,4 +291,40 @@ fn a_routed_nonce_is_refused_the_second_time() {
     let mut cache = RoutingReplayCache::default();
     assert!(cache.admit(routing.nonce()));
     assert!(!cache.admit(routing.nonce()));
+}
+
+#[test]
+fn session_records_parse_as_the_corpus_says() {
+    for vector in corpus().discovery_record {
+        let pairs: Vec<(&str, &str)> = vector
+            .txt
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        match DiscoveryRecord::parse(&pairs) {
+            Ok(record) => {
+                assert_eq!(vector.expected, "accepted", "{}", vector.name);
+                let hints = record.hints().iter().map(hex::encode).collect::<Vec<_>>();
+                assert_eq!(hints, vector.hints_hex, "{}", vector.name);
+            }
+            Err(_) => assert_eq!(vector.expected, "rejected", "{}", vector.name),
+        }
+    }
+}
+
+#[test]
+fn session_records_announce_the_most_recently_used_pairings() {
+    for vector in corpus().announcement_selection {
+        let candidates = vector
+            .candidates
+            .iter()
+            .map(|candidate| AnnouncementCandidate {
+                hint: array(&candidate.hint_hex),
+                last_used_ms: candidate.last_used_ms,
+            })
+            .collect::<Vec<_>>();
+        let record = DiscoveryRecord::assemble(&candidates);
+        let announced = record.hints().iter().map(hex::encode).collect::<Vec<_>>();
+        assert_eq!(announced, vector.announced_hex, "{}", vector.name);
+    }
 }

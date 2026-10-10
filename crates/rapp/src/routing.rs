@@ -26,12 +26,25 @@ use std::collections::VecDeque;
 use subtle::{ConditionallySelectable, ConstantTimeEq};
 use zeroize::Zeroizing;
 
+use super::txt::{
+    AnnouncementCandidate, MODE_KEY, VERSION, VERSION_KEY, decode_list, encode_list,
+    most_recently_used, values,
+};
 use super::{
     DegenerateAgreement, PAIR_KEY_SIZE, PairId, PairRecord, TransportProfile, X25519_KEY_SIZE,
 };
 
 /// Byte length of one published discovery hint.
-pub const DISCOVERY_HINT_SIZE: usize = 8;
+pub const DISCOVERY_HINT_SIZE: usize = super::txt::HINT_SIZE;
+
+/// Most discovery hints one `mode=session` record carries.
+pub const MAX_DISCOVERY_HINTS: usize = 4;
+
+/// TXT value naming the session mode.
+const TXT_MODE_SESSION: &str = "session";
+
+/// TXT key carrying the discovery hint list.
+const TXT_HINTS_KEY: &str = "hints";
 
 /// Length in seconds of one discovery-hint epoch.
 pub const DISCOVERY_HINT_EPOCH_SECONDS: u64 = 900;
@@ -124,6 +137,87 @@ impl DiscoveryKey {
             matched |= self.hint(candidate).ct_eq(hint);
         }
         bool::from(matched)
+    }
+
+    /// Whether `record` carries this pairing's hint for `epoch` or an
+    /// adjacent epoch.
+    #[must_use]
+    pub fn matches_record(&self, record: &DiscoveryRecord, epoch: u64) -> bool {
+        record
+            .hints
+            .iter()
+            .fold(false, |found, hint| found | self.matches(hint, epoch))
+    }
+}
+
+/// A well-formed `mode=session` record and the discovery hints it carries,
+/// possibly none (hierarchy specification §4.3).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DiscoveryRecord {
+    hints: Vec<[u8; DISCOVERY_HINT_SIZE]>,
+}
+
+/// Why a TXT record is not a well-formed `mode=session` record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiscoveryRecordError {
+    /// A key other than `v`, `mode` and `hints`, or a repeated key; keys
+    /// compare case-insensitively.
+    UnexpectedKey,
+    /// `v` or `mode` is missing or has another value.
+    WrongHeader,
+    /// The hint list is not one to four lowercase 16-digit hexadecimal
+    /// entries.
+    MalformedHints,
+}
+
+impl DiscoveryRecord {
+    /// A record announcing the hints of the four most recently used
+    /// pairings among `candidates`; pairings beyond the fourth are not
+    /// announced.
+    #[must_use]
+    pub fn assemble(candidates: &[AnnouncementCandidate]) -> Self {
+        Self {
+            hints: most_recently_used(candidates, MAX_DISCOVERY_HINTS),
+        }
+    }
+
+    /// Parses the TXT key/value pairs of a discovered record.
+    ///
+    /// # Errors
+    /// [`DiscoveryRecordError`] for anything but `v=1`, `mode=session` and an
+    /// optional `hints=` of one to four lowercase entries.
+    pub fn parse(entries: &[(&str, &str)]) -> Result<Self, DiscoveryRecordError> {
+        let [version, mode, hints] = values(entries, [VERSION_KEY, MODE_KEY, TXT_HINTS_KEY])
+            .ok_or(DiscoveryRecordError::UnexpectedKey)?;
+        if version != Some(VERSION) || mode != Some(TXT_MODE_SESSION) {
+            return Err(DiscoveryRecordError::WrongHeader);
+        }
+        let hints = match hints {
+            None => Vec::new(),
+            Some(list) => decode_list(list, MAX_DISCOVERY_HINTS)
+                .ok_or(DiscoveryRecordError::MalformedHints)?,
+        };
+        Ok(Self { hints })
+    }
+
+    /// The record's TXT key/value pairs, in publication order; `hints` only
+    /// when there are hints.
+    #[must_use]
+    pub fn txt_entries(&self) -> Vec<(&'static str, String)> {
+        let mut entries = vec![
+            (VERSION_KEY, VERSION.to_owned()),
+            (MODE_KEY, TXT_MODE_SESSION.to_owned()),
+        ];
+        if !self.hints.is_empty() {
+            entries.push((TXT_HINTS_KEY, encode_list(&self.hints)));
+        }
+        entries
+    }
+
+    /// The announced hints in publication order.
+    #[must_use]
+    pub fn hints(&self) -> &[[u8; DISCOVERY_HINT_SIZE]] {
+        &self.hints
     }
 }
 
@@ -296,6 +390,7 @@ impl RoutingReplayCache {
 
 #[cfg(test)]
 mod tests {
+    use super::super::txt::AnnouncementCandidate;
     use super::*;
 
     const FIRST_PRIVATE: u8 = 0x11;
@@ -403,6 +498,46 @@ mod tests {
             assert!(cache.admit(&nonce));
         }
         assert!(cache.admit(&first));
+    }
+
+    #[test]
+    fn a_session_record_round_trips_and_matches() {
+        let pair_id = PairId::from_array([PAIR_BYTE; super::super::PAIR_ID_SIZE]);
+        let custodian = DiscoveryKey::from_parts(
+            pair_id,
+            &[FIRST_PRIVATE; X25519_KEY_SIZE],
+            &public(SECOND_PRIVATE),
+        )
+        .expect("key");
+        let requester = DiscoveryKey::from_parts(
+            pair_id,
+            &[SECOND_PRIVATE; X25519_KEY_SIZE],
+            &public(FIRST_PRIVATE),
+        )
+        .expect("key");
+        let record = DiscoveryRecord::assemble(&[AnnouncementCandidate {
+            hint: custodian.hint(EPOCH),
+            last_used_ms: EPOCH,
+        }]);
+        let entries: Vec<(String, String)> = record
+            .txt_entries()
+            .into_iter()
+            .map(|(key, value)| (key.to_uppercase(), value))
+            .collect();
+        let pairs: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        let parsed = DiscoveryRecord::parse(&pairs).expect("parse");
+        assert!(requester.matches_record(&parsed, EPOCH));
+        assert_eq!(
+            DiscoveryRecord::parse(&[("v", "1"), ("mode", "session")]),
+            Ok(DiscoveryRecord::default())
+        );
+        assert_eq!(
+            DiscoveryRecord::parse(&[("v", "1"), ("mode", "pairing")]),
+            Err(DiscoveryRecordError::WrongHeader)
+        );
     }
 
     #[test]

@@ -155,5 +155,206 @@
       ],
       "expected_index": null
     }
+  ],
+  "discovery_record": [
+    {
+      "name": "minimal",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "session"
+        ]
+      ],
+      "hints_hex": [],
+      "expected": "accepted"
+    },
+    {
+      "name": "one-hint",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "session"
+        ],
+        [
+          "hints",
+          "054526c9fdd3b180"
+        ]
+      ],
+      "hints_hex": [
+        "054526c9fdd3b180"
+      ],
+      "expected": "accepted"
+    },
+    {
+      "name": "mixed-case-keys",
+      "txt": [
+        [
+          "V",
+          "1"
+        ],
+        [
+          "MODE",
+          "session"
+        ],
+        [
+          "Hints",
+          "054526c9fdd3b180"
+        ]
+      ],
+      "hints_hex": [
+        "054526c9fdd3b180"
+      ],
+      "expected": "accepted"
+    },
+    {
+      "name": "uppercase-hex",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "session"
+        ],
+        [
+          "hints",
+          "054526C9FDD3B180"
+        ]
+      ],
+      "expected": "rejected"
+    },
+    {
+      "name": "five-hints",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "session"
+        ],
+        [
+          "hints",
+          "054526c9fdd3b180,054526c9fdd3b180,054526c9fdd3b180,054526c9fdd3b180,054526c9fdd3b180"
+        ]
+      ],
+      "expected": "rejected"
+    },
+    {
+      "name": "empty-hint-list",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "session"
+        ],
+        [
+          "hints",
+          ""
+        ]
+      ],
+      "expected": "rejected"
+    },
+    {
+      "name": "unknown-key",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "session"
+        ],
+        [
+          "name",
+          "phone"
+        ]
+      ],
+      "expected": "rejected"
+    },
+    {
+      "name": "pairing-mode",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "pairing"
+        ]
+      ],
+      "expected": "rejected"
+    },
+    {
+      "name": "repeated-key-in-other-case",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "session"
+        ],
+        [
+          "hints",
+          "054526c9fdd3b180"
+        ],
+        [
+          "HINTS",
+          "054526c9fdd3b180"
+        ]
+      ],
+      "expected": "rejected"
+    }
+  ],
+  "announcement_selection": [
+    {
+      "name": "five-pairings-four-announced",
+      "limit": 4,
+      "candidates": [
+        {
+          "hint_hex": "2020202020202020",
+          "last_used_ms": 2000
+        },
+        {
+          "hint_hex": "2121212121212121",
+          "last_used_ms": 2001
+        },
+        {
+          "hint_hex": "2222222222222222",
+          "last_used_ms": 2002
+        },
+        {
+          "hint_hex": "2323232323232323",
+          "last_used_ms": 2003
+        },
+        {
+          "hint_hex": "2424242424242424",
+          "last_used_ms": 2004
+        }
+      ],
+      "announced_hex": [
+        "2424242424242424",
+        "2323232323232323",
+        "2222222222222222",
+        "2121212121212121"
+      ]
+    }
   ]
 }

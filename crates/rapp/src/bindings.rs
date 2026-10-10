@@ -1949,9 +1949,9 @@ impl RappPairRecord {
             .to_vec())
     }
 
-    /// Whether the discovered hint `hint` is this pairing's for the window
-    /// containing `unix_time_seconds` or an adjacent one. A hint of the
-    /// wrong size is `false`.
+    /// Whether the TXT attributes `txt` form a `mode=session` record that
+    /// carries this pairing's discovery hint for the window containing
+    /// `unix_time_seconds` or an adjacent one. A malformed record is `false`.
     ///
     /// # Errors
     /// [`RappBindingError::InvalidInput`] on a degenerate static agreement,
@@ -1960,17 +1960,21 @@ impl RappPairRecord {
         clippy::needless_pass_by_value,
         reason = "uniffi lowers exported arguments as owned values"
     )]
-    pub fn matches_discovery_hint(
+    pub fn matches_discovery_record(
         &self,
-        hint: Vec<u8>,
+        txt: Vec<RappTxtEntry>,
         unix_time_seconds: u64,
     ) -> Result<bool, RappBindingError> {
-        let Ok(hint) = <[u8; super::DISCOVERY_HINT_SIZE]>::try_from(hint.as_slice()) else {
+        let pairs: Vec<(&str, &str)> = txt
+            .iter()
+            .map(|entry| (entry.key.as_str(), entry.value.as_str()))
+            .collect();
+        let Ok(record) = super::DiscoveryRecord::parse(&pairs) else {
             return Ok(false);
         };
         Ok(self
             .discovery_key()?
-            .matches(&hint, super::discovery_epoch(unix_time_seconds)))
+            .matches_record(&record, super::discovery_epoch(unix_time_seconds)))
     }
 
     /// This pairing's withdrawal hint for the advertised service instance
@@ -1978,8 +1982,9 @@ impl RappPairRecord {
     /// (RAPP section 4.5).
     ///
     /// # Errors
-    /// [`RappBindingError::InvalidInput`] on an instance name that is not one
-    /// DNS label or a degenerate static agreement, and
+    /// [`RappBindingError::InvalidInput`] on an instance name that is not the
+    /// instance portion of the published name, or a degenerate static
+    /// agreement, and
     /// [`RappBindingError::WrongPhase`] when the record was revoked.
     #[allow(
         clippy::needless_pass_by_value,
@@ -2717,42 +2722,83 @@ pub struct RappTxtEntry {
     pub value: String,
 }
 
-/// The TXT attributes of a `mode=withdrawn` record carrying `hints`, the
-/// withdrawal hints of the custodian's stored pairings, padded to eight
-/// entries with random fillers and shuffled (RAPP section 4.5).
-///
-/// # Errors
-/// [`RappBindingError::InvalidInput`] for more than eight hints or a hint of
-/// the wrong size, and [`RappBindingError::LocalStateFailure`] when the
-/// random source fails.
-#[uniffi::export]
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "uniffi lowers exported arguments as owned values"
-)]
-pub fn rapp_withdrawn_record(hints: Vec<Vec<u8>>) -> Result<Vec<RappTxtEntry>, RappBindingError> {
-    let hints = hints
+/// One stored pairing a custodian could announce: its hint for the record
+/// being published and the time of its most recent established session, or
+/// of its creation when it has had none.
+#[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
+pub struct RappAnnouncementCandidate {
+    /// The pairing's discovery or withdrawal hint.
+    pub hint: Vec<u8>,
+    /// Milliseconds since the Unix epoch of the pairing's last use.
+    pub last_used_ms: u64,
+}
+
+fn announcement_candidates(
+    candidates: &[RappAnnouncementCandidate],
+) -> Result<Vec<super::AnnouncementCandidate>, RappBindingError> {
+    candidates
         .iter()
-        .map(|hint| {
-            <[u8; super::WITHDRAWAL_HINT_SIZE]>::try_from(hint.as_slice())
-                .map_err(|_| RappBindingError::InvalidInput)
+        .map(|candidate| {
+            Ok(super::AnnouncementCandidate {
+                hint: <[u8; super::DISCOVERY_HINT_SIZE]>::try_from(candidate.hint.as_slice())
+                    .map_err(|_| RappBindingError::InvalidInput)?,
+                last_used_ms: candidate.last_used_ms,
+            })
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    let record = super::WithdrawnRecord::assemble(&hints, |bytes| {
-        getrandom::fill(bytes).map_err(|_| super::WithdrawalError::RandomUnavailable)
-    })
-    .map_err(|error| match error {
-        super::WithdrawalError::RandomUnavailable => RappBindingError::LocalStateFailure,
-        _ => RappBindingError::InvalidInput,
-    })?;
-    Ok(record
-        .txt_entries()
+        .collect()
+}
+
+fn txt_entries(entries: impl IntoIterator<Item = (&'static str, String)>) -> Vec<RappTxtEntry> {
+    entries
         .into_iter()
         .map(|(key, value)| RappTxtEntry {
             key: key.to_owned(),
             value,
         })
-        .collect())
+        .collect()
+}
+
+/// The TXT attributes of a `mode=session` record announcing the discovery
+/// hints of the four most recently used `candidates` (hierarchy
+/// specification section 4.3). No candidates give the minimal record.
+///
+/// # Errors
+/// [`RappBindingError::InvalidInput`] for a hint of the wrong size.
+#[uniffi::export]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "uniffi lowers exported arguments as owned values"
+)]
+pub fn rapp_session_record(
+    candidates: Vec<RappAnnouncementCandidate>,
+) -> Result<Vec<RappTxtEntry>, RappBindingError> {
+    let candidates = announcement_candidates(&candidates)?;
+    Ok(txt_entries(
+        super::DiscoveryRecord::assemble(&candidates).txt_entries(),
+    ))
+}
+
+/// The TXT attributes of a `mode=withdrawn` record announcing the
+/// withdrawal hints of the eight most recently used `candidates`, padded to
+/// eight entries with random fillers and shuffled (RAPP section 4.5).
+///
+/// # Errors
+/// [`RappBindingError::InvalidInput`] for a hint of the wrong size, and
+/// [`RappBindingError::LocalStateFailure`] when the random source fails.
+#[uniffi::export]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "uniffi lowers exported arguments as owned values"
+)]
+pub fn rapp_withdrawn_record(
+    candidates: Vec<RappAnnouncementCandidate>,
+) -> Result<Vec<RappTxtEntry>, RappBindingError> {
+    let candidates = announcement_candidates(&candidates)?;
+    let record = super::WithdrawnRecord::assemble(&candidates, |bytes| {
+        getrandom::fill(bytes).map_err(|_| super::WithdrawalError::RandomUnavailable)
+    })
+    .map_err(|_| RappBindingError::LocalStateFailure)?;
+    Ok(txt_entries(record.txt_entries()))
 }
 
 fn encode_pair_record(record: &PairRecord) -> Result<Vec<u8>, RappBindingError> {
@@ -2910,7 +2956,10 @@ pub fn rapp_ble_sar_segment(
 
 #[cfg(test)]
 mod routing_binding_tests {
-    use super::{RappPairRecord, RappRoute, RappSessionRouter, rapp_pairing_preamble};
+    use super::{
+        RappAnnouncementCandidate, RappPairRecord, RappRoute, RappSessionRouter,
+        rapp_pairing_preamble, rapp_session_record, rapp_withdrawn_record,
+    };
     use crate::{
         BLE_PROFILE, EndpointRole, GrantsHash, PAIR_ID_SIZE, PairId, PairRecord, ProfileName,
         STREAM_PROFILE, X25519_KEY_SIZE, noise::x25519_public_key,
@@ -3029,19 +3078,38 @@ mod routing_binding_tests {
     }
 
     #[test]
-    fn discovery_hints_match_across_the_pairing() {
+    fn discovery_records_match_across_the_pairing() {
         let hint = custodian(PAIR_BYTE)
             .discovery_hint(UNIX_TIME_SECONDS)
             .expect("hint");
+        let txt = rapp_session_record(vec![RappAnnouncementCandidate {
+            hint,
+            last_used_ms: CREATED_AT_MS,
+        }])
+        .expect("record");
         assert!(
             requester()
-                .matches_discovery_hint(hint.clone(), UNIX_TIME_SECONDS)
+                .matches_discovery_record(txt.clone(), UNIX_TIME_SECONDS)
                 .expect("match")
         );
         assert!(
             !custodian(OTHER_PAIR_BYTE)
-                .matches_discovery_hint(hint, UNIX_TIME_SECONDS)
+                .matches_discovery_record(txt, UNIX_TIME_SECONDS)
                 .expect("match")
         );
+    }
+
+    #[test]
+    fn a_withdrawn_record_announces_at_most_eight_of_many_pairings() {
+        let candidates = (0..=crate::WITHDRAWN_RECORD_ENTRIES)
+            .map(|index| RappAnnouncementCandidate {
+                hint: vec![u8::try_from(index).expect("small"); crate::WITHDRAWAL_HINT_SIZE],
+                last_used_ms: u64::try_from(index).expect("small"),
+            })
+            .collect::<Vec<_>>();
+        let txt = rapp_withdrawn_record(candidates).expect("record");
+        let list = &txt.last().expect("hint list").value;
+        assert_eq!(list.split(',').count(), crate::WITHDRAWN_RECORD_ENTRIES);
+        assert!(!list.contains(&"00".repeat(crate::WITHDRAWAL_HINT_SIZE)));
     }
 }

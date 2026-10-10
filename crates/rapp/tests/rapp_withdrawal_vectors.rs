@@ -15,8 +15,9 @@
 //! Service withdrawal (RAPP v26.10.10 §4.5) against its corpus.
 
 use refineid_rapp::{
-    CloseReason, InstanceName, PairId, SessionCloseMessage, TypedMessage, WireValue, WithdrawalKey,
-    WithdrawnRecord, encode_deterministic_cbor, noise::x25519_public_key, withdrawal_counter,
+    AnnouncementCandidate, CloseReason, InstanceName, PairId, SessionCloseMessage, TypedMessage,
+    WireValue, WithdrawalKey, WithdrawnRecord, encode_deterministic_cbor, noise::x25519_public_key,
+    withdrawal_counter,
 };
 use serde::Deserialize;
 
@@ -30,6 +31,20 @@ struct Corpus {
     withdrawn_record: Vec<RecordVector>,
     malformed_record: Vec<MalformedVector>,
     session_close: Vec<CloseVector>,
+    announcement_selection: Vec<SelectionVector>,
+}
+
+#[derive(Deserialize)]
+struct SelectionVector {
+    name: String,
+    candidates: Vec<CandidateVector>,
+    announced_hex: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct CandidateVector {
+    hint_hex: String,
+    last_used_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -180,7 +195,11 @@ fn acceptance_matches_the_corpus() {
             &instance(&vector.published_instance),
             vector.published_counter,
         );
-        let record = WithdrawnRecord::assemble(&[published], |bytes| {
+        let candidate = AnnouncementCandidate {
+            hint: published,
+            last_used_ms: 0,
+        };
+        let record = WithdrawnRecord::assemble(&[candidate], |bytes| {
             bytes.fill(0);
             Ok(())
         })
@@ -248,5 +267,30 @@ fn session_close_bodies_match_the_corpus() {
             "{}",
             vector.name
         );
+    }
+}
+
+#[test]
+fn the_most_recently_used_pairings_are_announced() {
+    for vector in corpus().announcement_selection {
+        let candidates = vector
+            .candidates
+            .iter()
+            .map(|candidate| AnnouncementCandidate {
+                hint: hex::decode(&candidate.hint_hex)
+                    .expect("hex")
+                    .try_into()
+                    .expect("hint length"),
+                last_used_ms: candidate.last_used_ms,
+            })
+            .collect::<Vec<_>>();
+        let record = WithdrawnRecord::assemble(&candidates, |bytes| {
+            bytes.fill(0);
+            Ok(())
+        })
+        .expect("record");
+        let mut announced = record.entries().iter().map(hex::encode).collect::<Vec<_>>();
+        announced.sort();
+        assert_eq!(announced, vector.announced_hex, "{}", vector.name);
     }
 }

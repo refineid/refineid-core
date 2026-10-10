@@ -27,10 +27,14 @@ use core::fmt;
 use subtle::{Choice, ConstantTimeEq};
 use zeroize::Zeroizing;
 
+use super::txt::{
+    AnnouncementCandidate, MODE_KEY, VERSION, VERSION_KEY, decode_list, encode_list,
+    most_recently_used, values,
+};
 use super::{PAIR_KEY_SIZE, PairId, PairRecord, X25519_KEY_SIZE};
 
 /// Byte length of one withdrawal hint.
-pub const WITHDRAWAL_HINT_SIZE: usize = 8;
+pub const WITHDRAWAL_HINT_SIZE: usize = super::txt::HINT_SIZE;
 
 /// Seconds per withdrawal counter step.
 pub const WITHDRAWAL_COUNTER_SECONDS: u64 = 60;
@@ -38,47 +42,30 @@ pub const WITHDRAWAL_COUNTER_SECONDS: u64 = 60;
 /// Entries in every `withdrawn=` value, hints and fillers together.
 pub const WITHDRAWN_RECORD_ENTRIES: usize = 8;
 
-/// Longest service instance name, one DNS label.
+/// Longest instance portion of a service instance name, in octets.
 pub const MAX_INSTANCE_NAME_SIZE: usize = 63;
 
 /// HKDF-Expand info naming the withdrawal key.
 const WITHDRAWAL_KEY_INFO: &[u8] = b"RAPP-withdrawal-v1";
 
-/// TXT key and value naming the record version.
-const TXT_VERSION_KEY: &str = "v";
-const TXT_VERSION: &str = "1";
-
-/// TXT key and value naming the withdrawn mode.
-const TXT_MODE_KEY: &str = "mode";
+/// TXT value naming the withdrawn mode.
 const TXT_MODE_WITHDRAWN: &str = "withdrawn";
 
 /// TXT key carrying the hint list.
 const TXT_WITHDRAWN_KEY: &str = "withdrawn";
 
-/// Separator between hint-list entries.
-const ENTRY_SEPARATOR: char = ',';
-
-/// Hexadecimal digits per encoded entry.
-const ENTRY_HEX_DIGITS: usize = WITHDRAWAL_HINT_SIZE * 2;
-
-/// Lowercase hexadecimal alphabet of the encoded entries.
-const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
-
-/// Bits per hexadecimal digit.
-const NIBBLE_BITS: u32 = 4;
-
-/// Low-nibble mask.
-const NIBBLE_MASK: u8 = 0x0f;
+/// Suffixes that show a full service name was passed where only the
+/// instance portion belongs.
+const SERVICE_NAME_SUFFIXES: [&str; 4] = ["._tcp", "._udp", ".local", ".local."];
 
 /// Why a withdrawal value could not be formed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WithdrawalError {
     /// The static agreement is the identity point.
     DegenerateAgreement,
-    /// The service instance name is empty or longer than one DNS label.
+    /// The service instance name is empty, longer than 63 octets, or a
+    /// full service name rather than its instance portion.
     InvalidInstanceName,
-    /// More pairings than a record carries.
-    TooManyHints,
     /// The platform random source failed.
     RandomUnavailable,
 }
@@ -87,8 +74,7 @@ impl fmt::Display for WithdrawalError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::DegenerateAgreement => "static agreement is the identity point",
-            Self::InvalidInstanceName => "service instance name is not one DNS label",
-            Self::TooManyHints => "more pairings than a withdrawn record carries",
+            Self::InvalidInstanceName => "not the instance portion of a service instance name",
             Self::RandomUnavailable => "random source unavailable",
         })
     }
@@ -96,17 +82,27 @@ impl fmt::Display for WithdrawalError {
 
 impl core::error::Error for WithdrawalError {}
 
-/// The advertised DNS-SD service instance name a hint is bound to.
+/// The instance portion of the advertised DNS-SD service instance name
+/// (RFC 6763 §4.1), the part a hint is bound to: the name exactly as
+/// published, without the service type and domain, as UTF-8 octets. It may
+/// contain dots.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstanceName(String);
 
 impl InstanceName {
-    /// Validates an instance name of 1 to 63 UTF-8 octets.
+    /// Validates an instance portion of 1 to 63 UTF-8 octets that does not
+    /// end in a service type or domain suffix.
     ///
     /// # Errors
     /// [`WithdrawalError::InvalidInstanceName`] otherwise.
     pub fn new(name: &str) -> Result<Self, WithdrawalError> {
-        if name.is_empty() || name.len() > MAX_INSTANCE_NAME_SIZE {
+        let looks_like_service_name = SERVICE_NAME_SUFFIXES.iter().any(|suffix| {
+            name.len() >= suffix.len()
+                && name
+                    .get(name.len() - suffix.len()..)
+                    .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+        });
+        if name.is_empty() || name.len() > MAX_INSTANCE_NAME_SIZE || looks_like_service_name {
             return Err(WithdrawalError::InvalidInstanceName);
         }
         Ok(Self(name.to_owned()))
@@ -175,7 +171,7 @@ impl WithdrawalKey {
     #[must_use]
     pub fn hint(&self, instance: &InstanceName, counter: u64) -> [u8; WITHDRAWAL_HINT_SIZE] {
         let name = instance.as_bytes();
-        let length = u8::try_from(name.len()).expect("an instance name is one DNS label");
+        let length = u8::try_from(name.len()).expect("an instance portion is at most 63 octets");
         let digest = super::pair_key_mac(&self.0, &[&[length], name, &counter.to_be_bytes()]);
         let mut hint = [0_u8; WITHDRAWAL_HINT_SIZE];
         hint.copy_from_slice(&digest[..WITHDRAWAL_HINT_SIZE]);
@@ -213,7 +209,8 @@ pub struct WithdrawnRecord {
 /// Why a TXT record is not a well-formed withdrawn record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WithdrawnRecordError {
-    /// A key other than `v`, `mode` and `withdrawn`, or a repeated key.
+    /// A key other than `v`, `mode` and `withdrawn`, or a repeated key;
+    /// keys compare case-insensitively.
     UnexpectedKey,
     /// `v`, `mode` or `withdrawn` is missing or has another value.
     WrongHeader,
@@ -222,19 +219,18 @@ pub enum WithdrawnRecordError {
 }
 
 impl WithdrawnRecord {
-    /// Assembles a record from the custodian's hints, filling the remaining
-    /// entries with random values and shuffling all eight with `random`.
+    /// Assembles a record announcing the eight most recently used of the
+    /// custodian's pairings, filling the remaining entries with random
+    /// values and shuffling all eight with `random`. Pairings beyond the
+    /// eighth are not announced.
     ///
     /// # Errors
-    /// [`WithdrawalError::TooManyHints`] for more than eight hints, and
     /// [`WithdrawalError::RandomUnavailable`] when `random` fails.
     pub fn assemble(
-        hints: &[[u8; WITHDRAWAL_HINT_SIZE]],
+        candidates: &[AnnouncementCandidate],
         mut random: impl FnMut(&mut [u8]) -> Result<(), WithdrawalError>,
     ) -> Result<Self, WithdrawalError> {
-        if hints.len() > WITHDRAWN_RECORD_ENTRIES {
-            return Err(WithdrawalError::TooManyHints);
-        }
+        let hints = most_recently_used(candidates, WITHDRAWN_RECORD_ENTRIES);
         let mut keyed = [([0_u8; WITHDRAWAL_HINT_SIZE], [0_u8; WITHDRAWAL_HINT_SIZE]);
             WITHDRAWN_RECORD_ENTRIES];
         for (index, (order, entry)) in keyed.iter_mut().enumerate() {
@@ -256,52 +252,25 @@ impl WithdrawnRecord {
     /// [`WithdrawnRecordError`] for anything but exactly `v=1`,
     /// `mode=withdrawn` and eight lowercase entries in `withdrawn=`.
     pub fn parse(entries: &[(&str, &str)]) -> Result<Self, WithdrawnRecordError> {
-        let mut version = None;
-        let mut mode = None;
-        let mut list = None;
-        for &(key, value) in entries {
-            let slot = match key {
-                TXT_VERSION_KEY => &mut version,
-                TXT_MODE_KEY => &mut mode,
-                TXT_WITHDRAWN_KEY => &mut list,
-                _ => return Err(WithdrawnRecordError::UnexpectedKey),
-            };
-            if slot.replace(value).is_some() {
-                return Err(WithdrawnRecordError::UnexpectedKey);
-            }
-        }
-        if version != Some(TXT_VERSION) || mode != Some(TXT_MODE_WITHDRAWN) {
+        let [version, mode, list] = values(entries, [VERSION_KEY, MODE_KEY, TXT_WITHDRAWN_KEY])
+            .ok_or(WithdrawnRecordError::UnexpectedKey)?;
+        if version != Some(VERSION) || mode != Some(TXT_MODE_WITHDRAWN) {
             return Err(WithdrawnRecordError::WrongHeader);
         }
         let list = list.ok_or(WithdrawnRecordError::WrongHeader)?;
-        let mut parsed = [[0_u8; WITHDRAWAL_HINT_SIZE]; WITHDRAWN_RECORD_ENTRIES];
-        let mut count = 0;
-        for text in list.split(ENTRY_SEPARATOR) {
-            let slot = parsed
-                .get_mut(count)
-                .ok_or(WithdrawnRecordError::MalformedEntries)?;
-            *slot = decode_entry(text).ok_or(WithdrawnRecordError::MalformedEntries)?;
-            count += 1;
-        }
-        if count != WITHDRAWN_RECORD_ENTRIES {
-            return Err(WithdrawnRecordError::MalformedEntries);
-        }
+        let parsed = decode_list(list, WITHDRAWN_RECORD_ENTRIES)
+            .and_then(|entries| <[_; WITHDRAWN_RECORD_ENTRIES]>::try_from(entries).ok())
+            .ok_or(WithdrawnRecordError::MalformedEntries)?;
         Ok(Self { entries: parsed })
     }
 
     /// The record's TXT key/value pairs, in publication order.
     #[must_use]
     pub fn txt_entries(&self) -> [(&'static str, String); 3] {
-        let list = self
-            .entries
-            .iter()
-            .map(encode_entry)
-            .collect::<Vec<_>>()
-            .join(&ENTRY_SEPARATOR.to_string());
         [
-            (TXT_VERSION_KEY, TXT_VERSION.to_owned()),
-            (TXT_MODE_KEY, TXT_MODE_WITHDRAWN.to_owned()),
-            (TXT_WITHDRAWN_KEY, list),
+            (VERSION_KEY, VERSION.to_owned()),
+            (MODE_KEY, TXT_MODE_WITHDRAWN.to_owned()),
+            (TXT_WITHDRAWN_KEY, encode_list(&self.entries)),
         ]
     }
 
@@ -312,37 +281,6 @@ impl WithdrawnRecord {
     }
 }
 
-fn encode_entry(entry: &[u8; WITHDRAWAL_HINT_SIZE]) -> String {
-    let mut text = String::with_capacity(ENTRY_HEX_DIGITS);
-    for byte in entry {
-        text.push(char::from(HEX_DIGITS[usize::from(byte >> NIBBLE_BITS)]));
-        text.push(char::from(HEX_DIGITS[usize::from(byte & NIBBLE_MASK)]));
-    }
-    text
-}
-
-fn decode_entry(text: &str) -> Option<[u8; WITHDRAWAL_HINT_SIZE]> {
-    let bytes = text.as_bytes();
-    if bytes.len() != ENTRY_HEX_DIGITS {
-        return None;
-    }
-    let mut entry = [0_u8; WITHDRAWAL_HINT_SIZE];
-    let (pairs, _) = bytes.as_chunks::<2>();
-    for (slot, [high, low]) in entry.iter_mut().zip(pairs) {
-        let high = nibble(*high)?;
-        let low = nibble(*low)?;
-        *slot = (high << NIBBLE_BITS) | low;
-    }
-    Some(entry)
-}
-
-fn nibble(digit: u8) -> Option<u8> {
-    HEX_DIGITS
-        .iter()
-        .position(|candidate| *candidate == digit)
-        .and_then(|position| u8::try_from(position).ok())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -350,7 +288,9 @@ mod tests {
         WITHDRAWN_RECORD_ENTRIES, WithdrawalError, WithdrawalKey, WithdrawnRecord,
         WithdrawnRecordError, withdrawal_counter,
     };
-    use crate::{PAIR_ID_SIZE, PairId, X25519_KEY_SIZE, noise::x25519_public_key};
+    use crate::{
+        PAIR_ID_SIZE, PairId, X25519_KEY_SIZE, noise::x25519_public_key, txt::AnnouncementCandidate,
+    };
 
     /// Synthetic static private keys and pair identifier bytes.
     const CUSTODIAN_PRIVATE_BYTE: u8 = 0x11;
@@ -360,6 +300,7 @@ mod tests {
     const INSTANCE: &str = "refineid-7f2a1c84";
     const OTHER_INSTANCE: &str = "refineid-b3d90e15";
     const COUNTER: u64 = 29_858_400;
+    const LAST_USED_MS: u64 = 1;
 
     fn keys() -> (WithdrawalKey, WithdrawalKey) {
         let custodian = [CUSTODIAN_PRIVATE_BYTE; X25519_KEY_SIZE];
@@ -378,7 +319,11 @@ mod tests {
     }
 
     fn record_with(hint: [u8; WITHDRAWAL_HINT_SIZE]) -> WithdrawnRecord {
-        WithdrawnRecord::assemble(&[hint], |bytes| {
+        let candidate = AnnouncementCandidate {
+            hint,
+            last_used_ms: LAST_USED_MS,
+        };
+        WithdrawnRecord::assemble(&[candidate], |bytes| {
             bytes.fill(FILLER_BYTE);
             Ok(())
         })
@@ -461,21 +406,66 @@ mod tests {
     }
 
     #[test]
-    fn more_than_eight_hints_are_refused() {
-        let hints = [[0_u8; WITHDRAWAL_HINT_SIZE]; WITHDRAWN_RECORD_ENTRIES + 1];
+    fn pairings_beyond_the_eighth_are_not_announced() {
+        let candidates = (0..=WITHDRAWN_RECORD_ENTRIES)
+            .map(|index| AnnouncementCandidate {
+                hint: [u8::try_from(index).expect("small"); WITHDRAWAL_HINT_SIZE],
+                last_used_ms: u64::try_from(index).expect("small"),
+            })
+            .collect::<Vec<_>>();
+        let record = WithdrawnRecord::assemble(&candidates, |bytes| {
+            bytes.fill(FILLER_BYTE);
+            Ok(())
+        })
+        .expect("record");
+        let least_recent = [0_u8; WITHDRAWAL_HINT_SIZE];
+        assert!(!record.entries().contains(&least_recent));
+        for candidate in &candidates[1..] {
+            assert!(record.entries().contains(&candidate.hint));
+        }
+    }
+
+    #[test]
+    fn keys_are_case_insensitive_but_values_are_not() {
+        let eight = ["0123456789abcdef"; WITHDRAWN_RECORD_ENTRIES].join(",");
+        assert!(
+            WithdrawnRecord::parse(&[("V", "1"), ("MODE", "withdrawn"), ("Withdrawn", &eight)])
+                .is_ok()
+        );
         assert_eq!(
-            WithdrawnRecord::assemble(&hints, |_| Ok(())),
-            Err(WithdrawalError::TooManyHints)
+            WithdrawnRecord::parse(&[("v", "1"), ("mode", "WITHDRAWN"), ("withdrawn", &eight)]),
+            Err(WithdrawnRecordError::WrongHeader)
+        );
+        assert_eq!(
+            WithdrawnRecord::parse(&[
+                ("v", "1"),
+                ("mode", "withdrawn"),
+                ("withdrawn", &eight),
+                ("WITHDRAWN", &eight)
+            ]),
+            Err(WithdrawnRecordError::UnexpectedKey)
         );
     }
 
     #[test]
-    fn instance_names_are_one_label() {
+    fn instance_names_are_the_instance_portion() {
         assert_eq!(
             InstanceName::new(""),
             Err(WithdrawalError::InvalidInstanceName)
         );
         assert!(InstanceName::new(&"a".repeat(MAX_INSTANCE_NAME_SIZE)).is_ok());
+        assert!(InstanceName::new("Office Mac (2)").is_ok());
+        assert!(InstanceName::new("refineid.7f2a").is_ok());
+        for misuse in [
+            "refineid-7f2a1c84._refineid-stream._tcp",
+            "refineid-7f2a1c84._refineid-stream._tcp.local",
+            "refineid-7f2a1c84._refineid-stream._tcp.local.",
+        ] {
+            assert_eq!(
+                InstanceName::new(misuse),
+                Err(WithdrawalError::InvalidInstanceName)
+            );
+        }
         assert_eq!(
             InstanceName::new(&"a".repeat(MAX_INSTANCE_NAME_SIZE + 1)),
             Err(WithdrawalError::InvalidInstanceName)

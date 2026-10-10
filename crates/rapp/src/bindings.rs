@@ -1298,6 +1298,31 @@ fn pairing_context(
 }
 
 #[cfg(test)]
+mod discovery_hint_tests {
+    use super::{RappBindingError, rapp_discovery_hint};
+
+    /// Seconds into the window the corpus vector names, so the export
+    /// must divide by the window length rather than take an epoch.
+    const SECONDS_INTO_WINDOW: u64 = 899;
+
+    #[test]
+    fn export_matches_the_corpus_window_from_wall_time() {
+        let token = hex::decode("5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a").expect("token hex");
+        let epoch_start = 1_990_560 * crate::DISCOVERY_HINT_EPOCH_SECONDS;
+        let hint = rapp_discovery_hint(token, epoch_start + SECONDS_INTO_WINDOW).expect("hint");
+        assert_eq!(hex::encode(hint), "96b4d41e75873658");
+    }
+
+    #[test]
+    fn wrong_size_token_is_refused() {
+        assert!(matches!(
+            rapp_discovery_hint(vec![0; 15], 0),
+            Err(RappBindingError::InvalidInput)
+        ));
+    }
+}
+
+#[cfg(test)]
 mod pairing_bridge_tests {
     use super::*;
     use crate::{
@@ -2479,6 +2504,32 @@ pub fn rapp_stream_session_preamble(
 #[must_use]
 pub fn rapp_stream_profile_name() -> String {
     STREAM_PROFILE.to_owned()
+}
+
+/// Rotating discovery hint of one stored pairing for the 15-minute window
+/// containing `unix_time_seconds` (hierarchy specification section 4.3).
+///
+/// A custodian publishes the hints of the current window; a requester
+/// compares its own pairings against the current and adjacent windows.
+///
+/// # Errors
+/// [`RappBindingError::InvalidInput`] on a wrong-size token.
+#[uniffi::export]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "uniffi lowers exported arguments as owned values"
+)]
+pub fn rapp_discovery_hint(
+    rendezvous_token: Vec<u8>,
+    unix_time_seconds: u64,
+) -> Result<Vec<u8>, RappBindingError> {
+    let token = RendezvousToken::reconstruct(&rendezvous_token)
+        .map_err(|_| RappBindingError::InvalidInput)?;
+    Ok(super::discovery_hint(
+        &token,
+        unix_time_seconds / super::DISCOVERY_HINT_EPOCH_SECONDS,
+    )
+    .to_vec())
 }
 
 fn encode_pair_record(record: &PairRecord) -> Result<Vec<u8>, RappBindingError> {

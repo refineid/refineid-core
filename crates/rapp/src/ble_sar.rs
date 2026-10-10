@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The RAPP BLE segmentation and reassembly framing (RAPP v26.10.9 §5.3).
+//! The RAPP BLE segmentation and reassembly framing (RAPP v26.10.10 §5.3).
 //!
 //! Every message on the Channel Characteristic travels as one or more
 //! fragments, each a 6-byte header (total length, chunk sequence, flags,

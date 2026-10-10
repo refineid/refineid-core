@@ -1,7 +1,7 @@
 // Copyright 2026 Petri Koistinen
 // Licensed under the Apache License, Version 2.0.
 
-//! Replay of the RAPP v26.10.9 transport-bound corpus sections: pairing
+//! Replay of the RAPP v26.10.10 transport-bound corpus sections: pairing
 //! offers, CPace KC2 transcripts per transport, both Noise transcripts per
 //! transport (cross-checked against snow).
 
@@ -15,7 +15,7 @@ use refineid_rapp::{
 };
 use serde::Deserialize;
 
-const CORPUS: &str = include_str!("../../../docs/protocols/vectors/rapp-v26.10.9.json");
+const CORPUS: &str = include_str!("../../../docs/protocols/vectors/rapp-v26.10.10.json");
 
 #[derive(Deserialize)]
 struct Corpus {
@@ -201,7 +201,7 @@ fn kc2_transcripts_bind_the_transport_of_the_connection() {
 }
 
 /// Generator string length: lv(DSI) + lv(PRS) + lv(zero padding) + lv(C) +
-/// lv(SID) (RAPP v26.10.9 §6.1.2).
+/// lv(SID) (RAPP v26.10.10 §6.1.2).
 #[test]
 fn generator_strings_have_the_lengths_the_specification_states() {
     const DSI: usize = 18;

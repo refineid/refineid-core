@@ -1,8 +1,8 @@
 # Remote Authorization Proxy Protocol (RAPP)
 ## Transport and Discovery Hierarchy Specification
 
-- **Document Version**: `26.10.9`
-- **Protocol Versions**: `26.10.9`
+- **Document Version**: `26.10.10`
+- **Protocol Versions**: `26.10.10`
 - **Status**: Normative Specification / Architecture Blueprint
 - **Change Controller**: RefineID Project
 - **Applies To**: `refineid-core`, `refineid-unix`, `refineid-windows`, `refineid-apple`, `refineid-android`
@@ -96,13 +96,13 @@ Tier 3: Local IP Stream via mDNS / DNS-SD
 
 ### 3.2 Tier 2: Bluetooth / BLE Proximity Transport (`fi.refineid.rapp.ble.v1`)
 - **Applicability**: Standard cross-platform proximity transport across supported platforms (iOS, Android, Linux/BSD, Windows, macOS).
-- **Normative Specification**: Governed normatively by RAPP v26.10.9 §2–§5.
+- **Normative Specification**: Governed normatively by RAPP v26.10.10 §2–§5.
 - **Wire Profile**: The canonical cross-platform wire profile is GATT-based `fi.refineid.rapp.ble.v1`:
   - Primary Service UUID: `7E39FD01-A6B5-4D78-9E11-37E28E9545F1`
   - Channel Characteristic UUID: `7E39FD02-A6B5-4D78-9E11-37E28E9545F1` (Requester writes via `ATT_WRITE_REQ`; Custodian indicates via `ATT_HANDLE_VALUE_IND`)
   - Bootstrap Characteristic UUID: `7E39FD03-A6B5-4D78-9E11-37E28E9545F1` (Requester reads via `ATT_READ_REQ`)
   - Framing: Mandates ATT MTU Exchange ($\ge 512$ bytes) and RAPP BLE SAR framing (6-byte header: Total Frame Length, Chunk Sequence, Flags, Reserved).
-- **Advisory Proximity Gating (RAPP v26.10.9 §4.4)**:
+- **Advisory Proximity Gating (RAPP v26.10.10 §4.4)**:
   - The Requester enforces an advisory RSSI discovery gate ($\ge -55\text{ dBm}$ filtered median over at least 3 packets, configurable down to $-85\text{ dBm}$ strictly in isolated developer testing).
   - **Threat Model & Non-Guarantee**: RSSI is strictly an **advisory discovery heuristic** and defense-in-depth barrier. It does NOT constitute a cryptographic proof of physical co-location and CANNOT defeat transparent RF wormholes, relays, or directional power amplifiers that preserve authenticated frames. Real-world protection against relay attacks is enforced at Layer 7 by explicit per-operation user authorization on the Custodian phone screen and PACE/CAN boundaries.
 - **Platform Capability Constraints & L2CAP CoC Distinction**:
@@ -120,7 +120,7 @@ Tier 3: Local IP Stream via mDNS / DNS-SD
   - Custodian runs `StreamRelayListener` on a dynamic, ephemeral TCP port (`bind(0)`).
   - Custodian advertises service type `_refineid-stream._tcp.local.` via mDNS.
   - Requester runs `StreamRelayBrowser`, receives the PTR/SRV/TXT records, and initiates an **outbound** TCP `connect()` to the phone's advertised IP and port.
-- **Wire Profile**: Governed normatively by RAPP v26.10.9 §2.2.2. Each frame is a 2-byte unsigned big-endian length followed by 1 to 65535 payload bytes. The Requester's first frame is the routing preamble `["RAPP-stream-v1", purpose, routing]` (RAPP v26.10.10 §2.2.1). After a `"pairing"` preamble the Custodian's first frame is the encoded `pairing-offer` (§4.2); after a `"session"` preamble the Custodian routed the Requester sends `Noise_KK` message 1.
+- **Wire Profile**: Governed normatively by RAPP v26.10.10 §2.2.2. Each frame is a 2-byte unsigned big-endian length followed by 1 to 65535 payload bytes. The Requester's first frame is the routing preamble `["RAPP-stream-v1", purpose, routing]` (RAPP v26.10.10 §2.2.1). After a `"pairing"` preamble the Custodian's first frame is the encoded `pairing-offer` (§4.2); after a `"session"` preamble the Custodian routed the Requester sends `Noise_KK` message 1.
 
 ---
 
@@ -156,7 +156,7 @@ The Custodian publishes three distinct discovery modes:
      v=1
      mode=pairing
      ```
-   - Nothing derived from the pairing code or the offer is published. The Requester obtains the offer over the connection (RAPP v26.10.9 §4.2).
+   - Nothing derived from the pairing code or the offer is published. The Requester obtains the offer over the connection (RAPP v26.10.10 §4.2).
 
 2. **Session Reconnect Mode (`mode=session`)**:
    - Active when "Allow Remote Card Reader" is enabled and the phone is ready for operational card requests.

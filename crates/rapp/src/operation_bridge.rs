@@ -395,7 +395,7 @@ pub enum RappTerminalReason {
 }
 
 impl RappTerminalReason {
-    /// The reason a failure result names (RAPP v26.10.9 section 10).
+    /// The reason a failure result names (RAPP v26.10.10 section 10).
     #[must_use]
     pub const fn from_result(status: ResultStatus, error: Option<ResultError>) -> Self {
         match (status, error) {
@@ -1287,7 +1287,7 @@ impl RappOperationBridge {
         )
     }
 
-    /// Complete an identity read (RAPP v26.10.9 section 9.1).
+    /// Complete an identity read (RAPP v26.10.10 section 9.1).
     ///
     /// Both dates are `YYYY-MM-DD`; at least one DER certificate travels.
     ///

@@ -147,10 +147,10 @@ pub enum RappBindingError {
     /// Referenced operation was not found in the active session.
     UnknownOperation,
     /// Three pairing attempts failed against one offer; the offer is
-    /// destroyed (RAPP v26.10.9 §3.3).
+    /// destroyed (RAPP v26.10.10 §3.3).
     AttemptsExhausted,
     /// A pre-authentication attempt came within 500 ms of the previous one
-    /// (RAPP v26.10.9 §3.3.8); the caller refuses it and changes nothing.
+    /// (RAPP v26.10.10 §3.3.8); the caller refuses it and changes nothing.
     RateLimited,
 }
 
@@ -306,7 +306,7 @@ pub struct RappPairingBridge {
 
 #[uniffi::export]
 impl RappPairingBridge {
-    /// Create the custodian's offer (RAPP v26.10.9 §4.2) from a fresh
+    /// Create the custodian's offer (RAPP v26.10.10 §4.2) from a fresh
     /// platform-CSPRNG `offer_id`, the offered credential profiles, and the
     /// transport profiles the offer is served on.
     ///
@@ -336,7 +336,7 @@ impl RappPairingBridge {
     }
 
     /// Accept the offer bootstrap the requester received over the
-    /// transport `transport_profile` (RAPP v26.10.9 §4.2): the Bootstrap
+    /// transport `transport_profile` (RAPP v26.10.10 §4.2): the Bootstrap
     /// Characteristic value on BLE, or the custodian's first frame after the
     /// pairing preamble on the stream transport.
     ///
@@ -1278,7 +1278,7 @@ impl RappPairingBridge {
 }
 
 /// The CPace context of `offer` for the connection whose offer entry has
-/// `candidate_id` (RAPP v26.10.9 §6.1.1).
+/// `candidate_id` (RAPP v26.10.10 §6.1.1).
 fn pairing_context(
     offer: &PairingOffer,
     offer_hash: &[u8; 32],
@@ -1779,7 +1779,7 @@ mod pairing_bridge_tests {
 }
 
 /// The custodian's process-wide backoff after locked-out offers
-/// (RAPP v26.10.9 §3.3.7), driven by platform monotonic milliseconds.
+/// (RAPP v26.10.10 §3.3.7), driven by platform monotonic milliseconds.
 #[derive(Debug, Default, uniffi::Object)]
 pub struct RappPairingBackoff {
     backoff: Mutex<PairingBackoff>,
@@ -2847,7 +2847,7 @@ pub(super) fn take_unsigned(
 }
 
 /// The BLE segmentation and reassembly receiver for one connection and one
-/// direction (RAPP v26.10.9 §5.3).
+/// direction (RAPP v26.10.10 §5.3).
 ///
 /// Any refused fragment zeroizes the partial frame; the caller then drops
 /// the connection.
@@ -2916,7 +2916,7 @@ impl RappBleSarReassembler {
 }
 
 /// The uniform SAR fragment payload capacity for a negotiated ATT MTU and
-/// any smaller value limit the platform reports (RAPP v26.10.9 §5.3).
+/// any smaller value limit the platform reports (RAPP v26.10.10 §5.3).
 ///
 /// # Errors
 /// [`RappBindingError::InvalidInput`] below an MTU of 512 or when the limit

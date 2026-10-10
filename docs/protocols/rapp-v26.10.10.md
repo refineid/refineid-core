@@ -1,12 +1,12 @@
 # Remote Authorization Proxy Protocol (RAPP) v26.10.10
 ## Transport-Generic Pairing, BLE Direct Proximity and Stream Transport Specification
 
-Status: Draft awaiting the project owner's stamp. §6.4 and the corpora it cites carry the bytes of wire version `[26, 10, 9]` until the stamp regenerates them.  
+Status: Normative Specification / Research Record  
 Document version: 26.10.10  
 Wire version: `[26, 10, 10]` (`[Year, Month, Day]`)  
 Offer version: `[26, 10, 10]`  
 Transport Profiles: `"fi.refineid.rapp.ble.v1"`, `"fi.refineid.stream.v1"` (§2.2)  
-Date: unstamped  
+Date: 2026-10-10  
 Change controller: RefineID project  
 
 ---
@@ -826,23 +826,23 @@ The following normative test vector specifies the exact cryptographic transcript
   - Input `grants_hash`: `7777777777777777777777777777777777777777777777777777777777777777` (32 bytes)
   - Input `transport_profile`: `"fi.refineid.rapp.ble.v1"`
   - Encoded `prologue` (deterministic CBOR array, hex):
-    `866f524150502d73657373696f6e2d763183181a0a0978204e6f6973655f4b4b5f32353531395f436861436861506f6c795f534841353132508ab9b8bcde5c6eec845d9b1ca0d3a7be582077777777777777777777777777777777777777777777777777777777777777777766692e726566696e6569642e726170702e626c652e7631`
+    `866f524150502d73657373696f6e2d763183181a0a0a78204e6f6973655f4b4b5f32353531395f436861436861506f6c795f534841353132508ab9b8bcde5c6eec845d9b1ca0d3a7be582077777777777777777777777777777777777777777777777777777777777777777766692e726566696e6569642e726170702e626c652e7631`
 - **Handshake Wire Messages**:
   - **Message 1** (`-> e, es, ss`, 48 bytes: 32 bytes $e_{i, pub} \parallel 16$ bytes empty payload tag):
-    `7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b148c30d38badede403881573a1f023ad78`
+    `7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b149a63e73abf65ea4dec7a3df0025f5b6c`
   - **Message 2** (`<- e, ee, se`, 48 bytes: 32 bytes $e_{r, pub} \parallel 16$ bytes empty payload tag):
-    `ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b51a4403df69f4ff726d545270f37e8f9`
+    `ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b518e03ebb38bc0cc00aad6d71427cdff`
 - **Handshake Completion & Split Output**:
   - Final Handshake Hash ($h$, 64 bytes):
-    `c5fafdf985a18a48d4bf61e8784c34e07838a06bd41a3459bd32f3755fdb5713822fd0f1ada4af0cf13747a5e51158580bd17cb3dce870865ba5d93ecd4fa275`
+    `b054428bd222f4590ede01fa9b58ae0a32a0eb9f209519cc2c682cd6c8fcd70686aa615b02b04c3c6945d356e8c0a25c3134c3b55e5f209be5c3d6ed75df4f70`
   - Initiator-to-Responder Directional Transport Cipher Key ($c_1$, 32 bytes):
     `271245e9b5ffc357a6d442e04a376531bd3a0f81d69d7b97eaa132cc81d209ab`
   - Responder-to-Initiator Directional Transport Cipher Key ($c_2$, 32 bytes):
     `f3364ea960fcb3b95518b6029e2fbac8d1f259e630fa53beb63cf647e672ca40`
   - Operational Session Identifier (`session_id`, 16 bytes):
-    `16b5a8c5ab7a7b9dbc9f08e02a9974fc`
+    `78260a69cecd4931778e59a9e0d2de4e`
 
-This test vector is also cataloged under entry `"session-kk-fixed-transcript-ble"` in `docs/protocols/vectors/rapp-v26.10.9.json`, beside `"session-kk-fixed-transcript-stream"` for the stream transport profile (same keys, prologue naming `"fi.refineid.stream.v1"`).
+This test vector is also cataloged under entry `"session-kk-fixed-transcript-ble"` in `docs/protocols/vectors/rapp-v26.10.10.json`, beside `"session-kk-fixed-transcript-stream"` for the stream transport profile (same keys, prologue naming `"fi.refineid.stream.v1"`).
 
 ---
 

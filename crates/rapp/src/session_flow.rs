@@ -33,7 +33,7 @@ pub struct SessionHandshake {
 
 impl SessionHandshake {
     /// Requester-only explicit session start over `transport`, the
-    /// transport profile of the connection (RAPP v26.10.9 §4.3).
+    /// transport profile of the connection (RAPP v26.10.10 §4.3).
     ///
     /// # Errors
     /// [`SessionError`] on a role violation or a handshake-construction

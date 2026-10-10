@@ -75,7 +75,7 @@ const BLE_SERVICE_UUID_PARAMETER: &str = "service_uuid";
 /// Registered candidate identifier of the stream profile.
 pub const STREAM_CANDIDATE_ID: &str = "stream-1";
 
-/// A registered transport profile (RAPP v26.10.9 §2.2).
+/// A registered transport profile (RAPP v26.10.10 §2.2).
 ///
 /// Each profile fixes its candidate identifier and the exact offer-entry
 /// parameters, so a valid offer entry is fully determined by its profile.

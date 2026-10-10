@@ -8,7 +8,7 @@ use super::{
     OperationId, OperationReference, ProfileName, RequestHash, WireValue,
 };
 
-/// `operation-status-val` (RAPP v26.10.9 section 7.1).
+/// `operation-status-val` (RAPP v26.10.10 section 7.1).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResultStatus {
     /// Operation completed; acknowledgment is required unless retired.
@@ -52,7 +52,7 @@ impl ResultStatus {
     }
 }
 
-/// The `error` an `operation.result` names (RAPP v26.10.9 sections 8 and 10).
+/// The `error` an `operation.result` names (RAPP v26.10.10 sections 8 and 10).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResultError {
     /// The holder declined on screen.
@@ -260,7 +260,7 @@ impl ResultResponse {
     }
 }
 
-/// One `operation.result` (RAPP v26.10.9 section 7.1) bound to the request
+/// One `operation.result` (RAPP v26.10.10 section 7.1) bound to the request
 /// hash.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationResultMessage {

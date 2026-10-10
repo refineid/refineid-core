@@ -166,6 +166,9 @@ impl RequesterOperation {
                 TypedMessage::OperationResultAck(self.reference),
             ));
         }
+        let batch_signatures = result
+            .partial_batch_signatures(&self.request.operation)
+            .map_err(RequesterError::Operation)?;
         let terminal = result_status_state(result.status);
         self.persist_state(store, terminal)?;
         Ok(RequesterResultAction::Terminal {
@@ -173,6 +176,7 @@ impl RequesterOperation {
             status: result.status,
             error: result.error,
             remaining_retries: result.remaining_retries,
+            batch_signatures,
         })
     }
 
@@ -308,6 +312,8 @@ pub enum RequesterResultAction {
         error: Option<ResultError>,
         /// Remaining credential attempts the result reported.
         remaining_retries: Option<u8>,
+        /// Signatures an interrupted batch made before it became ambiguous.
+        batch_signatures: Vec<Vec<u8>>,
     },
 }
 

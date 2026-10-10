@@ -305,6 +305,26 @@ impl OperationResultMessage {
         result
     }
 
+    /// A non-successful result that also carries a batch's progress.
+    ///
+    /// An ambiguous batch that already made signatures carries them as the
+    /// section 9.3 partial response, so they are delivered and never made
+    /// again; every other failure carries no response.
+    #[must_use]
+    pub fn failure_with_batch(
+        reference: OperationReference,
+        failure: ProxyFailure,
+        completed_signatures: &[Vec<u8>],
+    ) -> Self {
+        let mut result = Self::failure(reference, failure);
+        if failure.status() == ResultStatus::Ambiguous && !completed_signatures.is_empty() {
+            result.response = Some(ResultResponse {
+                fields: partial_batch_response(completed_signatures),
+            });
+        }
+        result
+    }
+
     /// A non-successful result naming a registered status and error.
     #[must_use]
     pub const fn rejection(
@@ -368,6 +388,9 @@ impl OperationResultMessage {
             (ResultStatus::Completed, Some(error), None) => {
                 self.retired && matches!(error, ResultError::OperationAlreadyRetired)
             }
+            (ResultStatus::Ambiguous, Some(error), Some(_)) => {
+                !self.retired && error.permits(ResultStatus::Ambiguous)
+            }
             (status, Some(error), None) => {
                 !matches!(status, ResultStatus::Completed) && error.permits(status)
             }
@@ -394,13 +417,45 @@ impl OperationResultMessage {
         if !self.is_consistent() {
             return Err(CardOperationError::InvalidField("result"));
         }
-        if let Some(response) = &self.response {
+        if self.status == ResultStatus::Ambiguous {
+            self.partial_batch_signatures(operation)?;
+        } else if let Some(response) = &self.response {
             let result = response.typed_for(operation)?;
             if !result_matches_operation(&result, operation) {
                 return Err(CardOperationError::ProfileActionMismatch);
             }
         }
         Ok(())
+    }
+
+    /// The signatures an ambiguous batch made before it was interrupted;
+    /// empty when the result carries no partial progress.
+    ///
+    /// # Errors
+    /// [`CardOperationError::InvalidField`] when a partial response answers
+    /// an operation that is not a batch, or does not carry fewer signatures
+    /// than the batch has documents with a matching count.
+    pub fn partial_batch_signatures(
+        &self,
+        operation: &CardOperation,
+    ) -> Result<Vec<Vec<u8>>, CardOperationError> {
+        let (ResultStatus::Ambiguous, Some(response)) = (self.status, &self.response) else {
+            return Ok(Vec::new());
+        };
+        let total = operation
+            .batch_total()
+            .ok_or(CardOperationError::InvalidField("response"))?;
+        let mut fields = response.fields.clone();
+        let completed = take_byte_array(&mut fields, "completed_signatures")
+            .map_err(|_| CardOperationError::InvalidField("response"))?;
+        let count = match fields.remove("completed_count") {
+            Some(WireValue::Unsigned(count)) => usize::try_from(count).ok(),
+            _ => None,
+        };
+        if count != Some(completed.len()) || completed.len() >= total || !fields.is_empty() {
+            return Err(CardOperationError::InvalidField("response"));
+        }
+        Ok(completed)
     }
 
     /// Encode the exact `operation.result` body.
@@ -488,7 +543,14 @@ impl OperationResultMessage {
     }
 }
 
-const fn result_matches_operation(result: &CardOperationResult, operation: &CardOperation) -> bool {
+fn result_matches_operation(result: &CardOperationResult, operation: &CardOperation) -> bool {
+    if let (
+        CardOperationResult::Signatures(signatures),
+        CardOperation::BatchSignDocuments { digests, .. },
+    ) = (result, operation)
+    {
+        return signatures.len() == digests.len();
+    }
     matches!(
         (result, operation),
         (
@@ -576,6 +638,12 @@ fn result_to_wire(result: &CardOperationResult) -> BTreeMap<String, WireValue> {
         CardOperationResult::Signature(bytes) => {
             body.insert("signature".into(), WireValue::Bytes(bytes.clone()));
         }
+        CardOperationResult::Signatures(signatures) => {
+            body.insert(
+                "signatures".into(),
+                WireValue::Array(signatures.iter().cloned().map(WireValue::Bytes).collect()),
+            );
+        }
     }
     body
 }
@@ -634,11 +702,45 @@ fn result_from_wire(
         CardOperation::BrowserAuthenticate { .. } | CardOperation::SignDocument { .. } => {
             CardOperationResult::Signature(take_bytes(&mut body, "signature")?)
         }
+        CardOperation::BatchSignDocuments { .. } => {
+            CardOperationResult::Signatures(take_byte_array(&mut body, "signatures")?)
+        }
     };
     if !body.is_empty() {
         return Err(CardOperationError::UnexpectedField);
     }
     Ok(result)
+}
+
+/// The `response` an ambiguous batch carries: the signatures made before
+/// the interruption, which are never made again (section 9.3).
+fn partial_batch_response(completed: &[Vec<u8>]) -> BTreeMap<String, WireValue> {
+    BTreeMap::from([
+        (
+            "completed_signatures".to_owned(),
+            WireValue::Array(completed.iter().cloned().map(WireValue::Bytes).collect()),
+        ),
+        (
+            "completed_count".to_owned(),
+            WireValue::Unsigned(completed.len() as u64),
+        ),
+    ])
+}
+
+fn take_byte_array(
+    body: &mut BTreeMap<String, WireValue>,
+    name: &'static str,
+) -> Result<Vec<Vec<u8>>, CardOperationError> {
+    let Some(WireValue::Array(values)) = body.remove(name) else {
+        return Err(CardOperationError::InvalidField(name));
+    };
+    values
+        .into_iter()
+        .map(|value| match value {
+            WireValue::Bytes(bytes) if !bytes.is_empty() => Ok(bytes),
+            _ => Err(CardOperationError::InvalidField(name)),
+        })
+        .collect()
 }
 
 fn insert_optional_attempt(body: &mut BTreeMap<String, WireValue>, name: &str, value: Option<u8>) {

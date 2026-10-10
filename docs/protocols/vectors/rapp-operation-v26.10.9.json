@@ -30,7 +30,19 @@
       "pin1_attempts": 3,
       "pin2_attempts": null,
       "puk_attempts": 5
-    }
+    },
+    "batch_document_names": [
+      "Contract.pdf",
+      "Annex.pdf"
+    ],
+    "batch_digests_sha256": [
+      "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "abababababababababababababababababababababababababababababababab"
+    ],
+    "batch_signatures": [
+      "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
+    ]
   },
   "vectors": [
     {
@@ -193,6 +205,22 @@
       "name": "result-rejected-invalid-credential",
       "message_type": "OperationResult",
       "body_hex": "a5656572726f7272696e76616c69645f63726564656e7469616c667374617475736872656a65637465646c6f7065726174696f6e5f696450222222222222222222222222222222226c726571756573745f68617368582033333333333333333333333333333333333333333333333333333333333333337172656d61696e696e675f7265747269657302"
+    },
+    {
+      "name": "request-batch-sign-documents",
+      "message_type": "OperationRequest",
+      "body_hex": "a666616374696f6e7462617463685f7369676e5f646f63756d656e747367636f6e74657874a16e646f63756d656e745f6e616d6573826c436f6e74726163742e70646669416e6e65782e706466677061796c6f6164a36764696765737473825820cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc5820abababababababababababababababababababababababababababababababab69616c676f726974686d6c65636473615f7368613235366b6b65795f70726f66696c656a65636473615f703235366770726f66696c65781f66692e726566696e6569642e646f63756d656e742d7369676e696e672e76316c6f7065726174696f6e5f6964501111111111111111111111111111111170657870697265735f61667465725f6d731a0001d4c0",
+      "request_hash_hex": "a056f4117d5a21ad98540db3b0bd2c9ce27be9ef383a794915613796fd8bd9ce"
+    },
+    {
+      "name": "result-completed-batch-signatures",
+      "message_type": "OperationResult",
+      "body_hex": "a46673746174757369636f6d706c6574656468726573706f6e7365a16a7369676e617475726573825840eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee5840efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef6c6f7065726174696f6e5f696450222222222222222222222222222222226c726571756573745f6861736858203333333333333333333333333333333333333333333333333333333333333333"
+    },
+    {
+      "name": "result-ambiguous-batch-partial",
+      "message_type": "OperationResult",
+      "body_hex": "a5656572726f726a636172645f6572726f726673746174757369616d626967756f757368726573706f6e7365a26f636f6d706c657465645f636f756e740174636f6d706c657465645f7369676e617475726573815840eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee6c6f7065726174696f6e5f696450222222222222222222222222222222226c726571756573745f6861736858203333333333333333333333333333333333333333333333333333333333333333"
     }
   ]
 }

@@ -10,8 +10,9 @@
 use std::collections::BTreeMap;
 
 use refineid_rapp::{
-    CardOperation, CertificateKind, Envelope, MessageType, OperationId, OperationState, PairId,
-    ProtocolErrorMessage, ResultError, ResultStatus, SessionId, TypedMessage, WireValue,
+    CardKeyProfile, CardOperation, CardOperationResult, CertificateKind, Envelope, MessageType,
+    OperationId, OperationReference, OperationState, PairId, ProtocolErrorMessage, ResultError,
+    ResultStatus, SessionId, SignatureAlgorithm, TypedMessage, WireValue,
     decode_deterministic_cbor, encode_deterministic_cbor,
 };
 use serde::Deserialize;
@@ -90,7 +91,7 @@ fn corpus_names_this_protocol_version() {
     let corpus = corpus();
     assert_eq!(corpus.format, "fi.refineid.rapp.operation-vectors-v1");
     assert_eq!(corpus.protocol_document_version, "26.10.9");
-    assert_eq!(corpus.vectors.len(), 31);
+    assert_eq!(corpus.vectors.len(), 34);
 }
 
 #[test]
@@ -210,5 +211,87 @@ fn registry_values_decode_to_their_meaning() {
     assert_eq!(
         find("error-unknown-operation-bare"),
         TypedMessage::Error(ProtocolErrorMessage::UnknownOperation(None))
+    );
+}
+
+/// The batch the corpus's batch vectors answer.
+fn batch_operation(corpus: &Corpus) -> CardOperation {
+    let TypedMessage::OperationRequest(request) = typed(
+        corpus
+            .vectors
+            .iter()
+            .find(|vector| vector.name == "request-batch-sign-documents")
+            .expect("corpus has the batch request"),
+        &corpus.fixed_inputs,
+    ) else {
+        panic!("the batch request is admitted");
+    };
+    request.operation
+}
+
+#[test]
+fn batch_request_carries_its_documents_in_order() {
+    let corpus = corpus();
+    let CardOperation::BatchSignDocuments {
+        document_names,
+        key_profile,
+        algorithm,
+        digests,
+    } = batch_operation(&corpus)
+    else {
+        panic!("the batch request names a batch");
+    };
+    assert_eq!(document_names, ["Contract.pdf", "Annex.pdf"]);
+    assert_eq!(key_profile, CardKeyProfile::EcdsaP256);
+    assert_eq!(algorithm, SignatureAlgorithm::EcdsaSha256);
+    assert_eq!(digests.len(), 2);
+}
+
+#[test]
+fn batch_results_read_as_signatures_and_partial_progress() {
+    let corpus = corpus();
+    let operation = batch_operation(&corpus);
+    let find = |name: &str| {
+        let vector = corpus
+            .vectors
+            .iter()
+            .find(|vector| vector.name == name)
+            .unwrap_or_else(|| panic!("corpus lacks {name}"));
+        let TypedMessage::OperationResult(result) = typed(vector, &corpus.fixed_inputs) else {
+            panic!("{name} is a result");
+        };
+        result
+    };
+
+    let completed = find("result-completed-batch-signatures");
+    let reference = OperationReference {
+        operation_id: completed.operation_id,
+        request_hash: completed.request_hash,
+    };
+    completed
+        .validate_for(reference, &operation)
+        .expect("the completed batch answers the batch");
+    let Ok(CardOperationResult::Signatures(signatures)) = completed
+        .response
+        .as_ref()
+        .expect("a completed batch carries signatures")
+        .typed_for(&operation)
+    else {
+        panic!("the completed batch reads as signatures");
+    };
+    assert_eq!(signatures.len(), 2);
+
+    let partial = find("result-ambiguous-batch-partial");
+    assert_eq!(partial.status, ResultStatus::Ambiguous);
+    assert_eq!(partial.error, Some(ResultError::CardError));
+    partial
+        .validate_for(reference, &operation)
+        .expect("the partial batch answers the batch");
+    assert_eq!(
+        partial
+            .partial_batch_signatures(&operation)
+            .expect("partial progress")
+            .len(),
+        1
     );
 }

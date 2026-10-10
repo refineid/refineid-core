@@ -4,11 +4,12 @@ use core::fmt;
 
 use super::{
     ApprovalOutcome, AuthorizationError, AuthorizationStage, AuthorizationTransaction,
-    AuthorizedCardCommand, AuthorizedSafeRead, JournalError, JournalRecoveryStore, OperationId,
-    OperationJournal, OperationProgressMessage, OperationReference, OperationRequest,
-    OperationResultMessage, OperationState, PendingCardCommand, ProfileName, ProgressEvent,
-    ProtocolErrorMessage, ProxyFailure, RecoveredProxyRecord, ResultJournalStore, ResultStatus,
-    StatusReport, TypedMessage, UserApproval,
+    AuthorizedCardCommand, AuthorizedSafeRead, CardOperationResult, JournalError,
+    JournalRecoveryStore, JournalStore, OperationId, OperationJournal, OperationProgressMessage,
+    OperationReference, OperationRequest, OperationResultMessage, OperationState,
+    PendingCardCommand, ProfileName, ProgressEvent, ProtocolErrorMessage, ProxyFailure,
+    RecoveredProxyRecord, ResultJournalStore, ResultStatus, StatusReport, TypedMessage,
+    UserApproval,
 };
 
 /// Maximum incoming operation requests permitted per rolling minute window.
@@ -224,7 +225,11 @@ impl ProxyOperationEngine {
         let operation = self
             .operation_mut(operation_id)
             .ok_or(ProxyEngineError::UnknownLocalOperation)?;
-        let result = OperationResultMessage::failure(operation.reference(), failure);
+        let result = OperationResultMessage::failure_with_batch(
+            operation.reference(),
+            failure,
+            operation.batch_signatures(),
+        );
         operation
             .finish_failure_result(store, &result)
             .map_err(map_local_authorization_error)?;
@@ -232,6 +237,46 @@ impl ProxyOperationEngine {
             close_session: failure.closes_session(),
             message: TypedMessage::OperationResult(result),
         })
+    }
+
+    /// Persist one batch signature before the next document is signed
+    /// (section 9.3). A signature recorded here is delivered even if the
+    /// batch is interrupted.
+    ///
+    /// # Errors
+    /// [`ProxyEngineError`] on an unknown operation, an operation that is
+    /// not an executing batch, or a persistence failure.
+    pub fn record_batch_signature<S: JournalStore>(
+        &mut self,
+        store: &mut S,
+        operation_id: OperationId,
+        signature: Vec<u8>,
+    ) -> Result<(), ProxyEngineError<S::Error>> {
+        self.operation_mut(operation_id)
+            .ok_or(ProxyEngineError::UnknownLocalOperation)?
+            .record_batch_signature(store, signature)
+            .map_err(map_local_authorization_error)
+    }
+
+    /// Answer a batch once every document's signature is journaled, with
+    /// exactly those signatures.
+    ///
+    /// # Errors
+    /// [`ProxyEngineError`] on an unknown operation, a batch with documents
+    /// left to sign, or a persistence failure.
+    pub fn complete_batch<S: ResultJournalStore>(
+        &mut self,
+        store: &mut S,
+        operation_id: OperationId,
+    ) -> Result<ProxyDispatch, ProxyEngineError<S::Error>> {
+        let operation = self
+            .operation(operation_id)
+            .ok_or(ProxyEngineError::UnknownLocalOperation)?;
+        let result = OperationResultMessage::completed(
+            operation.reference(),
+            &CardOperationResult::Signatures(operation.batch_signatures().to_vec()),
+        );
+        self.finish_completed(store, operation_id, result)
     }
 
     /// Create an authenticated advisory progress message for an active operation.
@@ -403,11 +448,11 @@ impl ProxyOperationEngine {
                 TypedMessage::OperationResultAck(reference),
             ));
         };
-        let mut journal = OperationJournal::recovered(entry.record);
+        let mut journal = OperationJournal::recovered(entry.record.clone());
         journal
             .acknowledge_result(store)
             .map_err(map_journal_error)?;
-        entry.record = *journal.record();
+        entry.record = journal.record().clone();
         entry.retained_result = None;
         Ok(ProxyDispatch::ResultAcknowledged(operation_id))
     }
@@ -579,7 +624,18 @@ fn recovered_answer(entry: &RecoveredProxyRecord) -> OperationResultMessage {
         | OperationState::Committed
         | OperationState::Executing
         | OperationState::ResultPending
-        | OperationState::DeliveryUncertain => ProxyFailure::CardCompletionAmbiguous,
+        | OperationState::DeliveryUncertain => {
+            let completed = entry
+                .record
+                .batch
+                .as_ref()
+                .map_or(&[][..], |batch| batch.completed_signatures.as_slice());
+            return OperationResultMessage::failure_with_batch(
+                reference,
+                ProxyFailure::CardCompletionAmbiguous,
+                completed,
+            );
+        }
         OperationState::None
         | OperationState::Requested
         | OperationState::AwaitingConsent

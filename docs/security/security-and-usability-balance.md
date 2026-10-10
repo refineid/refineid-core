@@ -81,17 +81,17 @@ To completely eliminate prompt fatigue when signing multiple documents (e.g. 10 
 
 ---
 
-## 5. RAPP Pairing: High Security with a 6-Digit Code (PAKE)
+## 5. RAPP Pairing: High Security with a 6-Character Code (PAKE)
 
 Pairing must be effortless for humans while cryptographically impenetrable to network eavesdroppers and untrusted relays.
 
 ### 5.1 No QR Code Gimmicks
-RefineID prioritizes clean, accessible **6-digit numeric pairing codes** (formatted as two 3-digit groups: `123 456`) entered manually. QR codes are treated as optional shortcuts, never mandatory dependencies.
+RefineID prioritizes clean, accessible **6-character Crockford Base32 pairing codes** (formatted as three 2-character groups: `7K X4 M9`) entered manually. QR codes are treated as optional shortcuts, never mandatory dependencies.
 
 ### 5.2 Elimination of Relay Brute-Force via PAKE
-- Plain hashing of a 6-digit code (`SHA256(code)`) over an untrusted relay is vulnerable to instant offline dictionary attacks ($10^6$ combinations cracked in $<1\text{ ms}$ on a GPU).
-- RAPP adopts **CPace (draft-irtf-cfrg-cpace-21, cipher suite `CPACE-RISTR255-SHA512`)** over Ristretto255 for 6-digit numeric pairing.
-- **The PAKE Guarantee:** Mathematical immunity to offline dictionary attacks. The untrusted relay sees only uniform, random curve points. The relay learns zero bits of the PIN and cannot test guesses offline. An attacker can only test guesses through live, online attempts, which are strictly rate-limited and bounded by a short monotonic offer lifetime (60–120s).
+- The code carries 30 bits of entropy ($2^{30} \approx 1.07 \times 10^9$ codes, RAPP v26.10.9 §3.3). Plain hashing of the code (`SHA256(code)`) over an untrusted relay is still vulnerable to offline dictionary attacks: a single GPU exhausts $2^{30}$ SHA-256 guesses in well under a second.
+- RAPP adopts **CPace (draft-irtf-cfrg-cpace-21, cipher suite `CPACE-RISTR255-SHA512`)** over Ristretto255 for the 6-character pairing code.
+- **The PAKE Guarantee:** Mathematical immunity to offline dictionary attacks. The untrusted relay sees only uniform, random curve points. The relay learns zero bits of the code and cannot test guesses offline. An attacker can only test guesses through live, online attempts: at most 3 per offer, within a 60-second monotonic offer lifetime (RAPP v26.10.9 §3.3), for a success probability of at most $3 / 2^{30}$ per offer.
 
 ### 5.3 Closing Local Network Backdoors
 Pairing is an explicit, mutually authenticated ceremony. Direct unauthenticated LAN/mDNS record exchanges that automatically inject paired keys without user consent or pairing codes are prohibited.
@@ -114,5 +114,5 @@ Human users occasionally mistype digits. The security model must be resilient an
 | **Physical Security** | Card detachment | Card kept in wallet/pocket when idle | Hardware-level air gap; chip unpowered |
 | **Authentication (PIN 1)** | Unattended Keychain store | Instant tap-and-go login from computer | Click on computer = user intent; no arbitrary timers |
 | **Signing (PIN 2)** | Batch Signing (Solution A) | 1 PIN 2 entry per batch of documents | Conscious legal consent; zero prompt fatigue |
-| **Relay Pairing** | CPace PAKE (draft-irtf-cfrg-cpace-21) | Clean 6-digit code (`123 456`) | Zero offline dictionary attacks; relay is blind |
+| **Relay Pairing** | CPace PAKE (draft-irtf-cfrg-cpace-21) | Clean 6-character code (`7K X4 M9`) | Zero offline dictionary attacks; relay is blind |
 | **Typo Resilience** | Proportional error return | Clean retry with counter feedback | Prevents self-inflicted Denial of Service |

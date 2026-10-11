@@ -147,13 +147,18 @@ impl core::fmt::Display for RsaModulusError {
 impl core::error::Error for RsaModulusError {}
 
 impl RsaModulus {
-    /// Minimum modulus size accepted. 512-bit floor matches what
-    /// the lib-core stack sees from legacy FINEID cards; current
-    /// production is 2048+ but we don't enforce that here.
-    pub const MIN_BITS: usize = 512;
+    /// Minimum modulus size accepted. The keys this type admits
+    /// are the FINEID issuing CAs and Finnish CSCA generations (RSA
+    /// 4096 or elliptic-curve), eMRTD Document Signer keys, and the
+    /// card's own authentication key as the PKCS#11 module reads it
+    /// (RSA 3072 on FINEID S4-1 v3.1, secp384r1 on v4.0). 512-bit
+    /// RSA has been factored publicly since 1999 and 1024-bit is
+    /// deprecated everywhere; nothing legitimate here is below 2048.
+    pub const MIN_BITS: usize = 2048;
     /// Maximum modulus size accepted. 16 kbit ceiling is well
     /// past anything the ecosystem produces (current upper end
-    /// is 4096-bit RSA on FINEID S4-1 v3.1 cards).
+    /// is 4096-bit RSA in the FINEID issuing CAs and the Finnish
+    /// CSCA).
     pub const MAX_BITS: usize = 16384;
 
     /// Build from PKCS#1 magnitude bytes (no sign byte).
@@ -990,6 +995,9 @@ e7c1d3c8d5717a85f5e1d4cd3e8e95443ea76eeb220e2cc41cd57bd6e02bd9a8\
     /// the [`RsaModulus::MIN_BITS`] floor, used by the "too
     /// small" rejection test.
     const TOO_SMALL_MODULUS_BYTE_LEN: usize = 32;
+    /// Bytes-per-modulus one byte under the 2048-bit floor, so the
+    /// boundary itself is exercised rather than a value far below it.
+    const BELOW_FLOOR_MODULUS_BYTE_LEN: usize = RSA_2048_MODULUS_BYTE_LEN - 1;
     /// Arbitrary odd test bitpattern: every byte is 193 decimal,
     /// low bit set so the modulus is odd. The high nibble is
     /// non-zero so the bit length matches `byte_len * 8`.
@@ -1076,6 +1084,21 @@ e7c1d3c8d5717a85f5e1d4cd3e8e95443ea76eeb220e2cc41cd57bd6e02bd9a8\
             r,
             Err(RsaModulusError::BitsTooFew {
                 bits: TOO_SMALL_MODULUS_BITS,
+                min: RsaModulus::MIN_BITS
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_modulus_one_byte_below_floor() {
+        /// Bit length of the just-under fixture: full-width bytes,
+        /// one byte short of the floor.
+        const BELOW_FLOOR_MODULUS_BITS: usize = BELOW_FLOOR_MODULUS_BYTE_LEN * BITS_PER_BYTE_USIZE;
+        let r = RsaModulus::try_from_pkcs1(&[ODD_FILL_BYTE; BELOW_FLOOR_MODULUS_BYTE_LEN]);
+        assert!(matches!(
+            r,
+            Err(RsaModulusError::BitsTooFew {
+                bits: BELOW_FLOOR_MODULUS_BITS,
                 min: RsaModulus::MIN_BITS
             })
         ));

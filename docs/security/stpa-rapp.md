@@ -432,7 +432,7 @@ pairing record; the record on disk is the only channel between them.
 | :--- | :--- | :--- | :--- |
 | Offer the slot and token | Module | Session open or closed; `card.status` on the session | Whether the cached certificate is the card now on the phone |
 | Answer certificate attributes | Module | None needed: the answer is local | Whether the browser cached a certificate the token no longer offers |
-| Accept `C_Login` | Module | None: nothing is verified here | Whether the phone will ask for a PIN or has one cached |
+| Accept `C_Login` | Module | The slot's own token state: session open and `card.status` present | Whether the phone will ask for a PIN or has one cached |
 | Dispatch `C_Sign` to the phone | Module | `operation.progress`, `operation.result`, the close reason, the deadline | Whether the browser's own handshake deadline passed while the phone was asking |
 | Send the operation context with `C_Sign` | Module | None | Which relying party asked; PKCS#11 does not carry it |
 | Hold the session: dial, ping, reconnect | Module | Ping replies; discovery records; the close reason | A phone that is suspended but still advertised (UCA-6) |
@@ -451,11 +451,15 @@ pairing record; the record on disk is the only channel between them.
 | UCA-19 | Module | Hold the lock while a record lacks a certificate | P | When the GUI is the only writer of the certificate and the module holds the session, so the certificate is never fetched, the token never appears, and the user sees a paired phone that no browser can use. | H-7, H-5 |
 | UCA-20 | Module | Dispatch `C_Sign` | P | When the browser or the relying party will give up before the phone can answer, so the phone asks for a PIN whose signature arrives at a closed connection, and the user is left to guess whether to enter the PIN again. | H-5, H-2 |
 | UCA-21 | Module | Dispatch `C_Sign` again | P | After an outcome the module could not classify (transport lost after the request left), so the same login is executed twice on the card. Already constrained by the journal of §8.3. | H-2 |
-| UCA-22 | Module | Dial the phone again after the session was lost | N | When the phone's record is in sight again after a transient loss, a lost ping or a Wi-Fi roam, so the slot stays empty although the phone is back within seconds; or provided as a blind loop while the record is not in sight. | H-7 |
+| UCA-22 | Module | Dial the phone again after the session was lost | N | When the phone's record is in sight again after a transient loss, a lost ping or a Wi-Fi roam, so the slot stays empty although the phone is back within seconds. | H-7 |
 | UCA-23 | Module or GUI | Rewrite the pairing store | P | While the other process holds a record in memory, or when the store's open sweeps superseded and keyless records, so two processes on one computer hold different beliefs about the pairing. | H-4 |
 | UCA-24 | Module | Send the operation context | P | When the context names a relying party the module cannot know: PKCS#11 carries no origin, so a context that claims one would be fabricated. The phone's PIN prompt can name only the computer. | H-1, H-5 |
 | UCA-25 | Module | Accept `C_Login` | P | When the token is not present, no session or no card, so the browser enters the logged-in state, dispatches a sign that cannot succeed, and reports the failure as a PIN problem. | H-5 |
 | UCA-26 | Module | Answer certificate attributes | P | From the record on disk after the token appeared with other objects, so a browser session holds handles to objects that no longer exist, and a swapped record is served under old handles. | H-3, H-5 |
+| UCA-27 | Module | Withdraw the token | N | When the session closed or `card.status` reports no card, so the browser keeps offering an identity the phone cannot serve. | H-3 |
+| UCA-28 | Module | Withdraw the token | P | While an operation is in flight on the session, so the signature the user is approving on the phone returns to a handle that is gone, the browser reports an error, and a retry asks the card again. | H-5, H-2 |
+| UCA-29 | GUI or CLI | Forget the pairing | P | While another process on the computer holds the session, without that process learning of it, so the session stays open under a pairing the record calls revoked and the phone is never told. | H-4 |
+| UCA-30 | Module | Dial the phone again after the session was lost | P | As a loop while the phone's record is not in sight, so the computer dials into nothing and a phone that reappears is met by a burst. | H-6 |
 
 ### 10.4 Loss scenarios
 
@@ -488,7 +492,7 @@ again, and the user concludes the PIN was wrong. No PIN try was lost,
 but L-3 occurred, and a user who now types the PIN hastily is on the
 path to L-2.
 
-**Two sessions, one key (UCA-23, UCA-18).** Without the lock, the
+**Two sessions, one key (UCA-23, UCA-7).** Without the lock, the
 module and the GUI each open a session under the same static key. The
 specification allows one live operation per session, not one session
 per pairing, so the phone serves both; but the two processes then
@@ -499,12 +503,14 @@ away, and showing both as "not reachable" is UCA-7 again.
 
 **The phone said no and the module dials again (UCA-18).** The phone
 closes with `pairing_revoked`: its user forgot the computer. The
-module's session ends, but its next slot refresh reads a record that is
-still usable, dials again under a key the phone has destroyed, meets a
-refusal, and repeats at every refresh until the record is rewritten.
-The user at the computer sees a token that flickers. The write of the
-record and the next refresh are a race, and the order of the two is the
-whole defence.
+module's session ends and the token goes with it, as §8.4 requires. But
+the record on disk still reads usable, so the module's next refresh
+dials again under a key the phone has destroyed and meets a refusal,
+and again at every refresh until the record is rewritten: each dial is
+a handshake the phone must refuse, and the user at the computer sees a
+phone listed as paired that never answers. The write of the record and
+the next dial are a race, and the order of the two is the whole
+defence.
 
 ### 10.5 Requirements for the design
 
@@ -513,13 +519,14 @@ whole defence.
 | R-18 | Whichever requester process holds the session fetches the certificate when the record lacks one, and writes it to the record; the module is not a reader only. The read is a safe operation and consumes no PIN try. | UCA-19 |
 | R-19 | Before the token is offered on a session, the module reads the certificate over that session, a safe read that consumes no PIN try, and compares it with the record's; on a mismatch it rewrites the record and offers the new identity, and while the phone reports no card it offers nothing. No signature is requested under a certificate that was not read on the current session. | UCA-16 |
 | R-20 | The module's operation deadline is one named constant chosen below the browsers' and relying parties' handshake timeouts, sent to the phone as the operation lifetime, and a result that arrives after it is reconciled through the journal and never resent. | UCA-20, UCA-21 |
-| R-21 | The token follows the session, as §8.4 requires: it is withdrawn when the session closes or `card.status` reports no card, with no hold; the module dials again when the phone's record with a card-present hint is in sight, at a bounded interval, never in a blind loop. | UCA-22 |
+| R-21 | The token follows the session, as §8.4 requires: it is withdrawn when the session closes or `card.status` reports no card, with no hold; the module dials again when the phone's record with a card-present hint is in sight, at a bounded interval, and not at all while no record is in sight. | UCA-27, UCA-22, UCA-30 |
 | R-22 | A close carrying `pairing_revoked`, a verified revocation hint, or a Class 4 refusal marks the record revoked before any new dial, so the slot's token disappears at the same moment the pairing does. | UCA-18 |
-| R-23 | The pairing lock is a session lock, not a store lock: it is released by the kernel when its holder exits, and record rewrites are atomic renames any process makes after re-reading the record, so the GUI forgets or revokes while the browser holds the session. The module re-reads the record at every slot refresh; a record it finds revoked ends its session with the `pairing_revoked` close of §4.6 item 1, which the session holder is placed to deliver, and withdraws the token before any dial. The module's open never deletes records; sweeping is the GUI's. | UCA-23, UCA-18 |
+| R-23 | The pairing lock is a session lock, not a store lock: it is released by the kernel when its holder exits, and record rewrites are atomic renames any process makes after re-reading the record, so the GUI forgets or revokes while the browser holds the session. The session holder re-reads the record at every ping of its own session thread, independent of the browser's calls; a record it finds revoked ends its session with the `pairing_revoked` close of §4.6 item 1, which the session holder is placed to deliver, and withdraws the token. The module's open never deletes records; sweeping is the GUI's. | UCA-23, UCA-29 |
 | R-24 | The GUI tells apart "the browser holds the phone session" from "the phone is away", from the lock result, and shows the phone as paired and in use rather than unreachable. | UCA-7 |
 | R-25 | The operation context names the computer and nothing it cannot know; the phone's PIN prompt shows that name and the operation kind. The module never fabricates an origin. | UCA-24 |
 | R-26 | The module dials only when the phone's record carries a card-present hint (§4.5) and holds the session only while `card.status` reports a card, closing it when the card leaves, so a browser that merely runs costs the phone nothing while no card lies on it; `C_Finalize` ends any session. | UCA-17 |
 | R-27 | `C_Login` succeeds only while the token is present and otherwise returns the token-absent error, and the token's objects are fixed when the token appears: a changed record withdraws the token and offers a new one, so a handle never outlives its object. | UCA-25, UCA-26 |
+| R-28 | A withdrawal that arrives while an operation is in flight waits for that operation's own result or deadline, which the browser receives as the answer to its `C_Sign`; the token is withdrawn after, and the operation is never resent. | UCA-28 |
 
 ## 11. Open questions
 

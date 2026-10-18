@@ -700,6 +700,8 @@ again.
 
 ### 12.4 Loss scenarios
 
+Measured on 2026-10-19 on an iPhone 15 Pro Max: the slot's state went from valid card to missing 6 s to 8 s after the last command, and the system refused a new slot for 8 s to 11 s after that.
+
 **The second signature of a login (UCA-43, UCA-44, UCA-45, UCA-46).**
 A login to a site that fetches several resources under client
 authentication, or renegotiates, asks the browser's slot for a signature
@@ -732,7 +734,7 @@ would have served. L-3.
 
 | ID | Requirement | Closes |
 | :--- | :--- | :--- |
-| R-41 | The hold's process model follows the slot: while the session is idle the holder watches the slot's state, and a slot that no longer holds a valid card ends the session at once, so that the reader's pause after a session runs during the idle time and not inside the next request. A session is kept only as long as the platform keeps the field; nothing longer is promised. | UCA-43, UCA-46 |
+| R-41 | The hold's process model follows the slot: while the session is idle the holder watches the slot's state, and a slot that no longer holds a valid card ends the session at once, so that the reader's pause after a session runs during the idle time and not inside the next request. The system takes an idle slot away some six seconds after the last exchange, so a holder that keeps a session sends one harmless command on the channel every few seconds for as long as it holds it, and a request that arrives while that command is in flight waits for the card's answer. | UCA-43, UCA-46 |
 | R-42 | Opening the slot retries through the reader's pause, for a bounded time within the request's deadline, before the request is refused; the refusal the system gives for the pause is known by its code and never answered as card unavailable while a retry remains. | UCA-44, UCA-45 |
 | R-43 | The holder keeps no belief about the card's security status between operations: PIN 1 is verified for every signature, after the tries-left probe R-33 describes. A command the card refused is reported as refused, never as ambiguous. | UCA-47 |
 

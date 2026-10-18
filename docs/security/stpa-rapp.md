@@ -700,7 +700,16 @@ again.
 
 ### 12.4 Loss scenarios
 
-Measured on 2026-10-19 on an iPhone 15 Pro Max: the slot's state went from valid card to missing 6 s to 8 s after the last command, and the system refused a new slot for 8 s to 11 s after that.
+Measured on 2026-10-19 on an iPhone 15 Pro Max: left idle, the slot's
+state went from valid card to missing 6 s to 8 s after the last command;
+kept up by one SELECT every 2 s, the slot still went away 11 s to 22 s
+after it was given, once in the middle of a signature command; and the
+system refused a new slot for 8 s to 11 s after each ending. With the
+keep-alive and the retry, six of seven logins 0 s to 20 s apart
+completed, the ones that met the pause in 16 s to 17 s; without them,
+two of six. The slot's life is the platform's, and a request that meets
+its end pays the pause: a residual the holder cannot remove, only keep
+out of the request's path where the slot lets it.
 
 **The second signature of a login (UCA-43, UCA-44, UCA-45, UCA-46).**
 A login to a site that fetches several resources under client

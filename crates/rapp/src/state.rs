@@ -75,6 +75,9 @@ pub enum PairingState {
     Handshaking,
     /// Authenticated peer confirmation is active.
     Confirming,
+    /// Both grant sets are confirmed; the stored record awaits the peer's
+    /// storage confirmation.
+    StorageConfirming,
     /// Durable pairing exists without a healthy session.
     PairedDisconnected,
     /// Durable pairing has a healthy/checking session.
@@ -169,6 +172,8 @@ pub enum PairingEvent {
     HandshakeFailed,
     /// Both endpoints confirmed the same granted profile set.
     BothUsersConfirmed,
+    /// The peer confirmed that its pairing record is durably stored.
+    PeerStorageConfirmed,
     /// Confirmation was denied, aborted, or exceeded local policy time.
     DeniedAbortedOrTimedOut,
     /// A session for this pairing reached the healthy state.
@@ -345,6 +350,8 @@ pub enum Action {
     CloseCandidate,
     /// Atomically store keys, pair identifier, grants, and metadata.
     StorePairRecordAtomically,
+    /// Send the storage confirmation for the stored record.
+    SendPairingStored,
     /// Close the pairing channel; operations use fresh sessions.
     ClosePairingChannel,
     /// Send the pairing abort on a best-effort basis.
@@ -367,6 +374,9 @@ pub enum Action {
     SendCloseBestEffort(CloseReason),
     /// Close the active session.
     CloseSession,
+    /// Derive and retain the revocation key before the pair keys are
+    /// destroyed.
+    RetainRevocationKey,
     /// Destroy the pair-specific static keys.
     DestroyPairKeys,
     /// Destroy the pairing's rendezvous tokens.
@@ -649,14 +659,36 @@ impl PairingState {
             (Self::Confirming, E::BothUsersConfirmed) => {
                 require(guards.granted_sets_equal)?;
                 Transition {
-                    state: Self::PairedDisconnected,
+                    state: Self::StorageConfirming,
                     actions: &[
                         A::StorePairRecordAtomically,
                         A::InvalidateOffer,
-                        A::ClosePairingChannel,
+                        A::SendPairingStored,
                     ],
                 }
             }
+            (Self::StorageConfirming, E::PeerStorageConfirmed) => Transition {
+                state: Self::PairedDisconnected,
+                actions: &[A::ClosePairingChannel],
+            },
+            (Self::StorageConfirming, E::DeniedAbortedOrTimedOut) => Transition {
+                state: Self::Unpaired,
+                actions: &[
+                    A::RetainRevocationKey,
+                    A::DestroyPairKeys,
+                    A::ClearPairMetadata,
+                    A::CloseCandidate,
+                ],
+            },
+            (Self::StorageConfirming, E::AuthenticatedProtocolViolation) => Transition {
+                state: Self::Revoked,
+                actions: &[
+                    A::RetainRevocationKey,
+                    A::DestroyPairKeys,
+                    A::CloseCandidate,
+                    A::ShowRevoked,
+                ],
+            },
             (Self::Confirming, E::DeniedAbortedOrTimedOut) => Transition {
                 state: Self::Unpaired,
                 actions: &[
@@ -679,6 +711,7 @@ impl PairingState {
                 Transition {
                     state: Self::Unpaired,
                     actions: &[
+                        A::RetainRevocationKey,
                         A::DestroyPairKeys,
                         A::DestroyRelayTokens,
                         A::ClearPairMetadata,
@@ -690,7 +723,9 @@ impl PairingState {
                 Transition {
                     state: Self::Unpaired,
                     actions: &[
+                        A::SendCloseBestEffort(CloseReason::PairingRevoked),
                         A::CloseSession,
+                        A::RetainRevocationKey,
                         A::DestroyPairKeys,
                         A::DestroyRelayTokens,
                         A::ClearPairMetadata,
@@ -702,6 +737,7 @@ impl PairingState {
                 actions: &[
                     A::SendCloseBestEffort(CloseReason::ProtocolViolation),
                     A::CloseSession,
+                    A::RetainRevocationKey,
                     A::DestroyPairKeys,
                     A::ShowRevoked,
                 ],
@@ -713,6 +749,7 @@ impl PairingState {
                     actions: &[
                         A::SendCloseBestEffort(CloseReason::PairingRevoked),
                         A::CloseSession,
+                        A::RetainRevocationKey,
                         A::DestroyPairKeys,
                         A::ShowRevoked,
                     ],
@@ -722,7 +759,7 @@ impl PairingState {
                 require(guards.user_initiated)?;
                 Transition {
                     state: Self::Revoked,
-                    actions: &[A::DestroyPairKeys, A::ShowRevoked],
+                    actions: &[A::RetainRevocationKey, A::DestroyPairKeys, A::ShowRevoked],
                 }
             }
             (Self::PairedConnected, E::PeerRevocationNotice) => Transition {
@@ -913,6 +950,7 @@ impl SessionState {
                 Transition {
                     state: Self::Closing,
                     actions: &[
+                        A::RetainRevocationKey,
                         A::DestroyPairKeys,
                         A::ShowRevoked,
                         A::SendCloseBestEffort(CloseReason::CredentialRejected),
@@ -1334,8 +1372,19 @@ impl RappState {
                     self.session = SessionState::Closing;
                 }
                 self.pairing = PairingState::Revoked;
+                actions.push(Action::RetainRevocationKey);
                 actions.push(Action::DestroyPairKeys);
                 actions.push(Action::ShowRevoked);
+            }
+            PairingState::StorageConfirming => {
+                self.pairing = PairingState::Revoked;
+                self.session = SessionState::Closed;
+                actions.extend([
+                    Action::RetainRevocationKey,
+                    Action::DestroyPairKeys,
+                    Action::CloseCandidate,
+                    Action::ShowRevoked,
+                ]);
             }
             PairingState::Handshaking | PairingState::Confirming | PairingState::OfferActive => {
                 self.pairing = PairingState::Unpaired;
@@ -1398,6 +1447,7 @@ impl RappState {
             Action::RemoveRejectedCredentialAndDerivedState,
             Action::SendResultCredentialRejectedBestEffort,
             Action::RevokePairAfterCredentialRejection,
+            Action::RetainRevocationKey,
             Action::DestroyPairKeys,
             Action::ShowRevoked,
         ];

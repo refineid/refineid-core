@@ -115,7 +115,8 @@ pub use pairing_attempts::{
     PreAuthenticationRateLimit, phase_deadline_ms,
 };
 pub use pairing_flow::{
-    PairingAttemptFailure, PairingConfirmation, PairingError, PairingHandshake,
+    ActivePairing, PairingAttemptFailure, PairingConfirmation, PairingError, PairingHandshake,
+    PairingStorage,
 };
 pub use policy::{
     IncidentDisposition, OperationDisposition, PairDisposition, SecurityIncident,

@@ -29,7 +29,7 @@ use super::{
     CpaceKc2ResponderWaiting, EndpointRole, EstablishedEndpoint, ExplicitUserIntent, OfferId,
     POST_PAKE_CONFIRMATION_MS, POST_PAKE_HANDSHAKE_MS, PairId, PairKeyMaterial, PairRecord,
     PairStore, PairStoreError, PairTombstone, PairingBackoff, PairingConfirmation, PairingError,
-    PairingHandshake, PairingOffer, PairingOfferDeadline, PairingSecret,
+    PairingHandshake, PairingOffer, PairingOfferDeadline, PairingSecret, PairingStorage,
     PreAuthenticationRateLimit, ProfileName, RoutingPreamble, STREAM_PROFILE,
     SessionAuthentication, SessionHandshake, SessionId, TransportProfile, WireValue,
     encode_kc2_step1_frame, generate_pair_key_material, phase_deadline_ms,
@@ -142,6 +142,11 @@ pub enum RappBindingError {
     WrongPhase,
     /// The one-use pairing offer reached its monotonic deadline.
     OfferExpired,
+    /// The post-PAKE deadline passed before the peer confirmed that it
+    /// stored the pairing (RAPP v26.10.18 §4.3 item 4): the record this
+    /// endpoint stored is not active, and the caller revokes it with
+    /// [`RappPairRecord::revoke`].
+    StorageUnconfirmed,
     /// Authenticated protocol or cryptographic processing failed.
     ProtocolFailure,
     /// Local synchronization state was poisoned and cannot be reused.
@@ -249,6 +254,12 @@ enum PairingBridgeState {
         confirmation: Box<PairingConfirmation>,
         deadline_ms: u64,
     },
+    /// The stored record awaiting the peer's storage confirmation, under
+    /// the confirmation deadline (§3.3.7, §4.3 item 4).
+    Storage {
+        storage: Box<PairingStorage>,
+        deadline_ms: u64,
+    },
     Completed,
     Expired,
     /// Three failed attempts destroyed the custodian's offer (§3.3.5).
@@ -269,6 +280,13 @@ impl PairingBridgeState {
                 }
                 *self = Self::Expired;
                 return Err(RappBindingError::OfferExpired);
+            }
+            Self::Storage { deadline_ms, .. } => {
+                if now_monotonic_ms < *deadline_ms {
+                    return Ok(());
+                }
+                *self = Self::Failed;
+                return Err(RappBindingError::StorageUnconfirmed);
             }
             Self::Cpace(cpace) => cpace.deadline(),
             Self::Exhausted => return Err(RappBindingError::AttemptsExhausted),
@@ -944,6 +962,8 @@ impl RappPairingBridge {
     }
 
     /// Cancel pairing and destroy every in-progress offer or handshake secret.
+    /// Cancelled in the storage phase, the record the caller stored is not
+    /// active; the caller revokes it.
     ///
     /// # Errors
     /// [`RappBindingError::WrongPhase`] after the pairing completed.
@@ -958,7 +978,8 @@ impl RappPairingBridge {
             PairingBridgeState::Offer { .. }
             | PairingBridgeState::Cpace(_)
             | PairingBridgeState::Handshake { .. }
-            | PairingBridgeState::Confirmation { .. } => Ok(()),
+            | PairingBridgeState::Confirmation { .. }
+            | PairingBridgeState::Storage { .. } => Ok(()),
             PairingBridgeState::Expired
             | PairingBridgeState::Exhausted
             | PairingBridgeState::Failed => Ok(()),
@@ -1054,8 +1075,8 @@ impl RappPairingBridge {
     }
 
     /// Enter authenticated confirmation after Noise completes; hello,
-    /// confirmation and storage must follow within 10 seconds of
-    /// `now_monotonic_ms` (§3.3.7).
+    /// confirmation, storage and the peer's storage confirmation must
+    /// follow within 10 seconds of `now_monotonic_ms` (§3.3.7).
     ///
     /// # Errors
     /// [`RappBindingError`] on an expired offer, the wrong phase, or an
@@ -1166,13 +1187,18 @@ impl RappPairingBridge {
         })
     }
 
-    /// Complete equal human confirmation and retain the resulting pair record
-    /// in an opaque Rust object. No private key bytes are returned to Swift.
+    /// Build the pair record after equal confirmation and keep the pairing
+    /// channel open for the storage confirmation (§4.3 item 4). The caller
+    /// persists the record with [`RappPairRecord::persist_device_only`],
+    /// then calls [`Self::send_stored`] and feeds the peer's frame to
+    /// [`Self::receive_stored`]; the pairing is active once
+    /// [`Self::is_pairing_active`] reports it. No private key bytes are
+    /// returned to the platform.
     ///
     /// # Errors
-    /// [`RappBindingError`] on the wrong phase or incomplete or unequal
-    /// confirmations.
-    pub fn finish_pairing(
+    /// [`RappBindingError`] on the wrong phase, the passed deadline, or
+    /// incomplete or unequal confirmations.
+    pub fn build_pair_record(
         &self,
         created_at_ms: u64,
         now_monotonic_ms: u64,
@@ -1180,18 +1206,82 @@ impl RappPairingBridge {
         let mut state = self.lock()?;
         state.require_live_offer(now_monotonic_ms)?;
         let previous = core::mem::replace(&mut *state, PairingBridgeState::Failed);
-        let PairingBridgeState::Confirmation { confirmation, .. } = previous else {
+        let PairingBridgeState::Confirmation {
+            confirmation,
+            deadline_ms,
+        } = previous
+        else {
             *state = previous;
             return Err(RappBindingError::WrongPhase);
         };
-        let record = (*confirmation)
-            .into_pair_record(created_at_ms)
+        let (record, storage) = (*confirmation)
+            .into_storage(created_at_ms)
             .map_err(|_| RappBindingError::ProtocolFailure)?;
-        *state = PairingBridgeState::Completed;
+        *state = PairingBridgeState::Storage {
+            storage: Box::new(storage),
+            deadline_ms,
+        };
         drop(state);
         Ok(Arc::new(RappPairRecord {
             record: Mutex::new(Some(record)),
         }))
+    }
+
+    /// Confirm to the peer that the record is durably stored: the frame to
+    /// send once the vault reported the record written (§4.3 item 4).
+    ///
+    /// # Errors
+    /// [`RappBindingError`] on the wrong phase, the passed deadline, or a
+    /// second confirmation.
+    pub fn send_stored(&self, now_monotonic_ms: u64) -> Result<Vec<u8>, RappBindingError> {
+        self.with_storage(now_monotonic_ms, |storage| {
+            storage.send_stored().map(BinaryFrame::into_bytes)
+        })
+    }
+
+    /// Verify the peer's storage confirmation. A confirmation naming another
+    /// pairing is an authenticated protocol violation: the ceremony fails,
+    /// and the caller revokes the record it stored.
+    ///
+    /// # Errors
+    /// [`RappBindingError`] on the wrong phase, the passed deadline, an
+    /// oversized frame, or a confirmation that fails verification.
+    pub fn receive_stored(
+        &self,
+        bytes: Vec<u8>,
+        now_monotonic_ms: u64,
+    ) -> Result<(), RappBindingError> {
+        let frame = BinaryFrame::reconstruct(bytes).map_err(|_| RappBindingError::InvalidInput)?;
+        self.with_storage(now_monotonic_ms, |storage| {
+            storage.receive_stored(&frame, now_monotonic_ms)
+        })
+    }
+
+    /// Whether both storage confirmations have been exchanged. The first
+    /// true answer closes the pairing channel and completes the ceremony;
+    /// a false answer past the deadline is [`RappBindingError::StorageUnconfirmed`].
+    ///
+    /// # Errors
+    /// [`RappBindingError`] outside the storage phase or past the deadline.
+    pub fn is_pairing_active(&self, now_monotonic_ms: u64) -> Result<bool, RappBindingError> {
+        let mut state = self.lock()?;
+        let confirmed = match &*state {
+            PairingBridgeState::Completed => return Ok(true),
+            PairingBridgeState::Storage { storage, .. } => storage.is_confirmed(),
+            _ => return Err(RappBindingError::WrongPhase),
+        };
+        if !confirmed {
+            state.require_live_offer(now_monotonic_ms)?;
+            return Ok(false);
+        }
+        let previous = core::mem::replace(&mut *state, PairingBridgeState::Completed);
+        drop(state);
+        if let PairingBridgeState::Storage { storage, .. } = previous {
+            storage
+                .into_active()
+                .map_err(|_| RappBindingError::ProtocolFailure)?;
+        }
+        Ok(true)
     }
 }
 
@@ -1215,6 +1305,26 @@ impl RappPairingBridge {
             return Err(RappBindingError::WrongPhase);
         };
         let outcome = step(confirmation);
+        if outcome.is_err() {
+            *state = PairingBridgeState::Failed;
+        }
+        drop(state);
+        outcome.map_err(|_| RappBindingError::ProtocolFailure)
+    }
+
+    /// Run one storage-confirmation step before the deadline; a failed step
+    /// ends the ceremony, and the caller revokes the record it stored.
+    fn with_storage<T>(
+        &self,
+        now_monotonic_ms: u64,
+        step: impl FnOnce(&mut PairingStorage) -> Result<T, PairingError>,
+    ) -> Result<T, RappBindingError> {
+        let mut state = self.lock()?;
+        state.require_live_offer(now_monotonic_ms)?;
+        let PairingBridgeState::Storage { storage, .. } = &mut *state else {
+            return Err(RappBindingError::WrongPhase);
+        };
+        let outcome = step(storage);
         if outcome.is_err() {
             *state = PairingBridgeState::Failed;
         }
@@ -1533,16 +1643,82 @@ mod pairing_bridge_tests {
             .expect("requester receives confirmation");
 
         let requester_record = requester
-            .finish_pairing(at + 12, at + 12)
-            .expect("requester finishes pairing")
+            .build_pair_record(at + 12, at + 12)
+            .expect("requester builds its record")
             .metadata()
             .expect("requester metadata");
         let custodian_record = custodian
-            .finish_pairing(at + 12, at + 12)
-            .expect("custodian finishes pairing")
+            .build_pair_record(at + 12, at + 12)
+            .expect("custodian builds its record")
             .metadata()
             .expect("custodian metadata");
         assert_eq!(requester_record.pair_id, custodian_record.pair_id);
+        assert!(!requester.is_pairing_active(at + 12).expect("storage phase"));
+
+        let requester_stored = requester
+            .send_stored(at + 13)
+            .expect("requester confirms storage");
+        let custodian_stored = custodian
+            .send_stored(at + 13)
+            .expect("custodian confirms storage");
+        custodian
+            .receive_stored(requester_stored, at + 13)
+            .expect("custodian verifies the requester's confirmation");
+        requester
+            .receive_stored(custodian_stored, at + 13)
+            .expect("requester verifies the custodian's confirmation");
+        assert!(requester.is_pairing_active(at + 14).expect("exchange done"));
+        assert!(custodian.is_pairing_active(at + 14).expect("exchange done"));
+        assert!(matches!(
+            requester.send_stored(at + 14),
+            Err(RappBindingError::WrongPhase)
+        ));
+    }
+
+    #[test]
+    fn a_pairing_the_peer_never_confirms_is_not_active() {
+        let at = STARTED_AT_MS;
+        let (requester, custodian) = pair_into_confirmation(at);
+        let requester_hello = requester
+            .send_hello("desktop".into(), "macos".into(), at + 10)
+            .expect("requester sends hello");
+        let custodian_hello = custodian
+            .send_hello("phone".into(), "ios".into(), at + 10)
+            .expect("custodian sends hello");
+        custodian
+            .receive_hello(requester_hello, at + 10)
+            .expect("custodian receives hello");
+        requester
+            .receive_hello(custodian_hello, at + 10)
+            .expect("requester receives hello");
+        let grants = vec![ProfileName::Authentication.as_str().to_owned()];
+        let requester_confirmation = requester
+            .send_confirmation(grants.clone(), at + 11)
+            .expect("requester sends confirmation");
+        let custodian_confirmation = custodian
+            .send_confirmation(grants, at + 11)
+            .expect("custodian sends confirmation");
+        custodian
+            .receive_confirmation(requester_confirmation, at + 11)
+            .expect("custodian receives confirmation");
+        requester
+            .receive_confirmation(custodian_confirmation, at + 11)
+            .expect("requester receives confirmation");
+        requester
+            .build_pair_record(at + 12, at + 12)
+            .expect("requester builds its record");
+        requester
+            .send_stored(at + 13)
+            .expect("requester confirms storage");
+        assert!(!requester.is_pairing_active(at + 14).expect("still waiting"));
+        assert!(matches!(
+            requester.is_pairing_active(at + 9 + POST_PAKE_CONFIRMATION_MS),
+            Err(RappBindingError::StorageUnconfirmed)
+        ));
+        assert!(matches!(
+            requester.is_pairing_active(at + 9 + POST_PAKE_CONFIRMATION_MS + 1),
+            Err(RappBindingError::WrongPhase)
+        ));
     }
 
     #[test]
@@ -1589,7 +1765,7 @@ mod pairing_bridge_tests {
             Err(RappBindingError::OfferExpired)
         ));
         assert!(matches!(
-            requester.finish_pairing(at, at + 10),
+            requester.build_pair_record(at, at + 10),
             Err(RappBindingError::WrongPhase)
         ));
     }

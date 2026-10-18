@@ -6,8 +6,8 @@ use super::{
     BinaryFrame, CryptoError, EndpointRole, HandshakeChannel, HandshakeRole, MessageError,
     NegotiatedParameters, OpenError, PairKeyMaterial, PairRecord, PairRecordError,
     PairingConfirmMessage, PairingHandshakeParameters, PairingHelloMessage, PairingOffer,
-    PairingOfferError, PairingSecret, ProfileName, SecureChannel, TransportCandidate, TypedMessage,
-    compute_grants_hash,
+    PairingOfferError, PairingSecret, PairingStoredMessage, ProfileName, SecureChannel,
+    TransportCandidate, TypedMessage, compute_grants_hash,
 };
 
 /// In-progress mandatory Noise `XXpsk3` handshake.
@@ -379,13 +379,18 @@ impl PairingConfirmation {
         Ok(self.peer_grants.as_deref().expect("just inserted"))
     }
 
-    /// Build the only persistable record after both explicit confirmations.
-    /// Dropping this value closes and destroys the pairing-channel keys.
+    /// Build the only persistable record after both explicit confirmations,
+    /// keeping the pairing channel open for the storage confirmation
+    /// (section 4.3 item 4). The caller stores the record durably and then
+    /// confirms the storage with [`PairingStorage::send_stored`].
     ///
     /// # Errors
     /// [`PairingError`] before both hellos and both equal confirmations
     /// complete, or when the record cannot be constructed.
-    pub fn into_pair_record(self, created_at_ms: u64) -> Result<PairRecord, PairingError> {
+    pub fn into_storage(
+        self,
+        created_at_ms: u64,
+    ) -> Result<(PairRecord, PairingStorage), PairingError> {
         if !self.local_hello_sent || self.peer_hello.is_none() {
             return Err(PairingError::HelloIncomplete);
         }
@@ -400,7 +405,7 @@ impl PairingConfirmation {
         }
         let grants_hash = compute_grants_hash(&local_grants).map_err(PairingError::Crypto)?;
         let local_private = self.local_keys.with_private_key(|bytes| *bytes);
-        PairRecord::new(
+        let record = PairRecord::new(
             self.pair_id,
             self.role,
             local_private,
@@ -410,7 +415,136 @@ impl PairingConfirmation {
             local_grants,
             created_at_ms,
         )
-        .map_err(PairingError::PairRecord)
+        .map_err(PairingError::PairRecord)?;
+        Ok((
+            record,
+            PairingStorage {
+                pair_id: self.pair_id,
+                channel: self.channel,
+                local_stored_sent: false,
+                peer_stored: false,
+            },
+        ))
+    }
+}
+
+/// The pairing between equal confirmation and activity: each endpoint
+/// stores its record and confirms the storage over the still-open channel
+/// (section 4.3 item 4).
+///
+/// Dropping this value closes and destroys the pairing-channel keys. A
+/// value dropped before [`Self::into_active`] belongs to a pairing the peer
+/// never confirmed; the caller revokes the record it stored (section 4.6).
+pub struct PairingStorage {
+    pair_id: super::PairId,
+    channel: SecureChannel,
+    local_stored_sent: bool,
+    peer_stored: bool,
+}
+
+impl PairingStorage {
+    /// Pair identifier derived from the authenticated transcript.
+    #[must_use]
+    pub const fn pair_id(&self) -> super::PairId {
+        self.pair_id
+    }
+
+    /// Confirm to the peer that the local record is durably stored. Called
+    /// once, after the store reported the record written.
+    ///
+    /// # Errors
+    /// [`PairingError::DuplicateMessage`] on a second confirmation, or a
+    /// seal failure.
+    pub fn send_stored(&mut self) -> Result<BinaryFrame, PairingError> {
+        if self.local_stored_sent {
+            return Err(PairingError::DuplicateMessage);
+        }
+        let frame = self.seal_stored(self.pair_id)?;
+        self.local_stored_sent = true;
+        Ok(frame)
+    }
+
+    /// Receive the peer's storage confirmation. A pair identifier other
+    /// than the derived one is an authenticated protocol violation.
+    ///
+    /// # Errors
+    /// [`PairingError`] on a duplicate or unexpected message, or
+    /// [`PairingError::PairIdMismatch`].
+    pub fn receive_stored(&mut self, frame: &BinaryFrame, now_ms: u64) -> Result<(), PairingError> {
+        if self.peer_stored {
+            return Err(PairingError::DuplicateMessage);
+        }
+        let TypedMessage::PairingStored(stored) =
+            open_typed(&mut self.channel, frame, self.pair_id, now_ms)?
+        else {
+            return Err(PairingError::UnexpectedMessage);
+        };
+        if stored.pair_id != self.pair_id {
+            return Err(PairingError::PairIdMismatch);
+        }
+        self.peer_stored = true;
+        Ok(())
+    }
+
+    /// Whether both the local confirmation was sent and the peer's received.
+    #[must_use]
+    pub const fn is_confirmed(&self) -> bool {
+        self.local_stored_sent && self.peer_stored
+    }
+
+    /// Close the pairing channel and prove the pairing active: the only way
+    /// to obtain an [`ActivePairing`].
+    ///
+    /// # Errors
+    /// [`PairingError::StorageUnconfirmed`] before both confirmations.
+    pub fn into_active(self) -> Result<ActivePairing, PairingError> {
+        if !self.is_confirmed() {
+            return Err(PairingError::StorageUnconfirmed);
+        }
+        Ok(ActivePairing {
+            pair_id: self.pair_id,
+        })
+    }
+
+    fn seal_stored(&mut self, pair_id: super::PairId) -> Result<BinaryFrame, PairingError> {
+        seal_typed(
+            &mut self.channel,
+            &TypedMessage::PairingStored(PairingStoredMessage { pair_id }),
+        )
+    }
+
+    /// A storage confirmation naming another pairing, for the mismatch test.
+    #[cfg(test)]
+    fn send_stored_as(&mut self, pair_id: super::PairId) -> Result<BinaryFrame, PairingError> {
+        self.seal_stored(pair_id)
+    }
+}
+
+impl fmt::Debug for PairingStorage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PairingStorage")
+            .field("pair_id", &self.pair_id)
+            .field("channel", &"[secure channel]")
+            .field("local_stored_sent", &self.local_stored_sent)
+            .field("peer_stored", &self.peer_stored)
+            .finish()
+    }
+}
+
+/// Proof that both endpoints stored the pairing and confirmed it to each
+/// other (section 4.3 item 4). Only [`PairingStorage::into_active`] makes
+/// one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActivePairing {
+    pair_id: super::PairId,
+}
+
+impl ActivePairing {
+    /// Pair identifier of the active pairing.
+    #[must_use]
+    pub const fn pair_id(&self) -> super::PairId {
+        self.pair_id
     }
 }
 
@@ -519,6 +653,11 @@ pub enum PairingError {
     InvalidGrantSet,
     /// The two granted sets are not equal.
     GrantMismatch,
+    /// The peer's storage confirmation names another pairing: an
+    /// authenticated protocol violation (section 4.3 item 4).
+    PairIdMismatch,
+    /// Activity was claimed before both storage confirmations.
+    StorageUnconfirmed,
 }
 
 impl fmt::Display for PairingError {
@@ -528,3 +667,169 @@ impl fmt::Display for PairingError {
 }
 
 impl core::error::Error for PairingError {}
+
+#[cfg(test)]
+mod tests {
+    use super::{PairingConfirmation, PairingError, PairingHandshake, PairingStorage};
+    use crate::{
+        EndpointRole, OfferId, PairId, PairingOffer, PairingSecret, ProfileName,
+        STREAM_CANDIDATE_ID, TransportProfile, generate_pair_key_material,
+    };
+
+    /// Synthetic one-use offer identifier.
+    const OFFER_ID_BYTE: u8 = b'o';
+    /// Synthetic bearer pairing secret.
+    const PAIRING_SECRET_BYTE: u8 = b's';
+    /// A pair identifier no ceremony derives, for the mismatch test.
+    const FOREIGN_PAIR_ID_BYTE: u8 = b'x';
+    /// Monotonic milliseconds at which the confirmation frames are read.
+    const CONFIRMATION_AT_MS: u64 = 100;
+    /// Platform time recorded as the record's creation.
+    const CREATED_AT_MS: u64 = 200;
+
+    fn confirmed_pair() -> (PairingConfirmation, PairingConfirmation) {
+        let profiles = vec![ProfileName::Authentication.as_str().to_owned()];
+        let proxy_offer = PairingOffer::create(
+            OfferId::from_array([OFFER_ID_BYTE; 32]),
+            profiles,
+            &[TransportProfile::Stream],
+        )
+        .expect("the offer fixture is valid");
+        let bootstrap = proxy_offer.to_cbor().expect("the offer encodes");
+        let offer = PairingOffer::from_bootstrap(&bootstrap, TransportProfile::Stream)
+            .expect("the bootstrap decodes");
+        let pairing_secret = PairingSecret::from_random_bytes([PAIRING_SECRET_BYTE; 32]);
+        let mut requester = PairingHandshake::begin(
+            EndpointRole::Requester,
+            offer,
+            STREAM_CANDIDATE_ID,
+            generate_pair_key_material().expect("requester keys"),
+            &pairing_secret,
+        )
+        .expect("requester pairing starts");
+        let mut proxy = PairingHandshake::begin(
+            EndpointRole::Proxy,
+            proxy_offer,
+            STREAM_CANDIDATE_ID,
+            generate_pair_key_material().expect("proxy keys"),
+            &pairing_secret,
+        )
+        .expect("proxy pairing starts");
+        let first = requester.write_message().expect("message one");
+        proxy.read_message(&first).expect("proxy reads one");
+        let second = proxy.write_message().expect("message two");
+        requester
+            .read_message(&second)
+            .expect("requester reads two");
+        let third = requester.write_message().expect("message three");
+        proxy.read_message(&third).expect("proxy reads three");
+        let mut requester = requester.into_confirmation().expect("requester confirms");
+        let mut proxy = proxy.into_confirmation().expect("proxy confirms");
+        let requester_hello = requester
+            .send_hello("Requester".into(), "test".into())
+            .expect("requester hello");
+        proxy
+            .receive_hello(&requester_hello, CONFIRMATION_AT_MS)
+            .expect("proxy reads hello");
+        let proxy_hello = proxy
+            .send_hello("Proxy".into(), "test".into())
+            .expect("proxy hello");
+        requester
+            .receive_hello(&proxy_hello, CONFIRMATION_AT_MS)
+            .expect("requester reads hello");
+        let grants = vec![ProfileName::Authentication];
+        let requester_confirmation = requester
+            .send_confirmation(grants.clone())
+            .expect("requester grants");
+        proxy
+            .receive_confirmation(&requester_confirmation, CONFIRMATION_AT_MS)
+            .expect("proxy reads grants");
+        let proxy_confirmation = proxy.send_confirmation(grants).expect("proxy grants");
+        requester
+            .receive_confirmation(&proxy_confirmation, CONFIRMATION_AT_MS)
+            .expect("requester reads grants");
+        (requester, proxy)
+    }
+
+    fn storages() -> (PairingStorage, PairingStorage) {
+        let (requester, proxy) = confirmed_pair();
+        let (_, requester_storage) = requester
+            .into_storage(CREATED_AT_MS)
+            .expect("requester record");
+        let (_, proxy_storage) = proxy.into_storage(CREATED_AT_MS).expect("proxy record");
+        (requester_storage, proxy_storage)
+    }
+
+    #[test]
+    fn both_confirmations_make_the_pairing_active() {
+        let (mut requester, mut proxy) = storages();
+        assert!(!requester.is_confirmed());
+        let requester_stored = requester.send_stored().expect("requester confirms");
+        let proxy_stored = proxy.send_stored().expect("proxy confirms");
+        proxy
+            .receive_stored(&requester_stored, CONFIRMATION_AT_MS)
+            .expect("proxy reads the confirmation");
+        requester
+            .receive_stored(&proxy_stored, CONFIRMATION_AT_MS)
+            .expect("requester reads the confirmation");
+        let pair_id = requester.pair_id();
+        let active = requester.into_active().expect("active");
+        assert_eq!(active.pair_id(), pair_id);
+        assert_eq!(proxy.into_active().expect("active").pair_id(), pair_id);
+    }
+
+    #[test]
+    fn a_pairing_without_the_peers_confirmation_is_not_active() {
+        let (mut requester, _proxy) = storages();
+        requester.send_stored().expect("requester confirms");
+        assert!(matches!(
+            requester.into_active(),
+            Err(PairingError::StorageUnconfirmed)
+        ));
+    }
+
+    #[test]
+    fn a_pairing_without_the_local_confirmation_is_not_active() {
+        let (mut requester, mut proxy) = storages();
+        let proxy_stored = proxy.send_stored().expect("proxy confirms");
+        requester
+            .receive_stored(&proxy_stored, CONFIRMATION_AT_MS)
+            .expect("requester reads the confirmation");
+        assert!(matches!(
+            requester.into_active(),
+            Err(PairingError::StorageUnconfirmed)
+        ));
+    }
+
+    #[test]
+    fn a_confirmation_naming_another_pairing_is_a_violation() {
+        let (mut requester, mut proxy) = storages();
+        let foreign = proxy
+            .send_stored_as(PairId::from_array([FOREIGN_PAIR_ID_BYTE; 16]))
+            .expect("the frame seals");
+        assert!(matches!(
+            requester.receive_stored(&foreign, CONFIRMATION_AT_MS),
+            Err(PairingError::PairIdMismatch)
+        ));
+    }
+
+    #[test]
+    fn each_confirmation_is_sent_and_received_once() {
+        let (mut requester, mut proxy) = storages();
+        let stored = requester.send_stored().expect("first confirmation");
+        assert!(matches!(
+            requester.send_stored(),
+            Err(PairingError::DuplicateMessage)
+        ));
+        proxy
+            .receive_stored(&stored, CONFIRMATION_AT_MS)
+            .expect("proxy reads it");
+        let again = requester
+            .send_stored_as(requester.pair_id())
+            .expect("seals");
+        assert!(matches!(
+            proxy.receive_stored(&again, CONFIRMATION_AT_MS),
+            Err(PairingError::DuplicateMessage)
+        ));
+    }
+}

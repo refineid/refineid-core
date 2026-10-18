@@ -26,8 +26,8 @@ pub const CPACE_ATTEMPT_WINDOW_MS: u64 = 5_000;
 /// (§3.3.7).
 pub const POST_PAKE_HANDSHAKE_MS: u64 = 10_000;
 
-/// From local Noise completion to stored trust: hello, confirmation and
-/// storage (§3.3.7).
+/// From local Noise completion to an active pairing: hello, confirmation,
+/// storage and the peer's storage confirmation (§3.3.7, §4.3 item 4).
 pub const POST_PAKE_CONFIRMATION_MS: u64 = 10_000;
 
 /// Minimum spacing of pre-authentication attempts at the custodian

@@ -31,6 +31,7 @@
 
 use std::io::Write as _;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 #[cfg(feature = "pin-change")]
 use refineid_auth::PinManageOps as _;
@@ -42,14 +43,19 @@ use refineid_cms::container::{EcdsaP384, RsaPkcs1Sha256, Signature};
 use refineid_cms::x509::{
     EcCurve, Name, OwnedCert, PublicKeyAlgorithm, SpkiDer, extract_rsa_public_key,
 };
-use refineid_digest::{Sha1, Sha224, Sha256, Sha384, Sha512};
+use refineid_digest::{SHA256_LEN, SHA384_LEN, SHA512_LEN, Sha1, Sha224, Sha256, Sha384, Sha512};
 use refineid_pcsc::{PcscBackend, PcscCard, ReaderAccessCap, ReaderBackend as _, ReaderId};
 use refineid_pkcs15::{
     CertSlot, Pkcs15Ops as _, TokenSerial, derive_printed_serial, render_token_serial,
 };
 
+use refineid_remote::{
+    DisplayText, RemoteKeyProfile, RemoteOperationError, RemoteSignatureAlgorithm, SignatureRequest,
+};
+
 use crate::pin::PinBytes;
 use crate::pin_cache::PinSafetyCache;
+use crate::remote::{REMOTE_SIGN_DEADLINE, RemoteSignError, RemoteTokenSource, SessionCertificate};
 use crate::slot_kind::{RemoteSlotId, SlotKind};
 
 #[cfg(feature = "pin-change")]
@@ -62,11 +68,14 @@ use crate::ck::{
     CKA_NEVER_EXTRACTABLE, CKA_PRIVATE, CKA_PUBLIC_EXPONENT, CKA_SENSITIVE, CKA_SERIAL_NUMBER,
     CKA_SIGN, CKA_SIGN_RECOVER, CKA_SUBJECT, CKA_TOKEN, CKA_TRUSTED, CKA_UNWRAP, CKA_VALUE,
     CKA_VERIFY, CKA_WRAP, CKC_X_509, CKK_EC, CKK_RSA, CKO_CERTIFICATE, CKO_PRIVATE_KEY,
-    CKO_PUBLIC_KEY, CKR_ARGUMENTS_BAD, CKR_DATA_INVALID, CKR_DATA_LEN_RANGE, CKR_DEVICE_ERROR,
+    CKO_PUBLIC_KEY, CKR_DATA_INVALID, CKR_DATA_LEN_RANGE, CKR_DEVICE_ERROR, CKR_MECHANISM_INVALID,
     CKR_OK, CKR_PIN_INCORRECT, CKR_PIN_LOCKED, CKR_SIGNATURE_INVALID, CKR_SIGNATURE_LEN_RANGE,
     CKR_USER_NOT_LOGGED_IN, CkAttributeType, CkBbool, CkObjectHandle, CkRv, CkUlong,
 };
-use crate::sign::{Mechanism, sign_with_card};
+use crate::sign::{
+    DigestInfoHash, ECDSA_P384_SIGNATURE_BYTES, Mechanism, RSA3072_MODULUS_BITS,
+    RSA3072_SIGNATURE_BYTES, parse_digest_info, reject_degenerate_digest, sign_with_card,
+};
 
 /// Object handle for the authentication certificate. Fixed for the
 /// process; the session's slot disambiguates which card it belongs
@@ -81,6 +90,10 @@ pub const OBJ_PUBLIC_KEY: CkObjectHandle = 3;
 /// Base object handle for on-card and persisted CA certificates.
 /// Subsequent CA certificates receive sequential handles: `OBJ_CA_BASE + index`.
 pub const OBJ_CA_BASE: CkObjectHandle = 4;
+/// The handle range one raised token occupies. Each token the module
+/// raises takes the next range, so a handle of a withdrawn token
+/// names no object of the token that replaced it.
+const TOKEN_HANDLE_SPACE: CkObjectHandle = 1 << 16;
 
 /// Fixed human-readable token / object label used when the card's
 /// certificate carries no usable common name. NSS shows it in the
@@ -444,6 +457,9 @@ pub struct TokenObjects {
     key_material: TokenKeyMaterial,
     /// Intermediate and root CA certificate store.
     ca_store: RefinedTrustStore,
+    /// Which raised token these objects belong to; its handles are
+    /// offset by this many [`TOKEN_HANDLE_SPACE`]s.
+    generation: CkObjectHandle,
 }
 
 /// Encode a [`CkUlong`] attribute value into an inline zero-allocation buffer.
@@ -544,7 +560,33 @@ impl TokenObjects {
             token_serial: String::new(),
             key_material,
             ca_store,
+            generation: 0,
         })
+    }
+
+    /// Place the objects in the handle range of the token being
+    /// raised.
+    pub(crate) const fn set_generation(&mut self, generation: CkObjectHandle) {
+        self.generation = generation;
+    }
+
+    /// The handle of one of this token's objects.
+    #[must_use]
+    pub(crate) fn handle(&self, kind: ObjectKind) -> CkObjectHandle {
+        self.generation
+            .saturating_mul(TOKEN_HANDLE_SPACE)
+            .saturating_add(kind.handle())
+    }
+
+    /// The object a handle names on this token, or `None` for a
+    /// handle of another token or of no object.
+    #[must_use]
+    pub(crate) fn kind_of(&self, handle: CkObjectHandle) -> Option<ObjectKind> {
+        if handle / TOKEN_HANDLE_SPACE != self.generation {
+            return None;
+        }
+        let kind = ObjectKind::from_handle(handle % TOKEN_HANDLE_SPACE)?;
+        self.object_exists(kind).then_some(kind)
     }
 
     /// The sign mechanism for this card profile.
@@ -560,12 +602,33 @@ impl TokenObjects {
         &self.token_serial
     }
 
-    #[expect(
-        dead_code,
-        reason = "set_token_serial is an override hook for remote/custom token instances"
-    )]
+    /// Name the token by the pairing it is served through.
     pub(crate) fn set_token_serial(&mut self, serial: String) {
         self.token_serial = serial;
+    }
+
+    /// The authentication certificate's DER, as the token carries it.
+    #[must_use]
+    pub(crate) fn auth_cert_der(&self) -> &[u8] {
+        self.auth_cert.as_der()
+    }
+
+    /// The key a phone-served token signs with, decided from the
+    /// certificate's public key.
+    ///
+    /// # Errors
+    /// [`CKR_DEVICE_ERROR`] when the key is neither RSA-3072 nor
+    /// P-384, the two profiles a FINEID authentication key has.
+    pub(crate) fn remote_key(&self) -> Result<RemoteKey, CkRv> {
+        match &self.key_material {
+            TokenKeyMaterial::Rsa { modulus_bits, .. } if *modulus_bits == RSA3072_MODULUS_BITS => {
+                Ok(RemoteKey::Rsa3072)
+            }
+            TokenKeyMaterial::Ec { params, .. } if *params == EC_PARAMS_SECP384R1 => {
+                Ok(RemoteKey::EcdsaP384)
+            }
+            TokenKeyMaterial::Rsa { .. } | TokenKeyMaterial::Ec { .. } => Err(CKR_DEVICE_ERROR),
+        }
     }
 
     /// Look up one attribute of one object.
@@ -1166,7 +1229,7 @@ pub(super) fn build_token_objects(reader: &ReaderId) -> Result<TokenObjects, CkR
 pub(super) fn card_pin1_status(kind: &SlotKind) -> Result<PinStatus, CkRv> {
     // A remote reader reports its own PIN1 state over an authenticated
     // pairing, and this computer has no card to ask. Reaching this arm
-    // requires a vault-proven pairing, not a reader name.
+    // requires a host-admitted pairing, not a reader name.
     let Some(reader) = kind.local_reader() else {
         return Ok(PinStatus::Verified);
     };
@@ -1180,7 +1243,7 @@ pub(super) fn card_pin1_status(kind: &SlotKind) -> Result<PinStatus, CkRv> {
         .map_err(|_status_err| CKR_DEVICE_ERROR)
 }
 
-/// Run a signature on the card at `reader_name`.
+/// Run a signature on the card of a local reader.
 ///
 /// Mirrors the proven FINEID chain: open the card, select the
 /// PKCS#15 application, VERIFY PIN1 in that application context (the
@@ -1201,32 +1264,11 @@ pub(super) fn card_sign(
     pin_cache: &Arc<Mutex<PinSafetyCache>>,
     mechanism: Mechanism,
     input: &[u8],
-    origin: Option<&str>,
 ) -> Result<Vec<u8>, CkRv> {
-    if let Some(pair_id) = kind.remote_pair_id() {
-        let env_origin;
-        let effective_origin = if let Some(o) =
-            origin.filter(|o| !o.trim().is_empty() && o.len() <= 512)
-        {
-            o
-        } else {
-            env_origin = std::env::var("REFINEID_RP_ORIGIN")
-                .ok()
-                .or_else(|| std::env::var("REFINEID_ORIGIN").ok())
-                .filter(|o| !o.trim().is_empty() && o.len() <= 512);
-            if let Some(o) = &env_origin {
-                o.as_str()
-            } else {
-                crate::diag::diag!("card_sign: remote card sign missing required caller RP origin");
-                return Err(CKR_ARGUMENTS_BAD);
-            }
-        };
-        return remote_card_sign(pair_id, effective_origin, mechanism, input);
-    }
     let backend = PcscBackend;
+    // A remote slot has no local reader; its signatures go through
+    // `remote_card_sign`.
     let reader = kind.local_reader().ok_or(CKR_DEVICE_ERROR)?;
-    // The reader to open is this one; a remote slot has no local
-    // reader and never reaches here.
     // PinSequence: the whole SELECT -> probe -> VERIFY -> PSO span
     // runs inside one held PC/SC transaction, so no concurrent
     // card consumer can interleave and disturb the security state
@@ -1295,109 +1337,147 @@ pub(super) fn card_sign(
     }
 }
 
-#[cfg_attr(
-    not(windows),
-    allow(dead_code, reason = "helper for parsing DER lengths on Windows/tests")
-)]
-fn parse_der_len(der: &[u8], idx: &mut usize) -> Option<usize> {
-    if *idx >= der.len() {
-        return None;
-    }
-    let first = der[*idx];
-    *idx += 1;
-    if first & 0x80 == 0 {
-        return Some(first as usize);
-    }
-    let num_bytes = (first & 0x7f) as usize;
-    if num_bytes == 0 || num_bytes > 4 || *idx + num_bytes > der.len() {
-        return None;
-    }
-    let mut len = 0usize;
-    for _ in 0..num_bytes {
-        len = (len << 8) | (der[*idx] as usize);
-        *idx += 1;
-    }
-    Some(len)
-}
-
+/// Ask the paired phone of `pair_id` for the signature of `input`
+/// under `mechanism`.
+///
+/// The request is built once at this border: for `CKM_RSA_PKCS` the
+/// caller's `DigestInfo` names the hash and carries the digest; for
+/// `CKM_ECDSA` the caller's raw digest names the hash by its length
+/// and travels at that length. The phone verifies PIN 1 on the
+/// device, so no credential leaves this computer. One call per
+/// `C_Sign`; an answer that misses [`REMOTE_SIGN_DEADLINE`], a
+/// signature of the wrong length, or an unclassifiable outcome is
+/// reported and never retried.
+///
+/// # Errors
+/// [`CKR_DATA_INVALID`] / [`CKR_DATA_LEN_RANGE`] on bad input, the
+/// [`RemoteSignError::ck_rv`] of the source's answer, or
+/// [`CKR_DEVICE_ERROR`] when the signature is not the length the
+/// key produces.
 #[expect(
-    dead_code,
-    reason = "P1363 ECDSA conversion utility for remote signing"
+    clippy::redundant_pub_crate,
+    reason = "private root module helper is used by sibling api module; plain pub would violate the public-surface typing grep"
 )]
-pub fn ecdsa_der_to_p1363(der: &[u8], field_bytes: usize) -> Option<Vec<u8>> {
-    if field_bytes == 0 || der.is_empty() || der[0] != 0x30 {
-        return None;
-    }
-    let mut idx = 1;
-    let seq_len = parse_der_len(der, &mut idx)?;
-    if idx + seq_len != der.len() {
-        return None;
-    }
-    if idx >= der.len() || der[idx] != 0x02 {
-        return None;
-    }
-    idx += 1;
-    let r_len = parse_der_len(der, &mut idx)?;
-    if idx + r_len > der.len() {
-        return None;
-    }
-    let r_raw = &der[idx..idx + r_len];
-    idx += r_len;
-
-    if idx >= der.len() || der[idx] != 0x02 {
-        return None;
-    }
-    idx += 1;
-    let s_len = parse_der_len(der, &mut idx)?;
-    if idx + s_len != der.len() {
-        return None;
-    }
-    let s_raw = &der[idx..idx + s_len];
-
-    let mut r_slice = r_raw;
-    while r_slice.len() > 1 && r_slice[0] == 0 {
-        r_slice = &r_slice[1..];
-    }
-    if r_slice.is_empty() || (r_slice.len() == 1 && r_slice[0] == 0) || r_slice.len() > field_bytes
-    {
-        return None;
-    }
-
-    let mut s_slice = s_raw;
-    while s_slice.len() > 1 && s_slice[0] == 0 {
-        s_slice = &s_slice[1..];
-    }
-    if s_slice.is_empty() || (s_slice.len() == 1 && s_slice[0] == 0) || s_slice.len() > field_bytes
-    {
-        return None;
-    }
-
-    let mut out = vec![0u8; field_bytes * 2];
-    let r_pad = field_bytes - r_slice.len();
-    out[r_pad..field_bytes].copy_from_slice(r_slice);
-
-    let s_pad = field_bytes - s_slice.len();
-    out[field_bytes + s_pad..field_bytes * 2].copy_from_slice(s_slice);
-
-    Some(out)
-}
-
-fn remote_card_sign(
+pub(super) fn remote_card_sign(
+    source: &dyn RemoteTokenSource,
     pair_id: &RemoteSlotId,
-    origin: &str,
+    key: RemoteKey,
+    context: &DisplayText,
     mechanism: Mechanism,
     input: &[u8],
 ) -> Result<Vec<u8>, CkRv> {
-    if origin.trim().is_empty() || origin.len() > 512 {
-        crate::diag::diag!("remote_card_sign: invalid or missing RP origin");
-        return Err(CKR_ARGUMENTS_BAD);
+    let request = remote_signature_request(key, mechanism, input)?;
+    let started = Instant::now();
+    let signature = source
+        .sign(pair_id, &request, context, REMOTE_SIGN_DEADLINE)
+        .map_err(RemoteSignError::ck_rv)?;
+    if started.elapsed() > REMOTE_SIGN_DEADLINE {
+        crate::diag::diag!("remote_card_sign: the answer missed the deadline");
+        return Err(RemoteSignError::Expired.ck_rv());
     }
-    // The RP origin is the caller's own, not the device's: signing for
-    // a web origin means this computer must prove the request came
-    // from it, which is why the origin is required here rather than
-    // read from the pairing.
-    let _ = (pair_id, origin, mechanism, input);
-    Err(CKR_DEVICE_ERROR)
+    if signature.len() != key.signature_len() {
+        crate::diag::diag!("remote_card_sign: signature length is not the key's");
+        return Err(CKR_DEVICE_ERROR);
+    }
+    Ok(signature)
+}
+
+/// Build the typed request a phone signs, from the caller's PKCS#11
+/// input shape.
+///
+/// # Errors
+/// [`CKR_DATA_INVALID`] on a malformed or degenerate digest,
+/// [`CKR_DATA_LEN_RANGE`] on an ECDSA digest of no SHA-2 length,
+/// [`CKR_MECHANISM_INVALID`] when the mechanism does not fit the key.
+fn remote_signature_request(
+    key: RemoteKey,
+    mechanism: Mechanism,
+    input: &[u8],
+) -> Result<SignatureRequest, CkRv> {
+    let (algorithm, digest) = match mechanism {
+        Mechanism::RsaPkcs => {
+            let (hash, digest) = parse_digest_info(input)?;
+            let algorithm = match hash {
+                DigestInfoHash::Sha256 => RemoteSignatureAlgorithm::RsaPkcs1Sha256,
+                DigestInfoHash::Sha384 => RemoteSignatureAlgorithm::RsaPkcs1Sha384,
+                DigestInfoHash::Sha512 => RemoteSignatureAlgorithm::RsaPkcs1Sha512,
+            };
+            (algorithm, digest)
+        }
+        Mechanism::Ecdsa => {
+            let algorithm = match input.len() {
+                SHA256_LEN => RemoteSignatureAlgorithm::EcdsaSha256,
+                SHA384_LEN => RemoteSignatureAlgorithm::EcdsaSha384,
+                SHA512_LEN => RemoteSignatureAlgorithm::EcdsaSha512,
+                _ => return Err(CKR_DATA_LEN_RANGE),
+            };
+            reject_degenerate_digest(input)?;
+            (algorithm, input)
+        }
+    };
+    SignatureRequest::new(key.profile(), algorithm, digest.to_vec()).map_err(|error| match error {
+        RemoteOperationError::IncompatibleAlgorithm => CKR_MECHANISM_INVALID,
+        RemoteOperationError::DigestLength { .. } => CKR_DATA_LEN_RANGE,
+        RemoteOperationError::UnknownName
+        | RemoteOperationError::EmptyDisplayText
+        | RemoteOperationError::DisplayTextTooLong => CKR_DEVICE_ERROR,
+    })
+}
+
+/// The key a remote token serves: one of the two authentication key
+/// profiles a FINEID card carries, decided from the certificate's
+/// public key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteKey {
+    /// RSA-3072 (FINEID S4-1 v3.1).
+    Rsa3072,
+    /// ECDSA over P-384 (FINEID S4-1 v4.0).
+    EcdsaP384,
+}
+
+impl RemoteKey {
+    /// The registered key profile the request asserts.
+    #[must_use]
+    pub(crate) const fn profile(self) -> RemoteKeyProfile {
+        match self {
+            Self::Rsa3072 => RemoteKeyProfile::Rsa3072,
+            Self::EcdsaP384 => RemoteKeyProfile::EcdsaP384,
+        }
+    }
+
+    /// The length of every signature the key produces: the PKCS#1
+    /// block for RSA, the fixed-width `r || s` for ECDSA.
+    #[must_use]
+    pub(crate) const fn signature_len(self) -> usize {
+        match self {
+            Self::Rsa3072 => RSA3072_SIGNATURE_BYTES,
+            Self::EcdsaP384 => ECDSA_P384_SIGNATURE_BYTES,
+        }
+    }
+}
+
+/// Token objects for a phone-served card, from the certificate the
+/// source checked on its session; the serial names the pairing and
+/// the persisted CA certificates complete the chain.
+///
+/// # Errors
+/// [`CKR_DEVICE_ERROR`] if the certificate does not parse or carries
+/// a key outside the two FINEID authentication profiles.
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "private root module helper is used by sibling state module; plain pub would violate the public-surface typing grep"
+)]
+pub(super) fn remote_token_objects(
+    pair_id: &RemoteSlotId,
+    certificate: &SessionCertificate,
+) -> Result<TokenObjects, CkRv> {
+    let mut objects = TokenObjects::from_cert_der(certificate.as_der().to_vec())?;
+    objects.remote_key()?;
+    objects.set_token_serial(pair_id.token_serial());
+    for ca in load_persisted_ca_certs() {
+        objects.push_ca_cert(ca);
+    }
+    Ok(objects)
 }
 
 /// Verify and cache a `C_Login` PIN only after the live card accepts it.
@@ -1413,7 +1493,7 @@ pub(super) fn card_login(
     // Protected authentication path: the paired device verifies PIN1 in
     // its own protected storage, so there is no secret for this
     // computer to accept or check. Reaching this arm requires a
-    // vault-proven pairing, not a reader name.
+    // host-admitted pairing, not a reader name.
     if kind.is_remote() {
         return Ok(());
     }
@@ -1947,56 +2027,16 @@ mod tests {
         assert!(!super::is_cert_valid_at(&cert, past_not_after));
     }
 
-    /// A pairing as the vault producer would admit it, for the remote
-    /// sign path.
-    fn remote_kind() -> super::SlotKind {
-        super::SlotKind::Remote {
-            pair_id: super::RemoteSlotId::parse(&"a5".repeat(crate::slot_kind::PAIR_ID_SIZE))
-                .expect("valid pair id"),
-        }
-    }
-
     /// A reader that names itself after a pairing: local, and so never
-    /// routed to the remote sign path or its origin check.
+    /// routed to the remote sign path.
     fn impersonating_local_kind() -> super::SlotKind {
         super::SlotKind::Local {
             reader: refineid_pcsc::ReaderId::new("rapp:0123456789abcdef".to_owned()),
         }
     }
 
-    #[test]
-    fn remote_card_sign_missing_origin_fails_closed() {
-        let pin_cache = std::sync::Arc::new(std::sync::Mutex::new(
-            super::PinSafetyCache::new().expect("pin safety cache"),
-        ));
-        let res = super::card_sign(
-            &remote_kind(),
-            &pin_cache,
-            crate::sign::Mechanism::Ecdsa,
-            &[0u8; 32],
-            None,
-        );
-        assert_eq!(res, Err(crate::ck::CKR_ARGUMENTS_BAD));
-    }
-
-    #[test]
-    fn remote_card_sign_empty_origin_fails_closed() {
-        let pin_cache = std::sync::Arc::new(std::sync::Mutex::new(
-            super::PinSafetyCache::new().expect("pin safety cache"),
-        ));
-        let res = super::card_sign(
-            &remote_kind(),
-            &pin_cache,
-            crate::sign::Mechanism::Ecdsa,
-            &[0u8; 32],
-            Some("   "),
-        );
-        assert_eq!(res, Err(crate::ck::CKR_ARGUMENTS_BAD));
-    }
-
-    /// The remote origin check is a property of a vault-proven pairing,
-    /// so a reader that merely names itself one never reaches it. As a
-    /// local reader it fails on the card it cannot open.
+    /// A local reader that cannot be opened fails on the card, never
+    /// on a phone.
     #[test]
     fn a_local_reader_naming_itself_a_pairing_never_takes_the_remote_path() {
         let pin_cache = std::sync::Arc::new(std::sync::Mutex::new(
@@ -2007,20 +2047,19 @@ mod tests {
             &pin_cache,
             crate::sign::Mechanism::Ecdsa,
             &[0u8; 32],
-            None,
         );
         assert_eq!(res, Err(crate::ck::CKR_DEVICE_ERROR));
     }
 
     /// PIN1 state for a local reader is whatever the card says; only a
-    /// vault-proven pairing reports a state this computer did not read.
+    /// host-admitted pairing reports a state this computer did not read.
     #[test]
     fn a_local_reader_naming_itself_a_pairing_has_no_remote_pin_state() {
         let res = super::card_pin1_status(&impersonating_local_kind());
         assert_ne!(res, Ok(super::PinStatus::Verified));
     }
 
-    /// `C_Login` succeeds without a card only for a vault-proven
+    /// `C_Login` succeeds without a card only for a host-admitted
     /// pairing, whose PIN1 the device verified itself.
     #[test]
     fn a_local_reader_naming_itself_a_pairing_does_not_skip_login() {
@@ -2032,18 +2071,248 @@ mod tests {
         assert_eq!(res, Err(crate::ck::CKR_DEVICE_ERROR));
     }
 
+    /// A source that answers every request with a fixed outcome and
+    /// records the request it was handed.
+    struct AnsweringSource {
+        answer: Result<Vec<u8>, crate::remote::RemoteSignError>,
+        seen: std::sync::Mutex<Option<(refineid_remote::SignatureRequest, String)>>,
+    }
+
+    impl AnsweringSource {
+        fn answering(answer: Result<Vec<u8>, crate::remote::RemoteSignError>) -> Self {
+            Self {
+                answer,
+                seen: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn seen(&self) -> Option<(refineid_remote::SignatureRequest, String)> {
+            self.seen.lock().expect("seen lock").clone()
+        }
+    }
+
+    impl crate::remote::RemoteTokenSource for AnsweringSource {
+        fn offered(&self) -> Option<crate::remote::RemoteOffer> {
+            None
+        }
+
+        fn sign(
+            &self,
+            _pair_id: &super::RemoteSlotId,
+            request: &refineid_remote::SignatureRequest,
+            context: &refineid_remote::DisplayText,
+            deadline: core::time::Duration,
+        ) -> Result<Vec<u8>, crate::remote::RemoteSignError> {
+            assert_eq!(deadline, crate::remote::REMOTE_SIGN_DEADLINE);
+            *self.seen.lock().expect("seen lock") =
+                Some((request.clone(), context.as_str().to_owned()));
+            self.answer.clone()
+        }
+
+        fn stop(&self) {}
+    }
+
+    fn pair_id() -> super::RemoteSlotId {
+        super::RemoteSlotId::parse(&"a5".repeat(crate::slot_kind::PAIR_ID_SIZE))
+            .expect("valid pair id")
+    }
+
+    fn context() -> refineid_remote::DisplayText {
+        refineid_remote::DisplayText::new("alpha-desk".to_owned()).expect("bounded text")
+    }
+
+    /// A SHA-384 digest that is not a degenerate sentinel.
+    fn sha384_digest() -> Vec<u8> {
+        (1_u8..=48_u8).collect()
+    }
+
     #[test]
-    fn remote_card_sign_valid_origin_fails_device_error() {
-        let pin_cache = std::sync::Arc::new(std::sync::Mutex::new(
-            super::PinSafetyCache::new().expect("pin safety cache"),
-        ));
-        let res = super::card_sign(
-            &remote_kind(),
-            &pin_cache,
+    fn an_ecdsa_digest_names_its_hash_by_length_and_travels_whole() {
+        let signature = vec![7_u8; super::ECDSA_P384_SIGNATURE_BYTES];
+        let source = AnsweringSource::answering(Ok(signature.clone()));
+        let res = super::remote_card_sign(
+            &source,
+            &pair_id(),
+            super::RemoteKey::EcdsaP384,
+            &context(),
             crate::sign::Mechanism::Ecdsa,
-            &[0u8; 32],
-            Some("https://auth.example.com"),
+            &sha384_digest(),
+        );
+        assert_eq!(res, Ok(signature));
+        let (request, shown) = source.seen().expect("the source was asked");
+        assert_eq!(
+            request.algorithm(),
+            refineid_remote::RemoteSignatureAlgorithm::EcdsaSha384
+        );
+        assert_eq!(
+            request.key_profile(),
+            refineid_remote::RemoteKeyProfile::EcdsaP384
+        );
+        assert_eq!(request.digest(), sha384_digest().as_slice());
+        assert_eq!(shown, "alpha-desk");
+    }
+
+    #[test]
+    fn each_sha2_length_selects_its_ecdsa_algorithm() {
+        for (len, algorithm) in [
+            (32, refineid_remote::RemoteSignatureAlgorithm::EcdsaSha256),
+            (48, refineid_remote::RemoteSignatureAlgorithm::EcdsaSha384),
+            (64, refineid_remote::RemoteSignatureAlgorithm::EcdsaSha512),
+        ] {
+            let digest: Vec<u8> = (1..=len).map(|byte| byte as u8).collect();
+            let request = super::remote_signature_request(
+                super::RemoteKey::EcdsaP384,
+                crate::sign::Mechanism::Ecdsa,
+                &digest,
+            )
+            .expect("a SHA-2 length");
+            assert_eq!(request.algorithm(), algorithm);
+        }
+        let odd: Vec<u8> = (1_u8..=20_u8).collect();
+        assert_eq!(
+            super::remote_signature_request(
+                super::RemoteKey::EcdsaP384,
+                crate::sign::Mechanism::Ecdsa,
+                &odd,
+            ),
+            Err(crate::ck::CKR_DATA_LEN_RANGE)
+        );
+        assert_eq!(
+            super::remote_signature_request(
+                super::RemoteKey::EcdsaP384,
+                crate::sign::Mechanism::Ecdsa,
+                &[0_u8; 48],
+            ),
+            Err(crate::ck::CKR_DATA_INVALID)
+        );
+    }
+
+    #[test]
+    fn each_digest_info_hash_selects_its_rsa_algorithm() {
+        for (info, algorithm) in [
+            (
+                crate::sign::tests::digest_info_sha256_with_null(),
+                refineid_remote::RemoteSignatureAlgorithm::RsaPkcs1Sha256,
+            ),
+            (
+                crate::sign::tests::digest_info_sha384_with_null(),
+                refineid_remote::RemoteSignatureAlgorithm::RsaPkcs1Sha384,
+            ),
+            (
+                crate::sign::tests::digest_info_sha512_with_null(),
+                refineid_remote::RemoteSignatureAlgorithm::RsaPkcs1Sha512,
+            ),
+        ] {
+            let request = super::remote_signature_request(
+                super::RemoteKey::Rsa3072,
+                crate::sign::Mechanism::RsaPkcs,
+                &info,
+            )
+            .expect("a SHA-2 DigestInfo");
+            assert_eq!(request.algorithm(), algorithm);
+            assert_eq!(
+                request.key_profile(),
+                refineid_remote::RemoteKeyProfile::Rsa3072
+            );
+            assert_eq!(request.digest().len(), algorithm.digest_len());
+        }
+    }
+
+    /// A `DigestInfo` handed to an ECDSA key, or a raw digest to an
+    /// RSA key, is a mechanism that does not fit the key.
+    #[test]
+    fn a_mechanism_that_does_not_fit_the_key_is_refused() {
+        assert_eq!(
+            super::remote_signature_request(
+                super::RemoteKey::EcdsaP384,
+                crate::sign::Mechanism::RsaPkcs,
+                &crate::sign::tests::digest_info_sha256_with_null(),
+            ),
+            Err(crate::ck::CKR_MECHANISM_INVALID)
+        );
+        assert_eq!(
+            super::remote_signature_request(
+                super::RemoteKey::Rsa3072,
+                crate::sign::Mechanism::Ecdsa,
+                &sha384_digest(),
+            ),
+            Err(crate::ck::CKR_MECHANISM_INVALID)
+        );
+    }
+
+    #[test]
+    fn a_signature_of_the_wrong_length_is_refused() {
+        let source = AnsweringSource::answering(Ok(vec![7_u8; 10]));
+        let res = super::remote_card_sign(
+            &source,
+            &pair_id(),
+            super::RemoteKey::EcdsaP384,
+            &context(),
+            crate::sign::Mechanism::Ecdsa,
+            &sha384_digest(),
         );
         assert_eq!(res, Err(crate::ck::CKR_DEVICE_ERROR));
+    }
+
+    #[test]
+    fn the_sources_errors_reach_the_caller_as_the_table_says() {
+        for error in crate::remote::RemoteSignError::ALL {
+            let source = AnsweringSource::answering(Err(error));
+            let res = super::remote_card_sign(
+                &source,
+                &pair_id(),
+                super::RemoteKey::EcdsaP384,
+                &context(),
+                crate::sign::Mechanism::Ecdsa,
+                &sha384_digest(),
+            );
+            assert_eq!(res, Err(error.ck_rv()), "{error}");
+        }
+    }
+
+    /// A bad digest never reaches the source.
+    #[test]
+    fn a_bad_digest_is_refused_before_the_phone_is_asked() {
+        let source = AnsweringSource::answering(Ok(vec![7_u8; super::ECDSA_P384_SIGNATURE_BYTES]));
+        let res = super::remote_card_sign(
+            &source,
+            &pair_id(),
+            super::RemoteKey::EcdsaP384,
+            &context(),
+            crate::sign::Mechanism::Ecdsa,
+            &[],
+        );
+        assert_eq!(res, Err(crate::ck::CKR_DATA_LEN_RANGE));
+        assert!(source.seen().is_none());
+    }
+
+    /// The key a phone-served token signs with follows the
+    /// certificate's public key: P-384 is served; RSA-4096 and P-256
+    /// are not FINEID authentication keys and are refused at token
+    /// discovery.
+    #[test]
+    fn the_remote_key_follows_the_certificate() {
+        const EC_DER: &[u8] = include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+        const RSA_4096_DER: &[u8] =
+            include_bytes!("../ca-certs/fineid-intermediate-02-citizen-g4r.der");
+        const P256_DER: &[u8] = include_bytes!("../test-certs/p256-alpha.der");
+        let ec = super::TokenObjects::from_cert_der(EC_DER.to_vec()).expect("parses");
+        assert_eq!(ec.remote_key(), Ok(super::RemoteKey::EcdsaP384));
+        let rsa = super::TokenObjects::from_cert_der(RSA_4096_DER.to_vec()).expect("parses");
+        assert_eq!(rsa.remote_key(), Err(crate::ck::CKR_DEVICE_ERROR));
+        assert_eq!(
+            super::TokenObjects::from_cert_der(P256_DER.to_vec()).map(|_| ()),
+            Err(crate::ck::CKR_DEVICE_ERROR)
+        );
+        for refused in [RSA_4096_DER, P256_DER] {
+            let certificate = crate::remote::SessionCertificate::new(refused.to_vec());
+            assert_eq!(
+                super::remote_token_objects(&pair_id(), &certificate).map(|_| ()),
+                Err(crate::ck::CKR_DEVICE_ERROR)
+            );
+        }
+        let certificate = crate::remote::SessionCertificate::new(EC_DER.to_vec());
+        let objects = super::remote_token_objects(&pair_id(), &certificate).expect("served");
+        assert_eq!(objects.token_serial(), "REMOTE-a5a5a5a5");
     }
 }

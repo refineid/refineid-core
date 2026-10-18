@@ -24,47 +24,43 @@
 //! Two trust origins, two constructors. A [`SlotKind::Local`] is
 //! admitted at the PC/SC enumeration border and can only ever be a
 //! reader this computer drives, whatever it calls itself. A
-//! [`SlotKind::Remote`] is admitted at the vault border from a paired
-//! RAPP record and carries a validated [`RemoteSlotId`], so holding one
-//! is proof the pairing was established rather than claimed.
+//! [`SlotKind::Remote`] is admitted from the host's installed
+//! [`crate::remote::RemoteTokenSource`] and carries a validated
+//! [`RemoteSlotId`], so holding one is proof the host admitted the
+//! pairing rather than a claim.
 
 use alloc::string::{String, ToString};
 
 use refineid_pcsc::ReaderId;
+use refineid_remote::DisplayText;
 
 /// Byte length of the pair identifier that names a remote reader.
 ///
 /// RAPP v26.9.28 section 13.1 derives `pair_id` as the first 16 bytes
 /// of `SHA-512("RAPP-pair-id-v1" || h)`. This crate states the length
 /// locally rather than depending on `refineid-rapp`: the PKCS#11 module
-/// needs the pair identifier only as a vault key, and taking a
+/// needs the pair identifier only as a slot key, and taking a
 /// dependency on the RAPP protocol crate to read its own key length
 /// would couple the module to a wire format it never parses.
 pub const PAIR_ID_SIZE: usize = 16;
 
 /// Hex-encoded characters a [`RemoteSlotId`] renders as: two per byte.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "read by RemoteSlotId::parse, which only the vault producer can reach"
-    )
-)]
 const PAIR_ID_HEX_SIZE: usize = PAIR_ID_SIZE * 2;
+
+/// Leading bytes of the pair identifier that name a remote token's
+/// serial number; eight hex characters tell pairings apart in a
+/// token list without printing the whole identifier.
+const SERIAL_PAIR_ID_BYTES: usize = 4;
+
+/// Prefix of a remote token's serial number, before the pair
+/// identifier's leading hex.
+const REMOTE_SERIAL_PREFIX: &str = "REMOTE-";
 
 /// Prefix a remote reader's display name carries, so a paired phone is
 /// distinguishable from a USB reader in a slot list.
 const REMOTE_DISPLAY_PREFIX: &str = "RefineID Remote ";
 
 /// Why a candidate pair identifier is not a [`RemoteSlotId`].
-///
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "reported by RemoteSlotId::parse, which only the vault producer can reach"
-    )
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteSlotIdError {
     /// The candidate is not a whole number of hex-encoded bytes.
@@ -87,7 +83,7 @@ impl core::fmt::Display for RemoteSlotIdError {
 ///
 /// The predicate -- a hex encoding of exactly [`PAIR_ID_SIZE`] bytes --
 /// is checked once, here, so that every later holder of the value may
-/// read it, use it as a vault key, and render it back to hex without
+/// read it, use it as a slot key, and render it back to hex without
 /// re-checking. The hex form is regenerated from the bytes rather than
 /// kept beside them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,13 +101,6 @@ impl RemoteSlotId {
     /// length is not [`PAIR_ID_SIZE`].
     ///
     /// [`RemoteSlotIdError`]: crate::slot_kind::RemoteSlotIdError
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the vault producer is the only caller that may admit a pairing"
-        )
-    )]
     pub fn parse(hex: &str) -> Result<Self, RemoteSlotIdError> {
         if hex.len() != PAIR_ID_HEX_SIZE || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(if hex.len() != PAIR_ID_HEX_SIZE {
@@ -127,16 +116,21 @@ impl RemoteSlotId {
     }
 
     /// The pair identifier's bytes.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the vault producer is the only reader of the pair id bytes"
-        )
-    )]
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; PAIR_ID_SIZE] {
         &self.bytes
+    }
+
+    /// The serial number a token served through this pairing
+    /// reports: `REMOTE-` and the identifier's leading four bytes as
+    /// lower-case hex.
+    #[must_use]
+    pub fn token_serial(self) -> String {
+        let mut serial = String::from(REMOTE_SERIAL_PREFIX);
+        serial.push_str(&hex::encode(
+            self.bytes.get(..SERIAL_PAIR_ID_BYTES).unwrap_or_default(),
+        ));
+        serial
     }
 
     /// The pair identifier re-encoded as lower-case hex.
@@ -156,16 +150,13 @@ pub enum SlotKind {
     },
     /// A paired mobile RAPP reader; the credential is verified on the
     /// device, so this computer never holds a PIN1.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "only the vault producer may mint a Remote slot, so no reader name can impersonate one"
-        )
-    )]
     Remote {
-        /// The vault key naming the pairing this reader is trusted through.
+        /// The pairing this reader is trusted through.
         pair_id: RemoteSlotId,
+        /// The name the phone is shown under.
+        label: String,
+        /// The text naming this computer to the holder on the phone.
+        context: DisplayText,
     },
 }
 
@@ -190,7 +181,7 @@ impl SlotKind {
     pub const fn remote_pair_id(&self) -> Option<&RemoteSlotId> {
         match self {
             Self::Local { .. } => None,
-            Self::Remote { pair_id } => Some(pair_id),
+            Self::Remote { pair_id, .. } => Some(pair_id),
         }
     }
 
@@ -201,7 +192,7 @@ impl SlotKind {
     pub fn cache_key(&self) -> String {
         match self {
             Self::Local { reader } => reader.as_str().to_string(),
-            Self::Remote { pair_id } => pair_id.to_hex(),
+            Self::Remote { pair_id, .. } => pair_id.to_hex(),
         }
     }
 
@@ -210,9 +201,9 @@ impl SlotKind {
     pub fn display_name(&self) -> String {
         match self {
             Self::Local { reader } => reader.as_str().to_string(),
-            Self::Remote { pair_id } => {
+            Self::Remote { label, .. } => {
                 let mut name = String::from(REMOTE_DISPLAY_PREFIX);
-                name.push_str(&pair_id.to_hex());
+                name.push_str(label);
                 name
             }
         }
@@ -224,6 +215,7 @@ mod tests {
     use super::{PAIR_ID_SIZE, RemoteSlotId, RemoteSlotIdError, SlotKind};
     use alloc::string::ToString;
     use refineid_pcsc::ReaderId;
+    use refineid_remote::DisplayText;
 
     /// A valid pair identifier as the hex a pairing record carries.
     fn valid_hex() -> String {
@@ -278,19 +270,29 @@ mod tests {
         let local = SlotKind::Local {
             reader: ReaderId::new("Generic USB Reader".to_string()),
         };
-        let remote = SlotKind::Remote { pair_id };
+        let remote = SlotKind::Remote {
+            pair_id,
+            label: "Alpha Phone".to_string(),
+            context: DisplayText::new("alpha-desk".to_string()).expect("bounded text"),
+        };
         assert_ne!(local.cache_key(), remote.cache_key());
         assert_ne!(local.display_name(), remote.display_name());
     }
 
     #[test]
-    fn remote_display_name_carries_the_pair_id() {
-        let hex = valid_hex();
+    fn remote_display_name_carries_the_label() {
         let kind = SlotKind::Remote {
-            pair_id: RemoteSlotId::parse(&hex).expect("valid pair id"),
+            pair_id: RemoteSlotId::parse(&valid_hex()).expect("valid pair id"),
+            label: "Alpha Phone".to_string(),
+            context: DisplayText::new("alpha-desk".to_string()).expect("bounded text"),
         };
-        assert!(kind.display_name().ends_with(&hex));
-        assert!(!kind.display_name().starts_with("rapp:"));
+        assert_eq!(kind.display_name(), "RefineID Remote Alpha Phone");
+    }
+
+    #[test]
+    fn the_token_serial_names_the_pairing_by_its_leading_hex() {
+        let id = RemoteSlotId::parse(&valid_hex()).expect("valid pair id");
+        assert_eq!(id.token_serial(), "REMOTE-a5a5a5a5");
     }
 
     #[test]

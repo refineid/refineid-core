@@ -955,6 +955,7 @@ dependencies = [
  "refineid-pcsc",
  "refineid-pin-cache",
  "refineid-pkcs15",
+ "refineid-remote",
  "refineid-sign",
  "refineid-x509",
  "spki",

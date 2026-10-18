@@ -575,6 +575,9 @@ pub const CKR_DATA_LEN_RANGE: CkRv = 0x0000_0021;
 pub const CKR_DEVICE_ERROR: CkRv = 0x0000_0030;
 /// `CKR_DEVICE_REMOVED`: the token was removed mid-operation.
 pub const CKR_DEVICE_REMOVED: CkRv = 0x0000_0032;
+/// `CKR_FUNCTION_CANCELED`: the function was cancelled mid-execution,
+/// here by the holder on the phone or by the request's own expiry.
+pub const CKR_FUNCTION_CANCELED: CkRv = 0x0000_0050;
 /// `CKR_FUNCTION_NOT_SUPPORTED`: the function is not implemented.
 pub const CKR_FUNCTION_NOT_SUPPORTED: CkRv = 0x0000_0054;
 /// `CKR_FUNCTION_NOT_PARALLEL`: v2.40 s11.16 return for the legacy

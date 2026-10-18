@@ -309,6 +309,29 @@ SHA-224 length is added, cited to FIPS 180-4. Covered by unit tests over the
 complete registries; nothing here touches a card, so no hardware validation
 applies.
 
+The fourteenth slice admits the paired phone as a PKCS#11 slot in
+`refineid-pkcs11`, behind one seam: a host installs a `RemoteTokenSource`
+before it hands out the function list, and the module reads from it, at
+every slot refresh, the one pairing offered right now. An offer carries a
+certificate only while the source holds an open session on which the
+phone reports a card, and it is the certificate the source read from that
+card on that session; the token exists exactly then, its objects are
+built from that certificate and the persisted CA certificates, and its
+serial names the pairing. A withdrawn or replaced token is a new token
+when it reappears: every raised token takes its own object-handle range,
+so a handle of a withdrawn token names nothing. `C_Login` on a remote
+slot reads no PIN and succeeds only while the token is present, since
+the phone verifies PIN 1 itself; `C_Sign` builds one typed
+`SignatureRequest` from the caller's input -- the `DigestInfo` names the
+hash for RSA, the digest's length names it for ECDSA -- and makes one
+call to the source with the module's deadline and the text naming this
+computer, checks the signature's length against the key, and never
+retries; every outcome of the source maps through one table to a PKCS#11
+return value. The exported `C_GetFunctionList` is behind a default-on
+feature so a host library can own the symbol. RAPP's wire, channels,
+transports and stores stay outside the core. Covered by unit tests over a
+scripted source; the phone path is not recorded as hardware-validated.
+
 ## Hardware validation
 
 Slices two through five have been exercised against two citizen card

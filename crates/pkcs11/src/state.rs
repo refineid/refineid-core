@@ -36,15 +36,16 @@ use refineid_pcsc::{
 use refineid_pkcs15::{Pkcs15Error, Pkcs15Ops as _};
 
 use crate::pin_cache::PinSafetyCache;
+use crate::remote::{RemoteOffer, RemoteTokenSource};
 use crate::slot_kind::SlotKind;
 
 use crate::ck::{
-    CKF_RW_SESSION, CKR_DEVICE_ERROR, CKS_RO_PUBLIC_SESSION, CKS_RO_USER_FUNCTIONS,
-    CKS_RW_PUBLIC_SESSION, CKS_RW_USER_FUNCTIONS, CkFlags, CkObjectHandle, CkRv, CkSessionHandle,
-    CkSlotId, CkState,
+    CKF_RW_SESSION, CKR_DEVICE_ERROR, CKR_TOKEN_NOT_PRESENT, CKS_RO_PUBLIC_SESSION,
+    CKS_RO_USER_FUNCTIONS, CKS_RW_PUBLIC_SESSION, CKS_RW_USER_FUNCTIONS, CkFlags, CkObjectHandle,
+    CkRv, CkSessionHandle, CkSlotId, CkState,
 };
 use crate::sign::Mechanism;
-use crate::token::{TokenObjects, build_token_objects};
+use crate::token::{TokenObjects, build_token_objects, remote_token_objects};
 
 /// First slot id handed out. Slot ids are stable per reader name for
 /// the process lifetime; starting at 1 keeps 0 (a common "invalid"
@@ -53,6 +54,12 @@ const SLOT_ID_BASE: CkSlotId = 1;
 /// First session handle handed out. 0 is
 /// [`crate::ck::CK_INVALID_HANDLE`] and must never be a live handle.
 const SESSION_HANDLE_BASE: CkSessionHandle = 1;
+/// The handle range of the first token raised; the range below it
+/// holds objects of no raised token.
+const FIRST_TOKEN_GENERATION: CkObjectHandle = 1;
+/// The vendor a remote slot reports for its reader: this software,
+/// which is what drives the phone.
+const REMOTE_READER_VENDOR: &str = "RefineID";
 /// PIN1 minimum length in ASCII digits accepted by `C_Login`
 /// (DVV FINEID PIN1 policy).
 pub const PIN1_MIN_DIGITS: usize = 4;
@@ -110,6 +117,28 @@ impl SlotRecord {
     /// The reader's driver-reported identity attributes.
     pub(crate) const fn reader_identity(&self) -> &ReaderIdentity {
         &self.reader_identity
+    }
+
+    /// A remote slot, for tests that need one without a source.
+    #[cfg(test)]
+    pub(crate) fn remote_for_test(
+        id: CkSlotId,
+        pair_id: crate::slot_kind::RemoteSlotId,
+        label: &str,
+        context: &str,
+        card_present: bool,
+    ) -> Self {
+        Self {
+            id,
+            kind: SlotKind::Remote {
+                pair_id,
+                label: label.to_owned(),
+                context: refineid_remote::DisplayText::new(context.to_owned())
+                    .expect("bounded text"),
+            },
+            card_present,
+            reader_identity: ReaderIdentity::default(),
+        }
     }
 }
 
@@ -250,6 +279,8 @@ pub struct ModuleState {
     event_reported: BTreeMap<CkSlotId, bool>,
     /// Active login state for remote RAPP readers (authenticated via on-device protected path).
     remote_logged_in: BTreeSet<CkSlotId>,
+    /// The handle range the next raised token takes.
+    next_token_generation: CkObjectHandle,
 }
 
 impl ModuleState {
@@ -265,9 +296,19 @@ impl ModuleState {
             token_cache: BTreeMap::new(),
             event_reported: BTreeMap::new(),
             remote_logged_in: BTreeSet::new(),
+            next_token_generation: FIRST_TOKEN_GENERATION,
         };
         state.refresh_slots();
         state
+    }
+
+    /// Raise a token: place its objects in the next handle range and
+    /// cache them for the slot. Returns the objects as cached.
+    fn cache_token(&mut self, slot_id: CkSlotId, mut objects: TokenObjects) -> TokenObjects {
+        objects.set_generation(self.next_token_generation);
+        self.next_token_generation = self.next_token_generation.saturating_add(1);
+        self.token_cache.insert(slot_id, objects.clone());
+        objects
     }
 
     /// Re-enumerate readers, appending readers only after their
@@ -335,7 +376,7 @@ impl ModuleState {
                         slot.card_present = true;
                     }
                     self.invalidate_slot(id);
-                    self.token_cache.insert(id, objects);
+                    self.cache_token(id, objects);
                 } else if was_present && !aid_present {
                     if let Some(slot) = self.slots.get_mut(pos) {
                         slot.card_present = false;
@@ -358,21 +399,127 @@ impl ModuleState {
                     card_present: true,
                     reader_identity: prober.reader_identity(&reader.id),
                 });
-                self.token_cache.insert(id, objects);
+                self.cache_token(id, objects);
             }
         }
         Ok(())
     }
 
-    /// Discover paired remote RAPP mobile readers (iPhone/Android) from
-    /// the local vault.
+    /// Admit the paired phone the host's installed source offers.
     ///
-    /// The vault is the only trust origin that may admit a
-    /// [`SlotKind::Remote`]: a pairing record read here is proof the
-    /// pairing was established, where a reader name reported by a USB
-    /// device would only be a claim. While this admits nothing, no
+    /// The source is the only trust origin that may admit a
+    /// [`SlotKind::Remote`]: an offer read here is proof the host
+    /// admitted the pairing, where a reader name reported by a USB
+    /// device would only be a claim. With no source installed, no
     /// remote slot exists and no remote credential path is reachable.
-    fn refresh_remote_slots(&mut self) {}
+    fn refresh_remote_slots(&mut self) {
+        if let Some(source) = crate::remote::installed() {
+            self.refresh_remote_slots_with(source);
+        }
+    }
+
+    /// [`Self::refresh_remote_slots`] over an injected source, so the
+    /// admission logic is testable without a host.
+    ///
+    /// At most one remote slot carries a token at a time, the one the
+    /// offer names. A remote slot the offer no longer names keeps its
+    /// id and loses its token. The token exists exactly while the
+    /// offer carries a certificate that parses; a certificate that
+    /// differs from the cached one withdraws the token and raises a
+    /// new one, with new object handles, under the same slot id.
+    fn refresh_remote_slots_with(&mut self, source: &dyn RemoteTokenSource) {
+        let offer = source.offered();
+        let unnamed: Vec<CkSlotId> = self
+            .slots
+            .iter()
+            .filter(|slot| {
+                slot.card_present
+                    && slot.kind.is_remote()
+                    && offer
+                        .as_ref()
+                        .is_none_or(|offer| slot.kind.remote_pair_id() != Some(offer.pair_id()))
+            })
+            .map(|slot| slot.id)
+            .collect();
+        for id in unnamed {
+            self.withdraw_token(id);
+        }
+        let Some(offer) = offer else {
+            return;
+        };
+        let id = self.remote_slot_for(&offer);
+        let objects = offer
+            .certificate()
+            .and_then(|certificate| remote_token_objects(offer.pair_id(), certificate).ok());
+        let Some(objects) = objects else {
+            self.withdraw_token(id);
+            return;
+        };
+        let cached_same_certificate = self
+            .token_cache
+            .get(&id)
+            .is_some_and(|cached| cached.auth_cert_der() == objects.auth_cert_der());
+        if cached_same_certificate {
+            return;
+        }
+        self.withdraw_token(id);
+        self.cache_token(id, objects);
+        if let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == id) {
+            slot.card_present = true;
+        }
+        // A token the caller was last told was present was withdrawn
+        // and raised again within this refresh; the caller is told of
+        // the new token once.
+        self.event_reported
+            .entry(id)
+            .and_modify(|reported| *reported = false);
+    }
+
+    /// The slot of the offered pairing, appended on first sight and
+    /// renamed when the phone's label changed.
+    fn remote_slot_for(&mut self, offer: &RemoteOffer) -> CkSlotId {
+        if let Some(slot) = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.kind.remote_pair_id() == Some(offer.pair_id()))
+        {
+            if let SlotKind::Remote { label, context, .. } = &mut slot.kind {
+                if label != offer.label() {
+                    offer.label().clone_into(label);
+                }
+                if context != offer.context() {
+                    *context = offer.context().clone();
+                }
+            }
+            return slot.id;
+        }
+        let id = self.next_slot_id;
+        self.next_slot_id = self.next_slot_id.saturating_add(1);
+        self.slots.push(SlotRecord {
+            id,
+            kind: SlotKind::Remote {
+                pair_id: *offer.pair_id(),
+                label: offer.label().to_owned(),
+                context: offer.context().clone(),
+            },
+            card_present: false,
+            reader_identity: ReaderIdentity {
+                vendor_name: Some(REMOTE_READER_VENDOR.to_owned()),
+                ifd_version: None,
+            },
+        });
+        id
+    }
+
+    /// Mark a slot's token absent, end its login, and drop what was
+    /// cached for it.
+    fn withdraw_token(&mut self, slot_id: CkSlotId) {
+        if let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == slot_id) {
+            slot.card_present = false;
+        }
+        self.remote_logged_in.remove(&slot_id);
+        self.invalidate_slot(slot_id);
+    }
 
     /// Drop cached objects and PIN1 login for a slot (on card
     /// removal). Zeroizes the PIN1 secret via `PinBytes`'s drop.
@@ -513,17 +660,13 @@ impl ModuleState {
     #[must_use]
     pub(crate) fn is_logged_in(&self, slot_id: CkSlotId) -> bool {
         // A remote slot's PIN1 is verified on the device, so this
-        // computer holds no secret to check. Reaching that answer
-        // requires holding a vault-proven pairing, which only
-        // `refresh_remote_slots` can mint.
-        if self
-            .slot(slot_id)
-            .is_some_and(|slot| slot.kind().is_remote())
+        // computer holds no secret to check: the slot is logged in
+        // from `C_Login` until `C_Logout`, the last session's close,
+        // or the token's withdrawal.
+        if let Some(slot) = self.slot(slot_id)
+            && slot.kind().is_remote()
         {
-            return true;
-        }
-        if self.remote_logged_in.contains(&slot_id) {
-            return true;
+            return slot.card_present() && self.remote_logged_in.contains(&slot_id);
         }
         self.pin_caches.get(&slot_id).is_some_and(|cache| {
             cache
@@ -562,23 +705,24 @@ impl ModuleState {
     /// Return the cached token objects for `slot_id`, building and
     /// caching them from the card on first need.
     ///
+    /// A remote slot's objects come from its offer alone, so an
+    /// uncached remote slot has no token.
+    ///
     /// # Errors
-    /// [`CKR_DEVICE_ERROR`] if the slot is unknown or the card read /
-    /// parse fails.
+    /// [`CKR_TOKEN_NOT_PRESENT`] for a remote slot with no cached
+    /// objects; [`CKR_DEVICE_ERROR`] if the slot is unknown or the
+    /// card read / parse fails.
     pub(crate) fn ensure_token(&mut self, slot_id: CkSlotId) -> Result<TokenObjects, CkRv> {
         if let Some(cached) = self.token_cache.get(&slot_id) {
             return Ok(cached.clone());
         }
-        // Token objects are read from a card over PC/SC, so they come
-        // from a local reader or not at all.
-        let reader = self
-            .slot_kind(slot_id)
-            .and_then(SlotKind::local_reader)
-            .ok_or(CKR_DEVICE_ERROR)?
-            .clone();
+        let kind = self.slot_kind(slot_id).ok_or(CKR_DEVICE_ERROR)?;
+        if kind.is_remote() {
+            return Err(CKR_TOKEN_NOT_PRESENT);
+        }
+        let reader = kind.local_reader().ok_or(CKR_DEVICE_ERROR)?.clone();
         let objects = build_token_objects(&reader)?;
-        self.token_cache.insert(slot_id, objects.clone());
-        Ok(objects)
+        Ok(self.cache_token(slot_id, objects))
     }
 
     /// The number of open sessions (used by tests / diagnostics).
@@ -601,6 +745,7 @@ impl ModuleState {
             token_cache: BTreeMap::new(),
             event_reported: BTreeMap::new(),
             remote_logged_in: BTreeSet::new(),
+            next_token_generation: FIRST_TOKEN_GENERATION,
         }
     }
 }
@@ -706,6 +851,7 @@ mod tests {
     use crate::pin::PinBytes;
     use crate::slot_kind::{PAIR_ID_SIZE, RemoteSlotId, SlotKind};
     use refineid_pcsc::ReaderId;
+    use refineid_remote::DisplayText;
     use std::sync::Arc;
 
     /// Build module state without touching hardware by injecting a
@@ -728,12 +874,15 @@ mod tests {
         ModuleState::from_parts_for_test(slots, next)
     }
 
-    /// A pairing admitted by the vault, for the remote-slot assertions.
+    /// A pairing admitted by the host's source, for the remote-slot
+    /// assertions.
     fn remote_slot(pair_hex: &str) -> SlotRecord {
         SlotRecord {
             id: 1,
             kind: SlotKind::Remote {
                 pair_id: RemoteSlotId::parse(pair_hex).expect("valid pair id"),
+                label: "Alpha Phone".to_owned(),
+                context: DisplayText::new("alpha-desk".to_owned()).expect("bounded text"),
             },
             card_present: true,
             reader_identity: ReaderIdentity::default(),
@@ -756,7 +905,7 @@ mod tests {
 
     /// A reader name is a claim, not a proof: the USB device's driver
     /// chose the string. Naming a reader after a pairing must not buy
-    /// the credential answers that only a vault-proven pairing may
+    /// the credential answers that only a host-admitted pairing may
     /// give.
     #[test]
     fn a_local_reader_naming_itself_a_pairing_is_still_local() {
@@ -768,27 +917,252 @@ mod tests {
         assert!(!state.is_logged_in(1));
     }
 
-    /// Only a slot minted from a vault pairing record may answer "the
-    /// credential was verified on the device".
+    /// A remote slot is logged in from `C_Login` until `C_Logout` or
+    /// the token's withdrawal, and only while its token is present.
     #[test]
-    fn only_a_vault_pairing_counts_as_logged_in() {
-        let state =
+    fn a_remote_slot_is_logged_in_only_between_login_and_logout() {
+        let mut state =
             ModuleState::from_parts_for_test(vec![remote_slot(&"a5".repeat(PAIR_ID_SIZE))], 2);
         assert!(state.slot_kind(1).is_some_and(SlotKind::is_remote));
+        assert!(!state.is_logged_in(1));
+        state.set_remote_logged_in(1, true);
         assert!(state.is_logged_in(1));
+        state.logout(1);
+        assert!(!state.is_logged_in(1));
+        state.set_remote_logged_in(1, true);
+        state.withdraw_token(1);
+        assert!(!state.is_logged_in(1));
     }
 
-    /// Token objects are read from card silicon over PC/SC, so a
-    /// remote slot has no local token to build and must not fall
-    /// through to the local reader path.
+    /// A remote slot's objects come from its offer alone; with none
+    /// cached there is no token, and no local reader path is tried.
     #[test]
-    fn a_remote_slot_yields_no_local_token_objects() {
+    fn an_uncached_remote_slot_has_no_token() {
         let mut state =
             ModuleState::from_parts_for_test(vec![remote_slot(&"a5".repeat(PAIR_ID_SIZE))], 2);
         assert!(matches!(
             state.ensure_token(1),
-            Err(crate::ck::CKR_DEVICE_ERROR)
+            Err(crate::ck::CKR_TOKEN_NOT_PRESENT)
         ));
+    }
+
+    /// A source whose offer the test scripts, counting every call.
+    struct ScriptedSource {
+        offer: std::sync::Mutex<Option<crate::remote::RemoteOffer>>,
+        offered_calls: std::sync::atomic::AtomicUsize,
+        sign_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedSource {
+        fn offering(offer: Option<crate::remote::RemoteOffer>) -> Self {
+            Self {
+                offer: std::sync::Mutex::new(offer),
+                offered_calls: std::sync::atomic::AtomicUsize::new(0),
+                sign_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn set(&self, offer: Option<crate::remote::RemoteOffer>) {
+            *self.offer.lock().expect("offer lock") = offer;
+        }
+
+        fn offered_calls(&self) -> usize {
+            self.offered_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn sign_calls(&self) -> usize {
+            self.sign_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl crate::remote::RemoteTokenSource for ScriptedSource {
+        fn offered(&self) -> Option<crate::remote::RemoteOffer> {
+            self.offered_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.offer.lock().expect("offer lock").clone()
+        }
+
+        fn sign(
+            &self,
+            _pair_id: &RemoteSlotId,
+            _request: &refineid_remote::SignatureRequest,
+            _context: &DisplayText,
+            _deadline: core::time::Duration,
+        ) -> Result<Vec<u8>, crate::remote::RemoteSignError> {
+            self.sign_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(crate::remote::RemoteSignError::Unreachable)
+        }
+
+        fn stop(&self) {}
+    }
+
+    /// A P-384 certificate as the source would offer it after checking
+    /// it on its session.
+    const OFFERED_CERT_DER: &[u8] =
+        include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+
+    /// Another P-384 certificate, for the offer that replaces the
+    /// first.
+    const REPLACEMENT_CERT_DER: &[u8] = include_bytes!("../ca-certs/dvv-gov-root-ca-g3-ecc.der");
+
+    fn offer(pair_hex: &str, certificate: Option<&[u8]>) -> crate::remote::RemoteOffer {
+        crate::remote::RemoteOffer::new(
+            RemoteSlotId::parse(pair_hex).expect("valid pair id"),
+            "Alpha Phone".to_owned(),
+            DisplayText::new("alpha-desk".to_owned()).expect("bounded text"),
+            certificate.map(|der| crate::remote::SessionCertificate::new(der.to_vec())),
+        )
+    }
+
+    #[test]
+    fn the_remote_slot_appears_with_the_offer_and_keeps_its_id_without_it() {
+        let pair_hex = "a5".repeat(PAIR_ID_SIZE);
+        let source = ScriptedSource::offering(Some(offer(&pair_hex, Some(OFFERED_CERT_DER))));
+        let mut state = ModuleState::from_parts_for_test(Vec::new(), 1);
+        state.refresh_remote_slots_with(&source);
+        assert_eq!(state.slot_ids(), vec![1]);
+        assert!(state.slot(1).is_some_and(SlotRecord::card_present));
+        assert_eq!(
+            state.slot(1).map(SlotRecord::display_name).as_deref(),
+            Some("RefineID Remote Alpha Phone")
+        );
+        assert_eq!(state.take_slot_event(), Some(1));
+
+        source.set(None);
+        state.refresh_remote_slots_with(&source);
+        assert_eq!(state.slot_ids(), vec![1]);
+        assert!(!state.slot(1).is_some_and(SlotRecord::card_present));
+        assert_eq!(state.take_slot_event(), Some(1));
+        assert!(matches!(
+            state.ensure_token(1),
+            Err(crate::ck::CKR_TOKEN_NOT_PRESENT)
+        ));
+
+        source.set(Some(offer(&pair_hex, Some(OFFERED_CERT_DER))));
+        state.refresh_remote_slots_with(&source);
+        assert_eq!(state.slot_ids(), vec![1]);
+        assert!(state.slot(1).is_some_and(SlotRecord::card_present));
+    }
+
+    #[test]
+    fn the_token_follows_the_certificate_the_offer_carries() {
+        let pair_hex = "a5".repeat(PAIR_ID_SIZE);
+        let source = ScriptedSource::offering(Some(offer(&pair_hex, None)));
+        let mut state = ModuleState::from_parts_for_test(Vec::new(), 1);
+        state.refresh_remote_slots_with(&source);
+        assert_eq!(state.slot_ids(), vec![1]);
+        assert!(!state.slot(1).is_some_and(SlotRecord::card_present));
+
+        source.set(Some(offer(&pair_hex, Some(OFFERED_CERT_DER))));
+        state.refresh_remote_slots_with(&source);
+        assert!(state.slot(1).is_some_and(SlotRecord::card_present));
+        let objects = state.ensure_token(1).expect("token objects");
+        assert_eq!(objects.auth_cert_der(), OFFERED_CERT_DER);
+        assert_eq!(objects.token_serial(), "REMOTE-a5a5a5a5");
+
+        let first_handle = objects.handle(crate::token::ObjectKind::Certificate);
+        assert_eq!(
+            objects.kind_of(first_handle),
+            Some(crate::token::ObjectKind::Certificate)
+        );
+        assert_eq!(state.take_slot_event(), Some(1));
+        assert_eq!(state.take_slot_event(), None);
+        state.set_remote_logged_in(1, true);
+
+        source.set(Some(offer(&pair_hex, Some(REPLACEMENT_CERT_DER))));
+        state.refresh_remote_slots_with(&source);
+        assert_eq!(state.slot_ids(), vec![1]);
+        // The replacement is a withdrawal and a new token: the caller
+        // is told once, and the login of the old token is over.
+        assert_eq!(state.take_slot_event(), Some(1));
+        assert_eq!(state.take_slot_event(), None);
+        assert!(!state.is_logged_in(1));
+        let objects = state.ensure_token(1).expect("token objects");
+        assert_eq!(objects.auth_cert_der(), REPLACEMENT_CERT_DER);
+        assert_eq!(objects.token_serial(), "REMOTE-a5a5a5a5");
+        // The replaced token's handles name nothing on the new one.
+        assert_eq!(objects.kind_of(first_handle), None);
+        assert_ne!(
+            objects.handle(crate::token::ObjectKind::Certificate),
+            first_handle
+        );
+
+        source.set(Some(offer(&pair_hex, None)));
+        state.refresh_remote_slots_with(&source);
+        assert!(!state.slot(1).is_some_and(SlotRecord::card_present));
+    }
+
+    /// A token raised again after it was withdrawn is a new token:
+    /// its objects take new handles and the old handles name nothing.
+    #[test]
+    fn a_token_raised_again_takes_new_handles() {
+        let pair_hex = "a5".repeat(PAIR_ID_SIZE);
+        let source = ScriptedSource::offering(Some(offer(&pair_hex, Some(OFFERED_CERT_DER))));
+        let mut state = ModuleState::from_parts_for_test(Vec::new(), 1);
+        state.refresh_remote_slots_with(&source);
+        let first = state.ensure_token(1).expect("token objects");
+        let old_handle = first.handle(crate::token::ObjectKind::PrivateKey);
+
+        source.set(None);
+        state.refresh_remote_slots_with(&source);
+        source.set(Some(offer(&pair_hex, Some(OFFERED_CERT_DER))));
+        state.refresh_remote_slots_with(&source);
+        let second = state.ensure_token(1).expect("token objects");
+        assert_eq!(second.kind_of(old_handle), None);
+        assert_ne!(
+            second.handle(crate::token::ObjectKind::PrivateKey),
+            old_handle
+        );
+        assert_eq!(
+            second.kind_of(second.handle(crate::token::ObjectKind::PrivateKey)),
+            Some(crate::token::ObjectKind::PrivateKey)
+        );
+    }
+
+    #[test]
+    fn a_second_pairing_gets_its_own_slot_and_the_first_loses_its_token() {
+        let first = "a5".repeat(PAIR_ID_SIZE);
+        let second = "5a".repeat(PAIR_ID_SIZE);
+        let source = ScriptedSource::offering(Some(offer(&first, Some(OFFERED_CERT_DER))));
+        let mut state = ModuleState::from_parts_for_test(Vec::new(), 1);
+        state.refresh_remote_slots_with(&source);
+        source.set(Some(offer(&second, Some(OFFERED_CERT_DER))));
+        state.refresh_remote_slots_with(&source);
+        assert_eq!(state.slot_ids(), vec![1, 2]);
+        assert!(!state.slot(1).is_some_and(SlotRecord::card_present));
+        assert!(state.slot(2).is_some_and(SlotRecord::card_present));
+    }
+
+    /// Reading the token's objects and attributes is served from the
+    /// cache the refresh filled; the source is not consulted again
+    /// and never asked to sign.
+    #[test]
+    fn attribute_reads_never_call_the_source() {
+        let pair_hex = "a5".repeat(PAIR_ID_SIZE);
+        let source = ScriptedSource::offering(Some(offer(&pair_hex, Some(OFFERED_CERT_DER))));
+        let mut state = ModuleState::from_parts_for_test(Vec::new(), 1);
+        state.refresh_remote_slots_with(&source);
+        assert_eq!(source.offered_calls(), 1);
+        let objects = state.ensure_token(1).expect("token objects");
+        for kind in [
+            crate::token::ObjectKind::Certificate,
+            crate::token::ObjectKind::PublicKey,
+            crate::token::ObjectKind::PrivateKey,
+        ] {
+            assert!(objects.attribute(kind, crate::ck::CKA_ID).is_some());
+            assert!(objects.attribute(kind, crate::ck::CKA_LABEL).is_some());
+        }
+        assert!(
+            objects
+                .attribute(crate::token::ObjectKind::Certificate, crate::ck::CKA_VALUE)
+                .is_some()
+        );
+        let _ = state.ensure_token(1).expect("token objects again");
+        state.set_remote_logged_in(1, true);
+        assert!(state.is_logged_in(1));
+        assert_eq!(source.offered_calls(), 1);
+        assert_eq!(source.sign_calls(), 0);
     }
 
     /// A local reader and a paired phone must never share

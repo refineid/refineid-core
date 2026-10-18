@@ -28,6 +28,12 @@
 //! signature, then drops it -- it never holds the card open across
 //! PKCS#11 calls, so the desktop CLI can share the reader.
 //!
+//! A paired phone holding the card is a slot too, through the
+//! [`remote::RemoteTokenSource`] a host installs: the token exists
+//! while the phone serves a card on an open session, the phone
+//! verifies PIN 1 itself, and `C_Sign` hands the phone one typed
+//! signature request.
+//!
 //! PIN1 secrecy (AGENTS.md hard rule #5). PIN1 lives only in a zeroizing
 //! `refineid_lib_core::pin::PinBytes`, is never logged or rendered,
 //! is verified on the card inside each signature (not cached on the
@@ -64,12 +70,20 @@ pub mod ck;
 mod diag;
 pub mod pin;
 pub mod pin_cache;
+pub mod remote;
 mod sign;
-mod slot_kind;
+pub mod slot_kind;
 mod state;
 mod token;
 
+#[cfg(feature = "export-entry-point")]
 use crate::ck::{CkFunctionListPtrPtr, CkRv};
+
+/// The function-list entry point for a host that exports the
+/// `C_GetFunctionList` symbol itself (feature `export-entry-point`
+/// off). The host installs its [`remote::RemoteTokenSource`] first
+/// and then forwards the call here.
+pub use crate::api::c_get_function_list as get_function_list;
 
 /// Returns the static PKCS#11 function list (OASIS PKCS#11 v2.40 s5.6.4).
 ///
@@ -81,6 +95,7 @@ use crate::ck::{CkFunctionListPtrPtr, CkRv};
 /// # Safety
 /// `list` must be a valid, writable location for one
 /// `CK_FUNCTION_LIST_PTR`, per the PKCS#11 caller contract.
+#[cfg(feature = "export-entry-point")]
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn C_GetFunctionList(list: CkFunctionListPtrPtr) -> CkRv {
     // SAFETY: `list` validity is the caller's PKCS#11 contract;

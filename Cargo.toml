@@ -44,6 +44,7 @@ refineid-pcsc = { path = "crates/pcsc" }
 refineid-pin-cache = { path = "crates/pin-cache" }
 refineid-pkcs11 = { path = "crates/pkcs11" }
 refineid-pkcs15 = { path = "crates/pkcs15" }
+refineid-remote = { path = "crates/remote" }
 refineid-sign = { path = "crates/sign" }
 refineid-x509 = { path = "crates/x509" }
 pcsc = "2.9"

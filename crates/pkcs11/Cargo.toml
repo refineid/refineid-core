@@ -9,7 +9,12 @@ repository.workspace = true
 publish = false
 
 [features]
-default = []
+default = ["export-entry-point"]
+# Exports `C_GetFunctionList` from this library. A host that owns the
+# symbol itself, to install a remote token source before handing the
+# function list out, builds without it and re-exports
+# `refineid_pkcs11::get_function_list`.
+export-entry-point = []
 pin-change = []
 
 [lints]
@@ -28,6 +33,7 @@ refineid-digest.workspace = true
 refineid-pcsc.workspace = true
 refineid-pin-cache.workspace = true
 refineid-pkcs15.workspace = true
+refineid-remote.workspace = true
 refineid-sign.workspace = true
 refineid-x509.workspace = true
 getrandom.workspace = true

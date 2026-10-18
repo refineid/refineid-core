@@ -43,7 +43,7 @@ use crate::ck::{
     CKF_USER_PIN_INITIALIZED, CKF_USER_PIN_LOCKED, CKF_WRITE_PROTECTED, CKR_ARGUMENTS_BAD,
     CKR_ATTRIBUTE_SENSITIVE, CKR_ATTRIBUTE_TYPE_INVALID, CKR_BUFFER_TOO_SMALL,
     CKR_CRYPTOKI_ALREADY_INITIALIZED, CKR_CRYPTOKI_NOT_INITIALIZED, CKR_DEVICE_ERROR,
-    CKR_FUNCTION_NOT_PARALLEL, CKR_FUNCTION_NOT_SUPPORTED, CKR_GENERAL_ERROR,
+    CKR_DEVICE_REMOVED, CKR_FUNCTION_NOT_PARALLEL, CKR_FUNCTION_NOT_SUPPORTED, CKR_GENERAL_ERROR,
     CKR_KEY_FUNCTION_NOT_PERMITTED, CKR_KEY_HANDLE_INVALID, CKR_KEY_INDIGESTIBLE,
     CKR_MECHANISM_INVALID, CKR_NO_EVENT, CKR_OBJECT_HANDLE_INVALID, CKR_OK, CKR_OPERATION_ACTIVE,
     CKR_OPERATION_NOT_INITIALIZED, CKR_PIN_INVALID, CKR_PIN_LEN_RANGE,
@@ -59,7 +59,8 @@ use crate::ck::{
     CkVoidPtr,
 };
 use crate::diag::diag;
-use crate::sign::Mechanism;
+use crate::sign::{Mechanism, RSA3072_MODULUS_BITS};
+use crate::slot_kind::SlotKind;
 use crate::state::{
     MODULE, ModuleState, PIN1_MAX_DIGITS, PIN1_MIN_DIGITS, Session, SlotRecord, session_state,
 };
@@ -121,8 +122,8 @@ const fn version_component(text: &str) -> u8 {
 }
 
 /// RSA-3072 modulus size in bits, reported as the min/max key size
-/// for [`crate::ck::CKM_RSA_PKCS`] (FINEID S4-1 v3.1 auth key).
-const RSA_KEY_BITS: CkUlong = 3072;
+/// for [`crate::ck::CKM_RSA_PKCS`].
+const RSA_KEY_BITS: CkUlong = RSA3072_MODULUS_BITS;
 /// secp384r1 field size in bits, reported as the min/max key size for
 /// [`crate::ck::CKM_ECDSA`] (FINEID v4.0 auth key).
 const EC_KEY_BITS: CkUlong = 384;
@@ -260,6 +261,10 @@ unsafe extern "C" fn c_finalize(reserved: CkVoidPtr) -> CkRv {
         module.clear_all_positive_pins();
     }
     *guard = None;
+    drop(guard);
+    if let Some(source) = crate::remote::installed() {
+        source.stop();
+    }
     CKR_OK
 }
 
@@ -285,6 +290,10 @@ unsafe extern "C" fn c_get_info(info: CkInfoPtr) -> CkRv {
 
 /// `C_GetFunctionList`: hand back a pointer to the static vtable
 /// (v2.40 s5.6.4). The one function callers resolve by symbol.
+///
+/// # Safety
+/// `list` must be null or a valid, writable location for one
+/// `CK_FUNCTION_LIST_PTR`, per the PKCS#11 caller contract.
 pub unsafe extern "C" fn c_get_function_list(list: CkFunctionListPtrPtr) -> CkRv {
     if list.is_null() {
         return CKR_ARGUMENTS_BAD;
@@ -483,7 +492,10 @@ unsafe extern "C" fn c_get_token_info(slot_id: CkSlotId, info: CkTokenInfoPtr) -
 ///   Finnish  "Perus (PIN 1)"
 ///   Swedish  "Bas (PIN 1)"
 const TOKEN_LABEL_IDENTIFY: &str = "Basic (PIN 1)";
-const TOKEN_LABEL_REMOTE: &str = "RefineID Remote (PIN 1)";
+/// Fixed token label for a card served by a paired phone, which
+/// verifies PIN 1 itself: NSS shows no PIN prompt for it, and the
+/// label tells the citizen which device the prompt will appear on.
+const TOKEN_LABEL_PHONE: &str = "Phone (PIN 1)";
 
 /// Build the token-info payload. Fixed-width fields are space-padded;
 /// unknown counters use [`CK_UNAVAILABLE_INFORMATION`].
@@ -519,7 +531,7 @@ fn token_info_value(serial: &str, pin1_status: PinStatus, is_remote: bool) -> Ck
         base_flags | user_pin_status_flags(pin1_status)
     };
     let label = if is_remote {
-        padded_field(TOKEN_LABEL_REMOTE)
+        padded_field(TOKEN_LABEL_PHONE)
     } else {
         padded_field(TOKEN_LABEL_IDENTIFY)
     };
@@ -807,8 +819,14 @@ unsafe extern "C" fn c_login(
     // Protected authentication path: PIN1 is never typed on or
     // transmitted by this computer; the mobile device holds credentials
     // in protected on-device storage. Reached only for a slot admitted
-    // from a vault pairing record.
+    // from the host's source.
     if kind.is_remote() {
+        if !module.slot(slot_id).is_some_and(SlotRecord::card_present) {
+            return CKR_TOKEN_NOT_PRESENT;
+        }
+        if module.is_logged_in(slot_id) {
+            return CKR_USER_ALREADY_LOGGED_IN;
+        }
         module.set_remote_logged_in(slot_id, true);
         diag!("C_Login remote reader session={session} logged in via protected auth path");
         return CKR_OK;
@@ -978,7 +996,7 @@ fn matching_handles(
         .all_object_kinds()
         .into_iter()
         .filter(|kind| token.matches(*kind, template))
-        .map(ObjectKind::handle)
+        .map(|kind| token.handle(kind))
         .collect()
 }
 
@@ -1058,9 +1076,6 @@ unsafe extern "C" fn c_get_attribute_value(
         return CKR_ARGUMENTS_BAD;
     }
     diag!("C_GetAttributeValue session={session} object={object} count={count}");
-    let Some(kind) = ObjectKind::from_handle(object) else {
-        return CKR_OBJECT_HANDLE_INVALID;
-    };
     let mut guard = match lock_module() {
         Ok(guard) => guard,
         Err(err) => return err,
@@ -1075,9 +1090,9 @@ unsafe extern "C" fn c_get_attribute_value(
         Ok(token) => token,
         Err(err) => return err,
     };
-    if !token.object_exists(kind) {
+    let Some(kind) = token.kind_of(object) else {
         return CKR_OBJECT_HANDLE_INVALID;
-    }
+    };
     drop(guard);
     // SAFETY: caller guarantees `template`/`count` describe a valid,
     // writable attribute array.
@@ -1191,9 +1206,6 @@ unsafe extern "C" fn c_sign_init(
     if mechanism.is_null() {
         return CKR_ARGUMENTS_BAD;
     }
-    if key != crate::token::OBJ_PRIVATE_KEY {
-        return CKR_KEY_HANDLE_INVALID;
-    }
     // SAFETY: caller guarantees mechanism is a valid CK_MECHANISM.
     let requested = unsafe { mechanism.read() }.mechanism;
     diag!("C_SignInit session={session} mechanism={requested:#06x}");
@@ -1220,6 +1232,9 @@ unsafe extern "C" fn c_sign_init(
         Ok(token) => token,
         Err(err) => return err,
     };
+    if token.kind_of(key) != Some(ObjectKind::PrivateKey) {
+        return CKR_KEY_HANDLE_INVALID;
+    }
     if token.mechanism() != requested_mechanism {
         return CKR_MECHANISM_INVALID;
     }
@@ -1289,6 +1304,22 @@ unsafe extern "C" fn c_sign(
             return error;
         }
     };
+    // A phone-served token signs with the key its certificate names;
+    // the key is decided here, under the lock, from the cached objects.
+    let remote_key = if kind.is_remote() {
+        match module
+            .ensure_token(slot_id)
+            .and_then(|token| token.remote_key())
+        {
+            Ok(key) => Some(key),
+            Err(error) => {
+                clear_sign(module, session);
+                return error;
+            }
+        }
+    } else {
+        None
+    };
     // The sign operation is single-shot: terminate it now, before the
     // card round trip, so the module lock is not held across card IO
     // (an unrelated PKCS#11 call must not block on the card).
@@ -1303,7 +1334,23 @@ unsafe extern "C" fn c_sign(
         unsafe { core::slice::from_raw_parts(data, input_len) }.to_vec()
     };
     diag!("C_Sign session={session} data_len={input_len}");
-    let outcome = crate::token::card_sign(&kind, &pin_cache, mechanism, &input, None);
+    let outcome = match (&kind, remote_key) {
+        (
+            SlotKind::Remote {
+                pair_id, context, ..
+            },
+            Some(key),
+        ) => match crate::remote::installed() {
+            Some(source) => {
+                crate::token::remote_card_sign(source, pair_id, key, context, mechanism, &input)
+            }
+            None => Err(CKR_DEVICE_REMOVED),
+        },
+        (SlotKind::Remote { .. }, None) => Err(CKR_DEVICE_ERROR),
+        (SlotKind::Local { .. }, _) => {
+            crate::token::card_sign(&kind, &pin_cache, mechanism, &input)
+        }
+    };
     let rv = match outcome {
         Ok(bytes) => {
             // The module lock was dropped across the card round trip,
@@ -1748,9 +1795,6 @@ unsafe extern "C" fn c_verify_init(
     if mechanism.is_null() {
         return CKR_ARGUMENTS_BAD;
     }
-    if key != crate::token::OBJ_PUBLIC_KEY {
-        return CKR_KEY_HANDLE_INVALID;
-    }
     // SAFETY: caller guarantees mechanism is a valid CK_MECHANISM.
     let requested = unsafe { mechanism.read() }.mechanism;
     diag!("C_VerifyInit session={session} mechanism={requested:#06x}");
@@ -1777,6 +1821,9 @@ unsafe extern "C" fn c_verify_init(
         Ok(token) => token,
         Err(err) => return err,
     };
+    if token.kind_of(key) != Some(ObjectKind::PublicKey) {
+        return CKR_KEY_HANDLE_INVALID;
+    }
     if token.mechanism() != requested_mechanism {
         return CKR_MECHANISM_INVALID;
     }
@@ -2141,6 +2188,54 @@ mod tests {
             FUNCTION_LIST.C_Sign,
             FUNCTION_LIST.C_SignUpdate
         ));
+    }
+
+    /// A phone verifies PIN 1 itself, so `C_Login` on its slot succeeds
+    /// without reading a PIN: a null pointer is never dereferenced,
+    /// and the session is then in the user state.
+    #[test]
+    fn login_on_a_remote_slot_reads_no_pin() {
+        use crate::ck::{
+            CKF_SERIAL_SESSION, CKR_USER_ALREADY_LOGGED_IN, CKS_RO_PUBLIC_SESSION,
+            CKS_RO_USER_FUNCTIONS, CKU_USER, CkSessionInfo,
+        };
+        use crate::slot_kind::{PAIR_ID_SIZE, RemoteSlotId};
+        use crate::state::{MODULE, ModuleState, SlotRecord};
+
+        let pair_id = RemoteSlotId::parse(&"a5".repeat(PAIR_ID_SIZE)).expect("valid pair id");
+        let present = SlotRecord::remote_for_test(1, pair_id, "Alpha Phone", "alpha-desk", true);
+        let absent = SlotRecord::remote_for_test(2, pair_id, "Alpha Phone", "alpha-desk", false);
+        let mut state = ModuleState::from_parts_for_test(vec![present, absent], 3);
+        let with_token = state.open_session(1, CKF_SERIAL_SESSION);
+        let without_token = state.open_session(2, CKF_SERIAL_SESSION);
+        *MODULE.lock().expect("module lock") = Some(state);
+
+        let session_state = |session: CkSessionHandle| {
+            let mut info: CkSessionInfo = unsafe { core::mem::zeroed() };
+            assert_eq!(
+                unsafe { super::c_get_session_info(session, &mut info) },
+                CKR_OK
+            );
+            info.state
+        };
+
+        assert_eq!(session_state(with_token), CKS_RO_PUBLIC_SESSION);
+        let rv = unsafe { super::c_login(with_token, CKU_USER, core::ptr::null_mut(), 0) };
+        assert_eq!(rv, CKR_OK);
+        assert_eq!(session_state(with_token), CKS_RO_USER_FUNCTIONS);
+        let rv = unsafe { super::c_login(with_token, CKU_USER, core::ptr::null_mut(), 0) };
+        assert_eq!(rv, CKR_USER_ALREADY_LOGGED_IN);
+        assert_eq!(unsafe { super::c_logout(with_token) }, CKR_OK);
+        assert_eq!(session_state(with_token), CKS_RO_PUBLIC_SESSION);
+
+        // A slot whose token was withdrawn has no card to be logged
+        // into, and the session stays public.
+        assert_eq!(session_state(without_token), CKS_RO_PUBLIC_SESSION);
+        let rv = unsafe { super::c_login(without_token, CKU_USER, core::ptr::null_mut(), 0) };
+        assert_eq!(rv, crate::ck::CKR_TOKEN_NOT_PRESENT);
+        assert_eq!(session_state(without_token), CKS_RO_PUBLIC_SESSION);
+
+        *MODULE.lock().expect("module lock") = None;
     }
 
     #[test]

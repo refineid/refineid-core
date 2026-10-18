@@ -434,10 +434,12 @@ A Custodian **withdraws** when it deliberately stops serving every stored pairin
 
 ### 4.6 Pairing Revocation
 
-An endpoint **revokes** a pairing when its user forgets it, when §10 requires it (Class 4, card lockout), or when the confirmation deadline of §4.3 item 4 passes. Revocation is local and immediate: the record is marked revoked and its private key destroyed. The peer is told in-session and by a hint, so that it does not keep offering or dialing a pairing that no longer exists.
+An endpoint **revokes** a pairing when its user forgets it, when §10 requires it (Class 4, card lockout), or when the confirmation deadline of §4.3 item 4 passes. Revocation is local and immediate: the record is marked revoked, and the pairing is used for nothing but telling the peer. The peer is told in-session, by a close the Requester delivers, and by a hint, so that it does not keep offering, listing or dialing a pairing that no longer exists.
 
 1. **In-Session Notice**:
-   If the revoking endpoint holds an open operational session to the peer, it sends `session.close` with reason `"pairing_revoked"` (§7.1) before destroying the key. A Requester that revokes a pairing while holding no session MAY dial the Custodian once, within 10 seconds of the user's action, for the sole purpose of sending that close; it does not retry, and it destroys the key when the attempt ends.
+   If the revoking endpoint holds an open operational session to the peer, it sends `session.close` with reason `"pairing_revoked"` (§7.1) before destroying the key.
+
+   A Requester that revokes a pairing while holding no session MUST deliver that close itself, since a Custodian never dials: it keeps the static private key for the close alone, dials the Custodian at once if a `mode=session` record names the pairing, and otherwise dials once at each later sighting of such a record, completing the session handshake of §6.3 and sending the close as the session's only message. The key is destroyed when the close has been sent, or 30 days after the revocation, whichever comes first; until then the Requester neither offers nor serves anything for the pairing, and the record stays revoked for every other purpose from the moment of revocation. The `revocation_close` vectors of `vectors/rapp-revocation-v26.10.18.json` pin the close frame.
 
 2. **Revocation Key**:
    Before destroying the static private key, the revoking endpoint derives and retains, with `pair_id` and the revocation time:

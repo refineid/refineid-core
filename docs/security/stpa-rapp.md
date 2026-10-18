@@ -395,6 +395,7 @@ missing or wrong:
 | R-14 | End the NFC session as soon as the result has left, or at an idle limit measured in seconds, never later. | 9.3 |
 | R-15 | Read the phone's diagnostics report, which carries per-command round-trip times, before touching the handshake code, and record the command that took the time in this section. | 9.3 |
 | R-16 | Implemented in the 26.10.18 adoption: the requester offers the identity only while a session reports a card, and the phone reports absence as soon as an operation ends without the card answering, so a retrying browser finds nothing to retry; the back-off is gone. | UCA-3, UCA-7 |
+| R-17 | A requester that forgets a pairing without a session open had no feedback path to the phone: the specification let it dial once or not at all, and the Unix requester did neither, so the phone kept listing and serving a pairing that no longer existed until its own user forgot it too. Section 4.6 item 1 now requires the requester to deliver the `pairing_revoked` close itself, at once when the phone is in sight and at each later sighting for up to 30 days, keeping the key for that close alone. | UCA-9 |
 
 ## 10. Open questions
 

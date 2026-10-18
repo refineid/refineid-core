@@ -876,6 +876,154 @@ mod tests {
     }
 
     #[test]
+    fn a_failure_lost_with_the_session_is_acknowledged_on_the_next() {
+        let mut engine = ProxyOperationEngine::new(vec![ProfileName::CardStatus]);
+        let request = inspection_request();
+        let op_id = request.operation_id;
+        let reference = OperationReference {
+            operation_id: op_id,
+            request_hash: request.request_hash().expect("valid request hash"),
+        };
+        engine
+            .receive_request(&mut TestStore, request, 1_000)
+            .expect("the request is admitted");
+        let ProxyDispatch::SendFailure {
+            message: TypedMessage::OperationResult(result),
+            ..
+        } = engine
+            .finish_failure(&mut TestStore, op_id, ProxyFailure::UserDenied)
+            .expect("the denial is journaled")
+        else {
+            panic!("a denial is sent as a failure result");
+        };
+
+        let closed = engine
+            .session_closed(&mut TestStore)
+            .expect("session loss is classified");
+        assert!(matches!(
+            closed.as_slice(),
+            [ProxySessionCloseAction::DeliveryUncertain(id)] if *id == op_id
+        ));
+
+        let ProxyDispatch::SendAll(messages) = engine.status_answer(op_id) else {
+            panic!("the next session re-delivers the retained failure");
+        };
+        assert!(messages.contains(&TypedMessage::OperationResult(result)));
+        assert!(matches!(
+            engine.receive(
+                &mut TestStore,
+                TypedMessage::OperationResultAck(reference),
+                2_000
+            ),
+            Ok(ProxyDispatch::ResultAcknowledged(id)) if id == op_id
+        ));
+        let ProxyDispatch::Send(TypedMessage::OperationStatus(report)) =
+            engine.status_answer(op_id)
+        else {
+            panic!("an acknowledged failure answers with its status alone");
+        };
+        assert_eq!(report.state, Some(OperationState::Rejected));
+        assert!(report.retired);
+    }
+
+    /// A store whose records are what the previous process left behind.
+    struct RecoveryStore(Vec<crate::RecoveredProxyRecord>);
+    impl JournalStore for RecoveryStore {
+        type Error = ();
+        fn persist(&mut self, _record: &crate::JournalRecord) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+    impl ResultJournalStore for RecoveryStore {
+        fn persist_result(
+            &mut self,
+            _record: &crate::JournalRecord,
+            _result: &OperationResultMessage,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn retain_uncertain_result(
+            &mut self,
+            _record: &crate::JournalRecord,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn acknowledge_result(
+            &mut self,
+            _record: &crate::JournalRecord,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+    impl crate::JournalRecoveryStore for RecoveryStore {
+        fn load_all(&mut self) -> Result<Vec<crate::RecoveredProxyRecord>, Self::Error> {
+            Ok(core::mem::take(&mut self.0))
+        }
+    }
+
+    #[test]
+    fn a_recovered_failure_retires_in_place_on_its_acknowledgment() {
+        // A denial is journaled as rejected; the proxy journal holds no
+        // denied state of its own.
+        let dispositions = [
+            (OperationState::Rejected, ProxyFailure::UserDenied),
+            (OperationState::Cancelled, ProxyFailure::Cancelled),
+            (
+                OperationState::CredentialRejected,
+                ProxyFailure::CredentialRejected,
+            ),
+            (
+                OperationState::Ambiguous,
+                ProxyFailure::CardCompletionAmbiguous,
+            ),
+        ];
+        for (state, failure) in dispositions {
+            let request = inspection_request();
+            let reference = OperationReference {
+                operation_id: request.operation_id,
+                request_hash: request.request_hash().expect("valid request hash"),
+            };
+            let result = OperationResultMessage::failure(reference, failure);
+            let record = crate::JournalRecord {
+                pair_id: request.pair_id,
+                session_id: request.session_id,
+                operation_id: request.operation_id,
+                request_hash: reference.request_hash,
+                state,
+                transmission_count: 0,
+                automatic_retry_permitted: false,
+                batch: None,
+                acknowledged: false,
+                terminal_error: result.error,
+            };
+            let mut store = RecoveryStore(vec![crate::RecoveredProxyRecord {
+                record,
+                retained_result: Some(result.clone()),
+            }]);
+            let mut engine =
+                ProxyOperationEngine::recover(&mut store, vec![ProfileName::CardStatus])
+                    .expect("the failure is recovered unacknowledged");
+
+            let ProxyDispatch::SendAll(messages) = engine.status_answer(request.operation_id)
+            else {
+                panic!("the recovered failure is re-delivered");
+            };
+            assert!(messages.contains(&TypedMessage::OperationResult(result)));
+            assert!(matches!(
+                engine.receive(&mut store, TypedMessage::OperationResultAck(reference), 2_000),
+                Ok(ProxyDispatch::ResultAcknowledged(id)) if id == request.operation_id
+            ));
+            let ProxyDispatch::Send(TypedMessage::OperationStatus(report)) =
+                engine.status_answer(request.operation_id)
+            else {
+                panic!("an acknowledged failure answers with its status alone");
+            };
+            assert_eq!(report.state, Some(state), "{state:?} keeps its disposition");
+            assert!(report.retired, "{state:?} is retired");
+        }
+    }
+
+    #[test]
     fn terminal_operation_rejects_report_progress() {
         let mut engine = ProxyOperationEngine::new(vec![ProfileName::CardStatus]);
         let request = inspection_request();

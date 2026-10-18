@@ -84,17 +84,23 @@ impl core::fmt::Debug for DiscoveryKey {
 }
 
 impl DiscoveryKey {
-    /// Derives the key of a stored pairing.
+    /// Derives the key of a stored pairing. A pairing the peer never
+    /// confirmed storing is not announced (RAPP v26.10.18 section 4.3
+    /// item 4).
     ///
     /// # Errors
-    /// [`DegenerateAgreement`] when the static agreement is the identity
-    /// point.
-    pub fn derive(record: &PairRecord) -> Result<Self, DegenerateAgreement> {
+    /// [`RecordKeyError`] when the record is unconfirmed or its static
+    /// agreement is the identity point.
+    pub fn derive(record: &PairRecord) -> Result<Self, RecordKeyError> {
+        if !record.is_storage_confirmed() {
+            return Err(RecordKeyError::StorageUnconfirmed);
+        }
         Self::from_parts(
             record.pair_id(),
             record.local_static_private(),
             record.remote_static_public(),
         )
+        .map_err(RecordKeyError::DegenerateAgreement)
     }
 
     /// Derives `K_disc = HKDF-SHA-256(salt = pair_id, IKM = X25519(local
@@ -263,17 +269,23 @@ impl core::fmt::Debug for RoutingKey {
 }
 
 impl RoutingKey {
-    /// Derives the key of a stored pairing.
+    /// Derives the key of a stored pairing. A pairing the peer never
+    /// confirmed storing neither routes nor dials (RAPP v26.10.18 section
+    /// 4.3 item 4).
     ///
     /// # Errors
-    /// [`DegenerateAgreement`] when the static agreement is the identity
-    /// point.
-    pub fn derive(record: &PairRecord) -> Result<Self, DegenerateAgreement> {
+    /// [`RecordKeyError`] when the record is unconfirmed or its static
+    /// agreement is the identity point.
+    pub fn derive(record: &PairRecord) -> Result<Self, RecordKeyError> {
+        if !record.is_storage_confirmed() {
+            return Err(RecordKeyError::StorageUnconfirmed);
+        }
         Self::from_parts(
             record.pair_id(),
             record.local_static_private(),
             record.remote_static_public(),
         )
+        .map_err(RecordKeyError::DegenerateAgreement)
     }
 
     /// Derives `K_route = HKDF-SHA-256(salt = pair_id, IKM = X25519(local
@@ -337,6 +349,31 @@ impl RoutingKey {
 /// The platform random source failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RandomUnavailable;
+
+/// Why a stored record yields no routing or discovery key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecordKeyError {
+    /// The static agreement is the identity point.
+    DegenerateAgreement(DegenerateAgreement),
+    /// The peer never confirmed that it stored the pairing (RAPP v26.10.18
+    /// section 4.3 item 4).
+    StorageUnconfirmed,
+}
+
+impl core::fmt::Display for RecordKeyError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::DegenerateAgreement(_) => {
+                formatter.write_str("static agreement is the identity point")
+            }
+            Self::StorageUnconfirmed => {
+                formatter.write_str("the peer never confirmed storing the pairing")
+            }
+        }
+    }
+}
+
+impl core::error::Error for RecordKeyError {}
 
 /// The routing value of a `"session"` preamble: a fresh nonce and the tag
 /// it keys. Public bytes; only the two endpoints can tell whose it is.

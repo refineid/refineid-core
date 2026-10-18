@@ -97,6 +97,7 @@ actions:
   show_revoked: "expose the Pairing revoked visible state"
   close_session: "raise close_requested_by_pairing for the live session instance"
   retain_revocation_key: "derive and retain the pairing's revocation key before its static keys are destroyed, so the revocation can be announced"
+  revoke_unconfirmed_pair_record: "revoke the stored record the peer never confirmed, leaving its tombstone"
   destroy_pair_keys: "erase pair static keys from the platform key store"
   destroy_relay_tokens: "erase pair-specific rendezvous tokens"
   clear_pair_metadata: "erase stored names, grants, and pair metadata"
@@ -253,7 +254,7 @@ pairing:
       event: denied_aborted_or_timed_out
       role: both
       to: unpaired
-      actions: [retain_revocation_key, destroy_pair_keys, clear_pair_metadata, close_candidate]
+      actions: [retain_revocation_key, revoke_unconfirmed_pair_record, destroy_pair_keys, clear_pair_metadata, close_candidate]
     - from: storage_confirming
       event: authenticated_protocol_violation   # the peer's pairing.stored names another pairing
       role: both
@@ -685,37 +686,37 @@ operation:
       role: requester
       guard: profile_has_no_consequential_command
       to: completed
-      actions: [send_result_ack, journal_completed]
+      actions: [retain_result_under_local_storage, send_result_ack, journal_completed]
     - from: [requested, prepared]
       event: result_denied_received
       role: requester
       to: denied
-      actions: [send_result_ack, journal_denied]
+      actions: [journal_denied, send_result_ack]
     - from: [requested, prepared, committed]
       event: result_cancelled_received
       role: requester
       to: cancelled
-      actions: [send_result_ack, journal_cancelled]
+      actions: [journal_cancelled, send_result_ack]
     - from: [requested, prepared, committed]
       event: result_rejected_received
       role: requester
       to: rejected
-      actions: [send_result_ack, journal_rejected]
+      actions: [journal_rejected, send_result_ack]
     - from: [requested, prepared, committed]
       event: result_credential_rejected_received
       role: requester
       to: credential_rejected
-      actions: [send_result_ack, journal_credential_rejected, revoke_pair_after_credential_rejection]
+      actions: [journal_credential_rejected, send_result_ack, revoke_pair_after_credential_rejection]
     - from: committed
       event: result_completed_received
       role: requester
       to: completed
-      actions: [send_result_ack, journal_completed]
+      actions: [retain_result_under_local_storage, send_result_ack, journal_completed]
     - from: committed
       event: result_ambiguous_received
       role: requester
       to: ambiguous
-      actions: [send_result_ack, journal_ambiguous, prohibit_retry]
+      actions: [journal_ambiguous, send_result_ack, prohibit_retry]
     - from: committed
       event: session_closed_post_commit # produced by rule X-03
       role: requester

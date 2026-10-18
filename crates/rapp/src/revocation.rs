@@ -28,7 +28,7 @@ use core::fmt;
 use std::collections::BTreeMap;
 
 use subtle::{Choice, ConstantTimeEq};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::txt::{AnnouncementCandidate, most_recently_used};
 use super::wire::{decode_deterministic_cbor, encode_deterministic_cbor};
@@ -214,6 +214,18 @@ impl RevocationRetention {
         }
     }
 
+    /// Whether the announcement window has run out at `now_ms`, so the
+    /// retention can be destroyed (section 4.6 item 4). A `now_ms` before
+    /// the revocation is not an expiry: the clock has merely not reached
+    /// the revocation's own millisecond.
+    #[must_use]
+    pub const fn is_expired(&self, now_ms: u64) -> bool {
+        match now_ms.checked_sub(self.revoked_at_ms) {
+            Some(age_ms) => age_ms >= REVOCATION_ANNOUNCEMENT_MS,
+            None => false,
+        }
+    }
+
     /// The revocation hint for `instance` at `epoch`.
     #[must_use]
     pub fn hint(&self, instance: &InstanceName, epoch: u64) -> [u8; REVOCATION_HINT_SIZE] {
@@ -273,7 +285,7 @@ impl core::error::Error for RevocationRetentionCodecError {}
 pub fn encode_revocation_retention(
     retention: &RevocationRetention,
 ) -> Result<Zeroizing<Vec<u8>>, RevocationRetentionCodecError> {
-    let value = WireValue::Map(BTreeMap::from([
+    let mut value = WireValue::Map(BTreeMap::from([
         (
             "format_version".to_owned(),
             WireValue::Unsigned(REVOCATION_RETENTION_FORMAT_VERSION),
@@ -291,9 +303,17 @@ pub fn encode_revocation_retention(
             WireValue::Unsigned(retention.revoked_at_ms),
         ),
     ]));
-    encode_deterministic_cbor(&value)
+    let encoded = encode_deterministic_cbor(&value)
         .map(Zeroizing::new)
-        .map_err(|_| RevocationRetentionCodecError::ProtocolFailure)
+        .map_err(|_| RevocationRetentionCodecError::ProtocolFailure);
+    // The wire value held the only unprotected copy of the key; it is
+    // erased before the value is dropped.
+    if let WireValue::Map(map) = &mut value
+        && let Some(WireValue::Bytes(key)) = map.get_mut("revocation_key")
+    {
+        key.zeroize();
+    }
+    encoded
 }
 
 /// Deserializes a [`RevocationRetention`] from deterministic CBOR.
@@ -572,6 +592,10 @@ mod tests {
         assert!(retention.announces_at(REVOKED_AT_MS + REVOCATION_ANNOUNCEMENT_MS - 1));
         assert!(!retention.announces_at(REVOKED_AT_MS + REVOCATION_ANNOUNCEMENT_MS));
         assert!(!retention.announces_at(REVOKED_AT_MS - 1));
+        assert!(!retention.is_expired(REVOKED_AT_MS - 1));
+        assert!(!retention.is_expired(REVOKED_AT_MS));
+        assert!(!retention.is_expired(REVOKED_AT_MS + REVOCATION_ANNOUNCEMENT_MS - 1));
+        assert!(retention.is_expired(REVOKED_AT_MS + REVOCATION_ANNOUNCEMENT_MS));
         let name = instance(INSTANCE);
         let expired = RevocationRetention::candidates(
             &[retention],

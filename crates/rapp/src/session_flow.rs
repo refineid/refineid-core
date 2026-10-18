@@ -66,6 +66,9 @@ impl SessionHandshake {
     }
 
     fn begin(pair: &PairRecord, transport: TransportProfile) -> Result<Self, SessionError> {
+        if !pair.is_storage_confirmed() {
+            return Err(SessionError::StorageUnconfirmed);
+        }
         let local_keys =
             PairKeyMaterial::reconstruct(*pair.local_static_private(), *pair.local_static_public());
         let role = pair.role();
@@ -302,6 +305,9 @@ impl fmt::Debug for SessionAuthentication {
 pub enum SessionError<E = ()> {
     /// Call contradicts the stored pair's endpoint role.
     RoleViolation,
+    /// The peer never confirmed that it stored the pairing, so the record
+    /// opens no session (RAPP v26.10.18 section 4.3 item 4).
+    StorageUnconfirmed,
     /// Handshake or channel cryptography failed.
     Crypto(CryptoError),
     /// Authenticated message failed semantic decoding.

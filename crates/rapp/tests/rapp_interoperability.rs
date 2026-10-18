@@ -156,6 +156,8 @@ fn paired_records() -> (PairRecord, PairRecord) {
     requester_storage
         .receive_stored(&proxy_stored, 201)
         .expect("requester verifies the proxy's confirmation");
+    assert!(!requester_record.is_storage_confirmed());
+    assert!(!proxy_record.is_storage_confirmed());
     let requester_active = requester_storage
         .into_active()
         .expect("both confirmations make the requester's pairing active");
@@ -164,6 +166,14 @@ fn paired_records() -> (PairRecord, PairRecord) {
         .expect("both confirmations make the proxy's pairing active");
     assert_eq!(requester_active.pair_id(), requester_record.pair_id());
     assert_eq!(proxy_active.pair_id(), proxy_record.pair_id());
+    let requester_record = requester_active
+        .confirm(requester_record)
+        .expect("the active pairing confirms the requester's record");
+    let proxy_record = proxy_active
+        .confirm(proxy_record)
+        .expect("the active pairing confirms the proxy's record");
+    assert!(requester_record.is_storage_confirmed());
+    assert!(proxy_record.is_storage_confirmed());
     assert_eq!(requester_record.pair_id(), proxy_record.pair_id());
     assert_eq!(requester_record.grants_hash(), proxy_record.grants_hash());
     assert_eq!(requester_record.profiles(), proxy_record.profiles());
@@ -645,12 +655,16 @@ fn cpace_bootstrap_pairing_and_fresh_session_interoperate_end_to_end() {
     proxy_storage
         .receive_stored(&requester_stored, 201)
         .expect("proxy verifies the requester's confirmation");
-    requester_storage
+    let requester_record = requester_storage
         .into_active()
-        .expect("requester pairing is active");
-    proxy_storage
+        .expect("requester pairing is active")
+        .confirm(requester_record)
+        .expect("the requester's record is confirmed");
+    let proxy_record = proxy_storage
         .into_active()
-        .expect("proxy pairing is active");
+        .expect("proxy pairing is active")
+        .confirm(proxy_record)
+        .expect("the proxy's record is confirmed");
 
     assert_eq!(requester_record.pair_id(), proxy_record.pair_id());
 

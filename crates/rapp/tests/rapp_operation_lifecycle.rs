@@ -366,7 +366,7 @@ fn an_unacknowledged_failure_survives_session_loss_unchanged() {
     transaction
         .delivery_became_uncertain(&mut store)
         .expect("session loss ends the attempt");
-    assert_eq!(transaction.stage(), AuthorizationStage::Terminal);
+    assert_eq!(transaction.stage(), AuthorizationStage::ResultPending);
     assert_eq!(transaction.operation_state(), OperationState::Rejected);
     assert!(!transaction.is_retired());
     assert_eq!(transaction.retained_result(), Some(&result));
@@ -374,6 +374,14 @@ fn an_unacknowledged_failure_survives_session_loss_unchanged() {
         store.events,
         [StoreEvent::PersistResult(OperationState::Rejected, 0)]
     );
+
+    transaction
+        .acknowledge_result(&mut store, transaction.reference())
+        .expect("the next session's acknowledgment retires the failure");
+    assert_eq!(transaction.stage(), AuthorizationStage::Terminal);
+    assert_eq!(transaction.operation_state(), OperationState::Rejected);
+    assert!(transaction.is_retired());
+    assert_eq!(transaction.retained_result(), None);
 }
 
 #[test]

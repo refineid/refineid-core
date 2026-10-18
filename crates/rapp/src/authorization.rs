@@ -353,8 +353,9 @@ impl AuthorizationTransaction {
     /// automatic command or result replay.
     ///
     /// A completed result is marked delivery-uncertain; a failure keeps its
-    /// terminal state, retained and unacknowledged, for the next session to
-    /// re-deliver (section 8.3).
+    /// terminal state. Either stays retained and unacknowledged in the
+    /// result-pending stage, so the next session re-delivers it and its
+    /// acknowledgment still retires it (section 8.3).
     ///
     /// # Errors
     /// [`AuthorizationError`] on a wrong stage or a journal failure.
@@ -370,7 +371,6 @@ impl AuthorizationTransaction {
                 .mark_delivery_uncertain(store)
                 .map_err(AuthorizationError::Journal)?;
         }
-        self.stage = AuthorizationStage::Terminal;
         Ok(())
     }
 

@@ -126,6 +126,11 @@ pub struct RappPairMetadata {
     pub profiles: Vec<String>,
     /// Pair-record creation time supplied by the platform wall clock.
     pub created_at_ms: u64,
+    /// Whether the peer confirmed storing its record (RAPP v26.10.18 §4.3
+    /// item 4). A record loaded unconfirmed survived a crash inside the
+    /// confirmation window: it opens no session, routes nothing, and the
+    /// caller revokes it.
+    pub storage_confirmed: bool,
 }
 
 /// Deliberately coarse binding failure. Protocol internals and secrets never
@@ -142,10 +147,11 @@ pub enum RappBindingError {
     WrongPhase,
     /// The one-use pairing offer reached its monotonic deadline.
     OfferExpired,
-    /// The post-PAKE deadline passed before the peer confirmed that it
-    /// stored the pairing (RAPP v26.10.18 §4.3 item 4): the record this
-    /// endpoint stored is not active, and the caller revokes it with
-    /// [`RappPairRecord::revoke`].
+    /// The peer never confirmed that it stored the pairing (RAPP v26.10.18
+    /// §4.3 item 4): the post-PAKE deadline passed in the storage phase, or
+    /// a record loaded from the vault is unconfirmed. Such a record opens
+    /// no session, routes nothing and is announced nowhere; the caller
+    /// revokes it with [`RappPairRecord::revoke`].
     StorageUnconfirmed,
     /// Authenticated protocol or cryptographic processing failed.
     ProtocolFailure,
@@ -258,6 +264,7 @@ enum PairingBridgeState {
     /// the confirmation deadline (§3.3.7, §4.3 item 4).
     Storage {
         storage: Box<PairingStorage>,
+        record: Arc<RappPairRecord>,
         deadline_ms: u64,
     },
     Completed,
@@ -1188,12 +1195,14 @@ impl RappPairingBridge {
     }
 
     /// Build the pair record after equal confirmation and keep the pairing
-    /// channel open for the storage confirmation (§4.3 item 4). The caller
-    /// persists the record with [`RappPairRecord::persist_device_only`],
-    /// then calls [`Self::send_stored`] and feeds the peer's frame to
-    /// [`Self::receive_stored`]; the pairing is active once
-    /// [`Self::is_pairing_active`] reports it. No private key bytes are
-    /// returned to the platform.
+    /// channel open for the storage confirmation (§4.3 item 4). The record
+    /// is unconfirmed: the caller persists it with
+    /// [`RappPairRecord::persist_device_only`], then calls
+    /// [`Self::send_stored`] and feeds the peer's frame to
+    /// [`Self::receive_stored`]; once [`Self::activate_pairing`] returns
+    /// the record, the caller stores it again with
+    /// [`RappPairRecord::replace_device_only`], and only that stored form
+    /// opens sessions. No private key bytes are returned to the platform.
     ///
     /// # Errors
     /// [`RappBindingError`] on the wrong phase, the passed deadline, or
@@ -1217,14 +1226,16 @@ impl RappPairingBridge {
         let (record, storage) = (*confirmation)
             .into_storage(created_at_ms)
             .map_err(|_| RappBindingError::ProtocolFailure)?;
+        let record = Arc::new(RappPairRecord {
+            record: Mutex::new(Some(record)),
+        });
         *state = PairingBridgeState::Storage {
             storage: Box::new(storage),
+            record: Arc::clone(&record),
             deadline_ms,
         };
         drop(state);
-        Ok(Arc::new(RappPairRecord {
-            record: Mutex::new(Some(record)),
-        }))
+        Ok(record)
     }
 
     /// Confirm to the peer that the record is durably stored: the frame to
@@ -1257,31 +1268,51 @@ impl RappPairingBridge {
         })
     }
 
-    /// Whether both storage confirmations have been exchanged. The first
-    /// true answer closes the pairing channel and completes the ceremony;
-    /// a false answer past the deadline is [`RappBindingError::StorageUnconfirmed`].
+    /// The record in its confirmed form once both storage confirmations
+    /// have been exchanged, or `None` while the peer's is still awaited.
+    /// Returning the record closes the pairing channel and completes the
+    /// ceremony; the caller stores the returned record with
+    /// [`RappPairRecord::replace_device_only`], and the pairing is active
+    /// from that write on. A `None` past the deadline is
+    /// [`RappBindingError::StorageUnconfirmed`].
     ///
     /// # Errors
     /// [`RappBindingError`] outside the storage phase or past the deadline.
-    pub fn is_pairing_active(&self, now_monotonic_ms: u64) -> Result<bool, RappBindingError> {
+    pub fn activate_pairing(
+        &self,
+        now_monotonic_ms: u64,
+    ) -> Result<Option<Arc<RappPairRecord>>, RappBindingError> {
         let mut state = self.lock()?;
         let confirmed = match &*state {
-            PairingBridgeState::Completed => return Ok(true),
             PairingBridgeState::Storage { storage, .. } => storage.is_confirmed(),
             _ => return Err(RappBindingError::WrongPhase),
         };
         if !confirmed {
             state.require_live_offer(now_monotonic_ms)?;
-            return Ok(false);
+            return Ok(None);
         }
         let previous = core::mem::replace(&mut *state, PairingBridgeState::Completed);
         drop(state);
-        if let PairingBridgeState::Storage { storage, .. } = previous {
-            storage
-                .into_active()
-                .map_err(|_| RappBindingError::ProtocolFailure)?;
-        }
-        Ok(true)
+        let PairingBridgeState::Storage {
+            storage, record, ..
+        } = previous
+        else {
+            return Err(RappBindingError::WrongPhase);
+        };
+        let active = storage
+            .into_active()
+            .map_err(|_| RappBindingError::ProtocolFailure)?;
+        let mut guard = record
+            .record
+            .lock()
+            .map_err(|_| RappBindingError::LocalStateFailure)?;
+        let unconfirmed = guard.take().ok_or(RappBindingError::WrongPhase)?;
+        let confirmed = active
+            .confirm(unconfirmed)
+            .map_err(|_| RappBindingError::ProtocolFailure)?;
+        *guard = Some(confirmed);
+        drop(guard);
+        Ok(Some(record))
     }
 }
 
@@ -1644,16 +1675,21 @@ mod pairing_bridge_tests {
 
         let requester_record = requester
             .build_pair_record(at + 12, at + 12)
-            .expect("requester builds its record")
-            .metadata()
-            .expect("requester metadata");
+            .expect("requester builds its record");
         let custodian_record = custodian
             .build_pair_record(at + 12, at + 12)
-            .expect("custodian builds its record")
-            .metadata()
-            .expect("custodian metadata");
-        assert_eq!(requester_record.pair_id, custodian_record.pair_id);
-        assert!(!requester.is_pairing_active(at + 12).expect("storage phase"));
+            .expect("custodian builds its record");
+        let requester_metadata = requester_record.metadata().expect("requester metadata");
+        let custodian_metadata = custodian_record.metadata().expect("custodian metadata");
+        assert_eq!(requester_metadata.pair_id, custodian_metadata.pair_id);
+        assert!(!requester_metadata.storage_confirmed);
+        assert!(!custodian_metadata.storage_confirmed);
+        assert!(
+            requester
+                .activate_pairing(at + 12)
+                .expect("storage phase")
+                .is_none()
+        );
 
         let requester_stored = requester
             .send_stored(at + 13)
@@ -1667,8 +1703,30 @@ mod pairing_bridge_tests {
         requester
             .receive_stored(custodian_stored, at + 13)
             .expect("requester verifies the custodian's confirmation");
-        assert!(requester.is_pairing_active(at + 14).expect("exchange done"));
-        assert!(custodian.is_pairing_active(at + 14).expect("exchange done"));
+        let requester_active = requester
+            .activate_pairing(at + 14)
+            .expect("exchange done")
+            .expect("the confirmed record is returned");
+        assert!(Arc::ptr_eq(&requester_active, &requester_record));
+        assert!(
+            requester_active
+                .metadata()
+                .expect("metadata")
+                .storage_confirmed
+        );
+        assert!(
+            custodian
+                .activate_pairing(at + 14)
+                .expect("exchange done")
+                .expect("the custodian's record is returned")
+                .metadata()
+                .expect("metadata")
+                .storage_confirmed
+        );
+        assert!(matches!(
+            requester.activate_pairing(at + 14),
+            Err(RappBindingError::WrongPhase)
+        ));
         assert!(matches!(
             requester.send_stored(at + 14),
             Err(RappBindingError::WrongPhase)
@@ -1710,13 +1768,18 @@ mod pairing_bridge_tests {
         requester
             .send_stored(at + 13)
             .expect("requester confirms storage");
-        assert!(!requester.is_pairing_active(at + 14).expect("still waiting"));
+        assert!(
+            requester
+                .activate_pairing(at + 14)
+                .expect("still waiting")
+                .is_none()
+        );
         assert!(matches!(
-            requester.is_pairing_active(at + 9 + POST_PAKE_CONFIRMATION_MS),
+            requester.activate_pairing(at + 9 + POST_PAKE_CONFIRMATION_MS),
             Err(RappBindingError::StorageUnconfirmed)
         ));
         assert!(matches!(
-            requester.is_pairing_active(at + 9 + POST_PAKE_CONFIRMATION_MS + 1),
+            requester.activate_pairing(at + 9 + POST_PAKE_CONFIRMATION_MS + 1),
             Err(RappBindingError::WrongPhase)
         ));
     }
@@ -2058,6 +2121,12 @@ pub struct RappPairRecord {
 impl RappPairRecord {
     /// Load an active pair record from platform device-only storage.
     ///
+    /// A record whose [`RappPairMetadata::storage_confirmed`] is false was
+    /// stored inside a confirmation window this endpoint did not complete:
+    /// it opens no session, routes nothing and is announced nowhere, and
+    /// the caller revokes it with [`Self::revoke`] at the first start that
+    /// finds it.
+    ///
     /// # Errors
     /// [`RappBindingError`] on an invalid identifier, a revoked or absent
     /// pair, or a storage failure.
@@ -2328,6 +2397,41 @@ impl RappPairRecord {
             .map_err(|_| RappBindingError::LocalStateFailure)
     }
 
+    /// Store the confirmed record in place of the unconfirmed one written
+    /// by [`Self::persist_device_only`], once
+    /// [`RappPairingBridge::activate_pairing`] returned it (§4.3 item 4).
+    ///
+    /// # Errors
+    /// [`RappBindingError::StorageUnconfirmed`] for a record the peer has
+    /// not confirmed, [`RappBindingError::WrongPhase`] for a revoked one,
+    /// and [`RappBindingError::LocalStateFailure`] on a storage failure.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the record lock covers the vault write so revocation cannot interleave with persistence"
+    )]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "uniffi lowers exported arguments as owned values"
+    )]
+    pub fn replace_device_only(
+        &self,
+        vault: Arc<dyn RappPairVault>,
+    ) -> Result<(), RappBindingError> {
+        let record = self
+            .record
+            .lock()
+            .map_err(|_| RappBindingError::LocalStateFailure)?;
+        let record = record.as_ref().ok_or(RappBindingError::WrongPhase)?;
+        if !record.is_storage_confirmed() {
+            return Err(RappBindingError::StorageUnconfirmed);
+        }
+        let pair_id = record.pair_id().as_bytes().to_vec();
+        let bytes = encode_pair_record(record)?;
+        vault
+            .replace_device_only(pair_id, bytes)
+            .map_err(|_| RappBindingError::LocalStateFailure)
+    }
+
     /// Irreversibly delete active secret material and retain only a local
     /// tombstone. The in-memory private key is dropped only after the vault
     /// confirms deletion.
@@ -2367,7 +2471,11 @@ impl RappPairRecord {
             .map_err(|_| RappBindingError::LocalStateFailure)?;
         record.take();
         drop(record);
-        Ok(retention.map(|bytes| bytes.to_vec()))
+        // The encoded retention carries the revocation key. Its bytes are
+        // moved, not copied, into the returned value, so this is the one
+        // copy that leaves the crate: the caller owns it and protects it
+        // like the record it replaces.
+        Ok(retention.map(|mut bytes| core::mem::take(&mut *bytes)))
     }
 }
 
@@ -2389,6 +2497,14 @@ pub trait RappPairVault: Send + Sync {
     /// # Errors
     /// [`RappVaultError`] when storage is unavailable.
     fn load_device_only(&self, pair_id: Vec<u8>) -> Result<Option<Vec<u8>>, RappVaultError>;
+
+    /// Atomically replace the record stored under an existing identifier:
+    /// the confirmed form of a record inserted before the peer confirmed
+    /// its storage (RAPP v26.10.18 §4.3 item 4).
+    ///
+    /// # Errors
+    /// [`RappVaultError`] on an absent pair or unavailable storage.
+    fn replace_device_only(&self, pair_id: Vec<u8>, record: Vec<u8>) -> Result<(), RappVaultError>;
 
     /// Atomically destroy the record and retain a non-secret tombstone.
     ///
@@ -2733,7 +2849,10 @@ impl RappSessionBridge {
             ),
             EndpointRole::Proxy => SessionHandshake::begin_proxy(pair_record, transport),
         }
-        .map_err(|_| RappBindingError::ProtocolFailure)?;
+        .map_err(|error| match error {
+            super::SessionError::StorageUnconfirmed => RappBindingError::StorageUnconfirmed,
+            _ => RappBindingError::ProtocolFailure,
+        })?;
         let pair_id = pair_record.pair_id();
         drop(pair_guard);
         Ok(Arc::new(Self {
@@ -2823,6 +2942,7 @@ fn pair_metadata(record: &PairRecord) -> RappPairMetadata {
             .map(|profile| profile.as_str().to_owned())
             .collect(),
         created_at_ms: record.created_at_ms(),
+        storage_confirmed: record.is_storage_confirmed(),
     }
 }
 
@@ -2912,13 +3032,24 @@ impl RappSessionRouter {
             Ok(RoutingPreamble::Session(routing)) => routing,
             Err(_) => return Ok(RappRoute::Refuse),
         };
-        let keys = records
-            .iter()
-            .map(|record| record.routing_key())
-            .collect::<Result<Vec<_>, _>>()?;
-        let Some(index) = super::route_session(&keys, profile, &routing) else {
+        // A record the peer never confirmed routes nothing (§4.3 item 4);
+        // it is left out, and the answer indexes the caller's list.
+        let mut indices = Vec::with_capacity(records.len());
+        let mut keys = Vec::with_capacity(records.len());
+        for (index, record) in records.iter().enumerate() {
+            match record.routing_key() {
+                Ok(key) => {
+                    indices.push(index);
+                    keys.push(key);
+                }
+                Err(RappBindingError::StorageUnconfirmed) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let Some(position) = super::route_session(&keys, profile, &routing) else {
             return Ok(RappRoute::Refuse);
         };
+        let index = indices[position];
         let fresh = self
             .replay
             .lock()
@@ -2950,19 +3081,28 @@ impl RappPairRecord {
 
     fn routing_key(&self) -> Result<super::RoutingKey, RappBindingError> {
         self.with_record(|record| {
-            super::RoutingKey::derive(record).map_err(|_| RappBindingError::InvalidInput)
+            super::RoutingKey::derive(record).map_err(|error| match error {
+                super::RecordKeyError::StorageUnconfirmed => RappBindingError::StorageUnconfirmed,
+                super::RecordKeyError::DegenerateAgreement(_) => RappBindingError::InvalidInput,
+            })
         })
     }
 
     fn discovery_key(&self) -> Result<super::DiscoveryKey, RappBindingError> {
         self.with_record(|record| {
-            super::DiscoveryKey::derive(record).map_err(|_| RappBindingError::InvalidInput)
+            super::DiscoveryKey::derive(record).map_err(|error| match error {
+                super::RecordKeyError::StorageUnconfirmed => RappBindingError::StorageUnconfirmed,
+                super::RecordKeyError::DegenerateAgreement(_) => RappBindingError::InvalidInput,
+            })
         })
     }
 
     fn withdrawal_key(&self) -> Result<super::WithdrawalKey, RappBindingError> {
         self.with_record(|record| {
-            super::WithdrawalKey::derive(record).map_err(|_| RappBindingError::InvalidInput)
+            super::WithdrawalKey::derive(record).map_err(|error| match error {
+                super::WithdrawalError::StorageUnconfirmed => RappBindingError::StorageUnconfirmed,
+                _ => RappBindingError::InvalidInput,
+            })
         })
     }
 
@@ -3092,7 +3232,7 @@ pub fn rapp_revocation_retention_expired(
 ) -> Result<bool, RappBindingError> {
     let retention = super::decode_revocation_retention(&retention)
         .map_err(|_| RappBindingError::InvalidInput)?;
-    Ok(!retention.announces_at(unix_time_seconds.saturating_mul(MILLISECONDS_PER_SECOND)))
+    Ok(retention.is_expired(unix_time_seconds.saturating_mul(MILLISECONDS_PER_SECOND)))
 }
 
 /// The TXT attributes of a `mode=withdrawn` record announcing the
@@ -3309,6 +3449,10 @@ mod routing_binding_tests {
             Ok(None)
         }
 
+        fn replace_device_only(&self, _: Vec<u8>, _: Vec<u8>) -> Result<(), RappVaultError> {
+            Err(RappVaultError::Unavailable)
+        }
+
         fn revoke_device_only(&self, _: Vec<u8>, _: u64) -> Result<(), RappVaultError> {
             *self.revoked.lock().expect("lock") = true;
             Ok(())
@@ -3335,6 +3479,83 @@ mod routing_binding_tests {
         Arc::new(RappPairRecord {
             record: Mutex::new(Some(record)),
         })
+    }
+
+    /// A vault holding one encoded record.
+    struct StoringVault {
+        bytes: Vec<u8>,
+        revoked: Mutex<bool>,
+    }
+
+    impl RappPairVault for StoringVault {
+        fn insert_device_only(&self, _: Vec<u8>, _: Vec<u8>) -> Result<(), RappVaultError> {
+            Err(RappVaultError::IdentifierAlreadyUsed)
+        }
+
+        fn load_device_only(&self, _: Vec<u8>) -> Result<Option<Vec<u8>>, RappVaultError> {
+            Ok(Some(self.bytes.clone()))
+        }
+
+        fn replace_device_only(&self, _: Vec<u8>, _: Vec<u8>) -> Result<(), RappVaultError> {
+            Ok(())
+        }
+
+        fn revoke_device_only(&self, _: Vec<u8>, _: u64) -> Result<(), RappVaultError> {
+            *self.revoked.lock().expect("lock") = true;
+            Ok(())
+        }
+
+        fn is_revoked(&self, _: Vec<u8>) -> Result<bool, RappVaultError> {
+            Ok(*self.revoked.lock().expect("lock"))
+        }
+    }
+
+    #[test]
+    fn an_unconfirmed_record_from_the_vault_serves_nothing_and_revokes() {
+        let own_private = [REQUESTER_BYTE; X25519_KEY_SIZE];
+        let unconfirmed = PairRecord::new(
+            PairId::from_array([PAIR_BYTE; PAIR_ID_SIZE]),
+            EndpointRole::Requester,
+            own_private,
+            x25519_public_key(&own_private),
+            x25519_public_key(&[CUSTODIAN_BYTE; X25519_KEY_SIZE]),
+            GrantsHash::from_array([GRANTS_BYTE; crate::GRANTS_HASH_SIZE]),
+            vec![ProfileName::Authentication],
+            CREATED_AT_MS,
+        )
+        .expect("record")
+        .awaiting_storage_confirmation();
+        let vault = Arc::new(StoringVault {
+            bytes: crate::encode_pair_record(&unconfirmed).expect("encode"),
+            revoked: Mutex::new(false),
+        });
+        let loaded = RappPairRecord::load_from_vault(
+            unconfirmed.pair_id().as_bytes().to_vec(),
+            Arc::clone(&vault) as Arc<dyn RappPairVault>,
+        )
+        .expect("an unconfirmed record loads so that it can be revoked");
+        assert!(!loaded.metadata().expect("metadata").storage_confirmed);
+        assert!(matches!(
+            super::RappSessionBridge::begin_requester(
+                Arc::clone(&loaded),
+                Arc::clone(&vault) as Arc<dyn RappPairVault>,
+                STREAM_PROFILE.to_owned(),
+            ),
+            Err(super::RappBindingError::StorageUnconfirmed)
+        ));
+        assert!(matches!(
+            loaded.discovery_hint(UNIX_TIME_SECONDS),
+            Err(super::RappBindingError::StorageUnconfirmed)
+        ));
+        assert!(matches!(
+            loaded.replace_device_only(Arc::clone(&vault) as Arc<dyn RappPairVault>),
+            Err(super::RappBindingError::StorageUnconfirmed)
+        ));
+        let retention = loaded
+            .revoke(Arc::clone(&vault) as Arc<dyn RappPairVault>, REVOKED_AT_MS)
+            .expect("an unconfirmed record is revoked");
+        assert!(retention.is_some());
+        assert!(*vault.revoked.lock().expect("lock"));
     }
 
     fn requester() -> Arc<RappPairRecord> {

@@ -142,8 +142,8 @@ pub use revocation::{
 pub use routing::{
     DISCOVERY_HINT_EPOCH_SECONDS, DISCOVERY_HINT_SIZE, DiscoveryKey, DiscoveryRecord,
     DiscoveryRecordError, MAX_DISCOVERY_HINTS, ROUTING_NONCE_SIZE, ROUTING_REPLAY_WINDOW,
-    ROUTING_TAG_SIZE, RandomUnavailable, RoutingKey, RoutingReplayCache, SESSION_ROUTING_SIZE,
-    SessionRouting, discovery_epoch, route_session,
+    ROUTING_TAG_SIZE, RandomUnavailable, RecordKeyError, RoutingKey, RoutingReplayCache,
+    SESSION_ROUTING_SIZE, SessionRouting, discovery_epoch, route_session,
 };
 pub use runtime::{EstablishedSessionRuntime, RuntimeError, RuntimePoll, RuntimeReceive};
 pub use session_flow::{ExplicitUserIntent, SessionAuthentication, SessionError, SessionHandshake};

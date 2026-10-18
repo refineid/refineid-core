@@ -415,7 +415,8 @@ impl PairingConfirmation {
             local_grants,
             created_at_ms,
         )
-        .map_err(PairingError::PairRecord)?;
+        .map_err(PairingError::PairRecord)?
+        .awaiting_storage_confirmation();
         Ok((
             record,
             PairingStorage {
@@ -545,6 +546,20 @@ impl ActivePairing {
     #[must_use]
     pub const fn pair_id(&self) -> super::PairId {
         self.pair_id
+    }
+
+    /// The stored record in its confirmed form, to be stored again in
+    /// place of the unconfirmed one: the only way a record becomes
+    /// confirmed (section 4.3 item 4).
+    ///
+    /// # Errors
+    /// [`PairingError::PairIdMismatch`] when `record` belongs to another
+    /// pairing.
+    pub fn confirm(self, record: PairRecord) -> Result<PairRecord, PairingError> {
+        if record.pair_id() != self.pair_id {
+            return Err(PairingError::PairIdMismatch);
+        }
+        Ok(record.storage_confirmed())
     }
 }
 
@@ -762,7 +777,13 @@ mod tests {
 
     #[test]
     fn both_confirmations_make_the_pairing_active() {
-        let (mut requester, mut proxy) = storages();
+        let (requester, proxy) = confirmed_pair();
+        let (requester_record, mut requester) = requester
+            .into_storage(CREATED_AT_MS)
+            .expect("requester record");
+        let (proxy_record, mut proxy) = proxy.into_storage(CREATED_AT_MS).expect("proxy record");
+        assert!(!requester_record.is_storage_confirmed());
+        assert!(!proxy_record.is_storage_confirmed());
         assert!(!requester.is_confirmed());
         let requester_stored = requester.send_stored().expect("requester confirms");
         let proxy_stored = proxy.send_stored().expect("proxy confirms");
@@ -775,7 +796,39 @@ mod tests {
         let pair_id = requester.pair_id();
         let active = requester.into_active().expect("active");
         assert_eq!(active.pair_id(), pair_id);
+        let confirmed = active
+            .confirm(requester_record)
+            .expect("the active pairing confirms its own record");
+        assert!(confirmed.is_storage_confirmed());
+        assert_eq!(confirmed.pair_id(), pair_id);
         assert_eq!(proxy.into_active().expect("active").pair_id(), pair_id);
+    }
+
+    #[test]
+    fn an_active_pairing_confirms_only_its_own_record() {
+        let (requester, proxy) = confirmed_pair();
+        let (requester_record, mut requester) = requester
+            .into_storage(CREATED_AT_MS)
+            .expect("requester record");
+        let (_, mut proxy) = proxy.into_storage(CREATED_AT_MS).expect("proxy record");
+        let requester_stored = requester.send_stored().expect("requester confirms");
+        let proxy_stored = proxy.send_stored().expect("proxy confirms");
+        proxy
+            .receive_stored(&requester_stored, CONFIRMATION_AT_MS)
+            .expect("proxy reads the confirmation");
+        requester
+            .receive_stored(&proxy_stored, CONFIRMATION_AT_MS)
+            .expect("requester reads the confirmation");
+        let (other_requester, _) = confirmed_pair();
+        let (other_record, _) = other_requester
+            .into_storage(CREATED_AT_MS)
+            .expect("another pairing's record");
+        assert_ne!(other_record.pair_id(), requester_record.pair_id());
+        let active = requester.into_active().expect("active");
+        assert!(matches!(
+            active.confirm(other_record),
+            Err(PairingError::PairIdMismatch)
+        ));
     }
 
     #[test]

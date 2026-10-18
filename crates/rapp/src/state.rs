@@ -377,6 +377,9 @@ pub enum Action {
     /// Derive and retain the revocation key before the pair keys are
     /// destroyed.
     RetainRevocationKey,
+    /// Revoke the stored record the peer never confirmed, leaving its
+    /// tombstone (section 4.3 item 4).
+    RevokeUnconfirmedPairRecord,
     /// Destroy the pair-specific static keys.
     DestroyPairKeys,
     /// Destroy the pairing's rendezvous tokens.
@@ -675,6 +678,7 @@ impl PairingState {
                 state: Self::Unpaired,
                 actions: &[
                     A::RetainRevocationKey,
+                    A::RevokeUnconfirmedPairRecord,
                     A::DestroyPairKeys,
                     A::ClearPairMetadata,
                     A::CloseCandidate,
@@ -1249,7 +1253,11 @@ impl OperationState {
                 require(guards.profile_has_no_consequential_command)?;
                 Transition {
                     state: Self::Completed,
-                    actions: &[A::SendResultAck, A::JournalCompleted],
+                    actions: &[
+                        A::RetainResultUnderLocalStorage,
+                        A::SendResultAck,
+                        A::JournalCompleted,
+                    ],
                 }
             }
             (
@@ -1258,7 +1266,7 @@ impl OperationState {
                 EndpointRole::Requester,
             ) => Transition {
                 state: Self::Denied,
-                actions: &[A::SendResultAck, A::JournalDenied],
+                actions: &[A::JournalDenied, A::SendResultAck],
             },
             (
                 Self::Requested | Self::Prepared | Self::Committed,
@@ -1266,7 +1274,7 @@ impl OperationState {
                 EndpointRole::Requester,
             ) => Transition {
                 state: Self::Cancelled,
-                actions: &[A::SendResultAck, A::JournalCancelled],
+                actions: &[A::JournalCancelled, A::SendResultAck],
             },
             (
                 Self::Requested | Self::Prepared | Self::Committed,
@@ -1274,7 +1282,7 @@ impl OperationState {
                 EndpointRole::Requester,
             ) => Transition {
                 state: Self::Rejected,
-                actions: &[A::SendResultAck, A::JournalRejected],
+                actions: &[A::JournalRejected, A::SendResultAck],
             },
             (
                 Self::Requested | Self::Prepared | Self::Committed,
@@ -1283,18 +1291,22 @@ impl OperationState {
             ) => Transition {
                 state: Self::CredentialRejected,
                 actions: &[
-                    A::SendResultAck,
                     A::JournalCredentialRejected,
+                    A::SendResultAck,
                     A::RevokePairAfterCredentialRejection,
                 ],
             },
             (Self::Committed, E::ResultCompletedReceived, EndpointRole::Requester) => Transition {
                 state: Self::Completed,
-                actions: &[A::SendResultAck, A::JournalCompleted],
+                actions: &[
+                    A::RetainResultUnderLocalStorage,
+                    A::SendResultAck,
+                    A::JournalCompleted,
+                ],
             },
             (Self::Committed, E::ResultAmbiguousReceived, EndpointRole::Requester) => Transition {
                 state: Self::Ambiguous,
-                actions: &[A::SendResultAck, A::JournalAmbiguous, A::ProhibitRetry],
+                actions: &[A::JournalAmbiguous, A::SendResultAck, A::ProhibitRetry],
             },
             (Self::Committed, E::SessionClosedPostCommit, EndpointRole::Requester) => Transition {
                 state: Self::Ambiguous,

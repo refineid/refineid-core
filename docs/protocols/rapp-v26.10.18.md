@@ -62,7 +62,7 @@ Per project engineering standards, specification requirements are strictly disti
 | **GATT Connection & ATT MTU Exchange** (§5.2, §7.1) | Partially Observed on Hardware | BLE connection duration (~1.2 s setup; 735.6 ms Linux connect call) and 512-byte API update value capacity observed on hardware. Exact ATT MTU exchange and Indication-only path are Specified (unverified on physical hardware). |
 | **Over-The-Air Data Transfer** (§7.1) | Observed on Physical Hardware | Synthetic 64-byte write and 256-byte read on Channel characteristic verified over physical BLE link. |
 | **BLE SAR Framing & State Machine** (§5.3) | Normative Specification | Fully specified with invariant total length, attribute capacity limits, pre-copy capacity checks, and stop-and-wait flow control. |
-| **Crockford Base32 Canonical Normalization** (§3.1) | Normative Specification | Fully specified 7-step pipeline with Crockford decode alias mapping (`I`/`L` $\to$ `1`, `O` $\to$ `0`). |
+| **Crockford Base32 Canonical Normalization** (§3.1) | Normative Specification | Fully specified 7-step pipeline; the excluded letters `I`, `L`, `O` and `U` are rejected, never mapped to lookalikes. |
 | **CPaceRistretto255 KC2 Profile & Key Confirmation** (§6.1) | Normative Specification | Fully specified with Context $C$ binding, RFC 5869 HKDF key schedule, HMAC-SHA-512 confirmation tags $T_A, T_B$, scalar sampling options, and abort-on-identity. Implemented in `crates/rapp/src/cpace.rs` and verified with in-tree synthetic golden vectors (`cpace_kc2_golden_synthetic_vectors`) as well as standalone research harnesses (`kc2-v2-harness`, `verify_kc2_review.py`). |
 | **Attempt Reservation & Disconnect Oracle Protection** (§3.3) | Normative Specification | State machine rules fully defined. |
 | **Noise_XXpsk3 & Noise_KK Handshakes** (§6.2, §6.3) | Normative Specification | Complete token schedules (including 48-byte Message 1 and little-endian sequence nonces), directional key splits, and prologues fully specified. |
@@ -190,7 +190,7 @@ Both Custodian and Requester **MUST** apply an identical 7-step canonicalization
 2. Apply Unicode NFKC normalization first (normalizing compatibility characters).
 3. Convert all ASCII lowercase characters (`a-z`) to ASCII uppercase (`A-Z`).
 4. Strip all standard ASCII whitespace (`0x20` SPACE, `0x09` TAB, `0x0A` LF, `0x0B` VT, `0x0C` FF, `0x0D` CR) and hyphens (`-`).
-5. Apply Crockford decode aliases: map uppercase `I` and `L` to digit `1`; map uppercase `O` to digit `0`. Reject `U` (as invalid input).
+5. Reject `I`, `L`, `O` and `U` as invalid input: the alphabet excludes them, and a typed one is never read as the digit or letter it resembles.
 6. Verify that the resulting string is **exactly 6 characters in length** and composed **exclusively** of characters in Crockford's Base32 alphabet.
 7. Derive the password octets as exact UTF-8:
    $$\text{pw} = \text{UTF-8}(\text{normalized\_code}) \quad (\text{e.g., } \text{UTF-8}(\texttt{"7KX4M9"}))$$

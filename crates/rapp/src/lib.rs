@@ -48,6 +48,7 @@ mod proxy_engine;
 mod requester;
 mod requester_engine;
 mod result;
+mod revocation;
 mod routing;
 mod runtime;
 mod session_flow;
@@ -90,9 +91,9 @@ pub use liveness::{
     PongDisposition,
 };
 pub use message::{
-    LivenessMessage, MessageError, NegotiatedParameters, PairingAbortMessage,
-    PairingConfirmMessage, PairingHelloMessage, ProtocolErrorMessage, SessionCloseMessage,
-    SessionParameters, SessionReadyMessage, StatusReport, TypedMessage,
+    CardStatusMessage, LivenessMessage, MessageError, NegotiatedParameters, PairingAbortMessage,
+    PairingConfirmMessage, PairingHelloMessage, PairingStoredMessage, ProtocolErrorMessage,
+    SessionCloseMessage, SessionParameters, SessionReadyMessage, StatusReport, TypedMessage,
 };
 pub use offer::{MAX_OFFER_SIZE, PairingOffer, PairingOfferDeadline, PairingOfferError};
 pub use operation::{
@@ -114,7 +115,8 @@ pub use pairing_attempts::{
     PreAuthenticationRateLimit, phase_deadline_ms,
 };
 pub use pairing_flow::{
-    PairingAttemptFailure, PairingConfirmation, PairingError, PairingHandshake,
+    ActivePairing, PairingAttemptFailure, PairingConfirmation, PairingError, PairingHandshake,
+    PairingStorage,
 };
 pub use policy::{
     IncidentDisposition, OperationDisposition, PairDisposition, SecurityIncident,
@@ -131,11 +133,17 @@ pub use requester_engine::{
     RequesterDispatch, RequesterEngineError, RequesterOperationEngine, RequesterViolation,
 };
 pub use result::{OperationResultMessage, ProxyFailure, ResultError, ResultResponse, ResultStatus};
+pub use revocation::{
+    REVOCATION_ANNOUNCEMENT_MS, REVOCATION_HINT_SIZE, REVOCATION_RETENTION_FORMAT_VERSION,
+    REVOKED_ANNOUNCEMENT_ENTRIES, RevocationError, RevocationKey, RevocationRetention,
+    RevocationRetentionCodecError, RevokedAnnouncement, decode_revocation_retention,
+    encode_revocation_retention,
+};
 pub use routing::{
     DISCOVERY_HINT_EPOCH_SECONDS, DISCOVERY_HINT_SIZE, DiscoveryKey, DiscoveryRecord,
     DiscoveryRecordError, MAX_DISCOVERY_HINTS, ROUTING_NONCE_SIZE, ROUTING_REPLAY_WINDOW,
-    ROUTING_TAG_SIZE, RandomUnavailable, RoutingKey, RoutingReplayCache, SESSION_ROUTING_SIZE,
-    SessionRouting, discovery_epoch, route_session,
+    ROUTING_TAG_SIZE, RandomUnavailable, RecordKeyError, RoutingKey, RoutingReplayCache,
+    SESSION_ROUTING_SIZE, SessionRouting, discovery_epoch, route_session,
 };
 pub use runtime::{EstablishedSessionRuntime, RuntimeError, RuntimePoll, RuntimeReceive};
 pub use session_flow::{ExplicitUserIntent, SessionAuthentication, SessionError, SessionHandshake};
@@ -156,7 +164,7 @@ pub use types::{
     NOISE_TAG_SIZE, OFFER_ID_SIZE, OFFER_TTL_MS, OPERATION_ID_SIZE, OfferId, OperationId,
     PAIR_ID_SIZE, PAIRING_SECRET_SIZE, PairId, PairingSecret, ProfileName, REQUEST_HASH_SIZE,
     RequestHash, RetryDecision, SESSION_ID_SIZE, SESSION_READY_NONCE_SIZE, SessionId,
-    VisibleConnectionState, WIRE_VERSION_V26_10_10, X25519_KEY_SIZE,
+    VisibleConnectionState, WIRE_VERSION_V26_10_18, X25519_KEY_SIZE,
 };
 pub use wire::{
     Envelope, MessageType, SequenceGuard, WireError, WireValue, decode_deterministic_cbor,

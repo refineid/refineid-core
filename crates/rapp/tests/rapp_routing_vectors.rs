@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Discovery hints and session routing (RAPP v26.10.10 §2.2.1 and §4.3)
+//! Discovery hints and session routing (RAPP v26.10.18 §2.2.1 and §4.3)
 //! against their corpus.
 
 use refineid_rapp::{
@@ -22,7 +22,7 @@ use refineid_rapp::{
 };
 use serde::Deserialize;
 
-const CORPUS: &str = include_str!("../../../docs/protocols/vectors/rapp-routing-v26.10.10.json");
+const CORPUS: &str = include_str!("../../../docs/protocols/vectors/rapp-routing-v26.10.18.json");
 
 #[derive(Deserialize)]
 struct Corpus {
@@ -162,7 +162,7 @@ fn custodian_routing_key(keys: &Endpoints, pair: PairId) -> RoutingKey {
 fn corpus_names_its_version() {
     let corpus = corpus();
     assert_eq!(corpus.format, "fi.refineid.rapp.routing-vectors-v1");
-    assert_eq!(corpus.protocol_document_version, "26.10.10");
+    assert_eq!(corpus.protocol_document_version, "26.10.18");
 }
 
 #[test]
@@ -323,7 +323,7 @@ fn session_records_announce_the_most_recently_used_pairings() {
                 last_used_ms: candidate.last_used_ms,
             })
             .collect::<Vec<_>>();
-        let record = DiscoveryRecord::assemble(&candidates);
+        let record = DiscoveryRecord::assemble(&candidates, None);
         let announced = record.hints().iter().map(hex::encode).collect::<Vec<_>>();
         assert_eq!(announced, vector.announced_hex, "{}", vector.name);
     }

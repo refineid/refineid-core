@@ -140,12 +140,40 @@ fn paired_records() -> (PairRecord, PairRecord) {
         .receive_confirmation(&proxy_confirmation, 101)
         .expect("requester verifies equal grants");
 
-    let requester_record = requester
-        .into_pair_record(200)
+    let (requester_record, mut requester_storage) = requester
+        .into_storage(200)
         .expect("requester record becomes persistable after both confirmations");
-    let proxy_record = proxy
-        .into_pair_record(200)
+    let (proxy_record, mut proxy_storage) = proxy
+        .into_storage(200)
         .expect("proxy record becomes persistable after both confirmations");
+    let requester_stored = requester_storage
+        .send_stored()
+        .expect("requester confirms storage");
+    let proxy_stored = proxy_storage.send_stored().expect("proxy confirms storage");
+    proxy_storage
+        .receive_stored(&requester_stored, 201)
+        .expect("proxy verifies the requester's confirmation");
+    requester_storage
+        .receive_stored(&proxy_stored, 201)
+        .expect("requester verifies the proxy's confirmation");
+    assert!(!requester_record.is_storage_confirmed());
+    assert!(!proxy_record.is_storage_confirmed());
+    let requester_active = requester_storage
+        .into_active()
+        .expect("both confirmations make the requester's pairing active");
+    let proxy_active = proxy_storage
+        .into_active()
+        .expect("both confirmations make the proxy's pairing active");
+    assert_eq!(requester_active.pair_id(), requester_record.pair_id());
+    assert_eq!(proxy_active.pair_id(), proxy_record.pair_id());
+    let requester_record = requester_active
+        .confirm(requester_record)
+        .expect("the active pairing confirms the requester's record");
+    let proxy_record = proxy_active
+        .confirm(proxy_record)
+        .expect("the active pairing confirms the proxy's record");
+    assert!(requester_record.is_storage_confirmed());
+    assert!(proxy_record.is_storage_confirmed());
     assert_eq!(requester_record.pair_id(), proxy_record.pair_id());
     assert_eq!(requester_record.grants_hash(), proxy_record.grants_hash());
     assert_eq!(requester_record.profiles(), proxy_record.profiles());
@@ -611,10 +639,32 @@ fn cpace_bootstrap_pairing_and_fresh_session_interoperate_end_to_end() {
         .receive_confirmation(&req_confirm_msg, 101)
         .expect("proxy receives confirm");
 
-    let requester_record = requester_confirm
-        .into_pair_record(200)
-        .expect("requester finishes");
-    let proxy_record = proxy_confirm.into_pair_record(200).expect("proxy finishes");
+    let (requester_record, mut requester_storage) = requester_confirm
+        .into_storage(200)
+        .expect("requester builds its record");
+    let (proxy_record, mut proxy_storage) = proxy_confirm
+        .into_storage(200)
+        .expect("proxy builds its record");
+    let proxy_stored = proxy_storage.send_stored().expect("proxy confirms storage");
+    requester_storage
+        .receive_stored(&proxy_stored, 201)
+        .expect("requester verifies the proxy's confirmation");
+    let requester_stored = requester_storage
+        .send_stored()
+        .expect("requester confirms storage");
+    proxy_storage
+        .receive_stored(&requester_stored, 201)
+        .expect("proxy verifies the requester's confirmation");
+    let requester_record = requester_storage
+        .into_active()
+        .expect("requester pairing is active")
+        .confirm(requester_record)
+        .expect("the requester's record is confirmed");
+    let proxy_record = proxy_storage
+        .into_active()
+        .expect("proxy pairing is active")
+        .confirm(proxy_record)
+        .expect("the proxy's record is confirmed");
 
     assert_eq!(requester_record.pair_id(), proxy_record.pair_id());
 

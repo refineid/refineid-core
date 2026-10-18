@@ -242,9 +242,12 @@ impl From<&CardOperation> for RappOperationDescriptor {
     }
 }
 
-/// Advisory progress events exposed to platform callers.
+/// Progress events exposed to platform callers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum RappProgressEvent {
+    /// The consent view is on the custodian's screen (RAPP section 8.2
+    /// item 3).
+    ConsentShown,
     /// Proxy is waiting for card presentation.
     WaitingForCard,
     /// Card presentation wait has ended.
@@ -256,6 +259,7 @@ pub enum RappProgressEvent {
 impl From<RappProgressEvent> for super::ProgressEvent {
     fn from(value: RappProgressEvent) -> Self {
         match value {
+            RappProgressEvent::ConsentShown => Self::ConsentShown,
             RappProgressEvent::WaitingForCard => Self::WaitingForCard,
             RappProgressEvent::CardWaitEnded => Self::CardWaitEnded,
             RappProgressEvent::Unknown => Self::Unknown,
@@ -266,6 +270,7 @@ impl From<RappProgressEvent> for super::ProgressEvent {
 impl From<super::ProgressEvent> for RappProgressEvent {
     fn from(value: super::ProgressEvent) -> Self {
         match value {
+            super::ProgressEvent::ConsentShown => Self::ConsentShown,
             super::ProgressEvent::WaitingForCard => Self::WaitingForCard,
             super::ProgressEvent::CardWaitEnded => Self::CardWaitEnded,
             super::ProgressEvent::Unknown => Self::Unknown,
@@ -286,16 +291,22 @@ pub enum RappBridgeActionKind {
     ExecuteSafeRead,
     /// Execute the single authorized card command.
     ExecuteCardCommand,
-    /// Frame carrying the acknowledgment of a completed result.
+    /// Frame carrying the acknowledgment of a completed result; the result
+    /// is released once the frame is delivered.
     ResultAcknowledgment,
     /// Operation reached its completed terminal state.
     Completed,
-    /// Operation reached the named terminal state.
+    /// Operation reached the named terminal state; `frame`, when present,
+    /// carries the acknowledgment of the result and is delivered like any
+    /// other frame.
     Terminal,
-    /// Peer acknowledged the completed result.
+    /// Peer acknowledged the result.
     ResultAcknowledged,
-    /// Advisory progress update reported by peer.
+    /// Progress update reported by peer.
     Progress,
+    /// The custodian reported whether it can serve a card now
+    /// (`card_present`, RAPP section 8.4).
+    CardStatus,
     /// The peer could not admit the operation, such as while another runs.
     PeerBusy,
     /// Peer answered a stale reference; a normal race.
@@ -374,7 +385,7 @@ impl From<CloseReason> for RappCloseReason {
 pub enum RappTerminalReason {
     /// Human authorizer denied the operation.
     UserDenied,
-    /// Local monotonic request expiry elapsed.
+    /// The request's expiry elapsed on the continuous clock.
     RequestExpired,
     /// Cancellation proven before physical transmission.
     Cancelled,
@@ -395,7 +406,7 @@ pub enum RappTerminalReason {
 }
 
 impl RappTerminalReason {
-    /// The reason a failure result names (RAPP v26.10.10 section 10).
+    /// The reason a failure result names (RAPP v26.10.18 section 10).
     #[must_use]
     pub const fn from_result(status: ResultStatus, error: Option<ResultError>) -> Self {
         match (status, error) {
@@ -445,8 +456,10 @@ pub struct RappBridgeAction {
     /// The signatures an interrupted batch made before it became ambiguous;
     /// they are delivered and never made again.
     pub batch_signatures: Vec<Vec<u8>>,
-    /// Advisory progress event.
+    /// Progress event.
     pub progress_event: Option<RappProgressEvent>,
+    /// Whether the custodian can serve a card now, on a card-status action.
+    pub card_present: Option<bool>,
     /// The session must close after this frame is delivered.
     pub close_session_after_send: bool,
     /// Registered reason of a session closed by an authenticated notice,
@@ -469,6 +482,7 @@ impl RappBridgeAction {
             remaining_retries: None,
             batch_signatures: Vec::new(),
             progress_event: None,
+            card_present: None,
             close_session_after_send: false,
             close_reason: None,
             next_poll_at_ms: None,
@@ -499,6 +513,7 @@ impl RappBridgeAction {
             remaining_retries: None,
             batch_signatures: Vec::new(),
             progress_event: None,
+            card_present: None,
             close_session_after_send,
             close_reason: None,
             next_poll_at_ms: None,
@@ -1215,7 +1230,40 @@ impl RappOperationBridge {
         self.finish_failure(&operation_id, ProxyFailure::CardCompletionAmbiguous)
     }
 
-    /// Report authenticated advisory progress on an active operation.
+    /// Tell the requester whether a card can answer now (RAPP section 8.4).
+    ///
+    /// The proxy calls this once right after `begin_proxy`, so the notice
+    /// follows `session.ready`, and again whenever the presence of a card it
+    /// can serve changes. Primed or cached material without a card is
+    /// absence.
+    ///
+    /// # Errors
+    /// [`RappBindingError`] on the wrong protocol phase or a poisoned local
+    /// state.
+    pub fn report_card_status(
+        &self,
+        card_present: bool,
+    ) -> Result<RappBridgeAction, RappBindingError> {
+        let mut state = self.lock_state()?;
+        let OperationBridgeState::Proxy {
+            runtime,
+            engine,
+            journal,
+            ..
+        } = &mut *state
+        else {
+            return Err(RappBindingError::WrongPhase);
+        };
+        let message = ProxyOperationEngine::report_card_status(card_present);
+        let action = send_proxy(runtime, engine, journal, None, &message, false)?;
+        if action_closes_session(&action) {
+            *state = OperationBridgeState::Closed;
+            drop(state);
+        }
+        Ok(action)
+    }
+
+    /// Report authenticated progress on an active operation.
     ///
     /// # Errors
     /// [`RappBindingError`] on invalid input or the wrong protocol phase.
@@ -1287,7 +1335,7 @@ impl RappOperationBridge {
         )
     }
 
-    /// Complete an identity read (RAPP v26.10.10 section 9.1).
+    /// Complete an identity read (RAPP v26.10.18 section 9.1).
     ///
     /// Both dates are `YYYY-MM-DD`; at least one DER certificate travels.
     ///
@@ -1745,11 +1793,25 @@ fn requester_dispatch(
             error,
             remaining_retries,
             batch_signatures,
+            acknowledgment,
         } => {
             // A retired completed result reports the completed state with no
             // reason; its pruned response does not travel (section 8.2.5).
+            // The acknowledgment rides on the terminal action; a session
+            // that cannot carry it closes, and the outcome is still
+            // reported.
             let mut action =
                 RappBridgeAction::for_operation(RappBridgeActionKind::Terminal, operation_id);
+            match runtime.endpoint_mut().send(&acknowledgment) {
+                Ok(frame) => action.frame = Some(frame.into_bytes()),
+                Err(_) => {
+                    engine
+                        .session_closed(journal)
+                        .map_err(|_| RappBindingError::LocalStateFailure)?;
+                    runtime.close_session();
+                    action.close_session_after_send = true;
+                }
+            }
             action.terminal_state = Some(operation_state_name(state).to_owned());
             if status != ResultStatus::Completed {
                 action.terminal_reason = Some(RappTerminalReason::from_result(status, error));
@@ -1762,6 +1824,10 @@ fn requester_dispatch(
             RappBridgeActionKind::NoAction,
             operation_id,
         )),
+        RequesterDispatch::CardStatus { card_present } => Ok(RappBridgeAction {
+            card_present: Some(card_present),
+            ..RappBridgeAction::simple(RappBridgeActionKind::CardStatus)
+        }),
         RequesterDispatch::Progress {
             operation_id,
             event,
@@ -2120,6 +2186,14 @@ mod tests {
 
     #[test]
     fn progress_event_bridge_conversions() {
+        assert_eq!(
+            ProgressEvent::from(RappProgressEvent::ConsentShown),
+            ProgressEvent::ConsentShown
+        );
+        assert_eq!(
+            RappProgressEvent::from(ProgressEvent::ConsentShown),
+            RappProgressEvent::ConsentShown
+        );
         assert_eq!(
             ProgressEvent::from(RappProgressEvent::WaitingForCard),
             ProgressEvent::WaitingForCard

@@ -1,6 +1,6 @@
 {
   "format": "fi.refineid.rapp.routing-vectors-v1",
-  "protocol_document_version": "26.10.10",
+  "protocol_document_version": "26.10.18",
   "provenance": "Generated independently from RAPP v26.10.10 sections 2.2.1 and 4.3 and hierarchy specification section 4.3 with Python hmac/hashlib and an RFC 7748 X25519 ladder checked against RFC 7748 section 6.1, then checked against crates/rapp. The static keys and pair identifier equal those of rapp-withdrawal-v26.10.10.json; private keys, pair identifiers and nonces are fixed synthetic values.",
   "pair_keys": [
     {

@@ -6,7 +6,7 @@ use refineid_rapp::{
 };
 use serde::Deserialize;
 
-const MODEL: &str = include_str!("../../../docs/protocols/rapp-state-machine-v26.9.13.yaml");
+const MODEL: &str = include_str!("../../../docs/protocols/rapp-state-machine-v26.10.18.yaml");
 
 #[derive(Deserialize)]
 struct Model {
@@ -108,7 +108,7 @@ fn guard_is_registered(guard: &str) -> bool {
 
 #[test]
 fn formal_document_version_is_the_reviewed_revision() {
-    assert_eq!(model().document_version, "26.9.13");
+    assert_eq!(model().document_version, "26.10.18");
 }
 
 #[test]
@@ -241,6 +241,7 @@ const fn formal_action_name(action: Action) -> &'static str {
         Action::InvalidateOffer => "invalidate_offer",
         Action::CloseCandidate => "close_candidate",
         Action::StorePairRecordAtomically => "store_pair_record_atomically",
+        Action::SendPairingStored => "send_pairing_stored",
         Action::ClosePairingChannel => "close_pairing_channel",
         Action::SendPairingAbortBestEffort => "send_pairing_abort_best_effort",
         Action::DestroyCandidateKeys => "destroy_candidate_keys",
@@ -252,6 +253,8 @@ const fn formal_action_name(action: Action) -> &'static str {
         Action::ShowRevoked => "show_revoked",
         Action::SendCloseBestEffort(_) => "send_close_best_effort",
         Action::CloseSession => "close_session",
+        Action::RetainRevocationKey => "retain_revocation_key",
+        Action::RevokeUnconfirmedPairRecord => "revoke_unconfirmed_pair_record",
         Action::DestroyPairKeys => "destroy_pair_keys",
         Action::DestroyRelayTokens => "destroy_relay_tokens",
         Action::ClearPairMetadata => "clear_pair_metadata",
@@ -452,6 +455,7 @@ const PAIRING_STATES: &[(&str, PairingState)] = &[
     ("offer_active", PairingState::OfferActive),
     ("handshaking", PairingState::Handshaking),
     ("confirming", PairingState::Confirming),
+    ("storage_confirming", PairingState::StorageConfirming),
     ("paired_disconnected", PairingState::PairedDisconnected),
     ("paired_connected", PairingState::PairedConnected),
     ("revoked", PairingState::Revoked),
@@ -498,6 +502,7 @@ const PAIRING_EVENTS: &[(&str, PairingEvent)] = &[
     ),
     ("handshake_failed", PairingEvent::HandshakeFailed),
     ("both_users_confirmed", PairingEvent::BothUsersConfirmed),
+    ("peer_storage_confirmed", PairingEvent::PeerStorageConfirmed),
     (
         "denied_aborted_or_timed_out",
         PairingEvent::DeniedAbortedOrTimedOut,

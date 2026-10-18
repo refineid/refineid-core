@@ -276,6 +276,7 @@ const fn permitted_in_established_session(message: &TypedMessage) -> bool {
         TypedMessage::PairingHello(_)
             | TypedMessage::PairingConfirm(_)
             | TypedMessage::PairingAbort(_)
+            | TypedMessage::PairingStored(_)
             | TypedMessage::SessionReady(_)
     )
 }

@@ -137,9 +137,10 @@ impl RequesterOperation {
 
     /// Validate and durably retain a result.
     ///
-    /// A live completed result is held until the acknowledgment is
-    /// delivered; every other status, and a retired completed one, is
-    /// terminal at once and is never acknowledged.
+    /// Every result is acknowledged (section 8.2 item 5). A live completed
+    /// result is held until the acknowledgment is delivered; every other
+    /// status, and a retired completed one, is terminal at once and its
+    /// acknowledgment travels with the terminal outcome.
     ///
     /// # Errors
     /// [`RequesterError`] on a result that fails typed validation, a result
@@ -177,6 +178,7 @@ impl RequesterOperation {
             error: result.error,
             remaining_retries: result.remaining_retries,
             batch_signatures,
+            acknowledgment: TypedMessage::OperationResultAck(self.reference),
         })
     }
 
@@ -206,7 +208,7 @@ impl RequesterOperation {
         Ok(result)
     }
 
-    /// Receive an authenticated advisory progress update.
+    /// Receive an authenticated progress update.
     ///
     /// Progress updates do not change durable operation state or lifecycle.
     ///
@@ -302,7 +304,7 @@ impl RequesterOperation {
 pub enum RequesterResultAction {
     /// Send this exact hash acknowledgment, then call `acknowledgment_sent`.
     SendAcknowledgment(TypedMessage),
-    /// No acknowledgment is required.
+    /// The operation is terminal; send the acknowledgment it carries.
     Terminal {
         /// Journaled terminal state.
         state: OperationState,
@@ -314,11 +316,13 @@ pub enum RequesterResultAction {
         remaining_retries: Option<u8>,
         /// Signatures an interrupted batch made before it became ambiguous.
         batch_signatures: Vec<Vec<u8>>,
+        /// The exact acknowledgment of this result.
+        acknowledgment: TypedMessage,
     },
 }
 
-/// The journal state a non-acknowledged result leaves; a retired completed
-/// result has nothing left to deliver.
+/// The journal state a terminal result leaves; a retired completed result
+/// has nothing left to deliver.
 const fn result_status_state(status: ResultStatus) -> OperationState {
     match status {
         ResultStatus::Completed => OperationState::Completed,

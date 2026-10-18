@@ -17,7 +17,7 @@ use super::{
 const X25519_KEY_SIZE: usize = 32;
 
 /// Format version for encoded pairing records.
-pub const PAIR_RECORD_FORMAT_VERSION: u64 = 4;
+pub const PAIR_RECORD_FORMAT_VERSION: u64 = 5;
 
 /// Active long-term pairing material.
 ///
@@ -34,10 +34,14 @@ pub struct PairRecord {
     grants_hash: GrantsHash,
     profiles: Vec<ProfileName>,
     created_at_ms: u64,
+    storage_confirmed: bool,
 }
 
 impl PairRecord {
-    /// Constructs a validated active pairing record.
+    /// Constructs a validated pairing record whose storage the peer has
+    /// confirmed. The pairing flow builds its record unconfirmed and
+    /// confirms it only through an [`ActivePairing`](crate::ActivePairing)
+    /// (RAPP v26.10.18 section 4.3 item 4).
     ///
     /// # Errors
     /// [`PairRecordError`] on an all-zero static key or an empty profile set.
@@ -74,6 +78,7 @@ impl PairRecord {
             grants_hash,
             profiles,
             created_at_ms,
+            storage_confirmed: true,
         })
     }
 
@@ -119,6 +124,28 @@ impl PairRecord {
         self.created_at_ms
     }
 
+    /// Whether the peer confirmed that it stored its record (section 4.3
+    /// item 4). Only a confirmed record opens sessions, routes, or is
+    /// announced; an unconfirmed one found in storage was written inside a
+    /// confirmation window the endpoint did not complete, and is revoked.
+    #[must_use]
+    pub const fn is_storage_confirmed(&self) -> bool {
+        self.storage_confirmed
+    }
+
+    /// The record as the pairing flow stores it before the peer's
+    /// `pairing.stored` arrives.
+    pub(crate) const fn awaiting_storage_confirmation(mut self) -> Self {
+        self.storage_confirmed = false;
+        self
+    }
+
+    /// The record once both storage confirmations have been exchanged.
+    pub(crate) const fn storage_confirmed(mut self) -> Self {
+        self.storage_confirmed = true;
+        self
+    }
+
     /// Exposes the private key only to sibling protocol machinery and stores.
     #[must_use]
     pub fn local_static_private(&self) -> &[u8; X25519_KEY_SIZE] {
@@ -138,6 +165,7 @@ impl fmt::Debug for PairRecord {
             .field("grants_hash", &self.grants_hash)
             .field("profiles", &self.profiles)
             .field("created_at_ms", &self.created_at_ms)
+            .field("storage_confirmed", &self.storage_confirmed)
             .finish()
     }
 }
@@ -290,6 +318,10 @@ pub fn encode_pair_record(record: &PairRecord) -> Result<Vec<u8>, PairRecordCode
             "created_at_ms".to_owned(),
             WireValue::Unsigned(record.created_at_ms()),
         ),
+        (
+            "storage_confirmed".to_owned(),
+            WireValue::Bool(record.is_storage_confirmed()),
+        ),
     ]));
     encode_deterministic_cbor(&value).map_err(|_| PairRecordCodecError::ProtocolFailure)
 }
@@ -315,6 +347,7 @@ pub fn decode_pair_record(bytes: &[u8]) -> Result<PairRecord, PairRecordCodecErr
         "grants_hash",
         "profiles",
         "created_at_ms",
+        "storage_confirmed",
     ];
     if map.keys().any(|key| !expected.contains(&key.as_str())) {
         return Err(PairRecordCodecError::InvalidInput);
@@ -339,10 +372,11 @@ pub fn decode_pair_record(bytes: &[u8]) -> Result<PairRecord, PairRecordCodecErr
         .map(|name| ProfileName::parse(&name).ok_or(PairRecordCodecError::InvalidInput))
         .collect::<Result<Vec<_>, _>>()?;
     let created_at_ms = take_unsigned(&mut map, "created_at_ms")?;
+    let storage_confirmed = take_bool(&mut map, "storage_confirmed")?;
     if !map.is_empty() {
         return Err(PairRecordCodecError::InvalidInput);
     }
-    PairRecord::new(
+    let record = PairRecord::new(
         pair_id,
         role,
         local_static_private,
@@ -352,7 +386,12 @@ pub fn decode_pair_record(bytes: &[u8]) -> Result<PairRecord, PairRecordCodecErr
         profiles,
         created_at_ms,
     )
-    .map_err(PairRecordCodecError::InvalidRecord)
+    .map_err(PairRecordCodecError::InvalidRecord)?;
+    Ok(if storage_confirmed {
+        record
+    } else {
+        record.awaiting_storage_confirmation()
+    })
 }
 
 /// Serializes multiple [`PairRecord`]s to deterministic CBOR.
@@ -434,6 +473,16 @@ fn take_unsigned(
     }
 }
 
+fn take_bool(
+    map: &mut BTreeMap<String, WireValue>,
+    key: &str,
+) -> Result<bool, PairRecordCodecError> {
+    match take_value(map, key)? {
+        WireValue::Bool(value) => Ok(value),
+        _ => Err(PairRecordCodecError::InvalidInput),
+    }
+}
+
 fn take_text_array(
     map: &mut BTreeMap<String, WireValue>,
     key: &str,
@@ -494,6 +543,17 @@ mod tests {
         assert_eq!(original.grants_hash(), decoded.grants_hash());
         assert_eq!(original.profiles(), decoded.profiles());
         assert_eq!(original.created_at_ms(), decoded.created_at_ms());
+        assert!(decoded.is_storage_confirmed());
+    }
+
+    #[test]
+    fn an_unconfirmed_record_round_trips_unconfirmed() {
+        let original = test_record(0x42).awaiting_storage_confirmation();
+        assert!(!original.is_storage_confirmed());
+        let encoded = encode_pair_record(&original).expect("encode succeeds");
+        let decoded = decode_pair_record(&encoded).expect("decode succeeds");
+        assert!(!decoded.is_storage_confirmed());
+        assert!(decoded.storage_confirmed().is_storage_confirmed());
     }
 
     #[test]

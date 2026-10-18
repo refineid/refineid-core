@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Announced service withdrawal (RAPP v26.10.10 §4.5).
+//! Announced service withdrawal (RAPP v26.10.18 §4.5).
 //!
 //! A custodian that deliberately stops serving replaces its stream discovery
 //! record with a `mode=withdrawn` record. Each of its eight entries is either
@@ -63,6 +63,9 @@ const SERVICE_NAME_SUFFIXES: [&str; 4] = ["._tcp", "._udp", ".local", ".local."]
 pub enum WithdrawalError {
     /// The static agreement is the identity point.
     DegenerateAgreement,
+    /// The peer never confirmed that it stored the pairing, so it is not
+    /// announced (RAPP v26.10.18 section 4.3 item 4).
+    StorageUnconfirmed,
     /// The service instance name is empty, longer than 63 octets, or a
     /// full service name rather than its instance portion.
     InvalidInstanceName,
@@ -74,6 +77,7 @@ impl fmt::Display for WithdrawalError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::DegenerateAgreement => "static agreement is the identity point",
+            Self::StorageUnconfirmed => "the peer never confirmed storing the pairing",
             Self::InvalidInstanceName => "not the instance portion of a service instance name",
             Self::RandomUnavailable => "random source unavailable",
         })
@@ -134,9 +138,13 @@ impl WithdrawalKey {
     /// Derives the key of a stored pairing.
     ///
     /// # Errors
-    /// [`WithdrawalError::DegenerateAgreement`] when the static agreement is
-    /// the identity point.
+    /// [`WithdrawalError::StorageUnconfirmed`] for a record the peer never
+    /// confirmed, and [`WithdrawalError::DegenerateAgreement`] when the
+    /// static agreement is the identity point.
     pub fn derive(record: &PairRecord) -> Result<Self, WithdrawalError> {
+        if !record.is_storage_confirmed() {
+            return Err(WithdrawalError::StorageUnconfirmed);
+        }
         Self::from_parts(
             record.pair_id(),
             record.local_static_private(),

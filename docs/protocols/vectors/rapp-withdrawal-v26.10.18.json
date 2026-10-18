@@ -1,6 +1,6 @@
 {
   "format": "fi.refineid.rapp.withdrawal-vectors-v2",
-  "protocol_document_version": "26.10.10",
+  "protocol_document_version": "26.10.18",
   "provenance": "Generated independently from RAPP v26.10.10 section 4.5 and the session-close-body schema of section 7.1 with Python hmac/hashlib and an RFC 7748 X25519 ladder checked against RFC 7748 section 6.1, then checked against crates/rapp. Private keys, pair identifiers, instance names and fillers are fixed synthetic values.",
   "withdrawal_key": [
     {

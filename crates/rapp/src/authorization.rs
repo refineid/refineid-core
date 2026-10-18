@@ -66,7 +66,7 @@ pub struct AuthorizedSafeRead {
 /// The stage is authoritative before approval; afterwards the journal is,
 /// because only the journal survives a restart. Approval of a consequential
 /// action writes the in-flight entry before the card command exists
-/// (RAPP v26.10.10 section 8.1).
+/// (RAPP v26.10.18 section 8.1).
 #[derive(Debug)]
 pub struct AuthorizationTransaction {
     request: OperationRequest,
@@ -129,8 +129,9 @@ impl AuthorizationTransaction {
                 OperationState::AwaitingConsent
             }
             AuthorizationStage::Executing => OperationState::Executing,
-            AuthorizationStage::ResultPending => OperationState::ResultPending,
-            AuthorizationStage::Terminal => self.journal.record().state,
+            AuthorizationStage::ResultPending | AuthorizationStage::Terminal => {
+                self.journal.record().state
+            }
         }
     }
 
@@ -138,6 +139,12 @@ impl AuthorizationTransaction {
     #[must_use]
     pub const fn stage(&self) -> AuthorizationStage {
         self.stage
+    }
+
+    /// Whether the result was acknowledged and only the tombstone remains.
+    #[must_use]
+    pub const fn is_retired(&self) -> bool {
+        self.journal.record().is_retired()
     }
 
     /// Records completion of the profile's bounded, non-consequential card
@@ -196,8 +203,9 @@ impl AuthorizationTransaction {
     }
 
     /// Validate and persist a stable non-success result from any legal
-    /// pre-result stage, keeping the result so an identical retransmission
-    /// is answered without the card.
+    /// pre-result stage, keeping the result until the requester acknowledges
+    /// it (section 8.2 item 5); until then an identical retransmission is
+    /// answered with it, without the card.
     ///
     /// # Errors
     /// [`AuthorizationError`] on an invalid result, a wrong stage, or a
@@ -226,7 +234,7 @@ impl AuthorizationTransaction {
             stage => return Err(AuthorizationError::WrongStage(stage)),
         }
         self.retained_result = Some(result.clone());
-        self.stage = AuthorizationStage::Terminal;
+        self.stage = AuthorizationStage::ResultPending;
         Ok(())
     }
 
@@ -308,8 +316,8 @@ impl AuthorizationTransaction {
             .map_or(&[], |batch| batch.completed_signatures.as_slice())
     }
 
-    /// Exact retained result: a completed one while acknowledgment is
-    /// pending, or a failure that answers identical retransmissions.
+    /// Exact retained result while its acknowledgment is pending, completed
+    /// or not; it answers identical retransmissions.
     #[must_use]
     pub const fn retained_result(&self) -> Option<&OperationResultMessage> {
         self.retained_result.as_ref()
@@ -344,6 +352,11 @@ impl AuthorizationTransaction {
     /// Session loss after result send retains the encrypted result and forbids
     /// automatic command or result replay.
     ///
+    /// A completed result is marked delivery-uncertain; a failure keeps its
+    /// terminal state. Either stays retained and unacknowledged in the
+    /// result-pending stage, so the next session re-delivers it and its
+    /// acknowledgment still retires it (section 8.3).
+    ///
     /// # Errors
     /// [`AuthorizationError`] on a wrong stage or a journal failure.
     pub fn delivery_became_uncertain<S: ResultJournalStore>(
@@ -353,10 +366,11 @@ impl AuthorizationTransaction {
         if self.stage != AuthorizationStage::ResultPending {
             return Err(AuthorizationError::WrongStage(self.stage));
         }
-        self.journal
-            .mark_delivery_uncertain(store)
-            .map_err(AuthorizationError::Journal)?;
-        self.stage = AuthorizationStage::Terminal;
+        if self.journal.record().state == OperationState::ResultPending {
+            self.journal
+                .mark_delivery_uncertain(store)
+                .map_err(AuthorizationError::Journal)?;
+        }
         Ok(())
     }
 
@@ -422,7 +436,8 @@ pub enum AuthorizationStage {
     /// The in-flight entry is durable and exactly one physical command has
     /// been handed to the card adapter.
     Executing,
-    /// Completed result is durably retained until exact acknowledgment.
+    /// A result, completed or not, is durably retained until its exact
+    /// acknowledgment.
     ResultPending,
     /// Durable terminal result.
     Terminal,
@@ -500,9 +515,11 @@ impl OperationReference {
     }
 }
 
-/// Advisory progress event during credential operation processing.
+/// Progress event during credential operation processing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProgressEvent {
+    /// The consent view is on the custodian's screen (section 8.2 item 3).
+    ConsentShown,
     /// Proxy is waiting for card presentation.
     WaitingForCard,
     /// Card presentation wait has ended (card presented or removed).
@@ -516,6 +533,7 @@ impl ProgressEvent {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::ConsentShown => "consent_shown",
             Self::WaitingForCard => "waiting_for_card",
             Self::CardWaitEnded => "card_wait_ended",
             Self::Unknown => "unknown",
@@ -526,6 +544,7 @@ impl ProgressEvent {
     #[must_use]
     pub fn parse(value: &str) -> Self {
         match value {
+            "consent_shown" => Self::ConsentShown,
             "waiting_for_card" => Self::WaitingForCard,
             "card_wait_ended" => Self::CardWaitEnded,
             _ => Self::Unknown,
@@ -533,7 +552,7 @@ impl ProgressEvent {
     }
 }
 
-/// Advisory operation progress update.
+/// Operation progress update.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationProgressMessage {
     /// Operation identifier and request-hash echo.
@@ -599,6 +618,11 @@ mod tests {
 
     #[test]
     fn progress_event_round_trip() {
+        assert_eq!(
+            ProgressEvent::parse("consent_shown"),
+            ProgressEvent::ConsentShown
+        );
+        assert_eq!(ProgressEvent::ConsentShown.as_str(), "consent_shown");
         assert_eq!(
             ProgressEvent::parse("waiting_for_card"),
             ProgressEvent::WaitingForCard

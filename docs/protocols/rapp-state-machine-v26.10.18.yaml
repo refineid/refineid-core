@@ -1,7 +1,6 @@
 protocol: RAPP
-document_version: "26.9.13"
-supersedes: "26.9.7.70"
-wire_version: "26.9.13"
+document_version: "26.10.18"
+wire_version: "26.10.18"
 status: external-review
 
 semantics:
@@ -86,6 +85,7 @@ actions:
   invalidate_offer: "mark the offer permanently unusable"
   close_candidate: "close the candidate transport connection"
   store_pair_record_atomically: "store pair keys, pair_id, grants, grants_hash, and metadata in one commit"
+  send_pairing_stored: "send pairing.stored carrying the derived pair_id once the record is durably stored"
   close_pairing_channel: "close the authenticated pairing channel"
   send_pairing_abort_best_effort: "send pairing.abort if the channel is usable"
   destroy_candidate_keys: "erase unstored static and ephemeral candidate keys"
@@ -96,6 +96,8 @@ actions:
   show_connection_stopped: "expose the Connection stopped visible state"
   show_revoked: "expose the Pairing revoked visible state"
   close_session: "raise close_requested_by_pairing for the live session instance"
+  retain_revocation_key: "derive and retain the pairing's revocation key before its static keys are destroyed, so the revocation can be announced"
+  revoke_unconfirmed_pair_record: "revoke the stored record the peer never confirmed, leaving its tombstone"
   destroy_pair_keys: "erase pair static keys from the platform key store"
   destroy_relay_tokens: "erase pair-specific rendezvous tokens"
   clear_pair_metadata: "erase stored names, grants, and pair metadata"
@@ -184,11 +186,13 @@ pairing:
     - offer_active          # requester only
     - handshaking
     - confirming
+    - storage_confirming
     - paired_disconnected
     - paired_connected
     - revoked
   notes:
-    - "forget during offer, handshake, or confirmation is expressed by offer_expired_or_cancelled and denied_aborted_or_timed_out"
+    - "forget during offer, handshake, confirmation, or storage confirmation is expressed by offer_expired_or_cancelled and denied_aborted_or_timed_out"
+    - "the pairing is active only in paired_disconnected and paired_connected: a record stored in storage_confirming that the peer never confirms is revoked"
     - "peer_revocation_notice requires an authenticated channel, so it can occur only in paired_connected"
   transitions:
     - from: unpaired
@@ -239,8 +243,23 @@ pairing:
       event: both_users_confirmed
       role: both
       guard: granted_sets_equal
+      to: storage_confirming
+      actions: [store_pair_record_atomically, invalidate_offer, send_pairing_stored]
+    - from: storage_confirming
+      event: peer_storage_confirmed
+      role: both
       to: paired_disconnected
-      actions: [store_pair_record_atomically, invalidate_offer, close_pairing_channel]
+      actions: [close_pairing_channel]
+    - from: storage_confirming
+      event: denied_aborted_or_timed_out
+      role: both
+      to: unpaired
+      actions: [retain_revocation_key, revoke_unconfirmed_pair_record, destroy_pair_keys, clear_pair_metadata, close_candidate]
+    - from: storage_confirming
+      event: authenticated_protocol_violation   # the peer's pairing.stored names another pairing
+      role: both
+      to: revoked
+      actions: [retain_revocation_key, destroy_pair_keys, close_candidate, show_revoked]
     - from: confirming
       event: denied_aborted_or_timed_out
       role: both
@@ -261,30 +280,30 @@ pairing:
       role: both
       guard: local_user_action
       to: unpaired
-      actions: [destroy_pair_keys, destroy_relay_tokens, clear_pair_metadata]
+      actions: [retain_revocation_key, destroy_pair_keys, destroy_relay_tokens, clear_pair_metadata]
     - from: paired_connected
       event: forget_pairing
       role: both
       guard: local_user_action
       to: unpaired
-      actions: [close_session, destroy_pair_keys, destroy_relay_tokens, clear_pair_metadata]
+      actions: [send_close_best_effort, close_session, retain_revocation_key, destroy_pair_keys, destroy_relay_tokens, clear_pair_metadata]
     - from: paired_connected
       event: authenticated_protocol_violation
       role: both
       to: revoked
-      actions: [send_close_best_effort, close_session, destroy_pair_keys, show_revoked]
+      actions: [send_close_best_effort, close_session, retain_revocation_key, destroy_pair_keys, show_revoked]
     - from: paired_connected
       event: local_revoke
       role: both
       guard: local_user_action
       to: revoked
-      actions: [send_close_best_effort, close_session, destroy_pair_keys, show_revoked]
+      actions: [send_close_best_effort, close_session, retain_revocation_key, destroy_pair_keys, show_revoked]
     - from: paired_disconnected
       event: local_revoke
       role: both
       guard: local_user_action
       to: revoked
-      actions: [destroy_pair_keys, show_revoked]
+      actions: [retain_revocation_key, destroy_pair_keys, show_revoked]
     - from: paired_connected
       event: peer_revocation_notice     # produced by peer_close_received with reason pairing_revoked or protocol_violation
       role: both
@@ -421,7 +440,7 @@ session:
       event: credential_rejected        # produced by operation action request_session_close_credential_rejected
       role: proxy
       to: closing
-      actions: [destroy_pair_keys, show_revoked, send_close_best_effort, show_disconnecting]
+      actions: [retain_revocation_key, destroy_pair_keys, show_revoked, send_close_best_effort, show_disconnecting]
     - from: [healthy, checking]
       event: card_completion_ambiguous
       role: proxy
@@ -667,37 +686,37 @@ operation:
       role: requester
       guard: profile_has_no_consequential_command
       to: completed
-      actions: [send_result_ack, journal_completed]
+      actions: [retain_result_under_local_storage, send_result_ack, journal_completed]
     - from: [requested, prepared]
       event: result_denied_received
       role: requester
       to: denied
-      actions: [journal_denied]
+      actions: [journal_denied, send_result_ack]
     - from: [requested, prepared, committed]
       event: result_cancelled_received
       role: requester
       to: cancelled
-      actions: [journal_cancelled]
+      actions: [journal_cancelled, send_result_ack]
     - from: [requested, prepared, committed]
       event: result_rejected_received
       role: requester
       to: rejected
-      actions: [journal_rejected]
+      actions: [journal_rejected, send_result_ack]
     - from: [requested, prepared, committed]
       event: result_credential_rejected_received
       role: requester
       to: credential_rejected
-      actions: [journal_credential_rejected, revoke_pair_after_credential_rejection]
+      actions: [journal_credential_rejected, send_result_ack, revoke_pair_after_credential_rejection]
     - from: committed
       event: result_completed_received
       role: requester
       to: completed
-      actions: [send_result_ack, journal_completed]
+      actions: [retain_result_under_local_storage, send_result_ack, journal_completed]
     - from: committed
       event: result_ambiguous_received
       role: requester
       to: ambiguous
-      actions: [journal_ambiguous, prohibit_retry]
+      actions: [journal_ambiguous, send_result_ack, prohibit_retry]
     - from: committed
       event: session_closed_post_commit # produced by rule X-03
       role: requester

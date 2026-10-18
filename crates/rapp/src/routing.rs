@@ -14,7 +14,7 @@
 
 //! How a stored pairing finds its peer without naming itself on the wire:
 //! rotating discovery hints (hierarchy specification §4.3) and per-dial
-//! session routing tags (RAPP v26.10.10 §2.2.1).
+//! session routing tags (RAPP v26.10.18 §2.2.1).
 //!
 //! Both are keyed by the pairing's static X25519 agreement, which only the
 //! two endpoints know. A discovery hint changes every 15 minutes and a
@@ -27,11 +27,12 @@ use subtle::{ConditionallySelectable, ConstantTimeEq};
 use zeroize::Zeroizing;
 
 use super::txt::{
-    AnnouncementCandidate, MODE_KEY, VERSION, VERSION_KEY, decode_list, encode_list,
+    AnnouncementCandidate, MODE_KEY, REVOKED_KEY, VERSION, VERSION_KEY, decode_list, encode_list,
     most_recently_used, values,
 };
 use super::{
-    DegenerateAgreement, PAIR_KEY_SIZE, PairId, PairRecord, TransportProfile, X25519_KEY_SIZE,
+    DegenerateAgreement, PAIR_KEY_SIZE, PairId, PairRecord, REVOKED_ANNOUNCEMENT_ENTRIES,
+    RevokedAnnouncement, TransportProfile, X25519_KEY_SIZE,
 };
 
 /// Byte length of one published discovery hint.
@@ -83,17 +84,23 @@ impl core::fmt::Debug for DiscoveryKey {
 }
 
 impl DiscoveryKey {
-    /// Derives the key of a stored pairing.
+    /// Derives the key of a stored pairing. A pairing the peer never
+    /// confirmed storing is not announced (RAPP v26.10.18 section 4.3
+    /// item 4).
     ///
     /// # Errors
-    /// [`DegenerateAgreement`] when the static agreement is the identity
-    /// point.
-    pub fn derive(record: &PairRecord) -> Result<Self, DegenerateAgreement> {
+    /// [`RecordKeyError`] when the record is unconfirmed or its static
+    /// agreement is the identity point.
+    pub fn derive(record: &PairRecord) -> Result<Self, RecordKeyError> {
+        if !record.is_storage_confirmed() {
+            return Err(RecordKeyError::StorageUnconfirmed);
+        }
         Self::from_parts(
             record.pair_id(),
             record.local_static_private(),
             record.remote_static_public(),
         )
+        .map_err(RecordKeyError::DegenerateAgreement)
     }
 
     /// Derives `K_disc = HKDF-SHA-256(salt = pair_id, IKM = X25519(local
@@ -150,45 +157,57 @@ impl DiscoveryKey {
     }
 }
 
-/// A well-formed `mode=session` record and the discovery hints it carries,
-/// possibly none (hierarchy specification §4.3).
+/// A well-formed `mode=session` record: the discovery hints it carries,
+/// possibly none (hierarchy specification §4.3), and its revocation
+/// announcement when it has one (RAPP v26.10.18 §4.6).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DiscoveryRecord {
     hints: Vec<[u8; DISCOVERY_HINT_SIZE]>,
+    revoked: Option<RevokedAnnouncement>,
 }
 
 /// Why a TXT record is not a well-formed `mode=session` record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DiscoveryRecordError {
-    /// A key other than `v`, `mode` and `hints`, or a repeated key; keys
-    /// compare case-insensitively.
+    /// A key other than `v`, `mode`, `hints` and `revoked`, or a repeated
+    /// key; keys compare case-insensitively.
     UnexpectedKey,
     /// `v` or `mode` is missing or has another value.
     WrongHeader,
     /// The hint list is not one to four lowercase 16-digit hexadecimal
     /// entries.
     MalformedHints,
+    /// The revocation announcement is not exactly eight lowercase 16-digit
+    /// hexadecimal entries.
+    MalformedRevocations,
 }
 
 impl DiscoveryRecord {
     /// A record announcing the hints of the four most recently used
-    /// pairings among `candidates`; pairings beyond the fourth are not
-    /// announced.
+    /// pairings among `candidates`, pairings beyond the fourth not
+    /// announced, and carrying `revoked` when the custodian has a
+    /// revocation to announce.
     #[must_use]
-    pub fn assemble(candidates: &[AnnouncementCandidate]) -> Self {
+    pub fn assemble(
+        candidates: &[AnnouncementCandidate],
+        revoked: Option<RevokedAnnouncement>,
+    ) -> Self {
         Self {
             hints: most_recently_used(candidates, MAX_DISCOVERY_HINTS),
+            revoked,
         }
     }
 
     /// Parses the TXT key/value pairs of a discovered record.
     ///
     /// # Errors
-    /// [`DiscoveryRecordError`] for anything but `v=1`, `mode=session` and an
-    /// optional `hints=` of one to four lowercase entries.
+    /// [`DiscoveryRecordError`] for anything but `v=1`, `mode=session`, an
+    /// optional `hints=` of one to four lowercase entries, and an optional
+    /// `revoked=` of exactly eight.
     pub fn parse(entries: &[(&str, &str)]) -> Result<Self, DiscoveryRecordError> {
-        let [version, mode, hints] = values(entries, [VERSION_KEY, MODE_KEY, TXT_HINTS_KEY])
-            .ok_or(DiscoveryRecordError::UnexpectedKey)?;
+        let [version, mode, hints, revoked] =
+            values(entries, [VERSION_KEY, MODE_KEY, TXT_HINTS_KEY, REVOKED_KEY])
+                .ok_or(DiscoveryRecordError::UnexpectedKey)?;
         if version != Some(VERSION) || mode != Some(TXT_MODE_SESSION) {
             return Err(DiscoveryRecordError::WrongHeader);
         }
@@ -197,11 +216,20 @@ impl DiscoveryRecord {
             Some(list) => decode_list(list, MAX_DISCOVERY_HINTS)
                 .ok_or(DiscoveryRecordError::MalformedHints)?,
         };
-        Ok(Self { hints })
+        let revoked = match revoked {
+            None => None,
+            Some(list) => Some(
+                decode_list(list, REVOKED_ANNOUNCEMENT_ENTRIES)
+                    .and_then(|entries| <[_; REVOKED_ANNOUNCEMENT_ENTRIES]>::try_from(entries).ok())
+                    .map(RevokedAnnouncement::from_entries)
+                    .ok_or(DiscoveryRecordError::MalformedRevocations)?,
+            ),
+        };
+        Ok(Self { hints, revoked })
     }
 
     /// The record's TXT key/value pairs, in publication order; `hints` only
-    /// when there are hints.
+    /// when there are hints, `revoked` only when there is an announcement.
     #[must_use]
     pub fn txt_entries(&self) -> Vec<(&'static str, String)> {
         let mut entries = vec![
@@ -211,6 +239,9 @@ impl DiscoveryRecord {
         if !self.hints.is_empty() {
             entries.push((TXT_HINTS_KEY, encode_list(&self.hints)));
         }
+        if let Some(revoked) = &self.revoked {
+            entries.push((REVOKED_KEY, encode_list(revoked.entries())));
+        }
         entries
     }
 
@@ -218,6 +249,13 @@ impl DiscoveryRecord {
     #[must_use]
     pub fn hints(&self) -> &[[u8; DISCOVERY_HINT_SIZE]] {
         &self.hints
+    }
+
+    /// The revocation announcement's eight entries, when the record carries
+    /// one.
+    #[must_use]
+    pub fn revoked(&self) -> Option<&[[u8; DISCOVERY_HINT_SIZE]; REVOKED_ANNOUNCEMENT_ENTRIES]> {
+        self.revoked.as_ref().map(RevokedAnnouncement::entries)
     }
 }
 
@@ -231,17 +269,23 @@ impl core::fmt::Debug for RoutingKey {
 }
 
 impl RoutingKey {
-    /// Derives the key of a stored pairing.
+    /// Derives the key of a stored pairing. A pairing the peer never
+    /// confirmed storing neither routes nor dials (RAPP v26.10.18 section
+    /// 4.3 item 4).
     ///
     /// # Errors
-    /// [`DegenerateAgreement`] when the static agreement is the identity
-    /// point.
-    pub fn derive(record: &PairRecord) -> Result<Self, DegenerateAgreement> {
+    /// [`RecordKeyError`] when the record is unconfirmed or its static
+    /// agreement is the identity point.
+    pub fn derive(record: &PairRecord) -> Result<Self, RecordKeyError> {
+        if !record.is_storage_confirmed() {
+            return Err(RecordKeyError::StorageUnconfirmed);
+        }
         Self::from_parts(
             record.pair_id(),
             record.local_static_private(),
             record.remote_static_public(),
         )
+        .map_err(RecordKeyError::DegenerateAgreement)
     }
 
     /// Derives `K_route = HKDF-SHA-256(salt = pair_id, IKM = X25519(local
@@ -305,6 +349,31 @@ impl RoutingKey {
 /// The platform random source failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RandomUnavailable;
+
+/// Why a stored record yields no routing or discovery key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecordKeyError {
+    /// The static agreement is the identity point.
+    DegenerateAgreement(DegenerateAgreement),
+    /// The peer never confirmed that it stored the pairing (RAPP v26.10.18
+    /// section 4.3 item 4).
+    StorageUnconfirmed,
+}
+
+impl core::fmt::Display for RecordKeyError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::DegenerateAgreement(_) => {
+                formatter.write_str("static agreement is the identity point")
+            }
+            Self::StorageUnconfirmed => {
+                formatter.write_str("the peer never confirmed storing the pairing")
+            }
+        }
+    }
+}
+
+impl core::error::Error for RecordKeyError {}
 
 /// The routing value of a `"session"` preamble: a fresh nonce and the tag
 /// it keys. Public bytes; only the two endpoints can tell whose it is.
@@ -515,10 +584,13 @@ mod tests {
             &public(FIRST_PRIVATE),
         )
         .expect("key");
-        let record = DiscoveryRecord::assemble(&[AnnouncementCandidate {
-            hint: custodian.hint(EPOCH),
-            last_used_ms: EPOCH,
-        }]);
+        let record = DiscoveryRecord::assemble(
+            &[AnnouncementCandidate {
+                hint: custodian.hint(EPOCH),
+                last_used_ms: EPOCH,
+            }],
+            None,
+        );
         let entries: Vec<(String, String)> = record
             .txt_entries()
             .into_iter()

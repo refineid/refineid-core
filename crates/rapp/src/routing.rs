@@ -14,7 +14,7 @@
 
 //! How a stored pairing finds its peer without naming itself on the wire:
 //! rotating discovery hints (hierarchy specification §4.3) and per-dial
-//! session routing tags (RAPP v26.10.10 §2.2.1).
+//! session routing tags (RAPP v26.10.18 §2.2.1).
 //!
 //! Both are keyed by the pairing's static X25519 agreement, which only the
 //! two endpoints know. A discovery hint changes every 15 minutes and a

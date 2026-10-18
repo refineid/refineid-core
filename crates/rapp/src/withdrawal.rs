@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Announced service withdrawal (RAPP v26.10.10 §4.5).
+//! Announced service withdrawal (RAPP v26.10.18 §4.5).
 //!
 //! A custodian that deliberately stops serving replaces its stream discovery
 //! record with a `mode=withdrawn` record. Each of its eight entries is either

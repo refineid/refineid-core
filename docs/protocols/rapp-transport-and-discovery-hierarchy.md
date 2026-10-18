@@ -48,8 +48,8 @@ This specification defines the normative **3-Tier Discovery and Transport Hierar
 │                                                                        │
 │  • First-Class Workstations: refineid-unix, refineid-windows, apple    │
 │  • Default State: Pure Local Card Reader (PC/SC via CCID / slot)       │
-│  • UX Hygiene: "Remote Phone Reader" MUST be explicitly turned ON      │
-│  • Discovery: Browses mDNS / BLE only when remote reader is enabled    │
+│  • UX Hygiene: a phone is used only once paired by its code            │
+│  • Discovery: Browses mDNS / BLE only while a pairing exists           │
 │  • Network Role: Outbound Client Only (connects to Custodian)          │
 └────────────────────────────────────────────────────────────────────────┘
 ```
@@ -165,7 +165,7 @@ The Custodian publishes three distinct discovery modes:
      v=1
      mode=session
      ```
-     No pairing values, hashes, or hints are published. Requesters on the local subnet with "Enable Remote Phone Reader" active connect to the advertised endpoint and present a fresh session routing preamble inside the point-to-point stream in `Phase::Routing` (RAPP v26.10.18 §2.2.1). If no stored pairing keyed its tag, the TCP connection is immediately closed.
+     No pairing values, hashes, or hints are published. Requesters on the local subnet that hold a usable pairing connect to the advertised endpoint and present a fresh session routing preamble inside the point-to-point stream in `Phase::Routing` (RAPP v26.10.18 §2.2.1). If no stored pairing keyed its tag, the TCP connection is immediately closed.
    - **Optional Rotating Discovery Hints (Multi-Device Coexistence)**:
      To avoid trial connections in high-density enterprise environments with multiple active Custodians, the Custodian MAY publish truncated, rotating HMAC hints for the 4 most recently used stored pairings (use time and tie order as for withdrawn records, RAPP v26.10.18 §4.5):
      $$\text{hint}_i = \text{first 8 bytes of }\text{HMAC-SHA-256}(K_{\text{disc}, i}, \text{epoch\_be64})$$
@@ -200,17 +200,13 @@ To maintain clean, unobtrusive operation on enterprise and personal workstations
 - The application monitors local PC/SC smart card readers (integrated laptop slots, USB CCID readers via `pcscd` or `winscard`).
 - Background radio scanning, mDNS service browsing, and network polling **MUST NOT** run by default.
 
-### 5.2 Explicit Remote Phone Reader Opt-In
-- Workstations MUST provide an explicit user setting:
-  ```
-  [ ] Enable Remote Phone Reader
-      Allow discovering and using your phone as a wireless card reader.
-  ```
-- Only when this setting is enabled:
+### 5.2 Pairing Is the Opt-In
+- The user's decision to use a phone as a card reader is the pairing itself: typing the code the phone shows (RAPP §3) pairs the workstation with that phone, and forgetting a pairing withdraws the decision for it. Workstations MUST NOT present a separate switch for the remote reader.
+- Only while at least one usable stored pairing exists:
   1. The Requester activates Tier 2 (BLE scanner) and/or Tier 3 (mDNS browser).
-  2. Discovered Custodians configured for remote use appear in the reader selection list.
-  3. Outbound connections are established on-demand when the card is consulted.
-- Disabling the setting immediately halts background scanners, closes any idle outbound sockets, and purges transient discovery caches.
+  2. Paired Custodians appear in the reader selection list when discovered.
+  3. Outbound connections are established on demand when the card is consulted or, under the offering rule (RAPP §8.4), held while an identity is offered.
+- Forgetting the last pairing immediately halts background scanners, closes any idle outbound sockets, and purges transient discovery caches.
 
 ---
 

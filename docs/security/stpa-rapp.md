@@ -569,13 +569,15 @@ while the card lies on the phone.
 | ID | Controller | Control action | Type | Context | Hazard |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | UCA-32 | Preparation | Discard the entered PIN | P | When the attempt ended for a reason the PIN had no part in: no tap came, the field dropped, PACE lost the transport, or the attempt timed out; the next attempt asks again for a PIN the system never tested. | H-5 |
-| UCA-33 | Dialog | Report "card not found" | P | When no card answered at all, so the person is told a card is missing while holding it against the phone, and nothing says what to change. | H-5 |
+| UCA-33 | Dialog | End the attempt and offer Retry | P | When no card answered at all, so the person is told a card is missing while holding it against the phone, nothing says what to change, and Retry starts from the credentials step rather than from the tap. | H-5 |
 | UCA-34 | Preparation | Time out the attempt | T | Too early against the person's handling of the card, so a slow tap becomes a failure whose Retry asks the PIN again. | H-5 |
-| UCA-35 | Backend | Classify a field loss during the PIN command as card unavailable | P | When the command may have reached the card, so a try may have been counted and the person is not told the count. | H-5 |
-| UCA-36 | Dialog | Ask for PIN 1 again after a wrong PIN | N | Without the tries left, so the person cannot judge whether to continue or stop. | H-5 |
+| UCA-35 | Backend | Verify PIN 1 | P | Again with the held PIN after a field loss left the last command's outcome unknown, without reading the tries left first, so a wrong PIN the card did count is sent once more and the person never saw the count fall. | H-5 |
+| UCA-36 | Preparation | Ask for PIN 1 again after a wrong PIN | P | Without the tries left shown, so the person cannot judge whether to continue or stop. | H-5 |
 | UCA-37 | Reader controller | Keep reader mode armed | N | After the activity paused or the OS dropped reader mode, so the dialog waits for a tap that cannot arrive and says only "hold the card". | H-5 |
-| UCA-38 | Custodian | Show a computer's prompt | P | While the person is inside the local preparation dialog, so two PIN prompts compete and a PIN typed for one lands in the other. | H-1, H-5 |
+| UCA-38 | Remote dialog | Show a computer's request and ask its PIN | P | While the person is inside the local preparation dialog, so two PIN prompts compete and a PIN typed for one lands in the other. | H-1, H-5 |
 | UCA-39 | Custodian | Report the card present to a computer | P | From the last tag event when the field has since dropped, so the computer offers an identity the phone cannot serve. UCA-13 and R-8 state this for priming; this is the live-tag case. | H-3 |
+| UCA-40 | Backend | Connect: PACE with the CAN | P | Again with a CAN the card already rejected, without a new entry, so the attempt fails the same way at every tap and the person is told the card is missing. | H-5 |
+| UCA-41 | Preparation | Retain the verified PIN | P | After the purpose ended, or for a card other than the one that verified it, so a later operation runs under a PIN meant for another moment or another card, and a wrong one costs a try. | H-1, H-5 |
 
 ### 11.4 Loss scenarios
 
@@ -595,10 +597,12 @@ cycle. L-3 is immediate, and L-2 is two slips away.
 **The unknown count (UCA-35).** The PIN command leaves the phone and the
 field drops before the status word returns. The card may have verified
 the PIN, counted a wrong one, or never received it. The application
-reports contact lost, and the next attempt sends the PIN again. With
-the right PIN the card's counter resets, so nothing is lost; with a
-wrong one the person is one try nearer to lockout than the last count
-they saw, and nothing on the screen says so.
+classifies the loss as a missing card, which is a belief, not a fact,
+and the next attempt sends the held PIN again. With the right PIN the
+card's counter resets, so nothing is lost; with a wrong one the person
+is one try nearer to lockout than the last count they saw, and nothing
+on the screen says so. The card reports its tries left without
+counting one, so the count can be read before the PIN is sent.
 
 **Two prompts (UCA-38).** A computer sends a request while the person is
 in the middle of taking the card into use. The remote dialog appears
@@ -619,14 +623,16 @@ the PIN again. Every component acted as built; the dialog's model of
 
 | ID | Requirement | Closes |
 | :--- | :--- | :--- |
-| R-30 | The entered PIN lives for the whole preparation: an attempt that ends without an answer from the card (no tap, field lost, PACE transport lost, timeout) returns to waiting for the card with the PIN held, and the reader is re-armed. PIN 1 is asked again only when the card rejected it, when the person cancels or leaves the dialog, or when the purpose ends. The PIN is zeroed when the dialog ends. | UCA-32 |
-| R-31 | A tap that did not happen is not a failure: the dialog keeps waiting with the hold-card text. "Card not found" is reserved for a card that answered and was not a supported card. | UCA-33 |
-| R-32 | The attempt's timeout is measured from the last reader status change, not from the PIN entry, and its expiry returns to waiting with the PIN held, never to the credentials step. | UCA-34 |
-| R-33 | A field loss during the PIN command is reported as contact lost during the PIN check, and the next attempt reads the tries left before sending the PIN, which the card reports without counting a try. | UCA-35 |
+| R-30 | The entered PIN lives for the whole preparation: an attempt that ends without an answer from the card (no tap, field lost, PACE transport lost) returns to waiting for the card with the PIN held, and the reader is re-armed. PIN 1 is asked again when the card rejected it, when the tries left read after an unknown outcome are fewer than the last count (R-33), when the person cancels or leaves the dialog, or when the purpose ends. The PIN is zeroed when the dialog ends. | UCA-32 |
+| R-31 | A tap that did not happen is not a failure: the dialog keeps waiting with the hold-card text. A card that answered and is not a supported card is reported as not supported; "card not found" is shown for nothing. Retry, where it is offered, starts from the tap, not from the credentials. | UCA-33 |
+| R-32 | The attempt's timeout is measured from the last reader status change, not from the PIN entry; its expiry ends the attempt and offers Retry with the PIN still held. The dialog itself ends, zeroing the PIN, when the person cancels, when the application leaves the foreground, or after an idle limit. | UCA-34 |
+| R-33 | A field loss during the PIN command is reported as contact lost during the PIN check. The next attempt reads the tries left before sending the PIN, which the card reports without counting a try; a count lower than the last one the card reported means the PIN was counted wrong, so the held PIN is not sent, the count is shown and the PIN is asked again. | UCA-35 |
 | R-34 | Every PIN prompt shows the tries left whenever the card has told them. | UCA-36 |
 | R-35 | While a local preparation dialog is open, a computer's request waits behind it with a line saying a computer is waiting, and the request's own deadline is honoured; one PIN prompt is on screen at a time. | UCA-38 |
 | R-36 | The reader controller re-arms reader mode when the activity resumes and tells the dialog when reader mode is not active; the dialog says so instead of waiting. | UCA-37 |
 | R-37 | `card.status` reports the card present only while the tag answers, and a dropped field reports absent at once, as R-8 and R-16 say for the Apple custodian. | UCA-39 |
+| R-38 | A CAN the card rejected is asked again before the next PACE; the backend never repeats PACE with a CAN that failed. | UCA-40 |
+| R-39 | The retained PIN is bound to the card that verified it, by the identity read in the same session, and to its purpose: a different card asks again, and the end of the purpose zeroes it. | UCA-41 |
 
 ## 12. Open questions
 

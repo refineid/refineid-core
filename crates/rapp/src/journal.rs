@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{OperationId, OperationResultMessage, OperationState, PairId, RequestHash, SessionId};
+use super::{
+    OperationId, OperationReference, OperationResultMessage, OperationState, PairId, RequestHash,
+    ResultError, ResultStatus, SessionId,
+};
 
 /// Per-document progress of a `batch_sign_documents` operation (sections
 /// 8.1 and 9.3).
@@ -46,6 +49,60 @@ pub struct JournalRecord {
     pub automatic_retry_permitted: bool,
     /// Progress of a batch; `None` for every other operation.
     pub batch: Option<BatchProgress>,
+    /// The requester acknowledged a result that was not a live completed
+    /// one; a completed result's acknowledgment is the `Completed` state.
+    pub acknowledged: bool,
+    /// The registered error a terminal failure named, preserved for the
+    /// retired answer (section 8.2 item 5).
+    pub terminal_error: Option<ResultError>,
+}
+
+impl JournalRecord {
+    /// Whether the result was acknowledged and only the tombstone remains.
+    #[must_use]
+    pub const fn is_retired(&self) -> bool {
+        matches!(self.state, OperationState::Completed) || self.acknowledged
+    }
+
+    /// The `operation-status-val` the record's terminal state reads as.
+    #[must_use]
+    pub const fn terminal_status(&self) -> Option<ResultStatus> {
+        match self.state {
+            OperationState::Completed => Some(ResultStatus::Completed),
+            OperationState::Cancelled => Some(ResultStatus::Cancelled),
+            OperationState::Denied | OperationState::Rejected => Some(ResultStatus::Rejected),
+            OperationState::CredentialRejected => Some(ResultStatus::CredentialRejected),
+            OperationState::Ambiguous => Some(ResultStatus::Ambiguous),
+            OperationState::None
+            | OperationState::Requested
+            | OperationState::AwaitingConsent
+            | OperationState::Prepared
+            | OperationState::Committed
+            | OperationState::Executing
+            | OperationState::ResultPending
+            | OperationState::DeliveryUncertain => None,
+        }
+    }
+
+    /// The result a retired record answers a retransmission with: the
+    /// preserved disposition and error, no response (section 8.2 item 5).
+    #[must_use]
+    pub const fn retired_answer(&self) -> Option<OperationResultMessage> {
+        if !self.is_retired() {
+            return None;
+        }
+        let Some(status) = self.terminal_status() else {
+            return None;
+        };
+        Some(OperationResultMessage::retired(
+            OperationReference {
+                operation_id: self.operation_id,
+                request_hash: self.request_hash,
+            },
+            status,
+            self.terminal_error,
+        ))
+    }
 }
 
 /// Adapter boundary for durable write-ahead operation records.
@@ -153,6 +210,8 @@ impl OperationJournal {
                 transmission_count: 0,
                 automatic_retry_permitted: false,
                 batch: None,
+                acknowledged: false,
+                terminal_error: None,
             },
         }
     }
@@ -276,6 +335,7 @@ impl OperationJournal {
         let mut next = self.record.clone();
         next.state = state;
         next.automatic_retry_permitted = false;
+        next.terminal_error = result.error;
         store
             .persist_result(&next, result)
             .map_err(JournalError::Persistence)?;
@@ -311,8 +371,9 @@ impl OperationJournal {
     /// Persist exact result acknowledgment and erase the retained body,
     /// leaving the durable tombstone (section 8.2.5).
     ///
-    /// A result whose delivery became uncertain is still acknowledgeable once
-    /// it is delivered again.
+    /// A completed result becomes the `Completed` state; a failure keeps its
+    /// terminal state and is marked acknowledged. A result whose delivery
+    /// became uncertain is still acknowledgeable once it is delivered again.
     ///
     /// # Errors
     /// [`JournalError`] on an illegal state or a persistence failure.
@@ -320,16 +381,16 @@ impl OperationJournal {
         &mut self,
         store: &mut S,
     ) -> Result<(), JournalError<S::Error>> {
-        if !matches!(
-            self.record.state,
-            OperationState::ResultPending | OperationState::DeliveryUncertain
-        ) {
-            return Err(JournalError::InvalidState {
-                state: self.record.state,
-            });
-        }
         let mut next = self.record.clone();
-        next.state = OperationState::Completed;
+        match self.record.state {
+            OperationState::ResultPending | OperationState::DeliveryUncertain => {
+                next.state = OperationState::Completed;
+            }
+            state if is_unacknowledged_terminal(state) && !self.record.acknowledged => {
+                next.acknowledged = true;
+            }
+            state => return Err(JournalError::InvalidState { state }),
+        }
         next.automatic_retry_permitted = false;
         store
             .acknowledge_result(&next)
@@ -448,8 +509,11 @@ impl<C> PendingCardCommand<C> {
 
 #[cfg(test)]
 mod tests {
-    use super::{JournalRecord, JournalStore, OperationJournal};
-    use crate::{OperationId, OperationState, PairId, RequestHash, SessionId};
+    use super::{JournalRecord, JournalStore, OperationJournal, ResultJournalStore};
+    use crate::{
+        OperationId, OperationReference, OperationResultMessage, OperationState, PairId,
+        ProxyFailure, RequestHash, ResultError, ResultStatus, SessionId,
+    };
 
     #[derive(Default)]
     struct MemoryStore(Vec<JournalRecord>);
@@ -460,6 +524,24 @@ mod tests {
         fn persist(&mut self, record: &JournalRecord) -> Result<(), Self::Error> {
             self.0.push(record.clone());
             Ok(())
+        }
+    }
+
+    impl ResultJournalStore for MemoryStore {
+        fn persist_result(
+            &mut self,
+            record: &JournalRecord,
+            _result: &OperationResultMessage,
+        ) -> Result<(), Self::Error> {
+            self.persist(record)
+        }
+
+        fn retain_uncertain_result(&mut self, record: &JournalRecord) -> Result<(), Self::Error> {
+            self.persist(record)
+        }
+
+        fn acknowledge_result(&mut self, record: &JournalRecord) -> Result<(), Self::Error> {
+            self.persist(record)
         }
     }
 
@@ -515,6 +597,37 @@ mod tests {
                 .is_err()
         );
         assert_eq!(store.0.len(), 1);
+    }
+
+    #[test]
+    fn an_acknowledged_failure_keeps_its_state_and_answers_retired() {
+        let mut journal = journal();
+        let mut store = MemoryStore::default();
+        let reference = OperationReference {
+            operation_id: OperationId::from_array([3; 16]),
+            request_hash: RequestHash::from_array([4; 32]),
+        };
+        let result = OperationResultMessage::failure(reference, ProxyFailure::UserDenied);
+        journal
+            .finish_failure(&mut store, OperationState::Rejected, &result)
+            .expect("the denial is journaled");
+        assert!(!journal.record().is_retired());
+        assert_eq!(journal.record().retired_answer(), None);
+
+        journal
+            .acknowledge_result(&mut store)
+            .expect("the acknowledgment retires the failure");
+        assert_eq!(journal.record().state, OperationState::Rejected);
+        assert!(journal.record().acknowledged);
+        assert!(journal.record().is_retired());
+        let answer = journal
+            .record()
+            .retired_answer()
+            .expect("a retired failure has an answer");
+        assert!(answer.retired);
+        assert_eq!(answer.status, ResultStatus::Rejected);
+        assert_eq!(answer.error, Some(ResultError::UserCancelled));
+        assert!(journal.acknowledge_result(&mut store).is_err());
     }
 
     #[test]

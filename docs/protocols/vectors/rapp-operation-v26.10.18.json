@@ -1,7 +1,7 @@
 {
   "format": "fi.refineid.rapp.operation-vectors-v1",
-  "protocol_document_version": "26.10.10",
-  "provenance": "Encoded with an independent deterministic CBOR encoder from the RAPP v26.10.10 CDDL (sections 7.1, 8.2.1, 9 and 10.4). Error messages are informative text, not normative; the reference implementations send these exact strings.",
+  "protocol_document_version": "26.10.18",
+  "provenance": "Encoded with an independent deterministic CBOR encoder from the RAPP v26.10.18 CDDL (sections 7.1, 8.2.1, 9 and 10.4). Error messages are informative text, not normative; the reference implementations send these exact strings.",
   "fixed_inputs": {
     "operation_id_request": "11111111111111111111111111111111",
     "operation_id_reference": "22222222222222222222222222222222",
@@ -221,6 +221,31 @@
       "name": "result-ambiguous-batch-partial",
       "message_type": "OperationResult",
       "body_hex": "a5656572726f726a636172645f6572726f726673746174757369616d626967756f757368726573706f6e7365a26f636f6d706c657465645f636f756e740174636f6d706c657465645f7369676e617475726573815840eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee6c6f7065726174696f6e5f696450222222222222222222222222222222226c726571756573745f6861736858203333333333333333333333333333333333333333333333333333333333333333"
+    },
+    {
+      "name": "pairing-stored",
+      "message_type": "PairingStored",
+      "body_hex": "a167706169725f696450aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "name": "card-status-present",
+      "message_type": "CardStatus",
+      "body_hex": "a16c636172645f70726573656e74f5"
+    },
+    {
+      "name": "card-status-absent",
+      "message_type": "CardStatus",
+      "body_hex": "a16c636172645f70726573656e74f4"
+    },
+    {
+      "name": "progress-consent-shown",
+      "message_type": "OperationProgress",
+      "body_hex": "a3656576656e746d636f6e73656e745f73686f776e6c6f7065726174696f6e5f696450222222222222222222222222222222226c726571756573745f6861736858203333333333333333333333333333333333333333333333333333333333333333"
+    },
+    {
+      "name": "progress-waiting-for-card",
+      "message_type": "OperationProgress",
+      "body_hex": "a3656576656e747077616974696e675f666f725f636172646c6f7065726174696f6e5f696450222222222222222222222222222222226c726571756573745f6861736858203333333333333333333333333333333333333333333333333333333333333333"
     }
   ]
 }

@@ -247,7 +247,8 @@ pub enum OperationEvent {
     RequestInvalidOrUnsupported,
     /// Peer cancellation arrived.
     CancelReceived,
-    /// Local monotonic request expiry elapsed.
+    /// The request's expiry elapsed on the continuous clock, which advances
+    /// through suspension.
     RequestExpired,
     /// Human authorizer denied the operation.
     UserDenied,
@@ -418,7 +419,7 @@ pub enum Action {
     PersistTerminalSessionRecord,
     /// Validate request schema, hash, expiry, and context.
     ValidateSchemaHashExpiryAndContext,
-    /// Start the operation's monotonic expiry clock.
+    /// Start the operation's expiry on the continuous clock.
     StartExpiryClock,
     /// Begin the profile's safe prerequisite reads.
     BeginSafePrerequisiteReads,
@@ -1219,7 +1220,7 @@ impl OperationState {
                 EndpointRole::Requester,
             ) => Transition {
                 state: Self::Denied,
-                actions: &[A::JournalDenied],
+                actions: &[A::SendResultAck, A::JournalDenied],
             },
             (
                 Self::Requested | Self::Prepared | Self::Committed,
@@ -1227,7 +1228,7 @@ impl OperationState {
                 EndpointRole::Requester,
             ) => Transition {
                 state: Self::Cancelled,
-                actions: &[A::JournalCancelled],
+                actions: &[A::SendResultAck, A::JournalCancelled],
             },
             (
                 Self::Requested | Self::Prepared | Self::Committed,
@@ -1235,7 +1236,7 @@ impl OperationState {
                 EndpointRole::Requester,
             ) => Transition {
                 state: Self::Rejected,
-                actions: &[A::JournalRejected],
+                actions: &[A::SendResultAck, A::JournalRejected],
             },
             (
                 Self::Requested | Self::Prepared | Self::Committed,
@@ -1244,6 +1245,7 @@ impl OperationState {
             ) => Transition {
                 state: Self::CredentialRejected,
                 actions: &[
+                    A::SendResultAck,
                     A::JournalCredentialRejected,
                     A::RevokePairAfterCredentialRejection,
                 ],
@@ -1252,11 +1254,11 @@ impl OperationState {
                 state: Self::Completed,
                 actions: &[A::SendResultAck, A::JournalCompleted],
             },
-            (
-                Self::Committed,
-                E::ResultAmbiguousReceived | E::SessionClosedPostCommit,
-                EndpointRole::Requester,
-            ) => Transition {
+            (Self::Committed, E::ResultAmbiguousReceived, EndpointRole::Requester) => Transition {
+                state: Self::Ambiguous,
+                actions: &[A::SendResultAck, A::JournalAmbiguous, A::ProhibitRetry],
+            },
+            (Self::Committed, E::SessionClosedPostCommit, EndpointRole::Requester) => Transition {
                 state: Self::Ambiguous,
                 actions: &[A::JournalAmbiguous, A::ProhibitRetry],
             },

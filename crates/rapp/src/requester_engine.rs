@@ -132,6 +132,11 @@ impl RequesterOperationEngine {
         if let TypedMessage::OperationStatus(report) = &message {
             return self.receive_status(store, *report);
         }
+        if let TypedMessage::CardStatus(status) = &message {
+            return Ok(RequesterDispatch::CardStatus {
+                card_present: status.card_present,
+            });
+        }
         if let TypedMessage::Error(error) = &message {
             return Ok(match *error {
                 ProtocolErrorMessage::OperationFailed(_) => RequesterDispatch::PeerBusy,
@@ -178,6 +183,7 @@ impl RequesterOperationEngine {
                         error,
                         remaining_retries,
                         batch_signatures,
+                        acknowledgment,
                     } => RequesterDispatch::Terminal {
                         operation_id,
                         state,
@@ -185,18 +191,19 @@ impl RequesterOperationEngine {
                         error,
                         remaining_retries,
                         batch_signatures,
+                        acknowledgment,
                     },
                 })
             }
             TypedMessage::OperationProgress(progress) => {
                 match self.operations[index].receive_progress(&progress) {
                     Ok(event) => match event {
-                        ProgressEvent::WaitingForCard | ProgressEvent::CardWaitEnded => {
-                            Ok(RequesterDispatch::Progress {
-                                operation_id,
-                                event,
-                            })
-                        }
+                        ProgressEvent::ConsentShown
+                        | ProgressEvent::WaitingForCard
+                        | ProgressEvent::CardWaitEnded => Ok(RequesterDispatch::Progress {
+                            operation_id,
+                            event,
+                        }),
                         ProgressEvent::Unknown => {
                             Ok(RequesterDispatch::IgnoredProgress(operation_id))
                         }
@@ -332,7 +339,8 @@ pub enum RequesterDispatch {
         /// Exact acknowledgment to send.
         message: TypedMessage,
     },
-    /// Operation reached the journaled terminal state.
+    /// Operation reached the journaled terminal state; release the
+    /// acknowledgment it carries.
     Terminal {
         /// Terminated operation.
         operation_id: OperationId,
@@ -346,10 +354,17 @@ pub enum RequesterDispatch {
         remaining_retries: Option<u8>,
         /// Signatures an interrupted batch made before it became ambiguous.
         batch_signatures: Vec<Vec<u8>>,
+        /// The exact acknowledgment of the result.
+        acknowledgment: TypedMessage,
     },
     /// Authenticated status report was stored as a journal annotation.
     StatusAnnotated(OperationId),
-    /// Advisory operation progress update reported by proxy.
+    /// The custodian reported whether it can serve a card (section 8.4).
+    CardStatus {
+        /// True only while a card is coupled and answers.
+        card_present: bool,
+    },
+    /// Operation progress update reported by proxy.
     Progress {
         /// Active operation.
         operation_id: OperationId,
@@ -481,6 +496,64 @@ mod tests {
     }
 
     #[test]
+    fn every_terminal_result_carries_its_acknowledgment() {
+        let mut engine = RequesterOperationEngine::new();
+        let mut store = TestStore(None);
+        let request = inspection_request();
+        let op_id = request.operation_id;
+        let reference = OperationReference {
+            operation_id: op_id,
+            request_hash: request.request_hash().expect("valid request hash"),
+        };
+        engine.begin(&mut store, request).expect("begin succeeds");
+
+        let rejected = crate::OperationResultMessage::rejection(
+            reference,
+            crate::ResultStatus::Rejected,
+            crate::ResultError::UserCancelled,
+        );
+        let dispatch = engine
+            .receive(&mut store, TypedMessage::OperationResult(rejected))
+            .expect("a rejection is dispatched");
+        let RequesterDispatch::Terminal {
+            operation_id,
+            state,
+            acknowledgment,
+            ..
+        } = dispatch
+        else {
+            panic!("a rejection is terminal");
+        };
+        assert_eq!(operation_id, op_id);
+        assert_eq!(state, OperationState::Rejected);
+        assert_eq!(acknowledgment, TypedMessage::OperationResultAck(reference));
+        assert_eq!(
+            store.0.as_ref().expect("operation record").state,
+            OperationState::Rejected
+        );
+    }
+
+    #[test]
+    fn card_status_is_dispatched_to_the_platform() {
+        let mut engine = RequesterOperationEngine::new();
+        let mut store = TestStore(None);
+        let dispatch = engine
+            .receive(
+                &mut store,
+                TypedMessage::CardStatus(crate::message::CardStatusMessage {
+                    card_present: false,
+                }),
+            )
+            .expect("card status is dispatched");
+        assert_eq!(
+            dispatch,
+            RequesterDispatch::CardStatus {
+                card_present: false
+            }
+        );
+    }
+
+    #[test]
     fn progress_updates_are_dispatched_without_changing_operation_state() {
         let mut engine = RequesterOperationEngine::new();
         let mut store = TestStore(None);
@@ -494,25 +567,27 @@ mod tests {
             OperationState::Requested
         );
 
-        let progress_msg = TypedMessage::OperationProgress(OperationProgressMessage {
-            reference: OperationReference {
-                operation_id: op_id,
-                request_hash,
-            },
-            event: ProgressEvent::WaitingForCard,
-        });
+        for event in [ProgressEvent::ConsentShown, ProgressEvent::WaitingForCard] {
+            let progress_msg = TypedMessage::OperationProgress(OperationProgressMessage {
+                reference: OperationReference {
+                    operation_id: op_id,
+                    request_hash,
+                },
+                event,
+            });
 
-        let dispatch = engine
-            .receive(&mut store, progress_msg)
-            .expect("receive progress succeeds");
+            let dispatch = engine
+                .receive(&mut store, progress_msg)
+                .expect("receive progress succeeds");
 
-        assert_eq!(
-            dispatch,
-            RequesterDispatch::Progress {
-                operation_id: op_id,
-                event: ProgressEvent::WaitingForCard,
-            }
-        );
+            assert_eq!(
+                dispatch,
+                RequesterDispatch::Progress {
+                    operation_id: op_id,
+                    event,
+                }
+            );
+        }
 
         assert_eq!(
             store.0.as_ref().expect("operation record").state,

@@ -323,7 +323,7 @@ fn session_records_announce_the_most_recently_used_pairings() {
                 last_used_ms: candidate.last_used_ms,
             })
             .collect::<Vec<_>>();
-        let record = DiscoveryRecord::assemble(&candidates);
+        let record = DiscoveryRecord::assemble(&candidates, None);
         let announced = record.hints().iter().map(hex::encode).collect::<Vec<_>>();
         assert_eq!(announced, vector.announced_hex, "{}", vector.name);
     }

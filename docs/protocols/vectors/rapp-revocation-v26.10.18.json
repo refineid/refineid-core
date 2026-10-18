@@ -1,0 +1,487 @@
+{
+  "format": "fi.refineid.rapp.revocation-vectors-v1",
+  "protocol_document_version": "26.10.18",
+  "provenance": "Generated independently from RAPP v26.10.18 section 4.6 and the hierarchy specification section 4.3 with the Python standard library: an RFC 7748 X25519 Montgomery ladder, HKDF-SHA-256 as the two HMAC calls of RFC 5869, and HMAC-SHA-256 hints. Checked against the refineid-rapp crate afterwards.",
+  "revocation_key": [
+    {
+      "name": "custodian-and-requester-agree",
+      "pair_id_hex": "33333333333333333333333333333333",
+      "custodian_static_private_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "custodian_static_public_hex": "7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13",
+      "requester_static_private_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+      "requester_static_public_hex": "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20",
+      "shared_secret_hex": "9e004098efc091d4ec2663b4e9f5cfd4d7064571690b4bea97ab146ab9f35056",
+      "revocation_key_hex": "f97ce9f8df70d2f69a1fd02d17a25de5a5b6aa8cd71f3abd125918af38afd049"
+    }
+  ],
+  "revocation_hint": [
+    {
+      "name": "epoch-zero",
+      "instance_name": "refineid-7f2a1c84",
+      "unix_time_seconds": 0,
+      "epoch": 0,
+      "revocation_hint_hex": "8402eb393be4b13f"
+    },
+    {
+      "name": "epoch-2026-10-18",
+      "instance_name": "refineid-7f2a1c84",
+      "unix_time_seconds": 1792281600,
+      "epoch": 1991424,
+      "revocation_hint_hex": "6510fd40eb8055c4"
+    },
+    {
+      "name": "other-instance",
+      "instance_name": "refineid-b3d90e15",
+      "unix_time_seconds": 1792281600,
+      "epoch": 1991424,
+      "revocation_hint_hex": "37637fe2ce68f34f"
+    }
+  ],
+  "revocation_acceptance": [
+    {
+      "name": "same-epoch",
+      "published_instance": "refineid-7f2a1c84",
+      "published_epoch": 1991424,
+      "requester_instance": "refineid-7f2a1c84",
+      "requester_epoch": 1991424,
+      "requester_pair_id_hex": "33333333333333333333333333333333",
+      "expected": "accepted"
+    },
+    {
+      "name": "requester-one-epoch-later",
+      "published_instance": "refineid-7f2a1c84",
+      "published_epoch": 1991424,
+      "requester_instance": "refineid-7f2a1c84",
+      "requester_epoch": 1991425,
+      "requester_pair_id_hex": "33333333333333333333333333333333",
+      "expected": "accepted"
+    },
+    {
+      "name": "requester-one-epoch-earlier",
+      "published_instance": "refineid-7f2a1c84",
+      "published_epoch": 1991424,
+      "requester_instance": "refineid-7f2a1c84",
+      "requester_epoch": 1991423,
+      "requester_pair_id_hex": "33333333333333333333333333333333",
+      "expected": "accepted"
+    },
+    {
+      "name": "requester-two-epochs-later",
+      "published_instance": "refineid-7f2a1c84",
+      "published_epoch": 1991424,
+      "requester_instance": "refineid-7f2a1c84",
+      "requester_epoch": 1991426,
+      "requester_pair_id_hex": "33333333333333333333333333333333",
+      "expected": "rejected"
+    },
+    {
+      "name": "other-instance",
+      "published_instance": "refineid-7f2a1c84",
+      "published_epoch": 1991424,
+      "requester_instance": "refineid-b3d90e15",
+      "requester_epoch": 1991424,
+      "requester_pair_id_hex": "33333333333333333333333333333333",
+      "expected": "rejected"
+    },
+    {
+      "name": "other-pairing",
+      "published_instance": "refineid-7f2a1c84",
+      "published_epoch": 1991424,
+      "requester_instance": "refineid-7f2a1c84",
+      "requester_epoch": 1991424,
+      "requester_pair_id_hex": "34343434343434343434343434343434",
+      "expected": "rejected"
+    }
+  ],
+  "session_record": [
+    {
+      "name": "revoked-only",
+      "instance_name": "refineid-7f2a1c84",
+      "requester_epoch": 1991424,
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "session"
+        ],
+        [
+          "revoked",
+          "4040404040404040,4141414141414141,4242424242424242,6510fd40eb8055c4,4343434343434343,4444444444444444,4545454545454545,4646464646464646"
+        ]
+      ],
+      "hints_hex": [],
+      "expected": "accepted"
+    },
+    {
+      "name": "hints-and-revoked",
+      "instance_name": "refineid-7f2a1c84",
+      "requester_epoch": 1991424,
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "session"
+        ],
+        [
+          "hints",
+          "054526c9fdd3b180"
+        ],
+        [
+          "revoked",
+          "4040404040404040,4141414141414141,4242424242424242,6510fd40eb8055c4,4343434343434343,4444444444444444,4545454545454545,4646464646464646"
+        ]
+      ],
+      "hints_hex": [
+        "054526c9fdd3b180"
+      ],
+      "expected": "accepted"
+    },
+    {
+      "name": "mixed-case-keys",
+      "instance_name": "refineid-7f2a1c84",
+      "requester_epoch": 1991424,
+      "txt": [
+        [
+          "V",
+          "1"
+        ],
+        [
+          "Mode",
+          "session"
+        ],
+        [
+          "REVOKED",
+          "4040404040404040,4141414141414141,4242424242424242,6510fd40eb8055c4,4343434343434343,4444444444444444,4545454545454545,4646464646464646"
+        ]
+      ],
+      "hints_hex": [],
+      "expected": "accepted"
+    },
+    {
+      "name": "no-revocations",
+      "instance_name": "refineid-7f2a1c84",
+      "requester_epoch": 1991424,
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "session"
+        ]
+      ],
+      "hints_hex": [],
+      "expected": "no-match"
+    },
+    {
+      "name": "fillers-only",
+      "instance_name": "refineid-7f2a1c84",
+      "requester_epoch": 1991424,
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "session"
+        ],
+        [
+          "revoked",
+          "4040404040404040,4141414141414141,4242424242424242,4343434343434343,4444444444444444,4545454545454545,4646464646464646,4747474747474747"
+        ]
+      ],
+      "hints_hex": [],
+      "expected": "no-match"
+    },
+    {
+      "name": "wrong-instance",
+      "instance_name": "refineid-b3d90e15",
+      "requester_epoch": 1991424,
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "session"
+        ],
+        [
+          "revoked",
+          "4040404040404040,4141414141414141,4242424242424242,6510fd40eb8055c4,4343434343434343,4444444444444444,4545454545454545,4646464646464646"
+        ]
+      ],
+      "hints_hex": [],
+      "expected": "no-match"
+    }
+  ],
+  "malformed_record": [
+    {
+      "name": "seven-entries",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "session"
+        ],
+        [
+          "revoked",
+          "4040404040404040,4141414141414141,4242424242424242,6510fd40eb8055c4,4343434343434343,4444444444444444,4545454545454545"
+        ]
+      ]
+    },
+    {
+      "name": "nine-entries",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "session"
+        ],
+        [
+          "revoked",
+          "4040404040404040,4141414141414141,4242424242424242,6510fd40eb8055c4,4343434343434343,4444444444444444,4545454545454545,4646464646464646,4040404040404040"
+        ]
+      ]
+    },
+    {
+      "name": "uppercase-hex",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "session"
+        ],
+        [
+          "revoked",
+          "4040404040404040,4141414141414141,4242424242424242,6510FD40EB8055C4,4343434343434343,4444444444444444,4545454545454545,4646464646464646"
+        ]
+      ]
+    },
+    {
+      "name": "empty-value",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "session"
+        ],
+        [
+          "revoked",
+          ""
+        ]
+      ]
+    },
+    {
+      "name": "repeated-key",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "session"
+        ],
+        [
+          "revoked",
+          "4040404040404040,4141414141414141,4242424242424242,6510fd40eb8055c4,4343434343434343,4444444444444444,4545454545454545,4646464646464646"
+        ],
+        [
+          "Revoked",
+          "4040404040404040,4141414141414141,4242424242424242,6510fd40eb8055c4,4343434343434343,4444444444444444,4545454545454545,4646464646464646"
+        ]
+      ]
+    },
+    {
+      "name": "withdrawn-mode",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "withdrawn"
+        ],
+        [
+          "revoked",
+          "4040404040404040,4141414141414141,4242424242424242,6510fd40eb8055c4,4343434343434343,4444444444444444,4545454545454545,4646464646464646"
+        ]
+      ]
+    },
+    {
+      "name": "spaces-after-commas",
+      "txt": [
+        [
+          "v",
+          "1"
+        ],
+        [
+          "mode",
+          "session"
+        ],
+        [
+          "revoked",
+          "4040404040404040, 4141414141414141, 4242424242424242, 6510fd40eb8055c4, 4343434343434343, 4444444444444444, 4545454545454545, 4646464646464646"
+        ]
+      ]
+    }
+  ],
+  "retention_window": [
+    {
+      "name": "at-revocation",
+      "revoked_at_ms": 1000,
+      "now_ms": 1000,
+      "announced": true
+    },
+    {
+      "name": "last-millisecond",
+      "revoked_at_ms": 1000,
+      "now_ms": 2592000999,
+      "announced": true
+    },
+    {
+      "name": "thirty-days",
+      "revoked_at_ms": 1000,
+      "now_ms": 2592001000,
+      "announced": false
+    },
+    {
+      "name": "before-revocation",
+      "revoked_at_ms": 1000,
+      "now_ms": 999,
+      "announced": false
+    }
+  ],
+  "announcement_selection": [
+    {
+      "name": "ten-revocations-eight-announced",
+      "limit": 8,
+      "candidates": [
+        {
+          "hint_hex": "1010101010101010",
+          "revoked_at_ms": 1000
+        },
+        {
+          "hint_hex": "1111111111111111",
+          "revoked_at_ms": 1001
+        },
+        {
+          "hint_hex": "1212121212121212",
+          "revoked_at_ms": 1002
+        },
+        {
+          "hint_hex": "1313131313131313",
+          "revoked_at_ms": 1003
+        },
+        {
+          "hint_hex": "1414141414141414",
+          "revoked_at_ms": 1004
+        },
+        {
+          "hint_hex": "1515151515151515",
+          "revoked_at_ms": 1005
+        },
+        {
+          "hint_hex": "1616161616161616",
+          "revoked_at_ms": 1006
+        },
+        {
+          "hint_hex": "1717171717171717",
+          "revoked_at_ms": 1007
+        },
+        {
+          "hint_hex": "1818181818181818",
+          "revoked_at_ms": 1008
+        },
+        {
+          "hint_hex": "1919191919191919",
+          "revoked_at_ms": 1009
+        }
+      ],
+      "announced_hex": [
+        "1212121212121212",
+        "1313131313131313",
+        "1414141414141414",
+        "1515151515151515",
+        "1616161616161616",
+        "1717171717171717",
+        "1818181818181818",
+        "1919191919191919"
+      ]
+    },
+    {
+      "name": "equal-times-order-by-hint",
+      "limit": 8,
+      "candidates": [
+        {
+          "hint_hex": "2020202020202020",
+          "revoked_at_ms": 5
+        },
+        {
+          "hint_hex": "2121212121212121",
+          "revoked_at_ms": 5
+        },
+        {
+          "hint_hex": "2222222222222222",
+          "revoked_at_ms": 5
+        },
+        {
+          "hint_hex": "2323232323232323",
+          "revoked_at_ms": 5
+        },
+        {
+          "hint_hex": "2424242424242424",
+          "revoked_at_ms": 5
+        },
+        {
+          "hint_hex": "2525252525252525",
+          "revoked_at_ms": 5
+        },
+        {
+          "hint_hex": "2626262626262626",
+          "revoked_at_ms": 5
+        },
+        {
+          "hint_hex": "2727272727272727",
+          "revoked_at_ms": 5
+        },
+        {
+          "hint_hex": "2828282828282828",
+          "revoked_at_ms": 5
+        }
+      ],
+      "announced_hex": [
+        "2020202020202020",
+        "2121212121212121",
+        "2222222222222222",
+        "2323232323232323",
+        "2424242424242424",
+        "2525252525252525",
+        "2626262626262626",
+        "2727272727272727"
+      ]
+    }
+  ]
+}

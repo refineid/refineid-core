@@ -9,7 +9,7 @@ use super::{
     OperationReference, OperationRequest, OperationResultMessage, OperationState,
     PendingCardCommand, ProfileName, ProgressEvent, ProtocolErrorMessage, ProxyFailure,
     RecoveredProxyRecord, ResultJournalStore, ResultStatus, StatusReport, TypedMessage,
-    UserApproval,
+    UserApproval, message::CardStatusMessage,
 };
 
 /// Maximum incoming operation requests permitted per rolling minute window.
@@ -124,9 +124,11 @@ impl ProxyOperationEngine {
             TypedMessage::OperationStatusRequest(operation_id) => {
                 Ok(self.status_answer(operation_id))
             }
-            // Advisory progress is proxy-to-requester only; inbound progress
-            // is ignored.
-            TypedMessage::OperationProgress(_) => Ok(ProxyDispatch::NotOperation(message)),
+            // Progress and card status are proxy-to-requester only; inbound
+            // ones are ignored.
+            TypedMessage::OperationProgress(_) | TypedMessage::CardStatus(_) => {
+                Ok(ProxyDispatch::NotOperation(message))
+            }
             TypedMessage::OperationResult(_) | TypedMessage::OperationStatus(_) => {
                 self.refuse_requester_only(message)
             }
@@ -154,7 +156,9 @@ impl ProxyOperationEngine {
     /// A consequential action's in-flight entry is durable before the card
     /// command is returned. An approval that arrives after the request's
     /// local deadline cancels the operation instead (section 8.2.1); no card
-    /// command is produced.
+    /// command is produced. `now_ms` is the continuous clock, which advances
+    /// through suspension, so a custodian that resumes evaluates expiry here
+    /// before rendering anything for the operation.
     ///
     /// # Errors
     /// [`ProxyEngineError`] on an unknown operation, an illegal local
@@ -207,7 +211,8 @@ impl ProxyOperationEngine {
         Ok(ProxyDispatch::Send(TypedMessage::OperationResult(result)))
     }
 
-    /// Record a stable failure and release it.
+    /// Record a stable failure and release it; the requester acknowledges it
+    /// like every result (section 8.2 item 5).
     ///
     /// Three failures also close the session: a refused retry, a blocked
     /// credential, and an ambiguous card completion. Each means the endpoint
@@ -279,7 +284,14 @@ impl ProxyOperationEngine {
         self.finish_completed(store, operation_id, result)
     }
 
-    /// Create an authenticated advisory progress message for an active operation.
+    /// The card-presence notice for the session (section 8.4): sent once
+    /// after `session.ready` and again whenever presence changes.
+    #[must_use]
+    pub const fn report_card_status(card_present: bool) -> TypedMessage {
+        TypedMessage::CardStatus(CardStatusMessage { card_present })
+    }
+
+    /// Create an authenticated progress message for an active operation.
     ///
     /// # Errors
     /// [`ProxyEngineError`] on an unknown operation or an invalid local transition.
@@ -304,7 +316,7 @@ impl ProxyOperationEngine {
     ///
     /// An operation still awaiting consent is cancelled with nothing sent to
     /// the card; one executing on the card runs to its own conclusion; a
-    /// completed result not yet acknowledged stays retained for re-delivery
+    /// result not yet acknowledged stays retained for re-delivery
     /// (section 8.3).
     ///
     /// # Errors
@@ -377,14 +389,8 @@ impl ProxyOperationEngine {
                     retained.clone(),
                 )));
             }
-            if operation.operation_state() == OperationState::Completed {
-                return Ok(ProxyDispatch::Send(TypedMessage::OperationResult(
-                    OperationResultMessage::retired(
-                        operation.reference(),
-                        ResultStatus::Completed,
-                        None,
-                    ),
-                )));
+            if let Some(answer) = operation.journal().record().retired_answer() {
+                return Ok(ProxyDispatch::Send(TypedMessage::OperationResult(answer)));
             }
             return Ok(ProxyDispatch::IgnoredDuplicate(operation_id));
         }
@@ -418,8 +424,9 @@ impl ProxyOperationEngine {
         Ok(ProxyDispatch::InspectPrerequisites(operation_id))
     }
 
-    /// Retires an acknowledged result, live or re-delivered; any other
-    /// acknowledgment is ignored without touching a tombstone (section 8.2.5).
+    /// Retires an acknowledged result, completed or not, live or
+    /// re-delivered; any other acknowledgment is ignored without touching a
+    /// tombstone (section 8.2.5).
     fn receive_acknowledgment<S: ResultJournalStore>(
         &mut self,
         store: &mut S,
@@ -442,7 +449,8 @@ impl ProxyOperationEngine {
         let Some(entry) = self.recovered.iter_mut().find(|entry| {
             entry.record.operation_id == operation_id
                 && entry.record.request_hash == reference.request_hash
-                && entry.record.state == OperationState::DeliveryUncertain
+                && entry.retained_result.is_some()
+                && !entry.record.is_retired()
         }) else {
             return Ok(ProxyDispatch::NotOperation(
                 TypedMessage::OperationResultAck(reference),
@@ -467,7 +475,7 @@ impl ProxyOperationEngine {
                 known: true,
                 state: Some(state),
                 request_hash: Some(operation.reference().request_hash),
-                retired: state == OperationState::Completed,
+                retired: operation.is_retired(),
             });
             return match operation.retained_result() {
                 Some(retained) => ProxyDispatch::SendAll(vec![
@@ -478,7 +486,7 @@ impl ProxyOperationEngine {
             };
         }
         if let Some(entry) = self.recovered(operation_id) {
-            let retired = entry.record.state == OperationState::Completed;
+            let retired = entry.record.is_retired();
             let report = TypedMessage::OperationStatus(StatusReport {
                 operation_id,
                 known: true,
@@ -610,6 +618,9 @@ fn recovered_answer(entry: &RecoveredProxyRecord) -> OperationResultMessage {
     if let Some(retained) = &entry.retained_result {
         return retained.clone();
     }
+    if let Some(answer) = entry.record.retired_answer() {
+        return answer;
+    }
     let reference = OperationReference {
         operation_id: entry.record.operation_id,
         request_hash: entry.record.request_hash,
@@ -656,7 +667,7 @@ fn validate_recovered<E>(entry: &RecoveredProxyRecord) -> Result<(), ProxyEngine
     }
     let result_allowed = match entry.record.state {
         OperationState::ResultPending | OperationState::DeliveryUncertain => {
-            if entry.retained_result.is_none() {
+            if entry.retained_result.is_none() || entry.record.acknowledged {
                 return Err(ProxyEngineError::LocalInvariantFailure);
             }
             true
@@ -665,8 +676,13 @@ fn validate_recovered<E>(entry: &RecoveredProxyRecord) -> Result<(), ProxyEngine
         | OperationState::Denied
         | OperationState::Rejected
         | OperationState::CredentialRejected
-        | OperationState::Ambiguous => true,
-        _ => false,
+        | OperationState::Ambiguous => !entry.record.acknowledged,
+        _ => {
+            if entry.record.acknowledged {
+                return Err(ProxyEngineError::LocalInvariantFailure);
+            }
+            false
+        }
     };
     if entry.retained_result.is_some() && !result_allowed {
         return Err(ProxyEngineError::LocalInvariantFailure);
@@ -912,6 +928,25 @@ mod tests {
             after_dispatch,
             Ok(ProxyDispatch::InspectPrerequisites(_))
         ));
+    }
+
+    #[test]
+    fn card_status_is_sent_by_the_proxy_and_ignored_when_received() {
+        assert_eq!(
+            ProxyOperationEngine::report_card_status(true),
+            TypedMessage::CardStatus(CardStatusMessage { card_present: true })
+        );
+        let mut engine = ProxyOperationEngine::new(vec![ProfileName::CardStatus]);
+        let outcome = engine
+            .receive(
+                &mut TestStore,
+                TypedMessage::CardStatus(CardStatusMessage {
+                    card_present: false,
+                }),
+                1_000,
+            )
+            .expect("receive succeeds");
+        assert!(matches!(outcome, ProxyDispatch::NotOperation(_)));
     }
 
     #[test]

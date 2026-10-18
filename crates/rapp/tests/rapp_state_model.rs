@@ -6,7 +6,7 @@ use refineid_rapp::{
 };
 use serde::Deserialize;
 
-const MODEL: &str = include_str!("../../../docs/protocols/rapp-state-machine-v26.9.13.yaml");
+const MODEL: &str = include_str!("../../../docs/protocols/rapp-state-machine-v26.10.18.yaml");
 
 #[derive(Deserialize)]
 struct Model {
@@ -108,7 +108,7 @@ fn guard_is_registered(guard: &str) -> bool {
 
 #[test]
 fn formal_document_version_is_the_reviewed_revision() {
-    assert_eq!(model().document_version, "26.9.13");
+    assert_eq!(model().document_version, "26.10.18");
 }
 
 #[test]

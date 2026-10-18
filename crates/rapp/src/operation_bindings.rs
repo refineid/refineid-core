@@ -25,8 +25,8 @@ use super::{
     BATCH_DOCUMENTS, BatchProgress, CardIdentity, CardInspection, CardOperationResult,
     JournalRecord, JournalRecoveryStore, JournalStore, OperationId, OperationResultMessage,
     OperationState, PairId, RecoveredProxyRecord, RequestHash, RequesterJournalRecord,
-    RequesterJournalStore, RequesterRecoveryStore, ResultJournalStore, SessionId, StatusReport,
-    WireValue,
+    RequesterJournalStore, RequesterRecoveryStore, ResultError, ResultJournalStore, SessionId,
+    StatusReport, WireValue,
     bindings::{
         RappBindingError, RappVaultError, take_bytes, take_text, take_unsigned, take_value,
     },
@@ -34,7 +34,7 @@ use super::{
 };
 
 const REQUESTER_JOURNAL_FORMAT_VERSION: u64 = 2;
-const PROXY_JOURNAL_FORMAT_VERSION: u64 = 3;
+const PROXY_JOURNAL_FORMAT_VERSION: u64 = 4;
 
 /// One proxy recovery entry returned by an atomic platform load.
 #[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
@@ -353,6 +353,16 @@ fn encode_proxy_record(record: &JournalRecord) -> Result<Vec<u8>, RappBindingErr
                 .as_ref()
                 .map_or(WireValue::Null, batch_progress_value),
         ),
+        (
+            "acknowledged".to_owned(),
+            WireValue::Bool(record.acknowledged),
+        ),
+        (
+            "terminal_error".to_owned(),
+            record.terminal_error.map_or(WireValue::Null, |error| {
+                WireValue::Text(error.as_str().to_owned())
+            }),
+        ),
     ])))
     .map_err(|_| RappBindingError::ProtocolFailure)
 }
@@ -425,6 +435,12 @@ fn decode_proxy_record(bytes: &[u8]) -> Result<JournalRecord, RappBindingError> 
         .map_err(|_| RappBindingError::InvalidInput)?;
     let automatic_retry_permitted = take_bool(&mut map, "automatic_retry_permitted")?;
     let batch = parse_batch_progress(take_value(&mut map, "batch")?)?;
+    let acknowledged = take_bool(&mut map, "acknowledged")?;
+    let terminal_error = match take_value(&mut map, "terminal_error")? {
+        WireValue::Null => None,
+        WireValue::Text(name) => Some(ResultError::from_wire_name(&name)),
+        _ => return Err(RappBindingError::InvalidInput),
+    };
     require_empty(&map)?;
     Ok(JournalRecord {
         pair_id,
@@ -435,6 +451,8 @@ fn decode_proxy_record(bytes: &[u8]) -> Result<JournalRecord, RappBindingError> 
         transmission_count,
         automatic_retry_permitted,
         batch,
+        acknowledged,
+        terminal_error,
     })
 }
 

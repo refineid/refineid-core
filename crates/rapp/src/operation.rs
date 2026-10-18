@@ -445,7 +445,9 @@ pub struct OperationRequest {
     pub session_id: SessionId,
     /// Negotiated operation profile.
     pub profile: ProfileName,
-    /// Local monotonic receipt/creation time. This is never sent or hashed.
+    /// Local receipt or creation time on the continuous clock, which
+    /// advances through suspension (section 8.2 item 1). This is never sent
+    /// or hashed.
     pub local_start_ms: u64,
     /// Relative validity interval sent on the wire, excluded from the hash,
     /// and independently capped by each endpoint's local policy. Wall clocks
@@ -501,7 +503,8 @@ impl OperationRequest {
         self.operation.validate()
     }
 
-    /// Local monotonic deadline with an endpoint-specific maximum lifetime.
+    /// Local deadline on the continuous clock with an endpoint-specific
+    /// maximum lifetime (section 8.2 item 1).
     ///
     /// # Errors
     /// [`CardOperationError`] on an invalid request or a zero maximum

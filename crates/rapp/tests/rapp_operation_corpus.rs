@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 
 use refineid_rapp::{
     CardKeyProfile, CardOperation, CardOperationResult, CertificateKind, Envelope, MessageType,
-    OperationId, OperationReference, OperationState, PairId, ProtocolErrorMessage, ResultError,
-    ResultStatus, SessionId, SignatureAlgorithm, TypedMessage, WireValue,
+    OperationId, OperationReference, OperationState, PairId, ProgressEvent, ProtocolErrorMessage,
+    ResultError, ResultStatus, SessionId, SignatureAlgorithm, TypedMessage, WireValue,
     decode_deterministic_cbor, encode_deterministic_cbor,
 };
 use serde::Deserialize;
@@ -53,6 +53,9 @@ fn message_type(name: &str) -> MessageType {
         "OperationResultAck" => MessageType::OperationResultAck,
         "OperationStatusRequest" => MessageType::OperationStatusRequest,
         "OperationStatus" => MessageType::OperationStatus,
+        "OperationProgress" => MessageType::OperationProgress,
+        "PairingStored" => MessageType::PairingStored,
+        "CardStatus" => MessageType::CardStatus,
         "Error" => MessageType::Error,
         other => panic!("unregistered corpus message type {other}"),
     }
@@ -91,7 +94,7 @@ fn corpus_names_this_protocol_version() {
     let corpus = corpus();
     assert_eq!(corpus.format, "fi.refineid.rapp.operation-vectors-v1");
     assert_eq!(corpus.protocol_document_version, "26.10.18");
-    assert_eq!(corpus.vectors.len(), 34);
+    assert_eq!(corpus.vectors.len(), 39);
 }
 
 #[test]
@@ -212,6 +215,50 @@ fn registry_values_decode_to_their_meaning() {
         find("error-unknown-operation-bare"),
         TypedMessage::Error(ProtocolErrorMessage::UnknownOperation(None))
     );
+}
+
+#[test]
+fn storage_card_status_and_progress_decode_to_their_meaning() {
+    let corpus = corpus();
+    let find = |name: &str| {
+        let vector = corpus
+            .vectors
+            .iter()
+            .find(|vector| vector.name == name)
+            .unwrap_or_else(|| panic!("corpus lacks {name}"));
+        typed(vector, &corpus.fixed_inputs)
+    };
+
+    let TypedMessage::PairingStored(stored) = find("pairing-stored") else {
+        panic!("pairing-stored is a storage confirmation");
+    };
+    assert_eq!(
+        stored.pair_id,
+        PairId::reconstruct(&hex::decode(&corpus.fixed_inputs.pair_id).expect("valid hex"))
+            .expect("pair id length")
+    );
+
+    let TypedMessage::CardStatus(present) = find("card-status-present") else {
+        panic!("card-status-present is a card status");
+    };
+    assert!(present.card_present);
+    let TypedMessage::CardStatus(absent) = find("card-status-absent") else {
+        panic!("card-status-absent is a card status");
+    };
+    assert!(!absent.card_present);
+
+    let TypedMessage::OperationProgress(consent) = find("progress-consent-shown") else {
+        panic!("progress-consent-shown is a progress update");
+    };
+    assert_eq!(consent.event, ProgressEvent::ConsentShown);
+    assert_eq!(
+        consent.reference.operation_id,
+        OperationId::from_array([0x22; 16])
+    );
+    let TypedMessage::OperationProgress(waiting) = find("progress-waiting-for-card") else {
+        panic!("progress-waiting-for-card is a progress update");
+    };
+    assert_eq!(waiting.event, ProgressEvent::WaitingForCard);
 }
 
 /// The batch the corpus's batch vectors answer.

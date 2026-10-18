@@ -321,6 +321,62 @@ fn a_failure_result_is_retained_for_identical_retransmissions() {
 }
 
 #[test]
+fn a_failure_result_awaits_its_acknowledgment_and_retires_on_it() {
+    let mut store = MemoryResultStore::default();
+    let mut transaction = consented_transaction();
+    let result = OperationResultMessage::failure(transaction.reference(), ProxyFailure::UserDenied);
+    transaction
+        .finish_failure_result(&mut store, &result)
+        .expect("a denial is journaled");
+    assert_eq!(transaction.stage(), AuthorizationStage::ResultPending);
+    assert!(!transaction.is_retired());
+
+    transaction
+        .acknowledge_result(&mut store, transaction.reference())
+        .expect("the exact acknowledgment retires the failure");
+    assert_eq!(transaction.stage(), AuthorizationStage::Terminal);
+    assert_eq!(transaction.operation_state(), OperationState::Rejected);
+    assert!(transaction.is_retired());
+    assert_eq!(transaction.retained_result(), None);
+    assert_eq!(store.retained_result, None);
+    assert_eq!(
+        store.events.last(),
+        Some(&StoreEvent::Acknowledge(OperationState::Rejected, 0))
+    );
+    let retired = transaction
+        .journal()
+        .record()
+        .retired_answer()
+        .expect("a retired failure answers with its disposition");
+    assert!(retired.retired);
+    assert_eq!(retired.status, ResultStatus::Rejected);
+    assert_eq!(retired.error, Some(ResultError::UserCancelled));
+    assert_eq!(retired.response, None);
+}
+
+#[test]
+fn an_unacknowledged_failure_survives_session_loss_unchanged() {
+    let mut store = MemoryResultStore::default();
+    let mut transaction = consented_transaction();
+    let result = OperationResultMessage::failure(transaction.reference(), ProxyFailure::UserDenied);
+    transaction
+        .finish_failure_result(&mut store, &result)
+        .expect("a denial is journaled");
+
+    transaction
+        .delivery_became_uncertain(&mut store)
+        .expect("session loss ends the attempt");
+    assert_eq!(transaction.stage(), AuthorizationStage::Terminal);
+    assert_eq!(transaction.operation_state(), OperationState::Rejected);
+    assert!(!transaction.is_retired());
+    assert_eq!(transaction.retained_result(), Some(&result));
+    assert_eq!(
+        store.events,
+        [StoreEvent::PersistResult(OperationState::Rejected, 0)]
+    );
+}
+
+#[test]
 fn request_hash_is_bound_to_the_pairing_not_the_session_local_time_or_expiry() {
     let original = consequential_request();
     let mut local_only_change = original.clone();
@@ -513,6 +569,57 @@ fn an_acknowledged_result_answers_as_retired_and_the_status_says_so() {
             operation_id,
             known: true,
             state: Some(OperationState::Completed),
+            request_hash: Some(reference().request_hash),
+            retired: true,
+        }
+    );
+}
+
+#[test]
+fn an_acknowledged_failure_answers_as_retired_and_the_status_says_so() {
+    let mut store = MemoryResultStore::default();
+    let mut engine = engine_with_request(&mut store);
+    let operation_id = reference().operation_id;
+    engine
+        .prerequisites_complete(operation_id)
+        .expect("prerequisites complete");
+    engine
+        .finish_failure(&mut store, operation_id, ProxyFailure::UserDenied)
+        .expect("the denial is journaled");
+    assert!(matches!(
+        engine.receive(
+            &mut store,
+            TypedMessage::OperationResultAck(reference()),
+            1_200
+        ),
+        Ok(ProxyDispatch::ResultAcknowledged(_))
+    ));
+
+    let Ok(ProxyDispatch::Send(TypedMessage::OperationResult(retired))) = engine.receive(
+        &mut store,
+        TypedMessage::OperationRequest(consequential_request()),
+        1_300,
+    ) else {
+        panic!("a retired failure answers with its tombstone");
+    };
+    assert!(retired.retired);
+    assert_eq!(retired.status, ResultStatus::Rejected);
+    assert_eq!(retired.error, Some(ResultError::UserCancelled));
+    assert_eq!(retired.response, None);
+
+    let Ok(ProxyDispatch::Send(TypedMessage::OperationStatus(report))) = engine.receive(
+        &mut store,
+        TypedMessage::OperationStatusRequest(operation_id),
+        1_400,
+    ) else {
+        panic!("a retired failure reports its status alone");
+    };
+    assert_eq!(
+        report,
+        StatusReport {
+            operation_id,
+            known: true,
+            state: Some(OperationState::Rejected),
             request_hash: Some(reference().request_hash),
             retired: true,
         }

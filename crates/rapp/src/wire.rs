@@ -75,6 +75,8 @@ pub enum MessageType {
     PairingConfirm,
     /// Authenticated pairing cancellation.
     PairingAbort,
+    /// Confirmation that the pairing trust record is durably stored.
+    PairingStored,
     /// Session-ready parameter echo.
     SessionReady,
     /// Authenticated close notice.
@@ -93,8 +95,10 @@ pub enum MessageType {
     OperationStatusRequest,
     /// Durable status reconciliation answer.
     OperationStatus,
-    /// Advisory operation progress update.
+    /// Operation progress update.
     OperationProgress,
+    /// Whether the custodian can serve a card now.
+    CardStatus,
     /// Stable generic protocol error.
     Error,
 }
@@ -107,6 +111,7 @@ impl MessageType {
             Self::PairingHello => "pairing.hello",
             Self::PairingConfirm => "pairing.confirm",
             Self::PairingAbort => "pairing.abort",
+            Self::PairingStored => "pairing.stored",
             Self::SessionReady => "session.ready",
             Self::SessionClose => "session.close",
             Self::LivenessPing => "liveness.ping",
@@ -117,6 +122,7 @@ impl MessageType {
             Self::OperationStatusRequest => "operation.status_request",
             Self::OperationStatus => "operation.status",
             Self::OperationProgress => "operation.progress",
+            Self::CardStatus => "card.status",
             Self::Error => "error",
         }
     }
@@ -126,6 +132,7 @@ impl MessageType {
             "pairing.hello" => Ok(Self::PairingHello),
             "pairing.confirm" => Ok(Self::PairingConfirm),
             "pairing.abort" => Ok(Self::PairingAbort),
+            "pairing.stored" => Ok(Self::PairingStored),
             "session.ready" => Ok(Self::SessionReady),
             "session.close" => Ok(Self::SessionClose),
             "liveness.ping" => Ok(Self::LivenessPing),
@@ -136,6 +143,7 @@ impl MessageType {
             "operation.status_request" => Ok(Self::OperationStatusRequest),
             "operation.status" => Ok(Self::OperationStatus),
             "operation.progress" => Ok(Self::OperationProgress),
+            "card.status" => Ok(Self::CardStatus),
             "error" => Ok(Self::Error),
             _ => Err(WireError::UnknownMessageType),
         }
@@ -758,6 +766,7 @@ struct FieldSpec {
 }
 
 const OPERATION_ID: FieldType = FieldType::Bytes(16);
+const PAIR_ID: FieldType = FieldType::Bytes(16);
 const REQUEST_HASH: FieldType = FieldType::Bytes(32);
 /// Byte-length bounds of the error body's `error_name` (section 10.4).
 const ERROR_NAME_LENGTHS: core::ops::RangeInclusive<usize> = 1..=64;
@@ -805,6 +814,16 @@ fn validate_body(
         M::PairingAbort => &[FieldSpec {
             name: "reason",
             field_type: F::Text,
+            optional: false,
+        }],
+        M::PairingStored => &[FieldSpec {
+            name: "pair_id",
+            field_type: PAIR_ID,
+            optional: false,
+        }],
+        M::CardStatus => &[FieldSpec {
+            name: "card_present",
+            field_type: F::Bool,
             optional: false,
         }],
         M::SessionReady => &[

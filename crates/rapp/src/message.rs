@@ -50,6 +50,21 @@ pub struct PairingAbortMessage {
     pub reason: String,
 }
 
+/// Confirmation that the sender's pairing trust record is durably stored
+/// (section 4.3 item 4).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PairingStoredMessage {
+    /// The pairing identifier derived from the completed handshake.
+    pub pair_id: PairId,
+}
+
+/// Whether the custodian can serve a card now (section 8.4).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CardStatusMessage {
+    /// True only while a card is coupled and answers.
+    pub card_present: bool,
+}
+
 /// Fresh-session parameter echo.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionParameters {
@@ -174,6 +189,8 @@ pub enum TypedMessage {
     PairingConfirm(PairingConfirmMessage),
     /// Authenticated pairing cancellation.
     PairingAbort(PairingAbortMessage),
+    /// The sender's pairing trust record is durably stored.
+    PairingStored(PairingStoredMessage),
     /// Session-ready parameter echo and nonce.
     SessionReady(SessionReadyMessage),
     /// Authenticated close notice.
@@ -189,14 +206,16 @@ pub enum TypedMessage {
     OperationRequestRefused(OperationRequestRefusal),
     /// Profile-defined operation result.
     OperationResult(OperationResultMessage),
-    /// Acknowledgment of a completed result.
+    /// Acknowledgment of a result, whatever its status.
     OperationResultAck(OperationReference),
     /// Durable status reconciliation query.
     OperationStatusRequest(OperationId),
     /// Durable status reconciliation answer.
     OperationStatus(StatusReport),
-    /// Advisory operation progress update.
+    /// Operation progress update.
     OperationProgress(OperationProgressMessage),
+    /// Whether the custodian can serve a card now.
+    CardStatus(CardStatusMessage),
     /// Stable generic protocol error.
     Error(ProtocolErrorMessage),
 }
@@ -221,6 +240,9 @@ impl TypedMessage {
             }
             MessageType::PairingAbort => {
                 Self::PairingAbort(pairing_abort_from_body(envelope.body)?)
+            }
+            MessageType::PairingStored => {
+                Self::PairingStored(pairing_stored_from_body(envelope.body)?)
             }
             MessageType::SessionReady => {
                 Self::SessionReady(session_ready_from_body(envelope.body)?)
@@ -256,6 +278,7 @@ impl TypedMessage {
                 OperationProgressMessage::from_wire_body(envelope.body)
                     .map_err(MessageError::Operation)?,
             ),
+            MessageType::CardStatus => Self::CardStatus(card_status_from_body(envelope.body)?),
             MessageType::Error => Self::Error(error_from_body(envelope.body)?),
         };
         Ok(message)
@@ -268,6 +291,7 @@ impl TypedMessage {
             Self::PairingHello(_) => MessageType::PairingHello,
             Self::PairingConfirm(_) => MessageType::PairingConfirm,
             Self::PairingAbort(_) => MessageType::PairingAbort,
+            Self::PairingStored(_) => MessageType::PairingStored,
             Self::SessionReady(_) => MessageType::SessionReady,
             Self::SessionClose(_) => MessageType::SessionClose,
             Self::LivenessPing(_) => MessageType::LivenessPing,
@@ -280,6 +304,7 @@ impl TypedMessage {
             Self::OperationStatusRequest(_) => MessageType::OperationStatusRequest,
             Self::OperationStatus(_) => MessageType::OperationStatus,
             Self::OperationProgress(_) => MessageType::OperationProgress,
+            Self::CardStatus(_) => MessageType::CardStatus,
             Self::Error(_) => MessageType::Error,
         }
     }
@@ -293,6 +318,7 @@ impl TypedMessage {
             Self::PairingHello(value) => pairing_hello_to_body(value),
             Self::PairingConfirm(value) => pairing_confirm_to_body(value),
             Self::PairingAbort(value) => pairing_abort_to_body(value),
+            Self::PairingStored(value) => Ok(pairing_stored_to_body(*value)),
             Self::SessionReady(value) => session_ready_to_body(value),
             Self::SessionClose(value) => Ok(session_close_to_body(*value)),
             Self::LivenessPing(value) | Self::LivenessPong(value) => Ok(liveness_to_body(*value)),
@@ -310,6 +336,7 @@ impl TypedMessage {
             }
             Self::OperationStatus(value) => status_to_body(value),
             Self::OperationProgress(value) => Ok(value.to_wire_body()),
+            Self::CardStatus(value) => Ok(card_status_to_body(*value)),
             Self::Error(value) => Ok(error_to_body(*value)),
         }
     }
@@ -404,6 +431,38 @@ fn pairing_abort_from_body(
     require_empty(&body)?;
     validate_label(&reason, "reason")?;
     Ok(PairingAbortMessage { reason })
+}
+
+fn pairing_stored_to_body(value: PairingStoredMessage) -> BTreeMap<String, WireValue> {
+    let mut body = BTreeMap::new();
+    body.insert(
+        "pair_id".into(),
+        WireValue::Bytes(value.pair_id.as_bytes().to_vec()),
+    );
+    body
+}
+
+fn pairing_stored_from_body(
+    mut body: BTreeMap<String, WireValue>,
+) -> Result<PairingStoredMessage, MessageError> {
+    let pair_id = PairId::reconstruct(&take_bytes(&mut body, "pair_id")?)
+        .map_err(|_| MessageError::InvalidField("pair_id"))?;
+    require_empty(&body)?;
+    Ok(PairingStoredMessage { pair_id })
+}
+
+fn card_status_to_body(value: CardStatusMessage) -> BTreeMap<String, WireValue> {
+    let mut body = BTreeMap::new();
+    body.insert("card_present".into(), WireValue::Bool(value.card_present));
+    body
+}
+
+fn card_status_from_body(
+    mut body: BTreeMap<String, WireValue>,
+) -> Result<CardStatusMessage, MessageError> {
+    let card_present = take_bool(&mut body, "card_present")?;
+    require_empty(&body)?;
+    Ok(CardStatusMessage { card_present })
 }
 
 fn negotiated_parameters_to_map(value: &NegotiatedParameters) -> BTreeMap<String, WireValue> {

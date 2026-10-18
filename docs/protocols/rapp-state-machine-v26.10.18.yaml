@@ -1,7 +1,6 @@
 protocol: RAPP
-document_version: "26.9.13"
-supersedes: "26.9.7.70"
-wire_version: "26.9.13"
+document_version: "26.10.18"
+wire_version: "26.10.18"
 status: external-review
 
 semantics:
@@ -672,22 +671,22 @@ operation:
       event: result_denied_received
       role: requester
       to: denied
-      actions: [journal_denied]
+      actions: [send_result_ack, journal_denied]
     - from: [requested, prepared, committed]
       event: result_cancelled_received
       role: requester
       to: cancelled
-      actions: [journal_cancelled]
+      actions: [send_result_ack, journal_cancelled]
     - from: [requested, prepared, committed]
       event: result_rejected_received
       role: requester
       to: rejected
-      actions: [journal_rejected]
+      actions: [send_result_ack, journal_rejected]
     - from: [requested, prepared, committed]
       event: result_credential_rejected_received
       role: requester
       to: credential_rejected
-      actions: [journal_credential_rejected, revoke_pair_after_credential_rejection]
+      actions: [send_result_ack, journal_credential_rejected, revoke_pair_after_credential_rejection]
     - from: committed
       event: result_completed_received
       role: requester
@@ -697,7 +696,7 @@ operation:
       event: result_ambiguous_received
       role: requester
       to: ambiguous
-      actions: [journal_ambiguous, prohibit_retry]
+      actions: [send_result_ack, journal_ambiguous, prohibit_retry]
     - from: committed
       event: session_closed_post_commit # produced by rule X-03
       role: requester

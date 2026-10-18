@@ -324,7 +324,79 @@ Each CAST should produce: the control structure at the time, the
 controllers' process models, the feedback each lacked, and the
 recommendation that generalises beyond the one incident.
 
-## 9. Open questions
+## 9. CAST: a browser login through the phone, 2026-10-18
+
+**Status:** preliminary. The phone's own per-command timings have not
+been read yet; the timeline below comes from the requester's log and
+the phone's system log, which show when each command left, not when the
+card answered.
+
+### 9.1 What happened
+
+A browser login on the requester, with the card on the phone, failed
+twice and succeeded on the third attempt. Each attempt opened a fresh
+NFC session on the phone and ran the full card choreography.
+
+| Step | Failed attempt | Successful attempt |
+| :--- | :--- | :--- |
+| Browser asks, requester opens the session to the phone | 0.3 s | 0.3 s |
+| Phone opens the NFC session, finds the card, selects the application | 1.4 s | 0.25 s |
+| First commands to the card | 5 in 0.2 s | 6 in 0.3 s |
+| No command to the card | 2.6 s | 1.3 s |
+| Next command | RF error ("Tag Error"), card reported removed | 1 command, then 1.1 s with no command |
+| Remaining commands and the signature | - | 9 commands in 1.4 s |
+| NFC field left on after the result was delivered | - | 3.6 s |
+
+The requester then refused the browser's immediate retries for 15
+seconds under its back-off, so the user's own retry inside that window
+was refused silently.
+
+### 9.2 Control structure at the time
+
+Browser -> CryptoTokenKit token (requester) -> requester app -> RAPP
+session -> phone app -> CryptoTokenKit NFC slot daemon -> NFC daemon ->
+card, with the holder above the phone app. Three feedback paths were
+missing or wrong:
+
+- The requester offered the identity to the browser on the strength of
+  the phone's discovery record, with no word from the phone about the
+  card (UCA-3, scenario 6.2).
+- The requester's back-off hid the state from the holder: a refusal
+  looked like nothing happening (UCA-7, scenario 6.5).
+- The phone app's own timeline is private in the system log, so neither
+  the requester nor an observer could see what the phone was waiting
+  for during the silent stretch; only the phone's diagnostics report
+  carries per-command timings.
+
+### 9.3 Causal analysis
+
+- The phone ran a new NFC session and the full PACE handshake for every
+  browser request. On the contactless interface the card computes two
+  brainpoolP384r1 point multiplications during PACE, each on the order
+  of a second under the field, and a signing request needs PACE, the
+  PIN and the signature in one session.
+- The silent stretch before the RF error is where the card was most
+  likely computing or waiting; a card that answers late under a weak
+  coupling loses the link, and the phone reports the card removed. The
+  requester's engine math is not the cause: the phone's package is
+  compiled optimised, and the handshake arithmetic measures tens of
+  milliseconds.
+- The field stayed on for 3.6 s after the result left, which costs
+  nothing for that request and everything for the next: the phone's
+  NFC controller warms about 7 C per second under the field.
+- The controller temperature itself was examined and ruled out as a
+  cause: the failure came at 45 C, the success at 82 C.
+
+### 9.4 Recommendations
+
+| ID | Recommendation | Closes |
+| :--- | :--- | :--- |
+| R-13 | While the card stays on the phone, keep the NFC session and the PACE secure channel open across requests, and run PACE when the card is first seen rather than when a request arrives, so a browser request costs the PIN and the signature only. | 9.3, UCA-6 |
+| R-14 | End the NFC session as soon as the result has left, or at an idle limit measured in seconds, never later. | 9.3 |
+| R-15 | Read the phone's diagnostics report, which carries per-command round-trip times, before touching the handshake code, and record the command that took the time in this section. | 9.3 |
+| R-16 | Implemented in the 26.10.18 adoption: the requester offers the identity only while a session reports a card, and the phone reports absence as soon as an operation ends without the card answering, so a retrying browser finds nothing to retry; the back-off is gone. | UCA-3, UCA-7 |
+
+## 10. Open questions
 
 - Which of R-1 to R-6 are worth a protocol version, and which are better
   served by application behaviour over the existing messages?

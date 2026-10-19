@@ -846,7 +846,70 @@ record all along, and a query sent there would have been answered.
 | R-44 | The requester remembers the addresses a paired phone answered from, beside the pairing record, and every browse for that pairing sends the query to them directly as well as to the group. The addresses are a cache: losing them costs a slower discovery, never a pairing, and a pairing's removal drops them. The pairing ceremony, which knows no address, browses the group alone. | UCA-48 |
 | R-45 | "No phone found" is reported only after the remembered addresses were asked directly and did not answer. | UCA-49 |
 
-## 14. Open questions
+## 14. CAST: a signature refused as a mismatch, 2026-10-19
+
+### 14.1 What happened
+
+A browser login through the phone at kortti.tunnistautuminen.suomi.fi
+from a Unix requester failed every time, while the same login at a site
+negotiating TLS 1.3 succeeded. The phone's trace showed the card
+signing and the result sent; the browser showed a handshake failure
+two seconds later, and the phone's trace showed a new session with a
+certificate read right after. The requester's local check of the
+signature (R-19) had refused it as a mismatch, dropped the cached
+certificate, and closed the session. The server had asked for
+ECDSA with SHA-384 over a P-256 key, which TLS 1.2 allows; the check
+demanded a P-384 key for a SHA-384 digest.
+
+### 14.2 The control structure at the time
+
+Three controllers handled one value, each with its own model of what
+it meant:
+
+- NSS, in the browser, asked the module for `CKM_ECDSA` over 48 bytes.
+  The mechanism names no hash; the bytes are a digest and nothing says
+  of what.
+- The module's token named the request `EcdsaSha384` from the digest's
+  length: a hash inferred, not told, and the name then carried it as a
+  fact.
+- The requester's verifier took `EcdsaSha384Raw` to mean the document
+  signature profile of that name, in which the hash and the curve are
+  one choice, and required the key's curve to be P-384.
+
+The card signed the 48 bytes under its P-256 key as ECDSA says, taking
+the digest's leftmost 256 bits. The signature was right; the model of
+it was not.
+
+### 14.3 Why the control structure allowed it
+
+- **No refinement in the type.** One enum value stood for "ECDSA with
+  SHA-384" in the sense of a fixed profile and for "ECDSA over a 48-byte
+  digest" in the sense of a TLS request. The type carried a curve it
+  had no right to carry. A digest's length is the hash's; a coordinate's
+  width is the key's; a type that holds both as one name invites the
+  reader to assume they agree.
+- **A fact inferred and then asserted.** The token turned a length into
+  a hash name because the request type demanded a hash. The inference
+  was harmless until a consumer read the name as more than a length.
+- **A check added without its vectors.** The local verification was
+  added for the mismatch case (R-19) with a test that a certificate
+  parsing as nothing verifies nothing. No test ran a real signature for
+  each pairing of curve and hash the requester would meet; the one
+  field test, a TLS 1.3 site, pairs P-256 with SHA-256 and passed.
+- **The failure wore another failure's clothes.** A refused signature
+  was reported to the browser as ambiguous and to the record as a
+  certificate that was not the card's, so the first symptoms, a dropped
+  cache and a fresh certificate read, pointed at the card and the
+  phone, not at the verifier.
+
+### 14.4 Recommendations
+
+| ID | Requirement | Closes |
+| :--- | :--- | :--- |
+| R-48 | A signature request names the hash of its digest and nothing about the key; the key's curve is read from the key. No type in the request path carries a hash and a curve as one value. Where the hash is not told, as under `CKM_ECDSA`, the request carries the digest's length as a length, and the verifier takes the leftmost bits as the curve's order allows, as the card does. | 14.3 |
+| R-49 | Every local check of a signature ships with a vector for each pairing of curve and hash a browser can ask for (P-256 and P-384 with SHA-256, SHA-384 and SHA-512 at least), and a refusal by the check is reported as the check's refusal, distinguishable from a lost signature and from a card that is not the cached one. | 14.3 |
+
+## 15. Open questions
 
 - Which of R-1 to R-6 are worth a protocol version, and which are better
   served by application behaviour over the existing messages?

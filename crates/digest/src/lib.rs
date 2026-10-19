@@ -251,6 +251,51 @@ impl Sha512 {
     }
 }
 
+impl core::fmt::Display for Sha1 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for b in &self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl core::fmt::Display for Sha224 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for b in &self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl core::fmt::Display for Sha256 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for b in &self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl core::fmt::Display for Sha384 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for b in &self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl core::fmt::Display for Sha512 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for b in &self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 /// A SHA-1/SHA-2 hash-algorithm identifier.
 ///
 /// Parsed from a platform-supplied name and used to size or select a
@@ -460,5 +505,15 @@ mod tests {
         assert_eq!(HashAlg::Sha256.digest_len(), SHA256_LEN);
         assert_eq!(HashAlg::Sha384.digest_len(), SHA384_LEN);
         assert_eq!(HashAlg::Sha512.digest_len(), SHA512_LEN);
+    }
+
+    #[test]
+    fn sha256_display_is_lowercase_hex() {
+        let s = Sha256::of(b"abc");
+        assert_eq!(
+            format!("{s}"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(s.as_bytes(), &SHA256_ABC);
     }
 }

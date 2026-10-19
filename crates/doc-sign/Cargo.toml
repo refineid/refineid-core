@@ -1,0 +1,59 @@
+[package]
+name = "refineid-doc-sign"
+description = "Document signing: PAdES, ASiC-E, CAdES, and XAdES over FINEID credentials"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "refineid_doc_sign"
+path = "src/lib.rs"
+doctest = false
+
+[features]
+default = ["pcsc"]
+pcsc = [
+    "dep:refineid-apdu",
+    "dep:refineid-auth",
+    "dep:refineid-pace",
+    "dep:refineid-pcsc",
+    "dep:refineid-pkcs15",
+    "dep:refineid-sign",
+]
+
+[dependencies]
+refineid-apdu = { workspace = true, optional = true }
+refineid-auth = { workspace = true, optional = true }
+refineid-ber.workspace = true
+refineid-cms.workspace = true
+refineid-digest.workspace = true
+refineid-pace = { workspace = true, optional = true }
+refineid-pcsc = { workspace = true, optional = true }
+refineid-pkcs15 = { workspace = true, optional = true }
+refineid-sign = { workspace = true, optional = true }
+
+const-oid.workspace = true
+crypto-bigint.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+miniz_oxide.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+spki.workspace = true
+x509-cert.workspace = true
+zeroize.workspace = true
+
+
+[dev-dependencies]
+refineid-apdu.workspace = true
+refineid-auth.workspace = true
+refineid-pace.workspace = true
+refineid-pcsc.workspace = true
+refineid-pkcs15.workspace = true
+refineid-sign.workspace = true
+
+[lints]
+workspace = true

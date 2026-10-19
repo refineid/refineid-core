@@ -30,6 +30,7 @@ pub use fs::{
     EF_ROOT_CA_FID, EF_SIGN_CERT_ALT_FID, EF_SIGN_CERT_FID, EF_TOKEN_INFO_FID, ESIGN_AID,
     PKCS15_AID, Pkcs15Error, Pkcs15Ops,
 };
+pub use refineid_x509::UnvalidatedCertificate;
 pub use token_info::TokenInfo;
 pub use token_serial::{PrintedSerial, TokenSerial, derive_printed_serial, render_token_serial};
 

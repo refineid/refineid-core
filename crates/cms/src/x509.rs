@@ -231,9 +231,9 @@ impl Certificate<'_> {
     pub fn verify_signed_by(&self, issuer: Certificate<'_>) -> Result<(), VerifyError> {
         verify_tbs_signature(TbsSignature {
             tbs_der: self.tbs_der,
-            signature_alg_oid: self.signature_alg_oid.as_bytes(),
+            signature_alg_oid: self.signature_alg_oid,
             signature_bits: self.signature_bits,
-            issuer_spki_der: issuer.spki.as_der(),
+            issuer_spki: issuer.spki,
         })
     }
 }
@@ -375,7 +375,7 @@ impl<'a> Certificate<'a> {
     /// Any BER-level decode failure, or a top-level shape that does not
     /// look like `Certificate ::= SEQUENCE { TBSCertificate,
     /// AlgorithmIdentifier, BIT STRING }`.
-    pub(crate) fn from_der(der: &'a [u8]) -> Result<Self, X509Error> {
+    pub fn from_der(der: &'a [u8]) -> Result<Self, X509Error> {
         // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm,
         // signature }. Walk the three children with the vetted `der`
         // reader, capturing each as its exact input-borrowed TLV slice
@@ -701,8 +701,8 @@ impl SignatureAlgorithm {
     /// variant. Returns [`SignatureAlgorithm::Other`] for any
     /// OID this matcher doesn't recognise.
     #[must_use]
-    pub fn from_oid(oid: &[u8]) -> Self {
-        match oid {
+    pub fn from_oid(oid: Oid<'_>) -> Self {
+        match oid.as_bytes() {
             v if v == OID_SHA256_WITH_RSA => Self::Sha256WithRsa,
             v if v == OID_SHA384_WITH_RSA => Self::Sha384WithRsa,
             v if v == OID_SHA512_WITH_RSA => Self::Sha512WithRsa,
@@ -884,33 +884,33 @@ pub enum MessageSignatureAlgorithm {
 }
 
 /// Inputs needed to verify one TBS signature.
-pub(crate) struct TbsSignature<'a> {
+pub struct TbsSignature<'a> {
     /// DER bytes covered by the signature.
     pub tbs_der: &'a [u8],
     /// Signature algorithm OID.
-    pub signature_alg_oid: &'a [u8],
+    pub signature_alg_oid: Oid<'a>,
     /// Signature BIT STRING payload.
     pub signature_bits: &'a [u8],
-    /// Issuer `SubjectPublicKeyInfo` DER.
-    pub issuer_spki_der: &'a [u8],
+    /// Issuer `SubjectPublicKeyInfo`.
+    pub issuer_spki: SpkiDer<'a>,
 }
 
 /// Verify a signature against a TBS body.
 ///
 /// `signature_bits` is the raw signature, `signature_alg_oid`
-/// picks the verifier, and the issuer's `spki_der` gives the
+/// picks the verifier, and the issuer's `issuer_spki` gives the
 /// public key. Used for cert chain, CRL,
 /// and basic-OCSP-response verification.
 ///
 /// # Errors
 /// [`VerifyError`] variants as listed; only RSA-PKCS1v15 SHA-256
 /// is implemented today.
-pub(crate) fn verify_tbs_signature(
+pub fn verify_tbs_signature(
     TbsSignature {
         tbs_der,
         signature_alg_oid,
         signature_bits,
-        issuer_spki_der,
+        issuer_spki,
     }: TbsSignature<'_>,
 ) -> Result<(), VerifyError> {
     use crate::container::{RsaPkcs1Sha256, RsaPkcs1Sha384, RsaPkcs1Sha512, Signature};
@@ -918,18 +918,21 @@ pub(crate) fn verify_tbs_signature(
     let alg = SignatureAlgorithm::from_oid(signature_alg_oid);
     match alg {
         SignatureAlgorithm::Sha256WithRsa => {
-            let k = extract_rsa_public_key(issuer_spki_der).ok_or(VerifyError::BadIssuerKey)?;
+            let k =
+                extract_rsa_public_key(issuer_spki.as_der()).ok_or(VerifyError::BadIssuerKey)?;
             let sig = Signature::<RsaPkcs1Sha256>::new(signature_bits.to_vec());
             k.verify_pkcs1v15_sha256(tbs_der, &sig)
                 .map_err(VerifyError::Rsa)
         }
         SignatureAlgorithm::Sha384WithRsa => {
-            let k = extract_rsa_public_key(issuer_spki_der).ok_or(VerifyError::BadIssuerKey)?;
+            let k =
+                extract_rsa_public_key(issuer_spki.as_der()).ok_or(VerifyError::BadIssuerKey)?;
             let sig = Signature::<RsaPkcs1Sha384>::new(signature_bits.to_vec());
             verify_pkcs1v15_sha384(&k, tbs_der, &sig).map_err(VerifyError::Rsa)
         }
         SignatureAlgorithm::Sha512WithRsa => {
-            let k = extract_rsa_public_key(issuer_spki_der).ok_or(VerifyError::BadIssuerKey)?;
+            let k =
+                extract_rsa_public_key(issuer_spki.as_der()).ok_or(VerifyError::BadIssuerKey)?;
             let sig = Signature::<RsaPkcs1Sha512>::new(signature_bits.to_vec());
             verify_pkcs1v15_sha512(&k, tbs_der, &sig).map_err(VerifyError::Rsa)
         }
@@ -937,7 +940,7 @@ pub(crate) fn verify_tbs_signature(
         | SignatureAlgorithm::EcdsaWithSha384
         | SignatureAlgorithm::EcdsaWithSha512 => {
             let (curve, pubkey) =
-                extract_ec_pubkey(issuer_spki_der).ok_or(VerifyError::BadIssuerKey)?;
+                extract_ec_pubkey(issuer_spki.as_der()).ok_or(VerifyError::BadIssuerKey)?;
             // Caller picks the hash via the signature-alg OID;
             // we feed `verify_prehashed` the digest of the TBS
             // bytes under that hash. Only the three ECDSA
@@ -998,6 +1001,13 @@ impl<'a> SpkiDer<'a> {
     #[must_use]
     pub const fn as_der(&self) -> &'a [u8] {
         self.der
+    }
+
+    /// Raw `subjectPublicKey` BIT STRING value (unused-bits octet stripped).
+    /// Used e.g. for OCSP IssuerKeyHash calculation.
+    #[must_use]
+    pub const fn subject_public_key_bits(&self) -> &'a [u8] {
+        self.subject_public_key
     }
 
     /// Parsed algorithm summary from the `AlgorithmIdentifier`

@@ -105,8 +105,8 @@ impl HashAlgorithm {
     /// OID that isn't one of the three SHA-2 variants refineid
     /// supports.
     #[must_use]
-    pub fn from_oid(oid: &[u8]) -> Option<Self> {
-        match oid {
+    pub fn from_oid(oid: crate::oid::Oid<'_>) -> Option<Self> {
+        match oid.as_bytes() {
             v if v == known::SHA256.as_bytes() => Some(Self::Sha256),
             v if v == known::SHA384.as_bytes() => Some(Self::Sha384),
             v if v == known::SHA512.as_bytes() => Some(Self::Sha512),
@@ -182,9 +182,6 @@ pub enum CmsError {
     /// `Hash(eContent)`. Signature wasn't verified after this
     /// check failed (one of two PA preconditions per RFC 5652).
     SignerHashMismatch,
-    /// `eContent` OCTET STRING was missing -- detached `SignedData`
-    /// isn't supported (eMRTD SOD always carries eContent).
-    DetachedNotSupported,
     /// RSA signature verification (against the signer's
     /// PKCS#1 v1.5 key) failed.
     Rsa(RsaVerifyError),
@@ -216,7 +213,6 @@ impl core::fmt::Display for CmsError {
             }
             Self::BadSignerKey => write!(f, "CMS: signer key did not parse as RSA"),
             Self::SignerHashMismatch => write!(f, "CMS: messageDigest attr != hash(eContent)"),
-            Self::DetachedNotSupported => write!(f, "CMS: detached SignedData not supported"),
             Self::Rsa(e) => write!(f, "CMS: RSA verify: {e}"),
             Self::Ecdsa(e) => write!(f, "CMS: ECDSA verify: {e}"),
         }
@@ -423,7 +419,7 @@ impl<'a> SignedData<'a> {
     /// The detection is by the outer tag byte; the function never
     /// touches the inner certificate / signature material beyond
     /// borrowing slices from `input` (lifetime-tied output).
-    pub(crate) fn parse(input: &'a [u8]) -> Result<Self, CmsError> {
+    pub fn parse(input: &'a [u8]) -> Result<Self, CmsError> {
         // `split_first` fuses the empty-input check and the first-byte
         // peek into one pattern, leaving no bare indexing on `input[0]`.
         let Some((&first, _rest)) = input.split_first() else {
@@ -598,21 +594,30 @@ impl CmsHelpers {
         let econtent_type_oid = crate::oid::Oid::new(econtent_type.value()).or(Err(
             CmsError::UnexpectedStructure("eContentType OID malformed"),
         ))?;
-        let econtent_explicit = e_it
-            .next()
-            .ok_or(CmsError::DetachedNotSupported)??
-            .expect::<Asn1ContentExplicit0>()
-            .or(Err(CmsError::DetachedNotSupported))?;
-        if e_it.next().is_some() {
-            return Err(CmsError::UnexpectedStructure(
-                "encapContentInfo has trailing fields",
-            ));
-        }
-        let econtent_octet = Self::parse_exact::<OctetString>(
-            econtent_explicit.value(),
-            "trailing bytes in eContent",
-        )?;
-        let econtent_der = econtent_octet.value();
+        // `eContent [0] EXPLICIT` is optional: absent means the
+        // detached form, where the caller supplies the content by
+        // overwriting `econtent_der` before `verify` (the `ASiC`
+        // verifier does this with the manifest bytes). Until then
+        // the field reads empty, and `verify` fails closed on any
+        // signature whose messageDigest does not match empty input.
+        let econtent_der = match e_it.next() {
+            None => b"".as_slice(),
+            Some(field) => {
+                let explicit = field?.expect::<Asn1ContentExplicit0>().or(Err(
+                    CmsError::UnexpectedStructure("eContent is not [0] EXPLICIT"),
+                ))?;
+                if e_it.next().is_some() {
+                    return Err(CmsError::UnexpectedStructure(
+                        "encapContentInfo has trailing fields",
+                    ));
+                }
+                let econtent_octet = Self::parse_exact::<OctetString>(
+                    explicit.value(),
+                    "trailing bytes in eContent",
+                )?;
+                econtent_octet.value()
+            }
+        };
 
         let mut remaining = Vec::new();
         for tlv in it {
@@ -1054,7 +1059,7 @@ impl SignedData<'_> {
     /// Cross-check failure, unsupported algorithm, or RSA
     /// verifier rejection.
     pub fn verify(&self, signer_spki_der: &[u8]) -> Result<(), CmsError> {
-        let digest_alg = HashAlgorithm::from_oid(self.signer.digest_algorithm_oid.as_bytes())
+        let digest_alg = HashAlgorithm::from_oid(self.signer.digest_algorithm_oid)
             .ok_or(CmsError::UnsupportedDigestAlgorithm)?;
 
         // Signed attributes are only safe when they bind the eContent.
@@ -1292,8 +1297,11 @@ impl<'a> LdsSecurityObject<'a> {
         let hash_oid_tlv = BerTlv::<Oid>::parse(hash_alg_seq.value()).or(Err(
             CmsError::UnexpectedStructure("hashAlgorithm OID missing"),
         ))?;
-        let hash_algorithm = HashAlgorithm::from_oid(hash_oid_tlv.value())
-            .ok_or(CmsError::UnsupportedDigestAlgorithm)?;
+        let hash_oid = crate::oid::Oid::new(hash_oid_tlv.value()).or(Err(
+            CmsError::UnexpectedStructure("hashAlgorithm OID malformed"),
+        ))?;
+        let hash_algorithm =
+            HashAlgorithm::from_oid(hash_oid).ok_or(CmsError::UnsupportedDigestAlgorithm)?;
         // dataGroupHashValues SEQUENCE OF DataGroupHash
         let dgh_seq = it
             .next()
@@ -1727,25 +1735,23 @@ mod tests {
     #[test]
     fn hash_algorithm_from_oid_maps_sha2_only() {
         assert_eq!(
-            HashAlgorithm::from_oid(known::SHA256.as_bytes()),
+            HashAlgorithm::from_oid(known::SHA256),
             Some(HashAlgorithm::Sha256)
         );
         assert_eq!(
-            HashAlgorithm::from_oid(known::SHA384.as_bytes()),
+            HashAlgorithm::from_oid(known::SHA384),
             Some(HashAlgorithm::Sha384)
         );
         assert_eq!(
-            HashAlgorithm::from_oid(known::SHA512.as_bytes()),
+            HashAlgorithm::from_oid(known::SHA512),
             Some(HashAlgorithm::Sha512)
         );
         // A valid OID that is not one of the three SHA-2 variants.
-        assert_eq!(
-            HashAlgorithm::from_oid(known::RSA_ENCRYPTION.as_bytes()),
-            None
-        );
-        // Arbitrary non-OID bytes / empty.
-        assert_eq!(HashAlgorithm::from_oid(NOT_AN_OID), None);
-        assert_eq!(HashAlgorithm::from_oid(b""), None);
+        assert_eq!(HashAlgorithm::from_oid(known::RSA_ENCRYPTION), None);
+        let other_oid = crate::oid::Oid::new(NOT_AN_OID).expect("valid OID encoding");
+        assert_eq!(HashAlgorithm::from_oid(other_oid), None);
+        // Empty slice is rejected at the Oid constructor boundary.
+        assert!(crate::oid::Oid::new(b"").is_err());
     }
 
     #[test]
@@ -1907,9 +1913,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_detached_signeddata() {
+    fn accepts_detached_encap_content_info() {
         // SignedData whose encapContentInfo carries eContentType but
-        // no eContent OCTET STRING -- the detached form is unsupported.
+        // no eContent OCTET STRING: the detached form. The failure
+        // must move past the encap stage (missing signerInfos, not
+        // missing eContent); the full detached round trip -- parse,
+        // supply external content, verify -- is covered by the
+        // `asic_verify` openssl interop test.
         let encap = tlv(
             tag_byte::<Sequence>(),
             tlv(
@@ -1929,7 +1939,9 @@ mod tests {
         let sd_seq = tlv(tag_byte::<Sequence>(), &body);
         assert!(matches!(
             SignedData::parse(&sd_seq),
-            Err(CmsError::DetachedNotSupported)
+            Err(CmsError::UnexpectedStructure(
+                "SignedData missing signerInfos"
+            ))
         ));
     }
 
@@ -2256,10 +2268,6 @@ mod tests {
         assert_eq!(
             CmsError::SignerHashMismatch.to_string(),
             "CMS: messageDigest attr != hash(eContent)"
-        );
-        assert_eq!(
-            CmsError::DetachedNotSupported.to_string(),
-            "CMS: detached SignedData not supported"
         );
     }
 

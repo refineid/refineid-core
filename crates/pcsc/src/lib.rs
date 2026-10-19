@@ -578,6 +578,205 @@ pub trait ReaderBackend {
     }
 }
 
+/// Errors surfaced by `pick_single_reader` when the count of
+/// card-present readers can't be reduced to exactly one
+/// unambiguously.
+///
+/// The rule the picker enforces is the project's universal
+/// multi-card-safety policy: when more than one card is
+/// inserted across the connected readers, the caller MUST
+/// disambiguate via `--reader SUBSTR`. The picker never guesses;
+/// guessing could fire a card-state-changing APDU (PIN verify,
+/// signature, PUK rotation) against the wrong physical card.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum ReaderPickError {
+    /// `backend.enumerate()` returned no readers at all.
+    NoReaders,
+    /// One or more readers connected, none with a card inserted.
+    NoCardPresent,
+    /// More than one card-present reader, and the caller didn't
+    /// supply a `--reader` filter. `available` lists every
+    /// card-present reader name so the caller can surface an
+    /// actionable error message.
+    MultipleReadersNoFilter {
+        /// Connected card-present reader names. Tier 0
+        /// `Vec<String>`; presentational.
+        available: Vec<String>,
+    },
+    /// `filter` was supplied but matched no card-present reader.
+    NoMatchingReader {
+        /// The filter string the operator supplied. Tier 0
+        /// `String`; presentational.
+        filter: String,
+        /// Connected card-present reader names presented back
+        /// so the operator can correct the filter.
+        available: Vec<String>,
+    },
+    /// `filter` was supplied and matched more than one
+    /// card-present reader. The caller has to narrow it.
+    AmbiguousFilter {
+        /// The filter string the operator supplied.
+        filter: String,
+        /// Card-present reader names that matched the filter.
+        matched: Vec<String>,
+    },
+    /// Cards are inserted, but none of them respond as FINEID
+    /// when probed (no SELECT PKCS#15 success). Surfaced only
+    /// by `pkcs15::pick_fineid_reader`, which probes
+    /// every card-present reader to skip non-FINEID tokens like
+    /// YubiKey-in-CCID-mode.
+    NoFineidCard {
+        /// Card-present reader names that didn't respond as
+        /// FINEID. Helps the operator see which readers had
+        /// non-FINEID tokens.
+        available: Vec<String>,
+    },
+}
+
+impl core::fmt::Display for ReaderPickError {
+    #[expect(
+        clippy::use_debug,
+        reason = "operator-supplied --reader filter strings are rendered with Debug-quoting so whitespace-only / empty / control-character inputs surface visibly in diagnostics; `{filter}` would silently drop those distinctions"
+    )]
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NoReaders => write!(f, "no PC/SC readers connected"),
+            Self::NoCardPresent => write!(f, "no card present in any reader"),
+            Self::MultipleReadersNoFilter { available } => write!(
+                f,
+                "{} cards present; pass --reader SUBSTR to pick one: [{}]",
+                available.len(),
+                available.join(", ")
+            ),
+            Self::NoMatchingReader { filter, available } => write!(
+                f,
+                "no card-present reader matched --reader {filter:?}; \
+                 connected card-present readers: [{}]",
+                available.join(", ")
+            ),
+            Self::AmbiguousFilter { filter, matched } => write!(
+                f,
+                "--reader {filter:?} matched more than one card-present reader: \
+                 [{}] -- narrow the substring",
+                matched.join(", ")
+            ),
+            Self::NoFineidCard { available } => write!(
+                f,
+                "no FINEID-format card responded to probe; readers had cards \
+                 but none accepted SELECT PKCS#15: [{}]",
+                available.join(", ")
+            ),
+        }
+    }
+}
+
+impl core::error::Error for ReaderPickError {}
+
+/// Operator-supplied reader-name substring filter, typed at the
+/// trust boundary.
+///
+/// Used by the `--reader SUBSTR` CLI option and by the
+/// programmatic picker entry points to narrow which card-present
+/// reader the operation targets. The constructor is the single
+/// place an arbitrary string crosses into "matches an actual
+/// reader name" semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ReaderFilter(String);
+
+impl ReaderFilter {
+    /// Wrap an owned filter string. No structural validation:
+    /// the substring will be matched against
+    /// `ReaderInfo::id.as_str().contains(filter)`, so an empty
+    /// string matches every reader (which is rarely useful, but
+    /// not an error -- callers usually skip the filter
+    /// altogether for that case).
+    #[must_use]
+    pub fn new<S: AsRef<str>>(s: S) -> Self {
+        Self(s.as_ref().to_owned())
+    }
+
+    /// Borrow the underlying filter string for matching.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl core::fmt::Display for ReaderFilter {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Pick exactly one card-present reader, enforcing the project's
+/// universal multi-card-safety rule.
+pub fn pick_single_reader<B: ReaderBackend>(
+    backend: &B,
+    filter: Option<ReaderFilter>,
+) -> Result<ReaderId, ReaderPickError>
+where
+    B::Error: core::fmt::Display,
+{
+    let readers = backend
+        .enumerate()
+        .map_err(|_backend_err| ReaderPickError::NoReaders)?;
+    if readers.is_empty() {
+        return Err(ReaderPickError::NoReaders);
+    }
+    let present: Vec<ReaderInfo> = readers.into_iter().filter(|r| r.card_present).collect();
+    if present.is_empty() {
+        return Err(ReaderPickError::NoCardPresent);
+    }
+
+    filter.map_or_else(
+        || match present.as_slice() {
+            [single] => Ok(single.id.clone()),
+            many => Err(ReaderPickError::MultipleReadersNoFilter {
+                available: many.iter().map(|r| r.id.as_str().to_owned()).collect(),
+            }),
+        },
+        |f| {
+            let needle = f.as_str();
+            let matched: Vec<&ReaderInfo> = present
+                .iter()
+                .filter(|r| r.id.as_str().contains(needle))
+                .collect();
+            match matched.as_slice() {
+                [] => Err(ReaderPickError::NoMatchingReader {
+                    filter: needle.to_owned(),
+                    available: present.iter().map(|r| r.id.as_str().to_owned()).collect(),
+                }),
+                [single] => Ok(single.id.clone()),
+                many => Err(ReaderPickError::AmbiguousFilter {
+                    filter: needle.to_owned(),
+                    matched: many.iter().map(|r| r.id.as_str().to_owned()).collect(),
+                }),
+            }
+        },
+    )
+}
+
+/// Extension trait that hosts the multi-card-safety picker on
+/// every [`ReaderBackend`].
+pub trait ReaderBackendOps: ReaderBackend
+where
+    Self::Error: core::fmt::Display,
+{
+    /// See [`pick_single_reader`].
+    ///
+    /// # Errors
+    /// As for [`pick_single_reader`].
+    fn pick_single_reader(&self, filter: Option<ReaderFilter>) -> Result<ReaderId, ReaderPickError>
+    where
+        Self: Sized,
+    {
+        pick_single_reader(self, filter)
+    }
+}
+
+impl<B: ReaderBackend + ?Sized> ReaderBackendOps for B where B::Error: core::fmt::Display {}
+
 /// Reader (IFD) hardware version from `SCARD_ATTR_VENDOR_IFD_VERSION`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IfdVersion {

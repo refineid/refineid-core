@@ -408,13 +408,14 @@ process, beside the requester the user sees.
 ### 10.1 The design
 
 The PKCS#11 module that Firefox loads through p11-kit gains one slot
-for the one phone paired with the computer. The slot's token is present
-while the module holds an open session to the phone and the phone
-reports a card in the field (specification §8.4); the module dials when
-the phone's record carries a card-present hint (§4.5) and ends the
-session when the card leaves. The token's
-certificate objects are answered from the pairing record on disk, which
-the GUI fills after pairing, so that enumeration never dials the phone.
+for the one phone paired with the computer. The slot's token stands on
+the certificate the pairing record caches, while the pairing does: the
+module dials the phone for a session (§4.5 says when), ends the session
+when the card leaves, and keeps the token through both, so a browser
+that asks before the session is open is given the identity and its
+signature waits for the phone. The token's certificate objects are
+answered from the pairing record on disk, which whichever requester
+first held a session fills, so that enumeration never dials the phone.
 `C_Login` succeeds without reading a PIN: the token declares a
 protected authentication path, and the phone verifies PIN 1 when the
 operation arrives, as it does for every requester (§9.2 carries no
@@ -448,6 +449,7 @@ pairing record; the record on disk is the only channel between them.
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | UCA-16 | Module | Offer the token with the cached certificate | P | When the card on the phone is not the card the certificate was read from: the cardholder swapped cards, or a new card was issued, so the browser offers one identity and the phone signs with another. | H-3, H-5 |
 | UCA-17 | Module | Hold the session | P | When no login is wanted for hours, so the phone keeps a stream and its advertisement alive for a browser that merely runs; the cost is battery and the phone's "connected" state, and a reconnect storm on a flapping network. | H-6, H-7 |
+| UCA-50 | Module | Offer the token | N | Not before the session to the phone is open, when the browser's first page load at a site that asks for a certificate comes earlier: the browser answers the request with no certificate, and a browser given none at a handshake keeps resuming that handshake for the rest of its run and never asks again, so every later login at that site fails at once while the identity is present and the phone would serve. Seen on 2026-10-19 with Firefox and a site whose server asks for a certificate but admits a client without one. | H-7, H-5 |
 | UCA-18 | Module | Dial the phone again | P | After a close with reason `pairing_revoked`, a verified revocation hint, or a Class 4 refusal, when the record on disk is not yet marked revoked, so the module re-dials a pairing the phone has forgotten and lists it as paired. | H-4 |
 | UCA-19 | Module | Hold the lock while a record lacks a certificate | P | When the GUI is the only writer of the certificate and the module holds the session, so the certificate is never fetched, the token never appears, and the user sees a paired phone that no browser can use. | H-7, H-5 |
 | UCA-20 | Module | Dispatch `C_Sign` | P | When the browser or the relying party will give up before the phone can answer, so the phone asks for a PIN whose signature arrives at a closed connection, and the user is left to guess whether to enter the PIN again. | H-5, H-2 |
@@ -515,6 +517,23 @@ phone listed as paired that never answers. The write of the record and
 the next dial are a race, and the order of the two is the whole
 defence.
 
+**The handshake the browser remembers (UCA-50).** Firefox starts, loads
+the module, and the module's thread starts dialing the phone; the user
+opens the login page within the same seconds. The server asks for a
+certificate, the browser looks at the slot, finds a token without one
+or no token, and completes the handshake without a certificate. The
+server admits the connection and answers that no card was presented.
+The user waits for the module, which holds the session a few seconds
+later and offers the identity, and loads the page again: the browser
+resumes the TLS session it already has with that server, in which no
+certificate was ever asked for, and the server answers as before. Every
+reload does the same, with the identity visible in the browser's own
+list of certificates, until the browser is restarted. The requester's
+process model says the identity should be offered only when it can be
+served; the browser's process model says a server that once asked for
+nothing more will not ask again. L-3 and H-5, and nothing on the
+requester's side can clear the browser's memory.
+
 ### 10.5 Requirements for the design
 
 | ID | Requirement | Closes |
@@ -528,6 +547,7 @@ defence.
 | R-24 | The GUI tells apart "the browser holds the phone session" from "the phone is away", from the lock result, and shows the phone as paired and in use rather than unreachable. | UCA-7 |
 | R-25 | The operation context names the computer and nothing it cannot know; the phone's PIN prompt shows that name and the operation kind. The module never fabricates an origin. | UCA-24 |
 | R-26 | The module dials only when the phone's record carries a card-present hint (§4.5) and holds the session only while `card.status` reports a card, closing it when the card leaves and no operation is in flight (R-28), so a browser that merely runs costs the phone nothing while no card lies on it; `C_Finalize` ends any session. | UCA-17 |
+| R-46 | The token's presence is the pairing record's, not the session's: the token stands on the cached certificate from the module's load, before and between sessions, and goes only when the pairing goes or the certificate proved not to be the card's (R-19). A signature asked while no session is held waits for one within the browser's deadline and wakes the dial out of any pause at once; a request the browser has stopped waiting for is never sent to the card. The phone prompts for the card when none lies on it (section 12). Residual, accepted: with the phone unreachable the browser's handshake fails after the deadline, which the user sees as a failed login rather than a missing identity. | UCA-50 |
 | R-27 | `C_Login` succeeds only while the token is present and otherwise returns the token-absent error, and the token's objects are fixed when the token appears: a changed record withdraws the token and offers a new one, so a handle never outlives its object. | UCA-25, UCA-26 |
 | R-28 | A withdrawal that arrives while an operation is in flight waits for that operation's own result or deadline, which the browser receives as the answer to its `C_Sign`; the token is withdrawn after, and the operation is never resent. | UCA-28 |
 | R-29 | Every session under a pairing is opened under that pairing's lock, by the module, the GUI and the CLI alike; a process that cannot take the lock opens nothing and reports the holder. | UCA-31 |

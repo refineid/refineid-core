@@ -637,7 +637,182 @@ the PIN again. Every component acted as built; the dialog's model of
 | R-38 | A CAN the card rejected is asked again before the next PACE; the backend never repeats PACE with a CAN that failed. | UCA-40 |
 | R-39 | The retained PIN is bound to the card that verified it, by the identity read in the same session, and to its purpose: a different card asks again, and the end of the purpose zeroes it. | UCA-41 |
 
-## 12. Open questions
+## 12. STPA of the iOS custodian's held card session
+
+**Status:** prompted by an incident on 2026-10-18. A browser on a Unix
+computer logged in through the paired iPhone to a site that needs one
+signature, and failed or took tens of seconds on a site that needs
+several signatures in one login. The phone's trace: the first
+`browser_authenticate` completed in 4.7 s, of which PACE took 3.4 s; the
+next request, 14 s later, found the slot without a valid card, ended the
+near-field session and opened a new one within 10 ms, and `nfcd` refused
+the slot (`Reader mode temporarily disabled`); the request was answered
+as card unavailable, and the login failed. The request after that, some
+20 s later, succeeded, and the pattern repeated. A measurement on
+2026-10-19 with requests 3 s apart showed the other half: when the
+field had not idled off and the channel was reused, the holder skipped
+VERIFY on the strength of its own memory that PIN 1 was verified, the
+card refused the signature command with security status not satisfied,
+and the request was answered as ambiguous. A login that asks for two
+signatures failed on the second one either way.
+
+### 12.1 Scope
+
+The iOS application as custodian serving a paired computer over the
+near field: the system NFC slot it opens for a request, the card session
+and PACE channel it prepares on that slot, the hold that keeps the
+session for the next request, and the operations it runs. The contact
+reader path of a desktop custodian is out of scope; its field does not
+idle off.
+
+### 12.2 Control structure
+
+The holder is one controller with one process model, the hold: whether
+a session is open, whether its channel is prepared, whether an operation
+is running, when the session opened and when it last went idle. Its
+actuators are the system slot (open, end), the card session (open, PACE,
+command), and the sheet. Its sensors are the slot's state, the card's
+answers, and its own clock. Around it, the operating system keeps its
+own policy for the field and the reader, and says nothing of it: the
+field idles off within seconds of the last exchange, a session has an
+upper life, and ending a session starts a pause before the reader opens
+again.
+
+| Control action | Controller | Feedback present | Feedback absent |
+| :--- | :--- | :--- | :--- |
+| Open the slot | Holder | A slot, or the system's refusal with its code | How long the reader's pause after the last session lasts |
+| Prepare the channel (PACE) | Holder | The card's answers | Whether the field will hold for the next command |
+| Run the operation | Holder | The card's answer or its loss | Whether the field will hold through it |
+| Skip VERIFY, trusting the remembered verification | Holder | None | Whether the card still holds the security status |
+| Keep the session after an operation | Holder | Nothing until the next request looks at the slot | That the field idled off and the card lost its state |
+| End the session | Holder | None | That a pause follows, during which no slot opens |
+| Answer the request | Holder | None | How the requester's user reads "card unavailable" |
+
+### 12.3 Unsafe control actions
+
+| ID | Controller | Control action | Type | Context | Hazard |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| UCA-43 | Holder | Keep the session after an operation | P | For a hold measured in tens of seconds, when the field idles off within seconds of the last exchange, so the hold's model says a prepared channel and a present card while the card has lost its state; the next request pays an end and a fresh open, and meets the reader's pause. | H-3 |
+| UCA-44 | Holder | Open the slot | T | Within the reader's pause after the session it has just ended, so the system refuses the slot and the request is refused with the card lying on the phone. | H-3 |
+| UCA-45 | Holder | Answer the request | P | As card unavailable for a refusal the holder caused (UCA-44), so the requester's user is told to present a card that is present, and nothing says that waiting would have served. | H-5 |
+| UCA-46 | Holder | End the session | N | Not when the card leaves the field during the hold's idle time, but only when the next request looks at the slot, so the reader's pause runs inside that request's deadline instead of during the idle time. | H-3 |
+| UCA-47 | Holder | Skip VERIFY, trusting the remembered verification | P | For the second operation on a held channel, when the card does not keep PIN 1's security status from one signature to the next, so the signature command is refused and the request is answered as ambiguous: the requester cannot tell a refused command from a lost one, and nothing was signed. | H-3, H-5 |
+
+### 12.4 Loss scenarios
+
+Measured on 2026-10-19 on an iPhone 15 Pro Max: left idle, the slot's
+state went from valid card to missing 6 s to 8 s after the last command;
+kept up by one SELECT every 2 s, the slot still went away 11 s to 22 s
+after it was given, once in the middle of a signature command; and the
+system refused a new slot for 8 s to 11 s after each ending. With the
+keep-alive and the retry, six of seven logins 0 s to 20 s apart
+completed, the ones that met the pause in 16 s to 17 s; without them,
+two of six. The slot's life is the platform's, and a request that meets
+its end pays the pause: a residual the holder cannot remove, only keep
+out of the request's path where the slot lets it.
+
+**The second signature of a login (UCA-43, UCA-44, UCA-45, UCA-46).**
+A login to a site that fetches several resources under client
+authentication, or renegotiates, asks the browser's slot for a signature
+more than once within some seconds. The first request opens the slot,
+runs PACE and signs, and the holder keeps the session for 25 s so that
+the next request reuses the channel. The process model was built for a
+contact reader, where a card in the reader keeps its state until it is
+pulled; on the near field the operating system idles the field off
+within seconds, and with it the card's PACE state. The hold's only
+feedback is the slot's state, and the holder reads it only when a
+request arrives. The second request arrives, finds the slot without a
+valid card, ends the session and opens a new one at once; the system's
+pause after a session is still running, the slot is refused, and the
+holder answers card unavailable. The browser's handshake fails, the
+user sees the login fail or hang, and holds the card more firmly. The
+third request, after the pause, succeeds, which is why one-signature
+sites work and the failure looks like slowness. L-3.
+
+**The remembered PIN (UCA-47).** When the second request arrives while
+the field still holds, the channel is reused as designed, and the
+holder's credential state says PIN 1 was verified in this session. The
+card's security status does not survive the first signature, and the
+holder has no feedback on it: the first sign it gets is the refusal of
+the signature command, which the executor reports as ambiguous, the
+word for a command whose outcome is unknown. The requester tells its
+user the operation ended ambiguously; nothing says that a fresh VERIFY
+would have served. L-3.
+
+### 12.5 Requirements
+
+| ID | Requirement | Closes |
+| :--- | :--- | :--- |
+| R-41 | The hold's process model follows the slot: while the session is idle the holder watches the slot's state, and a slot that no longer holds a valid card ends the session at once, so that the reader's pause after a session runs during the idle time and not inside the next request. The system takes an idle slot away some six seconds after the last exchange, so a holder that keeps a session sends one harmless command on the channel every few seconds for as long as it holds it, and a request that arrives while that command is in flight waits for the card's answer. | UCA-43, UCA-46 |
+| R-42 | Opening the slot retries through the reader's pause, for a bounded time within the request's deadline, before the request is refused; the refusal the system gives for the pause is known by its code and never answered as card unavailable while a retry remains. | UCA-44, UCA-45 |
+| R-43 | The holder keeps no belief about the card's security status between operations: PIN 1 is verified for every signature, after the tries-left probe R-33 describes. A command the card refused is reported as refused, never as ambiguous. | UCA-47 |
+
+## 13. STPA of discovery over a wireless network
+
+**Status:** prompted by a measurement on 2026-10-19, made while
+reproducing the incident of section 12. A FreeBSD laptop on Wi-Fi and
+an iPhone on the same network: of nine identical mDNS queries the
+laptop sent to the group, four were answered; the loss came in bursts
+long enough that the requester reported "no phone found on the local
+network" six times in a row over four minutes, while the phone
+advertised and Avahi on the same laptop listed it. The same query sent
+to the phone's own address was answered every time.
+
+### 13.1 Scope
+
+The requester's search for the phone of one stored pairing over the
+local network: the query it sends, the answers it reads, the addresses
+it keeps, and the word it gives its user when nothing answers. The
+pairing ceremony, which searches for a phone it does not know yet, is
+in scope only as the case that has no address to ask.
+
+### 13.2 Control structure
+
+Finding the phone is one control action of the requester (section 4.5):
+a multicast query, answered by unicast. The requester's process model
+holds that a query reaches every phone on the link, so that no answer
+within the window means no phone. A wireless network gives no feedback
+on whether a multicast frame was delivered; a phone in power save
+receives multicast only at intervals, and an access point may not
+forward a client's multicast at all.
+
+| Control action | Controller | Feedback present | Feedback absent |
+| :--- | :--- | :--- | :--- |
+| Ask the network for the phone | Requester | Answers | Whether the query reached the phone |
+| Report no phone | Requester | None | That the phone was reachable by its address |
+
+### 13.3 Unsafe control actions
+
+| ID | Controller | Control action | Type | Context | Hazard |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| UCA-48 | Requester | Ask the network for the phone | P | By multicast alone, for a pairing whose phone answered from a known address before, so a network that drops the multicast hides a phone that would answer at its address. | H-3, H-7 |
+| UCA-49 | Requester | Report no phone | P | After a window in which no query reached the phone, so the user is told the phone is absent and looks at the phone, which is present and serving. | H-5 |
+
+### 13.4 Loss scenarios
+
+**The phone that was there (UCA-48, UCA-49).** The computer joins the
+phone's wireless network and the requester asks for the phone the way
+it always has, by a query to the multicast group. A wireless link
+acknowledges and retransmits unicast frames; multicast frames go out
+once, at the base rate, and a phone in power save receives them only at
+its listen interval, when the access point forwards them at all. The
+query is lost; the requester's model of the network says a lost query
+means no phone, so after its window it reports none. The user looks at
+the phone, which is on, paired and advertising, and can make nothing of
+the report. Each retry sends the same query the same way, and the loss
+comes in bursts longer than the window. The login does not happen,
+L-3, and the user is shown a state that is not the system's, H-5. The
+address the phone answered from last time was in the pairing's own
+record all along, and a query sent there would have been answered.
+
+### 13.5 Requirements
+
+| ID | Requirement | Closes |
+| :--- | :--- | :--- |
+| R-44 | The requester remembers the addresses a paired phone answered from, beside the pairing record, and every browse for that pairing sends the query to them directly as well as to the group. The addresses are a cache: losing them costs a slower discovery, never a pairing, and a pairing's removal drops them. The pairing ceremony, which knows no address, browses the group alone. | UCA-48 |
+| R-45 | "No phone found" is reported only after the remembered addresses were asked directly and did not answer. | UCA-49 |
+
+## 14. Open questions
 
 - Which of R-1 to R-6 are worth a protocol version, and which are better
   served by application behaviour over the existing messages?

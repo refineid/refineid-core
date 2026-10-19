@@ -247,12 +247,22 @@ fn is_ignored_root_path(root: &Path, path: &Path) -> bool {
 /// Apple-native implementation is the only pairing proven live, so the bridge
 /// is admitted as-is instead of being hardened speculatively; it may be
 /// simplified against the live-proven behaviour rather than polished.
-/// PC/SC and PKCS#11 subtrees interact with external C ABI specifications
-/// (OASIS Cryptoki v2.40 and PC/SC Workgroup). USB CCID (`crates/ccid`) interacts
-/// with the external USB Device Class: Smart Card (CCID) Rev 1.1 wire specification
-/// and descriptor tables. Remove an entry when its subtree is brought under policy or replaced.
+/// External protocol specifications, wire parsers, and conformance test fixtures:
+/// - `crates/ccid`: USB Device Class: Smart Card (CCID) Rev 1.1 wire tables and descriptors.
+/// - `crates/doc-sign`: Document signature wire standards (ETSI EN 319 142 PAdES, ETSI EN 319 162 ASiC,
+///   ETSI EN 319 122 CAdES, ETSI EN 319 132 XAdES, RFC 3161 TSP, RFC 6960 OCSP, RFC 5280 CRL)
+///   along with standard PDF operator syntax fixtures and font metrics tables. Scoped temporary
+///   exemption while migrating cross-platform document signing into core; tracked under issue
+///   #106 for incremental named constant extraction and fixture segregation.
+/// - `crates/pcsc`: PC/SC Workgroup WinSCard external C ABI interface.
+/// - `crates/pkcs11`: OASIS Cryptoki v2.40 external C ABI interface.
+/// - `crates/rapp`: RAPP protocol wire frame vectors and Noise state machine specifications.
+/// - `docs/protocols`: Protocol specification documents.
+///
+/// Remove an entry when its subtree is brought under policy or replaced.
 const POLICY_EXEMPT_SUBTREES: &[&str] = &[
     "crates/ccid",
+    "crates/doc-sign",
     "crates/pcsc",
     "crates/pkcs11",
     "crates/rapp",
@@ -1300,6 +1310,10 @@ mod tests {
         assert!(is_policy_exempt_path(
             root,
             Path::new("/workspace/crates/rapp/src/wire.rs")
+        ));
+        assert!(is_policy_exempt_path(
+            root,
+            Path::new("/workspace/crates/doc-sign/src/lib.rs")
         ));
         assert!(is_policy_exempt_path(
             root,

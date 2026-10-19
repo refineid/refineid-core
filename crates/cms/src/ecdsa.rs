@@ -960,19 +960,12 @@ impl Signature<EcdsaP384> {
     ///
     /// Pure local re-encoding; no card touch, no fallible
     /// inputs beyond the structural invariant the type carries.
-    ///
-    ///
-    /// # Panics
-    /// On odd input length. Unreachable in practice: the typed
-    /// constructor at the sign-path boundary enforces an even
-    /// length (48 + 48 = 96 for P-384).
     #[must_use]
-    pub fn into_der(self) -> Signature<EcdsaDer> {
+    pub fn into_der(self) -> Option<Signature<EcdsaDer>> {
         let raw = self.into_bytes();
-        assert!(
-            raw.len().is_multiple_of(SIG_COMPONENT_COUNT),
-            "Signature<EcdsaP384> must have even length (r||s)"
-        );
+        if !raw.len().is_multiple_of(SIG_COMPONENT_COUNT) || raw.is_empty() {
+            return None;
+        }
         // Bit-shift instead of `/ 2` to bypass the
         // clippy::integer_division_remainder_used lint; the even-
         // length invariant is asserted above, so `>> 1` is exact.
@@ -985,7 +978,7 @@ impl Signature<EcdsaP384> {
         out.push(ASN1_SEQUENCE_TAG);
         EcdsaHelpers::encode_der_length(&mut out, body.len());
         out.extend_from_slice(&body);
-        Signature::new(out)
+        Some(Signature::new(out))
     }
 }
 
@@ -997,18 +990,12 @@ impl Signature<EcdsaP256> {
     ///
     /// Pure local re-encoding; no card touch, no fallible
     /// inputs beyond the structural invariant the type carries.
-    ///
-    /// # Panics
-    /// On odd input length. Unreachable in practice: the typed
-    /// constructor at the sign-path boundary enforces an even
-    /// length (32 + 32 = 64 for P-256).
     #[must_use]
-    pub fn into_der(self) -> Signature<EcdsaDer> {
+    pub fn into_der(self) -> Option<Signature<EcdsaDer>> {
         let raw = self.into_bytes();
-        assert!(
-            raw.len().is_multiple_of(SIG_COMPONENT_COUNT),
-            "Signature<EcdsaP256> must have even length (r||s)"
-        );
+        if !raw.len().is_multiple_of(SIG_COMPONENT_COUNT) || raw.is_empty() {
+            return None;
+        }
         let half: usize = raw.len() >> 1_u32;
         let (r, s) = raw.split_at(half);
         let mut body = Vec::with_capacity(raw.len().saturating_add(BODY_SLACK));
@@ -1018,11 +1005,31 @@ impl Signature<EcdsaP256> {
         out.push(ASN1_SEQUENCE_TAG);
         EcdsaHelpers::encode_der_length(&mut out, body.len());
         out.extend_from_slice(&body);
-        Signature::new(out)
+        Some(Signature::new(out))
     }
 }
 
 impl Sec1UncompressedPoint {
+    /// Verify an ECDSA P-256 + SHA-256 signature against this
+    /// public key. Accepts the raw `r || s` form (64 bytes for
+    /// secp256r1); the conversion to DER for the underlying
+    /// verifier is internal.
+    ///
+    /// # Errors
+    /// [`EcdsaError`] on any reject branch -- curve construct
+    /// failure, off-curve pubkey, r/s out of `[1, n-1]`, s
+    /// not invertible mod n, or final verification mismatch.
+    pub fn verify_p256_sha256_raw(
+        &self,
+        signature_raw: Signature<EcdsaP256>,
+        message_digest: refineid_digest::Sha256,
+    ) -> Result<(), EcdsaError> {
+        let curve =
+            EcdsaHelpers::named_curve_from_oid(known::SECP256R1).ok_or(EcdsaError::BadModulus)?;
+        let signature_der = signature_raw.into_der().ok_or(EcdsaError::BadSignature)?;
+        verify_prehashed(&curve, self, &signature_der, message_digest.as_bytes())
+    }
+
     /// Verify an ECDSA P-384 + SHA-384 signature against this
     /// public key. Accepts the card-native raw `r || s` form
     /// FINEID PSO:CDS returns (96 bytes for secp384r1 per S1
@@ -1045,7 +1052,7 @@ impl Sec1UncompressedPoint {
     ) -> Result<(), EcdsaError> {
         let curve =
             EcdsaHelpers::named_curve_from_oid(known::SECP384R1).ok_or(EcdsaError::BadModulus)?;
-        let signature_der = signature_raw.into_der();
+        let signature_der = signature_raw.into_der().ok_or(EcdsaError::BadSignature)?;
         verify_prehashed(&curve, self, &signature_der, message_digest.as_bytes())
     }
 
@@ -1062,7 +1069,7 @@ impl Sec1UncompressedPoint {
     ) -> Result<(), EcdsaError> {
         let curve =
             EcdsaHelpers::named_curve_from_oid(known::SECP384R1).ok_or(EcdsaError::BadModulus)?;
-        let signature_der = signature_raw.into_der();
+        let signature_der = signature_raw.into_der().ok_or(EcdsaError::BadSignature)?;
         verify_prehashed(&curve, self, &signature_der, message_digest.as_bytes())
     }
 
@@ -1079,7 +1086,7 @@ impl Sec1UncompressedPoint {
     ) -> Result<(), EcdsaError> {
         let curve =
             EcdsaHelpers::named_curve_from_oid(known::SECP384R1).ok_or(EcdsaError::BadModulus)?;
-        let signature_der = signature_raw.into_der();
+        let signature_der = signature_raw.into_der().ok_or(EcdsaError::BadSignature)?;
         verify_prehashed(&curve, self, &signature_der, message_digest.as_bytes())
     }
 
@@ -1098,7 +1105,7 @@ impl Sec1UncompressedPoint {
     ) -> Result<(), EcdsaError> {
         let curve =
             EcdsaHelpers::named_curve_from_oid(known::SECP384R1).ok_or(EcdsaError::BadModulus)?;
-        let signature_der = signature_raw.into_der();
+        let signature_der = signature_raw.into_der().ok_or(EcdsaError::BadSignature)?;
         verify_prehashed(&curve, self, &signature_der, message_digest.as_bytes())
     }
 
@@ -1115,7 +1122,7 @@ impl Sec1UncompressedPoint {
     ) -> Result<(), EcdsaError> {
         let curve =
             EcdsaHelpers::named_curve_from_oid(known::SECP384R1).ok_or(EcdsaError::BadModulus)?;
-        let signature_der = signature_raw.into_der();
+        let signature_der = signature_raw.into_der().ok_or(EcdsaError::BadSignature)?;
         verify_prehashed(&curve, self, &signature_der, message_digest.as_bytes())
     }
 }
@@ -1259,7 +1266,13 @@ mod tests {
         ASN1_INTEGER_TAG, DER_LONG_FORM_1B, DER_LONG_FORM_2B, DER_SIGN_PAD, EcdsaError,
         EcdsaHelpers, HIGH_BIT_SET, ONE_BYTE_FORM_CEILING, P384_FIELD_LEN, SHORT_FORM_CEILING,
     };
-    use crate::container::{EcdsaDer, EcdsaP384, Signature};
+    use crate::container::{EcdsaDer, EcdsaP256, EcdsaP384, Signature};
+    use crate::hex::Hex;
+
+    /// Odd-width raw fixture -- cannot split into two equal halves.
+    const ODD_RAW: [u8; ODD_RAW_LEN] = [1, 2, 3];
+    /// Its width, named for the array type position.
+    const ODD_RAW_LEN: usize = 3;
 
     /// Fill byte for an `r` magnitude whose top bit is set.
     const R_FILL_TOP_BIT_SET: u8 = 0xFE;
@@ -1333,7 +1346,9 @@ mod tests {
             let r_expected = r_slice.to_vec();
             let s_expected = s_slice.to_vec();
             let sig: Signature<EcdsaP384> = Signature::new(raw);
-            let der = sig.into_der();
+            let der = sig
+                .into_der()
+                .expect("into_der must succeed for valid raw signature");
             let (r_parsed, s_parsed) = der
                 .parse_ecdsa_signature()
                 .expect("DER from into_der parses back");
@@ -1452,11 +1467,6 @@ mod tests {
 
     #[test]
     fn xml_raw_signature_rejects_missing_or_unequal_components() {
-        /// Odd-width raw fixture -- cannot split into two equal
-        /// halves.
-        const ODD_RAW: [u8; ODD_RAW_LEN] = [1, 2, 3];
-        /// Its width, named for the array type position.
-        const ODD_RAW_LEN: usize = 3;
         assert!(matches!(
             Signature::<EcdsaDer>::from_raw_concatenation(&[]),
             Err(EcdsaError::BadSignature)
@@ -1465,5 +1475,114 @@ mod tests {
             Signature::<EcdsaDer>::from_raw_concatenation(&ODD_RAW),
             Err(EcdsaError::BadSignature)
         ));
+    }
+
+    /// P-256 CAVP / RFC 6979 test vector public key X.
+    const P256_CAVP_QX: [u8; super::P256_FIELD_LEN] = Hex::decode_const(concat!(
+        "60fed4ba255a9d31c961eb74c6356d68",
+        "c049b8923b61fa6ce669622e60f29fb6",
+    ));
+    /// P-256 CAVP / RFC 6979 test vector public key Y.
+    const P256_CAVP_QY: [u8; super::P256_FIELD_LEN] = Hex::decode_const(concat!(
+        "7903fe1008b8bc99a41ae9e95628bc64",
+        "f2f1b20c2d7e9f5177a3c294d4462299",
+    ));
+    /// P-256 CAVP / RFC 6979 test vector signature R.
+    const P256_CAVP_R: [u8; super::P256_FIELD_LEN] = Hex::decode_const(concat!(
+        "efd48b2aacb6a8fd1140dd9cd45e81d6",
+        "9d2c877b56aaf991c34d0ea84eaf3716",
+    ));
+    /// P-256 CAVP / RFC 6979 test vector signature S.
+    const P256_CAVP_S: [u8; super::P256_FIELD_LEN] = Hex::decode_const(concat!(
+        "f7cb1c942d657c41d436c7a1b6e29f65",
+        "f3e900dbb9aff4064dc4ab2f843acda8",
+    ));
+
+    /// P-384 CAVP / RFC 6979 test vector public key X.
+    const P384_CAVP_QX: [u8; super::P384_FIELD_LEN] = Hex::decode_const(concat!(
+        "ec3a4e415b4e19a4568618029f427fa5",
+        "da9a8bc4ae92e02e06aae5286b300c64",
+        "def8f0ea9055866064a254515480bc13",
+    ));
+    /// P-384 CAVP / RFC 6979 test vector public key Y.
+    const P384_CAVP_QY: [u8; super::P384_FIELD_LEN] = Hex::decode_const(concat!(
+        "8015d9b72d7d57244ea8ef9ac0c62189",
+        "6708a59367f9dfb9f54ca84b3f1c9db1",
+        "288b231c3ae0d4fe7344fd",
+        "2533264720",
+    ));
+    /// P-384 CAVP / RFC 6979 test vector signature R.
+    const P384_CAVP_R: [u8; super::P384_FIELD_LEN] = Hex::decode_const(concat!(
+        "94edbb92a5ecb8aad4736e56c691916b",
+        "3f88140666ce9fa73d64c4ea95ad133c",
+        "81a648152e44acf96e36dd1e80fabe46",
+    ));
+    /// P-384 CAVP / RFC 6979 test vector signature S.
+    const P384_CAVP_S: [u8; super::P384_FIELD_LEN] = Hex::decode_const(concat!(
+        "99ef4aeb15f178cea1fe40db2603138f",
+        "130e740a19624526203b6351d0a3a94f",
+        "a329c145786e679e7b82c71a38628ac8",
+    ));
+
+    /// Fixed test message string for the CAVP / RFC 6979 vectors.
+    const CAVP_MESSAGE: &[u8] = b"sample";
+    /// SEC1 uncompressed point byte width for P-256 (1 tag byte + 2 field elements).
+    const P256_SEC1_POINT_LEN: usize = 1 + super::P256_FIELD_LEN + super::P256_FIELD_LEN;
+    /// Raw concatenated r||s signature byte width for P-256.
+    const P256_RAW_SIGNATURE_LEN: usize = super::P256_FIELD_LEN + super::P256_FIELD_LEN;
+    /// SEC1 uncompressed point byte width for P-384 (1 tag byte + 2 field elements).
+    const P384_SEC1_POINT_LEN: usize = 1 + super::P384_FIELD_LEN + super::P384_FIELD_LEN;
+    /// Raw concatenated r||s signature byte width for P-384.
+    const P384_RAW_SIGNATURE_LEN: usize = super::P384_FIELD_LEN + super::P384_FIELD_LEN;
+
+    #[test]
+    fn cavp_p256_sha256_signature_verifies() {
+        let mut sec1 = Vec::with_capacity(P256_SEC1_POINT_LEN);
+        sec1.push(super::SEC1_UNCOMPRESSED_TAG);
+        sec1.extend_from_slice(&P256_CAVP_QX);
+        sec1.extend_from_slice(&P256_CAVP_QY);
+        let pubkey =
+            super::Sec1UncompressedPoint::from_bytes(sec1).expect("valid P-256 public key");
+
+        let mut raw_sig = Vec::with_capacity(P256_RAW_SIGNATURE_LEN);
+        raw_sig.extend_from_slice(&P256_CAVP_R);
+        raw_sig.extend_from_slice(&P256_CAVP_S);
+        let sig: Signature<EcdsaP256> = Signature::new(raw_sig);
+
+        let digest = refineid_digest::Sha256::of(CAVP_MESSAGE);
+        assert_eq!(pubkey.verify_p256_sha256_raw(sig, digest), Ok(()));
+    }
+
+    #[test]
+    fn cavp_p384_sha384_signature_verifies() {
+        let mut sec1 = Vec::with_capacity(P384_SEC1_POINT_LEN);
+        sec1.push(super::SEC1_UNCOMPRESSED_TAG);
+        sec1.extend_from_slice(&P384_CAVP_QX);
+        sec1.extend_from_slice(&P384_CAVP_QY);
+        let pubkey =
+            super::Sec1UncompressedPoint::from_bytes(sec1).expect("valid P-384 public key");
+
+        let mut raw_sig = Vec::with_capacity(P384_RAW_SIGNATURE_LEN);
+        raw_sig.extend_from_slice(&P384_CAVP_R);
+        raw_sig.extend_from_slice(&P384_CAVP_S);
+        let sig: Signature<EcdsaP384> = Signature::new(raw_sig);
+
+        let digest = refineid_digest::Sha384::of(CAVP_MESSAGE);
+        assert_eq!(pubkey.verify_p384_sha384_raw(sig, digest), Ok(()));
+    }
+
+    #[test]
+    fn into_der_rejects_empty_and_odd_lengths() {
+        let empty_p384: Signature<EcdsaP384> = Signature::new(Vec::new());
+        assert!(empty_p384.into_der().is_none());
+
+        let odd_p384: Signature<EcdsaP384> = Signature::new(ODD_RAW.to_vec());
+        assert!(odd_p384.into_der().is_none());
+
+        let empty_p256: Signature<EcdsaP256> = Signature::new(Vec::new());
+        assert!(empty_p256.into_der().is_none());
+
+        let odd_p256: Signature<EcdsaP256> = Signature::new(ODD_RAW.to_vec());
+        assert!(odd_p256.into_der().is_none());
     }
 }

@@ -758,7 +758,15 @@ network" six times in a row over four minutes, while the phone
 advertised and Avahi on the same laptop listed it. The same query sent
 to the phone's own address was answered every time.
 
-### 13.1 Control structure
+### 13.1 Scope
+
+The requester's search for the phone of one stored pairing over the
+local network: the query it sends, the answers it reads, the addresses
+it keeps, and the word it gives its user when nothing answers. The
+pairing ceremony, which searches for a phone it does not know yet, is
+in scope only as the case that has no address to ask.
+
+### 13.2 Control structure
 
 Finding the phone is one control action of the requester (section 4.5):
 a multicast query, answered by unicast. The requester's process model
@@ -773,14 +781,31 @@ forward a client's multicast at all.
 | Ask the network for the phone | Requester | Answers | Whether the query reached the phone |
 | Report no phone | Requester | None | That the phone was reachable by its address |
 
-### 13.2 Unsafe control actions
+### 13.3 Unsafe control actions
 
 | ID | Controller | Control action | Type | Context | Hazard |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | UCA-48 | Requester | Ask the network for the phone | P | By multicast alone, for a pairing whose phone answered from a known address before, so a network that drops the multicast hides a phone that would answer at its address. | H-3, H-7 |
 | UCA-49 | Requester | Report no phone | P | After a window in which no query reached the phone, so the user is told the phone is absent and looks at the phone, which is present and serving. | H-5 |
 
-### 13.3 Requirements
+### 13.4 Loss scenarios
+
+**The phone that was there (UCA-48, UCA-49).** The computer joins the
+phone's wireless network and the requester asks for the phone the way
+it always has, by a query to the multicast group. A wireless link
+acknowledges and retransmits unicast frames; multicast frames go out
+once, at the base rate, and a phone in power save receives them only at
+its listen interval, when the access point forwards them at all. The
+query is lost; the requester's model of the network says a lost query
+means no phone, so after its window it reports none. The user looks at
+the phone, which is on, paired and advertising, and can make nothing of
+the report. Each retry sends the same query the same way, and the loss
+comes in bursts longer than the window. The login does not happen,
+L-3, and the user is shown a state that is not the system's, H-5. The
+address the phone answered from last time was in the pairing's own
+record all along, and a query sent there would have been answered.
+
+### 13.5 Requirements
 
 | ID | Requirement | Closes |
 | :--- | :--- | :--- |

@@ -716,6 +716,7 @@ again.
 | UCA-44 | Holder | Open the slot | T | Within the reader's pause after the session it has just ended, so the system refuses the slot and the request is refused with the card lying on the phone. | H-3 |
 | UCA-45 | Holder | Answer the request | P | As card unavailable for a refusal the holder caused (UCA-44), so the requester's user is told to present a card that is present, and nothing says that waiting would have served. | H-5 |
 | UCA-46 | Holder | End the session | N | Not when the card leaves the field during the hold's idle time, but only when the next request looks at the slot, so the reader's pause runs inside that request's deadline instead of during the idle time. | H-3 |
+| UCA-51 | Custodian | Accept a second computer's session | N | Not while one computer's session is held, although the two are different pairings: the second computer's dial is closed before its preamble is read, its requester retries behind its pauses and shows its user "connected" or nothing, and whichever computer dialed last cannot log in for as long as the other holds its session, which a browser slot holds for as long as the browser runs. Seen on 2026-10-19 with a Mac and a FreeBSD computer paired with one phone. The specification limits concurrent pre-authentication handshakes to one, not established sessions. | H-7, H-5 |
 | UCA-47 | Holder | Skip VERIFY, trusting the remembered verification | P | For the second operation on a held channel, when the card does not keep PIN 1's security status from one signature to the next, so the signature command is refused and the request is answered as ambiguous: the requester cannot tell a refused command from a lost one, and nothing was signed. | H-3, H-5 |
 
 ### 12.4 Loss scenarios
@@ -759,6 +760,18 @@ word for a command whose outcome is unknown. The requester tells its
 user the operation ended ambiguously; nothing says that a fresh VERIFY
 would have served. L-3.
 
+**Two computers, one phone (UCA-51).** The person's Mac and laptop are
+both paired with the phone; the laptop's browser slot holds a session
+from the moment the browser starts, as section 10 designed it. The Mac
+asks for a login; its requester dials, the phone closes the connection
+before reading the preamble, and the requester, which cannot tell a
+refusal from a lost packet, pauses and dials again. The Mac shows the
+phone connected and no identity; the laptop, idle, holds the phone. When
+the laptop's browser is closed, the Mac logs in. The person, who paired
+both on purpose, has no model in which pairing one computer locks out
+another, and nothing on either screen names the other computer. L-3,
+H-5.
+
 ### 12.5 Requirements
 
 | ID | Requirement | Closes |
@@ -766,6 +779,7 @@ would have served. L-3.
 | R-41 | The hold's process model follows the slot: while the session is idle the holder watches the slot's state, and a slot that no longer holds a valid card ends the session at once, so that the reader's pause after a session runs during the idle time and not inside the next request. The system takes an idle slot away some six seconds after the last exchange, so a holder that keeps a session sends one harmless command on the channel every few seconds for as long as it holds it, and a request that arrives while that command is in flight waits for the card's answer. | UCA-43, UCA-46 |
 | R-42 | Opening the slot retries through the reader's pause, for a bounded time within the request's deadline, before the request is refused; the refusal the system gives for the pause is known by its code and never answered as card unavailable while a retry remains. | UCA-44, UCA-45 |
 | R-43 | The holder keeps no belief about the card's security status between operations: PIN 1 is verified for every signature, after the tries-left probe R-33 describes. A command the card refused is reported as refused, never as ambiguous. | UCA-47 |
+| R-47 | The custodian holds one session per pairing, not one session: a second computer's dial is read, routed by its preamble to its own pairing, and served; the card is one and operations from all sessions join one queue at the holder (section 12.2). A dial that names a pairing whose session is already held replaces that session, so a requester that restarts does not wait for its own stale session to expire. A refusal the custodian does give is a close with a reason the requester can show, never a silent drop. | UCA-51 |
 
 ## 13. STPA of discovery over a wireless network
 

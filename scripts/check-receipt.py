@@ -6,7 +6,10 @@ Usage:
   scripts/check-receipt.py NAME [--tool TOOL ...] -- COMMAND [ARG ...]
 
 Receipts are local performance hints. The manual Ubuntu workflow runs the
-quality gates independently.
+quality gates independently. A receipt is trusted only because its file and
+directory belong to this user and no one else can write them, which needs POSIX
+file ownership and modes; on a platform without them, such as Windows, every
+check runs in full and no receipt is read or written.
 """
 
 from __future__ import annotations
@@ -30,6 +33,7 @@ NULL_BYTE_VALUE = 0
 NULL_BYTE = bytes((NULL_BYTE_VALUE,))
 PRIVATE_DIRECTORY_MODE = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
 PRIVATE_FILE_MODE = stat.S_IRUSR | stat.S_IWUSR
+RECEIPTS_SUPPORTED = hasattr(os, "getuid")
 VERSION_ARGS = {
     "cargo": ["--version"],
     "cargo-fmt": ["--version"],
@@ -362,6 +366,8 @@ def no_symlink_components(path: Path) -> bool:
 
 
 def cache_directory(root: Path) -> Path:
+    if not RECEIPTS_SUPPORTED:
+        raise CacheUnavailable("this platform has no POSIX file ownership to keep receipts private")
     parent = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
     directory = parent.resolve(strict=False) / "refineid-core" / "quality-receipts"
     if not no_symlink_components(directory):
@@ -428,7 +434,11 @@ def write_receipt(path: Path, key: str) -> None:
 
 def run(args: argparse.Namespace, command: list[str]) -> int:
     root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel")).resolve()
-    tree, cacheable, fingerprint_worktree = snapshot(root)
+    try:
+        tree, cacheable, fingerprint_worktree = snapshot(root)
+    except CacheUnavailable as error:
+        print(f"check receipt disabled: {error}", file=sys.stderr)
+        return subprocess.run(command, cwd=root, check=False).returncode
     receipt: Path | None = None
     key = ""
     if cacheable:

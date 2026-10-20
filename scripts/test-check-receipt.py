@@ -28,7 +28,8 @@ assert SPEC is not None and SPEC.loader is not None
 check_receipt = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = check_receipt
 SPEC.loader.exec_module(check_receipt)
-# Windows cannot start a process without these; they never enter a receipt key.
+# Processes on Windows rely on these (SYSTEMROOT above all); none is in STABLE_ENV,
+# so none enters a receipt key.
 PROCESS_ENVIRONMENT = ("COMSPEC", "PATHEXT", "SYSTEMDRIVE", "SYSTEMROOT", "TEMP", "TMP", "USERPROFILE", "WINDIR")
 requires_receipts = unittest.skipUnless(
     check_receipt.RECEIPTS_SUPPORTED, "receipts need POSIX file ownership"

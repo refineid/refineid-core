@@ -980,9 +980,9 @@ gone, and four feedback paths change:
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | UCA-52 | Requester | Release the held BLE link | P | While the pairing exists and nothing ended it but idleness, when the phone's application is in the background, so the next login finds no advertisement and the phone cannot be reached until its user opens the application. | H-7, H-5 |
 | UCA-53 | Requester | Report that the phone is not found | P | When no advertisement is seen because the phone's application is in the background or the phone is locked, so the user is told the phone is absent while it lies on the desk, and nothing names the remedy. | H-5 |
-| UCA-54 | Requester or custodian | Close the link for a small MTU | P | Without naming the cause, so a negotiation below 512 on one computer reads as "phone not reachable" (UCA-7) and nothing says that this computer's Bluetooth stack is the limit. | H-5 |
+| UCA-54 | Requester | Close the link for a small MTU | P | Without naming the cause, so a negotiation below 512 on one computer reads as "phone not reachable" (UCA-7) and nothing says that this computer's Bluetooth stack is the limit. | H-5 |
 | UCA-55 | Requester | Connect to an advertiser and route a preamble | P | Repeatedly to the same strangers' phones in a crowded room, in the order the scan returns them, so a login waits behind a sequence of refused routings and a phone's own requester is starved of the single-flight slot (§3.3 item 8) of each phone it dials. | H-7 |
-| UCA-56 | Requester | Ask the operating system to bond with the phone | P | At all: the bond adds an operating-system pairing dialog the user cannot relate to the RAPP pairing, stores a link key RAPP never relies on, and lists the phone by its device name in the computer's Bluetooth settings. | H-5, H-6 |
+| UCA-56 | Requester | Ask the operating system to bond with the phone | P | In any context, because RAPP authenticates on the application layer alone (§13.2): the bond adds an operating-system pairing dialog the user cannot relate to the RAPP pairing, stores a link key RAPP never relies on, and lists the phone by its device name in the computer's Bluetooth settings. | H-5, H-6 |
 | UCA-57 | Custodian | Execute `browser_authenticate` without a prompt | P | Under a stored PIN 1, as section 3 of the usability consensus intends, when a program on the computer other than the browser the user is using drives the key storage provider; the phone cannot tell a login the user clicked from one a program started, and over BLE the phone may be face down in a pocket. | H-1 |
 | UCA-58 | Requester | Name a relying party in the operation context | P | When the key storage provider cannot know it: CNG tells a provider nothing of the site, so an origin built from a process name or an environment variable is shown on the phone as if it were the site. As UCA-24 for the Unix slot. | H-1, H-5 |
 | UCA-59 | Custodian | Admit a session on the BLE peripheral | N | When the routing preamble's purpose is `"session"`, because the peripheral admits only pairing; every login fails after a successful pairing, and the requester shows the phone as paired. | H-7, H-5 |
@@ -1021,16 +1021,43 @@ which would turn an accepted residual risk into a misleading one.
 **The pairing that cannot log in (UCA-59).** The pairing ceremony over
 BLE completes and both ends store the pairing. The first operational
 connection sends a `"session"` preamble; the custodian's peripheral
-admits only pairing and closes the link. The requester, which cannot
-tell this close from a stranger's phone or a revoked pairing, reports
+admits only pairing and refuses the preamble; an iOS peripheral has no
+call that ends a central's connection, so it stops serving it and the
+requester's own deadline ends the link. The requester, which cannot
+tell this refusal from a stranger's phone or a revoked pairing, reports
 the phone unreachable. L-3, H-5.
 
 **The small link (UCA-54).** A Windows computer's Bluetooth stack
-negotiates an ATT MTU below 512 with the phone. The custodian's SAR
-layer refuses the capacity and closes the link before the preamble; the
-requester reports nothing more specific than a lost connection. The
-user retries, moves the phone closer, restarts both, and nothing
-changes, because nothing in the radio path is at fault.
+negotiates an ATT MTU below 512 with the phone. The custodian learns
+the capacity when the requester subscribes to the Channel
+Characteristic, refuses it, and stops serving the connection, which it
+cannot end; the requester, which never read the value it negotiated,
+waits out its deadline and reports nothing more specific than a lost
+connection. The user retries, moves the phone closer, restarts both,
+and nothing changes, because nothing in the radio path is at fault.
+L-3, H-5.
+
+**The crowded room (UCA-55).** In a lecture hall a dozen phones
+advertise the RAPP Service UUID, and the computer cannot tell its own
+phone from the others without routing a preamble to each (§2.2.1). The
+phones rotate their resolvable private addresses (§4.1), and RAPP
+forbids a link-layer bond that would let the computer resolve them
+(UCA-56), so the address it dialed last time is gone. The computer
+dials the advertisers in the order the scan returned them; each refuses
+the routing, and each of those phones' own computers finds the single
+pre-authentication slot (§3.3 item 8) taken while it is refused. The
+login waits behind the queue and may miss the browser's deadline. L-3,
+H-7.
+
+**The bond nobody asked for (UCA-56).** The requester's first GATT
+access asks for an encrypted link, or calls the operating system's
+pairing. Windows shows its own pairing dialog with a numeric
+comparison; the user, who has just typed the RAPP code, cannot tell
+which of the two pairings this is and accepts or cancels at random. If
+accepted, Windows stores a link key and an identity resolving key that
+RAPP never relies on, and lists the phone by its personal device name in
+the computer's Bluetooth settings, where any user of the computer can
+read it. H-5, H-6.
 
 ### 16.4 Requirements
 
@@ -1038,8 +1065,8 @@ changes, because nothing in the radio path is at fault.
 | :--- | :--- | :--- |
 | R-50 | Over BLE the requester holds the link and its session for as long as the pairing is usable and the user has not turned the remote reader off, and re-establishes it as soon as the phone's advertisement is seen; it never releases a BLE session for idleness. The cost is the phone's radio, which the custodian may end by withdrawal (§4.5) or by its user. R-26's release on idleness applies to the stream transport, where discovery can find the phone again. | UCA-52 |
 | R-51 | When no session is held and no advertisement is seen, the requester tells its user that the phone must have RefineID open to be found over Bluetooth, and never that the phone is absent. | UCA-53 |
-| R-52 | Both ends read the negotiated ATT MTU before the first frame. Below 512, the requester closes the link and names the cause with the value, distinct from every other close; the custodian, which closes before any authentication, sends nothing (§10.1 Class 1), so the requester's own reading is the feedback. | UCA-54 |
-| R-53 | The requester remembers, per pairing, the advertiser that last routed its preamble, and dials it first; other advertisers are dialed in descending filtered RSSI above the proximity gate (§4.4), each at most once per scan window, and a refused routing is not retried within that window. | UCA-55 |
+| R-52 | The requester reads the negotiated ATT MTU as soon as the connection is up and before its first write. Below 512, it closes the link itself and names the cause with the value, distinct from every other close. The custodian reads the capacity when the requester subscribes, which precedes the requester's first frame, refuses a capacity below the minimum before any authentication, and sends nothing (§10.1 Class 1); on iOS it cannot end the connection, so the requester's own reading is the feedback that matters. | UCA-54 |
+| R-53 | The requester remembers, per pairing, the advertiser address that last routed its preamble, and dials it first while that address is still advertised; the phone rotates its resolvable private address, and without a bond (R-54) the computer cannot follow it, so the memory lasts until the address changes. Other advertisers are dialed in descending filtered RSSI above the proximity gate (§4.4), each at most once per scan window, and a refused routing is not retried within that window. | UCA-55 |
 | R-54 | The requester never asks the operating system to bond or pair with the phone at the link layer, and the custodian's characteristics require no link-layer encryption, so no operating-system pairing dialog can appear. | UCA-56 |
 | R-55 | The operation context names the computer and the program that asked, and never a relying party it cannot know; the phone shows the computer's name and the program, labelled as such, never as a site. As R-25 for the Unix slot. | UCA-58 |
 | R-56 | Residual, accepted by the usability consensus (section 3): with PIN 1 stored, a program on the computer that reaches the requester can make the card sign for authentication without a prompt. The requester narrows who can reach it to the user's own processes (Windows platform STPA), shows every authentication it relays in its own notification, and the phone records each one in its history with the computer and program that asked. | UCA-57 |

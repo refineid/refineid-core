@@ -920,7 +920,8 @@ it was not.
 
 ## 16. STPA of a browser login over Bluetooth alone
 
-**Status:** prospective, for owner review. This section analyses a
+**Status:** prospective, reviewed by the owner on 2026-10-20. This
+section analyses a
 design before it is built: a browser on a Windows computer logs in to
 kortti.tunnistautuminen.suomi.fi with the card of a paired iPhone,
 while the iPhone has Wi-Fi and cellular data turned off, so the only

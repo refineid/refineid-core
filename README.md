@@ -100,6 +100,9 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo run --locked -p xtask -- check-magic-numbers
 ```
 
+On Windows, see [developing on Windows](docs/process/windows-development.md)
+for the prerequisites, line endings, and how the gates differ.
+
 ### Managing build cache
 
 Incremental compilation caches and old dependency artifacts in `target/` can grow during local development.

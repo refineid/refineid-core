@@ -36,9 +36,11 @@ local Git setting is needed, and none should be changed to work around it.
 A checkout made before `.gitattributes` existed keeps its CRLF files until
 they are written again. `git ls-files --eol` shows them as `w/crlf`. To
 rewrite them, commit or stash any work first, since this replaces every
-tracked file from the index, then run in Git Bash:
+tracked file from the index, and close editors and build servers that hold
+files open, then run in Git Bash:
 
 ```sh
+cd "$(git rev-parse --show-toplevel)"
 git ls-files -z | xargs -0 rm -f
 git checkout -- .
 git ls-files --eol | grep -c w/crlf   # 0

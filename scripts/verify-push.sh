@@ -22,7 +22,7 @@ fi
 
 python3 "$root/scripts/check-receipt.py" source-checks \
     --tool sh --tool cargo --tool rustc --tool rustfmt --tool cargo-fmt --tool git --tool grep \
-    -- "$root/scripts/run-source-checks.sh"
+    -- sh "$root/scripts/run-source-checks.sh"
 cargo build
 cargo test
 cargo clippy --all-targets -- -D warnings

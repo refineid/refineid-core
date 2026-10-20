@@ -1,0 +1,8 @@
+# Line endings are LF in the repository and on every checkout, so rustfmt
+# (newline_style = "Unix"), the source checks, and the receipt fingerprint see
+# identical bytes on Windows, macOS, and Linux. Without this a Windows checkout
+# converts text to CRLF and `cargo fmt --check` rejects every file.
+* text=auto eol=lf
+
+# Binary test vectors and trust anchors: never line-ending normalized.
+*.der binary

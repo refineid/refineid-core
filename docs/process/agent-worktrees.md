@@ -13,15 +13,15 @@ colliding and keeps the main checkout pristine for integration.
 ## Topology and naming
 
 - Reading does not require a worktree; writing does. The main checkout is never edited directly. It integrates and releases.
-- Each task gets a worktree strictly under `~/src/wt/`, never beside repositories or under `/tmp/`:
-  `~/src/wt/refineid-core-<topic>` on branch `agent/<topic>`.
+- Each task gets a worktree strictly under `../wt/`, never beside repositories or under `/tmp/`:
+  `../wt/refineid-core-<topic>` on branch `<topic>`.
 - One branch carries one pull request. Never stack unrelated work onto a
   branch that already has an open pull request.
 
 ## Starting a task
 
 1. Update local main: `git checkout main && git pull --ff-only`.
-2. Create the worktree under `~/src/wt/`: `git worktree add ~/src/wt/refineid-core-<topic> -b agent/<topic>`.
+2. Create the worktree under `../wt/`: `git worktree add ../wt/refineid-core-<topic> -b <topic>`.
 3. Run `scripts/agent-housekeeping.sh` and act on what it reports.
 
 ## Housekeeping

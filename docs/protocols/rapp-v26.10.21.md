@@ -958,38 +958,30 @@ No failure revokes a pairing. Pairings are revoked by their users (§4.6).
 - **Ordinary typo (retries remain)**: If the card rejects PIN 1, PIN 2 or the card access number (CAN) (`SW 63 Cx`) and retries remain, the Custodian answers `operation.result` with `status: "rejected"`, `error: "invalid_credential"`, and the exact `remaining_retries`. The operation terminates; stored pairings and vault keys remain intact. The next verification of that PIN is again subject to the floor.
 - **Blocked credential**: If the card reports a credential blocked (`SW 69 83`), which under the floor can only have happened outside RefineID, the Custodian stops card transmissions and answers `operation.result` with `status: "credential_rejected"`, `error: "card_blocked"`. The pairing is unaffected: pairing is device trust, not card state, and the card is unblocked with the PIN unblocking key (PUK) in the issuer's software; RAPP defines no unblocking operation.
 
-### 10.3 Standardized Error Envelope Body Schema & Code Mapping
+### 10.3 Errors
 ```cddl
 error-body = {
-  "error_code": uint,
   "error_name": tstr .size (1..64),
   "message": tstr .size (1..512),
   ? "operation_id": bstr .size 16
 }
 ```
 
-| `error_name` | `error_code` | Semantic Description |
-| :--- | :--- | :--- |
-| `"unknown_operation"` | `1001` | Queried or submitted `operation_id` is unknown or already terminal. |
-| `"operation_expired"` | `1002` | Local monotonic operation deadline passed prior to authorization. |
-| `"user_cancelled"` | `1003` | User consciously declined or canceled the operation on the screen. |
-| `"unauthorized"` | `1004` | Requested profile or action is not granted in active pairing. |
-| `"unsupported_parameter"` | `1005` | Unsupported key profile, algorithm, or parameter value. |
-| `"card_blocked"` | `1006` | Credential blocked on the card (`SW 69 83`); status `credential_rejected` (§10.2). The pairing is unaffected. |
-| `"pin_blocked"` | `1007` | Specific PIN retry counter exhausted on the card. The pairing is unaffected. |
-| `"invalid_credential"` | `1008` | Incorrect PIN entered; retries remain (`SW 63 Cx`). |
-| `"card_error"` | `1009` | APDU transmission failure, NFC loss, or smart card hardware fault. |
-| `"operation_failed"` | `1010` | Consequential hardware execution or durable journal write failed. |
-| `"duplicate_operation"` | `1011` | Non-idempotent attempt to execute an existing operation. |
-| `"retry_floor"` | `1012` | The card reports fewer than 3 remaining attempts for the PIN; no verification was sent (§10.2). |
-| `"storage_exhausted"` | `1013` | Device persistent secure storage allocated for pairing tombstones is exhausted. |
-| `"operation_already_retired"` | `1014` | Operation was already executed, acknowledged, and retired. |
-| `"invalid_lifetime"` | `1015` | `expires_after_ms` of 0 (§8.1 item 2). |
+The same names appear in the `error` field of `operation.result`:
 
-`operation_failed` also answers a second `operation.request` while another operation is live on the pairing (the `error` message).
-
-**Normative Error Handling Rule**:
-Semantic error handling is driven exclusively by `error_name`. The numeric `error_code` is informative and provides predictable numeric mappings across language bindings. If an implementation receives an unrecognized `error_code` with a recognized `error_name`, `error_name` takes precedence. If both are unrecognized, the error must be handled as a general `operation_failed`.
+| `error_name` | Meaning |
+| :--- | :--- |
+| `"busy"` | A request arrived while another operation of the session is live (§8.1 item 1). |
+| `"duplicate_operation"` | The `operation_id` was already used on this session (§8.1 item 1). |
+| `"invalid_lifetime"` | `expires_after_ms` of 0 (§8.1 item 2). |
+| `"operation_expired"` | The deadline passed before the card was commanded (§8.1 item 2). |
+| `"unauthorized"` | The profile is not granted to the pairing (§8.2 item 1). |
+| `"unsupported_parameter"` | Unsupported key profile, algorithm or parameter value (§9). |
+| `"user_cancelled"` | The holder declined on the screen (§8.2 item 3). |
+| `"retry_floor"` | The card reports fewer than 3 remaining attempts for the PIN; no verification was sent (§10.2). |
+| `"invalid_credential"` | The PIN was wrong; `remaining_retries` says how many attempts the card still allows (§10.2). |
+| `"card_error"` | The card did not answer: no card within the wait, the field lost, a transmission fault. |
+| `"operation_failed"` | The Custodian could not carry the operation out for a reason of its own. |
 
 ---
 

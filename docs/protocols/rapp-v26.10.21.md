@@ -410,13 +410,19 @@ A Custodian **withdraws** when it deliberately stops serving every stored pairin
 
 ### 4.6 Pairing Revocation
 
-An endpoint **revokes** a pairing when its user forgets it, when §10 requires it (Class 4), when the confirmation deadline of §4.3 item 4 passes, or when its peer closes a session with reason `"pairing_revoked"`. Revocation is local and immediate: the record is marked revoked and the static private key is destroyed at once. Nothing is announced.
+An endpoint **revokes** a pairing when its user forgets it, when §10 requires it (Class 4), when the confirmation deadline of §4.3 item 4 passes, or when its peer tells it so. The record is marked revoked at once and serves nothing from then on. The peer is told with `session.close` carrying reason `"pairing_revoked"` (§7.1), so that it can forget the pairing on its side too:
 
-1. **In-Session Notice**:
-   If the revoking endpoint holds an open operational session to the peer, it sends `session.close` with reason `"pairing_revoked"` (§7.1) before destroying the key. An endpoint that receives that close at any point of a session revokes the pairing, answers with no close of its own, and closes the transport.
+1. **In Session**:
+   If the revoking endpoint holds an open session to the peer, it sends the close at once.
 
-2. **Without a Session**:
-   A revocation reaches the peer no other way. A Custodian that revoked a pairing stops announcing its hint (§4.5), so the Requester never dials it again; the Requester's record names a phone that is never in sight until its user removes it. A Requester that revoked a pairing never dials again, and the Custodian keeps a record that costs nothing, since it serves on request only, until its user removes it. A pairing not yet confirmed is forgotten without a close.
+2. **On the Next Session**:
+   Otherwise the endpoint keeps the static private key for the close alone. A Custodian goes on announcing the pairing's hint (§4.5) and a Requester goes on dialing when the hint is in sight, as if nothing had changed; on the next session with the peer the revoking endpoint completes the handshake of §6.3, sends the close as its first message, and no card session starts.
+
+3. **Key Destruction**:
+   The static private key is destroyed once the close has been sent, or 30 days after the revocation, whichever comes first. A pairing not yet confirmed, and a revocation the confirmation deadline causes, destroy the key at once and tell nobody.
+
+4. **Receiving the Close**:
+   An endpoint that receives `session.close` with reason `"pairing_revoked"` at any point of a session revokes the pairing at once, destroys its key, withdraws any identity it offers for the pairing (§8.4), answers with no close of its own, and closes the transport.
 
 ---
 
@@ -1315,7 +1321,7 @@ The profile registry defines the operations permitted over authenticated RAPP se
 1. **Pre-Authentication Invalid Input (Class 1)**: Malformed preamble, an unrouted or replayed routing tag, invalid MTU, or out-of-order writes prior to Noise authentication. Action: close the connection immediately; zero stored state modified.
 2. **Transport Loss, Bearer Disruption, and Version Skew (Class 2)**: Radio or link drop, transport timeout, failed AEAD message authentication code (MAC) verification / decryption failure on an established channel, or unexpected wire version on connect/envelope. Because the bearer is untrusted and subject to RF corruption or relay tampering, ciphertext authentication failure cannot establish authenticated peer misconduct. Action: terminate the active session and the connection immediately, zeroize ephemeral session state; active operation marked `cancelled` (if before card execution) or `ambiguous` (if journaled in-flight). Stored pairing trust records and vault keys REMAIN INTACT. Smart card operations are NEVER re-executed.
 3. **Stale-Reference Race and Semantic Rejection (Class 3)**: Decrypted operation message for an unknown or already terminal `operation_id` (e.g. duplicate request for expired operation), or unsupported algorithm/parameter. Action: respond with `error` name `"unknown_operation"` or `operation.result` status `"rejected"` with `"unsupported_parameter"`; no pairing revocation.
-4. **Authenticated Protocol Violation (Class 4)**: Verified sequence regression across an established authenticated link (where AEAD MAC is valid and sequence < expected), parameter echo mismatch in an authenticated `pairing.hello`, authenticated `pair_id` mismatch, or explicit local user deletion/revocation. Action: close session immediately, mark pairing revoked, destroy pairing keys in local storage (§4.6), and require new manual pairing.
+4. **Authenticated Protocol Violation (Class 4)**: Verified sequence regression across an established authenticated link (where AEAD MAC is valid and sequence < expected), parameter echo mismatch in an authenticated `pairing.hello`, authenticated `pair_id` mismatch, or explicit local user deletion/revocation. Action: revoke the pairing (§4.6) and require new manual pairing.
 
 ### 10.2 Credential Rejection and the Retry Floor
 - **Retry floor (PIN 1 and PIN 2)**: Before any command that could decrement a PIN try counter, the Custodian reads the card's remaining attempts for that PIN. It sends the verification only while the card reports **at least 3** remaining. With 2 or fewer remaining, or a counter it cannot read, it refuses without sending any verification command, answering `operation.result` with `status: "rejected"` and `error: "retry_floor"`, and tells the user that the card's remaining attempts are reserved for the card issuer's software. RefineID therefore never consumes a card's last two attempts and can never block a PIN.

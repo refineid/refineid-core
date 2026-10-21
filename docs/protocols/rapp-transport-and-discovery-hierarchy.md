@@ -104,7 +104,7 @@ Bluetooth (BLE)
   - Custodian runs `StreamRelayListener` on a dynamic, ephemeral TCP port (`bind(0)`).
   - Custodian advertises service type `_refineid-stream._tcp.local.` via mDNS.
   - Requester runs `StreamRelayBrowser`, receives the PTR (pointer), SRV (service) and text (TXT) (text) records, and initiates an **outbound** TCP `connect()` to the phone's advertised IP and port.
-- **Wire Profile**: Governed normatively by RAPP v26.10.21 §2.2.2. Each frame is a 2-byte unsigned big-endian length followed by 1 to 65535 payload bytes. The Requester's first frame is the routing preamble `["RAPP-stream", purpose, routing]` (RAPP v26.10.21 §2.2.1). After a `"pairing"` preamble the Custodian's first frame is the encoded `pairing-offer` (§4.2); after a `"session"` preamble the Custodian routed the Requester sends `Noise_KK` message 1.
+- **Wire Profile**: Governed normatively by RAPP v26.10.21 §2.2.2. Each frame is a 2-byte unsigned big-endian length followed by 1 to 65535 payload bytes. The Requester's first frame is the routing preamble `["rapp-stream", purpose, routing]` (RAPP v26.10.21 §2.2.1). After a `"pairing"` preamble the Custodian's first frame is the encoded `pairing-offer` (§4.2); after a `"session"` preamble the Custodian routed the Requester sends `Noise_KK` message 1.
 
 ### 3.3 Bluetooth / BLE Proximity Transport (`fi.refineid.rapp.ble`)
 - **Applicability**: The last resort: a proximity transport for when no IP network is shared (no Wi-Fi, a virtual machine or container without a usable network, no router), across supported platforms (iOS, Android, Linux/BSD, Windows, macOS).
@@ -163,7 +163,7 @@ The Custodian publishes three distinct discovery modes:
      To avoid trial connections in high-density enterprise environments with multiple active Custodians, the Custodian publishes truncated, rotating HMAC hints for the 4 most recently used stored pairings (use time and tie order as for withdrawn records, RAPP v26.10.21 §4.5):
      $$\text{hint}_i = \text{first 8 bytes of }\text{HMAC-SHA-256}(K_{\text{disc}, i}, \text{epoch\_be64})$$
      where:
-     - $K_{\text{disc}, i}$ = HKDF-SHA-256 ([RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html)) with salt $\text{pair\_id}_i$, input keying material the pairing's static X25519 agreement, $\text{info} = $ `"RAPP-discovery-hint"` (ASCII), and $L = 32$ (RAPP v26.10.21 §4.3).
+     - $K_{\text{disc}, i}$ = HKDF-SHA-256 ([RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html)) with salt $\text{pair\_id}_i$, input keying material the pairing's static X25519 agreement, $\text{info} = $ `"rapp-discovery-hint"` (ASCII), and $L = 32$ (RAPP v26.10.21 §4.3).
      - $\text{epoch} = \lfloor \text{unix\_time} / 900 \rfloor$ (15-minute rotation window), and $\text{epoch\_be64}$ is that value as an unsigned 64-bit big-endian integer (8 bytes), the entire HMAC message.
      - TXT Attribute: `hints=` followed by at most 4 hints, each 16 lowercase hexadecimal digits, separated by commas without spaces (e.g. `hints=054526c9fdd3b180`).
      - The `discovery_hint` vectors of `vectors/rapp-routing-v26.10.21.json` pin the bytes.

@@ -931,8 +931,8 @@ The profiles a pairing can grant (§4.3), and the actions of each:
 - **`sign_document`**:
   - Context: `document_name` (`tstr .size (1..256)`, e.g. `"Employment_Contract_2026.pdf"`).
   - Payload: `key_profile`, `algorithm`, `digest` (pre-hashed document digest).
-  - Consent: Always requires conscious visual confirmation and PIN 2 entry on Custodian screen.
-  - Signature Wire Format: Conforms strictly to the signature wire encoding specified in §9.2.
+  - Consent: the document name on the Custodian's screen and PIN 2.
+  - Signature Wire Format: as §9.2.
   - Response: `signature` (`bstr`).
 - **`batch_sign_documents`**:
   - Context: `document_names` (`[1* tstr .size (1..256)]`, list of 1 to 64 document display names).
@@ -940,19 +940,10 @@ The profiles a pairing can grant (§4.3), and the actions of each:
     - `key_profile`, `algorithm`.
     - `digests` (`[1* bstr]`, ordered list of 1 to 64 document digests).
     - Invariant: `len(document_names) == len(digests) <= 64`.
-  - Consent: Custodian presents full document list and collects PIN 2 once to authorize the entire batch.
-  - Signature Wire Format: Each entry conforms strictly to the signature wire encoding specified in §9.2.
+  - Consent: the full list of document names on the Custodian's screen and PIN 2 once for the batch.
+  - Signature Wire Format: each entry as §9.2.
   - Response: `signatures` (`[1* bstr]`, ordered list of signatures).
-  - **Write-Ahead Journal Granularity and Crash Recovery**:
-    - For `batch_sign_documents`, the Custodian maintains a durable journal entry recording per-document progress:
-      - `batch_total` ($1 \le N \le 64$)
-      - `completed_signatures` array of byte strings ($0 \le k \le N$)
-      - Active document index $k$
-    - The Custodian executes card signature APDUs sequentially ($k = 0, 1, \dots, N-1$).
-    - If interrupted mid-batch (e.g. BLE disconnect or card removed after document $k$), the batch state is marked `ambiguous`.
-    - On reconnection, the Requester queries `operation.status_request`. The Custodian reports `state: "ambiguous"`, and `operation.result` returns partial results:
-      `response: {"completed_signatures": [sig_0, ..., sig_{k-1}], "completed_count": k}`.
-    - Already executed document signatures are NEVER re-executed.
+  - An interrupted batch ends with its session (§8.1 item 3); no signature of it is delivered.
 
 ---
 

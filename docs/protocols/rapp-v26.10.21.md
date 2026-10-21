@@ -86,7 +86,7 @@ The diagram shows the BLE profile; on the stream transport the Requester dials t
 ┌─────────────────────────────────────────────────────────────┐
 │                     REQUESTER (Central)                     │
 │  - Linux, macOS, or Windows Desktop/Laptop                  │
-│  - Normalizes Crockford Base32 input from keyboard          │
+│  - Takes the pairing code from keyboard or camera           │
 │  - Protocol engine (Noise session & operation)              │
 └──────────────────────────────┬──────────────────────────────┘
                                │
@@ -525,21 +525,20 @@ RAPP v26.10.21 specifies the **`CPaceRistretto255-KC2`** application profile ove
   Role strings designate protocol roles, not device identities: the Requester is the initiator ($A$) and the Custodian the responder ($B$) on every transport.
 
 #### 6.1.2 Generator Derivation (draft-21 Appendix A.2)
-The generator point $G$ is derived from length-value (LV) encoding with zero-padding to align the first hash block:
+The generator point $G$ is derived from the password-related string (PRS), the 6-character pairing code as UTF-8 (§3.1), by length-value (LV) encoding with zero-padding to align the first hash block:
 1. **Length-Value Encoding**:
    Each byte string $S$ is encoded with a Little Endian Base 128 (LEB128) length prefix as $\text{lv}(S) = \text{LEB128}(|S|) \parallel S$, where $|S|$ is the length of $S$ in bytes, and $\text{LEB128}$ is unsigned little-endian base 128 encoding (1 byte for lengths $< 128$). The total encoded length is $|\text{lv}(S)| = |\text{LEB128}(|S|)| + |S|$. The concatenation of multiple fields is $\text{lv\_cat}(S_1, S_2, \dots, S_k) = \text{lv}(S_1) \parallel \text{lv}(S_2) \parallel \dots \parallel \text{lv}(S_k)$.
 2. **First-Block Zero-Padding**:
-   The zero padding $\text{len\_zpad}$ is designed such that the encoded prefix $\text{lv}(\text{DSI}) \parallel \text{lv}(\text{PRS}) \parallel \text{lv}(\text{zero\_bytes}(\text{len\_zpad}))$ completely fills the first SHA-512 input block ($s = 128\text{ bytes}$). Because $\text{len\_zpad} < 128$, its length prefix occupies exactly 1 byte ($|\text{LEB128}(\text{len\_zpad})| = 1$). The required padding length is therefore:
+   The zero padding $\text{len\_zpad}$ makes the encoded prefix $\text{lv}(\text{DSI}) \parallel \text{lv}(\text{PRS}) \parallel \text{lv}(\text{zero\_bytes}(\text{len\_zpad}))$ fill the first SHA-512 input block of 128 bytes exactly. Because $\text{len\_zpad} < 128$, its length prefix is 1 byte, so:
    $$\text{len\_zpad} = \max(0, 128 - 1 - |\text{lv}(\text{PRS})| - |\text{lv}(\text{DSI})|)$$
    where:
    - $|\text{lv}(\text{DSI})| = |\text{LEB128}(|\text{DSI}|)| + |\text{DSI}| = 1 + 17 = 18\text{ bytes}$ for $\text{DSI} = \text{b"CPaceRistretto255"}$
-   - $|\text{lv}(\text{PRS})| = |\text{LEB128}(|\text{PRS}|)| + |\text{PRS}| = 1 + 6 = 7\text{ bytes}$ for 6-character Crockford Base32 pairing code $\text{PRS}$
+   - $|\text{lv}(\text{PRS})| = |\text{LEB128}(|\text{PRS}|)| + |\text{PRS}| = 1 + 6 = 7\text{ bytes}$
    - Yielding $\text{len\_zpad} = 128 - 1 - 7 - 18 = 102\text{ bytes}$ of zeros.
-   *(Note on draft-irtf-cfrg-cpace-21 §8.1: The draft states $\text{len\_zpad} = \max(0, s - \text{len}(\text{prepend\_len}(\text{PRS})) - \text{len}(\text{prepend\_len}(\text{DSI})) - 1)$, where §6.3 defines $\text{prepend\_len}(S) = \text{lv}(S)$ as the entire length-prefixed octet string, not merely the length prefix. An implementer interpreting $\text{prepend\_len}(S)$ as only the 1-byte LEB128 prefix would calculate $128 - 1 - 1 - 1 = 125$, overflowing the first block to 151 bytes and producing a non-conformant generator $G' \ne G$).*
 3. **Generator String & Point Evaluation**:
    $$\text{gen\_str} = \text{lv\_cat}(\text{DSI}, \text{PRS}, \text{zero\_bytes}(102), C, \text{SID}) \quad (355\text{ bytes on BLE, 349 bytes on stream})$$
    $$G = \text{MapToGroup}(\text{SHA-512}(\text{gen\_str}))$$
-   where $\text{PRS} = \text{UTF-8}(\text{normalized pairing code})$ and $\text{SID} = \text{offer\_id}$. Verify $G \ne \mathcal{O}$ (abort on identity).
+   where $\text{SID} = \text{offer\_id}$. $G = \mathcal{O}$ aborts as §6.1.1 says.
 
 #### 6.1.3 Ephemeral Exchange, Key Schedule, and Mutual Confirmation
 1. **Initiator (Requester - Step 1)**:

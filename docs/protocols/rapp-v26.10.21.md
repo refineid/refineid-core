@@ -383,7 +383,7 @@ A Custodian **withdraws** when it deliberately stops serving every stored pairin
    3. replaces the TXT record of its current `_refineid-stream._tcp` service instance with the withdrawn record (item 4);
    4. unregisters the service after at least 2 and at most 10 seconds.
 
-   Withdrawal does not alter the operation journal: an operation whose card exchange has begun completes or is recorded exactly as §8 requires, and the Requester reconciles it through §8.3 on its next session.
+   Withdrawal ends every session, and with it every operation, as §8.1 item 3 says.
 
 4. **Withdrawn Record**:
    ```text
@@ -814,155 +814,43 @@ card-status-body = {
 
 ---
 
-## 8. Operation Model and Execution Lifecycle (Direct Idempotent Execution)
+## 8. Operations
 
-Credential operations (authentication signatures, qualified document signing) invoke sensitive, stateful cryptographic operations on the physical identity card over NFC.
+An operation is one credential action, an authentication signature, a document signature or a read, carried out on the card for one Requester. It lives inside the session that carried it.
 
-### 8.1 Strict At-Most-Once Physical Transmission Contract
-1. **Zero Repeated Executions**:
-   Cryptographic private key commands and PIN verifications must never be executed more than once per user authorization. Replaying network requests or reconnecting after a transport failure must never trigger re-execution of a physical card command.
-2. **Write-Ahead Journaling**:
-   Before physically dispatching any application protocol data unit (APDU) command that can decrement a try counter or invoke a card private key, the Custodian must durably record a write-ahead journal entry in platform secure storage:
-   - `pair_id` (16 bytes, scoping the entry to the authenticated pairing)
-   - `operation_id` (16 bytes, uniquely identifying the operation within the pairing)
-   - `request_hash` (32 bytes, session-independent deterministic commitment)
-   - State: `in_flight`
-   - Timestamp (UTC / local monotonic milliseconds)
-   - Optional provenance: `session_id` (16 bytes, recording the session on which the request originally arrived; advisory metadata, not bound into `request_hash`)
-   - For `batch_sign_documents`: `batch_total` ($1..64$), `completed_signatures` (`[bstr]`), and currently executing document index.
-3. **Ambiguity Protection**:
-   If the link drops or the process terminates while an operation is executing on the card, physical card re-execution is strictly prohibited. Recovery and reconciliation occur exclusively through durable journal status inspection (§8.3).
+### 8.1 Operation Lifetime
 
-### 8.2 Direct Idempotent Operation Lifecycle
+1. **Request**: The Requester sends `operation.request` with a fresh 16-byte `operation_id`, the profile and action (§9), the context and payload maps, and `expires_after_ms` if it has a deadline of its own. An `operation_id` the session has already seen is rejected with `error` `"duplicate_operation"`. A session carries one operation at a time: a request that arrives while another is live on the session is rejected with `error` `"busy"`.
+2. **Deadline**: `expires_after_ms`, if present, is above 0; 0 is rejected with `"invalid_lifetime"`. If absent, the Custodian uses 300,000 ms. The Custodian takes the deadline on a clock that keeps running while the device sleeps and the process is suspended (`CLOCK_BOOTTIME`, `mach_continuous_time`, `SystemClock.elapsedRealtime`). An operation whose deadline passes before the card has been commanded is cancelled: `operation.result` with `status` `"cancelled"` and `error` `"operation_expired"`, and its consent view, if any, is taken down or never shown. A Custodian that wakes from suspension checks every pending operation against the clock before showing anything.
+3. **End**: An operation ends with its `operation.result`, or with the session. When the session closes, every operation of it is over: one that has not yet commanded the card is dropped, one whose card command is in progress runs to the card's answer, since a card command is never interrupted, and the answer is discarded. The Custodian remembers nothing of an operation once it is over. A Requester that did not receive a result starts a new operation with a new `operation_id` if it still needs one.
 
-1. **Operation Request & Deterministic Commitment**:
-   - Requester transmits `operation.request` carrying a fresh 16-byte `operation_id`, profile, action, context map, payload map, and optional `expires_after_ms`.
-   - Both endpoints derive the deterministic, session-independent request commitment:
-     $$\text{request\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}([\texttt{"RAPP-request-v1"}, \text{pair\_id}, \text{operation\_id}, \text{profile}, \text{action}, \text{context}, \text{payload}]))$$
-     - **Session-Independent Commitment Scope**:
-       This fixed-order array preimage binds the protocol domain label (`"RAPP-request-v1"`), the authenticated `pair_id` (16 bytes), the unique `operation_id` (16 bytes), the profile string, the action string, and all context/payload maps.
-       `pair_id` replaces ephemeral session identifiers in the commitment preimage. This ensures that the commitment is stable across transport disruptions and BLE reconnections: an otherwise identical request retransmitted across session boundaries under the same pairing computes the exact same `request_hash`. Ephemeral session binding is supplied by the outer authenticated envelope (`rapp-message.session_id` and directional AEAD transport encryption).
-       Requests originating from different pairings are cryptographically isolated: because each pairing possesses a distinct `pair_id`, requests from different pairings will never produce matching `request_hash` commitments even if an identical `operation_id` is accidentally or maliciously chosen.
-   - **`expires_after_ms` Semantics**:
-     - `expires_after_ms` is strictly **excluded** from `request_hash` so that local expiry policies do not alter cryptographic commitments.
-     - If present, `expires_after_ms` must be $> 0$; a value of 0 is rejected immediately with error `invalid_lifetime`. If absent, the Custodian applies a local default lifetime $\text{effective\_expires\_after\_ms} = 300{,}000\text{ ms}$ (5 minutes).
-     - Upon receiving `operation.request`, the Custodian derives a local deadline on its **continuous clock** using saturating arithmetic:
-       $$\text{local\_deadline} = \text{local\_start\_continuous\_ms}.\text{saturating\_add}(\min(\text{effective\_expires\_after\_ms}, \text{local\_policy\_max\_lifetime}))$$
-       The continuous clock is a monotonic clock that keeps advancing while the device sleeps and while the process is suspended (`CLOCK_BOOTTIME`, `mach_continuous_time`, `SystemClock.elapsedRealtime`). A clock that pauses with the process must not be used for operation deadlines: an operation received before a suspension would otherwise outlive its lifetime.
-     - If `local_deadline` passes before the user authorizes the operation on the phone screen, the operation expires. The Custodian transitions the in-memory state to `cancelled`, releases held resources, and responds with `operation.result` (`status: "cancelled"`, `error: "operation_expired"`). No card APDU is dispatched. A Custodian that resumes from suspension evaluates every pending operation against the continuous clock before rendering anything: an operation past its deadline expires as above and its consent view is never shown.
-2. **Atomic Admission, In-Flight Reservation, and Content Freezing**:
-   - **Pairing Scope & Cross-Pairing Isolation**: All operations, active task tables, write-ahead journal records, and durable tombstones are strictly scoped by `pair_id`. An `operation_id` is evaluated exclusively within the context of the calling pairing. The Custodian must never deliver another pairing's cached results, join another pairing's in-flight task, or expose another pairing's journal entries.
-   - **Atomic Admission Transaction**: Upon receiving `operation.request`, the Custodian executes an atomic check-and-reserve transaction against its active in-memory task table, write-ahead journal, and durable tombstones:
-     a. **Existing Operation Match**: If `(pair_id, operation_id)` is found in ANY state (awaiting consent, in-flight, completed, retired, ambiguous, rejected, cancelled):
-        - The Custodian **must validate the commitment**:
-          $$\text{incoming.request\_hash} == \text{existing.request\_hash}$$
-        - **Changed-Content Collision**: If $\text{incoming.request\_hash} \ne \text{existing.request\_hash}$:
-          The request is an illegal aliasing or parameter tampering attempt. The Custodian **must immediately reject** the request with `error: "duplicate_operation"`. The existing operation, active prompt, NFC card execution, or tombstone must not be replaced, cancelled, mutated, or joined.
-        - **Identical Retransmission**: If $\text{incoming.request\_hash} == \text{existing.request\_hash}$:
-          - `awaiting_consent`: Join the active authorization flow. The retransmitted request attaches as an observer awaiting user confirmation. No duplicate consent dialog is presented to the user.
-          - `in_flight`: Join the active NFC/card transaction. The retransmitted request attaches as an observer awaiting card completion and receives the single `operation.result`. No duplicate card APDUs are dispatched.
-          - `completed`: Re-transmit the cached `operation.result` immediately with cached response payload/status without re-accessing the card.
-          - `retired`: Re-transmit `operation.result` reporting `status: tombstone.terminal_disposition` (preserving `"completed"`, `"rejected"`, `"credential_rejected"`, or `"ambiguous"`), `retired: true`, and `error: "operation_already_retired"` (or the preserved error string for failed/rejected operations) without re-accessing the card or presenting user prompts (see Durable Tombstones below).
-          - `rejected` / `credential_rejected`: Re-transmit cached terminal error result (e.g. invalid PIN error with remaining retries) without re-accessing the card.
-          - `ambiguous`: Re-transmit terminal `operation.result` (`status: "ambiguous"`). Re-dispatching card APDUs is strictly forbidden.
-          - `cancelled`: Respond with `operation.result` (`status: "cancelled"`, `error: "operation_expired"`).
-     b. **New Operation Admission & Content Freezing**: If `(pair_id, operation_id)` is not present in active tasks, write-ahead journal, or durable tombstones:
-        - The Custodian atomically inserts a reservation entry in `state: "awaiting_consent"`, binding `pair_id`, `operation_id`, and `request_hash`.
-        - **Immutable Request Snapshot**: The Custodian takes an immutable snapshot of all request parameters (`profile`, `action`, `context`, `payload`, `request_hash`, `local_deadline`).
-        - The user consent UI presented on the phone screen (§11) must render strictly from this frozen immutable snapshot. Subsequent messages on the connection or other sessions cannot mutate or replace parameters under authorization.
-3. **Authorization and Conscious Consent**:
-   - The Custodian validates that the requested profile is present in `granted_profiles` for the active pairing. If not granted, the Custodian responds with `operation.result` (`status: "rejected"`, `error: "unauthorized"`).
-   - If the action requires user authorization or PIN entry (e.g. document signing under `"fi.refineid.document-signing.v1"` or browser authentication under `"fi.refineid.authentication.v1"`), the Custodian displays transaction details on the phone screen (§11) and, once the view is on screen, transmits `operation.progress` with event `"consent_shown"`, so the Requester can tell a prompt awaiting its user from a Custodian that has shown none.
-   - If the user declines on screen, the operation terminates immediately; the Custodian transitions the reservation slot to `state: "rejected"`, transmits `operation.result` (`status: "rejected"`, `error: "user_cancelled"`), and releases in-memory state. No card APDUs are dispatched and no write-ahead journal entry is created.
-4. **Write-Ahead Journaling & Card Execution**:
-   - Upon conscious human approval on the phone screen, the Custodian must write a durable write-ahead journal entry to persistent platform secure storage before dispatching any APDU to the smart card:
-     `[pair_id, operation_id, request_hash, state: "in_flight", timestamp]`.
-   - If the durable journal write fails (e.g. platform storage I/O error), the Custodian must not dispatch APDUs to the card; it aborts execution and returns `operation_failed`.
-   - Once durably recorded, the Custodian verifies the retry counter floor (§10.3) and dispatches APDUs to the FINEID card over NFC.
-   - Upon completing card execution, the Custodian transitions the journal entry to `state: "completed"` (or `state: "rejected"` / `"credential_rejected"` if card status word (SW) indicates verification failure) and caches the response payload.
-5. **Result Delivery, Acknowledgment Validation, and Durable Tombstones**:
-   - The Custodian transmits `operation.result` carrying `operation_id`, `request_hash`, and final execution status (`"completed"`, `"rejected"`, or `"credential_rejected"`).
-   - The Requester transmits `operation.result_ack` for every `operation.result` it receives, whatever its status. The acknowledgement tells the Custodian that the terminal outcome, including any `remaining_retries`, reached the Requester; a result not yet acknowledged is re-delivered when the Requester reconciles on its next session (§8.3).
-   - **Acknowledgment Validation**:
-     Upon receiving `operation.result_ack`, the Custodian validates:
-     a. `pair_id` matches the authenticated pairing owning the operation.
-     b. `operation_id` matches an existing unretired journal entry.
-     c. `request_hash` matches the entry's stored `request_hash`.
-     d. The operation is in an unacknowledged terminal state (`completed`, `rejected`, `credential_rejected`, `cancelled` or `ambiguous`).
-     If validation fails (unknown identifier, hash mismatch, or already retired), the acknowledgment is rejected or safely ignored without altering existing tombstones.
-   - **Durable Tombstone Transition**:
-     Upon receiving a valid `operation.result_ack` (or when storage garbage collection runs on terminal entries), the Custodian is permitted to delete the large cached response payload (signatures, certificates, diagnostic payloads) to conserve device storage, **BUT must RETAIN A DURABLE TOMBSTONE** in persistent platform secure storage:
-     `[pair_id, operation_id, request_hash, state: "retired", terminal_disposition, timestamp]`
-     where `terminal_disposition` preserves the terminal outcome (`"completed"`, `"rejected"`, `"credential_rejected"`, or `"ambiguous"`).
-   - **Tombstone Retention Contract & Pairing Lifetime Durability**:
-     - **Pairing Lifetime Retention**: The Custodian must retain durable tombstones in persistent secure storage for the **entire active lifetime of the pairing** (`pair_id`).
-     - Because `operation.request` and the 16-byte `operation_id` contain no creation timestamp or authenticated operation epoch, time-based expiration (e.g. 30 days) and FIFO ring-buffer eviction during an active pairing are **strictly prohibited**. Evicting a tombstone while the pairing remains active would allow a retransmitted or delayed `operation_id` to appear unknown in a fresh session and be silently re-admitted, violating identifier-level idempotency and physical card safety.
-     - Tombstones survive application termination, process restarts, operating system updates, and device reboots.
-     - **Destruction Contract**: Durable tombstones associated with a `pair_id` are purged if and only if the pairing itself is explicitly revoked or deleted (e.g. unpair ceremony or manual deletion of the pairing by the user in settings).
-     - **Storage Exhaustion Safety**: In the event that device persistent secure storage allocated for pairing tombstones is exhausted, the Custodian **must fail closed**: it must refuse to admit new operations by returning error `"storage_exhausted"`, rather than evicting historical tombstones.
-     - **Subsequent Queries & Requests Matching a Retained Tombstone**:
-       - If $\text{incoming.request\_hash} == \text{tombstone.request\_hash}$: The Custodian responds with `operation.result` reporting `status: tombstone.terminal_disposition`, `retired: true`, and `error: "operation_already_retired"` (if disposition was completed) or the original preserved error (if rejected / credential_rejected / ambiguous), omitting pruned response payloads. The preserved terminal disposition (`"completed"`, `"rejected"`, `"credential_rejected"`, `"ambiguous"`) is strictly honored; a retired failed or ambiguous operation is never reported as completed. Under NO circumstances are smart card APDUs re-dispatched or user consent prompts presented.
-       - If $\text{incoming.request\_hash} \ne \text{tombstone.request\_hash}$: The Custodian rejects immediately with `error: "duplicate_operation"`.
-6. **Safe Reads (Direct Optimization)**:
-   - Actions that perform read-only card operations (e.g. `inspect_card`, `read_identity`, `read_certificate`) involve no private-key operations or PIN try decrements.
-   - Safe reads omit write-ahead journaling and screen consent prompts, executing card read APDUs directly and responding with `operation.result`.
+### 8.2 Execution
 
-### 8.3 Durable Status Reconciliation and Ambiguity Recovery
+1. **Authorization**: The requested profile must be among the pairing's `granted_profiles`; otherwise `operation.result` with `status` `"rejected"` and `error` `"unauthorized"`.
+2. **Queue**: The card serves one operation at a time, across every session the Custodian holds. Operations take the card in the order they arrived. While an operation of another session holds the card, the Custodian sends the waiting operation `operation.progress` with event `"queued"`, once when it joins the queue; when its turn comes it proceeds. An operation that expires in the queue is cancelled as §8.1 item 2 says.
+3. **Consent**: For an action that needs the holder's authorization or PIN (§9), the Custodian shows the details on the phone screen (§11) and, once the view is on screen, sends `operation.progress` with event `"consent_shown"`. The view renders from a snapshot of the request taken at admission; nothing that arrives later changes it. If the holder declines, the operation ends with `status` `"rejected"` and `error` `"user_cancelled"`; no card command is sent.
+4. **Card**: The Custodian checks the retry floor (§10.2) and commands the card over NFC or through its reader. While it waits for the holder to present the card it sends `operation.progress` with event `"waiting_for_card"`, and `"card_wait_ended"` when the card is found or the wait is over.
+5. **Result**: The Custodian sends `operation.result` with `status` `"completed"` and the response, `"rejected"` with the error, `"credential_rejected"` with the error and `remaining_retries` (§10.2), or `"cancelled"` with the error.
+6. **Reads**: A read-only action (`inspect_card`, `read_identity`, `read_certificate`) commands no private key and no PIN. It takes its turn in the queue and skips consent.
 
-When a BLE connection drops, a timeout occurs, or the mobile device restarts while an operation is in progress, recovery is governed by strict deterministic reconciliation rules. Because `request_hash` is session-independent (§8.2.1) and durable tombstones are preserved (§8.2.5), reconciliation supports two equivalent paths: direct request retransmission and explicit status querying.
+### 8.3 Session Lifetime
 
-1. **Pre-Execution Disconnect (Awaiting Human Consent)**:
-   - If the BLE connection drops or `local_deadline` expires while the phone screen is awaiting user confirmation (prior to write-ahead journal commit):
-     - The operation is aborted in memory (`state: "cancelled"`).
-     - No write-ahead journal entry was written; no card commands were issued; retry counters are untouched.
-     - On reconnect, querying `operation.status_request` for this `operation_id` returns `known: false`.
-2. **In-Flight Disconnect (Card APDU in Progress)**:
-   - When the BLE connection drops while a card APDU is actively being executed over NFC:
-     - The Custodian's local NFC transaction runner continues executing the single active physical APDU sequence to its natural conclusion:
-       a. **Card APDU Succeeds**: If the card returns `SW 90 00` and the cryptographic signature, the Custodian writes `state: "completed"` and caches the signature in the write-ahead journal.
-       b. **Card APDU Reports Error**: If the card returns a definitive failure status (e.g. `SW 63 Cx` wrong PIN or `SW 69 83` blocked), the Custodian updates the journal to `state: "rejected"` or `"credential_rejected"` with remaining retries.
-       c. **NFC Field Interrupted / Custodian Crash**: If NFC coupling is dropped, the card is removed mid-command, or the phone restarts before terminal card status can be written: the Custodian transitions the journal record to `state: "ambiguous"`.
-     - In all cases, the Custodian must never automatically re-dispatch the physical card command.
-3. **Reconciliation Protocol (`operation.status_request` / `operation.status`)**:
-   - Upon reconnecting in a fresh operational session (the Noise session phase), the Requester transmits `operation.status_request` carrying the queried `operation_id` (or retransmits `operation.request` identically).
-   - The Custodian consults its durable write-ahead journal and durable tombstones for that `pair_id`:
-     - **Completed Operation (Unretired / Cached Payload)**: If `operation_id` is journaled in state `completed`:
-       - Custodian responds with `operation.status` (`known: true`, `state: "completed"`, `request_hash: <hash>`, `retired: false`).
-       - Custodian also re-delivers `operation.result` carrying the cached signature or response bytes without re-accessing the card.
-       - Requester completes the exchange with `operation.result_ack`.
-     - **Retired Operation (Acknowledged / Pruned Result)**: If `operation_id` matches a durable tombstone (`state: "retired"`):
-       - Custodian responds with `operation.status` (`known: true`, `state: tombstone.terminal_disposition`, `request_hash: tombstone.request_hash`, `retired: true`). The reported `state` preserves the exact original outcome (`"completed"`, `"rejected"`, `"credential_rejected"`, or `"ambiguous"`).
-       - If queried via `operation.request`, Custodian responds with `operation.result` (`status: tombstone.terminal_disposition`, `request_hash: tombstone.request_hash`, `retired: true`, `error: "operation_already_retired"` for completed operations, or the preserved terminal error for rejected/ambiguous operations). Pruned response payloads are omitted. Card APDUs are NEVER re-dispatched and user consent prompts are NEVER shown.
-     - **Terminal Rejected Operation (Unretired)**: If `operation_id` is journaled in state `rejected` or `credential_rejected`:
-       - Custodian responds with `operation.status` (`known: true`, `state: <state>`, `request_hash: <hash>`, `retired: false`).
-       - Custodian re-delivers `operation.result` carrying the cached error string and remaining retry count.
-     - **Still In-Flight**: If `operation_id` is currently executing on the smart card (e.g. lengthy key generation or awaiting NFC presentation):
-       - Custodian responds with `operation.status` (`known: true`, `state: "in_flight"`, `request_hash: <hash>`).
-       - Requester awaits the asynchronous `operation.result` indication or re-queries status periodically.
-     - **Ambiguous Operation (Unretired)**: If `operation_id` is journaled in state `ambiguous`:
-       - Custodian responds with `operation.status` (`known: true`, `state: "ambiguous"`, `request_hash: <hash>`, `retired: false`).
-       - If partial batch progress was recorded (`batch_sign_documents`), `operation.result` returns `response: {"completed_signatures": [sig_0, ..., sig_{k-1}], "completed_count": k}`.
-     - **Unknown Operation**: If `operation_id` is not present in active tasks, write-ahead journal, or durable tombstones: Custodian responds with `operation.status` (`known: false`).
-   - Every re-delivered `operation.result` is acknowledged with `operation.result_ack` as in §8.2 item 5.
-4. **Terminal Exit from Ambiguous State**:
-   - An ambiguous operation is permanently terminal for that `operation_id`. It CANNOT be retried or re-executed under the same identifier.
-   - If the application wishes to retry the action after an ambiguous or failed operation, the Requester must allocate a fresh 16-byte `operation_id` and initiate a completely new operation lifecycle, requiring fresh human consent and authorization on the Custodian phone screen.
-
+A session lives as long as both endpoints are in sight. An endpoint that has heard nothing from its peer for 20 seconds sends `liveness.ping`; the peer answers `liveness.pong` at once. A ping unanswered for 10 seconds, or a transport close, ends the session (§10.1 item 2). A Requester keeps a session open to every paired Custodian whose discovery hint is in sight (hierarchy specification §4.3), dialing when the hint appears and again, after a close, when it is next seen, so that an operation can start at once and the Custodian's state reaches the Requester as it changes. A Custodian holds as many sessions as Requesters dial (§2.2.2).
 
 ### 8.4 Card Presence and Identity Offering
 
 A Requester that offers the Custodian's credentials to local consumers (a browser's certificate chooser, a CryptoTokenKit or Public-Key Cryptography Standards (PKCS)#11 token) makes a claim on the Custodian's behalf: that a card can answer now. The claim is bounded by the Custodian's own word on an authenticated session, never by discovery.
 
 1. **`card.status`**:
-   On every operational session the Custodian sends `card.status` once immediately after `session.ready`, and again whenever the presence of a card it can serve changes. `card_present` is true while the Custodian can serve a card now: a card coupled in a reader, or an NFC card the holder has primed and can present on request. An operation that ends without the card answering (no card within the card wait, the card lost before a command was transmitted, the field lost) makes it false at once, until the holder next couples or primes the card. Cached material alone, with no holder able to present the card, is absence.
-2. **Offering Rule**:
-   A Requester must hold an open operational session to a pairing while it offers that pairing's credentials to local consumers, and must withdraw the offer at once when the session closes for any reason, when `card.status` reports absence, or when liveness (§7.1 items 6 and 7) fails. It offers again when a later `card.status` reports presence. Discovery records (hierarchy specification §4.3) tell a Requester whom to dial; they never justify an offer.
-3. **Session Lifetime**:
-   A session held for offering is subject to the lifetime limits of §7.2 item 3. The endpoints restart it with `session.close` reason `"normal"`, and the Requester withdraws the offer if the new session is not established at once.
+   On every session the Custodian sends `card.status` once right after `session.ready`, and again whenever the card it can serve changes. `card_present` is true while the Custodian can serve a card now: a card coupled in a reader, or an NFC card the holder has primed and can present on request. An operation that ends without the card answering (no card within the card wait, the card lost before a command was transmitted, the field lost) makes it false at once, until the holder next couples or primes the card. Cached material alone, with no holder able to present the card, is absence. A card busy with another session's operation is present, not absent: the queue of §8.2 item 2 holds the waiting operation, and `card.status` does not change.
+2. **Which Card**:
+   While `card_present` is true, `certificate_fingerprint` carries the SHA-256 digest of the DER encoding of the card's authentication certificate. A Requester compares it with the fingerprint of the certificates it holds for the pairing and, on any difference or when it holds none, reads the certificates afresh (§9) before offering anything; it never offers an identity whose fingerprint the Custodian has not confirmed on this session.
+3. **Offering Rule**:
+   A Requester holds an open session to a pairing while it offers that pairing's credentials to local consumers, and withdraws the offer at once when the session ends for any reason or when `card.status` reports absence. It offers again when a later `card.status` reports presence. Discovery records (hierarchy specification §4.3) tell a Requester whom to dial; they never justify an offer.
 4. **Privacy**:
    `card.status` travels only inside the AEAD-encrypted session, sized like a liveness message, so an observer cannot tell a card event from a keepalive. No discovery record, advertisement, or plaintext frame reflects the card's presence.
 5. **Ending the Session**:
-   A Custodian that can no longer serve any card for the rest of the session also closes it with reason `"card_unavailable"`; a Custodian that expects the card back keeps the session open and reports presence through `card.status`.
+   A Custodian that can no longer serve any card for the rest of the session closes it with reason `"card_unavailable"`; a Custodian that expects the card back keeps the session open and reports presence through `card.status`.
 
 ---
 
@@ -1112,7 +1000,7 @@ error-body = {
 | `"retry_floor"` | `1012` | The card reports fewer than 3 remaining attempts for the PIN; no verification was sent (§10.2). |
 | `"storage_exhausted"` | `1013` | Device persistent secure storage allocated for pairing tombstones is exhausted. |
 | `"operation_already_retired"` | `1014` | Operation was already executed, acknowledged, and retired. |
-| `"invalid_lifetime"` | `1015` | `expires_after_ms` of 0 (§8.2.1). |
+| `"invalid_lifetime"` | `1015` | `expires_after_ms` of 0 (§8.1 item 2). |
 
 `operation_failed` also answers a second `operation.request` while another operation is live on the pairing (the `error` message).
 

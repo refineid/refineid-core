@@ -12,7 +12,7 @@ colliding and keeps the main checkout pristine for integration.
 
 ## Topology and naming
 
-- The main checkout is never edited directly. It integrates and releases.
+- Reading does not require a worktree; writing does. The main checkout is never edited directly. It integrates and releases.
 - Each task gets a worktree strictly under `~/src/wt/`, never beside repositories or under `/tmp/`:
   `~/src/wt/refineid-core-<topic>` on branch `agent/<topic>`.
 - One branch carries one pull request. Never stack unrelated work onto a

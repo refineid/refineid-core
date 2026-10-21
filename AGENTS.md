@@ -120,8 +120,15 @@ before and the correction made the core better.
 
 ## Worktree policy
 
-- All agent worktrees MUST live strictly under `~/src/wt/` (e.g., `~/src/wt/refineid-core-<topic>`).
-- Worktrees must NEVER be created loose beside repositories in `~/src/` or under `/tmp/`.
+- Reading does not require a worktree; writing does. The main checkout is
+  never edited directly. Before writing code or modifying files for any task,
+  create a dedicated git worktree strictly under `~/src/wt/`
+  (e.g., `~/src/wt/refineid-core-<topic>`) on an `agent/<topic>` branch. Never
+  work directly on `main` or modify files in the main checkout.
+- All agent worktrees MUST live strictly under `~/src/wt/`, never loose beside
+  repositories in `~/src/`.
+- Never put a git worktree under `/tmp`. It is cleared on reboot and takes the
+  branch's only checkout with it.
 - One task, one worktree, one branch (`agent/<topic>`), one pull request (see [docs/process/agent-worktrees.md](docs/process/agent-worktrees.md)).
 - Run `scripts/agent-housekeeping.sh` to monitor worktrees and verify compliance.
 

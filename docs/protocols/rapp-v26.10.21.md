@@ -488,9 +488,9 @@ A reassembled frame goes to the handler of the phase the connection is in, the R
 ### 6. Normative Cryptographic Protocols
 
 RAPP v26.10.21 specifies three normative cryptographic protocols:
-1. **`CPaceRistretto255`**: Password-Authenticated Key Exchange (PAKE) for initial proximity pairing (§6.1).
-2. **`Noise_XXpsk3`**: Initial mutual pairing authentication handshake (§6.2).
-3. **`Noise_KK`**: Mutual operational session handshake (§6.3).
+1. **`CPaceRistretto255`**: the PAKE of the pairing ceremony (§6.1).
+2. **`Noise_XXpsk3`**: the pairing handshake that turns the PAKE result into a stored pairing (§6.2).
+3. **`Noise_KK`**: the session handshake between paired endpoints (§6.3).
 
 ### 6.1 CPaceRistretto255 KC2 Profile (draft-irtf-cfrg-cpace-21, RFC 9496, RFC 5869)
 
@@ -502,13 +502,11 @@ RAPP v26.10.21 specifies the **`CPaceRistretto255-KC2`** application profile ove
 - **Domain Separation Identifiers (DSI)**:
   - Base Point DSI: `CPaceRistretto255` (`b"CPaceRistretto255"`)
   - Intermediate Session Key DSI: `CPaceRistretto255_ISK` (`b"CPaceRistretto255_ISK"`)
-- **MapToGroup & Identity Handling**: Maps 64-byte uniform hash output to a Ristretto255 group element using `RistrettoPoint::from_uniform_bytes` per [RFC 9496 Section 4.3.4](https://www.rfc-editor.org/rfc/rfc9496.html#section-4.3.4) and draft-irtf-cfrg-cpace-21 Appendix A.2. If the mapped point is the group identity $\mathcal{O}$ (probability $2^{-252}$), the node must immediately abort the pairing offer, zeroize all intermediate ephemeral values, and cease pairing advertising. No fallback to a basepoint constant is permitted.
-- **Scalar Sampling Profile**:
-  CPace draft-21 §8.3 specifies scalar generation in $[1, q-1]$ using either its recommended masked-bit sampler or uniform sampling. Conforming RAPP implementations generate non-zero scalars $x \in [1, q-1]$ using either:
-  1. *Option A (Exact Rejection Sampling per draft-21 §8.3)*: Repeatedly draw 32 bytes from cryptographically secure pseudorandom number generator (CSPRNG), interpret as an unsigned little-endian integer, and accept if $1 \le x < q$; if $x == 0$ or $x \ge q$, redraw 32 bytes locally from CSPRNG until $1 \le x < q$.
-  2. *Option B (Profile Deviation: 64-Byte Wide Reduction per `crates/rapp`)*: Draw 64 uniform bytes from CSPRNG and reduce modulo $q$ using the wide modular reduction primitive (`Scalar::from_bytes_mod_order_wide`); if $x == 0$ (probability $2^{-512}$), redraw 64 bytes locally until $x \ne 0$. (Design Note: Because $2^{512} \pmod q \ne 0$, 64-byte wide reduction is a reviewed RAPP application profile deviation from draft-21 §8.3. The statistical distance from uniform on $[1, q-1]$ is bounded by $(q-1) / (4(2^{512} - k - 1)) \approx q / 2^{512} \approx 2^{-260}$, which is cryptographically negligible ($< 2^{-128}$) and enables constant-time arithmetic in the reduction primitive).
+- **MapToGroup & Identity Handling**: Maps 64-byte uniform hash output to a Ristretto255 group element using `RistrettoPoint::from_uniform_bytes` per [RFC 9496 Section 4.3.4](https://www.rfc-editor.org/rfc/rfc9496.html#section-4.3.4) and draft-irtf-cfrg-cpace-21 Appendix A.2. If the mapped point is the group identity $\mathcal{O}$ (probability $2^{-252}$), the endpoint aborts the pairing offer, zeroizes every intermediate value and stops advertising the offer.
+- **Scalar Sampling**:
+  Each ephemeral scalar is drawn as 64 uniform bytes from a cryptographically secure pseudorandom number generator (CSPRNG), reduced modulo $q$, and redrawn if the result is zero. This yields a scalar in $[1, q-1]$ at a statistical distance below $2^{-128}$ from uniform, in place of the rejection sampler of draft-irtf-cfrg-cpace-21 §8.3.
 - **Context $C$ and Protocol Binding**:
-  The Context input `CI` binds the pairing ceremony parameters in deterministic CBOR ([RFC 8949 Section 4.2.1](https://www.rfc-editor.org/rfc/rfc8949.html#section-4.2.1)):
+  The channel identifier `CI` binds the pairing ceremony parameters in deterministic CBOR ([RFC 8949 Section 4.2.1](https://www.rfc-editor.org/rfc/rfc8949.html#section-4.2.1)):
   ```cddl
   pairing-context = [
     "RAPP-PAIRING-CONTEXT-v2",
@@ -522,8 +520,9 @@ RAPP v26.10.21 specifies the **`CPaceRistretto255-KC2`** application profile ove
   ]
   ```
   $$C = \text{encode\_deterministic\_cbor}(\text{pairing-context}) \quad (192\text{ bytes on BLE, 186 bytes on stream})$$
+  Both parties' associated data (AD) is empty:
   $$\text{CI} = C, \quad \text{AD}_A = \emptyset, \quad \text{AD}_B = \emptyset$$
-  Role strings designate protocol roles, not persistent device identities. The Requester acts strictly as Initiator ($A$) and the Custodian strictly as Responder ($B$) on every transport; on BLE the Requester transmits via `ATT_WRITE_REQ` and the Custodian via `ATT_HANDLE_VALUE_IND`.
+  Role strings designate protocol roles, not device identities: the Requester is the initiator ($A$) and the Custodian the responder ($B$) on every transport.
 
 #### 6.1.2 Generator Derivation (draft-21 Appendix A.2)
 The generator point $G$ is derived from length-value (LV) encoding with zero-padding to align the first hash block:

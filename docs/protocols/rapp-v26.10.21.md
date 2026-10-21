@@ -649,32 +649,30 @@ The entries `"session-kk-fixed-transcript-ble"` and `"session-kk-fixed-transcrip
 
 ## 7. Authenticated Message Envelopes and Wire Framing
 
-### 7.1 Common Post-Handshake Message Envelope & Complete Message Schemas
-Every message transmitted inside an established pairing channel (the Noise pairing phase) or operational session (the Noise session phase) is encapsulated in a deterministic CBOR envelope conforming to the following normative Concise Data Definition Language (CDDL) specification:
+### 7.1 Message Envelope and Schemas
+Every message inside the Noise pairing phase or the Noise session phase is a deterministic CBOR envelope conforming to this Concise Data Definition Language (CDDL):
 
 ```cddl
-rapp-message =
-    { "version": [26, 10, 21], "session_id": bstr .size 16, "sequence": uint, "type": "pairing.hello", "body": pairing-hello-body, * common-opt }
-  / { "version": [26, 10, 21], "session_id": bstr .size 16, "sequence": uint, "type": "pairing.confirm", "body": pairing-confirm-body, * common-opt }
-  / { "version": [26, 10, 21], "session_id": bstr .size 16, "sequence": uint, "type": "pairing.abort", "body": pairing-abort-body, * common-opt }
-  / { "version": [26, 10, 21], "session_id": bstr .size 16, "sequence": uint, "type": "pairing.stored", "body": pairing-stored-body, * common-opt }
-  / { "version": [26, 10, 21], "session_id": bstr .size 16, "sequence": uint, "type": "session.ready", "body": session-ready-body, * common-opt }
-  / { "version": [26, 10, 21], "session_id": bstr .size 16, "sequence": uint, "type": "session.close", "body": session-close-body, * common-opt }
-  / { "version": [26, 10, 21], "session_id": bstr .size 16, "sequence": uint, "type": "liveness.ping", "body": liveness-ping-body, * common-opt }
-  / { "version": [26, 10, 21], "session_id": bstr .size 16, "sequence": uint, "type": "liveness.pong", "body": liveness-pong-body, * common-opt }
-  / { "version": [26, 10, 21], "session_id": bstr .size 16, "sequence": uint, "type": "operation.request", "body": operation-request-body, * common-opt }
-  / { "version": [26, 10, 21], "session_id": bstr .size 16, "sequence": uint, "type": "operation.result", "body": operation-result-body, * common-opt }
-  / { "version": [26, 10, 21], "session_id": bstr .size 16, "sequence": uint, "type": "operation.result_ack", "body": operation-result-ack-body, * common-opt }
-  / { "version": [26, 10, 21], "session_id": bstr .size 16, "sequence": uint, "type": "operation.status_request", "body": operation-status-request-body, * common-opt }
-  / { "version": [26, 10, 21], "session_id": bstr .size 16, "sequence": uint, "type": "operation.status", "body": operation-status-body, * common-opt }
-  / { "version": [26, 10, 21], "session_id": bstr .size 16, "sequence": uint, "type": "operation.progress", "body": operation-progress-body, * common-opt }
-  / { "version": [26, 10, 21], "session_id": bstr .size 16, "sequence": uint, "type": "card.status", "body": card-status-body, * common-opt }
-  / { "version": [26, 10, 21], "session_id": bstr .size 16, "sequence": uint, "type": "error", "body": error-body, * common-opt }
+rapp-message = {
+  "version": [26, 10, 21],
+  "session_id": bstr .size 16,
+  "sequence": uint,
+  message
+}
 
-common-opt = (
-  ? "critical": [* tstr],           ; unrecognized critical fields abort session
-  ? "extensions": { * tstr => any } ; forward-compatible non-critical data
-)
+message //= ( "type": "pairing.hello",      "body": pairing-hello-body )
+message //= ( "type": "pairing.confirm",    "body": pairing-confirm-body )
+message //= ( "type": "pairing.abort",      "body": pairing-abort-body )
+message //= ( "type": "pairing.stored",     "body": pairing-stored-body )
+message //= ( "type": "session.ready",      "body": session-ready-body )
+message //= ( "type": "session.close",      "body": session-close-body )
+message //= ( "type": "liveness.ping",      "body": liveness-ping-body )
+message //= ( "type": "liveness.pong",      "body": liveness-pong-body )
+message //= ( "type": "operation.request",  "body": operation-request-body )
+message //= ( "type": "operation.result",   "body": operation-result-body )
+message //= ( "type": "operation.progress", "body": operation-progress-body )
+message //= ( "type": "card.status",        "body": card-status-body )
+message //= ( "type": "error",              "body": error-body )
 
 ; 1. Pairing Peer Introduction
 pairing-hello-body = {
@@ -692,7 +690,7 @@ negotiated-parameters = {
   "candidate_id": tstr         ; candidate_id of its offer entry (§4.2)
 }
 
-; 2. Explicit Grant Confirmation
+; 2. Grant Confirmation
 pairing-confirm-body = {
   "granted_profiles": [* tstr]
 }
@@ -707,7 +705,7 @@ pairing-stored-body = {
   "pair_id": bstr .size 16
 }
 
-; 5. Operational Session Ready Proof
+; 5. Session Ready
 session-ready-body = {
   "parameters": session-parameters,
   "nonce": bstr .size 32
@@ -721,7 +719,7 @@ session-parameters = {
   "grants_hash": bstr .size 32
 }
 
-; 6. Authenticated Session Close
+; 6. Session Close
 session-close-body = {
   "reason": close-reason-val,
   "last_received_sequence": uint
@@ -745,7 +743,7 @@ liveness-ping-body = {
   "last_received_sequence": uint
 }
 
-; 8. Liveness Challenge Echo
+; 8. Liveness Echo
 liveness-pong-body = {
   "challenge": bstr .size 32,
   "last_received_sequence": uint
@@ -764,12 +762,10 @@ operation-request-body = {
 ; 10. Operation Result
 operation-result-body = {
   "operation_id": bstr .size 16,
-  "request_hash": bstr .size 32,
   "status": operation-status-val,
   ? "response": { * tstr => any },
   ? "error": tstr,
-  ? "remaining_retries": uint,
-  ? "retired": bool
+  ? "remaining_retries": uint
 }
 
 operation-status-val =
@@ -777,70 +773,41 @@ operation-status-val =
   / "rejected"
   / "credential_rejected"
   / "cancelled"
-  / "ambiguous"
 
-operation-state-val =
-    "in_flight"
-  / operation-status-val
-
-; 11. Operation Result Acknowledgment
-operation-result-ack-body = {
-  "operation_id": bstr .size 16,
-  "request_hash": bstr .size 32
-}
-
-; 12. Operation Status Request (Reconciliation Query)
-operation-status-request-body = {
-  "operation_id": bstr .size 16
-}
-
-; 13. Operation Status Report (Reconciliation Response)
-operation-status-body = {
-  "operation_id": bstr .size 16,
-  "known": bool,
-  ? "state": operation-state-val,
-  ? "request_hash": bstr .size 32,
-  ? "retired": bool
-}
-
-; 14. Operation Progress Update
+; 11. Operation Progress
 operation-progress-body = {
   "operation_id": bstr .size 16,
-  "request_hash": bstr .size 32,
   "event": progress-event-val
 }
 
 progress-event-val =
-    "consent_shown"
+    "queued"            ; another session's operation holds the card (§8.2)
+  / "consent_shown"
   / "waiting_for_card"
   / "card_wait_ended"
-  / tstr
 
-; 15. Card Presence
+; 12. Card Presence
 card-status-body = {
-  "card_present": bool
+  "card_present": bool,
+  ? "certificate_fingerprint": bstr .size 32   ; SHA-256 of the authentication certificate; present when card_present is true
 }
 
-; 16. Protocol Error Body: error-body is defined in §10.3
+; 13. Protocol Error: error-body is defined in §10.3
 ```
 
-#### Normative Semantics of Registered Message Types:
-1. **`pairing.hello`**: Transmitted by the Requester inside the Noise pairing phase immediately following handshake completion. Echoes negotiated pairing parameters (`version`, `suite`, `offer_hash`, `transport_profile`, `candidate_id`), peer display name, and requested profile names. The Custodian verifies that all echoed parameters match its local offer state; any discrepancy aborts pairing.
-2. **`pairing.confirm`**: Transmitted by the Custodian to grant the requested profiles matching the active offer; subsequently echoed by the Requester. Contains the canonical list of `granted_profiles`. Both peers verify that the sets are identical before deriving `grants_hash` (Section 4.3).
-3. **`pairing.abort`**: Transmitted by either peer to cancel an in-progress pairing ceremony prior to final trust record storage, providing an advisory reason string. Ephemeral keys are destroyed immediately.
-4. **`pairing.stored`**: Transmitted by each peer inside the Noise pairing phase once its pairing trust record is durably stored, carrying the derived `pair_id`. A peer treats the pairing as active only after receiving it (§4.3 item 4).
-5. **`session.ready`**: Transmitted by the Custodian upon completing the Noise session phase (`Noise_KK`) to prove possession of the operational session key and fresh session state, echoing session parameters and a fresh random 32-byte `nonce`.
-6. **`session.close`**: Transmitted by either peer to signal an orderly, authenticated termination of an operational session, providing a registered `close-reason-val` and acknowledging the `last_received_sequence`.
-7. **`liveness.ping`**: Periodic authenticated keepalive request transmitted by either peer carrying a fresh 32-byte `challenge` and sequence acknowledgment.
-8. **`liveness.pong`**: Periodic authenticated keepalive response echoing the exact 32-byte `challenge` and sequence acknowledgment.
-9. **`operation.request`**: Transmitted by the Requester to initiate a credential action under a registered profile (§8.2, §9).
-10. **`operation.result`**: Transmitted by the Custodian to deliver the final card execution outcome, status, signature/response payload, or credential error (§8.2).
-11. **`operation.result_ack`**: Transmitted by the Requester to acknowledge delivery of every `operation.result`, whatever its status, permitting the Custodian to prune the cached payload and retire the entry (§8.2).
-12. **`operation.status_request`**: Transmitted by the Requester after reconnecting to reconcile the terminal outcome of an interrupted or ambiguous operation (§8.3).
-13. **`operation.status`**: Transmitted by the Custodian in response to `operation.status_request`, reporting whether the operation is journaled (`known`) and its terminal state (§8.3).
-14. **`operation.progress`**: Notification transmitted by the Custodian while an operation is pending: that the consent view is on screen (`"consent_shown"`, §8.2 item 3), or during long-running card transactions (e.g. prompt to present card to NFC antenna).
-15. **`card.status`**: Transmitted by the Custodian on an operational session once immediately after `session.ready` and again whenever the presence of a card it can serve changes, so that a Requester offers the Custodian's credentials only while a card can answer (§8.4).
-16. **`error`**: Application protocol error envelope transmitted upon encountering unexpected conditions (e.g. a second request while one operation is live, refused with `operation_failed`, or an unknown operation race); bounded schema and numeric error code mappings are defined in §10.3.
+#### Message Semantics:
+1. **`pairing.hello`**: Sent by the Requester in the Noise pairing phase right after the handshake. Echoes the negotiated parameters, the peer's display name and platform, and the requested profile names. The Custodian checks every echoed parameter against its offer; any difference aborts the pairing.
+2. **`pairing.confirm`**: Sent by the Custodian with the profiles it grants from those requested, then echoed by the Requester. Both verify the lists are identical before deriving `grants_hash` (§4.3).
+3. **`pairing.abort`**: Sent by either endpoint to cancel a pairing before the records are stored, with a reason for display. Ephemeral keys are destroyed at once.
+4. **`pairing.stored`**: Sent by each endpoint once its pairing record is durably stored, carrying the derived `pair_id`. An endpoint treats the pairing as active only after receiving it (§4.3 item 4).
+5. **`session.ready`**: Sent by the Custodian on completing the `Noise_KK` handshake, echoing the session parameters with a fresh random 32-byte `nonce`.
+6. **`session.close`**: Sent by either endpoint to end a session, with a registered reason and the last sequence it received.
+7. **`liveness.ping`** and **`liveness.pong`**: Keepalive sent by either endpoint with a fresh 32-byte `challenge`, echoed exactly by the peer; both carry the last sequence received (§7.2).
+8. **`operation.request`**: Sent by the Requester to start a credential action under a registered profile (§8, §9).
+9. **`operation.result`**: Sent by the Custodian with the outcome of the operation: its status and the response, or the error (§8).
+10. **`operation.progress`**: Sent by the Custodian while an operation is pending, for every change of its state: queued behind another session's operation, consent on screen, waiting for the card, card found (§8.2).
+11. **`card.status`**: Sent by the Custodian once right after `session.ready` and again whenever the card it can serve changes: present or absent, and which card, by the fingerprint of its authentication certificate (§8.4).
+12. **`error`**: Sent on a protocol condition that is not an operation outcome, such as a second request while one operation of the session is live; schema and codes in §10.3.
 
 ### 7.2 Field Semantics, Version Precedence, and Sequencing
 1. **Wire Version & Skew Precedence**:

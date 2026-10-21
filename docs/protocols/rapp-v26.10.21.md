@@ -729,7 +729,6 @@ close-reason-val =
   / "complete"
   / "user_disconnect"
   / "policy"
-  / "credential_rejected"
   / "protocol_violation"
   / "pairing_revoked"
   / "shutdown"
@@ -761,14 +760,12 @@ operation-result-body = {
   "operation_id": bstr .size 16,
   "status": operation-status-val,
   ? "response": { * tstr => any },
-  ? "error": tstr,
-  ? "remaining_retries": uint
+  ? "error": tstr
 }
 
 operation-status-val =
     "completed"
   / "rejected"
-  / "credential_rejected"
   / "cancelled"
 
 ; 11. Operation Progress
@@ -830,7 +827,7 @@ An operation is one credential action, an authentication signature, a document s
 2. **Queue**: The card serves one operation at a time, across every session the Custodian holds. Operations take the card in the order they arrived. While an operation of another session holds the card, the Custodian sends the waiting operation `operation.progress` with event `"queued"`, once when it joins the queue; when its turn comes it proceeds. An operation that expires in the queue is cancelled as §8.1 item 2 says.
 3. **Consent**: For an action that needs the holder's authorization or PIN (§9), the Custodian shows the details on the phone screen (§11) and, once the view is on screen, sends `operation.progress` with event `"consent_shown"`. The view renders from a snapshot of the request taken at admission; nothing that arrives later changes it. If the holder declines, the operation ends with `status` `"rejected"` and `error` `"user_cancelled"`; no card command is sent.
 4. **Card**: The Custodian checks the retry floor (§10.2) and commands the card over NFC or through its reader. While it waits for the holder to present the card it sends `operation.progress` with event `"waiting_for_card"`, and `"card_wait_ended"` when the card is found or the wait is over.
-5. **Result**: The Custodian sends `operation.result` with `status` `"completed"` and the response, `"rejected"` with the error, `"credential_rejected"` with the error and `remaining_retries` (§10.2), or `"cancelled"` with the error.
+5. **Result**: The Custodian sends `operation.result` with `status` `"completed"` and the response, `"rejected"` with the error, or `"cancelled"` with the error.
 6. **Reads**: A read-only action (`inspect_card`, `read_identity`, `read_certificate`) commands no private key and no PIN. It takes its turn in the queue and skips consent.
 
 ### 8.3 Session Lifetime
@@ -953,10 +950,9 @@ What an endpoint does when something goes wrong depends on how much it knows abo
 
 No failure revokes a pairing. Pairings are revoked by their users (§4.6).
 
-### 10.2 Credential Rejection and the Retry Floor
-- **Retry floor (PIN 1 and PIN 2)**: Before any command that could decrement a PIN try counter, the Custodian reads the card's remaining attempts for that PIN. It sends the verification only while the card reports **at least 3** remaining. With 2 or fewer remaining, or a counter it cannot read, it refuses without sending any verification command, answering `operation.result` with `status: "rejected"` and `error: "retry_floor"`, and tells the user that the card's remaining attempts are reserved for the card issuer's software. RefineID therefore never consumes a card's last two attempts and can never block a PIN.
-- **Ordinary typo (retries remain)**: If the card rejects PIN 1, PIN 2 or the card access number (CAN) (`SW 63 Cx`) and retries remain, the Custodian answers `operation.result` with `status: "rejected"`, `error: "invalid_credential"`, and the exact `remaining_retries`. The operation terminates; stored pairings and vault keys remain intact. The next verification of that PIN is again subject to the floor.
-- **Blocked credential**: If the card reports a credential blocked (`SW 69 83`), which under the floor can only have happened outside RefineID, the Custodian stops card transmissions and answers `operation.result` with `status: "credential_rejected"`, `error: "card_blocked"`. The pairing is unaffected: pairing is device trust, not card state, and the card is unblocked with the PIN unblocking key (PUK) in the issuer's software; RAPP defines no unblocking operation.
+### 10.2 PIN Entry and the Retry Floor
+- **Retry floor (PIN 1 and PIN 2)**: Before any command that could decrement a PIN try counter, the Custodian reads the card's remaining attempts for that PIN. It sends the verification only while the card reports **at least 3** remaining. With 2, 1 or 0 remaining, or a counter it cannot read, it refuses without sending any verification command, answering `operation.result` with `status: "rejected"` and `error: "retry_floor"`, and tells the holder that the card's remaining attempts are reserved for the card issuer's software. RefineID therefore never consumes a card's last two attempts and can never block a PIN. RAPP defines no unblocking; a blocked card is unblocked with the PIN unblocking key (PUK) outside RAPP.
+- **Wrong PIN**: If the card rejects the PIN (`SW 63 Cx`), the Custodian tells the holder, with the attempts the card still allows, and prompts again, subject to the floor. The Requester learns nothing of it: an operation that needs a PIN ends only as `"completed"`, as `"rejected"` with `"user_cancelled"` or `"retry_floor"`, or as §8.1 says.
 
 ### 10.3 Errors
 ```cddl
@@ -979,7 +975,6 @@ The same names appear in the `error` field of `operation.result`:
 | `"unsupported_parameter"` | Unsupported key profile, algorithm or parameter value (§9). |
 | `"user_cancelled"` | The holder declined on the screen (§8.2 item 3). |
 | `"retry_floor"` | The card reports fewer than 3 remaining attempts for the PIN; no verification was sent (§10.2). |
-| `"invalid_credential"` | The PIN was wrong; `remaining_retries` says how many attempts the card still allows (§10.2). |
 | `"card_error"` | The card did not answer: no card within the wait, the field lost, a transmission fault. |
 | `"operation_failed"` | The Custodian could not carry the operation out for a reason of its own. |
 

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Announced pairing revocation (RAPP v26.10.18 §4.6) against its corpus.
+//! Announced pairing revocation (RAPP v26.10.21 §4.6) against its corpus.
 
 use refineid_rapp::{
     AnnouncementCandidate, DiscoveryRecord, EndpointRole, GrantsHash, InstanceName, PairId,
@@ -21,7 +21,7 @@ use refineid_rapp::{
 };
 use serde::Deserialize;
 
-const CORPUS: &str = include_str!("../../../docs/protocols/vectors/rapp-revocation-v26.10.18.json");
+const CORPUS: &str = include_str!("../../../docs/protocols/vectors/rapp-revocation-v26.10.21.json");
 
 #[derive(Deserialize)]
 struct Corpus {
@@ -171,7 +171,7 @@ fn fill(bytes: &mut [u8]) -> Result<(), refineid_rapp::RevocationError> {
 
 #[test]
 fn corpus_names_its_version() {
-    assert_eq!(corpus().protocol_document_version, "26.10.18");
+    assert_eq!(corpus().protocol_document_version, "26.10.21");
 }
 
 #[test]

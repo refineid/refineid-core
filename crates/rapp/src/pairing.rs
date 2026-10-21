@@ -41,7 +41,7 @@ impl PairRecord {
     /// Constructs a validated pairing record whose storage the peer has
     /// confirmed. The pairing flow builds its record unconfirmed and
     /// confirms it only through an [`ActivePairing`](crate::ActivePairing)
-    /// (RAPP v26.10.18 section 4.3 item 4).
+    /// (RAPP v26.10.21 section 4.3 item 4).
     ///
     /// # Errors
     /// [`PairRecordError`] on an all-zero static key or an empty profile set.

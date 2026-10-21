@@ -15,11 +15,11 @@
 use core::fmt;
 use zeroize::ZeroizeOnDrop;
 
-/// RAPP v26.10.18 wire version triple [Year, Month, Day].
-pub const WIRE_VERSION_V26_10_18: (u16, u16, u16) = (26, 10, 18);
+/// RAPP v26.10.21 wire version triple [Year, Month, Day].
+pub const WIRE_VERSION_V26_10_21: (u16, u16, u16) = (26, 10, 21);
 /// Mandatory RAPP pairing Noise suite.
 pub const MANDATORY_PAIRING_SUITE: &str = "Noise_XXpsk3_25519_ChaChaPoly_SHA512";
-/// Mandatory RAPP session Noise suite (RAPP v26.10.18 section 6.3).
+/// Mandatory RAPP session Noise suite (RAPP v26.10.21 section 6.3).
 pub const MANDATORY_SESSION_SUITE: &str = "Noise_KK_25519_ChaChaPoly_SHA512";
 /// Byte length of an X25519 public or private key.
 pub const X25519_KEY_SIZE: usize = 32;
@@ -31,8 +31,8 @@ pub const MAX_FRAME_SIZE: usize = 65_535;
 pub const MAX_FRAME_PLAINTEXT: usize = 65_519;
 /// Maximum simultaneously active operations at an authorization proxy.
 pub const MAX_ACTIVE_OPERATIONS: usize = 1;
-/// Pairing-offer lifetime in milliseconds (RAPP v26.10.18 §3.3, §4.2).
-pub const OFFER_TTL_MS: u64 = 60_000;
+/// Pairing-offer lifetime in milliseconds (RAPP v26.10.21 §3.3, §4.2).
+pub const OFFER_TTL_MS: u64 = 300_000;
 /// Minimum retry count on the credential that a command can decrement.
 pub const MINIMUM_REMAINING_ATTEMPTS: u8 = 3;
 /// Authentication failures after which re-pairing may be suggested.
@@ -201,9 +201,9 @@ impl ProfileName {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::CardStatus => "fi.refineid.card-status.v1",
-            Self::Authentication => "fi.refineid.authentication.v1",
-            Self::DocumentSigning => "fi.refineid.document-signing.v1",
+            Self::CardStatus => "fi.refineid.card-status",
+            Self::Authentication => "fi.refineid.authentication",
+            Self::DocumentSigning => "fi.refineid.document-signing",
         }
     }
 
@@ -211,9 +211,9 @@ impl ProfileName {
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "fi.refineid.card-status.v1" => Some(Self::CardStatus),
-            "fi.refineid.authentication.v1" => Some(Self::Authentication),
-            "fi.refineid.document-signing.v1" => Some(Self::DocumentSigning),
+            "fi.refineid.card-status" => Some(Self::CardStatus),
+            "fi.refineid.authentication" => Some(Self::Authentication),
+            "fi.refineid.document-signing" => Some(Self::DocumentSigning),
             _ => None,
         }
     }

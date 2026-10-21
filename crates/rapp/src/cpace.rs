@@ -34,7 +34,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::{
     BinaryFrame, HandshakeRole, OFFER_ID_SIZE, OfferId, PAIRING_SECRET_SIZE, PairingSecret,
-    WIRE_VERSION_V26_10_18, WireValue, decode_deterministic_cbor, encode_deterministic_cbor,
+    WIRE_VERSION_V26_10_21, WireValue, decode_deterministic_cbor, encode_deterministic_cbor,
 };
 
 /// Suite identifier for RAPP CPaceRistretto255 KC2 profile with Noise_XXpsk3.
@@ -76,20 +76,20 @@ const CPACE_RISTRETTO255_ISK_DSI: &[u8] = b"CPaceRistretto255_ISK";
 const SHA512_INPUT_BLOCK_SIZE: usize = 128;
 /// Wire framing domain identifier for legacy CPace.
 const CPACE_FRAME_DOMAIN: &str = "RAPP-cpace-v1";
-/// Pairing context array domain identifier (RAPP v26.10.18 §6.1.1).
-const CPACE_CONTEXT_DOMAIN: &str = "RAPP-PAIRING-CONTEXT-v2";
+/// Pairing context array domain identifier (RAPP v26.10.21 §6.1.1).
+const CPACE_CONTEXT_DOMAIN: &str = "rapp-pairing-context";
 /// Domain separation prefix for KC2 transcript hash ($TH$).
-const CPACE_TRANSCRIPT_PREFIX: &[u8] = b"RAPP-CPACE-TRANSCRIPT-v2";
+const CPACE_TRANSCRIPT_PREFIX: &[u8] = b"rapp-cpace-transcript";
 /// HKDF info string for PSK derivation.
-const CPACE_HKDF_PSK_INFO: &[u8] = b"RAPP-NOISE-PSK-v2";
+const CPACE_HKDF_PSK_INFO: &[u8] = b"rapp-noise-psk";
 /// HKDF info string for Initiator confirmation key ($K_A$) derivation.
-const CPACE_HKDF_CONFIRM_A_KEY_INFO: &[u8] = b"RAPP-CPACE-CONFIRM-A-KEY-v2";
+const CPACE_HKDF_CONFIRM_A_KEY_INFO: &[u8] = b"rapp-cpace-confirm-a-key";
 /// HKDF info string for Responder confirmation key ($K_B$) derivation.
-const CPACE_HKDF_CONFIRM_B_KEY_INFO: &[u8] = b"RAPP-CPACE-CONFIRM-B-KEY-v2";
+const CPACE_HKDF_CONFIRM_B_KEY_INFO: &[u8] = b"rapp-cpace-confirm-b-key";
 /// Domain prefix for Initiator confirmation tag ($T_A$) HMAC input.
-const CPACE_CONFIRM_A_TAG_PREFIX: &[u8] = b"RAPP-CPACE-CONFIRM-A-v2";
+const CPACE_CONFIRM_A_TAG_PREFIX: &[u8] = b"rapp-cpace-confirm-a";
 /// Domain prefix for Responder confirmation tag ($T_B$) HMAC input.
-const CPACE_CONFIRM_B_TAG_PREFIX: &[u8] = b"RAPP-CPACE-CONFIRM-B-v2";
+const CPACE_CONFIRM_B_TAG_PREFIX: &[u8] = b"rapp-cpace-confirm-b";
 
 type HmacSha512 = Hmac<Sha512>;
 
@@ -405,12 +405,12 @@ fn normalize_code(code: &str) -> Result<String, CpaceError> {
     Ok(trimmed.to_ascii_uppercase())
 }
 
-/// Encodes a deterministic CBOR pairing context array conforming to RAPP v26.10.18 §6.1.1.
+/// Encodes a deterministic CBOR pairing context array conforming to RAPP v26.10.21 §6.1.1.
 ///
 /// ```cddl
 /// pairing-context = [
-///   "RAPP-PAIRING-CONTEXT-v2",
-///   [26, 10, 18],                                                              ; wire version [Year, Month, Day]
+///   "rapp-pairing-context",
+///   [26, 10, 21],                                                              ; wire version [Year, Month, Day]
 ///   "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512", ; full suite literal
 ///   tstr,                                                                    ; transport profile of the connection
 ///   tstr,                                                                    ; candidate_id of its offer entry
@@ -450,7 +450,7 @@ pub fn encode_pairing_context_v2(
 
 /// Encodes the RAPP pairing context for the offer hash, the transport profile
 /// of the connection, and the candidate identifier of its offer entry
-/// (RAPP v26.10.18 §6.1.1).
+/// (RAPP v26.10.21 §6.1.1).
 ///
 /// # Errors
 /// [`CpaceError::MalformedFrame`] if CBOR serialization fails.
@@ -461,9 +461,9 @@ pub fn standard_pairing_context_v2(
 ) -> Result<Vec<u8>, CpaceError> {
     encode_pairing_context_v2(
         [
-            u64::from(WIRE_VERSION_V26_10_18.0),
-            u64::from(WIRE_VERSION_V26_10_18.1),
-            u64::from(WIRE_VERSION_V26_10_18.2),
+            u64::from(WIRE_VERSION_V26_10_21.0),
+            u64::from(WIRE_VERSION_V26_10_21.1),
+            u64::from(WIRE_VERSION_V26_10_21.2),
         ],
         CPACE_KC2_SUITE,
         transport_profile,
@@ -526,8 +526,8 @@ pub fn calculate_generator_kc2(
     Ok(point)
 }
 
-/// Computes the 64-byte CPace KC2 transcript hash $TH$ per RAPP v26.10.18 §6.1.3:
-/// `SHA-512(lv_cat(["RAPP-CPACE-TRANSCRIPT-v2", SID, C, Y_A, Y_B]))`.
+/// Computes the 64-byte CPace KC2 transcript hash $TH$ per RAPP v26.10.21 §6.1.3:
+/// `SHA-512(lv_cat(["rapp-cpace-transcript", SID, C, Y_A, Y_B]))`.
 #[must_use]
 pub fn calculate_transcript_hash_v2(
     sid: &[u8],
@@ -563,7 +563,7 @@ pub fn hkdf_expand_sha512_32(prk: &[u8; CPACE_PRK_SIZE], info: &[u8]) -> [u8; 32
     out
 }
 
-/// Computes a 32-byte mutual confirmation tag (FIRST32 of HMAC-SHA-512) per RAPP v26.10.18 §6.1.3:
+/// Computes a 32-byte mutual confirmation tag (FIRST32 of HMAC-SHA-512) per RAPP v26.10.21 §6.1.3:
 /// `FIRST32(HMAC-SHA512(key, lv_cat([tag_prefix, TH])))`.
 #[must_use]
 pub fn calculate_confirmation_tag(

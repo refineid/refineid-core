@@ -31,7 +31,7 @@ pub const VERSION: &str = "1";
 pub const MODE_KEY: &str = "mode";
 
 /// TXT key carrying the revocation announcement of a `mode=session` record
-/// (RAPP v26.10.18 section 4.6).
+/// (RAPP v26.10.21 section 4.6).
 pub const REVOKED_KEY: &str = "revoked";
 
 /// Separator between hint-list entries.

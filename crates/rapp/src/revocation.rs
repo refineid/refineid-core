@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Announced pairing revocation (RAPP v26.10.18 §4.6).
+//! Announced pairing revocation (RAPP v26.10.21 §4.6).
 //!
 //! An endpoint that forgets a pairing keeps, in place of the destroyed
 //! private key, the pairing's revocation key `K_rev` and the time of the
@@ -49,7 +49,7 @@ const MILLISECONDS_PER_DAY: u64 = 86_400_000;
 const REVOCATION_ANNOUNCEMENT_DAYS: u64 = 30;
 
 /// How long after a revocation the custodian announces it, in
-/// milliseconds (RAPP v26.10.18 §4.6 item 4).
+/// milliseconds (RAPP v26.10.21 §4.6 item 4).
 pub const REVOCATION_ANNOUNCEMENT_MS: u64 = REVOCATION_ANNOUNCEMENT_DAYS * MILLISECONDS_PER_DAY;
 
 /// Format version of an encoded [`RevocationRetention`].

@@ -8,7 +8,7 @@ use super::{
     LIVENESS_CHALLENGE_SIZE, MANDATORY_PAIRING_SUITE, MANDATORY_SESSION_SUITE, MessageType,
     OperationId, OperationProgressMessage, OperationReference, OperationRequest,
     OperationRequestRefusal, OperationResultMessage, OperationState, PairId, PingChallenge,
-    ProfileName, RequestError, RequestHash, SESSION_READY_NONCE_SIZE, WIRE_VERSION_V26_10_18,
+    ProfileName, RequestError, RequestHash, SESSION_READY_NONCE_SIZE, WIRE_VERSION_V26_10_21,
     WireValue,
 };
 
@@ -119,7 +119,7 @@ pub struct StatusReport {
     pub retired: bool,
 }
 
-/// Protocol-level error (RAPP v26.10.18 section 10.4).
+/// Protocol-level error (RAPP v26.10.21 section 10.4).
 ///
 /// The engine sends three: `unknown_operation` answers a stale reference,
 /// `duplicate_operation` refuses an operation identifier reused with
@@ -772,9 +772,9 @@ fn validate_profile_set(profiles: &[ProfileName]) -> Result<(), MessageError> {
 
 fn version_value() -> WireValue {
     WireValue::Array(vec![
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_18.0)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_18.1)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_18.2)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_21.0)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_21.1)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_21.2)),
     ])
 }
 
@@ -982,7 +982,7 @@ mod tests {
         MessageError, close_reason_name, parse_close_reason, require_version, version_value,
     };
     use crate::CloseReason;
-    use crate::{WIRE_VERSION_V26_10_18, WireValue};
+    use crate::{WIRE_VERSION_V26_10_21, WireValue};
     use std::collections::BTreeMap;
 
     /// Named so the test states which version is being refused. This constant is
@@ -1058,7 +1058,7 @@ mod tests {
     fn scalar_version_is_refused() {
         assert_eq!(
             require_version(&mut map_with(WireValue::Unsigned(u64::from(
-                WIRE_VERSION_V26_10_18.0
+                WIRE_VERSION_V26_10_21.0
             )))),
             Err(MessageError::InvalidField("version"))
         );

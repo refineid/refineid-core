@@ -7,31 +7,31 @@ use std::collections::BTreeMap;
 
 use refineid_rapp::{
     GrantsHash, HandshakeRole, MANDATORY_SESSION_SUITE, MessageType, PairId,
-    SessionHandshakeParameters, WIRE_VERSION_V26_10_18, WireValue, generate_pair_key_material,
+    SessionHandshakeParameters, WIRE_VERSION_V26_10_21, WireValue, generate_pair_key_material,
     noise::{KK_HANDSHAKE_MESSAGE_SIZE, KkHandshakeState},
 };
 
 /// The wire version as the prologue carries it.
 fn wire_version_value() -> WireValue {
     WireValue::Array(vec![
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_18.0)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_18.1)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_18.2)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_21.0)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_21.1)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_21.2)),
     ])
 }
 
-/// The session prologue of the fixed transcript (RAPP v26.10.18 section 4.3):
+/// The session prologue of the fixed transcript (RAPP v26.10.21 section 4.3):
 /// the corpus pair identifier, an all-0x77 grants hash, and the BLE profile.
 fn session_prologue_ble() -> Vec<u8> {
     let pair_id = hex::decode("8ab9b8bcde5c6eec845d9b1ca0d3a7be").expect("valid pair_id hex");
     let grants_hash = [0x77_u8; 32];
     refineid_rapp::encode_deterministic_cbor(&WireValue::Array(vec![
-        WireValue::Text("RAPP-session-v1".to_string()),
+        WireValue::Text("rapp-session".to_string()),
         wire_version_value(),
         WireValue::Text("Noise_KK_25519_ChaChaPoly_SHA512".to_string()),
         WireValue::Bytes(pair_id),
         WireValue::Bytes(grants_hash.to_vec()),
-        WireValue::Text("fi.refineid.rapp.ble.v1".to_string()),
+        WireValue::Text("fi.refineid.rapp.ble".to_string()),
     ]))
     .expect("encode prologue")
 }
@@ -378,12 +378,12 @@ fn test_generate_standard_noise_kk_vector() {
 
     // Normative RAPP session prologue (Section 4.3):
     let prologue_val = WireValue::Array(vec![
-        WireValue::Text("RAPP-session-v1".to_string()),
+        WireValue::Text("rapp-session".to_string()),
         wire_version_value(),
         WireValue::Text("Noise_KK_25519_ChaChaPoly_SHA512".to_string()),
         WireValue::Bytes(pair_id),
         WireValue::Bytes(grants_hash.to_vec()),
-        WireValue::Text("fi.refineid.rapp.ble.v1".to_string()),
+        WireValue::Text("fi.refineid.rapp.ble".to_string()),
     ]);
     let prologue =
         refineid_rapp::encode_deterministic_cbor(&prologue_val).expect("encode prologue");
@@ -517,12 +517,12 @@ fn test_standard_noise_kk_vector_matches_snow_implementation() {
     let pair_id = hex::decode("8ab9b8bcde5c6eec845d9b1ca0d3a7be").expect("valid pair_id hex");
     let grants_hash = [0x77_u8; 32];
     let prologue_val = WireValue::Array(vec![
-        WireValue::Text("RAPP-session-v1".to_string()),
+        WireValue::Text("rapp-session".to_string()),
         wire_version_value(),
         WireValue::Text("Noise_KK_25519_ChaChaPoly_SHA512".to_string()),
         WireValue::Bytes(pair_id),
         WireValue::Bytes(grants_hash.to_vec()),
-        WireValue::Text("fi.refineid.rapp.ble.v1".to_string()),
+        WireValue::Text("fi.refineid.rapp.ble".to_string()),
     ]);
     let prologue =
         refineid_rapp::encode_deterministic_cbor(&prologue_val).expect("encode prologue");

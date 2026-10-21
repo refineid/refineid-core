@@ -25,7 +25,7 @@ use super::{
     MANDATORY_PAIRING_SUITE, MANDATORY_SESSION_SUITE, MAX_FRAME_PLAINTEXT, MAX_FRAME_SIZE,
     MessageType, NOISE_TAG_SIZE, OperationId, PAIR_ID_SIZE, PairId, PairingSecret, ProfileName,
     REQUEST_HASH_SIZE, RequestHash, SESSION_ID_SIZE, SequenceGuard, SessionId,
-    WIRE_VERSION_V26_10_18, WireError, WireValue, X25519_KEY_SIZE, encode_deterministic_cbor,
+    WIRE_VERSION_V26_10_21, WireError, WireValue, X25519_KEY_SIZE, encode_deterministic_cbor,
     noise::{KkHandshakeState, NoiseTransport},
 };
 
@@ -475,7 +475,7 @@ fn build(builder: Builder<'_>, role: HandshakeRole) -> Result<HandshakeState, Cr
 pub fn derive_session_id(handshake_hash: &[u8]) -> SessionId {
     let mut bytes = [0_u8; SESSION_ID_SIZE];
     let digest = Sha512::new()
-        .chain_update(b"RAPP-session-id-v1")
+        .chain_update(b"rapp-session-id")
         .chain_update(handshake_hash)
         .finalize();
     bytes.copy_from_slice(&digest[..SESSION_ID_SIZE]);
@@ -487,7 +487,7 @@ pub fn derive_session_id(handshake_hash: &[u8]) -> SessionId {
 pub fn derive_pair_id(handshake_hash: &[u8]) -> PairId {
     let mut bytes = [0_u8; PAIR_ID_SIZE];
     let digest = Sha512::new()
-        .chain_update(b"RAPP-pair-id-v1")
+        .chain_update(b"rapp-pair-id")
         .chain_update(handshake_hash)
         .finalize();
     bytes.copy_from_slice(&digest[..PAIR_ID_SIZE]);
@@ -518,7 +518,7 @@ pub fn compute_grants_hash(profiles: &[ProfileName]) -> Result<GrantsHash, Crypt
     Ok(GrantsHash::from_array(bytes))
 }
 
-/// Bind the exact typed operation request to its pairing (RAPP v26.10.18
+/// Bind the exact typed operation request to its pairing (RAPP v26.10.21
 /// section 8.2.1).
 ///
 /// The commitment is session-independent, so an identical request
@@ -572,7 +572,7 @@ pub(crate) fn compute_wire_request_hash(
 
 fn pairing_prologue(offer_hash: [u8; 32], transport_profile: &str) -> Result<Vec<u8>, CryptoError> {
     encode_deterministic_cbor(&WireValue::Array(vec![
-        WireValue::Text("RAPP-pairing-v1".to_owned()),
+        WireValue::Text("rapp-pairing".to_owned()),
         version_value(),
         WireValue::Text(CPACE_KC2_SUITE.to_owned()),
         WireValue::Bytes(offer_hash.to_vec()),
@@ -587,7 +587,7 @@ fn session_prologue(
     transport_profile: &str,
 ) -> Result<Vec<u8>, CryptoError> {
     encode_deterministic_cbor(&WireValue::Array(vec![
-        WireValue::Text("RAPP-session-v1".to_owned()),
+        WireValue::Text("rapp-session".to_owned()),
         version_value(),
         WireValue::Text(MANDATORY_SESSION_SUITE.to_owned()),
         WireValue::Bytes(pair_id.as_bytes().to_vec()),
@@ -599,9 +599,9 @@ fn session_prologue(
 
 fn version_value() -> WireValue {
     WireValue::Array(vec![
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_18.0)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_18.1)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_18.2)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_21.0)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_21.1)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_21.2)),
     ])
 }
 
@@ -761,11 +761,11 @@ mod tests {
         );
     }
 
-    /// RAPP v26.10.18 §4.3:276: Deterministic CBOR of the pairing prologue is exactly 151 bytes.
+    /// RAPP v26.10.21 §4.3:276: Deterministic CBOR of the pairing prologue is exactly 151 bytes.
     #[test]
     fn pairing_prologue_matches_normative_151_byte_length() {
         const NORMATIVE_PAIRING_PROLOGUE_LENGTH: usize = 151;
-        let prologue = super::pairing_prologue([0xaa; 32], "fi.refineid.rapp.ble.v1")
+        let prologue = super::pairing_prologue([0xaa; 32], "fi.refineid.rapp.ble")
             .expect("pairing prologue encodes");
         assert_eq!(prologue.len(), NORMATIVE_PAIRING_PROLOGUE_LENGTH);
     }

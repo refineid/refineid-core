@@ -126,7 +126,7 @@ pub struct RappPairMetadata {
     pub profiles: Vec<String>,
     /// Pair-record creation time supplied by the platform wall clock.
     pub created_at_ms: u64,
-    /// Whether the peer confirmed storing its record (RAPP v26.10.18 §4.3
+    /// Whether the peer confirmed storing its record (RAPP v26.10.21 §4.3
     /// item 4). A record loaded unconfirmed survived a crash inside the
     /// confirmation window: it opens no session, routes nothing, and the
     /// caller revokes it.
@@ -147,7 +147,7 @@ pub enum RappBindingError {
     WrongPhase,
     /// The one-use pairing offer reached its monotonic deadline.
     OfferExpired,
-    /// The peer never confirmed that it stored the pairing (RAPP v26.10.18
+    /// The peer never confirmed that it stored the pairing (RAPP v26.10.21
     /// §4.3 item 4): the post-PAKE deadline passed in the storage phase, or
     /// a record loaded from the vault is unconfirmed. Such a record opens
     /// no session, routes nothing and is announced nowhere; the caller
@@ -162,10 +162,10 @@ pub enum RappBindingError {
     /// Referenced operation was not found in the active session.
     UnknownOperation,
     /// Three pairing attempts failed against one offer; the offer is
-    /// destroyed (RAPP v26.10.18 §3.3).
+    /// destroyed (RAPP v26.10.21 §3.3).
     AttemptsExhausted,
     /// A pre-authentication attempt came within 500 ms of the previous one
-    /// (RAPP v26.10.18 §3.3.8); the caller refuses it and changes nothing.
+    /// (RAPP v26.10.21 §3.3.8); the caller refuses it and changes nothing.
     RateLimited,
 }
 
@@ -335,7 +335,7 @@ pub struct RappPairingBridge {
 
 #[uniffi::export]
 impl RappPairingBridge {
-    /// Create the custodian's offer (RAPP v26.10.18 §4.2) from a fresh
+    /// Create the custodian's offer (RAPP v26.10.21 §4.2) from a fresh
     /// platform-CSPRNG `offer_id`, the offered credential profiles, and the
     /// transport profiles the offer is served on.
     ///
@@ -365,7 +365,7 @@ impl RappPairingBridge {
     }
 
     /// Accept the offer bootstrap the requester received over the
-    /// transport `transport_profile` (RAPP v26.10.18 §4.2): the Bootstrap
+    /// transport `transport_profile` (RAPP v26.10.21 §4.2): the Bootstrap
     /// Characteristic value on BLE, or the custodian's first frame after the
     /// pairing preamble on the stream transport.
     ///
@@ -1423,7 +1423,7 @@ impl RappPairingBridge {
 }
 
 /// The CPace context of `offer` for the connection whose offer entry has
-/// `candidate_id` (RAPP v26.10.18 §6.1.1).
+/// `candidate_id` (RAPP v26.10.21 §6.1.1).
 fn pairing_context(
     offer: &PairingOffer,
     offer_hash: &[u8; 32],
@@ -2022,7 +2022,7 @@ mod pairing_bridge_tests {
 }
 
 /// The custodian's process-wide backoff after locked-out offers
-/// (RAPP v26.10.18 §3.3.7), driven by platform monotonic milliseconds.
+/// (RAPP v26.10.21 §3.3.7), driven by platform monotonic milliseconds.
 #[derive(Debug, Default, uniffi::Object)]
 pub struct RappPairingBackoff {
     backoff: Mutex<PairingBackoff>,
@@ -2500,7 +2500,7 @@ pub trait RappPairVault: Send + Sync {
 
     /// Atomically replace the record stored under an existing identifier:
     /// the confirmed form of a record inserted before the peer confirmed
-    /// its storage (RAPP v26.10.18 §4.3 item 4).
+    /// its storage (RAPP v26.10.21 §4.3 item 4).
     ///
     /// # Errors
     /// [`RappVaultError`] on an absent pair or unavailable storage.
@@ -3304,7 +3304,7 @@ pub(super) fn take_unsigned(
 }
 
 /// The BLE segmentation and reassembly receiver for one connection and one
-/// direction (RAPP v26.10.18 §5.3).
+/// direction (RAPP v26.10.21 §5.3).
 ///
 /// Any refused fragment zeroizes the partial frame; the caller then drops
 /// the connection.
@@ -3373,7 +3373,7 @@ impl RappBleSarReassembler {
 }
 
 /// The uniform SAR fragment payload capacity for a negotiated ATT MTU and
-/// any smaller value limit the platform reports (RAPP v26.10.18 §5.3).
+/// any smaller value limit the platform reports (RAPP v26.10.21 §5.3).
 ///
 /// # Errors
 /// [`RappBindingError::InvalidInput`] below an MTU of 512 or when the limit

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! The routing preamble every connection opens with, on both transport
-//! profiles (RAPP v26.10.18 §2.2.1), and the stream profile's name.
+//! profiles (RAPP v26.10.21 §2.2.1), and the stream profile's name.
 //!
 //! The stream profile (§2.2.2) carries RAPP frames over one reliable ordered
 //! byte stream, each frame behind a 2-byte big-endian length. Socket I/O and
@@ -25,7 +25,7 @@ use super::{
 };
 
 /// Registered transport profile name for the stream profile.
-pub const STREAM_PROFILE: &str = "fi.refineid.stream.v1";
+pub const STREAM_PROFILE: &str = "fi.refineid.stream";
 
 /// Preamble purpose naming a pairing attempt.
 const PURPOSE_PAIRING: &str = "pairing";

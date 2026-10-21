@@ -14,7 +14,7 @@
 
 //! How a stored pairing finds its peer without naming itself on the wire:
 //! rotating discovery hints (hierarchy specification §4.3) and per-dial
-//! session routing tags (RAPP v26.10.18 §2.2.1).
+//! session routing tags (RAPP v26.10.21 §2.2.1).
 //!
 //! Both are keyed by the pairing's static X25519 agreement, which only the
 //! two endpoints know. A discovery hint changes every 15 minutes and a
@@ -63,10 +63,10 @@ pub const SESSION_ROUTING_SIZE: usize = ROUTING_NONCE_SIZE + ROUTING_TAG_SIZE;
 pub const ROUTING_REPLAY_WINDOW: usize = 256;
 
 /// HKDF info naming the discovery-hint key.
-const DISCOVERY_KEY_INFO: &[u8] = b"RAPP-discovery-hint-v2";
+const DISCOVERY_KEY_INFO: &[u8] = b"rapp-discovery-hint";
 
 /// HKDF info naming the routing key.
-const ROUTING_KEY_INFO: &[u8] = b"RAPP-routing-v1";
+const ROUTING_KEY_INFO: &[u8] = b"rapp-routing";
 
 /// The discovery epoch of a Unix time: `floor(unix_time / 900)`.
 #[must_use]
@@ -85,7 +85,7 @@ impl core::fmt::Debug for DiscoveryKey {
 
 impl DiscoveryKey {
     /// Derives the key of a stored pairing. A pairing the peer never
-    /// confirmed storing is not announced (RAPP v26.10.18 section 4.3
+    /// confirmed storing is not announced (RAPP v26.10.21 section 4.3
     /// item 4).
     ///
     /// # Errors
@@ -104,7 +104,7 @@ impl DiscoveryKey {
     }
 
     /// Derives `K_disc = HKDF-SHA-256(salt = pair_id, IKM = X25519(local
-    /// static private, peer static public), info = "RAPP-discovery-hint-v2",
+    /// static private, peer static public), info = "rapp-discovery-hint",
     /// L = 32)`.
     ///
     /// # Errors
@@ -159,7 +159,7 @@ impl DiscoveryKey {
 
 /// A well-formed `mode=session` record: the discovery hints it carries,
 /// possibly none (hierarchy specification §4.3), and its revocation
-/// announcement when it has one (RAPP v26.10.18 §4.6).
+/// announcement when it has one (RAPP v26.10.21 §4.6).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DiscoveryRecord {
     hints: Vec<[u8; DISCOVERY_HINT_SIZE]>,
@@ -270,7 +270,7 @@ impl core::fmt::Debug for RoutingKey {
 
 impl RoutingKey {
     /// Derives the key of a stored pairing. A pairing the peer never
-    /// confirmed storing neither routes nor dials (RAPP v26.10.18 section
+    /// confirmed storing neither routes nor dials (RAPP v26.10.21 section
     /// 4.3 item 4).
     ///
     /// # Errors
@@ -289,7 +289,7 @@ impl RoutingKey {
     }
 
     /// Derives `K_route = HKDF-SHA-256(salt = pair_id, IKM = X25519(local
-    /// static private, peer static public), info = "RAPP-routing-v1",
+    /// static private, peer static public), info = "rapp-routing",
     /// L = 32)`.
     ///
     /// # Errors
@@ -355,7 +355,7 @@ pub struct RandomUnavailable;
 pub enum RecordKeyError {
     /// The static agreement is the identity point.
     DegenerateAgreement(DegenerateAgreement),
-    /// The peer never confirmed that it stored the pairing (RAPP v26.10.18
+    /// The peer never confirmed that it stored the pairing (RAPP v26.10.21
     /// section 4.3 item 4).
     StorageUnconfirmed,
 }

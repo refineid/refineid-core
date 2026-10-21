@@ -50,7 +50,7 @@ impl OneOrMany {
 }
 
 fn model() -> Model {
-    serde_yaml::from_str(MODEL).expect("normative RAPP state model must parse")
+    serde_saphyr::from_str(MODEL).expect("normative RAPP state model must parse")
 }
 
 const fn all_guards() -> Guards {

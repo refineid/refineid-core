@@ -80,7 +80,7 @@ serde = "1"
 serde_json = "1"
 # Reads docs/protocols/rapp-state-machine-*.yaml in the model
 # conformance test; the rapp crate itself never parses YAML.
-serde_yaml = "0.9"
+serde-saphyr = { version = "2", default-features = false, features = ["deserialize"] }
 # The Noise Protocol Framework handshakes and transport cipher for the
 # mandatory RAPP suite (crates/rapp); the protocol's security lives
 # here, transports are underlays. Default features drag the ring C

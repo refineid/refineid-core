@@ -860,7 +860,7 @@ The profiles a pairing can grant (§4.3), and the actions of each:
 
 | Profile | Purpose | Card commands |
 | :--- | :--- | :--- |
-| `"fi.refineid.card-status"` | Card status, answer to reset (ATR), retry counters, identity | Reads only |
+| `"fi.refineid.card-status"` | Answer to reset (ATR), supported profiles, identity | Reads only |
 | `"fi.refineid.authentication"` | Workstation/browser authentication signatures | PIN 1 verify & private-key signature |
 | `"fi.refineid.document-signing"` | Qualified Electronic Signatures (QES) | PIN 2 verify & private-key signature |
 
@@ -871,11 +871,7 @@ The profiles a pairing can grant (§4.3), and the actions of each:
     ```cddl
     inspect-card-response = {
       "atr": bstr,                       ; answer to reset, or its historical bytes; empty when the platform exposes neither
-      "supported_profiles": [* tstr],
-      ? "pin1_factory": bool,            ; PIN 1 still holds factory reference data
-      ? "pin2_factory": bool,
-      ? "pin1_attempts": uint / null,    ; remaining tries; null when the card does not expose the counter
-      ? "pin2_attempts": uint / null
+      "supported_profiles": [* tstr]
     }
     ```
 - **`read_identity`** (Safe Read):

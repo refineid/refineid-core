@@ -76,8 +76,8 @@ enforce:
 | SC-7 | The requester withdraws an identity only on evidence that the custodian cannot serve it. |
 
 The protocol already addresses H-1, H-2, and H-6 in depth: consent on the
-custodian screen (section 11), write-ahead journaling and durable
-tombstones (section 8), and keyed, rotating discovery and withdrawal hints
+custodian screen (section 11), one operation at a time on the card,
+forgotten with its session (section 8), and keyed, rotating discovery and withdrawal hints
 (sections 2.2.1, 4.3, 4.5). The findings below concentrate on H-3, H-4,
 H-5, and H-7, where the control structure has the fewest feedback paths.
 
@@ -282,29 +282,29 @@ produces a consent screen that looks right for a document the user did
 not choose. The protocol cannot close this; the requester's own path from
 chosen file to digest must be the subject of its own analysis.
 
-## 7. Candidate requirements
+## 7. Controller constraints
 
-Protocol-level candidates, for the owner to stamp or reject:
+Protocol-level constraints, for the owner to stamp or reject:
 
-| ID | Candidate | Closes |
+| ID | Constraint | Closes |
 | :--- | :--- | :--- |
-| R-1 | A `pairing.stored` message from each side after Phase 4, so a pairing exists only when both confirmations have been exchanged; an unconfirmed pairing is revoked locally. | UCA-8 |
-| R-2 | An authenticated `pairing.revoke` message, sent on the next session or carried as a keyed hint like withdrawal, so a peer that forgets a pairing tells the other. | UCA-9 |
-| R-3 | A distinct close or handshake outcome for "pairing unknown" so the requester can show "this phone forgot this computer" instead of "not reachable". It must not become a probe for pairing existence; section 2.2.1's constant-time routing already shapes this. | UCA-7, UCA-9 |
-| R-4 | A card-status message or keyed discovery hint carrying card presence, per the departure plan, so the requester's identity publication follows the card. | UCA-3, UCA-5, UCA-13 |
-| R-5 | `operation.result_ack` for every terminal status, not only `completed`. | UCA-10 |
-| R-6 | An `operation.progress` state `consent_shown`, and a deadline measured against a clock that keeps running through suspension, so that an operation found past its deadline on resume expires without a prompt. | UCA-1, UCA-11 |
+| CC-1 | A `pairing.stored` message from each side after Phase 4, so a pairing exists only when both confirmations have been exchanged; an unconfirmed pairing is revoked locally. | UCA-8 |
+| CC-2 | An authenticated `pairing.revoke` message, sent on the next session or carried as a keyed hint like withdrawal, so a peer that forgets a pairing tells the other. | UCA-9 |
+| CC-3 | A distinct close or handshake outcome for "pairing unknown" so the requester can show "this phone forgot this computer" instead of "not reachable". It must not become a probe for pairing existence; section 2.2.1's constant-time routing already shapes this. | UCA-7, UCA-9 |
+| CC-4 | A card-status message or keyed discovery hint carrying card presence, per the departure plan, so the requester's identity publication follows the card. | UCA-3, UCA-5, UCA-13 |
+| CC-5 | `operation.result_ack` for every terminal status, not only `completed`. | UCA-10 |
+| CC-6 | An `operation.progress` state `consent_shown`, and a deadline measured against a clock that keeps running through suspension, so that an operation found past its deadline on resume expires without a prompt. | UCA-1, UCA-11 |
 
-Implementation-level candidates:
+Implementation-level constraints:
 
-| ID | Candidate | Closes |
+| ID | Constraint | Closes |
 | :--- | :--- | :--- |
-| R-7 | The requester shows the custodian by name and names the cause when it can: withdrawn, closed with reason, locked out, offer lapsed. | UCA-7, UCA-12 |
-| R-8 | The custodian stops advertising as serving when no card can answer, prime data or not. | UCA-13 |
-| R-9 | The custodian reads the platform's thermal and NFC availability state where the platform exposes it, and reports a distinct error when the field is degraded. | Scenario 6.6 |
-| R-10 | The requester treats keychain and token queries as hints and never withdraws an identity on their answer alone. Already in force on the Apple requester. | UCA-4 |
-| R-11 | The requester bounds every dial and every operation with its own deadline, and when it lapses tells the user that the phone did not answer rather than leaving the consumer to hang. | UCA-6 |
-| R-12 | The requester's path from the file the user chose to the digest it sends is analysed and tested as its own control loop, with the consumer's digest checked against the file where the consumer supplies one. | UCA-15 |
+| CC-7 | The requester shows the custodian by name and names the cause when it can: withdrawn, closed with reason, locked out, offer lapsed. | UCA-7, UCA-12 |
+| CC-8 | The custodian stops advertising as serving when no card can answer, prime data or not. | UCA-13 |
+| CC-9 | The custodian reads the platform's thermal and NFC availability state where the platform exposes it, and reports a distinct error when the field is degraded. | Scenario 6.6 |
+| CC-10 | The requester treats keychain and token queries as hints and never withdraws an identity on their answer alone. Already in force on the Apple requester. | UCA-4 |
+| CC-11 | The requester bounds every dial and every operation with its own deadline, and when it lapses tells the user that the phone did not answer rather than leaving the consumer to hang. | UCA-6 |
+| CC-12 | The requester's path from the file the user chose to the digest it sends is analysed and tested as its own control loop, with the consumer's digest checked against the file where the consumer supplies one. | UCA-15 |
 
 ## 8. Incidents for CAST
 
@@ -391,11 +391,11 @@ missing or wrong:
 
 | ID | Recommendation | Closes |
 | :--- | :--- | :--- |
-| R-13 | While the card stays on the phone, keep the NFC session and the PACE secure channel open across requests, and run PACE when the card is first seen rather than when a request arrives, so a browser request costs the PIN and the signature only. | 9.3, UCA-6 |
-| R-14 | End the NFC session as soon as the result has left, or at an idle limit measured in seconds, never later. | 9.3 |
-| R-15 | Read the phone's diagnostics report, which carries per-command round-trip times, before touching the handshake code, and record the command that took the time in this section. | 9.3 |
-| R-16 | Implemented in the 26.10.18 adoption: the requester offers the identity only while a session reports a card, and the phone reports absence as soon as an operation ends without the card answering, so a retrying browser finds nothing to retry; the back-off is gone. | UCA-3, UCA-7 |
-| R-17 | A requester that forgets a pairing without a session open had no feedback path to the phone: the specification let it dial once or not at all, and the Unix requester did neither, so the phone kept listing and serving a pairing that no longer existed until its own user forgot it too. Section 4.6 item 1 now requires the requester to deliver the `pairing_revoked` close itself whenever the phone's session record names the pairing, at most six dials per instance and epoch at least ten seconds apart, from the moment the user forgot the pairing and for up to 30 days, keeping the static key for that close alone until the phone closes the transport after the close or the phone's own revocation hint names the pairing. The retained key is the new hazard this introduces: for up to 30 days a forgotten pairing's key stays on the computer, usable for nothing but a close on a session the requester itself opens, at rest as it was before the user forgot the pairing. | UCA-9 |
+| CC-13 | While the card stays on the phone, keep the NFC session and the PACE secure channel open across requests, and run PACE when the card is first seen rather than when a request arrives, so a browser request costs the PIN and the signature only. | 9.3, UCA-6 |
+| CC-14 | End the NFC session as soon as the result has left, or at an idle limit measured in seconds, never later. | 9.3 |
+| CC-15 | Read the phone's diagnostics report, which carries per-command round-trip times, before touching the handshake code, and record the command that took the time in this section. | 9.3 |
+| CC-16 | Implemented in the 26.10.18 adoption: the requester offers the identity only while a session reports a card, and the phone reports absence as soon as an operation ends without the card answering, so a retrying browser finds nothing to retry; the back-off is gone. | UCA-3, UCA-7 |
+| CC-17 | A requester that forgets a pairing without a session open had no feedback path to the phone: the specification let it dial once or not at all, and the Unix requester did neither, so the phone kept listing and serving a pairing that no longer existed until its own user forgot it too. Section 4.6 item 1 now requires the requester to deliver the `pairing_revoked` close itself whenever the phone's session record names the pairing, at most six dials per instance and epoch at least ten seconds apart, from the moment the user forgot the pairing and for up to 30 days, keeping the static key for that close alone until the phone closes the transport after the close or the phone's own revocation hint names the pairing. The retained key is the new hazard this introduces: for up to 30 days a forgotten pairing's key stays on the computer, usable for nothing but a close on a session the requester itself opens, at rest as it was before the user forgot the pairing. | UCA-9 |
 
 ## 10. STPA of the browser slot on a Unix requester
 
@@ -538,20 +538,20 @@ requester's side can clear the browser's memory.
 
 | ID | Requirement | Closes |
 | :--- | :--- | :--- |
-| R-18 | Whichever requester process holds the session fetches the certificate when the record lacks one, and writes it to the record; the module is not a reader only. The read is a safe operation and consumes no PIN try. | UCA-19 |
-| R-19 | The token's certificate is the one the pairing record caches, read from the card once when no program has cached it yet; a session asks the phone for nothing but its pings, and the phone's one task is the signature. The computer checks every signature against the cached certificate's public key before handing it to the browser, which it can do alone: a signature that does not verify is reported as a device error, never handed on, and the cached certificate is dropped so the next session reads the card again. Residual risk, accepted: a card other than the cached one that shares the access number signs one TLS challenge the browser never receives, and a renewed card costs one failed login before the record is refreshed; a card whose access number differs fails PACE at the signature, which the card does not count, and is reported the same way. | UCA-16 |
-| R-20 | The module's operation deadline is one named constant chosen below the browsers' and relying parties' handshake timeouts, sent to the phone as the operation lifetime, and a result that arrives after it is reconciled through the journal and never resent. | UCA-20, UCA-21 |
-| R-21 | The token follows the session, as §8.4 requires: it is withdrawn when the session closes or `card.status` reports no card, with no hold beyond an operation in flight (R-28); the module dials again when the phone's record with a card-present hint is in sight, at a bounded interval, and not at all while no record is in sight. | UCA-27, UCA-22, UCA-30 |
-| R-22 | A close carrying `pairing_revoked` marks the record revoked before any new dial, so no dial follows the close and the slot goes with the pairing. | UCA-18 |
-| R-23 | The pairing lock is a session lock, not a store lock: it is released by the kernel when its holder exits, and record rewrites are atomic renames any process makes after re-reading the record, so the GUI forgets or revokes while the browser holds the session. The session holder re-reads the record at every ping of its own session thread, independent of the browser's calls; a record it finds revoked ends its session with the `pairing_revoked` close of §4.6 item 1, which the session holder is placed to deliver, and withdraws the token. The module's open never deletes records; sweeping is the GUI's. | UCA-23, UCA-29 |
-| R-24 | The GUI tells apart "the browser holds the phone session" from "the phone is away", from the lock result, and shows the phone as paired and in use rather than unreachable. | UCA-7 |
-| R-25 | The operation context names the computer and nothing it cannot know; the phone's PIN prompt shows that name and the operation kind. The module never fabricates an origin. | UCA-24 |
-| R-26 | The module dials when the phone's record carries a card-present hint (§4.5) and when a signature is asked (R-46), and holds the session only while `card.status` reports a card, closing it when the card leaves and no operation is in flight (R-28), so a browser that merely runs costs the phone nothing while no card lies on it; `C_Finalize` ends any session. | UCA-17 |
-| R-46 | The token's presence is the pairing record's, not the session's: the token stands on the cached certificate from the module's load, before and between sessions, and goes only when the pairing goes or the certificate proved not to be the card's (R-19). A signature asked while no session is held waits for one within the browser's deadline and wakes the dial out of any pause at once; a request the browser has stopped waiting for is never sent to the card. The phone prompts for the card when none lies on it (section 12). Residual, accepted: with the phone unreachable the browser's handshake fails after the deadline, which the user sees as a failed login rather than a missing identity. | UCA-50 |
-| R-27 | `C_Login` succeeds only while the token is present and otherwise returns the token-absent error, and the token's objects are fixed when the token appears: a changed record withdraws the token and offers a new one, so a handle never outlives its object. | UCA-25, UCA-26 |
-| R-28 | A withdrawal that arrives while an operation is in flight waits for that operation's own result or deadline, which the browser receives as the answer to its `C_Sign`; the token is withdrawn after, and the operation is never resent. | UCA-28 |
-| R-29 | Every session under a pairing is opened under that pairing's lock, by the module, the GUI and the CLI alike; a process that cannot take the lock opens nothing and reports the holder. | UCA-31 |
-| R-40 | The GUI closes its own feedback loop while it holds no session: at an interval it re-reads the pairing record, which any process that held a session or dialed may have marked revoked, and it listens to the phone's announcements on the local network, which costs no connection; a revocation hint it verifies (§4.6 item 3) it records under the pairing's lock (R-29), and while the lock is held it records nothing, since the holder is told in its session by the close of §4.6 item 1 and the hint stays announced for the GUI's next round after the lock is free. A phone that forgot the computer leaves the screen within one interval, and the GUI dials for none of this. | UCA-42 |
+| CC-18 | Whichever requester process holds the session fetches the certificate when the record lacks one, and writes it to the record; the module is not a reader only. The read is a safe operation and consumes no PIN try. | UCA-19 |
+| CC-19 | The token's certificate is the one the pairing record caches, read from the card once when no program has cached it yet; a session asks the phone for nothing but its pings, and the phone's one task is the signature. The computer checks every signature against the cached certificate's public key before handing it to the browser, which it can do alone: a signature that does not verify is reported as a device error, never handed on, and the cached certificate is dropped so the next session reads the card again. Residual risk, accepted: a card other than the cached one that shares the access number signs one TLS challenge the browser never receives, and a renewed card costs one failed login before the record is refreshed; a card whose access number differs fails PACE at the signature, which the card does not count, and is reported the same way. | UCA-16 |
+| CC-20 | The module's operation deadline is one named constant chosen below the browsers' and relying parties' handshake timeouts, sent to the phone as the operation lifetime, and a result that arrives after it is reconciled through the journal and never resent. | UCA-20, UCA-21 |
+| CC-21 | The token follows the session, as §8.4 requires: it is withdrawn when the session closes or `card.status` reports no card, with no hold beyond an operation in flight (CC-28); the module dials again when the phone's record with a card-present hint is in sight, at a bounded interval, and not at all while no record is in sight. | UCA-27, UCA-22, UCA-30 |
+| CC-22 | A close carrying `pairing_revoked` marks the record revoked before any new dial, so no dial follows the close and the slot goes with the pairing. | UCA-18 |
+| CC-23 | The pairing lock is a session lock, not a store lock: it is released by the kernel when its holder exits, and record rewrites are atomic renames any process makes after re-reading the record, so the GUI forgets or revokes while the browser holds the session. The session holder re-reads the record at every ping of its own session thread, independent of the browser's calls; a record it finds revoked ends its session with the `pairing_revoked` close of §4.6 item 1, which the session holder is placed to deliver, and withdraws the token. The module's open never deletes records; sweeping is the GUI's. | UCA-23, UCA-29 |
+| CC-24 | The GUI tells apart "the browser holds the phone session" from "the phone is away", from the lock result, and shows the phone as paired and in use rather than unreachable. | UCA-7 |
+| CC-25 | The operation context names the computer and nothing it cannot know; the phone's PIN prompt shows that name and the operation kind. The module never fabricates an origin. | UCA-24 |
+| CC-26 | The module dials when the phone's record carries a card-present hint (§4.5) and when a signature is asked (CC-46), and holds the session only while `card.status` reports a card, closing it when the card leaves and no operation is in flight (CC-28), so a browser that merely runs costs the phone nothing while no card lies on it; `C_Finalize` ends any session. | UCA-17 |
+| CC-46 | The token's presence is the pairing record's, not the session's: the token stands on the cached certificate from the module's load, before and between sessions, and goes only when the pairing goes or the certificate proved not to be the card's (CC-19). A signature asked while no session is held waits for one within the browser's deadline and wakes the dial out of any pause at once; a request the browser has stopped waiting for is never sent to the card. The phone prompts for the card when none lies on it (section 12). Residual, accepted: with the phone unreachable the browser's handshake fails after the deadline, which the user sees as a failed login rather than a missing identity. | UCA-50 |
+| CC-27 | `C_Login` succeeds only while the token is present and otherwise returns the token-absent error, and the token's objects are fixed when the token appears: a changed record withdraws the token and offers a new one, so a handle never outlives its object. | UCA-25, UCA-26 |
+| CC-28 | A withdrawal that arrives while an operation is in flight waits for that operation's own result or deadline, which the browser receives as the answer to its `C_Sign`; the token is withdrawn after, and the operation is never resent. | UCA-28 |
+| CC-29 | Every session under a pairing is opened under that pairing's lock, by the module, the GUI and the CLI alike; a process that cannot take the lock opens nothing and reports the holder. | UCA-31 |
+| CC-40 | The GUI closes its own feedback loop while it holds no session: at an interval it re-reads the pairing record, which any process that held a session or dialed may have marked revoked, and it listens to the phone's announcements on the local network, which costs no connection; a revocation hint it verifies (§4.6 item 3) it records under the pairing's lock (CC-29), and while the lock is held it records nothing, since the holder is told in its session by the close of §4.6 item 1 and the hint stays announced for the GUI's next round after the lock is free. A phone that forgot the computer leaves the screen within one interval, and the GUI dials for none of this. | UCA-42 |
 
 ## 11. STPA of the Android custodian
 
@@ -598,7 +598,7 @@ while the card lies on the phone.
 | UCA-36 | Preparation | Ask for PIN 1 | P | Again after a wrong PIN, without the tries left shown, so the person cannot judge whether to continue or stop. | H-5 |
 | UCA-37 | Reader controller | Arm reader mode and wait for a tap | N | When the activity resumes after the OS dropped reader mode with it, so the dialog waits for a tap that cannot arrive and says only "hold the card". | H-5 |
 | UCA-38 | Remote dialog | Show a computer's request and ask its PIN | P | While the person is inside the local preparation dialog, so two PIN prompts compete and a PIN typed for one lands in the other. | H-1, H-5 |
-| UCA-39 | Custodian | Report the card present to a computer | P | From the last tag event when the field has since dropped, so the computer offers an identity the phone cannot serve. UCA-13 and R-8 state this for priming; this is the live-tag case. | H-3 |
+| UCA-39 | Custodian | Report the card present to a computer | P | From the last tag event when the field has since dropped, so the computer offers an identity the phone cannot serve. UCA-13 and CC-8 state this for priming; this is the live-tag case. | H-3 |
 | UCA-40 | Backend | Connect: PACE with the CAN | P | Again with a CAN the card already rejected, without a new entry, so the attempt fails the same way at every tap and the person is told the card is missing. | H-5 |
 | UCA-41 | Preparation | Retain the verified PIN | P | After the purpose ended, or for a card other than the one that verified it, so a later operation runs under a PIN meant for another moment or another card, and a wrong one costs a try. | H-1, H-5 |
 
@@ -646,16 +646,16 @@ the PIN again. Every component acted as built; the dialog's model of
 
 | ID | Requirement | Closes |
 | :--- | :--- | :--- |
-| R-30 | The entered PIN lives for the whole preparation: an attempt that ends without an answer from the card (no tap, field lost, PACE transport lost) returns to waiting for the card with the PIN held, and the reader is re-armed. The held PIN is sent only to the card first seen in this preparation, by the serial read before the PIN command; another card asks again. PIN 1 is asked again when the card rejected it, when the tries left read after an unknown outcome are fewer than the last count (R-33), when the person cancels, or when the dialog ends on its idle limit (R-32). An entered PIN the card never verified is zeroed when the dialog ends; a verified PIN is retained as R-39 says. | UCA-32 |
-| R-31 | A tap that did not happen is not a failure: the dialog keeps waiting with the hold-card text. A card that answered and is not a supported card is reported as not supported; "card not found" is shown for nothing. Retry, where it is offered, starts from the tap, not from the credentials. | UCA-33 |
-| R-32 | The attempt's timeout is measured from the last reader status change, not from the PIN entry, and counts only while the application is in the foreground with reader mode armed; its expiry ends the attempt and offers Retry with the PIN still held. The dialog itself ends, zeroing the PIN, when the person cancels or after an idle limit that counts in the background too; leaving the foreground alone ends nothing, so a person who answers a notification returns to the same attempt (R-36). | UCA-34 |
-| R-33 | The tries left are read before the first PIN command of a preparation and before every PIN command that follows an unknown outcome; the card reports them without counting a try. A field loss during the PIN command is reported as contact lost during the PIN check. A count lower than the last one read means the PIN was counted wrong, so the held PIN is not sent, the count is shown and the PIN is asked again; with no count to compare, the held PIN is not sent either. | UCA-35 |
-| R-34 | Every PIN prompt shows the tries left whenever the card has told them. | UCA-36 |
-| R-35 | While a local preparation dialog is open, a computer's request waits behind it with a line saying a computer is waiting, and the request's own deadline is honoured; one PIN prompt is on screen at a time. | UCA-38 |
-| R-36 | The reader controller re-arms reader mode when the activity resumes and tells the dialog when reader mode is not active; the dialog says so instead of waiting. | UCA-37 |
-| R-37 | `card.status` claims the card present only on the strength of a command the card answered, never from a tag event alone; a command that ends without the card answering reports absence at once, as R-16 says. A field that drops between commands is learned of at the next command, which is why the computer offers the identity only while a session reports a card (§8.4). | UCA-39 |
-| R-38 | A CAN the card rejected is asked again before the next PACE; the backend never repeats PACE with a CAN that failed. | UCA-40 |
-| R-39 | The retained PIN is bound to the card that verified it, by the identity read in the same session, and to its purpose: a different card asks again, and the end of the purpose zeroes it. | UCA-41 |
+| CC-30 | The entered PIN lives for the whole preparation: an attempt that ends without an answer from the card (no tap, field lost, PACE transport lost) returns to waiting for the card with the PIN held, and the reader is re-armed. The held PIN is sent only to the card first seen in this preparation, by the serial read before the PIN command; another card asks again. PIN 1 is asked again when the card rejected it, when the tries left read after an unknown outcome are fewer than the last count (CC-33), when the person cancels, or when the dialog ends on its idle limit (CC-32). An entered PIN the card never verified is zeroed when the dialog ends; a verified PIN is retained as CC-39 says. | UCA-32 |
+| CC-31 | A tap that did not happen is not a failure: the dialog keeps waiting with the hold-card text. A card that answered and is not a supported card is reported as not supported; "card not found" is shown for nothing. Retry, where it is offered, starts from the tap, not from the credentials. | UCA-33 |
+| CC-32 | The attempt's timeout is measured from the last reader status change, not from the PIN entry, and counts only while the application is in the foreground with reader mode armed; its expiry ends the attempt and offers Retry with the PIN still held. The dialog itself ends, zeroing the PIN, when the person cancels or after an idle limit that counts in the background too; leaving the foreground alone ends nothing, so a person who answers a notification returns to the same attempt (CC-36). | UCA-34 |
+| CC-33 | The tries left are read before the first PIN command of a preparation and before every PIN command that follows an unknown outcome; the card reports them without counting a try. A field loss during the PIN command is reported as contact lost during the PIN check. A count lower than the last one read means the PIN was counted wrong, so the held PIN is not sent, the count is shown and the PIN is asked again; with no count to compare, the held PIN is not sent either. | UCA-35 |
+| CC-34 | Every PIN prompt shows the tries left whenever the card has told them. | UCA-36 |
+| CC-35 | While a local preparation dialog is open, a computer's request waits behind it with a line saying a computer is waiting, and the request's own deadline is honoured; one PIN prompt is on screen at a time. | UCA-38 |
+| CC-36 | The reader controller re-arms reader mode when the activity resumes and tells the dialog when reader mode is not active; the dialog says so instead of waiting. | UCA-37 |
+| CC-37 | `card.status` claims the card present only on the strength of a command the card answered, never from a tag event alone; a command that ends without the card answering reports absence at once, as CC-16 says. A field that drops between commands is learned of at the next command, which is why the computer offers the identity only while a session reports a card (§8.4). | UCA-39 |
+| CC-38 | A CAN the card rejected is asked again before the next PACE; the backend never repeats PACE with a CAN that failed. | UCA-40 |
+| CC-39 | The retained PIN is bound to the card that verified it, by the identity read in the same session, and to its purpose: a different card asks again, and the end of the purpose zeroes it. | UCA-41 |
 
 ## 12. STPA of the iOS custodian's held card session
 
@@ -776,10 +776,10 @@ H-5.
 
 | ID | Requirement | Closes |
 | :--- | :--- | :--- |
-| R-41 | The hold's process model follows the slot: while the session is idle the holder watches the slot's state, and a slot that no longer holds a valid card ends the session at once, so that the reader's pause after a session runs during the idle time and not inside the next request. The system takes an idle slot away some six seconds after the last exchange, so a holder that keeps a session sends one harmless command on the channel every few seconds for as long as it holds it, and a request that arrives while that command is in flight waits for the card's answer. | UCA-43, UCA-46 |
-| R-42 | Opening the slot retries through the reader's pause, for a bounded time within the request's deadline, before the request is refused; the refusal the system gives for the pause is known by its code and never answered as card unavailable while a retry remains. | UCA-44, UCA-45 |
-| R-43 | The holder keeps no belief about the card's security status between operations: PIN 1 is verified for every signature, after the tries-left probe R-33 describes. A command the card refused is reported as refused, never as ambiguous. | UCA-47 |
-| R-47 | The custodian holds one session per pairing, not one session: a second computer's dial is read, routed by its preamble to its own pairing, and served; the card is one and operations from all sessions join one queue at the holder (section 12.2). A dial that names a pairing whose session is already held replaces that session, so a requester that restarts does not wait for its own stale session to expire. A refusal the custodian does give is a close with a reason the requester can show, never a silent drop. | UCA-51 |
+| CC-41 | The hold's process model follows the slot: while the session is idle the holder watches the slot's state, and a slot that no longer holds a valid card ends the session at once, so that the reader's pause after a session runs during the idle time and not inside the next request. The system takes an idle slot away some six seconds after the last exchange, so a holder that keeps a session sends one harmless command on the channel every few seconds for as long as it holds it, and a request that arrives while that command is in flight waits for the card's answer. | UCA-43, UCA-46 |
+| CC-42 | Opening the slot retries through the reader's pause, for a bounded time within the request's deadline, before the request is refused; the refusal the system gives for the pause is known by its code and never answered as card unavailable while a retry remains. | UCA-44, UCA-45 |
+| CC-43 | The holder keeps no belief about the card's security status between operations: PIN 1 is verified for every signature, after the tries-left probe CC-33 describes. A command the card refused is reported as refused, never as ambiguous. | UCA-47 |
+| CC-47 | The custodian holds one session per pairing, not one session: a second computer's dial is read, routed by its preamble to its own pairing, and served; the card is one and operations from all sessions join one queue at the holder (section 12.2). A dial that names a pairing whose session is already held replaces that session, so a requester that restarts does not wait for its own stale session to expire. A refusal the custodian does give is a close with a reason the requester can show, never a silent drop. | UCA-51 |
 
 ## 13. STPA of discovery over a wireless network
 
@@ -843,8 +843,8 @@ record all along, and a query sent there would have been answered.
 
 | ID | Requirement | Closes |
 | :--- | :--- | :--- |
-| R-44 | The requester remembers the addresses a paired phone answered from, beside the pairing record, and every browse for that pairing sends the query to them directly as well as to the group. The addresses are a cache: losing them costs a slower discovery, never a pairing, and a pairing's removal drops them. The pairing ceremony, which knows no address, browses the group alone. | UCA-48 |
-| R-45 | "No phone found" is reported only after the remembered addresses were asked directly and did not answer. | UCA-49 |
+| CC-44 | The requester remembers the addresses a paired phone answered from, beside the pairing record, and every browse for that pairing sends the query to them directly as well as to the group. The addresses are a cache: losing them costs a slower discovery, never a pairing, and a pairing's removal drops them. The pairing ceremony, which knows no address, browses the group alone. | UCA-48 |
+| CC-45 | "No phone found" is reported only after the remembered addresses were asked directly and did not answer. | UCA-49 |
 
 ## 14. CAST: a signature refused as a mismatch, 2026-10-19
 
@@ -856,7 +856,7 @@ negotiating TLS 1.3 succeeded. The phone's trace showed the card
 signing and the result sent; the browser showed a handshake failure
 two seconds later, and the phone's trace showed a new session with a
 certificate read right after. The requester's local check of the
-signature (R-19) had refused it as a mismatch, dropped the cached
+signature (CC-19) had refused it as a mismatch, dropped the cached
 certificate, and closed the session. The server had asked for
 ECDSA with SHA-384 over a P-256 key, which TLS 1.2 allows; the check
 demanded a P-384 key for a SHA-384 digest.
@@ -892,7 +892,7 @@ it was not.
   a hash name because the request type demanded a hash. The inference
   was harmless until a consumer read the name as more than a length.
 - **A check added without its vectors.** The local verification was
-  added for the mismatch case (R-19) with a test that a certificate
+  added for the mismatch case (CC-19) with a test that a certificate
   parsing as nothing verifies nothing. No test ran a real signature for
   each pairing of curve and hash the requester would meet; the one
   field test, a TLS 1.3 site, pairs P-256 with SHA-256 and passed.
@@ -906,12 +906,12 @@ it was not.
 
 | ID | Requirement | Closes |
 | :--- | :--- | :--- |
-| R-48 | A signature request names the hash of its digest and nothing about the key; the key's curve is read from the key. No type in the request path carries a hash and a curve as one value. Where the hash is not told, as under `CKM_ECDSA`, the request carries the digest's length as a length, and the verifier takes the leftmost bits as the curve's order allows, as the card does. | 14.3 |
-| R-49 | Every local check of a signature ships with a vector for each pairing of curve and hash a browser can ask for (P-256 and P-384 with SHA-256, SHA-384 and SHA-512 at least), and a refusal by the check is reported as the check's refusal, distinguishable from a lost signature and from a card that is not the cached one. | 14.3 |
+| CC-48 | A signature request names the hash of its digest and nothing about the key; the key's curve is read from the key. No type in the request path carries a hash and a curve as one value. Where the hash is not told, as under `CKM_ECDSA`, the request carries the digest's length as a length, and the verifier takes the leftmost bits as the curve's order allows, as the card does. | 14.3 |
+| CC-49 | Every local check of a signature ships with a vector for each pairing of curve and hash a browser can ask for (P-256 and P-384 with SHA-256, SHA-384 and SHA-512 at least), and a refusal by the check is reported as the check's refusal, distinguishable from a lost signature and from a card that is not the cached one. | 14.3 |
 
 ## 15. Open questions
 
-- Which of R-1 to R-6 are worth a protocol version, and which are better
+- Which of CC-1 to CC-6 are worth a protocol version, and which are better
   served by application behaviour over the existing messages?
 - Should discovery carry any authenticated liveness at all, or should the
   requester hold a long-lived session instead of inferring presence?
@@ -994,7 +994,7 @@ gone, and four feedback paths change:
 computer with the phone, both in the foreground, and logs in. Later the
 phone is locked and put away. The requester, built on the stream
 transport's model, closes the idle session after a while to save the
-phone's battery, as R-26 asks for a stream. Over the stream the phone's
+phone's battery, as CC-26 asks for a stream. Over the stream the phone's
 discovery record would bring it back within seconds; over BLE the
 locked phone advertises nothing a Windows computer can read. The next
 click on "log in with identity card" finds no phone, the login fails,
@@ -1064,14 +1064,14 @@ read it. H-5, H-6.
 
 | ID | Requirement | Closes |
 | :--- | :--- | :--- |
-| R-50 | Over BLE the requester holds the link and its session for as long as the pairing is usable and the user has not turned the remote reader off, and re-establishes it as soon as the phone's advertisement is seen; it never releases a BLE session for idleness. The cost is the phone's radio, which the custodian may end by withdrawal (§4.5) or by its user. R-26's release on idleness applies to the stream transport, where discovery can find the phone again. | UCA-52 |
-| R-51 | When no session is held and no advertisement is seen, the requester tells its user that the phone must have RefineID open to be found over Bluetooth, and never that the phone is absent. | UCA-53 |
-| R-52 | The requester reads the negotiated ATT MTU as soon as the connection is up and before its first write. Below 512, it closes the link itself and names the cause with the value, distinct from every other close. The custodian reads the capacity when the requester subscribes, which precedes the requester's first frame, refuses a capacity below the minimum before any authentication, and sends nothing (§10.1 item 1); on iOS it cannot end the connection, so the requester's own reading is the feedback that matters. | UCA-54 |
-| R-53 | The requester remembers, per pairing, the advertiser address that last routed its preamble, and dials it first while that address is still advertised; the phone rotates its resolvable private address, and without a bond (R-54) the computer cannot follow it, so the memory lasts until the address changes. Other advertisers are dialed in descending filtered RSSI above the proximity gate (§4.4), each at most once per scan window, and a refused routing is not retried within that window. | UCA-55 |
-| R-54 | The requester never asks the operating system to bond or pair with the phone at the link layer, and the custodian's characteristics require no link-layer encryption, so no operating-system pairing dialog can appear. | UCA-56 |
-| R-55 | The operation context names the computer and the program that asked, and never a relying party it cannot know; the phone shows the computer's name and the program, labelled as such, never as a site. As R-25 for the Unix slot. | UCA-58 |
-| R-56 | Residual, accepted by the usability consensus (section 3): with PIN 1 stored, a program on the computer that reaches the requester can make the card sign for authentication without a prompt. The requester narrows who can reach it to the user's own processes (Windows platform STPA), shows every authentication it relays in its own notification, and the phone records each one in its history with the computer and program that asked. | UCA-57 |
-| R-57 | The custodian's BLE peripheral admits `"session"` preambles and routes them as on the stream transport (§2.2.1), with one session per pairing (R-47). | UCA-59 |
+| CC-50 | Over BLE the requester holds the link and its session for as long as the pairing is usable and the user has not turned the remote reader off, and re-establishes it as soon as the phone's advertisement is seen; it never releases a BLE session for idleness. The cost is the phone's radio, which the custodian may end by withdrawal (§4.5) or by its user. CC-26's release on idleness applies to the stream transport, where discovery can find the phone again. | UCA-52 |
+| CC-51 | When no session is held and no advertisement is seen, the requester tells its user that the phone must have RefineID open to be found over Bluetooth, and never that the phone is absent. | UCA-53 |
+| CC-52 | The requester reads the negotiated ATT MTU as soon as the connection is up and before its first write. Below 512, it closes the link itself and names the cause with the value, distinct from every other close. The custodian reads the capacity when the requester subscribes, which precedes the requester's first frame, refuses a capacity below the minimum before any authentication, and sends nothing (§10.1 item 1); on iOS it cannot end the connection, so the requester's own reading is the feedback that matters. | UCA-54 |
+| CC-53 | The requester remembers, per pairing, the advertiser address that last routed its preamble, and dials it first while that address is still advertised; the phone rotates its resolvable private address, and without a bond (CC-54) the computer cannot follow it, so the memory lasts until the address changes. Other advertisers are dialed in descending filtered RSSI above the proximity gate (§4.4), each at most once per scan window, and a refused routing is not retried within that window. | UCA-55 |
+| CC-54 | The requester never asks the operating system to bond or pair with the phone at the link layer, and the custodian's characteristics require no link-layer encryption, so no operating-system pairing dialog can appear. | UCA-56 |
+| CC-55 | The operation context names the computer and the program that asked, and never a relying party it cannot know; the phone shows the computer's name and the program, labelled as such, never as a site. As CC-25 for the Unix slot. | UCA-58 |
+| CC-56 | Residual, accepted by the usability consensus (section 3): with PIN 1 stored, a program on the computer that reaches the requester can make the card sign for authentication without a prompt. The requester narrows who can reach it to the user's own processes (Windows platform STPA), shows every authentication it relays in its own notification, and the phone records each one in its history with the computer and program that asked. | UCA-57 |
+| CC-57 | The custodian's BLE peripheral admits `"session"` preambles and routes them as on the stream transport (§2.2.1), with one session per pairing (CC-47). | UCA-59 |
 
 ## 17. STPA of serving many computers from one card
 
@@ -1090,7 +1090,7 @@ trusted; the protocol secures the channel and the consent, not an
 arbitrary quota of who may ask. This section covers the custodian
 serving several such clients over the stream transport. BLE, where a
 computer is a single central whose programs share one GATT link, is out
-of scope here; R-57 stands.
+of scope here; CC-57 stands.
 
 ### 17.2 The governing principle
 
@@ -1123,7 +1123,7 @@ by the one consent prompt the holder answers.
 | Card present / removed / replaced on the phone | `card.status` on **every** open session on change, carrying the authentication certificate's SHA-256 fingerprint |
 | Client requests an operation while the card is busy | That it is queued, not silence |
 | Holder is shown the consent prompt | `consent_shown` to the requesting client |
-| Operation completes, is rejected, or expires | The terminal result to the client, and the `operation.result_ack` the stamped spec already requires (§8.2) |
+| Operation completes, is rejected, or expires | The terminal result to the client |
 
 ### 17.4 Unsafe control actions
 
@@ -1175,16 +1175,16 @@ Windows machine from one iPhone with a reader card.
   identity, because a glitched exchange while the card sat in the reader
   was read as the card being gone.
 
-### 17.6 Requirements
+### 17.6 Controller constraints
 
-| ID | Requirement | Closes |
+| ID | Constraint | Closes |
 | :--- | :--- | :--- |
-| R-58 | The custodian serves every paired client concurrently: one authenticated session per client connection, as many under a pairing as the programs that need the card. This supersedes R-47's "one session per pairing" (never adopted -- UCA-60 is the single slot still in force) and keeps R-47's clause that a refusal is a close with a reason, never a silent drop. A paired client is trusted within the channel; there is no quota on sessions or operations. Stream transport; R-57 (BLE) stands. | UCA-60 |
-| R-59 | The card serves one whole request at a time: a request's card commands run start to finish before another request's begin, and commands from different sessions are never interleaved. Concurrent requests queue first-come-first-served, serialized by the one consent prompt, each bounded by a deadline that runs through suspension (R-6). A waiting client is told it is queued (no position), never left silent. Restates R-47's single-queue clause. | UCA-60 |
-| R-60 | `card.status` always carries the SHA-256 fingerprint of the card's authentication certificate (the X.509 certificate fingerprint), zeroed when no card is present so the message is one fixed size. A requester caches the certificate with its fingerprint, reuses it while the fingerprint matches, and re-reads (`read_certificate`) when it changes. | UCA-63 |
-| R-61 | Card presence and every change to it are sent on **every** open session, not only the one being served, so a removed or replaced card reaches all clients at once; `card.status` is sent on change, not polled, with the liveness heartbeat standing in between. A requester whose consumer re-queries (CryptoTokenKit, a browser chooser) offers the card only while a session is open and withdraws the instant the session closes, `card.status` reports absence, or the fingerprint changes. The PKCS#11 slot keeps R-46: its token stands on the cached certificate between sessions, because Firefox never re-asks once handed none. | UCA-61, UCA-62 |
-| R-62 | Every state distinct in the implementation is distinct on the wire and to the user: card ready, waiting on consent, queued, no card, phone unreachable. "Busy" and "gone" are never the same state, and no state is collapsed or hidden. Amends R-7. | UCA-64 |
-| R-63 | Presence is whether the custodian can serve the card on request, not whether the card is electrically connected at that instant, applied the same way to `card.status` on every session and to the custodian's own on-device display. A reader card is present while it is in the reader; a near-field card is present while it is primed and the holder can present it on request, the card summoned per operation. A glitched exchange, or a tap that did not complete, is a failed operation, not absence -- the identity stays. The card is absent only when the holder can no longer serve it: the reader card removed, or the near-field prime cleared. This supersedes section 8.4 item 1's marking the card absent on an unanswered operation. | UCA-65 |
+| CC-58 | The custodian serves every paired client concurrently: one authenticated session per client connection, as many under a pairing as the programs that need the card. This supersedes CC-47's "one session per pairing" (never adopted -- UCA-60 is the single slot still in force) and keeps CC-47's clause that a refusal is a close with a reason, never a silent drop. A paired client is trusted within the channel; there is no quota on sessions or operations. Stream transport; CC-57 (BLE) stands. | UCA-60 |
+| CC-59 | The card serves one whole request at a time: a request's card commands run start to finish before another request's begin, and commands from different sessions are never interleaved. Concurrent requests queue first-come-first-served, serialized by the one consent prompt, each bounded by a deadline that runs through suspension (CC-6). A waiting client is told it is queued (no position), never left silent. Restates CC-47's single-queue clause. | UCA-60 |
+| CC-60 | `card.status` always carries the SHA-256 fingerprint of the card's authentication certificate (the X.509 certificate fingerprint), zeroed when no card is present so the message is one fixed size. A requester caches the certificate with its fingerprint, reuses it while the fingerprint matches, and re-reads (`read_certificate`) when it changes. | UCA-63 |
+| CC-61 | Card presence and every change to it are sent on **every** open session, not only the one being served, so a removed or replaced card reaches all clients at once; `card.status` is sent on change, not polled, with the liveness heartbeat standing in between. A requester whose consumer re-queries (CryptoTokenKit, a browser chooser) offers the card only while a session is open and withdraws the instant the session closes, `card.status` reports absence, or the fingerprint changes. The PKCS#11 slot keeps CC-46: its token stands on the cached certificate between sessions, because Firefox never re-asks once handed none. | UCA-61, UCA-62 |
+| CC-62 | Every state distinct in the implementation is distinct on the wire and to the user: card ready, waiting on consent, queued, no card, phone unreachable. "Busy" and "gone" are never the same state, and no state is collapsed or hidden. Amends CC-7. | UCA-64 |
+| CC-63 | Presence is whether the custodian can serve the card on request, not whether the card is electrically connected at that instant, applied the same way to `card.status` on every session and to the custodian's own on-device display. A reader card is present while it is in the reader; a near-field card is present while it is primed and the holder can present it on request, the card summoned per operation. A glitched exchange, or a tap that did not complete, is a failed operation, not absence -- the identity stays. The card is absent only when the holder can no longer serve it: the reader card removed, or the near-field prime cleared. This supersedes section 8.4 item 1's marking the card absent on an unanswered operation. | UCA-65 |
 
 ### 17.7 Wire changes these require
 
@@ -1201,8 +1201,18 @@ transport:
   payload, always present, zeroed when `card_present` is false.
 - **`queued` feedback.** An `operation.progress` value `queued`, for a
   request waiting on the card, alongside the existing `consent_shown`. No
-  position; `operation.status` (the reconciliation reply) is unchanged.
+  position.
 
 No new identifiers are invented: the fingerprint is the standard X.509
-certificate fingerprint, the session is the client's identity, and the
-operation ID already carries across reconnects.
+certificate fingerprint, the session is the client's identity, and an
+operation lives inside its session.
+
+## 18. Constraints at 26.10.21
+
+The specification stamped 26.10.21 adopts CC-1, CC-2 (as the `pairing_revoked` close delivered in session or on the next one, in both directions), CC-4, CC-6 and CC-58 to CC-63. Three constraints and the hazards behind them are closed differently:
+
+- **CC-5 is withdrawn.** There are no acknowledgements: an operation lives inside its session and is forgotten when the session ends (specification §8.1). A requester that lacks a result starts a new operation.
+- **CC-47 is superseded** by CC-58, as section 17.6 says.
+- **The at-most-once machinery behind UCA-2 and UCA-21 is withdrawn.** Nothing RAPP does mutates the card: a repeated signature or read changes nothing on it, and a PIN is typed by the holder on the phone, bounded by the retry floor (specification §10.2), so a retransmitted request cannot spend a try. The write-ahead journal, the durable tombstones and the reconciliation messages that guarded against a repeated card command are gone; the hazard they addressed does not exist for these operations.
+
+The offer in UCA-12 now lasts 5 minutes, and a wrong PIN is re-prompted on the phone, so the retries-remaining count of section 6 never reaches the requester.

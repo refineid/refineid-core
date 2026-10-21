@@ -783,7 +783,7 @@ progress-event-val =
 ; 12. Card Presence
 card-status-body = {
   "card_present": bool,
-  ? "certificate_fingerprint": bstr .size 32   ; SHA-256 of the authentication certificate; present when card_present is true
+  "certificate_fingerprint": bstr .size 32   ; SHA-256 of the authentication certificate; all zero when card_present is false
 }
 
 ; 13. Protocol Error: error-body is defined in §10.3
@@ -841,7 +841,7 @@ A Requester that offers the Custodian's credentials to local consumers (a browse
 1. **`card.status`**:
    On every session the Custodian sends `card.status` once right after `session.ready`, and again whenever the card it can serve changes. `card_present` is true while the Custodian can serve a card now: a card coupled in a reader, or an NFC card the holder has primed and can present on request. An operation that ends without the card answering (no card within the card wait, the card lost before a command was transmitted, the field lost) makes it false at once, until the holder next couples or primes the card. Cached material alone, with no holder able to present the card, is absence. A card busy with another session's operation is present, not absent: the queue of §8.2 item 2 holds the waiting operation, and `card.status` does not change.
 2. **Which Card**:
-   While `card_present` is true, `certificate_fingerprint` carries the SHA-256 digest of the Distinguished Encoding Rules (DER) encoding of the card's authentication certificate. A Requester compares it with the fingerprint of the certificates it holds for the pairing and, on any difference or when it holds none, reads the certificates afresh (§9) before offering anything; it never offers an identity whose fingerprint the Custodian has not confirmed on this session.
+   While `card_present` is true, `certificate_fingerprint` carries the SHA-256 digest of the Distinguished Encoding Rules (DER) encoding of the card's authentication certificate; while it is false the field is 32 zero bytes, so the message has one size whatever it says. A Requester compares it with the fingerprint of the certificates it holds for the pairing and, on any difference or when it holds none, reads the certificates afresh (§9) before offering anything; it never offers an identity whose fingerprint the Custodian has not confirmed on this session.
 3. **Offering Rule**:
    A Requester holds an open session to a pairing while it offers that pairing's credentials to local consumers, and withdraws the offer at once when the session ends for any reason or when `card.status` reports absence. It offers again when a later `card.status` reports presence. Discovery records (hierarchy specification §4.3) tell a Requester whom to dial; they never justify an offer.
 4. **Privacy**:

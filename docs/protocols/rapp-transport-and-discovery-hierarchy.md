@@ -11,11 +11,11 @@
 
 ## 1. Abstract and Motivation
 
-The Remote Authorization Proxy Protocol (RAPP) enables a desktop or laptop requester to leverage an identity card (e.g., FINEID Citizen Certificate) held in physical custody by a mobile phone over NFC, without exporting the private keys, PIN codes, or credential secrets.
+The Remote Authorization Proxy Protocol (RAPP) enables a desktop or laptop requester to leverage an identity card (e.g., Finnish Electronic Identification (FINEID) Citizen Certificate) held in physical custody by a mobile phone over Near Field Communication (NFC), without exporting the private keys, personal identification number (PIN) codes, or credential secrets.
 
 The mobile device listens and the workstation dials. On desktop operating systems—most notably Windows and desktop Unix/Linux distributions—an inbound listening port would introduce unacceptable security risks:
-1. It exposes unauthenticated application TCP listening ports on desktop workstations, increasing the attack surface for local network port scans and lateral exploit movement.
-2. It requires administrative UAC elevation and inbound firewall modifications (e.g. Windows Firewall `netsh` rule creation, or `iptables`/`nftables`/`firewalld` rule modifications).
+1. It exposes unauthenticated application Transmission Control Protocol (TCP) listening ports on desktop workstations, increasing the attack surface for local network port scans and lateral exploit movement.
+2. It requires administrative User Account Control (UAC) elevation and inbound firewall modifications (e.g. Windows Firewall `netsh` rule creation, or `iptables`/`nftables`/`firewalld` rule modifications).
 3. It places the listening socket on the workstation, whereas placing the listener and advertisement on the mobile device (which holds hardware custody of the card and controls per-operation authorization prompts) allows workstations to operate strictly as outbound clients without inbound application firewall holes.
 
 This specification defines the normative **Discovery and Transport Preference**: for local network stream transport the phone acts as the listener/advertiser (when explicitly enabled), and workstations connect strictly as outbound clients. It also fixes the workstation defaults: desktop applications function as ordinary local smart card readers until paired.
@@ -24,9 +24,11 @@ This specification defines the normative **Discovery and Transport Preference**:
 
 ## 2. Asymmetric Device Security & Architectural Roles
 
+In the diagram, Bluetooth Low Energy (BLE) is the Bluetooth transport; discovery on the local network uses the Domain Name System (DNS) in its multicast form (mDNS) with DNS Service Discovery (DNS-SD); a Chip Card Interface Device (CCID) is the class of Universal Serial Bus (USB) smart card reader; and a Trusted Execution Environment (TEE) is the phone's hardware security root.
+
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
-│                        SOVEREIGN CUSTODIAN                             │
+│                               CUSTODIAN                                │
 │                      (iOS / Android Phone)                             │
 │                                                                        │
 │  • Hardware Security Root: Secure Enclave / StrongBox / TEE / Biometrics│
@@ -62,7 +64,7 @@ The mobile device is the authoritative security anchor:
 
 ### 2.2 The Requester (Workstation)
 Desktop platforms (`refineid-unix`, `refineid-windows`, macOS):
-- **No Inbound Application TCP Listeners**: Workstations must not open inbound application TCP listening ports, bind network sockets for incoming TCP traffic, or prompt users for administrative inbound firewall modifications. Discovery operates via outbound queries and standard OS-level multicast reception (UDP port 5353) or platform discovery services.
+- **No Inbound Application TCP Listeners**: Workstations must not open inbound application TCP listening ports, bind network sockets for incoming TCP traffic, or prompt users for administrative inbound firewall modifications. Discovery operates via outbound queries and standard operating system (OS)-level multicast reception (UDP port 5353) or platform discovery services.
 - **Outbound Client Model**: Workstations establish outbound TCP connections (`connect()`) to the Custodian's advertised endpoint. Outbound connections eliminate the need for application-specific inbound TCP firewall rules (though enterprise egress policies or network discovery filters may still apply).
 - **Zero PIN Knowledge**: Workstations operate via `CKF_PROTECTED_AUTHENTICATION_PATH` and never handle, log, or prompt for card PINs.
 
@@ -70,7 +72,7 @@ Desktop platforms (`refineid-unix`, `refineid-windows`, macOS):
 
 ## 3. Discovery and Transport Preference
 
-When a Requester discovers and reaches a Custodian, it tries the transports in this order and uses the first one available:
+When a Requester discovers and reaches a Custodian, it tries the transports in this order and uses the first one available. In the diagram, the Internet Protocol (IP) stream is the local-network transport; a Request for Comments (RFC) is an Internet Engineering Task Force (IETF) standard; a virtual machine (VM) is a computer without a radio of its own; and the Generic Attribute Profile (GATT) is Bluetooth's data layer.
 
 ```
 Apple-to-Apple direct (peer-to-peer Wi-Fi)
@@ -101,19 +103,19 @@ Bluetooth (BLE)
 - **Connection Direction**:
   - Custodian runs `StreamRelayListener` on a dynamic, ephemeral TCP port (`bind(0)`).
   - Custodian advertises service type `_refineid-stream._tcp.local.` via mDNS.
-  - Requester runs `StreamRelayBrowser`, receives the PTR/SRV/TXT records, and initiates an **outbound** TCP `connect()` to the phone's advertised IP and port.
+  - Requester runs `StreamRelayBrowser`, receives the PTR (pointer), SRV (service) and text (TXT) (text) records, and initiates an **outbound** TCP `connect()` to the phone's advertised IP and port.
 - **Wire Profile**: Governed normatively by RAPP v26.10.21 §2.2.2. Each frame is a 2-byte unsigned big-endian length followed by 1 to 65535 payload bytes. The Requester's first frame is the routing preamble `["RAPP-stream-v1", purpose, routing]` (RAPP v26.10.21 §2.2.1). After a `"pairing"` preamble the Custodian's first frame is the encoded `pairing-offer` (§4.2); after a `"session"` preamble the Custodian routed the Requester sends `Noise_KK` message 1.
 
 ### 3.3 Bluetooth / BLE Proximity Transport (`fi.refineid.rapp.ble.v1`)
 - **Applicability**: The last resort: a proximity transport for when no IP network is shared (no Wi-Fi, a virtual machine or container without a usable network, no router), across supported platforms (iOS, Android, Linux/BSD, Windows, macOS).
 - **Normative Specification**: Governed normatively by RAPP v26.10.21 §2–§5.
 - **Wire Profile**: The canonical cross-platform wire profile is GATT-based `fi.refineid.rapp.ble.v1`:
-  - Primary Service UUID: `7E39FD01-A6B5-4D78-9E11-37E28E9545F1`
+  - Primary Service Universally Unique Identifier (UUID): `7E39FD01-A6B5-4D78-9E11-37E28E9545F1`
   - Channel Characteristic UUID: `7E39FD02-A6B5-4D78-9E11-37E28E9545F1` (Requester writes via `ATT_WRITE_REQ`; Custodian indicates via `ATT_HANDLE_VALUE_IND`)
   - Bootstrap Characteristic UUID: `7E39FD03-A6B5-4D78-9E11-37E28E9545F1` (Requester reads via `ATT_READ_REQ`)
-  - Framing: Mandates ATT MTU Exchange ($\ge 512$ bytes) and RAPP BLE SAR framing (6-byte header: Total Frame Length, Chunk Sequence, Flags, Reserved).
-- **Platform Capability Constraints & L2CAP CoC Distinction**:
-  - Windows 10/11 user-space APIs (WinRT `Windows.Devices.Bluetooth.GenericAttributeProfile`) support GATT, but provide no public user-space API for BLE L2CAP Connection-Oriented Channels (CoC).
+  - Framing: Mandates Attribute Protocol (ATT) Maximum Transmission Unit (MTU) Exchange ($\ge 512$ bytes) and RAPP BLE Segmentation and Reassembly (SAR) framing (6-byte header: Total Frame Length, Chunk Sequence, Flags, Reserved).
+- **Platform Capability Constraints & Logical Link Control and Adaptation Protocol (L2CAP) CoC Distinction**:
+  - Windows 10/11 user-space APIs (WinRT `Windows.Devices.Bluetooth.GenericAttributeProfile`) support GATT, but provide no public user-space application programming interface (API) for BLE L2CAP Connection-Oriented Channels (CoC).
   - Linux BlueZ supports GATT over D-Bus without requiring raw socket capabilities.
   - L2CAP CoC is NOT wire-compatible with GATT and cannot share the `fi.refineid.rapp.ble.v1` profile identifier. If a credit-based L2CAP CoC transport is introduced in the future, it must be specified as a separate, distinct profile (e.g. `fi.refineid.rapp.ble-coc.v1`) with explicit PSM discovery via GATT, platform capability tests, and independent qualification.
 
@@ -124,13 +126,13 @@ Bluetooth (BLE)
 Because mDNS discovery broadcasts on multicast UDP port 5353 (IPv4 `224.0.0.251`, IPv6 `ff02::fb`), packets are visible to all devices on the local Layer 2 broadcast domain. In compliance with IETF [RFC 8882](https://www.rfc-editor.org/rfc/rfc8882.html) (*DNS-SD Privacy and Security Requirements*) and RefineID privacy rules:
 
 ### 4.1 No Stable Pairing Identifier on the Wire
-- **Keys from the static agreement**: Every value that names a stored pairing outside its encrypted channel -- discovery hints (§4.3), withdrawal hints (§4.3), revocation hints (§4.3) and session routing tags -- is keyed by the pairing's static X25519 agreement under its own HKDF label (RAPP v26.10.21 §4.3). Only the pairing's two endpoints can compute or recognise these values.
+- **Keys from the static agreement**: Every value that names a stored pairing outside its encrypted channel -- discovery hints (§4.3), withdrawal hints (§4.3), revocation hints (§4.3) and session routing tags -- is keyed by the pairing's static X25519 agreement (X25519 is the Diffie-Hellman function over Curve25519, RFC 7748) under its own Hash-based Message Authentication Code (HMAC)-based Key Derivation Function (HKDF) label (RAPP v26.10.21 §4.3). Only the pairing's two endpoints can compute or recognise these values.
 - **Fresh per connection**: The Requester's session routing preamble carries a fresh random nonce and the routing tag it keys (RAPP v26.10.21 §2.2.1), sent point-to-point over the established TCP stream or BLE Channel Characteristic in `Phase::Routing`. No routing value recurs across connections, so preambles cannot be linked to one another or to discovery records.
 - **Zero Public Broadcast of stable values**: `pair_id`, static public keys, and any other stable per-pairing value must never be published in mDNS PTR, SRV, or TXT records, nor broadcast in unauthenticated BLE advertising packets.
 
 ### 4.2 Public DNS-SD Identifiers and Ephemeral Lifecycle
 - **Zero Personally Identifiable Information (PII)**:
-  - Service instance names, host targets, and TXT records must not contain personal names, identity codes, citizen IDs, card numbers, IMEI, hardware serials, or persistent MAC addresses.
+  - Service instance names, host targets, and TXT records must not contain personal names, identity codes, citizen IDs, card numbers, International Mobile Equipment Identity (IMEI), hardware serials, or persistent Media Access Control (MAC) addresses.
 - **Ephemeral Randomized Instance Name**:
   - The DNS-SD service instance name must be freshly generated as a random hex identifier whenever advertising starts or restarts:
     `refineid-[random_8_hex]._refineid-stream._tcp.local.` (e.g., `refineid-7f2a1c84._refineid-stream._tcp.local.`).
@@ -145,7 +147,7 @@ TXT keys compare case-insensitively ([RFC 6763](https://www.rfc-editor.org/rfc/r
 The Custodian publishes three distinct discovery modes:
 
 1. **Pairing Mode (`mode=pairing`)**:
-   - Active strictly during an explicit user-initiated pairing ceremony on the phone, bounded by the 60-second offer TTL.
+   - Active strictly during an explicit user-initiated pairing ceremony on the phone, bounded by the 60-second offer time to live (TTL).
    - TXT Attributes:
      ```text
      v=1
@@ -192,7 +194,7 @@ To maintain clean, unobtrusive operation on enterprise and personal workstations
 
 ### 5.1 Local Card Reader by Default
 - On launch, RefineID desktop applications (`refineid-unix`, `refineid-windows`, `refineid-apple`) must operate strictly as **Local Card Reader Software**.
-- The application monitors local PC/SC smart card readers (integrated laptop slots, USB CCID readers via `pcscd` or `winscard`).
+- The application monitors local Personal Computer/Smart Card (PC/SC) smart card readers (integrated laptop slots, USB CCID readers via `pcscd` or `winscard`).
 - Background radio scanning, mDNS service browsing, and network polling must not run by default.
 
 ### 5.2 Pairing Is the Opt-In
@@ -210,7 +212,7 @@ To maintain clean, unobtrusive operation on enterprise and personal workstations
 | Repository | Platform Role | Discovery / Transport Actions Required |
 | :--- | :--- | :--- |
 | **`refineid-core`** | Protocol Core | Standardize 3-tier hierarchy and update `fi.refineid.stream.v1` stream profile framing to designate Custodian as listener and Requester as dialer. Define RFC 8882 discovery token formats and rotation. |
-| **`refineid-unix`** | Requester (Linux, BSD) | Keep `pcscd` default; implement outbound `StreamRelayBrowser` using native mDNS (`avahi` / `systemd-resolved`); provide GUI toggle in `refineid-gui-fltk`; maintain zero open listening ports. |
+| **`refineid-unix`** | Requester (Linux, BSD) | Keep `pcscd` default; implement outbound `StreamRelayBrowser` using native mDNS (`avahi` / `systemd-resolved`); provide graphical user interface (GUI) toggle in `refineid-gui-fltk`; maintain zero open listening ports. |
 | **`refineid-windows`** | Requester (Windows 10/11) | Remove `FirewallService.cs` and inbound TCP listener (port 47110); implement outbound `StreamRelayBrowser` using supported `Windows.Devices.Enumeration` or Win32 `DnsServiceBrowse`; add explicit opt-in toggle in `RefineID-winui`. |
-| **`refineid-apple`** | Custodian (iOS) & Requester (macOS) | Implement the Apple-to-Apple direct transport `NWListener(includePeerToPeer: true)` / `NWBrowser` direct P2P for Apple-to-Apple; maintain `StreamRelayListener` on iOS gated by "Allow Remote Reader" setting; adhere to RFC 8882 ephemeral discovery names. |
+| **`refineid-apple`** | Custodian (iOS) & Requester (macOS) | Implement the Apple-to-Apple direct transport `NWListener(includePeerToPeer: true)` / `NWBrowser` direct peer-to-peer (P2P) for Apple-to-Apple; maintain `StreamRelayListener` on iOS gated by "Allow Remote Reader" setting; adhere to RFC 8882 ephemeral discovery names. |
 | **`refineid-android`** | Custodian (Android) | Maintain `StreamRelayListener` (`_refineid-stream._tcp` via `NsdManager`) gated by "Allow Remote Reader" setting; support BLE peripheral GATT `fi.refineid.rapp.ble.v1`. |

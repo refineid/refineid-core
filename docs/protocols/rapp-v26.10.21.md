@@ -124,13 +124,13 @@ routing-preamble = [
 ]
 session-routing = bstr .size 32   ; nonce (16 bytes) || routing_tag (16 bytes)
 ```
-For a `"session"` preamble the Requester draws a fresh 16-byte `nonce` from a cryptographically secure random source for every connection and computes the following, where the input keying material (IKM) is the pairing's static X25519 agreement:
+For a `"session"` preamble the Requester draws a fresh 16-byte `nonce` from a cryptographically secure random source for every connection and computes the following, where the input keying material (IKM) is the pairing's static X25519 agreement (X25519 is the Diffie-Hellman function over Curve25519, Request for Comments (RFC) 7748):
 ```text
 K_route     = HKDF-SHA-256(salt = pair_id, IKM = X25519(local static private, peer static public),
                            info = "RAPP-routing-v1", L = 32)
 routing_tag = first 16 bytes of HMAC-SHA-256(K_route, len(domain) || domain || nonce)
 ```
-where `domain` is the preamble domain of the transport profile in use as UTF-8 octets and `len` is one octet. Both endpoints of a pairing derive the same `K_route` (§4.3); no other party can. A Requester never reuses a nonce.
+where `domain` is the preamble domain of the transport profile in use as 8-bit Unicode Transformation Format (UTF-8) octets and `len` is one octet. Both endpoints of a pairing derive the same `K_route` (§4.3); no other party can. A Requester never reuses a nonce.
 
 The Custodian routes a `"session"` preamble as follows:
 1. It evaluates the tag against `K_route` of every non-revoked stored pairing, comparing in constant time and without stopping at a match, so the work does not reveal which pairing matched or whether any did. The pre-authentication limiter (§3.3) bounds how often this runs.
@@ -142,7 +142,7 @@ A preamble that does not decode, names another profile's domain, carries an unre
 The routing tag only selects a pairing; it authenticates nothing. Authentication is established exclusively by the `Noise_KK` handshake that follows.
 
 #### 2.2.2 Stream Transport Profile (`"fi.refineid.stream.v1"`)
-- **Bearer**: one reliable, ordered TCP byte stream per connection. The Custodian listens and advertises the endpoint per the hierarchy specification; the Requester dials. Neither peer accepts inbound pairing or session connections on any other role.
+- **Bearer**: one reliable, ordered TCP byte stream per connection. The Custodian listens and advertises the endpoint per the hierarchy specification; the Requester dials. The Custodian accepts any number of connections at the same time, one per client session (§8). An open connection from one client is never a reason to refuse another. Neither peer accepts inbound pairing or session connections on any other role.
 - **Framing**: each transport frame is a 2-byte unsigned big-endian length $n$ followed by exactly $n$ payload bytes, $1 \le n \le 65535$. A zero length, a truncated frame, or a length above the receiver's limit closes the connection (Class 1 before authentication, Class 2 after).
 - **Offer parameters**: the stream transport entry of `pairing-offer` carries `parameters: {}`; endpoints are learned from discovery, never from the offer.
 - **Ordering**: after a `"pairing"` preamble the Custodian sends the encoded `pairing-offer` as its first frame (§4.2); after a `"session"` preamble the Custodian routed (§2.2.1) the Requester sends `Noise_KK` message 1.
@@ -151,7 +151,7 @@ The routing tag only selects a pairing; it authenticates nothing. Authentication
 
 ## 3. Human Factors and Pairing Code Specification
 
-### 3.1 Crockford Base32 Alphabet and Canonical Normalization
+### 3.1 Crockford Base32 Alphabet and Code Entry
 
 The pairing code consists of exactly 6 characters sampled uniformly at random from Crockford's Base32 alphabet:
 
@@ -165,16 +165,12 @@ Excluded symbols:
 - `O`: Excluded to eliminate visual confusion with digit `0`.
 - `U`: Excluded to eliminate accidental generation of offensive words in Latin-script languages.
 
-#### Canonical Normalization Pipeline
-Both Custodian and Requester must apply an identical 7-step canonicalization pipeline:
-1. Accept input string from human keyboard or local interface.
-2. Apply Unicode Normalization Form Compatibility Composition (NFKC) normalization first (normalizing compatibility characters).
-3. Convert all American Standard Code for Information Interchange (ASCII) lowercase characters (`a-z`) to ASCII uppercase (`A-Z`).
-4. Strip all standard ASCII whitespace (`0x20` SPACE, `0x09` TAB, `0x0A` LF, `0x0B` VT, `0x0C` FF, `0x0D` CR) and hyphens (`-`).
-5. Reject `I`, `L`, `O` and `U` as invalid input: the alphabet excludes them, and a typed one is never read as the digit or letter it resembles.
-6. Verify that the resulting string is **exactly 6 characters in length** and composed **exclusively** of characters in Crockford's Base32 alphabet.
-7. Derive the password octets as exact UTF-8:
-   $$\text{pw} = \text{UTF-8}(\text{normalized\_code}) \quad (\text{e.g., } \text{UTF-8}(\texttt{"7KX4M9"}))$$
+#### Entering the code
+
+The Requester's entry field accepts only the 32 alphabet characters, folding a lowercase letter to its uppercase form, and ignores spaces and hyphens typed between the displayed groups (§3.2); it accepts nothing else, so a mistyped `O` or `1` is corrected by the user, never guessed. The code is complete at exactly 6 characters.
+
+Both endpoints derive the password octets as the UTF-8 encoding of the 6 uppercase characters:
+$$\text{pw} = \text{UTF-8}(\text{code}) \quad (\text{e.g., } \text{UTF-8}(\texttt{"7KX4M9"}))$$
 
 ### 3.2 Display Formatting and Chunking
 
@@ -408,7 +404,7 @@ A Custodian **withdraws** when it deliberately stops serving every stored pairin
    - **Unannounced loss.** A malformed record, a withdrawn record without a match, a record on another instance, or a service that disappears without one is unannounced loss; the Requester applies its own hold before withdrawing presence, so that a brief discovery gap does not withdraw a Custodian that is still serving.
 
 7. **Authenticity and Replay**:
-   Only the two endpoints of a pairing know its static agreement, so no other party can compute a withdrawal hint; observing sessions, routing preambles or discovery records does not help. A party on the local link that recorded a genuine withdrawn record can republish it under the same instance name for at most about three minutes (the counter window), and only while the Requester still associates that instance with the pairing; instance names are fresh on every advertisement start (hierarchy specification §4.2). The effect is the same as a spoofed mDNS goodbye without the Requester's hold: presence is withdrawn until the Custodian is next discovered. These bounds assume the Requester's clock is not under the attacker's control; an attacker who can move the Requester's time, for example through an unauthenticated Network Time Protocol (NTP) source, can stretch the replay window for as long as it controls that clock, with the same effect and no other. Random fillers keep the record the same size whatever the number of stored pairings, and the hints are unlinkable across instances and minutes.
+   Only the two endpoints of a pairing know its static agreement, so no other party can compute a withdrawal hint; observing sessions, routing preambles or discovery records does not help. A party on the local link that recorded a genuine withdrawn record can republish it under the same instance name for at most about three minutes (the counter window), and only while the Requester still associates that instance with the pairing; instance names are fresh on every advertisement start (hierarchy specification §4.2). The effect is the same as a spoofed multicast DNS (mDNS) goodbye without the Requester's hold: presence is withdrawn until the Custodian is next discovered. These bounds assume the Requester's clock is not under the attacker's control; an attacker who can move the Requester's time, for example through an unauthenticated Network Time Protocol (NTP) source, can stretch the replay window for as long as it controls that clock, with the same effect and no other. Random fillers keep the record the same size whatever the number of stored pairings, and the hints are unlinkable across instances and minutes.
 
 ### 4.6 Pairing Revocation
 
@@ -758,7 +754,7 @@ The generator point $G$ is derived from length-value (LV) encoding with zero-pad
     <- e, ee, se
   ```
 - **State Initialization**:
-  1. `protocol_name` = `"Noise_KK_25519_ChaChaPoly_SHA512"` (32 ASCII bytes).
+  1. `protocol_name` = `"Noise_KK_25519_ChaChaPoly_SHA512"` (32 American Standard Code for Information Interchange (ASCII) bytes).
   2. Because $|\text{protocol\_name}| \le 64$, $h$ is initialized by right-padding with 32 zero bytes to 64 bytes:
      $$h = \text{protocol\_name} \parallel 0^{32}$$
   3. Chaining key initialized to $ck = h$.
@@ -1297,7 +1293,7 @@ The profile registry defines the operations permitted over authenticated RAPP se
     - For `"ecdsa_sha256"`: The signature must be serialized as fixed-width raw Institute of Electrical and Electronics Engineers (IEEE) P1363 big-endian concatenation $r \parallel s$. For `"ecdsa_p256"`, exactly 64 bytes (32-byte $r \parallel$ 32-byte $s$); for `"ecdsa_p384"`, exactly 96 bytes (48-byte $r \parallel$ 48-byte $s$). ASN.1 DER encoding is strictly prohibited on the wire.
     - For `"rsa_pkcs1_sha256"`: The signature must be serialized as raw big-endian integer bytes matching the Rivest-Shamir-Adleman (RSA) key modulus length (256 bytes for `"rsa_2048"`, 384 bytes for `"rsa_3072"`), computed via RSASSA-PKCS1-v1_5 per RFC 8017 Section 8.2 (EMSA-PKCS1-v1_5 with SHA-256 DigestInfo prefix `3031300d060960864801650304020105000420` followed by 32-byte SHA-256 digest).
     - For `"rsa_pkcs1_sha384"` and `"rsa_pkcs1_sha512"`: as `"rsa_pkcs1_sha256"`, with the SHA-384 or SHA-512 DigestInfo prefix of RFC 8017 Section 9.2 Note 1.
-    - For `"rsa_pss_sha256"`: RSASSA-PSS (Probabilistic Signature Scheme, PSS) per RFC 8017 Section 8.1 with Mask Generation Function 1 (MGF1) over SHA-256 and the salt length the card publishes in its CIAInfo (FINEID S4-1 v4.2 Section 8.1.3), serialized as for `"rsa_pkcs1_sha256"`. Two signatures over the same digest differ.
+    - For `"rsa_pss_sha256"`: RSASSA-PSS, the Probabilistic Signature Scheme (PSS) per RFC 8017 Section 8.1 with Mask Generation Function 1 (MGF1) over SHA-256 and the salt length the card publishes in its CIAInfo (FINEID S4-1 v4.2 Section 8.1.3), serialized as for `"rsa_pkcs1_sha256"`. Two signatures over the same digest differ.
     - For every `"ecdsa_*"` algorithm: fixed-width raw $r \parallel s$ sized by the key profile, as for `"ecdsa_sha256"`.
   - Response: `signature` (`bstr`, matching the specified signature wire format).
 
@@ -1400,6 +1396,7 @@ Semantic error handling is driven exclusively by `error_name`. The numeric `erro
    - **PIN 1 (Authentication)**: May use platform-cached authorization (e.g. biometric authentication or Secure Enclave session policy) if configured by user policy.
    - **PIN 2 (Qualified Signing)**: Strictly mandates conscious, explicit human interaction on the phone screen for every signature or batch request. No automatic or unattended signing is permitted.
 3. **Document Secrecy**: Raw document bytes and unhashed browser data must never cross the RAPP protocol. Requester hashes all content locally before transmission.
+4. **Secrets Never on the Wire**: PIN 1, PIN 2, the CAN and the PIN unblocking key (PUK) have no representation in any RAPP message and never traverse any transport. The Custodian verifies them locally with the card; a Requester receives only the resulting signature or result.
 
 ---
 
@@ -1419,43 +1416,3 @@ Semantic error handling is driven exclusively by `error_name`. The numeric `erro
 | **Withdrawal Forgery & Replay** | Attacker publishes a forged `mode=withdrawn` record, or republishes a recorded one. | Withdrawal hints are keyed by the pairing's static X25519 agreement, which never crosses the wire, so they cannot be forged. A recorded record is honoured only on the instance the Requester associates with the pairing and within one minute either side of its counter; its effect is limited to withdrawing presence until the Custodian is next discovered. These bounds assume the Requester's clock is not attacker-controlled; spoofing its time source, for example unauthenticated NTP, extends the replay window, still with no effect beyond the presence drop. The same holds for discovery-hint epochs, where a replayed `hints=` value can only make a Requester dial an endpoint that then fails routing. An open session ignores discovery records and ends only on an authenticated `session.close` (§4.5). |
 
 ---
-
-## 13. Empirical Physical Hardware Observations (Informative)
-
-This section provides informative reference data, observed hardware benchmarks, and implementation notes. Normative protocol requirements are established exclusively in Sections 1 through 12 and 14.
-
-Empirical execution was observed on physical hardware on October 1, 2026:
-- **Central (Requester)**: Linux host (Linux Kernel 7.0, BlueZ 5.85, Intel AX211 Bluetooth 5.4).
-- **Peripheral (Custodian)**: Apple iPhone 15 Pro Max (`RefineID-dev`, iOS 26/27).
-
-### 13.1 Observed Metrics
-- **Connect Timing**: $735.6\text{ ms}$ (Linux `Device1.Connect()` call duration; typical full connection establishment ~1.2 s).
-- **Observed Notification/Update Capacity**: $512\text{ bytes}$ (`maximumUpdateValueLength` on iOS peripheral application programming interface (API)). Note: This is a platform API buffer capacity observation, not a direct trace of the ATT MTU exchange (which is specified in §5.2 as requiring MTU >= 512).
-- **Synthetic Frame Transfer**: 64-byte write and 256-byte read on Channel characteristic verified over the physical BLE link.
-- **Beacon Privacy**: Advertised standardized service UUID and generic name only; zero pairing code bits in broadcast.
-
-### 13.2 Implementation Findings for BlueZ & CoreBluetooth
-- **BlueZ D-Bus Asynchronous Responsiveness**:
-  On Linux, `bluetoothd` dispatches link-layer Security Manager Protocol (SMP) agent callbacks (`org.bluez.Agent1.RequestConfirmation`) asynchronously over D-Bus. Linux implementations must ensure that BlueZ D-Bus callback dispatching is not blocked by synchronous ATT operations (e.g. using non-blocking asynchronous event loops or dedicated worker threads).
-- **Application vs. Link Security**:
-  Link-layer Bluetooth pairing (SMP) is independent of RAPP. RAPP treats the BLE link as completely untrusted, anchoring end-to-end security exclusively in `CPaceRistretto255` and Noise AEAD at the application layer.
-- **OS Background Advertising**:
-  On iOS, CoreBluetooth manages background advertisement payloads, RPA rotation, and peripheral state transitions. Background advertisements suppress local names and move overflow service UUIDs to internal Apple-proprietary beacons. RAPP pairing is designed for active foreground Custodian interaction where standard 128-bit UUID discovery is operational.
-
----
-
-## 14. RefineID Project Security Rules Compliance
-
-1. **Inviolable Rule #1: Secret Exclusion over the Wire**:
-   PIN1, PIN2, CAN, and PIN unblocking key (PUK) values must never traverse any transport. The RAPP wire format contains zero fields, messages, or representations for credential secrets.
-2. **Inviolable Rule #2: Zero PIN and PIN-Length Logging Across All Environments**:
-   PIN codes (PIN1, PIN2), PUK, and CAN must never be logged, printed, or rendered in any development, test, staging, or production context.
-   Furthermore, PIN lengths and candidate digit counts must never be logged or rendered in error messages, diagnostic traces, or telemetry.
-   Disclosing candidate digit counts or PIN lengths leaks secret entropy and reduces keyspace security.
-   Diagnostic output (`diag!`), tracing, event logs, and `Display`/`Error` formatting must never include PIN values, PIN lengths, or candidate digit counts.
-   If specialized debugging is ever needed, it is done exclusively via temporary private test harnesses and never checked into the repository.
-3. **Credential Custody and Memory Safety**:
-   All pairing codes, private CPace scalars ($x_A, x_B$), generator input buffers, intermediate keys ($\text{ISK}$), and session keys ($PSK, K_{\text{sess}}$) must implement zeroize-on-drop semantics and must not implement `Debug`, `Display`, or serialization traits.
-4. **Character Encoding Preservation**:
-   Card APDUs carrying ISO-8859-15 text are losslessly decoded to Unicode at the Custodian NFC layer before encapsulation into UTF-8 CBOR strings. Unmappable bytes trigger explicit validation errors rather than lossy replacement or silent truncation. Display UIs must fully render `§` (U+00A7), `€` (U+20AC), `ä` (U+00E4), `ö` (U+00F6).
-

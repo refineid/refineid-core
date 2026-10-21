@@ -114,10 +114,6 @@ Bluetooth (BLE)
   - Channel Characteristic UUID: `7E39FD02-A6B5-4D78-9E11-37E28E9545F1` (Requester writes via `ATT_WRITE_REQ`; Custodian indicates via `ATT_HANDLE_VALUE_IND`)
   - Bootstrap Characteristic UUID: `7E39FD03-A6B5-4D78-9E11-37E28E9545F1` (Requester reads via `ATT_READ_REQ`)
   - Framing: Mandates Attribute Protocol (ATT) Maximum Transmission Unit (MTU) Exchange ($\ge 512$ bytes) and RAPP BLE Segmentation and Reassembly (SAR) framing (6-byte header: Total Frame Length, Chunk Sequence, Flags, Reserved).
-- **Platform Capability Constraints & Logical Link Control and Adaptation Protocol (L2CAP) CoC Distinction**:
-  - Windows 10/11 user-space APIs (WinRT `Windows.Devices.Bluetooth.GenericAttributeProfile`) support GATT, but provide no public user-space application programming interface (API) for BLE L2CAP Connection-Oriented Channels (CoC).
-  - Linux BlueZ supports GATT over D-Bus without requiring raw socket capabilities.
-  - L2CAP CoC is NOT wire-compatible with GATT and cannot share the `fi.refineid.rapp.ble` profile identifier. If a credit-based L2CAP CoC transport is introduced in the future, it must be specified as a separate, distinct profile (e.g. `fi.refineid.rapp.ble-coc.v1`) with explicit PSM discovery via GATT, platform capability tests, and independent qualification.
 
 ---
 

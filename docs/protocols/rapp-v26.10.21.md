@@ -244,7 +244,7 @@ The BLE advertisement payload must not contain:
 The Custodian must:
 - Broadcast solely the standardized 128-bit RAPP Service UUID (`7E39FD01-A6B5-4D78-9E11-37E28E9545F1`).
 - Set the BLE Local Name to an empty string or generic constant (`"RefineID"`), strictly avoiding default platform names (such as `"<owner's device name>"`).
-- Rotate the BLE Resolvable Private Address (RPA) per Bluetooth Core Specification v5.4. (Note: On iOS, CoreBluetooth manages RPA rotation and background advertisement payload filtering automatically; local names may be omitted or moved to scan responses in background modes without compromising foreground pairing).
+- Rotate the BLE Resolvable Private Address (RPA) per Bluetooth Core Specification v5.4.
 
 ### 4.2 Bootstrap Discovery & PairingOffer Schema
 
@@ -276,7 +276,7 @@ The `transports` array lists one entry for each registered transport the Custodi
 
 `pairing_secret` is never part of `pairing-offer`: the pairing secret is negotiated by CPace, and storing or serving a static pairing secret over an unauthenticated bootstrap is strictly prohibited.
 
-The canonical `offer_hash` is computed with the SHA as:
+The canonical `offer_hash` is computed with SHA-256 as:
 $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{pairing-offer}))$$
 
 #### Bootstrap Read Flow:

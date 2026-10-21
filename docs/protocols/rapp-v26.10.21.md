@@ -259,7 +259,7 @@ pairing-offer = {
   "version": [26, 10, 21],       ; offer version triple
   "offer_id": bstr .size 32,    ; 32-byte cryptographic random SID
   "suites": [
-    "CPACE-RISTR255-SHA512-rapp-kc2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512"
+    "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512"
   ],
   "profiles": [ + tstr ],       ; offered credential profiles (§9)
   "transports": [ + transport-entry ],
@@ -294,7 +294,7 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
    pairing-prologue = [
      "rapp-pairing",
      [26, 10, 21],                                                         ; wire version [Year, Month, Day]
-     "CPACE-RISTR255-SHA512-rapp-kc2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512", ; cryptographic suite name
+     "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512", ; cryptographic suite name
      bstr .size 32,                                                       ; offer_hash
      tstr                                                                 ; transport profile of the connection (§2.2)
    ]
@@ -511,7 +511,7 @@ RAPP v26.10.21 specifies the **`CPaceRistretto255-KC2`** application profile ove
   pairing-context = [
     "rapp-pairing-context",
     [26, 10, 21],                                                              ; wire version [Year, Month, Day]
-    "CPACE-RISTR255-SHA512-rapp-kc2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512", ; full suite literal
+    "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512", ; full suite literal
     tstr,                                                                    ; transport profile of the connection (§2.2)
     tstr,                                                                    ; candidate_id of its offer entry (§4.2)
     bstr .size 32,                                                           ; offer_hash
@@ -684,7 +684,7 @@ pairing-hello-body = {
 
 negotiated-parameters = {
   "version": [26, 10, 21],
-  "suite": "CPACE-RISTR255-SHA512-rapp-kc2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512",
+  "suite": "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512",
   "offer_hash": bstr .size 32,
   "transport_profile": tstr,   ; transport profile of the connection (§2.2)
   "candidate_id": tstr         ; candidate_id of its offer entry (§4.2)

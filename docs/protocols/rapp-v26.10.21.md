@@ -321,12 +321,12 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
 
 4. **Atomic Permanent Key Storage**:
    Immediately upon receipt and verification of matching `pairing.confirm` messages:
-   - **Fresh Pair-Specific Static Keys**: Each pairing ceremony must generate a fresh, cryptographically independent static X25519 keypair $(s, s_{pub})$ on each endpoint. Static keys must not be reused across different peer pairings or across distinct pairing ceremonies. This provides pairwise endpoint isolation and prevents correlation across peers. Private keys must be stored in platform-encrypted secure hardware (Secure Enclave / Trusted Platform Module (TPM) / operating system (OS) Keychain), excluded from backups and cloud synchronization, and marked non-exportable.
+   - **Fresh Pair-Specific Static Keys**: Each pairing ceremony must generate a fresh, cryptographically independent static X25519 keypair $(s, s_{pub})$ on each endpoint. Static keys must not be reused across different peer pairings or across distinct pairing ceremonies. This provides pairwise endpoint isolation and prevents correlation across peers. The private key is stored in the platform's protected key store, excluded from backups and cloud synchronization, and never exported.
    - Each endpoint atomically persists the pairing trust record:
      - `pair_id`
      - `grants_hash` and confirmed granted profiles
      - Remote peer's static public key
-     - Local static private key (stored in platform-encrypted secure hardware / keychain)
+     - Local static private key
    - Once its record is durably stored, each endpoint sends `pairing.stored` carrying the derived `pair_id` (§7.1). An endpoint treats the pairing as active only after it has both stored its own record and received the peer's `pairing.stored`; until then it neither routes nor dials for the pairing, and announces it in no discovery or withdrawal record. The stored record carries whether the peer confirmed it, and the endpoint rewrites the record as confirmed when the peer's `pairing.stored` arrives: a record found unconfirmed at a later start was stored inside a confirmation window the endpoint did not complete, and the endpoint revokes it (§4.6) before serving anything. A `pairing.stored` whose `pair_id` differs from the derived one is an authenticated protocol violation (Class 4). If the deadline of §3.3 item 7 passes without the peer's `pairing.stored`, the endpoint revokes the record it stored (§4.6), so a pairing that only one side holds does not survive.
    - The pairing channel is cleanly closed once both `pairing.stored` messages have been exchanged.
 
@@ -584,11 +584,10 @@ The generator point $G$ is derived from the password-related string (PRS), the 6
 - **Suite**: `Noise_XXpsk3_25519_ChaChaPoly_SHA512`
 - **Underlying Primitives**:
   - Diffie-Hellman (DH): Curve25519 / X25519 per [RFC 7748](https://www.rfc-editor.org/rfc/rfc7748.html) (32-byte keys).
-  - Cipher: ChaCha20-Poly1305 per [RFC 8439](https://www.rfc-editor.org/rfc/rfc8439.html) (32-byte key, 12-byte nonce, 16-byte tag). Nonce layout: 4 zero bytes (`0x00, 0x00, 0x00, 0x00`) followed by 8 little-endian bytes representing the 64-bit sequence counter (per Noise Protocol Framework rev 34 Section 12.3 and reference implementation `crates/rapp/src/noise.rs:97`).
-  - Hash: SHA-512 per [Federal Information Processing Standard (FIPS) 180-4](https://doi.org/10.6028/National Institute of Standards and Technology (NIST).FIPS.180-4) (64-byte output, 128-byte block size).
-  - key derivation function (KDF): HKDF-SHA-512 per [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html).
-- **Fresh Static Key Generation Requirement**:
-  Each pairing ceremony must generate a fresh, cryptographically independent static X25519 keypair $(s, s_{pub})$ on each endpoint. Static keys must not be reused across different peer pairings. Private keys must be stored in platform-encrypted secure hardware and marked non-exportable.
+  - Cipher: ChaCha20-Poly1305 per [RFC 8439](https://www.rfc-editor.org/rfc/rfc8439.html) (32-byte key, 12-byte nonce, 16-byte tag). Nonce layout: 4 zero bytes followed by the 64-bit sequence counter as 8 little-endian bytes (Noise Protocol Framework revision 34 Section 12.3).
+  - Hash: SHA-512 per Federal Information Processing Standard (FIPS) 180-4 of the National Institute of Standards and Technology (NIST), [doi:10.6028/NIST.FIPS.180-4](https://doi.org/10.6028/NIST.FIPS.180-4) (64-byte output, 128-byte block size).
+  - Key derivation: HKDF-SHA-512 per [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html).
+- **Static Keys**: the fresh pair-specific X25519 keypair $(s, s_{pub})$ of §4.3.
 - **Handshake Pattern**:
   ```text
   Noise_XXpsk3(s, rs):
@@ -598,7 +597,7 @@ The generator point $G$ is derived from the password-related string (PRS), the 6
   ```
 - **Pre-messages**: None.
 - **Prologue**: `encode_deterministic_cbor(pairing-prologue)` (§4.3.1).
-- **PSK Input**: The 32-byte $PSK$ derived from CPace KC2 via HKDF-Expand-SHA512 (§6.1.3, §6.1.4) is injected as the pre-shared key at token `psk` via `MixKeyAndHash(psk)` per Noise revision 34 Section 9.2.
+- **PSK Input**: The 32-byte $PSK$ of §6.1.4 enters at token `psk` through `MixKeyAndHash(psk)` (Noise revision 34 Section 9.2).
 - **Handshake Payload Policy**: All handshake message payloads are empty ($\emptyset$, length 0). Encrypting an empty payload produces a 16-byte Poly1305 authentication tag.
 - **Handshake Messages**:
   - Message 1 (Initiator -> Responder):
@@ -613,13 +612,13 @@ The generator point $G$ is derived from the password-related string (PRS), the 6
     Tokens: `s, se, psk`.
     Carries encrypted 32-byte static public key $s_{pub}$ (48 bytes including 16-byte Poly1305 tag), mixes $psk$, and 16-byte empty payload tag.
     Total size: $48 + 16 = 64$ bytes.
-- **Immediate Channel Identifier Derivation**:
-  Upon completing Message 3, both endpoints derive channel identifiers from the completed 64-byte handshake hash $h$:
+- **Identifiers**:
+  On completing Message 3, both endpoints derive from the 64-byte handshake hash $h$:
   ```text
   session_id = first 16 bytes of SHA-512("RAPP-session-id-v1" || h)
   pair_id    = first 16 bytes of SHA-512("RAPP-pair-id-v1" || h)
   ```
-  Both peers immediately zeroize $PSK$ and ephemeral keys.
+  Both endpoints then zeroize $PSK$ and the ephemeral keys.
 
 ### 6.3 Noise_KK Operational Session Handshake (RFC 7748, RFC 8439, RFC 5869)
 

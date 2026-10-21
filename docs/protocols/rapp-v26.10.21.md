@@ -721,8 +721,7 @@ session-parameters = {
 
 ; 6. Session Close
 session-close-body = {
-  "reason": close-reason-val,
-  "last_received_sequence": uint
+  "reason": close-reason-val
 }
 
 close-reason-val =
@@ -739,14 +738,12 @@ close-reason-val =
 
 ; 7. Liveness Challenge
 liveness-ping-body = {
-  "challenge": bstr .size 32,
-  "last_received_sequence": uint
+  "challenge": bstr .size 32
 }
 
 ; 8. Liveness Echo
 liveness-pong-body = {
-  "challenge": bstr .size 32,
-  "last_received_sequence": uint
+  "challenge": bstr .size 32
 }
 
 ; 9. Operation Request
@@ -801,34 +798,19 @@ card-status-body = {
 3. **`pairing.abort`**: Sent by either endpoint to cancel a pairing before the records are stored, with a reason for display. Ephemeral keys are destroyed at once.
 4. **`pairing.stored`**: Sent by each endpoint once its pairing record is durably stored, carrying the derived `pair_id`. An endpoint treats the pairing as active only after receiving it (§4.3 item 4).
 5. **`session.ready`**: Sent by the Custodian on completing the `Noise_KK` handshake, echoing the session parameters with a fresh random 32-byte `nonce`.
-6. **`session.close`**: Sent by either endpoint to end a session, with a registered reason and the last sequence it received.
-7. **`liveness.ping`** and **`liveness.pong`**: Keepalive sent by either endpoint with a fresh 32-byte `challenge`, echoed exactly by the peer; both carry the last sequence received (§7.2).
+6. **`session.close`**: Sent by either endpoint to end a session, with a registered reason.
+7. **`liveness.ping`** and **`liveness.pong`**: Keepalive sent by either endpoint with a fresh 32-byte `challenge`, echoed exactly by the peer.
 8. **`operation.request`**: Sent by the Requester to start a credential action under a registered profile (§8, §9).
 9. **`operation.result`**: Sent by the Custodian with the outcome of the operation: its status and the response, or the error (§8).
 10. **`operation.progress`**: Sent by the Custodian while an operation is pending, for every change of its state: queued behind another session's operation, consent on screen, waiting for the card, card found (§8.2).
 11. **`card.status`**: Sent by the Custodian once right after `session.ready` and again whenever the card it can serve changes: present or absent, and which card, by the fingerprint of its authentication certificate (§8.4).
 12. **`error`**: Sent on a protocol condition that is not an operation outcome, such as a second request while one operation of the session is live; schema and codes in §10.3.
 
-### 7.2 Field Semantics, Version Precedence, and Sequencing
-1. **Wire Version & Skew Precedence**:
-   - The envelope wire version is fixed to `[26, 10, 21]` (`[Year, Month, Day]`).
-   - If version skew is observed during handshake prologue negotiation (e.g. mismatched version in the Noise prologue), the handshake fails AEAD decryption and surfaces as a **Class 2 (Transport Loss)** failure; the link drops and stored pairings remain intact.
-   - If an authenticated envelope carrying a version other than `[26, 10, 21]` is received on an establishing or active session, the receiver must reject the message and terminate the session as a **Class 2** transport failure without modifying stored pairing records.
-   - **Class 4 (Pairing Revocation)** is strictly NOT triggered by version mismatch; Class 4 is reserved exclusively for authenticated cryptographic tampering, repeat echo mismatches, or sequence manipulation by an established, paired peer.
-2. **Session Scoping (`session_id`)**:
-   - For pairing-channel envelopes (`pairing.hello`, `pairing.confirm`), `session_id` must equal the 16-byte pairing `session_id` derived immediately from $h$ (Section 4.3).
-   - For operational sessions, `session_id` must equal the independent 16-byte operational `session_id` derived from $h_{\text{session}}$ (Section 4.3).
-   - An envelope carrying a mismatched `session_id` is an unrecoverable session error: close the session immediately (Class 2) without altering stored pairings.
-3. **Sequential Monotonic Sequencing (`sequence`) & Rollover Rules**:
-   - The sequence counter starts at `0` independently for each direction (`0, 1, 2, ...`) and is represented as an unsigned 64-bit integer (`u64`).
-   - It increases by exactly `1` for each transmitted envelope.
-   - **Initial State & Inbound Sequencing**: Before any inbound envelope has been received on an established transport channel, the expected incoming sequence counter is `0` (`expected_inbound_seq = 0`), and `last_received_sequence` is initialized to an unreceived state (`None` in local state, represented as `0` in outgoing acknowledge fields where sequence 0 has not yet arrived). The very first inbound envelope from a peer on a new session must have `sequence == 0`. Each accepted inbound envelope advances `expected_inbound_seq = expected_inbound_seq + 1` and updates `last_received_sequence = Some(envelope.sequence)`.
-   - **Rollover & Session Lifetime**: If `sequence` approaches $2^{64}-1$, or upon reaching the local policy session limit (e.g. 10,000 messages or 1 hour of continuous inactivity), the endpoints must execute an orderly session restart by transmitting `session.close` with reason `"normal"` or `"shutdown"` and dropping the link. Subsequent operations reconnect via the Routing phase with a fresh session and sequence reset to 0. Rollover is an orderly lifecycle transition, NOT a protocol violation or pairing revocation.
-   - **Acknowledged Delivery & Invariants**: Because ATT Indications are stop-and-wait acknowledged (`ATT_HANDLE_VALUE_CFM`), and transport nonces are sequential, any confirmed sequence regression (backward jump, duplicate, or gap) observed across the authenticated decrypted stream proves that an authenticated peer tampered with protocol sequencing: close the session immediately and revoke pairing (Class 4). Outbound indication retries at the ATT layer are deduplicated by the underlying BLE controller before delivery to the RAPP layer.
-4. **Cryptographic AEAD Encapsulation**:
-   - The plaintext `rapp-message` is encoded via deterministic CBOR (RFC 8949 Section 4.2).
-   - Encrypted via ChaCha20-Poly1305 with a 16-byte Poly1305 authentication tag using the active directional Noise cipher state.
-   - The resulting ciphertext payload is one transport frame (§2.2): on BLE it is framed into RAPP SAR fragments (Section 5.3) and transmitted via `ATT_WRITE_REQ` (Central to Peripheral) or `ATT_HANDLE_VALUE_IND` (Peripheral to Central); on the stream transport it is one length-prefixed frame (§2.2.2).
+### 7.2 Envelope Rules
+1. **Version**: `version` is `[26, 10, 21]`, as `[Year, Month, Day]`. A version mismatch in a Noise prologue fails the handshake's AEAD and is Class 2 (§10.1): the link drops and stored pairings stay. An authenticated envelope with any other version closes the session, Class 2 likewise.
+2. **Session**: `session_id` is the identifier derived from the handshake hash of the phase the envelope belongs to, the pairing `session_id` of §6.2 or the operational `session_id` of §6.3. An envelope with another `session_id` closes the session (Class 2).
+3. **Sequence**: `sequence` starts at 0 in each direction and increases by exactly 1 per envelope; it equals the nonce of the Noise cipher state that encrypted the envelope. The first envelope received in a direction has `sequence` 0 and each accepted envelope raises the expected value by 1. An envelope whose `sequence` is not the expected value, after its AEAD verified, is an authenticated protocol violation (Class 4). A session ends as §8.4 item 5 says; the counter never wraps in practice, and an endpoint that would exceed $2^{64}-1$ closes the session with reason `"normal"`.
+4. **Encapsulation**: The `rapp-message` is encoded as deterministic CBOR (RFC 8949 Section 4.2) and encrypted with ChaCha20-Poly1305 under the direction's Noise cipher state, giving the ciphertext and a 16-byte tag. The ciphertext is one transport frame (§2.2).
 
 ---
 

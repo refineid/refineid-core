@@ -931,14 +931,13 @@ The profiles a pairing can grant (§4.3), and the actions of each:
   - Signature Wire Format: as §9.2.
   - Response: `signature` (`bstr`).
 - **`batch_sign_documents`**:
-  - Context: `document_names` (`[1* tstr .size (1..256)]`, list of 1 to 64 document display names).
+  - Context: `document_names` (`[+ tstr .size (1..256)]`, the documents' display names, in order).
   - Payload:
     - `key_profile`, `algorithm`.
-    - `digests` (`[1* bstr]`, ordered list of 1 to 64 document digests).
-    - Invariant: `len(document_names) == len(digests) <= 64`.
-  - Consent: the full list of document names on the Custodian's screen and PIN 2 once for the batch.
+    - `digests` (`[+ bstr]`, one per document, in the same order).
+  - Consent: the full list of document names on the Custodian's screen and PIN 2 once for the batch. The card takes PIN 2 for one signature at a time (FINEID S1); how the Custodian carries one entry through the batch is its own, and PIN 2 never leaves it (§11).
   - Signature Wire Format: each entry as §9.2.
-  - Response: `signatures` (`[1* bstr]`, ordered list of signatures).
+  - Response: `signatures` (`[+ bstr]`, in the same order).
   - An interrupted batch ends with its session (§8.1 item 3); no signature of it is delivered.
 
 ---

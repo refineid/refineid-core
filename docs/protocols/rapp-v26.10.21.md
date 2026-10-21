@@ -556,7 +556,7 @@ The generator point $G$ is derived from the password-related string (PRS), the 6
      $$\text{transcript\_ir} = \text{lv\_cat}([Y_A, \emptyset]) \parallel \text{lv\_cat}([Y_B, \emptyset])$$
      $$\text{isk\_input} = \text{lv\_cat}([\text{DSI}_{\text{ISK}}, \text{SID}, K]) \parallel \text{transcript\_ir}$$
      $$\text{ISK} = \text{SHA-512}(\text{isk\_input}) \quad (64\text{ bytes})$$
-   - Derives Transcript Hash ($TH$) and Application Key Schedule (RFC 5869 HKDF-SHA-512):
+   - Derives the transcript hash ($TH$), the pseudorandom key ($PRK$) and the keys drawn from it with HKDF-SHA-512 (RFC 5869):
      $$TH = \text{SHA-512}(\text{lv\_cat}([\text{"RAPP-CPACE-TRANSCRIPT-v2"}, \text{SID}, C, Y_A, Y_B])) \quad (64\text{ bytes})$$
      $$PRK = \text{HKDF-Extract-SHA512}(\text{salt} = TH, \text{IKM} = \text{ISK}) \quad (64\text{ bytes})$$
      $$PSK = \text{HKDF-Expand-SHA512}(PRK, \text{info} = \text{"RAPP-NOISE-PSK-v2"}, L = 32)$$

@@ -17,30 +17,17 @@ struct Corpus {
 struct RejectedEnvelope {
     name: String,
     canonical_cbor_hex: String,
-    supported_critical: Vec<String>,
     error: String,
 }
 
 #[test]
 fn malformed_or_unsupported_envelopes_match_the_versioned_corpus() {
     let corpus = load_corpus();
-    assert_eq!(corpus.rejected_envelope.len(), 12);
+    assert_eq!(corpus.rejected_envelope.len(), 10);
     for vector in corpus.rejected_envelope {
-        // The corpus states the supported set each vector was judged
-        // against. It is empty for every vector because this
-        // implementation supports no critical extension, which is what
-        // `require_supported_critical` now decides from its own
-        // constant rather than from a caller.
-        assert!(
-            vector.supported_critical.is_empty(),
-            "{} was judged against a non-empty supported set",
-            vector.name
-        );
         let bytes = decode_hex(&vector.canonical_cbor_hex);
         let actual = match Envelope::decode(&bytes) {
-            Ok(envelope) => envelope
-                .require_supported_critical()
-                .map_or_else(|error| format!("{error:?}"), |()| "Accepted".to_owned()),
+            Ok(_) => "Accepted".to_owned(),
             Err(error) => format!("{error:?}"),
         };
         assert_eq!(actual, vector.error, "{}", vector.name);

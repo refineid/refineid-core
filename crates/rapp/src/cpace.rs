@@ -1296,20 +1296,21 @@ mod tests {
         let sid_array: [u8; 32] = sid_bytes.as_slice().try_into().expect("sid is 32 bytes");
         let offer_id = OfferId::from_array(sid_array);
 
-        // 1. Context C (192 bytes)
+        // 1. Context C, whose BLE length RAPP v26.10.21 section 6.1.1 states.
+        const BLE_CONTEXT_LENGTH: usize = 177;
         let context = standard_pairing_context_v2(
             &offer_hash_bytes,
             crate::BLE_PROFILE,
             crate::BLE_CANDIDATE_ID,
         )
         .expect("context cbor");
-        assert_eq!(context.len(), 192);
+        assert_eq!(context.len(), BLE_CONTEXT_LENGTH);
         let expected_context_hex = concat!(
-            "8877524150502d50414952494e472d434f4e544558542d763283181a0a12784543504143452d5249",
-            "5354523235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f32",
-            "353531395f436861436861506f6c795f5348413531327766692e726566696e6569642e72617070",
-            "2e626c652e76316c626c652d6469726563742d315820303132333435363738393a3b3c3d3e3f40",
-            "4142434445464748494a4b4c4d4e4f6972657175657374657269637573746f6469616e"
+            "8874726170702d70616972696e672d636f6e7465787483181a0a15784543504143452d5249535452",
+            "3235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f3235353139",
+            "5f436861436861506f6c795f5348413531327466692e726566696e6569642e726170702e626c6563",
+            "626c655820303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f697265",
+            "7175657374657269637573746f6469616e"
         );
         assert_eq!(hex::encode(&context), expected_context_hex);
 
@@ -1320,7 +1321,7 @@ mod tests {
         let g_bytes = g.compress().to_bytes();
         assert_eq!(
             hex::encode(g_bytes),
-            "c0e3161f417f5242e7aee0e484e6e999830135f5c264f6b5546050f4b1988010"
+            "0c4eb83d9af220570a5afd600860785072aed8d4914d2a738493b7eb281f8103"
         );
 
         // 3. Option B Scalars: 64 repeated bytes
@@ -1344,7 +1345,7 @@ mod tests {
             .expect("alice init succeeds");
         assert_eq!(
             hex::encode(msg1),
-            "7e8dc7f3ae5bbdbec7233b09c29bed672020ac033fac8553e340d477692df040"
+            "dc90506b0a1621fd62f264c21fa768665485c14823d47d978c02e1b3702ce529"
         );
 
         // 5. Step 2: Responder processes Y_A and outputs Y_B || T_B (64 bytes)
@@ -1354,22 +1355,22 @@ mod tests {
         assert_eq!(msg2.len(), 64);
         assert_eq!(
             hex::encode(&msg2[..32]),
-            "e4d921d4f81ef1b111eb74911cf2eca596cb1d1fbb44a0a6272c86a123210621"
+            "ac7a60ab91d31bfb47c5a71a0f9be05f88a992e51f6dabcdbecb0d4d3e35fa5f"
         );
         assert_eq!(
             hex::encode(&msg2[32..]),
-            "df9f39ad7df64d9a08001df53a50582cda0932d8f88c00d65c92824140249519"
+            "430e5b4eda6d093f68d73ae1d40a9489c3806aea43000730052e5cbc60e1d310"
         );
 
         // 6. Step 3: Initiator verifies T_B and outputs T_A (32 bytes) + PSK
         let (msg3, alice_secret) = alice.process_step2(&msg2).expect("alice step2 succeeds");
         assert_eq!(
             hex::encode(msg3),
-            "875985aa1833b35da6faa54e53b3c82675fa50c07b29941186d135c010a80716"
+            "41f24e933dd85a107e8615aa25cd7ee15f1901cf05b1205c2ef90439638a4072"
         );
         assert_eq!(
             hex::encode(alice_secret.expose()),
-            "5c56be609fce5bdce5f10845d283bc0251c621db4a007f452df60df468b44d27"
+            "1be5b273ab251dc6a895136a89a8932c4e882e4a0373f10ab7fca8ba8d0413b9"
         );
 
         // 7. Responder verifies T_A and completes with PSK
@@ -1378,7 +1379,7 @@ mod tests {
             .expect("bob step3 succeeds");
         assert_eq!(
             hex::encode(bob_secret.expose()),
-            "5c56be609fce5bdce5f10845d283bc0251c621db4a007f452df60df468b44d27"
+            "1be5b273ab251dc6a895136a89a8932c4e882e4a0373f10ab7fca8ba8d0413b9"
         );
         assert_eq!(alice_secret.expose(), bob_secret.expose());
 
@@ -1392,7 +1393,7 @@ mod tests {
         assert_eq!(ya_point * scalar_b, k_point);
         assert_eq!(
             hex::encode(k_point.compress().to_bytes()),
-            "f8e984f17d2a92553ea8ce4cc61b9d381c53e377cc2327604a0c467c47928761"
+            "cc01328f6f74bf21cff599af3985916744562047fca1bd78c2bceea57629980f"
         );
 
         let isk = calculate_isk(
@@ -1405,39 +1406,39 @@ mod tests {
         );
         assert_eq!(
             hex::encode(isk),
-            "83a4700e722a5dae82015c842d1552cb815c59cafd3bf6b446d40db2df7e31d961d3ba5f4ee325b86531fc56f0d5d86f60083a82f44091d4a4cbad5266905e3b"
+            "6c3d5065b4504cd4261da984ebf16165aac0d3e6a06763bc241cab3a462ede81574d731a25a308275f89c6e0a1e9dd55f3782b1f0be08ee602e0492349bdce1e"
         );
 
         let th = calculate_transcript_hash_v2(&sid_bytes, &context, &msg1, &yb_arr);
         assert_eq!(
             hex::encode(th),
-            "11aa1c9f2fc6c49f92e7c30ccaf01b84daac4accab7347b08718862338c36b0f26ec7f93075da266efcf6a77665544d1d1be7a180f7696c2acccb67fd82a779c"
+            "6f3692304b832f2c16a53798de996df5e0d4b0fdee178e48267afd7d0cd3cde8a5e3a9051dc5fa44579b398c1f0097fd2a8d5733713d8edc7554c824098918c7"
         );
 
         let keys = derive_kc2_keys(&isk, &th);
         assert_eq!(
             hex::encode(keys.prk()),
-            "58164ca7e04c1c77537bffeb125527599fa17a1577267457df4a17d4b56417e8c257f0d2baacafb7872784dd5fe4db5628d743a1615dc198c52a38d9165e33a0"
+            "9686bc4150ff1bdbc7c101ad84d7b0c21b630470e5cd9bcd14d6c185bcd74a429175b3ce09361f97d81af38ffb03240df7a37e4494f3ef01f895ec88c6365768"
         );
         assert_eq!(
             hex::encode(keys.psk()),
-            "5c56be609fce5bdce5f10845d283bc0251c621db4a007f452df60df468b44d27"
+            "1be5b273ab251dc6a895136a89a8932c4e882e4a0373f10ab7fca8ba8d0413b9"
         );
         assert_eq!(
             hex::encode(keys.k_a()),
-            "28d91f1544b18ef75d4fdd9fe6a97c26081d51dd36441d4c90bf5dc597d370b5"
+            "03cdd5abe1fece10a17f72bbbdca2d21d31355cb22daa7741f8121449cbc61a0"
         );
         assert_eq!(
             hex::encode(keys.k_b()),
-            "1308076ec743fd4b4987965bcde624af2a7f9dad81bd1d37fce18868cfd13120"
+            "63afae313427e703ea2da0199abc41a8f3d33b6b924dc905cf0dfa4abb99ebd8"
         );
         assert_eq!(
             hex::encode(keys.tag_a()),
-            "875985aa1833b35da6faa54e53b3c82675fa50c07b29941186d135c010a80716"
+            "41f24e933dd85a107e8615aa25cd7ee15f1901cf05b1205c2ef90439638a4072"
         );
         assert_eq!(
             hex::encode(keys.tag_b()),
-            "df9f39ad7df64d9a08001df53a50582cda0932d8f88c00d65c92824140249519"
+            "430e5b4eda6d093f68d73ae1d40a9489c3806aea43000730052e5cbc60e1d310"
         );
     }
 

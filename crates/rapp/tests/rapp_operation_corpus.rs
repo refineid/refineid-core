@@ -81,8 +81,6 @@ fn typed(vector: &Vector, inputs: &FixedInputs) -> TypedMessage {
         session_id,
         0,
         body(&vector.body_hex),
-        Vec::new(),
-        BTreeMap::new(),
     )
     .unwrap_or_else(|error| panic!("{} fails the envelope schema: {error:?}", vector.name));
     TypedMessage::from_envelope(envelope, pair_id, inputs.local_start_ms)

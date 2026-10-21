@@ -31,13 +31,6 @@ impl EstablishedEndpoint {
         &self.state
     }
 
-    /// Most recently authenticated peer sequence for liveness messages.
-    pub fn last_received_sequence(&self) -> Option<u64> {
-        self.channel
-            .as_ref()
-            .and_then(SecureChannel::last_received_sequence)
-    }
-
     /// Opens and fully validates one encrypted frame.
     ///
     /// A successfully authenticated grammar/sequence violation revokes the

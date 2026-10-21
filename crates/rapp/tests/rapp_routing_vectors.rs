@@ -161,7 +161,7 @@ fn custodian_routing_key(keys: &Endpoints, pair: PairId) -> RoutingKey {
 #[test]
 fn corpus_names_its_version() {
     let corpus = corpus();
-    assert_eq!(corpus.format, "fi.refineid.rapp.routing-vectors-v1");
+    assert_eq!(corpus.format, "fi.refineid.rapp.routing-vectors");
     assert_eq!(corpus.protocol_document_version, "26.10.21");
 }
 

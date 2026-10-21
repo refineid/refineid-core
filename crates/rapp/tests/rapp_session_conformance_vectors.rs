@@ -202,8 +202,6 @@ fn envelope(session_id: SessionId, sequence: u64) -> Envelope {
         session_id,
         sequence,
         BTreeMap::from([("reason".to_owned(), WireValue::Text("cancelled".to_owned()))]),
-        Vec::new(),
-        BTreeMap::new(),
     )
     .expect("valid sequence-test envelope")
 }

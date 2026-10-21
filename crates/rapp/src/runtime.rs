@@ -57,10 +57,7 @@ impl EstablishedSessionRuntime {
         &mut self,
         reason: CloseReason,
     ) -> Result<BinaryFrame, EndpointError<()>> {
-        let notice = TypedMessage::SessionClose(SessionCloseMessage {
-            reason,
-            last_received_sequence: self.last_received_sequence(),
-        });
+        let notice = TypedMessage::SessionClose(SessionCloseMessage { reason });
         let sealed = self.endpoint.send(&notice);
         self.close_session();
         sealed
@@ -85,7 +82,6 @@ impl EstablishedSessionRuntime {
             ReceiveOutcome::Message(TypedMessage::LivenessPing(ping)) => {
                 let reply = TypedMessage::LivenessPong(LivenessMessage {
                     challenge: ping.challenge,
-                    last_received_sequence: self.last_received_sequence(),
                 });
                 let frame = self.endpoint.send(&reply).map_err(RuntimeError::Send)?;
                 Ok(RuntimeReceive::Send(frame))
@@ -128,10 +124,7 @@ impl EstablishedSessionRuntime {
         match self.liveness.poll(now_ms, next_challenge, jitter_ms) {
             LivenessDecision::NoAction => Ok(RuntimePoll::NoAction),
             LivenessDecision::SendPing(challenge) => {
-                let ping = TypedMessage::LivenessPing(LivenessMessage {
-                    challenge,
-                    last_received_sequence: self.last_received_sequence(),
-                });
+                let ping = TypedMessage::LivenessPing(LivenessMessage { challenge });
                 Ok(RuntimePoll::Send(self.endpoint.send(&ping)?))
             }
             LivenessDecision::ProbeMissed { next_probe_at_ms } => {
@@ -147,10 +140,6 @@ impl EstablishedSessionRuntime {
             }
             LivenessDecision::AlreadyClosed => Ok(RuntimePoll::AlreadyClosed),
         }
-    }
-
-    fn last_received_sequence(&self) -> u64 {
-        self.endpoint.last_received_sequence().unwrap_or(0)
     }
 }
 

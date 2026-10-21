@@ -71,7 +71,7 @@ fn native_kk_replays_the_fixed_transcript() {
         .expect("message 1");
     assert_eq!(
         hex::encode(&message[..length]),
-        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b149814856e40b737fde1dba1ebbe84b923"
+        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b147b11ad5bf9db1826488e0c51a5130895"
     );
     assert_eq!(
         responder
@@ -84,7 +84,7 @@ fn native_kk_replays_the_fixed_transcript() {
         .expect("message 2");
     assert_eq!(
         hex::encode(&message[..length]),
-        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b2fb8b0e5a3f5bb48d282779f512f780c"
+        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b4e344df2ef301875249d68c9e27398a4"
     );
     assert_eq!(
         initiator
@@ -92,12 +92,12 @@ fn native_kk_replays_the_fixed_transcript() {
             .expect("read 2"),
         0
     );
-    let expected_hash = "6950afe05ed9ee39d68c5f24646f0d75ea90b65c9df15873213aa26a472fac00b9e833f68bd3ed40b78ac9bc570069529913779a7148fa10df576285df11fcff";
+    let expected_hash = "24e9f95f60ec7fd69b45def1d0bf6293e3a75eebb969fb173f41b0e7b0d4d8b549eeb57d52cd78f4395a358091d0dff4bd068cc23981b1594dfff59027d753e0";
     assert_eq!(hex::encode(initiator.handshake_hash()), expected_hash);
     assert_eq!(hex::encode(responder.handshake_hash()), expected_hash);
     assert_eq!(
         hex::encode(refineid_rapp::derive_session_id(&initiator.handshake_hash()).as_bytes()),
-        "1cf33fcb49a1f5c05dfa8ddac6b9bc29"
+        "2e2c91b01aa8577ba72e677c52e02131"
     );
 
     let mut initiator_transport = initiator.into_transport().expect("initiator transport");
@@ -196,7 +196,6 @@ fn kk_handshake_and_transport_round_trip() {
     // Requester -> Proxy
     let mut req_body = BTreeMap::new();
     req_body.insert("challenge".to_owned(), WireValue::Bytes(vec![0xAA; 32]));
-    req_body.insert("last_received_sequence".to_owned(), WireValue::Unsigned(0));
     let frame1 = requester_channel
         .seal(MessageType::LivenessPing, req_body.clone())
         .expect("seal frame 1");
@@ -207,7 +206,6 @@ fn kk_handshake_and_transport_round_trip() {
     // Proxy -> Requester
     let mut resp_body = BTreeMap::new();
     resp_body.insert("challenge".to_owned(), WireValue::Bytes(vec![0xAA; 32]));
-    resp_body.insert("last_received_sequence".to_owned(), WireValue::Unsigned(0));
     let frame2 = proxy_channel
         .seal(MessageType::LivenessPong, resp_body)
         .expect("seal frame 2");
@@ -482,15 +480,15 @@ fn test_generate_standard_noise_kk_vector() {
 
     assert_eq!(
         hex::encode(msg1_wire),
-        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b149814856e40b737fde1dba1ebbe84b923"
+        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b147b11ad5bf9db1826488e0c51a5130895"
     );
     assert_eq!(
         hex::encode(msg2_wire),
-        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b2fb8b0e5a3f5bb48d282779f512f780c"
+        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b4e344df2ef301875249d68c9e27398a4"
     );
     assert_eq!(
         hex::encode(final_h),
-        "6950afe05ed9ee39d68c5f24646f0d75ea90b65c9df15873213aa26a472fac00b9e833f68bd3ed40b78ac9bc570069529913779a7148fa10df576285df11fcff"
+        "24e9f95f60ec7fd69b45def1d0bf6293e3a75eebb969fb173f41b0e7b0d4d8b549eeb57d52cd78f4395a358091d0dff4bd068cc23981b1594dfff59027d753e0"
     );
     assert_eq!(
         hex::encode(init_c1),
@@ -502,7 +500,7 @@ fn test_generate_standard_noise_kk_vector() {
     );
     assert_eq!(
         hex::encode(session_id.as_bytes()),
-        "1cf33fcb49a1f5c05dfa8ddac6b9bc29"
+        "2e2c91b01aa8577ba72e677c52e02131"
     );
 }
 
@@ -568,7 +566,7 @@ fn test_standard_noise_kk_vector_matches_snow_implementation() {
     assert_eq!(len1, 48);
     assert_eq!(
         hex::encode(&buf[..len1]),
-        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b149814856e40b737fde1dba1ebbe84b923"
+        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b147b11ad5bf9db1826488e0c51a5130895"
     );
     let plen1 = resp
         .read_message(&buf[..len1], &mut payload)
@@ -582,7 +580,7 @@ fn test_standard_noise_kk_vector_matches_snow_implementation() {
     assert_eq!(len2, 48);
     assert_eq!(
         hex::encode(&buf[..len2]),
-        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b2fb8b0e5a3f5bb48d282779f512f780c"
+        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b4e344df2ef301875249d68c9e27398a4"
     );
     let plen2 = init
         .read_message(&buf[..len2], &mut payload)
@@ -593,7 +591,7 @@ fn test_standard_noise_kk_vector_matches_snow_implementation() {
     let snow_hash = init.get_handshake_hash();
     assert_eq!(
         hex::encode(snow_hash),
-        "6950afe05ed9ee39d68c5f24646f0d75ea90b65c9df15873213aa26a472fac00b9e833f68bd3ed40b78ac9bc570069529913779a7148fa10df576285df11fcff"
+        "24e9f95f60ec7fd69b45def1d0bf6293e3a75eebb969fb173f41b0e7b0d4d8b549eeb57d52cd78f4395a358091d0dff4bd068cc23981b1594dfff59027d753e0"
     );
     assert_eq!(resp.get_handshake_hash(), snow_hash);
 

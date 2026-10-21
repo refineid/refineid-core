@@ -86,7 +86,7 @@ fn error_name(error: BleSarError) -> &'static str {
 #[test]
 fn corpus_names_this_profile() {
     let corpus = corpus();
-    assert_eq!(corpus.format, "fi.refineid.rapp.ble-sar-vectors-v1");
+    assert_eq!(corpus.format, "fi.refineid.rapp.ble-sar-vectors");
     assert_eq!(corpus.protocol_document_version, "26.10.21");
     assert_eq!(
         corpus.header_size,

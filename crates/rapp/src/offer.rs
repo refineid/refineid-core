@@ -614,8 +614,8 @@ mod tests {
 
         assert!(!deadline.is_live(9_999));
         assert!(deadline.is_live(10_000));
-        assert!(deadline.is_live(69_999));
-        assert!(!deadline.is_live(70_000));
+        assert!(deadline.is_live(10_000 + crate::OFFER_TTL_MS - 1));
+        assert!(!deadline.is_live(10_000 + crate::OFFER_TTL_MS));
     }
 
     #[test]

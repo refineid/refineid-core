@@ -15,25 +15,12 @@
 //! Strict deterministic-CBOR wire representation for RAPP.
 
 use core::fmt;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use super::{MAX_FRAME_PLAINTEXT, SESSION_ID_SIZE, SessionId, WIRE_VERSION_V26_10_21};
 
 const MAX_NESTING_DEPTH: usize = 8;
 const MAX_TEXT_SIZE: usize = 4_096;
-
-/// Critical extension names this implementation understands.
-///
-/// RAPP v26.9.28 section 7.3: "An implementation MUST reject an unknown
-/// field named in `critical`." Which names are known is fixed by what
-/// this module implements, not chosen per call, so the set is a
-/// constant rather than a parameter: a caller that supplied its own set
-/// could widen it and quietly accept traffic this endpoint cannot act
-/// on. The set is empty because no critical extension is implemented, so
-/// every critical name a peer sends is by definition one this endpoint
-/// must reject. The outgoing path is correspondingly free of critical
-/// names, which keeps both directions consistent.
-pub(crate) const SUPPORTED_CRITICAL_EXTENSIONS: &[&str] = &[];
 
 /// CBOR additional-information values selecting the argument width (RFC 8949 section 3).
 const ARGUMENT_IMMEDIATE_MAX: u8 = 23;
@@ -161,35 +148,25 @@ pub struct Envelope {
     pub sequence: u64,
     /// Message-specific, schema-validated body.
     pub body: BTreeMap<String, WireValue>,
-    /// Extensions that an endpoint must understand.
-    pub critical: Vec<String>,
-    /// Registered extension values.
-    pub extensions: BTreeMap<String, WireValue>,
 }
 
 impl Envelope {
     /// Construct and validate an outgoing envelope.
     ///
     /// # Errors
-    /// [`WireError`] when the body or extensions violate the registered
-    /// schema.
+    /// [`WireError`] when the body violates the registered schema.
     pub fn reconstruct(
         message_type: MessageType,
         session_id: SessionId,
         sequence: u64,
         body: BTreeMap<String, WireValue>,
-        critical: Vec<String>,
-        extensions: BTreeMap<String, WireValue>,
     ) -> Result<Self, WireError> {
         validate_body(message_type, &body)?;
-        validate_extensions(&critical, &extensions)?;
         Ok(Self {
             message_type,
             session_id,
             sequence,
             body,
-            critical,
-            extensions,
         })
     }
 
@@ -218,18 +195,6 @@ impl Envelope {
         );
         map.insert("sequence".to_owned(), WireValue::Unsigned(self.sequence));
         map.insert("body".to_owned(), WireValue::Map(self.body.clone()));
-        if !self.critical.is_empty() {
-            map.insert(
-                "critical".to_owned(),
-                WireValue::Array(self.critical.iter().cloned().map(WireValue::Text).collect()),
-            );
-        }
-        if !self.extensions.is_empty() {
-            map.insert(
-                "extensions".to_owned(),
-                WireValue::Map(self.extensions.clone()),
-            );
-        }
         let encoded = encode_deterministic_cbor(&WireValue::Map(map))?;
         if encoded.len() > MAX_FRAME_PLAINTEXT {
             return Err(WireError::OversizedPlaintext { got: encoded.len() });
@@ -249,18 +214,7 @@ impl Envelope {
         let WireValue::Map(mut map) = decode_deterministic_cbor(bytes)? else {
             return Err(WireError::WrongType { field: "envelope" });
         };
-        reject_unknown_fields(
-            &map,
-            &[
-                "version",
-                "type",
-                "session_id",
-                "sequence",
-                "body",
-                "critical",
-                "extensions",
-            ],
-        )?;
+        reject_unknown_fields(&map, &["version", "type", "session_id", "sequence", "body"])?;
 
         let version = take_array(&mut map, "version")?;
         if version.as_slice()
@@ -282,59 +236,13 @@ impl Envelope {
             })?;
         let sequence = take_unsigned(&mut map, "sequence")?;
         let body = take_map(&mut map, "body")?;
-        let critical = match map.remove("critical") {
-            None => Vec::new(),
-            Some(WireValue::Array(values)) => values
-                .into_iter()
-                .map(|value| match value {
-                    WireValue::Text(text) => Ok(text),
-                    _ => Err(WireError::WrongType { field: "critical" }),
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            Some(_) => return Err(WireError::WrongType { field: "critical" }),
-        };
-        let extensions = match map.remove("extensions") {
-            None => BTreeMap::new(),
-            Some(WireValue::Map(values)) => values,
-            Some(_) => {
-                return Err(WireError::WrongType {
-                    field: "extensions",
-                });
-            }
-        };
         validate_body(message_type, &body)?;
-        validate_extensions(&critical, &extensions)?;
         Ok(Self {
             message_type,
             session_id,
             sequence,
             body,
-            critical,
-            extensions,
         })
-    }
-
-    /// Reject critical extensions this implementation does not support.
-    ///
-    /// Every authenticated receive path must call this: the peer names a
-    /// critical extension to declare that ignoring it would misrepresent
-    /// the message, so a name this implementation does not support has
-    /// to end the session rather than be processed as if it had not been
-    /// sent. The supported set is the module's own constant, not a
-    /// caller's, so no caller can widen it.
-    ///
-    /// # Errors
-    /// [`WireError::UnsupportedCriticalExtension`] when a critical name is
-    /// not supported locally.
-    pub fn require_supported_critical(&self) -> Result<(), WireError> {
-        if self
-            .critical
-            .iter()
-            .any(|name| !SUPPORTED_CRITICAL_EXTENSIONS.contains(&name.as_str()))
-        {
-            return Err(WireError::UnsupportedCriticalExtension);
-        }
-        Ok(())
     }
 }
 
@@ -371,14 +279,7 @@ impl SequenceGuard {
             .next_send
             .checked_add(1)
             .ok_or(WireError::SequenceWrapped)?;
-        Envelope::reconstruct(
-            message_type,
-            self.session_id,
-            sequence,
-            body,
-            Vec::new(),
-            BTreeMap::new(),
-        )
+        Envelope::reconstruct(message_type, self.session_id, sequence, body)
     }
 
     /// Verify session binding and exact next sequence after decryption.
@@ -401,12 +302,6 @@ impl SequenceGuard {
             .checked_add(1)
             .ok_or(WireError::SequenceWrapped)?;
         Ok(())
-    }
-
-    /// Most recently accepted peer sequence, if any.
-    #[must_use]
-    pub const fn last_received_sequence(&self) -> Option<u64> {
-        self.next_receive.checked_sub(1)
     }
 }
 
@@ -470,10 +365,6 @@ pub enum WireError {
     UnsupportedVersion,
     /// Message type is outside the registry.
     UnknownMessageType,
-    /// A named critical extension is not supported locally.
-    UnsupportedCriticalExtension,
-    /// A named critical extension has no extension value.
-    CriticalExtensionMissing,
     /// Plaintext exceeds the single-frame envelope limit.
     OversizedPlaintext {
         /// Plaintext length in bytes.
@@ -838,30 +729,16 @@ fn validate_body(
                 optional: false,
             },
         ],
-        M::SessionClose => &[
-            FieldSpec {
-                name: "reason",
-                field_type: F::Text,
-                optional: false,
-            },
-            FieldSpec {
-                name: "last_received_sequence",
-                field_type: F::Unsigned,
-                optional: false,
-            },
-        ],
-        M::LivenessPing | M::LivenessPong => &[
-            FieldSpec {
-                name: "challenge",
-                field_type: F::Bytes(32),
-                optional: false,
-            },
-            FieldSpec {
-                name: "last_received_sequence",
-                field_type: F::Unsigned,
-                optional: false,
-            },
-        ],
+        M::SessionClose => &[FieldSpec {
+            name: "reason",
+            field_type: F::Text,
+            optional: false,
+        }],
+        M::LivenessPing | M::LivenessPong => &[FieldSpec {
+            name: "challenge",
+            field_type: F::Bytes(32),
+            optional: false,
+        }],
         M::OperationRequest => &[
             FieldSpec {
                 name: "operation_id",
@@ -1107,22 +984,6 @@ fn validate_discriminants(
     Ok(())
 }
 
-fn validate_extensions(
-    critical: &[String],
-    extensions: &BTreeMap<String, WireValue>,
-) -> Result<(), WireError> {
-    let mut names = BTreeSet::new();
-    for name in critical {
-        if !names.insert(name) {
-            return Err(WireError::DuplicateMapKey);
-        }
-        if !extensions.contains_key(name) {
-            return Err(WireError::CriticalExtensionMissing);
-        }
-    }
-    Ok(())
-}
-
 fn reject_unknown_fields(
     map: &BTreeMap<String, WireValue>,
     known: &[&str],
@@ -1221,8 +1082,6 @@ mod tests {
             session,
             1,
             BTreeMap::from([("reason".to_owned(), WireValue::Text("cancelled".to_owned()))]),
-            Vec::new(),
-            BTreeMap::new(),
         )
         .expect("valid body");
         assert_eq!(
@@ -1243,8 +1102,6 @@ mod tests {
             SessionId::from_array([0x55; 16]),
             0,
             BTreeMap::from([("reason".to_owned(), WireValue::Text("cancelled".to_owned()))]),
-            Vec::new(),
-            BTreeMap::new(),
         )
         .expect("valid envelope");
         let encoded_envelope = envelope.encode().expect("envelope encodes");

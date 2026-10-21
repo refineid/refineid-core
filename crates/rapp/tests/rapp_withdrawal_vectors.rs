@@ -96,7 +96,6 @@ struct MalformedVector {
 struct CloseVector {
     name: String,
     reason: String,
-    last_received_sequence: u64,
     body_cbor_hex: String,
 }
 
@@ -257,7 +256,6 @@ fn session_close_bodies_match_the_corpus() {
         assert_eq!(vector.reason, "service_withdrawn", "{}", vector.name);
         let message = TypedMessage::SessionClose(SessionCloseMessage {
             reason: CloseReason::ServiceWithdrawn,
-            last_received_sequence: vector.last_received_sequence,
         });
         let body = message.to_wire_body().expect("body");
         let encoded = encode_deterministic_cbor(&WireValue::Map(body)).expect("encode");

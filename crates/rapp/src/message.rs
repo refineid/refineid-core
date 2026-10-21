@@ -90,8 +90,6 @@ pub struct SessionReadyMessage {
 pub struct SessionCloseMessage {
     /// Registered close reason.
     pub reason: CloseReason,
-    /// Highest peer sequence accepted before closing.
-    pub last_received_sequence: u64,
 }
 
 /// Authenticated ping or pong body.
@@ -99,8 +97,6 @@ pub struct SessionCloseMessage {
 pub struct LivenessMessage {
     /// Fresh challenge, echoed exactly by the answering pong.
     pub challenge: PingChallenge,
-    /// Highest peer sequence accepted so far.
-    pub last_received_sequence: u64,
 }
 
 /// Durable status reconciliation answer.
@@ -566,10 +562,6 @@ fn session_close_to_body(value: SessionCloseMessage) -> BTreeMap<String, WireVal
         "reason".into(),
         WireValue::Text(close_reason_name(value.reason).into()),
     );
-    body.insert(
-        "last_received_sequence".into(),
-        WireValue::Unsigned(value.last_received_sequence),
-    );
     body
 }
 
@@ -577,12 +569,8 @@ fn session_close_from_body(
     mut body: BTreeMap<String, WireValue>,
 ) -> Result<SessionCloseMessage, MessageError> {
     let reason = parse_close_reason(&take_text(&mut body, "reason")?)?;
-    let last_received_sequence = take_unsigned(&mut body, "last_received_sequence")?;
     require_empty(&body)?;
-    Ok(SessionCloseMessage {
-        reason,
-        last_received_sequence,
-    })
+    Ok(SessionCloseMessage { reason })
 }
 
 fn liveness_to_body(value: LivenessMessage) -> BTreeMap<String, WireValue> {
@@ -590,10 +578,6 @@ fn liveness_to_body(value: LivenessMessage) -> BTreeMap<String, WireValue> {
     body.insert(
         "challenge".into(),
         WireValue::Bytes(value.challenge.as_bytes().to_vec()),
-    );
-    body.insert(
-        "last_received_sequence".into(),
-        WireValue::Unsigned(value.last_received_sequence),
     );
     body
 }
@@ -605,12 +589,8 @@ fn liveness_from_body(
         &mut body,
         "challenge",
     )?);
-    let last_received_sequence = take_unsigned(&mut body, "last_received_sequence")?;
     require_empty(&body)?;
-    Ok(LivenessMessage {
-        challenge,
-        last_received_sequence,
-    })
+    Ok(LivenessMessage { challenge })
 }
 
 fn status_request_from_body(

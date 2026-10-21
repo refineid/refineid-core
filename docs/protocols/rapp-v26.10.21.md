@@ -622,13 +622,7 @@ The generator point $G$ is derived from the password-related string (PRS), the 6
 
 ### 6.3 Noise_KK Operational Session Handshake (RFC 7748, RFC 8439, RFC 5869)
 
-- **Suite**: `Noise_KK_25519_ChaChaPoly_SHA512`
-- **Pinned Cryptographic Standards**:
-  - Noise Protocol Framework: Revision 34 (June 2018).
-  - Classical DH: Curve25519 / X25519 per [RFC 7748](https://www.rfc-editor.org/rfc/rfc7748.html) (32-byte keys).
-  - AEAD Cipher: ChaCha20-Poly1305 per [RFC 8439](https://www.rfc-editor.org/rfc/rfc8439.html) (32-byte key, 12-byte nonce, 16-byte tag). Nonce layout: 4 zero prefix bytes followed by 8 little-endian sequence counter bytes.
-  - Hash Function: SHA-512 per [FIPS 180-4](https://doi.org/10.6028/NIST.FIPS.180-4) (64-byte output, 128-byte block size).
-  - Key Derivation: HKDF-SHA-512 per [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html).
+- **Suite**: `Noise_KK_25519_ChaChaPoly_SHA512`, over the primitives of §6.2.
 - **Handshake Pattern**:
   ```text
   Noise_KK(s, rs):
@@ -638,68 +632,14 @@ The generator point $G$ is derived from the password-related string (PRS), the 6
     -> e, es, ss
     <- e, ee, se
   ```
-- **State Initialization**:
-  1. `protocol_name` = `"Noise_KK_25519_ChaChaPoly_SHA512"` (32 American Standard Code for Information Interchange (ASCII) bytes).
-  2. Because $|\text{protocol\_name}| \le 64$, $h$ is initialized by right-padding with 32 zero bytes to 64 bytes:
-     $$h = \text{protocol\_name} \parallel 0^{32}$$
-  3. Chaining key initialized to $ck = h$.
-  4. MixHash(prologue): $h = \text{SHA-512}(h \parallel \text{prologue})$ where prologue is `encode_deterministic_cbor(session-prologue)` (§4.3).
-  5. Pre-message static point hashing:
-     - Initiator (Requester): $h = \text{SHA-512}(h \parallel s_{local\_pub})$; then $h = \text{SHA-512}(h \parallel s_{remote\_pub})$.
-     - Responder (Custodian): $h = \text{SHA-512}(h \parallel s_{remote\_pub})$; then $h = \text{SHA-512}(h \parallel s_{local\_pub})$.
-- **Message 1 (Initiator -> Responder)**: Tokens `e, es, ss`
-  1. `e`: Initiator samples fresh ephemeral X25519 private key $e_{priv}$, computes 32-byte public key $e_{pub} = \text{X25519}(e_{priv}, G)$. Appends $e_{pub}$ (32 bytes) unencrypted to message buffer. Calls `MixHash(e_pub)`: $h = \text{SHA-512}(h \parallel e_{pub})$.
-  2. `es`: Initiator computes classical DH shared secret $DH(e_{priv}, rs_{pub})$ (32 bytes). Calls `MixKey`:
-     $$(ck, k) = \text{HKDF-SHA-512}(ck, DH(e_{priv}, rs_{pub}), 2)$$
-     Cipher state rekeyed with $k$, sequence counter reset to 0.
-  3. `ss`: Initiator computes static DH shared secret $DH(s_{priv}, rs_{pub})$ (32 bytes). Calls `MixKey`:
-     $$(ck, k) = \text{HKDF-SHA-512}(ck, DH(s_{priv}, rs_{pub}), 2)$$
-     Cipher state rekeyed with $k$, sequence counter reset to 0.
-  4. Handshake Payload: Empty ($\emptyset$). Initiator calls `EncryptAndHash("")` with $h$ as associated data, producing a 16-byte Poly1305 authentication tag appended to message buffer. Updates $h = \text{SHA-512}(h \parallel \text{tag})$.
-  **Total Message 1 Length**: $32 + 16 = 48\text{ bytes}$, one transport frame.
-- **Message 1 Processing by Responder (Custodian)**:
-  1. Reads 32 bytes $re_{pub}$. Validates non-zero point. Calls `MixHash(re_pub)`.
-  2. `es`: Computes $DH(s_{priv}, re_{pub})$ (32 bytes). Calls `MixKey`:
-     $$(ck, k) = \text{HKDF-SHA-512}(ck, DH(s_{priv}, re_{pub}), 2)$$
-     Cipher state rekeyed with $k$, sequence counter reset to 0.
-  3. `ss`: Computes $DH(s_{priv}, rs_{pub})$ (32 bytes). Calls `MixKey`:
-     $$(ck, k) = \text{HKDF-SHA-512}(ck, DH(s_{priv}, rs_{pub}), 2)$$
-     Cipher state rekeyed with $k$, sequence counter reset to 0.
-  4. Reads 16-byte encrypted empty payload tag. Calls `DecryptAndHash`: verifies Poly1305 tag over empty plaintext with $h$ as associated data. Updates $h = \text{SHA-512}(h \parallel \text{tag})$.
-- **Message 2 (Responder -> Initiator)**: Tokens `e, ee, se`
-  1. `e`: Responder samples fresh ephemeral X25519 private key $e_{priv}$, computes 32-byte public key $e_{pub}$. Appends $e_{pub}$ (32 bytes) unencrypted to message buffer. Calls `MixHash(e_pub)`.
-  2. `ee`: Responder computes ephemeral DH shared secret $DH(e_{priv}, re_{pub})$ (32 bytes, using initiator's ephemeral public key $re_{pub}$). Calls `MixKey`:
-     $$(ck, k) = \text{HKDF-SHA-512}(ck, DH(e_{priv}, re_{pub}), 2)$$
-     Cipher state rekeyed with $k$, sequence counter reset to 0.
-  3. `se`: Responder computes DH shared secret between its ephemeral private key $e_{priv}$ and Initiator's static public key $rs_{pub}$ (32 bytes): $DH(e_{priv}, rs_{pub})$. Calls `MixKey`:
-     $$(ck, k) = \text{HKDF-SHA-512}(ck, DH(e_{priv}, rs_{pub}), 2)$$
-     Cipher state rekeyed with $k$, sequence counter reset to 0.
-  4. Handshake Payload: Empty ($\emptyset$). Calls `EncryptAndHash("")` with $h$ as associated data, producing a 16-byte Poly1305 authentication tag appended to message buffer. Updates $h = \text{SHA-512}(h \parallel \text{tag})$.
-  **Total Message 2 Length**: $32 + 16 = 48\text{ bytes}$, one transport frame.
-- **Message 2 Processing by Initiator (Requester)**:
-  1. Reads 32 bytes $re_{pub}$. Calls `MixHash(re_pub)`.
-  2. `ee`: Computes ephemeral DH shared secret $DH(e_{priv}, re_{pub})$ (32 bytes, using initiator's ephemeral private key $e_{priv}$ and responder's ephemeral public key $re_{pub}$). Calls `MixKey`:
-     $$(ck, k) = \text{HKDF-SHA-512}(ck, DH(e_{priv}, re_{pub}), 2)$$
-     Cipher state rekeyed with $k$, sequence counter reset to 0.
-  3. `se`: Initiator computes DH shared secret between its static private key $s_{priv}$ and Responder's ephemeral public key $re_{pub}$ (32 bytes): $DH(s_{priv}, re_{pub})$. Calls `MixKey`:
-     $$(ck, k) = \text{HKDF-SHA-512}(ck, DH(s_{priv}, re_{pub}), 2)$$
-     Cipher state rekeyed with $k$, sequence counter reset to 0.
-  4. Reads 16-byte encrypted empty payload tag. Calls `DecryptAndHash`: verifies Poly1305 tag over empty plaintext with $h$ as associated data. Updates $h = \text{SHA-512}(h \parallel \text{tag})$.
-- **Transport Mode Transition & Directional Key Split**:
-  Immediately upon completing Message 2:
-  1. Both endpoints call `Split()` on the final chaining key $ck$:
-     $$PRK = \text{HMAC-SHA-512}(ck, \emptyset)$$
-     $$out1 = \text{HMAC-SHA-512}(PRK, \text{0x01})$$
-     $$out2 = \text{HMAC-SHA-512}(PRK, out1 \parallel \text{0x02})$$
-     $$c_1 = out1[0..32], \quad c_2 = out2[0..32]$$
-  2. Directional Key Assignment:
-     - **Initiator (Requester)**: Transmits using cipher key $c_1$; receives using cipher key $c_2$.
-     - **Responder (Custodian)**: Transmits using cipher key $c_2$; receives using cipher key $c_1$.
-  3. Both cipher states initialize sequence nonces to 0. Nonces increment strictly by 1 for each encrypted frame.
-  4. Operational Session Identifier Derivation:
-     $$\text{session\_id} = \text{SHA-512}(\texttt{"RAPP-session-id-v1"} \parallel h)[0..16]$$
-     This fresh 16-byte `session_id` scopes all envelopes in the operational session.
-  5. Ephemeral handshake state ($e_{priv}$) is immediately zeroized.
+- **Initialization**: `protocol_name` is `"Noise_KK_25519_ChaChaPoly_SHA512"`, 32 bytes, so $h = \text{protocol\_name} \parallel 0^{32}$ and $ck = h$. The prologue mixed into $h$ is `encode_deterministic_cbor(session-prologue)` (§4.3). The pre-message static keys are mixed in pattern order: the initiator's (the Requester's) first, then the responder's (the Custodian's).
+- **Messages**: Both handshake payloads are empty, so each message is a 32-byte ephemeral public key followed by a 16-byte Poly1305 tag over the empty payload with $h$ as associated data: 48 bytes, one transport frame. Tokens are processed as Noise revision 34 Section 5 prescribes; each `MixKey` runs $\text{HKDF-SHA-512}(ck, \text{DH output}, 2)$ and resets the cipher state's sequence counter to 0. A received ephemeral public key that is the all-zero point is rejected.
+- **Transport Mode**: On completing Message 2 both endpoints call `Split()`:
+  $$PRK = \text{HMAC-SHA-512}(ck, \emptyset), \quad out1 = \text{HMAC-SHA-512}(PRK, \text{0x01}), \quad out2 = \text{HMAC-SHA-512}(PRK, out1 \parallel \text{0x02})$$
+  $$c_1 = out1[0..32], \quad c_2 = out2[0..32]$$
+  The Requester sends under $c_1$ and receives under $c_2$; the Custodian the reverse. Each direction's nonce starts at 0 and increases by 1 per frame. The session identifier is
+  $$\text{session\_id} = \text{SHA-512}(\texttt{"RAPP-session-id-v1"} \parallel h)[0..16]$$
+  and scopes every envelope of the session (§7). The ephemeral private keys are zeroized at once.
 
 ### 6.4 Independent Standard Noise_KK Interoperability Test Vector
 

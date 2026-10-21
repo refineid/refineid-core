@@ -147,7 +147,7 @@ TXT keys compare case-insensitively ([RFC 6763](https://www.rfc-editor.org/rfc/r
 The Custodian publishes three distinct discovery modes:
 
 1. **Pairing Mode (`mode=pairing`)**:
-   - Active strictly during an explicit user-initiated pairing ceremony on the phone, bounded by the 60-second offer time to live (TTL).
+   - Active strictly during an explicit user-initiated pairing ceremony on the phone, bounded by the 5-minute offer time to live (TTL).
    - TXT Attributes:
      ```text
      v=1

@@ -542,14 +542,14 @@ The generator point $G$ is derived from the password-related string (PRS), the 6
 
 #### 6.1.3 Ephemeral Exchange, Key Schedule, and Mutual Confirmation
 1. **Initiator (Requester - Step 1)**:
-   - Samples scalar $x_A \leftarrow \text{Scalar} \setminus \{0\}$ using either Option A or Option B.
+   - Samples scalar $x_A \leftarrow \text{Scalar} \setminus \{0\}$ as §6.1.1 says.
    - Computes $Y_A = x_A \cdot G$. Encodes to 32 bytes via canonical Ristretto255 point compression.
    - Transmits 32-byte $Y_A$ in CPace Step 1 as one transport frame.
 2. **Responder (Custodian - Step 2)**:
    - Receives $Y_A$, decodes and validates $Y_A \ne \mathcal{O}$ and canonical Ristretto255 element.
    - Atomically reserves attempt slot ($1 \le \text{attempts\_admitted} \le 3$, `active_attempt = true`).
    - Arms the attempt timer at admission: $\text{attempt\_deadline} = \min(\text{admission\_time} + 5.0\text{ s}, \text{offer\_deadline})$.
-   - Samples scalar $x_B \leftarrow \text{Scalar} \setminus \{0\}$ using either Option A or Option B.
+   - Samples scalar $x_B \leftarrow \text{Scalar} \setminus \{0\}$ as §6.1.1 says.
    - Computes $Y_B = x_B \cdot G$.
    - Computes shared point $K = x_B \cdot Y_A$. Verifies $K \ne \mathcal{O}$.
    - Derives Intermediate Session Key (ISK):

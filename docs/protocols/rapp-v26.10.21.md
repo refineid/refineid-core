@@ -1,5 +1,5 @@
 # Remote Authorization Proxy Protocol (RAPP) v26.10.21
-## Transport-Generic Pairing, BLE Direct Proximity and Stream Transport Specification
+## Pairing and Session Protocol over the BLE and Stream Transports
 
 Status: Normative Specification / Research Record  
 Document version: 26.10.21  
@@ -28,7 +28,7 @@ To support upper-layer messages (such as X.509 certificate chains or document si
 ### 1.1 Scope and Standalone Specification Model
 
 This document defines the complete, standalone normative specification for the **Remote Authorization Proxy Protocol (RAPP) version 26.10.21**. It encompasses:
-- The **Transport Profile Registry** (§2.2) with the **BLE Direct Proximity Transport Profile** (`"fi.refineid.rapp.ble"`) and the **Local IP Stream Transport Profile** (`"fi.refineid.stream"`).
+- The **Transport Profile Registry** (§2.2) with the **BLE Transport Profile** (`"fi.refineid.rapp.ble"`) and the **Local IP Stream Transport Profile** (`"fi.refineid.stream"`).
 - The **pairing protocol** utilizing `CPaceRistretto255`, 6-character Crockford Base32 human factors, atomic attempt reservation, and authenticated `Noise_XXpsk3` channel binding.
 - The **BLE SAR Adaptation Layer** with latched invariant total lengths and stop-and-wait flow control.
 - The **Authenticated Message Envelope**, sequential sequencing, and session multiplexing.
@@ -91,7 +91,7 @@ The diagram shows the BLE profile; on the stream transport the Requester dials t
 └──────────────────────────────┬──────────────────────────────┘
                                │
                     Direct BLE 2.4 GHz Link
-       Negotiated ATT MTU >= 512 (sar_payload_capacity = min(MTU - 3, 512) - 6; max 506 B)
+       Negotiated ATT maximum transmission unit (MTU) >= 512; sar_payload_capacity = min(MTU - 3, 512) - 6
               RAPP Segmentation & Reassembly (SAR) Bearer
                                │
 ┌──────────────────────────────▼──────────────────────────────┐
@@ -100,7 +100,7 @@ The diagram shows the BLE profile; on the stream transport the Requester dials t
 │  - Displays Crockford Base32 code on screen                 │
 │  - Advertises Service UUID with ZERO hints / Anonymous Name │
 │  - Holds exclusive NFC custody of FINEID Card               │
-│  - Enforces atomic 3-attempt budget and offer lifecycle     │
+│  - Three attempts per offer, offer lifecycle                │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -221,7 +221,7 @@ To mathematically close this oracle while permitting the final legitimate attemp
      1. **Noise Handshake Completion Deadline**: 10.0 seconds from local CPace handoff.
      2. **Grant Echo, Storage and Confirmation Deadline**: 10.0 seconds from local Noise completion, within which `pairing.confirm` is echoed, the record is stored, and the peer's `pairing.stored` is received (§4.3 item 4).
      Any timeout, peer silence, transport disconnect, or protocol error destroys candidate trust immediately, erases ephemeral keys, and closes the connection without persisting an unconfirmed pairing; a record already stored when the deadline passes without the peer's `pairing.stored` is revoked (§4.6). An indefinitely silent peer is terminated upon deadline expiry. The Requester enters Noise only after the transport frame carrying Message 3 has been sent; the transport's own delivery acknowledgment (on BLE, the ATT write acknowledgment) does not prove that the Custodian accepted $T_A$.
-   - **Fail-Stop Lockout and Exponential Backoff**: Triggered strictly upon attempt budget exhaustion (`attempts_failed == 3`). Upon fail-stop lockout:
+   - **Fail-Stop Lockout and Exponential Backoff**: Triggered by the third failed attempt (`attempts_failed == 3`). Upon fail-stop lockout:
      1. The Custodian destroys all ephemeral keys, stops serving the offer on every transport, and surfaces an on-screen notification to the user ("Pairing failed: 3 incorrect codes. Pairing locked.").
      2. The Custodian enforces an exponential backoff penalty of $\text{delay\_seconds} = \min(2^n, 300\text{ s})$ before permitting the generation of a new offer, where $n = \text{consecutive\_failed\_offers}$ (saturating at $n = 9$; $2^8 = 256\text{ s}$, $2^9 \to 300\text{ s}$).
      3. The counter $n$ starts at $0$, increments by $1$ only upon a fail-stop lockout (`attempts_failed == 3`), and resets to $0$ upon any successful pairing completion (Phase 4), upon conscious manual user reset/unlock in the Custodian settings UI, or after 15 minutes of user inactivity. The counter $n$ is held in volatile memory and resets to $0$ across device reboot.
@@ -370,7 +370,7 @@ A Custodian **withdraws** when it deliberately stops serving every stored pairin
    Each stored pairing has a withdrawal key that both endpoints derive from their static keys, the static agreement $S$ serving as the IKM, and that never crosses the wire:
    $$S = \text{X25519}(\text{local static private}, \text{peer static public})$$
    $$K_{\text{wd}} = \text{HKDF-SHA-256}(\text{salt} = \text{pair\_id}, \text{IKM} = S, \text{info} = \texttt{"rapp-withdrawal"}, L = 32)$$
-   HKDF is [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html): $\text{PRK} = \text{HMAC-SHA-256}(\text{pair\_id}, S)$ over the 16-byte `pair_id`, then the single block $K_{\text{wd}} = \text{HMAC-SHA-256}(\text{PRK}, \text{info} \parallel \texttt{0x01})$. An $S$ equal to the X25519 identity (all zero) yields no key; such a pairing is never announced. The Requester may cache $K_{\text{wd}}$ with the pairing.
+   HKDF is [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html), with the pseudorandom key $\text{PRK} = \text{HMAC-SHA-256}(\text{pair\_id}, S)$ over the 16-byte `pair_id`, then the single block $K_{\text{wd}} = \text{HMAC-SHA-256}(\text{PRK}, \text{info} \parallel \texttt{0x01})$. An $S$ equal to the X25519 identity (all zero) yields no key; such a pairing is never announced. The Requester may cache $K_{\text{wd}}$ with the pairing.
 
 2. **Withdrawal Hint**:
    $$\text{whint} = \text{first 8 bytes of }\text{HMAC-SHA-256}(K_{\text{wd}}, \text{len} \parallel \text{instance} \parallel \text{counter\_be64})$$
@@ -596,7 +596,7 @@ The generator point $G$ is derived from the password-related string (PRS), the 6
     -> s, se, psk
   ```
 - **Pre-messages**: None.
-- **Prologue**: `encode_deterministic_cbor(pairing-prologue)` (§4.3.1).
+- **Prologue**: `encode_deterministic_cbor(pairing-prologue)` (§4.3).
 - **PSK Input**: The 32-byte $PSK$ of §6.1.4 enters at token `psk` through `MixKeyAndHash(psk)` (Noise revision 34 Section 9.2).
 - **Handshake Payload Policy**: All handshake message payloads are empty ($\emptyset$, length 0). Encrypting an empty payload produces a 16-byte Poly1305 authentication tag.
 - **Handshake Messages**:
@@ -841,7 +841,7 @@ A Requester that offers the Custodian's credentials to local consumers (a browse
 1. **`card.status`**:
    On every session the Custodian sends `card.status` once right after `session.ready`, and again whenever the card it can serve changes. `card_present` is true while the Custodian can serve a card now: a card coupled in a reader, or an NFC card the holder has primed and can present on request. An operation that ends without the card answering (no card within the card wait, the card lost before a command was transmitted, the field lost) makes it false at once, until the holder next couples or primes the card. Cached material alone, with no holder able to present the card, is absence. A card busy with another session's operation is present, not absent: the queue of §8.2 item 2 holds the waiting operation, and `card.status` does not change.
 2. **Which Card**:
-   While `card_present` is true, `certificate_fingerprint` carries the SHA-256 digest of the DER encoding of the card's authentication certificate. A Requester compares it with the fingerprint of the certificates it holds for the pairing and, on any difference or when it holds none, reads the certificates afresh (§9) before offering anything; it never offers an identity whose fingerprint the Custodian has not confirmed on this session.
+   While `card_present` is true, `certificate_fingerprint` carries the SHA-256 digest of the Distinguished Encoding Rules (DER) encoding of the card's authentication certificate. A Requester compares it with the fingerprint of the certificates it holds for the pairing and, on any difference or when it holds none, reads the certificates afresh (§9) before offering anything; it never offers an identity whose fingerprint the Custodian has not confirmed on this session.
 3. **Offering Rule**:
    A Requester holds an open session to a pairing while it offers that pairing's credentials to local consumers, and withdraws the offer at once when the session ends for any reason or when `card.status` reports absence. It offers again when a later `card.status` reports presence. Discovery records (hierarchy specification §4.3) tell a Requester whom to dial; they never justify an offer.
 4. **Privacy**:
@@ -888,7 +888,7 @@ The profiles a pairing can grant (§4.3), and the actions of each:
 ### 9.2 Profile: `"fi.refineid.authentication"`
 - **`read_certificate`** (Safe Read):
   - Payload: `{"kind": "authentication"}`.
-  - Response: `certificate` (Distinguished Encoding Rules (DER)-encoded X.509 certificate bytes).
+  - Response: `certificate` (DER-encoded X.509 certificate bytes).
 - **`browser_authenticate`**:
   - Context: `origin` (`tstr .size (1..256)`, e.g. `"https://login.example.fi"`).
   - Payload:
@@ -952,7 +952,7 @@ No failure revokes a pairing. Pairings are revoked by their users (§4.6).
 
 ### 10.2 PIN Entry and the Retry Floor
 - **Retry floor (PIN 1 and PIN 2)**: Before any command that could decrement a PIN try counter, the Custodian reads the card's remaining attempts for that PIN. It sends the verification only while the card reports **at least 3** remaining. With 2, 1 or 0 remaining, or a counter it cannot read, it refuses without sending any verification command, answering `operation.result` with `status: "rejected"` and `error: "retry_floor"`, and tells the holder that the card's remaining attempts are reserved for the card issuer's software. RefineID therefore never consumes a card's last two attempts and can never block a PIN. RAPP defines no unblocking; a blocked card is unblocked with the PIN unblocking key (PUK) outside RAPP.
-- **Wrong PIN**: If the card rejects the PIN (`SW 63 Cx`), the Custodian tells the holder, with the attempts the card still allows, and prompts again, subject to the floor. The Requester learns nothing of it: an operation that needs a PIN ends only as `"completed"`, as `"rejected"` with `"user_cancelled"` or `"retry_floor"`, or as §8.1 says.
+- **Wrong PIN**: If the card rejects the PIN (status word (SW) `63 Cx`), the Custodian tells the holder, with the attempts the card still allows, and prompts again, subject to the floor. The Requester learns nothing of it: an operation that needs a PIN ends only as `"completed"`, as `"rejected"` with `"user_cancelled"` or `"retry_floor"`, or as §8.1 says.
 
 ### 10.3 Errors
 ```cddl
@@ -985,7 +985,7 @@ The same names appear in the `error` field of `operation.result`:
 1. **What the holder sees is what is signed**: The Custodian's screen shows the operation before the holder authorizes it. For authentication: the relying party's `origin`, the operation and the card holder's name. For document signing: the `document_name`, or the full list of names for a batch.
 2. **PIN 1 and PIN 2**: PIN 1 may be kept and reused on the Custodian as its own policy allows. PIN 2 is entered by the holder on the Custodian for every signature or batch; nothing signs unattended.
 3. **Documents stay home**: Document bytes and unhashed browser data never cross RAPP; the Requester hashes locally and sends the digest.
-4. **Secrets never on the wire**: PIN 1, PIN 2, the CAN and the PUK have no representation in any RAPP message and never traverse any transport. The Custodian presents them to the card itself; a Requester receives only the signature or the result.
+4. **Secrets never on the wire**: PIN 1, PIN 2, the card access number (CAN) and the PUK have no representation in any RAPP message and never traverse any transport. The Custodian presents them to the card itself; a Requester receives only the signature or the result.
 
 ---
 

@@ -86,7 +86,7 @@ The diagram shows the BLE profile; on the stream transport the Requester dials t
 ┌─────────────────────────────────────────────────────────────┐
 │                     REQUESTER (Central)                     │
 │  - Linux, macOS, or Windows Desktop/Laptop                  │
-│  - Takes the pairing code from keyboard or camera           │
+│  - Takes the pairing code from the keyboard                 │
 │  - Protocol engine (Noise session & operation)              │
 └──────────────────────────────┬──────────────────────────────┘
                                │

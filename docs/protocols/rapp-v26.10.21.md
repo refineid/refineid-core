@@ -641,42 +641,9 @@ The generator point $G$ is derived from the password-related string (PRS), the 6
   $$\text{session\_id} = \text{SHA-512}(\texttt{"RAPP-session-id-v1"} \parallel h)[0..16]$$
   and scopes every envelope of the session (§7). The ephemeral private keys are zeroized at once.
 
-### 6.4 Independent Standard Noise_KK Interoperability Test Vector
+### 6.4 Session Handshake Vectors
 
-The following normative test vector specifies the exact cryptographic transcript and intermediate values for `Noise_KK_25519_ChaChaPoly_SHA512` adhering strictly to Noise Protocol Framework Revision 34 and Section 6.3. Conforming implementations must produce byte-for-byte identical output for these inputs:
-
-- **Static Keypairs**:
-  - Initiator Static Private Key ($s_{i, priv}$): `1111111111111111111111111111111111111111111111111111111111111111`
-  - Initiator Static Public Key ($s_{i, pub}$): `7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13`
-  - Responder Static Private Key ($s_{r, priv}$): `2222222222222222222222222222222222222222222222222222222222222222`
-  - Responder Static Public Key ($s_{r, pub}$): `0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20`
-- **Ephemeral Keypairs**:
-  - Initiator Ephemeral Private Key ($e_{i, priv}$): `3333333333333333333333333333333333333333333333333333333333333333`
-  - Initiator Ephemeral Public Key ($e_{i, pub}$): `7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b14`
-  - Responder Ephemeral Private Key ($e_{r, priv}$): `4444444444444444444444444444444444444444444444444444444444444444`
-  - Responder Ephemeral Public Key ($e_{r, pub}$): `ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b`
-- **Session Prologue (§4.3)**:
-  - Input `pair_id`: `8ab9b8bcde5c6eec845d9b1ca0d3a7be` (16 bytes)
-  - Input `grants_hash`: `7777777777777777777777777777777777777777777777777777777777777777` (32 bytes)
-  - Input `transport_profile`: `"fi.refineid.rapp.ble.v1"`
-  - Encoded `prologue` (deterministic CBOR array, hex):
-    `866f524150502d73657373696f6e2d763183181a0a0a78204e6f6973655f4b4b5f32353531395f436861436861506f6c795f534841353132508ab9b8bcde5c6eec845d9b1ca0d3a7be582077777777777777777777777777777777777777777777777777777777777777777766692e726566696e6569642e726170702e626c652e7631`
-- **Handshake Wire Messages**:
-  - **Message 1** (`-> e, es, ss`, 48 bytes: 32 bytes $e_{i, pub} \parallel 16$ bytes empty payload tag):
-    `7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b149a63e73abf65ea4dec7a3df0025f5b6c`
-  - **Message 2** (`<- e, ee, se`, 48 bytes: 32 bytes $e_{r, pub} \parallel 16$ bytes empty payload tag):
-    `ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b518e03ebb38bc0cc00aad6d71427cdff`
-- **Handshake Completion & Split Output**:
-  - Final Handshake Hash ($h$, 64 bytes):
-    `b054428bd222f4590ede01fa9b58ae0a32a0eb9f209519cc2c682cd6c8fcd70686aa615b02b04c3c6945d356e8c0a25c3134c3b55e5f209be5c3d6ed75df4f70`
-  - Initiator-to-Responder Directional Transport Cipher Key ($c_1$, 32 bytes):
-    `271245e9b5ffc357a6d442e04a376531bd3a0f81d69d7b97eaa132cc81d209ab`
-  - Responder-to-Initiator Directional Transport Cipher Key ($c_2$, 32 bytes):
-    `f3364ea960fcb3b95518b6029e2fbac8d1f259e630fa53beb63cf647e672ca40`
-  - Operational Session Identifier (`session_id`, 16 bytes):
-    `78260a69cecd4931778e59a9e0d2de4e`
-
-This test vector is also cataloged under entry `"session-kk-fixed-transcript-ble"` in `docs/protocols/vectors/rapp-v26.10.21.json`, beside `"session-kk-fixed-transcript-stream"` for the stream transport profile (same keys, prologue naming `"fi.refineid.stream.v1"`).
+The entries `"session-kk-fixed-transcript-ble"` and `"session-kk-fixed-transcript-stream"` of `docs/protocols/vectors/rapp-v26.10.21.json` pin, for fixed static and ephemeral keys and a fixed session prologue, both handshake messages, the final handshake hash $h$, the directional keys $c_1$ and $c_2$ and the `session_id` of §6.3, one entry per transport profile. An implementation reproduces them byte for byte.
 
 ---
 

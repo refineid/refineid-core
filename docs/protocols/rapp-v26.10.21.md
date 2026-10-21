@@ -980,17 +980,12 @@ The same names appear in the `error` field of `operation.result`:
 
 ---
 
-## 11. User Experience and Consent Contract
+## 11. Consent and Secrets
 
-1. **Display of Authorized Intent on the Phone**:
-   - The Custodian screen acts as the authoritative human trust anchor.
-   - For authentication: Custodian displays relying-party origin (`origin`), operation type, and card holder name.
-   - For document signing: Custodian displays document name (`document_name`) or complete list of document names (batch signing) alongside hash summaries.
-2. **Conscious vs. Seamless Authorization**:
-   - **PIN 1 (Authentication)**: May use platform-cached authorization (e.g. biometric authentication or Secure Enclave session policy) if configured by user policy.
-   - **PIN 2 (Qualified Signing)**: Strictly mandates conscious, explicit human interaction on the phone screen for every signature or batch request. No automatic or unattended signing is permitted.
-3. **Document Secrecy**: Raw document bytes and unhashed browser data must never cross the RAPP protocol. Requester hashes all content locally before transmission.
-4. **Secrets Never on the Wire**: PIN 1, PIN 2, the CAN and the PUK have no representation in any RAPP message and never traverse any transport. The Custodian verifies them locally with the card; a Requester receives only the resulting signature or result.
+1. **What the holder sees is what is signed**: The Custodian's screen shows the operation before the holder authorizes it. For authentication: the relying party's `origin`, the operation and the card holder's name. For document signing: the `document_name`, or the full list of names for a batch.
+2. **PIN 1 and PIN 2**: PIN 1 may be kept and reused on the Custodian as its own policy allows. PIN 2 is entered by the holder on the Custodian for every signature or batch; nothing signs unattended.
+3. **Documents stay home**: Document bytes and unhashed browser data never cross RAPP; the Requester hashes locally and sends the digest.
+4. **Secrets never on the wire**: PIN 1, PIN 2, the CAN and the PUK have no representation in any RAPP message and never traverse any transport. The Custodian presents them to the card itself; a Requester receives only the signature or the result.
 
 ---
 

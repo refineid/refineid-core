@@ -410,7 +410,7 @@ A Custodian **withdraws** when it deliberately stops serving every stored pairin
 
 ### 4.6 Pairing Revocation
 
-An endpoint **revokes** a pairing when its user forgets it, when §10 requires it (Class 4), when the confirmation deadline of §4.3 item 4 passes, or when its peer tells it so. The record is marked revoked at once and serves nothing from then on. The peer is told with `session.close` carrying reason `"pairing_revoked"` (§7.1), so that it can forget the pairing on its side too:
+An endpoint **revokes** a pairing when its user forgets it, when §10 requires it (Class 4), when the confirmation deadline of §4.3 item 4 passes, or when its peer tells it so. The record is marked revoked at once and serves nothing from then on. Whichever endpoint revokes, Custodian or Requester, tells the other with `session.close` carrying reason `"pairing_revoked"` (§7.1), so that the peer forgets the pairing on its side too:
 
 1. **In Session**:
    If the revoking endpoint holds an open session to the peer, it sends the close at once.

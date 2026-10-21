@@ -1,6 +1,27 @@
 
 # cargo-vet imports lock
 
+[[publisher.encoding_rs]]
+version = "0.8.42"
+when = "2026-09-24"
+user-id = 4484
+user-login = "hsivonen"
+user-name = "Henri Sivonen"
+
+[[publisher.multiversion_no_op]]
+version = "1.0.0"
+when = "2026-07-30"
+user-id = 4484
+user-login = "hsivonen"
+user-name = "Henri Sivonen"
+
+[[publisher.unicode-width]]
+version = "0.2.2"
+when = "2025-10-06"
+user-id = 1139
+user-login = "Manishearth"
+user-name = "Manish Goregaokar"
+
 [[publisher.unicode-xid]]
 version = "0.2.6"
 when = "2024-09-19"
@@ -157,6 +178,26 @@ This crate is a single-file crate that does what it says on the tin. There are
 a few `unsafe` blocks related to utf-8 validation which are locally verifiable
 as correct and otherwise this crate is good to go.
 """
+
+[[audits.bytecode-alliance.audits.pkg-config]]
+who = "Pat Hickey <phickey@fastly.com>"
+criteria = "safe-to-deploy"
+version = "0.3.25"
+notes = "This crate shells out to the pkg-config executable, but it appears to sanitize inputs reasonably."
+
+[[audits.bytecode-alliance.audits.pkg-config]]
+who = "Alex Crichton <alex@alexcrichton.com>"
+criteria = "safe-to-deploy"
+delta = "0.3.26 -> 0.3.29"
+notes = """
+No `unsafe` additions or anything outside of the purview of the crate in this
+change.
+"""
+
+[[audits.bytecode-alliance.audits.pkg-config]]
+who = "Chris Fallin <chris@cfallin.org>"
+criteria = "safe-to-deploy"
+delta = "0.3.29 -> 0.3.32"
 
 [[audits.bytecode-alliance.audits.rustc_version]]
 who = "Alex Crichton <alex@alexcrichton.com>"
@@ -446,6 +487,33 @@ who = "David Cook <dcook@divviup.org>"
 criteria = "safe-to-deploy"
 delta = "2.5.0 -> 2.6.1"
 
+[[audits.mozilla.wildcard-audits.encoding_rs]]
+who = "Henri Sivonen <hsivonen@hsivonen.fi>"
+criteria = "safe-to-deploy"
+user-id = 4484 # Henri Sivonen (hsivonen)
+start = "2019-02-26"
+end = "2027-09-07"
+notes = "I, Henri Sivonen, wrote encoding_rs for Gecko and have reviewed contributions by others."
+aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
+
+[[audits.mozilla.wildcard-audits.multiversion_no_op]]
+who = "Henri Sivonen <hsivonen@hsivonen.fi>"
+criteria = "safe-to-deploy"
+user-id = 4484 # Henri Sivonen (hsivonen)
+start = "2026-07-30"
+end = "2027-08-06"
+notes = "I, Henri Sivonen, am the sole author of multiversion_no_op (which is a trivial crate)."
+aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
+
+[[audits.mozilla.wildcard-audits.unicode-width]]
+who = "Manish Goregaokar <manishsmail@gmail.com>"
+criteria = "safe-to-deploy"
+user-id = 1139 # Manish Goregaokar (Manishearth)
+start = "2019-12-05"
+end = "2026-02-01"
+notes = "All code written or reviewed by Manish"
+aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
+
 [[audits.mozilla.wildcard-audits.unicode-xid]]
 who = "Manish Goregaokar <manishsmail@gmail.com>"
 criteria = "safe-to-deploy"
@@ -539,6 +607,12 @@ aggregated-from = "https://raw.githubusercontent.com/mozilla/glean/main/supply-c
 who = "Erich Gubler <erichdongubler@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "2.0.0 -> 2.0.1"
+aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
+
+[[audits.mozilla.audits.arraydeque]]
+who = "Lars Eggert <lars@eggert.org>"
+criteria = "safe-to-deploy"
+version = "0.5.1"
 aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
 
 [[audits.mozilla.audits.askama]]
@@ -643,6 +717,12 @@ delta = "0.19.2 -> 0.23.1"
 notes = "Some dependency updates and very minor API changes.  No new unsafe code."
 aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
 
+[[audits.mozilla.audits.core_detect]]
+who = "Henri Sivonen <hsivonen@hsivonen.fi>"
+criteria = "safe-to-deploy"
+version = "1.0.0"
+aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
+
 [[audits.mozilla.audits.hex]]
 who = "Simon Friedberger <simon@mozilla.com>"
 criteria = "safe-to-deploy"
@@ -678,6 +758,18 @@ aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/mai
 who = "edgul <ed.guloien@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "2.3.1 -> 2.3.2"
+aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
+
+[[audits.mozilla.audits.pkg-config]]
+who = "Mike Hommey <mh+mozilla@glandium.org>"
+criteria = "safe-to-deploy"
+delta = "0.3.25 -> 0.3.26"
+aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
+
+[[audits.mozilla.audits.pkg-config]]
+who = "Max Inden <mail@max-inden.de>"
+criteria = "safe-to-deploy"
+delta = "0.3.32 -> 0.3.34"
 aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
 
 [[audits.mozilla.audits.quote]]
@@ -744,6 +836,13 @@ The bulk of this is https://github.com/RustCrypto/hashes/pull/490 which adds aar
 I didn't check the implementation thoroughly but there wasn't anything obviously nefarious. 0.10.8 has been out for more than a year
 which suggests no one else has found anything either.
 """
+aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
+
+[[audits.mozilla.audits.simdutf8]]
+who = "Henri Sivonen <hsivonen@hsivonen.fi>"
+criteria = "safe-to-deploy"
+version = "0.1.5"
+notes = "Confidence in correctness of the algorithm is based on fuzzing the SSE 4.2 and AVX2 implementations rather than working through the logic of the code. Audit of aarch64 and Wasm is by comparing the code with the SSE 4.2 case."
 aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
 
 [[audits.mozilla.audits.strsim]]

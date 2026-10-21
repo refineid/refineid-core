@@ -1,6 +1,6 @@
 # STPA of the Remote Authorization Proxy Protocol
 
-**Status:** Draft for owner review
+**Status:** Reviewed by the owner on 2026-10-22 with RAPP v26.10.21
 **Date:** 2026-10-18
 **Applies to:** RAPP v26.10.21 (`docs/protocols/rapp-v26.10.21.md`), the
 transport and discovery hierarchy, and the requester and custodian

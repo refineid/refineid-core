@@ -442,52 +442,15 @@ An endpoint **revokes** a pairing when its user forgets it, when §10 requires i
   * **Properties**: `Read` (`0x02`)
   * **Permissions**: Unauthenticated Readable (carries `encode_deterministic_cbor(pairing-offer)`).
 
-### 5.2 ATT Roles, Connection Setup, and Delivery Primitives
+### 5.2 ATT Roles and Connection Setup
 
-Under Bluetooth Core Specification v5.4, ATT roles are strictly asymmetric:
-- **Requester to Custodian (Client -> Server)**:
-  All messages must be transmitted exclusively using **`ATT_WRITE_REQ`** (Write With Response). The Custodian responds with `ATT_WRITE_RSP`.
-- **Custodian to Requester (Server -> Client)**:
-  All responses (CPace Step 2, Noise handshake replies, operational responses, signatures, and errors) must be transmitted exclusively using **`ATT_HANDLE_VALUE_IND`** (GATT Indication). The Requester acknowledges receipt with `ATT_HANDLE_VALUE_CFM`.
-- GATT Notifications (`ATT_HANDLE_VALUE_NTF`) and Characteristic Reads on the Channel Characteristic are strictly prohibited for protocol frame transport, guaranteeing strictly ordered, duplicate-free delivery.
-- **Outbound Backpressure & Flow Control**:
-  The transmitting endpoint maintains a first in, first out (FIFO) queue of fragments for the current frame. For indications, the Custodian transmits fragment $k$ and must not transmit fragment $k+1$ until `ATT_HANDLE_VALUE_CFM` is received. For writes, the Requester transmits fragment $k$ and must not transmit fragment $k+1$ until `ATT_WRITE_RSP` is received.
-- **At-Most-Once Operation Execution**:
-  If a connection drops during response transmission, smart card cryptographic operations must never be re-executed to re-generate or re-send lost responses. Operations are strictly at-most-once. The Requester must handle the disconnect/timeout error.
+The Requester is the GATT Client and the Custodian the GATT Server. Every fragment from Requester to Custodian is an `ATT_WRITE_REQ` (write with response) on the Channel Characteristic, answered by `ATT_WRITE_RSP`; every fragment from Custodian to Requester is an `ATT_HANDLE_VALUE_IND` (indication), answered by `ATT_HANDLE_VALUE_CFM`. Notifications and reads of the Channel Characteristic carry no protocol frame. Each direction has one fragment in flight: the next fragment is sent only after the answer to the previous one has arrived, which gives ordered, duplicate-free delivery.
 
-#### Mandatory Connection Setup Sequence:
-1. **ATT MTU Exchange**:
-   Immediately upon connection establishment, the Requester (GATT Client) must initiate an ATT MTU Exchange (`Exchange MTU Request`, opcode `0x02`) requesting an MTU of at least 515 bytes (giving a 512-byte ATT payload `maximumUpdateValueLength`).
-   If the resulting negotiated ATT MTU is $< 512$ bytes, the connection must be dropped immediately.
-   (Implementation note: On Linux with BlueZ, the client initiates MTU exchange on the connection socket/D-Bus channel; on iOS, CoreBluetooth manages peripheral MTU exchange automatically).
-2. **CCCD Indication Enablement**:
-   Immediately following MTU exchange and before transmitting the routing preamble, the Requester must write `0x0002` (Indications Enabled) to the Channel Characteristic CCCD (`0x2902`) via `ATT_WRITE_REQ`.
-   The Custodian must not accept routing preambles or emit Indications until Indications are enabled in the CCCD. If a preamble is received before CCCD enablement, the Custodian closes the connection.
-3. **Initial Connection Routing**:
-Every newly established BLE connection begins in **the Routing phase**.
-1. The Requester must transmit exactly one plaintext `ble-routing-preamble` preamble frame, the BLE instance of `routing-preamble` (§2.2.1), over the Channel Characteristic via `ATT_WRITE_REQ` (in a `SINGLE` SAR frame):
-   ```cddl
-   ble-routing-preamble = [
-     "RAPP-ble-v1",
-     tstr,                     ; purpose: "pairing" / "session"
-     bstr                      ; purpose "pairing": empty (bstr .size 0)
-                               ; purpose "session": session-routing (bstr .size 32, §2.2.1)
-   ]
-   ```
-2. The Custodian in the Routing phase decodes and evaluates the preamble:
-   - **Purpose `"pairing"`**:
-     - Verify the value is empty.
-     - Check if Custodian has an active pairing offer (within the 5-minute TTL).
-     - If active: the Requester reads the Bootstrap Characteristic (§4.2), and the connection transitions to **the CPace phase**.
-     - If no active offer exists: close connection immediately.
-   - **Purpose `"session"`**:
-     - Verify the value is 32 bytes.
-     - Route it per §2.2.1 against the non-revoked stored pairings and the replay memory.
-     - If routed: retrieve `pair_id`, `grants_hash`, and peer static public key, and transition connection to **the Noise session phase**.
-     - Otherwise: close connection immediately without altering any stored pairing.
-   - **Invalid Preamble**:
-     - Unknown purpose, malformed CBOR, a non-empty value for `"pairing"`, a value other than 32 bytes for `"session"`, oversized frame, or any non-preamble frame received in the Routing phase is pre-authentication invalid input: close connection immediately.
-3. Exactly one preamble frame is permitted per connection. Any preamble received after transitioning out of the Routing phase is an unrecoverable protocol violation. A routing tag never authenticates a caller; authentication is established exclusively by the subsequent Noise handshake.
+A connection is set up in this order:
+
+1. **MTU exchange**: The Requester requests an ATT MTU of at least 515 bytes. If the negotiated MTU is below 512 bytes, the connection is dropped.
+2. **Indications on**: The Requester writes `0x0002` to the Channel Characteristic's CCCD. Until then the Custodian accepts no preamble and sends no indication; a preamble that arrives before it closes the connection.
+3. **Routing**: The Requester sends the routing preamble of §2.2.1 with domain `"RAPP-ble-v1"` as a `SINGLE` SAR frame (§5.3). With purpose `"pairing"` and an active offer (§4.2), the Requester reads the Bootstrap Characteristic and the connection enters the CPace phase; with purpose `"session"`, the Custodian routes the tag as §2.2.1 says and the connection enters the Noise session phase. A `"pairing"` preamble with no active offer closes the connection.
 
 ### 5.3 BLE SAR Adaptation Layer
 
@@ -572,7 +535,7 @@ All RAPP messages over the Channel Characteristic must be encapsulated in the **
    - Noise Handshake & Transport Frames: raw Noise ciphertext payloads encapsulated in SAR frames (segmented across multiple chunks if payload exceeds $\text{sar\_payload\_capacity} = \min(\text{negotiated\_att\_mtu} - 3, 512) - 6$ bytes, e.g. $> 506$ bytes at MTU $\ge 515$, $> 503$ bytes at MTU 512).
 10. **Phase-Specific Frame Dispatch**:
    - Reassembled complete frames are dispatched strictly according to the internal connection state machine:
-     - the Routing phase: Dispatched to connection routing evaluator (Section 5.2).
+     - the Routing phase: Dispatched to the routing of §2.2.1.
      - the CPace phase: Dispatched to `CPaceRistretto255` handler.
      - the Noise pairing phase: Dispatched to `Noise_XXpsk3` pairing engine.
      - the Noise session phase: Dispatched to `Noise_KK` operational session engine.
@@ -641,7 +604,7 @@ The generator point $G$ is derived from length-value (LV) encoding with zero-pad
 1. **Initiator (Requester - Step 1)**:
    - Samples scalar $x_A \leftarrow \text{Scalar} \setminus \{0\}$ using either Option A or Option B.
    - Computes $Y_A = x_A \cdot G$. Encodes to 32 bytes via canonical Ristretto255 point compression.
-   - Transmits 32-byte $Y_A$ in CPace Step 1 as one transport frame (on BLE via `ATT_WRITE_REQ` in a `SINGLE` SAR frame).
+   - Transmits 32-byte $Y_A$ in CPace Step 1 as one transport frame.
 2. **Responder (Custodian - Step 2)**:
    - Receives $Y_A$, decodes and validates $Y_A \ne \mathcal{O}$ and canonical Ristretto255 element.
    - Atomically reserves attempt slot ($1 \le \text{attempts\_admitted} \le 3$, `active_attempt = true`).
@@ -661,7 +624,7 @@ The generator point $G$ is derived from length-value (LV) encoding with zero-pad
      $$K_B = \text{HKDF-Expand-SHA512}(PRK, \text{info} = \text{"RAPP-CPACE-CONFIRM-B-KEY-v2"}, L = 32)$$
    - Computes mutual confirmation authenticator $T_B$:
      $$T_B = \text{FIRST32}(\text{HMAC-SHA512}(\text{key} = K_B, \text{data} = \text{lv\_cat}([\text{"RAPP-CPACE-CONFIRM-B-v2"}, TH])))$$
-   - Transmits 64-byte $Y_B \parallel T_B$ in CPace Step 2 as one transport frame (on BLE via `ATT_HANDLE_VALUE_IND` in a `SINGLE` SAR frame).
+   - Transmits 64-byte $Y_B \parallel T_B$ in CPace Step 2 as one transport frame.
 3. **Key Confirmation (Requester - Step 3)**:
    - Requester receives $Y_B \parallel T_B$, decodes and validates $Y_B \ne \mathcal{O}$ and canonical point.
    - Computes shared point $K = x_A \cdot Y_B$. Verifies $K \ne \mathcal{O}$.
@@ -669,7 +632,7 @@ The generator point $G$ is derived from length-value (LV) encoding with zero-pad
    - Verifies $T_B$ in constant time against received 32-byte tag. Any mismatch immediately aborts the attempt and destroys temporary state.
    - Computes mutual confirmation authenticator $T_A$:
      $$T_A = \text{FIRST32}(\text{HMAC-SHA512}(\text{key} = K_A, \text{data} = \text{lv\_cat}([\text{"RAPP-CPACE-CONFIRM-A-v2"}, TH])))$$
-   - Transmits 32-byte $T_A$ in CPace Step 3 as one transport frame (on BLE via `ATT_WRITE_REQ` in a `SINGLE` SAR frame).
+   - Transmits 32-byte $T_A$ in CPace Step 3 as one transport frame.
 
 #### 6.1.4 Finalization, PSK Handoff, and Post-PAKE Lifecycles
 - Custodian receives and verifies $T_A$ in constant time within the clamped attempt deadline.
@@ -757,7 +720,7 @@ The generator point $G$ is derived from length-value (LV) encoding with zero-pad
      $$(ck, k) = \text{HKDF-SHA-512}(ck, DH(s_{priv}, rs_{pub}), 2)$$
      Cipher state rekeyed with $k$, sequence counter reset to 0.
   4. Handshake Payload: Empty ($\emptyset$). Initiator calls `EncryptAndHash("")` with $h$ as associated data, producing a 16-byte Poly1305 authentication tag appended to message buffer. Updates $h = \text{SHA-512}(h \parallel \text{tag})$.
-  **Total Message 1 Length**: $32 + 16 = 48\text{ bytes}$ (fits entirely in a single ATT Write Request frame without SAR fragmentation).
+  **Total Message 1 Length**: $32 + 16 = 48\text{ bytes}$, one transport frame.
 - **Message 1 Processing by Responder (Custodian)**:
   1. Reads 32 bytes $re_{pub}$. Validates non-zero point. Calls `MixHash(re_pub)`.
   2. `es`: Computes $DH(s_{priv}, re_{pub})$ (32 bytes). Calls `MixKey`:
@@ -776,7 +739,7 @@ The generator point $G$ is derived from length-value (LV) encoding with zero-pad
      $$(ck, k) = \text{HKDF-SHA-512}(ck, DH(e_{priv}, rs_{pub}), 2)$$
      Cipher state rekeyed with $k$, sequence counter reset to 0.
   4. Handshake Payload: Empty ($\emptyset$). Calls `EncryptAndHash("")` with $h$ as associated data, producing a 16-byte Poly1305 authentication tag appended to message buffer. Updates $h = \text{SHA-512}(h \parallel \text{tag})$.
-  **Total Message 2 Length**: $32 + 16 = 48\text{ bytes}$ (fits entirely in a single ATT Indication frame without SAR fragmentation).
+  **Total Message 2 Length**: $32 + 16 = 48\text{ bytes}$, one transport frame.
 - **Message 2 Processing by Initiator (Requester)**:
   1. Reads 32 bytes $re_{pub}$. Calls `MixHash(re_pub)`.
   2. `ee`: Computes ephemeral DH shared secret $DH(e_{priv}, re_{pub})$ (32 bytes, using initiator's ephemeral private key $e_{priv}$ and responder's ephemeral public key $re_{pub}$). Calls `MixKey`:

@@ -1072,3 +1072,137 @@ read it. H-5, H-6.
 | R-55 | The operation context names the computer and the program that asked, and never a relying party it cannot know; the phone shows the computer's name and the program, labelled as such, never as a site. As R-25 for the Unix slot. | UCA-58 |
 | R-56 | Residual, accepted by the usability consensus (section 3): with PIN 1 stored, a program on the computer that reaches the requester can make the card sign for authentication without a prompt. The requester narrows who can reach it to the user's own processes (Windows platform STPA), shows every authentication it relays in its own notification, and the phone records each one in its history with the computer and program that asked. | UCA-57 |
 | R-57 | The custodian's BLE peripheral admits `"session"` preambles and routes them as on the stream transport (§2.2.1), with one session per pairing (R-47). | UCA-59 |
+
+## 17. STPA of serving many computers from one card
+
+### 17.1 Scope
+
+A person pairs a card's phone with the computers they use -- a desktop,
+a laptop, a work machine -- and expects the card to work from any of
+them. The phone is the card's server; the computers are its clients.
+One phone serves many computers; each computer is bound to one phone. A
+computer paired to several phones is complexity we do not need and do
+not build. A computer runs more than one program that needs the card: on
+macOS the app that shows the identity and the extension that signs are
+separate processes. The card is one, and physical: the security boundary
+is that the holder takes it away. Within that, a paired computer is
+trusted; the protocol secures the channel and the consent, not an
+arbitrary quota of who may ask. This section covers the custodian
+serving several such clients over the stream transport. BLE, where a
+computer is a single central whose programs share one GATT link, is out
+of scope here; R-57 stands.
+
+### 17.2 The governing principle
+
+Never assume; always feed back. Every fact one controller needs about
+another -- the card is present, the card changed, the operation is
+queued, the prompt is shown, the result arrived -- is communicated, not
+inferred. Where a controller cannot know, it asks. Every state that is
+distinct in the implementation is distinct on the wire and to the user;
+none is collapsed, and none is hidden, because a vague state neither
+lets a human act nor lets an engineer debug. The incidents below are all
+one failure of this principle: a controller acted on a guess.
+
+### 17.3 Control structure
+
+The earlier model had one serving slot: the custodian served a single
+requester, and a second dialer was refused. Several computers, and the
+two programs of one computer, then raced for the slot, and the loser
+inferred from a dropped connection whether the phone, or the card, was
+there at all.
+
+The model here is one authenticated control loop per client session. The
+custodian is the controller of the card; each client holds its own
+session and its own feedback edge. The card is the single controlled
+process behind them, and operations on it are serialized by a queue and
+by the one consent prompt the holder answers.
+
+| Control action | Feedback that must be present |
+| :--- | :--- |
+| Client opens a session (any number per pairing) | Session established, and the card's presence and fingerprint at once (`card.status`, fingerprint proposed in §17.7) |
+| Card present / removed / replaced on the phone | `card.status` on **every** open session on change, carrying the authentication certificate's SHA-256 fingerprint |
+| Client requests an operation while the card is busy | That it is queued, not silence |
+| Holder is shown the consent prompt | `consent_shown` to the requesting client |
+| Operation completes, is rejected, or expires | The terminal result to the client, and the `operation.result_ack` the stamped spec already requires (§8.2) |
+
+### 17.4 Unsafe control actions
+
+- **UCA-60** The custodian serves one client and drops a competing
+  dialer with no feedback, so the loser cannot tell "busy" from "gone"
+  and re-dials at once; several clients then thrash and none is served.
+- **UCA-61** The custodian reports the card gone only on the session it
+  is serving, so other clients keep offering a card that has left.
+- **UCA-62** A requester keeps offering a cached certificate after its
+  session has closed, against the offering rule (§8.4 item 2), so a
+  consumer that re-queries is handed an identity the phone is no longer
+  serving.
+- **UCA-63** `card.status` carries presence as one bit and no identity,
+  so a requester cannot tell a replaced card from the same card and
+  offers the old card's certificate for the new card in the reader.
+- **UCA-64** A requester, and its user, is shown one state -- "phone
+  connected" -- for many distinct situations (card ready, card gone,
+  phone asleep, busy serving another, waiting on consent), so the human
+  cannot act and the behaviour cannot be diagnosed.
+- **UCA-65** A contact-reader card still in its slot is reported absent
+  because one exchange glitched, so the identity is withdrawn -- on the
+  wire to every client and on the phone's own screen -- in the middle of
+  a signature.
+
+### 17.5 Loss scenarios (observed 2026-10-21)
+
+All five were seen in one session serving a FreeBSD box, a Mac and a
+Windows machine from one iPhone with a reader card.
+
+- **The locked-out computer (UCA-60).** The Mac's session was refused
+  every two seconds while the phone served another peer; its log was an
+  unbroken run of `transportClosed`, and it showed "iPhone yhdistetty"
+  with no identity. Freeing the phone let it in at once -- proof it was
+  contention, not a dead phone. L-3.
+- **The stale certificate across a swap (UCA-61, UCA-63).** A login
+  failed with a non-revoked card after the card was changed on the
+  phone: the Mac offered the previous card's certificate, the extension
+  signed with the new card's key, and the signatures did not match the
+  offered certificate. L-1 for the user, who cannot log in.
+- **The offer that outlived its session (UCA-62).** Grace timers and a
+  cached certificate kept the Mac's offer published after its session
+  dropped, so Safari was handed an identity with no serving session
+  behind it.
+- **The collapsed state (UCA-64).** "iPhone yhdistetty," without even a
+  trailing stop, stood for every way the card was unavailable; the user
+  had nothing to act on. L-3.
+- **The identity that vanished at PIN entry (UCA-65).** On the iPhone's
+  own screen, entering PIN 1 for a remote signature blanked the holder's
+  identity, because a glitched exchange while the card sat in the reader
+  was read as the card being gone.
+
+### 17.6 Requirements
+
+| ID | Requirement | Closes |
+| :--- | :--- | :--- |
+| R-58 | The custodian serves every paired client concurrently: one authenticated session per client connection, as many under a pairing as the programs that need the card. This supersedes R-47's "one session per pairing" (never adopted -- UCA-60 is the single slot still in force) and keeps R-47's clause that a refusal is a close with a reason, never a silent drop. A paired client is trusted within the channel; there is no quota on sessions or operations. Stream transport; R-57 (BLE) stands. | UCA-60 |
+| R-59 | The card serves one whole request at a time: a request's card commands run start to finish before another request's begin, and commands from different sessions are never interleaved. Concurrent requests queue first-come-first-served, serialized by the one consent prompt, each bounded by a deadline that runs through suspension (R-6). A waiting client is told it is queued (no position), never left silent. Restates R-47's single-queue clause. | UCA-60 |
+| R-60 | `card.status` always carries the SHA-256 fingerprint of the card's authentication certificate (the X.509 certificate fingerprint), zeroed when no card is present so the message is one fixed size. A requester caches the certificate with its fingerprint, reuses it while the fingerprint matches, and re-reads (`read_certificate`) when it changes. | UCA-63 |
+| R-61 | Card presence and every change to it are sent on **every** open session, not only the one being served, so a removed or replaced card reaches all clients at once; `card.status` is sent on change, not polled, with the liveness heartbeat standing in between. A requester whose consumer re-queries (CryptoTokenKit, a browser chooser) offers the card only while a session is open and withdraws the instant the session closes, `card.status` reports absence, or the fingerprint changes. The PKCS#11 slot keeps R-46: its token stands on the cached certificate between sessions, because Firefox never re-asks once handed none. | UCA-61, UCA-62 |
+| R-62 | Every state distinct in the implementation is distinct on the wire and to the user: card ready, waiting on consent, queued, no card, phone unreachable. "Busy" and "gone" are never the same state, and no state is collapsed or hidden. Amends R-7. | UCA-64 |
+| R-63 | Presence is whether the custodian can serve the card on request, not whether the card is electrically connected at that instant, applied the same way to `card.status` on every session and to the custodian's own on-device display. A reader card is present while it is in the reader; a near-field card is present while it is primed and the holder can present it on request, the card summoned per operation. A glitched exchange, or a tap that did not complete, is a failed operation, not absence -- the identity stays. The card is absent only when the holder can no longer serve it: the reader card removed, or the near-field prime cleared. This supersedes section 8.4 item 1's marking the card absent on an unanswered operation. | UCA-65 |
+
+### 17.7 Wire changes these require
+
+For the owner to stamp as the next RAPP version, over the stream
+transport:
+
+- **Concurrent sessions.** The custodian accepts and keeps a session per
+  client connection; the single-session gate is removed. Pair keys are
+  unchanged; each session is its own Noise_KK handshake. A stale session
+  left by a crashed program ends by liveness (§7.1), not by a new dial
+  replacing "the" session, of which there is now no single one.
+- **Fingerprint in `card.status`.** Add `cert_fingerprint` (32-byte
+  SHA-256 of the DER authentication certificate) to the `card.status`
+  payload, always present, zeroed when `card_present` is false.
+- **`queued` feedback.** An `operation.progress` value `queued`, for a
+  request waiting on the card, alongside the existing `consent_shown`. No
+  position; `operation.status` (the reconciliation reply) is unchanged.
+
+No new identifiers are invented: the fingerprint is the standard X.509
+certificate fingerprint, the session is the client's identity, and the
+operation ID already carries across reconnects.

@@ -454,9 +454,7 @@ A connection is set up in this order:
 
 ### 5.3 BLE SAR Adaptation Layer
 
-While operational session handshake messages in `Noise_KK` are compact (Message 1 and Message 2 are each 48 bytes, fitting cleanly in single 512-byte ATT frames), upper-layer application envelopes (carrying X.509 certificate chains or document signing digests) frequently exceed 512 bytes and cannot be assumed to fit in a single ATT transaction.
-
-All RAPP messages over the Channel Characteristic must be encapsulated in the **RAPP BLE SAR Framing**:
+Every transport frame on the Channel Characteristic, the routing preamble, the CPace steps, the Noise handshake messages and the Noise transport frames alike, is carried as one SAR message: a 6-byte header in front of each fragment, one fragment per ATT write or indication. A frame that fits in one fragment is sent as `SINGLE`; a longer one is segmented into `FIRST`, `CONT` ... `LAST`.
 
 ```
  0                   1                   2                   3
@@ -468,78 +466,22 @@ All RAPP messages over the Channel Characteristic must be encapsulated in the **
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
-#### Field Definitions:
-- **Total Frame Length** (`u16`, 2 bytes, network byte order / big-endian): Total byte length of the complete RAPP message payload (excluding this 6-byte SAR header). Permitted range: $1..65{,}535$ bytes.
-- **Chunk Sequence** (`u16`, 2 bytes, network byte order / big-endian): 0-indexed sequence counter for fragments of the current message (`0, 1, 2, ...`). Permitted range: $0..1{,}023$.
-- **Flags** (`u8`, 1 byte):
-  - `0x01` (`FIRST`): Initial fragment of a multi-fragment frame.
-  - `0x02` (`CONT`): Intermediate fragment.
-  - `0x04` (`LAST`): Final fragment.
-  - `0x05` (`SINGLE` = `FIRST | LAST`): Self-contained single-fragment message (carrying payload $\le \text{sar\_payload\_capacity}$).
-  - All other bit patterns are illegal. Any message with non-zero reserved bits (bits 3–7) or illegal flag combinations (e.g., `0x00`, `0x03`, `0x06`, `0x07`) must be rejected as an unrecoverable protocol violation.
-- **Reserved** (`u8`, 1 byte): Must be set to `0x00`.
+- **Total Frame Length** (`u16`, big-endian): length of the whole frame without SAR headers, 1 to 65,535.
+- **Chunk Sequence** (`u16`, big-endian): index of this fragment within the frame, from 0, below 1,024.
+- **Flags** (`u8`): `0x01` `FIRST`, `0x02` `CONT`, `0x04` `LAST`, `0x05` `SINGLE` (`FIRST | LAST`). Any other value is a violation.
+- **Reserved** (`u8`): `0x00`.
 
-#### Normative SAR Receive State Machine with Invariant Total Length:
-1. **Capacity & MTU Requirement**: Negotiated ATT MTU must be $\ge 512$ bytes.
-   Per Bluetooth Core Specification v5.4, Vol 3, Part F, Section 3.2.9, any attribute value is hard-capped at 512 bytes. Accounting for the 3-byte ATT header and the 6-byte SAR header, the uniform maximum fragment payload capacity for all fragments (`FIRST`, `CONT`, `LAST`, `SINGLE`) is defined as:
-   $$\text{sar\_payload\_capacity} = \min(\text{negotiated\_att\_mtu} - 3, 512) - 6$$
-   Any smaller platform-reported usable value limit (e.g. `maximumUpdateValueLength`) must also be honored.
-   - At negotiated ATT MTU 512: $\min(509, 512) - 6 = 503\text{ bytes}$.
-   - At negotiated ATT MTU 515: $\min(512, 512) - 6 = 506\text{ bytes}$.
-   - At negotiated ATT MTU 517: $\min(514, 512) - 6 = 506\text{ bytes}$.
-   If negotiated ATT MTU $< 512$ bytes, the connection must be dropped immediately.
-2. **Initial Fragment Processing (Receiver Idle: `expected_seq == 0` and `accumulated_bytes == 0`)**:
-   - The fragment must have `flags == FIRST` (`0x01`) or `flags == SINGLE` (`0x05`), and `Chunk Sequence == 0`.
-   - Validate `Total Frame Length`:
-     - Range: $1 \le \text{Total Frame Length} \le 65{,}535$.
-     - For `SINGLE` (`flags == 0x05`): must satisfy $\text{Total Frame Length} == \text{fragment\_payload\_len} \le \text{sar\_payload\_capacity}$.
-     - For `FIRST` (`flags == 0x01`): must satisfy $64 \le \text{fragment\_payload\_len} \le \text{sar\_payload\_capacity}$ and $\text{fragment\_payload\_len} < \text{Total Frame Length}$.
-   - Latch `expected_total = fragment.total_frame_length`. This latched value is frozen for the duration of the frame.
-   - Arm non-extendable 5.0-second reassembly timer.
-3. **Subsequent Fragment Processing (`expected_seq > 0`)**:
-   - Flags must be `CONT` (`0x02`) or `LAST` (`0x04`). Any `FIRST` or `SINGLE` received while reassembly is in progress is an illegal transition: abort immediately, zeroize buffer, cancel timer, and close connection.
-   - Non-final chunks (`CONT`) must carry $\ge 64$ bytes.
-4. **Header Invariance & Sequence Check (Every Fragment)**:
-   - **Total Length Invariance**: The fragment's declared `Total Frame Length` must equal `expected_total` exactly:
-     $$\text{fragment.total\_frame\_length} == \text{expected\_total}$$
-     Any mismatch (increasing or decreasing declared total) must be rejected immediately before copying, zeroizing buffer, cancelling timer, and dropping connection.
-   - **Sequence Continuity**: `fragment.chunk_sequence == expected_seq`.
-   - **Sequence Bound**: `fragment.chunk_sequence < 1024`.
-   - Zero-payload chunks are forbidden: `fragment_payload_len > 0`.
-   - Any violation aborts immediately, zeroizes buffer, cancels timer, and drops connection.
-5. **Cumulative Length Pre-Copy Check**:
-   - Compute candidate accumulated bytes:
-     $$\text{new\_total} = \text{accumulated\_bytes} + \text{fragment\_payload\_len}$$
-   - Verify:
-     $$\text{new\_total} \le \text{expected\_total}$$
-   - If `new_total > expected_total`, reject before copying, zeroize buffer, cancel timer, and drop connection.
-6. **Buffer Copy & Counter Advance**:
-   - Copy `fragment_payload` into the reassembly buffer at offset `accumulated_bytes`.
-   - Advance counter: `accumulated_bytes = new_total`.
-7. **Completion & State Reset**:
-   - If `flags & LAST != 0` (i.e. `LAST` or `SINGLE`):
-     - Verify exact completion: $\text{accumulated\_bytes} == \text{expected\_total}$.
-     - If equal: cancel the 5.0-second timer, reset receiver state (`expected_seq = 0`, `accumulated_bytes = 0`, `expected_total = 0`), and pass the complete reassembled frame to the active phase engine.
-     - If unequal: reject, zeroize buffer, cancel timer, and close connection.
-   - If `flags & LAST == 0` (i.e. `FIRST` or `CONT`):
-     - Increment `expected_seq = expected_seq + 1`. Await next fragment.
-8. **Buffer Ownership & Pre-Authentication Limits**:
-   - Reassembly buffers are bound per BLE connection and direction.
-   - Custodian permits at most 1 concurrent pre-authentication connection (single-flight peripheral serialization).
-   - If reassembly does not complete within the 5.0-second timer, buffer is zeroized and connection is dropped.
-9. **Wire Framing of Channel Messages**:
-   - Routing Preamble: deterministic CBOR `["RAPP-ble-v1", purpose, routing]` encapsulated in a `SINGLE` SAR frame.
-   - CPace Step 1 ($Y_A$): raw 32 bytes of compressed Ristretto255 point $Y_A$ encapsulated in a `SINGLE` SAR frame (`Total Frame Length = 32`, `Chunk Sequence = 0`, `Flags = 0x05`).
-   - CPace Step 2 ($Y_B, T_B$): raw concatenation $Y_B \parallel T_B$ ($32 + 32 = 64\text{ bytes}$) encapsulated in a `SINGLE` SAR frame (`Total Frame Length = 64`, `Chunk Sequence = 0`, `Flags = 0x05`).
-   - CPace Step 3 ($T_A$): raw 32 bytes of confirmation authenticator $T_A$ encapsulated in a `SINGLE` SAR frame (`Total Frame Length = 32`, `Chunk Sequence = 0`, `Flags = 0x05`).
-   - Noise Handshake & Transport Frames: raw Noise ciphertext payloads encapsulated in SAR frames (segmented across multiple chunks if payload exceeds $\text{sar\_payload\_capacity} = \min(\text{negotiated\_att\_mtu} - 3, 512) - 6$ bytes, e.g. $> 506$ bytes at MTU $\ge 515$, $> 503$ bytes at MTU 512).
-10. **Phase-Specific Frame Dispatch**:
-   - Reassembled complete frames are dispatched strictly according to the internal connection state machine:
-     - the Routing phase: Dispatched to the routing of §2.2.1.
-     - the CPace phase: Dispatched to `CPaceRistretto255` handler.
-     - the Noise pairing phase: Dispatched to `Noise_XXpsk3` pairing engine.
-     - the Noise session phase: Dispatched to `Noise_KK` operational session engine.
-   - Handlers NEVER select dispatch targets based on unauthenticated payload inspection. Any frame arriving out of expected phase is an unrecoverable protocol violation.
+The fragment payload holds at most
+$$\text{sar\_payload\_capacity} = \min(\text{negotiated\_att\_mtu} - 3, 512) - 6$$
+bytes, since an attribute value is at most 512 bytes (Bluetooth Core Specification v5.4, Vol 3, Part F, Section 3.2.9) and the ATT header takes 3: 506 bytes at an MTU of 515 or more. A smaller limit the platform reports, such as `maximumUpdateValueLength`, is honored instead.
+
+The receiver keeps `expected_total`, `expected_seq` and `accumulated_bytes` per connection and direction, all zero when idle. Every violation below zeroizes the buffer, cancels the timer and closes the connection.
+
+1. **Idle receiver**: the fragment is `FIRST` or `SINGLE` with sequence 0. For `SINGLE` the payload length equals Total Frame Length and is at most the capacity; for `FIRST` the payload is 64 bytes to the capacity and shorter than Total Frame Length. The receiver latches `expected_total` and arms a 5-second timer that is never extended; its expiry is a violation.
+2. **In progress**: the fragment is `CONT` or `LAST`, its Total Frame Length equals `expected_total`, its sequence equals `expected_seq`, its payload is at most the capacity, at least 64 bytes for `CONT` and at least 1 byte for `LAST`, and `accumulated_bytes` plus the payload is at most `expected_total`.
+3. **Advance**: the payload is appended and `accumulated_bytes` advanced. On `LAST` or `SINGLE`, `accumulated_bytes` must now equal `expected_total`; the timer is cancelled, the state reset and the frame handed to the phase the connection is in. Otherwise `expected_seq` is incremented.
+
+A reassembled frame goes to the handler of the phase the connection is in, the Routing phase (§2.2.1), the CPace phase (§6.1), the Noise pairing phase (§6.2) or the Noise session phase (§6.3). The payload never selects the handler; a frame in the wrong phase is a violation.
 
 ---
 

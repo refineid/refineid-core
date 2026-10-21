@@ -925,7 +925,7 @@ section analyses a
 design before it is built: a browser on a Windows computer logs in to
 kortti.tunnistautuminen.suomi.fi with the card of a paired iPhone,
 while the iPhone has Wi-Fi and cellular data turned off, so the only
-bearer is BLE (`"fi.refineid.rapp.ble.v1"`, RAPP v26.10.18 §5). On the
+bearer is BLE (`"fi.refineid.rapp.ble"`, RAPP v26.10.18 §5). On the
 first run the card sits in a contact reader wired to the iPhone, so the
 near-field behaviour of section 12 is out of the path. The Windows
 computer's own controllers, the browser, CNG, the key storage provider

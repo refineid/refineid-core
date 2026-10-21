@@ -92,11 +92,11 @@ Bluetooth (BLE)
 
 ### 3.1 Apple-to-Apple Direct (the stream profile over the peer-to-peer link)
 - **Applicability**: Exclusively between Apple devices (iPhone Custodian ↔ Mac Requester).
-- **Underlay**: The stream profile (`fi.refineid.stream.v1`, §3.2) carried by `Network.framework` over Apple Wireless Direct Link (AWDL): the Custodian's listener and the Requester's browser both enable peer-to-peer, so the same TCP stream, framing and routing preamble reach the phone without an access point or shared router.
+- **Underlay**: The stream profile (`fi.refineid.stream`, §3.2) carried by `Network.framework` over Apple Wireless Direct Link (AWDL): the Custodian's listener and the Requester's browser both enable peer-to-peer, so the same TCP stream, framing and routing preamble reach the phone without an access point or shared router.
 - **Properties**: Operates over peer-to-peer Wi-Fi without requiring an external access point or shared router. Provides hardware-accelerated direct proximity with minimal latency and high power efficiency.
 - **Priority**: First choice whenever both peers are Apple devices.
 
-### 3.2 Local IP Stream via mDNS / DNS-SD (`fi.refineid.stream.v1`)
+### 3.2 Local IP Stream via mDNS / DNS-SD (`fi.refineid.stream`)
 - **Applicability**: The cross-platform path whenever the devices share a local IP network; the default outside Apple-to-Apple.
 - **Underlay**: Single reliable ordered byte stream (TCP) over local IP.
 - **Discovery Standard**: IETF Multicast DNS ([RFC 6762](https://www.rfc-editor.org/rfc/rfc6762.html)) and DNS-Based Service Discovery ([RFC 6763](https://www.rfc-editor.org/rfc/rfc6763.html)).
@@ -104,12 +104,12 @@ Bluetooth (BLE)
   - Custodian runs `StreamRelayListener` on a dynamic, ephemeral TCP port (`bind(0)`).
   - Custodian advertises service type `_refineid-stream._tcp.local.` via mDNS.
   - Requester runs `StreamRelayBrowser`, receives the PTR (pointer), SRV (service) and text (TXT) (text) records, and initiates an **outbound** TCP `connect()` to the phone's advertised IP and port.
-- **Wire Profile**: Governed normatively by RAPP v26.10.21 §2.2.2. Each frame is a 2-byte unsigned big-endian length followed by 1 to 65535 payload bytes. The Requester's first frame is the routing preamble `["RAPP-stream-v1", purpose, routing]` (RAPP v26.10.21 §2.2.1). After a `"pairing"` preamble the Custodian's first frame is the encoded `pairing-offer` (§4.2); after a `"session"` preamble the Custodian routed the Requester sends `Noise_KK` message 1.
+- **Wire Profile**: Governed normatively by RAPP v26.10.21 §2.2.2. Each frame is a 2-byte unsigned big-endian length followed by 1 to 65535 payload bytes. The Requester's first frame is the routing preamble `["RAPP-stream", purpose, routing]` (RAPP v26.10.21 §2.2.1). After a `"pairing"` preamble the Custodian's first frame is the encoded `pairing-offer` (§4.2); after a `"session"` preamble the Custodian routed the Requester sends `Noise_KK` message 1.
 
-### 3.3 Bluetooth / BLE Proximity Transport (`fi.refineid.rapp.ble.v1`)
+### 3.3 Bluetooth / BLE Proximity Transport (`fi.refineid.rapp.ble`)
 - **Applicability**: The last resort: a proximity transport for when no IP network is shared (no Wi-Fi, a virtual machine or container without a usable network, no router), across supported platforms (iOS, Android, Linux/BSD, Windows, macOS).
 - **Normative Specification**: Governed normatively by RAPP v26.10.21 §2–§5.
-- **Wire Profile**: The canonical cross-platform wire profile is GATT-based `fi.refineid.rapp.ble.v1`:
+- **Wire Profile**: The canonical cross-platform wire profile is GATT-based `fi.refineid.rapp.ble`:
   - Primary Service Universally Unique Identifier (UUID): `7E39FD01-A6B5-4D78-9E11-37E28E9545F1`
   - Channel Characteristic UUID: `7E39FD02-A6B5-4D78-9E11-37E28E9545F1` (Requester writes via `ATT_WRITE_REQ`; Custodian indicates via `ATT_HANDLE_VALUE_IND`)
   - Bootstrap Characteristic UUID: `7E39FD03-A6B5-4D78-9E11-37E28E9545F1` (Requester reads via `ATT_READ_REQ`)
@@ -117,7 +117,7 @@ Bluetooth (BLE)
 - **Platform Capability Constraints & Logical Link Control and Adaptation Protocol (L2CAP) CoC Distinction**:
   - Windows 10/11 user-space APIs (WinRT `Windows.Devices.Bluetooth.GenericAttributeProfile`) support GATT, but provide no public user-space application programming interface (API) for BLE L2CAP Connection-Oriented Channels (CoC).
   - Linux BlueZ supports GATT over D-Bus without requiring raw socket capabilities.
-  - L2CAP CoC is NOT wire-compatible with GATT and cannot share the `fi.refineid.rapp.ble.v1` profile identifier. If a credit-based L2CAP CoC transport is introduced in the future, it must be specified as a separate, distinct profile (e.g. `fi.refineid.rapp.ble-coc.v1`) with explicit PSM discovery via GATT, platform capability tests, and independent qualification.
+  - L2CAP CoC is NOT wire-compatible with GATT and cannot share the `fi.refineid.rapp.ble` profile identifier. If a credit-based L2CAP CoC transport is introduced in the future, it must be specified as a separate, distinct profile (e.g. `fi.refineid.rapp.ble-coc.v1`) with explicit PSM discovery via GATT, platform capability tests, and independent qualification.
 
 ---
 
@@ -167,7 +167,7 @@ The Custodian publishes three distinct discovery modes:
      To avoid trial connections in high-density enterprise environments with multiple active Custodians, the Custodian publishes truncated, rotating HMAC hints for the 4 most recently used stored pairings (use time and tie order as for withdrawn records, RAPP v26.10.21 §4.5):
      $$\text{hint}_i = \text{first 8 bytes of }\text{HMAC-SHA-256}(K_{\text{disc}, i}, \text{epoch\_be64})$$
      where:
-     - $K_{\text{disc}, i}$ = HKDF-SHA-256 ([RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html)) with salt $\text{pair\_id}_i$, input keying material the pairing's static X25519 agreement, $\text{info} = $ `"RAPP-discovery-hint-v2"` (ASCII), and $L = 32$ (RAPP v26.10.21 §4.3).
+     - $K_{\text{disc}, i}$ = HKDF-SHA-256 ([RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html)) with salt $\text{pair\_id}_i$, input keying material the pairing's static X25519 agreement, $\text{info} = $ `"RAPP-discovery-hint"` (ASCII), and $L = 32$ (RAPP v26.10.21 §4.3).
      - $\text{epoch} = \lfloor \text{unix\_time} / 900 \rfloor$ (15-minute rotation window), and $\text{epoch\_be64}$ is that value as an unsigned 64-bit big-endian integer (8 bytes), the entire HMAC message.
      - TXT Attribute: `hints=` followed by at most 4 hints, each 16 lowercase hexadecimal digits, separated by commas without spaces (e.g. `hints=054526c9fdd3b180`).
      - The `discovery_hint` vectors of `vectors/rapp-routing-v26.10.21.json` pin the bytes.
@@ -211,8 +211,8 @@ To maintain clean, unobtrusive operation on enterprise and personal workstations
 
 | Repository | Platform Role | Discovery / Transport Actions Required |
 | :--- | :--- | :--- |
-| **`refineid-core`** | Protocol Core | Standardize 3-tier hierarchy and update `fi.refineid.stream.v1` stream profile framing to designate Custodian as listener and Requester as dialer. Define RFC 8882 discovery token formats and rotation. |
+| **`refineid-core`** | Protocol Core | Standardize 3-tier hierarchy and update `fi.refineid.stream` stream profile framing to designate Custodian as listener and Requester as dialer. Define RFC 8882 discovery token formats and rotation. |
 | **`refineid-unix`** | Requester (Linux, BSD) | Keep `pcscd` default; implement outbound `StreamRelayBrowser` using native mDNS (`avahi` / `systemd-resolved`); provide graphical user interface (GUI) toggle in `refineid-gui-fltk`; maintain zero open listening ports. |
 | **`refineid-windows`** | Requester (Windows 10/11) | Remove `FirewallService.cs` and inbound TCP listener (port 47110); implement outbound `StreamRelayBrowser` using supported `Windows.Devices.Enumeration` or Win32 `DnsServiceBrowse`; add explicit opt-in toggle in `RefineID-winui`. |
 | **`refineid-apple`** | Custodian (iOS) & Requester (macOS) | Implement the Apple-to-Apple direct transport `NWListener(includePeerToPeer: true)` / `NWBrowser` direct peer-to-peer (P2P) for Apple-to-Apple; maintain `StreamRelayListener` on iOS gated by "Allow Remote Reader" setting; adhere to RFC 8882 ephemeral discovery names. |
-| **`refineid-android`** | Custodian (Android) | Maintain `StreamRelayListener` (`_refineid-stream._tcp` via `NsdManager`) gated by "Allow Remote Reader" setting; support BLE peripheral GATT `fi.refineid.rapp.ble.v1`. |
+| **`refineid-android`** | Custodian (Android) | Maintain `StreamRelayListener` (`_refineid-stream._tcp` via `NsdManager`) gated by "Allow Remote Reader" setting; support BLE peripheral GATT `fi.refineid.rapp.ble`. |

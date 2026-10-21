@@ -96,7 +96,6 @@ actions:
   show_connection_stopped: "expose the Connection stopped visible state"
   show_revoked: "expose the Pairing revoked visible state"
   close_session: "raise close_requested_by_pairing for the live session instance"
-  retain_revocation_key: "derive and retain the pairing's revocation key before its static keys are destroyed, so the revocation can be announced"
   revoke_unconfirmed_pair_record: "revoke the stored record the peer never confirmed, leaving its tombstone"
   destroy_pair_keys: "erase pair static keys from the platform key store"
   destroy_relay_tokens: "erase pair-specific rendezvous tokens"
@@ -254,12 +253,12 @@ pairing:
       event: denied_aborted_or_timed_out
       role: both
       to: unpaired
-      actions: [retain_revocation_key, revoke_unconfirmed_pair_record, destroy_pair_keys, clear_pair_metadata, close_candidate]
+      actions: [revoke_unconfirmed_pair_record, destroy_pair_keys, clear_pair_metadata, close_candidate]
     - from: storage_confirming
       event: authenticated_protocol_violation   # the peer's pairing.stored names another pairing
       role: both
       to: revoked
-      actions: [retain_revocation_key, destroy_pair_keys, close_candidate, show_revoked]
+      actions: [destroy_pair_keys, close_candidate, show_revoked]
     - from: confirming
       event: denied_aborted_or_timed_out
       role: both
@@ -280,30 +279,30 @@ pairing:
       role: both
       guard: local_user_action
       to: unpaired
-      actions: [retain_revocation_key, destroy_pair_keys, destroy_relay_tokens, clear_pair_metadata]
+      actions: [destroy_pair_keys, destroy_relay_tokens, clear_pair_metadata]
     - from: paired_connected
       event: forget_pairing
       role: both
       guard: local_user_action
       to: unpaired
-      actions: [send_close_best_effort, close_session, retain_revocation_key, destroy_pair_keys, destroy_relay_tokens, clear_pair_metadata]
+      actions: [send_close_best_effort, close_session, destroy_pair_keys, destroy_relay_tokens, clear_pair_metadata]
     - from: paired_connected
       event: authenticated_protocol_violation
       role: both
       to: revoked
-      actions: [send_close_best_effort, close_session, retain_revocation_key, destroy_pair_keys, show_revoked]
+      actions: [send_close_best_effort, close_session, destroy_pair_keys, show_revoked]
     - from: paired_connected
       event: local_revoke
       role: both
       guard: local_user_action
       to: revoked
-      actions: [send_close_best_effort, close_session, retain_revocation_key, destroy_pair_keys, show_revoked]
+      actions: [send_close_best_effort, close_session, destroy_pair_keys, show_revoked]
     - from: paired_disconnected
       event: local_revoke
       role: both
       guard: local_user_action
       to: revoked
-      actions: [retain_revocation_key, destroy_pair_keys, show_revoked]
+      actions: [destroy_pair_keys, show_revoked]
     - from: paired_connected
       event: peer_revocation_notice     # produced by peer_close_received with reason pairing_revoked or protocol_violation
       role: both
@@ -440,7 +439,7 @@ session:
       event: credential_rejected        # produced by operation action request_session_close_credential_rejected
       role: proxy
       to: closing
-      actions: [retain_revocation_key, destroy_pair_keys, show_revoked, send_close_best_effort, show_disconnecting]
+      actions: [destroy_pair_keys, show_revoked, send_close_best_effort, show_disconnecting]
     - from: [healthy, checking]
       event: card_completion_ambiguous
       role: proxy

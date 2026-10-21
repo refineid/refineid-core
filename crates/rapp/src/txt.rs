@@ -30,10 +30,6 @@ pub const VERSION: &str = "1";
 /// TXT key naming the discovery mode.
 pub const MODE_KEY: &str = "mode";
 
-/// TXT key carrying the revocation announcement of a `mode=session` record
-/// (RAPP v26.10.21 section 4.6).
-pub const REVOKED_KEY: &str = "revoked";
-
 /// Separator between hint-list entries.
 pub const ENTRY_SEPARATOR: char = ',';
 

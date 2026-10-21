@@ -374,9 +374,6 @@ pub enum Action {
     SendCloseBestEffort(CloseReason),
     /// Close the active session.
     CloseSession,
-    /// Derive and retain the revocation key before the pair keys are
-    /// destroyed.
-    RetainRevocationKey,
     /// Revoke the stored record the peer never confirmed, leaving its
     /// tombstone (section 4.3 item 4).
     RevokeUnconfirmedPairRecord,
@@ -677,7 +674,6 @@ impl PairingState {
             (Self::StorageConfirming, E::DeniedAbortedOrTimedOut) => Transition {
                 state: Self::Unpaired,
                 actions: &[
-                    A::RetainRevocationKey,
                     A::RevokeUnconfirmedPairRecord,
                     A::DestroyPairKeys,
                     A::ClearPairMetadata,
@@ -686,12 +682,7 @@ impl PairingState {
             },
             (Self::StorageConfirming, E::AuthenticatedProtocolViolation) => Transition {
                 state: Self::Revoked,
-                actions: &[
-                    A::RetainRevocationKey,
-                    A::DestroyPairKeys,
-                    A::CloseCandidate,
-                    A::ShowRevoked,
-                ],
+                actions: &[A::DestroyPairKeys, A::CloseCandidate, A::ShowRevoked],
             },
             (Self::Confirming, E::DeniedAbortedOrTimedOut) => Transition {
                 state: Self::Unpaired,
@@ -715,7 +706,6 @@ impl PairingState {
                 Transition {
                     state: Self::Unpaired,
                     actions: &[
-                        A::RetainRevocationKey,
                         A::DestroyPairKeys,
                         A::DestroyRelayTokens,
                         A::ClearPairMetadata,
@@ -729,7 +719,6 @@ impl PairingState {
                     actions: &[
                         A::SendCloseBestEffort(CloseReason::PairingRevoked),
                         A::CloseSession,
-                        A::RetainRevocationKey,
                         A::DestroyPairKeys,
                         A::DestroyRelayTokens,
                         A::ClearPairMetadata,
@@ -741,7 +730,6 @@ impl PairingState {
                 actions: &[
                     A::SendCloseBestEffort(CloseReason::ProtocolViolation),
                     A::CloseSession,
-                    A::RetainRevocationKey,
                     A::DestroyPairKeys,
                     A::ShowRevoked,
                 ],
@@ -753,7 +741,6 @@ impl PairingState {
                     actions: &[
                         A::SendCloseBestEffort(CloseReason::PairingRevoked),
                         A::CloseSession,
-                        A::RetainRevocationKey,
                         A::DestroyPairKeys,
                         A::ShowRevoked,
                     ],
@@ -763,7 +750,7 @@ impl PairingState {
                 require(guards.user_initiated)?;
                 Transition {
                     state: Self::Revoked,
-                    actions: &[A::RetainRevocationKey, A::DestroyPairKeys, A::ShowRevoked],
+                    actions: &[A::DestroyPairKeys, A::ShowRevoked],
                 }
             }
             (Self::PairedConnected, E::PeerRevocationNotice) => Transition {
@@ -954,7 +941,6 @@ impl SessionState {
                 Transition {
                     state: Self::Closing,
                     actions: &[
-                        A::RetainRevocationKey,
                         A::DestroyPairKeys,
                         A::ShowRevoked,
                         A::SendCloseBestEffort(CloseReason::CredentialRejected),
@@ -1384,7 +1370,6 @@ impl RappState {
                     self.session = SessionState::Closing;
                 }
                 self.pairing = PairingState::Revoked;
-                actions.push(Action::RetainRevocationKey);
                 actions.push(Action::DestroyPairKeys);
                 actions.push(Action::ShowRevoked);
             }
@@ -1392,7 +1377,6 @@ impl RappState {
                 self.pairing = PairingState::Revoked;
                 self.session = SessionState::Closed;
                 actions.extend([
-                    Action::RetainRevocationKey,
                     Action::DestroyPairKeys,
                     Action::CloseCandidate,
                     Action::ShowRevoked,
@@ -1459,7 +1443,6 @@ impl RappState {
             Action::RemoveRejectedCredentialAndDerivedState,
             Action::SendResultCredentialRejectedBestEffort,
             Action::RevokePairAfterCredentialRejection,
-            Action::RetainRevocationKey,
             Action::DestroyPairKeys,
             Action::ShowRevoked,
         ];

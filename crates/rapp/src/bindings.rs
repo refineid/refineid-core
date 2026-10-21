@@ -2288,70 +2288,6 @@ impl RappPairRecord {
         ))
     }
 
-    /// This pairing's revocation hint for the advertised service instance
-    /// `instance_name` in the 15-minute window containing
-    /// `unix_time_seconds` (RAPP section 4.6).
-    ///
-    /// # Errors
-    /// [`RappBindingError::InvalidInput`] on an instance name that is not the
-    /// instance portion of the published name, or a degenerate static
-    /// agreement, and [`RappBindingError::WrongPhase`] when the record was
-    /// revoked.
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "uniffi lowers exported arguments as owned values"
-    )]
-    pub fn revocation_hint(
-        &self,
-        instance_name: String,
-        unix_time_seconds: u64,
-    ) -> Result<Vec<u8>, RappBindingError> {
-        let instance =
-            super::InstanceName::new(&instance_name).map_err(|_| RappBindingError::InvalidInput)?;
-        let key = self.revocation_key()?;
-        Ok(key
-            .hint(&instance, super::discovery_epoch(unix_time_seconds))
-            .to_vec())
-    }
-
-    /// Whether the TXT attributes `txt` discovered on the service instance
-    /// `instance_name` form a `mode=session` record whose `revoked`
-    /// announcement carries this pairing's hint for the window containing
-    /// `unix_time_seconds` or an adjacent one (RAPP section 4.6): a verified
-    /// revocation, after which the caller revokes its own record. A
-    /// malformed record or instance name is `false`.
-    ///
-    /// # Errors
-    /// [`RappBindingError::InvalidInput`] on a degenerate static agreement,
-    /// and [`RappBindingError::WrongPhase`] when the record was revoked.
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "uniffi lowers exported arguments as owned values"
-    )]
-    pub fn matches_revoked_record(
-        &self,
-        instance_name: String,
-        txt: Vec<RappTxtEntry>,
-        unix_time_seconds: u64,
-    ) -> Result<bool, RappBindingError> {
-        let Ok(instance) = super::InstanceName::new(&instance_name) else {
-            return Ok(false);
-        };
-        let pairs: Vec<(&str, &str)> = txt
-            .iter()
-            .map(|entry| (entry.key.as_str(), entry.value.as_str()))
-            .collect();
-        let Ok(record) = super::DiscoveryRecord::parse(&pairs) else {
-            return Ok(false);
-        };
-        let key = self.revocation_key()?;
-        Ok(key.matches(
-            &record,
-            &instance,
-            super::discovery_epoch(unix_time_seconds),
-        ))
-    }
-
     /// Read non-secret metadata suitable for confirmation and connection UI.
     ///
     /// # Errors
@@ -2434,14 +2370,8 @@ impl RappPairRecord {
 
     /// Irreversibly delete active secret material and retain only a local
     /// tombstone. The in-memory private key is dropped only after the vault
-    /// confirms deletion.
-    ///
-    /// Returns what the custodian keeps to announce the revocation (RAPP
-    /// section 4.6): an opaque encoded retention for the platform to store
-    /// beside its tombstones and pass to [`rapp_session_record`] for thirty
-    /// days, with `revoked_at_ms` as milliseconds since the Unix epoch. `None`
-    /// when the pairing's static agreement is degenerate, which is never
-    /// announced.
+    /// confirms deletion; `revoked_at_ms` is milliseconds since the Unix
+    /// epoch.
     ///
     /// # Errors
     /// [`RappBindingError`] on an already-revoked record or a storage
@@ -2454,28 +2384,18 @@ impl RappPairRecord {
         &self,
         vault: Arc<dyn RappPairVault>,
         revoked_at_ms: u64,
-    ) -> Result<Option<Vec<u8>>, RappBindingError> {
+    ) -> Result<(), RappBindingError> {
         let mut record = self
             .record
             .lock()
             .map_err(|_| RappBindingError::LocalStateFailure)?;
         let active = record.as_ref().ok_or(RappBindingError::WrongPhase)?;
         let pair_id = active.pair_id();
-        let retention = super::RevocationRetention::derive(active, revoked_at_ms)
-            .ok()
-            .map(|retention| super::encode_revocation_retention(&retention))
-            .transpose()
-            .map_err(|_| RappBindingError::ProtocolFailure)?;
         vault
             .revoke_device_only(pair_id.as_bytes().to_vec(), revoked_at_ms)
             .map_err(|_| RappBindingError::LocalStateFailure)?;
         record.take();
-        drop(record);
-        // The encoded retention carries the revocation key. Its bytes are
-        // moved, not copied, into the returned value, so this is the one
-        // copy that leaves the crate: the caller owns it and protects it
-        // like the record it replaces.
-        Ok(retention.map(|mut bytes| core::mem::take(&mut *bytes)))
+        Ok(())
     }
 }
 
@@ -3105,12 +3025,6 @@ impl RappPairRecord {
             })
         })
     }
-
-    fn revocation_key(&self) -> Result<super::RevocationKey, RappBindingError> {
-        self.with_record(|record| {
-            super::RevocationKey::derive(record).map_err(|_| RappBindingError::InvalidInput)
-        })
-    }
 }
 
 /// One DNS-SD TXT attribute, key and value.
@@ -3160,19 +3074,10 @@ fn txt_entries(entries: impl IntoIterator<Item = (&'static str, String)>) -> Vec
 
 /// The TXT attributes of a `mode=session` record announcing the discovery
 /// hints of the four most recently used `candidates` (hierarchy
-/// specification section 4.3) and, when any of the encoded `retentions`
-/// returned by [`RappPairRecord::revoke`] is still within its thirty days at
-/// `unix_time_seconds`, the `revoked` announcement for the advertised
-/// service instance `instance_name` in that window: the hints of the up to
-/// eight most recent revocations, random fillers, in random order (RAPP
-/// section 4.6). No candidates and no announced revocation give the minimal
-/// record.
+/// specification section 4.3). No candidates give the minimal record.
 ///
 /// # Errors
-/// [`RappBindingError::InvalidInput`] for a hint of the wrong size, a
-/// retention that does not decode, or an instance name that is not the
-/// instance portion of the published name, and
-/// [`RappBindingError::LocalStateFailure`] when the random source fails.
+/// [`RappBindingError::InvalidInput`] for a hint of the wrong size.
 #[uniffi::export]
 #[allow(
     clippy::needless_pass_by_value,
@@ -3180,59 +3085,11 @@ fn txt_entries(entries: impl IntoIterator<Item = (&'static str, String)>) -> Vec
 )]
 pub fn rapp_session_record(
     candidates: Vec<RappAnnouncementCandidate>,
-    retentions: Vec<Vec<u8>>,
-    instance_name: String,
-    unix_time_seconds: u64,
 ) -> Result<Vec<RappTxtEntry>, RappBindingError> {
     let candidates = announcement_candidates(&candidates)?;
-    let retentions = retentions
-        .iter()
-        .map(|bytes| {
-            super::decode_revocation_retention(bytes).map_err(|_| RappBindingError::InvalidInput)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let instance =
-        super::InstanceName::new(&instance_name).map_err(|_| RappBindingError::InvalidInput)?;
-    let now_ms = unix_time_seconds.saturating_mul(MILLISECONDS_PER_SECOND);
-    let revocations = super::RevocationRetention::candidates(
-        &retentions,
-        &instance,
-        super::discovery_epoch(unix_time_seconds),
-        now_ms,
-    );
-    let revoked = if revocations.is_empty() {
-        None
-    } else {
-        Some(
-            super::RevokedAnnouncement::assemble(&revocations, |bytes| {
-                getrandom::fill(bytes).map_err(|_| super::RevocationError::RandomUnavailable)
-            })
-            .map_err(|_| RappBindingError::LocalStateFailure)?,
-        )
-    };
     Ok(txt_entries(
-        super::DiscoveryRecord::assemble(&candidates, revoked).txt_entries(),
+        super::DiscoveryRecord::assemble(&candidates).txt_entries(),
     ))
-}
-
-/// Whether an encoded retention returned by [`RappPairRecord::revoke`] has
-/// left its thirty-day announcement window at `unix_time_seconds`, so the
-/// platform can delete it (RAPP section 4.6 item 4).
-///
-/// # Errors
-/// [`RappBindingError::InvalidInput`] for a retention that does not decode.
-#[uniffi::export]
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "uniffi lowers exported arguments as owned values"
-)]
-pub fn rapp_revocation_retention_expired(
-    retention: Vec<u8>,
-    unix_time_seconds: u64,
-) -> Result<bool, RappBindingError> {
-    let retention = super::decode_revocation_retention(&retention)
-        .map_err(|_| RappBindingError::InvalidInput)?;
-    Ok(retention.is_expired(unix_time_seconds.saturating_mul(MILLISECONDS_PER_SECOND)))
 }
 
 /// The TXT attributes of a `mode=withdrawn` record announcing the
@@ -3415,12 +3272,11 @@ pub fn rapp_ble_sar_segment(
 mod routing_binding_tests {
     use super::{
         RappAnnouncementCandidate, RappPairRecord, RappPairVault, RappRoute, RappSessionRouter,
-        RappVaultError, rapp_pairing_preamble, rapp_revocation_retention_expired,
-        rapp_session_record, rapp_withdrawn_record,
+        RappVaultError, rapp_pairing_preamble, rapp_session_record, rapp_withdrawn_record,
     };
     use crate::{
         BLE_PROFILE, EndpointRole, GrantsHash, PAIR_ID_SIZE, PairId, PairRecord, ProfileName,
-        REVOCATION_ANNOUNCEMENT_MS, STREAM_PROFILE, X25519_KEY_SIZE, noise::x25519_public_key,
+        STREAM_PROFILE, X25519_KEY_SIZE, noise::x25519_public_key,
     };
     use std::sync::{Arc, Mutex};
 
@@ -3551,10 +3407,9 @@ mod routing_binding_tests {
             loaded.replace_device_only(Arc::clone(&vault) as Arc<dyn RappPairVault>),
             Err(super::RappBindingError::StorageUnconfirmed)
         ));
-        let retention = loaded
+        loaded
             .revoke(Arc::clone(&vault) as Arc<dyn RappPairVault>, REVOKED_AT_MS)
             .expect("an unconfirmed record is revoked");
-        assert!(retention.is_some());
         assert!(*vault.revoked.lock().expect("lock"));
     }
 
@@ -3648,15 +3503,10 @@ mod routing_binding_tests {
         let hint = custodian(PAIR_BYTE)
             .discovery_hint(UNIX_TIME_SECONDS)
             .expect("hint");
-        let txt = rapp_session_record(
-            vec![RappAnnouncementCandidate {
-                hint,
-                last_used_ms: CREATED_AT_MS,
-            }],
-            Vec::new(),
-            INSTANCE_NAME.to_owned(),
-            UNIX_TIME_SECONDS,
-        )
+        let txt = rapp_session_record(vec![RappAnnouncementCandidate {
+            hint,
+            last_used_ms: CREATED_AT_MS,
+        }])
         .expect("record");
         assert!(
             requester()
@@ -3668,50 +3518,6 @@ mod routing_binding_tests {
                 .matches_discovery_record(txt, UNIX_TIME_SECONDS)
                 .expect("match")
         );
-    }
-
-    #[test]
-    fn a_revoked_pairing_is_announced_to_its_requester_for_thirty_days() {
-        let vault = Arc::new(RevokingVault {
-            revoked: Mutex::new(false),
-        });
-        let retention = custodian(PAIR_BYTE)
-            .revoke(vault.clone(), REVOKED_AT_MS)
-            .expect("revoke")
-            .expect("retention");
-        assert!(*vault.revoked.lock().expect("lock"));
-        let txt = rapp_session_record(
-            Vec::new(),
-            vec![retention.clone()],
-            INSTANCE_NAME.to_owned(),
-            UNIX_TIME_SECONDS,
-        )
-        .expect("record");
-        assert!(txt.iter().any(|entry| entry.key == "revoked"));
-        assert!(
-            requester()
-                .matches_revoked_record(INSTANCE_NAME.to_owned(), txt.clone(), UNIX_TIME_SECONDS)
-                .expect("match")
-        );
-        assert!(
-            !custodian(OTHER_PAIR_BYTE)
-                .matches_revoked_record(INSTANCE_NAME.to_owned(), txt, UNIX_TIME_SECONDS)
-                .expect("match")
-        );
-        let expiry = UNIX_TIME_SECONDS + REVOCATION_ANNOUNCEMENT_MS / MILLISECONDS_PER_SECOND;
-        assert!(
-            !rapp_revocation_retention_expired(retention.clone(), UNIX_TIME_SECONDS)
-                .expect("fresh")
-        );
-        assert!(rapp_revocation_retention_expired(retention.clone(), expiry).expect("expired"));
-        let txt = rapp_session_record(
-            Vec::new(),
-            vec![retention],
-            INSTANCE_NAME.to_owned(),
-            expiry,
-        )
-        .expect("record");
-        assert!(txt.iter().all(|entry| entry.key != "revoked"));
     }
 
     #[test]

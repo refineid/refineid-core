@@ -253,7 +253,6 @@ const fn formal_action_name(action: Action) -> &'static str {
         Action::ShowRevoked => "show_revoked",
         Action::SendCloseBestEffort(_) => "send_close_best_effort",
         Action::CloseSession => "close_session",
-        Action::RetainRevocationKey => "retain_revocation_key",
         Action::RevokeUnconfirmedPairRecord => "revoke_unconfirmed_pair_record",
         Action::DestroyPairKeys => "destroy_pair_keys",
         Action::DestroyRelayTokens => "destroy_relay_tokens",

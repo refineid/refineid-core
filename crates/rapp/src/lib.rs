@@ -48,7 +48,6 @@ mod proxy_engine;
 mod requester;
 mod requester_engine;
 mod result;
-mod revocation;
 mod routing;
 mod runtime;
 mod session_flow;
@@ -133,12 +132,6 @@ pub use requester_engine::{
     RequesterDispatch, RequesterEngineError, RequesterOperationEngine, RequesterViolation,
 };
 pub use result::{OperationResultMessage, ProxyFailure, ResultError, ResultResponse, ResultStatus};
-pub use revocation::{
-    REVOCATION_ANNOUNCEMENT_MS, REVOCATION_HINT_SIZE, REVOCATION_RETENTION_FORMAT_VERSION,
-    REVOKED_ANNOUNCEMENT_ENTRIES, RevocationError, RevocationKey, RevocationRetention,
-    RevocationRetentionCodecError, RevokedAnnouncement, decode_revocation_retention,
-    encode_revocation_retention,
-};
 pub use routing::{
     DISCOVERY_HINT_EPOCH_SECONDS, DISCOVERY_HINT_SIZE, DiscoveryKey, DiscoveryRecord,
     DiscoveryRecordError, MAX_DISCOVERY_HINTS, ROUTING_NONCE_SIZE, ROUTING_REPLAY_WINDOW,

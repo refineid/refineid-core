@@ -574,13 +574,10 @@ The generator point $G$ is derived from the password-related string (PRS), the 6
      $$T_A = \text{FIRST32}(\text{HMAC-SHA512}(\text{key} = K_A, \text{data} = \text{lv\_cat}([\text{"RAPP-CPACE-CONFIRM-A-v2"}, TH])))$$
    - Transmits 32-byte $T_A$ in CPace Step 3 as one transport frame.
 
-#### 6.1.4 Finalization, PSK Handoff, and Post-PAKE Lifecycles
-- Custodian receives and verifies $T_A$ in constant time within the clamped attempt deadline.
-- Upon successful verification, Custodian clears `active_attempt`, marks the offer **consumed**, cancels the PAKE attempt timer, and transfers exclusive ownership to the Noise pairing phase under a 10.0-second Noise handshake completion deadline.
-- Subsequent post-Noise parameter echo, grant exchange, and trust storage is bounded by a 10.0-second monotonic deadline from local Noise completion. Active handed-off ceremonies are exempt from destruction by the original 5-minute offer TTL; any failure of Noise, protocol mismatch, or deadline expiry destroys candidate trust immediately.
-- Both parties immediately zeroize all intermediate ephemeral values ($\text{ISK}, PRK, K_A, K_B, x_A, x_B, K$).
-- The established 32-byte $PSK$ is passed directly as the pre-shared key into the `Noise_XXpsk3` pairing handshake (§6.2).
-- Security of the pairing ceremony is bounded by the ~252-bit prime order of Ristretto255, the uniform 30-bit entropy of the 6-character code, and the strict 3-attempt rate limit. Pairing and subsequent operational sessions provide industry-standard classical 128-bit cryptographic security via Curve25519, ChaCha20-Poly1305, and SHA-512 (§6.2, §6.3).
+#### 6.1.4 Finalization and PSK Handoff
+- The Custodian verifies $T_A$ in constant time within the attempt deadline. On success it clears `active_attempt`, marks the offer **consumed**, cancels the attempt timer and hands the connection to the Noise pairing phase, which completes the handshake of §6.2 within 10 seconds; the parameter echo, grant exchange and storage of §4.3 that follow complete within 10 seconds of the handshake. A ceremony that has been handed off is not destroyed by the offer's 5-minute TTL; any Noise failure, protocol mismatch or missed deadline destroys the candidate trust at once.
+- Both parties zeroize $\text{ISK}, PRK, K_A, K_B, x_A, x_B$ and $K$ at once.
+- The 32-byte $PSK$ is the pre-shared key of the `Noise_XXpsk3` pairing handshake (§6.2).
 
 ### 6.2 Noise_XXpsk3 Pairing Handshake (RFC 7748, RFC 8439, RFC 5869)
 

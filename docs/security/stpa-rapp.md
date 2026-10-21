@@ -2,7 +2,7 @@
 
 **Status:** Draft for owner review
 **Date:** 2026-10-18
-**Applies to:** RAPP v26.10.10 (`docs/protocols/rapp-v26.10.10.md`), the
+**Applies to:** RAPP v26.10.21 (`docs/protocols/rapp-v26.10.21.md`), the
 transport and discovery hierarchy, and the requester and custodian
 applications built on them
 

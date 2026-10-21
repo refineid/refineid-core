@@ -856,11 +856,11 @@ A Requester that offers the Custodian's credentials to local consumers (a browse
 
 ## 9. Registered Credential Profiles and Actions
 
-The profile registry defines the operations permitted over authenticated RAPP sessions:
+The profiles a pairing can grant (§4.3), and the actions of each:
 
-| Profile Identifier | Human Purpose | Consequential Card Commands |
+| Profile | Purpose | Card commands |
 | :--- | :--- | :--- |
-| `"fi.refineid.card-status"` | Inspect card status, answer to reset (ATR), and retry counters | None (Safe Reads) |
+| `"fi.refineid.card-status"` | Card status, answer to reset (ATR), retry counters, identity | Reads only |
 | `"fi.refineid.authentication"` | Workstation/browser authentication signatures | PIN 1 verify & private-key signature |
 | `"fi.refineid.document-signing"` | Qualified Electronic Signatures (QES) | PIN 2 verify & private-key signature |
 
@@ -870,14 +870,12 @@ The profile registry defines the operations permitted over authenticated RAPP se
   - Response:
     ```cddl
     inspect-card-response = {
-      "card_present": bool,
       "atr": bstr,                       ; answer to reset, or its historical bytes; empty when the platform exposes neither
       "supported_profiles": [* tstr],
       ? "pin1_factory": bool,            ; PIN 1 still holds factory reference data
       ? "pin2_factory": bool,
       ? "pin1_attempts": uint / null,    ; remaining tries; null when the card does not expose the counter
-      ? "pin2_attempts": uint / null,
-      ? "puk_attempts": uint / null
+      ? "pin2_attempts": uint / null
     }
     ```
 - **`read_identity`** (Safe Read):

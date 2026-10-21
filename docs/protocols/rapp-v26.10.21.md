@@ -178,7 +178,7 @@ The Custodian must render the code on screen in two-character clusters separated
 
 $$\text{Display: } \texttt{XX XX XX} \quad (\text{e.g., } \texttt{7K X4 M9})$$
 
-This format structures visual transfer into three distinct 2-character groups. The Requester user interface (UI) receives human input and performs local validation before initiating the GATT connection.
+This format structures visual transfer into three distinct 2-character groups. The Requester user interface (UI) receives the typed code and applies the entry rule of §3.1 before initiating the connection, on every transport.
 
 ### 3.3 Entropy, Attempt Accounting, and Disconnect Oracle Mitigation
 
@@ -1029,7 +1029,7 @@ card-status-body = {
   "card_present": bool
 }
 
-; 16. Protocol Error Body: error-body is defined in §10.4
+; 16. Protocol Error Body: error-body is defined in §10.3
 ```
 
 #### Normative Semantics of Registered Message Types:
@@ -1048,7 +1048,7 @@ card-status-body = {
 13. **`operation.status`**: Transmitted by the Custodian in response to `operation.status_request`, reporting whether the operation is journaled (`known`) and its terminal state (§8.3).
 14. **`operation.progress`**: Notification transmitted by the Custodian while an operation is pending: that the consent view is on screen (`"consent_shown"`, §8.2 item 3), or during long-running card transactions (e.g. prompt to present card to NFC antenna).
 15. **`card.status`**: Transmitted by the Custodian on an operational session once immediately after `session.ready` and again whenever the presence of a card it can serve changes, so that a Requester offers the Custodian's credentials only while a card can answer (§8.4).
-16. **`error`**: Application protocol error envelope transmitted upon encountering unexpected conditions (e.g. a second request while one operation is live, refused with `operation_failed`, or an unknown operation race); bounded schema and numeric error code mappings are defined in §10.4.
+16. **`error`**: Application protocol error envelope transmitted upon encountering unexpected conditions (e.g. a second request while one operation is live, refused with `operation_failed`, or an unknown operation race); bounded schema and numeric error code mappings are defined in §10.3.
 
 ### 7.2 Field Semantics, Version Precedence, and Sequencing
 1. **Wire Version & Skew Precedence**:
@@ -1332,26 +1332,17 @@ The profile registry defines the operations permitted over authenticated RAPP se
 ## 10. Failure Semantics, Error Handling, and Retry Protection
 
 ### 10.1 Failure Classification
-1. **Pre-Authentication Invalid Input (Class 1)**: Malformed preamble, an unrouted or replayed routing tag, invalid MTU, or out-of-order writes prior to Noise authentication. Action: close BLE connection immediately; zero stored state modified.
-2. **Transport Loss, Bearer Disruption, and Version Skew (Class 2)**: Radio drop, ATT timeout, link termination, failed AEAD message authentication code (MAC) verification / decryption failure on an established channel, or unexpected wire version on connect/envelope. Because the bearer is untrusted and subject to RF corruption or relay tampering, ciphertext authentication failure cannot establish authenticated peer misconduct. Action: terminate active session and BLE link immediately, zeroize ephemeral session state; active operation marked `cancelled` (if before card execution) or `ambiguous` (if journaled in-flight). Stored pairing trust records and vault keys REMAIN INTACT. Smart card operations are NEVER re-executed.
+1. **Pre-Authentication Invalid Input (Class 1)**: Malformed preamble, an unrouted or replayed routing tag, invalid MTU, or out-of-order writes prior to Noise authentication. Action: close the connection immediately; zero stored state modified.
+2. **Transport Loss, Bearer Disruption, and Version Skew (Class 2)**: Radio or link drop, transport timeout, failed AEAD message authentication code (MAC) verification / decryption failure on an established channel, or unexpected wire version on connect/envelope. Because the bearer is untrusted and subject to RF corruption or relay tampering, ciphertext authentication failure cannot establish authenticated peer misconduct. Action: terminate the active session and the connection immediately, zeroize ephemeral session state; active operation marked `cancelled` (if before card execution) or `ambiguous` (if journaled in-flight). Stored pairing trust records and vault keys REMAIN INTACT. Smart card operations are NEVER re-executed.
 3. **Stale-Reference Race and Semantic Rejection (Class 3)**: Decrypted operation message for an unknown or already terminal `operation_id` (e.g. duplicate request for expired operation), or unsupported algorithm/parameter. Action: respond with `error` name `"unknown_operation"` or `operation.result` status `"rejected"` with `"unsupported_parameter"`; no pairing revocation.
 4. **Authenticated Protocol Violation (Class 4)**: Verified sequence regression across an established authenticated link (where AEAD MAC is valid and sequence < expected), parameter echo mismatch in an authenticated `pairing.hello`, authenticated `pair_id` mismatch, or explicit local user deletion/revocation. Action: close session immediately, mark pairing revoked, destroy pairing keys in local storage, announce the revocation (§4.6), and require new manual pairing.
 
-### 10.2 Typo Handling vs. Permanent Card Lockout
-- **Ordinary Typo (Retries Remain)**: If the card reports invalid PIN 1, PIN 2, or card access number (CAN) (`SW 63 Cx`), and remaining retry count $> 0$:
-  - Custodian transmits `operation.result` with `status: "rejected"`, `error: "invalid_credential"`, and exact `remaining_retries: count`.
-  - The operation terminates, but stored pairings and vault keys **REMAIN INTACT**.
-- **Low Retry Warning & Confirmation**:
-  Before transmitting any PIN verification command when the card's remaining retry counter is $\le 1$, the Custodian must display an explicit warning on screen ("Warning: 1 attempt remaining before card lockout") and require explicit, conscious user confirmation to proceed. If the user declines, the operation terminates with `status: "rejected"`, `error: "user_declined"`, preserving the card's remaining try.
-- **Permanent Card Lockout (Zero Retries Remain)**: If a PIN try counter reaches 0 (card blocked, `SW 69 83`) or hardware tampering is detected:
-  - Terminate card transmissions immediately.
-  - Transmit `operation.result` with `status: "credential_rejected"`, `error: "card_blocked"`.
-  - Mark active pairing `revoked`, permanently delete pairing keys from local secure storage, and close the connection. Both peers require a completely new manual pairing ceremony after card unblocking.
+### 10.2 Credential Rejection and the Retry Floor
+- **Retry floor (PIN 1 and PIN 2)**: Before any command that could decrement a PIN try counter, the Custodian reads the card's remaining attempts for that PIN. It sends the verification only while the card reports **at least 3** remaining. With 2 or fewer remaining, or a counter it cannot read, it refuses without sending any verification command, answering `operation.result` with `status: "rejected"` and `error: "retry_floor"`, and tells the user that the card's remaining attempts are reserved for the card issuer's software. RefineID therefore never consumes a card's last two attempts and can never block a PIN.
+- **Ordinary typo (retries remain)**: If the card rejects PIN 1, PIN 2 or the CAN (`SW 63 Cx`) and retries remain, the Custodian answers `operation.result` with `status: "rejected"`, `error: "invalid_credential"`, and the exact `remaining_retries`. The operation terminates; stored pairings and vault keys remain intact. The next verification of that PIN is again subject to the floor.
+- **Blocked credential**: If the card reports a credential blocked (`SW 69 83`), which under the floor can only have happened outside RefineID, the Custodian stops card transmissions and answers `operation.result` with `status: "credential_rejected"`, `error: "card_blocked"`. The pairing is unaffected: pairing is device trust, not card state, and the card is unblocked with the PUK in the issuer's software.
 
-### 10.3 Retry Floor Protection
-Before transmitting any command that could decrement a PIN try counter, the Custodian must query the card's remaining try counter. If the counter indicates $\le 1$ attempt remaining, the Custodian must enforce the low-retry confirmation workflow (§10.2). If the try counter is 0 or unreadable, the Custodian must refuse the operation without transmitting verification commands to the card, answering `operation.result` with `status: "rejected"` and `error: "operation_failed"`.
-
-### 10.4 Standardized Error Envelope Body Schema & Code Mapping
+### 10.3 Standardized Error Envelope Body Schema & Code Mapping
 ```cddl
 error-body = {
   "error_code": uint,
@@ -1368,18 +1359,18 @@ error-body = {
 | `"user_cancelled"` | `1003` | User consciously declined or canceled the operation on the screen. | Class 3 |
 | `"unauthorized"` | `1004` | Requested profile or action is not granted in active pairing. | Class 3 |
 | `"unsupported_parameter"` | `1005` | Unsupported key profile, algorithm, or parameter value. | Class 3 |
-| `"card_blocked"` | `1006` | Card retry counter exhausted / credential blocked (`SW 69 83`); status `credential_rejected` (§10.2). | Class 4 |
-| `"pin_blocked"` | `1007` | Specific PIN retry counter exhausted. | Class 4 |
+| `"card_blocked"` | `1006` | Credential blocked on the card (`SW 69 83`); status `credential_rejected` (§10.2). The pairing is unaffected. | Class 3 |
+| `"pin_blocked"` | `1007` | Specific PIN retry counter exhausted on the card. The pairing is unaffected. | Class 3 |
 | `"invalid_credential"` | `1008` | Incorrect PIN entered; retries remain (`SW 63 Cx`). | Class 3 |
 | `"card_error"` | `1009` | APDU transmission failure, NFC loss, or smart card hardware fault. | Class 2 |
 | `"operation_failed"` | `1010` | Consequential hardware execution or durable journal write failed. | Class 3 |
 | `"duplicate_operation"` | `1011` | Non-idempotent attempt to execute an existing operation. | Class 3 |
-| `"user_declined"` | `1012` | User declined proceeding under low-retry warning floor. | Class 3 |
+| `"retry_floor"` | `1012` | The card reports fewer than 3 remaining attempts for the PIN; no verification was sent (§10.2). | Class 3 |
 | `"storage_exhausted"` | `1013` | Device persistent secure storage allocated for pairing tombstones is exhausted. | Class 3 |
 | `"operation_already_retired"` | `1014` | Operation was already executed, acknowledged, and retired. | Class 3 |
 | `"invalid_lifetime"` | `1015` | `expires_after_ms` of 0 (§8.2.1). | Class 3 |
 
-`operation_failed` also answers a second `operation.request` while another operation is live on the pairing (the `error` message) and the retry floor refusal of §10.3 (an `operation.result`).
+`operation_failed` also answers a second `operation.request` while another operation is live on the pairing (the `error` message).
 
 **Normative Error Handling Rule**:
 Semantic error handling is driven exclusively by `error_name`. The numeric `error_code` is informative and provides predictable numeric mappings across language bindings. If an implementation receives an unrecognized `error_code` with a recognized `error_name`, `error_name` takes precedence. If both are unrecognized, the error must be handled as a general Class 3 `operation_failed`.

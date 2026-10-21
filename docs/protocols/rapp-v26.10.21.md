@@ -134,16 +134,16 @@ where `domain` is the preamble domain of the transport profile in use as 8-bit U
 
 The Custodian routes a `"session"` preamble as follows:
 1. It evaluates the tag against `K_route` of every non-revoked stored pairing, comparing in constant time and without stopping at a match, so the work does not reveal which pairing matched or whether any did. The pre-authentication limiter (§3.3) bounds how often this runs.
-2. No match is Class 1 invalid input: the Custodian closes the connection without changing stored state.
-3. On a match it consults its replay memory: the nonces of the 256 most recently routed sessions. A nonce already there is Class 1 invalid input; otherwise the nonce is added, displacing the oldest, and the connection proceeds to the Noise session phase for the matched pairing.
+2. On no match the Custodian closes the connection without changing stored state.
+3. On a match it consults its replay memory: the nonces of the 256 most recently routed sessions. A nonce already there closes the connection; otherwise the nonce is added, displacing the oldest, and the connection proceeds to the Noise session phase for the matched pairing.
 
-A preamble that does not decode, names another profile's domain, carries an unregistered purpose, a non-empty value with `"pairing"`, or a value other than 32 bytes with `"session"` is Class 1 invalid input (§10.1): the Custodian closes the connection without changing stored state. An encoded preamble longer than 64 bytes is rejected before parsing. A `"session"` preamble encodes to 58 bytes on the stream transport and 55 bytes on BLE. The `routing_tag` and `routing_preamble` vectors of `vectors/rapp-routing-v26.10.21.json` pin the bytes.
+A preamble that does not decode, names another profile's domain, carries an unregistered purpose, a non-empty value with `"pairing"`, or a value other than 32 bytes with `"session"` closes the connection (§10.1) without changing stored state. An encoded preamble longer than 64 bytes is rejected before parsing. A `"session"` preamble encodes to 58 bytes on the stream transport and 55 bytes on BLE. The `routing_tag` and `routing_preamble` vectors of `vectors/rapp-routing-v26.10.21.json` pin the bytes.
 
 The routing tag only selects a pairing; it authenticates nothing. Authentication is established exclusively by the `Noise_KK` handshake that follows.
 
 #### 2.2.2 Stream Transport Profile (`"fi.refineid.stream.v1"`)
 - **Bearer**: one reliable, ordered TCP byte stream per connection. The Custodian listens and advertises the endpoint per the hierarchy specification; the Requester dials. The Custodian accepts any number of connections at the same time, one per client session (§8). An open connection from one client is never a reason to refuse another. Neither peer accepts inbound pairing or session connections on any other role.
-- **Framing**: each transport frame is a 2-byte unsigned big-endian length $n$ followed by exactly $n$ payload bytes, $1 \le n \le 65535$. A zero length, a truncated frame, or a length above the receiver's limit closes the connection (Class 1 before authentication, Class 2 after).
+- **Framing**: each transport frame is a 2-byte unsigned big-endian length $n$ followed by exactly $n$ payload bytes, $1 \le n \le 65535$. A zero length, a truncated frame, or a length above the receiver's limit closes the connection, and the session if one is established.
 - **Offer parameters**: the stream transport entry of `pairing-offer` carries `parameters: {}`; endpoints are learned from discovery, never from the offer.
 - **Ordering**: after a `"pairing"` preamble the Custodian sends the encoded `pairing-offer` as its first frame (§4.2); after a `"session"` preamble the Custodian routed (§2.2.1) the Requester sends `Noise_KK` message 1.
 
@@ -327,7 +327,7 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
      - `grants_hash` and confirmed granted profiles
      - Remote peer's static public key
      - Local static private key
-   - Once its record is durably stored, each endpoint sends `pairing.stored` carrying the derived `pair_id` (§7.1). An endpoint treats the pairing as active only after it has both stored its own record and received the peer's `pairing.stored`; until then it neither routes nor dials for the pairing, and announces it in no discovery or withdrawal record. The stored record carries whether the peer confirmed it, and the endpoint rewrites the record as confirmed when the peer's `pairing.stored` arrives: a record found unconfirmed at a later start was stored inside a confirmation window the endpoint did not complete, and the endpoint revokes it (§4.6) before serving anything. A `pairing.stored` whose `pair_id` differs from the derived one is an authenticated protocol violation (Class 4). If the deadline of §3.3 item 7 passes without the peer's `pairing.stored`, the endpoint revokes the record it stored (§4.6), so a pairing that only one side holds does not survive.
+   - Once its record is durably stored, each endpoint sends `pairing.stored` carrying the derived `pair_id` (§7.1). An endpoint treats the pairing as active only after it has both stored its own record and received the peer's `pairing.stored`; until then it neither routes nor dials for the pairing, and announces it in no discovery or withdrawal record. The stored record carries whether the peer confirmed it, and the endpoint rewrites the record as confirmed when the peer's `pairing.stored` arrives: a record found unconfirmed at a later start was stored inside a confirmation window the endpoint did not complete, and the endpoint revokes it (§4.6) before serving anything. A `pairing.stored` whose `pair_id` differs from the derived one aborts the pairing: the endpoint revokes the record it stored (§4.6). If the deadline of §3.3 item 7 passes without the peer's `pairing.stored`, the endpoint revokes the record it stored (§4.6), so a pairing that only one side holds does not survive.
    - The pairing channel is cleanly closed once both `pairing.stored` messages have been exchanged.
 
 5. **Reconnect Routing for Operational Sessions (`Noise_KK`)**:
@@ -410,7 +410,7 @@ A Custodian **withdraws** when it deliberately stops serving every stored pairin
 
 ### 4.6 Pairing Revocation
 
-An endpoint **revokes** a pairing when its user forgets it, when §10 requires it (Class 4), when the confirmation deadline of §4.3 item 4 passes, or when its peer tells it so. The record is marked revoked at once and serves nothing from then on. Whichever endpoint revokes, Custodian or Requester, tells the other with `session.close` carrying reason `"pairing_revoked"` (§7.1), so that the peer forgets the pairing on its side too:
+An endpoint **revokes** a pairing when its user forgets it, when a pairing fails after its record was stored (§4.3), when the confirmation deadline of §4.3 item 4 passes, or when its peer tells it so. The record is marked revoked at once and serves nothing from then on. Whichever endpoint revokes, Custodian or Requester, tells the other with `session.close` carrying reason `"pairing_revoked"` (§7.1), so that the peer forgets the pairing on its side too:
 
 1. **In Session**:
    If the revoking endpoint holds an open session to the peer, it sends the close at once.
@@ -807,9 +807,9 @@ card-status-body = {
 12. **`error`**: Sent on a protocol condition that is not an operation outcome, such as a second request while one operation of the session is live; schema and codes in §10.3.
 
 ### 7.2 Envelope Rules
-1. **Version**: `version` is `[26, 10, 21]`, as `[Year, Month, Day]`. A version mismatch in a Noise prologue fails the handshake's AEAD and is Class 2 (§10.1): the link drops and stored pairings stay. An authenticated envelope with any other version closes the session, Class 2 likewise.
-2. **Session**: `session_id` is the identifier derived from the handshake hash of the phase the envelope belongs to, the pairing `session_id` of §6.2 or the operational `session_id` of §6.3. An envelope with another `session_id` closes the session (Class 2).
-3. **Sequence**: `sequence` starts at 0 in each direction and increases by exactly 1 per envelope; it equals the nonce of the Noise cipher state that encrypted the envelope. The first envelope received in a direction has `sequence` 0 and each accepted envelope raises the expected value by 1. An envelope whose `sequence` is not the expected value, after its AEAD verified, is an authenticated protocol violation (Class 4). A session ends as §8.4 item 5 says; the counter never wraps in practice, and an endpoint that would exceed $2^{64}-1$ closes the session with reason `"normal"`.
+1. **Version**: `version` is `[26, 10, 21]`, as `[Year, Month, Day]`. A version mismatch in a Noise prologue fails the handshake's AEAD: the link drops and stored pairings stay. An authenticated envelope with any other version closes the session.
+2. **Session**: `session_id` is the identifier derived from the handshake hash of the phase the envelope belongs to, the pairing `session_id` of §6.2 or the operational `session_id` of §6.3. An envelope with another `session_id` closes the session.
+3. **Sequence**: `sequence` starts at 0 in each direction and increases by exactly 1 per envelope; it equals the nonce of the Noise cipher state that encrypted the envelope. The first envelope received in a direction has `sequence` 0 and each accepted envelope raises the expected value by 1. An envelope whose `sequence` is not the expected value closes the session. A session ends as §8.4 item 5 says; the counter never wraps in practice, and an endpoint that would exceed $2^{64}-1$ closes the session with reason `"normal"`.
 4. **Encapsulation**: The `rapp-message` is encoded as deterministic CBOR (RFC 8949 Section 4.2) and encrypted with ChaCha20-Poly1305 under the direction's Noise cipher state, giving the ciphertext and a 16-byte tag. The ciphertext is one transport frame (§2.2).
 
 ---
@@ -857,7 +857,7 @@ Credential operations (authentication signatures, qualified document signing) in
         - The Custodian **must validate the commitment**:
           $$\text{incoming.request\_hash} == \text{existing.request\_hash}$$
         - **Changed-Content Collision**: If $\text{incoming.request\_hash} \ne \text{existing.request\_hash}$:
-          The request is an illegal aliasing or parameter tampering attempt. The Custodian **must immediately reject** the request with `error: "duplicate_operation"` (Class 3). The existing operation, active prompt, NFC card execution, or tombstone must not be replaced, cancelled, mutated, or joined.
+          The request is an illegal aliasing or parameter tampering attempt. The Custodian **must immediately reject** the request with `error: "duplicate_operation"`. The existing operation, active prompt, NFC card execution, or tombstone must not be replaced, cancelled, mutated, or joined.
         - **Identical Retransmission**: If $\text{incoming.request\_hash} == \text{existing.request\_hash}$:
           - `awaiting_consent`: Join the active authorization flow. The retransmitted request attaches as an observer awaiting user confirmation. No duplicate consent dialog is presented to the user.
           - `in_flight`: Join the active NFC/card transaction. The retransmitted request attaches as an observer awaiting card completion and receives the single `operation.result`. No duplicate card APDUs are dispatched.
@@ -877,7 +877,7 @@ Credential operations (authentication signatures, qualified document signing) in
 4. **Write-Ahead Journaling & Card Execution**:
    - Upon conscious human approval on the phone screen, the Custodian must write a durable write-ahead journal entry to persistent platform secure storage before dispatching any APDU to the smart card:
      `[pair_id, operation_id, request_hash, state: "in_flight", timestamp]`.
-   - If the durable journal write fails (e.g. platform storage I/O error), the Custodian must not dispatch APDUs to the card; it aborts execution and returns Class 3 `operation_failed`.
+   - If the durable journal write fails (e.g. platform storage I/O error), the Custodian must not dispatch APDUs to the card; it aborts execution and returns `operation_failed`.
    - Once durably recorded, the Custodian verifies the retry counter floor (§10.3) and dispatches APDUs to the FINEID card over NFC.
    - Upon completing card execution, the Custodian transitions the journal entry to `state: "completed"` (or `state: "rejected"` / `"credential_rejected"` if card status word (SW) indicates verification failure) and caches the response payload.
 5. **Result Delivery, Acknowledgment Validation, and Durable Tombstones**:
@@ -899,10 +899,10 @@ Credential operations (authentication signatures, qualified document signing) in
      - Because `operation.request` and the 16-byte `operation_id` contain no creation timestamp or authenticated operation epoch, time-based expiration (e.g. 30 days) and FIFO ring-buffer eviction during an active pairing are **strictly prohibited**. Evicting a tombstone while the pairing remains active would allow a retransmitted or delayed `operation_id` to appear unknown in a fresh session and be silently re-admitted, violating identifier-level idempotency and physical card safety.
      - Tombstones survive application termination, process restarts, operating system updates, and device reboots.
      - **Destruction Contract**: Durable tombstones associated with a `pair_id` are purged if and only if the pairing itself is explicitly revoked or deleted (e.g. unpair ceremony or manual deletion of the pairing by the user in settings).
-     - **Storage Exhaustion Safety**: In the event that device persistent secure storage allocated for pairing tombstones is exhausted, the Custodian **must fail closed**: it must refuse to admit new operations by returning error `"storage_exhausted"` (Class 3), rather than evicting historical tombstones.
+     - **Storage Exhaustion Safety**: In the event that device persistent secure storage allocated for pairing tombstones is exhausted, the Custodian **must fail closed**: it must refuse to admit new operations by returning error `"storage_exhausted"`, rather than evicting historical tombstones.
      - **Subsequent Queries & Requests Matching a Retained Tombstone**:
        - If $\text{incoming.request\_hash} == \text{tombstone.request\_hash}$: The Custodian responds with `operation.result` reporting `status: tombstone.terminal_disposition`, `retired: true`, and `error: "operation_already_retired"` (if disposition was completed) or the original preserved error (if rejected / credential_rejected / ambiguous), omitting pruned response payloads. The preserved terminal disposition (`"completed"`, `"rejected"`, `"credential_rejected"`, `"ambiguous"`) is strictly honored; a retired failed or ambiguous operation is never reported as completed. Under NO circumstances are smart card APDUs re-dispatched or user consent prompts presented.
-       - If $\text{incoming.request\_hash} \ne \text{tombstone.request\_hash}$: The Custodian rejects immediately with `error: "duplicate_operation"` (Class 3).
+       - If $\text{incoming.request\_hash} \ne \text{tombstone.request\_hash}$: The Custodian rejects immediately with `error: "duplicate_operation"`.
 6. **Safe Reads (Direct Optimization)**:
    - Actions that perform read-only card operations (e.g. `inspect_card`, `read_identity`, `read_certificate`) involve no private-key operations or PIN try decrements.
    - Safe reads omit write-ahead journaling and screen consent prompts, executing card read APDUs directly and responding with `operation.result`.
@@ -1029,7 +1029,7 @@ The profile registry defines the operations permitted over authenticated RAPP se
 
       A P-384 key signing a Transport Layer Security (TLS) 1.3 handshake needs `"ecdsa_sha384"`.
     - `digest` (`bstr`): Pre-hashed challenge bytes matching algorithm digest length (e.g. 32 bytes for SHA-256).
-  - Validation: If a request specifies an unrecognized or unsupported `key_profile` or `algorithm`, the Custodian must respond with `operation.result` carrying `status: "rejected"` and `error: "unsupported_parameter"`. This is a semantic rejection, NOT an authenticated protocol violation (Class 4).
+  - Validation: If a request specifies an unrecognized or unsupported `key_profile` or `algorithm`, the Custodian must respond with `operation.result` carrying `status: "rejected"` and `error: "unsupported_parameter"`. The session and the pairing stay.
   - Signature Wire Format:
     - For `"ecdsa_sha256"`: The signature must be serialized as fixed-width raw Institute of Electrical and Electronics Engineers (IEEE) P1363 big-endian concatenation $r \parallel s$. For `"ecdsa_p256"`, exactly 64 bytes (32-byte $r \parallel$ 32-byte $s$); for `"ecdsa_p384"`, exactly 96 bytes (48-byte $r \parallel$ 48-byte $s$). ASN.1 DER encoding is strictly prohibited on the wire.
     - For `"rsa_pkcs1_sha256"`: The signature must be serialized as raw big-endian integer bytes matching the Rivest-Shamir-Adleman (RSA) key modulus length (256 bytes for `"rsa_2048"`, 384 bytes for `"rsa_3072"`), computed via RSASSA-PKCS1-v1_5 per RFC 8017 Section 8.2 (EMSA-PKCS1-v1_5 with SHA-256 DigestInfo prefix `3031300d060960864801650304020105000420` followed by 32-byte SHA-256 digest).
@@ -1072,11 +1072,14 @@ The profile registry defines the operations permitted over authenticated RAPP se
 
 ## 10. Failure Semantics, Error Handling, and Retry Protection
 
-### 10.1 Failure Classification
-1. **Pre-Authentication Invalid Input (Class 1)**: Malformed preamble, an unrouted or replayed routing tag, invalid MTU, or out-of-order writes prior to Noise authentication. Action: close the connection immediately; zero stored state modified.
-2. **Transport Loss, Bearer Disruption, and Version Skew (Class 2)**: Radio or link drop, transport timeout, failed AEAD message authentication code (MAC) verification / decryption failure on an established channel, or unexpected wire version on connect/envelope. Because the bearer is untrusted and subject to RF corruption or relay tampering, ciphertext authentication failure cannot establish authenticated peer misconduct. Action: terminate the active session and the connection immediately, zeroize ephemeral session state; active operation marked `cancelled` (if before card execution) or `ambiguous` (if journaled in-flight). Stored pairing trust records and vault keys REMAIN INTACT. Smart card operations are NEVER re-executed.
-3. **Stale-Reference Race and Semantic Rejection (Class 3)**: Decrypted operation message for an unknown or already terminal `operation_id` (e.g. duplicate request for expired operation), or unsupported algorithm/parameter. Action: respond with `error` name `"unknown_operation"` or `operation.result` status `"rejected"` with `"unsupported_parameter"`; no pairing revocation.
-4. **Authenticated Protocol Violation (Class 4)**: Verified sequence regression across an established authenticated link (where AEAD MAC is valid and sequence < expected), parameter echo mismatch in an authenticated `pairing.hello`, authenticated `pair_id` mismatch, or explicit local user deletion/revocation. Action: revoke the pairing (§4.6) and require new manual pairing.
+### 10.1 Failure Handling
+What an endpoint does when something goes wrong depends on how much it knows about its peer:
+
+1. **Before authentication**: a malformed preamble, an unrouted or replayed routing tag, a short MTU, a frame out of order. The endpoint closes the connection; nothing stored changes.
+2. **On a session**: a link drop, a timeout, an AEAD failure, a wrong version, a wrong `session_id` or `sequence`. A bit flip and an attacker look the same, so the endpoint closes the session and keeps the pairing; every operation of the session is over (§8). The card is never touched on the way out.
+3. **Inside an operation**: an unknown `operation_id`, an unsupported parameter, a credential the card refused. The endpoint rejects that operation with `operation.result` or `error` (§10.3); the session and the pairing stay.
+
+No failure revokes a pairing. Pairings are revoked by their users (§4.6).
 
 ### 10.2 Credential Rejection and the Retry Floor
 - **Retry floor (PIN 1 and PIN 2)**: Before any command that could decrement a PIN try counter, the Custodian reads the card's remaining attempts for that PIN. It sends the verification only while the card reports **at least 3** remaining. With 2 or fewer remaining, or a counter it cannot read, it refuses without sending any verification command, answering `operation.result` with `status: "rejected"` and `error: "retry_floor"`, and tells the user that the card's remaining attempts are reserved for the card issuer's software. RefineID therefore never consumes a card's last two attempts and can never block a PIN.
@@ -1093,28 +1096,28 @@ error-body = {
 }
 ```
 
-| `error_name` | `error_code` | Semantic Description | Failure Class |
-| :--- | :--- | :--- | :--- |
-| `"unknown_operation"` | `1001` | Queried or submitted `operation_id` is unknown or already terminal. | Class 3 |
-| `"operation_expired"` | `1002` | Local monotonic operation deadline passed prior to authorization. | Class 3 |
-| `"user_cancelled"` | `1003` | User consciously declined or canceled the operation on the screen. | Class 3 |
-| `"unauthorized"` | `1004` | Requested profile or action is not granted in active pairing. | Class 3 |
-| `"unsupported_parameter"` | `1005` | Unsupported key profile, algorithm, or parameter value. | Class 3 |
-| `"card_blocked"` | `1006` | Credential blocked on the card (`SW 69 83`); status `credential_rejected` (§10.2). The pairing is unaffected. | Class 3 |
-| `"pin_blocked"` | `1007` | Specific PIN retry counter exhausted on the card. The pairing is unaffected. | Class 3 |
-| `"invalid_credential"` | `1008` | Incorrect PIN entered; retries remain (`SW 63 Cx`). | Class 3 |
-| `"card_error"` | `1009` | APDU transmission failure, NFC loss, or smart card hardware fault. | Class 2 |
-| `"operation_failed"` | `1010` | Consequential hardware execution or durable journal write failed. | Class 3 |
-| `"duplicate_operation"` | `1011` | Non-idempotent attempt to execute an existing operation. | Class 3 |
-| `"retry_floor"` | `1012` | The card reports fewer than 3 remaining attempts for the PIN; no verification was sent (§10.2). | Class 3 |
-| `"storage_exhausted"` | `1013` | Device persistent secure storage allocated for pairing tombstones is exhausted. | Class 3 |
-| `"operation_already_retired"` | `1014` | Operation was already executed, acknowledged, and retired. | Class 3 |
-| `"invalid_lifetime"` | `1015` | `expires_after_ms` of 0 (§8.2.1). | Class 3 |
+| `error_name` | `error_code` | Semantic Description |
+| :--- | :--- | :--- |
+| `"unknown_operation"` | `1001` | Queried or submitted `operation_id` is unknown or already terminal. |
+| `"operation_expired"` | `1002` | Local monotonic operation deadline passed prior to authorization. |
+| `"user_cancelled"` | `1003` | User consciously declined or canceled the operation on the screen. |
+| `"unauthorized"` | `1004` | Requested profile or action is not granted in active pairing. |
+| `"unsupported_parameter"` | `1005` | Unsupported key profile, algorithm, or parameter value. |
+| `"card_blocked"` | `1006` | Credential blocked on the card (`SW 69 83`); status `credential_rejected` (§10.2). The pairing is unaffected. |
+| `"pin_blocked"` | `1007` | Specific PIN retry counter exhausted on the card. The pairing is unaffected. |
+| `"invalid_credential"` | `1008` | Incorrect PIN entered; retries remain (`SW 63 Cx`). |
+| `"card_error"` | `1009` | APDU transmission failure, NFC loss, or smart card hardware fault. |
+| `"operation_failed"` | `1010` | Consequential hardware execution or durable journal write failed. |
+| `"duplicate_operation"` | `1011` | Non-idempotent attempt to execute an existing operation. |
+| `"retry_floor"` | `1012` | The card reports fewer than 3 remaining attempts for the PIN; no verification was sent (§10.2). |
+| `"storage_exhausted"` | `1013` | Device persistent secure storage allocated for pairing tombstones is exhausted. |
+| `"operation_already_retired"` | `1014` | Operation was already executed, acknowledged, and retired. |
+| `"invalid_lifetime"` | `1015` | `expires_after_ms` of 0 (§8.2.1). |
 
 `operation_failed` also answers a second `operation.request` while another operation is live on the pairing (the `error` message).
 
 **Normative Error Handling Rule**:
-Semantic error handling is driven exclusively by `error_name`. The numeric `error_code` is informative and provides predictable numeric mappings across language bindings. If an implementation receives an unrecognized `error_code` with a recognized `error_name`, `error_name` takes precedence. If both are unrecognized, the error must be handled as a general Class 3 `operation_failed`.
+Semantic error handling is driven exclusively by `error_name`. The numeric `error_code` is informative and provides predictable numeric mappings across language bindings. If an implementation receives an unrecognized `error_code` with a recognized `error_name`, `error_name` takes precedence. If both are unrecognized, the error must be handled as a general `operation_failed`.
 
 ---
 

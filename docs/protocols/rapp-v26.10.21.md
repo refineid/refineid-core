@@ -1041,7 +1041,7 @@ Credential operations (authentication signatures, qualified document signing) in
    - **Tombstone Retention Contract & Pairing Lifetime Durability**:
      - **Pairing Lifetime Retention**: The Custodian must retain durable tombstones in persistent secure storage for the **entire active lifetime of the pairing** (`pair_id`).
      - Because `operation.request` and the 16-byte `operation_id` contain no creation timestamp or authenticated operation epoch, time-based expiration (e.g. 30 days) and FIFO ring-buffer eviction during an active pairing are **strictly prohibited**. Evicting a tombstone while the pairing remains active would allow a retransmitted or delayed `operation_id` to appear unknown in a fresh session and be silently re-admitted, violating identifier-level idempotency and physical card safety.
-     - Tombstones survive application termination, process restarts, OS updates, and device reboots.
+     - Tombstones survive application termination, process restarts, operating system updates, and device reboots.
      - **Destruction Contract**: Durable tombstones associated with a `pair_id` are purged if and only if the pairing itself is explicitly revoked or deleted (e.g. unpair ceremony or manual deletion of the pairing by the user in settings).
      - **Storage Exhaustion Safety**: In the event that device persistent secure storage allocated for pairing tombstones is exhausted, the Custodian **must fail closed**: it must refuse to admit new operations by returning error `"storage_exhausted"` (Class 3), rather than evicting historical tombstones.
      - **Subsequent Queries & Requests Matching a Retained Tombstone**:

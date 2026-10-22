@@ -22,9 +22,10 @@
 //! `C_Initialize` arg and `CKF_OS_LOCKING_OK`.
 //!
 //! PIN1 secrecy: the login secret lives only in [`PinSafetyCache`] here,
-//! is never logged or rendered, and is dropped (zeroized by
-//! `PinBytes`) on `C_Logout`, `C_CloseSession` of the last session,
-//! card removal, and `C_Finalize`.
+//! is never logged or rendered, and has no idle window. Besides the
+//! invalidation rules the cache enforces itself, it is dropped
+//! (zeroized by `PinBytes`) on `C_Logout`, `C_CloseSession` of the last
+//! session, card removal, and `C_Finalize`.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -265,9 +266,9 @@ pub struct ModuleState {
     sessions: BTreeMap<CkSessionHandle, Session>,
     /// Next session handle to assign.
     next_session_handle: CkSessionHandle,
-    /// Per-slot five-minute positive PIN1 state plus process-lifetime
-    /// rejection memory. Entries survive logout/removal so rejection
-    /// fingerprints cannot be bypassed without restarting the process.
+    /// Per-slot held PIN1 plus process-lifetime rejection memory.
+    /// Entries survive logout/removal so rejection fingerprints cannot
+    /// be bypassed without restarting the process.
     pin_caches: BTreeMap<CkSlotId, Arc<Mutex<PinSafetyCache>>>,
     /// Cached token objects per slot while the same card stays
     /// present.
@@ -1327,12 +1328,52 @@ mod tests {
         let cache = state.pin_cache(1).expect("cache created");
         {
             let mut cache = cache.lock().expect("cache lock");
-            cache.remember_pin1(&serial, pin.clone());
+            cache
+                .store_pin1(serial.clone(), pin.clone())
+                .expect("a fresh PIN1 is not a rejected one");
             cache.record_rejected(&serial, &pin);
         }
         state.logout(1);
         assert!(state.close_session(handle));
         assert!(cache.lock().expect("cache lock").is_rejected(&serial, &pin));
+    }
+
+    /// A logout reaches a PIN1 that is out on an in-flight signature:
+    /// the card's answer to that signature cannot bring it back.
+    #[test]
+    fn logout_destroys_a_pin1_out_on_a_checkout() {
+        /// Retry count of a pristine FINEID PIN.
+        const RETRIES_PRISTINE: u8 = 5;
+        const DECIMAL_DIGIT_RADIX: u8 = 10;
+        let mut digits = vec![0_u8; PinBytes::MAX_LENGTH];
+        getrandom::fill(&mut digits).expect("operating system random source is available");
+        for digit in &mut digits {
+            *digit = b'0' + (*digit % DECIMAL_DIGIT_RADIX);
+        }
+        let pin = PinBytes::new(digits).expect("random digits satisfy the PIN policy");
+        let pristine = refineid_auth::PinStatus::Remaining(
+            refineid_apdu::PinRetries::from_nibble(RETRIES_PRISTINE)
+                .expect("test retry count fits the status-word nibble"),
+        );
+        let serial = refineid_pkcs15::TokenSerial::new("CARD-LOGOUT".to_owned());
+        let mut state = state_with_slots(&["Logout During Checkout Reader"]);
+        let cache = state.pin_cache(1).expect("cache created");
+        let checkout = {
+            let mut cache = cache.lock().expect("cache lock");
+            cache
+                .store_pin1(serial.clone(), pin)
+                .expect("a fresh PIN1 is not a rejected one");
+            cache
+                .checkout_pin1(&serial, pristine)
+                .expect("the held value is checked out")
+        };
+        state.logout(1);
+        let accepted: Result<
+            refineid_auth::VerifyOutcome,
+            refineid_auth::AuthError<core::convert::Infallible>,
+        > = Ok(refineid_auth::VerifyOutcome::Ok);
+        checkout.settle_verify(&mut cache.lock().expect("cache lock"), &accepted);
+        assert!(!state.is_logged_in(1));
     }
 
     #[test]

@@ -21,6 +21,9 @@ the PUK is excluded by construction, matching its no-cache-path contract. A
 PIN's digits are absorbed into the fingerprint through a scoped borrow,
 never handed out, so the cache adds no raw-bytes accessor to a PIN role.
 
-The two exported lifetime constants describe how long a host may retain a
-*positively* verified PIN in its own upstream policy; this crate keeps no
-positive cache and performs no card I/O.
+This crate keeps no positive cache and performs no card I/O. Holding a PIN1
+the card accepted is the host's, under the
+[credential custody](../../docs/security/credential-custody.md) contract: in
+process memory from the first card-confirmed success until an invalidation
+event, with no idle window or countdown. PIN2 is never held between
+operations.

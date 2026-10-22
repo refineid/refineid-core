@@ -17,15 +17,13 @@ Implemented:
   `C_GetTokenInfo`, `C_GetMechanismList`, `C_GetMechanismInfo`, `C_WaitForSlotEvent` (non-blocking: reports card insertion / removal events, so NSS notices a card without a browser restart).
 - Sessions: `C_OpenSession` (serial, read-only), `C_CloseSession`, `C_CloseAllSessions`, `C_GetSessionInfo`.
 - Login: `C_Login` (`CKU_USER` only), `C_Logout`.
-  On success the module best-effort forwards PIN1 over a local
-  pin-channel socket to the RefineID signature-creation-service
-  daemon when one is running (a separate component), and reports
-  card removal the same way, so that daemon neither prompts a
-  second time nor serves a stale cache. Forwards run detached;
-  failure is a diagnostic line, never an error to NSS.
-  PIN1 is validated as 4..=12 ASCII digits and cached in memory for
-  at most five minutes;
-  it is verified on the card inside each sign, never logged, and zeroized on logout, session close, or finalize.
+  PIN1 is validated as 4..=12 ASCII digits and verified on the card.
+  Once the card accepts it under a pristine retry counter, it is held in this process's memory with no idle window,
+  until the card is removed or replaced, the card refuses it, its retry counter reads below pristine,
+  or `C_Logout`, the last `C_CloseSession` or `C_Finalize` ends the login;
+  under a counter below pristine it only bridges to the next operation.
+  It is presented to the card inside each sign, never logged, and never written to storage
+  (see [credential custody](../../docs/security/credential-custody.md)).
 - Objects: `C_FindObjectsInit` / `C_FindObjects` / `C_FindObjectsFinal` and `C_GetAttributeValue` over three objects
   -- the authentication certificate (`CKO_CERTIFICATE`, `CKC_X_509`),
   its public key (`CKO_PUBLIC_KEY`, from the certificate SPKI, for

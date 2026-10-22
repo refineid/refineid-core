@@ -313,13 +313,14 @@ The fourteenth slice admits the paired phone as a PKCS#11 slot in
 `refineid-pkcs11`, behind one seam: a host installs a `RemoteTokenSource`
 before it hands out the function list, and the module reads from it, at
 every slot refresh, the one pairing offered right now. An offer carries a
-certificate only while the source holds an open session on which the
-phone reports a card, and it is the certificate the source read from that
-card on that session; the token exists exactly then, its objects are
-built from that certificate and the persisted CA certificates, and its
-serial names the pairing. A withdrawn or replaced token is a new token
-when it reappears: every raised token takes its own object-handle range,
-so a handle of a withdrawn token names nothing. `C_Login` on a remote
+certificate whose fingerprint the phone confirmed on a session, and keeps
+carrying it between sessions until the host withdraws it as RAPP
+v26.10.22 section 8.4 item 3 says; the token exists exactly then, its
+objects are built from that certificate and the persisted CA
+certificates, and its serial names the pairing. A withdrawn or replaced
+token is a new token when it reappears: every raised token takes its own
+object-handle range, so a handle of a withdrawn token names nothing.
+`C_Login` on a remote
 slot reads no PIN and succeeds only while the token is present, since
 the phone verifies PIN 1 itself; `C_Sign` builds one typed
 `SignatureRequest` from the caller's input -- the `DigestInfo` names the

@@ -1251,6 +1251,12 @@ pub(super) fn card_pin1_status(kind: &SlotKind) -> Result<PinStatus, CkRv> {
 /// pre-hashed PSO chain via [`sign_with_card`]. The card is dropped
 /// before returning.
 ///
+/// The held PIN1 is checked out for the card's token serial under the
+/// retry state the card reports in the same transaction, and settled by
+/// the card's answer to its VERIFY
+/// ([`crate::pin_cache::CheckedOutPin1::settle_verify`]): a value the
+/// card accepted stays held whatever the signature step does next.
+///
 /// # Errors
 /// [`CKR_PIN_INCORRECT`] / [`CKR_PIN_LOCKED`] on PIN failure,
 /// [`CKR_DEVICE_ERROR`] on any card / transport failure, or the
@@ -1300,7 +1306,7 @@ pub(super) fn card_sign(
     let checkout = pin_cache
         .lock()
         .map_err(|_poisoned| CKR_DEVICE_ERROR)?
-        .checkout_pin1(&serial)
+        .checkout_pin1(&serial, pin1_status)
         .ok_or(CKR_USER_NOT_LOGGED_IN)?;
     if pin1_status == PinStatus::Verified
         && let Ok(signature) = sign_with_card(&mut card, mechanism, input)
@@ -1312,26 +1318,15 @@ pub(super) fn card_sign(
     let secret =
         refineid_auth::UnvalidatedSecret::from_owned_bytes(checkout.pin().as_bytes().to_vec());
     let Ok(pin1) = refineid_auth::Pin1::reconstruct(secret) else {
-        clear_positive(pin_cache);
         return Err(CKR_DEVICE_ERROR);
     };
-    let outcome = card
-        .verify_pin1(pin1)
-        .map_err(|_verify_err| CKR_DEVICE_ERROR);
-    match outcome {
-        Ok(VerifyOutcome::Ok) => {
-            let signature = sign_with_card(&mut card, mechanism, input)?;
-            let mut cache = pin_cache.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?;
-            checkout.restore_after_success(&mut cache);
-            Ok(signature)
-        }
-        Ok(VerifyOutcome::WrongPin { .. }) => {
-            pin_cache
-                .lock()
-                .map_err(|_poisoned| CKR_DEVICE_ERROR)?
-                .record_rejected(&serial, checkout.pin());
-            Err(CKR_PIN_INCORRECT)
-        }
+    let answer = card.verify_pin1(pin1);
+    let mut cache = pin_cache.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?;
+    checkout.settle_verify(&mut cache, &answer);
+    drop(cache);
+    match answer {
+        Ok(VerifyOutcome::Ok) => sign_with_card(&mut card, mechanism, input),
+        Ok(VerifyOutcome::WrongPin { .. }) => Err(CKR_PIN_INCORRECT),
         Ok(VerifyOutcome::Locked) => Err(CKR_PIN_LOCKED),
         Ok(VerifyOutcome::Other(_)) | Err(_) => Err(CKR_DEVICE_ERROR),
     }
@@ -1480,7 +1475,10 @@ pub(super) fn remote_token_objects(
     Ok(objects)
 }
 
-/// Verify and cache a `C_Login` PIN only after the live card accepts it.
+/// Verify a `C_Login` PIN on the live card and keep it only once the
+/// card accepts it: held when the retry counter read before the VERIFY
+/// was pristine ([`PinSafetyCache::store_pin1`]), otherwise staged for
+/// the one operation that follows ([`PinSafetyCache::stage_pin1_once`]).
 #[expect(
     clippy::redundant_pub_crate,
     reason = "private root module helper is used by sibling api module; plain pub would violate the public-surface typing grep"

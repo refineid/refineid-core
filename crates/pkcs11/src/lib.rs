@@ -30,15 +30,19 @@
 //!
 //! A paired phone holding the card is a slot too, through the
 //! [`remote::RemoteTokenSource`] a host installs: the token exists
-//! while the phone serves a card on an open session, the phone
-//! verifies PIN 1 itself, and `C_Sign` hands the phone one typed
-//! signature request.
+//! while the host offers a certificate the phone confirmed on a
+//! session, the phone verifies PIN 1 itself, and `C_Sign` hands the
+//! phone one typed signature request.
 //!
-//! PIN1 secrecy (AGENTS.md hard rule #5). PIN1 lives only in a zeroizing
-//! `refineid_lib_core::pin::PinBytes`, is never logged or rendered,
-//! is verified on the card inside each signature (not cached on the
-//! card), and is dropped on `C_Logout`, the last `C_CloseSession`,
-//! card removal, and `C_Finalize`.
+//! PIN1 custody (`docs/security/credential-custody.md`). PIN1 lives
+//! only in a zeroizing [`pin::PinBytes`] in this process's memory, is
+//! never logged or rendered, and is presented to the card for every
+//! signature the card does not already report PIN1 verified for. It
+//! is held from the card's first acceptance with no idle window
+//! ([`pin_cache::PinSafetyCache`]), and destroyed on a refused,
+//! blocked or malformed answer, a retry counter below pristine,
+//! another card, card removal, `C_Logout`, the last `C_CloseSession`,
+//! and `C_Finalize`.
 //!
 //! Panics. The workspace builds with `panic = "abort"`, so a panic
 //! aborts the host process rather than unwinding across the C ABI

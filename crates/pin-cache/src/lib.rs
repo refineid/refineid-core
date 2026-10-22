@@ -20,28 +20,15 @@
 //! only as a keyed fingerprint under fresh process-local random material; the
 //! raw PIN bytes are never stored by this cache.
 //!
-//! The two cache-lifetime constants describe how long a host may retain a
-//! positively verified PIN in its own upstream policy. They are read by a host;
-//! this crate keeps no positive cache and consumes neither constant.
-
-use core::time::Duration;
+//! This crate keeps no positive cache. Holding a PIN1 the card accepted is a
+//! host's, under the credential custody contract: in process memory until an
+//! invalidation event, with no idle window. PIN2 is never held between
+//! operations.
 
 use refineid_auth::{CACHE_FINGERPRINT_KEY_LEN, CACHE_FINGERPRINT_LEN, CachedPin, PinSlot};
 use refineid_pkcs15::TokenSerial;
 use subtle::ConstantTimeEq as _;
 use zeroize::{Zeroize, ZeroizeOnDrop};
-
-/// PIN1 idle-session policy: a positively verified PIN1 may be retained upstream
-/// for at most this many minutes, its window refreshed on each use.
-const PIN1_CACHE_MINUTES: u64 = 15;
-
-/// Maximum lifetime a host may keep a positively verified PIN1, refreshed on
-/// each use -- an idle authentication-session window.
-pub const PIN1_CACHE_LIFETIME: Duration = Duration::from_mins(PIN1_CACHE_MINUTES);
-
-/// Maximum lifetime a host may keep a positively verified PIN2, measured from
-/// entry and never refreshed -- a bounded consent window for one signing batch.
-pub const PIN2_CACHE_LIFETIME: Duration = Duration::from_mins(1);
 
 /// Opaque keyed mark standing in for one card-rejected PIN value. Erases
 /// on drop, so a discarded candidate mark leaves no residue. The mark is

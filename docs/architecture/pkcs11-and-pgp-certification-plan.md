@@ -47,8 +47,9 @@ produce two distinct `cdylib` artifacts:
    - **Target**: Everyday authentication, web identification, and developer tooling.
    - **Key Reference**: `KEY_REF_AUTH` (PIN1-gated, NIST P-384 or RSA-3072).
    - **Certificate**: Citizen Authentication Certificate (`EF.CD #1` / `EF.4331`).
-   - **PIN Policy**: PIN1 (4–12 digits). Short-lived in-memory caching allowed
-     within strict process boundaries (§ credential custody).
+   - **PIN Policy**: PIN1 (4–12 digits). Held only in process memory, from the
+     card's first acceptance until an invalidation event, with no idle window
+     (§ credential custody).
    - **Consumers**: Firefox/NSS client-certificate TLS, Suomi.fi web login,
      Web-eID, OpenSSH client authentication (`ssh-add -s`).
 

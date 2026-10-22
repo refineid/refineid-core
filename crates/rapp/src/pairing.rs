@@ -540,10 +540,12 @@ mod tests {
 
     #[test]
     fn forgetting_again_keeps_the_first_time() {
+        let later = FORGOTTEN_AT_MS + REVOCATION_NOTICE_MS / 2;
         let forgotten = test_record(0x42)
             .forgotten(FORGOTTEN_AT_MS)
-            .forgotten(FORGOTTEN_AT_MS + REVOCATION_NOTICE_MS);
+            .forgotten(later);
         assert_eq!(forgotten.forgotten_at_ms(), Some(FORGOTTEN_AT_MS));
+        assert!(!forgotten.revocation_notice_expired(FORGOTTEN_AT_MS + REVOCATION_NOTICE_MS - 1));
         assert!(forgotten.revocation_notice_expired(FORGOTTEN_AT_MS + REVOCATION_NOTICE_MS));
     }
 

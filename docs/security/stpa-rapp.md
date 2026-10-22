@@ -1293,3 +1293,81 @@ its app runs; right after the phone leaves the screen, a Mac may spend
 one stream discovery window before it dials Bluetooth; Core NFC needs
 the app in front, so an NFC card operation from the background needs the
 holder to answer the notification.
+
+## 21. Serving every computer at once
+
+### 21.1 Scope
+
+Under CC-67 the custodian served one session at a time across its
+transports and refused a dial while that session was busy. A Mac whose
+token extension dialed the stream while the app's Bluetooth session
+carried an operation was refused that way, and so was a second computer:
+each saw its connection close and its login fail, the lockout of UCA-60
+across transports. The custodian now serves every routed connection as its
+own session on either transport, and the card's one-operation queue
+(CC-59) is the only serialization left. On a Mac the app holds the
+computer's one session and keeps running without its window. Losses and
+hazards are this record's: L-1, L-3; H-1, H-5, H-7.
+
+### 21.2 Control structure
+
+```
+Mac: token extension --handoff--> Mac app (one session, stream | BLE) --+
+other computers (one session each per connection) ----------------------+
+                                                                        v
+Phone: session 1..n, each with its own coordinator and dispatcher
+       card.status to every open session
+                 |
+                 v
+       card queue (first come first served, one whole operation)
+                 |                       \--queued--> a waiting session
+                 v
+       PIN prompt / holder summons (the operation holding the card only)
+                 |
+                 v
+                card
+```
+
+New control actions: the custodian admits a session per routed connection;
+the card queue grants the card's turn and releases it. New feedback:
+`queued` to a waiting session, once; an operation cancelled for its
+deadline is reported to its dispatcher as answered, so its prompt comes
+down and the queue moves on.
+
+### 21.3 Unsafe control actions
+
+| ID | Controller | Control action | Type | Context | Hazard |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| UCA-73 | Custodian | Show the PIN prompt or summons naming a computer | P | Naming a computer other than the one whose operation holds the card, so the holder consents for the wrong computer. | H-1, H-5 |
+| UCA-74 | Custodian | Release the card's turn | N, late | Not when the operation expired or its session ended while its prompt was up, so every other computer's operation waits behind a prompt nobody will answer. | H-7, H-5 |
+| UCA-75 | Custodian | Take down a prompt or summons | P | Another session's, because one session ended, so the holder's consent in progress for a computer still waiting is withdrawn. | H-7, H-5 |
+| UCA-76 | Requester | Open a session to the phone | P | While its own session is open or being established, by the extension beside the app or by a fixed short redial, so the phone holds sessions nobody needs and a refused dial repeats without end. | H-7 |
+| UCA-77 | Requester | End the Mac app | P | When its window closes, while the app holds the computer's one session: the extension falls back to dialing the stream per operation, and a phone reachable only over Bluetooth is unreachable. | H-7 |
+| UCA-78 | Custodian | Hold a connection that has not routed | P | Without a bound, so dialers on the local network that never authenticate hold the phone's connections and paired computers cannot reach it. | H-7 |
+
+### 21.4 Controller constraints
+
+| ID | Constraint | Closes |
+| :--- | :--- | :--- |
+| CC-74 | No session is displaced or refused for being busy, on any transport. The custodian serves every routed stream connection and every subscribed Bluetooth central as its own session, concurrently, and the card serves one whole operation at a time across all of them (CC-59). No other session cuts an admitted operation: it ends by its answer, its own session's end or its deadline, and a card command already under way runs to the card's answer. Over Bluetooth a computer is one central with one link, so it holds one session there. This supersedes CC-67 and CC-57's one session per pairing, and carries CC-58 to both transports. | UCA-66, UCA-60 |
+| CC-75 | The PIN prompt and the holder summons name the computer of the session whose operation holds the card. | UCA-73 |
+| CC-76 | An operation that expires, or whose session ends, releases the card's turn as soon as no card exchange of it is under way, and its prompt and summons come down at once. A waiting operation whose session ends or whose deadline passes leaves the queue at once. | UCA-74 |
+| CC-77 | Ending one session takes down only that session's prompt and summons. | UCA-75 |
+| CC-78 | A requester holds at most one session to its phone across its transports, and a Mac across its processes too: only the app holds it, on either transport, and the extension hands its operation to the app whenever the app runs and dials itself only when no app answers the handoff port. An iPad, whose extension has no handoff port, is the accepted exception below. Operations on that session wait their turn instead of failing busy. A failed or refused dial is followed by a wait that doubles from 2 to 32 seconds and starts over when a session comes up or the phone newly appears. This supersedes CC-71. | UCA-76, UCA-70 |
+| CC-79 | The Mac app keeps running when its window closes and starts at login, without a window; only quitting ends it. It registers itself as a login item once, and a removal by the user stands. | UCA-77 |
+| CC-80 | A connection on the custodian's session listener that has not sent its first whole frame within 5 seconds is closed, and at most 8 such connections wait at once. Routed, authenticated sessions have no quota (CC-58). | UCA-78 |
+
+Residuals, accepted:
+
+- The phone's own preparation of a reader card (opening the reader session
+  and reading the authentication certificate for `card.status`) runs on the
+  reader's exchange chain, not in the operation queue. It never splits one
+  card exchange and sends no PIN command, but it may run between two
+  exchanges of one operation, such as before a re-prompt after a refused PIN.
+- A Mac whose app is not running lets the extension dial a session per
+  operation; the phone serves it beside any other.
+- An iPad requester's extension dials its own stream session beside the
+  app's, since iOS gives it no handoff port, an exception to CC-78; the
+  phone serves them all.
+- `queued` reaches the requester on the wire, but no requester shows it as a
+  state of its own yet, so CC-62's display half is open.

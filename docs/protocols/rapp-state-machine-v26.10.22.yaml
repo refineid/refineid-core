@@ -106,7 +106,7 @@ actions:
   send_result_unsupported_parameter: "send operation.result rejected with unsupported_parameter or invalid_lifetime"
   send_progress_queued: "send operation.progress queued, once"
   present_consent: "ask the holder for a PIN the custodian does not hold, showing the admitted request; nothing when the custodian holds PIN 1 for a browser authentication"
-  send_progress_consent_shown: "send operation.progress consent_shown when a PIN prompt is on screen; nothing when no prompt is shown"
+  send_progress_consent_shown: "send operation.progress consent_shown when a PIN prompt is on screen, since entering the PIN is the holder's consent; nothing when no prompt is shown"
   dismiss_consent: "remove the PIN prompt"
   execute_read: "run the read-only card commands"
   check_retry_floor: "read the remaining attempts of the PIN the command needs"

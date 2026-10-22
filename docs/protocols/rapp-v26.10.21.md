@@ -1,13 +1,13 @@
 # Remote Authorization Proxy Protocol (RAPP) v26.10.21
 ## Pairing and Session Protocol over the BLE and Stream Transports
 
-Status: Stamped specification, reviewed by the owner  
-Document version: 26.10.21  
-Wire version: `[26, 10, 21]` (`[Year, Month, Day]`)  
-Offer version: `[26, 10, 21]`  
-Transport Profiles: `"fi.refineid.rapp.ble"`, `"fi.refineid.stream"` (§2.2)  
-Date: 2026-10-21  
-Change controller: RefineID project  
+Status: Stamped specification, reviewed by the owner\
+Document version: 26.10.21\
+Wire version: `[26, 10, 21]` (`[Year, Month, Day]`)\
+Offer version: `[26, 10, 21]`\
+Transport Profiles: `"fi.refineid.rapp.ble"`, `"fi.refineid.stream"` (§2.2)\
+Date: 2026-10-21\
+Change controller: RefineID project
 
 ---
 
@@ -35,7 +35,7 @@ This document defines the complete, standalone normative specification for the *
 - The **operation model** (§8): one operation at a time on the card, queued across sessions, forgotten with its session.
 - The **Registered Credential Profiles and Actions** for card status inspection, browser authentication, and qualified document signing.
 - **Service Withdrawal** (§4.5): the Custodian's notice, keyed by each pairing's static agreement, that it has stopped serving, on discovery and on open sessions.
-- **Pairing Storage Confirmation and Revocation** (§4.3, §4.6): each endpoint confirms its stored trust record before the pairing is active, and an endpoint that forgets a pairing tells the other, in-session and by a hint keyed by the pairing's static agreement.
+- **Pairing Storage Confirmation and Revocation** (§4.3, §4.6): each endpoint confirms its stored trust record before the pairing is active, and an endpoint that forgets a pairing tells the other with a `pairing_revoked` close, in session or as the first message of the next session.
 - **Card Presence** (§8.4): the Custodian's in-session notice of the card's presence, which bounds what a Requester may offer to local consumers.
 - **Concurrent Multi-Client Serving** (§8): the Custodian serves every paired Requester over its own session; card operations are serialized on the single card.
 - The **Failure Semantics, Retry Protection, and Human Consent Contracts**.
@@ -416,7 +416,7 @@ An endpoint **revokes** a pairing when its user forgets it, when a pairing fails
    If the revoking endpoint holds an open session to the peer, it sends the close at once.
 
 2. **On the Next Session**:
-   Otherwise the endpoint keeps the static private key for the close alone. A Custodian goes on announcing the pairing's hint (§4.5) and a Requester goes on dialing when the hint is in sight, as if nothing had changed; on the next session with the peer the revoking endpoint completes the handshake of §6.3, sends the close as its first message, and no card session starts.
+   Otherwise the endpoint keeps the static private key for the close alone. A Custodian goes on announcing the pairing's discovery hint (hierarchy specification §4.3) and a Requester goes on dialing when the hint is in sight, as if nothing had changed; on the next session with the peer the revoking endpoint completes the handshake of §6.3, sends the close as its first message, and no card session starts.
 
 3. **Key Destruction**:
    The static private key is destroyed once the close has been sent, or 30 days after the revocation, whichever comes first. A pairing not yet confirmed, and a revocation the confirmation deadline causes, destroy the key at once and tell nobody.
@@ -806,7 +806,7 @@ card-status-body = {
 ### 7.2 Envelope Rules
 1. **Version**: `version` is `[26, 10, 21]`, as `[Year, Month, Day]`. A version mismatch in a Noise prologue fails the handshake's AEAD: the link drops and stored pairings stay. An authenticated envelope with any other version closes the session.
 2. **Session**: `session_id` is the identifier derived from the handshake hash of the phase the envelope belongs to, the pairing `session_id` of §6.2 or the operational `session_id` of §6.3. An envelope with another `session_id` closes the session.
-3. **Sequence**: `sequence` starts at 0 in each direction and increases by exactly 1 per envelope; it equals the nonce of the Noise cipher state that encrypted the envelope. The first envelope received in a direction has `sequence` 0 and each accepted envelope raises the expected value by 1. An envelope whose `sequence` is not the expected value closes the session. A session ends as §8.4 item 5 says; the counter never wraps in practice, and an endpoint that would exceed $2^{64}-1$ closes the session with reason `"normal"`.
+3. **Sequence**: `sequence` starts at 0 in each direction and increases by exactly 1 per envelope; it equals the nonce of the Noise cipher state that encrypted the envelope. The first envelope received in a direction has `sequence` 0 and each accepted envelope raises the expected value by 1. An envelope whose `sequence` is not the expected value closes the session. A session ends as §8.3 says; the counter never wraps in practice, and an endpoint that would exceed $2^{64}-1$ closes the session with reason `"normal"`.
 4. **Encapsulation**: The `rapp-message` is encoded as deterministic CBOR (RFC 8949 Section 4.2) and encrypted with ChaCha20-Poly1305 under the direction's Noise cipher state, giving the ciphertext and a 16-byte tag. The ciphertext is one transport frame (§2.2).
 
 ---
@@ -948,7 +948,7 @@ What an endpoint does when something goes wrong depends on how much it knows abo
 2. **On a session**: a link drop, a timeout, an AEAD failure, a wrong version, a wrong `session_id` or `sequence`. A bit flip and an attacker look the same, so the endpoint closes the session and keeps the pairing; every operation of the session is over (§8). The card is never touched on the way out.
 3. **Inside an operation**: an unknown `operation_id`, an unsupported parameter, a credential the card refused. The endpoint rejects that operation with `operation.result` or `error` (§10.3); the session and the pairing stay.
 
-No failure revokes a pairing. Pairings are revoked by their users (§4.6).
+No failure revokes an active pairing: an active pairing is revoked by its user, or by its peer's `pairing_revoked` close (§4.6). A pairing whose confirmation fails is undone as §4.3 item 4 says.
 
 ### 10.2 PIN Entry and the Retry Floor
 - **Retry floor (PIN 1 and PIN 2)**: Before any command that could decrement a PIN try counter, the Custodian reads the card's remaining attempts for that PIN. It sends the verification only while the card reports **at least 3** remaining. With 2, 1 or 0 remaining, or a counter it cannot read, it refuses without sending any verification command, answering `operation.result` with `status: "rejected"` and `error: "retry_floor"`, and tells the holder that the card's remaining attempts are reserved for the card issuer's software. RefineID therefore never consumes a card's last two attempts and can never block a PIN. RAPP defines no unblocking; a blocked card is unblocked with the PIN unblocking key (PUK) outside RAPP.
@@ -963,7 +963,7 @@ error-body = {
 }
 ```
 
-The same names appear in the `error` field of `operation.result`:
+The same names appear in the `error` field of `operation.result`, except `"busy"` and `"duplicate_operation"`, which refuse a request before it becomes an operation and travel only in `error`:
 
 | `error_name` | Meaning |
 | :--- | :--- |

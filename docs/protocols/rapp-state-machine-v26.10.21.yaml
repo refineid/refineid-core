@@ -34,7 +34,7 @@ guards:
   local_user_action: "the event originates from the local user, never the peer"
   transcript_matches: "the completed handshake used the expected prologue and empty handshake payloads"
   granted_sets_equal: "both pairing.confirm granted_profiles sets are equal"
-  initiation_permitted: "a stored pairing is active and its custodian's discovery hint is in sight"
+  initiation_permitted: "a stored pairing is active, or forgotten and owing its revocation close, and its custodian's discovery hint is in sight"
   pairing_routed: "the routing tag matched an active stored pairing and its nonce is not in the replay memory"
   ready_parameters_match: "received session.ready parameters equal the local view"
 

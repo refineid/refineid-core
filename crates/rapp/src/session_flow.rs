@@ -3,8 +3,9 @@
 use core::fmt;
 
 use super::{
-    BinaryFrame, CryptoError, EndpointRole, EstablishedEndpoint, HandshakeChannel, HandshakeRole,
-    MessageError, OpenError, PairKeyMaterial, PairRecord, PairingState, RappState, SecureChannel,
+    AuthenticatedViolation, BinaryFrame, CloseReason, CryptoError, EndpointRole,
+    EstablishedEndpoint, HandshakeChannel, HandshakeRole, MessageError, OpenError, PairKeyMaterial,
+    PairRecord, PairingState, RappState, SecureChannel, SessionCloseMessage,
     SessionHandshakeParameters, SessionParameters, SessionReadyMessage, SessionState,
     TransportProfile, TypedMessage,
 };
@@ -125,7 +126,7 @@ impl SessionHandshake {
         self.channel.is_complete()
     }
 
-    /// Complete Noise and enter mutual parameter-echo verification.
+    /// Complete Noise and enter `session.ready` authentication.
     ///
     /// # Errors
     /// [`SessionError`] when Noise is incomplete or the handshake produced
@@ -141,8 +142,7 @@ impl SessionHandshake {
             session_id: completion.session_id,
             expected_parameters: self.expected_parameters,
             channel: Some(completion.secure_channel),
-            local_ready_sent: false,
-            peer_ready_received: false,
+            ready: false,
             _local_keys: self.local_keys,
         })
     }
@@ -161,82 +161,119 @@ impl fmt::Debug for SessionHandshake {
     }
 }
 
-/// Authenticated session which is not healthy until both parameter echoes are
-/// sent and verified.
+/// A completed Noise KK session that is not healthy until `session.ready`:
+/// the Custodian sends it, the Requester verifies it (RAPP v26.10.21 section
+/// 7.1 item 5). A revoking endpoint sends the `pairing_revoked` close in its
+/// place (section 4.6 item 2).
 pub struct SessionAuthentication {
     role: EndpointRole,
     pair_id: super::PairId,
     session_id: super::SessionId,
     expected_parameters: SessionParameters,
     channel: Option<SecureChannel>,
-    local_ready_sent: bool,
-    peer_ready_received: bool,
+    ready: bool,
     _local_keys: PairKeyMaterial,
 }
 
 impl SessionAuthentication {
-    /// Send local exact parameters with a caller-generated fresh nonce.
+    /// The Custodian's `session.ready`: the exact session parameters with a
+    /// caller-generated fresh nonce. The session is then healthy.
     ///
     /// # Errors
-    /// [`SessionError`] on a duplicate ready, a closed channel, or a seal
-    /// failure.
+    /// [`SessionError`] for a Requester, a second ready, a closed channel, or
+    /// a seal failure.
     pub fn send_ready(&mut self, nonce: [u8; 32]) -> Result<BinaryFrame, SessionError> {
-        if self.local_ready_sent {
+        if self.role != EndpointRole::Proxy {
+            return Err(SessionError::RoleViolation);
+        }
+        if self.ready {
             return Err(SessionError::DuplicateReady);
         }
-        let message = TypedMessage::SessionReady(SessionReadyMessage {
+        let frame = self.seal(&TypedMessage::SessionReady(SessionReadyMessage {
             parameters: self.expected_parameters.clone(),
             nonce,
-        });
-        let channel = self.channel.as_mut().ok_or(SessionError::Closed)?;
-        let body = message.to_wire_body().map_err(SessionError::Message)?;
-        let frame = channel
-            .seal(message.message_type(), body)
-            .map_err(SessionError::Crypto)?;
-        self.local_ready_sent = true;
+        }))?;
+        self.ready = true;
         Ok(frame)
     }
 
-    /// Verify the peer's authenticated exact parameter echo. Any failure
-    /// closes the session; the pairing stays (section 10.1 item 2).
+    /// The Requester reads the Custodian's first message: `session.ready`,
+    /// or a close in its place. Anything else, and ready parameters that
+    /// differ from the local view, close the session with a sealed
+    /// `protocol_violation` notice; the pairing stays (section 10.1 item 2).
     ///
     /// # Errors
-    /// [`SessionError`] naming the failure; the channel is closed.
-    pub fn receive_ready(&mut self, frame: &BinaryFrame, now_ms: u64) -> Result<(), SessionError> {
-        if self.peer_ready_received {
-            return self.fail(SessionError::DuplicateReady);
+    /// [`SessionError`] for a Custodian, a ready already verified, a closed
+    /// channel, or a frame that fails authentication, which closes the
+    /// session without a notice.
+    pub fn receive_ready(
+        &mut self,
+        frame: &BinaryFrame,
+        now_ms: u64,
+    ) -> Result<ReadyOutcome, SessionError> {
+        if self.role != EndpointRole::Requester {
+            return Err(SessionError::RoleViolation);
+        }
+        if self.ready {
+            return Err(SessionError::DuplicateReady);
         }
         let channel = self.channel.as_mut().ok_or(SessionError::Closed)?;
         let envelope = match channel.open(frame) {
             Ok(envelope) => envelope,
             Err(OpenError::SessionIntegrityFailure) => {
-                return self.fail(SessionError::IntegrityFailure);
+                self.channel = None;
+                return Err(SessionError::IntegrityFailure);
             }
             Err(OpenError::AuthenticatedProtocolViolation(error)) => {
-                return self.fail(SessionError::AuthenticatedWire(error));
+                return Ok(self.close_for_violation(AuthenticatedViolation::Wire(error)));
             }
         };
-        let message = match TypedMessage::from_envelope(envelope, now_ms) {
-            Ok(message) => message,
-            Err(error) => return self.fail(SessionError::Message(error)),
-        };
-        let TypedMessage::SessionReady(ready) = message else {
-            return self.fail(SessionError::UnexpectedMessage);
-        };
-        if ready.parameters != self.expected_parameters {
-            return self.fail(SessionError::ParameterMismatch);
-        }
-        self.peer_ready_received = true;
-        Ok(())
+        Ok(match TypedMessage::from_envelope(envelope, now_ms) {
+            Ok(TypedMessage::SessionReady(ready))
+                if ready.parameters == self.expected_parameters =>
+            {
+                self.ready = true;
+                ReadyOutcome::Verified
+            }
+            Ok(TypedMessage::SessionReady(_)) => {
+                self.close_for_violation(AuthenticatedViolation::ReadyParameterMismatch)
+            }
+            Ok(TypedMessage::SessionClose(close)) => {
+                self.channel = None;
+                ReadyOutcome::PeerClosed(close.reason)
+            }
+            Ok(message) => self.close_for_violation(AuthenticatedViolation::UnexpectedPhase(
+                message.message_type(),
+            )),
+            Err(error) => self.close_for_violation(AuthenticatedViolation::Semantic(error)),
+        })
     }
 
-    /// Promote to a healthy endpoint only after both directions verified ready.
+    /// The first and only message of a session whose pairing this endpoint
+    /// revoked: the sealed `session.close` with reason `pairing_revoked`
+    /// (section 4.6 item 2). The session closes; no card session starts.
     ///
     /// # Errors
-    /// [`SessionError`] before both ready echoes verify or when the channel
-    /// is already closed.
+    /// [`SessionError`] after the Custodian sent `session.ready`, on a closed
+    /// channel, or on a seal failure.
+    pub fn send_revocation_notice(&mut self) -> Result<BinaryFrame, SessionError> {
+        if self.role == EndpointRole::Proxy && self.ready {
+            return Err(SessionError::DuplicateReady);
+        }
+        let sealed = self.seal(&TypedMessage::SessionClose(SessionCloseMessage {
+            reason: CloseReason::PairingRevoked,
+        }));
+        self.channel = None;
+        sealed
+    }
+
+    /// Promote to a healthy endpoint once the Custodian sent, or the
+    /// Requester verified, `session.ready`.
+    ///
+    /// # Errors
+    /// [`SessionError`] before ready or when the channel is closed.
     pub fn into_established(mut self) -> Result<EstablishedEndpoint, SessionError> {
-        if !self.local_ready_sent || !self.peer_ready_received {
+        if !self.ready {
             return Err(SessionError::ReadyIncomplete);
         }
         let channel = self.channel.take().ok_or(SessionError::Closed)?;
@@ -247,20 +284,32 @@ impl SessionAuthentication {
                 role: self.role,
                 pairing: PairingState::PairedConnected,
                 session: SessionState::Healthy,
-                operation: super::OperationState::None,
             },
         ))
     }
 
-    /// Fresh session identifier used in operation request hashes.
+    /// The session identifier derived from the handshake hash.
     #[must_use]
     pub const fn session_id(&self) -> super::SessionId {
         self.session_id
     }
 
-    fn fail(&mut self, error: SessionError) -> Result<(), SessionError> {
+    fn seal(&mut self, message: &TypedMessage) -> Result<BinaryFrame, SessionError> {
+        let channel = self.channel.as_mut().ok_or(SessionError::Closed)?;
+        let body = message.to_wire_body().map_err(SessionError::Message)?;
+        channel
+            .seal(message.message_type(), body)
+            .map_err(SessionError::Crypto)
+    }
+
+    fn close_for_violation(&mut self, violation: AuthenticatedViolation) -> ReadyOutcome {
+        let notice = self
+            .seal(&TypedMessage::SessionClose(SessionCloseMessage {
+                reason: CloseReason::ProtocolViolation,
+            }))
+            .ok();
         self.channel = None;
-        Err(error)
+        ReadyOutcome::ViolationClosed { violation, notice }
     }
 }
 
@@ -275,10 +324,29 @@ impl fmt::Debug for SessionAuthentication {
                 "channel",
                 &self.channel.as_ref().map(|_| "[secure channel]"),
             )
-            .field("local_ready_sent", &self.local_ready_sent)
-            .field("peer_ready_received", &self.peer_ready_received)
+            .field("ready", &self.ready)
             .finish_non_exhaustive()
     }
+}
+
+/// What the Requester's reading of the Custodian's first message gives.
+#[derive(Debug)]
+pub enum ReadyOutcome {
+    /// The parameters match; promote with
+    /// [`SessionAuthentication::into_established`].
+    Verified,
+    /// The Custodian closed the session in place of `session.ready`, as a
+    /// revoking Custodian does; the session is closed.
+    PeerClosed(CloseReason),
+    /// Authenticated traffic violated the protocol; the session is closed
+    /// and the pairing stays. Deliver `notice`, the sealed
+    /// `protocol_violation` close, then drop the link.
+    ViolationClosed {
+        /// The violation.
+        violation: AuthenticatedViolation,
+        /// The sealed close, when it could be sealed.
+        notice: Option<BinaryFrame>,
+    },
 }
 
 /// Session establishment failure.
@@ -291,21 +359,16 @@ pub enum SessionError {
     StorageUnconfirmed,
     /// Handshake or channel cryptography failed.
     Crypto(CryptoError),
-    /// Authenticated message failed semantic decoding.
+    /// A local message failed to encode.
     Message(MessageError),
-    /// Successfully decrypted envelope violated the wire schema.
-    AuthenticatedWire(super::WireError),
-    /// Frame failed authenticated decryption; not peer-attributable.
+    /// Frame failed authenticated decryption; not peer-attributable. The
+    /// session closed.
     IntegrityFailure,
     /// Session handshake produced pairing-channel identifiers.
     UnexpectedPairId,
-    /// A second ready echo arrived or was sent.
+    /// `session.ready` was already sent or verified.
     DuplicateReady,
-    /// Message type is not legal during ready verification.
-    UnexpectedMessage,
-    /// Peer's ready parameters differ from the local view.
-    ParameterMismatch,
-    /// Promotion was attempted before both ready echoes verified.
+    /// Promotion was attempted before `session.ready`.
     ReadyIncomplete,
     /// Channel is already closed.
     Closed,

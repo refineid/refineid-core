@@ -108,16 +108,24 @@ impl AuthorizationTransaction {
         matches!(self.stage, AuthorizationStage::Terminal)
     }
 
-    /// Records completion of the profile's reads that precede consent.
+    /// Records that the operation has the card and its prerequisite reads
+    /// are done. An action that needs the holder's authorization waits for
+    /// consent; a read skips consent and runs (section 8.2 items 3 and 6).
     ///
     /// # Errors
     /// [`AuthorizationError::WrongStage`] outside the requested stage.
-    pub fn prerequisites_complete(&mut self) -> Result<(), AuthorizationError> {
+    pub fn prerequisites_complete(&mut self) -> Result<PrerequisitesOutcome, AuthorizationError> {
         if self.stage != AuthorizationStage::Requested {
             return Err(AuthorizationError::WrongStage(self.stage));
         }
-        self.stage = AuthorizationStage::AwaitingConsent;
-        Ok(())
+        if self.request.operation.is_consequential() {
+            self.stage = AuthorizationStage::AwaitingConsent;
+            return Ok(PrerequisitesOutcome::AwaitConsent);
+        }
+        self.stage = AuthorizationStage::ExecutingSafeRead;
+        Ok(PrerequisitesOutcome::ExecuteSafeRead(AuthorizedSafeRead {
+            operation: self.request.operation.clone(),
+        }))
     }
 
     /// Accepts the holder's approval and hands out the one card command.
@@ -130,7 +138,7 @@ impl AuthorizationTransaction {
         approval: UserApproval,
         now_ms: u64,
         maximum_lifetime_ms: u64,
-    ) -> Result<ApprovalOutcome, AuthorizationError> {
+    ) -> Result<PendingCardCommand<AuthorizedCardCommand>, AuthorizationError> {
         if self.stage != AuthorizationStage::AwaitingConsent {
             return Err(AuthorizationError::WrongStage(self.stage));
         }
@@ -147,18 +155,12 @@ impl AuthorizationTransaction {
         {
             return Err(AuthorizationError::Expired);
         }
-        let operation = self.request.operation.clone();
-        if operation.is_consequential() {
-            self.stage = AuthorizationStage::Executing;
-            Ok(ApprovalOutcome::ExecuteCardCommand(PendingCardCommand {
-                command: AuthorizedCardCommand { operation },
-            }))
-        } else {
-            self.stage = AuthorizationStage::ExecutingSafeRead;
-            Ok(ApprovalOutcome::ExecuteSafeRead(AuthorizedSafeRead {
-                operation,
-            }))
-        }
+        self.stage = AuthorizationStage::Executing;
+        Ok(PendingCardCommand {
+            command: AuthorizedCardCommand {
+                operation: self.request.operation.clone(),
+            },
+        })
     }
 
     /// Ends the operation with a result that did not complete.
@@ -261,7 +263,8 @@ impl AuthorizationTransaction {
 pub enum AuthorizationStage {
     /// Admitted; the reads that precede consent have not completed.
     Requested,
-    /// Consent may be shown.
+    /// The consent view may be shown; only an action that needs the
+    /// holder's authorization comes here.
     AwaitingConsent,
     /// A registered read is running.
     ExecutingSafeRead,
@@ -271,12 +274,13 @@ pub enum AuthorizationStage {
     Terminal,
 }
 
-/// What the holder's approval releases.
+/// What follows once an operation has the card and its prerequisite reads
+/// are done.
 #[derive(Debug)]
-pub enum ApprovalOutcome {
-    /// Take the one card command.
-    ExecuteCardCommand(PendingCardCommand<AuthorizedCardCommand>),
-    /// Execute this read and answer directly with a result.
+pub enum PrerequisitesOutcome {
+    /// Show the consent view and wait for the holder.
+    AwaitConsent,
+    /// Execute this read and answer directly with a result; no consent.
     ExecuteSafeRead(AuthorizedSafeRead),
 }
 

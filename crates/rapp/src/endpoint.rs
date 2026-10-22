@@ -2,8 +2,9 @@
 //! pairing (RAPP v26.10.21 section 10.1).
 
 use super::{
-    BinaryFrame, CryptoError, MessageError, MessageType, OpenError, PairId, ProxyViolation,
-    RappState, RequesterViolation, SecureChannel, SecurityOutcome, TypedMessage, WireError,
+    BinaryFrame, CloseReason, CryptoError, MessageError, MessageType, OpenError, PairId,
+    ProxyViolation, RappState, RequesterViolation, SecureChannel, SecurityOutcome,
+    SessionCloseMessage, TypedMessage, WireError,
 };
 use core::fmt;
 
@@ -38,8 +39,9 @@ impl EstablishedEndpoint {
     }
 
     /// Opens and fully validates one encrypted frame. A frame that fails
-    /// authentication, or an authenticated one that violates the protocol,
-    /// closes the session; the pairing stays.
+    /// authentication closes the session; an authenticated one that violates
+    /// the protocol closes it with a sealed `protocol_violation` notice. The
+    /// pairing stays.
     ///
     /// # Errors
     /// [`EndpointError::SessionClosed`] when the session is already closed.
@@ -113,8 +115,17 @@ impl EstablishedEndpoint {
 
     fn close_for_violation(&mut self, violation: AuthenticatedViolation) -> ReceiveOutcome {
         let outcome = self.state.authenticated_protocol_violation();
+        let notice = self
+            .send(&TypedMessage::SessionClose(SessionCloseMessage {
+                reason: CloseReason::ProtocolViolation,
+            }))
+            .ok();
         self.channel = None;
-        ReceiveOutcome::ViolationClosed { violation, outcome }
+        ReceiveOutcome::ViolationClosed {
+            violation,
+            outcome,
+            notice,
+        }
     }
 }
 
@@ -140,12 +151,14 @@ pub enum ReceiveOutcome {
     /// A frame failed authentication; the session closed.
     SessionClosed(SecurityOutcome),
     /// Authenticated traffic violated the protocol; the session closed and
-    /// the pairing stays.
+    /// the pairing stays. Deliver `notice`, then drop the link.
     ViolationClosed {
         /// The violation.
         violation: AuthenticatedViolation,
         /// Effects the endpoint carries out.
         outcome: SecurityOutcome,
+        /// The sealed `protocol_violation` close, when it could be sealed.
+        notice: Option<BinaryFrame>,
     },
 }
 
@@ -156,8 +169,13 @@ pub enum AuthenticatedViolation {
     Wire(WireError),
     /// Typed-message or profile semantic violation.
     Semantic(MessageError),
-    /// A pairing or session-authentication message on an established session.
+    /// A message the session's phase does not admit: a pairing message, a
+    /// `session.ready` on a healthy session, or anything but `session.ready`
+    /// or a close as the Custodian's first message.
     UnexpectedPhase(MessageType),
+    /// The Custodian's `session.ready` parameters differ from the local
+    /// view.
+    ReadyParameterMismatch,
     /// An operation engine had no legal transition for the message.
     Operation(OperationViolation),
 }

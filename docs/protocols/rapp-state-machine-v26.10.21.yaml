@@ -259,17 +259,17 @@ pairing:
       to: revoking
       actions: [mark_record_revoked, withdraw_identity, show_forgotten]
     - from: revoking
-      event: session_healthy               # the next session carries the close and nothing else
+      event: revocation_notice_sent        # produced by the next session sending the close as its first message
       role: both
       to: revoked
-      actions: [send_close_pairing_revoked, close_session, destroy_pair_keys]
+      actions: [destroy_pair_keys]
     - from: revoking
       event: notice_window_expired         # revocation_notice_days after the revocation
       role: both
       to: revoked
       actions: [destroy_pair_keys]
-    - from: [paired_connected, revoking]
-      event: peer_revocation_notice        # session.close with reason pairing_revoked
+    - from: [paired_disconnected, paired_connected, revoking]
+      event: peer_revocation_notice        # session.close with reason pairing_revoked, also in place of session.ready
       role: both
       to: revoked
       actions: [mark_record_revoked, close_session, destroy_pair_keys, withdraw_identity, show_peer_forgot]
@@ -291,6 +291,7 @@ session:
     - closed
   notes:
     - "entering healthy produces session_healthy; entering closed after healthy was reached produces session_closed"
+    - "handshake_complete_while_revoking produces revocation_notice_sent; a received close with reason pairing_revoked produces peer_revocation_notice"
     - "entering closing produces session_closed for the session's operation"
     - "closed is terminal for the instance"
   transitions:
@@ -326,6 +327,16 @@ session:
       role: requester
       to: authenticating
       actions: [derive_session_identifiers]
+    - from: authenticating
+      event: handshake_complete_while_revoking   # the pairing is revoking: the close is the session's first message
+      role: both
+      to: closed
+      actions: [derive_session_identifiers, send_close_pairing_revoked, destroy_session_material]
+    - from: authenticating
+      event: peer_close_received           # a revoking custodian's close in place of session.ready
+      role: requester
+      to: closed
+      actions: [record_peer_close_reason, destroy_session_material]
     - from: authenticating
       event: ready_verified
       role: requester

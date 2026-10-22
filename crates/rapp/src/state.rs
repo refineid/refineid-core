@@ -154,6 +154,8 @@ pub enum PairingEvent {
     SessionClosed,
     /// The local user forgot the pairing.
     ForgetPairing,
+    /// The revocation close went out as a session's first message.
+    RevocationNoticeSent,
     /// The revocation notice window passed.
     NoticeWindowExpired,
     /// A session.close with reason pairing_revoked arrived.
@@ -173,6 +175,9 @@ pub enum SessionEvent {
     TransportFailed,
     /// The Noise_KK handshake completed.
     HandshakeComplete,
+    /// The Noise_KK handshake completed for a pairing this endpoint is
+    /// revoking.
+    HandshakeCompleteWhileRevoking,
     /// The requester verified session.ready.
     ReadyVerified,
     /// Input before authentication was invalid.
@@ -667,17 +672,23 @@ impl PairingState {
                     actions: &[A::MarkRecordRevoked, A::WithdrawIdentity, A::ShowForgotten],
                 }
             }
-            (Self::Revoking, E::SessionHealthy) => Transition {
+            (Self::Revoking, E::RevocationNoticeSent) => Transition {
                 state: Self::Revoked,
-                actions: &[
-                    A::SendClosePairingRevoked,
-                    A::CloseSession,
-                    A::DestroyPairKeys,
-                ],
+                actions: &[A::DestroyPairKeys],
             },
             (Self::Revoking, E::NoticeWindowExpired) => Transition {
                 state: Self::Revoked,
                 actions: &[A::DestroyPairKeys],
+            },
+            (Self::PairedDisconnected, E::PeerRevocationNotice) => Transition {
+                state: Self::Revoked,
+                actions: &[
+                    A::MarkRecordRevoked,
+                    A::CloseSession,
+                    A::DestroyPairKeys,
+                    A::WithdrawIdentity,
+                    A::ShowPeerForgot,
+                ],
             },
             (Self::PairedConnected, E::PeerRevocationNotice) => Transition {
                 state: Self::Revoked,
@@ -781,6 +792,21 @@ impl SessionState {
                     actions: &[A::DeriveSessionIdentifiers],
                 },
             },
+            (Self::Authenticating, E::HandshakeCompleteWhileRevoking) => Transition {
+                state: Self::Closed,
+                actions: &[
+                    A::DeriveSessionIdentifiers,
+                    A::SendClosePairingRevoked,
+                    A::DestroySessionMaterial,
+                ],
+            },
+            (Self::Authenticating, E::PeerCloseReceived) => {
+                require_role(role, EndpointRole::Requester)?;
+                Transition {
+                    state: Self::Closed,
+                    actions: &[A::RecordPeerCloseReason, A::DestroySessionMaterial],
+                }
+            }
             (Self::Authenticating, E::ReadyVerified) => {
                 require_role(role, EndpointRole::Requester)?;
                 require(guards.ready_parameters_match)?;
@@ -1180,8 +1206,9 @@ impl OperationState {
     }
 }
 
-/// What an endpoint keeps of one pairing, its session and the session's
-/// operation.
+/// What an endpoint keeps of one pairing and its session. The session's
+/// operation lives in the operation engines, which end it when the session
+/// closes (cross-component rule X-02).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RappState {
     /// Local endpoint projection.
@@ -1190,8 +1217,6 @@ pub struct RappState {
     pub pairing: PairingState,
     /// Session component.
     pub session: SessionState,
-    /// The session's live operation.
-    pub operation: OperationState,
 }
 
 /// Ordered effects of a security event that spans the machines.
@@ -1209,16 +1234,15 @@ impl RappState {
             role,
             pairing: PairingState::Unpaired,
             session: SessionState::Absent,
-            operation: OperationState::None,
         }
     }
 
-    /// Operation admission (cross-component rule X-03).
+    /// The pairing and session half of operation admission (cross-component
+    /// rule X-03); the operation engines refuse a second live operation.
     #[must_use]
     pub const fn operation_admission_permitted(&self) -> bool {
         matches!(self.pairing, PairingState::PairedConnected)
             && matches!(self.session, SessionState::Healthy)
-            && matches!(self.operation, OperationState::None)
     }
 
     /// An authenticated message violated the protocol. The session closes
@@ -1261,16 +1285,6 @@ impl RappState {
         if let Ok(transition) = self.session.transition(self.role, event, Guards::default()) {
             self.session = transition.state;
             actions.extend_from_slice(transition.actions);
-            if self.session == SessionState::Closing
-                && let Ok(operation) = self.operation.transition(
-                    self.role,
-                    OperationEvent::SessionClosed,
-                    Guards::default(),
-                )
-            {
-                self.operation = operation.state;
-                actions.extend_from_slice(operation.actions);
-            }
         }
         SecurityOutcome { actions }
     }
@@ -1278,20 +1292,19 @@ impl RappState {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, EndpointRole, OperationState, PairingState, RappState, SessionState};
+    use super::{Action, EndpointRole, PairingState, RappState, SessionState};
 
-    const fn connected(role: EndpointRole, operation: OperationState) -> RappState {
+    const fn connected(role: EndpointRole) -> RappState {
         RappState {
             role,
             pairing: PairingState::PairedConnected,
             session: SessionState::Healthy,
-            operation,
         }
     }
 
     #[test]
     fn an_authenticated_violation_closes_the_session_and_keeps_the_pairing() {
-        let mut state = connected(EndpointRole::Requester, OperationState::None);
+        let mut state = connected(EndpointRole::Requester);
         let outcome = state.authenticated_protocol_violation();
         assert_eq!(state.pairing, PairingState::PairedConnected);
         assert_eq!(state.session, SessionState::Closing);
@@ -1305,31 +1318,10 @@ mod tests {
 
     #[test]
     fn an_integrity_failure_keeps_the_pairing() {
-        let mut state = connected(EndpointRole::Proxy, OperationState::None);
+        let mut state = connected(EndpointRole::Proxy);
         state.session_integrity_failed();
         assert_eq!(state.pairing, PairingState::PairedConnected);
         assert_eq!(state.session, SessionState::Closing);
-    }
-
-    #[test]
-    fn closing_lets_a_commanded_card_finish_and_discards_its_answer() {
-        let mut state = connected(EndpointRole::Proxy, OperationState::Executing);
-        let outcome = state.silence_limit_reached();
-        assert_eq!(state.operation, OperationState::None);
-        assert!(
-            outcome
-                .actions
-                .contains(&Action::ContinueCardExchangeLocally)
-        );
-        assert!(outcome.actions.contains(&Action::DiscardAnswer));
-    }
-
-    #[test]
-    fn closing_tells_the_requester_its_operation_is_lost() {
-        let mut state = connected(EndpointRole::Requester, OperationState::Requested);
-        let outcome = state.silence_limit_reached();
-        assert_eq!(state.operation, OperationState::None);
-        assert!(outcome.actions.contains(&Action::ReportOperationLost));
     }
 
     #[test]
@@ -1338,7 +1330,6 @@ mod tests {
             role: EndpointRole::Requester,
             pairing: PairingState::Confirming,
             session: SessionState::Absent,
-            operation: OperationState::None,
         };
         state.authenticated_protocol_violation();
         assert_eq!(state.pairing, PairingState::Unpaired);

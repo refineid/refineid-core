@@ -27,9 +27,9 @@ use super::{
     CardOperation, CardOperationResult, CardStatusMessage, CertificateFingerprint, CertificateKind,
     CloseReason, EndpointError, EstablishedSessionRuntime, OperationId, OperationRequest,
     OperationResultMessage, OperationViolation, PingChallenge, ProfileName, ProxyDispatch,
-    ProxyEngineError, ProxyFailure, ProxyOperationEngine, RequesterDispatch, RequesterEngineError,
-    RequesterOperationEngine, ResultError, RuntimeError, RuntimePoll, RuntimeReceive,
-    SignatureAlgorithm, TypedMessage, UserApproval,
+    ProxyEngineError, ProxyFailure, ProxyOperationEngine, ProxySessionCloseAction,
+    RequesterDispatch, RequesterEngineError, RequesterOperationEngine, ResultError, RuntimeError,
+    RuntimePoll, RuntimeReceive, SignatureAlgorithm, TypedMessage, UserApproval,
     bindings::{RappBindingError, RappSessionBridge, fixed_array},
 };
 
@@ -283,7 +283,8 @@ impl From<super::ProgressEvent> for RappProgressEvent {
 pub enum RappBridgeActionKind {
     /// Deliver one opaque encrypted frame to the transport.
     SendFrame,
-    /// Perform the reads that precede consent.
+    /// Take the card in the order operations arrived, perform the reads
+    /// that precede consent, then call `prerequisites_complete`.
     InspectPrerequisites,
     /// Present the descriptor and wait for the holder.
     AwaitUserApproval,
@@ -304,7 +305,12 @@ pub enum RappBridgeActionKind {
     /// Nothing to execute.
     NoAction,
     /// The session closed; the pairing stays. `operation_id`, when present,
-    /// names the requester's operation that ended with it.
+    /// names the session's operation that ended with it, and
+    /// `card_exchange_continues` says whether the custodian's card command
+    /// runs on to the card's answer, which is discarded (RAPP section 8.1
+    /// item 3). On a received `PairingRevoked` close, revoke the record with
+    /// `RappPairRecord::revoke` and withdraw its identity (section 4.6 item
+    /// 4).
     SessionClosed,
 }
 
@@ -433,10 +439,14 @@ pub struct RappBridgeAction {
     /// Registered reason of a session closed by an authenticated notice,
     /// sent or received.
     pub close_reason: Option<RappCloseReason>,
+    /// On a closed session, the custodian's card command for `operation_id`
+    /// runs to the card's answer, which is discarded; otherwise the
+    /// operation was dropped before the card was commanded.
+    pub card_exchange_continues: bool,
 }
 
 impl RappBridgeAction {
-    const fn simple(kind: RappBridgeActionKind) -> Self {
+    pub(super) const fn simple(kind: RappBridgeActionKind) -> Self {
         Self {
             kind,
             operation_id: None,
@@ -449,6 +459,7 @@ impl RappBridgeAction {
             certificate_fingerprint: None,
             close_session_after_send: false,
             close_reason: None,
+            card_exchange_continues: false,
         }
     }
 
@@ -467,10 +478,65 @@ impl RappBridgeAction {
         }
     }
 
-    fn session_closed(lost: Option<OperationId>) -> Self {
-        Self {
-            operation_id: lost.map(|id| id.as_bytes().to_vec()),
+    pub(super) fn session_closed(ended: EndedOperation) -> Self {
+        Self::simple(RappBridgeActionKind::SessionClosed).ending(ended)
+    }
+
+    /// The session closed on a protocol violation: deliver the sealed
+    /// `protocol_violation` notice, when there is one, then drop the link.
+    pub(super) fn violation_closed(notice: Option<BinaryFrame>) -> Self {
+        let closed = Self {
+            close_reason: Some(RappCloseReason::ProtocolViolation),
             ..Self::simple(RappBridgeActionKind::SessionClosed)
+        };
+        match notice {
+            Some(frame) => Self {
+                kind: RappBridgeActionKind::SendFrame,
+                frame: Some(frame.into_bytes()),
+                close_session_after_send: true,
+                ..closed
+            },
+            None => closed,
+        }
+    }
+
+    /// Name the session's operation that ended with the session.
+    fn ending(self, ended: EndedOperation) -> Self {
+        Self {
+            operation_id: ended.operation_id.map(|id| id.as_bytes().to_vec()),
+            card_exchange_continues: ended.card_exchange_continues,
+            ..self
+        }
+    }
+}
+
+/// The session's operation that ended when the session closed (RAPP
+/// section 8.1 item 3).
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct EndedOperation {
+    operation_id: Option<OperationId>,
+    card_exchange_continues: bool,
+}
+
+impl EndedOperation {
+    fn requester(engine: &mut RequesterOperationEngine) -> Self {
+        Self {
+            operation_id: engine.session_closed(),
+            card_exchange_continues: false,
+        }
+    }
+
+    fn proxy(engine: &mut ProxyOperationEngine) -> Self {
+        match engine.session_closed() {
+            None => Self::default(),
+            Some(ProxySessionCloseAction::Dropped(operation_id)) => Self {
+                operation_id: Some(operation_id),
+                card_exchange_continues: false,
+            },
+            Some(ProxySessionCloseAction::ContinueCardExchange(operation_id)) => Self {
+                operation_id: Some(operation_id),
+                card_exchange_continues: true,
+            },
         }
     }
 }
@@ -821,25 +887,21 @@ impl RappOperationBridge {
                 let message = match receive_runtime(runtime, &frame, now_ms)? {
                     RuntimeFrame::Message(message) => message,
                     RuntimeFrame::Action(action) => return Ok(action),
-                    RuntimeFrame::Closed(mut action) => {
-                        let lost = engine.session_closed();
-                        action.operation_id = lost.map(|id| id.as_bytes().to_vec());
+                    RuntimeFrame::Closed(action) => {
+                        let ended = EndedOperation::requester(engine);
                         *state = OperationBridgeState::Closed;
-                        return Ok(action);
+                        return Ok(action.ending(ended));
                     }
                 };
                 match engine.receive(message) {
                     Ok(dispatch) => requester_dispatch(dispatch),
                     Err(RequesterEngineError::AuthenticatedProtocolViolation(violation)) => {
-                        runtime.close_for_operation_violation(OperationViolation::Requester(
-                            violation,
+                        let notice = violation_notice(runtime.close_for_operation_violation(
+                            OperationViolation::Requester(violation),
                         ));
-                        let lost = engine.session_closed();
+                        let ended = EndedOperation::requester(engine);
                         *state = OperationBridgeState::Closed;
-                        return Ok(RappBridgeAction {
-                            close_reason: Some(RappCloseReason::ProtocolViolation),
-                            ..RappBridgeAction::session_closed(lost)
-                        });
+                        return Ok(RappBridgeAction::violation_closed(notice).ending(ended));
                     }
                     Err(_) => return Err(RappBindingError::LocalStateFailure),
                 }
@@ -853,9 +915,9 @@ impl RappOperationBridge {
                     RuntimeFrame::Message(message) => message,
                     RuntimeFrame::Action(action) => return Ok(action),
                     RuntimeFrame::Closed(action) => {
-                        engine.session_closed();
+                        let ended = EndedOperation::proxy(engine);
                         *state = OperationBridgeState::Closed;
-                        return Ok(action);
+                        return Ok(action.ending(ended));
                     }
                 };
                 let incoming = match &message {
@@ -865,13 +927,13 @@ impl RappOperationBridge {
                 let dispatch = match engine.receive(message) {
                     Ok(dispatch) => dispatch,
                     Err(ProxyEngineError::AuthenticatedProtocolViolation(violation)) => {
-                        runtime.close_for_operation_violation(OperationViolation::Proxy(violation));
-                        engine.session_closed();
+                        let notice =
+                            violation_notice(runtime.close_for_operation_violation(
+                                OperationViolation::Proxy(violation),
+                            ));
+                        let ended = EndedOperation::proxy(engine);
                         *state = OperationBridgeState::Closed;
-                        return Ok(RappBridgeAction {
-                            close_reason: Some(RappCloseReason::ProtocolViolation),
-                            ..RappBridgeAction::session_closed(None)
-                        });
+                        return Ok(RappBridgeAction::violation_closed(notice).ending(ended));
                     }
                     Err(_) => return Err(RappBindingError::LocalStateFailure),
                 };
@@ -889,30 +951,37 @@ impl RappOperationBridge {
         Ok(action)
     }
 
-    /// Mark the reads that precede consent complete.
+    /// The operation has the card and its prerequisite reads are done. An
+    /// action that needs the holder's authorization gives
+    /// `AwaitUserApproval`; a read skips consent and gives `ExecuteSafeRead`
+    /// (RAPP section 8.2 items 3 and 6). An operation past its deadline is
+    /// cancelled instead, with the result to send. `now_ms` is the
+    /// continuous clock.
     ///
     /// # Errors
     /// [`RappBindingError`] on invalid input or the wrong protocol phase.
     pub fn prerequisites_complete(
         &self,
         operation_id: Vec<u8>,
+        now_ms: u64,
     ) -> Result<RappBridgeAction, RappBindingError> {
         let operation_id = decode_operation_id(&operation_id)?;
         let mut state = self.lock_state()?;
         let OperationBridgeState::Proxy {
+            runtime,
             engine,
             live_request,
-            ..
         } = &mut *state
         else {
             return Err(RappBindingError::WrongPhase);
         };
-        engine
-            .prerequisites_complete(operation_id)
+        let dispatch = engine
+            .prerequisites_complete(operation_id, now_ms, self.maximum_lifetime_ms)
             .map_err(|_| RappBindingError::WrongPhase)?;
-        let mut action =
-            RappBridgeAction::for_operation(RappBridgeActionKind::AwaitUserApproval, operation_id);
-        action.operation = Some((&live(live_request.as_ref(), operation_id)?.operation).into());
+        let action = proxy_dispatch(runtime, engine, live_request.as_ref(), dispatch);
+        if action.kind == RappBridgeActionKind::SessionClosed {
+            *state = OperationBridgeState::Closed;
+        }
         drop(state);
         Ok(action)
     }
@@ -1243,15 +1312,14 @@ impl RappOperationBridge {
                 .poll(now_ms, challenge)
                 .map_err(|_| RappBindingError::ProtocolFailure)?,
             OperationBridgeState::Closed => {
-                return Ok(RappBridgeAction::session_closed(None));
+                return Ok(RappBridgeAction::session_closed(EndedOperation::default()));
             }
         };
         let action = match decision {
             RuntimePoll::NoAction => RappBridgeAction::simple(RappBridgeActionKind::NoAction),
             RuntimePoll::Send(frame) => RappBridgeAction::send(None, frame),
             RuntimePoll::SessionClosed(_) | RuntimePoll::AlreadyClosed => {
-                let lost = end_operations(&mut state);
-                RappBridgeAction::session_closed(lost)
+                RappBridgeAction::session_closed(end_operations(&mut state))
             }
         };
         drop(state);
@@ -1270,9 +1338,9 @@ impl RappOperationBridge {
             | OperationBridgeState::Proxy { runtime, .. } => runtime.close_session(),
             OperationBridgeState::Closed => {}
         }
-        let lost = end_operations(&mut state);
+        let ended = end_operations(&mut state);
         drop(state);
-        Ok(RappBridgeAction::session_closed(lost))
+        Ok(RappBridgeAction::session_closed(ended))
     }
 
     /// Close the session with an authenticated `session.close` carrying
@@ -1294,16 +1362,19 @@ impl RappOperationBridge {
             }
             OperationBridgeState::Closed => None,
         };
-        let lost = end_operations(&mut state);
+        let ended = end_operations(&mut state);
         drop(state);
-        Ok(sealed.map_or_else(
-            || RappBridgeAction::session_closed(lost),
-            |frame| RappBridgeAction {
+        let closed = RappBridgeAction::session_closed(ended);
+        Ok(match sealed {
+            Some(frame) => RappBridgeAction {
+                kind: RappBridgeActionKind::SendFrame,
+                frame: Some(frame.into_bytes()),
                 close_reason: Some(reason),
                 close_session_after_send: true,
-                ..RappBridgeAction::send(lost, frame)
+                ..closed
             },
-        ))
+            None => closed,
+        })
     }
 }
 
@@ -1351,9 +1422,9 @@ impl RappOperationBridge {
             RappBridgeAction::send(Some(operation_id), frame)
         } else {
             runtime.close_session();
-            let lost = engine.session_closed();
+            let ended = EndedOperation::requester(engine);
             *state = OperationBridgeState::Closed;
-            RappBridgeAction::session_closed(lost)
+            RappBridgeAction::session_closed(ended)
         };
         drop(state);
         Ok(action)
@@ -1415,19 +1486,25 @@ impl RappOperationBridge {
     }
 }
 
-/// End every operation of a closing session; returns the requester's
-/// operation that ended with it.
-fn end_operations(state: &mut OperationBridgeState) -> Option<OperationId> {
-    let lost = match state {
-        OperationBridgeState::Requester { engine, .. } => engine.session_closed(),
-        OperationBridgeState::Proxy { engine, .. } => {
-            engine.session_closed();
-            None
-        }
-        OperationBridgeState::Closed => None,
+/// End every operation of a closing session; returns the operation that
+/// ended with it.
+fn end_operations(state: &mut OperationBridgeState) -> EndedOperation {
+    let ended = match state {
+        OperationBridgeState::Requester { engine, .. } => EndedOperation::requester(engine),
+        OperationBridgeState::Proxy { engine, .. } => EndedOperation::proxy(engine),
+        OperationBridgeState::Closed => EndedOperation::default(),
     };
     *state = OperationBridgeState::Closed;
-    lost
+    ended
+}
+
+/// The sealed `protocol_violation` close of a session an operation engine
+/// closed.
+fn violation_notice(received: RuntimeReceive) -> Option<BinaryFrame> {
+    match received {
+        RuntimeReceive::ViolationClosed { notice, .. } => notice,
+        _ => None,
+    }
 }
 
 fn requester_dispatch(dispatch: RequesterDispatch) -> RappBridgeAction {
@@ -1493,6 +1570,12 @@ fn proxy_dispatch(
                 operation_id,
             )
         },
+        ProxyDispatch::AwaitConsent(operation_id) => RappBridgeAction {
+            operation: live_request
+                .filter(|request| request.operation_id == operation_id)
+                .map(|request| (&request.operation).into()),
+            ..RappBridgeAction::for_operation(RappBridgeActionKind::AwaitUserApproval, operation_id)
+        },
         ProxyDispatch::ExecuteSafeRead { operation_id, read } => RappBridgeAction {
             operation: Some((&read.operation).into()),
             ..RappBridgeAction::for_operation(RappBridgeActionKind::ExecuteSafeRead, operation_id)
@@ -1528,8 +1611,7 @@ fn send_proxy(
         RappBridgeAction::send(operation_id, frame)
     } else {
         runtime.close_session();
-        engine.session_closed();
-        RappBridgeAction::session_closed(None)
+        RappBridgeAction::session_closed(EndedOperation::proxy(engine))
     }
 }
 
@@ -1547,7 +1629,9 @@ fn receive_runtime(
     let received = match runtime.receive(frame, now_ms) {
         Ok(received) => received,
         Err(RuntimeError::Receive(EndpointError::SessionClosed)) => {
-            return Ok(RuntimeFrame::Closed(RappBridgeAction::session_closed(None)));
+            return Ok(RuntimeFrame::Closed(RappBridgeAction::session_closed(
+                EndedOperation::default(),
+            )));
         }
         Err(_) => return Err(RappBindingError::ProtocolFailure),
     };
@@ -1558,15 +1642,14 @@ fn receive_runtime(
             RuntimeFrame::Action(RappBridgeAction::simple(RappBridgeActionKind::NoAction))
         }
         RuntimeReceive::SessionClosed(_) => {
-            RuntimeFrame::Closed(RappBridgeAction::session_closed(None))
+            RuntimeFrame::Closed(RappBridgeAction::session_closed(EndedOperation::default()))
         }
-        RuntimeReceive::ViolationClosed { .. } => RuntimeFrame::Closed(RappBridgeAction {
-            close_reason: Some(RappCloseReason::ProtocolViolation),
-            ..RappBridgeAction::session_closed(None)
-        }),
+        RuntimeReceive::ViolationClosed { notice, .. } => {
+            RuntimeFrame::Closed(RappBridgeAction::violation_closed(notice))
+        }
         RuntimeReceive::PeerClosed(reason) => RuntimeFrame::Closed(RappBridgeAction {
             close_reason: Some(reason.into()),
-            ..RappBridgeAction::session_closed(None)
+            ..RappBridgeAction::session_closed(EndedOperation::default())
         }),
     })
 }

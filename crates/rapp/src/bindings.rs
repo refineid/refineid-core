@@ -27,9 +27,11 @@ use super::{
     POST_PAKE_CONFIRMATION_MS, POST_PAKE_HANDSHAKE_MS, PairId, PairKeyMaterial, PairRecord,
     PairStore, PairStoreError, PairTombstone, PairingBackoff, PairingConfirmation, PairingError,
     PairingHandshake, PairingOffer, PairingOfferDeadline, PairingSecret, PairingStorage,
-    PreAuthenticationRateLimit, ProfileName, RoutingPreamble, STREAM_PROFILE,
+    PreAuthenticationRateLimit, ProfileName, ReadyOutcome, RoutingPreamble, STREAM_PROFILE,
     SessionAuthentication, SessionHandshake, SessionId, TransportProfile, encode_kc2_step1_frame,
-    generate_pair_key_material, phase_deadline_ms, standard_pairing_context_v2,
+    generate_pair_key_material,
+    operation_bridge::{EndedOperation, RappBridgeAction, RappBridgeActionKind},
+    phase_deadline_ms, standard_pairing_context_v2,
 };
 
 /// Endpoint role fixed by the protocol rather than transport direction.
@@ -2689,7 +2691,9 @@ impl RappSessionBridge {
         Ok(complete)
     }
 
-    /// Enter exact bilateral `session.ready` authentication.
+    /// Enter `session.ready` authentication: the Custodian sends it, the
+    /// Requester verifies it (RAPP §7.1 item 5). For a forgotten record,
+    /// call [`Self::deliver_revocation_notice`] instead.
     ///
     /// # Errors
     /// [`RappBindingError`] on the wrong phase or an incomplete handshake.
@@ -2711,13 +2715,17 @@ impl RappSessionBridge {
         Ok(())
     }
 
-    /// Send the exact session parameters with a platform-CSPRNG nonce.
+    /// The Custodian's `session.ready`: the exact session parameters with a
+    /// platform-CSPRNG nonce. Then call [`Self::enter_established`].
     ///
     /// # Errors
-    /// [`RappBindingError`] on a wrong-size nonce, the wrong phase, or a
-    /// duplicate or failed ready.
+    /// [`RappBindingError`] on a wrong-size nonce, the wrong phase, a
+    /// Requester, a forgotten record, or a second ready.
     pub fn send_ready(&self, nonce: Vec<u8>) -> Result<Vec<u8>, RappBindingError> {
         let nonce = fixed_array(nonce)?;
+        if self.is_forgotten()? {
+            return Err(RappBindingError::WrongPhase);
+        }
         let mut state = self.lock_state()?;
         let SessionBridgeState::Authentication(authentication) = &mut *state else {
             return Err(RappBindingError::WrongPhase);
@@ -2725,38 +2733,73 @@ impl RappSessionBridge {
         let frame = authentication
             .send_ready(nonce)
             .map(BinaryFrame::into_bytes)
-            .map_err(|_| RappBindingError::ProtocolFailure);
+            .map_err(|error| match error {
+                super::SessionError::RoleViolation | super::SessionError::DuplicateReady => {
+                    RappBindingError::WrongPhase
+                }
+                _ => RappBindingError::ProtocolFailure,
+            });
         drop(state);
         frame
     }
 
-    /// Verify the peer's exact authenticated session parameters. A failure
-    /// closes the session; the pairing stays.
+    /// The Requester reads the Custodian's first message (RAPP §7.1 item 5):
+    ///
+    /// - `NoAction`: `session.ready` verified; call
+    ///   [`Self::enter_established`].
+    /// - `SessionClosed`: the Custodian closed the session, with its reason
+    ///   in `close_reason`; on `PairingRevoked`, revoke the record with
+    ///   [`RappPairRecord::revoke`] and withdraw its identity (§4.6 item 4).
+    ///   A frame that fails authentication closes it without a reason.
+    /// - `SendFrame`: the message violated the protocol; deliver the sealed
+    ///   `protocol_violation` close, then drop the link.
+    ///
+    /// The pairing stays in every case but a received `PairingRevoked`.
     ///
     /// # Errors
-    /// [`RappBindingError`] on the wrong phase, an oversized frame, or an
-    /// echo that fails verification.
-    pub fn receive_ready(&self, bytes: Vec<u8>, now_ms: u64) -> Result<(), RappBindingError> {
+    /// [`RappBindingError`] on the wrong phase, a Custodian, or an oversized
+    /// frame.
+    pub fn receive_ready(
+        &self,
+        bytes: Vec<u8>,
+        now_ms: u64,
+    ) -> Result<RappBridgeAction, RappBindingError> {
         let frame = BinaryFrame::reconstruct(bytes).map_err(|_| RappBindingError::InvalidInput)?;
         let mut state = self.lock_state()?;
         let SessionBridgeState::Authentication(authentication) = &mut *state else {
             return Err(RappBindingError::WrongPhase);
         };
-        if authentication.receive_ready(&frame, now_ms).is_err() {
-            *state = SessionBridgeState::Failed;
-            drop(state);
-            return Err(RappBindingError::ProtocolFailure);
-        }
+        let action = match authentication.receive_ready(&frame, now_ms) {
+            Ok(ReadyOutcome::Verified) => {
+                return Ok(RappBridgeAction::simple(RappBridgeActionKind::NoAction));
+            }
+            Ok(ReadyOutcome::PeerClosed(reason)) => RappBridgeAction {
+                close_reason: Some(reason.into()),
+                ..RappBridgeAction::session_closed(EndedOperation::default())
+            },
+            Ok(ReadyOutcome::ViolationClosed { notice, .. }) => {
+                RappBridgeAction::violation_closed(notice)
+            }
+            Err(super::SessionError::IntegrityFailure) => {
+                RappBridgeAction::session_closed(EndedOperation::default())
+            }
+            Err(_) => return Err(RappBindingError::WrongPhase),
+        };
+        *state = SessionBridgeState::Closed;
         drop(state);
-        Ok(())
+        Ok(action)
     }
 
-    /// Promote the mutually authenticated channel to healthy established use.
+    /// Promote the authenticated channel to healthy established use once the
+    /// Custodian sent, or the Requester verified, `session.ready`.
     ///
     /// # Errors
-    /// [`RappBindingError`] on the wrong phase or incomplete ready
-    /// verification.
+    /// [`RappBindingError`] on the wrong phase, a forgotten record, or a
+    /// ready not yet sent or verified.
     pub fn enter_established(&self) -> Result<(), RappBindingError> {
+        if self.is_forgotten()? {
+            return Err(RappBindingError::WrongPhase);
+        }
         let mut state = self.lock_state()?;
         let previous = core::mem::replace(&mut *state, SessionBridgeState::Failed);
         let SessionBridgeState::Authentication(authentication) = previous else {
@@ -2770,7 +2813,7 @@ impl RappSessionBridge {
         Ok(())
     }
 
-    /// Whether exact bilateral ready verification produced a healthy session.
+    /// Whether `session.ready` produced a healthy session.
     ///
     /// # Errors
     /// [`RappBindingError::LocalStateFailure`] when the lock is poisoned.
@@ -2779,35 +2822,30 @@ impl RappSessionBridge {
         Ok(matches!(&*state, SessionBridgeState::Established(_)))
     }
 
-    /// The first and only message of an established session whose record
-    /// was forgotten: the sealed `session.close` with reason
-    /// `pairing_revoked` (RAPP §4.6 item 2). The session closes; deliver the
-    /// frame, then destroy the record with [`RappPairRecord::revoke`].
+    /// The first and only message of a session whose record was forgotten:
+    /// the sealed `session.close` with reason `pairing_revoked` (RAPP §4.6
+    /// item 2), sent once [`Self::enter_authentication`] ran and before
+    /// anything else. The session closes and no card session starts; deliver
+    /// the frame, drop the link, then destroy the record with
+    /// [`RappPairRecord::revoke`].
     ///
     /// # Errors
-    /// [`RappBindingError::WrongPhase`] before the session is established or
-    /// for a record that is not forgotten, and
-    /// [`RappBindingError::ProtocolFailure`] when the close cannot be sealed.
+    /// [`RappBindingError::WrongPhase`] outside authentication, after the
+    /// Custodian's `session.ready`, or for a record that is not forgotten,
+    /// and [`RappBindingError::ProtocolFailure`] when the close cannot be
+    /// sealed.
     pub fn deliver_revocation_notice(&self) -> Result<Vec<u8>, RappBindingError> {
-        let forgotten = self
-            .pair_store
-            .lock()
-            .map_err(|_| RappBindingError::LocalStateFailure)?
-            .pair
-            .with_record(|record| Ok(record.forgotten_at_ms().is_some()))?;
-        if !forgotten {
+        if !self.is_forgotten()? {
             return Err(RappBindingError::WrongPhase);
         }
         let mut state = self.lock_state()?;
-        let SessionBridgeState::Established(endpoint) = &mut *state else {
+        let SessionBridgeState::Authentication(authentication) = &mut *state else {
             return Err(RappBindingError::WrongPhase);
         };
-        let sealed = endpoint.send(&super::TypedMessage::SessionClose(
-            super::SessionCloseMessage {
-                reason: super::CloseReason::PairingRevoked,
-            },
-        ));
-        endpoint.close_session();
+        let sealed = match authentication.send_revocation_notice() {
+            Err(super::SessionError::DuplicateReady) => return Err(RappBindingError::WrongPhase),
+            sealed => sealed,
+        };
         *state = SessionBridgeState::Closed;
         drop(state);
         sealed
@@ -2882,6 +2920,14 @@ impl RappSessionBridge {
         self.state
             .lock()
             .map_err(|_| RappBindingError::LocalStateFailure)
+    }
+
+    fn is_forgotten(&self) -> Result<bool, RappBindingError> {
+        self.pair_store
+            .lock()
+            .map_err(|_| RappBindingError::LocalStateFailure)?
+            .pair
+            .with_record(|record| Ok(record.forgotten_at_ms().is_some()))
     }
 
     pub(super) fn take_established(
@@ -3600,5 +3646,264 @@ mod routing_binding_tests {
         let list = &txt.last().expect("hint list").value;
         assert_eq!(list.split(',').count(), crate::WITHDRAWN_RECORD_ENTRIES);
         assert!(!list.contains(&"00".repeat(crate::WITHDRAWAL_HINT_SIZE)));
+    }
+
+    /// The session phase of one stored pairing, both ends in memory.
+    mod session_bridge {
+        use super::{CREATED_AT_MS, PAIR_BYTE, RappPairRecord, RappPairVault, StoringVault};
+        use crate::{
+            STREAM_PROFILE,
+            bindings::{RappBindingError, RappSessionBridge},
+            operation_bridge::{
+                RappBridgeAction, RappBridgeActionKind, RappCardKeyProfile, RappCloseReason,
+                RappOperationBridge, RappResultKind, RappSignatureAlgorithm,
+            },
+        };
+        use std::sync::{Arc, Mutex};
+
+        /// Monotonic instant the sessions start at.
+        const NOW_MS: u64 = 1_000;
+        const MAXIMUM_LIFETIME_MS: u64 = 300_000;
+        const LIFETIME_MS: u64 = 60_000;
+        const NONCE_BYTE: u8 = 0x5a;
+        const OPERATION_BYTE: u8 = 0x71;
+        const DIGEST_BYTE: u8 = 0xcc;
+        const SHA256_DIGEST_SIZE: usize = 32;
+        const OPERATION_ID_SIZE: usize = 16;
+        const SESSION_READY_NONCE_SIZE: usize = 32;
+        /// Opaque certificate bytes; the custodian relays what the card
+        /// holds.
+        const CERTIFICATE_BYTE: u8 = 0x30;
+        const CERTIFICATE_SIZE: usize = 64;
+
+        fn vault() -> Arc<dyn RappPairVault> {
+            Arc::new(StoringVault {
+                bytes: Vec::new(),
+                revoked: Mutex::new(false),
+            })
+        }
+
+        fn requester_record() -> Arc<RappPairRecord> {
+            super::requester()
+        }
+
+        fn custodian_record() -> Arc<RappPairRecord> {
+            super::custodian(PAIR_BYTE)
+        }
+
+        /// Both ends after the Noise KK handshake, awaiting `session.ready`.
+        fn authenticating(
+            requester: &Arc<RappPairRecord>,
+            custodian: &Arc<RappPairRecord>,
+        ) -> (Arc<RappSessionBridge>, Arc<RappSessionBridge>) {
+            let requester = RappSessionBridge::begin_requester(
+                Arc::clone(requester),
+                vault(),
+                STREAM_PROFILE.to_owned(),
+            )
+            .expect("requester session starts");
+            let custodian = RappSessionBridge::begin_proxy(
+                Arc::clone(custodian),
+                vault(),
+                STREAM_PROFILE.to_owned(),
+            )
+            .expect("custodian session starts");
+            custodian
+                .read_handshake_frame(requester.write_handshake_frame().expect("message one"))
+                .expect("custodian reads message one");
+            requester
+                .read_handshake_frame(custodian.write_handshake_frame().expect("message two"))
+                .expect("requester reads message two");
+            requester
+                .enter_authentication()
+                .expect("requester authenticates");
+            custodian
+                .enter_authentication()
+                .expect("custodian authenticates");
+            (requester, custodian)
+        }
+
+        fn nonce() -> Vec<u8> {
+            vec![NONCE_BYTE; SESSION_READY_NONCE_SIZE]
+        }
+
+        /// Both ends healthy, with their operation bridges.
+        fn established() -> (Arc<RappOperationBridge>, Arc<RappOperationBridge>) {
+            let (requester, custodian) = authenticating(&requester_record(), &custodian_record());
+            let ready = custodian
+                .send_ready(nonce())
+                .expect("custodian sends ready");
+            custodian.enter_established().expect("custodian is healthy");
+            assert_eq!(
+                requester
+                    .receive_ready(ready, NOW_MS)
+                    .expect("requester reads ready")
+                    .kind,
+                RappBridgeActionKind::NoAction
+            );
+            requester.enter_established().expect("requester is healthy");
+            (
+                RappOperationBridge::begin_requester(requester, MAXIMUM_LIFETIME_MS, NOW_MS)
+                    .expect("requester operations"),
+                RappOperationBridge::begin_proxy(custodian, MAXIMUM_LIFETIME_MS, NOW_MS)
+                    .expect("custodian operations"),
+            )
+        }
+
+        fn frame(action: RappBridgeAction) -> Vec<u8> {
+            assert_eq!(action.kind, RappBridgeActionKind::SendFrame, "{action:?}");
+            action.frame.expect("a frame to send")
+        }
+
+        fn operation_id() -> Vec<u8> {
+            vec![OPERATION_BYTE; OPERATION_ID_SIZE]
+        }
+
+        #[test]
+        fn only_the_custodian_sends_ready() {
+            let (requester, custodian) = authenticating(&requester_record(), &custodian_record());
+            assert!(matches!(
+                requester.send_ready(nonce()),
+                Err(RappBindingError::WrongPhase)
+            ));
+            let ready = custodian
+                .send_ready(nonce())
+                .expect("custodian sends ready");
+            assert!(matches!(
+                custodian.receive_ready(ready, NOW_MS),
+                Err(RappBindingError::WrongPhase)
+            ));
+        }
+
+        #[test]
+        fn a_read_is_served_without_consent() {
+            let (requester, custodian) = established();
+            requester
+                .receive_frame(
+                    frame(custodian.report_card_status(None).expect("card status")),
+                    NOW_MS,
+                )
+                .expect("requester reads the card status");
+            let request = frame(
+                requester
+                    .begin_read_certificate(operation_id(), false, NOW_MS, LIFETIME_MS)
+                    .expect("requester asks"),
+            );
+            assert_eq!(
+                custodian
+                    .receive_frame(request, NOW_MS)
+                    .expect("custodian admits")
+                    .kind,
+                RappBridgeActionKind::InspectPrerequisites
+            );
+            assert_eq!(
+                custodian
+                    .prerequisites_complete(operation_id(), NOW_MS)
+                    .expect("the read has the card")
+                    .kind,
+                RappBridgeActionKind::ExecuteSafeRead
+            );
+            let result = frame(
+                custodian
+                    .complete_certificate(operation_id(), vec![CERTIFICATE_BYTE; CERTIFICATE_SIZE])
+                    .expect("completion"),
+            );
+            let completed = requester
+                .receive_frame(result, NOW_MS)
+                .expect("requester reads the result");
+            assert_eq!(completed.kind, RappBridgeActionKind::Completed);
+            assert_eq!(
+                completed.result.expect("an answer").kind,
+                RappResultKind::Certificate
+            );
+        }
+
+        #[test]
+        fn closing_tells_the_custodian_its_card_command_runs_on() {
+            let (requester, custodian) = established();
+            let request = frame(
+                requester
+                    .begin_browser_authentication(
+                        operation_id(),
+                        "https://example.org".to_owned(),
+                        RappCardKeyProfile::EcdsaP256,
+                        RappSignatureAlgorithm::EcdsaSha256,
+                        vec![DIGEST_BYTE; SHA256_DIGEST_SIZE],
+                        NOW_MS,
+                        LIFETIME_MS,
+                    )
+                    .expect("requester asks"),
+            );
+            custodian
+                .receive_frame(request, NOW_MS)
+                .expect("custodian admits");
+            assert_eq!(
+                custodian
+                    .prerequisites_complete(operation_id(), NOW_MS)
+                    .expect("consent")
+                    .kind,
+                RappBridgeActionKind::AwaitUserApproval
+            );
+            assert_eq!(
+                custodian
+                    .approve(operation_id(), NOW_MS)
+                    .expect("approval")
+                    .kind,
+                RappBridgeActionKind::ExecuteCardCommand
+            );
+            let closed = custodian.close_session().expect("close");
+            assert_eq!(closed.kind, RappBridgeActionKind::SessionClosed);
+            assert_eq!(closed.operation_id, Some(operation_id()));
+            assert!(closed.card_exchange_continues);
+        }
+
+        #[test]
+        fn a_forgotten_custodian_record_sends_the_close_in_place_of_ready() {
+            let custodian_record = custodian_record();
+            custodian_record
+                .forget(vault(), CREATED_AT_MS)
+                .expect("forget");
+            let (requester, custodian) = authenticating(&requester_record(), &custodian_record);
+            assert!(matches!(
+                custodian.send_ready(nonce()),
+                Err(RappBindingError::WrongPhase)
+            ));
+            let notice = custodian
+                .deliver_revocation_notice()
+                .expect("the close is the first message");
+            let closed = requester
+                .receive_ready(notice, NOW_MS)
+                .expect("requester reads the close");
+            assert_eq!(closed.kind, RappBridgeActionKind::SessionClosed);
+            assert_eq!(closed.close_reason, Some(RappCloseReason::PairingRevoked));
+            assert!(matches!(
+                requester.enter_established(),
+                Err(RappBindingError::WrongPhase)
+            ));
+        }
+
+        #[test]
+        fn a_forgotten_requester_record_sends_the_close_as_its_first_message() {
+            let requester_record = requester_record();
+            requester_record
+                .forget(vault(), CREATED_AT_MS)
+                .expect("forget");
+            let (requester, custodian) = authenticating(&requester_record, &custodian_record());
+            custodian
+                .send_ready(nonce())
+                .expect("custodian sends ready");
+            custodian.enter_established().expect("custodian is healthy");
+            let custodian =
+                RappOperationBridge::begin_proxy(custodian, MAXIMUM_LIFETIME_MS, NOW_MS)
+                    .expect("custodian operations");
+            let notice = requester
+                .deliver_revocation_notice()
+                .expect("the close is the first message");
+            let closed = custodian
+                .receive_frame(notice, NOW_MS)
+                .expect("custodian reads the close");
+            assert_eq!(closed.kind, RappBridgeActionKind::SessionClosed);
+            assert_eq!(closed.close_reason, Some(RappCloseReason::PairingRevoked));
+        }
     }
 }

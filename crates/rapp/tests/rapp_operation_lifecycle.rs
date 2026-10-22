@@ -5,10 +5,10 @@
 //! custodian engines exchanging messages through their wire encoding.
 
 use refineid_rapp::{
-    CardKeyProfile, CardOperation, CardOperationResult, Envelope, OperationId, OperationRequest,
-    OperationResultMessage, ProfileName, ProxyDispatch, ProxyFailure, ProxyOperationEngine,
-    ProxySessionCloseAction, RequesterDispatch, RequesterOperationEngine, ResultError,
-    ResultStatus, SessionId, SignatureAlgorithm, TypedMessage, UserApproval,
+    CardInspection, CardKeyProfile, CardOperation, CardOperationResult, Envelope, OperationId,
+    OperationRequest, OperationResultMessage, ProfileName, ProxyDispatch, ProxyFailure,
+    ProxyOperationEngine, ProxySessionCloseAction, RequesterDispatch, RequesterOperationEngine,
+    ResultError, ResultStatus, SessionId, SignatureAlgorithm, TypedMessage, UserApproval,
 };
 
 const SESSION_ID: SessionId = SessionId::from_array([0x5e; 16]);
@@ -16,6 +16,9 @@ const START_MS: u64 = 1_000;
 const LIFETIME_MS: u64 = 60_000;
 const MAXIMUM_LIFETIME_MS: u64 = 300_000;
 const SHA256_DIGEST_SIZE: usize = 32;
+/// The initial byte of a direct-convention answer to reset (ISO/IEC 7816-3).
+const ANSWER_TO_RESET_BYTE: u8 = 0x3b;
+const ANSWER_TO_RESET_SIZE: usize = 20;
 
 /// Carries a message across the wire: encode its body, decode it again.
 fn across(message: &TypedMessage) -> TypedMessage {
@@ -81,12 +84,13 @@ fn sent(dispatch: ProxyDispatch) -> TypedMessage {
     }
 }
 
-/// Admits `request` on the custodian and brings it to consent.
+/// Admits `request` on the custodian and gives it the card: the next step
+/// the custodian takes.
 fn admit(
     engine: &mut ProxyOperationEngine,
     requester: &mut RequesterOperationEngine,
     request: &OperationRequest,
-) {
+) -> ProxyDispatch {
     let wire = requester
         .begin(request.clone())
         .expect("the requester starts");
@@ -95,8 +99,49 @@ fn admit(
         Ok(ProxyDispatch::InspectPrerequisites(_))
     ));
     engine
-        .prerequisites_complete(request.operation_id)
-        .expect("the reads complete");
+        .prerequisites_complete(request.operation_id, START_MS, MAXIMUM_LIFETIME_MS)
+        .expect("the reads complete")
+}
+
+#[test]
+fn a_signature_waits_for_consent() {
+    let mut engine = custodian();
+    let mut requester = RequesterOperationEngine::new();
+    let request = signing(1);
+    assert!(matches!(
+        admit(&mut engine, &mut requester, &request),
+        ProxyDispatch::AwaitConsent(operation_id) if operation_id == request.operation_id
+    ));
+}
+
+#[test]
+fn a_read_answers_without_consent() {
+    let mut engine = custodian();
+    let mut requester = RequesterOperationEngine::new();
+    let request = request(1, CardOperation::InspectCard);
+    let ProxyDispatch::ExecuteSafeRead { read, .. } = admit(&mut engine, &mut requester, &request)
+    else {
+        panic!("a read runs once it has the card");
+    };
+    assert_eq!(read.operation, request.operation);
+    let answer = CardOperationResult::Inspection(CardInspection {
+        answer_to_reset: vec![ANSWER_TO_RESET_BYTE; ANSWER_TO_RESET_SIZE],
+    });
+    let result = sent(
+        engine
+            .finish_completed(
+                request.operation_id,
+                OperationResultMessage::completed(request.operation_id, &answer),
+            )
+            .expect("completion"),
+    );
+    assert_eq!(
+        requester.receive(across(&result)).expect("result"),
+        RequesterDispatch::Completed {
+            operation_id: request.operation_id,
+            result: answer,
+        }
+    );
 }
 
 #[test]

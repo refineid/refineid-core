@@ -56,8 +56,8 @@ mod wire;
 mod withdrawal;
 
 pub use authorization::{
-    ApprovalOutcome, AuthorizationError, AuthorizationStage, AuthorizationTransaction,
-    AuthorizedCardCommand, AuthorizedSafeRead, OperationProgressMessage, PendingCardCommand,
+    AuthorizationError, AuthorizationStage, AuthorizationTransaction, AuthorizedCardCommand,
+    AuthorizedSafeRead, OperationProgressMessage, PendingCardCommand, PrerequisitesOutcome,
     ProgressEvent, UserApproval,
 };
 pub use cpace::{
@@ -128,7 +128,9 @@ pub use routing::{
     SESSION_ROUTING_SIZE, SessionRouting, discovery_epoch, route_session,
 };
 pub use runtime::{EstablishedSessionRuntime, RuntimeError, RuntimePoll, RuntimeReceive};
-pub use session_flow::{ExplicitUserIntent, SessionAuthentication, SessionError, SessionHandshake};
+pub use session_flow::{
+    ExplicitUserIntent, ReadyOutcome, SessionAuthentication, SessionError, SessionHandshake,
+};
 pub use state::{
     Action, EndpointRole, Guards, OperationEvent, OperationState, PairingEvent, PairingState,
     RappState, SecurityOutcome, SessionEvent, SessionState, Transition, TransitionError,

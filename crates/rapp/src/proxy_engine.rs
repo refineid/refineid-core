@@ -4,9 +4,9 @@ use core::fmt;
 use std::collections::BTreeSet;
 
 use super::{
-    ApprovalOutcome, AuthorizationStage, AuthorizationTransaction, AuthorizedCardCommand,
-    AuthorizedSafeRead, CardOperationResult, CardStatusMessage, OperationId,
-    OperationProgressMessage, OperationRequest, OperationResultMessage, PendingCardCommand,
+    AuthorizationStage, AuthorizationTransaction, AuthorizedCardCommand, AuthorizedSafeRead,
+    CardOperationResult, CardStatusMessage, OperationId, OperationProgressMessage,
+    OperationRequest, OperationResultMessage, PendingCardCommand, PrerequisitesOutcome,
     ProfileName, ProgressEvent, ProtocolErrorMessage, ProxyFailure, ResultStatus, TypedMessage,
     UserApproval,
 };
@@ -60,17 +60,35 @@ impl ProxyOperationEngine {
         }
     }
 
-    /// Mark the reads that precede consent complete.
+    /// The operation has the card and its prerequisite reads are done. An
+    /// action that needs the holder's authorization goes to consent; a read
+    /// skips consent and runs (section 8.2 items 3 and 6). An operation whose
+    /// deadline has passed is cancelled instead (section 8.1 item 2). `now_ms`
+    /// is the continuous clock.
     ///
     /// # Errors
     /// [`ProxyEngineError`] on an unknown operation or an illegal transition.
     pub fn prerequisites_complete(
         &mut self,
         operation_id: OperationId,
-    ) -> Result<(), ProxyEngineError> {
-        self.live_mut(operation_id)?
+        now_ms: u64,
+        maximum_lifetime_ms: u64,
+    ) -> Result<ProxyDispatch, ProxyEngineError> {
+        let operation = self.live_mut(operation_id)?;
+        if operation.stage() == AuthorizationStage::Requested
+            && operation.is_expired(now_ms, maximum_lifetime_ms)
+        {
+            return self.finish_failure(operation_id, ProxyFailure::RequestExpired);
+        }
+        let outcome = operation
             .prerequisites_complete()
-            .map_err(|_| ProxyEngineError::InvalidLocalTransition)
+            .map_err(|_| ProxyEngineError::InvalidLocalTransition)?;
+        Ok(match outcome {
+            PrerequisitesOutcome::AwaitConsent => ProxyDispatch::AwaitConsent(operation_id),
+            PrerequisitesOutcome::ExecuteSafeRead(read) => {
+                ProxyDispatch::ExecuteSafeRead { operation_id, read }
+            }
+        })
     }
 
     /// Apply the holder's approval. An approval after the request's deadline
@@ -92,17 +110,12 @@ impl ProxyOperationEngine {
         {
             return self.finish_failure(operation_id, ProxyFailure::RequestExpired);
         }
-        let outcome = operation
+        let command = operation
             .approve(approval, now_ms, maximum_lifetime_ms)
             .map_err(|_| ProxyEngineError::InvalidLocalTransition)?;
-        Ok(match outcome {
-            ApprovalOutcome::ExecuteCardCommand(command) => ProxyDispatch::ExecuteCardCommand {
-                operation_id,
-                command,
-            },
-            ApprovalOutcome::ExecuteSafeRead(read) => {
-                ProxyDispatch::ExecuteSafeRead { operation_id, read }
-            }
+        Ok(ProxyDispatch::ExecuteCardCommand {
+            operation_id,
+            command,
         })
     }
 
@@ -295,8 +308,11 @@ impl ProxyOperationEngine {
 /// Bounded step the custodian adapter executes next.
 #[derive(Debug)]
 pub enum ProxyDispatch {
-    /// Perform the reads that precede consent.
+    /// Take the operation's turn on the card and perform the reads that
+    /// precede consent.
     InspectPrerequisites(OperationId),
+    /// Show the consent view and wait for the holder.
+    AwaitConsent(OperationId),
     /// Execute the read; no private key, no PIN.
     ExecuteSafeRead {
         /// Operation the read belongs to.
@@ -455,23 +471,44 @@ mod tests {
     }
 
     #[test]
-    fn an_approval_after_the_deadline_cancels_without_a_card_command() {
+    fn a_read_skips_consent() {
         let mut engine = ProxyOperationEngine::new(vec![ProfileName::CardStatus]);
         let request = inspection_request(1);
         let operation_id = request.operation_id;
         engine
             .receive(TypedMessage::OperationRequest(request.clone()))
             .expect("admitted");
-        engine.prerequisites_complete(operation_id).expect("reads");
-        let late = START_MS + LIFETIME_MS + 1;
-        let result = sent_result(
+        let ProxyDispatch::ExecuteSafeRead { read, .. } = engine
+            .prerequisites_complete(operation_id, START_MS, MAXIMUM_LIFETIME_MS)
+            .expect("the read has the card")
+        else {
+            panic!("a read runs without consent");
+        };
+        assert_eq!(read.operation, request.operation);
+        assert!(
             engine
                 .approve(
                     operation_id,
-                    UserApproval::for_request(&request, late),
-                    late,
+                    UserApproval::for_request(&request, START_MS),
+                    START_MS,
                     MAXIMUM_LIFETIME_MS,
                 )
+                .is_err(),
+            "a read has no consent to approve"
+        );
+    }
+
+    #[test]
+    fn an_operation_that_gets_the_card_after_its_deadline_is_cancelled() {
+        let mut engine = ProxyOperationEngine::new(vec![ProfileName::CardStatus]);
+        let request = inspection_request(1);
+        engine
+            .receive(TypedMessage::OperationRequest(request.clone()))
+            .expect("admitted");
+        let late = START_MS + LIFETIME_MS + 1;
+        let result = sent_result(
+            engine
+                .prerequisites_complete(request.operation_id, late, MAXIMUM_LIFETIME_MS)
                 .expect("dispatch"),
         );
         assert_eq!(result.status, ResultStatus::Cancelled);

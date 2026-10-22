@@ -62,9 +62,15 @@ impl EstablishedSessionRuntime {
     ) -> RuntimeReceive {
         self.liveness.close();
         match self.endpoint.close_for_operation_violation(violation) {
-            ReceiveOutcome::ViolationClosed { violation, outcome } => {
-                RuntimeReceive::ViolationClosed { violation, outcome }
-            }
+            ReceiveOutcome::ViolationClosed {
+                violation,
+                outcome,
+                notice,
+            } => RuntimeReceive::ViolationClosed {
+                violation,
+                outcome,
+                notice,
+            },
             ReceiveOutcome::SessionClosed(outcome) => RuntimeReceive::SessionClosed(outcome),
             ReceiveOutcome::Message(message) => RuntimeReceive::Message(message),
         }
@@ -110,9 +116,17 @@ impl EstablishedSessionRuntime {
                 self.liveness.close();
                 Ok(RuntimeReceive::SessionClosed(outcome))
             }
-            ReceiveOutcome::ViolationClosed { violation, outcome } => {
+            ReceiveOutcome::ViolationClosed {
+                violation,
+                outcome,
+                notice,
+            } => {
                 self.liveness.close();
-                Ok(RuntimeReceive::ViolationClosed { violation, outcome })
+                Ok(RuntimeReceive::ViolationClosed {
+                    violation,
+                    outcome,
+                    notice,
+                })
             }
         }
     }
@@ -165,12 +179,14 @@ pub enum RuntimeReceive {
     /// The peer closed the session with an authenticated notice.
     PeerClosed(CloseReason),
     /// Authenticated traffic violated the protocol; the session closed and
-    /// the pairing stays.
+    /// the pairing stays. Deliver `notice`, then drop the link.
     ViolationClosed {
         /// The violation.
         violation: AuthenticatedViolation,
         /// Effects the endpoint carries out.
         outcome: SecurityOutcome,
+        /// The sealed `protocol_violation` close, when it could be sealed.
+        notice: Option<BinaryFrame>,
     },
 }
 

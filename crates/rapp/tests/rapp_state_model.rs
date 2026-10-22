@@ -465,6 +465,7 @@ const PAIRING_EVENTS: &[(&str, PairingEvent)] = &[
     ("session_healthy", PairingEvent::SessionHealthy),
     ("session_closed", PairingEvent::SessionClosed),
     ("forget_pairing", PairingEvent::ForgetPairing),
+    ("revocation_notice_sent", PairingEvent::RevocationNoticeSent),
     ("notice_window_expired", PairingEvent::NoticeWindowExpired),
     ("peer_revocation_notice", PairingEvent::PeerRevocationNotice),
 ];
@@ -475,6 +476,10 @@ const SESSION_EVENTS: &[(&str, SessionEvent)] = &[
     ("transport_connected", SessionEvent::TransportConnected),
     ("transport_failed", SessionEvent::TransportFailed),
     ("handshake_complete", SessionEvent::HandshakeComplete),
+    (
+        "handshake_complete_while_revoking",
+        SessionEvent::HandshakeCompleteWhileRevoking,
+    ),
     ("ready_verified", SessionEvent::ReadyVerified),
     ("candidate_failure", SessionEvent::CandidateFailure),
     (

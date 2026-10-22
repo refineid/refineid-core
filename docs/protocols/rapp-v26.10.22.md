@@ -36,7 +36,7 @@ This document defines the complete, standalone normative specification for the *
 - The **Registered Credential Profiles and Actions** for card status inspection, browser authentication, and qualified document signing.
 - **Service Withdrawal** (§4.5): the Custodian's notice, keyed by each pairing's static agreement, that it has stopped serving, on discovery and on open sessions.
 - **Pairing Storage Confirmation and Revocation** (§4.3, §4.6): each endpoint confirms its stored trust record before the pairing is active, and an endpoint that forgets a pairing tells the other with a `pairing_revoked` close, in session or as the first message of the next session.
-- **Card Presence** (§8.4): the Custodian's in-session notice of the card it holds, which a Requester's offer to local consumers follows, eventually consistent.
+- **Card Presence** (§8.4): the Custodian's in-session notice of the card it holds and of whether a card reader is attached to it; a Requester's offer to local consumers follows the card, eventually consistent.
 - **Concurrent Multi-Client Serving** (§8): the Custodian serves every paired Requester over its own session; card operations are serialized on the single card.
 - The **Failure Semantics, Retry Protection, and PIN Contracts**.
 
@@ -783,6 +783,7 @@ progress-event-val =
 ; 12. Card Presence
 card-status-body = {
   "card_present": bool,
+  "reader_attached": bool,                   ; a contact card reader is connected to the Custodian (§8.4 item 1)
   "certificate_fingerprint": bstr .size 32   ; SHA-256 of the authentication certificate; all zero when card_present is false
 }
 
@@ -800,7 +801,7 @@ card-status-body = {
 8. **`operation.request`**: Sent by the Requester to start a credential action under a registered profile (§8, §9).
 9. **`operation.result`**: Sent by the Custodian with the outcome of the operation: its status and the response, or the error (§8).
 10. **`operation.progress`**: Sent by the Custodian while an operation is pending, for every change of its state: queued behind another session's operation, a PIN prompt on screen, waiting for the card, card found (§8.2).
-11. **`card.status`**: Sent by the Custodian once right after `session.ready` and again whenever the card it holds changes: present or absent, and which card, by the fingerprint of its authentication certificate (§8.4).
+11. **`card.status`**: Sent by the Custodian once right after `session.ready` and again whenever the card it holds changes (present or absent, and which card, by the fingerprint of its authentication certificate) or a card reader is attached to it or detached (§8.4).
 12. **`error`**: Sent on a protocol condition that is not an operation outcome, such as a second request while one operation of the session is live; schema and codes in §10.3.
 
 ### 7.2 Envelope Rules
@@ -839,15 +840,17 @@ A session lives as long as both endpoints are in sight. An endpoint that has hea
 A Requester that offers the Custodian's credentials to local consumers (a browser's certificate chooser, a CryptoTokenKit or Public-Key Cryptography Standards (PKCS)#11 token) makes a claim on the Custodian's behalf: that the card can answer when asked. The claim rests on the Custodian's own word on an authenticated session, never on discovery, and follows it eventually: a card that is gone leaves every Requester within the grace of item 3.
 
 1. **`card.status`**:
-   On every session the Custodian sends `card.status` once right after `session.ready`, and again whenever the card it holds changes. `card_present` is true while the Custodian holds a card: a card in its reader, from insertion until removal, or an NFC card the holder has added to the Custodian, from adding until the holder removes it there. An operation that ends without the card answering (no card within the card wait, the card lost before a command was transmitted, the field lost) ends with `"card_error"` and leaves presence unchanged; the next operation asks the holder to present the card again. A card busy with another session's operation is present: the queue of §8.2 item 2 holds the waiting operation, and `card.status` does not change.
+   On every session the Custodian sends `card.status` once right after `session.ready`, and again whenever the card it holds changes or a card reader is attached to it or detached. `card_present` is true while the Custodian holds a card: a card in its reader, from insertion until removal, or an NFC card the holder has added to the Custodian, from adding until the holder removes it there. An operation that ends without the card answering (no card within the card wait, the card lost before a command was transmitted, the field lost) ends with `"card_error"` and leaves presence unchanged; the next operation asks the holder to present the card again. A card busy with another session's operation is present: the queue of §8.2 item 2 holds the waiting operation, and `card.status` does not change. `reader_attached` is true while a contact card reader is connected to the Custodian: a reader built into it, or one attached to its Universal Serial Bus (USB) or Lightning port. It is false otherwise, including on a Custodian that reads cards only over NFC. Attaching or detaching a reader leaves `card_present` as it is, except that detaching a reader removes the card in it; an NFC card the holder has added stays present.
 2. **Which Card**:
-   While `card_present` is true, `certificate_fingerprint` carries the SHA-256 digest of the Distinguished Encoding Rules (DER) encoding of the card's authentication certificate; while it is false the field is 32 zero bytes, so the message has one size whatever it says. A Requester compares a present card's fingerprint with the fingerprint of the certificates it holds for the pairing and, on any difference or when it holds none, reads the certificates afresh (§9) before offering anything; a report of absence is not a different card; it offers only an identity whose fingerprint the Custodian confirmed on a session.
+   While `card_present` is true, `certificate_fingerprint` carries the SHA-256 digest of the Distinguished Encoding Rules (DER) encoding of the card's authentication certificate; while it is false the field is 32 zero bytes. A Requester compares a present card's fingerprint with the fingerprint of the certificates it holds for the pairing and, on any difference or when it holds none, reads the certificates afresh (§9) before offering anything; a report of absence is not a different card; it offers only an identity whose fingerprint the Custodian confirmed on a session.
 3. **Offering Rule**:
    A Requester offers a pairing's credentials to local consumers on a certificate whose fingerprint the Custodian confirmed on a session, and keeps offering it between sessions: when a request arrives with no session open, the Requester dials the Custodian and holds the request until a session opens or the consumer's own deadline passes. It withdraws the offer when, for 120 seconds, no session to the Custodian has been open or the Custodian has reported absence, with no `card.status` reporting the card present in that time; at once when the pairing is forgotten or revoked (§4.6); and at once when a session reports a different card present (item 2). It offers again as soon as a session confirms the card. Discovery records (hierarchy specification §4.3) tell a Requester whom to dial; they never justify an offer.
 4. **Privacy**:
-   `card.status` travels only inside the AEAD-encrypted session, sized like a liveness message, so an observer cannot tell a card event from a keepalive. No discovery record, advertisement, or plaintext frame reflects the card's presence.
+   `card.status` travels only inside the AEAD-encrypted session. No discovery record, advertisement, or plaintext frame reflects the card's presence or the Custodian's card reader.
 5. **Ending the Session**:
    A Custodian that can no longer serve any card for the rest of the session closes it with reason `"card_unavailable"`; a Custodian that expects the card back keeps the session open and reports presence through `card.status`.
+6. **Asking for the Card**:
+   A Requester that asks its user for the card names the Custodian's card reader only while the latest `card.status` on an open session reports the card absent and `reader_attached` true, and then asks for the card in that reader. Otherwise it asks the user to present the card to the Custodian. `reader_attached` changes no offer: item 3 alone governs offering and withdrawal.
 
 ---
 

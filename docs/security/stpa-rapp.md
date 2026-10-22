@@ -1371,3 +1371,48 @@ Residuals, accepted:
   phone serves them all.
 - `queued` reaches the requester on the wire, but no requester shows it as a
   state of its own yet, so CC-62's display half is open.
+
+## 22. Reporting the custodian's card reader
+
+### 22.1 Scope
+
+A requester that needs the card tells its user how to supply it: into the
+phone's card reader, or to the phone over NFC. `card.status` carried the
+card and its fingerprint but nothing about the reader, so the requester
+chose the instruction from a reader it had assumed. A Mac paired with an
+Android phone told its user to insert the card into the phone's card
+reader after the reader had been unplugged from the phone. Seen on
+2026-10-22. The custodian now reports in `card.status` whether a contact
+card reader is connected to it, and the requester names the reader only
+while one is reported. Losses and hazards are this record's: L-3; H-5,
+H-6.
+
+### 22.2 Control structure
+
+```
+Phone OS --reader attached / detached (built in, USB, Lightning)--> custodian
+custodian --card.status {card_present, reader_attached, fingerprint}--> every open session
+requester --"insert the card into the phone's reader" | "present the card to the phone"--> user
+```
+
+New feedback: the reader's attachment, in `card.status` right after
+`session.ready` and on every attachment or detachment. The control action
+it informs is the requester's instruction to its user; presence and the
+identity offer (CC-64, CC-65) do not change.
+
+### 22.3 Unsafe control actions
+
+| ID | Controller | Control action | Type | Context | Hazard |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| UCA-79 | Requester | Tell the user to insert the card into the custodian's reader | P | When the custodian has no reader connected, because it was unplugged or the phone reads cards only over NFC, so the user looks for a reader that is not there and does not tap the card. | H-5 |
+| UCA-80 | Requester | Tell the user to attach a reader or present the card | N | When the card is absent and the custodian's reader is gone, so the user is left with an instruction that cannot be followed and nothing that can. | H-5 |
+
+### 22.4 Controller constraints
+
+| ID | Constraint | Closes |
+| :--- | :--- | :--- |
+| CC-81 | The custodian reports in `card.status` whether a contact card reader is connected to it, built in or attached to a port, once right after `session.ready` and again on every attachment or detachment, on every open session. Attaching or detaching a reader leaves presence as CC-65 defines it, except that detaching a reader removes the card in it; an NFC card the holder added stays present. Specification §8.4 item 1. | UCA-79, UCA-80 |
+| CC-82 | A requester that asks its user for the card names the custodian's reader only while the latest `card.status` on an open session reports the card absent and a reader attached; otherwise it asks the user to present the card to the custodian. The reader changes no offer: CC-64 alone governs offering and withdrawal. Specification §8.4 item 6. | UCA-79, UCA-80 |
+
+Privacy: `reader_attached` travels only inside the encrypted session, and
+no discovery record or advertisement carries it.

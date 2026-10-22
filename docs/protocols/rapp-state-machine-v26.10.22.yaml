@@ -84,7 +84,7 @@ actions:
   begin_kk_responder: "start the session handshake in the responder role"
   derive_session_identifiers: "derive session_id from the handshake hash"
   send_session_ready: "send session.ready with the session-parameter echo"
-  send_card_status: "send card.status with presence and the certificate fingerprint"
+  send_card_status: "send card.status with presence, reader attachment and the certificate fingerprint"
   start_liveness: "start the 5-second silence ping and the 30-second silence limit"
   send_liveness_ping: "send liveness.ping with a fresh challenge"
   record_peer_close_reason: "keep the received close reason for the user"
@@ -608,7 +608,7 @@ cross_component_rules:
     when: an_operation_needs_the_card
     require: one_operation_holds_the_card_across_every_session_in_arrival_order
   - id: X-05
-    when: card_presence_or_card_changes
+    when: card_presence_card_or_reader_attachment_changes
     require: every_healthy_session_receives_card_status
 
 invariants:

@@ -78,7 +78,7 @@ pub enum MessageType {
     OperationResult,
     /// Operation progress update.
     OperationProgress,
-    /// Whether the custodian can serve a card now.
+    /// The card the custodian holds, and whether a card reader is attached.
     CardStatus,
     /// Stable generic protocol error.
     Error,
@@ -703,6 +703,11 @@ fn validate_body(
         M::CardStatus => &[
             FieldSpec {
                 name: "card_present",
+                field_type: F::Bool,
+                optional: false,
+            },
+            FieldSpec {
+                name: "reader_attached",
                 field_type: F::Bool,
                 optional: false,
             },

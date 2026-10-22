@@ -84,9 +84,10 @@ pub use liveness::{
     PongDisposition, SESSION_SILENCE_LIMIT_MS,
 };
 pub use message::{
-    CardStatusMessage, LivenessMessage, MessageError, NegotiatedParameters, PairingAbortMessage,
-    PairingConfirmMessage, PairingHelloMessage, PairingStoredMessage, ProtocolErrorMessage,
-    SessionCloseMessage, SessionParameters, SessionReadyMessage, TypedMessage,
+    CardPresence, CardReader, CardStatusMessage, LivenessMessage, MessageError,
+    NegotiatedParameters, PairingAbortMessage, PairingConfirmMessage, PairingHelloMessage,
+    PairingStoredMessage, ProtocolErrorMessage, SessionCloseMessage, SessionParameters,
+    SessionReadyMessage, TypedMessage,
 };
 pub use offer::{MAX_OFFER_SIZE, PairingOffer, PairingOfferDeadline, PairingOfferError};
 pub use operation::{

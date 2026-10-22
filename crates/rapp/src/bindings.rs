@@ -3592,8 +3592,8 @@ mod routing_binding_tests {
             STREAM_PROFILE,
             bindings::{RappBindingError, RappSessionBridge},
             operation_bridge::{
-                RappBridgeAction, RappBridgeActionKind, RappCardKeyProfile, RappCloseReason,
-                RappOperationBridge, RappResultKind, RappSignatureAlgorithm,
+                RappBridgeAction, RappBridgeActionKind, RappCardKeyProfile, RappCardReader,
+                RappCloseReason, RappOperationBridge, RappResultKind, RappSignatureAlgorithm,
             },
         };
         use std::sync::{Arc, Mutex};
@@ -3713,11 +3713,48 @@ mod routing_binding_tests {
         }
 
         #[test]
+        fn the_requester_learns_the_card_and_the_custodians_reader() {
+            let (requester, custodian) = established();
+            for (certificate, reader) in [
+                (None, RappCardReader::Attached),
+                (
+                    Some(vec![CERTIFICATE_BYTE; CERTIFICATE_SIZE]),
+                    RappCardReader::Attached,
+                ),
+                (None, RappCardReader::Absent),
+                (
+                    Some(vec![CERTIFICATE_BYTE; CERTIFICATE_SIZE]),
+                    RappCardReader::Absent,
+                ),
+            ] {
+                let present = certificate.is_some();
+                let action = requester
+                    .receive_frame(
+                        frame(
+                            custodian
+                                .report_card_status(certificate, reader)
+                                .expect("card status"),
+                        ),
+                        NOW_MS,
+                    )
+                    .expect("requester reads the card status");
+                assert_eq!(action.kind, RappBridgeActionKind::CardStatus);
+                assert_eq!(action.card_present, Some(present));
+                assert_eq!(action.certificate_fingerprint.is_some(), present);
+                assert_eq!(action.card_reader, Some(reader));
+            }
+        }
+
+        #[test]
         fn a_read_is_served_without_consent() {
             let (requester, custodian) = established();
             requester
                 .receive_frame(
-                    frame(custodian.report_card_status(None).expect("card status")),
+                    frame(
+                        custodian
+                            .report_card_status(None, RappCardReader::Absent)
+                            .expect("card status"),
+                    ),
                     NOW_MS,
                 )
                 .expect("requester reads the card status");

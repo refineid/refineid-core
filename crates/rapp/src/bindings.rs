@@ -25,11 +25,10 @@ use super::{
     BinaryFrame, CpaceAttemptLedger, CpaceKc2Initiator, CpaceKc2Responder,
     CpaceKc2ResponderWaiting, EndpointRole, EstablishedEndpoint, ExplicitUserIntent, OfferId,
     POST_PAKE_CONFIRMATION_MS, POST_PAKE_HANDSHAKE_MS, PairId, PairKeyMaterial, PairRecord,
-    PairStore, PairStoreError, PairTombstone, PairingBackoff, PairingConfirmation, PairingError,
-    PairingHandshake, PairingOffer, PairingOfferDeadline, PairingSecret, PairingStorage,
-    PreAuthenticationRateLimit, ProfileName, ReadyOutcome, RoutingPreamble, STREAM_PROFILE,
-    SessionAuthentication, SessionHandshake, SessionId, TransportProfile, encode_kc2_step1_frame,
-    generate_pair_key_material,
+    PairingBackoff, PairingConfirmation, PairingError, PairingHandshake, PairingOffer,
+    PairingOfferDeadline, PairingSecret, PairingStorage, PreAuthenticationRateLimit, ProfileName,
+    ReadyOutcome, RoutingPreamble, STREAM_PROFILE, SessionAuthentication, SessionHandshake,
+    SessionId, TransportProfile, encode_kc2_step1_frame, generate_pair_key_material,
     operation_bridge::{EndedOperation, RappBridgeAction, RappBridgeActionKind},
     phase_deadline_ms, standard_pairing_context_v2,
 };
@@ -2531,57 +2530,6 @@ impl core::fmt::Display for RappVaultError {
 
 impl core::error::Error for RappVaultError {}
 
-#[derive(Clone)]
-pub(super) struct BindingPairStore {
-    pair_id: PairId,
-    pair: Arc<RappPairRecord>,
-    vault: Arc<dyn RappPairVault>,
-}
-
-impl PairStore for BindingPairStore {
-    type Error = RappVaultError;
-
-    fn load(&mut self, pair_id: PairId) -> Result<Option<PairRecord>, Self::Error> {
-        let Some(bytes) = self.vault.load_device_only(pair_id.as_bytes().to_vec())? else {
-            return Ok(None);
-        };
-        decode_pair_record(&bytes)
-            .map(Some)
-            .map_err(|_| RappVaultError::Unavailable)
-    }
-
-    fn insert(&mut self, record: PairRecord) -> Result<(), PairStoreError<Self::Error>> {
-        let pair_id = record.pair_id().as_bytes().to_vec();
-        let bytes = encode_pair_record(&record)
-            .map_err(|_| PairStoreError::Backend(RappVaultError::Unavailable))?;
-        self.vault
-            .insert_device_only(pair_id, bytes)
-            .map_err(PairStoreError::Backend)
-    }
-
-    fn revoke(&mut self, tombstone: PairTombstone) -> Result<(), PairStoreError<Self::Error>> {
-        if tombstone.pair_id != self.pair_id {
-            return Err(PairStoreError::PairNotFound);
-        }
-        self.vault
-            .revoke_device_only(
-                tombstone.pair_id.as_bytes().to_vec(),
-                tombstone.revoked_at_ms,
-            )
-            .map_err(PairStoreError::Backend)?;
-        self.pair
-            .record
-            .lock()
-            .map_err(|_| PairStoreError::Backend(RappVaultError::Unavailable))?
-            .take();
-        Ok(())
-    }
-
-    fn is_revoked(&mut self, pair_id: PairId) -> Result<bool, Self::Error> {
-        self.vault.is_revoked(pair_id.as_bytes().to_vec())
-    }
-}
-
 pub(super) enum SessionBridgeState {
     Handshake(Box<SessionHandshake>),
     Authentication(SessionAuthentication),
@@ -2598,7 +2546,7 @@ pub(super) enum SessionBridgeState {
 #[derive(uniffi::Object)]
 pub struct RappSessionBridge {
     pub(super) state: Mutex<SessionBridgeState>,
-    pub(super) pair_store: Mutex<BindingPairStore>,
+    pair: Arc<RappPairRecord>,
     session_id: Mutex<Option<SessionId>>,
 }
 
@@ -2903,15 +2851,10 @@ impl RappSessionBridge {
             super::SessionError::StorageUnconfirmed => RappBindingError::StorageUnconfirmed,
             _ => RappBindingError::ProtocolFailure,
         })?;
-        let pair_id = pair_record.pair_id();
         drop(pair_guard);
         Ok(Arc::new(Self {
             state: Mutex::new(SessionBridgeState::Handshake(Box::new(handshake))),
-            pair_store: Mutex::new(BindingPairStore {
-                pair_id,
-                pair,
-                vault,
-            }),
+            pair,
             session_id: Mutex::new(None),
         }))
     }
@@ -2923,10 +2866,7 @@ impl RappSessionBridge {
     }
 
     fn is_forgotten(&self) -> Result<bool, RappBindingError> {
-        self.pair_store
-            .lock()
-            .map_err(|_| RappBindingError::LocalStateFailure)?
-            .pair
+        self.pair
             .with_record(|record| Ok(record.forgotten_at_ms().is_some()))
     }
 
@@ -2944,9 +2884,6 @@ impl RappSessionBridge {
         };
         drop(state);
         let profiles = self
-            .pair_store
-            .lock()
-            .map_err(|_| RappBindingError::LocalStateFailure)?
             .pair
             .record
             .lock()

@@ -163,10 +163,14 @@ impl PairRecord {
         self.forgotten_at_ms
     }
 
-    /// The record its user forgot at `at_ms`, kept for the close.
+    /// The record its user forgot at `at_ms`, kept for the close. A record
+    /// already forgotten keeps its first time, so the notice window of
+    /// section 4.6 item 3 runs from the revocation.
     #[must_use]
     pub const fn forgotten(mut self, at_ms: u64) -> Self {
-        self.forgotten_at_ms = Some(at_ms);
+        if self.forgotten_at_ms.is_none() {
+            self.forgotten_at_ms = Some(at_ms);
+        }
         self
     }
 
@@ -216,49 +220,6 @@ impl fmt::Debug for PairRecord {
     }
 }
 
-/// Non-secret marker retained after an irreversible revocation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PairTombstone {
-    /// Revoked pair identifier.
-    pub pair_id: PairId,
-    /// Local time at which the secret was destroyed.
-    pub revoked_at_ms: u64,
-}
-
-/// Platform persistence boundary for long-term pair keys.
-///
-/// Implementations MUST use device-only, non-migrating, non-backup secret
-/// storage. `insert` and `revoke` MUST be atomic. `revoke` MUST destroy the
-/// private key before reporting success and retain only a non-secret tombstone.
-pub trait PairStore {
-    /// Platform storage error.
-    type Error;
-
-    /// Loads an active pair into zeroizing process memory.
-    ///
-    /// # Errors
-    /// The platform storage failure.
-    fn load(&mut self, pair_id: PairId) -> Result<Option<PairRecord>, Self::Error>;
-
-    /// Atomically inserts a newly authenticated pair.
-    ///
-    /// # Errors
-    /// [`PairStoreError`] on a reused identifier or a backend failure.
-    fn insert(&mut self, record: PairRecord) -> Result<(), PairStoreError<Self::Error>>;
-
-    /// Atomically destroys active secret material and stores a tombstone.
-    ///
-    /// # Errors
-    /// [`PairStoreError`] when the pair does not exist or the backend fails.
-    fn revoke(&mut self, tombstone: PairTombstone) -> Result<(), PairStoreError<Self::Error>>;
-
-    /// Reports whether an identifier has been permanently revoked locally.
-    ///
-    /// # Errors
-    /// The platform storage failure.
-    fn is_revoked(&mut self, pair_id: PairId) -> Result<bool, Self::Error>;
-}
-
 /// Pair-record validation failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PairRecordError {
@@ -275,17 +236,6 @@ impl fmt::Display for PairRecordError {
 }
 
 impl core::error::Error for PairRecordError {}
-
-/// Atomic pair-store operation failure.
-#[derive(Debug)]
-pub enum PairStoreError<E> {
-    /// The identifier already has an active record or tombstone.
-    IdentifierAlreadyUsed,
-    /// The requested active pair does not exist.
-    PairNotFound,
-    /// Platform-provided storage failed.
-    Backend(E),
-}
 
 /// Failure during pair record serialization or deserialization.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -586,6 +536,17 @@ mod tests {
         assert!(!forgotten.revocation_notice_expired(FORGOTTEN_AT_MS + REVOCATION_NOTICE_MS - 1));
         assert!(forgotten.revocation_notice_expired(FORGOTTEN_AT_MS + REVOCATION_NOTICE_MS));
         assert!(!test_record(0x42).revocation_notice_expired(u64::MAX));
+    }
+
+    #[test]
+    fn forgetting_again_keeps_the_first_time() {
+        let later = FORGOTTEN_AT_MS + REVOCATION_NOTICE_MS / 2;
+        let forgotten = test_record(0x42)
+            .forgotten(FORGOTTEN_AT_MS)
+            .forgotten(later);
+        assert_eq!(forgotten.forgotten_at_ms(), Some(FORGOTTEN_AT_MS));
+        assert!(!forgotten.revocation_notice_expired(FORGOTTEN_AT_MS + REVOCATION_NOTICE_MS - 1));
+        assert!(forgotten.revocation_notice_expired(FORGOTTEN_AT_MS + REVOCATION_NOTICE_MS));
     }
 
     fn test_record(id_byte: u8) -> PairRecord {

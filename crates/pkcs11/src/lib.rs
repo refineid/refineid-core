@@ -37,9 +37,9 @@
 //! PIN1 custody (`docs/security/credential-custody.md`). PIN1 lives
 //! only in a zeroizing [`pin::PinBytes`] in this process's memory, is
 //! never logged or rendered, and is presented to the card for every
-//! signature the card does not already report PIN1 verified for. It
-//! is held from the card's first acceptance with no idle window
-//! ([`pin_cache::PinSafetyCache`]), and destroyed on a refused,
+//! signature, since the card drops its PIN1 verification after each
+//! one. It is held from the card's first acceptance with no idle
+//! window ([`pin_cache::PinSafetyCache`]), and destroyed on a refused,
 //! blocked or malformed answer, a retry counter below pristine,
 //! another card, card removal, `C_Logout`, the last `C_CloseSession`,
 //! and `C_Finalize`.

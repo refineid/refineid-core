@@ -895,16 +895,15 @@ unsafe extern "C" fn c_logout(session: CkSessionHandle) -> CkRv {
         return CKR_SESSION_HANDLE_INVALID;
     };
     let slot_id = session_ref.slot_id();
-    let logged_in = module.is_logged_in(slot_id);
-    // A PIN1 out on an in-flight signature does not count as a login,
-    // and the logout destroys it all the same, so it never comes back.
+    // A PIN1 out on an in-flight signature is the slot's login too; the
+    // logout destroys it, so the signature's settlement cannot bring it
+    // back.
+    if !module.is_logged_in(slot_id) {
+        return CKR_USER_NOT_LOGGED_IN;
+    }
     module.logout(slot_id);
     drop(guard);
-    if logged_in {
-        CKR_OK
-    } else {
-        CKR_USER_NOT_LOGGED_IN
-    }
+    CKR_OK
 }
 
 /// Read one `C_FindObjects` / `C_GetAttributeValue` template into a
@@ -1379,9 +1378,9 @@ unsafe extern "C" fn c_sign(
             // bytes.len(), and signature_len is writable.
             unsafe { deliver_bytes(signature, signature_len, &bytes) }
         }
-        // `card_sign` destructively checks the held PIN1 out before any
-        // VERIFY; only the card accepting it, or leaving the VERIFY
-        // unanswered, puts it back.
+        // `card_sign` destructively checks the held PIN1 out before its
+        // VERIFY; it comes back only when the card accepted it and
+        // stayed in the reader, or left the VERIFY unanswered.
         Err(err) => err,
     };
     diag!("C_Sign rv={rv:#06x}");

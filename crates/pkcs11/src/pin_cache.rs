@@ -24,21 +24,27 @@
 //! below pristine bridges to the one operation that follows and no further
 //! ([`PIN1_LOGIN_BRIDGE`]).
 //!
-//! Use is destructive checkout: [`PinSafetyCache::checkout_pin1`] takes
-//! the value out under the retry counter the card reports, and
-//! [`CheckedOutPin1`] puts it back only when the card accepted it or left
-//! its VERIFY unanswered. Every other ending destroys it, dropping the
-//! checkout included. PIN2 never enters this cache.
+//! Use is destructive checkout. [`PinSafetyCache::checkout_pin1`] takes
+//! the value out under the retry counter the card reports;
+//! [`CheckedOutPin1::settle_verify`] settles it by the card's answer to
+//! the VERIFY that carried it, and an accepted value is settled again by
+//! what became of the card in the operation it authorized
+//! ([`AcceptedPin1::settle_operation`]). Only a held value the card
+//! accepted, or a VERIFY the card left unanswered, puts it back. Every
+//! other ending destroys it, dropping the checkout included. PIN2 never
+//! enters this cache.
 
 use core::time::Duration;
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
-use refineid_apdu::TransportOutcome;
+use refineid_apdu::{TransportErrorExt, TransportErrorKind, TransportOutcome};
 use refineid_auth::{
     AuthError, Pin1, PinStatus, UnvalidatedSecret, VerifyOutcome,
     pin1_status_permits_reusable_cache,
 };
 use refineid_pkcs15::TokenSerial;
+use refineid_sign::SignError;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::pin::PinBytes;
@@ -73,13 +79,55 @@ struct CachedPin1 {
     retention: Pin1Retention,
 }
 
-/// A positive PIN1 taken out of the cache for one credential operation on
-/// the card identified by its serial.
+/// A positive PIN1 taken out of the cache for one VERIFY on the card
+/// identified by its serial.
 ///
-/// Dropping it destroys the value; only [`Self::restore_after_success`]
-/// and [`Self::settle_verify`] can return it, and only a held value.
+/// Dropping it destroys the value; only [`Self::settle_verify`] can lead
+/// it back, and only a held value.
 pub struct CheckedOutPin1 {
     entry: CachedPin1,
+    /// Marks the checkout outstanding to [`PinSafetyCache::holds_pin1`].
+    _lease: Arc<()>,
+}
+
+/// A checked-out PIN1 the card has just accepted, out for the one
+/// operation it authorizes.
+///
+/// Dropping it destroys the value; only [`Self::settle_operation`] can
+/// return it, and only a held value.
+pub struct AcceptedPin1 {
+    entry: CachedPin1,
+    /// Marks the checkout outstanding to [`PinSafetyCache::holds_pin1`].
+    _lease: Arc<()>,
+}
+
+/// What a failed card exchange says about the card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExchangeFailure {
+    /// The card left the reader, or the reader went away.
+    CardLeft,
+    /// No answer arrived with the card still in the reader: a transport
+    /// fault, a timeout with the card state unknown, a card reset, or
+    /// lost protocol state. The card may or may not have acted.
+    Unanswered,
+}
+
+impl ExchangeFailure {
+    const fn of(kind: TransportErrorKind) -> Self {
+        match kind {
+            TransportErrorKind::NoCard | TransportErrorKind::ReaderRemoved => Self::CardLeft,
+            TransportErrorKind::TimeoutUnknownState
+            | TransportErrorKind::CardReset
+            | TransportErrorKind::ProtocolDesync
+            | TransportErrorKind::Backend => Self::Unanswered,
+        }
+    }
+
+    /// The failure a transport state transition stands for; `None` for a
+    /// response, which is an answer.
+    fn of_outcome(outcome: &TransportOutcome) -> Option<Self> {
+        outcome.kind().map(Self::of)
+    }
 }
 
 impl CheckedOutPin1 {
@@ -89,61 +137,84 @@ impl CheckedOutPin1 {
         &self.entry.pin
     }
 
-    /// Return a held value after the card confirmed it: it signed under
-    /// the PIN1 verification it already held. A bridge value is spent by
-    /// its one use and is destroyed instead.
-    pub fn restore_after_success(self, cache: &mut PinSafetyCache) {
-        self.restore(cache);
-    }
-
     /// Settle this checkout by the card's answer to the VERIFY that
     /// carried it.
     ///
-    /// - The card accepted it: a held value is returned, as
-    ///   [`Self::restore_after_success`] does.
-    /// - The VERIFY went unanswered with the card still in the reader --
-    ///   a transport failure, a timeout with the state unknown, a card
-    ///   reset, or lost protocol state: a held value is returned, and the
-    ///   retry counter read before its next use decides. A held value is
-    ///   checked out only under a pristine or verified counter
-    ///   ([`PinSafetyCache::checkout_pin1`]), so a refusal the card
-    ///   counted destroys it then instead of sending it again.
+    /// - The card accepted it: the value goes on to the operation it
+    ///   authorizes, as the returned [`AcceptedPin1`].
+    /// - The VERIFY went unanswered with the card still in the reader: a
+    ///   held value is returned to the cache, and the retry counter read
+    ///   before its next use decides. A value is checked out only under a
+    ///   pristine or verified counter ([`PinSafetyCache::checkout_pin1`]),
+    ///   so a refusal the card counted destroys it then instead of
+    ///   sending it again.
     /// - The card refused it as wrong: it is remembered as rejected and
     ///   destroyed.
     /// - The card reported the PIN blocked or answered with any other
     ///   status word, the card left the reader, or no command could be
     ///   built: it is destroyed.
     ///
-    /// A bridge value is destroyed whatever the answer.
-    pub fn settle_verify<E>(
+    /// A bridge value is never returned to the cache.
+    #[must_use]
+    pub fn settle_verify<E: TransportErrorExt>(
         self,
         cache: &mut PinSafetyCache,
         answer: &Result<VerifyOutcome, AuthError<E>>,
-    ) {
-        let keep = match answer {
-            Ok(VerifyOutcome::Ok) => true,
+    ) -> Option<AcceptedPin1> {
+        let failure = match answer {
+            Ok(VerifyOutcome::Ok) => {
+                return Some(AcceptedPin1 {
+                    entry: self.entry,
+                    _lease: self._lease,
+                });
+            }
             Ok(VerifyOutcome::WrongPin { .. }) => {
                 cache.record_rejected(&self.entry.serial, &self.entry.pin);
-                false
+                return None;
             }
-            Ok(VerifyOutcome::Locked | VerifyOutcome::Other(_)) => false,
-            Err(error) => verify_unanswered(error),
+            Ok(VerifyOutcome::Locked | VerifyOutcome::Other(_))
+            | Err(AuthError::Command(_) | AuthError::LengthUnsupported { .. }) => return None,
+            Err(AuthError::Transport(error)) => Some(ExchangeFailure::of(error.kind())),
+            Err(AuthError::Outcome(outcome)) => ExchangeFailure::of_outcome(outcome),
         };
-        if keep {
-            self.restore(cache);
+        if failure == Some(ExchangeFailure::Unanswered) {
+            cache.restore(self.entry);
         }
+        None
     }
+}
 
-    /// Put a held value back, unless the cache was cleared or given a
-    /// newer value while it was out.
-    fn restore(self, cache: &mut PinSafetyCache) {
-        if self.entry.retention != Pin1Retention::Held {
-            return;
+impl AcceptedPin1 {
+    /// Settle a value the card accepted by what became of the card in the
+    /// operation it authorized: `failure` is that operation's error, or
+    /// `None` when it completed.
+    ///
+    /// A held value is returned to the cache unless the card left the
+    /// reader during the operation. A card that refused the operation,
+    /// or left it unanswered, did not refuse the PIN it had just
+    /// accepted. A bridge value is spent either way.
+    pub fn settle_operation<E: TransportErrorExt>(
+        self,
+        cache: &mut PinSafetyCache,
+        failure: Option<&SignError<E>>,
+    ) {
+        let left = match failure {
+            None
+            | Some(
+                SignError::Status(..)
+                | SignError::Command(_)
+                | SignError::UnexpectedSignatureLength { .. },
+            ) => false,
+            Some(SignError::Transport(error)) => {
+                ExchangeFailure::of(error.kind()) == ExchangeFailure::CardLeft
+            }
+            Some(SignError::Outcome(outcome)) => {
+                ExchangeFailure::of_outcome(outcome) == Some(ExchangeFailure::CardLeft)
+            }
+        };
+        if !left {
+            cache.restore(self.entry);
         }
-        if cache.generation != self.entry.generation || cache.positive_pin1.is_some() {
-            return;
-        }
-        cache.positive_pin1 = Some(self.entry);
     }
 }
 
@@ -155,27 +226,24 @@ impl core::fmt::Debug for CheckedOutPin1 {
     }
 }
 
-/// Whether a VERIFY that failed left its command unanswered with the card
-/// still in the reader, so the card may or may not have counted it.
-const fn verify_unanswered<E>(error: &AuthError<E>) -> bool {
-    match error {
-        AuthError::Transport(_) => true,
-        AuthError::Outcome(outcome) => match outcome {
-            TransportOutcome::TimeoutUnknownState
-            | TransportOutcome::CardReset
-            | TransportOutcome::ProtocolDesync => true,
-            TransportOutcome::NoCard
-            | TransportOutcome::ReaderRemoved
-            | TransportOutcome::Response(_) => false,
-        },
-        AuthError::Command(_) | AuthError::LengthUnsupported { .. } => false,
+impl core::fmt::Debug for AcceptedPin1 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AcceptedPin1")
+            .field("serial", &self.entry.serial)
+            .finish_non_exhaustive()
     }
 }
 
-/// Whether the retry counter the card reports leaves a held PIN1 usable:
-/// pristine, or PIN1 standing verified. Any lower count means the card
-/// counted a refused PIN since it last confirmed this one.
-const fn held_counter_intact(live: PinStatus) -> bool {
+/// Whether the PIN1 retry state the card reports leaves a positive PIN1
+/// usable: pristine, or PIN1 standing verified.
+///
+/// A VERIFY the card accepts sets the try counter to its limit, and one
+/// it refuses decrements the counter and clears the verified state
+/// (FINEID S1 v4.2 section 3.5); the limit is five for PIN1 on both card
+/// families (FINEID S4-1 v4.2 section 4.1, S4-2 v4.0). A positive value
+/// was accepted by the card, so any count below the limit means the card
+/// refused a PIN since.
+const fn counter_intact(live: PinStatus) -> bool {
     matches!(live, PinStatus::Verified) || pin1_status_permits_reusable_cache(live)
 }
 
@@ -202,6 +270,9 @@ impl core::error::Error for PreviouslyRejectedPin {}
 pub struct PinSafetyCache {
     #[zeroize(skip)]
     positive_pin1: Option<CachedPin1>,
+    /// The checkout of the current generation, while one is out.
+    #[zeroize(skip)]
+    outstanding: Weak<()>,
     generation: u64,
     #[zeroize(skip)]
     negative: refineid_pin_cache::PinSafetyCache,
@@ -215,13 +286,15 @@ impl PinSafetyCache {
     pub fn new() -> Result<Self, getrandom::Error> {
         Ok(Self {
             positive_pin1: None,
+            outstanding: Weak::new(),
             generation: 0,
             negative: refineid_pin_cache::PinSafetyCache::new()?,
         })
     }
 
     /// Hold a PIN1 the card identified by `serial` has just accepted under
-    /// a pristine retry counter. It stays until an invalidation event.
+    /// a pristine retry counter. It stays until an invalidation event, and
+    /// a checkout still out from before can no longer come back.
     ///
     /// # Errors
     /// Returns [`PreviouslyRejectedPin`] if this PIN was previously recorded as rejected.
@@ -265,7 +338,7 @@ impl PinSafetyCache {
         if self.is_rejected(&serial, &pin) {
             return Err(PreviouslyRejectedPin);
         }
-        self.generation = self.generation.saturating_add(1);
+        self.next_generation();
         self.positive_pin1 = Some(CachedPin1 {
             serial,
             pin,
@@ -275,16 +348,22 @@ impl PinSafetyCache {
         Ok(())
     }
 
+    /// Start a new generation: a checkout still out can no longer come
+    /// back.
+    fn next_generation(&mut self) {
+        self.generation = self.generation.saturating_add(1);
+        self.outstanding = Weak::new();
+    }
+
     /// Check out the positive PIN1 for the card identified by `serial`,
     /// under `live`, the PIN1 retry state that card reported in the same
-    /// card transaction.
+    /// card session.
     ///
     /// The value leaves the cache whatever the outcome. It is destroyed
-    /// instead of handed out when it belongs to another card; when it is
-    /// held and `live` is neither pristine nor verified, since the counter
-    /// then went down after the card last confirmed it; or when it is a
-    /// bridge past [`PIN1_LOGIN_BRIDGE`]. A bridge is spent by this
-    /// checkout.
+    /// instead of handed out when it belongs to another card; when `live`
+    /// is neither pristine nor verified, since the counter then went down
+    /// after the card accepted it; or when it is a bridge past
+    /// [`PIN1_LOGIN_BRIDGE`]. A bridge is spent by this checkout.
     #[must_use]
     pub fn checkout_pin1(
         &mut self,
@@ -301,40 +380,53 @@ impl PinSafetyCache {
         now: Instant,
     ) -> Option<CheckedOutPin1> {
         let entry = self.positive_pin1.take()?;
-        if &entry.serial != serial {
+        let usable = &entry.serial == serial
+            && counter_intact(live)
+            && match entry.retention {
+                Pin1Retention::Held => true,
+                Pin1Retention::Bridge { staged_at } => bridge_open(staged_at, now),
+            };
+        if !usable {
             return None;
         }
-        let usable = match entry.retention {
-            Pin1Retention::Held => held_counter_intact(live),
-            Pin1Retention::Bridge { staged_at } => bridge_open(staged_at, now),
-        };
-        usable.then_some(CheckedOutPin1 { entry })
+        let lease = Arc::new(());
+        self.outstanding = Arc::downgrade(&lease);
+        Some(CheckedOutPin1 {
+            entry,
+            _lease: lease,
+        })
+    }
+
+    /// Put a held value back, unless the cache was cleared or given a
+    /// newer value while it was out.
+    fn restore(&mut self, entry: CachedPin1) {
+        if entry.retention != Pin1Retention::Held
+            || self.generation != entry.generation
+            || self.positive_pin1.is_some()
+        {
+            return;
+        }
+        self.positive_pin1 = Some(entry);
     }
 
     /// Destroy any positive PIN1, including one out on a checkout, which
     /// then cannot come back.
     pub fn clear_positive(&mut self) {
-        self.generation = self.generation.saturating_add(1);
+        self.next_generation();
         self.positive_pin1 = None;
     }
 
-    /// Destroy the positive PIN1 if it belongs to `serial`.
-    pub fn clear_positive_for_serial(&mut self, serial: &TokenSerial) {
-        if let Some(entry) = &self.positive_pin1
-            && &entry.serial == serial
-        {
-            self.clear_positive();
+    /// Whether this cache holds a PIN1 for the slot's login: a held value,
+    /// a bridge still open, or a value out on a checkout that can still
+    /// come back. A bridge past its time is destroyed here.
+    pub fn holds_pin1(&mut self) -> bool {
+        self.holds_pin1_at(Instant::now())
+    }
+
+    fn holds_pin1_at(&mut self, now: Instant) -> bool {
+        if self.outstanding.strong_count() > 0 {
+            return true;
         }
-    }
-
-    /// Whether a positive PIN1 is in the cache: a held value, or a bridge
-    /// still open. A bridge past its time is destroyed here; a value out on
-    /// a checkout is not in the cache and is left alone.
-    pub fn has_positive_pin1(&mut self) -> bool {
-        self.has_positive_pin1_at(Instant::now())
-    }
-
-    fn has_positive_pin1_at(&mut self, now: Instant) -> bool {
         let Some(entry) = &self.positive_pin1 else {
             return false;
         };
@@ -359,10 +451,12 @@ impl PinSafetyCache {
         }
     }
 
-    /// Record a card-rejected PIN1 value, destroying a positive PIN1 held
-    /// for the same card.
+    /// Record a PIN1 value the card identified by `serial` rejected, and
+    /// destroy the slot's positive PIN1, held, staged or out on a
+    /// checkout: the rejection either lowered that card's retry counter
+    /// or shows another card in the reader.
     pub fn record_rejected(&mut self, serial: &TokenSerial, pin: &PinBytes) {
-        self.clear_positive_for_serial(serial);
+        self.clear_positive();
         let secret = UnvalidatedSecret::from_owned_bytes(pin.as_bytes().to_vec());
         if let Ok(pin1) = Pin1::reconstruct(secret) {
             self.negative.record_rejected(serial, &pin1);
@@ -375,7 +469,7 @@ impl core::fmt::Debug for PinSafetyCache {
         f.debug_struct("PinSafetyCache")
             .field("has_positive_pin1", &self.positive_pin1.is_some())
             .field("negative", &self.negative)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -384,11 +478,15 @@ mod tests {
     use core::time::Duration;
     use std::time::Instant;
 
-    use refineid_apdu::{CredentialBodyError, PinRetries, StatusWord, TransportOutcome};
+    use refineid_apdu::{
+        CredentialBodyError, PinRetries, StatusWord, TransportErrorExt, TransportErrorKind,
+        TransportOutcome,
+    };
     use refineid_auth::{AuthError, ORGANIZATIONAL_PIN_MAX_LENGTH, PinStatus, VerifyOutcome};
     use refineid_pkcs15::TokenSerial;
+    use refineid_sign::SignError;
 
-    use super::{PIN1_LOGIN_BRIDGE, PinSafetyCache, PreviouslyRejectedPin};
+    use super::{AcceptedPin1, PIN1_LOGIN_BRIDGE, PinSafetyCache, PreviouslyRejectedPin};
     use crate::pin::PinBytes;
 
     /// Retry count of a pristine FINEID PIN.
@@ -400,14 +498,25 @@ mod tests {
     const LONG_IDLE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
     /// Uses of one held value in a row.
     const REPEATED_USES: usize = 3;
+    /// The signing stage a scripted card refuses.
+    const REFUSED_STAGE: &str = "PSO:CDS";
 
     /// Distinct synthetic card serials.
     const CARD_A_SERIAL: &str = "CARD-A-FULL-SERIAL";
     const CARD_B_SERIAL: &str = "CARD-B-FULL-SERIAL";
 
-    /// The adapter-level failure a scripted link reports.
+    /// The adapter-level failure a scripted link reports, of the kind it
+    /// names.
     #[derive(Debug)]
-    struct LinkDown;
+    struct ScriptedFault(TransportErrorKind);
+
+    impl TransportErrorExt for ScriptedFault {
+        fn kind(&self) -> TransportErrorKind {
+            self.0
+        }
+    }
+
+    type VerifyAnswer = Result<VerifyOutcome, AuthError<ScriptedFault>>;
 
     fn cache() -> PinSafetyCache {
         PinSafetyCache::new().expect("operating system random source is available")
@@ -444,55 +553,92 @@ mod tests {
         cache
     }
 
-    fn answered(outcome: VerifyOutcome) -> Result<VerifyOutcome, AuthError<LinkDown>> {
-        Ok(outcome)
+    fn staging(staged_at: Instant) -> PinSafetyCache {
+        let mut cache = cache();
+        cache
+            .stage_pin1_once_at(serial(CARD_A_SERIAL), random_pin(), staged_at)
+            .expect("a fresh PIN1 is not a rejected one");
+        cache
     }
 
-    fn failed(error: AuthError<LinkDown>) -> Result<VerifyOutcome, AuthError<LinkDown>> {
-        Err(error)
+    fn accepted() -> VerifyAnswer {
+        Ok(VerifyOutcome::Ok)
     }
 
-    fn unanswered_failures() -> [AuthError<LinkDown>; 4] {
+    fn fault(kind: TransportErrorKind) -> ScriptedFault {
+        ScriptedFault(kind)
+    }
+
+    fn unanswered_verifies() -> [VerifyAnswer; 5] {
         [
-            AuthError::Transport(LinkDown),
-            AuthError::Outcome(TransportOutcome::TimeoutUnknownState),
-            AuthError::Outcome(TransportOutcome::CardReset),
-            AuthError::Outcome(TransportOutcome::ProtocolDesync),
+            Err(AuthError::Transport(fault(TransportErrorKind::Backend))),
+            Err(AuthError::Transport(fault(
+                TransportErrorKind::TimeoutUnknownState,
+            ))),
+            Err(AuthError::Outcome(TransportOutcome::TimeoutUnknownState)),
+            Err(AuthError::Outcome(TransportOutcome::CardReset)),
+            Err(AuthError::Outcome(TransportOutcome::ProtocolDesync)),
         ]
+    }
+
+    fn card_left_verifies() -> [VerifyAnswer; 4] {
+        [
+            Err(AuthError::Outcome(TransportOutcome::NoCard)),
+            Err(AuthError::Outcome(TransportOutcome::ReaderRemoved)),
+            Err(AuthError::Transport(fault(TransportErrorKind::NoCard))),
+            Err(AuthError::Transport(fault(
+                TransportErrorKind::ReaderRemoved,
+            ))),
+        ]
+    }
+
+    /// Check the held value out and have the card accept it.
+    fn accepted_held(cache: &mut PinSafetyCache) -> AcceptedPin1 {
+        let checkout = cache
+            .checkout_pin1(&serial(CARD_A_SERIAL), pristine())
+            .expect("the held value is checked out");
+        checkout
+            .settle_verify(cache, &accepted())
+            .expect("an accepted VERIFY leads to the operation")
+    }
+
+    fn completed(accepted: AcceptedPin1, cache: &mut PinSafetyCache) {
+        accepted.settle_operation::<ScriptedFault>(cache, None);
     }
 
     #[test]
     fn a_held_pin1_has_no_idle_window() {
         let mut cache = holding(random_pin());
         let much_later = Instant::now() + LONG_IDLE;
-        assert!(cache.has_positive_pin1_at(much_later));
+        assert!(cache.holds_pin1_at(much_later));
         let checkout = cache
             .checkout_pin1_at(&serial(CARD_A_SERIAL), pristine(), much_later)
             .expect("a held value has no idle window");
-        checkout.restore_after_success(&mut cache);
-        assert!(cache.has_positive_pin1_at(much_later + LONG_IDLE));
+        let accepted = checkout
+            .settle_verify(&mut cache, &accepted())
+            .expect("an accepted VERIFY leads to the operation");
+        completed(accepted, &mut cache);
+        assert!(cache.holds_pin1_at(much_later + LONG_IDLE));
     }
 
     #[test]
     fn a_held_pin1_serves_every_operation_the_card_confirms() {
         let mut cache = holding(random_pin());
         for _ in 0..REPEATED_USES {
-            let checkout = cache
-                .checkout_pin1(&serial(CARD_A_SERIAL), pristine())
-                .expect("the held value is checked out");
-            checkout.settle_verify(&mut cache, &answered(VerifyOutcome::Ok));
+            let accepted = accepted_held(&mut cache);
+            completed(accepted, &mut cache);
         }
-        assert!(cache.has_positive_pin1());
+        assert!(cache.holds_pin1());
     }
 
     #[test]
     fn a_verified_card_keeps_the_held_pin1() {
         let mut cache = holding(random_pin());
-        let checkout = cache
-            .checkout_pin1(&serial(CARD_A_SERIAL), PinStatus::Verified)
-            .expect("a verified PIN1 is not a counter that went down");
-        checkout.restore_after_success(&mut cache);
-        assert!(cache.has_positive_pin1());
+        let checkout = cache.checkout_pin1(&serial(CARD_A_SERIAL), PinStatus::Verified);
+        assert!(
+            checkout.is_some(),
+            "a verified PIN1 is a counter at its limit"
+        );
     }
 
     #[test]
@@ -503,7 +649,7 @@ mod tests {
                 .checkout_pin1(&serial(CARD_B_SERIAL), pristine())
                 .is_none()
         );
-        assert!(!cache.has_positive_pin1());
+        assert!(!cache.holds_pin1());
         assert!(
             cache
                 .checkout_pin1(&serial(CARD_A_SERIAL), pristine())
@@ -519,7 +665,7 @@ mod tests {
                 .checkout_pin1(&serial(CARD_A_SERIAL), remaining(RETRIES_ONE_SPENT))
                 .is_none()
         );
-        assert!(!cache.has_positive_pin1());
+        assert!(!cache.holds_pin1());
     }
 
     #[test]
@@ -531,19 +677,31 @@ mod tests {
         ] {
             let mut cache = holding(random_pin());
             assert!(cache.checkout_pin1(&serial(CARD_A_SERIAL), live).is_none());
-            assert!(!cache.has_positive_pin1());
+            assert!(!cache.holds_pin1());
         }
     }
 
     #[test]
     fn an_unanswered_verify_returns_the_held_pin1() {
-        for failure in unanswered_failures() {
+        for answer in unanswered_verifies() {
             let mut cache = holding(random_pin());
             let checkout = cache
                 .checkout_pin1(&serial(CARD_A_SERIAL), pristine())
                 .expect("the held value is checked out");
-            checkout.settle_verify(&mut cache, &failed(failure));
-            assert!(cache.has_positive_pin1());
+            assert!(checkout.settle_verify(&mut cache, &answer).is_none());
+            assert!(cache.holds_pin1());
+        }
+    }
+
+    #[test]
+    fn a_verify_the_card_left_destroys_the_held_pin1() {
+        for answer in card_left_verifies() {
+            let mut cache = holding(random_pin());
+            let checkout = cache
+                .checkout_pin1(&serial(CARD_A_SERIAL), pristine())
+                .expect("the held value is checked out");
+            assert!(checkout.settle_verify(&mut cache, &answer).is_none());
+            assert!(!cache.holds_pin1());
         }
     }
 
@@ -553,13 +711,15 @@ mod tests {
         let checkout = cache
             .checkout_pin1(&serial(CARD_A_SERIAL), pristine())
             .expect("the held value is checked out");
-        checkout.settle_verify(&mut cache, &failed(AuthError::Transport(LinkDown)));
+        let unanswered: VerifyAnswer =
+            Err(AuthError::Transport(fault(TransportErrorKind::Backend)));
+        assert!(checkout.settle_verify(&mut cache, &unanswered).is_none());
         assert!(
             cache
                 .checkout_pin1(&serial(CARD_A_SERIAL), remaining(RETRIES_ONE_SPENT))
                 .is_none()
         );
-        assert!(!cache.has_positive_pin1());
+        assert!(!cache.holds_pin1());
     }
 
     #[test]
@@ -568,7 +728,9 @@ mod tests {
         let checkout = cache
             .checkout_pin1(&serial(CARD_A_SERIAL), pristine())
             .expect("the held value is checked out");
-        checkout.settle_verify(&mut cache, &failed(AuthError::Transport(LinkDown)));
+        let unanswered: VerifyAnswer =
+            Err(AuthError::Transport(fault(TransportErrorKind::Backend)));
+        assert!(checkout.settle_verify(&mut cache, &unanswered).is_none());
         assert!(
             cache
                 .checkout_pin1(&serial(CARD_A_SERIAL), pristine())
@@ -583,12 +745,12 @@ mod tests {
         let checkout = cache
             .checkout_pin1(&serial(CARD_A_SERIAL), pristine())
             .expect("the held value is checked out");
-        let wrong = VerifyOutcome::WrongPin {
+        let wrong: VerifyAnswer = Ok(VerifyOutcome::WrongPin {
             retries_left: PinRetries::from_nibble(RETRIES_ONE_SPENT)
                 .expect("test retry count fits the status-word nibble"),
-        };
-        checkout.settle_verify(&mut cache, &answered(wrong));
-        assert!(!cache.has_positive_pin1());
+        });
+        assert!(checkout.settle_verify(&mut cache, &wrong).is_none());
+        assert!(!cache.holds_pin1());
         assert!(cache.is_rejected(&serial(CARD_A_SERIAL), &pin));
         assert_eq!(
             cache.store_pin1(serial(CARD_A_SERIAL), pin),
@@ -598,11 +760,11 @@ mod tests {
 
     #[test]
     fn a_blocked_or_malformed_answer_destroys_the_held_pin1() {
-        let answers = [
-            answered(VerifyOutcome::Locked),
-            answered(VerifyOutcome::Other(StatusWord::SecurityNotSatisfied)),
-            failed(AuthError::Command(CredentialBodyError::Empty)),
-            failed(AuthError::LengthUnsupported {
+        let answers: [VerifyAnswer; 4] = [
+            Ok(VerifyOutcome::Locked),
+            Ok(VerifyOutcome::Other(StatusWord::SecurityNotSatisfied)),
+            Err(AuthError::Command(CredentialBodyError::Empty)),
+            Err(AuthError::LengthUnsupported {
                 max: ORGANIZATIONAL_PIN_MAX_LENGTH,
             }),
         ];
@@ -611,20 +773,40 @@ mod tests {
             let checkout = cache
                 .checkout_pin1(&serial(CARD_A_SERIAL), pristine())
                 .expect("the held value is checked out");
-            checkout.settle_verify(&mut cache, &answer);
-            assert!(!cache.has_positive_pin1());
+            assert!(checkout.settle_verify(&mut cache, &answer).is_none());
+            assert!(!cache.holds_pin1());
         }
     }
 
     #[test]
-    fn a_card_that_left_the_reader_destroys_the_held_pin1() {
-        for gone in [TransportOutcome::NoCard, TransportOutcome::ReaderRemoved] {
+    fn an_operation_the_card_left_destroys_the_accepted_pin1() {
+        let failures: [SignError<ScriptedFault>; 4] = [
+            SignError::Outcome(TransportOutcome::NoCard),
+            SignError::Outcome(TransportOutcome::ReaderRemoved),
+            SignError::Transport(fault(TransportErrorKind::NoCard)),
+            SignError::Transport(fault(TransportErrorKind::ReaderRemoved)),
+        ];
+        for failure in failures {
             let mut cache = holding(random_pin());
-            let checkout = cache
-                .checkout_pin1(&serial(CARD_A_SERIAL), pristine())
-                .expect("the held value is checked out");
-            checkout.settle_verify(&mut cache, &failed(AuthError::Outcome(gone)));
-            assert!(!cache.has_positive_pin1());
+            let accepted = accepted_held(&mut cache);
+            accepted.settle_operation(&mut cache, Some(&failure));
+            assert!(!cache.holds_pin1());
+        }
+    }
+
+    #[test]
+    fn an_operation_that_failed_with_the_card_present_keeps_the_accepted_pin1() {
+        let failures: [SignError<ScriptedFault>; 4] = [
+            SignError::Status(REFUSED_STAGE, StatusWord::SecurityNotSatisfied),
+            SignError::Outcome(TransportOutcome::CardReset),
+            SignError::Outcome(TransportOutcome::TimeoutUnknownState),
+            SignError::Transport(fault(TransportErrorKind::Backend)),
+        ];
+        for failure in failures {
+            let mut cache = holding(random_pin());
+            let accepted = accepted_held(&mut cache);
+            accepted.settle_operation(&mut cache, Some(&failure));
+            assert!(cache.holds_pin1());
         }
     }
 
@@ -634,7 +816,7 @@ mod tests {
         let checkout = cache.checkout_pin1(&serial(CARD_A_SERIAL), pristine());
         assert!(checkout.is_some());
         drop(checkout);
-        assert!(!cache.has_positive_pin1());
+        assert!(!cache.holds_pin1());
         assert!(
             cache
                 .checkout_pin1(&serial(CARD_A_SERIAL), pristine())
@@ -643,76 +825,113 @@ mod tests {
     }
 
     #[test]
-    fn clearing_during_a_checkout_keeps_the_value_from_coming_back() {
+    fn dropping_an_accepted_value_destroys_it() {
         let mut cache = holding(random_pin());
-        let checkout = cache
-            .checkout_pin1(&serial(CARD_A_SERIAL), pristine())
-            .expect("the held value is checked out");
-        cache.clear_positive();
-        checkout.settle_verify(&mut cache, &answered(VerifyOutcome::Ok));
-        assert!(!cache.has_positive_pin1());
+        let accepted = accepted_held(&mut cache);
+        drop(accepted);
+        assert!(!cache.holds_pin1());
     }
 
     #[test]
-    fn asking_for_login_state_during_a_checkout_does_not_destroy_the_value() {
+    fn clearing_during_a_checkout_keeps_the_value_from_coming_back() {
+        let mut cache = holding(random_pin());
+        let accepted = accepted_held(&mut cache);
+        cache.clear_positive();
+        assert!(!cache.holds_pin1());
+        completed(accepted, &mut cache);
+        assert!(!cache.holds_pin1());
+    }
+
+    #[test]
+    fn a_rejection_on_another_card_destroys_the_held_pin1() {
+        let mut cache = holding(random_pin());
+        cache.record_rejected(&serial(CARD_B_SERIAL), &random_pin());
+        assert!(!cache.holds_pin1());
+    }
+
+    #[test]
+    fn a_rejection_during_a_checkout_keeps_the_value_from_coming_back() {
+        let mut cache = holding(random_pin());
+        let accepted = accepted_held(&mut cache);
+        cache.record_rejected(&serial(CARD_B_SERIAL), &random_pin());
+        completed(accepted, &mut cache);
+        assert!(!cache.holds_pin1());
+    }
+
+    #[test]
+    fn a_stale_checkout_does_not_replace_a_newer_login() {
+        let newer = random_pin();
+        let mut cache = holding(random_pin());
+        let stale = accepted_held(&mut cache);
+        cache
+            .store_pin1(serial(CARD_A_SERIAL), newer.clone())
+            .expect("a fresh PIN1 is not a rejected one");
+        completed(stale, &mut cache);
+        let checkout = cache
+            .checkout_pin1(&serial(CARD_A_SERIAL), pristine())
+            .expect("the newer value is held");
+        assert_eq!(checkout.pin().as_bytes(), newer.as_bytes());
+    }
+
+    #[test]
+    fn a_checkout_counts_as_the_login_until_it_settles() {
         let mut cache = holding(random_pin());
         let checkout = cache
             .checkout_pin1(&serial(CARD_A_SERIAL), pristine())
             .expect("the held value is checked out");
-        assert!(!cache.has_positive_pin1());
-        checkout.restore_after_success(&mut cache);
-        assert!(cache.has_positive_pin1());
+        assert!(cache.holds_pin1());
+        let accepted = checkout
+            .settle_verify(&mut cache, &accepted())
+            .expect("an accepted VERIFY leads to the operation");
+        assert!(cache.holds_pin1());
+        completed(accepted, &mut cache);
+        assert!(cache.holds_pin1());
     }
 
     #[test]
     fn the_login_bridge_serves_one_operation() {
-        let mut cache = cache();
-        cache
-            .stage_pin1_once(serial(CARD_A_SERIAL), random_pin())
-            .expect("a fresh PIN1 is not a rejected one");
+        let mut cache = staging(Instant::now());
         let checkout = cache
-            .checkout_pin1(&serial(CARD_A_SERIAL), remaining(RETRIES_ONE_SPENT))
+            .checkout_pin1(&serial(CARD_A_SERIAL), pristine())
             .expect("the bridge serves the operation after the login");
-        checkout.settle_verify(&mut cache, &answered(VerifyOutcome::Ok));
-        assert!(!cache.has_positive_pin1());
+        let accepted = checkout
+            .settle_verify(&mut cache, &accepted())
+            .expect("an accepted VERIFY leads to the operation");
+        completed(accepted, &mut cache);
+        assert!(!cache.holds_pin1());
     }
 
     #[test]
     fn the_login_bridge_is_spent_by_an_unanswered_verify() {
-        let mut cache = cache();
-        cache
-            .stage_pin1_once(serial(CARD_A_SERIAL), random_pin())
-            .expect("a fresh PIN1 is not a rejected one");
+        let mut cache = staging(Instant::now());
         let checkout = cache
             .checkout_pin1(&serial(CARD_A_SERIAL), pristine())
             .expect("the bridge serves the operation after the login");
-        checkout.settle_verify(&mut cache, &failed(AuthError::Transport(LinkDown)));
-        assert!(!cache.has_positive_pin1());
+        let unanswered: VerifyAnswer =
+            Err(AuthError::Transport(fault(TransportErrorKind::Backend)));
+        assert!(checkout.settle_verify(&mut cache, &unanswered).is_none());
+        assert!(!cache.holds_pin1());
     }
 
     #[test]
-    fn the_login_bridge_closes_when_its_time_runs_out() {
-        let staged_at = Instant::now();
-        let mut cache = cache();
-        cache
-            .stage_pin1_once_at(serial(CARD_A_SERIAL), random_pin(), staged_at)
-            .expect("a fresh PIN1 is not a rejected one");
-        assert!(cache.has_positive_pin1_at(staged_at));
-        assert!(!cache.has_positive_pin1_at(staged_at + PIN1_LOGIN_BRIDGE));
+    fn the_login_bridge_needs_an_intact_counter() {
+        for live in [remaining(RETRIES_ONE_SPENT), PinStatus::Locked] {
+            let mut cache = staging(Instant::now());
+            assert!(cache.checkout_pin1(&serial(CARD_A_SERIAL), live).is_none());
+            assert!(!cache.holds_pin1());
+        }
+        let mut cache = staging(Instant::now());
         assert!(
             cache
-                .checkout_pin1_at(&serial(CARD_A_SERIAL), pristine(), staged_at)
-                .is_none()
+                .checkout_pin1(&serial(CARD_A_SERIAL), PinStatus::Verified)
+                .is_some()
         );
     }
 
     #[test]
-    fn a_checkout_past_the_login_bridge_finds_nothing() {
+    fn a_checkout_past_the_login_bridge_destroys_it() {
         let staged_at = Instant::now();
-        let mut cache = cache();
-        cache
-            .stage_pin1_once_at(serial(CARD_A_SERIAL), random_pin(), staged_at)
-            .expect("a fresh PIN1 is not a rejected one");
+        let mut cache = staging(staged_at);
         assert!(
             cache
                 .checkout_pin1_at(
@@ -722,6 +941,27 @@ mod tests {
                 )
                 .is_none()
         );
-        assert!(!cache.has_positive_pin1_at(staged_at));
+        assert!(
+            cache
+                .checkout_pin1_at(&serial(CARD_A_SERIAL), pristine(), staged_at)
+                .is_none(),
+            "the expired checkout removed the bridge"
+        );
+    }
+
+    #[test]
+    fn the_login_bridge_leaves_the_login_when_its_time_runs_out() {
+        let staged_at = Instant::now();
+        let mut cache = staging(staged_at);
+        assert!(cache.holds_pin1_at(staged_at));
+        assert!(!cache.holds_pin1_at(staged_at + PIN1_LOGIN_BRIDGE));
+        assert!(!cache.holds_pin1_at(staged_at));
+    }
+
+    #[test]
+    fn a_rejected_pin_destroys_a_staged_bridge() {
+        let mut cache = staging(Instant::now());
+        cache.record_rejected(&serial(CARD_A_SERIAL), &random_pin());
+        assert!(!cache.holds_pin1());
     }
 }

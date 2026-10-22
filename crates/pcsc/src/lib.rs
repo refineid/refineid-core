@@ -540,6 +540,12 @@ pub struct ReaderInfo {
     pub id: ReaderId,
     /// Whether a card is currently presented in this reader.
     pub card_present: bool,
+    /// How many card insertions and removals the platform has counted
+    /// for this reader: the event counter `SCardGetStatusChange` reports
+    /// in the upper half of `dwEventState`. A change between two reads
+    /// means a card arrived or left in between; a platform that keeps no
+    /// count reports zero throughout.
+    pub card_events: u32,
 }
 
 /// Access permission requested when opening a card on a reader.
@@ -851,22 +857,26 @@ impl ReaderBackend for PcscBackend {
             let cstr = CString::new(name.as_str())
                 .map_err(|e| PcscError::Transport(format!("reader name has interior NUL: {e}")))?;
             let mut states = vec![ReaderState::new(cstr, State::UNAWARE)];
-            let card_present = match ctx.get_status_change(core::time::Duration::ZERO, &mut states)
-            {
-                Ok(()) | Err(pcsc::Error::Timeout) => {
-                    let Some(state) = states.first() else {
-                        return Err(PcscError::Transport(
-                            "reader-state vector unexpectedly empty".into(),
-                        ));
-                    };
-                    let event = state.event_state();
-                    event.contains(State::PRESENT) && !event.contains(State::EMPTY)
-                }
-                Err(e) => return Err(e.into()),
-            };
+            let (card_present, card_events) =
+                match ctx.get_status_change(core::time::Duration::ZERO, &mut states) {
+                    Ok(()) | Err(pcsc::Error::Timeout) => {
+                        let Some(state) = states.first() else {
+                            return Err(PcscError::Transport(
+                                "reader-state vector unexpectedly empty".into(),
+                            ));
+                        };
+                        let event = state.event_state();
+                        (
+                            event.contains(State::PRESENT) && !event.contains(State::EMPTY),
+                            state.event_count(),
+                        )
+                    }
+                    Err(e) => return Err(e.into()),
+                };
             out.push(ReaderInfo {
                 id: ReaderId::new(name),
                 card_present,
+                card_events,
             });
         }
         Ok(out)

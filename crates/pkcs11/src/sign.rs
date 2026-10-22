@@ -37,11 +37,10 @@
 //! seam even though we do not ship a full-chain hardware mock.
 
 use refineid_apdu::CardTransport;
-use refineid_sign::{KeyRef, SignOps, SignScheme};
+use refineid_sign::{KeyRef, SignError, SignOps, SignScheme, Signature};
 
 use crate::ck::{
-    CKM_ECDSA, CKM_RSA_PKCS, CKR_DATA_INVALID, CKR_DATA_LEN_RANGE, CKR_DEVICE_ERROR,
-    CkMechanismType, CkRv, CkUlong,
+    CKM_ECDSA, CKM_RSA_PKCS, CKR_DATA_INVALID, CKR_DATA_LEN_RANGE, CkMechanismType, CkRv, CkUlong,
 };
 
 /// RSA-3072 modulus length in bits (FINEID S4-1 v3.1 auth key).
@@ -303,47 +302,61 @@ pub(super) fn parse_digest_info(input: &[u8]) -> Result<(DigestInfoHash, &[u8]),
     Ok((hash, digest_body))
 }
 
-/// Run the card sign for `mechanism` over `input`.
+/// A `C_Sign` input checked against its mechanism and ready for the
+/// card, so the card is commanded only for input the module accepts.
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "private root module helper is used by sibling token module; plain pub would violate the public-surface typing grep"
+)]
+pub(super) enum CardSignInput {
+    /// The SHA-256 digest a `CKM_RSA_PKCS` `DigestInfo` carries.
+    RsaSha256([u8; SHA256_DIGEST_BYTES]),
+    /// A `CKM_ECDSA` digest fitted to the card's 48-byte slot by
+    /// [`CkEcdsaDigest`].
+    EcdsaP384([u8; SHA384_DIGEST_BYTES]),
+}
+
+impl CardSignInput {
+    /// Check `input` against `mechanism`: a `DigestInfo` for RSA, a raw
+    /// digest for ECDSA.
+    ///
+    /// # Errors
+    /// [`CKR_DATA_INVALID`] / [`CKR_DATA_LEN_RANGE`] on bad input.
+    pub(super) fn parse(mechanism: Mechanism, input: &[u8]) -> Result<Self, CkRv> {
+        match mechanism {
+            Mechanism::RsaPkcs => parse_sha256_digest_info(input).map(Self::RsaSha256),
+            Mechanism::Ecdsa => CkEcdsaDigest::fit_p384(input)
+                .map(|digest| Self::EcdsaP384(digest.into_card_hash())),
+        }
+    }
+}
+
+/// Run the card sign over a checked input.
 ///
 /// The caller has already opened the card, selected the PKCS#15
-/// application, and verified PIN1 on this connection (the FINEID
-/// applet keeps the auth state for the subsequent PSO chain). For
-/// RSA the input is a `DigestInfo`; for ECDSA it is the raw
-/// digest, fitted to the card's 48-byte slot by
-/// [`CkEcdsaDigest`].
+/// application, and verified PIN1 on this connection; the card drops
+/// that verification after the signature (FINEID S4-1 v4.2 section
+/// 8.1.7).
 ///
 /// # Errors
-/// [`CKR_DATA_INVALID`] / [`CKR_DATA_LEN_RANGE`] on bad input,
-/// [`CKR_DEVICE_ERROR`] if the card leg fails.
+/// The card leg's [`SignError`], typed so the caller can tell a card
+/// that left the reader from one that answered or stayed silent.
 #[expect(
     clippy::redundant_pub_crate,
     reason = "private root module helper is used by sibling token module; plain pub would violate the public-surface typing grep"
 )]
 pub(super) fn sign_with_card<T: CardTransport>(
     transport: &mut T,
-    mechanism: Mechanism,
-    input: &[u8],
-) -> Result<Vec<u8>, CkRv> {
-    match mechanism {
-        Mechanism::RsaPkcs => {
-            let digest = parse_sha256_digest_info(input)?;
-            let signature = transport
-                .sign_prehashed_sha256_rsa(SignScheme::Citizen, KeyRef::Auth, digest)
-                .map_err(|_sign_err| CKR_DEVICE_ERROR)?;
-            Ok(signature.into_bytes())
-        }
-        Mechanism::Ecdsa => {
-            let digest = CkEcdsaDigest::fit_p384(input)?;
-            let signature = transport
-                .sign_prehashed_sha384_ecdsa(
-                    SignScheme::Citizen,
-                    KeyRef::Auth,
-                    digest.into_card_hash(),
-                )
-                .map_err(|_sign_err| CKR_DEVICE_ERROR)?;
-            // Raw r || s -- already the CKM_ECDSA output format.
-            Ok(signature.into_bytes())
-        }
+    input: CardSignInput,
+) -> Result<Vec<u8>, SignError<T::Error>> {
+    match input {
+        CardSignInput::RsaSha256(digest) => transport
+            .sign_prehashed_sha256_rsa(SignScheme::Citizen, KeyRef::Auth, digest)
+            .map(Signature::into_bytes),
+        // Raw r || s -- already the CKM_ECDSA output format.
+        CardSignInput::EcdsaP384(digest) => transport
+            .sign_prehashed_sha384_ecdsa(SignScheme::Citizen, KeyRef::Auth, digest)
+            .map(Signature::into_bytes),
     }
 }
 

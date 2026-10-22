@@ -280,6 +280,9 @@ pub struct ModuleState {
     event_reported: BTreeMap<CkSlotId, bool>,
     /// Active login state for remote RAPP readers (authenticated via on-device protected path).
     remote_logged_in: BTreeSet<CkSlotId>,
+    /// Per local slot, the reader's card insertion and removal count at
+    /// the last refresh that acted on it.
+    card_events: BTreeMap<CkSlotId, u32>,
     /// The handle range the next raised token takes.
     next_token_generation: CkObjectHandle,
 }
@@ -297,6 +300,7 @@ impl ModuleState {
             token_cache: BTreeMap::new(),
             event_reported: BTreeMap::new(),
             remote_logged_in: BTreeSet::new(),
+            card_events: BTreeMap::new(),
             next_token_generation: FIRST_TOKEN_GENERATION,
         };
         state.refresh_slots();
@@ -314,8 +318,10 @@ impl ModuleState {
 
     /// Re-enumerate readers, appending readers only after their
     /// inserted card proves that it is FINEID and updating FINEID-card
-    /// presence. When a card leaves a slot, its cached objects and
-    /// login state are dropped.
+    /// presence. When a card leaves a slot -- seen absent, or seen
+    /// through the reader's insertion and removal count to have left
+    /// since the last refresh -- its cached objects and login state are
+    /// dropped.
     ///
     /// Proof of FINEID has two stages. Answering the PKCS#15 AID
     /// SELECT ([`probe_fineid_card`]) is the cheap steady-state
@@ -362,10 +368,29 @@ impl ModuleState {
                 .iter()
                 .position(|s| s.kind.local_reader() == Some(&reader.id))
             {
-                let (id, was_present) = match self.slots.get(pos) {
+                let (id, mut was_present) = match self.slots.get(pos) {
                     Some(slot) => (slot.id, slot.card_present),
                     None => continue,
                 };
+                let card_moved = self
+                    .card_events
+                    .insert(id, reader.card_events)
+                    .is_some_and(|last| last != reader.card_events);
+                if card_moved && was_present {
+                    // The card left since the last refresh, and the one
+                    // in the reader now, if any, may be another: the
+                    // slot loses its token and its PIN1 as on removal,
+                    // and a card still there is raised again and
+                    // reported once.
+                    if let Some(slot) = self.slots.get_mut(pos) {
+                        slot.card_present = false;
+                    }
+                    self.invalidate_slot(id);
+                    self.event_reported
+                        .entry(id)
+                        .and_modify(|reported| *reported = false);
+                    was_present = false;
+                }
                 if aid_present && !was_present {
                     // Transition into presence: demand the
                     // cert-proven objects before the slot reports a
@@ -400,6 +425,7 @@ impl ModuleState {
                     card_present: true,
                     reader_identity: prober.reader_identity(&reader.id),
                 });
+                self.card_events.insert(id, reader.card_events);
                 self.cache_token(id, objects);
             }
         }
@@ -669,11 +695,9 @@ impl ModuleState {
         {
             return slot.card_present() && self.remote_logged_in.contains(&slot_id);
         }
-        self.pin_caches.get(&slot_id).is_some_and(|cache| {
-            cache
-                .lock()
-                .is_ok_and(|mut cache| cache.has_positive_pin1())
-        })
+        self.pin_caches
+            .get(&slot_id)
+            .is_some_and(|cache| cache.lock().is_ok_and(|mut cache| cache.holds_pin1()))
     }
 
     /// Report the next pending slot event: the first slot whose
@@ -746,6 +770,7 @@ impl ModuleState {
             token_cache: BTreeMap::new(),
             event_reported: BTreeMap::new(),
             remote_logged_in: BTreeSet::new(),
+            card_events: BTreeMap::new(),
             next_token_generation: FIRST_TOKEN_GENERATION,
         }
     }
@@ -1222,11 +1247,97 @@ mod tests {
         objects_ok: bool,
     }
 
+    /// The insertion and removal count a reader that saw no card move
+    /// keeps reporting.
+    const STEADY_READER_EVENTS: u32 = 0;
+
+    /// A reader whose FINEID card answers the probe, reporting the
+    /// insertion and removal count it is scripted with.
+    struct CountingProber {
+        reader: &'static str,
+        card_events: u32,
+    }
+
+    impl super::SlotProber for CountingProber {
+        fn enumerate(&self) -> Result<Vec<refineid_pcsc::ReaderInfo>, super::CkRv> {
+            Ok(vec![refineid_pcsc::ReaderInfo {
+                id: refineid_pcsc::ReaderId::new(self.reader.to_owned()),
+                card_present: true,
+                card_events: self.card_events,
+            }])
+        }
+
+        fn probe(&self, _reader: &refineid_pcsc::ReaderId) -> FineidCardObservation {
+            FineidCardObservation::Present
+        }
+
+        fn reader_identity(&self, _reader: &refineid_pcsc::ReaderId) -> ReaderIdentity {
+            ReaderIdentity::default()
+        }
+
+        fn build_objects(
+            &self,
+            _reader: &refineid_pcsc::ReaderId,
+        ) -> Result<crate::token::TokenObjects, super::CkRv> {
+            Err(crate::ck::CKR_DEVICE_ERROR)
+        }
+    }
+
+    /// A card that left the reader and came back between two refreshes
+    /// takes the held PIN1 with it, as a removal does; a reader whose
+    /// count stands still keeps it.
+    #[test]
+    fn a_card_that_left_between_refreshes_takes_the_held_pin1() {
+        const READER: &str = "Returning Card Reader";
+        /// The count when the PIN1 was entered.
+        const EVENTS_AT_LOGIN: u32 = 4;
+        /// One removal and one insertion later.
+        const EVENTS_AFTER_RETURN: u32 = 6;
+        const DECIMAL_DIGIT_RADIX: u8 = 10;
+        let mut digits = vec![0_u8; PinBytes::MAX_LENGTH];
+        getrandom::fill(&mut digits).expect("operating system random source is available");
+        for digit in &mut digits {
+            *digit = b'0' + (*digit % DECIMAL_DIGIT_RADIX);
+        }
+        let pin = PinBytes::new(digits).expect("random digits satisfy the PIN policy");
+        let at_login = CountingProber {
+            reader: READER,
+            card_events: EVENTS_AT_LOGIN,
+        };
+        let mut state = state_with_slots(&[READER]);
+        state
+            .refresh_slots_with(&at_login)
+            .expect("refresh succeeds");
+        state
+            .pin_cache(1)
+            .expect("cache created")
+            .lock()
+            .expect("cache lock")
+            .store_pin1(
+                refineid_pkcs15::TokenSerial::new("CARD-RETURNING".to_owned()),
+                pin,
+            )
+            .expect("a fresh PIN1 is not a rejected one");
+        state
+            .refresh_slots_with(&at_login)
+            .expect("refresh succeeds");
+        assert!(state.is_logged_in(1));
+        state
+            .refresh_slots_with(&CountingProber {
+                reader: READER,
+                card_events: EVENTS_AFTER_RETURN,
+            })
+            .expect("refresh succeeds");
+        assert!(!state.is_logged_in(1));
+        assert!(!state.slot(1).is_some_and(SlotRecord::card_present));
+    }
+
     impl super::SlotProber for ScriptedProber {
         fn enumerate(&self) -> Result<Vec<refineid_pcsc::ReaderInfo>, super::CkRv> {
             Ok(vec![refineid_pcsc::ReaderInfo {
                 id: refineid_pcsc::ReaderId::new("Scripted Reader".to_owned()),
                 card_present: true,
+                card_events: STEADY_READER_EVENTS,
             }])
         }
 
@@ -1338,8 +1449,9 @@ mod tests {
         assert!(cache.lock().expect("cache lock").is_rejected(&serial, &pin));
     }
 
-    /// A logout reaches a PIN1 that is out on an in-flight signature:
-    /// the card's answer to that signature cannot bring it back.
+    /// A PIN1 out on an in-flight signature is the slot's login, and a
+    /// logout reaches it: the card's answer to that signature cannot
+    /// bring it back.
     #[test]
     fn logout_destroys_a_pin1_out_on_a_checkout() {
         /// Retry count of a pristine FINEID PIN.
@@ -1367,12 +1479,15 @@ mod tests {
                 .checkout_pin1(&serial, pristine)
                 .expect("the held value is checked out")
         };
+        assert!(state.is_logged_in(1));
         state.logout(1);
-        let accepted: Result<
-            refineid_auth::VerifyOutcome,
-            refineid_auth::AuthError<core::convert::Infallible>,
-        > = Ok(refineid_auth::VerifyOutcome::Ok);
-        checkout.settle_verify(&mut cache.lock().expect("cache lock"), &accepted);
+        assert!(!state.is_logged_in(1));
+        let accepted: Result<refineid_auth::VerifyOutcome, refineid_auth::AuthError<String>> =
+            Ok(refineid_auth::VerifyOutcome::Ok);
+        let accepted = checkout
+            .settle_verify(&mut cache.lock().expect("cache lock"), &accepted)
+            .expect("an accepted VERIFY leads to the operation");
+        accepted.settle_operation::<String>(&mut cache.lock().expect("cache lock"), None);
         assert!(!state.is_logged_in(1));
     }
 

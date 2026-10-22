@@ -29,6 +29,7 @@
 //! holds a PC/SC handle across PKCS#11 calls, so the desktop CLI
 //! shares the reader.
 
+use alloc::collections::BTreeMap;
 use std::io::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -73,7 +74,7 @@ use crate::ck::{
     CKR_USER_NOT_LOGGED_IN, CkAttributeType, CkBbool, CkObjectHandle, CkRv, CkUlong,
 };
 use crate::sign::{
-    DigestInfoHash, ECDSA_P384_SIGNATURE_BYTES, Mechanism, RSA3072_MODULUS_BITS,
+    CardSignInput, DigestInfoHash, ECDSA_P384_SIGNATURE_BYTES, Mechanism, RSA3072_MODULUS_BITS,
     RSA3072_SIGNATURE_BYTES, parse_digest_info, reject_degenerate_digest, sign_with_card,
 };
 
@@ -1251,16 +1252,22 @@ pub(super) fn card_pin1_status(kind: &SlotKind) -> Result<PinStatus, CkRv> {
 /// pre-hashed PSO chain via [`sign_with_card`]. The card is dropped
 /// before returning.
 ///
-/// The held PIN1 is checked out for the card's token serial under the
-/// retry state the card reports in the same transaction, and settled by
-/// the card's answer to its VERIFY
-/// ([`crate::pin_cache::CheckedOutPin1::settle_verify`]): a value the
-/// card accepted stays held whatever the signature step does next.
+/// PIN1 is presented for every signature: the card drops its PIN1
+/// verification after each signature with the authentication key
+/// (FINEID S4-1 v4.2 section 8.1.7). The held PIN1 is checked out for
+/// the card's token serial under the retry state the card reports in
+/// the same card session, settled by the card's answer to the VERIFY
+/// ([`crate::pin_cache::CheckedOutPin1::settle_verify`]), and an
+/// accepted value settled again by what became of the card in the
+/// signature ([`crate::pin_cache::AcceptedPin1::settle_operation`]).
+/// The reader's card lane is held from before the checkout until the
+/// value is settled.
 ///
 /// # Errors
-/// [`CKR_PIN_INCORRECT`] / [`CKR_PIN_LOCKED`] on PIN failure,
-/// [`CKR_DEVICE_ERROR`] on any card / transport failure, or the
-/// mechanism-specific data errors from [`sign_with_card`].
+/// [`CKR_DATA_INVALID`] / [`CKR_DATA_LEN_RANGE`] on bad input, before
+/// the card is opened; [`CKR_USER_NOT_LOGGED_IN`] when no usable PIN1
+/// is held; [`CKR_PIN_INCORRECT`] / [`CKR_PIN_LOCKED`] on PIN failure;
+/// [`CKR_DEVICE_ERROR`] on any other card / transport failure.
 #[expect(
     clippy::redundant_pub_crate,
     reason = "private root module helper is used by sibling api module; plain pub would violate the public-surface typing grep"
@@ -1271,15 +1278,17 @@ pub(super) fn card_sign(
     mechanism: Mechanism,
     input: &[u8],
 ) -> Result<Vec<u8>, CkRv> {
+    let request = CardSignInput::parse(mechanism, input)?;
     let backend = PcscBackend;
     // A remote slot has no local reader; its signatures go through
     // `remote_card_sign`.
     let reader = kind.local_reader().ok_or(CKR_DEVICE_ERROR)?;
-    // PinSequence: the whole SELECT -> probe -> VERIFY -> PSO span
-    // runs inside one held PC/SC transaction, so no concurrent
-    // card consumer can interleave and disturb the security state
-    // between our APDUs. The PIN is already in the cache -- no
-    // prompt or non-card wait happens while the card is open.
+    // The lane keeps this process's other PIN-bearing operations on
+    // this reader waiting until the held PIN1 is settled. The PIN is
+    // already in the cache -- no prompt or non-card wait happens while
+    // the card is open.
+    let lane = card_lane(reader)?;
+    let _turn = lane.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?;
     let mut card = backend
         .open_session(reader, ReaderAccessCap::PinSequence)
         .map_err(|_open_err| CKR_DEVICE_ERROR)?;
@@ -1308,28 +1317,43 @@ pub(super) fn card_sign(
         .map_err(|_poisoned| CKR_DEVICE_ERROR)?
         .checkout_pin1(&serial, pin1_status)
         .ok_or(CKR_USER_NOT_LOGGED_IN)?;
-    if pin1_status == PinStatus::Verified
-        && let Ok(signature) = sign_with_card(&mut card, mechanism, input)
-    {
-        let mut cache = pin_cache.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?;
-        checkout.restore_after_success(&mut cache);
-        return Ok(signature);
-    }
     let secret =
         refineid_auth::UnvalidatedSecret::from_owned_bytes(checkout.pin().as_bytes().to_vec());
     let Ok(pin1) = refineid_auth::Pin1::reconstruct(secret) else {
         return Err(CKR_DEVICE_ERROR);
     };
     let answer = card.verify_pin1(pin1);
-    let mut cache = pin_cache.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?;
-    checkout.settle_verify(&mut cache, &answer);
-    drop(cache);
-    match answer {
-        Ok(VerifyOutcome::Ok) => sign_with_card(&mut card, mechanism, input),
-        Ok(VerifyOutcome::WrongPin { .. }) => Err(CKR_PIN_INCORRECT),
-        Ok(VerifyOutcome::Locked) => Err(CKR_PIN_LOCKED),
-        Ok(VerifyOutcome::Other(_)) | Err(_) => Err(CKR_DEVICE_ERROR),
-    }
+    let accepted = checkout.settle_verify(
+        &mut *pin_cache.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?,
+        &answer,
+    );
+    let accepted = match (answer, accepted) {
+        (Ok(VerifyOutcome::Ok), Some(accepted)) => accepted,
+        (Ok(VerifyOutcome::WrongPin { .. }), _) => return Err(CKR_PIN_INCORRECT),
+        (Ok(VerifyOutcome::Locked), _) => return Err(CKR_PIN_LOCKED),
+        _ => return Err(CKR_DEVICE_ERROR),
+    };
+    let signed = sign_with_card(&mut card, request);
+    accepted.settle_operation(
+        &mut *pin_cache.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?,
+        signed.as_ref().err(),
+    );
+    signed.map_err(|_card_err| CKR_DEVICE_ERROR)
+}
+
+/// The card lane of each local reader this process has signed or
+/// logged in on, by reader name.
+static CARD_LANES: Mutex<BTreeMap<String, Arc<Mutex<()>>>> = Mutex::new(BTreeMap::new());
+
+/// The card lane of `reader`: held by one PIN-bearing card operation at
+/// a time, from before its PIN1 is checked out or verified until the
+/// PIN1 is settled, so a concurrent operation on the same card waits
+/// instead of finding the PIN1 out or interleaving its commands.
+fn card_lane(reader: &ReaderId) -> Result<Arc<Mutex<()>>, CkRv> {
+    let mut lanes = CARD_LANES.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?;
+    Ok(Arc::clone(
+        lanes.entry(reader.as_str().to_owned()).or_default(),
+    ))
 }
 
 /// Ask the paired phone of `pair_id` for the signature of `input`
@@ -1498,10 +1522,12 @@ pub(super) fn card_login(
     let backend = PcscBackend;
     let reader = kind.local_reader().ok_or(CKR_DEVICE_ERROR)?;
     // The reader to open is this one; a remote slot has no local
-    // reader and never reaches here.
-    // PinSequence: SELECT -> probe -> VERIFY is one held
-    // transaction; the PIN arrived with the call, so nothing
+    // reader and never reaches here. The lane keeps this process's
+    // other PIN-bearing operations on this reader waiting until the
+    // VERIFY is settled; the PIN arrived with the call, so nothing
     // non-card happens while the card is open.
+    let lane = card_lane(reader)?;
+    let _turn = lane.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?;
     let mut card = backend
         .open_session(reader, ReaderAccessCap::PinSequence)
         .map_err(|_open_err| CKR_DEVICE_ERROR)?;
@@ -2040,11 +2066,12 @@ mod tests {
         let pin_cache = std::sync::Arc::new(std::sync::Mutex::new(
             super::PinSafetyCache::new().expect("pin safety cache"),
         ));
+        let digest = refineid_digest::Sha256::of(b"a signature the card is asked for");
         let res = super::card_sign(
             &impersonating_local_kind(),
             &pin_cache,
             crate::sign::Mechanism::Ecdsa,
-            &[0u8; 32],
+            digest.as_bytes(),
         );
         assert_eq!(res, Err(crate::ck::CKR_DEVICE_ERROR));
     }

@@ -36,8 +36,6 @@ pub const MAX_ACTIVE_OPERATIONS: usize = 1;
 pub const OFFER_TTL_MS: u64 = 300_000;
 /// Minimum retry count on the credential that a command can decrement.
 pub const MINIMUM_REMAINING_ATTEMPTS: u8 = 3;
-/// Authentication failures after which re-pairing may be suggested.
-pub const CANDIDATE_FAILURE_HINT_THRESHOLD: u8 = 3;
 
 /// Byte length of an offer identifier.
 pub const OFFER_ID_SIZE: usize = 32;
@@ -281,42 +279,4 @@ pub enum CloseReason {
     CardUnavailable,
     /// The custodian deliberately stopped serving every pairing.
     ServiceWithdrawn,
-}
-
-/// Total unexpected-input classification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FailureClass {
-    /// Invalid input before peer authentication.
-    PreAuthenticationInvalidInput,
-    /// Framing or authenticated-decryption failure on an established channel.
-    EstablishedChannelIntegrityFailure,
-    /// Unknown/terminal operation reference or unmatched pong.
-    StaleReferenceRace,
-    /// Nonconforming message proven to come from the paired peer.
-    AuthenticatedProtocolViolation,
-    /// Local invariant failure.
-    LocalInternalFault,
-    /// Input arriving after a session became terminal.
-    TrafficAfterClosed,
-}
-
-/// User-visible RAPP connection status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VisibleConnectionState {
-    /// Durable pairing exists without a live session.
-    PairedDisconnected,
-    /// Transport establishment is in progress.
-    Connecting,
-    /// The mutually authenticated channel is being verified.
-    VerifyingSecureConnection,
-    /// Recent cryptographic liveness has been proven.
-    Connected,
-    /// Liveness recovery is in progress and operations are blocked.
-    CheckingConnection,
-    /// Session closure is in progress.
-    Disconnecting,
-    /// Session has stopped.
-    ConnectionStopped,
-    /// Pairing is permanently revoked and requires manual re-pairing.
-    PairingRevoked,
 }

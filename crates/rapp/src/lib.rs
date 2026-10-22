@@ -97,9 +97,9 @@ pub use operation::{
 pub use pair_keys::{DegenerateAgreement, PAIR_KEY_SIZE};
 pub(crate) use pair_keys::{derive_pair_key, mac as pair_key_mac};
 pub use pairing::{
-    PAIR_RECORD_FORMAT_VERSION, PairRecord, PairRecordCodecError, PairRecordError, PairStore,
-    PairStoreError, PairTombstone, REVOCATION_NOTICE_MS, decode_pair_record, decode_pair_records,
-    encode_pair_record, encode_pair_records,
+    PAIR_RECORD_FORMAT_VERSION, PairRecord, PairRecordCodecError, PairRecordError,
+    REVOCATION_NOTICE_MS, decode_pair_record, decode_pair_records, encode_pair_record,
+    encode_pair_records,
 };
 pub use pairing_attempts::{
     CPACE_ATTEMPT_WINDOW_MS, CpaceAttemptLedger, MAXIMUM_CPACE_ATTEMPTS, POST_PAKE_CONFIRMATION_MS,
@@ -142,14 +142,13 @@ pub use transport::{
 };
 pub use txt::AnnouncementCandidate;
 pub use types::{
-    CANDIDATE_FAILURE_HINT_THRESHOLD, CERTIFICATE_FINGERPRINT_SIZE, CertificateFingerprint,
-    CloseReason, FailureClass, GRANTS_HASH_SIZE, GrantsHash, IdentifierError,
-    LIVENESS_CHALLENGE_SIZE, MANDATORY_PAIRING_SUITE, MANDATORY_SESSION_SUITE,
-    MAX_ACTIVE_OPERATIONS, MAX_FRAME_PLAINTEXT, MAX_FRAME_SIZE, MINIMUM_REMAINING_ATTEMPTS,
-    NOISE_TAG_SIZE, OFFER_ID_SIZE, OFFER_TTL_MS, OPERATION_ID_SIZE, OfferId, OperationId,
-    PAIR_ID_SIZE, PAIRING_SECRET_SIZE, PairId, PairingSecret, ProfileName, RetryDecision,
-    SESSION_ID_SIZE, SESSION_READY_NONCE_SIZE, SessionId, VisibleConnectionState,
-    WIRE_VERSION_V26_10_21, X25519_KEY_SIZE,
+    CERTIFICATE_FINGERPRINT_SIZE, CertificateFingerprint, CloseReason, GRANTS_HASH_SIZE,
+    GrantsHash, IdentifierError, LIVENESS_CHALLENGE_SIZE, MANDATORY_PAIRING_SUITE,
+    MANDATORY_SESSION_SUITE, MAX_ACTIVE_OPERATIONS, MAX_FRAME_PLAINTEXT, MAX_FRAME_SIZE,
+    MINIMUM_REMAINING_ATTEMPTS, NOISE_TAG_SIZE, OFFER_ID_SIZE, OFFER_TTL_MS, OPERATION_ID_SIZE,
+    OfferId, OperationId, PAIR_ID_SIZE, PAIRING_SECRET_SIZE, PairId, PairingSecret, ProfileName,
+    RetryDecision, SESSION_ID_SIZE, SESSION_READY_NONCE_SIZE, SessionId, WIRE_VERSION_V26_10_21,
+    X25519_KEY_SIZE,
 };
 pub use wire::{
     Envelope, MessageType, SequenceGuard, WireError, WireValue, decode_deterministic_cbor,

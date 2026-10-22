@@ -32,8 +32,6 @@ use core::ptr;
 
 use crate::pin::{PinBytes, PinRoleError};
 use refineid_auth::{PinRetryRisk, PinStatus};
-#[cfg(feature = "pin-change")]
-use refineid_pcsc::ReaderId;
 
 use crate::ck::{
     CK_EFFECTIVELY_INFINITE, CK_UNAVAILABLE_INFORMATION, CKF_DONT_BLOCK, CKF_EC_F_P,

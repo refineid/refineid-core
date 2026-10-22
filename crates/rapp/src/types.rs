@@ -16,11 +16,11 @@ use core::fmt;
 use sha2::{Digest, Sha256};
 use zeroize::ZeroizeOnDrop;
 
-/// RAPP v26.10.21 wire version triple [Year, Month, Day].
-pub const WIRE_VERSION_V26_10_21: (u16, u16, u16) = (26, 10, 21);
+/// RAPP v26.10.22 wire version triple [Year, Month, Day].
+pub const WIRE_VERSION_V26_10_22: (u16, u16, u16) = (26, 10, 22);
 /// Mandatory RAPP pairing Noise suite.
 pub const MANDATORY_PAIRING_SUITE: &str = "Noise_XXpsk3_25519_ChaChaPoly_SHA512";
-/// Mandatory RAPP session Noise suite (RAPP v26.10.21 section 6.3).
+/// Mandatory RAPP session Noise suite (RAPP v26.10.22 section 6.3).
 pub const MANDATORY_SESSION_SUITE: &str = "Noise_KK_25519_ChaChaPoly_SHA512";
 /// Byte length of an X25519 public or private key.
 pub const X25519_KEY_SIZE: usize = 32;
@@ -32,7 +32,7 @@ pub const MAX_FRAME_SIZE: usize = 65_535;
 pub const MAX_FRAME_PLAINTEXT: usize = 65_519;
 /// Maximum simultaneously active operations at an authorization proxy.
 pub const MAX_ACTIVE_OPERATIONS: usize = 1;
-/// Pairing-offer lifetime in milliseconds (RAPP v26.10.21 §3.3, §4.2).
+/// Pairing-offer lifetime in milliseconds (RAPP v26.10.22 §3.3, §4.2).
 pub const OFFER_TTL_MS: u64 = 300_000;
 /// Minimum retry count on the credential that a command can decrement.
 pub const MINIMUM_REMAINING_ATTEMPTS: u8 = 3;
@@ -243,7 +243,7 @@ pub enum RetryDecision {
 }
 
 impl RetryDecision {
-    /// Apply the retry floor of RAPP v26.10.21 section 10.2 to the counter
+    /// Apply the retry floor of RAPP v26.10.22 section 10.2 to the counter
     /// the command would consume.
     #[must_use]
     pub const fn for_decrementing_counter(remaining: Option<u8>) -> Self {

@@ -24,7 +24,7 @@ use super::{
     BinaryFrame, CPACE_KC2_SUITE, Envelope, FrameError, GRANTS_HASH_SIZE, GrantsHash,
     MANDATORY_PAIRING_SUITE, MANDATORY_SESSION_SUITE, MAX_FRAME_PLAINTEXT, MAX_FRAME_SIZE,
     MessageType, NOISE_TAG_SIZE, PAIR_ID_SIZE, PairId, PairingSecret, ProfileName, SESSION_ID_SIZE,
-    SequenceGuard, SessionId, WIRE_VERSION_V26_10_21, WireError, WireValue, X25519_KEY_SIZE,
+    SequenceGuard, SessionId, WIRE_VERSION_V26_10_22, WireError, WireValue, X25519_KEY_SIZE,
     encode_deterministic_cbor,
     noise::{KkHandshakeState, NoiseTransport},
 };
@@ -532,15 +532,15 @@ fn session_prologue(
 
 fn version_value() -> WireValue {
     WireValue::Array(vec![
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_21.0)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_21.1)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_21.2)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_22.0)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_22.1)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_22.2)),
     ])
 }
 
 #[cfg(test)]
 mod tests {
-    /// RAPP v26.10.21 section 4.3 item 1: the pairing prologue on BLE is 145 bytes.
+    /// RAPP v26.10.22 section 4.3 item 1: the pairing prologue on BLE is 145 bytes.
     #[test]
     fn pairing_prologue_matches_the_specified_length() {
         const BLE_PAIRING_PROLOGUE_LENGTH: usize = 145;

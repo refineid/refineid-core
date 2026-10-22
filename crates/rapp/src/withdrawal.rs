@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Announced service withdrawal (RAPP v26.10.21 §4.5).
+//! Announced service withdrawal (RAPP v26.10.22 §4.5).
 //!
 //! A custodian that deliberately stops serving replaces its stream discovery
 //! record with a `mode=withdrawn` record. Each of its eight entries is either
@@ -64,7 +64,7 @@ pub enum WithdrawalError {
     /// The static agreement is the identity point.
     DegenerateAgreement,
     /// The peer never confirmed that it stored the pairing, so it is not
-    /// announced (RAPP v26.10.21 section 4.3 item 4).
+    /// announced (RAPP v26.10.22 section 4.3 item 4).
     StorageUnconfirmed,
     /// The service instance name is empty, longer than 63 octets, or a
     /// full service name rather than its instance portion.

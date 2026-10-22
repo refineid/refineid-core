@@ -8,7 +8,7 @@ use super::{
     CloseReason, Envelope, GrantsHash, LIVENESS_CHALLENGE_SIZE, MANDATORY_PAIRING_SUITE,
     MANDATORY_SESSION_SUITE, MessageType, OperationId, OperationProgressMessage, OperationRequest,
     OperationRequestRefusal, OperationResultMessage, PairId, PingChallenge, ProfileName,
-    RequestError, ResultError, SESSION_READY_NONCE_SIZE, WIRE_VERSION_V26_10_21, WireValue,
+    RequestError, ResultError, SESSION_READY_NONCE_SIZE, WIRE_VERSION_V26_10_22, WireValue,
 };
 
 /// Pairing-channel parameter echo.
@@ -100,7 +100,7 @@ pub struct LivenessMessage {
     pub challenge: PingChallenge,
 }
 
-/// An `error` message (RAPP v26.10.21 sections 7.1 and 10.3): a registered
+/// An `error` message (RAPP v26.10.22 sections 7.1 and 10.3): a registered
 /// name and, when it concerns one, the operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProtocolErrorMessage {
@@ -631,9 +631,9 @@ fn validate_profile_set(profiles: &[ProfileName]) -> Result<(), MessageError> {
 
 fn version_value() -> WireValue {
     WireValue::Array(vec![
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_21.0)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_21.1)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_21.2)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_22.0)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_22.1)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_22.2)),
     ])
 }
 
@@ -793,7 +793,7 @@ mod tests {
         MessageError, close_reason_name, parse_close_reason, require_version, version_value,
     };
     use crate::CloseReason;
-    use crate::{WIRE_VERSION_V26_10_21, WireValue};
+    use crate::{WIRE_VERSION_V26_10_22, WireValue};
     use std::collections::BTreeMap;
 
     /// Named so the test states which version is being refused. This constant is
@@ -869,7 +869,7 @@ mod tests {
     fn scalar_version_is_refused() {
         assert_eq!(
             require_version(&mut map_with(WireValue::Unsigned(u64::from(
-                WIRE_VERSION_V26_10_21.0
+                WIRE_VERSION_V26_10_22.0
             )))),
             Err(MessageError::InvalidField("version"))
         );

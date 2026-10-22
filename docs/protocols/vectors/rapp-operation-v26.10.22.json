@@ -1,7 +1,7 @@
 {
   "format": "fi.refineid.rapp.operation-vectors",
-  "protocol_document_version": "26.10.21",
-  "provenance": "Derived by tools/rapp-vectors/generate.py from the inputs in this file and RAPP v26.10.21 sections 7.1, 9 and 10.3: the CDDL of every operation message body, with standard-library primitives checked against RFC 7748 section 6.1, RFC 8439 section 2.8.2 and RFC 9496 appendix A.1; the engine is not used.",
+  "protocol_document_version": "26.10.22",
+  "provenance": "Derived by tools/rapp-vectors/generate.py from the inputs in this file and RAPP v26.10.22 sections 7.1, 9 and 10.3: the CDDL of every operation message body, with standard-library primitives checked against RFC 7748 section 6.1, RFC 8439 section 2.8.2 and RFC 9496 appendix A.1; the engine is not used.",
   "fixed_inputs": {
     "operation_id_request": "11111111111111111111111111111111",
     "operation_id_result": "22222222222222222222222222222222",
@@ -77,7 +77,7 @@
     {
       "name": "result-completed-inspection",
       "message_type": "OperationResult",
-      "body_hex": "a36673746174757369636f6d706c6574656468726573706f6e7365a263617472433b8f8072737570706f727465645f70726f66696c6573837766692e726566696e6569642e636172642d737461747573781a66692e726566696e6569642e61757468656e7469636174696f6e781c66692e726566696e6569642e646f63756d656e742d7369676e696e676c6f7065726174696f6e5f69645022222222222222222222222222222222"
+      "body_hex": "a36673746174757369636f6d706c6574656468726573706f6e7365a163617472433b8f806c6f7065726174696f6e5f69645022222222222222222222222222222222"
     },
     {
       "name": "result-completed-identity",

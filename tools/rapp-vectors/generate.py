@@ -22,12 +22,12 @@ import sys
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from primitives import (  # noqa: E402
-    Q, cbor, decode, encode, from_uniform_bytes, hkdf256, hmac256, hmac512, noise_kk,
+    Q, cbor, cbor_decode, decode, encode, from_uniform_bytes, hkdf256, hmac256, hmac512, noise_kk,
     noise_xxpsk3, scalar_mult, selftest, sha256, sha512, x25519, x25519_public,
 )
 
-VERSION = [26, 10, 21]
-DOCUMENT = "26.10.21"
+VERSION = [26, 10, 22]
+DOCUMENT = "26.10.22"
 OFFER_TTL_MS = 300000
 BLE = "fi.refineid.rapp.ble"
 STREAM = "fi.refineid.stream"
@@ -42,6 +42,9 @@ SHA512_BLOCK = 128
 DISCOVERY_EPOCH_SECONDS = 900
 WITHDRAWAL_COUNTER_SECONDS = 60
 GENERATOR = "tools/rapp-vectors/generate.py"
+# Rejected envelopes that test the version field itself keep their own; every
+# other one carries the stamped version, so it fails for its stated reason.
+VERSION_ENVELOPE_VECTORS = ("missing-version", "wrong-version-type", "unsupported-version")
 PRIMITIVE_CHECKS = "RFC 7748 section 6.1, RFC 8439 section 2.8.2 and RFC 9496 appendix A.1"
 
 VECTORS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "docs", "protocols", "vectors")
@@ -210,6 +213,12 @@ def main_corpus(d):
             e["version"] = VERSION
     for e in d["deterministic_cbor"]:
         e["encoded_hex"] = cbor(typed(e["value"])).hex()
+    for e in d["rejected_envelope"]:
+        if e["name"] in VERSION_ENVELOPE_VECTORS:
+            continue
+        envelope = cbor_decode(h(e["canonical_cbor_hex"]))
+        envelope["version"] = VERSION
+        e["canonical_cbor_hex"] = cbor(envelope).hex()
     return d
 
 
@@ -354,7 +363,7 @@ def operation_corpus(d):
                  {"digests": [h(x) for x in f["batch_digests_sha256"]], "algorithm": "ecdsa_sha256",
                   "key_profile": "ecdsa_p256"})),
         ("result-completed-inspection", "OperationResult",
-         result("completed", response={"atr": h(f["atr"]), "supported_profiles": [card, auth, sign]})),
+         result("completed", response={"atr": h(f["atr"])})),
         ("result-completed-identity", "OperationResult",
          result("completed", response={"card_holder_name": f["holder_name"], "card_id": f["card_id"],
                                        "issuance_date": f["issuance_date"], "expiration_date": f["expiration_date"],
@@ -402,11 +411,11 @@ def operation_corpus(d):
 
 
 CORPORA = {
-    "rapp-v26.10.21.json": main_corpus,
-    "rapp-routing-v26.10.21.json": routing_corpus,
-    "rapp-withdrawal-v26.10.21.json": withdrawal_corpus,
-    "rapp-ble-sar-v26.10.21.json": ble_sar_corpus,
-    "rapp-operation-v26.10.21.json": operation_corpus,
+    "rapp-v26.10.22.json": main_corpus,
+    "rapp-routing-v26.10.22.json": routing_corpus,
+    "rapp-withdrawal-v26.10.22.json": withdrawal_corpus,
+    "rapp-ble-sar-v26.10.22.json": ble_sar_corpus,
+    "rapp-operation-v26.10.22.json": operation_corpus,
 }
 
 

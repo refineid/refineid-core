@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Closed generated binding for the operations of one RAPP session
-//! (RAPP v26.10.21 section 8).
+//! (RAPP v26.10.22 section 8).
 //!
 //! The platform transports only opaque encrypted frames and receives bounded
 //! semantic actions. It never receives a generic decrypted protocol message,
@@ -243,12 +243,12 @@ impl From<&CardOperation> for RappOperationDescriptor {
     }
 }
 
-/// Progress events exposed to platform callers (RAPP v26.10.21 section 8.2).
+/// Progress events exposed to platform callers (RAPP v26.10.22 section 8.2).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum RappProgressEvent {
     /// Another session's operation holds the card.
     Queued,
-    /// The consent view is on the custodian's screen.
+    /// A PIN prompt is on the custodian's screen.
     ConsentShown,
     /// The custodian waits for the holder to present the card.
     WaitingForCard,
@@ -986,7 +986,8 @@ impl RappOperationBridge {
         Ok(action)
     }
 
-    /// Approve exactly the request the consent view rendered.
+    /// Approve exactly the admitted request: the holder entered the PIN
+    /// on the prompt it rendered, or the custodian holds PIN 1.
     ///
     /// # Errors
     /// [`RappBindingError`] on invalid input or the wrong protocol phase.

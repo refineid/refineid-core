@@ -1,19 +1,19 @@
-# Remote Authorization Proxy Protocol (RAPP) v26.10.21
+# Remote Authorization Proxy Protocol (RAPP) v26.10.22
 ## Pairing and Session Protocol over the BLE and Stream Transports
 
 Status: Stamped specification, reviewed by the owner\
-Document version: 26.10.21\
-Wire version: `[26, 10, 21]` (`[Year, Month, Day]`)\
-Offer version: `[26, 10, 21]`\
+Document version: 26.10.22\
+Wire version: `[26, 10, 22]` (`[Year, Month, Day]`)\
+Offer version: `[26, 10, 22]`\
 Transport Profiles: `"fi.refineid.rapp.ble"`, `"fi.refineid.stream"` (§2.2)\
-Date: 2026-10-21\
+Date: 2026-10-22\
 Change controller: RefineID project
 
 ---
 
 ## Abstract
 
-This specification defines the pairing protocol and the operational protocol of the Remote Authorization Proxy Protocol (RAPP v26.10.21), carried over any registered transport profile (§2.2): the **Bluetooth Low Energy (BLE) Direct Proximity Transport Profile** (`"fi.refineid.rapp.ble"`) and the **Local Internet Protocol (IP) Stream Transport Profile** (`"fi.refineid.stream"`). Pairing, offer bootstrap, sessions, and operations are identical on every transport; only framing, routing, and discovery differ.
+This specification defines the pairing protocol and the operational protocol of the Remote Authorization Proxy Protocol (RAPP v26.10.22), carried over any registered transport profile (§2.2): the **Bluetooth Low Energy (BLE) Direct Proximity Transport Profile** (`"fi.refineid.rapp.ble"`) and the **Local Internet Protocol (IP) Stream Transport Profile** (`"fi.refineid.stream"`). Pairing, offer bootstrap, sessions, and operations are identical on every transport; only framing, routing, and discovery differ.
 
 A user's mobile device acts as the Custodian holding physical custody of the Finnish Electronic Identification (FINEID) identity card over Near Field Communication (NFC). The workstation acts as a Requester. On BLE the Custodian is the Generic Attribute Profile (GATT) Peripheral and the Requester the GATT Central. The Peripheral is the side that advertises, accepts the connection, and serves the data (the GATT Server); the Central is the side that scans, connects, and reads or writes that data (the GATT Client). On the stream transport the Custodian listens and the Requester dials.
 
@@ -27,7 +27,7 @@ To support upper-layer messages (such as X.509 certificate chains or document si
 
 ### 1.1 Scope and Standalone Specification Model
 
-This document defines the complete, standalone normative specification for the **Remote Authorization Proxy Protocol (RAPP) version 26.10.21**. It encompasses:
+This document defines the complete, standalone normative specification for the **Remote Authorization Proxy Protocol (RAPP) version 26.10.22**. It encompasses:
 - The **Transport Profile Registry** (§2.2) with the **BLE Transport Profile** (`"fi.refineid.rapp.ble"`) and the **Local IP Stream Transport Profile** (`"fi.refineid.stream"`).
 - The **pairing protocol** utilizing `CPaceRistretto255`, 6-character Crockford Base32 human factors, atomic attempt reservation, and authenticated `Noise_XXpsk3` channel binding.
 - The **BLE SAR Adaptation Layer** with latched invariant total lengths and stop-and-wait flow control.
@@ -36,17 +36,17 @@ This document defines the complete, standalone normative specification for the *
 - The **Registered Credential Profiles and Actions** for card status inspection, browser authentication, and qualified document signing.
 - **Service Withdrawal** (§4.5): the Custodian's notice, keyed by each pairing's static agreement, that it has stopped serving, on discovery and on open sessions.
 - **Pairing Storage Confirmation and Revocation** (§4.3, §4.6): each endpoint confirms its stored trust record before the pairing is active, and an endpoint that forgets a pairing tells the other with a `pairing_revoked` close, in session or as the first message of the next session.
-- **Card Presence** (§8.4): the Custodian's in-session notice of the card's presence, which bounds what a Requester may offer to local consumers.
+- **Card Presence** (§8.4): the Custodian's in-session notice of the card it holds, which a Requester's offer to local consumers follows, eventually consistent.
 - **Concurrent Multi-Client Serving** (§8): the Custodian serves every paired Requester over its own session; card operations are serialized on the single card.
-- The **Failure Semantics, Retry Protection, and Human Consent Contracts**.
+- The **Failure Semantics, Retry Protection, and PIN Contracts**.
 
-This document is completely self-contained: all normative schemas, protocol state machines, cryptographic bindings, error handling rules, and wire formats required to implement, verify, and audit RAPP v26.10.21 are defined herein.
+This document is completely self-contained: all normative schemas, protocol state machines, cryptographic bindings, error handling rules, and wire formats required to implement, verify, and audit RAPP v26.10.22 are defined herein.
 
 - **Migration and Compatibility**:
-  RAPP v26.10.21 runs the same pairing and session protocol over every registered transport profile (§2.2). Its wire and offer versions are `[26, 10, 21]` (`[Year, Month, Day]`). It does not interoperate with other RAPP versions. Implementations must conform strictly to the schemas and state machines defined in this standalone specification.
+  RAPP v26.10.22 runs the same pairing and session protocol over every registered transport profile (§2.2). Its wire and offer versions are `[26, 10, 22]` (`[Year, Month, Day]`). It does not interoperate with other RAPP versions. Implementations must conform strictly to the schemas and state machines defined in this standalone specification.
 - **Wire and Offer Versioning**:
-  - Offer version: `[26, 10, 21]` in `pairing-offer`.
-  - Wire version: `[26, 10, 21]` (`[Year, Month, Day]`) in channel envelopes, pairing context, and handshake prologues.
+  - Offer version: `[26, 10, 22]` in `pairing-offer`.
+  - Wire version: `[26, 10, 22]` (`[Year, Month, Day]`) in channel envelopes, pairing context, and handshake prologues.
 - **Role Mapping**:
   - **Requester**: Corresponds to the RAPP Requester. On BLE it operates as GATT Client (Central); on the stream transport it dials the Custodian.
   - **Custodian**: Corresponds to the mobile device acting as the RAPP Authorization Proxy while holding exclusive physical NFC custody of the Credential Holder (FINEID Card). On BLE it operates as GATT Server (Peripheral); on the stream transport it listens.
@@ -66,8 +66,8 @@ This document is completely self-contained: all normative schemas, protocol stat
 
 ### 2.1 Transport Architecture & Protocol Lifecycle
 
-- **Wire Version**: `[26, 10, 21]` (`[Year, Month, Day]`)
-- **Offer Version**: `[26, 10, 21]`
+- **Wire Version**: `[26, 10, 22]` (`[Year, Month, Day]`)
+- **Offer Version**: `[26, 10, 22]`
 - **Transport Profiles**: registered in §2.2
 
 The transport acts as the underlying point-to-point bearer for RAPP frames. CPace establishes the 32-byte pre-shared key (PSK) that seeds mutual pairing authentication (`Noise_XXpsk3`), replay protection, monotonic sequence counters, and typed at-most-once operation dispatch. Every phase below runs unchanged on every registered transport profile; "transport frame" means one SAR-reassembled message on BLE (§5.3) and one length-prefixed frame on the stream transport (§2.2.2).
@@ -76,7 +76,7 @@ The transport acts as the underlying point-to-point bearer for RAPP frames. CPac
 - **Phase 0: Routing**: Every connection starts with exactly one routing preamble transport frame from the Requester (§2.2). For purpose `"pairing"` with an active offer, the connection proceeds to the offer bootstrap. For purpose `"session"` whose routing tag a stored pairing keyed (§2.2.1), the connection transitions to the Noise session phase.
 - **Phase 1: Offer Bootstrap**: The Requester obtains the canonical `pairing-offer`, carrying a fresh random 32-byte `offer_id`, the CPace session identifier (SID), over the transport in use (§4.2): on BLE by reading the Bootstrap Characteristic, on the stream transport as the Custodian's first transport frame after the pairing preamble. Both peers compute the canonical `offer_hash` and bind the transport entry of the offer that names the transport profile in use.
 - **Phase 2: CPace Key Agreement & Confirmation**: Execute the `CPaceRistretto255` key confirmation variant 2 (KC2) profile, one transport frame per CPace message, with Context $C$ binding, mutually authenticating via Hash-based Message Authentication Code (HMAC) tags $T_B$ and $T_A$ to establish $PSK$ via HMAC-based Key Derivation Function (HKDF)-Expand. On success, transition to the Noise pairing phase and consume the offer.
-- **Phase 3: Noise_XXpsk3 Pairing**: Perform the authenticated pairing handshake with prologue bound to canonical `offer_hash`, wire version `[26, 10, 21]`, suite, and the transport profile in use. Immediately on handshake completion, derive pairing-channel `session_id` and `pair_id`. Exchange `pairing.hello` (parameter echo using `session_id`) and `pairing.confirm` (capability grants), deriving `grants_hash`.
+- **Phase 3: Noise_XXpsk3 Pairing**: Perform the authenticated pairing handshake with prologue bound to canonical `offer_hash`, wire version `[26, 10, 22]`, suite, and the transport profile in use. Immediately on handshake completion, derive pairing-channel `session_id` and `pair_id`. Exchange `pairing.hello` (parameter echo using `session_id`) and `pairing.confirm` (capability grants), deriving `grants_hash`.
 - **Phase 4: Pair Storage and Confirmation**: Atomically store the pairing trust record (`pair_id`, `grants_hash`, peer static public key, and local private key), then send `pairing.stored`. The pairing is active on an endpoint only once it has both stored its record and received the peer's `pairing.stored` (§4.3). A stored pairing is not bound to the transport it was created on; sessions may use any registered transport.
 - **Subsequent Operational Sessions**: Operational connections start in the Routing phase, route by a fresh routing tag (§2.2.1), and open a fresh `Noise_KK` session with an independent operational `session_id`, bound to the transport profile of that connection.
 
@@ -137,7 +137,7 @@ The Custodian routes a `"session"` preamble as follows:
 2. On no match the Custodian closes the connection without changing stored state.
 3. On a match it consults its replay memory: the nonces of the 256 most recently routed sessions. A nonce already there closes the connection; otherwise the nonce is added, displacing the oldest, and the connection proceeds to the Noise session phase for the matched pairing.
 
-A preamble that does not decode, names another profile's domain, carries an unregistered purpose, a non-empty value with `"pairing"`, or a value other than 32 bytes with `"session"` closes the connection (§10.1) without changing stored state. An encoded preamble longer than 64 bytes is rejected before parsing. A `"session"` preamble encodes to 55 bytes on the stream transport and 52 bytes on BLE. The `routing_tag` and `routing_preamble` vectors of `vectors/rapp-routing-v26.10.21.json` pin the bytes.
+A preamble that does not decode, names another profile's domain, carries an unregistered purpose, a non-empty value with `"pairing"`, or a value other than 32 bytes with `"session"` closes the connection (§10.1) without changing stored state. An encoded preamble longer than 64 bytes is rejected before parsing. A `"session"` preamble encodes to 55 bytes on the stream transport and 52 bytes on BLE. The `routing_tag` and `routing_preamble` vectors of `vectors/rapp-routing-v26.10.22.json` pin the bytes.
 
 The routing tag only selects a pairing; it authenticates nothing. Authentication is established exclusively by the `Noise_KK` handshake that follows.
 
@@ -256,7 +256,7 @@ The SID used in CPace must be an independent 32-byte cryptographic random value 
 ```cddl
 pairing-offer = {
   "scheme": "rapp",
-  "version": [26, 10, 21],       ; offer version triple
+  "version": [26, 10, 22],       ; offer version triple
   "offer_id": bstr .size 32,    ; 32-byte cryptographic random SID
   "suites": [
     "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512"
@@ -282,7 +282,7 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
 #### Bootstrap Read Flow:
 1. **BLE**: the Custodian exposes the **RAPP Bootstrap Characteristic** (`7E39FD03-A6B5-4D78-9E11-37E28E9545F1`, Read-only). The Requester connects, sends the `"pairing"` routing preamble (§5.2), and performs an `ATT_READ_REQ` on this characteristic to obtain `encode_deterministic_cbor(pairing-offer)`.
 2. **Stream**: after receiving the `"pairing"` routing preamble, the Custodian sends `encode_deterministic_cbor(pairing-offer)` as its first transport frame. A Custodian with no active offer closes the connection instead.
-3. The Requester decodes the offer and rejects it unless it is deterministic CBOR matching the schema, carries version `[26, 10, 21]`, lists an acceptable suite, and contains a `transports` entry whose `profile` is the transport profile of the connection. Unsupported suites terminate the pairing flow immediately before CPace; automatic downgrade or fallback to unconfirmed legacy suites is strictly prohibited.
+3. The Requester decodes the offer and rejects it unless it is deterministic CBOR matching the schema, carries version `[26, 10, 22]`, lists an acceptable suite, and contains a `transports` entry whose `profile` is the transport profile of the connection. Unsupported suites terminate the pairing flow immediately before CPace; automatic downgrade or fallback to unconfirmed legacy suites is strictly prohibited.
 4. Both peers bind the `candidate_id` of that entry and the connection's transport profile (§4.3, §6.1.1), use `offer_id` as SID for CPace, and compute `offer_hash` for the Noise pairing prologue.
 5. A deterministic encoding of `pairing-offer` with the KC2 suite, the three registered profiles, and both transport entries stays within the 509-byte ATT value capacity at the minimum ATT Maximum Transmission Unit (MTU) of 512.
 
@@ -293,7 +293,7 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
    ```cddl
    pairing-prologue = [
      "rapp-pairing",
-     [26, 10, 21],                                                         ; wire version [Year, Month, Day]
+     [26, 10, 22],                                                         ; wire version [Year, Month, Day]
      "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512", ; cryptographic suite name
      bstr .size 32,                                                       ; offer_hash
      tstr                                                                 ; transport profile of the connection (§2.2)
@@ -312,7 +312,7 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
 
 3. **Parameter Echo & Mutual Grants**:
    - Inside the established pairing channel, peers exchange `pairing.hello`.
-   - `pairing.hello` echoes `offer_hash`, the bound transport profile and `candidate_id` (§4.2), wire version `[26, 10, 21]`, suite name, display name, platform description, and requester's requested profiles.
+   - `pairing.hello` echoes `offer_hash`, the bound transport profile and `candidate_id` (§4.2), wire version `[26, 10, 22]`, suite name, display name, platform description, and requester's requested profiles.
    - Custodian verifies matching echoes. Any mismatch aborts with an authenticated protocol violation.
    - The Custodian automatically grants the valid requested profiles matching its pairing offer (since possession and entry of the 30-bit pairing code constitutes user authorization), and transmits `pairing.confirm` carrying granted profiles. Requester echoes and confirms. Both granted sets must be identical.
    - Derive `grants_hash` from the confirmed, canonically sorted grant set:
@@ -340,13 +340,13 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
      ```text
      K_x = HKDF-SHA-256(salt = pair_id, IKM = X25519(local static private, peer static public), info, L = 32)
      ```
-     with `info` `"rapp-routing"` for routing tags (§2.2.1), `"rapp-discovery-hint"` for discovery hints (hierarchy specification §4.3), and `"rapp-withdrawal"` for withdrawal hints (§4.5). Both endpoints obtain the same agreement from their own private key and the peer's public key. An agreement equal to the identity point yields no key; such a pairing is never announced or routed. The `pair_keys` vectors of `vectors/rapp-routing-v26.10.21.json` pin the keys.
+     with `info` `"rapp-routing"` for routing tags (§2.2.1), `"rapp-discovery-hint"` for discovery hints (hierarchy specification §4.3), and `"rapp-withdrawal"` for withdrawal hints (§4.5). Both endpoints obtain the same agreement from their own private key and the peer's public key. An agreement equal to the identity point yields no key; such a pairing is never announced or routed. The `pair_keys` vectors of `vectors/rapp-routing-v26.10.22.json` pin the keys.
    - **Routing privacy**: A routing tag is fresh for every connection and computationally unlinkable without `K_route`, so an observer of preambles cannot tell whether two connections belong to the same pairing, and no routing value recurs. A replayed preamble is refused in the Routing phase while its nonce is in the Custodian's replay memory; a preamble replayed after its nonce has left the memory reaches `Noise_KK` message 1, which the replaying party cannot complete. That timing difference reveals only that some stored pairing once routed that preamble, which the observer already saw; it is mitigated by single-flight connection serialization and the pre-authentication limiter (§3.3).
    - Session Prologue:
      ```cddl
      session-prologue = [
        "rapp-session",
-       [26, 10, 21],                                                         ; wire version [Year, Month, Day]
+       [26, 10, 22],                                                         ; wire version [Year, Month, Day]
        "Noise_KK_25519_ChaChaPoly_SHA512",                              ; suite name
        pair_id,                                                         ; bstr .size 16
        grants_hash,                                                     ; bstr .size 32
@@ -360,7 +360,7 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
 
 Under Bluetooth Core Specification v5.4 and this profile (§5.2, §6.3), ATT and CPace roles are strictly asymmetric and immutable: the Requester is Central ($A$), transmitting exclusively via `ATT_WRITE_REQ`, while the Custodian is Peripheral ($B$), replying exclusively via `ATT_HANDLE_VALUE_IND`. Per draft-irtf-cfrg-cpace-21 Section 10.1, strict initiator/responder role separation structurally eliminates relay loopback and reflection attacks: an adversary cannot reflect the Custodian's $Y_B \parallel T_B$ indication back to the Custodian as an initiator write $Y_A$, nor can it relay frames between two peers acting in the same role.
 
-A transparent radio frequency (RF) relay that forwards packets between distant rooms without decrypting them bypasses any physical-distance assumption. PAKE secrecy keeps the session key from the relay, and explicit per-operation user authorization on the Custodian's screen bounds what such a relay can achieve. Signal analysis cannot detect a bit-preserving relay, so none is attempted.
+A transparent radio frequency (RF) relay that forwards packets between distant rooms without decrypting them bypasses any physical-distance assumption. PAKE secrecy keeps the session key from the relay, so it carries only what the paired endpoints send and cannot originate an operation. Signal analysis cannot detect a bit-preserving relay, so none is attempted.
 
 ### 4.5 Service Withdrawal
 
@@ -374,7 +374,7 @@ A Custodian **withdraws** when it deliberately stops serving every stored pairin
 
 2. **Withdrawal Hint**:
    $$\text{whint} = \text{first 8 bytes of }\text{HMAC-SHA-256}(K_{\text{wd}}, \text{len} \parallel \text{instance} \parallel \text{counter\_be64})$$
-   where $\text{instance}$ is the instance portion of the DNS-SD service instance name the Custodian publishes ([RFC 6763](https://www.rfc-editor.org/rfc/rfc6763.html) §4.1): the name exactly as published, without the service type (`_refineid-stream._tcp`) and the domain (`local.`), as UTF-8 octets, 1 to 63 octets (hierarchy specification §4.2). Instance names may contain dots; a value ending in a service type or domain suffix is a misuse and is refused. $\text{len}$ is its length as one octet, and $\text{counter} = \lfloor \text{unix\_time} / 60 \rfloor$ as an unsigned 64-bit big-endian integer. The `withdrawal_key` and `withdrawal_hint` vectors of `vectors/rapp-withdrawal-v26.10.21.json` pin the bytes.
+   where $\text{instance}$ is the instance portion of the DNS-SD service instance name the Custodian publishes ([RFC 6763](https://www.rfc-editor.org/rfc/rfc6763.html) §4.1): the name exactly as published, without the service type (`_refineid-stream._tcp`) and the domain (`local.`), as UTF-8 octets, 1 to 63 octets (hierarchy specification §4.2). Instance names may contain dots; a value ending in a service type or domain suffix is a misuse and is refused. $\text{len}$ is its length as one octet, and $\text{counter} = \lfloor \text{unix\_time} / 60 \rfloor$ as an unsigned 64-bit big-endian integer. The `withdrawal_key` and `withdrawal_hint` vectors of `vectors/rapp-withdrawal-v26.10.22.json` pin the bytes.
 
 3. **Custodian Order**:
    On withdrawal the Custodian, in this order:
@@ -487,14 +487,14 @@ A reassembled frame goes to the handler of the phase the connection is in, the R
 
 ### 6. Normative Cryptographic Protocols
 
-RAPP v26.10.21 specifies three normative cryptographic protocols:
+RAPP v26.10.22 specifies three normative cryptographic protocols:
 1. **`CPaceRistretto255`**: the PAKE of the pairing ceremony (§6.1).
 2. **`Noise_XXpsk3`**: the pairing handshake that turns the PAKE result into a stored pairing (§6.2).
 3. **`Noise_KK`**: the session handshake between paired endpoints (§6.3).
 
 ### 6.1 CPaceRistretto255 KC2 Profile (draft-irtf-cfrg-cpace-21, RFC 9496, RFC 5869)
 
-RAPP v26.10.21 specifies the **`CPaceRistretto255-KC2`** application profile over [draft-irtf-cfrg-cpace-21](https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-cpace-21), [RFC 9496](https://www.rfc-editor.org/rfc/rfc9496.html), and [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html):
+RAPP v26.10.22 specifies the **`CPaceRistretto255-KC2`** application profile over [draft-irtf-cfrg-cpace-21](https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-cpace-21), [RFC 9496](https://www.rfc-editor.org/rfc/rfc9496.html), and [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html):
 
 #### 6.1.1 Cryptographic Suite Definition
 - **Group**: Prime-order Ristretto255 group (order $q = 2^{252} + 27742317777372353535851937790883648493$).
@@ -510,7 +510,7 @@ RAPP v26.10.21 specifies the **`CPaceRistretto255-KC2`** application profile ove
   ```cddl
   pairing-context = [
     "rapp-pairing-context",
-    [26, 10, 21],                                                              ; wire version [Year, Month, Day]
+    [26, 10, 22],                                                              ; wire version [Year, Month, Day]
     "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512", ; full suite literal
     tstr,                                                                    ; transport profile of the connection (§2.2)
     tstr,                                                                    ; candidate_id of its offer entry (§4.2)
@@ -643,7 +643,7 @@ The generator point $G$ is derived from the password-related string (PRS), the 6
 
 ### 6.4 Session Handshake Vectors
 
-The entries `"session-kk-fixed-transcript-ble"` and `"session-kk-fixed-transcript-stream"` of `docs/protocols/vectors/rapp-v26.10.21.json` pin, for fixed static and ephemeral keys and a fixed session prologue, both handshake messages, the final handshake hash $h$, the directional keys $c_1$ and $c_2$ and the `session_id` of §6.3, one entry per transport profile. An implementation reproduces them byte for byte.
+The entries `"session-kk-fixed-transcript-ble"` and `"session-kk-fixed-transcript-stream"` of `docs/protocols/vectors/rapp-v26.10.22.json` pin, for fixed static and ephemeral keys and a fixed session prologue, both handshake messages, the final handshake hash $h$, the directional keys $c_1$ and $c_2$ and the `session_id` of §6.3, one entry per transport profile. An implementation reproduces them byte for byte.
 
 ---
 
@@ -654,7 +654,7 @@ Every message inside the Noise pairing phase or the Noise session phase is a det
 
 ```cddl
 rapp-message = {
-  "version": [26, 10, 21],
+  "version": [26, 10, 22],
   "session_id": bstr .size 16,
   "sequence": uint,
   message
@@ -683,7 +683,7 @@ pairing-hello-body = {
 }
 
 negotiated-parameters = {
-  "version": [26, 10, 21],
+  "version": [26, 10, 22],
   "suite": "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512",
   "offer_hash": bstr .size 32,
   "transport_profile": tstr,   ; transport profile of the connection (§2.2)
@@ -712,7 +712,7 @@ session-ready-body = {
 }
 
 session-parameters = {
-  "version": [26, 10, 21],
+  "version": [26, 10, 22],
   "suite": "Noise_KK_25519_ChaChaPoly_SHA512",
   "transport_profile": tstr,   ; transport profile of the connection (§2.2)
   "candidate_id": tstr,        ; its registered candidate_id (§2.2)
@@ -799,12 +799,12 @@ card-status-body = {
 7. **`liveness.ping`** and **`liveness.pong`**: Keepalive sent by either endpoint with a fresh 32-byte `challenge`, echoed exactly by the peer.
 8. **`operation.request`**: Sent by the Requester to start a credential action under a registered profile (§8, §9).
 9. **`operation.result`**: Sent by the Custodian with the outcome of the operation: its status and the response, or the error (§8).
-10. **`operation.progress`**: Sent by the Custodian while an operation is pending, for every change of its state: queued behind another session's operation, consent on screen, waiting for the card, card found (§8.2).
+10. **`operation.progress`**: Sent by the Custodian while an operation is pending, for every change of its state: queued behind another session's operation, a PIN prompt on screen, waiting for the card, card found (§8.2).
 11. **`card.status`**: Sent by the Custodian once right after `session.ready` and again whenever the card it can serve changes: present or absent, and which card, by the fingerprint of its authentication certificate (§8.4).
 12. **`error`**: Sent on a protocol condition that is not an operation outcome, such as a second request while one operation of the session is live; schema and codes in §10.3.
 
 ### 7.2 Envelope Rules
-1. **Version**: `version` is `[26, 10, 21]`, as `[Year, Month, Day]`. A version mismatch in a Noise prologue fails the handshake's AEAD: the link drops and stored pairings stay. An authenticated envelope with any other version closes the session.
+1. **Version**: `version` is `[26, 10, 22]`, as `[Year, Month, Day]`. A version mismatch in a Noise prologue fails the handshake's AEAD: the link drops and stored pairings stay. An authenticated envelope with any other version closes the session.
 2. **Session**: `session_id` is the identifier derived from the handshake hash of the phase the envelope belongs to, the pairing `session_id` of §6.2 or the operational `session_id` of §6.3. An envelope with another `session_id` closes the session.
 3. **Sequence**: `sequence` starts at 0 in each direction and increases by exactly 1 per envelope; it equals the nonce of the Noise cipher state that encrypted the envelope. The first envelope received in a direction has `sequence` 0 and each accepted envelope raises the expected value by 1. An envelope whose `sequence` is not the expected value closes the session. A session ends as §8.3 says; the counter never wraps in practice, and an endpoint that would exceed $2^{64}-1$ closes the session with reason `"normal"`.
 4. **Encapsulation**: The `rapp-message` is encoded as deterministic CBOR (RFC 8949 Section 4.2) and encrypted with ChaCha20-Poly1305 under the direction's Noise cipher state, giving the ciphertext and a 16-byte tag. The ciphertext is one transport frame (§2.2).
@@ -818,17 +818,17 @@ An operation is one credential action, an authentication signature, a document s
 ### 8.1 Operation Lifetime
 
 1. **Request**: The Requester sends `operation.request` with a fresh 16-byte `operation_id`, the profile and action (§9), the context and payload maps, and `expires_after_ms` if it has a deadline of its own. An `operation_id` the session has already seen is rejected with `error` `"duplicate_operation"`. A session carries one operation at a time: a request that arrives while another is live on the session is rejected with `error` `"busy"`.
-2. **Deadline**: `expires_after_ms`, if present, is above 0; 0 is rejected with `"invalid_lifetime"`. If absent, the Custodian uses 300,000 ms. The Custodian takes the deadline on a clock that keeps running while the device sleeps and the process is suspended (`CLOCK_BOOTTIME`, `mach_continuous_time`, `SystemClock.elapsedRealtime`). An operation whose deadline passes before the card has been commanded is cancelled: `operation.result` with `status` `"cancelled"` and `error` `"operation_expired"`, and its consent view, if any, is taken down or never shown. A Custodian that wakes from suspension checks every pending operation against the clock before showing anything.
+2. **Deadline**: `expires_after_ms`, if present, is above 0; 0 is rejected with `"invalid_lifetime"`. If absent, the Custodian uses 300,000 ms. The Custodian takes the deadline on a clock that keeps running while the device sleeps and the process is suspended (`CLOCK_BOOTTIME`, `mach_continuous_time`, `SystemClock.elapsedRealtime`). An operation whose deadline passes before the card has been commanded is cancelled: `operation.result` with `status` `"cancelled"` and `error` `"operation_expired"`, and its PIN prompt, if any, is taken down or never shown. A Custodian that wakes from suspension checks every pending operation against the clock before showing anything.
 3. **End**: An operation ends with its `operation.result`, or with the session. When the session closes, every operation of it is over: one that has not yet commanded the card is dropped, one whose card command is in progress runs to the card's answer, since a card command is never interrupted, and the answer is discarded. The Custodian remembers nothing of an operation once it is over. A Requester that did not receive a result starts a new operation with a new `operation_id` if it still needs one.
 
 ### 8.2 Execution
 
 1. **Authorization**: The requested profile must be among the pairing's `granted_profiles`; otherwise `operation.result` with `status` `"rejected"` and `error` `"unauthorized"`.
 2. **Queue**: The card serves one operation at a time, across every session the Custodian holds. Operations take the card in the order they arrived. While an operation of another session holds the card, the Custodian sends the waiting operation `operation.progress` with event `"queued"`, once when it joins the queue; when its turn comes it proceeds. An operation that expires in the queue is cancelled as §8.1 item 2 says.
-3. **Consent**: For an action that needs the holder's authorization or PIN (§9), the Custodian shows the details on the phone screen (§11) and, once the view is on screen, sends `operation.progress` with event `"consent_shown"`. The view renders from a snapshot of the request taken at admission; nothing that arrives later changes it. If the holder declines, the operation ends with `status` `"rejected"` and `error` `"user_cancelled"`; no card command is sent.
+3. **PIN**: An action that needs a PIN (§9) takes it on the Custodian. When the Custodian does not hold the PIN, it asks the holder on its own screen and, once the prompt is on screen, sends `operation.progress` with event `"consent_shown"`; a browser authentication whose PIN 1 the Custodian holds (§11 item 2) runs without a prompt. The prompt renders from a snapshot of the request taken at admission; nothing that arrives later changes it. If the holder declines, the operation ends with `status` `"rejected"` and `error` `"user_cancelled"`; no card command is sent.
 4. **Card**: The Custodian checks the retry floor (§10.2) and commands the card over NFC or through its reader. While it waits for the holder to present the card it sends `operation.progress` with event `"waiting_for_card"`, and `"card_wait_ended"` when the card is found or the wait is over.
 5. **Result**: The Custodian sends `operation.result` with `status` `"completed"` and the response, `"rejected"` with the error, or `"cancelled"` with the error.
-6. **Reads**: A read-only action (`inspect_card`, `read_identity`, `read_certificate`) commands no private key and no PIN. It takes its turn in the queue and skips consent.
+6. **Reads**: A read-only action (`inspect_card`, `read_identity`, `read_certificate`) commands no private key and no PIN. It takes its turn in the queue and asks the holder nothing.
 
 ### 8.3 Session Lifetime
 
@@ -836,14 +836,14 @@ A session lives as long as both endpoints are in sight. An endpoint that has hea
 
 ### 8.4 Card Presence and Identity Offering
 
-A Requester that offers the Custodian's credentials to local consumers (a browser's certificate chooser, a CryptoTokenKit or Public-Key Cryptography Standards (PKCS)#11 token) makes a claim on the Custodian's behalf: that a card can answer now. The claim is bounded by the Custodian's own word on an authenticated session, never by discovery.
+A Requester that offers the Custodian's credentials to local consumers (a browser's certificate chooser, a CryptoTokenKit or Public-Key Cryptography Standards (PKCS)#11 token) makes a claim on the Custodian's behalf: that the card can answer when asked. The claim rests on the Custodian's own word on an authenticated session, never on discovery, and follows it eventually: a card that is gone leaves every Requester within the grace of item 3.
 
 1. **`card.status`**:
-   On every session the Custodian sends `card.status` once right after `session.ready`, and again whenever the card it can serve changes. `card_present` is true while the Custodian can serve a card now: a card coupled in a reader, or an NFC card the holder has primed and can present on request. An operation that ends without the card answering (no card within the card wait, the card lost before a command was transmitted, the field lost) makes it false at once, until the holder next couples or primes the card. Cached material alone, with no holder able to present the card, is absence. A card busy with another session's operation is present, not absent: the queue of §8.2 item 2 holds the waiting operation, and `card.status` does not change.
+   On every session the Custodian sends `card.status` once right after `session.ready`, and again whenever the card it holds changes. `card_present` is true while the Custodian holds a card: a card in its reader, from insertion until removal, or an NFC card the holder has added to the Custodian, from adding until the holder removes it there. An operation that ends without the card answering (no card within the card wait, the card lost before a command was transmitted, the field lost) ends with `"card_error"` and leaves presence unchanged; the next operation asks the holder to present the card again. A card busy with another session's operation is present: the queue of §8.2 item 2 holds the waiting operation, and `card.status` does not change.
 2. **Which Card**:
-   While `card_present` is true, `certificate_fingerprint` carries the SHA-256 digest of the Distinguished Encoding Rules (DER) encoding of the card's authentication certificate; while it is false the field is 32 zero bytes, so the message has one size whatever it says. A Requester compares it with the fingerprint of the certificates it holds for the pairing and, on any difference or when it holds none, reads the certificates afresh (§9) before offering anything; it never offers an identity whose fingerprint the Custodian has not confirmed on this session.
+   While `card_present` is true, `certificate_fingerprint` carries the SHA-256 digest of the Distinguished Encoding Rules (DER) encoding of the card's authentication certificate; while it is false the field is 32 zero bytes, so the message has one size whatever it says. A Requester compares it with the fingerprint of the certificates it holds for the pairing and, on any difference or when it holds none, reads the certificates afresh (§9) before offering anything; it offers only an identity whose fingerprint the Custodian confirmed on a session.
 3. **Offering Rule**:
-   A Requester holds an open session to a pairing while it offers that pairing's credentials to local consumers, and withdraws the offer at once when the session ends for any reason or when `card.status` reports absence. It offers again when a later `card.status` reports presence. Discovery records (hierarchy specification §4.3) tell a Requester whom to dial; they never justify an offer.
+   A Requester offers a pairing's credentials to local consumers on a certificate whose fingerprint the Custodian confirmed on a session, and keeps offering it between sessions: a request that arrives with no session open dials the Custodian and waits for a session within the consumer's own deadline. It withdraws the offer when the Custodian has been out of reach, or has reported absence, for 120 seconds with no later `card.status` reporting the card present; at once when the pairing is forgotten or revoked (§4.6); and at once when a session confirms a different fingerprint (item 2). It offers again as soon as a session confirms the card. Discovery records (hierarchy specification §4.3) tell a Requester whom to dial; they never justify an offer.
 4. **Privacy**:
    `card.status` travels only inside the AEAD-encrypted session, sized like a liveness message, so an observer cannot tell a card event from a keepalive. No discovery record, advertisement, or plaintext frame reflects the card's presence.
 5. **Ending the Session**:
@@ -857,7 +857,7 @@ The profiles a pairing can grant (§4.3), and the actions of each:
 
 | Profile | Purpose | Card commands |
 | :--- | :--- | :--- |
-| `"fi.refineid.card-status"` | Answer to reset (ATR), supported profiles, identity | Reads only |
+| `"fi.refineid.card-status"` | Answer to reset (ATR), identity | Reads only |
 | `"fi.refineid.authentication"` | Workstation/browser authentication signatures | PIN 1 verify & private-key signature |
 | `"fi.refineid.document-signing"` | Qualified Electronic Signatures (QES) | PIN 2 verify & private-key signature |
 
@@ -867,8 +867,7 @@ The profiles a pairing can grant (§4.3), and the actions of each:
   - Response:
     ```cddl
     inspect-card-response = {
-      "atr": bstr,                       ; answer to reset, or its historical bytes; empty when the platform exposes neither
-      "supported_profiles": [* tstr]
+      "atr": bstr                        ; answer to reset, or its historical bytes; empty when the platform exposes neither
     }
     ```
 - **`read_identity`** (Safe Read):
@@ -924,7 +923,7 @@ The profiles a pairing can grant (§4.3), and the actions of each:
 - **`sign_document`**:
   - Context: `document_name` (`tstr .size (1..256)`, e.g. `"Employment_Contract_2026.pdf"`).
   - Payload: `key_profile`, `algorithm`, `digest` (pre-hashed document digest).
-  - Consent: the document name on the Custodian's screen and PIN 2.
+  - PIN: PIN 2 on the Custodian's screen, with the document name.
   - Signature Wire Format: as §9.2.
   - Response: `signature` (`bstr`).
 - **`batch_sign_documents`**:
@@ -932,7 +931,7 @@ The profiles a pairing can grant (§4.3), and the actions of each:
   - Payload:
     - `key_profile`, `algorithm`.
     - `digests` (`[+ bstr]`, one per document, in the same order).
-  - Consent: the full list of document names on the Custodian's screen and PIN 2 once for the batch. The card takes PIN 2 for one signature at a time (FINEID S1); how the Custodian carries one entry through the batch is its own, and PIN 2 never leaves it (§11).
+  - PIN: PIN 2 once for the batch on the Custodian's screen, with the full list of document names. The card takes PIN 2 for one signature at a time (FINEID S1); how the Custodian carries one entry through the batch is its own, and PIN 2 never leaves it (§11).
   - Signature Wire Format: each entry as §9.2.
   - Response: `signatures` (`[+ bstr]`, in the same order).
   - An interrupted batch ends with its session (§8.1 item 3); no signature of it is delivered.
@@ -973,17 +972,17 @@ The same names appear in the `error` field of `operation.result`, except `"busy"
 | `"operation_expired"` | The deadline passed before the card was commanded (§8.1 item 2). |
 | `"unauthorized"` | The profile is not granted to the pairing (§8.2 item 1). |
 | `"unsupported_parameter"` | Unsupported key profile, algorithm or parameter value (§9). |
-| `"user_cancelled"` | The holder declined on the screen (§8.2 item 3). |
+| `"user_cancelled"` | The holder declined the PIN prompt (§8.2 item 3). |
 | `"retry_floor"` | The card reports fewer than 3 remaining attempts for the PIN; no verification was sent (§10.2). |
 | `"card_error"` | The card did not answer: no card within the wait, the field lost, a transmission fault. |
 | `"operation_failed"` | The Custodian could not carry the operation out for a reason of its own. |
 
 ---
 
-## 11. Consent and Secrets
+## 11. PINs and Secrets
 
-1. **What the holder sees is what is signed**: The Custodian's screen shows the operation before the holder authorizes it. For authentication: the relying party's `origin`, the operation and the card holder's name. For document signing: the `document_name`, or the full list of names for a batch.
-2. **PIN 1 and PIN 2**: PIN 1 may be kept and reused on the Custodian as its own policy allows. PIN 2 is entered by the holder on the Custodian for every signature or batch; nothing signs unattended.
+1. **What the holder sees is what is signed**: A PIN prompt on the Custodian shows the operation it authorizes. For authentication: the relying party's `origin`, the operation and the card holder's name. For document signing: the `document_name`, or the full list of names for a batch.
+2. **PIN 1 and PIN 2**: PIN 1 is asked once and held only in the Custodian's memory, never in storage, until the card is removed (§8.4 item 1), the card rejects it, the Custodian's process ends or the device restarts; while it is held, a browser authentication runs without a prompt. PIN 2 is entered by the holder on the Custodian for every signature or batch and kept no longer; nothing signs unattended.
 3. **Documents stay home**: Document bytes and unhashed browser data never cross RAPP; the Requester hashes locally and sends the digest.
 4. **Secrets never on the wire**: PIN 1, PIN 2, the card access number (CAN) and the PUK have no representation in any RAPP message and never traverse any transport. The Custodian presents them to the card itself; a Requester receives only the signature or the result.
 
@@ -997,7 +996,7 @@ The same names appear in the `error` field of `operation.result`, except `"busy"
 | **Man in the middle** | Injects, modifies or drops frames during pairing or a session. | CPace binds the context $C$ (protocol, suite, offer, transport, roles) into the generator, so a mismatched channel yields no shared key; the confirmation tags $T_B$ and $T_A$ prove the key before Noise; `Noise_XXpsk3` with fresh pairwise static keys authenticates both endpoints. A wrong code burns an attempt (§3.3). |
 | **Disconnect oracle** | Tests $T_B$ and disconnects before sending $T_A$ to avoid spending an attempt. | The attempt is reserved before $Y_B$ and $T_B$ are sent and is not refunded on disconnect (§3.3, §6.1.3). |
 | **Rogue Custodian** | Advertises the RAPP service without the pairing code. | Without the code it cannot derive $G$ or pass the confirmation tags; the Requester pairs with nothing. |
-| **Relay** | Relays frames between two distant endpoints. | Roles are fixed per transport and protocol (§4.4), so frames cannot be reflected or looped; what the holder authorizes is what the phone shows (§11). A bit-exact relay of a pairing in progress stays possible at the physical layer and is not detected. |
+| **Relay** | Relays frames between two distant endpoints. | Roles are fixed per transport and protocol (§4.4), so frames cannot be reflected or looped; a relay carries only what the paired endpoints send. A bit-exact relay of a pairing in progress stays possible at the physical layer and is not detected. |
 | **Attempt burning** | Connects repeatedly to spend the offer's attempts. | An offer exists only when the holder opens one, for 5 minutes, with three attempts; one guess runs at a time; failure stops the offer and backs off exponentially, up to 300 s, with the holder told on screen (§3.3 item 8). |
 | **Tracking** | Records discovery records and routing preambles over time to recognise a phone or link a computer's connections. | Discovery hints rotate every 15 minutes and routing tags are fresh per connection; both are keyed by the pairing's static agreement, which never crosses the wire (§2.2.1, §4.3, hierarchy specification §4.3). No stable pairing identifier is ever sent in clear. |
 | **Routing replay** | Replays a captured routing preamble to probe presence or cause work. | The tag selects a pairing and authenticates nothing. A nonce in the replay memory of 256 routed sessions is refused in the Routing phase; an older replay reaches `Noise_KK` message 1 and fails. The pre-authentication limiter bounds the work (§3.3). |

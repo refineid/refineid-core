@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! The pairing, session and operation machines of the RAPP state model
-//! (`docs/protocols/rapp-state-machine-v26.10.21.yaml`), and the runtime state
+//! (`docs/protocols/rapp-state-machine-v26.10.22.yaml`), and the runtime state
 //! an endpoint keeps. No failure revokes a pairing; only a user does.
 
 /// Local projection of the distributed state machine.
@@ -99,7 +99,8 @@ pub enum OperationState {
     Requested,
     /// Another session's operation holds the card.
     Queued,
-    /// The consent view is on the custodian's screen.
+    /// The custodian takes the PIN, asking the holder when it does not
+    /// hold it.
     AwaitingConsent,
     /// The card is commanded.
     Executing,
@@ -390,11 +391,12 @@ pub enum Action {
     SendResultUnsupportedParameter,
     /// Send operation.progress queued, once.
     SendProgressQueued,
-    /// Show the operation from the admitted request.
+    /// Ask the holder for a PIN the custodian does not hold, showing the
+    /// admitted request.
     PresentConsent,
-    /// Send operation.progress consent_shown once the view is on screen.
+    /// Send operation.progress consent_shown once a PIN prompt is on screen.
     SendProgressConsentShown,
-    /// Remove the consent view.
+    /// Remove the PIN prompt.
     DismissConsent,
     /// Run the read-only card commands.
     ExecuteRead,

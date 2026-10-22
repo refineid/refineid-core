@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Keys both endpoints of a pairing derive from its static X25519 agreement
-//! (RAPP v26.10.21 §4.3).
+//! (RAPP v26.10.22 §4.3).
 //!
 //! The agreement never crosses the wire, so a value keyed by it identifies
 //! the pairing only to its two endpoints. Each use takes its own HKDF info

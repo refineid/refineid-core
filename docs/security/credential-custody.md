@@ -8,22 +8,13 @@ See also [Security and Usability Balance](security-and-usability-balance.md) for
 the architectural consensus on unattended PIN 1 authentication and explicit
 batch signing for PIN 2.
 
-## PIN2 qualified-signature convenience window
+## PIN2: every signature or batch
 
 FINEID S4-1 v4.2 sections 4.1 and 8.1.7 require manual PIN entry for every
-qualified-signature operation. RefineID's explicit product decision is to give
-PIN2 a bounded one-minute convenience window so that one signing session --
-for example, a document set signed in a single user action -- does not prompt
-for every signature. This exception must be disclosed as a profile deviation
-in public release documentation.
-
-The default maximum is a one-minute idle window measured by a monotonic clock
-from the last card-confirmed successful use. The cache design constraints,
-destructive-checkout discipline, and mandatory invalidation triggers defined
-below for PIN1 apply to PIN2 identically; only the window length differs. The
-cached entry is bound to the complete card token identifier and the PIN2
-qualified-signature role. Its capability excludes PIN management and every
-PIN1 operation.
+qualified-signature operation. PIN2 is entered for every signature, or once
+for a batch the holder sees whole (RAPP v26.10.22 section 9.3); it is carried
+only through that batch's signatures and destroyed at its end. It is never
+kept between operations.
 
 Each use is still reconstructed as `Pin2`, consumed by an at-most-once
 credential command, and zeroized on every success or error path. PIN2 must
@@ -31,49 +22,56 @@ never be clonable, serializable, persisted, placed on a command line, stored
 in an environment variable, or rendered by `Debug`, tracing, panic, or error
 output.
 
-## PIN1 authentication convenience window
+## PIN1 authentication: held until the card leaves
 
 FINEID S4-1 v4.2 sections 4.1 and 8.1.7 require user interaction and manual
 PIN1 entry for every authentication-key signing operation. RefineID's explicit
-product decision is to provide a bounded convenience exception for PIN1
-authentication operations, including TLS client-auth signatures driven by
-CryptoTokenKit. The software re-presents PIN1 to the card for every operation;
-it does not treat card verification state as persistent. This exception must be
-disclosed as a profile deviation in public release documentation. It never
-extends to PIN2 or either qualified-signature key; PIN2 has its own, shorter
-window above. The current specification is published on the
+product decision is to provide a convenience exception for PIN1
+authentication operations, bounded by the card's presence, including TLS
+client-auth signatures driven by CryptoTokenKit. The software re-presents PIN1
+to the card for every operation; it does not treat card verification state as
+persistent. This exception must be disclosed as a profile deviation in public
+release documentation. It never extends to PIN2 or either qualified-signature
+key. The current specification is published on the
 [DVV FINEID specifications page](https://dvv.fi/en/fineid-specifications).
 
-The default maximum is a 15-minute idle window measured by a monotonic clock
-from the last card-confirmed successful use. It is not a wall-clock lifetime
-from entry and it is not refreshed by checkout, prompt display, local parsing,
-or a failed operation. A host with a scheduler actively releases the resident
-entry at the deadline; every lookup independently rejects an expired entry.
+PIN1 is held in process memory from the first card-confirmed successful use
+until one of the invalidation events below; there is no idle window or
+countdown. It is never written to storage -- not to a keychain, a keystore, a
+credential manager or a file -- so it never survives a restart (RAPP v26.10.22
+section 11 item 2).
 
 Reusable retention is allowed only when every live credential retry counter is
-in its pristine state. The cached entry is bound to the complete card token
+in its pristine state. The held entry is bound to the complete card token
 identifier and the PIN1 authentication role. Its capability excludes PIN
 management, PIN2, and qualified-signature operations.
 
 Use is destructive checkout:
 
-1. atomically remove the entry from the cache;
-2. attempt one credential operation;
-3. restore it only after the card confirms success; and
-4. set `last_successful_use` to that confirmed monotonic instant.
+1. atomically remove the entry from the held state;
+2. attempt one credential operation; and
+3. restore it after the card confirms success, or after a transport failure
+   or an unanswered command once the retry counter shows the card did not
+   refuse it.
 
-Dropping an in-flight checkout, receiving a card error, or losing the caller
-must destroy the value rather than resurrect it.
+Dropping an in-flight checkout or losing the caller destroys the value rather
+than resurrecting it. NFC glitches are common and are not removal, so a
+transport failure keeps the value; the retry counter read before the next use
+decides: a counter below the one read before the failed attempt means the card
+refused the PIN, and the value is destroyed instead of sent again.
 
 ## Mandatory invalidation
 
-Positive PIN1 or PIN2 state is destroyed on:
+Held PIN1 is destroyed on:
 
-- card removal, reader loss, or token-identifier mismatch;
-- wrong-PIN, blocked-PIN, malformed-response, or transport failure;
-- screen lock, logout, process exit, system sleep, or explicit lock;
-- retry-counter state below pristine or unavailable counter state; and
-- any generation change while a checked-out value is in flight.
+- card removal -- the card leaving the reader, or its holder removing it from
+  the phone -- and token-identifier mismatch;
+- a wrong, blocked or malformed PIN response, or a retry counter that went
+  down;
+- process exit, device restart, or the user clearing it; and
+- retry-counter state below pristine or unavailable counter state.
+
+PIN2 is never held between operations, so it has nothing to invalidate.
 
 Process-lifetime memory of card-rejected candidates may retain only a keyed,
 constant-time-comparable fingerprint bound to the full card identifier and PIN

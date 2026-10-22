@@ -16,7 +16,8 @@ pub struct UserApproval {
 }
 
 impl UserApproval {
-    /// Approval of `request`, the request the consent view rendered.
+    /// Approval of `request`, the admitted request a PIN prompt rendered or
+    /// the held PIN 1 authorizes.
     #[must_use]
     pub const fn for_request(request: &OperationRequest, approved_at_ms: u64) -> Self {
         Self {
@@ -64,7 +65,7 @@ impl<C> PendingCardCommand<C> {
     }
 }
 
-/// One operation of a session from admission to its result (RAPP v26.10.21
+/// One operation of a session from admission to its result (RAPP v26.10.22
 /// section 8). It lives in memory only and ends with the session.
 #[derive(Debug)]
 pub struct AuthorizationTransaction {
@@ -74,7 +75,8 @@ pub struct AuthorizationTransaction {
 }
 
 impl AuthorizationTransaction {
-    /// Admits a request; the consent view renders from this snapshot.
+    /// Admits a request; a PIN prompt, when one is shown, renders from this
+    /// snapshot.
     #[must_use]
     pub const fn prepare(request: OperationRequest) -> Self {
         Self {
@@ -261,10 +263,10 @@ impl AuthorizationTransaction {
 /// Phase of one operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthorizationStage {
-    /// Admitted; the reads that precede consent have not completed.
+    /// Admitted; the reads that precede the PIN have not completed.
     Requested,
-    /// The consent view may be shown; only an action that needs the
-    /// holder's authorization comes here.
+    /// The custodian takes the PIN, asking the holder when it does not
+    /// hold it; only an action that needs a PIN comes here.
     AwaitingConsent,
     /// A registered read is running.
     ExecutingSafeRead,
@@ -278,19 +280,19 @@ pub enum AuthorizationStage {
 /// are done.
 #[derive(Debug)]
 pub enum PrerequisitesOutcome {
-    /// Show the consent view and wait for the holder.
+    /// Take the PIN: ask the holder when the custodian does not hold it.
     AwaitConsent,
-    /// Execute this read and answer directly with a result; no consent.
+    /// Execute this read and answer directly with a result; no PIN.
     ExecuteSafeRead(AuthorizedSafeRead),
 }
 
 /// A change of an operation's state that the custodian reports while it is
-/// pending (RAPP v26.10.21 section 8.2).
+/// pending (RAPP v26.10.22 section 8.2).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProgressEvent {
     /// Another session's operation holds the card.
     Queued,
-    /// The consent view is on the custodian's screen.
+    /// A PIN prompt is on the custodian's screen.
     ConsentShown,
     /// The custodian waits for the holder to present the card.
     WaitingForCard,

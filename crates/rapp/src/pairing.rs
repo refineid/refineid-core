@@ -39,7 +39,7 @@ pub struct PairRecord {
 }
 
 /// Days a forgotten pairing keeps its key to deliver the `pairing_revoked`
-/// close on a later session (RAPP v26.10.21 section 4.6 item 3).
+/// close on a later session (RAPP v26.10.22 section 4.6 item 3).
 const REVOCATION_NOTICE_DAYS: u64 = 30;
 const MILLISECONDS_PER_DAY: u64 = 86_400_000;
 /// How long a forgotten pairing keeps its key for the close.
@@ -49,7 +49,7 @@ impl PairRecord {
     /// Constructs a validated pairing record whose storage the peer has
     /// confirmed. The pairing flow builds its record unconfirmed and
     /// confirms it only through an [`ActivePairing`](crate::ActivePairing)
-    /// (RAPP v26.10.21 section 4.3 item 4).
+    /// (RAPP v26.10.22 section 4.3 item 4).
     ///
     /// # Errors
     /// [`PairRecordError`] on an all-zero static key or an empty profile set.

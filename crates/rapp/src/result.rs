@@ -5,10 +5,10 @@ use std::collections::BTreeMap;
 
 use super::{
     CardIdentity, CardInspection, CardOperation, CardOperationError, CardOperationResult,
-    OperationId, ProfileName, WireValue,
+    OperationId, WireValue,
 };
 
-/// `operation-status-val` (RAPP v26.10.21 section 7.1).
+/// `operation-status-val` (RAPP v26.10.22 section 7.1).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResultStatus {
     /// The operation completed and carries its response.
@@ -44,7 +44,7 @@ impl ResultStatus {
     }
 }
 
-/// An `error_name` of RAPP v26.10.21 section 10.3, carried by an `error`
+/// An `error_name` of RAPP v26.10.22 section 10.3, carried by an `error`
 /// message or by the `error` field of an `operation.result`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResultError {
@@ -219,7 +219,7 @@ impl ResultResponse {
     }
 }
 
-/// One `operation.result` (RAPP v26.10.21 section 7.1).
+/// One `operation.result` (RAPP v26.10.22 section 7.1).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationResultMessage {
     /// The operation this result ends.
@@ -403,15 +403,6 @@ fn result_to_wire(result: &CardOperationResult) -> BTreeMap<String, WireValue> {
                 "atr".into(),
                 WireValue::Bytes(inspection.answer_to_reset.clone()),
             );
-            body.insert(
-                "supported_profiles".into(),
-                WireValue::Array(
-                    ProfileName::ALL
-                        .iter()
-                        .map(|profile| WireValue::Text(profile.as_str().into()))
-                        .collect(),
-                ),
-            );
         }
         CardOperationResult::Identity(identity) => {
             body.insert(
@@ -465,10 +456,6 @@ fn result_from_wire(
     let result = match operation {
         CardOperation::InspectCard => {
             let answer_to_reset = take_bytes(&mut body, "atr")?;
-            match body.remove("supported_profiles") {
-                Some(WireValue::Array(_)) => {}
-                _ => return Err(CardOperationError::InvalidField("supported_profiles")),
-            }
             CardOperationResult::Inspection(CardInspection { answer_to_reset })
         }
         CardOperation::ReadIdentity => {
@@ -580,7 +567,37 @@ impl fmt::Display for ResultError {
 mod tests {
     use core::str::FromStr;
 
-    use super::{ProxyFailure, ResultError, ResultStatus};
+    use super::{
+        CardInspection, CardOperation, CardOperationError, CardOperationResult, ProxyFailure,
+        ResultError, ResultResponse, ResultStatus, WireValue,
+    };
+
+    /// The first byte of a direct-convention answer to reset (ISO/IEC 7816-3).
+    const ANSWER_TO_RESET_BYTE: u8 = 0x3b;
+    const ANSWER_TO_RESET_SIZE: usize = 20;
+
+    #[test]
+    fn an_inspection_answers_with_the_answer_to_reset_alone() {
+        let answer = CardOperationResult::Inspection(CardInspection {
+            answer_to_reset: vec![ANSWER_TO_RESET_BYTE; ANSWER_TO_RESET_SIZE],
+        });
+        let response = ResultResponse::from_result(&answer);
+        assert_eq!(
+            response
+                .fields()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["atr"]
+        );
+        assert_eq!(response.typed_for(&CardOperation::InspectCard), Ok(answer));
+        let mut extended = response.fields().clone();
+        extended.insert("supported_profiles".into(), WireValue::Array(Vec::new()));
+        assert_eq!(
+            ResultResponse { fields: extended }.typed_for(&CardOperation::InspectCard),
+            Err(CardOperationError::UnexpectedField)
+        );
+    }
 
     #[test]
     fn result_status_wire_labels_bidirectional_round_trip() {

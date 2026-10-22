@@ -1,7 +1,7 @@
 {
   "format": "fi.refineid.rapp.routing-vectors",
-  "protocol_document_version": "26.10.21",
-  "provenance": "Derived by tools/rapp-vectors/generate.py from the inputs in this file and RAPP v26.10.21 sections 2.2.1 and 4.3 and hierarchy specification section 4.3, with standard-library primitives checked against RFC 7748 section 6.1, RFC 8439 section 2.8.2 and RFC 9496 appendix A.1; the engine is not used.",
+  "protocol_document_version": "26.10.22",
+  "provenance": "Derived by tools/rapp-vectors/generate.py from the inputs in this file and RAPP v26.10.22 sections 2.2.1 and 4.3 and hierarchy specification section 4.3, with standard-library primitives checked against RFC 7748 section 6.1, RFC 8439 section 2.8.2 and RFC 9496 appendix A.1; the engine is not used.",
   "pair_keys": [
     {
       "name": "custodian-and-requester-agree",

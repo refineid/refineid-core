@@ -1,4 +1,4 @@
-//! Custodian-side operations of one session (RAPP v26.10.21 section 8).
+//! Custodian-side operations of one session (RAPP v26.10.22 section 8).
 
 use core::fmt;
 use std::collections::BTreeSet;
@@ -309,9 +309,9 @@ impl ProxyOperationEngine {
 #[derive(Debug)]
 pub enum ProxyDispatch {
     /// Take the operation's turn on the card and perform the reads that
-    /// precede consent.
+    /// precede the PIN.
     InspectPrerequisites(OperationId),
-    /// Show the consent view and wait for the holder.
+    /// Take the PIN: ask the holder when the custodian does not hold it.
     AwaitConsent(OperationId),
     /// Execute the read; no private key, no PIN.
     ExecuteSafeRead {

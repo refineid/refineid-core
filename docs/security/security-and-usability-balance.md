@@ -28,7 +28,7 @@ The fundamental security guarantee of a smart card is that **the private key nev
 Previous iterations debated whether PIN 1 should be cached for 15 minutes, 1 minute, or evicted immediately. In practice:
 - If a card is resting in a reader or on a phone, an automated attacker with code execution on the host does not need 15 minutes—they can exploit the connected card in **15 milliseconds**.
 - If the card is physically removed and placed back in the user's wallet or pocket, **an attacker can do nothing in 15 seconds or in 15 hours**. Without the physical silicon chip energized in the RF/contact field, the private key is physically unreachable.
-- Evicting PIN 1 from secure local storage after an arbitrary countdown does not protect a connected card; it merely punishes the legitimate user who took a short coffee break by forcing them to re-type digits.
+- Evicting PIN 1 after an arbitrary countdown does not protect a connected card; it merely punishes the legitimate user who took a short coffee break by forcing them to re-type digits.
 
 ### 2.2 The Real-World Invariant: Detach the Card
 The user discipline in RefineID is simple, physical, and absolute:
@@ -43,21 +43,19 @@ The physical card detachment is the ultimate, unforgeable hardware air-gap.
 PIN 1 protects the **Authentication Role** (identification, TLS client-certificate authentication, routine web logins).
 
 ### 3.1 Unattended Operation Model
-- A user may explicitly choose to save PIN 1 in the device's hardware-backed secure store:
-  - **iOS/macOS:** Apple Data Protection Keychain (`kSecAttrAccessibleWhenUnlockedThisDeviceOnly`, non-synchronizable, protected by Secure Enclave / Face ID / device passcode).
-  - **Linux/BSD:** OS secret service / hardware keystore with user authorization.
-  - **Windows:** Windows Credential Manager / DPAPI with user context isolation.
-- There is **no arbitrary countdown timer** evicting PIN 1 from this store.
+- PIN 1 is asked once, on the device that holds the card, and then held only in that process's memory. It is never written to storage: not to the Apple keychain, the Android Keystore, a credential manager or a file. Nothing written survives a restart, so nothing can be read back from a lost or stolen device.
+- There is **no arbitrary countdown timer** evicting PIN 1 from memory.
 - When the user is sitting at their computer and clicks *"Log in with Identity Card"* on a website:
   - The click in the browser on the computer **is the human action and intent**.
-  - If the card is present (in a reader or on the paired phone proxy) and PIN 1 is stored, the operation executes **unattended and seamlessly**.
+  - If the card is present (in a reader or on the paired phone proxy) and PIN 1 is held, the operation executes **unattended and seamlessly** (RAPP v26.10.22 section 11 item 2).
   - Requiring a second, redundant "Approve" tap on a phone screen for every routine webpage login is security theater that adds friction without providing meaningful protection.
 
 ### 3.2 Invalidation Events
-Stored PIN 1 is purged immediately upon:
-- Explicit user deletion / logout;
-- Card reporting a blocked, locked, or counter-decremented state;
-- OS device lock or hardware container wipe.
+Held PIN 1 is forgotten immediately when:
+- The card leaves or is replaced: it is removed from the reader, or its holder removes it from the phone;
+- The card rejects it, or reports a blocked or decremented counter;
+- The process holding it ends, or the device restarts;
+- The user clears it.
 
 ---
 
@@ -102,7 +100,7 @@ Pairing is an explicit, mutually authenticated ceremony. Direct unauthenticated 
 
 Human users occasionally mistype digits. The security model must be resilient and forgiving of ordinary human error:
 - A mistyped PIN is told to the holder on the phone, with the attempts the card still allows, and the phone prompts again; the computer learns only the operation's outcome.
-- The phone verifies a PIN only while the card reports at least three remaining attempts, so RefineID never blocks a card (RAPP v26.10.21 section 10.2).
+- The phone verifies a PIN only while the card reports at least three remaining attempts, so RefineID never blocks a card (RAPP v26.10.22 section 10.2).
 - No failure revokes a pairing: a failure closes the connection or the session, or rejects one operation. Pairings are revoked only by their users.
 
 ---
@@ -112,7 +110,7 @@ Human users occasionally mistype digits. The security model must be resilient an
 | Domain | Mechanism | User Experience | Security Grounding |
 | :--- | :--- | :--- | :--- |
 | **Physical Security** | Card detachment | Card kept in wallet/pocket when idle | Hardware-level air gap; chip unpowered |
-| **Authentication (PIN 1)** | Unattended Keychain store | Instant tap-and-go login from computer | Click on computer = user intent; no arbitrary timers |
+| **Authentication (PIN 1)** | Held in memory until the card leaves | Instant tap-and-go login from computer | Click on computer = user intent; no arbitrary timers |
 | **Signing (PIN 2)** | Batch Signing (Solution A) | 1 PIN 2 entry per batch of documents | Conscious legal consent; zero prompt fatigue |
 | **Relay Pairing** | CPace PAKE (draft-irtf-cfrg-cpace-21) | Clean 6-character code (`7K X4 M9`) | Zero offline dictionary attacks; relay is blind |
 | **Typo Resilience** | Proportional error return | Clean retry with counter feedback | Prevents self-inflicted Denial of Service |

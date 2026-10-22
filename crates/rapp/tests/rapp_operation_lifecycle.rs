@@ -1,7 +1,7 @@
 // Copyright 2026 Petri Koistinen
 // Licensed under the Apache License, Version 2.0.
 
-//! Operation lifecycles of RAPP v26.10.21 section 8, with the requester and
+//! Operation lifecycles of RAPP v26.10.22 section 8, with the requester and
 //! custodian engines exchanging messages through their wire encoding.
 
 use refineid_rapp::{

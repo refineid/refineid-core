@@ -1,8 +1,8 @@
 # STPA of the Remote Authorization Proxy Protocol
 
-**Status:** Reviewed by the owner on 2026-10-22 with RAPP v26.10.21
+**Status:** Reviewed by the owner on 2026-10-22 with RAPP v26.10.22
 **Date:** 2026-10-18
-**Applies to:** RAPP v26.10.21 (`docs/protocols/rapp-v26.10.21.md`), the
+**Applies to:** RAPP v26.10.22 (`docs/protocols/rapp-v26.10.22.md`), the
 transport and discovery hierarchy, and the requester and custodian
 applications built on them
 
@@ -1219,3 +1219,15 @@ The specification stamped 26.10.21 adopts CC-1, CC-2 (as the `pairing_revoked` c
 - **The at-most-once machinery behind UCA-2 and UCA-21 is withdrawn.** Nothing RAPP does mutates the card: a repeated signature or read changes nothing on it, and a PIN is typed by the holder on the phone, bounded by the retry floor (specification §10.2), so a retransmitted request cannot spend a try. The write-ahead journal, the durable tombstones and the reconciliation messages that guarded against a repeated card command are gone; the hazard they addressed does not exist for these operations.
 
 The offer in UCA-12 now lasts 5 minutes, and a wrong PIN is re-prompted on the phone, so the retries-remaining count of section 6 never reaches the requester.
+
+## 19. Constraints at 26.10.22
+
+The specification stamped 26.10.22 chooses software that works with real browsers and real NFC over a stricter reading, and keeps the state eventually consistent: a card that is really gone leaves every client within a bounded time.
+
+| ID | Constraint | UCA |
+| :--- | :--- | :--- |
+| CC-64 | A requester offers an identity on a certificate the custodian confirmed by fingerprint on a session, before and between sessions, on every consumer alike. A request that arrives with no session open wakes the dial and waits within the consumer's own deadline. The offer goes when the custodian has been out of reach, or has reported absence, for 120 seconds with no later report of the card present; at once when the pairing is forgotten or revoked; and at once when a session confirms a different card. This supersedes CC-46, CC-61's instant withdrawal on a closed session or an absence report, and the Mac's session-loss grace. Residual, accepted: for up to 120 seconds a consumer can be offered an identity whose phone has left, and a login then fails after the consumer's deadline. | UCA-50, UCA-62 |
+| CC-65 | Presence is the card the custodian holds: a reader card from insertion until removal, and an NFC card from the holder adding it to the custodian until the holder removes it there. An operation the card did not answer ends with `card_error` and never changes presence; the next operation asks the holder to present the card again. This narrows CC-63 and supersedes CC-8 and CC-37 where they inferred absence from a missing answer. | UCA-13, UCA-39, UCA-65 |
+| CC-66 | PIN 1 is asked once and held only in the custodian's memory, never in storage; it ends when the card is removed, the card rejects it, the custodian's process ends or the device restarts. While it is held a browser authentication runs with no screen. PIN 2 is asked for every signature or batch and kept no longer. The PIN prompt is the holder's authorization; there is no separate consent view. Residual, accepted: while PIN 1 is held, a paired computer can obtain authentication signatures with no prompt, with a tap per operation for an NFC card and none for a card left in the reader. | UCA-1, UCA-36 |
+
+`inspect_card` no longer carries `supported_profiles`; nothing consumed the list, so no control action changes.

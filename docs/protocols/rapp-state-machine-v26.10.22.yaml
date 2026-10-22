@@ -1,6 +1,6 @@
 protocol: RAPP
-document_version: "26.10.21"
-wire_version: "26.10.21"
+document_version: "26.10.22"
+wire_version: "26.10.22"
 
 semantics:
   instances: >
@@ -28,6 +28,7 @@ constants:
   liveness_ping_after_silence_ms: 5000
   session_silence_limit_ms: 30000
   revocation_notice_days: 30
+  identity_offer_grace_ms: 120000
 
 guards:
   user_initiated: "an explicit local user action started this event"
@@ -104,9 +105,9 @@ actions:
   send_result_unauthorized: "send operation.result rejected with unauthorized"
   send_result_unsupported_parameter: "send operation.result rejected with unsupported_parameter or invalid_lifetime"
   send_progress_queued: "send operation.progress queued, once"
-  present_consent: "show the operation from the admitted request"
-  send_progress_consent_shown: "send operation.progress consent_shown once the view is on screen"
-  dismiss_consent: "remove the consent view"
+  present_consent: "ask the holder for a PIN the custodian does not hold, showing the admitted request; nothing when the custodian holds PIN 1 for a browser authentication"
+  send_progress_consent_shown: "send operation.progress consent_shown when a PIN prompt is on screen, since entering the PIN is the holder's consent; nothing when no prompt is shown"
+  dismiss_consent: "remove the PIN prompt"
   execute_read: "run the read-only card commands"
   check_retry_floor: "read the remaining attempts of the PIN the command needs"
   consume_card_command: "consume the one-shot card command"

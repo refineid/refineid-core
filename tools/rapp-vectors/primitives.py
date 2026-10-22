@@ -20,6 +20,12 @@ TWO_BYTE_ARGUMENT_LIMIT = 1 << 16
 FOUR_BYTE_ARGUMENT_LIMIT = 1 << 32
 MAJOR_SIMPLE = 7
 SIMPLE_FALSE, SIMPLE_TRUE, SIMPLE_NULL = 20, 21, 22
+SIMPLE_VALUES = {SIMPLE_FALSE: False, SIMPLE_TRUE: True, SIMPLE_NULL: None}
+# The low five bits of an initial byte: an argument below 24 is inline, and
+# 24 to 27 announce a 1-, 2-, 4- or 8-byte argument.
+ARGUMENT_MASK = 31
+INLINE_ARGUMENT_LIMIT = 24
+ARGUMENT_WIDTHS = {24: 1, 25: 2, 26: 4, 27: 8}
 
 
 def _head(major, n):
@@ -54,6 +60,53 @@ def cbor(v):
         items = sorted((cbor(k), cbor(x)) for k, x in v.items())
         return _head(5, len(items)) + b"".join(k + x for k, x in items)
     raise TypeError(type(v))
+
+
+def cbor_decode(b):
+    """The value of one deterministic CBOR item that fills `b` exactly."""
+    value, rest = _cbor_item(bytes(b))
+    if rest:
+        raise ValueError("trailing bytes")
+    return value
+
+
+def _cbor_item(b):
+    major, info = b[0] >> 5, b[0] & ARGUMENT_MASK
+    b = b[1:]
+    if info < INLINE_ARGUMENT_LIMIT:
+        n = info
+    elif info in ARGUMENT_WIDTHS:
+        width = ARGUMENT_WIDTHS[info]
+        if len(b) < width:
+            raise ValueError("truncated argument")
+        n, b = int.from_bytes(b[:width], "big"), b[width:]
+    else:
+        raise ValueError("indefinite or reserved argument")
+    if major == 0:
+        return n, b
+    if major == 1:
+        return -1 - n, b
+    if major in (2, 3) and len(b) < n:
+        raise ValueError("truncated string")
+    if major == 2:
+        return b[:n], b[n:]
+    if major == 3:
+        return b[:n].decode("utf-8"), b[n:]
+    if major == 4:
+        items = []
+        for _ in range(n):
+            item, b = _cbor_item(b)
+            items.append(item)
+        return items, b
+    if major == 5:
+        entries = {}
+        for _ in range(n):
+            key, b = _cbor_item(b)
+            entries[key], b = _cbor_item(b)
+        return entries, b
+    if major == MAJOR_SIMPLE and n in SIMPLE_VALUES:
+        return SIMPLE_VALUES[n], b
+    raise ValueError("unsupported item")
 
 
 # ---------------------------------------------------------------- hashes, HKDF
@@ -459,3 +512,5 @@ def selftest():
     assert encode(scalar_mult(2, BASEPOINT)).hex() == RFC9496_2B
     assert decode(bytes.fromhex(RFC9496_2B)) is not None
     assert cbor({"z": 1, "aa": 2}).hex() == RFC8949_MAP_ORDER
+    sample = {"z": [1, -2, b"ab", "c", True, None], "aa": {"n": ONE_BYTE_ARGUMENT_LIMIT}}
+    assert cbor_decode(cbor(sample)) == sample

@@ -1231,3 +1231,65 @@ The specification stamped 26.10.22 chooses software that works with real browser
 | CC-66 | PIN 1 is asked once and held only in the custodian's memory, never in storage; it ends when the card is removed, the card rejects it, the custodian's process ends or the device restarts. While it is held a browser authentication runs with no screen. PIN 2 is asked for every signature or batch and kept no longer. The PIN prompt is the holder's authorization; there is no separate consent view. Residual, accepted: while PIN 1 is held, a paired computer can obtain authentication signatures with no prompt, with a tap per operation for an NFC card and none for a card left in the reader. | UCA-1, UCA-36 |
 
 `inspect_card` no longer carries `supported_profiles`; nothing consumed the list, so no control action changes.
+
+## 20. Serving over Bluetooth in the background
+
+### 20.1 Scope
+
+iOS suspends a custodian app soon after it leaves the screen; its stream
+listener stops, and a paired computer cannot reach the phone. The
+custodian therefore also serves the BLE transport profile with the
+pairings it already has (a stored pairing serves any registered
+transport, specification §2.1 phase 4), as a GATT peripheral that iOS
+keeps serving and relaunches for Bluetooth events. A Mac requester dials
+the stream while the phone is on the local network and Bluetooth
+otherwise; its programs share one GATT link to the phone, so the
+extension that signs hands its operation to the app that holds the
+session. Losses and hazards are this record's: L-1, L-3; H-1, H-3, H-5,
+H-7.
+
+### 20.2 Control structure
+
+```
+Mac: token extension --handoff--> Mac app (held session, stream | BLE) <=RAPP=> phone relay
+Phone relay: stream listener + GATT server --one session--> coordinator
+Phone OS: suspends the app; wakes it for BLE events; relaunches it
+Phone relay --notification--> cardholder --tap--> app in front --> NFC
+```
+
+New control actions: the custodian admits a session on a second
+transport and displaces the open one; it unpublishes its stream listener
+in the background; it summons the holder; the requester picks a
+transport per dial; the extension hands an operation to the app. New
+feedback: a BLE link routed, refused or closed with its cause, and
+`waiting_for_card` while the holder is summoned.
+
+### 20.3 Unsafe control actions
+
+| ID | Controller | Control action | Type | Context | Hazard |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| UCA-66 | Custodian | Admit a session on the second transport | P | While a session on the other transport carries an operation, so the operation is cut and its card command's answer is lost. | H-5, H-7 |
+| UCA-67 | Custodian | Keep the stream listener published | P | While the app is suspended in the background, so the Mac dials a phone that cannot answer and never tries Bluetooth (UCA-6). | H-7, H-5 |
+| UCA-68 | Custodian | Command the near-field card | P | While the app is in the background: Core NFC refuses, the operation ends as `card_error`, and the holder never learned a card was wanted. | H-7, H-5 |
+| UCA-69 | Custodian | Report `card.status` absent | P | While the phone is locked and the primed card is unreadable only because protected data is unavailable, so the Mac withdraws an identity the phone can serve once the holder unlocks it. | H-7 |
+| UCA-70 | Requester | Open a second GATT link from the extension | P | While the app holds one: both share the phone's single link and channel, SAR fragments interleave, and both sessions fail. | H-7, H-5 |
+| UCA-71 | Requester | Dial the stream again | P | When the last stream dial failed while Bonjour still shows the phone (cached record of a suspended app), so Bluetooth is never tried. | H-7 |
+| UCA-72 | Custodian | Answer a refused preamble with an authentication or encryption error | P | Any context: the central's OS starts bonding and shows a pairing dialog the user cannot relate to RAPP. | H-5 |
+
+### 20.4 Controller constraints
+
+| ID | Constraint | Closes |
+| :--- | :--- | :--- |
+| CC-67 | One session at a time across all transports; a session with an operation in flight or a handshake under way is never displaced from any transport; the main actor re-decides admission before displacing. | UCA-66 |
+| CC-68 | On entering the background with Bluetooth serving, the custodian closes an idle stream session and unpublishes the stream listener (a busy one when it ends), and publishes it again on foreground. Not a withdrawal (§4.5). | UCA-67 |
+| CC-69 | A near-field card command from the background first summons the holder: a time-sensitive notification, `waiting_for_card`, and a wait bounded by a named limit and by the session; the card is commanded only once the app is active, otherwise the operation ends `card_error` with `card_wait_ended`. | UCA-68 |
+| CC-70 | While protected data is unavailable the custodian keeps the card status it last read with protected data available. | UCA-69 |
+| CC-71 | On a Mac only the app holds a GATT link to the phone; the extension hands its operation to the app, which carries it on its session or tells the extension to dial the stream. | UCA-70 |
+| CC-72 | A stream dial that fails while Bonjour still shows the phone sends the next dial over Bluetooth, until the phone is seen on Bonjour again after an absence. | UCA-71 |
+| CC-73 | A refused or closed link answers writes with `writeNotPermitted`; the characteristics need no link-layer security (CC-54). | UCA-72 |
+
+Residuals, accepted: a Mac reaches the phone over Bluetooth only while
+its app runs; right after the phone leaves the screen, a Mac may spend
+one stream discovery window before it dials Bluetooth; Core NFC needs
+the app in front, so an NFC card operation from the background needs the
+holder to answer the notification.

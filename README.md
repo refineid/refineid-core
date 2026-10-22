@@ -74,8 +74,10 @@ integration, full X.509 with revocation, document-format signing).
 ## Security posture
 
 - PIN1, PIN2, and the PUK are distinct non-clonable types.
-- PIN2 retention is bounded to a one-minute convenience window measured from
-  the last card-confirmed use; the window never extends to PIN management.
+- PIN1 is held only in process memory, from the card's first acceptance until
+  the card leaves or another invalidation event; there is no idle window, and
+  it is never written to storage. PIN2 is entered for every signature or batch
+  and never held between operations.
 - Credential and CAN input are accepted only through explicitly unvalidated,
   zeroize-on-drop boundaries and reconstructed into validated role types.
 - Anonymous protocol numbers are rejected. Hexadecimal wire values may appear

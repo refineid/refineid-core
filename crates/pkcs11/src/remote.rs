@@ -24,12 +24,18 @@
 //! handed out; the module reads offers from it at every slot refresh
 //! and dispatches `C_Sign` to it for a remote slot.
 //!
-//! A token is offered only with the certificate the source read from
-//! the card on the session it holds now, so the identity the module
-//! serves is the identity the phone is serving, and the token follows
-//! that session exactly. Each `C_Sign` is one call to the source with
-//! the module's deadline; an answer that misses the deadline, or an
-//! outcome the source cannot classify, is reported and never retried.
+//! A token is offered on a certificate whose fingerprint the phone
+//! confirmed on a session, and the module follows the offer: the token
+//! exists while the offer carries a certificate. The host keeps
+//! offering it between sessions as RAPP v26.10.22 section 8.4 item 3
+//! says, until the phone has been out of reach or has reported no card
+//! for the grace that section fixes (`IDENTITY_OFFER_GRACE_MS` in
+//! `refineid-rapp`) with no report of the card present in that time,
+//! until the pairing is forgotten or revoked, or until a session
+//! reports a different card. Each `C_Sign` is one call to the source
+//! with the module's deadline; an answer that misses the deadline, or
+//! an outcome the source cannot classify, is reported and never
+//! retried.
 //!
 //! The source is the only producer of a [`RemoteSlotId`], so holding
 //! a remote slot is proof that the host admitted a pairing. The source
@@ -58,14 +64,14 @@ use crate::slot_kind::RemoteSlotId;
 /// every request as the operation's lifetime.
 pub const REMOTE_SIGN_DEADLINE: Duration = Duration::from_secs(30);
 
-/// The authentication certificate of the card the phone serves, as
-/// the source read it from that card on the session the source holds
-/// now.
+/// The authentication certificate of the card the phone serves: one
+/// whose fingerprint the phone confirmed on a session (RAPP v26.10.22
+/// section 8.4 item 2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionCertificate(Vec<u8>);
 
 impl SessionCertificate {
-    /// The certificate's DER, read on the current session.
+    /// The certificate's DER, confirmed by fingerprint on a session.
     #[must_use]
     pub const fn new(der: Vec<u8>) -> Self {
         Self(der)
@@ -92,10 +98,10 @@ impl RemoteOffer {
     ///
     /// `context` names this computer to the holder on the phone's
     /// consent view; it travels with every signature request.
-    /// `certificate` is present while the source holds an open session
-    /// on which the phone reports a card, and is the certificate the
-    /// source read from that card on that session; the token exists
-    /// exactly then.
+    /// `certificate` is present while the source offers the card: a
+    /// certificate whose fingerprint the phone confirmed on a session,
+    /// kept between sessions until the offer is withdrawn as RAPP
+    /// v26.10.22 section 8.4 item 3 says. The token exists exactly then.
     #[must_use]
     pub const fn new(
         pair_id: RemoteSlotId,
@@ -129,8 +135,8 @@ impl RemoteOffer {
         &self.context
     }
 
-    /// The certificate read on the current session, while the phone
-    /// serves a card.
+    /// The certificate the phone confirmed on a session, while the
+    /// source offers it.
     #[must_use]
     pub const fn certificate(&self) -> Option<&SessionCertificate> {
         self.certificate.as_ref()
@@ -224,11 +230,11 @@ impl core::error::Error for RemoteSignError {}
 pub trait RemoteTokenSource: Send + Sync {
     /// The one pairing offered right now, or none.
     ///
-    /// The offer carries a certificate only while the source holds an
-    /// open session on which the phone reports a card; the module
-    /// withdraws the token the moment the offer carries none, and
-    /// raises a new token, with new object handles, when a
-    /// certificate is offered again.
+    /// The offer carries a certificate while the source offers the
+    /// card under RAPP v26.10.22 section 8.4 item 3, between sessions
+    /// included; the module withdraws the token the moment the offer
+    /// carries none, and raises a new token, with new object handles,
+    /// when a certificate is offered again.
     fn offered(&self) -> Option<RemoteOffer>;
 
     /// Asks the phone of `pair_id` to sign `request`, showing
@@ -236,7 +242,9 @@ pub trait RemoteTokenSource: Send + Sync {
     /// the registered encoding: the PKCS#1 block for RSA, the
     /// fixed-width `r || s` for ECDSA.
     ///
-    /// The source answers within `deadline` or reports
+    /// With no session open, the source dials the phone and holds the
+    /// request until a session opens or `deadline` passes. The source
+    /// answers within `deadline` or reports
     /// [`RemoteSignError::Expired`]; the module issues one call per
     /// `C_Sign` and never repeats it.
     ///

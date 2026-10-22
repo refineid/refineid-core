@@ -176,9 +176,10 @@ impl SecretDigits {
 /// Validated PIN1 value.
 ///
 /// The type deliberately does not implement `Clone`, `Copy`, serialization,
-/// or a raw-byte accessor. Future credential APDU construction will consume
-/// this value through a crate-private, zeroizing path. A fresh, manually
-/// entered PIN1 remains mandatory for each private-key signing operation.
+/// or a raw-byte accessor. The PIN operations consume it through a
+/// crate-private, zeroizing path. A host may hold a PIN1 the card accepted
+/// only in process memory, until an invalidation event, as the credential
+/// custody contract says.
 #[derive(ZeroizeOnDrop)]
 pub struct Pin1(SecretDigits);
 
@@ -218,10 +219,10 @@ impl fmt::Debug for Pin1 {
 
 /// Validated PIN2 value.
 ///
-/// PIN2 retention is bounded by the one-minute qualified-signature
-/// convenience window in the credential custody contract. The type
-/// deliberately does not implement `Clone`, `Copy`, serialization, or a
-/// raw-byte accessor.
+/// PIN2 is entered for every signature, or once for a batch the holder
+/// sees whole, and is never held between operations (credential custody
+/// contract). The type deliberately does not implement `Clone`, `Copy`,
+/// serialization, or a raw-byte accessor.
 #[derive(ZeroizeOnDrop)]
 pub struct Pin2(SecretDigits);
 

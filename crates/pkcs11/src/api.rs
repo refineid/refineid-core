@@ -792,7 +792,7 @@ unsafe extern "C" fn c_get_session_info(session: CkSessionHandle, info: CkSessio
 /// s5.6.5).
 ///
 /// The PIN is validated as 4..=12 ASCII digits, verified once on the
-/// live card, and cached only after definite success. It is never logged.
+/// live card, and kept only once the card accepts it. It is never logged.
 unsafe extern "C" fn c_login(
     session: CkSessionHandle,
     user_type: CkUserType,
@@ -881,7 +881,7 @@ const fn classify_pin_error(error: PinRoleError) -> CkRv {
     }
 }
 
-/// `C_Logout`: drop the token's cached PIN1 (v2.40 s5.6.6).
+/// `C_Logout`: destroy the token's held PIN1 (v2.40 s5.6.6).
 unsafe extern "C" fn c_logout(session: CkSessionHandle) -> CkRv {
     diag!("C_Logout session={session}");
     let mut guard = match lock_module() {
@@ -895,6 +895,9 @@ unsafe extern "C" fn c_logout(session: CkSessionHandle) -> CkRv {
         return CKR_SESSION_HANDLE_INVALID;
     };
     let slot_id = session_ref.slot_id();
+    // A PIN1 out on an in-flight signature is the slot's login too; the
+    // logout destroys it, so the signature's settlement cannot bring it
+    // back.
     if !module.is_logged_in(slot_id) {
         return CKR_USER_NOT_LOGGED_IN;
     }
@@ -1375,8 +1378,9 @@ unsafe extern "C" fn c_sign(
             // bytes.len(), and signature_len is writable.
             unsafe { deliver_bytes(signature, signature_len, &bytes) }
         }
-        // `card_sign` destructively checks the cache out before any
-        // VERIFY and restores it only after the entire operation succeeds.
+        // `card_sign` destructively checks the held PIN1 out before its
+        // VERIFY; it comes back only when the card accepted it and
+        // stayed in the reader, or left the VERIFY unanswered.
         Err(err) => err,
     };
     diag!("C_Sign rv={rv:#06x}");

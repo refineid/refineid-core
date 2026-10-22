@@ -1,8 +1,9 @@
 # Credential custody
 
-This is the target contract for PIN-bearing code. The public tree currently
-implements the refined input types and the credential-command ownership types;
-it does not yet build a credential APDU flow or cache a PIN.
+This is the contract for PIN-bearing code. The public tree implements the
+refined input types, the credential-command ownership types, and the PKCS#11
+module's held PIN1 (`crates/pkcs11/src/pin_cache.rs`), which follows the rules
+below.
 
 See also [Security and Usability Balance](security-and-usability-balance.md) for
 the architectural consensus on unattended PIN 1 authentication and explicit

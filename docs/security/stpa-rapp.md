@@ -1506,3 +1506,88 @@ computer. Losses and hazards are this record's: L-1; H-1, H-5.
 | ID | Constraint | Closes |
 | :--- | :--- | :--- |
 | CC-85 | The custodian's PIN prompt names the paired computer by its pairing's name, the `display_name` of its `pairing.hello`, and never a site; the requester's operation context is not shown. A signature's PIN 2 prompt keeps its document names (specification §9.3). This supersedes CC-55's display clause, "the phone shows the computer's name and the program, labelled as such"; CC-55's rule that the context never names a relying party the requester cannot know stands, as do CC-25 and CC-75. Specification §11 item 1. | UCA-83, UCA-58 |
+
+## 25. A local card overrides the phone on the Mac
+
+### 25.1 Scope
+
+The Mac requester serves a card in its own reader and a paired phone's
+card. Holding both, it offered two identities of one person to the
+browser's chooser and kept the phone's session busy for a computer that
+had a card of its own. The Mac app now lets a card in its own reader
+override the phone: while one is present it holds no session to the
+phone. The same change gives the holder a one-click way to forget the
+phone, with no confirmation. Losses and hazards are this record's: L-3;
+H-4, H-5, H-7.
+
+### 25.2 Unsafe control actions
+
+| ID | Controller | Control action | Type | Context | Hazard |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| UCA-84 | Requester | Hold or dial the phone session and offer the phone's identity | P | While a card is in the computer's own reader: the browser shows two identities of one person and the login may go to the card the holder did not mean, and the phone is kept busy for a computer that does not need it. | H-5, H-7 |
+| UCA-85 | Requester | Keep the phone suppressed | P | After the local card has left: a phone that can serve is not dialed and the holder is offered nothing. | H-7, H-5 |
+| UCA-86 | Requester | Route a signature to the phone | P | While a local card is present but not yet ready: the signing window asks for no PIN 2 and the phone path refuses, so signing fails without saying why. | H-5 |
+| UCA-87 | Cardholder | Forget the pairing | P | By a slip, with no confirmation by design: the identity line must then show the state the vault holds, or the holder is shown a pairing that no longer exists. | H-4, H-5 |
+
+### 25.3 Controller constraints
+
+| ID | Constraint | Closes |
+| :--- | :--- | :--- |
+| CC-86 | While a card is in a reader attached to the computer, the requester holds no phone session, starts no dial, redial or Bluetooth scan, refuses operations its token extension hands over, and offers no phone identity. Local presence is read at each decision, never remembered, and the identity line shows only the local card. | UCA-84 |
+| CC-87 | When the local card leaves, discovery and dialing resume at once and the phone's line returns; the override never changes the pairing. | UCA-85 |
+| CC-88 | The signing device follows the same presence fact, read at the moment of signing: a signature goes to the local card whenever one is in a local reader, ready or not, so the local path's own feedback (reading the card, its PIN 2 prompt, its errors) tells the holder what happens; the phone signs only while no card is in a local reader. | UCA-86 |
+| CC-89 | Forgetting ends the pairing as specification §4.6 says (`pairing_revoked` at once, or on the next session); the identity line then follows what the vault holds, and a refused forget is reported in development builds. Recovery is a new pairing. | UCA-87 |
+
+Residual, accepted: while the Mac app is not running, nothing withdraws
+the phone's identity when a local card is inserted, and the token
+extension dials the phone itself. The app stays running without its
+window and starts at login (CC-79).
+
+## 26. Keeping the phone's near field warm
+
+### 26.1 Scope
+
+A browser login that needs several signatures in a row (the TLS
+handshakes of one identification service) met a closed near field at
+each one on the iPhone custodian. The hold ended ten seconds after the
+last operation whatever the platform allowed, and an operation that
+arrived while the app's own NFC sheet kept it inactive summoned the holder
+as if the app were in the background. Each signature cost a summons, a
+tap, PACE and often the reader's pause. The custodian now keeps the field,
+the card session and the PACE channel open for the next queued operation
+for as long as the platform keeps the slot. Losses and hazards are this
+record's: L-1, L-3; H-1, H-5, H-7.
+
+### 26.2 Control structure change
+
+The holder feeds its warm state into the summons decision (CC-69), and
+the PIN prompt path ends the field before it shows. Feedback: the slot's
+state, looked at every second, and the answer to a keep-alive after two
+seconds without an exchange.
+
+### 26.3 Unsafe control actions
+
+| ID | Controller | Control action | Type | Context | Hazard |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| UCA-88 | Custodian | Keep the field while showing a PIN prompt | P | The system sheet covers the prompt, so the holder cannot answer it and the operation waits out its lifetime. | H-5, H-7 |
+| UCA-89 | Custodian | Command the card through a warm field | P | While the app is in the background (UCA-68): the platform refuses, and the holder was never told a card was wanted. | H-7, H-5 |
+| UCA-90 | Custodian | Summon the holder | P | While a warm field holds the card and the app is only inactive under its own sheet: the summons waits for the sheet to close, which ends the field, and every further signature costs a new tap. | H-7 |
+
+### 26.4 Controller constraints
+
+| ID | Constraint | Closes |
+| :--- | :--- | :--- |
+| CC-90 | The field ends before any PIN prompt shows. | UCA-88 |
+| CC-91 | Going to the background ends the field; a near-field operation from the background summons the holder as CC-69 says. | UCA-89 |
+| CC-92 | An operation that finds a field the app opened in the foreground still holding the card runs on it while the app is inactive under its own sheet, with no summons. This relaxes CC-69's "commanded only once the app is active" for a warm field only; from the background CC-69 applies unchanged. | UCA-90 |
+| CC-93 | The field has no idle limit of its own: it ends when the slot is gone (the card left, the sheet was closed, or the platform ended it), when a keep-alive or an operation goes unanswered, 50 seconds after it was asked for, when serving stops or the last session closes, and per CC-90 and CC-91. CC-41's watch on the slot and its keep-alive stand; the custodian adds no idle limit of its own on top of the platform's. | UCA-43, UCA-46 |
+
+Residual, accepted, widening CC-66's: while PIN 1 is held, a paired
+computer can obtain several authentication signatures within one field
+instead of one per tap. The field lasts at most the platform's slot life
+(about 20 seconds) and 50 seconds in any case, the system sheet is on
+screen for all of it, and lifting the card, the background, Remote Access
+off or the last session closing ends it. VERIFY with the held PIN still
+runs before every signature, since the card keeps no PIN state between
+them. A card swapped in fails the secure channel, so the next exchange
+goes unanswered and the field ends.

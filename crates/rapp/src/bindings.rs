@@ -22,13 +22,14 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::{
-    BinaryFrame, CpaceAttemptLedger, CpaceKc2Initiator, CpaceKc2Responder,
-    CpaceKc2ResponderWaiting, EndpointRole, EstablishedEndpoint, ExplicitUserIntent, OfferId,
-    POST_PAKE_CONFIRMATION_MS, POST_PAKE_HANDSHAKE_MS, PairId, PairKeyMaterial, PairRecord,
-    PairingBackoff, PairingConfirmation, PairingError, PairingHandshake, PairingOffer,
-    PairingOfferDeadline, PairingSecret, PairingStorage, PreAuthenticationRateLimit, ProfileName,
-    ReadyOutcome, RoutingPreamble, STREAM_PROFILE, SessionAuthentication, SessionHandshake,
-    SessionId, TransportProfile, encode_kc2_step1_frame, generate_pair_key_material,
+    BinaryFrame, CandidateError, CpaceAttemptLedger, CpaceKc2Initiator, CpaceKc2Responder,
+    CpaceKc2ResponderWaiting, EndpointRole, EstablishedEndpoint, ExplicitUserIntent, NextCandidate,
+    OfferId, POST_PAKE_CONFIRMATION_MS, POST_PAKE_HANDSHAKE_MS, PairId, PairKeyMaterial,
+    PairRecord, PairingBackoff, PairingCandidates, PairingConfirmation, PairingError,
+    PairingHandshake, PairingOffer, PairingOfferDeadline, PairingSecret, PairingStorage,
+    PreAuthenticationRateLimit, ProfileName, ReadyOutcome, RoutingPreamble, STREAM_PROFILE,
+    SessionAuthentication, SessionHandshake, SessionId, TransportProfile, encode_kc2_step1_frame,
+    generate_pair_key_material,
     operation_bridge::{EndedOperation, RappBridgeAction, RappBridgeActionKind},
     phase_deadline_ms, standard_pairing_context_v2,
 };
@@ -2028,6 +2029,108 @@ mod pairing_bridge_tests {
             Err(RappBindingError::ProtocolFailure)
         ));
     }
+
+    /// A second phone in pairing mode, showing a code of its own.
+    fn other_custodian() -> Arc<RappPairingBridge> {
+        let counts = rapp_random_byte_counts();
+        RappPairingBridge::create_custodian_offer(
+            vec![0x12; usize::try_from(counts.offer_id).expect("offer id size fits usize")],
+            vec![ProfileName::Authentication.as_str().to_owned()],
+            vec![TransportProfile::Stream.name().to_owned()],
+            STARTED_AT_MS,
+        )
+        .expect("custodian offer is valid")
+    }
+
+    /// Runs CPace through T_B with the code the user typed against the code
+    /// the custodian shows.
+    fn try_code(
+        requester: &RappPairingBridge,
+        custodian: &RappPairingBridge,
+        shown: &str,
+        at: u64,
+    ) -> Result<(), RappBindingError> {
+        requester
+            .begin_cpace(
+                STREAM_CANDIDATE_ID.into(),
+                PAIRING_CODE.into(),
+                vec![0x33; 64],
+                at + 1,
+            )
+            .expect("requester begins cpace");
+        custodian
+            .begin_cpace(
+                STREAM_CANDIDATE_ID.into(),
+                shown.into(),
+                vec![0x44; 64],
+                at + 1,
+            )
+            .expect("custodian begins cpace");
+        exchange_through_step2(requester, custodian, at)
+    }
+
+    #[test]
+    fn a_requester_tries_the_next_phone_before_refusing_the_code() {
+        let other = other_custodian();
+        let this = custodian(&[TransportProfile::Stream]);
+        let candidates = RappPairingCandidates::new();
+        candidates.found("other".into()).expect("lock");
+        candidates.found("this".into()).expect("lock");
+
+        assert_eq!(
+            candidates.next_endpoint().expect("none open").as_deref(),
+            Some("other")
+        );
+        let first = requester(&other, TransportProfile::Stream, STARTED_AT_MS);
+        assert!(candidates.begin_try(Arc::clone(&first)).expect("offer"));
+        assert!(try_code(&first, &other, WRONG_CODE, STARTED_AT_MS).is_err());
+        assert_eq!(candidates.closed().expect("open"), RappNextCandidate::Try);
+
+        let at = STARTED_AT_MS + NEXT_ATTEMPT_MS;
+        assert_eq!(
+            candidates.next_endpoint().expect("none open").as_deref(),
+            Some("this")
+        );
+        let second = requester(&this, TransportProfile::Stream, at);
+        assert!(candidates.begin_try(Arc::clone(&second)).expect("offer"));
+        try_code(&second, &this, PAIRING_CODE, at).expect("T_B verifies");
+        candidates.accepted().expect("a try runs");
+        assert!(matches!(
+            candidates.next_endpoint(),
+            Err(RappBindingError::WrongPhase)
+        ));
+    }
+
+    #[test]
+    fn a_phone_found_twice_receives_one_guess() {
+        let phone = custodian(&[TransportProfile::Ble, TransportProfile::Stream]);
+        let candidates = RappPairingCandidates::new();
+        candidates.found("stream".into()).expect("lock");
+        candidates.found("ble".into()).expect("lock");
+
+        candidates.next_endpoint().expect("none open");
+        let first = requester(&phone, TransportProfile::Stream, STARTED_AT_MS);
+        assert!(candidates.begin_try(Arc::clone(&first)).expect("offer"));
+        assert!(try_code(&first, &phone, WRONG_CODE, STARTED_AT_MS).is_err());
+        assert!(
+            phone
+                .candidate_failed(STARTED_AT_MS + 4)
+                .expect("the phone keeps its offer")
+        );
+        assert_eq!(candidates.closed().expect("open"), RappNextCandidate::Try);
+
+        candidates.next_endpoint().expect("none open");
+        let again = requester(
+            &phone,
+            TransportProfile::Ble,
+            STARTED_AT_MS + NEXT_ATTEMPT_MS,
+        );
+        assert!(!candidates.begin_try(again).expect("offer"));
+        assert_eq!(
+            candidates.closed().expect("open"),
+            RappNextCandidate::NotAccepted
+        );
+    }
 }
 
 /// The custodian's process-wide backoff after locked-out offers
@@ -2112,6 +2215,143 @@ impl RappPreAuthenticationLimiter {
             .lock()
             .map_err(|_| RappBindingError::LocalStateFailure)?
             .admit(now_monotonic_ms))
+    }
+}
+
+/// What a requester does after a pairing connection closed without its
+/// custodian taking the code (RAPP v26.10.22 §4.2, "Trying Each Custodian in
+/// Pairing Mode").
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+pub enum RappNextCandidate {
+    /// Open the next endpoint with [`RappPairingCandidates::next_endpoint`].
+    Try,
+    /// Every custodian tried refused the code: report it as not accepted,
+    /// naming none of them.
+    NotAccepted,
+    /// No custodian has been tried and no endpoint is left to open: wait
+    /// for discovery to find another, or report that none in pairing mode
+    /// was found.
+    NoneTried,
+}
+
+impl From<NextCandidate> for RappNextCandidate {
+    fn from(next: NextCandidate) -> Self {
+        match next {
+            NextCandidate::Try => Self::Try,
+            NextCandidate::NotAccepted => Self::NotAccepted,
+            NextCandidate::NoneTried => Self::NoneTried,
+        }
+    }
+}
+
+/// The custodians in pairing mode a requester tries with one typed code
+/// (RAPP v26.10.22 §4.2, "Trying Each Custodian in Pairing Mode"). The
+/// platform creates one per submitted code, reports every endpoint
+/// discovery finds in pairing mode by its own name for it (a service
+/// instance, a peripheral identifier), opens the endpoints the ledger hands
+/// out one at a time, and reports how each connection ended.
+#[derive(Debug, Default, uniffi::Object)]
+pub struct RappPairingCandidates {
+    candidates: Mutex<PairingCandidates<String>>,
+}
+
+#[uniffi::export]
+impl RappPairingCandidates {
+    /// The ledger of a code the user has just submitted.
+    #[uniffi::constructor]
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Record an endpoint discovery found in pairing mode: a `mode=pairing`
+    /// service instance, or a BLE peripheral of the RAPP service.
+    ///
+    /// # Errors
+    /// [`RappBindingError::LocalStateFailure`] on a poisoned lock.
+    pub fn found(&self, endpoint: String) -> Result<(), RappBindingError> {
+        self.lock()?.found(endpoint);
+        Ok(())
+    }
+
+    /// The next endpoint to open a pairing connection to, or `None` when
+    /// every endpoint found is opened.
+    ///
+    /// # Errors
+    /// [`RappBindingError::WrongPhase`] while a pairing connection is open
+    /// or once the code is accepted or refused.
+    pub fn next_endpoint(&self) -> Result<Option<String>, RappBindingError> {
+        let mut candidates = self.lock()?;
+        let endpoint = candidates
+            .next_endpoint()
+            .map_err(|_| RappBindingError::WrongPhase)?
+            .cloned();
+        drop(candidates);
+        Ok(endpoint)
+    }
+
+    /// Admit the offer `bridge` holds, read over the open connection, before
+    /// CPace step 1. Returns `false` when CPace already ran on this offer
+    /// with the code, the same custodian found on another transport: the
+    /// caller closes the connection without CPace and calls [`Self::closed`].
+    ///
+    /// # Errors
+    /// [`RappBindingError::WrongPhase`] when `bridge` is not a requester's
+    /// offer awaiting CPace, or no connection awaits an offer.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "uniffi lowers exported arguments as owned values"
+    )]
+    pub fn begin_try(&self, bridge: Arc<RappPairingBridge>) -> Result<bool, RappBindingError> {
+        let state = bridge.lock()?;
+        let PairingBridgeState::Offer {
+            role: EndpointRole::Requester,
+            offer,
+            ..
+        } = &*state
+        else {
+            return Err(RappBindingError::WrongPhase);
+        };
+        let admitted = self.lock()?.begin_try(offer);
+        drop(state);
+        match admitted {
+            Ok(()) => Ok(true),
+            Err(CandidateError::OfferAlreadyTried) => Ok(false),
+            Err(_) => Err(RappBindingError::WrongPhase),
+        }
+    }
+
+    /// The open connection closed without its custodian taking the code:
+    /// refused or closed, no offer or one the requester rejects or already
+    /// tried, no CPace step 2 within the attempt deadline, or a `T_B` that
+    /// did not verify.
+    ///
+    /// # Errors
+    /// [`RappBindingError::WrongPhase`] when no connection is open or the
+    /// code is already accepted or refused.
+    pub fn closed(&self) -> Result<RappNextCandidate, RappBindingError> {
+        self.lock()?
+            .closed()
+            .map(RappNextCandidate::from)
+            .map_err(|_| RappBindingError::WrongPhase)
+    }
+
+    /// The custodian tried proved it holds the code: its `T_B` verified.
+    ///
+    /// # Errors
+    /// [`RappBindingError::WrongPhase`] when no CPace runs.
+    pub fn accepted(&self) -> Result<(), RappBindingError> {
+        self.lock()?
+            .accepted()
+            .map_err(|_| RappBindingError::WrongPhase)
+    }
+}
+
+impl RappPairingCandidates {
+    fn lock(&self) -> Result<MutexGuard<'_, PairingCandidates<String>>, RappBindingError> {
+        self.candidates
+            .lock()
+            .map_err(|_| RappBindingError::LocalStateFailure)
     }
 }
 

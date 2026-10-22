@@ -68,23 +68,22 @@ Every design includes a short System-Theoretic Process Analysis (STPA),
 sized to the change. [stpa-rapp.md](docs/security/stpa-rapp.md) is the worked example and the
 record for RAPP and its applications.
 
-- Name the losses that matter in the real world: an operation without the
-  cardholder's informed consent, a PIN retry budget spent or a card
-  blocked, a cardholder who cannot authenticate or sign and cannot tell
-  why, a person or a card event disclosed to a third party, a document
-  other than the approved one signed. Reuse the recorded losses (L-n) and
-  hazards (H-n); add one only for a situation that can happen to a real
-  user.
+- Ground the analysis in the losses (L-n) and hazards (H-n) the record
+  already names. Add a loss only when a real stakeholder could suffer it
+  and no recorded loss covers it, and a hazard only for a real system
+  state that leads to a loss.
 - Do not invent imaginary losses, hazards or threats to fill the method.
   A few real ones beat a long list.
-- Draw the control structure the change touches: who commands whom, and
-  what feedback each controller gets. Look first for missing, late or
-  misleading feedback; a controller acting on a stale model is the usual
-  cause of a loss.
-- List the unsafe control actions (UCA-n) the change could issue and the
-  controller constraints (CC-n) the design enforces against them.
-- A small change records its analysis in the pull request; a change to
-  the control structure updates the STPA record that covers it.
+- Describe the control structure the change touches: the controllers,
+  their control actions, and the feedback each gets. Look first for
+  missing, late or misleading feedback; a controller acting on a stale
+  process model is the usual cause of an unsafe control action.
+- List the unsafe control actions (UCA-n) the affected controllers could
+  issue or fail to issue, the hazards each leads to, and the controller
+  constraints (CC-n) the design enforces against them.
+- A small change records its analysis in the pull request, and a change
+  with no control action or feedback to analyse says so in one line. A
+  change to the control structure updates the STPA record that covers it.
 
 ## The floor
 

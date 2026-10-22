@@ -1213,6 +1213,9 @@ The specification stamped 26.10.21 adopts CC-1, CC-2 (as the `pairing_revoked` c
 
 - **CC-5 is withdrawn.** There are no acknowledgements: an operation lives inside its session and is forgotten when the session ends (specification §8.1). A requester that lacks a result starts a new operation.
 - **CC-47 is superseded** by CC-58, as section 17.6 says.
+- **CC-20's journal clause is withdrawn.** A result that arrives after the module's deadline ends with its session; the module starts a new operation (specification §8.1 item 3).
+- **CC-26 is superseded** by specification §8.3 and CC-61: a requester keeps a session open to every paired custodian whose discovery hint is in sight, card or no card, and no record carries a card-present hint.
+- **CC-40's hint path is withdrawn.** No record carries a revocation hint. A phone that forgot the computer tells it as the first message of the next session (specification §4.6 item 2), and the requester dials whenever the phone's discovery hint is in sight (§8.3), so the GUI learns of the forget on that session.
 - **The at-most-once machinery behind UCA-2 and UCA-21 is withdrawn.** Nothing RAPP does mutates the card: a repeated signature or read changes nothing on it, and a PIN is typed by the holder on the phone, bounded by the retry floor (specification §10.2), so a retransmitted request cannot spend a try. The write-ahead journal, the durable tombstones and the reconciliation messages that guarded against a repeated card command are gone; the hazard they addressed does not exist for these operations.
 
 The offer in UCA-12 now lasts 5 minutes, and a wrong PIN is re-prompted on the phone, so the retries-remaining count of section 6 never reaches the requester.

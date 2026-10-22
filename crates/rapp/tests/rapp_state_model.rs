@@ -1,7 +1,9 @@
 //! Executable conformance against the normative RAPP state-machine grammar.
 
 use refineid_rapp::{
-    Action, EndpointRole, Guards, OperationEvent, OperationState, PairingEvent, PairingState,
+    Action, EndpointRole, Guards, IDENTITY_OFFER_GRACE_MS, LIVENESS_PING_AFTER_SILENCE_MS,
+    MAXIMUM_CPACE_ATTEMPTS, MINIMUM_REMAINING_ATTEMPTS, OFFER_TTL_MS, OperationEvent,
+    OperationState, PAIRING_CANDIDATES_MAX, PairingEvent, PairingState, SESSION_SILENCE_LIMIT_MS,
     SessionEvent, SessionState,
 };
 use serde::Deserialize;
@@ -11,9 +13,22 @@ const MODEL: &str = include_str!("../../../docs/protocols/rapp-state-machine-v26
 #[derive(Deserialize)]
 struct Model {
     document_version: String,
+    constants: Constants,
     pairing: Machine,
     session: Machine,
     operation: Machine,
+}
+
+/// The model's named numbers that the engine mirrors.
+#[derive(Deserialize)]
+struct Constants {
+    pairing_attempts_per_offer: u64,
+    pairing_candidates_max: u64,
+    minimum_remaining_attempts: u64,
+    offer_ttl_ms: u64,
+    liveness_ping_after_silence_ms: u64,
+    session_silence_limit_ms: u64,
+    identity_offer_grace_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -62,6 +77,7 @@ const fn all_guards() -> Guards {
         initiation_permitted: true,
         pairing_routed: true,
         ready_parameters_match: true,
+        untried_pairing_candidate: true,
     }
 }
 
@@ -84,12 +100,36 @@ fn guard_is_registered(guard: &str) -> bool {
             | "initiation_permitted"
             | "pairing_routed"
             | "ready_parameters_match"
+            | "untried_pairing_candidate"
     )
 }
 
 #[test]
 fn formal_document_version_is_the_reviewed_revision() {
     assert_eq!(model().document_version, "26.10.22");
+}
+
+#[test]
+fn formal_constants_are_the_engine_constants() {
+    let constants = model().constants;
+    let pairing_candidates_max =
+        u64::try_from(PAIRING_CANDIDATES_MAX).expect("the candidate limit fits in u64");
+    assert_eq!(constants.pairing_candidates_max, pairing_candidates_max);
+    assert_eq!(
+        constants.pairing_attempts_per_offer,
+        u64::from(MAXIMUM_CPACE_ATTEMPTS)
+    );
+    assert_eq!(
+        constants.minimum_remaining_attempts,
+        u64::from(MINIMUM_REMAINING_ATTEMPTS)
+    );
+    assert_eq!(constants.offer_ttl_ms, OFFER_TTL_MS);
+    assert_eq!(
+        constants.liveness_ping_after_silence_ms,
+        LIVENESS_PING_AFTER_SILENCE_MS
+    );
+    assert_eq!(constants.session_silence_limit_ms, SESSION_SILENCE_LIMIT_MS);
+    assert_eq!(constants.identity_offer_grace_ms, IDENTITY_OFFER_GRACE_MS);
 }
 
 #[test]
@@ -213,9 +253,11 @@ const fn formal_action_name(action: Action) -> &'static str {
         Action::ShowAttemptsExhausted => "show_attempts_exhausted",
         Action::ReadOffer => "read_offer",
         Action::BeginCpaceInitiator => "begin_cpace_initiator",
+        Action::TryNextCandidate => "try_next_candidate",
         Action::ReserveAttempt => "reserve_attempt",
         Action::CountFailedAttempt => "count_failed_attempt",
         Action::ShowWrongCode => "show_wrong_code",
+        Action::ShowNoneInPairingMode => "show_none_in_pairing_mode",
         Action::ConsumeOffer => "consume_offer",
         Action::DerivePairingSecret => "derive_pairing_secret",
         Action::BeginPairingHandshake => "begin_pairing_handshake",
@@ -449,6 +491,8 @@ const PAIRING_EVENTS: &[(&str, PairingEvent)] = &[
     ("code_entered", PairingEvent::CodeEntered),
     ("attempt_failed", PairingEvent::AttemptFailed),
     ("last_attempt_failed", PairingEvent::LastAttemptFailed),
+    ("last_candidate_failed", PairingEvent::LastCandidateFailed),
+    ("no_custodian_tried", PairingEvent::NoCustodianTried),
     ("key_confirmed", PairingEvent::KeyConfirmed),
     (
         "handshake_authenticated",

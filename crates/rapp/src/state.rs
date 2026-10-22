@@ -46,6 +46,10 @@ pub struct Guards {
     pub pairing_routed: bool,
     /// Received session.ready parameters equal the local view.
     pub ready_parameters_match: bool,
+    /// An endpoint found in pairing mode is not yet opened for the typed
+    /// code, and fewer than `pairing_candidates_max` pairing connections
+    /// were opened for it.
+    pub untried_pairing_candidate: bool,
 }
 
 /// Pairing component state.
@@ -131,10 +135,18 @@ pub enum PairingEvent {
     AttemptStarted,
     /// The user typed the pairing code on the requester.
     CodeEntered,
-    /// A CPace attempt failed to confirm the key.
+    /// A CPace attempt failed to confirm the key. On the requester: the
+    /// endpoint opened did not take the code, because its custodian refused
+    /// it or it served no offer the requester could try.
     AttemptFailed,
     /// The offer's last CPace attempt failed.
     LastAttemptFailed,
+    /// Every custodian the requester tried refused the code, and no endpoint
+    /// is left to open.
+    LastCandidateFailed,
+    /// No endpoint served an offer the requester could try, and its search
+    /// ended.
+    NoCustodianTried,
     /// Both CPace confirmation tags verified.
     KeyConfirmed,
     /// The pairing handshake completed.
@@ -281,12 +293,17 @@ pub enum Action {
     ReadOffer,
     /// Send CPace step 1 from the typed pairing code.
     BeginCpaceInitiator,
+    /// Open a pairing connection to the next endpoint found in pairing mode
+    /// and not yet opened for the typed code.
+    TryNextCandidate,
     /// Count the attempt before sending CPace step 2 and arm its deadline.
     ReserveAttempt,
     /// Record the failed attempt; the offer stays.
     CountFailedAttempt,
-    /// Tell the user the pairing code did not match.
+    /// Tell the user the pairing code was not accepted, naming no custodian.
     ShowWrongCode,
+    /// Tell the user that no custodian in pairing mode was found.
+    ShowNoneInPairingMode,
     /// Mark the offer consumed once T_A verified.
     ConsumeOffer,
     /// Derive the PSK for the pairing handshake from the CPace key schedule.
@@ -545,11 +562,33 @@ impl PairingState {
                     state: Self::Offering,
                     actions: &[A::CountFailedAttempt],
                 },
-                EndpointRole::Requester => Transition {
+                EndpointRole::Requester => {
+                    require(guards.untried_pairing_candidate)?;
+                    Transition {
+                        state: Self::Exchanging,
+                        actions: &[
+                            A::CloseCandidate,
+                            A::TryNextCandidate,
+                            A::ReadOffer,
+                            A::BeginCpaceInitiator,
+                        ],
+                    }
+                }
+            },
+            (Self::Exchanging, E::LastCandidateFailed) => {
+                require_role(role, EndpointRole::Requester)?;
+                Transition {
                     state: Self::Unpaired,
                     actions: &[A::CloseCandidate, A::ShowWrongCode],
-                },
-            },
+                }
+            }
+            (Self::Exchanging, E::NoCustodianTried) => {
+                require_role(role, EndpointRole::Requester)?;
+                Transition {
+                    state: Self::Unpaired,
+                    actions: &[A::CloseCandidate, A::ShowNoneInPairingMode],
+                }
+            }
             (Self::Exchanging, E::LastAttemptFailed) => {
                 require_role(role, EndpointRole::Proxy)?;
                 Transition {
@@ -1250,14 +1289,19 @@ impl RappState {
 
     /// An authenticated message violated the protocol. The session closes
     /// and the pairing stays; during a pairing, the attempt aborts (section
-    /// 10.1).
+    /// 10.1). This state holds no pairing candidates, so a requester's
+    /// ceremony ends with the attempt; trying the next custodian in pairing
+    /// mode is [`crate::PairingCandidates`]'s.
     pub fn authenticated_protocol_violation(&mut self) -> SecurityOutcome {
         let pairing_event = match self.pairing {
             PairingState::Handshaking => Some(PairingEvent::HandshakeFailed),
             PairingState::Confirming | PairingState::StorageConfirming => {
                 Some(PairingEvent::DeniedAbortedOrTimedOut)
             }
-            PairingState::Exchanging => Some(PairingEvent::AttemptFailed),
+            PairingState::Exchanging => Some(match self.role {
+                EndpointRole::Proxy => PairingEvent::AttemptFailed,
+                EndpointRole::Requester => PairingEvent::LastCandidateFailed,
+            }),
             _ => None,
         };
         if let Some(event) = pairing_event {

@@ -39,6 +39,7 @@ pub mod operation_bridge;
 mod pair_keys;
 mod pairing;
 mod pairing_attempts;
+mod pairing_candidates;
 mod pairing_flow;
 mod policy;
 mod proxy_engine;
@@ -106,6 +107,9 @@ pub use pairing_attempts::{
     CPACE_ATTEMPT_WINDOW_MS, CpaceAttemptLedger, MAXIMUM_CPACE_ATTEMPTS, POST_PAKE_CONFIRMATION_MS,
     POST_PAKE_HANDSHAKE_MS, PRE_AUTHENTICATION_SPACING_MS, PairingBackoff,
     PreAuthenticationRateLimit, phase_deadline_ms,
+};
+pub use pairing_candidates::{
+    CandidateError, NextCandidate, PAIRING_CANDIDATES_MAX, PairingCandidates,
 };
 pub use pairing_flow::{
     ActivePairing, PairingAttemptFailure, PairingConfirmation, PairingError, PairingHandshake,

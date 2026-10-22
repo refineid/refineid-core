@@ -1416,3 +1416,93 @@ identity offer (CC-64, CC-65) do not change.
 
 Privacy: `reader_attached` travels only inside the encrypted session, and
 no discovery record or advertisement carries it.
+
+## 23. Trying every phone in pairing mode
+
+### 23.1 Scope
+
+Two phones on one network, an iPhone and an Android phone, were both in
+pairing mode. The Mac took the code shown on one, dialed the other, and
+that phone's CPace key confirmation failed; the Mac reported that the code
+was not accepted, although it was right. Seen on 2026-10-22. A
+`mode=pairing` record and a BLE advertisement carry nothing derived from
+the code or the offer (specification §4.1), so a requester cannot tell
+which phone in pairing mode shows the typed code. The requester now tries
+each phone in pairing mode with the code, one at a time, before it reports
+the code as not accepted. Losses and hazards are this record's: L-3; H-5.
+
+### 23.2 Control structure
+
+```
+user --typed code--> requester
+requester --pairing connection, offer read, CPace step 1--> custodian A, then B, ... (one at a time)
+custodian --Y_B || T_B, or a close--> requester
+requester --paired | "code not accepted" | "no phone in pairing mode"--> user
+```
+
+Before key confirmation the only authenticated feedback is `T_B`. A
+verified `T_B` proves that the custodian holds the code; a mismatch, a
+close or silence says only that this custodian does not. The requester
+acted on a process model in which the one custodian it dialed was the one
+showing the code, and read that custodian's mismatch as a wrong code.
+Discovery records and offers name no phone, and nothing a custodian says
+about itself is authenticated until the code is accepted.
+
+### 23.3 Unsafe control actions
+
+| ID | Controller | Control action | Type | Context | Hazard |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| UCA-81 | Requester | Report the pairing code as not accepted | P | While a custodian it found in pairing mode has not been tried with the code, or when it tried none: the user retypes or doubts a right code, and the phone that shows it is never asked. | H-5 |
+| UCA-82 | Requester | Name a custodian in the pairing outcome or its progress | P | Before a code is accepted, from a discovery record, an advertisement or an offer: none of them is authenticated, so a rogue on the link chooses the name the user reads. | H-5 |
+
+### 23.4 Controller constraints
+
+| ID | Constraint | Closes |
+| :--- | :--- | :--- |
+| CC-83 | The requester tries every custodian it finds in pairing mode on any transport, from when the code is submitted until the last one tried refuses it: one pairing connection at a time, each endpoint opened at most once and each `offer_id` tried at most once per typed code, at most 8 pairing connections per code. A refused or closed connection, no CPace step 2 within the attempt deadline, or a `T_B` that does not verify moves on to the next; a verified `T_B` ends the search. It reports the code as not accepted only when every custodian tried refused it and no endpoint is left, or the limit is reached; when it tried none, it reports that no phone in pairing mode was found. Specification §4.2, "Trying Each Custodian in Pairing Mode"; `PairingCandidates` in the core. | UCA-81 |
+| CC-84 | Until a code is accepted the requester names no custodian, in its progress or in the not-accepted report; it names the custodian only from the custodian's `pairing.hello`, inside the authenticated pairing channel. | UCA-82 |
+
+The limit: a phone advertises pairing mode only during a ceremony, so a
+real network shows one or two. The limit of 8 pairing connections per
+typed code bounds what a flood of fake pairing-mode advertisers can cost:
+the requester's time, and other custodians' attempts.
+
+Residuals, accepted:
+
+- Each custodian tried that does not show the code spends one of its
+  offer's three attempts (specification §3.3 item 1). The limit still holds
+  per custodian: one guess per typed code, never two at once, under its own
+  attempt deadline, so the guessing bound of the 30-bit code is unchanged.
+  A phone in pairing mode beside the right one can lose attempts it never
+  saw typed, and after three mistyped codes its offer locks out with the
+  backoff of §3.3 item 7; its holder starts a new offer.
+- On BLE the advertisement shows no mode: a peripheral that serves no offer
+  is not in pairing mode, and costs a connection but no attempt.
+- Rogues that take up the 8 pairing connections, or one that serves a copy
+  of a real offer's `offer_id` first, keep the requester from the real
+  phone for that code, which is then reported as not accepted. That is a
+  denial of service any party on the link can cause; it yields no pairing
+  and no extra guess.
+
+## 24. Naming the computer in the PIN prompt
+
+### 24.1 Scope
+
+The Android custodian's PIN 1 prompt named the paired computer and, on a
+line of its own, the program taken from the requester's operation context.
+On a Mac that context reads "macOS CryptoTokenKit": the token stack, never
+the site, which no requester can know. The iPhone custodian already named
+only the computer. The custodian's prompt now names only the paired
+computer. Losses and hazards are this record's: L-1; H-1, H-5.
+
+### 24.2 Unsafe control actions
+
+| ID | Controller | Control action | Type | Context | Hazard |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| UCA-83 | Custodian | Show the requester's operation context in the PIN prompt | P | When the context names plumbing, such as the token stack, or anything else the requester cannot vouch for: the holder reads it as the party asking and consents or declines on a name that says nothing about the login. | H-5, H-1 |
+
+### 24.3 Controller constraints
+
+| ID | Constraint | Closes |
+| :--- | :--- | :--- |
+| CC-85 | The custodian's PIN prompt names the paired computer by its pairing's name, the `display_name` of its `pairing.hello`, and never a site; the requester's operation context is not shown. A signature's PIN 2 prompt keeps its document names (specification §9.3). This supersedes CC-55's display clause, "the phone shows the computer's name and the program, labelled as such"; CC-55's rule that the context never names a relying party the requester cannot know stands, as do CC-25 and CC-75. Specification §11 item 1. | UCA-83, UCA-58 |

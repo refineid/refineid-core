@@ -14,7 +14,7 @@
 
 //! How a stored pairing finds its peer without naming itself on the wire:
 //! rotating discovery hints (hierarchy specification §4.3) and per-dial
-//! session routing tags (RAPP v26.10.18 §2.2.1).
+//! session routing tags (RAPP v26.10.21 §2.2.1).
 //!
 //! Both are keyed by the pairing's static X25519 agreement, which only the
 //! two endpoints know. A discovery hint changes every 15 minutes and a
@@ -27,12 +27,11 @@ use subtle::{ConditionallySelectable, ConstantTimeEq};
 use zeroize::Zeroizing;
 
 use super::txt::{
-    AnnouncementCandidate, MODE_KEY, REVOKED_KEY, VERSION, VERSION_KEY, decode_list, encode_list,
+    AnnouncementCandidate, MODE_KEY, VERSION, VERSION_KEY, decode_list, encode_list,
     most_recently_used, values,
 };
 use super::{
-    DegenerateAgreement, PAIR_KEY_SIZE, PairId, PairRecord, REVOKED_ANNOUNCEMENT_ENTRIES,
-    RevokedAnnouncement, TransportProfile, X25519_KEY_SIZE,
+    DegenerateAgreement, PAIR_KEY_SIZE, PairId, PairRecord, TransportProfile, X25519_KEY_SIZE,
 };
 
 /// Byte length of one published discovery hint.
@@ -63,10 +62,10 @@ pub const SESSION_ROUTING_SIZE: usize = ROUTING_NONCE_SIZE + ROUTING_TAG_SIZE;
 pub const ROUTING_REPLAY_WINDOW: usize = 256;
 
 /// HKDF info naming the discovery-hint key.
-const DISCOVERY_KEY_INFO: &[u8] = b"RAPP-discovery-hint-v2";
+const DISCOVERY_KEY_INFO: &[u8] = b"rapp-discovery-hint";
 
 /// HKDF info naming the routing key.
-const ROUTING_KEY_INFO: &[u8] = b"RAPP-routing-v1";
+const ROUTING_KEY_INFO: &[u8] = b"rapp-routing";
 
 /// The discovery epoch of a Unix time: `floor(unix_time / 900)`.
 #[must_use]
@@ -85,7 +84,7 @@ impl core::fmt::Debug for DiscoveryKey {
 
 impl DiscoveryKey {
     /// Derives the key of a stored pairing. A pairing the peer never
-    /// confirmed storing is not announced (RAPP v26.10.18 section 4.3
+    /// confirmed storing is not announced (RAPP v26.10.21 section 4.3
     /// item 4).
     ///
     /// # Errors
@@ -104,7 +103,7 @@ impl DiscoveryKey {
     }
 
     /// Derives `K_disc = HKDF-SHA-256(salt = pair_id, IKM = X25519(local
-    /// static private, peer static public), info = "RAPP-discovery-hint-v2",
+    /// static private, peer static public), info = "rapp-discovery-hint",
     /// L = 32)`.
     ///
     /// # Errors
@@ -158,56 +157,44 @@ impl DiscoveryKey {
 }
 
 /// A well-formed `mode=session` record: the discovery hints it carries,
-/// possibly none (hierarchy specification §4.3), and its revocation
-/// announcement when it has one (RAPP v26.10.18 §4.6).
+/// possibly none (hierarchy specification §4.3).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DiscoveryRecord {
     hints: Vec<[u8; DISCOVERY_HINT_SIZE]>,
-    revoked: Option<RevokedAnnouncement>,
 }
 
 /// Why a TXT record is not a well-formed `mode=session` record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DiscoveryRecordError {
-    /// A key other than `v`, `mode`, `hints` and `revoked`, or a repeated
-    /// key; keys compare case-insensitively.
+    /// A key other than `v`, `mode` and `hints`, or a repeated key; keys
+    /// compare case-insensitively.
     UnexpectedKey,
     /// `v` or `mode` is missing or has another value.
     WrongHeader,
     /// The hint list is not one to four lowercase 16-digit hexadecimal
     /// entries.
     MalformedHints,
-    /// The revocation announcement is not exactly eight lowercase 16-digit
-    /// hexadecimal entries.
-    MalformedRevocations,
 }
 
 impl DiscoveryRecord {
     /// A record announcing the hints of the four most recently used
     /// pairings among `candidates`, pairings beyond the fourth not
-    /// announced, and carrying `revoked` when the custodian has a
-    /// revocation to announce.
+    /// announced.
     #[must_use]
-    pub fn assemble(
-        candidates: &[AnnouncementCandidate],
-        revoked: Option<RevokedAnnouncement>,
-    ) -> Self {
+    pub fn assemble(candidates: &[AnnouncementCandidate]) -> Self {
         Self {
             hints: most_recently_used(candidates, MAX_DISCOVERY_HINTS),
-            revoked,
         }
     }
 
     /// Parses the TXT key/value pairs of a discovered record.
     ///
     /// # Errors
-    /// [`DiscoveryRecordError`] for anything but `v=1`, `mode=session`, an
-    /// optional `hints=` of one to four lowercase entries, and an optional
-    /// `revoked=` of exactly eight.
+    /// [`DiscoveryRecordError`] for anything but `v=1`, `mode=session` and an
+    /// optional `hints=` of one to four lowercase entries.
     pub fn parse(entries: &[(&str, &str)]) -> Result<Self, DiscoveryRecordError> {
-        let [version, mode, hints, revoked] =
-            values(entries, [VERSION_KEY, MODE_KEY, TXT_HINTS_KEY, REVOKED_KEY])
-                .ok_or(DiscoveryRecordError::UnexpectedKey)?;
+        let [version, mode, hints] = values(entries, [VERSION_KEY, MODE_KEY, TXT_HINTS_KEY])
+            .ok_or(DiscoveryRecordError::UnexpectedKey)?;
         if version != Some(VERSION) || mode != Some(TXT_MODE_SESSION) {
             return Err(DiscoveryRecordError::WrongHeader);
         }
@@ -216,20 +203,11 @@ impl DiscoveryRecord {
             Some(list) => decode_list(list, MAX_DISCOVERY_HINTS)
                 .ok_or(DiscoveryRecordError::MalformedHints)?,
         };
-        let revoked = match revoked {
-            None => None,
-            Some(list) => Some(
-                decode_list(list, REVOKED_ANNOUNCEMENT_ENTRIES)
-                    .and_then(|entries| <[_; REVOKED_ANNOUNCEMENT_ENTRIES]>::try_from(entries).ok())
-                    .map(RevokedAnnouncement::from_entries)
-                    .ok_or(DiscoveryRecordError::MalformedRevocations)?,
-            ),
-        };
-        Ok(Self { hints, revoked })
+        Ok(Self { hints })
     }
 
     /// The record's TXT key/value pairs, in publication order; `hints` only
-    /// when there are hints, `revoked` only when there is an announcement.
+    /// when there are hints.
     #[must_use]
     pub fn txt_entries(&self) -> Vec<(&'static str, String)> {
         let mut entries = vec![
@@ -239,9 +217,6 @@ impl DiscoveryRecord {
         if !self.hints.is_empty() {
             entries.push((TXT_HINTS_KEY, encode_list(&self.hints)));
         }
-        if let Some(revoked) = &self.revoked {
-            entries.push((REVOKED_KEY, encode_list(revoked.entries())));
-        }
         entries
     }
 
@@ -249,13 +224,6 @@ impl DiscoveryRecord {
     #[must_use]
     pub fn hints(&self) -> &[[u8; DISCOVERY_HINT_SIZE]] {
         &self.hints
-    }
-
-    /// The revocation announcement's eight entries, when the record carries
-    /// one.
-    #[must_use]
-    pub fn revoked(&self) -> Option<&[[u8; DISCOVERY_HINT_SIZE]; REVOKED_ANNOUNCEMENT_ENTRIES]> {
-        self.revoked.as_ref().map(RevokedAnnouncement::entries)
     }
 }
 
@@ -270,7 +238,7 @@ impl core::fmt::Debug for RoutingKey {
 
 impl RoutingKey {
     /// Derives the key of a stored pairing. A pairing the peer never
-    /// confirmed storing neither routes nor dials (RAPP v26.10.18 section
+    /// confirmed storing neither routes nor dials (RAPP v26.10.21 section
     /// 4.3 item 4).
     ///
     /// # Errors
@@ -289,7 +257,7 @@ impl RoutingKey {
     }
 
     /// Derives `K_route = HKDF-SHA-256(salt = pair_id, IKM = X25519(local
-    /// static private, peer static public), info = "RAPP-routing-v1",
+    /// static private, peer static public), info = "rapp-routing",
     /// L = 32)`.
     ///
     /// # Errors
@@ -355,7 +323,7 @@ pub struct RandomUnavailable;
 pub enum RecordKeyError {
     /// The static agreement is the identity point.
     DegenerateAgreement(DegenerateAgreement),
-    /// The peer never confirmed that it stored the pairing (RAPP v26.10.18
+    /// The peer never confirmed that it stored the pairing (RAPP v26.10.21
     /// section 4.3 item 4).
     StorageUnconfirmed,
 }
@@ -584,13 +552,10 @@ mod tests {
             &public(FIRST_PRIVATE),
         )
         .expect("key");
-        let record = DiscoveryRecord::assemble(
-            &[AnnouncementCandidate {
-                hint: custodian.hint(EPOCH),
-                last_used_ms: EPOCH,
-            }],
-            None,
-        );
+        let record = DiscoveryRecord::assemble(&[AnnouncementCandidate {
+            hint: custodian.hint(EPOCH),
+            last_used_ms: EPOCH,
+        }]);
         let entries: Vec<(String, String)> = record
             .txt_entries()
             .into_iter()

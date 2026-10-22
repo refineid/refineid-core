@@ -15,25 +15,12 @@
 //! Strict deterministic-CBOR wire representation for RAPP.
 
 use core::fmt;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
-use super::{MAX_FRAME_PLAINTEXT, SESSION_ID_SIZE, SessionId, WIRE_VERSION_V26_10_18};
+use super::{MAX_FRAME_PLAINTEXT, SESSION_ID_SIZE, SessionId, WIRE_VERSION_V26_10_21};
 
 const MAX_NESTING_DEPTH: usize = 8;
 const MAX_TEXT_SIZE: usize = 4_096;
-
-/// Critical extension names this implementation understands.
-///
-/// RAPP v26.9.28 section 7.3: "An implementation MUST reject an unknown
-/// field named in `critical`." Which names are known is fixed by what
-/// this module implements, not chosen per call, so the set is a
-/// constant rather than a parameter: a caller that supplied its own set
-/// could widen it and quietly accept traffic this endpoint cannot act
-/// on. The set is empty because no critical extension is implemented, so
-/// every critical name a peer sends is by definition one this endpoint
-/// must reject. The outgoing path is correspondingly free of critical
-/// names, which keeps both directions consistent.
-pub(crate) const SUPPORTED_CRITICAL_EXTENSIONS: &[&str] = &[];
 
 /// CBOR additional-information values selecting the argument width (RFC 8949 section 3).
 const ARGUMENT_IMMEDIATE_MAX: u8 = 23;
@@ -89,12 +76,6 @@ pub enum MessageType {
     OperationRequest,
     /// Profile-defined operation result.
     OperationResult,
-    /// Acknowledgment of a completed result.
-    OperationResultAck,
-    /// Durable status reconciliation query.
-    OperationStatusRequest,
-    /// Durable status reconciliation answer.
-    OperationStatus,
     /// Operation progress update.
     OperationProgress,
     /// Whether the custodian can serve a card now.
@@ -118,9 +99,6 @@ impl MessageType {
             Self::LivenessPong => "liveness.pong",
             Self::OperationRequest => "operation.request",
             Self::OperationResult => "operation.result",
-            Self::OperationResultAck => "operation.result_ack",
-            Self::OperationStatusRequest => "operation.status_request",
-            Self::OperationStatus => "operation.status",
             Self::OperationProgress => "operation.progress",
             Self::CardStatus => "card.status",
             Self::Error => "error",
@@ -139,9 +117,6 @@ impl MessageType {
             "liveness.pong" => Ok(Self::LivenessPong),
             "operation.request" => Ok(Self::OperationRequest),
             "operation.result" => Ok(Self::OperationResult),
-            "operation.result_ack" => Ok(Self::OperationResultAck),
-            "operation.status_request" => Ok(Self::OperationStatusRequest),
-            "operation.status" => Ok(Self::OperationStatus),
             "operation.progress" => Ok(Self::OperationProgress),
             "card.status" => Ok(Self::CardStatus),
             "error" => Ok(Self::Error),
@@ -161,35 +136,25 @@ pub struct Envelope {
     pub sequence: u64,
     /// Message-specific, schema-validated body.
     pub body: BTreeMap<String, WireValue>,
-    /// Extensions that an endpoint must understand.
-    pub critical: Vec<String>,
-    /// Registered extension values.
-    pub extensions: BTreeMap<String, WireValue>,
 }
 
 impl Envelope {
     /// Construct and validate an outgoing envelope.
     ///
     /// # Errors
-    /// [`WireError`] when the body or extensions violate the registered
-    /// schema.
+    /// [`WireError`] when the body violates the registered schema.
     pub fn reconstruct(
         message_type: MessageType,
         session_id: SessionId,
         sequence: u64,
         body: BTreeMap<String, WireValue>,
-        critical: Vec<String>,
-        extensions: BTreeMap<String, WireValue>,
     ) -> Result<Self, WireError> {
         validate_body(message_type, &body)?;
-        validate_extensions(&critical, &extensions)?;
         Ok(Self {
             message_type,
             session_id,
             sequence,
             body,
-            critical,
-            extensions,
         })
     }
 
@@ -203,9 +168,9 @@ impl Envelope {
         map.insert(
             "version".to_owned(),
             WireValue::Array(vec![
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_18.0)),
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_18.1)),
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_18.2)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_21.0)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_21.1)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_21.2)),
             ]),
         );
         map.insert(
@@ -218,18 +183,6 @@ impl Envelope {
         );
         map.insert("sequence".to_owned(), WireValue::Unsigned(self.sequence));
         map.insert("body".to_owned(), WireValue::Map(self.body.clone()));
-        if !self.critical.is_empty() {
-            map.insert(
-                "critical".to_owned(),
-                WireValue::Array(self.critical.iter().cloned().map(WireValue::Text).collect()),
-            );
-        }
-        if !self.extensions.is_empty() {
-            map.insert(
-                "extensions".to_owned(),
-                WireValue::Map(self.extensions.clone()),
-            );
-        }
         let encoded = encode_deterministic_cbor(&WireValue::Map(map))?;
         if encoded.len() > MAX_FRAME_PLAINTEXT {
             return Err(WireError::OversizedPlaintext { got: encoded.len() });
@@ -249,25 +202,14 @@ impl Envelope {
         let WireValue::Map(mut map) = decode_deterministic_cbor(bytes)? else {
             return Err(WireError::WrongType { field: "envelope" });
         };
-        reject_unknown_fields(
-            &map,
-            &[
-                "version",
-                "type",
-                "session_id",
-                "sequence",
-                "body",
-                "critical",
-                "extensions",
-            ],
-        )?;
+        reject_unknown_fields(&map, &["version", "type", "session_id", "sequence", "body"])?;
 
         let version = take_array(&mut map, "version")?;
         if version.as_slice()
             != [
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_18.0)),
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_18.1)),
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_18.2)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_21.0)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_21.1)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_21.2)),
             ]
         {
             return Err(WireError::UnsupportedVersion);
@@ -282,59 +224,13 @@ impl Envelope {
             })?;
         let sequence = take_unsigned(&mut map, "sequence")?;
         let body = take_map(&mut map, "body")?;
-        let critical = match map.remove("critical") {
-            None => Vec::new(),
-            Some(WireValue::Array(values)) => values
-                .into_iter()
-                .map(|value| match value {
-                    WireValue::Text(text) => Ok(text),
-                    _ => Err(WireError::WrongType { field: "critical" }),
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            Some(_) => return Err(WireError::WrongType { field: "critical" }),
-        };
-        let extensions = match map.remove("extensions") {
-            None => BTreeMap::new(),
-            Some(WireValue::Map(values)) => values,
-            Some(_) => {
-                return Err(WireError::WrongType {
-                    field: "extensions",
-                });
-            }
-        };
         validate_body(message_type, &body)?;
-        validate_extensions(&critical, &extensions)?;
         Ok(Self {
             message_type,
             session_id,
             sequence,
             body,
-            critical,
-            extensions,
         })
-    }
-
-    /// Reject critical extensions this implementation does not support.
-    ///
-    /// Every authenticated receive path must call this: the peer names a
-    /// critical extension to declare that ignoring it would misrepresent
-    /// the message, so a name this implementation does not support has
-    /// to end the session rather than be processed as if it had not been
-    /// sent. The supported set is the module's own constant, not a
-    /// caller's, so no caller can widen it.
-    ///
-    /// # Errors
-    /// [`WireError::UnsupportedCriticalExtension`] when a critical name is
-    /// not supported locally.
-    pub fn require_supported_critical(&self) -> Result<(), WireError> {
-        if self
-            .critical
-            .iter()
-            .any(|name| !SUPPORTED_CRITICAL_EXTENSIONS.contains(&name.as_str()))
-        {
-            return Err(WireError::UnsupportedCriticalExtension);
-        }
-        Ok(())
     }
 }
 
@@ -371,14 +267,7 @@ impl SequenceGuard {
             .next_send
             .checked_add(1)
             .ok_or(WireError::SequenceWrapped)?;
-        Envelope::reconstruct(
-            message_type,
-            self.session_id,
-            sequence,
-            body,
-            Vec::new(),
-            BTreeMap::new(),
-        )
+        Envelope::reconstruct(message_type, self.session_id, sequence, body)
     }
 
     /// Verify session binding and exact next sequence after decryption.
@@ -401,12 +290,6 @@ impl SequenceGuard {
             .checked_add(1)
             .ok_or(WireError::SequenceWrapped)?;
         Ok(())
-    }
-
-    /// Most recently accepted peer sequence, if any.
-    #[must_use]
-    pub const fn last_received_sequence(&self) -> Option<u64> {
-        self.next_receive.checked_sub(1)
     }
 }
 
@@ -470,10 +353,6 @@ pub enum WireError {
     UnsupportedVersion,
     /// Message type is outside the registry.
     UnknownMessageType,
-    /// A named critical extension is not supported locally.
-    UnsupportedCriticalExtension,
-    /// A named critical extension has no extension value.
-    CriticalExtensionMissing,
     /// Plaintext exceeds the single-frame envelope limit.
     OversizedPlaintext {
         /// Plaintext length in bytes.
@@ -767,10 +646,10 @@ struct FieldSpec {
 
 const OPERATION_ID: FieldType = FieldType::Bytes(16);
 const PAIR_ID: FieldType = FieldType::Bytes(16);
-const REQUEST_HASH: FieldType = FieldType::Bytes(32);
-/// Byte-length bounds of the error body's `error_name` (section 10.4).
+const CERTIFICATE_FINGERPRINT: FieldType = FieldType::Bytes(32);
+/// Byte-length bounds of the error body's `error_name` (section 10.3).
 const ERROR_NAME_LENGTHS: core::ops::RangeInclusive<usize> = 1..=64;
-/// Byte-length bounds of the error body's `message` (section 10.4).
+/// Byte-length bounds of the error body's `message` (section 10.3).
 const ERROR_MESSAGE_LENGTHS: core::ops::RangeInclusive<usize> = 1..=512;
 
 #[allow(
@@ -821,11 +700,18 @@ fn validate_body(
             field_type: PAIR_ID,
             optional: false,
         }],
-        M::CardStatus => &[FieldSpec {
-            name: "card_present",
-            field_type: F::Bool,
-            optional: false,
-        }],
+        M::CardStatus => &[
+            FieldSpec {
+                name: "card_present",
+                field_type: F::Bool,
+                optional: false,
+            },
+            FieldSpec {
+                name: "certificate_fingerprint",
+                field_type: CERTIFICATE_FINGERPRINT,
+                optional: false,
+            },
+        ],
         M::SessionReady => &[
             FieldSpec {
                 name: "parameters",
@@ -838,30 +724,16 @@ fn validate_body(
                 optional: false,
             },
         ],
-        M::SessionClose => &[
-            FieldSpec {
-                name: "reason",
-                field_type: F::Text,
-                optional: false,
-            },
-            FieldSpec {
-                name: "last_received_sequence",
-                field_type: F::Unsigned,
-                optional: false,
-            },
-        ],
-        M::LivenessPing | M::LivenessPong => &[
-            FieldSpec {
-                name: "challenge",
-                field_type: F::Bytes(32),
-                optional: false,
-            },
-            FieldSpec {
-                name: "last_received_sequence",
-                field_type: F::Unsigned,
-                optional: false,
-            },
-        ],
+        M::SessionClose => &[FieldSpec {
+            name: "reason",
+            field_type: F::Text,
+            optional: false,
+        }],
+        M::LivenessPing | M::LivenessPong => &[FieldSpec {
+            name: "challenge",
+            field_type: F::Bytes(32),
+            optional: false,
+        }],
         M::OperationRequest => &[
             FieldSpec {
                 name: "operation_id",
@@ -894,27 +766,10 @@ fn validate_body(
                 optional: true,
             },
         ],
-        M::OperationResultAck => &[
-            FieldSpec {
-                name: "operation_id",
-                field_type: OPERATION_ID,
-                optional: false,
-            },
-            FieldSpec {
-                name: "request_hash",
-                field_type: REQUEST_HASH,
-                optional: false,
-            },
-        ],
         M::OperationResult => &[
             FieldSpec {
                 name: "operation_id",
                 field_type: OPERATION_ID,
-                optional: false,
-            },
-            FieldSpec {
-                name: "request_hash",
-                field_type: REQUEST_HASH,
                 optional: false,
             },
             FieldSpec {
@@ -932,58 +787,11 @@ fn validate_body(
                 field_type: F::Text,
                 optional: true,
             },
-            FieldSpec {
-                name: "remaining_retries",
-                field_type: F::Unsigned,
-                optional: true,
-            },
-            FieldSpec {
-                name: "retired",
-                field_type: F::Bool,
-                optional: true,
-            },
-        ],
-        M::OperationStatusRequest => &[FieldSpec {
-            name: "operation_id",
-            field_type: OPERATION_ID,
-            optional: false,
-        }],
-        M::OperationStatus => &[
-            FieldSpec {
-                name: "operation_id",
-                field_type: OPERATION_ID,
-                optional: false,
-            },
-            FieldSpec {
-                name: "known",
-                field_type: F::Bool,
-                optional: false,
-            },
-            FieldSpec {
-                name: "state",
-                field_type: F::Text,
-                optional: true,
-            },
-            FieldSpec {
-                name: "request_hash",
-                field_type: REQUEST_HASH,
-                optional: true,
-            },
-            FieldSpec {
-                name: "retired",
-                field_type: F::Bool,
-                optional: true,
-            },
         ],
         M::OperationProgress => &[
             FieldSpec {
                 name: "operation_id",
                 field_type: OPERATION_ID,
-                optional: false,
-            },
-            FieldSpec {
-                name: "request_hash",
-                field_type: REQUEST_HASH,
                 optional: false,
             },
             FieldSpec {
@@ -993,11 +801,6 @@ fn validate_body(
             },
         ],
         M::Error => &[
-            FieldSpec {
-                name: "error_code",
-                field_type: F::Unsigned,
-                optional: false,
-            },
             FieldSpec {
                 name: "error_name",
                 field_type: F::Text,
@@ -1069,7 +872,6 @@ fn validate_discriminants(
                         | "complete"
                         | "user_disconnect"
                         | "policy"
-                        | "credential_rejected"
                         | "protocol_violation"
                         | "pairing_revoked"
                         | "shutdown"
@@ -1081,15 +883,11 @@ fn validate_discriminants(
             }
         }
         MessageType::OperationResult => {
-            if !matches!(
-                text("status"),
-                Some("completed" | "rejected" | "credential_rejected" | "cancelled" | "ambiguous")
-            ) {
+            if !matches!(text("status"), Some("completed" | "rejected" | "cancelled")) {
                 return Err(WireError::InvalidValue { field: "status" });
             }
         }
-        // Any error name is admitted: an unrecognized one is handled as a
-        // general `operation_failed` (section 10.4), so only lengths bind.
+        // The message layer reads the name against section 10.3.
         MessageType::Error => {
             if !text("error_name").is_some_and(|name| ERROR_NAME_LENGTHS.contains(&name.len())) {
                 return Err(WireError::InvalidValue {
@@ -1103,22 +901,6 @@ fn validate_discriminants(
             }
         }
         _ => {}
-    }
-    Ok(())
-}
-
-fn validate_extensions(
-    critical: &[String],
-    extensions: &BTreeMap<String, WireValue>,
-) -> Result<(), WireError> {
-    let mut names = BTreeSet::new();
-    for name in critical {
-        if !names.insert(name) {
-            return Err(WireError::DuplicateMapKey);
-        }
-        if !extensions.contains_key(name) {
-            return Err(WireError::CriticalExtensionMissing);
-        }
     }
     Ok(())
 }
@@ -1221,8 +1003,6 @@ mod tests {
             session,
             1,
             BTreeMap::from([("reason".to_owned(), WireValue::Text("cancelled".to_owned()))]),
-            Vec::new(),
-            BTreeMap::new(),
         )
         .expect("valid body");
         assert_eq!(
@@ -1243,8 +1023,6 @@ mod tests {
             SessionId::from_array([0x55; 16]),
             0,
             BTreeMap::from([("reason".to_owned(), WireValue::Text("cancelled".to_owned()))]),
-            Vec::new(),
-            BTreeMap::new(),
         )
         .expect("valid envelope");
         let encoded_envelope = envelope.encode().expect("envelope encodes");
@@ -1273,9 +1051,9 @@ mod tests {
         assert_eq!(
             envelope_version,
             &WireValue::Array(vec![
-                WireValue::Unsigned(u64::from(crate::WIRE_VERSION_V26_10_18.0)),
-                WireValue::Unsigned(u64::from(crate::WIRE_VERSION_V26_10_18.1)),
-                WireValue::Unsigned(u64::from(crate::WIRE_VERSION_V26_10_18.2)),
+                WireValue::Unsigned(u64::from(crate::WIRE_VERSION_V26_10_21.0)),
+                WireValue::Unsigned(u64::from(crate::WIRE_VERSION_V26_10_21.1)),
+                WireValue::Unsigned(u64::from(crate::WIRE_VERSION_V26_10_21.2)),
             ])
         );
     }

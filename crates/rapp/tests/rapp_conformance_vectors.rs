@@ -14,15 +14,15 @@
 
 //! Verification of the versioned, implementation-independent RAPP corpus.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 use refineid_rapp::{
-    OperationId, PairId, ProfileName, WireValue, compute_grants_hash, compute_request_hash,
-    decode_deterministic_cbor, derive_pair_id, derive_session_id, encode_deterministic_cbor,
+    ProfileName, WireValue, compute_grants_hash, decode_deterministic_cbor, derive_pair_id,
+    derive_session_id, encode_deterministic_cbor,
 };
 use serde::Deserialize;
 
-const CORPUS: &str = include_str!("../../../docs/protocols/vectors/rapp-v26.10.18.json");
+const CORPUS: &str = include_str!("../../../docs/protocols/vectors/rapp-v26.10.21.json");
 
 #[derive(Debug, Deserialize)]
 struct Corpus {
@@ -31,7 +31,6 @@ struct Corpus {
     deterministic_cbor: Vec<CborVector>,
     identifier_derivation: Vec<IdentifierVector>,
     grants_hash: Vec<GrantsVector>,
-    request_hash: Vec<RequestVector>,
     rejected_cbor: Vec<RejectedCborVector>,
 }
 
@@ -78,19 +77,6 @@ struct GrantsVector {
 }
 
 #[derive(Debug, Deserialize)]
-struct RequestVector {
-    name: String,
-    pair_id_hex: String,
-    operation_id_hex: String,
-    profile: String,
-    action: String,
-    context: CorpusValue,
-    payload: CorpusValue,
-    preimage_cbor_hex: String,
-    sha256_hex: String,
-}
-
-#[derive(Debug, Deserialize)]
 struct RejectedCborVector {
     name: String,
     encoded_hex: String,
@@ -100,12 +86,11 @@ struct RejectedCborVector {
 #[test]
 fn corpus_metadata_and_names_are_stable() {
     let corpus = corpus();
-    assert_eq!(corpus.format, "fi.refineid.rapp.conformance-v1");
-    assert_eq!(corpus.protocol_document_version, "26.10.18");
+    assert_eq!(corpus.format, "fi.refineid.rapp.conformance");
+    assert_eq!(corpus.protocol_document_version, "26.10.21");
     assert_eq!(corpus.deterministic_cbor.len(), 15);
     assert_eq!(corpus.identifier_derivation.len(), 2);
     assert_eq!(corpus.grants_hash.len(), 3);
-    assert_eq!(corpus.request_hash.len(), 1);
     assert_eq!(corpus.rejected_cbor.len(), 8);
 
     let names = corpus
@@ -119,12 +104,6 @@ fn corpus_metadata_and_names_are_stable() {
                 .map(|vector| vector.name.as_str()),
         )
         .chain(corpus.grants_hash.iter().map(|vector| vector.name.as_str()))
-        .chain(
-            corpus
-                .request_hash
-                .iter()
-                .map(|vector| vector.name.as_str()),
-        )
         .chain(
             corpus
                 .rejected_cbor
@@ -203,51 +182,6 @@ fn grants_hash_normalizes_profile_order_and_matches_golden_values() {
 }
 
 #[test]
-fn request_hash_preimage_and_digest_match_golden_values() {
-    for vector in corpus().request_hash {
-        let pair_bytes = decode_hex(&vector.pair_id_hex);
-        let operation_bytes = decode_hex(&vector.operation_id_hex);
-        let pair_id = PairId::reconstruct(&pair_bytes).expect("pair id length");
-        let operation_id = OperationId::reconstruct(&operation_bytes).expect("operation id length");
-        let profile = ProfileName::parse(&vector.profile).expect("registered profile");
-        let context = to_wire_map(vector.context.clone());
-        let payload = to_wire_map(vector.payload.clone());
-
-        let preimage = WireValue::Array(vec![
-            WireValue::Text("RAPP-request-v1".into()),
-            WireValue::Bytes(pair_bytes),
-            WireValue::Bytes(operation_bytes),
-            WireValue::Text(profile.as_str().into()),
-            WireValue::Text(vector.action.clone()),
-            WireValue::Map(context.clone()),
-            WireValue::Map(payload.clone()),
-        ]);
-        assert_eq!(
-            encode_deterministic_cbor(&preimage).expect("request preimage must encode"),
-            decode_hex(&vector.preimage_cbor_hex),
-            "{} preimage",
-            vector.name
-        );
-
-        let actual = compute_request_hash(
-            pair_id,
-            operation_id,
-            profile,
-            &vector.action,
-            context,
-            payload,
-        )
-        .expect("request hash must compute");
-        assert_eq!(
-            actual.as_bytes().as_slice(),
-            decode_hex(&vector.sha256_hex),
-            "{} digest",
-            vector.name
-        );
-    }
-}
-
-#[test]
 fn forbidden_and_noncanonical_cbor_is_rejected_by_class() {
     for vector in corpus().rejected_cbor {
         let error = decode_deterministic_cbor(&decode_hex(&vector.encoded_hex))
@@ -258,13 +192,6 @@ fn forbidden_and_noncanonical_cbor_is_rejected_by_class() {
 
 fn corpus() -> Corpus {
     serde_json::from_str(CORPUS).expect("the checked-in RAPP corpus must be valid JSON")
-}
-
-fn to_wire_map(value: CorpusValue) -> BTreeMap<String, WireValue> {
-    match to_wire_value(value) {
-        WireValue::Map(map) => map,
-        _ => panic!("corpus request context and payload must be maps"),
-    }
 }
 
 fn to_wire_value(value: CorpusValue) -> WireValue {

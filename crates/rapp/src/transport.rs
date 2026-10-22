@@ -61,29 +61,29 @@ impl BinaryFrame {
 }
 
 /// Registered transport profile name of the BLE direct proximity profile.
-pub const BLE_PROFILE: &str = "fi.refineid.rapp.ble.v1";
+pub const BLE_PROFILE: &str = "fi.refineid.rapp.ble";
 /// Registered candidate identifier of the BLE profile.
-pub const BLE_CANDIDATE_ID: &str = "ble-direct-1";
+pub const BLE_CANDIDATE_ID: &str = "ble";
 /// Domain string opening every BLE routing preamble.
-const BLE_PREAMBLE_DOMAIN: &str = "RAPP-ble-v1";
+const BLE_PREAMBLE_DOMAIN: &str = "rapp-ble";
 /// Domain string opening every stream routing preamble.
-const STREAM_PREAMBLE_DOMAIN: &str = "RAPP-stream-v1";
+const STREAM_PREAMBLE_DOMAIN: &str = "rapp-stream";
 /// 128-bit RAPP service UUID the BLE offer entry carries.
 pub const BLE_SERVICE_UUID: &str = "7E39FD01-A6B5-4D78-9E11-37E28E9545F1";
 /// Offer-entry parameter key naming the BLE service UUID.
 const BLE_SERVICE_UUID_PARAMETER: &str = "service_uuid";
 /// Registered candidate identifier of the stream profile.
-pub const STREAM_CANDIDATE_ID: &str = "stream-1";
+pub const STREAM_CANDIDATE_ID: &str = "stream";
 
-/// A registered transport profile (RAPP v26.10.18 §2.2).
+/// A registered transport profile (RAPP v26.10.21 §2.2).
 ///
 /// Each profile fixes its candidate identifier and the exact offer-entry
 /// parameters, so a valid offer entry is fully determined by its profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TransportProfile {
-    /// `fi.refineid.rapp.ble.v1`.
+    /// `fi.refineid.rapp.ble`.
     Ble,
-    /// `fi.refineid.stream.v1`.
+    /// `fi.refineid.stream`.
     Stream,
 }
 

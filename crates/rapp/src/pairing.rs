@@ -17,7 +17,7 @@ use super::{
 const X25519_KEY_SIZE: usize = 32;
 
 /// Format version for encoded pairing records.
-pub const PAIR_RECORD_FORMAT_VERSION: u64 = 5;
+pub const PAIR_RECORD_FORMAT_VERSION: u64 = 6;
 
 /// Active long-term pairing material.
 ///
@@ -35,13 +35,21 @@ pub struct PairRecord {
     profiles: Vec<ProfileName>,
     created_at_ms: u64,
     storage_confirmed: bool,
+    forgotten_at_ms: Option<u64>,
 }
+
+/// Days a forgotten pairing keeps its key to deliver the `pairing_revoked`
+/// close on a later session (RAPP v26.10.21 section 4.6 item 3).
+const REVOCATION_NOTICE_DAYS: u64 = 30;
+const MILLISECONDS_PER_DAY: u64 = 86_400_000;
+/// How long a forgotten pairing keeps its key for the close.
+pub const REVOCATION_NOTICE_MS: u64 = REVOCATION_NOTICE_DAYS * MILLISECONDS_PER_DAY;
 
 impl PairRecord {
     /// Constructs a validated pairing record whose storage the peer has
     /// confirmed. The pairing flow builds its record unconfirmed and
     /// confirms it only through an [`ActivePairing`](crate::ActivePairing)
-    /// (RAPP v26.10.18 section 4.3 item 4).
+    /// (RAPP v26.10.21 section 4.3 item 4).
     ///
     /// # Errors
     /// [`PairRecordError`] on an all-zero static key or an empty profile set.
@@ -79,6 +87,7 @@ impl PairRecord {
             profiles,
             created_at_ms,
             storage_confirmed: true,
+            forgotten_at_ms: None,
         })
     }
 
@@ -146,6 +155,42 @@ impl PairRecord {
         self
     }
 
+    /// When its user forgot the pairing while no session was open: the
+    /// record serves nothing from then on and keeps its key only to deliver
+    /// the `pairing_revoked` close on the next session (section 4.6 item 2).
+    #[must_use]
+    pub const fn forgotten_at_ms(&self) -> Option<u64> {
+        self.forgotten_at_ms
+    }
+
+    /// The record its user forgot at `at_ms`, kept for the close.
+    #[must_use]
+    pub const fn forgotten(mut self, at_ms: u64) -> Self {
+        self.forgotten_at_ms = Some(at_ms);
+        self
+    }
+
+    /// Whether a forgotten record has kept its key for
+    /// [`REVOCATION_NOTICE_MS`]; it is then destroyed untold.
+    #[must_use]
+    pub const fn revocation_notice_expired(&self, now_ms: u64) -> bool {
+        match self.forgotten_at_ms {
+            Some(at_ms) => now_ms.saturating_sub(at_ms) >= REVOCATION_NOTICE_MS,
+            None => false,
+        }
+    }
+
+    /// The profiles a session of this record serves: the granted ones, or
+    /// none once the record is forgotten.
+    #[must_use]
+    pub fn serving_profiles(&self) -> &[ProfileName] {
+        if self.forgotten_at_ms.is_some() {
+            &[]
+        } else {
+            &self.profiles
+        }
+    }
+
     /// Exposes the private key only to sibling protocol machinery and stores.
     #[must_use]
     pub fn local_static_private(&self) -> &[u8; X25519_KEY_SIZE] {
@@ -166,6 +211,7 @@ impl fmt::Debug for PairRecord {
             .field("profiles", &self.profiles)
             .field("created_at_ms", &self.created_at_ms)
             .field("storage_confirmed", &self.storage_confirmed)
+            .field("forgotten_at_ms", &self.forgotten_at_ms)
             .finish()
     }
 }
@@ -322,6 +368,12 @@ pub fn encode_pair_record(record: &PairRecord) -> Result<Vec<u8>, PairRecordCode
             "storage_confirmed".to_owned(),
             WireValue::Bool(record.is_storage_confirmed()),
         ),
+        (
+            "forgotten_at_ms".to_owned(),
+            record
+                .forgotten_at_ms()
+                .map_or(WireValue::Null, WireValue::Unsigned),
+        ),
     ]));
     encode_deterministic_cbor(&value).map_err(|_| PairRecordCodecError::ProtocolFailure)
 }
@@ -348,6 +400,7 @@ pub fn decode_pair_record(bytes: &[u8]) -> Result<PairRecord, PairRecordCodecErr
         "profiles",
         "created_at_ms",
         "storage_confirmed",
+        "forgotten_at_ms",
     ];
     if map.keys().any(|key| !expected.contains(&key.as_str())) {
         return Err(PairRecordCodecError::InvalidInput);
@@ -373,6 +426,11 @@ pub fn decode_pair_record(bytes: &[u8]) -> Result<PairRecord, PairRecordCodecErr
         .collect::<Result<Vec<_>, _>>()?;
     let created_at_ms = take_unsigned(&mut map, "created_at_ms")?;
     let storage_confirmed = take_bool(&mut map, "storage_confirmed")?;
+    let forgotten_at_ms = match map.remove("forgotten_at_ms") {
+        Some(WireValue::Null) => None,
+        Some(WireValue::Unsigned(at_ms)) => Some(at_ms),
+        _ => return Err(PairRecordCodecError::InvalidInput),
+    };
     if !map.is_empty() {
         return Err(PairRecordCodecError::InvalidInput);
     }
@@ -387,10 +445,14 @@ pub fn decode_pair_record(bytes: &[u8]) -> Result<PairRecord, PairRecordCodecErr
         created_at_ms,
     )
     .map_err(PairRecordCodecError::InvalidRecord)?;
-    Ok(if storage_confirmed {
+    let record = if storage_confirmed {
         record
     } else {
         record.awaiting_storage_confirmation()
+    };
+    Ok(match forgotten_at_ms {
+        Some(at_ms) => record.forgotten(at_ms),
+        None => record,
     })
 }
 
@@ -502,9 +564,29 @@ fn take_text_array(
 #[cfg(test)]
 mod tests {
     use super::{
-        EndpointRole, GrantsHash, PairId, PairRecord, ProfileName, decode_pair_record,
-        decode_pair_records, encode_pair_record, encode_pair_records,
+        EndpointRole, GrantsHash, PairId, PairRecord, ProfileName, REVOCATION_NOTICE_MS,
+        decode_pair_record, decode_pair_records, encode_pair_record, encode_pair_records,
     };
+
+    const FORGOTTEN_AT_MS: u64 = 1_800_000_000_000;
+
+    #[test]
+    fn a_forgotten_record_round_trips_and_serves_nothing() {
+        let forgotten = test_record(0x42).forgotten(FORGOTTEN_AT_MS);
+        let decoded =
+            decode_pair_record(&encode_pair_record(&forgotten).expect("encode")).expect("decode");
+        assert_eq!(decoded.forgotten_at_ms(), Some(FORGOTTEN_AT_MS));
+        assert!(decoded.serving_profiles().is_empty());
+        assert!(!test_record(0x42).serving_profiles().is_empty());
+    }
+
+    #[test]
+    fn a_forgotten_record_keeps_its_key_for_the_notice_window() {
+        let forgotten = test_record(0x42).forgotten(FORGOTTEN_AT_MS);
+        assert!(!forgotten.revocation_notice_expired(FORGOTTEN_AT_MS + REVOCATION_NOTICE_MS - 1));
+        assert!(forgotten.revocation_notice_expired(FORGOTTEN_AT_MS + REVOCATION_NOTICE_MS));
+        assert!(!test_record(0x42).revocation_notice_expired(u64::MAX));
+    }
 
     fn test_record(id_byte: u8) -> PairRecord {
         PairRecord::new(

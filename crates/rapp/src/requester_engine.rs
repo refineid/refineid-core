@@ -1,639 +1,354 @@
-//! Total requester-side operation dispatcher.
+//! Requester-side operations of one session (RAPP v26.10.21 section 8).
 
 use core::fmt;
+use std::collections::BTreeSet;
 
 use super::{
-    CardOperationError, CardOperationResult, OperationId, OperationRequest, OperationState,
-    ProgressEvent, ProtocolErrorMessage, RequesterError, RequesterJournalRecord,
-    RequesterJournalStore, RequesterOperation, RequesterRecoveryStore, RequesterResultAction,
-    ResultError, ResultStatus, StatusReport, TypedMessage,
+    CardOperationError, CardOperationResult, CardStatusMessage, OperationId, OperationRequest,
+    ProgressEvent, ProtocolErrorMessage, ResultError, ResultStatus, TypedMessage,
 };
 
-/// All live and terminal requester operations for one paired endpoint.
-///
-/// Terminal entries remain addressable for authenticated status annotations.
-/// Integrations may remove them only after their durable retention policy has
-/// expired.
+/// The requester's operations on one session: one live at a time, every
+/// identifier used once. Nothing outlives the session; a requester that did
+/// not receive a result starts a new operation (section 8.1 item 3).
 #[derive(Debug, Default)]
 pub struct RequesterOperationEngine {
-    operations: Vec<RequesterOperation>,
-    recovered: Vec<RequesterJournalRecord>,
+    live: Option<OperationRequest>,
+    used: BTreeSet<OperationId>,
 }
 
 impl RequesterOperationEngine {
-    /// Construct an engine with no live or recovered operations.
+    /// An engine with no operation.
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            operations: Vec::new(),
-            recovered: Vec::new(),
+            live: None,
+            used: BTreeSet::new(),
         }
     }
 
-    /// Load and fail closed every journal left by a previous process. No
-    /// recovered operation returns to a live protocol state.
+    /// Start an operation; the returned message is its `operation.request`.
     ///
     /// # Errors
-    /// [`RequesterEngineError`] on a persistence failure or a record that
-    /// contradicts a machine invariant.
-    pub fn recover<S: RequesterRecoveryStore>(
-        store: &mut S,
-    ) -> Result<Self, RequesterEngineError<S::Error>> {
-        let mut records = store
-            .load_all()
-            .map_err(RequesterEngineError::Persistence)?;
-        for index in 0..records.len() {
-            if records[..index]
-                .iter()
-                .any(|record| record.operation_id == records[index].operation_id)
-            {
-                return Err(RequesterEngineError::LocalInvariantFailure);
-            }
-            // A request that was sent and never answered may have been
-            // executed after consent, so it is ambiguous until reconciled.
-            let next = match records[index].state {
-                OperationState::AwaitingConsent | OperationState::Prepared => {
-                    Some(OperationState::Cancelled)
-                }
-                OperationState::Requested
-                | OperationState::Committed
-                | OperationState::Executing => Some(OperationState::Ambiguous),
-                OperationState::ResultPending => Some(OperationState::DeliveryUncertain),
-                OperationState::None => {
-                    return Err(RequesterEngineError::LocalInvariantFailure);
-                }
-                state if state.is_terminal() => None,
-                _ => return Err(RequesterEngineError::LocalInvariantFailure),
-            };
-            if let Some(state) = next {
-                records[index].state = state;
-                store
-                    .persist(&records[index])
-                    .map_err(RequesterEngineError::Persistence)?;
-            }
-            let result_required = records[index].state == OperationState::DeliveryUncertain;
-            if result_required != records[index].retained_result.is_some() {
-                return Err(RequesterEngineError::LocalInvariantFailure);
-            }
-        }
-        Ok(Self {
-            operations: Vec::new(),
-            recovered: records,
-        })
-    }
-
-    /// Durably begin a unique operation before releasing its request frame.
-    ///
-    /// # Errors
-    /// [`RequesterEngineError`] on a duplicate identifier, an invalid
-    /// request, or a persistence failure.
-    pub fn begin<S: RequesterJournalStore>(
+    /// [`RequesterEngineError`] while another operation is live, on an
+    /// identifier this session has used, or on an invalid request.
+    pub fn begin(
         &mut self,
-        store: &mut S,
         request: OperationRequest,
-    ) -> Result<TypedMessage, RequesterEngineError<S::Error>> {
-        if self.contains(request.operation_id) {
+    ) -> Result<TypedMessage, RequesterEngineError> {
+        if self.live.is_some() {
+            return Err(RequesterEngineError::LiveOperation);
+        }
+        if self.used.contains(&request.operation_id) {
             return Err(RequesterEngineError::DuplicateLocalOperationId);
         }
-        let mut operation =
-            RequesterOperation::new(request).map_err(RequesterEngineError::InvalidLocalRequest)?;
-        let message = operation.begin(store).map_err(map_requester_error)?;
-        self.operations.push(operation);
-        Ok(message)
+        request
+            .validate()
+            .map_err(RequesterEngineError::InvalidLocalRequest)?;
+        self.used.insert(request.operation_id);
+        self.live = Some(request.clone());
+        Ok(TypedMessage::OperationRequest(request))
     }
 
-    /// Abandon one request locally; no message travels.
+    /// Stop waiting for the live operation; nothing travels. A result that
+    /// arrives for it later is ignored.
     ///
     /// # Errors
-    /// [`RequesterEngineError`] on an unknown operation, an illegal state,
-    /// or a persistence failure.
-    pub fn cancel<S: RequesterJournalStore>(
-        &mut self,
-        store: &mut S,
-        operation_id: OperationId,
-    ) -> Result<OperationState, RequesterEngineError<S::Error>> {
-        let operation = self
-            .operation_mut(operation_id)
-            .ok_or(RequesterEngineError::UnknownLocalOperation)?;
-        operation.cancel(store).map_err(map_requester_error)
+    /// [`RequesterEngineError::UnknownLocalOperation`] when it is not live.
+    pub fn cancel(&mut self, operation_id: OperationId) -> Result<(), RequesterEngineError> {
+        if self.live_id() != Some(operation_id) {
+            return Err(RequesterEngineError::UnknownLocalOperation);
+        }
+        self.live = None;
+        Ok(())
     }
 
-    /// Classify one authenticated inbound message without leaving sequencing
-    /// decisions to the platform integration.
+    /// Classify one authenticated inbound message.
     ///
     /// # Errors
-    /// [`RequesterEngineError`] on an authenticated protocol violation, a
-    /// local invariant failure, or a persistence failure.
-    pub fn receive<S: RequesterJournalStore>(
+    /// [`RequesterEngineError::AuthenticatedProtocolViolation`] when the
+    /// custodian sends a message only a requester sends, or a result that
+    /// does not answer the live request; the session closes.
+    pub fn receive(
         &mut self,
-        store: &mut S,
         message: TypedMessage,
-    ) -> Result<RequesterDispatch, RequesterEngineError<S::Error>> {
-        if let TypedMessage::OperationStatus(report) = &message {
-            return self.receive_status(store, *report);
-        }
-        if let TypedMessage::CardStatus(status) = &message {
-            return Ok(RequesterDispatch::CardStatus {
-                card_present: status.card_present,
-            });
-        }
-        if let TypedMessage::Error(error) = &message {
-            return Ok(match *error {
-                ProtocolErrorMessage::OperationFailed(_) => RequesterDispatch::PeerBusy,
-                ProtocolErrorMessage::UnknownOperation(operation_id) => {
-                    RequesterDispatch::PeerUnknownOperation(operation_id)
-                }
-                ProtocolErrorMessage::DuplicateOperation(operation_id) => {
-                    RequesterDispatch::PeerUnknownOperation(Some(operation_id))
-                }
-            });
-        }
-
-        let Some(operation_id) = referenced_operation_id(&message) else {
-            return Ok(RequesterDispatch::NotOperation(message));
-        };
-        let Some(index) = self.index(operation_id) else {
-            if matches!(message, TypedMessage::OperationProgress(_)) {
-                return Ok(RequesterDispatch::IgnoredProgress(operation_id));
-            }
-            return Ok(stale(operation_id));
-        };
-        if self.operations[index].record().state.is_terminal() {
-            if matches!(message, TypedMessage::OperationProgress(_)) {
-                return Ok(RequesterDispatch::IgnoredProgress(operation_id));
-            }
-            return Ok(stale(operation_id));
-        }
-
+    ) -> Result<RequesterDispatch, RequesterEngineError> {
         match message {
-            TypedMessage::OperationResult(result) => {
-                let action = self.operations[index]
-                    .receive_result(store, result)
-                    .map_err(map_requester_error)?;
-                Ok(match action {
-                    RequesterResultAction::SendAcknowledgment(message) => {
-                        RequesterDispatch::SendResultAcknowledgment {
-                            operation_id,
-                            message,
-                        }
+            TypedMessage::CardStatus(status) => Ok(RequesterDispatch::CardStatus(status)),
+            TypedMessage::Error(error) => Ok(self.receive_error(error)),
+            TypedMessage::OperationProgress(progress) => {
+                Ok(if self.live_id() == Some(progress.operation_id) {
+                    RequesterDispatch::Progress {
+                        operation_id: progress.operation_id,
+                        event: progress.event,
                     }
-                    RequesterResultAction::Terminal {
-                        state,
-                        status,
-                        error,
-                        remaining_retries,
-                        batch_signatures,
-                        acknowledgment,
-                    } => RequesterDispatch::Terminal {
-                        operation_id,
-                        state,
-                        status,
-                        error,
-                        remaining_retries,
-                        batch_signatures,
-                        acknowledgment,
-                    },
+                } else {
+                    RequesterDispatch::Ignored(progress.operation_id)
                 })
             }
-            TypedMessage::OperationProgress(progress) => {
-                match self.operations[index].receive_progress(&progress) {
-                    Ok(event) => match event {
-                        ProgressEvent::ConsentShown
-                        | ProgressEvent::WaitingForCard
-                        | ProgressEvent::CardWaitEnded => Ok(RequesterDispatch::Progress {
+            TypedMessage::OperationResult(result) => {
+                let operation_id = result.operation_id;
+                let Some(request) = self.live.take_if(|live| live.operation_id == operation_id)
+                else {
+                    return Ok(RequesterDispatch::Ignored(operation_id));
+                };
+                result
+                    .validate_for(operation_id, &request.operation)
+                    .map_err(|_| {
+                        RequesterEngineError::AuthenticatedProtocolViolation(
+                            RequesterViolation::InvalidResult,
+                        )
+                    })?;
+                Ok(match (result.status, result.response, result.error) {
+                    (ResultStatus::Completed, Some(response), None) => {
+                        RequesterDispatch::Completed {
                             operation_id,
-                            event,
-                        }),
-                        ProgressEvent::Unknown => {
-                            Ok(RequesterDispatch::IgnoredProgress(operation_id))
+                            result: response.typed_for(&request.operation).map_err(|_| {
+                                RequesterEngineError::AuthenticatedProtocolViolation(
+                                    RequesterViolation::InvalidResult,
+                                )
+                            })?,
                         }
-                    },
-                    Err(RequesterError::WrongState(_) | RequesterError::ReferenceMismatch) => {
-                        Ok(RequesterDispatch::IgnoredProgress(operation_id))
                     }
-                    Err(err) => Err(map_requester_error(err)),
+                    (status, None, Some(error)) => RequesterDispatch::Ended {
+                        operation_id,
+                        status,
+                        error,
+                    },
+                    _ => {
+                        return Err(RequesterEngineError::AuthenticatedProtocolViolation(
+                            RequesterViolation::InvalidResult,
+                        ));
+                    }
+                })
+            }
+            TypedMessage::OperationRequest(_) | TypedMessage::OperationRequestRefused(_) => {
+                Err(RequesterEngineError::AuthenticatedProtocolViolation(
+                    RequesterViolation::RequesterOnlyMessage,
+                ))
+            }
+            other => Ok(RequesterDispatch::NotOperation(other)),
+        }
+    }
+
+    /// The session closed: the live operation, if any, is lost with it.
+    pub fn session_closed(&mut self) -> Option<OperationId> {
+        self.used.clear();
+        self.live.take().map(|request| request.operation_id)
+    }
+
+    fn receive_error(&mut self, error: ProtocolErrorMessage) -> RequesterDispatch {
+        match error.operation_id {
+            Some(operation_id) if self.live_id() == Some(operation_id) => {
+                self.live = None;
+                RequesterDispatch::Refused {
+                    operation_id,
+                    error: error.error,
                 }
             }
-            _ => Err(RequesterEngineError::AuthenticatedProtocolViolation(
-                RequesterViolation::IllegalMessageForActiveOperation,
-            )),
+            Some(operation_id) => RequesterDispatch::Ignored(operation_id),
+            None => RequesterDispatch::PeerError(error.error),
         }
     }
 
-    /// Persist successful ack release before returning the result to the app.
-    ///
-    /// # Errors
-    /// [`RequesterEngineError`] on an unknown operation, an illegal state,
-    /// or a persistence failure.
-    pub fn acknowledgment_released<S: RequesterJournalStore>(
-        &mut self,
-        store: &mut S,
-        operation_id: OperationId,
-    ) -> Result<CardOperationResult, RequesterEngineError<S::Error>> {
-        let operation = self
-            .operation_mut(operation_id)
-            .ok_or(RequesterEngineError::UnknownLocalOperation)?;
-        operation
-            .acknowledgment_sent(store)
-            .map_err(map_requester_error)
-    }
-
-    /// Classify every operation when its authenticated session closes.
-    ///
-    /// # Errors
-    /// [`RequesterEngineError`] on an unclassifiable state or a persistence
-    /// failure.
-    pub fn session_closed<S: RequesterJournalStore>(
-        &mut self,
-        store: &mut S,
-    ) -> Result<Vec<(OperationId, OperationState)>, RequesterEngineError<S::Error>> {
-        let mut classified = Vec::new();
-        for operation in &mut self.operations {
-            if operation.record().state.is_terminal() {
-                continue;
-            }
-            let operation_id = operation.record().operation_id;
-            let state = operation
-                .session_closed(store)
-                .map_err(map_requester_error)?;
-            classified.push((operation_id, state));
-        }
-        Ok(classified)
-    }
-
-    /// Build a status query for either a live or recovered durable record.
-    ///
-    /// # Errors
-    /// [`RequesterEngineError::UnknownLocalOperation`] when this engine does
-    /// not hold the operation.
-    pub fn status_query(
-        &self,
-        operation_id: OperationId,
-    ) -> Result<TypedMessage, RequesterEngineError<core::convert::Infallible>> {
-        if self.contains(operation_id) {
-            Ok(TypedMessage::OperationStatusRequest(operation_id))
-        } else {
-            Err(RequesterEngineError::UnknownLocalOperation)
-        }
-    }
-
-    fn receive_status<S: RequesterJournalStore>(
-        &mut self,
-        store: &mut S,
-        report: StatusReport,
-    ) -> Result<RequesterDispatch, RequesterEngineError<S::Error>> {
-        let operation_id = report.operation_id;
-        if let Some(operation) = self.operation_mut(operation_id) {
-            operation
-                .annotate_status(store, report)
-                .map_err(map_requester_error)?;
-        } else if let Some(record) = self
-            .recovered
-            .iter_mut()
-            .find(|record| record.operation_id == operation_id)
-        {
-            if let Some(hash) = report.request_hash
-                && hash != record.request_hash
-            {
-                return Err(RequesterEngineError::AuthenticatedProtocolViolation(
-                    RequesterViolation::ReferenceMismatch,
-                ));
-            }
-            record.reconciliation = Some(report);
-            store
-                .persist(record)
-                .map_err(RequesterEngineError::Persistence)?;
-        } else {
-            return Ok(stale(operation_id));
-        }
-        Ok(RequesterDispatch::StatusAnnotated(operation_id))
-    }
-
-    fn operation_mut(&mut self, operation_id: OperationId) -> Option<&mut RequesterOperation> {
-        let index = self.index(operation_id)?;
-        self.operations.get_mut(index)
-    }
-
-    fn index(&self, operation_id: OperationId) -> Option<usize> {
-        self.operations
-            .iter()
-            .position(|operation| operation.record().operation_id == operation_id)
-    }
-
-    fn contains(&self, operation_id: OperationId) -> bool {
-        self.index(operation_id).is_some()
-            || self
-                .recovered
-                .iter()
-                .any(|record| record.operation_id == operation_id)
+    fn live_id(&self) -> Option<OperationId> {
+        self.live.as_ref().map(|request| request.operation_id)
     }
 }
 
-/// Required caller action after dispatching an inbound operation message.
+/// What an inbound message means to the requester.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RequesterDispatch {
-    /// Release this acknowledgment for the completed result.
-    SendResultAcknowledgment {
-        /// Acknowledged operation.
-        operation_id: OperationId,
-        /// Exact acknowledgment to send.
-        message: TypedMessage,
-    },
-    /// Operation reached the journaled terminal state; release the
-    /// acknowledgment it carries.
-    Terminal {
-        /// Terminated operation.
-        operation_id: OperationId,
-        /// Journaled terminal state.
-        state: OperationState,
-        /// Status the result reported.
-        status: ResultStatus,
-        /// Error the result named.
-        error: Option<ResultError>,
-        /// Remaining credential attempts the result reported.
-        remaining_retries: Option<u8>,
-        /// Signatures an interrupted batch made before it became ambiguous.
-        batch_signatures: Vec<Vec<u8>>,
-        /// The exact acknowledgment of the result.
-        acknowledgment: TypedMessage,
-    },
-    /// Authenticated status report was stored as a journal annotation.
-    StatusAnnotated(OperationId),
-    /// The custodian reported whether it can serve a card (section 8.4).
-    CardStatus {
-        /// True only while a card is coupled and answers.
-        card_present: bool,
-    },
-    /// Operation progress update reported by proxy.
+    /// The custodian's card is present, with its fingerprint, or absent
+    /// (section 8.4).
+    CardStatus(CardStatusMessage),
+    /// The live operation's state changed.
     Progress {
-        /// Active operation.
+        /// The live operation.
         operation_id: OperationId,
-        /// Specific progress event.
+        /// What changed.
         event: ProgressEvent,
     },
-    /// Stale or advisory progress update; ignore without sending error response.
-    IgnoredProgress(OperationId),
-    /// The peer could not admit the operation, such as while another runs.
-    PeerBusy,
-    /// Peer answered a stale reference; a normal race.
-    PeerUnknownOperation(Option<OperationId>),
-    /// Stale-reference race; answer without state change.
-    IgnoredStale {
-        /// Stale operation the peer referenced.
+    /// The live operation completed.
+    Completed {
+        /// The operation.
         operation_id: OperationId,
-        /// Unknown-operation answer to send.
-        response: TypedMessage,
+        /// Its answer.
+        result: CardOperationResult,
     },
-    /// Message is not an operation message; no operation effect.
+    /// The live operation ended without completing.
+    Ended {
+        /// The operation.
+        operation_id: OperationId,
+        /// Rejected or cancelled.
+        status: ResultStatus,
+        /// Why.
+        error: ResultError,
+    },
+    /// The custodian refused the request before admitting it (`busy`,
+    /// `duplicate_operation`).
+    Refused {
+        /// The refused operation.
+        operation_id: OperationId,
+        /// Why.
+        error: ResultError,
+    },
+    /// An `error` naming no operation.
+    PeerError(ResultError),
+    /// A message for an operation that is no longer live.
+    Ignored(OperationId),
+    /// Not an operation message.
     NotOperation(TypedMessage),
-}
-
-const fn stale(operation_id: OperationId) -> RequesterDispatch {
-    RequesterDispatch::IgnoredStale {
-        operation_id,
-        response: TypedMessage::Error(ProtocolErrorMessage::UnknownOperation(Some(operation_id))),
-    }
-}
-
-const fn referenced_operation_id(message: &TypedMessage) -> Option<OperationId> {
-    match message {
-        TypedMessage::OperationRequest(request) => Some(request.operation_id),
-        TypedMessage::OperationRequestRefused(refusal) => Some(refusal.reference.operation_id),
-        TypedMessage::OperationResultAck(reference) => Some(reference.operation_id),
-        TypedMessage::OperationResult(result) => Some(result.operation_id),
-        TypedMessage::OperationStatusRequest(operation_id) => Some(*operation_id),
-        TypedMessage::OperationStatus(report) => Some(report.operation_id),
-        TypedMessage::OperationProgress(progress) => Some(progress.reference.operation_id),
-        _ => None,
-    }
-}
-
-fn map_requester_error<E>(error: RequesterError<E>) -> RequesterEngineError<E> {
-    match error {
-        RequesterError::Persistence(error) => RequesterEngineError::Persistence(error),
-        RequesterError::Operation(_) => RequesterEngineError::AuthenticatedProtocolViolation(
-            RequesterViolation::InvalidOperationMessage,
-        ),
-        RequesterError::WrongState(_) => RequesterEngineError::AuthenticatedProtocolViolation(
-            RequesterViolation::IllegalOperationTransition,
-        ),
-        RequesterError::ReferenceMismatch => RequesterEngineError::AuthenticatedProtocolViolation(
-            RequesterViolation::ReferenceMismatch,
-        ),
-        RequesterError::UnknownOperationRace => RequesterEngineError::LocalRaceClassification,
-        RequesterError::MissingResult => RequesterEngineError::LocalInvariantFailure,
-    }
 }
 
 /// Authenticated protocol violation observed by the requester.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequesterViolation {
-    /// Message is illegal for the active operation's state.
-    IllegalMessageForActiveOperation,
-    /// Operation message failed its typed validation.
-    InvalidOperationMessage,
-    /// Message demands a transition the machine does not define.
-    IllegalOperationTransition,
-    /// Echoed request hash differs from the journal.
-    ReferenceMismatch,
+    /// The custodian sent a message only a requester sends.
+    RequesterOnlyMessage,
+    /// A result does not answer the live request.
+    InvalidResult,
 }
 
 /// Requester operation-engine failure.
-#[derive(Debug)]
-pub enum RequesterEngineError<E> {
-    /// Durable persistence failed; the message is not released.
-    Persistence(E),
-    /// Local request failed its typed validation.
-    InvalidLocalRequest(CardOperationError),
-    /// Local request reuses a known operation identifier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequesterEngineError {
+    /// Another operation of the session is live.
+    LiveOperation,
+    /// The identifier was already used on this session.
     DuplicateLocalOperationId,
-    /// Local call references an operation this engine does not hold.
+    /// The request failed its typed validation.
+    InvalidLocalRequest(CardOperationError),
+    /// The operation is not live.
     UnknownLocalOperation,
-    /// Local reference resolved to a stale-reference race.
-    LocalRaceClassification,
-    /// Local durable state contradicts a machine invariant.
-    LocalInvariantFailure,
-    /// Authenticated peer traffic violated the protocol.
+    /// Authenticated peer traffic violated the protocol; close the session.
     AuthenticatedProtocolViolation(RequesterViolation),
 }
 
-impl<E: fmt::Debug> fmt::Display for RequesterEngineError<E> {
+impl fmt::Display for RequesterEngineError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{self:?}")
     }
 }
 
-impl<E: fmt::Debug> core::error::Error for RequesterEngineError<E> {}
+impl core::error::Error for RequesterEngineError {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        CardOperation, OperationId, OperationProgressMessage, OperationReference, PairId,
-        ProfileName, ProgressEvent, RequestHash, SessionId,
-    };
+    use crate::{CardInspection, CardOperation, OperationResultMessage, ProfileName, ProxyFailure};
 
-    struct TestStore(Option<RequesterJournalRecord>);
-    impl RequesterJournalStore for TestStore {
-        type Error = ();
-        fn persist(&mut self, record: &RequesterJournalRecord) -> Result<(), ()> {
-            self.0 = Some(record.clone());
-            Ok(())
-        }
-    }
+    const START_MS: u64 = 1_000;
+    const LIFETIME_MS: u64 = 5_000;
 
-    fn inspection_request() -> OperationRequest {
+    fn inspection_request(byte: u8) -> OperationRequest {
         OperationRequest::reconstruct(
-            OperationId::from_array([0x11; 16]),
-            PairId::from_array([0x22; 16]),
-            SessionId::from_array([0x33; 16]),
+            OperationId::from_array([byte; 16]),
             ProfileName::CardStatus,
-            1_000,
-            5_000,
+            START_MS,
+            LIFETIME_MS,
             CardOperation::InspectCard,
         )
         .expect("registered card-status request")
     }
 
     #[test]
-    fn every_terminal_result_carries_its_acknowledgment() {
+    fn one_operation_is_live_at_a_time() {
         let mut engine = RequesterOperationEngine::new();
-        let mut store = TestStore(None);
-        let request = inspection_request();
-        let op_id = request.operation_id;
-        let reference = OperationReference {
-            operation_id: op_id,
-            request_hash: request.request_hash().expect("valid request hash"),
-        };
-        engine.begin(&mut store, request).expect("begin succeeds");
-
-        let rejected = crate::OperationResultMessage::rejection(
-            reference,
-            crate::ResultStatus::Rejected,
-            crate::ResultError::UserCancelled,
-        );
-        let dispatch = engine
-            .receive(&mut store, TypedMessage::OperationResult(rejected))
-            .expect("a rejection is dispatched");
-        let RequesterDispatch::Terminal {
-            operation_id,
-            state,
-            acknowledgment,
-            ..
-        } = dispatch
-        else {
-            panic!("a rejection is terminal");
-        };
-        assert_eq!(operation_id, op_id);
-        assert_eq!(state, OperationState::Rejected);
-        assert_eq!(acknowledgment, TypedMessage::OperationResultAck(reference));
+        engine.begin(inspection_request(1)).expect("first");
         assert_eq!(
-            store.0.as_ref().expect("operation record").state,
-            OperationState::Rejected
+            engine.begin(inspection_request(2)),
+            Err(RequesterEngineError::LiveOperation)
         );
     }
 
     #[test]
-    fn card_status_is_dispatched_to_the_platform() {
+    fn a_completed_result_ends_the_operation() {
         let mut engine = RequesterOperationEngine::new();
-        let mut store = TestStore(None);
+        let request = inspection_request(1);
+        engine.begin(request.clone()).expect("begin");
+        let answer = CardOperationResult::Inspection(CardInspection {
+            answer_to_reset: vec![1, 2, 3],
+        });
         let dispatch = engine
-            .receive(
-                &mut store,
-                TypedMessage::CardStatus(crate::message::CardStatusMessage {
-                    card_present: false,
-                }),
-            )
-            .expect("card status is dispatched");
+            .receive(TypedMessage::OperationResult(
+                OperationResultMessage::completed(request.operation_id, &answer),
+            ))
+            .expect("result");
         assert_eq!(
             dispatch,
-            RequesterDispatch::CardStatus {
-                card_present: false
+            RequesterDispatch::Completed {
+                operation_id: request.operation_id,
+                result: answer,
+            }
+        );
+        assert_eq!(
+            engine.begin(request),
+            Err(RequesterEngineError::DuplicateLocalOperationId)
+        );
+    }
+
+    #[test]
+    fn a_failure_result_ends_the_operation_with_its_error() {
+        let mut engine = RequesterOperationEngine::new();
+        let request = inspection_request(1);
+        engine.begin(request.clone()).expect("begin");
+        assert_eq!(
+            engine
+                .receive(TypedMessage::OperationResult(
+                    OperationResultMessage::failure(request.operation_id, ProxyFailure::UserDenied)
+                ))
+                .expect("result"),
+            RequesterDispatch::Ended {
+                operation_id: request.operation_id,
+                status: ResultStatus::Rejected,
+                error: ResultError::UserCancelled,
+            }
+        );
+        engine
+            .begin(inspection_request(2))
+            .expect("a new one may start");
+    }
+
+    #[test]
+    fn busy_refuses_the_live_request() {
+        let mut engine = RequesterOperationEngine::new();
+        let request = inspection_request(1);
+        engine.begin(request.clone()).expect("begin");
+        assert_eq!(
+            engine
+                .receive(TypedMessage::Error(ProtocolErrorMessage::busy(
+                    request.operation_id
+                )))
+                .expect("error"),
+            RequesterDispatch::Refused {
+                operation_id: request.operation_id,
+                error: ResultError::Busy,
             }
         );
     }
 
     #[test]
-    fn progress_updates_are_dispatched_without_changing_operation_state() {
+    fn a_result_for_another_operation_is_ignored() {
         let mut engine = RequesterOperationEngine::new();
-        let mut store = TestStore(None);
-        let request = inspection_request();
-        let op_id = request.operation_id;
-        let request_hash = request.request_hash().expect("valid request hash");
-
-        let _begin_msg = engine.begin(&mut store, request).expect("begin succeeds");
+        engine.begin(inspection_request(1)).expect("begin");
+        let other = OperationId::from_array([9; 16]);
         assert_eq!(
-            store.0.as_ref().expect("operation record").state,
-            OperationState::Requested
+            engine
+                .receive(TypedMessage::OperationResult(
+                    OperationResultMessage::failure(other, ProxyFailure::UserDenied)
+                ))
+                .expect("result"),
+            RequesterDispatch::Ignored(other)
         );
+    }
 
-        for event in [ProgressEvent::ConsentShown, ProgressEvent::WaitingForCard] {
-            let progress_msg = TypedMessage::OperationProgress(OperationProgressMessage {
-                reference: OperationReference {
-                    operation_id: op_id,
-                    request_hash,
-                },
-                event,
-            });
-
-            let dispatch = engine
-                .receive(&mut store, progress_msg)
-                .expect("receive progress succeeds");
-
-            assert_eq!(
-                dispatch,
-                RequesterDispatch::Progress {
-                    operation_id: op_id,
-                    event,
-                }
-            );
-        }
-
-        assert_eq!(
-            store.0.as_ref().expect("operation record").state,
-            OperationState::Requested
-        );
-
-        // Unknown event is tolerated as IgnoredProgress
-        let unknown_event_msg = TypedMessage::OperationProgress(OperationProgressMessage {
-            reference: OperationReference {
-                operation_id: op_id,
-                request_hash,
-            },
-            event: ProgressEvent::Unknown,
-        });
-        let dispatch = engine
-            .receive(&mut store, unknown_event_msg)
-            .expect("receive unknown progress succeeds");
-        assert_eq!(dispatch, RequesterDispatch::IgnoredProgress(op_id));
-
-        // Hash mismatch is tolerated as IgnoredProgress
-        let mismatched_msg = TypedMessage::OperationProgress(OperationProgressMessage {
-            reference: OperationReference {
-                operation_id: op_id,
-                request_hash: RequestHash::from_array([0x99; 32]),
-            },
-            event: ProgressEvent::WaitingForCard,
-        });
-        let dispatch = engine
-            .receive(&mut store, mismatched_msg)
-            .expect("receive mismatched progress succeeds");
-        assert_eq!(dispatch, RequesterDispatch::IgnoredProgress(op_id));
-
-        // Unknown operation ID is tolerated as IgnoredProgress
-        let unknown_op_msg = TypedMessage::OperationProgress(OperationProgressMessage {
-            reference: OperationReference {
-                operation_id: OperationId::from_array([0xee; 16]),
-                request_hash,
-            },
-            event: ProgressEvent::WaitingForCard,
-        });
-        let dispatch = engine
-            .receive(&mut store, unknown_op_msg)
-            .expect("receive unknown op progress succeeds");
-        assert_eq!(
-            dispatch,
-            RequesterDispatch::IgnoredProgress(OperationId::from_array([0xee; 16]))
-        );
+    #[test]
+    fn closing_the_session_loses_the_live_operation() {
+        let mut engine = RequesterOperationEngine::new();
+        let request = inspection_request(1);
+        engine.begin(request.clone()).expect("begin");
+        assert_eq!(engine.session_closed(), Some(request.operation_id));
+        assert_eq!(engine.session_closed(), None);
     }
 }

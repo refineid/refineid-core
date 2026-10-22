@@ -1,21 +1,22 @@
 // Copyright 2026 Petri Koistinen
 // Licensed under the Apache License, Version 2.0.
 
-//! Replay of the RAPP v26.10.18 transport-bound corpus sections: pairing
+//! Replay of the RAPP v26.10.21 transport-bound corpus sections: pairing
 //! offers, CPace KC2 transcripts per transport, both Noise transcripts per
 //! transport (cross-checked against snow).
 
 use refineid_rapp::{
     BinaryFrame, CpaceKc2Initiator, CpaceKc2Responder, HandshakeRole, OfferId, PairingOffer,
     TransportProfile,
-    cpace::calculate_generator_kc2,
+    cpace::{calculate_generator_kc2, generator_string, prepend_len},
     derive_pair_id, derive_session_id, encode_kc2_step1_frame,
     noise::{KkHandshakeState, x25519_public_key},
     standard_pairing_context_v2,
 };
 use serde::Deserialize;
+use sha2::{Sha512, digest::common::BlockSizeUser};
 
-const CORPUS: &str = include_str!("../../../docs/protocols/vectors/rapp-v26.10.18.json");
+const CORPUS: &str = include_str!("../../../docs/protocols/vectors/rapp-v26.10.21.json");
 
 #[derive(Deserialize)]
 struct Corpus {
@@ -200,22 +201,29 @@ fn kc2_transcripts_bind_the_transport_of_the_connection() {
     }
 }
 
-/// Generator string length: lv(DSI) + lv(PRS) + lv(zero padding) + lv(C) +
-/// lv(SID) (RAPP v26.10.18 §6.1.2).
+/// The Ristretto255 domain separator of draft-irtf-cfrg-cpace-21 section 6.2.
+const CPACE_DSI: &[u8] = b"CPaceRistretto255";
+
+/// The generator string is lv(DSI) || lv(PRS) || lv(zero padding) || lv(C) ||
+/// lv(SID), and its first three fields fill exactly one SHA-512 input block
+/// (RAPP v26.10.21 section 6.1.2).
 #[test]
-fn generator_strings_have_the_lengths_the_specification_states() {
-    const DSI: usize = 18;
-    const PRS: usize = 7;
-    const PADDING: usize = 103;
-    const SID: usize = 33;
-    const LONG_LENGTH_PREFIX: usize = 2;
-    for (vector, expected) in corpus().cpace_kc2.iter().zip([355_usize, 349]) {
-        assert_eq!(
-            DSI + PRS + PADDING + LONG_LENGTH_PREFIX + vector.context_length + SID,
-            expected,
-            "{}",
-            vector.name
+fn generator_strings_fill_one_hash_block_before_the_context() {
+    let block = <Sha512 as BlockSizeUser>::block_size();
+    for vector in corpus().cpace_kc2 {
+        let context = bytes(&vector.context_hex);
+        let sid = bytes(&vector.offer_id_hex);
+        assert_eq!(context.len(), vector.context_length, "{}", vector.name);
+        let generator = generator_string(
+            CPACE_DSI,
+            vector.pairing_code.as_bytes(),
+            &context,
+            &sid,
+            block,
         );
+        let tail = [prepend_len(&context), prepend_len(&sid)].concat();
+        assert!(generator.ends_with(&tail), "{}", vector.name);
+        assert_eq!(generator.len() - tail.len(), block, "{}", vector.name);
     }
 }
 

@@ -6,7 +6,7 @@ use refineid_rapp::{
 };
 use serde::Deserialize;
 
-const MODEL: &str = include_str!("../../../docs/protocols/rapp-state-machine-v26.10.18.yaml");
+const MODEL: &str = include_str!("../../../docs/protocols/rapp-state-machine-v26.10.21.yaml");
 
 #[derive(Deserialize)]
 struct Model {
@@ -56,28 +56,19 @@ fn model() -> Model {
 const fn all_guards() -> Guards {
     Guards {
         user_initiated: true,
-        offer_valid_and_supported: true,
-        offer_live: true,
+        local_user_action: true,
         transcript_matches: true,
         granted_sets_equal: true,
-        pairing_paired: true,
         initiation_permitted: true,
+        pairing_routed: true,
         ready_parameters_match: true,
-        deadline_not_expired: true,
-        another_session_live: true,
-        admission_permitted: true,
-        hash_echo_matches: true,
-        hash_matches: true,
-        zero_transmissions: true,
-        proven_no_transmission: true,
-        profile_has_no_consequential_command: true,
     }
 }
 
 fn roles(rule: &Rule) -> &'static [EndpointRole] {
     match rule.role.as_str() {
         "requester" => &[EndpointRole::Requester],
-        "proxy" => &[EndpointRole::Proxy],
+        "custodian" => &[EndpointRole::Proxy],
         "both" => &[EndpointRole::Requester, EndpointRole::Proxy],
         value => panic!("unknown formal role {value}"),
     }
@@ -88,27 +79,17 @@ fn guard_is_registered(guard: &str) -> bool {
         guard,
         "user_initiated"
             | "local_user_action"
-            | "offer_valid_and_supported"
-            | "offer_live"
             | "transcript_matches"
             | "granted_sets_equal"
-            | "pairing_paired"
             | "initiation_permitted"
+            | "pairing_routed"
             | "ready_parameters_match"
-            | "deadline_not_expired"
-            | "another_session_live"
-            | "admission_permitted"
-            | "hash_echo_matches"
-            | "hash_matches"
-            | "zero_transmissions"
-            | "proven_no_transmission"
-            | "profile_has_no_consequential_command"
     )
 }
 
 #[test]
 fn formal_document_version_is_the_reviewed_revision() {
-    assert_eq!(model().document_version, "26.10.18");
+    assert_eq!(model().document_version, "26.10.21");
 }
 
 #[test]
@@ -222,118 +203,93 @@ fn assert_actions(actual: &[Action], rule: &Rule, from: &str, endpoint_role: End
 )]
 const fn formal_action_name(action: Action) -> &'static str {
     match action {
-        Action::GenerateOfferId => "generate_offer_id",
-        Action::GeneratePairingSecret => "generate_pairing_secret",
-        Action::StartOfferExpiry => "start_offer_expiry",
+        Action::GenerateOffer => "generate_offer",
+        Action::GeneratePairingCode => "generate_pairing_code",
+        Action::AdvertisePairingMode => "advertise_pairing_mode",
         Action::DisplayPairingCode => "display_pairing_code",
         Action::HidePairingCode => "hide_pairing_code",
-        Action::SelectOneCandidate => "select_one_candidate",
-        Action::ConnectCandidate => "connect_candidate",
-        Action::PreparePairingResponder => "prepare_pairing_responder",
-        Action::BeginPairingHandshakeInitiator => "begin_pairing_handshake_initiator",
+        Action::DestroyOffer => "destroy_offer",
+        Action::StartPairingBackoff => "start_pairing_backoff",
+        Action::ShowAttemptsExhausted => "show_attempts_exhausted",
+        Action::ReadOffer => "read_offer",
+        Action::BeginCpaceInitiator => "begin_cpace_initiator",
+        Action::ReserveAttempt => "reserve_attempt",
+        Action::CountFailedAttempt => "count_failed_attempt",
+        Action::ShowWrongCode => "show_wrong_code",
+        Action::ConsumeOffer => "consume_offer",
+        Action::DerivePairingSecret => "derive_pairing_secret",
+        Action::BeginPairingHandshake => "begin_pairing_handshake",
         Action::DeriveChannelIdentifiers => "derive_channel_identifiers",
         Action::DestroyPairingSecret => "destroy_pairing_secret",
-        Action::StopAcceptingCandidates => "stop_accepting_candidates",
         Action::SendPairingHello => "send_pairing_hello",
-        Action::ShowPeerAndRequestedGrants => "show_peer_and_requested_grants",
-        Action::DiscardCandidate => "discard_candidate",
-        Action::RetainOffer => "retain_offer",
-        Action::InvalidateOffer => "invalidate_offer",
+        Action::SendPairingConfirm => "send_pairing_confirm",
+        Action::SendPairingAbortBestEffort => "send_pairing_abort_best_effort",
+        Action::DestroyCandidateKeys => "destroy_candidate_keys",
         Action::CloseCandidate => "close_candidate",
         Action::StorePairRecordAtomically => "store_pair_record_atomically",
         Action::SendPairingStored => "send_pairing_stored",
+        Action::MarkRecordConfirmed => "mark_record_confirmed",
         Action::ClosePairingChannel => "close_pairing_channel",
-        Action::SendPairingAbortBestEffort => "send_pairing_abort_best_effort",
-        Action::DestroyCandidateKeys => "destroy_candidate_keys",
+        Action::RevokeUnconfirmedPairRecord => "revoke_unconfirmed_pair_record",
+        Action::MarkRecordRevoked => "mark_record_revoked",
+        Action::SendClosePairingRevoked => "send_close_pairing_revoked",
+        Action::CloseSession => "close_session",
+        Action::DestroyPairKeys => "destroy_pair_keys",
+        Action::WithdrawIdentity => "withdraw_identity",
         Action::ShowConnected => "show_connected",
         Action::ShowPairedDisconnected => "show_paired_disconnected",
-        Action::ShowChecking => "show_checking",
-        Action::ShowDisconnecting => "show_disconnecting",
-        Action::ShowConnectionStopped => "show_connection_stopped",
-        Action::ShowRevoked => "show_revoked",
-        Action::SendCloseBestEffort(_) => "send_close_best_effort",
-        Action::CloseSession => "close_session",
-        Action::RetainRevocationKey => "retain_revocation_key",
-        Action::RevokeUnconfirmedPairRecord => "revoke_unconfirmed_pair_record",
-        Action::DestroyPairKeys => "destroy_pair_keys",
-        Action::DestroyRelayTokens => "destroy_relay_tokens",
-        Action::ClearPairMetadata => "clear_pair_metadata",
+        Action::ShowForgotten => "show_forgotten",
+        Action::ShowPeerForgot => "show_peer_forgot",
         Action::ClearResidualPairRecord => "clear_residual_pair_record",
-        Action::RecordPeerInitiated => "record_peer_initiated",
-        Action::SelectOneTransport => "select_one_transport",
         Action::OpenTransport => "open_transport",
-        Action::AssociatePairingFromRendezvous => "associate_pairing_from_rendezvous",
+        Action::SendSessionPreamble => "send_session_preamble",
         Action::BeginKkInitiator => "begin_kk_initiator",
         Action::BeginKkResponder => "begin_kk_responder",
         Action::DeriveSessionIdentifiers => "derive_session_identifiers",
         Action::SendSessionReady => "send_session_ready",
-        Action::SendErrorBusy => "send_error_busy",
-        Action::StartAuthenticatedLiveness => "start_authenticated_liveness",
-        Action::BlockNewOperations => "block_new_operations",
-        Action::StartBackoffAndDeadline => "start_backoff_and_deadline",
-        Action::ResetBackoff => "reset_backoff",
+        Action::SendCardStatus => "send_card_status",
+        Action::StartLiveness => "start_liveness",
+        Action::SendLivenessPing => "send_liveness_ping",
         Action::RecordPeerCloseReason => "record_peer_close_reason",
-        Action::CountCandidateFailureHint => "count_candidate_failure_hint",
+        Action::SendCloseUserDisconnect => "send_close_user_disconnect",
+        Action::SendCloseNormal => "send_close_normal",
+        Action::SendCloseProtocolViolation => "send_close_protocol_violation",
+        Action::SendCloseServiceWithdrawn => "send_close_service_withdrawn",
+        Action::SendCloseCardUnavailable => "send_close_card_unavailable",
         Action::NoteCloseNoticeImpossible => "note_close_notice_impossible",
         Action::ProceedWithoutCloseNotice => "proceed_without_close_notice",
-        Action::AbortCandidate => "abort_candidate",
         Action::DestroySessionMaterial => "destroy_session_material",
         Action::DestroyCredentialBuffers => "destroy_credential_buffers",
-        Action::PersistTerminalSessionRecord => "persist_terminal_session_record",
-        Action::ValidateSchemaHashExpiryAndContext => "validate_schema_hash_expiry_and_context",
+        Action::ShowDisconnecting => "show_disconnecting",
+        Action::ShowConnectionStopped => "show_connection_stopped",
         Action::StartExpiryClock => "start_expiry_clock",
-        Action::BeginSafePrerequisiteReads => "begin_safe_prerequisite_reads",
-        Action::PresentConsentPerProfile => "present_consent_per_profile",
+        Action::SendErrorBusy => "send_error_busy",
+        Action::SendErrorDuplicateOperation => "send_error_duplicate_operation",
+        Action::SendResultUnauthorized => "send_result_unauthorized",
+        Action::SendResultUnsupportedParameter => "send_result_unsupported_parameter",
+        Action::SendProgressQueued => "send_progress_queued",
+        Action::PresentConsent => "present_consent",
+        Action::SendProgressConsentShown => "send_progress_consent_shown",
         Action::DismissConsent => "dismiss_consent",
-        Action::ClearOperationCredentials => "clear_operation_credentials",
-        Action::ClearAllActiveCredentials => "clear_all_active_credentials",
-        Action::RemoveRejectedCredentialAndDerivedState => {
-            "remove_rejected_credential_and_derived_state"
-        }
-        Action::SendPrepared => "send_prepared",
+        Action::ExecuteRead => "execute_read",
+        Action::CheckRetryFloor => "check_retry_floor",
+        Action::ConsumeCardCommand => "consume_card_command",
+        Action::SendProgressWaitingForCard => "send_progress_waiting_for_card",
+        Action::SendProgressCardWaitEnded => "send_progress_card_wait_ended",
+        Action::PromptPinAgain => "prompt_pin_again",
         Action::SendResultCompleted => "send_result_completed",
-        Action::SendResultDenied => "send_result_denied",
-        Action::SendResultCancelled => "send_result_cancelled",
-        Action::SendResultRejected => "send_result_rejected",
-        Action::SendResultRetryPolicyRefused => "send_result_retry_policy_refused",
-        Action::SendResultCredentialRejectedBestEffort => {
-            "send_result_credential_rejected_best_effort"
-        }
-        Action::SendResultAmbiguousBestEffort => "send_result_ambiguous_best_effort",
-        Action::RequestSessionClose => "request_session_close",
-        Action::RequestSessionCloseCredentialRejected => {
-            "request_session_close_credential_rejected"
-        }
-        Action::RevokePairAfterCredentialRejection => "revoke_pair_after_credential_rejection",
-        Action::RequestSessionCloseAmbiguous => "request_session_close_ambiguous",
-        Action::SendOperationCancel => "send_operation_cancel",
-        Action::DurablyWriteCommitBeforeTransmission => "durably_write_commit_before_transmission",
-        Action::ConsumeNonClonableCommand => "consume_non_clonable_command",
-        Action::IncrementTransmissionCountOnce => "increment_transmission_count_once",
-        Action::RecordAdvisoryCancel => "record_advisory_cancel",
+        Action::SendResultUserCancelled => "send_result_user_cancelled",
+        Action::SendResultRetryFloor => "send_result_retry_floor",
+        Action::SendResultCardError => "send_result_card_error",
+        Action::SendResultOperationExpired => "send_result_operation_expired",
+        Action::ClearOperationCredentials => "clear_operation_credentials",
         Action::ContinueCardExchangeLocally => "continue_card_exchange_locally",
-        Action::NoteResultDeliveryImpossible => "note_result_delivery_impossible",
-        Action::PersistResult => "persist_result",
-        Action::PersistRejection => "persist_rejection",
-        Action::PersistCancelled => "persist_cancelled",
-        Action::PersistAmbiguous => "persist_ambiguous",
-        Action::PersistCompleted => "persist_completed",
-        Action::PersistDeliveryUncertain => "persist_delivery_uncertain",
-        Action::RetainResultUnderLocalStorage => "retain_result_under_local_storage",
+        Action::DiscardAnswer => "discard_answer",
+        Action::ReleaseCard => "release_card",
+        Action::ShowProgress => "show_progress",
         Action::ReleaseResult => "release_result",
-        Action::ProhibitRetry => "prohibit_retry",
-        Action::ProhibitCardRetry => "prohibit_card_retry",
-        Action::ComputeRequestHash => "compute_request_hash",
-        Action::JournalRequest => "journal_request",
-        Action::JournalPrepared => "journal_prepared",
-        Action::JournalCommitIntentDurably => "journal_commit_intent_durably",
-        Action::JournalCompleted => "journal_completed",
-        Action::JournalDenied => "journal_denied",
-        Action::JournalCancelled => "journal_cancelled",
-        Action::JournalRejected => "journal_rejected",
-        Action::JournalCredentialRejected => "journal_credential_rejected",
-        Action::JournalAmbiguous => "journal_ambiguous",
-        Action::SendResultAck => "send_result_ack",
+        Action::ReleaseFailure => "release_failure",
+        Action::ReportOperationLost => "report_operation_lost",
     }
 }
 
@@ -452,12 +408,14 @@ fn operation_event(value: &str) -> OperationEvent {
 
 const PAIRING_STATES: &[(&str, PairingState)] = &[
     ("unpaired", PairingState::Unpaired),
-    ("offer_active", PairingState::OfferActive),
+    ("offering", PairingState::Offering),
+    ("exchanging", PairingState::Exchanging),
     ("handshaking", PairingState::Handshaking),
     ("confirming", PairingState::Confirming),
     ("storage_confirming", PairingState::StorageConfirming),
     ("paired_disconnected", PairingState::PairedDisconnected),
     ("paired_connected", PairingState::PairedConnected),
+    ("revoking", PairingState::Revoking),
     ("revoked", PairingState::Revoked),
 ];
 
@@ -466,7 +424,6 @@ const SESSION_STATES: &[(&str, SessionState)] = &[
     ("connecting", SessionState::Connecting),
     ("authenticating", SessionState::Authenticating),
     ("healthy", SessionState::Healthy),
-    ("checking", SessionState::Checking),
     ("closing", SessionState::Closing),
     ("closed", SessionState::Closed),
 ];
@@ -474,81 +431,68 @@ const SESSION_STATES: &[(&str, SessionState)] = &[
 const OPERATION_STATES: &[(&str, OperationState)] = &[
     ("none", OperationState::None),
     ("requested", OperationState::Requested),
+    ("queued", OperationState::Queued),
     ("awaiting_consent", OperationState::AwaitingConsent),
-    ("prepared", OperationState::Prepared),
-    ("committed", OperationState::Committed),
     ("executing", OperationState::Executing),
-    ("result_pending", OperationState::ResultPending),
     ("completed", OperationState::Completed),
-    ("denied", OperationState::Denied),
-    ("cancelled", OperationState::Cancelled),
     ("rejected", OperationState::Rejected),
-    ("credential_rejected", OperationState::CredentialRejected),
-    ("ambiguous", OperationState::Ambiguous),
-    ("delivery_uncertain", OperationState::DeliveryUncertain),
+    ("cancelled", OperationState::Cancelled),
 ];
 
 const PAIRING_EVENTS: &[(&str, PairingEvent)] = &[
-    ("create_offer", PairingEvent::CreateOffer),
-    ("offer_scanned", PairingEvent::OfferScanned),
-    ("candidate_connected", PairingEvent::CandidateConnected),
+    ("start_pairing", PairingEvent::StartPairing),
     (
         "offer_expired_or_cancelled",
         PairingEvent::OfferExpiredOrCancelled,
     ),
+    ("attempt_started", PairingEvent::AttemptStarted),
+    ("code_entered", PairingEvent::CodeEntered),
+    ("attempt_failed", PairingEvent::AttemptFailed),
+    ("last_attempt_failed", PairingEvent::LastAttemptFailed),
+    ("key_confirmed", PairingEvent::KeyConfirmed),
     (
         "handshake_authenticated",
         PairingEvent::HandshakeAuthenticated,
     ),
     ("handshake_failed", PairingEvent::HandshakeFailed),
-    ("both_users_confirmed", PairingEvent::BothUsersConfirmed),
-    ("peer_storage_confirmed", PairingEvent::PeerStorageConfirmed),
+    ("hello_verified", PairingEvent::HelloVerified),
+    ("both_confirmed", PairingEvent::BothConfirmed),
     (
         "denied_aborted_or_timed_out",
         PairingEvent::DeniedAbortedOrTimedOut,
     ),
+    ("peer_storage_confirmed", PairingEvent::PeerStorageConfirmed),
     ("session_healthy", PairingEvent::SessionHealthy),
     ("session_closed", PairingEvent::SessionClosed),
     ("forget_pairing", PairingEvent::ForgetPairing),
-    (
-        "authenticated_protocol_violation",
-        PairingEvent::AuthenticatedProtocolViolation,
-    ),
-    ("local_revoke", PairingEvent::LocalRevoke),
+    ("revocation_notice_sent", PairingEvent::RevocationNoticeSent),
+    ("notice_window_expired", PairingEvent::NoticeWindowExpired),
     ("peer_revocation_notice", PairingEvent::PeerRevocationNotice),
 ];
 
 const SESSION_EVENTS: &[(&str, SessionEvent)] = &[
     ("connect", SessionEvent::Connect),
-    ("transport_accepted", SessionEvent::TransportAccepted),
+    ("preamble_received", SessionEvent::PreambleReceived),
     ("transport_connected", SessionEvent::TransportConnected),
     ("transport_failed", SessionEvent::TransportFailed),
-    ("user_disconnect", SessionEvent::UserDisconnect),
     ("handshake_complete", SessionEvent::HandshakeComplete),
     (
-        "second_session_detected",
-        SessionEvent::SecondSessionDetected,
+        "handshake_complete_while_revoking",
+        SessionEvent::HandshakeCompleteWhileRevoking,
     ),
     ("ready_verified", SessionEvent::ReadyVerified),
     ("candidate_failure", SessionEvent::CandidateFailure),
-    ("busy_received", SessionEvent::BusyReceived),
-    ("peer_close_received", SessionEvent::PeerCloseReceived),
     (
         "authenticated_protocol_violation",
         SessionEvent::AuthenticatedProtocolViolation,
     ),
-    ("liveness_missed", SessionEvent::LivenessMissed),
-    ("liveness_restored", SessionEvent::LivenessRestored),
-    (
-        "liveness_deadline_expired",
-        SessionEvent::LivenessDeadlineExpired,
-    ),
+    ("peer_silent", SessionEvent::PeerSilent),
+    ("silence_limit_reached", SessionEvent::SilenceLimitReached),
+    ("user_disconnect", SessionEvent::UserDisconnect),
     ("local_close_requested", SessionEvent::LocalCloseRequested),
-    ("credential_rejected", SessionEvent::CredentialRejected),
-    (
-        "card_completion_ambiguous",
-        SessionEvent::CardCompletionAmbiguous,
-    ),
+    ("service_withdrawn", SessionEvent::ServiceWithdrawn),
+    ("card_unavailable", SessionEvent::CardUnavailable),
+    ("peer_close_received", SessionEvent::PeerCloseReceived),
     (
         "session_integrity_failed",
         SessionEvent::SessionIntegrityFailed,
@@ -558,96 +502,48 @@ const SESSION_EVENTS: &[(&str, SessionEvent)] = &[
         SessionEvent::CloseRequestedByPairing,
     ),
     (
-        "local_security_shutdown",
-        SessionEvent::LocalSecurityShutdown,
-    ),
-    (
         "close_complete_or_deadline",
         SessionEvent::CloseCompleteOrDeadline,
     ),
 ];
 
 const OPERATION_EVENTS: &[(&str, OperationEvent)] = &[
-    ("operation_request_sent", OperationEvent::RequestSent),
+    ("request_received", OperationEvent::RequestReceived),
+    ("request_duplicate", OperationEvent::RequestDuplicate),
+    ("request_while_busy", OperationEvent::RequestWhileBusy),
+    ("request_unauthorized", OperationEvent::RequestUnauthorized),
+    ("request_unsupported", OperationEvent::RequestUnsupported),
+    ("card_held_elsewhere", OperationEvent::CardHeldElsewhere),
     (
-        "operation_request_received",
-        OperationEvent::RequestReceived,
+        "card_acquired_for_consent",
+        OperationEvent::CardAcquiredForConsent,
     ),
-    ("request_valid", OperationEvent::RequestValid),
     (
-        "request_invalid_or_unsupported",
-        OperationEvent::RequestInvalidOrUnsupported,
+        "card_acquired_for_read",
+        OperationEvent::CardAcquiredForRead,
     ),
-    ("cancel_received", OperationEvent::CancelReceived),
-    ("request_expired", OperationEvent::RequestExpired),
     ("user_denied", OperationEvent::UserDenied),
-    ("retry_policy_refused", OperationEvent::RetryPolicyRefused),
-    (
-        "invalid_can_or_pin1_or_pin2",
-        OperationEvent::InvalidCanOrPin1OrPin2,
-    ),
-    ("safe_reads_complete", OperationEvent::SafeReadsComplete),
-    (
-        "user_approved_and_proxy_ready",
-        OperationEvent::UserApprovedAndProxyReady,
-    ),
-    ("valid_commit", OperationEvent::ValidCommit),
-    ("begin_card_command", OperationEvent::BeginCardCommand),
-    (
-        "crash_recovered_without_terminal_result",
-        OperationEvent::CrashRecoveredWithoutTerminalResult,
-    ),
+    ("user_approved", OperationEvent::UserApproved),
+    ("waiting_for_card", OperationEvent::WaitingForCard),
+    ("card_found", OperationEvent::CardFound),
+    ("wrong_pin", OperationEvent::WrongPin),
+    ("retry_floor_refused", OperationEvent::RetryFloorRefused),
     ("card_success", OperationEvent::CardSuccess),
-    ("card_policy_rejection", OperationEvent::CardPolicyRejection),
-    (
-        "card_removed_before_transmit",
-        OperationEvent::CardRemovedBeforeTransmit,
-    ),
-    (
-        "card_removed_or_transport_uncertain",
-        OperationEvent::CardRemovedOrTransportUncertain,
-    ),
-    (
-        "session_closed_post_commit",
-        OperationEvent::SessionClosedPostCommit,
-    ),
-    ("valid_result_ack", OperationEvent::ValidResultAck),
-    (
-        "session_closed_before_ack",
-        OperationEvent::SessionClosedBeforeAck,
-    ),
-    ("prepared_received", OperationEvent::PreparedReceived),
-    (
-        "cancel_sent_or_request_expired",
-        OperationEvent::CancelSentOrRequestExpired,
-    ),
-    ("commit_sent", OperationEvent::CommitSent),
+    ("card_error", OperationEvent::CardError),
+    ("request_expired", OperationEvent::RequestExpired),
+    ("session_closed", OperationEvent::SessionClosed),
+    ("request_sent", OperationEvent::RequestSent),
+    ("progress_received", OperationEvent::ProgressReceived),
     (
         "result_completed_received",
         OperationEvent::ResultCompletedReceived,
-    ),
-    (
-        "result_denied_received",
-        OperationEvent::ResultDeniedReceived,
-    ),
-    (
-        "result_cancelled_received",
-        OperationEvent::ResultCancelledReceived,
     ),
     (
         "result_rejected_received",
         OperationEvent::ResultRejectedReceived,
     ),
     (
-        "result_credential_rejected_received",
-        OperationEvent::ResultCredentialRejectedReceived,
-    ),
-    (
-        "result_ambiguous_received",
-        OperationEvent::ResultAmbiguousReceived,
-    ),
-    (
-        "session_closed_pre_commit",
-        OperationEvent::SessionClosedPreCommit,
+        "result_cancelled_received",
+        OperationEvent::ResultCancelledReceived,
     ),
 ];

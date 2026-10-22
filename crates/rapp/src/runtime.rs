@@ -1,13 +1,12 @@
-//! Established-session liveness composition.
+//! An established session with its liveness (RAPP v26.10.21 section 8.3).
 
 use super::{
     AuthenticatedViolation, BinaryFrame, CloseReason, EndpointError, EstablishedEndpoint,
-    LivenessConfig, LivenessDecision, LivenessError, LivenessMessage, LivenessTracker, PairStore,
-    PingChallenge, PongDisposition, ReceiveOutcome, SecurityOutcome, SessionCloseMessage,
-    TypedMessage,
+    LivenessDecision, LivenessMessage, LivenessTracker, OperationViolation, PingChallenge,
+    PongDisposition, ReceiveOutcome, SecurityOutcome, SessionCloseMessage, TypedMessage,
 };
 
-/// Established encrypted session with authenticated cryptographic liveness.
+/// Established encrypted session with authenticated liveness.
 #[derive(Debug)]
 pub struct EstablishedSessionRuntime {
     endpoint: EstablishedEndpoint,
@@ -15,19 +14,14 @@ pub struct EstablishedSessionRuntime {
 }
 
 impl EstablishedSessionRuntime {
-    /// Start liveness tracking over an established endpoint.
-    ///
-    /// # Errors
-    /// [`LivenessError`] when the policy fails validation.
-    pub fn new(
-        endpoint: EstablishedEndpoint,
-        config: LivenessConfig,
-        now_ms: u64,
-    ) -> Result<Self, LivenessError> {
-        Ok(Self {
+    /// Start liveness over an established endpoint, with the peer last heard
+    /// at `now_ms`.
+    #[must_use]
+    pub const fn new(endpoint: EstablishedEndpoint, now_ms: u64) -> Self {
+        Self {
             endpoint,
-            liveness: LivenessTracker::new(config, now_ms)?,
-        })
+            liveness: LivenessTracker::new(now_ms),
+        }
     }
 
     /// Underlying cryptographic endpoint.
@@ -53,17 +47,33 @@ impl EstablishedSessionRuntime {
     /// # Errors
     /// [`EndpointError`] when the session is already closed or the notice
     /// cannot be sealed; the session is closed either way.
-    pub fn close_with_reason(
-        &mut self,
-        reason: CloseReason,
-    ) -> Result<BinaryFrame, EndpointError<()>> {
-        let notice = TypedMessage::SessionClose(SessionCloseMessage {
-            reason,
-            last_received_sequence: self.last_received_sequence(),
-        });
+    pub fn close_with_reason(&mut self, reason: CloseReason) -> Result<BinaryFrame, EndpointError> {
+        let notice = TypedMessage::SessionClose(SessionCloseMessage { reason });
         let sealed = self.endpoint.send(&notice);
         self.close_session();
         sealed
+    }
+
+    /// Close after an operation engine found the peer's traffic violating
+    /// the protocol; the pairing stays.
+    pub fn close_for_operation_violation(
+        &mut self,
+        violation: OperationViolation,
+    ) -> RuntimeReceive {
+        self.liveness.close();
+        match self.endpoint.close_for_operation_violation(violation) {
+            ReceiveOutcome::ViolationClosed {
+                violation,
+                outcome,
+                notice,
+            } => RuntimeReceive::ViolationClosed {
+                violation,
+                outcome,
+                notice,
+            },
+            ReceiveOutcome::SessionClosed(outcome) => RuntimeReceive::SessionClosed(outcome),
+            ReceiveOutcome::Message(message) => RuntimeReceive::Message(message),
+        }
     }
 
     /// Receive one encrypted frame and consume liveness messages centrally.
@@ -71,33 +81,31 @@ impl EstablishedSessionRuntime {
     /// # Errors
     /// [`RuntimeError`] separating receive-path faults from pong-response
     /// send faults.
-    pub fn receive<S: PairStore>(
+    pub fn receive(
         &mut self,
-        store: &mut S,
         frame: &BinaryFrame,
         now_ms: u64,
-    ) -> Result<RuntimeReceive, RuntimeError<S::Error>> {
-        match self
+    ) -> Result<RuntimeReceive, RuntimeError> {
+        let outcome = self
             .endpoint
-            .receive(store, frame, now_ms)
-            .map_err(RuntimeError::Receive)?
-        {
+            .receive(frame, now_ms)
+            .map_err(RuntimeError::Receive)?;
+        if matches!(outcome, ReceiveOutcome::Message(_)) {
+            self.liveness.heard(now_ms);
+        }
+        match outcome {
             ReceiveOutcome::Message(TypedMessage::LivenessPing(ping)) => {
                 let reply = TypedMessage::LivenessPong(LivenessMessage {
                     challenge: ping.challenge,
-                    last_received_sequence: self.last_received_sequence(),
                 });
                 let frame = self.endpoint.send(&reply).map_err(RuntimeError::Send)?;
                 Ok(RuntimeReceive::Send(frame))
             }
             ReceiveOutcome::Message(TypedMessage::LivenessPong(pong)) => {
-                match self.liveness.receive_pong(now_ms, pong.challenge) {
-                    PongDisposition::Accepted => {
-                        let outcome = self.endpoint.liveness_restored();
-                        Ok(RuntimeReceive::LivenessRestored(outcome))
-                    }
-                    PongDisposition::IgnoredUnmatched => Ok(RuntimeReceive::IgnoredStalePong),
-                }
+                Ok(match self.liveness.receive_pong(now_ms, pong.challenge) {
+                    PongDisposition::Accepted => RuntimeReceive::LivenessConfirmed,
+                    PongDisposition::IgnoredUnmatched => RuntimeReceive::IgnoredStalePong,
+                })
             }
             ReceiveOutcome::Message(TypedMessage::SessionClose(close)) => {
                 self.close_session();
@@ -108,60 +116,51 @@ impl EstablishedSessionRuntime {
                 self.liveness.close();
                 Ok(RuntimeReceive::SessionClosed(outcome))
             }
-            ReceiveOutcome::PairRevoked { violation, outcome } => {
+            ReceiveOutcome::ViolationClosed {
+                violation,
+                outcome,
+                notice,
+            } => {
                 self.liveness.close();
-                Ok(RuntimeReceive::PairRevoked { violation, outcome })
+                Ok(RuntimeReceive::ViolationClosed {
+                    violation,
+                    outcome,
+                    notice,
+                })
             }
         }
     }
 
-    /// Advance the injected monotonic liveness policy.
+    /// Advance the liveness clock.
     ///
     /// # Errors
-    /// [`EndpointError`] when a due probe cannot be sealed or sent.
+    /// [`EndpointError`] when a due ping cannot be sealed.
     pub fn poll(
         &mut self,
         now_ms: u64,
         next_challenge: PingChallenge,
-        jitter_ms: i64,
-    ) -> Result<RuntimePoll, EndpointError<()>> {
-        match self.liveness.poll(now_ms, next_challenge, jitter_ms) {
+    ) -> Result<RuntimePoll, EndpointError> {
+        match self.liveness.poll(now_ms, next_challenge) {
             LivenessDecision::NoAction => Ok(RuntimePoll::NoAction),
             LivenessDecision::SendPing(challenge) => {
-                let ping = TypedMessage::LivenessPing(LivenessMessage {
-                    challenge,
-                    last_received_sequence: self.last_received_sequence(),
-                });
+                let ping = TypedMessage::LivenessPing(LivenessMessage { challenge });
                 Ok(RuntimePoll::Send(self.endpoint.send(&ping)?))
             }
-            LivenessDecision::ProbeMissed { next_probe_at_ms } => {
-                let outcome = self.endpoint.liveness_missed();
-                Ok(RuntimePoll::Checking {
-                    next_probe_at_ms,
-                    outcome,
-                })
-            }
-            LivenessDecision::CloseSession => {
-                let outcome = self.endpoint.close_for_connectivity_failure();
-                Ok(RuntimePoll::SessionClosed(outcome))
-            }
+            LivenessDecision::CloseSession => Ok(RuntimePoll::SessionClosed(
+                self.endpoint.close_for_silence(),
+            )),
             LivenessDecision::AlreadyClosed => Ok(RuntimePoll::AlreadyClosed),
         }
     }
-
-    fn last_received_sequence(&self) -> u64 {
-        self.endpoint.last_received_sequence().unwrap_or(0)
-    }
 }
 
-/// Runtime failure preserves whether the fault occurred while receiving from
-/// a durable paired endpoint or while producing a local response frame.
+/// Where a runtime fault occurred.
 #[derive(Debug)]
-pub enum RuntimeError<E> {
-    /// Fault while receiving from the durable paired endpoint.
-    Receive(EndpointError<E>),
+pub enum RuntimeError {
+    /// Fault while receiving.
+    Receive(EndpointError),
     /// Fault while producing a local response frame.
-    Send(EndpointError<()>),
+    Send(EndpointError),
 }
 
 /// Outcome of receiving one encrypted frame.
@@ -171,39 +170,35 @@ pub enum RuntimeReceive {
     Message(TypedMessage),
     /// Frame to send; a liveness answer was produced centrally.
     Send(BinaryFrame),
-    /// Exact challenge echo restored liveness.
-    LivenessRestored(SecurityOutcome),
-    /// Pong matched no outstanding ping; discarded, not liveness proof.
+    /// The outstanding ping was answered.
+    LivenessConfirmed,
+    /// Pong matched no outstanding ping; discarded.
     IgnoredStalePong,
-    /// Session closed; ordered effects to execute.
+    /// A frame failed authentication; the session closed.
     SessionClosed(SecurityOutcome),
     /// The peer closed the session with an authenticated notice.
     PeerClosed(CloseReason),
-    /// Pairing revoked after an authenticated violation.
-    PairRevoked {
-        /// Violation that revoked the pairing.
+    /// Authenticated traffic violated the protocol; the session closed and
+    /// the pairing stays. Deliver `notice`, then drop the link.
+    ViolationClosed {
+        /// The violation.
         violation: AuthenticatedViolation,
-        /// Ordered security effects to execute.
+        /// Effects the endpoint carries out.
         outcome: SecurityOutcome,
+        /// The sealed `protocol_violation` close, when it could be sealed.
+        notice: Option<BinaryFrame>,
     },
 }
 
-/// Outcome of advancing the liveness policy.
+/// Outcome of advancing the liveness clock.
 #[derive(Debug)]
 pub enum RuntimePoll {
     /// Nothing is due.
     NoAction,
-    /// Liveness probe frame to send.
+    /// Ping frame to send.
     Send(BinaryFrame),
-    /// Probe unanswered; new operations blocked during recovery.
-    Checking {
-        /// Monotonic time of the next probe.
-        next_probe_at_ms: u64,
-        /// Ordered security effects to execute.
-        outcome: SecurityOutcome,
-    },
-    /// Liveness hard deadline closed the session.
+    /// The silence limit closed the session.
     SessionClosed(SecurityOutcome),
-    /// Session was already closed.
+    /// The session was already closed.
     AlreadyClosed,
 }

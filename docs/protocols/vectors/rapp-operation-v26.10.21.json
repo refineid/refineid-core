@@ -1,0 +1,230 @@
+{
+  "format": "fi.refineid.rapp.operation-vectors",
+  "protocol_document_version": "26.10.21",
+  "provenance": "Derived by tools/rapp-vectors/generate.py from the inputs in this file and RAPP v26.10.21 sections 7.1, 9 and 10.3: the CDDL of every operation message body, with standard-library primitives checked against RFC 7748 section 6.1, RFC 8439 section 2.8.2 and RFC 9496 appendix A.1; the engine is not used.",
+  "fixed_inputs": {
+    "operation_id_request": "11111111111111111111111111111111",
+    "operation_id_result": "22222222222222222222222222222222",
+    "operation_id_error": "66666666666666666666666666666666",
+    "pair_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "digest_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "digest_sha384": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "signature_bytes": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "certificate_der": "30820102",
+    "atr": "3b8f80",
+    "origin": "https://example.test",
+    "document_name": "Contract.pdf",
+    "holder_name": "Test Holder",
+    "card_id": "99999999A",
+    "issuance_date": "2026-01-01",
+    "expiration_date": "2031-01-01",
+    "local_start_ms": 1000,
+    "expires_after_ms": 120000,
+    "batch_document_names": [
+      "Contract.pdf",
+      "Annex.pdf"
+    ],
+    "batch_digests_sha256": [
+      "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "abababababababababababababababababababababababababababababababab"
+    ],
+    "batch_signatures": [
+      "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
+    ],
+    "error_messages": {
+      "busy": "Another operation of this session is live.",
+      "duplicate_operation": "The operation identifier was already used on this session.",
+      "operation_failed": "The operation could not be carried out."
+    }
+  },
+  "vectors": [
+    {
+      "name": "request-inspect-card",
+      "message_type": "OperationRequest",
+      "body_hex": "a666616374696f6e6c696e73706563745f6361726467636f6e74657874a0677061796c6f6164a06770726f66696c657766692e726566696e6569642e636172642d7374617475736c6f7065726174696f6e5f6964501111111111111111111111111111111170657870697265735f61667465725f6d731a0001d4c0"
+    },
+    {
+      "name": "request-read-identity",
+      "message_type": "OperationRequest",
+      "body_hex": "a666616374696f6e6d726561645f6964656e7469747967636f6e74657874a0677061796c6f6164a06770726f66696c657766692e726566696e6569642e636172642d7374617475736c6f7065726174696f6e5f6964501111111111111111111111111111111170657870697265735f61667465725f6d731a0001d4c0"
+    },
+    {
+      "name": "request-read-certificate-authentication",
+      "message_type": "OperationRequest",
+      "body_hex": "a666616374696f6e70726561645f636572746966696361746567636f6e74657874a0677061796c6f6164a1646b696e646e61757468656e7469636174696f6e6770726f66696c65781a66692e726566696e6569642e61757468656e7469636174696f6e6c6f7065726174696f6e5f6964501111111111111111111111111111111170657870697265735f61667465725f6d731a0001d4c0"
+    },
+    {
+      "name": "request-read-certificate-signature",
+      "message_type": "OperationRequest",
+      "body_hex": "a666616374696f6e70726561645f636572746966696361746567636f6e74657874a0677061796c6f6164a1646b696e64697369676e61747572656770726f66696c65781c66692e726566696e6569642e646f63756d656e742d7369676e696e676c6f7065726174696f6e5f6964501111111111111111111111111111111170657870697265735f61667465725f6d731a0001d4c0"
+    },
+    {
+      "name": "request-browser-authenticate",
+      "message_type": "OperationRequest",
+      "body_hex": "a666616374696f6e7462726f777365725f61757468656e74696361746567636f6e74657874a1666f726967696e7468747470733a2f2f6578616d706c652e74657374677061796c6f6164a3666469676573745820cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc69616c676f726974686d707273615f706b6373315f7368613235366b6b65795f70726f66696c65687273615f333037326770726f66696c65781a66692e726566696e6569642e61757468656e7469636174696f6e6c6f7065726174696f6e5f6964501111111111111111111111111111111170657870697265735f61667465725f6d731a0001d4c0"
+    },
+    {
+      "name": "request-sign-document",
+      "message_type": "OperationRequest",
+      "body_hex": "a666616374696f6e6d7369676e5f646f63756d656e7467636f6e74657874a16d646f63756d656e745f6e616d656c436f6e74726163742e706466677061796c6f6164a3666469676573745830dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd69616c676f726974686d6c65636473615f7368613338346b6b65795f70726f66696c656a65636473615f703338346770726f66696c65781c66692e726566696e6569642e646f63756d656e742d7369676e696e676c6f7065726174696f6e5f6964501111111111111111111111111111111170657870697265735f61667465725f6d731a0001d4c0"
+    },
+    {
+      "name": "request-batch-sign-documents",
+      "message_type": "OperationRequest",
+      "body_hex": "a666616374696f6e7462617463685f7369676e5f646f63756d656e747367636f6e74657874a16e646f63756d656e745f6e616d6573826c436f6e74726163742e70646669416e6e65782e706466677061796c6f6164a36764696765737473825820cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc5820abababababababababababababababababababababababababababababababab69616c676f726974686d6c65636473615f7368613235366b6b65795f70726f66696c656a65636473615f703235366770726f66696c65781c66692e726566696e6569642e646f63756d656e742d7369676e696e676c6f7065726174696f6e5f6964501111111111111111111111111111111170657870697265735f61667465725f6d731a0001d4c0"
+    },
+    {
+      "name": "result-completed-inspection",
+      "message_type": "OperationResult",
+      "body_hex": "a36673746174757369636f6d706c6574656468726573706f6e7365a263617472433b8f8072737570706f727465645f70726f66696c6573837766692e726566696e6569642e636172642d737461747573781a66692e726566696e6569642e61757468656e7469636174696f6e781c66692e726566696e6569642e646f63756d656e742d7369676e696e676c6f7065726174696f6e5f69645022222222222222222222222222222222"
+    },
+    {
+      "name": "result-completed-identity",
+      "message_type": "OperationResult",
+      "body_hex": "a36673746174757369636f6d706c6574656468726573706f6e7365a567636172645f6964693939393939393939416c6365727469666963617465738144308201026d69737375616e63655f646174656a323032362d30312d30316f65787069726174696f6e5f646174656a323033312d30312d303170636172645f686f6c6465725f6e616d656b5465737420486f6c6465726c6f7065726174696f6e5f69645022222222222222222222222222222222"
+    },
+    {
+      "name": "result-completed-certificate",
+      "message_type": "OperationResult",
+      "body_hex": "a36673746174757369636f6d706c6574656468726573706f6e7365a16b636572746966696361746544308201026c6f7065726174696f6e5f69645022222222222222222222222222222222"
+    },
+    {
+      "name": "result-completed-signature",
+      "message_type": "OperationResult",
+      "body_hex": "a36673746174757369636f6d706c6574656468726573706f6e7365a1697369676e61747572655840eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee6c6f7065726174696f6e5f69645022222222222222222222222222222222"
+    },
+    {
+      "name": "result-completed-batch-signatures",
+      "message_type": "OperationResult",
+      "body_hex": "a36673746174757369636f6d706c6574656468726573706f6e7365a16a7369676e617475726573825840eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee5840efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef6c6f7065726174696f6e5f69645022222222222222222222222222222222"
+    },
+    {
+      "name": "result-rejected-user-cancelled",
+      "message_type": "OperationResult",
+      "body_hex": "a3656572726f726e757365725f63616e63656c6c6564667374617475736872656a65637465646c6f7065726174696f6e5f69645022222222222222222222222222222222"
+    },
+    {
+      "name": "result-cancelled-operation-expired",
+      "message_type": "OperationResult",
+      "body_hex": "a3656572726f72716f7065726174696f6e5f65787069726564667374617475736963616e63656c6c65646c6f7065726174696f6e5f69645022222222222222222222222222222222"
+    },
+    {
+      "name": "result-rejected-card-error",
+      "message_type": "OperationResult",
+      "body_hex": "a3656572726f726a636172645f6572726f72667374617475736872656a65637465646c6f7065726174696f6e5f69645022222222222222222222222222222222"
+    },
+    {
+      "name": "result-rejected-unsupported-parameter",
+      "message_type": "OperationResult",
+      "body_hex": "a3656572726f7275756e737570706f727465645f706172616d65746572667374617475736872656a65637465646c6f7065726174696f6e5f69645022222222222222222222222222222222"
+    },
+    {
+      "name": "result-rejected-invalid-lifetime",
+      "message_type": "OperationResult",
+      "body_hex": "a3656572726f7270696e76616c69645f6c69666574696d65667374617475736872656a65637465646c6f7065726174696f6e5f69645022222222222222222222222222222222"
+    },
+    {
+      "name": "result-rejected-unauthorized",
+      "message_type": "OperationResult",
+      "body_hex": "a3656572726f726c756e617574686f72697a6564667374617475736872656a65637465646c6f7065726174696f6e5f69645022222222222222222222222222222222"
+    },
+    {
+      "name": "result-rejected-retry-floor",
+      "message_type": "OperationResult",
+      "body_hex": "a3656572726f726b72657472795f666c6f6f72667374617475736872656a65637465646c6f7065726174696f6e5f69645022222222222222222222222222222222"
+    },
+    {
+      "name": "result-rejected-operation-failed",
+      "message_type": "OperationResult",
+      "body_hex": "a3656572726f72706f7065726174696f6e5f6661696c6564667374617475736872656a65637465646c6f7065726174696f6e5f69645022222222222222222222222222222222"
+    },
+    {
+      "name": "error-busy",
+      "message_type": "Error",
+      "body_hex": "a3676d657373616765782a416e6f74686572206f7065726174696f6e206f6620746869732073657373696f6e206973206c6976652e6a6572726f725f6e616d6564627573796c6f7065726174696f6e5f69645066666666666666666666666666666666"
+    },
+    {
+      "name": "error-duplicate-operation",
+      "message_type": "Error",
+      "body_hex": "a3676d657373616765783a546865206f7065726174696f6e206964656e7469666965722077617320616c72656164792075736564206f6e20746869732073657373696f6e2e6a6572726f725f6e616d65736475706c69636174655f6f7065726174696f6e6c6f7065726174696f6e5f69645066666666666666666666666666666666"
+    },
+    {
+      "name": "error-operation-failed-bare",
+      "message_type": "Error",
+      "body_hex": "a2676d6573736167657827546865206f7065726174696f6e20636f756c64206e6f742062652063617272696564206f75742e6a6572726f725f6e616d65706f7065726174696f6e5f6661696c6564"
+    },
+    {
+      "name": "progress-queued",
+      "message_type": "OperationProgress",
+      "body_hex": "a2656576656e74667175657565646c6f7065726174696f6e5f69645022222222222222222222222222222222"
+    },
+    {
+      "name": "progress-consent-shown",
+      "message_type": "OperationProgress",
+      "body_hex": "a2656576656e746d636f6e73656e745f73686f776e6c6f7065726174696f6e5f69645022222222222222222222222222222222"
+    },
+    {
+      "name": "progress-waiting-for-card",
+      "message_type": "OperationProgress",
+      "body_hex": "a2656576656e747077616974696e675f666f725f636172646c6f7065726174696f6e5f69645022222222222222222222222222222222"
+    },
+    {
+      "name": "progress-card-wait-ended",
+      "message_type": "OperationProgress",
+      "body_hex": "a2656576656e746f636172645f776169745f656e6465646c6f7065726174696f6e5f69645022222222222222222222222222222222"
+    },
+    {
+      "name": "card-status-present",
+      "message_type": "CardStatus",
+      "body_hex": "a26c636172645f70726573656e74f57763657274696669636174655f66696e6765727072696e745820cab073fa360de7ddf0ba6dc576fb3b7436560aa6a8ffc2995cfd9be474fd1542"
+    },
+    {
+      "name": "card-status-absent",
+      "message_type": "CardStatus",
+      "body_hex": "a26c636172645f70726573656e74f47763657274696669636174655f66696e6765727072696e7458200000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "name": "pairing-stored",
+      "message_type": "PairingStored",
+      "body_hex": "a167706169725f696450aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ],
+  "rejected": [
+    {
+      "name": "card-status-present-without-fingerprint",
+      "message_type": "CardStatus",
+      "body_hex": "a26c636172645f70726573656e74f57763657274696669636174655f66696e6765727072696e7458200000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "name": "card-status-absent-with-fingerprint",
+      "message_type": "CardStatus",
+      "body_hex": "a26c636172645f70726573656e74f47763657274696669636174655f66696e6765727072696e745820cab073fa360de7ddf0ba6dc576fb3b7436560aa6a8ffc2995cfd9be474fd1542"
+    },
+    {
+      "name": "result-completed-with-error",
+      "message_type": "OperationResult",
+      "body_hex": "a4656572726f72706f7065726174696f6e5f6661696c65646673746174757369636f6d706c6574656468726573706f6e7365a1697369676e61747572655840eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee6c6f7065726174696f6e5f69645022222222222222222222222222222222"
+    },
+    {
+      "name": "result-rejected-busy",
+      "message_type": "OperationResult",
+      "body_hex": "a3656572726f726462757379667374617475736872656a65637465646c6f7065726174696f6e5f69645022222222222222222222222222222222"
+    },
+    {
+      "name": "result-unregistered-error",
+      "message_type": "OperationResult",
+      "body_hex": "a3656572726f7272696e76616c69645f63726564656e7469616c667374617475736872656a65637465646c6f7065726174696f6e5f69645022222222222222222222222222222222"
+    },
+    {
+      "name": "progress-unregistered-event",
+      "message_type": "OperationProgress",
+      "body_hex": "a2656576656e7467756e6b6e6f776e6c6f7065726174696f6e5f69645022222222222222222222222222222222"
+    },
+    {
+      "name": "error-unregistered-name",
+      "message_type": "Error",
+      "body_hex": "a2676d65737361676568556e6b6e6f776e2e6a6572726f725f6e616d6571756e6b6e6f776e5f6f7065726174696f6e"
+    }
+  ]
+}

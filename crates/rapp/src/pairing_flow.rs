@@ -285,8 +285,7 @@ impl PairingConfirmation {
         if self.peer_hello.is_some() {
             return Err(PairingError::DuplicateMessage);
         }
-        let TypedMessage::PairingHello(hello) =
-            open_typed(&mut self.channel, frame, self.pair_id, now_ms)?
+        let TypedMessage::PairingHello(hello) = open_typed(&mut self.channel, frame, now_ms)?
         else {
             return Err(PairingError::UnexpectedMessage);
         };
@@ -364,8 +363,7 @@ impl PairingConfirmation {
         if self.peer_grants.is_some() {
             return Err(PairingError::DuplicateMessage);
         }
-        let TypedMessage::PairingConfirm(confirm) =
-            open_typed(&mut self.channel, frame, self.pair_id, now_ms)?
+        let TypedMessage::PairingConfirm(confirm) = open_typed(&mut self.channel, frame, now_ms)?
         else {
             return Err(PairingError::UnexpectedMessage);
         };
@@ -475,8 +473,7 @@ impl PairingStorage {
         if self.peer_stored {
             return Err(PairingError::DuplicateMessage);
         }
-        let TypedMessage::PairingStored(stored) =
-            open_typed(&mut self.channel, frame, self.pair_id, now_ms)?
+        let TypedMessage::PairingStored(stored) = open_typed(&mut self.channel, frame, now_ms)?
         else {
             return Err(PairingError::UnexpectedMessage);
         };
@@ -625,11 +622,10 @@ fn seal_typed(
 fn open_typed(
     channel: &mut SecureChannel,
     frame: &BinaryFrame,
-    pair_id: super::PairId,
     now_ms: u64,
 ) -> Result<TypedMessage, PairingError> {
     let envelope = channel.open(frame).map_err(PairingError::Open)?;
-    TypedMessage::from_envelope(envelope, pair_id, now_ms).map_err(PairingError::Message)
+    TypedMessage::from_envelope(envelope, now_ms).map_err(PairingError::Message)
 }
 
 /// Pairing attempt failure. Once Noise authenticated the peer, semantic/open

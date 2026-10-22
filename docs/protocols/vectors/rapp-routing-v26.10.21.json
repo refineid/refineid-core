@@ -1,7 +1,7 @@
 {
-  "format": "fi.refineid.rapp.routing-vectors-v1",
-  "protocol_document_version": "26.10.18",
-  "provenance": "Generated independently from RAPP v26.10.10 sections 2.2.1 and 4.3 and hierarchy specification section 4.3 with Python hmac/hashlib and an RFC 7748 X25519 ladder checked against RFC 7748 section 6.1, then checked against crates/rapp. The static keys and pair identifier equal those of rapp-withdrawal-v26.10.10.json; private keys, pair identifiers and nonces are fixed synthetic values.",
+  "format": "fi.refineid.rapp.routing-vectors",
+  "protocol_document_version": "26.10.21",
+  "provenance": "Derived by tools/rapp-vectors/generate.py from the inputs in this file and RAPP v26.10.21 sections 2.2.1 and 4.3 and hierarchy specification section 4.3, with standard-library primitives checked against RFC 7748 section 6.1, RFC 8439 section 2.8.2 and RFC 9496 appendix A.1; the engine is not used.",
   "pair_keys": [
     {
       "name": "custodian-and-requester-agree",
@@ -9,8 +9,8 @@
       "custodian_static_private_hex": "1111111111111111111111111111111111111111111111111111111111111111",
       "requester_static_private_hex": "2222222222222222222222222222222222222222222222222222222222222222",
       "shared_secret_hex": "9e004098efc091d4ec2663b4e9f5cfd4d7064571690b4bea97ab146ab9f35056",
-      "discovery_key_hex": "4d090746267b1303784ab464ae6b145effa657c6fb2dac3735f67f04657975ae",
-      "routing_key_hex": "c031bdd97af66540c19c4367f9d9bdd673f7784fb7d5084eb5633c40d282be76"
+      "discovery_key_hex": "7c44754280e7d29c707412ccc7f099d8595a9e2474a89dc19b0679739a643373",
+      "routing_key_hex": "7f53bec7c7ba119a6ece0406cb83e55d954effe7a22a795b5e73d80522a5a3e5"
     }
   ],
   "discovery_hint": [
@@ -18,101 +18,102 @@
       "name": "epoch-zero",
       "unix_time_seconds": 0,
       "epoch": 0,
-      "discovery_hint_hex": "e4c547fe6a9673b1"
+      "discovery_hint_hex": "4e392ee3a4368182"
     },
     {
       "name": "epoch-1990560",
       "unix_time_seconds": 1791504899,
       "epoch": 1990560,
-      "discovery_hint_hex": "054526c9fdd3b180"
+      "discovery_hint_hex": "731f265bc8f6bce5"
     }
   ],
   "discovery_acceptance": [
     {
       "name": "same-epoch",
       "published_epoch": 1990560,
-      "published_hint_hex": "054526c9fdd3b180",
+      "published_hint_hex": "731f265bc8f6bce5",
       "requester_epoch": 1990560,
       "expected": "accepted"
     },
     {
       "name": "requester-one-epoch-later",
       "published_epoch": 1990560,
-      "published_hint_hex": "054526c9fdd3b180",
+      "published_hint_hex": "731f265bc8f6bce5",
       "requester_epoch": 1990561,
       "expected": "accepted"
     },
     {
       "name": "requester-one-epoch-earlier",
       "published_epoch": 1990560,
-      "published_hint_hex": "054526c9fdd3b180",
+      "published_hint_hex": "731f265bc8f6bce5",
       "requester_epoch": 1990559,
       "expected": "accepted"
     },
     {
       "name": "requester-two-epochs-later",
       "published_epoch": 1990560,
-      "published_hint_hex": "054526c9fdd3b180",
+      "published_hint_hex": "731f265bc8f6bce5",
       "requester_epoch": 1990562,
       "expected": "rejected"
     },
     {
       "name": "withdrawal-hint-is-not-a-discovery-hint",
       "published_epoch": 1990560,
-      "published_hint_hex": "3532f1f27d15448a",
+      "published_hint_hex": "05f4a939a170e513",
       "requester_epoch": 1990560,
-      "expected": "rejected"
+      "expected": "rejected",
+      "withdrawal_instance_name": "refineid-7f2a1c84"
     }
   ],
   "routing_tag": [
     {
-      "name": "RAPP-stream-v1",
-      "transport_profile": "fi.refineid.stream.v1",
+      "name": "rapp-stream",
+      "transport_profile": "fi.refineid.stream",
       "nonce_hex": "44444444444444444444444444444444",
-      "routing_tag_hex": "f073a90d6f9fc979301b3db7eda0551f"
+      "routing_tag_hex": "a09a6add3714bee03f06d252451d620c"
     },
     {
-      "name": "RAPP-ble-v1",
-      "transport_profile": "fi.refineid.rapp.ble.v1",
+      "name": "rapp-ble",
+      "transport_profile": "fi.refineid.rapp.ble",
       "nonce_hex": "44444444444444444444444444444444",
-      "routing_tag_hex": "a57ce4bf96750b26773eab586fb8b7fa"
+      "routing_tag_hex": "1de154396fd3db2a0e57472d9abcaa7c"
     }
   ],
   "routing_preamble": [
     {
-      "name": "RAPP-stream-v1-pairing",
-      "transport_profile": "fi.refineid.stream.v1",
+      "name": "rapp-stream-pairing",
+      "transport_profile": "fi.refineid.stream",
       "purpose": "pairing",
-      "encoded_hex": "836e524150502d73747265616d2d76316770616972696e6740"
+      "encoded_hex": "836b726170702d73747265616d6770616972696e6740"
     },
     {
-      "name": "RAPP-stream-v1-session",
-      "transport_profile": "fi.refineid.stream.v1",
+      "name": "rapp-stream-session",
+      "transport_profile": "fi.refineid.stream",
       "purpose": "session",
       "nonce_hex": "44444444444444444444444444444444",
-      "routing_tag_hex": "f073a90d6f9fc979301b3db7eda0551f",
-      "encoded_hex": "836e524150502d73747265616d2d76316773657373696f6e582044444444444444444444444444444444f073a90d6f9fc979301b3db7eda0551f"
+      "routing_tag_hex": "a09a6add3714bee03f06d252451d620c",
+      "encoded_hex": "836b726170702d73747265616d6773657373696f6e582044444444444444444444444444444444a09a6add3714bee03f06d252451d620c"
     },
     {
-      "name": "RAPP-ble-v1-pairing",
-      "transport_profile": "fi.refineid.rapp.ble.v1",
+      "name": "rapp-ble-pairing",
+      "transport_profile": "fi.refineid.rapp.ble",
       "purpose": "pairing",
-      "encoded_hex": "836b524150502d626c652d76316770616972696e6740"
+      "encoded_hex": "8368726170702d626c656770616972696e6740"
     },
     {
-      "name": "RAPP-ble-v1-session",
-      "transport_profile": "fi.refineid.rapp.ble.v1",
+      "name": "rapp-ble-session",
+      "transport_profile": "fi.refineid.rapp.ble",
       "purpose": "session",
       "nonce_hex": "44444444444444444444444444444444",
-      "routing_tag_hex": "a57ce4bf96750b26773eab586fb8b7fa",
-      "encoded_hex": "836b524150502d626c652d76316773657373696f6e582044444444444444444444444444444444a57ce4bf96750b26773eab586fb8b7fa"
+      "routing_tag_hex": "1de154396fd3db2a0e57472d9abcaa7c",
+      "encoded_hex": "8368726170702d626c656773657373696f6e5820444444444444444444444444444444441de154396fd3db2a0e57472d9abcaa7c"
     }
   ],
   "routing_lookup": [
     {
       "name": "second-of-two-pairings",
-      "transport_profile": "fi.refineid.stream.v1",
-      "routing_hex": "44444444444444444444444444444444f073a90d6f9fc979301b3db7eda0551f",
+      "transport_profile": "fi.refineid.stream",
+      "routing_hex": "44444444444444444444444444444444a09a6add3714bee03f06d252451d620c",
       "custodian_pair_ids_hex": [
         "55555555555555555555555555555555",
         "33333333333333333333333333333333"
@@ -121,8 +122,8 @@
     },
     {
       "name": "only-pairing",
-      "transport_profile": "fi.refineid.stream.v1",
-      "routing_hex": "44444444444444444444444444444444f073a90d6f9fc979301b3db7eda0551f",
+      "transport_profile": "fi.refineid.stream",
+      "routing_hex": "44444444444444444444444444444444a09a6add3714bee03f06d252451d620c",
       "custodian_pair_ids_hex": [
         "33333333333333333333333333333333"
       ],
@@ -130,8 +131,8 @@
     },
     {
       "name": "ble-tag-on-stream",
-      "transport_profile": "fi.refineid.stream.v1",
-      "routing_hex": "44444444444444444444444444444444a57ce4bf96750b26773eab586fb8b7fa",
+      "transport_profile": "fi.refineid.stream",
+      "routing_hex": "444444444444444444444444444444441de154396fd3db2a0e57472d9abcaa7c",
       "custodian_pair_ids_hex": [
         "33333333333333333333333333333333"
       ],
@@ -139,8 +140,8 @@
     },
     {
       "name": "altered-tag",
-      "transport_profile": "fi.refineid.stream.v1",
-      "routing_hex": "44444444444444444444444444444444f173a90d6f9fc979301b3db7eda0551f",
+      "transport_profile": "fi.refineid.stream",
+      "routing_hex": "44444444444444444444444444444444a19a6add3714bee03f06d252451d620c",
       "custodian_pair_ids_hex": [
         "33333333333333333333333333333333"
       ],
@@ -148,8 +149,8 @@
     },
     {
       "name": "unknown-pairing",
-      "transport_profile": "fi.refineid.stream.v1",
-      "routing_hex": "44444444444444444444444444444444f073a90d6f9fc979301b3db7eda0551f",
+      "transport_profile": "fi.refineid.stream",
+      "routing_hex": "44444444444444444444444444444444a09a6add3714bee03f06d252451d620c",
       "custodian_pair_ids_hex": [
         "55555555555555555555555555555555"
       ],
@@ -185,11 +186,11 @@
         ],
         [
           "hints",
-          "054526c9fdd3b180"
+          "731f265bc8f6bce5"
         ]
       ],
       "hints_hex": [
-        "054526c9fdd3b180"
+        "731f265bc8f6bce5"
       ],
       "expected": "accepted"
     },
@@ -206,11 +207,11 @@
         ],
         [
           "Hints",
-          "054526c9fdd3b180"
+          "731f265bc8f6bce5"
         ]
       ],
       "hints_hex": [
-        "054526c9fdd3b180"
+        "731f265bc8f6bce5"
       ],
       "expected": "accepted"
     },
@@ -227,7 +228,7 @@
         ],
         [
           "hints",
-          "054526C9FDD3B180"
+          "731F265BC8F6BCE5"
         ]
       ],
       "expected": "rejected"
@@ -245,7 +246,7 @@
         ],
         [
           "hints",
-          "054526c9fdd3b180,054526c9fdd3b180,054526c9fdd3b180,054526c9fdd3b180,054526c9fdd3b180"
+          "731f265bc8f6bce5,731f265bc8f6bce5,731f265bc8f6bce5,731f265bc8f6bce5,731f265bc8f6bce5"
         ]
       ],
       "expected": "rejected"
@@ -313,11 +314,11 @@
         ],
         [
           "hints",
-          "054526c9fdd3b180"
+          "731f265bc8f6bce5"
         ],
         [
           "HINTS",
-          "054526c9fdd3b180"
+          "731f265bc8f6bce5"
         ]
       ],
       "expected": "rejected"

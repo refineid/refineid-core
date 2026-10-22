@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Announced service withdrawal (RAPP v26.10.18 §4.5).
+//! Announced service withdrawal (RAPP v26.10.21 §4.5).
 //!
 //! A custodian that deliberately stops serving replaces its stream discovery
 //! record with a `mode=withdrawn` record. Each of its eight entries is either
@@ -46,7 +46,7 @@ pub const WITHDRAWN_RECORD_ENTRIES: usize = 8;
 pub const MAX_INSTANCE_NAME_SIZE: usize = 63;
 
 /// HKDF-Expand info naming the withdrawal key.
-const WITHDRAWAL_KEY_INFO: &[u8] = b"RAPP-withdrawal-v1";
+const WITHDRAWAL_KEY_INFO: &[u8] = b"rapp-withdrawal";
 
 /// TXT value naming the withdrawn mode.
 const TXT_MODE_WITHDRAWN: &str = "withdrawn";
@@ -64,7 +64,7 @@ pub enum WithdrawalError {
     /// The static agreement is the identity point.
     DegenerateAgreement,
     /// The peer never confirmed that it stored the pairing, so it is not
-    /// announced (RAPP v26.10.18 section 4.3 item 4).
+    /// announced (RAPP v26.10.21 section 4.3 item 4).
     StorageUnconfirmed,
     /// The service instance name is empty, longer than 63 octets, or a
     /// full service name rather than its instance portion.
@@ -153,7 +153,7 @@ impl WithdrawalKey {
     }
 
     /// Derives `K_wd = HKDF-SHA-256(salt = pair_id, IKM = X25519(local
-    /// static private, peer static public), info = "RAPP-withdrawal-v1",
+    /// static private, peer static public), info = "rapp-withdrawal",
     /// L = 32)`.
     ///
     /// # Errors

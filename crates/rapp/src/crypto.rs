@@ -23,9 +23,9 @@ use zeroize::ZeroizeOnDrop;
 use super::{
     BinaryFrame, CPACE_KC2_SUITE, Envelope, FrameError, GRANTS_HASH_SIZE, GrantsHash,
     MANDATORY_PAIRING_SUITE, MANDATORY_SESSION_SUITE, MAX_FRAME_PLAINTEXT, MAX_FRAME_SIZE,
-    MessageType, NOISE_TAG_SIZE, OperationId, PAIR_ID_SIZE, PairId, PairingSecret, ProfileName,
-    REQUEST_HASH_SIZE, RequestHash, SESSION_ID_SIZE, SequenceGuard, SessionId,
-    WIRE_VERSION_V26_10_18, WireError, WireValue, X25519_KEY_SIZE, encode_deterministic_cbor,
+    MessageType, NOISE_TAG_SIZE, PAIR_ID_SIZE, PairId, PairingSecret, ProfileName, SESSION_ID_SIZE,
+    SequenceGuard, SessionId, WIRE_VERSION_V26_10_21, WireError, WireValue, X25519_KEY_SIZE,
+    encode_deterministic_cbor,
     noise::{KkHandshakeState, NoiseTransport},
 };
 
@@ -393,13 +393,6 @@ impl HandshakeChannel {
 }
 
 impl SecureChannel {
-    /// Most recently authenticated peer sequence, including handshake-channel
-    /// application messages such as `session.ready`.
-    #[must_use]
-    pub const fn last_received_sequence(&self) -> Option<u64> {
-        self.sequence.last_received_sequence()
-    }
-
     /// Encrypt one validated envelope and advance the send sequence once.
     ///
     /// # Errors
@@ -447,14 +440,6 @@ impl SecureChannel {
         plaintext.truncate(length);
         let envelope =
             Envelope::decode(&plaintext).map_err(OpenError::AuthenticatedProtocolViolation)?;
-        // The peer named a critical extension to say it must not be
-        // ignored (RAPP v26.9.28 section 7.3). This is inside a frame
-        // that authenticated, so declining to act on it is
-        // attributable and belongs to the revoking arm of the caller's
-        // fail-closed handling, not to the close-only arm.
-        envelope
-            .require_supported_critical()
-            .map_err(OpenError::AuthenticatedProtocolViolation)?;
         self.sequence
             .accept_incoming(&envelope)
             .map_err(OpenError::AuthenticatedProtocolViolation)?;
@@ -475,7 +460,7 @@ fn build(builder: Builder<'_>, role: HandshakeRole) -> Result<HandshakeState, Cr
 pub fn derive_session_id(handshake_hash: &[u8]) -> SessionId {
     let mut bytes = [0_u8; SESSION_ID_SIZE];
     let digest = Sha512::new()
-        .chain_update(b"RAPP-session-id-v1")
+        .chain_update(b"rapp-session-id")
         .chain_update(handshake_hash)
         .finalize();
     bytes.copy_from_slice(&digest[..SESSION_ID_SIZE]);
@@ -487,7 +472,7 @@ pub fn derive_session_id(handshake_hash: &[u8]) -> SessionId {
 pub fn derive_pair_id(handshake_hash: &[u8]) -> PairId {
     let mut bytes = [0_u8; PAIR_ID_SIZE];
     let digest = Sha512::new()
-        .chain_update(b"RAPP-pair-id-v1")
+        .chain_update(b"rapp-pair-id")
         .chain_update(handshake_hash)
         .finalize();
     bytes.copy_from_slice(&digest[..PAIR_ID_SIZE]);
@@ -518,61 +503,9 @@ pub fn compute_grants_hash(profiles: &[ProfileName]) -> Result<GrantsHash, Crypt
     Ok(GrantsHash::from_array(bytes))
 }
 
-/// Bind the exact typed operation request to its pairing (RAPP v26.10.18
-/// section 8.2.1).
-///
-/// The commitment is session-independent, so an identical request
-/// retransmitted on a later session of the same pairing hashes the same.
-///
-/// # Errors
-/// [`CryptoError::Wire`] when deterministic encoding fails.
-pub fn compute_request_hash(
-    pair_id: PairId,
-    operation_id: OperationId,
-    profile: ProfileName,
-    action: &str,
-    context: BTreeMap<String, WireValue>,
-    payload: BTreeMap<String, WireValue>,
-) -> Result<RequestHash, CryptoError> {
-    compute_wire_request_hash(
-        pair_id,
-        operation_id,
-        profile.as_str(),
-        action,
-        context,
-        payload,
-    )
-}
-
-/// The section 8.2.1 commitment over a request exactly as the wire carries
-/// it, before its profile name is interpreted.
-pub(crate) fn compute_wire_request_hash(
-    pair_id: PairId,
-    operation_id: OperationId,
-    profile: &str,
-    action: &str,
-    context: BTreeMap<String, WireValue>,
-    payload: BTreeMap<String, WireValue>,
-) -> Result<RequestHash, CryptoError> {
-    let preimage = WireValue::Array(vec![
-        WireValue::Text("RAPP-request-v1".to_owned()),
-        WireValue::Bytes(pair_id.as_bytes().to_vec()),
-        WireValue::Bytes(operation_id.as_bytes().to_vec()),
-        WireValue::Text(profile.to_owned()),
-        WireValue::Text(action.to_owned()),
-        WireValue::Map(context),
-        WireValue::Map(payload),
-    ]);
-    let encoded = encode_deterministic_cbor(&preimage).map_err(CryptoError::Wire)?;
-    let digest = Sha256::digest(encoded);
-    let mut bytes = [0_u8; REQUEST_HASH_SIZE];
-    bytes.copy_from_slice(&digest);
-    Ok(RequestHash::from_array(bytes))
-}
-
 fn pairing_prologue(offer_hash: [u8; 32], transport_profile: &str) -> Result<Vec<u8>, CryptoError> {
     encode_deterministic_cbor(&WireValue::Array(vec![
-        WireValue::Text("RAPP-pairing-v1".to_owned()),
+        WireValue::Text("rapp-pairing".to_owned()),
         version_value(),
         WireValue::Text(CPACE_KC2_SUITE.to_owned()),
         WireValue::Bytes(offer_hash.to_vec()),
@@ -587,7 +520,7 @@ fn session_prologue(
     transport_profile: &str,
 ) -> Result<Vec<u8>, CryptoError> {
     encode_deterministic_cbor(&WireValue::Array(vec![
-        WireValue::Text("RAPP-session-v1".to_owned()),
+        WireValue::Text("rapp-session".to_owned()),
         version_value(),
         WireValue::Text(MANDATORY_SESSION_SUITE.to_owned()),
         WireValue::Bytes(pair_id.as_bytes().to_vec()),
@@ -599,174 +532,20 @@ fn session_prologue(
 
 fn version_value() -> WireValue {
     WireValue::Array(vec![
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_18.0)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_18.1)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_18.2)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_21.0)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_21.1)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_21.2)),
     ])
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BinaryFrame, HandshakeChannel, HandshakeRole, NOISE_TAG_SIZE, OpenError, SecureChannel,
-        SessionHandshakeParameters, generate_pair_key_material,
-    };
-    use crate::types::{LIVENESS_CHALLENGE_SIZE, PAIR_ID_SIZE, PairId, ProfileName, SessionId};
-    use crate::wire::{Envelope, MessageType, WireError, WireValue};
-    use std::collections::{BTreeMap, BTreeSet};
-
-    /// A critical name no implementation of this version supports.
-    const UNSUPPORTED_CRITICAL: &str = "example.unsupported-critical";
-
-    /// The two channels of a completed session handshake, with the
-    /// session identifier their envelopes must carry.
-    fn established_channels() -> (SessionId, SecureChannel, SecureChannel) {
-        let pair_id = PairId::from_array([0x91; PAIR_ID_SIZE]);
-        let grants_hash =
-            super::compute_grants_hash(&[ProfileName::CardStatus]).expect("the fixed set hashes");
-        let requester_keys = generate_pair_key_material().expect("requester keys");
-        let proxy_keys = generate_pair_key_material().expect("proxy keys");
-        let mut requester = HandshakeChannel::session(&SessionHandshakeParameters {
-            role: HandshakeRole::Initiator,
-            local_keys: &requester_keys,
-            remote_public_key: proxy_keys.public_key(),
-            pair_id,
-            grants_hash,
-            transport_profile: "local-quic-v1",
-        })
-        .expect("requester handshake starts");
-        let mut proxy = HandshakeChannel::session(&SessionHandshakeParameters {
-            role: HandshakeRole::Responder,
-            local_keys: &proxy_keys,
-            remote_public_key: requester_keys.public_key(),
-            pair_id,
-            grants_hash,
-            transport_profile: "local-quic-v1",
-        })
-        .expect("proxy handshake starts");
-        let first = requester.write_message().expect("handshake message one");
-        proxy.read_message(&first).expect("proxy reads message one");
-        let second = proxy.write_message().expect("handshake message two");
-        requester
-            .read_message(&second)
-            .expect("requester reads message two");
-        let requester = requester.complete().expect("requester completes");
-        let proxy = proxy.complete().expect("proxy completes");
-        assert_eq!(requester.session_id, proxy.session_id);
-        (
-            requester.session_id,
-            requester.secure_channel,
-            proxy.secure_channel,
-        )
-    }
-
-    /// A valid `liveness.ping` body.
-    fn ping_body(challenge: [u8; LIVENESS_CHALLENGE_SIZE]) -> BTreeMap<String, WireValue> {
-        BTreeMap::from([
-            ("challenge".to_owned(), WireValue::Bytes(challenge.to_vec())),
-            ("last_received_sequence".to_owned(), WireValue::Unsigned(0)),
-        ])
-    }
-
-    /// Encrypt one envelope carrying `critical`, without advancing the
-    /// local send sequence: the local endpoint never originates a
-    /// critical name, so this stands in for a peer that does.
-    fn seal_critical(
-        channel: &mut SecureChannel,
-        session_id: SessionId,
-        body: BTreeMap<String, WireValue>,
-        critical: BTreeSet<String>,
-    ) -> BinaryFrame {
-        let mut extensions = BTreeMap::new();
-        for name in &critical {
-            extensions.insert(name.clone(), WireValue::Unsigned(0));
-        }
-        let envelope = Envelope::reconstruct(
-            MessageType::LivenessPing,
-            session_id,
-            0,
-            body,
-            critical.into_iter().collect(),
-            extensions,
-        )
-        .expect("the fixture envelope is well formed");
-        let plaintext = envelope.encode().expect("the fixture envelope encodes");
-        let mut output = vec![0_u8; plaintext.len() + NOISE_TAG_SIZE];
-        let length = match &mut channel.transport {
-            super::TransportMode::Snow(state) => state
-                .write_message(&plaintext, &mut output)
-                .expect("the fixture frame encrypts"),
-            super::TransportMode::Native(transport) => transport
-                .write_message(&plaintext, &mut output)
-                .expect("the fixture frame encrypts"),
-        };
-        output.truncate(length);
-        BinaryFrame::reconstruct(output).expect("the fixture frame is bounded")
-    }
-
-    /// RAPP v26.9.28 section 7.3: a name in `critical` states the message
-    /// must not be processed if the recipient does not understand it, so
-    /// an authenticated frame carrying one is refused. The refusal is
-    /// attributable (the frame authenticated) and so maps to the
-    /// revoking arm, not the close-only arm.
+    /// RAPP v26.10.21 section 4.3 item 1: the pairing prologue on BLE is 145 bytes.
     #[test]
-    fn opening_an_unsupported_critical_extension_is_refused() {
-        let (session_id, mut sender, mut receiver) = established_channels();
-        let frame = seal_critical(
-            &mut sender,
-            session_id,
-            ping_body([0x86; LIVENESS_CHALLENGE_SIZE]),
-            BTreeSet::from([UNSUPPORTED_CRITICAL.to_owned()]),
-        );
-        assert_eq!(
-            receiver.open(&frame),
-            Err(OpenError::AuthenticatedProtocolViolation(
-                WireError::UnsupportedCriticalExtension
-            ))
-        );
-    }
-
-    /// The refusal is attributable to the critical name alone: the same
-    /// message without one is accepted.
-    #[test]
-    fn opening_without_a_critical_extension_succeeds() {
-        let (session_id, mut sender, mut receiver) = established_channels();
-        let frame = seal_critical(
-            &mut sender,
-            session_id,
-            ping_body([0x87; LIVENESS_CHALLENGE_SIZE]),
-            BTreeSet::new(),
-        );
-        let envelope = receiver.open(&frame).expect("the ping is processed");
-        assert_eq!(envelope.message_type, MessageType::LivenessPing);
-        assert!(envelope.critical.is_empty());
-    }
-
-    /// One unsupported name is enough: the check is over every name
-    /// present, not whether some of them are recognised.
-    #[test]
-    fn a_critical_name_alongside_a_valid_body_is_still_refused() {
-        let (session_id, mut sender, mut receiver) = established_channels();
-        let frame = seal_critical(
-            &mut sender,
-            session_id,
-            ping_body([0x88; LIVENESS_CHALLENGE_SIZE]),
-            BTreeSet::from([UNSUPPORTED_CRITICAL.to_owned(), "example.second".to_owned()]),
-        );
-        assert_eq!(
-            receiver.open(&frame),
-            Err(OpenError::AuthenticatedProtocolViolation(
-                WireError::UnsupportedCriticalExtension
-            ))
-        );
-    }
-
-    /// RAPP v26.10.18 §4.3:276: Deterministic CBOR of the pairing prologue is exactly 151 bytes.
-    #[test]
-    fn pairing_prologue_matches_normative_151_byte_length() {
-        const NORMATIVE_PAIRING_PROLOGUE_LENGTH: usize = 151;
-        let prologue = super::pairing_prologue([0xaa; 32], "fi.refineid.rapp.ble.v1")
+    fn pairing_prologue_matches_the_specified_length() {
+        const BLE_PAIRING_PROLOGUE_LENGTH: usize = 145;
+        let prologue = super::pairing_prologue([0xaa; 32], "fi.refineid.rapp.ble")
             .expect("pairing prologue encodes");
-        assert_eq!(prologue.len(), NORMATIVE_PAIRING_PROLOGUE_LENGTH);
+        assert_eq!(prologue.len(), BLE_PAIRING_PROLOGUE_LENGTH);
     }
 }

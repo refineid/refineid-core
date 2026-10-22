@@ -29,14 +29,11 @@ pub mod ble_sar;
 pub mod cpace;
 mod crypto;
 mod endpoint;
-mod journal;
 mod liveness;
 mod message;
 pub mod noise;
 mod offer;
 mod operation;
-#[cfg(feature = "bindings")]
-pub mod operation_bindings;
 #[cfg(feature = "bindings")]
 pub mod operation_bridge;
 mod pair_keys;
@@ -45,10 +42,8 @@ mod pairing_attempts;
 mod pairing_flow;
 mod policy;
 mod proxy_engine;
-mod requester;
 mod requester_engine;
 mod result;
-mod revocation;
 mod routing;
 mod runtime;
 mod session_flow;
@@ -61,8 +56,8 @@ mod wire;
 mod withdrawal;
 
 pub use authorization::{
-    ApprovalOutcome, AuthorizationError, AuthorizationStage, AuthorizationTransaction,
-    AuthorizedCardCommand, AuthorizedSafeRead, OperationProgressMessage, OperationReference,
+    AuthorizationError, AuthorizationStage, AuthorizationTransaction, AuthorizedCardCommand,
+    AuthorizedSafeRead, OperationProgressMessage, PendingCardCommand, PrerequisitesOutcome,
     ProgressEvent, UserApproval,
 };
 pub use cpace::{
@@ -79,35 +74,32 @@ pub use cpace::{
 pub use crypto::{
     CryptoError, HandshakeChannel, HandshakeCompletion, HandshakeRole, OpenError, PairKeyMaterial,
     PairingHandshakeParameters, SecureChannel, SessionHandshakeParameters, compute_grants_hash,
-    compute_request_hash, derive_pair_id, derive_session_id, generate_pair_key_material,
+    derive_pair_id, derive_session_id, generate_pair_key_material,
 };
-pub use endpoint::{AuthenticatedViolation, EndpointError, EstablishedEndpoint, ReceiveOutcome};
-pub use journal::{
-    BatchProgress, JournalError, JournalRecord, JournalRecoveryStore, JournalStore,
-    OperationJournal, PendingCardCommand, RecoveredProxyRecord, ResultJournalStore,
+pub use endpoint::{
+    AuthenticatedViolation, EndpointError, EstablishedEndpoint, OperationViolation, ReceiveOutcome,
 };
 pub use liveness::{
-    LivenessConfig, LivenessDecision, LivenessError, LivenessTracker, PingChallenge,
-    PongDisposition,
+    LIVENESS_PING_AFTER_SILENCE_MS, LivenessDecision, LivenessTracker, PingChallenge,
+    PongDisposition, SESSION_SILENCE_LIMIT_MS,
 };
 pub use message::{
     CardStatusMessage, LivenessMessage, MessageError, NegotiatedParameters, PairingAbortMessage,
     PairingConfirmMessage, PairingHelloMessage, PairingStoredMessage, ProtocolErrorMessage,
-    SessionCloseMessage, SessionParameters, SessionReadyMessage, StatusReport, TypedMessage,
+    SessionCloseMessage, SessionParameters, SessionReadyMessage, TypedMessage,
 };
 pub use offer::{MAX_OFFER_SIZE, PairingOffer, PairingOfferDeadline, PairingOfferError};
 pub use operation::{
-    BATCH_DOCUMENTS, CardIdentity, CardInspection, CardKeyProfile, CardOperation,
-    CardOperationError, CardOperationResult, CertificateKind, CredentialKind,
-    DEFAULT_OPERATION_LIFETIME_MS, OperationRequest, OperationRequestRefusal, RequestError,
-    SignatureAlgorithm,
+    CardIdentity, CardInspection, CardKeyProfile, CardOperation, CardOperationError,
+    CardOperationResult, CertificateKind, CredentialKind, DEFAULT_OPERATION_LIFETIME_MS,
+    OperationRequest, OperationRequestRefusal, RequestError, SignatureAlgorithm,
 };
 pub use pair_keys::{DegenerateAgreement, PAIR_KEY_SIZE};
 pub(crate) use pair_keys::{derive_pair_key, mac as pair_key_mac};
 pub use pairing::{
     PAIR_RECORD_FORMAT_VERSION, PairRecord, PairRecordCodecError, PairRecordError, PairStore,
-    PairStoreError, PairTombstone, decode_pair_record, decode_pair_records, encode_pair_record,
-    encode_pair_records,
+    PairStoreError, PairTombstone, REVOCATION_NOTICE_MS, decode_pair_record, decode_pair_records,
+    encode_pair_record, encode_pair_records,
 };
 pub use pairing_attempts::{
     CPACE_ATTEMPT_WINDOW_MS, CpaceAttemptLedger, MAXIMUM_CPACE_ATTEMPTS, POST_PAKE_CONFIRMATION_MS,
@@ -125,20 +117,10 @@ pub use policy::{
 pub use proxy_engine::{
     ProxyDispatch, ProxyEngineError, ProxyOperationEngine, ProxySessionCloseAction, ProxyViolation,
 };
-pub use requester::{
-    RequesterError, RequesterJournalRecord, RequesterJournalStore, RequesterOperation,
-    RequesterRecoveryStore, RequesterResultAction,
-};
 pub use requester_engine::{
     RequesterDispatch, RequesterEngineError, RequesterOperationEngine, RequesterViolation,
 };
 pub use result::{OperationResultMessage, ProxyFailure, ResultError, ResultResponse, ResultStatus};
-pub use revocation::{
-    REVOCATION_ANNOUNCEMENT_MS, REVOCATION_HINT_SIZE, REVOCATION_RETENTION_FORMAT_VERSION,
-    REVOKED_ANNOUNCEMENT_ENTRIES, RevocationError, RevocationKey, RevocationRetention,
-    RevocationRetentionCodecError, RevokedAnnouncement, decode_revocation_retention,
-    encode_revocation_retention,
-};
 pub use routing::{
     DISCOVERY_HINT_EPOCH_SECONDS, DISCOVERY_HINT_SIZE, DiscoveryKey, DiscoveryRecord,
     DiscoveryRecordError, MAX_DISCOVERY_HINTS, ROUTING_NONCE_SIZE, ROUTING_REPLAY_WINDOW,
@@ -146,7 +128,9 @@ pub use routing::{
     SESSION_ROUTING_SIZE, SessionRouting, discovery_epoch, route_session,
 };
 pub use runtime::{EstablishedSessionRuntime, RuntimeError, RuntimePoll, RuntimeReceive};
-pub use session_flow::{ExplicitUserIntent, SessionAuthentication, SessionError, SessionHandshake};
+pub use session_flow::{
+    ExplicitUserIntent, ReadyOutcome, SessionAuthentication, SessionError, SessionHandshake,
+};
 pub use state::{
     Action, EndpointRole, Guards, OperationEvent, OperationState, PairingEvent, PairingState,
     RappState, SecurityOutcome, SessionEvent, SessionState, Transition, TransitionError,
@@ -158,13 +142,14 @@ pub use transport::{
 };
 pub use txt::AnnouncementCandidate;
 pub use types::{
-    CANDIDATE_FAILURE_HINT_THRESHOLD, CloseReason, FailureClass, GRANTS_HASH_SIZE, GrantsHash,
-    IdentifierError, LIVENESS_CHALLENGE_SIZE, MANDATORY_PAIRING_SUITE, MANDATORY_SESSION_SUITE,
+    CANDIDATE_FAILURE_HINT_THRESHOLD, CERTIFICATE_FINGERPRINT_SIZE, CertificateFingerprint,
+    CloseReason, FailureClass, GRANTS_HASH_SIZE, GrantsHash, IdentifierError,
+    LIVENESS_CHALLENGE_SIZE, MANDATORY_PAIRING_SUITE, MANDATORY_SESSION_SUITE,
     MAX_ACTIVE_OPERATIONS, MAX_FRAME_PLAINTEXT, MAX_FRAME_SIZE, MINIMUM_REMAINING_ATTEMPTS,
     NOISE_TAG_SIZE, OFFER_ID_SIZE, OFFER_TTL_MS, OPERATION_ID_SIZE, OfferId, OperationId,
-    PAIR_ID_SIZE, PAIRING_SECRET_SIZE, PairId, PairingSecret, ProfileName, REQUEST_HASH_SIZE,
-    RequestHash, RetryDecision, SESSION_ID_SIZE, SESSION_READY_NONCE_SIZE, SessionId,
-    VisibleConnectionState, WIRE_VERSION_V26_10_18, X25519_KEY_SIZE,
+    PAIR_ID_SIZE, PAIRING_SECRET_SIZE, PairId, PairingSecret, ProfileName, RetryDecision,
+    SESSION_ID_SIZE, SESSION_READY_NONCE_SIZE, SessionId, VisibleConnectionState,
+    WIRE_VERSION_V26_10_21, X25519_KEY_SIZE,
 };
 pub use wire::{
     Envelope, MessageType, SequenceGuard, WireError, WireValue, decode_deterministic_cbor,

@@ -1,9 +1,10 @@
-//! Fail-closed established-session endpoint composition.
+//! Established-session endpoint: failures close the session and never the
+//! pairing (RAPP v26.10.21 section 10.1).
 
 use super::{
-    BinaryFrame, CryptoError, MessageError, MessageType, OpenError, PairId, PairStore,
-    PairStoreError, PairTombstone, ProxyViolation, RappState, RequesterViolation, SecureChannel,
-    SecurityOutcome, TypedMessage, WireError,
+    BinaryFrame, CloseReason, CryptoError, MessageError, MessageType, OpenError, PairId,
+    ProxyViolation, RappState, RequesterViolation, SecureChannel, SecurityOutcome,
+    SessionCloseMessage, TypedMessage, WireError,
 };
 use core::fmt;
 
@@ -25,54 +26,42 @@ impl EstablishedEndpoint {
         }
     }
 
+    /// The pairing this session belongs to.
+    #[must_use]
+    pub const fn pair_id(&self) -> PairId {
+        self.pair_id
+    }
+
     /// Current product state projection.
     #[must_use]
     pub const fn state(&self) -> &RappState {
         &self.state
     }
 
-    /// Most recently authenticated peer sequence for liveness messages.
-    pub fn last_received_sequence(&self) -> Option<u64> {
-        self.channel
-            .as_ref()
-            .and_then(SecureChannel::last_received_sequence)
-    }
-
-    /// Opens and fully validates one encrypted frame.
-    ///
-    /// A successfully authenticated grammar/sequence violation revokes the
-    /// pair immediately on this first event. A frame that cannot be
-    /// authenticated closes only this session, preventing unauthenticated
-    /// network traffic from deleting a valid pairing.
+    /// Opens and fully validates one encrypted frame. A frame that fails
+    /// authentication closes the session; an authenticated one that violates
+    /// the protocol closes it with a sealed `protocol_violation` notice. The
+    /// pairing stays.
     ///
     /// # Errors
-    /// [`EndpointError`] when the session is already closed or the
-    /// revocation tombstone cannot be persisted.
-    pub fn receive<S: PairStore>(
+    /// [`EndpointError::SessionClosed`] when the session is already closed.
+    pub fn receive(
         &mut self,
-        store: &mut S,
         frame: &BinaryFrame,
         now_ms: u64,
-    ) -> Result<ReceiveOutcome, EndpointError<S::Error>> {
+    ) -> Result<ReceiveOutcome, EndpointError> {
         let Some(channel) = self.channel.as_mut() else {
             return Err(EndpointError::SessionClosed);
         };
-
         match channel.open(frame) {
-            Ok(envelope) => match TypedMessage::from_envelope(envelope, self.pair_id, now_ms) {
+            Ok(envelope) => match TypedMessage::from_envelope(envelope, now_ms) {
                 Ok(message) if permitted_in_established_session(&message) => {
                     Ok(ReceiveOutcome::Message(message))
                 }
-                Ok(message) => self.revoke_for_violation(
-                    store,
-                    now_ms,
+                Ok(message) => Ok(self.close_for_violation(
                     AuthenticatedViolation::UnexpectedPhase(message.message_type()),
-                ),
-                Err(error) => self.revoke_for_violation(
-                    store,
-                    now_ms,
-                    AuthenticatedViolation::Semantic(error),
-                ),
+                )),
+                Err(error) => Ok(self.close_for_violation(AuthenticatedViolation::Semantic(error))),
             },
             Err(OpenError::SessionIntegrityFailure) => {
                 let outcome = self.state.session_integrity_failed();
@@ -80,7 +69,7 @@ impl EstablishedEndpoint {
                 Ok(ReceiveOutcome::SessionClosed(outcome))
             }
             Err(OpenError::AuthenticatedProtocolViolation(wire_error)) => {
-                self.revoke_for_violation(store, now_ms, AuthenticatedViolation::Wire(wire_error))
+                Ok(self.close_for_violation(AuthenticatedViolation::Wire(wire_error)))
             }
         }
     }
@@ -91,7 +80,7 @@ impl EstablishedEndpoint {
     /// # Errors
     /// [`EndpointError`] on a closed session, a wrong-phase message, or an
     /// encoding or encryption failure.
-    pub fn send(&mut self, message: &TypedMessage) -> Result<BinaryFrame, EndpointError<()>> {
+    pub fn send(&mut self, message: &TypedMessage) -> Result<BinaryFrame, EndpointError> {
         if !permitted_in_established_session(message) {
             return Err(EndpointError::UnexpectedPhase(message.message_type()));
         }
@@ -102,101 +91,41 @@ impl EstablishedEndpoint {
             .map_err(EndpointError::Crypto)
     }
 
-    /// Closes the local secure channel without revoking the long-term pair.
+    /// Closes the local secure channel; the pairing stays.
     pub fn close_session(&mut self) {
         self.channel = None;
     }
 
-    /// Close for unattributable connectivity failure while preserving pairing.
-    pub fn close_for_connectivity_failure(&mut self) -> SecurityOutcome {
-        let outcome = self.state.session_integrity_failed();
+    /// Closes after nothing arrived for the session silence limit (section
+    /// 8.3).
+    pub fn close_for_silence(&mut self) -> SecurityOutcome {
+        let outcome = self.state.silence_limit_reached();
         self.channel = None;
         outcome
     }
 
-    /// Project the first missed authenticated liveness probe.
-    pub fn liveness_missed(&mut self) -> SecurityOutcome {
-        self.state.liveness_missed()
-    }
-
-    /// Project an exact authenticated pong.
-    pub fn liveness_restored(&mut self) -> SecurityOutcome {
-        self.state.liveness_restored()
-    }
-
-    /// Revoke for a requester-engine violation through the same fail-closed
-    /// path used by authenticated wire and message violations.
-    ///
-    /// # Errors
-    /// [`EndpointError::PairRevocationFailed`] when the tombstone cannot be
-    /// persisted.
-    pub fn revoke_requester_violation<S: PairStore>(
+    /// Closes after an operation engine found the peer's traffic violating
+    /// the protocol.
+    pub fn close_for_operation_violation(
         &mut self,
-        store: &mut S,
-        now_ms: u64,
-        violation: RequesterViolation,
-    ) -> Result<ReceiveOutcome, EndpointError<S::Error>> {
-        self.revoke_for_violation(
-            store,
-            now_ms,
-            AuthenticatedViolation::RequesterState(violation),
-        )
+        violation: OperationViolation,
+    ) -> ReceiveOutcome {
+        self.close_for_violation(AuthenticatedViolation::Operation(violation))
     }
 
-    /// Revoke for a proxy-engine violation on its first authenticated event.
-    ///
-    /// # Errors
-    /// [`EndpointError::PairRevocationFailed`] when the tombstone cannot be
-    /// persisted.
-    pub fn revoke_proxy_violation<S: PairStore>(
-        &mut self,
-        store: &mut S,
-        now_ms: u64,
-        violation: ProxyViolation,
-    ) -> Result<ReceiveOutcome, EndpointError<S::Error>> {
-        self.revoke_for_violation(store, now_ms, AuthenticatedViolation::ProxyState(violation))
-    }
-
-    /// Revoke this pairing after the card rejects CAN, PIN 1, or PIN 2.
-    ///
-    /// The caller seals the bounded `credential_rejected` result first when
-    /// the authenticated channel is still usable. This method then destroys
-    /// the channel and durably tombstones the pair before control returns.
-    ///
-    /// # Errors
-    /// [`EndpointError::PairRevocationFailed`] when the tombstone cannot be
-    /// persisted.
-    pub fn revoke_credential_rejection<S: PairStore>(
-        &mut self,
-        store: &mut S,
-        now_ms: u64,
-    ) -> Result<SecurityOutcome, EndpointError<S::Error>> {
-        let outcome = self.state.credential_rejected();
-        self.channel = None;
-        store
-            .revoke(PairTombstone {
-                pair_id: self.pair_id,
-                revoked_at_ms: now_ms,
-            })
-            .map_err(EndpointError::PairRevocationFailed)?;
-        Ok(outcome)
-    }
-
-    fn revoke_for_violation<S: PairStore>(
-        &mut self,
-        store: &mut S,
-        now_ms: u64,
-        violation: AuthenticatedViolation,
-    ) -> Result<ReceiveOutcome, EndpointError<S::Error>> {
+    fn close_for_violation(&mut self, violation: AuthenticatedViolation) -> ReceiveOutcome {
         let outcome = self.state.authenticated_protocol_violation();
+        let notice = self
+            .send(&TypedMessage::SessionClose(SessionCloseMessage {
+                reason: CloseReason::ProtocolViolation,
+            }))
+            .ok();
         self.channel = None;
-        store
-            .revoke(PairTombstone {
-                pair_id: self.pair_id,
-                revoked_at_ms: now_ms,
-            })
-            .map_err(EndpointError::PairRevocationFailed)?;
-        Ok(ReceiveOutcome::PairRevoked { violation, outcome })
+        ReceiveOutcome::ViolationClosed {
+            violation,
+            outcome,
+            notice,
+        }
     }
 }
 
@@ -219,36 +148,50 @@ impl fmt::Debug for EstablishedEndpoint {
 pub enum ReceiveOutcome {
     /// Authenticated, schema-valid application message.
     Message(TypedMessage),
-    /// Unattributable integrity failure closed only the session.
+    /// A frame failed authentication; the session closed.
     SessionClosed(SecurityOutcome),
-    /// First authenticated violation destroyed the pair immediately.
-    PairRevoked {
-        /// Exact authenticated wire or semantic violation.
+    /// Authenticated traffic violated the protocol; the session closed and
+    /// the pairing stays. Deliver `notice`, then drop the link.
+    ViolationClosed {
+        /// The violation.
         violation: AuthenticatedViolation,
-        /// Product state effects that platform adapters must project.
+        /// Effects the endpoint carries out.
         outcome: SecurityOutcome,
+        /// The sealed `protocol_violation` close, when it could be sealed.
+        notice: Option<BinaryFrame>,
     },
 }
 
-/// Attributable violation which triggers immediate first-incident revocation.
+/// An authenticated message that violated the protocol.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthenticatedViolation {
     /// Canonical framing, envelope, session, or sequence violation.
     Wire(WireError),
-    /// Nested typed-message or profile/action semantic violation.
+    /// Typed-message or profile semantic violation.
     Semantic(MessageError),
-    /// Authenticated message belongs to pairing or session authentication,
-    /// not an already-established application session.
+    /// A message the session's phase does not admit: a pairing message, a
+    /// `session.ready` on a healthy session, or anything but `session.ready`
+    /// or a close as the Custodian's first message.
     UnexpectedPhase(MessageType),
-    /// Requester operation machine had no legal active transition.
-    RequesterState(RequesterViolation),
-    /// Proxy operation machine had no legal active transition.
-    ProxyState(ProxyViolation),
+    /// The Custodian's `session.ready` parameters differ from the local
+    /// view.
+    ReadyParameterMismatch,
+    /// An operation engine had no legal transition for the message.
+    Operation(OperationViolation),
+}
+
+/// The operation engine that found a violation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationViolation {
+    /// The requester's engine.
+    Requester(RequesterViolation),
+    /// The custodian's engine.
+    Proxy(ProxyViolation),
 }
 
 /// Established-endpoint processing failure.
 #[derive(Debug)]
-pub enum EndpointError<E> {
+pub enum EndpointError {
     /// The secure channel is no longer available.
     SessionClosed,
     /// Outgoing encryption or encoding failed.
@@ -257,18 +200,15 @@ pub enum EndpointError<E> {
     Message(MessageError),
     /// Local code attempted to send a message from an earlier protocol phase.
     UnexpectedPhase(MessageType),
-    /// Pair-key destruction could not be durably completed. The in-memory
-    /// endpoint remains failed closed and cannot process more traffic.
-    PairRevocationFailed(PairStoreError<E>),
 }
 
-impl<E: fmt::Debug> fmt::Display for EndpointError<E> {
+impl fmt::Display for EndpointError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{self:?}")
     }
 }
 
-impl<E: fmt::Debug> core::error::Error for EndpointError<E> {}
+impl core::error::Error for EndpointError {}
 
 const fn permitted_in_established_session(message: &TypedMessage) -> bool {
     !matches!(

@@ -17,40 +17,14 @@
 use refineid_rapp::{
     AuthenticatedViolation, BinaryFrame, CardOperation, CloseReason, CpaceKc2Initiator,
     CpaceKc2Responder, EndpointError, EndpointRole, EstablishedEndpoint, EstablishedSessionRuntime,
-    ExplicitUserIntent, HandshakeChannel, HandshakeRole, LivenessConfig, MessageType, OfferId,
-    OperationId, OperationRequest, OperationState, PairRecord, PairStore, PairStoreError,
-    PairTombstone, PairingHandshake, PairingOffer, PairingSecret, PairingState, ProfileName,
-    RappState, ReceiveOutcome, RuntimeReceive, SecureChannel, SessionHandshake,
+    ExplicitUserIntent, HandshakeChannel, HandshakeRole, MessageType, OfferId, OperationId,
+    OperationRequest, PairRecord, PairingHandshake, PairingOffer, PairingSecret, PairingState,
+    ProfileName, RappState, ReadyOutcome, ReceiveOutcome, RuntimeReceive, SecureChannel,
+    SessionAuthentication, SessionCloseMessage, SessionError, SessionHandshake,
     SessionHandshakeParameters, SessionParameters, SessionReadyMessage, SessionState,
     TransportProfile, TypedMessage, compute_grants_hash, encode_kc2_step1_frame,
     generate_pair_key_material, standard_pairing_context_v2,
 };
-
-#[derive(Default)]
-struct MemoryPairStore {
-    revoked: Vec<PairTombstone>,
-}
-
-impl PairStore for MemoryPairStore {
-    type Error = core::convert::Infallible;
-
-    fn load(&mut self, _pair_id: refineid_rapp::PairId) -> Result<Option<PairRecord>, Self::Error> {
-        Ok(None)
-    }
-
-    fn insert(&mut self, _record: PairRecord) -> Result<(), PairStoreError<Self::Error>> {
-        Ok(())
-    }
-
-    fn revoke(&mut self, tombstone: PairTombstone) -> Result<(), PairStoreError<Self::Error>> {
-        self.revoked.push(tombstone);
-        Ok(())
-    }
-
-    fn is_revoked(&mut self, pair_id: refineid_rapp::PairId) -> Result<bool, Self::Error> {
-        Ok(self.revoked.iter().any(|entry| entry.pair_id == pair_id))
-    }
-}
 
 #[allow(
     clippy::too_many_lines,
@@ -247,23 +221,23 @@ const fn healthy_proxy(
             role: EndpointRole::Proxy,
             pairing: PairingState::PairedConnected,
             session: SessionState::Healthy,
-            operation: OperationState::None,
-            requires_user_intent: false,
         },
     )
 }
 
-#[test]
-fn pairing_and_fresh_session_interoperate_end_to_end() {
-    let (requester_record, proxy_record) = paired_records();
-    let pair_id = requester_record.pair_id();
+/// Runs the session handshake of a stored pairing; both sides then hold
+/// the completed handshake awaiting `session.ready`.
+fn authenticating_sessions(
+    requester_record: &PairRecord,
+    proxy_record: &PairRecord,
+) -> (SessionAuthentication, SessionAuthentication) {
     let mut requester = SessionHandshake::begin_requester(
-        &requester_record,
+        requester_record,
         TransportProfile::Stream,
         ExplicitUserIntent::record(),
     )
     .expect("explicit requester session starts");
-    let mut proxy = SessionHandshake::begin_proxy(&proxy_record, TransportProfile::Stream)
+    let mut proxy = SessionHandshake::begin_proxy(proxy_record, TransportProfile::Stream)
         .expect("proxy session starts");
 
     let first = requester.write_message().expect("KK message one");
@@ -277,49 +251,55 @@ fn pairing_and_fresh_session_interoperate_end_to_end() {
     assert!(requester.is_complete());
     assert!(proxy.is_complete());
 
-    let mut requester = requester
+    let requester = requester
         .into_authentication()
         .expect("requester derives the fresh session");
-    let mut proxy = proxy
+    let proxy = proxy
         .into_authentication()
         .expect("proxy derives the fresh session");
     assert_eq!(requester.session_id(), proxy.session_id());
-    let session_id = requester.session_id();
+    (requester, proxy)
+}
 
-    let mut requester_nonce = [0_u8; 32];
-    getrandom::fill(&mut requester_nonce).expect("random requester nonce");
-    let mut proxy_nonce = [0_u8; 32];
-    getrandom::fill(&mut proxy_nonce).expect("random proxy nonce");
-    let requester_ready = requester
-        .send_ready(requester_nonce)
-        .expect("requester session.ready seals");
+/// Monotonic instant the custodian's first message arrives.
+const READY_AT_MS: u64 = 300;
+
+fn ready_nonce() -> [u8; 32] {
+    let mut nonce = [0_u8; 32];
+    getrandom::fill(&mut nonce).expect("random ready nonce");
+    nonce
+}
+
+#[test]
+fn pairing_and_fresh_session_interoperate_end_to_end() {
+    let (requester_record, proxy_record) = paired_records();
+    let (mut requester, mut proxy) = authenticating_sessions(&requester_record, &proxy_record);
+
+    assert!(matches!(
+        requester.send_ready(ready_nonce()),
+        Err(SessionError::RoleViolation)
+    ));
     let proxy_ready = proxy
-        .send_ready(proxy_nonce)
-        .expect("proxy session.ready seals");
-    let mut requester_store = MemoryPairStore::default();
-    let mut proxy_store = MemoryPairStore::default();
-    requester
-        .receive_ready(&mut requester_store, &proxy_ready, 300)
-        .expect("requester verifies exact proxy parameters");
-    proxy
-        .receive_ready(&mut proxy_store, &requester_ready, 300)
-        .expect("proxy verifies exact requester parameters");
-    assert!(requester_store.revoked.is_empty());
-    assert!(proxy_store.revoked.is_empty());
+        .send_ready(ready_nonce())
+        .expect("custodian session.ready seals");
+    assert!(matches!(
+        requester
+            .receive_ready(&proxy_ready, READY_AT_MS)
+            .expect("requester reads the custodian's first message"),
+        ReadyOutcome::Verified
+    ));
 
     let mut requester = requester
         .into_established()
-        .expect("requester becomes healthy only after mutual ready");
+        .expect("requester becomes healthy once it verified ready");
     let mut proxy = proxy
         .into_established()
-        .expect("proxy becomes healthy only after mutual ready");
+        .expect("custodian becomes healthy once it sent ready");
     assert!(requester.state().operation_admission_permitted());
     assert!(proxy.state().operation_admission_permitted());
 
     let request = OperationRequest::reconstruct(
         OperationId::from_array([0x70; 16]),
-        pair_id,
-        session_id,
         ProfileName::CardStatus,
         400,
         5_000,
@@ -330,14 +310,12 @@ fn pairing_and_fresh_session_interoperate_end_to_end() {
         .send(&TypedMessage::OperationRequest(request.clone()))
         .expect("established requester seals typed traffic");
     match proxy
-        .receive(&mut proxy_store, &frame, 401)
+        .receive(&frame, 401)
         .expect("proxy authenticates typed traffic")
     {
         ReceiveOutcome::Message(TypedMessage::OperationRequest(received)) => {
             let expected = OperationRequest::reconstruct(
                 request.operation_id,
-                request.pair_id,
-                request.session_id,
                 request.profile,
                 401,
                 request.expires_after_ms,
@@ -345,10 +323,6 @@ fn pairing_and_fresh_session_interoperate_end_to_end() {
             )
             .expect("the receiver-local request is valid");
             assert_eq!(received, expected);
-            assert_eq!(
-                received.request_hash().expect("received request hashes"),
-                request.request_hash().expect("sent request hashes"),
-            );
         }
         other => panic!("unexpected established-session outcome: {other:?}"),
     }
@@ -368,10 +342,9 @@ fn pairing_and_fresh_session_interoperate_end_to_end() {
 }
 
 #[test]
-fn first_authenticated_wrong_phase_message_revokes_pairing() {
+fn an_authenticated_wrong_phase_message_closes_the_session_and_keeps_the_pairing() {
     let (pair_id, mut sender, receiver, grants_hash) = raw_established_channels();
     let mut receiver = healthy_proxy(pair_id, receiver);
-    let mut store = MemoryPairStore::default();
     let wrong_phase = TypedMessage::SessionReady(SessionReadyMessage {
         parameters: SessionParameters {
             transport_profile: refineid_rapp::STREAM_PROFILE.into(),
@@ -387,33 +360,35 @@ fn first_authenticated_wrong_phase_message_revokes_pairing() {
         )
         .expect("the paired peer authenticates the wrong-phase message");
 
-    match receiver
-        .receive(&mut store, &frame, 10_000)
-        .expect("durable pair revocation succeeds")
-    {
-        ReceiveOutcome::PairRevoked {
+    let notice = match receiver.receive(&frame, 10_000).expect("receive") {
+        ReceiveOutcome::ViolationClosed {
             violation: AuthenticatedViolation::UnexpectedPhase(MessageType::SessionReady),
-            ..
-        } => {}
-        other => panic!("wrong-phase traffic did not revoke immediately: {other:?}"),
-    }
-    assert_eq!(store.revoked.len(), 1);
-    assert_eq!(store.revoked[0].pair_id, pair_id);
-    assert_eq!(receiver.state().pairing, PairingState::Revoked);
+            outcome,
+            notice,
+        } => {
+            assert!(
+                !outcome
+                    .actions
+                    .contains(&refineid_rapp::Action::DestroyPairKeys)
+            );
+            notice.expect("the violation close is sealed")
+        }
+        other => panic!("wrong-phase traffic did not close the session: {other:?}"),
+    };
+    let envelope = sender.open(&notice).expect("the sender opens the close");
+    assert_eq!(
+        TypedMessage::from_envelope(envelope, 10_000).expect("the close decodes"),
+        TypedMessage::SessionClose(SessionCloseMessage {
+            reason: CloseReason::ProtocolViolation
+        })
+    );
+    assert_eq!(receiver.state().pairing, PairingState::PairedConnected);
+    assert_eq!(receiver.state().session, SessionState::Closing);
     assert!(matches!(
-        receiver.receive(&mut store, &frame, 10_001),
+        receiver.receive(&frame, 10_001),
         Err(EndpointError::SessionClosed)
     ));
 }
-
-/// Liveness timing that never fires within these tests.
-const QUIET_LIVENESS: LivenessConfig = LivenessConfig {
-    base_interval_ms: 60_000,
-    response_timeout_ms: 10_000,
-    maximum_interval_ms: 60_000,
-    maximum_jitter_ms: 0,
-    maximum_misses: 1,
-};
 
 /// Monotonic instant the sessions start at.
 const SESSION_START_MS: u64 = 1_000;
@@ -427,67 +402,126 @@ fn established_runtimes() -> (EstablishedSessionRuntime, EstablishedSessionRunti
             role: EndpointRole::Requester,
             pairing: PairingState::PairedConnected,
             session: SessionState::Healthy,
-            operation: OperationState::None,
-            requires_user_intent: false,
         },
     );
     (
-        EstablishedSessionRuntime::new(requester, QUIET_LIVENESS, SESSION_START_MS)
-            .expect("requester runtime starts"),
-        EstablishedSessionRuntime::new(
-            healthy_proxy(pair_id, proxy),
-            QUIET_LIVENESS,
-            SESSION_START_MS,
-        )
-        .expect("proxy runtime starts"),
+        EstablishedSessionRuntime::new(requester, SESSION_START_MS),
+        EstablishedSessionRuntime::new(healthy_proxy(pair_id, proxy), SESSION_START_MS),
     )
 }
 
 #[test]
 fn custodian_withdrawal_close_reaches_the_requester_with_its_reason() {
     let (mut requester, mut proxy) = established_runtimes();
-    let mut store = MemoryPairStore::default();
     let frame = proxy
         .close_with_reason(CloseReason::ServiceWithdrawn)
         .expect("close notice seals");
     assert!(matches!(
         requester
-            .receive(&mut store, &frame, SESSION_START_MS)
+            .receive(&frame, SESSION_START_MS)
             .expect("close notice opens"),
         RuntimeReceive::PeerClosed(CloseReason::ServiceWithdrawn)
     ));
-    assert!(store.revoked.is_empty());
     assert!(proxy.close_with_reason(CloseReason::Normal).is_err());
+}
+
+#[test]
+fn a_revocation_notice_is_a_session_only_message() {
+    let (mut requester, mut proxy) = established_runtimes();
+    let frame = requester
+        .close_with_reason(CloseReason::PairingRevoked)
+        .expect("close notice seals");
+    assert!(matches!(
+        proxy
+            .receive(&frame, SESSION_START_MS)
+            .expect("close notice opens"),
+        RuntimeReceive::PeerClosed(CloseReason::PairingRevoked)
+    ));
+}
+
+#[test]
+fn a_revoking_custodian_sends_the_close_in_place_of_ready() {
+    let (requester_record, proxy_record) = paired_records();
+    let (mut requester, mut proxy) = authenticating_sessions(&requester_record, &proxy_record);
+    let notice = proxy
+        .send_revocation_notice()
+        .expect("the close is the custodian's first message");
+    assert!(matches!(
+        requester
+            .receive_ready(&notice, READY_AT_MS)
+            .expect("requester reads the custodian's first message"),
+        ReadyOutcome::PeerClosed(CloseReason::PairingRevoked)
+    ));
+    assert!(matches!(
+        requester.into_established(),
+        Err(SessionError::ReadyIncomplete)
+    ));
+    assert!(matches!(
+        proxy.send_ready(ready_nonce()),
+        Err(SessionError::Closed)
+    ));
+}
+
+#[test]
+fn a_revoking_requester_sends_the_close_as_its_first_message() {
+    let (requester_record, proxy_record) = paired_records();
+    let (mut requester, mut proxy) = authenticating_sessions(&requester_record, &proxy_record);
+    proxy
+        .send_ready(ready_nonce())
+        .expect("custodian session.ready seals");
+    let notice = requester
+        .send_revocation_notice()
+        .expect("the close is the requester's first message");
+    let mut proxy = EstablishedSessionRuntime::new(
+        proxy.into_established().expect("custodian is healthy"),
+        SESSION_START_MS,
+    );
+    assert!(matches!(
+        proxy
+            .receive(&notice, SESSION_START_MS)
+            .expect("the close opens"),
+        RuntimeReceive::PeerClosed(CloseReason::PairingRevoked)
+    ));
+}
+
+#[test]
+fn a_custodian_that_sent_ready_cannot_send_the_revocation_close_first() {
+    let (requester_record, proxy_record) = paired_records();
+    let (_, mut proxy) = authenticating_sessions(&requester_record, &proxy_record);
+    proxy
+        .send_ready(ready_nonce())
+        .expect("custodian session.ready seals");
+    assert!(matches!(
+        proxy.send_revocation_notice(),
+        Err(SessionError::DuplicateReady)
+    ));
 }
 
 #[test]
 fn requester_close_reaches_the_custodian_with_its_reason() {
     let (mut requester, mut proxy) = established_runtimes();
-    let mut store = MemoryPairStore::default();
     let frame = requester
         .close_with_reason(CloseReason::UserDisconnect)
         .expect("close notice seals");
     assert!(matches!(
         proxy
-            .receive(&mut store, &frame, SESSION_START_MS)
+            .receive(&frame, SESSION_START_MS)
             .expect("close notice opens"),
         RuntimeReceive::PeerClosed(CloseReason::UserDisconnect)
     ));
-    assert!(store.revoked.is_empty());
 }
 
 #[test]
 fn unauthenticated_ciphertext_failure_closes_only_session() {
     let (pair_id, mut sender, receiver, _) = raw_established_channels();
     let mut receiver = healthy_proxy(pair_id, receiver);
-    let mut store = MemoryPairStore::default();
-    let message = TypedMessage::OperationStatusRequest(OperationId::from_array([0x83; 16]));
+    let message = TypedMessage::CardStatus(refineid_rapp::CardStatusMessage::Absent);
     let valid = sender
         .seal(
             message.message_type(),
-            message.to_wire_body().expect("status request encodes"),
+            message.to_wire_body().expect("card status encodes"),
         )
-        .expect("status request encrypts");
+        .expect("card status encrypts");
     let mut tampered = valid.as_bytes().to_vec();
     let last = tampered.last_mut().expect("Noise frame is nonempty");
     *last ^= 0x01;
@@ -495,34 +529,11 @@ fn unauthenticated_ciphertext_failure_closes_only_session() {
 
     assert!(matches!(
         receiver
-            .receive(&mut store, &tampered, 20_000)
+            .receive(&tampered, 20_000)
             .expect("integrity failure has a fail-closed outcome"),
         ReceiveOutcome::SessionClosed(_)
     ));
-    assert!(store.revoked.is_empty());
     assert_eq!(receiver.state().pairing, PairingState::PairedConnected);
-}
-
-#[test]
-fn credential_rejection_durably_revokes_the_pair() {
-    let (pair_id, _, receiver, _) = raw_established_channels();
-    let mut receiver = healthy_proxy(pair_id, receiver);
-    let mut store = MemoryPairStore::default();
-
-    let outcome = receiver
-        .revoke_credential_rejection(&mut store, 12_345)
-        .expect("credential rejection tombstones the pair");
-
-    assert_eq!(store.revoked.len(), 1);
-    assert_eq!(store.revoked[0].pair_id, pair_id);
-    assert_eq!(store.revoked[0].revoked_at_ms, 12_345);
-    assert_eq!(receiver.state().pairing, PairingState::Revoked);
-    assert_eq!(receiver.state().session, SessionState::Closing);
-    assert!(
-        outcome
-            .actions
-            .contains(&refineid_rapp::Action::DestroyPairKeys)
-    );
 }
 
 #[test]

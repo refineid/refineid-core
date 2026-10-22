@@ -1,0 +1,683 @@
+{
+  "cpace_kc2": [
+    {
+      "candidate_id": "ble",
+      "context_hex": "8874726170702d70616972696e672d636f6e7465787483181a0a15784543504143452d52495354523235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f32353531395f436861436861506f6c795f5348413531327466692e726566696e6569642e726170702e626c6563626c6558206e0b03f362a81029af53003c55ecb9bde3045918ae4f21c16a9b72879ab7ddc66972657175657374657269637573746f6469616e",
+      "context_length": 177,
+      "generator_hex": "8a880b160767c57afb53a4e1ce5a77716eaa308d0b2cfe03bd15d99c3428fc6b",
+      "name": "kc2-ble",
+      "offer_hash_hex": "6e0b03f362a81029af53003c55ecb9bde3045918ae4f21c16a9b72879ab7ddc6",
+      "offer_id_hex": "1010101010101010101010101010101010101010101010101010101010101010",
+      "pairing_code": "7KX4M9",
+      "step1_hex": "72c5218a2d49ca9ff731a2d19f13edaa61deaa463f65669eaaa0604a63eb8750",
+      "step2_hex": "56e5558471e193d14ab910e10c1f9ef6478fa6c34315657713190eba224132370cdb0ae4ea3c925063827c7e78f0a098b1e8f3aa82ee8a0cc128423004b987d3",
+      "step3_hex": "c4754c04cc60d0b048d5b3cb20571dbca6b843605cf8e5c2385dfd2a93b7a88f",
+      "test_only_initiator_random_hex": "33333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333",
+      "test_only_responder_random_hex": "44444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444",
+      "transport_profile": "fi.refineid.rapp.ble"
+    },
+    {
+      "candidate_id": "stream",
+      "context_hex": "8874726170702d70616972696e672d636f6e7465787483181a0a15784543504143452d52495354523235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f32353531395f436861436861506f6c795f5348413531327266692e726566696e6569642e73747265616d6673747265616d58206e0b03f362a81029af53003c55ecb9bde3045918ae4f21c16a9b72879ab7ddc66972657175657374657269637573746f6469616e",
+      "context_length": 178,
+      "generator_hex": "e6d99ec4b941a340055696213b29d2f6b118c9739c6ba0a5c5500d1b4acc3247",
+      "name": "kc2-stream",
+      "offer_hash_hex": "6e0b03f362a81029af53003c55ecb9bde3045918ae4f21c16a9b72879ab7ddc6",
+      "offer_id_hex": "1010101010101010101010101010101010101010101010101010101010101010",
+      "pairing_code": "7KX4M9",
+      "step1_hex": "aa4bad349f37e79daba10e71209debb32e685332367eb67796291a48e02c786a",
+      "step2_hex": "e4900cf90614e3d682a17049b823e3d047c413339376eba6f36d5e0168d5db3ca4ab6098b9796a9e98e104c4dd88c20e70eb895bcbcef298034f91a411e8be45",
+      "step3_hex": "682b4c5c7ffec0d0d5df580db670baa41b9eaa41c7a258cdb9147c17f57a4ce0",
+      "test_only_initiator_random_hex": "33333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333",
+      "test_only_responder_random_hex": "44444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444",
+      "transport_profile": "fi.refineid.stream"
+    }
+  ],
+  "deterministic_cbor": [
+    {
+      "encoded_hex": "00",
+      "name": "unsigned-zero",
+      "value": {
+        "kind": "unsigned",
+        "value": 0
+      }
+    },
+    {
+      "encoded_hex": "17",
+      "name": "unsigned-last-immediate",
+      "value": {
+        "kind": "unsigned",
+        "value": 23
+      }
+    },
+    {
+      "encoded_hex": "1818",
+      "name": "unsigned-first-byte",
+      "value": {
+        "kind": "unsigned",
+        "value": 24
+      }
+    },
+    {
+      "encoded_hex": "18ff",
+      "name": "unsigned-last-byte",
+      "value": {
+        "kind": "unsigned",
+        "value": 255
+      }
+    },
+    {
+      "encoded_hex": "190100",
+      "name": "unsigned-first-u16",
+      "value": {
+        "kind": "unsigned",
+        "value": 256
+      }
+    },
+    {
+      "encoded_hex": "20",
+      "name": "negative-one",
+      "value": {
+        "kind": "negative",
+        "value": -1
+      }
+    },
+    {
+      "encoded_hex": "37",
+      "name": "negative-last-immediate",
+      "value": {
+        "kind": "negative",
+        "value": -24
+      }
+    },
+    {
+      "encoded_hex": "3818",
+      "name": "negative-first-byte",
+      "value": {
+        "kind": "negative",
+        "value": -25
+      }
+    },
+    {
+      "encoded_hex": "430001ff",
+      "name": "byte-string",
+      "value": {
+        "hex": "0001ff",
+        "kind": "bytes"
+      }
+    },
+    {
+      "encoded_hex": "6452415050",
+      "name": "text-string",
+      "value": {
+        "kind": "text",
+        "value": "RAPP"
+      }
+    },
+    {
+      "encoded_hex": "f5",
+      "name": "boolean",
+      "value": {
+        "kind": "bool",
+        "value": true
+      }
+    },
+    {
+      "encoded_hex": "f6",
+      "name": "null",
+      "value": {
+        "kind": "null"
+      }
+    },
+    {
+      "encoded_hex": "83016178f4",
+      "name": "heterogeneous-array",
+      "value": {
+        "items": [
+          {
+            "kind": "unsigned",
+            "value": 1
+          },
+          {
+            "kind": "text",
+            "value": "x"
+          },
+          {
+            "kind": "bool",
+            "value": false
+          }
+        ],
+        "kind": "array"
+      }
+    },
+    {
+      "encoded_hex": "a2617a0162616102",
+      "name": "rfc8949-map-key-order",
+      "value": {
+        "entries": [
+          {
+            "key": "aa",
+            "value": {
+              "kind": "unsigned",
+              "value": 2
+            }
+          },
+          {
+            "key": "z",
+            "value": {
+              "kind": "unsigned",
+              "value": 1
+            }
+          }
+        ],
+        "kind": "map"
+      }
+    },
+    {
+      "encoded_hex": "a1616182f6420102",
+      "name": "nested-values",
+      "value": {
+        "entries": [
+          {
+            "key": "a",
+            "value": {
+              "items": [
+                {
+                  "kind": "null"
+                },
+                {
+                  "hex": "0102",
+                  "kind": "bytes"
+                }
+              ],
+              "kind": "array"
+            }
+          }
+        ],
+        "kind": "map"
+      }
+    }
+  ],
+  "format": "fi.refineid.rapp.conformance",
+  "grant_enforcement": [
+    {
+      "expected": "accepted",
+      "granted_profiles": [
+        "fi.refineid.card-status"
+      ],
+      "name": "granted-card-status",
+      "requested_profile": "fi.refineid.card-status"
+    },
+    {
+      "expected": "profile_not_granted",
+      "granted_profiles": [
+        "fi.refineid.authentication"
+      ],
+      "name": "card-status-not-granted",
+      "requested_profile": "fi.refineid.card-status"
+    },
+    {
+      "expected": "profile_not_granted",
+      "granted_profiles": [],
+      "name": "empty-grant-set",
+      "requested_profile": "fi.refineid.card-status"
+    }
+  ],
+  "grants_hash": [
+    {
+      "canonical_cbor_hex": "81781a66692e726566696e6569642e61757468656e7469636174696f6e",
+      "name": "authentication-only",
+      "profiles": [
+        "fi.refineid.authentication"
+      ],
+      "sha256_hex": "c7eeddabd990c83a823b4d2866d4f2f0e70d38e58ff961c5b209ea199f49fb71"
+    },
+    {
+      "canonical_cbor_hex": "82781a66692e726566696e6569642e61757468656e7469636174696f6e7766692e726566696e6569642e636172642d737461747573",
+      "name": "authentication-and-card-status",
+      "profiles": [
+        "fi.refineid.authentication",
+        "fi.refineid.card-status"
+      ],
+      "sha256_hex": "b44e47930fe605d14a3bcf433ac27f0ebd77a152c309490f7db2e854d038e943"
+    },
+    {
+      "canonical_cbor_hex": "82781a66692e726566696e6569642e61757468656e7469636174696f6e7766692e726566696e6569642e636172642d737461747573",
+      "name": "input-order-is-not-semantic",
+      "profiles": [
+        "fi.refineid.card-status",
+        "fi.refineid.authentication"
+      ],
+      "sha256_hex": "b44e47930fe605d14a3bcf433ac27f0ebd77a152c309490f7db2e854d038e943"
+    }
+  ],
+  "identifier_derivation": [
+    {
+      "handshake_hash_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "name": "zero-handshake-hash",
+      "pair_id_hex": "3068cd52b9a5bfeff40801b5c32c92a4",
+      "session_id_hex": "8bf9f5d29f938076a40181b0cff866c7"
+    },
+    {
+      "handshake_hash_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+      "name": "incrementing-handshake-hash",
+      "pair_id_hex": "7739e31da04cb64444f4ff318e3e0ecd",
+      "session_id_hex": "3c00f80ee878ff959f939c208c32229a"
+    }
+  ],
+  "noise_handshake": [
+    {
+      "handshake_hash_hex": "7d03d15a828e3e58732b21d7bc29166fef3fc23215d3cf3d33c8f0834440df63b235c5c616d01f1c1380af933181e710a248d5fdf598f8b2fa67d8b3d42e5311",
+      "initiator_static_public_hex": "7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13",
+      "messages_hex": [
+        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b1428f1d1772791e91661a8299bab0ab601",
+        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b5d2e5945bc2b211c807592da57d72728cf713a87420d8f24fc6894d55760bb702ec0627c291565563d388b740c29eca73dd347d163d79ecb76e93f9962c6b111",
+        "833dfea961fbaa4ffcf981d64d355d775ddf662bb00cdedce9e9b3324ceb667dcd25e550635538dcf94dc73baa9202f12274c458f9656542e8fe84ee18f6bb40"
+      ],
+      "name": "pairing-xxpsk3-fixed-transcript-ble",
+      "offer_hash_hex": "6666666666666666666666666666666666666666666666666666666666666666",
+      "pair_id_hex": "fafdc31df6800eeb4081facd47e6960c",
+      "prologue_hex": "856c726170702d70616972696e6783181a0a15784543504143452d52495354523235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f32353531395f436861436861506f6c795f534841353132582066666666666666666666666666666666666666666666666666666666666666667466692e726566696e6569642e726170702e626c65",
+      "responder_static_public_hex": "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20",
+      "session_id_hex": "fc7867895c141e0e829380b94013afc5",
+      "suite": "Noise_XXpsk3_25519_ChaChaPoly_SHA512",
+      "test_only_initiator_ephemeral_private_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+      "test_only_initiator_static_private_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "test_only_pairing_secret_hex": "5555555555555555555555555555555555555555555555555555555555555555",
+      "test_only_responder_ephemeral_private_hex": "4444444444444444444444444444444444444444444444444444444444444444",
+      "test_only_responder_static_private_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+      "transport_profile": "fi.refineid.rapp.ble"
+    },
+    {
+      "handshake_hash_hex": "835e1b7dbcd26b978430a843fddf090e43512c58a99f5c1e96a45c5a9dbe3d58d5262c275159d02daf74f89ab26d98874b28261bfea12efbdd03a2cab7910e33",
+      "initiator_static_public_hex": "7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13",
+      "messages_hex": [
+        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b14efe3be55aa077a8b8da7e475b687527f",
+        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b5d2e5945bc2b211c807592da57d72728cf713a87420d8f24fc6894d55760bb708bd82129a77ae9a464b109f7aa7f807bfec0ebbfa4224635b3290200b2fd74eb",
+        "833dfea961fbaa4ffcf981d64d355d775ddf662bb00cdedce9e9b3324ceb667dbbbbc4a354a73f566214989bc9adaf70063d61a079b68dec3013dd5074fac55c"
+      ],
+      "name": "pairing-xxpsk3-fixed-transcript-stream",
+      "offer_hash_hex": "6666666666666666666666666666666666666666666666666666666666666666",
+      "pair_id_hex": "a67115edfa0db1ccedd37f0b2780e33d",
+      "prologue_hex": "856c726170702d70616972696e6783181a0a15784543504143452d52495354523235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f32353531395f436861436861506f6c795f534841353132582066666666666666666666666666666666666666666666666666666666666666667266692e726566696e6569642e73747265616d",
+      "responder_static_public_hex": "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20",
+      "session_id_hex": "929117f37d60bd78e6802853e9de591b",
+      "suite": "Noise_XXpsk3_25519_ChaChaPoly_SHA512",
+      "test_only_initiator_ephemeral_private_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+      "test_only_initiator_static_private_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "test_only_pairing_secret_hex": "5555555555555555555555555555555555555555555555555555555555555555",
+      "test_only_responder_ephemeral_private_hex": "4444444444444444444444444444444444444444444444444444444444444444",
+      "test_only_responder_static_private_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+      "transport_profile": "fi.refineid.stream"
+    },
+    {
+      "c1_initiator_to_responder_hex": "271245e9b5ffc357a6d442e04a376531bd3a0f81d69d7b97eaa132cc81d209ab",
+      "c2_responder_to_initiator_hex": "f3364ea960fcb3b95518b6029e2fbac8d1f259e630fa53beb63cf647e672ca40",
+      "grants_hash_hex": "7777777777777777777777777777777777777777777777777777777777777777",
+      "handshake_hash_hex": "24e9f95f60ec7fd69b45def1d0bf6293e3a75eebb969fb173f41b0e7b0d4d8b549eeb57d52cd78f4395a358091d0dff4bd068cc23981b1594dfff59027d753e0",
+      "initiator_static_public_hex": "7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13",
+      "messages_hex": [
+        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b147b11ad5bf9db1826488e0c51a5130895",
+        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b4e344df2ef301875249d68c9e27398a4"
+      ],
+      "name": "session-kk-fixed-transcript-ble",
+      "pair_id_hex": "8ab9b8bcde5c6eec845d9b1ca0d3a7be",
+      "prologue_hex": "866c726170702d73657373696f6e83181a0a1578204e6f6973655f4b4b5f32353531395f436861436861506f6c795f534841353132508ab9b8bcde5c6eec845d9b1ca0d3a7be582077777777777777777777777777777777777777777777777777777777777777777466692e726566696e6569642e726170702e626c65",
+      "responder_static_public_hex": "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20",
+      "session_id_hex": "2e2c91b01aa8577ba72e677c52e02131",
+      "suite": "Noise_KK_25519_ChaChaPoly_SHA512",
+      "test_only_initiator_ephemeral_private_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+      "test_only_initiator_static_private_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "test_only_responder_ephemeral_private_hex": "4444444444444444444444444444444444444444444444444444444444444444",
+      "test_only_responder_static_private_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+      "transport_profile": "fi.refineid.rapp.ble"
+    },
+    {
+      "c1_initiator_to_responder_hex": "271245e9b5ffc357a6d442e04a376531bd3a0f81d69d7b97eaa132cc81d209ab",
+      "c2_responder_to_initiator_hex": "f3364ea960fcb3b95518b6029e2fbac8d1f259e630fa53beb63cf647e672ca40",
+      "grants_hash_hex": "7777777777777777777777777777777777777777777777777777777777777777",
+      "handshake_hash_hex": "873f129acfbd06a2a1fbd30851cfcb9621faf6f9691aa0cb1681f643bdaeb18052f8e56c68c2d5cfb1056fb7e29d5e244c03da11d0ef5dec03eda292c21781e8",
+      "initiator_static_public_hex": "7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13",
+      "messages_hex": [
+        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b148dd0265297cad17dafff0e8cc068ce3b",
+        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b333ea2d1cef53c3205b415cc06950353"
+      ],
+      "name": "session-kk-fixed-transcript-stream",
+      "pair_id_hex": "8ab9b8bcde5c6eec845d9b1ca0d3a7be",
+      "prologue_hex": "866c726170702d73657373696f6e83181a0a1578204e6f6973655f4b4b5f32353531395f436861436861506f6c795f534841353132508ab9b8bcde5c6eec845d9b1ca0d3a7be582077777777777777777777777777777777777777777777777777777777777777777266692e726566696e6569642e73747265616d",
+      "responder_static_public_hex": "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20",
+      "session_id_hex": "3789acde82e6af43f054b3e0e33ade33",
+      "suite": "Noise_KK_25519_ChaChaPoly_SHA512",
+      "test_only_initiator_ephemeral_private_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+      "test_only_initiator_static_private_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "test_only_responder_ephemeral_private_hex": "4444444444444444444444444444444444444444444444444444444444444444",
+      "test_only_responder_static_private_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+      "transport_profile": "fi.refineid.stream"
+    }
+  ],
+  "pairing_offer": [
+    {
+      "encoded_hex": "a766736368656d6564726170706673756974657381784543504143452d52495354523235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f32353531395f436861436861506f6c795f5348413531326776657273696f6e83181a0a15686f666665725f6964582010101010101010101010101010101010101010101010101010101010101010106870726f66696c6573837766692e726566696e6569642e636172642d737461747573781a66692e726566696e6569642e61757468656e7469636174696f6e781c66692e726566696e6569642e646f63756d656e742d7369676e696e676a7472616e73706f72747381a36770726f66696c657466692e726566696e6569642e726170702e626c656a706172616d6574657273a16c736572766963655f75756964782437453339464430312d413642352d344437382d394531312d3337453238453935343546316c63616e6469646174655f696463626c656c6f666665725f74746c5f6d731a000493e0",
+      "encoded_length": 380,
+      "name": "offer-ble",
+      "offer_hash_hex": "273fefd93f8a5de7060a5ae8d5d5b05e29047b5628af7912bd41ad224a8b4b25",
+      "offer_id_hex": "1010101010101010101010101010101010101010101010101010101010101010",
+      "profiles": [
+        "fi.refineid.card-status",
+        "fi.refineid.authentication",
+        "fi.refineid.document-signing"
+      ],
+      "transport_profiles": [
+        "fi.refineid.rapp.ble"
+      ]
+    },
+    {
+      "encoded_hex": "a766736368656d6564726170706673756974657381784543504143452d52495354523235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f32353531395f436861436861506f6c795f5348413531326776657273696f6e83181a0a15686f666665725f6964582010101010101010101010101010101010101010101010101010101010101010106870726f66696c6573837766692e726566696e6569642e636172642d737461747573781a66692e726566696e6569642e61757468656e7469636174696f6e781c66692e726566696e6569642e646f63756d656e742d7369676e696e676a7472616e73706f72747381a36770726f66696c657266692e726566696e6569642e73747265616d6a706172616d6574657273a06c63616e6469646174655f69646673747265616d6c6f666665725f74746c5f6d731a000493e0",
+      "encoded_length": 330,
+      "name": "offer-stream",
+      "offer_hash_hex": "bfff8d49fc9c43f760754c1cee1ec0c766e808e321e8dc6b332bc536b7034b78",
+      "offer_id_hex": "1010101010101010101010101010101010101010101010101010101010101010",
+      "profiles": [
+        "fi.refineid.card-status",
+        "fi.refineid.authentication",
+        "fi.refineid.document-signing"
+      ],
+      "transport_profiles": [
+        "fi.refineid.stream"
+      ]
+    },
+    {
+      "encoded_hex": "a766736368656d6564726170706673756974657381784543504143452d52495354523235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f32353531395f436861436861506f6c795f5348413531326776657273696f6e83181a0a15686f666665725f6964582010101010101010101010101010101010101010101010101010101010101010106870726f66696c6573837766692e726566696e6569642e636172642d737461747573781a66692e726566696e6569642e61757468656e7469636174696f6e781c66692e726566696e6569642e646f63756d656e742d7369676e696e676a7472616e73706f72747382a36770726f66696c657466692e726566696e6569642e726170702e626c656a706172616d6574657273a16c736572766963655f75756964782437453339464430312d413642352d344437382d394531312d3337453238453935343546316c63616e6469646174655f696463626c65a36770726f66696c657266692e726566696e6569642e73747265616d6a706172616d6574657273a06c63616e6469646174655f69646673747265616d6c6f666665725f74746c5f6d731a000493e0",
+      "encoded_length": 440,
+      "name": "offer-ble-and-stream",
+      "offer_hash_hex": "3f0ac1013ae677936123f7d3aebd6cbd5f6050656eeeda5fc57fd17ee8676077",
+      "offer_id_hex": "1010101010101010101010101010101010101010101010101010101010101010",
+      "profiles": [
+        "fi.refineid.card-status",
+        "fi.refineid.authentication",
+        "fi.refineid.document-signing"
+      ],
+      "transport_profiles": [
+        "fi.refineid.rapp.ble",
+        "fi.refineid.stream"
+      ]
+    }
+  ],
+  "protocol_document_version": "26.10.21",
+  "rejected_cbor": [
+    {
+      "encoded_hex": "1817",
+      "error": "NonCanonical",
+      "name": "non-minimal-integer"
+    },
+    {
+      "encoded_hex": "a2616101616102",
+      "error": "DuplicateMapKey",
+      "name": "duplicate-map-key"
+    },
+    {
+      "encoded_hex": "a10102",
+      "error": "NonTextMapKey",
+      "name": "non-text-map-key"
+    },
+    {
+      "encoded_hex": "61ff",
+      "error": "InvalidUtf8",
+      "name": "invalid-utf8"
+    },
+    {
+      "encoded_hex": "0000",
+      "error": "TrailingData",
+      "name": "trailing-data"
+    },
+    {
+      "encoded_hex": "9fff",
+      "error": "ForbiddenCborType",
+      "name": "indefinite-length"
+    },
+    {
+      "encoded_hex": "c000",
+      "error": "ForbiddenCborType",
+      "name": "unregistered-tag"
+    },
+    {
+      "encoded_hex": "81818181818181818100",
+      "error": "NestingTooDeep",
+      "name": "excessive-nesting"
+    }
+  ],
+  "rejected_envelope": [
+    {
+      "canonical_cbor_hex": "a464626f6479a1696368616c6c656e67655820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb64747970656d6c6976656e6573732e70696e676873657175656e6365006a73657373696f6e5f696450aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "error": "MissingField { field: \"version\" }",
+      "name": "missing-version"
+    },
+    {
+      "canonical_cbor_hex": "a664626f6479a1696368616c6c656e67655820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb64747970656d6c6976656e6573732e70696e6766667574757265016776657273696f6e83181a0a156873657175656e6365006a73657373696f6e5f696450aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "error": "UnknownField",
+      "name": "unknown-envelope-field"
+    },
+    {
+      "canonical_cbor_hex": "a564626f6479a1696368616c6c656e67655820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb64747970656d6c6976656e6573732e70696e676776657273696f6e63302e316873657175656e6365006a73657373696f6e5f696450aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "error": "WrongType { field: \"version\" }",
+      "name": "wrong-version-type"
+    },
+    {
+      "canonical_cbor_hex": "a564626f6479a1696368616c6c656e67655820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb64747970656d6c6976656e6573732e70696e676776657273696f6e8200026873657175656e6365006a73657373696f6e5f696450aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "error": "UnsupportedVersion",
+      "name": "unsupported-version"
+    },
+    {
+      "canonical_cbor_hex": "a564626f6479a1696368616c6c656e67655820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb64747970656e6675747572652e6d6573736167656776657273696f6e83181a0a156873657175656e6365006a73657373696f6e5f696450aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "error": "UnknownMessageType",
+      "name": "unknown-message-type"
+    },
+    {
+      "canonical_cbor_hex": "a564626f6479a1696368616c6c656e67655820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb64747970656d6c6976656e6573732e70696e676776657273696f6e83181a0a156873657175656e6365006a73657373696f6e5f69644faaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "error": "WrongLength { field: \"session_id\", expected: 16, got: 15 }",
+      "name": "wrong-session-id-length"
+    },
+    {
+      "canonical_cbor_hex": "a564626f6479a1696368616c6c656e67655820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb64747970656d6c6976656e6573732e70696e676776657273696f6e83181a0a156873657175656e6365647a65726f6a73657373696f6e5f696450aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "error": "WrongType { field: \"sequence\" }",
+      "name": "wrong-sequence-type"
+    },
+    {
+      "canonical_cbor_hex": "a564626f64798064747970656d6c6976656e6573732e70696e676776657273696f6e83181a0a156873657175656e6365006a73657373696f6e5f696450aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "error": "WrongType { field: \"body\" }",
+      "name": "wrong-body-type"
+    },
+    {
+      "canonical_cbor_hex": "a664626f6479a1696368616c6c656e67655820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb64747970656d6c6976656e6573732e70696e676776657273696f6e83181a0a1568637269746963616c806873657175656e6365006a73657373696f6e5f696450aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "error": "UnknownField",
+      "name": "critical-is-an-unknown-field"
+    },
+    {
+      "canonical_cbor_hex": "a664626f6479a1696368616c6c656e67655820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb64747970656d6c6976656e6573732e70696e676776657273696f6e83181a0a156873657175656e6365006a657874656e73696f6e73a06a73657373696f6e5f696450aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "error": "UnknownField",
+      "name": "extensions-is-an-unknown-field"
+    }
+  ],
+  "sequence_guard": [
+    {
+      "accepted_sequences": [],
+      "expected": "accepted",
+      "expected_next_receive": 1,
+      "guard_session_id_hex": "000102030405060708090a0b0c0d0e0f",
+      "incoming_sequence": 0,
+      "incoming_session_id_hex": "000102030405060708090a0b0c0d0e0f",
+      "name": "initial-zero"
+    },
+    {
+      "accepted_sequences": [
+        0,
+        1
+      ],
+      "expected": "accepted",
+      "expected_next_receive": 3,
+      "guard_session_id_hex": "000102030405060708090a0b0c0d0e0f",
+      "incoming_sequence": 2,
+      "incoming_session_id_hex": "000102030405060708090a0b0c0d0e0f",
+      "name": "sequential-after-two"
+    },
+    {
+      "accepted_sequences": [
+        0
+      ],
+      "expected": "wrong_sequence",
+      "expected_next_receive": 1,
+      "guard_session_id_hex": "000102030405060708090a0b0c0d0e0f",
+      "incoming_sequence": 0,
+      "incoming_session_id_hex": "000102030405060708090a0b0c0d0e0f",
+      "name": "replayed-zero"
+    },
+    {
+      "accepted_sequences": [
+        0
+      ],
+      "expected": "wrong_sequence",
+      "expected_next_receive": 1,
+      "guard_session_id_hex": "000102030405060708090a0b0c0d0e0f",
+      "incoming_sequence": 2,
+      "incoming_session_id_hex": "000102030405060708090a0b0c0d0e0f",
+      "name": "forward-gap"
+    },
+    {
+      "accepted_sequences": [
+        0,
+        1
+      ],
+      "expected": "wrong_sequence",
+      "expected_next_receive": 2,
+      "guard_session_id_hex": "000102030405060708090a0b0c0d0e0f",
+      "incoming_sequence": 0,
+      "incoming_session_id_hex": "000102030405060708090a0b0c0d0e0f",
+      "name": "rollback-after-two"
+    },
+    {
+      "accepted_sequences": [],
+      "expected": "wrong_session",
+      "expected_next_receive": 0,
+      "guard_session_id_hex": "000102030405060708090a0b0c0d0e0f",
+      "incoming_sequence": 0,
+      "incoming_session_id_hex": "f0e0d0c0b0a090807060504030201000",
+      "name": "wrong-session"
+    }
+  ],
+  "wire_version": [
+    {
+      "expected": "accepted",
+      "name": "current-version",
+      "version": [
+        26,
+        10,
+        21
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "superseded-v26-10-18",
+      "version": [
+        26,
+        10,
+        18
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "superseded-v26-10-10",
+      "version": [
+        26,
+        10,
+        10
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "superseded-v26-10-9",
+      "version": [
+        26,
+        10,
+        9
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "superseded-v26-10-1",
+      "version": [
+        26,
+        10,
+        1
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "legacy-v26-9-28-downgrade",
+      "version": [
+        26,
+        9,
+        28
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "downgrade-to-earlier-patch",
+      "version": [
+        26,
+        10,
+        8
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "downgrade-to-26-8",
+      "version": [
+        26,
+        8,
+        0
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "downgrade-to-pre-release-zero",
+      "version": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "unknown-major",
+      "version": [
+        27,
+        0,
+        0
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "historical-two-element-version",
+      "version": [
+        26,
+        10
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "four-element-version",
+      "version": [
+        26,
+        10,
+        21,
+        1
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "empty-version",
+      "version": []
+    }
+  ],
+  "provenance": "Derived by tools/rapp-vectors/generate.py from the inputs in this file and RAPP v26.10.21 sections 4.2, 4.3, 6.1 to 6.3 and 7.2, with standard-library primitives checked against RFC 7748 section 6.1, RFC 8439 section 2.8.2 and RFC 9496 appendix A.1; the engine is not used."
+}

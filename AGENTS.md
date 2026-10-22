@@ -62,6 +62,30 @@ If any answer is missing, the slice is not ready; read the specification
 section again. The design questions in the refinement-types policy's
 "Review questions" are the checklist for both writing and review.
 
+## STPA in design
+
+Every design includes a short System-Theoretic Process Analysis (STPA),
+sized to the change. [stpa-rapp.md](docs/security/stpa-rapp.md) is the worked example and the
+record for RAPP and its applications.
+
+- Name the losses that matter in the real world: an operation without the
+  cardholder's informed consent, a PIN retry budget spent or a card
+  blocked, a cardholder who cannot authenticate or sign and cannot tell
+  why, a person or a card event disclosed to a third party, a document
+  other than the approved one signed. Reuse the recorded losses (L-n) and
+  hazards (H-n); add one only for a situation that can happen to a real
+  user.
+- Do not invent imaginary losses, hazards or threats to fill the method.
+  A few real ones beat a long list.
+- Draw the control structure the change touches: who commands whom, and
+  what feedback each controller gets. Look first for missing, late or
+  misleading feedback; a controller acting on a stale model is the usual
+  cause of a loss.
+- List the unsafe control actions (UCA-n) the change could issue and the
+  controller constraints (CC-n) the design enforces against them.
+- A small change records its analysis in the pull request; a change to
+  the control structure updates the STPA record that covers it.
+
 ## The floor
 
 The floor is enforced, not suggested: tracked git hooks (enable once per

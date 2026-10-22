@@ -10,10 +10,11 @@
 use std::collections::BTreeMap;
 
 use refineid_rapp::{
-    CardKeyProfile, CardOperation, CardOperationResult, CardStatusMessage, CertificateFingerprint,
-    CertificateKind, Envelope, MessageType, OperationId, PairId, ProgressEvent,
-    ProtocolErrorMessage, ResultError, ResultStatus, SessionId, SignatureAlgorithm, TypedMessage,
-    WireValue, decode_deterministic_cbor, encode_deterministic_cbor,
+    CardKeyProfile, CardOperation, CardOperationResult, CardPresence, CardReader,
+    CardStatusMessage, CertificateFingerprint, CertificateKind, Envelope, MessageType, OperationId,
+    PairId, ProgressEvent, ProtocolErrorMessage, ResultError, ResultStatus, SessionId,
+    SignatureAlgorithm, TypedMessage, WireValue, decode_deterministic_cbor,
+    encode_deterministic_cbor,
 };
 use serde::Deserialize;
 
@@ -211,19 +212,34 @@ fn results_and_errors_decode_to_their_meaning() {
 }
 
 #[test]
-fn card_status_carries_the_certificate_fingerprint() {
+fn card_status_carries_the_certificate_fingerprint_and_the_reader() {
     let corpus = corpus();
     let certificate = hex::decode(&corpus.fixed_inputs.certificate_der).expect("valid hex");
-    assert_eq!(
-        find(&corpus, "card-status-present"),
-        TypedMessage::CardStatus(CardStatusMessage::Present(
-            CertificateFingerprint::of_certificate(&certificate)
-        ))
-    );
-    assert_eq!(
-        find(&corpus, "card-status-absent"),
-        TypedMessage::CardStatus(CardStatusMessage::Absent)
-    );
+    let present = CardPresence::Present(CertificateFingerprint::of_certificate(&certificate));
+    for (name, card, reader) in [
+        (
+            "card-status-present-reader-attached",
+            present,
+            CardReader::Attached,
+        ),
+        ("card-status-present-no-reader", present, CardReader::Absent),
+        (
+            "card-status-absent-reader-attached",
+            CardPresence::Absent,
+            CardReader::Attached,
+        ),
+        (
+            "card-status-absent-no-reader",
+            CardPresence::Absent,
+            CardReader::Absent,
+        ),
+    ] {
+        assert_eq!(
+            find(&corpus, name),
+            TypedMessage::CardStatus(CardStatusMessage { card, reader }),
+            "{name}"
+        );
+    }
 }
 
 #[test]

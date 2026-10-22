@@ -515,7 +515,10 @@ fn requester_close_reaches_the_custodian_with_its_reason() {
 fn unauthenticated_ciphertext_failure_closes_only_session() {
     let (pair_id, mut sender, receiver, _) = raw_established_channels();
     let mut receiver = healthy_proxy(pair_id, receiver);
-    let message = TypedMessage::CardStatus(refineid_rapp::CardStatusMessage::Absent);
+    let message = TypedMessage::CardStatus(refineid_rapp::CardStatusMessage {
+        card: refineid_rapp::CardPresence::Absent,
+        reader: refineid_rapp::CardReader::Absent,
+    });
     let valid = sender
         .seal(
             message.message_type(),

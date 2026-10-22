@@ -57,13 +57,33 @@ pub struct PairingStoredMessage {
     pub pair_id: PairId,
 }
 
-/// Whether the custodian can serve a card now, and which (section 8.4).
+/// The card the custodian holds (section 8.4 items 1 and 2).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CardStatusMessage {
-    /// A card can answer; the fingerprint of its authentication certificate.
+pub enum CardPresence {
+    /// The custodian holds a card; the fingerprint of its authentication
+    /// certificate.
     Present(CertificateFingerprint),
-    /// No card can answer.
+    /// The custodian holds no card.
     Absent,
+}
+
+/// Whether a contact card reader is connected to the custodian (section 8.4
+/// item 1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CardReader {
+    /// A contact card reader is connected: built in, or attached to a port.
+    Attached,
+    /// No contact card reader is connected.
+    Absent,
+}
+
+/// The custodian's card and card reader (section 8.4).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CardStatusMessage {
+    /// The card the custodian holds.
+    pub card: CardPresence,
+    /// Whether a contact card reader is connected to the custodian.
+    pub reader: CardReader,
 }
 
 /// Fresh-session parameter echo.
@@ -179,7 +199,7 @@ pub enum TypedMessage {
     OperationResult(OperationResultMessage),
     /// Operation progress update.
     OperationProgress(OperationProgressMessage),
-    /// Whether the custodian can serve a card now, and which.
+    /// The card the custodian holds, and whether a card reader is attached.
     CardStatus(CardStatusMessage),
     /// Protocol error.
     Error(ProtocolErrorMessage),
@@ -390,14 +410,19 @@ fn pairing_stored_from_body(
 }
 
 /// A present card names its certificate; an absent one carries 32 zero
-/// bytes, so the message has one size whatever it says (section 8.4).
+/// bytes (section 8.4 item 2).
 fn card_status_to_body(value: CardStatusMessage) -> BTreeMap<String, WireValue> {
-    let (present, fingerprint) = match value {
-        CardStatusMessage::Present(fingerprint) => (true, *fingerprint.as_bytes()),
-        CardStatusMessage::Absent => (false, [0; CERTIFICATE_FINGERPRINT_SIZE]),
+    let (present, fingerprint) = match value.card {
+        CardPresence::Present(fingerprint) => (true, *fingerprint.as_bytes()),
+        CardPresence::Absent => (false, [0; CERTIFICATE_FINGERPRINT_SIZE]),
+    };
+    let reader_attached = match value.reader {
+        CardReader::Attached => true,
+        CardReader::Absent => false,
     };
     BTreeMap::from([
         ("card_present".into(), WireValue::Bool(present)),
+        ("reader_attached".into(), WireValue::Bool(reader_attached)),
         (
             "certificate_fingerprint".into(),
             WireValue::Bytes(fingerprint.to_vec()),
@@ -409,17 +434,22 @@ fn card_status_from_body(
     mut body: BTreeMap<String, WireValue>,
 ) -> Result<CardStatusMessage, MessageError> {
     let card_present = take_bool(&mut body, "card_present")?;
+    let reader_attached = take_bool(&mut body, "reader_attached")?;
     let fingerprint =
         take_fixed::<CERTIFICATE_FINGERPRINT_SIZE>(&mut body, "certificate_fingerprint")?;
     require_empty(&body)?;
     let zero = fingerprint == [0; CERTIFICATE_FINGERPRINT_SIZE];
-    match (card_present, zero) {
-        (true, false) => Ok(CardStatusMessage::Present(
-            CertificateFingerprint::from_array(fingerprint),
-        )),
-        (false, true) => Ok(CardStatusMessage::Absent),
-        _ => Err(MessageError::InvalidField("certificate_fingerprint")),
-    }
+    let card = match (card_present, zero) {
+        (true, false) => CardPresence::Present(CertificateFingerprint::from_array(fingerprint)),
+        (false, true) => CardPresence::Absent,
+        _ => return Err(MessageError::InvalidField("certificate_fingerprint")),
+    };
+    let reader = if reader_attached {
+        CardReader::Attached
+    } else {
+        CardReader::Absent
+    };
+    Ok(CardStatusMessage { card, reader })
 }
 
 fn negotiated_parameters_to_map(value: &NegotiatedParameters) -> BTreeMap<String, WireValue> {

@@ -24,12 +24,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::{
     AuthorizedCardCommand, BinaryFrame, CardIdentity, CardInspection, CardKeyProfile,
-    CardOperation, CardOperationResult, CardStatusMessage, CertificateFingerprint, CertificateKind,
-    CloseReason, EndpointError, EstablishedSessionRuntime, OperationId, OperationRequest,
-    OperationResultMessage, OperationViolation, PingChallenge, ProfileName, ProxyDispatch,
-    ProxyEngineError, ProxyFailure, ProxyOperationEngine, ProxySessionCloseAction,
-    RequesterDispatch, RequesterEngineError, RequesterOperationEngine, ResultError, RuntimeError,
-    RuntimePoll, RuntimeReceive, SignatureAlgorithm, TypedMessage, UserApproval,
+    CardOperation, CardOperationResult, CardPresence, CardReader, CardStatusMessage,
+    CertificateFingerprint, CertificateKind, CloseReason, EndpointError, EstablishedSessionRuntime,
+    OperationId, OperationRequest, OperationResultMessage, OperationViolation, PingChallenge,
+    ProfileName, ProxyDispatch, ProxyEngineError, ProxyFailure, ProxyOperationEngine,
+    ProxySessionCloseAction, RequesterDispatch, RequesterEngineError, RequesterOperationEngine,
+    ResultError, RuntimeError, RuntimePoll, RuntimeReceive, SignatureAlgorithm, TypedMessage,
+    UserApproval,
     bindings::{RappBindingError, RappSessionBridge, fixed_array},
 };
 
@@ -278,6 +279,35 @@ impl From<super::ProgressEvent> for RappProgressEvent {
     }
 }
 
+/// Whether a contact card reader is connected to the custodian (RAPP
+/// v26.10.22 section 8.4 item 1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+pub enum RappCardReader {
+    /// A contact card reader is connected: built in, or attached to a port.
+    Attached,
+    /// No contact card reader is connected, as on a custodian that reads
+    /// cards only over NFC.
+    Absent,
+}
+
+impl From<RappCardReader> for CardReader {
+    fn from(value: RappCardReader) -> Self {
+        match value {
+            RappCardReader::Attached => Self::Attached,
+            RappCardReader::Absent => Self::Absent,
+        }
+    }
+}
+
+impl From<CardReader> for RappCardReader {
+    fn from(value: CardReader) -> Self {
+        match value {
+            CardReader::Attached => Self::Attached,
+            CardReader::Absent => Self::Absent,
+        }
+    }
+}
+
 /// Bounded action produced by the Rust state machine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum RappBridgeActionKind {
@@ -299,8 +329,9 @@ pub enum RappBridgeActionKind {
     Terminal,
     /// The custodian reported the operation's progress.
     Progress,
-    /// The custodian reported its card: present with a fingerprint, or
-    /// absent (RAPP section 8.4).
+    /// The custodian reported its card, present with a fingerprint or
+    /// absent, and whether a card reader is connected to it (RAPP section
+    /// 8.4).
     CardStatus,
     /// Nothing to execute.
     NoAction,
@@ -434,6 +465,11 @@ pub struct RappBridgeAction {
     pub card_present: Option<bool>,
     /// SHA-256 of the present card's authentication certificate.
     pub certificate_fingerprint: Option<Vec<u8>>,
+    /// Whether a contact card reader is connected to the custodian, on a
+    /// card-status action. While the card is absent, the requester names
+    /// the custodian's reader to its user only when this is `Attached`
+    /// (RAPP section 8.4 item 6).
+    pub card_reader: Option<RappCardReader>,
     /// The session must close after this frame is delivered.
     pub close_session_after_send: bool,
     /// Registered reason of a session closed by an authenticated notice,
@@ -457,6 +493,7 @@ impl RappBridgeAction {
             progress_event: None,
             card_present: None,
             certificate_fingerprint: None,
+            card_reader: None,
             close_session_after_send: false,
             close_reason: None,
             card_exchange_continues: false,
@@ -1104,11 +1141,14 @@ impl RappOperationBridge {
         Ok(action)
     }
 
-    /// Tell the requester which card can answer now (RAPP section 8.4): the
-    /// DER authentication certificate of a present card, or `None` when no
-    /// card can answer. Call it once right after `begin_proxy` and again
-    /// whenever the card or its presence changes; a card busy with another
-    /// session's operation is present.
+    /// Tell the requester which card the custodian holds and whether a
+    /// contact card reader is connected to it (RAPP section 8.4): the DER
+    /// authentication certificate of a present card, or `None` when the
+    /// custodian holds no card, and the reader's attachment. Call it once
+    /// right after `begin_proxy` and again whenever the card, its presence
+    /// or the reader's attachment changes; a card busy with another
+    /// session's operation is present, and detaching a reader removes the
+    /// card in it.
     ///
     /// # Errors
     /// [`RappBindingError`] on an empty certificate, the wrong protocol
@@ -1116,11 +1156,16 @@ impl RappOperationBridge {
     pub fn report_card_status(
         &self,
         authentication_certificate: Option<Vec<u8>>,
+        card_reader: RappCardReader,
     ) -> Result<RappBridgeAction, RappBindingError> {
-        let status = match authentication_certificate {
+        let card = match authentication_certificate {
             Some(der) if der.is_empty() => return Err(RappBindingError::InvalidInput),
-            Some(der) => CardStatusMessage::Present(CertificateFingerprint::of_certificate(&der)),
-            None => CardStatusMessage::Absent,
+            Some(der) => CardPresence::Present(CertificateFingerprint::of_certificate(&der)),
+            None => CardPresence::Absent,
+        };
+        let status = CardStatusMessage {
+            card,
+            reader: card_reader.into(),
         };
         let mut state = self.lock_state()?;
         let OperationBridgeState::Proxy {
@@ -1510,17 +1555,18 @@ fn violation_notice(received: RuntimeReceive) -> Option<BinaryFrame> {
 
 fn requester_dispatch(dispatch: RequesterDispatch) -> RappBridgeAction {
     match dispatch {
-        RequesterDispatch::CardStatus(CardStatusMessage::Present(fingerprint)) => {
+        RequesterDispatch::CardStatus(CardStatusMessage { card, reader }) => {
+            let (card_present, certificate_fingerprint) = match card {
+                CardPresence::Present(fingerprint) => (true, Some(fingerprint.as_bytes().to_vec())),
+                CardPresence::Absent => (false, None),
+            };
             RappBridgeAction {
-                card_present: Some(true),
-                certificate_fingerprint: Some(fingerprint.as_bytes().to_vec()),
+                card_present: Some(card_present),
+                certificate_fingerprint,
+                card_reader: Some(reader.into()),
                 ..RappBridgeAction::simple(RappBridgeActionKind::CardStatus)
             }
         }
-        RequesterDispatch::CardStatus(CardStatusMessage::Absent) => RappBridgeAction {
-            card_present: Some(false),
-            ..RappBridgeAction::simple(RappBridgeActionKind::CardStatus)
-        },
         RequesterDispatch::Progress {
             operation_id,
             event,
@@ -1722,18 +1768,42 @@ mod tests {
     }
 
     #[test]
+    fn card_readers_convert_both_ways() {
+        for reader in [RappCardReader::Attached, RappCardReader::Absent] {
+            assert_eq!(RappCardReader::from(CardReader::from(reader)), reader);
+        }
+    }
+
+    #[test]
     fn a_present_card_reports_its_fingerprint() {
         let fingerprint = CertificateFingerprint::of_certificate(b"certificate");
-        let action = requester_dispatch(RequesterDispatch::CardStatus(CardStatusMessage::Present(
-            fingerprint,
-        )));
+        let action = requester_dispatch(RequesterDispatch::CardStatus(CardStatusMessage {
+            card: CardPresence::Present(fingerprint),
+            reader: CardReader::Absent,
+        }));
+        assert_eq!(action.kind, RappBridgeActionKind::CardStatus);
         assert_eq!(action.card_present, Some(true));
         assert_eq!(
             action.certificate_fingerprint,
             Some(fingerprint.as_bytes().to_vec())
         );
-        let absent = requester_dispatch(RequesterDispatch::CardStatus(CardStatusMessage::Absent));
-        assert_eq!(absent.card_present, Some(false));
-        assert_eq!(absent.certificate_fingerprint, None);
+        assert_eq!(action.card_reader, Some(RappCardReader::Absent));
+    }
+
+    #[test]
+    fn an_absent_card_reports_the_custodians_reader() {
+        for (reader, exported) in [
+            (CardReader::Attached, RappCardReader::Attached),
+            (CardReader::Absent, RappCardReader::Absent),
+        ] {
+            let action = requester_dispatch(RequesterDispatch::CardStatus(CardStatusMessage {
+                card: CardPresence::Absent,
+                reader,
+            }));
+            assert_eq!(action.kind, RappBridgeActionKind::CardStatus);
+            assert_eq!(action.card_present, Some(false));
+            assert_eq!(action.certificate_fingerprint, None);
+            assert_eq!(action.card_reader, Some(exported));
+        }
     }
 }

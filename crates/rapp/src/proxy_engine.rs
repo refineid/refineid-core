@@ -371,7 +371,7 @@ impl core::error::Error for ProxyEngineError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CardOperation, OperationRequestRefusal, ResultError};
+    use crate::{CardOperation, CardPresence, CardReader, OperationRequestRefusal, ResultError};
 
     const START_MS: u64 = 1_000;
     const LIFETIME_MS: u64 = 5_000;
@@ -541,7 +541,10 @@ mod tests {
         let mut engine = ProxyOperationEngine::new(vec![ProfileName::CardStatus]);
         assert_eq!(
             engine
-                .receive(TypedMessage::CardStatus(CardStatusMessage::Absent))
+                .receive(TypedMessage::CardStatus(CardStatusMessage {
+                    card: CardPresence::Absent,
+                    reader: CardReader::Absent,
+                }))
                 .expect_err("violation"),
             ProxyEngineError::AuthenticatedProtocolViolation(ProxyViolation::CustodianOnlyMessage)
         );

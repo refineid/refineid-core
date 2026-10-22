@@ -344,6 +344,10 @@ def operation_corpus(d):
             body["operation_id"] = operation_id
         return body
 
+    def card_status(card_present, reader_attached, certificate_fingerprint):
+        return {"card_present": card_present, "reader_attached": reader_attached,
+                "certificate_fingerprint": certificate_fingerprint}
+
     fingerprint = sha256(h(f["certificate_der"]))
     vectors = [
         ("request-inspect-card", "OperationRequest", request(card, "inspect_card", {}, {})),
@@ -389,15 +393,23 @@ def operation_corpus(d):
         ("progress-consent-shown", "OperationProgress", {"operation_id": result_id, "event": "consent_shown"}),
         ("progress-waiting-for-card", "OperationProgress", {"operation_id": result_id, "event": "waiting_for_card"}),
         ("progress-card-wait-ended", "OperationProgress", {"operation_id": result_id, "event": "card_wait_ended"}),
-        ("card-status-present", "CardStatus", {"card_present": True, "certificate_fingerprint": fingerprint}),
-        ("card-status-absent", "CardStatus", {"card_present": False, "certificate_fingerprint": bytes(len(fingerprint))}),
+        ("card-status-present-reader-attached", "CardStatus",
+         card_status(True, True, fingerprint)),
+        ("card-status-present-no-reader", "CardStatus",
+         card_status(True, False, fingerprint)),
+        ("card-status-absent-reader-attached", "CardStatus",
+         card_status(False, True, bytes(len(fingerprint)))),
+        ("card-status-absent-no-reader", "CardStatus",
+         card_status(False, False, bytes(len(fingerprint)))),
         ("pairing-stored", "PairingStored", {"pair_id": h(f["pair_id"])}),
     ]
     rejected = [
         ("card-status-present-without-fingerprint", "CardStatus",
-         {"card_present": True, "certificate_fingerprint": bytes(len(fingerprint))}),
+         card_status(True, True, bytes(len(fingerprint)))),
         ("card-status-absent-with-fingerprint", "CardStatus",
-         {"card_present": False, "certificate_fingerprint": fingerprint}),
+         card_status(False, True, fingerprint)),
+        ("card-status-missing-reader-attached", "CardStatus",
+         {"card_present": False, "certificate_fingerprint": bytes(len(fingerprint))}),
         ("result-completed-with-error", "OperationResult",
          result("completed", "operation_failed", {"signature": h(f["signature_bytes"])})),
         ("result-rejected-busy", "OperationResult", result("rejected", "busy")),

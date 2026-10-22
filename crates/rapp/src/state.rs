@@ -349,7 +349,8 @@ pub enum Action {
     DeriveSessionIdentifiers,
     /// Send session.ready with the session-parameter echo.
     SendSessionReady,
-    /// Send card.status with presence and the certificate fingerprint.
+    /// Send card.status with presence, reader attachment and the certificate
+    /// fingerprint.
     SendCardStatus,
     /// Start the 5-second silence ping and the 30-second silence limit.
     StartLiveness,

@@ -159,8 +159,8 @@ impl RequesterOperationEngine {
 /// What an inbound message means to the requester.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RequesterDispatch {
-    /// The custodian's card is present, with its fingerprint, or absent
-    /// (section 8.4).
+    /// The custodian's card, present with its fingerprint or absent, and
+    /// whether a card reader is attached to the custodian (section 8.4).
     CardStatus(CardStatusMessage),
     /// The live operation's state changed.
     Progress {

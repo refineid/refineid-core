@@ -123,6 +123,22 @@ pub struct RappPairMetadata {
     /// confirmation window: it opens no session, routes nothing, and the
     /// caller revokes it.
     pub storage_confirmed: bool,
+    /// When the local user forgot the pairing while no session was open:
+    /// the record serves nothing and keeps its key only to deliver the
+    /// `pairing_revoked` close on the next session (RAPP §4.6 item 2).
+    pub forgotten_at_ms: Option<u64>,
+}
+
+/// What forgetting a pairing did (RAPP §4.6).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+pub enum RappForgetOutcome {
+    /// The record is marked forgotten and keeps its key until the next
+    /// session delivers the close, or for 30 days: dial or route as usual,
+    /// then call [`RappSessionBridge::deliver_revocation_notice`].
+    NoticePending,
+    /// The pairing was never confirmed; its key is destroyed and nobody is
+    /// told.
+    Destroyed,
 }
 
 /// Deliberately coarse binding failure. Protocol internals and secrets never
@@ -2360,6 +2376,61 @@ impl RappPairRecord {
             .map_err(|_| RappBindingError::LocalStateFailure)
     }
 
+    /// The local user forgets the pairing while no session to the peer is
+    /// open (RAPP §4.6). A confirmed record is stored as forgotten and keeps
+    /// its key only to deliver the `pairing_revoked` close on the next
+    /// session; an unconfirmed one is destroyed at once. With a session
+    /// open, close it with reason `pairing_revoked` and call
+    /// [`Self::revoke`] instead. `forgotten_at_ms` is milliseconds since the
+    /// Unix epoch.
+    ///
+    /// # Errors
+    /// [`RappBindingError`] on an already-revoked record or a storage
+    /// failure.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "uniffi lowers exported arguments as owned values"
+    )]
+    pub fn forget(
+        &self,
+        vault: Arc<dyn RappPairVault>,
+        forgotten_at_ms: u64,
+    ) -> Result<RappForgetOutcome, RappBindingError> {
+        let mut guard = self
+            .record
+            .lock()
+            .map_err(|_| RappBindingError::LocalStateFailure)?;
+        let record = guard.take().ok_or(RappBindingError::WrongPhase)?;
+        let pair_id = record.pair_id().as_bytes().to_vec();
+        if !record.is_storage_confirmed() {
+            let outcome = vault
+                .revoke_device_only(pair_id, forgotten_at_ms)
+                .map(|()| RappForgetOutcome::Destroyed);
+            if outcome.is_err() {
+                *guard = Some(record);
+            }
+            return outcome.map_err(|_| RappBindingError::LocalStateFailure);
+        }
+        let forgotten = record.forgotten(forgotten_at_ms);
+        let stored = encode_pair_record(&forgotten).and_then(|bytes| {
+            vault
+                .replace_device_only(pair_id, bytes)
+                .map_err(|_| RappBindingError::LocalStateFailure)
+        });
+        *guard = Some(forgotten);
+        drop(guard);
+        stored.map(|()| RappForgetOutcome::NoticePending)
+    }
+
+    /// Whether a forgotten record kept its key for 30 days without a session
+    /// to deliver the close; destroy it then with [`Self::revoke`].
+    ///
+    /// # Errors
+    /// [`RappBindingError`] when the record was already revoked.
+    pub fn revocation_notice_expired(&self, now_ms: u64) -> Result<bool, RappBindingError> {
+        self.with_record(|record| Ok(record.revocation_notice_expired(now_ms)))
+    }
+
     /// Irreversibly delete active secret material and retain only a local
     /// tombstone. The in-memory private key is dropped only after the vault
     /// confirms deletion; `revoked_at_ms` is milliseconds since the Unix
@@ -2708,6 +2779,42 @@ impl RappSessionBridge {
         Ok(matches!(&*state, SessionBridgeState::Established(_)))
     }
 
+    /// The first and only message of an established session whose record
+    /// was forgotten: the sealed `session.close` with reason
+    /// `pairing_revoked` (RAPP §4.6 item 2). The session closes; deliver the
+    /// frame, then destroy the record with [`RappPairRecord::revoke`].
+    ///
+    /// # Errors
+    /// [`RappBindingError::WrongPhase`] before the session is established or
+    /// for a record that is not forgotten, and
+    /// [`RappBindingError::ProtocolFailure`] when the close cannot be sealed.
+    pub fn deliver_revocation_notice(&self) -> Result<Vec<u8>, RappBindingError> {
+        let forgotten = self
+            .pair_store
+            .lock()
+            .map_err(|_| RappBindingError::LocalStateFailure)?
+            .pair
+            .with_record(|record| Ok(record.forgotten_at_ms().is_some()))?;
+        if !forgotten {
+            return Err(RappBindingError::WrongPhase);
+        }
+        let mut state = self.lock_state()?;
+        let SessionBridgeState::Established(endpoint) = &mut *state else {
+            return Err(RappBindingError::WrongPhase);
+        };
+        let sealed = endpoint.send(&super::TypedMessage::SessionClose(
+            super::SessionCloseMessage {
+                reason: super::CloseReason::PairingRevoked,
+            },
+        ));
+        endpoint.close_session();
+        *state = SessionBridgeState::Closed;
+        drop(state);
+        sealed
+            .map(super::BinaryFrame::into_bytes)
+            .map_err(|_| RappBindingError::ProtocolFailure)
+    }
+
     /// Close only the ephemeral session while retaining the pairing.
     ///
     /// # Errors
@@ -2800,7 +2907,7 @@ impl RappSessionBridge {
             .map_err(|_| RappBindingError::LocalStateFailure)?
             .as_ref()
             .ok_or(RappBindingError::PairNotFound)?
-            .profiles()
+            .serving_profiles()
             .to_vec();
         Ok((endpoint, profiles))
     }
@@ -2830,6 +2937,7 @@ fn pair_metadata(record: &PairRecord) -> RappPairMetadata {
             .collect(),
         created_at_ms: record.created_at_ms(),
         storage_confirmed: record.is_storage_confirmed(),
+        forgotten_at_ms: record.forgotten_at_ms(),
     }
 }
 
@@ -3265,6 +3373,65 @@ mod routing_binding_tests {
         fn is_revoked(&self, _: Vec<u8>) -> Result<bool, RappVaultError> {
             Ok(*self.revoked.lock().expect("lock"))
         }
+    }
+
+    #[test]
+    fn forgetting_a_confirmed_pairing_keeps_its_key_for_the_close() {
+        let pair = record(
+            REQUESTER_BYTE,
+            CUSTODIAN_BYTE,
+            PAIR_BYTE,
+            EndpointRole::Requester,
+        );
+        let vault = Arc::new(StoringVault {
+            bytes: Vec::new(),
+            revoked: Mutex::new(false),
+        });
+        assert_eq!(
+            pair.forget(Arc::clone(&vault) as Arc<dyn RappPairVault>, CREATED_AT_MS)
+                .expect("forget"),
+            super::RappForgetOutcome::NoticePending
+        );
+        assert!(!*vault.revoked.lock().expect("lock"));
+        assert_eq!(
+            pair.metadata().expect("metadata").forgotten_at_ms,
+            Some(CREATED_AT_MS)
+        );
+        assert!(
+            pair.discovery_hint(UNIX_TIME_SECONDS).is_ok(),
+            "a forgotten record is still announced so the close can travel"
+        );
+    }
+
+    #[test]
+    fn forgetting_an_unconfirmed_pairing_destroys_it_untold() {
+        let own_private = [REQUESTER_BYTE; X25519_KEY_SIZE];
+        let unconfirmed = PairRecord::new(
+            PairId::from_array([PAIR_BYTE; PAIR_ID_SIZE]),
+            EndpointRole::Requester,
+            own_private,
+            x25519_public_key(&own_private),
+            x25519_public_key(&[CUSTODIAN_BYTE; X25519_KEY_SIZE]),
+            GrantsHash::from_array([GRANTS_BYTE; crate::GRANTS_HASH_SIZE]),
+            vec![ProfileName::Authentication],
+            CREATED_AT_MS,
+        )
+        .expect("record")
+        .awaiting_storage_confirmation();
+        let pair = Arc::new(RappPairRecord {
+            record: Mutex::new(Some(unconfirmed)),
+        });
+        let vault = Arc::new(StoringVault {
+            bytes: Vec::new(),
+            revoked: Mutex::new(false),
+        });
+        assert_eq!(
+            pair.forget(Arc::clone(&vault) as Arc<dyn RappPairVault>, CREATED_AT_MS)
+                .expect("forget"),
+            super::RappForgetOutcome::Destroyed
+        );
+        assert!(*vault.revoked.lock().expect("lock"));
+        assert!(pair.metadata().is_err());
     }
 
     #[test]

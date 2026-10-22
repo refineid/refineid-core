@@ -400,6 +400,20 @@ fn custodian_withdrawal_close_reaches_the_requester_with_its_reason() {
 }
 
 #[test]
+fn a_revocation_notice_is_a_session_only_message() {
+    let (mut requester, mut proxy) = established_runtimes();
+    let frame = requester
+        .close_with_reason(CloseReason::PairingRevoked)
+        .expect("close notice seals");
+    assert!(matches!(
+        proxy
+            .receive(&frame, SESSION_START_MS)
+            .expect("close notice opens"),
+        RuntimeReceive::PeerClosed(CloseReason::PairingRevoked)
+    ));
+}
+
+#[test]
 fn requester_close_reaches_the_custodian_with_its_reason() {
     let (mut requester, mut proxy) = established_runtimes();
     let frame = requester

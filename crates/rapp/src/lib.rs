@@ -98,8 +98,8 @@ pub use pair_keys::{DegenerateAgreement, PAIR_KEY_SIZE};
 pub(crate) use pair_keys::{derive_pair_key, mac as pair_key_mac};
 pub use pairing::{
     PAIR_RECORD_FORMAT_VERSION, PairRecord, PairRecordCodecError, PairRecordError, PairStore,
-    PairStoreError, PairTombstone, decode_pair_record, decode_pair_records, encode_pair_record,
-    encode_pair_records,
+    PairStoreError, PairTombstone, REVOCATION_NOTICE_MS, decode_pair_record, decode_pair_records,
+    encode_pair_record, encode_pair_records,
 };
 pub use pairing_attempts::{
     CPACE_ATTEMPT_WINDOW_MS, CpaceAttemptLedger, MAXIMUM_CPACE_ATTEMPTS, POST_PAKE_CONFIRMATION_MS,

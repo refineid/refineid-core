@@ -75,7 +75,8 @@ pub struct AuthorizationTransaction {
 }
 
 impl AuthorizationTransaction {
-    /// Admits a request; the PIN prompt renders from this snapshot.
+    /// Admits a request; a PIN prompt, when one is shown, renders from this
+    /// snapshot.
     #[must_use]
     pub const fn prepare(request: OperationRequest) -> Self {
         Self {
@@ -262,7 +263,7 @@ impl AuthorizationTransaction {
 /// Phase of one operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthorizationStage {
-    /// Admitted; the reads that precede consent have not completed.
+    /// Admitted; the reads that precede the PIN have not completed.
     Requested,
     /// The custodian takes the PIN, asking the holder when it does not
     /// hold it; only an action that needs a PIN comes here.

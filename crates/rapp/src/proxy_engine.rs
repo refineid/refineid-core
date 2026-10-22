@@ -309,7 +309,7 @@ impl ProxyOperationEngine {
 #[derive(Debug)]
 pub enum ProxyDispatch {
     /// Take the operation's turn on the card and perform the reads that
-    /// precede consent.
+    /// precede the PIN.
     InspectPrerequisites(OperationId),
     /// Take the PIN: ask the holder when the custodian does not hold it.
     AwaitConsent(OperationId),

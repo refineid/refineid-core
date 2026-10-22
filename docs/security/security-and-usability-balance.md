@@ -52,7 +52,7 @@ PIN 1 protects the **Authentication Role** (identification, TLS client-certifica
 
 ### 3.2 Invalidation Events
 Held PIN 1 is forgotten immediately when:
-- The card leaves: it is removed from the reader, or its holder removes it from the phone;
+- The card leaves or is replaced: it is removed from the reader, or its holder removes it from the phone;
 - The card rejects it, or reports a blocked or decremented counter;
 - The process holding it ends, or the device restarts;
 - The user clears it.

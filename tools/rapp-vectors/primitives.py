@@ -77,6 +77,8 @@ def _cbor_item(b):
         n = info
     elif info in ARGUMENT_WIDTHS:
         width = ARGUMENT_WIDTHS[info]
+        if len(b) < width:
+            raise ValueError("truncated argument")
         n, b = int.from_bytes(b[:width], "big"), b[width:]
     else:
         raise ValueError("indefinite or reserved argument")
@@ -84,6 +86,8 @@ def _cbor_item(b):
         return n, b
     if major == 1:
         return -1 - n, b
+    if major in (2, 3) and len(b) < n:
+        raise ValueError("truncated string")
     if major == 2:
         return b[:n], b[n:]
     if major == 3:

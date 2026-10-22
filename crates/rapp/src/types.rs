@@ -36,6 +36,10 @@ pub const MAX_ACTIVE_OPERATIONS: usize = 1;
 pub const OFFER_TTL_MS: u64 = 300_000;
 /// Minimum retry count on the credential that a command can decrement.
 pub const MINIMUM_REMAINING_ATTEMPTS: u8 = 3;
+/// How long a requester keeps offering a confirmed certificate with no
+/// session open or the card reported absent (RAPP v26.10.22 section 8.4
+/// item 3).
+pub const IDENTITY_OFFER_GRACE_MS: u64 = 120_000;
 
 /// Byte length of an offer identifier.
 pub const OFFER_ID_SIZE: usize = 32;

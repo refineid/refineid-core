@@ -48,16 +48,17 @@ management, PIN2, and qualified-signature operations.
 
 Use is destructive checkout:
 
-1. atomically remove the entry from the cache;
-2. attempt one credential operation;
-3. restore it only after the card confirms success; and
-4. set `last_successful_use` to that confirmed monotonic instant.
+1. atomically remove the entry from the held state;
+2. attempt one credential operation; and
+3. restore it after the card confirms success, or after a transport failure
+   or an unanswered command once the retry counter shows the card did not
+   refuse it.
 
 Dropping an in-flight checkout or losing the caller destroys the value rather
-than resurrecting it. A transport failure, or a card that did not answer, keeps
-it: NFC glitches are common and are not removal. The next use first reads the
-retry counter, and a counter below the one read before the failed attempt means
-the card refused the PIN, so the value is destroyed instead of sent again.
+than resurrecting it. NFC glitches are common and are not removal, so a
+transport failure keeps the value; the retry counter read before the next use
+decides: a counter below the one read before the failed attempt means the card
+refused the PIN, and the value is destroyed instead of sent again.
 
 ## Mandatory invalidation
 

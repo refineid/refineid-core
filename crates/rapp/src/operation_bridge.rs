@@ -284,7 +284,7 @@ pub enum RappBridgeActionKind {
     /// Deliver one opaque encrypted frame to the transport.
     SendFrame,
     /// Take the card in the order operations arrived, perform the reads
-    /// that precede consent, then call `prerequisites_complete`.
+    /// that precede the PIN, then call `prerequisites_complete`.
     InspectPrerequisites,
     /// Present the descriptor and wait for the holder.
     AwaitUserApproval,

@@ -101,9 +101,9 @@ Pairing is an explicit, mutually authenticated ceremony. Direct unauthenticated 
 ## 6. Proportional Error Handling: No Nuclear Resets on Typos
 
 Human users occasionally mistype digits. The security model must be resilient and forgiving of ordinary human error:
-- A mistyped PIN or CAN fails the active transaction cleanly and reports the remaining card retry attempts.
-- It **must not** trigger a nuclear response (destroying all stored pairings, wiping credentials, or factory-resetting the device).
-- Permanent pairing tombstones and security shutdowns are reserved strictly for **hardware card lockouts** (retry counters reaching 0) or cryptographically verified protocol tampering.
+- A mistyped PIN is told to the holder on the phone, with the attempts the card still allows, and the phone prompts again; the computer learns only the operation's outcome.
+- The phone verifies a PIN only while the card reports at least three remaining attempts, so RefineID never blocks a card (RAPP v26.10.21 section 10.2).
+- No failure revokes a pairing: a failure closes the connection or the session, or rejects one operation. Pairings are revoked only by their users.
 
 ---
 

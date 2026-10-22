@@ -23,9 +23,9 @@ use zeroize::ZeroizeOnDrop;
 use super::{
     BinaryFrame, CPACE_KC2_SUITE, Envelope, FrameError, GRANTS_HASH_SIZE, GrantsHash,
     MANDATORY_PAIRING_SUITE, MANDATORY_SESSION_SUITE, MAX_FRAME_PLAINTEXT, MAX_FRAME_SIZE,
-    MessageType, NOISE_TAG_SIZE, OperationId, PAIR_ID_SIZE, PairId, PairingSecret, ProfileName,
-    REQUEST_HASH_SIZE, RequestHash, SESSION_ID_SIZE, SequenceGuard, SessionId,
-    WIRE_VERSION_V26_10_21, WireError, WireValue, X25519_KEY_SIZE, encode_deterministic_cbor,
+    MessageType, NOISE_TAG_SIZE, PAIR_ID_SIZE, PairId, PairingSecret, ProfileName, SESSION_ID_SIZE,
+    SequenceGuard, SessionId, WIRE_VERSION_V26_10_21, WireError, WireValue, X25519_KEY_SIZE,
+    encode_deterministic_cbor,
     noise::{KkHandshakeState, NoiseTransport},
 };
 
@@ -501,58 +501,6 @@ pub fn compute_grants_hash(profiles: &[ProfileName]) -> Result<GrantsHash, Crypt
     let mut bytes = [0_u8; GRANTS_HASH_SIZE];
     bytes.copy_from_slice(&digest);
     Ok(GrantsHash::from_array(bytes))
-}
-
-/// Bind the exact typed operation request to its pairing (RAPP v26.10.21
-/// section 8.2.1).
-///
-/// The commitment is session-independent, so an identical request
-/// retransmitted on a later session of the same pairing hashes the same.
-///
-/// # Errors
-/// [`CryptoError::Wire`] when deterministic encoding fails.
-pub fn compute_request_hash(
-    pair_id: PairId,
-    operation_id: OperationId,
-    profile: ProfileName,
-    action: &str,
-    context: BTreeMap<String, WireValue>,
-    payload: BTreeMap<String, WireValue>,
-) -> Result<RequestHash, CryptoError> {
-    compute_wire_request_hash(
-        pair_id,
-        operation_id,
-        profile.as_str(),
-        action,
-        context,
-        payload,
-    )
-}
-
-/// The section 8.2.1 commitment over a request exactly as the wire carries
-/// it, before its profile name is interpreted.
-pub(crate) fn compute_wire_request_hash(
-    pair_id: PairId,
-    operation_id: OperationId,
-    profile: &str,
-    action: &str,
-    context: BTreeMap<String, WireValue>,
-    payload: BTreeMap<String, WireValue>,
-) -> Result<RequestHash, CryptoError> {
-    let preimage = WireValue::Array(vec![
-        WireValue::Text("RAPP-request-v1".to_owned()),
-        WireValue::Bytes(pair_id.as_bytes().to_vec()),
-        WireValue::Bytes(operation_id.as_bytes().to_vec()),
-        WireValue::Text(profile.to_owned()),
-        WireValue::Text(action.to_owned()),
-        WireValue::Map(context),
-        WireValue::Map(payload),
-    ]);
-    let encoded = encode_deterministic_cbor(&preimage).map_err(CryptoError::Wire)?;
-    let digest = Sha256::digest(encoded);
-    let mut bytes = [0_u8; REQUEST_HASH_SIZE];
-    bytes.copy_from_slice(&digest);
-    Ok(RequestHash::from_array(bytes))
 }
 
 fn pairing_prologue(offer_hash: [u8; 32], transport_profile: &str) -> Result<Vec<u8>, CryptoError> {

@@ -1,313 +1,278 @@
 protocol: RAPP
-document_version: "26.10.18"
-wire_version: "26.10.18"
-status: external-review
+document_version: "26.10.21"
+wire_version: "26.10.21"
 
 semantics:
   instances: >
-    Machines describe instances, not singletons. A pairing instance exists per
-    stored or in-progress peer relationship; unpaired is the absence of one. A
-    session instance exists per connection attempt; absent means no live
-    instance for the pairing. An operation instance exists per operation_id;
-    none is the admission state of a new instance, and terminal states are
-    permanent journal records that accept no further transitions.
+    Machines describe instances. A pairing instance exists per stored or
+    in-progress peer relationship; unpaired is the absence of one. A session
+    instance exists per connection; a custodian holds as many as requesters
+    dial. An operation instance exists per operation_id within one session;
+    none is the absence of one, and it is also where an operation goes when
+    its session ends, since nothing of an operation outlives its session.
   roles: >
-    Every transition names a role: requester, proxy, or both. An endpoint
-    implements exactly the transitions whose role includes it. States occupied
-    by one role only are marked on the state list.
+    Every transition names a role: requester, custodian, or both. An endpoint
+    implements exactly the transitions whose role includes it.
   from_lists: "a list-valued from is shorthand for one rule per listed state"
   no_wildcards: >
-    There are no wildcard transitions. Any input without a matching transition
-    from the current state is handled by exactly one unexpected_input_policy
-    class, which is part of this model and of generated tests.
-  guard_failure: >
-    A failed guard on a transition triggered by an authenticated peer message
-    produces the bounded response named by the failure taxonomy (for example
-    the busy error on operation admission) and leaves state unchanged. A
-    failed guard on a local event is a no-op.
+    Any input without a matching transition from the current state is handled
+    by exactly one unexpected_input_policy class.
   actions_are_ordered: true
-  event_precedence: >
-    Racing events are processed in the order of the prose Section 14.7: local
-    forget, revocation, or security shutdown; authenticated peer revocation
-    notice; credential rejection or card ambiguity;
-    authenticated peer close; transport loss, integrity failure, or liveness
-    deadline; operation transitions; liveness traffic.
 
 constants:
-  max_active_operations: 1
+  live_operations_per_session: 1
+  card_commands_per_operation: 1
+  pairing_attempts_per_offer: 3
   minimum_remaining_attempts: 3
-  maximum_credential_transmissions_per_operation: 1
-  candidate_failure_hint_threshold: 3
-  offer_ttl_max_ms: 180000
+  offer_ttl_ms: 300000
+  liveness_ping_after_silence_ms: 5000
+  session_silence_limit_ms: 30000
+  revocation_notice_days: 30
 
 guards:
   user_initiated: "an explicit local user action started this event"
   local_user_action: "the event originates from the local user, never the peer"
-  offer_valid_and_supported: >
-    the scanned offer parses within size limits with a supported version,
-    suite, profile intersection, and permitted transport candidate
-  offer_live: "the offer is unexpired, uncancelled, and not yet consumed"
-  transcript_matches: >
-    the completed handshake used the expected prologue and empty handshake
-    payloads
+  transcript_matches: "the completed handshake used the expected prologue and empty handshake payloads"
   granted_sets_equal: "both pairing.confirm granted_profiles sets are equal"
-  pairing_paired: "pairing is paired_disconnected or paired_connected"
-  initiation_permitted: "an explicit user action or an explicit application action"
+  initiation_permitted: "a stored pairing is active and its custodian's discovery hint is in sight"
+  pairing_routed: "the routing tag matched an active stored pairing and its nonce is not in the replay memory"
   ready_parameters_match: "received session.ready parameters equal the local view"
-  deadline_not_expired: "the liveness hard deadline has not passed"
-  another_session_live: "a session for this pairing is healthy or checking"
-  admission_permitted: >
-    session healthy, profile granted, and no operation instance in an active
-    state
-  hash_echo_matches: "the echoed request_hash equals the journaled value"
-  hash_matches: "the commit request_hash equals the prepared request"
-  zero_transmissions: "the physical credential transmission count is zero"
-  proven_no_transmission: "zero physical transmissions is provable"
-  profile_has_no_consequential_command: "the profile defines no consequential command for this action"
 
 actions:
-  generate_offer_id: "create a random 32-byte offer identifier"
-  generate_pairing_secret: "create the random 32-byte bearer secret"
-  start_offer_expiry: "start the monotonic offer expiry, clamped to offer_ttl_max_ms"
-  display_pairing_code: "display the 6-digit pairing code on the requester"
-  hide_pairing_code: "remove the pairing code from display"
-  select_one_candidate: "choose exactly one offered transport candidate"
-  connect_candidate: "open the selected candidate transport"
-  prepare_pairing_responder: "arm the pairing handshake in the responder role"
-  begin_pairing_handshake_initiator: "start the pairing handshake in the initiator role"
-  derive_channel_identifiers: "derive session_id, and for pairing also pair_id, from the handshake hash"
-  destroy_pairing_secret: "erase the bearer secret from memory"
-  stop_accepting_candidates: "requester stops accepting further candidates for the offer"
+  generate_offer: "create the offer with a fresh random offer_id and offer_ttl_ms"
+  generate_pairing_code: "draw the 6-character pairing code"
+  advertise_pairing_mode: "publish the mode=pairing record"
+  display_pairing_code: "show the pairing code on the custodian"
+  hide_pairing_code: "remove the pairing code from the screen"
+  destroy_offer: "erase the offer and its pairing code and stop advertising it"
+  start_pairing_backoff: "stop offering and back off exponentially before the next offer"
+  show_attempts_exhausted: "tell the holder that the offer used its attempts"
+  read_offer: "obtain the offer over the pairing connection and validate it"
+  begin_cpace_initiator: "send CPace step 1 from the typed pairing code"
+  reserve_attempt: "count the attempt before sending CPace step 2 and arm its deadline"
+  count_failed_attempt: "record the failed attempt; the offer stays"
+  show_wrong_code: "tell the user the pairing code did not match"
+  consume_offer: "mark the offer consumed once T_A verified"
+  derive_pairing_secret: "derive the PSK for the pairing handshake from the CPace key schedule"
+  begin_pairing_handshake: "run Noise_XXpsk3 with the PSK"
+  derive_channel_identifiers: "derive session_id and pair_id from the handshake hash"
+  destroy_pairing_secret: "erase the PSK and the CPace intermediate values"
   send_pairing_hello: "send pairing.hello with the negotiated-parameter echo"
-  show_peer_and_requested_grants: "display peer identity labels and requested profiles"
-  discard_candidate: "drop the candidate connection and its handshake state"
-  retain_offer: "keep the offer live for further candidates"
-  invalidate_offer: "mark the offer permanently unusable"
-  close_candidate: "close the candidate transport connection"
-  store_pair_record_atomically: "store pair keys, pair_id, grants, grants_hash, and metadata in one commit"
-  send_pairing_stored: "send pairing.stored carrying the derived pair_id once the record is durably stored"
-  close_pairing_channel: "close the authenticated pairing channel"
+  send_pairing_confirm: "grant the requested profiles the offer allows and send pairing.confirm"
   send_pairing_abort_best_effort: "send pairing.abort if the channel is usable"
-  destroy_candidate_keys: "erase unstored static and ephemeral candidate keys"
-  show_connected: "expose the Connected visible state"
-  show_paired_disconnected: "expose the Paired, disconnected visible state"
-  show_checking: "expose the Checking connection visible state"
-  show_disconnecting: "expose the Disconnecting visible state"
-  show_connection_stopped: "expose the Connection stopped visible state"
-  show_revoked: "expose the Pairing revoked visible state"
-  close_session: "raise close_requested_by_pairing for the live session instance"
-  revoke_unconfirmed_pair_record: "revoke the stored record the peer never confirmed, leaving its tombstone"
-  destroy_pair_keys: "erase pair static keys from the platform key store"
-  destroy_relay_tokens: "erase pair-specific rendezvous tokens"
-  clear_pair_metadata: "erase stored names, grants, and pair metadata"
-  clear_residual_pair_record: "erase the remaining fail-stop record"
-  record_peer_initiated: "record that the peer initiated the termination"
-  send_close_best_effort: "send session.close with the transition's reason if the channel is usable"
-  select_one_transport: "choose one mutually stored transport profile"
-  open_transport: "start transport establishment"
-  associate_pairing_from_rendezvous: "map the incoming connection to a stored pairing via its rendezvous"
+  destroy_candidate_keys: "erase unstored static and ephemeral keys"
+  close_candidate: "close the candidate connection"
+  store_pair_record_atomically: "store pair keys, pair_id, grants, grants_hash and the unconfirmed mark in one commit"
+  send_pairing_stored: "send pairing.stored carrying the derived pair_id"
+  mark_record_confirmed: "rewrite the stored record as confirmed"
+  close_pairing_channel: "close the authenticated pairing channel"
+  revoke_unconfirmed_pair_record: "revoke the stored record the peer never confirmed"
+  mark_record_revoked: "mark the record revoked; it serves nothing from now on and its key is kept only for the close"
+  send_close_pairing_revoked: "send session.close with reason pairing_revoked as the session's first or next message"
+  close_session: "raise close_requested_by_pairing for the live session"
+  destroy_pair_keys: "erase the pairing's static private key"
+  withdraw_identity: "stop offering the pairing's credentials to local consumers"
+  show_connected: "show that the paired peer is connected"
+  show_paired_disconnected: "show that the paired peer is not connected"
+  show_forgotten: "show that this endpoint forgot the peer"
+  show_peer_forgot: "show that the peer forgot this endpoint"
+  clear_residual_pair_record: "erase the revoked record"
+  open_transport: "connect to the custodian's advertised endpoint or peripheral"
+  send_session_preamble: "send the session routing preamble with a fresh routing tag"
   begin_kk_initiator: "start the session handshake in the initiator role"
   begin_kk_responder: "start the session handshake in the responder role"
   derive_session_identifiers: "derive session_id from the handshake hash"
-  send_session_ready: "send session.ready with the negotiated-parameter echo"
-  send_error_busy: "send the authenticated busy error"
-  start_authenticated_liveness: "start the liveness schedule"
-  block_new_operations: "refuse operation admission until healthy"
-  start_backoff_and_deadline: "start liveness backoff with jitter and the hard deadline"
-  reset_backoff: "clear liveness backoff state"
-  record_peer_close_reason: "journal the received close reason"
-  count_candidate_failure_hint: >
-    count consecutive candidate authentication failures; at
-    candidate_failure_hint_threshold suggest re-pairing without altering
-    stored keys
+  send_session_ready: "send session.ready with the session-parameter echo"
+  send_card_status: "send card.status with presence and the certificate fingerprint"
+  start_liveness: "start the 5-second silence ping and the 30-second silence limit"
+  send_liveness_ping: "send liveness.ping with a fresh challenge"
+  record_peer_close_reason: "keep the received close reason for the user"
+  send_close_user_disconnect: "send session.close with reason user_disconnect"
+  send_close_normal: "send session.close with reason normal"
+  send_close_protocol_violation: "send session.close with reason protocol_violation"
+  send_close_service_withdrawn: "send session.close with reason service_withdrawn"
+  send_close_card_unavailable: "send session.close with reason card_unavailable"
   note_close_notice_impossible: "record that no close notice can be sent"
   proceed_without_close_notice: "continue closing without further sends"
-  abort_candidate: "cancel transport establishment"
-  destroy_session_material: "erase session keys, handshake state, and buffers"
-  destroy_credential_buffers: "erase any credential buffers tied to the session"
-  persist_terminal_session_record: "journal the terminal session record"
-  validate_schema_hash_expiry_and_context: "validate request schema, request_hash, expiry, and context"
-  start_expiry_clock: "start the monotonic expires_after_ms clock"
-  begin_safe_prerequisite_reads: "run the profile's bounded safe reads, including secure-channel establishment"
-  present_consent_per_profile: "present the profile-defined consent context"
-  dismiss_consent: "remove the consent prompt"
-  clear_operation_credentials: "zeroize credentials collected for this operation"
-  clear_all_active_credentials: "zeroize every credential value and command buffer in the flow"
-  remove_rejected_credential_and_derived_state: >
-    remove the cached rejected credential; for CAN also remove stored CAN and
-    card-derived identity state
-  send_prepared: "send operation.prepared with the request_hash echo"
-  send_result_completed: "send operation.result with status completed"
-  send_result_denied: "send operation.result with status denied"
-  send_result_cancelled: "send operation.result with status cancelled"
-  send_result_rejected: "send operation.result with status rejected"
-  send_result_retry_policy_refused: "send operation.result status rejected, error retry_policy_refused"
-  send_result_credential_rejected_best_effort: "send the bounded credential_rejected result if the channel is usable"
-  send_result_ambiguous_best_effort: "send operation.result status ambiguous if the channel is usable"
-  request_session_close: "raise local_close_requested for the session"
-  request_session_close_credential_rejected: "raise credential_rejected for the session"
-  revoke_pair_after_credential_rejection: "durably destroy pair keys and write a tombstone after sealing the bounded credential_rejected result, or immediately when receiving that authenticated result"
-  request_session_close_ambiguous: "raise card_completion_ambiguous for the session"
-  send_operation_cancel: "send operation.cancel with the request_hash echo"
-  send_operation_progress: "send advisory operation.progress with the request_hash echo and event"
-  durably_write_commit_before_transmission: "write the non-secret commit record before any transmission"
-  consume_non_clonable_command: "consume the one-shot command object"
-  increment_transmission_count_once: "increment the physical transmission count exactly once"
-  record_advisory_cancel: "journal the advisory cancel without interrupting the card exchange"
-  continue_card_exchange_locally: "let the card exchange finish; never interrupt or repeat it"
-  note_result_delivery_impossible: "record that no session exists for result delivery"
-  persist_result: "journal the card result durably"
-  persist_rejection: "journal the rejection durably"
-  persist_cancelled: "journal cancelled with proven zero transmissions"
-  persist_ambiguous: "journal ambiguous durably"
-  persist_completed: "journal completed durably"
-  persist_delivery_uncertain: "journal delivery_uncertain durably"
-  retain_result_under_local_storage: "keep the result encrypted under local platform storage"
-  release_result: "release the result to the requesting application"
-  prohibit_retry: "mark automatic retry permanently false for this operation_id"
-  prohibit_card_retry: "mark the card command as never repeatable for this operation_id"
-  compute_request_hash: "compute request_hash over the defined preimage"
-  journal_request: "journal the sent request"
-  journal_prepared: "journal the prepared acknowledgment"
-  journal_commit_intent_durably: "journal the commit intent before sending commit"
-  journal_completed: "journal completed"
-  journal_denied: "journal denied"
-  journal_cancelled: "journal cancelled"
-  journal_rejected: "journal rejected"
-  journal_credential_rejected: "journal credential_rejected"
-  journal_ambiguous: "journal ambiguous"
-  send_result_ack: "send operation.result_ack with the request_hash echo"
+  destroy_session_material: "erase session keys, handshake state and buffers"
+  destroy_credential_buffers: "erase credential buffers tied to the session"
+  show_disconnecting: "show that the session is closing"
+  show_connection_stopped: "show that the session ended"
+  start_expiry_clock: "take the deadline on the continuous clock"
+  send_error_busy: "send error busy naming the operation"
+  send_error_duplicate_operation: "send error duplicate_operation naming the operation"
+  send_result_unauthorized: "send operation.result rejected with unauthorized"
+  send_result_unsupported_parameter: "send operation.result rejected with unsupported_parameter or invalid_lifetime"
+  send_progress_queued: "send operation.progress queued, once"
+  present_consent: "show the operation from the admitted request"
+  send_progress_consent_shown: "send operation.progress consent_shown once the view is on screen"
+  dismiss_consent: "remove the consent view"
+  execute_read: "run the read-only card commands"
+  check_retry_floor: "read the remaining attempts of the PIN the command needs"
+  consume_card_command: "consume the one-shot card command"
+  send_progress_waiting_for_card: "send operation.progress waiting_for_card"
+  send_progress_card_wait_ended: "send operation.progress card_wait_ended"
+  prompt_pin_again: "tell the holder the PIN was wrong, with the attempts left, and prompt again"
+  send_result_completed: "send operation.result completed with the response"
+  send_result_user_cancelled: "send operation.result rejected with user_cancelled"
+  send_result_retry_floor: "send operation.result rejected with retry_floor"
+  send_result_card_error: "send operation.result rejected with card_error"
+  send_result_operation_expired: "send operation.result cancelled with operation_expired"
+  clear_operation_credentials: "zeroize credentials collected for the operation"
+  continue_card_exchange_locally: "let the card command finish; never interrupt or repeat it"
+  discard_answer: "drop the card's answer; no session carries it"
+  release_card: "let the next queued operation take the card"
+  show_progress: "show the operation's progress to the user"
+  release_result: "hand the response to the requesting application"
+  release_failure: "tell the requesting application why the operation ended"
+  report_operation_lost: "tell the requesting application that the operation ended with its session"
 
 pairing:
   initial: unpaired
   states:
     - unpaired
-    - offer_active          # requester only
-    - handshaking
+    - offering              # custodian only
+    - exchanging            # CPace
+    - handshaking           # Noise_XXpsk3
     - confirming
     - storage_confirming
     - paired_disconnected
     - paired_connected
+    - revoking              # key kept for the pairing_revoked close
     - revoked
-  notes:
-    - "forget during offer, handshake, confirmation, or storage confirmation is expressed by offer_expired_or_cancelled and denied_aborted_or_timed_out"
-    - "the pairing is active only in paired_disconnected and paired_connected: a record stored in storage_confirming that the peer never confirms is revoked"
-    - "peer_revocation_notice requires an authenticated channel, so it can occur only in paired_connected"
   transitions:
     - from: unpaired
-      event: create_offer
+      event: start_pairing
+      role: custodian
+      guard: user_initiated
+      to: offering
+      actions: [generate_offer, generate_pairing_code, advertise_pairing_mode, display_pairing_code]
+    - from: offering
+      event: offer_expired_or_cancelled
+      role: custodian
+      to: unpaired
+      actions: [destroy_offer, hide_pairing_code]
+    - from: offering
+      event: attempt_started
+      role: custodian
+      to: exchanging
+      actions: [reserve_attempt]
+    - from: unpaired
+      event: code_entered
       role: requester
       guard: user_initiated
-      to: offer_active
-      actions: [generate_offer_id, generate_pairing_secret, start_offer_expiry, display_pairing_code]
-    - from: unpaired
-      event: offer_scanned
-      role: proxy
-      guard: offer_valid_and_supported
-      to: handshaking
-      actions: [select_one_candidate, connect_candidate, prepare_pairing_responder]
-    - from: offer_active
-      event: candidate_connected
-      role: requester
-      guard: offer_live
-      to: handshaking
-      actions: [begin_pairing_handshake_initiator]
-    - from: offer_active
-      event: offer_expired_or_cancelled
+      to: exchanging
+      actions: [read_offer, begin_cpace_initiator]
+    - from: exchanging
+      event: attempt_failed
+      role: custodian
+      to: offering
+      actions: [count_failed_attempt]
+    - from: exchanging
+      event: last_attempt_failed
+      role: custodian
+      to: unpaired
+      actions: [destroy_offer, hide_pairing_code, start_pairing_backoff, show_attempts_exhausted]
+    - from: exchanging
+      event: attempt_failed
       role: requester
       to: unpaired
-      actions: [destroy_pairing_secret, invalidate_offer, hide_pairing_code]
+      actions: [close_candidate, show_wrong_code]
+    - from: exchanging
+      event: offer_expired_or_cancelled
+      role: custodian
+      to: unpaired
+      actions: [destroy_offer, hide_pairing_code, close_candidate]
+    - from: exchanging
+      event: key_confirmed
+      role: custodian
+      to: handshaking
+      actions: [consume_offer, hide_pairing_code, derive_pairing_secret, begin_pairing_handshake]
+    - from: exchanging
+      event: key_confirmed
+      role: requester
+      to: handshaking
+      actions: [derive_pairing_secret, begin_pairing_handshake]
     - from: handshaking
       event: handshake_authenticated
-      role: both
+      role: requester
       guard: transcript_matches
       to: confirming
-      actions: [derive_channel_identifiers, destroy_pairing_secret, stop_accepting_candidates, hide_pairing_code, send_pairing_hello, show_peer_and_requested_grants]
+      actions: [derive_channel_identifiers, destroy_pairing_secret, send_pairing_hello]
+    - from: handshaking
+      event: handshake_authenticated
+      role: custodian
+      guard: transcript_matches
+      to: confirming
+      actions: [derive_channel_identifiers, destroy_pairing_secret]
     - from: handshaking
       event: handshake_failed
-      role: requester
-      to: offer_active
-      actions: [discard_candidate, retain_offer]
-    - from: handshaking
-      event: handshake_failed
-      role: proxy
+      role: both
       to: unpaired
-      actions: [discard_candidate]
-    - from: handshaking
-      event: offer_expired_or_cancelled
-      role: requester
-      to: unpaired
-      actions: [destroy_pairing_secret, invalidate_offer, close_candidate]
+      actions: [destroy_pairing_secret, destroy_candidate_keys, close_candidate]
     - from: confirming
-      event: both_users_confirmed
+      event: hello_verified
+      role: custodian
+      to: confirming
+      actions: [send_pairing_confirm]
+    - from: confirming
+      event: both_confirmed
       role: both
       guard: granted_sets_equal
       to: storage_confirming
-      actions: [store_pair_record_atomically, invalidate_offer, send_pairing_stored]
+      actions: [store_pair_record_atomically, send_pairing_stored]
+    - from: confirming
+      event: denied_aborted_or_timed_out
+      role: both
+      to: unpaired
+      actions: [send_pairing_abort_best_effort, destroy_candidate_keys, close_candidate]
     - from: storage_confirming
       event: peer_storage_confirmed
       role: both
       to: paired_disconnected
-      actions: [close_pairing_channel]
+      actions: [mark_record_confirmed, close_pairing_channel]
     - from: storage_confirming
-      event: denied_aborted_or_timed_out
+      event: denied_aborted_or_timed_out   # also a pairing.stored naming another pair_id
       role: both
       to: unpaired
-      actions: [revoke_unconfirmed_pair_record, destroy_pair_keys, clear_pair_metadata, close_candidate]
-    - from: storage_confirming
-      event: authenticated_protocol_violation   # the peer's pairing.stored names another pairing
-      role: both
-      to: revoked
-      actions: [destroy_pair_keys, close_candidate, show_revoked]
-    - from: confirming
-      event: denied_aborted_or_timed_out
-      role: both
-      to: unpaired
-      actions: [send_pairing_abort_best_effort, destroy_candidate_keys, invalidate_offer, close_candidate]
+      actions: [revoke_unconfirmed_pair_record, destroy_pair_keys, close_candidate]
     - from: paired_disconnected
-      event: session_healthy            # produced by the session machine entering healthy
+      event: session_healthy               # produced by the session machine entering healthy
       role: both
       to: paired_connected
       actions: [show_connected]
     - from: paired_connected
-      event: session_closed             # produced by the session machine entering closed
+      event: session_closed                # produced by the session machine entering closed
       role: both
       to: paired_disconnected
       actions: [show_paired_disconnected]
-    - from: paired_disconnected
-      event: forget_pairing
-      role: both
-      guard: local_user_action
-      to: unpaired
-      actions: [destroy_pair_keys, destroy_relay_tokens, clear_pair_metadata]
     - from: paired_connected
       event: forget_pairing
       role: both
       guard: local_user_action
-      to: unpaired
-      actions: [send_close_best_effort, close_session, destroy_pair_keys, destroy_relay_tokens, clear_pair_metadata]
-    - from: paired_connected
-      event: authenticated_protocol_violation
-      role: both
       to: revoked
-      actions: [send_close_best_effort, close_session, destroy_pair_keys, show_revoked]
-    - from: paired_connected
-      event: local_revoke
-      role: both
-      guard: local_user_action
-      to: revoked
-      actions: [send_close_best_effort, close_session, destroy_pair_keys, show_revoked]
+      actions: [mark_record_revoked, send_close_pairing_revoked, close_session, destroy_pair_keys, withdraw_identity, show_forgotten]
     - from: paired_disconnected
-      event: local_revoke
+      event: forget_pairing
       role: both
       guard: local_user_action
-      to: revoked
-      actions: [destroy_pair_keys, show_revoked]
-    - from: paired_connected
-      event: peer_revocation_notice     # produced by peer_close_received with reason pairing_revoked or protocol_violation
+      to: revoking
+      actions: [mark_record_revoked, withdraw_identity, show_forgotten]
+    - from: revoking
+      event: session_healthy               # the next session carries the close and nothing else
       role: both
       to: revoked
-      actions: [record_peer_initiated, close_session, destroy_pair_keys, show_revoked]
+      actions: [send_close_pairing_revoked, close_session, destroy_pair_keys]
+    - from: revoking
+      event: notice_window_expired         # revocation_notice_days after the revocation
+      role: both
+      to: revoked
+      actions: [destroy_pair_keys]
+    - from: [paired_connected, revoking]
+      event: peer_revocation_notice        # session.close with reason pairing_revoked
+      role: both
+      to: revoked
+      actions: [mark_record_revoked, close_session, destroy_pair_keys, withdraw_identity, show_peer_forgot]
     - from: revoked
       event: forget_pairing
       role: both
@@ -322,73 +287,56 @@ session:
     - connecting            # requester only
     - authenticating
     - healthy
-    - checking
     - closing
     - closed
   notes:
     - "entering healthy produces session_healthy; entering closed after healthy was reached produces session_closed"
-    - "entering closing produces session_closed_pre_commit, session_closed_post_commit, or session_closed_before_ack for the active operation per rules X-02 through X-05"
-    - "closed is terminal for the instance; a new connect may create a new instance whenever none is live"
+    - "entering closing produces session_closed for the session's operation"
+    - "closed is terminal for the instance"
   transitions:
     - from: absent
       event: connect
       role: requester
       guard: initiation_permitted
       to: connecting
-      actions: [select_one_transport, open_transport]
+      actions: [open_transport]
     - from: absent
-      event: transport_accepted
-      role: proxy
-      guard: pairing_paired
+      event: preamble_received
+      role: custodian
+      guard: pairing_routed
       to: authenticating
-      actions: [associate_pairing_from_rendezvous, begin_kk_responder]
+      actions: [begin_kk_responder]
     - from: connecting
       event: transport_connected
       role: requester
       to: authenticating
-      actions: [begin_kk_initiator]
+      actions: [send_session_preamble, begin_kk_initiator]
     - from: connecting
       event: transport_failed
       role: requester
       to: closed
       actions: [destroy_session_material, show_connection_stopped]
-    - from: connecting
-      event: user_disconnect
-      role: requester
-      to: closed
-      actions: [abort_candidate, destroy_session_material, show_connection_stopped]
     - from: authenticating
       event: handshake_complete
-      role: both
-      to: authenticating
-      actions: [derive_session_identifiers, send_session_ready]
+      role: custodian
+      to: healthy
+      actions: [derive_session_identifiers, send_session_ready, send_card_status, start_liveness]
     - from: authenticating
-      event: second_session_detected
-      role: proxy
-      guard: another_session_live
-      to: closed
-      actions: [send_error_busy, destroy_session_material, close_candidate]
+      event: handshake_complete
+      role: requester
+      to: authenticating
+      actions: [derive_session_identifiers]
     - from: authenticating
       event: ready_verified
-      role: both
+      role: requester
       guard: ready_parameters_match
       to: healthy
-      actions: [start_authenticated_liveness, show_connected]
+      actions: [start_liveness, show_connected]
     - from: authenticating
-      event: candidate_failure          # handshake failure or pre-authentication garbage, policy class 1
+      event: candidate_failure             # before authentication: the connection closes, nothing stored changes
       role: both
       to: closed
-      actions: [destroy_session_material, close_candidate, count_candidate_failure_hint, show_connection_stopped]
-    - from: authenticating
-      event: busy_received
-      role: requester
-      to: closed
-      actions: [destroy_session_material, close_candidate, show_connection_stopped]
-    - from: authenticating
-      event: peer_close_received
-      role: both
-      to: closed
-      actions: [record_peer_close_reason, destroy_session_material, close_candidate, show_connection_stopped]
+      actions: [destroy_session_material, close_candidate]
     - from: authenticating
       event: transport_failed
       role: both
@@ -398,70 +346,59 @@ session:
       event: authenticated_protocol_violation
       role: both
       to: closing
-      actions: [send_close_best_effort, show_disconnecting]
+      actions: [send_close_protocol_violation, show_disconnecting]
     - from: healthy
-      event: liveness_missed
+      event: peer_silent                   # liveness_ping_after_silence_ms without a message
       role: both
-      to: checking
-      actions: [block_new_operations, start_backoff_and_deadline, show_checking]
-    - from: checking
-      event: liveness_restored
-      role: both
-      guard: deadline_not_expired
       to: healthy
-      actions: [reset_backoff, show_connected]
-    - from: checking
-      event: liveness_deadline_expired
+      actions: [send_liveness_ping]
+    - from: healthy
+      event: silence_limit_reached         # session_silence_limit_ms without a message
       role: both
       to: closing
-      actions: [show_disconnecting]
-    - from: [healthy, checking]
+      actions: [note_close_notice_impossible, show_disconnecting]
+    - from: healthy
       event: user_disconnect
       role: both
       to: closing
-      actions: [send_close_best_effort, show_disconnecting]
-    - from: [healthy, checking]
-      event: local_close_requested      # produced by operation action request_session_close
+      actions: [send_close_user_disconnect, show_disconnecting]
+    - from: healthy
+      event: local_close_requested
       role: both
       to: closing
-      actions: [send_close_best_effort, show_disconnecting]
-    - from: [healthy, checking]
+      actions: [send_close_normal, show_disconnecting]
+    - from: healthy
+      event: service_withdrawn
+      role: custodian
+      to: closing
+      actions: [send_close_service_withdrawn, show_disconnecting]
+    - from: healthy
+      event: card_unavailable
+      role: custodian
+      to: closing
+      actions: [send_close_card_unavailable, show_disconnecting]
+    - from: healthy
       event: peer_close_received
       role: both
       to: closing
       actions: [record_peer_close_reason, show_disconnecting]
-    - from: closing
-      event: peer_close_received
-      role: both
-      to: closing
-      actions: []
-    - from: [healthy, checking]
-      event: credential_rejected        # produced by operation action request_session_close_credential_rejected
-      role: proxy
-      to: closing
-      actions: [destroy_pair_keys, show_revoked, send_close_best_effort, show_disconnecting]
-    - from: [healthy, checking]
-      event: card_completion_ambiguous
-      role: proxy
-      to: closing
-      actions: [show_disconnecting]
-    - from: [healthy, checking]
+    - from: healthy
       event: transport_failed
       role: both
       to: closing
       actions: [note_close_notice_impossible, show_disconnecting]
-    - from: [healthy, checking]
-      event: session_integrity_failed   # policy class 2; no pairing effect
+    - from: healthy
+      event: session_integrity_failed      # a frame failed authenticated decryption or framing
       role: both
       to: closing
       actions: [note_close_notice_impossible, show_disconnecting]
-    - from: [healthy, checking]
-      event: authenticated_protocol_violation   # policy class 4
+    - from: healthy
+      event: authenticated_protocol_violation   # version, session_id, sequence or message misuse
       role: both
       to: closing
-      actions: [send_close_best_effort, show_disconnecting]
-    - from: [healthy, checking]
-      event: close_requested_by_pairing # produced by pairing actions and rule X-01
+      actions: [send_close_protocol_violation, show_disconnecting]
+    - from: healthy
+      event: close_requested_by_pairing
       role: both
       to: closing
       actions: [show_disconnecting]
@@ -470,16 +407,11 @@ session:
       role: both
       to: closed
       actions: [destroy_session_material, close_candidate, show_connection_stopped]
-    - from: [healthy, checking]
-      event: local_security_shutdown    # policy class 5
+    - from: closing
+      event: peer_close_received
       role: both
       to: closing
-      actions: [note_close_notice_impossible, show_disconnecting]
-    - from: [connecting, authenticating]
-      event: local_security_shutdown
-      role: both
-      to: closed
-      actions: [destroy_session_material, show_connection_stopped]
+      actions: []
     - from: closing
       event: transport_failed
       role: both
@@ -489,348 +421,208 @@ session:
       event: close_complete_or_deadline
       role: both
       to: closed
-      actions: [destroy_session_material, destroy_credential_buffers, persist_terminal_session_record, show_connection_stopped]
+      actions: [destroy_session_material, destroy_credential_buffers, show_connection_stopped]
 
 operation:
   initial: none
   states:
     - none
     - requested
-    - awaiting_consent      # proxy only
-    - prepared
-    - committed
-    - executing             # proxy only
-    - result_pending        # proxy only
+    - queued                # custodian only
+    - awaiting_consent      # custodian only
+    - executing
     - completed
-    - denied
-    - cancelled
     - rejected
-    - credential_rejected
-    - ambiguous
-    - delivery_uncertain
-  terminal:
-    - completed
-    - denied
     - cancelled
-    - rejected
-    - credential_rejected
-    - ambiguous
-    - delivery_uncertain
-  notes:
-    - "messages referencing an unknown or terminal operation_id are stale-reference races, policy class 3, and transition nothing"
-    - "an authenticated status report may annotate a terminal journal record; it never transitions any state"
-    - "protocol violations transition the session; the operation is then classified by the session_closed_* events alone"
   transitions:
     - from: none
-      event: operation_request_sent
-      role: requester
-      guard: admission_permitted
+      event: request_received          # identifier unseen, no live operation, profile granted
+      role: custodian
       to: requested
-      actions: [compute_request_hash, journal_request, start_expiry_clock]
+      actions: [start_expiry_clock]
     - from: none
-      event: operation_request_received
-      role: proxy
-      guard: admission_permitted
-      to: requested
-      actions: [validate_schema_hash_expiry_and_context, start_expiry_clock]
-    - from: requested
-      event: request_valid
-      role: proxy
-      to: awaiting_consent
-      actions: [begin_safe_prerequisite_reads, present_consent_per_profile]
-    - from: requested
-      event: request_invalid_or_unsupported
-      role: proxy
+      event: request_duplicate
+      role: custodian
+      to: none
+      actions: [send_error_duplicate_operation]
+    - from: none
+      event: request_while_busy
+      role: custodian
+      to: none
+      actions: [send_error_busy]
+    - from: none
+      event: request_unauthorized
+      role: custodian
       to: rejected
-      actions: [send_result_rejected]
-    - from: [requested, awaiting_consent]
-      event: cancel_received
-      role: proxy
-      to: cancelled
-      actions: [clear_operation_credentials, dismiss_consent, send_result_cancelled]
-    - from: [requested, awaiting_consent]
-      event: request_expired
-      role: proxy
-      to: cancelled
-      actions: [clear_operation_credentials, dismiss_consent, send_result_cancelled]
+      actions: [send_result_unauthorized]
+    - from: none
+      event: request_unsupported
+      role: custodian
+      to: rejected
+      actions: [send_result_unsupported_parameter]
+    - from: requested
+      event: card_held_elsewhere
+      role: custodian
+      to: queued
+      actions: [send_progress_queued]
+    - from: [requested, queued]
+      event: card_acquired_for_consent
+      role: custodian
+      to: awaiting_consent
+      actions: [present_consent, send_progress_consent_shown]
+    - from: [requested, queued]
+      event: card_acquired_for_read
+      role: custodian
+      to: executing
+      actions: [execute_read]
     - from: awaiting_consent
       event: user_denied
-      role: proxy
-      to: denied
-      actions: [clear_operation_credentials, send_result_denied]
-    - from: awaiting_consent
-      event: retry_policy_refused
-      role: proxy
+      role: custodian
       to: rejected
-      actions: [clear_operation_credentials, send_result_retry_policy_refused, request_session_close]
+      actions: [dismiss_consent, send_result_user_cancelled, release_card]
     - from: awaiting_consent
-      event: invalid_can_or_pin1_or_pin2
-      role: proxy
-      to: credential_rejected
-      actions: [clear_all_active_credentials, remove_rejected_credential_and_derived_state, send_result_credential_rejected_best_effort, revoke_pair_after_credential_rejection, request_session_close_credential_rejected]
-    - from: awaiting_consent
-      event: safe_reads_complete
-      role: proxy
-      guard: profile_has_no_consequential_command
-      to: result_pending
-      actions: [persist_result, send_result_completed]
-    - from: awaiting_consent
-      event: user_approved_and_proxy_ready
-      role: proxy
-      guard: zero_transmissions
-      to: prepared
-      actions: [send_prepared]
-    - from: prepared
-      event: cancel_received
-      role: proxy
-      to: cancelled
-      actions: [clear_operation_credentials, send_result_cancelled]
-    - from: prepared
-      event: request_expired
-      role: proxy
-      to: cancelled
-      actions: [clear_operation_credentials, send_result_cancelled]
-    - from: prepared
-      event: valid_commit
-      role: proxy
-      guard: hash_matches
-      to: committed
-      actions: [durably_write_commit_before_transmission]
-    - from: committed
-      event: begin_card_command
-      role: proxy
-      guard: zero_transmissions
+      event: user_approved
+      role: custodian
       to: executing
-      actions: [consume_non_clonable_command, increment_transmission_count_once]
-    - from: committed
-      event: cancel_received
-      role: proxy
-      guard: proven_no_transmission
-      to: cancelled
-      actions: [persist_cancelled, clear_operation_credentials, send_result_cancelled]
-    - from: [committed, executing]
-      event: crash_recovered_without_terminal_result
-      role: both
-      to: ambiguous
-      actions: [persist_ambiguous, prohibit_retry]
+      actions: [dismiss_consent, check_retry_floor, consume_card_command]
+    - from: executing
+      event: waiting_for_card
+      role: custodian
+      to: executing
+      actions: [send_progress_waiting_for_card]
+    - from: executing
+      event: card_found
+      role: custodian
+      to: executing
+      actions: [send_progress_card_wait_ended]
+    - from: executing
+      event: wrong_pin
+      role: custodian
+      to: executing
+      actions: [prompt_pin_again]
+    - from: executing
+      event: retry_floor_refused
+      role: custodian
+      to: rejected
+      actions: [clear_operation_credentials, send_result_retry_floor, release_card]
     - from: executing
       event: card_success
-      role: proxy
-      to: result_pending
-      actions: [persist_result, clear_operation_credentials, send_result_completed]
-    - from: executing
-      event: invalid_can_or_pin1_or_pin2
-      role: proxy
-      to: credential_rejected
-      actions: [clear_all_active_credentials, remove_rejected_credential_and_derived_state, send_result_credential_rejected_best_effort, revoke_pair_after_credential_rejection, request_session_close_credential_rejected]
-    - from: executing
-      event: card_policy_rejection
-      role: proxy
-      to: rejected
-      actions: [clear_operation_credentials, persist_rejection, send_result_rejected]
-    - from: executing
-      event: card_removed_before_transmit
-      role: proxy
-      guard: proven_no_transmission
-      to: cancelled
-      actions: [persist_cancelled, clear_operation_credentials, send_result_cancelled]
-    - from: executing
-      event: card_removed_or_transport_uncertain
-      role: proxy
-      to: ambiguous
-      actions: [clear_operation_credentials, persist_ambiguous, prohibit_retry, send_result_ambiguous_best_effort, request_session_close_ambiguous]
-    - from: executing
-      event: cancel_received
-      role: proxy
-      to: executing
-      actions: [record_advisory_cancel]
-    - from: executing
-      event: session_closed_post_commit # rule X-04: the card exchange is never interrupted
-      role: proxy
-      to: executing
-      actions: [continue_card_exchange_locally, note_result_delivery_impossible]
-    - from: result_pending
-      event: valid_result_ack
-      role: proxy
+      role: custodian
       to: completed
-      actions: [persist_completed, release_result]
-    - from: result_pending
-      event: session_closed_before_ack  # produced by rule X-05
-      role: proxy
-      to: delivery_uncertain
-      actions: [persist_delivery_uncertain, prohibit_card_retry, retain_result_under_local_storage]
-    - from: committed
-      event: session_closed_post_commit # produced by rule X-03; proxy side proves zero transmissions
-      role: proxy
+      actions: [clear_operation_credentials, send_result_completed, release_card]
+    - from: executing
+      event: card_error
+      role: custodian
+      to: rejected
+      actions: [clear_operation_credentials, send_result_card_error, release_card]
+    - from: [requested, queued, awaiting_consent]
+      event: request_expired
+      role: custodian
       to: cancelled
-      actions: [persist_cancelled, clear_operation_credentials]
+      actions: [dismiss_consent, send_result_operation_expired, release_card]
+    - from: [requested, queued, awaiting_consent]
+      event: session_closed
+      role: custodian
+      to: none
+      actions: [dismiss_consent, clear_operation_credentials, release_card]
+    - from: executing
+      event: session_closed
+      role: custodian
+      to: none
+      actions: [continue_card_exchange_locally, discard_answer, clear_operation_credentials, release_card]
+    - from: none
+      event: request_sent
+      role: requester
+      to: requested
+      actions: []
     - from: requested
-      event: prepared_received
+      event: progress_received
       role: requester
-      guard: hash_echo_matches
-      to: prepared
-      actions: [journal_prepared]
-    - from: [requested, prepared]
-      event: cancel_sent_or_request_expired
-      role: requester
-      to: cancelled
-      actions: [send_operation_cancel, journal_cancelled]
-    - from: prepared
-      event: commit_sent
-      role: requester
-      to: committed
-      actions: [journal_commit_intent_durably]
+      to: requested
+      actions: [show_progress]
     - from: requested
       event: result_completed_received
       role: requester
-      guard: profile_has_no_consequential_command
       to: completed
-      actions: [retain_result_under_local_storage, send_result_ack, journal_completed]
-    - from: [requested, prepared]
-      event: result_denied_received
+      actions: [release_result]
+    - from: requested
+      event: result_rejected_received  # an operation.result rejected, or an error busy or duplicate_operation
       role: requester
-      to: denied
-      actions: [journal_denied, send_result_ack]
-    - from: [requested, prepared, committed]
+      to: rejected
+      actions: [release_failure]
+    - from: requested
       event: result_cancelled_received
       role: requester
       to: cancelled
-      actions: [journal_cancelled, send_result_ack]
-    - from: [requested, prepared, committed]
-      event: result_rejected_received
+      actions: [release_failure]
+    - from: requested
+      event: session_closed
       role: requester
-      to: rejected
-      actions: [journal_rejected, send_result_ack]
-    - from: [requested, prepared, committed]
-      event: result_credential_rejected_received
-      role: requester
-      to: credential_rejected
-      actions: [journal_credential_rejected, send_result_ack, revoke_pair_after_credential_rejection]
-    - from: committed
-      event: result_completed_received
-      role: requester
-      to: completed
-      actions: [retain_result_under_local_storage, send_result_ack, journal_completed]
-    - from: committed
-      event: result_ambiguous_received
-      role: requester
-      to: ambiguous
-      actions: [journal_ambiguous, send_result_ack, prohibit_retry]
-    - from: committed
-      event: session_closed_post_commit # produced by rule X-03
-      role: requester
-      to: ambiguous
-      actions: [journal_ambiguous, prohibit_retry]
-    - from: [requested, awaiting_consent, prepared]
-      event: session_closed_pre_commit  # produced by rule X-02
-      role: both
-      to: cancelled
-      actions: [clear_operation_credentials, persist_cancelled]
+      to: none
+      actions: [report_operation_lost]
 
 unexpected_input_policy:
-  - class: pre_authentication_invalid_input
+  - class: before_authentication
     applies: >
-      malformed, unexpected, or unauthenticated input during pairing offers,
-      connection, or any handshake, including a handshake message with a
-      non-empty payload
-    handling: [discard_input, close_candidate]
-    emits: "handshake_failed or candidate_failure as applicable"
+      a malformed preamble, an unrouted or replayed routing tag, a short MTU,
+      a frame out of order, or any input a pairing or session handshake does
+      not expect
+    handling: [close_candidate]
     pairing_effect: none
-  - class: established_channel_integrity_failure
+  - class: on_a_session
     applies: >
-      a frame on an authenticated session that fails authenticated decryption
-      or framing
-    handling: [raise_session_integrity_failed]
+      a link drop, a timeout, an AEAD failure, a wrong version, session_id or
+      sequence, or a message the receiving role never receives
+    handling: [close_session]
     pairing_effect: none
-  - class: stale_reference_race
+  - class: inside_an_operation
     applies: >
-      a successfully decrypted operation message for an unknown or terminal
-      operation_id, a duplicate commit whose hash matches the committed
-      record, or a pong whose challenge matches no outstanding ping
-    handling: [discard_input, send_error_unknown_operation_if_useful]
-    pairing_effect: none
-  - class: authenticated_protocol_violation
-    applies: >
-      a successfully decrypted message with a schema violation, sequence or
-      session_id violation, parameter-echo mismatch, or no legal transition
-      and no stale-reference classification
-    handling: [raise_authenticated_protocol_violation]
-    pairing_effect: >
-      immediate revocation of a stored pairing. On the pairing channel before
-      a pairing is stored, the attempt aborts via denied_aborted_or_timed_out
-      and nothing is recorded
-  - class: local_internal_fault
-    applies: "a local invariant failure inside the RAPP implementation"
-    handling: [raise_local_security_shutdown]
-    pairing_effect: none
-  - class: traffic_after_closed
-    applies: "any frame for a closed or unknown session"
-    handling: [discard_without_response]
+      an unknown operation_id, an unsupported parameter, or a card that
+      refused or did not answer
+    handling: [reject_operation]
     pairing_effect: none
 
 cross_component_rules:
   - id: X-01
-    when: pairing_leaves_paired_by_forget_or_revocation_with_live_session
+    when: pairing_leaves_paired_connected_with_a_live_session
     require: session_receives_close_requested_by_pairing
   - id: X-02
-    when: session_enters_closing_with_operation_in_requested_awaiting_consent_or_prepared
-    require: operation_receives_session_closed_pre_commit
+    when: session_enters_closing
+    require: the_session_operation_receives_session_closed
   - id: X-03
-    when: session_enters_closing_with_operation_committed
-    require: requester_operation_enters_ambiguous_and_proxy_operation_enters_cancelled_with_proven_zero_transmissions
-  - id: X-04
-    when: session_enters_closing_with_proxy_operation_executing
-    require: card_exchange_continues_locally_uninterrupted_and_unrepeated
-  - id: X-05
-    when: session_enters_closing_with_operation_result_pending
-    require: operation_receives_session_closed_before_ack
-  - id: X-06
-    when: operation_enters_credential_rejected
-    require: session_enters_closing_and_both_peers_durably_revoke_the_pair_on_the_first_incident
-  - id: X-07
-    when: operation_enters_ambiguous
-    require: automatic_retry_is_permanently_false
-  - id: X-08
     when: operation_admission
-    require: pairing_paired_connected_and_session_healthy_and_no_active_operation
-  - id: X-09
-    when: pairing_enters_revoked
-    require: one_best_effort_authenticated_close_notice_before_key_destruction
+    require: pairing_paired_connected_and_session_healthy_and_no_live_operation_on_the_session
+  - id: X-04
+    when: an_operation_needs_the_card
+    require: one_operation_holds_the_card_across_every_session_in_arrival_order
+  - id: X-05
+    when: card_presence_or_card_changes
+    require: every_healthy_session_receives_card_status
 
 invariants:
   - id: INV-01
-    statement: no_operation_without_confirmed_pairing
+    statement: no_operation_without_a_confirmed_pairing
   - id: INV-02
-    statement: new_operations_only_while_session_healthy
+    statement: new_operations_only_while_the_session_is_healthy
   - id: INV-03
-    statement: no_credential_command_before_exact_consent_and_commit
+    statement: no_private_key_command_before_the_holder_consents
   - id: INV-04
-    statement: at_most_one_active_credential_operation_per_proxy
+    statement: one_live_operation_per_session
   - id: INV-05
-    statement: at_most_one_credential_command_transmission_per_operation_id
+    statement: one_card_command_per_operation
   - id: INV-06
-    statement: ambiguous_completion_never_retried_automatically
+    statement: an_operation_identifier_is_used_once_per_session
   - id: INV-07
-    statement: revoked_keys_never_restored_automatically
+    statement: one_operation_on_the_card_at_a_time_across_sessions
   - id: INV-08
-    statement: version_suite_grants_and_transport_are_transcript_bound
+    statement: no_failure_revokes_a_pairing
   - id: INV-09
-    statement: relay_never_receives_plaintext_or_credentials
+    statement: pin_can_and_puk_never_leave_the_custodian
   - id: INV-10
-    statement: requester_never_receives_can_pin_activation_or_puk
+    statement: no_pin_verification_below_minimum_remaining_attempts
   - id: INV-11
-    statement: connected_requires_recent_authenticated_liveness
+    statement: version_suite_grants_and_transport_are_transcript_bound
   - id: INV-12
-    statement: security_connection_state_visible_on_both_peers
-  - id: INV-13
-    statement: no_automatic_downgrade_or_mid_operation_fallback
-  - id: INV-14
     statement: session_keys_and_credential_buffers_destroyed_on_close
-  - id: INV-15
-    statement: local_policy_may_only_be_stricter
-  - id: INV-16
-    statement: invalid_can_pin1_or_pin2_closes_rapp_session
-  - id: INV-17
-    statement: credential_rejection_never_auto_reconnects_or_repeats
-  - id: INV-18
-    statement: unattributable_input_never_revokes_pairing
+  - id: INV-13
+    statement: nothing_of_an_operation_outlives_its_session

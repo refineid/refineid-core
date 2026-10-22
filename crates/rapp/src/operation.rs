@@ -7,12 +7,9 @@
 use core::fmt;
 use std::collections::BTreeMap;
 
-use super::{
-    OperationId, OperationReference, PairId, ProfileName, RequestHash, ResultError, SessionId,
-    WireError, WireValue, compute_request_hash, crypto::compute_wire_request_hash,
-};
+use super::{OperationId, ProfileName, ResultError, WireError, WireValue};
 
-/// The lifetime a request that names none receives (section 8.2.1).
+/// The lifetime a request that names none receives (section 8.1 item 2).
 pub const DEFAULT_OPERATION_LIFETIME_MS: u64 = 300_000;
 
 /// Card credential selected by an operation.
@@ -164,7 +161,7 @@ impl SignatureAlgorithm {
 /// Explicitly supported remote card operations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CardOperation {
-    /// Read activation and retry state without attempting a credential.
+    /// Read the card's answer to reset and supported profiles.
     InspectCard,
     /// Read the public identity fields displayed by `RefineID`.
     ReadIdentity,
@@ -210,14 +207,12 @@ pub enum CardOperation {
     },
 }
 
-/// Documents one `batch_sign_documents` may name (section 9.3).
-pub const BATCH_DOCUMENTS: core::ops::RangeInclusive<usize> = 1..=64;
 /// Byte length of one batch document name (section 9.3).
 const BATCH_DOCUMENT_NAME_BYTES: core::ops::RangeInclusive<usize> = 1..=256;
 
 impl CardOperation {
-    /// Whether this action may consume a credential attempt or invoke a
-    /// private key, and so needs the write-ahead journal (section 8.1).
+    /// Whether this action commands a private key behind a PIN, and so needs
+    /// the holder's consent (section 8.2 item 3).
     #[must_use]
     pub const fn is_consequential(&self) -> bool {
         matches!(
@@ -274,9 +269,7 @@ impl CardOperation {
                 algorithm,
                 digests,
             } => {
-                if !BATCH_DOCUMENTS.contains(&digests.len())
-                    || document_names.len() != digests.len()
-                {
+                if digests.is_empty() || document_names.len() != digests.len() {
                     return Err(CardOperationError::InvalidField("digests"));
                 }
                 for (name, digest) in document_names.iter().zip(digests) {
@@ -430,28 +423,19 @@ impl CardOperation {
     }
 }
 
-/// Typed request bound to one authenticated pairing and carried by a session.
-///
-/// The request hash covers the pairing and every field a holder is shown and
-/// every field the card acts on, so an approval cannot be moved to a
-/// different request or pairing. The session is provenance only.
+/// Typed request of one operation, which lives inside the session that
+/// carried it (section 8.1).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationRequest {
-    /// Unique at-most-once operation identifier.
+    /// Identifier, used once per session.
     pub operation_id: OperationId,
-    /// Long-term pair binding.
-    pub pair_id: PairId,
-    /// Session the request arrived on; provenance, not hashed.
-    pub session_id: SessionId,
     /// Negotiated operation profile.
     pub profile: ProfileName,
     /// Local receipt or creation time on the continuous clock, which
-    /// advances through suspension (section 8.2 item 1). This is never sent
-    /// or hashed.
+    /// advances through suspension (section 8.1 item 2). This is never sent.
     pub local_start_ms: u64,
-    /// Relative validity interval sent on the wire, excluded from the hash,
-    /// and independently capped by each endpoint's local policy. Wall clocks
-    /// are not used.
+    /// Relative validity interval sent on the wire and capped by each
+    /// endpoint's local policy. Wall clocks are not used.
     pub expires_after_ms: u64,
     /// Closed operation body.
     pub operation: CardOperation,
@@ -462,14 +446,8 @@ impl OperationRequest {
     ///
     /// # Errors
     /// [`CardOperationError`] when validation rejects the request.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "one atomic constructor takes every field of the request"
-    )]
     pub fn reconstruct(
         operation_id: OperationId,
-        pair_id: PairId,
-        session_id: SessionId,
         profile: ProfileName,
         local_start_ms: u64,
         expires_after_ms: u64,
@@ -477,8 +455,6 @@ impl OperationRequest {
     ) -> Result<Self, CardOperationError> {
         let request = Self {
             operation_id,
-            pair_id,
-            session_id,
             profile,
             local_start_ms,
             expires_after_ms,
@@ -504,7 +480,7 @@ impl OperationRequest {
     }
 
     /// Local deadline on the continuous clock with an endpoint-specific
-    /// maximum lifetime (section 8.2 item 1).
+    /// maximum lifetime (section 8.1 item 2).
     ///
     /// # Errors
     /// [`CardOperationError`] on an invalid request or a zero maximum
@@ -517,25 +493,6 @@ impl OperationRequest {
         Ok(self
             .local_start_ms
             .saturating_add(self.expires_after_ms.min(maximum_lifetime_ms)))
-    }
-
-    /// Computes the deterministic request hash committed by approval and the
-    /// durable at-most-once journal.
-    ///
-    /// # Errors
-    /// [`CardOperationError`] on an invalid request or an encoding failure.
-    pub fn request_hash(&self) -> Result<RequestHash, CardOperationError> {
-        self.validate()?;
-        let (action, context, payload) = self.operation.wire_parts();
-        compute_request_hash(
-            self.pair_id,
-            self.operation_id,
-            self.profile,
-            action,
-            context,
-            payload,
-        )
-        .map_err(|_| CardOperationError::HashFailure)
     }
 
     /// Registered wire action and its separately bounded consent context and
@@ -577,8 +534,7 @@ impl OperationRequest {
         Ok(body)
     }
 
-    /// Parses an authenticated `operation.request` body; both peers derive
-    /// its hash.
+    /// Parses an authenticated `operation.request` body.
     ///
     /// # Errors
     /// [`RequestError::Malformed`] on a schema violation, and
@@ -586,8 +542,6 @@ impl OperationRequest {
     /// lifetime, profile, action, or parameter this endpoint cannot serve.
     pub fn from_wire_body(
         mut body: BTreeMap<String, WireValue>,
-        pair_id: PairId,
-        session_id: SessionId,
         local_start_ms: u64,
     ) -> Result<Self, RequestError> {
         let operation_id_bytes = take_bytes(&mut body, "operation_id")?;
@@ -605,21 +559,9 @@ impl OperationRequest {
         if !body.is_empty() {
             return Err(CardOperationError::UnexpectedField.into());
         }
-        let request_hash = compute_wire_request_hash(
-            pair_id,
-            operation_id,
-            &profile_text,
-            &action,
-            context.clone(),
-            payload.clone(),
-        )
-        .map_err(|_| CardOperationError::HashFailure)?;
         let refuse = |error| {
             RequestError::Refused(OperationRequestRefusal {
-                reference: OperationReference {
-                    operation_id,
-                    request_hash,
-                },
+                operation_id,
                 error,
             })
         };
@@ -629,36 +571,29 @@ impl OperationRequest {
         let Some(profile) = ProfileName::parse(&profile_text) else {
             return Err(refuse(ResultError::UnsupportedParameter));
         };
-        let request = CardOperation::from_wire_parts(&action, context, payload)
+        CardOperation::from_wire_parts(&action, context, payload)
             .and_then(|operation| {
                 Self::reconstruct(
                     operation_id,
-                    pair_id,
-                    session_id,
                     profile,
                     local_start_ms,
                     expires_after_ms,
                     operation,
                 )
             })
-            .map_err(|_| refuse(ResultError::UnsupportedParameter))?;
-        if request.request_hash()? != request_hash {
-            return Err(refuse(ResultError::UnsupportedParameter));
-        }
-        Ok(request)
+            .map_err(|_| refuse(ResultError::UnsupportedParameter))
     }
 }
 
 /// A request that parsed as an envelope but names something this endpoint
 /// cannot serve.
 ///
-/// It is a semantic rejection answered with a result, not an authenticated
-/// protocol violation (section 9.2), so it carries the reference the result
-/// must echo.
+/// It is answered with a rejected result, so it carries the identifier the
+/// result names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationRequestRefusal {
-    /// The identifier and the commitment the refusal result echoes.
-    pub reference: OperationReference,
+    /// The identifier the refusal result names.
+    pub operation_id: OperationId,
     /// The registered rejection error.
     pub error: ResultError,
 }
@@ -678,26 +613,13 @@ impl From<CardOperationError> for RequestError {
     }
 }
 
-/// Public card state returned by `InspectCard`.
-///
-/// The `inspect_card` answer (section 9.1) carries the card's answer to
-/// reset; the factory flags and counters travel beside it as this
-/// implementation's own response fields.
+/// The `inspect_card` answer (section 9.1). PIN state stays on the
+/// custodian.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CardInspection {
     /// The answer to reset, or its historical bytes where the platform hides
     /// the rest; empty when the platform exposes neither.
     pub answer_to_reset: Vec<u8>,
-    /// Whether PIN 1 still has factory reference data.
-    pub pin1_factory: bool,
-    /// Whether PIN 2 still has factory reference data.
-    pub pin2_factory: bool,
-    /// Remaining PIN 1 attempts, when the card exposes it.
-    pub pin1_attempts: Option<u8>,
-    /// Remaining PIN 2 attempts, when the card exposes it.
-    pub pin2_attempts: Option<u8>,
-    /// Remaining PUK attempts, when the card exposes it.
-    pub puk_attempts: Option<u8>,
 }
 
 /// Successful typed operation output.
@@ -825,10 +747,8 @@ pub enum CardOperationError {
     InvalidField(&'static str),
     /// A typed request contained an additional unregistered field.
     UnexpectedField,
-    /// A result echoed a request hash that does not cover the request.
-    RequestHashMismatch,
-    /// Deterministic request commitment could not be constructed.
-    HashFailure,
+    /// A result names another operation than the one it answers.
+    OperationMismatch,
     /// Deterministic wire encoding failed.
     Wire(WireError),
 }

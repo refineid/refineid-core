@@ -12,517 +12,423 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::CloseReason;
+//! The pairing, session and operation machines of the RAPP state model
+//! (`docs/protocols/rapp-state-machine-v26.10.21.yaml`), and the runtime state
+//! an endpoint keeps. No failure revokes a pairing; only a user does.
 
 /// Local projection of the distributed state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointRole {
-    /// Device asking for a credential operation.
+    /// The computer asking for a credential operation.
     Requester,
-    /// Device holding credentials and communicating with the card.
+    /// The custodian: the phone holding the card.
     Proxy,
 }
 
-/// Runtime facts referenced by formal transition guards.
+/// Runtime facts the formal transition guards name.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "each field is an independent guard fact from the formal transition model, not a state encoding"
+    reason = "each field is an independent guard fact from the formal model, not a state encoding"
 )]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Guards {
-    /// Event was initiated by an explicit local user action.
+    /// An explicit local user action started this event.
     pub user_initiated: bool,
-    /// Pairing offer is structurally valid and locally supported.
-    pub offer_valid_and_supported: bool,
-    /// Pairing offer remains live.
-    pub offer_live: bool,
-    /// Handshake transcript matches the expected prologue and empty payloads.
+    /// The event originates from the local user, never the peer.
+    pub local_user_action: bool,
+    /// The completed handshake used the expected prologue and empty handshake payloads.
     pub transcript_matches: bool,
-    /// Both confirmation messages contain exactly the same grant set.
+    /// Both pairing.confirm granted_profiles sets are equal.
     pub granted_sets_equal: bool,
-    /// Pairing is confirmed.
-    pub pairing_paired: bool,
-    /// Session initiation satisfies the explicit-user-intent policy.
+    /// A stored pairing is active and its custodian's discovery hint is in sight.
     pub initiation_permitted: bool,
-    /// Session-ready parameter echo equals the local view.
+    /// The routing tag matched an active stored pairing and its nonce is not in the replay memory.
+    pub pairing_routed: bool,
+    /// Received session.ready parameters equal the local view.
     pub ready_parameters_match: bool,
-    /// Liveness hard deadline has not expired.
-    pub deadline_not_expired: bool,
-    /// A healthy/checking session already exists for this pair.
-    pub another_session_live: bool,
-    /// Pair, session, profile grant, and active-operation admission all pass.
-    pub admission_permitted: bool,
-    /// Received request-hash echo equals the journal.
-    pub hash_echo_matches: bool,
-    /// Commit hash equals the prepared request hash.
-    pub hash_matches: bool,
-    /// No physical credential command has been transmitted.
-    pub zero_transmissions: bool,
-    /// Zero transmissions can be proved durably.
-    pub proven_no_transmission: bool,
-    /// Profile action has no consequential credential command.
-    pub profile_has_no_consequential_command: bool,
 }
 
 /// Pairing component state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairingState {
-    /// No peer key material exists.
+    /// No pairing exists.
     Unpaired,
-    /// A manual QR offer is live on a requester.
-    OfferActive,
-    /// Pairing Noise handshake is active.
+    /// The custodian shows the pairing code and accepts attempts.
+    Offering,
+    /// A CPace attempt is running.
+    Exchanging,
+    /// The Noise_XXpsk3 pairing handshake is running.
     Handshaking,
-    /// Authenticated peer confirmation is active.
+    /// The endpoints exchange pairing.hello and pairing.confirm.
     Confirming,
-    /// Both grant sets are confirmed; the stored record awaits the peer's
-    /// storage confirmation.
+    /// The record is stored and awaits the peer's pairing.stored.
     StorageConfirming,
-    /// Durable pairing exists without a healthy session.
+    /// The pairing is active and no session is healthy.
     PairedDisconnected,
-    /// Durable pairing has a healthy/checking session.
+    /// The pairing is active and a session is healthy.
     PairedConnected,
-    /// Fail-stop state; keys cannot be restored.
+    /// The record is revoked; its key is kept only to deliver the pairing_revoked close.
+    Revoking,
+    /// The record is revoked and its key destroyed.
     Revoked,
 }
 
 /// Session component state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
-    /// No live session instance.
+    /// No session instance exists.
     Absent,
-    /// Requester transport establishment.
+    /// The requester connects to the custodian.
     Connecting,
-    /// Noise and parameter-echo authentication.
+    /// The Noise_KK handshake and the session.ready echo are running.
     Authenticating,
-    /// Recent cryptographic liveness proven.
+    /// The session carries operations.
     Healthy,
-    /// Liveness recovery; new operations blocked.
-    Checking,
-    /// Close classification and key destruction.
+    /// The session is closing.
     Closing,
-    /// Terminal session record.
+    /// The session ended.
     Closed,
 }
 
 /// Operation component state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationState {
-    /// Admission state for a new operation instance.
+    /// No live operation instance.
     None,
-    /// Request sent or received.
+    /// The request is admitted and waits for the card.
     Requested,
-    /// Proxy performs safe reads, consent, and local credential entry.
+    /// Another session's operation holds the card.
+    Queued,
+    /// The consent view is on the custodian's screen.
     AwaitingConsent,
-    /// Approved with zero physical transmissions.
-    Prepared,
-    /// Durable point of no return recorded.
-    Committed,
-    /// One credential command may be in flight.
+    /// The card is commanded.
     Executing,
-    /// Result exists and awaits acknowledgment.
-    ResultPending,
-    /// Completed terminal result.
+    /// The operation completed.
     Completed,
-    /// User-denied terminal result.
-    Denied,
-    /// Safely cancelled terminal result.
-    Cancelled,
-    /// Policy/card rejection terminal result.
+    /// The operation was refused or failed.
     Rejected,
-    /// CAN, PIN 1, or PIN 2 rejection terminal result.
-    CredentialRejected,
-    /// Completion cannot be proven and retry is forbidden.
-    Ambiguous,
-    /// Result exists but delivery was not acknowledged.
-    DeliveryUncertain,
+    /// The deadline passed before the card was commanded.
+    Cancelled,
 }
 
 impl OperationState {
-    /// Whether this state is a permanent journal terminal.
+    /// Whether the operation has its result.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            Self::Completed
-                | Self::Denied
-                | Self::Cancelled
-                | Self::Rejected
-                | Self::CredentialRejected
-                | Self::Ambiguous
-                | Self::DeliveryUncertain
-        )
+        matches!(self, Self::Completed | Self::Rejected | Self::Cancelled)
     }
 }
 
 /// Pairing-machine input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairingEvent {
-    /// Explicit user action creates one manual QR offer.
-    CreateOffer,
-    /// Proxy scanned and validated a pairing offer QR.
-    OfferScanned,
-    /// A transport candidate connected while the offer is live.
-    CandidateConnected,
-    /// Offer reached its monotonic expiry or was cancelled.
+    /// The holder starts a pairing on the custodian.
+    StartPairing,
+    /// The offer lived out its lifetime or was cancelled.
     OfferExpiredOrCancelled,
-    /// Pairing Noise handshake completed with a matching transcript.
+    /// A requester began a CPace attempt.
+    AttemptStarted,
+    /// The user typed the pairing code on the requester.
+    CodeEntered,
+    /// A CPace attempt failed to confirm the key.
+    AttemptFailed,
+    /// The offer's last CPace attempt failed.
+    LastAttemptFailed,
+    /// Both CPace confirmation tags verified.
+    KeyConfirmed,
+    /// The pairing handshake completed.
     HandshakeAuthenticated,
-    /// Pairing Noise handshake failed before authentication.
+    /// The pairing handshake failed.
     HandshakeFailed,
-    /// Both endpoints confirmed the same granted profile set.
-    BothUsersConfirmed,
-    /// The peer confirmed that its pairing record is durably stored.
-    PeerStorageConfirmed,
-    /// Confirmation was denied, aborted, or exceeded local policy time.
+    /// The custodian verified pairing.hello against its offer.
+    HelloVerified,
+    /// Both pairing.confirm messages arrived.
+    BothConfirmed,
+    /// The pairing was aborted, denied, or missed its deadline.
     DeniedAbortedOrTimedOut,
-    /// A session for this pairing reached the healthy state.
+    /// The peer's pairing.stored arrived.
+    PeerStorageConfirmed,
+    /// A session of the pairing became healthy.
     SessionHealthy,
-    /// The pairing's session closed.
+    /// The session closed.
     SessionClosed,
-    /// Explicit user action removes the stored pairing.
+    /// The local user forgot the pairing.
     ForgetPairing,
-    /// Successfully decrypted traffic violated the protocol.
-    AuthenticatedProtocolViolation,
-    /// Explicit user action revokes the pairing.
-    LocalRevoke,
-    /// Authenticated peer close carried a revocation reason.
+    /// The revocation notice window passed.
+    NoticeWindowExpired,
+    /// A session.close with reason pairing_revoked arrived.
     PeerRevocationNotice,
 }
 
 /// Session-machine input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionEvent {
-    /// Explicit action initiates a new session transport.
+    /// The requester dials the custodian.
     Connect,
-    /// Accepting endpoint received an inbound transport connection.
-    TransportAccepted,
-    /// Requester transport establishment completed.
+    /// The custodian received a session routing preamble.
+    PreambleReceived,
+    /// The requester's connection is up.
     TransportConnected,
-    /// Transport was lost or could not be established.
+    /// The connection was lost or could not be made.
     TransportFailed,
-    /// Explicit local user disconnect.
-    UserDisconnect,
-    /// Session Noise handshake completed.
+    /// The Noise_KK handshake completed.
     HandshakeComplete,
-    /// A live session already exists for the same pairing.
-    SecondSessionDetected,
-    /// Received session-ready parameters equal the local view.
+    /// The requester verified session.ready.
     ReadyVerified,
-    /// Candidate connection failed during authentication.
+    /// Input before authentication was invalid.
     CandidateFailure,
-    /// Authenticated busy error arrived on the candidate session.
-    BusyReceived,
-    /// Authenticated peer close notice arrived.
-    PeerCloseReceived,
-    /// Successfully decrypted message violated the protocol.
+    /// An authenticated message violated the protocol.
     AuthenticatedProtocolViolation,
-    /// A liveness exchange went unanswered.
-    LivenessMissed,
-    /// An exact challenge echo restored liveness.
-    LivenessRestored,
-    /// The local liveness hard deadline passed.
-    LivenessDeadlineExpired,
-    /// Local endpoint requested an orderly close.
+    /// Nothing arrived for the liveness ping interval.
+    PeerSilent,
+    /// Nothing arrived for the session silence limit.
+    SilenceLimitReached,
+    /// The local user disconnected.
+    UserDisconnect,
+    /// The endpoint closes the session in order.
     LocalCloseRequested,
-    /// Card rejected the CAN, PIN 1, or PIN 2.
-    CredentialRejected,
-    /// Card completion can no longer be proven.
-    CardCompletionAmbiguous,
+    /// The custodian withdraws from serving.
+    ServiceWithdrawn,
+    /// The custodian can no longer serve any card.
+    CardUnavailable,
+    /// An authenticated session.close arrived.
+    PeerCloseReceived,
     /// A frame failed authenticated decryption or framing.
     SessionIntegrityFailed,
-    /// Pairing machine requested this session to close.
+    /// The pairing machine asked the session to close.
     CloseRequestedByPairing,
-    /// Local internal fault stops RAPP.
-    LocalSecurityShutdown,
-    /// Close notice finished or the closing deadline passed.
+    /// The close finished or its deadline passed.
     CloseCompleteOrDeadline,
 }
 
 /// Operation-machine input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationEvent {
-    /// Requester sent the operation request.
-    RequestSent,
-    /// Proxy received the operation request.
+    /// An admissible operation.request arrived.
     RequestReceived,
-    /// Request passed schema, hash, expiry, and context validation.
-    RequestValid,
-    /// Request failed validation or names an unsupported profile or action.
-    RequestInvalidOrUnsupported,
-    /// Peer cancellation arrived.
-    CancelReceived,
-    /// The request's expiry elapsed on the continuous clock, which advances
-    /// through suspension.
-    RequestExpired,
-    /// Human authorizer denied the operation.
+    /// A request reused an identifier the session has seen.
+    RequestDuplicate,
+    /// A request arrived while another operation is live.
+    RequestWhileBusy,
+    /// A request named a profile the pairing does not grant.
+    RequestUnauthorized,
+    /// A request named a lifetime or parameter the custodian cannot serve.
+    RequestUnsupported,
+    /// Another session's operation holds the card.
+    CardHeldElsewhere,
+    /// The card is free for an operation that needs consent.
+    CardAcquiredForConsent,
+    /// The card is free for a read.
+    CardAcquiredForRead,
+    /// The holder declined.
     UserDenied,
-    /// Fewer than three attempts remain on the decrementable counter.
-    RetryPolicyRefused,
-    /// Card rejected the CAN, PIN 1, or PIN 2.
-    InvalidCanOrPin1OrPin2,
-    /// Safe prerequisite reads finished for an action with no consequential
-    /// command.
-    SafeReadsComplete,
-    /// Human approved and the proxy can execute the exact request.
-    UserApprovedAndProxyReady,
-    /// Commit whose hash equals the prepared request hash arrived.
-    ValidCommit,
-    /// Proxy begins the single credential-command transmission.
-    BeginCardCommand,
-    /// Restart found a committed or executing record without a terminal
-    /// result.
-    CrashRecoveredWithoutTerminalResult,
-    /// Card completed the consequential command.
+    /// The holder approved.
+    UserApproved,
+    /// The custodian waits for the holder to present the card.
+    WaitingForCard,
+    /// The card was found.
+    CardFound,
+    /// The card refused the PIN and attempts remain above the floor.
+    WrongPin,
+    /// The retry floor refused the PIN verification.
+    RetryFloorRefused,
+    /// The card answered.
     CardSuccess,
-    /// Card refused the command for a non-credential reason.
-    CardPolicyRejection,
-    /// Card left before transmission provably began.
-    CardRemovedBeforeTransmit,
-    /// Card removal or transport loss left completion unproven.
-    CardRemovedOrTransportUncertain,
-    /// Session closed after the commit point.
-    SessionClosedPostCommit,
-    /// Result acknowledgment echoing the request hash arrived.
-    ValidResultAck,
-    /// Session closed with a completed result unacknowledged.
-    SessionClosedBeforeAck,
-    /// Prepared echo arrived on the requester.
-    PreparedReceived,
-    /// Requester cancelled or its local expiry elapsed.
-    CancelSentOrRequestExpired,
-    /// Requester sent the commit; the point of no return.
-    CommitSent,
-    /// Result with completed status arrived.
+    /// The card did not answer.
+    CardError,
+    /// The deadline passed before the card was commanded.
+    RequestExpired,
+    /// The session closed.
+    SessionClosed,
+    /// The requester sent the request.
+    RequestSent,
+    /// An operation.progress arrived.
+    ProgressReceived,
+    /// A completed operation.result arrived.
     ResultCompletedReceived,
-    /// Result with denied status arrived.
-    ResultDeniedReceived,
-    /// Result with cancelled status arrived.
-    ResultCancelledReceived,
-    /// Result with rejected status arrived.
+    /// A rejected operation.result, or an error busy or duplicate_operation, arrived.
     ResultRejectedReceived,
-    /// Result with credential-rejected status arrived.
-    ResultCredentialRejectedReceived,
-    /// Result with ambiguous status arrived.
-    ResultAmbiguousReceived,
-    /// Session closed before the commit point.
-    SessionClosedPreCommit,
+    /// A cancelled operation.result arrived.
+    ResultCancelledReceived,
 }
 
-/// Protocol side effect emitted by a state transition.
+/// Effect a transition asks the endpoint to carry out, in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    /// Generate a fresh random offer identifier.
-    GenerateOfferId,
-    /// Generate the fresh random bearer pairing secret.
-    GeneratePairingSecret,
-    /// Start the offer's monotonic expiry clock.
-    StartOfferExpiry,
-    /// Display the pairing code.
+    /// Create the offer with a fresh random offer_id and offer_ttl_ms.
+    GenerateOffer,
+    /// Draw the 6-character pairing code.
+    GeneratePairingCode,
+    /// Publish the mode=pairing record.
+    AdvertisePairingMode,
+    /// Show the pairing code on the custodian.
     DisplayPairingCode,
-    /// Stop displaying the pairing code.
+    /// Remove the pairing code from the screen.
     HidePairingCode,
-    /// Select exactly one offered transport candidate.
-    SelectOneCandidate,
-    /// Connect the selected transport candidate.
-    ConnectCandidate,
-    /// Prepare the pairing Noise responder role.
-    PreparePairingResponder,
-    /// Begin the pairing Noise handshake as initiator.
-    BeginPairingHandshakeInitiator,
-    /// Derive the channel identifiers from the handshake hash.
+    /// Erase the offer and its pairing code and stop advertising it.
+    DestroyOffer,
+    /// Stop offering and back off exponentially before the next offer.
+    StartPairingBackoff,
+    /// Tell the holder that the offer used its attempts.
+    ShowAttemptsExhausted,
+    /// Obtain the offer over the pairing connection and validate it.
+    ReadOffer,
+    /// Send CPace step 1 from the typed pairing code.
+    BeginCpaceInitiator,
+    /// Count the attempt before sending CPace step 2 and arm its deadline.
+    ReserveAttempt,
+    /// Record the failed attempt; the offer stays.
+    CountFailedAttempt,
+    /// Tell the user the pairing code did not match.
+    ShowWrongCode,
+    /// Mark the offer consumed once T_A verified.
+    ConsumeOffer,
+    /// Derive the PSK for the pairing handshake from the CPace key schedule.
+    DerivePairingSecret,
+    /// Run Noise_XXpsk3 with the PSK.
+    BeginPairingHandshake,
+    /// Derive session_id and pair_id from the handshake hash.
     DeriveChannelIdentifiers,
-    /// Destroy the pairing secret.
+    /// Erase the PSK and the CPace intermediate values.
     DestroyPairingSecret,
-    /// Stop accepting further candidates for this offer.
-    StopAcceptingCandidates,
-    /// Send the pairing hello with the negotiated-parameter echo.
+    /// Send pairing.hello with the negotiated-parameter echo.
     SendPairingHello,
-    /// Display the peer and the proposed grant set.
-    ShowPeerAndRequestedGrants,
-    /// Discard the failed candidate connection.
-    DiscardCandidate,
-    /// Keep the offer live for further candidates.
-    RetainOffer,
-    /// Invalidate the pairing offer.
-    InvalidateOffer,
+    /// Grant the requested profiles the offer allows and send pairing.confirm.
+    SendPairingConfirm,
+    /// Send pairing.abort if the channel is usable.
+    SendPairingAbortBestEffort,
+    /// Erase unstored static and ephemeral keys.
+    DestroyCandidateKeys,
     /// Close the candidate connection.
     CloseCandidate,
-    /// Atomically store keys, pair identifier, grants, and metadata.
+    /// Store pair keys, pair_id, grants, grants_hash and the unconfirmed mark in one commit.
     StorePairRecordAtomically,
-    /// Send the storage confirmation for the stored record.
+    /// Send pairing.stored carrying the derived pair_id.
     SendPairingStored,
-    /// Close the pairing channel; operations use fresh sessions.
+    /// Rewrite the stored record as confirmed.
+    MarkRecordConfirmed,
+    /// Close the authenticated pairing channel.
     ClosePairingChannel,
-    /// Send the pairing abort on a best-effort basis.
-    SendPairingAbortBestEffort,
-    /// Destroy the candidate pairing keys.
-    DestroyCandidateKeys,
-    /// Present the Connected liveness state.
-    ShowConnected,
-    /// Present the Paired, disconnected liveness state.
-    ShowPairedDisconnected,
-    /// Present the Checking connection liveness state.
-    ShowChecking,
-    /// Present the Disconnecting liveness state.
-    ShowDisconnecting,
-    /// Present the Connection stopped liveness state.
-    ShowConnectionStopped,
-    /// Present the Pairing revoked liveness state.
-    ShowRevoked,
-    /// Send the session close with this reason on a best-effort basis.
-    SendCloseBestEffort(CloseReason),
-    /// Close the active session.
-    CloseSession,
-    /// Revoke the stored record the peer never confirmed, leaving its
-    /// tombstone (section 4.3 item 4).
+    /// Revoke the stored record the peer never confirmed.
     RevokeUnconfirmedPairRecord,
-    /// Destroy the pair-specific static keys.
+    /// Mark the record revoked; it serves nothing from now on and its key is kept only for the close.
+    MarkRecordRevoked,
+    /// Send session.close with reason pairing_revoked as the session's first or next message.
+    SendClosePairingRevoked,
+    /// Raise close_requested_by_pairing for the live session.
+    CloseSession,
+    /// Erase the pairing's static private key.
     DestroyPairKeys,
-    /// Destroy the pairing's rendezvous tokens.
-    DestroyRelayTokens,
-    /// Clear stored pairing metadata.
-    ClearPairMetadata,
-    /// Clear the residual record of a revoked pairing.
+    /// Stop offering the pairing's credentials to local consumers.
+    WithdrawIdentity,
+    /// Show that the paired peer is connected.
+    ShowConnected,
+    /// Show that the paired peer is not connected.
+    ShowPairedDisconnected,
+    /// Show that this endpoint forgot the peer.
+    ShowForgotten,
+    /// Show that the peer forgot this endpoint.
+    ShowPeerForgot,
+    /// Erase the revoked record.
     ClearResidualPairRecord,
-    /// Record that the peer initiated the revocation.
-    RecordPeerInitiated,
-    /// Select one mutually stored transport profile.
-    SelectOneTransport,
-    /// Open the selected transport.
+    /// Connect to the custodian's advertised endpoint or peripheral.
     OpenTransport,
-    /// Associate the connection with the stored pairing its routing preamble names.
-    AssociatePairingFromRendezvous,
-    /// Begin the session Noise handshake as initiator.
+    /// Send the session routing preamble with a fresh routing tag.
+    SendSessionPreamble,
+    /// Start the session handshake in the initiator role.
     BeginKkInitiator,
-    /// Begin the session Noise handshake as responder.
+    /// Start the session handshake in the responder role.
     BeginKkResponder,
-    /// Derive the session identifier from the handshake hash.
+    /// Derive session_id from the handshake hash.
     DeriveSessionIdentifiers,
-    /// Send the encrypted session-ready parameter echo.
+    /// Send session.ready with the session-parameter echo.
     SendSessionReady,
-    /// Send the authenticated busy error.
-    SendErrorBusy,
-    /// Start authenticated liveness probing.
-    StartAuthenticatedLiveness,
-    /// Block admission of new operations.
-    BlockNewOperations,
-    /// Start liveness backoff and the hard deadline.
-    StartBackoffAndDeadline,
-    /// Reset the liveness backoff.
-    ResetBackoff,
-    /// Record the peer's close reason.
+    /// Send card.status with presence and the certificate fingerprint.
+    SendCardStatus,
+    /// Start the 5-second silence ping and the 30-second silence limit.
+    StartLiveness,
+    /// Send liveness.ping with a fresh challenge.
+    SendLivenessPing,
+    /// Keep the received close reason for the user.
     RecordPeerCloseReason,
-    /// Count a candidate authentication failure toward the re-pairing hint.
-    CountCandidateFailureHint,
-    /// Note that no close notice can reach the peer.
+    /// Send session.close with reason user_disconnect.
+    SendCloseUserDisconnect,
+    /// Send session.close with reason normal.
+    SendCloseNormal,
+    /// Send session.close with reason protocol_violation.
+    SendCloseProtocolViolation,
+    /// Send session.close with reason service_withdrawn.
+    SendCloseServiceWithdrawn,
+    /// Send session.close with reason card_unavailable.
+    SendCloseCardUnavailable,
+    /// Record that no close notice can be sent.
     NoteCloseNoticeImpossible,
-    /// Continue closing without a peer notice.
+    /// Continue closing without further sends.
     ProceedWithoutCloseNotice,
-    /// Abort the candidate connection attempt.
-    AbortCandidate,
-    /// Destroy session keys and handshake material.
+    /// Erase session keys, handshake state and buffers.
     DestroySessionMaterial,
-    /// Destroy collected credential buffers.
+    /// Erase credential buffers tied to the session.
     DestroyCredentialBuffers,
-    /// Persist the terminal session record.
-    PersistTerminalSessionRecord,
-    /// Validate request schema, hash, expiry, and context.
-    ValidateSchemaHashExpiryAndContext,
-    /// Start the operation's expiry on the continuous clock.
+    /// Show that the session is closing.
+    ShowDisconnecting,
+    /// Show that the session ended.
+    ShowConnectionStopped,
+    /// Take the deadline on the continuous clock.
     StartExpiryClock,
-    /// Begin the profile's safe prerequisite reads.
-    BeginSafePrerequisiteReads,
-    /// Present profile-defined consent context.
-    PresentConsentPerProfile,
-    /// Dismiss any open consent prompt.
+    /// Send error busy naming the operation.
+    SendErrorBusy,
+    /// Send error duplicate_operation naming the operation.
+    SendErrorDuplicateOperation,
+    /// Send operation.result rejected with unauthorized.
+    SendResultUnauthorized,
+    /// Send operation.result rejected with unsupported_parameter or invalid_lifetime.
+    SendResultUnsupportedParameter,
+    /// Send operation.progress queued, once.
+    SendProgressQueued,
+    /// Show the operation from the admitted request.
+    PresentConsent,
+    /// Send operation.progress consent_shown once the view is on screen.
+    SendProgressConsentShown,
+    /// Remove the consent view.
     DismissConsent,
-    /// Destroy credentials collected for this operation.
-    ClearOperationCredentials,
-    /// Destroy every credential value in the active flow.
-    ClearAllActiveCredentials,
-    /// Remove cached values for the rejected credential and derived state.
-    RemoveRejectedCredentialAndDerivedState,
-    /// Send the prepared echo.
-    SendPrepared,
-    /// Send the result with completed status.
+    /// Run the read-only card commands.
+    ExecuteRead,
+    /// Read the remaining attempts of the PIN the command needs.
+    CheckRetryFloor,
+    /// Consume the one-shot card command.
+    ConsumeCardCommand,
+    /// Send operation.progress waiting_for_card.
+    SendProgressWaitingForCard,
+    /// Send operation.progress card_wait_ended.
+    SendProgressCardWaitEnded,
+    /// Tell the holder the PIN was wrong, with the attempts left, and prompt again.
+    PromptPinAgain,
+    /// Send operation.result completed with the response.
     SendResultCompleted,
-    /// Send the result with denied status.
-    SendResultDenied,
-    /// Send the result with cancelled status.
-    SendResultCancelled,
-    /// Send the result with rejected status.
-    SendResultRejected,
-    /// Send the rejected result for a retry-policy refusal.
-    SendResultRetryPolicyRefused,
-    /// Send the bounded credential-rejected result on a best-effort basis.
-    SendResultCredentialRejectedBestEffort,
-    /// Send the ambiguous result on a best-effort basis.
-    SendResultAmbiguousBestEffort,
-    /// Ask the session machine for an explicit close.
-    RequestSessionClose,
-    /// Ask the session machine to close after credential rejection.
-    RequestSessionCloseCredentialRejected,
-    /// Revoke the pairing after a credential rejection.
-    RevokePairAfterCredentialRejection,
-    /// Ask the session machine to close after card ambiguity.
-    RequestSessionCloseAmbiguous,
-    /// Send the operation cancellation.
-    SendOperationCancel,
-    /// Durably write the commit record before any transmission.
-    DurablyWriteCommitBeforeTransmission,
-    /// Consume the non-clonable command object.
-    ConsumeNonClonableCommand,
-    /// Count the single permitted transmission.
-    IncrementTransmissionCountOnce,
-    /// Record the post-commit cancel as advisory.
-    RecordAdvisoryCancel,
-    /// Let the in-flight card exchange finish locally.
+    /// Send operation.result rejected with user_cancelled.
+    SendResultUserCancelled,
+    /// Send operation.result rejected with retry_floor.
+    SendResultRetryFloor,
+    /// Send operation.result rejected with card_error.
+    SendResultCardError,
+    /// Send operation.result cancelled with operation_expired.
+    SendResultOperationExpired,
+    /// Zeroize credentials collected for the operation.
+    ClearOperationCredentials,
+    /// Let the card command finish; never interrupt or repeat it.
     ContinueCardExchangeLocally,
-    /// Note that the result can no longer be delivered.
-    NoteResultDeliveryImpossible,
-    /// Persist the card result.
-    PersistResult,
-    /// Persist the rejected terminal state.
-    PersistRejection,
-    /// Persist the cancelled terminal state.
-    PersistCancelled,
-    /// Persist the ambiguous terminal state.
-    PersistAmbiguous,
-    /// Persist the completed terminal state.
-    PersistCompleted,
-    /// Persist the delivery-uncertain terminal state.
-    PersistDeliveryUncertain,
-    /// Release the acknowledged result.
+    /// Drop the card's answer; no session carries it.
+    DiscardAnswer,
+    /// Let the next queued operation take the card.
+    ReleaseCard,
+    /// Show the operation's progress to the user.
+    ShowProgress,
+    /// Hand the response to the requesting application.
     ReleaseResult,
-    /// Retain the result encrypted under local platform storage.
-    RetainResultUnderLocalStorage,
-    /// Forbid any retry of this operation.
-    ProhibitRetry,
-    /// Forbid repeating the card command.
-    ProhibitCardRetry,
-    /// Compute the deterministic request hash.
-    ComputeRequestHash,
-    /// Journal the request.
-    JournalRequest,
-    /// Journal the prepared state.
-    JournalPrepared,
-    /// Durably journal the commit intent.
-    JournalCommitIntentDurably,
-    /// Journal the completed terminal state.
-    JournalCompleted,
-    /// Journal the denied terminal state.
-    JournalDenied,
-    /// Journal the cancelled terminal state.
-    JournalCancelled,
-    /// Journal the rejected terminal state.
-    JournalRejected,
-    /// Journal the credential-rejected terminal state.
-    JournalCredentialRejected,
-    /// Journal the ambiguous terminal state.
-    JournalAmbiguous,
-    /// Send the result acknowledgment.
-    SendResultAck,
+    /// Tell the requesting application why the operation ended.
+    ReleaseFailure,
+    /// Tell the requesting application that the operation ended with its session.
+    ReportOperationLost,
 }
 
 /// Successful transition and its ordered effects.
@@ -530,21 +436,20 @@ pub enum Action {
 pub struct Transition<S> {
     /// Resulting component state.
     pub state: S,
-    /// Ordered effects the adapter must execute.
+    /// Ordered effects the endpoint carries out.
     pub actions: &'static [Action],
 }
 
-/// A guard or machine-domain rejection.
+/// Why a transition does not apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransitionError {
-    /// This endpoint role does not implement the selected transition.
+    /// This endpoint role does not implement the transition.
     WrongRole,
-    /// A named formal guard failed.
+    /// A named guard failed.
     GuardFailed,
-    /// No legal transition exists; authenticated input is a violation unless
-    /// separately classified as a stale-reference race.
+    /// No transition exists for this input.
     UnexpectedInput,
-    /// Terminal operation references are stale races, not violations.
+    /// The operation already has its result.
     TerminalOperation,
 }
 
@@ -556,19 +461,31 @@ const fn require(condition: bool) -> Result<(), TransitionError> {
     }
 }
 
+const fn require_role(role: EndpointRole, expected: EndpointRole) -> Result<(), TransitionError> {
+    if matches!(
+        (role, expected),
+        (EndpointRole::Requester, EndpointRole::Requester)
+            | (EndpointRole::Proxy, EndpointRole::Proxy)
+    ) {
+        Ok(())
+    } else {
+        Err(TransitionError::WrongRole)
+    }
+}
+
 impl PairingState {
-    /// Apply one transition from the normative pairing projection.
+    /// Apply one transition of the pairing machine.
     ///
     /// # Errors
     /// [`TransitionError`] on a wrong role, a failed guard, or input with no
-    /// legal transition.
+    /// transition.
     #[allow(
         clippy::too_many_lines,
-        reason = "the match is one pairing state machine projection and reads best unsplit"
+        reason = "the match is the pairing machine's transition table and reads best whole"
     )]
     #[allow(
         clippy::match_same_arms,
-        reason = "arms mirror the normative pairing transition table; distinct transitions stay distinct even when action lists coincide"
+        reason = "arms mirror the formal transition table; distinct transitions stay distinct"
     )]
     pub fn transition(
         self,
@@ -580,116 +497,144 @@ impl PairingState {
         use PairingEvent as E;
 
         let transition = match (self, event) {
-            (Self::Unpaired, E::CreateOffer) => {
-                require(role == EndpointRole::Requester && guards.user_initiated)?;
+            (Self::Unpaired, E::StartPairing) => {
+                require_role(role, EndpointRole::Proxy)?;
+                require(guards.user_initiated)?;
                 Transition {
-                    state: Self::OfferActive,
+                    state: Self::Offering,
                     actions: &[
-                        A::GenerateOfferId,
-                        A::GeneratePairingSecret,
-                        A::StartOfferExpiry,
+                        A::GenerateOffer,
+                        A::GeneratePairingCode,
+                        A::AdvertisePairingMode,
                         A::DisplayPairingCode,
                     ],
                 }
             }
-            (Self::Unpaired, E::OfferScanned) => {
-                require(role == EndpointRole::Proxy && guards.offer_valid_and_supported)?;
+            (Self::Offering, E::OfferExpiredOrCancelled) => {
+                require_role(role, EndpointRole::Proxy)?;
                 Transition {
-                    state: Self::Handshaking,
-                    actions: &[
-                        A::SelectOneCandidate,
-                        A::ConnectCandidate,
-                        A::PreparePairingResponder,
-                    ],
+                    state: Self::Unpaired,
+                    actions: &[A::DestroyOffer, A::HidePairingCode],
                 }
             }
-            (Self::OfferActive, E::CandidateConnected) => {
-                require(role == EndpointRole::Requester && guards.offer_live)?;
+            (Self::Offering, E::AttemptStarted) => {
+                require_role(role, EndpointRole::Proxy)?;
                 Transition {
-                    state: Self::Handshaking,
-                    actions: &[A::BeginPairingHandshakeInitiator],
+                    state: Self::Exchanging,
+                    actions: &[A::ReserveAttempt],
                 }
             }
-            (Self::OfferActive, E::OfferExpiredOrCancelled) => {
-                require(role == EndpointRole::Requester)?;
+            (Self::Unpaired, E::CodeEntered) => {
+                require_role(role, EndpointRole::Requester)?;
+                require(guards.user_initiated)?;
+                Transition {
+                    state: Self::Exchanging,
+                    actions: &[A::ReadOffer, A::BeginCpaceInitiator],
+                }
+            }
+            (Self::Exchanging, E::AttemptFailed) => match role {
+                EndpointRole::Proxy => Transition {
+                    state: Self::Offering,
+                    actions: &[A::CountFailedAttempt],
+                },
+                EndpointRole::Requester => Transition {
+                    state: Self::Unpaired,
+                    actions: &[A::CloseCandidate, A::ShowWrongCode],
+                },
+            },
+            (Self::Exchanging, E::LastAttemptFailed) => {
+                require_role(role, EndpointRole::Proxy)?;
                 Transition {
                     state: Self::Unpaired,
                     actions: &[
-                        A::DestroyPairingSecret,
-                        A::InvalidateOffer,
+                        A::DestroyOffer,
                         A::HidePairingCode,
+                        A::StartPairingBackoff,
+                        A::ShowAttemptsExhausted,
                     ],
                 }
             }
-            (Self::Handshaking, E::OfferExpiredOrCancelled) => {
-                require(role == EndpointRole::Requester)?;
+            (Self::Exchanging, E::OfferExpiredOrCancelled) => {
+                require_role(role, EndpointRole::Proxy)?;
                 Transition {
                     state: Self::Unpaired,
-                    actions: &[
-                        A::DestroyPairingSecret,
-                        A::InvalidateOffer,
-                        A::CloseCandidate,
-                    ],
+                    actions: &[A::DestroyOffer, A::HidePairingCode, A::CloseCandidate],
                 }
             }
-            (Self::Handshaking, E::HandshakeAuthenticated) => {
-                require(guards.transcript_matches)?;
+            (Self::Exchanging, E::KeyConfirmed) => match role {
+                EndpointRole::Proxy => Transition {
+                    state: Self::Handshaking,
+                    actions: &[
+                        A::ConsumeOffer,
+                        A::HidePairingCode,
+                        A::DerivePairingSecret,
+                        A::BeginPairingHandshake,
+                    ],
+                },
+                EndpointRole::Requester => Transition {
+                    state: Self::Handshaking,
+                    actions: &[A::DerivePairingSecret, A::BeginPairingHandshake],
+                },
+            },
+            (Self::Handshaking, E::HandshakeAuthenticated) => match role {
+                EndpointRole::Requester => {
+                    require(guards.transcript_matches)?;
+                    Transition {
+                        state: Self::Confirming,
+                        actions: &[
+                            A::DeriveChannelIdentifiers,
+                            A::DestroyPairingSecret,
+                            A::SendPairingHello,
+                        ],
+                    }
+                }
+                EndpointRole::Proxy => {
+                    require(guards.transcript_matches)?;
+                    Transition {
+                        state: Self::Confirming,
+                        actions: &[A::DeriveChannelIdentifiers, A::DestroyPairingSecret],
+                    }
+                }
+            },
+            (Self::Handshaking, E::HandshakeFailed) => Transition {
+                state: Self::Unpaired,
+                actions: &[
+                    A::DestroyPairingSecret,
+                    A::DestroyCandidateKeys,
+                    A::CloseCandidate,
+                ],
+            },
+            (Self::Confirming, E::HelloVerified) => {
+                require_role(role, EndpointRole::Proxy)?;
                 Transition {
                     state: Self::Confirming,
-                    actions: &[
-                        A::DeriveChannelIdentifiers,
-                        A::DestroyPairingSecret,
-                        A::StopAcceptingCandidates,
-                        A::HidePairingCode,
-                        A::SendPairingHello,
-                        A::ShowPeerAndRequestedGrants,
-                    ],
+                    actions: &[A::SendPairingConfirm],
                 }
             }
-            (Self::Handshaking, E::HandshakeFailed) if role == EndpointRole::Requester => {
-                Transition {
-                    state: Self::OfferActive,
-                    actions: &[A::DiscardCandidate, A::RetainOffer],
-                }
-            }
-            (Self::Handshaking, E::HandshakeFailed) if role == EndpointRole::Proxy => Transition {
-                state: Self::Unpaired,
-                actions: &[A::DiscardCandidate],
-            },
-            (Self::Confirming, E::BothUsersConfirmed) => {
+            (Self::Confirming, E::BothConfirmed) => {
                 require(guards.granted_sets_equal)?;
                 Transition {
                     state: Self::StorageConfirming,
-                    actions: &[
-                        A::StorePairRecordAtomically,
-                        A::InvalidateOffer,
-                        A::SendPairingStored,
-                    ],
+                    actions: &[A::StorePairRecordAtomically, A::SendPairingStored],
                 }
             }
+            (Self::Confirming, E::DeniedAbortedOrTimedOut) => Transition {
+                state: Self::Unpaired,
+                actions: &[
+                    A::SendPairingAbortBestEffort,
+                    A::DestroyCandidateKeys,
+                    A::CloseCandidate,
+                ],
+            },
             (Self::StorageConfirming, E::PeerStorageConfirmed) => Transition {
                 state: Self::PairedDisconnected,
-                actions: &[A::ClosePairingChannel],
+                actions: &[A::MarkRecordConfirmed, A::ClosePairingChannel],
             },
             (Self::StorageConfirming, E::DeniedAbortedOrTimedOut) => Transition {
                 state: Self::Unpaired,
                 actions: &[
                     A::RevokeUnconfirmedPairRecord,
                     A::DestroyPairKeys,
-                    A::ClearPairMetadata,
-                    A::CloseCandidate,
-                ],
-            },
-            (Self::StorageConfirming, E::AuthenticatedProtocolViolation) => Transition {
-                state: Self::Revoked,
-                actions: &[A::DestroyPairKeys, A::CloseCandidate, A::ShowRevoked],
-            },
-            (Self::Confirming, E::DeniedAbortedOrTimedOut) => Transition {
-                state: Self::Unpaired,
-                actions: &[
-                    A::SendPairingAbortBestEffort,
-                    A::DestroyCandidateKeys,
-                    A::InvalidateOffer,
                     A::CloseCandidate,
                 ],
             },
@@ -701,69 +646,61 @@ impl PairingState {
                 state: Self::PairedDisconnected,
                 actions: &[A::ShowPairedDisconnected],
             },
-            (Self::PairedDisconnected, E::ForgetPairing) => {
-                require(guards.user_initiated)?;
-                Transition {
-                    state: Self::Unpaired,
-                    actions: &[
-                        A::DestroyPairKeys,
-                        A::DestroyRelayTokens,
-                        A::ClearPairMetadata,
-                    ],
-                }
-            }
             (Self::PairedConnected, E::ForgetPairing) => {
-                require(guards.user_initiated)?;
+                require(guards.local_user_action)?;
                 Transition {
-                    state: Self::Unpaired,
+                    state: Self::Revoked,
                     actions: &[
-                        A::SendCloseBestEffort(CloseReason::PairingRevoked),
+                        A::MarkRecordRevoked,
+                        A::SendClosePairingRevoked,
                         A::CloseSession,
                         A::DestroyPairKeys,
-                        A::DestroyRelayTokens,
-                        A::ClearPairMetadata,
+                        A::WithdrawIdentity,
+                        A::ShowForgotten,
                     ],
                 }
             }
-            (Self::PairedConnected, E::AuthenticatedProtocolViolation) => Transition {
+            (Self::PairedDisconnected, E::ForgetPairing) => {
+                require(guards.local_user_action)?;
+                Transition {
+                    state: Self::Revoking,
+                    actions: &[A::MarkRecordRevoked, A::WithdrawIdentity, A::ShowForgotten],
+                }
+            }
+            (Self::Revoking, E::SessionHealthy) => Transition {
                 state: Self::Revoked,
                 actions: &[
-                    A::SendCloseBestEffort(CloseReason::ProtocolViolation),
+                    A::SendClosePairingRevoked,
                     A::CloseSession,
                     A::DestroyPairKeys,
-                    A::ShowRevoked,
                 ],
             },
-            (Self::PairedConnected, E::LocalRevoke) => {
-                require(guards.user_initiated)?;
-                Transition {
-                    state: Self::Revoked,
-                    actions: &[
-                        A::SendCloseBestEffort(CloseReason::PairingRevoked),
-                        A::CloseSession,
-                        A::DestroyPairKeys,
-                        A::ShowRevoked,
-                    ],
-                }
-            }
-            (Self::PairedDisconnected, E::LocalRevoke) => {
-                require(guards.user_initiated)?;
-                Transition {
-                    state: Self::Revoked,
-                    actions: &[A::DestroyPairKeys, A::ShowRevoked],
-                }
-            }
+            (Self::Revoking, E::NoticeWindowExpired) => Transition {
+                state: Self::Revoked,
+                actions: &[A::DestroyPairKeys],
+            },
             (Self::PairedConnected, E::PeerRevocationNotice) => Transition {
                 state: Self::Revoked,
                 actions: &[
-                    A::RecordPeerInitiated,
+                    A::MarkRecordRevoked,
                     A::CloseSession,
                     A::DestroyPairKeys,
-                    A::ShowRevoked,
+                    A::WithdrawIdentity,
+                    A::ShowPeerForgot,
+                ],
+            },
+            (Self::Revoking, E::PeerRevocationNotice) => Transition {
+                state: Self::Revoked,
+                actions: &[
+                    A::MarkRecordRevoked,
+                    A::CloseSession,
+                    A::DestroyPairKeys,
+                    A::WithdrawIdentity,
+                    A::ShowPeerForgot,
                 ],
             },
             (Self::Revoked, E::ForgetPairing) => {
-                require(guards.user_initiated)?;
+                require(guards.local_user_action)?;
                 Transition {
                     state: Self::Unpaired,
                     actions: &[A::ClearResidualPairRecord],
@@ -776,18 +713,18 @@ impl PairingState {
 }
 
 impl SessionState {
-    /// Apply one transition from the normative session projection.
+    /// Apply one transition of the session machine.
     ///
     /// # Errors
     /// [`TransitionError`] on a wrong role, a failed guard, or input with no
-    /// legal transition.
+    /// transition.
     #[allow(
         clippy::too_many_lines,
-        reason = "the match is one session state machine projection and reads best unsplit"
+        reason = "the match is the session machine's transition table and reads best whole"
     )]
     #[allow(
         clippy::match_same_arms,
-        reason = "arms mirror the normative session transition table; distinct transitions stay distinct even when action lists coincide"
+        reason = "arms mirror the formal transition table; distinct transitions stay distinct"
     )]
     pub fn transition(
         self,
@@ -800,190 +737,139 @@ impl SessionState {
 
         let transition = match (self, event) {
             (Self::Absent, E::Connect) => {
-                require(role == EndpointRole::Requester && guards.initiation_permitted)?;
+                require_role(role, EndpointRole::Requester)?;
+                require(guards.initiation_permitted)?;
                 Transition {
                     state: Self::Connecting,
-                    actions: &[A::SelectOneTransport, A::OpenTransport],
+                    actions: &[A::OpenTransport],
                 }
             }
-            (Self::Absent, E::TransportAccepted) => {
-                require(role == EndpointRole::Proxy && guards.pairing_paired)?;
+            (Self::Absent, E::PreambleReceived) => {
+                require_role(role, EndpointRole::Proxy)?;
+                require(guards.pairing_routed)?;
                 Transition {
                     state: Self::Authenticating,
-                    actions: &[A::AssociatePairingFromRendezvous, A::BeginKkResponder],
+                    actions: &[A::BeginKkResponder],
                 }
             }
             (Self::Connecting, E::TransportConnected) => {
-                require(role == EndpointRole::Requester)?;
+                require_role(role, EndpointRole::Requester)?;
                 Transition {
                     state: Self::Authenticating,
-                    actions: &[A::BeginKkInitiator],
+                    actions: &[A::SendSessionPreamble, A::BeginKkInitiator],
                 }
             }
             (Self::Connecting, E::TransportFailed) => {
-                require(role == EndpointRole::Requester)?;
+                require_role(role, EndpointRole::Requester)?;
                 Transition {
                     state: Self::Closed,
                     actions: &[A::DestroySessionMaterial, A::ShowConnectionStopped],
                 }
             }
-            (Self::Connecting, E::UserDisconnect) => {
-                require(role == EndpointRole::Requester)?;
-                Transition {
-                    state: Self::Closed,
+            (Self::Authenticating, E::HandshakeComplete) => match role {
+                EndpointRole::Proxy => Transition {
+                    state: Self::Healthy,
                     actions: &[
-                        A::AbortCandidate,
-                        A::DestroySessionMaterial,
-                        A::ShowConnectionStopped,
+                        A::DeriveSessionIdentifiers,
+                        A::SendSessionReady,
+                        A::SendCardStatus,
+                        A::StartLiveness,
                     ],
-                }
-            }
-            (Self::Authenticating, E::HandshakeComplete) => Transition {
-                state: Self::Authenticating,
-                actions: &[A::DeriveSessionIdentifiers, A::SendSessionReady],
+                },
+                EndpointRole::Requester => Transition {
+                    state: Self::Authenticating,
+                    actions: &[A::DeriveSessionIdentifiers],
+                },
             },
-            (Self::Authenticating, E::SecondSessionDetected) => {
-                require(role == EndpointRole::Proxy && guards.another_session_live)?;
-                Transition {
-                    state: Self::Closed,
-                    actions: &[
-                        A::SendErrorBusy,
-                        A::DestroySessionMaterial,
-                        A::CloseCandidate,
-                    ],
-                }
-            }
             (Self::Authenticating, E::ReadyVerified) => {
+                require_role(role, EndpointRole::Requester)?;
                 require(guards.ready_parameters_match)?;
                 Transition {
                     state: Self::Healthy,
-                    actions: &[A::StartAuthenticatedLiveness, A::ShowConnected],
+                    actions: &[A::StartLiveness, A::ShowConnected],
                 }
             }
             (Self::Authenticating, E::CandidateFailure) => Transition {
                 state: Self::Closed,
-                actions: &[
-                    A::DestroySessionMaterial,
-                    A::CloseCandidate,
-                    A::CountCandidateFailureHint,
-                    A::ShowConnectionStopped,
-                ],
+                actions: &[A::DestroySessionMaterial, A::CloseCandidate],
             },
             (Self::Authenticating, E::TransportFailed) => Transition {
                 state: Self::Closed,
                 actions: &[A::DestroySessionMaterial, A::ShowConnectionStopped],
             },
-            (Self::Authenticating, E::BusyReceived) => {
-                require(role == EndpointRole::Requester)?;
+            (Self::Authenticating, E::AuthenticatedProtocolViolation) => Transition {
+                state: Self::Closing,
+                actions: &[A::SendCloseProtocolViolation, A::ShowDisconnecting],
+            },
+            (Self::Healthy, E::PeerSilent) => Transition {
+                state: Self::Healthy,
+                actions: &[A::SendLivenessPing],
+            },
+            (Self::Healthy, E::SilenceLimitReached) => Transition {
+                state: Self::Closing,
+                actions: &[A::NoteCloseNoticeImpossible, A::ShowDisconnecting],
+            },
+            (Self::Healthy, E::UserDisconnect) => Transition {
+                state: Self::Closing,
+                actions: &[A::SendCloseUserDisconnect, A::ShowDisconnecting],
+            },
+            (Self::Healthy, E::LocalCloseRequested) => Transition {
+                state: Self::Closing,
+                actions: &[A::SendCloseNormal, A::ShowDisconnecting],
+            },
+            (Self::Healthy, E::ServiceWithdrawn) => {
+                require_role(role, EndpointRole::Proxy)?;
                 Transition {
-                    state: Self::Closed,
-                    actions: &[
-                        A::DestroySessionMaterial,
-                        A::CloseCandidate,
-                        A::ShowConnectionStopped,
-                    ],
+                    state: Self::Closing,
+                    actions: &[A::SendCloseServiceWithdrawn, A::ShowDisconnecting],
                 }
             }
-            (Self::Authenticating, E::PeerCloseReceived) => Transition {
+            (Self::Healthy, E::CardUnavailable) => {
+                require_role(role, EndpointRole::Proxy)?;
+                Transition {
+                    state: Self::Closing,
+                    actions: &[A::SendCloseCardUnavailable, A::ShowDisconnecting],
+                }
+            }
+            (Self::Healthy, E::PeerCloseReceived) => Transition {
+                state: Self::Closing,
+                actions: &[A::RecordPeerCloseReason, A::ShowDisconnecting],
+            },
+            (Self::Healthy, E::TransportFailed) => Transition {
+                state: Self::Closing,
+                actions: &[A::NoteCloseNoticeImpossible, A::ShowDisconnecting],
+            },
+            (Self::Healthy, E::SessionIntegrityFailed) => Transition {
+                state: Self::Closing,
+                actions: &[A::NoteCloseNoticeImpossible, A::ShowDisconnecting],
+            },
+            (Self::Healthy, E::AuthenticatedProtocolViolation) => Transition {
+                state: Self::Closing,
+                actions: &[A::SendCloseProtocolViolation, A::ShowDisconnecting],
+            },
+            (Self::Healthy, E::CloseRequestedByPairing) => Transition {
+                state: Self::Closing,
+                actions: &[A::ShowDisconnecting],
+            },
+            (Self::Connecting, E::CloseRequestedByPairing) => Transition {
                 state: Self::Closed,
                 actions: &[
-                    A::RecordPeerCloseReason,
                     A::DestroySessionMaterial,
                     A::CloseCandidate,
                     A::ShowConnectionStopped,
                 ],
             },
-            (Self::Authenticating, E::AuthenticatedProtocolViolation) => Transition {
-                state: Self::Closing,
+            (Self::Authenticating, E::CloseRequestedByPairing) => Transition {
+                state: Self::Closed,
                 actions: &[
-                    A::SendCloseBestEffort(CloseReason::ProtocolViolation),
-                    A::ShowDisconnecting,
+                    A::DestroySessionMaterial,
+                    A::CloseCandidate,
+                    A::ShowConnectionStopped,
                 ],
-            },
-            (Self::Healthy, E::LivenessMissed) => Transition {
-                state: Self::Checking,
-                actions: &[
-                    A::BlockNewOperations,
-                    A::StartBackoffAndDeadline,
-                    A::ShowChecking,
-                ],
-            },
-            (Self::Checking, E::LivenessRestored) => {
-                require(guards.deadline_not_expired)?;
-                Transition {
-                    state: Self::Healthy,
-                    actions: &[A::ResetBackoff, A::ShowConnected],
-                }
-            }
-            (Self::Checking, E::LivenessDeadlineExpired) => Transition {
-                state: Self::Closing,
-                actions: &[A::ShowDisconnecting],
-            },
-            (Self::Healthy | Self::Checking, E::UserDisconnect | E::LocalCloseRequested) => {
-                Transition {
-                    state: Self::Closing,
-                    actions: &[
-                        A::SendCloseBestEffort(CloseReason::UserDisconnect),
-                        A::ShowDisconnecting,
-                    ],
-                }
-            }
-            (Self::Healthy | Self::Checking, E::PeerCloseReceived) => Transition {
-                state: Self::Closing,
-                actions: &[A::RecordPeerCloseReason, A::ShowDisconnecting],
             },
             (Self::Closing, E::PeerCloseReceived) => Transition {
                 state: Self::Closing,
                 actions: &[],
-            },
-            (Self::Healthy | Self::Checking, E::CredentialRejected) => {
-                require(role == EndpointRole::Proxy)?;
-                Transition {
-                    state: Self::Closing,
-                    actions: &[
-                        A::DestroyPairKeys,
-                        A::ShowRevoked,
-                        A::SendCloseBestEffort(CloseReason::CredentialRejected),
-                        A::ShowDisconnecting,
-                    ],
-                }
-            }
-            (Self::Healthy | Self::Checking, E::CardCompletionAmbiguous) => {
-                require(role == EndpointRole::Proxy)?;
-                Transition {
-                    state: Self::Closing,
-                    actions: &[A::ShowDisconnecting],
-                }
-            }
-            (
-                Self::Healthy | Self::Checking,
-                E::TransportFailed | E::SessionIntegrityFailed | E::LocalSecurityShutdown,
-            ) => Transition {
-                state: Self::Closing,
-                actions: &[A::NoteCloseNoticeImpossible, A::ShowDisconnecting],
-            },
-            (Self::Healthy | Self::Checking, E::AuthenticatedProtocolViolation) => Transition {
-                state: Self::Closing,
-                actions: &[
-                    A::SendCloseBestEffort(CloseReason::ProtocolViolation),
-                    A::ShowDisconnecting,
-                ],
-            },
-            (Self::Healthy | Self::Checking, E::CloseRequestedByPairing) => Transition {
-                state: Self::Closing,
-                actions: &[A::ShowDisconnecting],
-            },
-            (Self::Connecting | Self::Authenticating, E::CloseRequestedByPairing) => Transition {
-                state: Self::Closed,
-                actions: &[
-                    A::DestroySessionMaterial,
-                    A::CloseCandidate,
-                    A::ShowConnectionStopped,
-                ],
-            },
-            (Self::Connecting | Self::Authenticating, E::LocalSecurityShutdown) => Transition {
-                state: Self::Closed,
-                actions: &[A::DestroySessionMaterial, A::ShowConnectionStopped],
             },
             (Self::Closing, E::TransportFailed) => Transition {
                 state: Self::Closing,
@@ -994,7 +880,6 @@ impl SessionState {
                 actions: &[
                     A::DestroySessionMaterial,
                     A::DestroyCredentialBuffers,
-                    A::PersistTerminalSessionRecord,
                     A::ShowConnectionStopped,
                 ],
             },
@@ -1005,314 +890,298 @@ impl SessionState {
 }
 
 impl OperationState {
-    /// Apply one transition from the normative operation projection.
+    /// Apply one transition of the operation machine.
     ///
     /// # Errors
-    /// [`TransitionError`] on a terminal operation, a failed guard, or input
-    /// with no legal transition.
+    /// [`TransitionError`] on a wrong role, a failed guard, or input with no
+    /// transition.
     #[allow(
         clippy::too_many_lines,
-        reason = "the match is one operation state machine projection and reads best unsplit"
+        reason = "the match is the operation machine's transition table and reads best whole"
     )]
     #[allow(
         clippy::match_same_arms,
-        reason = "arms mirror the normative operation transition table; distinct transitions stay distinct even when action lists coincide"
+        reason = "arms mirror the formal transition table; distinct transitions stay distinct"
     )]
     pub fn transition(
         self,
         role: EndpointRole,
         event: OperationEvent,
-        guards: Guards,
+        _guards: Guards,
     ) -> Result<Transition<Self>, TransitionError> {
         use Action as A;
         use OperationEvent as E;
 
-        if self.is_terminal() {
-            return Err(TransitionError::TerminalOperation);
-        }
-
-        let transition = match (self, event, role) {
-            (Self::None, E::RequestSent, EndpointRole::Requester) => {
-                require(guards.admission_permitted)?;
+        let transition = match (self, event) {
+            (Self::None, E::RequestReceived) => {
+                require_role(role, EndpointRole::Proxy)?;
                 Transition {
                     state: Self::Requested,
-                    actions: &[
-                        A::ComputeRequestHash,
-                        A::JournalRequest,
-                        A::StartExpiryClock,
-                    ],
+                    actions: &[A::StartExpiryClock],
                 }
             }
-            (Self::None, E::RequestReceived, EndpointRole::Proxy) => {
-                require(guards.admission_permitted)?;
+            (Self::None, E::RequestDuplicate) => {
+                require_role(role, EndpointRole::Proxy)?;
                 Transition {
-                    state: Self::Requested,
-                    actions: &[A::ValidateSchemaHashExpiryAndContext, A::StartExpiryClock],
+                    state: Self::None,
+                    actions: &[A::SendErrorDuplicateOperation],
                 }
             }
-            (Self::Requested, E::RequestValid, EndpointRole::Proxy) => Transition {
-                state: Self::AwaitingConsent,
-                actions: &[A::BeginSafePrerequisiteReads, A::PresentConsentPerProfile],
-            },
-            (Self::Requested, E::RequestInvalidOrUnsupported, EndpointRole::Proxy) => Transition {
-                state: Self::Rejected,
-                actions: &[A::SendResultRejected],
-            },
-            (
-                Self::Requested | Self::AwaitingConsent,
-                E::CancelReceived | E::RequestExpired,
-                EndpointRole::Proxy,
-            ) => Transition {
-                state: Self::Cancelled,
-                actions: &[
-                    A::ClearOperationCredentials,
-                    A::DismissConsent,
-                    A::SendResultCancelled,
-                ],
-            },
-            (Self::AwaitingConsent, E::UserDenied, EndpointRole::Proxy) => Transition {
-                state: Self::Denied,
-                actions: &[A::ClearOperationCredentials, A::SendResultDenied],
-            },
-            (Self::AwaitingConsent, E::RetryPolicyRefused, EndpointRole::Proxy) => Transition {
-                state: Self::Rejected,
-                actions: &[
-                    A::ClearOperationCredentials,
-                    A::SendResultRetryPolicyRefused,
-                    A::RequestSessionClose,
-                ],
-            },
-            (
-                Self::AwaitingConsent | Self::Executing,
-                E::InvalidCanOrPin1OrPin2,
-                EndpointRole::Proxy,
-            ) => Transition {
-                state: Self::CredentialRejected,
-                actions: &[
-                    A::ClearAllActiveCredentials,
-                    A::RemoveRejectedCredentialAndDerivedState,
-                    A::SendResultCredentialRejectedBestEffort,
-                    A::RevokePairAfterCredentialRejection,
-                    A::RequestSessionCloseCredentialRejected,
-                ],
-            },
-            (Self::AwaitingConsent, E::SafeReadsComplete, EndpointRole::Proxy) => {
-                require(guards.profile_has_no_consequential_command)?;
+            (Self::None, E::RequestWhileBusy) => {
+                require_role(role, EndpointRole::Proxy)?;
                 Transition {
-                    state: Self::ResultPending,
-                    actions: &[A::PersistResult, A::SendResultCompleted],
+                    state: Self::None,
+                    actions: &[A::SendErrorBusy],
                 }
             }
-            (Self::AwaitingConsent, E::UserApprovedAndProxyReady, EndpointRole::Proxy) => {
-                require(guards.zero_transmissions)?;
+            (Self::None, E::RequestUnauthorized) => {
+                require_role(role, EndpointRole::Proxy)?;
                 Transition {
-                    state: Self::Prepared,
-                    actions: &[A::SendPrepared],
+                    state: Self::Rejected,
+                    actions: &[A::SendResultUnauthorized],
                 }
             }
-            (Self::Prepared, E::CancelReceived | E::RequestExpired, EndpointRole::Proxy) => {
+            (Self::None, E::RequestUnsupported) => {
+                require_role(role, EndpointRole::Proxy)?;
                 Transition {
-                    state: Self::Cancelled,
-                    actions: &[A::ClearOperationCredentials, A::SendResultCancelled],
+                    state: Self::Rejected,
+                    actions: &[A::SendResultUnsupportedParameter],
                 }
             }
-            (Self::Prepared, E::ValidCommit, EndpointRole::Proxy) => {
-                require(guards.hash_matches)?;
+            (Self::Requested, E::CardHeldElsewhere) => {
+                require_role(role, EndpointRole::Proxy)?;
                 Transition {
-                    state: Self::Committed,
-                    actions: &[A::DurablyWriteCommitBeforeTransmission],
+                    state: Self::Queued,
+                    actions: &[A::SendProgressQueued],
                 }
             }
-            (Self::Committed, E::BeginCardCommand, EndpointRole::Proxy) => {
-                require(guards.zero_transmissions)?;
+            (Self::Requested, E::CardAcquiredForConsent) => {
+                require_role(role, EndpointRole::Proxy)?;
+                Transition {
+                    state: Self::AwaitingConsent,
+                    actions: &[A::PresentConsent, A::SendProgressConsentShown],
+                }
+            }
+            (Self::Queued, E::CardAcquiredForConsent) => {
+                require_role(role, EndpointRole::Proxy)?;
+                Transition {
+                    state: Self::AwaitingConsent,
+                    actions: &[A::PresentConsent, A::SendProgressConsentShown],
+                }
+            }
+            (Self::Requested, E::CardAcquiredForRead) => {
+                require_role(role, EndpointRole::Proxy)?;
                 Transition {
                     state: Self::Executing,
+                    actions: &[A::ExecuteRead],
+                }
+            }
+            (Self::Queued, E::CardAcquiredForRead) => {
+                require_role(role, EndpointRole::Proxy)?;
+                Transition {
+                    state: Self::Executing,
+                    actions: &[A::ExecuteRead],
+                }
+            }
+            (Self::AwaitingConsent, E::UserDenied) => {
+                require_role(role, EndpointRole::Proxy)?;
+                Transition {
+                    state: Self::Rejected,
                     actions: &[
-                        A::ConsumeNonClonableCommand,
-                        A::IncrementTransmissionCountOnce,
+                        A::DismissConsent,
+                        A::SendResultUserCancelled,
+                        A::ReleaseCard,
                     ],
                 }
             }
-            (Self::Committed, E::CancelReceived, EndpointRole::Proxy) => {
-                require(guards.proven_no_transmission)?;
+            (Self::AwaitingConsent, E::UserApproved) => {
+                require_role(role, EndpointRole::Proxy)?;
                 Transition {
-                    state: Self::Cancelled,
+                    state: Self::Executing,
+                    actions: &[A::DismissConsent, A::CheckRetryFloor, A::ConsumeCardCommand],
+                }
+            }
+            (Self::Executing, E::WaitingForCard) => {
+                require_role(role, EndpointRole::Proxy)?;
+                Transition {
+                    state: Self::Executing,
+                    actions: &[A::SendProgressWaitingForCard],
+                }
+            }
+            (Self::Executing, E::CardFound) => {
+                require_role(role, EndpointRole::Proxy)?;
+                Transition {
+                    state: Self::Executing,
+                    actions: &[A::SendProgressCardWaitEnded],
+                }
+            }
+            (Self::Executing, E::WrongPin) => {
+                require_role(role, EndpointRole::Proxy)?;
+                Transition {
+                    state: Self::Executing,
+                    actions: &[A::PromptPinAgain],
+                }
+            }
+            (Self::Executing, E::RetryFloorRefused) => {
+                require_role(role, EndpointRole::Proxy)?;
+                Transition {
+                    state: Self::Rejected,
                     actions: &[
-                        A::PersistCancelled,
                         A::ClearOperationCredentials,
-                        A::SendResultCancelled,
+                        A::SendResultRetryFloor,
+                        A::ReleaseCard,
                     ],
                 }
             }
-            (Self::Committed | Self::Executing, E::CrashRecoveredWithoutTerminalResult, _) => {
-                Transition {
-                    state: Self::Ambiguous,
-                    actions: &[A::PersistAmbiguous, A::ProhibitRetry],
-                }
-            }
-            (Self::Executing, E::CardSuccess, EndpointRole::Proxy) => Transition {
-                state: Self::ResultPending,
-                actions: &[
-                    A::PersistResult,
-                    A::ClearOperationCredentials,
-                    A::SendResultCompleted,
-                ],
-            },
-            (Self::Executing, E::CardPolicyRejection, EndpointRole::Proxy) => Transition {
-                state: Self::Rejected,
-                actions: &[
-                    A::ClearOperationCredentials,
-                    A::PersistRejection,
-                    A::SendResultRejected,
-                ],
-            },
-            (Self::Executing, E::CardRemovedBeforeTransmit, EndpointRole::Proxy) => {
-                require(guards.proven_no_transmission)?;
-                Transition {
-                    state: Self::Cancelled,
-                    actions: &[
-                        A::PersistCancelled,
-                        A::ClearOperationCredentials,
-                        A::SendResultCancelled,
-                    ],
-                }
-            }
-            (Self::Executing, E::CardRemovedOrTransportUncertain, EndpointRole::Proxy) => {
-                Transition {
-                    state: Self::Ambiguous,
-                    actions: &[
-                        A::ClearOperationCredentials,
-                        A::PersistAmbiguous,
-                        A::ProhibitRetry,
-                        A::SendResultAmbiguousBestEffort,
-                        A::RequestSessionCloseAmbiguous,
-                    ],
-                }
-            }
-            (Self::Executing, E::CancelReceived, EndpointRole::Proxy) => Transition {
-                state: Self::Executing,
-                actions: &[A::RecordAdvisoryCancel],
-            },
-            (Self::Executing, E::SessionClosedPostCommit, EndpointRole::Proxy) => Transition {
-                state: Self::Executing,
-                actions: &[
-                    A::ContinueCardExchangeLocally,
-                    A::NoteResultDeliveryImpossible,
-                ],
-            },
-            (Self::ResultPending, E::ValidResultAck, EndpointRole::Proxy) => Transition {
-                state: Self::Completed,
-                actions: &[A::PersistCompleted, A::ReleaseResult],
-            },
-            (Self::ResultPending, E::SessionClosedBeforeAck, EndpointRole::Proxy) => Transition {
-                state: Self::DeliveryUncertain,
-                actions: &[
-                    A::PersistDeliveryUncertain,
-                    A::ProhibitCardRetry,
-                    A::RetainResultUnderLocalStorage,
-                ],
-            },
-            (Self::Committed, E::SessionClosedPostCommit, EndpointRole::Proxy) => Transition {
-                state: Self::Cancelled,
-                actions: &[A::PersistCancelled, A::ClearOperationCredentials],
-            },
-            (Self::Requested, E::PreparedReceived, EndpointRole::Requester) => {
-                require(guards.hash_echo_matches)?;
-                Transition {
-                    state: Self::Prepared,
-                    actions: &[A::JournalPrepared],
-                }
-            }
-            (
-                Self::Requested | Self::Prepared,
-                E::CancelSentOrRequestExpired,
-                EndpointRole::Requester,
-            ) => Transition {
-                state: Self::Cancelled,
-                actions: &[A::SendOperationCancel, A::JournalCancelled],
-            },
-            (Self::Prepared, E::CommitSent, EndpointRole::Requester) => Transition {
-                state: Self::Committed,
-                actions: &[A::JournalCommitIntentDurably],
-            },
-            (Self::Requested, E::ResultCompletedReceived, EndpointRole::Requester) => {
-                require(guards.profile_has_no_consequential_command)?;
+            (Self::Executing, E::CardSuccess) => {
+                require_role(role, EndpointRole::Proxy)?;
                 Transition {
                     state: Self::Completed,
                     actions: &[
-                        A::RetainResultUnderLocalStorage,
-                        A::SendResultAck,
-                        A::JournalCompleted,
+                        A::ClearOperationCredentials,
+                        A::SendResultCompleted,
+                        A::ReleaseCard,
                     ],
                 }
             }
-            (
-                Self::Requested | Self::Prepared,
-                E::ResultDeniedReceived,
-                EndpointRole::Requester,
-            ) => Transition {
-                state: Self::Denied,
-                actions: &[A::JournalDenied, A::SendResultAck],
+            (Self::Executing, E::CardError) => {
+                require_role(role, EndpointRole::Proxy)?;
+                Transition {
+                    state: Self::Rejected,
+                    actions: &[
+                        A::ClearOperationCredentials,
+                        A::SendResultCardError,
+                        A::ReleaseCard,
+                    ],
+                }
+            }
+            (Self::Requested, E::RequestExpired) => {
+                require_role(role, EndpointRole::Proxy)?;
+                Transition {
+                    state: Self::Cancelled,
+                    actions: &[
+                        A::DismissConsent,
+                        A::SendResultOperationExpired,
+                        A::ReleaseCard,
+                    ],
+                }
+            }
+            (Self::Queued, E::RequestExpired) => {
+                require_role(role, EndpointRole::Proxy)?;
+                Transition {
+                    state: Self::Cancelled,
+                    actions: &[
+                        A::DismissConsent,
+                        A::SendResultOperationExpired,
+                        A::ReleaseCard,
+                    ],
+                }
+            }
+            (Self::AwaitingConsent, E::RequestExpired) => {
+                require_role(role, EndpointRole::Proxy)?;
+                Transition {
+                    state: Self::Cancelled,
+                    actions: &[
+                        A::DismissConsent,
+                        A::SendResultOperationExpired,
+                        A::ReleaseCard,
+                    ],
+                }
+            }
+            (Self::Requested, E::SessionClosed) => match role {
+                EndpointRole::Proxy => Transition {
+                    state: Self::None,
+                    actions: &[
+                        A::DismissConsent,
+                        A::ClearOperationCredentials,
+                        A::ReleaseCard,
+                    ],
+                },
+                EndpointRole::Requester => Transition {
+                    state: Self::None,
+                    actions: &[A::ReportOperationLost],
+                },
             },
-            (
-                Self::Requested | Self::Prepared | Self::Committed,
-                E::ResultCancelledReceived,
-                EndpointRole::Requester,
-            ) => Transition {
-                state: Self::Cancelled,
-                actions: &[A::JournalCancelled, A::SendResultAck],
-            },
-            (
-                Self::Requested | Self::Prepared | Self::Committed,
-                E::ResultRejectedReceived,
-                EndpointRole::Requester,
-            ) => Transition {
-                state: Self::Rejected,
-                actions: &[A::JournalRejected, A::SendResultAck],
-            },
-            (
-                Self::Requested | Self::Prepared | Self::Committed,
-                E::ResultCredentialRejectedReceived,
-                EndpointRole::Requester,
-            ) => Transition {
-                state: Self::CredentialRejected,
-                actions: &[
-                    A::JournalCredentialRejected,
-                    A::SendResultAck,
-                    A::RevokePairAfterCredentialRejection,
-                ],
-            },
-            (Self::Committed, E::ResultCompletedReceived, EndpointRole::Requester) => Transition {
-                state: Self::Completed,
-                actions: &[
-                    A::RetainResultUnderLocalStorage,
-                    A::SendResultAck,
-                    A::JournalCompleted,
-                ],
-            },
-            (Self::Committed, E::ResultAmbiguousReceived, EndpointRole::Requester) => Transition {
-                state: Self::Ambiguous,
-                actions: &[A::JournalAmbiguous, A::SendResultAck, A::ProhibitRetry],
-            },
-            (Self::Committed, E::SessionClosedPostCommit, EndpointRole::Requester) => Transition {
-                state: Self::Ambiguous,
-                actions: &[A::JournalAmbiguous, A::ProhibitRetry],
-            },
-            (
-                Self::Requested | Self::AwaitingConsent | Self::Prepared,
-                E::SessionClosedPreCommit,
-                _,
-            ) => Transition {
-                state: Self::Cancelled,
-                actions: &[A::ClearOperationCredentials, A::PersistCancelled],
-            },
+            (Self::Queued, E::SessionClosed) => {
+                require_role(role, EndpointRole::Proxy)?;
+                Transition {
+                    state: Self::None,
+                    actions: &[
+                        A::DismissConsent,
+                        A::ClearOperationCredentials,
+                        A::ReleaseCard,
+                    ],
+                }
+            }
+            (Self::AwaitingConsent, E::SessionClosed) => {
+                require_role(role, EndpointRole::Proxy)?;
+                Transition {
+                    state: Self::None,
+                    actions: &[
+                        A::DismissConsent,
+                        A::ClearOperationCredentials,
+                        A::ReleaseCard,
+                    ],
+                }
+            }
+            (Self::Executing, E::SessionClosed) => {
+                require_role(role, EndpointRole::Proxy)?;
+                Transition {
+                    state: Self::None,
+                    actions: &[
+                        A::ContinueCardExchangeLocally,
+                        A::DiscardAnswer,
+                        A::ClearOperationCredentials,
+                        A::ReleaseCard,
+                    ],
+                }
+            }
+            (Self::None, E::RequestSent) => {
+                require_role(role, EndpointRole::Requester)?;
+                Transition {
+                    state: Self::Requested,
+                    actions: &[],
+                }
+            }
+            (Self::Requested, E::ProgressReceived) => {
+                require_role(role, EndpointRole::Requester)?;
+                Transition {
+                    state: Self::Requested,
+                    actions: &[A::ShowProgress],
+                }
+            }
+            (Self::Requested, E::ResultCompletedReceived) => {
+                require_role(role, EndpointRole::Requester)?;
+                Transition {
+                    state: Self::Completed,
+                    actions: &[A::ReleaseResult],
+                }
+            }
+            (Self::Requested, E::ResultRejectedReceived) => {
+                require_role(role, EndpointRole::Requester)?;
+                Transition {
+                    state: Self::Rejected,
+                    actions: &[A::ReleaseFailure],
+                }
+            }
+            (Self::Requested, E::ResultCancelledReceived) => {
+                require_role(role, EndpointRole::Requester)?;
+                Transition {
+                    state: Self::Cancelled,
+                    actions: &[A::ReleaseFailure],
+                }
+            }
+            (Self::Completed | Self::Rejected | Self::Cancelled, _) => {
+                return Err(TransitionError::TerminalOperation);
+            }
             _ => return Err(TransitionError::UnexpectedInput),
         };
         Ok(transition)
     }
 }
 
-/// Product state coordinating pairing, session, and one active operation.
+/// What an endpoint keeps of one pairing, its session and the session's
+/// operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RappState {
     /// Local endpoint projection.
@@ -1321,21 +1190,19 @@ pub struct RappState {
     pub pairing: PairingState,
     /// Session component.
     pub session: SessionState,
-    /// Active operation component.
+    /// The session's live operation.
     pub operation: OperationState,
-    /// Credential rejection requires a new explicit user action.
-    pub requires_user_intent: bool,
 }
 
-/// Security-event result spanning multiple component machines.
+/// Ordered effects of a security event that spans the machines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecurityOutcome {
-    /// Ordered security effects the adapter must execute.
+    /// Ordered effects the endpoint carries out.
     pub actions: Vec<Action>,
 }
 
 impl RappState {
-    /// Construct an endpoint without a pairing.
+    /// An endpoint without a pairing.
     #[must_use]
     pub const fn unpaired(role: EndpointRole) -> Self {
         Self {
@@ -1343,11 +1210,10 @@ impl RappState {
             pairing: PairingState::Unpaired,
             session: SessionState::Absent,
             operation: OperationState::None,
-            requires_user_intent: false,
         }
     }
 
-    /// Check the global operation-admission invariant.
+    /// Operation admission (cross-component rule X-03).
     #[must_use]
     pub const fn operation_admission_permitted(&self) -> bool {
         matches!(self.pairing, PairingState::PairedConnected)
@@ -1355,206 +1221,126 @@ impl RappState {
             && matches!(self.operation, OperationState::None)
     }
 
-    /// Apply an authenticated protocol violation.
-    ///
-    /// The first attributable violation revokes a stored pairing. Before a
-    /// pairing is stored it aborts only that pairing attempt.
+    /// An authenticated message violated the protocol. The session closes
+    /// and the pairing stays; during a pairing, the attempt aborts (section
+    /// 10.1).
     pub fn authenticated_protocol_violation(&mut self) -> SecurityOutcome {
-        let mut actions = Vec::new();
-        match self.pairing {
-            PairingState::PairedConnected | PairingState::PairedDisconnected => {
-                if !matches!(self.session, SessionState::Absent | SessionState::Closed) {
-                    actions.push(Action::SendCloseBestEffort(CloseReason::ProtocolViolation));
-                    actions.push(Action::CloseSession);
-                    self.classify_operation_for_close(&mut actions);
-                    self.session = SessionState::Closing;
-                }
-                self.pairing = PairingState::Revoked;
-                actions.push(Action::DestroyPairKeys);
-                actions.push(Action::ShowRevoked);
+        let pairing_event = match self.pairing {
+            PairingState::Handshaking => Some(PairingEvent::HandshakeFailed),
+            PairingState::Confirming | PairingState::StorageConfirming => {
+                Some(PairingEvent::DeniedAbortedOrTimedOut)
             }
-            PairingState::StorageConfirming => {
-                self.pairing = PairingState::Revoked;
-                self.session = SessionState::Closed;
-                actions.extend([
-                    Action::DestroyPairKeys,
-                    Action::CloseCandidate,
-                    Action::ShowRevoked,
-                ]);
+            PairingState::Exchanging => Some(PairingEvent::AttemptFailed),
+            _ => None,
+        };
+        if let Some(event) = pairing_event {
+            let mut actions = Vec::new();
+            if let Ok(transition) = self.pairing.transition(self.role, event, Guards::default()) {
+                self.pairing = transition.state;
+                actions.extend_from_slice(transition.actions);
             }
-            PairingState::Handshaking | PairingState::Confirming | PairingState::OfferActive => {
-                self.pairing = PairingState::Unpaired;
-                self.session = SessionState::Closed;
-                actions.extend([
-                    Action::SendPairingAbortBestEffort,
-                    Action::DestroyPairingSecret,
-                    Action::DestroyCandidateKeys,
-                    Action::DiscardCandidate,
-                ]);
-            }
-            PairingState::Unpaired | PairingState::Revoked => {}
+            return SecurityOutcome { actions };
         }
-        SecurityOutcome { actions }
+        self.close_session(SessionEvent::AuthenticatedProtocolViolation)
     }
 
-    /// Apply an established-channel integrity failure.
-    ///
-    /// This event is not attributable to the authenticated peer, so it closes
-    /// only the session and never revokes the pairing.
+    /// A frame failed authenticated decryption or framing; the session
+    /// closes and the pairing stays.
     pub fn session_integrity_failed(&mut self) -> SecurityOutcome {
+        self.close_session(SessionEvent::SessionIntegrityFailed)
+    }
+
+    /// Nothing arrived for the session silence limit; the session closes and
+    /// the pairing stays (section 8.3).
+    pub fn silence_limit_reached(&mut self) -> SecurityOutcome {
+        self.close_session(SessionEvent::SilenceLimitReached)
+    }
+
+    fn close_session(&mut self, event: SessionEvent) -> SecurityOutcome {
         let mut actions = Vec::new();
-        if matches!(self.session, SessionState::Healthy | SessionState::Checking) {
-            self.classify_operation_for_close(&mut actions);
-            self.session = SessionState::Closing;
-            actions.push(Action::ShowDisconnecting);
+        if let Ok(transition) = self.session.transition(self.role, event, Guards::default()) {
+            self.session = transition.state;
+            actions.extend_from_slice(transition.actions);
+            if self.session == SessionState::Closing
+                && let Ok(operation) = self.operation.transition(
+                    self.role,
+                    OperationEvent::SessionClosed,
+                    Guards::default(),
+                )
+            {
+                self.operation = operation.state;
+                actions.extend_from_slice(operation.actions);
+            }
         }
         SecurityOutcome { actions }
-    }
-
-    /// An unanswered authenticated liveness probe blocks new operations while
-    /// preserving the pairing and current session keys.
-    pub fn liveness_missed(&mut self) -> SecurityOutcome {
-        let mut actions = Vec::new();
-        if self.session == SessionState::Healthy {
-            self.session = SessionState::Checking;
-            actions.extend([
-                Action::BlockNewOperations,
-                Action::StartBackoffAndDeadline,
-                Action::ShowChecking,
-            ]);
-        }
-        SecurityOutcome { actions }
-    }
-
-    /// Exact authenticated pong restores operation admission.
-    pub fn liveness_restored(&mut self) -> SecurityOutcome {
-        let mut actions = Vec::new();
-        if self.session == SessionState::Checking {
-            self.session = SessionState::Healthy;
-            actions.extend([Action::ResetBackoff, Action::ShowConnected]);
-        }
-        SecurityOutcome { actions }
-    }
-
-    /// Apply invalid CAN, PIN 1, or PIN 2 handling across the product state.
-    pub fn credential_rejected(&mut self) -> SecurityOutcome {
-        let mut actions = vec![
-            Action::ClearAllActiveCredentials,
-            Action::RemoveRejectedCredentialAndDerivedState,
-            Action::SendResultCredentialRejectedBestEffort,
-            Action::RevokePairAfterCredentialRejection,
-            Action::DestroyPairKeys,
-            Action::ShowRevoked,
-        ];
-        self.pairing = PairingState::Revoked;
-        self.operation = OperationState::CredentialRejected;
-        self.requires_user_intent = false;
-        if matches!(self.session, SessionState::Healthy | SessionState::Checking) {
-            self.session = SessionState::Closing;
-            actions.extend([
-                Action::SendCloseBestEffort(CloseReason::CredentialRejected),
-                Action::ShowDisconnecting,
-            ]);
-        }
-        SecurityOutcome { actions }
-    }
-
-    fn classify_operation_for_close(&mut self, actions: &mut Vec<Action>) {
-        match self.operation {
-            OperationState::Requested
-            | OperationState::AwaitingConsent
-            | OperationState::Prepared => {
-                self.operation = OperationState::Cancelled;
-                actions.extend([Action::ClearOperationCredentials, Action::PersistCancelled]);
-            }
-            OperationState::Committed if self.role == EndpointRole::Requester => {
-                self.operation = OperationState::Ambiguous;
-                actions.extend([Action::PersistAmbiguous, Action::ProhibitRetry]);
-            }
-            OperationState::Committed => {
-                self.operation = OperationState::Cancelled;
-                actions.extend([Action::PersistCancelled, Action::ClearOperationCredentials]);
-            }
-            OperationState::Executing => {
-                actions.extend([
-                    Action::ContinueCardExchangeLocally,
-                    Action::NoteResultDeliveryImpossible,
-                ]);
-            }
-            OperationState::ResultPending => {
-                self.operation = OperationState::DeliveryUncertain;
-                actions.extend([
-                    Action::PersistDeliveryUncertain,
-                    Action::ProhibitRetry,
-                    Action::RetainResultUnderLocalStorage,
-                ]);
-            }
-            OperationState::None
-            | OperationState::Completed
-            | OperationState::Denied
-            | OperationState::Cancelled
-            | OperationState::Rejected
-            | OperationState::CredentialRejected
-            | OperationState::Ambiguous
-            | OperationState::DeliveryUncertain => {}
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{EndpointRole, OperationState, PairingState, RappState, SessionState};
+    use super::{Action, EndpointRole, OperationState, PairingState, RappState, SessionState};
 
-    #[test]
-    fn first_authenticated_violation_revokes_pairing() {
-        let mut state = RappState {
-            role: EndpointRole::Requester,
+    const fn connected(role: EndpointRole, operation: OperationState) -> RappState {
+        RappState {
+            role,
             pairing: PairingState::PairedConnected,
             session: SessionState::Healthy,
-            operation: OperationState::None,
-            requires_user_intent: false,
-        };
-
-        let outcome = state.authenticated_protocol_violation();
-
-        assert_eq!(state.pairing, PairingState::Revoked);
-        assert_eq!(state.session, SessionState::Closing);
-        assert!(outcome.actions.contains(&super::Action::DestroyPairKeys));
+            operation,
+        }
     }
 
     #[test]
-    fn integrity_failure_never_revokes_pairing() {
-        let mut state = RappState {
-            role: EndpointRole::Proxy,
-            pairing: PairingState::PairedConnected,
-            session: SessionState::Healthy,
-            operation: OperationState::None,
-            requires_user_intent: false,
-        };
+    fn an_authenticated_violation_closes_the_session_and_keeps_the_pairing() {
+        let mut state = connected(EndpointRole::Requester, OperationState::None);
+        let outcome = state.authenticated_protocol_violation();
+        assert_eq!(state.pairing, PairingState::PairedConnected);
+        assert_eq!(state.session, SessionState::Closing);
+        assert!(
+            outcome
+                .actions
+                .contains(&Action::SendCloseProtocolViolation)
+        );
+        assert!(!outcome.actions.contains(&Action::DestroyPairKeys));
+    }
 
+    #[test]
+    fn an_integrity_failure_keeps_the_pairing() {
+        let mut state = connected(EndpointRole::Proxy, OperationState::None);
         state.session_integrity_failed();
-
         assert_eq!(state.pairing, PairingState::PairedConnected);
         assert_eq!(state.session, SessionState::Closing);
     }
 
     #[test]
-    fn credential_rejection_revokes_pairing_on_the_first_incident() {
+    fn closing_lets_a_commanded_card_finish_and_discards_its_answer() {
+        let mut state = connected(EndpointRole::Proxy, OperationState::Executing);
+        let outcome = state.silence_limit_reached();
+        assert_eq!(state.operation, OperationState::None);
+        assert!(
+            outcome
+                .actions
+                .contains(&Action::ContinueCardExchangeLocally)
+        );
+        assert!(outcome.actions.contains(&Action::DiscardAnswer));
+    }
+
+    #[test]
+    fn closing_tells_the_requester_its_operation_is_lost() {
+        let mut state = connected(EndpointRole::Requester, OperationState::Requested);
+        let outcome = state.silence_limit_reached();
+        assert_eq!(state.operation, OperationState::None);
+        assert!(outcome.actions.contains(&Action::ReportOperationLost));
+    }
+
+    #[test]
+    fn a_violation_during_pairing_aborts_the_attempt() {
         let mut state = RappState {
-            role: EndpointRole::Proxy,
-            pairing: PairingState::PairedConnected,
-            session: SessionState::Healthy,
-            operation: OperationState::Executing,
-            requires_user_intent: false,
+            role: EndpointRole::Requester,
+            pairing: PairingState::Confirming,
+            session: SessionState::Absent,
+            operation: OperationState::None,
         };
-
-        let outcome = state.credential_rejected();
-
-        assert_eq!(state.pairing, PairingState::Revoked);
-        assert_eq!(state.session, SessionState::Closing);
-        assert_eq!(state.operation, OperationState::CredentialRejected);
-        assert!(!state.requires_user_intent);
-        assert!(outcome.actions.contains(&super::Action::DestroyPairKeys));
-        assert!(outcome.actions.contains(&super::Action::ShowRevoked));
+        state.authenticated_protocol_violation();
+        assert_eq!(state.pairing, PairingState::Unpaired);
     }
 }

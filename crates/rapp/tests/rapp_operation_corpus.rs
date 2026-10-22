@@ -5,19 +5,20 @@
 //!
 //! Every body decodes into its typed message and re-encodes to the identical
 //! bytes, so an independently written peer and this crate put the same bytes
-//! on the wire. Request vectors also pin the section 8.2.1 commitment.
+//! on the wire. Every rejected body is refused.
 
 use std::collections::BTreeMap;
 
 use refineid_rapp::{
-    CardKeyProfile, CardOperation, CardOperationResult, CertificateKind, Envelope, MessageType,
-    OperationId, OperationReference, OperationState, PairId, ProgressEvent, ProtocolErrorMessage,
-    ResultError, ResultStatus, SessionId, SignatureAlgorithm, TypedMessage, WireValue,
-    decode_deterministic_cbor, encode_deterministic_cbor,
+    CardKeyProfile, CardOperation, CardOperationResult, CardStatusMessage, CertificateFingerprint,
+    CertificateKind, Envelope, MessageType, OperationId, PairId, ProgressEvent,
+    ProtocolErrorMessage, ResultError, ResultStatus, SessionId, SignatureAlgorithm, TypedMessage,
+    WireValue, decode_deterministic_cbor, encode_deterministic_cbor,
 };
 use serde::Deserialize;
 
 const CORPUS: &str = include_str!("../../../docs/protocols/vectors/rapp-operation-v26.10.21.json");
+const SESSION_ID: SessionId = SessionId::from_array([0xbb; 16]);
 
 #[derive(Deserialize)]
 struct Corpus {
@@ -25,12 +26,15 @@ struct Corpus {
     protocol_document_version: String,
     fixed_inputs: FixedInputs,
     vectors: Vec<Vector>,
+    rejected: Vec<Vector>,
 }
 
 #[derive(Deserialize)]
 struct FixedInputs {
+    operation_id_result: String,
+    operation_id_error: String,
     pair_id: String,
-    session_id: String,
+    certificate_der: String,
     local_start_ms: u64,
 }
 
@@ -39,7 +43,6 @@ struct Vector {
     name: String,
     message_type: String,
     body_hex: String,
-    request_hash_hex: Option<String>,
 }
 
 fn corpus() -> Corpus {
@@ -50,9 +53,6 @@ fn message_type(name: &str) -> MessageType {
     match name {
         "OperationRequest" => MessageType::OperationRequest,
         "OperationResult" => MessageType::OperationResult,
-        "OperationResultAck" => MessageType::OperationResultAck,
-        "OperationStatusRequest" => MessageType::OperationStatusRequest,
-        "OperationStatus" => MessageType::OperationStatus,
         "OperationProgress" => MessageType::OperationProgress,
         "PairingStored" => MessageType::PairingStored,
         "CardStatus" => MessageType::CardStatus,
@@ -71,35 +71,44 @@ fn body(hex_body: &str) -> BTreeMap<String, WireValue> {
 }
 
 /// Decodes one vector into its typed message exactly as a receiver would.
-fn typed(vector: &Vector, inputs: &FixedInputs) -> TypedMessage {
-    let session_id = SessionId::reconstruct(&hex::decode(&inputs.session_id).expect("valid hex"))
-        .expect("session id length");
-    let pair_id = PairId::reconstruct(&hex::decode(&inputs.pair_id).expect("valid hex"))
-        .expect("pair id length");
+fn decode(vector: &Vector, inputs: &FixedInputs) -> Result<TypedMessage, String> {
     let envelope = Envelope::reconstruct(
         message_type(&vector.message_type),
-        session_id,
+        SESSION_ID,
         0,
         body(&vector.body_hex),
     )
-    .unwrap_or_else(|error| panic!("{} fails the envelope schema: {error:?}", vector.name));
-    TypedMessage::from_envelope(envelope, pair_id, inputs.local_start_ms)
-        .unwrap_or_else(|error| panic!("{} fails typed decoding: {error:?}", vector.name))
+    .map_err(|error| format!("{error:?}"))?;
+    TypedMessage::from_envelope(envelope, inputs.local_start_ms)
+        .map_err(|error| format!("{error:?}"))
+}
+
+fn find(corpus: &Corpus, name: &str) -> TypedMessage {
+    let vector = corpus
+        .vectors
+        .iter()
+        .find(|vector| vector.name == name)
+        .unwrap_or_else(|| panic!("corpus lacks {name}"));
+    decode(vector, &corpus.fixed_inputs).unwrap_or_else(|error| panic!("{name}: {error}"))
+}
+
+fn identifier(hex_text: &str) -> OperationId {
+    OperationId::reconstruct(&hex::decode(hex_text).expect("valid hex")).expect("id length")
 }
 
 #[test]
 fn corpus_names_this_protocol_version() {
     let corpus = corpus();
-    assert_eq!(corpus.format, "fi.refineid.rapp.operation-vectors-v1");
+    assert_eq!(corpus.format, "fi.refineid.rapp.operation-vectors");
     assert_eq!(corpus.protocol_document_version, "26.10.21");
-    assert_eq!(corpus.vectors.len(), 39);
 }
 
 #[test]
 fn every_body_decodes_and_re_encodes_byte_for_byte() {
     let corpus = corpus();
     for vector in &corpus.vectors {
-        let message = typed(vector, &corpus.fixed_inputs);
+        let message = decode(vector, &corpus.fixed_inputs)
+            .unwrap_or_else(|error| panic!("{} fails decoding: {error}", vector.name));
         let encoded = encode_deterministic_cbor(&WireValue::Map(
             message
                 .to_wire_body()
@@ -111,19 +120,12 @@ fn every_body_decodes_and_re_encodes_byte_for_byte() {
 }
 
 #[test]
-fn request_commitments_match() {
+fn every_rejected_body_is_refused() {
     let corpus = corpus();
-    for vector in &corpus.vectors {
-        let Some(expected) = &vector.request_hash_hex else {
-            continue;
-        };
-        let TypedMessage::OperationRequest(request) = typed(vector, &corpus.fixed_inputs) else {
-            panic!("{} is not an admitted request", vector.name);
-        };
-        assert_eq!(
-            &hex::encode(request.request_hash().expect("hash succeeds").as_bytes()),
-            expected,
-            "{}",
+    for vector in &corpus.rejected {
+        assert!(
+            decode(vector, &corpus.fixed_inputs).is_err(),
+            "{} was accepted",
             vector.name
         );
     }
@@ -142,12 +144,7 @@ fn completed_responses_read_as_the_operation_they_answer() {
             },
         ),
     ] {
-        let vector = corpus
-            .vectors
-            .iter()
-            .find(|vector| vector.name == name)
-            .unwrap_or_else(|| panic!("corpus lacks {name}"));
-        let TypedMessage::OperationResult(result) = typed(vector, &corpus.fixed_inputs) else {
+        let TypedMessage::OperationResult(result) = find(&corpus, name) else {
             panic!("{name} is not a result");
         };
         result
@@ -160,74 +157,79 @@ fn completed_responses_read_as_the_operation_they_answer() {
 }
 
 #[test]
-fn registry_values_decode_to_their_meaning() {
+fn results_and_errors_decode_to_their_meaning() {
     let corpus = corpus();
-    let find = |name: &str| {
-        let vector = corpus
-            .vectors
-            .iter()
-            .find(|vector| vector.name == name)
-            .unwrap_or_else(|| panic!("corpus lacks {name}"));
-        typed(vector, &corpus.fixed_inputs)
-    };
-
-    let TypedMessage::OperationStatus(in_flight) = find("status-in-flight") else {
-        panic!("status-in-flight is a status");
-    };
-    assert_eq!(in_flight.state, Some(OperationState::Executing));
-    assert!(!in_flight.retired);
-
-    let TypedMessage::OperationStatus(retired) = find("status-completed-retired") else {
-        panic!("status-completed-retired is a status");
-    };
-    assert_eq!(retired.state, Some(OperationState::Completed));
-    assert!(retired.retired);
-
-    let TypedMessage::OperationResult(tombstone) = find("result-retired-completed") else {
-        panic!("result-retired-completed is a result");
-    };
-    assert!(tombstone.retired);
-    assert_eq!(tombstone.status, ResultStatus::Completed);
-    assert_eq!(tombstone.error, Some(ResultError::OperationAlreadyRetired));
-
-    let TypedMessage::OperationResult(typo) = find("result-rejected-invalid-credential") else {
-        panic!("result-rejected-invalid-credential is a result");
-    };
-    assert_eq!(typo.status, ResultStatus::Rejected);
-    assert_eq!(typo.error, Some(ResultError::InvalidCredential));
-    assert_eq!(typo.remaining_retries, Some(2));
-
-    let TypedMessage::OperationResult(blocked) = find("result-credential-rejected-card-blocked")
-    else {
-        panic!("result-credential-rejected-card-blocked is a result");
-    };
-    assert_eq!(blocked.status, ResultStatus::CredentialRejected);
-    assert_eq!(blocked.error, Some(ResultError::CardBlocked));
-
-    let operation_id = OperationId::from_array([0x66; 16]);
+    for (name, status, error) in [
+        (
+            "result-rejected-user-cancelled",
+            ResultStatus::Rejected,
+            ResultError::UserCancelled,
+        ),
+        (
+            "result-cancelled-operation-expired",
+            ResultStatus::Cancelled,
+            ResultError::OperationExpired,
+        ),
+        (
+            "result-rejected-card-error",
+            ResultStatus::Rejected,
+            ResultError::CardError,
+        ),
+        (
+            "result-rejected-retry-floor",
+            ResultStatus::Rejected,
+            ResultError::RetryFloor,
+        ),
+        (
+            "result-rejected-invalid-lifetime",
+            ResultStatus::Rejected,
+            ResultError::InvalidLifetime,
+        ),
+    ] {
+        let TypedMessage::OperationResult(result) = find(&corpus, name) else {
+            panic!("{name} is a result");
+        };
+        assert_eq!(result.status, status, "{name}");
+        assert_eq!(result.error, Some(error), "{name}");
+    }
+    let operation_id = identifier(&corpus.fixed_inputs.operation_id_error);
     assert_eq!(
-        find("error-duplicate-operation"),
-        TypedMessage::Error(ProtocolErrorMessage::DuplicateOperation(operation_id))
+        find(&corpus, "error-busy"),
+        TypedMessage::Error(ProtocolErrorMessage::busy(operation_id))
     );
     assert_eq!(
-        find("error-unknown-operation-bare"),
-        TypedMessage::Error(ProtocolErrorMessage::UnknownOperation(None))
+        find(&corpus, "error-duplicate-operation"),
+        TypedMessage::Error(ProtocolErrorMessage::duplicate(operation_id))
+    );
+    assert_eq!(
+        find(&corpus, "error-operation-failed-bare"),
+        TypedMessage::Error(ProtocolErrorMessage {
+            error: ResultError::OperationFailed,
+            operation_id: None,
+        })
     );
 }
 
 #[test]
-fn storage_card_status_and_progress_decode_to_their_meaning() {
+fn card_status_carries_the_certificate_fingerprint() {
     let corpus = corpus();
-    let find = |name: &str| {
-        let vector = corpus
-            .vectors
-            .iter()
-            .find(|vector| vector.name == name)
-            .unwrap_or_else(|| panic!("corpus lacks {name}"));
-        typed(vector, &corpus.fixed_inputs)
-    };
+    let certificate = hex::decode(&corpus.fixed_inputs.certificate_der).expect("valid hex");
+    assert_eq!(
+        find(&corpus, "card-status-present"),
+        TypedMessage::CardStatus(CardStatusMessage::Present(
+            CertificateFingerprint::of_certificate(&certificate)
+        ))
+    );
+    assert_eq!(
+        find(&corpus, "card-status-absent"),
+        TypedMessage::CardStatus(CardStatusMessage::Absent)
+    );
+}
 
-    let TypedMessage::PairingStored(stored) = find("pairing-stored") else {
+#[test]
+fn storage_and_progress_decode_to_their_meaning() {
+    let corpus = corpus();
+    let TypedMessage::PairingStored(stored) = find(&corpus, "pairing-stored") else {
         panic!("pairing-stored is a storage confirmation");
     };
     assert_eq!(
@@ -235,108 +237,57 @@ fn storage_card_status_and_progress_decode_to_their_meaning() {
         PairId::reconstruct(&hex::decode(&corpus.fixed_inputs.pair_id).expect("valid hex"))
             .expect("pair id length")
     );
-
-    let TypedMessage::CardStatus(present) = find("card-status-present") else {
-        panic!("card-status-present is a card status");
-    };
-    assert!(present.card_present);
-    let TypedMessage::CardStatus(absent) = find("card-status-absent") else {
-        panic!("card-status-absent is a card status");
-    };
-    assert!(!absent.card_present);
-
-    let TypedMessage::OperationProgress(consent) = find("progress-consent-shown") else {
-        panic!("progress-consent-shown is a progress update");
-    };
-    assert_eq!(consent.event, ProgressEvent::ConsentShown);
-    assert_eq!(
-        consent.reference.operation_id,
-        OperationId::from_array([0x22; 16])
-    );
-    let TypedMessage::OperationProgress(waiting) = find("progress-waiting-for-card") else {
-        panic!("progress-waiting-for-card is a progress update");
-    };
-    assert_eq!(waiting.event, ProgressEvent::WaitingForCard);
-}
-
-/// The batch the corpus's batch vectors answer.
-fn batch_operation(corpus: &Corpus) -> CardOperation {
-    let TypedMessage::OperationRequest(request) = typed(
-        corpus
-            .vectors
-            .iter()
-            .find(|vector| vector.name == "request-batch-sign-documents")
-            .expect("corpus has the batch request"),
-        &corpus.fixed_inputs,
-    ) else {
-        panic!("the batch request is admitted");
-    };
-    request.operation
+    let operation_id = identifier(&corpus.fixed_inputs.operation_id_result);
+    for (name, event) in [
+        ("progress-queued", ProgressEvent::Queued),
+        ("progress-consent-shown", ProgressEvent::ConsentShown),
+        ("progress-waiting-for-card", ProgressEvent::WaitingForCard),
+        ("progress-card-wait-ended", ProgressEvent::CardWaitEnded),
+    ] {
+        let TypedMessage::OperationProgress(progress) = find(&corpus, name) else {
+            panic!("{name} is a progress update");
+        };
+        assert_eq!(progress.event, event, "{name}");
+        assert_eq!(progress.operation_id, operation_id, "{name}");
+    }
 }
 
 #[test]
-fn batch_request_carries_its_documents_in_order() {
+fn a_batch_carries_its_documents_and_signatures_in_order() {
     let corpus = corpus();
+    let TypedMessage::OperationRequest(request) = find(&corpus, "request-batch-sign-documents")
+    else {
+        panic!("the batch request is admitted");
+    };
     let CardOperation::BatchSignDocuments {
         document_names,
         key_profile,
         algorithm,
         digests,
-    } = batch_operation(&corpus)
+    } = &request.operation
     else {
         panic!("the batch request names a batch");
     };
-    assert_eq!(document_names, ["Contract.pdf", "Annex.pdf"]);
-    assert_eq!(key_profile, CardKeyProfile::EcdsaP256);
-    assert_eq!(algorithm, SignatureAlgorithm::EcdsaSha256);
-    assert_eq!(digests.len(), 2);
-}
+    assert_eq!(document_names, &["Contract.pdf", "Annex.pdf"]);
+    assert_eq!(*key_profile, CardKeyProfile::EcdsaP256);
+    assert_eq!(*algorithm, SignatureAlgorithm::EcdsaSha256);
+    assert_eq!(digests.len(), document_names.len());
 
-#[test]
-fn batch_results_read_as_signatures_and_partial_progress() {
-    let corpus = corpus();
-    let operation = batch_operation(&corpus);
-    let find = |name: &str| {
-        let vector = corpus
-            .vectors
-            .iter()
-            .find(|vector| vector.name == name)
-            .unwrap_or_else(|| panic!("corpus lacks {name}"));
-        let TypedMessage::OperationResult(result) = typed(vector, &corpus.fixed_inputs) else {
-            panic!("{name} is a result");
-        };
-        result
-    };
-
-    let completed = find("result-completed-batch-signatures");
-    let reference = OperationReference {
-        operation_id: completed.operation_id,
-        request_hash: completed.request_hash,
+    let TypedMessage::OperationResult(completed) =
+        find(&corpus, "result-completed-batch-signatures")
+    else {
+        panic!("the batch result is a result");
     };
     completed
-        .validate_for(reference, &operation)
+        .validate_for(completed.operation_id, &request.operation)
         .expect("the completed batch answers the batch");
     let Ok(CardOperationResult::Signatures(signatures)) = completed
         .response
         .as_ref()
         .expect("a completed batch carries signatures")
-        .typed_for(&operation)
+        .typed_for(&request.operation)
     else {
         panic!("the completed batch reads as signatures");
     };
-    assert_eq!(signatures.len(), 2);
-
-    let partial = find("result-ambiguous-batch-partial");
-    assert_eq!(partial.status, ResultStatus::Ambiguous);
-    assert_eq!(partial.error, Some(ResultError::CardError));
-    partial
-        .validate_for(reference, &operation)
-        .expect("the partial batch answers the batch");
-    assert_eq!(
-        partial
-            .partial_batch_signatures(&operation)
-            .expect("partial progress")
-            .len(),
-        1
-    );
+    assert_eq!(signatures.len(), digests.len());
 }

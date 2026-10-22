@@ -158,7 +158,7 @@ The Custodian publishes three distinct discovery modes:
      v=1
      mode=session
      ```
-     No pairing values, hashes, or hints are published. Requesters on the local subnet that hold a usable pairing connect to the advertised endpoint and present a fresh session routing preamble inside the point-to-point stream in `Phase::Routing` (RAPP v26.10.21 §2.2.1). If no stored pairing keyed its tag, the TCP connection is immediately closed.
+     No pairing values, hashes, or hints are published. Requesters on the local subnet that hold a usable pairing connect to the advertised endpoint and present a fresh session routing preamble inside the point-to-point stream in the Routing phase (RAPP v26.10.21 §2.2.1). If no stored pairing keyed its tag, the TCP connection is immediately closed.
    - **Optional Rotating Discovery Hints (Multi-Device Coexistence)**:
      To avoid trial connections in high-density enterprise environments with multiple active Custodians, the Custodian publishes truncated, rotating HMAC hints for the 4 most recently used stored pairings (use time and tie order as for withdrawn records, RAPP v26.10.21 §4.5):
      $$\text{hint}_i = \text{first 8 bytes of }\text{HMAC-SHA-256}(K_{\text{disc}, i}, \text{epoch\_be64})$$
@@ -168,8 +168,7 @@ The Custodian publishes three distinct discovery modes:
      - TXT Attribute: `hints=` followed by at most 4 hints, each 16 lowercase hexadecimal digits, separated by commas without spaces (e.g. `hints=054526c9fdd3b180`).
      - The `discovery_hint` vectors of `vectors/rapp-routing-v26.10.21.json` pin the bytes.
      Requesters evaluate candidate hints for the current and adjacent epoch ($\text{epoch} \pm 1$) against their stored pairings before initiating TCP connections; the window tolerates a clock difference of at least 15 minutes and up to just under 30 minutes, and implementations must not widen it. A record with `hints` holds 1 to 4 entries; an empty `hints` value is malformed. The `discovery_record` and `announcement_selection` vectors of `vectors/rapp-routing-v26.10.21.json` pin parsing and selection.
-   - **Revocation Announcements**:
-     A `mode=session` record therefore carries the keys `v` and `mode`, optionally `hints`, and no other.
+   - A `mode=session` record carries the keys `v` and `mode`, optionally `hints`, and no other.
 
 3. **Withdrawn Mode (`mode=withdrawn`)**:
    - Published for 2 to 10 seconds on the current service instance after the user turns remote access off or quits the application, once open sessions are closed and connections are no longer accepted; the service is then unregistered (RAPP v26.10.21 §4.5).
@@ -207,7 +206,7 @@ To maintain clean, unobtrusive operation on enterprise and personal workstations
 
 | Repository | Platform Role | Discovery / Transport Actions Required |
 | :--- | :--- | :--- |
-| **`refineid-core`** | Protocol Core | Standardize 3-tier hierarchy and update `fi.refineid.stream` stream profile framing to designate Custodian as listener and Requester as dialer. Define RFC 8882 discovery token formats and rotation. |
+| **`refineid-core`** | Protocol Core | Keep the transport preference order and the `fi.refineid.stream` stream profile framing to designate Custodian as listener and Requester as dialer. Define RFC 8882 discovery token formats and rotation. |
 | **`refineid-unix`** | Requester (Linux, BSD) | Keep `pcscd` default; implement outbound `StreamRelayBrowser` using native mDNS (`avahi` / `systemd-resolved`); provide graphical user interface (GUI) toggle in `refineid-gui-fltk`; maintain zero open listening ports. |
 | **`refineid-windows`** | Requester (Windows 10/11) | Remove `FirewallService.cs` and inbound TCP listener (port 47110); implement outbound `StreamRelayBrowser` using supported `Windows.Devices.Enumeration` or Win32 `DnsServiceBrowse`; add explicit opt-in toggle in `RefineID-winui`. |
 | **`refineid-apple`** | Custodian (iOS) & Requester (macOS) | Implement the Apple-to-Apple direct transport `NWListener(includePeerToPeer: true)` / `NWBrowser` direct peer-to-peer (P2P) for Apple-to-Apple; maintain `StreamRelayListener` on iOS gated by "Allow Remote Reader" setting; adhere to RFC 8882 ephemeral discovery names. |

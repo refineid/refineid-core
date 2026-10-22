@@ -309,11 +309,104 @@ def ble_sar_corpus(d):
     return d
 
 
+def operation_corpus(d):
+    d["format"] = "fi.refineid.rapp.operation-vectors"
+    d["protocol_document_version"] = DOCUMENT
+    d["provenance"] = provenance("sections 7.1, 9 and 10.3: the CDDL of every operation message body")
+    f = d["fixed_inputs"]
+    card, auth, sign = "fi.refineid.card-status", "fi.refineid.authentication", "fi.refineid.document-signing"
+    request_id, result_id, error_id = (h(f[k]) for k in ("operation_id_request", "operation_id_result", "operation_id_error"))
+
+    def request(profile, action, context, payload):
+        return {"operation_id": request_id, "profile": profile, "action": action, "context": context,
+                "payload": payload, "expires_after_ms": f["expires_after_ms"]}
+
+    def result(status, error=None, response=None):
+        body = {"operation_id": result_id, "status": status}
+        if error is not None:
+            body["error"] = error
+        if response is not None:
+            body["response"] = response
+        return body
+
+    def error(name, operation_id):
+        body = {"error_name": name, "message": f["error_messages"][name]}
+        if operation_id is not None:
+            body["operation_id"] = operation_id
+        return body
+
+    fingerprint = sha256(h(f["certificate_der"]))
+    vectors = [
+        ("request-inspect-card", "OperationRequest", request(card, "inspect_card", {}, {})),
+        ("request-read-identity", "OperationRequest", request(card, "read_identity", {}, {})),
+        ("request-read-certificate-authentication", "OperationRequest",
+         request(auth, "read_certificate", {}, {"kind": "authentication"})),
+        ("request-read-certificate-signature", "OperationRequest",
+         request(sign, "read_certificate", {}, {"kind": "signature"})),
+        ("request-browser-authenticate", "OperationRequest",
+         request(auth, "browser_authenticate", {"origin": f["origin"]},
+                 {"digest": h(f["digest_sha256"]), "algorithm": "rsa_pkcs1_sha256", "key_profile": "rsa_3072"})),
+        ("request-sign-document", "OperationRequest",
+         request(sign, "sign_document", {"document_name": f["document_name"]},
+                 {"digest": h(f["digest_sha384"]), "algorithm": "ecdsa_sha384", "key_profile": "ecdsa_p384"})),
+        ("request-batch-sign-documents", "OperationRequest",
+         request(sign, "batch_sign_documents", {"document_names": f["batch_document_names"]},
+                 {"digests": [h(x) for x in f["batch_digests_sha256"]], "algorithm": "ecdsa_sha256",
+                  "key_profile": "ecdsa_p256"})),
+        ("result-completed-inspection", "OperationResult",
+         result("completed", response={"atr": h(f["atr"]), "supported_profiles": [card, auth, sign]})),
+        ("result-completed-identity", "OperationResult",
+         result("completed", response={"card_holder_name": f["holder_name"], "card_id": f["card_id"],
+                                       "issuance_date": f["issuance_date"], "expiration_date": f["expiration_date"],
+                                       "certificates": [h(f["certificate_der"])]})),
+        ("result-completed-certificate", "OperationResult",
+         result("completed", response={"certificate": h(f["certificate_der"])})),
+        ("result-completed-signature", "OperationResult",
+         result("completed", response={"signature": h(f["signature_bytes"])})),
+        ("result-completed-batch-signatures", "OperationResult",
+         result("completed", response={"signatures": [h(x) for x in f["batch_signatures"]]})),
+        ("result-rejected-user-cancelled", "OperationResult", result("rejected", "user_cancelled")),
+        ("result-cancelled-operation-expired", "OperationResult", result("cancelled", "operation_expired")),
+        ("result-rejected-card-error", "OperationResult", result("rejected", "card_error")),
+        ("result-rejected-unsupported-parameter", "OperationResult", result("rejected", "unsupported_parameter")),
+        ("result-rejected-invalid-lifetime", "OperationResult", result("rejected", "invalid_lifetime")),
+        ("result-rejected-unauthorized", "OperationResult", result("rejected", "unauthorized")),
+        ("result-rejected-retry-floor", "OperationResult", result("rejected", "retry_floor")),
+        ("result-rejected-operation-failed", "OperationResult", result("rejected", "operation_failed")),
+        ("error-busy", "Error", error("busy", error_id)),
+        ("error-duplicate-operation", "Error", error("duplicate_operation", error_id)),
+        ("error-operation-failed-bare", "Error", error("operation_failed", None)),
+        ("progress-queued", "OperationProgress", {"operation_id": result_id, "event": "queued"}),
+        ("progress-consent-shown", "OperationProgress", {"operation_id": result_id, "event": "consent_shown"}),
+        ("progress-waiting-for-card", "OperationProgress", {"operation_id": result_id, "event": "waiting_for_card"}),
+        ("progress-card-wait-ended", "OperationProgress", {"operation_id": result_id, "event": "card_wait_ended"}),
+        ("card-status-present", "CardStatus", {"card_present": True, "certificate_fingerprint": fingerprint}),
+        ("card-status-absent", "CardStatus", {"card_present": False, "certificate_fingerprint": bytes(len(fingerprint))}),
+        ("pairing-stored", "PairingStored", {"pair_id": h(f["pair_id"])}),
+    ]
+    rejected = [
+        ("card-status-present-without-fingerprint", "CardStatus",
+         {"card_present": True, "certificate_fingerprint": bytes(len(fingerprint))}),
+        ("card-status-absent-with-fingerprint", "CardStatus",
+         {"card_present": False, "certificate_fingerprint": fingerprint}),
+        ("result-completed-with-error", "OperationResult",
+         result("completed", "operation_failed", {"signature": h(f["signature_bytes"])})),
+        ("result-rejected-busy", "OperationResult", result("rejected", "busy")),
+        ("result-unregistered-error", "OperationResult", result("rejected", "invalid_credential")),
+        ("progress-unregistered-event", "OperationProgress", {"operation_id": result_id, "event": "unknown"}),
+        ("error-unregistered-name", "Error", {"error_name": "unknown_operation", "message": "Unknown."}),
+    ]
+    d["vectors"] = [{"name": n, "message_type": m, "body_hex": cbor(b).hex()} for n, m, b in vectors]
+    d["rejected"] = [{"name": n, "message_type": m, "body_hex": cbor(b).hex()} for n, m, b in rejected]
+    return d
+
+
 CORPORA = {
     "rapp-v26.10.21.json": main_corpus,
     "rapp-routing-v26.10.21.json": routing_corpus,
     "rapp-withdrawal-v26.10.21.json": withdrawal_corpus,
     "rapp-ble-sar-v26.10.21.json": ble_sar_corpus,
+    "rapp-operation-v26.10.21.json": operation_corpus,
 }
 
 

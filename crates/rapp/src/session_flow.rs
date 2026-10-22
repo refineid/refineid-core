@@ -4,9 +4,9 @@ use core::fmt;
 
 use super::{
     BinaryFrame, CryptoError, EndpointRole, EstablishedEndpoint, HandshakeChannel, HandshakeRole,
-    MessageError, OpenError, PairKeyMaterial, PairRecord, PairStore, PairStoreError, PairTombstone,
-    PairingState, RappState, SecureChannel, SessionHandshakeParameters, SessionParameters,
-    SessionReadyMessage, SessionState, TransportProfile, TypedMessage,
+    MessageError, OpenError, PairKeyMaterial, PairRecord, PairingState, RappState, SecureChannel,
+    SessionHandshakeParameters, SessionParameters, SessionReadyMessage, SessionState,
+    TransportProfile, TypedMessage,
 };
 
 /// Evidence supplied by the requester integration that the user explicitly
@@ -197,41 +197,34 @@ impl SessionAuthentication {
         Ok(frame)
     }
 
-    /// Verify the peer's authenticated exact parameter echo. Any decrypted
-    /// mismatch revokes this pair immediately on its first occurrence.
+    /// Verify the peer's authenticated exact parameter echo. Any failure
+    /// closes the session; the pairing stays (section 10.1 item 2).
     ///
     /// # Errors
-    /// [`SessionError`] on an integrity failure, an authenticated violation
-    /// that revokes the pairing, or a failed tombstone write.
-    pub fn receive_ready<S: PairStore>(
-        &mut self,
-        store: &mut S,
-        frame: &BinaryFrame,
-        now_ms: u64,
-    ) -> Result<(), SessionError<S::Error>> {
+    /// [`SessionError`] naming the failure; the channel is closed.
+    pub fn receive_ready(&mut self, frame: &BinaryFrame, now_ms: u64) -> Result<(), SessionError> {
         if self.peer_ready_received {
-            return self.revoke(store, now_ms, SessionError::DuplicateReady);
+            return self.fail(SessionError::DuplicateReady);
         }
         let channel = self.channel.as_mut().ok_or(SessionError::Closed)?;
         let envelope = match channel.open(frame) {
             Ok(envelope) => envelope,
             Err(OpenError::SessionIntegrityFailure) => {
-                self.channel = None;
-                return Err(SessionError::IntegrityFailure);
+                return self.fail(SessionError::IntegrityFailure);
             }
             Err(OpenError::AuthenticatedProtocolViolation(error)) => {
-                return self.revoke(store, now_ms, SessionError::AuthenticatedWire(error));
+                return self.fail(SessionError::AuthenticatedWire(error));
             }
         };
-        let message = match TypedMessage::from_envelope(envelope, self.pair_id, now_ms) {
+        let message = match TypedMessage::from_envelope(envelope, now_ms) {
             Ok(message) => message,
-            Err(error) => return self.revoke(store, now_ms, SessionError::Message(error)),
+            Err(error) => return self.fail(SessionError::Message(error)),
         };
         let TypedMessage::SessionReady(ready) = message else {
-            return self.revoke(store, now_ms, SessionError::UnexpectedMessage);
+            return self.fail(SessionError::UnexpectedMessage);
         };
         if ready.parameters != self.expected_parameters {
-            return self.revoke(store, now_ms, SessionError::ParameterMismatch);
+            return self.fail(SessionError::ParameterMismatch);
         }
         self.peer_ready_received = true;
         Ok(())
@@ -255,7 +248,6 @@ impl SessionAuthentication {
                 pairing: PairingState::PairedConnected,
                 session: SessionState::Healthy,
                 operation: super::OperationState::None,
-                requires_user_intent: false,
             },
         ))
     }
@@ -266,20 +258,9 @@ impl SessionAuthentication {
         self.session_id
     }
 
-    fn revoke<S: PairStore>(
-        &mut self,
-        store: &mut S,
-        now_ms: u64,
-        _cause: SessionError<()>,
-    ) -> Result<(), SessionError<S::Error>> {
+    fn fail(&mut self, error: SessionError) -> Result<(), SessionError> {
         self.channel = None;
-        store
-            .revoke(PairTombstone {
-                pair_id: self.pair_id,
-                revoked_at_ms: now_ms,
-            })
-            .map_err(SessionError::PairRevocationFailed)?;
-        Err(SessionError::PairRevoked)
+        Err(error)
     }
 }
 
@@ -302,7 +283,7 @@ impl fmt::Debug for SessionAuthentication {
 
 /// Session establishment failure.
 #[derive(Debug)]
-pub enum SessionError<E = ()> {
+pub enum SessionError {
     /// Call contradicts the stored pair's endpoint role.
     RoleViolation,
     /// The peer never confirmed that it stored the pairing, so the record
@@ -328,16 +309,12 @@ pub enum SessionError<E = ()> {
     ReadyIncomplete,
     /// Channel is already closed.
     Closed,
-    /// Pair store could not persist the revocation tombstone.
-    PairRevocationFailed(PairStoreError<E>),
-    /// Pairing was revoked by an authenticated violation.
-    PairRevoked,
 }
 
-impl<E: fmt::Debug> fmt::Display for SessionError<E> {
+impl fmt::Display for SessionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{self:?}")
     }
 }
 
-impl<E: fmt::Debug> core::error::Error for SessionError<E> {}
+impl core::error::Error for SessionError {}

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use core::fmt;
+use sha2::{Digest, Sha256};
 use zeroize::ZeroizeOnDrop;
 
 /// RAPP v26.10.21 wire version triple [Year, Month, Day].
@@ -46,8 +47,8 @@ pub const PAIR_ID_SIZE: usize = 16;
 pub const SESSION_ID_SIZE: usize = 16;
 /// Byte length of an operation identifier.
 pub const OPERATION_ID_SIZE: usize = 16;
-/// Byte length of a request hash.
-pub const REQUEST_HASH_SIZE: usize = 32;
+/// Byte length of a certificate fingerprint.
+pub const CERTIFICATE_FINGERPRINT_SIZE: usize = 32;
 /// Byte length of a grant-set hash.
 pub const GRANTS_HASH_SIZE: usize = 32;
 /// Byte length of the one-use QR pairing secret.
@@ -143,10 +144,18 @@ public_identifier!(
     "Random identifier for one semantic operation."
 );
 public_identifier!(
-    RequestHash,
-    REQUEST_HASH_SIZE,
-    "Hash binding an operation request."
+    CertificateFingerprint,
+    CERTIFICATE_FINGERPRINT_SIZE,
+    "SHA-256 of the DER encoding of a card's authentication certificate (section 8.4)."
 );
+
+impl CertificateFingerprint {
+    /// The fingerprint of a DER-encoded certificate.
+    #[must_use]
+    pub fn of_certificate(der: &[u8]) -> Self {
+        Self(Sha256::digest(der).into())
+    }
+}
 public_identifier!(
     GrantsHash,
     GRANTS_HASH_SIZE,
@@ -236,11 +245,8 @@ pub enum RetryDecision {
 }
 
 impl RetryDecision {
-    /// Apply RAPP retry policy to the counter that the command would consume.
-    ///
-    /// A blocked target PIN does not use this decision when a PUK reset is
-    /// requested. In that operation the PUK counter is the decrementing
-    /// counter and is checked instead.
+    /// Apply the retry floor of RAPP v26.10.21 section 10.2 to the counter
+    /// the command would consume.
     #[must_use]
     pub const fn for_decrementing_counter(remaining: Option<u8>) -> Self {
         match remaining {
@@ -265,8 +271,6 @@ pub enum CloseReason {
     UserDisconnect,
     /// Local policy refusal.
     Policy,
-    /// CAN, PIN 1, or PIN 2 rejection.
-    CredentialRejected,
     /// Authenticated peer protocol violation.
     ProtocolViolation,
     /// Deliberate pairing revocation.

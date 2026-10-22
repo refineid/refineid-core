@@ -1,8 +1,14 @@
-//! Authenticated session liveness with explicit exponential backoff.
+//! Session liveness (RAPP v26.10.21 section 8.3): a ping after 5 seconds of
+//! silence, the session's end after 30 seconds without any message.
 
 use core::fmt;
 
 use super::LIVENESS_CHALLENGE_SIZE;
+
+/// Silence after which an endpoint sends `liveness.ping`.
+pub const LIVENESS_PING_AFTER_SILENCE_MS: u64 = 5_000;
+/// Silence after which the session ends.
+pub const SESSION_SILENCE_LIMIT_MS: u64 = 30_000;
 
 /// Unpredictable caller-supplied ping value echoed by the peer.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -29,193 +35,87 @@ impl fmt::Debug for PingChallenge {
     }
 }
 
-/// Liveness timing policy expressed against an injected monotonic clock.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LivenessConfig {
-    /// Interval before the first idle probe.
-    pub base_interval_ms: u64,
-    /// Time allowed for an authenticated pong.
-    pub response_timeout_ms: u64,
-    /// Maximum retry interval after exponential backoff.
-    pub maximum_interval_ms: u64,
-    /// Maximum absolute caller-supplied jitter applied after a missed probe.
-    pub maximum_jitter_ms: u64,
-    /// Number of consecutive missed probes that closes the session.
-    pub maximum_misses: u8,
-}
-
-impl LivenessConfig {
-    /// Validates a policy. Timing values are policy inputs rather than hidden
-    /// UI delays.
-    ///
-    /// # Errors
-    /// [`LivenessError::InvalidConfiguration`] on a nonsensical timing or
-    /// retry policy.
-    pub const fn validate(self) -> Result<Self, LivenessError> {
-        if self.base_interval_ms == 0
-            || self.response_timeout_ms == 0
-            || self.maximum_interval_ms < self.base_interval_ms
-            || self.maximum_jitter_ms > self.base_interval_ms
-            || self.maximum_misses == 0
-        {
-            return Err(LivenessError::InvalidConfiguration);
-        }
-        Ok(self)
-    }
-}
-
-#[allow(
-    variant_size_differences,
-    reason = "AwaitingPong carries the 32-byte outstanding challenge; boxing a 47-byte variant buys nothing"
-)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Phase {
-    Waiting {
-        next_probe_at_ms: u64,
-        consecutive_misses: u8,
-    },
-    AwaitingPong {
-        challenge: PingChallenge,
-        deadline_ms: u64,
-        consecutive_misses: u8,
-    },
-    Closed,
-}
-
-/// Session-local liveness tracker.
+/// Session-local liveness on an injected monotonic clock.
 #[allow(
     missing_copy_implementations,
     reason = "one tracker per session; a copied tracker would fork liveness state"
 )]
 #[derive(Debug)]
 pub struct LivenessTracker {
-    config: LivenessConfig,
-    phase: Phase,
+    last_heard_ms: u64,
+    last_ping_ms: Option<u64>,
+    outstanding: Option<PingChallenge>,
+    closed: bool,
 }
 
 impl LivenessTracker {
-    /// Starts liveness tracking at a monotonic timestamp.
-    ///
-    /// # Errors
-    /// [`LivenessError::InvalidConfiguration`] when the policy fails
-    /// validation.
-    pub fn new(config: LivenessConfig, now_ms: u64) -> Result<Self, LivenessError> {
-        let config = config.validate()?;
-        Ok(Self {
-            config,
-            phase: Phase::Waiting {
-                next_probe_at_ms: now_ms.saturating_add(config.base_interval_ms),
-                consecutive_misses: 0,
-            },
-        })
-    }
-
-    /// Advances the timer. The challenge is consumed only when a probe is due.
-    pub fn poll(
-        &mut self,
-        now_ms: u64,
-        next_challenge: PingChallenge,
-        jitter_ms: i64,
-    ) -> LivenessDecision {
-        match self.phase {
-            Phase::Waiting {
-                next_probe_at_ms,
-                consecutive_misses,
-            } if now_ms >= next_probe_at_ms => {
-                self.phase = Phase::AwaitingPong {
-                    challenge: next_challenge,
-                    deadline_ms: now_ms.saturating_add(self.config.response_timeout_ms),
-                    consecutive_misses,
-                };
-                LivenessDecision::SendPing(next_challenge)
-            }
-            Phase::AwaitingPong {
-                deadline_ms,
-                consecutive_misses,
-                ..
-            } if now_ms >= deadline_ms => {
-                let misses = consecutive_misses.saturating_add(1);
-                if misses >= self.config.maximum_misses {
-                    self.phase = Phase::Closed;
-                    LivenessDecision::CloseSession
-                } else {
-                    let interval = jittered_interval(
-                        backoff_interval(self.config, misses),
-                        self.config.maximum_jitter_ms,
-                        jitter_ms,
-                    );
-                    self.phase = Phase::Waiting {
-                        next_probe_at_ms: now_ms.saturating_add(interval),
-                        consecutive_misses: misses,
-                    };
-                    LivenessDecision::ProbeMissed {
-                        next_probe_at_ms: now_ms.saturating_add(interval),
-                    }
-                }
-            }
-            Phase::Closed => LivenessDecision::AlreadyClosed,
-            _ => LivenessDecision::NoAction,
+    /// Starts tracking with the peer last heard at `now_ms`.
+    #[must_use]
+    pub const fn new(now_ms: u64) -> Self {
+        Self {
+            last_heard_ms: now_ms,
+            last_ping_ms: None,
+            outstanding: None,
+            closed: false,
         }
     }
 
-    /// Accepts only the exact authenticated challenge currently outstanding.
-    /// A different or late value is discarded as a normal race and is not
-    /// liveness proof.
+    /// Any authenticated message from the peer resets the silence.
+    pub const fn heard(&mut self, now_ms: u64) {
+        self.last_heard_ms = now_ms;
+        self.last_ping_ms = None;
+    }
+
+    /// Advances the clock. The challenge is consumed only when a ping is due:
+    /// after each 5 seconds of silence, until 30 seconds of silence end the
+    /// session.
+    pub fn poll(&mut self, now_ms: u64, next_challenge: PingChallenge) -> LivenessDecision {
+        if self.closed {
+            return LivenessDecision::AlreadyClosed;
+        }
+        let silence = now_ms.saturating_sub(self.last_heard_ms);
+        if silence >= SESSION_SILENCE_LIMIT_MS {
+            self.closed = true;
+            return LivenessDecision::CloseSession;
+        }
+        let since_ping = self
+            .last_ping_ms
+            .map_or(silence, |ping| now_ms.saturating_sub(ping));
+        if silence >= LIVENESS_PING_AFTER_SILENCE_MS && since_ping >= LIVENESS_PING_AFTER_SILENCE_MS
+        {
+            self.last_ping_ms = Some(now_ms);
+            self.outstanding = Some(next_challenge);
+            return LivenessDecision::SendPing(next_challenge);
+        }
+        LivenessDecision::NoAction
+    }
+
+    /// Accepts only the exact challenge outstanding. Any authenticated
+    /// message counts as heard through [`Self::heard`]; a pong also clears
+    /// its challenge.
     pub fn receive_pong(&mut self, now_ms: u64, challenge: PingChallenge) -> PongDisposition {
-        let Phase::AwaitingPong {
-            challenge: expected,
-            ..
-        } = self.phase
-        else {
-            return PongDisposition::IgnoredUnmatched;
-        };
-        if challenge != expected {
+        if self.outstanding != Some(challenge) {
             return PongDisposition::IgnoredUnmatched;
         }
-        self.phase = Phase::Waiting {
-            next_probe_at_ms: now_ms.saturating_add(self.config.base_interval_ms),
-            consecutive_misses: 0,
-        };
+        self.outstanding = None;
+        self.heard(now_ms);
         PongDisposition::Accepted
     }
 
-    /// Permanently closes this session-local tracker.
+    /// Permanently closes this tracker.
     pub const fn close(&mut self) {
-        self.phase = Phase::Closed;
+        self.closed = true;
     }
 }
 
-fn backoff_interval(config: LivenessConfig, misses: u8) -> u64 {
-    let shift = u32::from(misses.min(63));
-    let multiplier = 1_u64.checked_shl(shift).unwrap_or(u64::MAX);
-    config
-        .base_interval_ms
-        .saturating_mul(multiplier)
-        .min(config.maximum_interval_ms)
-}
-
-fn jittered_interval(interval_ms: u64, maximum_jitter_ms: u64, jitter_ms: i64) -> u64 {
-    let magnitude = jitter_ms.unsigned_abs().min(maximum_jitter_ms);
-    if jitter_ms.is_negative() {
-        interval_ms.saturating_sub(magnitude).max(1)
-    } else {
-        interval_ms.saturating_add(magnitude)
-    }
-}
-
-/// Action emitted by a liveness timer tick.
+/// Action emitted by a liveness clock tick.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LivenessDecision {
-    /// No wire activity is required.
+    /// Nothing to send.
     NoAction,
     /// Send an authenticated ping carrying this challenge.
     SendPing(PingChallenge),
-    /// A probe timed out; retry at the supplied monotonic time.
-    ProbeMissed {
-        /// Monotonic time of the next probe after backoff.
-        next_probe_at_ms: u64,
-    },
-    /// Repeated connectivity loss closes only the current session.
+    /// The silence limit passed; the session ends.
     CloseSession,
     /// The tracker was already closed.
     AlreadyClosed,
@@ -224,23 +124,67 @@ pub enum LivenessDecision {
 /// Result of receiving an authenticated pong.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PongDisposition {
-    /// Exact outstanding challenge matched and liveness was proven.
+    /// The outstanding challenge matched.
     Accepted,
-    /// No outstanding challenge matched; discard as a normal delayed race.
+    /// No outstanding challenge matched; a delayed race.
     IgnoredUnmatched,
 }
 
-/// Liveness configuration or authenticated-message failure.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LivenessError {
-    /// Timing or retry policy is nonsensical.
-    InvalidConfiguration,
-}
+#[cfg(test)]
+mod tests {
+    use super::{
+        LIVENESS_CHALLENGE_SIZE, LIVENESS_PING_AFTER_SILENCE_MS, LivenessDecision, LivenessTracker,
+        PingChallenge, PongDisposition, SESSION_SILENCE_LIMIT_MS,
+    };
 
-impl fmt::Display for LivenessError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{self:?}")
+    const CHALLENGE: PingChallenge = PingChallenge::reconstruct([7; LIVENESS_CHALLENGE_SIZE]);
+
+    #[test]
+    fn silence_brings_a_ping_and_then_the_end() {
+        let mut tracker = LivenessTracker::new(0);
+        assert_eq!(
+            tracker.poll(LIVENESS_PING_AFTER_SILENCE_MS - 1, CHALLENGE),
+            LivenessDecision::NoAction
+        );
+        assert_eq!(
+            tracker.poll(LIVENESS_PING_AFTER_SILENCE_MS, CHALLENGE),
+            LivenessDecision::SendPing(CHALLENGE)
+        );
+        assert_eq!(
+            tracker.poll(LIVENESS_PING_AFTER_SILENCE_MS + 1, CHALLENGE),
+            LivenessDecision::NoAction
+        );
+        assert_eq!(
+            tracker.poll(2 * LIVENESS_PING_AFTER_SILENCE_MS, CHALLENGE),
+            LivenessDecision::SendPing(CHALLENGE)
+        );
+        assert_eq!(
+            tracker.poll(SESSION_SILENCE_LIMIT_MS, CHALLENGE),
+            LivenessDecision::CloseSession
+        );
+        assert_eq!(
+            tracker.poll(SESSION_SILENCE_LIMIT_MS, CHALLENGE),
+            LivenessDecision::AlreadyClosed
+        );
+    }
+
+    #[test]
+    fn a_matching_pong_resets_the_silence() {
+        let mut tracker = LivenessTracker::new(0);
+        tracker.poll(LIVENESS_PING_AFTER_SILENCE_MS, CHALLENGE);
+        let other = PingChallenge::reconstruct([8; LIVENESS_CHALLENGE_SIZE]);
+        assert_eq!(
+            tracker.receive_pong(LIVENESS_PING_AFTER_SILENCE_MS, other),
+            PongDisposition::IgnoredUnmatched
+        );
+        let answered = SESSION_SILENCE_LIMIT_MS - 1;
+        assert_eq!(
+            tracker.receive_pong(answered, CHALLENGE),
+            PongDisposition::Accepted
+        );
+        assert_eq!(
+            tracker.poll(SESSION_SILENCE_LIMIT_MS, CHALLENGE),
+            LivenessDecision::NoAction
+        );
     }
 }
-
-impl core::error::Error for LivenessError {}

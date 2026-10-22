@@ -1,841 +1,330 @@
 // Copyright 2026 Petri Koistinen
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     https://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed under the Apache License, Version 2.0.
 
-//! Executable evidence for the RAPP at-most-once and result-delivery boundary.
+//! Operation lifecycles of RAPP v26.10.21 section 8, with the requester and
+//! custodian engines exchanging messages through their wire encoding.
 
 use refineid_rapp::{
-    ApprovalOutcome, AuthorizationStage, AuthorizationTransaction, AuthorizedCardCommand,
-    CardKeyProfile, CardOperation, CardOperationResult, JournalRecord, JournalStore, OperationId,
-    OperationReference, OperationRequest, OperationResultMessage, OperationState, PairId,
-    PendingCardCommand, ProfileName, ProtocolErrorMessage, ProxyDispatch, ProxyFailure,
-    ProxyOperationEngine, RequestHash, ResultError, ResultJournalStore, ResultStatus, SessionId,
-    SignatureAlgorithm, StatusReport, TypedMessage, UserApproval,
+    CardKeyProfile, CardOperation, CardOperationResult, Envelope, OperationId, OperationRequest,
+    OperationResultMessage, ProfileName, ProxyDispatch, ProxyFailure, ProxyOperationEngine,
+    ProxySessionCloseAction, RequesterDispatch, RequesterOperationEngine, ResultError,
+    ResultStatus, SessionId, SignatureAlgorithm, TypedMessage, UserApproval,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StoreEvent {
-    Persist(OperationState, u8),
-    PersistResult(OperationState, u8),
-    RetainUncertain(OperationState, u8),
-    Acknowledge(OperationState, u8),
+const SESSION_ID: SessionId = SessionId::from_array([0x5e; 16]);
+const START_MS: u64 = 1_000;
+const LIFETIME_MS: u64 = 60_000;
+const MAXIMUM_LIFETIME_MS: u64 = 300_000;
+const SHA256_DIGEST_SIZE: usize = 32;
+
+/// Carries a message across the wire: encode its body, decode it again.
+fn across(message: &TypedMessage) -> TypedMessage {
+    let envelope = Envelope::reconstruct(
+        message.message_type(),
+        SESSION_ID,
+        0,
+        message.to_wire_body().expect("the message encodes"),
+    )
+    .expect("the body fits its schema");
+    TypedMessage::from_envelope(envelope, START_MS).expect("the message decodes")
 }
 
-#[derive(Default)]
-struct MemoryResultStore {
-    events: Vec<StoreEvent>,
-    retained_result: Option<OperationResultMessage>,
-    fail_next_write: bool,
-}
-
-impl MemoryResultStore {
-    const fn maybe_fail(&mut self) -> Result<(), &'static str> {
-        if self.fail_next_write {
-            self.fail_next_write = false;
-            Err("injected durable-store failure")
-        } else {
-            Ok(())
-        }
-    }
-}
-
-impl JournalStore for MemoryResultStore {
-    type Error = &'static str;
-
-    fn persist(&mut self, record: &JournalRecord) -> Result<(), Self::Error> {
-        self.maybe_fail()?;
-        self.events
-            .push(StoreEvent::Persist(record.state, record.transmission_count));
-        Ok(())
-    }
-}
-
-impl ResultJournalStore for MemoryResultStore {
-    fn persist_result(
-        &mut self,
-        record: &JournalRecord,
-        result: &OperationResultMessage,
-    ) -> Result<(), Self::Error> {
-        self.maybe_fail()?;
-        self.retained_result = Some(result.clone());
-        self.events.push(StoreEvent::PersistResult(
-            record.state,
-            record.transmission_count,
-        ));
-        Ok(())
-    }
-
-    fn retain_uncertain_result(&mut self, record: &JournalRecord) -> Result<(), Self::Error> {
-        self.maybe_fail()?;
-        assert!(
-            self.retained_result.is_some(),
-            "delivery uncertainty must retain an already-durable result"
-        );
-        self.events.push(StoreEvent::RetainUncertain(
-            record.state,
-            record.transmission_count,
-        ));
-        Ok(())
-    }
-
-    fn acknowledge_result(&mut self, record: &JournalRecord) -> Result<(), Self::Error> {
-        self.maybe_fail()?;
-        self.retained_result = None;
-        self.events.push(StoreEvent::Acknowledge(
-            record.state,
-            record.transmission_count,
-        ));
-        Ok(())
-    }
-}
-
-fn consequential_request() -> OperationRequest {
+fn request(byte: u8, operation: CardOperation) -> OperationRequest {
     OperationRequest::reconstruct(
-        OperationId::from_array([0x11; 16]),
-        PairId::from_array([0x22; 16]),
-        SessionId::from_array([0x33; 16]),
-        ProfileName::Authentication,
-        1_000,
-        5_000,
-        CardOperation::BrowserAuthenticate {
-            origin: "https://example.invalid".into(),
+        OperationId::from_array([byte; 16]),
+        operation.required_profile(),
+        START_MS,
+        LIFETIME_MS,
+        operation,
+    )
+    .expect("a registered request")
+}
+
+fn signing(byte: u8) -> OperationRequest {
+    request(
+        byte,
+        CardOperation::SignDocument {
+            document_name: "Contract.pdf".to_owned(),
             key_profile: CardKeyProfile::EcdsaP256,
             algorithm: SignatureAlgorithm::EcdsaSha256,
-            digest: vec![0x44; 32],
+            digest: vec![0xcc; SHA256_DIGEST_SIZE],
         },
     )
-    .expect("the fixed request vector is valid")
 }
 
-fn consented_transaction() -> AuthorizationTransaction {
-    let mut transaction = AuthorizationTransaction::prepare(consequential_request())
-        .expect("the fixed request vector is valid");
-    transaction
-        .prerequisites_complete()
-        .expect("prerequisites complete once");
-    transaction
-}
-
-fn approval() -> UserApproval {
-    UserApproval::for_request(&consequential_request(), 1_100)
-        .expect("the fixed request vector has a deterministic hash")
-}
-
-fn executing_transaction(
-    store: &mut MemoryResultStore,
-) -> (
-    AuthorizationTransaction,
-    PendingCardCommand<AuthorizedCardCommand>,
-) {
-    let mut transaction = consented_transaction();
-    let ApprovalOutcome::ExecuteCardCommand(command) = transaction
-        .approve(store, approval(), 1_100, 10_000)
-        .expect("fresh exact approval is accepted")
-    else {
-        panic!("a consequential approval yields the card command");
-    };
-    (transaction, command)
-}
-
-fn completed_result(transaction: &AuthorizationTransaction) -> OperationResultMessage {
-    OperationResultMessage::completed(
-        transaction.reference(),
-        &CardOperationResult::Signature(vec![0x55; 64]),
-    )
-}
-
-#[test]
-fn durable_in_flight_entry_precedes_the_only_physical_command() {
-    let mut store = MemoryResultStore::default();
-    let (transaction, command) = executing_transaction(&mut store);
-    let mut physical_transmissions = 0_u8;
-
-    assert_eq!(
-        store.events,
-        [StoreEvent::Persist(OperationState::Executing, 1)]
-    );
-    command.execute(|command| {
-        physical_transmissions += 1;
-        assert_eq!(command.operation, consequential_request().operation);
-    });
-
-    assert_eq!(physical_transmissions, 1);
-    assert_eq!(transaction.stage(), AuthorizationStage::Executing);
-    assert_eq!(transaction.journal().record().transmission_count, 1);
-    assert!(!transaction.journal().record().automatic_retry_permitted);
-}
-
-#[test]
-fn a_second_approval_cannot_create_another_card_command() {
-    let mut store = MemoryResultStore::default();
-    let (mut transaction, _command) = executing_transaction(&mut store);
-    let writes = store.events.len();
-
-    assert!(
-        transaction
-            .approve(&mut store, approval(), 1_101, 10_000)
-            .is_err()
-    );
-    assert_eq!(store.events.len(), writes);
-}
-
-#[test]
-fn persistence_failure_prevents_command_exposure() {
-    let mut store = MemoryResultStore {
-        fail_next_write: true,
-        ..MemoryResultStore::default()
-    };
-    let mut transaction = consented_transaction();
-
-    assert!(
-        transaction
-            .approve(&mut store, approval(), 1_100, 10_000)
-            .is_err()
-    );
-    assert_eq!(transaction.stage(), AuthorizationStage::AwaitingConsent);
-    assert_eq!(transaction.journal().record().transmission_count, 0);
-    assert!(store.events.is_empty());
-}
-
-#[test]
-fn expired_approval_writes_nothing() {
-    let mut store = MemoryResultStore::default();
-    let mut transaction = consented_transaction();
-    let late = UserApproval::for_request(&consequential_request(), 6_001)
-        .expect("the fixed request vector has a deterministic hash");
-
-    assert!(
-        transaction
-            .approve(&mut store, late, 6_001, 10_000)
-            .is_err()
-    );
-    assert!(store.events.is_empty());
-}
-
-#[test]
-fn result_is_durable_before_release_and_acknowledgment_erases_it() {
-    let mut store = MemoryResultStore::default();
-    let (mut transaction, command) = executing_transaction(&mut store);
-    command.execute(|_| ());
-    let result = completed_result(&transaction);
-
-    transaction
-        .finish_completed(&mut store, result.clone())
-        .expect("a valid completed result is persisted");
-    assert_eq!(transaction.stage(), AuthorizationStage::ResultPending);
-    assert_eq!(transaction.retained_result(), Some(&result));
-    assert_eq!(store.retained_result.as_ref(), Some(&result));
-    assert_eq!(
-        store.events.last(),
-        Some(&StoreEvent::PersistResult(OperationState::ResultPending, 1))
-    );
-
-    transaction
-        .acknowledge_result(&mut store, transaction.reference())
-        .expect("the exact acknowledgment completes delivery");
-    assert_eq!(transaction.stage(), AuthorizationStage::Terminal);
-    assert_eq!(transaction.operation_state(), OperationState::Completed);
-    assert_eq!(transaction.retained_result(), None);
-    assert_eq!(store.retained_result, None);
-    assert_eq!(
-        store.events.last(),
-        Some(&StoreEvent::Acknowledge(OperationState::Completed, 1))
-    );
-}
-
-#[test]
-fn lost_ack_retains_result_and_forbids_automatic_replay() {
-    let mut store = MemoryResultStore::default();
-    let (mut transaction, command) = executing_transaction(&mut store);
-    command.execute(|_| ());
-    let result = completed_result(&transaction);
-    transaction
-        .finish_completed(&mut store, result.clone())
-        .expect("result is durable before transport release");
-
-    transaction
-        .delivery_became_uncertain(&mut store)
-        .expect("session loss marks delivery uncertain");
-    assert_eq!(
-        transaction.operation_state(),
-        OperationState::DeliveryUncertain
-    );
-    assert_eq!(transaction.retained_result(), Some(&result));
-    assert_eq!(store.retained_result.as_ref(), Some(&result));
-    assert!(!transaction.journal().record().automatic_retry_permitted);
-    assert_eq!(
-        store.events.last(),
-        Some(&StoreEvent::RetainUncertain(
-            OperationState::DeliveryUncertain,
-            1,
-        ))
-    );
-    assert!(
-        transaction
-            .approve(&mut store, approval(), 1_200, 10_000)
-            .is_err()
-    );
-}
-
-#[test]
-fn crash_after_transmission_is_ambiguous_and_never_retried() {
-    let mut store = MemoryResultStore::default();
-    let (mut transaction, command) = executing_transaction(&mut store);
-    command.execute(|_| ());
-
-    transaction
-        .recover_after_crash(&mut store)
-        .expect("executing work recovers as ambiguous");
-    assert_eq!(transaction.operation_state(), OperationState::Ambiguous);
-    assert_eq!(transaction.journal().record().transmission_count, 1);
-    assert!(!transaction.journal().record().automatic_retry_permitted);
-}
-
-#[test]
-fn a_failure_result_is_retained_for_identical_retransmissions() {
-    let mut store = MemoryResultStore::default();
-    let mut transaction = consented_transaction();
-    let result = OperationResultMessage::failure(transaction.reference(), ProxyFailure::UserDenied);
-
-    transaction
-        .finish_failure_result(&mut store, &result)
-        .expect("a denial is journaled");
-    assert_eq!(transaction.operation_state(), OperationState::Rejected);
-    assert_eq!(transaction.retained_result(), Some(&result));
-    assert_eq!(result.status, ResultStatus::Rejected);
-    assert_eq!(result.error, Some(ResultError::UserCancelled));
-    assert_eq!(
-        store.events,
-        [StoreEvent::PersistResult(OperationState::Rejected, 0)]
-    );
-}
-
-#[test]
-fn a_failure_result_awaits_its_acknowledgment_and_retires_on_it() {
-    let mut store = MemoryResultStore::default();
-    let mut transaction = consented_transaction();
-    let result = OperationResultMessage::failure(transaction.reference(), ProxyFailure::UserDenied);
-    transaction
-        .finish_failure_result(&mut store, &result)
-        .expect("a denial is journaled");
-    assert_eq!(transaction.stage(), AuthorizationStage::ResultPending);
-    assert!(!transaction.is_retired());
-
-    transaction
-        .acknowledge_result(&mut store, transaction.reference())
-        .expect("the exact acknowledgment retires the failure");
-    assert_eq!(transaction.stage(), AuthorizationStage::Terminal);
-    assert_eq!(transaction.operation_state(), OperationState::Rejected);
-    assert!(transaction.is_retired());
-    assert_eq!(transaction.retained_result(), None);
-    assert_eq!(store.retained_result, None);
-    assert_eq!(
-        store.events.last(),
-        Some(&StoreEvent::Acknowledge(OperationState::Rejected, 0))
-    );
-    let retired = transaction
-        .journal()
-        .record()
-        .retired_answer()
-        .expect("a retired failure answers with its disposition");
-    assert!(retired.retired);
-    assert_eq!(retired.status, ResultStatus::Rejected);
-    assert_eq!(retired.error, Some(ResultError::UserCancelled));
-    assert_eq!(retired.response, None);
-}
-
-#[test]
-fn an_unacknowledged_failure_survives_session_loss_unchanged() {
-    let mut store = MemoryResultStore::default();
-    let mut transaction = consented_transaction();
-    let result = OperationResultMessage::failure(transaction.reference(), ProxyFailure::UserDenied);
-    transaction
-        .finish_failure_result(&mut store, &result)
-        .expect("a denial is journaled");
-
-    transaction
-        .delivery_became_uncertain(&mut store)
-        .expect("session loss ends the attempt");
-    assert_eq!(transaction.stage(), AuthorizationStage::ResultPending);
-    assert_eq!(transaction.operation_state(), OperationState::Rejected);
-    assert!(!transaction.is_retired());
-    assert_eq!(transaction.retained_result(), Some(&result));
-    assert_eq!(
-        store.events,
-        [StoreEvent::PersistResult(OperationState::Rejected, 0)]
-    );
-
-    transaction
-        .acknowledge_result(&mut store, transaction.reference())
-        .expect("the next session's acknowledgment retires the failure");
-    assert_eq!(transaction.stage(), AuthorizationStage::Terminal);
-    assert_eq!(transaction.operation_state(), OperationState::Rejected);
-    assert!(transaction.is_retired());
-    assert_eq!(transaction.retained_result(), None);
-}
-
-#[test]
-fn request_hash_is_bound_to_the_pairing_not_the_session_local_time_or_expiry() {
-    let original = consequential_request();
-    let mut local_only_change = original.clone();
-    local_only_change.local_start_ms += 99_000;
-    local_only_change.expires_after_ms += 99_000;
-    assert_eq!(
-        original.request_hash().expect("hash succeeds"),
-        local_only_change.request_hash().expect("hash succeeds")
-    );
-
-    let mut session_change = original.clone();
-    session_change.session_id = SessionId::from_array([0x99; 16]);
-    assert_eq!(
-        original.request_hash().expect("hash succeeds"),
-        session_change.request_hash().expect("hash succeeds"),
-        "a retransmission on a later session hashes the same"
-    );
-
-    let mut pair_change = original.clone();
-    pair_change.pair_id = PairId::from_array([0x98; 16]);
-    assert_ne!(
-        original.request_hash().expect("hash succeeds"),
-        pair_change.request_hash().expect("hash succeeds")
-    );
-
-    let mut semantic_change = original.clone();
-    semantic_change.operation = CardOperation::BrowserAuthenticate {
-        origin: "https://different.example.invalid".into(),
-        key_profile: CardKeyProfile::EcdsaP256,
-        algorithm: SignatureAlgorithm::EcdsaSha256,
-        digest: vec![0x44; 32],
-    };
-    assert_ne!(
-        original.request_hash().expect("hash succeeds"),
-        semantic_change.request_hash().expect("hash succeeds")
-    );
-
-    let mut operation_id_change = original.clone();
-    operation_id_change.operation_id = OperationId::from_array([0xaa; 16]);
-    assert_ne!(
-        original.request_hash().expect("hash succeeds"),
-        operation_id_change.request_hash().expect("hash succeeds")
-    );
-
-    assert_ne!(
-        original.request_hash().expect("hash succeeds"),
-        RequestHash::from_array([0; 32]),
-        "the fixed vector must not collapse to the all-zero sentinel"
-    );
-}
-
-fn engine_with_request(store: &mut MemoryResultStore) -> ProxyOperationEngine {
-    let mut engine = ProxyOperationEngine::new(vec![ProfileName::Authentication]);
-    assert!(matches!(
-        engine.receive(
-            store,
-            TypedMessage::OperationRequest(consequential_request()),
-            1_000
-        ),
-        Ok(ProxyDispatch::InspectPrerequisites(_))
-    ));
-    engine
-}
-
-fn reference() -> OperationReference {
-    let request = consequential_request();
-    OperationReference {
-        operation_id: request.operation_id,
-        request_hash: request.request_hash().expect("hash succeeds"),
-    }
-}
-
-#[test]
-fn identical_retransmission_joins_the_live_operation() {
-    let mut store = MemoryResultStore::default();
-    let mut engine = engine_with_request(&mut store);
-
-    assert!(matches!(
-        engine.receive(
-            &mut store,
-            TypedMessage::OperationRequest(consequential_request()),
-            1_010
-        ),
-        Ok(ProxyDispatch::IgnoredDuplicate(_))
-    ));
-    assert!(store.events.is_empty());
-}
-
-#[test]
-fn changed_content_under_a_live_identifier_is_a_duplicate_operation() {
-    let mut store = MemoryResultStore::default();
-    let mut engine = engine_with_request(&mut store);
-    let mut changed = consequential_request();
-    changed.operation = CardOperation::BrowserAuthenticate {
-        origin: "https://other.example.invalid".into(),
-        key_profile: CardKeyProfile::EcdsaP256,
-        algorithm: SignatureAlgorithm::EcdsaSha256,
-        digest: vec![0x44; 32],
-    };
-
-    let Ok(ProxyDispatch::Send(TypedMessage::Error(error))) =
-        engine.receive(&mut store, TypedMessage::OperationRequest(changed), 1_010)
-    else {
-        panic!("changed content is refused with an error");
-    };
-    assert_eq!(
-        error,
-        ProtocolErrorMessage::DuplicateOperation(reference().operation_id)
-    );
-}
-
-#[test]
-fn a_retained_failure_answers_a_retransmission_without_the_card() {
-    let mut store = MemoryResultStore::default();
-    let mut engine = engine_with_request(&mut store);
-    engine
-        .prerequisites_complete(reference().operation_id)
-        .expect("prerequisites complete");
-    engine
-        .finish_failure(
-            &mut store,
-            reference().operation_id,
-            ProxyFailure::UserDenied,
-        )
-        .expect("the denial is journaled");
-
-    let Ok(ProxyDispatch::Send(TypedMessage::OperationResult(result))) = engine.receive(
-        &mut store,
-        TypedMessage::OperationRequest(consequential_request()),
-        1_020,
-    ) else {
-        panic!("the retained failure is re-delivered");
-    };
-    assert_eq!(result.status, ResultStatus::Rejected);
-    assert_eq!(result.error, Some(ResultError::UserCancelled));
-}
-
-#[test]
-fn an_acknowledged_result_answers_as_retired_and_the_status_says_so() {
-    let mut store = MemoryResultStore::default();
-    let mut engine = engine_with_request(&mut store);
-    let operation_id = reference().operation_id;
-    engine
-        .prerequisites_complete(operation_id)
-        .expect("prerequisites complete");
-    let Ok(ProxyDispatch::ExecuteCardCommand { command, .. }) =
-        engine.approve(&mut store, operation_id, approval(), 1_100, 10_000)
-    else {
-        panic!("approval yields the card command");
-    };
-    command.execute(|_| ());
-    let completed = OperationResultMessage::completed(
-        reference(),
-        &CardOperationResult::Signature(vec![0x55; 64]),
-    );
-    engine
-        .finish_completed(&mut store, operation_id, completed)
-        .expect("the result is retained");
-    assert!(matches!(
-        engine.receive(
-            &mut store,
-            TypedMessage::OperationResultAck(reference()),
-            1_200
-        ),
-        Ok(ProxyDispatch::ResultAcknowledged(_))
-    ));
-
-    let Ok(ProxyDispatch::Send(TypedMessage::OperationResult(retired))) = engine.receive(
-        &mut store,
-        TypedMessage::OperationRequest(consequential_request()),
-        1_300,
-    ) else {
-        panic!("a retired operation answers with its tombstone");
-    };
-    assert!(retired.retired);
-    assert_eq!(retired.status, ResultStatus::Completed);
-    assert_eq!(retired.error, Some(ResultError::OperationAlreadyRetired));
-    assert_eq!(retired.response, None);
-
-    let Ok(ProxyDispatch::Send(TypedMessage::OperationStatus(report))) = engine.receive(
-        &mut store,
-        TypedMessage::OperationStatusRequest(operation_id),
-        1_400,
-    ) else {
-        panic!("a retired operation reports its status alone");
-    };
-    assert_eq!(
-        report,
-        StatusReport {
-            operation_id,
-            known: true,
-            state: Some(OperationState::Completed),
-            request_hash: Some(reference().request_hash),
-            retired: true,
-        }
-    );
-}
-
-#[test]
-fn an_acknowledged_failure_answers_as_retired_and_the_status_says_so() {
-    let mut store = MemoryResultStore::default();
-    let mut engine = engine_with_request(&mut store);
-    let operation_id = reference().operation_id;
-    engine
-        .prerequisites_complete(operation_id)
-        .expect("prerequisites complete");
-    engine
-        .finish_failure(&mut store, operation_id, ProxyFailure::UserDenied)
-        .expect("the denial is journaled");
-    assert!(matches!(
-        engine.receive(
-            &mut store,
-            TypedMessage::OperationResultAck(reference()),
-            1_200
-        ),
-        Ok(ProxyDispatch::ResultAcknowledged(_))
-    ));
-
-    let Ok(ProxyDispatch::Send(TypedMessage::OperationResult(retired))) = engine.receive(
-        &mut store,
-        TypedMessage::OperationRequest(consequential_request()),
-        1_300,
-    ) else {
-        panic!("a retired failure answers with its tombstone");
-    };
-    assert!(retired.retired);
-    assert_eq!(retired.status, ResultStatus::Rejected);
-    assert_eq!(retired.error, Some(ResultError::UserCancelled));
-    assert_eq!(retired.response, None);
-
-    let Ok(ProxyDispatch::Send(TypedMessage::OperationStatus(report))) = engine.receive(
-        &mut store,
-        TypedMessage::OperationStatusRequest(operation_id),
-        1_400,
-    ) else {
-        panic!("a retired failure reports its status alone");
-    };
-    assert_eq!(
-        report,
-        StatusReport {
-            operation_id,
-            known: true,
-            state: Some(OperationState::Rejected),
-            request_hash: Some(reference().request_hash),
-            retired: true,
-        }
-    );
-}
-
-#[test]
-fn status_of_a_pending_result_re_delivers_it() {
-    let mut store = MemoryResultStore::default();
-    let mut engine = ProxyOperationEngine::new(vec![ProfileName::Authentication]);
-    let mut request = consequential_request();
-    request.profile = ProfileName::CardStatus;
-    request.operation = CardOperation::InspectCard;
-    let operation_id = request.operation_id;
-    engine
-        .receive(&mut store, TypedMessage::OperationRequest(request), 1_000)
-        .expect("an ungranted profile is answered, not punished");
-
-    let Ok(ProxyDispatch::SendAll(messages)) = engine.receive(
-        &mut store,
-        TypedMessage::OperationStatusRequest(operation_id),
-        1_100,
-    ) else {
-        panic!("the status re-delivers the retained result");
-    };
-    assert!(matches!(messages.as_slice(), [
-        TypedMessage::OperationStatus(StatusReport { known: true, retired: false, .. }),
-        TypedMessage::OperationResult(result),
-    ] if result.error == Some(ResultError::Unauthorized)));
-}
-
-#[test]
-fn a_second_request_while_one_is_live_is_refused_with_operation_failed() {
-    let mut store = MemoryResultStore::default();
-    let mut engine = engine_with_request(&mut store);
-    let mut second = consequential_request();
-    second.operation_id = OperationId::from_array([0x77; 16]);
-
-    assert!(matches!(
-        engine.receive(&mut store, TypedMessage::OperationRequest(second), 1_010),
-        Ok(ProxyDispatch::Send(TypedMessage::Error(
-            ProtocolErrorMessage::OperationFailed(_)
-        )))
-    ));
-}
-
-fn batch_request(documents: usize) -> OperationRequest {
-    OperationRequest::reconstruct(
-        OperationId::from_array([0x55; 16]),
-        PairId::from_array([0x22; 16]),
-        SessionId::from_array([0x33; 16]),
-        ProfileName::DocumentSigning,
-        1_000,
-        5_000,
+fn batch(byte: u8, documents: usize) -> OperationRequest {
+    request(
+        byte,
         CardOperation::BatchSignDocuments {
             document_names: (0..documents)
-                .map(|index| format!("Doc{index}.pdf"))
+                .map(|index| format!("Document {index}.pdf"))
                 .collect(),
             key_profile: CardKeyProfile::EcdsaP256,
             algorithm: SignatureAlgorithm::EcdsaSha256,
-            digests: vec![vec![0x44; 32]; documents],
+            digests: vec![vec![0xcc; SHA256_DIGEST_SIZE]; documents],
         },
     )
-    .expect("the batch vector is valid")
 }
 
-fn batch_engine(store: &mut MemoryResultStore) -> (ProxyOperationEngine, OperationRequest) {
-    let request = batch_request(3);
-    let mut engine = ProxyOperationEngine::new(vec![ProfileName::DocumentSigning]);
-    engine
-        .receive(
-            store,
-            TypedMessage::OperationRequest(request.clone()),
-            1_000,
-        )
-        .expect("the batch is admitted");
+fn custodian() -> ProxyOperationEngine {
+    ProxyOperationEngine::new(vec![
+        ProfileName::CardStatus,
+        ProfileName::Authentication,
+        ProfileName::DocumentSigning,
+    ])
+}
+
+fn sent(dispatch: ProxyDispatch) -> TypedMessage {
+    match dispatch {
+        ProxyDispatch::Send(message) => message,
+        other => panic!("expected a message to send, got {other:?}"),
+    }
+}
+
+/// Admits `request` on the custodian and brings it to consent.
+fn admit(
+    engine: &mut ProxyOperationEngine,
+    requester: &mut RequesterOperationEngine,
+    request: &OperationRequest,
+) {
+    let wire = requester
+        .begin(request.clone())
+        .expect("the requester starts");
+    assert!(matches!(
+        engine.receive(across(&wire)),
+        Ok(ProxyDispatch::InspectPrerequisites(_))
+    ));
     engine
         .prerequisites_complete(request.operation_id)
-        .expect("prerequisites complete");
-    let approval = UserApproval::for_request(&request, 1_100).expect("deterministic hash");
-    let Ok(ProxyDispatch::ExecuteCardCommand { command, .. }) =
-        engine.approve(store, request.operation_id, approval, 1_100, 10_000)
-    else {
-        panic!("approval yields the batch command");
-    };
-    command.execute(|_| ());
-    (engine, request)
+        .expect("the reads complete");
 }
 
 #[test]
-fn batch_validation_follows_section_9_3() {
-    assert!(
-        OperationRequest::reconstruct(
-            OperationId::from_array([0x55; 16]),
-            PairId::from_array([0x22; 16]),
-            SessionId::from_array([0x33; 16]),
-            ProfileName::DocumentSigning,
-            1_000,
-            5_000,
-            CardOperation::BatchSignDocuments {
-                document_names: vec!["One.pdf".into()],
-                key_profile: CardKeyProfile::EcdsaP256,
-                algorithm: SignatureAlgorithm::EcdsaSha256,
-                digests: vec![vec![0x44; 32]; 2],
-            },
+fn an_approved_signature_reaches_the_requester() {
+    let mut engine = custodian();
+    let mut requester = RequesterOperationEngine::new();
+    let request = signing(1);
+    admit(&mut engine, &mut requester, &request);
+    let ProxyDispatch::ExecuteCardCommand { command, .. } = engine
+        .approve(
+            request.operation_id,
+            UserApproval::for_request(&request, START_MS),
+            START_MS,
+            MAXIMUM_LIFETIME_MS,
         )
-        .is_err(),
-        "names and digests must pair"
+        .expect("approval")
+    else {
+        panic!("approval of a signature gives the card command");
+    };
+    let operation = command.execute(|command| command.operation);
+    assert_eq!(operation, request.operation);
+    let answer = CardOperationResult::Signature(vec![0xee; SHA256_DIGEST_SIZE]);
+    let result = sent(
+        engine
+            .finish_completed(
+                request.operation_id,
+                OperationResultMessage::completed(request.operation_id, &answer),
+            )
+            .expect("completion"),
     );
-    assert!(
-        OperationRequest::reconstruct(
-            OperationId::from_array([0x55; 16]),
-            PairId::from_array([0x22; 16]),
-            SessionId::from_array([0x33; 16]),
-            ProfileName::DocumentSigning,
-            1_000,
-            5_000,
-            CardOperation::BatchSignDocuments {
-                document_names: (0..65).map(|index| format!("Doc{index}.pdf")).collect(),
-                key_profile: CardKeyProfile::EcdsaP256,
-                algorithm: SignatureAlgorithm::EcdsaSha256,
-                digests: vec![vec![0x44; 32]; 65],
-            },
-        )
-        .is_err(),
-        "more than 64 documents is refused"
+    assert_eq!(
+        requester.receive(across(&result)).expect("result"),
+        RequesterDispatch::Completed {
+            operation_id: request.operation_id,
+            result: answer,
+        }
     );
-    assert!(batch_request(64).operation.is_consequential());
 }
 
 #[test]
-fn each_batch_signature_is_journaled_before_the_next_document() {
-    let mut store = MemoryResultStore::default();
-    let (mut engine, request) = batch_engine(&mut store);
-    let writes = store.events.len();
-    for index in 0..3_u8 {
-        engine
-            .record_batch_signature(&mut store, request.operation_id, vec![index + 1; 64])
-            .expect("signature journaled");
-    }
-    assert_eq!(store.events.len(), writes + 3);
-    assert!(
-        engine
-            .record_batch_signature(&mut store, request.operation_id, vec![9; 64])
-            .is_err(),
-        "no signature past the last document"
-    );
-    let Ok(ProxyDispatch::Send(TypedMessage::OperationResult(result))) =
-        engine.complete_batch(&mut store, request.operation_id)
-    else {
-        panic!("a complete batch answers with its signatures");
-    };
-    assert_eq!(result.status, ResultStatus::Completed);
-    let Ok(CardOperationResult::Signatures(signatures)) = result
-        .response
-        .as_ref()
-        .expect("signatures travel")
-        .typed_for(&request.operation)
-    else {
-        panic!("the result reads as signatures");
-    };
-    assert_eq!(signatures, vec![vec![1; 64], vec![2; 64], vec![3; 64]]);
-}
-
-#[test]
-fn an_unfinished_batch_cannot_complete() {
-    let mut store = MemoryResultStore::default();
-    let (mut engine, request) = batch_engine(&mut store);
+fn an_approval_gives_one_card_command() {
+    let mut engine = custodian();
+    let mut requester = RequesterOperationEngine::new();
+    let request = signing(1);
+    admit(&mut engine, &mut requester, &request);
+    let approval = UserApproval::for_request(&request, START_MS);
     engine
-        .record_batch_signature(&mut store, request.operation_id, vec![1; 64])
-        .expect("signature journaled");
+        .approve(
+            request.operation_id,
+            approval,
+            START_MS,
+            MAXIMUM_LIFETIME_MS,
+        )
+        .expect("first approval");
     assert!(
         engine
-            .complete_batch(&mut store, request.operation_id)
+            .approve(
+                request.operation_id,
+                approval,
+                START_MS,
+                MAXIMUM_LIFETIME_MS
+            )
             .is_err()
     );
 }
 
 #[test]
-fn an_interrupted_batch_answers_ambiguous_with_its_signatures() {
-    let mut store = MemoryResultStore::default();
-    let (mut engine, request) = batch_engine(&mut store);
-    engine
-        .record_batch_signature(&mut store, request.operation_id, vec![1; 64])
-        .expect("signature journaled");
-    let Ok(ProxyDispatch::SendFailure {
-        message: TypedMessage::OperationResult(result),
-        ..
-    }) = engine.finish_failure(
-        &mut store,
-        request.operation_id,
-        ProxyFailure::CardCompletionAmbiguous,
-    )
-    else {
-        panic!("the interruption is reported");
-    };
-    assert_eq!(result.status, ResultStatus::Ambiguous);
-    let reference = OperationReference {
-        operation_id: request.operation_id,
-        request_hash: request.request_hash().expect("hash"),
-    };
-    result
-        .validate_for(reference, &request.operation)
-        .expect("the partial result answers the batch");
-    assert_eq!(
-        result
-            .partial_batch_signatures(&request.operation)
-            .expect("partial progress"),
-        vec![vec![1; 64]]
+fn a_late_approval_cancels_without_a_card_command() {
+    let mut engine = custodian();
+    let mut requester = RequesterOperationEngine::new();
+    let request = signing(1);
+    admit(&mut engine, &mut requester, &request);
+    let late = START_MS + LIFETIME_MS + 1;
+    let result = sent(
+        engine
+            .approve(
+                request.operation_id,
+                UserApproval::for_request(&request, late),
+                late,
+                MAXIMUM_LIFETIME_MS,
+            )
+            .expect("dispatch"),
     );
+    assert_eq!(
+        requester.receive(across(&result)).expect("result"),
+        RequesterDispatch::Ended {
+            operation_id: request.operation_id,
+            status: ResultStatus::Cancelled,
+            error: ResultError::OperationExpired,
+        }
+    );
+}
+
+#[test]
+fn the_retry_floor_reaches_the_requester_as_a_rejection() {
+    let mut engine = custodian();
+    let mut requester = RequesterOperationEngine::new();
+    let request = signing(1);
+    admit(&mut engine, &mut requester, &request);
+    engine
+        .approve(
+            request.operation_id,
+            UserApproval::for_request(&request, START_MS),
+            START_MS,
+            MAXIMUM_LIFETIME_MS,
+        )
+        .expect("approval");
+    let result = sent(
+        engine
+            .finish_failure(request.operation_id, ProxyFailure::RetryFloor)
+            .expect("refusal"),
+    );
+    assert_eq!(
+        requester.receive(across(&result)).expect("result"),
+        RequesterDispatch::Ended {
+            operation_id: request.operation_id,
+            status: ResultStatus::Rejected,
+            error: ResultError::RetryFloor,
+        }
+    );
+}
+
+#[test]
+fn a_second_request_while_one_is_live_is_busy() {
+    let mut engine = custodian();
+    let mut requester = RequesterOperationEngine::new();
+    admit(&mut engine, &mut requester, &signing(1));
+    let mut other_requester = RequesterOperationEngine::new();
+    let second = signing(2);
+    let wire = other_requester.begin(second.clone()).expect("begin");
+    let refusal = sent(engine.receive(across(&wire)).expect("dispatch"));
+    assert_eq!(
+        other_requester.receive(across(&refusal)).expect("refusal"),
+        RequesterDispatch::Refused {
+            operation_id: second.operation_id,
+            error: ResultError::Busy,
+        }
+    );
+}
+
+#[test]
+fn a_batch_completes_only_with_every_signature_in_order() {
+    let mut engine = custodian();
+    let mut requester = RequesterOperationEngine::new();
+    let request = batch(1, 2);
+    admit(&mut engine, &mut requester, &request);
+    engine
+        .approve(
+            request.operation_id,
+            UserApproval::for_request(&request, START_MS),
+            START_MS,
+            MAXIMUM_LIFETIME_MS,
+        )
+        .expect("approval");
+    let signatures = vec![
+        vec![0xe1; SHA256_DIGEST_SIZE],
+        vec![0xe2; SHA256_DIGEST_SIZE],
+    ];
+    engine
+        .record_batch_signature(request.operation_id, signatures[0].clone())
+        .expect("first document");
+    assert!(engine.complete_batch(request.operation_id).is_err());
+    engine
+        .record_batch_signature(request.operation_id, signatures[1].clone())
+        .expect("second document");
+    assert!(
+        engine
+            .record_batch_signature(request.operation_id, signatures[1].clone())
+            .is_err()
+    );
+    let result = sent(
+        engine
+            .complete_batch(request.operation_id)
+            .expect("complete"),
+    );
+    assert_eq!(
+        requester.receive(across(&result)).expect("result"),
+        RequesterDispatch::Completed {
+            operation_id: request.operation_id,
+            result: CardOperationResult::Signatures(signatures),
+        }
+    );
+}
+
+#[test]
+fn a_batch_names_one_digest_per_document_and_has_no_count_limit() {
+    assert!(
+        OperationRequest::reconstruct(
+            OperationId::from_array([1; 16]),
+            ProfileName::DocumentSigning,
+            START_MS,
+            LIFETIME_MS,
+            CardOperation::BatchSignDocuments {
+                document_names: Vec::new(),
+                key_profile: CardKeyProfile::EcdsaP256,
+                algorithm: SignatureAlgorithm::EcdsaSha256,
+                digests: Vec::new(),
+            },
+        )
+        .is_err()
+    );
+    let many = 100;
+    let request = batch(1, many);
+    let CardOperation::BatchSignDocuments { digests, .. } = &request.operation else {
+        panic!("a batch");
+    };
+    assert_eq!(digests.len(), many);
+}
+
+#[test]
+fn closing_the_session_ends_both_sides_of_the_operation() {
+    let mut engine = custodian();
+    let mut requester = RequesterOperationEngine::new();
+    let request = signing(1);
+    admit(&mut engine, &mut requester, &request);
+    engine
+        .approve(
+            request.operation_id,
+            UserApproval::for_request(&request, START_MS),
+            START_MS,
+            MAXIMUM_LIFETIME_MS,
+        )
+        .expect("approval");
+    assert_eq!(
+        engine.session_closed(),
+        Some(ProxySessionCloseAction::ContinueCardExchange(
+            request.operation_id
+        ))
+    );
+    assert_eq!(requester.session_closed(), Some(request.operation_id));
 }

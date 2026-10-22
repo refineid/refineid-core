@@ -19,10 +19,7 @@
 //! remain inside Rust. Completed private pair material stays inside the opaque
 //! [`RappPairRecord`] until a device-only vault adapter is supplied.
 
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex, MutexGuard},
-};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::{
     BinaryFrame, CpaceAttemptLedger, CpaceKc2Initiator, CpaceKc2Responder,
@@ -31,14 +28,9 @@ use super::{
     PairStore, PairStoreError, PairTombstone, PairingBackoff, PairingConfirmation, PairingError,
     PairingHandshake, PairingOffer, PairingOfferDeadline, PairingSecret, PairingStorage,
     PreAuthenticationRateLimit, ProfileName, RoutingPreamble, STREAM_PROFILE,
-    SessionAuthentication, SessionHandshake, SessionId, TransportProfile, WireValue,
-    encode_kc2_step1_frame, generate_pair_key_material, phase_deadline_ms,
-    standard_pairing_context_v2,
+    SessionAuthentication, SessionHandshake, SessionId, TransportProfile, encode_kc2_step1_frame,
+    generate_pair_key_material, phase_deadline_ms, standard_pairing_context_v2,
 };
-
-/// Milliseconds per second, for retention windows measured in milliseconds
-/// against Unix times given in seconds.
-const MILLISECONDS_PER_SECOND: u64 = 1_000;
 
 /// Endpoint role fixed by the protocol rather than transport direction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
@@ -2667,8 +2659,8 @@ impl RappSessionBridge {
         frame
     }
 
-    /// Verify the peer's exact authenticated session parameters. The first
-    /// attributable violation synchronously revokes device-only pair keys.
+    /// Verify the peer's exact authenticated session parameters. A failure
+    /// closes the session; the pairing stays.
     ///
     /// # Errors
     /// [`RappBindingError`] on the wrong phase, an oversized frame, or an
@@ -2676,22 +2668,15 @@ impl RappSessionBridge {
     pub fn receive_ready(&self, bytes: Vec<u8>, now_ms: u64) -> Result<(), RappBindingError> {
         let frame = BinaryFrame::reconstruct(bytes).map_err(|_| RappBindingError::InvalidInput)?;
         let mut state = self.lock_state()?;
-        let mut pair_store = self
-            .pair_store
-            .lock()
-            .map_err(|_| RappBindingError::LocalStateFailure)?;
         let SessionBridgeState::Authentication(authentication) = &mut *state else {
             return Err(RappBindingError::WrongPhase);
         };
-        if authentication
-            .receive_ready(&mut *pair_store, &frame, now_ms)
-            .is_err()
-        {
+        if authentication.receive_ready(&frame, now_ms).is_err() {
             *state = SessionBridgeState::Failed;
             drop(state);
             return Err(RappBindingError::ProtocolFailure);
         }
-        drop(pair_store);
+        drop(state);
         Ok(())
     }
 
@@ -2794,16 +2779,7 @@ impl RappSessionBridge {
 
     pub(super) fn take_established(
         &self,
-    ) -> Result<
-        (
-            EstablishedEndpoint,
-            BindingPairStore,
-            PairId,
-            SessionId,
-            Vec<ProfileName>,
-        ),
-        RappBindingError,
-    > {
+    ) -> Result<(EstablishedEndpoint, Vec<ProfileName>), RappBindingError> {
         let mut state = self.lock_state()?;
         let previous = core::mem::replace(&mut *state, SessionBridgeState::Closed);
         let endpoint = match previous {
@@ -2814,14 +2790,10 @@ impl RappSessionBridge {
             }
         };
         drop(state);
-
-        let pair_store = self
+        let profiles = self
             .pair_store
             .lock()
             .map_err(|_| RappBindingError::LocalStateFailure)?
-            .clone();
-        let pair_id = pair_store.pair_id;
-        let profiles = pair_store
             .pair
             .record
             .lock()
@@ -2830,12 +2802,7 @@ impl RappSessionBridge {
             .ok_or(RappBindingError::PairNotFound)?
             .profiles()
             .to_vec();
-        let session_id = self
-            .session_id
-            .lock()
-            .map_err(|_| RappBindingError::LocalStateFailure)?
-            .ok_or(RappBindingError::WrongPhase)?;
-        Ok((endpoint, pair_store, pair_id, session_id, profiles))
+        Ok((endpoint, profiles))
     }
 }
 
@@ -3123,43 +3090,6 @@ fn decode_pair_record(bytes: &[u8]) -> Result<PairRecord, RappBindingError> {
     super::decode_pair_record(bytes).map_err(|_| RappBindingError::InvalidInput)
 }
 
-pub(super) fn take_value(
-    map: &mut BTreeMap<String, WireValue>,
-    key: &str,
-) -> Result<WireValue, RappBindingError> {
-    map.remove(key).ok_or(RappBindingError::InvalidInput)
-}
-
-pub(super) fn take_bytes(
-    map: &mut BTreeMap<String, WireValue>,
-    key: &str,
-) -> Result<Vec<u8>, RappBindingError> {
-    match take_value(map, key)? {
-        WireValue::Bytes(value) => Ok(value),
-        _ => Err(RappBindingError::InvalidInput),
-    }
-}
-
-pub(super) fn take_text(
-    map: &mut BTreeMap<String, WireValue>,
-    key: &str,
-) -> Result<String, RappBindingError> {
-    match take_value(map, key)? {
-        WireValue::Text(value) => Ok(value),
-        _ => Err(RappBindingError::InvalidInput),
-    }
-}
-
-pub(super) fn take_unsigned(
-    map: &mut BTreeMap<String, WireValue>,
-    key: &str,
-) -> Result<u64, RappBindingError> {
-    match take_value(map, key)? {
-        WireValue::Unsigned(value) => Ok(value),
-        _ => Err(RappBindingError::InvalidInput),
-    }
-}
-
 /// The BLE segmentation and reassembly receiver for one connection and one
 /// direction (RAPP v26.10.21 §5.3).
 ///
@@ -3287,37 +3217,8 @@ mod routing_binding_tests {
     const GRANTS_BYTE: u8 = 0x66;
     const CREATED_AT_MS: u64 = 1;
     const UNIX_TIME_SECONDS: u64 = 1_791_504_899;
-    const INSTANCE_NAME: &str = "refineid-7f2a1c84";
     const MILLISECONDS_PER_SECOND: u64 = 1_000;
     const REVOKED_AT_MS: u64 = UNIX_TIME_SECONDS * MILLISECONDS_PER_SECOND;
-
-    /// A vault that only records that the pair was revoked.
-    struct RevokingVault {
-        revoked: Mutex<bool>,
-    }
-
-    impl RappPairVault for RevokingVault {
-        fn insert_device_only(&self, _: Vec<u8>, _: Vec<u8>) -> Result<(), RappVaultError> {
-            Err(RappVaultError::Unavailable)
-        }
-
-        fn load_device_only(&self, _: Vec<u8>) -> Result<Option<Vec<u8>>, RappVaultError> {
-            Ok(None)
-        }
-
-        fn replace_device_only(&self, _: Vec<u8>, _: Vec<u8>) -> Result<(), RappVaultError> {
-            Err(RappVaultError::Unavailable)
-        }
-
-        fn revoke_device_only(&self, _: Vec<u8>, _: u64) -> Result<(), RappVaultError> {
-            *self.revoked.lock().expect("lock") = true;
-            Ok(())
-        }
-
-        fn is_revoked(&self, _: Vec<u8>) -> Result<bool, RappVaultError> {
-            Ok(*self.revoked.lock().expect("lock"))
-        }
-    }
 
     fn record(own: u8, peer: u8, pair: u8, role: EndpointRole) -> Arc<RappPairRecord> {
         let own_private = [own; X25519_KEY_SIZE];

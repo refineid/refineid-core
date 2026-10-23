@@ -8,7 +8,7 @@ use refineid_rapp::{
 };
 use serde::Deserialize;
 
-const MODEL: &str = include_str!("../../../docs/protocols/rapp-state-machine-v26.10.22.yaml");
+const MODEL: &str = include_str!("../../../doc/protocols/rapp-state-machine-v26.10.22.yaml");
 
 #[derive(Deserialize)]
 struct Model {

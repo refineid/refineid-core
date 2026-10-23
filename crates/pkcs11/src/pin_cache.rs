@@ -17,7 +17,7 @@
 //! [`PinSafetyCache`] keeps, per slot, the PIN1 the card accepted through
 //! `C_Login`, so that each later signature re-presents it to the card
 //! without asking again. This is the PIN1 exception of the credential
-//! custody contract (`docs/security/credential-custody.md`): the value
+//! custody contract (`doc/security/credential-custody.md`): the value
 //! lives only in this process's memory, from the first card-confirmed
 //! success until an invalidation event, with no idle window or countdown.
 //! It is held only under a pristine retry counter; a login under a counter

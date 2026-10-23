@@ -7,7 +7,7 @@
 use refineid_rapp::ble_sar::{BleSarError, BleSarReassembler, payload_capacity, segment};
 use serde::Deserialize;
 
-const CORPUS: &str = include_str!("../../../docs/protocols/vectors/rapp-ble-sar-v26.10.22.json");
+const CORPUS: &str = include_str!("../../../doc/protocols/vectors/rapp-ble-sar-v26.10.22.json");
 
 #[derive(Deserialize)]
 struct Corpus {

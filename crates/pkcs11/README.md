@@ -23,7 +23,7 @@ Implemented:
   or `C_Logout`, the last `C_CloseSession` or `C_Finalize` ends the login;
   under a counter below pristine it only bridges to the next operation.
   It is presented to the card inside each sign, never logged, and never written to storage
-  (see [credential custody](../../docs/security/credential-custody.md)).
+  (see [credential custody](../../doc/security/credential-custody.md)).
 - Objects: `C_FindObjectsInit` / `C_FindObjects` / `C_FindObjectsFinal` and `C_GetAttributeValue` over three objects
   -- the authentication certificate (`CKO_CERTIFICATE`, `CKC_X_509`),
   its public key (`CKO_PUBLIC_KEY`, from the certificate SPKI, for

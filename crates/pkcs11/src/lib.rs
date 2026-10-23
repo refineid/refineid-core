@@ -34,7 +34,7 @@
 //! session, the phone verifies PIN 1 itself, and `C_Sign` hands the
 //! phone one typed signature request.
 //!
-//! PIN1 custody (`docs/security/credential-custody.md`). PIN1 lives
+//! PIN1 custody (`doc/security/credential-custody.md`). PIN1 lives
 //! only in a zeroizing [`pin::PinBytes`] in this process's memory, is
 //! never logged or rendered, and is presented to the card for every
 //! signature, since the card drops its PIN1 verification after each

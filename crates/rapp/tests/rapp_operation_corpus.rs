@@ -18,7 +18,7 @@ use refineid_rapp::{
 };
 use serde::Deserialize;
 
-const CORPUS: &str = include_str!("../../../docs/protocols/vectors/rapp-operation-v26.10.22.json");
+const CORPUS: &str = include_str!("../../../doc/protocols/vectors/rapp-operation-v26.10.22.json");
 const SESSION_ID: SessionId = SessionId::from_array([0xbb; 16]);
 
 #[derive(Deserialize)]

@@ -235,3 +235,7 @@ before and the correction made the core better.
   a code review from the project's author.
 - Check every finding against the code. Fix the real ones and list the
   rejected ones, with the reason, in the pull request description.
+
+## Working method
+
+Read [docs/process/working-method.md](docs/process/working-method.md) before starting: the roles (front agent, implementation agents), what a brief contains, the feedback loops, and which documentation is kept. The same file is in every RefineID repository.

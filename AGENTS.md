@@ -65,8 +65,9 @@ section again. The design questions in the refinement-types policy's
 ## STPA in design
 
 Every design includes a short System-Theoretic Process Analysis (STPA),
-sized to the change. [stpa-rapp.md](doc/security/stpa-rapp.md) is the worked example and the
-record for RAPP and its applications.
+sized to the change. [doc/stpa.md](doc/stpa.md) explains the method and
+its literature; [stpa-rapp.md](doc/security/stpa-rapp.md) is the worked
+example and the record for RAPP and its applications.
 
 - Ground the analysis in the losses (L-n) and hazards (H-n) the record
   already names. Add a loss only when a real stakeholder could suffer it

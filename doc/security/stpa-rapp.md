@@ -11,6 +11,8 @@ applications built on them
 ## 1. Purpose and method
 
 This document applies System-Theoretic Process Analysis (STPA) to RAPP.
+[../stpa.md](../stpa.md) explains the method, how this project uses it,
+and its literature.
 STPA rests on the STAMP accident model: losses are not caused only by
 component failures but by inadequate control, and control is inadequate
 when a controller's model of the process it controls is wrong. A

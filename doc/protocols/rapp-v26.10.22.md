@@ -34,7 +34,7 @@ This document defines the complete, standalone normative specification for the *
 - The **Authenticated Message Envelope**, sequential sequencing, and session multiplexing.
 - The **operation model** (§8): one operation at a time on the card, queued across sessions, forgotten with its session.
 - The **Registered Credential Profiles and Actions** for card status inspection, browser authentication, and qualified document signing.
-- **Service Withdrawal** (§4.5): the Custodian's notice, keyed by each pairing's static agreement, that it has stopped serving, on discovery and on open sessions.
+- **Service Withdrawal** (§4.5): the Custodian's notice, keyed by each pairing's static agreement, that it has stopped serving, on discovery and on open sessions, and the Requester's notice, on open sessions, that it has stopped using remote access.
 - **Pairing Storage Confirmation and Revocation** (§4.3, §4.6): each endpoint confirms its stored trust record before the pairing is active, and an endpoint that forgets a pairing tells the other with a `pairing_revoked` close, in session or as the first message of the next session.
 - **Card Presence** (§8.4): the Custodian's in-session notice of the card it holds and of whether a card reader is attached to it; a Requester's offer to local consumers follows the card, eventually consistent.
 - **Concurrent Multi-Client Serving** (§8): the Custodian serves every paired Requester over its own session; card operations are serialized on the single card.
@@ -374,7 +374,7 @@ A transparent radio frequency (RF) relay that forwards packets between distant r
 
 ### 4.5 Service Withdrawal
 
-A Custodian **withdraws** when it deliberately stops serving every stored pairing. Exactly two causes are withdrawal: the user turns remote access off, and the user quits the application. Suspension or termination by the operating system, loss of the network, and a session restart with reason `"normal"` or `"shutdown"` (§7.2) are not withdrawal. Withdrawal changes no stored pairing; serving resumes with the next `mode=session` advertisement.
+An endpoint **withdraws** when it deliberately stops serving, or stops using, remote access for every stored pairing. A Custodian withdraws when its user turns remote access off or quits the application. A Requester withdraws when its user turns remote use off, when a card inserted into a reader attached to the computer turns remote use off (hierarchy specification §5.2), or when its user quits the application. Nothing else is withdrawal: suspension or termination by the operating system, sleep, loss of the network, and a session restart with reason `"normal"` or `"shutdown"` (§7.2) are not. Withdrawal changes no stored pairing; a Custodian serves again with its next `mode=session` advertisement, and a Requester dials again once its user turns remote use on. Items 1 to 7 are the Custodian's withdrawal and how a Requester receives it; items 8 and 9 are the Requester's withdrawal and how a Custodian receives it.
 
 1. **Withdrawal Key**:
    Each stored pairing has a withdrawal key that both endpoints derive from their static keys, the static agreement $S$ serving as the IKM, and that never crosses the wire:
@@ -417,6 +417,18 @@ A Custodian **withdraws** when it deliberately stops serving every stored pairin
 
 7. **Authenticity and Replay**:
    Only the two endpoints of a pairing know its static agreement, so no other party can compute a withdrawal hint; observing sessions, routing preambles or discovery records does not help. A party on the local link that recorded a genuine withdrawn record can republish it under the same instance name for at most about three minutes (the counter window), and only while the Requester still associates that instance with the pairing; instance names are fresh on every advertisement start (hierarchy specification §4.2). The effect is the same as a spoofed multicast DNS (mDNS) goodbye without the Requester's hold: presence is withdrawn until the Custodian is next discovered. These bounds assume the Requester's clock is not under the attacker's control; an attacker who can move the Requester's time, for example through an unauthenticated Network Time Protocol (NTP) source, can stretch the replay window for as long as it controls that clock, with the same effect and no other. Random fillers keep the record the same size whatever the number of stored pairings, and the hints are unlinkable across instances and minutes.
+
+8. **Requester Withdrawal**:
+   On withdrawal the Requester, in this order:
+   1. sends `session.close` with reason `"service_withdrawn"` (§7.1) on every open operational session, one whose `session.ready` it verified, and closes its link; a connection whose session is not yet open it closes without a notice;
+   2. stops dialing and browsing for every pairing until its user turns remote use on again; hierarchy specification §5.2 lists what else a workstation stops.
+
+   It keeps every stored pairing. A Requester publishes no discovery record and no BLE advertisement, so it announces nothing else. Withdrawal ends every session, and with it every operation, as §8.1 item 3 says.
+
+   Quitting is best effort: a Requester that quits sends its closes before it exits and waits at most 1 second for them to leave, written to the stream connection or, on BLE, acknowledged by each write's response. A close that has not left by then is dropped, and the Custodian sees that session as lost.
+
+9. **Custodian Behavior**:
+   An authenticated `session.close` with reason `"service_withdrawn"` from a Requester is that Requester's **withdrawal**; any other close reason, or loss of the session, is not. Both endpoints send this reason, and receiving it is never a protocol violation; only the paired Requester can send it, inside the session's authenticated channel. The Custodian closes that session without a close of its own, keeps the pairing, changes no stored pairing state, and records that the computer withdrew. Its user interface may show that computer as off, not merely disconnected, until the next session from that pairing, and shows no error. It goes on serving every pairing, that one included, and accepts the Requester's next dial as any other.
 
 ### 4.6 Pairing Revocation
 
@@ -743,7 +755,7 @@ close-reason-val =
   / "pairing_revoked"
   / "shutdown"
   / "card_unavailable"   ; the Custodian can no longer serve the card
-  / "service_withdrawn"  ; the Custodian stopped serving every pairing (§4.5)
+  / "service_withdrawn"  ; the sender withdrew: a Custodian stopped serving, or a Requester stopped using, every pairing (§4.5)
 
 ; 7. Liveness Challenge
 liveness-ping-body = {
@@ -843,7 +855,7 @@ An operation is one credential action, an authentication signature, a document s
 
 ### 8.3 Session Lifetime
 
-A session lives as long as both endpoints are in sight. An endpoint that has heard nothing from its peer for 5 seconds sends `liveness.ping`; the peer answers `liveness.pong` at once. Thirty seconds without any message from the peer, or a transport close, ends the session (§10.1 item 2). A Requester keeps a session open to every paired Custodian whose discovery hint is in sight (hierarchy specification §4.3), dialing when the hint appears and again, after a close, when it is next seen, so that an operation can start at once and the Custodian's state reaches the Requester as it changes. A Custodian holds as many sessions as Requesters dial (§2.2.2).
+A session lives as long as both endpoints are in sight. An endpoint that has heard nothing from its peer for 5 seconds sends `liveness.ping`; the peer answers `liveness.pong` at once. Thirty seconds without any message from the peer, or a transport close, ends the session (§10.1 item 2). While it has not withdrawn (§4.5), a Requester keeps a session open to every paired Custodian whose discovery hint is in sight (hierarchy specification §4.3), dialing when the hint appears and again, after a close, when it is next seen, so that an operation can start at once and the Custodian's state reaches the Requester as it changes. A Custodian holds as many sessions as Requesters dial (§2.2.2).
 
 ### 8.4 Card Presence and Identity Offering
 
@@ -854,7 +866,7 @@ A Requester that offers the Custodian's credentials to local consumers (a browse
 2. **Which Card**:
    While `card_present` is true, `certificate_fingerprint` carries the SHA-256 digest of the Distinguished Encoding Rules (DER) encoding of the card's authentication certificate; while it is false the field is 32 zero bytes. A Requester compares a present card's fingerprint with the fingerprint of the certificates it holds for the pairing and, on any difference or when it holds none, reads the certificates afresh (§9) before offering anything; a report of absence is not a different card; it offers only an identity whose fingerprint the Custodian confirmed on a session.
 3. **Offering Rule**:
-   A Requester offers a pairing's credentials to local consumers on a certificate whose fingerprint the Custodian confirmed on a session, and keeps offering it between sessions: when a request arrives with no session open, the Requester dials the Custodian and holds the request until a session opens or the consumer's own deadline passes. It withdraws the offer when, for 120 seconds, no session to the Custodian has been open or the Custodian has reported absence, with no `card.status` reporting the card present in that time; at once when the pairing is forgotten or revoked (§4.6); and at once when a session reports a different card present (item 2). It offers again as soon as a session confirms the card. Discovery records (hierarchy specification §4.3) tell a Requester whom to dial; they never justify an offer.
+   A Requester offers a pairing's credentials to local consumers on a certificate whose fingerprint the Custodian confirmed on a session, and keeps offering it between sessions: when a request arrives with no session open, the Requester dials the Custodian and holds the request until a session opens or the consumer's own deadline passes. It withdraws the offer when, for 120 seconds, no session to the Custodian has been open or the Custodian has reported absence, with no `card.status` reporting the card present in that time; at once when the pairing is forgotten or revoked (§4.6); at once when the Requester itself withdraws (§4.5 item 8); and at once when a session reports a different card present (item 2). It offers again as soon as a session confirms the card. Discovery records (hierarchy specification §4.3) tell a Requester whom to dial; they never justify an offer.
 4. **Privacy**:
    `card.status` travels only inside the AEAD-encrypted session. No discovery record, advertisement, or plaintext frame reflects the card's presence or the Custodian's card reader.
 5. **Ending the Session**:

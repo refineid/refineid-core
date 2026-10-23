@@ -30,6 +30,7 @@ constants:
   session_silence_limit_ms: 30000
   revocation_notice_days: 30
   identity_offer_grace_ms: 120000
+  quit_withdrawal_bound_ms: 1000
 
 guards:
   user_initiated: "an explicit local user action started this event"
@@ -81,6 +82,7 @@ actions:
   show_paired_disconnected: "show that the paired peer is not connected"
   show_forgotten: "show that this endpoint forgot the peer"
   show_peer_forgot: "show that the peer forgot this endpoint"
+  show_peer_withdrawn: "show the paired computer as off, not merely disconnected, until the pairing's next session"
   clear_residual_pair_record: "erase the revoked record"
   open_transport: "connect to the custodian's advertised endpoint or peripheral"
   send_session_preamble: "send the session routing preamble with a fresh routing tag"
@@ -263,6 +265,11 @@ pairing:
       to: paired_disconnected
       actions: [show_paired_disconnected]
     - from: paired_connected
+      event: peer_withdrawal_notice        # produced in place of session_closed by a session the requester closed with reason service_withdrawn
+      role: custodian
+      to: paired_disconnected
+      actions: [show_peer_withdrawn]
+    - from: paired_connected
       event: forget_pairing
       role: both
       guard: local_user_action
@@ -306,7 +313,7 @@ session:
     - closing
     - closed
   notes:
-    - "entering healthy produces session_healthy; entering closed after healthy was reached produces session_closed"
+    - "entering healthy produces session_healthy; entering closed after healthy was reached produces session_closed, or peer_withdrawal_notice on a custodian whose session the requester closed with reason service_withdrawn"
     - "handshake_complete_while_revoking produces revocation_notice_sent; a received close with reason pairing_revoked produces peer_revocation_notice"
     - "entering closing produces session_closed for the session's operation"
     - "closed is terminal for the instance"
@@ -395,10 +402,15 @@ session:
       to: closing
       actions: [send_close_normal, show_disconnecting]
     - from: healthy
-      event: service_withdrawn
-      role: custodian
+      event: service_withdrawn             # the endpoint withdraws: remote access or remote use off, or the application quits
+      role: both
       to: closing
       actions: [send_close_service_withdrawn, show_disconnecting]
+    - from: [connecting, authenticating]
+      event: service_withdrawn             # a requester's connection whose session is not yet open closes without a notice
+      role: requester
+      to: closed
+      actions: [destroy_session_material, close_candidate, show_connection_stopped]
     - from: healthy
       event: card_unavailable
       role: custodian
@@ -653,3 +665,5 @@ invariants:
     statement: session_keys_and_credential_buffers_destroyed_on_close
   - id: INV-13
     statement: nothing_of_an_operation_outlives_its_session
+  - id: INV-14
+    statement: no_withdrawal_changes_a_stored_pairing

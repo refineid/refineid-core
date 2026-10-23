@@ -40,6 +40,9 @@ pub const MINIMUM_REMAINING_ATTEMPTS: u8 = 3;
 /// session open or the card reported absent (RAPP v26.10.22 section 8.4
 /// item 3).
 pub const IDENTITY_OFFER_GRACE_MS: u64 = 120_000;
+/// How long a requester that quits waits for its `service_withdrawn` closes
+/// to leave before it exits (RAPP v26.10.22 section 4.5 item 8).
+pub const QUIT_WITHDRAWAL_BOUND_MS: u64 = 1_000;
 
 /// Byte length of an offer identifier.
 pub const OFFER_ID_SIZE: usize = 32;
@@ -281,6 +284,7 @@ pub enum CloseReason {
     Shutdown,
     /// The custodian can no longer serve the card.
     CardUnavailable,
-    /// The custodian deliberately stopped serving every pairing.
+    /// The sender withdrew: a custodian stopped serving, or a requester
+    /// stopped using, every pairing (section 4.5).
     ServiceWithdrawn,
 }

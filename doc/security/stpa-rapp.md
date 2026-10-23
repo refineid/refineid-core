@@ -1629,3 +1629,49 @@ state.
 | CC-94 | Turning remote use off closes every session at once, withdraws every identity offered from a phone at once, halts discovery and scanning, and keeps the pairings; while it is off nothing dials or offers. | UCA-91 |
 | CC-95 | The switch shows the requester's live state: connected only while a session is open, waiting while on with none, and blocked, with its cause named in the control's help and accessibility value, while the computer's Bluetooth is off or a permission was denied. No state is shown by colour alone. | UCA-92 |
 | CC-96 | The workstation requests local-network and Bluetooth permission only when the holder turns remote use on, never at launch. | UCA-93 |
+
+## 28. Telling the phone the computer is off
+
+### 28.1 Scope
+
+Remote use on a workstation is off at every launch. A card inserted into
+the computer's own reader turns it off, and removing the card leaves it
+off; only the holder turns it on. Turning remote use off, and quitting
+the application, tell the phone, like logging off: the requester closes
+every open session with `service_withdrawn` and keeps its pairings
+(specification §4.5 item 8), and the phone records that the computer is
+off until the pairing's next session (item 9). Before, the requester
+went silent, and the phone could not tell a computer turned off from one
+that had left or failed. Losses and hazards are this record's: L-3, L-4;
+H-5, H-6.
+
+### 28.2 Control structure change
+
+New control action: the requester's withdrawal, a `session.close` with
+reason `service_withdrawn` on every open session, when the holder turns
+remote use off, a local card turns it off, or the holder quits. New
+feedback at the custodian: the computer is off, distinct from a lost
+session or any other close, shown until the pairing's next session.
+Inserting a local card becomes a control action on the switch, the same
+as the holder's click; removing it is no longer one.
+
+### 28.3 Unsafe control actions
+
+| ID | Controller | Control action | Type | Context | Hazard |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| UCA-94 | Requester | Resume remote use: browse, dial, or offer the phone's identity | P | When the local card leaves, or at launch with the switch on from an earlier run, without the holder deciding: the computer goes back to the phone and offers an identity the holder did not ask for. | H-5, H-6 |
+| UCA-95 | Requester | Stop using remote access without telling the custodian | P | When the holder turns remote use off, a local card does, or the holder quits: the custodian and its user still treat the computer as available and cannot tell a computer that is off from one that left or failed, and a PIN prompt for the computer's operation stays up until the session's silence limit ends it. | H-5 |
+
+### 28.4 Controller constraints
+
+| ID | Constraint | Closes |
+| :--- | :--- | :--- |
+| CC-97 | A card inserted into a reader attached to the computer turns remote use off, as the holder's click does, with the withdrawal of CC-98; removing the card leaves remote use off, and only the holder turns it on again. CC-86 stands. This supersedes CC-87's resume of discovery and dialing when the local card leaves. Hierarchy specification §5.2. | UCA-94 |
+| CC-98 | A requester that withdraws, because the holder turned remote use off, a local card did, or the holder quit, sends `session.close` with reason `service_withdrawn` on every open session before it closes the link, keeps every pairing, and dials nothing until the holder turns remote use on. Quitting waits at most 1 second for the closes to leave. Suspension, sleep and loss of the network are not withdrawal and send nothing. The custodian takes the close as the computer's withdrawal and never as a protocol violation: it closes that session, which ends its operation and takes down its prompt, keeps the pairing, and may show the computer as off, not merely disconnected, until the pairing's next session. This extends CC-94: its closes carry `service_withdrawn`. Specification §4.5 items 8 and 9. | UCA-95 |
+| CC-99 | Remote use is off at every launch, a start at login (CC-79) included; only the holder turns it on. This amends section 27's switch, which hierarchy specification §5.2 kept across restarts; CC-94 to CC-96 stand. | UCA-94 |
+
+Residual, accepted: a requester that crashes, is ended by the operating
+system, or cannot get its close out within the bound leaves the phone
+with a lost session, shown as disconnected rather than off; so does a
+withdrawal while a dial is still being set up, which closes without a
+notice. Section 25's residual for a Mac app that is not running stands.

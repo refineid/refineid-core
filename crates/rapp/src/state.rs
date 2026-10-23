@@ -173,6 +173,9 @@ pub enum PairingEvent {
     NoticeWindowExpired,
     /// A session.close with reason pairing_revoked arrived.
     PeerRevocationNotice,
+    /// The requester closed the session with reason service_withdrawn: the
+    /// computer withdrew (section 4.5 item 9).
+    PeerWithdrawalNotice,
 }
 
 /// Session-machine input.
@@ -205,7 +208,8 @@ pub enum SessionEvent {
     UserDisconnect,
     /// The endpoint closes the session in order.
     LocalCloseRequested,
-    /// The custodian withdraws from serving.
+    /// The endpoint withdraws: its user turned remote access or remote use
+    /// off, or quit the application (section 4.5).
     ServiceWithdrawn,
     /// The custodian can no longer serve any card.
     CardUnavailable,
@@ -352,6 +356,9 @@ pub enum Action {
     ShowForgotten,
     /// Show that the peer forgot this endpoint.
     ShowPeerForgot,
+    /// Show the paired computer as off, not merely disconnected, until the
+    /// pairing's next session.
+    ShowPeerWithdrawn,
     /// Erase the revoked record.
     ClearResidualPairRecord,
     /// Connect to the custodian's advertised endpoint or peripheral.
@@ -693,6 +700,13 @@ impl PairingState {
                 state: Self::PairedDisconnected,
                 actions: &[A::ShowPairedDisconnected],
             },
+            (Self::PairedConnected, E::PeerWithdrawalNotice) => {
+                require_role(role, EndpointRole::Proxy)?;
+                Transition {
+                    state: Self::PairedDisconnected,
+                    actions: &[A::ShowPeerWithdrawn],
+                }
+            }
             (Self::PairedConnected, E::ForgetPairing) => {
                 require(guards.local_user_action)?;
                 Transition {
@@ -885,11 +899,19 @@ impl SessionState {
                 state: Self::Closing,
                 actions: &[A::SendCloseNormal, A::ShowDisconnecting],
             },
-            (Self::Healthy, E::ServiceWithdrawn) => {
-                require_role(role, EndpointRole::Proxy)?;
+            (Self::Healthy, E::ServiceWithdrawn) => Transition {
+                state: Self::Closing,
+                actions: &[A::SendCloseServiceWithdrawn, A::ShowDisconnecting],
+            },
+            (Self::Connecting | Self::Authenticating, E::ServiceWithdrawn) => {
+                require_role(role, EndpointRole::Requester)?;
                 Transition {
-                    state: Self::Closing,
-                    actions: &[A::SendCloseServiceWithdrawn, A::ShowDisconnecting],
+                    state: Self::Closed,
+                    actions: &[
+                        A::DestroySessionMaterial,
+                        A::CloseCandidate,
+                        A::ShowConnectionStopped,
+                    ],
                 }
             }
             (Self::Healthy, E::CardUnavailable) => {

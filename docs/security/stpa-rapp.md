@@ -1591,3 +1591,39 @@ off or the last session closing ends it. VERIFY with the held PIN still
 runs before every signature, since the card keeps no PIN state between
 them. A card swapped in fails the secure channel, so the next exchange
 goes unanswered and the field ends.
+
+## 27. The workstation's remote-use switch
+
+### 27.1 Scope
+
+A workstation gains one switch for remote use, off by default (hierarchy
+specification §5.2). While it is off the workstation is a local card
+reader only and asks the operating system for no network or Bluetooth
+permission; turning it on asks for them in context. On the Mac the switch
+sits in the window's toolbar and its icon is the state: off, on and
+waiting, on with the phone connected, and on but blocked (the computer's
+Bluetooth off or a permission denied). Losses and hazards are this
+record's: L-3, L-4; H-3, H-5, H-6.
+
+### 27.2 Control structure change
+
+New control action: the holder turns remote use on or off. New feedback:
+the switch's icon and its accessibility value, derived from the
+requester's session state and from the platform's radio and permission
+state.
+
+### 27.3 Unsafe control actions
+
+| ID | Controller | Control action | Type | Context | Hazard |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| UCA-91 | Requester | Browse, scan, dial or offer a phone's identity | P | While the holder has turned remote use off: the computer keeps talking to the phone and offers an identity the holder believes switched off. | H-3, H-5, H-6 |
+| UCA-92 | Requester | Show the switch as connected | P | When no session is open, or show it as waiting when the computer's Bluetooth is off or a permission was denied, so the holder cannot tell a phone that is coming from one that cannot. | H-5 |
+| UCA-93 | Requester | Request local-network or Bluetooth permission | P | At launch while remote use is off, so the holder is asked for something the app does not use. | H-5 |
+
+### 27.4 Controller constraints
+
+| ID | Constraint | Closes |
+| :--- | :--- | :--- |
+| CC-94 | Turning remote use off closes every session at once, withdraws every identity offered from a phone at once, halts discovery and scanning, and keeps the pairings; while it is off nothing dials or offers. | UCA-91 |
+| CC-95 | The switch shows the requester's live state: connected only while a session is open, waiting while on with none, and blocked, with its cause named in the control's help and accessibility value, while the computer's Bluetooth is off or a permission was denied. No state is shown by colour alone. | UCA-92 |
+| CC-96 | The workstation requests local-network and Bluetooth permission only when the holder turns remote use on, never at launch. | UCA-93 |

@@ -1,0 +1,5 @@
+error[E0599]: no method named `idle_expired` found for reference `&refineid_rapp::PairRecord` in the current scope
+ --> tests/ui/no_idle_check_without_the_session_fact.rs:4:76
+  |
+4 |     let expire_unless_recorded = |record: &PairRecord, now_ms: u64| record.idle_expired(now_ms);
+  |                                                                            ^^^^^^^^^^^^ method not found in `&refineid_rapp::PairRecord`

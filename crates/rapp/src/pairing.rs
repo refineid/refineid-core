@@ -51,6 +51,23 @@ pub const REVOCATION_NOTICE_MS: u64 = REVOCATION_NOTICE_DAYS * MILLISECONDS_PER_
 /// How long a pairing lives without an established session.
 pub const PAIRING_IDLE_EXPIRY_MS: u64 = PAIRING_IDLE_EXPIRY_DAYS * MILLISECONDS_PER_DAY;
 
+/// What an idle-expiry sweep did with one pairing (RAPP v26.10.22 section
+/// 4.6 item 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepOutcome {
+    /// A session to the pairing is established: the sweep recorded its time
+    /// and the pairing stays.
+    Recorded,
+    /// Nothing changed: no session is established and the pairing is short
+    /// of the idle limit, or the record is not active.
+    Kept,
+    /// The pairing had no established session for
+    /// [`PAIRING_IDLE_EXPIRY_DAYS`]: the record is forgotten at the sweep's
+    /// time and keeps its key only for the close (section 4.6 items 2 to
+    /// 4). Nothing is sent and no user is told.
+    Expired,
+}
+
 impl PairRecord {
     /// Constructs a validated pairing record whose storage the peer has
     /// confirmed. The pairing flow builds its record unconfirmed and
@@ -201,29 +218,53 @@ impl PairRecord {
     }
 
     /// The record whose pairing had an established session at `at_ms`,
-    /// milliseconds since the Unix epoch. The endpoint records this at least
-    /// when a session is established and when it ends; the idle time of
-    /// section 4.6 item 5 runs from the latest time recorded.
+    /// milliseconds since the Unix epoch. The recorded time only moves
+    /// forward: a time before the one already recorded, as a clock set back
+    /// reads, leaves it as it is. The idle time of section 4.6 item 5 runs
+    /// from the latest time recorded.
     #[must_use]
     pub const fn with_session_at(mut self, at_ms: u64) -> Self {
-        self.last_session_at_ms = Some(at_ms);
+        self.last_session_at_ms = match self.last_session_at_ms {
+            Some(recorded_ms) if recorded_ms >= at_ms => Some(recorded_ms),
+            _ => Some(at_ms),
+        };
         self
     }
 
-    /// Whether the pairing has gone [`PAIRING_IDLE_EXPIRY_MS`] of wall-clock
-    /// time since its last recorded session, or since its creation while it
-    /// has had none, so that the endpoint revokes it (section 4.6 item 5).
-    /// A forgotten record is revoked already and never expires. A pairing
-    /// with a session established now never expires either, so the endpoint
-    /// asks this only of one without.
+    /// One pairing's idle-expiry check at `now_ms`, milliseconds since the
+    /// Unix epoch (section 4.6 item 5). `session_established` says whether
+    /// a session to the pairing is established now. With one, the sweep
+    /// records `now_ms` and keeps the pairing, whatever time was recorded
+    /// before, so no order of calls expires a pairing in session. Without
+    /// one, the pairing expires once [`PAIRING_IDLE_EXPIRY_MS`] have passed
+    /// since its latest recorded session, or since its creation while it
+    /// has had none. A record that is not active, one the peer never
+    /// confirmed or one already forgotten, is kept as it is: section 4.3
+    /// item 4 and section 4.6 item 3 govern it.
+    ///
+    /// The endpoint sweeps every pairing when it starts and at least once a
+    /// day, and sweeps a pairing with `session_established` true when a
+    /// session to it is established and when that session ends.
     #[must_use]
-    pub const fn idle_expired(&self, now_ms: u64) -> bool {
-        if self.forgotten_at_ms.is_some() {
-            return false;
+    pub const fn sweep(self, now_ms: u64, session_established: bool) -> (Self, SweepOutcome) {
+        if !self.storage_confirmed || self.forgotten_at_ms.is_some() {
+            return (self, SweepOutcome::Kept);
         }
+        if session_established {
+            return (self.with_session_at(now_ms), SweepOutcome::Recorded);
+        }
+        if self.idle_limit_reached(now_ms) {
+            return (self.forgotten(now_ms), SweepOutcome::Expired);
+        }
+        (self, SweepOutcome::Kept)
+    }
+
+    /// Whether [`PAIRING_IDLE_EXPIRY_MS`] have passed at `now_ms` since the
+    /// later of the pairing's creation and its latest recorded session.
+    const fn idle_limit_reached(&self, now_ms: u64) -> bool {
         let since_ms = match self.last_session_at_ms {
-            Some(at_ms) => at_ms,
-            None => self.created_at_ms,
+            Some(at_ms) if at_ms > self.created_at_ms => at_ms,
+            _ => self.created_at_ms,
         };
         now_ms.saturating_sub(since_ms) >= PAIRING_IDLE_EXPIRY_MS
     }
@@ -578,8 +619,9 @@ fn take_text_array(
 #[cfg(test)]
 mod tests {
     use super::{
-        EndpointRole, GrantsHash, PAIRING_IDLE_EXPIRY_MS, PairId, PairRecord, ProfileName,
-        REVOCATION_NOTICE_MS, decode_pair_record, decode_pair_records, encode_pair_record,
+        EndpointRole, GrantsHash, MILLISECONDS_PER_DAY, PAIRING_IDLE_EXPIRY_DAYS,
+        PAIRING_IDLE_EXPIRY_MS, PairId, PairRecord, ProfileName, REVOCATION_NOTICE_MS,
+        SweepOutcome, decode_pair_record, decode_pair_records, encode_pair_record,
         encode_pair_records,
     };
 
@@ -587,32 +629,105 @@ mod tests {
     const FORGOTTEN_AT_MS: u64 = 1_800_000_000_000;
     const SESSION_AT_MS: u64 = 1_750_000_000_000;
 
+    fn swept(record: PairRecord, now_ms: u64, session_established: bool) -> SweepOutcome {
+        record.sweep(now_ms, session_established).1
+    }
+
     #[test]
     fn a_pairing_without_sessions_expires_from_its_creation() {
-        let record = test_record(0x42);
-        assert_eq!(record.last_session_at_ms(), None);
-        assert!(!record.idle_expired(CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS - 1));
-        assert!(record.idle_expired(CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS));
+        assert_eq!(test_record(0x42).last_session_at_ms(), None);
+        assert_eq!(
+            swept(
+                test_record(0x42),
+                CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS - 1,
+                false
+            ),
+            SweepOutcome::Kept
+        );
+        let (expired, outcome) =
+            test_record(0x42).sweep(CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS, false);
+        assert_eq!(outcome, SweepOutcome::Expired);
+        assert_eq!(
+            expired.forgotten_at_ms(),
+            Some(CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS)
+        );
+        assert!(expired.serving_profiles().is_empty());
     }
 
     #[test]
     fn a_recorded_session_renews_the_idle_time() {
-        let record = test_record(0x42).with_session_at(SESSION_AT_MS);
-        assert!(!record.idle_expired(CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS));
-        assert!(!record.idle_expired(SESSION_AT_MS + PAIRING_IDLE_EXPIRY_MS - 1));
-        assert!(record.idle_expired(SESSION_AT_MS + PAIRING_IDLE_EXPIRY_MS));
+        let record = || test_record(0x42).with_session_at(SESSION_AT_MS);
+        assert_eq!(
+            swept(record(), CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS, false),
+            SweepOutcome::Kept
+        );
+        assert_eq!(
+            swept(record(), SESSION_AT_MS + PAIRING_IDLE_EXPIRY_MS - 1, false),
+            SweepOutcome::Kept
+        );
+        assert_eq!(
+            swept(record(), SESSION_AT_MS + PAIRING_IDLE_EXPIRY_MS, false),
+            SweepOutcome::Expired
+        );
+    }
+
+    #[test]
+    fn the_recorded_session_time_never_moves_back() {
+        let record = test_record(0x42)
+            .with_session_at(SESSION_AT_MS)
+            .with_session_at(SESSION_AT_MS - MILLISECONDS_PER_DAY);
+        assert_eq!(record.last_session_at_ms(), Some(SESSION_AT_MS));
+        let (record, outcome) = record.sweep(CREATED_AT_MS, true);
+        assert_eq!(outcome, SweepOutcome::Recorded);
+        assert_eq!(record.last_session_at_ms(), Some(SESSION_AT_MS));
     }
 
     #[test]
     fn a_clock_behind_the_last_session_expires_nothing() {
         let record = test_record(0x42).with_session_at(SESSION_AT_MS);
-        assert!(!record.idle_expired(CREATED_AT_MS));
+        assert_eq!(swept(record, CREATED_AT_MS, false), SweepOutcome::Kept);
     }
 
     #[test]
-    fn a_forgotten_record_never_expires_again() {
-        let forgotten = test_record(0x42).forgotten(FORGOTTEN_AT_MS);
-        assert!(!forgotten.idle_expired(u64::MAX));
+    fn a_session_held_open_past_the_idle_limit_never_expires() {
+        let mut record = test_record(0x42);
+        let mut now_ms = CREATED_AT_MS;
+        for _ in 0..PAIRING_IDLE_EXPIRY_DAYS * 2 {
+            now_ms += MILLISECONDS_PER_DAY;
+            let (next, outcome) = record.sweep(now_ms, true);
+            assert_eq!(outcome, SweepOutcome::Recorded);
+            record = next;
+        }
+        assert_eq!(record.last_session_at_ms(), Some(now_ms));
+        let (record, outcome) = record.sweep(now_ms + PAIRING_IDLE_EXPIRY_MS - 1, false);
+        assert_eq!(outcome, SweepOutcome::Kept);
+        assert_eq!(
+            swept(record, now_ms + PAIRING_IDLE_EXPIRY_MS, false),
+            SweepOutcome::Expired
+        );
+    }
+
+    #[test]
+    fn a_long_idle_pairing_with_a_session_established_is_recorded_not_expired() {
+        let now_ms = CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS * 2;
+        let (record, outcome) = test_record(0x42).sweep(now_ms, true);
+        assert_eq!(outcome, SweepOutcome::Recorded);
+        assert_eq!(record.forgotten_at_ms(), None);
+        assert_eq!(record.last_session_at_ms(), Some(now_ms));
+    }
+
+    #[test]
+    fn a_record_that_is_not_active_is_kept_as_it_is() {
+        let (forgotten, outcome) = test_record(0x42)
+            .forgotten(FORGOTTEN_AT_MS)
+            .sweep(u64::MAX, false);
+        assert_eq!(outcome, SweepOutcome::Kept);
+        assert_eq!(forgotten.forgotten_at_ms(), Some(FORGOTTEN_AT_MS));
+        let (unconfirmed, outcome) = test_record(0x42)
+            .awaiting_storage_confirmation()
+            .sweep(SESSION_AT_MS, true);
+        assert_eq!(outcome, SweepOutcome::Kept);
+        assert_eq!(unconfirmed.last_session_at_ms(), None);
     }
 
     #[test]

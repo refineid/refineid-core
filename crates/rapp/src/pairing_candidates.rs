@@ -81,15 +81,18 @@ pub enum NextCandidate {
 
 impl NextCandidate {
     /// The pairing-machine event of this outcome on the requester, with the
-    /// guards it carries. [`Self::NoneTried`] is
+    /// guards it carries. `remote_use_available` says whether the
+    /// requester's remote use is on and no card is in a reader attached to
+    /// it; without it no further custodian is tried (hierarchy specification
+    /// section 5.2). [`Self::NoneTried`] is
     /// [`PairingEvent::NoCustodianTried`] once the requester's search ends.
     #[must_use]
-    pub fn pairing_event(self) -> (PairingEvent, Guards) {
+    pub fn pairing_event(self, remote_use_available: bool) -> (PairingEvent, Guards) {
         match self {
             Self::Try => (
                 PairingEvent::AttemptFailed,
                 Guards {
-                    untried_pairing_candidate: true,
+                    untried_pairing_candidate: remote_use_available,
                     ..Guards::default()
                 },
             ),
@@ -413,7 +416,7 @@ mod tests {
     #[test]
     fn the_outcomes_drive_the_requester_pairing_machine() {
         let requester = EndpointRole::Requester;
-        let (event, guards) = NextCandidate::Try.pairing_event();
+        let (event, guards) = NextCandidate::Try.pairing_event(true);
         let next = PairingState::Exchanging
             .transition(requester, event, guards)
             .expect("an untried candidate is tried");
@@ -421,7 +424,7 @@ mod tests {
         assert!(next.actions.contains(&Action::TryNextCandidate));
         assert!(!next.actions.contains(&Action::ShowWrongCode));
 
-        let (event, guards) = NextCandidate::NotAccepted.pairing_event();
+        let (event, guards) = NextCandidate::NotAccepted.pairing_event(true);
         assert_eq!(event, PairingEvent::LastCandidateFailed);
         let last = PairingState::Exchanging
             .transition(requester, event, guards)
@@ -429,18 +432,29 @@ mod tests {
         assert_eq!(last.state, PairingState::Unpaired);
         assert!(last.actions.contains(&Action::ShowWrongCode));
 
-        let (event, guards) = NextCandidate::NoneTried.pairing_event();
+        let (event, guards) = NextCandidate::NoneTried.pairing_event(true);
         let none = PairingState::Exchanging
             .transition(requester, event, guards)
             .expect("a search that tried nobody ends");
         assert!(none.actions.contains(&Action::ShowNoneInPairingMode));
         assert!(!none.actions.contains(&Action::ShowWrongCode));
 
-        let (_, guards) = NextCandidate::NotAccepted.pairing_event();
+        let (_, guards) = NextCandidate::NotAccepted.pairing_event(true);
         assert_eq!(
             PairingState::Exchanging.transition(requester, PairingEvent::AttemptFailed, guards),
             Err(TransitionError::GuardFailed),
             "a refusal with nobody left to try never stays exchanging"
+        );
+    }
+
+    #[test]
+    fn no_custodian_is_tried_while_remote_use_is_off_or_suspended() {
+        let (event, guards) = NextCandidate::Try.pairing_event(false);
+        assert_eq!(event, PairingEvent::AttemptFailed);
+        assert_eq!(
+            PairingState::Exchanging.transition(EndpointRole::Requester, event, guards),
+            Err(TransitionError::GuardFailed),
+            "a local card or remote use off stops the search"
         );
     }
 }

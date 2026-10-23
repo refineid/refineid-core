@@ -8,6 +8,7 @@ use refineid_rapp::{
     SessionState,
 };
 use serde::Deserialize;
+use std::collections::BTreeMap;
 
 const MODEL: &str = include_str!("../../../doc/protocols/rapp-state-machine-v26.10.22.yaml");
 
@@ -15,6 +16,7 @@ const MODEL: &str = include_str!("../../../doc/protocols/rapp-state-machine-v26.
 struct Model {
     document_version: String,
     constants: Constants,
+    guards: BTreeMap<String, String>,
     pairing: Machine,
     session: Machine,
     operation: Machine,
@@ -270,7 +272,56 @@ fn no_pairing_expires_while_a_session_to_it_is_established() {
                 .transition(role, PairingEvent::IdleExpired, all_guards())
                 .is_err()
         );
+        let check = PairingState::PairedConnected
+            .transition(role, PairingEvent::ExpiryCheck, all_guards())
+            .expect("the sweep checks a pairing in session");
+        assert_eq!(check.state, PairingState::PairedConnected);
+        assert_eq!(check.actions, &[Action::RecordLastSession]);
     }
+}
+
+/// Conditions every requester guard that reaches a phone carries
+/// (hierarchy specification section 5.2).
+const REMOTE_USE_CONDITIONS: &[&str] =
+    &["remote use is on", "no card is in a reader attached to it"];
+
+#[test]
+fn nothing_reaches_a_phone_while_remote_use_is_off_or_suspended() {
+    let model = model();
+    for guard in ["initiation_permitted", "untried_pairing_candidate"] {
+        let statement = model
+            .guards
+            .get(guard)
+            .unwrap_or_else(|| panic!("the model names {guard}"));
+        for condition in REMOTE_USE_CONDITIONS {
+            assert!(
+                statement.contains(condition),
+                "{guard} lacks \"{condition}\""
+            );
+        }
+    }
+    let refused = Guards {
+        untried_pairing_candidate: false,
+        ..all_guards()
+    };
+    assert!(
+        PairingState::Exchanging
+            .transition(
+                EndpointRole::Requester,
+                PairingEvent::AttemptFailed,
+                refused
+            )
+            .is_err()
+    );
+    let refused = Guards {
+        initiation_permitted: false,
+        ..all_guards()
+    };
+    assert!(
+        SessionState::Absent
+            .transition(EndpointRole::Requester, SessionEvent::Connect, refused)
+            .is_err()
+    );
 }
 
 #[test]
@@ -683,6 +734,7 @@ const PAIRING_EVENTS: &[(&str, PairingEvent)] = &[
     ("session_healthy", PairingEvent::SessionHealthy),
     ("session_closed", PairingEvent::SessionClosed),
     ("forget_pairing", PairingEvent::ForgetPairing),
+    ("expiry_check", PairingEvent::ExpiryCheck),
     ("idle_expired", PairingEvent::IdleExpired),
     ("revocation_notice_sent", PairingEvent::RevocationNoticeSent),
     ("notice_window_expired", PairingEvent::NoticeWindowExpired),

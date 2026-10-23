@@ -1688,9 +1688,10 @@ quitting, and destroys the pairing at once; a phone with no session open
 is told nothing and forgets the computer by its own idle expiry
 (specification §4.6 items 5 and 6). While remote use is off nothing remote
 runs on the workstation, for any reason.
-Turning remote use on with no pairing asks for a pairing code. The switch
-keeps its state across quit, sleep and restart, so a workstation that
-holds a pairing starts with remote use on. A card in a reader attached to
+Remote use is on from the holder's click turning it on until the holder
+turns it off; with no pairing, being on offers the pairing-code entry. A
+launch restores it on only while the workstation holds an active pairing,
+so a workstation that holds one starts with remote use on. A card in a reader attached to
 the workstation suspends remote use while it is present, with the
 withdrawal of section 28, and remote use resumes with the same pairing
 when the card leaves. Quitting stays a withdrawal and keeps the pairing.
@@ -1711,8 +1712,8 @@ hazards are this record's: L-1, L-3, L-4; H-1, H-4, H-5, H-6, H-7.
 - Inserting and removing a local card become the requester's suspend and
   resume actions. Neither changes the switch or the pairing. The phone's
   feedback is the withdrawal of CC-98, then the next session.
-- A launch is no longer a control action on the switch: the switch's
-  state is the pairing the vault holds.
+- A launch is no longer a control action on the switch: it restores the
+  switch on only while the vault holds an active pairing.
 - New control action on both endpoints: revoke a pairing that has been
   idle for 30 days. Its feedback is the latest time a session to the
   pairing was established, kept in the stored pair record and read
@@ -1742,9 +1743,12 @@ Loss scenarios:
   a slip is one pairing ceremony.
 - UCA-98: an endpoint that does not record its sessions measures from
   the pairing's creation and expires a pairing in daily use 30 days after
-  it was made. A session held open past 30 days would expire as it ends if
+  it was made. A check for expiry made apart from the session's state,
+  before the open session's time is recorded, expires a pairing in
+  session. A session held open past 30 days would expire as it ends if
   only its start were recorded, and a crash during it would lose its end.
-  A wall clock set ahead expires early, one set back late. The two
+  A wall clock set ahead expires early; one set back would, if the
+  recorded time followed it, move the idle time backwards. The two
   endpoints read their own clocks and expire at about the same time; the
   one that expires first tells the other on the next session within the
   notice window, so they do not disagree for longer.
@@ -1757,9 +1761,9 @@ Loss scenarios:
 | ID | Constraint | Closes |
 | :--- | :--- | :--- |
 | CC-100 | The holder's click turning remote use off on a workstation forgets every pairing it holds as specification §4.6 item 6 says: `pairing_revoked` on every open session, waiting at most 1 second for the closes to leave as quitting does, then every pairing's key destroyed; a pairing with no session open is destroyed at once and owed nothing, and its phone forgets the computer by idle expiry (CC-103). Every identity offered from a phone is withdrawn at once. While remote use is off the workstation does not browse, scan or dial for any reason, so it needs no permission. The click asks for no confirmation; the switch then shows off, and turning it on asks for a pairing code. It is the workstation's only control that forgets a pairing, and only the holder's own click forgets: a local card and quitting do not. The phone keeps its own forget. This supersedes CC-94's "keeps the pairings" and CC-98 for the holder's click; the rest of CC-94 stands. CC-89 applies to the switch. Hierarchy specification §5.2. | UCA-96, UCA-91 |
-| CC-101 | Remote use is on while the workstation holds an active pairing, at launch too, a start at login included, and off while it holds none; a launch asks for no permission (CC-96 stands). When the last pairing ends otherwise, by the phone's `pairing_revoked` or by idle expiry, the switch shows off. This supersedes CC-99. Hierarchy specification §5.2. | UCA-94 |
-| CC-102 | A card in a reader attached to the workstation suspends remote use while it is present: the requester withdraws as CC-98 says and CC-86 holds; when the card leaves, discovery and dialing resume at once with the same pairing and no code, as CC-87 says. The switch and the pairing do not change. CC-98 stands with its causes narrowed to a local card and quitting, and with "dials nothing until the holder turns remote use on" read as "until the local card leaves, or after quitting, until the next launch". This supersedes CC-97 and restores CC-87. Hierarchy specification §5.2, specification §4.5. | UCA-84, UCA-85, UCA-97 |
-| CC-103 | Each endpoint revokes on its own a pairing that has had no established session for 30 days (`pairing_idle_expiry_days`) by its wall clock, counted from the latest time it recorded a session to the pairing established, or from the pairing's creation while it has had none; it never expires a pairing while a session to it is established. The time lives in the stored pair record. The endpoint records it when a session is established and when it ends (the state model's `record_last_session`), and for every open session whenever it checks for expiry, which it does at launch and at least once a day. Expiry sends nothing and shows nothing, and the revoked record then follows specification §4.6 items 2 to 4. Specification §4.6 item 5. | UCA-98, UCA-99 |
+| CC-101 | Remote use is on from the holder's click turning it on until the holder turns it off; with no pairing, being on offers the pairing-code entry and browses `mode=pairing` only while a code is tried. Every launch, a start at login included, restores it on only if the workstation holds an active pairing, and asks for no permission (CC-96 stands); a change of the stored pairing format drops the pairings, so remote use starts off. When the last pairing ends otherwise, by the phone's `pairing_revoked` or by idle expiry, remote use turns off. This supersedes CC-99. Hierarchy specification §5.2. | UCA-94 |
+| CC-102 | A card in a reader attached to the workstation suspends remote use while it is present: the requester withdraws as CC-98 says, CC-86 holds, and it tries no pairing code (the guards `initiation_permitted` and `untried_pairing_candidate` both require remote use on and no local card); when the card leaves, discovery and dialing resume at once with the same pairing and no code, as CC-87 says. The switch and the pairing do not change. CC-98 stands with its causes narrowed to a local card and quitting, and with "dials nothing until the holder turns remote use on" read as "until the local card leaves, or after quitting, until the next launch". This supersedes CC-97 and restores CC-87. Hierarchy specification §5.2, specification §4.5. | UCA-84, UCA-85, UCA-97 |
+| CC-103 | Each endpoint revokes on its own a pairing that has had no established session for 30 days (`pairing_idle_expiry_days`) by its wall clock, counted from the latest time it recorded a session to the pairing established, or from the pairing's creation while it has had none; it never expires a pairing while a session to it is established. The time lives in the stored pair record and only moves forward, so a clock set back cannot move it back. Expiry is decided by one sweep per pairing that takes whether a session to it is established: with one it records the time and keeps the pairing, so no order of calls expires a pairing in session, and no other public call can expire one (the state model's `expiry_check` and `idle_expired`). The endpoint sweeps a pairing when a session to it is established and when it ends (`record_last_session`), and sweeps every pairing at launch and at least once a day. Expiry sends nothing and shows nothing, and the revoked record then follows specification §4.6 items 2 to 4. Specification §4.6 item 5. | UCA-98, UCA-99 |
 
 Residual, accepted: a slip on the switch costs a new pairing (UCA-96).
 Turning remote use off with no session open, or with a close that does

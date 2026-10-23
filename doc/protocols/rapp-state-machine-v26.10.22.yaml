@@ -41,7 +41,7 @@ guards:
   initiation_permitted: "the requester's remote use is on, no card is in a reader attached to it, a stored pairing is active, or forgotten and owing its revocation close, and its custodian's discovery hint is in sight"
   pairing_routed: "the routing tag matched an active stored pairing and its nonce is not in the replay memory"
   ready_parameters_match: "received session.ready parameters equal the local view"
-  untried_pairing_candidate: "an endpoint found in pairing mode is not yet opened for the typed code, and fewer than pairing_candidates_max pairing connections were opened for it"
+  untried_pairing_candidate: "the requester's remote use is on, no card is in a reader attached to it, an endpoint found in pairing mode is not yet opened for the typed code, and fewer than pairing_candidates_max pairing connections were opened for it"
 
 actions:
   generate_offer: "create the offer with a fresh random offer_id and offer_ttl_ms"
@@ -289,8 +289,18 @@ pairing:
       guard: local_user_action
       to: revoked
       actions: [mark_record_revoked, destroy_pair_keys, withdraw_identity, show_forgotten]
+    - from: paired_connected
+      event: expiry_check                  # the idle-expiry sweep with a session established: it records the session and never expires the pairing
+      role: both
+      to: paired_connected
+      actions: [record_last_session]
     - from: paired_disconnected
-      event: idle_expired                  # pairing_idle_expiry_days of wall-clock time past the latest recorded session, or the creation; silent
+      event: expiry_check                  # the sweep with no session established, short of the idle limit
+      role: both
+      to: paired_disconnected
+      actions: []
+    - from: paired_disconnected
+      event: idle_expired                  # the sweep with no session established, pairing_idle_expiry_days past the latest recorded session or the creation; silent
       role: both
       to: revoking
       actions: [mark_record_revoked, withdraw_identity]

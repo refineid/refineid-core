@@ -101,7 +101,7 @@ pub(crate) use pair_keys::{derive_pair_key, mac as pair_key_mac};
 pub use pairing::{
     PAIR_RECORD_FORMAT_VERSION, PAIRING_IDLE_EXPIRY_DAYS, PAIRING_IDLE_EXPIRY_MS, PairRecord,
     PairRecordCodecError, PairRecordError, REVOCATION_NOTICE_DAYS, REVOCATION_NOTICE_MS,
-    decode_pair_record, decode_pair_records, encode_pair_record, encode_pair_records,
+    SweepOutcome, decode_pair_record, decode_pair_records, encode_pair_record, encode_pair_records,
 };
 pub use pairing_attempts::{
     CPACE_ATTEMPT_WINDOW_MS, CpaceAttemptLedger, MAXIMUM_CPACE_ATTEMPTS, POST_PAKE_CONFIRMATION_MS,

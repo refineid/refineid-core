@@ -49,7 +49,8 @@ pub struct Guards {
     pub pairing_routed: bool,
     /// Received session.ready parameters equal the local view.
     pub ready_parameters_match: bool,
-    /// An endpoint found in pairing mode is not yet opened for the typed
+    /// The requester's remote use is on, no card is in a reader attached to
+    /// it, an endpoint found in pairing mode is not yet opened for the typed
     /// code, and fewer than `pairing_candidates_max` pairing connections
     /// were opened for it.
     pub untried_pairing_candidate: bool,
@@ -172,8 +173,13 @@ pub enum PairingEvent {
     /// use off, which forgets every pairing it holds and, with no session
     /// open, owes the custodian nothing (section 4.6 item 6).
     ForgetPairing,
-    /// The pairing went `pairing_idle_expiry_days` of wall-clock time
-    /// without an established session (section 4.6 item 5).
+    /// The idle-expiry sweep, with a session to the pairing established or
+    /// with none and the pairing short of the idle limit (section 4.6 item
+    /// 5).
+    ExpiryCheck,
+    /// The idle-expiry sweep found no session established and the pairing
+    /// `pairing_idle_expiry_days` of wall-clock time past its latest
+    /// recorded session, or its creation (section 4.6 item 5).
     IdleExpired,
     /// The revocation close went out as a session's first message.
     RevocationNoticeSent,
@@ -751,6 +757,14 @@ impl PairingState {
                     },
                 }
             }
+            (Self::PairedConnected, E::ExpiryCheck) => Transition {
+                state: Self::PairedConnected,
+                actions: &[A::RecordLastSession],
+            },
+            (Self::PairedDisconnected, E::ExpiryCheck) => Transition {
+                state: Self::PairedDisconnected,
+                actions: &[],
+            },
             (Self::PairedDisconnected, E::IdleExpired) => Transition {
                 state: Self::Revoking,
                 actions: &[A::MarkRecordRevoked, A::WithdrawIdentity],

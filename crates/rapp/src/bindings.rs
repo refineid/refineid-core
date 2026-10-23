@@ -3191,6 +3191,14 @@ pub fn rapp_stream_profile_name() -> String {
     STREAM_PROFILE.to_owned()
 }
 
+/// How long a requester that quits waits for its `service_withdrawn` closes
+/// to leave before it exits (RAPP v26.10.22 section 4.5 item 8).
+#[uniffi::export]
+#[must_use]
+pub const fn rapp_quit_withdrawal_bound_ms() -> u64 {
+    super::QUIT_WITHDRAWAL_BOUND_MS
+}
+
 /// Where a custodian sends one received routing preamble.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum RappRoute {
@@ -3906,7 +3914,16 @@ mod routing_binding_tests {
 
         /// Both ends healthy, with their operation bridges.
         fn established() -> (Arc<RappOperationBridge>, Arc<RappOperationBridge>) {
-            let (requester, custodian) = authenticating(&requester_record(), &custodian_record());
+            established_with(&requester_record(), &custodian_record())
+        }
+
+        /// Both ends of the given records healthy, with their operation
+        /// bridges.
+        fn established_with(
+            requester: &Arc<RappPairRecord>,
+            custodian: &Arc<RappPairRecord>,
+        ) -> (Arc<RappOperationBridge>, Arc<RappOperationBridge>) {
+            let (requester, custodian) = authenticating(requester, custodian);
             let ready = custodian
                 .send_ready(nonce())
                 .expect("custodian sends ready");
@@ -4069,6 +4086,74 @@ mod routing_binding_tests {
             assert_eq!(closed.kind, RappBridgeActionKind::SessionClosed);
             assert_eq!(closed.operation_id, Some(operation_id()));
             assert!(closed.card_exchange_continues);
+        }
+
+        #[test]
+        fn a_requester_withdrawal_reaches_the_custodian_and_ends_its_operation() {
+            let (requester, custodian) = established();
+            let request = frame(
+                requester
+                    .begin_read_certificate(operation_id(), false, NOW_MS, LIFETIME_MS)
+                    .expect("requester asks"),
+            );
+            assert_eq!(
+                custodian
+                    .receive_frame(request, NOW_MS)
+                    .expect("custodian admits")
+                    .kind,
+                RappBridgeActionKind::InspectPrerequisites
+            );
+            let notice = requester
+                .close_with_reason(RappCloseReason::ServiceWithdrawn)
+                .expect("the requester withdraws");
+            assert!(notice.close_session_after_send);
+            assert_eq!(notice.close_reason, Some(RappCloseReason::ServiceWithdrawn));
+            assert_eq!(notice.operation_id, Some(operation_id()));
+            let closed = custodian
+                .receive_frame(frame(notice), NOW_MS)
+                .expect("custodian reads the close");
+            assert_eq!(closed.kind, RappBridgeActionKind::SessionClosed);
+            assert_eq!(closed.close_reason, Some(RappCloseReason::ServiceWithdrawn));
+            assert_eq!(closed.operation_id, Some(operation_id()));
+            assert!(!closed.card_exchange_continues);
+            assert!(matches!(
+                custodian.report_card_status(None, RappCardReader::Absent),
+                Err(RappBindingError::WrongPhase)
+            ));
+        }
+
+        #[test]
+        fn a_withdrawal_in_either_direction_keeps_the_pairing() {
+            let requester_record = requester_record();
+            let custodian_record = custodian_record();
+            for requester_withdraws in [true, false] {
+                let (requester, custodian) = established_with(&requester_record, &custodian_record);
+                let (withdrawing, peer) = if requester_withdraws {
+                    (&requester, &custodian)
+                } else {
+                    (&custodian, &requester)
+                };
+                let notice = withdrawing
+                    .close_with_reason(RappCloseReason::ServiceWithdrawn)
+                    .expect("the endpoint withdraws");
+                let closed = peer
+                    .receive_frame(frame(notice), NOW_MS)
+                    .expect("the peer reads the close");
+                assert_eq!(closed.kind, RappBridgeActionKind::SessionClosed);
+                assert_eq!(closed.close_reason, Some(RappCloseReason::ServiceWithdrawn));
+            }
+            let (requester, custodian) = established_with(&requester_record, &custodian_record);
+            let status = requester
+                .receive_frame(
+                    frame(
+                        custodian
+                            .report_card_status(None, RappCardReader::Absent)
+                            .expect("card status"),
+                    ),
+                    NOW_MS,
+                )
+                .expect("the next session carries the card status");
+            assert_eq!(status.kind, RappBridgeActionKind::CardStatus);
         }
 
         #[test]

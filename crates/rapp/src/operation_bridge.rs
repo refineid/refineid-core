@@ -341,7 +341,13 @@ pub enum RappBridgeActionKind {
     /// runs on to the card's answer, which is discarded (RAPP section 8.1
     /// item 3). On a received `PairingRevoked` close, revoke the record with
     /// `RappPairRecord::revoke` and withdraw its identity (section 4.6 item
-    /// 4).
+    /// 4). A received `ServiceWithdrawn` close is the peer's withdrawal
+    /// (section 4.5) and the pairing stays: a custodian shows that computer
+    /// as off, not merely disconnected, until the pairing's next session
+    /// (item 9); a requester withdraws the custodian's identity at once and
+    /// does not dial it until it is discovered serving again (item 6). A
+    /// close with no reason, or with another one, is neither a revocation
+    /// nor a withdrawal.
     SessionClosed,
 }
 
@@ -364,7 +370,8 @@ pub enum RappCloseReason {
     Shutdown,
     /// The custodian can no longer serve the card.
     CardUnavailable,
-    /// The custodian stopped serving every pairing (RAPP section 4.5).
+    /// The sender withdrew: a custodian stopped serving, or a requester
+    /// stopped using, every pairing (RAPP section 4.5).
     ServiceWithdrawn,
 }
 
@@ -1392,7 +1399,10 @@ impl RappOperationBridge {
     /// Close the session with an authenticated `session.close` carrying
     /// `reason` and return the notice frame to deliver before dropping the
     /// link. A session that is already closed yields `SessionClosed` without
-    /// a frame.
+    /// a frame. An endpoint that withdraws, custodian or requester, closes
+    /// every open session with `ServiceWithdrawn` (RAPP section 4.5 items 3
+    /// and 8); a requester that quits waits at most
+    /// `rapp_quit_withdrawal_bound_ms()` for the frames to leave.
     ///
     /// # Errors
     /// [`RappBindingError::LocalStateFailure`] on a poisoned local state.

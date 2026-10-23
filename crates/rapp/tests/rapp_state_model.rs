@@ -3,8 +3,8 @@
 use refineid_rapp::{
     Action, EndpointRole, Guards, IDENTITY_OFFER_GRACE_MS, LIVENESS_PING_AFTER_SILENCE_MS,
     MAXIMUM_CPACE_ATTEMPTS, MINIMUM_REMAINING_ATTEMPTS, OFFER_TTL_MS, OperationEvent,
-    OperationState, PAIRING_CANDIDATES_MAX, PairingEvent, PairingState, SESSION_SILENCE_LIMIT_MS,
-    SessionEvent, SessionState,
+    OperationState, PAIRING_CANDIDATES_MAX, PairingEvent, PairingState, QUIT_WITHDRAWAL_BOUND_MS,
+    SESSION_SILENCE_LIMIT_MS, SessionEvent, SessionState,
 };
 use serde::Deserialize;
 
@@ -29,6 +29,7 @@ struct Constants {
     liveness_ping_after_silence_ms: u64,
     session_silence_limit_ms: u64,
     identity_offer_grace_ms: u64,
+    quit_withdrawal_bound_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -130,6 +131,7 @@ fn formal_constants_are_the_engine_constants() {
     );
     assert_eq!(constants.session_silence_limit_ms, SESSION_SILENCE_LIMIT_MS);
     assert_eq!(constants.identity_offer_grace_ms, IDENTITY_OFFER_GRACE_MS);
+    assert_eq!(constants.quit_withdrawal_bound_ms, QUIT_WITHDRAWAL_BOUND_MS);
 }
 
 #[test]
@@ -146,6 +148,86 @@ fn rust_defines_no_transition_absent_from_the_formal_model() {
     assert_no_extra_pairing_transitions(&model.pairing);
     assert_no_extra_session_transitions(&model.session);
     assert_no_extra_operation_transitions(&model.operation);
+}
+
+/// Actions that change or end a stored pairing.
+const PAIRING_CHANGING_ACTIONS: &[&str] = &[
+    "store_pair_record_atomically",
+    "mark_record_confirmed",
+    "revoke_unconfirmed_pair_record",
+    "mark_record_revoked",
+    "send_close_pairing_revoked",
+    "destroy_pair_keys",
+    "clear_residual_pair_record",
+];
+
+/// Events that are an endpoint's withdrawal or the notice of its peer's
+/// (RAPP section 4.5).
+const WITHDRAWAL_EVENTS: &[&str] = &["service_withdrawn", "peer_withdrawal_notice"];
+
+#[test]
+fn no_withdrawal_changes_a_stored_pairing() {
+    let model = model();
+    let rules = model
+        .pairing
+        .transitions
+        .iter()
+        .chain(&model.session.transitions)
+        .filter(|rule| WITHDRAWAL_EVENTS.contains(&rule.event.as_str()))
+        .collect::<Vec<_>>();
+    assert!(!rules.is_empty(), "the model names withdrawal");
+    for rule in rules {
+        assert!(
+            rule.actions
+                .iter()
+                .all(|action| !PAIRING_CHANGING_ACTIONS.contains(&action.as_str())),
+            "withdrawal changes a pairing: {}",
+            rule.event
+        );
+        assert_ne!(rule.to, "revoked", "{}", rule.event);
+        assert_ne!(rule.to, "unpaired", "{}", rule.event);
+    }
+}
+
+#[test]
+fn both_endpoints_withdraw_and_only_the_custodian_shows_its_peer_off() {
+    for role in [EndpointRole::Requester, EndpointRole::Proxy] {
+        let closing = SessionState::Healthy
+            .transition(role, SessionEvent::ServiceWithdrawn, all_guards())
+            .expect("an open session closes on withdrawal");
+        assert_eq!(closing.state, SessionState::Closing);
+        assert_eq!(
+            closing.actions.first(),
+            Some(&Action::SendCloseServiceWithdrawn)
+        );
+    }
+    let off = PairingState::PairedConnected
+        .transition(
+            EndpointRole::Proxy,
+            PairingEvent::PeerWithdrawalNotice,
+            all_guards(),
+        )
+        .expect("the custodian records the computer's withdrawal");
+    assert_eq!(off.state, PairingState::PairedDisconnected);
+    assert_eq!(off.actions, &[Action::ShowPeerWithdrawn]);
+    let back = off
+        .state
+        .transition(
+            EndpointRole::Proxy,
+            PairingEvent::SessionHealthy,
+            all_guards(),
+        )
+        .expect("the pairing's next session ends the off display");
+    assert_eq!(back.state, PairingState::PairedConnected);
+    assert!(
+        PairingState::PairedConnected
+            .transition(
+                EndpointRole::Requester,
+                PairingEvent::PeerWithdrawalNotice,
+                all_guards(),
+            )
+            .is_err()
+    );
 }
 
 fn assert_pairing_rules(machine: &Machine) {
@@ -282,6 +364,7 @@ const fn formal_action_name(action: Action) -> &'static str {
         Action::ShowPairedDisconnected => "show_paired_disconnected",
         Action::ShowForgotten => "show_forgotten",
         Action::ShowPeerForgot => "show_peer_forgot",
+        Action::ShowPeerWithdrawn => "show_peer_withdrawn",
         Action::ClearResidualPairRecord => "clear_residual_pair_record",
         Action::OpenTransport => "open_transport",
         Action::SendSessionPreamble => "send_session_preamble",
@@ -512,6 +595,7 @@ const PAIRING_EVENTS: &[(&str, PairingEvent)] = &[
     ("revocation_notice_sent", PairingEvent::RevocationNoticeSent),
     ("notice_window_expired", PairingEvent::NoticeWindowExpired),
     ("peer_revocation_notice", PairingEvent::PeerRevocationNotice),
+    ("peer_withdrawal_notice", PairingEvent::PeerWithdrawalNotice),
 ];
 
 const SESSION_EVENTS: &[(&str, SessionEvent)] = &[

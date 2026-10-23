@@ -193,15 +193,15 @@ To maintain clean, unobtrusive operation on enterprise and personal workstations
 - Background radio scanning, mDNS service browsing, and network polling must not run by default.
 
 ### 5.2 Remote Use Is the Opt-In
-- A workstation offers one switch for remote use, off by default and kept across restarts. While it is off the workstation is Local Card Reader Software only (§5.1): it browses no mDNS, scans no BLE, dials no phone, offers no identity from a phone, and requests no local-network or Bluetooth permission from the operating system. Turning it on is the moment the workstation asks for those permissions.
+- A workstation offers one switch for remote use, off at every launch. While it is off the workstation is Local Card Reader Software only (§5.1): it browses no mDNS, scans no BLE, dials no phone, offers no identity from a phone, and requests no local-network or Bluetooth permission from the operating system. Only the holder turns it on, and turning it on is the only moment the workstation asks for those permissions.
 - While remote use is on and no usable stored pairing exists, the workstation asks for the pairing code a phone shows (RAPP §3) and browses `mode=pairing` only while a code is being tried (RAPP §4.2).
 - While remote use is on and at least one usable stored pairing exists:
   1. The Requester activates the mDNS browser and/or the BLE scanner.
   2. Paired Custodians appear in the reader selection list when discovered.
   3. Outbound connections are established on demand when the card is consulted or, under the offering rule (RAPP §8.4), held while an identity is offered.
-- Turning remote use off closes every session at once, withdraws every identity offered from a phone at once, halts the scanners and purges transient discovery caches. Stored pairings are kept, so turning it on again resumes without a new code.
+- Turning remote use off, and quitting the application while it is on, is the Requester's withdrawal (RAPP §4.5): the workstation closes every session at once with `session.close` reason `"service_withdrawn"`, withdraws every identity offered from a phone at once, halts the scanners and purges transient discovery caches. Stored pairings are kept, so turning it on again resumes without a new code.
 - Forgetting the last pairing halts the scanners, closes any idle outbound sockets and purges transient discovery caches, as turning remote use off does.
-- A card in a reader attached to the workstation overrides remote use while it is present: the workstation holds no phone session and offers no phone identity (STPA CC-86).
+- Inserting a card into a reader attached to the workstation turns remote use off, as the switch does; removing it leaves remote use off. While the card is present the workstation holds no phone session and offers no phone identity (STPA CC-86, CC-97).
 
 ---
 

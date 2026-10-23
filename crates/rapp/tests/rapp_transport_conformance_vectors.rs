@@ -16,7 +16,7 @@ use refineid_rapp::{
 use serde::Deserialize;
 use sha2::{Sha512, digest::common::BlockSizeUser};
 
-const CORPUS: &str = include_str!("../../../docs/protocols/vectors/rapp-v26.10.22.json");
+const CORPUS: &str = include_str!("../../../doc/protocols/vectors/rapp-v26.10.22.json");
 
 #[derive(Deserialize)]
 struct Corpus {

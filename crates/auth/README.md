@@ -40,4 +40,4 @@ Constants are traced to the
 [DVV FINEID specifications](https://dvv.fi/en/fineid-specifications) (S1
 sections 3.5, 3.11, and 3.12, and S4-2) and ISO/IEC 7816-4 and -8. See the
 repository's
-[credential custody contract](../../docs/security/credential-custody.md).
+[credential custody contract](../../doc/security/credential-custody.md).

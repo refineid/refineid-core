@@ -2,7 +2,7 @@
 
 **Status:** Reviewed by the owner on 2026-10-22 with RAPP v26.10.22
 **Date:** 2026-10-18
-**Applies to:** RAPP v26.10.22 (`docs/protocols/rapp-v26.10.22.md`), the
+**Applies to:** RAPP v26.10.22 (`doc/protocols/rapp-v26.10.22.md`), the
 transport and discovery hierarchy, and the requester and custodian
 applications built on them
 
@@ -11,6 +11,8 @@ applications built on them
 ## 1. Purpose and method
 
 This document applies System-Theoretic Process Analysis (STPA) to RAPP.
+[../stpa.md](../stpa.md) explains the method, how this project uses it,
+and its literature.
 STPA rests on the STAMP accident model: losses are not caused only by
 component failures but by inadequate control, and control is inadequate
 when a controller's model of the process it controls is wrong. A
@@ -930,7 +932,7 @@ first run the card sits in a contact reader wired to the iPhone, so the
 near-field behaviour of section 12 is out of the path. The Windows
 computer's own controllers, the browser, CNG, the key storage provider
 and the agent that holds the session, are analysed in the Windows
-repository's platform STPA (`docs/stpa-windows-ble-requester.md`),
+repository's platform STPA (`doc/stpa-windows-ble-requester.md`),
 which refines this section and keeps its identifiers.
 
 ### 16.1 What the bearer changes

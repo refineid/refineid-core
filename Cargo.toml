@@ -78,7 +78,7 @@ subtle = "2"
 rustc_lexer = "0.1"
 serde = "1"
 serde_json = "1"
-# Reads docs/protocols/rapp-state-machine-*.yaml in the model
+# Reads doc/protocols/rapp-state-machine-*.yaml in the model
 # conformance test; the rapp crate itself never parses YAML.
 serde-saphyr = { version = "2", default-features = false, features = ["deserialize"] }
 # The Noise Protocol Framework handshakes and transport cipher for the

@@ -88,11 +88,11 @@ Constraints are traced to the
 [DVV FINEID specifications](https://dvv.fi/en/fineid-specifications),
 [ICAO Doc 9303](https://www.icao.int/publications/doc-series/doc-9303), and
 the ISO/IEC 7816 series. See
-[credential custody](docs/security/credential-custody.md),
-the [core migration policy](docs/architecture/core-migration.md),
-[public provenance](docs/governance/public-provenance.md), the
-[FINEID specifications](docs/reference/specifications.md), and the
-[supported cards](docs/reference/supported-cards.md).
+[credential custody](doc/security/credential-custody.md),
+the [core migration policy](doc/architecture/core-migration.md),
+[public provenance](doc/governance/public-provenance.md), the
+[FINEID specifications](doc/reference/specifications.md), and the
+[supported cards](doc/reference/supported-cards.md).
 
 ## Build and check
 
@@ -102,7 +102,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo run --locked -p xtask -- check-magic-numbers
 ```
 
-On Windows, see [developing on Windows](docs/process/windows-development.md)
+On Windows, see [developing on Windows](doc/process/windows-development.md)
 for the prerequisites, line endings, and how the gates differ.
 
 ### Managing build cache

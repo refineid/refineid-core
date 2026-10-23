@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! The pairing, session and operation machines of the RAPP state model
-//! (`docs/protocols/rapp-state-machine-v26.10.22.yaml`), and the runtime state
+//! (`doc/protocols/rapp-state-machine-v26.10.22.yaml`), and the runtime state
 //! an endpoint keeps. No failure revokes a pairing; only a user does.
 
 /// Local projection of the distributed state machine.

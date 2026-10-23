@@ -23,7 +23,7 @@ never handed out, so the cache adds no raw-bytes accessor to a PIN role.
 
 This crate keeps no positive cache and performs no card I/O. Holding a PIN1
 the card accepted is the host's, under the
-[credential custody](../../docs/security/credential-custody.md) contract: in
+[credential custody](../../doc/security/credential-custody.md) contract: in
 process memory from the first card-confirmed success until an invalidation
 event, with no idle window or countdown. PIN2 is never held between
 operations.

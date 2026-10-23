@@ -11,14 +11,14 @@ Three documents are normative. Read them in full before designing or
 editing anything, and do not infer the rules from existing code -- code
 may predate its own review:
 
-- [docs/architecture/core-migration.md](docs/architecture/core-migration.md)
+- [doc/architecture/core-migration.md](doc/architecture/core-migration.md)
   -- slice admission, trust by construction, the numeric policy.
-- [docs/architecture/refinement-types.md](docs/architecture/refinement-types.md)
+- [doc/architecture/refinement-types.md](doc/architecture/refinement-types.md)
   -- the type discipline: predicates, borders, the three states of bytes,
   dependence with reason, no ducks at the border.
-- [docs/security/credential-custody.md](docs/security/credential-custody.md)
+- [doc/security/credential-custody.md](doc/security/credential-custody.md)
   -- how secrets move.
-- [docs/architecture/case-study-refinement-types-vec-insert.md](docs/architecture/case-study-refinement-types-vec-insert.md)
+- [doc/architecture/case-study-refinement-types-vec-insert.md](doc/architecture/case-study-refinement-types-vec-insert.md)
   -- case study: why `<alloc::vec::Vec>::insert` is bad code, progress and preservation,
   and refinement typing across collections.
 
@@ -65,8 +65,9 @@ section again. The design questions in the refinement-types policy's
 ## STPA in design
 
 Every design includes a short System-Theoretic Process Analysis (STPA),
-sized to the change. [stpa-rapp.md](docs/security/stpa-rapp.md) is the worked example and the
-record for RAPP and its applications.
+sized to the change. [doc/stpa.md](doc/stpa.md) explains the method and
+its literature; [stpa-rapp.md](doc/security/stpa-rapp.md) is the worked
+example and the record for RAPP and its applications.
 
 - Ground the analysis in the losses (L-n) and hazards (H-n) the record
   already names. Add a loss only when a real stakeholder could suffer it
@@ -152,7 +153,7 @@ before and the correction made the core better.
   repositories or in parent directories.
 - Never put a git worktree under `/tmp`. It is cleared on reboot and takes the
   branch's only checkout with it.
-- One task, one worktree, one branch, one pull request (see [docs/process/agent-worktrees.md](docs/process/agent-worktrees.md)).
+- One task, one worktree, one branch, one pull request (see [doc/process/agent-worktrees.md](doc/process/agent-worktrees.md)).
 - Run `scripts/agent-housekeeping.sh` to monitor worktrees and verify compliance.
 
 ## Working discipline
@@ -161,7 +162,7 @@ before and the correction made the core better.
 
 ## Protocol specifications
 
-- A specification under `docs/protocols/` states the protocol as it is at
+- A specification under `doc/protocols/` states the protocol as it is at
   its stamped version: rules, schemas, and bytes. It carries no change
   history -- no "changes from" sections, no "supersedes" lines, no prose
   about what a revision altered. History belongs in commit messages and
@@ -238,4 +239,4 @@ before and the correction made the core better.
 
 ## Working method
 
-Read [docs/process/working-method.md](docs/process/working-method.md) before starting: the roles (front agent, implementation agents), what a brief contains, the feedback loops, and which documentation is kept. The same file is in every RefineID repository.
+Read [doc/process/working-method.md](doc/process/working-method.md) before starting: the roles (front agent, implementation agents), what a brief contains, the feedback loops, and which documentation is kept. The same file is in every RefineID repository.

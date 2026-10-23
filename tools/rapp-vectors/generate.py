@@ -5,7 +5,7 @@
 Usage:
   tools/rapp-vectors/generate.py [--write]
 
-Every corpus under docs/protocols/vectors holds inputs (fixed keys, offer
+Every corpus under doc/protocols/vectors holds inputs (fixed keys, offer
 identifiers, pairing codes, times, instance names) and values derived from
 them by the specification. This tool recomputes the derived values with the
 standard-library primitives of primitives.py, never with the engine. Without
@@ -47,7 +47,7 @@ GENERATOR = "tools/rapp-vectors/generate.py"
 VERSION_ENVELOPE_VECTORS = ("missing-version", "wrong-version-type", "unsupported-version")
 PRIMITIVE_CHECKS = "RFC 7748 section 6.1, RFC 8439 section 2.8.2 and RFC 9496 appendix A.1"
 
-VECTORS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "docs", "protocols", "vectors")
+VECTORS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "doc", "protocols", "vectors")
 
 
 def h(x):

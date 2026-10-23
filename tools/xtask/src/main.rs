@@ -257,7 +257,7 @@ fn is_ignored_root_path(root: &Path, path: &Path) -> bool {
 /// - `crates/pcsc`: PC/SC Workgroup WinSCard external C ABI interface.
 /// - `crates/pkcs11`: OASIS Cryptoki v2.40 external C ABI interface.
 /// - `crates/rapp`: RAPP protocol wire frame vectors and Noise state machine specifications.
-/// - `docs/protocols`: Protocol specification documents.
+/// - `doc/protocols`: Protocol specification documents.
 ///
 /// Remove an entry when its subtree is brought under policy or replaced.
 const POLICY_EXEMPT_SUBTREES: &[&str] = &[
@@ -266,7 +266,7 @@ const POLICY_EXEMPT_SUBTREES: &[&str] = &[
     "crates/pcsc",
     "crates/pkcs11",
     "crates/rapp",
-    "docs/protocols",
+    "doc/protocols",
 ];
 
 fn is_policy_exempt_path(root: &Path, path: &Path) -> bool {
@@ -1325,7 +1325,7 @@ mod tests {
         ));
         assert!(is_policy_exempt_path(
             root,
-            Path::new("/workspace/docs/protocols/vectors/rapp-v26.9.13.json")
+            Path::new("/workspace/doc/protocols/vectors/rapp-v26.9.13.json")
         ));
         assert!(!is_policy_exempt_path(
             root,

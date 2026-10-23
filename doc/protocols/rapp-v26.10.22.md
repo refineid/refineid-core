@@ -35,7 +35,7 @@ This document defines the complete, standalone normative specification for the *
 - The **operation model** (§8): one operation at a time on the card, queued across sessions, forgotten with its session.
 - The **Registered Credential Profiles and Actions** for card status inspection, browser authentication, and qualified document signing.
 - **Service Withdrawal** (§4.5): the Custodian's notice, keyed by each pairing's static agreement, that it has stopped serving, on discovery and on open sessions, and the Requester's notice, on open sessions, that it has stopped using remote access.
-- **Pairing Storage Confirmation and Revocation** (§4.3, §4.6): each endpoint confirms its stored trust record before the pairing is active, and an endpoint that forgets a pairing tells the other with a `pairing_revoked` close, in session or as the first message of the next session.
+- **Pairing Storage Confirmation and Revocation** (§4.3, §4.6): each endpoint confirms its stored trust record before the pairing is active, an endpoint that forgets a pairing tells the other with a `pairing_revoked` close, in session or as the first message of the next session, and a pairing with no session for 30 days expires on each endpoint.
 - **Card Presence** (§8.4): the Custodian's in-session notice of the card it holds and of whether a card reader is attached to it; a Requester's offer to local consumers follows the card, eventually consistent.
 - **Concurrent Multi-Client Serving** (§8): the Custodian serves every paired Requester over its own session; card operations are serialized on the single card.
 - The **Failure Semantics, Retry Protection, and PIN Contracts**.
@@ -374,7 +374,7 @@ A transparent radio frequency (RF) relay that forwards packets between distant r
 
 ### 4.5 Service Withdrawal
 
-An endpoint **withdraws** when it deliberately stops serving, or stops using, remote access for every stored pairing. A Custodian withdraws when its user turns remote access off or quits the application. A Requester withdraws when its user turns remote use off, when a card inserted into a reader attached to the computer turns remote use off (hierarchy specification §5.2), or when its user quits the application. Nothing else is withdrawal: suspension or termination by the operating system, sleep, loss of the network, and a session restart with reason `"normal"` or `"shutdown"` (§7.2) are not. Withdrawal changes no stored pairing; a Custodian serves again with its next `mode=session` advertisement, and a Requester dials again once its user turns remote use on. Items 1 to 7 are the Custodian's withdrawal and how a Requester receives it; items 8 and 9 are the Requester's withdrawal and how a Custodian receives it.
+An endpoint **withdraws** when it deliberately stops serving, or stops using, remote access for every stored pairing and keeps the pairings. A Custodian withdraws when its user turns remote access off or quits the application. A Requester withdraws when a card in a reader attached to the computer suspends remote use (hierarchy specification §5.2), and when its user quits the application. Nothing else is withdrawal: suspension or termination by the operating system, sleep, loss of the network, and a session restart with reason `"normal"` or `"shutdown"` (§7.2) are not, and a Requester's user turning remote use off forgets its pairings, which is revocation (§4.6). Withdrawal revokes no pairing; a Custodian serves again with its next `mode=session` advertisement, and a Requester dials again once the card that suspended remote use leaves the reader or, after it quit, at its next launch. Items 1 to 7 are the Custodian's withdrawal and how a Requester receives it; items 8 and 9 are the Requester's withdrawal and how a Custodian receives it.
 
 1. **Withdrawal Key**:
    Each stored pairing has a withdrawal key that both endpoints derive from their static keys, the static agreement $S$ serving as the IKM, and that never crosses the wire:
@@ -421,30 +421,36 @@ An endpoint **withdraws** when it deliberately stops serving, or stops using, re
 8. **Requester Withdrawal**:
    On withdrawal the Requester, in this order:
    1. sends `session.close` with reason `"service_withdrawn"` (§7.1) on every open operational session, one whose `session.ready` it verified, and closes its link; a connection whose session is not yet open it closes without a notice;
-   2. stops dialing and browsing for every pairing until its user turns remote use on again; hierarchy specification §5.2 lists what else a workstation stops.
+   2. stops dialing and browsing for every pairing; a Requester that a local card suspended resumes once the card leaves the reader. Hierarchy specification §5.2 lists what else a workstation stops.
 
    It keeps every stored pairing. A Requester publishes no discovery record and no BLE advertisement, so it announces nothing else. Withdrawal ends every session, and with it every operation, as §8.1 item 3 says.
 
    Quitting is best effort: a Requester that quits sends its closes before it exits and waits at most 1 second for them to leave, written to the stream connection or, on BLE, acknowledged by each write's response. A close that has not left by then is dropped, and the Custodian sees that session as lost.
 
 9. **Custodian Behavior**:
-   An authenticated `session.close` with reason `"service_withdrawn"` from a Requester is that Requester's **withdrawal**; any other close reason, or loss of the session, is not. Both endpoints send this reason, and receiving it is never a protocol violation; only the paired Requester can send it, inside the session's authenticated channel. The Custodian closes that session without a close of its own, keeps the pairing, changes no stored pairing state, and records that the computer withdrew. Its user interface may show that computer as off, not merely disconnected, until the next session from that pairing, and shows no error. It goes on serving every pairing, that one included, and accepts the Requester's next dial as any other.
+   An authenticated `session.close` with reason `"service_withdrawn"` from a Requester is that Requester's **withdrawal**; any other close reason, or loss of the session, is not. Both endpoints send this reason, and receiving it is never a protocol violation; only the paired Requester can send it, inside the session's authenticated channel. The Custodian closes that session without a close of its own, keeps the pairing, and records that the computer withdrew. Its user interface may show that computer as off, not merely disconnected, until the next session from that pairing, and shows no error. It goes on serving every pairing, that one included, and accepts the Requester's next dial as any other.
 
 ### 4.6 Pairing Revocation
 
-An endpoint **revokes** a pairing when its user forgets it, when a pairing fails after its record was stored (§4.3), when the confirmation deadline of §4.3 item 4 passes, or when its peer tells it so. The record is marked revoked at once and serves nothing from then on. Whichever endpoint revokes, Custodian or Requester, tells the other with `session.close` carrying reason `"pairing_revoked"` (§7.1), so that the peer forgets the pairing on its side too:
+An endpoint **revokes** a pairing when its user forgets it, when the pairing expires (item 5), when a pairing fails after its record was stored (§4.3), when the confirmation deadline of §4.3 item 4 passes, or when its peer tells it so. A Requester's user forgets its pairings by turning remote use off (item 6). The record is marked revoked at once and serves nothing from then on. Whichever endpoint revokes, Custodian or Requester, tells the other with `session.close` carrying reason `"pairing_revoked"` (§7.1), so that the peer forgets the pairing on its side too, except as items 3 and 6 say:
 
 1. **In Session**:
    If the revoking endpoint holds an open session to the peer, it sends the close at once.
 
 2. **On the Next Session**:
-   Otherwise the endpoint keeps the static private key for the close alone. A Custodian goes on announcing the pairing's discovery hint (hierarchy specification §4.3) and a Requester goes on dialing when the hint is in sight, as if nothing had changed; on the next session with the peer the revoking endpoint completes the handshake of §6.3, sends the close as its first message, and no card session starts.
+   Otherwise the endpoint keeps the static private key for the close alone. A Custodian goes on announcing the pairing's discovery hint (hierarchy specification §4.3) and a Requester goes on dialing when the hint is in sight while its remote use is on (hierarchy specification §5.2), as if nothing had changed; on the next session with the peer the revoking endpoint completes the handshake of §6.3, sends the close as its first message, and no card session starts.
 
 3. **Key Destruction**:
-   The static private key is destroyed once the close has been sent, or 30 days after the revocation, whichever comes first. A pairing not yet confirmed, and a revocation the confirmation deadline causes, destroy the key at once and tell nobody.
+   The static private key is destroyed once the close has been sent, or 30 days after the revocation, whichever comes first. A pairing not yet confirmed, and a revocation the confirmation deadline causes, destroy the key at once and tell nobody; turning remote use off destroys it as item 6 says.
 
 4. **Receiving the Close**:
    An endpoint that receives `session.close` with reason `"pairing_revoked"` at any point of a session revokes the pairing at once, destroys its key, withdraws any identity it offers for the pairing (§8.4), answers with no close of its own, and closes the transport.
+
+5. **Idle Expiry**:
+   A pairing that has had no established session for 30 days (`pairing_idle_expiry_days`) expires. A session is established from the moment the Custodian sends, or the Requester verifies, its `session.ready` until it ends. Each endpoint keeps with the stored pairing the latest wall-clock time at which it had a session to the pairing established, noting it at least when a session is established and when it ends; while the pairing has had none, that time is its creation. The endpoint revokes the pairing once that time is 30 days past. A pairing never expires while a session to it is established. Custodian and Requester apply this each on its own, by their own clocks, and check for expiry when they start and at least once a day while they run. Expiry is silent: nothing is sent at that moment, since the peer has been out of reach, and no user is interrupted. Items 2 to 4 then apply as to any revocation, so a peer that opens a session within the notice window receives the `pairing_revoked` close. Idle expiry is also how a Custodian forgets a Requester that forgot the pairing while no session was open (item 6).
+
+6. **Remote Use Off**:
+   A Requester's user forgets every pairing the Requester holds by turning remote use off (hierarchy specification §5.2). On every open session the Requester sends the close as item 1 says and waits at most 1 second for it to leave, as for quitting (§4.5 item 8), then destroys the static private key of every pairing. A pairing with no session open is told nothing, and item 2 does not apply to it; a close that has not left within the second is dropped. The Custodian of such a pairing forgets it by idle expiry (item 5).
 
 ---
 
@@ -752,7 +758,7 @@ close-reason-val =
   / "user_disconnect"
   / "policy"
   / "protocol_violation"
-  / "pairing_revoked"
+  / "pairing_revoked"    ; the sender revoked the pairing: its user forgot it, or it expired (§4.6)
   / "shutdown"
   / "card_unavailable"   ; the Custodian can no longer serve the card
   / "service_withdrawn"  ; the sender withdrew: a Custodian stopped serving, or a Requester stopped using, every pairing (§4.5)
@@ -972,7 +978,7 @@ What an endpoint does when something goes wrong depends on how much it knows abo
 2. **On a session**: a link drop, a timeout, an AEAD failure, a wrong version, a wrong `session_id` or `sequence`. A bit flip and an attacker look the same, so the endpoint closes the session and keeps the pairing; every operation of the session is over (§8). The card is never touched on the way out.
 3. **Inside an operation**: an unknown `operation_id`, an unsupported parameter, a credential the card refused. The endpoint rejects that operation with `operation.result` or `error` (§10.3); the session and the pairing stay.
 
-No failure revokes an active pairing: an active pairing is revoked by its user, or by its peer's `pairing_revoked` close (§4.6). A pairing whose confirmation fails is undone as §4.3 item 4 says.
+No failure revokes an active pairing: an active pairing is revoked by its user, by idle expiry, or by its peer's `pairing_revoked` close (§4.6). A pairing whose confirmation fails is undone as §4.3 item 4 says.
 
 ### 10.2 PIN Entry and the Retry Floor
 - **Retry floor (PIN 1 and PIN 2)**: Before any command that could decrement a PIN try counter, the Custodian reads the card's remaining attempts for that PIN. It sends the verification only while the card reports **at least 3** remaining. With 2, 1 or 0 remaining, or a counter it cannot read, it refuses without sending any verification command, answering `operation.result` with `status: "rejected"` and `error: "retry_floor"`, and tells the holder that the card's remaining attempts are reserved for the card issuer's software. RefineID therefore never consumes a card's last two attempts and can never block a PIN. RAPP defines no unblocking; a blocked card is unblocked with the PIN unblocking key (PUK) outside RAPP.
@@ -1026,3 +1032,4 @@ The same names appear in the `error` field of `operation.result`, except `"busy"
 | **Tracking** | Records discovery records and routing preambles over time to recognise a phone or link a computer's connections. | Discovery hints rotate every 15 minutes and routing tags are fresh per connection; both are keyed by the pairing's static agreement, which never crosses the wire (§2.2.1, §4.3, hierarchy specification §4.3). No stable pairing identifier is ever sent in clear. |
 | **Routing replay** | Replays a captured routing preamble to probe presence or cause work. | The tag selects a pairing and authenticates nothing. A nonce in the replay memory of 256 routed sessions is refused in the Routing phase; an older replay reaches `Noise_KK` message 1 and fails. The pre-authentication limiter bounds the work (§3.3). |
 | **Withdrawal forgery or replay** | Publishes a forged `mode=withdrawn` record, or republishes a recorded one. | Withdrawal hints are keyed by the static agreement and cannot be forged. A recorded record counts only on the instance the Requester associates with the pairing and within one minute of its counter, and only withdraws presence until the Custodian is next discovered; a spoofed clock widens that window and nothing more. A replayed `hints=` value only makes a Requester dial an endpoint that then fails routing. An open session ignores records and ends only on an authenticated `session.close` (§4.5). |
+| **Stale pairing** | Uses the stored pairing of a computer or phone its holder lost, sold or stopped using: recognises the other endpoint's discovery hints, or dials it and asks for operations. | Every key operation needs the holder's PIN on the Custodian, except a browser authentication while the Custodian holds PIN 1 (§8.2 item 3, §11 item 2). A pairing with no session for 30 days expires on each endpoint (§4.6 item 5), and the user of either endpoint can forget it at once (§4.6). |

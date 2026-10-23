@@ -3,8 +3,9 @@
 use refineid_rapp::{
     Action, EndpointRole, Guards, IDENTITY_OFFER_GRACE_MS, LIVENESS_PING_AFTER_SILENCE_MS,
     MAXIMUM_CPACE_ATTEMPTS, MINIMUM_REMAINING_ATTEMPTS, OFFER_TTL_MS, OperationEvent,
-    OperationState, PAIRING_CANDIDATES_MAX, PairingEvent, PairingState, QUIT_WITHDRAWAL_BOUND_MS,
-    SESSION_SILENCE_LIMIT_MS, SessionEvent, SessionState,
+    OperationState, PAIRING_CANDIDATES_MAX, PAIRING_IDLE_EXPIRY_DAYS, PairingEvent, PairingState,
+    QUIT_WITHDRAWAL_BOUND_MS, REVOCATION_NOTICE_DAYS, SESSION_SILENCE_LIMIT_MS, SessionEvent,
+    SessionState,
 };
 use serde::Deserialize;
 
@@ -28,6 +29,8 @@ struct Constants {
     offer_ttl_ms: u64,
     liveness_ping_after_silence_ms: u64,
     session_silence_limit_ms: u64,
+    revocation_notice_days: u64,
+    pairing_idle_expiry_days: u64,
     identity_offer_grace_ms: u64,
     quit_withdrawal_bound_ms: u64,
 }
@@ -130,6 +133,8 @@ fn formal_constants_are_the_engine_constants() {
         LIVENESS_PING_AFTER_SILENCE_MS
     );
     assert_eq!(constants.session_silence_limit_ms, SESSION_SILENCE_LIMIT_MS);
+    assert_eq!(constants.revocation_notice_days, REVOCATION_NOTICE_DAYS);
+    assert_eq!(constants.pairing_idle_expiry_days, PAIRING_IDLE_EXPIRY_DAYS);
     assert_eq!(constants.identity_offer_grace_ms, IDENTITY_OFFER_GRACE_MS);
     assert_eq!(constants.quit_withdrawal_bound_ms, QUIT_WITHDRAWAL_BOUND_MS);
 }
@@ -166,7 +171,7 @@ const PAIRING_CHANGING_ACTIONS: &[&str] = &[
 const WITHDRAWAL_EVENTS: &[&str] = &["service_withdrawn", "peer_withdrawal_notice"];
 
 #[test]
-fn no_withdrawal_changes_a_stored_pairing() {
+fn no_withdrawal_revokes_a_pairing() {
     let model = model();
     let rules = model
         .pairing
@@ -209,7 +214,10 @@ fn both_endpoints_withdraw_and_only_the_custodian_shows_its_peer_off() {
         )
         .expect("the custodian records the computer's withdrawal");
     assert_eq!(off.state, PairingState::PairedDisconnected);
-    assert_eq!(off.actions, &[Action::ShowPeerWithdrawn]);
+    assert_eq!(
+        off.actions,
+        &[Action::RecordLastSession, Action::ShowPeerWithdrawn]
+    );
     let back = off
         .state
         .transition(
@@ -228,6 +236,88 @@ fn both_endpoints_withdraw_and_only_the_custodian_shows_its_peer_off() {
             )
             .is_err()
     );
+}
+
+/// Actions that tell anyone anything: a user or the peer.
+fn is_notice(action: &str) -> bool {
+    action.starts_with("show_") || action.starts_with("send_")
+}
+
+#[test]
+fn no_pairing_expires_while_a_session_to_it_is_established() {
+    let model = model();
+    let expiries = model
+        .pairing
+        .transitions
+        .iter()
+        .filter(|rule| rule.event == "idle_expired")
+        .collect::<Vec<_>>();
+    assert!(!expiries.is_empty(), "the model names idle expiry");
+    for rule in expiries {
+        assert!(
+            rule.from.values().all(|from| from == "paired_disconnected"),
+            "a pairing expires only with no session established"
+        );
+        assert_eq!(rule.role, "both", "both endpoints expire a pairing");
+        assert!(
+            rule.actions.iter().all(|action| !is_notice(action)),
+            "idle expiry is silent"
+        );
+    }
+    for role in [EndpointRole::Requester, EndpointRole::Proxy] {
+        assert!(
+            PairingState::PairedConnected
+                .transition(role, PairingEvent::IdleExpired, all_guards())
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn a_requester_that_forgets_with_no_session_open_owes_nothing() {
+    let forgotten = PairingState::PairedDisconnected
+        .transition(
+            EndpointRole::Requester,
+            PairingEvent::ForgetPairing,
+            all_guards(),
+        )
+        .expect("the holder turns remote use off");
+    assert_eq!(forgotten.state, PairingState::Revoked);
+    assert!(forgotten.actions.contains(&Action::DestroyPairKeys));
+    assert!(!forgotten.actions.contains(&Action::SendClosePairingRevoked));
+    let custodian = PairingState::PairedDisconnected
+        .transition(
+            EndpointRole::Proxy,
+            PairingEvent::ForgetPairing,
+            all_guards(),
+        )
+        .expect("the custodian's user forgets the computer");
+    assert_eq!(custodian.state, PairingState::Revoking);
+}
+
+#[test]
+fn every_session_start_and_end_records_the_last_session() {
+    let model = model();
+    for event in [
+        "session_healthy",
+        "session_closed",
+        "peer_withdrawal_notice",
+    ] {
+        let rules = model
+            .pairing
+            .transitions
+            .iter()
+            .filter(|rule| rule.event == event)
+            .collect::<Vec<_>>();
+        assert!(!rules.is_empty(), "the model names {event}");
+        for rule in rules {
+            assert_eq!(
+                rule.actions.first().map(String::as_str),
+                Some("record_last_session"),
+                "{event}"
+            );
+        }
+    }
 }
 
 fn assert_pairing_rules(machine: &Machine) {
@@ -359,6 +449,7 @@ const fn formal_action_name(action: Action) -> &'static str {
         Action::SendClosePairingRevoked => "send_close_pairing_revoked",
         Action::CloseSession => "close_session",
         Action::DestroyPairKeys => "destroy_pair_keys",
+        Action::RecordLastSession => "record_last_session",
         Action::WithdrawIdentity => "withdraw_identity",
         Action::ShowConnected => "show_connected",
         Action::ShowPairedDisconnected => "show_paired_disconnected",
@@ -592,6 +683,7 @@ const PAIRING_EVENTS: &[(&str, PairingEvent)] = &[
     ("session_healthy", PairingEvent::SessionHealthy),
     ("session_closed", PairingEvent::SessionClosed),
     ("forget_pairing", PairingEvent::ForgetPairing),
+    ("idle_expired", PairingEvent::IdleExpired),
     ("revocation_notice_sent", PairingEvent::RevocationNoticeSent),
     ("notice_window_expired", PairingEvent::NoticeWindowExpired),
     ("peer_revocation_notice", PairingEvent::PeerRevocationNotice),

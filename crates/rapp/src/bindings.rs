@@ -125,10 +125,16 @@ pub struct RappPairMetadata {
     /// confirmation window: it opens no session, routes nothing, and the
     /// caller revokes it.
     pub storage_confirmed: bool,
-    /// When the local user forgot the pairing while no session was open:
-    /// the record serves nothing and keeps its key only to deliver the
-    /// `pairing_revoked` close on the next session (RAPP §4.6 item 2).
+    /// When the local user forgot the pairing, or it expired, while no
+    /// session was open: the record serves nothing and keeps its key only
+    /// to deliver the `pairing_revoked` close on the next session (RAPP
+    /// §4.6 item 2).
     pub forgotten_at_ms: Option<u64>,
+    /// The latest wall-clock time recorded with
+    /// [`RappPairRecord::record_session`] at which the pairing had an
+    /// established session, or `None` while it has had none (RAPP §4.6
+    /// item 5).
+    pub last_session_at_ms: Option<u64>,
 }
 
 /// What forgetting a pairing did (RAPP §4.6).
@@ -2617,13 +2623,17 @@ impl RappPairRecord {
             .map_err(|_| RappBindingError::LocalStateFailure)
     }
 
-    /// The local user forgets the pairing while no session to the peer is
-    /// open (RAPP §4.6). A confirmed record is stored as forgotten and keeps
-    /// its key only to deliver the `pairing_revoked` close on the next
-    /// session; an unconfirmed one is destroyed at once. With a session
-    /// open, close it with reason `pairing_revoked` and call
-    /// [`Self::revoke`] instead. `forgotten_at_ms` is milliseconds since the
-    /// Unix epoch.
+    /// The custodian's user forgets the pairing, or the pairing expired
+    /// ([`Self::idle_expired`]), while no session to the peer is open (RAPP
+    /// §4.6). A confirmed record is stored as forgotten and keeps its key
+    /// only to deliver the `pairing_revoked` close on the next session; an
+    /// unconfirmed one is destroyed at once. With a session open, close it
+    /// with reason `pairing_revoked` and call [`Self::revoke`] instead. A
+    /// requester whose holder turns remote use off never forgets this way:
+    /// it closes each open session with `pairing_revoked`, waits at most
+    /// [`rapp_quit_withdrawal_bound_ms`] for the closes to leave, and calls
+    /// [`Self::revoke`] for every pairing, owing nothing (§4.6 item 6).
+    /// `forgotten_at_ms` is milliseconds since the Unix epoch.
     ///
     /// # Errors
     /// [`RappBindingError`] on an already-revoked record or a storage
@@ -2672,10 +2682,75 @@ impl RappPairRecord {
         self.with_record(|record| Ok(record.revocation_notice_expired(now_ms)))
     }
 
+    /// Record that the pairing has a session established at `at_ms`,
+    /// milliseconds since the Unix epoch, and store the record (RAPP §4.6
+    /// item 5). Call it once [`RappSessionBridge::enter_established`]
+    /// succeeded, when that session ends, and at every idle-expiry sweep
+    /// while it stays established. The pairing's idle time runs from the
+    /// latest time recorded.
+    ///
+    /// # Errors
+    /// [`RappBindingError::WrongPhase`] for a revoked or forgotten record,
+    /// [`RappBindingError::StorageUnconfirmed`] for one the peer has not
+    /// confirmed, and [`RappBindingError::LocalStateFailure`] on a storage
+    /// failure, which leaves the time recorded in memory only.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "uniffi lowers exported arguments as owned values"
+    )]
+    pub fn record_session(
+        &self,
+        vault: Arc<dyn RappPairVault>,
+        at_ms: u64,
+    ) -> Result<(), RappBindingError> {
+        let mut guard = self
+            .record
+            .lock()
+            .map_err(|_| RappBindingError::LocalStateFailure)?;
+        let record = guard.take().ok_or(RappBindingError::WrongPhase)?;
+        let refusal = if !record.is_storage_confirmed() {
+            Some(RappBindingError::StorageUnconfirmed)
+        } else if record.forgotten_at_ms().is_some() {
+            Some(RappBindingError::WrongPhase)
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
+            *guard = Some(record);
+            return Err(refusal);
+        }
+        let recorded = record.with_session_at(at_ms);
+        let pair_id = recorded.pair_id().as_bytes().to_vec();
+        let stored = encode_pair_record(&recorded).and_then(|bytes| {
+            vault
+                .replace_device_only(pair_id, bytes)
+                .map_err(|_| RappBindingError::LocalStateFailure)
+        });
+        *guard = Some(recorded);
+        drop(guard);
+        stored
+    }
+
+    /// Whether the pairing has gone 30 days of wall-clock time, at
+    /// `now_ms` milliseconds since the Unix epoch, since its last recorded
+    /// session or, while it has had none, since its creation (RAPP §4.6
+    /// item 5). Sweep at launch and at least once a day: a pairing with a
+    /// session established now is recorded with [`Self::record_session`]
+    /// and never expires; any other that answers `true` is forgotten with
+    /// [`Self::forget`], silently. A forgotten record answers `false`.
+    ///
+    /// # Errors
+    /// [`RappBindingError`] when the record was already revoked.
+    pub fn idle_expired(&self, now_ms: u64) -> Result<bool, RappBindingError> {
+        self.with_record(|record| Ok(record.idle_expired(now_ms)))
+    }
+
     /// Irreversibly delete active secret material and retain only a local
     /// tombstone. The in-memory private key is dropped only after the vault
     /// confirms deletion; `revoked_at_ms` is milliseconds since the Unix
-    /// epoch.
+    /// epoch. A requester whose holder turns remote use off revokes every
+    /// pairing this way, after the closes of its open sessions left or
+    /// their bound passed (RAPP §4.6 item 6).
     ///
     /// # Errors
     /// [`RappBindingError`] on an already-revoked record or a storage
@@ -2979,7 +3054,9 @@ impl RappSessionBridge {
     }
 
     /// Promote the authenticated channel to healthy established use once the
-    /// Custodian sent, or the Requester verified, `session.ready`.
+    /// Custodian sent, or the Requester verified, `session.ready`. The
+    /// session is then established: record it with
+    /// [`RappPairRecord::record_session`].
     ///
     /// # Errors
     /// [`RappBindingError`] on the wrong phase, a forgotten record, or a
@@ -3161,6 +3238,7 @@ fn pair_metadata(record: &PairRecord) -> RappPairMetadata {
         created_at_ms: record.created_at_ms(),
         storage_confirmed: record.is_storage_confirmed(),
         forgotten_at_ms: record.forgotten_at_ms(),
+        last_session_at_ms: record.last_session_at_ms(),
     }
 }
 
@@ -3192,11 +3270,21 @@ pub fn rapp_stream_profile_name() -> String {
 }
 
 /// How long a requester that quits waits for its `service_withdrawn` closes
-/// to leave before it exits (RAPP v26.10.22 section 4.5 item 8).
+/// to leave before it exits (RAPP v26.10.22 section 4.5 item 8), and one
+/// whose holder turned remote use off waits for its `pairing_revoked` closes
+/// (section 4.6 item 6).
 #[uniffi::export]
 #[must_use]
 pub const fn rapp_quit_withdrawal_bound_ms() -> u64 {
     super::QUIT_WITHDRAWAL_BOUND_MS
+}
+
+/// How long a pairing lives without an established session before it
+/// expires (RAPP v26.10.22 section 4.6 item 5).
+#[uniffi::export]
+#[must_use]
+pub const fn rapp_pairing_idle_expiry_ms() -> u64 {
+    super::PAIRING_IDLE_EXPIRY_MS
 }
 
 /// Where a custodian sends one received routing preamble.
@@ -3544,8 +3632,8 @@ mod routing_binding_tests {
         RappVaultError, rapp_pairing_preamble, rapp_session_record, rapp_withdrawn_record,
     };
     use crate::{
-        BLE_PROFILE, EndpointRole, GrantsHash, PAIR_ID_SIZE, PairId, PairRecord, ProfileName,
-        STREAM_PROFILE, X25519_KEY_SIZE, noise::x25519_public_key,
+        BLE_PROFILE, EndpointRole, GrantsHash, PAIR_ID_SIZE, PAIRING_IDLE_EXPIRY_MS, PairId,
+        PairRecord, ProfileName, STREAM_PROFILE, X25519_KEY_SIZE, noise::x25519_public_key,
     };
     use std::sync::{Arc, Mutex};
 
@@ -3558,6 +3646,7 @@ mod routing_binding_tests {
     const UNIX_TIME_SECONDS: u64 = 1_791_504_899;
     const MILLISECONDS_PER_SECOND: u64 = 1_000;
     const REVOKED_AT_MS: u64 = UNIX_TIME_SECONDS * MILLISECONDS_PER_SECOND;
+    const SESSION_AT_MS: u64 = UNIX_TIME_SECONDS * MILLISECONDS_PER_SECOND;
 
     fn record(own: u8, peer: u8, pair: u8, role: EndpointRole) -> Arc<RappPairRecord> {
         let own_private = [own; X25519_KEY_SIZE];
@@ -3604,6 +3693,95 @@ mod routing_binding_tests {
         fn is_revoked(&self, _: Vec<u8>) -> Result<bool, RappVaultError> {
             Ok(*self.revoked.lock().expect("lock"))
         }
+    }
+
+    /// A vault that keeps the record last written in place.
+    struct ReplacingVault {
+        replaced: Mutex<Option<Vec<u8>>>,
+    }
+
+    impl ReplacingVault {
+        fn shared() -> Arc<Self> {
+            Arc::new(Self {
+                replaced: Mutex::new(None),
+            })
+        }
+    }
+
+    impl RappPairVault for ReplacingVault {
+        fn insert_device_only(&self, _: Vec<u8>, _: Vec<u8>) -> Result<(), RappVaultError> {
+            Err(RappVaultError::IdentifierAlreadyUsed)
+        }
+
+        fn load_device_only(&self, _: Vec<u8>) -> Result<Option<Vec<u8>>, RappVaultError> {
+            Ok(self.replaced.lock().expect("lock").clone())
+        }
+
+        fn replace_device_only(&self, _: Vec<u8>, record: Vec<u8>) -> Result<(), RappVaultError> {
+            *self.replaced.lock().expect("lock") = Some(record);
+            Ok(())
+        }
+
+        fn revoke_device_only(&self, _: Vec<u8>, _: u64) -> Result<(), RappVaultError> {
+            Ok(())
+        }
+
+        fn is_revoked(&self, _: Vec<u8>) -> Result<bool, RappVaultError> {
+            Ok(false)
+        }
+    }
+
+    #[test]
+    fn a_recorded_session_is_stored_and_renews_the_idle_time() {
+        let pair = requester();
+        let vault = ReplacingVault::shared();
+        assert!(
+            pair.idle_expired(CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS)
+                .expect("idle"),
+            "a pairing that never had a session expires from its creation"
+        );
+        pair.record_session(Arc::clone(&vault) as Arc<dyn RappPairVault>, SESSION_AT_MS)
+            .expect("record the session");
+        assert_eq!(
+            pair.metadata().expect("metadata").last_session_at_ms,
+            Some(SESSION_AT_MS)
+        );
+        assert!(
+            !pair
+                .idle_expired(SESSION_AT_MS + PAIRING_IDLE_EXPIRY_MS - 1)
+                .expect("idle")
+        );
+        assert!(
+            pair.idle_expired(SESSION_AT_MS + PAIRING_IDLE_EXPIRY_MS)
+                .expect("idle")
+        );
+        let reloaded = RappPairRecord::load_from_vault(
+            vec![PAIR_BYTE; PAIR_ID_SIZE],
+            vault as Arc<dyn RappPairVault>,
+        )
+        .expect("the stored record loads");
+        assert_eq!(
+            reloaded.metadata().expect("metadata").last_session_at_ms,
+            Some(SESSION_AT_MS)
+        );
+    }
+
+    #[test]
+    fn a_forgotten_pairing_records_no_session_and_never_expires_again() {
+        let pair = requester();
+        let vault = ReplacingVault::shared();
+        pair.forget(Arc::clone(&vault) as Arc<dyn RappPairVault>, SESSION_AT_MS)
+            .expect("forget");
+        assert!(matches!(
+            pair.record_session(vault as Arc<dyn RappPairVault>, SESSION_AT_MS),
+            Err(super::RappBindingError::WrongPhase)
+        ));
+        assert!(!pair.idle_expired(u64::MAX).expect("idle"));
+    }
+
+    #[test]
+    fn the_idle_expiry_accessor_is_the_engine_constant() {
+        assert_eq!(super::rapp_pairing_idle_expiry_ms(), PAIRING_IDLE_EXPIRY_MS);
     }
 
     #[test]

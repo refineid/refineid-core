@@ -188,20 +188,22 @@ The Custodian publishes three distinct discovery modes:
 To maintain clean, unobtrusive operation on enterprise and personal workstations:
 
 ### 5.1 Local Card Reader by Default
-- On launch, RefineID desktop applications (`refineid-unix`, `refineid-windows`, `refineid-apple`) must operate strictly as **Local Card Reader Software**.
+- RefineID desktop applications (`refineid-unix`, `refineid-windows`, `refineid-apple`) operate strictly as **Local Card Reader Software** until a phone is paired, and whenever remote use is off or suspended (§5.2).
 - The application monitors local Personal Computer/Smart Card (PC/SC) smart card readers (integrated laptop slots, USB CCID readers via `pcscd` or `winscard`).
-- Background radio scanning, mDNS service browsing, and network polling must not run by default.
+- Background radio scanning, mDNS service browsing, and network polling run only while remote use is on (§5.2); while it is off, nothing remote runs.
 
-### 5.2 Remote Use Is the Opt-In
-- A workstation offers one switch for remote use, off at every launch. While it is off the workstation is Local Card Reader Software only (§5.1): it browses no mDNS, scans no BLE, dials no phone, offers no identity from a phone, and requests no local-network or Bluetooth permission from the operating system. Only the holder turns it on, and turning it on is the only moment the workstation asks for those permissions.
-- While remote use is on and no usable stored pairing exists, the workstation asks for the pairing code a phone shows (RAPP §3) and browses `mode=pairing` only while a code is being tried (RAPP §4.2).
-- While remote use is on and at least one usable stored pairing exists:
+### 5.2 Remote Use Is the Pairing
+- A workstation offers one switch for remote use, and the switch is the pairing: remote use is on while the workstation holds an active pairing (RAPP §4.3 item 4) and off while it holds none. The switch keeps its state across quit, sleep, restart and software update: a workstation that holds an active pairing starts with remote use on, a start at login included, and one that holds none starts with it off.
+- While remote use is off the workstation is Local Card Reader Software only (§5.1): it browses no mDNS, scans no BLE, dials no phone for any reason, offers no identity from a phone, and needs and requests no local-network or Bluetooth permission from the operating system.
+- Only the holder turns remote use on, and turning it on is the only moment the workstation asks for those permissions; a launch with remote use on asks for none. Turning it on with no pairing asks for the pairing code a phone shows (RAPP §3), and the workstation browses `mode=pairing` only while a code is being tried (RAPP §4.2).
+- While remote use is on and not suspended:
   1. The Requester activates the mDNS browser and/or the BLE scanner.
   2. Paired Custodians appear in the reader selection list when discovered.
   3. Outbound connections are established on demand when the card is consulted or, under the offering rule (RAPP §8.4), held while an identity is offered.
-- Turning remote use off, and quitting the application while it is on, is the Requester's withdrawal (RAPP §4.5): the workstation closes every session at once with `session.close` reason `"service_withdrawn"`, withdraws every identity offered from a phone at once, halts the scanners and purges transient discovery caches. Stored pairings are kept, so turning it on again resumes without a new code.
-- Forgetting the last pairing halts the scanners, closes any idle outbound sockets and purges transient discovery caches, as turning remote use off does.
-- Inserting a card into a reader attached to the workstation turns remote use off, as the switch does; removing it leaves remote use off. While the card is present the workstation holds no phone session and offers no phone identity (STPA CC-86, CC-97).
+- The holder's click turning remote use off forgets every pairing the workstation holds (RAPP §4.6 item 6): the workstation closes every open session with `session.close` reason `"pairing_revoked"`, waiting at most 1 second for the closes to leave as for quitting, and destroys every pairing's key at once; a phone with no session open is told nothing and forgets the computer by its own idle expiry (RAPP §4.6 item 5). The workstation withdraws every identity offered from a phone at once, and halts the scanners, closes any idle outbound sockets and purges transient discovery caches. Only the holder's own click does this, and the switch is the workstation's only control that forgets a pairing. Turning remote use on again asks for a new pairing code.
+- A pairing that ends any other way, because the phone forgot it (RAPP §4.6 item 4) or it expired after 30 days without a session (RAPP §4.6 item 5), is gone as if forgotten; when the last one goes, remote use is off.
+- A card in a reader attached to the workstation suspends remote use while it is present: the workstation withdraws (RAPP §4.5 item 8), closing every open session with `session.close` reason `"service_withdrawn"`, and holds no phone session, starts no dial or scan, and offers no phone identity (STPA CC-86). When the card leaves, remote use resumes with the same pairing: discovery and dialing start again, without a code. Suspension leaves the switch on.
+- Quitting the application while remote use is on is the Requester's withdrawal too (RAPP §4.5 item 8): the workstation closes every open session with `"service_withdrawn"` and keeps every pairing, and its next launch starts with remote use on.
 
 ---
 

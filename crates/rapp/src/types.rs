@@ -41,7 +41,9 @@ pub const MINIMUM_REMAINING_ATTEMPTS: u8 = 3;
 /// item 3).
 pub const IDENTITY_OFFER_GRACE_MS: u64 = 120_000;
 /// How long a requester that quits waits for its `service_withdrawn` closes
-/// to leave before it exits (RAPP v26.10.22 section 4.5 item 8).
+/// to leave before it exits (RAPP v26.10.22 section 4.5 item 8), and one
+/// whose holder turned remote use off waits for its `pairing_revoked` closes
+/// (section 4.6 item 6).
 pub const QUIT_WITHDRAWAL_BOUND_MS: u64 = 1_000;
 
 /// Byte length of an offer identifier.

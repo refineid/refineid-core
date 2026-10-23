@@ -1402,7 +1402,9 @@ impl RappOperationBridge {
     /// a frame. An endpoint that withdraws, custodian or requester, closes
     /// every open session with `ServiceWithdrawn` (RAPP section 4.5 items 3
     /// and 8); a requester that quits waits at most
-    /// `rapp_quit_withdrawal_bound_ms()` for the frames to leave.
+    /// `rapp_quit_withdrawal_bound_ms()` for the frames to leave. A requester
+    /// whose holder turns remote use off closes every open session with
+    /// `PairingRevoked` under the same bound (section 4.6 item 6).
     ///
     /// # Errors
     /// [`RappBindingError::LocalStateFailure`] on a poisoned local state.

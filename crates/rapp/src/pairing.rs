@@ -17,7 +17,7 @@ use super::{
 const X25519_KEY_SIZE: usize = 32;
 
 /// Format version for encoded pairing records.
-pub const PAIR_RECORD_FORMAT_VERSION: u64 = 6;
+pub const PAIR_RECORD_FORMAT_VERSION: u64 = 7;
 
 /// Active long-term pairing material.
 ///
@@ -36,14 +36,20 @@ pub struct PairRecord {
     created_at_ms: u64,
     storage_confirmed: bool,
     forgotten_at_ms: Option<u64>,
+    last_session_at_ms: Option<u64>,
 }
 
 /// Days a forgotten pairing keeps its key to deliver the `pairing_revoked`
 /// close on a later session (RAPP v26.10.22 section 4.6 item 3).
-const REVOCATION_NOTICE_DAYS: u64 = 30;
+pub const REVOCATION_NOTICE_DAYS: u64 = 30;
+/// Days a pairing lives without an established session before it expires
+/// (RAPP v26.10.22 section 4.6 item 5).
+pub const PAIRING_IDLE_EXPIRY_DAYS: u64 = 30;
 const MILLISECONDS_PER_DAY: u64 = 86_400_000;
 /// How long a forgotten pairing keeps its key for the close.
 pub const REVOCATION_NOTICE_MS: u64 = REVOCATION_NOTICE_DAYS * MILLISECONDS_PER_DAY;
+/// How long a pairing lives without an established session.
+pub const PAIRING_IDLE_EXPIRY_MS: u64 = PAIRING_IDLE_EXPIRY_DAYS * MILLISECONDS_PER_DAY;
 
 impl PairRecord {
     /// Constructs a validated pairing record whose storage the peer has
@@ -88,6 +94,7 @@ impl PairRecord {
             created_at_ms,
             storage_confirmed: true,
             forgotten_at_ms: None,
+            last_session_at_ms: None,
         })
     }
 
@@ -155,17 +162,18 @@ impl PairRecord {
         self
     }
 
-    /// When its user forgot the pairing while no session was open: the
-    /// record serves nothing from then on and keeps its key only to deliver
-    /// the `pairing_revoked` close on the next session (section 4.6 item 2).
+    /// When its user forgot the pairing, or it expired (section 4.6 item 5),
+    /// while no session was open: the record serves nothing from then on
+    /// and keeps its key only to deliver the `pairing_revoked` close on the
+    /// next session (section 4.6 item 2).
     #[must_use]
     pub const fn forgotten_at_ms(&self) -> Option<u64> {
         self.forgotten_at_ms
     }
 
-    /// The record its user forgot at `at_ms`, kept for the close. A record
-    /// already forgotten keeps its first time, so the notice window of
-    /// section 4.6 item 3 runs from the revocation.
+    /// The record its user forgot, or that expired, at `at_ms`, kept for the
+    /// close. A record already forgotten keeps its first time, so the notice
+    /// window of section 4.6 item 3 runs from the revocation.
     #[must_use]
     pub const fn forgotten(mut self, at_ms: u64) -> Self {
         if self.forgotten_at_ms.is_none() {
@@ -182,6 +190,42 @@ impl PairRecord {
             Some(at_ms) => now_ms.saturating_sub(at_ms) >= REVOCATION_NOTICE_MS,
             None => false,
         }
+    }
+
+    /// The latest wall-clock time, in milliseconds since the Unix epoch, at
+    /// which the pairing had an established session, or `None` while it has
+    /// had none (section 4.6 item 5).
+    #[must_use]
+    pub const fn last_session_at_ms(&self) -> Option<u64> {
+        self.last_session_at_ms
+    }
+
+    /// The record whose pairing had an established session at `at_ms`,
+    /// milliseconds since the Unix epoch. The endpoint records this at least
+    /// when a session is established and when it ends; the idle time of
+    /// section 4.6 item 5 runs from the latest time recorded.
+    #[must_use]
+    pub const fn with_session_at(mut self, at_ms: u64) -> Self {
+        self.last_session_at_ms = Some(at_ms);
+        self
+    }
+
+    /// Whether the pairing has gone [`PAIRING_IDLE_EXPIRY_MS`] of wall-clock
+    /// time since its last recorded session, or since its creation while it
+    /// has had none, so that the endpoint revokes it (section 4.6 item 5).
+    /// A forgotten record is revoked already and never expires. A pairing
+    /// with a session established now never expires either, so the endpoint
+    /// asks this only of one without.
+    #[must_use]
+    pub const fn idle_expired(&self, now_ms: u64) -> bool {
+        if self.forgotten_at_ms.is_some() {
+            return false;
+        }
+        let since_ms = match self.last_session_at_ms {
+            Some(at_ms) => at_ms,
+            None => self.created_at_ms,
+        };
+        now_ms.saturating_sub(since_ms) >= PAIRING_IDLE_EXPIRY_MS
     }
 
     /// The profiles a session of this record serves: the granted ones, or
@@ -216,6 +260,7 @@ impl fmt::Debug for PairRecord {
             .field("created_at_ms", &self.created_at_ms)
             .field("storage_confirmed", &self.storage_confirmed)
             .field("forgotten_at_ms", &self.forgotten_at_ms)
+            .field("last_session_at_ms", &self.last_session_at_ms)
             .finish()
     }
 }
@@ -324,6 +369,12 @@ pub fn encode_pair_record(record: &PairRecord) -> Result<Vec<u8>, PairRecordCode
                 .forgotten_at_ms()
                 .map_or(WireValue::Null, WireValue::Unsigned),
         ),
+        (
+            "last_session_at_ms".to_owned(),
+            record
+                .last_session_at_ms()
+                .map_or(WireValue::Null, WireValue::Unsigned),
+        ),
     ]));
     encode_deterministic_cbor(&value).map_err(|_| PairRecordCodecError::ProtocolFailure)
 }
@@ -351,6 +402,7 @@ pub fn decode_pair_record(bytes: &[u8]) -> Result<PairRecord, PairRecordCodecErr
         "created_at_ms",
         "storage_confirmed",
         "forgotten_at_ms",
+        "last_session_at_ms",
     ];
     if map.keys().any(|key| !expected.contains(&key.as_str())) {
         return Err(PairRecordCodecError::InvalidInput);
@@ -376,11 +428,8 @@ pub fn decode_pair_record(bytes: &[u8]) -> Result<PairRecord, PairRecordCodecErr
         .collect::<Result<Vec<_>, _>>()?;
     let created_at_ms = take_unsigned(&mut map, "created_at_ms")?;
     let storage_confirmed = take_bool(&mut map, "storage_confirmed")?;
-    let forgotten_at_ms = match map.remove("forgotten_at_ms") {
-        Some(WireValue::Null) => None,
-        Some(WireValue::Unsigned(at_ms)) => Some(at_ms),
-        _ => return Err(PairRecordCodecError::InvalidInput),
-    };
+    let forgotten_at_ms = take_optional_unsigned(&mut map, "forgotten_at_ms")?;
+    let last_session_at_ms = take_optional_unsigned(&mut map, "last_session_at_ms")?;
     if !map.is_empty() {
         return Err(PairRecordCodecError::InvalidInput);
     }
@@ -399,6 +448,10 @@ pub fn decode_pair_record(bytes: &[u8]) -> Result<PairRecord, PairRecordCodecErr
         record
     } else {
         record.awaiting_storage_confirmation()
+    };
+    let record = match last_session_at_ms {
+        Some(at_ms) => record.with_session_at(at_ms),
+        None => record,
     };
     Ok(match forgotten_at_ms {
         Some(at_ms) => record.forgotten(at_ms),
@@ -485,6 +538,17 @@ fn take_unsigned(
     }
 }
 
+fn take_optional_unsigned(
+    map: &mut BTreeMap<String, WireValue>,
+    key: &str,
+) -> Result<Option<u64>, PairRecordCodecError> {
+    match take_value(map, key)? {
+        WireValue::Null => Ok(None),
+        WireValue::Unsigned(value) => Ok(Some(value)),
+        _ => Err(PairRecordCodecError::InvalidInput),
+    }
+}
+
 fn take_bool(
     map: &mut BTreeMap<String, WireValue>,
     key: &str,
@@ -514,11 +578,53 @@ fn take_text_array(
 #[cfg(test)]
 mod tests {
     use super::{
-        EndpointRole, GrantsHash, PairId, PairRecord, ProfileName, REVOCATION_NOTICE_MS,
-        decode_pair_record, decode_pair_records, encode_pair_record, encode_pair_records,
+        EndpointRole, GrantsHash, PAIRING_IDLE_EXPIRY_MS, PairId, PairRecord, ProfileName,
+        REVOCATION_NOTICE_MS, decode_pair_record, decode_pair_records, encode_pair_record,
+        encode_pair_records,
     };
 
+    const CREATED_AT_MS: u64 = 1_700_000_000_000;
     const FORGOTTEN_AT_MS: u64 = 1_800_000_000_000;
+    const SESSION_AT_MS: u64 = 1_750_000_000_000;
+
+    #[test]
+    fn a_pairing_without_sessions_expires_from_its_creation() {
+        let record = test_record(0x42);
+        assert_eq!(record.last_session_at_ms(), None);
+        assert!(!record.idle_expired(CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS - 1));
+        assert!(record.idle_expired(CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS));
+    }
+
+    #[test]
+    fn a_recorded_session_renews_the_idle_time() {
+        let record = test_record(0x42).with_session_at(SESSION_AT_MS);
+        assert!(!record.idle_expired(CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS));
+        assert!(!record.idle_expired(SESSION_AT_MS + PAIRING_IDLE_EXPIRY_MS - 1));
+        assert!(record.idle_expired(SESSION_AT_MS + PAIRING_IDLE_EXPIRY_MS));
+    }
+
+    #[test]
+    fn a_clock_behind_the_last_session_expires_nothing() {
+        let record = test_record(0x42).with_session_at(SESSION_AT_MS);
+        assert!(!record.idle_expired(CREATED_AT_MS));
+    }
+
+    #[test]
+    fn a_forgotten_record_never_expires_again() {
+        let forgotten = test_record(0x42).forgotten(FORGOTTEN_AT_MS);
+        assert!(!forgotten.idle_expired(u64::MAX));
+    }
+
+    #[test]
+    fn the_last_session_round_trips() {
+        let original = test_record(0x42).with_session_at(SESSION_AT_MS);
+        let decoded =
+            decode_pair_record(&encode_pair_record(&original).expect("encode")).expect("decode");
+        assert_eq!(decoded.last_session_at_ms(), Some(SESSION_AT_MS));
+        let fresh = decode_pair_record(&encode_pair_record(&test_record(0x42)).expect("encode"))
+            .expect("decode");
+        assert_eq!(fresh.last_session_at_ms(), None);
+    }
 
     #[test]
     fn a_forgotten_record_round_trips_and_serves_nothing() {
@@ -558,7 +664,7 @@ mod tests {
             [id_byte.wrapping_add(4); 32],
             GrantsHash::from_array([id_byte.wrapping_add(5); 32]),
             vec![ProfileName::Authentication, ProfileName::CardStatus],
-            1_700_000_000_000,
+            CREATED_AT_MS,
         )
         .expect("valid pair record")
     }

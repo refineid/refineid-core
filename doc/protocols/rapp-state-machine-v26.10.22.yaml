@@ -199,6 +199,11 @@ pairing:
       to: unpaired
       actions: [close_candidate, show_none_in_pairing_mode]
     - from: exchanging
+      event: search_interrupted            # a card in a reader attached to the requester, or the holder turning remote use off, ends the search; the code entry is offered again once remote use resumes
+      role: requester
+      to: unpaired
+      actions: [close_candidate]
+    - from: exchanging
       event: offer_expired_or_cancelled
       role: custodian
       to: unpaired

@@ -313,6 +313,24 @@ fn nothing_reaches_a_phone_while_remote_use_is_off_or_suspended() {
             )
             .is_err()
     );
+    let ended = PairingState::Exchanging
+        .transition(
+            EndpointRole::Requester,
+            PairingEvent::SearchInterrupted,
+            all_guards(),
+        )
+        .expect("suspension ends a pairing search");
+    assert_eq!(ended.state, PairingState::Unpaired);
+    assert!(
+        PairingState::Exchanging
+            .transition(
+                EndpointRole::Proxy,
+                PairingEvent::SearchInterrupted,
+                all_guards()
+            )
+            .is_err(),
+        "only a requester searches"
+    );
     let refused = Guards {
         initiation_permitted: false,
         ..all_guards()
@@ -718,6 +736,7 @@ const PAIRING_EVENTS: &[(&str, PairingEvent)] = &[
     ("last_attempt_failed", PairingEvent::LastAttemptFailed),
     ("last_candidate_failed", PairingEvent::LastCandidateFailed),
     ("no_custodian_tried", PairingEvent::NoCustodianTried),
+    ("search_interrupted", PairingEvent::SearchInterrupted),
     ("key_confirmed", PairingEvent::KeyConfirmed),
     (
         "handshake_authenticated",

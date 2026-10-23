@@ -68,6 +68,64 @@ pub enum SweepOutcome {
     Expired,
 }
 
+/// Why a sweep changed nothing although its pairing needed a change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepError<E> {
+    /// The changed record could not be encoded; nothing was handed to the
+    /// store.
+    Encoding(PairRecordCodecError),
+    /// The store refused the changed record. The record is as it was, and
+    /// the next sweep repeats the whole step.
+    Store(E),
+}
+
+impl<E: fmt::Display> fmt::Display for SweepError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Encoding(error) => write!(formatter, "the swept record did not encode: {error}"),
+            Self::Store(error) => write!(formatter, "the store refused the swept record: {error}"),
+        }
+    }
+}
+
+impl<E: fmt::Debug + fmt::Display> core::error::Error for SweepError<E> {}
+
+/// A pair record in its stored form, on its way to the device-only store.
+/// It carries the static private key, so it is zeroized on drop, cannot be
+/// cloned, and formats without its bytes. Only this module encodes one.
+pub struct EncodedPairRecord(Zeroizing<Vec<u8>>);
+
+impl EncodedPairRecord {
+    /// The bytes the device-only store writes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for EncodedPairRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("EncodedPairRecord([redacted])")
+    }
+}
+
+/// The times a sweep leaves in one record and what it did, decided before
+/// anything changes so that the store commits first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SweepPlan {
+    outcome: SweepOutcome,
+    last_session_at_ms: Option<u64>,
+    forgotten_at_ms: Option<u64>,
+}
+
+/// The later of a recorded session time and a new reading.
+const fn later_session(recorded_ms: Option<u64>, at_ms: u64) -> u64 {
+    match recorded_ms {
+        Some(recorded_ms) if recorded_ms >= at_ms => recorded_ms,
+        _ => at_ms,
+    }
+}
+
 impl PairRecord {
     /// Constructs a validated pairing record whose storage the peer has
     /// confirmed. The pairing flow builds its record unconfirmed and
@@ -218,16 +276,14 @@ impl PairRecord {
     }
 
     /// The record whose pairing had an established session at `at_ms`,
-    /// milliseconds since the Unix epoch. The recorded time only moves
-    /// forward: a time before the one already recorded, as a clock set back
-    /// reads, leaves it as it is. The idle time of section 4.6 item 5 runs
-    /// from the latest time recorded.
+    /// milliseconds since the Unix epoch, as stored. The recorded time only
+    /// moves forward: a time before the one already recorded, as a clock set
+    /// back reads, leaves it as it is. The idle time of section 4.6 item 5
+    /// runs from the latest time recorded; [`Self::sweep`] is the only way
+    /// to record a session.
     #[must_use]
-    pub const fn with_session_at(mut self, at_ms: u64) -> Self {
-        self.last_session_at_ms = match self.last_session_at_ms {
-            Some(recorded_ms) if recorded_ms >= at_ms => Some(recorded_ms),
-            _ => Some(at_ms),
-        };
+    const fn with_session_at(mut self, at_ms: u64) -> Self {
+        self.last_session_at_ms = Some(later_session(self.last_session_at_ms, at_ms));
         self
     }
 
@@ -242,21 +298,64 @@ impl PairRecord {
     /// confirmed or one already forgotten, is kept as it is: section 4.3
     /// item 4 and section 4.6 item 3 govern it.
     ///
+    /// A change is stored before it is made: the sweep hands the changed
+    /// record, encoded, to `store`, which writes it to the device-only
+    /// store, and changes this record only when `store` returned `Ok`. With
+    /// nothing to change ([`SweepOutcome::Kept`]) it calls nothing. A
+    /// refused store leaves the record as it was, so the next sweep repeats
+    /// the whole step.
+    ///
     /// The endpoint sweeps every pairing when it starts and at least once a
     /// day, and sweeps a pairing with `session_established` true when a
     /// session to it is established and when that session ends.
-    #[must_use]
-    pub const fn sweep(self, now_ms: u64, session_established: bool) -> (Self, SweepOutcome) {
+    ///
+    /// # Errors
+    /// [`SweepError::Store`] with the store's error, and
+    /// [`SweepError::Encoding`] when the changed record does not encode; the
+    /// record is unchanged in both.
+    pub fn sweep<E>(
+        &mut self,
+        now_ms: u64,
+        session_established: bool,
+        store: impl FnOnce(&EncodedPairRecord) -> Result<(), E>,
+    ) -> Result<SweepOutcome, SweepError<E>> {
+        let plan = self.plan_sweep(now_ms, session_established);
+        if plan.outcome == SweepOutcome::Kept {
+            return Ok(plan.outcome);
+        }
+        let encoded = encode_with_times(self, plan.forgotten_at_ms, plan.last_session_at_ms)
+            .map_err(SweepError::Encoding)?;
+        store(&EncodedPairRecord(Zeroizing::new(encoded))).map_err(SweepError::Store)?;
+        self.last_session_at_ms = plan.last_session_at_ms;
+        self.forgotten_at_ms = plan.forgotten_at_ms;
+        Ok(plan.outcome)
+    }
+
+    /// What [`Self::sweep`] would leave in this record, without changing it.
+    const fn plan_sweep(&self, now_ms: u64, session_established: bool) -> SweepPlan {
+        let unchanged = SweepPlan {
+            outcome: SweepOutcome::Kept,
+            last_session_at_ms: self.last_session_at_ms,
+            forgotten_at_ms: self.forgotten_at_ms,
+        };
         if !self.storage_confirmed || self.forgotten_at_ms.is_some() {
-            return (self, SweepOutcome::Kept);
+            return unchanged;
         }
         if session_established {
-            return (self.with_session_at(now_ms), SweepOutcome::Recorded);
+            return SweepPlan {
+                outcome: SweepOutcome::Recorded,
+                last_session_at_ms: Some(later_session(self.last_session_at_ms, now_ms)),
+                ..unchanged
+            };
         }
         if self.idle_limit_reached(now_ms) {
-            return (self.forgotten(now_ms), SweepOutcome::Expired);
+            return SweepPlan {
+                outcome: SweepOutcome::Expired,
+                forgotten_at_ms: Some(now_ms),
+                ..unchanged
+            };
         }
-        (self, SweepOutcome::Kept)
+        unchanged
     }
 
     /// Whether [`PAIRING_IDLE_EXPIRY_MS`] have passed at `now_ms` since the
@@ -356,6 +455,18 @@ impl core::error::Error for PairRecordCodecError {}
 /// # Errors
 /// [`PairRecordCodecError::ProtocolFailure`] if serialization fails.
 pub fn encode_pair_record(record: &PairRecord) -> Result<Vec<u8>, PairRecordCodecError> {
+    encode_with_times(
+        record,
+        record.forgotten_at_ms(),
+        record.last_session_at_ms(),
+    )
+}
+
+fn encode_with_times(
+    record: &PairRecord,
+    forgotten_at_ms: Option<u64>,
+    last_session_at_ms: Option<u64>,
+) -> Result<Vec<u8>, PairRecordCodecError> {
     let role = match record.role() {
         EndpointRole::Requester => "requester",
         EndpointRole::Proxy => "proxy",
@@ -406,15 +517,11 @@ pub fn encode_pair_record(record: &PairRecord) -> Result<Vec<u8>, PairRecordCode
         ),
         (
             "forgotten_at_ms".to_owned(),
-            record
-                .forgotten_at_ms()
-                .map_or(WireValue::Null, WireValue::Unsigned),
+            forgotten_at_ms.map_or(WireValue::Null, WireValue::Unsigned),
         ),
         (
             "last_session_at_ms".to_owned(),
-            record
-                .last_session_at_ms()
-                .map_or(WireValue::Null, WireValue::Unsigned),
+            last_session_at_ms.map_or(WireValue::Null, WireValue::Unsigned),
         ),
     ]));
     encode_deterministic_cbor(&value).map_err(|_| PairRecordCodecError::ProtocolFailure)
@@ -620,72 +727,84 @@ fn take_text_array(
 mod tests {
     use super::{
         EndpointRole, GrantsHash, MILLISECONDS_PER_DAY, PAIRING_IDLE_EXPIRY_DAYS,
-        PAIRING_IDLE_EXPIRY_MS, PairId, PairRecord, ProfileName, REVOCATION_NOTICE_MS,
+        PAIRING_IDLE_EXPIRY_MS, PairId, PairRecord, ProfileName, REVOCATION_NOTICE_MS, SweepError,
         SweepOutcome, decode_pair_record, decode_pair_records, encode_pair_record,
         encode_pair_records,
     };
+    use core::convert::Infallible;
 
     const CREATED_AT_MS: u64 = 1_700_000_000_000;
     const FORGOTTEN_AT_MS: u64 = 1_800_000_000_000;
     const SESSION_AT_MS: u64 = 1_750_000_000_000;
 
-    fn swept(record: PairRecord, now_ms: u64, session_established: bool) -> SweepOutcome {
-        record.sweep(now_ms, session_established).1
+    /// Sweeps `record` into a store that accepts every write.
+    fn swept(record: &mut PairRecord, now_ms: u64, session_established: bool) -> SweepOutcome {
+        record
+            .sweep(now_ms, session_established, |_| Ok::<(), Infallible>(()))
+            .expect("the store accepts")
     }
 
     #[test]
     fn a_pairing_without_sessions_expires_from_its_creation() {
-        assert_eq!(test_record(0x42).last_session_at_ms(), None);
+        let mut record = test_record(0x42);
+        assert_eq!(record.last_session_at_ms(), None);
         assert_eq!(
             swept(
-                test_record(0x42),
+                &mut record,
                 CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS - 1,
                 false
             ),
             SweepOutcome::Kept
         );
-        let (expired, outcome) =
-            test_record(0x42).sweep(CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS, false);
-        assert_eq!(outcome, SweepOutcome::Expired);
         assert_eq!(
-            expired.forgotten_at_ms(),
+            swept(&mut record, CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS, false),
+            SweepOutcome::Expired
+        );
+        assert_eq!(
+            record.forgotten_at_ms(),
             Some(CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS)
         );
-        assert!(expired.serving_profiles().is_empty());
+        assert!(record.serving_profiles().is_empty());
     }
 
     #[test]
     fn a_recorded_session_renews_the_idle_time() {
         let record = || test_record(0x42).with_session_at(SESSION_AT_MS);
         assert_eq!(
-            swept(record(), CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS, false),
+            swept(&mut record(), CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS, false),
             SweepOutcome::Kept
         );
         assert_eq!(
-            swept(record(), SESSION_AT_MS + PAIRING_IDLE_EXPIRY_MS - 1, false),
+            swept(
+                &mut record(),
+                SESSION_AT_MS + PAIRING_IDLE_EXPIRY_MS - 1,
+                false
+            ),
             SweepOutcome::Kept
         );
         assert_eq!(
-            swept(record(), SESSION_AT_MS + PAIRING_IDLE_EXPIRY_MS, false),
+            swept(&mut record(), SESSION_AT_MS + PAIRING_IDLE_EXPIRY_MS, false),
             SweepOutcome::Expired
         );
     }
 
     #[test]
     fn the_recorded_session_time_never_moves_back() {
-        let record = test_record(0x42)
+        let mut record = test_record(0x42)
             .with_session_at(SESSION_AT_MS)
             .with_session_at(SESSION_AT_MS - MILLISECONDS_PER_DAY);
         assert_eq!(record.last_session_at_ms(), Some(SESSION_AT_MS));
-        let (record, outcome) = record.sweep(CREATED_AT_MS, true);
-        assert_eq!(outcome, SweepOutcome::Recorded);
+        assert_eq!(
+            swept(&mut record, CREATED_AT_MS, true),
+            SweepOutcome::Recorded
+        );
         assert_eq!(record.last_session_at_ms(), Some(SESSION_AT_MS));
     }
 
     #[test]
     fn a_clock_behind_the_last_session_expires_nothing() {
-        let record = test_record(0x42).with_session_at(SESSION_AT_MS);
-        assert_eq!(swept(record, CREATED_AT_MS, false), SweepOutcome::Kept);
+        let mut record = test_record(0x42).with_session_at(SESSION_AT_MS);
+        assert_eq!(swept(&mut record, CREATED_AT_MS, false), SweepOutcome::Kept);
     }
 
     #[test]
@@ -694,15 +813,15 @@ mod tests {
         let mut now_ms = CREATED_AT_MS;
         for _ in 0..PAIRING_IDLE_EXPIRY_DAYS * 2 {
             now_ms += MILLISECONDS_PER_DAY;
-            let (next, outcome) = record.sweep(now_ms, true);
-            assert_eq!(outcome, SweepOutcome::Recorded);
-            record = next;
+            assert_eq!(swept(&mut record, now_ms, true), SweepOutcome::Recorded);
         }
         assert_eq!(record.last_session_at_ms(), Some(now_ms));
-        let (record, outcome) = record.sweep(now_ms + PAIRING_IDLE_EXPIRY_MS - 1, false);
-        assert_eq!(outcome, SweepOutcome::Kept);
         assert_eq!(
-            swept(record, now_ms + PAIRING_IDLE_EXPIRY_MS, false),
+            swept(&mut record, now_ms + PAIRING_IDLE_EXPIRY_MS - 1, false),
+            SweepOutcome::Kept
+        );
+        assert_eq!(
+            swept(&mut record, now_ms + PAIRING_IDLE_EXPIRY_MS, false),
             SweepOutcome::Expired
         );
     }
@@ -710,23 +829,91 @@ mod tests {
     #[test]
     fn a_long_idle_pairing_with_a_session_established_is_recorded_not_expired() {
         let now_ms = CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS * 2;
-        let (record, outcome) = test_record(0x42).sweep(now_ms, true);
-        assert_eq!(outcome, SweepOutcome::Recorded);
+        let mut record = test_record(0x42);
+        assert_eq!(swept(&mut record, now_ms, true), SweepOutcome::Recorded);
         assert_eq!(record.forgotten_at_ms(), None);
         assert_eq!(record.last_session_at_ms(), Some(now_ms));
     }
 
     #[test]
+    fn the_store_receives_the_record_the_sweep_leaves() {
+        let now_ms = CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS;
+        for session_established in [true, false] {
+            let mut record = test_record(0x42);
+            let before = encode_pair_record(&record).expect("encode record");
+            let mut stored = None;
+            record
+                .sweep(now_ms, session_established, |encoded| {
+                    stored = Some(encoded.as_bytes().to_vec());
+                    Ok::<(), Infallible>(())
+                })
+                .expect("the store accepts");
+            let stored = stored.expect("a change is stored");
+            assert_ne!(stored, before, "the sweep changes the stored times");
+            assert_eq!(encode_pair_record(&record).expect("encode swept"), stored);
+        }
+    }
+
+    #[test]
+    fn a_sweep_whose_store_failed_is_repeated_whole() {
+        let expired_at_ms = CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS;
+        let mut record = test_record(0x42);
+        assert_eq!(
+            record.sweep(expired_at_ms, false, |_| Err("store unavailable")),
+            Err(SweepError::Store("store unavailable"))
+        );
+        assert_eq!(
+            record.forgotten_at_ms(),
+            None,
+            "a refused store leaves the record as it was"
+        );
+        let mut stored = None;
+        assert_eq!(
+            record.sweep(expired_at_ms, false, |encoded| {
+                stored = Some(encoded.as_bytes().to_vec());
+                Ok::<(), Infallible>(())
+            }),
+            Ok(SweepOutcome::Expired)
+        );
+        let stored = decode_pair_record(&stored.expect("the retry stores")).expect("decode");
+        assert_eq!(stored.forgotten_at_ms(), Some(expired_at_ms));
+        assert_eq!(record.forgotten_at_ms(), Some(expired_at_ms));
+
+        let mut record = test_record(0x42);
+        assert!(
+            record
+                .sweep(SESSION_AT_MS, true, |_| Err("store unavailable"))
+                .is_err()
+        );
+        assert_eq!(record.last_session_at_ms(), None);
+        assert_eq!(
+            swept(&mut record, SESSION_AT_MS, true),
+            SweepOutcome::Recorded
+        );
+        assert_eq!(record.last_session_at_ms(), Some(SESSION_AT_MS));
+    }
+
+    #[test]
+    fn a_sweep_that_changes_nothing_stores_nothing() {
+        let mut record = test_record(0x42);
+        assert_eq!(
+            record.sweep(CREATED_AT_MS, false, |_| -> Result<(), Infallible> {
+                unreachable!("nothing changed, so nothing is stored")
+            }),
+            Ok(SweepOutcome::Kept)
+        );
+    }
+
+    #[test]
     fn a_record_that_is_not_active_is_kept_as_it_is() {
-        let (forgotten, outcome) = test_record(0x42)
-            .forgotten(FORGOTTEN_AT_MS)
-            .sweep(u64::MAX, false);
-        assert_eq!(outcome, SweepOutcome::Kept);
+        let mut forgotten = test_record(0x42).forgotten(FORGOTTEN_AT_MS);
+        assert_eq!(swept(&mut forgotten, u64::MAX, false), SweepOutcome::Kept);
         assert_eq!(forgotten.forgotten_at_ms(), Some(FORGOTTEN_AT_MS));
-        let (unconfirmed, outcome) = test_record(0x42)
-            .awaiting_storage_confirmation()
-            .sweep(SESSION_AT_MS, true);
-        assert_eq!(outcome, SweepOutcome::Kept);
+        let mut unconfirmed = test_record(0x42).awaiting_storage_confirmation();
+        assert_eq!(
+            swept(&mut unconfirmed, SESSION_AT_MS, true),
+            SweepOutcome::Kept
+        );
         assert_eq!(unconfirmed.last_session_at_ms(), None);
     }
 

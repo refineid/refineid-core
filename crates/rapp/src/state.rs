@@ -151,6 +151,11 @@ pub enum PairingEvent {
     /// No endpoint served an offer the requester could try, and its search
     /// ended.
     NoCustodianTried,
+    /// Remote use stopped being available during the requester's search: a
+    /// card in a reader attached to it, or the holder turned remote use off.
+    /// The search ends; the code entry is offered again once remote use
+    /// resumes.
+    SearchInterrupted,
     /// Both CPace confirmation tags verified.
     KeyConfirmed,
     /// The pairing handshake completed.
@@ -612,6 +617,13 @@ impl PairingState {
                 Transition {
                     state: Self::Unpaired,
                     actions: &[A::CloseCandidate, A::ShowNoneInPairingMode],
+                }
+            }
+            (Self::Exchanging, E::SearchInterrupted) => {
+                require_role(role, EndpointRole::Requester)?;
+                Transition {
+                    state: Self::Unpaired,
+                    actions: &[A::CloseCandidate],
                 }
             }
             (Self::Exchanging, E::LastAttemptFailed) => {

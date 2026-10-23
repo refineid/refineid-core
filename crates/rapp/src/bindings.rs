@@ -2713,7 +2713,10 @@ impl RappPairRecord {
     /// whatever was recorded before, so no order of calls expires a pairing
     /// in session; the recorded time never moves back. Without one, the
     /// pairing expires 30 days after its latest recorded session, or its
-    /// creation while it has had none, and is then stored as forgotten.
+    /// creation while it has had none, and is then stored as forgotten. The
+    /// change is stored first and taken into memory only once the vault
+    /// confirmed it, so a sweep that failed to store is repeated whole by
+    /// the next one.
     ///
     /// Sweep every pairing at launch and at least once a day, and sweep a
     /// pairing with `session_established` true once
@@ -2724,7 +2727,11 @@ impl RappPairRecord {
     /// [`RappBindingError::WrongPhase`] for a revoked record,
     /// [`RappBindingError::StorageUnconfirmed`] for one the peer has not
     /// confirmed, and [`RappBindingError::LocalStateFailure`] on a storage
-    /// failure, which leaves the change in memory only.
+    /// failure, which changes nothing.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the record lock covers the vault write so the record in memory changes only with the stored one"
+    )]
     #[allow(
         clippy::needless_pass_by_value,
         reason = "uniffi lowers exported arguments as owned values"
@@ -2739,26 +2746,21 @@ impl RappPairRecord {
             .record
             .lock()
             .map_err(|_| RappBindingError::LocalStateFailure)?;
-        let record = guard.take().ok_or(RappBindingError::WrongPhase)?;
+        let record = guard.as_mut().ok_or(RappBindingError::WrongPhase)?;
         if !record.is_storage_confirmed() {
-            *guard = Some(record);
             return Err(RappBindingError::StorageUnconfirmed);
         }
-        let (swept, outcome) = record.sweep(now_ms, session_established);
-        let stored = match outcome {
-            super::SweepOutcome::Kept => Ok(()),
-            super::SweepOutcome::Recorded | super::SweepOutcome::Expired => {
-                let pair_id = swept.pair_id().as_bytes().to_vec();
-                encode_pair_record(&swept).and_then(|bytes| {
-                    vault
-                        .replace_device_only(pair_id, bytes)
-                        .map_err(|_| RappBindingError::LocalStateFailure)
-                })
-            }
-        };
-        *guard = Some(swept);
+        let pair_id = record.pair_id().as_bytes().to_vec();
+        let outcome = record
+            .sweep(now_ms, session_established, |encoded| {
+                vault.replace_device_only(pair_id, encoded.as_bytes().to_vec())
+            })
+            .map_err(|error| match error {
+                super::SweepError::Encoding(_) => RappBindingError::ProtocolFailure,
+                super::SweepError::Store(_) => RappBindingError::LocalStateFailure,
+            })?;
         drop(guard);
-        stored.map(|()| outcome.into())
+        Ok(outcome.into())
     }
 
     /// Irreversibly delete active secret material and retain only a local
@@ -3713,15 +3715,22 @@ mod routing_binding_tests {
         }
     }
 
-    /// A vault that keeps the record last written in place.
+    /// A vault that keeps the record last written in place, after refusing
+    /// as many writes as it was told to.
     struct ReplacingVault {
         replaced: Mutex<Option<Vec<u8>>>,
+        writes_to_refuse: Mutex<usize>,
     }
 
     impl ReplacingVault {
         fn shared() -> Arc<Self> {
+            Self::refusing(0)
+        }
+
+        fn refusing(writes_to_refuse: usize) -> Arc<Self> {
             Arc::new(Self {
                 replaced: Mutex::new(None),
+                writes_to_refuse: Mutex::new(writes_to_refuse),
             })
         }
     }
@@ -3736,6 +3745,12 @@ mod routing_binding_tests {
         }
 
         fn replace_device_only(&self, _: Vec<u8>, record: Vec<u8>) -> Result<(), RappVaultError> {
+            let mut refusals = self.writes_to_refuse.lock().expect("lock");
+            if *refusals > 0 {
+                *refusals -= 1;
+                return Err(RappVaultError::Unavailable);
+            }
+            drop(refusals);
             *self.replaced.lock().expect("lock") = Some(record);
             Ok(())
         }
@@ -3809,6 +3824,65 @@ mod routing_binding_tests {
         .expect("sweep");
         pair.sweep(vault as Arc<dyn RappPairVault>, CREATED_AT_MS, true)
             .expect("sweep with a clock set back");
+        assert_eq!(
+            pair.metadata().expect("metadata").last_session_at_ms,
+            Some(SESSION_AT_MS)
+        );
+    }
+
+    #[test]
+    fn a_sweep_whose_store_failed_is_repeated_whole() {
+        let expired_at_ms = CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS;
+        let pair = requester();
+        let vault = ReplacingVault::refusing(1);
+        assert!(matches!(
+            pair.sweep(
+                Arc::clone(&vault) as Arc<dyn RappPairVault>,
+                expired_at_ms,
+                false,
+            ),
+            Err(super::RappBindingError::LocalStateFailure)
+        ));
+        assert_eq!(
+            pair.metadata().expect("metadata").forgotten_at_ms,
+            None,
+            "a failed store leaves the record in memory as it was"
+        );
+        assert_eq!(
+            pair.sweep(
+                Arc::clone(&vault) as Arc<dyn RappPairVault>,
+                expired_at_ms,
+                false,
+            )
+            .expect("the retry stores"),
+            RappSweepOutcome::Expired
+        );
+        let reloaded = RappPairRecord::load_from_vault(
+            vec![PAIR_BYTE; PAIR_ID_SIZE],
+            vault as Arc<dyn RappPairVault>,
+        )
+        .expect("the stored record loads");
+        assert_eq!(
+            reloaded.metadata().expect("metadata").forgotten_at_ms,
+            Some(expired_at_ms)
+        );
+
+        let pair = requester();
+        let vault = ReplacingVault::refusing(1);
+        assert!(
+            pair.sweep(
+                Arc::clone(&vault) as Arc<dyn RappPairVault>,
+                SESSION_AT_MS,
+                true,
+            )
+            .is_err()
+        );
+        assert_eq!(pair.metadata().expect("metadata").last_session_at_ms, None);
+        assert_eq!(
+            pair.sweep(vault as Arc<dyn RappPairVault>, SESSION_AT_MS, true)
+                .expect("the retry stores"),
+            RappSweepOutcome::Recorded
+        );
         assert_eq!(
             pair.metadata().expect("metadata").last_session_at_ms,
             Some(SESSION_AT_MS)

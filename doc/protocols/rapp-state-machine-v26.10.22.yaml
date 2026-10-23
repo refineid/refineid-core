@@ -29,6 +29,7 @@ constants:
   liveness_ping_after_silence_ms: 5000
   session_silence_limit_ms: 30000
   revocation_notice_days: 30
+  pairing_idle_expiry_days: 30
   identity_offer_grace_ms: 120000
   quit_withdrawal_bound_ms: 1000
 
@@ -37,10 +38,10 @@ guards:
   local_user_action: "the event originates from the local user, never the peer"
   transcript_matches: "the completed handshake used the expected prologue and empty handshake payloads"
   granted_sets_equal: "both pairing.confirm granted_profiles sets are equal"
-  initiation_permitted: "a stored pairing is active, or forgotten and owing its revocation close, and its custodian's discovery hint is in sight"
+  initiation_permitted: "the requester's remote use is on, no card is in a reader attached to it, a stored pairing is active, or forgotten and owing its revocation close, and its custodian's discovery hint is in sight"
   pairing_routed: "the routing tag matched an active stored pairing and its nonce is not in the replay memory"
   ready_parameters_match: "received session.ready parameters equal the local view"
-  untried_pairing_candidate: "an endpoint found in pairing mode is not yet opened for the typed code, and fewer than pairing_candidates_max pairing connections were opened for it"
+  untried_pairing_candidate: "the requester's remote use is on, no card is in a reader attached to it, an endpoint found in pairing mode is not yet opened for the typed code, and fewer than pairing_candidates_max pairing connections were opened for it"
 
 actions:
   generate_offer: "create the offer with a fresh random offer_id and offer_ttl_ms"
@@ -77,6 +78,7 @@ actions:
   send_close_pairing_revoked: "send session.close with reason pairing_revoked as the session's first or next message"
   close_session: "raise close_requested_by_pairing for the live session"
   destroy_pair_keys: "erase the pairing's static private key"
+  record_last_session: "keep the wall-clock time in the record as the latest time the pairing had an established session"
   withdraw_identity: "stop offering the pairing's credentials to local consumers"
   show_connected: "show that the paired peer is connected"
   show_paired_disconnected: "show that the paired peer is not connected"
@@ -197,6 +199,11 @@ pairing:
       to: unpaired
       actions: [close_candidate, show_none_in_pairing_mode]
     - from: exchanging
+      event: search_interrupted            # a card in a reader attached to the requester, or the holder turning remote use off, ends the search; the code entry is offered again once remote use resumes
+      role: requester
+      to: unpaired
+      actions: [close_candidate]
+    - from: exchanging
       event: offer_expired_or_cancelled
       role: custodian
       to: unpaired
@@ -258,29 +265,50 @@ pairing:
       event: session_healthy               # produced by the session machine entering healthy
       role: both
       to: paired_connected
-      actions: [show_connected]
+      actions: [record_last_session, show_connected]
     - from: paired_connected
       event: session_closed                # produced by the session machine entering closed
       role: both
       to: paired_disconnected
-      actions: [show_paired_disconnected]
+      actions: [record_last_session, show_paired_disconnected]
     - from: paired_connected
       event: peer_withdrawal_notice        # produced in place of session_closed by a session the requester closed with reason service_withdrawn
       role: custodian
       to: paired_disconnected
-      actions: [show_peer_withdrawn]
+      actions: [record_last_session, show_peer_withdrawn]
     - from: paired_connected
-      event: forget_pairing
+      event: forget_pairing                # on a requester, the holder turning remote use off forgets every pairing; the close leaves within quit_withdrawal_bound_ms or is dropped
       role: both
       guard: local_user_action
       to: revoked
       actions: [mark_record_revoked, send_close_pairing_revoked, close_session, destroy_pair_keys, withdraw_identity, show_forgotten]
     - from: paired_disconnected
       event: forget_pairing
-      role: both
+      role: custodian
       guard: local_user_action
       to: revoking
       actions: [mark_record_revoked, withdraw_identity, show_forgotten]
+    - from: paired_disconnected
+      event: forget_pairing                # remote use off with no session open: the key goes at once and nothing is owed; the custodian forgets by idle expiry
+      role: requester
+      guard: local_user_action
+      to: revoked
+      actions: [mark_record_revoked, destroy_pair_keys, withdraw_identity, show_forgotten]
+    - from: paired_connected
+      event: expiry_check                  # the idle-expiry sweep with a session established: it records the session and never expires the pairing
+      role: both
+      to: paired_connected
+      actions: [record_last_session]
+    - from: paired_disconnected
+      event: expiry_check                  # the sweep with no session established, short of the idle limit
+      role: both
+      to: paired_disconnected
+      actions: []
+    - from: paired_disconnected
+      event: idle_expired                  # the sweep with no session established, pairing_idle_expiry_days past the latest recorded session or the creation; silent
+      role: both
+      to: revoking
+      actions: [mark_record_revoked, withdraw_identity]
     - from: revoking
       event: revocation_notice_sent        # produced by the next session sending the close as its first message
       role: both
@@ -402,7 +430,7 @@ session:
       to: closing
       actions: [send_close_normal, show_disconnecting]
     - from: healthy
-      event: service_withdrawn             # the endpoint withdraws: remote access or remote use off, or the application quits
+      event: service_withdrawn             # the endpoint withdraws: a custodian's remote access off, a local card suspending a requester's remote use, or the application quits
       role: both
       to: closing
       actions: [send_close_service_withdrawn, show_disconnecting]
@@ -666,4 +694,6 @@ invariants:
   - id: INV-13
     statement: nothing_of_an_operation_outlives_its_session
   - id: INV-14
-    statement: no_withdrawal_changes_a_stored_pairing
+    statement: no_withdrawal_revokes_a_pairing
+  - id: INV-15
+    statement: no_pairing_expires_while_a_session_to_it_is_established

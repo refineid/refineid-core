@@ -81,11 +81,20 @@ pub enum NextCandidate {
 
 impl NextCandidate {
     /// The pairing-machine event of this outcome on the requester, with the
-    /// guards it carries. [`Self::NoneTried`] is
-    /// [`PairingEvent::NoCustodianTried`] once the requester's search ends.
+    /// guards it carries. `remote_use_available` says whether the
+    /// requester's remote use is on and no card is in a reader attached to
+    /// it. Without it no further custodian is tried and the search ends as
+    /// [`PairingEvent::SearchInterrupted`], unless every custodian tried
+    /// already refused the code (hierarchy specification section 5.2).
+    /// [`Self::NoneTried`] is [`PairingEvent::NoCustodianTried`] once the
+    /// requester's search ends.
     #[must_use]
-    pub fn pairing_event(self) -> (PairingEvent, Guards) {
+    pub fn pairing_event(self, remote_use_available: bool) -> (PairingEvent, Guards) {
         match self {
+            Self::NotAccepted => (PairingEvent::LastCandidateFailed, Guards::default()),
+            Self::Try | Self::NoneTried if !remote_use_available => {
+                (PairingEvent::SearchInterrupted, Guards::default())
+            }
             Self::Try => (
                 PairingEvent::AttemptFailed,
                 Guards {
@@ -93,7 +102,6 @@ impl NextCandidate {
                     ..Guards::default()
                 },
             ),
-            Self::NotAccepted => (PairingEvent::LastCandidateFailed, Guards::default()),
             Self::NoneTried => (PairingEvent::NoCustodianTried, Guards::default()),
         }
     }
@@ -271,8 +279,8 @@ impl<E: PartialEq> PairingCandidates<E> {
 mod tests {
     use super::{CandidateError, NextCandidate, PAIRING_CANDIDATES_MAX, PairingCandidates};
     use crate::{
-        Action, EndpointRole, OFFER_ID_SIZE, OfferId, PairingEvent, PairingOffer, PairingState,
-        ProfileName, TransitionError, TransportProfile,
+        Action, EndpointRole, Guards, OFFER_ID_SIZE, OfferId, PairingEvent, PairingOffer,
+        PairingState, ProfileName, TransitionError, TransportProfile,
     };
 
     fn offer(id: u8) -> PairingOffer {
@@ -413,7 +421,7 @@ mod tests {
     #[test]
     fn the_outcomes_drive_the_requester_pairing_machine() {
         let requester = EndpointRole::Requester;
-        let (event, guards) = NextCandidate::Try.pairing_event();
+        let (event, guards) = NextCandidate::Try.pairing_event(true);
         let next = PairingState::Exchanging
             .transition(requester, event, guards)
             .expect("an untried candidate is tried");
@@ -421,7 +429,7 @@ mod tests {
         assert!(next.actions.contains(&Action::TryNextCandidate));
         assert!(!next.actions.contains(&Action::ShowWrongCode));
 
-        let (event, guards) = NextCandidate::NotAccepted.pairing_event();
+        let (event, guards) = NextCandidate::NotAccepted.pairing_event(true);
         assert_eq!(event, PairingEvent::LastCandidateFailed);
         let last = PairingState::Exchanging
             .transition(requester, event, guards)
@@ -429,18 +437,50 @@ mod tests {
         assert_eq!(last.state, PairingState::Unpaired);
         assert!(last.actions.contains(&Action::ShowWrongCode));
 
-        let (event, guards) = NextCandidate::NoneTried.pairing_event();
+        let (event, guards) = NextCandidate::NoneTried.pairing_event(true);
         let none = PairingState::Exchanging
             .transition(requester, event, guards)
             .expect("a search that tried nobody ends");
         assert!(none.actions.contains(&Action::ShowNoneInPairingMode));
         assert!(!none.actions.contains(&Action::ShowWrongCode));
 
-        let (_, guards) = NextCandidate::NotAccepted.pairing_event();
+        let (_, guards) = NextCandidate::NotAccepted.pairing_event(true);
         assert_eq!(
             PairingState::Exchanging.transition(requester, PairingEvent::AttemptFailed, guards),
             Err(TransitionError::GuardFailed),
             "a refusal with nobody left to try never stays exchanging"
+        );
+    }
+
+    #[test]
+    fn a_local_card_or_remote_use_off_ends_the_search() {
+        for outcome in [NextCandidate::Try, NextCandidate::NoneTried] {
+            let (event, guards) = outcome.pairing_event(false);
+            assert_eq!(event, PairingEvent::SearchInterrupted);
+            let ended = PairingState::Exchanging
+                .transition(EndpointRole::Requester, event, guards)
+                .expect("the search ends");
+            assert_eq!(ended.state, PairingState::Unpaired);
+            assert_eq!(ended.actions, &[Action::CloseCandidate]);
+        }
+        let (event, _) = NextCandidate::NotAccepted.pairing_event(false);
+        assert_eq!(
+            event,
+            PairingEvent::LastCandidateFailed,
+            "a code every custodian tried refused is still reported"
+        );
+        let refused = Guards {
+            untried_pairing_candidate: false,
+            ..Guards::default()
+        };
+        assert_eq!(
+            PairingState::Exchanging.transition(
+                EndpointRole::Requester,
+                PairingEvent::AttemptFailed,
+                refused
+            ),
+            Err(TransitionError::GuardFailed),
+            "no further custodian is tried without the guard"
         );
     }
 }

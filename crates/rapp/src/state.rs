@@ -14,7 +14,8 @@
 
 //! The pairing, session and operation machines of the RAPP state model
 //! (`doc/protocols/rapp-state-machine-v26.10.22.yaml`), and the runtime state
-//! an endpoint keeps. No failure revokes a pairing; only a user does.
+//! an endpoint keeps. No failure revokes a pairing; a user does, idle expiry
+//! does, and the peer's revocation notice does.
 
 /// Local projection of the distributed state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,13 +41,16 @@ pub struct Guards {
     pub transcript_matches: bool,
     /// Both pairing.confirm granted_profiles sets are equal.
     pub granted_sets_equal: bool,
-    /// A stored pairing is active and its custodian's discovery hint is in sight.
+    /// The requester's remote use is on, no card is in a reader attached to
+    /// it, a stored pairing is active, or forgotten and owing its revocation
+    /// close, and its custodian's discovery hint is in sight.
     pub initiation_permitted: bool,
     /// The routing tag matched an active stored pairing and its nonce is not in the replay memory.
     pub pairing_routed: bool,
     /// Received session.ready parameters equal the local view.
     pub ready_parameters_match: bool,
-    /// An endpoint found in pairing mode is not yet opened for the typed
+    /// The requester's remote use is on, no card is in a reader attached to
+    /// it, an endpoint found in pairing mode is not yet opened for the typed
     /// code, and fewer than `pairing_candidates_max` pairing connections
     /// were opened for it.
     pub untried_pairing_candidate: bool,
@@ -147,6 +151,11 @@ pub enum PairingEvent {
     /// No endpoint served an offer the requester could try, and its search
     /// ended.
     NoCustodianTried,
+    /// Remote use stopped being available during the requester's search: a
+    /// card in a reader attached to it, or the holder turned remote use off.
+    /// The search ends; the code entry is offered again once remote use
+    /// resumes.
+    SearchInterrupted,
     /// Both CPace confirmation tags verified.
     KeyConfirmed,
     /// The pairing handshake completed.
@@ -165,8 +174,18 @@ pub enum PairingEvent {
     SessionHealthy,
     /// The session closed.
     SessionClosed,
-    /// The local user forgot the pairing.
+    /// The local user forgot the pairing; on a requester, by turning remote
+    /// use off, which forgets every pairing it holds and, with no session
+    /// open, owes the custodian nothing (section 4.6 item 6).
     ForgetPairing,
+    /// The idle-expiry sweep, with a session to the pairing established or
+    /// with none and the pairing short of the idle limit (section 4.6 item
+    /// 5).
+    ExpiryCheck,
+    /// The idle-expiry sweep found no session established and the pairing
+    /// `pairing_idle_expiry_days` of wall-clock time past its latest
+    /// recorded session, or its creation (section 4.6 item 5).
+    IdleExpired,
     /// The revocation close went out as a session's first message.
     RevocationNoticeSent,
     /// The revocation notice window passed.
@@ -208,8 +227,9 @@ pub enum SessionEvent {
     UserDisconnect,
     /// The endpoint closes the session in order.
     LocalCloseRequested,
-    /// The endpoint withdraws: its user turned remote access or remote use
-    /// off, or quit the application (section 4.5).
+    /// The endpoint withdraws (section 4.5): a custodian's user turned
+    /// remote access off, a card in a reader attached to a requester
+    /// suspends its remote use, or the user quit the application.
     ServiceWithdrawn,
     /// The custodian can no longer serve any card.
     CardUnavailable,
@@ -346,6 +366,9 @@ pub enum Action {
     CloseSession,
     /// Erase the pairing's static private key.
     DestroyPairKeys,
+    /// Keep the wall-clock time in the record as the latest time the
+    /// pairing had an established session.
+    RecordLastSession,
     /// Stop offering the pairing's credentials to local consumers.
     WithdrawIdentity,
     /// Show that the paired peer is connected.
@@ -596,6 +619,13 @@ impl PairingState {
                     actions: &[A::CloseCandidate, A::ShowNoneInPairingMode],
                 }
             }
+            (Self::Exchanging, E::SearchInterrupted) => {
+                require_role(role, EndpointRole::Requester)?;
+                Transition {
+                    state: Self::Unpaired,
+                    actions: &[A::CloseCandidate],
+                }
+            }
             (Self::Exchanging, E::LastAttemptFailed) => {
                 require_role(role, EndpointRole::Proxy)?;
                 Transition {
@@ -694,17 +724,17 @@ impl PairingState {
             },
             (Self::PairedDisconnected, E::SessionHealthy) => Transition {
                 state: Self::PairedConnected,
-                actions: &[A::ShowConnected],
+                actions: &[A::RecordLastSession, A::ShowConnected],
             },
             (Self::PairedConnected, E::SessionClosed) => Transition {
                 state: Self::PairedDisconnected,
-                actions: &[A::ShowPairedDisconnected],
+                actions: &[A::RecordLastSession, A::ShowPairedDisconnected],
             },
             (Self::PairedConnected, E::PeerWithdrawalNotice) => {
                 require_role(role, EndpointRole::Proxy)?;
                 Transition {
                     state: Self::PairedDisconnected,
-                    actions: &[A::ShowPeerWithdrawn],
+                    actions: &[A::RecordLastSession, A::ShowPeerWithdrawn],
                 }
             }
             (Self::PairedConnected, E::ForgetPairing) => {
@@ -723,11 +753,34 @@ impl PairingState {
             }
             (Self::PairedDisconnected, E::ForgetPairing) => {
                 require(guards.local_user_action)?;
-                Transition {
-                    state: Self::Revoking,
-                    actions: &[A::MarkRecordRevoked, A::WithdrawIdentity, A::ShowForgotten],
+                match role {
+                    EndpointRole::Proxy => Transition {
+                        state: Self::Revoking,
+                        actions: &[A::MarkRecordRevoked, A::WithdrawIdentity, A::ShowForgotten],
+                    },
+                    EndpointRole::Requester => Transition {
+                        state: Self::Revoked,
+                        actions: &[
+                            A::MarkRecordRevoked,
+                            A::DestroyPairKeys,
+                            A::WithdrawIdentity,
+                            A::ShowForgotten,
+                        ],
+                    },
                 }
             }
+            (Self::PairedConnected, E::ExpiryCheck) => Transition {
+                state: Self::PairedConnected,
+                actions: &[A::RecordLastSession],
+            },
+            (Self::PairedDisconnected, E::ExpiryCheck) => Transition {
+                state: Self::PairedDisconnected,
+                actions: &[],
+            },
+            (Self::PairedDisconnected, E::IdleExpired) => Transition {
+                state: Self::Revoking,
+                actions: &[A::MarkRecordRevoked, A::WithdrawIdentity],
+            },
             (Self::Revoking, E::RevocationNoticeSent) => Transition {
                 state: Self::Revoked,
                 actions: &[A::DestroyPairKeys],

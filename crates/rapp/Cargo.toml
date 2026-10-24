@@ -15,6 +15,9 @@ crate-type = ["rlib", "staticlib"]
 [features]
 default = []
 bindings = ["dep:uniffi"]
+# Pins handshake ephemerals for the known-answer vectors. Enabled only by
+# this crate's own tests, never by a platform build.
+test-vectors = []
 
 [lints]
 workspace = true
@@ -38,6 +41,7 @@ required-features = ["bindings"]
 [dev-dependencies]
 getrandom = { workspace = true }
 hex.workspace = true
+refineid-rapp = { path = ".", features = ["test-vectors"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 serde-saphyr.workspace = true

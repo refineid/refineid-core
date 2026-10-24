@@ -47,6 +47,9 @@ jobs:
       - name: Lint without warnings
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      - name: Lint the RAPP library without its test-vectors feature
+        run: cargo clippy -p refineid-rapp --locked -- -D warnings
+
       - name: Build documentation without warnings
         env:
           RUSTDOCFLAGS: -D warnings

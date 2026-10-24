@@ -38,8 +38,8 @@ use refineid_apdu::CardTransport;
 #[cfg(feature = "pin-change")]
 use refineid_auth::PinManageOps as _;
 use refineid_auth::{
-    PinOps as _, PinSlot, PinStatus, RetryFloorRefusal, VerifyOutcome, check_retry_floor,
-    pin1_status_permits_reusable_cache,
+    FlooredCredential, PinOps as _, PinSlot, PinStatus, RetryFloorRefusal, VerifyOutcome,
+    check_retry_floor, pin1_status_permits_reusable_cache,
 };
 use refineid_cms::container::{EcdsaP384, RsaPkcs1Sha256, Signature};
 use refineid_cms::x509::{
@@ -1639,7 +1639,7 @@ fn settle_login(
 /// this module never spends those attempts; a counter the card did not
 /// report is a device error.
 const fn pin1_verify_guard(status: PinStatus) -> Result<(), CkRv> {
-    match check_retry_floor(PinSlot::Pin1, status) {
+    match check_retry_floor(FlooredCredential::Pin1, status) {
         Ok(()) => Ok(()),
         Err(RetryFloorRefusal::TriesBelowFloor { .. } | RetryFloorRefusal::Blocked { .. }) => {
             Err(CKR_PIN_LOCKED)

@@ -20,16 +20,35 @@ use refineid_apdu::{
     TransportOutcome,
 };
 use refineid_auth::{
-    ManageOutcome, PIN1_REFERENCE, PIN1_REFERENCE_ORGANIZATIONAL, PUK_REFERENCE_ORGANIZATIONAL,
-    Pin1, PinManageOps, Puk, UnvalidatedSecret,
+    ActivationCode, ActivationScheme, AuthError, FlooredCredential, ManageOutcome, PIN1_REFERENCE,
+    PIN1_REFERENCE_ORGANIZATIONAL, PIN2_REFERENCE, PUK_REFERENCE, PUK_REFERENCE_ORGANIZATIONAL,
+    Pin1, Pin2, PinManageOps, Puk, RetryFloorRefusal, UnvalidatedSecret,
 };
 
 /// Wire index of the P2 reference byte.
 const P2_INDEX: usize = 3;
 /// A retry count returned on a wrong credential.
 const TWO_RETRIES: u8 = 2;
-/// Commands the organizational unblock sends: a VERIFY then a RESET.
+/// Retry count of a pristine credential.
+const RETRIES_PRISTINE: u8 = 5;
+/// Lowest retry count the floor serves.
+const RETRIES_FLOOR: u8 = 3;
+/// Retry count one wrong try from lockout.
+const RETRIES_LOCKDOWN_IMMINENT: u8 = 1;
+/// Credential commands the organizational unblock sends: a VERIFY then
+/// a RESET.
 const ORG_UNBLOCK_COMMAND_COUNT: usize = 2;
+/// Credential commands an activation of both blocked PINs sends: one
+/// RESET RETRY COUNTER per PIN.
+const ACTIVATION_COMMAND_COUNT: usize = 2;
+/// A valid PUK fixture, eight digits.
+const PUK_DIGITS: &[u8] = b"12345678";
+
+fn counter(count: u8) -> StatusWord {
+    StatusWord::PinIncorrect {
+        retries: PinRetries::from_nibble(count).expect("fits a nibble"),
+    }
+}
 
 fn response(sw: StatusWord) -> ResponseApdu {
     let [sw1, sw2] = sw.as_u16().to_be_bytes();
@@ -45,17 +64,32 @@ fn pin1(digits: &[u8]) -> Pin1 {
         .expect("valid PIN1 fixture")
 }
 
+fn pin2(digits: &[u8]) -> Pin2 {
+    Pin2::reconstruct(UnvalidatedSecret::from_owned_bytes(digits.to_vec()))
+        .expect("valid PIN2 fixture")
+}
+
+fn activation_code(digits: &[u8]) -> ActivationCode {
+    ActivationCode::reconstruct(
+        UnvalidatedSecret::from_owned_bytes(digits.to_vec()),
+        ActivationScheme::ActivationCodeIsPuk,
+    )
+    .expect("valid activation-code fixture")
+}
+
 fn puk(digits: &[u8]) -> Puk {
     Puk::reconstruct(UnvalidatedSecret::from_owned_bytes(digits.to_vec()))
         .expect("valid PUK fixture")
 }
 
-/// A transport that answers the counter-safe resolution probe by P2 --
-/// so a session resolves its numbering -- then records the credential
-/// commands it is handed and answers each from a scripted queue.
+/// A transport that answers the counter-safe probes by P2 -- so a
+/// session resolves its numbering and reads the PUK's counter -- then
+/// records the credential commands it is handed and answers each from a
+/// scripted queue.
 struct ResolvingRecorder {
     citizen_probe: StatusWord,
     organizational_probe: StatusWord,
+    puk_probe: StatusWord,
     responses: Vec<StatusWord>,
     cursor: usize,
     commands: Vec<Vec<u8>>,
@@ -65,11 +99,10 @@ impl CardTransport for ResolvingRecorder {
     type Error = String;
 
     fn transmit(&mut self, command: &CommandApdu) -> Result<TransportOutcome, Self::Error> {
-        let reference = command.as_bytes().get(P2_INDEX).copied();
-        let sw = if reference == Some(PIN1_REFERENCE) {
-            self.citizen_probe
-        } else {
-            self.organizational_probe
+        let sw = match command.as_bytes().get(P2_INDEX).copied() {
+            Some(PIN1_REFERENCE | PIN2_REFERENCE) => self.citizen_probe,
+            Some(PUK_REFERENCE | PUK_REFERENCE_ORGANIZATIONAL) => self.puk_probe,
+            _ => self.organizational_probe,
         };
         Ok(TransportOutcome::Response(response(sw)))
     }
@@ -95,6 +128,7 @@ fn change_pin1_resolves_the_citizen_numbering_then_updates() {
     let mut transport = ResolvingRecorder {
         citizen_probe: StatusWord::Success,
         organizational_probe: StatusWord::ReferenceDataNotFound,
+        puk_probe: counter(RETRIES_PRISTINE),
         responses: vec![StatusWord::Success],
         cursor: 0,
         commands: vec![],
@@ -118,12 +152,13 @@ fn unblock_pin1_resolves_organizational_then_sends_the_two_command_flow() {
     let mut transport = ResolvingRecorder {
         citizen_probe: StatusWord::ReferenceDataNotFound,
         organizational_probe: StatusWord::PinIncorrect { retries: two },
+        puk_probe: counter(RETRIES_FLOOR),
         responses: vec![StatusWord::Success, StatusWord::Success],
         cursor: 0,
         commands: vec![],
     };
     let outcome = transport
-        .unblock_pin1(puk(b"12345678"), pin1(b"5678"))
+        .unblock_pin1(puk(PUK_DIGITS), pin1(b"5678"))
         .expect("scripted unblock succeeds");
     assert_eq!(outcome, ManageOutcome::Ok);
     assert_eq!(transport.commands.len(), ORG_UNBLOCK_COMMAND_COUNT);
@@ -137,4 +172,85 @@ fn unblock_pin1_resolves_organizational_then_sends_the_two_command_flow() {
         transport.commands[1].get(P2_INDEX).copied(),
         Some(PIN1_REFERENCE_ORGANIZATIONAL)
     );
+}
+
+#[test]
+fn unblock_refuses_a_puk_below_the_floor_whatever_the_pin_counter() {
+    // PIN 1 has five tries left; the PUK has one. Nothing carrying the
+    // PUK goes out.
+    let mut transport = ResolvingRecorder {
+        citizen_probe: counter(RETRIES_PRISTINE),
+        organizational_probe: StatusWord::ReferenceDataNotFound,
+        puk_probe: counter(RETRIES_LOCKDOWN_IMMINENT),
+        responses: vec![StatusWord::Success],
+        cursor: 0,
+        commands: vec![],
+    };
+    let refused = transport.unblock_pin1(puk(PUK_DIGITS), pin1(b"5678"));
+    assert!(matches!(
+        refused,
+        Err(AuthError::RetryFloor(RetryFloorRefusal::TriesBelowFloor {
+            credential: FlooredCredential::Puk,
+            ..
+        }))
+    ));
+    assert!(transport.commands.is_empty());
+}
+
+#[test]
+fn unblock_serves_a_blocked_pin_while_the_puk_counter_is_at_the_floor() {
+    let mut transport = ResolvingRecorder {
+        citizen_probe: StatusWord::AuthenticationBlocked,
+        organizational_probe: StatusWord::ReferenceDataNotFound,
+        puk_probe: counter(RETRIES_FLOOR),
+        responses: vec![StatusWord::Success],
+        cursor: 0,
+        commands: vec![],
+    };
+    let outcome = transport
+        .unblock_pin2(puk(PUK_DIGITS), pin2(b"567890"))
+        .expect("the PUK counter is at the floor");
+    assert_eq!(outcome, ManageOutcome::Ok);
+    assert_eq!(transport.commands.len(), 1);
+}
+
+#[test]
+fn activation_with_the_code_as_puk_follows_the_puk_floor() {
+    let activate = |puk_probe| {
+        let mut transport = ResolvingRecorder {
+            citizen_probe: StatusWord::AuthenticationBlocked,
+            organizational_probe: StatusWord::ReferenceDataNotFound,
+            puk_probe,
+            responses: vec![StatusWord::Success, StatusWord::Success],
+            cursor: 0,
+            commands: vec![],
+        };
+        let result = transport.activate_card(
+            ActivationScheme::ActivationCodeIsPuk,
+            activation_code(PUK_DIGITS),
+            Some(pin1(b"5678")),
+            Some(pin2(b"567890")),
+        );
+        (result, transport.commands.len())
+    };
+
+    let (served, sent) = activate(counter(RETRIES_FLOOR));
+    let report = served.expect("the PUK counter is at the floor");
+    assert_eq!(report.pin1, Some(ManageOutcome::Ok));
+    assert_eq!(report.pin2, Some(ManageOutcome::Ok));
+    assert_eq!(sent, ACTIVATION_COMMAND_COUNT);
+
+    for probe in [
+        counter(TWO_RETRIES),
+        counter(RETRIES_LOCKDOWN_IMMINENT),
+        StatusWord::AuthenticationBlocked,
+    ] {
+        let (refused, sent) = activate(probe);
+        assert!(matches!(
+            refused,
+            Err(AuthError::RetryFloor(refusal))
+                if refusal.credential() == FlooredCredential::Puk
+        ));
+        assert_eq!(sent, 0);
+    }
 }

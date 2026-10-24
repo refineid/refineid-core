@@ -1088,7 +1088,7 @@ fn sign_on_card<T: CardTransport>(
     let status = transport
         .pin_status_with_scheme(scheme, SIGNING_PIN)
         .map_err(|e| SignErrorKind::Transport(format!("{e}")))?;
-    check_retry_floor(SIGNING_PIN, status).map_err(SignErrorKind::RetryFloor)?;
+    check_retry_floor(SIGNING_PIN.into(), status).map_err(SignErrorKind::RetryFloor)?;
     let outcome = verify_pin_with_scheme(transport, SIGNING_PIN, scheme, options.pin.clone())?;
     let pin_retries_after = match outcome {
         VerifyOutcome::Ok => None,

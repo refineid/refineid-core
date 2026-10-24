@@ -368,8 +368,8 @@ fn pin_fingerprint(
 /// behalf. It resets a blocked PIN's retry counter while setting a new
 /// value (RESET RETRY COUNTER, FINEID S1 v4.2 section 3.5.4). The PUK
 /// spends its own retry counter, and exhausting it is terminal for the
-/// card, so a caller holds its retry floor against the PUK's counter, not
-/// the target PIN's. Like the PIN roles, this type is not `Clone`, `Copy`,
+/// card, so every operation that presents it applies the retry floor to
+/// the PUK's counter, not the target PIN's. Like the PIN roles, this type is not `Clone`, `Copy`,
 /// serializable, or raw-debuggable, and there is no cache path.
 #[derive(ZeroizeOnDrop)]
 pub struct Puk(SecretDigits);

@@ -393,11 +393,13 @@ impl HandshakeChannel {
 }
 
 impl SecureChannel {
-    /// Encrypt one validated envelope and advance the send sequence once.
+    /// Encrypt one validated envelope. The send sequence advances only once
+    /// the envelope has encoded within one frame, so a refused body leaves
+    /// the sequence equal to the Noise nonce (section 7.2 item 3).
     ///
     /// # Errors
-    /// [`CryptoError`] on an invalid body, sequence exhaustion, or an
-    /// encryption failure.
+    /// [`CryptoError`] on an invalid body, a body that does not fit one
+    /// frame, sequence exhaustion, or an encryption failure.
     pub fn seal(
         &mut self,
         message_type: MessageType,
@@ -405,9 +407,10 @@ impl SecureChannel {
     ) -> Result<BinaryFrame, CryptoError> {
         let envelope = self
             .sequence
-            .next_outgoing(message_type, body)
+            .outgoing(message_type, body)
             .map_err(CryptoError::Wire)?;
         let plaintext = envelope.encode().map_err(CryptoError::Wire)?;
+        self.sequence.advance_send().map_err(CryptoError::Wire)?;
         let mut output = vec![0_u8; plaintext.len() + NOISE_TAG_SIZE];
         let length = match &mut self.transport {
             TransportMode::Snow(s) => s

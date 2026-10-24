@@ -7,7 +7,10 @@
 use core::fmt;
 use std::collections::BTreeMap;
 
-use super::{OperationId, ProfileName, ResultError, WireError, WireValue};
+use super::{
+    Envelope, MessageType, OPERATION_ID_SIZE, OperationId, OperationResultMessage, ProfileName,
+    ResultError, SESSION_ID_SIZE, SessionId, WireError, WireValue,
+};
 
 /// The lifetime a request that names none receives (section 8.1 item 2).
 pub const DEFAULT_OPERATION_LIFETIME_MS: u64 = 300_000;
@@ -61,7 +64,27 @@ pub enum CardKeyProfile {
     Rsa3072,
 }
 
+/// ECDSA P-256 signature on the wire: 32-byte r || 32-byte s (section 9.2).
+const ECDSA_P256_SIGNATURE_SIZE: usize = 64;
+/// ECDSA P-384 signature on the wire: 48-byte r || 48-byte s (section 9.2).
+const ECDSA_P384_SIGNATURE_SIZE: usize = 96;
+/// RSA-2048 signature on the wire: the modulus length (section 9.2).
+const RSA_2048_SIGNATURE_SIZE: usize = 256;
+/// RSA-3072 signature on the wire: the modulus length (section 9.2).
+const RSA_3072_SIGNATURE_SIZE: usize = 384;
+
 impl CardKeyProfile {
+    /// Byte length of one signature of this key on the wire (section 9.2).
+    #[must_use]
+    pub const fn signature_size(self) -> usize {
+        match self {
+            Self::EcdsaP256 => ECDSA_P256_SIGNATURE_SIZE,
+            Self::EcdsaP384 => ECDSA_P384_SIGNATURE_SIZE,
+            Self::Rsa2048 => RSA_2048_SIGNATURE_SIZE,
+            Self::Rsa3072 => RSA_3072_SIGNATURE_SIZE,
+        }
+    }
+
     const fn wire_name(self) -> &'static str {
         match self {
             Self::EcdsaP256 => "ecdsa_p256",
@@ -277,6 +300,9 @@ impl CardOperation {
                         return Err(CardOperationError::InvalidDisplayContext);
                     }
                     validate_named_digest(name, *key_profile, *algorithm, digest)?;
+                }
+                if !batch_result_fits_one_frame(digests.len(), *key_profile) {
+                    return Err(CardOperationError::BatchTooLarge);
                 }
                 Ok(())
             }
@@ -724,6 +750,32 @@ fn validate_named_digest(
     Ok(())
 }
 
+/// Whether the completed result of a batch of `count` signatures of
+/// `key_profile` travels in one frame (section 7.2 item 4): the largest
+/// `operation.result` envelope such a batch can produce is built and
+/// encoded against the single-frame limit.
+fn batch_result_fits_one_frame(count: usize, key_profile: CardKeyProfile) -> bool {
+    let signature = vec![u8::MIN; key_profile.signature_size()];
+    let result = CardOperationResult::Signatures(vec![signature; count]);
+    let message = OperationResultMessage::completed(
+        OperationId::from_array([u8::MIN; OPERATION_ID_SIZE]),
+        &result,
+    );
+    message
+        .to_wire_body()
+        .and_then(|body| {
+            Envelope::reconstruct(
+                MessageType::OperationResult,
+                SessionId::from_array([u8::MIN; SESSION_ID_SIZE]),
+                u64::MAX,
+                body,
+            )
+            .map_err(CardOperationError::Wire)
+        })
+        .and_then(|envelope| envelope.encode().map_err(CardOperationError::Wire))
+        .is_ok()
+}
+
 /// Rejected operation construction or hashing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CardOperationError {
@@ -735,6 +787,8 @@ pub enum CardOperationError {
     WrongDigestLength,
     /// The requested signature scheme cannot use the expected card key.
     KeyAlgorithmMismatch,
+    /// The signatures of the batch do not fit one result frame.
+    BatchTooLarge,
     /// A fixed-size identifier could not be reconstructed.
     InvalidIdentifier,
     /// Action is not registered under the named credential profile.

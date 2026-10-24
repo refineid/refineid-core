@@ -1822,6 +1822,36 @@ requester's misbehaviour is this record's standing principle (section
 | :--- | :--- | :--- |
 | CC-104 | The custodian remembers at most `MAX_SEEN_OPERATION_IDS` (4096) distinct identifiers per session. An identifier already remembered is refused as `duplicate_operation` whatever the count; a fresh identifier past the bound is an authenticated protocol violation that closes that session alone, with the pairing and every other session kept, as any such violation does. The memory is released when the session closes. One session is one workstation, and no honest requester starts thousands of operations on one session, so the bound costs the holder nothing. | UCA-100 |
 
+## 31. Admission of a batch whose result cannot travel
+
+### 31.1 Scope
+
+Specification §7.2 item 4 carries every envelope in one transport frame,
+and §9.3 answers `batch_sign_documents` with one `operation.result`
+holding every signature. The request is far smaller than its result, so
+a batch that fits one frame can ask for more signatures than one frame
+holds. Losses and hazards are this record's: L-2, L-3; H-2, H-5.
+
+### 31.2 Control structure
+
+The custodian's admission check is the controller; its control action is
+to admit a batch and put its document names before the holder. The
+requester's own check before it sends is a second controller on the same
+request. Neither had feedback on the size of the result until the card
+had signed every document and the secure channel refused to seal it.
+
+### 31.3 Unsafe control actions
+
+| ID | Controller | Control action | Type | Context | Hazard |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| UCA-101 | Custodian or requester | Admit a batch | P | When the batch's completed result exceeds one frame: the holder enters PIN 2, the card signs every document, the session closes with nothing delivered and no error shown, and a requester that starts the batch again has the card sign it again. | H-2, H-5 |
+
+### 31.4 Controller constraints
+
+| ID | Constraint | Closes |
+| :--- | :--- | :--- |
+| CC-105 | A batch is admitted only when the largest `operation.result` its key profile can produce, every signature at the profile's fixed §9.2 size and the sequence at its widest encoding, encodes within one frame. The custodian refuses any other batch at admission with `unsupported_parameter` (specification §9.2, §10 table), before any card command and before the holder is asked, and the requester refuses to start it. The secure channel advances its send sequence only after an envelope has encoded, so a refused seal leaves the sequence equal to the Noise nonce (specification §7.2 item 3). | UCA-101 |
+
 ## 32. A session outliving the pairing it belongs to
 
 ### 32.1 Scope

@@ -253,21 +253,29 @@ impl SequenceGuard {
         }
     }
 
-    /// Allocate the only legal sequence for the next outgoing message.
+    /// Build the next outgoing message at the only legal sequence; the
+    /// counter stays where it is until [`Self::advance_send`].
     ///
     /// # Errors
-    /// [`WireError`] on sequence exhaustion or an invalid body.
-    pub fn next_outgoing(
-        &mut self,
+    /// [`WireError`] on an invalid body.
+    pub fn outgoing(
+        &self,
         message_type: MessageType,
         body: BTreeMap<String, WireValue>,
     ) -> Result<Envelope, WireError> {
-        let sequence = self.next_send;
+        Envelope::reconstruct(message_type, self.session_id, self.next_send, body)
+    }
+
+    /// Consume the sequence of an outgoing message that encoded.
+    ///
+    /// # Errors
+    /// [`WireError::SequenceWrapped`] on sequence exhaustion.
+    pub fn advance_send(&mut self) -> Result<(), WireError> {
         self.next_send = self
             .next_send
             .checked_add(1)
             .ok_or(WireError::SequenceWrapped)?;
-        Envelope::reconstruct(message_type, self.session_id, sequence, body)
+        Ok(())
     }
 
     /// Verify session binding and exact next sequence after decryption.

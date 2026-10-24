@@ -48,6 +48,20 @@ pub const W_LEVEL_CONTINUE: u16 = 0x0003;
 /// Maximum attempts to drain stale Bulk-IN packets following an abort handshake (CCID Rev 1.1 §5.3.1).
 pub const MAX_ABORT_DRAIN_ATTEMPTS: u8 = 5;
 
+/// Most time extensions one operation may chain before the host treats the
+/// reader as stalled. USB-IF CCID Rev 1.1 section 6.2.6 does not bound how
+/// many `RDR_to_PC_DataBlock` frames with `bmCommandStatus` = 2 a reader may
+/// send for one command; this count is host policy.
+pub const MAX_TIME_EXTENSIONS: u32 = 60;
+
+/// Longest total wait one operation may accumulate through time extensions,
+/// in milliseconds, measured from the operation's start. USB-IF CCID Rev 1.1
+/// section 6.2.6 bounds neither the `bError` multiplier nor the number of
+/// extensions; this is host policy: ten seconds, several times the slowest
+/// card computation a FINEID profile performs, so a stalled reader fails
+/// the operation quickly.
+pub const MAX_TIME_EXTENSION_WALL_MS: u64 = 10_000;
+
 /// Opaque identifier for a logical operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OperationId(pub u64);
@@ -446,6 +460,8 @@ pub struct CcidEngine {
     outgoing_chain: VecDeque<Zeroizing<Vec<u8>>>,
     pending_b_wi: u8,
     wtx_count: u32,
+    /// Monotonic time at which the pending operation started.
+    op_started_at: MonotonicTime,
     abort_drain_count: u8,
     waiting_unit_ms: u32,
 }
@@ -476,6 +492,7 @@ impl core::fmt::Debug for CcidEngine {
             .field("chain_buffer", &"[redacted]")
             .field("outgoing_chain", &"[redacted]")
             .field("wtx_count", &self.wtx_count)
+            .field("op_started_at", &self.op_started_at)
             .field("abort_drain_count", &self.abort_drain_count)
             .field("waiting_unit_ms", &self.waiting_unit_ms)
             .finish()
@@ -516,6 +533,7 @@ impl CcidEngine {
             outgoing_chain: VecDeque::new(),
             pending_b_wi: 0,
             wtx_count: 0,
+            op_started_at: MonotonicTime::default(),
             abort_drain_count: 0,
             waiting_unit_ms: 1000,
         }
@@ -751,6 +769,7 @@ impl CcidEngine {
                 }
 
                 self.wtx_count = 0;
+                self.op_started_at = now;
                 self.chain_buffer.clear();
                 self.outgoing_chain.clear();
                 let seq = self.allocate_seq();
@@ -936,9 +955,14 @@ impl CcidEngine {
                         self.expected_seq,
                     ) {
                         Ok(crate::codec::CcidResponse::TimeExtension { multiplier, .. }) => {
-                            const MAX_TIME_EXTENSIONS: u32 = 60;
                             self.wtx_count = self.wtx_count.saturating_add(1);
-                            if self.wtx_count > MAX_TIME_EXTENSIONS {
+                            let extension_ms = u64::from(multiplier)
+                                .saturating_mul(u64::from(self.waiting_unit_ms));
+                            let extended_until = now.0.saturating_add(extension_ms);
+                            let waited_ms = extended_until.saturating_sub(self.op_started_at.0);
+                            if self.wtx_count > MAX_TIME_EXTENSIONS
+                                || waited_ms > MAX_TIME_EXTENSION_WALL_MS
+                            {
                                 self.current_deadline = None;
                                 self.needs_recovery = true;
                                 actions.push(Action::CancelTransfers);
@@ -952,11 +976,10 @@ impl CcidEngine {
                                 };
                             }
                             self.pending_op = Some((op_id, pending));
-                            let extension_ms = (multiplier as u64) * (self.waiting_unit_ms as u64);
                             self.active_deadline_id = self.active_deadline_id.wrapping_add(1);
                             let dl = Deadline {
                                 id: DeadlineId(self.active_deadline_id),
-                                expires_at: MonotonicTime(now.0 + extension_ms),
+                                expires_at: MonotonicTime(extended_until),
                             };
                             self.current_deadline = Some(dl);
                             next_deadline = Some(dl);
@@ -1377,6 +1400,14 @@ mod tests {
     use crate::descriptor::{AUTOMATIC_ACTIVATION, SHORT_APDU_EXCHANGE};
 
     const TEST_B_WI: u8 = 0;
+    /// Multiplier the within-cap time-extension test requests.
+    const TEST_TIME_EXTENSION_MULTIPLIER: u8 = 3;
+    /// Multiplier whose second consecutive extension, requested at the end of
+    /// the first, carries the operation past `MAX_TIME_EXTENSION_WALL_MS`
+    /// while the first alone stays within it at the default waiting unit.
+    const TEST_WALL_CAP_PROBE_MULTIPLIER: u8 = 6;
+    /// Payload length of the transfer block the time-extension tests send.
+    const TEST_TRANSFER_PAYLOAD_LEN: usize = 5;
 
     fn make_test_descriptor() -> CcidFunctionalDescriptor {
         CcidFunctionalDescriptor::from_parts_unchecked(
@@ -1386,6 +1417,20 @@ mod tests {
             SHORT_APDU_EXCHANGE | AUTOMATIC_ACTIVATION,
             3,
         )
+    }
+
+    /// `RDR_to_PC_DataBlock` carrying a time-extension request (`bmCommandStatus` = 2,
+    /// `bError` = multiplier) and no payload.
+    fn make_test_time_extension_frame(seq: u8, multiplier: u8) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.push(RDR_TO_PC_DATA_BLOCK);
+        f.extend_from_slice(&0_u32.to_le_bytes());
+        f.push(0); // slot
+        f.push(seq);
+        f.push((COMMAND_STATUS_TIME_EXTENSION << 6) | CARD_STATUS_ACTIVE);
+        f.push(multiplier);
+        f.push(CHAIN_COMPLETE);
+        f
     }
 
     fn make_test_data_block_response(seq: u8, payload: &[u8]) -> Vec<u8> {
@@ -1519,25 +1564,20 @@ mod tests {
             InputEvent::IoCompleted(IoCompletion::BulkOut { transferred: 15 }),
         );
 
-        // Frame reporting time extension: multiplier = 3
-        let mut time_ext_frame = Vec::new();
-        time_ext_frame.push(RDR_TO_PC_DATA_BLOCK);
-        time_ext_frame.extend_from_slice(&0_u32.to_le_bytes());
-        time_ext_frame.push(0); // slot
-        time_ext_frame.push(0); // seq
-        time_ext_frame.push((COMMAND_STATUS_TIME_EXTENSION << 6) | CARD_STATUS_ACTIVE);
-        time_ext_frame.push(3); // multiplier
-        time_ext_frame.push(0);
+        let time_ext_frame = make_test_time_extension_frame(0, TEST_TIME_EXTENSION_MULTIPLIER);
 
         let t1 = engine.step(
             MonotonicTime(350),
             InputEvent::IoCompleted(IoCompletion::BulkIn(time_ext_frame)),
         );
 
-        // Should produce a new SubmitBulkIn and extended deadline (3000ms from 350 = 3350)
+        // Re-arms the deadline at now + multiplier x waiting unit and keeps reading.
         assert_eq!(t1.actions.len(), 1);
         assert!(matches!(t1.actions[0], Action::SubmitBulkIn { .. }));
-        assert_eq!(t1.next_deadline.expect("new deadline").expires_at.0, 3350);
+        assert_eq!(
+            t1.next_deadline.expect("new deadline").expires_at.0,
+            350 + u64::from(TEST_TIME_EXTENSION_MULTIPLIER) * u64::from(engine.waiting_unit_ms)
+        );
 
         // Then real data block arrives
         let rapdu = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x90, 0x00];
@@ -1556,6 +1596,75 @@ mod tests {
             }
             _ => panic!("expected Complete action"),
         }
+    }
+
+    #[test]
+    fn time_extension_total_wall_time_is_capped() {
+        let desc = make_test_descriptor();
+        let mut engine = CcidEngine::new(0, 0, 1, &desc);
+        let unit_ms = u64::from(engine.waiting_unit_ms);
+        let extension_ms = u64::from(TEST_WALL_CAP_PROBE_MULTIPLIER) * unit_ms;
+        assert!(extension_ms <= MAX_TIME_EXTENSION_WALL_MS);
+        assert!(2 * extension_ms > MAX_TIME_EXTENSION_WALL_MS);
+
+        let started_at = MonotonicTime(300);
+        let op_id = OperationId(5);
+        let _ = engine.step(
+            started_at,
+            InputEvent::Start {
+                id: op_id,
+                op: Operation::TransferBlock {
+                    b_wi: TEST_B_WI,
+                    w_level_parameter: W_LEVEL_NONE,
+                    data: Zeroizing::new(vec![0; TEST_TRANSFER_PAYLOAD_LEN]),
+                },
+            },
+        );
+        let _ = engine.step(
+            MonotonicTime(310),
+            InputEvent::IoCompleted(IoCompletion::BulkOut {
+                transferred: CCID_HEADER_SIZE + TEST_TRANSFER_PAYLOAD_LEN,
+            }),
+        );
+
+        let time_ext_frame = make_test_time_extension_frame(0, TEST_WALL_CAP_PROBE_MULTIPLIER);
+
+        // The first extension stays within the wall cap: the deadline moves and the read continues.
+        let first_requested_at = MonotonicTime(350);
+        let t1 = engine.step(
+            first_requested_at,
+            InputEvent::IoCompleted(IoCompletion::BulkIn(time_ext_frame.clone())),
+        );
+        assert_eq!(t1.actions.len(), 1);
+        assert!(matches!(t1.actions[0], Action::SubmitBulkIn { .. }));
+        let first_deadline = t1.next_deadline.expect("re-armed deadline");
+        assert_eq!(
+            first_deadline.expires_at.0,
+            first_requested_at.0 + extension_ms
+        );
+        assert!(!engine.needs_recovery());
+
+        // The second extension, requested as the first window ends, would hold the
+        // operation open past the cap measured from its start: it fails instead.
+        let t2 = engine.step(
+            first_deadline.expires_at,
+            InputEvent::IoCompleted(IoCompletion::BulkIn(time_ext_frame)),
+        );
+        assert!(
+            first_deadline.expires_at.0 + extension_ms - started_at.0 > MAX_TIME_EXTENSION_WALL_MS
+        );
+        assert_eq!(t2.next_deadline, None);
+        assert_eq!(t2.actions.len(), 2);
+        assert_eq!(t2.actions[0], Action::CancelTransfers);
+        match &t2.actions[1] {
+            Action::Complete { id, result } => {
+                assert_eq!(*id, op_id);
+                assert_eq!(result, &Err(CcidError::Timeout));
+            }
+            _ => panic!("expected Complete action"),
+        }
+        assert!(engine.needs_recovery());
+        assert!(engine.pending_op.is_none());
     }
 
     #[test]
@@ -1758,18 +1867,11 @@ mod tests {
             InputEvent::IoCompleted(IoCompletion::BulkOut { transferred: 15 }),
         );
 
-        let mut time_ext_frame = Vec::new();
-        time_ext_frame.push(RDR_TO_PC_DATA_BLOCK);
-        time_ext_frame.extend_from_slice(&0_u32.to_le_bytes());
-        time_ext_frame.push(0); // slot
-        time_ext_frame.push(0); // seq
-        time_ext_frame.push((COMMAND_STATUS_TIME_EXTENSION << 6) | CARD_STATUS_ACTIVE);
-        time_ext_frame.push(1); // multiplier
-        time_ext_frame.push(0);
+        let time_ext_frame = make_test_time_extension_frame(0, 1);
 
-        for i in 0..60 {
+        for i in 0..MAX_TIME_EXTENSIONS {
             let t = engine.step(
-                MonotonicTime(320 + i as u64),
+                MonotonicTime(320 + u64::from(i)),
                 InputEvent::IoCompleted(IoCompletion::BulkIn(time_ext_frame.clone())),
             );
             assert!(

@@ -36,7 +36,8 @@ applies one rule, `check_retry_floor` in `refineid-auth`:
 
 The last attempts belong to the cardholder: other software may spend
 them, but a lockout is never RefineID's doing. Holding PIN 1 for reuse is
-stricter still: it requires every counter pristine (below).
+stricter still: it requires the PIN 1 counter at its full allowance, read as
+five tries left or as PIN 1 verified (below).
 
 ## PIN2: every signature or batch
 
@@ -75,12 +76,17 @@ countdown. It is never written to storage -- not to a keychain, a keystore, a
 credential manager or a file -- so it never survives a restart (RAPP v26.10.22
 section 11 item 2).
 
-Reusable retention is allowed only when the PIN1 retry counter is in its
-pristine state. The probe that precedes every PIN1-bearing command decides it
-anew: a probe reading five tries left, or the card verified in session, permits
-holding; any other reading destroys the held value before the card is
-commanded, and a freshly entered PIN1 is held only under such a probe. The
-held entry is bound to the complete card token identifier and the PIN1
+Reusable retention is allowed only when the PIN1 retry counter is at its
+limit. The probe that precedes every authentication operation, whether or not
+the operation will carry the PIN, decides it anew: a probe reading five tries
+left, or PIN1 verified in session, permits holding; any other reading destroys
+the held value before the card is commanded, and a freshly entered PIN1 is held
+only under such a probe. A verified answer carries no count and still proves a
+full counter: a successful VERIFY sets the counter to its limit and the flag,
+a failed VERIFY or CHANGE REFERENCE DATA decrements the counter and clears the
+flag, and a successful CHANGE REFERENCE DATA or RESET RETRY COUNTER sets the
+counter to its limit with the flag cleared (FINEID S1 v4.2 sections 3.5, 3.11
+and 3.12). The held entry is bound to the complete card token identifier and the PIN1
 authentication role. Its capability excludes PIN
 management, PIN2, and qualified-signature operations.
 
@@ -110,7 +116,8 @@ Held PIN1 is destroyed on:
 - a wrong, blocked or malformed PIN response, or a retry counter that went
   down;
 - process exit, device restart, or the user clearing it; and
-- retry-counter state below pristine or unavailable counter state.
+- a probe reporting anything but five tries left or PIN1 verified: a lower
+  count, a blocked PIN, or no readable state.
 
 PIN2 is never held between operations, so it has nothing to invalidate.
 

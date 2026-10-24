@@ -268,10 +268,14 @@ pub const fn check_retry_floor(
 ///
 /// A VERIFY the card accepts sets the try counter to its limit and the
 /// verified flag, and one it refuses decrements the counter and clears
-/// the flag (FINEID S1 v4.2 section 3.5); the limit is five for PIN1 on
-/// both card families (FINEID S4-1 v4.2 section 4.1, S4-2 v4.0). A
-/// verified answer therefore proves a full counter, and any count below
-/// the limit means the card refused a PIN since it last accepted one.
+/// the flag (FINEID S1 v4.2 section 3.5). No other command leaves the
+/// flag set beside a lower counter: a refused CHANGE REFERENCE DATA
+/// decrements the counter and clears the flag, and an accepted one, or
+/// RESET RETRY COUNTER, sets the counter to its limit with the flag
+/// cleared (sections 3.11 and 3.12). The limit is five for PIN1 on both
+/// card families (FINEID S4-1 v4.2 section 4.1, S4-2 v4.0). A verified
+/// answer therefore proves a full counter, and any count below the limit
+/// means the card refused a PIN since it last accepted one.
 #[must_use]
 pub const fn pin1_status_permits_reusable_cache(pin1: PinStatus) -> bool {
     match pin1 {
@@ -462,6 +466,11 @@ mod tests {
         )));
         assert!(!pin1_status_permits_reusable_cache(remaining(
             RETRIES_FLOOR
+        )));
+        assert!(!pin1_status_permits_reusable_cache(PinStatus::Locked));
+        assert!(!pin1_status_permits_reusable_cache(PinStatus::NoInfo));
+        assert!(!pin1_status_permits_reusable_cache(PinStatus::Other(
+            StatusWord::from_u16(UNMODELED_SW)
         )));
     }
 

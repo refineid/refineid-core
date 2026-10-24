@@ -26,6 +26,9 @@ python3 "$root/scripts/check-receipt.py" source-checks \
 cargo build
 cargo test
 cargo clippy --all-targets -- -D warnings
+# The library alone, without dev-dependencies: the RAPP crate's
+# test-vectors feature stays off, as in every platform build.
+cargo clippy -p refineid-rapp -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 if command -v cargo-audit > /dev/null 2>&1; then
     cargo audit

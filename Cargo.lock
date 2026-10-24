@@ -1082,6 +1082,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "hmac",
+ "refineid-rapp",
  "serde",
  "serde-saphyr",
  "serde_json",

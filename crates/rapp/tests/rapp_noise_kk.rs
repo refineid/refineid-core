@@ -7,7 +7,8 @@ use std::collections::BTreeMap;
 
 use refineid_rapp::{
     GrantsHash, HandshakeRole, MANDATORY_SESSION_SUITE, MessageType, PairId,
-    SessionHandshakeParameters, WIRE_VERSION_V26_10_22, WireValue, generate_pair_key_material,
+    SessionHandshakeParameters, WIRE_VERSION_V26_10_22, WireValue, X25519_KEY_SIZE,
+    generate_pair_key_material,
     noise::{KK_HANDSHAKE_MESSAGE_SIZE, KkHandshakeState},
 };
 
@@ -111,6 +112,30 @@ fn native_kk_replays_the_fixed_transcript() {
         .read_message(&sealed[..length], &mut opened)
         .expect("open");
     assert_eq!(&opened[..length], b"RAPP");
+}
+
+#[test]
+fn kk_handshake_draws_fresh_ephemerals() {
+    let prologue = session_prologue_ble();
+    let initiator_static = [0x11_u8; X25519_KEY_SIZE];
+    let responder_public = refineid_rapp::noise::x25519_public_key(&[0x22_u8; X25519_KEY_SIZE]);
+    let mut first_message = [0_u8; KK_HANDSHAKE_MESSAGE_SIZE];
+    let mut second_message = [0_u8; KK_HANDSHAKE_MESSAGE_SIZE];
+    for message in [&mut first_message, &mut second_message] {
+        let mut initiator = KkHandshakeState::new(
+            HandshakeRole::Initiator,
+            &initiator_static,
+            &responder_public,
+            &prologue,
+        )
+        .expect("initiator");
+        let length = initiator.write_message(&[], message).expect("message 1");
+        assert_eq!(length, KK_HANDSHAKE_MESSAGE_SIZE);
+    }
+    assert_ne!(
+        first_message[..X25519_KEY_SIZE],
+        second_message[..X25519_KEY_SIZE]
+    );
 }
 
 #[test]

@@ -256,6 +256,13 @@ impl NoiseSymmetricState {
     }
 }
 
+/// Samples an ephemeral private key from the operating system's randomness.
+fn fresh_ephemeral_private() -> Result<[u8; X25519_KEY_SIZE], CryptoError> {
+    let mut key = [0_u8; X25519_KEY_SIZE];
+    getrandom::fill(&mut key).map_err(|_| CryptoError::Configuration)?;
+    Ok(key)
+}
+
 /// Compute public X25519 point from private scalar with standard clamping.
 #[must_use]
 pub fn x25519_public_key(private_key: &[u8; 32]) -> [u8; 32] {
@@ -334,6 +341,7 @@ pub struct KkHandshakeState {
     remote_static_pub: [u8; X25519_KEY_SIZE],
     local_ephemeral_priv: Option<[u8; X25519_KEY_SIZE]>,
     remote_ephemeral_pub: Option<[u8; X25519_KEY_SIZE]>,
+    #[cfg(feature = "test-vectors")]
     fixed_ephemeral_priv: Option<[u8; X25519_KEY_SIZE]>,
     message_index: usize,
     finished: bool,
@@ -345,6 +353,7 @@ impl Drop for KkHandshakeState {
         if let Some(mut ephemeral) = self.local_ephemeral_priv.take() {
             ephemeral.zeroize();
         }
+        #[cfg(feature = "test-vectors")]
         if let Some(mut fixed) = self.fixed_ephemeral_priv.take() {
             fixed.zeroize();
         }
@@ -386,6 +395,7 @@ impl KkHandshakeState {
             remote_static_pub: *remote_static_pub,
             local_ephemeral_priv: None,
             remote_ephemeral_pub: None,
+            #[cfg(feature = "test-vectors")]
             fixed_ephemeral_priv: None,
             message_index: 0,
             finished: false,
@@ -393,6 +403,7 @@ impl KkHandshakeState {
     }
 
     /// Fix the ephemeral private key for known-answer vectors.
+    #[cfg(feature = "test-vectors")]
     pub fn set_fixed_ephemeral_for_testing(&mut self, fixed: [u8; X25519_KEY_SIZE]) {
         self.fixed_ephemeral_priv = Some(fixed);
     }
@@ -475,23 +486,32 @@ impl KkHandshakeState {
         }
     }
 
-    /// Samples (or takes the fixed) ephemeral key, writes `e` and mixes it.
+    /// Draws the ephemeral key, writes `e` and mixes it.
     fn write_ephemeral(
         &mut self,
         buffer: &mut Vec<u8>,
     ) -> Result<[u8; X25519_KEY_SIZE], CryptoError> {
-        let ephemeral_priv = if let Some(fixed) = self.fixed_ephemeral_priv {
-            fixed
-        } else {
-            let mut key = [0_u8; X25519_KEY_SIZE];
-            getrandom::fill(&mut key).map_err(|_| CryptoError::Configuration)?;
-            key
-        };
+        let ephemeral_priv = self.next_ephemeral_private()?;
         let ephemeral_pub = x25519_public_key(&ephemeral_priv);
         self.local_ephemeral_priv = Some(ephemeral_priv);
         buffer.extend_from_slice(&ephemeral_pub);
         self.symmetric.mix_hash(&ephemeral_pub);
         Ok(ephemeral_priv)
+    }
+
+    /// The pinned ephemeral private key when one is set, a fresh one otherwise.
+    #[cfg(feature = "test-vectors")]
+    fn next_ephemeral_private(&self) -> Result<[u8; X25519_KEY_SIZE], CryptoError> {
+        match self.fixed_ephemeral_priv {
+            Some(fixed) => Ok(fixed),
+            None => fresh_ephemeral_private(),
+        }
+    }
+
+    /// A fresh ephemeral private key for every handshake.
+    #[cfg(not(feature = "test-vectors"))]
+    fn next_ephemeral_private(&self) -> Result<[u8; X25519_KEY_SIZE], CryptoError> {
+        fresh_ephemeral_private()
     }
 
     /// Reads `e` and mixes it.

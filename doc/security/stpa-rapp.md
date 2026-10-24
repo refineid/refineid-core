@@ -1821,3 +1821,36 @@ requester's misbehaviour is this record's standing principle (section
 | ID | Constraint | Closes |
 | :--- | :--- | :--- |
 | CC-104 | The custodian remembers at most `MAX_SEEN_OPERATION_IDS` (4096) distinct identifiers per session. An identifier already remembered is refused as `duplicate_operation` whatever the count; a fresh identifier past the bound is an authenticated protocol violation that closes that session alone, with the pairing and every other session kept, as any such violation does. The memory is released when the session closes. One session is one workstation, and no honest requester starts thousands of operations on one session, so the bound costs the holder nothing. | UCA-100 |
+
+## 32. A session outliving the pairing it belongs to
+
+### 32.1 Scope
+
+Specification §4.6: a forgotten or revoked record "serves nothing from
+then on", and item 1 has the revoking endpoint send the close at once on
+a session it holds open. The core's session bridge consulted the record
+only until the session was established; the operation bridge that then
+carries every operation never consulted it again. Losses and hazards are
+this record's: L-1, L-2; H-1, H-4.
+
+### 32.2 Control structure
+
+The operation bridge is the controller for one session; its control
+actions are to send a request (requester), to put an admitted request
+before the holder and to release a card command on approval (custodian).
+The pair record is the process model of whether the pairing exists, and
+the holder's forget or the endpoint's revoke changes it. The bridge had
+no feedback from it: only the platform's own forget path, calling
+`close_with_reason` on every live bridge, ended the session.
+
+### 32.3 Unsafe control actions
+
+| ID | Controller | Control action | Type | Context | Hazard |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| UCA-102 | Operation bridge | Release a card command, admit a request, or send one | P | After the holder forgot or the endpoint revoked the pairing, when the platform has not yet closed that session or races the close against a PIN prompt already on screen: the holder's entry signs for a computer they have just forgotten, or a forgotten computer's request reaches the holder. | H-1, H-4 |
+
+### 32.4 Controller constraints
+
+| ID | Constraint | Closes |
+| :--- | :--- | :--- |
+| CC-106 | The operation bridge holds the pair record of its session and consults it under the record's lock at every call that serves the session, the liveness poll included: a record forgotten or revoked makes the call do nothing it was asked and return the sealed `pairing_revoked` close, after which the session is closed (specification §4.6 item 1). A forget or revoke cannot land inside a call, so an approval either precedes it and runs, or follows it and closes. A batch signature recorded on a forgotten pairing is refused and the next serving call carries the close. The platform's own close on forget stays; this constraint makes the core hold the invariant when the platform misses one. | UCA-102 |

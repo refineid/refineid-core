@@ -958,11 +958,7 @@ unsafe extern "C" fn c_find_objects_init(
     // object class, a CKA_ID) stay out of the log.
     diag!(
         "C_FindObjectsInit session={session} template=[{}]",
-        parsed
-            .iter()
-            .map(|(attr, value)| format!("{attr:#06x}={}", hex::encode(value)))
-            .collect::<Vec<_>>()
-            .join(",")
+        describe_template(&parsed)
     );
     let mut guard = match lock_module() {
         Ok(guard) => guard,
@@ -985,6 +981,16 @@ unsafe extern "C" fn c_find_objects_init(
     session_mut.begin_find(matches);
     drop(guard);
     CKR_OK
+}
+
+/// Describe a find template for diagnostics: attribute types and value
+/// lengths only. Values never reach the sink (`crate::diag` contract).
+fn describe_template(template: &[(CkAttributeType, Vec<u8>)]) -> String {
+    template
+        .iter()
+        .map(|(attr, value)| format!("{attr:#06x}:len={}", value.len()))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Compute the object handles whose attributes satisfy a find
@@ -2155,12 +2161,34 @@ mod tests {
     use refineid_auth::PinStatus;
 
     use super::{
-        FUNCTION_LIST, c_get_info, c_sign, padded_field, token_info_value, user_pin_status_flags,
+        FUNCTION_LIST, c_get_info, c_sign, describe_template, padded_field, token_info_value,
+        user_pin_status_flags,
     };
     use crate::ck::{
-        CKF_USER_PIN_COUNT_LOW, CKF_USER_PIN_FINAL_TRY, CKF_USER_PIN_LOCKED, CKR_OK, CkBytePtr,
-        CkInfo, CkRv, CkSessionHandle, CkUlong, CkUlongPtr, CkUtf8Char, CkVersion,
+        CKA_ID, CKF_USER_PIN_COUNT_LOW, CKF_USER_PIN_FINAL_TRY, CKF_USER_PIN_LOCKED, CKR_OK,
+        CkBytePtr, CkInfo, CkRv, CkSessionHandle, CkUlong, CkUlongPtr, CkUtf8Char, CkVersion,
     };
+
+    /// The diagnostic rendering of a find template names each
+    /// attribute type and its value length; the value bytes themselves
+    /// never appear, in any encoding.
+    #[test]
+    fn describe_template_names_types_and_lengths_only() {
+        let value = refineid_digest::Sha1::of(b"template-fixture")
+            .as_bytes()
+            .to_vec();
+        let rendered = describe_template(&[(CKA_ID, value.clone())]);
+        assert_eq!(
+            rendered,
+            format!("{CKA_ID:#06x}:len={}", refineid_digest::SHA1_LEN)
+        );
+        assert!(!rendered.contains(&hex::encode(&value)));
+    }
+
+    #[test]
+    fn describe_template_of_an_empty_template_is_empty() {
+        assert_eq!(describe_template(&[]), "");
+    }
 
     #[test]
     fn versions_are_calver_and_v240() {

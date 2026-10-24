@@ -249,90 +249,434 @@ const MAX_TOTAL_BYTES: usize = 512 << 20;
 /// Most decompressed bytes in one entry.
 const MAX_ENTRY_BYTES: usize = 512 << 20;
 
-/// Read the local-file-header sequence: names plus bytes.
+/// Fixed part of the end of central directory record, signature
+/// included (APPNOTE 4.3.16).
+const END_OF_DIRECTORY_LEN: usize = 22;
+
+/// Longest archive comment: its length field is 16 bits (APPNOTE 4.3.16).
+const MAX_ARCHIVE_COMMENT_LEN: usize = 65_535;
+
+/// ZIP64 end of central directory locator signature (APPNOTE 4.3.15).
+const ZIP64_LOCATOR_SIG: u32 = 0x0706_4B50;
+
+/// Size of the ZIP64 end of central directory locator (APPNOTE 4.3.15).
+const ZIP64_LOCATOR_LEN: usize = 20;
+
+/// A 16-bit field holding this value defers to a ZIP64 record (APPNOTE 4.4.1.4).
+const ZIP64_MARKER_U16: u16 = u16::MAX;
+
+/// A 32-bit field holding this value defers to a ZIP64 record (APPNOTE 4.4.1.4).
+const ZIP64_MARKER_U32: u32 = u32::MAX;
+
+/// The only disk number a single-volume archive carries (ISO/IEC 21320-1).
+const SINGLE_DISK: u16 = 0;
+
+/// Extra field header id of the ZIP64 extended information (APPNOTE 4.5.3).
+const EXTRA_ZIP64: u16 = 0x0001;
+
+/// Extra field header id of the Info-ZIP Unicode Comment (APPNOTE 4.6.8).
+const EXTRA_UNICODE_COMMENT: u16 = 0x6375;
+
+/// Extra field header id of the Info-ZIP Unicode Path (APPNOTE 4.6.9).
+const EXTRA_UNICODE_PATH: u16 = 0x7075;
+
+/// The host-dependent upper half of the external attributes, where a
+/// Unix archiver stores the file mode (APPNOTE 4.4.15, Info-ZIP).
+const UNIX_MODE_SHIFT: u32 = 16;
+
+/// `S_IFMT`: the file-type bits of a Unix mode (POSIX `<sys/stat.h>`).
+const UNIX_FILE_TYPE_MASK: u16 = 0o170_000;
+
+/// `S_IFLNK`: the symbolic-link file type (POSIX `<sys/stat.h>`).
+const UNIX_SYMBOLIC_LINK: u16 = 0o120_000;
+
+/// `S_IFDIR`: the directory file type (POSIX `<sys/stat.h>`).
+const UNIX_DIRECTORY: u16 = 0o040_000;
+
+/// MS-DOS directory attribute, in the low byte of the external
+/// attributes (APPNOTE 4.4.15).
+const DOS_DIRECTORY_ATTRIBUTE: u32 = 0x10;
+
+/// Path separator inside an archive (APPNOTE 4.4.17.1).
+const ENTRY_SEPARATOR: char = '/';
+
+/// The separator an archive name must not use (APPNOTE 4.4.17.1).
+const FORBIDDEN_SEPARATOR: char = '\\';
+
+/// Where the central directory sits, from the end of central directory record.
+struct EndOfDirectory {
+    /// Offset of the record itself: where the central directory must end.
+    offset: usize,
+    /// Number of central directory records.
+    count: usize,
+    /// Offset of the first central directory record.
+    central_offset: usize,
+}
+
+/// One central directory record: what an extractor believes about an entry.
+struct CentralRecord {
+    flags: u16,
+    method: u16,
+    crc: u32,
+    compressed_len: usize,
+    uncompressed_len: usize,
+    name: Vec<u8>,
+    local_offset: usize,
+}
+
+/// The archive extent one local entry occupies: header through data.
+struct LocalExtent {
+    start: usize,
+    end: usize,
+}
+
+fn zip_error(detail: &str) -> DocumentVerifyError {
+    DocumentVerifyError::Zip(detail.to_owned())
+}
+
+/// Read the container the way an extractor does.
 ///
-/// The central directory is not consulted; the local headers carry
-/// everything a verifier needs, and a second source of names would
-/// only be a second source of disagreement.
+/// The end of central directory record names the central directory,
+/// the central directory names every entry, and each entry's local
+/// header must agree with its record. The verifier then sees exactly
+/// what an extractor shows, and refuses whatever could make two readers
+/// disagree: bytes after the end of central directory record, a central
+/// directory that does not end at that record, a local header that
+/// contradicts its record, local entries that do not tile the archive
+/// exactly (a hidden entry between listed ones, or stray bytes), a
+/// name that is not a plain relative file path or repeats another
+/// after case folding, data whose CRC-32 is not the declared one, an
+/// extra field that would give an extractor another name or size, an
+/// entry declared a directory or symbolic link, and ZIP64, multi-volume,
+/// encrypted, data-descriptor or unknown-method entries.
 fn read_zip(bytes: &[u8]) -> Result<Vec<ZipEntry>, DocumentVerifyError> {
-    let mut cursor = Cursor::new(bytes);
-    let mut entries = Vec::new();
-    let mut total = 0_usize;
-    while let Some(sig) = cursor.u32() {
-        if sig == ZIP_CENTRAL_SIG || sig == ZIP_EOD_SIG {
-            break;
-        }
-        if sig != ZIP_LOCAL_SIG {
-            // No entries yet means the file never was a ZIP; a bad
-            // signature mid-walk means the ZIP is corrupt.
-            if entries.is_empty() {
-                return Err(DocumentVerifyError::NotAContainer);
-            }
-            return Err(DocumentVerifyError::Zip(
-                "entry does not start with a local file header".to_owned(),
-            ));
-        }
-        let Some(header) = LocalHeader::read(&mut cursor) else {
-            return Err(DocumentVerifyError::Zip(
-                "truncated local header".to_owned(),
-            ));
-        };
-        if header.flags & ZIP_FLAG_ENCRYPTED != 0 {
-            return Err(DocumentVerifyError::Zip(
-                "encrypted entries are not supported".to_owned(),
-            ));
-        }
-        if header.flags & ZIP_FLAG_DESCRIPTOR != 0 {
-            return Err(DocumentVerifyError::Zip(
-                "data descriptors are not supported".to_owned(),
-            ));
-        }
-        let Some(name_bytes) = cursor.take(header.name_len) else {
-            return Err(DocumentVerifyError::Zip("truncated entry name".to_owned()));
-        };
-        let Some(_) = cursor.take(header.extra_len) else {
-            return Err(DocumentVerifyError::Zip("truncated extra field".to_owned()));
-        };
-        let Some(stored) = cursor.take(header.compressed_len) else {
-            return Err(DocumentVerifyError::Zip("truncated entry data".to_owned()));
-        };
-        let data = match header.method {
-            ZIP_METHOD_STORED => stored.to_vec(),
-            ZIP_METHOD_DEFLATED => {
-                miniz_oxide::inflate::decompress_to_vec_with_limit(stored, MAX_ENTRY_BYTES)
-                    .map_err(|error| {
-                        DocumentVerifyError::Zip(format!("deflate error: {error:?}"))
-                    })?
-            }
-            method => {
-                return Err(DocumentVerifyError::Zip(format!(
-                    "unsupported compression method {method}"
-                )));
-            }
-        };
-        if data.len() != header.uncompressed_len {
-            return Err(DocumentVerifyError::Zip(
-                "entry size does not match its header".to_owned(),
-            ));
-        }
-        total = total.saturating_add(data.len());
-        if total > MAX_TOTAL_BYTES {
-            return Err(DocumentVerifyError::Zip(
-                "container exceeds the decompressed-size ceiling".to_owned(),
-            ));
-        }
-        entries.push(ZipEntry {
-            name: String::from_utf8_lossy(name_bytes).into_owned(),
-            data,
-        });
-        if entries.len() > MAX_ENTRIES {
-            return Err(DocumentVerifyError::Zip("too many entries".to_owned()));
-        }
-    }
-    if entries.is_empty() {
+    if Cursor::new(bytes).u32() != Some(ZIP_LOCAL_SIG) {
         return Err(DocumentVerifyError::NotAContainer);
     }
+    let end = find_end_of_directory(bytes)?;
+    let records = read_central_directory(bytes, &end)?;
+    let mut entries = Vec::with_capacity(records.len());
+    let mut extents = Vec::with_capacity(records.len());
+    let mut folded_names = std::collections::BTreeSet::new();
+    let mut total = 0_usize;
+    for record in &records {
+        total = total
+            .checked_add(record.uncompressed_len)
+            .filter(|declared| *declared <= MAX_TOTAL_BYTES)
+            .ok_or_else(|| zip_error("container exceeds the decompressed-size ceiling"))?;
+        let (entry, extent) = read_local_entry(bytes, record)?;
+        if !folded_names.insert(entry.name.to_lowercase()) {
+            return Err(zip_error("duplicate entry name"));
+        }
+        entries.push(entry);
+        extents.push(extent);
+    }
+    require_exact_tiling(extents, end.central_offset)?;
     Ok(entries)
+}
+
+/// Locate the end of central directory record, which must end exactly
+/// at the end of the file, and check the archive geometry it declares.
+///
+/// An archive comment may itself contain the signature bytes, so a
+/// candidate whose comment does not reach the end of the file is
+/// skipped rather than refused.
+fn find_end_of_directory(bytes: &[u8]) -> Result<EndOfDirectory, DocumentVerifyError> {
+    const MISSING: &str = "no end of central directory record ends at the end of the file";
+    let Some(latest) = bytes.len().checked_sub(END_OF_DIRECTORY_LEN) else {
+        return Err(zip_error(MISSING));
+    };
+    let earliest = latest.saturating_sub(MAX_ARCHIVE_COMMENT_LEN);
+    for offset in (earliest..=latest).rev() {
+        let mut cursor = Cursor::at(bytes, offset);
+        if cursor.u32() != Some(ZIP_EOD_SIG) {
+            continue;
+        }
+        let truncated = || zip_error("truncated end of central directory record");
+        let disk = cursor.u16().ok_or_else(truncated)?;
+        let directory_disk = cursor.u16().ok_or_else(truncated)?;
+        let count_on_disk = cursor.u16().ok_or_else(truncated)?;
+        let count = cursor.u16().ok_or_else(truncated)?;
+        let central_size = cursor.u32().ok_or_else(truncated)?;
+        let central_offset = cursor.u32().ok_or_else(truncated)?;
+        let comment_len = cursor.u16().ok_or_else(truncated)?;
+        if cursor.position().checked_add(usize::from(comment_len)) != Some(bytes.len()) {
+            continue;
+        }
+        if count_on_disk == ZIP64_MARKER_U16
+            || count == ZIP64_MARKER_U16
+            || central_size == ZIP64_MARKER_U32
+            || central_offset == ZIP64_MARKER_U32
+            || offset
+                .checked_sub(ZIP64_LOCATOR_LEN)
+                .is_some_and(|at| Cursor::at(bytes, at).u32() == Some(ZIP64_LOCATOR_SIG))
+        {
+            return Err(DocumentVerifyError::Unsupported(
+                "ZIP64 containers are not supported".to_owned(),
+            ));
+        }
+        if disk != SINGLE_DISK || directory_disk != SINGLE_DISK {
+            return Err(zip_error("multi-volume archives are not supported"));
+        }
+        if count_on_disk != count {
+            return Err(zip_error("entry counts disagree"));
+        }
+        let central_offset = usize::try_from(central_offset).map_err(|_| truncated())?;
+        let central_size = usize::try_from(central_size).map_err(|_| truncated())?;
+        if central_offset.checked_add(central_size) != Some(offset) {
+            return Err(zip_error(
+                "central directory does not end at the end of central directory record",
+            ));
+        }
+        return Ok(EndOfDirectory {
+            offset,
+            count: usize::from(count),
+            central_offset,
+        });
+    }
+    Err(zip_error(MISSING))
+}
+
+/// Read exactly the declared number of central directory records, which
+/// must fill the central directory to the byte.
+fn read_central_directory(
+    bytes: &[u8],
+    end: &EndOfDirectory,
+) -> Result<Vec<CentralRecord>, DocumentVerifyError> {
+    if end.count > MAX_ENTRIES {
+        return Err(zip_error("too many entries"));
+    }
+    let mut cursor = Cursor::at(bytes, end.central_offset);
+    let mut records = Vec::with_capacity(end.count);
+    for _ in 0..end.count {
+        if cursor.u32() != Some(ZIP_CENTRAL_SIG) {
+            return Err(zip_error(
+                "central directory record does not start with its signature",
+            ));
+        }
+        records.push(CentralRecord::read(&mut cursor)?);
+    }
+    if cursor.position() != end.offset {
+        return Err(zip_error(
+            "central directory does not end at the end of central directory record",
+        ));
+    }
+    Ok(records)
+}
+
+impl CentralRecord {
+    /// Read one record past the already-consumed signature.
+    fn read(cursor: &mut Cursor<'_>) -> Result<Self, DocumentVerifyError> {
+        let truncated = || zip_error("truncated central directory record");
+        let _version_made_by = cursor.u16().ok_or_else(truncated)?;
+        let _version_needed = cursor.u16().ok_or_else(truncated)?;
+        let flags = cursor.u16().ok_or_else(truncated)?;
+        let method = cursor.u16().ok_or_else(truncated)?;
+        let _mod_time = cursor.u16().ok_or_else(truncated)?;
+        let _mod_date = cursor.u16().ok_or_else(truncated)?;
+        let crc = cursor.u32().ok_or_else(truncated)?;
+        let compressed = cursor.u32().ok_or_else(truncated)?;
+        let uncompressed = cursor.u32().ok_or_else(truncated)?;
+        let name_len = cursor.u16().ok_or_else(truncated)?;
+        let extra_len = cursor.u16().ok_or_else(truncated)?;
+        let comment_len = cursor.u16().ok_or_else(truncated)?;
+        let disk = cursor.u16().ok_or_else(truncated)?;
+        let _internal_attributes = cursor.u16().ok_or_else(truncated)?;
+        let external_attributes = cursor.u32().ok_or_else(truncated)?;
+        let local_offset = cursor.u32().ok_or_else(truncated)?;
+        let name = cursor
+            .take(usize::from(name_len))
+            .ok_or_else(truncated)?
+            .to_vec();
+        let extra = cursor.take(usize::from(extra_len)).ok_or_else(truncated)?;
+        cursor
+            .take(usize::from(comment_len))
+            .ok_or_else(truncated)?;
+        if compressed == ZIP64_MARKER_U32
+            || uncompressed == ZIP64_MARKER_U32
+            || local_offset == ZIP64_MARKER_U32
+        {
+            return Err(DocumentVerifyError::Unsupported(
+                "ZIP64 containers are not supported".to_owned(),
+            ));
+        }
+        if disk != SINGLE_DISK {
+            return Err(zip_error("multi-volume archives are not supported"));
+        }
+        require_plain_file_attributes(external_attributes)?;
+        require_plain_extra_field(extra)?;
+        Ok(Self {
+            flags,
+            method,
+            crc,
+            compressed_len: usize::try_from(compressed).map_err(|_| truncated())?,
+            uncompressed_len: usize::try_from(uncompressed).map_err(|_| truncated())?,
+            name,
+            local_offset: usize::try_from(local_offset).map_err(|_| truncated())?,
+        })
+    }
+}
+
+/// An entry an extractor would create as a directory or a symbolic
+/// link is not a data file and has no place in the container.
+fn require_plain_file_attributes(external: u32) -> Result<(), DocumentVerifyError> {
+    let unix_mode = u16::try_from(external >> UNIX_MODE_SHIFT)
+        .map_err(|_| zip_error("malformed external attributes"))?;
+    match unix_mode & UNIX_FILE_TYPE_MASK {
+        UNIX_SYMBOLIC_LINK => return Err(zip_error("symbolic link entry")),
+        UNIX_DIRECTORY => return Err(zip_error("directory entry")),
+        _ => {}
+    }
+    if external & DOS_DIRECTORY_ATTRIBUTE != 0 {
+        return Err(zip_error("directory entry"));
+    }
+    Ok(())
+}
+
+/// Walk an extra field as the (id, size, data) records APPNOTE 4.5.1
+/// defines, refusing a malformed one and any record that would give
+/// an extractor a name or size other than the header's.
+fn require_plain_extra_field(extra: &[u8]) -> Result<(), DocumentVerifyError> {
+    let mut cursor = Cursor::new(extra);
+    while cursor.position() < extra.len() {
+        let malformed = || zip_error("malformed extra field");
+        let id = cursor.u16().ok_or_else(malformed)?;
+        let size = cursor.u16().ok_or_else(malformed)?;
+        cursor.take(usize::from(size)).ok_or_else(malformed)?;
+        match id {
+            EXTRA_ZIP64 => {
+                return Err(DocumentVerifyError::Unsupported(
+                    "ZIP64 containers are not supported".to_owned(),
+                ));
+            }
+            EXTRA_UNICODE_PATH => return Err(zip_error("Unicode Path extra field")),
+            EXTRA_UNICODE_COMMENT => return Err(zip_error("Unicode Comment extra field")),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// An entry name must be a plain relative file path: UTF-8, no
+/// absolute or backslash form, no control characters, every component
+/// non-empty and neither `.` nor `..`, and not a directory.
+fn require_plain_entry_name(name: &[u8]) -> Result<String, DocumentVerifyError> {
+    let name =
+        String::from_utf8(name.to_vec()).map_err(|_| zip_error("entry name is not UTF-8"))?;
+    if name.is_empty() {
+        return Err(zip_error("empty entry name"));
+    }
+    if name.starts_with(ENTRY_SEPARATOR) {
+        return Err(zip_error("absolute entry name"));
+    }
+    if name.contains(FORBIDDEN_SEPARATOR) {
+        return Err(zip_error("backslash in entry name"));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(zip_error("control character in entry name"));
+    }
+    if name.ends_with(ENTRY_SEPARATOR) {
+        return Err(zip_error("directory entry"));
+    }
+    for component in name.split(ENTRY_SEPARATOR) {
+        if component.is_empty() {
+            return Err(zip_error("empty path component in entry name"));
+        }
+        if component == "." || component == ".." {
+            return Err(zip_error("relative path component in entry name"));
+        }
+    }
+    Ok(name)
+}
+
+/// Read the local entry a central record points at, requiring the two
+/// to agree on everything that decides what the entry is.
+fn read_local_entry(
+    bytes: &[u8],
+    record: &CentralRecord,
+) -> Result<(ZipEntry, LocalExtent), DocumentVerifyError> {
+    let mut cursor = Cursor::at(bytes, record.local_offset);
+    if cursor.u32() != Some(ZIP_LOCAL_SIG) {
+        return Err(zip_error(
+            "central directory names an offset that is not a local file header",
+        ));
+    }
+    let header =
+        LocalHeader::read(&mut cursor).ok_or_else(|| zip_error("truncated local header"))?;
+    let name_bytes = cursor
+        .take(header.name_len)
+        .ok_or_else(|| zip_error("truncated entry name"))?;
+    let extra = cursor
+        .take(header.extra_len)
+        .ok_or_else(|| zip_error("truncated extra field"))?;
+    let stored = cursor
+        .take(header.compressed_len)
+        .ok_or_else(|| zip_error("truncated entry data"))?;
+    if header.flags != record.flags
+        || header.method != record.method
+        || header.crc != record.crc
+        || header.compressed_len != record.compressed_len
+        || header.uncompressed_len != record.uncompressed_len
+        || name_bytes != record.name.as_slice()
+    {
+        return Err(zip_error(
+            "central directory and local file header disagree",
+        ));
+    }
+    if header.flags & ZIP_FLAG_ENCRYPTED != 0 {
+        return Err(zip_error("encrypted entries are not supported"));
+    }
+    if header.flags & ZIP_FLAG_DESCRIPTOR != 0 {
+        return Err(zip_error("data descriptors are not supported"));
+    }
+    require_plain_extra_field(extra)?;
+    let name = require_plain_entry_name(&record.name)?;
+    let data = match header.method {
+        ZIP_METHOD_STORED => stored.to_vec(),
+        ZIP_METHOD_DEFLATED => {
+            miniz_oxide::inflate::decompress_to_vec_with_limit(stored, MAX_ENTRY_BYTES)
+                .map_err(|error| zip_error(&format!("deflate error: {error:?}")))?
+        }
+        method => {
+            return Err(zip_error(&format!(
+                "unsupported compression method {method}"
+            )));
+        }
+    };
+    if data.len() != header.uncompressed_len {
+        return Err(zip_error("entry size does not match its header"));
+    }
+    if crate::asic::crc32(&data) != header.crc {
+        return Err(zip_error("entry data does not match its CRC-32"));
+    }
+    Ok((
+        ZipEntry { name, data },
+        LocalExtent {
+            start: record.local_offset,
+            end: cursor.position(),
+        },
+    ))
+}
+
+/// The listed local entries must cover the bytes before the central
+/// directory exactly, so nothing hides between or beside them.
+fn require_exact_tiling(
+    mut extents: Vec<LocalExtent>,
+    central_offset: usize,
+) -> Result<(), DocumentVerifyError> {
+    const GAP: &str = "local entries do not tile the archive exactly";
+    extents.sort_unstable_by_key(|extent| extent.start);
+    let mut expected = 0_usize;
+    for extent in &extents {
+        if extent.start != expected {
+            return Err(zip_error(GAP));
+        }
+        expected = extent.end;
+    }
+    if expected != central_offset {
+        return Err(zip_error(GAP));
+    }
+    Ok(())
 }
 
 /// Byte cursor that fails closed instead of slicing.
@@ -344,6 +688,15 @@ struct Cursor<'a> {
 impl<'a> Cursor<'a> {
     const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, pos: 0 }
+    }
+
+    /// A cursor positioned at `pos`; reads past the end fail closed.
+    const fn at(bytes: &'a [u8], pos: usize) -> Self {
+        Self { bytes, pos }
+    }
+
+    const fn position(&self) -> usize {
+        self.pos
     }
 
     fn take(&mut self, len: usize) -> Option<&'a [u8]> {
@@ -370,6 +723,7 @@ impl<'a> Cursor<'a> {
 struct LocalHeader {
     flags: u16,
     method: u16,
+    crc: u32,
     compressed_len: usize,
     uncompressed_len: usize,
     name_len: usize,
@@ -377,16 +731,15 @@ struct LocalHeader {
 }
 
 impl LocalHeader {
-    /// Read one header past the already-consumed signature. Times
-    /// and CRC are skipped: the manifest digests are the integrity
-    /// check, and CRC is error detection, not evidence.
+    /// Read one header past the already-consumed signature. Times are
+    /// skipped; the CRC must match the central record and the data.
     fn read(cursor: &mut Cursor<'_>) -> Option<Self> {
         let _version = cursor.u16()?;
         let flags = cursor.u16()?;
         let method = cursor.u16()?;
         let _mod_time = cursor.u16()?;
         let _mod_date = cursor.u16()?;
-        let _crc = cursor.u32()?;
+        let crc = cursor.u32()?;
         let compressed = cursor.u32()?;
         let uncompressed = cursor.u32()?;
         let name_len = cursor.u16()?;
@@ -394,8 +747,9 @@ impl LocalHeader {
         Some(Self {
             flags,
             method,
-            compressed_len: usize::try_from(compressed).unwrap_or(usize::MAX),
-            uncompressed_len: usize::try_from(uncompressed).unwrap_or(usize::MAX),
+            crc,
+            compressed_len: usize::try_from(compressed).ok()?,
+            uncompressed_len: usize::try_from(uncompressed).ok()?,
             name_len: usize::from(name_len),
             extra_len: usize::from(extra_len),
         })
@@ -950,6 +1304,636 @@ mod tests {
             verify_bytes(&container, "empty.asice".to_owned()),
             Err(DocumentVerifyError::Manifest(_))
         ));
+    }
+
+    /// Test-only archive assembler: every record is a plain function,
+    /// so a test can duplicate, hide, misplace or contradict one.
+    mod raw {
+        use super::super::{
+            ZIP_CENTRAL_SIG, ZIP_EOD_SIG, ZIP_LOCAL_SIG, ZIP_METHOD_STORED, ZIP64_LOCATOR_LEN,
+            ZIP64_LOCATOR_SIG,
+        };
+        use crate::asic::crc32;
+
+        /// Version needed to extract: 2.0 (APPNOTE 4.4.3.2).
+        const VERSION: u16 = 20;
+        /// No general-purpose flags: not encrypted, no data descriptor.
+        const NO_FLAGS: u16 = 0;
+        /// Single-volume disk number (ISO/IEC 21320-1).
+        const DISK: u16 = 0;
+        /// External attributes of a plain file as a DOS archiver writes them.
+        const PLAIN_FILE: u32 = 0;
+
+        /// What a header declares about its data; a test may declare
+        /// something other than the truth.
+        #[derive(Clone)]
+        pub struct Declared {
+            pub name: Vec<u8>,
+            pub flags: u16,
+            pub method: u16,
+            pub compressed: u32,
+            pub uncompressed: u32,
+            pub crc: u32,
+            pub extra: Vec<u8>,
+            pub external: u32,
+        }
+
+        impl Declared {
+            pub fn truthful(name: &[u8], data: &[u8]) -> Self {
+                let size = u32::try_from(data.len()).expect("fixture fits");
+                Self {
+                    name: name.to_vec(),
+                    flags: NO_FLAGS,
+                    method: ZIP_METHOD_STORED,
+                    compressed: size,
+                    uncompressed: size,
+                    crc: crc32(data),
+                    extra: Vec::new(),
+                    external: PLAIN_FILE,
+                }
+            }
+        }
+
+        /// One extra-field record (APPNOTE 4.5.1).
+        pub fn extra_field(id: u16, data: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&id.to_le_bytes());
+            let size = u16::try_from(data.len()).expect("fixture fits");
+            out.extend_from_slice(&size.to_le_bytes());
+            out.extend_from_slice(data);
+            out
+        }
+
+        pub fn local_header(declared: &Declared) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&ZIP_LOCAL_SIG.to_le_bytes());
+            out.extend_from_slice(&VERSION.to_le_bytes());
+            out.extend_from_slice(&declared.flags.to_le_bytes());
+            out.extend_from_slice(&declared.method.to_le_bytes());
+            out.extend_from_slice(&0_u16.to_le_bytes());
+            out.extend_from_slice(&0_u16.to_le_bytes());
+            out.extend_from_slice(&declared.crc.to_le_bytes());
+            out.extend_from_slice(&declared.compressed.to_le_bytes());
+            out.extend_from_slice(&declared.uncompressed.to_le_bytes());
+            let name_len = u16::try_from(declared.name.len()).expect("fixture name fits");
+            out.extend_from_slice(&name_len.to_le_bytes());
+            let extra_len = u16::try_from(declared.extra.len()).expect("fixture extra fits");
+            out.extend_from_slice(&extra_len.to_le_bytes());
+            out.extend_from_slice(&declared.name);
+            out.extend_from_slice(&declared.extra);
+            out
+        }
+
+        pub fn central_record(declared: &Declared, local_offset: u32) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&ZIP_CENTRAL_SIG.to_le_bytes());
+            out.extend_from_slice(&VERSION.to_le_bytes());
+            out.extend_from_slice(&VERSION.to_le_bytes());
+            out.extend_from_slice(&declared.flags.to_le_bytes());
+            out.extend_from_slice(&declared.method.to_le_bytes());
+            out.extend_from_slice(&0_u16.to_le_bytes());
+            out.extend_from_slice(&0_u16.to_le_bytes());
+            out.extend_from_slice(&declared.crc.to_le_bytes());
+            out.extend_from_slice(&declared.compressed.to_le_bytes());
+            out.extend_from_slice(&declared.uncompressed.to_le_bytes());
+            let name_len = u16::try_from(declared.name.len()).expect("fixture name fits");
+            out.extend_from_slice(&name_len.to_le_bytes());
+            let extra_len = u16::try_from(declared.extra.len()).expect("fixture extra fits");
+            out.extend_from_slice(&extra_len.to_le_bytes());
+            // Comment length.
+            out.extend_from_slice(&0_u16.to_le_bytes());
+            out.extend_from_slice(&DISK.to_le_bytes());
+            // Internal attributes.
+            out.extend_from_slice(&0_u16.to_le_bytes());
+            out.extend_from_slice(&declared.external.to_le_bytes());
+            out.extend_from_slice(&local_offset.to_le_bytes());
+            out.extend_from_slice(&declared.name);
+            out.extend_from_slice(&declared.extra);
+            out
+        }
+
+        /// What the end record declares; a test may declare otherwise.
+        pub struct Ending {
+            pub disk: u16,
+            pub count: Option<u16>,
+            pub comment: Vec<u8>,
+            pub zip64_locator: bool,
+        }
+
+        impl Default for Ending {
+            fn default() -> Self {
+                Self {
+                    disk: DISK,
+                    count: None,
+                    comment: Vec::new(),
+                    zip64_locator: false,
+                }
+            }
+        }
+
+        /// An archive under construction.
+        #[derive(Default)]
+        pub struct Archive {
+            body: Vec<u8>,
+            directory: Vec<Vec<u8>>,
+        }
+
+        impl Archive {
+            pub fn new() -> Self {
+                Self::default()
+            }
+
+            /// A well-formed entry: local header and central record agree.
+            pub fn add(&mut self, name: &[u8], data: &[u8]) {
+                let declared = Declared::truthful(name, data);
+                self.add_declaring(data, &declared, &declared);
+            }
+
+            /// An entry whose local header and central record declare
+            /// what the test says, truthful or not.
+            pub fn add_declaring(&mut self, data: &[u8], local: &Declared, central: &Declared) {
+                let offset = self.add_unlisted_declaring(data, local);
+                self.add_record(central, offset);
+            }
+
+            /// A local entry the central directory does not list.
+            pub fn add_unlisted(&mut self, name: &[u8], data: &[u8]) -> u32 {
+                let declared = Declared::truthful(name, data);
+                self.add_unlisted_declaring(data, &declared)
+            }
+
+            /// A local entry declaring what the test says, unlisted;
+            /// returns its offset.
+            pub fn add_unlisted_declaring(&mut self, data: &[u8], local: &Declared) -> u32 {
+                let offset = u32::try_from(self.body.len()).expect("fixture fits");
+                self.body.extend_from_slice(&local_header(local));
+                self.body.extend_from_slice(data);
+                offset
+            }
+
+            /// A central record for whatever sits at `offset`.
+            pub fn add_record(&mut self, central: &Declared, offset: u32) {
+                self.directory.push(central_record(central, offset));
+            }
+
+            /// A central directory record given as raw bytes.
+            pub fn add_record_bytes(&mut self, record: Vec<u8>) {
+                self.directory.push(record);
+            }
+
+            /// List the entries in the opposite order to their bytes.
+            pub fn reverse_directory(&mut self) {
+                self.directory.reverse();
+            }
+
+            /// Central directory and a truthful end record.
+            pub fn finish(self) -> Vec<u8> {
+                self.finish_declaring(Ending::default())
+            }
+
+            /// Central directory and an end record as `ending` says.
+            pub fn finish_declaring(mut self, ending: Ending) -> Vec<u8> {
+                let directory_at = u32::try_from(self.body.len()).expect("fixture fits");
+                let true_count = u16::try_from(self.directory.len()).expect("fixture fits");
+                let directory: Vec<u8> = self.directory.concat();
+                let directory_size = u32::try_from(directory.len()).expect("fixture fits");
+                self.body.extend_from_slice(&directory);
+                if ending.zip64_locator {
+                    self.body
+                        .extend_from_slice(&ZIP64_LOCATOR_SIG.to_le_bytes());
+                    let padding = ZIP64_LOCATOR_LEN - ZIP64_LOCATOR_SIG.to_le_bytes().len();
+                    self.body.extend(std::iter::repeat_n(0_u8, padding));
+                }
+                let count = ending.count.unwrap_or(true_count);
+                self.body.extend_from_slice(&ZIP_EOD_SIG.to_le_bytes());
+                self.body.extend_from_slice(&ending.disk.to_le_bytes());
+                self.body.extend_from_slice(&ending.disk.to_le_bytes());
+                self.body.extend_from_slice(&count.to_le_bytes());
+                self.body.extend_from_slice(&count.to_le_bytes());
+                self.body.extend_from_slice(&directory_size.to_le_bytes());
+                self.body.extend_from_slice(&directory_at.to_le_bytes());
+                let comment_len = u16::try_from(ending.comment.len()).expect("fixture fits");
+                self.body.extend_from_slice(&comment_len.to_le_bytes());
+                self.body.extend_from_slice(&ending.comment);
+                self.body
+            }
+        }
+    }
+
+    const FIRST_NAME: &[u8] = b"contract.pdf";
+    const FIRST_DATA: &[u8] = b"the agreed text";
+    const SECOND_NAME: &[u8] = b"annex.txt";
+    const SECOND_DATA: &[u8] = b"an annex";
+    const OTHER_DATA: &[u8] = b"a different text";
+
+    fn two_entry_archive() -> raw::Archive {
+        let mut archive = raw::Archive::new();
+        archive.add(FIRST_NAME, FIRST_DATA);
+        archive.add(SECOND_NAME, SECOND_DATA);
+        archive
+    }
+
+    /// The ZIP-structure detail a refusal names.
+    fn refusal(bytes: &[u8]) -> String {
+        match read_zip(bytes) {
+            Err(DocumentVerifyError::Zip(detail)) => detail,
+            Err(other) => panic!("expected a ZIP refusal, got {other}"),
+            Ok(_) => panic!("expected a refusal, got entries"),
+        }
+    }
+
+    fn unsupported(bytes: &[u8]) -> String {
+        match read_zip(bytes) {
+            Err(DocumentVerifyError::Unsupported(detail)) => detail,
+            Err(other) => panic!("expected an unsupported refusal, got {other}"),
+            Ok(_) => panic!("expected a refusal, got entries"),
+        }
+    }
+
+    /// One entry whose local header and central record both declare
+    /// `declared` over `data`.
+    fn single(data: &[u8], declared: &raw::Declared) -> Vec<u8> {
+        let mut archive = raw::Archive::new();
+        archive.add_declaring(data, declared, declared);
+        archive.finish()
+    }
+
+    #[test]
+    fn raw_archive_reads_in_directory_order() {
+        let entries = read_zip(&two_entry_archive().finish()).expect("parse");
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, ["contract.pdf", "annex.txt"]);
+        assert_eq!(entries.first().expect("first").data, FIRST_DATA);
+    }
+
+    #[test]
+    fn a_comment_containing_the_signature_is_tolerated() {
+        let mut comment = b"comment that mentions ".to_vec();
+        comment.extend_from_slice(&ZIP_EOD_SIG.to_le_bytes());
+        comment.extend_from_slice(b" and goes on");
+        let bytes = two_entry_archive().finish_declaring(raw::Ending {
+            comment,
+            ..raw::Ending::default()
+        });
+        assert_eq!(read_zip(&bytes).expect("parse").len(), 2);
+    }
+
+    #[test]
+    fn entries_out_of_physical_order_still_tile() {
+        let mut archive = two_entry_archive();
+        archive.reverse_directory();
+        let entries = read_zip(&archive.finish()).expect("parse");
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, ["annex.txt", "contract.pdf"]);
+    }
+
+    #[test]
+    fn duplicate_entry_name_is_refused() {
+        let mut archive = two_entry_archive();
+        archive.add(FIRST_NAME, OTHER_DATA);
+        assert_eq!(refusal(&archive.finish()), "duplicate entry name");
+    }
+
+    #[test]
+    fn case_insensitive_duplicate_name_is_refused() {
+        let mut archive = two_entry_archive();
+        archive.add(b"Contract.PDF", OTHER_DATA);
+        assert_eq!(refusal(&archive.finish()), "duplicate entry name");
+    }
+
+    #[test]
+    fn local_and_central_size_disagreement_is_refused() {
+        let local = raw::Declared::truthful(FIRST_NAME, FIRST_DATA);
+        let mut central = local.clone();
+        central.uncompressed += 1;
+        let mut archive = raw::Archive::new();
+        archive.add_declaring(FIRST_DATA, &local, &central);
+        assert_eq!(
+            refusal(&archive.finish()),
+            "central directory and local file header disagree"
+        );
+    }
+
+    #[test]
+    fn local_and_central_name_disagreement_is_refused() {
+        let local = raw::Declared::truthful(FIRST_NAME, FIRST_DATA);
+        let central = raw::Declared::truthful(SECOND_NAME, FIRST_DATA);
+        let mut archive = raw::Archive::new();
+        archive.add_declaring(FIRST_DATA, &local, &central);
+        assert_eq!(
+            refusal(&archive.finish()),
+            "central directory and local file header disagree"
+        );
+    }
+
+    #[test]
+    fn crc_disagreement_is_refused() {
+        let local = raw::Declared::truthful(FIRST_NAME, FIRST_DATA);
+        let mut central = local.clone();
+        central.crc ^= 1;
+        let mut archive = raw::Archive::new();
+        archive.add_declaring(FIRST_DATA, &local, &central);
+        assert_eq!(
+            refusal(&archive.finish()),
+            "central directory and local file header disagree"
+        );
+    }
+
+    #[test]
+    fn flags_disagreement_is_refused() {
+        let local = raw::Declared::truthful(FIRST_NAME, FIRST_DATA);
+        let mut central = local.clone();
+        central.flags |= ZIP_FLAG_ENCRYPTED;
+        let mut archive = raw::Archive::new();
+        archive.add_declaring(FIRST_DATA, &local, &central);
+        assert_eq!(
+            refusal(&archive.finish()),
+            "central directory and local file header disagree"
+        );
+    }
+
+    #[test]
+    fn method_disagreement_is_refused() {
+        let local = raw::Declared::truthful(FIRST_NAME, FIRST_DATA);
+        let mut central = local.clone();
+        central.method = ZIP_METHOD_DEFLATED;
+        let mut archive = raw::Archive::new();
+        archive.add_declaring(FIRST_DATA, &local, &central);
+        assert_eq!(
+            refusal(&archive.finish()),
+            "central directory and local file header disagree"
+        );
+    }
+
+    #[test]
+    fn wrong_crc_is_refused() {
+        let mut declared = raw::Declared::truthful(FIRST_NAME, FIRST_DATA);
+        declared.crc ^= 1;
+        assert_eq!(
+            refusal(&single(FIRST_DATA, &declared)),
+            "entry data does not match its CRC-32"
+        );
+    }
+
+    #[test]
+    fn encrypted_entry_is_refused() {
+        let mut declared = raw::Declared::truthful(FIRST_NAME, FIRST_DATA);
+        declared.flags |= ZIP_FLAG_ENCRYPTED;
+        assert_eq!(
+            refusal(&single(FIRST_DATA, &declared)),
+            "encrypted entries are not supported"
+        );
+    }
+
+    #[test]
+    fn data_descriptor_entry_is_refused() {
+        let mut declared = raw::Declared::truthful(FIRST_NAME, FIRST_DATA);
+        declared.flags |= ZIP_FLAG_DESCRIPTOR;
+        assert_eq!(
+            refusal(&single(FIRST_DATA, &declared)),
+            "data descriptors are not supported"
+        );
+    }
+
+    #[test]
+    fn trailing_bytes_after_eocd_are_refused() {
+        let mut bytes = two_entry_archive().finish();
+        bytes.extend_from_slice(b"appended after the end record");
+        assert_eq!(
+            refusal(&bytes),
+            "no end of central directory record ends at the end of the file"
+        );
+    }
+
+    #[test]
+    fn missing_central_directory_is_refused() {
+        let complete = two_entry_archive().finish();
+        let directory_at = complete
+            .windows(ZIP_CENTRAL_SIG.to_le_bytes().len())
+            .position(|window| window == ZIP_CENTRAL_SIG.to_le_bytes())
+            .expect("central directory present");
+        let locals_only = complete.get(..directory_at).expect("prefix");
+        assert_eq!(
+            refusal(locals_only),
+            "no end of central directory record ends at the end of the file"
+        );
+    }
+
+    #[test]
+    fn hidden_local_entry_between_entries_is_refused() {
+        let mut archive = raw::Archive::new();
+        archive.add(FIRST_NAME, FIRST_DATA);
+        archive.add_unlisted(FIRST_NAME, OTHER_DATA);
+        archive.add(SECOND_NAME, SECOND_DATA);
+        assert_eq!(
+            refusal(&archive.finish()),
+            "local entries do not tile the archive exactly"
+        );
+    }
+
+    #[test]
+    fn hidden_local_entry_before_the_directory_is_refused() {
+        let mut archive = two_entry_archive();
+        archive.add_unlisted(FIRST_NAME, OTHER_DATA);
+        assert_eq!(
+            refusal(&archive.finish()),
+            "local entries do not tile the archive exactly"
+        );
+    }
+
+    #[test]
+    fn overlapping_extents_are_refused() {
+        // The outer entry's data is itself a complete inner entry, and
+        // the directory lists both.
+        let inner = raw::Declared::truthful(SECOND_NAME, SECOND_DATA);
+        let mut outer_data = raw::local_header(&inner);
+        outer_data.extend_from_slice(SECOND_DATA);
+        let outer = raw::Declared::truthful(FIRST_NAME, &outer_data);
+        let mut archive = raw::Archive::new();
+        let outer_at = archive.add_unlisted_declaring(&outer_data, &outer);
+        archive.add_record(&outer, outer_at);
+        let inner_at = u32::try_from(raw::local_header(&outer).len()).expect("fixture fits");
+        archive.add_record(&inner, inner_at);
+        assert_eq!(
+            refusal(&archive.finish()),
+            "local entries do not tile the archive exactly"
+        );
+    }
+
+    #[test]
+    fn local_offset_not_at_a_local_header_is_refused() {
+        let mut archive = two_entry_archive();
+        let declared = raw::Declared::truthful(b"phantom.txt", OTHER_DATA);
+        archive.add_record(&declared, 1);
+        assert_eq!(
+            refusal(&archive.finish()),
+            "central directory names an offset that is not a local file header"
+        );
+    }
+
+    #[test]
+    fn zip64_markers_are_refused() {
+        let bytes = two_entry_archive().finish_declaring(raw::Ending {
+            count: Some(ZIP64_MARKER_U16),
+            ..raw::Ending::default()
+        });
+        assert_eq!(unsupported(&bytes), "ZIP64 containers are not supported");
+    }
+
+    #[test]
+    fn zip64_locator_is_refused() {
+        let bytes = two_entry_archive().finish_declaring(raw::Ending {
+            zip64_locator: true,
+            ..raw::Ending::default()
+        });
+        assert_eq!(unsupported(&bytes), "ZIP64 containers are not supported");
+    }
+
+    #[test]
+    fn zip64_extra_field_is_refused() {
+        let mut declared = raw::Declared::truthful(FIRST_NAME, FIRST_DATA);
+        declared.extra = raw::extra_field(EXTRA_ZIP64, b"");
+        assert_eq!(
+            unsupported(&single(FIRST_DATA, &declared)),
+            "ZIP64 containers are not supported"
+        );
+    }
+
+    #[test]
+    fn unicode_path_extra_field_is_refused() {
+        let mut declared = raw::Declared::truthful(FIRST_NAME, FIRST_DATA);
+        declared.extra = raw::extra_field(EXTRA_UNICODE_PATH, b"another-name.pdf");
+        assert_eq!(
+            refusal(&single(FIRST_DATA, &declared)),
+            "Unicode Path extra field"
+        );
+    }
+
+    #[test]
+    fn malformed_extra_field_is_refused() {
+        let mut declared = raw::Declared::truthful(FIRST_NAME, FIRST_DATA);
+        declared.extra = raw::extra_field(EXTRA_UNICODE_COMMENT, b"cut");
+        declared.extra.pop();
+        assert_eq!(
+            refusal(&single(FIRST_DATA, &declared)),
+            "malformed extra field"
+        );
+    }
+
+    #[test]
+    fn multi_disk_archive_is_refused() {
+        let bytes = two_entry_archive().finish_declaring(raw::Ending {
+            disk: 1,
+            ..raw::Ending::default()
+        });
+        assert_eq!(refusal(&bytes), "multi-volume archives are not supported");
+    }
+
+    #[test]
+    fn truncated_central_record_is_refused() {
+        let mut archive = two_entry_archive();
+        let mut declared = raw::Declared::truthful(b"long.txt", OTHER_DATA);
+        declared.name = vec![b'n'; MAX_ARCHIVE_COMMENT_LEN];
+        let mut record = raw::central_record(&declared, 0);
+        record.truncate(record.len() - declared.name.len());
+        archive.add_record_bytes(record);
+        assert_eq!(
+            refusal(&archive.finish()),
+            "truncated central directory record"
+        );
+    }
+
+    #[test]
+    fn entry_count_mismatch_is_refused() {
+        let over = two_entry_archive().finish_declaring(raw::Ending {
+            count: Some(1 + 1 + 1),
+            ..raw::Ending::default()
+        });
+        assert_eq!(
+            refusal(&over),
+            "central directory record does not start with its signature"
+        );
+        let under = two_entry_archive().finish_declaring(raw::Ending {
+            count: Some(1),
+            ..raw::Ending::default()
+        });
+        assert_eq!(
+            refusal(&under),
+            "central directory does not end at the end of central directory record"
+        );
+    }
+
+    #[test]
+    fn symlink_entry_is_refused() {
+        let mut declared = raw::Declared::truthful(FIRST_NAME, FIRST_DATA);
+        declared.external = u32::from(UNIX_SYMBOLIC_LINK) << UNIX_MODE_SHIFT;
+        assert_eq!(
+            refusal(&single(FIRST_DATA, &declared)),
+            "symbolic link entry"
+        );
+    }
+
+    #[test]
+    fn directory_entry_is_refused() {
+        let mut by_mode = raw::Declared::truthful(FIRST_NAME, FIRST_DATA);
+        by_mode.external = u32::from(UNIX_DIRECTORY) << UNIX_MODE_SHIFT;
+        assert_eq!(refusal(&single(FIRST_DATA, &by_mode)), "directory entry");
+        let mut by_dos = raw::Declared::truthful(FIRST_NAME, FIRST_DATA);
+        by_dos.external = DOS_DIRECTORY_ATTRIBUTE;
+        assert_eq!(refusal(&single(FIRST_DATA, &by_dos)), "directory entry");
+        let by_name = raw::Declared::truthful(b"folder/", b"");
+        assert_eq!(refusal(&single(b"", &by_name)), "directory entry");
+    }
+
+    #[test]
+    fn traversal_name_is_refused() {
+        for (name, rule) in [
+            (
+                b"../contract.pdf".as_slice(),
+                "relative path component in entry name",
+            ),
+            (
+                b"docs/./contract.pdf",
+                "relative path component in entry name",
+            ),
+            (b"/contract.pdf", "absolute entry name"),
+            (b"docs\\contract.pdf", "backslash in entry name"),
+            (b"docs//contract.pdf", "empty path component in entry name"),
+            (b"contract\n.pdf", "control character in entry name"),
+        ] {
+            let declared = raw::Declared::truthful(name, FIRST_DATA);
+            assert_eq!(refusal(&single(FIRST_DATA, &declared)), rule);
+        }
+    }
+
+    #[test]
+    fn empty_entry_name_is_refused() {
+        let declared = raw::Declared::truthful(b"", FIRST_DATA);
+        assert_eq!(refusal(&single(FIRST_DATA, &declared)), "empty entry name");
+    }
+
+    #[test]
+    fn non_utf8_entry_name_is_refused() {
+        let mut name = FIRST_NAME.to_vec();
+        name.push(u8::MAX);
+        let declared = raw::Declared::truthful(&name, FIRST_DATA);
+        assert_eq!(
+            refusal(&single(FIRST_DATA, &declared)),
+            "entry name is not UTF-8"
+        );
+    }
+
+    #[test]
+    fn decompressed_ceiling_is_checked_before_inflating() {
+        // A stored entry of a few bytes declaring a size past the
+        // ceiling: the declared total is refused before the entry is
+        // read, where the size mismatch would otherwise be named.
+        let mut declared = raw::Declared::truthful(FIRST_NAME, FIRST_DATA);
+        declared.uncompressed = ZIP64_MARKER_U32 - 1;
+        assert_eq!(
+            refusal(&single(FIRST_DATA, &declared)),
+            "container exceeds the decompressed-size ceiling"
+        );
     }
 
     /// Shell out, the way the `cades` interop tests do: the goal is a

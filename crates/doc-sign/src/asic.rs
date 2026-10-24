@@ -499,7 +499,7 @@ impl ZipWriter {
 /// Computed bitwise rather than from a table: this runs once per entry
 /// over files measured in kilobytes, and a 1 KiB table earns nothing
 /// here but a thing to get wrong.
-fn crc32(data: &[u8]) -> u32 {
+pub(crate) fn crc32(data: &[u8]) -> u32 {
     /// Reflected IEEE 802.3 polynomial.
     const POLYNOMIAL: u32 = 0xEDB8_8320;
     /// Bits per input byte.

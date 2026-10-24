@@ -559,11 +559,11 @@ mod tests {
         CHANGE_P1_CURRENT_THEN_NEW, CHANGE_REFERENCE_DATA_INS, ManageOutcome, PinManageOps,
         RESET_P1_CODE_THEN_NEW, RESET_P1_NEW_ONLY, RESET_RETRY_COUNTER_INS, classify_manage_sw,
     };
-    use crate::credentials::{Pin1, Puk, UnvalidatedSecret};
+    use crate::credentials::{Pin1, Pin2, Puk, UnvalidatedSecret};
     use crate::verify::{CREDENTIAL_BODY_SCRATCH, VERIFY_INS, VERIFY_P1};
     use crate::{
         AuthError, ORGANIZATIONAL_PIN_MAX_LENGTH, PIN_STORED_LENGTH, PUK_REFERENCE_ORGANIZATIONAL,
-        PinReferenceScheme, PinSlot,
+        PinReferenceScheme, PinSlot, PinStatus, check_retry_floor,
     };
     use refineid_apdu::{
         ApduClass, CardTransport, CommandApdu, CredentialCommand, PinRetries, ResponseApdu,
@@ -572,6 +572,14 @@ mod tests {
 
     /// A retry count for the tests.
     const TWO_RETRIES: u8 = 2;
+    /// Highest retry count below the retry floor.
+    const RETRIES_BELOW_FLOOR: u8 = 2;
+    /// Retry count one wrong try from lockout.
+    const RETRIES_LOCKDOWN_IMMINENT: u8 = 1;
+    /// Retry count of an exhausted PIN.
+    const RETRIES_EXHAUSTED: u8 = 0;
+    /// A valid new-PIN2 fixture, six digits.
+    const NEW_PIN2_DIGITS: &[u8] = b"567890";
     /// Commands the organizational unblock sends: a VERIFY then a RESET.
     const ORG_UNBLOCK_COMMAND_COUNT: usize = 2;
     /// Wire index of the class byte.
@@ -605,6 +613,11 @@ mod tests {
     fn pin1(digits: &[u8]) -> Pin1 {
         Pin1::reconstruct(UnvalidatedSecret::from_owned_bytes(digits.to_vec()))
             .expect("valid PIN1 fixture")
+    }
+
+    fn pin2(digits: &[u8]) -> Pin2 {
+        Pin2::reconstruct(UnvalidatedSecret::from_owned_bytes(digits.to_vec()))
+            .expect("valid PIN2 fixture")
     }
 
     fn puk(digits: &[u8]) -> Puk {
@@ -759,6 +772,38 @@ mod tests {
             &wire[DATA_OFFSET..DATA_OFFSET + PUK_DIGITS.len()],
             PUK_DIGITS
         );
+    }
+
+    #[test]
+    fn the_puk_sets_a_new_pin_where_the_retry_floor_refuses_an_attempt() {
+        for slot in [PinSlot::Pin1, PinSlot::Pin2] {
+            for count in [
+                RETRIES_BELOW_FLOOR,
+                RETRIES_LOCKDOWN_IMMINENT,
+                RETRIES_EXHAUSTED,
+            ] {
+                let status =
+                    PinStatus::Remaining(PinRetries::from_nibble(count).expect("fits a nibble"));
+                assert!(check_retry_floor(slot, status).is_err());
+                let mut transport = Recorder::new(vec![StatusWord::Success]);
+                let outcome = match slot {
+                    PinSlot::Pin1 => transport.unblock_pin1_with_scheme(
+                        PinReferenceScheme::Citizen,
+                        puk(PUK_DIGITS),
+                        pin1(NEW_DIGITS),
+                    ),
+                    PinSlot::Pin2 => transport.unblock_pin2_with_scheme(
+                        PinReferenceScheme::Citizen,
+                        puk(PUK_DIGITS),
+                        pin2(NEW_PIN2_DIGITS),
+                    ),
+                }
+                .expect("scripted unblock succeeds");
+                assert_eq!(outcome, ManageOutcome::Ok);
+                assert_eq!(transport.commands.len(), 1);
+                assert_eq!(transport.commands[0][INS_INDEX], RESET_RETRY_COUNTER_INS);
+            }
+        }
     }
 
     #[test]

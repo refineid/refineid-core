@@ -135,9 +135,9 @@ The fifth slice admits PIN verification in `refineid-auth`:
   so a PIN2 can never reach the PIN1 slot;
 - the counter-safe status probe reads the retry state without spending a
   counter, on the plain path with no credential;
-- the typed outcomes and status-word classifiers, and the retry-risk
-  policy that maps the live counter to the safety floors different
-  surfaces stop at.
+- the typed outcomes and status-word classifiers, and the retry floor
+  every surface stops at: a PIN 1 or PIN 2 attempt is served only at
+  five, four or three tries left.
 
 VERIFY is retry-consuming: the classifiers, the credential-command wire,
 and the retry-risk policy are covered by scripted-transport and unit

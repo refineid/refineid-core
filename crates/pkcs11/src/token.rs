@@ -38,7 +38,7 @@ use refineid_apdu::CardTransport;
 #[cfg(feature = "pin-change")]
 use refineid_auth::PinManageOps as _;
 use refineid_auth::{
-    PinOps as _, PinRetryRisk, PinSlot, PinStatus, VerifyOutcome,
+    PinOps as _, PinSlot, PinStatus, RetryFloorRefusal, VerifyOutcome, check_retry_floor,
     pin1_status_permits_reusable_cache,
 };
 use refineid_cms::container::{EcdsaP384, RsaPkcs1Sha256, Signature};
@@ -1634,21 +1634,17 @@ fn settle_login(
     }
 }
 
-/// Refuse every PIN-bearing APDU once fewer than three attempts remain.
-/// Firefox does not surface retry warnings, so the module may consume
-/// attempts down to two remaining and no further: a near-last attempt is
-/// never `RefineID`'s to spend, and only another middleware locks the card.
-/// Mirrors the `CryptoTokenKit` adapter's retry floor of three.
+/// Apply the shared retry floor before every PIN1-bearing APDU. A PIN1
+/// at two, one or no tries left, or blocked, answers as locked, since
+/// this module never spends those attempts; a counter the card did not
+/// report is a device error.
 const fn pin1_verify_guard(status: PinStatus) -> Result<(), CkRv> {
-    match status {
-        PinStatus::Remaining(retries) => match PinRetryRisk::from_retries(retries) {
-            Some(risk) if risk.permits_compatibility_module() => Ok(()),
-            Some(_) => Err(CKR_PIN_LOCKED),
-            None => Err(CKR_DEVICE_ERROR),
-        },
-        PinStatus::Locked => Err(CKR_PIN_LOCKED),
-        PinStatus::Verified => Ok(()),
-        PinStatus::NoInfo | PinStatus::Other(_) => Err(CKR_DEVICE_ERROR),
+    match check_retry_floor(PinSlot::Pin1, status) {
+        Ok(()) => Ok(()),
+        Err(RetryFloorRefusal::TriesBelowFloor { .. } | RetryFloorRefusal::Blocked { .. }) => {
+            Err(CKR_PIN_LOCKED)
+        }
+        Err(RetryFloorRefusal::CounterUnreadable { .. }) => Err(CKR_DEVICE_ERROR),
     }
 }
 
@@ -1711,7 +1707,7 @@ pub(super) fn card_change_pin1(
         card.select_pkcs15_application()
             .map_err(|_select_err| CKR_DEVICE_ERROR)?;
         // The empty-body VERIFY probe consumes no retry. Apply the same
-        // consumer floor as login and signing before CHANGE REFERENCE DATA.
+        // retry floor as login and signing before CHANGE REFERENCE DATA.
         let status = card
             .pin_status(PinSlot::Pin1)
             .map_err(|_probe_err| CKR_DEVICE_ERROR)?;
@@ -1756,7 +1752,7 @@ mod tests {
     use crate::ck::{CKR_DEVICE_ERROR, CKR_PIN_LOCKED};
 
     #[test]
-    fn pin1_verify_guard_blocks_only_one_and_two_attempts() {
+    fn pin1_verify_guard_serves_only_five_four_and_three_tries() {
         let retries = |count| {
             PinRetries::from_nibble(count).expect("test retry count fits the status-word nibble")
         };
@@ -1772,8 +1768,10 @@ mod tests {
             pin1_verify_guard(PinStatus::Remaining(retries(1))),
             Err(CKR_PIN_LOCKED)
         );
-        // Zero attempts passes the floor; the card itself then reports locked.
-        assert_eq!(pin1_verify_guard(PinStatus::Remaining(retries(0))), Ok(()));
+        assert_eq!(
+            pin1_verify_guard(PinStatus::Remaining(retries(0))),
+            Err(CKR_PIN_LOCKED)
+        );
         assert_eq!(pin1_verify_guard(PinStatus::Locked), Err(CKR_PIN_LOCKED));
         assert_eq!(pin1_verify_guard(PinStatus::NoInfo), Err(CKR_DEVICE_ERROR));
         assert_eq!(

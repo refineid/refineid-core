@@ -49,7 +49,10 @@ use refineid_apdu::command::{
 };
 use refineid_apdu::status_word::StatusWord;
 use refineid_apdu::{ApduClass, CardTransport};
-use refineid_auth::{PinOps as _, PinReferenceScheme, PinSlot, VerifyOutcome, classify_verify_sw};
+use refineid_auth::{
+    PinOps as _, PinReferenceScheme, PinSlot, RetryFloorRefusal, VerifyOutcome, check_retry_floor,
+    classify_verify_sw,
+};
 use refineid_cms::x509::{
     Certificate, DateTime, EcCurve, MessageSignatureAlgorithm, OwnedCert, PublicKeyAlgorithm,
 };
@@ -486,6 +489,10 @@ pub enum SignErrorKind {
         /// `AuthenticationFailed`, ...).
         outcome: VerifyOutcome,
     },
+    /// The card's retry counter for the slot's PIN is at or below the
+    /// shared retry floor, blocked, or unreadable, so no VERIFY was
+    /// sent. The counter is unaffected.
+    RetryFloor(RetryFloorRefusal),
     /// Local-policy rejection (PIN length / non-digit) before any
     /// APDU went out. Counter is unaffected.
     PinPolicy {
@@ -552,6 +559,7 @@ impl fmt::Display for SignErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ReaderPick(e) => write!(f, "{e}"),
+            Self::RetryFloor(refusal) => write!(f, "{refusal}"),
             Self::Pcsc(e) => write!(f, "PC/SC: {e}"),
             Self::Document(e) => write!(f, "{e}"),
             Self::VisibleSignature(detail) => write!(f, "visible signature: {detail}"),
@@ -1077,6 +1085,10 @@ fn sign_on_card<T: CardTransport>(
     // S1 v4.2 vs organizational S4-2 v4.0), resolved by
     // counter-safe probes before the typed PIN is spent.
     let scheme = resolve_pin_reference_scheme(transport)?;
+    let status = transport
+        .pin_status_with_scheme(scheme, SIGNING_PIN)
+        .map_err(|e| SignErrorKind::Transport(format!("{e}")))?;
+    check_retry_floor(SIGNING_PIN, status).map_err(SignErrorKind::RetryFloor)?;
     let outcome = verify_pin_with_scheme(transport, SIGNING_PIN, scheme, options.pin.clone())?;
     let pin_retries_after = match outcome {
         VerifyOutcome::Ok => None,

@@ -34,7 +34,9 @@ pub const MAX_FRAME_PLAINTEXT: usize = 65_519;
 pub const MAX_ACTIVE_OPERATIONS: usize = 1;
 /// Pairing-offer lifetime in milliseconds (RAPP v26.10.22 §3.3, §4.2).
 pub const OFFER_TTL_MS: u64 = 300_000;
-/// Minimum retry count on the credential that a command can decrement.
+/// Fewest tries left at which a Custodian sends a PIN verification (RAPP
+/// v26.10.22 section 10.2). The floor itself is `check_retry_floor` in
+/// `refineid-auth`, which every surface applies.
 pub const MINIMUM_REMAINING_ATTEMPTS: u8 = 3;
 /// How long a requester keeps offering a confirmed certificate with no
 /// session open or the card reported absent (RAPP v26.10.22 section 8.4
@@ -231,38 +233,6 @@ impl ProfileName {
             "fi.refineid.authentication" => Some(Self::Authentication),
             "fi.refineid.document-signing" => Some(Self::DocumentSigning),
             _ => None,
-        }
-    }
-}
-
-/// Result of checking the counter that a proposed command can decrement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RetryDecision {
-    /// The command may be offered to the user.
-    Permit,
-    /// The counter is unavailable, so the command must not be sent.
-    RefuseUnavailable,
-    /// Only one or two attempts remain, so the command must not be sent.
-    RefuseNearLockout {
-        /// Remaining attempts reported by the credential.
-        remaining: u8,
-    },
-    /// The checked credential is blocked and cannot be verified.
-    RefuseBlocked,
-}
-
-impl RetryDecision {
-    /// Apply the retry floor of RAPP v26.10.22 section 10.2 to the counter
-    /// the command would consume.
-    #[must_use]
-    pub const fn for_decrementing_counter(remaining: Option<u8>) -> Self {
-        match remaining {
-            None => Self::RefuseUnavailable,
-            Some(0) => Self::RefuseBlocked,
-            Some(value) if value < MINIMUM_REMAINING_ATTEMPTS => {
-                Self::RefuseNearLockout { remaining: value }
-            }
-            Some(_) => Self::Permit,
         }
     }
 }

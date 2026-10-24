@@ -64,16 +64,10 @@ pub(crate) fn signature_octets<'a>(
     }
 }
 
-/// CRL extensions whose presence leaves the list complete, so a
-/// reader that passes over them processes them correctly even when
-/// an issuer marks them critical: `cRLNumber` (RFC 5280 sec.5.2.3),
-/// `authorityKeyIdentifier` (sec.5.2.1) and `freshestCRL`
-/// (sec.5.2.6), which points at deltas this reader does not fetch.
-const LIST_PRESERVING_EXTENSIONS: [Oid<'static>; 3] = [
-    crate::oids::CRL_NUMBER,
-    crate::oids::AUTHORITY_KEY_IDENTIFIER,
-    crate::oids::FRESHEST_CRL,
-];
+/// The `Version` value of a v2 CRL (RFC 5280 sec.5.1.2.1: `v2(1)`).
+/// A v1 CRL omits the field and carries no extensions at either level
+/// (sec.5.1.2.6, sec.5.1.2.7).
+const CRL_VERSION_2: u8 = 1;
 
 /// Why bytes are not a complete CRL this reader can answer from.
 #[non_exhaustive]
@@ -536,7 +530,11 @@ fn parse_tbs_cert_list<'a>(
             .map_err(|_ignored| X509Error::UnexpectedStructure("tbsCertList version/signature"))?,
     )
     .map_err(|_ignored| X509Error::UnexpectedStructure("tbsCertList version/signature"))?;
-    if first.tag() == Tag::Integer {
+    let is_v2 = first.tag() == Tag::Integer;
+    if is_v2 {
+        if first.decode_as::<u8>().ok() != Some(CRL_VERSION_2) {
+            return Err(X509Error::UnexpectedStructure("tbsCertList version").into());
+        }
         reader
             .tlv_bytes()
             .map_err(|_ignored| X509Error::UnexpectedStructure("tbsCertList signature"))?;
@@ -584,11 +582,14 @@ fn parse_tbs_cert_list<'a>(
             }
             Tag::Sequence => {
                 seen = seen.advance_to(TrailingField::RevokedCertificates)?;
-                check_revoked_entries(any.value())?;
+                check_revoked_entries(any.value(), is_v2)?;
                 revoked_seq_value = Some(any.value());
             }
             tag if tag == CRL_EXTENSIONS_TAG => {
                 seen = seen.advance_to(TrailingField::CrlExtensions)?;
+                if !is_v2 {
+                    return Err(X509Error::UnexpectedStructure("crlExtensions in a v1 CRL").into());
+                }
                 check_crl_extensions(any.value())?;
             }
             _ => return Err(X509Error::UnexpectedStructure("unexpected CRL field").into()),
@@ -633,7 +634,9 @@ impl TrailingField {
     }
 }
 
-/// Refuse a CRL that is not a complete list for its issuer.
+/// Refuse a CRL that is not a complete list for its issuer, or that
+/// carries a critical extension: this reader processes none, so a
+/// critical one means the CRL MUST NOT be used (RFC 5280 sec.5.2).
 ///
 /// `extensions` is the value of the `[0] EXPLICIT` wrapper: the
 /// `Extensions` SEQUENCE (RFC 5280 sec.5.1.2.7).
@@ -648,11 +651,7 @@ fn check_crl_extensions(extensions: &[u8]) -> Result<(), CrlError> {
         if oid == crate::oids::ISSUING_DISTRIBUTION_POINT.as_bytes() {
             return Err(CrlError::Scoped);
         }
-        if extension.critical
-            && !LIST_PRESERVING_EXTENSIONS
-                .iter()
-                .any(|known| known.as_bytes() == oid)
-        {
+        if extension.critical {
             return Err(CrlError::UnsupportedCriticalExtension);
         }
     }
@@ -660,9 +659,10 @@ fn check_crl_extensions(extensions: &[u8]) -> Result<(), CrlError> {
 }
 
 /// Decode every `revokedCertificates` entry, refusing the CRL when one
-/// does not decode or carries a critical extension other than
-/// `reasonCode` (RFC 5280 sec.5.3). `body` is the SEQUENCE OF's value.
-fn check_revoked_entries(body: &[u8]) -> Result<(), CrlError> {
+/// does not decode, carries extensions in a v1 CRL (`is_v2` false,
+/// RFC 5280 sec.5.1.2.6), or carries a critical extension other than
+/// `reasonCode` (sec.5.3). `body` is the SEQUENCE OF's value.
+fn check_revoked_entries(body: &[u8], is_v2: bool) -> Result<(), CrlError> {
     let mut reader = SliceReader::new(body)
         .map_err(|_ignored| X509Error::UnexpectedStructure("revokedCertificates"))?;
     while !reader.is_finished() {
@@ -672,6 +672,9 @@ fn check_revoked_entries(body: &[u8]) -> Result<(), CrlError> {
                 .map_err(|_ignored| X509Error::UnexpectedStructure("revokedCertificates entry"))?,
         )
         .map_err(|_ignored| X509Error::UnexpectedStructure("revokedCertificates entry"))?;
+        if !is_v2 && revoked.crl_entry_extensions.is_some() {
+            return Err(X509Error::UnexpectedStructure("crlEntryExtensions in a v1 CRL").into());
+        }
         if revoked
             .crl_entry_extensions
             .iter()
@@ -1137,10 +1140,73 @@ mod tests {
             integer_extension(crate::oids::CRL_NUMBER, false),
             unlisted_extension(false),
         ]);
-        let crl = Crl::parse(&der).expect("a complete CRL with list-preserving extensions parses");
+        let crl = Crl::parse(&der).expect("a complete CRL with non-critical extensions parses");
         assert!(crl.find_serial(&fixture_serial(6)).is_some());
-        let der = crl_with_extensions(vec![integer_extension(crate::oids::CRL_NUMBER, true)]);
-        Crl::parse(&der).expect("a critical cRLNumber leaves the list complete");
+    }
+
+    #[test]
+    fn critical_profile_extensions_are_refused() {
+        for oid in [
+            crate::oids::CRL_NUMBER,
+            crate::oids::AUTHORITY_KEY_IDENTIFIER,
+            crate::oids::FRESHEST_CRL,
+        ] {
+            let der = crl_with_extensions(vec![sequence_extension(identifier(oid), true)]);
+            assert_eq!(
+                Crl::parse(&der).err(),
+                Some(CrlError::UnsupportedCriticalExtension)
+            );
+        }
+        let der = crl_with_extensions(vec![sequence_extension(
+            identifier(crate::oids::FRESHEST_CRL),
+            false,
+        )]);
+        Crl::parse(&der).expect("a non-critical freshestCRL leaves the list complete");
+    }
+
+    /// `der` as a v1 CRL: its `version` field removed.
+    fn without_version(der: &[u8]) -> Vec<u8> {
+        with_tbs_fields(der, |fields| {
+            fields.remove(0);
+        })
+    }
+
+    #[test]
+    fn v1_crl_without_extensions_parses() {
+        let der = without_version(&build_crl(&[revoked_row()], true));
+        let crl = Crl::parse(&der).expect("a v1 CRL without extensions parses");
+        assert!(crl.find_serial(&fixture_serial(6)).is_some());
+    }
+
+    #[test]
+    fn v1_crl_with_extensions_is_refused() {
+        let with_crl_extensions = without_version(&crl_with_extensions(vec![integer_extension(
+            crate::oids::CRL_NUMBER,
+            false,
+        )]));
+        let rows = [RevokedFixture {
+            reason: Some(CrlReason::KeyCompromise),
+            ..revoked_row()
+        }];
+        let with_entry_extensions = without_version(&build_crl(&rows, true));
+        for der in [with_crl_extensions, with_entry_extensions] {
+            assert!(matches!(
+                Crl::parse(&der),
+                Err(CrlError::Malformed(X509Error::UnexpectedStructure(_)))
+            ));
+        }
+    }
+
+    #[test]
+    fn version_other_than_v2_is_refused() {
+        let v1_explicit = Version::V1.to_der().expect("Version encodes");
+        let der = with_tbs_fields(&build_crl(&[revoked_row()], true), |fields| {
+            fields[0] = v1_explicit;
+        });
+        assert!(matches!(
+            Crl::parse(&der),
+            Err(CrlError::Malformed(X509Error::UnexpectedStructure(_)))
+        ));
     }
 
     #[test]
@@ -1232,6 +1298,20 @@ mod tests {
         Crl::parse(&listed).expect("the unedited fields parse");
         assert!(matches!(
             Crl::parse(&doubled),
+            Err(CrlError::Malformed(X509Error::UnexpectedStructure(_)))
+        ));
+    }
+
+    #[test]
+    fn next_update_after_revoked_list_is_refused() {
+        let der = build_crl(&[revoked_row()], true);
+        // version, signature, issuer, thisUpdate, nextUpdate, revoked.
+        let next_update_at = 4;
+        let reordered = with_tbs_fields(&der, |fields| {
+            fields.swap(next_update_at, next_update_at + 1)
+        });
+        assert!(matches!(
+            Crl::parse(&reordered),
             Err(CrlError::Malformed(X509Error::UnexpectedStructure(_)))
         ));
     }

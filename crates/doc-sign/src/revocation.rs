@@ -703,6 +703,30 @@ mod tests {
     }
 
     #[test]
+    fn crl_is_valid_from_its_this_update() {
+        let (cert_der, crl_der) = unlisted_cert_and_crl();
+        let cert = Certificate::from_der(&cert_der).expect("cert");
+        let crl = VerifiedCrl::from_unverified_for_test(Crl::parse(&crl_der).expect("crl"));
+        let at_this_update = DateTime::new(2026, 5, 20, 12, 0, 0).expect("valid test instant");
+        assert_eq!(
+            check_against_crl(cert, &crl, at_this_update),
+            RevocationStatus::Good
+        );
+    }
+
+    #[test]
+    fn listed_serial_on_future_crl_is_not_yet_valid() {
+        let cert_der = build_cert(&[0x01], &issuer_name());
+        let cert = Certificate::from_der(&cert_der).expect("cert");
+        let crl_der = build_crl(Some(&[0x01]), &issuer_name(), Some("260620120000"));
+        let crl = VerifiedCrl::from_unverified_for_test(Crl::parse(&crl_der).expect("crl"));
+        assert_eq!(
+            check_against_crl(cert, &crl, before_this_update()),
+            RevocationStatus::NotYetValid
+        );
+    }
+
+    #[test]
     fn ocsp_not_yet_valid_when_this_update_in_future() {
         let (cert_der, resp_der) = good_cert_and_response();
         let cert = Certificate::from_der(&cert_der).expect("cert");

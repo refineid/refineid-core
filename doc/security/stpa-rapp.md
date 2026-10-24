@@ -1850,7 +1850,7 @@ had signed every document and the secure channel refused to seal it.
 
 | ID | Constraint | Closes |
 | :--- | :--- | :--- |
-| CC-105 | A batch is admitted only when the largest `operation.result` its key profile can produce, every signature at the profile's fixed §9.2 size and the sequence at its widest encoding, encodes within one frame. The custodian refuses any other batch at admission with `unsupported_parameter` (specification §9.2, §10 table), before any card command and before the holder is asked, and the requester refuses to start it. The secure channel advances its send sequence only after an envelope has encoded, so a refused seal leaves the sequence equal to the Noise nonce (specification §7.2 item 3). | UCA-101 |
+| CC-105 | A batch is admitted only when the largest `operation.result` its key profile can produce, every signature at the profile's fixed §9.2 size and the sequence at its widest encoding, encodes within one frame. The custodian refuses any other batch at admission with `unsupported_parameter` (specification §9.2, §10 table), before any card command and before the holder is asked, and the requester refuses to start it. The secure channel advances its send sequence only after an envelope has encoded and encrypted, so a refused or failed seal leaves the sequence equal to the Noise nonce (specification §7.2 item 3). | UCA-101 |
 
 ## 32. A session outliving the pairing it belongs to
 

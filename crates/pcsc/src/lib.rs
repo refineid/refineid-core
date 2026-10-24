@@ -721,6 +721,15 @@ pub trait ReaderBackend {
     /// Enumerate all visible readers and their card-present status.
     fn enumerate(&self) -> Result<Vec<ReaderInfo>, Self::Error>;
 
+    /// The card insertion and removal count of the named reader, as
+    /// [`ReaderInfo::card_events`] reports it, read now. Two equal
+    /// reads bracket a span in which the platform saw no card arrive
+    /// or leave.
+    ///
+    /// # Errors
+    /// The platform cannot report the reader's state.
+    fn card_events(&self, reader: &ReaderId) -> Result<u32, Self::Error>;
+
     /// Open a session on the named reader for `access`. The PC/SC
     /// backend connects in shared mode; `access` decides whether
     /// the session may run a PIN sequence.
@@ -997,6 +1006,38 @@ pub fn read_reader_identity(reader: &ReaderId) -> ReaderIdentity {
     }
 }
 
+/// One reader's state as `SCardGetStatusChange` reports it now.
+struct ReaderStatus {
+    /// A card is in the reader.
+    card_present: bool,
+    /// The reader's card insertion and removal count
+    /// ([`ReaderInfo::card_events`]).
+    card_events: u32,
+    /// The platform reported the reader's state in this query. A
+    /// zero-wait query that times out leaves the state as the caller
+    /// passed it, with no count read.
+    reported: bool,
+}
+
+/// Query the named reader's state once, without waiting for a change.
+fn reader_status(ctx: &Context, reader: &str) -> Result<ReaderStatus, PcscError> {
+    let cstr = CString::new(reader)
+        .map_err(|e| PcscError::Transport(format!("reader name has interior NUL: {e}")))?;
+    let mut states = [ReaderState::new(cstr, State::UNAWARE)];
+    let answered = match ctx.get_status_change(core::time::Duration::ZERO, &mut states) {
+        Ok(()) => true,
+        Err(pcsc::Error::Timeout) => false,
+        Err(e) => return Err(e.into()),
+    };
+    let [state] = &states;
+    let event = state.event_state();
+    Ok(ReaderStatus {
+        card_present: event.contains(State::PRESENT) && !event.contains(State::EMPTY),
+        card_events: state.event_count(),
+        reported: answered || event.contains(State::CHANGED),
+    })
+}
+
 /// Default desktop PC/SC reader backend implementation.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PcscBackend;
@@ -1010,32 +1051,24 @@ impl ReaderBackend for PcscBackend {
         let names = list_readers(&ctx)?;
         let mut out = Vec::with_capacity(names.len());
         for name in names {
-            let cstr = CString::new(name.as_str())
-                .map_err(|e| PcscError::Transport(format!("reader name has interior NUL: {e}")))?;
-            let mut states = vec![ReaderState::new(cstr, State::UNAWARE)];
-            let (card_present, card_events) =
-                match ctx.get_status_change(core::time::Duration::ZERO, &mut states) {
-                    Ok(()) | Err(pcsc::Error::Timeout) => {
-                        let Some(state) = states.first() else {
-                            return Err(PcscError::Transport(
-                                "reader-state vector unexpectedly empty".into(),
-                            ));
-                        };
-                        let event = state.event_state();
-                        (
-                            event.contains(State::PRESENT) && !event.contains(State::EMPTY),
-                            state.event_count(),
-                        )
-                    }
-                    Err(e) => return Err(e.into()),
-                };
+            let status = reader_status(&ctx, name.as_str())?;
             out.push(ReaderInfo {
                 id: ReaderId::new(name),
-                card_present,
-                card_events,
+                card_present: status.card_present,
+                card_events: status.card_events,
             });
         }
         Ok(out)
+    }
+
+    fn card_events(&self, reader: &ReaderId) -> Result<u32, Self::Error> {
+        let ctx = establish_context()?;
+        let status = reader_status(&ctx, reader.as_str())?;
+        if status.reported {
+            Ok(status.card_events)
+        } else {
+            Err(PcscError::Pcsc(pcsc::Error::Timeout))
+        }
     }
 
     fn open_exclusive(

@@ -66,7 +66,10 @@ refused the PIN, and the value is destroyed instead of sent again.
 Held PIN1 is destroyed on:
 
 - card removal -- the card leaving the reader, or its holder removing it from
-  the phone -- and token-identifier mismatch;
+  the phone -- and token-identifier mismatch; on a PC/SC reader a card that
+  left and came back between two uses is seen through the reader's card
+  insertion and removal count, read in the card session of every use and
+  compared with the count read when the card accepted the value;
 - a wrong, blocked or malformed PIN response, or a retry counter that went
   down;
 - process exit, device restart, or the user clearing it; and

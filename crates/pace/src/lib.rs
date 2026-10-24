@@ -43,6 +43,7 @@ mod public_contract_tests {
     use zeroize::{Zeroize, ZeroizeOnDrop};
 
     use super::{Can, PaceSession, Ssc, UnvalidatedCan};
+    use crate::crypto::brainpool_p384::AffinePoint;
     use crate::crypto::symmetric::Aes256Key;
 
     trait AmbiguousIfImplemented<Disambiguator, Marker> {
@@ -72,6 +73,8 @@ mod public_contract_tests {
     fn require_zeroize_on_drop<T: ZeroizeOnDrop>() {}
 
     fn require_zeroizable_boundary<T: Zeroize + ZeroizeOnDrop>() {}
+
+    fn require_zeroize<T: Zeroize>() {}
 
     #[test]
     fn sensitive_public_types_preserve_ownership_contracts() {
@@ -113,5 +116,12 @@ mod public_contract_tests {
         // value, so it is neither Copy nor Clone.
         let _ = <Ssc as AmbiguousIfImplemented<_, CloneMarker>>::marker;
         let _ = <Ssc as AmbiguousIfImplemented<_, CopyMarker>>::marker;
+
+        // A curve point computed from a private scalar is duplicated only
+        // by an explicit clone and can be wiped on request, so the
+        // handshake's secret-dependent points never spread by implicit
+        // copy and die with their zeroizing owner.
+        require_zeroize::<AffinePoint>();
+        let _ = <AffinePoint as AmbiguousIfImplemented<_, CopyMarker>>::marker;
     }
 }

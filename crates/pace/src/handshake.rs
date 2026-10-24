@@ -30,7 +30,7 @@
 
 use crypto_bigint::U384;
 use subtle::ConstantTimeEq as _;
-use zeroize::Zeroizing;
+use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 use refineid_apdu::{CardTransport, CommandDataError, ResponseApdu, StatusWord, TransportOutcome};
 use refineid_ber::{BerEncodeError, BerError, BerTag, BerTlv};
@@ -255,7 +255,9 @@ impl<E> From<CommandDataError> for PaceError<E> {
 /// The steps one through four state carried into the mutual-auth round.
 ///
 /// No `Debug`: the state holds the ephemeral private scalar, which must
-/// never reach a formatter.
+/// never reach a formatter. Every field zeroizes on drop, so the scalar
+/// and the points it was combined with do not outlive the handshake.
+#[derive(ZeroizeOnDrop)]
 pub(crate) struct PaceMidwayState {
     /// The card's key-agreement public point.
     v_picc: AffinePoint,
@@ -385,10 +387,12 @@ fn map_nonce_and_key_agreement<T: CardTransport>(
     let card_y = BerTlv::<MappingDataOut>::parse(outer.value())?;
     let y_picc = AffinePoint::decode_uncompressed(card_y.value()).ok_or(PaceError::InvalidPoint)?;
 
-    let h = y_picc.scalar_mul(&x_pcd);
+    // The mapped generator and everything it is built from depend on
+    // the nonce and the private scalar; each lives in a scrubbed owner.
+    let h = Zeroizing::new(y_picc.scalar_mul(&x_pcd));
     let s_scalar = scalar_from_nonce(nonce);
-    let s_g = AffinePoint::generator().scalar_mul(&s_scalar);
-    let mapped_g = s_g.add(&h);
+    let s_g = Zeroizing::new(AffinePoint::generator().scalar_mul(&s_scalar));
+    let mapped_g = Zeroizing::new(s_g.add(&h));
 
     let u_pcd = random_scalar_mod_n()?;
     let u_pcd_public = mapped_g.scalar_mul(&u_pcd);
@@ -411,7 +415,7 @@ fn map_nonce_and_key_agreement<T: CardTransport>(
 
     Ok(PaceMidwayState {
         v_picc,
-        u_pcd,
+        u_pcd: *u_pcd,
         u_pcd_public,
     })
 }
@@ -422,12 +426,12 @@ pub(crate) fn run_mutual_authentication<T: CardTransport>(
     transport: &mut T,
     state: PaceMidwayState,
 ) -> Result<PaceSession, PaceError<T::Error>> {
-    let shared = state.v_picc.scalar_mul(&state.u_pcd);
-    let (shared_x, _shared_y) = shared.coords.ok_or(PaceError::InvalidPoint)?;
-    let shared_x_bytes = Zeroizing::new(shared_x.to_be_bytes().as_ref().to_vec());
+    let shared = Zeroizing::new(state.v_picc.scalar_mul(&state.u_pcd));
+    let shared_x = Zeroizing::new(shared.coords.as_ref().ok_or(PaceError::InvalidPoint)?.0);
+    let shared_x_bytes = Zeroizing::new(shared_x.to_be_bytes());
 
-    let k_enc = kdf_aes256(&shared_x_bytes, KdfParam::Encryption);
-    let k_mac = kdf_aes256(&shared_x_bytes, KdfParam::Mac);
+    let k_enc = kdf_aes256(shared_x_bytes.as_ref(), KdfParam::Encryption);
+    let k_mac = kdf_aes256(shared_x_bytes.as_ref(), KdfParam::Mac);
 
     let token_for_card = encode_auth_token(&state.v_picc).ok_or(PaceError::InvalidPoint)?;
     let t_pcd = aes256_cmac_truncated(k_mac.as_bytes(), &token_for_card);
@@ -477,15 +481,16 @@ fn encode_auth_token(point: &AffinePoint) -> Option<Vec<u8>> {
 }
 
 /// Draw a random scalar in the range one up to the subgroup order, by
-/// rejection sampling.
-fn random_scalar_mod_n<E>() -> Result<U384, PaceError<E>> {
+/// rejection sampling. The draw buffer and the scalar are both scrubbed
+/// owners: the scalar is a private key for the rest of the handshake.
+fn random_scalar_mod_n<E>() -> Result<Zeroizing<U384>, PaceError<E>> {
     let order = brainpool_n();
     loop {
-        let mut buffer = [0_u8; SCALAR_LEN];
-        rng::fill(&mut buffer).map_err(PaceError::Random)?;
-        let candidate = U384::from_be_slice(&buffer);
-        let nonzero = candidate != U384::ZERO;
-        let in_range = candidate < order;
+        let mut buffer = Zeroizing::new([0_u8; SCALAR_LEN]);
+        rng::fill(buffer.as_mut()).map_err(PaceError::Random)?;
+        let candidate = Zeroizing::new(U384::from_be_slice(buffer.as_ref()));
+        let nonzero = *candidate != U384::ZERO;
+        let in_range = *candidate < order;
         if nonzero && in_range {
             return Ok(candidate);
         }
@@ -493,11 +498,12 @@ fn random_scalar_mod_n<E>() -> Result<U384, PaceError<E>> {
 }
 
 /// Lift a nonce to a scalar by left-padding with zeros to the scalar
-/// width; the result is always below the subgroup order.
-fn scalar_from_nonce(nonce: &[u8; NONCE_LEN]) -> U384 {
-    let mut padded = [0_u8; SCALAR_LEN];
+/// width; the result is always below the subgroup order. The scalar is
+/// the CAN-protected mapping secret, so it is a scrubbed owner.
+fn scalar_from_nonce(nonce: &[u8; NONCE_LEN]) -> Zeroizing<U384> {
+    let mut padded = Zeroizing::new([0_u8; SCALAR_LEN]);
     padded[SCALAR_LEN - NONCE_LEN..].copy_from_slice(nonce);
-    U384::from_be_slice(&padded)
+    Zeroizing::new(U384::from_be_slice(padded.as_ref()))
 }
 
 #[cfg(test)]
@@ -552,8 +558,8 @@ mod tests {
         for _round in 0..SCALAR_ROUNDS {
             let scalar = random_scalar_mod_n::<core::convert::Infallible>()
                 .expect("scalar generation succeeds");
-            let nonzero = scalar != U384::ZERO;
-            let in_range = scalar < order;
+            let nonzero = *scalar != U384::ZERO;
+            let in_range = *scalar < order;
             assert!(nonzero);
             assert!(in_range);
         }
@@ -566,6 +572,12 @@ mod tests {
         let bytes = scalar.to_be_bytes();
         assert!(bytes[..SCALAR_HIGH_ZEROS].iter().all(|&b| b == 0));
         assert_eq!(&bytes[SCALAR_HIGH_ZEROS..], &nonce[..]);
+    }
+
+    #[test]
+    fn midway_state_is_zeroize_on_drop() {
+        fn require_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        require_zeroize_on_drop::<PaceMidwayState>();
     }
 
     #[test]

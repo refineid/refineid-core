@@ -170,6 +170,14 @@ before and the correction made the core better.
 - Document and protocol versions are stamped by the project owner; never
   invent one.
 
+## Rules live here, not in an agent's memory
+
+Every rule, decision and durable finding an agent should remember goes
+into this repository: a working rule into this file, a design rule into
+`doc/`, a defect into an issue. An agent's own memory holds pointers at
+most. A rule that lives only in one agent's memory binds nobody else and
+is lost with that agent: agent-local memory is the modern vendor lock-in.
+
 ## Source comments
 
 - Comments explain what the code does now and the constraints it honors.

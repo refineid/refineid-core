@@ -77,6 +77,18 @@ const MAX_TIMESTAMP_CLOCK_SKEW: core::time::Duration = core::time::Duration::fro
 const TIMESTAMP_RETRY_INITIAL_DELAY: core::time::Duration = core::time::Duration::from_secs(1);
 /// Ceiling for repeated timestamp-authority retries.
 const TIMESTAMP_RETRY_MAX_DELAY: core::time::Duration = core::time::Duration::from_mins(1);
+/// Most attempts made against one authority before giving up.
+///
+/// With the doubling schedule above this spends a little over two
+/// minutes waiting; an authority still down after that is reported
+/// rather than waited on, because the reader session stays open for
+/// the whole wait.
+const TIMESTAMP_RETRY_MAX_ATTEMPTS: u32 = 8;
+/// Most time spent waiting on one authority across all attempts.
+///
+/// Same allowance as `MAX_TIMESTAMP_CLOCK_SKEW`: a holder with a card
+/// in the reader waits no longer than that for an attested time.
+const TIMESTAMP_RETRY_TOTAL_BUDGET: core::time::Duration = core::time::Duration::from_mins(5);
 
 /// Candidate EU-qualified timestamp endpoints used by first-party clients.
 ///
@@ -1294,9 +1306,10 @@ fn post_timestamp_query(
     }
     retry_timestamp_query(
         || post_timestamp_query_once(uri, timestamp_query_der, max_response, credentials),
-        |delay, error| {
+        |attempt, delay, error| {
             eprintln!(
-                "timestamp authority temporarily unavailable ({error}); retrying in {} seconds",
+                "timestamp authority temporarily unavailable ({error}); attempt {attempt} of \
+                 {TIMESTAMP_RETRY_MAX_ATTEMPTS}, retrying in {} seconds",
                 delay.as_secs()
             );
             std::thread::sleep(delay);
@@ -1336,16 +1349,34 @@ fn post_timestamp_query_once(
     )
 }
 
+/// Repeats `post` on transient authority failures with a doubling delay.
+///
+/// The loop stops at `TIMESTAMP_RETRY_MAX_ATTEMPTS` attempts or when the
+/// next wait would push the accumulated waiting past
+/// `TIMESTAMP_RETRY_TOTAL_BUDGET`, whichever comes first, and returns the
+/// last transient error unchanged. `wait` receives the number of the
+/// attempt that just failed, the delay before the next one, and the
+/// error.
 fn retry_timestamp_query<T>(
     mut post: impl FnMut() -> Result<T, crate::http::HttpError>,
-    mut wait: impl FnMut(core::time::Duration, &crate::http::HttpError),
+    mut wait: impl FnMut(u32, core::time::Duration, &crate::http::HttpError),
 ) -> Result<T, crate::http::HttpError> {
     let mut delay = TIMESTAMP_RETRY_INITIAL_DELAY;
+    let mut waited = core::time::Duration::ZERO;
+    let mut attempts: u32 = 0;
     loop {
+        attempts = attempts.saturating_add(1);
         match post() {
             Ok(response) => return Ok(response),
             Err(error) if error.is_retryable_authority_failure() => {
-                wait(delay, &error);
+                let next_waited = waited.saturating_add(delay);
+                if attempts >= TIMESTAMP_RETRY_MAX_ATTEMPTS
+                    || next_waited > TIMESTAMP_RETRY_TOTAL_BUDGET
+                {
+                    return Err(error);
+                }
+                wait(attempts, delay, &error);
+                waited = next_waited;
                 delay = delay
                     .checked_mul(2)
                     .unwrap_or(TIMESTAMP_RETRY_MAX_DELAY)
@@ -2039,29 +2070,81 @@ mod tests {
     fn timestamp_retry_uses_capped_exponential_backoff_until_success() {
         assert!(retry_transient_authority_failures(1));
         assert!(!retry_transient_authority_failures(2));
-        let mut attempts = 0_u8;
+        let mut attempts = 0_u32;
         let mut delays = Vec::new();
         let token = retry_timestamp_query(
             || {
                 attempts = attempts.saturating_add(1);
-                if attempts <= 8 {
-                    Err(crate::http::HttpError::HttpStatus {
-                        code: 429,
-                        reason: "Too Many Requests".to_owned(),
-                        location: None,
-                    })
+                if attempts < TIMESTAMP_RETRY_MAX_ATTEMPTS {
+                    Err(too_many_requests())
                 } else {
                     Ok("timestamp")
                 }
             },
-            |delay, _error| delays.push(delay),
+            |attempt, delay, _error| delays.push((attempt, delay)),
         )
-        .expect("a later attempt succeeds");
+        .expect("the last permitted attempt succeeds");
         assert_eq!(token, "timestamp");
-        assert_eq!(attempts, 9);
-        assert_eq!(
-            delays,
-            [1, 2, 4, 8, 16, 32, 60, 60].map(core::time::Duration::from_secs)
+        assert_eq!(attempts, TIMESTAMP_RETRY_MAX_ATTEMPTS);
+        let expected_delays = [1, 2, 4, 8, 16, 32, 60].map(core::time::Duration::from_secs);
+        let expected: Vec<_> = (1_u32..).zip(expected_delays).collect();
+        assert_eq!(delays, expected);
+    }
+
+    fn too_many_requests() -> crate::http::HttpError {
+        crate::http::HttpError::HttpStatus {
+            code: 429,
+            reason: "Too Many Requests".to_owned(),
+            location: None,
+        }
+    }
+
+    fn service_unavailable() -> crate::http::HttpError {
+        crate::http::HttpError::HttpStatus {
+            code: 503,
+            reason: "Service Unavailable".to_owned(),
+            location: None,
+        }
+    }
+
+    #[test]
+    fn timestamp_retry_gives_up_after_the_attempt_bound() {
+        let mut attempts = 0_u32;
+        let mut waits = 0_u32;
+        let error = retry_timestamp_query(
+            || {
+                attempts = attempts.saturating_add(1);
+                Err::<(), _>(service_unavailable())
+            },
+            |_attempt, _delay, _error| waits = waits.saturating_add(1),
+        )
+        .expect_err("an authority that never answers is reported");
+        assert!(matches!(
+            error,
+            crate::http::HttpError::HttpStatus { code: 503, .. }
+        ));
+        assert_eq!(attempts, TIMESTAMP_RETRY_MAX_ATTEMPTS);
+        assert_eq!(waits, TIMESTAMP_RETRY_MAX_ATTEMPTS - 1);
+    }
+
+    #[test]
+    fn timestamp_retry_gives_up_when_the_budget_would_be_exceeded() {
+        let mut delays = Vec::new();
+        retry_timestamp_query(
+            || Err::<(), _>(service_unavailable()),
+            |_attempt, delay, _error| delays.push(delay),
+        )
+        .expect_err("an authority that never answers is reported");
+        let waited = delays
+            .iter()
+            .fold(core::time::Duration::ZERO, |sum, delay| {
+                sum.saturating_add(*delay)
+            });
+        assert!(waited <= TIMESTAMP_RETRY_TOTAL_BUDGET);
+        assert!(
+            delays
+                .iter()
+                .all(|delay| *delay <= TIMESTAMP_RETRY_MAX_DELAY)
         );
     }
 
@@ -2077,7 +2160,7 @@ mod tests {
                     location: None,
                 })
             },
-            |_delay, _error| panic!("permanent failure must not wait"),
+            |_attempt, _delay, _error| panic!("permanent failure must not wait"),
         )
         .expect_err("authentication failure is permanent");
         assert!(matches!(

@@ -18,8 +18,8 @@
 //! reconstructed as types whose constructors preserve their invariants.
 //! The verification chain consumes a validated PIN through a
 //! crate-private path and ships it as a credential command, consumed
-//! exactly once; the retry-risk policy maps the live counter to the
-//! safety floors different surfaces stop at.
+//! exactly once; the retry floor serves a PIN 1 or PIN 2 attempt only at
+//! five, four or three tries left, the one floor every surface stops at.
 
 pub mod activation;
 pub mod credentials;
@@ -38,8 +38,7 @@ pub use credentials::{
 };
 pub use manage::{ManageOutcome, PinManageOps, classify_manage_sw};
 pub use retry_risk::{
-    PinRetryRisk, pin1_status_permits_consumer_authentication, pin1_status_permits_reusable_cache,
-    pin2_status_permits_qualified_signature,
+    PinRetryRisk, RetryFloorRefusal, check_retry_floor, pin1_status_permits_reusable_cache,
 };
 pub use verify::{
     AuthError, ORGANIZATIONAL_PIN_MAX_LENGTH, PIN_STORED_LENGTH, PIN1_REFERENCE,

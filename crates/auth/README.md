@@ -8,8 +8,10 @@ validates once and reconstructs the non-clonable, zeroizing `Pin1` and
 PIN through a crate-private path, pad it to the stored length, and ship
 it only as a credential command, consumed exactly once; the slot is
 fixed by the argument type. The counter-safe status probe reads the
-retry state without spending a counter, and the retry-risk policy maps
-the live counter to the safety floors different surfaces stop at.
+retry state without spending a counter, and `check_retry_floor` serves a
+PIN 1 or PIN 2 attempt only at five, four or three tries left -- the one
+floor every surface stops at. Setting a new PIN with the PUK is not
+subject to it.
 
 Both citizen and organizational cards are supported.
 `resolve_pin_reference_scheme` settles which credential numbering the card

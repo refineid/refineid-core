@@ -11,8 +11,15 @@ use super::{
     UserApproval,
 };
 
+/// Most operation identifiers one session remembers for the duplicate check
+/// of RAPP v26.10.22 section 8.1 item 1. A local resource bound: one session
+/// is one workstation, and a requester that starts more operations than this
+/// on one session has its session closed.
+pub const MAX_SEEN_OPERATION_IDS: usize = 4_096;
+
 /// The operations of one authenticated session: one live at a time, and
-/// every identifier used once. Nothing outlives the session.
+/// every identifier used once; at most [`MAX_SEEN_OPERATION_IDS`] are
+/// remembered. Nothing outlives the session.
 #[derive(Debug)]
 pub struct ProxyOperationEngine {
     granted_profiles: Vec<ProfileName>,
@@ -35,12 +42,13 @@ impl ProxyOperationEngine {
     ///
     /// # Errors
     /// [`ProxyEngineError::AuthenticatedProtocolViolation`] when the requester
-    /// sends a message only a custodian sends; the session closes.
+    /// sends a message only a custodian sends, or more distinct operation
+    /// identifiers than [`MAX_SEEN_OPERATION_IDS`]; the session closes.
     pub fn receive(&mut self, message: TypedMessage) -> Result<ProxyDispatch, ProxyEngineError> {
         match message {
-            TypedMessage::OperationRequest(request) => Ok(self.receive_request(request)),
+            TypedMessage::OperationRequest(request) => self.receive_request(request),
             TypedMessage::OperationRequestRefused(refusal) => {
-                if let Some(answer) = self.admission_refusal(refusal.operation_id) {
+                if let Some(answer) = self.admission_refusal(refusal.operation_id)? {
                     return Ok(answer);
                 }
                 Ok(ProxyDispatch::Send(TypedMessage::OperationResult(
@@ -259,39 +267,53 @@ impl ProxyOperationEngine {
         }
     }
 
-    fn receive_request(&mut self, request: OperationRequest) -> ProxyDispatch {
+    fn receive_request(
+        &mut self,
+        request: OperationRequest,
+    ) -> Result<ProxyDispatch, ProxyEngineError> {
         let operation_id = request.operation_id;
-        if let Some(answer) = self.admission_refusal(operation_id) {
-            return answer;
+        if let Some(answer) = self.admission_refusal(operation_id)? {
+            return Ok(answer);
         }
         if !self.granted_profiles.contains(&request.profile) {
-            return ProxyDispatch::Send(TypedMessage::OperationResult(
+            return Ok(ProxyDispatch::Send(TypedMessage::OperationResult(
                 OperationResultMessage::failure(operation_id, ProxyFailure::Unauthorized),
-            ));
+            )));
         }
         self.live = Some(AuthorizationTransaction::prepare(request));
-        ProxyDispatch::InspectPrerequisites(operation_id)
+        Ok(ProxyDispatch::InspectPrerequisites(operation_id))
     }
 
     /// The `error` that refuses a request before admission: an identifier
     /// the session has seen, or a second request while one is live
-    /// (section 8.1 item 1). Every identifier counts as seen from here on.
-    fn admission_refusal(&mut self, operation_id: OperationId) -> Option<ProxyDispatch> {
-        if !self.seen.insert(operation_id) {
-            return Some(ProxyDispatch::Send(TypedMessage::Error(
+    /// (section 8.1 item 1). Every identifier counts as seen from here on,
+    /// up to [`MAX_SEEN_OPERATION_IDS`]; a fresh identifier past that bound
+    /// is a violation and the session closes.
+    fn admission_refusal(
+        &mut self,
+        operation_id: OperationId,
+    ) -> Result<Option<ProxyDispatch>, ProxyEngineError> {
+        if self.seen.contains(&operation_id) {
+            return Ok(Some(ProxyDispatch::Send(TypedMessage::Error(
                 ProtocolErrorMessage::duplicate(operation_id),
-            )));
+            ))));
         }
+        if self.seen.len() >= MAX_SEEN_OPERATION_IDS {
+            return Err(ProxyEngineError::AuthenticatedProtocolViolation(
+                ProxyViolation::OperationMemoryExhausted,
+            ));
+        }
+        self.seen.insert(operation_id);
         if self
             .live
             .as_ref()
             .is_some_and(|operation| !operation.is_terminal())
         {
-            return Some(ProxyDispatch::Send(TypedMessage::Error(
+            return Ok(Some(ProxyDispatch::Send(TypedMessage::Error(
                 ProtocolErrorMessage::busy(operation_id),
-            )));
+            ))));
         }
-        None
+        Ok(None)
     }
 
     fn live_mut(
@@ -347,6 +369,9 @@ pub enum ProxySessionCloseAction {
 pub enum ProxyViolation {
     /// The requester sent a message only a custodian sends.
     CustodianOnlyMessage,
+    /// The requester sent more distinct operation identifiers on one session
+    /// than [`MAX_SEEN_OPERATION_IDS`].
+    OperationMemoryExhausted,
 }
 
 /// Custodian operation-engine failure.
@@ -371,21 +396,52 @@ impl core::error::Error for ProxyEngineError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CardOperation, CardPresence, CardReader, OperationRequestRefusal, ResultError};
+    use crate::{
+        CardOperation, CardPresence, CardReader, OPERATION_ID_SIZE, OperationRequestRefusal,
+        ResultError,
+    };
 
     const START_MS: u64 = 1_000;
     const LIFETIME_MS: u64 = 5_000;
     const MAXIMUM_LIFETIME_MS: u64 = 300_000;
 
     fn inspection_request(byte: u8) -> OperationRequest {
+        inspection_request_for(OperationId::from_array([byte; 16]))
+    }
+
+    fn inspection_request_for(operation_id: OperationId) -> OperationRequest {
         OperationRequest::reconstruct(
-            OperationId::from_array([byte; 16]),
+            operation_id,
             ProfileName::CardStatus,
             START_MS,
             LIFETIME_MS,
             CardOperation::InspectCard,
         )
         .expect("registered card-status request")
+    }
+
+    /// The `index`-th of a run of distinct identifiers.
+    fn numbered_operation_id(index: usize) -> OperationId {
+        let mut bytes = [0; OPERATION_ID_SIZE];
+        bytes[..size_of::<usize>()].copy_from_slice(&index.to_be_bytes());
+        OperationId::from_array(bytes)
+    }
+
+    /// An engine that has refused `MAX_SEEN_OPERATION_IDS` distinct requests
+    /// as unauthorized, so its memory of identifiers is full.
+    fn engine_with_full_memory() -> ProxyOperationEngine {
+        let mut engine = ProxyOperationEngine::new(Vec::new());
+        for index in 0..MAX_SEEN_OPERATION_IDS {
+            let result = sent_result(
+                engine
+                    .receive(TypedMessage::OperationRequest(inspection_request_for(
+                        numbered_operation_id(index),
+                    )))
+                    .expect("refused, not a violation"),
+            );
+            assert_eq!(result.error, Some(ResultError::Unauthorized));
+        }
+        engine
     }
 
     fn sent_error(dispatch: ProxyDispatch) -> ProtocolErrorMessage {
@@ -450,6 +506,67 @@ mod tests {
             ),
             ProtocolErrorMessage::duplicate(request.operation_id)
         );
+    }
+
+    #[test]
+    fn the_seen_set_is_bounded() {
+        let mut engine = engine_with_full_memory();
+        assert_eq!(
+            engine
+                .receive(TypedMessage::OperationRequest(inspection_request_for(
+                    numbered_operation_id(MAX_SEEN_OPERATION_IDS),
+                )))
+                .expect_err("violation"),
+            ProxyEngineError::AuthenticatedProtocolViolation(
+                ProxyViolation::OperationMemoryExhausted
+            )
+        );
+    }
+
+    #[test]
+    fn a_refusal_relay_past_the_bound_is_a_violation() {
+        let mut engine = engine_with_full_memory();
+        assert_eq!(
+            engine
+                .receive(TypedMessage::OperationRequestRefused(
+                    OperationRequestRefusal {
+                        operation_id: numbered_operation_id(MAX_SEEN_OPERATION_IDS),
+                        error: ResultError::InvalidLifetime,
+                    },
+                ))
+                .expect_err("violation"),
+            ProxyEngineError::AuthenticatedProtocolViolation(
+                ProxyViolation::OperationMemoryExhausted
+            )
+        );
+    }
+
+    #[test]
+    fn a_duplicate_is_still_reported_at_the_bound() {
+        let mut engine = engine_with_full_memory();
+        let seen = numbered_operation_id(MAX_SEEN_OPERATION_IDS - 1);
+        assert_eq!(
+            sent_error(
+                engine
+                    .receive(TypedMessage::OperationRequest(inspection_request_for(seen)))
+                    .expect("dispatch")
+            ),
+            ProtocolErrorMessage::duplicate(seen)
+        );
+    }
+
+    #[test]
+    fn session_close_resets_the_seen_bound() {
+        let mut engine = engine_with_full_memory();
+        assert_eq!(engine.session_closed(), None);
+        let result = sent_result(
+            engine
+                .receive(TypedMessage::OperationRequest(inspection_request_for(
+                    numbered_operation_id(MAX_SEEN_OPERATION_IDS),
+                )))
+                .expect("admitted to the duplicate check"),
+        );
+        assert_eq!(result.error, Some(ResultError::Unauthorized));
     }
 
     #[test]

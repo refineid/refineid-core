@@ -1782,3 +1782,42 @@ on the phone keeps its key for the notice window, up to 30 days more;
 until it expires, a lost computer's pairing is live, and the holder
 forgets it on the phone. A wall clock set far ahead expires pairings
 early, costing a new pairing, and one set back delays expiry by as much.
+
+## 30. The custodian's memory of operation identifiers
+
+### 30.1 Scope
+
+Specification §8.1 item 1 has the custodian refuse an `operation_id`
+the session has already seen with `duplicate_operation`, so the
+custodian remembers every identifier a session has carried, admitted or
+refused, until the session closes. The identifiers come from the
+authenticated peer, which may be the stale-pairing attacker of
+specification §12. Losses and hazards are this record's: L-3; H-3.
+
+### 30.2 Control structure
+
+The custodian's admission check is the controller; its control action is
+to remember an identifier and answer the request. Its feedback is the
+session's set of remembered identifiers. Without a bound the feedback
+grows with the peer's traffic, not with the holder's use: every request
+is answered in constant time, and the process's memory is the only thing
+that changes.
+
+### 30.3 Unsafe control actions
+
+| ID | Controller | Control action | Type | Context | Hazard |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| UCA-100 | Custodian | Remember an operation identifier | P | For every distinct identifier a session sends, without a bound: a requester holding a stored pairing sends distinct identifiers until the platform ends the custodian process, and with it every other session the phone was serving. No card command runs and nothing stored changes. | H-3 |
+
+Loss scenario: the holder's computer loses its session with the rest and
+sees the phone as not reachable; the cause is another endpoint's stored
+pairing, which the holder forgets on the phone (specification §4.6)
+once they know. Serving the holder's other sessions through one
+requester's misbehaviour is this record's standing principle (section
+17).
+
+### 30.4 Controller constraints
+
+| ID | Constraint | Closes |
+| :--- | :--- | :--- |
+| CC-104 | The custodian remembers at most `MAX_SEEN_OPERATION_IDS` (4096) distinct identifiers per session. An identifier already remembered is refused as `duplicate_operation` whatever the count; a fresh identifier past the bound is an authenticated protocol violation that closes that session alone, with the pairing and every other session kept, as any such violation does. The memory is released when the session closes. One session is one workstation, and no honest requester starts thousands of operations on one session, so the bound costs the holder nothing. | UCA-100 |

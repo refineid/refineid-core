@@ -116,7 +116,8 @@ pub use pairing_flow::{
     PairingStorage,
 };
 pub use proxy_engine::{
-    ProxyDispatch, ProxyEngineError, ProxyOperationEngine, ProxySessionCloseAction, ProxyViolation,
+    MAX_SEEN_OPERATION_IDS, ProxyDispatch, ProxyEngineError, ProxyOperationEngine,
+    ProxySessionCloseAction, ProxyViolation,
 };
 pub use requester_engine::{
     RequesterDispatch, RequesterEngineError, RequesterOperationEngine, RequesterViolation,

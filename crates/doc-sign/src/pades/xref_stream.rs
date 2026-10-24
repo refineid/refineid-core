@@ -15,13 +15,25 @@
 //! and unfiltered rows keep the update inspectable.
 
 use super::{
-    PdfDictionary, PdfError, XrefEntry, XrefLocation, XrefSection, dictionary_at, dictionary_usize,
-    find_first, parse_u16, parse_u32, parse_usize, read_pdf_token, skip_pdf_whitespace,
+    MAX_XREF_ENTRIES, PdfDictionary, PdfError, XrefEntry, XrefLocation, XrefSection, dictionary_at,
+    dictionary_usize, find_first, parse_u16, parse_u32, parse_usize, read_pdf_token,
+    skip_pdf_whitespace,
 };
 
 /// Bound on any one decoded stream, so a hostile document cannot make
 /// this reader allocate without limit.
 const DECODED_LIMIT: usize = 1 << 26;
+
+/// Widest predictor row this reader accepts, in samples. ISO 32000-1
+/// sec.7.4.4.4 leaves `/Columns` open; a cross-reference row is the sum
+/// of `/W`, three fields of at most [`MAX_FIELD_WIDTH`] bytes, and an
+/// object stream's text is not written behind a row predictor by any
+/// mainstream writer, so a few hundred samples is ample headroom.
+const MAX_PREDICTOR_COLUMNS: usize = 256;
+
+/// Widest `/W` field this reader accepts, in bytes: wide enough for any
+/// offset this platform can address.
+const MAX_FIELD_WIDTH: usize = usize::BITS as usize / u8::BITS as usize;
 
 /// The predictor value meaning none was applied.
 const NO_PREDICTOR: usize = 1;
@@ -90,6 +102,9 @@ pub(super) fn parse_stream_section(pdf: &[u8], offset: usize) -> Result<XrefSect
         return Err(PdfError::MissingTrailer);
     }
     let size = dictionary_usize(&object.dictionary, b"/Size").ok_or(PdfError::MissingTrailer)?;
+    if size > MAX_XREF_ENTRIES {
+        return Err(PdfError::MissingTrailer);
+    }
     let mut subsections = integer_array(&object.dictionary, b"/Index");
     if subsections.is_empty() {
         subsections = vec![0, size];
@@ -299,6 +314,9 @@ fn unpredicted(data: Vec<u8>, dictionary: &[u8]) -> Result<Vec<u8>, PdfError> {
         return Err(PdfError::UnsupportedCrossReferenceStream);
     }
     let columns = dictionary_usize(&parameters, b"/Columns").unwrap_or(1);
+    if columns == 0 || columns > MAX_PREDICTOR_COLUMNS {
+        return Err(PdfError::UnsupportedCrossReferenceStream);
+    }
     png_unfiltered(&data, columns)
 }
 
@@ -384,15 +402,37 @@ fn stream_entries(
     widths: &[usize],
     subsections: &[usize],
 ) -> Result<Vec<XrefEntry>, PdfError> {
-    let row_length = widths.iter().sum::<usize>();
-    if row_length == 0 || !subsections.len().is_multiple_of(2) {
+    if widths.iter().any(|width| *width > MAX_FIELD_WIDTH) {
         return Err(PdfError::MissingTrailer);
     }
-    let mut entries = Vec::new();
+    let row_length = widths.iter().sum::<usize>();
+    let (pairs, odd) = subsections.as_chunks::<2>();
+    if row_length == 0 || !odd.is_empty() {
+        return Err(PdfError::MissingTrailer);
+    }
+    // Every declared entry is a number below the file-wide ceiling and
+    // a full row of the payload; both hold before anything is pushed.
+    let mut declared = 0_usize;
+    for [first, count] in pairs {
+        let end = first.checked_add(*count).ok_or(PdfError::MissingTrailer)?;
+        declared = declared
+            .checked_add(*count)
+            .ok_or(PdfError::MissingTrailer)?;
+        if end > MAX_XREF_ENTRIES {
+            return Err(PdfError::MissingTrailer);
+        }
+    }
+    if declared
+        .checked_mul(row_length)
+        .is_none_or(|needed| needed > payload.len())
+    {
+        return Err(PdfError::MissingTrailer);
+    }
+    let mut entries = Vec::with_capacity(declared);
     let mut cursor = 0_usize;
-    for pair in subsections.as_chunks::<2>().0 {
-        let first = pair[0];
-        for entry in 0..pair[1] {
+    for [first, count] in pairs {
+        let first = *first;
+        for entry in 0..*count {
             let row = payload
                 .get(cursor..cursor.saturating_add(row_length))
                 .ok_or(PdfError::MissingTrailer)?;
@@ -483,4 +523,201 @@ fn trim(bytes: &[u8]) -> &[u8] {
         .rposition(|byte| !byte.is_ascii_whitespace())
         .map_or(start, |found| found.saturating_add(1));
     &bytes[start..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MAX_FIELD_WIDTH, MAX_PREDICTOR_COLUMNS, MAX_XREF_ENTRIES, PdfError, parse_stream_section,
+        png_unfiltered,
+    };
+
+    /// zlib compression level for test payloads; any level decodes.
+    const LEVEL: u8 = 6;
+
+    /// Field widths of the test rows: type, two offset bytes, two
+    /// generation bytes.
+    const WIDTHS: &str = "/W [1 2 2]";
+
+    /// Bytes in one row under [`WIDTHS`].
+    const ROW: usize = 5;
+
+    /// One cross-reference stream object at offset zero.
+    fn section(keys: &str, payload: &[u8]) -> Vec<u8> {
+        let mut pdf = format!(
+            "1 0 obj\n<< /Type /XRef {keys} /Length {} >>\nstream\n",
+            payload.len()
+        )
+        .into_bytes();
+        pdf.extend_from_slice(payload);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        pdf
+    }
+
+    /// An empty payload, `FlateDecode` compressed.
+    fn empty_flate() -> Vec<u8> {
+        miniz_oxide::deflate::compress_to_vec_zlib(&[], LEVEL)
+    }
+
+    /// `rows` free rows of [`ROW`] bytes.
+    fn free_rows(rows: usize) -> Vec<u8> {
+        vec![0; rows.saturating_mul(ROW)]
+    }
+
+    fn parsed(keys: &str, payload: &[u8]) -> Result<usize, PdfError> {
+        parse_stream_section(&section(keys, payload), 0).map(|section| section.entries.len())
+    }
+
+    #[test]
+    fn oversized_columns_is_refused() {
+        let keys = format!(
+            "/Size 1 {WIDTHS} /Filter /FlateDecode \
+             /DecodeParms << /Predictor 12 /Columns {} >>",
+            MAX_PREDICTOR_COLUMNS + 1
+        );
+        assert_eq!(
+            parsed(&keys, &empty_flate()),
+            Err(PdfError::UnsupportedCrossReferenceStream)
+        );
+    }
+
+    #[test]
+    fn columns_beyond_any_allocation_are_refused() {
+        for columns in [usize::MAX, usize::MAX / 2, isize::MAX.unsigned_abs()] {
+            let keys = format!(
+                "/Size 1 {WIDTHS} /Filter /FlateDecode \
+                 /DecodeParms << /Predictor 12 /Columns {columns} >>"
+            );
+            assert_eq!(
+                parsed(&keys, &empty_flate()),
+                Err(PdfError::UnsupportedCrossReferenceStream)
+            );
+        }
+    }
+
+    #[test]
+    fn widest_accepted_columns_still_decode() {
+        let keys = format!(
+            "/Size 0 {WIDTHS} /Filter /FlateDecode \
+             /DecodeParms << /Predictor 12 /Columns {MAX_PREDICTOR_COLUMNS} >>"
+        );
+        assert_eq!(parsed(&keys, &empty_flate()), Ok(0));
+    }
+
+    #[test]
+    fn zero_columns_is_refused() {
+        let keys = format!(
+            "/Size 1 {WIDTHS} /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 0 >>"
+        );
+        assert_eq!(
+            parsed(&keys, &empty_flate()),
+            Err(PdfError::UnsupportedCrossReferenceStream)
+        );
+        assert_eq!(png_unfiltered(&[], 0), Err(PdfError::MissingTrailer));
+    }
+
+    #[test]
+    fn oversized_size_is_refused() {
+        let keys = format!("/Size {} {WIDTHS}", MAX_XREF_ENTRIES + 1);
+        assert_eq!(parsed(&keys, &free_rows(1)), Err(PdfError::MissingTrailer));
+    }
+
+    #[test]
+    fn size_at_the_ceiling_is_read_against_its_index() {
+        let keys = format!("/Size {MAX_XREF_ENTRIES} /Index [0 1] {WIDTHS}");
+        assert_eq!(parsed(&keys, &free_rows(1)), Ok(1));
+    }
+
+    #[test]
+    fn index_pairs_exceeding_payload_are_refused() {
+        let declared = 4;
+        let keys = format!("/Size {declared} /Index [0 {declared}] {WIDTHS}");
+        assert_eq!(
+            parsed(&keys, &free_rows(declared - 1)),
+            Err(PdfError::MissingTrailer)
+        );
+        // A payload shorter than one row refuses every declaration.
+        let short = vec![0; ROW - 1];
+        assert_eq!(parsed(&keys, &short), Err(PdfError::MissingTrailer));
+        assert_eq!(
+            parsed(&keys, &free_rows(declared)),
+            Ok(declared),
+            "an exact payload is read"
+        );
+    }
+
+    #[test]
+    fn index_count_sums_that_overflow_are_refused() {
+        let keys = format!(
+            "/Size 1 /Index [0 {} 0 {}] {WIDTHS}",
+            usize::MAX,
+            usize::MAX
+        );
+        assert_eq!(parsed(&keys, &free_rows(1)), Err(PdfError::MissingTrailer));
+        let keys = format!("/Size 1 /Index [{} 1] {WIDTHS}", usize::MAX);
+        assert_eq!(parsed(&keys, &free_rows(1)), Err(PdfError::MissingTrailer));
+    }
+
+    #[test]
+    fn index_past_the_object_ceiling_is_refused() {
+        let keys = format!("/Size 1 /Index [{MAX_XREF_ENTRIES} 1] {WIDTHS}");
+        assert_eq!(parsed(&keys, &free_rows(1)), Err(PdfError::MissingTrailer));
+        let keys = format!("/Size 1 /Index [{} 1] {WIDTHS}", MAX_XREF_ENTRIES - 1);
+        assert_eq!(parsed(&keys, &free_rows(1)), Ok(1));
+    }
+
+    #[test]
+    fn widths_wider_than_an_offset_are_refused() {
+        for widths in [
+            format!("/W [1 {} 2]", MAX_FIELD_WIDTH + 1),
+            format!("/W [{} {} 1]", usize::MAX, usize::MAX),
+        ] {
+            let keys = format!("/Size 1 {widths}");
+            assert_eq!(parsed(&keys, &free_rows(1)), Err(PdfError::MissingTrailer));
+        }
+    }
+
+    /// Every combination of boundary values in the counts the file
+    /// chooses: each parse returns, none panics or allocates without
+    /// bound, and only the plausible combinations are read.
+    #[test]
+    fn crafted_counts_never_abort() {
+        let boundaries: Vec<String> = [
+            0,
+            1,
+            ROW,
+            MAX_PREDICTOR_COLUMNS,
+            MAX_PREDICTOR_COLUMNS + 1,
+            MAX_XREF_ENTRIES - 1,
+            MAX_XREF_ENTRIES,
+            MAX_XREF_ENTRIES + 1,
+            isize::MAX.unsigned_abs(),
+            usize::MAX,
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .chain([format!("{}0", usize::MAX), String::from("-1")])
+        .collect();
+        let payloads = [Vec::new(), empty_flate(), free_rows(1)];
+        for size in &boundaries {
+            for count in &boundaries {
+                for columns in &boundaries {
+                    for payload in &payloads {
+                        let filter = if payload.is_empty() || payload.len() == ROW {
+                            String::new()
+                        } else {
+                            format!(
+                                " /Filter /FlateDecode \
+                                 /DecodeParms << /Predictor 12 /Columns {columns} >>"
+                            )
+                        };
+                        let keys = format!("/Size {size} /Index [0 {count}] {WIDTHS}{filter}");
+                        if let Ok(entries) = parsed(&keys, payload) {
+                            assert!(entries <= payload.len() / ROW, "entries fit the payload");
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

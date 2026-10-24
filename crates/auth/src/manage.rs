@@ -128,9 +128,9 @@ pub(crate) fn change<T: CardTransport + ?Sized>(
 ///
 /// Both numberings answer a Case 1 VERIFY (header only, no Lc, no data)
 /// under the PUK reference with the comparison status (ISO 7816-4
-/// section 7.5.6). When the citizen card answers that probe without a
-/// counter, the PIN container is read with GET DATA instead (FINEID S1
-/// v4.2 section 3.15.2).
+/// section 7.5.6). When the citizen card answers that probe with neither
+/// a counter nor a blocked state, the PIN container is read with GET DATA
+/// instead (FINEID S1 v4.2 section 3.15.2).
 fn puk_status<T: CardTransport + ?Sized>(
     transport: &mut T,
     scheme: PinReferenceScheme,
@@ -146,7 +146,7 @@ fn puk_status<T: CardTransport + ?Sized>(
     let status = crate::verify::classify_pin_status_sw(response.status_word());
     match scheme {
         PinReferenceScheme::Citizen
-            if matches!(status, PinStatus::Other(_) | PinStatus::NoInfo) =>
+            if !matches!(status, PinStatus::Remaining(_) | PinStatus::Locked) =>
         {
             crate::activation::read_puk_status_from_container(transport)
         }
@@ -578,6 +578,7 @@ mod tests {
         CHANGE_P1_CURRENT_THEN_NEW, CHANGE_REFERENCE_DATA_INS, ManageOutcome, PinManageOps,
         RESET_P1_CODE_THEN_NEW, RESET_P1_NEW_ONLY, RESET_RETRY_COUNTER_INS, classify_manage_sw,
     };
+    use crate::activation::GET_DATA_INS;
     use crate::credentials::{Pin1, Pin2, Puk, UnvalidatedSecret};
     use crate::verify::{CREDENTIAL_BODY_SCRATCH, VERIFY_INS, VERIFY_P1};
     use crate::{
@@ -600,6 +601,9 @@ mod tests {
     const RETRIES_FLOOR: u8 = 3;
     /// Commands a refused counter probe leaves on the wire: the probe.
     const PROBE_ONLY_COMMAND_COUNT: usize = 1;
+    /// Commands a refusal after the citizen container read leaves on the
+    /// wire: the probe, then GET DATA.
+    const CONTAINER_READ_COMMAND_COUNT: usize = 2;
     /// Commands the citizen unblock sends: the PUK probe, then the reset.
     const CITIZEN_UNBLOCK_COMMAND_COUNT: usize = 2;
     /// Highest retry count below the retry floor.
@@ -972,6 +976,46 @@ mod tests {
                 .iter()
                 .all(|wire| wire[INS_INDEX] != RESET_RETRY_COUNTER_INS)
         );
+    }
+
+    #[test]
+    fn a_citizen_probe_answering_success_reads_the_container() {
+        let mut transport = Recorder::new(vec![
+            StatusWord::Success,
+            StatusWord::AuthenticationBlocked,
+            StatusWord::Success,
+        ]);
+        let result = transport.unblock_pin1_with_scheme(
+            PinReferenceScheme::Citizen,
+            puk(PUK_DIGITS),
+            pin1(NEW_DIGITS),
+        );
+        assert!(matches!(
+            result,
+            Err(AuthError::RetryFloor(RetryFloorRefusal::Blocked {
+                credential: FlooredCredential::Puk
+            }))
+        ));
+        assert_eq!(transport.commands.len(), CONTAINER_READ_COMMAND_COUNT);
+        assert_eq!(transport.commands[1][INS_INDEX], GET_DATA_INS);
+    }
+
+    #[test]
+    fn an_organizational_puk_reported_verified_is_never_presented() {
+        let (result, transport) = unblock_against(
+            PinReferenceScheme::Organizational,
+            PinSlot::Pin1,
+            StatusWord::Success,
+        );
+        assert!(matches!(
+            result,
+            Err(AuthError::RetryFloor(
+                RetryFloorRefusal::CounterUnreadable {
+                    credential: FlooredCredential::Puk
+                }
+            ))
+        ));
+        assert_eq!(transport.commands.len(), PROBE_ONLY_COMMAND_COUNT);
     }
 
     #[test]

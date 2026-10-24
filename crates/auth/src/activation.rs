@@ -34,7 +34,7 @@ use crate::verify::{
 
 /// GET DATA instruction byte, odd variant carrying a command data field
 /// (ISO 7816-4:2020 section 11.4.2; FINEID S1 v4.2 section 3.15.2 Table 16).
-const GET_DATA_INS: u8 = 0xCB;
+pub(crate) const GET_DATA_INS: u8 = 0xCB;
 /// GET DATA P1 for PIN container query (FINEID S1 v4.2 section 3.15.2).
 const GET_DATA_P1: u8 = 0x00;
 /// GET DATA P2 for PIN container query (FINEID S1 v4.2 section 3.15.2).

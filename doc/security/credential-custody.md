@@ -18,7 +18,7 @@ the organizational card's PUK VERIFY presenting the PUK -- every surface
 reads the card's tries left for that credential without spending one and
 applies one rule, `check_retry_floor` in `refineid-auth`:
 
-- **Served**: five, four or three tries left, or the credential already
+- **Served**: five, four or three tries left, or PIN 1 or PIN 2 already
   verified in the card's current security context.
 - **Refused**: two, one or no tries left, a blocked credential, and any
   answer that carries no readable count. Nothing is sent, and the refusal
@@ -28,7 +28,8 @@ applies one rule, `check_retry_floor` in `refineid-auth`:
 - **The PUK follows the same floor.** FINEID S1 v4.2 leaves the PUK's try
   limit to card personalization; RefineID presents the PUK -- to unblock
   a PIN, or as the activation code on a card that ships with blocked
-  PINs -- only at five, four or three PUK tries left. A blocked PUK
+  PINs -- only at five, four or three PUK tries left; a PUK the card
+  reports verified carries no count and is refused. A blocked PUK
   cannot be recovered, so a PUK refusal names no other credential. The
   unblock is gated by the PUK's counter alone: it stays available
   whatever the PIN 1 and PIN 2 counters read, a blocked PIN included.

@@ -48,7 +48,17 @@ mod xref_stream;
 
 pub use appearance::{SignatureInk, VisibleSignature};
 pub use stamp::StampLanguage;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+/// Most cross-reference entries a file may declare, through `/Size`, a
+/// classic subsection count or a stream's `/Index` pairs.
+///
+/// ISO 32000-1 Annex C, Table C.1, caps a file at 8 388 607 indirect
+/// objects, numbered from one; with entry zero, which heads the free
+/// list, that is two to the twenty-third entries. Every object number
+/// this reader admits is below this, so the merged index never holds
+/// more objects than this either.
+const MAX_XREF_ENTRIES: usize = 1 << 23;
 
 /// Signature dictionary `/SubFilter` for `PAdES` (EN 319 142-1 sec.5.1).
 const SUBFILTER_PADES: &str = "/ETSI.CAdES.detached";
@@ -1897,7 +1907,8 @@ struct PdfIndex<'a> {
     /// Whether the newest section is a cross-reference stream, which
     /// decides the shape of the section an update appends.
     newest_is_stream: bool,
-    objects: Vec<XrefEntry>,
+    /// The newest entry for each object number.
+    objects: HashMap<u32, XrefEntry>,
 }
 
 impl<'a> PdfIndex<'a> {
@@ -1910,7 +1921,7 @@ impl<'a> PdfIndex<'a> {
         let mut visited = Vec::new();
         let mut trailer = None;
         let mut newest_is_stream = false;
-        let mut objects = Vec::new();
+        let mut objects: HashMap<u32, XrefEntry> = HashMap::new();
 
         for _ in 0..Self::MAX_XREF_DEPTH {
             let Some(offset) = next else { break };
@@ -1927,12 +1938,7 @@ impl<'a> PdfIndex<'a> {
             for entry in section.entries {
                 // Newer xref sections win. Keep a newer free entry too:
                 // it deletes the object and must suppress older copies.
-                if !objects
-                    .iter()
-                    .any(|existing: &XrefEntry| existing.number == entry.number)
-                {
-                    objects.push(entry);
-                }
+                objects.entry(entry.number).or_insert(entry);
             }
             next = dictionary_usize(&section.trailer, b"/Prev");
         }
@@ -1967,9 +1973,10 @@ impl<'a> PdfIndex<'a> {
     }
 
     fn object_body_reference(&self, reference: PdfObjectReference) -> Option<Vec<u8>> {
-        let entry = self.objects.iter().find(|entry| {
-            entry.number == reference.number && entry.generation == reference.generation
-        })?;
+        let entry = self
+            .objects
+            .get(&reference.number)
+            .filter(|entry| entry.generation == reference.generation)?;
         match entry.location {
             XrefLocation::Free => None,
             XrefLocation::Direct { offset } => {
@@ -1979,10 +1986,7 @@ impl<'a> PdfIndex<'a> {
                 container,
                 position,
             } => {
-                let carrier = self
-                    .objects
-                    .iter()
-                    .find(|entry| entry.number == container)?;
+                let carrier = self.objects.get(&container)?;
                 let XrefLocation::Direct { offset } = carrier.location else {
                     return None;
                 };
@@ -2014,12 +2018,29 @@ fn parse_xref_section(pdf: &[u8], offset: usize) -> Result<XrefSection, PdfError
         let token = read_pdf_token(pdf, &mut cursor).ok_or(PdfError::MissingTrailer)?;
         if token == b"trailer" {
             let (trailer, _after) = dictionary_at(pdf, cursor).ok_or(PdfError::MissingTrailer)?;
+            if dictionary_usize(&trailer, b"/Size").is_some_and(|size| size > MAX_XREF_ENTRIES) {
+                return Err(PdfError::MissingTrailer);
+            }
             return hybrid_merged(pdf, trailer, entries);
         }
 
         let start = parse_u32(token).ok_or(PdfError::MissingTrailer)?;
         let count = parse_u32(read_pdf_token(pdf, &mut cursor).ok_or(PdfError::MissingTrailer)?)
             .ok_or(PdfError::MissingTrailer)?;
+        let end = usize::try_from(start)
+            .ok()
+            .zip(usize::try_from(count).ok())
+            .and_then(|(start, count)| start.checked_add(count))
+            .ok_or(PdfError::MissingTrailer)?;
+        // The subsections together declare no more entries than the
+        // ceiling either.
+        let total = usize::try_from(count)
+            .ok()
+            .and_then(|count| entries.len().checked_add(count))
+            .ok_or(PdfError::MissingTrailer)?;
+        if end > MAX_XREF_ENTRIES || total > MAX_XREF_ENTRIES {
+            return Err(PdfError::MissingTrailer);
+        }
 
         for index in 0..count {
             let object_offset =
@@ -2582,14 +2603,15 @@ mod tests {
     use crate::cades::{DigestAlgorithm, SignatureAlgorithm, SignerParameters};
     use crate::document::{Format, plan as plan_document};
     use crate::validation::ValidationMaterial;
+    use std::collections::HashMap;
 
     use super::{
         AnnotsTarget, DEFAULT_SIGNATURE_CAPACITY, FieldListTarget, MAX_FIELD_NAME_BYTES,
-        PdfDictionary, PdfError, PdfIndex, SignatureInk, SignatureMetadata, VisibleSignature,
-        XrefEntry, XrefLocation, append_validation_store, complete_object_reference,
-        dictionary_reference, existing_field_names, last_object_header, last_reference,
-        object_body, plan_annotation, plan_field_list, prepare, prepare_document_timestamp,
-        validation_references,
+        MAX_XREF_ENTRIES, PdfDictionary, PdfError, PdfIndex, SignatureInk, SignatureMetadata,
+        VisibleSignature, XrefEntry, XrefLocation, append_validation_store,
+        complete_object_reference, dictionary_reference, existing_field_names, last_object_header,
+        last_reference, object_body, parse_xref_section, plan_annotation, plan_field_list, prepare,
+        prepare_document_timestamp, validation_references,
     };
 
     const CERTIFICATE_DER: &[u8] =
@@ -2799,6 +2821,81 @@ mod tests {
         assert!(again.starts_with(&once), "the chain grows in place");
     }
 
+    /// A classic table of one subsection, `entries` in-use rows.
+    fn classic_table(start: usize, count: usize, entries: usize) -> Vec<u8> {
+        classic_table_sized(&[(start, count, entries)], 1)
+    }
+
+    /// A classic table of the subsections `(start, count, rows)` under a
+    /// trailer declaring `size`.
+    fn classic_table_sized(subsections: &[(usize, usize, usize)], size: usize) -> Vec<u8> {
+        let mut table = String::from("xref\n");
+        for (start, count, rows) in subsections {
+            table.push_str(&format!("{start} {count}\n"));
+            for _ in 0..*rows {
+                table.push_str("0000000000 00000 n \n");
+            }
+        }
+        table.push_str(&format!("trailer\n<< /Size {size} >>\n"));
+        table.into_bytes()
+    }
+
+    #[test]
+    fn classic_subsections_together_are_bounded() {
+        let half = MAX_XREF_ENTRIES / 2;
+        let rows = 1;
+        // Each subsection lies below the ceiling; the second repeats the
+        // first's numbers and declares more entries than it leaves room
+        // for.
+        let over = classic_table_sized(&[(0, rows, rows), (0, MAX_XREF_ENTRIES, 0)], rows);
+        assert!(matches!(
+            parse_xref_section(&over, 0),
+            Err(PdfError::MissingTrailer)
+        ));
+        let subsections = [(0, rows, rows), (half, rows, rows)];
+        let section = parse_xref_section(&classic_table_sized(&subsections, rows), 0)
+            .expect("subsections within the ceiling are read");
+        assert_eq!(section.entries.len(), rows + rows);
+    }
+
+    #[test]
+    fn classic_trailer_size_is_bounded() {
+        let rows = 1;
+        assert!(matches!(
+            parse_xref_section(
+                &classic_table_sized(&[(0, rows, rows)], MAX_XREF_ENTRIES + 1),
+                0
+            ),
+            Err(PdfError::MissingTrailer)
+        ));
+        let section = parse_xref_section(
+            &classic_table_sized(&[(0, rows, rows)], MAX_XREF_ENTRIES),
+            0,
+        )
+        .expect("a size at the ceiling is read");
+        assert_eq!(section.entries.len(), rows);
+    }
+
+    #[test]
+    fn classic_table_count_is_bounded() {
+        let declared = classic_table(0, MAX_XREF_ENTRIES + 1, 0);
+        assert!(matches!(
+            parse_xref_section(&declared, 0),
+            Err(PdfError::MissingTrailer)
+        ));
+        // A subsection whose rows are present but whose numbers run past
+        // the object ceiling.
+        let rows = 2;
+        let past = classic_table(MAX_XREF_ENTRIES - 1, rows, rows);
+        assert!(matches!(
+            parse_xref_section(&past, 0),
+            Err(PdfError::MissingTrailer)
+        ));
+        let below = classic_table(MAX_XREF_ENTRIES - rows, rows, rows);
+        let section = parse_xref_section(&below, 0).expect("rows below the ceiling are read");
+        assert_eq!(section.entries.len(), rows);
+    }
+
     #[test]
     fn flate_and_up_predictor_are_decoded() {
         let signed = prepare(&stream_pdf(true), &SignatureMetadata::default(), 64)
@@ -2820,15 +2917,18 @@ mod tests {
     }
 
     fn fragment_index(pdf: &[u8]) -> PdfIndex<'_> {
-        let mut objects = Vec::new();
+        let mut objects = HashMap::new();
         for number in 1..32 {
             let header = format!("{number} 0 obj");
             if let Some(offset) = last_object_header(pdf, header.as_bytes()) {
-                objects.push(XrefEntry {
+                objects.insert(
                     number,
-                    generation: 0,
-                    location: XrefLocation::Direct { offset },
-                });
+                    XrefEntry {
+                        number,
+                        generation: 0,
+                        location: XrefLocation::Direct { offset },
+                    },
+                );
             }
         }
         PdfIndex {

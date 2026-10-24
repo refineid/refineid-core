@@ -172,11 +172,10 @@ before and the correction made the core better.
 
 ## Rules live here, not in an agent's memory
 
-Every rule, decision and durable finding an agent should remember goes
-into this repository: a working rule into this file, a design rule into
-`doc/`, a defect into an issue. An agent's own memory holds pointers at
-most. A rule that lives only in one agent's memory binds nobody else and
-is lost with that agent: agent-local memory is the modern vendor lock-in.
+Every rule, decision and finding an agent should remember lives in this
+repository: a working rule in this file, a design rule in `doc/`, a defect
+in an issue; never only in an agent's memory. This file is the table of
+required readings, not the place where they live.
 
 ## Source comments
 

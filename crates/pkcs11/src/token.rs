@@ -1564,36 +1564,57 @@ pub(super) fn card_login(
             clear_positive(pin_cache);
             return Err(error);
         }
-        let mut cache = pin_cache.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?;
-        if cache.is_rejected(&serial, &pin1) {
+        // The cache mutex is bookkeeping and is never held across a card
+        // exchange: rejection memory is consulted and released before
+        // the VERIFY, and the answer is settled under a second lock. The
+        // reader's lane, held above, serialises PIN-bearing operations.
+        let rejected = pin_cache
+            .lock()
+            .map_err(|_poisoned| CKR_DEVICE_ERROR)?
+            .is_rejected(&serial, &pin1);
+        if rejected {
             return Err(CKR_PIN_INCORRECT);
         }
         let secret = refineid_auth::UnvalidatedSecret::from_owned_bytes(pin1.as_bytes().to_vec());
         let Ok(pin1_val) = refineid_auth::Pin1::reconstruct(secret) else {
             return Err(CKR_PIN_INCORRECT);
         };
-        match card
+        let outcome = card
             .verify_pin1(pin1_val)
-            .map_err(|_verify_err| CKR_DEVICE_ERROR)?
-        {
-            VerifyOutcome::Ok => {
-                let stored = if pin1_status_permits_reusable_cache(pin1_status) {
-                    cache.store_pin1(serial, pin1)
-                } else {
-                    cache.stage_pin1_once(serial, pin1)
-                };
-                stored.map_err(|_rejected| CKR_PIN_INCORRECT)
-            }
-            VerifyOutcome::WrongPin { .. } => {
-                cache.record_rejected(&serial, &pin1);
-                drop(cache);
-                Err(CKR_PIN_INCORRECT)
-            }
-            VerifyOutcome::Locked => Err(CKR_PIN_LOCKED),
-            VerifyOutcome::Other(_sw) => Err(CKR_DEVICE_ERROR),
-        }
+            .map_err(|_verify_err| CKR_DEVICE_ERROR)?;
+        let mut cache = pin_cache.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?;
+        settle_login(&mut cache, serial, pin1, pin1_status, outcome)
     })
     .map_err(|_transaction_err| CKR_DEVICE_ERROR)?
+}
+
+/// Settle a `C_Login` VERIFY by the card's answer: hold an accepted
+/// value when `pin1_status`, read before the VERIFY, was pristine,
+/// stage it for one operation otherwise; remember a refused value as
+/// rejected; keep nothing for a blocked PIN or any other status word.
+fn settle_login(
+    cache: &mut PinSafetyCache,
+    serial: TokenSerial,
+    pin1: PinBytes,
+    pin1_status: PinStatus,
+    outcome: VerifyOutcome,
+) -> Result<(), CkRv> {
+    match outcome {
+        VerifyOutcome::Ok => {
+            let stored = if pin1_status_permits_reusable_cache(pin1_status) {
+                cache.store_pin1(serial, pin1)
+            } else {
+                cache.stage_pin1_once(serial, pin1)
+            };
+            stored.map_err(|_rejected| CKR_PIN_INCORRECT)
+        }
+        VerifyOutcome::WrongPin { .. } => {
+            cache.record_rejected(&serial, &pin1);
+            Err(CKR_PIN_INCORRECT)
+        }
+        VerifyOutcome::Locked => Err(CKR_PIN_LOCKED),
+        VerifyOutcome::Other(_sw) => Err(CKR_DEVICE_ERROR),
+    }
 }
 
 /// Refuse every PIN-bearing APDU once fewer than three attempts remain.
@@ -2358,5 +2379,134 @@ mod tests {
         let certificate = crate::remote::SessionCertificate::new(EC_DER.to_vec());
         let objects = super::remote_token_objects(&pair_id(), &certificate).expect("served");
         assert_eq!(objects.token_serial(), "REMOTE-a5a5a5a5");
+    }
+
+    /// Retry count of a pristine FINEID PIN.
+    const RETRIES_PRISTINE: u8 = 5;
+    /// Retry count after one refused presentation.
+    const RETRIES_ONE_SPENT: u8 = 4;
+    const DECIMAL_DIGIT_RADIX: u8 = 10;
+    /// A synthetic card serial for the login settlement tests.
+    const LOGIN_CARD_SERIAL: &str = "CARD-LOGIN-FULL-SERIAL";
+
+    fn login_cache() -> super::PinSafetyCache {
+        super::PinSafetyCache::new().expect("operating system random source is available")
+    }
+
+    fn login_serial() -> super::TokenSerial {
+        super::TokenSerial::new(LOGIN_CARD_SERIAL.to_owned())
+    }
+
+    fn random_pin() -> crate::pin::PinBytes {
+        let mut digits = vec![0_u8; crate::pin::PinBytes::MAX_LENGTH];
+        getrandom::fill(&mut digits).expect("operating system random source is available");
+        for digit in &mut digits {
+            *digit = b'0' + (*digit % DECIMAL_DIGIT_RADIX);
+        }
+        crate::pin::PinBytes::new(digits).expect("random digits satisfy the PIN policy")
+    }
+
+    fn retries(count: u8) -> PinRetries {
+        PinRetries::from_nibble(count).expect("test retry count fits the status-word nibble")
+    }
+
+    fn remaining(count: u8) -> PinStatus {
+        PinStatus::Remaining(retries(count))
+    }
+
+    /// Take the settled value out for one accepted VERIFY and one
+    /// completed operation, as a signature does.
+    fn use_once(cache: &mut super::PinSafetyCache) {
+        let checkout = cache
+            .checkout_pin1(&login_serial(), remaining(RETRIES_PRISTINE))
+            .expect("the settled value is checked out");
+        let accepted: Result<super::VerifyOutcome, refineid_auth::AuthError<String>> =
+            Ok(super::VerifyOutcome::Ok);
+        let accepted = checkout
+            .settle_verify(cache, &accepted)
+            .expect("an accepted VERIFY leads to the operation");
+        accepted.settle_operation::<String>(cache, None);
+    }
+
+    #[test]
+    fn settle_login_holds_an_accepted_pin1_under_a_pristine_counter() {
+        let mut cache = login_cache();
+        let res = super::settle_login(
+            &mut cache,
+            login_serial(),
+            random_pin(),
+            remaining(RETRIES_PRISTINE),
+            super::VerifyOutcome::Ok,
+        );
+        assert_eq!(res, Ok(()));
+        assert!(cache.holds_pin1());
+        use_once(&mut cache);
+        assert!(cache.holds_pin1());
+        assert!(
+            cache
+                .checkout_pin1(&login_serial(), remaining(RETRIES_PRISTINE))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn settle_login_stages_an_accepted_pin1_under_a_spent_counter() {
+        let mut cache = login_cache();
+        let res = super::settle_login(
+            &mut cache,
+            login_serial(),
+            random_pin(),
+            remaining(RETRIES_ONE_SPENT),
+            super::VerifyOutcome::Ok,
+        );
+        assert_eq!(res, Ok(()));
+        assert!(cache.holds_pin1());
+        use_once(&mut cache);
+        assert!(!cache.holds_pin1());
+        assert!(
+            cache
+                .checkout_pin1(&login_serial(), remaining(RETRIES_PRISTINE))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn settle_login_remembers_a_refused_pin1() {
+        let mut cache = login_cache();
+        let pin = random_pin();
+        let res = super::settle_login(
+            &mut cache,
+            login_serial(),
+            pin.clone(),
+            remaining(RETRIES_PRISTINE),
+            super::VerifyOutcome::WrongPin {
+                retries_left: retries(RETRIES_ONE_SPENT),
+            },
+        );
+        assert_eq!(res, Err(crate::ck::CKR_PIN_INCORRECT));
+        assert!(cache.is_rejected(&login_serial(), &pin));
+        assert!(!cache.holds_pin1());
+    }
+
+    #[test]
+    fn settle_login_maps_locked_and_other() {
+        for (outcome, expected) in [
+            (super::VerifyOutcome::Locked, CKR_PIN_LOCKED),
+            (
+                super::VerifyOutcome::Other(StatusWord::SecurityNotSatisfied),
+                CKR_DEVICE_ERROR,
+            ),
+        ] {
+            let mut cache = login_cache();
+            let res = super::settle_login(
+                &mut cache,
+                login_serial(),
+                random_pin(),
+                remaining(RETRIES_PRISTINE),
+                outcome,
+            );
+            assert_eq!(res, Err(expected));
+            assert!(!cache.holds_pin1());
+        }
     }
 }

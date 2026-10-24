@@ -43,6 +43,7 @@ pub mod commands;
 pub mod container;
 
 use refineid_apdu::{CardTransport, CommandDataError, ResponseApdu, StatusWord, TransportOutcome};
+use zeroize::Zeroizing;
 
 use commands::{
     DecipherAlgRef, ExternalHashValue, MseSet, MseSetCt, PsoComputeDigitalSignature, PsoDecipher,
@@ -236,7 +237,10 @@ pub trait SignOps: CardTransport {
     }
 
     /// Ship the host digest inline and have the card sign it in one
-    /// PSO:CDS, the organizational chain's single signing command.
+    /// PSO:CDS, the organizational chain's single signing command. The
+    /// digest arrives as [`ExternalHashValue`], so its wire length is the
+    /// one its hash function fixes; `le` is the expected-length byte for
+    /// the signature (see [`expected_length_le`]).
     ///
     /// # Errors
     ///
@@ -244,14 +248,14 @@ pub trait SignOps: CardTransport {
     /// word.
     fn pso_compute_signature_over_digest(
         &mut self,
-        digest: &[u8],
+        hash: ExternalHashValue,
         le: u8,
     ) -> Result<Vec<u8>, SignError<Self::Error>>
     where
         Self: Sized,
     {
         let command = PsoComputeDigitalSignature
-            .into_apdu_with_digest(digest, le)
+            .into_apdu_with_digest(hash, le)
             .map_err(SignError::Command)?;
         Ok(self.exchange(&command, "PSO:CDS")?.body)
     }
@@ -554,15 +558,20 @@ pub trait SignOps: CardTransport {
         .map_err(SignError::Command)?;
         self.exchange(&mse, "MSE:Set CT")?;
 
-        let chain = PsoDecipher {
-            ciphertext: cryptogram.as_bytes(),
+        let chain = PsoDecipher { cryptogram }
+            .into_chain()
+            .map_err(SignError::Command)?;
+        let (last, leading) = chain
+            .split_last()
+            .ok_or(SignError::Command(CommandDataError::Empty))?;
+        for command in leading {
+            // A non-final chained command draws a status only; any body
+            // the card does return is decipher output and is zeroised
+            // before the next exchange.
+            let body = Zeroizing::new(self.exchange(command, "PSO:DECIPHER")?.body);
+            drop(body);
         }
-        .into_chain()
-        .map_err(SignError::Command)?;
-        let mut plaintext = Vec::new();
-        for command in &chain {
-            plaintext = self.exchange(command, "PSO:DECIPHER")?.body;
-        }
+        let plaintext = self.exchange(last, "PSO:DECIPHER")?.body;
         Ok(RecoveredPlaintext::new(plaintext))
     }
 
@@ -611,8 +620,6 @@ fn drive_chain<T: SignOps>(
             transport.pso_hash(hash)?;
             transport.pso_compute_signature(le)
         }
-        SignScheme::Organizational => {
-            transport.pso_compute_signature_over_digest(hash.as_bytes(), le)
-        }
+        SignScheme::Organizational => transport.pso_compute_signature_over_digest(hash, le),
     }
 }

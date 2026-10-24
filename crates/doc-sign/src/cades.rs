@@ -437,28 +437,17 @@ fn signing_certificate_v2(parameters: &SignerParameters<'_>) -> Vec<u8> {
 /// `signature` OCTET STRING happily and produce a structure that every
 /// verifier rejects for a reason that points nowhere near the encoding.
 ///
+/// The card never returns DER, so nothing here tries to recognise it:
+/// a pair whose first bytes happen to spell a SEQUENCE tag and a
+/// plausible length is still a pair and is split like any other.
+///
 /// The reverse conversion, for XML signatures, is
 /// [`crate::xades::ecdsa_signature_to_xml`]. Cards need this one;
-/// signers backed by OpenSSL need that one.
+/// signers that already produce DER need that one.
 ///
-/// Returns `None` unless `raw` is an even, non-empty number of bytes, or already a valid DER sequence.
+/// Returns `None` unless `raw` is an even, non-empty number of bytes.
 #[must_use]
 pub fn ecdsa_signature_to_cms(raw: &[u8]) -> Option<Vec<u8>> {
-    if raw.len() >= 6 && raw[0] == TAG_SEQUENCE {
-        let (len_len, payload_len) = match raw.get(1)? {
-            b if *b < 0x80 => (1, *b as usize),
-            0x81 => (2, *raw.get(2)? as usize),
-            0x82 => {
-                let hi = *raw.get(2)? as usize;
-                let lo = *raw.get(3)? as usize;
-                (3, (hi << 8) | lo)
-            }
-            _ => return None,
-        };
-        if raw.len() == 1 + len_len + payload_len {
-            return Some(raw.to_vec());
-        }
-    }
     if raw.is_empty() || !raw.len().is_multiple_of(2) {
         return None;
     }
@@ -743,7 +732,6 @@ mod tests {
                 0x02, 0x02, 0x0A, 0x0B, // s, leading zeros stripped
             ]
         );
-        assert_eq!(super::ecdsa_signature_to_cms(&der), Some(der.clone()));
         // Back to the fixed-width form the card produced.
         assert_eq!(
             ecdsa_signature_to_xml(&der, raw.len() / 2).expect("raw"),
@@ -757,6 +745,57 @@ mod tests {
         // An odd length cannot be split into two coordinates.
         assert_eq!(super::ecdsa_signature_to_cms(&[0x01, 0x02, 0x03]), None);
         assert_eq!(super::ecdsa_signature_to_cms(&[]), None);
+    }
+
+    /// The card returns only the raw pair (FINEID S1 v4.2 sec.3.8.3), so
+    /// a pair whose leading bytes spell a SEQUENCE header is split like
+    /// any other instead of being passed through as DER.
+    #[test]
+    fn a_raw_pair_that_starts_like_a_der_sequence_is_still_split() {
+        use crate::xades::ecdsa_signature_to_xml;
+
+        /// A P-384 `r || s` pair (FINEID S1 v4.2 sec.3.8.3).
+        const P384_RAW_SIGNATURE_LEN: usize = 96;
+        /// Long-form length with one following octet (X.690 sec.8.1.3.5).
+        const DER_LONG_FORM_ONE_BYTE: u8 = 0x81;
+        /// Long-form length with two following octets (X.690 sec.8.1.3.5).
+        const DER_LONG_FORM_TWO_BYTES: u8 = 0x82;
+        /// Short-form length (X.690 sec.8.1.3.4) equal to the bytes after
+        /// a tag and one length octet.
+        const DER_SHORT_LENGTH_OF_REMAINDER: u8 = (P384_RAW_SIGNATURE_LEN - 2) as u8;
+        /// Bytes after a tag, a long-form marker and one length octet.
+        const DER_ONE_BYTE_LENGTH_OF_REMAINDER: u8 = (P384_RAW_SIGNATURE_LEN - 3) as u8;
+        /// Bytes after a tag, a long-form marker and two length octets,
+        /// as the high and low octet of a two-octet length.
+        const DER_TWO_BYTE_LENGTH_OF_REMAINDER: [u8; 2] = [0, (P384_RAW_SIGNATURE_LEN - 4) as u8];
+
+        let short_form = [super::TAG_SEQUENCE, DER_SHORT_LENGTH_OF_REMAINDER];
+        let one_byte_form = [
+            super::TAG_SEQUENCE,
+            DER_LONG_FORM_ONE_BYTE,
+            DER_ONE_BYTE_LENGTH_OF_REMAINDER,
+        ];
+        let two_byte_form = [
+            super::TAG_SEQUENCE,
+            DER_LONG_FORM_TWO_BYTES,
+            DER_TWO_BYTE_LENGTH_OF_REMAINDER[0],
+            DER_TWO_BYTE_LENGTH_OF_REMAINDER[1],
+        ];
+
+        for header in [&short_form[..], &one_byte_form[..], &two_byte_form[..]] {
+            let mut raw = vec![0_u8; P384_RAW_SIGNATURE_LEN];
+            raw[..header.len()].copy_from_slice(header);
+            raw[P384_RAW_SIGNATURE_LEN - 1] = 1;
+
+            let der = super::ecdsa_signature_to_cms(&raw).expect("der");
+            assert_ne!(der, raw, "header {header:?} was passed through as DER");
+            assert_eq!(der.first(), Some(&super::TAG_SEQUENCE));
+            assert_eq!(
+                ecdsa_signature_to_xml(&der, P384_RAW_SIGNATURE_LEN / 2).expect("raw"),
+                raw,
+                "header {header:?} did not survive the round trip"
+            );
+        }
     }
 
     use super::{

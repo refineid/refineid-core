@@ -804,14 +804,18 @@ fn sign_dispatch_by_alg<T: CardTransport>(
 ///
 /// FINEID S1 v4.2 §3.5 + §3.6 + §3.7. Steps:
 ///
-///   1. Open a transport against the picked reader.
-///   2. Select the FINEID PKCS#15 application, then the slot's
-///      cert; read the SPKI for the local verify step.
+///   1. Open a PIN-sequence transport against the picked reader.
+///   2. Inside one PC/SC transaction: select the FINEID PKCS#15
+///      application, then the slot's cert; read the SPKI for the
+///      local verify step.
 ///   3. VERIFY the slot's PIN; consume `options` so the
 ///      [`PinBytes`] zeroize on return (Rule E1).
 ///   4. MSE:SET DST -> PSO:HASH -> PSO:CDS chain.
 ///   5. Local verify against the SPKI (Rule E7); refuse to
-///      hand back a signature that doesn't verify.
+///      hand back a signature that doesn't verify. The
+///      transaction ends with a card reset.
+///   6. Assemble the document and fetch its timestamps with the
+///      card session closed.
 ///
 /// Returns a [`SignReport`] carrying the signature bytes,
 /// local-verify outcome, and audit metadata. The function never
@@ -841,14 +845,12 @@ pub fn sign_qualified(
     let input_len: u64 = u64::try_from(input_bytes.len()).unwrap_or(u64::MAX);
     let input_sha256 = Sha256::of(&input_bytes);
 
-    // Stays Read (not PinSequence) deliberately: for document
-    // output, sign_chain calls assemble_document, which fetches
-    // timestamps from network authorities WHILE this transport is
-    // alive -- a held transaction across network IO would trip
-    // the resource manager's idle reset. PinSequence becomes
-    // possible here once document assembly moves after the card
-    // session closes.
-    let mut transport = backend.open_session(&reader_id, ReaderAccessCap::Read)?;
+    // The PIN sequence -- certificate read, VERIFY and the PSO
+    // chain -- runs inside one PC/SC transaction that ends with a
+    // card reset. Document assembly, which talks to timestamp and
+    // revocation authorities, runs after the card session is
+    // closed, so the reader is never held across network I/O.
+    let mut transport = backend.open_session(&reader_id, ReaderAccessCap::PinSequence)?;
 
     // SELECT the FINEID PKCS#15 application first. The qualified-
     // signature cert (EF.4332) lives under DF.5016 and the card
@@ -867,8 +869,17 @@ pub fn sign_qualified(
     // sign key's access condition is plain CHV with no interface
     // restriction (FINEID S4-1 v4.2 s8.1.7-9), which is what
     // licenses contactless signing at all.
-    let chain = match transport.select_pkcs15_application() {
-        Ok(()) => sign_chain(&mut transport, &options, &input_bytes, input_sha256)?,
+    let on_card = match transport.select_pkcs15_application() {
+        Ok(()) => transport.pin_sequence(|mut card| {
+            // The probe above ran outside the transaction; the
+            // application context this sequence relies on is
+            // established inside it.
+            card.select_pkcs15_application()
+                .map_err(|e| SignErrorKind::CertUnavailable {
+                    detail: format!("select pkcs15 app: {e}"),
+                })?;
+            sign_on_card(&mut card, &options, &input_bytes, input_sha256)
+        })??,
         Err(Pkcs15Error::Status(StatusWord::SecurityNotSatisfied)) => {
             let Some(can) = options.can.take() else {
                 return Err(SignErrorKind::NeedCan);
@@ -886,22 +897,25 @@ pub fn sign_qualified(
             transport
                 .reset()
                 .map_err(|e| SignErrorKind::Pace(format!("reset before PACE: {e}")))?;
-            // PACE's MSE:Set AT is only accepted in MF context.
-            // The reset lands the card there already; this makes
+            // PACE, the secure channel and the signing chain are
+            // one transaction. PACE's MSE:Set AT is only accepted
+            // in MF context: the reset lands the card there
+            // already; selecting MF inside the transaction makes
             // the requirement explicit and survives a backend
             // whose reset leaves selection elsewhere. The proven
             // contactless flow in refineid-lib-ffi does the same.
-            transport
-                .select_mf()
-                .map_err(|e| SignErrorKind::Pace(format!("SELECT MF before PACE: {e}")))?;
-            let session =
-                run_pace_with_can(&mut transport, can).map_err(|e| pace_err_to_kind(&e))?;
-            let mut sm = SmTransport::new(transport, session);
-            sm.select_pkcs15_application()
-                .map_err(|e| SignErrorKind::CertUnavailable {
-                    detail: format!("select pkcs15 app under SM: {e}"),
-                })?;
-            sign_chain(&mut sm, &options, &input_bytes, input_sha256)?
+            transport.pin_sequence(|mut card| {
+                card.select_mf()
+                    .map_err(|e| SignErrorKind::Pace(format!("SELECT MF before PACE: {e}")))?;
+                let session =
+                    run_pace_with_can(&mut card, can).map_err(|e| pace_err_to_kind(&e))?;
+                let mut sm = SmTransport::new(card, session);
+                sm.select_pkcs15_application()
+                    .map_err(|e| SignErrorKind::CertUnavailable {
+                        detail: format!("select pkcs15 app under SM: {e}"),
+                    })?;
+                sign_on_card(&mut sm, &options, &input_bytes, input_sha256)
+            })??
         }
         Err(e) => {
             return Err(SignErrorKind::CertUnavailable {
@@ -909,6 +923,7 @@ pub fn sign_qualified(
             });
         }
     };
+    let chain = finish_signature(&options, on_card)?;
 
     let signature_len = chain.signature_bytes.len();
     let output_len = chain.output_bytes.len();
@@ -946,8 +961,26 @@ pub fn sign_qualified(
     })
 }
 
-/// Output of [`sign_chain`]: what `sign_qualified` still needs
-/// once the card-facing work is done.
+/// What the card produced inside the PIN sequence: everything
+/// [`finish_signature`] needs once the card session is closed.
+struct CardSignOutput {
+    /// DER of the slot cert that produced the signature.
+    cert_der: UnvalidatedCertificate,
+    /// The same certificate, parsed, for the assembly parameters.
+    cert_owned: OwnedCert,
+    /// Retry count surfaced by a non-Ok VERIFY status word.
+    pin_retries_after: Option<u8>,
+    /// Raw signature bytes off the card.
+    signature_bytes: Vec<u8>,
+    /// Rule E7 local-verify outcome.
+    local_verify: LocalVerifyOutcome,
+    /// The half-built document the signature completes, when a
+    /// format was asked for.
+    plan: Option<DocumentPlan>,
+}
+
+/// Output of [`finish_signature`]: what `sign_qualified` still
+/// needs once the document is assembled.
 struct SignChainOutput {
     /// DER of the slot cert that produced the signature.
     cert_der: UnvalidatedCertificate,
@@ -973,12 +1006,14 @@ struct SignChainOutput {
 /// dispatch with its local verify. Generic over
 /// [`CardTransport`] so the same code runs on the plain contact
 /// channel and inside the PACE [`SmTransport`] on contactless.
-fn sign_chain<T: CardTransport>(
+/// It runs inside the PIN-sequence transaction and touches no
+/// network.
+fn sign_on_card<T: CardTransport>(
     transport: &mut T,
     options: &SignOptions,
     input_bytes: &[u8],
     input_sha256: Sha256,
-) -> Result<SignChainOutput, SignErrorKind> {
+) -> Result<CardSignOutput, SignErrorKind> {
     let cert_der = transport
         .read_certificate(SIGNING_CERT)
         .or_else(|_| {
@@ -998,7 +1033,6 @@ fn sign_chain<T: CardTransport>(
         })?;
     // Bind the view once: `view()` re-parses the DER on each call.
     let cert = cert_owned.view();
-    let cert_subject_cn = cert.subject.common_name();
     let cert_algorithm = cert.spki.algorithm();
 
     // What the card actually signs. For a raw signature that is the
@@ -1063,14 +1097,44 @@ fn sign_chain<T: CardTransport>(
         signed_sha256,
     )?;
 
-    // Local verify above proved the card signed what we asked it to.
-    // Only now is it worth assembling, because assembly can still
-    // fail -- a CAdES that outgrew the hole reserved in a PDF.
-    let (output_bytes, timestamps) = match document {
-        None => (signature_bytes.clone(), 0),
-        Some((plan, parameters)) => {
+    let plan = document.map(|(plan, _parameters)| plan);
+    Ok(CardSignOutput {
+        cert_der,
+        cert_owned,
+        pin_retries_after,
+        signature_bytes,
+        local_verify,
+        plan,
+    })
+}
+
+/// Complete the signature once the card session is closed.
+///
+/// The local verify inside the PIN sequence proved the card signed
+/// what was asked. Only now is it worth assembling, because assembly
+/// can still fail -- a CAdES that outgrew the hole reserved in a
+/// PDF -- and because assembly fetches timestamps from the network,
+/// which never happens while the reader is held.
+fn finish_signature(
+    options: &SignOptions,
+    on_card: CardSignOutput,
+) -> Result<SignChainOutput, SignErrorKind> {
+    let CardSignOutput {
+        cert_der,
+        cert_owned,
+        pin_retries_after,
+        signature_bytes,
+        local_verify,
+        plan,
+    } = on_card;
+    let cert = cert_owned.view();
+    let cert_subject_cn = cert.subject.common_name();
+    let (output_bytes, timestamps) = match (options.document.as_ref(), plan) {
+        (Some(request), Some(plan)) => {
+            let parameters = document_signer(&cert, cert.spki.algorithm(), request.signing_time)?;
             assemble_document(options, plan, &parameters, &signature_bytes, &cert_der)?
         }
+        (None, _) | (Some(_), None) => (signature_bytes.clone(), 0),
     };
 
     Ok(SignChainOutput {

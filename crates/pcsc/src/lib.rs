@@ -34,12 +34,26 @@
 //!
 //! ATR and status snapshots are taken with `SCardGetStatusChange`
 //! and `SCardStatus2` so the same handle can be reused across
-//! many `transmit` calls without an `SCardReconnect`. The
-//! transport wraps every APDU in a PC/SC transaction
-//! (`SCardBeginTransaction`/`SCardEndTransaction` via the
-//! `pcsc` crate's `Card::transaction()` RAII) so the card
-//! command stream is atomic against concurrent PKCS#11 / app
-//! peers.
+//! many `transmit` calls without an `SCardReconnect`.
+//!
+//! Every card is connected in shared mode, and the access
+//! capability a session is opened with decides what may travel
+//! on it:
+//!
+//! - A [`ReaderAccessCap::Read`] session carries replay-safe
+//!   commands only. Each APDU runs in its own PC/SC transaction
+//!   (`SCardBeginTransaction`/`SCardEndTransaction` via the
+//!   `pcsc` crate's `Card::transaction()`), so one command stream
+//!   is atomic against concurrent peers. A credential command is
+//!   refused on it.
+//! - A [`ReaderAccessCap::PinSequence`] session carries a
+//!   credential only inside [`PcscCard::pin_sequence`]: one PC/SC
+//!   transaction spans the whole sequence (application selection,
+//!   counter probe, VERIFY and the key operation), the transaction
+//!   ends with a card reset so no verified state outlives it, and
+//!   the handle is released. No other PC/SC client can interleave
+//!   a command between the VERIFY and the operation it authorizes,
+//!   or use the verified state afterwards.
 
 #![forbid(unsafe_code)]
 
@@ -112,6 +126,13 @@ pub enum PcscError {
     /// counterpart (response shorter than 2 bytes, retry-loop
     /// ceiling exceeded, etc.).
     Transport(String),
+    /// A credential command was offered outside a PIN-sequence
+    /// transaction. Credentials travel only inside
+    /// [`PcscCard::pin_sequence`].
+    CredentialOutsideTransaction,
+    /// [`PcscCard::pin_sequence`] was asked of a session opened
+    /// for card-public reads.
+    NotAPinSession,
 }
 
 impl From<pcsc::Error> for PcscError {
@@ -125,6 +146,10 @@ impl core::fmt::Display for PcscError {
         match self {
             Self::Pcsc(e) => write!(f, "PCSC: {e}"),
             Self::Transport(s) => write!(f, "PCSC transport: {s}"),
+            Self::CredentialOutsideTransaction => {
+                f.write_str("PCSC: credential command outside a PIN-sequence transaction")
+            }
+            Self::NotAPinSession => f.write_str("PCSC: PIN sequence on a read-only session"),
         }
     }
 }
@@ -137,7 +162,10 @@ impl TransportErrorExt for PcscError {
             Self::Pcsc(pcsc::Error::NoSmartcard) => TransportErrorKind::NoCard,
             Self::Pcsc(pcsc::Error::RemovedCard) => TransportErrorKind::ReaderRemoved,
             Self::Pcsc(pcsc::Error::ResetCard) => TransportErrorKind::CardReset,
-            Self::Transport(_) | Self::Pcsc(_) => TransportErrorKind::Backend,
+            Self::Transport(_)
+            | Self::Pcsc(_)
+            | Self::CredentialOutsideTransaction
+            | Self::NotAPinSession => TransportErrorKind::Backend,
         }
     }
 }
@@ -194,20 +222,25 @@ fn connect_resilient(ctx: &Context, cstr: &CString) -> Result<Option<Card>, Pcsc
     Err(PcscError::Pcsc(pcsc::Error::UnresponsiveCard))
 }
 
-/// Open a card on `reader` in shared mode.
+/// Open a card on `reader` in shared mode, for `access`.
 ///
 /// Returns `Ok(Some(_))` when a card is present, `Ok(None)`
 /// when the reader is empty / just removed. Callers translate
 /// `None` into "slot present, token absent".
 ///
-/// The connection is shared with PC/SC's normal arbitration --
-/// all APDU exchanges happen inside transactions so concurrent peers cannot
-/// interleave commands on the same card.
+/// The connection is shared with PC/SC's normal arbitration.
+/// Every replay-safe APDU runs inside its own transaction; a
+/// PIN sequence runs inside one transaction for all of its
+/// commands (see [`PcscCard::pin_sequence`]).
 ///
 /// # Errors
 /// Reader name has interior NUL, PC/SC connect failure other
 /// than "no card present", or status query failure.
-pub(crate) fn connect(ctx: &Context, reader: &str) -> Result<Option<PcscCard>, PcscError> {
+pub(crate) fn connect(
+    ctx: &Context,
+    reader: &str,
+    access: ReaderAccessCap,
+) -> Result<Option<PcscCard>, PcscError> {
     let cstr = CString::new(reader)
         .map_err(|e| PcscError::Transport(format!("reader name has interior NUL: {e}")))?;
     let card = match connect_resilient(ctx, &cstr) {
@@ -226,6 +259,7 @@ pub(crate) fn connect(ctx: &Context, reader: &str) -> Result<Option<PcscCard>, P
         card,
         atr,
         protocol,
+        access,
     }))
 }
 
@@ -252,13 +286,17 @@ pub(crate) const fn other_protocols_mask(protocol: Protocol) -> Protocols {
     }
 }
 
-/// Connected card wrapped around a `pcsc::Card`. Drops back to
-/// the OS PC/SC handle release on `Drop`
-/// (`SCardDisconnect(SCARD_LEAVE_CARD)`).
+/// Connected card wrapped around a `pcsc::Card`, opened with one
+/// [`ReaderAccessCap`].
+///
+/// Replay-safe commands run one PC/SC transaction each. A
+/// credential command is refused on this type; it travels only
+/// inside [`PcscCard::pin_sequence`], which a `PinSequence`
+/// session alone can enter. Dropping the card releases the
+/// handle through the `pcsc` crate's `Card` drop, which is
+/// `SCardDisconnect(SCARD_RESET_CARD)`.
 pub struct PcscCard {
-    /// Owned `pcsc::Card` handle. Drops to
-    /// `SCardDisconnect(SCARD_LEAVE_CARD)` on this struct's
-    /// drop; the card is left powered for subsequent connects.
+    /// Owned `pcsc::Card` handle.
     card: Card,
     /// Card's Answer-To-Reset bytes, captured at connect time
     /// via `SCardStatus`. Cached so the ATR-classification
@@ -266,9 +304,53 @@ pub struct PcscCard {
     atr: Vec<u8>,
     /// Active protocol captured from `SCardStatus`.
     protocol: Protocol,
+    /// What the session was opened for; decides whether a PIN
+    /// sequence may run on it.
+    access: ReaderAccessCap,
 }
 
 impl PcscCard {
+    /// Run one PIN-bearing command sequence inside a single PC/SC
+    /// transaction and reset the card when it ends.
+    ///
+    /// `body` receives the only transport that accepts a credential
+    /// command. The transaction begins before the body runs and
+    /// ends with `SCARD_RESET_CARD` on every path out of the body,
+    /// so the verified state a VERIFY established serves this
+    /// sequence alone and does not outlive it. The card handle is
+    /// consumed: nothing can be sent on it after the reset.
+    ///
+    /// # Errors
+    /// [`PcscError::NotAPinSession`] when the session was opened
+    /// with [`ReaderAccessCap::Read`]; the PC/SC error when the
+    /// transaction cannot begin, or cannot end with the reset. In
+    /// the last case the body's result is withheld, because the
+    /// sequence did not deliver its guarantee, and the handle's
+    /// release attempts the reset once more.
+    pub fn pin_sequence<R>(
+        self,
+        body: impl FnOnce(PcscTransactionCard<'_, '_>) -> R,
+    ) -> Result<R, PcscError> {
+        pin_sequence_permitted(self.access)?;
+        let Self {
+            mut card, protocol, ..
+        } = self;
+        let result = {
+            let tx = card.transaction()?;
+            let result = body(PcscTransactionCard { tx: &tx, protocol });
+            tx.end(Disposition::ResetCard)
+                .map_err(|(_ended_without_reset, error)| error)?;
+            result
+        };
+        // The transaction's reset already cleared the card, so the
+        // handle is released without a second reset. A refused
+        // release hands the handle back; its drop releases it with
+        // a reset.
+        if let Err((card, _release_error)) = card.disconnect(Disposition::LeaveCard) {
+            drop(card);
+        }
+        Ok(result)
+    }
     /// Reset the card, returning it to its post-ATR state.
     ///
     /// # Errors
@@ -451,65 +533,134 @@ fn run_t0_exchange<T: T0Transmitter>(
     }))
 }
 
+/// Whether a session opened with `access` may run a PIN sequence.
+fn pin_sequence_permitted(access: ReaderAccessCap) -> Result<(), PcscError> {
+    match access {
+        ReaderAccessCap::PinSequence => Ok(()),
+        ReaderAccessCap::Read => Err(PcscError::NotAPinSession),
+    }
+}
+
+/// Begin a PC/SC transaction on `card`, mapping the card-state
+/// failures to their [`TransportOutcome`] transitions.
+fn begin_transaction(card: &mut Card) -> Result<Transaction<'_>, TransmitBreak> {
+    match card.transaction() {
+        Ok(tx) => Ok(tx),
+        Err(pcsc::Error::NoSmartcard) => Err(TransmitBreak::Outcome(TransportOutcome::NoCard)),
+        Err(pcsc::Error::RemovedCard) => {
+            Err(TransmitBreak::Outcome(TransportOutcome::ReaderRemoved))
+        }
+        Err(pcsc::Error::ResetCard) => Err(TransmitBreak::Outcome(TransportOutcome::CardReset)),
+        Err(e) => Err(TransmitBreak::Error(e.into())),
+    }
+}
+
+/// The T=0 case-4 adaptation for `apdu`, when the active protocol
+/// needs it.
+fn t0_adaptation(protocol: Protocol, apdu: &[u8]) -> Option<Vec<u8>> {
+    if protocol == Protocol::T0 {
+        t0_case3_from_short_case4(apdu)
+    } else {
+        None
+    }
+}
+
+/// One replay-safe exchange: the T=0 case-4 adaptation, the `61xx`
+/// chain, and the single wrong-Le correction a case-2 builder
+/// opted into.
+fn exchange_plain<T: T0Transmitter>(
+    transmitter: &mut T,
+    protocol: Protocol,
+    command: &CommandApdu,
+) -> Result<TransportOutcome, PcscError> {
+    let t0_adapted = t0_adaptation(protocol, command.as_bytes());
+    let bytes_to_send = t0_adapted.as_deref().unwrap_or_else(|| command.as_bytes());
+    let outcome = run_t0_exchange(transmitter, bytes_to_send)?;
+
+    if let TransportOutcome::Response(ref resp) = outcome
+        && resp.sw1 == SW1_WRONG_LE
+        && let Some(corrected) = command.corrected_wrong_le(resp.sw2)
+    {
+        let retry_t0 = t0_adaptation(protocol, corrected.as_bytes());
+        let retry_bytes = retry_t0.as_deref().unwrap_or_else(|| corrected.as_bytes());
+        return run_t0_exchange(transmitter, retry_bytes);
+    }
+
+    Ok(outcome)
+}
+
+/// One credential exchange: sent exactly once with the `61xx`
+/// chain settled, never corrected and never resent.
+fn exchange_credential<T: T0Transmitter>(
+    transmitter: &mut T,
+    protocol: Protocol,
+    command: CredentialCommand,
+) -> Result<TransportOutcome, PcscError> {
+    command.expose_wire(|wire| {
+        let t0_adapted = t0_adaptation(protocol, wire);
+        let bytes_to_send = t0_adapted.as_deref().unwrap_or(wire);
+        run_t0_exchange(transmitter, bytes_to_send)
+    })
+}
+
 impl CardTransport for PcscCard {
     type Error = PcscError;
 
     fn transmit(&mut self, command: &CommandApdu) -> Result<TransportOutcome, Self::Error> {
-        let tx = match self.card.transaction() {
+        let tx = match begin_transaction(&mut self.card) {
             Ok(tx) => tx,
-            Err(pcsc::Error::NoSmartcard) => return Ok(TransportOutcome::NoCard),
-            Err(pcsc::Error::RemovedCard) => return Ok(TransportOutcome::ReaderRemoved),
-            Err(pcsc::Error::ResetCard) => return Ok(TransportOutcome::CardReset),
-            Err(e) => return Err(e.into()),
+            Err(TransmitBreak::Outcome(outcome)) => return Ok(outcome),
+            Err(TransmitBreak::Error(e)) => return Err(e),
         };
         let mut transmitter = PcscTransmitter(&tx);
-        let t0_adapted = if self.protocol == Protocol::T0 {
-            t0_case3_from_short_case4(command.as_bytes())
-        } else {
-            None
-        };
-        let bytes_to_send = t0_adapted.as_deref().unwrap_or_else(|| command.as_bytes());
-        let outcome = run_t0_exchange(&mut transmitter, bytes_to_send)?;
+        exchange_plain(&mut transmitter, self.protocol, command)
+    }
 
-        // Wrong-Le single retry on opted-in case-2 commands:
-        if let TransportOutcome::Response(ref resp) = outcome
-            && resp.sw1 == SW1_WRONG_LE
-            && let Some(corrected) = command.corrected_wrong_le(resp.sw2)
-        {
-            let retry_t0 = if self.protocol == Protocol::T0 {
-                t0_case3_from_short_case4(corrected.as_bytes())
-            } else {
-                None
-            };
-            let retry_bytes = retry_t0.as_deref().unwrap_or_else(|| corrected.as_bytes());
-            return run_t0_exchange(&mut transmitter, retry_bytes);
-        }
+    /// Refused: a credential travels only inside
+    /// [`PcscCard::pin_sequence`]. The command is consumed and its
+    /// storage zeroizes.
+    fn transmit_credential(
+        &mut self,
+        _command: CredentialCommand,
+    ) -> Result<TransportOutcome, Self::Error> {
+        Err(PcscError::CredentialOutsideTransaction)
+    }
+}
 
-        Ok(outcome)
+/// A card inside one PC/SC transaction, handed to the body of
+/// [`PcscCard::pin_sequence`].
+///
+/// This is the only transport on which a credential command
+/// travels. It offers no reset and no way out of the transaction,
+/// which ends with a card reset when the body returns.
+pub struct PcscTransactionCard<'tx, 'card> {
+    tx: &'tx Transaction<'card>,
+    protocol: Protocol,
+}
+
+impl CardTransport for PcscTransactionCard<'_, '_> {
+    type Error = PcscError;
+
+    fn transmit(&mut self, command: &CommandApdu) -> Result<TransportOutcome, Self::Error> {
+        let mut transmitter = PcscTransmitter(self.tx);
+        exchange_plain(&mut transmitter, self.protocol, command)
     }
 
     fn transmit_credential(
         &mut self,
         command: CredentialCommand,
     ) -> Result<TransportOutcome, Self::Error> {
-        let tx = match self.card.transaction() {
-            Ok(tx) => tx,
-            Err(pcsc::Error::NoSmartcard) => return Ok(TransportOutcome::NoCard),
-            Err(pcsc::Error::RemovedCard) => return Ok(TransportOutcome::ReaderRemoved),
-            Err(pcsc::Error::ResetCard) => return Ok(TransportOutcome::CardReset),
-            Err(e) => return Err(e.into()),
-        };
-        let mut transmitter = PcscTransmitter(&tx);
-        command.expose_wire(|wire| {
-            let t0_adapted = if self.protocol == Protocol::T0 {
-                t0_case3_from_short_case4(wire)
-            } else {
-                None
-            };
-            let bytes_to_send = t0_adapted.as_deref().unwrap_or(wire);
-            // Credential command: sent once, no wrong-Le retry, chaining handled if 61xx
-            run_t0_exchange(&mut transmitter, bytes_to_send)
-        })
+        let mut transmitter = PcscTransmitter(self.tx);
+        exchange_credential(&mut transmitter, self.protocol, command)
+    }
+}
+
+impl core::fmt::Debug for PcscTransactionCard<'_, '_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PcscTransactionCard")
+            .field("tx", &"<pcsc transaction>")
+            .field("protocol", &self.protocol)
+            .finish()
     }
 }
 
@@ -551,9 +702,12 @@ pub struct ReaderInfo {
 /// Access permission requested when opening a card on a reader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReaderAccessCap {
-    /// Card-public reads only (eMRTD via PACE, ATR-derived metadata, cert reads).
+    /// Card-public reads only (eMRTD via PACE, ATR-derived metadata,
+    /// cert reads). A credential command is refused on the session.
     Read,
-    /// A PIN-bearing command sequence.
+    /// A PIN-bearing command sequence: the session may enter
+    /// [`PcscCard::pin_sequence`], one transaction for the whole
+    /// sequence, ended with a card reset.
     PinSequence,
 }
 
@@ -567,7 +721,9 @@ pub trait ReaderBackend {
     /// Enumerate all visible readers and their card-present status.
     fn enumerate(&self) -> Result<Vec<ReaderInfo>, Self::Error>;
 
-    /// Open an exclusive session on the named reader.
+    /// Open a session on the named reader for `access`. The PC/SC
+    /// backend connects in shared mode; `access` decides whether
+    /// the session may run a PIN sequence.
     fn open_exclusive(
         &self,
         reader: &ReaderId,
@@ -885,21 +1041,37 @@ impl ReaderBackend for PcscBackend {
     fn open_exclusive(
         &self,
         reader: &ReaderId,
-        _access: ReaderAccessCap,
+        access: ReaderAccessCap,
     ) -> Result<Self::Transport, Self::Error> {
         let ctx = establish_context()?;
-        connect(&ctx, reader.as_str())?.ok_or(PcscError::Pcsc(pcsc::Error::NoSmartcard))
+        connect(&ctx, reader.as_str(), access)?.ok_or(PcscError::Pcsc(pcsc::Error::NoSmartcard))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        PcscError, T0Transmitter, TransmitBreak, TransportOutcome, run_t0_exchange,
+        PcscError, ReaderAccessCap, SW1_WRONG_LE, T0Transmitter, TransmitBreak, TransportOutcome,
+        exchange_credential, exchange_plain, pin_sequence_permitted, run_t0_exchange,
         t0_case3_from_short_case4,
     };
-    use refineid_apdu::ApduClass;
+    use pcsc::Protocol;
     use refineid_apdu::iso7816::GetResponse;
+    use refineid_apdu::status_word::StatusWord;
+    use refineid_apdu::{
+        ApduClass, CommandHeader, CredentialBody, CredentialCommand, UnvalidatedCredentialBlock,
+    };
+
+    /// Le the scripted card asks for in its `6Cxx` answer.
+    const CORRECTED_LE: u8 = 0x05;
+    /// Le the scripted `GET RESPONSE` starts with.
+    const INITIAL_LE: u8 = 0x10;
+    /// Synthetic instruction byte of the scripted credential command.
+    const TEST_CREDENTIAL_INS: u8 = 0xEE;
+    /// Synthetic credential octet; never a real credential value.
+    const TEST_CREDENTIAL_OCTET: u8 = 0x2A;
+    /// Octets the scripted credential command carries.
+    const TEST_CREDENTIAL_LEN: usize = 4;
 
     #[allow(dead_code)]
     enum Step {
@@ -998,6 +1170,83 @@ mod tests {
         let case4 = vec![0x00, 0x2A, 0x90, 0xA0, 0x02, 0xAA, 0xBB, 0x00];
         let case3 = t0_case3_from_short_case4(&case4).expect("valid short case 4 APDU");
         assert_eq!(case3, vec![0x00, 0x2A, 0x90, 0xA0, 0x02, 0xAA, 0xBB]);
+    }
+
+    fn success_bytes() -> Vec<u8> {
+        StatusWord::Success.as_u16().to_be_bytes().to_vec()
+    }
+
+    fn scripted_credential() -> CredentialCommand {
+        let header = CommandHeader {
+            class: ApduClass::Plain,
+            instruction: TEST_CREDENTIAL_INS,
+            p1: 0,
+            p2: 0,
+        };
+        let mut block = UnvalidatedCredentialBlock::zeroed();
+        block.buffer()[..TEST_CREDENTIAL_LEN].fill(TEST_CREDENTIAL_OCTET);
+        block.set_filled(TEST_CREDENTIAL_LEN);
+        let body = CredentialBody::from_block(block).expect("scripted credential body");
+        CredentialCommand::assemble(header, body)
+    }
+
+    #[test]
+    fn plain_exchange_corrects_wrong_le_once_for_an_opted_in_read() {
+        let command = GetResponse {
+            class: ApduClass::Plain,
+            le: INITIAL_LE,
+        }
+        .into_apdu();
+        let mut card = ScriptedCard::new(vec![
+            Step::Reply(vec![SW1_WRONG_LE, CORRECTED_LE]),
+            Step::Reply(success_bytes()),
+        ]);
+        let outcome = exchange_plain(&mut card, Protocol::T1, &command).expect("exchange succeeds");
+        match outcome {
+            TransportOutcome::Response(resp) => assert!(resp.is_ok()),
+            other => panic!("expected response, got {other:?}"),
+        }
+        let corrected = command
+            .corrected_wrong_le(CORRECTED_LE)
+            .expect("GET RESPONSE opts into the correction");
+        assert_eq!(card.sent.len(), 2);
+        assert_eq!(card.sent[0], command.as_bytes());
+        assert_eq!(card.sent[1], corrected.as_bytes());
+    }
+
+    #[test]
+    fn credential_exchange_sends_once_and_never_corrects_wrong_le() {
+        let mut card = ScriptedCard::new(vec![Step::Reply(vec![SW1_WRONG_LE, CORRECTED_LE])]);
+        let outcome = exchange_credential(&mut card, Protocol::T1, scripted_credential())
+            .expect("exchange succeeds");
+        match outcome {
+            TransportOutcome::Response(resp) => {
+                assert_eq!(resp.sw1, SW1_WRONG_LE);
+                assert_eq!(resp.sw2, CORRECTED_LE);
+            }
+            other => panic!("expected response, got {other:?}"),
+        }
+        assert_eq!(card.sent.len(), 1);
+    }
+
+    #[test]
+    fn credential_exchange_on_t0_sends_the_case3_wire_unchanged() {
+        // A credential command is case 3 already, so the T=0
+        // adaptation leaves it alone.
+        let mut card = ScriptedCard::new(vec![Step::Reply(success_bytes())]);
+        let expected_wire = scripted_credential().expose_wire(<[u8]>::to_vec);
+        exchange_credential(&mut card, Protocol::T0, scripted_credential())
+            .expect("exchange succeeds");
+        assert_eq!(card.sent, vec![expected_wire]);
+    }
+
+    #[test]
+    fn pin_sequence_is_permitted_only_on_a_pin_session() {
+        assert!(pin_sequence_permitted(ReaderAccessCap::PinSequence).is_ok());
+        assert!(matches!(
+            pin_sequence_permitted(ReaderAccessCap::Read),
+            Err(PcscError::NotAPinSession)
+        ));
     }
 
     #[test]

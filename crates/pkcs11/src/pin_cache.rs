@@ -20,9 +20,9 @@
 //! custody contract (`doc/security/credential-custody.md`): the value
 //! lives only in this process's memory, from the first card-confirmed
 //! success until an invalidation event, with no idle window or countdown.
-//! It is held only under a pristine retry counter; a login under a counter
-//! below pristine bridges to the one operation that follows and no further
-//! ([`PIN1_LOGIN_BRIDGE`]).
+//! It is held only under a pristine retry counter, or PIN1 standing
+//! verified, which proves one; a login under any other counter bridges to
+//! the one operation that follows and no further ([`PIN1_LOGIN_BRIDGE`]).
 //!
 //! The value is bound to one stay of one card in its reader: the token
 //! serial the card reported and the reader's card insertion and removal
@@ -247,19 +247,6 @@ impl core::fmt::Debug for AcceptedPin1 {
     }
 }
 
-/// Whether the PIN1 retry state the card reports leaves a positive PIN1
-/// usable: pristine, or PIN1 standing verified.
-///
-/// A VERIFY the card accepts sets the try counter to its limit, and one
-/// it refuses decrements the counter and clears the verified state
-/// (FINEID S1 v4.2 section 3.5); the limit is five for PIN1 on both card
-/// families (FINEID S4-1 v4.2 section 4.1, S4-2 v4.0). A positive value
-/// was accepted by the card, so any count below the limit means the card
-/// refused a PIN since.
-const fn counter_intact(live: PinStatus) -> bool {
-    matches!(live, PinStatus::Verified) || pin1_status_permits_reusable_cache(live)
-}
-
 /// Whether a bridge staged at `staged_at` is still open at `now`.
 fn bridge_open(staged_at: Instant, now: Instant) -> bool {
     now.checked_duration_since(staged_at)
@@ -413,7 +400,7 @@ impl PinSafetyCache {
         let entry = self.positive_pin1.take()?;
         let usable = &entry.serial == serial
             && entry.card_events == card_events
-            && counter_intact(live)
+            && pin1_status_permits_reusable_cache(live)
             && match entry.retention {
                 Pin1Retention::Held => true,
                 Pin1Retention::Bridge { staged_at } => bridge_open(staged_at, now),

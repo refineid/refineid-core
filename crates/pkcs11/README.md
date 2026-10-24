@@ -33,6 +33,13 @@ Implemented:
   The private key answers `CKA_EXTRACTABLE` false and
   `CKA_NEVER_EXTRACTABLE` / `CKA_ALWAYS_SENSITIVE` true -- the FINEID
   key never leaves the card.
+  On a card in a local reader the private key is a private object
+  (`CKA_PRIVATE` true) and the token reports `CKF_LOGIN_REQUIRED`.
+  On a card served by a paired phone the phone verifies PIN 1 and asks
+  the holder for each signature, so the token reports
+  `CKF_PROTECTED_AUTHENTICATION_PATH` without `CKF_LOGIN_REQUIRED`, every
+  object is public, `C_Sign` needs no login, and `C_Login` (null PIN)
+  succeeds without contacting the phone.
 - Signing: `C_SignInit` / `C_Sign` (single-part).
   `CKM_RSA_PKCS` takes a DER `DigestInfo` (SHA-256 only) on the RSA-3072 card;
   `CKM_ECDSA` takes a raw digest of any hash on the ECC P-384 card and returns raw `r || s`.

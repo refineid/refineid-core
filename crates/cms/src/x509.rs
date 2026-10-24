@@ -81,9 +81,6 @@ const TAG_NULL: u16 = 0x05;
 const OID_KEY_USAGE: Oid<'static> = known::KEY_USAGE;
 /// `OID_BASIC_CONSTRAINTS` constant.
 const OID_BASIC_CONSTRAINTS: Oid<'static> = known::BASIC_CONSTRAINTS;
-/// id-icao-mlSigner -- EKU OID that ICAO Doc 9303 §12
-/// requires on a CSCA Master List Signer cert.
-pub const OID_ICAO_ML_SIGNER: Oid<'static> = known::ICAO_ML_SIGNER;
 /// `OID_EXT_KEY_USAGE` constant.
 const OID_EXT_KEY_USAGE: Oid<'static> = known::EXT_KEY_USAGE;
 
@@ -1160,8 +1157,7 @@ pub enum PublicKeyAlgorithm {
     Ec(EcCurve),
     /// EC key with explicit curve parameters (parameters
     /// encoded inline as an `ECParameters` SEQUENCE rather than
-    /// referenced by a named-curve OID). Used by (e.g.) Finnish
-    /// eMRTD DSCs.
+    /// referenced by a named-curve OID).
     EcExplicit {
         /// Field prime's bit length, decoded from the inline
         /// `ECParameters` SEQUENCE. `usize` is the natural fit.
@@ -1188,7 +1184,7 @@ pub enum EcCurve {
     /// Brainpool P-256r1 (`1.3.36.3.3.2.8.1.1.7`).
     BrainpoolP256r1,
     /// Brainpool P-384r1 (`1.3.36.3.3.2.8.1.1.11`). FINEID
-    /// PACE / eMRTD AA use this.
+    /// PACE uses this.
     BrainpoolP384r1,
     /// Unrecognised curve OID.
     Other,
@@ -1587,10 +1583,7 @@ pub fn extract_extended_key_usage_meta(extensions: &[u8]) -> Option<ExtendedKeyU
 
 /// Parsed Key Usage extension with criticality.
 ///
-/// Carries the `KeyUsage` flags and the critical-flag. ICAO
-/// Doc 9303 requires DSC certs to carry `Key Usage` critical
-/// with only `digitalSignature` asserted; CSCA certs to carry
-/// critical `keyCertSign | cRLSign`.
+/// Carries the `KeyUsage` flags and the critical-flag.
 #[derive(Debug, Clone, Copy)]
 pub struct KeyUsageMeta {
     /// The parsed Key Usage flags. See [`KeyUsage`] for the
@@ -1643,7 +1636,7 @@ pub struct BasicConstraints {
     pub path_len: Option<u32>,
     /// The extension's `critical` flag (RFC 5280 §4.2). RFC
     /// 5280 §4.2.1.9 mandates that a CA cert MUST mark
-    /// `BasicConstraints` critical; user / DSC certs typically
+    /// `BasicConstraints` critical; end-entity certs typically
     /// omit the extension entirely.
     pub critical: bool,
     /// `true` when the extension was present at all. `false`

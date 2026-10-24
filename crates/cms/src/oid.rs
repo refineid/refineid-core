@@ -288,17 +288,6 @@ pub mod known {
     pub const GIVEN_NAME: Oid<'static> =
         Oid::const_new(::const_oid::ObjectIdentifier::new_unwrap("2.5.4.42").as_bytes());
 
-    // ---- ICAO PKD ----
-
-    /// `2.23.136.1.1.1` -- id-icao-mrtd-security-ldsSecurityObject
-    /// (ICAO 9303-10) -- the SOD eContentType.
-    pub const ICAO_LDS_SECURITY_OBJECT: Oid<'static> =
-        Oid::const_new(::const_oid::ObjectIdentifier::new_unwrap("2.23.136.1.1.1").as_bytes());
-
-    /// `2.23.136.1.1.3` -- id-icao-cscaMasterListSignedData (ICAO 9303-12).
-    pub const ICAO_ML_SIGNER: Oid<'static> =
-        Oid::const_new(::const_oid::ObjectIdentifier::new_unwrap("2.23.136.1.1.3").as_bytes());
-
     /// `2.5.29.15` -- id-ce-keyUsage (critical in FINEID S2).
     pub const KEY_USAGE: Oid<'static> =
         Oid::const_new(::const_oid::ObjectIdentifier::new_unwrap("2.5.29.15").as_bytes());
@@ -498,12 +487,6 @@ pub mod known {
     pub const PRIME_FIELD: Oid<'static> =
         Oid::const_new(::const_oid::ObjectIdentifier::new_unwrap("1.2.840.10045.1.1").as_bytes());
 
-    // ---- ICAO PKD (additional) ----
-
-    /// `2.23.136.1.1.2` -- id-icao-cscaMasterList (CMS eContentType).
-    pub const CSCA_MASTER_LIST: Oid<'static> =
-        Oid::const_new(::const_oid::ObjectIdentifier::new_unwrap("2.23.136.1.1.2").as_bytes());
-
     // ---- PACE mechanism (BSI TR-03110-3) ----
 
     /// `0.4.0.127.0.7.2.2.4.2.4` -- id-PACE-ECDH-GM-AES-CBC-CMAC-256.
@@ -625,14 +608,6 @@ mod tests {
     #[test]
     fn display_ad_ocsp() {
         assert_eq!(format!("{}", known::AD_OCSP), "1.3.6.1.5.5.7.48.1");
-    }
-
-    #[test]
-    fn display_icao_ml_signer() {
-        // The first two arcs pack into one byte (two times forty
-        // plus twenty-three); the remaining arcs are base-128
-        // encoded.
-        assert_eq!(format!("{}", known::ICAO_ML_SIGNER), "2.23.136.1.1.3");
     }
 
     #[test]

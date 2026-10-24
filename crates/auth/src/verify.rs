@@ -175,11 +175,11 @@ pub enum AuthError<E> {
     /// The credential command could not be assembled; unreachable for a
     /// validated PIN, kept fail-closed.
     Command(CredentialBodyError),
-    /// The typed PIN is longer than the organizational card stores. That
-    /// card compares at the typed length and caps every credential at
-    /// [`ORGANIZATIONAL_PIN_MAX_LENGTH`], so a longer entry can never
-    /// match; it is refused locally before any command, so no retry is
-    /// spent learning it.
+    /// The organizational card stores credentials of at most
+    /// [`ORGANIZATIONAL_PIN_MAX_LENGTH`] digits and compares at the typed
+    /// length, so a credential outside that bound can never match; it is
+    /// refused locally before any command, so no retry is spent learning
+    /// it.
     LengthUnsupported {
         /// The maximum the card stores.
         max: usize,
@@ -194,7 +194,7 @@ impl<E: core::fmt::Display> core::fmt::Display for AuthError<E> {
             Self::Command(e) => write!(f, "auth command: {e}"),
             Self::LengthUnsupported { max } => write!(
                 f,
-                "auth: PIN length exceeds the organizational card's {max}-digit maximum"
+                "auth: the organizational card stores credentials of at most {max} digits"
             ),
         }
     }
@@ -241,11 +241,23 @@ pub(crate) const CREDENTIAL_BODY_SCRATCH: usize = 2 * PIN_STORED_LENGTH;
 /// `out`, returning the total byte count the card compares.
 ///
 /// The citizen card compares a block right-padded with the pad byte to
-/// the stored length; the organizational card compares the bare typed
-/// digits at their own length, because it publishes no padding and a
-/// padded block would fail the comparison and spend a retry. `out` must
-/// be pre-filled with the pad byte so the citizen padding falls out of
-/// the untouched tail.
+/// the stored length (FINEID S1 v4.2 section 3.5); the organizational
+/// card compares the bare typed digits at their own length, because it
+/// publishes no padding and a padded block would fail the comparison and
+/// spend a retry. `out` must be pre-filled with the pad byte so the
+/// citizen padding falls out of the untouched tail.
+///
+/// The organizational card delimits a two-group field itself. IAS ECC
+/// v1.0.1 section 9.4.2 defines the CHANGE REFERENCE DATA data field as
+/// `Current Password || New reference data` under P1 `00` alone, and
+/// states the processing rule: the card retrieves the current length L
+/// from the stored PIN object, takes the first L bytes of the data field
+/// as the current password, and takes the rest as the new one, with
+/// `Lnew = Lc - Lold`. The stored length is the typed length of the
+/// current credential, so the groups are written back to back with no
+/// padding and no length prefix. FINEID S4-2 v4.0 sections 4.3.1 and
+/// 4.3.3 only bound each credential to 4..=8 digits and define no field
+/// layout of their own.
 pub(crate) fn write_credential_blocks(
     scheme: PinReferenceScheme,
     groups: &[&[u8]],
@@ -534,10 +546,10 @@ impl<T: CardTransport + ?Sized> PinOps for T {}
 #[cfg(test)]
 mod tests {
     use super::{
-        CREDENTIAL_BODY_MAX, CREDENTIAL_BODY_SCRATCH, PIN_PAD_BYTE, PIN_STORED_LENGTH,
-        PIN1_REFERENCE, PIN1_REFERENCE_ORGANIZATIONAL, PinOps, PinReferenceScheme, PinSlot,
-        PinStatus, VERIFY_INS, VERIFY_P1, VerifyOutcome, classify_pin_status_sw,
-        classify_verify_sw, write_credential_blocks,
+        AuthError, CREDENTIAL_BODY_MAX, CREDENTIAL_BODY_SCRATCH, ORGANIZATIONAL_PIN_MAX_LENGTH,
+        PIN_PAD_BYTE, PIN_STORED_LENGTH, PIN1_REFERENCE, PIN1_REFERENCE_ORGANIZATIONAL, PinOps,
+        PinReferenceScheme, PinSlot, PinStatus, VERIFY_INS, VERIFY_P1, VerifyOutcome,
+        classify_pin_status_sw, classify_verify_sw, write_credential_blocks,
     };
     use crate::credentials::{Pin1, UnvalidatedSecret};
     use refineid_apdu::{
@@ -716,6 +728,22 @@ mod tests {
             &body[PIN_STORED_LENGTH..PIN_STORED_LENGTH + b"567890".len()],
             b"567890"
         );
+    }
+
+    #[test]
+    fn length_unsupported_display_states_only_the_policy_bound() {
+        let error: AuthError<String> = AuthError::LengthUnsupported {
+            max: ORGANIZATIONAL_PIN_MAX_LENGTH,
+        };
+        let rendered = error.to_string();
+        assert_eq!(
+            rendered,
+            format!(
+                "auth: the organizational card stores credentials of at most {ORGANIZATIONAL_PIN_MAX_LENGTH} digits"
+            )
+        );
+        assert!(!rendered.contains("exceeds"));
+        assert!(!rendered.contains("PIN length"));
     }
 
     #[test]

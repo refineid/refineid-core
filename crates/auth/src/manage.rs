@@ -43,7 +43,9 @@ use crate::verify::{
 /// section 3.11).
 const CHANGE_REFERENCE_DATA_INS: u8 = 0x24;
 /// CHANGE REFERENCE DATA P1: the data field carries the current
-/// reference data followed by the new.
+/// reference data followed by the new. The organizational card accepts
+/// no other P1 and splits the field at its stored length (IAS ECC v1.0.1
+/// section 9.4.2).
 const CHANGE_P1_CURRENT_THEN_NEW: u8 = 0x00;
 
 /// RESET RETRY COUNTER instruction (ISO 7816-8; FINEID S1 v4.2
@@ -97,6 +99,11 @@ pub const fn classify_manage_sw(sw: StatusWord) -> ManageOutcome {
 
 /// Send one CHANGE REFERENCE DATA for `slot`: the current credential
 /// block, then the new.
+///
+/// Both numberings take the single-command form under P1
+/// [`CHANGE_P1_CURRENT_THEN_NEW`]; no separate VERIFY precedes it. How
+/// each card delimits the two blocks is recorded on
+/// [`crate::verify::write_credential_blocks`].
 pub(crate) fn change<T: CardTransport + ?Sized>(
     transport: &mut T,
     scheme: PinReferenceScheme,

@@ -21,7 +21,6 @@ const RAW_SFI_COM: u8 = 0x1E;
 const RAW_SFI_DG1: u8 = 0x01;
 const RAW_SFI_DG2: u8 = 0x02;
 const RAW_SFI_DG7: u8 = 0x07;
-const RAW_SFI_SOD: u8 = 0x1D;
 
 /// Short File Identifier (5-bit value, ISO 7816-4 section 7.2.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,12 +58,9 @@ pub const SFI_EF_DG2: Sfi = Sfi::new(RAW_SFI_DG2);
 /// EF.DG7: Displayed signature or usual mark.
 pub const SFI_EF_DG7: Sfi = Sfi::new(RAW_SFI_DG7);
 
-/// EF.SOD: Security Object for Document (tamper proof passive authentication).
-pub const SFI_EF_SOD: Sfi = Sfi::new(RAW_SFI_SOD);
-
 #[cfg(test)]
 mod tests {
-    use super::{SFI_EF_COM, SFI_EF_DG1, SFI_EF_DG2, SFI_EF_DG7, SFI_EF_SOD, Sfi};
+    use super::{SFI_EF_COM, SFI_EF_DG1, SFI_EF_DG2, SFI_EF_DG7, Sfi};
 
     const FULL_MASK_INPUT: u8 = 0xFF;
     const FULL_MASK_EXPECTED: u8 = 0x1F;
@@ -74,7 +70,6 @@ mod tests {
     const EXPECTED_P1_DG2: u8 = 0x82;
     const EXPECTED_P1_DG7: u8 = 0x87;
     const EXPECTED_P1_COM: u8 = 0x9E;
-    const EXPECTED_P1_SOD: u8 = 0x9D;
 
     #[test]
     fn sfi_masks_to_five_bits() {
@@ -88,6 +83,5 @@ mod tests {
         assert_eq!(SFI_EF_DG2.p1_for_read_binary(), EXPECTED_P1_DG2);
         assert_eq!(SFI_EF_DG7.p1_for_read_binary(), EXPECTED_P1_DG7);
         assert_eq!(SFI_EF_COM.p1_for_read_binary(), EXPECTED_P1_COM);
-        assert_eq!(SFI_EF_SOD.p1_for_read_binary(), EXPECTED_P1_SOD);
     }
 }

@@ -21,10 +21,8 @@
 //!
 //! - Named curves (P-256, P-384, P-521, brainpoolP*) when the
 //!   caller looks them up from a constant table.
-//! - **Explicit-parameter curves** carried in the cert's SPKI,
-//!   which is what Finnish CSCA-signed eMRTD DSCs use today
-//!   (brainpoolP512r1 transmitted in `prime-field` form, not by
-//!   OID).
+//! - **Explicit-parameter curves** carried in the cert's SPKI
+//!   (`prime-field` form, not referenced by OID).
 //!
 //! Verify-only: this module never holds a private key. Builds on
 //! `crypto-bigint::BoxedUint` + `BoxedMontyForm` for
@@ -175,8 +173,7 @@ impl core::error::Error for EcdsaError {}
 /// (`SEC1_UNCOMPRESSED_TAG`), the even body length, and a
 /// non-empty body. Compressed (tag `02` / `03`) and hybrid (tag
 /// `06` / `07`) SEC1 forms are *not* a `Sec1UncompressedPoint`
-/// -- this codebase only verifies uncompressed-form keys
-/// (CSCA-published DSCs always ship uncompressed).
+/// -- this codebase only verifies uncompressed-form keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sec1UncompressedPoint {
     /// SEC1 uncompressed-form payload: `04 || X || Y`, X and Y equal-length.
@@ -1129,7 +1126,7 @@ impl Sec1UncompressedPoint {
 
 // Named-curve constant table: today this covers `secp256r1`
 // (NIST P-256) and `secp384r1` (NIST P-384) -- the curves
-// FINEID's G4E chain and most modern CSCAs use. Brainpool +
+// FINEID's G4E chain uses. Brainpool +
 // P-521 named-curve SPKIs land in `named_curve_from_oid` as
 // `None`; if they're ever needed extend the table rather than
 // the verifier.

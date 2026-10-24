@@ -20,10 +20,9 @@ use crate::applet::select_emrtd_application;
 use crate::error::EmrtdError;
 use crate::inventory::DataGroupInventory;
 use crate::mrz::ParsedMrzTd1;
-use crate::passive::{EfDg1Bytes, EfDg2Bytes, EfSodBytes, PassiveAuthenticationFiles};
 use crate::portrait::{CardFaceImage, parse_card_face_image};
 use crate::reader::read_emrtd_file;
-use crate::sfi::{SFI_EF_COM, SFI_EF_DG1, SFI_EF_DG2, SFI_EF_SOD};
+use crate::sfi::{SFI_EF_COM, SFI_EF_DG1, SFI_EF_DG2};
 
 /// High-level operations for reading ICAO 9303 eMRTD applications.
 pub trait EmrtdOps: CardTransport {
@@ -66,71 +65,25 @@ pub trait EmrtdOps: CardTransport {
         Ok(ParsedMrzTd1::parse(&bytes))
     }
 
-    /// Reads the three raw files passive authentication consumes --
-    /// EF.DG1, EF.DG2, and EF.SOD -- inside one selected eMRTD
-    /// application session, as boundary inputs for
-    /// [`crate::passive::authenticate_document`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EmrtdError`] if any file read fails.
-    fn read_passive_authentication_files(
-        &mut self,
-    ) -> Result<PassiveAuthenticationFiles, EmrtdError<Self::Error>> {
-        let mrz = EfDg1Bytes::new(read_emrtd_file(self, SFI_EF_DG1)?);
-        let face = EfDg2Bytes::new(read_emrtd_file(self, SFI_EF_DG2)?);
-        let security_object = EfSodBytes::new(read_emrtd_file(self, SFI_EF_SOD)?);
-        Ok(PassiveAuthenticationFiles {
-            mrz,
-            face,
-            security_object,
-        })
-    }
-
     /// Selects the eMRTD application, reads the identification and biometric files
-    /// (EF.DG1 and EF.DG2), performs passive authentication against CSCA trust anchors
-    /// if provided (using EF.SOD), and returns an [`EmrtdCardProfile`].
+    /// (EF.DG1 and EF.DG2), and returns an [`EmrtdCardProfile`]. A file that fails
+    /// to read or parse leaves its field `None`.
     ///
     /// # Errors
     ///
     /// Returns [`EmrtdError`] if the transport fails or application selection is refused.
-    fn read_card_emrtd_profile(
-        &mut self,
-        anchors: Option<&crate::passive::CscaAnchors>,
-    ) -> Result<EmrtdCardProfile, EmrtdError<Self::Error>> {
+    fn read_card_emrtd_profile(&mut self) -> Result<EmrtdCardProfile, EmrtdError<Self::Error>> {
         self.select_emrtd_application()?;
-
-        let mut profile = EmrtdCardProfile {
-            document_number: None,
-            face_image: None,
-            passive_authentication_passed: None,
-        };
-
-        if let Ok(files) = self.read_passive_authentication_files() {
-            let mrz = ParsedMrzTd1::parse(files.mrz.as_bytes());
-            profile.document_number = mrz.map(|parsed| parsed.document_number);
-
-            if let Some(anchors) = anchors {
-                let verdict = crate::passive::authenticate_document(
-                    &files.security_object,
-                    &files.mrz,
-                    &files.face,
-                    anchors,
-                );
-                profile.passive_authentication_passed = Some(verdict.is_ok());
-            }
-
-            profile.face_image = parse_card_face_image(files.face.as_bytes());
-        } else {
-            if let Ok(Some(mrz)) = self.read_mrz_td1() {
-                profile.document_number = Some(mrz.document_number);
-            }
-            if let Ok(Some(face)) = self.read_face_image() {
-                profile.face_image = Some(face);
-            }
-        }
-
-        Ok(profile)
+        let document_number = self
+            .read_mrz_td1()
+            .ok()
+            .flatten()
+            .map(|mrz| mrz.document_number);
+        let face_image = self.read_face_image().ok().flatten();
+        Ok(EmrtdCardProfile {
+            document_number,
+            face_image,
+        })
     }
 }
 
@@ -141,10 +94,6 @@ pub struct EmrtdCardProfile {
     pub document_number: Option<String>,
     /// Parsed cardholder facial image from EF.DG2.
     pub face_image: Option<CardFaceImage>,
-    /// Passive authentication verdict against installed CSCA anchors:
-    /// `Some(true)` if verified, `Some(false)` if signature/digest mismatch,
-    /// `None` if anchors were not provided or SOD was not evaluated.
-    pub passive_authentication_passed: Option<bool>,
 }
 
 impl<T: CardTransport + ?Sized> EmrtdOps for T {}

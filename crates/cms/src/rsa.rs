@@ -148,8 +148,7 @@ impl core::error::Error for RsaModulusError {}
 
 impl RsaModulus {
     /// Minimum modulus size accepted. The keys this type admits
-    /// are the FINEID issuing CAs and Finnish CSCA generations (RSA
-    /// 4096 or elliptic-curve), eMRTD Document Signer keys, and the
+    /// are the FINEID issuing CAs (RSA 4096 or elliptic-curve) and the
     /// card's own authentication key as the PKCS#11 module reads it
     /// (RSA 3072 on FINEID S4-1 v3.1, secp384r1 on v4.0). 512-bit
     /// RSA has been factored publicly since 1999 and 1024-bit is
@@ -157,8 +156,7 @@ impl RsaModulus {
     pub const MIN_BITS: usize = 2048;
     /// Maximum modulus size accepted. 16 kbit ceiling is well
     /// past anything the ecosystem produces (current upper end
-    /// is 4096-bit RSA in the FINEID issuing CAs and the Finnish
-    /// CSCA).
+    /// is 4096-bit RSA in the FINEID issuing CAs).
     pub const MAX_BITS: usize = 16384;
 
     /// Build from PKCS#1 magnitude bytes (no sign byte).

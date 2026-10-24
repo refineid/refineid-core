@@ -27,16 +27,15 @@ crates stay transport-agnostic and country-profile-neutral.
   with a typed tag layer.
 - `crates/cms` (`refineid-cms`) -- strict-DER CMS `SignedData` parsing and
   offline signature verification, with the RSA and ECDSA verification
-  primitives and the X.509 certificate machinery they need. The
-  host-side trust checks for card-delivered documents; verify-only by
-  design, no key generation and no platform crypto dependency.
+  primitives and the X.509 certificate machinery they need.
+  Verify-only by design, no key generation and no platform crypto dependency.
 - `crates/digest` (`refineid-digest`) -- typed SHA-2 digest values and
   hash-algorithm identifiers with the digest lengths as named constants;
   no key material, no card I/O.
 - `crates/emrtd` (`refineid-emrtd`) -- ICAO 9303 eMRTD application file
-  reading and parsing (EF.COM inventory, TD1 MRZ, encoded face), and
-  passive authentication: EF.SOD signature, data-group hash comparison,
-  and the DSC-to-CSCA chain against verifier-supplied trust anchors.
+  reading and parsing (EF.COM inventory, TD1 MRZ, encoded face). The
+  read data is shown, not authenticated: there is no passive
+  authentication.
 - `crates/pace` (`refineid-pace`) -- Card Access Number input type, the
   PACE handshake, and secure messaging.
 - `crates/pin-cache` (`refineid-pin-cache`) -- process-lifetime negative

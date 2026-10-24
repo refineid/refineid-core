@@ -17,9 +17,3 @@ workspace = true
 [dependencies]
 refineid-apdu.workspace = true
 refineid-ber.workspace = true
-# CMS SignedData parsing and signature verification for passive
-# authentication of EF.SOD.
-refineid-cms.workspace = true
-
-[dev-dependencies]
-hex.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "refineid-cms"
-description = "Strict-DER CMS SignedData parsing and offline signature verification -- the host-side trust checks for card-delivered documents. Entities and use cases, no transport awareness, no GUI awareness."
+description = "Strict-DER X.509 and CMS SignedData parsing and offline signature verification. Entities and use cases, no transport awareness, no GUI awareness."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

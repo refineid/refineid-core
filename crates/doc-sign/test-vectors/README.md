@@ -24,3 +24,9 @@ intermediate CA certificate embedded in RFC 3161 tokens from `http://timestamp.s
 Copied here so timestamp chain verification tests can exercise the full 3-certificate chain
 (`Signer #3` -> `CA R35` -> `Sectigo Qualified Time Stamping Root R45`) offline without network access.
 
+
+## `icao-pkd-un-csca-2.pem`
+
+The self-signed *United Nations CSCA* root certificate (RSA, `sha256WithRSAEncryption`) from the ICAO PKD.
+The `verify` tests use it as a public RSA-PKCS1v15-SHA256 accept case:
+a self-signed certificate's signature verifies under its own key over its own TBS bytes, so no private key is needed.

@@ -34,6 +34,7 @@ use std::io::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use refineid_apdu::CardTransport;
 #[cfg(feature = "pin-change")]
 use refineid_auth::PinManageOps as _;
 use refineid_auth::{
@@ -1249,8 +1250,11 @@ pub(super) fn card_pin1_status(kind: &SlotKind) -> Result<PinStatus, CkRv> {
 /// Mirrors the proven FINEID chain: open the card, select the
 /// PKCS#15 application, VERIFY PIN1 in that application context (the
 /// card refuses VERIFY from MF context with `SW=6985`), then run the
-/// pre-hashed PSO chain via [`sign_with_card`]. The card is dropped
-/// before returning.
+/// pre-hashed PSO chain via [`sign_with_card`]. The whole sequence
+/// runs inside one PC/SC transaction ([`PcscCard::pin_sequence`])
+/// that ends with a card reset, so no other PC/SC client can slip a
+/// command between the VERIFY and the signature or use the verified
+/// state afterwards.
 ///
 /// PIN1 is presented for every signature: the card drops its PIN1
 /// verification after each signature with the authentication key
@@ -1289,56 +1293,59 @@ pub(super) fn card_sign(
     // the card is open.
     let lane = card_lane(reader)?;
     let _turn = lane.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?;
-    let mut card = backend
+    let card = backend
         .open_session(reader, ReaderAccessCap::PinSequence)
         .map_err(|_open_err| CKR_DEVICE_ERROR)?;
-    card.select_pkcs15_application()
-        .map_err(|_select_err| CKR_DEVICE_ERROR)?;
-    let serial = match live_token_serial(&mut card) {
-        Ok(serial) => serial,
-        Err(error) => {
+    card.pin_sequence(|mut card| -> Result<Vec<u8>, CkRv> {
+        card.select_pkcs15_application()
+            .map_err(|_select_err| CKR_DEVICE_ERROR)?;
+        let serial = match live_token_serial(&mut card) {
+            Ok(serial) => serial,
+            Err(error) => {
+                clear_positive(pin_cache);
+                return Err(error);
+            }
+        };
+        let pin1_status = match card.pin_status(PinSlot::Pin1) {
+            Ok(status) => status,
+            Err(_status_err) => {
+                clear_positive(pin_cache);
+                return Err(CKR_DEVICE_ERROR);
+            }
+        };
+        if let Err(error) = pin1_verify_guard(pin1_status) {
             clear_positive(pin_cache);
             return Err(error);
         }
-    };
-    let pin1_status = match card.pin_status(PinSlot::Pin1) {
-        Ok(status) => status,
-        Err(_status_err) => {
-            clear_positive(pin_cache);
+        let checkout = pin_cache
+            .lock()
+            .map_err(|_poisoned| CKR_DEVICE_ERROR)?
+            .checkout_pin1(&serial, pin1_status)
+            .ok_or(CKR_USER_NOT_LOGGED_IN)?;
+        let secret =
+            refineid_auth::UnvalidatedSecret::from_owned_bytes(checkout.pin().as_bytes().to_vec());
+        let Ok(pin1) = refineid_auth::Pin1::reconstruct(secret) else {
             return Err(CKR_DEVICE_ERROR);
-        }
-    };
-    if let Err(error) = pin1_verify_guard(pin1_status) {
-        clear_positive(pin_cache);
-        return Err(error);
-    }
-    let checkout = pin_cache
-        .lock()
-        .map_err(|_poisoned| CKR_DEVICE_ERROR)?
-        .checkout_pin1(&serial, pin1_status)
-        .ok_or(CKR_USER_NOT_LOGGED_IN)?;
-    let secret =
-        refineid_auth::UnvalidatedSecret::from_owned_bytes(checkout.pin().as_bytes().to_vec());
-    let Ok(pin1) = refineid_auth::Pin1::reconstruct(secret) else {
-        return Err(CKR_DEVICE_ERROR);
-    };
-    let answer = card.verify_pin1(pin1);
-    let accepted = checkout.settle_verify(
-        &mut *pin_cache.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?,
-        &answer,
-    );
-    let accepted = match (answer, accepted) {
-        (Ok(VerifyOutcome::Ok), Some(accepted)) => accepted,
-        (Ok(VerifyOutcome::WrongPin { .. }), _) => return Err(CKR_PIN_INCORRECT),
-        (Ok(VerifyOutcome::Locked), _) => return Err(CKR_PIN_LOCKED),
-        _ => return Err(CKR_DEVICE_ERROR),
-    };
-    let signed = sign_with_card(&mut card, request);
-    accepted.settle_operation(
-        &mut *pin_cache.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?,
-        signed.as_ref().err(),
-    );
-    signed.map_err(|_card_err| CKR_DEVICE_ERROR)
+        };
+        let answer = card.verify_pin1(pin1);
+        let accepted = checkout.settle_verify(
+            &mut *pin_cache.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?,
+            &answer,
+        );
+        let accepted = match (answer, accepted) {
+            (Ok(VerifyOutcome::Ok), Some(accepted)) => accepted,
+            (Ok(VerifyOutcome::WrongPin { .. }), _) => return Err(CKR_PIN_INCORRECT),
+            (Ok(VerifyOutcome::Locked), _) => return Err(CKR_PIN_LOCKED),
+            _ => return Err(CKR_DEVICE_ERROR),
+        };
+        let signed = sign_with_card(&mut card, request);
+        accepted.settle_operation(
+            &mut *pin_cache.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?,
+            signed.as_ref().err(),
+        );
+        signed.map_err(|_card_err| CKR_DEVICE_ERROR)
+    })
+    .map_err(|_transaction_err| CKR_DEVICE_ERROR)?
 }
 
 /// The card lane of each local reader this process has signed or
@@ -1503,6 +1510,11 @@ pub(super) fn remote_token_objects(
 /// card accepts it: held when the retry counter read before the VERIFY
 /// was pristine ([`PinSafetyCache::store_pin1`]), otherwise staged for
 /// the one operation that follows ([`PinSafetyCache::stage_pin1_once`]).
+///
+/// The VERIFY runs inside one PC/SC transaction that ends with a card
+/// reset ([`PcscCard::pin_sequence`]): the login proves the PIN to this
+/// module and leaves no verified state on the card for another PC/SC
+/// client to use. Each signature presents PIN1 again.
 #[expect(
     clippy::redundant_pub_crate,
     reason = "private root module helper is used by sibling api module; plain pub would violate the public-surface typing grep"
@@ -1528,57 +1540,60 @@ pub(super) fn card_login(
     // non-card happens while the card is open.
     let lane = card_lane(reader)?;
     let _turn = lane.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?;
-    let mut card = backend
+    let card = backend
         .open_session(reader, ReaderAccessCap::PinSequence)
         .map_err(|_open_err| CKR_DEVICE_ERROR)?;
-    card.select_pkcs15_application()
-        .map_err(|_select_err| CKR_DEVICE_ERROR)?;
-    let serial = match live_token_serial(&mut card) {
-        Ok(serial) => serial,
-        Err(error) => {
+    card.pin_sequence(|mut card| -> Result<(), CkRv> {
+        card.select_pkcs15_application()
+            .map_err(|_select_err| CKR_DEVICE_ERROR)?;
+        let serial = match live_token_serial(&mut card) {
+            Ok(serial) => serial,
+            Err(error) => {
+                clear_positive(pin_cache);
+                return Err(error);
+            }
+        };
+        let pin1_status = match card.pin_status(PinSlot::Pin1) {
+            Ok(status) => status,
+            Err(_status_err) => {
+                clear_positive(pin_cache);
+                return Err(CKR_DEVICE_ERROR);
+            }
+        };
+        if let Err(error) = pin1_verify_guard(pin1_status) {
             clear_positive(pin_cache);
             return Err(error);
         }
-    };
-    let pin1_status = match card.pin_status(PinSlot::Pin1) {
-        Ok(status) => status,
-        Err(_status_err) => {
-            clear_positive(pin_cache);
-            return Err(CKR_DEVICE_ERROR);
+        let mut cache = pin_cache.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?;
+        if cache.is_rejected(&serial, &pin1) {
+            return Err(CKR_PIN_INCORRECT);
         }
-    };
-    if let Err(error) = pin1_verify_guard(pin1_status) {
-        clear_positive(pin_cache);
-        return Err(error);
-    }
-    let mut cache = pin_cache.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?;
-    if cache.is_rejected(&serial, &pin1) {
-        return Err(CKR_PIN_INCORRECT);
-    }
-    let secret = refineid_auth::UnvalidatedSecret::from_owned_bytes(pin1.as_bytes().to_vec());
-    let Ok(pin1_val) = refineid_auth::Pin1::reconstruct(secret) else {
-        return Err(CKR_PIN_INCORRECT);
-    };
-    match card
-        .verify_pin1(pin1_val)
-        .map_err(|_verify_err| CKR_DEVICE_ERROR)?
-    {
-        VerifyOutcome::Ok => {
-            let stored = if pin1_status_permits_reusable_cache(pin1_status) {
-                cache.store_pin1(serial, pin1)
-            } else {
-                cache.stage_pin1_once(serial, pin1)
-            };
-            stored.map_err(|_rejected| CKR_PIN_INCORRECT)
+        let secret = refineid_auth::UnvalidatedSecret::from_owned_bytes(pin1.as_bytes().to_vec());
+        let Ok(pin1_val) = refineid_auth::Pin1::reconstruct(secret) else {
+            return Err(CKR_PIN_INCORRECT);
+        };
+        match card
+            .verify_pin1(pin1_val)
+            .map_err(|_verify_err| CKR_DEVICE_ERROR)?
+        {
+            VerifyOutcome::Ok => {
+                let stored = if pin1_status_permits_reusable_cache(pin1_status) {
+                    cache.store_pin1(serial, pin1)
+                } else {
+                    cache.stage_pin1_once(serial, pin1)
+                };
+                stored.map_err(|_rejected| CKR_PIN_INCORRECT)
+            }
+            VerifyOutcome::WrongPin { .. } => {
+                cache.record_rejected(&serial, &pin1);
+                drop(cache);
+                Err(CKR_PIN_INCORRECT)
+            }
+            VerifyOutcome::Locked => Err(CKR_PIN_LOCKED),
+            VerifyOutcome::Other(_sw) => Err(CKR_DEVICE_ERROR),
         }
-        VerifyOutcome::WrongPin { .. } => {
-            cache.record_rejected(&serial, &pin1);
-            drop(cache);
-            Err(CKR_PIN_INCORRECT)
-        }
-        VerifyOutcome::Locked => Err(CKR_PIN_LOCKED),
-        VerifyOutcome::Other(_sw) => Err(CKR_DEVICE_ERROR),
-    }
+    })
+    .map_err(|_transaction_err| CKR_DEVICE_ERROR)?
 }
 
 /// Refuse every PIN-bearing APDU once fewer than three attempts remain.
@@ -1599,7 +1614,7 @@ const fn pin1_verify_guard(status: PinStatus) -> Result<(), CkRv> {
     }
 }
 
-fn live_token_serial(card: &mut PcscCard) -> Result<TokenSerial, CkRv> {
+fn live_token_serial<T: CardTransport>(card: &mut T) -> Result<TokenSerial, CkRv> {
     card.read_token_info()
         .map_err(|_read_err| CKR_DEVICE_ERROR)?
         .serial_number_hex()
@@ -1648,38 +1663,42 @@ pub(super) fn card_change_pin1(
     new_pin1: PinBytes,
 ) -> Result<(), CkRv> {
     let backend = PcscBackend;
-    // PinSequence: SELECT -> probe -> CHANGE REFERENCE DATA is one
-    // held transaction; both PINs arrived with the call.
-    let mut card = backend
+    // SELECT -> probe -> CHANGE REFERENCE DATA is one held
+    // transaction, ended with a card reset; both PINs arrived with
+    // the call.
+    let card = backend
         .open_session(reader, ReaderAccessCap::PinSequence)
         .map_err(|_open_err| CKR_DEVICE_ERROR)?;
-    card.select_pkcs15_application()
-        .map_err(|_select_err| CKR_DEVICE_ERROR)?;
-    // The empty-body VERIFY probe consumes no retry. Apply the same
-    // consumer floor as login and signing before CHANGE REFERENCE DATA.
-    let status = card
-        .pin_status(PinSlot::Pin1)
-        .map_err(|_probe_err| CKR_DEVICE_ERROR)?;
-    pin1_verify_guard(status)?;
-    let curr_secret =
-        refineid_auth::UnvalidatedSecret::from_owned_bytes(current_pin1.as_bytes().to_vec());
-    let Ok(curr_pin) = refineid_auth::Pin1::reconstruct(curr_secret) else {
-        return Err(CKR_PIN_INCORRECT);
-    };
-    let new_secret =
-        refineid_auth::UnvalidatedSecret::from_owned_bytes(new_pin1.as_bytes().to_vec());
-    let Ok(new_pin) = refineid_auth::Pin1::reconstruct(new_secret) else {
-        return Err(CKR_PIN_LEN_RANGE);
-    };
-    let outcome = card
-        .change_pin1(curr_pin, new_pin)
-        .map_err(|_change_err| CKR_DEVICE_ERROR)?;
-    match outcome {
-        refineid_auth::ManageOutcome::Ok => Ok(()),
-        refineid_auth::ManageOutcome::WrongCredential { .. } => Err(CKR_PIN_INCORRECT),
-        refineid_auth::ManageOutcome::Locked => Err(CKR_PIN_LOCKED),
-        refineid_auth::ManageOutcome::Other(_sw) => Err(CKR_DEVICE_ERROR),
-    }
+    card.pin_sequence(|mut card| -> Result<(), CkRv> {
+        card.select_pkcs15_application()
+            .map_err(|_select_err| CKR_DEVICE_ERROR)?;
+        // The empty-body VERIFY probe consumes no retry. Apply the same
+        // consumer floor as login and signing before CHANGE REFERENCE DATA.
+        let status = card
+            .pin_status(PinSlot::Pin1)
+            .map_err(|_probe_err| CKR_DEVICE_ERROR)?;
+        pin1_verify_guard(status)?;
+        let curr_secret =
+            refineid_auth::UnvalidatedSecret::from_owned_bytes(current_pin1.as_bytes().to_vec());
+        let Ok(curr_pin) = refineid_auth::Pin1::reconstruct(curr_secret) else {
+            return Err(CKR_PIN_INCORRECT);
+        };
+        let new_secret =
+            refineid_auth::UnvalidatedSecret::from_owned_bytes(new_pin1.as_bytes().to_vec());
+        let Ok(new_pin) = refineid_auth::Pin1::reconstruct(new_secret) else {
+            return Err(CKR_PIN_LEN_RANGE);
+        };
+        let outcome = card
+            .change_pin1(curr_pin, new_pin)
+            .map_err(|_change_err| CKR_DEVICE_ERROR)?;
+        match outcome {
+            refineid_auth::ManageOutcome::Ok => Ok(()),
+            refineid_auth::ManageOutcome::WrongCredential { .. } => Err(CKR_PIN_INCORRECT),
+            refineid_auth::ManageOutcome::Locked => Err(CKR_PIN_LOCKED),
+            refineid_auth::ManageOutcome::Other(_sw) => Err(CKR_DEVICE_ERROR),
+        }
+    })
+    .map_err(|_transaction_err| CKR_DEVICE_ERROR)?
 }
 
 #[cfg(test)]

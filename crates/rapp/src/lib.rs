@@ -41,7 +41,6 @@ mod pairing;
 mod pairing_attempts;
 mod pairing_candidates;
 mod pairing_flow;
-mod policy;
 mod proxy_engine;
 mod requester_engine;
 mod result;
@@ -115,10 +114,6 @@ pub use pairing_candidates::{
 pub use pairing_flow::{
     ActivePairing, PairingAttemptFailure, PairingConfirmation, PairingError, PairingHandshake,
     PairingStorage,
-};
-pub use policy::{
-    IncidentDisposition, OperationDisposition, PairDisposition, SecurityIncident,
-    SessionDisposition,
 };
 pub use proxy_engine::{
     ProxyDispatch, ProxyEngineError, ProxyOperationEngine, ProxySessionCloseAction, ProxyViolation,

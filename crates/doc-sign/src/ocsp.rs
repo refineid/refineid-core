@@ -1027,7 +1027,8 @@ impl<'a> BasicOcspResponse<'a> {
             X509Error::UnexpectedStructure("OCSP signatureAlgorithm OID malformed"),
         ))?;
 
-        // signature BIT STRING -- strip the leading unused-bits byte.
+        // signature BIT STRING -- whole octets behind a zero
+        // unused-bits byte.
         let sig_bits = AnyRef::from_der(
             reader
                 .tlv_bytes()
@@ -1039,12 +1040,8 @@ impl<'a> BasicOcspResponse<'a> {
                 "OCSP signature not BIT STRING",
             ));
         }
-        let signature_bits = sig_bits
-            .value()
-            .get(1..)
-            .ok_or(X509Error::UnexpectedStructure(
-                "OCSP signature BIT STRING empty",
-            ))?;
+        let signature_bits =
+            crate::crl::signature_octets(sig_bits.value(), "OCSP signature BIT STRING")?;
 
         // Optional [0] EXPLICIT certs SEQUENCE OF Certificate.
         let mut embedded_cert_ders: Vec<&[u8]> = Vec::new();
@@ -1102,6 +1099,7 @@ mod tests {
     /// so only a fixture writes it.
     const TAG_CONTEXT_2_PRIMITIVE: u8 = 0x82;
     use crate::ber::tlv;
+    use crate::crl::SIGNATURE_BIT_STRING_UNUSED_BITS;
     use crate::identity::CertSerial;
     use spki::der::{DateTime, Reader as _};
 
@@ -1151,9 +1149,15 @@ mod tests {
     /// The signature is never checked here -- `parse` reads bytes and
     /// `verify` is a separate door -- so it is three filler octets.
     fn wrap_response(response_data: Vec<u8>) -> Vec<u8> {
+        wrap_response_with_unused_bits(response_data, SIGNATURE_BIT_STRING_UNUSED_BITS)
+    }
+
+    /// [`wrap_response`] with the signature BIT STRING declaring
+    /// `unused_bits` unused bits.
+    fn wrap_response_with_unused_bits(response_data: Vec<u8>, unused_bits: u8) -> Vec<u8> {
         let mut basic = tlv(TAG_SEQUENCE, &response_data);
         basic.extend_from_slice(&tlv(TAG_SEQUENCE, &tlv(TAG_OID, OID_SHA1.as_bytes())));
-        basic.extend_from_slice(&tlv(TAG_BIT_STRING, &[0x00, b's', b'i', b'g']));
+        basic.extend_from_slice(&tlv(TAG_BIT_STRING, &[unused_bits, b's', b'i', b'g']));
         let basic = tlv(TAG_SEQUENCE, &basic);
 
         let mut response_bytes = tlv(TAG_OID, ObjectIdentifier::new_unwrap(OID_BASIC).as_bytes());
@@ -1282,6 +1286,21 @@ mod tests {
             !request.as_der().windows(needle.len()).any(|w| w == needle),
             "a request built without a nonce named the nonce extension"
         );
+    }
+
+    #[test]
+    fn nonzero_unused_bits_is_refused() {
+        let single = single_response_der(&fixture_serial(1), &tlv(TAG_CONTEXT_0_PRIMITIVE, &[]));
+        let whole = wrap_response(response_data(&single, None));
+        super::OcspResponse::parse(&whole).expect("whole octets parse");
+        let partial = wrap_response_with_unused_bits(
+            response_data(&single, None),
+            SIGNATURE_BIT_STRING_UNUSED_BITS + 1,
+        );
+        assert!(matches!(
+            super::OcspResponse::parse(&partial),
+            Err(super::X509Error::UnexpectedStructure(_))
+        ));
     }
 
     #[test]

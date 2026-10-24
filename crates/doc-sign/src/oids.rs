@@ -56,3 +56,18 @@ pub const KP_OCSP_SIGNING: Oid<'static> =
 /// Extended-key-usage purpose `id-kp-timeStamping` (`1.3.6.1.5.5.7.3.8`).
 pub const KP_TIME_STAMPING: Oid<'static> =
     Oid::const_new(::const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.8").as_bytes());
+/// CRL extension `id-ce-cRLNumber` (`2.5.29.20`, RFC 5280 sec.5.2.3).
+pub const CRL_NUMBER: Oid<'static> =
+    Oid::const_new(::const_oid::ObjectIdentifier::new_unwrap("2.5.29.20").as_bytes());
+/// CRL extension `id-ce-deltaCRLIndicator` (`2.5.29.27`, RFC 5280 sec.5.2.4).
+pub const DELTA_CRL_INDICATOR: Oid<'static> =
+    Oid::const_new(::const_oid::ObjectIdentifier::new_unwrap("2.5.29.27").as_bytes());
+/// CRL extension `id-ce-issuingDistributionPoint` (`2.5.29.28`, RFC 5280 sec.5.2.5).
+pub const ISSUING_DISTRIBUTION_POINT: Oid<'static> =
+    Oid::const_new(::const_oid::ObjectIdentifier::new_unwrap("2.5.29.28").as_bytes());
+/// X.509 Authority Key Identifier (`2.5.29.35`, RFC 5280 sec.4.2.1.1 and sec.5.2.1).
+pub const AUTHORITY_KEY_IDENTIFIER: Oid<'static> =
+    Oid::const_new(::const_oid::ObjectIdentifier::new_unwrap("2.5.29.35").as_bytes());
+/// CRL extension `id-ce-freshestCRL` (`2.5.29.46`, RFC 5280 sec.5.2.6).
+pub const FRESHEST_CRL: Oid<'static> =
+    Oid::const_new(::const_oid::ObjectIdentifier::new_unwrap("2.5.29.46").as_bytes());

@@ -17,16 +17,22 @@
 //!
 //! Given the DER bytes of an RFC 5280 `CertificateList`, exposes
 //! the issuer DN, `thisUpdate`, optional `nextUpdate`, and a
-//! `Crl::find_serial` lookup that lazily walks the revoked-cert
-//! list. The parser does **not** verify the CRL's signature --
-//! that ties to the issuer trust store and lives a layer up.
+//! `Crl::find_serial` lookup over the revoked-cert list. The parser
+//! does **not** verify the CRL's signature -- that ties to the issuer
+//! trust store and lives a layer up.
+//!
+//! A [`Crl`] exists only for a *complete* list: one whose absence of a
+//! serial means "not revoked by this issuer". The parser refuses a
+//! delta CRL (RFC 5280 sec.5.2.4), a CRL scoped by an issuing
+//! distribution point (sec.5.2.5), any critical CRL or entry extension
+//! this reader does not process (sec.5.2, sec.5.3), and a revoked list
+//! with an entry that does not decode.
 //!
 //! Per-entry extensions: the `reasonCode` extension (OID
 //! `2.5.29.21`) is parsed and surfaced as
-//! [`RevokedEntry::reason`]. Other per-entry extensions (invalidity
-//! date, certificate issuer for indirect CRLs) and CRL-level
-//! extensions are not interpreted yet -- they land when a use
-//! case needs them.
+//! [`RevokedEntry::reason`]. Non-critical extensions at either level
+//! say nothing about which certificates the list covers and are
+//! passed over.
 //!
 //! Decoded with the `der` / `x509-cert` `RustCrypto` stack and reuses
 //! the time parser from [`crate::x509`]. The module ships in full;
@@ -38,7 +44,84 @@ use refineid_cms::x509::{DateTime, X509Error};
 use spki::der::asn1::{AnyRef, ObjectIdentifier};
 use spki::der::{Decode as _, Reader as _, SliceReader, Tag, TagNumber, Tagged as _};
 use x509_cert::crl::RevokedCert;
-use x509_cert::ext::Extension;
+use x509_cert::ext::{Extension, Extensions};
+
+/// The unused-bits octet a DER signature BIT STRING carries: a
+/// signature is whole octets, so none of its bits are unused
+/// (X.690 sec.8.6.2.2).
+pub(crate) const SIGNATURE_BIT_STRING_UNUSED_BITS: u8 = 0;
+
+/// The signature octets of a signature BIT STRING's value: its
+/// unused-bits octet must be [`SIGNATURE_BIT_STRING_UNUSED_BITS`] and
+/// at least one octet must follow. `what` names the field in the error.
+pub(crate) fn signature_octets<'a>(
+    bit_string_value: &'a [u8],
+    what: &'static str,
+) -> Result<&'a [u8], X509Error> {
+    match bit_string_value {
+        [SIGNATURE_BIT_STRING_UNUSED_BITS, octets @ ..] if !octets.is_empty() => Ok(octets),
+        _ => Err(X509Error::UnexpectedStructure(what)),
+    }
+}
+
+/// CRL extensions whose presence leaves the list complete, so a
+/// reader that passes over them processes them correctly even when
+/// an issuer marks them critical: `cRLNumber` (RFC 5280 sec.5.2.3),
+/// `authorityKeyIdentifier` (sec.5.2.1) and `freshestCRL`
+/// (sec.5.2.6), which points at deltas this reader does not fetch.
+const LIST_PRESERVING_EXTENSIONS: [Oid<'static>; 3] = [
+    crate::oids::CRL_NUMBER,
+    crate::oids::AUTHORITY_KEY_IDENTIFIER,
+    crate::oids::FRESHEST_CRL,
+];
+
+/// Why bytes are not a complete CRL this reader can answer from.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrlError {
+    /// The DER does not have the `CertificateList` shape (RFC 5280
+    /// sec.5.1), or a field inside it does not decode.
+    Malformed(X509Error),
+    /// The CRL carries `deltaCRLIndicator` (RFC 5280 sec.5.2.4): it
+    /// lists only changes since a base CRL.
+    Delta,
+    /// The CRL carries `issuingDistributionPoint` (RFC 5280
+    /// sec.5.2.5): it covers only one partition of the issuer's
+    /// certificates, which no caller here names.
+    Scoped,
+    /// A critical CRL extension this reader does not process (RFC
+    /// 5280 sec.5.2: such a CRL MUST NOT be used).
+    UnsupportedCriticalExtension,
+    /// A critical CRL entry extension this reader does not process
+    /// (RFC 5280 sec.5.3: such a CRL MUST NOT be used).
+    UnsupportedCriticalEntryExtension,
+}
+
+impl From<X509Error> for CrlError {
+    #[inline]
+    fn from(error: X509Error) -> Self {
+        Self::Malformed(error)
+    }
+}
+
+impl core::fmt::Display for CrlError {
+    #[inline]
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Self::Malformed(ref error) => write!(f, "{error}"),
+            Self::Delta => f.write_str("a delta CRL is not a complete list"),
+            Self::Scoped => {
+                f.write_str("a CRL scoped by an issuing distribution point is not a complete list")
+            }
+            Self::UnsupportedCriticalExtension => f.write_str("unsupported critical CRL extension"),
+            Self::UnsupportedCriticalEntryExtension => {
+                f.write_str("unsupported critical CRL entry extension")
+            }
+        }
+    }
+}
+
+impl core::error::Error for CrlError {}
 
 /// `id-ce-cRLReasons` (RFC 5280 sec.5.3.1) -- the per-entry
 /// `reasonCode` extension OID.
@@ -134,8 +217,13 @@ impl core::fmt::Display for CrlReason {
     }
 }
 
-/// X.509 v2 CRL, parsed enough to check whether a given cert
-/// serial is on the revocation list.
+/// A complete X.509 v2 CRL, parsed enough to check whether a given
+/// cert serial is on the revocation list.
+///
+/// Trust by construction: `Crl::parse` is the only constructor and
+/// it refuses every CRL that is not a complete list for its issuer
+/// (see the module documentation), so a serial absent from a `Crl`
+/// is not revoked by that issuer as of `this_update`.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 #[expect(
@@ -161,13 +249,14 @@ pub struct Crl<'a> {
     /// CRLs without the optional field.
     pub next_update: Option<DateTime>,
     /// Value bytes of the `revokedCertificates` SEQUENCE -- a
-    /// sequence of `RevokedCertificate` SEQUENCEs. `None` if
-    /// the CRL declares no revoked entries (the field is OPTIONAL).
+    /// sequence of `RevokedCertificate` SEQUENCEs, every one of which
+    /// decoded at parse. `None` if the CRL declares no revoked
+    /// entries (the field is OPTIONAL).
     revoked_seq_value: Option<&'a [u8]>,
     /// Signature algorithm OID body (the value of the `06 LL`
     /// TLV inside the outer `signatureAlgorithm`).
     pub signature_alg_oid: Oid<'a>,
-    /// Outer signature BIT STRING value with the unused-bits
+    /// Outer signature BIT STRING value with its zero unused-bits
     /// leading byte stripped.
     pub signature_bits: &'a [u8],
 }
@@ -281,9 +370,9 @@ impl OwnedCrl {
     /// the input borrow.
     ///
     /// # Errors
-    /// [`X509Error`] from the CRL parser.
+    /// [`CrlError`] from the CRL parser.
     #[inline]
-    pub fn from_der(der: &[u8]) -> Result<Self, X509Error> {
+    pub fn from_der(der: &[u8]) -> Result<Self, CrlError> {
         let bytes = der.to_vec();
         Crl::parse(&bytes)?;
         Ok(Self { der: bytes })
@@ -335,17 +424,18 @@ impl<'a> Crl<'a> {
     /// Parse a `CertificateList` DER blob.
     ///
     /// # Errors
-    /// Any der decode failure, or a top-level shape that doesn't look
-    /// like `CertificateList ::= SEQUENCE { TBSCertList,
-    /// AlgorithmIdentifier, BIT STRING }`.
+    /// [`CrlError::Malformed`] for any der decode failure, or a shape
+    /// that doesn't look like `CertificateList ::= SEQUENCE {
+    /// TBSCertList, AlgorithmIdentifier, BIT STRING }`; the other
+    /// [`CrlError`] variants for a CRL that is not a complete list.
     #[inline]
-    pub(crate) fn parse(der: &'a [u8]) -> Result<Self, X509Error> {
+    pub(crate) fn parse(der: &'a [u8]) -> Result<Self, CrlError> {
         // CertificateList ::= SEQUENCE { tbsCertList, signatureAlgorithm,
         //                                signatureValue BIT STRING }
         let outer = AnyRef::from_der(der)
             .map_err(|_ignored| X509Error::UnexpectedStructure("CRL not a TLV"))?;
         if outer.tag() != Tag::Sequence {
-            return Err(X509Error::UnexpectedStructure("CRL not SEQUENCE"));
+            return Err(X509Error::UnexpectedStructure("CRL not SEQUENCE").into());
         }
         let mut reader = SliceReader::new(outer.value())
             .map_err(|_ignored| X509Error::UnexpectedStructure("CRL body"))?;
@@ -371,13 +461,14 @@ impl<'a> Crl<'a> {
             })?)
             .map_err(|_ignored| X509Error::UnexpectedStructure("CRL signatureAlgorithm OID"))?;
         if alg_oid.tag() != Tag::ObjectIdentifier {
-            return Err(X509Error::UnexpectedStructure("CRL signatureAlgorithm OID"));
+            return Err(X509Error::UnexpectedStructure("CRL signatureAlgorithm OID").into());
         }
         let signature_alg_oid = Oid::new(alg_oid.value()).or(Err(
             X509Error::UnexpectedStructure("CRL signatureAlgorithm OID malformed"),
         ))?;
 
-        // signatureValue BIT STRING -- strip the leading unused-bits byte.
+        // signatureValue BIT STRING -- whole octets behind a zero
+        // unused-bits byte.
         let sig_bits = AnyRef::from_der(
             reader
                 .tlv_bytes()
@@ -385,16 +476,9 @@ impl<'a> Crl<'a> {
         )
         .map_err(|_ignored| X509Error::UnexpectedStructure("CRL signature"))?;
         if sig_bits.tag() != Tag::BitString {
-            return Err(X509Error::UnexpectedStructure(
-                "CRL signature not BIT STRING",
-            ));
+            return Err(X509Error::UnexpectedStructure("CRL signature not BIT STRING").into());
         }
-        let signature_bits = sig_bits
-            .value()
-            .get(1..)
-            .ok_or(X509Error::UnexpectedStructure(
-                "CRL signature BIT STRING empty",
-            ))?;
+        let signature_bits = signature_octets(sig_bits.value(), "CRL signature BIT STRING")?;
 
         parse_tbs_cert_list(tbs_der, der, signature_alg_oid, signature_bits)
     }
@@ -417,7 +501,7 @@ fn parse_tbs_cert_list<'a>(
     raw: &'a [u8],
     signature_alg_oid: Oid<'a>,
     signature_bits: &'a [u8],
-) -> Result<Crl<'a>, X509Error> {
+) -> Result<Crl<'a>, CrlError> {
     // TBSCertList ::= SEQUENCE {
     //     version                 INTEGER OPTIONAL,
     //     signature               AlgorithmIdentifier,
@@ -437,7 +521,7 @@ fn parse_tbs_cert_list<'a>(
     let tbs = AnyRef::from_der(tbs_der)
         .map_err(|_ignored| X509Error::UnexpectedStructure("tbsCertList not a TLV"))?;
     if tbs.tag() != Tag::Sequence {
-        return Err(X509Error::UnexpectedStructure("tbsCertList not SEQUENCE"));
+        return Err(X509Error::UnexpectedStructure("tbsCertList not SEQUENCE").into());
     }
     let mut reader = SliceReader::new(tbs.value())
         .map_err(|_ignored| X509Error::UnexpectedStructure("tbsCertList body"))?;
@@ -474,9 +558,11 @@ fn parse_tbs_cert_list<'a>(
     .to_date_time();
 
     // Optional nextUpdate (Time) / revokedCertificates (SEQUENCE) /
-    // crlExtensions ([0] EXPLICIT).
+    // crlExtensions ([0] EXPLICIT), each at most once and in this
+    // order: `seen` is how many of the three positions are behind.
     let mut next_update: Option<DateTime> = None;
     let mut revoked_seq_value: Option<&[u8]> = None;
+    let mut seen = TrailingField::Start;
     while !reader.is_finished() {
         let field_tlv = reader
             .tlv_bytes()
@@ -489,6 +575,7 @@ fn parse_tbs_cert_list<'a>(
         )]
         match any.tag() {
             Tag::UtcTime | Tag::GeneralizedTime => {
+                seen = seen.advance_to(TrailingField::NextUpdate)?;
                 next_update = Some(
                     x509_cert::time::Time::from_der(field_tlv)
                         .map_err(|_ignored| X509Error::InvalidTime)?
@@ -496,11 +583,15 @@ fn parse_tbs_cert_list<'a>(
                 );
             }
             Tag::Sequence => {
+                seen = seen.advance_to(TrailingField::RevokedCertificates)?;
+                check_revoked_entries(any.value())?;
                 revoked_seq_value = Some(any.value());
             }
-            // crlExtensions [0] EXPLICIT -- not interpreted.
-            tag if tag == CRL_EXTENSIONS_TAG => {}
-            _ => return Err(X509Error::UnexpectedStructure("unexpected CRL field")),
+            tag if tag == CRL_EXTENSIONS_TAG => {
+                seen = seen.advance_to(TrailingField::CrlExtensions)?;
+                check_crl_extensions(any.value())?;
+            }
+            _ => return Err(X509Error::UnexpectedStructure("unexpected CRL field").into()),
         }
     }
 
@@ -516,10 +607,86 @@ fn parse_tbs_cert_list<'a>(
     })
 }
 
+/// The optional trailing fields of `TBSCertList`, in their order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TrailingField {
+    /// None read yet.
+    Start,
+    /// `nextUpdate`.
+    NextUpdate,
+    /// `revokedCertificates`.
+    RevokedCertificates,
+    /// `crlExtensions`.
+    CrlExtensions,
+}
+
+impl TrailingField {
+    /// Move past `next`, which must come after every field read so far.
+    fn advance_to(self, next: Self) -> Result<Self, X509Error> {
+        if next > self {
+            Ok(next)
+        } else {
+            Err(X509Error::UnexpectedStructure(
+                "tbsCertList field repeated or out of order",
+            ))
+        }
+    }
+}
+
+/// Refuse a CRL that is not a complete list for its issuer.
+///
+/// `extensions` is the value of the `[0] EXPLICIT` wrapper: the
+/// `Extensions` SEQUENCE (RFC 5280 sec.5.1.2.7).
+fn check_crl_extensions(extensions: &[u8]) -> Result<(), CrlError> {
+    let extensions = Extensions::from_der(extensions)
+        .map_err(|_ignored| X509Error::UnexpectedStructure("crlExtensions"))?;
+    for extension in &extensions {
+        let oid = extension.extn_id.as_bytes();
+        if oid == crate::oids::DELTA_CRL_INDICATOR.as_bytes() {
+            return Err(CrlError::Delta);
+        }
+        if oid == crate::oids::ISSUING_DISTRIBUTION_POINT.as_bytes() {
+            return Err(CrlError::Scoped);
+        }
+        if extension.critical
+            && !LIST_PRESERVING_EXTENSIONS
+                .iter()
+                .any(|known| known.as_bytes() == oid)
+        {
+            return Err(CrlError::UnsupportedCriticalExtension);
+        }
+    }
+    Ok(())
+}
+
+/// Decode every `revokedCertificates` entry, refusing the CRL when one
+/// does not decode or carries a critical extension other than
+/// `reasonCode` (RFC 5280 sec.5.3). `body` is the SEQUENCE OF's value.
+fn check_revoked_entries(body: &[u8]) -> Result<(), CrlError> {
+    let mut reader = SliceReader::new(body)
+        .map_err(|_ignored| X509Error::UnexpectedStructure("revokedCertificates"))?;
+    while !reader.is_finished() {
+        let revoked = RevokedCert::<x509_cert::certificate::Rfc5280>::from_der(
+            reader
+                .tlv_bytes()
+                .map_err(|_ignored| X509Error::UnexpectedStructure("revokedCertificates entry"))?,
+        )
+        .map_err(|_ignored| X509Error::UnexpectedStructure("revokedCertificates entry"))?;
+        if revoked
+            .crl_entry_extensions
+            .iter()
+            .flatten()
+            .any(|extension| extension.critical && extension.extn_id != OID_CRL_REASONS)
+        {
+            return Err(CrlError::UnsupportedCriticalEntryExtension);
+        }
+    }
+    Ok(())
+}
+
 impl<'a> Crl<'a> {
-    /// Lazily iterate the revoked-certificate entries. A malformed
-    /// entry ends iteration (treated as end-of-list) so one corrupt
-    /// entry can't poison the rest of the lookup.
+    /// Lazily iterate the revoked-certificate entries. [`Crl::parse`]
+    /// decoded every entry, so the walk reaches the end of the list.
     #[inline]
     #[must_use]
     pub(crate) fn entries(&self) -> RevokedIter<'a> {
@@ -602,13 +769,14 @@ impl RevokedIter<'_> {
 #[cfg(test)]
 mod tests {
 
-    use super::{Crl, CrlReason, RevokedEntry, X509Error};
+    use super::{Crl, CrlError, CrlReason, RevokedEntry, X509Error};
     use crate::identity::CertSerial;
     use core::str::FromStr as _;
+    use refineid_cms::oid::Oid;
     use spki::AlgorithmIdentifierOwned;
     use spki::der::Encode as _;
     use spki::der::asn1::{Any, BitString, ObjectIdentifier, OctetString, UtcTime};
-    use spki::der::{DateTime, Tag};
+    use spki::der::{DateTime, Decode as _, Reader as _, SliceReader, Tag};
     use x509_cert::certificate::Version;
     use x509_cert::crl::{CertificateList, RevokedCert, TbsCertList};
     use x509_cert::ext::Extension;
@@ -647,6 +815,37 @@ mod tests {
     /// Build a CRL DER blob from typed fixtures via x509-cert's
     /// `CertificateList` encoder -- no hand-assembled ASN.1 bytes.
     fn build_crl(entries: &[RevokedFixture], with_next_update: bool) -> Vec<u8> {
+        build_crl_with(CrlShape {
+            entries,
+            with_next_update,
+            ..CrlShape::default()
+        })
+    }
+
+    /// What [`build_crl_with`] varies beyond the revoked rows.
+    #[derive(Default)]
+    struct CrlShape<'a> {
+        /// The revoked rows.
+        entries: &'a [RevokedFixture],
+        /// Whether `nextUpdate` is present.
+        with_next_update: bool,
+        /// `crlExtensions`, when present.
+        crl_extensions: Option<Vec<Extension>>,
+        /// Extensions every revoked row carries besides `reasonCode`.
+        entry_extensions: Vec<Extension>,
+        /// The signature BIT STRING's unused-bits count.
+        unused_bits: u8,
+    }
+
+    /// Build a CRL DER blob of `shape` via x509-cert's encoder.
+    fn build_crl_with(shape: CrlShape<'_>) -> Vec<u8> {
+        let CrlShape {
+            entries,
+            with_next_update,
+            crl_extensions,
+            entry_extensions,
+            unused_bits,
+        } = shape;
         let sig_alg = AlgorithmIdentifierOwned {
             oid: ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11"),
             parameters: None,
@@ -657,18 +856,19 @@ mod tests {
                 serial_number: SerialNumber::new(e.serial.as_bytes())
                     .expect("fixture serial encodes"),
                 revocation_date: as_utc(e.revoked_at),
-                crl_entry_extensions: e.reason.map(|r| {
-                    let enumerated = Any::new(Tag::Enumerated, vec![r.code()])
-                        .expect("reason code fits an ENUMERATED");
-                    vec![Extension {
-                        extn_id: super::OID_CRL_REASONS,
-                        critical: false,
-                        extn_value: OctetString::new(
-                            enumerated.to_der().expect("ENUMERATED encodes to DER"),
+                crl_entry_extensions: {
+                    let mut extensions = entry_extensions.clone();
+                    extensions.extend(e.reason.map(|r| {
+                        let enumerated = Any::new(Tag::Enumerated, vec![r.code()])
+                            .expect("reason code fits an ENUMERATED");
+                        extension_with(
+                            super::OID_CRL_REASONS,
+                            false,
+                            &enumerated.to_der().expect("ENUMERATED encodes to DER"),
                         )
-                        .expect("reason DER fits an OCTET STRING"),
-                    }]
-                }),
+                    }));
+                    (!extensions.is_empty()).then_some(extensions)
+                },
             })
             .collect();
         let tbs = TbsCertList {
@@ -678,12 +878,12 @@ mod tests {
             this_update: at(2026, 5, 20, 12, 0, 0),
             next_update: with_next_update.then(|| at(2026, 6, 20, 12, 0, 0)),
             revoked_certificates: (!revoked.is_empty()).then_some(revoked),
-            crl_extensions: None,
+            crl_extensions,
         };
         CertificateList {
             tbs_cert_list: tbs,
             signature_algorithm: sig_alg,
-            signature: BitString::new(0, b"sig").expect("signature bits encode"),
+            signature: BitString::new(unused_bits, b"sig").expect("signature bits encode"),
         }
         .to_der()
         .expect("fixture CRL encodes to DER")
@@ -780,7 +980,10 @@ mod tests {
             .to_der()
             .expect("INTEGER fixture encodes to DER");
         let err = Crl::parse(&bad).expect_err("non-SEQUENCE outer is rejected");
-        assert!(matches!(err, X509Error::UnexpectedStructure(_)));
+        assert!(matches!(
+            err,
+            CrlError::Malformed(X509Error::UnexpectedStructure(_))
+        ));
     }
 
     /// reasonCode = superseded (RFC 5280 sec.5.3.1) -- DVV uses this
@@ -805,5 +1008,248 @@ mod tests {
     fn crl_reason_renders_name_and_code() {
         assert_eq!(CrlReason::Superseded.to_string(), "superseded (0x04)");
         assert_eq!(CrlReason::from_code(7), None);
+    }
+
+    /// An extension whose `extnValue` wraps `value_der`.
+    fn extension_with(extn_id: ObjectIdentifier, critical: bool, value_der: &[u8]) -> Extension {
+        Extension {
+            extn_id,
+            critical,
+            extn_value: OctetString::new(value_der.to_vec()).expect("value fits an OCTET STRING"),
+        }
+    }
+
+    /// The crate's OID constant as the encoder's identifier type.
+    fn identifier(oid: Oid<'static>) -> ObjectIdentifier {
+        ObjectIdentifier::from_bytes(oid.as_bytes()).expect("crate OID constants are well formed")
+    }
+
+    /// An extension `oid` carrying an INTEGER, as `cRLNumber` and
+    /// `deltaCRLIndicator` (`BaseCRLNumber`) do.
+    fn integer_extension(oid: Oid<'static>, critical: bool) -> Extension {
+        let number: u32 = 1;
+        extension_with(
+            identifier(oid),
+            critical,
+            &number.to_der().expect("INTEGER encodes"),
+        )
+    }
+
+    /// An extension `oid` carrying an empty SEQUENCE, which is an
+    /// `IssuingDistributionPoint` with every field at its default.
+    fn sequence_extension(oid: ObjectIdentifier, critical: bool) -> Extension {
+        let empty = Any::new(Tag::Sequence, Vec::new()).expect("empty SEQUENCE builds");
+        extension_with(oid, critical, &empty.to_der().expect("SEQUENCE encodes"))
+    }
+
+    /// An extension this reader does not know: X.509's
+    /// `expiredCertsOnCRL`, which issuers publish non-critical.
+    fn unlisted_extension(critical: bool) -> Extension {
+        sequence_extension(
+            ObjectIdentifier::new_unwrap(UNLISTED_EXTENSION_OID),
+            critical,
+        )
+    }
+
+    /// `expiredCertsOnCRL` (ITU-T X.509 sec.9.6.2.9).
+    const UNLISTED_EXTENSION_OID: &str = "2.5.29.60";
+
+    /// `certificateIssuer`, the indirect-CRL entry extension (RFC
+    /// 5280 sec.5.3.3), which MUST be critical.
+    const CERTIFICATE_ISSUER_OID: &str = "2.5.29.29";
+
+    /// A CRL with one revoked row and `crl_extensions`.
+    fn crl_with_extensions(crl_extensions: Vec<Extension>) -> Vec<u8> {
+        build_crl_with(CrlShape {
+            entries: &[revoked_row()],
+            with_next_update: true,
+            crl_extensions: Some(crl_extensions),
+            ..CrlShape::default()
+        })
+    }
+
+    /// One revoked row without a reason.
+    fn revoked_row() -> RevokedFixture {
+        RevokedFixture {
+            serial: fixture_serial(6),
+            revoked_at: DateTime::new(2026, 1, 1, 0, 0, 0).expect("valid"),
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn delta_crl_is_refused() {
+        for critical in [true, false] {
+            let der = crl_with_extensions(vec![integer_extension(
+                crate::oids::DELTA_CRL_INDICATOR,
+                critical,
+            )]);
+            assert_eq!(Crl::parse(&der).err(), Some(CrlError::Delta));
+        }
+    }
+
+    #[test]
+    fn scoped_crl_is_refused() {
+        for critical in [true, false] {
+            let der = crl_with_extensions(vec![sequence_extension(
+                identifier(crate::oids::ISSUING_DISTRIBUTION_POINT),
+                critical,
+            )]);
+            assert_eq!(Crl::parse(&der).err(), Some(CrlError::Scoped));
+        }
+    }
+
+    #[test]
+    fn unknown_critical_extension_is_refused() {
+        let der = crl_with_extensions(vec![unlisted_extension(true)]);
+        assert_eq!(
+            Crl::parse(&der).err(),
+            Some(CrlError::UnsupportedCriticalExtension)
+        );
+        let der = crl_with_extensions(vec![unlisted_extension(false)]);
+        Crl::parse(&der).expect("the same extension non-critical is passed over");
+    }
+
+    #[test]
+    fn crl_number_and_aki_parse() {
+        let key_identifier =
+            OctetString::new(b"key".to_vec()).expect("key identifier fits an OCTET STRING");
+        let aki = Any::new(
+            Tag::Sequence,
+            Any::new(
+                Tag::ContextSpecific {
+                    constructed: false,
+                    number: spki::der::TagNumber(0),
+                },
+                key_identifier.as_bytes().to_vec(),
+            )
+            .expect("keyIdentifier builds")
+            .to_der()
+            .expect("keyIdentifier encodes"),
+        )
+        .expect("AuthorityKeyIdentifier builds");
+        let der = crl_with_extensions(vec![
+            extension_with(
+                identifier(crate::oids::AUTHORITY_KEY_IDENTIFIER),
+                false,
+                &aki.to_der().expect("AuthorityKeyIdentifier encodes"),
+            ),
+            integer_extension(crate::oids::CRL_NUMBER, false),
+            unlisted_extension(false),
+        ]);
+        let crl = Crl::parse(&der).expect("a complete CRL with list-preserving extensions parses");
+        assert!(crl.find_serial(&fixture_serial(6)).is_some());
+        let der = crl_with_extensions(vec![integer_extension(crate::oids::CRL_NUMBER, true)]);
+        Crl::parse(&der).expect("a critical cRLNumber leaves the list complete");
+    }
+
+    #[test]
+    fn critical_entry_extension_is_refused() {
+        let rows = [RevokedFixture {
+            reason: Some(CrlReason::KeyCompromise),
+            ..revoked_row()
+        }];
+        let shape = |critical| CrlShape {
+            entries: &rows,
+            with_next_update: true,
+            entry_extensions: vec![sequence_extension(
+                ObjectIdentifier::new_unwrap(CERTIFICATE_ISSUER_OID),
+                critical,
+            )],
+            ..CrlShape::default()
+        };
+        assert_eq!(
+            Crl::parse(&build_crl_with(shape(true))).err(),
+            Some(CrlError::UnsupportedCriticalEntryExtension)
+        );
+        let crl_der = build_crl_with(shape(false));
+        let crl = Crl::parse(&crl_der).expect("a non-critical entry extension is passed over");
+        let entry = crl.find_serial(&fixture_serial(6)).expect("found");
+        assert_eq!(entry.reason, Some(CrlReason::KeyCompromise));
+    }
+
+    #[test]
+    fn nonzero_unused_bits_is_refused() {
+        let der = build_crl_with(CrlShape {
+            with_next_update: true,
+            unused_bits: 1,
+            ..CrlShape::default()
+        });
+        assert!(matches!(
+            Crl::parse(&der),
+            Err(CrlError::Malformed(X509Error::UnexpectedStructure(_)))
+        ));
+    }
+
+    #[test]
+    fn signature_octets_need_zero_unused_bits_and_content() {
+        let unused = super::SIGNATURE_BIT_STRING_UNUSED_BITS;
+        assert_eq!(
+            super::signature_octets(&[unused, b's'], "test"),
+            Ok(&b"s"[..])
+        );
+        assert!(super::signature_octets(&[unused], "test").is_err());
+        assert!(super::signature_octets(&[], "test").is_err());
+        assert!(super::signature_octets(&[unused + 1, b's'], "test").is_err());
+    }
+
+    /// The top-level TLVs of a SEQUENCE's value.
+    fn sequence_fields(der: &[u8]) -> Vec<Vec<u8>> {
+        let outer = Any::from_der(der).expect("a SEQUENCE");
+        let mut reader = SliceReader::new(outer.value()).expect("SEQUENCE body");
+        let mut fields = Vec::new();
+        while !reader.is_finished() {
+            fields.push(reader.tlv_bytes().expect("a field").to_vec());
+        }
+        fields
+    }
+
+    /// A SEQUENCE whose value is `fields` in order.
+    fn sequence_of(fields: &[Vec<u8>]) -> Vec<u8> {
+        Any::new(Tag::Sequence, fields.concat())
+            .expect("SEQUENCE builds")
+            .to_der()
+            .expect("SEQUENCE encodes")
+    }
+
+    /// `der` with its `tbsCertList` fields rewritten by `edit`.
+    fn with_tbs_fields(der: &[u8], edit: impl FnOnce(&mut Vec<Vec<u8>>)) -> Vec<u8> {
+        let mut outer = sequence_fields(der);
+        let mut tbs = sequence_fields(&outer[0]);
+        edit(&mut tbs);
+        outer[0] = sequence_of(&tbs);
+        sequence_of(&outer)
+    }
+
+    #[test]
+    fn repeated_revoked_list_is_refused() {
+        let der = build_crl(&[revoked_row()], true);
+        // version, signature, issuer, thisUpdate, nextUpdate, revoked.
+        let revoked_at = 5;
+        let empty_list = sequence_of(&[]);
+        let doubled = with_tbs_fields(&der, |fields| fields.push(empty_list));
+        let listed = with_tbs_fields(&der, |fields| fields.truncate(revoked_at + 1));
+        Crl::parse(&listed).expect("the unedited fields parse");
+        assert!(matches!(
+            Crl::parse(&doubled),
+            Err(CrlError::Malformed(X509Error::UnexpectedStructure(_)))
+        ));
+    }
+
+    #[test]
+    fn undecodable_revoked_entry_is_refused() {
+        let der = build_crl(&[revoked_row()], true);
+        let revoked_at = 5;
+        let tbs = sequence_fields(&sequence_fields(&der)[0]);
+        let rows = sequence_fields(&tbs[revoked_at]);
+        // A row of only a serial: no revocationDate.
+        let row = sequence_of(&[sequence_fields(&rows[0]).remove(0)]);
+        let truncated = with_tbs_fields(&der, |fields| {
+            fields[revoked_at] = sequence_of(&[row]);
+        });
+        assert!(matches!(
+            Crl::parse(&truncated),
+            Err(CrlError::Malformed(X509Error::UnexpectedStructure(_)))
+        ));
     }
 }

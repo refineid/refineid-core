@@ -170,6 +170,14 @@ before and the correction made the core better.
 - Document and protocol versions are stamped by the project owner; never
   invent one.
 
+## Rules live here, not in an agent's memory
+
+Every rule, decision and finding an agent should remember lives in this
+repository, never only in an agent's memory: a design rule in `doc/`, a
+defect in an issue, a working rule in this file. This file states each
+rule in a line and points to the reading behind it; the readings live in
+`doc/`, not here.
+
 ## Source comments
 
 - Comments explain what the code does now and the constraints it honors.

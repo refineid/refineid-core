@@ -38,7 +38,8 @@ pub use credentials::{
 };
 pub use manage::{ManageOutcome, PinManageOps, classify_manage_sw};
 pub use retry_risk::{
-    PinRetryRisk, RetryFloorRefusal, check_retry_floor, pin1_status_permits_reusable_cache,
+    FlooredCredential, PinRetryRisk, RetryFloorRefusal, check_retry_floor,
+    pin1_status_permits_reusable_cache,
 };
 pub use verify::{
     AuthError, ORGANIZATIONAL_PIN_MAX_LENGTH, PIN_STORED_LENGTH, PIN1_REFERENCE,

@@ -33,6 +33,7 @@ use refineid_apdu::{
 };
 
 use crate::credentials::{Pin1, Pin2};
+use crate::retry_risk::RetryFloorRefusal;
 
 /// Citizen-card PIN1 reference: the global authentication PIN (FINEID S1
 /// v4.2 section 3.5.2).
@@ -184,6 +185,10 @@ pub enum AuthError<E> {
         /// The maximum the card stores.
         max: usize,
     },
+    /// The retry floor refused the credential before any command that
+    /// carries it was sent. Returned by the operations that present the
+    /// PUK, which read the PUK's counter themselves.
+    RetryFloor(RetryFloorRefusal),
 }
 
 impl<E: core::fmt::Display> core::fmt::Display for AuthError<E> {
@@ -196,6 +201,7 @@ impl<E: core::fmt::Display> core::fmt::Display for AuthError<E> {
                 f,
                 "auth: the organizational card stores credentials of at most {max} digits"
             ),
+            Self::RetryFloor(refusal) => write!(f, "{refusal}"),
         }
     }
 }

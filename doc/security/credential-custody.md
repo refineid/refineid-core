@@ -11,21 +11,27 @@ batch signing for PIN 2.
 
 ## The retry floor: never the software that locks the card
 
-RefineID never spends a PIN attempt that could block the card. Before any
-command that can spend a PIN 1 or PIN 2 try -- VERIFY, or CHANGE
-REFERENCE DATA presenting the current PIN -- every surface reads the
-card's tries left for that PIN without spending one and applies one
-rule, `check_retry_floor` in `refineid-auth`:
+RefineID never spends an attempt that could block the card. Before any
+command that can spend a PIN 1, PIN 2 or PUK try -- VERIFY, CHANGE
+REFERENCE DATA presenting the current PIN, or RESET RETRY COUNTER and
+the organizational card's PUK VERIFY presenting the PUK -- every surface
+reads the card's tries left for that credential without spending one and
+applies one rule, `check_retry_floor` in `refineid-auth`:
 
-- **Served**: five, four or three tries left, or the PIN already verified
-  in the card's current security context.
-- **Refused**: two, one or no tries left, a blocked PIN, and any answer
-  that carries no readable count. Nothing is sent, and the refusal names
-  the PIN and the tries left, never candidate PIN data. RAPP answers it
-  as `retry_floor` (RAPP v26.10.22 section 10.2).
-- **PUK exemption**: setting a new PIN 1 or PIN 2 with the PUK (RESET
-  RETRY COUNTER) is not a PIN attempt and stays available at two, one or
-  no tries left and on a blocked PIN.
+- **Served**: five, four or three tries left, or the credential already
+  verified in the card's current security context.
+- **Refused**: two, one or no tries left, a blocked credential, and any
+  answer that carries no readable count. Nothing is sent, and the refusal
+  names the credential and the tries left, never candidate credential
+  data. RAPP answers a PIN refusal as `retry_floor` (RAPP v26.10.22
+  section 10.2).
+- **The PUK follows the same floor.** FINEID S1 v4.2 leaves the PUK's try
+  limit to card personalization; RefineID presents the PUK -- to unblock
+  a PIN, or as the activation code on a card that ships with blocked
+  PINs -- only at five, four or three PUK tries left. A blocked PUK
+  cannot be recovered, so a PUK refusal names no other credential. The
+  unblock is gated by the PUK's counter alone: it stays available
+  whatever the PIN 1 and PIN 2 counters read, a blocked PIN included.
 
 The last attempts belong to the cardholder: other software may spend
 them, but a lockout is never RefineID's doing. Holding PIN 1 for reuse is

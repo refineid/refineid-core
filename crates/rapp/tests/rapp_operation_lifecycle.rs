@@ -327,7 +327,7 @@ fn a_batch_completes_only_with_every_signature_in_order() {
 }
 
 #[test]
-fn a_batch_names_one_digest_per_document_and_has_no_count_limit() {
+fn a_batch_names_at_least_one_document() {
     assert!(
         OperationRequest::reconstruct(
             OperationId::from_array([1; 16]),

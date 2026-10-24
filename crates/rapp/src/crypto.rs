@@ -212,6 +212,12 @@ pub enum CryptoError {
     Wire(WireError),
 }
 
+impl From<WireError> for CryptoError {
+    fn from(error: WireError) -> Self {
+        Self::Wire(error)
+    }
+}
+
 /// Failure while opening a post-handshake frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenError {
@@ -393,31 +399,33 @@ impl HandshakeChannel {
 }
 
 impl SecureChannel {
-    /// Encrypt one validated envelope and advance the send sequence once.
+    /// Encrypt one validated envelope. The send sequence advances only once
+    /// the envelope has encoded within one frame and encrypted, so a refused
+    /// body or a failed encryption leaves the sequence equal to the Noise
+    /// nonce (section 7.2 item 3).
     ///
     /// # Errors
-    /// [`CryptoError`] on an invalid body, sequence exhaustion, or an
-    /// encryption failure.
+    /// [`CryptoError`] on an invalid body, a body that does not fit one
+    /// frame, sequence exhaustion, or an encryption failure.
     pub fn seal(
         &mut self,
         message_type: MessageType,
         body: BTreeMap<String, WireValue>,
     ) -> Result<BinaryFrame, CryptoError> {
-        let envelope = self
-            .sequence
-            .next_outgoing(message_type, body)
-            .map_err(CryptoError::Wire)?;
-        let plaintext = envelope.encode().map_err(CryptoError::Wire)?;
-        let mut output = vec![0_u8; plaintext.len() + NOISE_TAG_SIZE];
-        let length = match &mut self.transport {
-            TransportMode::Snow(s) => s
-                .write_message(&plaintext, &mut output)
-                .map_err(|_| CryptoError::NoiseHandshake)?,
-            TransportMode::Native(n) => n
-                .write_message(&plaintext, &mut output)
-                .map_err(|_| CryptoError::NoiseHandshake)?,
-        };
-        output.truncate(length);
+        let transport = &mut self.transport;
+        let output = self.sequence.seal_next(message_type, body, |plaintext| {
+            let mut output = vec![0_u8; plaintext.len() + NOISE_TAG_SIZE];
+            let length = match transport {
+                TransportMode::Snow(s) => s
+                    .write_message(plaintext, &mut output)
+                    .map_err(|_| CryptoError::NoiseHandshake)?,
+                TransportMode::Native(n) => n
+                    .write_message(plaintext, &mut output)
+                    .map_err(|_| CryptoError::NoiseHandshake)?,
+            };
+            output.truncate(length);
+            Ok::<_, CryptoError>(output)
+        })?;
         BinaryFrame::reconstruct(output).map_err(CryptoError::Frame)
     }
 

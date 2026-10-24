@@ -28,7 +28,8 @@ revised; this page resolves those names to the documents.
   certificates.
 - [Gixel IAS ECC v1.0.1](https://dvv.fi/documents/16079645/17324992/IAS+ECC+v1_0_1UK.pdf)
   -- the IAS-ECC card specification; the organizational card's local
-  security-data-object key reference follows its section 4.4.
+  security-data-object key reference follows its section 4.4, and its
+  CHANGE REFERENCE DATA data-field rule is section 9.4.2.
 - [ICAO Doc 9303 Part 11](https://dvv.fi/documents/16079645/17324992/ICAO_9303_p11_cons_en.pdf)
   -- the PACE protocol and secure messaging.
 - [Technology note -- ATR bytes](https://dvv.fi/documents/16079645/17324992/Technology+note+-+ATR+bytes.pdf)

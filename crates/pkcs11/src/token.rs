@@ -1259,8 +1259,9 @@ pub(super) fn card_pin1_status(kind: &SlotKind) -> Result<PinStatus, CkRv> {
 /// PIN1 is presented for every signature: the card drops its PIN1
 /// verification after each signature with the authentication key
 /// (FINEID S4-1 v4.2 section 8.1.7). The held PIN1 is checked out for
-/// the card's token serial under the retry state the card reports in
-/// the same card session, settled by the card's answer to the VERIFY
+/// the card's token serial and the reader's card insertion and removal
+/// count, under the retry state the card reports, all read in the same
+/// card session, settled by the card's answer to the VERIFY
 /// ([`crate::pin_cache::CheckedOutPin1::settle_verify`]), and an
 /// accepted value settled again by what became of the card in the
 /// signature ([`crate::pin_cache::AcceptedPin1::settle_operation`]).
@@ -1317,10 +1318,18 @@ pub(super) fn card_sign(
             clear_positive(pin_cache);
             return Err(error);
         }
+        // The count is read while the transaction holds the card: a
+        // card that leaves now ends this handle, so an unmoved count
+        // proves no card left the reader since the card accepted the
+        // held value.
+        let Ok(card_events) = backend.card_events(reader) else {
+            clear_positive(pin_cache);
+            return Err(CKR_DEVICE_ERROR);
+        };
         let checkout = pin_cache
             .lock()
             .map_err(|_poisoned| CKR_DEVICE_ERROR)?
-            .checkout_pin1(&serial, pin1_status)
+            .checkout_pin1(&serial, card_events, pin1_status)
             .ok_or(CKR_USER_NOT_LOGGED_IN)?;
         let secret =
             refineid_auth::UnvalidatedSecret::from_owned_bytes(checkout.pin().as_bytes().to_vec());
@@ -1510,6 +1519,10 @@ pub(super) fn remote_token_objects(
 /// card accepts it: held when the retry counter read before the VERIFY
 /// was pristine ([`PinSafetyCache::store_pin1`]), otherwise staged for
 /// the one operation that follows ([`PinSafetyCache::stage_pin1_once`]).
+/// Either way it is bound to the card's token serial and the reader's
+/// card insertion and removal count, read in the same card session
+/// before the VERIFY; a login whose reader reports no count is refused
+/// before the VERIFY, since nothing would bound the value's stay.
 ///
 /// The VERIFY runs inside one PC/SC transaction that ends with a card
 /// reset ([`PcscCard::pin_sequence`]): the login proves the PIN to this
@@ -1564,6 +1577,9 @@ pub(super) fn card_login(
             clear_positive(pin_cache);
             return Err(error);
         }
+        let card_events = backend
+            .card_events(reader)
+            .map_err(|_status_err| CKR_DEVICE_ERROR)?;
         // The cache mutex is bookkeeping and is never held across a card
         // exchange: rejection memory is consulted and released before
         // the VERIFY, and the answer is settled under a second lock. The
@@ -1583,7 +1599,7 @@ pub(super) fn card_login(
             .verify_pin1(pin1_val)
             .map_err(|_verify_err| CKR_DEVICE_ERROR)?;
         let mut cache = pin_cache.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?;
-        settle_login(&mut cache, serial, pin1, pin1_status, outcome)
+        settle_login(&mut cache, serial, card_events, pin1, pin1_status, outcome)
     })
     .map_err(|_transaction_err| CKR_DEVICE_ERROR)?
 }
@@ -1595,6 +1611,7 @@ pub(super) fn card_login(
 fn settle_login(
     cache: &mut PinSafetyCache,
     serial: TokenSerial,
+    card_events: u32,
     pin1: PinBytes,
     pin1_status: PinStatus,
     outcome: VerifyOutcome,
@@ -1602,9 +1619,9 @@ fn settle_login(
     match outcome {
         VerifyOutcome::Ok => {
             let stored = if pin1_status_permits_reusable_cache(pin1_status) {
-                cache.store_pin1(serial, pin1)
+                cache.store_pin1(serial, card_events, pin1)
             } else {
-                cache.stage_pin1_once(serial, pin1)
+                cache.stage_pin1_once(serial, card_events, pin1)
             };
             stored.map_err(|_rejected| CKR_PIN_INCORRECT)
         }
@@ -2393,6 +2410,9 @@ mod tests {
         super::PinSafetyCache::new().expect("operating system random source is available")
     }
 
+    /// The reader's card-event count across a login and its use.
+    const LOGIN_READER_EVENTS: u32 = 0;
+
     fn login_serial() -> super::TokenSerial {
         super::TokenSerial::new(LOGIN_CARD_SERIAL.to_owned())
     }
@@ -2418,7 +2438,11 @@ mod tests {
     /// completed operation, as a signature does.
     fn use_once(cache: &mut super::PinSafetyCache) {
         let checkout = cache
-            .checkout_pin1(&login_serial(), remaining(RETRIES_PRISTINE))
+            .checkout_pin1(
+                &login_serial(),
+                LOGIN_READER_EVENTS,
+                remaining(RETRIES_PRISTINE),
+            )
             .expect("the settled value is checked out");
         let accepted: Result<super::VerifyOutcome, refineid_auth::AuthError<String>> =
             Ok(super::VerifyOutcome::Ok);
@@ -2434,6 +2458,7 @@ mod tests {
         let res = super::settle_login(
             &mut cache,
             login_serial(),
+            LOGIN_READER_EVENTS,
             random_pin(),
             remaining(RETRIES_PRISTINE),
             super::VerifyOutcome::Ok,
@@ -2444,7 +2469,11 @@ mod tests {
         assert!(cache.holds_pin1());
         assert!(
             cache
-                .checkout_pin1(&login_serial(), remaining(RETRIES_PRISTINE))
+                .checkout_pin1(
+                    &login_serial(),
+                    LOGIN_READER_EVENTS,
+                    remaining(RETRIES_PRISTINE)
+                )
                 .is_some()
         );
     }
@@ -2455,6 +2484,7 @@ mod tests {
         let res = super::settle_login(
             &mut cache,
             login_serial(),
+            LOGIN_READER_EVENTS,
             random_pin(),
             remaining(RETRIES_ONE_SPENT),
             super::VerifyOutcome::Ok,
@@ -2465,7 +2495,11 @@ mod tests {
         assert!(!cache.holds_pin1());
         assert!(
             cache
-                .checkout_pin1(&login_serial(), remaining(RETRIES_PRISTINE))
+                .checkout_pin1(
+                    &login_serial(),
+                    LOGIN_READER_EVENTS,
+                    remaining(RETRIES_PRISTINE)
+                )
                 .is_none()
         );
     }
@@ -2477,6 +2511,7 @@ mod tests {
         let res = super::settle_login(
             &mut cache,
             login_serial(),
+            LOGIN_READER_EVENTS,
             pin.clone(),
             remaining(RETRIES_PRISTINE),
             super::VerifyOutcome::WrongPin {
@@ -2501,6 +2536,7 @@ mod tests {
             let res = super::settle_login(
                 &mut cache,
                 login_serial(),
+                LOGIN_READER_EVENTS,
                 random_pin(),
                 remaining(RETRIES_PRISTINE),
                 outcome,

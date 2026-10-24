@@ -64,9 +64,9 @@ fn pso_cds_empty_wire(le: u8) -> Vec<u8> {
     PsoComputeDigitalSignature.into_apdu(le).as_bytes().to_vec()
 }
 
-fn pso_cds_inline_wire(digest: &[u8], le: u8) -> Vec<u8> {
+fn pso_cds_inline_wire(hash: ExternalHashValue, le: u8) -> Vec<u8> {
     PsoComputeDigitalSignature
-        .into_apdu_with_digest(digest, le)
+        .into_apdu_with_digest(hash, le)
         .expect("inline PSO:CDS encodes")
         .as_bytes()
         .to_vec()
@@ -277,7 +277,7 @@ fn organizational_sign_skips_pso_hash_and_carries_the_digest_inline() {
     let mut transport = Scripted::new(vec![
         (mse, success(vec![])),
         (
-            pso_cds_inline_wire(&digest, ecdsa_le()),
+            pso_cds_inline_wire(ExternalHashValue::Sha384(digest), ecdsa_le()),
             success(signature.clone()),
         ),
     ]);
@@ -380,8 +380,12 @@ fn citizen_rsa_pss_sha512_uses_the_matching_hash_and_pss_reference() {
 fn rsa_decipher_sets_the_confidentiality_template_and_chains_the_cryptogram() {
     // A modulus-wide cryptogram; with the padding indicator it exceeds the
     // short form and must chain.
-    let cryptogram = vec![DIGEST_FILL; RSA_3072_SIG_BYTES];
+    let cryptogram =
+        RsaCryptogram::from_bytes(vec![DIGEST_FILL; RSA_3072_SIG_BYTES]).expect("modulus-wide");
     let plaintext = b"recovered content".to_vec();
+    // A body on a non-final chained response is not part of the recovered
+    // plaintext; only the final command's response carries it.
+    let interim = b"interim block".to_vec();
 
     let mse = MseSetCt {
         alg_ref: DecipherAlgRef::RSA_PKCS1,
@@ -392,10 +396,11 @@ fn rsa_decipher_sets_the_confidentiality_template_and_chains_the_cryptogram() {
     .as_bytes()
     .to_vec();
     let chain = PsoDecipher {
-        ciphertext: &cryptogram,
+        cryptogram: &cryptogram,
     }
     .into_chain()
     .expect("cryptogram chains");
+    assert!(chain.len() > 1, "a modulus-wide cryptogram chains");
 
     let mut steps = vec![(mse, success(vec![]))];
     let last_index = chain.len() - 1;
@@ -403,19 +408,18 @@ fn rsa_decipher_sets_the_confidentiality_template_and_chains_the_cryptogram() {
         let response = if index == last_index {
             success(plaintext.clone())
         } else {
-            success(vec![])
+            success(interim.clone())
         };
         steps.push((command.as_bytes().to_vec(), response));
     }
     let mut transport = Scripted::new(steps);
 
-    let typed = RsaCryptogram::from_bytes(cryptogram).expect("modulus-wide cryptogram");
     let result = transport
         .decipher_rsa(
             SignScheme::Citizen,
             KeyRef::Auth,
             DecipherAlgRef::RSA_PKCS1,
-            &typed,
+            &cryptogram,
         )
         .expect("scripted decipher succeeds");
     assert_eq!(result.as_bytes(), plaintext.as_slice());

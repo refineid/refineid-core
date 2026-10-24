@@ -101,15 +101,6 @@ pub struct EcdsaBrainpoolP384r1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EcdsaDer;
 
-/// Marker: RSA PKCS#1 v1.5 encryption (no hash).
-///
-/// Distinct from the `RsaPkcs1Sha*` signature markers below:
-/// encryption pads raw plaintext, signing pads a pre-computed
-/// hash digest. The FINEID auth key decrypts with this scheme
-/// via `PSO:DECIPHER`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RsaPkcs1;
-
 /// Marker: RSA PKCS#1 v1.5 with SHA-256.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RsaPkcs1Sha256;
@@ -196,74 +187,6 @@ impl<Alg> Ciphertext<Alg> {
 
     /// `true` when the ciphertext is empty (operationally this
     /// shouldn't happen for a real encrypt output).
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
-}
-
-/// Cleartext bytes recovered from a specific decryption / unpad
-/// operation.
-///
-/// `Alg` records which algorithm produced the plaintext, so the
-/// compiler refuses to pass a value recovered from
-/// `Plaintext<RsaPkcs1>` (already-unpadded) to a function that
-/// expected the raw cipher-block output of `Plaintext<AesCbc>`.
-///
-/// Used for the unpadded RSA-PKCS#1 v1.5 plaintext returned by
-/// `PSO:DECIPHER`; siblings can be added as new symmetric-decrypt
-/// boundaries arrive (e.g. AES-GCM authenticated plaintext).
-///
-/// No derived `Debug` / `PartialEq`: the bytes are live decryption
-/// output, so `Debug` is a manual redacted impl (like `Aes256Key`
-/// and `PinBytes`), and equality is deliberately absent -- a
-/// derived `==` would be a non-constant-time comparison waiting to
-/// be reached for. Compare via an explicit `ct_eq` on `as_bytes()`
-/// if a comparison is ever needed.
-#[derive(Clone)]
-pub struct Plaintext<Alg> {
-    /// Unpadded plaintext bytes recovered from a decrypt of `Alg`.
-    bytes: Vec<u8>,
-    /// Type-level tag binding the value to the decrypting algorithm.
-    _phantom: PhantomData<Alg>,
-}
-
-impl<Alg> Plaintext<Alg> {
-    /// Wrap raw plaintext bytes recovered from `Alg`.
-    ///
-    /// The constructor is the trust boundary: by handing back a
-    /// `Plaintext<Alg>` value, the decrypt function asserts the
-    /// bytes are the unpadded plaintext that `Alg` was supposed
-    /// to recover.
-    #[must_use]
-    pub const fn new(bytes: Vec<u8>) -> Self {
-        Self {
-            bytes,
-            _phantom: PhantomData,
-        }
-    }
-
-    /// Borrow the underlying plaintext bytes.
-    #[must_use]
-    pub const fn as_bytes(&self) -> &[u8] {
-        self.bytes.as_slice()
-    }
-
-    /// Consume the container and return the owned plaintext bytes.
-    #[must_use]
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
-    }
-
-    /// Length of the plaintext in bytes. Tier 0 `usize`;
-    /// arithmetic count.
-    #[must_use]
-    pub const fn len(&self) -> usize {
-        self.bytes.len()
-    }
-
-    /// `true` when the plaintext is empty (a valid output for
-    /// some unpadded RSA-PKCS#1 v1.5 edge cases).
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.bytes.is_empty()
@@ -449,22 +372,6 @@ impl<Alg> fmt::Display for Ciphertext<Alg> {
     }
 }
 
-impl<Alg> fmt::Display for Plaintext<Alg> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Plaintext({} bytes)", self.bytes.len())
-    }
-}
-
-/// Manual redacted `Debug`: a derived impl would print the raw
-/// decryption output byte-for-byte the moment anything formats the
-/// value with `{:?}` (an error context, a test assertion, a trace
-/// field), defeating the redacted `Display` next door.
-impl<Alg> fmt::Debug for Plaintext<Alg> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Plaintext {{ bytes: [redacted; {}] }}", self.bytes.len())
-    }
-}
-
 impl<Alg> fmt::Display for Mac<Alg> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Mac({} bytes)", self.bytes.len())
@@ -486,8 +393,8 @@ impl<const N: usize> fmt::Display for Nonce<N> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AesCbc, Ciphertext, CmacAes, CmacAesTruncated, EcdsaP256, Mac, Nonce, Plaintext, RsaPkcs1,
-        RsaPkcs1Sha256, Signature,
+        AesCbc, Ciphertext, CmacAes, CmacAesTruncated, EcdsaP256, Mac, Nonce, RsaPkcs1Sha256,
+        Signature,
     };
 
     /// Length of the short fixture payload.
@@ -506,17 +413,6 @@ mod tests {
     const NONCE_BLOCK_FILL: u8 = 0xAB;
     /// Arbitrary fixture fill byte for the SSC-sized nonce.
     const NONCE_SSC_FILL: u8 = 0xCD;
-    /// Arbitrary fixture fill byte for plaintext payloads.
-    const PLAINTEXT_FILL: u8 = 0xAA;
-    /// Arbitrary fixture length for the typed-plaintext test.
-    const PLAINTEXT_LEN: usize = 32;
-    /// Fill byte whose hex and decimal spellings the redaction
-    /// assertions search for.
-    const LEAK_PROBE_FILL: u8 = 0xDE;
-    /// Fixture length for the `Display` redaction test.
-    const LEAK_PROBE_SHORT_LEN: usize = 24;
-    /// Fixture length for the `Debug` redaction test.
-    const LEAK_PROBE_LONG_LEN: usize = 48;
     /// ECDSA P-256 raw `r || s` signature length.
     const P256_RAW_SIGNATURE_LEN: usize = 64;
     /// RSA-2048 signature length in bytes.
@@ -554,52 +450,10 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_carries_algorithm_at_type_level() {
-        let rsa: Plaintext<RsaPkcs1> = Plaintext::new(vec![PLAINTEXT_FILL; PLAINTEXT_LEN]);
-        // Compile-test: Plaintext<RsaPkcs1> is distinct from a
-        // hypothetical Plaintext<AesCbc>; the compiler refuses
-        // cross-substitution.
-        assert_eq!(rsa.len(), PLAINTEXT_LEN);
-        assert_eq!(rsa.as_bytes().first().copied(), Some(PLAINTEXT_FILL));
-        let owned = rsa.into_bytes();
-        assert_eq!(owned.len(), PLAINTEXT_LEN);
-    }
-
-    #[test]
-    fn plaintext_display_does_not_leak_bytes() {
-        let p: Plaintext<RsaPkcs1> = Plaintext::new(vec![LEAK_PROBE_FILL; LEAK_PROBE_SHORT_LEN]);
-        let s = format!("{p}");
-        assert!(s.contains(&format!("{LEAK_PROBE_SHORT_LEN} bytes")));
-        assert!(!s.contains(&format!("{LEAK_PROBE_FILL:X}")));
-        assert!(!s.contains(&format!("{LEAK_PROBE_FILL:x}")));
-    }
-
-    #[test]
     fn signature_carries_algorithm() {
         let p256: Signature<EcdsaP256> = Signature::new(vec![0_u8; P256_RAW_SIGNATURE_LEN]);
         let rsa: Signature<RsaPkcs1Sha256> = Signature::new(vec![0_u8; RSA_2048_SIGNATURE_LEN]);
         assert_eq!(p256.len(), P256_RAW_SIGNATURE_LEN);
         assert_eq!(rsa.len(), RSA_2048_SIGNATURE_LEN);
-    }
-
-    #[test]
-    fn plaintext_debug_and_display_do_not_leak_bytes() {
-        let plain: Plaintext<RsaPkcs1> = Plaintext::new(vec![LEAK_PROBE_FILL; LEAK_PROBE_LONG_LEN]);
-        for rendered in [format!("{plain}"), format!("{plain:?}")] {
-            assert!(
-                rendered.contains(&format!("{LEAK_PROBE_LONG_LEN}")),
-                "got: {rendered}"
-            );
-            assert!(
-                !rendered.contains(&format!("{LEAK_PROBE_FILL:X}")),
-                "got: {rendered}"
-            );
-            assert!(
-                !rendered.contains(&format!("{LEAK_PROBE_FILL:x}")),
-                "got: {rendered}"
-            );
-            let decimal_spelling = format!("{LEAK_PROBE_FILL}");
-            assert!(!rendered.contains(&decimal_spelling), "got: {rendered}");
-        }
     }
 }

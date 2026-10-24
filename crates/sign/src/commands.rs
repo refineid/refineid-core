@@ -26,6 +26,8 @@
 
 use refineid_apdu::{ApduClass, CommandApdu, CommandDataError, CommandHeader};
 
+use crate::container::RsaCryptogram;
+
 /// MANAGE SECURITY ENVIRONMENT instruction.
 const MSE_INS: u8 = 0x22;
 /// MSE P1 selecting SET for computation and decipherment.
@@ -78,6 +80,8 @@ const PSO_DECIPHER_P2: u8 = 0x86;
 /// section 3.9): the data field is this byte followed by the encrypted
 /// message.
 const DECIPHER_PADDING_INDICATOR: u8 = 0x81;
+/// Bytes the padding-content indicator occupies ahead of the cryptogram.
+const DECIPHER_INDICATOR_LEN: usize = 1;
 
 /// SHA-1 digest length in bytes.
 pub const SHA1_LEN: usize = 20;
@@ -347,17 +351,18 @@ impl PsoComputeDigitalSignature {
     /// external-hash PSO:HASH step, so the digest rides inline and the
     /// card signs it directly. The citizen card rejects this shape and the
     /// organizational card rejects the empty form, which is why the
-    /// resolved numbering picks the chain. `le` is the expected-length
-    /// byte (see [`expected_length_le`]).
+    /// resolved numbering picks the chain. The digest is an
+    /// [`ExternalHashValue`], so its wire length is the one its hash
+    /// function fixes; `le` is the expected-length byte (see
+    /// [`expected_length_le`]).
     ///
     /// # Errors
     ///
-    /// [`CommandDataError`] never triggers: a digest is at most 64 bytes,
-    /// well within the short form. Fallible so the caller stays
-    /// fail-closed.
+    /// [`CommandDataError`] never triggers: the largest digest is well
+    /// within the short form. Fallible so the caller stays fail-closed.
     pub fn into_apdu_with_digest(
         self,
-        digest: &[u8],
+        hash: ExternalHashValue,
         le: u8,
     ) -> Result<CommandApdu, CommandDataError> {
         CommandApdu::case_4(
@@ -367,7 +372,7 @@ impl PsoComputeDigitalSignature {
                 p1: PSO_CDS_P1,
                 p2: PSO_CDS_P2,
             },
-            digest,
+            hash.as_bytes(),
             le,
         )
     }
@@ -381,8 +386,8 @@ impl PsoComputeDigitalSignature {
 /// section 3.9). The card strips the padding and returns the plaintext.
 #[derive(Debug, Clone, Copy)]
 pub struct PsoDecipher<'a> {
-    /// The RSA cryptogram: exactly one modulus-wide block.
-    pub ciphertext: &'a [u8],
+    /// The RSA cryptogram, modulus-wide by construction.
+    pub cryptogram: &'a RsaCryptogram,
 }
 
 impl PsoDecipher<'_> {
@@ -391,11 +396,14 @@ impl PsoDecipher<'_> {
     ///
     /// # Errors
     ///
-    /// [`CommandDataError::Empty`] when the cryptogram is empty.
+    /// [`CommandDataError`] never triggers: the data field is the
+    /// padding-content indicator and a modulus-wide block. Fallible so
+    /// the caller stays fail-closed.
     pub fn into_chain(self) -> Result<Vec<CommandApdu>, CommandDataError> {
-        let mut data = Vec::with_capacity(1 + self.ciphertext.len());
+        let ciphertext = self.cryptogram.as_bytes();
+        let mut data = Vec::with_capacity(DECIPHER_INDICATOR_LEN + ciphertext.len());
         data.push(DECIPHER_PADDING_INDICATOR);
-        data.extend_from_slice(self.ciphertext);
+        data.extend_from_slice(ciphertext);
         CommandApdu::command_chain(
             CommandHeader {
                 class: ApduClass::Plain,
@@ -418,7 +426,9 @@ mod tests {
         PSO_HASH_P1, PSO_HASH_P2_EXTERNAL, PSO_HASH_TAG_VALUE, PSO_INS, PsoComputeDigitalSignature,
         PsoDecipher, PsoHashExternal, SHA256_LEN, SHA384_LEN, SHA512_LEN, SignatureAlgRef,
     };
-    use crate::{KEY_REF_AUTH, KEY_REF_SIGN, ORG_QUALIFIED_KEY_REF};
+    use crate::{
+        KEY_REF_AUTH, KEY_REF_SIGN, ORG_QUALIFIED_KEY_REF, RSA_3072_MODULUS_BYTES, RsaCryptogram,
+    };
     use refineid_apdu::ApduClass;
 
     /// A digest filler byte.
@@ -441,8 +451,6 @@ mod tests {
     const ALG_SHA512_RSA_PSS: u8 = 0x65;
     /// The documented RSA PKCS#1 v1.5 decipher algorithm-reference byte.
     const ALG_DECIPHER_PKCS1: u8 = 0x1A;
-    /// RSA-3072 modulus width in bytes: one cryptogram block.
-    const RSA_3072_MODULUS_LEN: usize = 384;
     /// Commands a modulus-wide cryptogram chains into.
     const TWO_DECIPHER_COMMANDS: usize = 2;
     /// Wire index of the instruction byte.
@@ -618,7 +626,7 @@ mod tests {
     fn pso_cds_inline_carries_the_digest_between_lc_and_le() {
         let digest = [FILL; SHA384_LEN];
         let apdu = PsoComputeDigitalSignature
-            .into_apdu_with_digest(&digest, PSO_CDS_LE_ANY)
+            .into_apdu_with_digest(ExternalHashValue::Sha384(digest), PSO_CDS_LE_ANY)
             .expect("digest fits the short form");
         assert_eq!(
             apdu.as_bytes(),
@@ -659,9 +667,10 @@ mod tests {
 
     #[test]
     fn pso_decipher_chains_the_padding_indicator_and_cryptogram() {
-        let cryptogram = [FILL; RSA_3072_MODULUS_LEN];
+        let cryptogram =
+            RsaCryptogram::from_bytes(vec![FILL; RSA_3072_MODULUS_BYTES]).expect("modulus-wide");
         let chain = PsoDecipher {
-            ciphertext: &cryptogram,
+            cryptogram: &cryptogram,
         }
         .into_chain()
         .expect("cryptogram chains");

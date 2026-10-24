@@ -3205,9 +3205,13 @@ impl RappSessionBridge {
             .with_record(|record| Ok(record.forgotten_at_ms().is_some()))
     }
 
+    /// Hand the established endpoint to an operation bridge, with the
+    /// profiles the pairing serves and the record the bridge consults
+    /// before it serves anything.
     pub(super) fn take_established(
         &self,
-    ) -> Result<(EstablishedEndpoint, Vec<ProfileName>), RappBindingError> {
+    ) -> Result<(EstablishedEndpoint, Vec<ProfileName>, Arc<RappPairRecord>), RappBindingError>
+    {
         let mut state = self.lock_state()?;
         let previous = core::mem::replace(&mut *state, SessionBridgeState::Closed);
         let endpoint = match previous {
@@ -3227,7 +3231,7 @@ impl RappSessionBridge {
             .ok_or(RappBindingError::PairNotFound)?
             .serving_profiles()
             .to_vec();
-        Ok((endpoint, profiles))
+        Ok((endpoint, profiles, Arc::clone(&self.pair)))
     }
 }
 
@@ -3397,6 +3401,26 @@ impl RappSessionRouter {
 }
 
 impl RappPairRecord {
+    /// Run `serve` while this record stays active, holding the record so a
+    /// forget or revoke cannot land in the middle; `None`, without running
+    /// `serve`, once the record is forgotten or revoked, since such a
+    /// pairing serves nothing (RAPP v26.10.22 §4.6).
+    pub(super) fn serve_while_active<T>(
+        &self,
+        serve: impl FnOnce() -> Result<T, RappBindingError>,
+    ) -> Result<Option<T>, RappBindingError> {
+        let guard = self
+            .record
+            .lock()
+            .map_err(|_| RappBindingError::LocalStateFailure)?;
+        let active = guard
+            .as_ref()
+            .is_some_and(|record| record.forgotten_at_ms().is_none());
+        let served = if active { serve().map(Some) } else { Ok(None) };
+        drop(guard);
+        served
+    }
+
     fn with_record<T>(
         &self,
         use_record: impl FnOnce(&PairRecord) -> Result<T, RappBindingError>,
@@ -3669,6 +3693,16 @@ mod routing_binding_tests {
     const SESSION_AT_MS: u64 = UNIX_TIME_SECONDS * MILLISECONDS_PER_SECOND;
 
     fn record(own: u8, peer: u8, pair: u8, role: EndpointRole) -> Arc<RappPairRecord> {
+        record_serving(own, peer, pair, role, vec![ProfileName::Authentication])
+    }
+
+    fn record_serving(
+        own: u8,
+        peer: u8,
+        pair: u8,
+        role: EndpointRole,
+        profiles: Vec<ProfileName>,
+    ) -> Arc<RappPairRecord> {
         let own_private = [own; X25519_KEY_SIZE];
         let record = PairRecord::new(
             PairId::from_array([pair; PAIR_ID_SIZE]),
@@ -3677,7 +3711,7 @@ mod routing_binding_tests {
             x25519_public_key(&own_private),
             x25519_public_key(&[peer; X25519_KEY_SIZE]),
             GrantsHash::from_array([GRANTS_BYTE; crate::GRANTS_HASH_SIZE]),
-            vec![ProfileName::Authentication],
+            profiles,
             CREATED_AT_MS,
         )
         .expect("record");
@@ -4140,9 +4174,12 @@ mod routing_binding_tests {
 
     /// The session phase of one stored pairing, both ends in memory.
     mod session_bridge {
-        use super::{CREATED_AT_MS, PAIR_BYTE, RappPairRecord, RappPairVault, StoringVault};
+        use super::{
+            CREATED_AT_MS, CUSTODIAN_BYTE, PAIR_BYTE, REQUESTER_BYTE, RappPairRecord,
+            RappPairVault, StoringVault, record_serving,
+        };
         use crate::{
-            STREAM_PROFILE,
+            EndpointRole, LIVENESS_CHALLENGE_SIZE, ProfileName, STREAM_PROFILE,
             bindings::{RappBindingError, RappSessionBridge},
             operation_bridge::{
                 RappBridgeAction, RappBridgeActionKind, RappCardKeyProfile, RappCardReader,
@@ -4165,6 +4202,11 @@ mod routing_binding_tests {
         /// holds.
         const CERTIFICATE_BYTE: u8 = 0x30;
         const CERTIFICATE_SIZE: usize = 64;
+        const DOCUMENT_NAME: &str = "contract.pdf";
+        /// Opaque signature bytes; the custodian relays what the card makes.
+        const SIGNATURE_BYTE: u8 = 0x5e;
+        /// ECDSA P-256 `r || s` on the wire (RAPP section 9.2).
+        const ECDSA_P256_SIGNATURE_SIZE: usize = 64;
 
         fn vault() -> Arc<dyn RappPairVault> {
             Arc::new(StoringVault {
@@ -4179,6 +4221,28 @@ mod routing_binding_tests {
 
         fn custodian_record() -> Arc<RappPairRecord> {
             super::custodian(PAIR_BYTE)
+        }
+
+        /// A requester record granted every profile.
+        fn granted_requester_record() -> Arc<RappPairRecord> {
+            record_serving(
+                REQUESTER_BYTE,
+                CUSTODIAN_BYTE,
+                PAIR_BYTE,
+                EndpointRole::Requester,
+                ProfileName::ALL.to_vec(),
+            )
+        }
+
+        /// A custodian record granted every profile.
+        fn granted_custodian_record() -> Arc<RappPairRecord> {
+            record_serving(
+                CUSTODIAN_BYTE,
+                REQUESTER_BYTE,
+                PAIR_BYTE,
+                EndpointRole::Proxy,
+                ProfileName::ALL.to_vec(),
+            )
         }
 
         /// Both ends after the Noise KK handshake, awaiting `session.ready`.
@@ -4508,6 +4572,261 @@ mod routing_binding_tests {
                 .expect("custodian reads the close");
             assert_eq!(closed.kind, RappBridgeActionKind::SessionClosed);
             assert_eq!(closed.close_reason, Some(RappCloseReason::PairingRevoked));
+        }
+
+        /// The custodian admitted a document signature and awaits the
+        /// holder's PIN 2.
+        fn awaiting_signature_approval(
+            requester: &RappOperationBridge,
+            custodian: &RappOperationBridge,
+        ) {
+            let request = frame(
+                requester
+                    .begin_sign_document(
+                        operation_id(),
+                        DOCUMENT_NAME.to_owned(),
+                        RappCardKeyProfile::EcdsaP256,
+                        RappSignatureAlgorithm::EcdsaSha256,
+                        vec![DIGEST_BYTE; SHA256_DIGEST_SIZE],
+                        NOW_MS,
+                        LIFETIME_MS,
+                    )
+                    .expect("requester asks"),
+            );
+            assert_eq!(
+                custodian
+                    .receive_frame(request, NOW_MS)
+                    .expect("custodian admits")
+                    .kind,
+                RappBridgeActionKind::InspectPrerequisites
+            );
+            assert_eq!(
+                custodian
+                    .prerequisites_complete(operation_id(), NOW_MS)
+                    .expect("the signature has the card")
+                    .kind,
+                RappBridgeActionKind::AwaitUserApproval
+            );
+        }
+
+        /// `action` is the sealed `pairing_revoked` close, and the peer
+        /// reads it as the end of the session.
+        fn assert_pairing_revoked_close(action: RappBridgeAction, peer: &RappOperationBridge) {
+            assert_eq!(action.close_reason, Some(RappCloseReason::PairingRevoked));
+            assert!(action.close_session_after_send);
+            let closed = peer
+                .receive_frame(frame(action), NOW_MS)
+                .expect("the peer reads the close");
+            assert_eq!(closed.kind, RappBridgeActionKind::SessionClosed);
+            assert_eq!(closed.close_reason, Some(RappCloseReason::PairingRevoked));
+        }
+
+        fn challenge() -> Vec<u8> {
+            vec![NONCE_BYTE; LIVENESS_CHALLENGE_SIZE]
+        }
+
+        #[test]
+        fn an_approval_after_forget_closes_with_pairing_revoked() {
+            let custodian_record = granted_custodian_record();
+            let (requester, custodian) =
+                established_with(&granted_requester_record(), &custodian_record);
+            awaiting_signature_approval(&requester, &custodian);
+            custodian_record
+                .forget(vault(), CREATED_AT_MS)
+                .expect("forget");
+            let action = custodian
+                .approve(operation_id(), NOW_MS)
+                .expect("the approval is answered");
+            assert_eq!(action.operation_id, Some(operation_id()));
+            assert!(!action.card_exchange_continues);
+            assert_pairing_revoked_close(action, &requester);
+            assert_eq!(
+                custodian
+                    .poll_liveness(NOW_MS, challenge())
+                    .expect("the session stays closed")
+                    .kind,
+                RappBridgeActionKind::SessionClosed
+            );
+        }
+
+        #[test]
+        fn a_request_on_a_forgotten_pairing_is_answered_with_the_close() {
+            let custodian_record = granted_custodian_record();
+            let (requester, custodian) =
+                established_with(&granted_requester_record(), &custodian_record);
+            let request = frame(
+                requester
+                    .begin_read_certificate(operation_id(), false, NOW_MS, LIFETIME_MS)
+                    .expect("requester asks"),
+            );
+            custodian_record
+                .forget(vault(), CREATED_AT_MS)
+                .expect("forget");
+            let action = custodian
+                .receive_frame(request, NOW_MS)
+                .expect("the request is answered");
+            assert_eq!(action.kind, RappBridgeActionKind::SendFrame);
+            assert_pairing_revoked_close(action, &requester);
+        }
+
+        #[test]
+        fn a_requester_cannot_begin_an_operation_on_a_forgotten_pairing() {
+            let requester_record = granted_requester_record();
+            let (requester, custodian) =
+                established_with(&requester_record, &granted_custodian_record());
+            requester_record
+                .forget(vault(), CREATED_AT_MS)
+                .expect("forget");
+            let action = requester
+                .begin_inspect_card(operation_id(), NOW_MS, LIFETIME_MS)
+                .expect("the request is answered");
+            assert_eq!(action.kind, RappBridgeActionKind::SendFrame);
+            assert_eq!(action.operation_id, None);
+            assert_pairing_revoked_close(action, &custodian);
+        }
+
+        #[test]
+        fn a_revoked_record_counts_as_forgotten() {
+            let custodian_record = granted_custodian_record();
+            let (requester, custodian) =
+                established_with(&granted_requester_record(), &custodian_record);
+            awaiting_signature_approval(&requester, &custodian);
+            custodian_record
+                .revoke(vault(), CREATED_AT_MS)
+                .expect("revoke");
+            let action = custodian
+                .approve(operation_id(), NOW_MS)
+                .expect("the approval is answered");
+            assert_pairing_revoked_close(action, &requester);
+        }
+
+        #[test]
+        fn a_batch_signature_on_a_forgotten_pairing_is_not_recorded() {
+            let custodian_record = granted_custodian_record();
+            let (requester, custodian) =
+                established_with(&granted_requester_record(), &custodian_record);
+            let request = frame(
+                requester
+                    .begin_batch_sign_documents(
+                        operation_id(),
+                        vec![DOCUMENT_NAME.to_owned()],
+                        RappCardKeyProfile::EcdsaP256,
+                        RappSignatureAlgorithm::EcdsaSha256,
+                        vec![vec![DIGEST_BYTE; SHA256_DIGEST_SIZE]],
+                        NOW_MS,
+                        LIFETIME_MS,
+                    )
+                    .expect("requester asks"),
+            );
+            custodian
+                .receive_frame(request, NOW_MS)
+                .expect("custodian admits");
+            custodian
+                .prerequisites_complete(operation_id(), NOW_MS)
+                .expect("the batch has the card");
+            assert_eq!(
+                custodian
+                    .approve(operation_id(), NOW_MS)
+                    .expect("approval")
+                    .kind,
+                RappBridgeActionKind::ExecuteCardCommand
+            );
+            custodian_record
+                .forget(vault(), CREATED_AT_MS)
+                .expect("forget");
+            assert!(matches!(
+                custodian.record_batch_signature(
+                    operation_id(),
+                    vec![SIGNATURE_BYTE; ECDSA_P256_SIGNATURE_SIZE]
+                ),
+                Err(RappBindingError::WrongPhase)
+            ));
+            let action = custodian
+                .poll_liveness(NOW_MS, challenge())
+                .expect("the liveness poll is answered");
+            assert_eq!(action.operation_id, Some(operation_id()));
+            assert!(action.card_exchange_continues);
+            assert_pairing_revoked_close(action, &requester);
+        }
+
+        #[test]
+        fn a_denial_after_forget_closes_with_pairing_revoked() {
+            let custodian_record = granted_custodian_record();
+            let (requester, custodian) =
+                established_with(&granted_requester_record(), &custodian_record);
+            awaiting_signature_approval(&requester, &custodian);
+            custodian_record
+                .forget(vault(), CREATED_AT_MS)
+                .expect("forget");
+            let action = custodian
+                .deny(operation_id())
+                .expect("the denial is answered");
+            assert_eq!(action.operation_id, Some(operation_id()));
+            assert!(action.terminal_reason.is_none());
+            assert_pairing_revoked_close(action, &requester);
+        }
+
+        #[test]
+        fn finished_prerequisites_after_forget_close_with_pairing_revoked() {
+            let custodian_record = granted_custodian_record();
+            let (requester, custodian) =
+                established_with(&granted_requester_record(), &custodian_record);
+            let request = frame(
+                requester
+                    .begin_read_certificate(operation_id(), false, NOW_MS, LIFETIME_MS)
+                    .expect("requester asks"),
+            );
+            assert_eq!(
+                custodian
+                    .receive_frame(request, NOW_MS)
+                    .expect("custodian admits")
+                    .kind,
+                RappBridgeActionKind::InspectPrerequisites
+            );
+            custodian_record
+                .forget(vault(), CREATED_AT_MS)
+                .expect("forget");
+            let action = custodian
+                .prerequisites_complete(operation_id(), NOW_MS)
+                .expect("the prerequisites are answered");
+            assert_eq!(action.kind, RappBridgeActionKind::SendFrame);
+            assert!(!action.card_exchange_continues);
+            assert_pairing_revoked_close(action, &requester);
+        }
+
+        #[test]
+        fn a_requester_receiving_on_a_forgotten_pairing_closes_with_pairing_revoked() {
+            let requester_record = granted_requester_record();
+            let (requester, custodian) =
+                established_with(&requester_record, &granted_custodian_record());
+            let status = frame(
+                custodian
+                    .report_card_status(None, RappCardReader::Absent)
+                    .expect("custodian reports its card"),
+            );
+            requester_record
+                .forget(vault(), CREATED_AT_MS)
+                .expect("forget");
+            let action = requester
+                .receive_frame(status, NOW_MS)
+                .expect("the frame is answered");
+            assert_eq!(action.kind, RappBridgeActionKind::SendFrame);
+            assert_pairing_revoked_close(action, &custodian);
+        }
+
+        #[test]
+        fn a_requester_cannot_begin_an_operation_on_a_revoked_pairing() {
+            let requester_record = granted_requester_record();
+            let (requester, custodian) =
+                established_with(&requester_record, &granted_custodian_record());
+            requester_record
+                .revoke(vault(), CREATED_AT_MS)
+                .expect("revoke");
+            let action = requester
+                .begin_inspect_card(operation_id(), NOW_MS, LIFETIME_MS)
+                .expect("the request is answered");
+            assert_eq!(action.kind, RappBridgeActionKind::SendFrame);
+            assert_pairing_revoked_close(action, &custodian);
         }
     }
 }

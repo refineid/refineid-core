@@ -31,7 +31,7 @@ use super::{
     ProxySessionCloseAction, RequesterDispatch, RequesterEngineError, RequesterOperationEngine,
     ResultError, RuntimeError, RuntimePoll, RuntimeReceive, SignatureAlgorithm, TypedMessage,
     UserApproval,
-    bindings::{RappBindingError, RappSessionBridge, fixed_array},
+    bindings::{RappBindingError, RappPairRecord, RappSessionBridge, fixed_array},
 };
 
 /// Closed operation names exposed to platform card adapters.
@@ -686,6 +686,11 @@ enum OperationBridgeState {
 }
 
 /// One established RAPP session with closed operation dispatch.
+///
+/// Every call that serves the session, the liveness poll included, first
+/// consults the pairing: once the record is forgotten or revoked the call
+/// does nothing it was asked and returns the sealed `pairing_revoked` close
+/// to send instead (RAPP section 4.6 item 1).
 #[allow(
     missing_debug_implementations,
     reason = "state holds session keys and credential-bearing engines; no formatted view exists"
@@ -694,6 +699,9 @@ enum OperationBridgeState {
 pub struct RappOperationBridge {
     state: Mutex<OperationBridgeState>,
     maximum_lifetime_ms: u64,
+    /// The pairing the session belongs to; a forgotten or revoked one
+    /// serves nothing (RAPP section 4.6).
+    pair: Arc<RappPairRecord>,
 }
 
 #[uniffi::export]
@@ -714,7 +722,7 @@ impl RappOperationBridge {
         now_ms: u64,
     ) -> Result<Arc<Self>, RappBindingError> {
         require_lifetime(maximum_lifetime_ms)?;
-        let (endpoint, granted_profiles) = session.take_established()?;
+        let (endpoint, granted_profiles, pair) = session.take_established()?;
         Ok(Arc::new(Self {
             state: Mutex::new(OperationBridgeState::Requester {
                 runtime: EstablishedSessionRuntime::new(endpoint, now_ms),
@@ -722,6 +730,7 @@ impl RappOperationBridge {
                 granted_profiles,
             }),
             maximum_lifetime_ms,
+            pair,
         }))
     }
 
@@ -739,7 +748,7 @@ impl RappOperationBridge {
         now_ms: u64,
     ) -> Result<Arc<Self>, RappBindingError> {
         require_lifetime(maximum_lifetime_ms)?;
-        let (endpoint, granted_profiles) = session.take_established()?;
+        let (endpoint, granted_profiles, pair) = session.take_established()?;
         Ok(Arc::new(Self {
             state: Mutex::new(OperationBridgeState::Proxy {
                 runtime: EstablishedSessionRuntime::new(endpoint, now_ms),
@@ -747,6 +756,7 @@ impl RappOperationBridge {
                 live_request: None,
             }),
             maximum_lifetime_ms,
+            pair,
         }))
     }
 
@@ -923,76 +933,77 @@ impl RappOperationBridge {
         now_ms: u64,
     ) -> Result<RappBridgeAction, RappBindingError> {
         let frame = BinaryFrame::reconstruct(bytes).map_err(|_| RappBindingError::InvalidInput)?;
-        let mut state = self.lock_state()?;
-        let action = match &mut *state {
-            OperationBridgeState::Requester {
-                runtime, engine, ..
-            } => {
-                let message = match receive_runtime(runtime, &frame, now_ms)? {
-                    RuntimeFrame::Message(message) => message,
-                    RuntimeFrame::Action(action) => return Ok(action),
-                    RuntimeFrame::Closed(action) => {
-                        let ended = EndedOperation::requester(engine);
-                        *state = OperationBridgeState::Closed;
-                        return Ok(action.ending(ended));
+        self.serving(|| {
+            let mut state = self.lock_state()?;
+            let action = match &mut *state {
+                OperationBridgeState::Requester {
+                    runtime, engine, ..
+                } => {
+                    let message = match receive_runtime(runtime, &frame, now_ms)? {
+                        RuntimeFrame::Message(message) => message,
+                        RuntimeFrame::Action(action) => return Ok(action),
+                        RuntimeFrame::Closed(action) => {
+                            let ended = EndedOperation::requester(engine);
+                            *state = OperationBridgeState::Closed;
+                            return Ok(action.ending(ended));
+                        }
+                    };
+                    match engine.receive(message) {
+                        Ok(dispatch) => requester_dispatch(dispatch),
+                        Err(RequesterEngineError::AuthenticatedProtocolViolation(violation)) => {
+                            let notice = violation_notice(runtime.close_for_operation_violation(
+                                OperationViolation::Requester(violation),
+                            ));
+                            let ended = EndedOperation::requester(engine);
+                            *state = OperationBridgeState::Closed;
+                            return Ok(RappBridgeAction::violation_closed(notice).ending(ended));
+                        }
+                        Err(_) => return Err(RappBindingError::LocalStateFailure),
                     }
-                };
-                match engine.receive(message) {
-                    Ok(dispatch) => requester_dispatch(dispatch),
-                    Err(RequesterEngineError::AuthenticatedProtocolViolation(violation)) => {
-                        let notice = violation_notice(runtime.close_for_operation_violation(
-                            OperationViolation::Requester(violation),
-                        ));
-                        let ended = EndedOperation::requester(engine);
-                        *state = OperationBridgeState::Closed;
-                        return Ok(RappBridgeAction::violation_closed(notice).ending(ended));
-                    }
-                    Err(_) => return Err(RappBindingError::LocalStateFailure),
                 }
-            }
-            OperationBridgeState::Proxy {
-                runtime,
-                engine,
-                live_request,
-            } => {
-                let message = match receive_runtime(runtime, &frame, now_ms)? {
-                    RuntimeFrame::Message(message) => message,
-                    RuntimeFrame::Action(action) => return Ok(action),
-                    RuntimeFrame::Closed(action) => {
-                        let ended = EndedOperation::proxy(engine);
-                        *state = OperationBridgeState::Closed;
-                        return Ok(action.ending(ended));
-                    }
-                };
-                let incoming = match &message {
-                    TypedMessage::OperationRequest(request) => Some(request.clone()),
-                    _ => None,
-                };
-                let dispatch = match engine.receive(message) {
-                    Ok(dispatch) => dispatch,
-                    Err(ProxyEngineError::AuthenticatedProtocolViolation(violation)) => {
-                        let notice =
-                            violation_notice(runtime.close_for_operation_violation(
+                OperationBridgeState::Proxy {
+                    runtime,
+                    engine,
+                    live_request,
+                } => {
+                    let message = match receive_runtime(runtime, &frame, now_ms)? {
+                        RuntimeFrame::Message(message) => message,
+                        RuntimeFrame::Action(action) => return Ok(action),
+                        RuntimeFrame::Closed(action) => {
+                            let ended = EndedOperation::proxy(engine);
+                            *state = OperationBridgeState::Closed;
+                            return Ok(action.ending(ended));
+                        }
+                    };
+                    let incoming = match &message {
+                        TypedMessage::OperationRequest(request) => Some(request.clone()),
+                        _ => None,
+                    };
+                    let dispatch = match engine.receive(message) {
+                        Ok(dispatch) => dispatch,
+                        Err(ProxyEngineError::AuthenticatedProtocolViolation(violation)) => {
+                            let notice = violation_notice(runtime.close_for_operation_violation(
                                 OperationViolation::Proxy(violation),
                             ));
-                        let ended = EndedOperation::proxy(engine);
-                        *state = OperationBridgeState::Closed;
-                        return Ok(RappBridgeAction::violation_closed(notice).ending(ended));
+                            let ended = EndedOperation::proxy(engine);
+                            *state = OperationBridgeState::Closed;
+                            return Ok(RappBridgeAction::violation_closed(notice).ending(ended));
+                        }
+                        Err(_) => return Err(RappBindingError::LocalStateFailure),
+                    };
+                    if matches!(dispatch, ProxyDispatch::InspectPrerequisites(_)) {
+                        *live_request = incoming;
                     }
-                    Err(_) => return Err(RappBindingError::LocalStateFailure),
-                };
-                if matches!(dispatch, ProxyDispatch::InspectPrerequisites(_)) {
-                    *live_request = incoming;
+                    proxy_dispatch(runtime, engine, live_request.as_ref(), dispatch)
                 }
-                proxy_dispatch(runtime, engine, live_request.as_ref(), dispatch)
+                OperationBridgeState::Closed => return Err(RappBindingError::WrongPhase),
+            };
+            if action.kind == RappBridgeActionKind::SessionClosed {
+                *state = OperationBridgeState::Closed;
             }
-            OperationBridgeState::Closed => return Err(RappBindingError::WrongPhase),
-        };
-        if action.kind == RappBridgeActionKind::SessionClosed {
-            *state = OperationBridgeState::Closed;
-        }
-        drop(state);
-        Ok(action)
+            drop(state);
+            Ok(action)
+        })
     }
 
     /// The operation has the card and its prerequisite reads are done. An
@@ -1010,24 +1021,26 @@ impl RappOperationBridge {
         now_ms: u64,
     ) -> Result<RappBridgeAction, RappBindingError> {
         let operation_id = decode_operation_id(&operation_id)?;
-        let mut state = self.lock_state()?;
-        let OperationBridgeState::Proxy {
-            runtime,
-            engine,
-            live_request,
-        } = &mut *state
-        else {
-            return Err(RappBindingError::WrongPhase);
-        };
-        let dispatch = engine
-            .prerequisites_complete(operation_id, now_ms, self.maximum_lifetime_ms)
-            .map_err(|_| RappBindingError::WrongPhase)?;
-        let action = proxy_dispatch(runtime, engine, live_request.as_ref(), dispatch);
-        if action.kind == RappBridgeActionKind::SessionClosed {
-            *state = OperationBridgeState::Closed;
-        }
-        drop(state);
-        Ok(action)
+        self.serving(|| {
+            let mut state = self.lock_state()?;
+            let OperationBridgeState::Proxy {
+                runtime,
+                engine,
+                live_request,
+            } = &mut *state
+            else {
+                return Err(RappBindingError::WrongPhase);
+            };
+            let dispatch = engine
+                .prerequisites_complete(operation_id, now_ms, self.maximum_lifetime_ms)
+                .map_err(|_| RappBindingError::WrongPhase)?;
+            let action = proxy_dispatch(runtime, engine, live_request.as_ref(), dispatch);
+            if action.kind == RappBridgeActionKind::SessionClosed {
+                *state = OperationBridgeState::Closed;
+            }
+            drop(state);
+            Ok(action)
+        })
     }
 
     /// Approve exactly the admitted request: the holder entered the PIN
@@ -1041,31 +1054,35 @@ impl RappOperationBridge {
         approved_at_ms: u64,
     ) -> Result<RappBridgeAction, RappBindingError> {
         let operation_id = decode_operation_id(&operation_id)?;
-        let mut state = self.lock_state()?;
-        let OperationBridgeState::Proxy {
-            runtime,
-            engine,
-            live_request,
-        } = &mut *state
-        else {
-            return Err(RappBindingError::WrongPhase);
-        };
-        let approval =
-            UserApproval::for_request(live(live_request.as_ref(), operation_id)?, approved_at_ms);
-        let dispatch = engine
-            .approve(
-                operation_id,
-                approval,
+        self.serving(|| {
+            let mut state = self.lock_state()?;
+            let OperationBridgeState::Proxy {
+                runtime,
+                engine,
+                live_request,
+            } = &mut *state
+            else {
+                return Err(RappBindingError::WrongPhase);
+            };
+            let approval = UserApproval::for_request(
+                live(live_request.as_ref(), operation_id)?,
                 approved_at_ms,
-                self.maximum_lifetime_ms,
-            )
-            .map_err(|_| RappBindingError::WrongPhase)?;
-        let action = proxy_dispatch(runtime, engine, live_request.as_ref(), dispatch);
-        if action.kind == RappBridgeActionKind::SessionClosed {
-            *state = OperationBridgeState::Closed;
-        }
-        drop(state);
-        Ok(action)
+            );
+            let dispatch = engine
+                .approve(
+                    operation_id,
+                    approval,
+                    approved_at_ms,
+                    self.maximum_lifetime_ms,
+                )
+                .map_err(|_| RappBindingError::WrongPhase)?;
+            let action = proxy_dispatch(runtime, engine, live_request.as_ref(), dispatch);
+            if action.kind == RappBridgeActionKind::SessionClosed {
+                *state = OperationBridgeState::Closed;
+            }
+            drop(state);
+            Ok(action)
+        })
     }
 
     /// The holder declined.
@@ -1125,27 +1142,29 @@ impl RappOperationBridge {
     /// # Errors
     /// [`RappBindingError`] on the wrong protocol phase.
     pub fn expire_due(&self, now_ms: u64) -> Result<RappBridgeAction, RappBindingError> {
-        let mut state = self.lock_state()?;
-        let OperationBridgeState::Proxy {
-            runtime,
-            engine,
-            live_request,
-        } = &mut *state
-        else {
-            return Err(RappBindingError::WrongPhase);
-        };
-        let action = match engine
-            .expire_due(now_ms, self.maximum_lifetime_ms)
-            .map_err(|_| RappBindingError::WrongPhase)?
-        {
-            Some(dispatch) => proxy_dispatch(runtime, engine, live_request.as_ref(), dispatch),
-            None => RappBridgeAction::simple(RappBridgeActionKind::NoAction),
-        };
-        if action.kind == RappBridgeActionKind::SessionClosed {
-            *state = OperationBridgeState::Closed;
-        }
-        drop(state);
-        Ok(action)
+        self.serving(|| {
+            let mut state = self.lock_state()?;
+            let OperationBridgeState::Proxy {
+                runtime,
+                engine,
+                live_request,
+            } = &mut *state
+            else {
+                return Err(RappBindingError::WrongPhase);
+            };
+            let action = match engine
+                .expire_due(now_ms, self.maximum_lifetime_ms)
+                .map_err(|_| RappBindingError::WrongPhase)?
+            {
+                Some(dispatch) => proxy_dispatch(runtime, engine, live_request.as_ref(), dispatch),
+                None => RappBridgeAction::simple(RappBridgeActionKind::NoAction),
+            };
+            if action.kind == RappBridgeActionKind::SessionClosed {
+                *state = OperationBridgeState::Closed;
+            }
+            drop(state);
+            Ok(action)
+        })
     }
 
     /// Tell the requester which card the custodian holds and whether a
@@ -1174,24 +1193,26 @@ impl RappOperationBridge {
             card,
             reader: card_reader.into(),
         };
-        let mut state = self.lock_state()?;
-        let OperationBridgeState::Proxy {
-            runtime, engine, ..
-        } = &mut *state
-        else {
-            return Err(RappBindingError::WrongPhase);
-        };
-        let action = send_proxy(
-            runtime,
-            engine,
-            None,
-            &ProxyOperationEngine::report_card_status(status),
-        );
-        if action.kind == RappBridgeActionKind::SessionClosed {
-            *state = OperationBridgeState::Closed;
-        }
-        drop(state);
-        Ok(action)
+        self.serving(|| {
+            let mut state = self.lock_state()?;
+            let OperationBridgeState::Proxy {
+                runtime, engine, ..
+            } = &mut *state
+            else {
+                return Err(RappBindingError::WrongPhase);
+            };
+            let action = send_proxy(
+                runtime,
+                engine,
+                None,
+                &ProxyOperationEngine::report_card_status(status),
+            );
+            if action.kind == RappBridgeActionKind::SessionClosed {
+                *state = OperationBridgeState::Closed;
+            }
+            drop(state);
+            Ok(action)
+        })
     }
 
     /// Report a change of the live operation's state.
@@ -1204,25 +1225,27 @@ impl RappOperationBridge {
         event: RappProgressEvent,
     ) -> Result<RappBridgeAction, RappBindingError> {
         let operation_id = decode_operation_id(&operation_id)?;
-        let mut state = self.lock_state()?;
-        let OperationBridgeState::Proxy {
-            runtime, engine, ..
-        } = &mut *state
-        else {
-            return Err(RappBindingError::WrongPhase);
-        };
-        let message = engine
-            .report_progress(operation_id, event.into())
-            .map_err(|error| match error {
-                ProxyEngineError::UnknownLocalOperation => RappBindingError::UnknownOperation,
-                _ => RappBindingError::WrongPhase,
-            })?;
-        let action = send_proxy(runtime, engine, Some(operation_id), &message);
-        if action.kind == RappBridgeActionKind::SessionClosed {
-            *state = OperationBridgeState::Closed;
-        }
-        drop(state);
-        Ok(action)
+        self.serving(|| {
+            let mut state = self.lock_state()?;
+            let OperationBridgeState::Proxy {
+                runtime, engine, ..
+            } = &mut *state
+            else {
+                return Err(RappBindingError::WrongPhase);
+            };
+            let message = engine
+                .report_progress(operation_id, event.into())
+                .map_err(|error| match error {
+                    ProxyEngineError::UnknownLocalOperation => RappBindingError::UnknownOperation,
+                    _ => RappBindingError::WrongPhase,
+                })?;
+            let action = send_proxy(runtime, engine, Some(operation_id), &message);
+            if action.kind == RappBridgeActionKind::SessionClosed {
+                *state = OperationBridgeState::Closed;
+            }
+            drop(state);
+            Ok(action)
+        })
     }
 
     /// Complete a card inspection with the card's answer to reset, or its
@@ -1296,23 +1319,28 @@ impl RappOperationBridge {
     /// Record one batch signature as the card makes it.
     ///
     /// # Errors
-    /// [`RappBindingError`] on invalid input or an operation that is not an
-    /// executing batch.
+    /// [`RappBindingError`] on invalid input, an operation that is not an
+    /// executing batch, or a forgotten or revoked pairing, whose
+    /// `pairing_revoked` close the next serving call returns.
     pub fn record_batch_signature(
         &self,
         operation_id: Vec<u8>,
         signature: Vec<u8>,
     ) -> Result<(), RappBindingError> {
         let operation_id = decode_operation_id(&operation_id)?;
-        let mut state = self.lock_state()?;
-        let OperationBridgeState::Proxy { engine, .. } = &mut *state else {
-            return Err(RappBindingError::WrongPhase);
-        };
-        let result = engine
-            .record_batch_signature(operation_id, signature)
-            .map_err(|_| RappBindingError::WrongPhase);
-        drop(state);
-        result
+        self.pair
+            .serve_while_active(|| {
+                let mut state = self.lock_state()?;
+                let OperationBridgeState::Proxy { engine, .. } = &mut *state else {
+                    return Err(RappBindingError::WrongPhase);
+                };
+                let result = engine
+                    .record_batch_signature(operation_id, signature)
+                    .map_err(|_| RappBindingError::WrongPhase);
+                drop(state);
+                result
+            })?
+            .ok_or(RappBindingError::WrongPhase)
     }
 
     /// Answer a batch once every document is signed, with exactly those
@@ -1326,24 +1354,26 @@ impl RappOperationBridge {
         operation_id: Vec<u8>,
     ) -> Result<RappBridgeAction, RappBindingError> {
         let operation_id = decode_operation_id(&operation_id)?;
-        let mut state = self.lock_state()?;
-        let OperationBridgeState::Proxy {
-            runtime,
-            engine,
-            live_request,
-        } = &mut *state
-        else {
-            return Err(RappBindingError::WrongPhase);
-        };
-        let dispatch = engine
-            .complete_batch(operation_id)
-            .map_err(|_| RappBindingError::WrongPhase)?;
-        let action = proxy_dispatch(runtime, engine, live_request.as_ref(), dispatch);
-        if action.kind == RappBridgeActionKind::SessionClosed {
-            *state = OperationBridgeState::Closed;
-        }
-        drop(state);
-        Ok(action)
+        self.serving(|| {
+            let mut state = self.lock_state()?;
+            let OperationBridgeState::Proxy {
+                runtime,
+                engine,
+                live_request,
+            } = &mut *state
+            else {
+                return Err(RappBindingError::WrongPhase);
+            };
+            let dispatch = engine
+                .complete_batch(operation_id)
+                .map_err(|_| RappBindingError::WrongPhase)?;
+            let action = proxy_dispatch(runtime, engine, live_request.as_ref(), dispatch);
+            if action.kind == RappBridgeActionKind::SessionClosed {
+                *state = OperationBridgeState::Closed;
+            }
+            drop(state);
+            Ok(action)
+        })
     }
 
     /// Advance liveness with the platform's monotonic time and CSPRNG
@@ -1358,25 +1388,27 @@ impl RappOperationBridge {
         challenge: Vec<u8>,
     ) -> Result<RappBridgeAction, RappBindingError> {
         let challenge = PingChallenge::reconstruct(fixed_array(challenge)?);
-        let mut state = self.lock_state()?;
-        let decision = match &mut *state {
-            OperationBridgeState::Requester { runtime, .. }
-            | OperationBridgeState::Proxy { runtime, .. } => runtime
-                .poll(now_ms, challenge)
-                .map_err(|_| RappBindingError::ProtocolFailure)?,
-            OperationBridgeState::Closed => {
-                return Ok(RappBridgeAction::session_closed(EndedOperation::default()));
-            }
-        };
-        let action = match decision {
-            RuntimePoll::NoAction => RappBridgeAction::simple(RappBridgeActionKind::NoAction),
-            RuntimePoll::Send(frame) => RappBridgeAction::send(None, frame),
-            RuntimePoll::SessionClosed(_) | RuntimePoll::AlreadyClosed => {
-                RappBridgeAction::session_closed(end_operations(&mut state))
-            }
-        };
-        drop(state);
-        Ok(action)
+        self.serving(|| {
+            let mut state = self.lock_state()?;
+            let decision = match &mut *state {
+                OperationBridgeState::Requester { runtime, .. }
+                | OperationBridgeState::Proxy { runtime, .. } => runtime
+                    .poll(now_ms, challenge)
+                    .map_err(|_| RappBindingError::ProtocolFailure)?,
+                OperationBridgeState::Closed => {
+                    return Ok(RappBridgeAction::session_closed(EndedOperation::default()));
+                }
+            };
+            let action = match decision {
+                RuntimePoll::NoAction => RappBridgeAction::simple(RappBridgeActionKind::NoAction),
+                RuntimePoll::Send(frame) => RappBridgeAction::send(None, frame),
+                RuntimePoll::SessionClosed(_) | RuntimePoll::AlreadyClosed => {
+                    RappBridgeAction::session_closed(end_operations(&mut state))
+                }
+            };
+            drop(state);
+            Ok(action)
+        })
     }
 
     /// Close the session; every operation of it is over and the pairing
@@ -1437,6 +1469,20 @@ impl RappOperationBridge {
 }
 
 impl RappOperationBridge {
+    /// Serve one call while the pairing stays active. Once the record is
+    /// forgotten or revoked the session serves nothing and closes with
+    /// `pairing_revoked` in place of the call (RAPP section 4.6 and its
+    /// item 1); the returned action carries that close.
+    fn serving(
+        &self,
+        serve: impl FnOnce() -> Result<RappBridgeAction, RappBindingError>,
+    ) -> Result<RappBridgeAction, RappBindingError> {
+        match self.pair.serve_while_active(serve)? {
+            Some(action) => Ok(action),
+            None => self.close_with_reason(RappCloseReason::PairingRevoked),
+        }
+    }
+
     fn lock_state(&self) -> Result<MutexGuard<'_, OperationBridgeState>, RappBindingError> {
         self.state
             .lock()
@@ -1451,41 +1497,43 @@ impl RappOperationBridge {
         operation: CardOperation,
     ) -> Result<RappBridgeAction, RappBindingError> {
         let operation_id = decode_operation_id(operation_id)?;
-        let mut state = self.lock_state()?;
-        let OperationBridgeState::Requester {
-            runtime,
-            engine,
-            granted_profiles,
-        } = &mut *state
-        else {
-            return Err(RappBindingError::WrongPhase);
-        };
-        let profile: ProfileName = operation.required_profile();
-        if !granted_profiles.contains(&profile) {
-            return Err(RappBindingError::InvalidInput);
-        }
-        let request = OperationRequest::reconstruct(
-            operation_id,
-            profile,
-            local_start_ms,
-            expires_after_ms,
-            operation,
-        )
-        .map_err(|_| RappBindingError::InvalidInput)?;
-        let message = engine.begin(request).map_err(|error| match error {
-            RequesterEngineError::LiveOperation => RappBindingError::WrongPhase,
-            _ => RappBindingError::InvalidInput,
-        })?;
-        let action = if let Ok(frame) = runtime.endpoint_mut().send(&message) {
-            RappBridgeAction::send(Some(operation_id), frame)
-        } else {
-            runtime.close_session();
-            let ended = EndedOperation::requester(engine);
-            *state = OperationBridgeState::Closed;
-            RappBridgeAction::session_closed(ended)
-        };
-        drop(state);
-        Ok(action)
+        self.serving(|| {
+            let mut state = self.lock_state()?;
+            let OperationBridgeState::Requester {
+                runtime,
+                engine,
+                granted_profiles,
+            } = &mut *state
+            else {
+                return Err(RappBindingError::WrongPhase);
+            };
+            let profile: ProfileName = operation.required_profile();
+            if !granted_profiles.contains(&profile) {
+                return Err(RappBindingError::InvalidInput);
+            }
+            let request = OperationRequest::reconstruct(
+                operation_id,
+                profile,
+                local_start_ms,
+                expires_after_ms,
+                operation,
+            )
+            .map_err(|_| RappBindingError::InvalidInput)?;
+            let message = engine.begin(request).map_err(|error| match error {
+                RequesterEngineError::LiveOperation => RappBindingError::WrongPhase,
+                _ => RappBindingError::InvalidInput,
+            })?;
+            let action = if let Ok(frame) = runtime.endpoint_mut().send(&message) {
+                RappBridgeAction::send(Some(operation_id), frame)
+            } else {
+                runtime.close_session();
+                let ended = EndedOperation::requester(engine);
+                *state = OperationBridgeState::Closed;
+                RappBridgeAction::session_closed(ended)
+            };
+            drop(state);
+            Ok(action)
+        })
     }
 
     fn finish_failure(
@@ -1494,24 +1542,26 @@ impl RappOperationBridge {
         failure: ProxyFailure,
     ) -> Result<RappBridgeAction, RappBindingError> {
         let operation_id = decode_operation_id(operation_id)?;
-        let mut state = self.lock_state()?;
-        let OperationBridgeState::Proxy {
-            runtime,
-            engine,
-            live_request,
-        } = &mut *state
-        else {
-            return Err(RappBindingError::WrongPhase);
-        };
-        let dispatch = engine
-            .finish_failure(operation_id, failure)
-            .map_err(|_| RappBindingError::WrongPhase)?;
-        let action = proxy_dispatch(runtime, engine, live_request.as_ref(), dispatch);
-        if action.kind == RappBridgeActionKind::SessionClosed {
-            *state = OperationBridgeState::Closed;
-        }
-        drop(state);
-        Ok(action)
+        self.serving(|| {
+            let mut state = self.lock_state()?;
+            let OperationBridgeState::Proxy {
+                runtime,
+                engine,
+                live_request,
+            } = &mut *state
+            else {
+                return Err(RappBindingError::WrongPhase);
+            };
+            let dispatch = engine
+                .finish_failure(operation_id, failure)
+                .map_err(|_| RappBindingError::WrongPhase)?;
+            let action = proxy_dispatch(runtime, engine, live_request.as_ref(), dispatch);
+            if action.kind == RappBridgeActionKind::SessionClosed {
+                *state = OperationBridgeState::Closed;
+            }
+            drop(state);
+            Ok(action)
+        })
     }
 
     fn complete(
@@ -1520,27 +1570,29 @@ impl RappOperationBridge {
         result: CardOperationResult,
     ) -> Result<RappBridgeAction, RappBindingError> {
         let operation_id = decode_operation_id(operation_id)?;
-        let mut state = self.lock_state()?;
-        let OperationBridgeState::Proxy {
-            runtime,
-            engine,
-            live_request,
-        } = &mut *state
-        else {
-            return Err(RappBindingError::WrongPhase);
-        };
-        let dispatch = engine
-            .finish_completed(
-                operation_id,
-                OperationResultMessage::completed(operation_id, &result),
-            )
-            .map_err(|_| RappBindingError::WrongPhase)?;
-        let action = proxy_dispatch(runtime, engine, live_request.as_ref(), dispatch);
-        if action.kind == RappBridgeActionKind::SessionClosed {
-            *state = OperationBridgeState::Closed;
-        }
-        drop(state);
-        Ok(action)
+        self.serving(|| {
+            let mut state = self.lock_state()?;
+            let OperationBridgeState::Proxy {
+                runtime,
+                engine,
+                live_request,
+            } = &mut *state
+            else {
+                return Err(RappBindingError::WrongPhase);
+            };
+            let dispatch = engine
+                .finish_completed(
+                    operation_id,
+                    OperationResultMessage::completed(operation_id, &result),
+                )
+                .map_err(|_| RappBindingError::WrongPhase)?;
+            let action = proxy_dispatch(runtime, engine, live_request.as_ref(), dispatch);
+            if action.kind == RappBridgeActionKind::SessionClosed {
+                *state = OperationBridgeState::Closed;
+            }
+            drop(state);
+            Ok(action)
+        })
     }
 }
 

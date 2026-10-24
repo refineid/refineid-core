@@ -36,7 +36,8 @@ applies one rule, `check_retry_floor` in `refineid-auth`:
 
 The last attempts belong to the cardholder: other software may spend
 them, but a lockout is never RefineID's doing. Holding PIN 1 for reuse is
-stricter still: it requires every counter pristine (below).
+stricter still: it requires the PIN 1 counter at its full allowance, read as
+five tries left or as PIN 1 verified (below).
 
 ## PIN2: every signature or batch
 
@@ -59,8 +60,12 @@ PIN1 entry for every authentication-key signing operation. RefineID's explicit
 product decision is to provide a convenience exception for PIN1
 authentication operations, bounded by the card's presence, including TLS
 client-auth signatures driven by CryptoTokenKit. The software re-presents PIN1
-to the card for every operation; it does not treat card verification state as
-persistent. This exception must be disclosed as a profile deviation in public
+to the card for every operation, except when the card itself answers the
+probe as already verified in the current session: a successful VERIFY sets
+the try counter to its limit and the validated flag true (FINEID S1 v4.2
+section 3.5), so such a card signs without another VERIFY. Verification
+state is never assumed; it is read from the card before every command. This
+exception must be disclosed as a profile deviation in public
 release documentation. It never extends to PIN2 or either qualified-signature
 key. The current specification is published on the
 [DVV FINEID specifications page](https://dvv.fi/en/fineid-specifications).
@@ -71,9 +76,18 @@ countdown. It is never written to storage -- not to a keychain, a keystore, a
 credential manager or a file -- so it never survives a restart (RAPP v26.10.22
 section 11 item 2).
 
-Reusable retention is allowed only when every live credential retry counter is
-in its pristine state. The held entry is bound to the complete card token
-identifier and the PIN1 authentication role. Its capability excludes PIN
+Reusable retention is allowed only when the PIN1 retry counter is at its
+limit. The probe that precedes every authentication operation, whether or not
+the operation will carry the PIN, decides it anew: a probe reading five tries
+left, or PIN1 verified in session, permits holding; any other reading destroys
+the held value before the card is commanded, and a freshly entered PIN1 is held
+only under such a probe. A verified answer carries no count and still proves a
+full counter: a successful VERIFY sets the counter to its limit and the flag,
+a failed VERIFY or CHANGE REFERENCE DATA decrements the counter and clears the
+flag, and a successful CHANGE REFERENCE DATA or RESET RETRY COUNTER sets the
+counter to its limit with the flag cleared (FINEID S1 v4.2 sections 3.5, 3.11
+and 3.12). The held entry is bound to the complete card token identifier and the PIN1
+authentication role. Its capability excludes PIN
 management, PIN2, and qualified-signature operations.
 
 Use is destructive checkout:
@@ -102,7 +116,8 @@ Held PIN1 is destroyed on:
 - a wrong, blocked or malformed PIN response, or a retry counter that went
   down;
 - process exit, device restart, or the user clearing it; and
-- retry-counter state below pristine or unavailable counter state.
+- a probe reporting anything but five tries left or PIN1 verified: a lower
+  count, a blocked PIN, or no readable state.
 
 PIN2 is never held between operations, so it has nothing to invalidate.
 

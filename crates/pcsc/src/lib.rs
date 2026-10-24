@@ -1013,6 +1013,10 @@ struct ReaderStatus {
     /// The reader's card insertion and removal count
     /// ([`ReaderInfo::card_events`]).
     card_events: u32,
+    /// The platform reported the reader's state in this query. A
+    /// zero-wait query that times out leaves the state as the caller
+    /// passed it, with no count read.
+    reported: bool,
 }
 
 /// Query the named reader's state once, without waiting for a change.
@@ -1020,15 +1024,17 @@ fn reader_status(ctx: &Context, reader: &str) -> Result<ReaderStatus, PcscError>
     let cstr = CString::new(reader)
         .map_err(|e| PcscError::Transport(format!("reader name has interior NUL: {e}")))?;
     let mut states = [ReaderState::new(cstr, State::UNAWARE)];
-    match ctx.get_status_change(core::time::Duration::ZERO, &mut states) {
-        Ok(()) | Err(pcsc::Error::Timeout) => {}
+    let answered = match ctx.get_status_change(core::time::Duration::ZERO, &mut states) {
+        Ok(()) => true,
+        Err(pcsc::Error::Timeout) => false,
         Err(e) => return Err(e.into()),
-    }
+    };
     let [state] = &states;
     let event = state.event_state();
     Ok(ReaderStatus {
         card_present: event.contains(State::PRESENT) && !event.contains(State::EMPTY),
         card_events: state.event_count(),
+        reported: answered || event.contains(State::CHANGED),
     })
 }
 
@@ -1057,7 +1063,12 @@ impl ReaderBackend for PcscBackend {
 
     fn card_events(&self, reader: &ReaderId) -> Result<u32, Self::Error> {
         let ctx = establish_context()?;
-        Ok(reader_status(&ctx, reader.as_str())?.card_events)
+        let status = reader_status(&ctx, reader.as_str())?;
+        if status.reported {
+            Ok(status.card_events)
+        } else {
+            Err(PcscError::Pcsc(pcsc::Error::Timeout))
+        }
     }
 
     fn open_exclusive(

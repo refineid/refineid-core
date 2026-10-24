@@ -22,10 +22,14 @@
 //! [`doc/fineid-s2-cert-profile.md`][s2] for the broader
 //! framing.
 //!
-//! The on-card root cert at `EF.4334` is the proximate trust
-//! source for the chain check (leaf -> AIA-fetched intermediate
-//! -> on-card root). We pin its SHA-256 here so that a card with
-//! a substituted root cert can't fool the verifier.
+//! The pin tables are the only trust anchors. The on-card root
+//! cert at `EF.4334` and the issuing CA at `EF.4336` are
+//! distribution copies: [`crate::trust_roots`] admits them only
+//! when the root's SHA-256 is in [`PINNED_ROOT_SHA256`] and the
+//! issuing CA chains to it, and no lookup here consults that
+//! cache. A card with a substituted root cert therefore cannot
+//! fool the verifier, and nothing an application injects at
+//! start can widen the anchor set.
 //!
 //! DVV runs **two parallel G3 roots** since 2021-05-06, one
 //! per key family (RSA / ECC). Both are pinned: an RSA-keyed
@@ -38,7 +42,6 @@
 //! [typing]: ../../../../doc/typing-discipline.md
 //! [s2]: ../../../../doc/fineid-s2-cert-profile.md
 
-use crate::trust_roots;
 use refineid_digest::Sha256;
 
 /// Accepted on-card root certs as `(label, sha256)` pairs.
@@ -70,14 +73,9 @@ pub const PINNED_ROOT_SHA256: &[(&str, Sha256)] = &[
     ),
 ];
 
-/// `true` if `fingerprint` matches one of the pinned roots or dynamically cached roots.
+/// `true` if `fingerprint` matches one of the pinned roots.
 #[must_use]
 pub fn is_pinned_root(fingerprint: Sha256) -> bool {
-    if let Some(cached) = trust_roots::active_root_certificates()
-        && cached.contains_fingerprint(fingerprint)
-    {
-        return true;
-    }
     PINNED_ROOT_SHA256
         .iter()
         .any(|(_, pinned)| *pinned == fingerprint)
@@ -87,11 +85,6 @@ pub fn is_pinned_root(fingerprint: Sha256) -> bool {
 /// `fingerprint`, or `None` if no pin matches.
 #[must_use]
 pub fn pinned_root_label(fingerprint: Sha256) -> Option<&'static str> {
-    if let Some(cached) = trust_roots::active_root_certificates()
-        && cached.contains_fingerprint(fingerprint)
-    {
-        return Some("On-Card Issuing Root CA");
-    }
     PINNED_ROOT_SHA256
         .iter()
         .find(|(_, fp)| *fp == fingerprint)
@@ -272,8 +265,8 @@ pub fn pinned_icao_root_label(fingerprint: Sha256) -> Option<&'static str> {
 mod tests {
     use super::{
         PINNED_ROOT_DER, PINNED_ROOT_SHA256, PINNED_TSA_ROOT_DER, PINNED_TSA_ROOT_SHA256,
-        is_pinned_tsa_root, pinned_root_der_by_fingerprint, pinned_tsa_root_der_by_fingerprint,
-        pinned_tsa_root_label,
+        is_pinned_root, is_pinned_tsa_root, pinned_root_der_by_fingerprint, pinned_root_label,
+        pinned_tsa_root_der_by_fingerprint, pinned_tsa_root_label,
     };
     use crate::test_util::{TestResult, check, check_true};
     use refineid_digest::Sha256;
@@ -318,6 +311,41 @@ mod tests {
         check_true(
             pinned_root_der_by_fingerprint(bogus).is_none(),
             "bogus pin returns None",
+        )
+    }
+
+    /// Only the pin table answers: every pinned fingerprint is a
+    /// root, and a well-formed certificate outside the table (the
+    /// TSA root) is not, whatever any cache holds.
+    #[test]
+    fn is_pinned_root_true_only_for_pin_table() -> TestResult {
+        for (label, pin) in PINNED_ROOT_SHA256 {
+            check_true(is_pinned_root(*pin), &format!("{label} is pinned"))?;
+        }
+        let tsa_root = Sha256::of(PINNED_TSA_ROOT_DER[0].1);
+        check_true(
+            !is_pinned_root(tsa_root),
+            "a certificate outside the pin table is not a root",
+        )?;
+        let bogus = Sha256::from_bytes([0_u8; 32]);
+        check_true(!is_pinned_root(bogus), "bogus fingerprint is not a root")
+    }
+
+    /// The label comes from the pin table and from nowhere else.
+    #[test]
+    fn pinned_root_label_only_from_pin_table() -> TestResult {
+        for (label, pin) in PINNED_ROOT_SHA256 {
+            check(
+                &pinned_root_label(*pin),
+                &Some(*label),
+                "label of a pinned root",
+            )?;
+        }
+        let tsa_root = Sha256::of(PINNED_TSA_ROOT_DER[0].1);
+        check(
+            &pinned_root_label(tsa_root),
+            &None,
+            "no label for a certificate outside the pin table",
         )
     }
 

@@ -179,6 +179,16 @@ fn a_batch_whose_result_overflows_one_frame_is_refused() {
             }
         ))
     );
+    assert_eq!(
+        OperationRequest::reconstruct(
+            request.operation_id,
+            request.profile,
+            request.local_start_ms,
+            request.expires_after_ms,
+            request.operation.clone(),
+        ),
+        Err(CardOperationError::BatchTooLarge)
+    );
     let mut requester = RequesterOperationEngine::new();
     assert_eq!(
         requester.begin(request).err(),
@@ -266,33 +276,60 @@ fn batch_bounds_hold_for_every_key_profile() {
     );
 }
 
+/// Envelopes the custodian seals before the refused one.
+const ENVELOPES_BEFORE_THE_REFUSAL: u64 = 3;
+
+/// A completed certificate result of `size` bytes.
+fn certificate_result(size: usize) -> BTreeMap<String, WireValue> {
+    OperationResultMessage::completed(
+        OperationId::from_array([SIGNATURE_BYTE; OPERATION_ID_SIZE]),
+        &CardOperationResult::Certificate(vec![SIGNATURE_BYTE; size]),
+    )
+    .to_wire_body()
+    .expect("the body builds")
+}
+
 #[test]
 fn a_refused_seal_leaves_the_send_sequence_unchanged() {
     let (mut requester_channel, mut custodian_channel) = session_channels();
-    let oversized = OperationResultMessage::completed(
-        OperationId::from_array([SIGNATURE_BYTE; OPERATION_ID_SIZE]),
-        &CardOperationResult::Certificate(vec![SIGNATURE_BYTE; MAX_FRAME_PLAINTEXT]),
-    );
-    assert!(
-        custodian_channel
+    for sequence in 0..ENVELOPES_BEFORE_THE_REFUSAL {
+        let frame = custodian_channel
             .seal(
                 MessageType::OperationResult,
-                oversized.to_wire_body().expect("the body builds"),
+                certificate_result(SHA256_DIGEST_SIZE),
             )
-            .is_err()
-    );
-    let fitting = OperationResultMessage::completed(
-        OperationId::from_array([SIGNATURE_BYTE; OPERATION_ID_SIZE]),
-        &CardOperationResult::Certificate(vec![SIGNATURE_BYTE; SHA256_DIGEST_SIZE]),
-    );
-    let frame = custodian_channel
-        .seal(
-            MessageType::OperationResult,
-            fitting.to_wire_body().expect("the body builds"),
-        )
-        .expect("the next envelope seals");
-    let opened = requester_channel
-        .open(&frame)
-        .expect("the peer accepts the first sequence");
-    assert_eq!(opened.sequence, 0);
+            .expect("an envelope that fits seals");
+        assert_eq!(
+            requester_channel
+                .open(&frame)
+                .expect("the peer accepts it")
+                .sequence,
+            sequence
+        );
+    }
+    for _ in 0..ENVELOPES_BEFORE_THE_REFUSAL {
+        assert!(
+            custodian_channel
+                .seal(
+                    MessageType::OperationResult,
+                    certificate_result(MAX_FRAME_PLAINTEXT),
+                )
+                .is_err()
+        );
+    }
+    for sequence in ENVELOPES_BEFORE_THE_REFUSAL..ENVELOPES_BEFORE_THE_REFUSAL * 2 {
+        let frame = custodian_channel
+            .seal(
+                MessageType::OperationResult,
+                certificate_result(SHA256_DIGEST_SIZE),
+            )
+            .expect("the next envelope seals");
+        assert_eq!(
+            requester_channel
+                .open(&frame)
+                .expect("the peer accepts the sequence after the refusals")
+                .sequence,
+            sequence
+        );
+    }
 }

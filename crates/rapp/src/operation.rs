@@ -301,10 +301,7 @@ impl CardOperation {
                     }
                     validate_named_digest(name, *key_profile, *algorithm, digest)?;
                 }
-                if !batch_result_fits_one_frame(digests.len(), *key_profile) {
-                    return Err(CardOperationError::BatchTooLarge);
-                }
-                Ok(())
+                ensure_batch_result_fits_one_frame(digests.len(), *key_profile)
             }
             _ => Ok(()),
         }
@@ -750,30 +747,37 @@ fn validate_named_digest(
     Ok(())
 }
 
-/// Whether the completed result of a batch of `count` signatures of
+/// Check that the completed result of a batch of `count` signatures of
 /// `key_profile` travels in one frame (section 7.2 item 4): the largest
 /// `operation.result` envelope such a batch can produce is built and
 /// encoded against the single-frame limit.
-fn batch_result_fits_one_frame(count: usize, key_profile: CardKeyProfile) -> bool {
+///
+/// # Errors
+/// [`CardOperationError::BatchTooLarge`] when that envelope exceeds one
+/// frame; any other encoding failure as itself.
+fn ensure_batch_result_fits_one_frame(
+    count: usize,
+    key_profile: CardKeyProfile,
+) -> Result<(), CardOperationError> {
     let signature = vec![u8::MIN; key_profile.signature_size()];
     let result = CardOperationResult::Signatures(vec![signature; count]);
-    let message = OperationResultMessage::completed(
+    let body = OperationResultMessage::completed(
         OperationId::from_array([u8::MIN; OPERATION_ID_SIZE]),
         &result,
-    );
-    message
-        .to_wire_body()
-        .and_then(|body| {
-            Envelope::reconstruct(
-                MessageType::OperationResult,
-                SessionId::from_array([u8::MIN; SESSION_ID_SIZE]),
-                u64::MAX,
-                body,
-            )
-            .map_err(CardOperationError::Wire)
-        })
-        .and_then(|envelope| envelope.encode().map_err(CardOperationError::Wire))
-        .is_ok()
+    )
+    .to_wire_body()?;
+    let envelope = Envelope::reconstruct(
+        MessageType::OperationResult,
+        SessionId::from_array([u8::MIN; SESSION_ID_SIZE]),
+        u64::MAX,
+        body,
+    )
+    .map_err(CardOperationError::Wire)?;
+    match envelope.encode() {
+        Ok(_) => Ok(()),
+        Err(WireError::OversizedPlaintext { .. }) => Err(CardOperationError::BatchTooLarge),
+        Err(error) => Err(CardOperationError::Wire(error)),
+    }
 }
 
 /// Rejected operation construction or hashing.

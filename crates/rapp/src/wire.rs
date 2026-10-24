@@ -253,29 +253,31 @@ impl SequenceGuard {
         }
     }
 
-    /// Build the next outgoing message at the only legal sequence; the
-    /// counter stays where it is until [`Self::advance_send`].
+    /// Build the next outgoing message at the only legal sequence, encode it
+    /// within one frame, and hand the plaintext to `seal`. The counter
+    /// advances only when `seal` succeeds, so a refused body or a failed
+    /// encryption leaves the next sequence equal to the Noise nonce
+    /// (section 7.2 item 3).
     ///
     /// # Errors
-    /// [`WireError`] on an invalid body.
-    pub fn outgoing(
-        &self,
+    /// [`WireError::SequenceWrapped`] on sequence exhaustion, [`WireError`]
+    /// on an invalid body or one that does not fit a frame, or the error of
+    /// `seal`.
+    pub fn seal_next<T, E: From<WireError>>(
+        &mut self,
         message_type: MessageType,
         body: BTreeMap<String, WireValue>,
-    ) -> Result<Envelope, WireError> {
-        Envelope::reconstruct(message_type, self.session_id, self.next_send, body)
-    }
-
-    /// Consume the sequence of an outgoing message that encoded.
-    ///
-    /// # Errors
-    /// [`WireError::SequenceWrapped`] on sequence exhaustion.
-    pub fn advance_send(&mut self) -> Result<(), WireError> {
-        self.next_send = self
+        seal: impl FnOnce(&[u8]) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let following = self
             .next_send
             .checked_add(1)
             .ok_or(WireError::SequenceWrapped)?;
-        Ok(())
+        let plaintext =
+            Envelope::reconstruct(message_type, self.session_id, self.next_send, body)?.encode()?;
+        let sealed = seal(&plaintext)?;
+        self.next_send = following;
+        Ok(sealed)
     }
 
     /// Verify session binding and exact next sequence after decryption.
@@ -1005,6 +1007,32 @@ mod tests {
             decode_deterministic_cbor(&[0x18, 0x01]),
             Err(WireError::NonCanonical)
         );
+    }
+
+    #[test]
+    fn a_failed_seal_leaves_the_send_sequence_where_it_was() {
+        let session = SessionId::from_array([7; 16]);
+        let mut guard = SequenceGuard::new(session);
+        let body =
+            || BTreeMap::from([("reason".to_owned(), WireValue::Text("cancelled".to_owned()))]);
+        assert_eq!(
+            guard.seal_next(MessageType::PairingAbort, body(), |_| {
+                Err::<(), _>(WireError::SequenceWrapped)
+            }),
+            Err(WireError::SequenceWrapped)
+        );
+        let sealed = guard
+            .seal_next(MessageType::PairingAbort, body(), |plaintext| {
+                Envelope::decode(plaintext)
+            })
+            .expect("the next seal succeeds");
+        assert_eq!(sealed.sequence, 0);
+        let following = guard
+            .seal_next(MessageType::PairingAbort, body(), |plaintext| {
+                Envelope::decode(plaintext)
+            })
+            .expect("the following seal succeeds");
+        assert_eq!(following.sequence, 1);
     }
 
     #[test]

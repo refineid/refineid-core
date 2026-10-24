@@ -29,6 +29,7 @@
 use crypto_bigint::modular::{FixedMontyForm, FixedMontyParams};
 use crypto_bigint::{Odd, U384};
 use subtle::{Choice, ConstantTimeEq};
+use zeroize::Zeroize;
 
 /// Field prime `p` (RFC 5639 section 3.6).
 const P_HEX: &str = concat!(
@@ -128,7 +129,12 @@ impl Sec1UncompressedPoint {
 ///
 /// `coords == None` is the point at infinity, the additive identity;
 /// `coords == Some((x, y))` is a finite point in canonical coordinates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Copy`: a point computed from a private scalar is duplicated only
+/// by an explicit `clone`, so the handshake owns every secret-dependent
+/// point in a zeroizing wrapper. Zeroizing wipes both coordinates and
+/// leaves the point at infinity.
+#[derive(Debug, Clone, PartialEq, Eq, Zeroize)]
 pub struct AffinePoint {
     /// Coordinates, or `None` for the point at infinity.
     pub coords: Option<(U384, U384)>,
@@ -254,10 +260,10 @@ impl AffinePoint {
     #[must_use]
     pub fn add(&self, other: &Self) -> Self {
         let Some((x1_u, y1_u)) = &self.coords else {
-            return *other;
+            return other.clone();
         };
         let Some((x2_u, y2_u)) = &other.coords else {
-            return *self;
+            return self.clone();
         };
 
         if x1_u == x2_u {
@@ -302,7 +308,7 @@ impl AffinePoint {
                     if started {
                         result = result.add(self);
                     } else {
-                        result = *self;
+                        result = self.clone();
                         started = true;
                     }
                 }
@@ -330,6 +336,7 @@ impl ConstantTimeEq for AffinePoint {
 mod tests {
     use super::{AffinePoint, COORD_LEN, SEC1_UNCOMPRESSED_LEN, n};
     use crypto_bigint::U384;
+    use zeroize::Zeroize as _;
 
     /// High bit of the prime's leading byte: brainpoolP384r1's prime
     /// exceeds two to the three hundred eighty-third power.
@@ -395,6 +402,15 @@ mod tests {
         assert_eq!(g.scalar_mul(&U384::ONE), g);
         assert_eq!(g.scalar_mul(&U384::from(TWO)), g.double());
         assert_eq!(g.scalar_mul(&U384::from(THREE)), g.double().add(&g));
+    }
+
+    #[test]
+    fn affine_point_zeroize_clears_both_coordinates() {
+        let mut point = AffinePoint::generator();
+        assert!(point.coords.is_some());
+        point.zeroize();
+        assert!(point.coords.is_none());
+        assert!(point.is_infinity());
     }
 
     #[test]

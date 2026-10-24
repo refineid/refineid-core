@@ -2018,6 +2018,9 @@ fn parse_xref_section(pdf: &[u8], offset: usize) -> Result<XrefSection, PdfError
         let token = read_pdf_token(pdf, &mut cursor).ok_or(PdfError::MissingTrailer)?;
         if token == b"trailer" {
             let (trailer, _after) = dictionary_at(pdf, cursor).ok_or(PdfError::MissingTrailer)?;
+            if dictionary_usize(&trailer, b"/Size").is_some_and(|size| size > MAX_XREF_ENTRIES) {
+                return Err(PdfError::MissingTrailer);
+            }
             return hybrid_merged(pdf, trailer, entries);
         }
 
@@ -2029,7 +2032,13 @@ fn parse_xref_section(pdf: &[u8], offset: usize) -> Result<XrefSection, PdfError
             .zip(usize::try_from(count).ok())
             .and_then(|(start, count)| start.checked_add(count))
             .ok_or(PdfError::MissingTrailer)?;
-        if end > MAX_XREF_ENTRIES {
+        // The subsections together declare no more entries than the
+        // ceiling either.
+        let total = usize::try_from(count)
+            .ok()
+            .and_then(|count| entries.len().checked_add(count))
+            .ok_or(PdfError::MissingTrailer)?;
+        if end > MAX_XREF_ENTRIES || total > MAX_XREF_ENTRIES {
             return Err(PdfError::MissingTrailer);
         }
 
@@ -2814,12 +2823,57 @@ mod tests {
 
     /// A classic table of one subsection, `entries` in-use rows.
     fn classic_table(start: usize, count: usize, entries: usize) -> Vec<u8> {
-        let mut table = format!("xref\n{start} {count}\n");
-        for _ in 0..entries {
-            table.push_str("0000000000 00000 n \n");
+        classic_table_sized(&[(start, count, entries)], 1)
+    }
+
+    /// A classic table of the subsections `(start, count, rows)` under a
+    /// trailer declaring `size`.
+    fn classic_table_sized(subsections: &[(usize, usize, usize)], size: usize) -> Vec<u8> {
+        let mut table = String::from("xref\n");
+        for (start, count, rows) in subsections {
+            table.push_str(&format!("{start} {count}\n"));
+            for _ in 0..*rows {
+                table.push_str("0000000000 00000 n \n");
+            }
         }
-        table.push_str("trailer\n<< /Size 1 >>\n");
+        table.push_str(&format!("trailer\n<< /Size {size} >>\n"));
         table.into_bytes()
+    }
+
+    #[test]
+    fn classic_subsections_together_are_bounded() {
+        let half = MAX_XREF_ENTRIES / 2;
+        let rows = 1;
+        // Each subsection lies below the ceiling; the second repeats the
+        // first's numbers and declares more entries than it leaves room
+        // for.
+        let over = classic_table_sized(&[(0, rows, rows), (0, MAX_XREF_ENTRIES, 0)], rows);
+        assert!(matches!(
+            parse_xref_section(&over, 0),
+            Err(PdfError::MissingTrailer)
+        ));
+        let subsections = [(0, rows, rows), (half, rows, rows)];
+        let section = parse_xref_section(&classic_table_sized(&subsections, rows), 0)
+            .expect("subsections within the ceiling are read");
+        assert_eq!(section.entries.len(), rows + rows);
+    }
+
+    #[test]
+    fn classic_trailer_size_is_bounded() {
+        let rows = 1;
+        assert!(matches!(
+            parse_xref_section(
+                &classic_table_sized(&[(0, rows, rows)], MAX_XREF_ENTRIES + 1),
+                0
+            ),
+            Err(PdfError::MissingTrailer)
+        ));
+        let section = parse_xref_section(
+            &classic_table_sized(&[(0, rows, rows)], MAX_XREF_ENTRIES),
+            0,
+        )
+        .expect("a size at the ceiling is read");
+        assert_eq!(section.entries.len(), rows);
     }
 
     #[test]

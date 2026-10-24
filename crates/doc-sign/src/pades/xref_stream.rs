@@ -31,9 +31,10 @@ const DECODED_LIMIT: usize = 1 << 26;
 /// mainstream writer, so a few hundred samples is ample headroom.
 const MAX_PREDICTOR_COLUMNS: usize = 256;
 
-/// Widest `/W` field this reader accepts, in bytes: wide enough for any
-/// offset this platform can address.
-const MAX_FIELD_WIDTH: usize = usize::BITS as usize / u8::BITS as usize;
+/// Widest `/W` field this reader accepts, in bytes: a 64-bit offset,
+/// on every target. A value wider than the platform's offsets is
+/// refused when the field is decoded, not by its declared width.
+const MAX_FIELD_WIDTH: usize = size_of::<u64>();
 
 /// The predictor value meaning none was applied.
 const NO_PREDICTOR: usize = 1;
@@ -97,10 +98,9 @@ pub(super) fn parse_stream_section(pdf: &[u8], offset: usize) -> Result<XrefSect
     if find_first(&object.dictionary, b"/XRef").is_none() {
         return Err(PdfError::MissingTrailer);
     }
-    let widths = integer_array(&object.dictionary, b"/W");
-    if widths.len() != ENTRY_FIELDS {
-        return Err(PdfError::MissingTrailer);
-    }
+    let widths: [usize; ENTRY_FIELDS] = integer_array(&object.dictionary, b"/W")
+        .try_into()
+        .map_err(|_ignored| PdfError::MissingTrailer)?;
     let size = dictionary_usize(&object.dictionary, b"/Size").ok_or(PdfError::MissingTrailer)?;
     if size > MAX_XREF_ENTRIES {
         return Err(PdfError::MissingTrailer);
@@ -399,7 +399,7 @@ fn paeth(left: u8, upper: u8, upper_left: u8) -> u8 {
 /// The decoded entry rows as section entries (ISO 32000-1 sec.7.5.8.3).
 fn stream_entries(
     payload: &[u8],
-    widths: &[usize],
+    widths: &[usize; ENTRY_FIELDS],
     subsections: &[usize],
 ) -> Result<Vec<XrefEntry>, PdfError> {
     if widths.iter().any(|width| *width > MAX_FIELD_WIDTH) {
@@ -411,14 +411,15 @@ fn stream_entries(
         return Err(PdfError::MissingTrailer);
     }
     // Every declared entry is a number below the file-wide ceiling and
-    // a full row of the payload; both hold before anything is pushed.
+    // a full row of the payload, and the pairs together declare no more
+    // entries than the ceiling; all hold before anything is pushed.
     let mut declared = 0_usize;
     for [first, count] in pairs {
         let end = first.checked_add(*count).ok_or(PdfError::MissingTrailer)?;
         declared = declared
             .checked_add(*count)
             .ok_or(PdfError::MissingTrailer)?;
-        if end > MAX_XREF_ENTRIES {
+        if end > MAX_XREF_ENTRIES || declared > MAX_XREF_ENTRIES {
             return Err(PdfError::MissingTrailer);
         }
     }
@@ -451,7 +452,11 @@ fn stream_entries(
 /// fields default to zero. Free, and any type this reader does not
 /// know, claims the number with no location -- a reference to such an
 /// object is a reference to null.
-fn entry_from_row(number: u32, row: &[u8], widths: &[usize]) -> Result<XrefEntry, PdfError> {
+fn entry_from_row(
+    number: u32,
+    row: &[u8],
+    widths: &[usize; ENTRY_FIELDS],
+) -> Result<XrefEntry, PdfError> {
     let mut fields = [0_usize; ENTRY_FIELDS];
     let mut at = 0_usize;
     for (position, width) in widths.iter().enumerate() {
@@ -528,8 +533,8 @@ fn trim(bytes: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_FIELD_WIDTH, MAX_PREDICTOR_COLUMNS, MAX_XREF_ENTRIES, PdfError, parse_stream_section,
-        png_unfiltered,
+        MAX_FIELD_WIDTH, MAX_PREDICTOR_COLUMNS, MAX_XREF_ENTRIES, PNG_NONE, PdfError, TYPE_DIRECT,
+        XrefLocation, parse_stream_section, png_unfiltered,
     };
 
     /// zlib compression level for test payloads; any level decodes.
@@ -602,6 +607,13 @@ mod tests {
              /DecodeParms << /Predictor 12 /Columns {MAX_PREDICTOR_COLUMNS} >>"
         );
         assert_eq!(parsed(&keys, &empty_flate()), Ok(0));
+        // One unfiltered row of the widest accepted shape decodes whole.
+        let mut row = vec![PNG_NONE];
+        row.extend((0..MAX_PREDICTOR_COLUMNS).map(|column| column.to_le_bytes()[0]));
+        assert_eq!(
+            png_unfiltered(&row, MAX_PREDICTOR_COLUMNS).as_deref(),
+            Ok(&row[1..])
+        );
     }
 
     #[test]
@@ -647,6 +659,26 @@ mod tests {
     }
 
     #[test]
+    fn index_pairs_together_are_bounded() {
+        // Each pair lies below the ceiling; together they declare more
+        // entries than it.
+        let keys = format!("/Size 1 /Index [0 1 0 {MAX_XREF_ENTRIES}] {WIDTHS}");
+        assert_eq!(parsed(&keys, &free_rows(1)), Err(PdfError::MissingTrailer));
+        let keys = format!("/Size 1 /Index [0 1 0 1] {WIDTHS}");
+        assert_eq!(parsed(&keys, &free_rows(2)), Ok(2));
+    }
+
+    #[test]
+    fn malformed_index_and_widths_are_refused() {
+        let keys = format!("/Size 1 /Index [0 1 2] {WIDTHS}");
+        assert_eq!(parsed(&keys, &free_rows(1)), Err(PdfError::MissingTrailer));
+        for widths in ["/W [1 4]", "/W [1 2 2 1]", "/W []"] {
+            let keys = format!("/Size 1 {widths}");
+            assert_eq!(parsed(&keys, &free_rows(1)), Err(PdfError::MissingTrailer));
+        }
+    }
+
+    #[test]
     fn index_count_sums_that_overflow_are_refused() {
         let keys = format!(
             "/Size 1 /Index [0 {} 0 {}] {WIDTHS}",
@@ -675,6 +707,22 @@ mod tests {
             let keys = format!("/Size 1 {widths}");
             assert_eq!(parsed(&keys, &free_rows(1)), Err(PdfError::MissingTrailer));
         }
+    }
+
+    #[test]
+    fn a_sixty_four_bit_offset_field_is_read_on_every_target() {
+        let offset: u64 = 1 << u8::BITS;
+        let mut row = vec![u8::try_from(TYPE_DIRECT).expect("a type code is one byte")];
+        row.extend(offset.to_be_bytes());
+        row.extend(u16::MIN.to_be_bytes());
+        let keys = format!("/Size 1 /W [1 {MAX_FIELD_WIDTH} 2]");
+        let section = parse_stream_section(&section(&keys, &row), 0).expect("the row is read");
+        assert!(matches!(
+            section.entries.as_slice(),
+            [entry] if entry.location == XrefLocation::Direct {
+                offset: usize::try_from(offset).expect("the offset fits every target"),
+            }
+        ));
     }
 
     /// Every combination of boundary values in the counts the file

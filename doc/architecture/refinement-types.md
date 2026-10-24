@@ -219,14 +219,15 @@ review:
    conversion bound, a generic byte parameter -- where a nominal
    unvalidated or refinement type belongs?
 10. Does the name say where the value comes from? A reader who knows only
-    the name must guess right, human or agent. Name by origin
-    (`ChipSerial`: what the chip reports; `PrintedSerial`: what is printed
-    on the plastic), never by a stack of adjectives that repeat each other
-    (`FullLongSerial`) or by a usage policy (`InternalSerial`), and never
-    by a consumer's vocabulary that misleads about the thing (`TokenSerial`
-    for the full chip serial, `CardInstanceIdentifier` for a printed
-    fragment). A name the reader guesses wrong is a defect, and a renaming
-    lands in every repository that shares the type in one change.
+    the name, human or agent, should be able to say what the value is and
+    where its bytes originate. Name by origin (`ChipSerial`: what the chip
+    reports; `PrintedSerial`: what is printed on the plastic), never by a
+    stack of adjectives that repeat each other (`FullLongSerial`) or by a
+    usage policy (`InternalSerial`), and never by a consumer's vocabulary
+    that misleads about the thing (`TokenSerial` for the full chip serial,
+    `CardInstanceIdentifier` for a printed fragment). A name readers get
+    wrong is a defect; its renaming is carried to every repository that
+    shares the type in the same round, one change in each.
 
 ## Case studies
 

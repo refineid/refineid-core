@@ -65,7 +65,7 @@ pub use cpace::{
     CPACE_CONFIRMATION_KEY_SIZE, CPACE_KC2_SUITE, CPACE_POINT_SIZE, CPACE_PRK_SIZE, CPACE_PSK_SIZE,
     CPACE_STEP1_MSG_SIZE, CPACE_STEP2_MSG_SIZE, CPACE_STEP3_MSG_SIZE, CPACE_TAG_SIZE,
     CPACE_TRANSCRIPT_HASH_SIZE, CpaceError, CpaceKc2Initiator, CpaceKc2Keys, CpaceKc2Responder,
-    CpaceKc2ResponderWaiting, CpaceState, calculate_confirmation_tag, calculate_generator_kc2,
+    CpaceKc2ResponderWaiting, calculate_confirmation_tag, calculate_generator_kc2,
     calculate_transcript_hash_v2, decode_kc2_step1_frame, decode_kc2_step2_frame,
     decode_kc2_step3_frame, derive_kc2_keys, encode_kc2_step1_frame, encode_kc2_step2_frame,
     encode_kc2_step3_frame, encode_pairing_context_v2, hkdf_expand_sha512_32, hkdf_extract_sha512,

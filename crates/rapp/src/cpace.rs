@@ -21,7 +21,6 @@
 
 use core::fmt;
 use curve25519_dalek::{
-    constants::RISTRETTO_BASEPOINT_POINT,
     ristretto::{CompressedRistretto, RistrettoPoint},
     scalar::Scalar,
     traits::Identity,
@@ -33,8 +32,8 @@ use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::{
-    BinaryFrame, HandshakeRole, OFFER_ID_SIZE, OfferId, PAIRING_SECRET_SIZE, PairingSecret,
-    WIRE_VERSION_V26_10_22, WireValue, decode_deterministic_cbor, encode_deterministic_cbor,
+    BinaryFrame, OFFER_ID_SIZE, OfferId, PairingSecret, WIRE_VERSION_V26_10_22, WireValue,
+    encode_deterministic_cbor,
 };
 
 /// Suite identifier for RAPP CPaceRistretto255 KC2 profile with Noise_XXpsk3.
@@ -74,8 +73,6 @@ const CPACE_RISTRETTO255_DSI: &[u8] = b"CPaceRistretto255";
 const CPACE_RISTRETTO255_ISK_DSI: &[u8] = b"CPaceRistretto255_ISK";
 /// SHA-512 input block size in bytes (draft-irtf-cfrg-cpace-21).
 const SHA512_INPUT_BLOCK_SIZE: usize = 128;
-/// Wire framing domain identifier for legacy CPace.
-const CPACE_FRAME_DOMAIN: &str = "RAPP-cpace-v1";
 /// Pairing context array domain identifier (RAPP v26.10.22 §6.1.1).
 const CPACE_CONTEXT_DOMAIN: &str = "rapp-pairing-context";
 /// Domain separation prefix for KC2 transcript hash ($TH$).
@@ -108,7 +105,7 @@ pub enum CpaceError {
     IdentityGenerator,
     /// Mutual confirmation tag ($T_A$ or $T_B$) verification failed.
     ConfirmationTagMismatch,
-    /// Received CPace binary frame was malformed, oversized, or carried wrong domain.
+    /// A CPace frame or byte slice has the wrong size, or a frame could not be encoded.
     MalformedFrame,
 }
 
@@ -133,166 +130,6 @@ impl fmt::Display for CpaceError {
 }
 
 impl core::error::Error for CpaceError {}
-
-/// Ephemeral state for one party in the CPace key exchange.
-#[derive(Zeroize, ZeroizeOnDrop)]
-pub struct CpaceState {
-    #[zeroize(skip)]
-    role: HandshakeRole,
-    offer_id: [u8; OFFER_ID_SIZE],
-    scalar: Scalar,
-    my_public: [u8; CPACE_POINT_SIZE],
-}
-
-impl CpaceState {
-    /// Start a CPace exchange for the given role, pairing code, offer ID, and 64 random bytes.
-    ///
-    /// # Errors
-    /// [`CpaceError`] if the code is invalid or scalar generation fails.
-    pub fn new(
-        role: HandshakeRole,
-        pairing_code: &str,
-        offer_id: &OfferId,
-        random_bytes_64: &[u8; 64],
-    ) -> Result<Self, CpaceError> {
-        let normalized_code = normalize_code(pairing_code)?;
-        let generator = calculate_generator(normalized_code.as_bytes(), &[], offer_id.as_bytes());
-
-        let scalar = Scalar::from_bytes_mod_order_wide(random_bytes_64);
-        if scalar == Scalar::ZERO {
-            return Err(CpaceError::InvalidScalar);
-        }
-
-        let my_point = generator * scalar;
-        let my_public = my_point.compress().to_bytes();
-
-        let mut offer_id_bytes = [0_u8; OFFER_ID_SIZE];
-        offer_id_bytes.copy_from_slice(offer_id.as_bytes());
-
-        Ok(Self {
-            role,
-            offer_id: offer_id_bytes,
-            scalar,
-            my_public,
-        })
-    }
-
-    /// Public ephemeral point to transmit to the peer (32 bytes).
-    #[must_use]
-    pub const fn public_point(&self) -> &[u8; CPACE_POINT_SIZE] {
-        &self.my_public
-    }
-
-    /// Complete the exchange by processing the peer's 32-byte public point.
-    ///
-    /// Derives the 256-bit [`PairingSecret`] using `draft-irtf-cfrg-cpace-21` ISK derivation.
-    ///
-    /// # Errors
-    /// [`CpaceError::InvalidPoint`] if the peer point is not a canonical Ristretto point.
-    /// [`CpaceError::IdentitySharedPoint`] if the exchange resulted in identity.
-    pub fn finish(
-        self,
-        peer_public_bytes: &[u8; CPACE_POINT_SIZE],
-    ) -> Result<PairingSecret, CpaceError> {
-        let compressed = CompressedRistretto(*peer_public_bytes);
-        let peer_point = compressed.decompress().ok_or(CpaceError::InvalidPoint)?;
-
-        if peer_point == RistrettoPoint::identity() {
-            return Err(CpaceError::InvalidPoint);
-        }
-
-        let shared_point = peer_point * self.scalar;
-        if shared_point == RistrettoPoint::identity() {
-            return Err(CpaceError::IdentitySharedPoint);
-        }
-
-        let shared_point_bytes = shared_point.compress().to_bytes();
-
-        // Transcript ordering: initiator point first, responder point second
-        let (initiator_point, responder_point) = match self.role {
-            HandshakeRole::Initiator => (&self.my_public, peer_public_bytes),
-            HandshakeRole::Responder => (peer_public_bytes, &self.my_public),
-        };
-
-        let isk = calculate_isk(
-            &self.offer_id,
-            &shared_point_bytes,
-            initiator_point,
-            &[],
-            responder_point,
-            &[],
-        );
-
-        let mut psk = [0_u8; PAIRING_SECRET_SIZE];
-        psk.copy_from_slice(&isk[..PAIRING_SECRET_SIZE]);
-
-        Ok(PairingSecret::from_random_bytes(psk))
-    }
-
-    /// Produce a deterministic-CBOR binary frame carrying this peer's public group element.
-    ///
-    /// # Errors
-    /// [`CpaceError::MalformedFrame`] if encoding fails.
-    pub fn write_message(&self) -> Result<BinaryFrame, CpaceError> {
-        encode_cpace_frame(&self.my_public)
-    }
-
-    /// Read and verify the peer's binary frame, completing the exchange and deriving the secret.
-    ///
-    /// # Errors
-    /// [`CpaceError`] if the frame is malformed, point is invalid, or shared point is identity.
-    pub fn read_message(self, frame: &BinaryFrame) -> Result<PairingSecret, CpaceError> {
-        let peer_point = decode_cpace_frame(frame)?;
-        self.finish(&peer_point)
-    }
-}
-
-/// Encodes a CPace public point into a deterministic-CBOR binary frame:
-/// `["RAPP-cpace-v1", bstr .size 32]`
-///
-/// # Errors
-/// [`CpaceError::MalformedFrame`] if CBOR serialization or frame reconstruction fails.
-pub fn encode_cpace_frame(
-    public_point: &[u8; CPACE_POINT_SIZE],
-) -> Result<BinaryFrame, CpaceError> {
-    let wire = WireValue::Array(vec![
-        WireValue::Text(CPACE_FRAME_DOMAIN.to_owned()),
-        WireValue::Bytes(public_point.to_vec()),
-    ]);
-    let encoded = encode_deterministic_cbor(&wire).map_err(|_| CpaceError::MalformedFrame)?;
-    BinaryFrame::reconstruct(encoded).map_err(|_| CpaceError::MalformedFrame)
-}
-
-/// Decodes a peer's CPace public point from a binary frame:
-/// `["RAPP-cpace-v1", bstr .size 32]`
-///
-/// # Errors
-/// [`CpaceError::MalformedFrame`] if the frame does not match the exact expected schema.
-pub fn decode_cpace_frame(frame: &BinaryFrame) -> Result<[u8; CPACE_POINT_SIZE], CpaceError> {
-    let wire =
-        decode_deterministic_cbor(frame.as_bytes()).map_err(|_| CpaceError::MalformedFrame)?;
-    let WireValue::Array(elements) = wire else {
-        return Err(CpaceError::MalformedFrame);
-    };
-    if elements.len() != 2 {
-        return Err(CpaceError::MalformedFrame);
-    }
-    let WireValue::Text(ref domain) = elements[0] else {
-        return Err(CpaceError::MalformedFrame);
-    };
-    if domain != CPACE_FRAME_DOMAIN {
-        return Err(CpaceError::MalformedFrame);
-    }
-    let WireValue::Bytes(ref bytes) = elements[1] else {
-        return Err(CpaceError::MalformedFrame);
-    };
-    let point_bytes: [u8; CPACE_POINT_SIZE] = bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| CpaceError::MalformedFrame)?;
-    Ok(point_bytes)
-}
-
 /// LEB128 encoding of length (draft-irtf-cfrg-cpace-21 Appendix A.1.1).
 #[must_use]
 pub fn encode_leb128_len(mut len: usize) -> Vec<u8> {
@@ -350,29 +187,6 @@ pub fn transcript_ir(ya: &[u8], ada: &[u8], yb: &[u8], adb: &[u8]) -> Vec<u8> {
     let mut out = lv_cat(&[ya, ada]);
     out.extend(lv_cat(&[yb, adb]));
     out
-}
-
-/// Computes the CPace generator point $g$ (draft-irtf-cfrg-cpace-21 Section 8.3).
-#[must_use]
-pub fn calculate_generator(prs: &[u8], ci: &[u8], sid: &[u8]) -> RistrettoPoint {
-    let gen_str = generator_string(
-        CPACE_RISTRETTO255_DSI,
-        prs,
-        ci,
-        sid,
-        SHA512_INPUT_BLOCK_SIZE,
-    );
-    let mut hasher = Sha512::new();
-    hasher.update(&gen_str);
-    let hash: [u8; 64] = hasher.finalize().into();
-
-    let point = RistrettoPoint::from_uniform_bytes(&hash);
-    if point == RistrettoPoint::identity() {
-        // Highly improbable (2^-252), fallback to basepoint
-        RISTRETTO_BASEPOINT_POINT
-    } else {
-        point
-    }
 }
 
 /// Computes the 64-byte intermediate session key (ISK) (draft-irtf-cfrg-cpace-21 Section 7.2).
@@ -1063,119 +877,8 @@ pub fn decode_kc2_step3_frame(frame: &BinaryFrame) -> Result<[u8; CPACE_TAG_SIZE
 mod tests {
     use super::*;
 
-    #[test]
-    fn cpace_successful_key_agreement() {
-        let offer_id = OfferId::from_array([0x42; OFFER_ID_SIZE]);
-        let code = "123 456";
-
-        let random_a = [0x11; 64];
-        let random_b = [0x22; 64];
-
-        let alice = CpaceState::new(HandshakeRole::Initiator, code, &offer_id, &random_a)
-            .expect("alice init succeeds");
-        let bob = CpaceState::new(HandshakeRole::Responder, code, &offer_id, &random_b)
-            .expect("bob init succeeds");
-
-        let alice_public = *alice.public_point();
-        let bob_public = *bob.public_point();
-
-        // Ensure public points are non-zero and distinct
-        assert_ne!(alice_public, [0_u8; 32]);
-        assert_ne!(bob_public, [0_u8; 32]);
-        assert_ne!(alice_public, bob_public);
-
-        let secret_a = alice.finish(&bob_public).expect("alice completes");
-        let secret_b = bob.finish(&alice_public).expect("bob completes");
-
-        // Both parties arrive at the identical 256-bit pairing secret
-        assert_eq!(secret_a.expose(), secret_b.expose());
-    }
-
-    #[test]
-    fn cpace_mismatched_codes_produce_different_secrets() {
-        let offer_id = OfferId::from_array([0x42; OFFER_ID_SIZE]);
-        let code_alice = "123456";
-        let code_eve = "123457";
-
-        let random_a = [0x11; 64];
-        let random_e = [0x33; 64];
-
-        let alice = CpaceState::new(HandshakeRole::Initiator, code_alice, &offer_id, &random_a)
-            .expect("alice init succeeds");
-        let eve = CpaceState::new(HandshakeRole::Responder, code_eve, &offer_id, &random_e)
-            .expect("eve init succeeds");
-
-        let alice_public = *alice.public_point();
-        let eve_public = *eve.public_point();
-
-        let secret_a = alice.finish(&eve_public).expect("alice completes");
-        let secret_e = eve.finish(&alice_public).expect("eve completes");
-
-        // With different codes, derived secrets MUST NOT match
-        assert_ne!(secret_a.expose(), secret_e.expose());
-    }
-
-    #[test]
-    fn cpace_rejects_invalid_public_point() {
-        let offer_id = OfferId::from_array([0x42; OFFER_ID_SIZE]);
-        let alice = CpaceState::new(HandshakeRole::Initiator, "654321", &offer_id, &[0x55; 64])
-            .expect("alice init succeeds");
-
-        // Non-canonical Ristretto point (all 0xFF is not a canonical Ristretto encoding)
-        let invalid_point = [0xFF; 32];
-        let result = alice.finish(&invalid_point);
-        assert_eq!(
-            result.expect_err("non-canonical point should fail"),
-            CpaceError::InvalidPoint
-        );
-    }
-
-    #[test]
-    fn cpace_binary_frame_round_trip() {
-        let offer_id = OfferId::from_array([0x77; OFFER_ID_SIZE]);
-        let code = "987 654";
-
-        let alice = CpaceState::new(HandshakeRole::Initiator, code, &offer_id, &[0xAA; 64])
-            .expect("alice init succeeds");
-        let bob = CpaceState::new(HandshakeRole::Responder, code, &offer_id, &[0xBB; 64])
-            .expect("bob init succeeds");
-
-        // Alice writes frame, Bob reads frame
-        let alice_frame = alice.write_message().expect("alice encodes frame");
-        // Bob writes frame, Alice reads frame
-        let bob_frame = bob.write_message().expect("bob encodes frame");
-
-        let secret_b = bob
-            .read_message(&alice_frame)
-            .expect("bob reads alice frame");
-        let secret_a = alice
-            .read_message(&bob_frame)
-            .expect("alice reads bob frame");
-
-        assert_eq!(secret_a.expose(), secret_b.expose());
-    }
-
-    #[test]
-    fn cpace_rejects_malformed_binary_frame() {
-        // Garbage frame
-        let garbage = BinaryFrame::reconstruct(vec![0x01, 0x02, 0x03]).expect("valid frame bytes");
-        assert_eq!(
-            decode_cpace_frame(&garbage).expect_err("garbage frame should fail"),
-            CpaceError::MalformedFrame
-        );
-
-        // Frame with wrong domain
-        let wrong_domain = WireValue::Array(vec![
-            WireValue::Text("WRONG-domain".to_owned()),
-            WireValue::Bytes(vec![0u8; 32]),
-        ]);
-        let encoded = encode_deterministic_cbor(&wrong_domain).expect("cbor encoding succeeds");
-        let frame = BinaryFrame::reconstruct(encoded).expect("frame reconstruction succeeds");
-        assert_eq!(
-            decode_cpace_frame(&frame).expect_err("wrong domain should fail"),
-            CpaceError::MalformedFrame
-        );
-    }
+    /// Not a canonical Ristretto255 encoding (RFC 9496 §4.3.1).
+    const NON_CANONICAL_POINT_BYTE: u8 = 0xFF;
 
     #[test]
     fn cpace_draft_appendix_a_utility_functions() {
@@ -1566,7 +1269,7 @@ mod tests {
             standard_pairing_context_v2(&offer_hash, crate::BLE_PROFILE, crate::BLE_CANDIDATE_ID)
                 .expect("context succeeds");
 
-        let non_canonical = [0xFF; 32];
+        let non_canonical = [NON_CANONICAL_POINT_BYTE; CPACE_POINT_SIZE];
         let err = CpaceKc2Responder::process_step1(
             "7KX4M9",
             &context,
@@ -1657,11 +1360,5 @@ mod tests {
         assert_ne!(alice.scalar, Scalar::ZERO);
         alice.zeroize();
         assert_eq!(alice.scalar, Scalar::ZERO);
-
-        let mut legacy = CpaceState::new(HandshakeRole::Initiator, code, &offer_id, &[0xAA; 64])
-            .expect("legacy init succeeds");
-        assert_ne!(legacy.scalar, Scalar::ZERO);
-        legacy.zeroize();
-        assert_eq!(legacy.scalar, Scalar::ZERO);
     }
 }

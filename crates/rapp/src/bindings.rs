@@ -4748,5 +4748,85 @@ mod routing_binding_tests {
             assert!(action.card_exchange_continues);
             assert_pairing_revoked_close(action, &requester);
         }
+
+        #[test]
+        fn a_denial_after_forget_closes_with_pairing_revoked() {
+            let custodian_record = granted_custodian_record();
+            let (requester, custodian) =
+                established_with(&granted_requester_record(), &custodian_record);
+            awaiting_signature_approval(&requester, &custodian);
+            custodian_record
+                .forget(vault(), CREATED_AT_MS)
+                .expect("forget");
+            let action = custodian
+                .deny(operation_id())
+                .expect("the denial is answered");
+            assert_eq!(action.operation_id, Some(operation_id()));
+            assert!(action.terminal_reason.is_none());
+            assert_pairing_revoked_close(action, &requester);
+        }
+
+        #[test]
+        fn finished_prerequisites_after_forget_close_with_pairing_revoked() {
+            let custodian_record = granted_custodian_record();
+            let (requester, custodian) =
+                established_with(&granted_requester_record(), &custodian_record);
+            let request = frame(
+                requester
+                    .begin_read_certificate(operation_id(), false, NOW_MS, LIFETIME_MS)
+                    .expect("requester asks"),
+            );
+            assert_eq!(
+                custodian
+                    .receive_frame(request, NOW_MS)
+                    .expect("custodian admits")
+                    .kind,
+                RappBridgeActionKind::InspectPrerequisites
+            );
+            custodian_record
+                .forget(vault(), CREATED_AT_MS)
+                .expect("forget");
+            let action = custodian
+                .prerequisites_complete(operation_id(), NOW_MS)
+                .expect("the prerequisites are answered");
+            assert_eq!(action.kind, RappBridgeActionKind::SendFrame);
+            assert!(!action.card_exchange_continues);
+            assert_pairing_revoked_close(action, &requester);
+        }
+
+        #[test]
+        fn a_requester_receiving_on_a_forgotten_pairing_closes_with_pairing_revoked() {
+            let requester_record = granted_requester_record();
+            let (requester, custodian) =
+                established_with(&requester_record, &granted_custodian_record());
+            let status = frame(
+                custodian
+                    .report_card_status(None, RappCardReader::Absent)
+                    .expect("custodian reports its card"),
+            );
+            requester_record
+                .forget(vault(), CREATED_AT_MS)
+                .expect("forget");
+            let action = requester
+                .receive_frame(status, NOW_MS)
+                .expect("the frame is answered");
+            assert_eq!(action.kind, RappBridgeActionKind::SendFrame);
+            assert_pairing_revoked_close(action, &custodian);
+        }
+
+        #[test]
+        fn a_requester_cannot_begin_an_operation_on_a_revoked_pairing() {
+            let requester_record = granted_requester_record();
+            let (requester, custodian) =
+                established_with(&requester_record, &granted_custodian_record());
+            requester_record
+                .revoke(vault(), CREATED_AT_MS)
+                .expect("revoke");
+            let action = requester
+                .begin_inspect_card(operation_id(), NOW_MS, LIFETIME_MS)
+                .expect("the request is answered");
+            assert_eq!(action.kind, RappBridgeActionKind::SendFrame);
+            assert_pairing_revoked_close(action, &custodian);
+        }
     }
 }

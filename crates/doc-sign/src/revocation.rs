@@ -66,6 +66,10 @@ pub enum RevocationStatus {
     },
     /// The supplied revocation source is stale: `now > nextUpdate`.
     Stale,
+    /// The supplied revocation source is not yet valid: its
+    /// `thisUpdate` is after `now`, so it is no evidence about `now`
+    /// (RFC 5280 sec.5.1.2.4, RFC 6960 sec.4.2.2.1).
+    NotYetValid,
     /// CRL or OCSP responder reported the cert as unknown.
     /// (For CRL this is impossible -- only OCSP has a "not on
     /// our books" status.)
@@ -104,8 +108,10 @@ impl core::fmt::Display for InapplicableReason {
 ///
 /// Returns [`RevocationStatus::Inapplicable`] when the CRL was
 /// issued by a different issuer than the cert,
+/// [`RevocationStatus::NotYetValid`] when `now < crl.thisUpdate`,
 /// [`RevocationStatus::Stale`] when `now > crl.nextUpdate`, and
-/// otherwise `Good` / `Revoked`.
+/// otherwise `Good` / `Revoked`. A [`crate::crl::Crl`] is a complete
+/// list, so absence from it is `Good`.
 #[inline]
 #[must_use]
 pub fn check_against_crl(
@@ -116,6 +122,9 @@ pub fn check_against_crl(
     let crl = crl.as_crl();
     if crl.issuer != cert.issuer {
         return RevocationStatus::Inapplicable(InapplicableReason::CrlIssuerMismatch);
+    }
+    if now < crl.this_update {
+        return RevocationStatus::NotYetValid;
     }
     if let Some(next) = crl.next_update
         && now > next
@@ -139,7 +148,9 @@ pub fn check_against_crl(
 /// `VerifiedOcspResponse` only exists for a successful, basic reply.
 ///
 /// Returns [`RevocationStatus::Inapplicable`] when no
-/// `SingleResponse` matches the target serial, and
+/// `SingleResponse` matches the target serial,
+/// [`RevocationStatus::NotYetValid`] when `now` is before the
+/// matching `SingleResponse`'s `thisUpdate`, and
 /// [`RevocationStatus::Stale`] when `now > nextUpdate` of the
 /// matching `SingleResponse` (if `nextUpdate` is present).
 #[inline]
@@ -156,6 +167,9 @@ pub fn check_against_ocsp_response(
     else {
         return RevocationStatus::Inapplicable(InapplicableReason::OcspNoEntryForSerial);
     };
+    if now < single.this_update {
+        return RevocationStatus::NotYetValid;
+    }
     if let Some(next) = single.next_update
         && now > next
     {
@@ -646,13 +660,81 @@ mod tests {
         DateTime::new(2026, 5, 23, 0, 0, 0).expect("valid test instant")
     }
 
+    /// A certificate and a CRL from its issuer that does not list it:
+    /// `(certificate DER, CRL DER)`.
+    fn unlisted_cert_and_crl() -> (Vec<u8>, Vec<u8>) {
+        (
+            build_cert(&[0x01], &issuer_name()),
+            build_crl(None, &issuer_name(), Some("260620120000")),
+        )
+    }
+
+    /// A certificate and an OCSP response answering `good` for it:
+    /// `(certificate DER, response DER)`.
+    fn good_cert_and_response() -> (Vec<u8>, Vec<u8>) {
+        (
+            build_cert(&[0x01, 0x23], &issuer_name()),
+            build_ocsp_response(&[0x01, 0x23], 0x80, &[], Some("20260622120000"), 0),
+        )
+    }
+
+    /// One day before the fixtures' `thisUpdate` of 2026-05-20 12:00.
+    fn before_this_update() -> DateTime {
+        DateTime::new(2026, 5, 19, 12, 0, 0).expect("valid test instant")
+    }
+
     #[test]
     fn crl_good_when_serial_not_present() {
-        let cert_der = build_cert(&[0x01], &issuer_name());
+        let (cert_der, crl_der) = unlisted_cert_and_crl();
         let cert = Certificate::from_der(&cert_der).expect("cert");
-        let crl_der = build_crl(None, &issuer_name(), Some("260620120000"));
         let crl = VerifiedCrl::from_unverified_for_test(Crl::parse(&crl_der).expect("crl"));
         assert_eq!(check_against_crl(cert, &crl, now()), RevocationStatus::Good);
+    }
+
+    #[test]
+    fn crl_not_yet_valid_when_this_update_in_future() {
+        let (cert_der, crl_der) = unlisted_cert_and_crl();
+        let cert = Certificate::from_der(&cert_der).expect("cert");
+        let crl = VerifiedCrl::from_unverified_for_test(Crl::parse(&crl_der).expect("crl"));
+        assert_eq!(
+            check_against_crl(cert, &crl, before_this_update()),
+            RevocationStatus::NotYetValid
+        );
+    }
+
+    #[test]
+    fn crl_is_valid_from_its_this_update() {
+        let (cert_der, crl_der) = unlisted_cert_and_crl();
+        let cert = Certificate::from_der(&cert_der).expect("cert");
+        let crl = VerifiedCrl::from_unverified_for_test(Crl::parse(&crl_der).expect("crl"));
+        let at_this_update = DateTime::new(2026, 5, 20, 12, 0, 0).expect("valid test instant");
+        assert_eq!(
+            check_against_crl(cert, &crl, at_this_update),
+            RevocationStatus::Good
+        );
+    }
+
+    #[test]
+    fn listed_serial_on_future_crl_is_not_yet_valid() {
+        let cert_der = build_cert(&[0x01], &issuer_name());
+        let cert = Certificate::from_der(&cert_der).expect("cert");
+        let crl_der = build_crl(Some(&[0x01]), &issuer_name(), Some("260620120000"));
+        let crl = VerifiedCrl::from_unverified_for_test(Crl::parse(&crl_der).expect("crl"));
+        assert_eq!(
+            check_against_crl(cert, &crl, before_this_update()),
+            RevocationStatus::NotYetValid
+        );
+    }
+
+    #[test]
+    fn ocsp_not_yet_valid_when_this_update_in_future() {
+        let (cert_der, resp_der) = good_cert_and_response();
+        let cert = Certificate::from_der(&cert_der).expect("cert");
+        let verified = verified_for_test(OcspResponse::parse(&resp_der).expect("ocsp"));
+        assert_eq!(
+            check_against_ocsp_response(cert, &verified, before_this_update()),
+            RevocationStatus::NotYetValid
+        );
     }
 
     #[test]
@@ -692,9 +774,8 @@ mod tests {
 
     #[test]
     fn ocsp_good_translates() {
-        let cert_der = build_cert(&[0x01, 0x23], &issuer_name());
+        let (cert_der, resp_der) = good_cert_and_response();
         let cert = Certificate::from_der(&cert_der).expect("cert");
-        let resp_der = build_ocsp_response(&[0x01, 0x23], 0x80, &[], Some("20260622120000"), 0);
         let verified = verified_for_test(OcspResponse::parse(&resp_der).expect("ocsp"));
         assert_eq!(
             check_against_ocsp_response(cert, &verified, now()),
@@ -725,6 +806,7 @@ mod tests {
             RevocationStatus::Good
             | RevocationStatus::Inapplicable(_)
             | RevocationStatus::Stale
+            | RevocationStatus::NotYetValid
             | RevocationStatus::Unknown => panic!("expected Revoked, got {status:?}"),
         }
     }

@@ -1,4 +1,4 @@
-//! Requester-side operations of one session (RAPP v26.10.22 section 8).
+//! Requester-side operations of one session (RAPP v26.10.29 section 8).
 
 use core::fmt;
 use std::collections::BTreeSet;

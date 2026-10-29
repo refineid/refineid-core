@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! The pairing, session and operation machines of the RAPP state model
-//! (`doc/protocols/rapp-state-machine-v26.10.22.yaml`), and the runtime state
+//! (`doc/protocols/rapp-state-machine-v26.10.29.yaml`), and the runtime state
 //! an endpoint keeps. No failure revokes a pairing; a user does, idle expiry
 //! does, and the peer's revocation notice does.
 
@@ -143,8 +143,6 @@ pub enum PairingEvent {
     /// endpoint opened did not take the code, because its custodian refused
     /// it or it served no offer the requester could try.
     AttemptFailed,
-    /// The offer's last CPace attempt failed.
-    LastAttemptFailed,
     /// Every custodian the requester tried refused the code, and no endpoint
     /// is left to open.
     LastCandidateFailed,
@@ -309,10 +307,6 @@ pub enum Action {
     HidePairingCode,
     /// Erase the offer and its pairing code and stop advertising it.
     DestroyOffer,
-    /// Stop offering and back off exponentially before the next offer.
-    StartPairingBackoff,
-    /// Tell the holder that the offer used its attempts.
-    ShowAttemptsExhausted,
     /// Obtain the offer over the pairing connection and validate it.
     ReadOffer,
     /// Send CPace step 1 from the typed pairing code.
@@ -320,10 +314,10 @@ pub enum Action {
     /// Open a pairing connection to the next endpoint found in pairing mode
     /// and not yet opened for the typed code.
     TryNextCandidate,
-    /// Count the attempt before sending CPace step 2 and arm its deadline.
-    ReserveAttempt,
-    /// Record the failed attempt; the offer stays.
-    CountFailedAttempt,
+    /// Admit the attempt before sending CPace step 2 and arm its deadline.
+    AdmitAttempt,
+    /// End the failed attempt; the offer stays as it was.
+    EndFailedAttempt,
     /// Tell the user the pairing code was not accepted, naming no custodian.
     ShowWrongCode,
     /// Tell the user that no custodian in pairing mode was found.
@@ -576,7 +570,7 @@ impl PairingState {
                 require_role(role, EndpointRole::Proxy)?;
                 Transition {
                     state: Self::Exchanging,
-                    actions: &[A::ReserveAttempt],
+                    actions: &[A::AdmitAttempt],
                 }
             }
             (Self::Unpaired, E::CodeEntered) => {
@@ -590,7 +584,7 @@ impl PairingState {
             (Self::Exchanging, E::AttemptFailed) => match role {
                 EndpointRole::Proxy => Transition {
                     state: Self::Offering,
-                    actions: &[A::CountFailedAttempt],
+                    actions: &[A::EndFailedAttempt],
                 },
                 EndpointRole::Requester => {
                     require(guards.untried_pairing_candidate)?;
@@ -624,18 +618,6 @@ impl PairingState {
                 Transition {
                     state: Self::Unpaired,
                     actions: &[A::CloseCandidate],
-                }
-            }
-            (Self::Exchanging, E::LastAttemptFailed) => {
-                require_role(role, EndpointRole::Proxy)?;
-                Transition {
-                    state: Self::Unpaired,
-                    actions: &[
-                        A::DestroyOffer,
-                        A::HidePairingCode,
-                        A::StartPairingBackoff,
-                        A::ShowAttemptsExhausted,
-                    ],
                 }
             }
             (Self::Exchanging, E::OfferExpiredOrCancelled) => {

@@ -1,6 +1,6 @@
 protocol: RAPP
-document_version: "26.10.22"
-wire_version: "26.10.22"
+document_version: "26.10.29"
+wire_version: "26.10.29"
 
 semantics:
   instances: >
@@ -22,7 +22,6 @@ semantics:
 constants:
   live_operations_per_session: 1
   card_commands_per_operation: 1
-  pairing_attempts_per_offer: 3
   pairing_candidates_max: 8
   minimum_remaining_attempts: 3
   offer_ttl_ms: 300000
@@ -50,13 +49,11 @@ actions:
   display_pairing_code: "show the pairing code on the custodian"
   hide_pairing_code: "remove the pairing code from the screen"
   destroy_offer: "erase the offer and its pairing code and stop advertising it"
-  start_pairing_backoff: "stop offering and back off exponentially before the next offer"
-  show_attempts_exhausted: "tell the holder that the offer used its attempts"
   read_offer: "obtain the offer over the pairing connection and validate it"
   begin_cpace_initiator: "send CPace step 1 from the typed pairing code"
   try_next_candidate: "open a pairing connection to the next endpoint found in pairing mode and not yet opened for the typed code"
-  reserve_attempt: "count the attempt before sending CPace step 2 and arm its deadline"
-  count_failed_attempt: "record the failed attempt; the offer stays"
+  admit_attempt: "admit the attempt before sending CPace step 2 and arm its deadline"
+  end_failed_attempt: "end the failed attempt; the offer stays as it was"
   show_wrong_code: "tell the user the pairing code was not accepted, naming no custodian"
   show_none_in_pairing_mode: "tell the user that no custodian in pairing mode was found"
   consume_offer: "mark the offer consumed once T_A verified"
@@ -165,7 +162,7 @@ pairing:
       event: attempt_started
       role: custodian
       to: exchanging
-      actions: [reserve_attempt]
+      actions: [admit_attempt]
     - from: unpaired
       event: code_entered
       role: requester
@@ -176,12 +173,7 @@ pairing:
       event: attempt_failed
       role: custodian
       to: offering
-      actions: [count_failed_attempt]
-    - from: exchanging
-      event: last_attempt_failed
-      role: custodian
-      to: unpaired
-      actions: [destroy_offer, hide_pairing_code, start_pairing_backoff, show_attempts_exhausted]
+      actions: [end_failed_attempt]
     - from: exchanging
       event: attempt_failed                # the endpoint opened did not take the code: its custodian refused it, or it served no offer it could try
       role: requester

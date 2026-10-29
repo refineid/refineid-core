@@ -1,7 +1,7 @@
 // Copyright 2026 Petri Koistinen
 // Licensed under the Apache License, Version 2.0.
 
-//! Byte-exact replay of the RAPP v26.10.22 operation-message corpus.
+//! Byte-exact replay of the RAPP v26.10.29 operation-message corpus.
 //!
 //! Every body decodes into its typed message and re-encodes to the identical
 //! bytes, so an independently written peer and this crate put the same bytes
@@ -18,7 +18,7 @@ use refineid_rapp::{
 };
 use serde::Deserialize;
 
-const CORPUS: &str = include_str!("../../../doc/protocols/vectors/rapp-operation-v26.10.22.json");
+const CORPUS: &str = include_str!("../../../doc/protocols/vectors/rapp-operation-v26.10.29.json");
 const SESSION_ID: SessionId = SessionId::from_array([0xbb; 16]);
 
 #[derive(Deserialize)]
@@ -101,7 +101,7 @@ fn identifier(hex_text: &str) -> OperationId {
 fn corpus_names_this_protocol_version() {
     let corpus = corpus();
     assert_eq!(corpus.format, "fi.refineid.rapp.operation-vectors");
-    assert_eq!(corpus.protocol_document_version, "26.10.22");
+    assert_eq!(corpus.protocol_document_version, "26.10.29");
 }
 
 #[test]

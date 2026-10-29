@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! The routing preamble every connection opens with, on both transport
-//! profiles (RAPP v26.10.22 §2.2.1), and the stream profile's name.
+//! profiles (RAPP v26.10.29 §2.2.1), and the stream profile's name.
 //!
 //! The stream profile (§2.2.2) carries RAPP frames over one reliable ordered
 //! byte stream, each frame behind a 2-byte big-endian length. Socket I/O and

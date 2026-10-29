@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Service withdrawal (RAPP v26.10.22 §4.5) against its corpus.
+//! Service withdrawal (RAPP v26.10.29 §4.5) against its corpus.
 
 use refineid_rapp::{
     AnnouncementCandidate, CloseReason, InstanceName, PairId, SessionCloseMessage, TypedMessage,
@@ -21,7 +21,7 @@ use refineid_rapp::{
 };
 use serde::Deserialize;
 
-const CORPUS: &str = include_str!("../../../doc/protocols/vectors/rapp-withdrawal-v26.10.22.json");
+const CORPUS: &str = include_str!("../../../doc/protocols/vectors/rapp-withdrawal-v26.10.29.json");
 
 #[derive(Deserialize)]
 struct Corpus {

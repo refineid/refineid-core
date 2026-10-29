@@ -22,13 +22,13 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::{
-    BinaryFrame, CandidateError, CpaceAttemptLedger, CpaceKc2Initiator, CpaceKc2Responder,
+    BinaryFrame, CandidateError, CpaceAttemptSlot, CpaceKc2Initiator, CpaceKc2Responder,
     CpaceKc2ResponderWaiting, EndpointRole, EstablishedEndpoint, ExplicitUserIntent, NextCandidate,
     OfferId, POST_PAKE_CONFIRMATION_MS, POST_PAKE_HANDSHAKE_MS, PairId, PairKeyMaterial,
-    PairRecord, PairingBackoff, PairingCandidates, PairingConfirmation, PairingError,
-    PairingHandshake, PairingOffer, PairingOfferDeadline, PairingSecret, PairingStorage,
-    PreAuthenticationRateLimit, ProfileName, ReadyOutcome, RoutingPreamble, STREAM_PROFILE,
-    SessionAuthentication, SessionHandshake, SessionId, TransportProfile, encode_kc2_step1_frame,
+    PairRecord, PairingCandidates, PairingConfirmation, PairingError, PairingHandshake,
+    PairingOffer, PairingOfferDeadline, PairingSecret, PairingStorage, PreAuthenticationRateLimit,
+    ProfileName, ReadyOutcome, RoutingPreamble, STREAM_PROFILE, SessionAuthentication,
+    SessionHandshake, SessionId, TransportProfile, encode_kc2_step1_frame,
     generate_pair_key_material,
     operation_bridge::{EndedOperation, RappBridgeAction, RappBridgeActionKind},
     phase_deadline_ms, standard_pairing_context_v2,
@@ -120,7 +120,7 @@ pub struct RappPairMetadata {
     pub profiles: Vec<String>,
     /// Pair-record creation time supplied by the platform wall clock.
     pub created_at_ms: u64,
-    /// Whether the peer confirmed storing its record (RAPP v26.10.22 §4.3
+    /// Whether the peer confirmed storing its record (RAPP v26.10.29 §4.3
     /// item 4). A record loaded unconfirmed survived a crash inside the
     /// confirmation window: it opens no session, routes nothing, and the
     /// caller revokes it.
@@ -187,7 +187,7 @@ pub enum RappBindingError {
     WrongPhase,
     /// The one-use pairing offer reached its monotonic deadline.
     OfferExpired,
-    /// The peer never confirmed that it stored the pairing (RAPP v26.10.22
+    /// The peer never confirmed that it stored the pairing (RAPP v26.10.29
     /// §4.3 item 4): the post-PAKE deadline passed in the storage phase, or
     /// a record loaded from the vault is unconfirmed. Such a record opens
     /// no session, routes nothing and is announced nowhere; the caller
@@ -201,11 +201,8 @@ pub enum RappBindingError {
     PairNotFound,
     /// Referenced operation was not found in the active session.
     UnknownOperation,
-    /// Three pairing attempts failed against one offer; the offer is
-    /// destroyed (RAPP v26.10.22 §3.3).
-    AttemptsExhausted,
     /// A pre-authentication attempt came within 500 ms of the previous one
-    /// (RAPP v26.10.22 §3.3.8); the caller refuses it and changes nothing.
+    /// (RAPP v26.10.29 §3.3.6); the caller refuses it and changes nothing.
     RateLimited,
 }
 
@@ -309,8 +306,6 @@ enum PairingBridgeState {
     },
     Completed,
     Expired,
-    /// Three failed attempts destroyed the custodian's offer (§3.3.5).
-    Exhausted,
     Failed,
 }
 
@@ -336,7 +331,6 @@ impl PairingBridgeState {
                 return Err(RappBindingError::StorageUnconfirmed);
             }
             Self::Cpace(cpace) => cpace.deadline(),
-            Self::Exhausted => return Err(RappBindingError::AttemptsExhausted),
             _ => return Ok(()),
         };
         if deadline.is_live(now_monotonic_ms) {
@@ -369,13 +363,13 @@ impl PairingBridgeState {
 #[derive(uniffi::Object)]
 pub struct RappPairingBridge {
     state: Mutex<PairingBridgeState>,
-    attempts: Mutex<CpaceAttemptLedger>,
+    attempt: Mutex<CpaceAttemptSlot>,
     pre_authentication: Mutex<PreAuthenticationRateLimit>,
 }
 
 #[uniffi::export]
 impl RappPairingBridge {
-    /// Create the custodian's offer (RAPP v26.10.22 §4.2) from a fresh
+    /// Create the custodian's offer (RAPP v26.10.29 §4.2) from a fresh
     /// platform-CSPRNG `offer_id`, the offered credential profiles, and the
     /// transport profiles the offer is served on.
     ///
@@ -405,7 +399,7 @@ impl RappPairingBridge {
     }
 
     /// Accept the offer bootstrap the requester received over the
-    /// transport `transport_profile` (RAPP v26.10.22 §4.2): the Bootstrap
+    /// transport `transport_profile` (RAPP v26.10.29 §4.2): the Bootstrap
     /// Characteristic value on BLE, or the custodian's first frame after the
     /// pairing preamble on the stream transport.
     ///
@@ -589,7 +583,7 @@ impl RappPairingBridge {
                 Ok(())
             }
             EndpointRole::Proxy => {
-                // §3.3.8: one pre-authentication attempt per 500 ms, which
+                // §3.3.6: one pre-authentication attempt per 500 ms, which
                 // also spaces repeated invalid Y_A submissions.
                 let admitted = self
                     .pre_authentication
@@ -604,22 +598,15 @@ impl RappPairingBridge {
                     };
                     return Err(RappBindingError::RateLimited);
                 }
-                let ledger = self.lock_attempts()?;
-                if !ledger.accepts_another_attempt() || ledger.has_active_attempt() {
-                    let exhausted = ledger.is_exhausted();
-                    drop(ledger);
+                // §3.3.6: one guess at a time.
+                if !self.lock_attempt()?.accepts_another_attempt() {
                     *state = PairingBridgeState::Offer {
                         role,
                         offer,
                         deadline,
                     };
-                    return Err(if exhausted {
-                        RappBindingError::AttemptsExhausted
-                    } else {
-                        RappBindingError::WrongPhase
-                    });
+                    return Err(RappBindingError::WrongPhase);
                 }
-                drop(ledger);
                 *state =
                     PairingBridgeState::Cpace(Box::new(CpaceBridgeState::CustodianWaitingStep1 {
                         pairing_code,
@@ -711,7 +698,7 @@ impl RappPairingBridge {
                 local_keys,
                 deadline,
             } => {
-                if !self.lock_attempts()?.attempt_is_live(now_monotonic_ms) {
+                if !self.lock_attempt()?.attempt_is_live(now_monotonic_ms) {
                     let (next, error) =
                         self.custodian_attempt_failed(offer, deadline, now_monotonic_ms)?;
                     *state = next;
@@ -831,23 +818,18 @@ impl RappPairingBridge {
                         return Err(RappBindingError::ProtocolFailure);
                     }
                 };
-                // §3.3.2: the attempt is reserved before Y_B and T_B leave.
-                let mut ledger = self.lock_attempts()?;
-                if !ledger.admit(now_monotonic_ms, deadline.expires_at_ms()) {
-                    let exhausted = ledger.is_exhausted();
-                    drop(ledger);
+                // §3.3.2: the attempt is admitted before Y_B and T_B leave.
+                if !self
+                    .lock_attempt()?
+                    .admit(now_monotonic_ms, deadline.expires_at_ms())
+                {
                     *state = PairingBridgeState::after_cpace_failure(
                         EndpointRole::Proxy,
                         offer,
                         deadline,
                     );
-                    return Err(if exhausted {
-                        RappBindingError::AttemptsExhausted
-                    } else {
-                        RappBindingError::WrongPhase
-                    });
+                    return Err(RappBindingError::WrongPhase);
                 }
-                drop(ledger);
                 *state =
                     PairingBridgeState::Cpace(Box::new(CpaceBridgeState::CustodianWaitingStep3 {
                         waiting: Box::new(waiting),
@@ -868,7 +850,7 @@ impl RappPairingBridge {
                 ..
             } => {
                 let verified = self
-                    .lock_attempts()?
+                    .lock_attempt()?
                     .attempt_is_live(now_monotonic_ms)
                     .then(|| BinaryFrame::reconstruct(frame).ok())
                     .flatten()
@@ -879,7 +861,7 @@ impl RappPairingBridge {
                     *state = next;
                     return Err(error);
                 };
-                self.lock_attempts()?.consume();
+                self.lock_attempt()?.consume();
                 match PairingHandshake::begin(
                     EndpointRole::Proxy,
                     offer,
@@ -971,7 +953,7 @@ impl RappPairingBridge {
         let (role, offer, deadline) = match previous {
             PairingBridgeState::Handshake { .. } => {
                 // CPace consumed the offer; a lost candidate after handoff
-                // destroys candidate trust (§3.3.6).
+                // destroys candidate trust (§3.3 items 5 and 7).
                 drop(state);
                 return Ok(false);
             }
@@ -1027,9 +1009,7 @@ impl RappPairingBridge {
             | PairingBridgeState::Handshake { .. }
             | PairingBridgeState::Confirmation { .. }
             | PairingBridgeState::Storage { .. } => Ok(()),
-            PairingBridgeState::Expired
-            | PairingBridgeState::Exhausted
-            | PairingBridgeState::Failed => Ok(()),
+            PairingBridgeState::Expired | PairingBridgeState::Failed => Ok(()),
             PairingBridgeState::Completed => {
                 *state = PairingBridgeState::Completed;
                 drop(state);
@@ -1403,31 +1383,23 @@ impl RappPairingBridge {
         outcome.map_err(|_| RappBindingError::ProtocolFailure)
     }
 
-    fn lock_attempts(&self) -> Result<MutexGuard<'_, CpaceAttemptLedger>, RappBindingError> {
-        self.attempts
+    fn lock_attempt(&self) -> Result<MutexGuard<'_, CpaceAttemptSlot>, RappBindingError> {
+        self.attempt
             .lock()
             .map_err(|_| RappBindingError::LocalStateFailure)
     }
 
-    /// Spend the custodian's active attempt (§3.3.5) and decide what the
-    /// offer becomes: kept while attempts and lifetime remain, otherwise
-    /// destroyed, with [`RappBindingError::AttemptsExhausted`] after the
-    /// third failure.
+    /// End the custodian's active attempt (§3.3 item 4) and decide what the
+    /// offer becomes: kept as it was while its lifetime remains, otherwise
+    /// destroyed.
     fn custodian_attempt_failed(
         &self,
         offer: PairingOffer,
         deadline: PairingOfferDeadline,
         now_monotonic_ms: u64,
     ) -> Result<(PairingBridgeState, RappBindingError), RappBindingError> {
-        let mut ledger = self.lock_attempts()?;
-        ledger.fail_active_attempt();
-        if ledger.is_exhausted() {
-            return Ok((
-                PairingBridgeState::Exhausted,
-                RappBindingError::AttemptsExhausted,
-            ));
-        }
-        if ledger.accepts_another_attempt() && deadline.is_live(now_monotonic_ms) {
+        self.lock_attempt()?.end_active_attempt();
+        if deadline.is_live(now_monotonic_ms) {
             return Ok((
                 PairingBridgeState::Offer {
                     role: EndpointRole::Proxy,
@@ -1456,14 +1428,14 @@ impl RappPairingBridge {
                 offer,
                 deadline,
             }),
-            attempts: Mutex::new(CpaceAttemptLedger::default()),
+            attempt: Mutex::new(CpaceAttemptSlot::default()),
             pre_authentication: Mutex::new(PreAuthenticationRateLimit::default()),
         }))
     }
 }
 
 /// The CPace context of `offer` for the connection whose offer entry has
-/// `candidate_id` (RAPP v26.10.22 §6.1.1).
+/// `candidate_id` (RAPP v26.10.29 §6.1.1).
 fn pairing_context(
     offer: &PairingOffer,
     offer_hash: &[u8; 32],
@@ -1491,7 +1463,7 @@ mod pairing_bridge_tests {
     const STARTED_AT_MS: u64 = 1_000;
     const PAIRING_CODE: &str = "7KX4M9";
     const WRONG_CODE: &str = "7KX4M8";
-    /// Spacing between attempts, beyond the §3.3.8 rate limit.
+    /// Spacing between attempts, beyond the §3.3.6 rate limit.
     const NEXT_ATTEMPT_MS: u64 = 1_000;
 
     fn custodian(transports: &[TransportProfile]) -> Arc<RappPairingBridge> {
@@ -1908,32 +1880,30 @@ mod pairing_bridge_tests {
     }
 
     #[test]
-    fn three_wrong_codes_exhaust_the_custodian_offer() {
+    fn wrong_codes_never_exhaust_the_custodian_offer() {
         let custodian = custodian(&[TransportProfile::Stream]);
-        for attempt in 0..3 {
+        for attempt in 0..8 {
             let at = STARTED_AT_MS + attempt * NEXT_ATTEMPT_MS;
             let (_, verdict) = attempt_through_step2(&custodian, &Attempt::wrong_code(at));
             assert!(matches!(verdict, Err(RappBindingError::ProtocolFailure)));
-            // The requester hangs up after T_B fails; the attempt is spent.
-            let retained = custodian
-                .candidate_failed(at + 4)
-                .expect("custodian classifies the lost candidate");
-            assert_eq!(retained, attempt < 2, "attempt {attempt}");
+            // The requester hangs up after T_B fails; the offer stays as it was.
+            assert!(
+                custodian
+                    .candidate_failed(at + 4)
+                    .expect("custodian classifies the lost candidate"),
+                "attempt {attempt}"
+            );
         }
-        let later = STARTED_AT_MS + 3 * NEXT_ATTEMPT_MS;
-        assert!(matches!(
-            custodian.bootstrap_bytes(later),
-            Err(RappBindingError::AttemptsExhausted)
-        ));
-        assert!(matches!(
-            custodian.begin_cpace(
-                STREAM_CANDIDATE_ID.into(),
-                PAIRING_CODE.into(),
-                vec![0x44; 64],
-                later
-            ),
-            Err(RappBindingError::AttemptsExhausted)
-        ));
+        let later = STARTED_AT_MS + 8 * NEXT_ATTEMPT_MS;
+        assert!(custodian.bootstrap_bytes(later).is_ok());
+        let (requester, verdict) = attempt_through_step2(&custodian, &Attempt::honest(later));
+        verdict.expect("T_B verifies after any number of wrong codes");
+        let step3 = requester
+            .write_cpace_frame(later + 4)
+            .expect("requester writes step 3");
+        custodian
+            .read_cpace_frame(step3, later + 4)
+            .expect("the right code consumes the offer");
     }
 
     #[test]
@@ -1962,15 +1932,9 @@ mod pairing_bridge_tests {
     }
 
     #[test]
-    fn a_wrong_t_a_on_the_third_attempt_reports_exhaustion() {
+    fn a_wrong_t_a_frees_the_slot_and_keeps_the_offer() {
         let custodian = custodian(&[TransportProfile::Stream]);
-        for attempt in 0..2 {
-            let at = STARTED_AT_MS + attempt * NEXT_ATTEMPT_MS;
-            let (_, verdict) = attempt_through_step2(&custodian, &Attempt::wrong_code(at));
-            assert!(verdict.is_err());
-            assert!(custodian.candidate_failed(at + 4).expect("offer kept"));
-        }
-        let at = STARTED_AT_MS + 2 * NEXT_ATTEMPT_MS;
+        let at = STARTED_AT_MS;
         let (requester, verdict) = attempt_through_step2(&custodian, &Attempt::honest(at));
         verdict.expect("T_B verifies");
         let mut step3 = requester
@@ -1981,8 +1945,12 @@ mod pairing_bridge_tests {
         }
         assert!(matches!(
             custodian.read_cpace_frame(step3, at + 4),
-            Err(RappBindingError::AttemptsExhausted)
+            Err(RappBindingError::ProtocolFailure)
         ));
+        let next = at + NEXT_ATTEMPT_MS;
+        assert!(custodian.bootstrap_bytes(next).is_ok());
+        let (_, verdict) = attempt_through_step2(&custodian, &Attempt::honest(next));
+        verdict.expect("the offer admits the next attempt");
     }
 
     #[test]
@@ -2163,59 +2131,7 @@ mod pairing_bridge_tests {
     }
 }
 
-/// The custodian's process-wide backoff after locked-out offers
-/// (RAPP v26.10.22 §3.3.7), driven by platform monotonic milliseconds.
-#[derive(Debug, Default, uniffi::Object)]
-pub struct RappPairingBackoff {
-    backoff: Mutex<PairingBackoff>,
-}
-
-#[uniffi::export]
-impl RappPairingBackoff {
-    /// A counter with no lockouts recorded.
-    #[uniffi::constructor]
-    #[must_use]
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-
-    /// Record one offer locked out by three failed attempts.
-    ///
-    /// # Errors
-    /// [`RappBindingError::LocalStateFailure`] on a poisoned lock.
-    pub fn record_lockout(&self, now_monotonic_ms: u64) -> Result<(), RappBindingError> {
-        self.lock()?.record_lockout(now_monotonic_ms);
-        Ok(())
-    }
-
-    /// Clear the count after a completed pairing.
-    ///
-    /// # Errors
-    /// [`RappBindingError::LocalStateFailure`] on a poisoned lock.
-    pub fn record_success(&self) -> Result<(), RappBindingError> {
-        self.lock()?.record_success();
-        Ok(())
-    }
-
-    /// Milliseconds before a new offer may be created; zero when one may be
-    /// created now.
-    ///
-    /// # Errors
-    /// [`RappBindingError::LocalStateFailure`] on a poisoned lock.
-    pub fn ms_until_next_offer(&self, now_monotonic_ms: u64) -> Result<u64, RappBindingError> {
-        Ok(self.lock()?.ms_until_next_offer(now_monotonic_ms))
-    }
-}
-
-impl RappPairingBackoff {
-    fn lock(&self) -> Result<MutexGuard<'_, PairingBackoff>, RappBindingError> {
-        self.backoff
-            .lock()
-            .map_err(|_| RappBindingError::LocalStateFailure)
-    }
-}
-
-/// The §3.3.8 limit of one pre-authentication attempt per 500 ms for a
+/// The §3.3.6 limit of one pre-authentication attempt per 500 ms for a
 /// custodian's connection accepts. The platform calls [`Self::admit`] for
 /// every accepted pairing or session connection before reading its routing
 /// preamble, and closes the connection unanswered when it returns `false`.
@@ -2249,7 +2165,7 @@ impl RappPreAuthenticationLimiter {
 }
 
 /// What a requester does after a pairing connection closed without its
-/// custodian taking the code (RAPP v26.10.22 §4.2, "Trying Each Custodian in
+/// custodian taking the code (RAPP v26.10.29 §4.2, "Trying Each Custodian in
 /// Pairing Mode").
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum RappNextCandidate {
@@ -2275,7 +2191,7 @@ impl From<NextCandidate> for RappNextCandidate {
 }
 
 /// The custodians in pairing mode a requester tries with one typed code
-/// (RAPP v26.10.22 §4.2, "Trying Each Custodian in Pairing Mode"). The
+/// (RAPP v26.10.29 §4.2, "Trying Each Custodian in Pairing Mode"). The
 /// platform creates one per submitted code, reports every endpoint
 /// discovery finds in pairing mode by its own name for it (a service
 /// instance, a peripheral identifier), opens the endpoints the ledger hands
@@ -2817,7 +2733,7 @@ pub trait RappPairVault: Send + Sync {
 
     /// Atomically replace the record stored under an existing identifier:
     /// the confirmed form of a record inserted before the peer confirmed
-    /// its storage (RAPP v26.10.22 §4.3 item 4).
+    /// its storage (RAPP v26.10.29 §4.3 item 4).
     ///
     /// # Errors
     /// [`RappVaultError`] on an absent pair or unavailable storage.
@@ -3292,7 +3208,7 @@ pub fn rapp_stream_profile_name() -> String {
 }
 
 /// How long a requester that quits waits for its `service_withdrawn` closes
-/// to leave before it exits (RAPP v26.10.22 section 4.5 item 8), and one
+/// to leave before it exits (RAPP v26.10.29 section 4.5 item 8), and one
 /// whose holder turned remote use off waits for its `pairing_revoked` closes
 /// (section 4.6 item 6).
 #[uniffi::export]
@@ -3302,7 +3218,7 @@ pub const fn rapp_quit_withdrawal_bound_ms() -> u64 {
 }
 
 /// How long a pairing lives without an established session before it
-/// expires (RAPP v26.10.22 section 4.6 item 5).
+/// expires (RAPP v26.10.29 section 4.6 item 5).
 #[uniffi::export]
 #[must_use]
 pub const fn rapp_pairing_idle_expiry_ms() -> u64 {
@@ -3404,7 +3320,7 @@ impl RappPairRecord {
     /// Run `serve` while this record stays active, holding the record so a
     /// forget or revoke cannot land in the middle; `None`, without running
     /// `serve`, once the record is forgotten or revoked, since such a
-    /// pairing serves nothing (RAPP v26.10.22 §4.6).
+    /// pairing serves nothing (RAPP v26.10.29 §4.6).
     pub(super) fn serve_while_active<T>(
         &self,
         serve: impl FnOnce() -> Result<T, RappBindingError>,
@@ -3560,7 +3476,7 @@ fn decode_pair_record(bytes: &[u8]) -> Result<PairRecord, RappBindingError> {
 }
 
 /// The BLE segmentation and reassembly receiver for one connection and one
-/// direction (RAPP v26.10.22 §5.3).
+/// direction (RAPP v26.10.29 §5.3).
 ///
 /// Any refused fragment zeroizes the partial frame; the caller then drops
 /// the connection.
@@ -3629,7 +3545,7 @@ impl RappBleSarReassembler {
 }
 
 /// The uniform SAR fragment payload capacity for a negotiated ATT MTU and
-/// any smaller value limit the platform reports (RAPP v26.10.22 §5.3).
+/// any smaller value limit the platform reports (RAPP v26.10.29 §5.3).
 ///
 /// # Errors
 /// [`RappBindingError::InvalidInput`] below an MTU of 512 or when the limit

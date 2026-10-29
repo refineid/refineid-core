@@ -1,7 +1,7 @@
 {
   "format": "fi.refineid.rapp.ble-sar-vectors",
-  "protocol_document_version": "26.10.22",
-  "provenance": "Written independently from RAPP v26.10.22 section 5.3: header layout, flags, capacity formula and the receive rules. Timestamps are monotonic milliseconds; error names label the violated receive rule. tools/rapp-vectors/generate.py keeps only the metadata current.",
+  "protocol_document_version": "26.10.29",
+  "provenance": "Written independently from RAPP v26.10.29 section 5.3: header layout, flags, capacity formula and the receive rules. Timestamps are monotonic milliseconds; error names label the violated receive rule. tools/rapp-vectors/generate.py keeps only the metadata current.",
   "header_size": 6,
   "reassembly_timeout_ms": 5000,
   "capacity": [

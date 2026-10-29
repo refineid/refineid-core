@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Discovery hints and session routing (RAPP v26.10.22 §2.2.1 and §4.3)
+//! Discovery hints and session routing (RAPP v26.10.29 §2.2.1 and §4.3)
 //! against their corpus.
 
 use refineid_rapp::{
@@ -22,7 +22,7 @@ use refineid_rapp::{
 };
 use serde::Deserialize;
 
-const CORPUS: &str = include_str!("../../../doc/protocols/vectors/rapp-routing-v26.10.22.json");
+const CORPUS: &str = include_str!("../../../doc/protocols/vectors/rapp-routing-v26.10.29.json");
 
 #[derive(Deserialize)]
 struct Corpus {
@@ -162,7 +162,7 @@ fn custodian_routing_key(keys: &Endpoints, pair: PairId) -> RoutingKey {
 fn corpus_names_its_version() {
     let corpus = corpus();
     assert_eq!(corpus.format, "fi.refineid.rapp.routing-vectors");
-    assert_eq!(corpus.protocol_document_version, "26.10.22");
+    assert_eq!(corpus.protocol_document_version, "26.10.29");
 }
 
 #[test]

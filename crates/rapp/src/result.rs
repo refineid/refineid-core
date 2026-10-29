@@ -8,7 +8,7 @@ use super::{
     OperationId, WireValue,
 };
 
-/// `operation-status-val` (RAPP v26.10.22 section 7.1).
+/// `operation-status-val` (RAPP v26.10.29 section 7.1).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResultStatus {
     /// The operation completed and carries its response.
@@ -44,7 +44,7 @@ impl ResultStatus {
     }
 }
 
-/// An `error_name` of RAPP v26.10.22 section 10.3, carried by an `error`
+/// An `error_name` of RAPP v26.10.29 section 10.3, carried by an `error`
 /// message or by the `error` field of an `operation.result`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResultError {
@@ -219,7 +219,7 @@ impl ResultResponse {
     }
 }
 
-/// One `operation.result` (RAPP v26.10.22 section 7.1).
+/// One `operation.result` (RAPP v26.10.29 section 7.1).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationResultMessage {
     /// The operation this result ends.

@@ -26,8 +26,8 @@ from primitives import (  # noqa: E402
     noise_xxpsk3, scalar_mult, selftest, sha256, sha512, x25519, x25519_public,
 )
 
-VERSION = [26, 10, 22]
-DOCUMENT = "26.10.22"
+VERSION = [26, 10, 29]
+DOCUMENT = "26.10.29"
 OFFER_TTL_MS = 300000
 BLE = "fi.refineid.rapp.ble"
 STREAM = "fi.refineid.stream"
@@ -423,11 +423,11 @@ def operation_corpus(d):
 
 
 CORPORA = {
-    "rapp-v26.10.22.json": main_corpus,
-    "rapp-routing-v26.10.22.json": routing_corpus,
-    "rapp-withdrawal-v26.10.22.json": withdrawal_corpus,
-    "rapp-ble-sar-v26.10.22.json": ble_sar_corpus,
-    "rapp-operation-v26.10.22.json": operation_corpus,
+    "rapp-v26.10.29.json": main_corpus,
+    "rapp-routing-v26.10.29.json": routing_corpus,
+    "rapp-withdrawal-v26.10.29.json": withdrawal_corpus,
+    "rapp-ble-sar-v26.10.29.json": ble_sar_corpus,
+    "rapp-operation-v26.10.29.json": operation_corpus,
 }
 
 

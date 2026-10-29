@@ -913,6 +913,7 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 name = "refineid-apdu"
 version = "26.10.29"
 dependencies = [
+ "refineid-build-number",
  "serde",
  "trybuild",
  "zeroize",
@@ -936,6 +937,10 @@ dependencies = [
 
 [[package]]
 name = "refineid-ber"
+version = "26.10.29"
+
+[[package]]
+name = "refineid-build-number"
 version = "26.10.29"
 
 [[package]]

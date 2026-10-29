@@ -12,54 +12,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Emit the crate family's build version as `REFINEID_BUILD_VERSION`.
-//!
-//! The version is deterministic for anything that ships: a release build, or
-//! any build with `SOURCE_DATE_EPOCH` set (Debian and Nix set it), reports the
-//! bare workspace version, so the packaging system never invents a version and
-//! reproducibility holds. Only a local debug build with no `SOURCE_DATE_EPOCH`
-//! appends a `+B` build-metadata stamp, where B is the UTC hour times ten plus
-//! the minute over ten -- a development convenience, never committed.
+//! Sets `REFINEID_BUILD_NUMBER`, the build number `B` of the project
+//! version `YY.M.D.B`: the override of the same name when set, else the
+//! UTC time of day of this build.
 
+use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Seconds in one hour.
-const SECONDS_PER_HOUR: u64 = 3_600;
-/// Seconds in one minute.
-const SECONDS_PER_MINUTE: u64 = 60;
-/// Seconds in one day, for reducing an epoch to its time of day.
-const SECONDS_PER_DAY: u64 = 86_400;
-/// The hour's weight in the B stamp.
-const HOUR_WEIGHT: u64 = 10;
-/// The minute is counted in tens.
-const MINUTES_PER_B_UNIT: u64 = 10;
+use refineid_build_number::{build_number, is_build_number};
 
-fn main() {
-    // A change to the reproducibility signal must re-run this script.
-    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+const BUILD_NUMBER_ENV: &str = "REFINEID_BUILD_NUMBER";
+/// A path that never exists. Cargo reruns a build script on every
+/// build while a `rerun-if-changed` path is missing, so the build
+/// number is the time of the latest build.
+const ALWAYS_RERUN: &str = "refineid-build-number-always-rerun";
 
-    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
-    let is_debug = std::env::var("PROFILE").as_deref() == Ok("debug");
-    let is_reproducible = std::env::var_os("SOURCE_DATE_EPOCH").is_some();
-
-    let reported = if is_debug && !is_reproducible {
-        match utc_b_stamp() {
-            Some(b) => format!("{version}+{b}"),
-            None => version,
+fn main() -> ExitCode {
+    println!("cargo:rerun-if-changed={ALWAYS_RERUN}");
+    let build = match std::env::var(BUILD_NUMBER_ENV) {
+        Ok(build) if is_build_number(&build) => build,
+        Ok(build) => {
+            eprintln!("error: {BUILD_NUMBER_ENV}={build:?} is not hour * 100 + minute");
+            return ExitCode::FAILURE;
         }
-    } else {
-        version
+        Err(_) => match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(elapsed) => build_number(elapsed.as_secs()).to_string(),
+            Err(_) => {
+                eprintln!("error: system clock is before 1970");
+                return ExitCode::FAILURE;
+            }
+        },
     };
-
-    println!("cargo:rustc-env=REFINEID_BUILD_VERSION={reported}");
-}
-
-/// The current UTC B stamp (hour * 10 + minute / 10), or `None` if the host
-/// clock is before the Unix epoch.
-fn utc_b_stamp() -> Option<u64> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-    let time_of_day = now % SECONDS_PER_DAY;
-    let hour = time_of_day / SECONDS_PER_HOUR;
-    let minute = (time_of_day % SECONDS_PER_HOUR) / SECONDS_PER_MINUTE;
-    Some(hour * HOUR_WEIGHT + minute / MINUTES_PER_B_UNIT)
+    println!("cargo:rustc-env={BUILD_NUMBER_ENV}={build}");
+    ExitCode::SUCCESS
 }

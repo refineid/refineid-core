@@ -202,7 +202,7 @@ pub enum RappBindingError {
     /// Referenced operation was not found in the active session.
     UnknownOperation,
     /// A pre-authentication attempt came within 500 ms of the previous one
-    /// (RAPP v26.10.29 §3.3.6); the caller refuses it and changes nothing.
+    /// (RAPP v26.10.29 §3.3 item 6); the caller refuses it and changes nothing.
     RateLimited,
 }
 
@@ -286,19 +286,19 @@ enum PairingBridgeState {
     },
     Cpace(Box<CpaceBridgeState>),
     /// `Noise_XXpsk3` after CPace handoff, bounded by the post-PAKE
-    /// handshake deadline instead of the offer lifetime (§3.3.7).
+    /// handshake deadline instead of the offer lifetime (§3.3 item 7).
     Handshake {
         handshake: Box<PairingHandshake>,
         deadline_ms: u64,
     },
     /// Hello, grant confirmation and storage, bounded by the deadline that
-    /// starts at local Noise completion (§3.3.7).
+    /// starts at local Noise completion (§3.3 item 7).
     Confirmation {
         confirmation: Box<PairingConfirmation>,
         deadline_ms: u64,
     },
     /// The stored record awaiting the peer's storage confirmation, under
-    /// the confirmation deadline (§3.3.7, §4.3 item 4).
+    /// the confirmation deadline (§3.3 item 7, §4.3 item 4).
     Storage {
         storage: Box<PairingStorage>,
         record: Arc<RappPairRecord>,
@@ -583,7 +583,7 @@ impl RappPairingBridge {
                 Ok(())
             }
             EndpointRole::Proxy => {
-                // §3.3.6: one pre-authentication attempt per 500 ms, which
+                // §3.3 item 6: one pre-authentication attempt per 500 ms, which
                 // also spaces repeated invalid Y_A submissions.
                 let admitted = self
                     .pre_authentication
@@ -598,7 +598,7 @@ impl RappPairingBridge {
                     };
                     return Err(RappBindingError::RateLimited);
                 }
-                // §3.3.6: one guess at a time.
+                // §3.3 item 6: one guess at a time.
                 if !self.lock_attempt()?.accepts_another_attempt() {
                     *state = PairingBridgeState::Offer {
                         role,
@@ -818,7 +818,7 @@ impl RappPairingBridge {
                         return Err(RappBindingError::ProtocolFailure);
                     }
                 };
-                // §3.3.2: the attempt is admitted before Y_B and T_B leave.
+                // §3.3 item 2: the attempt is admitted before Y_B and T_B leave.
                 if !self
                     .lock_attempt()?
                     .admit(now_monotonic_ms, deadline.expires_at_ms())
@@ -1103,7 +1103,7 @@ impl RappPairingBridge {
 
     /// Enter authenticated confirmation after Noise completes; hello,
     /// confirmation, storage and the peer's storage confirmation must
-    /// follow within 10 seconds of `now_monotonic_ms` (§3.3.7).
+    /// follow within 10 seconds of `now_monotonic_ms` (§3.3 item 7).
     ///
     /// # Errors
     /// [`RappBindingError`] on an expired offer, the wrong phase, or an
@@ -1344,7 +1344,7 @@ impl RappPairingBridge {
     }
 
     /// Run one confirmation step before the post-PAKE deadline; a failed
-    /// step destroys candidate trust (§3.3.7).
+    /// step destroys candidate trust (§3.3 item 7).
     fn with_confirmation<T>(
         &self,
         now_monotonic_ms: u64,
@@ -1463,7 +1463,7 @@ mod pairing_bridge_tests {
     const STARTED_AT_MS: u64 = 1_000;
     const PAIRING_CODE: &str = "7KX4M9";
     const WRONG_CODE: &str = "7KX4M8";
-    /// Spacing between attempts, beyond the §3.3.6 rate limit.
+    /// Spacing between attempts, beyond the §3.3 item 6 rate limit.
     const NEXT_ATTEMPT_MS: u64 = 1_000;
 
     fn custodian(transports: &[TransportProfile]) -> Arc<RappPairingBridge> {
@@ -2131,7 +2131,7 @@ mod pairing_bridge_tests {
     }
 }
 
-/// The §3.3.6 limit of one pre-authentication attempt per 500 ms for a
+/// The §3.3 item 6 limit of one pre-authentication attempt per 500 ms for a
 /// custodian's connection accepts. The platform calls [`Self::admit`] for
 /// every accepted pairing or session connection before reading its routing
 /// preamble, and closes the connection unanswered when it returns `false`.

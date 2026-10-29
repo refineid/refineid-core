@@ -19,15 +19,15 @@
 pub const CPACE_ATTEMPT_WINDOW_MS: u64 = 5_000;
 
 /// From local CPace handoff to a completed `Noise_XXpsk3` handshake
-/// (§3.3.7).
+/// (§3.3 item 7).
 pub const POST_PAKE_HANDSHAKE_MS: u64 = 10_000;
 
 /// From local Noise completion to an active pairing: hello, confirmation,
-/// storage and the peer's storage confirmation (§3.3.7, §4.3 item 4).
+/// storage and the peer's storage confirmation (§3.3 item 7, §4.3 item 4).
 pub const POST_PAKE_CONFIRMATION_MS: u64 = 10_000;
 
 /// Minimum spacing of pre-authentication attempts at the custodian
-/// (§3.3.6).
+/// (§3.3 item 6).
 pub const PRE_AUTHENTICATION_SPACING_MS: u64 = 500;
 
 /// The monotonic deadline `window` milliseconds after `start_ms`.
@@ -36,7 +36,7 @@ pub const fn phase_deadline_ms(start_ms: u64, window_ms: u64) -> u64 {
     start_ms.saturating_add(window_ms)
 }
 
-/// The §3.3.6 limit of one pre-authentication attempt per 500 ms.
+/// The §3.3 item 6 limit of one pre-authentication attempt per 500 ms.
 ///
 /// The custodian pairing bridge applies it to every CPace start, which
 /// covers repeated invalid `Y_A` submissions; the platform applies its own

@@ -93,6 +93,8 @@ pub struct PairingCandidates<E> {
     openings: usize,
     /// Offers CPace ran on.
     tried: Vec<OfferId>,
+    /// Whether any custodian answered `pairing-busy` for this code.
+    busy_answered: bool,
     phase: CandidatePhase,
 }
 
@@ -106,8 +108,9 @@ pub enum NextCandidate {
     /// the next endpoint ([`PairingCandidates::next_endpoint`]), which
     /// hands this one out again once its wait has passed.
     Deferred,
-    /// Every custodian tried refused the code, or answered busy at the
-    /// connection limit: report it as not accepted, naming none of them.
+    /// Every custodian tried refused the code, a custodian that answered
+    /// busy counting as one that refused it: report it as not accepted,
+    /// naming none of them.
     NotAccepted,
     /// No custodian has been tried, none answered busy, and no endpoint is
     /// left to open: wait for discovery to find another, or report that
@@ -198,6 +201,7 @@ impl<E> PairingCandidates<E> {
             candidates: Vec::new(),
             openings: 0,
             tried: Vec::new(),
+            busy_answered: false,
             phase: CandidatePhase::Closed,
         }
     }
@@ -337,6 +341,7 @@ impl<E: PartialEq> PairingCandidates<E> {
         if trying {
             self.tried.pop();
         }
+        self.busy_answered = true;
         Ok(self.after_connection(NextCandidate::Deferred))
     }
 
@@ -378,9 +383,10 @@ impl<E: PartialEq> PairingCandidates<E> {
     }
 
     /// What follows a closed connection: `next` while an endpoint is left
-    /// to open within the connection limit, otherwise the report. A
-    /// custodian whose last answer was busy counts as one that refused the
-    /// code.
+    /// to open within the connection limit, otherwise the report. A search
+    /// that tried no custodian and received no busy answer found none in
+    /// pairing mode; otherwise the code is not accepted, a custodian that
+    /// answered busy counting as one that refused it.
     fn after_connection(&mut self, next: NextCandidate) -> NextCandidate {
         let left = self
             .candidates
@@ -389,11 +395,7 @@ impl<E: PartialEq> PairingCandidates<E> {
         if left && self.openings < PAIRING_CANDIDATES_MAX {
             return next;
         }
-        let still_busy = self
-            .candidates
-            .iter()
-            .any(|candidate| matches!(candidate.status, EndpointStatus::Deferred { .. }));
-        if self.tried.is_empty() && !still_busy {
+        if self.tried.is_empty() && !self.busy_answered {
             return NextCandidate::NoneTried;
         }
         self.phase = CandidatePhase::NotAccepted;
@@ -657,6 +659,49 @@ mod tests {
             NextCandidate::NotAccepted,
             "the custodian still busy at the limit counts as one that refused"
         );
+    }
+
+    #[test]
+    fn a_search_that_saw_a_busy_answer_does_not_report_none_found() {
+        let mut ledger = PairingCandidates::new();
+        ledger.found("busy");
+        open(&mut ledger);
+        assert_eq!(ledger.busy(0, NOW_MS), Ok(NextCandidate::Deferred));
+        open(&mut ledger);
+        assert_eq!(
+            ledger.closed(),
+            Ok(NextCandidate::NotAccepted),
+            "a custodian that answered busy then served nothing tryable"
+        );
+    }
+
+    #[test]
+    fn deferred_endpoints_are_reopened_in_the_order_their_waits_pass() {
+        const A_NOT_BEFORE_MS: u64 = 1_100;
+        const B_NOT_BEFORE_MS: u64 = 1_500;
+        const BUSY_AT_MS: u64 = 1_000;
+        let mut ledger = PairingCandidates::new();
+        ledger.found("a");
+        ledger.found("b");
+        assert_eq!(open_at(&mut ledger, BUSY_AT_MS), "a");
+        ledger
+            .busy(A_NOT_BEFORE_MS - BUSY_AT_MS, BUSY_AT_MS)
+            .expect("a is open");
+        assert_eq!(open_at(&mut ledger, BUSY_AT_MS), "b");
+        ledger
+            .busy(B_NOT_BEFORE_MS - BUSY_AT_MS, BUSY_AT_MS)
+            .expect("b is open");
+        assert_eq!(
+            ledger.next_endpoint(BUSY_AT_MS),
+            Ok(NextEndpoint::NotBefore(A_NOT_BEFORE_MS))
+        );
+        assert_eq!(open_at(&mut ledger, A_NOT_BEFORE_MS), "a");
+        assert_eq!(ledger.closed(), Ok(NextCandidate::Try));
+        assert_eq!(
+            ledger.next_endpoint(A_NOT_BEFORE_MS),
+            Ok(NextEndpoint::NotBefore(B_NOT_BEFORE_MS))
+        );
+        assert_eq!(open_at(&mut ledger, B_NOT_BEFORE_MS), "b");
     }
 
     #[test]

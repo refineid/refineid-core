@@ -22,14 +22,14 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::{
-    BinaryFrame, BootstrapAnswer, CPACE_STEP2_MSG_SIZE, CandidateError, CpaceAttemptSlot,
-    CpaceKc2Initiator, CpaceKc2Responder, CpaceKc2ResponderWaiting, EndpointRole,
-    EstablishedEndpoint, ExplicitUserIntent, NextCandidate, NextEndpoint, OfferId,
-    PAIRING_BUSY_RETRY_AFTER_MAX_MS, POST_PAKE_CONFIRMATION_MS, POST_PAKE_HANDSHAKE_MS, PairId,
-    PairKeyMaterial, PairRecord, PairingBusy, PairingCandidates, PairingConfirmation, PairingError,
-    PairingHandshake, PairingOffer, PairingOfferDeadline, PairingSecret, PairingStorage,
-    PreAuthenticationRateLimit, ProfileName, ReadyOutcome, RoutingPreamble, STREAM_PROFILE,
-    SessionAuthentication, SessionHandshake, SessionId, TransportProfile, encode_kc2_step1_frame,
+    BinaryFrame, BootstrapAnswer, CandidateError, CpaceAttemptSlot, CpaceKc2Initiator,
+    CpaceKc2Responder, CpaceKc2ResponderWaiting, EndpointRole, EstablishedEndpoint,
+    ExplicitUserIntent, NextCandidate, NextEndpoint, OfferId, PAIRING_BUSY_RETRY_AFTER_MAX_MS,
+    POST_PAKE_CONFIRMATION_MS, POST_PAKE_HANDSHAKE_MS, PairId, PairKeyMaterial, PairRecord,
+    PairingBusy, PairingCandidates, PairingConfirmation, PairingError, PairingHandshake,
+    PairingOffer, PairingOfferDeadline, PairingSecret, PairingStorage, PreAuthenticationRateLimit,
+    ProfileName, ReadyOutcome, RoutingPreamble, STREAM_PROFILE, SessionAuthentication,
+    SessionHandshake, SessionId, TransportProfile, encode_kc2_step1_frame,
     generate_pair_key_material,
     operation_bridge::{EndedOperation, RappBridgeAction, RappBridgeActionKind},
     phase_deadline_ms, standard_pairing_context_v2,
@@ -457,13 +457,13 @@ impl RappPairingBridge {
             } => offer,
             PairingBridgeState::Cpace(cpace) if cpace.role() == EndpointRole::Proxy => {
                 drop(state);
-                return self.busy_answer(now_monotonic_ms);
+                return self.busy_answer(now_monotonic_ms, 0);
             }
             _ => return Err(RappBindingError::WrongPhase),
         };
         if self.admission_wait_ms(now_monotonic_ms)? > 0 {
             drop(state);
-            return self.busy_answer(now_monotonic_ms);
+            return self.busy_answer(now_monotonic_ms, 0);
         }
         let bytes = offer
             .to_cbor()
@@ -472,17 +472,28 @@ impl RappPairingBridge {
         bytes
     }
 
-    /// The `pairing-busy` the custodian sends in place of CPace step 2,
-    /// before closing the connection, after [`Self::begin_cpace`] refused
-    /// the connection's step 1 with [`RappBindingError::RateLimited`] or
-    /// [`RappBindingError::WrongPhase`] while the offer is live (RAPP
-    /// v26.10.29 §4.2, "Busy Refusal" item 2). It carries the time until
-    /// the custodian can admit an attempt.
+    /// The `pairing-busy` the custodian sends on a pairing connection it
+    /// refused while its offer is live, before closing the connection
+    /// (RAPP v26.10.29 §4.2, "Busy Refusal"). It carries the time until the
+    /// custodian can admit an attempt: the larger of the time left on the
+    /// active attempt, the time left of this bridge's spacing, and
+    /// `spacing_wait_ms`, held between 1 and 5000 ms. The platform calls it
+    ///
+    /// - with `spacing_wait_ms` from [`RappPreAuthenticationLimiter::wait_ms`]
+    ///   in place of [`Self::bootstrap_bytes`], when that limiter refused a
+    ///   connection whose routing preamble named `"pairing"`;
+    /// - with `spacing_wait_ms` of zero in place of CPace step 2, when
+    ///   [`Self::begin_cpace`] refused the connection's step 1 with
+    ///   [`RappBindingError::RateLimited`] or [`RappBindingError::WrongPhase`].
     ///
     /// # Errors
     /// [`RappBindingError`] on an expired offer, the requester role, or a
     /// phase with no live offer.
-    pub fn busy_bytes(&self, now_monotonic_ms: u64) -> Result<Vec<u8>, RappBindingError> {
+    pub fn busy_bytes(
+        &self,
+        now_monotonic_ms: u64,
+        spacing_wait_ms: u64,
+    ) -> Result<Vec<u8>, RappBindingError> {
         let mut state = self.lock()?;
         state.require_live_offer(now_monotonic_ms)?;
         let live_offer = match &*state {
@@ -494,7 +505,7 @@ impl RappPairingBridge {
         if !live_offer {
             return Err(RappBindingError::WrongPhase);
         }
-        self.busy_answer(now_monotonic_ms)
+        self.busy_answer(now_monotonic_ms, spacing_wait_ms)
     }
 
     /// Advertised lifetime used by the platform to schedule visible expiry.
@@ -943,9 +954,9 @@ impl RappPairingBridge {
                 deadline,
                 ..
             } => {
-                // A frame of any other length than step 2 is the custodian's
-                // pairing-busy in place of step 2 (§4.2, "Busy Refusal").
-                if frame.len() != CPACE_STEP2_MSG_SIZE && PairingBusy::from_cbor(&frame).is_ok() {
+                // A frame that decodes as pairing-busy is the custodian's busy
+                // answer in place of step 2 (§4.2, "Busy Refusal").
+                if PairingBusy::from_cbor(&frame).is_ok() {
                     *state = PairingBridgeState::after_cpace_failure(
                         EndpointRole::Requester,
                         offer,
@@ -1457,12 +1468,19 @@ impl RappPairingBridge {
         Ok(attempt.max(spacing))
     }
 
-    /// The encoded `pairing-busy` for the custodian's wait at
-    /// `now_monotonic_ms`.
-    fn busy_answer(&self, now_monotonic_ms: u64) -> Result<Vec<u8>, RappBindingError> {
-        PairingBusy::until_admissible(self.admission_wait_ms(now_monotonic_ms)?)
-            .to_cbor()
-            .map_err(|_| RappBindingError::ProtocolFailure)
+    /// The encoded `pairing-busy` for the larger of the custodian's own wait
+    /// at `now_monotonic_ms` and `spacing_wait_ms`, the platform limiter's.
+    fn busy_answer(
+        &self,
+        now_monotonic_ms: u64,
+        spacing_wait_ms: u64,
+    ) -> Result<Vec<u8>, RappBindingError> {
+        PairingBusy::until_admissible(
+            self.admission_wait_ms(now_monotonic_ms)?
+                .max(spacing_wait_ms),
+        )
+        .to_cbor()
+        .map_err(|_| RappBindingError::ProtocolFailure)
     }
 
     fn lock_attempt(&self) -> Result<MutexGuard<'_, CpaceAttemptSlot>, RappBindingError> {
@@ -2312,7 +2330,7 @@ mod pairing_bridge_tests {
             ),
             Err(RappBindingError::WrongPhase)
         ));
-        let busy = custodian.busy_bytes(at + 4).expect("the offer is live");
+        let busy = custodian.busy_bytes(at + 4, 0).expect("the offer is live");
         assert_eq!(
             rapp_pairing_busy_retry_after_ms(busy.clone()).expect("a busy answer"),
             CPACE_ATTEMPT_WINDOW_MS - 2
@@ -2333,7 +2351,7 @@ mod pairing_bridge_tests {
         let custodian = custodian(&[TransportProfile::Stream]);
         let requester = requester(&custodian, TransportProfile::Stream, STARTED_AT_MS);
         assert!(matches!(
-            requester.busy_bytes(STARTED_AT_MS),
+            requester.busy_bytes(STARTED_AT_MS, 0),
             Err(RappBindingError::WrongPhase)
         ));
         assert!(matches!(
@@ -2345,7 +2363,7 @@ mod pairing_bridge_tests {
             Err(RappBindingError::InvalidInput)
         ));
         assert!(matches!(
-            custodian.busy_bytes(STARTED_AT_MS + crate::OFFER_TTL_MS),
+            custodian.busy_bytes(STARTED_AT_MS + crate::OFFER_TTL_MS, 0),
             Err(RappBindingError::OfferExpired)
         ));
     }
@@ -2411,16 +2429,98 @@ mod pairing_bridge_tests {
             Err(RappBindingError::InvalidInput)
         ));
     }
+
+    #[test]
+    fn a_connection_the_platform_limiter_refused_is_answered_with_its_wait() {
+        const LIMITER_WAIT_MS: u64 = 300;
+        let custodian = custodian(&[TransportProfile::Stream]);
+        let limiter = RappPreAuthenticationLimiter::new();
+        assert!(limiter.admit(STARTED_AT_MS).expect("lock"));
+        let refused_at = STARTED_AT_MS + PRE_AUTHENTICATION_SPACING_MS - LIMITER_WAIT_MS;
+        assert!(!limiter.admit(refused_at).expect("lock"));
+        let wait = limiter.wait_ms(refused_at).expect("lock");
+        assert_eq!(wait, LIMITER_WAIT_MS);
+        let busy = custodian
+            .busy_bytes(refused_at, wait)
+            .expect("the idle bridge's offer is live");
+        assert_eq!(
+            rapp_pairing_busy_retry_after_ms(busy).expect("a busy answer"),
+            LIMITER_WAIT_MS
+        );
+        assert_eq!(
+            limiter
+                .wait_ms(STARTED_AT_MS + PRE_AUTHENTICATION_SPACING_MS)
+                .expect("lock"),
+            0
+        );
+    }
+
+    #[test]
+    fn a_corrupt_step_2_is_a_refused_code_not_a_busy_answer() {
+        let phone = custodian(&[TransportProfile::Ble, TransportProfile::Stream]);
+        let candidates = RappPairingCandidates::new();
+        candidates.found("stream".into()).expect("lock");
+        candidates.found("ble".into()).expect("lock");
+        let at = STARTED_AT_MS;
+        candidates.next_endpoint(at).expect("none open");
+        let first = requester(&phone, TransportProfile::Stream, at);
+        assert!(candidates.begin_try(Arc::clone(&first)).expect("offer"));
+        begin_both(&first, &phone, &Attempt::honest(at));
+        let step1 = first.write_cpace_frame(at + 2).expect("step 1");
+        phone
+            .read_cpace_frame(step1, at + 2)
+            .expect("step 1 admitted");
+        let mut step2 = phone.write_cpace_frame(at + 3).expect("step 2");
+        if let Some(byte) = step2.last_mut() {
+            *byte ^= 0x01;
+        }
+        assert!(matches!(
+            first.read_cpace_frame(step2, at + 3),
+            Err(RappBindingError::ProtocolFailure)
+        ));
+        assert_eq!(candidates.closed().expect("open"), RappNextCandidate::Try);
+        assert_eq!(
+            candidates.next_endpoint(at + 4).expect("none open"),
+            RappNextEndpoint::Open {
+                endpoint: "ble".into()
+            },
+            "the refused endpoint is not deferred"
+        );
+        assert!(phone.candidate_failed(at + 4).expect("offer kept"));
+        let again = requester(&phone, TransportProfile::Ble, at + NEXT_ATTEMPT_MS);
+        assert!(
+            !candidates.begin_try(again).expect("offer"),
+            "the offer counts as tried"
+        );
+    }
+
+    #[test]
+    fn a_busy_answer_with_no_wait_is_reopened_at_once() {
+        let candidates = RappPairingCandidates::new();
+        candidates.found("phone".into()).expect("lock");
+        candidates.next_endpoint(STARTED_AT_MS).expect("none open");
+        assert_eq!(
+            candidates.busy(0, STARTED_AT_MS).expect("open"),
+            RappNextCandidate::Deferred
+        );
+        assert_eq!(
+            candidates.next_endpoint(STARTED_AT_MS).expect("none open"),
+            RappNextEndpoint::Open {
+                endpoint: "phone".into()
+            }
+        );
+    }
 }
 
 /// The §3.3 item 6 limit of one pre-authentication attempt per 500 ms for a
 /// custodian's connection accepts. The platform reads the routing preamble
 /// of every accepted connection, then calls [`Self::admit`]. When it returns
 /// `false`, a session connection is closed unanswered, and a pairing
-/// connection is answered with the bridge's
-/// [`RappPairingBridge::bootstrap_bytes`], which carries the `pairing-busy`
-/// with the remaining spacing (§4.2, "Busy Refusal"), and then closed. The
-/// pairing bridge applies its own instance to CPace starts.
+/// connection, while an offer is live, is answered with
+/// [`RappPairingBridge::busy_bytes`] called with `now_monotonic_ms` and
+/// [`Self::wait_ms`] at that time, in place of
+/// [`RappPairingBridge::bootstrap_bytes`], and then closed (§4.2, "Busy
+/// Refusal"). The pairing bridge applies its own instance to CPace starts.
 #[derive(Debug, Default, uniffi::Object)]
 pub struct RappPreAuthenticationLimiter {
     limit: Mutex<PreAuthenticationRateLimit>,
@@ -2447,6 +2547,20 @@ impl RappPreAuthenticationLimiter {
             .map_err(|_| RappBindingError::LocalStateFailure)?
             .admit(now_monotonic_ms))
     }
+
+    /// Milliseconds from `now_monotonic_ms` until [`Self::admit`] would
+    /// admit an attempt, zero when it would admit one now. Asking moves
+    /// nothing.
+    ///
+    /// # Errors
+    /// [`RappBindingError::LocalStateFailure`] on a poisoned lock.
+    pub fn wait_ms(&self, now_monotonic_ms: u64) -> Result<u64, RappBindingError> {
+        Ok(self
+            .limit
+            .lock()
+            .map_err(|_| RappBindingError::LocalStateFailure)?
+            .wait_ms(now_monotonic_ms))
+    }
 }
 
 /// What a requester does after a pairing connection closed without its
@@ -2460,8 +2574,9 @@ pub enum RappNextCandidate {
     /// the next endpoint with [`RappPairingCandidates::next_endpoint`],
     /// showing nothing.
     Deferred,
-    /// Every custodian tried refused the code, or answered busy at the
-    /// connection limit: report it as not accepted, naming none of them.
+    /// Every custodian tried refused the code, a custodian that answered
+    /// busy counting as one that refused it: report it as not accepted,
+    /// naming none of them.
     NotAccepted,
     /// No custodian has been tried and no endpoint is left to open: wait
     /// for discovery to find another, or report that none in pairing mode

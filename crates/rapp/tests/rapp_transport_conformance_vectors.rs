@@ -422,10 +422,7 @@ fn malformed_busy_answers_are_refused_for_their_stated_reason() {
         let error = PairingBusy::from_cbor(&encoded).expect_err(&vector.name);
         assert_eq!(format!("{error:?}"), vector.error, "{}", vector.name);
         assert!(
-            !matches!(
-                BootstrapAnswer::from_bootstrap(&encoded, TransportProfile::Stream),
-                Ok(BootstrapAnswer::Busy(_))
-            ),
+            BootstrapAnswer::from_bootstrap(&encoded, TransportProfile::Stream).is_err(),
             "{}",
             vector.name
         );

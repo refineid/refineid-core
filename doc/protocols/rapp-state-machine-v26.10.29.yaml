@@ -51,7 +51,7 @@ actions:
   destroy_offer: "erase the offer and its pairing code and stop advertising it"
   read_offer: "obtain the offer over the pairing connection and validate it"
   begin_cpace_initiator: "send CPace step 1 from the typed pairing code"
-  try_next_candidate: "open a pairing connection to the next endpoint found in pairing mode and not yet opened for the typed code"
+  try_next_candidate: "open a pairing connection to the next endpoint found in pairing mode and not yet opened for the typed code, or waiting out a busy answer whose retry-after has passed"
   admit_attempt: "admit the attempt before sending CPace step 2 and arm its deadline"
   end_failed_attempt: "end the failed attempt; the offer stays as it was"
   answer_busy: "send pairing-busy with the time until an attempt can be admitted, and close the connection"

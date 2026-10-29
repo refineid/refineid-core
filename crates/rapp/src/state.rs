@@ -317,7 +317,8 @@ pub enum Action {
     /// Send CPace step 1 from the typed pairing code.
     BeginCpaceInitiator,
     /// Open a pairing connection to the next endpoint found in pairing mode
-    /// and not yet opened for the typed code.
+    /// and not yet opened for the typed code, or waiting out a busy answer
+    /// whose retry-after has passed.
     TryNextCandidate,
     /// Admit the attempt before sending CPace step 2 and arm its deadline.
     AdmitAttempt,

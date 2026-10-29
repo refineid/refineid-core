@@ -61,6 +61,15 @@ impl PreAuthenticationRateLimit {
         self.last_admitted_ms = Some(now_ms);
         true
     }
+
+    /// Milliseconds from `now_ms` until [`Self::admit`] admits an attempt,
+    /// zero when it would admit one now. Asking moves nothing.
+    #[must_use]
+    pub fn wait_ms(&self, now_ms: u64) -> u64 {
+        self.last_admitted_ms.map_or(0, |last| {
+            PRE_AUTHENTICATION_SPACING_MS.saturating_sub(now_ms.saturating_sub(last))
+        })
+    }
 }
 
 /// The custodian's one attempt slot for an offer (§3.3 items 1 to 5).
@@ -108,6 +117,14 @@ impl CpaceAttemptSlot {
         true
     }
 
+    /// Milliseconds from `now_ms` until the active attempt's deadline, zero
+    /// when no attempt is active or its deadline has passed.
+    #[must_use]
+    pub fn active_attempt_wait_ms(&self, now_ms: u64) -> u64 {
+        self.active_deadline_ms
+            .map_or(0, |deadline| deadline.saturating_sub(now_ms))
+    }
+
     /// Whether the active attempt may still complete.
     #[must_use]
     pub fn attempt_is_live(&self, now_ms: u64) -> bool {
@@ -142,6 +159,36 @@ mod tests {
         assert!(!limit.admit(1_000 + PRE_AUTHENTICATION_SPACING_MS - 1));
         assert!(limit.admit(1_000 + PRE_AUTHENTICATION_SPACING_MS));
         assert!(!limit.admit(1_000 + PRE_AUTHENTICATION_SPACING_MS + 1));
+    }
+
+    #[test]
+    fn the_spacing_wait_is_read_without_moving_the_window() {
+        let mut limit = PreAuthenticationRateLimit::default();
+        assert_eq!(limit.wait_ms(1_000), 0);
+        assert!(limit.admit(1_000));
+        assert_eq!(limit.wait_ms(1_000), PRE_AUTHENTICATION_SPACING_MS);
+        assert_eq!(limit.wait_ms(1_100), PRE_AUTHENTICATION_SPACING_MS - 100);
+        assert_eq!(limit.wait_ms(1_000 + PRE_AUTHENTICATION_SPACING_MS), 0);
+        assert!(!limit.admit(1_100));
+        assert_eq!(limit.wait_ms(1_100), PRE_AUTHENTICATION_SPACING_MS - 100);
+    }
+
+    #[test]
+    fn the_attempt_wait_is_the_time_left_on_its_deadline() {
+        let mut slot = CpaceAttemptSlot::default();
+        assert_eq!(slot.active_attempt_wait_ms(1_000), 0);
+        assert!(slot.admit(1_000, OFFER_END));
+        assert_eq!(slot.active_attempt_wait_ms(1_000), CPACE_ATTEMPT_WINDOW_MS);
+        assert_eq!(
+            slot.active_attempt_wait_ms(3_000),
+            CPACE_ATTEMPT_WINDOW_MS - 2_000
+        );
+        assert_eq!(
+            slot.active_attempt_wait_ms(1_000 + CPACE_ATTEMPT_WINDOW_MS),
+            0
+        );
+        slot.end_active_attempt();
+        assert_eq!(slot.active_attempt_wait_ms(2_000), 0);
     }
 
     #[test]

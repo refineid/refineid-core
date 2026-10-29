@@ -1461,7 +1461,7 @@ about itself is authenticated until the code is accepted.
 
 | ID | Constraint | Closes |
 | :--- | :--- | :--- |
-| CC-83 | The requester tries every custodian it finds in pairing mode on any transport, from when the code is submitted until the last one tried refuses it: one pairing connection at a time, each endpoint opened at most once and each `offer_id` tried at most once per typed code, at most 8 pairing connections per code. A refused or closed connection, no CPace step 2 within the attempt deadline, or a `T_B` that does not verify moves on to the next; a verified `T_B` ends the search. It reports the code as not accepted only when every custodian tried refused it and no endpoint is left, or the limit is reached; when it tried none, it reports that no phone in pairing mode was found. Specification §4.2, "Trying Each Custodian in Pairing Mode"; `PairingCandidates` in the core. | UCA-81 |
+| CC-83 | The requester tries every custodian it finds in pairing mode on any transport, from when the code is submitted until the last one tried refuses it: one pairing connection at a time, each endpoint opened once per typed code and again after each busy answer (CC-108), each `offer_id` tried at most once per typed code, at most 8 pairing connections per code. A refused or closed connection, no CPace step 2 within the attempt deadline, or a `T_B` that does not verify moves on to the next; a verified `T_B` ends the search. It reports the code as not accepted only when every custodian tried refused it and no endpoint is left, or the limit is reached; when it tried none, it reports that no phone in pairing mode was found. Specification §4.2, "Trying Each Custodian in Pairing Mode"; `PairingCandidates` in the core. | UCA-81 |
 | CC-84 | Until a code is accepted the requester names no custodian, in its progress or in the not-accepted report; it names the custodian only from the custodian's `pairing.hello`, inside the authenticated pairing channel. | UCA-82 |
 
 The limit: a phone advertises pairing mode only during a ceremony, so a
@@ -1920,3 +1920,48 @@ Residual, accepted: a device that keeps the single-flight slot busy denies
 pairing for as long as it keeps connecting. That is inherent to pairing on
 a shared link, a strike counter did nothing against it, and it ends with
 the offer.
+
+## 34. A busy phone that reads as a wrong code
+
+### 34.1 Scope
+
+Specification §3.3 item 6 and §4.2 "Busy Refusal": a custodian that
+cannot admit an attempt, because one is active or the 500 ms spacing has
+not passed, answers `pairing-busy` with the time until it can, and the
+requester opens that endpoint once more after the wait. Losses and
+hazards are this record's: L-3; H-5.
+
+### 34.2 Control structure
+
+The requester is the controller of the search for the phone that shows
+the typed code (section 23). Its feedback from each endpoint was the
+CPace outcome or the connection's end, and §4.2 item 4 read a connection
+refused or closed before `T_B` as the custodian refusing the code. A
+custodian that refused a connection for single flight or spacing, by
+closing it, therefore looked exactly like one that does not show the
+code. With two computers pairing to two phones, a computer whose phone
+was answering the other computer's attempt was told its correct code
+was not accepted, and the user retyped a right code. The custodian is
+the controller of its one attempt slot; it had no way to say that the
+slot, not the code, was the reason.
+
+### 34.3 Unsafe control actions
+
+| ID | Controller | Control action | Type | Context | Hazard |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| UCA-104 | Requester | Report the pairing code as not accepted | P | While the custodian that shows it was never asked, because its attempt slot or spacing refused the connection and the refusal was indistinguishable from a refused code. The user doubts or retypes a right code; the phone's offer is unchanged. | H-5 |
+
+### 34.4 Controller constraints
+
+| ID | Constraint | Closes |
+| :--- | :--- | :--- |
+| CC-108 | A custodian that cannot admit an attempt answers `pairing-busy` with the time until it can, before evaluating any code material, and the requester treats it as "not yet tried": it opens that endpoint again after the other endpoints waiting and no sooner than the stated wait, for as long as it answers busy, within the limit of 8 pairing connections per typed code, and shows nothing meanwhile. A custodian still busy at the limit counts as having refused the code, so the only reports stay "not accepted" and "none in pairing mode". Specification §3.3 item 6, §4.2 "Busy Refusal" and "Trying Each Custodian in Pairing Mode"; `PairingBusy` and `PairingCandidates` in the core. | UCA-104 |
+
+Residuals, accepted: a rogue that answers busy holds the requester for
+at most 8 openings and 35 s of waits per typed code, after which the
+code is reported as not accepted; a custodian kept busy by a device that
+connects without pause is still unreachable, which section 33 records as
+inherent to pairing on a shared link. The busy answer carries only a
+duration, nothing of the code or the offer. The owner chose a quiet
+retry over a "phone busy" report: nothing is shown while the requester
+waits, and no new outcome exists.

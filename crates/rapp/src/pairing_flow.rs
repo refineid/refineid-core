@@ -683,7 +683,7 @@ impl core::error::Error for PairingError {}
 mod tests {
     use super::{PairingConfirmation, PairingError, PairingHandshake, PairingStorage};
     use crate::{
-        EndpointRole, OfferId, PairId, PairingOffer, PairingSecret, ProfileName,
+        BootstrapAnswer, EndpointRole, OfferId, PairId, PairingOffer, PairingSecret, ProfileName,
         STREAM_CANDIDATE_ID, TransportProfile, generate_pair_key_material,
     };
 
@@ -707,8 +707,11 @@ mod tests {
         )
         .expect("the offer fixture is valid");
         let bootstrap = proxy_offer.to_cbor().expect("the offer encodes");
-        let offer = PairingOffer::from_bootstrap(&bootstrap, TransportProfile::Stream)
-            .expect("the bootstrap decodes");
+        let Ok(BootstrapAnswer::Offer(offer)) =
+            BootstrapAnswer::from_bootstrap(&bootstrap, TransportProfile::Stream)
+        else {
+            panic!("the bootstrap decodes as the offer");
+        };
         let pairing_secret = PairingSecret::from_random_bytes([PAIRING_SECRET_BYTE; 32]);
         let mut requester = PairingHandshake::begin(
             EndpointRole::Requester,

@@ -679,5 +679,49 @@
       "version": []
     }
   ],
-  "provenance": "Derived by tools/rapp-vectors/generate.py from the inputs in this file and RAPP v26.10.29 sections 4.2, 4.3, 6.1 to 6.3 and 7.2, with standard-library primitives checked against RFC 7748 section 6.1, RFC 8439 section 2.8.2 and RFC 9496 appendix A.1; the engine is not used."
+  "provenance": "Derived by tools/rapp-vectors/generate.py from the inputs in this file and RAPP v26.10.29 sections 4.2, 4.3, 6.1 to 6.3 and 7.2, with standard-library primitives checked against RFC 7748 section 6.1, RFC 8439 section 2.8.2 and RFC 9496 appendix A.1; the engine is not used.",
+  "pairing_busy": [
+    {
+      "name": "least-wait",
+      "retry_after_ms": 1,
+      "encoded_hex": "a366736368656d6564726170706776657273696f6e83181a0a181d6e72657472795f61667465725f6d7301"
+    },
+    {
+      "name": "spacing-wait",
+      "retry_after_ms": 500,
+      "encoded_hex": "a366736368656d6564726170706776657273696f6e83181a0a181d6e72657472795f61667465725f6d731901f4"
+    },
+    {
+      "name": "greatest-wait",
+      "retry_after_ms": 5000,
+      "encoded_hex": "a366736368656d6564726170706776657273696f6e83181a0a181d6e72657472795f61667465725f6d73191388"
+    }
+  ],
+  "rejected_pairing_busy": [
+    {
+      "name": "zero-wait",
+      "encoded_hex": "a366736368656d6564726170706776657273696f6e83181a0a181d6e72657472795f61667465725f6d7300",
+      "error": "RetryAfterOutOfRange { got: 0 }"
+    },
+    {
+      "name": "wait-above-greatest",
+      "encoded_hex": "a366736368656d6564726170706776657273696f6e83181a0a181d6e72657472795f61667465725f6d73191389",
+      "error": "RetryAfterOutOfRange { got: 5001 }"
+    },
+    {
+      "name": "missing-wait",
+      "encoded_hex": "a266736368656d6564726170706776657273696f6e83181a0a181d",
+      "error": "MissingField { field: \"retry_after_ms\" }"
+    },
+    {
+      "name": "wrong-version",
+      "encoded_hex": "a366736368656d6564726170706776657273696f6e83181a0a181e6e72657472795f61667465725f6d731901f4",
+      "error": "UnsupportedVersion"
+    },
+    {
+      "name": "extra-field",
+      "encoded_hex": "a466736368656d6564726170706776657273696f6e83181a0a181d6c6f666665725f74746c5f6d731a000493e06e72657472795f61667465725f6d731901f4",
+      "error": "UnknownField"
+    }
+  ]
 }

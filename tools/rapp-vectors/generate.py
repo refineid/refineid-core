@@ -29,6 +29,9 @@ from primitives import (  # noqa: E402
 VERSION = [26, 10, 29]
 DOCUMENT = "26.10.29"
 OFFER_TTL_MS = 300000
+BUSY_RETRY_AFTER_MIN_MS = 1
+BUSY_RETRY_AFTER_MAX_MS = 5000
+PRE_AUTHENTICATION_SPACING_MS = 500
 BLE = "fi.refineid.rapp.ble"
 STREAM = "fi.refineid.stream"
 CANDIDATE = {BLE: "ble", STREAM: "stream"}
@@ -125,6 +128,29 @@ def offer(e):
     return {"encoded_hex": body.hex(), "encoded_length": len(body), "offer_hash_hex": sha256(body).hex()}
 
 
+def busy(retry_after_ms=None, version=VERSION, **extra):
+    """A pairing-busy body (section 4.2, "PairingBusy Schema"); None leaves the wait out."""
+    body = {"scheme": "rapp", "version": version, **extra}
+    if retry_after_ms is not None:
+        body["retry_after_ms"] = retry_after_ms
+    return cbor(body)
+
+
+def pairing_busy():
+    accepted = [("least-wait", BUSY_RETRY_AFTER_MIN_MS), ("spacing-wait", PRE_AUTHENTICATION_SPACING_MS),
+                ("greatest-wait", BUSY_RETRY_AFTER_MAX_MS)]
+    rejected = [
+        ("zero-wait", busy(0), "RetryAfterOutOfRange { got: 0 }"),
+        ("wait-above-greatest", busy(BUSY_RETRY_AFTER_MAX_MS + 1),
+         f"RetryAfterOutOfRange {{ got: {BUSY_RETRY_AFTER_MAX_MS + 1} }}"),
+        ("missing-wait", busy(), 'MissingField { field: "retry_after_ms" }'),
+        ("wrong-version", busy(PRE_AUTHENTICATION_SPACING_MS, VERSION[:2] + [VERSION[2] + 1]), "UnsupportedVersion"),
+        ("extra-field", busy(PRE_AUTHENTICATION_SPACING_MS, offer_ttl_ms=OFFER_TTL_MS), "UnknownField"),
+    ]
+    return ([{"name": n, "retry_after_ms": ms, "encoded_hex": busy(ms).hex()} for n, ms in accepted],
+            [{"name": n, "encoded_hex": b.hex(), "error": err} for n, b, err in rejected])
+
+
 def grants(e):
     canonical = cbor(sorted(set(e["profiles"]), key=lambda s: s.encode()))
     return {"canonical_cbor_hex": canonical.hex(), "sha256_hex": sha256(canonical).hex()}
@@ -202,6 +228,7 @@ def main_corpus(d):
         e.update(cpace(e))
     for e in d["pairing_offer"]:
         e.update(offer(e))
+    d["pairing_busy"], d["rejected_pairing_busy"] = pairing_busy()
     for e in d["grants_hash"]:
         e.update(grants(e))
     for e in d["identifier_derivation"]:

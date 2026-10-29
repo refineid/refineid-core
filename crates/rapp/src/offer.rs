@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The `pairing-offer` a custodian serves through the offer bootstrap of
-//! each transport (RAPP v26.10.29 §4.2).
+//! The bootstrap answer a custodian in pairing mode serves on each
+//! transport (RAPP v26.10.29 §4.2): the `pairing-offer` while it can admit
+//! an attempt, and `pairing-busy` while it cannot.
 
 use core::fmt;
 use std::collections::BTreeMap;
@@ -29,6 +30,36 @@ use super::{
 /// Upper bound on an encoded offer: the 509-byte ATT value capacity at the
 /// minimum ATT MTU of 512 (RAPP v26.10.29 §4.2).
 pub const MAX_OFFER_SIZE: usize = 509;
+
+/// Least `retry_after_ms` a `pairing-busy` carries (RAPP v26.10.29 §4.2,
+/// "PairingBusy Schema").
+pub const PAIRING_BUSY_RETRY_AFTER_MIN_MS: u64 = 1;
+
+/// Greatest `retry_after_ms` a `pairing-busy` carries (RAPP v26.10.29 §4.2,
+/// "PairingBusy Schema").
+pub const PAIRING_BUSY_RETRY_AFTER_MAX_MS: u64 = 5_000;
+
+/// Fields of the `pairing-offer` schema.
+const OFFER_FIELDS: [&str; 7] = [
+    "scheme",
+    "version",
+    "offer_id",
+    "suites",
+    "profiles",
+    "transports",
+    "offer_ttl_ms",
+];
+
+/// Field that names the time a `pairing-busy` asks the requester to wait;
+/// the `pairing-offer` schema has no field of that name, so its presence
+/// tells a busy answer from an offer.
+const RETRY_AFTER_FIELD: &str = "retry_after_ms";
+
+/// Fields of the `pairing-busy` schema.
+const BUSY_FIELDS: [&str; 3] = ["scheme", "version", RETRY_AFTER_FIELD];
+
+/// The scheme name both bootstrap answers carry.
+const SCHEME: &str = "rapp";
 
 /// Validated `pairing-offer` per RAPP v26.10.29 §4.2.
 ///
@@ -166,38 +197,12 @@ impl PairingOffer {
     /// [`PairingOfferError`] on a wrong scheme, unexpected fields, malformed
     /// payload, or failed structural or policy validation.
     pub fn from_cbor(bytes: &[u8]) -> Result<Self, PairingOfferError> {
-        if bytes.len() > MAX_OFFER_SIZE {
-            return Err(PairingOfferError::Oversized { got: bytes.len() });
-        }
-        let value = decode_deterministic_cbor(bytes)?;
-        let WireValue::Map(mut map) = value else {
-            return Err(PairingOfferError::WrongType);
-        };
-        let expected = [
-            "scheme",
-            "version",
-            "offer_id",
-            "suites",
-            "profiles",
-            "transports",
-            "offer_ttl_ms",
-        ];
-        if map.keys().any(|key| !expected.contains(&key.as_str())) {
-            return Err(PairingOfferError::UnknownField);
-        }
-        if take_text(&mut map, "scheme")? != "rapp" {
-            return Err(PairingOfferError::WrongScheme);
-        }
-        let version = take_array(&mut map, "version")?;
-        if version
-            != vec![
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.0)),
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.1)),
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.2)),
-            ]
-        {
-            return Err(PairingOfferError::UnsupportedVersion);
-        }
+        Self::from_map(decode_bootstrap_map(bytes)?)
+    }
+
+    /// Reconstruct an offer from its decoded map.
+    fn from_map(mut map: BTreeMap<String, WireValue>) -> Result<Self, PairingOfferError> {
+        take_header(&mut map, &OFFER_FIELDS)?;
         let offer_id = take_bytes(&mut map, "offer_id")?;
         let offer_id =
             OfferId::reconstruct(&offer_id).map_err(|_| PairingOfferError::WrongLength {
@@ -216,22 +221,12 @@ impl PairingOffer {
         Self::reconstruct(offer_id, suites, profiles, transports, offer_ttl_ms)
     }
 
-    /// Decode bootstrap bytes received over the transport `profile`, which
-    /// the offer must list (RAPP v26.10.29 §4.2 step 3).
-    ///
-    /// # Errors
-    /// [`PairingOfferError`] on any decode or validation failure, or
-    /// [`PairingOfferError::TransportNotOffered`] when the offer does not
-    /// list `profile`.
-    pub fn from_bootstrap(
-        bytes: &[u8],
-        profile: TransportProfile,
-    ) -> Result<Self, PairingOfferError> {
-        let offer = Self::from_cbor(bytes)?;
-        if offer.entry(profile).is_none() {
+    /// The offer, when it lists the transport `profile` it arrived over.
+    fn served_over(self, profile: TransportProfile) -> Result<Self, PairingOfferError> {
+        if self.entry(profile).is_none() {
             return Err(PairingOfferError::TransportNotOffered);
         }
-        Ok(offer)
+        Ok(self)
     }
 
     /// Hash the deterministic offer per RAPP v26.10.29 §4.2.
@@ -274,15 +269,8 @@ impl PairingOffer {
 
     fn to_map(&self) -> BTreeMap<String, WireValue> {
         BTreeMap::from([
-            ("scheme".to_owned(), WireValue::Text("rapp".to_owned())),
-            (
-                "version".to_owned(),
-                WireValue::Array(vec![
-                    WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.0)),
-                    WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.1)),
-                    WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.2)),
-                ]),
-            ),
+            ("scheme".to_owned(), WireValue::Text(SCHEME.to_owned())),
+            ("version".to_owned(), version_value()),
             (
                 "offer_id".to_owned(),
                 WireValue::Bytes(self.offer_id.as_bytes().to_vec()),
@@ -320,10 +308,128 @@ impl fmt::Debug for PairingOffer {
     }
 }
 
-/// Structural or policy failure in a pairing offer.
+/// The `pairing-busy` a custodian in pairing mode answers while it cannot
+/// admit an attempt (RAPP v26.10.29 §3.3 item 6, §4.2 "PairingBusy Schema"
+/// and "Busy Refusal").
+///
+/// It carries only the time until the custodian can admit an attempt,
+/// between [`PAIRING_BUSY_RETRY_AFTER_MIN_MS`] and
+/// [`PAIRING_BUSY_RETRY_AFTER_MAX_MS`], and nothing of the code or the
+/// offer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PairingBusy {
+    retry_after_ms: u64,
+}
+
+impl PairingBusy {
+    /// A busy answer asking the requester to wait `retry_after_ms`.
+    ///
+    /// # Errors
+    /// [`PairingOfferError::RetryAfterOutOfRange`] outside
+    /// [`PAIRING_BUSY_RETRY_AFTER_MIN_MS`] to
+    /// [`PAIRING_BUSY_RETRY_AFTER_MAX_MS`].
+    pub const fn new(retry_after_ms: u64) -> Result<Self, PairingOfferError> {
+        if retry_after_ms < PAIRING_BUSY_RETRY_AFTER_MIN_MS
+            || retry_after_ms > PAIRING_BUSY_RETRY_AFTER_MAX_MS
+        {
+            return Err(PairingOfferError::RetryAfterOutOfRange {
+                got: retry_after_ms,
+            });
+        }
+        Ok(Self { retry_after_ms })
+    }
+
+    /// The custodian's busy answer for a wait of `wait_ms` until it can
+    /// admit an attempt, held to the schema's range: a wait that has
+    /// already passed asks for the least wait, a longer one for the
+    /// greatest.
+    #[must_use]
+    pub const fn until_admissible(wait_ms: u64) -> Self {
+        let retry_after_ms = if wait_ms < PAIRING_BUSY_RETRY_AFTER_MIN_MS {
+            PAIRING_BUSY_RETRY_AFTER_MIN_MS
+        } else if wait_ms > PAIRING_BUSY_RETRY_AFTER_MAX_MS {
+            PAIRING_BUSY_RETRY_AFTER_MAX_MS
+        } else {
+            wait_ms
+        };
+        Self { retry_after_ms }
+    }
+
+    /// Milliseconds until the custodian can admit an attempt.
+    #[must_use]
+    pub const fn retry_after_ms(self) -> u64 {
+        self.retry_after_ms
+    }
+
+    /// Serialize into deterministic CBOR.
+    ///
+    /// # Errors
+    /// [`PairingOfferError::Wire`] when deterministic encoding fails.
+    pub fn to_cbor(self) -> Result<Vec<u8>, PairingOfferError> {
+        Ok(encode_deterministic_cbor(&WireValue::Map(BTreeMap::from(
+            [
+                ("scheme".to_owned(), WireValue::Text(SCHEME.to_owned())),
+                ("version".to_owned(), version_value()),
+                (
+                    RETRY_AFTER_FIELD.to_owned(),
+                    WireValue::Unsigned(self.retry_after_ms),
+                ),
+            ],
+        )))?)
+    }
+
+    /// Decode a deterministic-CBOR `pairing-busy`.
+    ///
+    /// # Errors
+    /// [`PairingOfferError`] on malformed CBOR, a wrong scheme or version,
+    /// a missing or unknown field, or a `retry_after_ms` out of range.
+    pub fn from_cbor(bytes: &[u8]) -> Result<Self, PairingOfferError> {
+        Self::from_map(decode_bootstrap_map(bytes)?)
+    }
+
+    fn from_map(mut map: BTreeMap<String, WireValue>) -> Result<Self, PairingOfferError> {
+        take_header(&mut map, &BUSY_FIELDS)?;
+        Self::new(take_unsigned(&mut map, RETRY_AFTER_FIELD)?)
+    }
+}
+
+/// What a requester reads from a custodian in pairing mode (RAPP v26.10.29
+/// §4.2, Bootstrap Read Flow item 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootstrapAnswer {
+    /// The custodian can admit an attempt: its offer, listing the transport
+    /// it arrived over.
+    Offer(PairingOffer),
+    /// The custodian cannot admit an attempt now.
+    Busy(PairingBusy),
+}
+
+impl BootstrapAnswer {
+    /// Decode the bootstrap bytes received over the transport `profile`. A
+    /// map carrying `retry_after_ms` is a `pairing-busy`; any other is a
+    /// `pairing-offer`, which must list `profile`.
+    ///
+    /// # Errors
+    /// [`PairingOfferError`] when the answer decodes as neither.
+    pub fn from_bootstrap(
+        bytes: &[u8],
+        profile: TransportProfile,
+    ) -> Result<Self, PairingOfferError> {
+        let map = decode_bootstrap_map(bytes)?;
+        if map.contains_key(RETRY_AFTER_FIELD) {
+            return PairingBusy::from_map(map).map(Self::Busy);
+        }
+        PairingOffer::from_map(map)?
+            .served_over(profile)
+            .map(Self::Offer)
+    }
+}
+
+/// Structural or policy failure in a bootstrap answer: a `pairing-offer`
+/// or a `pairing-busy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairingOfferError {
-    /// The offer does not carry the `rapp` scheme.
+    /// The answer does not carry the `rapp` scheme.
     WrongScheme,
     /// Offer version differs from the supported wire version.
     UnsupportedVersion,
@@ -354,6 +460,12 @@ pub enum PairingOfferError {
     InvalidTransport,
     /// The offer does not list the transport it was received over.
     TransportNotOffered,
+    /// A `pairing-busy` wait outside [`PAIRING_BUSY_RETRY_AFTER_MIN_MS`] to
+    /// [`PAIRING_BUSY_RETRY_AFTER_MAX_MS`].
+    RetryAfterOutOfRange {
+        /// Declared wait in milliseconds.
+        got: u64,
+    },
     /// Lifetime differs from [`OFFER_TTL_MS`].
     InvalidTtl {
         /// Declared lifetime in milliseconds.
@@ -383,6 +495,48 @@ impl fmt::Display for PairingOfferError {
 }
 
 impl core::error::Error for PairingOfferError {}
+
+/// The bootstrap answers' version triple, `[26, 10, 29]`.
+fn version_triple() -> Vec<WireValue> {
+    vec![
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.0)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.1)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.2)),
+    ]
+}
+
+fn version_value() -> WireValue {
+    WireValue::Array(version_triple())
+}
+
+/// Decode bounded bootstrap bytes into their top-level map.
+fn decode_bootstrap_map(bytes: &[u8]) -> Result<BTreeMap<String, WireValue>, PairingOfferError> {
+    if bytes.len() > MAX_OFFER_SIZE {
+        return Err(PairingOfferError::Oversized { got: bytes.len() });
+    }
+    let WireValue::Map(map) = decode_deterministic_cbor(bytes)? else {
+        return Err(PairingOfferError::WrongType);
+    };
+    Ok(map)
+}
+
+/// Check that `map` has no field outside `fields`, and take and check the
+/// scheme and version both bootstrap answers carry.
+fn take_header(
+    map: &mut BTreeMap<String, WireValue>,
+    fields: &[&str],
+) -> Result<(), PairingOfferError> {
+    if map.keys().any(|key| !fields.contains(&key.as_str())) {
+        return Err(PairingOfferError::UnknownField);
+    }
+    if take_text(map, "scheme")? != SCHEME {
+        return Err(PairingOfferError::WrongScheme);
+    }
+    if take_array(map, "version")? != version_triple() {
+        return Err(PairingOfferError::UnsupportedVersion);
+    }
+    Ok(())
+}
 
 fn transport_to_value(candidate: &TransportCandidate) -> WireValue {
     WireValue::Map(BTreeMap::from([
@@ -495,10 +649,16 @@ fn take_unsigned(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_OFFER_SIZE, PairingOffer, PairingOfferDeadline, PairingOfferError};
+    use std::collections::BTreeMap;
+
+    use super::{
+        BootstrapAnswer, MAX_OFFER_SIZE, PAIRING_BUSY_RETRY_AFTER_MAX_MS,
+        PAIRING_BUSY_RETRY_AFTER_MIN_MS, PairingBusy, PairingOffer, PairingOfferDeadline,
+        PairingOfferError, RETRY_AFTER_FIELD, SCHEME, version_value,
+    };
     use crate::{
-        OfferId, ProfileName, TransportCandidate, TransportProfile, WireValue,
-        encode_deterministic_cbor,
+        OfferId, ProfileName, TransportCandidate, TransportProfile, WIRE_VERSION_V26_10_29,
+        WireValue, encode_deterministic_cbor,
     };
 
     fn profiles() -> Vec<String> {
@@ -519,8 +679,8 @@ mod tests {
         let bytes = offer.to_cbor().expect("CBOR encodes");
         for profile in [TransportProfile::Ble, TransportProfile::Stream] {
             assert_eq!(
-                PairingOffer::from_bootstrap(&bytes, profile).expect("bootstrap decodes"),
-                offer
+                BootstrapAnswer::from_bootstrap(&bytes, profile).expect("bootstrap decodes"),
+                BootstrapAnswer::Offer(offer.clone())
             );
         }
     }
@@ -531,8 +691,130 @@ mod tests {
             .to_cbor()
             .expect("CBOR encodes");
         assert_eq!(
-            PairingOffer::from_bootstrap(&bytes, TransportProfile::Stream),
+            BootstrapAnswer::from_bootstrap(&bytes, TransportProfile::Stream),
             Err(PairingOfferError::TransportNotOffered)
+        );
+    }
+
+    /// A `pairing-busy` map with `retry_after_ms` replaced by `retry_after`,
+    /// or removed when it is `None`.
+    fn busy_map(retry_after: Option<WireValue>) -> BTreeMap<String, WireValue> {
+        let mut map = BTreeMap::from([
+            ("scheme".to_owned(), WireValue::Text(SCHEME.to_owned())),
+            ("version".to_owned(), version_value()),
+        ]);
+        if let Some(value) = retry_after {
+            map.insert(RETRY_AFTER_FIELD.to_owned(), value);
+        }
+        map
+    }
+
+    fn encode(map: BTreeMap<String, WireValue>) -> Vec<u8> {
+        encode_deterministic_cbor(&WireValue::Map(map)).expect("CBOR encodes")
+    }
+
+    #[test]
+    fn a_busy_answer_round_trips_over_either_transport() {
+        for retry_after_ms in [
+            PAIRING_BUSY_RETRY_AFTER_MIN_MS,
+            PAIRING_BUSY_RETRY_AFTER_MAX_MS,
+        ] {
+            let busy = PairingBusy::new(retry_after_ms).expect("in range");
+            let bytes = busy.to_cbor().expect("CBOR encodes");
+            assert_eq!(PairingBusy::from_cbor(&bytes), Ok(busy));
+            for profile in [TransportProfile::Ble, TransportProfile::Stream] {
+                assert_eq!(
+                    BootstrapAnswer::from_bootstrap(&bytes, profile),
+                    Ok(BootstrapAnswer::Busy(busy))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_busy_wait_is_held_to_the_schema_range() {
+        assert_eq!(
+            PairingBusy::until_admissible(0).retry_after_ms(),
+            PAIRING_BUSY_RETRY_AFTER_MIN_MS
+        );
+        assert_eq!(
+            PairingBusy::until_admissible(PAIRING_BUSY_RETRY_AFTER_MAX_MS + 1).retry_after_ms(),
+            PAIRING_BUSY_RETRY_AFTER_MAX_MS
+        );
+        assert_eq!(PairingBusy::until_admissible(250).retry_after_ms(), 250);
+        assert_eq!(
+            PairingBusy::new(0),
+            Err(PairingOfferError::RetryAfterOutOfRange { got: 0 })
+        );
+    }
+
+    #[test]
+    fn malformed_busy_answers_are_refused() {
+        let out_of_range = [
+            PAIRING_BUSY_RETRY_AFTER_MIN_MS - 1,
+            PAIRING_BUSY_RETRY_AFTER_MAX_MS + 1,
+        ];
+        for got in out_of_range {
+            assert_eq!(
+                BootstrapAnswer::from_bootstrap(
+                    &encode(busy_map(Some(WireValue::Unsigned(got)))),
+                    TransportProfile::Stream
+                ),
+                Err(PairingOfferError::RetryAfterOutOfRange { got })
+            );
+        }
+        assert_eq!(
+            PairingBusy::from_cbor(&encode(busy_map(None))),
+            Err(PairingOfferError::MissingField {
+                field: RETRY_AFTER_FIELD
+            })
+        );
+        assert_eq!(
+            BootstrapAnswer::from_bootstrap(
+                &encode(busy_map(Some(WireValue::Text("soon".to_owned())))),
+                TransportProfile::Stream
+            ),
+            Err(PairingOfferError::WrongType)
+        );
+        let mut wrong_version =
+            busy_map(Some(WireValue::Unsigned(PAIRING_BUSY_RETRY_AFTER_MIN_MS)));
+        wrong_version.insert(
+            "version".to_owned(),
+            WireValue::Array(vec![
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.0)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.1)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.2) + 1),
+            ]),
+        );
+        assert_eq!(
+            BootstrapAnswer::from_bootstrap(&encode(wrong_version), TransportProfile::Stream),
+            Err(PairingOfferError::UnsupportedVersion)
+        );
+        let mut wrong_scheme = busy_map(Some(WireValue::Unsigned(PAIRING_BUSY_RETRY_AFTER_MIN_MS)));
+        wrong_scheme.insert("scheme".to_owned(), WireValue::Text("rappx".to_owned()));
+        assert_eq!(
+            BootstrapAnswer::from_bootstrap(&encode(wrong_scheme), TransportProfile::Stream),
+            Err(PairingOfferError::WrongScheme)
+        );
+        let mut extra = busy_map(Some(WireValue::Unsigned(PAIRING_BUSY_RETRY_AFTER_MIN_MS)));
+        extra.insert("offer_id".to_owned(), WireValue::Bytes(vec![0x10; 32]));
+        assert_eq!(
+            BootstrapAnswer::from_bootstrap(&encode(extra), TransportProfile::Stream),
+            Err(PairingOfferError::UnknownField),
+            "an offer field in a busy answer is not an offer"
+        );
+    }
+
+    #[test]
+    fn an_offer_carrying_a_wait_is_refused() {
+        let mut map = offer(&[TransportProfile::Stream]).to_map();
+        map.insert(
+            RETRY_AFTER_FIELD.to_owned(),
+            WireValue::Unsigned(PAIRING_BUSY_RETRY_AFTER_MIN_MS),
+        );
+        assert_eq!(
+            BootstrapAnswer::from_bootstrap(&encode(map), TransportProfile::Stream),
+            Err(PairingOfferError::UnknownField)
         );
     }
 

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! The requester's tries of one typed pairing code across the custodians it
-//! finds in pairing mode (RAPP v26.10.22 §4.2, "Trying Each Custodian in
+//! finds in pairing mode (RAPP v26.10.29 §4.2, "Trying Each Custodian in
 //! Pairing Mode").
 //!
 //! Nothing a custodian advertises tells which one shows the typed code, so

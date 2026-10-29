@@ -104,9 +104,8 @@ pub use pairing::{
     decode_pair_records, encode_pair_record, encode_pair_records,
 };
 pub use pairing_attempts::{
-    CPACE_ATTEMPT_WINDOW_MS, CpaceAttemptLedger, MAXIMUM_CPACE_ATTEMPTS, POST_PAKE_CONFIRMATION_MS,
-    POST_PAKE_HANDSHAKE_MS, PRE_AUTHENTICATION_SPACING_MS, PairingBackoff,
-    PreAuthenticationRateLimit, phase_deadline_ms,
+    CPACE_ATTEMPT_WINDOW_MS, CpaceAttemptSlot, POST_PAKE_CONFIRMATION_MS, POST_PAKE_HANDSHAKE_MS,
+    PRE_AUTHENTICATION_SPACING_MS, PreAuthenticationRateLimit, phase_deadline_ms,
 };
 pub use pairing_candidates::{
     CandidateError, NextCandidate, PAIRING_CANDIDATES_MAX, PairingCandidates,
@@ -150,7 +149,7 @@ pub use types::{
     MAX_FRAME_SIZE, MINIMUM_REMAINING_ATTEMPTS, NOISE_TAG_SIZE, OFFER_ID_SIZE, OFFER_TTL_MS,
     OPERATION_ID_SIZE, OfferId, OperationId, PAIR_ID_SIZE, PAIRING_SECRET_SIZE, PairId,
     PairingSecret, ProfileName, QUIT_WITHDRAWAL_BOUND_MS, SESSION_ID_SIZE,
-    SESSION_READY_NONCE_SIZE, SessionId, WIRE_VERSION_V26_10_22, X25519_KEY_SIZE,
+    SESSION_READY_NONCE_SIZE, SessionId, WIRE_VERSION_V26_10_29, X25519_KEY_SIZE,
 };
 pub use wire::{
     Envelope, MessageType, SequenceGuard, WireError, WireValue, decode_deterministic_cbor,

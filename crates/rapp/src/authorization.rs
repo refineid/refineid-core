@@ -65,7 +65,7 @@ impl<C> PendingCardCommand<C> {
     }
 }
 
-/// One operation of a session from admission to its result (RAPP v26.10.22
+/// One operation of a session from admission to its result (RAPP v26.10.29
 /// section 8). It lives in memory only and ends with the session.
 #[derive(Debug)]
 pub struct AuthorizationTransaction {
@@ -287,7 +287,7 @@ pub enum PrerequisitesOutcome {
 }
 
 /// A change of an operation's state that the custodian reports while it is
-/// pending (RAPP v26.10.22 section 8.2).
+/// pending (RAPP v26.10.29 section 8.2).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProgressEvent {
     /// Another session's operation holds the card.

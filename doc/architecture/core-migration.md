@@ -315,7 +315,7 @@ before it hands out the function list, and the module reads from it, at
 every slot refresh, the one pairing offered right now. An offer carries a
 certificate whose fingerprint the phone confirmed on a session, and keeps
 carrying it between sessions until the host withdraws it as RAPP
-v26.10.22 section 8.4 item 3 says; the token exists exactly then, its
+v26.10.29 section 8.4 item 3 says; the token exists exactly then, its
 objects are built from that certificate and the persisted CA
 certificates, and its serial names the pairing. A withdrawn or replaced
 token is a new token when it reappears: every raised token takes its own

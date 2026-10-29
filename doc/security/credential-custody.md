@@ -23,7 +23,7 @@ applies one rule, `check_retry_floor` in `refineid-auth`:
 - **Refused**: two, one or no tries left, a blocked credential, and any
   answer that carries no readable count. Nothing is sent, and the refusal
   names the credential and the tries left, never candidate credential
-  data. RAPP answers a PIN refusal as `retry_floor` (RAPP v26.10.22
+  data. RAPP answers a PIN refusal as `retry_floor` (RAPP v26.10.29
   section 10.2).
 - **The PUK follows the same floor.** FINEID S1 v4.2 leaves the PUK's try
   limit to card personalization; RefineID presents the PUK -- to unblock
@@ -43,7 +43,7 @@ five tries left or as PIN 1 verified (below).
 
 FINEID S4-1 v4.2 sections 4.1 and 8.1.7 require manual PIN entry for every
 qualified-signature operation. PIN2 is entered for every signature, or once
-for a batch the holder sees whole (RAPP v26.10.22 section 9.3); it is carried
+for a batch the holder sees whole (RAPP v26.10.29 section 9.3); it is carried
 only through that batch's signatures and destroyed at its end. It is never
 kept between operations.
 
@@ -73,7 +73,7 @@ key. The current specification is published on the
 PIN1 is held in process memory from the first card-confirmed successful use
 until one of the invalidation events below; there is no idle window or
 countdown. It is never written to storage -- not to a keychain, a keystore, a
-credential manager or a file -- so it never survives a restart (RAPP v26.10.22
+credential manager or a file -- so it never survives a restart (RAPP v26.10.29
 section 11 item 2).
 
 Reusable retention is allowed only when the PIN1 retry counter is at its

@@ -2,15 +2,15 @@
 
 use refineid_rapp::{
     Action, EndpointRole, Guards, IDENTITY_OFFER_GRACE_MS, LIVENESS_PING_AFTER_SILENCE_MS,
-    MAXIMUM_CPACE_ATTEMPTS, MINIMUM_REMAINING_ATTEMPTS, OFFER_TTL_MS, OperationEvent,
-    OperationState, PAIRING_CANDIDATES_MAX, PAIRING_IDLE_EXPIRY_DAYS, PairingEvent, PairingState,
+    MINIMUM_REMAINING_ATTEMPTS, OFFER_TTL_MS, OperationEvent, OperationState,
+    PAIRING_CANDIDATES_MAX, PAIRING_IDLE_EXPIRY_DAYS, PairingEvent, PairingState,
     QUIT_WITHDRAWAL_BOUND_MS, REVOCATION_NOTICE_DAYS, SESSION_SILENCE_LIMIT_MS, SessionEvent,
     SessionState,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
-const MODEL: &str = include_str!("../../../doc/protocols/rapp-state-machine-v26.10.22.yaml");
+const MODEL: &str = include_str!("../../../doc/protocols/rapp-state-machine-v26.10.29.yaml");
 
 #[derive(Deserialize)]
 struct Model {
@@ -25,7 +25,6 @@ struct Model {
 /// The model's named numbers that the engine mirrors.
 #[derive(Deserialize)]
 struct Constants {
-    pairing_attempts_per_offer: u64,
     pairing_candidates_max: u64,
     minimum_remaining_attempts: u64,
     offer_ttl_ms: u64,
@@ -112,7 +111,7 @@ fn guard_is_registered(guard: &str) -> bool {
 
 #[test]
 fn formal_document_version_is_the_reviewed_revision() {
-    assert_eq!(model().document_version, "26.10.22");
+    assert_eq!(model().document_version, "26.10.29");
 }
 
 #[test]
@@ -121,10 +120,6 @@ fn formal_constants_are_the_engine_constants() {
     let pairing_candidates_max =
         u64::try_from(PAIRING_CANDIDATES_MAX).expect("the candidate limit fits in u64");
     assert_eq!(constants.pairing_candidates_max, pairing_candidates_max);
-    assert_eq!(
-        constants.pairing_attempts_per_offer,
-        u64::from(MAXIMUM_CPACE_ATTEMPTS)
-    );
     assert_eq!(
         constants.minimum_remaining_attempts,
         u64::from(MINIMUM_REMAINING_ATTEMPTS)
@@ -490,13 +485,11 @@ const fn formal_action_name(action: Action) -> &'static str {
         Action::DisplayPairingCode => "display_pairing_code",
         Action::HidePairingCode => "hide_pairing_code",
         Action::DestroyOffer => "destroy_offer",
-        Action::StartPairingBackoff => "start_pairing_backoff",
-        Action::ShowAttemptsExhausted => "show_attempts_exhausted",
         Action::ReadOffer => "read_offer",
         Action::BeginCpaceInitiator => "begin_cpace_initiator",
         Action::TryNextCandidate => "try_next_candidate",
-        Action::ReserveAttempt => "reserve_attempt",
-        Action::CountFailedAttempt => "count_failed_attempt",
+        Action::AdmitAttempt => "admit_attempt",
+        Action::EndFailedAttempt => "end_failed_attempt",
         Action::ShowWrongCode => "show_wrong_code",
         Action::ShowNoneInPairingMode => "show_none_in_pairing_mode",
         Action::ConsumeOffer => "consume_offer",
@@ -733,7 +726,6 @@ const PAIRING_EVENTS: &[(&str, PairingEvent)] = &[
     ("attempt_started", PairingEvent::AttemptStarted),
     ("code_entered", PairingEvent::CodeEntered),
     ("attempt_failed", PairingEvent::AttemptFailed),
-    ("last_attempt_failed", PairingEvent::LastAttemptFailed),
     ("last_candidate_failed", PairingEvent::LastCandidateFailed),
     ("no_custodian_tried", PairingEvent::NoCustodianTried),
     ("search_interrupted", PairingEvent::SearchInterrupted),

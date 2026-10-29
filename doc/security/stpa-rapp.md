@@ -2,7 +2,7 @@
 
 **Status:** Reviewed by the owner on 2026-10-22 with RAPP v26.10.22
 **Date:** 2026-10-18
-**Applies to:** RAPP v26.10.22 (`doc/protocols/rapp-v26.10.22.md`), the
+**Applies to:** RAPP v26.10.29 (`doc/protocols/rapp-v26.10.29.md`), the
 transport and discovery hierarchy, and the requester and custodian
 applications built on them
 
@@ -129,7 +129,7 @@ the fact; a timeout or an inference from silence is not feedback.
 
 | Control action | Feedback present | Feedback absent |
 | :--- | :--- | :--- |
-| Type the pairing code | "connecting", then success or one failure string | Which of wrong code, lockout, wrong network, phone not offering (section 3.3 withholds some of this on purpose) |
+| Type the pairing code | "connecting", then success or one failure string | Which of wrong code, wrong network, phone not offering (section 3.3 withholds some of this on purpose) |
 | Forget a pairing on the computer | Local list updates | The custodian is never told |
 | Start a browser login or a signature | The consumer's own progress | Whether the phone has shown the prompt (4.4) |
 
@@ -247,8 +247,8 @@ block, is the payload most worth confirming.
 
 ### 6.5 The requester's user is shown one state for many (UCA-7, UCA-12)
 
-Close reasons (section 7.1 item 5), withdrawal (section 4.5), lockout
-(section 3.3), offer expiry (60 s), and handshake failure after revocation
+Close reasons (section 7.1 item 5), withdrawal (section 4.5), offer
+expiry (60 s), and handshake failure after revocation
 all reach the requester, but its user interface collapses them into one
 line. Section 3.3 withholds "wrong code" versus "other failure" on purpose
 to deny a disconnect oracle; that is a security trade-off, and it should
@@ -1048,7 +1048,7 @@ forbids a link-layer bond that would let the computer resolve them
 (UCA-56), so the address it dialed last time is gone. The computer
 dials the advertisers in the order the scan returned them; each refuses
 the routing, and each of those phones' own computers finds the single
-pre-authentication slot (§3.3 item 8) taken while it is refused. The
+pre-authentication slot (§3.3 item 6) taken while it is refused. The
 login waits behind the queue and may miss the browser's deadline. L-3,
 H-7.
 
@@ -1467,17 +1467,15 @@ about itself is authenticated until the code is accepted.
 The limit: a phone advertises pairing mode only during a ceremony, so a
 real network shows one or two. The limit of 8 pairing connections per
 typed code bounds what a flood of fake pairing-mode advertisers can cost:
-the requester's time, and other custodians' attempts.
+the requester's time, and a moment of other custodians' single-flight slots.
 
 Residuals, accepted:
 
-- Each custodian tried that does not show the code spends one of its
-  offer's three attempts (specification §3.3 item 1). The limit still holds
-  per custodian: one guess per typed code, never two at once, under its own
-  attempt deadline, so the guessing bound of the 30-bit code is unchanged.
-  A phone in pairing mode beside the right one can lose attempts it never
-  saw typed, and after three mistyped codes its offer locks out with the
-  backoff of §3.3 item 7; its holder starts a new offer.
+- Each custodian tried that does not show the code holds its single-flight
+  slot for the attempt's duration and nothing more (specification §3.3
+  item 4, CC-107). The limit still holds per custodian: one guess per typed
+  code, never two at once, under its own attempt deadline, so the guessing
+  bound of the 30-bit code is unchanged.
 - On BLE the advertisement shows no mode: a peripheral that serves no offer
   is not in pairing mode, and costs a connection but no attempt.
 - Rogues that take up the 8 pairing connections, or one that serves a copy
@@ -1884,3 +1882,41 @@ no feedback from it: only the platform's own forget path, calling
 | ID | Constraint | Closes |
 | :--- | :--- | :--- |
 | CC-106 | The operation bridge holds the pair record of its session and consults it under the record's lock at every call that serves the session, the liveness poll included: a record forgotten or revoked makes the call do nothing it was asked and return the sealed `pairing_revoked` close, after which the session is closed (specification §4.6 item 1). A forget or revoke cannot land inside a call, so an approval either precedes it and runs, or follows it and closes. A batch signature recorded on a forgotten pairing is refused and the next serving call carries the close. The platform's own close on forget stays; this constraint makes the core hold the invariant when the platform misses one. | UCA-102 |
+
+## 33. Pairing attempts that are not guesses
+
+### 33.1 Scope
+
+Specification §3.3 bounds the guessing of a pairing code by single flight,
+the 500 ms admission spacing and the offer's lifetime. It keeps no count
+of failed attempts, ends no offer because of them, and delays no new offer
+after one. Losses and hazards are this record's: L-3; H-5.
+
+### 33.2 Control structure
+
+The custodian is the controller of its offer: it admits an attempt, ends a
+failed one, and ends the offer. Its feedback about an attempt is the CPace
+outcome alone, which says that the code the requester typed is not the one
+this custodian shows, and nothing about why. A requester trying every
+custodian in pairing mode (section 23) reaches a custodian showing another
+code with the same frames as a guesser sends, and a link lost after step 1
+ends the attempt the same way as a wrong $T_A$. A count of failed attempts
+therefore counts the other custodians on the network, the other requesters,
+a test run and the radio as guesses, and acts on that model.
+
+### 33.3 Unsafe control actions
+
+| ID | Controller | Control action | Type | Context | Hazard |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| UCA-103 | Custodian | End the offer and delay the next one | P | Because of failed attempts that were not an adversary's guesses: a requester trying the code shown by another phone, a test run on the same network, or a connection lost during an attempt. The holder's code stops working, with a lockout message naming a cause the holder cannot see, and the guessing bound of the 30-bit code did not need the limit. | H-5 |
+
+### 33.4 Controller constraints
+
+| ID | Constraint | Closes |
+| :--- | :--- | :--- |
+| CC-107 | The custodian keeps no count of failed attempts: a failed attempt frees the single-flight slot and changes nothing else, and only the offer's lifetime, its consumption by a verified $T_A$, or the holder ends it. No lockout and no delay before the next offer exist. The guessing bound is single flight, the 500 ms admission spacing and the 300 s lifetime: at most 600 attempts per offer, about $2^{-20.8}$ per offer against the 30-bit code (specification §3.3, "Guessing Bound"). `CpaceAttemptSlot` in the core. | UCA-103 |
+
+Residual, accepted: a device that keeps the single-flight slot busy denies
+pairing for as long as it keeps connecting. That is inherent to pairing on
+a shared link, a strike counter did nothing against it, and it ends with
+the offer.

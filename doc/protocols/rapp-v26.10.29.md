@@ -1,23 +1,23 @@
-# Remote Authorization Proxy Protocol (RAPP) v26.10.22
+# Remote Authorization Proxy Protocol (RAPP) v26.10.29
 ## Pairing and Session Protocol over the BLE and Stream Transports
 
 Status: Stamped specification, reviewed by the owner\
-Document version: 26.10.22\
-Wire version: `[26, 10, 22]` (`[Year, Month, Day]`)\
-Offer version: `[26, 10, 22]`\
+Document version: 26.10.29\
+Wire version: `[26, 10, 29]` (`[Year, Month, Day]`)\
+Offer version: `[26, 10, 29]`\
 Transport Profiles: `"fi.refineid.rapp.ble"`, `"fi.refineid.stream"` (§2.2)\
-Date: 2026-10-22\
+Date: 2026-10-29\
 Change controller: RefineID project
 
 ---
 
 ## Abstract
 
-This specification defines the pairing protocol and the operational protocol of the Remote Authorization Proxy Protocol (RAPP v26.10.22), carried over any registered transport profile (§2.2): the **Bluetooth Low Energy (BLE) Direct Proximity Transport Profile** (`"fi.refineid.rapp.ble"`) and the **Local Internet Protocol (IP) Stream Transport Profile** (`"fi.refineid.stream"`). Pairing, offer bootstrap, sessions, and operations are identical on every transport; only framing, routing, and discovery differ.
+This specification defines the pairing protocol and the operational protocol of the Remote Authorization Proxy Protocol (RAPP v26.10.29), carried over any registered transport profile (§2.2): the **Bluetooth Low Energy (BLE) Direct Proximity Transport Profile** (`"fi.refineid.rapp.ble"`) and the **Local Internet Protocol (IP) Stream Transport Profile** (`"fi.refineid.stream"`). Pairing, offer bootstrap, sessions, and operations are identical on every transport; only framing, routing, and discovery differ.
 
 A user's mobile device acts as the Custodian holding physical custody of the Finnish Electronic Identification (FINEID) identity card over Near Field Communication (NFC). The workstation acts as a Requester. On BLE the Custodian is the Generic Attribute Profile (GATT) Peripheral and the Requester the GATT Central. The Peripheral is the side that advertises, accepts the connection, and serves the data (the GATT Server); the Central is the side that scans, connects, and reads or writes that data (the GATT Client). On the stream transport the Custodian listens and the Requester dials.
 
-Pairing is established through a 6-character Crockford Base32 human code (`7K X4 M9`, 30.0 bits entropy) executed over `CPaceRistretto255` ([draft-irtf-cfrg-cpace-21](https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-cpace-21)). Advertisements broadcast zero pairing code material, zero ephemeral bucket hints, and zero user identifiers or personal device names. Device discovery is mediated by a standardized 128-bit RAPP Service Universally Unique Identifier (UUID) and finalized through authenticated `Noise_XXpsk3` key exchange. Rate limiting allows three guesses of the pairing code per 5-minute offer, with atomic attempt reservation preventing disconnect oracles.
+Pairing is established through a 6-character Crockford Base32 human code (`7K X4 M9`, 30.0 bits entropy) executed over `CPaceRistretto255` ([draft-irtf-cfrg-cpace-21](https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-cpace-21)). Advertisements broadcast zero pairing code material, zero ephemeral bucket hints, and zero user identifiers or personal device names. Device discovery is mediated by a standardized 128-bit RAPP Service Universally Unique Identifier (UUID) and finalized through authenticated `Noise_XXpsk3` key exchange. One guess of the pairing code runs at a time and the next is admitted no sooner than 500 ms later, so a 5-minute offer admits at most 600 guesses of its 30-bit code; an attempt is charged before the Custodian answers it, so disconnecting gains nothing.
 
 To support upper-layer messages (such as X.509 certificate chains or document signing summaries) across single Attribute Protocol (ATT) transactions, this profile specifies a normative **BLE Segmentation and Reassembly (SAR) Adaptation Layer**, preserving upper-layer session and operation security guarantees without frame truncation.
 
@@ -27,9 +27,9 @@ To support upper-layer messages (such as X.509 certificate chains or document si
 
 ### 1.1 Scope and Standalone Specification Model
 
-This document defines the complete, standalone normative specification for the **Remote Authorization Proxy Protocol (RAPP) version 26.10.22**. It encompasses:
+This document defines the complete, standalone normative specification for the **Remote Authorization Proxy Protocol (RAPP) version 26.10.29**. It encompasses:
 - The **Transport Profile Registry** (§2.2) with the **BLE Transport Profile** (`"fi.refineid.rapp.ble"`) and the **Local IP Stream Transport Profile** (`"fi.refineid.stream"`).
-- The **pairing protocol** utilizing `CPaceRistretto255`, 6-character Crockford Base32 human factors, atomic attempt reservation, and authenticated `Noise_XXpsk3` channel binding.
+- The **pairing protocol** utilizing `CPaceRistretto255`, 6-character Crockford Base32 human factors, atomic attempt admission, and authenticated `Noise_XXpsk3` channel binding.
 - The **BLE SAR Adaptation Layer** with latched invariant total lengths and stop-and-wait flow control.
 - The **Authenticated Message Envelope**, sequential sequencing, and session multiplexing.
 - The **operation model** (§8): one operation at a time on the card, queued across sessions, forgotten with its session.
@@ -40,13 +40,13 @@ This document defines the complete, standalone normative specification for the *
 - **Concurrent Multi-Client Serving** (§8): the Custodian serves every paired Requester over its own session; card operations are serialized on the single card.
 - The **Failure Semantics, Retry Protection, and PIN Contracts**.
 
-This document is completely self-contained: all normative schemas, protocol state machines, cryptographic bindings, error handling rules, and wire formats required to implement, verify, and audit RAPP v26.10.22 are defined herein.
+This document is completely self-contained: all normative schemas, protocol state machines, cryptographic bindings, error handling rules, and wire formats required to implement, verify, and audit RAPP v26.10.29 are defined herein.
 
 - **Migration and Compatibility**:
-  RAPP v26.10.22 runs the same pairing and session protocol over every registered transport profile (§2.2). Its wire and offer versions are `[26, 10, 22]` (`[Year, Month, Day]`). It does not interoperate with other RAPP versions. Implementations must conform strictly to the schemas and state machines defined in this standalone specification.
+  RAPP v26.10.29 runs the same pairing and session protocol over every registered transport profile (§2.2). Its wire and offer versions are `[26, 10, 29]` (`[Year, Month, Day]`). It does not interoperate with other RAPP versions. Implementations must conform strictly to the schemas and state machines defined in this standalone specification.
 - **Wire and Offer Versioning**:
-  - Offer version: `[26, 10, 22]` in `pairing-offer`.
-  - Wire version: `[26, 10, 22]` (`[Year, Month, Day]`) in channel envelopes, pairing context, and handshake prologues.
+  - Offer version: `[26, 10, 29]` in `pairing-offer`.
+  - Wire version: `[26, 10, 29]` (`[Year, Month, Day]`) in channel envelopes, pairing context, and handshake prologues.
 - **Role Mapping**:
   - **Requester**: Corresponds to the RAPP Requester. On BLE it operates as GATT Client (Central); on the stream transport it dials the Custodian.
   - **Custodian**: Corresponds to the mobile device acting as the RAPP Authorization Proxy while holding exclusive physical NFC custody of the Credential Holder (FINEID Card). On BLE it operates as GATT Server (Peripheral); on the stream transport it listens.
@@ -58,7 +58,6 @@ This document is completely self-contained: all normative schemas, protocol stat
 * **Custodian**: the server. The mobile phone that holds the identity card over NFC and serves it to its clients. In BLE topology, the Custodian operates as the **GATT Server (Peripheral)**.
 * **Requester**: the client. The computer that asks the Custodian for authentication or qualified signatures. In BLE topology, the Requester operates as the **GATT Client (Central)**.
 * **Crockford Base32 Code**: A 6-character human-readable alphanumeric code sampled uniformly from Crockford's unambiguous Base32 alphabet.
-* **Fail-Stop**: The permanent termination of a pairing offer after three failed guesses of the pairing code (`attempts_failed == 3`), destroying all ephemeral key material and imposing exponential backoff before permitting a new offer (§3.3). Offer time to live (TTL) expiration without 3 failed attempts tears down the offer cleanly without backoff. Reserving the 3rd attempt blocks subsequent admissions but permits that active 3rd attempt to finish under its clamped timer.
 
 ---
 
@@ -66,8 +65,8 @@ This document is completely self-contained: all normative schemas, protocol stat
 
 ### 2.1 Transport Architecture & Protocol Lifecycle
 
-- **Wire Version**: `[26, 10, 22]` (`[Year, Month, Day]`)
-- **Offer Version**: `[26, 10, 22]`
+- **Wire Version**: `[26, 10, 29]` (`[Year, Month, Day]`)
+- **Offer Version**: `[26, 10, 29]`
 - **Transport Profiles**: registered in §2.2
 
 The transport acts as the underlying point-to-point bearer for RAPP frames. CPace establishes the 32-byte pre-shared key (PSK) that seeds mutual pairing authentication (`Noise_XXpsk3`), replay protection, monotonic sequence counters, and typed at-most-once operation dispatch. Every phase below runs unchanged on every registered transport profile; "transport frame" means one SAR-reassembled message on BLE (§5.3) and one length-prefixed frame on the stream transport (§2.2.2).
@@ -76,7 +75,7 @@ The transport acts as the underlying point-to-point bearer for RAPP frames. CPac
 - **Phase 0: Routing**: Every connection starts with exactly one routing preamble transport frame from the Requester (§2.2). For purpose `"pairing"` with an active offer, the connection proceeds to the offer bootstrap. For purpose `"session"` whose routing tag a stored pairing keyed (§2.2.1), the connection transitions to the Noise session phase.
 - **Phase 1: Offer Bootstrap**: The Requester obtains the canonical `pairing-offer`, carrying a fresh random 32-byte `offer_id`, the CPace session identifier (SID), over the transport in use (§4.2): on BLE by reading the Bootstrap Characteristic, on the stream transport as the Custodian's first transport frame after the pairing preamble. Both peers compute the canonical `offer_hash` and bind the transport entry of the offer that names the transport profile in use.
 - **Phase 2: CPace Key Agreement & Confirmation**: Execute the `CPaceRistretto255` key confirmation variant 2 (KC2) profile, one transport frame per CPace message, with Context $C$ binding, mutually authenticating via Hash-based Message Authentication Code (HMAC) tags $T_B$ and $T_A$ to establish $PSK$ via HMAC-based Key Derivation Function (HKDF)-Expand. On success, transition to the Noise pairing phase and consume the offer.
-- **Phase 3: Noise_XXpsk3 Pairing**: Perform the authenticated pairing handshake with prologue bound to canonical `offer_hash`, wire version `[26, 10, 22]`, suite, and the transport profile in use. Immediately on handshake completion, derive pairing-channel `session_id` and `pair_id`. Exchange `pairing.hello` (parameter echo using `session_id`) and `pairing.confirm` (capability grants), deriving `grants_hash`.
+- **Phase 3: Noise_XXpsk3 Pairing**: Perform the authenticated pairing handshake with prologue bound to canonical `offer_hash`, wire version `[26, 10, 29]`, suite, and the transport profile in use. Immediately on handshake completion, derive pairing-channel `session_id` and `pair_id`. Exchange `pairing.hello` (parameter echo using `session_id`) and `pairing.confirm` (capability grants), deriving `grants_hash`.
 - **Phase 4: Pair Storage and Confirmation**: Atomically store the pairing trust record (`pair_id`, `grants_hash`, peer static public key, and local private key), then send `pairing.stored`. The pairing is active on an endpoint only once it has both stored its record and received the peer's `pairing.stored` (§4.3). A stored pairing is not bound to the transport it was created on; sessions may use any registered transport.
 - **Subsequent Operational Sessions**: Operational connections start in the Routing phase, route by a fresh routing tag (§2.2.1), and open a fresh `Noise_KK` session with an independent operational `session_id`, bound to the transport profile of that connection.
 
@@ -100,7 +99,7 @@ The diagram shows the BLE profile; on the stream transport the Requester dials t
 │  - Displays Crockford Base32 code on screen                 │
 │  - Advertises Service UUID with ZERO hints / Anonymous Name │
 │  - Holds exclusive NFC custody of FINEID Card               │
-│  - Three attempts per offer, offer lifecycle                │
+│  - One guess at a time, offer lifecycle                     │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -137,7 +136,7 @@ The Custodian routes a `"session"` preamble as follows:
 2. On no match the Custodian closes the connection without changing stored state.
 3. On a match it consults its replay memory: the nonces of the 256 most recently routed sessions. A nonce already there closes the connection; otherwise the nonce is added, displacing the oldest, and the connection proceeds to the Noise session phase for the matched pairing.
 
-A preamble that does not decode, names another profile's domain, carries an unregistered purpose, a non-empty value with `"pairing"`, or a value other than 32 bytes with `"session"` closes the connection (§10.1) without changing stored state. An encoded preamble longer than 64 bytes is rejected before parsing. A `"session"` preamble encodes to 55 bytes on the stream transport and 52 bytes on BLE. The `routing_tag` and `routing_preamble` vectors of `vectors/rapp-routing-v26.10.22.json` pin the bytes.
+A preamble that does not decode, names another profile's domain, carries an unregistered purpose, a non-empty value with `"pairing"`, or a value other than 32 bytes with `"session"` closes the connection (§10.1) without changing stored state. An encoded preamble longer than 64 bytes is rejected before parsing. A `"session"` preamble encodes to 55 bytes on the stream transport and 52 bytes on BLE. The `routing_tag` and `routing_preamble` vectors of `vectors/rapp-routing-v26.10.29.json` pin the bytes.
 
 The routing tag only selects a pairing; it authenticates nothing. Authentication is established exclusively by the `Noise_KK` handshake that follows.
 
@@ -180,7 +179,7 @@ $$\text{Display: } \texttt{XX XX XX} \quad (\text{e.g., } \texttt{7K X4 M9})$$
 
 This format structures visual transfer into three distinct 2-character groups. The Requester user interface (UI) receives the typed code and applies the entry rule of §3.1 before initiating the connection, on every transport.
 
-### 3.3 Entropy, Attempt Accounting, and Disconnect Oracle Mitigation
+### 3.3 Entropy, Attempt Admission, and the Guessing Bound
 
 Each character carries $\log_2(32) = 5.0\text{ bits}$ of entropy. The 6-character code provides:
 
@@ -189,45 +188,39 @@ $$\text{Entropy} = 6 \times 5 = 30.0\text{ bits} \quad (1{,}073{,}741{,}824\text
 #### Local Well-Formedness vs. Attempt Consumption
 - **Local Validation**: If the user enters an invalid character, incomplete string ($< 6$ chars), or illegal symbol on the Requester, the Requester UI must reject the input locally. **No frame is transmitted on any transport, and no attempt is consumed.**
 
-#### Atomic Attempt Accounting & Disconnect Oracle Mitigation
+#### Atomic Attempt Admission and the Disconnect Oracle
 An attempt here is one guess of the pairing code over the transport. It is unrelated to the card's personal identification number (PIN) try counter, which §10.2 governs.
 
-In two-pass password-authenticated key exchange (PAKE) protocols, an adversary acting as initiator could transmit candidate public point $Y_A$, receive the Custodian's $Y_B$ and confirmation authenticator $T_B$, test their guess offline against $T_B$, and disconnect without submitting $T_A$, attempting to evade strike accounting.
+In two-pass password-authenticated key exchange (PAKE) protocols, an adversary acting as initiator could transmit candidate public point $Y_A$, receive the Custodian's $Y_B$ and confirmation authenticator $T_B$, test its guess against $T_B$, and disconnect without submitting $T_A$. $T_B$ tests only the one code that $Y_A$ was built from (§6.1.3), so the attempt is charged at admission, before $Y_B \parallel T_B$ leave the Custodian, and a disconnect after $T_B$ costs the adversary the same as a completed wrong guess: one admission under the single-flight and spacing rules of item 6. No count of failed attempts ends an offer; only its lifetime and its consumption do.
 
-To mathematically close this oracle while permitting the final legitimate attempt to complete:
 1. **Attempt State Model**:
-   The Custodian maintains explicit state:
-   - `attempts_admitted`: monotonically increasing counter of initiated attempts (initial: 0, maximum: 3). Admission exhaustion triggers when `attempts_admitted == 3`.
+   The Custodian maintains for the offer:
    - `active_attempt`: boolean indicating an attempt is currently executing under its timer.
-   - `attempts_failed`: count of failed, timed-out, or abandoned attempts (initial: 0, maximum: 3). Fail-stop lockout triggers strictly when `attempts_failed == 3`. (Offer TTL expiration without 3 failed attempts tears down the offer cleanly without triggering fail-stop lockout or backoff).
-2. **Atomic Attempt Reservation**:
-   When the Custodian receives $Y_A$, it validates group membership. If `attempts_admitted < 3` and `!active_attempt`, it atomically increments `attempts_admitted`, sets `active_attempt = true`, and derives the shared secret. **This reservation occurs strictly before transmitting $Y_B$ and $T_B$.**
+   - `consumed`: boolean set once a verified $T_A$ consumed the offer (item 5).
+2. **Atomic Attempt Admission**:
+   When the Custodian receives $Y_A$, it validates group membership. If `!active_attempt`, the offer is not consumed, the offer deadline has not passed, and the spacing of item 6 allows it, the Custodian atomically sets `active_attempt = true` and derives the shared secret. **This admission occurs strictly before transmitting $Y_B$ and $T_B$.** Otherwise the Custodian refuses the attempt as item 6 says.
 3. **Attempt Deadline & Admission Timing**:
    Upon validating $Y_A$ and atomically admitting an attempt, the Custodian arms a non-extendable monotonic attempt timer bounded by:
    $$\text{attempt\_deadline} = \min(\text{admission\_time} + 5.0\text{ s}, \text{offer\_deadline})$$
    Starting the timer at admission strictly bounds local derivation computation before transmitting $Y_B \parallel T_B$ and guarantees an absolute ceiling on the round-trip completion window. If $\text{offer\_deadline}$ has already elapsed ($\text{remaining\_offer\_ttl} == 0$), no attempt can be admitted.
-4. **Completion of the Third Attempt**:
-   Reserving the 3rd attempt (`attempts_admitted == 3`) blocks any further admissions (`attempts_admitted >= 3`). However, **ephemeral offer keys remain active during the attempt deadline to allow that 3rd attempt to successfully complete.**
-5. **No Refund on Disconnect or Timeout**:
-   If the Requester disconnects, drops the link, or fails to deliver a valid mutual confirmation authenticator $T_A$ before the attempt deadline expires, `active_attempt` is cleared and `attempts_failed` increments. If `attempts_failed == 3`, the offer is permanently destroyed (fail-stop lockout).
-6. **Successful PAKE Completion & Offer Consumption**:
-   Upon receiving and verifying a valid mutual confirmation authenticator $T_A$ within the attempt deadline, `active_attempt` is cleared, the PAKE attempt timer is canceled, the pairing offer is permanently marked **consumed** (disabling any subsequent admissions or attempt reservations under that `offer_id`), and the session transitions exclusively to the Noise pairing phase. Subsequent network faults during Noise or protocol mismatches do not restore the consumed offer or alter PAKE strike accounting; any new pairing ceremony mandates generating a fresh offer and pairing code.
-   - **Multi-Attempt Replay Resistance & Composition Scope**: Although the 32-byte `offer_id` ($SID$) is shared across the up to 3 admitted attempts of a single offer, each honest endpoint draws a fresh independent nonzero scalar ($x_A, x_B$) for every attempt. Transcript-bound confirmation prevents reuse of a prior tag against a different transcript except with the relevant cryptographic failure probabilities. This argument is not a formal proof that several guesses sharing one SID compose securely; that remains a recorded engineering assumption, bounded in operation by strict atomic attempt accounting (`attempts_admitted <= 3`), single-flight serialization, monotonic attempt deadlines (5.0 s), and immediate offer consumption upon valid $T_A$.
+4. **End of a Failed Attempt**:
+   If the Requester disconnects, drops the link, or fails to deliver a valid mutual confirmation authenticator $T_A$ before the attempt deadline expires, `active_attempt` is cleared and nothing else changes: the offer keeps being served on every transport, the pairing code stays on screen, and the next attempt is admitted under items 2 and 6. The Custodian keeps no count of failed attempts and shows the holder nothing about them.
+5. **Successful PAKE Completion & Offer Consumption**:
+   Upon receiving and verifying a valid mutual confirmation authenticator $T_A$ within the attempt deadline, `active_attempt` is cleared, the PAKE attempt timer is canceled, the pairing offer is permanently marked **consumed** (disabling any subsequent admissions under that `offer_id`), and the session transitions exclusively to the Noise pairing phase. Subsequent network faults during Noise or protocol mismatches do not restore the consumed offer; any new pairing ceremony mandates generating a fresh offer and pairing code.
+   - **Multi-Attempt Replay Resistance & Composition Scope**: Although the 32-byte `offer_id` ($SID$) is shared across every attempt admitted under a single offer, each honest endpoint draws a fresh independent nonzero scalar ($x_A, x_B$) for every attempt. Transcript-bound confirmation prevents reuse of a prior tag against a different transcript except with the relevant cryptographic failure probabilities. This argument is not a formal proof that several guesses sharing one SID compose securely; that remains a recorded engineering assumption, bounded in operation by single-flight serialization and the admission spacing of item 6, monotonic attempt deadlines (5.0 s), the offer lifetime of item 7, and immediate offer consumption upon valid $T_A$.
+6. **Single-Flight Serialization & Rate Limiting**:
+   The Custodian never runs two pairing-code guesses at once. A second connection that starts CPace while `active_attempt` is true is refused: on BLE with the ATT error `0x80 Application Error`, on the stream transport by closing the connection. In addition, pre-authentication connection attempts and CPace step 1 submissions, valid or invalid, are admitted at most once per 500 ms; a connection refused by the spacing is refused the same way, and nothing in the offer changes.
 7. **Offer Lifecycle, Expiry Separation, and Post-PAKE Deadlines**:
    The pairing offer is valid for exactly 5 minutes (300 seconds) from user initiation (`offer_ttl_ms = 300000`).
-   - **Clean Offer Expiry**: If the 5-minute offer TTL expires without an active attempt or after all admitted attempts have finished with `attempts_failed < 3`, the offer is terminated cleanly: the offer stops being served on every transport and ephemeral offer keys are zeroized. No strike penalty or exponential backoff is imposed; the user may immediately start a new offer without delay.
-   - **Active Attempt Clamping**: An active PAKE attempt cannot extend past the offer deadline: per rule 3, the attempt timer is strictly clamped by $\text{attempt\_deadline} = \min(\text{admission\_time} + 5.0\text{ s}, \text{offer\_deadline})$. Reserving an attempt at $t = 299\text{ s}$ yields an attempt deadline of $1.0\text{ s}$, terminating at $t = 300\text{ s}$.
+   - **Offer Expiry**: When the 5-minute offer TTL passes, the offer is terminated: it stops being served on every transport, the pairing code leaves the screen, and ephemeral offer keys are zeroized. No penalty follows, and the user may immediately start a new offer. The attempts admitted or failed under the offer play no part in its termination.
+   - **Active Attempt Clamping**: An active PAKE attempt cannot extend past the offer deadline: per item 3, the attempt timer is strictly clamped by $\text{attempt\_deadline} = \min(\text{admission\_time} + 5.0\text{ s}, \text{offer\_deadline})$. Admitting an attempt at $t = 299\text{ s}$ yields an attempt deadline of $1.0\text{ s}$, terminating at $t = 300\text{ s}$.
    - **Handed-Off Lifecycle & Finite Post-PAKE Deadlines**: Once CPace completes successfully and transfers exclusive custody to the Noise pairing phase, the active ceremony is **exempt** from destruction by the original 5-minute offer TTL. Instead, the active pairing channel is bounded by finite post-PAKE monotonic deadlines:
      1. **Noise Handshake Completion Deadline**: 10.0 seconds from local CPace handoff.
      2. **Grant Echo, Storage and Confirmation Deadline**: 10.0 seconds from local Noise completion, within which `pairing.confirm` is echoed, the record is stored, and the peer's `pairing.stored` is received (§4.3 item 4).
      Any timeout, peer silence, transport disconnect, or protocol error destroys candidate trust immediately, erases ephemeral keys, and closes the connection without persisting an unconfirmed pairing; a record already stored when the deadline passes without the peer's `pairing.stored` is revoked (§4.6). An indefinitely silent peer is terminated upon deadline expiry. The Requester enters Noise only after the transport frame carrying Message 3 has been sent; the transport's own delivery acknowledgment (on BLE, the ATT write acknowledgment) does not prove that the Custodian accepted $T_A$.
-   - **Fail-Stop Lockout and Exponential Backoff**: Triggered by the third failed attempt (`attempts_failed == 3`). Upon fail-stop lockout:
-     1. The Custodian destroys all ephemeral keys, stops serving the offer on every transport, and surfaces an on-screen notification to the user ("Pairing failed: 3 incorrect codes. Pairing locked.").
-     2. The Custodian enforces an exponential backoff penalty of $\text{delay\_seconds} = \min(2^n, 300\text{ s})$ before permitting the generation of a new offer, where $n = \text{consecutive\_failed\_offers}$ (saturating at $n = 9$; $2^8 = 256\text{ s}$, $2^9 \to 300\text{ s}$).
-     3. The counter $n$ starts at $0$, increments by $1$ only upon a fail-stop lockout (`attempts_failed == 3`), and resets to $0$ upon any successful pairing completion (Phase 4), upon conscious manual user reset/unlock in the Custodian settings UI, or after 15 minutes of user inactivity. The counter $n$ is held in volatile memory and resets to $0$ across device reboot.
-8. **Single-Flight Serialization & Rate Limiting**:
-   The Custodian never runs two pairing-code guesses at once. A second connection that starts CPace while `active_attempt` is true is refused: on BLE with the ATT error `0x80 Application Error`, on the stream transport by closing the connection. In addition, pre-authentication connection attempts and invalid $Y_A$ candidate submissions are rate-limited to at most 1 attempt per 500 ms to mitigate serial resource consumption.
 
+#### Guessing Bound
+The code space is $2^{30}$ and CPace admits only online guessing: each attempt tests the one code its $Y_A$ was built from (§6.1.3), whether or not $T_A$ is sent. Items 3, 6 and 7 bound the attempts an offer admits: one at a time, at most one every 500 ms, for at most 300 s, so at most 600 attempts per offer. An adversary who guesses at that rate for the whole lifetime of an offer finds the code with probability at most $600 / 2^{30} \approx 2^{-20.8}$, about 1 in 1.8 million per offer, and has to be on the holder's network or within Bluetooth range during the minutes the Custodian is in pairing mode. Because no count of failures ends the offer, attempts that are not an adversary's guesses, such as a Requester trying this Custodian with a code shown by another Custodian (§4.2), or a connection lost during an attempt, cannot make the holder's offer unusable. A device that keeps the single-flight slot busy denies pairing for as long as it keeps connecting, which is inherent to pairing on a shared link and is bounded by the offer's lifetime.
 ---
 
 ## 4. Privacy, Bootstrap Discovery, and Noise Binding
@@ -256,7 +249,7 @@ The SID used in CPace must be an independent 32-byte cryptographic random value 
 ```cddl
 pairing-offer = {
   "scheme": "rapp",
-  "version": [26, 10, 22],       ; offer version triple
+  "version": [26, 10, 29],       ; offer version triple
   "offer_id": bstr .size 32,    ; 32-byte cryptographic random SID
   "suites": [
     "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512"
@@ -282,7 +275,7 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
 #### Bootstrap Read Flow:
 1. **BLE**: the Custodian exposes the **RAPP Bootstrap Characteristic** (`7E39FD03-A6B5-4D78-9E11-37E28E9545F1`, Read-only). The Requester connects, sends the `"pairing"` routing preamble (§5.2), and performs an `ATT_READ_REQ` on this characteristic to obtain `encode_deterministic_cbor(pairing-offer)`.
 2. **Stream**: after receiving the `"pairing"` routing preamble, the Custodian sends `encode_deterministic_cbor(pairing-offer)` as its first transport frame. A Custodian with no active offer closes the connection instead.
-3. The Requester decodes the offer and rejects it unless it is deterministic CBOR matching the schema, carries version `[26, 10, 22]`, lists an acceptable suite, and contains a `transports` entry whose `profile` is the transport profile of the connection. Unsupported suites terminate the pairing flow immediately before CPace; automatic downgrade or fallback to unconfirmed legacy suites is strictly prohibited.
+3. The Requester decodes the offer and rejects it unless it is deterministic CBOR matching the schema, carries version `[26, 10, 29]`, lists an acceptable suite, and contains a `transports` entry whose `profile` is the transport profile of the connection. Unsupported suites terminate the pairing flow immediately before CPace; automatic downgrade or fallback to unconfirmed legacy suites is strictly prohibited.
 4. Both peers bind the `candidate_id` of that entry and the connection's transport profile (§4.3, §6.1.1), use `offer_id` as SID for CPace, and compute `offer_hash` for the Noise pairing prologue.
 5. A deterministic encoding of `pairing-offer` with the KC2 suite, the three registered profiles, and both transport entries stays within the 509-byte ATT value capacity at the minimum ATT Maximum Transmission Unit (MTU) of 512.
 
@@ -294,7 +287,7 @@ A `mode=pairing` record and a BLE advertisement carry nothing derived from the c
 4. **Refusal**: A Custodian refuses the code when its pairing connection is refused or closed before $T_B$ verifies, when its CPace step 2 does not arrive within 5.0 s of step 1 (the attempt deadline of §3.3 item 3), or when its $T_B$ does not verify (§6.1.3 step 3). The Requester then closes that connection and tries the next Custodian. A verified $T_B$ shows that the Custodian holds the code: the Requester tries no other Custodian with it, and a later failure ends the ceremony as §3.3 item 7 says.
 5. **Limit**: The Requester opens at most 8 pairing connections per typed code, whether or not CPace runs on them.
 6. **Report**: The Requester reports the code as not accepted only when it has tried at least one Custodian, every Custodian it tried has refused the code, and it has no endpoint left to open or has opened 8 pairing connections. The report names no Custodian: until a code is accepted nothing a Custodian says about itself is authenticated, and the offer names no device. A Requester that tried no Custodian found none in pairing mode and says so; it does not report the code as not accepted.
-7. **Attempt budget**: A Custodian that admitted the attempt (§3.3 item 2) and then refused the code has spent one of its offer's three attempts (`attempts_admitted`, §3.3 item 1). The limit still holds for each Custodian: it receives at most one guess per typed code, never two at once (§3.3 item 8), each under its own attempt deadline.
+7. **One guess per Custodian per code**: A Custodian that admitted the attempt (§3.3 item 2) and then refused the code keeps its offer as it was (§3.3 item 4). Each Custodian receives at most one guess per typed code, never two at once (§3.3 item 6), each under its own attempt deadline; a try at a Custodian that shows another code costs that Custodian nothing but the attempt's time.
 
 ### 4.3 Mandatory Noise Binding, Temporal Derivation, and Reconnect Routing
 
@@ -303,13 +296,13 @@ A `mode=pairing` record and a BLE advertisement carry nothing derived from the c
    ```cddl
    pairing-prologue = [
      "rapp-pairing",
-     [26, 10, 22],                                                         ; wire version [Year, Month, Day]
+     [26, 10, 29],                                                         ; wire version [Year, Month, Day]
      "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512", ; cryptographic suite name
      bstr .size 32,                                                       ; offer_hash
      tstr                                                                 ; transport profile of the connection (§2.2)
    ]
    ```
-   $$\text{prologue} = \text{encode\_deterministic\_cbor}(\text{pairing-prologue}) \quad (145\text{ bytes on BLE, 143 bytes on stream})$$
+   $$\text{prologue} = \text{encode\_deterministic\_cbor}(\text{pairing-prologue}) \quad (146\text{ bytes on BLE, 144 bytes on stream})$$
 
 2. **Immediate Channel Identifier Derivation**:
    Immediately upon completing the `Noise_XXpsk3` handshake, both peers derive the channel identifiers from the completed handshake hash $h$ in strict order:
@@ -322,7 +315,7 @@ A `mode=pairing` record and a BLE advertisement carry nothing derived from the c
 
 3. **Parameter Echo & Mutual Grants**:
    - Inside the established pairing channel, peers exchange `pairing.hello`.
-   - `pairing.hello` echoes `offer_hash`, the bound transport profile and `candidate_id` (§4.2), wire version `[26, 10, 22]`, suite name, display name, platform description, and requester's requested profiles.
+   - `pairing.hello` echoes `offer_hash`, the bound transport profile and `candidate_id` (§4.2), wire version `[26, 10, 29]`, suite name, display name, platform description, and requester's requested profiles.
    - Custodian verifies matching echoes. Any mismatch aborts with an authenticated protocol violation.
    - The Custodian automatically grants the valid requested profiles matching its pairing offer (since possession and entry of the 30-bit pairing code constitutes user authorization), and transmits `pairing.confirm` carrying granted profiles. Requester echoes and confirms. Both granted sets must be identical.
    - Derive `grants_hash` from the confirmed, canonically sorted grant set:
@@ -350,13 +343,13 @@ A `mode=pairing` record and a BLE advertisement carry nothing derived from the c
      ```text
      K_x = HKDF-SHA-256(salt = pair_id, IKM = X25519(local static private, peer static public), info, L = 32)
      ```
-     with `info` `"rapp-routing"` for routing tags (§2.2.1), `"rapp-discovery-hint"` for discovery hints (hierarchy specification §4.3), and `"rapp-withdrawal"` for withdrawal hints (§4.5). Both endpoints obtain the same agreement from their own private key and the peer's public key. An agreement equal to the identity point yields no key; such a pairing is never announced or routed. The `pair_keys` vectors of `vectors/rapp-routing-v26.10.22.json` pin the keys.
+     with `info` `"rapp-routing"` for routing tags (§2.2.1), `"rapp-discovery-hint"` for discovery hints (hierarchy specification §4.3), and `"rapp-withdrawal"` for withdrawal hints (§4.5). Both endpoints obtain the same agreement from their own private key and the peer's public key. An agreement equal to the identity point yields no key; such a pairing is never announced or routed. The `pair_keys` vectors of `vectors/rapp-routing-v26.10.29.json` pin the keys.
    - **Routing privacy**: A routing tag is fresh for every connection and computationally unlinkable without `K_route`, so an observer of preambles cannot tell whether two connections belong to the same pairing, and no routing value recurs. A replayed preamble is refused in the Routing phase while its nonce is in the Custodian's replay memory; a preamble replayed after its nonce has left the memory reaches `Noise_KK` message 1, which the replaying party cannot complete. That timing difference reveals only that some stored pairing once routed that preamble, which the observer already saw; it is mitigated by single-flight connection serialization and the pre-authentication limiter (§3.3).
    - Session Prologue:
      ```cddl
      session-prologue = [
        "rapp-session",
-       [26, 10, 22],                                                         ; wire version [Year, Month, Day]
+       [26, 10, 29],                                                         ; wire version [Year, Month, Day]
        "Noise_KK_25519_ChaChaPoly_SHA512",                              ; suite name
        pair_id,                                                         ; bstr .size 16
        grants_hash,                                                     ; bstr .size 32
@@ -384,7 +377,7 @@ An endpoint **withdraws** when it deliberately stops serving, or stops using, re
 
 2. **Withdrawal Hint**:
    $$\text{whint} = \text{first 8 bytes of }\text{HMAC-SHA-256}(K_{\text{wd}}, \text{len} \parallel \text{instance} \parallel \text{counter\_be64})$$
-   where $\text{instance}$ is the instance portion of the DNS-SD service instance name the Custodian publishes ([RFC 6763](https://www.rfc-editor.org/rfc/rfc6763.html) §4.1): the name exactly as published, without the service type (`_refineid-stream._tcp`) and the domain (`local.`), as UTF-8 octets, 1 to 63 octets (hierarchy specification §4.2). Instance names may contain dots; a value ending in a service type or domain suffix is a misuse and is refused. $\text{len}$ is its length as one octet, and $\text{counter} = \lfloor \text{unix\_time} / 60 \rfloor$ as an unsigned 64-bit big-endian integer. The `withdrawal_key` and `withdrawal_hint` vectors of `vectors/rapp-withdrawal-v26.10.22.json` pin the bytes.
+   where $\text{instance}$ is the instance portion of the DNS-SD service instance name the Custodian publishes ([RFC 6763](https://www.rfc-editor.org/rfc/rfc6763.html) §4.1): the name exactly as published, without the service type (`_refineid-stream._tcp`) and the domain (`local.`), as UTF-8 octets, 1 to 63 octets (hierarchy specification §4.2). Instance names may contain dots; a value ending in a service type or domain suffix is a misuse and is refused. $\text{len}$ is its length as one octet, and $\text{counter} = \lfloor \text{unix\_time} / 60 \rfloor$ as an unsigned 64-bit big-endian integer. The `withdrawal_key` and `withdrawal_hint` vectors of `vectors/rapp-withdrawal-v26.10.29.json` pin the bytes.
 
 3. **Custodian Order**:
    On withdrawal the Custodian, in this order:
@@ -515,14 +508,14 @@ A reassembled frame goes to the handler of the phase the connection is in, the R
 
 ### 6. Normative Cryptographic Protocols
 
-RAPP v26.10.22 specifies three normative cryptographic protocols:
+RAPP v26.10.29 specifies three normative cryptographic protocols:
 1. **`CPaceRistretto255`**: the PAKE of the pairing ceremony (§6.1).
 2. **`Noise_XXpsk3`**: the pairing handshake that turns the PAKE result into a stored pairing (§6.2).
 3. **`Noise_KK`**: the session handshake between paired endpoints (§6.3).
 
 ### 6.1 CPaceRistretto255 KC2 Profile (draft-irtf-cfrg-cpace-21, RFC 9496, RFC 5869)
 
-RAPP v26.10.22 specifies the **`CPaceRistretto255-KC2`** application profile over [draft-irtf-cfrg-cpace-21](https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-cpace-21), [RFC 9496](https://www.rfc-editor.org/rfc/rfc9496.html), and [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html):
+RAPP v26.10.29 specifies the **`CPaceRistretto255-KC2`** application profile over [draft-irtf-cfrg-cpace-21](https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-cpace-21), [RFC 9496](https://www.rfc-editor.org/rfc/rfc9496.html), and [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html):
 
 #### 6.1.1 Cryptographic Suite Definition
 - **Group**: Prime-order Ristretto255 group (order $q = 2^{252} + 27742317777372353535851937790883648493$).
@@ -538,7 +531,7 @@ RAPP v26.10.22 specifies the **`CPaceRistretto255-KC2`** application profile ove
   ```cddl
   pairing-context = [
     "rapp-pairing-context",
-    [26, 10, 22],                                                              ; wire version [Year, Month, Day]
+    [26, 10, 29],                                                              ; wire version [Year, Month, Day]
     "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512", ; full suite literal
     tstr,                                                                    ; transport profile of the connection (§2.2)
     tstr,                                                                    ; candidate_id of its offer entry (§4.2)
@@ -547,7 +540,7 @@ RAPP v26.10.22 specifies the **`CPaceRistretto255-KC2`** application profile ove
     "custodian"                                                              ; responder role B
   ]
   ```
-  $$C = \text{encode\_deterministic\_cbor}(\text{pairing-context}) \quad (177\text{ bytes on BLE, 178 bytes on stream})$$
+  $$C = \text{encode\_deterministic\_cbor}(\text{pairing-context}) \quad (178\text{ bytes on BLE, 179 bytes on stream})$$
   Both parties' associated data (AD) is empty:
   $$\text{CI} = C, \quad \text{AD}_A = \emptyset, \quad \text{AD}_B = \emptyset$$
   Role strings designate protocol roles, not device identities: the Requester is the initiator ($A$) and the Custodian the responder ($B$) on every transport.
@@ -564,7 +557,7 @@ The generator point $G$ is derived from the password-related string (PRS), the 6
    - $|\text{lv}(\text{PRS})| = |\text{LEB128}(|\text{PRS}|)| + |\text{PRS}| = 1 + 6 = 7\text{ bytes}$
    - Yielding $\text{len\_zpad} = 128 - 1 - 7 - 18 = 102\text{ bytes}$ of zeros.
 3. **Generator String & Point Evaluation**:
-   $$\text{gen\_str} = \text{lv\_cat}(\text{DSI}, \text{PRS}, \text{zero\_bytes}(102), C, \text{SID}) \quad (340\text{ bytes on BLE, 341 bytes on stream})$$
+   $$\text{gen\_str} = \text{lv\_cat}(\text{DSI}, \text{PRS}, \text{zero\_bytes}(102), C, \text{SID}) \quad (341\text{ bytes on BLE, 342 bytes on stream})$$
    $$G = \text{MapToGroup}(\text{SHA-512}(\text{gen\_str}))$$
    where $\text{SID} = \text{offer\_id}$. $G = \mathcal{O}$ aborts as §6.1.1 says.
 
@@ -575,7 +568,7 @@ The generator point $G$ is derived from the password-related string (PRS), the 6
    - Transmits 32-byte $Y_A$ in CPace Step 1 as one transport frame.
 2. **Responder (Custodian - Step 2)**:
    - Receives $Y_A$, decodes and validates $Y_A \ne \mathcal{O}$ and canonical Ristretto255 element.
-   - Atomically reserves attempt slot ($1 \le \text{attempts\_admitted} \le 3$, `active_attempt = true`).
+   - Atomically admits the attempt (`active_attempt = true`, §3.3 item 2).
    - Arms the attempt timer at admission: $\text{attempt\_deadline} = \min(\text{admission\_time} + 5.0\text{ s}, \text{offer\_deadline})$.
    - Samples scalar $x_B \leftarrow \text{Scalar} \setminus \{0\}$ as §6.1.1 says.
    - Computes $Y_B = x_B \cdot G$.
@@ -671,7 +664,7 @@ The generator point $G$ is derived from the password-related string (PRS), the 6
 
 ### 6.4 Session Handshake Vectors
 
-The entries `"session-kk-fixed-transcript-ble"` and `"session-kk-fixed-transcript-stream"` of `doc/protocols/vectors/rapp-v26.10.22.json` pin, for fixed static and ephemeral keys and a fixed session prologue, both handshake messages, the final handshake hash $h$, the directional keys $c_1$ and $c_2$ and the `session_id` of §6.3, one entry per transport profile. An implementation reproduces them byte for byte.
+The entries `"session-kk-fixed-transcript-ble"` and `"session-kk-fixed-transcript-stream"` of `doc/protocols/vectors/rapp-v26.10.29.json` pin, for fixed static and ephemeral keys and a fixed session prologue, both handshake messages, the final handshake hash $h$, the directional keys $c_1$ and $c_2$ and the `session_id` of §6.3, one entry per transport profile. An implementation reproduces them byte for byte.
 
 ---
 
@@ -682,7 +675,7 @@ Every message inside the Noise pairing phase or the Noise session phase is a det
 
 ```cddl
 rapp-message = {
-  "version": [26, 10, 22],
+  "version": [26, 10, 29],
   "session_id": bstr .size 16,
   "sequence": uint,
   message
@@ -711,7 +704,7 @@ pairing-hello-body = {
 }
 
 negotiated-parameters = {
-  "version": [26, 10, 22],
+  "version": [26, 10, 29],
   "suite": "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512",
   "offer_hash": bstr .size 32,
   "transport_profile": tstr,   ; transport profile of the connection (§2.2)
@@ -740,7 +733,7 @@ session-ready-body = {
 }
 
 session-parameters = {
-  "version": [26, 10, 22],
+  "version": [26, 10, 29],
   "suite": "Noise_KK_25519_ChaChaPoly_SHA512",
   "transport_profile": tstr,   ; transport profile of the connection (§2.2)
   "candidate_id": tstr,        ; its registered candidate_id (§2.2)
@@ -833,7 +826,7 @@ card-status-body = {
 12. **`error`**: Sent on a protocol condition that is not an operation outcome, such as a second request while one operation of the session is live; schema and codes in §10.3.
 
 ### 7.2 Envelope Rules
-1. **Version**: `version` is `[26, 10, 22]`, as `[Year, Month, Day]`. A version mismatch in a Noise prologue fails the handshake's AEAD: the link drops and stored pairings stay. An authenticated envelope with any other version closes the session.
+1. **Version**: `version` is `[26, 10, 29]`, as `[Year, Month, Day]`. A version mismatch in a Noise prologue fails the handshake's AEAD: the link drops and stored pairings stay. An authenticated envelope with any other version closes the session.
 2. **Session**: `session_id` is the identifier derived from the handshake hash of the phase the envelope belongs to, the pairing `session_id` of §6.2 or the operational `session_id` of §6.3. An envelope with another `session_id` closes the session.
 3. **Sequence**: `sequence` starts at 0 in each direction and increases by exactly 1 per envelope; it equals the nonce of the Noise cipher state that encrypted the envelope. The first envelope received in a direction has `sequence` 0 and each accepted envelope raises the expected value by 1. An envelope whose `sequence` is not the expected value closes the session. A session ends as §8.3 says; the counter never wraps in practice, and an endpoint that would exceed $2^{64}-1$ closes the session with reason `"normal"`.
 4. **Encapsulation**: The `rapp-message` is encoded as deterministic CBOR (RFC 8949 Section 4.2) and encrypted with ChaCha20-Poly1305 under the direction's Noise cipher state, giving the ciphertext and a 16-byte tag. The ciphertext is one transport frame (§2.2).
@@ -1024,11 +1017,11 @@ The same names appear in the `error` field of `operation.result`, except `"busy"
 | Threat | What the attacker does | What stops it |
 | :--- | :--- | :--- |
 | **Eavesdropping** | Records traffic on the radio or the network. | Nothing in an advertisement or discovery record names a pairing. CPace resists offline guessing of the code; every handshake and session is encrypted with ChaCha20-Poly1305 under keys separated by HKDF-SHA-512. |
-| **Man in the middle** | Injects, modifies or drops frames during pairing or a session. | CPace binds the context $C$ (protocol, suite, offer, transport, roles) into the generator, so a mismatched channel yields no shared key; the confirmation tags $T_B$ and $T_A$ prove the key before Noise; `Noise_XXpsk3` with fresh pairwise static keys authenticates both endpoints. A wrong code burns an attempt (§3.3). |
-| **Disconnect oracle** | Tests $T_B$ and disconnects before sending $T_A$ to avoid spending an attempt. | The attempt is reserved before $Y_B$ and $T_B$ are sent and is not refunded on disconnect (§3.3, §6.1.3). |
+| **Man in the middle** | Injects, modifies or drops frames during pairing or a session. | CPace binds the context $C$ (protocol, suite, offer, transport, roles) into the generator, so a mismatched channel yields no shared key; the confirmation tags $T_B$ and $T_A$ prove the key before Noise; `Noise_XXpsk3` with fresh pairwise static keys authenticates both endpoints. A wrong code fails its attempt, and the next is admitted no sooner than 500 ms later (§3.3). |
+| **Disconnect oracle** | Tests $T_B$ and disconnects before sending $T_A$, to guess faster than completed attempts allow. | The attempt is admitted before $Y_B$ and $T_B$ are sent, under the same single flight and 500 ms spacing as a completed one, and $T_B$ tests only the one code $Y_A$ was built from; disconnecting gains no guess (§3.3, §6.1.3). |
 | **Rogue Custodian** | Advertises the RAPP service without the pairing code. | Without the code it cannot derive $G$ or pass the confirmation tags; the Requester pairs with nothing and tries the next Custodian in pairing mode (§4.2). Rogues that take up the 8 pairing connections of a typed code, or one that serves a copy of a real offer's `offer_id` first, can keep the Requester from the real Custodian for that code, which is then reported as not accepted; they gain nothing else, and each real Custodian still receives at most one guess per typed code. |
 | **Relay** | Relays frames between two distant endpoints. | Roles are fixed per transport and protocol (§4.4), so frames cannot be reflected or looped; a relay carries only what the paired endpoints send. A bit-exact relay of a pairing in progress stays possible at the physical layer and is not detected. |
-| **Attempt burning** | Connects repeatedly to spend the offer's attempts. | An offer exists only when the holder opens one, for 5 minutes, with three attempts; one guess runs at a time; failure stops the offer and backs off exponentially, up to 300 s, with the holder told on screen (§3.3 item 8). |
+| **Guess flooding** | Connects repeatedly to guess the code or to keep the offer busy. | An offer exists only while the holder opens one, for 5 minutes; one guess runs at a time, admitted at most every 500 ms, so at most 600 guesses of a 30-bit code per offer, about 1 in 1.8 million (§3.3, "Guessing Bound"). No number of failed guesses ends the offer or delays the next one, so another device's guesses cannot lock the holder out. A device that keeps the single-flight slot busy denies pairing for as long as it keeps connecting; that is inherent to pairing on a shared link and ends with the offer. |
 | **Tracking** | Records discovery records and routing preambles over time to recognise a phone or link a computer's connections. | Discovery hints rotate every 15 minutes and routing tags are fresh per connection; both are keyed by the pairing's static agreement, which never crosses the wire (§2.2.1, §4.3, hierarchy specification §4.3). No stable pairing identifier is ever sent in clear. |
 | **Routing replay** | Replays a captured routing preamble to probe presence or cause work. | The tag selects a pairing and authenticates nothing. A nonce in the replay memory of 256 routed sessions is refused in the Routing phase; an older replay reaches `Noise_KK` message 1 and fails. The pre-authentication limiter bounds the work (§3.3). |
 | **Withdrawal forgery or replay** | Publishes a forged `mode=withdrawn` record, or republishes a recorded one. | Withdrawal hints are keyed by the static agreement and cannot be forged. A recorded record counts only on the instance the Requester associates with the pairing and within one minute of its counter, and only withdraws presence until the Custodian is next discovered; a spoofed clock widens that window and nothing more. A replayed `hints=` value only makes a Requester dial an endpoint that then fails routing. An open session ignores records and ends only on an authenticated `session.close` (§4.5). |

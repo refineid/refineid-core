@@ -292,7 +292,7 @@ The bootstrap answer of a Custodian in pairing mode is `pairing-offer` while it 
 #### Busy Refusal:
 A Custodian that cannot admit an attempt (§3.3 item 6) refuses the connection with `pairing-busy`:
 1. **At bootstrap**: as Bootstrap Read Flow items 1 and 2 say.
-2. **After the offer was served**: when CPace step 1 arrives on a connection the Custodian can no longer admit, because another connection was admitted in between or the spacing has not passed, the Custodian answers on the stream transport with `encode_deterministic_cbor(pairing-busy)` in place of step 2 and closes the connection; on BLE it refuses the step 1 write with the ATT error `0x80 Application Error`, and the Requester then reads the Bootstrap Characteristic once more: a `pairing-busy` is the busy refusal, and a `pairing-offer` counts as a busy refusal with `retry_after_ms` of 0.
+2. **After the offer was served**: when CPace step 1 arrives on a connection the Custodian can no longer admit, because another connection was admitted in between or the spacing has not passed, the Custodian answers on the stream transport with `encode_deterministic_cbor(pairing-busy)` in place of step 2 and closes the connection; on BLE it refuses the step 1 write with the ATT error `0x11 Insufficient Resources` (Bluetooth Core Specification, Vol. 3, Part F, §3.4.1.1), which every platform's GATT server can send, and the Requester then reads the Bootstrap Characteristic once more: a `pairing-busy` is the busy refusal, and a `pairing-offer` counts as a busy refusal with `retry_after_ms` of 0.
 3. A busy refusal admits no attempt, evaluates no code material, and changes nothing in the offer.
 
 #### Trying Each Custodian in Pairing Mode:

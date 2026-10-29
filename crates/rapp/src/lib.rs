@@ -89,7 +89,11 @@ pub use message::{
     PairingStoredMessage, ProtocolErrorMessage, SessionCloseMessage, SessionParameters,
     SessionReadyMessage, TypedMessage,
 };
-pub use offer::{MAX_OFFER_SIZE, PairingOffer, PairingOfferDeadline, PairingOfferError};
+pub use offer::{
+    BootstrapAnswer, MAX_OFFER_SIZE, PAIRING_BUSY_RETRY_AFTER_MAX_MS,
+    PAIRING_BUSY_RETRY_AFTER_MIN_MS, PairingBusy, PairingOffer, PairingOfferDeadline,
+    PairingOfferError,
+};
 pub use operation::{
     CardIdentity, CardInspection, CardKeyProfile, CardOperation, CardOperationError,
     CardOperationResult, CertificateKind, CredentialKind, DEFAULT_OPERATION_LIFETIME_MS,
@@ -108,7 +112,7 @@ pub use pairing_attempts::{
     PRE_AUTHENTICATION_SPACING_MS, PreAuthenticationRateLimit, phase_deadline_ms,
 };
 pub use pairing_candidates::{
-    CandidateError, NextCandidate, PAIRING_CANDIDATES_MAX, PairingCandidates,
+    CandidateError, NextCandidate, NextEndpoint, PAIRING_CANDIDATES_MAX, PairingCandidates,
 };
 pub use pairing_flow::{
     ActivePairing, PairingAttemptFailure, PairingConfirmation, PairingError, PairingHandshake,

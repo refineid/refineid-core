@@ -2,12 +2,12 @@
 // Licensed under the Apache License, Version 2.0.
 
 //! Replay of the RAPP v26.10.29 transport-bound corpus sections: pairing
-//! offers, CPace KC2 transcripts per transport, both Noise transcripts per
+//! offers, busy answers, CPace KC2 transcripts per transport, both Noise transcripts per
 //! transport (cross-checked against snow).
 
 use refineid_rapp::{
-    BinaryFrame, CpaceKc2Initiator, CpaceKc2Responder, HandshakeRole, OfferId, PairingOffer,
-    TransportProfile,
+    BinaryFrame, BootstrapAnswer, CpaceKc2Initiator, CpaceKc2Responder, HandshakeRole, OfferId,
+    PairingBusy, PairingOffer, TransportProfile,
     cpace::{calculate_generator_kc2, generator_string, prepend_len},
     derive_pair_id, derive_session_id, encode_kc2_step1_frame,
     noise::{KkHandshakeState, x25519_public_key},
@@ -21,6 +21,8 @@ const CORPUS: &str = include_str!("../../../doc/protocols/vectors/rapp-v26.10.29
 #[derive(Deserialize)]
 struct Corpus {
     pairing_offer: Vec<OfferVector>,
+    pairing_busy: Vec<BusyVector>,
+    rejected_pairing_busy: Vec<RejectedBusyVector>,
     cpace_kc2: Vec<Kc2Vector>,
     noise_handshake: Vec<NoiseVector>,
 }
@@ -34,6 +36,20 @@ struct OfferVector {
     encoded_hex: String,
     encoded_length: usize,
     offer_hash_hex: String,
+}
+
+#[derive(Deserialize)]
+struct BusyVector {
+    name: String,
+    retry_after_ms: u64,
+    encoded_hex: String,
+}
+
+#[derive(Deserialize)]
+struct RejectedBusyVector {
+    name: String,
+    encoded_hex: String,
+    error: String,
 }
 
 #[derive(Deserialize)]
@@ -121,8 +137,8 @@ fn offers_encode_decode_and_hash_to_the_corpus() {
         );
         for transport in &transports {
             assert_eq!(
-                PairingOffer::from_bootstrap(&encoded, *transport).expect("bootstrap decodes"),
-                offer,
+                BootstrapAnswer::from_bootstrap(&encoded, *transport).expect("bootstrap decodes"),
+                BootstrapAnswer::Offer(offer.clone()),
                 "{}",
                 vector.name
             );
@@ -370,6 +386,43 @@ fn native_kk_replays_the_session_transcripts() {
         assert_eq!(
             hex::encode(initiator.handshake_hash()),
             vector.handshake_hash_hex,
+            "{}",
+            vector.name
+        );
+    }
+}
+
+#[test]
+fn busy_answers_encode_and_decode_to_the_corpus() {
+    let transports = [TransportProfile::Ble, TransportProfile::Stream];
+    for vector in corpus().pairing_busy {
+        let busy = PairingBusy::new(vector.retry_after_ms).expect("the corpus wait is in range");
+        let encoded = bytes(&vector.encoded_hex);
+        assert_eq!(
+            busy.to_cbor().expect("busy encodes"),
+            encoded,
+            "{}",
+            vector.name
+        );
+        for transport in transports {
+            assert_eq!(
+                BootstrapAnswer::from_bootstrap(&encoded, transport),
+                Ok(BootstrapAnswer::Busy(busy)),
+                "{}",
+                vector.name
+            );
+        }
+    }
+}
+
+#[test]
+fn malformed_busy_answers_are_refused_for_their_stated_reason() {
+    for vector in corpus().rejected_pairing_busy {
+        let encoded = bytes(&vector.encoded_hex);
+        let error = PairingBusy::from_cbor(&encoded).expect_err(&vector.name);
+        assert_eq!(format!("{error:?}"), vector.error, "{}", vector.name);
+        assert!(
+            BootstrapAnswer::from_bootstrap(&encoded, TransportProfile::Stream).is_err(),
             "{}",
             vector.name
         );

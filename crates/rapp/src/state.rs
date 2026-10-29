@@ -51,8 +51,8 @@ pub struct Guards {
     pub ready_parameters_match: bool,
     /// The requester's remote use is on, no card is in a reader attached to
     /// it, an endpoint found in pairing mode is not yet opened for the typed
-    /// code, and fewer than `pairing_candidates_max` pairing connections
-    /// were opened for it.
+    /// code or answered busy and its retry-after has passed, and fewer than
+    /// `pairing_candidates_max` pairing connections were opened for it.
     pub untried_pairing_candidate: bool,
 }
 
@@ -143,8 +143,13 @@ pub enum PairingEvent {
     /// endpoint opened did not take the code, because its custodian refused
     /// it or it served no offer the requester could try.
     AttemptFailed,
-    /// Every custodian the requester tried refused the code, and no endpoint
-    /// is left to open.
+    /// A pairing connection the custodian cannot admit: an attempt is
+    /// active, or the 500 ms spacing has not passed.
+    AttemptRefused,
+    /// The endpoint the requester opened answered `pairing-busy`.
+    CandidateBusy,
+    /// Every custodian the requester tried refused the code, or answered
+    /// busy at the connection limit, and no endpoint is left to open.
     LastCandidateFailed,
     /// No endpoint served an offer the requester could try, and its search
     /// ended.
@@ -312,12 +317,19 @@ pub enum Action {
     /// Send CPace step 1 from the typed pairing code.
     BeginCpaceInitiator,
     /// Open a pairing connection to the next endpoint found in pairing mode
-    /// and not yet opened for the typed code.
+    /// and not yet opened for the typed code, or waiting out a busy answer
+    /// whose retry-after has passed.
     TryNextCandidate,
     /// Admit the attempt before sending CPace step 2 and arm its deadline.
     AdmitAttempt,
     /// End the failed attempt; the offer stays as it was.
     EndFailedAttempt,
+    /// Send pairing-busy with the time until an attempt can be admitted,
+    /// and close the connection.
+    AnswerBusy,
+    /// Keep the endpoint for another opening no sooner than its
+    /// retry-after, after the other endpoints waiting.
+    DeferCandidate,
     /// Tell the user the pairing code was not accepted, naming no custodian.
     ShowWrongCode,
     /// Tell the user that no custodian in pairing mode was found.
@@ -599,6 +611,27 @@ impl PairingState {
                     }
                 }
             },
+            (Self::Offering | Self::Exchanging, E::AttemptRefused) => {
+                require_role(role, EndpointRole::Proxy)?;
+                Transition {
+                    state: self,
+                    actions: &[A::AnswerBusy],
+                }
+            }
+            (Self::Exchanging, E::CandidateBusy) => {
+                require_role(role, EndpointRole::Requester)?;
+                require(guards.untried_pairing_candidate)?;
+                Transition {
+                    state: Self::Exchanging,
+                    actions: &[
+                        A::CloseCandidate,
+                        A::DeferCandidate,
+                        A::TryNextCandidate,
+                        A::ReadOffer,
+                        A::BeginCpaceInitiator,
+                    ],
+                }
+            }
             (Self::Exchanging, E::LastCandidateFailed) => {
                 require_role(role, EndpointRole::Requester)?;
                 Transition {

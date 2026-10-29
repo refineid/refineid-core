@@ -20,7 +20,9 @@
 //! the requester tries them in turn. A candidate is an endpoint discovery
 //! found in pairing mode: a `mode=pairing` service instance, or a BLE
 //! peripheral of the RAPP service, which shows its mode only by serving an
-//! offer. The ledger holds no code.
+//! offer or a `pairing-busy`. A custodian that answers busy is asked again
+//! after its wait, quietly, within the connection limit. The ledger holds no
+//! code.
 
 use core::fmt;
 
@@ -41,26 +43,58 @@ enum CandidatePhase {
     Trying,
     /// A custodian's `T_B` verified: it holds the code.
     Accepted,
-    /// Every custodian tried refused the code and no endpoint is left.
+    /// Every custodian tried refused the code, or answered busy at the
+    /// connection limit, and no endpoint is left.
     NotAccepted,
+}
+
+/// Where one endpoint stands for the typed code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointStatus {
+    /// Found and not yet opened.
+    Waiting,
+    /// The pairing connection to it is open.
+    Open,
+    /// Its last answer was `pairing-busy`: it is opened again no sooner
+    /// than `not_before_ms`, after every endpoint still waiting.
+    Deferred {
+        /// Monotonic time of the earliest reopening.
+        not_before_ms: u64,
+    },
+    /// Its connection closed without a busy answer; it is not opened again
+    /// for this code.
+    Done,
+}
+
+/// One endpoint found in pairing mode and where it stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Candidate<E> {
+    endpoint: E,
+    status: EndpointStatus,
 }
 
 /// The custodians in pairing mode a requester tries with one typed code.
 ///
 /// One ledger serves one typed code; a new code starts a new ledger. It
-/// opens each endpoint at most once and at most [`PAIRING_CANDIDATES_MAX`]
-/// in all, one at a time; it lets CPace run at most once per `offer_id`, so
-/// a custodian found on two transports receives one guess; and it reports
-/// the code as not accepted only once every custodian tried refused it.
-/// `E` is the platform's name for an endpoint: a service instance or a
-/// peripheral address. No outcome names one.
+/// opens each endpoint once, and again after each busy answer once the
+/// endpoint's wait has passed and no other endpoint waits to be opened; it
+/// opens at most [`PAIRING_CANDIDATES_MAX`] connections in all, reopenings
+/// included, one at a time; it lets CPace run at most once per `offer_id`,
+/// so a custodian found on two transports receives one guess; and it
+/// reports the code as not accepted only once every custodian tried
+/// refused it, a custodian still busy at the connection limit counting as
+/// one that refused it. `E` is the platform's name for an endpoint: a
+/// service instance or a peripheral address. No outcome names one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairingCandidates<E> {
-    /// Endpoints found, in the order found; the first `opened` were opened.
-    endpoints: Vec<E>,
-    opened: usize,
+    /// Endpoints found, in the order found.
+    candidates: Vec<Candidate<E>>,
+    /// Pairing connections opened, reopenings included.
+    openings: usize,
     /// Offers CPace ran on.
     tried: Vec<OfferId>,
+    /// Whether any custodian answered `pairing-busy` for this code.
+    busy_answered: bool,
     phase: CandidatePhase,
 }
 
@@ -70,12 +104,17 @@ pub struct PairingCandidates<E> {
 pub enum NextCandidate {
     /// Open the next endpoint ([`PairingCandidates::next_endpoint`]).
     Try,
-    /// Every custodian tried refused the code: report it as not accepted,
+    /// The custodian answered busy and is kept for another opening: open
+    /// the next endpoint ([`PairingCandidates::next_endpoint`]), which
+    /// hands this one out again once its wait has passed.
+    Deferred,
+    /// Every custodian tried refused the code, a custodian that answered
+    /// busy counting as one that refused it: report it as not accepted,
     /// naming none of them.
     NotAccepted,
-    /// No custodian has been tried and no endpoint is left to open: wait
-    /// for discovery to find another, or report that none in pairing mode
-    /// was found.
+    /// No custodian has been tried, none answered busy, and no endpoint is
+    /// left to open: wait for discovery to find another, or report that
+    /// none in pairing mode was found.
     NoneTried,
 }
 
@@ -90,21 +129,32 @@ impl NextCandidate {
     /// requester's search ends.
     #[must_use]
     pub fn pairing_event(self, remote_use_available: bool) -> (PairingEvent, Guards) {
+        let untried = Guards {
+            untried_pairing_candidate: true,
+            ..Guards::default()
+        };
         match self {
             Self::NotAccepted => (PairingEvent::LastCandidateFailed, Guards::default()),
-            Self::Try | Self::NoneTried if !remote_use_available => {
+            Self::Try | Self::Deferred | Self::NoneTried if !remote_use_available => {
                 (PairingEvent::SearchInterrupted, Guards::default())
             }
-            Self::Try => (
-                PairingEvent::AttemptFailed,
-                Guards {
-                    untried_pairing_candidate: true,
-                    ..Guards::default()
-                },
-            ),
+            Self::Try => (PairingEvent::AttemptFailed, untried),
+            Self::Deferred => (PairingEvent::CandidateBusy, untried),
             Self::NoneTried => (PairingEvent::NoCustodianTried, Guards::default()),
         }
     }
+}
+
+/// The endpoint the requester opens next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NextEndpoint<'a, E> {
+    /// Open a pairing connection to this endpoint now.
+    Open(&'a E),
+    /// Only endpoints that answered busy are left, and none of their waits
+    /// has passed: ask again at this monotonic time.
+    NotBefore(u64),
+    /// No endpoint is left to open, or the connection limit is reached.
+    Exhausted,
 }
 
 /// A ledger call that the tries of the code do not admit.
@@ -148,9 +198,10 @@ impl<E> PairingCandidates<E> {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            endpoints: Vec::new(),
-            opened: 0,
+            candidates: Vec::new(),
+            openings: 0,
             tried: Vec::new(),
+            busy_answered: false,
             phase: CandidatePhase::Closed,
         }
     }
@@ -162,22 +213,31 @@ impl<E: PartialEq> PairingCandidates<E> {
     /// once the code is accepted or refused are not tried with this code.
     pub fn found(&mut self, endpoint: E) {
         if self.is_settled()
-            || self.endpoints.len() >= PAIRING_CANDIDATES_MAX
-            || self.endpoints.contains(&endpoint)
+            || self.candidates.len() >= PAIRING_CANDIDATES_MAX
+            || self
+                .candidates
+                .iter()
+                .any(|candidate| candidate.endpoint == endpoint)
         {
             return;
         }
-        self.endpoints.push(endpoint);
+        self.candidates.push(Candidate {
+            endpoint,
+            status: EndpointStatus::Waiting,
+        });
     }
 
-    /// The next endpoint to open a pairing connection to, in the order
-    /// found, or `None` when every endpoint recorded is opened.
+    /// The next endpoint to open a pairing connection to at the monotonic
+    /// time `now_ms`: the first found and not yet opened, otherwise the
+    /// one that answered busy whose wait passed first. An endpoint whose
+    /// wait has not passed is not handed out; the answer then names the
+    /// earliest time one will be.
     ///
     /// # Errors
     /// [`CandidateError::ConnectionOpen`] while a pairing connection is
     /// open, and [`CandidateError::Settled`] once the code is accepted or
     /// refused.
-    pub fn next_endpoint(&mut self) -> Result<Option<&E>, CandidateError> {
+    pub fn next_endpoint(&mut self, now_ms: u64) -> Result<NextEndpoint<'_, E>, CandidateError> {
         match self.phase {
             CandidatePhase::Closed => {}
             CandidatePhase::Opened | CandidatePhase::Trying => {
@@ -187,12 +247,35 @@ impl<E: PartialEq> PairingCandidates<E> {
                 return Err(CandidateError::Settled);
             }
         }
-        let Some(endpoint) = self.endpoints.get(self.opened) else {
-            return Ok(None);
+        if self.openings >= PAIRING_CANDIDATES_MAX {
+            return Ok(NextEndpoint::Exhausted);
+        }
+        let waiting = self
+            .candidates
+            .iter()
+            .position(|candidate| candidate.status == EndpointStatus::Waiting);
+        let earliest_deferred = self
+            .candidates
+            .iter()
+            .enumerate()
+            .filter_map(|(index, candidate)| match candidate.status {
+                EndpointStatus::Deferred { not_before_ms } => Some((not_before_ms, index)),
+                _ => None,
+            })
+            .min();
+        let index = match (waiting, earliest_deferred) {
+            (Some(index), _) => index,
+            (None, Some((not_before_ms, index))) if not_before_ms <= now_ms => index,
+            (None, Some((not_before_ms, _))) => return Ok(NextEndpoint::NotBefore(not_before_ms)),
+            (None, None) => return Ok(NextEndpoint::Exhausted),
         };
-        self.opened += 1;
+        let Some(candidate) = self.candidates.get_mut(index) else {
+            return Ok(NextEndpoint::Exhausted);
+        };
+        candidate.status = EndpointStatus::Open;
+        self.openings += 1;
         self.phase = CandidatePhase::Opened;
-        Ok(Some(endpoint))
+        Ok(NextEndpoint::Open(&candidate.endpoint))
     }
 
     /// Admit the offer the open connection served, before CPace step 1.
@@ -224,29 +307,42 @@ impl<E: PartialEq> PairingCandidates<E> {
     /// The open connection closed without its custodian taking the code:
     /// the connection was refused or closed, it served no offer or one the
     /// requester rejects or already tried, CPace step 2 did not arrive
-    /// within the attempt deadline, or `T_B` did not verify.
+    /// within the attempt deadline, or `T_B` did not verify. The endpoint
+    /// is not opened again for this code.
     ///
     /// # Errors
     /// [`CandidateError::NoConnection`] when no connection is open, and
     /// [`CandidateError::Settled`] once the code is accepted or refused.
     pub fn closed(&mut self) -> Result<NextCandidate, CandidateError> {
-        match self.phase {
-            CandidatePhase::Opened | CandidatePhase::Trying => {}
-            CandidatePhase::Closed => return Err(CandidateError::NoConnection),
-            CandidatePhase::Accepted | CandidatePhase::NotAccepted => {
-                return Err(CandidateError::Settled);
-            }
+        self.end_connection(EndpointStatus::Done)?;
+        Ok(self.after_connection(NextCandidate::Try))
+    }
+
+    /// The open connection's custodian answered `pairing-busy` at the
+    /// monotonic time `now_ms`, asking for a wait of `retry_after_ms`: at
+    /// bootstrap, in place of CPace step 2, or, on BLE, by refusing step 1
+    /// and then serving its offer (a wait of zero). A busy answer is not a
+    /// try: a CPace begun on the connection gives its `offer_id` back, and
+    /// the endpoint is kept for another opening no sooner than
+    /// `now_ms + retry_after_ms`.
+    ///
+    /// # Errors
+    /// [`CandidateError::NoConnection`] when no connection is open, and
+    /// [`CandidateError::Settled`] once the code is accepted or refused.
+    pub fn busy(
+        &mut self,
+        retry_after_ms: u64,
+        now_ms: u64,
+    ) -> Result<NextCandidate, CandidateError> {
+        let trying = self.phase == CandidatePhase::Trying;
+        self.end_connection(EndpointStatus::Deferred {
+            not_before_ms: now_ms.saturating_add(retry_after_ms),
+        })?;
+        if trying {
+            self.tried.pop();
         }
-        if self.opened < self.endpoints.len() {
-            self.phase = CandidatePhase::Closed;
-            return Ok(NextCandidate::Try);
-        }
-        if self.tried.is_empty() {
-            self.phase = CandidatePhase::Closed;
-            return Ok(NextCandidate::NoneTried);
-        }
-        self.phase = CandidatePhase::NotAccepted;
-        Ok(NextCandidate::NotAccepted)
+        self.busy_answered = true;
+        Ok(self.after_connection(NextCandidate::Deferred))
     }
 
     /// The custodian tried proved it holds the code: its `T_B` verified.
@@ -266,6 +362,46 @@ impl<E: PartialEq> PairingCandidates<E> {
         }
     }
 
+    /// Close the open connection, leaving its endpoint at `status`.
+    fn end_connection(&mut self, status: EndpointStatus) -> Result<(), CandidateError> {
+        match self.phase {
+            CandidatePhase::Opened | CandidatePhase::Trying => {}
+            CandidatePhase::Closed => return Err(CandidateError::NoConnection),
+            CandidatePhase::Accepted | CandidatePhase::NotAccepted => {
+                return Err(CandidateError::Settled);
+            }
+        }
+        if let Some(candidate) = self
+            .candidates
+            .iter_mut()
+            .find(|candidate| candidate.status == EndpointStatus::Open)
+        {
+            candidate.status = status;
+        }
+        self.phase = CandidatePhase::Closed;
+        Ok(())
+    }
+
+    /// What follows a closed connection: `next` while an endpoint is left
+    /// to open within the connection limit, otherwise the report. A search
+    /// that tried no custodian and received no busy answer found none in
+    /// pairing mode; otherwise the code is not accepted, a custodian that
+    /// answered busy counting as one that refused it.
+    fn after_connection(&mut self, next: NextCandidate) -> NextCandidate {
+        let left = self
+            .candidates
+            .iter()
+            .any(|candidate| candidate.status != EndpointStatus::Done);
+        if left && self.openings < PAIRING_CANDIDATES_MAX {
+            return next;
+        }
+        if self.tried.is_empty() && !self.busy_answered {
+            return NextCandidate::NoneTried;
+        }
+        self.phase = CandidatePhase::NotAccepted;
+        NextCandidate::NotAccepted
+    }
+
     /// Whether the code is accepted or refused.
     const fn is_settled(&self) -> bool {
         matches!(
@@ -277,7 +413,9 @@ impl<E: PartialEq> PairingCandidates<E> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CandidateError, NextCandidate, PAIRING_CANDIDATES_MAX, PairingCandidates};
+    use super::{
+        CandidateError, NextCandidate, NextEndpoint, PAIRING_CANDIDATES_MAX, PairingCandidates,
+    };
     use crate::{
         Action, EndpointRole, Guards, OFFER_ID_SIZE, OfferId, PairingEvent, PairingOffer,
         PairingState, ProfileName, TransitionError, TransportProfile,
@@ -295,12 +433,20 @@ mod tests {
         .expect("fixture offer is valid")
     }
 
+    /// The monotonic time of the searches that do not wait.
+    const NOW_MS: u64 = 10_000;
+    /// A custodian's busy wait.
+    const RETRY_AFTER_MS: u64 = 400;
+
+    fn open_at(ledger: &mut PairingCandidates<&'static str>, now_ms: u64) -> &'static str {
+        match ledger.next_endpoint(now_ms).expect("no connection is open") {
+            NextEndpoint::Open(endpoint) => endpoint,
+            other => panic!("an endpoint is left to open now, got {other:?}"),
+        }
+    }
+
     fn open(ledger: &mut PairingCandidates<&'static str>) -> &'static str {
-        ledger
-            .next_endpoint()
-            .expect("no connection is open")
-            .copied()
-            .expect("an endpoint is left")
+        open_at(ledger, NOW_MS)
     }
 
     #[test]
@@ -314,7 +460,7 @@ mod tests {
         assert_eq!(open(&mut ledger), "iphone");
         ledger.begin_try(&offer(2)).expect("second offer");
         assert_eq!(ledger.accepted(), Ok(()));
-        assert_eq!(ledger.next_endpoint(), Err(CandidateError::Settled));
+        assert_eq!(ledger.next_endpoint(NOW_MS), Err(CandidateError::Settled));
     }
 
     #[test]
@@ -329,7 +475,7 @@ mod tests {
         ledger.begin_try(&offer(2)).expect("second offer");
         assert_eq!(ledger.closed(), Ok(NextCandidate::NotAccepted));
         ledger.found("late");
-        assert_eq!(ledger.next_endpoint(), Err(CandidateError::Settled));
+        assert_eq!(ledger.next_endpoint(NOW_MS), Err(CandidateError::Settled));
     }
 
     #[test]
@@ -366,9 +512,15 @@ mod tests {
         ledger.found("first");
         ledger.found("second");
         open(&mut ledger);
-        assert_eq!(ledger.next_endpoint(), Err(CandidateError::ConnectionOpen));
+        assert_eq!(
+            ledger.next_endpoint(NOW_MS),
+            Err(CandidateError::ConnectionOpen)
+        );
         ledger.begin_try(&offer(1)).expect("first offer");
-        assert_eq!(ledger.next_endpoint(), Err(CandidateError::ConnectionOpen));
+        assert_eq!(
+            ledger.next_endpoint(NOW_MS),
+            Err(CandidateError::ConnectionOpen)
+        );
         assert_eq!(
             ledger.begin_try(&offer(2)),
             Err(CandidateError::NoConnection)
@@ -401,11 +553,155 @@ mod tests {
         ledger.found("session-mode phone");
         open(&mut ledger);
         assert_eq!(ledger.closed(), Ok(NextCandidate::NoneTried));
-        assert_eq!(ledger.next_endpoint(), Ok(None));
+        assert_eq!(ledger.next_endpoint(NOW_MS), Ok(NextEndpoint::Exhausted));
         ledger.found("pairing phone");
         assert_eq!(open(&mut ledger), "pairing phone");
         ledger.begin_try(&offer(1)).expect("offer");
         assert_eq!(ledger.closed(), Ok(NextCandidate::NotAccepted));
+    }
+
+    #[test]
+    fn a_busy_endpoint_is_reopened_after_the_others_and_after_its_wait() {
+        let mut ledger = PairingCandidates::new();
+        ledger.found("busy");
+        ledger.found("other");
+        assert_eq!(open(&mut ledger), "busy");
+        assert_eq!(
+            ledger.busy(RETRY_AFTER_MS, NOW_MS),
+            Ok(NextCandidate::Deferred)
+        );
+        assert_eq!(open(&mut ledger), "other", "the others come first");
+        ledger.begin_try(&offer(1)).expect("other offer");
+        assert_eq!(ledger.closed(), Ok(NextCandidate::Try));
+        assert_eq!(
+            ledger.next_endpoint(NOW_MS + RETRY_AFTER_MS - 1),
+            Ok(NextEndpoint::NotBefore(NOW_MS + RETRY_AFTER_MS))
+        );
+        assert_eq!(open_at(&mut ledger, NOW_MS + RETRY_AFTER_MS), "busy");
+        ledger
+            .begin_try(&offer(2))
+            .expect("the busy custodian's offer");
+        assert_eq!(ledger.accepted(), Ok(()));
+    }
+
+    #[test]
+    fn an_endpoint_found_while_one_waits_is_opened_first() {
+        let mut ledger = PairingCandidates::new();
+        ledger.found("busy");
+        open(&mut ledger);
+        assert_eq!(ledger.busy(0, NOW_MS), Ok(NextCandidate::Deferred));
+        ledger.found("late");
+        assert_eq!(open(&mut ledger), "late");
+        assert_eq!(ledger.closed(), Ok(NextCandidate::Try));
+        assert_eq!(open(&mut ledger), "busy");
+    }
+
+    #[test]
+    fn a_busy_endpoint_is_reopened_until_the_limit_and_then_refused() {
+        let mut ledger = PairingCandidates::new();
+        ledger.found("busy");
+        let mut now_ms = NOW_MS;
+        let mut openings = 0_usize;
+        let mut next = NextCandidate::Deferred;
+        while next == NextCandidate::Deferred {
+            assert_eq!(open_at(&mut ledger, now_ms), "busy");
+            openings += 1;
+            next = ledger
+                .busy(RETRY_AFTER_MS, now_ms)
+                .expect("a connection is open");
+            now_ms += RETRY_AFTER_MS;
+        }
+        assert_eq!(openings, PAIRING_CANDIDATES_MAX, "every reopening counts");
+        assert_eq!(next, NextCandidate::NotAccepted);
+        assert_eq!(ledger.next_endpoint(now_ms), Err(CandidateError::Settled));
+    }
+
+    #[test]
+    fn a_busy_answer_after_step_1_is_not_a_try() {
+        let mut ledger = PairingCandidates::new();
+        ledger.found("stream");
+        ledger.found("ble");
+        open(&mut ledger);
+        ledger.begin_try(&offer(1)).expect("offer");
+        assert_eq!(ledger.busy(0, NOW_MS), Ok(NextCandidate::Deferred));
+        open(&mut ledger);
+        ledger
+            .begin_try(&offer(1))
+            .expect("the busy custodian's offer was not tried");
+        assert_eq!(ledger.closed(), Ok(NextCandidate::Try));
+        open(&mut ledger);
+        assert_eq!(
+            ledger.begin_try(&offer(1)),
+            Err(CandidateError::OfferAlreadyTried),
+            "a busy answer then an admitted attempt is one try"
+        );
+        assert_eq!(ledger.closed(), Ok(NextCandidate::NotAccepted));
+    }
+
+    #[test]
+    fn the_connection_limit_counts_reopenings() {
+        let mut ledger = PairingCandidates::new();
+        for endpoint in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+            ledger.found(endpoint);
+        }
+        open(&mut ledger);
+        assert_eq!(ledger.busy(0, NOW_MS), Ok(NextCandidate::Deferred));
+        let mut opened = 1_usize;
+        let mut next = NextCandidate::Try;
+        while next == NextCandidate::Try {
+            open(&mut ledger);
+            opened += 1;
+            next = ledger.closed().expect("a connection is open");
+        }
+        assert_eq!(opened, PAIRING_CANDIDATES_MAX);
+        assert_eq!(
+            next,
+            NextCandidate::NotAccepted,
+            "the custodian still busy at the limit counts as one that refused"
+        );
+    }
+
+    #[test]
+    fn a_search_that_saw_a_busy_answer_does_not_report_none_found() {
+        let mut ledger = PairingCandidates::new();
+        ledger.found("busy");
+        open(&mut ledger);
+        assert_eq!(ledger.busy(0, NOW_MS), Ok(NextCandidate::Deferred));
+        open(&mut ledger);
+        assert_eq!(
+            ledger.closed(),
+            Ok(NextCandidate::NotAccepted),
+            "a custodian that answered busy then served nothing tryable"
+        );
+    }
+
+    #[test]
+    fn deferred_endpoints_are_reopened_in_the_order_their_waits_pass() {
+        const A_NOT_BEFORE_MS: u64 = 1_100;
+        const B_NOT_BEFORE_MS: u64 = 1_500;
+        const BUSY_AT_MS: u64 = 1_000;
+        let mut ledger = PairingCandidates::new();
+        ledger.found("a");
+        ledger.found("b");
+        assert_eq!(open_at(&mut ledger, BUSY_AT_MS), "a");
+        ledger
+            .busy(A_NOT_BEFORE_MS - BUSY_AT_MS, BUSY_AT_MS)
+            .expect("a is open");
+        assert_eq!(open_at(&mut ledger, BUSY_AT_MS), "b");
+        ledger
+            .busy(B_NOT_BEFORE_MS - BUSY_AT_MS, BUSY_AT_MS)
+            .expect("b is open");
+        assert_eq!(
+            ledger.next_endpoint(BUSY_AT_MS),
+            Ok(NextEndpoint::NotBefore(A_NOT_BEFORE_MS))
+        );
+        assert_eq!(open_at(&mut ledger, A_NOT_BEFORE_MS), "a");
+        assert_eq!(ledger.closed(), Ok(NextCandidate::Try));
+        assert_eq!(
+            ledger.next_endpoint(A_NOT_BEFORE_MS),
+            Ok(NextEndpoint::NotBefore(B_NOT_BEFORE_MS))
+        );
+        assert_eq!(open_at(&mut ledger, B_NOT_BEFORE_MS), "b");
     }
 
     #[test]
@@ -437,6 +733,15 @@ mod tests {
         assert_eq!(last.state, PairingState::Unpaired);
         assert!(last.actions.contains(&Action::ShowWrongCode));
 
+        let (event, guards) = NextCandidate::Deferred.pairing_event(true);
+        assert_eq!(event, PairingEvent::CandidateBusy);
+        let deferred = PairingState::Exchanging
+            .transition(requester, event, guards)
+            .expect("a busy custodian is kept for another opening");
+        assert_eq!(deferred.state, PairingState::Exchanging);
+        assert!(deferred.actions.contains(&Action::DeferCandidate));
+        assert!(!deferred.actions.contains(&Action::ShowWrongCode));
+
         let (event, guards) = NextCandidate::NoneTried.pairing_event(true);
         let none = PairingState::Exchanging
             .transition(requester, event, guards)
@@ -454,7 +759,11 @@ mod tests {
 
     #[test]
     fn a_local_card_or_remote_use_off_ends_the_search() {
-        for outcome in [NextCandidate::Try, NextCandidate::NoneTried] {
+        for outcome in [
+            NextCandidate::Try,
+            NextCandidate::Deferred,
+            NextCandidate::NoneTried,
+        ] {
             let (event, guards) = outcome.pairing_event(false);
             assert_eq!(event, PairingEvent::SearchInterrupted);
             let ended = PairingState::Exchanging

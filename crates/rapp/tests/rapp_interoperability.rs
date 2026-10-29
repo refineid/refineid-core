@@ -15,14 +15,14 @@
 //! End-to-end cryptographic interoperability through the public RAPP API.
 
 use refineid_rapp::{
-    AuthenticatedViolation, BinaryFrame, CardOperation, CloseReason, CpaceKc2Initiator,
-    CpaceKc2Responder, EndpointError, EndpointRole, EstablishedEndpoint, EstablishedSessionRuntime,
-    ExplicitUserIntent, HandshakeChannel, HandshakeRole, MessageType, OfferId, OperationId,
-    OperationRequest, PairRecord, PairingHandshake, PairingOffer, PairingSecret, PairingState,
-    ProfileName, RappState, ReadyOutcome, ReceiveOutcome, RuntimeReceive, SecureChannel,
-    SessionAuthentication, SessionCloseMessage, SessionError, SessionHandshake,
-    SessionHandshakeParameters, SessionParameters, SessionReadyMessage, SessionState,
-    TransportProfile, TypedMessage, compute_grants_hash, encode_kc2_step1_frame,
+    AuthenticatedViolation, BinaryFrame, BootstrapAnswer, CardOperation, CloseReason,
+    CpaceKc2Initiator, CpaceKc2Responder, EndpointError, EndpointRole, EstablishedEndpoint,
+    EstablishedSessionRuntime, ExplicitUserIntent, HandshakeChannel, HandshakeRole, MessageType,
+    OfferId, OperationId, OperationRequest, PairRecord, PairingHandshake, PairingOffer,
+    PairingSecret, PairingState, ProfileName, RappState, ReadyOutcome, ReceiveOutcome,
+    RuntimeReceive, SecureChannel, SessionAuthentication, SessionCloseMessage, SessionError,
+    SessionHandshake, SessionHandshakeParameters, SessionParameters, SessionReadyMessage,
+    SessionState, TransportProfile, TypedMessage, compute_grants_hash, encode_kc2_step1_frame,
     generate_pair_key_material, standard_pairing_context_v2,
 };
 
@@ -42,8 +42,11 @@ fn paired_records() -> (PairRecord, PairRecord) {
     )
     .expect("the pairing offer fixture is valid");
     let bootstrap = proxy_offer.to_cbor().expect("the offer encodes");
-    let offer = PairingOffer::from_bootstrap(&bootstrap, TransportProfile::Stream)
-        .expect("the bootstrap decodes");
+    let Ok(BootstrapAnswer::Offer(offer)) =
+        BootstrapAnswer::from_bootstrap(&bootstrap, TransportProfile::Stream)
+    else {
+        panic!("the bootstrap decodes as the offer");
+    };
 
     let pairing_secret = PairingSecret::from_random_bytes([0x20; 32]);
 
@@ -569,8 +572,11 @@ fn cpace_bootstrap_pairing_and_fresh_session_interoperate_end_to_end() {
     )
     .expect("custodian offer is valid");
     let bootstrap = proxy_offer.to_cbor().expect("the offer encodes");
-    let requester_offer = PairingOffer::from_bootstrap(&bootstrap, TransportProfile::Stream)
-        .expect("the stream bootstrap decodes");
+    let Ok(BootstrapAnswer::Offer(requester_offer)) =
+        BootstrapAnswer::from_bootstrap(&bootstrap, TransportProfile::Stream)
+    else {
+        panic!("the stream bootstrap decodes as the offer");
+    };
     let offer_id = requester_offer.offer_id;
 
     let offer_hash = requester_offer.offer_hash().expect("offer hash succeeds");

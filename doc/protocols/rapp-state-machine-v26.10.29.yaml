@@ -40,7 +40,7 @@ guards:
   initiation_permitted: "the requester's remote use is on, no card is in a reader attached to it, a stored pairing is active, or forgotten and owing its revocation close, and its custodian's discovery hint is in sight"
   pairing_routed: "the routing tag matched an active stored pairing and its nonce is not in the replay memory"
   ready_parameters_match: "received session.ready parameters equal the local view"
-  untried_pairing_candidate: "the requester's remote use is on, no card is in a reader attached to it, an endpoint found in pairing mode is not yet opened for the typed code, and fewer than pairing_candidates_max pairing connections were opened for it"
+  untried_pairing_candidate: "the requester's remote use is on, no card is in a reader attached to it, an endpoint found in pairing mode is not yet opened for the typed code or answered busy and its retry-after has passed, and fewer than pairing_candidates_max pairing connections were opened for it"
 
 actions:
   generate_offer: "create the offer with a fresh random offer_id and offer_ttl_ms"
@@ -51,9 +51,11 @@ actions:
   destroy_offer: "erase the offer and its pairing code and stop advertising it"
   read_offer: "obtain the offer over the pairing connection and validate it"
   begin_cpace_initiator: "send CPace step 1 from the typed pairing code"
-  try_next_candidate: "open a pairing connection to the next endpoint found in pairing mode and not yet opened for the typed code"
+  try_next_candidate: "open a pairing connection to the next endpoint found in pairing mode and not yet opened for the typed code, or waiting out a busy answer whose retry-after has passed"
   admit_attempt: "admit the attempt before sending CPace step 2 and arm its deadline"
   end_failed_attempt: "end the failed attempt; the offer stays as it was"
+  answer_busy: "send pairing-busy with the time until an attempt can be admitted, and close the connection"
+  defer_candidate: "keep the endpoint for another opening no sooner than its retry-after, after the other endpoints waiting"
   show_wrong_code: "tell the user the pairing code was not accepted, naming no custodian"
   show_none_in_pairing_mode: "tell the user that no custodian in pairing mode was found"
   consume_offer: "mark the offer consumed once T_A verified"
@@ -174,6 +176,22 @@ pairing:
       role: custodian
       to: offering
       actions: [end_failed_attempt]
+    - from: offering
+      event: attempt_refused              # a pairing connection arrived inside the 500 ms spacing
+      role: custodian
+      to: offering
+      actions: [answer_busy]
+    - from: exchanging
+      event: attempt_refused              # a pairing connection arrived while an attempt is active
+      role: custodian
+      to: exchanging
+      actions: [answer_busy]
+    - from: exchanging
+      event: candidate_busy                # the endpoint opened answered pairing-busy
+      role: requester
+      guard: untried_pairing_candidate
+      to: exchanging
+      actions: [close_candidate, defer_candidate, try_next_candidate, read_offer, begin_cpace_initiator]
     - from: exchanging
       event: attempt_failed                # the endpoint opened did not take the code: its custodian refused it, or it served no offer it could try
       role: requester
@@ -181,7 +199,7 @@ pairing:
       to: exchanging
       actions: [close_candidate, try_next_candidate, read_offer, begin_cpace_initiator]
     - from: exchanging
-      event: last_candidate_failed         # every custodian tried refused the code and no endpoint is left to open
+      event: last_candidate_failed         # every custodian tried refused the code, or answered busy at the connection limit, and no endpoint is left to open
       role: requester
       to: unpaired
       actions: [close_candidate, show_wrong_code]

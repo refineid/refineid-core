@@ -12,8 +12,11 @@ root=$(git rev-parse --show-toplevel)
 # The workspace version is the UTC day the tree was last committed on.
 # When the day has changed since the stamp, the commit carries a fresh
 # stamp, so no build published from main names an earlier day.
-"$root/scripts/version-stamp.sh"
-git add "$root/Cargo.toml" "$root/Cargo.lock"
+stamped=$("$root/scripts/version-stamp.sh")
+if [ -n "$stamped" ]; then
+    echo "$stamped"
+    git add "$root/Cargo.toml" "$root/Cargo.lock"
+fi
 
 # Mandatory fast quality gates; bypassing them (--no-verify or
 # otherwise) is prohibited for every contributor, human or AI agent.

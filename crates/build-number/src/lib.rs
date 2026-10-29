@@ -37,7 +37,7 @@ pub const fn build_number(epoch_seconds: u64) -> u64 {
 }
 
 /// Whether `text` is a build number: a decimal number from 0 to 2359
-/// with no sign and no leading zero, whose last two digits are a
+/// with no sign and no leading zero, whose value modulo 100 is a
 /// minute.
 #[must_use]
 pub fn is_build_number(text: &str) -> bool {
@@ -95,7 +95,11 @@ mod tests {
     fn build_number_shape() {
         assert!(is_build_number("0"));
         assert!(is_build_number("7"));
+        assert!(is_build_number("59"));
+        assert!(is_build_number("105"));
+        assert!(is_build_number("959"));
         assert!(is_build_number("2359"));
+        assert!(!is_build_number("160"));
         assert!(!is_build_number("007"));
         assert!(!is_build_number("2400"));
         assert!(!is_build_number("1260"));

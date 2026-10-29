@@ -5,25 +5,17 @@
 # Bypassing it (--no-verify or otherwise) is prohibited for every
 # contributor, human or AI agent alike.
 
+set -eu
+
 root=$(git rev-parse --show-toplevel)
-manifest="$root/Cargo.toml"
 
-# Two-digit year and leading-zero-stripped month/day (portable, no GNU date).
-yy=$(date -u +%y); yy=${yy#0}
-mo=$(date -u +%m); mo=${mo#0}
-dd=$(date -u +%d); dd=${dd#0}
-today="$yy.$mo.$dd"
-
-# The workspace version line, taken between its quotes; drop any build suffix.
-current=$(awk -F'"' '/^version = / { print $2; exit }' "$manifest")
-current=${current%%+*}
-
-if [ "$current" != "$today" ]; then
-    sed -i.bak "s|^version = \"$current\"|version = \"$today\"|" "$manifest"
-    rm -f "$manifest.bak"
-    cargo check --workspace --quiet 2>/dev/null || cargo check --workspace
-    git add "$manifest" "$root/Cargo.lock"
-    echo "stamp-version: workspace version $current -> $today (UTC day change)"
+# The workspace version is the UTC day the tree was last committed on.
+# When the day has changed since the stamp, the commit carries a fresh
+# stamp, so no build published from main names an earlier day.
+stamped=$("$root/scripts/version-stamp.sh")
+if [ -n "$stamped" ]; then
+    echo "$stamped"
+    git add "$root/Cargo.toml" "$root/Cargo.lock"
 fi
 
 # Mandatory fast quality gates; bypassing them (--no-verify or

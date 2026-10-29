@@ -14,9 +14,13 @@ doctest = false
 [lints]
 workspace = true
 
+[build-dependencies]
+refineid-build-number.workspace = true
+
 [dependencies]
 zeroize.workspace = true
 
 [dev-dependencies]
+refineid-build-number.workspace = true
 serde.workspace = true
 trybuild.workspace = true

@@ -25,6 +25,9 @@ crates stay transport-agnostic and country-profile-neutral.
   COUNTER (unblock) chains, and the retry-risk policy.
 - `crates/ber` (`refineid-ber`) -- minimal BER-TLV encoder and decoder
   with a typed tag layer.
+- `crates/build-number` (`refineid-build-number`) -- the build number `B`
+  of the project version `YY.M.D.B` ([version](#version)) from the UTC
+  clock, and its shape check; used by `refineid-apdu`'s build script.
 - `crates/cms` (`refineid-cms`) -- strict-DER CMS `SignedData` parsing and
   offline signature verification, with the RSA and ECDSA verification
   primitives and the X.509 certificate machinery they need.
@@ -103,6 +106,18 @@ cargo run --locked -p xtask -- check-magic-numbers
 
 On Windows, see [developing on Windows](doc/process/windows-development.md)
 for the prerequisites, line endings, and how the gates differ.
+
+### Version
+
+The project version is `YY.M.D.B`, in UTC. The date `YY.M.D` is the
+workspace version in `Cargo.toml` and says when the code was last touched:
+the pre-commit hook runs `scripts/version-stamp.sh`, which moves it to
+the commit's day, so it changes at most once a day. The build number `B` is the time of
+day of the build as hour * 100 + minute (7 at 00:07, 2105 at 21:05) and
+says how fresh the binary is; `crates/apdu/build.rs` takes it from the
+clock (`crates/build-number`) on every build, or from `REFINEID_BUILD_NUMBER` when set, and nothing
+in the repository records it. `refineid_apdu::BUILD_VERSION` carries the
+whole version.
 
 ### Managing build cache
 

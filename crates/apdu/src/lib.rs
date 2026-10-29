@@ -21,15 +21,15 @@
 //! Neither path accepts or exposes an unstructured byte blob, and the
 //! [`CardTransport`] port carries only the typed forms.
 
-/// The crate family's build version.
-///
-/// Release and distribution builds -- and any build with `SOURCE_DATE_EPOCH`
-/// set, as Debian and Nix set it -- report the bare workspace version, so the
-/// version is deterministic and nothing is invented at package time. A local
-/// debug build additionally carries a `+B` build-metadata stamp (B = the UTC
-/// hour times ten plus the minute over ten), a development convenience that is
-/// never committed. See this crate's `build.rs`.
-pub const BUILD_VERSION: &str = env!("REFINEID_BUILD_VERSION");
+/// The project version `YY.M.D.B`: the workspace version `YY.M.D`, the UTC
+/// day the code last changed, and the build number `B` from this crate's
+/// `build.rs` (`refineid-build-number`), the UTC time of day of the build as
+/// hour * 100 + minute.
+pub const BUILD_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    ".",
+    env!("REFINEID_BUILD_NUMBER")
+);
 
 pub mod command;
 pub mod iso7816;
@@ -50,13 +50,18 @@ pub use transport::{
 
 #[cfg(test)]
 mod build_version_tests {
+    use refineid_build_number::is_build_number;
+
     use super::BUILD_VERSION;
 
     #[test]
-    fn build_version_extends_the_crate_version() {
+    fn build_version_is_the_crate_version_and_a_build_number() {
+        let build = BUILD_VERSION
+            .strip_prefix(env!("CARGO_PKG_VERSION"))
+            .and_then(|rest| rest.strip_prefix('.'));
         assert!(
-            BUILD_VERSION.starts_with(env!("CARGO_PKG_VERSION")),
-            "build version {BUILD_VERSION} must extend the crate version"
+            build.is_some_and(is_build_number),
+            "build version {BUILD_VERSION} must be the crate version, a dot and a build number"
         );
     }
 }

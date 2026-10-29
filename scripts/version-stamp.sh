@@ -13,24 +13,20 @@
 # implied. See the License for the specific language governing
 # permissions and limitations under the License.
 
-# Stamp the project version across the tree. The canonical version is
-# CalVer YY.M.D.B, where B is a within-day 10-minute bucket
-# (hour*10 + minute/10, 0..235). Updates:
-#   VERSION                 canonical four-component string
-#   Cargo.toml              workspace three-component SemVer projection
+# Stamp the workspace version YY.M.D in Cargo.toml and Cargo.lock with
+# the UTC day, so the version names the day the code last changed. The
+# build number that completes the project version YY.M.D.B is taken at
+# build time (crates/apdu/build.rs) and never committed.
 #
 # Usage: scripts/version-stamp.sh
 
 set -eu
 cd "$(dirname "$0")/.."
 
-read -r year month day hour minute < <(date -u '+%y %-m %-d %-H %-M')
-today="$year.$month.$day"
-time_bucket=$((10#$hour * 10 + 10#$minute / 10))
-project_version="$today.$time_bucket"
+read -r year month day < <(date -u '+%y %m %d')
+today="$year.$((10#$month)).$((10#$day))"
 old=$(grep '^version = ' Cargo.toml | head -n 1 | cut -d '"' -f 2)
 [ -n "$old" ] || { echo "version-stamp: no workspace version" >&2; exit 1; }
-read -r old_project < VERSION
 
 old_ifs=$IFS
 IFS=.
@@ -46,14 +42,9 @@ for component in "$@"; do
         exit 1
     }
 done
-[ "$time_bucket" -le 255 ] || {
-    echo "version-stamp: time bucket $time_bucket exceeds PKCS#11 byte range" >&2
-    exit 1
-}
 
-printf '%s\n' "$project_version" > VERSION
+[ "$old" != "$today" ] || exit 0
 
-if [ "$old" != "$today" ]; then
 awk -v version="$today" '
     /^version = "/ && !done { sub(/"[^"]*"/, "\"" version "\""); done=1 }
     { print }
@@ -81,6 +72,4 @@ awk -v old="$old" -v version="$today" '
     END { if (in_package) flush_package() }
 ' Cargo.lock > Cargo.lock.tmp.$$ && mv Cargo.lock.tmp.$$ Cargo.lock
 
-fi
-
-printf 'version-stamp: %s -> %s (workspace %s)\n' "$old_project" "$project_version" "$today"
+printf 'version-stamp: %s -> %s\n' "$old" "$today"

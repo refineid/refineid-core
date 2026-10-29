@@ -5,6 +5,7 @@ members = [
     "crates/atr",
     "crates/auth",
     "crates/ber",
+    "crates/build-number",
     "crates/ccid",
     "crates/cms",
     "crates/digest",
@@ -37,6 +38,7 @@ refineid-apdu = { path = "crates/apdu" }
 refineid-atr = { path = "crates/atr" }
 refineid-auth = { path = "crates/auth" }
 refineid-ber = { path = "crates/ber" }
+refineid-build-number = { path = "crates/build-number" }
 refineid-ccid = { path = "crates/ccid" }
 refineid-cms = { path = "crates/cms" }
 refineid-digest = { path = "crates/digest" }

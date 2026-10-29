@@ -106,7 +106,9 @@ so a shared desktop reader stays usable.
 
 ## Versions
 
-- Library version: tracks the workspace CalVer (see the root `VERSION` file).
+- Library and token hardware version: `YY.M` of the workspace version
+  `YY.M.D` ([README](../../README.md#version)).
+- Token firmware version: `M.D` of the workspace version.
 - Cryptoki version: `2.40`.
 
 ## Register with p11-kit

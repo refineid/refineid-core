@@ -329,12 +329,59 @@ pub fn post_authority(
     )
 }
 
-/// First octet of the RFC 6598 shared address space, 100.64.0.0/10.
-const SHARED_ADDRESS_FIRST_OCTET: u8 = 100;
-/// Mask over the second octet selecting the /10 prefix bits.
-const SHARED_ADDRESS_SECOND_OCTET_MASK: u8 = 0xC0;
-/// Second-octet prefix bits of 100.64.0.0/10.
-const SHARED_ADDRESS_SECOND_OCTET_PREFIX: u8 = 0x40;
+/// An IPv4 prefix: network address and prefix length in bits.
+struct V4Prefix {
+    network: Ipv4Addr,
+    bits: u32,
+}
+
+impl V4Prefix {
+    fn contains(&self, ip: Ipv4Addr) -> bool {
+        let mask = u32::MAX.checked_shl(u32::BITS - self.bits).unwrap_or(0);
+        u32::from(ip) & mask == u32::from(self.network) & mask
+    }
+}
+
+/// An IPv6 prefix: network address and prefix length in bits.
+struct V6Prefix {
+    network: Ipv6Addr,
+    bits: u32,
+}
+
+impl V6Prefix {
+    fn contains(&self, ip: Ipv6Addr) -> bool {
+        let mask = u128::MAX.checked_shl(u128::BITS - self.bits).unwrap_or(0);
+        u128::from(ip) & mask == u128::from(self.network) & mask
+    }
+}
+
+/// "This network", 0.0.0.0/8 (RFC 6890 section 2.2.2).
+const THIS_NETWORK: V4Prefix = V4Prefix {
+    network: Ipv4Addr::UNSPECIFIED,
+    bits: 8,
+};
+/// Shared address space, 100.64.0.0/10 (RFC 6598; RFC 6890 section
+/// 2.2.2).
+const SHARED_ADDRESS_SPACE: V4Prefix = V4Prefix {
+    network: Ipv4Addr::new(100, 64, 0, 0),
+    bits: 10,
+};
+/// Benchmarking, 198.18.0.0/15 (RFC 2544; RFC 6890 section 2.2.2).
+const BENCHMARKING: V4Prefix = V4Prefix {
+    network: Ipv4Addr::new(198, 18, 0, 0),
+    bits: 15,
+};
+/// Reserved for future use, 240.0.0.0/4, which holds the limited
+/// broadcast address (RFC 6890 section 2.2.2).
+const RESERVED_V4: V4Prefix = V4Prefix {
+    network: Ipv4Addr::new(240, 0, 0, 0),
+    bits: 4,
+};
+/// IPv6 documentation prefix, 2001:db8::/32 (RFC 3849).
+const DOCUMENTATION_V6: V6Prefix = V6Prefix {
+    network: Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0),
+    bits: 32,
+};
 
 /// Whether `ip` is anything but a public unicast address. An
 /// IPv4-mapped IPv6 address is judged as the IPv4 address it reaches.
@@ -349,18 +396,22 @@ fn is_non_public(ip: IpAddr) -> bool {
     }
 }
 
+/// Whether `v4` lies in a range that is not public unicast; the RFC 5737
+/// documentation ranges come from [`Ipv4Addr::is_documentation`].
 fn is_non_public_v4(v4: Ipv4Addr) -> bool {
-    let [first, second, ..] = v4.octets();
-    let shared = first == SHARED_ADDRESS_FIRST_OCTET
-        && second & SHARED_ADDRESS_SECOND_OCTET_MASK == SHARED_ADDRESS_SECOND_OCTET_PREFIX;
     v4.is_loopback()
         || v4.is_private()
         || v4.is_link_local()
         || v4.is_multicast()
-        || v4.is_unspecified()
-        || v4.is_broadcast()
         || v4.is_documentation()
-        || shared
+        || [
+            THIS_NETWORK,
+            SHARED_ADDRESS_SPACE,
+            BENCHMARKING,
+            RESERVED_V4,
+        ]
+        .iter()
+        .any(|prefix| prefix.contains(v4))
 }
 
 fn is_non_public_v6(v6: Ipv6Addr) -> bool {
@@ -369,6 +420,7 @@ fn is_non_public_v6(v6: Ipv6Addr) -> bool {
         || v6.is_unicast_link_local()
         || v6.is_multicast()
         || v6.is_unspecified()
+        || DOCUMENTATION_V6.contains(v6)
 }
 
 /// SSRF guard for certificate-published URLs: resolve the host and
@@ -414,8 +466,9 @@ pub fn authority_redirect_ok(from: &Uri, to: &Uri) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        HttpError, HttpTransport, SocketAddr, Uri, clear_http_transport, get, guard_destination,
-        is_non_public, set_http_transport,
+        BENCHMARKING, DOCUMENTATION_V6, HttpError, HttpTransport, RESERVED_V4, SocketAddr,
+        THIS_NETWORK, Uri, clear_http_transport, get, guard_destination, is_non_public, post,
+        set_http_transport,
     };
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -428,6 +481,18 @@ mod tests {
     const SHARED_V4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
     /// An address in the RFC 5737 documentation range TEST-NET-1.
     const DOCUMENTATION_V4: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
+    /// The last address of the RFC 2544 benchmarking range.
+    const BENCHMARKING_LAST_V4: Ipv4Addr = Ipv4Addr::new(198, 19, 255, 255);
+    /// The first address above the benchmarking range.
+    const ABOVE_BENCHMARKING_V4: Ipv4Addr = Ipv4Addr::new(198, 20, 0, 0);
+    /// A non-zero address in "this network".
+    const THIS_NETWORK_HOST_V4: Ipv4Addr = Ipv4Addr::new(0, 1, 2, 3);
+    /// An address in the RFC 3849 IPv6 documentation prefix.
+    const DOCUMENTATION_HOST_V6: Ipv6Addr = Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1);
+    /// A public IPv6 address just above the documentation prefix.
+    const ABOVE_DOCUMENTATION_V6: Ipv6Addr = Ipv6Addr::new(0x2001, 0x0db9, 0, 0, 0, 0, 0, 1);
+    /// Content type passed by the post test; no body is ever sent.
+    const TEST_CONTENT_TYPE: &str = "application/octet-stream";
 
     fn uri(text: &str) -> Uri {
         Uri::parse(text.to_owned()).expect("test URL parses")
@@ -462,6 +527,29 @@ mod tests {
         assert!(is_non_public(IpAddr::V4(DOCUMENTATION_V4)));
         assert!(is_non_public(IpAddr::V4(Ipv4Addr::BROADCAST)));
         assert!(is_non_public(IpAddr::V6(SHARED_V4.to_ipv6_mapped())));
+    }
+
+    #[test]
+    fn reserved_and_special_purpose_ranges_are_refused() {
+        for v4 in [
+            THIS_NETWORK.network,
+            THIS_NETWORK_HOST_V4,
+            BENCHMARKING.network,
+            BENCHMARKING_LAST_V4,
+            RESERVED_V4.network,
+            Ipv4Addr::BROADCAST,
+        ] {
+            assert!(is_non_public(IpAddr::V4(v4)), "{v4}");
+            assert!(is_non_public(IpAddr::V6(v4.to_ipv6_mapped())), "{v4}");
+        }
+        assert!(is_non_public(IpAddr::V6(DOCUMENTATION_V6.network)));
+        assert!(is_non_public(IpAddr::V6(DOCUMENTATION_HOST_V6)));
+    }
+
+    #[test]
+    fn neighbours_of_the_special_ranges_pass() {
+        assert!(!is_non_public(IpAddr::V4(ABOVE_BENCHMARKING_V4)));
+        assert!(!is_non_public(IpAddr::V6(ABOVE_DOCUMENTATION_V6)));
     }
 
     #[test]
@@ -524,6 +612,21 @@ mod tests {
     fn get_consults_guard_before_transport() {
         set_http_transport(Box::new(RecordingTransport));
         let result = get(&uri("http://127.0.0.1/"), TEST_MAX_BYTES, super::USER_AGENT);
+        clear_http_transport();
+        assert!(matches!(result, Err(HttpError::UnsafeDestination(_))));
+        assert!(!TRANSPORT_CALLED.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn post_consults_guard_before_transport() {
+        set_http_transport(Box::new(RecordingTransport));
+        let result = post(
+            &uri("http://127.0.0.1/"),
+            TEST_CONTENT_TYPE,
+            &[],
+            TEST_MAX_BYTES,
+            super::USER_AGENT,
+        );
         clear_http_transport();
         assert!(matches!(result, Err(HttpError::UnsafeDestination(_))));
         assert!(!TRANSPORT_CALLED.load(Ordering::SeqCst));

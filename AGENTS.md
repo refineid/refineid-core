@@ -154,7 +154,7 @@ before and the correction made the core better.
 - Never put a git worktree under `/tmp`. It is cleared on reboot and takes the
   branch's only checkout with it.
 - One task, one worktree, one branch, one pull request (see [doc/process/agent-worktrees.md](doc/process/agent-worktrees.md)).
-- Run `scripts/agent-housekeeping.sh` to monitor worktrees and verify compliance.
+- Run `./scripts/agent-housekeeping.sh` to monitor worktrees and verify compliance.
 
 ## Working discipline
 

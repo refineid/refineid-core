@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 use zeroize::Zeroizing;
 
+use super::wire::encode_deterministic_cbor_into;
 use super::{
     EndpointRole, GrantsHash, PairId, ProfileName, WireValue, decode_deterministic_cbor,
     encode_deterministic_cbor,
@@ -90,12 +91,22 @@ impl<E: fmt::Display> fmt::Display for SweepError<E> {
 
 impl<E: fmt::Debug + fmt::Display> core::error::Error for SweepError<E> {}
 
-/// A pair record in its stored form, on its way to the device-only store.
-/// It carries the static private key, so it is zeroized on drop, cannot be
-/// cloned, and formats without its bytes. Only this module encodes one.
+/// A pair record in its stored form, on its way to or from the
+/// device-only store. It carries the static private key, so it is zeroized
+/// on drop, cannot be cloned, and formats without its bytes. Only
+/// [`encode_pair_record`] builds one from a record, and only
+/// [`decode_pair_record`] reads one back.
 pub struct EncodedPairRecord(Zeroizing<Vec<u8>>);
 
 impl EncodedPairRecord {
+    /// Take custody of bytes read back from the device-only store. They
+    /// are zeroized when this value drops; [`decode_pair_record`] checks
+    /// them.
+    #[must_use]
+    pub fn from_stored(bytes: Vec<u8>) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
+
     /// The bytes the device-only store writes.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
@@ -325,7 +336,7 @@ impl PairRecord {
         }
         let encoded = encode_with_times(self, plan.forgotten_at_ms, plan.last_session_at_ms)
             .map_err(SweepError::Encoding)?;
-        store(&EncodedPairRecord(Zeroizing::new(encoded))).map_err(SweepError::Store)?;
+        store(&encoded).map_err(SweepError::Store)?;
         self.last_session_at_ms = plan.last_session_at_ms;
         self.forgotten_at_ms = plan.forgotten_at_ms;
         Ok(plan.outcome)
@@ -379,9 +390,9 @@ impl PairRecord {
         }
     }
 
-    /// Exposes the private key only to sibling protocol machinery and stores.
+    /// Exposes the private key only to sibling protocol machinery.
     #[must_use]
-    pub fn local_static_private(&self) -> &[u8; X25519_KEY_SIZE] {
+    pub(crate) fn local_static_private(&self) -> &[u8; X25519_KEY_SIZE] {
         &self.local_static_private
     }
 }
@@ -450,11 +461,11 @@ impl fmt::Display for PairRecordCodecError {
 
 impl core::error::Error for PairRecordCodecError {}
 
-/// Serializes a [`PairRecord`] to deterministic CBOR.
+/// Serializes a [`PairRecord`] to deterministic CBOR in its stored form.
 ///
 /// # Errors
 /// [`PairRecordCodecError::ProtocolFailure`] if serialization fails.
-pub fn encode_pair_record(record: &PairRecord) -> Result<Vec<u8>, PairRecordCodecError> {
+pub fn encode_pair_record(record: &PairRecord) -> Result<EncodedPairRecord, PairRecordCodecError> {
     encode_with_times(
         record,
         record.forgotten_at_ms(),
@@ -462,16 +473,23 @@ pub fn encode_pair_record(record: &PairRecord) -> Result<Vec<u8>, PairRecordCode
     )
 }
 
+/// Map key of the static private key in the stored form.
+const LOCAL_STATIC_PRIVATE_KEY: &str = "local_static_private";
+
+/// Encodes `record` with the given times. Every buffer that holds the
+/// private key is zeroized: the key's map entry once the encoding is
+/// written, and the encoding itself, which is reserved at its final
+/// length so that it is never reallocated.
 fn encode_with_times(
     record: &PairRecord,
     forgotten_at_ms: Option<u64>,
     last_session_at_ms: Option<u64>,
-) -> Result<Vec<u8>, PairRecordCodecError> {
+) -> Result<EncodedPairRecord, PairRecordCodecError> {
     let role = match record.role() {
         EndpointRole::Requester => "requester",
         EndpointRole::Proxy => "proxy",
     };
-    let value = WireValue::Map(BTreeMap::from([
+    let mut value = Zeroizing::new(WireValue::Map(BTreeMap::from([
         (
             "format_version".to_owned(),
             WireValue::Unsigned(PAIR_RECORD_FORMAT_VERSION),
@@ -482,8 +500,8 @@ fn encode_with_times(
         ),
         ("role".to_owned(), WireValue::Text(role.to_owned())),
         (
-            "local_static_private".to_owned(),
-            WireValue::Bytes(record.local_static_private().to_vec()),
+            LOCAL_STATIC_PRIVATE_KEY.to_owned(),
+            WireValue::Bytes(vec![0; X25519_KEY_SIZE]),
         ),
         (
             "local_static_public".to_owned(),
@@ -523,26 +541,42 @@ fn encode_with_times(
             "last_session_at_ms".to_owned(),
             last_session_at_ms.map_or(WireValue::Null, WireValue::Unsigned),
         ),
-    ]));
-    encode_deterministic_cbor(&value).map_err(|_| PairRecordCodecError::ProtocolFailure)
+    ])));
+    // The key is a fixed-size byte string, so the encoding with its
+    // placeholder has the final length.
+    let length = encode_deterministic_cbor(&value)
+        .map_err(|_| PairRecordCodecError::ProtocolFailure)?
+        .len();
+    if let WireValue::Map(map) = &mut *value
+        && let Some(WireValue::Bytes(key)) = map.get_mut(LOCAL_STATIC_PRIVATE_KEY)
+    {
+        key.copy_from_slice(record.local_static_private());
+    }
+    let mut encoded = Zeroizing::new(Vec::with_capacity(length));
+    encode_deterministic_cbor_into(&value, &mut encoded)
+        .map_err(|_| PairRecordCodecError::ProtocolFailure)?;
+    Ok(EncodedPairRecord(encoded))
 }
 
-/// Deserializes a [`PairRecord`] from deterministic CBOR.
+/// Deserializes a [`PairRecord`] from its stored form. The decoded
+/// values are zeroized on every path, the private key included.
 ///
 /// # Errors
 /// [`PairRecordCodecError`] on malformed CBOR, invalid keys, unsupported format version,
 /// or invariant failure.
-pub fn decode_pair_record(bytes: &[u8]) -> Result<PairRecord, PairRecordCodecError> {
-    let WireValue::Map(mut map) =
-        decode_deterministic_cbor(bytes).map_err(|_| PairRecordCodecError::InvalidInput)?
-    else {
+pub fn decode_pair_record(encoded: &EncodedPairRecord) -> Result<PairRecord, PairRecordCodecError> {
+    let mut value = Zeroizing::new(
+        decode_deterministic_cbor(encoded.as_bytes())
+            .map_err(|_| PairRecordCodecError::InvalidInput)?,
+    );
+    let WireValue::Map(map) = &mut *value else {
         return Err(PairRecordCodecError::InvalidInput);
     };
     let expected = [
         "format_version",
         "pair_id",
         "role",
-        "local_static_private",
+        LOCAL_STATIC_PRIVATE_KEY,
         "local_static_public",
         "remote_static_public",
         "grants_hash",
@@ -555,36 +589,36 @@ pub fn decode_pair_record(bytes: &[u8]) -> Result<PairRecord, PairRecordCodecErr
     if map.keys().any(|key| !expected.contains(&key.as_str())) {
         return Err(PairRecordCodecError::InvalidInput);
     }
-    if take_unsigned(&mut map, "format_version")? != PAIR_RECORD_FORMAT_VERSION {
+    if take_unsigned(map, "format_version")? != PAIR_RECORD_FORMAT_VERSION {
         return Err(PairRecordCodecError::UnsupportedVersion);
     }
-    let pair_id = PairId::reconstruct(&take_bytes(&mut map, "pair_id")?)
+    let pair_id = PairId::reconstruct(&take_bytes(map, "pair_id")?)
         .map_err(|_| PairRecordCodecError::InvalidInput)?;
-    let role = match take_text(&mut map, "role")?.as_str() {
+    let role = match take_text(map, "role")?.as_str() {
         "requester" => EndpointRole::Requester,
         "proxy" => EndpointRole::Proxy,
         _ => return Err(PairRecordCodecError::InvalidInput),
     };
-    let local_static_private = take_array::<X25519_KEY_SIZE>(&mut map, "local_static_private")?;
-    let local_static_public = take_array::<X25519_KEY_SIZE>(&mut map, "local_static_public")?;
-    let remote_static_public = take_array::<X25519_KEY_SIZE>(&mut map, "remote_static_public")?;
-    let grants_hash = GrantsHash::reconstruct(&take_bytes(&mut map, "grants_hash")?)
+    let local_static_private = take_private_key(map)?;
+    let local_static_public = take_array::<X25519_KEY_SIZE>(map, "local_static_public")?;
+    let remote_static_public = take_array::<X25519_KEY_SIZE>(map, "remote_static_public")?;
+    let grants_hash = GrantsHash::reconstruct(&take_bytes(map, "grants_hash")?)
         .map_err(|_| PairRecordCodecError::InvalidInput)?;
-    let profiles = take_text_array(&mut map, "profiles")?
+    let profiles = take_text_array(map, "profiles")?
         .into_iter()
         .map(|name| ProfileName::parse(&name).ok_or(PairRecordCodecError::InvalidInput))
         .collect::<Result<Vec<_>, _>>()?;
-    let created_at_ms = take_unsigned(&mut map, "created_at_ms")?;
-    let storage_confirmed = take_bool(&mut map, "storage_confirmed")?;
-    let forgotten_at_ms = take_optional_unsigned(&mut map, "forgotten_at_ms")?;
-    let last_session_at_ms = take_optional_unsigned(&mut map, "last_session_at_ms")?;
+    let created_at_ms = take_unsigned(map, "created_at_ms")?;
+    let storage_confirmed = take_bool(map, "storage_confirmed")?;
+    let forgotten_at_ms = take_optional_unsigned(map, "forgotten_at_ms")?;
+    let last_session_at_ms = take_optional_unsigned(map, "last_session_at_ms")?;
     if !map.is_empty() {
         return Err(PairRecordCodecError::InvalidInput);
     }
     let record = PairRecord::new(
         pair_id,
         role,
-        local_static_private,
+        *local_static_private,
         local_static_public,
         remote_static_public,
         grants_hash,
@@ -605,39 +639,6 @@ pub fn decode_pair_record(bytes: &[u8]) -> Result<PairRecord, PairRecordCodecErr
         Some(at_ms) => record.forgotten(at_ms),
         None => record,
     })
-}
-
-/// Serializes multiple [`PairRecord`]s to deterministic CBOR.
-///
-/// # Errors
-/// [`PairRecordCodecError::ProtocolFailure`] if serialization fails.
-pub fn encode_pair_records(records: &[PairRecord]) -> Result<Vec<u8>, PairRecordCodecError> {
-    let mut entries = Vec::with_capacity(records.len());
-    for record in records {
-        entries.push(WireValue::Bytes(encode_pair_record(record)?));
-    }
-    encode_deterministic_cbor(&WireValue::Array(entries))
-        .map_err(|_| PairRecordCodecError::ProtocolFailure)
-}
-
-/// Deserializes multiple [`PairRecord`]s from deterministic CBOR.
-///
-/// # Errors
-/// [`PairRecordCodecError`] on malformed CBOR or invalid record entries.
-pub fn decode_pair_records(bytes: &[u8]) -> Result<Vec<PairRecord>, PairRecordCodecError> {
-    let WireValue::Array(entries) =
-        decode_deterministic_cbor(bytes).map_err(|_| PairRecordCodecError::InvalidInput)?
-    else {
-        return Err(PairRecordCodecError::InvalidInput);
-    };
-    let mut records = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let WireValue::Bytes(record_bytes) = entry else {
-            return Err(PairRecordCodecError::InvalidInput);
-        };
-        records.push(decode_pair_record(&record_bytes)?);
-    }
-    Ok(records)
 }
 
 fn take_value(
@@ -664,6 +665,20 @@ fn take_array<const SIZE: usize>(
     take_bytes(map, key)?
         .try_into()
         .map_err(|_| PairRecordCodecError::InvalidInput)
+}
+
+/// Takes the static private key out of the decoded map. The decoded
+/// byte string is zeroized when this returns, whatever its length.
+fn take_private_key(
+    map: &mut BTreeMap<String, WireValue>,
+) -> Result<Zeroizing<[u8; X25519_KEY_SIZE]>, PairRecordCodecError> {
+    let decoded = Zeroizing::new(take_bytes(map, LOCAL_STATIC_PRIVATE_KEY)?);
+    let mut key = Zeroizing::new([0_u8; X25519_KEY_SIZE]);
+    if decoded.len() != X25519_KEY_SIZE {
+        return Err(PairRecordCodecError::InvalidInput);
+    }
+    key.copy_from_slice(&decoded);
+    Ok(key)
 }
 
 fn take_text(
@@ -726,10 +741,9 @@ fn take_text_array(
 #[cfg(test)]
 mod tests {
     use super::{
-        EndpointRole, GrantsHash, MILLISECONDS_PER_DAY, PAIRING_IDLE_EXPIRY_DAYS,
-        PAIRING_IDLE_EXPIRY_MS, PairId, PairRecord, ProfileName, REVOCATION_NOTICE_MS, SweepError,
-        SweepOutcome, decode_pair_record, decode_pair_records, encode_pair_record,
-        encode_pair_records,
+        EncodedPairRecord, EndpointRole, GrantsHash, MILLISECONDS_PER_DAY,
+        PAIRING_IDLE_EXPIRY_DAYS, PAIRING_IDLE_EXPIRY_MS, PairId, PairRecord, ProfileName,
+        REVOCATION_NOTICE_MS, SweepError, SweepOutcome, decode_pair_record, encode_pair_record,
     };
     use core::convert::Infallible;
 
@@ -840,7 +854,10 @@ mod tests {
         let now_ms = CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS;
         for session_established in [true, false] {
             let mut record = test_record(0x42);
-            let before = encode_pair_record(&record).expect("encode record");
+            let before = encode_pair_record(&record)
+                .expect("encode record")
+                .as_bytes()
+                .to_vec();
             let mut stored = None;
             record
                 .sweep(now_ms, session_established, |encoded| {
@@ -850,7 +867,12 @@ mod tests {
                 .expect("the store accepts");
             let stored = stored.expect("a change is stored");
             assert_ne!(stored, before, "the sweep changes the stored times");
-            assert_eq!(encode_pair_record(&record).expect("encode swept"), stored);
+            assert_eq!(
+                encode_pair_record(&record)
+                    .expect("encode swept")
+                    .as_bytes(),
+                stored
+            );
         }
     }
 
@@ -875,7 +897,10 @@ mod tests {
             }),
             Ok(SweepOutcome::Expired)
         );
-        let stored = decode_pair_record(&stored.expect("the retry stores")).expect("decode");
+        let stored = decode_pair_record(&EncodedPairRecord::from_stored(
+            stored.expect("the retry stores"),
+        ))
+        .expect("decode");
         assert_eq!(stored.forgotten_at_ms(), Some(expired_at_ms));
         assert_eq!(record.forgotten_at_ms(), Some(expired_at_ms));
 
@@ -1008,15 +1033,31 @@ mod tests {
     }
 
     #[test]
-    fn multiple_pair_records_round_trip() {
-        let records = vec![test_record(0x11), test_record(0x22), test_record(0x33)];
-        let encoded = encode_pair_records(&records).expect("encode records succeeds");
-        let decoded = decode_pair_records(&encoded).expect("decode records succeeds");
+    fn the_codec_keeps_the_stored_form_in_custody() {
+        let encoded: EncodedPairRecord =
+            encode_pair_record(&test_record(0x42)).expect("encode succeeds");
+        assert_eq!(format!("{encoded:?}"), "EncodedPairRecord([redacted])");
+        let reread = EncodedPairRecord::from_stored(encoded.as_bytes().to_vec());
+        let decoded = decode_pair_record(&reread).expect("decode succeeds");
+        assert_eq!(decoded.pair_id(), test_record(0x42).pair_id());
+    }
 
-        assert_eq!(records.len(), decoded.len());
-        for (orig, dec) in records.iter().zip(decoded.iter()) {
-            assert_eq!(orig.pair_id(), dec.pair_id());
-            assert_eq!(orig.local_static_private(), dec.local_static_private());
-        }
+    #[test]
+    fn a_private_key_of_the_wrong_length_is_refused() {
+        let encoded = encode_pair_record(&test_record(0x42)).expect("encode succeeds");
+        let crate::WireValue::Map(mut map) =
+            crate::decode_deterministic_cbor(encoded.as_bytes()).expect("decodes")
+        else {
+            panic!("a pair record is a map");
+        };
+        map.insert(
+            super::LOCAL_STATIC_PRIVATE_KEY.to_owned(),
+            crate::WireValue::Bytes(vec![0x42; super::X25519_KEY_SIZE - 1]),
+        );
+        let short = crate::encode_deterministic_cbor(&crate::WireValue::Map(map)).expect("encodes");
+        assert_eq!(
+            decode_pair_record(&EncodedPairRecord::from_stored(short)).err(),
+            Some(super::PairRecordCodecError::InvalidInput)
+        );
     }
 }

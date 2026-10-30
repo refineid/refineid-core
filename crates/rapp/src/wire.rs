@@ -17,6 +17,8 @@
 use core::fmt;
 use std::collections::BTreeMap;
 
+use zeroize::{Zeroize, Zeroizing};
+
 use super::{MAX_FRAME_PLAINTEXT, SESSION_ID_SIZE, SessionId, WIRE_VERSION_V26_10_29};
 
 const MAX_NESTING_DEPTH: usize = 8;
@@ -398,8 +400,18 @@ impl core::error::Error for WireError {}
 /// integer.
 pub fn encode_deterministic_cbor(value: &WireValue) -> Result<Vec<u8>, WireError> {
     let mut output = Vec::new();
-    encode_value(value, &mut output, 0)?;
+    encode_deterministic_cbor_into(value, &mut output)?;
     Ok(output)
+}
+
+/// Append the deterministic CBOR encoding of `value` to `output`. An
+/// `output` reserved for the whole encoding is never reallocated, so a
+/// secret-bearing encoding leaves no copy behind in freed memory.
+pub(crate) fn encode_deterministic_cbor_into(
+    value: &WireValue,
+    output: &mut Vec<u8>,
+) -> Result<(), WireError> {
+    encode_value(value, output, 0)
 }
 
 /// Decode a complete, strictly deterministic RAPP CBOR value.
@@ -412,14 +424,36 @@ pub fn decode_deterministic_cbor(bytes: &[u8]) -> Result<WireValue, WireError> {
         return Err(WireError::OversizedPlaintext { got: bytes.len() });
     }
     let mut decoder = Decoder { bytes, offset: 0 };
-    let value = decoder.value(0)?;
+    // A refused value is zeroized when it drops, and so is the canonical
+    // re-encoding, reserved at the input's length: the input may be a
+    // stored pair record carrying its private key.
+    let mut value = Zeroizing::new(decoder.value(0)?);
     if decoder.offset != bytes.len() {
         return Err(WireError::TrailingData);
     }
-    if encode_deterministic_cbor(&value)?.as_slice() != bytes {
+    let mut canonical = Zeroizing::new(Vec::with_capacity(bytes.len()));
+    encode_deterministic_cbor_into(&value, &mut canonical)?;
+    if canonical.as_slice() != bytes {
         return Err(WireError::NonCanonical);
     }
-    Ok(value)
+    Ok(core::mem::replace(&mut *value, WireValue::Null))
+}
+
+impl Zeroize for WireValue {
+    /// Zeroize every byte and text string the value holds. Map keys are
+    /// field names and stay.
+    fn zeroize(&mut self) {
+        match self {
+            Self::Unsigned(value) => value.zeroize(),
+            Self::Negative(value) => value.zeroize(),
+            Self::Bytes(bytes) => bytes.zeroize(),
+            Self::Text(text) => text.zeroize(),
+            Self::Array(values) => values.iter_mut().for_each(Zeroize::zeroize),
+            Self::Map(values) => values.values_mut().for_each(Zeroize::zeroize),
+            Self::Bool(value) => value.zeroize(),
+            Self::Null => {}
+        }
+    }
 }
 
 fn encode_value(value: &WireValue, output: &mut Vec<u8>, depth: usize) -> Result<(), WireError> {
@@ -541,22 +575,18 @@ impl Decoder<'_> {
             4 => {
                 let length = self.bounded_collection_length(additional, 1)?;
                 let mut values = Vec::with_capacity(length);
-                for _ in 0..length {
-                    values.push(self.value(depth + 1)?);
+                if let Err(error) = self.fill_array(&mut values, length, depth) {
+                    values.iter_mut().for_each(Zeroize::zeroize);
+                    return Err(error);
                 }
                 Ok(WireValue::Array(values))
             }
             5 => {
                 let length = self.bounded_collection_length(additional, 2)?;
                 let mut values = BTreeMap::new();
-                for _ in 0..length {
-                    let WireValue::Text(key) = self.value(depth + 1)? else {
-                        return Err(WireError::NonTextMapKey);
-                    };
-                    let value = self.value(depth + 1)?;
-                    if values.insert(key, value).is_some() {
-                        return Err(WireError::DuplicateMapKey);
-                    }
+                if let Err(error) = self.fill_map(&mut values, length, depth) {
+                    values.values_mut().for_each(Zeroize::zeroize);
+                    return Err(error);
                 }
                 Ok(WireValue::Map(values))
             }
@@ -565,6 +595,46 @@ impl Decoder<'_> {
             7 if additional == 22 => Ok(WireValue::Null),
             _ => Err(WireError::ForbiddenCborType),
         }
+    }
+
+    /// Decode `length` array elements into `values`, which was reserved
+    /// for them. On an error the caller zeroizes what was decoded.
+    fn fill_array(
+        &mut self,
+        values: &mut Vec<WireValue>,
+        length: usize,
+        depth: usize,
+    ) -> Result<(), WireError> {
+        for _ in 0..length {
+            values.push(self.value(depth + 1)?);
+        }
+        Ok(())
+    }
+
+    /// Decode `length` map entries into `values`. A refused key or a
+    /// displaced duplicate is zeroized here; on an error the caller
+    /// zeroizes what was decoded.
+    fn fill_map(
+        &mut self,
+        values: &mut BTreeMap<String, WireValue>,
+        length: usize,
+        depth: usize,
+    ) -> Result<(), WireError> {
+        for _ in 0..length {
+            let key = match self.value(depth + 1)? {
+                WireValue::Text(key) => key,
+                mut other => {
+                    other.zeroize();
+                    return Err(WireError::NonTextMapKey);
+                }
+            };
+            let value = self.value(depth + 1)?;
+            if let Some(mut displaced) = values.insert(key, value) {
+                displaced.zeroize();
+                return Err(WireError::DuplicateMapKey);
+            }
+        }
+        Ok(())
     }
 
     fn byte(&mut self) -> Result<u8, WireError> {

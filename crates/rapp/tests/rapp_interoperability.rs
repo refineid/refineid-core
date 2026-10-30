@@ -18,12 +18,12 @@ use refineid_rapp::{
     AuthenticatedViolation, BinaryFrame, BootstrapAnswer, CardOperation, CloseReason,
     CpaceKc2Initiator, CpaceKc2Responder, EndpointError, EndpointRole, EstablishedEndpoint,
     EstablishedSessionRuntime, ExplicitUserIntent, HandshakeChannel, HandshakeRole, MessageType,
-    OfferId, OperationId, OperationRequest, PairRecord, PairingHandshake, PairingOffer,
-    PairingSecret, PairingState, ProfileName, RappState, ReadyOutcome, ReceiveOutcome,
-    RuntimeReceive, SecureChannel, SessionAuthentication, SessionCloseMessage, SessionError,
-    SessionHandshake, SessionHandshakeParameters, SessionParameters, SessionReadyMessage,
-    SessionState, TransportProfile, TypedMessage, compute_grants_hash, encode_kc2_step1_frame,
-    generate_pair_key_material, standard_pairing_context_v2,
+    OfferId, OperationId, OperationRequest, PairRecord, PairingCode, PairingHandshake,
+    PairingOffer, PairingSecret, PairingState, ProfileName, RappState, ReadyOutcome,
+    ReceiveOutcome, RuntimeReceive, SecureChannel, SessionAuthentication, SessionCloseMessage,
+    SessionError, SessionHandshake, SessionHandshakeParameters, SessionParameters,
+    SessionReadyMessage, SessionState, TransportProfile, TypedMessage, compute_grants_hash,
+    encode_kc2_step1_frame, generate_pair_key_material, standard_pairing_context_v2,
 };
 
 #[allow(
@@ -559,7 +559,7 @@ fn unauthenticated_ciphertext_failure_closes_only_session() {
 
 #[test]
 fn cpace_bootstrap_pairing_and_fresh_session_interoperate_end_to_end() {
-    let pairing_code = "7KX4M9";
+    let pairing_code = PairingCode::parse("7KX4M9").expect("a valid pairing code");
 
     let profiles = vec![
         ProfileName::CardStatus.as_str().to_owned(),
@@ -588,12 +588,12 @@ fn cpace_bootstrap_pairing_and_fresh_session_interoperate_end_to_end() {
     .expect("context succeeds");
 
     // Phase 1: CPace KC2 3-step mutual confirmation exchange
-    let (initiator, ya) = CpaceKc2Initiator::new(pairing_code, &context, &offer_id, &[0x33; 64])
+    let (initiator, ya) = CpaceKc2Initiator::new(&pairing_code, &context, &offer_id, &[0x33; 64])
         .expect("alice cpace init succeeds");
     let step1_frame = encode_kc2_step1_frame(&ya).expect("alice writes step 1 frame");
 
     let (step2_frame, bob_waiting) = CpaceKc2Responder::process_step1_frame(
-        pairing_code,
+        &pairing_code,
         &context,
         &offer_id,
         &step1_frame,

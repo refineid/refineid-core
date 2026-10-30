@@ -22,17 +22,22 @@ colliding and keeps the main checkout pristine for integration.
 
 1. Update local main: `git checkout main && git pull --ff-only`.
 2. Create the worktree under `../wt/`: `git worktree add ../wt/refineid-core-<topic> -b <topic>`.
-3. Run `scripts/agent-housekeeping.sh` and act on what it reports.
+3. Run `./scripts/agent-housekeeping.sh` (a bash script) and act on what it reports.
 
 ## Housekeeping
 
-`scripts/agent-housekeeping.sh` reports every worktree with its branch,
+`./scripts/agent-housekeeping.sh` reports every worktree with its branch,
 merge state, dirty files, unpushed commits, activity freshness, and disk use.
 With `--clean` it removes only what is provably done:
 
 - The branch is merged into main, the tree is clean, and nothing is
   unpushed. The work is fully preserved in main, so deleting the worktree
   loses nothing. The branch goes with it.
+- Merged means main contains the branch by ancestry, or contains all of
+  its changes by patch: each commit on its own (`git cherry`), or the
+  branch's whole diff as one squash commit, which is how pull requests
+  merge here. A branch without an upstream whose content is in main has
+  nothing unpushed.
 
 Everything else is reported, never destroyed, with the latest commit headline
 quoted so the evaluator — owner or agent — can decide in seconds whether to
@@ -40,7 +45,8 @@ resume work or clean up. In particular:
 
 - Fresh activity (or dirty working tree) is hands off, unconditionally.
 - Uncommitted changes or unpushed commits are never auto-deleted.
-- Non-compliant worktrees not under `~/src/wt/` are flagged explicitly.
+- Non-compliant worktrees not under `../wt/`, beside the main checkout, are
+  flagged explicitly.
 
 ## Finishing a task
 

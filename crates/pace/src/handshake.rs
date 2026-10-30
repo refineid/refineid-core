@@ -209,6 +209,9 @@ pub enum PaceError<E> {
     UnexpectedResponse(&'static str),
     /// The card sent an off-curve or mis-encoded EC point.
     InvalidPoint,
+    /// The card answered with the terminal's own ephemeral public key
+    /// (ICAO Doc 9303 Part 11 section 4.4.1, step 4 d).
+    ReflectedKey,
     /// The mutual-authentication token did not match; the terminal and
     /// card derived different keys, almost always a wrong CAN.
     AuthMismatch,
@@ -226,6 +229,7 @@ impl<E: core::fmt::Display> core::fmt::Display for PaceError<E> {
             Self::Status(stage, sw) => write!(f, "PACE {stage}: card returned {sw}"),
             Self::UnexpectedResponse(what) => write!(f, "PACE unexpected response: {what}"),
             Self::InvalidPoint => f.write_str("PACE: card sent an off-curve EC point"),
+            Self::ReflectedKey => f.write_str("PACE: card echoed the terminal's ephemeral key"),
             Self::AuthMismatch => f.write_str("PACE: mutual authentication token did not match"),
             Self::Random(e) => write!(f, "PACE random: {e}"),
         }
@@ -386,6 +390,7 @@ fn map_nonce_and_key_agreement<T: CardTransport>(
     let outer = BerTlv::<DynamicAuthData>::parse(&response.body)?;
     let card_y = BerTlv::<MappingDataOut>::parse(outer.value())?;
     let y_picc = AffinePoint::decode_uncompressed(card_y.value()).ok_or(PaceError::InvalidPoint)?;
+    reject_reflection(&x_pcd_public, &y_picc)?;
 
     // The mapped generator and everything it is built from depend on
     // the nonce and the private scalar; each lives in a scrubbed owner.
@@ -412,6 +417,7 @@ fn map_nonce_and_key_agreement<T: CardTransport>(
     let outer = BerTlv::<DynamicAuthData>::parse(&response.body)?;
     let card_v = BerTlv::<KeyAgreeOut>::parse(outer.value())?;
     let v_picc = AffinePoint::decode_uncompressed(card_v.value()).ok_or(PaceError::InvalidPoint)?;
+    reject_reflection(&u_pcd_public, &v_picc)?;
 
     Ok(PaceMidwayState {
         v_picc,
@@ -480,6 +486,18 @@ fn encode_auth_token(point: &AffinePoint) -> Option<Vec<u8>> {
     refineid_ber::tlv2(TAG_PUBLIC_KEY_TEMPLATE, inner.finish()).ok()
 }
 
+/// Refuse a card point equal to the terminal's own point for the same
+/// step. ICAO Doc 9303 Part 11 section 4.4.1, step 4 d, has both parties
+/// check that the two key-agreement public keys differ; the mapping
+/// exchange gets the same check. Both run before anything derived from
+/// the card's point is computed or sent.
+fn reject_reflection<E>(ours: &AffinePoint, theirs: &AffinePoint) -> Result<(), PaceError<E>> {
+    if bool::from(ours.ct_eq(theirs)) {
+        return Err(PaceError::ReflectedKey);
+    }
+    Ok(())
+}
+
 /// Draw a random scalar in the range one up to the subgroup order, by
 /// rejection sampling. The draw buffer and the scalar are both scrubbed
 /// owners: the scalar is a private key for the rest of the handshake.
@@ -509,16 +527,20 @@ fn scalar_from_nonce(nonce: &[u8; NONCE_LEN]) -> Zeroizing<U384> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTH_TOKEN_LEN, AffinePoint, KdfParam, PACE_MECHANISM_OID, PaceError, PaceMidwayState, Ssc,
-        TAG_AUTH_TOKEN_PCD, TAG_DYNAMIC_AUTH, aes256_cmac_truncated, encode_auth_token, kdf_aes256,
-        random_scalar_mod_n, scalar_from_nonce,
+        AUTH_TOKEN_LEN, AffinePoint, DynamicAuthData, KdfParam, NONCE_LEN as AES_NONCE_LEN,
+        PACE_MECHANISM_OID, PaceError, PaceMidwayState, Ssc, TAG_AUTH_TOKEN_PCD, TAG_DYNAMIC_AUTH,
+        aes256_cmac_truncated, encode_auth_token, kdf_aes256, random_scalar_mod_n,
+        reject_reflection, scalar_from_nonce,
     };
+    use crate::can::{Can, UnvalidatedCan};
     use crate::commands::GeneralAuthenticate;
     use crate::crypto::brainpool_p384::n as brainpool_n;
     use crypto_bigint::U384;
     use refineid_apdu::{
-        CardTransport, CommandApdu, CredentialCommand, ResponseApdu, TransportOutcome,
+        APDU_HEADER_LEN, CardTransport, CommandApdu, CredentialCommand, ResponseApdu,
+        TransportOutcome,
     };
+    use refineid_ber::{BerTag, BerTlv};
 
     /// The card-response authentication-token tag as a one-byte value.
     const TAG_AUTH_TOKEN_PICC: u8 = 0x86;
@@ -546,6 +568,159 @@ mod tests {
     const CARD_SCALAR: u64 = 0x0123_4567;
     /// A synthetic terminal-side private scalar.
     const TERMINAL_SCALAR: u64 = 0x0FED_CBA9;
+    /// The card-response encrypted-nonce tag as a one-byte value.
+    const TAG_ENCRYPTED_NONCE: u8 = 0x80;
+    /// The card-response mapping-data tag as a one-byte value.
+    const TAG_MAPPING_PICC: u8 = 0x82;
+    /// The card-response key-agreement tag as a one-byte value.
+    const TAG_KEY_AGREE_PICC: u8 = 0x84;
+    /// Width of the short-form Lc field (ISO/IEC 7816-4 section 5.1).
+    const LC_LEN: usize = 1;
+    /// Width of the short-form Le field (ISO/IEC 7816-4 section 5.1).
+    const LE_LEN: usize = 1;
+    /// Offset of the data field in a short case 4 command (ISO/IEC
+    /// 7816-4 section 5.1): the header, then Lc.
+    const CASE4_DATA_OFFSET: usize = APDU_HEADER_LEN + LC_LEN;
+    /// A synthetic Card Access Number.
+    const CAN_TEXT: &str = "123456";
+    /// A synthetic encrypted nonce, one AES block of ASCII.
+    const SYNTHETIC_NONCE: &[u8; AES_NONCE_LEN] = b"synthetic nonce.";
+    /// Exchanges up to and including the mapping round: MSE:Set AT,
+    /// GA-1 and GA-2.
+    const EXCHANGES_THROUGH_MAPPING: usize = 3;
+    /// Exchanges up to and including the key-agreement round.
+    const EXCHANGES_THROUGH_KEY_AGREEMENT: usize = 4;
+
+    /// The terminal's mapping-data object inside a GA-2 command.
+    struct MapPcdPublic;
+    impl BerTag for MapPcdPublic {
+        const TAG: u16 = 0x81;
+    }
+
+    /// The terminal's key-agreement object inside a GA-3 command.
+    struct KeyAgreePcdPublic;
+    impl BerTag for KeyAgreePcdPublic {
+        const TAG: u16 = 0x83;
+    }
+
+    /// Which round the reflecting peer echoes back.
+    #[derive(Clone, Copy)]
+    enum Reflect {
+        Mapping,
+        KeyAgreement,
+    }
+
+    /// A card emulator that does not know the CAN: it answers GA-1 with
+    /// a fixed block, GA-2 with the generator or the terminal's own
+    /// point, and GA-3 with the terminal's own point.
+    struct ReflectingPeer {
+        reflect: Reflect,
+        exchanges: usize,
+    }
+
+    impl ReflectingPeer {
+        fn terminal_point<T: BerTag>(command: &CommandApdu) -> Vec<u8> {
+            let bytes = command.as_bytes();
+            let data = &bytes[CASE4_DATA_OFFSET..bytes.len() - LE_LEN];
+            let outer = BerTlv::<DynamicAuthData>::parse(data).expect("dynamic auth data");
+            BerTlv::<T>::parse(outer.value())
+                .expect("terminal public point")
+                .value()
+                .to_vec()
+        }
+
+        fn answer(tag: u8, value: &[u8]) -> TransportOutcome {
+            let body = refineid_ber::tlv(
+                TAG_DYNAMIC_AUTH,
+                refineid_ber::tlv(tag, value).expect("encodes"),
+            )
+            .expect("encodes");
+            TransportOutcome::Response(success_response(body))
+        }
+    }
+
+    /// Exchange index of the opening MSE:Set AT.
+    const EXCHANGE_MSE: usize = 0;
+    /// Exchange index of GA-1.
+    const EXCHANGE_NONCE: usize = 1;
+    /// Exchange index of GA-2.
+    const EXCHANGE_MAPPING: usize = 2;
+    /// Exchange index of GA-3.
+    const EXCHANGE_KEY_AGREEMENT: usize = 3;
+
+    impl CardTransport for ReflectingPeer {
+        type Error = String;
+
+        fn transmit(&mut self, command: &CommandApdu) -> Result<TransportOutcome, Self::Error> {
+            let index = self.exchanges;
+            self.exchanges += 1;
+            match index {
+                EXCHANGE_MSE => Ok(TransportOutcome::Response(success_response(Vec::new()))),
+                EXCHANGE_NONCE => Ok(Self::answer(TAG_ENCRYPTED_NONCE, SYNTHETIC_NONCE)),
+                EXCHANGE_MAPPING => Ok(match self.reflect {
+                    Reflect::Mapping => Self::answer(
+                        TAG_MAPPING_PICC,
+                        &Self::terminal_point::<MapPcdPublic>(command),
+                    ),
+                    Reflect::KeyAgreement => {
+                        let generator = AffinePoint::generator()
+                            .encode_uncompressed()
+                            .expect("generator encodes");
+                        Self::answer(TAG_MAPPING_PICC, generator.as_bytes())
+                    }
+                }),
+                EXCHANGE_KEY_AGREEMENT => Ok(Self::answer(
+                    TAG_KEY_AGREE_PICC,
+                    &Self::terminal_point::<KeyAgreePcdPublic>(command),
+                )),
+                _ => Err("ReflectingPeer has no answer for the token round".to_owned()),
+            }
+        }
+
+        fn transmit_credential(
+            &mut self,
+            _command: CredentialCommand,
+        ) -> Result<TransportOutcome, Self::Error> {
+            Err("the handshake issues no credential command".to_owned())
+        }
+    }
+
+    fn synthetic_can() -> Can {
+        Can::reconstruct(UnvalidatedCan::from_owned_text(CAN_TEXT.to_owned()))
+            .expect("fixture is a valid CAN")
+    }
+
+    #[test]
+    fn reject_reflection_refuses_an_equal_point() {
+        let g = AffinePoint::generator();
+        assert!(matches!(
+            reject_reflection::<core::convert::Infallible>(&g, &g),
+            Err(PaceError::ReflectedKey)
+        ));
+        assert!(reject_reflection::<core::convert::Infallible>(&g, &g.double()).is_ok());
+    }
+
+    #[test]
+    fn reflected_key_agreement_point_aborts_before_the_token_round() {
+        let mut peer = ReflectingPeer {
+            reflect: Reflect::KeyAgreement,
+            exchanges: 0,
+        };
+        let result = super::run_pace_with_can(&mut peer, synthetic_can());
+        assert!(matches!(result, Err(PaceError::ReflectedKey)));
+        assert_eq!(peer.exchanges, EXCHANGES_THROUGH_KEY_AGREEMENT);
+    }
+
+    #[test]
+    fn reflected_mapping_point_aborts() {
+        let mut peer = ReflectingPeer {
+            reflect: Reflect::Mapping,
+            exchanges: 0,
+        };
+        let result = super::run_pace_with_can(&mut peer, synthetic_can());
+        assert!(matches!(result, Err(PaceError::ReflectedKey)));
+        assert_eq!(peer.exchanges, EXCHANGES_THROUGH_MAPPING);
+    }
 
     #[test]
     fn mechanism_oid_body_is_ten_bytes() {

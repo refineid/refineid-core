@@ -18,7 +18,7 @@ use core::fmt;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// A syntactically valid FINEID PIN: 4-12 ASCII digits.
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct PinBytes {
     bytes: [u8; Self::MAX_LENGTH],
     length: u8,

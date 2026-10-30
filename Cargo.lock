@@ -997,6 +997,7 @@ dependencies = [
  "sha1",
  "sha2 0.11.0",
  "spki",
+ "trybuild",
  "x509-cert",
  "zeroize",
 ]
@@ -1064,6 +1065,7 @@ dependencies = [
  "refineid-sign",
  "refineid-x509",
  "spki",
+ "trybuild",
  "zeroize",
 ]
 

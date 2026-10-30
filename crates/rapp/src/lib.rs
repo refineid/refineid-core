@@ -105,7 +105,7 @@ pub use pairing::{
     EncodedPairRecord, PAIR_RECORD_FORMAT_VERSION, PAIRING_IDLE_EXPIRY_DAYS,
     PAIRING_IDLE_EXPIRY_MS, PairRecord, PairRecordCodecError, PairRecordError,
     REVOCATION_NOTICE_DAYS, REVOCATION_NOTICE_MS, SweepError, SweepOutcome, decode_pair_record,
-    decode_pair_records, encode_pair_record, encode_pair_records,
+    encode_pair_record,
 };
 pub use pairing_attempts::{
     CPACE_ATTEMPT_WINDOW_MS, CpaceAttemptSlot, POST_PAKE_CONFIRMATION_MS, POST_PAKE_HANDSHAKE_MS,

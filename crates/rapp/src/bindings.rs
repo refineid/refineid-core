@@ -23,14 +23,14 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::{
     BinaryFrame, BootstrapAnswer, CandidateError, CpaceAttemptSlot, CpaceKc2Initiator,
-    CpaceKc2Responder, CpaceKc2ResponderWaiting, EndpointRole, EstablishedEndpoint,
-    ExplicitUserIntent, NextCandidate, NextEndpoint, OfferId, PAIRING_BUSY_RETRY_AFTER_MAX_MS,
-    POST_PAKE_CONFIRMATION_MS, POST_PAKE_HANDSHAKE_MS, PairId, PairKeyMaterial, PairRecord,
-    PairingBusy, PairingCandidates, PairingCode, PairingConfirmation, PairingError,
-    PairingHandshake, PairingOffer, PairingOfferDeadline, PairingSecret, PairingStorage,
-    PreAuthenticationRateLimit, ProfileName, ReadyOutcome, RoutingPreamble, STREAM_PROFILE,
-    SessionAuthentication, SessionHandshake, SessionId, TransportProfile, encode_kc2_step1_frame,
-    generate_pair_key_material,
+    CpaceKc2Responder, CpaceKc2ResponderWaiting, EncodedPairRecord, EndpointRole,
+    EstablishedEndpoint, ExplicitUserIntent, NextCandidate, NextEndpoint, OfferId,
+    PAIRING_BUSY_RETRY_AFTER_MAX_MS, POST_PAKE_CONFIRMATION_MS, POST_PAKE_HANDSHAKE_MS, PairId,
+    PairKeyMaterial, PairRecord, PairingBusy, PairingCandidates, PairingCode, PairingConfirmation,
+    PairingError, PairingHandshake, PairingOffer, PairingOfferDeadline, PairingSecret,
+    PairingStorage, PreAuthenticationRateLimit, ProfileName, ReadyOutcome, RoutingPreamble,
+    STREAM_PROFILE, SessionAuthentication, SessionHandshake, SessionId, TransportProfile,
+    encode_kc2_step1_frame, generate_pair_key_material,
     operation_bridge::{EndedOperation, RappBridgeAction, RappBridgeActionKind},
     phase_deadline_ms, standard_pairing_context_v2,
 };
@@ -2848,11 +2848,12 @@ impl RappPairRecord {
         {
             return Err(RappBindingError::PairNotFound);
         }
-        let bytes = vault
+        let encoded = vault
             .load_device_only(pair_id.as_bytes().to_vec())
             .map_err(|_| RappBindingError::LocalStateFailure)?
+            .map(EncodedPairRecord::from_stored)
             .ok_or(RappBindingError::PairNotFound)?;
-        let record = decode_pair_record(&bytes)?;
+        let record = decode_pair_record(&encoded)?;
         if record.pair_id() != pair_id {
             return Err(RappBindingError::InvalidInput);
         }
@@ -3029,9 +3030,9 @@ impl RappPairRecord {
             .map_err(|_| RappBindingError::LocalStateFailure)?;
         let record = record.as_ref().ok_or(RappBindingError::WrongPhase)?;
         let pair_id = record.pair_id().as_bytes().to_vec();
-        let bytes = encode_pair_record(record)?;
+        let encoded = encode_pair_record(record)?;
         vault
-            .insert_device_only(pair_id, bytes)
+            .insert_device_only(pair_id, encoded.as_bytes().to_vec())
             .map_err(|_| RappBindingError::LocalStateFailure)
     }
 
@@ -3064,9 +3065,9 @@ impl RappPairRecord {
             return Err(RappBindingError::StorageUnconfirmed);
         }
         let pair_id = record.pair_id().as_bytes().to_vec();
-        let bytes = encode_pair_record(record)?;
+        let encoded = encode_pair_record(record)?;
         vault
-            .replace_device_only(pair_id, bytes)
+            .replace_device_only(pair_id, encoded.as_bytes().to_vec())
             .map_err(|_| RappBindingError::LocalStateFailure)
     }
 
@@ -3110,9 +3111,9 @@ impl RappPairRecord {
             return outcome.map_err(|_| RappBindingError::LocalStateFailure);
         }
         let forgotten = record.forgotten(forgotten_at_ms);
-        let stored = encode_pair_record(&forgotten).and_then(|bytes| {
+        let stored = encode_pair_record(&forgotten).and_then(|encoded| {
             vault
-                .replace_device_only(pair_id, bytes)
+                .replace_device_only(pair_id, encoded.as_bytes().to_vec())
                 .map_err(|_| RappBindingError::LocalStateFailure)
         });
         *guard = Some(forgotten);
@@ -3993,12 +3994,12 @@ pub fn rapp_withdrawn_record(
     Ok(txt_entries(record.txt_entries()))
 }
 
-fn encode_pair_record(record: &PairRecord) -> Result<Vec<u8>, RappBindingError> {
+fn encode_pair_record(record: &PairRecord) -> Result<EncodedPairRecord, RappBindingError> {
     super::encode_pair_record(record).map_err(|_| RappBindingError::ProtocolFailure)
 }
 
-fn decode_pair_record(bytes: &[u8]) -> Result<PairRecord, RappBindingError> {
-    super::decode_pair_record(bytes).map_err(|_| RappBindingError::InvalidInput)
+fn decode_pair_record(encoded: &EncodedPairRecord) -> Result<PairRecord, RappBindingError> {
+    super::decode_pair_record(encoded).map_err(|_| RappBindingError::InvalidInput)
 }
 
 /// The BLE segmentation and reassembly receiver for one connection and one
@@ -4462,7 +4463,10 @@ mod routing_binding_tests {
         .expect("record")
         .awaiting_storage_confirmation();
         let vault = Arc::new(StoringVault {
-            bytes: crate::encode_pair_record(&unconfirmed).expect("encode"),
+            bytes: crate::encode_pair_record(&unconfirmed)
+                .expect("encode")
+                .as_bytes()
+                .to_vec(),
             revoked: Mutex::new(false),
         });
         let loaded = RappPairRecord::load_from_vault(

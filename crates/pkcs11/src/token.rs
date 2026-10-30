@@ -2415,13 +2415,21 @@ mod tests {
         super::TokenSerial::new(LOGIN_CARD_SERIAL.to_owned())
     }
 
-    fn random_pin() -> crate::pin::PinBytes {
+    fn random_digits() -> Vec<u8> {
         let mut digits = vec![0_u8; crate::pin::PinBytes::MAX_LENGTH];
         getrandom::fill(&mut digits).expect("operating system random source is available");
         for digit in &mut digits {
             *digit = b'0' + (*digit % DECIMAL_DIGIT_RADIX);
         }
-        crate::pin::PinBytes::new(digits).expect("random digits satisfy the PIN policy")
+        digits
+    }
+
+    fn pin_from(digits: &[u8]) -> crate::pin::PinBytes {
+        crate::pin::PinBytes::new(digits.to_vec()).expect("random digits satisfy the PIN policy")
+    }
+
+    fn random_pin() -> crate::pin::PinBytes {
+        pin_from(&random_digits())
     }
 
     fn retries(count: u8) -> PinRetries {
@@ -2505,12 +2513,13 @@ mod tests {
     #[test]
     fn settle_login_remembers_a_refused_pin1() {
         let mut cache = login_cache();
-        let pin = random_pin();
+        let digits = random_digits();
+        let pin = pin_from(&digits);
         let res = super::settle_login(
             &mut cache,
             login_serial(),
             LOGIN_READER_EVENTS,
-            pin.clone(),
+            pin_from(&digits),
             remaining(RETRIES_PRISTINE),
             super::VerifyOutcome::WrongPin {
                 retries_left: retries(RETRIES_ONE_SPENT),

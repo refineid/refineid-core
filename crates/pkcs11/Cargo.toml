@@ -40,3 +40,6 @@ getrandom.workspace = true
 hex.workspace = true
 spki.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+trybuild.workspace = true

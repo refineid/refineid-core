@@ -1435,13 +1435,15 @@ mod tests {
     fn rejected_pin_survives_logout_and_session_close() {
         let mut state = state_with_slots(&["Reader A"]);
         let handle = state.open_session(1, CKF_SERIAL_SESSION);
-        let pin = PinBytes::try_from(*b"1234").expect("valid PIN1");
+        let digits = *b"1234";
+        let stored = PinBytes::try_from(digits).expect("valid PIN1");
+        let pin = PinBytes::try_from(digits).expect("valid PIN1");
         let serial = refineid_pkcs15::TokenSerial::new("CARD-A".to_owned());
         let cache = state.pin_cache(1).expect("cache created");
         {
             let mut cache = cache.lock().expect("cache lock");
             cache
-                .store_pin1(serial.clone(), STEADY_READER_EVENTS, pin.clone())
+                .store_pin1(serial.clone(), STEADY_READER_EVENTS, stored)
                 .expect("a fresh PIN1 is not a rejected one");
             cache.record_rejected(&serial, &pin);
         }

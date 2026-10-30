@@ -550,13 +550,21 @@ mod tests {
         TokenSerial::new(text.to_owned())
     }
 
-    fn random_pin() -> PinBytes {
+    fn random_digits() -> Vec<u8> {
         let mut digits = vec![0_u8; PinBytes::MAX_LENGTH];
         getrandom::fill(&mut digits).expect("operating system random source is available");
         for digit in &mut digits {
             *digit = b'0' + (*digit % DECIMAL_DIGIT_RADIX);
         }
-        PinBytes::new(digits).expect("random digits satisfy the PIN policy")
+        digits
+    }
+
+    fn pin_from(digits: &[u8]) -> PinBytes {
+        PinBytes::new(digits.to_vec()).expect("random digits satisfy the PIN policy")
+    }
+
+    fn random_pin() -> PinBytes {
+        pin_from(&random_digits())
     }
 
     fn remaining(count: u8) -> PinStatus {
@@ -850,8 +858,9 @@ mod tests {
 
     #[test]
     fn a_wrong_pin_destroys_the_value_and_remembers_it() {
-        let pin = random_pin();
-        let mut cache = holding(pin.clone());
+        let digits = random_digits();
+        let mut cache = holding(pin_from(&digits));
+        let pin = pin_from(&digits);
         let checkout = cache
             .checkout_pin1(&serial(CARD_A_SERIAL), READER_EVENTS, pristine())
             .expect("the held value is checked out");
@@ -970,17 +979,17 @@ mod tests {
 
     #[test]
     fn a_stale_checkout_does_not_replace_a_newer_login() {
-        let newer = random_pin();
+        let newer = random_digits();
         let mut cache = holding(random_pin());
         let stale = accepted_held(&mut cache);
         cache
-            .store_pin1(serial(CARD_A_SERIAL), READER_EVENTS, newer.clone())
+            .store_pin1(serial(CARD_A_SERIAL), READER_EVENTS, pin_from(&newer))
             .expect("a fresh PIN1 is not a rejected one");
         completed(stale, &mut cache);
         let checkout = cache
             .checkout_pin1(&serial(CARD_A_SERIAL), READER_EVENTS, pristine())
             .expect("the newer value is held");
-        assert_eq!(checkout.pin().as_bytes(), newer.as_bytes());
+        assert_eq!(checkout.pin().as_bytes(), newer.as_slice());
     }
 
     #[test]

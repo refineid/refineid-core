@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/ui/no_raw_pin_clone.rs:4:5
+  |
+3 | fn duplicate(pin: &PinBytes) -> PinBytes {
+  |                                 -------- expected `PinBytes` because of return type
+4 |     pin.clone()
+  |     ^^^^^^^^^^^ expected `PinBytes`, found `&PinBytes`
+  |
+note: `PinBytes` does not implement `Clone`, so `&PinBytes` was cloned instead
+ --> tests/ui/no_raw_pin_clone.rs:4:5
+  |
+4 |     pin.clone()
+  |     ^^^

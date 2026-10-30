@@ -67,31 +67,15 @@ browser's address space, and an implicit file in a world-writable
 directory would be a symlink-attack surface. The environment is read
 once per process.
 
-`examples/nss_debug.rs` answers "why doesn't Firefox see the card"
-without launching Firefox: it dlopens the built module exactly like
-NSS and replays NSS's discovery probes, including the vendor-defined
-builtin-root class and the `CKO_PROFILE` search this module must
-answer with zero matches (the eager-PIN1 rule). Run
-`cargo run -p refineid-pkcs11 --example nss_debug` with a card
-present; add `--login` (PIN1 from `REFINEID_PIN1`) and
-`--sign-probe` for the key path.
+## Example programs and hardware rigs
 
-## Hardware test rigs (`test/`)
-
-Operator-run, gated on `REFINEID_HARDWARE_TEST=1`; neither runs in
-the commit hooks.
-
-- `test/pkcs11-hardware-suite.sh` -- pkcs11-tool + CLI sweep with a
-  PIN-retry-counter guard around every card-touching phase (aborts
-  the moment a counter drops) and offline openssl verification of
-  every signature. PIN-change and PUK-unblock phases are separately
-  opt-in.
-- `test/headless-cert-auth.sh` -- real TLS client-cert
-  authentication through NSS's `tstclnt` against a fresh NSS
-  profile, no browser; supports A/B comparison of two module builds
-  by diffing their `C_Login`/`C_Sign` log lines. Reproduces in ~5
-  seconds the cross-layer regression class that once evaded every
-  unit test.
+This repository carries no example programs or hardware rigs for the
+module. The [refineid-unix](https://github.com/refineid/refineid-unix)
+repository builds this crate into its host library and keeps them in
+`crates/refineid-pkcs11/`: `examples/nss_debug.rs`, which replays NSS's
+discovery probes against the built module without launching Firefox,
+and the operator-run scripts under `test/`, gated on
+`REFINEID_HARDWARE_TEST=1`.
 
 ## Card access
 

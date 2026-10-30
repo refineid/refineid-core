@@ -37,7 +37,7 @@ With `--clean` it removes only what is provably done:
   its changes by patch: each commit on its own (`git cherry`), or the
   branch's whole diff as one squash commit, which is how pull requests
   merge here. A branch without an upstream whose content is in main has
-  nothing unpushed.
+  nothing unpushed. A probe that fails counts as not merged.
 
 Everything else is reported, never destroyed, with the latest commit headline
 quoted so the evaluator — owner or agent — can decide in seconds whether to

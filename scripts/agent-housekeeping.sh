@@ -37,20 +37,28 @@ wt_root="$(cd "${primary}/.." && pwd -P)/wt"
 stale_after_seconds=86400
 now=$(date +%s)
 
-# Print how main contains the branch, or nothing when it does not.
+# Print how main contains the branch, or nothing when it does not. Any
+# probe that fails prints nothing, so the branch is kept.
 merged_by() {
-  local branch="$1" base squash
+  local branch="$1" cherry base squash_id main_ids
   if git merge-base --is-ancestor "${branch}" main 2>/dev/null; then
     echo "ancestry"
     return
   fi
-  if [[ -z "$(git cherry main "${branch}" 2>/dev/null | grep '^+' || true)" ]]; then
+  cherry=$(git cherry main "${branch}" 2>/dev/null) || return 0
+  if [[ -n "${cherry}" ]] && ! grep -q '^+' <<<"${cherry}"; then
     echo "patch"
     return
   fi
+  # The branch's whole diff as one squash, compared by patch ID against
+  # each commit main gained since the branch forked.
   base=$(git merge-base main "${branch}" 2>/dev/null) || return 0
-  squash=$(git commit-tree "${branch}^{tree}" -p "${base}" -m "housekeeping squash probe" 2>/dev/null) || return 0
-  if [[ "$(git cherry main "${squash}" 2>/dev/null)" == "-"* ]]; then
+  squash_id=$(git diff --no-color --no-ext-diff "${base}" "${branch}" 2>/dev/null \
+    | git patch-id --stable | cut -d ' ' -f 1) || return 0
+  [[ -n "${squash_id}" ]] || return 0
+  main_ids=$(git log -p --no-merges --no-color --no-ext-diff "${base}..main" 2>/dev/null \
+    | git patch-id --stable | cut -d ' ' -f 1) || return 0
+  if grep -qxF "${squash_id}" <<<"${main_ids}"; then
     echo "squash"
   fi
 }

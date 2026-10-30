@@ -50,10 +50,24 @@ jobs:
       - name: Lint the RAPP library without its test-vectors feature
         run: cargo clippy -p refineid-rapp --locked -- -D warnings
 
+      - name: Lint the RAPP bindings library without its test-vectors feature
+        run: cargo clippy -p refineid-rapp --features bindings --locked -- -D warnings
+
+      - name: Lint the RAPP bindings without warnings
+        run: cargo clippy -p refineid-rapp --features bindings --all-targets --locked -- -D warnings
+
+      - name: Test the RAPP bindings
+        run: cargo test -p refineid-rapp --features bindings --locked
+
       - name: Build documentation without warnings
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --no-deps --locked
+
+      - name: Build the RAPP bindings documentation without warnings
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc -p refineid-rapp --features bindings --no-deps --locked
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21

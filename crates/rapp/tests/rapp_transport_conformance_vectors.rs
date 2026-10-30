@@ -7,7 +7,7 @@
 
 use refineid_rapp::{
     BinaryFrame, BootstrapAnswer, CpaceKc2Initiator, CpaceKc2Responder, HandshakeRole, OfferId,
-    PairingBusy, PairingOffer, TransportProfile,
+    PairingBusy, PairingCode, PairingOffer, TransportProfile,
     cpace::{calculate_generator_kc2, generator_string, prepend_len},
     derive_pair_id, derive_session_id, encode_kc2_step1_frame,
     noise::{KkHandshakeState, x25519_public_key},
@@ -174,8 +174,9 @@ fn kc2_transcripts_bind_the_transport_of_the_connection() {
             "{}",
             vector.name
         );
+        let pairing_code = PairingCode::parse(&vector.pairing_code).expect("vector code parses");
         let (initiator, step1_point) = CpaceKc2Initiator::new(
-            &vector.pairing_code,
+            &pairing_code,
             &context,
             &offer_id,
             &array(&vector.test_only_initiator_random_hex),
@@ -189,7 +190,7 @@ fn kc2_transcripts_bind_the_transport_of_the_connection() {
             vector.name
         );
         let (step2, waiting) = CpaceKc2Responder::process_step1_frame(
-            &vector.pairing_code,
+            &pairing_code,
             &context,
             &offer_id,
             &step1,

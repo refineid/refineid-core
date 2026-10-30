@@ -93,7 +93,8 @@ type HmacSha512 = Hmac<Sha512>;
 /// CPace PAKE protocol failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CpaceError {
-    /// The supplied 6-digit pairing code is empty or malformed.
+    /// The entered pairing code is not six symbols of the pairing-code
+    /// alphabet (RAPP v26.10.29 section 3.1).
     InvalidCode,
     /// Random scalar generation produced an invalid/zero scalar.
     InvalidScalar,
@@ -112,7 +113,7 @@ pub enum CpaceError {
 impl fmt::Display for CpaceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidCode => formatter.write_str("invalid or empty pairing code"),
+            Self::InvalidCode => formatter.write_str("invalid pairing code"),
             Self::InvalidScalar => formatter.write_str("failed to sample valid scalar"),
             Self::InvalidPoint => {
                 formatter.write_str("peer group element is invalid or not canonical")
@@ -206,17 +207,63 @@ pub fn calculate_isk(
     hasher.finalize().into()
 }
 
-/// Normalizes a human-entered pairing code (removes ASCII whitespace and normalizes to uppercase).
-fn normalize_code(code: &str) -> Result<String, CpaceError> {
-    let trimmed: String = code.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-    if trimmed.is_empty() || trimmed.len() > 64 {
-        return Err(CpaceError::InvalidCode);
+/// Symbols of the pairing code, in order: Crockford's Base32 alphabet
+/// without `I`, `L`, `O` and `U` (RAPP v26.10.29 section 3.1).
+pub const PAIRING_CODE_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+/// Symbols in a complete pairing code (RAPP v26.10.29 section 3.1).
+pub const PAIRING_CODE_LENGTH: usize = 6;
+/// Separator the display inserts between groups (RAPP v26.10.29 section 3.2).
+const PAIRING_CODE_GROUP_SEPARATOR: char = ' ';
+/// Separator a user may type between groups (RAPP v26.10.29 section 3.1).
+const PAIRING_CODE_TYPED_SEPARATOR: char = '-';
+
+/// A complete pairing code: exactly six uppercase symbols of
+/// [`PAIRING_CODE_ALPHABET`].
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct PairingCode([u8; PAIRING_CODE_LENGTH]);
+
+impl PairingCode {
+    /// Parse an entered code: folds lowercase to uppercase, drops spaces
+    /// and hyphens, and refuses anything else (RAPP v26.10.29 section 3.1).
+    ///
+    /// # Errors
+    /// [`CpaceError::InvalidCode`] for a symbol outside the alphabet or a
+    /// symbol count other than six.
+    pub fn parse(entered: &str) -> Result<Self, CpaceError> {
+        // Built in place, so every early return drops and zeroizes the
+        // symbols collected so far.
+        let mut code = Self([0_u8; PAIRING_CODE_LENGTH]);
+        let mut count = 0_usize;
+        for symbol in entered
+            .chars()
+            .filter(|c| *c != PAIRING_CODE_GROUP_SEPARATOR && *c != PAIRING_CODE_TYPED_SEPARATOR)
+        {
+            let byte =
+                u8::try_from(symbol.to_ascii_uppercase()).map_err(|_| CpaceError::InvalidCode)?;
+            if !PAIRING_CODE_ALPHABET.contains(&byte) {
+                return Err(CpaceError::InvalidCode);
+            }
+            let slot = code.0.get_mut(count).ok_or(CpaceError::InvalidCode)?;
+            *slot = byte;
+            count += 1;
+        }
+        if count != PAIRING_CODE_LENGTH {
+            return Err(CpaceError::InvalidCode);
+        }
+        Ok(code)
     }
-    // Verify numeric or alphanumeric characters
-    if !trimmed.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return Err(CpaceError::InvalidCode);
+
+    /// The password octets: the UTF-8 encoding of the six uppercase
+    /// symbols (RAPP v26.10.29 section 3.1).
+    const fn as_prs(&self) -> &[u8; PAIRING_CODE_LENGTH] {
+        &self.0
     }
-    Ok(trimmed.to_ascii_uppercase())
+}
+
+impl fmt::Debug for PairingCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PairingCode([redacted])")
+    }
 }
 
 /// Encodes a deterministic CBOR pairing context array conforming to RAPP v26.10.29 §6.1.1.
@@ -509,7 +556,7 @@ impl CpaceKc2Initiator {
     /// # Errors
     /// [`CpaceError`] if the code is invalid, scalar is zero, or generator derivation fails.
     pub fn new(
-        pairing_code: &str,
+        pairing_code: &PairingCode,
         context: &[u8],
         offer_id: &OfferId,
         random_bytes_64: &[u8; 64],
@@ -523,7 +570,7 @@ impl CpaceKc2Initiator {
     /// # Errors
     /// [`CpaceError`] if the code is invalid, scalar is zero, or generator derivation fails.
     pub fn new_with_scalar(
-        pairing_code: &str,
+        pairing_code: &PairingCode,
         context: &[u8],
         offer_id: &OfferId,
         scalar: Scalar,
@@ -531,11 +578,10 @@ impl CpaceKc2Initiator {
         if scalar == Scalar::ZERO {
             return Err(CpaceError::InvalidScalar);
         }
-        let normalized = normalize_code(pairing_code)?;
         let mut sid_bytes = [0_u8; OFFER_ID_SIZE];
         sid_bytes.copy_from_slice(offer_id.as_bytes());
 
-        let generator = calculate_generator_kc2(normalized.as_bytes(), context, &sid_bytes)?;
+        let generator = calculate_generator_kc2(pairing_code.as_prs(), context, &sid_bytes)?;
         let my_point = generator * scalar;
         let my_public = my_point.compress().to_bytes();
 
@@ -645,7 +691,7 @@ impl CpaceKc2Responder {
     /// # Errors
     /// [`CpaceError`] if inputs are invalid or peer point is invalid/identity.
     pub fn process_step1(
-        pairing_code: &str,
+        pairing_code: &PairingCode,
         context: &[u8],
         offer_id: &OfferId,
         ya_bytes: &[u8; CPACE_POINT_SIZE],
@@ -664,7 +710,7 @@ impl CpaceKc2Responder {
     /// [`CpaceError::InvalidPoint`] if $Y_A$ is invalid or identity.
     /// [`CpaceError::IdentitySharedPoint`] if $K$ is identity.
     pub fn process_step1_with_scalar(
-        pairing_code: &str,
+        pairing_code: &PairingCode,
         context: &[u8],
         offer_id: &OfferId,
         ya_bytes: &[u8; CPACE_POINT_SIZE],
@@ -679,11 +725,10 @@ impl CpaceKc2Responder {
             return Err(CpaceError::InvalidPoint);
         }
 
-        let normalized = normalize_code(pairing_code)?;
         let mut sid_bytes = [0_u8; OFFER_ID_SIZE];
         sid_bytes.copy_from_slice(offer_id.as_bytes());
 
-        let generator = calculate_generator_kc2(normalized.as_bytes(), context, &sid_bytes)?;
+        let generator = calculate_generator_kc2(pairing_code.as_prs(), context, &sid_bytes)?;
         let my_point = generator * scalar;
         let yb_bytes = my_point.compress().to_bytes();
 
@@ -722,7 +767,7 @@ impl CpaceKc2Responder {
     /// [`CpaceError::MalformedFrame`] if slice is not 32 bytes.
     /// [`CpaceError`] if step 1 processing fails.
     pub fn process_step1_slice(
-        pairing_code: &str,
+        pairing_code: &PairingCode,
         context: &[u8],
         offer_id: &OfferId,
         ya_slice: &[u8],
@@ -739,7 +784,7 @@ impl CpaceKc2Responder {
     /// # Errors
     /// [`CpaceError`] if frame is invalid or step 1 processing fails.
     pub fn process_step1_frame(
-        pairing_code: &str,
+        pairing_code: &PairingCode,
         context: &[u8],
         offer_id: &OfferId,
         frame: &BinaryFrame,
@@ -877,6 +922,54 @@ pub fn decode_kc2_step3_frame(frame: &BinaryFrame) -> Result<[u8; CPACE_TAG_SIZE
 mod tests {
     use super::*;
 
+    fn code(text: &str) -> PairingCode {
+        PairingCode::parse(text).expect("a valid pairing code")
+    }
+
+    #[test]
+    fn pairing_code_accepts_the_alphabet_in_either_case() {
+        let plain = code("7KX4M9");
+        for entered in ["7kx4m9", "7K X4 M9", "7K-X4-M9"] {
+            assert_eq!(code(entered).as_prs(), plain.as_prs());
+        }
+        assert_eq!(plain.as_prs(), b"7KX4M9");
+    }
+
+    #[test]
+    fn pairing_code_refuses_excluded_symbols() {
+        for entered in ["7KX4MI", "7KX4ML", "7KX4MO", "7KX4MU", "7kx4mi"] {
+            assert_eq!(
+                PairingCode::parse(entered).err(),
+                Some(CpaceError::InvalidCode)
+            );
+        }
+    }
+
+    #[test]
+    fn pairing_code_refuses_other_lengths() {
+        for entered in ["", "7KX4M", "7KX4M9Z", "7K X4 M9 ZZ"] {
+            assert_eq!(
+                PairingCode::parse(entered).err(),
+                Some(CpaceError::InvalidCode)
+            );
+        }
+    }
+
+    #[test]
+    fn pairing_code_refuses_other_characters() {
+        for entered in ["7KX4M\u{00C9}", "7KX4M_", "7KX4M\u{2014}", "7KX4\tM9"] {
+            assert_eq!(
+                PairingCode::parse(entered).err(),
+                Some(CpaceError::InvalidCode)
+            );
+        }
+    }
+
+    #[test]
+    fn pairing_code_debug_is_redacted() {
+        assert_eq!(format!("{:?}", code("7KX4M9")), "PairingCode([redacted])");
+    }
+
     /// Not a canonical Ristretto255 encoding (RFC 9496 §4.3.1).
     const NON_CANONICAL_POINT_BYTE: u8 = 0xFF;
 
@@ -986,7 +1079,7 @@ mod tests {
 
     #[test]
     fn cpace_kc2_golden_synthetic_vectors() {
-        let code = "7KX4M9";
+        let code = code("7KX4M9");
         let sid_bytes =
             hex::decode("101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f")
                 .expect("valid hex");
@@ -1018,7 +1111,7 @@ mod tests {
         assert_eq!(hex::encode(&context), expected_context_hex);
 
         // 2. Generator G (32 bytes)
-        let g = calculate_generator_kc2(code.as_bytes(), &context, &sid_bytes)
+        let g = calculate_generator_kc2(code.as_prs(), &context, &sid_bytes)
             .expect("generator computation");
         assert_ne!(g, RistrettoPoint::identity());
         let g_bytes = g.compress().to_bytes();
@@ -1044,7 +1137,7 @@ mod tests {
         );
 
         // 4. Step 1: Initiator computes Y_A (32 bytes)
-        let (alice, msg1) = CpaceKc2Initiator::new(code, &context, &offer_id, &random_a)
+        let (alice, msg1) = CpaceKc2Initiator::new(&code, &context, &offer_id, &random_a)
             .expect("alice init succeeds");
         assert_eq!(
             hex::encode(msg1),
@@ -1053,7 +1146,7 @@ mod tests {
 
         // 5. Step 2: Responder processes Y_A and outputs Y_B || T_B (64 bytes)
         let (msg2, bob_waiting) =
-            CpaceKc2Responder::process_step1(code, &context, &offer_id, &msg1, &random_b)
+            CpaceKc2Responder::process_step1(&code, &context, &offer_id, &msg1, &random_b)
                 .expect("bob step1 succeeds");
         assert_eq!(msg2.len(), 64);
         assert_eq!(
@@ -1153,11 +1246,17 @@ mod tests {
             standard_pairing_context_v2(&offer_hash, crate::BLE_PROFILE, crate::BLE_CANDIDATE_ID)
                 .expect("context succeeds");
 
-        let (alice, msg1) = CpaceKc2Initiator::new("7KX4M9", &context, &offer_id, &[0x11; 64])
-            .expect("alice init succeeds");
-        let (msg2, _) =
-            CpaceKc2Responder::process_step1("7KX4M8", &context, &offer_id, &msg1, &[0x22; 64])
-                .expect("responder step1 succeeds");
+        let (alice, msg1) =
+            CpaceKc2Initiator::new(&code("7KX4M9"), &context, &offer_id, &[0x11; 64])
+                .expect("alice init succeeds");
+        let (msg2, _) = CpaceKc2Responder::process_step1(
+            &code("7KX4M8"),
+            &context,
+            &offer_id,
+            &msg1,
+            &[0x22; 64],
+        )
+        .expect("responder step1 succeeds");
 
         let err = alice
             .process_step2(&msg2)
@@ -1177,11 +1276,17 @@ mod tests {
             standard_pairing_context_v2(&offer_hash_b, crate::BLE_PROFILE, crate::BLE_CANDIDATE_ID)
                 .expect("context b succeeds");
 
-        let (alice, msg1) = CpaceKc2Initiator::new("7KX4M9", &context_a, &offer_id, &[0x11; 64])
-            .expect("alice init succeeds");
-        let (msg2, _) =
-            CpaceKc2Responder::process_step1("7KX4M9", &context_b, &offer_id, &msg1, &[0x22; 64])
-                .expect("responder step1 succeeds");
+        let (alice, msg1) =
+            CpaceKc2Initiator::new(&code("7KX4M9"), &context_a, &offer_id, &[0x11; 64])
+                .expect("alice init succeeds");
+        let (msg2, _) = CpaceKc2Responder::process_step1(
+            &code("7KX4M9"),
+            &context_b,
+            &offer_id,
+            &msg1,
+            &[0x22; 64],
+        )
+        .expect("responder step1 succeeds");
 
         let err = alice
             .process_step2(&msg2)
@@ -1197,11 +1302,17 @@ mod tests {
             standard_pairing_context_v2(&offer_hash, crate::BLE_PROFILE, crate::BLE_CANDIDATE_ID)
                 .expect("context succeeds");
 
-        let (alice, msg1) = CpaceKc2Initiator::new("7KX4M9", &context, &offer_id, &[0x11; 64])
-            .expect("alice init succeeds");
-        let (mut msg2, _) =
-            CpaceKc2Responder::process_step1("7KX4M9", &context, &offer_id, &msg1, &[0x22; 64])
-                .expect("responder step1 succeeds");
+        let (alice, msg1) =
+            CpaceKc2Initiator::new(&code("7KX4M9"), &context, &offer_id, &[0x11; 64])
+                .expect("alice init succeeds");
+        let (mut msg2, _) = CpaceKc2Responder::process_step1(
+            &code("7KX4M9"),
+            &context,
+            &offer_id,
+            &msg1,
+            &[0x22; 64],
+        )
+        .expect("responder step1 succeeds");
 
         msg2[63] ^= 0x01;
         let err = alice
@@ -1218,11 +1329,17 @@ mod tests {
             standard_pairing_context_v2(&offer_hash, crate::BLE_PROFILE, crate::BLE_CANDIDATE_ID)
                 .expect("context succeeds");
 
-        let (alice, msg1) = CpaceKc2Initiator::new("7KX4M9", &context, &offer_id, &[0x11; 64])
-            .expect("alice init succeeds");
-        let (msg2, bob_waiting) =
-            CpaceKc2Responder::process_step1("7KX4M9", &context, &offer_id, &msg1, &[0x22; 64])
-                .expect("responder step1 succeeds");
+        let (alice, msg1) =
+            CpaceKc2Initiator::new(&code("7KX4M9"), &context, &offer_id, &[0x11; 64])
+                .expect("alice init succeeds");
+        let (msg2, bob_waiting) = CpaceKc2Responder::process_step1(
+            &code("7KX4M9"),
+            &context,
+            &offer_id,
+            &msg1,
+            &[0x22; 64],
+        )
+        .expect("responder step1 succeeds");
 
         let (mut msg3, _) = alice.process_step2(&msg2).expect("alice step2 succeeds");
         msg3[31] ^= 0x01;
@@ -1242,7 +1359,7 @@ mod tests {
 
         let identity_bytes = RistrettoPoint::identity().compress().to_bytes();
         let err = CpaceKc2Responder::process_step1(
-            "7KX4M9",
+            &code("7KX4M9"),
             &context,
             &offer_id,
             &identity_bytes,
@@ -1251,7 +1368,7 @@ mod tests {
         .expect_err("identity YA must fail");
         assert_eq!(err, CpaceError::InvalidPoint);
 
-        let (alice, _) = CpaceKc2Initiator::new("7KX4M9", &context, &offer_id, &[0x11; 64])
+        let (alice, _) = CpaceKc2Initiator::new(&code("7KX4M9"), &context, &offer_id, &[0x11; 64])
             .expect("alice init succeeds");
         let mut bad_step2 = [0u8; 64];
         bad_step2[..32].copy_from_slice(&identity_bytes);
@@ -1271,7 +1388,7 @@ mod tests {
 
         let non_canonical = [NON_CANONICAL_POINT_BYTE; CPACE_POINT_SIZE];
         let err = CpaceKc2Responder::process_step1(
-            "7KX4M9",
+            &code("7KX4M9"),
             &context,
             &offer_id,
             &non_canonical,
@@ -1280,7 +1397,7 @@ mod tests {
         .expect_err("non-canonical YA must fail");
         assert_eq!(err, CpaceError::InvalidPoint);
 
-        let (alice, _) = CpaceKc2Initiator::new("7KX4M9", &context, &offer_id, &[0x11; 64])
+        let (alice, _) = CpaceKc2Initiator::new(&code("7KX4M9"), &context, &offer_id, &[0x11; 64])
             .expect("alice init succeeds");
         let mut bad_step2 = [0u8; 64];
         bad_step2[..32].copy_from_slice(&non_canonical);
@@ -1310,9 +1427,9 @@ mod tests {
         let context =
             standard_pairing_context_v2(&offer_hash, crate::BLE_PROFILE, crate::BLE_CANDIDATE_ID)
                 .expect("context succeeds");
-        let code = "987 654";
+        let code = code("987 654");
 
-        let (alice, ya) = CpaceKc2Initiator::new(code, &context, &offer_id, &[0xAA; 64])
+        let (alice, ya) = CpaceKc2Initiator::new(&code, &context, &offer_id, &[0xAA; 64])
             .expect("alice init succeeds");
         let frame1 = encode_kc2_step1_frame(&ya).expect("frame 1 encodes");
         assert_eq!(
@@ -1320,9 +1437,14 @@ mod tests {
             ya
         );
 
-        let (frame2, bob_waiting) =
-            CpaceKc2Responder::process_step1_frame(code, &context, &offer_id, &frame1, &[0xBB; 64])
-                .expect("bob step 1 frame succeeds");
+        let (frame2, bob_waiting) = CpaceKc2Responder::process_step1_frame(
+            &code,
+            &context,
+            &offer_id,
+            &frame1,
+            &[0xBB; 64],
+        )
+        .expect("bob step 1 frame succeeds");
 
         let (frame3, secret_a) = alice
             .process_step2_frame(&frame2)
@@ -1353,9 +1475,9 @@ mod tests {
         let context =
             standard_pairing_context_v2(&offer_hash, crate::BLE_PROFILE, crate::BLE_CANDIDATE_ID)
                 .expect("context succeeds");
-        let code = "987 654";
+        let code = code("987 654");
 
-        let (mut alice, _) = CpaceKc2Initiator::new(code, &context, &offer_id, &[0xAA; 64])
+        let (mut alice, _) = CpaceKc2Initiator::new(&code, &context, &offer_id, &[0xAA; 64])
             .expect("alice init succeeds");
         assert_ne!(alice.scalar, Scalar::ZERO);
         alice.zeroize();

@@ -26,10 +26,10 @@ use super::{
     CpaceKc2Responder, CpaceKc2ResponderWaiting, EndpointRole, EstablishedEndpoint,
     ExplicitUserIntent, NextCandidate, NextEndpoint, OfferId, PAIRING_BUSY_RETRY_AFTER_MAX_MS,
     POST_PAKE_CONFIRMATION_MS, POST_PAKE_HANDSHAKE_MS, PairId, PairKeyMaterial, PairRecord,
-    PairingBusy, PairingCandidates, PairingConfirmation, PairingError, PairingHandshake,
-    PairingOffer, PairingOfferDeadline, PairingSecret, PairingStorage, PreAuthenticationRateLimit,
-    ProfileName, ReadyOutcome, RoutingPreamble, STREAM_PROFILE, SessionAuthentication,
-    SessionHandshake, SessionId, TransportProfile, encode_kc2_step1_frame,
+    PairingBusy, PairingCandidates, PairingCode, PairingConfirmation, PairingError,
+    PairingHandshake, PairingOffer, PairingOfferDeadline, PairingSecret, PairingStorage,
+    PreAuthenticationRateLimit, ProfileName, ReadyOutcome, RoutingPreamble, STREAM_PROFILE,
+    SessionAuthentication, SessionHandshake, SessionId, TransportProfile, encode_kc2_step1_frame,
     generate_pair_key_material,
     operation_bridge::{EndedOperation, RappBridgeAction, RappBridgeActionKind},
     phase_deadline_ms, standard_pairing_context_v2,
@@ -238,7 +238,7 @@ enum CpaceBridgeState {
         deadline: PairingOfferDeadline,
     },
     CustodianWaitingStep1 {
-        pairing_code: String,
+        pairing_code: PairingCode,
         random_bytes_64: [u8; 64],
         offer: PairingOffer,
         candidate_id: String,
@@ -541,10 +541,17 @@ impl RappPairingBridge {
         Ok(candidates)
     }
 
-    /// Begin CPace PAKE key exchange for a selected transport candidate using the 6-digit code.
+    /// Begin CPace PAKE key exchange for a selected transport candidate using the pairing code.
+    ///
+    /// The code is parsed before anything else in the offer is touched: a
+    /// code that is not six symbols of the pairing-code alphabet (RAPP
+    /// v26.10.29 section 3.1) is refused locally, the offer stays as it was,
+    /// and no attempt is admitted (section 3.3).
     ///
     /// # Errors
-    /// [`RappBindingError`] on expired offer, wrong phase, or invalid random scalar entropy.
+    /// [`RappBindingError::InvalidInput`] for a malformed pairing code or
+    /// random input; otherwise [`RappBindingError`] on expired offer, wrong
+    /// phase, or rate limiting.
     #[allow(
         clippy::needless_pass_by_value,
         reason = "uniffi lowers exported arguments as owned values"
@@ -567,6 +574,14 @@ impl RappPairingBridge {
         else {
             *state = previous;
             return Err(RappBindingError::WrongPhase);
+        };
+        let Ok(pairing_code) = PairingCode::parse(&pairing_code) else {
+            *state = PairingBridgeState::Offer {
+                role,
+                offer,
+                deadline,
+            };
+            return Err(RappBindingError::InvalidInput);
         };
         let random_array: [u8; 64] = random_bytes_64
             .as_slice()
@@ -2067,6 +2082,35 @@ mod pairing_bridge_tests {
             Err(RappBindingError::ProtocolFailure)
         ));
         assert!(custodian.bootstrap_bytes(at + 10_000).is_ok());
+    }
+
+    #[test]
+    fn custodian_begin_cpace_refuses_a_malformed_code() {
+        let custodian = custodian(&[TransportProfile::Stream]);
+        let at = STARTED_AT_MS + 1;
+        for malformed in ["7KX4M", "7KX4M9Z", "7KX4MO", "7KX4M_"] {
+            assert!(matches!(
+                custodian.begin_cpace(
+                    STREAM_CANDIDATE_ID.into(),
+                    malformed.into(),
+                    vec![0x44; 64],
+                    at
+                ),
+                Err(RappBindingError::InvalidInput)
+            ));
+        }
+        // The offer is still served, and neither the rate limit nor the
+        // attempt slot saw the refused codes: a well-formed code begins
+        // at the same instant.
+        assert!(custodian.bootstrap_bytes(at).is_ok());
+        custodian
+            .begin_cpace(
+                STREAM_CANDIDATE_ID.into(),
+                PAIRING_CODE.into(),
+                vec![0x44; 64],
+                at,
+            )
+            .expect("a well-formed code begins");
     }
 
     #[test]

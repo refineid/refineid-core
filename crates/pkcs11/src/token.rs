@@ -436,6 +436,28 @@ impl TokenKeyMaterial {
     }
 }
 
+/// What authenticates the holder before the authentication key signs.
+///
+/// The token reports the answer twice, and both reports follow from
+/// this one value: as [`crate::ck::CKF_LOGIN_REQUIRED`] in its token
+/// information ("there are some cryptographic functions that a user
+/// MUST be logged in to perform", PKCS#11 v3.1 section 3.2 table 6)
+/// and as the private key's [`CKA_PRIVATE`] ("a user may not access
+/// the object until the user has been authenticated to the token",
+/// section 4.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyGate {
+    /// `C_Login` on this computer: the card verifies the PIN1 the
+    /// login carried, and each signature presents it again. The key
+    /// is a private object.
+    Login,
+    /// The paired phone holding the card: it verifies PIN 1 itself
+    /// and asks the holder on its own screen for each signature, so
+    /// no login on this computer gates the key. The key is a public
+    /// object, and the token requires no login.
+    Device,
+}
+
 /// The token objects, parsed from the card's authentication
 /// certificate and cached per slot while the same card stays present.
 #[derive(Debug, Clone)]
@@ -459,6 +481,8 @@ pub struct TokenObjects {
     key_material: TokenKeyMaterial,
     /// Intermediate and root CA certificate store.
     ca_store: RefinedTrustStore,
+    /// What authenticates the holder before the key signs.
+    key_gate: KeyGate,
     /// Which raised token these objects belong to; its handles are
     /// offset by this many [`TOKEN_HANDLE_SPACE`]s.
     generation: CkObjectHandle,
@@ -538,14 +562,14 @@ fn non_empty(bytes: &[u8]) -> Option<&[u8]> {
 
 impl TokenObjects {
     /// Build token objects from the card's leaf authentication certificate
-    /// DER bytes. Initializes an empty trust store populated dynamically from
-    /// persisted cache and on-card CA slots.
+    /// DER bytes, gated by `key_gate`. Initializes an empty trust store
+    /// populated dynamically from persisted cache and on-card CA slots.
     ///
     /// # Errors
     /// [`CKR_DEVICE_ERROR`] if the DER does not parse or the key
     /// algorithm is neither RSA nor secp384r1 EC (the only two FINEID
     /// auth profiles).
-    pub(crate) fn from_cert_der(cert_der: Vec<u8>) -> Result<Self, CkRv> {
+    pub(crate) fn from_cert_der(cert_der: Vec<u8>, key_gate: KeyGate) -> Result<Self, CkRv> {
         let auth_cert = OwnedCert::from_der(&cert_der).map_err(|_parse_err| CKR_DEVICE_ERROR)?;
         let view = auth_cert.view();
         let key_material = TokenKeyMaterial::extract(&view.spki)?;
@@ -562,6 +586,7 @@ impl TokenObjects {
             token_serial: String::new(),
             key_material,
             ca_store,
+            key_gate,
             generation: 0,
         })
     }
@@ -595,6 +620,12 @@ impl TokenObjects {
     #[must_use]
     pub(crate) const fn mechanism(&self) -> Mechanism {
         self.key_material.mechanism()
+    }
+
+    /// What authenticates the holder before the key signs.
+    #[must_use]
+    pub(crate) const fn key_gate(&self) -> KeyGate {
+        self.key_gate
     }
 
     /// The rendered chip serial from EF.TokenInfo; empty when the
@@ -762,16 +793,21 @@ impl TokenObjects {
     /// the card -- it is what a security review greps for, and an
     /// absent attribute never matches a find template asking for
     /// `CKA_EXTRACTABLE = FALSE`.
+    ///
+    /// [`CKA_PRIVATE`] follows the [`KeyGate`]: true when `C_Login`
+    /// gates the key, false when the phone authenticates each
+    /// signature.
     fn private_key_attribute(&self, attr: CkAttributeType) -> Option<AttrValue<'_>> {
         match attr {
             CKA_CLASS => Some(ulong_attr(CKO_PRIVATE_KEY)),
             CKA_KEY_TYPE => Some(ulong_attr(self.key_material.key_type())),
-            CKA_TOKEN
-            | CKA_PRIVATE
-            | CKA_SIGN
-            | CKA_SENSITIVE
-            | CKA_NEVER_EXTRACTABLE
-            | CKA_ALWAYS_SENSITIVE => Some(bool_attr(CK_TRUE)),
+            CKA_PRIVATE => Some(bool_attr(match self.key_gate {
+                KeyGate::Login => CK_TRUE,
+                KeyGate::Device => CK_FALSE,
+            })),
+            CKA_TOKEN | CKA_SIGN | CKA_SENSITIVE | CKA_NEVER_EXTRACTABLE | CKA_ALWAYS_SENSITIVE => {
+                Some(bool_attr(CK_TRUE))
+            }
             CKA_ALWAYS_AUTHENTICATE
             | CKA_EXTRACTABLE
             | CKA_SIGN_RECOVER
@@ -1184,7 +1220,7 @@ pub(super) fn build_token_objects(reader: &ReaderId) -> Result<TokenObjects, CkR
         .map_err(|_read_err| CKR_DEVICE_ERROR)?;
 
     let mut cas = load_persisted_ca_certs();
-    let mut objects = TokenObjects::from_cert_der(cert.as_bytes().to_vec())?;
+    let mut objects = TokenObjects::from_cert_der(cert.as_bytes().to_vec(), KeyGate::Login)?;
     if let Some(serial) = serial {
         objects.token_serial = serial;
     }
@@ -1492,8 +1528,9 @@ impl RemoteKey {
 }
 
 /// Token objects for a phone-served card, from the certificate the
-/// source checked on its session; the serial names the pairing and
-/// the persisted CA certificates complete the chain.
+/// source checked on its session; the serial names the pairing, the
+/// persisted CA certificates complete the chain, and the phone gates
+/// the key ([`KeyGate::Device`]).
 ///
 /// # Errors
 /// [`CKR_DEVICE_ERROR`] if the certificate does not parse or carries
@@ -1506,7 +1543,7 @@ pub(super) fn remote_token_objects(
     pair_id: &RemoteSlotId,
     certificate: &SessionCertificate,
 ) -> Result<TokenObjects, CkRv> {
-    let mut objects = TokenObjects::from_cert_der(certificate.as_der().to_vec())?;
+    let mut objects = TokenObjects::from_cert_der(certificate.as_der().to_vec(), KeyGate::Device)?;
     objects.remote_key()?;
     objects.set_token_serial(pair_id.token_serial());
     for ca in load_persisted_ca_certs() {
@@ -1920,8 +1957,9 @@ mod tests {
         assert!(!oversized_path.exists());
 
         // Test object_exists and ca_object_for_kind
-        let mut objects = super::TokenObjects::from_cert_der(TEST_CA_1_DER.to_vec())
-            .expect("token objects from cert der");
+        let mut objects =
+            super::TokenObjects::from_cert_der(TEST_CA_1_DER.to_vec(), super::KeyGate::Login)
+                .expect("token objects from cert der");
         assert!(!objects.object_exists(ObjectKind::Ca(0)));
 
         objects.push_ca_cert(cert1);
@@ -2075,8 +2113,9 @@ mod tests {
 
         const TEST_CA_1_DER: &[u8] =
             include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
-        let objects = super::TokenObjects::from_cert_der(TEST_CA_1_DER.to_vec())
-            .expect("token objects from cert der");
+        let objects =
+            super::TokenObjects::from_cert_der(TEST_CA_1_DER.to_vec(), super::KeyGate::Login)
+                .expect("token objects from cert der");
         assert!(!objects.object_exists(ObjectKind::Ca(0)));
         const HIGH_OUT_OF_BOUNDS_INDEX: usize = 9999;
         assert!(!objects.object_exists(ObjectKind::Ca(HIGH_OUT_OF_BOUNDS_INDEX)));
@@ -2366,6 +2405,39 @@ mod tests {
         assert!(source.seen().is_none());
     }
 
+    /// `CKA_PRIVATE` on the private key follows the key gate: private
+    /// on a token `C_Login` gates, public on a phone-served token. The
+    /// certificate and the public key are public on both.
+    #[test]
+    fn the_key_gate_decides_whether_the_private_key_is_private() {
+        const CERT_DER: &[u8] =
+            include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+        let card = super::TokenObjects::from_cert_der(CERT_DER.to_vec(), super::KeyGate::Login)
+            .expect("parses");
+        let phone = super::remote_token_objects(
+            &pair_id(),
+            &crate::remote::SessionCertificate::new(CERT_DER.to_vec()),
+        )
+        .expect("served");
+        assert_eq!(card.key_gate(), super::KeyGate::Login);
+        assert_eq!(phone.key_gate(), super::KeyGate::Device);
+        let private = |objects: &super::TokenObjects, kind| {
+            objects
+                .attribute(kind, crate::ck::CKA_PRIVATE)
+                .and_then(|value| value.as_bytes().map(<[u8]>::to_vec))
+        };
+        let public = Some(vec![crate::ck::CK_FALSE]);
+        assert_eq!(
+            private(&card, ObjectKind::PrivateKey),
+            Some(vec![crate::ck::CK_TRUE])
+        );
+        assert_eq!(private(&phone, ObjectKind::PrivateKey), public);
+        for objects in [&card, &phone] {
+            assert_eq!(private(objects, ObjectKind::Certificate), public);
+            assert_eq!(private(objects, ObjectKind::PublicKey), public);
+        }
+    }
+
     /// The key a phone-served token signs with follows the
     /// certificate's public key: P-384 is served; RSA-4096 and P-256
     /// are not FINEID authentication keys and are refused at token
@@ -2376,12 +2448,15 @@ mod tests {
         const RSA_4096_DER: &[u8] =
             include_bytes!("../ca-certs/fineid-intermediate-02-citizen-g4r.der");
         const P256_DER: &[u8] = include_bytes!("../test-certs/p256-alpha.der");
-        let ec = super::TokenObjects::from_cert_der(EC_DER.to_vec()).expect("parses");
+        let ec = super::TokenObjects::from_cert_der(EC_DER.to_vec(), super::KeyGate::Device)
+            .expect("parses");
         assert_eq!(ec.remote_key(), Ok(super::RemoteKey::EcdsaP384));
-        let rsa = super::TokenObjects::from_cert_der(RSA_4096_DER.to_vec()).expect("parses");
+        let rsa = super::TokenObjects::from_cert_der(RSA_4096_DER.to_vec(), super::KeyGate::Device)
+            .expect("parses");
         assert_eq!(rsa.remote_key(), Err(crate::ck::CKR_DEVICE_ERROR));
         assert_eq!(
-            super::TokenObjects::from_cert_der(P256_DER.to_vec()).map(|_| ()),
+            super::TokenObjects::from_cert_der(P256_DER.to_vec(), super::KeyGate::Device)
+                .map(|_| ()),
             Err(crate::ck::CKR_DEVICE_ERROR)
         );
         for refused in [RSA_4096_DER, P256_DER] {

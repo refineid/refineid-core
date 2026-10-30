@@ -37,12 +37,16 @@ const LONG_FORM_LENGTH_FLAG: u8 = 0x80;
 const LENGTH_COUNT_MASK: u8 = 0x7F;
 const MIN_HEADER_BYTES_FOR_LENGTH: usize = 2;
 /// Most length octets a long-form outer length may carry here (X.690
-/// section 8.1.3.5); three octets already exceed
+/// section 8.1.3.5); two octets already reach past
 /// [`MAX_EMRTD_FILE_BYTES`].
-const MAX_LENGTH_OCTETS: usize = 3;
-/// Largest elementary file this reader assembles. An announced length
-/// above it is refused before any chunk is read.
-pub const MAX_EMRTD_FILE_BYTES: usize = 0x1_0000;
+const MAX_LENGTH_OCTETS: usize = 2;
+/// Largest elementary file this reader assembles: every byte lies within
+/// the fifteen-bit direct-offset range of the even-INS READ BINARY.
+/// Offsets above [`DirectOffset15::MAX`] need the odd-INS READ BINARY with
+/// an offset data object (ICAO Doc 9303 Part 10), which this reader does
+/// not issue. An announced length above the ceiling is refused before any
+/// chunk is read.
+pub const MAX_EMRTD_FILE_BYTES: usize = DirectOffset15::MAX as usize + 1;
 
 /// Reads an entire elementary file by its Short File Identifier.
 ///
@@ -55,8 +59,8 @@ pub const MAX_EMRTD_FILE_BYTES: usize = 0x1_0000;
 /// Returns an [`EmrtdError`] on transport faults or if reading is rejected
 /// by the card; [`EmrtdError::MalformedData`] when the probe answers more
 /// bytes than requested, the outer length does not decode, the file
-/// exceeds [`MAX_EMRTD_FILE_BYTES`], or a chunk would start beyond the
-/// direct-offset range.
+/// exceeds [`MAX_EMRTD_FILE_BYTES`], or a chunk answers more bytes than
+/// requested.
 pub fn read_emrtd_file<T: CardTransport + ?Sized>(
     transport: &mut T,
     sfi: Sfi,
@@ -100,6 +104,7 @@ pub fn read_emrtd_file<T: CardTransport + ?Sized>(
     let total_expected_length =
         decode_outer_total_length(&header).ok_or(EmrtdError::MalformedData)?;
     let mut buffer = header;
+    buffer.truncate(total_expected_length);
 
     while buffer.len() < total_expected_length {
         let remaining = total_expected_length - buffer.len();
@@ -136,11 +141,7 @@ pub fn read_emrtd_file<T: CardTransport + ?Sized>(
             break;
         }
 
-        let assembled = buffer
-            .len()
-            .checked_add(chunk_response.body.len())
-            .ok_or(EmrtdError::MalformedData)?;
-        if assembled > MAX_EMRTD_FILE_BYTES {
+        if chunk_response.body.len() > usize::from(want) {
             return Err(EmrtdError::MalformedData);
         }
         buffer.extend_from_slice(&chunk_response.body);
@@ -158,7 +159,7 @@ pub fn read_emrtd_file<T: CardTransport + ?Sized>(
 /// 8.1).
 ///
 /// `None` when the header is truncated before the length is complete,
-/// the long form is indefinite or carries more than three length octets,
+/// the long form is indefinite or carries more than two length octets,
 /// or the total exceeds [`MAX_EMRTD_FILE_BYTES`].
 #[must_use]
 pub fn decode_outer_total_length(header: &[u8]) -> Option<usize> {
@@ -195,14 +196,16 @@ pub fn decode_outer_total_length(header: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HIGH_BIT_SET_FLAG, LONG_FORM_LENGTH_FLAG, MAX_EMRTD_FILE_BYTES, MULTI_BYTE_TAG_FLAG,
-        decode_outer_total_length, read_emrtd_file,
+        HEADER_PROBE_LENGTH, HIGH_BIT_SET_FLAG, INS_READ_BINARY, LONG_FORM_LENGTH_FLAG,
+        MAX_EMRTD_FILE_BYTES, MULTI_BYTE_TAG_FLAG, PARAMETER_ZERO, decode_outer_total_length,
+        read_emrtd_file,
     };
     use crate::error::EmrtdError;
     use crate::sfi::SFI_EF_DG2;
     use refineid_apdu::iso7816::DirectOffset15;
     use refineid_apdu::{
-        CardTransport, CommandApdu, CredentialCommand, ResponseApdu, StatusWord, TransportOutcome,
+        ApduClass, CardTransport, CommandApdu, CredentialCommand, ResponseApdu, StatusWord,
+        TransportOutcome,
     };
 
     /// EF.DG2 outer tag (ICAO Doc 9303 Part 10, data group tags).
@@ -217,17 +220,21 @@ mod tests {
     const SHORT_LENGTH_LEN: usize = 1;
     /// Length octets in a two-octet long form.
     const TWO_LENGTH_OCTETS: u8 = 2;
-    /// Length octets in a three-octet long form.
+    /// Length octets in a three-octet long form, one above the cap.
     const THREE_LENGTH_OCTETS: u8 = 3;
-    /// Length octets in a four-octet long form, one above the cap.
-    const FOUR_LENGTH_OCTETS: u8 = 4;
+    /// Bytes of a single-byte tag followed by a two-octet long form.
+    const LONG_HEADER_LEN: usize = 4;
     /// Bytes a misbehaving card answers to the four-byte header probe.
     const OVER_LONG_PROBE: usize = 10;
+    /// Extra bytes a misbehaving card appends to a chunk.
+    const CHUNK_OVERRUN: usize = 1;
+    /// Bytes stored in the elementary file after its outer TLV.
+    const TRAILING_PADDING: usize = 2;
     /// Bit of P1 that selects the SFI form of READ BINARY (FINEID S1 v4.2
     /// section 3.4.2).
     const P1_SFI_FORM_BIT: u8 = 0x80;
-    /// Index of P1 in a command header.
-    const P1_INDEX: usize = 2;
+    /// Bytes of a case 2 short command: header and Le.
+    const CASE_2_LEN: usize = 5;
     /// A synthetic file byte.
     const FILLER: u8 = b'x';
 
@@ -265,11 +272,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_length_of_length_above_three_octets() {
-        let mut header = vec![TAG_DG2, long_form(FOUR_LENGTH_OCTETS)];
+    fn rejects_length_of_length_above_two_octets() {
+        let mut header = vec![TAG_DG2, long_form(THREE_LENGTH_OCTETS)];
         header.extend(core::iter::repeat_n(
-            u8::MAX,
-            usize::from(FOUR_LENGTH_OCTETS),
+            PARAMETER_ZERO,
+            usize::from(THREE_LENGTH_OCTETS),
         ));
         assert_eq!(decode_outer_total_length(&header), None);
     }
@@ -283,13 +290,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_total_above_file_ceiling() {
-        let mut header = vec![TAG_DG2, long_form(THREE_LENGTH_OCTETS)];
-        header.extend(core::iter::repeat_n(
-            u8::MAX,
-            usize::from(THREE_LENGTH_OCTETS),
-        ));
-        assert_eq!(decode_outer_total_length(&header), None);
+    fn ceiling_is_the_direct_offset_reach() {
+        assert_eq!(MAX_EMRTD_FILE_BYTES, usize::from(DirectOffset15::MAX) + 1);
+        let at_ceiling = header_announcing(MAX_EMRTD_FILE_BYTES - LONG_HEADER_LEN);
+        assert_eq!(
+            decode_outer_total_length(&at_ceiling),
+            Some(MAX_EMRTD_FILE_BYTES)
+        );
+        let above = header_announcing(MAX_EMRTD_FILE_BYTES - LONG_HEADER_LEN + 1);
+        assert_eq!(decode_outer_total_length(&above), None);
     }
 
     #[test]
@@ -301,19 +310,39 @@ mod tests {
         assert_eq!(decode_outer_total_length(&[]), None);
     }
 
-    /// A card serving one transparent file: the SFI probe and every
-    /// direct-offset chunk read from `file`, cut to the requested Le
-    /// unless `probe_overrun` asks for more on the probe.
+    /// A card serving one transparent file by SFI: a strict READ BINARY
+    /// peer that refuses any command other than the SFI probe of EF.DG2
+    /// followed by direct-offset chunks, and answers each with exactly the
+    /// requested bytes unless an overrun is configured.
     struct ScriptedFile {
         file: Vec<u8>,
         probe_overrun: Option<usize>,
+        chunk_overrun: usize,
         p1_bytes: Vec<u8>,
     }
 
     impl ScriptedFile {
+        fn new(file: Vec<u8>) -> Self {
+            Self {
+                file,
+                probe_overrun: None,
+                chunk_overrun: 0,
+                p1_bytes: Vec::new(),
+            }
+        }
+
         fn success(body: Vec<u8>) -> TransportOutcome {
             let [sw1, sw2] = StatusWord::Success.as_u16().to_be_bytes();
             TransportOutcome::Response(ResponseApdu { body, sw1, sw2 })
+        }
+
+        fn serve(&self, offset: usize, length: usize) -> Vec<u8> {
+            self.file
+                .iter()
+                .copied()
+                .skip(offset)
+                .take(length)
+                .collect()
         }
     }
 
@@ -321,23 +350,33 @@ mod tests {
         type Error = String;
 
         fn transmit(&mut self, command: &CommandApdu) -> Result<TransportOutcome, Self::Error> {
-            let bytes = command.as_bytes();
-            let (&p1, rest) = bytes
-                .get(P1_INDEX..)
-                .and_then(<[u8]>::split_first)
-                .ok_or("short command")?;
-            let (&p2, le) = rest.split_first().ok_or("short command")?;
-            let le = usize::from(*le.first().ok_or("no Le")?);
-            self.p1_bytes.push(p1);
-            if p1 & P1_SFI_FORM_BIT != 0 {
-                let served = self.probe_overrun.unwrap_or(le);
-                return Ok(Self::success(
-                    self.file.iter().copied().take(served).collect(),
+            let &[cla, ins, p1, p2, le] = command.as_bytes() else {
+                return Err(format!(
+                    "not a {CASE_2_LEN}-byte case 2 command: {} bytes",
+                    command.as_bytes().len()
                 ));
+            };
+            if cla != ApduClass::Plain.as_byte() || ins != INS_READ_BINARY {
+                return Err("not a plain READ BINARY".to_owned());
+            }
+            let le = usize::from(le);
+            let first = self.p1_bytes.is_empty();
+            self.p1_bytes.push(p1);
+            if first {
+                if p1 != SFI_EF_DG2.p1_for_read_binary()
+                    || p2 != PARAMETER_ZERO
+                    || le != usize::from(HEADER_PROBE_LENGTH)
+                {
+                    return Err("the first command is not the EF.DG2 SFI probe".to_owned());
+                }
+                let served = self.probe_overrun.unwrap_or(le);
+                return Ok(Self::success(self.serve(0, served)));
+            }
+            if p1 & P1_SFI_FORM_BIT != 0 || le == 0 {
+                return Err("a chunk is not a direct-offset read with Le".to_owned());
             }
             let offset = usize::from(u16::from_be_bytes([p1, p2]));
-            let chunk = self.file.iter().copied().skip(offset).take(le).collect();
-            Ok(Self::success(chunk))
+            Ok(Self::success(self.serve(offset, le + self.chunk_overrun)))
         }
 
         fn transmit_credential(
@@ -348,34 +387,34 @@ mod tests {
         }
     }
 
+    /// A DG2 tag and two-octet long form announcing `content` bytes.
+    fn header_announcing(content: usize) -> Vec<u8> {
+        let content = u16::try_from(content).expect("fits two length octets");
+        let mut header = vec![TAG_DG2, long_form(TWO_LENGTH_OCTETS)];
+        header.extend_from_slice(&content.to_be_bytes());
+        header
+    }
+
     /// A DG2-tagged file whose two-octet long form announces `content`
     /// bytes, filled with [`FILLER`].
-    fn file_with_content(content: u16) -> Vec<u8> {
-        let mut file = vec![TAG_DG2, long_form(TWO_LENGTH_OCTETS)];
-        file.extend_from_slice(&content.to_be_bytes());
-        file.extend(core::iter::repeat_n(FILLER, usize::from(content)));
+    fn file_with_content(content: usize) -> Vec<u8> {
+        let mut file = header_announcing(content);
+        file.extend(core::iter::repeat_n(FILLER, content));
         file
     }
 
     #[test]
     fn reads_a_whole_file_in_chunks() {
-        let file = file_with_content(LONG_CONTENT);
-        let mut card = ScriptedFile {
-            file: file.clone(),
-            probe_overrun: None,
-            p1_bytes: Vec::new(),
-        };
+        let file = file_with_content(usize::from(LONG_CONTENT));
+        let mut card = ScriptedFile::new(file.clone());
         let read = read_emrtd_file(&mut card, SFI_EF_DG2).expect("the file reads");
         assert_eq!(read, file);
     }
 
     #[test]
     fn over_long_probe_response_is_malformed_data() {
-        let mut card = ScriptedFile {
-            file: file_with_content(LONG_CONTENT),
-            probe_overrun: Some(OVER_LONG_PROBE),
-            p1_bytes: Vec::new(),
-        };
+        let mut card = ScriptedFile::new(file_with_content(usize::from(LONG_CONTENT)));
+        card.probe_overrun = Some(OVER_LONG_PROBE);
         assert_eq!(
             read_emrtd_file(&mut card, SFI_EF_DG2),
             Err(EmrtdError::MalformedData)
@@ -383,30 +422,46 @@ mod tests {
     }
 
     #[test]
-    fn chunk_offsets_stay_below_direct_offset_cap() {
-        // Content reaching past the direct-offset range but within the
-        // file ceiling: the read ends in a typed error once the next
-        // chunk would start beyond DirectOffset15::MAX.
-        let content = DirectOffset15::MAX
-            .checked_add(DirectOffset15::MAX / u16::from(TWO_LENGTH_OCTETS))
-            .expect("fits sixteen bits");
-        assert!(usize::from(content) < MAX_EMRTD_FILE_BYTES);
-        let mut card = ScriptedFile {
-            file: file_with_content(content),
-            probe_overrun: None,
-            p1_bytes: Vec::new(),
-        };
+    fn chunk_longer_than_requested_is_malformed_data() {
+        let mut card = ScriptedFile::new(file_with_content(usize::from(LONG_CONTENT)));
+        card.chunk_overrun = CHUNK_OVERRUN;
         assert_eq!(
             read_emrtd_file(&mut card, SFI_EF_DG2),
             Err(EmrtdError::MalformedData)
         );
-        let (probe, chunks) = card.p1_bytes.split_first().expect("the probe was sent");
-        let probe_is_sfi_form = probe & P1_SFI_FORM_BIT == P1_SFI_FORM_BIT;
-        let chunks_are_direct = chunks
-            .iter()
-            .all(|p1| p1 & P1_SFI_FORM_BIT != P1_SFI_FORM_BIT);
-        assert!(probe_is_sfi_form);
+    }
+
+    #[test]
+    fn probe_beyond_a_short_object_is_cut_to_the_object() {
+        let object = [TAG_DG2, PARAMETER_ZERO];
+        let mut file = object.to_vec();
+        file.extend(core::iter::repeat_n(FILLER, TRAILING_PADDING));
+        let mut card = ScriptedFile::new(file);
+        let read = read_emrtd_file(&mut card, SFI_EF_DG2).expect("the object reads");
+        assert_eq!(read, object);
+        assert_eq!(card.p1_bytes.len(), 1);
+    }
+
+    #[test]
+    fn file_at_the_ceiling_reads_by_direct_offset() {
+        let file = file_with_content(MAX_EMRTD_FILE_BYTES - LONG_HEADER_LEN);
+        let mut card = ScriptedFile::new(file.clone());
+        let read = read_emrtd_file(&mut card, SFI_EF_DG2).expect("the file reads");
+        assert_eq!(read, file);
+        let chunks = card.p1_bytes.get(1..).expect("the probe was sent");
         assert!(!chunks.is_empty());
-        assert!(chunks_are_direct);
+        assert!(chunks.iter().all(|p1| p1 & P1_SFI_FORM_BIT == 0));
+    }
+
+    #[test]
+    fn file_above_the_ceiling_is_refused_before_any_chunk() {
+        let mut card = ScriptedFile::new(header_announcing(
+            MAX_EMRTD_FILE_BYTES - LONG_HEADER_LEN + 1,
+        ));
+        assert_eq!(
+            read_emrtd_file(&mut card, SFI_EF_DG2),
+            Err(EmrtdError::MalformedData)
+        );
+        assert_eq!(card.p1_bytes.len(), 1);
     }
 }

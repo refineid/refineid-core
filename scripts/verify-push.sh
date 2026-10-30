@@ -29,7 +29,9 @@ cargo clippy --all-targets -- -D warnings
 # The library alone, without dev-dependencies: the RAPP crate's
 # test-vectors feature stays off, as in every platform build.
 cargo clippy -p refineid-rapp -- -D warnings
-# The UniFFI surface is off by default; the platform apps build with it.
+# The UniFFI surface is off by default; the platform apps build with it,
+# library alone as above.
+cargo clippy -p refineid-rapp --features bindings -- -D warnings
 cargo clippy -p refineid-rapp --features bindings --all-targets -- -D warnings
 cargo test -p refineid-rapp --features bindings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps

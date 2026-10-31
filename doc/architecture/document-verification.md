@@ -20,8 +20,7 @@ target the signing side produces. The validation process follows
 EN 319 102-1.
 
 Out of scope, reported as unsupported rather than judged: encrypted
-PDFs, XFA and XAdES signatures inside PDFs, counter-signatures,
-inclusive canonicalisation of SignedInfo, and signatures over MD5 or
+PDFs, XFA and XAdES signatures inside PDFs, and signatures over MD5 or
 SHA-1.
 
 ## Trust origins and borders
@@ -71,7 +70,14 @@ For each signature the report carries independent facts:
   a row. For XAdES, every Reference recomputes, the SignedProperties
   reference resolves to this signature, and every data file in the
   container is covered; a reference URI names an entry percent-decoded
-  or as written. For CAdES in a container, the ASiCManifest that binds
+  or as written. A same-document reference digests the subtree its
+  `Id` names, under its canonicalisation transform or, without one,
+  Canonical XML 1.0. For an XAdES counter-signature, the data files
+  are not required; instead a reference whose `Type` is
+  `CountersignedSignature` must resolve to the `ds:SignatureValue` of
+  the signature the counter-signature is embedded in. One without that
+  `Type` is an ordinary reference and covers nothing, and one with it
+  that resolves elsewhere, another signature's value included, fails. For CAdES in a container, the ASiCManifest that binds
   the signature (one manifest with exactly one SigReference naming it)
   references every data file and at least one, and each digest
   recomputes. A reference the verifier cannot resolve fails this fact;
@@ -99,10 +105,20 @@ For each signature the report carries independent facts:
   attribute must be present once and name `id-data`: absent, the CMS
   structure is refused as unsupported; another type is not valid. In
   XAdES a SignatureMethod or DigestMethod the verifier does not know,
-  a canonicalisation other than Exclusive XML Canonicalization (with
-  or without an `InclusiveNamespaces` prefix list, which is applied),
-  and a Reference with more than one transform or a transform over a
-  data file make the signature unsupported. A SigningCertificate
+  a canonicalisation other than Canonical XML 1.0, Canonical XML 1.1
+  or Exclusive XML Canonicalization 1.0 (each with or without
+  comments; an exclusive `InclusiveNamespaces` prefix list is applied,
+  and the inclusive algorithms take no parameter), and a Reference
+  with more than one transform, a transform other than these, or a
+  transform over a data file make the signature unsupported. The
+  canonicalised subtree is the apex of its node set: the inclusive
+  algorithms render on it every namespace in scope and the `xml:`
+  attributes it inherits from its ancestors (all of them for 1.0;
+  `xml:lang` and `xml:space`, with `xml:base` joined from the
+  ancestors' values, for 1.1), the exclusive one renders only what
+  each element visibly uses. A signature file that declares a relative
+  namespace URI does not read, since Canonical XML 1.0 sec.2.1 makes
+  canonicalising it an error. A SigningCertificate
   binding that names a certificate the signature does not carry leaves
   it without a signer, and an unsupported row.
 - **Chain verified.** A path from the signer certificate to a trust
@@ -115,7 +131,13 @@ For each signature the report carries independent facts:
   digitalSignature or nonRepudiation. Every anchored path is judged and
   the best revocation outcome kept, good before unavailable before
   revoked (RFC 5280 sec.6 accepts any valid path). Every certificate
-  below the anchor is checked for revocation.
+  below the anchor is checked for revocation. The report carries the
+  path as certificates, the signer's issuer first: anchored, ending in
+  the anchor, exactly when the chain is verified; otherwise partial,
+  as far as verifiable issuers in the evidence reach, which may be
+  empty. A signer that is itself not valid at the validation time or
+  not fit to sign has a partial path even when its issuers reach an
+  anchor; the path is then the one to that anchor.
 - **Proof of existence.** The earliest time proven by a timestamp whose
   authority chains to a trust anchor with the time-stamping role: a
   signature-time-stamp attribute over the signature value, a XAdES
@@ -138,8 +160,13 @@ For each signature the report carries independent facts:
   (with the time it proves), claimed (verified under an authority that
   is not anchored, with the time it claims), invalid (with the reason
   the token failed), or unsupported (an XAdES timestamp whose imprint
-  needs a canonicalisation other than Exclusive XML Canonicalization,
-  or a document timestamp whose range does not end a revision).
+  needs a canonicalisation the verifier does not compute, or a
+  document timestamp whose range does not end a revision). An XAdES
+  timestamp that names no canonicalisation imprints the
+  `ds:SignatureValue` under Canonical XML 1.0 (EN 319 132-1 clause
+  4.5). An anchored or claimed token is reported with its signer and
+  the path above it, as for the signer's chain: issuer first, anchor
+  last when anchored, as far as it was built when not.
   A timestamp that is invalid, unsupported, or verified under an
   authority that is not anchored is reported and decides nothing: it
   sets no proof of existence and does not make the signature or the
@@ -176,6 +203,25 @@ For each signature the report carries independent facts:
 - **Covers whole document.** Whether bytes follow the signed revision.
   Reported, not judged.
 
+An XAdES `CounterSignature` in a signature's unsigned properties
+holds a complete `ds:Signature` over that signature's
+`ds:SignatureValue` (EN 319 132-1 clause 5.2.7). It is judged as a
+signature in its own right: its references recomputed, its
+SignedProperties reference required, its SigningCertificate binding
+required, its chain, revocation and timestamps judged as any
+signature's, with the evidence of every signature it is nested in
+added to its own, since their `CertificateValues` may carry its path
+(clause 5.4.2). It is its own row, placed after the row of the
+signature it counter-signs and naming that row; a counter-signature
+of a counter-signature names the counter-signature. Counter-signatures
+are judged four levels deep below a signature over the document; a
+deeper one is an unsupported row and nothing below it is read. A
+counter-signature that does not read is an unsupported row naming the
+signature it counter-signs. A counter-signature sits in unsigned
+properties anyone can append to, so, like a timestamp, it decides
+nothing: whatever its own verdict, it changes neither the verdict of
+the signature it counter-signs nor the document's.
+
 A signature is valid when the document is intact, the signature is
 valid, the chain is verified at the validation time, and no revocation
 that invalidates it is known (see Revocation). A signature the verifier
@@ -184,24 +230,29 @@ row saying so, with a typed reason: a PDF subfilter other than the two
 above, a PDF range that does not end a revision, a CMS structure the
 CMS border refuses, a CAdES signature no `ASiCManifest` binds, an
 XAdES feature outside the scope, an XAdES signature without a carried
-signer, one XAdES signature that does not read (its neighbours in the
-same file are still judged), or XAdES signature files that do not
-read.
+signer, one XAdES signature or counter-signature that does not read
+(its neighbours in the same file are still judged), or XAdES
+signature files that do not read.
 
 Each PDF document timestamp is reported with what its token was found
 to be and how far into the file its range reaches. A document
 timestamp credits the signatures whose revision ends where its own
 range starts or earlier.
 
-The document is valid when it has at least one signature, every
-signature is valid, and no signature is unsupported.
+The document is valid when it has at least one signature over the
+document, every such signature is valid, and none of them is
+unsupported; counter-signature rows are reported and do not count.
 
 ## Signer identity
 
-Given names and surname from the subject, else the common name, with
-the serial-number attribute as the identifier when it has the shape of
-a Finnish electronic user identifier. The identifier is a type, never a
-string beside a flag.
+The name is the subject's `commonName` exactly as the certificate
+carries it, never recomposed from `givenName` and `surname` and never
+case-changed; a FINEID certificate's reads surname, given names and
+identifier. A subject without a `commonName` is named by the whole
+subject as RFC 4514 writes it. The `serialNumber` attribute, when it
+has the shape of a Finnish electronic user identifier, is the
+identifier for machine use, and is not appended to the name. The
+identifier is a type, never a string beside a flag.
 
 ## Failures
 
@@ -240,7 +291,7 @@ judged.
 | Id | Controller | Unsafe control action | Hazard | Constraint |
 |---|---|---|---|---|
 | UCA-105 | Verifier | Uses a timestamp's time as the validation time when the timestamp's authority is not anchored. | H-8 | CC-109: only an anchored token sets the validation time; others are reported unproven. |
-| UCA-106 | Verifier | Omits a signature or document timestamp it could not read from the report. | H-8 | CC-110: every signature dictionary, signature timestamp and document timestamp found is reported. A signature the verifier cannot read is a row marked unsupported and blocks the document verdict. A signature timestamp or document timestamp that fails verification, cannot be computed, or is not anchored is reported with what it was found to be and decides nothing: no proof of existence, no verdict. Archive timestamps are counted and reported, never judged and never blocking. |
+| UCA-106 | Verifier | Omits a signature or document timestamp it could not read from the report. | H-8 | CC-110: every signature dictionary, XAdES signature and counter-signature, signature timestamp and document timestamp found is reported. A signature the verifier cannot read is a row marked unsupported and blocks the document verdict; a counter-signature, of any verdict, is a row that decides nothing. A signature timestamp or document timestamp that fails verification, cannot be computed, or is not anchored is reported with what it was found to be and decides nothing: no proof of existence, no verdict. Archive timestamps are counted and reported, never judged and never blocking. |
 | UCA-107 | Verifier | Reports revocation Good from a live answer while the chain is not verified, or Revoked without the revocation time. | H-8 | CC-111: revocation is reported with its evidence time and judged against the proof of existence; a live answer never upgrades a chain the pool did not verify. |
 | UCA-108 | Verifier | Reports a document intact when a reference could not be resolved or canonicalised. | H-8 | CC-112: an unresolvable reference fails the fact. |
 | UCA-109 | Shell | Renders a verdict from anchors or lists that are stale without saying so. | H-8 | CC-113: the report carries the anchors' fetch time; the shell shows it. |
@@ -262,5 +313,8 @@ the report says not valid.
 - ETSI EN 319 142-1 V1.2.1 and 142-2 V1.2.1, PAdES.
 - ETSI EN 319 162-1 V1.1.1, ASiC baseline containers.
 - ETSI TS 119 612, Trusted lists.
-- RFC 3161, RFC 5652, RFC 5280, RFC 6960, RFC 5754, RFC 5758, RFC 5480.
+- W3C Canonical XML 1.0, Canonical XML 1.1, Exclusive XML
+  Canonicalization 1.0, XML Signature Syntax and Processing 1.1.
+- RFC 3161, RFC 5652, RFC 5280, RFC 6960, RFC 5754, RFC 5758, RFC 5480,
+  RFC 4514, RFC 3986.
 - ISO 32000-1, Document management, Portable document format.

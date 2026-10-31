@@ -57,7 +57,8 @@ use self::cades::{CadesReadError, CadesSignature, Content, EssBinding};
 use self::pdf::{ByteRange, PdfDocument, PdfReadError, SignatureKind, SubFilter};
 use self::trust::judge;
 pub use self::trust::{
-    AnchorError, AnchorRole, GrantedPeriod, MaterialPool, Revocation, TrustAnchor, TrustAnchors,
+    AnchorError, AnchorRole, CertificationPath, GrantedPeriod, MaterialPool, Revocation,
+    TrustAnchor, TrustAnchors,
 };
 use self::xades::{XadesReadError, XadesUnsupported, XadesVerdict};
 
@@ -103,56 +104,77 @@ impl DocumentFile {
 /// The holder a signer certificate names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignerIdentity {
-    /// Given names and surname, else the common name.
+    /// The subject's `commonName` as the certificate carries it, else
+    /// the whole subject as RFC 4514 writes it.
     name: String,
     /// The Finnish electronic user identifier.
     identifier: Option<Peuin>,
 }
 
 impl SignerIdentity {
-    /// The holder `certificate`'s subject names: its given names and
-    /// surname when it carries them, else its common name; and the
-    /// `serialNumber` attribute when it has the shape of a Finnish
-    /// electronic user identifier.
+    /// The holder `certificate`'s subject names: its `commonName`
+    /// exactly as encoded, neither recomposed from other attributes nor
+    /// case-changed, or the whole subject as RFC 4514 sec.2 writes it
+    /// when there is no `commonName`; and the `serialNumber` attribute
+    /// when it has the shape of a Finnish electronic user identifier.
     #[must_use]
     pub fn of(certificate: &OwnedCert) -> Self {
         let subject = certificate.view().subject;
-        let given = subject.given_names();
-        let mut parts: Vec<String> = Vec::new();
-        parts.extend(given.first.map(|name| name.as_str().to_owned()));
-        parts.extend(given.second.map(|name| name.as_str().to_owned()));
-        parts.extend(given.additional.iter().map(|name| name.as_str().to_owned()));
-        parts.extend(subject.surname().map(|name| name.as_str().to_owned()));
-        let name = if parts.is_empty() {
-            subject
-                .common_name()
-                .map_or_else(String::new, |name| name.as_str().to_owned())
-        } else {
-            parts.join(" ")
-        };
+        let name = subject.common_name().map_or_else(
+            || subject.rfc4514().unwrap_or_default(),
+            |name| name.as_str().to_owned(),
+        );
         Self {
             name,
             identifier: subject.peuin(),
         }
     }
 
-    /// Given names and surname, else the common name; empty when the
-    /// subject carries neither.
+    /// The subject's `commonName` verbatim, else the RFC 4514 subject;
+    /// empty when the subject is an empty name.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// The Finnish electronic user identifier, on certificates issued
-    /// to a person.
+    /// The Finnish electronic user identifier from the subject's
+    /// `serialNumber`, on certificates issued to a person; for machine
+    /// use, and not part of [`Self::name`].
     #[must_use]
     pub const fn identifier(&self) -> Option<&Peuin> {
         self.identifier.as_ref()
     }
 }
 
+/// The authority behind a timestamp token that verifies: the token's
+/// signer and the certification path judged above it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimestampAuthority {
+    /// The certificate that signed the token.
+    signer: OwnedCert,
+    /// The path above it to a time-stamping anchor, or as far as the
+    /// evidence reaches.
+    chain: CertificationPath,
+}
+
+impl TimestampAuthority {
+    /// The certificate that signed the token.
+    #[must_use]
+    pub const fn signer(&self) -> &OwnedCert {
+        &self.signer
+    }
+
+    /// The certification path above the token's signer, judged at the
+    /// token's time: anchored, its issuer first and the time-stamping
+    /// anchor last, or partial.
+    #[must_use]
+    pub const fn chain(&self) -> &CertificationPath {
+        &self.chain
+    }
+}
+
 /// What one RFC 3161 timestamp token was found to be.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimestampReport {
     /// The token verifies, imprints what it should, and its authority
     /// chains to a time-stamping anchor granted at `time`: it proves
@@ -160,6 +182,8 @@ pub enum TimestampReport {
     Anchored {
         /// `genTime`.
         time: DateTime,
+        /// The token's signer and its path to the anchor.
+        authority: TimestampAuthority,
     },
     /// The token verifies and imprints what it should, but its
     /// authority is not anchored: `time` is what the token claims and
@@ -167,12 +191,14 @@ pub enum TimestampReport {
     Claimed {
         /// `genTime`.
         time: DateTime,
+        /// The token's signer and its path as far as it was built.
+        authority: TimestampAuthority,
     },
     /// The token does not verify, or imprints other data.
     Invalid(TimestampError),
     /// The token is not judged: an `XAdES` timestamp under a
-    /// canonicalisation other than Exclusive XML Canonicalization, or a
-    /// PDF document timestamp whose range does not end a revision.
+    /// canonicalisation this verifier does not compute, or a PDF
+    /// document timestamp whose range does not end a revision.
     Unsupported,
 }
 
@@ -181,8 +207,8 @@ impl TimestampReport {
     /// anchored.
     #[must_use]
     pub const fn proven_time(&self) -> Option<DateTime> {
-        match *self {
-            Self::Anchored { time } => Some(time),
+        match self {
+            Self::Anchored { time, .. } => Some(*time),
             Self::Claimed { .. } | Self::Invalid(_) | Self::Unsupported => None,
         }
     }
@@ -191,6 +217,15 @@ impl TimestampReport {
     #[must_use]
     pub const fn is_verified(&self) -> bool {
         matches!(self, Self::Anchored { .. } | Self::Claimed { .. })
+    }
+
+    /// The token's signer and path, when the token verifies.
+    #[must_use]
+    pub const fn authority(&self) -> Option<&TimestampAuthority> {
+        match self {
+            Self::Anchored { authority, .. } | Self::Claimed { authority, .. } => Some(authority),
+            Self::Invalid(_) | Self::Unsupported => None,
+        }
     }
 }
 
@@ -201,16 +236,15 @@ pub struct SignatureReport {
     signer: SignerIdentity,
     /// The signer certificate.
     signer_certificate: OwnedCert,
-    /// The issuer the chain step was proven against.
-    issuer_certificate: Option<OwnedCert>,
+    /// The certification path above the signer, anchored at the
+    /// validation time or partial.
+    chain: CertificationPath,
     /// Every byte the signature claims to cover digests to the value it
     /// states.
     document_intact: bool,
     /// The signature verifies under the signer's key, bound as the
     /// profile requires.
     signature_valid: bool,
-    /// A path to a certificate-issuing anchor at the validation time.
-    chain_verified: bool,
     /// The earliest time an anchored timestamp proves.
     proof_of_existence: Option<DateTime>,
     /// The signature's own timestamps, in encoded order.
@@ -238,12 +272,13 @@ impl SignatureReport {
         &self.signer_certificate
     }
 
-    /// The certificate that verifiably issued the signer, when the
-    /// evidence holds one: the issuer on the anchored path when there is
-    /// one.
+    /// The certification path above the signer, its issuer first:
+    /// [`CertificationPath::Anchored`], ending in the certificate-issuing
+    /// anchor, when [`Self::chain_verified`]; otherwise
+    /// [`CertificationPath::Partial`], as far as the evidence reaches.
     #[must_use]
-    pub const fn issuer_certificate(&self) -> Option<&OwnedCert> {
-        self.issuer_certificate.as_ref()
+    pub const fn chain(&self) -> &CertificationPath {
+        &self.chain
     }
 
     /// Every byte the signature claims to cover digests to the value
@@ -267,7 +302,7 @@ impl SignatureReport {
     /// valid at that time.
     #[must_use]
     pub const fn chain_verified(&self) -> bool {
-        self.chain_verified
+        self.chain.is_anchored()
     }
 
     /// The earliest time an anchored timestamp proves: a signature
@@ -321,7 +356,7 @@ impl SignatureReport {
     pub fn is_valid(&self) -> bool {
         self.document_intact
             && self.signature_valid
-            && self.chain_verified
+            && self.chain.is_anchored()
             && !self.revocation.revoked_before(self.proof_of_existence)
     }
 
@@ -332,7 +367,7 @@ impl SignatureReport {
     /// the report is returned unchanged.
     #[must_use]
     pub const fn with_live_revocation(mut self, answer: Revocation) -> Self {
-        if self.chain_verified && matches!(self.revocation, Revocation::Unavailable) {
+        if self.chain.is_anchored() && matches!(self.revocation, Revocation::Unavailable) {
             self.revocation = answer;
         }
         self
@@ -363,30 +398,90 @@ pub enum UnsupportedSignature {
     /// An `XAdES` signature whose signing-certificate binding names a
     /// certificate it does not carry, so it has no signer to judge.
     XadesSignerNotCarried,
+    /// An `XAdES` counter-signature nested more than
+    /// [`MAX_COUNTER_SIGNATURE_DEPTH`] levels below the signature over
+    /// the document.
+    CounterSignatureTooDeep,
 }
 
-/// One signature found in the document.
+/// Most levels of `XAdES` counter-signatures judged below a signature
+/// over the document: a counter-signature, its counter-signature, and
+/// so on. EN 319 132-1 clause 5.2.7.2 allows chains of any length; a
+/// real one has one or two levels, and the bound keeps a hostile file
+/// from making the report as deep as its XML.
+pub const MAX_COUNTER_SIGNATURE_DEPTH: usize = 4;
+
+/// What became of one signature found in the document.
 #[derive(Debug, Clone)]
-pub enum SignatureRow {
+pub enum SignatureOutcome {
     /// The signature was judged.
     Judged(SignatureReport),
     /// The signature was found and not judged.
     Unsupported(UnsupportedSignature),
 }
 
+/// One signature found in the document.
+#[derive(Debug, Clone)]
+pub struct SignatureRow {
+    /// Whether it was judged, and the facts or the reason.
+    outcome: SignatureOutcome,
+    /// The row of the signature whose `ds:SignatureValue` this one
+    /// counter-signs, for an `XAdES` counter-signature.
+    counter_signs: Option<usize>,
+}
+
 impl SignatureRow {
+    /// A judged signature that counter-signs nothing.
+    const fn judged(report: SignatureReport) -> Self {
+        Self {
+            outcome: SignatureOutcome::Judged(report),
+            counter_signs: None,
+        }
+    }
+
+    /// A signature found and not judged, that counter-signs nothing.
+    const fn unsupported(reason: UnsupportedSignature) -> Self {
+        Self {
+            outcome: SignatureOutcome::Unsupported(reason),
+            counter_signs: None,
+        }
+    }
+
+    /// This row as the counter-signature of the signature at `row`.
+    fn counter_signing(self, row: Option<usize>) -> Self {
+        Self {
+            counter_signs: row,
+            ..self
+        }
+    }
+
+    /// Whether the signature was judged, and the facts or the reason.
+    #[must_use]
+    pub const fn outcome(&self) -> &SignatureOutcome {
+        &self.outcome
+    }
+
+    /// The index in [`DocumentReport::rows`] of the signature whose
+    /// `ds:SignatureValue` this one counter-signs (`ETSI EN 319 132-1`
+    /// clause 5.2.7); always an earlier row. `None` for a signature
+    /// over the document itself.
+    #[must_use]
+    pub const fn counter_signs(&self) -> Option<usize> {
+        self.counter_signs
+    }
+
     /// Whether the signature was judged and is valid.
     #[must_use]
     pub fn is_valid(&self) -> bool {
-        match self {
-            Self::Judged(report) => report.is_valid(),
-            Self::Unsupported(_) => false,
+        match &self.outcome {
+            SignatureOutcome::Judged(report) => report.is_valid(),
+            SignatureOutcome::Unsupported(_) => false,
         }
     }
 }
 
 /// One PDF document timestamp (`ETSI EN 319 142-1` clause 5.4.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentTimestampReport {
     /// What the token was found to be.
     timestamp: TimestampReport,
@@ -397,8 +492,8 @@ pub struct DocumentTimestampReport {
 impl DocumentTimestampReport {
     /// What the token was found to be.
     #[must_use]
-    pub const fn timestamp(&self) -> TimestampReport {
-        self.timestamp
+    pub const fn timestamp(&self) -> &TimestampReport {
+        &self.timestamp
     }
 
     /// One past the last byte its range covers: the revisions it
@@ -440,12 +535,19 @@ impl DocumentReport {
         self.anchors_fetched_at
     }
 
-    /// Whether the document is valid: it has at least one signature,
-    /// and every signature was judged and is valid. A document
-    /// timestamp that does not verify is reported and decides nothing.
+    /// Whether the document is valid: it has at least one signature
+    /// over the document itself, and every such signature was judged
+    /// and is valid. A document timestamp that does not verify, and an
+    /// `XAdES` counter-signature of any verdict, are reported and decide
+    /// nothing: both sit in unsigned material anyone can append to.
     #[must_use]
     pub fn is_valid(&self) -> bool {
-        !self.rows.is_empty() && self.rows.iter().all(SignatureRow::is_valid)
+        let mut signatures = self
+            .rows
+            .iter()
+            .filter(|row| row.counter_signs.is_none())
+            .peekable();
+        signatures.peek().is_some() && signatures.all(SignatureRow::is_valid)
     }
 
     /// This report with live revocation answers: `ask` is called for
@@ -458,8 +560,8 @@ impl DocumentReport {
         mut ask: impl FnMut(&SignatureReport) -> Revocation,
     ) -> Self {
         for row in &mut self.rows {
-            if let SignatureRow::Judged(report) = row
-                && report.chain_verified
+            if let SignatureOutcome::Judged(report) = &mut row.outcome
+                && report.chain.is_anchored()
                 && report.revocation == Revocation::Unavailable
             {
                 report.revocation = ask(report);
@@ -642,10 +744,15 @@ impl Context<'_> {
                 now: self.now,
             },
         );
-        if chain.anchored && !chain.revocation.revoked_before(Some(time)) {
-            TimestampReport::Anchored { time }
+        let anchored = chain.path.is_anchored();
+        let authority = TimestampAuthority {
+            signer: verified.signer_certificate().clone(),
+            chain: chain.path,
+        };
+        if anchored && !chain.revocation.revoked_before(Some(time)) {
+            TimestampReport::Anchored { time, authority }
         } else {
-            TimestampReport::Claimed { time }
+            TimestampReport::Claimed { time, authority }
         }
     }
 
@@ -687,10 +794,9 @@ impl Context<'_> {
         SignatureReport {
             signer: SignerIdentity::of(&facts.signer),
             signer_certificate: facts.signer,
-            issuer_certificate: chain.issuer,
+            chain: chain.path,
             document_intact: facts.document_intact,
             signature_valid: facts.signature_valid,
-            chain_verified: chain.anchored,
             proof_of_existence,
             timestamps,
             archive_timestamps: facts.archive_timestamps,
@@ -746,7 +852,7 @@ impl Context<'_> {
                 SignatureKind::Signature(SubFilter::EtsiCadesDetached) => EssBinding::Required,
                 SignatureKind::Signature(SubFilter::AdbePkcs7Detached) => EssBinding::NotRequired,
                 SignatureKind::Signature(SubFilter::EtsiRfc3161 | SubFilter::Other) => {
-                    rows.push(SignatureRow::Unsupported(
+                    rows.push(SignatureRow::unsupported(
                         UnsupportedSignature::PdfSubFilter,
                     ));
                     continue;
@@ -754,7 +860,7 @@ impl Context<'_> {
                 SignatureKind::DocumentTimestamp => continue,
             };
             if !found.ends_revision() {
-                rows.push(SignatureRow::Unsupported(
+                rows.push(SignatureRow::unsupported(
                     UnsupportedSignature::PdfRangeNotARevision,
                 ));
                 continue;
@@ -762,7 +868,7 @@ impl Context<'_> {
             let signature = match CadesSignature::parse(found.cms()) {
                 Ok(signature) => signature,
                 Err(error) => {
-                    rows.push(SignatureRow::Unsupported(UnsupportedSignature::Cms(error)));
+                    rows.push(SignatureRow::unsupported(UnsupportedSignature::Cms(error)));
                     continue;
                 }
             };
@@ -783,7 +889,7 @@ impl Context<'_> {
                 .filter(|(_, stamp_range)| stamp_range.hole().start >= range.end())
                 .filter_map(|(stamp, _)| stamp.timestamp.proven_time())
                 .collect();
-            rows.push(SignatureRow::Judged(self.report(Facts {
+            rows.push(SignatureRow::judged(self.report(Facts {
                 signer: signature.signer_certificate().clone(),
                 document_intact: verdict.document_intact,
                 signature_valid: verdict.signature_valid && !baseline_time_attribute,
@@ -818,17 +924,12 @@ impl Context<'_> {
         let mut rows = Vec::new();
         if !container.xades_signature_files().is_empty() {
             match xades::signatures(&container) {
-                Err(error) => rows.push(SignatureRow::Unsupported(
+                Err(error) => rows.push(SignatureRow::unsupported(
                     UnsupportedSignature::XadesFile(error),
                 )),
                 Ok(signatures) => {
-                    for signature in signatures {
-                        rows.push(match signature {
-                            Ok(signature) => self.xades_row(&container, &signature),
-                            Err(error) => SignatureRow::Unsupported(
-                                UnsupportedSignature::XadesMalformed(error),
-                            ),
-                        });
+                    for signature in &signatures {
+                        self.push_xades_rows(&container, signature, &[], &mut rows);
                     }
                 }
             }
@@ -839,24 +940,77 @@ impl Context<'_> {
         Ok(rows)
     }
 
-    /// The row of one `XAdES` signature.
+    /// The row of one `XAdES` signature, then the rows of its
+    /// counter-signatures, each naming the row it counter-signs.
+    /// `enclosing` holds the signatures this one is nested in, the
+    /// outermost first, each with its row; the last is the one it
+    /// counter-signs. Past [`MAX_COUNTER_SIGNATURE_DEPTH`] levels a
+    /// counter-signature is an unsupported row and its own
+    /// counter-signatures are not read.
+    fn push_xades_rows(
+        &self,
+        container: &AsicContainer,
+        signature: &Result<xades::XadesSignature, XadesReadError>,
+        enclosing: &[(usize, &xades::XadesSignature)],
+        rows: &mut Vec<SignatureRow>,
+    ) {
+        let row = rows.len();
+        let counter_signs = enclosing.last().map(|(row, _)| *row);
+        if enclosing.len() > MAX_COUNTER_SIGNATURE_DEPTH {
+            rows.push(
+                SignatureRow::unsupported(UnsupportedSignature::CounterSignatureTooDeep)
+                    .counter_signing(counter_signs),
+            );
+            return;
+        }
+        match signature {
+            Ok(signature) => {
+                let outer: Vec<&xades::XadesSignature> =
+                    enclosing.iter().map(|(_, outer)| *outer).collect();
+                rows.push(
+                    self.xades_row(container, signature, &outer)
+                        .counter_signing(counter_signs),
+                );
+                let mut nested = enclosing.to_vec();
+                nested.push((row, signature));
+                for counter_signature in signature.counter_signatures() {
+                    self.push_xades_rows(container, counter_signature, &nested, rows);
+                }
+            }
+            Err(error) => rows.push(
+                SignatureRow::unsupported(UnsupportedSignature::XadesMalformed(*error))
+                    .counter_signing(counter_signs),
+            ),
+        }
+    }
+
+    /// The row of one `XAdES` signature. A counter-signature's evidence
+    /// includes that of every signature in `enclosing`, the signatures
+    /// it is nested in, whose `CertificateValues` and `RevocationValues`
+    /// may carry the counter-signer's path (`ETSI EN 319 132-1` clause
+    /// 5.4.2).
     fn xades_row(
         &self,
         container: &AsicContainer,
         signature: &xades::XadesSignature,
+        enclosing: &[&xades::XadesSignature],
     ) -> SignatureRow {
         let judgement = match signature.verify(container) {
             XadesVerdict::Unsupported(unsupported) => {
-                return SignatureRow::Unsupported(UnsupportedSignature::Xades(unsupported));
+                return SignatureRow::unsupported(UnsupportedSignature::Xades(unsupported));
             }
             XadesVerdict::Judged(judgement) => judgement,
         };
         let Some(signer) = signature.signer_certificate() else {
-            return SignatureRow::Unsupported(UnsupportedSignature::XadesSignerNotCarried);
+            return SignatureRow::unsupported(UnsupportedSignature::XadesSignerNotCarried);
         };
         let mut pool = self.anchor_pool();
         pool.add_material(signature.embedded_material());
         pool.add_certificate_ders(signature.embedded_certificates());
+        for outer in enclosing {
+            pool.add_material(outer.embedded_material());
+            pool.add_certificate_ders(outer.embedded_certificates());
+        }
         let timestamps = signature
             .signature_timestamps()
             .iter()
@@ -868,7 +1022,7 @@ impl Context<'_> {
                 None => Timestamp::Uncomputable,
             })
             .collect();
-        SignatureRow::Judged(self.report(Facts {
+        SignatureRow::judged(self.report(Facts {
             signer: signer.clone(),
             document_intact: judgement.document_intact(),
             signature_valid: judgement.signature_valid(),
@@ -884,10 +1038,10 @@ impl Context<'_> {
     fn asic_cades_row(&self, container: &AsicContainer, entry: &asic::CadesEntry) -> SignatureRow {
         let signature = match CadesSignature::parse(entry.signature().content()) {
             Ok(signature) => signature,
-            Err(error) => return SignatureRow::Unsupported(UnsupportedSignature::Cms(error)),
+            Err(error) => return SignatureRow::unsupported(UnsupportedSignature::Cms(error)),
         };
         let Some(manifest) = entry.manifest() else {
-            return SignatureRow::Unsupported(UnsupportedSignature::CadesWithoutManifest);
+            return SignatureRow::unsupported(UnsupportedSignature::CadesWithoutManifest);
         };
         let verdict = signature.verify(
             Content::Detached {
@@ -897,7 +1051,7 @@ impl Context<'_> {
         );
         let mut pool = self.anchor_pool();
         pool.add_material(signature.embedded_material());
-        SignatureRow::Judged(self.report(Facts {
+        SignatureRow::judged(self.report(Facts {
             signer: signature.signer_certificate().clone(),
             document_intact: verdict.document_intact && container.manifest_intact(entry),
             signature_valid: verdict.signature_valid,
@@ -922,7 +1076,7 @@ impl Context<'_> {
         let verdict = signature.verify(Content::Attached, EssBinding::Required);
         let mut pool = self.anchor_pool();
         pool.add_material(signature.embedded_material());
-        Ok(SignatureRow::Judged(self.report(Facts {
+        Ok(SignatureRow::judged(self.report(Facts {
             signer: signature.signer_certificate().clone(),
             document_intact: verdict.document_intact,
             signature_valid: verdict.signature_valid,

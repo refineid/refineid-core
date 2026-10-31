@@ -231,7 +231,7 @@ pub(super) fn push_stream_close(
     size: u32,
     catalog: PdfObjectReference,
     previous_xref: usize,
-    carried: &str,
+    carried: &[u8],
 ) -> Result<(), PdfError> {
     let stream_number = size;
     let mut entries: Vec<(PdfObjectReference, usize)> = offsets.to_vec();
@@ -248,17 +248,25 @@ pub(super) fn push_stream_close(
         rows.extend_from_slice(&reference.generation.to_be_bytes());
     }
     let catalog_number = catalog.rendered();
-    let head = format!(
-        "{stream_number} 0 obj\n<< /Type /XRef /Size {} /Root {catalog_number} \
-         /Prev {previous_xref}{carried} /Index [ {index}] /W [{} {} {}] /Length {} \
-         >>\nstream\n",
-        stream_number.saturating_add(1),
-        WRITTEN_WIDTHS[0],
-        WRITTEN_WIDTHS[1],
-        WRITTEN_WIDTHS[2],
-        rows.len()
+    update.extend_from_slice(
+        format!(
+            "{stream_number} 0 obj\n<< /Type /XRef /Size {} /Root {catalog_number} \
+             /Prev {previous_xref}",
+            stream_number.saturating_add(1),
+        )
+        .as_bytes(),
     );
-    update.extend_from_slice(head.as_bytes());
+    update.extend_from_slice(carried);
+    update.extend_from_slice(
+        format!(
+            " /Index [ {index}] /W [{} {} {}] /Length {} >>\nstream\n",
+            WRITTEN_WIDTHS[0],
+            WRITTEN_WIDTHS[1],
+            WRITTEN_WIDTHS[2],
+            rows.len()
+        )
+        .as_bytes(),
+    );
     update.extend_from_slice(&rows);
     update.extend_from_slice(
         format!("\nendstream\nendobj\nstartxref\n{xref_at}\n%%EOF\n").as_bytes(),

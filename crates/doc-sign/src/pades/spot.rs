@@ -38,9 +38,16 @@
 //! more than one small enough for the very corner.
 
 use super::index::{
-    PdfDictionary, PdfIndex, PdfObjectReference, PdfValueParser, complete_object_reference,
-    complete_reference_array, parse_usize, validation_references,
+    COMMENT_MARK, HEX_RADIX, NAME_ESCAPE, NAME_ESCAPE_LEN, PdfDictionary, PdfIndex,
+    PdfObjectReference, PdfValueParser, complete_object_reference, complete_reference_array,
+    parse_usize, validation_references,
 };
+
+/// Whether `byte` is PDF white space: the one definition in
+/// [`PdfValueParser::is_whitespace`] (ISO 32000-1 sec.7.2.2 Table 1).
+const fn is_whitespace(byte: &u8) -> bool {
+    PdfValueParser::is_whitespace(*byte)
+}
 
 /// How far the search moves between candidate positions, in points.
 const SEARCH_STEP: f64 = 6.0;
@@ -212,7 +219,7 @@ fn stream_data(index: &PdfIndex<'_>, reference: PdfObjectReference) -> Option<Ve
     parser.skip_trivia();
     let dictionary = parser.dictionary(1).ok()?;
     let mut cursor = parser.offset;
-    while body.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+    while body.get(cursor).is_some_and(is_whitespace) {
         cursor = cursor.saturating_add(1);
     }
     if !body.get(cursor..)?.starts_with(b"stream") {
@@ -262,11 +269,11 @@ fn stream_length(index: &PdfIndex<'_>, body: &[u8], dictionary: &PdfDictionary) 
 fn trim(bytes: &[u8]) -> &[u8] {
     let start = bytes
         .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
+        .position(|byte| !is_whitespace(byte))
         .unwrap_or(bytes.len());
     let end = bytes
         .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
+        .rposition(|byte| !is_whitespace(byte))
         .map_or(start, |at| at.saturating_add(1));
     &bytes[start..end]
 }
@@ -280,10 +287,9 @@ fn numbers_in(value: &[u8]) -> Option<Vec<f64>> {
     {
         inner = stripped;
     }
-    let text = core::str::from_utf8(inner).ok()?;
     let mut numbers = Vec::new();
-    for token in text.split_ascii_whitespace() {
-        let number: f64 = token.parse().ok()?;
+    for token in inner.split(is_whitespace).filter(|token| !token.is_empty()) {
+        let number: f64 = core::str::from_utf8(token).ok()?.parse().ok()?;
         if !number.is_finite() {
             return None;
         }
@@ -773,9 +779,9 @@ impl Tokens<'_> {
 
     fn skip_trivia(&mut self) {
         while let Some(&byte) = self.bytes.get(self.offset) {
-            if byte.is_ascii_whitespace() {
+            if is_whitespace(&byte) {
                 self.offset = self.offset.saturating_add(1);
-            } else if byte == b'%' {
+            } else if byte == COMMENT_MARK {
                 while self
                     .bytes
                     .get(self.offset)
@@ -849,7 +855,7 @@ impl Tokens<'_> {
             if byte == b'>' {
                 return Some(Operand::Text(digits.div_ceil(2)));
             }
-            if byte.is_ascii_hexdigit() {
+            if PdfValueParser::hex_digit(byte).is_some() {
                 digits = digits.saturating_add(1);
             }
         }
@@ -869,23 +875,23 @@ impl Tokens<'_> {
     fn name(&mut self) -> Vec<u8> {
         let mut decoded = Vec::new();
         while let Some(&byte) = self.bytes.get(self.offset) {
-            if byte.is_ascii_whitespace() || is_delimiter(byte) {
+            if is_whitespace(&byte) || PdfValueParser::is_delimiter(byte) {
                 break;
             }
-            if byte == b'#' {
+            if byte == NAME_ESCAPE {
                 let high = self
                     .bytes
                     .get(self.offset.saturating_add(1))
                     .copied()
-                    .and_then(hex_digit);
+                    .and_then(PdfValueParser::hex_digit);
                 let low = self
                     .bytes
                     .get(self.offset.saturating_add(2))
                     .copied()
-                    .and_then(hex_digit);
+                    .and_then(PdfValueParser::hex_digit);
                 if let (Some(high), Some(low)) = (high, low) {
-                    decoded.push(high.saturating_mul(16).saturating_add(low));
-                    self.offset = self.offset.saturating_add(3);
+                    decoded.push(high.saturating_mul(HEX_RADIX).saturating_add(low));
+                    self.offset = self.offset.saturating_add(NAME_ESCAPE_LEN);
                     continue;
                 }
             }
@@ -901,7 +907,7 @@ impl Tokens<'_> {
         while self
             .bytes
             .get(self.offset)
-            .is_some_and(|byte| !byte.is_ascii_whitespace() && !is_delimiter(*byte))
+            .is_some_and(|byte| !is_whitespace(byte) && !PdfValueParser::is_delimiter(*byte))
         {
             self.offset = self.offset.saturating_add(1);
         }
@@ -917,22 +923,6 @@ impl Tokens<'_> {
             Some(_) => None,
             None => Some(Token::Operator(atom.to_vec())),
         }
-    }
-}
-
-const fn is_delimiter(byte: u8) -> bool {
-    matches!(
-        byte,
-        b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
-    )
-}
-
-const fn hex_digit(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
     }
 }
 

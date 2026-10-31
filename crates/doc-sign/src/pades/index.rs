@@ -59,13 +59,13 @@ const NUL: u8 = 0x00;
 
 /// Opens a comment, which runs to the end of the line (ISO 32000-1
 /// sec.7.2.3).
-const COMMENT_MARK: u8 = b'%';
+pub(crate) const COMMENT_MARK: u8 = b'%';
 
 /// The FORM FEED white-space character (ISO 32000-1 sec.7.2.2, Table 1).
 const FORM_FEED: u8 = 0x0C;
 
 /// Radix of a hexadecimal digit pair in a name escape or hex string.
-const HEX_RADIX: u8 = 16;
+pub(crate) const HEX_RADIX: u8 = 16;
 
 /// Value of the first hexadecimal letter digit, `A`.
 const HEX_LETTER_VALUE: u8 = 10;
@@ -74,10 +74,10 @@ const HEX_LETTER_VALUE: u8 = 10;
 const DECIMAL_RADIX: usize = 10;
 
 /// Bytes of a `#xx` name escape (ISO 32000-1 sec.7.3.5).
-const NAME_ESCAPE_LEN: usize = 3;
+pub(crate) const NAME_ESCAPE_LEN: usize = 3;
 
 /// Introduces a `#xx` escape inside a name.
-const NAME_ESCAPE: u8 = b'#';
+pub(crate) const NAME_ESCAPE: u8 = b'#';
 
 /// Introduces a name (ISO 32000-1 sec.7.3.5).
 const NAME_OPEN: &[u8] = b"/";

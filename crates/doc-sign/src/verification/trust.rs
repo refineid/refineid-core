@@ -285,17 +285,44 @@ pub struct MaterialPool {
     seen: HashSet<[u8; SHA256_LEN]>,
 }
 
+/// The certification path above a judged certificate, its issuer
+/// first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CertificationPath {
+    /// A path ends in an anchor of the requested role granted at the
+    /// validation time, the judged certificate is valid then and fit
+    /// for the role, and every certificate below the anchor is valid
+    /// then: the best such path, the anchor last. Empty when the judged
+    /// certificate is itself the anchor.
+    Anchored(Vec<OwnedCert>),
+    /// No such path: the certificates as far as verifiable issuers in
+    /// the evidence reach, or, when the judged certificate itself is
+    /// not valid or not fit, the path to the anchor it would have had.
+    /// Empty when nothing in the evidence issued it.
+    Partial(Vec<OwnedCert>),
+}
+
+impl CertificationPath {
+    /// Whether the path is anchored.
+    #[must_use]
+    pub const fn is_anchored(&self) -> bool {
+        matches!(self, Self::Anchored(_))
+    }
+
+    /// The certificates, the judged certificate's issuer first.
+    #[must_use]
+    pub fn certificates(&self) -> &[OwnedCert] {
+        match self {
+            Self::Anchored(certificates) | Self::Partial(certificates) => certificates,
+        }
+    }
+}
+
 /// What the pool says about one certificate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainVerdict {
-    /// The certificate that verifiably issued the judged one, when one
-    /// in the pool did: the issuer on the anchored path when there is
-    /// one.
-    pub issuer: Option<OwnedCert>,
-    /// Whether a path ends in an anchor of the requested role granted
-    /// at the validation time, every certificate below the anchor valid
-    /// at that time.
-    pub anchored: bool,
+    /// The path above the judged certificate, anchored or partial.
+    pub path: CertificationPath,
     /// The revocation status of the anchored path, or of the judged
     /// certificate alone against its issuer when there is no path.
     pub revocation: Revocation,
@@ -484,6 +511,34 @@ impl MaterialPool {
             .collect()
     }
 
+    /// The path above `certificate` as far as it goes without reaching
+    /// an anchor: at each step the first pool certificate that
+    /// verifiably issued the one below and is not yet on the path, up to
+    /// [`MAX_PATH_DEPTH`] certificates.
+    fn partial_path(&self, certificate: &OwnedCert, step: &Step<'_>) -> Vec<OwnedCert> {
+        let mut path: Vec<OwnedCert> = Vec::new();
+        let mut top = certificate.clone();
+        while path.len() < MAX_PATH_DEPTH {
+            let below = Step {
+                intermediates_below: path.len(),
+                ..*step
+            };
+            let Some(issuer) = self
+                .issuers_of(top.view(), &below)
+                .into_iter()
+                .find(|issuer| {
+                    issuer.as_der() != certificate.as_der()
+                        && !path.iter().any(|seen| seen.as_der() == issuer.as_der())
+                })
+            else {
+                break;
+            };
+            top = issuer.clone();
+            path.push(top.clone());
+        }
+        path
+    }
+
     /// Every path from the last certificate of `path` upward to an
     /// anchor, each running from the judged certificate to the anchor,
     /// appended to `found` until it holds [`MAX_ANCHORED_PATHS`].
@@ -645,17 +700,17 @@ const MAX_ANCHORED_PATHS: usize = 16;
 /// Judge `certificate` against `pool` and `anchors` for `role` at the
 /// validation time `when.at`.
 ///
-/// `issuer` is reported whenever a pool certificate verifiably issued
-/// the certificate, anchored or not; `anchored` additionally needs the
+/// `path` is reported whenever a pool certificate verifiably issued the
+/// certificate, anchored or not; `anchored` additionally needs the
 /// certificate valid at `at`, fit for the role, and a path ending in an
 /// anchor for `role` granted at `at`. Every anchored path is judged and
 /// the best revocation status kept (RFC 5280 sec.6 accepts any valid
 /// path): good, then unavailable, then revoked. A certificate that is
 /// itself such an anchor is anchored by its granted period alone, with
 /// nothing below it to check for revocation. Without an anchored path
-/// only the certificate is checked, against `issuer`. The status is
-/// [`Revocation::Unavailable`] without an issuer: no unverified answer
-/// is ever reported.
+/// only the certificate is checked, against the first issuer of the
+/// partial path. The status is [`Revocation::Unavailable`] without an
+/// issuer: no unverified answer is ever reported.
 ///
 /// A document signer, judged for [`AnchorRole::CertificateIssuing`],
 /// is fit when it is no CA, its Key Usage, when present, asserts
@@ -675,8 +730,7 @@ pub fn judge(
     let at = when.at;
     if anchors.is_anchor(view, role, at) {
         return ChainVerdict {
-            issuer: None,
-            anchored: true,
+            path: CertificationPath::Anchored(Vec::new()),
             revocation: Revocation::Unavailable,
         };
     }
@@ -690,7 +744,6 @@ pub fn judge(
         at,
         intermediates_below: 0,
     };
-    let candidates = pool.issuers_of(view, &step);
     let mut paths = Vec::new();
     let mut path = vec![certificate.clone()];
     pool.anchored_paths(anchors, role, at, &mut path, &mut paths);
@@ -698,19 +751,24 @@ pub fn judge(
         .iter()
         .map(|path| (path, pool.path_revocation(path, when)))
         .max_by_key(|(_, revocation)| revocation.preference());
-    let (issuer, revocation) = match best {
-        Some((path, revocation)) => (path.get(1).cloned(), revocation),
+    let (path, revocation) = match best {
+        Some((path, revocation)) => (path.get(1..).unwrap_or_default().to_vec(), revocation),
         None => {
-            let issuer = candidates.first().copied().cloned();
-            let revocation = issuer.as_ref().map_or(Revocation::Unavailable, |issuer| {
+            let path = pool.partial_path(certificate, &step);
+            let revocation = path.first().map_or(Revocation::Unavailable, |issuer| {
                 pool.revocation_of(view, issuer.view(), when)
             });
-            (issuer, revocation)
+            (path, revocation)
         }
     };
+    let anchored = valid_at(view, at) && fit && best.is_some();
     ChainVerdict {
-        issuer,
-        anchored: valid_at(view, at) && fit && best.is_some(),
+        path: if anchored {
+            CertificationPath::Anchored(path)
+        } else {
+            CertificationPath::Partial(path)
+        },
+
         revocation,
     }
 }
@@ -1082,12 +1140,23 @@ mod tests {
             AnchorRole::CertificateIssuing,
             at(VALIDATED),
         );
-        assert!(verdict.anchored);
+        assert!(verdict.path.is_anchored());
         assert_eq!(
-            verdict.issuer.map(OwnedCert::into_der),
-            Some(chain.intermediate.clone())
+            der_path(&verdict),
+            [chain.intermediate.clone(), chain.root.clone()],
+            "the issuer first, the anchor last"
         );
         assert_eq!(verdict.revocation, Revocation::Unavailable);
+    }
+
+    /// The certificates of `verdict`'s path, as DER.
+    fn der_path(verdict: &super::ChainVerdict) -> Vec<Vec<u8>> {
+        verdict
+            .path
+            .certificates()
+            .iter()
+            .map(|certificate| certificate.as_der().to_vec())
+            .collect()
     }
 
     #[test]
@@ -1112,7 +1181,8 @@ mod tests {
                 issuing_role,
                 When { at, now: at }
             )
-            .anchored
+            .path
+            .is_anchored()
         );
 
         let lapsed = TrustAnchors::new(vec![
@@ -1131,7 +1201,8 @@ mod tests {
                 issuing_role,
                 When { at, now: at }
             )
-            .anchored
+            .path
+            .is_anchored()
         );
         assert!(
             judge(
@@ -1141,7 +1212,8 @@ mod tests {
                 issuing_role,
                 self::at(EARLY)
             )
-            .anchored
+            .path
+            .is_anchored()
         );
     }
 
@@ -1175,7 +1247,7 @@ mod tests {
             AnchorRole::CertificateIssuing,
             at(VALIDATED),
         );
-        assert!(verdict.anchored);
+        assert!(verdict.path.is_anchored());
     }
 
     #[test]
@@ -1210,10 +1282,11 @@ mod tests {
             AnchorRole::CertificateIssuing,
             at(VALIDATED),
         );
-        assert!(!verdict.anchored);
+        assert!(!verdict.path.is_anchored());
         assert_eq!(
-            verdict.issuer.map(OwnedCert::into_der),
-            Some(chain.intermediate.clone())
+            der_path(&verdict),
+            [chain.intermediate.clone(), chain.root.clone()],
+            "the partial path as far as the pool reaches"
         );
     }
 
@@ -1227,8 +1300,8 @@ mod tests {
             AnchorRole::CertificateIssuing,
             at(VALIDATED),
         );
-        assert!(!verdict.anchored);
-        assert!(verdict.issuer.is_none());
+        assert!(!verdict.path.is_anchored());
+        assert!(verdict.path.certificates().is_empty());
         assert_eq!(verdict.revocation, Revocation::Unavailable);
     }
 
@@ -1242,8 +1315,8 @@ mod tests {
             AnchorRole::CertificateIssuing,
             at(VALIDATED),
         );
-        assert!(!verdict.anchored);
-        assert!(verdict.issuer.is_some());
+        assert!(!verdict.path.is_anchored());
+        assert!(!verdict.path.certificates().is_empty());
     }
 
     #[test]
@@ -1262,8 +1335,8 @@ mod tests {
             AnchorRole::CertificateIssuing,
             at(VALIDATED),
         );
-        assert!(!verdict.anchored);
-        assert!(verdict.issuer.is_none());
+        assert!(!verdict.path.is_anchored());
+        assert!(verdict.path.certificates().is_empty());
     }
 
     #[test]
@@ -1306,9 +1379,17 @@ mod tests {
         let anchors = issuing(&chain.root);
         let at = day(VALIDATED);
         let role = AnchorRole::CertificateIssuing;
-        assert!(judge(&chain.signer, &pool, &anchors, role, When { at, now: at }).anchored);
+        assert!(
+            judge(&chain.signer, &pool, &anchors, role, When { at, now: at })
+                .path
+                .is_anchored()
+        );
         let deep = OwnedCert::from_der(&deep_signer).expect("signer parses");
-        assert!(!judge(&deep, &pool, &anchors, role, When { at, now: at }).anchored);
+        assert!(
+            !judge(&deep, &pool, &anchors, role, When { at, now: at })
+                .path
+                .is_anchored()
+        );
     }
 
     #[test]
@@ -1331,7 +1412,7 @@ mod tests {
             AnchorRole::CertificateIssuing,
             at(VALIDATED),
         );
-        assert!(!verdict.anchored);
+        assert!(!verdict.path.is_anchored());
     }
 
     #[test]
@@ -1457,7 +1538,7 @@ mod tests {
             AnchorRole::CertificateIssuing,
             at(VALIDATED),
         );
-        assert!(verdict.anchored);
+        assert!(verdict.path.is_anchored());
         assert_eq!(
             verdict.revocation,
             Revocation::Revoked {
@@ -1501,7 +1582,7 @@ mod tests {
             AnchorRole::CertificateIssuing,
             at(VALIDATED),
         );
-        assert!(verdict.anchored);
+        assert!(verdict.path.is_anchored());
         assert_eq!(verdict.revocation, Revocation::Unavailable);
         assert_eq!(
             signer_revocation(&chain, &pool, VALIDATED),
@@ -1583,8 +1664,8 @@ mod tests {
                 AnchorRole::CertificateIssuing,
                 at(VALIDATED),
             );
-            assert!(!verdict.anchored);
-            assert!(verdict.issuer.is_none());
+            assert!(!verdict.path.is_anchored());
+            assert!(verdict.path.certificates().is_empty());
         }
     }
 
@@ -1660,7 +1741,8 @@ mod tests {
                 AnchorRole::CertificateIssuing,
                 at(VALIDATED),
             )
-            .anchored
+            .path
+            .is_anchored()
         };
         let non_repudiation = key_usage(
             crate::testkit::KEY_USAGE_NON_REPUDIATION_UNUSED,
@@ -1728,10 +1810,15 @@ mod tests {
             AnchorRole::CertificateIssuing,
             at(VALIDATED),
         );
-        assert!(verdict.anchored);
+        assert!(verdict.path.is_anchored());
         assert_eq!(verdict.revocation, Revocation::Good { at: day(ANSWERED) });
         assert_eq!(
-            verdict.issuer.map(OwnedCert::into_der),
+            verdict
+                .path
+                .certificates()
+                .first()
+                .cloned()
+                .map(OwnedCert::into_der),
             Some(chain.intermediate.clone())
         );
     }

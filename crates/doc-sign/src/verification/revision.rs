@@ -2,44 +2,57 @@
 //! What the revisions after a signed one change in a PDF.
 //!
 //! A signature covers the revision its `/ByteRange` ends; anyone may
-//! append revisions after it. The verifier indexes the signed
-//! revision on its own and compares its objects with the newest view
-//! of the document, object by object, through the cross-reference
-//! index. An object that is the same value in both is untouched. Of the
-//! rest, a later revision may add, without changing what the signer
+//! append revisions after it. The verifier indexes the signed revision
+//! on its own and compares it with the newest view of the document:
+//! the trailers, the interactive form's field tree, each page's
+//! `/Annots`, the `/DSS`, and every object by its number, each object
+//! parsed once per view. An object that is the same value in both is
+//! untouched. A later revision may, without changing what the signer
 //! saw:
 //!
-//! - signature and document timestamp dictionaries, the signature
-//!   fields and widgets that hold them, and new objects their
+//! - add signature fields and widgets that carry a signature (`/V`),
+//!   attached to the form's field tree and, for a widget, to a page's
+//!   `/Annots` after the annotations already there; the signature and
+//!   document timestamp dictionaries they name; and new objects their
 //!   appearance streams draw from;
-//! - the `/DSS` and the objects it reaches;
-//! - cross-reference and object streams;
-//! - the document information dictionary and the catalog's `/Metadata`
-//!   stream, which signing tools update and which change nothing
-//!   rendered;
-//! - the catalog rewritten with a changed `/DSS`, `/AcroForm`,
-//!   `/Perms`, `/Extensions` or `/Metadata`, an `/AcroForm` whose `/Fields` gains
-//!   signature fields and whose `/SigFlags`, `/DA` or `/DR` change, and
-//!   a page whose `/Annots` gains signature widgets.
+//! - give an existing signature field without a value its `/V`, `/AP`
+//!   and `/AS`;
+//! - grow the `/DSS`: new streams in its `/Certs`, `/OCSPs` and
+//!   `/CRLs`, and new `/VRI` entries;
+//! - add cross-reference and object streams;
+//! - change the document information dictionary and the catalog's
+//!   `/Metadata` stream, which signing tools update and which change
+//!   nothing rendered;
+//! - rewrite the catalog only in `/DSS`, `/AcroForm`, `/Extensions` and
+//!   `/Metadata`, the interactive form only in `/Fields` and
+//!   `/SigFlags`, and the trailer anywhere but `/Root` and the first,
+//!   permanent `/ID` element.
 //!
-//! Anything else is a change after signing, typed by what it touches.
+//! Anything else, a new object that is none of these included, is a
+//! change after signing, typed by what it touches.
 //!
 //! # Conformance
 //!
 //! - ISO 32000-1 sec.7.5.6: an incremental update appends changed and
-//!   new objects with a cross-reference section of its own.
+//!   new objects with a cross-reference section of its own. Objects
+//!   are compared by number: one whose generation rises replaces the
+//!   freed one, and since the signed revision's references to it no
+//!   longer resolve, it is a change.
 //! - ISO 32000-1 sec.12.8.2.2 (`DocMDP`) and sec.12.8.2.4
 //!   (`FieldMDP`): the changes a signature may be followed by are
 //!   signing, filling in signature fields, and adding document-level
 //!   validation material; `ETSI EN 319 142-1` V1.2.1 clauses 5.4.2 and
 //!   5.4.3 add the `/DSS` and document timestamps.
-//! - ISO 32000-1 sec.12.7.3.1: a field inherits `/FT` from its parent;
-//!   sec.12.5.2: an annotation is a dictionary with `/Subtype` and
-//!   `/Rect`.
+//! - ISO 32000-1 sec.12.7.3.1: a field inherits `/FT` from its parent,
+//!   and `/Kids` holds its children; sec.12.5.2: an annotation is a
+//!   dictionary with `/Subtype` and `/Rect`, drawn in `/Annots` order.
+//! - ISO 32000-1 sec.14.4: the first `/ID` element is permanent; the
+//!   second changes with each update.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::pades::index::{PdfDictionary, PdfIndex, PdfObjectReference, PdfValueParser};
+use crate::pades::index::{MAX_XREF_ENTRIES, PdfIndex, PdfObjectReference, PdfValueParser};
+use refineid_digest::Sha256;
 
 /// Opens a dictionary (ISO 32000-1 sec.7.3.7).
 const DICTIONARY_OPEN: &[u8] = b"<<";
@@ -55,9 +68,16 @@ const NAME_OPEN: &[u8] = b"/";
 const LITERAL_OPEN: &[u8] = b"(";
 /// Opens a hexadecimal string (ISO 32000-1 sec.7.3.4.3).
 const HEX_OPEN: &[u8] = b"<";
+/// The keyword that opens a stream's payload (ISO 32000-1 sec.7.3.8).
+const STREAM_KEYWORD: &[u8] = b"stream";
 
 /// Trailer key of the catalog (ISO 32000-1 sec.7.5.5, Table 15).
 const KEY_ROOT: &[u8] = b"Root";
+/// Trailer key of the file identifier.
+const KEY_ID: &[u8] = b"ID";
+/// Trailer key of the document information dictionary (ISO 32000-1
+/// sec.14.3.3).
+const KEY_INFO: &[u8] = b"Info";
 /// Key naming an object's type.
 const KEY_TYPE: &[u8] = b"Type";
 /// Key naming an annotation's or `XObject`'s subtype.
@@ -66,11 +86,17 @@ const KEY_SUBTYPE: &[u8] = b"Subtype";
 const KEY_RECT: &[u8] = b"Rect";
 /// Key of a field's type (ISO 32000-1 sec.12.7.3.1, Table 220).
 const KEY_FIELD_TYPE: &[u8] = b"FT";
+/// Key of a field's value.
+const KEY_VALUE: &[u8] = b"V";
 /// Key of a field's or a page's parent.
 const KEY_PARENT: &[u8] = b"Parent";
+/// Key of a field's children.
+const KEY_KIDS: &[u8] = b"Kids";
 /// Key of an annotation's appearance dictionary (ISO 32000-1
 /// sec.12.5.5).
 const KEY_APPEARANCE: &[u8] = b"AP";
+/// Key of an annotation's appearance state.
+const KEY_APPEARANCE_STATE: &[u8] = b"AS";
 /// Key of a page's annotations (ISO 32000-1 sec.7.7.3.3, Table 30).
 const KEY_ANNOTS: &[u8] = b"Annots";
 /// Key of the catalog's interactive form (ISO 32000-1 sec.7.7.2).
@@ -80,22 +106,26 @@ const KEY_ACROFORM: &[u8] = b"AcroForm";
 const KEY_FIELDS: &[u8] = b"Fields";
 /// Key of the interactive form's signature flags.
 const KEY_SIG_FLAGS: &[u8] = b"SigFlags";
-/// Key of the interactive form's default appearance string.
-const KEY_DEFAULT_APPEARANCE: &[u8] = b"DA";
-/// Key of the interactive form's default resources.
-const KEY_DEFAULT_RESOURCES: &[u8] = b"DR";
 /// Key of the catalog's document security store (`ETSI EN 319 142-1`
 /// clause 5.4.2).
 const KEY_DSS: &[u8] = b"DSS";
-/// Key of the catalog's permissions (ISO 32000-1 sec.12.8.4).
-const KEY_PERMS: &[u8] = b"Perms";
+/// Key of the store's certificates.
+const KEY_CERTS: &[u8] = b"Certs";
+/// Key of the store's OCSP responses.
+const KEY_OCSPS: &[u8] = b"OCSPs";
+/// Key of the store's CRLs.
+const KEY_CRLS: &[u8] = b"CRLs";
+/// Key of the store's validation-related information.
+const KEY_VRI: &[u8] = b"VRI";
+/// Keys of one `/VRI` entry's arrays (`ETSI EN 319 142-1` clause
+/// 5.4.2.2).
+const VRI_ARRAY_KEYS: [&[u8]; 3] = [b"Cert", b"OCSP", b"CRL"];
+/// Key of one `/VRI` entry's timestamp stream.
+const KEY_VRI_TIMESTAMP: &[u8] = b"TS";
 /// Key of the catalog's developer extensions (ISO 32000-1 sec.7.12).
 const KEY_EXTENSIONS: &[u8] = b"Extensions";
 /// Key of the catalog's metadata stream (ISO 32000-1 sec.14.3.2).
 const KEY_METADATA: &[u8] = b"Metadata";
-/// Trailer key of the document information dictionary (ISO 32000-1
-/// sec.14.3.3).
-const KEY_INFO: &[u8] = b"Info";
 /// Key of a signature dictionary's signed range (ISO 32000-1
 /// sec.12.8.1, Table 252).
 const KEY_BYTE_RANGE: &[u8] = b"ByteRange";
@@ -112,15 +142,20 @@ const TYPE_ANNOT: &[u8] = b"Annot";
 const TYPE_XREF: &[u8] = b"XRef";
 /// `/Type` of an object stream (ISO 32000-1 sec.7.5.7).
 const TYPE_OBJECT_STREAM: &[u8] = b"ObjStm";
+/// `/Subtype` of a widget annotation (ISO 32000-1 sec.12.5.6.19).
+const SUBTYPE_WIDGET: &[u8] = b"Widget";
 /// `/FT` of a signature field (ISO 32000-1 sec.12.7.4.5).
 const FIELD_TYPE_SIGNATURE: &[u8] = b"Sig";
 
-/// Most `/Parent` links followed to find a field's inherited type; a
-/// real field tree is a handful deep.
+/// Most `/Parent` links followed, and most `/Kids` levels walked, in a
+/// field tree; a real one is a handful deep.
 const MAX_FIELD_DEPTH: usize = 32;
-/// Most objects followed from the `/DSS` or from one appearance
-/// dictionary.
+/// Most objects followed from one appearance dictionary.
 const MAX_REACHED_OBJECTS: usize = 4096;
+/// Most live objects one view may hold to be compared.
+const MAX_COMPARED_OBJECTS: usize = MAX_XREF_ENTRIES;
+/// Most octets of object bodies read from one view to compare it.
+const MAX_COMPARED_BYTES: usize = 1 << 30;
 
 /// What a later revision changes in what the signer saw, in order of
 /// precedence: when a revision changes several things, the first in
@@ -129,16 +164,19 @@ const MAX_REACHED_OBJECTS: usize = 4096;
 pub enum DocumentChange {
     /// The page tree: a page added, removed or moved.
     Pages,
-    /// A form field other than a signature field, or the interactive
-    /// form beyond its signature fields.
+    /// A form field other than a signature being added, or the
+    /// interactive form beyond its signature fields.
     FormField,
-    /// An annotation other than a signature widget.
+    /// An annotation other than a signature widget, or the order of a
+    /// page's annotations.
     Annotation,
-    /// The catalog, beyond `/DSS`, `/AcroForm`, `/Perms`,
-    /// `/Extensions` and `/Metadata`.
+    /// The catalog, beyond `/DSS`, `/AcroForm`, `/Extensions` and
+    /// `/Metadata`.
     Catalog,
-    /// A page's content, its resources, or any other object of the
-    /// document.
+    /// The trailer's `/Root` or permanent `/ID`.
+    Trailer,
+    /// A page's content, its resources, the validation store beyond
+    /// growing, or any other object of the document.
     Content,
 }
 
@@ -156,7 +194,8 @@ pub enum Revision {
 
 /// What the revisions after the one ending at `end` do to `file`,
 /// whose newest view is `latest`. `None` when the first `end` bytes do
-/// not index as a document of their own.
+/// not index as a document of their own, or either view exceeds
+/// [`MAX_COMPARED_OBJECTS`] or [`MAX_COMPARED_BYTES`].
 pub(crate) fn later_revisions(file: &[u8], end: usize, latest: &PdfIndex<'_>) -> Option<Revision> {
     if end == file.len() {
         return Some(Revision::WholeDocument);
@@ -168,6 +207,8 @@ pub(crate) fn later_revisions(file: &[u8], end: usize, latest: &PdfIndex<'_>) ->
         Comparison {
             before: &before,
             after: &after,
+            after_roles: Roles::of(&after),
+            before_roles: Roles::of(&before),
         }
         .first_change()
         .map_or(
@@ -269,39 +310,47 @@ impl Value {
     }
 }
 
-/// One object's body: its value, and the bytes after it (a stream's
-/// keyword and payload), compared as written.
+/// One object's body, read once.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Object {
-    /// The value, `None` when the body is no value this reader reads.
-    value: Option<Value>,
-    /// The bytes after the value, or the whole body when it does not
-    /// read.
-    rest: Vec<u8>,
+enum Object {
+    /// A value with nothing after it.
+    Parsed(Value),
+    /// A stream: its dictionary and the SHA-256 of the keyword and
+    /// payload that follow it.
+    Stream(Value, Vec<u8>),
+    /// A body that is no value this reader reads, by its SHA-256.
+    Unparsed(Vec<u8>),
 }
 
 impl Object {
     /// Read the body of one object.
     fn read(body: &[u8]) -> Self {
         let mut parser = PdfValueParser::new(body);
-        match Value::read(&mut parser, 1) {
-            Some(value) => {
-                parser.skip_trivia();
-                Self {
-                    value: Some(value),
-                    rest: body.get(parser.offset..).unwrap_or_default().to_vec(),
-                }
-            }
-            None => Self {
-                value: None,
-                rest: body.to_vec(),
-            },
+        let Some(value) = Value::read(&mut parser, 1) else {
+            return Self::Unparsed(Sha256::of(body).as_bytes().to_vec());
+        };
+        parser.skip_trivia();
+        let rest = body.get(parser.offset..).unwrap_or_default();
+        if rest.is_empty() {
+            Self::Parsed(value)
+        } else if rest.starts_with(STREAM_KEYWORD) && value.dictionary().is_some() {
+            Self::Stream(value, Sha256::of(rest).as_bytes().to_vec())
+        } else {
+            Self::Unparsed(Sha256::of(body).as_bytes().to_vec())
+        }
+    }
+
+    /// The value, unless the body does not read.
+    const fn value(&self) -> Option<&Value> {
+        match self {
+            Self::Parsed(value) | Self::Stream(value, _) => Some(value),
+            Self::Unparsed(_) => None,
         }
     }
 
     /// The dictionary the object is or opens.
     fn dictionary(&self) -> Option<&BTreeMap<Vec<u8>, Value>> {
-        self.value.as_ref().and_then(Value::dictionary)
+        self.value().and_then(Value::dictionary)
     }
 
     /// The value under `key` of the object's dictionary.
@@ -312,6 +361,18 @@ impl Object {
     /// Whether the object's dictionary names `name` under `key`.
     fn names(&self, key: &[u8], name: &[u8]) -> bool {
         matches!(self.entry(key), Some(Value::Name(found)) if found == name)
+    }
+
+    /// Whether the object is a cross-reference or object stream.
+    fn is_structure_stream(&self) -> bool {
+        matches!(self, Self::Stream(..))
+            && (self.names(KEY_TYPE, TYPE_XREF) || self.names(KEY_TYPE, TYPE_OBJECT_STREAM))
+    }
+
+    /// Whether the object is a stream other than a cross-reference or
+    /// object stream.
+    fn is_data_stream(&self) -> bool {
+        matches!(self, Self::Stream(..)) && !self.is_structure_stream()
     }
 
     /// Whether the object is a signature or document timestamp
@@ -337,115 +398,153 @@ enum FieldType {
     Other,
 }
 
-/// One view of the document: the signed revision, or the newest.
-struct Snapshot<'i, 'a> {
-    /// The cross-reference index of this view.
-    index: &'i PdfIndex<'a>,
+/// One view of the document, the signed revision or the newest, every
+/// live object read once.
+struct Snapshot {
+    /// Each live object by number, with the generation that is live.
+    objects: HashMap<u32, (u16, Object)>,
+    /// The trailer's entries.
+    trailer: BTreeMap<Vec<u8>, Value>,
     /// The catalog.
     root: PdfObjectReference,
-    /// The objects the catalog's `/DSS` reaches, the store itself
-    /// among them when it is indirect.
-    store: HashSet<PdfObjectReference>,
-    /// The objects the appearance dictionaries of signature widgets
-    /// reach.
-    appearances: HashSet<PdfObjectReference>,
-    /// The arrays a page names indirectly as its `/Annots`.
-    annotation_arrays: HashSet<PdfObjectReference>,
-    /// The trailer's `/Info` dictionary and the catalog's `/Metadata`
-    /// stream, when indirect.
-    metadata: HashSet<PdfObjectReference>,
 }
 
-impl<'i, 'a> Snapshot<'i, 'a> {
-    /// The view `index` gives; `None` without a catalog reference.
-    fn new(index: &'i PdfIndex<'a>) -> Option<Self> {
-        let trailer = PdfDictionary::parse(index.trailer()).ok()?;
-        let root_value = trailer.entry(KEY_ROOT).ok()??;
-        let mut parser = PdfValueParser::new(index.trailer().get(root_value.value.clone())?);
-        parser.skip_trivia();
-        let root = parser.reference()?;
-        let mut metadata = HashSet::new();
-        if let Some(info) = trailer.entry(KEY_INFO).ok()? {
-            let mut parser = PdfValueParser::new(index.trailer().get(info.value.clone())?);
-            parser.skip_trivia();
-            metadata.extend(parser.reference());
-        }
-        let mut snapshot = Self {
-            index,
-            root,
-            store: HashSet::new(),
-            appearances: HashSet::new(),
-            annotation_arrays: HashSet::new(),
-            metadata,
+impl Snapshot {
+    /// The view `index` gives; `None` without a readable trailer and
+    /// catalog reference, or past the comparison bounds.
+    fn new(index: &PdfIndex<'_>) -> Option<Self> {
+        let trailer = Value::read(&mut PdfValueParser::new(index.trailer()), 1)?
+            .dictionary()?
+            .clone();
+        let Some(Value::Reference(root)) = trailer.get(KEY_ROOT) else {
+            return None;
         };
-        let catalog = snapshot.object(root);
-        if let Some(Value::Reference(stream)) = catalog
-            .as_ref()
-            .and_then(|catalog| catalog.entry(KEY_METADATA))
-        {
-            snapshot.metadata.insert(*stream);
+        let root = *root;
+        let live = index.live_references();
+        if live.len() > MAX_COMPARED_OBJECTS {
+            return None;
         }
-        if let Some(store) = catalog.as_ref().and_then(|catalog| catalog.entry(KEY_DSS)) {
-            snapshot.store = snapshot.reached_from(store);
-        }
-        let mut appearances = HashSet::new();
-        let mut annotation_arrays = HashSet::new();
-        for reference in index.live_references() {
-            let Some(object) = snapshot.object(reference) else {
+        let mut objects = HashMap::new();
+        let mut read = 0_usize;
+        for reference in live {
+            let Some(body) = index.object_body_reference(reference) else {
                 continue;
             };
-            if object.names(KEY_TYPE, TYPE_PAGE)
-                && let Some(Value::Reference(array)) = object.entry(KEY_ANNOTS)
-            {
-                annotation_arrays.insert(*array);
+            read = read.saturating_add(body.len());
+            if read > MAX_COMPARED_BYTES {
+                return None;
             }
-            if snapshot.field_type(reference) == Some(FieldType::Signature)
-                && let Some(appearance) = object.entry(KEY_APPEARANCE)
-            {
-                appearances.extend(snapshot.reached_from(appearance));
+            objects.insert(
+                reference.number,
+                (reference.generation, Object::read(&body)),
+            );
+        }
+        Some(Self {
+            objects,
+            trailer,
+            root,
+        })
+    }
+
+    /// The live object `reference` names, number and generation.
+    fn object(&self, reference: PdfObjectReference) -> Option<&Object> {
+        self.objects
+            .get(&reference.number)
+            .filter(|(generation, _)| *generation == reference.generation)
+            .map(|(_, object)| object)
+    }
+
+    /// The catalog.
+    fn catalog(&self) -> Option<&Object> {
+        self.object(self.root)
+    }
+
+    /// `value`, or the value of the object it references.
+    fn resolve<'v>(&'v self, value: &'v Value) -> Option<&'v Value> {
+        match value {
+            Value::Reference(reference) => self.object(*reference)?.value(),
+            Value::Dictionary(_) | Value::Array(_) | Value::Name(_) | Value::Token(_) => {
+                Some(value)
             }
         }
-        snapshot.appearances = appearances;
-        snapshot.annotation_arrays = annotation_arrays;
-        Some(snapshot)
     }
 
-    /// The object `reference` names in this view.
-    fn object(&self, reference: PdfObjectReference) -> Option<Object> {
-        self.index
-            .object_body_reference(reference)
-            .map(|body| Object::read(&body))
+    /// The dictionary `value` is, inline or indirect; an absent value
+    /// is an empty one. `None` when it is neither.
+    fn dictionary_of(&self, value: Option<&Value>) -> Option<BTreeMap<Vec<u8>, Value>> {
+        match value {
+            None => Some(BTreeMap::new()),
+            Some(value) => self.resolve(value)?.dictionary().cloned(),
+        }
     }
 
-    /// The objects `value` references, and those they reference in
-    /// turn, up to [`MAX_REACHED_OBJECTS`].
-    fn reached_from(&self, value: &Value) -> HashSet<PdfObjectReference> {
-        let mut pending = Vec::new();
-        value.references(&mut pending);
-        let mut reached = HashSet::new();
-        while let Some(reference) = pending.pop() {
-            if reached.len() == MAX_REACHED_OBJECTS || !reached.insert(reference) {
+    /// The references a list value holds, inline or as an indirect
+    /// array; an absent list is empty. `None` when it is neither, or an
+    /// element is no reference.
+    fn list(&self, value: Option<&Value>) -> Option<Vec<PdfObjectReference>> {
+        let Some(value) = value else {
+            return Some(Vec::new());
+        };
+        let Value::Array(items) = self.resolve(value)? else {
+            return None;
+        };
+        items
+            .iter()
+            .map(|item| match item {
+                Value::Reference(reference) => Some(*reference),
+                Value::Dictionary(_) | Value::Array(_) | Value::Name(_) | Value::Token(_) => None,
+            })
+            .collect()
+    }
+
+    /// The interactive form's dictionary; empty without one.
+    fn form(&self) -> Option<BTreeMap<Vec<u8>, Value>> {
+        self.dictionary_of(self.catalog()?.entry(KEY_ACROFORM))
+    }
+
+    /// Every node of the form's field tree: the `/Fields` and their
+    /// `/Kids`, walked once each, at most [`MAX_FIELD_DEPTH`] levels.
+    /// `None` when a list does not read or the tree is deeper.
+    fn field_tree(&self) -> Option<HashSet<PdfObjectReference>> {
+        let form = self.form()?;
+        let mut tree = HashSet::new();
+        let mut pending: Vec<(PdfObjectReference, usize)> = self
+            .list(form.get(KEY_FIELDS))?
+            .into_iter()
+            .map(|reference| (reference, 0))
+            .collect();
+        while let Some((reference, depth)) = pending.pop() {
+            if depth > MAX_FIELD_DEPTH || tree.len() >= MAX_COMPARED_OBJECTS {
+                return None;
+            }
+            if !tree.insert(reference) {
                 continue;
             }
-            if let Some(value) = self.object(reference).and_then(|object| object.value) {
-                value.references(&mut pending);
+            if let Some(object) = self.object(reference) {
+                for kid in self.list(object.entry(KEY_KIDS))? {
+                    pending.push((kid, depth.saturating_add(1)));
+                }
             }
         }
-        reached
+        Some(tree)
     }
 
-    /// The type of the field `reference` names: its own `/FT`, or the
-    /// nearest one up its `/Parent` chain. `None` for an object that is
-    /// no field.
-    fn field_type(&self, reference: PdfObjectReference) -> Option<FieldType> {
+    /// The field node that `reference` is or belongs to, with its type:
+    /// the object itself or the nearest one up its `/Parent` chain that
+    /// carries `/FT`, at most [`MAX_FIELD_DEPTH`] links, never twice.
+    fn field_node(&self, reference: PdfObjectReference) -> Option<(PdfObjectReference, FieldType)> {
         let mut current = reference;
+        let mut seen = HashSet::new();
         for _ in 0..MAX_FIELD_DEPTH {
+            if !seen.insert(current) {
+                return None;
+            }
             let object = self.object(current)?;
             match object.entry(KEY_FIELD_TYPE) {
                 Some(Value::Name(name)) if name == FIELD_TYPE_SIGNATURE => {
-                    return Some(FieldType::Signature);
+                    return Some((current, FieldType::Signature));
                 }
-                Some(_) => return Some(FieldType::Other),
+                Some(_) => return Some((current, FieldType::Other)),
                 None => {}
             }
             match object.entry(KEY_PARENT) {
@@ -456,44 +555,56 @@ impl<'i, 'a> Snapshot<'i, 'a> {
         None
     }
 
-    /// Whether `reference` is a signature field or a widget of one.
-    fn is_signature_field(&self, reference: PdfObjectReference) -> bool {
-        self.field_type(reference) == Some(FieldType::Signature)
+    /// The type of the field `reference` is or belongs to.
+    fn field_type(&self, reference: PdfObjectReference) -> Option<FieldType> {
+        self.field_node(reference).map(|(_, kind)| kind)
     }
 
-    /// The references a list value holds, inline or as an indirect
-    /// array of this view; `None` when it is neither.
-    fn list(&self, value: Option<&Value>) -> Option<Vec<PdfObjectReference>> {
-        let items = match value {
-            None => return Some(Vec::new()),
-            Some(Value::Array(items)) => items.clone(),
-            Some(Value::Reference(reference)) => match self.object(*reference)?.value? {
-                Value::Array(items) => items,
-                _ => return None,
-            },
-            Some(_) => return None,
-        };
-        items
-            .into_iter()
-            .map(|item| match item {
-                Value::Reference(reference) => Some(reference),
-                _ => None,
+    /// Whether `reference` is a signature field or widget whose field
+    /// carries a value.
+    fn is_signed(&self, reference: PdfObjectReference) -> bool {
+        self.field_node(reference).is_some_and(|(node, kind)| {
+            kind == FieldType::Signature
+                && self
+                    .object(node)
+                    .is_some_and(|field| field.entry(KEY_VALUE).is_some())
+        })
+    }
+
+    /// Whether `reference` is a signed signature field node: a field
+    /// or a widget of type `/Sig` with a value, with no `/Subtype` or
+    /// `/Subtype /Widget`.
+    fn is_signed_field_node(&self, reference: PdfObjectReference) -> bool {
+        self.is_signed(reference)
+            && self.object(reference).is_some_and(|object| {
+                object.entry(KEY_SUBTYPE).is_none() || object.names(KEY_SUBTYPE, SUBTYPE_WIDGET)
+            })
+    }
+
+    /// Whether `reference` is a widget, `/Subtype /Widget` itself, of a
+    /// signed signature field.
+    fn is_signed_widget(&self, reference: PdfObjectReference) -> bool {
+        self.is_signed(reference)
+            && self
+                .object(reference)
+                .is_some_and(|object| object.names(KEY_SUBTYPE, SUBTYPE_WIDGET))
+    }
+
+    /// The pages of this view: every live `/Type /Page` object.
+    fn pages(&self) -> Vec<(PdfObjectReference, &Object)> {
+        self.objects
+            .iter()
+            .filter(|(_, (_, object))| object.names(KEY_TYPE, TYPE_PAGE))
+            .map(|(number, (generation, object))| {
+                (
+                    PdfObjectReference {
+                        number: *number,
+                        generation: *generation,
+                    },
+                    object,
+                )
             })
             .collect()
-    }
-
-    /// The dictionary a value is, inline or as an indirect object of
-    /// this view; empty when absent. `None` when it is neither.
-    fn dictionary_of(&self, value: Option<&Value>) -> Option<BTreeMap<Vec<u8>, Value>> {
-        match value {
-            None => Some(BTreeMap::new()),
-            Some(Value::Dictionary(entries)) => Some(entries.clone()),
-            Some(Value::Reference(reference)) => match self.object(*reference)?.value? {
-                Value::Dictionary(entries) => Some(entries),
-                _ => None,
-            },
-            Some(_) => None,
-        }
     }
 
     /// What a change to `object`, the object `reference` names in this
@@ -505,7 +616,7 @@ impl<'i, 'a> Snapshot<'i, 'a> {
             DocumentChange::FormField
         } else if object.is_annotation() {
             DocumentChange::Annotation
-        } else if reference == self.root {
+        } else if reference.number == self.root.number {
             DocumentChange::Catalog
         } else {
             DocumentChange::Content
@@ -513,246 +624,443 @@ impl<'i, 'a> Snapshot<'i, 'a> {
     }
 }
 
-/// The signed revision against the newest view.
-struct Comparison<'s, 'i, 'a> {
-    /// The signed revision.
-    before: &'s Snapshot<'i, 'a>,
-    /// The newest view.
-    after: &'s Snapshot<'i, 'a>,
+/// The objects of one view that play a role a later revision may add
+/// or rewrite.
+#[derive(Default)]
+struct Roles {
+    /// The `/DSS` dictionary, its category arrays and its `/VRI`
+    /// dictionary, when indirect: these may grow.
+    store_containers: HashSet<PdfObjectReference>,
+    /// The `/VRI` entries and their arrays, when indirect: these may
+    /// only be new.
+    store_entries: HashSet<PdfObjectReference>,
+    /// The streams the store's arrays and `/VRI` entries name.
+    store_streams: HashSet<PdfObjectReference>,
+    /// The interactive form and its `/Fields` array, when indirect, and
+    /// each page's `/Annots` array, when indirect: judged as a whole.
+    lists: HashSet<PdfObjectReference>,
+    /// The signature dictionaries signed fields of the field tree name
+    /// as their `/V`.
+    signature_values: HashSet<PdfObjectReference>,
+    /// The objects reached from the `/AP` of the signed signature
+    /// fields and widgets of the field tree.
+    appearances: HashSet<PdfObjectReference>,
+    /// The trailer's `/Info` and the catalog's `/Metadata`.
+    metadata: HashSet<PdfObjectReference>,
+    /// The nodes of the form's field tree; empty when it does not read.
+    field_tree: HashSet<PdfObjectReference>,
 }
 
-impl Comparison<'_, '_, '_> {
+impl Roles {
+    /// The roles in `view`.
+    fn of(view: &Snapshot) -> Self {
+        let mut roles = Self::default();
+        let indirect = |value: Option<&Value>| match value {
+            Some(Value::Reference(reference)) => Some(*reference),
+            _ => None,
+        };
+        roles.metadata.extend(indirect(view.trailer.get(KEY_INFO)));
+        let catalog = view.catalog();
+        if let Some(catalog) = catalog {
+            roles.metadata.extend(indirect(catalog.entry(KEY_METADATA)));
+            roles.lists.extend(indirect(catalog.entry(KEY_ACROFORM)));
+            roles.store(view, catalog.entry(KEY_DSS));
+        }
+        if let Some(form) = view.form() {
+            roles.lists.extend(indirect(form.get(KEY_FIELDS)));
+        }
+        for (_, page) in view.pages() {
+            roles.lists.extend(indirect(page.entry(KEY_ANNOTS)));
+        }
+        roles.field_tree = view.field_tree().unwrap_or_default();
+        for node in roles.field_tree.clone() {
+            if !view.is_signed_field_node(node) {
+                continue;
+            }
+            let Some(object) = view.object(node) else {
+                continue;
+            };
+            roles
+                .signature_values
+                .extend(indirect(object.entry(KEY_VALUE)));
+            if let Some(appearance) = object.entry(KEY_APPEARANCE) {
+                roles.appearances.extend(reached_from(view, appearance));
+            }
+        }
+        roles
+    }
+
+    /// The store's containers, entries and streams.
+    fn store(&mut self, view: &Snapshot, value: Option<&Value>) {
+        let Some(value) = value else {
+            return;
+        };
+        if let Value::Reference(reference) = value {
+            self.store_containers.insert(*reference);
+        }
+        let Some(store) = view.resolve(value).and_then(Value::dictionary) else {
+            return;
+        };
+        for key in [KEY_CERTS, KEY_OCSPS, KEY_CRLS] {
+            if let Some(list) = store.get(key) {
+                if let Value::Reference(reference) = list {
+                    self.store_containers.insert(*reference);
+                }
+                self.streams(view, view.list(Some(list)).unwrap_or_default());
+            }
+        }
+        let Some(entries) = store.get(KEY_VRI) else {
+            return;
+        };
+        if let Value::Reference(reference) = entries {
+            self.store_containers.insert(*reference);
+        }
+        let Some(entries) = view.resolve(entries).and_then(Value::dictionary) else {
+            return;
+        };
+        for entry in entries.values() {
+            if let Value::Reference(reference) = entry {
+                self.store_entries.insert(*reference);
+            }
+            let Some(entry) = view.resolve(entry).and_then(Value::dictionary) else {
+                continue;
+            };
+            for key in VRI_ARRAY_KEYS {
+                if let Some(list) = entry.get(key) {
+                    if let Value::Reference(reference) = list {
+                        self.store_entries.insert(*reference);
+                    }
+                    self.streams(view, view.list(Some(list)).unwrap_or_default());
+                }
+            }
+            if let Some(Value::Reference(stream)) = entry.get(KEY_VRI_TIMESTAMP) {
+                self.streams(view, vec![*stream]);
+            }
+        }
+    }
+
+    /// The data streams among `references`.
+    fn streams(&mut self, view: &Snapshot, references: Vec<PdfObjectReference>) {
+        self.store_streams.extend(
+            references
+                .into_iter()
+                .filter(|reference| view.object(*reference).is_some_and(Object::is_data_stream)),
+        );
+    }
+}
+
+/// The objects `value` references, and those they reference in turn,
+/// each once, up to [`MAX_REACHED_OBJECTS`].
+fn reached_from(view: &Snapshot, value: &Value) -> HashSet<PdfObjectReference> {
+    let mut pending = Vec::new();
+    value.references(&mut pending);
+    let mut reached = HashSet::new();
+    while let Some(reference) = pending.pop() {
+        if reached.len() == MAX_REACHED_OBJECTS || !reached.insert(reference) {
+            continue;
+        }
+        if let Some(value) = view.object(reference).and_then(Object::value) {
+            value.references(&mut pending);
+        }
+    }
+    reached
+}
+
+/// How one object number fares between the two views.
+enum Fate<'o> {
+    /// New in a later revision.
+    Added(&'o Object),
+    /// Rewritten in a later revision, its generation risen or not.
+    Replaced {
+        /// The signed revision's body.
+        older: &'o Object,
+        /// The newest body.
+        newer: &'o Object,
+    },
+}
+
+/// The signed revision against the newest view.
+struct Comparison<'s> {
+    /// The signed revision.
+    before: &'s Snapshot,
+    /// The newest view.
+    after: &'s Snapshot,
+    /// The roles in the newest view.
+    after_roles: Roles,
+    /// The roles in the signed revision.
+    before_roles: Roles,
+}
+
+impl Comparison<'_> {
     /// The change of highest precedence the later revisions make, or
     /// `None` when they only add what may follow a signature.
     fn first_change(&self) -> Option<DocumentChange> {
-        let mut changes = Vec::new();
-        if self.before.root != self.after.root {
-            changes.push(DocumentChange::Catalog);
+        let mut changes = vec![
+            self.trailer(),
+            self.form(),
+            self.annotations(),
+            self.store(),
+        ];
+        for (number, (generation, newer)) in &self.after.objects {
+            let reference = PdfObjectReference {
+                number: *number,
+                generation: *generation,
+            };
+            let fate = match self.before.objects.get(number) {
+                None => Fate::Added(newer),
+                Some((older_generation, older))
+                    if older_generation == generation && older == newer =>
+                {
+                    continue;
+                }
+                Some((_, older)) => Fate::Replaced { older, newer },
+            };
+            changes.push(self.judge(reference, &fate));
         }
-        for reference in self.after.index.live_references() {
-            let newer = self.after.object(reference);
-            let older = self.before.object(reference);
-            if let Some(newer) = newer
-                && older.as_ref() != Some(&newer)
-                && let Some(change) = self.judge(reference, older.as_ref(), &newer)
-            {
-                changes.push(change);
+        for (number, (generation, older)) in &self.before.objects {
+            if !self.after.objects.contains_key(number) {
+                let reference = PdfObjectReference {
+                    number: *number,
+                    generation: *generation,
+                };
+                changes.push(Some(self.before.kind_of(reference, older)));
             }
         }
-        for reference in self.before.index.live_references() {
-            if self.after.index.object_body_reference(reference).is_none()
-                && let Some(older) = self.before.object(reference)
-            {
-                changes.push(self.before.kind_of(reference, &older));
+        changes.into_iter().flatten().min()
+    }
+
+    /// The trailer: `/Root` the same object, and the first `/ID`
+    /// element, once present, kept.
+    fn trailer(&self) -> Option<DocumentChange> {
+        if self.before.root != self.after.root {
+            return Some(DocumentChange::Trailer);
+        }
+        let permanent = |view: &Snapshot| match view.trailer.get(KEY_ID) {
+            Some(Value::Array(items)) => items.first().cloned(),
+            _ => None,
+        };
+        match (permanent(self.before), permanent(self.after)) {
+            (Some(before), after) if after.as_ref() != Some(&before) => {
+                Some(DocumentChange::Trailer)
+            }
+            _ => None,
+        }
+    }
+
+    /// The interactive form: every entry but `/Fields` and `/SigFlags`
+    /// unchanged; no node of the field tree removed; every node added a
+    /// signed signature field or widget.
+    fn form(&self) -> Option<DocumentChange> {
+        let (Some(old), Some(new)) = (self.before.form(), self.after.form()) else {
+            return Some(DocumentChange::FormField);
+        };
+        if changed_beyond(&old, &new, &[KEY_FIELDS, KEY_SIG_FLAGS]) {
+            return Some(DocumentChange::FormField);
+        }
+        let (Some(old_tree), Some(new_tree)) = (self.before.field_tree(), self.after.field_tree())
+        else {
+            return Some(DocumentChange::FormField);
+        };
+        let removed = old_tree.iter().any(|node| !new_tree.contains(node));
+        let foreign = new_tree
+            .iter()
+            .filter(|node| !old_tree.contains(node))
+            .any(|node| !self.after.is_signed_field_node(*node));
+        (removed || foreign).then_some(DocumentChange::FormField)
+    }
+
+    /// Each page's `/Annots`, resolved on both sides: the annotations
+    /// already there kept in their order, and every one added a widget
+    /// of a signed signature field of the field tree.
+    fn annotations(&self) -> Option<DocumentChange> {
+        let tree = &self.after_roles.field_tree;
+        let mut changes = Vec::new();
+        for (reference, newer) in self.after.pages() {
+            let Some(older) = self
+                .before
+                .object(reference)
+                .filter(|older| older.names(KEY_TYPE, TYPE_PAGE))
+            else {
+                continue;
+            };
+            let (Some(old), Some(new)) = (
+                self.before.list(older.entry(KEY_ANNOTS)),
+                self.after.list(newer.entry(KEY_ANNOTS)),
+            ) else {
+                changes.push(DocumentChange::Annotation);
+                continue;
+            };
+            let kept: Vec<PdfObjectReference> = new
+                .iter()
+                .copied()
+                .filter(|annotation| old.contains(annotation))
+                .collect();
+            if kept != old {
+                changes.push(DocumentChange::Annotation);
+            }
+            for added in new.iter().filter(|annotation| !old.contains(annotation)) {
+                let attached = self
+                    .after
+                    .field_node(*added)
+                    .is_some_and(|(node, _)| tree.contains(&node) || tree.contains(added));
+                if !(attached && self.after.is_signed_widget(*added)) {
+                    changes.push(if self.after.field_type(*added).is_some() {
+                        DocumentChange::FormField
+                    } else {
+                        DocumentChange::Annotation
+                    });
+                }
             }
         }
         changes.into_iter().min()
     }
 
-    /// What the change of the object `reference` from `older` (absent
-    /// when new) to `newer` touches; `None` when it is a change that may
-    /// follow a signature.
-    fn judge(
+    /// The `/DSS`: its category arrays only gaining entries, its `/VRI`
+    /// entries kept, every other entry but `/Type` unchanged.
+    fn store(&self) -> Option<DocumentChange> {
+        let store = |view: &Snapshot| view.dictionary_of(view.catalog()?.entry(KEY_DSS));
+        let (Some(old), Some(new)) = (store(self.before), store(self.after)) else {
+            return Some(DocumentChange::Content);
+        };
+        if changed_beyond(
+            &old,
+            &new,
+            &[KEY_TYPE, KEY_CERTS, KEY_OCSPS, KEY_CRLS, KEY_VRI],
+        ) {
+            return Some(DocumentChange::Content);
+        }
+        for key in [KEY_CERTS, KEY_OCSPS, KEY_CRLS] {
+            let (Some(old_list), Some(new_list)) = (
+                self.before.list(old.get(key)),
+                self.after.list(new.get(key)),
+            ) else {
+                return Some(DocumentChange::Content);
+            };
+            if old_list.iter().any(|entry| !new_list.contains(entry)) {
+                return Some(DocumentChange::Content);
+            }
+        }
+        let (Some(old_vri), Some(new_vri)) = (
+            self.before.dictionary_of(old.get(KEY_VRI)),
+            self.after.dictionary_of(new.get(KEY_VRI)),
+        ) else {
+            return Some(DocumentChange::Content);
+        };
+        old_vri
+            .iter()
+            .any(|(key, entry)| new_vri.get(key) != Some(entry))
+            .then_some(DocumentChange::Content)
+    }
+
+    /// What one object's fate touches; `None` when it may follow a
+    /// signature.
+    fn judge(&self, reference: PdfObjectReference, fate: &Fate<'_>) -> Option<DocumentChange> {
+        let roles = &self.after_roles;
+        match *fate {
+            Fate::Added(newer) => {
+                let kind = self.after.kind_of(reference, newer);
+                let harmless = newer.is_structure_stream()
+                    || roles.store_containers.contains(&reference)
+                    || roles.store_entries.contains(&reference)
+                    || roles.store_streams.contains(&reference)
+                    || roles.lists.contains(&reference)
+                    || (newer.is_signature_value() && roles.signature_values.contains(&reference))
+                    || (self.after.is_signed_field_node(reference)
+                        && roles.field_tree.contains(&reference))
+                    || (kind == DocumentChange::Content
+                        && (roles.appearances.contains(&reference)
+                            || roles.metadata.contains(&reference)));
+                (!harmless).then_some(kind)
+            }
+            Fate::Replaced { older, newer } => {
+                let kind = self.after.kind_of(reference, newer);
+                if self.before.object(reference).is_none() {
+                    // The generation rose: the object the signed
+                    // revision's references named is freed.
+                    return Some(kind);
+                }
+                let unchanged_role = |set: fn(&Roles) -> &HashSet<PdfObjectReference>| {
+                    set(roles).contains(&reference) && set(&self.before_roles).contains(&reference)
+                };
+                if (older.is_structure_stream() && newer.is_structure_stream())
+                    || unchanged_role(|roles| &roles.store_containers)
+                    || unchanged_role(|roles| &roles.lists)
+                    || (kind == DocumentChange::Content
+                        && roles.metadata.contains(&reference)
+                        && self.before_roles.metadata.contains(&reference))
+                {
+                    return None;
+                }
+                if reference.number == self.after.root.number {
+                    return Self::catalog(older, newer);
+                }
+                if older.names(KEY_TYPE, TYPE_PAGE) && newer.names(KEY_TYPE, TYPE_PAGE) {
+                    return Self::page(older, newer);
+                }
+                if self.before.field_type(reference) == Some(FieldType::Signature) {
+                    return self.signature_field(reference, older, newer);
+                }
+                Some(kind)
+            }
+        }
+    }
+
+    /// A rewritten catalog: every entry other than `/DSS`, `/AcroForm`,
+    /// `/Extensions` and `/Metadata` unchanged; those are judged on
+    /// their own.
+    fn catalog(older: &Object, newer: &Object) -> Option<DocumentChange> {
+        let (Some(old), Some(new)) = (older.dictionary(), newer.dictionary()) else {
+            return Some(DocumentChange::Catalog);
+        };
+        changed_beyond(
+            old,
+            new,
+            &[KEY_DSS, KEY_ACROFORM, KEY_EXTENSIONS, KEY_METADATA],
+        )
+        .then_some(DocumentChange::Catalog)
+    }
+
+    /// A rewritten page: every entry other than `/Annots` unchanged;
+    /// `/Annots` is judged on its own.
+    fn page(older: &Object, newer: &Object) -> Option<DocumentChange> {
+        let (Some(old), Some(new)) = (older.dictionary(), newer.dictionary()) else {
+            return Some(DocumentChange::Content);
+        };
+        if matches!(older, Object::Stream(..)) || matches!(newer, Object::Stream(..)) {
+            return Some(DocumentChange::Content);
+        }
+        if old.get(KEY_PARENT) != new.get(KEY_PARENT) {
+            return Some(DocumentChange::Pages);
+        }
+        changed_beyond(old, new, &[KEY_ANNOTS]).then_some(DocumentChange::Content)
+    }
+
+    /// A rewritten signature field or widget: its field carried no
+    /// value before and carries one now, and only `/V`, `/AP` and `/AS`
+    /// differ.
+    fn signature_field(
         &self,
         reference: PdfObjectReference,
-        older: Option<&Object>,
+        older: &Object,
         newer: &Object,
     ) -> Option<DocumentChange> {
-        let kind = self.after.kind_of(reference, newer);
-        let new = older.is_none();
-        if self.after.store.contains(&reference)
-            && kind == DocumentChange::Content
-            && (new || self.before.store.contains(&reference))
-        {
-            return None;
-        }
-        if self.after.metadata.contains(&reference)
-            && kind == DocumentChange::Content
-            && (new || self.before.metadata.contains(&reference))
-        {
-            return None;
-        }
-        let stream_type = |object: &Object| {
-            object.names(KEY_TYPE, TYPE_XREF) || object.names(KEY_TYPE, TYPE_OBJECT_STREAM)
-        };
-        if stream_type(newer) && older.is_none_or(stream_type) {
-            return None;
-        }
-        if newer.is_signature_value() {
-            return (!new).then_some(DocumentChange::FormField);
-        }
-        if self.after.is_signature_field(reference) {
-            return (!new && !self.before.is_signature_field(reference))
-                .then_some(DocumentChange::FormField);
-        }
-        if new && kind == DocumentChange::Content && self.after.appearances.contains(&reference) {
-            return None;
-        }
-        let older = older?;
-        if reference == self.after.root {
-            return self.catalog(older, newer);
-        }
-        if let Some(form) = self
-            .after
-            .object(self.after.root)
-            .and_then(|catalog| catalog.entry(KEY_ACROFORM).cloned())
-            && form == Value::Reference(reference)
-        {
-            return self.form(older.dictionary(), newer.dictionary());
-        }
-        if self.is_field_list(reference) {
-            return self.list(
-                self.before.list(older.value.as_ref()),
-                self.after.list(newer.value.as_ref()),
-                DocumentChange::FormField,
-            );
-        }
-        if newer.names(KEY_TYPE, TYPE_PAGE) && older.names(KEY_TYPE, TYPE_PAGE) {
-            return self.page(older, newer);
-        }
-        if self.after.annotation_arrays.contains(&reference) {
-            return self.list(
-                self.before.list(older.value.as_ref()),
-                self.after.list(newer.value.as_ref()),
-                DocumentChange::Annotation,
-            );
-        }
-        Some(kind)
-    }
-
-    /// Whether `reference` is the array the newest `/AcroForm` names
-    /// as its `/Fields`.
-    fn is_field_list(&self, reference: PdfObjectReference) -> bool {
-        let Some(catalog) = self.after.object(self.after.root) else {
-            return false;
-        };
-        self.after
-            .dictionary_of(catalog.entry(KEY_ACROFORM))
-            .is_some_and(|form| form.get(KEY_FIELDS) == Some(&Value::Reference(reference)))
-    }
-
-    /// A rewritten catalog: every entry other than `/DSS`, `/Perms`,
-    /// `/Extensions` and `/AcroForm` unchanged, and the interactive
-    /// form changed only as [`Self::form`] allows.
-    fn catalog(&self, older: &Object, newer: &Object) -> Option<DocumentChange> {
         let (Some(old), Some(new)) = (older.dictionary(), newer.dictionary()) else {
-            return Some(DocumentChange::Catalog);
-        };
-        let free = [
-            KEY_DSS,
-            KEY_PERMS,
-            KEY_EXTENSIONS,
-            KEY_METADATA,
-            KEY_ACROFORM,
-        ];
-        let others_changed = old
-            .keys()
-            .chain(new.keys())
-            .filter(|key| !free.contains(&key.as_slice()))
-            .any(|key| old.get(key) != new.get(key));
-        if others_changed {
-            return Some(DocumentChange::Catalog);
-        }
-        let (old_form, new_form) = (old.get(KEY_ACROFORM), new.get(KEY_ACROFORM));
-        if old_form == new_form && matches!(new_form, None | Some(Value::Reference(_))) {
-            return None;
-        }
-        let old_form = self.before.dictionary_of(old_form);
-        let new_form = self.after.dictionary_of(new_form);
-        self.form(old_form.as_ref(), new_form.as_ref())
-    }
-
-    /// A changed interactive form: `/SigFlags`, `/DA` and `/DR` free,
-    /// every other entry but `/Fields` unchanged, and `/Fields` gaining
-    /// only signature fields.
-    fn form(
-        &self,
-        older: Option<&BTreeMap<Vec<u8>, Value>>,
-        newer: Option<&BTreeMap<Vec<u8>, Value>>,
-    ) -> Option<DocumentChange> {
-        let (Some(old), Some(new)) = (older, newer) else {
             return Some(DocumentChange::FormField);
         };
-        let free = [
-            KEY_SIG_FLAGS,
-            KEY_DEFAULT_APPEARANCE,
-            KEY_DEFAULT_RESOURCES,
-            KEY_FIELDS,
-        ];
-        let others_changed = old
-            .keys()
-            .chain(new.keys())
-            .filter(|key| !free.contains(&key.as_slice()))
-            .any(|key| old.get(key) != new.get(key));
-        if others_changed {
-            return Some(DocumentChange::FormField);
-        }
-        let (old_fields, new_fields) = (old.get(KEY_FIELDS), new.get(KEY_FIELDS));
-        if old_fields == new_fields && matches!(new_fields, None | Some(Value::Reference(_))) {
-            return None;
-        }
-        self.list(
-            self.before.list(old_fields),
-            self.after.list(new_fields),
-            DocumentChange::FormField,
-        )
+        let filled = !self.before.is_signed(reference) && self.after.is_signed(reference);
+        (!filled || changed_beyond(old, new, &[KEY_VALUE, KEY_APPEARANCE, KEY_APPEARANCE_STATE]))
+            .then_some(DocumentChange::FormField)
     }
+}
 
-    /// A rewritten page: every entry other than `/Annots` unchanged,
-    /// and `/Annots` gaining only signature widgets.
-    fn page(&self, older: &Object, newer: &Object) -> Option<DocumentChange> {
-        let (Some(old), Some(new)) = (older.dictionary(), newer.dictionary()) else {
-            return Some(DocumentChange::Content);
-        };
-        if older.rest != newer.rest {
-            return Some(DocumentChange::Content);
-        }
-        let changed = |key: &Vec<u8>| key.as_slice() != KEY_ANNOTS && old.get(key) != new.get(key);
-        if let Some(key) = old.keys().chain(new.keys()).find(|key| changed(key)) {
-            return Some(if key.as_slice() == KEY_PARENT {
-                DocumentChange::Pages
-            } else {
-                DocumentChange::Content
-            });
-        }
-        let (old_annots, new_annots) = (old.get(KEY_ANNOTS), new.get(KEY_ANNOTS));
-        if old_annots == new_annots && matches!(new_annots, None | Some(Value::Reference(_))) {
-            return None;
-        }
-        self.list(
-            self.before.list(old_annots),
-            self.after.list(new_annots),
-            DocumentChange::Annotation,
-        )
-    }
-
-    /// A changed list of fields or annotations: nothing removed, and
-    /// every addition a signature field or widget. An addition that is
-    /// another field is a [`DocumentChange::FormField`]; a removal, an
-    /// unreadable list or any other addition is `kind`.
-    fn list(
-        &self,
-        older: Option<Vec<PdfObjectReference>>,
-        newer: Option<Vec<PdfObjectReference>>,
-        kind: DocumentChange,
-    ) -> Option<DocumentChange> {
-        let (Some(older), Some(newer)) = (older, newer) else {
-            return Some(kind);
-        };
-        if older.iter().any(|reference| !newer.contains(reference)) {
-            return Some(kind);
-        }
-        newer
-            .iter()
-            .filter(|reference| !older.contains(reference))
-            .filter(|reference| !self.after.is_signature_field(**reference))
-            .map(|reference| {
-                if self.after.field_type(*reference).is_some() {
-                    DocumentChange::FormField
-                } else {
-                    kind
-                }
-            })
-            .min()
-    }
+/// Whether `old` and `new` differ in an entry other than `free`.
+fn changed_beyond(
+    old: &BTreeMap<Vec<u8>, Value>,
+    new: &BTreeMap<Vec<u8>, Value>,
+    free: &[&[u8]],
+) -> bool {
+    old.keys()
+        .chain(new.keys())
+        .filter(|key| !free.contains(&key.as_slice()))
+        .any(|key| old.get(key) != new.get(key))
 }

@@ -56,6 +56,7 @@ pub mod xml;
 use crate::ber::{BerTag, Sequence};
 use crate::identity::Peuin;
 use crate::timestamp::{TimestampError, verify_token};
+use crate::validation::ValidationMaterial;
 use crate::x509_ext::NameExt;
 use refineid_cms::x509::{DateTime, OwnedCert};
 
@@ -734,8 +735,8 @@ struct Facts {
     signature_valid: bool,
     /// The signature's own timestamps.
     timestamps: Vec<Timestamp>,
-    /// The archive timestamps, each with its form.
-    archive_timestamps: Vec<(ArchiveForm, Timestamp)>,
+    /// The archive timestamps.
+    archive_timestamps: Vec<ArchiveFact>,
     /// Proven times of the document timestamps covering the signature.
     covering_proofs: Vec<DateTime>,
     /// What the revisions after the signed one do to the document.
@@ -759,6 +760,20 @@ enum Timestamp {
     /// A token found not valid before it is verified: an archive
     /// timestamp whose hash index does not hold.
     Refused(TimestampError),
+}
+
+/// One archive timestamp as a reader found it.
+struct ArchiveFact {
+    /// Its form.
+    form: ArchiveForm,
+    /// The token and what it imprints.
+    timestamp: Timestamp,
+    /// The validation material it covers: what the signer is judged
+    /// from when its time is the proof of existence.
+    covered: ValidationMaterial,
+    /// Validation data placed for this token alone, after it: its own
+    /// authority may be judged from it, nothing else.
+    authority_material: ValidationMaterial,
 }
 
 /// What a token's message imprint must digest.
@@ -834,33 +849,62 @@ impl Context<'_> {
     /// Turn one signature's facts into a report: its timestamps judged,
     /// the proof of existence taken from the anchored ones, and the
     /// chain and revocation judged at the validation time.
+    ///
+    /// An archive timestamp is judged from the anchors, its own token,
+    /// the material it covers and the validation data placed after it
+    /// for it only. When an archive time is the
+    /// earliest proof of existence, the signer's chain and revocation
+    /// are judged from the anchors and the material the anchored
+    /// archive timestamps cover, never from material none of them
+    /// protects (`ETSI EN 319 122-1` clause 5.5.2).
     fn report(&self, facts: Facts) -> SignatureReport {
-        let judge_one = |timestamp: &Timestamp| match timestamp {
+        let judge_one = |timestamp: &Timestamp, pool: &MaterialPool| match timestamp {
             Timestamp::Token { token, imprint } => {
-                self.judge_token(token, |algorithm| imprint.digest(algorithm), &facts.pool)
+                self.judge_token(token, |algorithm| imprint.digest(algorithm), pool)
             }
             Timestamp::Uncomputable => TimestampReport::Unsupported,
             Timestamp::Refused(error) => TimestampReport::Invalid(*error),
         };
-        let timestamps: Vec<TimestampReport> = facts.timestamps.iter().map(judge_one).collect();
-        let archive_timestamps: Vec<ArchiveTimestampReport> = facts
-            .archive_timestamps
+        let timestamps: Vec<TimestampReport> = facts
+            .timestamps
             .iter()
-            .map(|(form, timestamp)| ArchiveTimestampReport {
-                form: *form,
-                timestamp: judge_one(timestamp),
-            })
+            .map(|timestamp| judge_one(timestamp, &facts.pool))
             .collect();
-        let proof_of_existence = timestamps
+        let mut archive_pool = self.anchor_pool();
+        let mut archive_timestamps = Vec::new();
+        for archive in &facts.archive_timestamps {
+            let mut authority = self.anchor_pool();
+            authority.add_material(&archive.covered);
+            authority.add_material(&archive.authority_material);
+            let timestamp = judge_one(&archive.timestamp, &authority);
+            if timestamp.proven_time().is_some() {
+                archive_pool.add_material(&archive.covered);
+            }
+            archive_timestamps.push(ArchiveTimestampReport {
+                form: archive.form,
+                timestamp,
+            });
+        }
+        let primary = timestamps
             .iter()
-            .chain(archive_timestamps.iter().map(|archive| &archive.timestamp))
             .filter_map(TimestampReport::proven_time)
             .chain(facts.covering_proofs.iter().copied())
             .min();
+        let archived = archive_timestamps
+            .iter()
+            .filter_map(|archive| archive.timestamp.proven_time())
+            .min();
+        let (proof_of_existence, pool) = match (primary, archived) {
+            (Some(primary), Some(archived)) if archived < primary => {
+                (Some(archived), &archive_pool)
+            }
+            (None, Some(archived)) => (Some(archived), &archive_pool),
+            (primary, _) => (primary, &facts.pool),
+        };
         let validation_time = proof_of_existence.unwrap_or(self.now);
         let chain = judge(
             &facts.signer,
-            &facts.pool,
+            pool,
             self.anchors,
             AnchorRole::CertificateIssuing,
             trust::When {
@@ -1105,13 +1149,18 @@ impl Context<'_> {
             .into_iter()
             .map(|archive| {
                 let timestamp = match archive.imprint_input() {
-                    Some(input) => Timestamp::Token {
+                    xades::ArchiveInput::Computed(input) => Timestamp::Token {
                         token: archive.token().to_vec(),
-                        imprint: Imprint::Octets(input.to_vec()),
+                        imprint: Imprint::Octets(input.clone()),
                     },
-                    None => Timestamp::Uncomputable,
+                    xades::ArchiveInput::Uncomputable(_) => Timestamp::Uncomputable,
                 };
-                (ArchiveForm::Xades, timestamp)
+                ArchiveFact {
+                    form: ArchiveForm::Xades,
+                    timestamp,
+                    covered: archive.covered().clone(),
+                    authority_material: archive.authority_material().clone(),
+                }
             })
             .collect();
         SignatureRow::judged(self.report(Facts {
@@ -1193,23 +1242,31 @@ fn cades_timestamps(timestamps: &[cades::CadesTimestamp]) -> Vec<Timestamp> {
 }
 
 /// The `CAdES` archive timestamps as the report judges them.
-fn cades_archive_timestamps(
-    timestamps: Vec<cades::CadesArchiveTimestamp>,
-) -> Vec<(ArchiveForm, Timestamp)> {
+fn cades_archive_timestamps(timestamps: Vec<cades::CadesArchiveTimestamp>) -> Vec<ArchiveFact> {
     timestamps
         .into_iter()
         .map(|timestamp| match timestamp {
-            cades::CadesArchiveTimestamp::V3(Ok(archive)) => (
-                ArchiveForm::CadesV3,
-                Timestamp::Token {
+            cades::CadesArchiveTimestamp::V3(Ok(archive)) => ArchiveFact {
+                form: ArchiveForm::CadesV3,
+                timestamp: Timestamp::Token {
                     token: archive.token().to_vec(),
                     imprint: Imprint::Archive(archive.imprint().clone()),
                 },
-            ),
-            cades::CadesArchiveTimestamp::V3(Err(error)) => {
-                (ArchiveForm::CadesV3, Timestamp::Refused(error))
-            }
-            cades::CadesArchiveTimestamp::V2 => (ArchiveForm::CadesV2, Timestamp::Uncomputable),
+                covered: archive.covered().clone(),
+                authority_material: ValidationMaterial::default(),
+            },
+            cades::CadesArchiveTimestamp::V3(Err(error)) => ArchiveFact {
+                form: ArchiveForm::CadesV3,
+                timestamp: Timestamp::Refused(error),
+                covered: ValidationMaterial::default(),
+                authority_material: ValidationMaterial::default(),
+            },
+            cades::CadesArchiveTimestamp::V2 => ArchiveFact {
+                form: ArchiveForm::CadesV2,
+                timestamp: Timestamp::Uncomputable,
+                covered: ValidationMaterial::default(),
+                authority_material: ValidationMaterial::default(),
+            },
         })
         .collect()
 }

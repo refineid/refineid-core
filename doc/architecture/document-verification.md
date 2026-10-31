@@ -160,19 +160,41 @@ For each signature the report carries independent facts:
   timestamp's authority can no longer be anchored, the archive time is
   the proof the signer's chain and revocation are judged at. A CAdES
   `archive-time-stamp-v3` attribute holds exactly one value, else it
-  is invalid as malformed, and first has its `ats-hash-index-v3` validated:
-  the token carries exactly one, under SHA-256, SHA-384 or SHA-512,
-  and every hash it lists must be that of a certificate in
-  `SignedData.certificates`, an entry of `SignedData.crls`, or an
-  unsigned attribute's type followed by one of its values; a hash
-  naming nothing present makes the token invalid. Its imprint is then
+  is invalid as malformed, and first has its `ats-hash-index-v3`
+  validated: the token carries exactly one, its `AlgorithmIdentifier`
+  SHA-256, SHA-384 or SHA-512 with parameters absent or NULL, each
+  hash a primitive OCTET STRING of that length, each list bounded; and
+  every hash it lists must be that of a complete `CertificateChoices`
+  in `SignedData.certificates`, a complete `RevocationInfoChoice` in
+  `SignedData.crls`, or an unsigned attribute's type followed by one of
+  its values, each as encoded; a hash naming nothing present makes the
+  token invalid. A present value the index does not list, this token's
+  own attribute and later archive timestamps among them, is not
+  protected by it. A signature declared attached whose content is
+  absent is refused, never hashed as empty. Its imprint is then
   recomputed over the `eContentType`, the hash of the signed data under
   the index's algorithm, the `SignerInfo` fields `version` through
   `signature` and the index, each as encoded, and the token must
   imprint under that same algorithm. The token's authority is judged
   from the document's evidence and the certificates and revocation
   values of the token's own `SignedData`; certificate and revocation
-  values in the token's unsigned attributes are not consulted. An XAdES `ArchiveTimeStamp` in
+  values in the token's unsigned attributes are not consulted. An
+  archive timestamp is judged, and when its time is the earliest proof
+  of existence the signer's chain and revocation are judged, only from
+  the anchors, the token and the material it covers: for CAdES the
+  certificates and revocation values its index lists, for XAdES the
+  `ds:KeyInfo` certificates and the `CertificateValues`,
+  `RevocationValues` and `TimeStampValidationData` before it in
+  document order. Material it does not cover, appended after it, is
+  left out; when the signer is judged at the archive time, the
+  material of every anchored archive timestamp is pooled. One
+  exception serves the XAdES timestamp's own authority: a
+  `TimeStampValidationData` after it that names it by `URI`, or has no
+  `URI` and follows it as the nearest archive timestamp before it
+  (EN 319 132-1 clause 5.5.1), may be used to judge that timestamp's
+  authority path and revocation, never the signer's chain or an
+  earlier timestamp; a later archive timestamp covers it for the long
+  term like any material before it. An XAdES `ArchiveTimeStamp` in
   the 1.4.1 namespace imprints, under its canonicalisation (Canonical
   XML 1.0 when it names none), the octets every reference digests, in
   order, then `ds:SignedInfo`, `ds:SignatureValue`, `ds:KeyInfo`, each
@@ -181,9 +203,13 @@ For each signature the report carries independent facts:
   one holding the qualifying properties (clause 5.5.2.3). The
   certificates and revocation values of a `TimeStampValidationData`
   join the evidence. A CAdES `archive-time-stamp` of version 2, an
-  XAdES `ArchiveTimeStamp` in the 1.3.2 namespace, and one with
-  `xades:Include` children (time-stamped properties not sharing its
-  parent, clause 5.5.2.4) are reported unsupported.
+  XAdES `ArchiveTimeStamp` in the 1.3.2 namespace, one with
+  `xades:Include` children in either namespace (time-stamped
+  properties not sharing its parent, clause 5.5.2.4), and one under a
+  canonicalisation or over a reference the verifier does not compute
+  are reported unsupported. The octets of a reference are those its
+  verification digests; a data file is never under a transform, since
+  a transform over one makes the signature unsupported.
 - **Timestamps.** Each signature timestamp, and each archive
   timestamp with its form (CAdES v3, CAdES v2, XAdES), is reported as anchored
   (with the time it proves), claimed (verified under an authority that
@@ -234,28 +260,42 @@ For each signature the report carries independent facts:
   revisions after the one it signs do to the document (ISO 32000-1
   sec.12.8.2.2 and sec.12.8.2.4): none follow; later revisions are
   harmless; or the document was changed after signing, with the kind
-  of change. The signed revision is indexed on its own and compared
-  with the newest view object by object, values compared by meaning
-  (dictionaries by key, spacing ignored). A later revision is harmless
-  when it only adds signature and document timestamp dictionaries,
-  signature fields and their widgets, new objects their appearance
-  streams draw from, the `/DSS` and what it reaches,
-  cross-reference and object streams, and the document information
-  dictionary and the catalog's `/Metadata` stream (signing tools
-  update both, and neither changes what is rendered), and rewrites the
-  catalog only in `/DSS`, `/AcroForm`, `/Perms`, `/Extensions` and
-  `/Metadata`, the interactive form
-  only by adding signature fields to `/Fields` and changing
-  `/SigFlags`, `/DA` or `/DR`, and a page only by adding signature
-  widgets to `/Annots`. Anything else is a change after signing, typed
-  as the page tree, a form field, an annotation, the catalog, or
-  content (a content stream, a resource, any other object), the first
-  of these when several change. A change after signing makes the
-  document not intact, since the document the signer saw is not the
-  one the reader sees; harmless later revisions keep it intact. A
-  range whose bytes do not index as a document of their own does not
-  end a revision. Outside a PDF the signature always covers the whole
-  document.
+  of change. The signed revision is indexed on its own, each live
+  object of both views parsed once, values compared by meaning
+  (dictionaries by key, spacing ignored), objects matched by number;
+  the comparison is bounded by the index's entry ceiling and a ceiling
+  on the octets read, and a document past them does not end a
+  judgeable revision. A later revision is harmless when, and only
+  when, everything it adds or rewrites is one of these: signature
+  fields and widgets that carry a signature (`/V`), attached to the
+  field tree and, for a widget (its own `/Subtype /Widget`), to a
+  page's `/Annots` after the annotations already there; the signature
+  and document timestamp dictionaries those fields name; new objects
+  the `/AP` of those fields reaches; an existing signature field that
+  had no value gaining `/V`, `/AP` and `/AS`; the `/DSS` growing (new
+  streams in `/Certs`, `/OCSPs` and `/CRLs`, new `/VRI` entries, old
+  ones kept); cross-reference and object streams; the document
+  information dictionary and the catalog's `/Metadata` stream (signing
+  tools update both, and neither changes what is rendered); the
+  catalog rewritten only in `/DSS`, `/AcroForm`, `/Extensions` and
+  `/Metadata`; the interactive form only in `/Fields`, whose order is
+  free, and `/SigFlags`; and the trailer anywhere but `/Root` and the
+  first, permanent `/ID` element. `/Annots` and `/Fields` are resolved
+  on both sides whether inline or indirect, and the field tree is
+  walked through `/Kids` once per node and to a bounded depth. Anything
+  else is a change after signing, a new object that is none of these
+  included: a reordered `/Annots`, a changed `/Perms`, `/DA` or `/DR`,
+  a rewritten signed widget, a replaced store object, an unattached
+  signature field and what it reaches, an object whose generation rose
+  (the signed revision's references to it no longer resolve). It is
+  typed as the page tree, a form field, an annotation, the catalog,
+  the trailer, or content (a content stream, a resource, the store
+  beyond growing, any other object), the first of these when several
+  change. A change after signing makes the document not intact, since
+  the document the signer saw is not the one the reader sees; harmless
+  later revisions keep it intact. A range whose bytes do not index as
+  a document of their own does not end a revision. Outside a PDF the
+  signature always covers the whole document.
 
 An XAdES `CounterSignature` in a signature's unsigned properties
 holds a complete `ds:Signature` over that signature's

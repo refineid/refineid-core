@@ -485,13 +485,48 @@ impl SignatureTimestamp {
     }
 }
 
+/// Why the imprint input of an `ArchiveTimeStamp` is not computed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveUncomputable {
+    /// The element is in the 1.3.2 namespace, whose computation this
+    /// verifier does not implement.
+    Namespace132,
+    /// It carries `xades:Include` children: its time-stamped
+    /// properties do not share its parent (EN 319 132-1 sec.5.5.2.4).
+    Distributed,
+    /// It names a canonicalisation this verifier does not compute.
+    Canonicalization,
+    /// A reference's octets do not resolve.
+    Reference,
+}
+
+/// The octets an `ArchiveTimeStamp` token must imprint, or why they are
+/// not computed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArchiveInput {
+    /// The octets of EN 319 132-1 sec.5.5.2.3: those every
+    /// `ds:Reference` digests, in order, after its transform; then
+    /// `ds:SignedInfo`, `ds:SignatureValue`, `ds:KeyInfo` when present,
+    /// every unsigned signature property before the `ArchiveTimeStamp`
+    /// and every `ds:Object` but the one holding `QualifyingProperties`,
+    /// each under the timestamp's canonicalisation, Canonical XML 1.0
+    /// when it names none.
+    Computed(Vec<u8>),
+    /// Not computed, for this reason.
+    Uncomputable(ArchiveUncomputable),
+}
+
 /// One `EncapsulatedTimeStamp` of an `ArchiveTimeStamp`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveTimestamp {
     /// The RFC 3161 token.
     token: Vec<u8>,
     /// What it must imprint.
-    imprint_input: Option<Vec<u8>>,
+    imprint_input: ArchiveInput,
+    /// The validation material it covers.
+    covered: ValidationMaterial,
+    /// The `TimeStampValidationData` placed after it for it.
+    authority_material: ValidationMaterial,
 }
 
 impl ArchiveTimestamp {
@@ -501,31 +536,47 @@ impl ArchiveTimestamp {
         &self.token
     }
 
-    /// The octets the token's message imprint must digest (EN 319 132-1
-    /// sec.5.5.2.3): the octets every `ds:Reference` digests, in order;
-    /// then `ds:SignedInfo`, `ds:SignatureValue`, `ds:KeyInfo` when
-    /// present, every unsigned signature property before the
-    /// `ArchiveTimeStamp` and every `ds:Object` but the one holding
-    /// `QualifyingProperties`, each under the timestamp's
-    /// canonicalisation, Canonical XML 1.0 when it names none. `None`
-    /// when this verifier does not compute it: an `ArchiveTimeStamp` in
-    /// the 1.3.2 namespace, one with `xades:Include` children, one
-    /// under a canonicalisation this verifier does not compute, or a
-    /// reference whose octets it cannot resolve.
+    /// The octets the token's message imprint must digest, or why they
+    /// are not computed.
     #[must_use]
-    pub fn imprint_input(&self) -> Option<&[u8]> {
-        self.imprint_input.as_deref()
+    pub const fn imprint_input(&self) -> &ArchiveInput {
+        &self.imprint_input
+    }
+
+    /// The validation material the token covers: the `ds:KeyInfo`
+    /// certificates and the `CertificateValues`, `RevocationValues` and
+    /// `TimeStampValidationData` that precede the `ArchiveTimeStamp`.
+    /// Material that follows it did not exist when it was made.
+    #[must_use]
+    pub const fn covered(&self) -> &ValidationMaterial {
+        &self.covered
+    }
+
+    /// The material of the `TimeStampValidationData` that follow the
+    /// `ArchiveTimeStamp` for it (EN 319 132-1 sec.5.5.1): those naming
+    /// it by `URI`, and those without a `URI` whose nearest preceding
+    /// `ArchiveTimeStamp` it is. It serves the token's own authority
+    /// path and revocation only, never the signer's chain or an earlier
+    /// timestamp.
+    #[must_use]
+    pub const fn authority_material(&self) -> &ValidationMaterial {
+        &self.authority_material
     }
 }
 
-/// One `ArchiveTimeStamp` as read: its tokens and the canonical octets
-/// its imprint digests after the references' octets.
+/// One `ArchiveTimeStamp` as read: its tokens, the canonical octets its
+/// imprint digests after the references' octets, and the material it
+/// covers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ArchivePlan {
     /// Every `EncapsulatedTimeStamp` token.
     tokens: Vec<Vec<u8>>,
-    /// Steps 4 to 6 of EN 319 132-1 sec.5.5.2.3, when computed.
-    after_references: Option<Vec<u8>>,
+    /// Steps 4 to 6 of EN 319 132-1 sec.5.5.2.3, or why not computed.
+    after_references: ArchiveInput,
+    /// The material before it.
+    covered: ValidationMaterial,
+    /// The `TimeStampValidationData` after it for it.
+    authority_material: ValidationMaterial,
 }
 
 /// A signature feature this verifier does not implement.
@@ -904,22 +955,31 @@ impl XadesSignature {
         self.archive_timestamps
             .iter()
             .flat_map(|plan| {
-                let input = references
-                    .as_ref()
-                    .zip(plan.after_references.as_ref())
-                    .map(|(references, after)| [references.as_slice(), after].concat());
+                let input = match (&references, &plan.after_references) {
+                    (_, ArchiveInput::Uncomputable(reason)) => ArchiveInput::Uncomputable(*reason),
+                    (None, ArchiveInput::Computed(_)) => {
+                        ArchiveInput::Uncomputable(ArchiveUncomputable::Reference)
+                    }
+                    (Some(references), ArchiveInput::Computed(after)) => {
+                        ArchiveInput::Computed([references.as_slice(), after].concat())
+                    }
+                };
                 plan.tokens.iter().map(move |token| ArchiveTimestamp {
                     token: token.clone(),
                     imprint_input: input.clone(),
+                    covered: plan.covered.clone(),
+                    authority_material: plan.authority_material.clone(),
                 })
             })
             .collect()
     }
 
-    /// The octets every `ds:Reference` digests, in order: a data file's
-    /// content, or a same-document element canonicalised as its
-    /// reference says (EN 319 132-1 sec.5.5.2.3 step 3). `None` when one
-    /// does not resolve.
+    /// The octets every `ds:Reference` digests, in order, as reference
+    /// verification computes them (EN 319 132-1 sec.5.5.2.3 step 3): a
+    /// same-document element after its canonicalisation transform, or a
+    /// data file's content. A data file is only ever a target without a
+    /// transform; a reference with a transform over one makes the whole
+    /// signature unsupported. `None` when one does not resolve.
     fn reference_octets(&self, container: &AsicContainer) -> Option<Vec<u8>> {
         let mut octets = Vec::new();
         for reference in &self.references {
@@ -1009,17 +1069,65 @@ fn encapsulated(
         .map_err(|_ignored| XadesReadError::Malformed("encapsulated value is not base64"))
 }
 
+/// Add the validation material of one unsigned signature property to
+/// `material`: a `CertificateValues`, a `RevocationValues`, or a
+/// `TimeStampValidationData` holding them (EN 319 132-1 sec.5.4 and
+/// sec.5.5.1). Any other property adds nothing.
+fn property_material(
+    property: ElementRef<'_>,
+    material: &mut ValidationMaterial,
+) -> Result<(), XadesReadError> {
+    if property.is(NAMESPACE_XADES_141, ELEMENT_TIMESTAMP_VALIDATION_DATA) {
+        for inner in property.children() {
+            if !inner.is(NAMESPACE_XADES_141, ELEMENT_TIMESTAMP_VALIDATION_DATA) {
+                property_material(inner, material)?;
+            }
+        }
+    } else if property.is(NAMESPACE_XADES, ELEMENT_CERTIFICATE_VALUES) {
+        material
+            .certificates
+            .extend(encapsulated(property, ELEMENT_ENCAPSULATED_CERTIFICATE)?);
+    } else if property.is(NAMESPACE_XADES, ELEMENT_REVOCATION_VALUES) {
+        for crls in property.children_named(NAMESPACE_XADES, ELEMENT_CRL_VALUES) {
+            material
+                .crls
+                .extend(encapsulated(crls, ELEMENT_ENCAPSULATED_CRL)?);
+        }
+        for responses in property.children_named(NAMESPACE_XADES, ELEMENT_OCSP_VALUES) {
+            material
+                .ocsp_responses
+                .extend(encapsulated(responses, ELEMENT_ENCAPSULATED_OCSP)?);
+        }
+    }
+    Ok(())
+}
+
 /// Read every `ArchiveTimeStamp` of `unsigned`, in either namespace,
 /// with steps 4 to 6 of its imprint input (EN 319 132-1 sec.5.5.2.3)
-/// when it is in the 1.4.1 namespace, carries no `xades:Include` and
-/// names a canonicalisation this verifier computes.
+/// when it is in the 1.4.1 namespace, carries no `xades:Include` in
+/// either namespace and names a canonicalisation this verifier
+/// computes, and with the material it covers: the `ds:KeyInfo`
+/// certificates and the material of the properties before it.
 fn read_archive_timestamps(
     signature: ElementRef<'_>,
     signed_info: ElementRef<'_>,
     signature_value: ElementRef<'_>,
     unsigned: ElementRef<'_>,
 ) -> Result<Vec<ArchivePlan>, XadesReadError> {
-    let mut plans = Vec::new();
+    let key_info = signature.child(NAMESPACE_DSIG, ELEMENT_KEY_INFO);
+    let mut covered = ValidationMaterial::default();
+    for certificate in key_info
+        .into_iter()
+        .flat_map(|key_info| key_info.children_named(NAMESPACE_DSIG, ELEMENT_X509_DATA))
+        .flat_map(|data| data.children_named(NAMESPACE_DSIG, ELEMENT_X509_CERTIFICATE))
+    {
+        covered.certificates.push(
+            base64::decode_wrapped(&certificate.text())
+                .map_err(|_ignored| XadesReadError::Malformed("X509Certificate is not base64"))?,
+        );
+    }
+    let mut plans: Vec<ArchivePlan> = Vec::new();
+    let mut stamps: Vec<ElementRef<'_>> = Vec::new();
     let mut preceding: Vec<ElementRef<'_>> = Vec::new();
     for property in unsigned.children() {
         let current = property.is(NAMESPACE_XADES_141, ELEMENT_ARCHIVE_TIMESTAMP);
@@ -1028,34 +1136,61 @@ fn read_archive_timestamps(
                 None => Some(default_canonicalization()),
                 Some(method) => canonicalization_method(method),
             };
-            let distributed = property
-                .children_named(NAMESPACE_XADES, ELEMENT_INCLUDE)
-                .next()
-                .is_some();
-            let after_references = method.filter(|_| current && !distributed).map(|method| {
-                let mut octets = signed_info.canonicalize(&method);
-                octets.extend_from_slice(&signature_value.canonicalize(&method));
-                if let Some(key_info) = signature.child(NAMESPACE_DSIG, ELEMENT_KEY_INFO) {
-                    octets.extend_from_slice(&key_info.canonicalize(&method));
-                }
-                for earlier in &preceding {
-                    octets.extend_from_slice(&earlier.canonicalize(&method));
-                }
-                for object in signature.children_named(NAMESPACE_DSIG, ELEMENT_OBJECT) {
-                    if object
-                        .child(NAMESPACE_XADES, ELEMENT_QUALIFYING_PROPERTIES)
-                        .is_none()
-                    {
-                        octets.extend_from_slice(&object.canonicalize(&method));
-                    }
-                }
-                octets
+            let distributed = property.children().any(|child| {
+                child.is(NAMESPACE_XADES, ELEMENT_INCLUDE)
+                    || child.is(NAMESPACE_XADES_141, ELEMENT_INCLUDE)
             });
+            let after_references = match method {
+                _ if !current => ArchiveInput::Uncomputable(ArchiveUncomputable::Namespace132),
+                _ if distributed => ArchiveInput::Uncomputable(ArchiveUncomputable::Distributed),
+                None => ArchiveInput::Uncomputable(ArchiveUncomputable::Canonicalization),
+                Some(method) => {
+                    let mut octets = signed_info.canonicalize(&method);
+                    octets.extend_from_slice(&signature_value.canonicalize(&method));
+                    if let Some(key_info) = key_info {
+                        octets.extend_from_slice(&key_info.canonicalize(&method));
+                    }
+                    for earlier in &preceding {
+                        octets.extend_from_slice(&earlier.canonicalize(&method));
+                    }
+                    for object in signature.children_named(NAMESPACE_DSIG, ELEMENT_OBJECT) {
+                        if object
+                            .child(NAMESPACE_XADES, ELEMENT_QUALIFYING_PROPERTIES)
+                            .is_none()
+                        {
+                            octets.extend_from_slice(&object.canonicalize(&method));
+                        }
+                    }
+                    ArchiveInput::Computed(octets)
+                }
+            };
             plans.push(ArchivePlan {
                 tokens: encapsulated(property, ELEMENT_ENCAPSULATED_TIMESTAMP)?,
                 after_references,
+                covered: covered.clone(),
+                authority_material: ValidationMaterial::default(),
             });
+            stamps.push(property);
+        } else if property.is(NAMESPACE_XADES_141, ELEMENT_TIMESTAMP_VALIDATION_DATA) {
+            let named = property.attribute(ATTRIBUTE_URI).map(|uri| {
+                stamps.iter().position(|stamp| {
+                    uri.strip_prefix(FRAGMENT_MARK).is_some_and(|id| {
+                        stamp.attribute(ATTRIBUTE_ID) == Some(id)
+                            || stamp
+                                .children()
+                                .any(|token| token.attribute(ATTRIBUTE_ID) == Some(id))
+                    })
+                })
+            });
+            let target = match named {
+                Some(position) => position,
+                None => stamps.len().checked_sub(1),
+            };
+            if let Some(plan) = target.and_then(|position| plans.get_mut(position)) {
+                property_material(property, &mut plan.authority_material)?;
+            }
         }
+        property_material(property, &mut covered)?;
         preceding.push(property);
     }
     Ok(plans)
@@ -1085,31 +1220,8 @@ fn read_unsigned(
             });
         }
     }
-    let holders: Vec<ElementRef<'_>> = core::iter::once(unsigned)
-        .chain(unsigned.children_named(NAMESPACE_XADES_141, ELEMENT_TIMESTAMP_VALIDATION_DATA))
-        .collect();
-    for values in holders
-        .iter()
-        .flat_map(|holder| holder.children_named(NAMESPACE_XADES, ELEMENT_CERTIFICATE_VALUES))
-    {
-        material
-            .certificates
-            .extend(encapsulated(values, ELEMENT_ENCAPSULATED_CERTIFICATE)?);
-    }
-    for values in holders
-        .iter()
-        .flat_map(|holder| holder.children_named(NAMESPACE_XADES, ELEMENT_REVOCATION_VALUES))
-    {
-        for crls in values.children_named(NAMESPACE_XADES, ELEMENT_CRL_VALUES) {
-            material
-                .crls
-                .extend(encapsulated(crls, ELEMENT_ENCAPSULATED_CRL)?);
-        }
-        for responses in values.children_named(NAMESPACE_XADES, ELEMENT_OCSP_VALUES) {
-            material
-                .ocsp_responses
-                .extend(encapsulated(responses, ELEMENT_ENCAPSULATED_OCSP)?);
-        }
+    for property in unsigned.children() {
+        property_material(property, material)?;
     }
     Ok(())
 }
@@ -1656,7 +1768,10 @@ mod tests {
         )
         .clone();
         assert_eq!(archive.token(), FIRST_TOKEN);
-        assert!(archive.imprint_input().is_some());
+        assert!(matches!(
+            archive.imprint_input(),
+            super::ArchiveInput::Computed(_)
+        ));
     }
 
     #[test]

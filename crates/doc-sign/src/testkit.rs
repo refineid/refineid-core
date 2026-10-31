@@ -437,6 +437,32 @@ pub fn archive_timestamp_token(
     generated: DateTime,
     hash_index: &[u8],
 ) -> Vec<u8> {
+    archive_timestamp_token_indexed(
+        tsa,
+        tsa_key,
+        algorithm,
+        imprint,
+        generated,
+        &[hash_index.to_vec()],
+    )
+}
+
+/// As [`archive_timestamp_token`], carrying one `ats-hash-index-v3`
+/// attribute for each of `hash_indexes`, so a test can give none or
+/// several.
+#[must_use]
+pub fn archive_timestamp_token_indexed(
+    tsa: &[u8],
+    tsa_key: &TestKey,
+    algorithm: DigestAlgorithm,
+    imprint: &[u8],
+    generated: DateTime,
+    hash_indexes: &[Vec<u8>],
+) -> Vec<u8> {
+    let attributes: Vec<Vec<u8>> = hash_indexes
+        .iter()
+        .map(|index| attribute(known::ATS_HASH_INDEX_V3, index))
+        .collect();
     timestamp_token_with(
         tsa,
         tsa_key,
@@ -444,7 +470,7 @@ pub fn archive_timestamp_token(
         imprint,
         generated,
         &[],
-        &[attribute(known::ATS_HASH_INDEX_V3, hash_index)],
+        &attributes,
     )
 }
 
@@ -484,7 +510,7 @@ pub fn ats_hash_index_v3(
 /// When `pdf` does not index or has no `/Root`.
 #[must_use]
 pub fn incremental_update(pdf: &[u8], objects: &[(u32, &[u8])]) -> Vec<u8> {
-    update_naming_info(pdf, objects, None)
+    update(pdf, &at_generation_zero(objects), &Trailer::default())
 }
 
 /// As [`incremental_update`], the new trailer naming object `info` as
@@ -494,17 +520,71 @@ pub fn incremental_update(pdf: &[u8], objects: &[(u32, &[u8])]) -> Vec<u8> {
 /// As [`incremental_update`].
 #[must_use]
 pub fn incremental_update_with_info(pdf: &[u8], objects: &[(u32, &[u8])], info: u32) -> Vec<u8> {
-    update_naming_info(pdf, objects, Some(info))
+    let trailer = Trailer {
+        info: Some(info),
+        root: None,
+    };
+    update(pdf, &at_generation_zero(objects), &trailer)
 }
 
-/// [`incremental_update`], naming `info` in the trailer when given.
-fn update_naming_info(pdf: &[u8], objects: &[(u32, &[u8])], info: Option<u32>) -> Vec<u8> {
+/// As [`incremental_update`], the new trailer naming object `root` at
+/// generation zero as the catalog.
+///
+/// # Panics
+/// As [`incremental_update`].
+#[must_use]
+pub fn incremental_update_with_root(pdf: &[u8], objects: &[(u32, &[u8])], root: u32) -> Vec<u8> {
+    let trailer = Trailer {
+        info: None,
+        root: Some(root),
+    };
+    update(pdf, &at_generation_zero(objects), &trailer)
+}
+
+/// As [`incremental_update`], each `(number, generation, body)`
+/// written at its own generation (ISO 32000-1 sec.7.5.6: an object
+/// whose number is reused after it is freed takes a higher one).
+///
+/// # Panics
+/// As [`incremental_update`].
+#[must_use]
+pub fn incremental_update_at_generation(pdf: &[u8], objects: &[(u32, u16, &[u8])]) -> Vec<u8> {
+    update(pdf, objects, &Trailer::default())
+}
+
+/// What an update's trailer names beyond `/Size` and `/Prev`.
+#[derive(Default)]
+struct Trailer {
+    /// The document information dictionary.
+    info: Option<u32>,
+    /// A catalog other than the previous trailer's.
+    root: Option<u32>,
+}
+
+/// `objects` at generation zero.
+fn at_generation_zero<'a>(objects: &[(u32, &'a [u8])]) -> Vec<(u32, u16, &'a [u8])> {
+    objects
+        .iter()
+        .map(|(number, body)| (*number, u16::MIN, *body))
+        .collect()
+}
+
+/// [`incremental_update`] with each object at its generation and the
+/// trailer naming what `trailer` says.
+fn update(pdf: &[u8], objects: &[(u32, u16, &[u8])], trailer: &Trailer) -> Vec<u8> {
     use crate::pades::index::{PdfIndex, dictionary_integer, dictionary_reference};
     let index = PdfIndex::parse(pdf).expect("the PDF indexes");
-    let root = dictionary_reference(index.trailer(), b"/Root").expect("a /Root");
+    let root = trailer.root.map_or_else(
+        || {
+            dictionary_reference(index.trailer(), b"/Root")
+                .expect("a /Root")
+                .rendered()
+        },
+        |root| format!("{root} 0 R"),
+    );
     let size = objects
         .iter()
-        .map(|(number, _body)| number.saturating_add(1))
+        .map(|(number, _generation, _body)| number.saturating_add(1))
         .chain(dictionary_integer(index.trailer(), b"/Size"))
         .max()
         .unwrap_or_default();
@@ -514,22 +594,24 @@ fn update_naming_info(pdf: &[u8], objects: &[(u32, &[u8])], info: Option<u32>) -
         out.push(b'\n');
     }
     let mut offsets = Vec::new();
-    for (number, body) in objects {
-        offsets.push((*number, out.len()));
-        out.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+    for (number, generation, body) in objects {
+        offsets.push((*number, *generation, out.len()));
+        out.extend_from_slice(format!("{number} {generation} obj\n").as_bytes());
         out.extend_from_slice(body);
         out.extend_from_slice(b"\nendobj\n");
     }
     let xref_at = out.len();
     out.extend_from_slice(b"xref\n");
-    for (number, offset) in offsets {
-        out.extend_from_slice(format!("{number} 1\n{offset:010} 00000 n \n").as_bytes());
+    for (number, generation, offset) in offsets {
+        out.extend_from_slice(format!("{number} 1\n{offset:010} {generation:05} n \n").as_bytes());
     }
+    let info = trailer
+        .info
+        .map(|info| format!(" /Info {info} 0 R"))
+        .unwrap_or_default();
     out.extend_from_slice(
         format!(
-            "trailer\n<< /Size {size} /Root {}{} /Prev {previous} >>\nstartxref\n{xref_at}\n%%EOF\n",
-            root.rendered(),
-            info.map(|info| format!(" /Info {info} 0 R")).unwrap_or_default()
+            "trailer\n<< /Size {size} /Root {root}{info} /Prev {previous} >>\nstartxref\n{xref_at}\n%%EOF\n"
         )
         .as_bytes(),
     );

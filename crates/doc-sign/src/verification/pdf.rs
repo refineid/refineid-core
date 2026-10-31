@@ -1898,4 +1898,64 @@ mod tests {
         );
         assert_eq!(document.signatures().len(), 1);
     }
+
+    /// A later revision that rewrites a page inside a new object stream
+    /// is seen through the live view and judged a change.
+    #[test]
+    fn an_object_rewritten_through_a_new_object_stream_is_a_change() {
+        let (pdf, _digest) = signed(&classic_pdf(&page_objects(), ""));
+        let page_number = PAGE_OBJECTS.len();
+        let index = PdfIndex::parse(&pdf).expect("the signed PDF indexes");
+        let page = index
+            .object_body(u32::try_from(page_number).expect("small fixture"))
+            .expect("the page");
+        let size =
+            crate::pades::index::dictionary_usize(index.trailer(), b"/Size").expect("a /Size");
+        let container = size;
+        let stream_number = container + FIRST_OBJECT;
+        let mut updated = pdf.clone();
+        let container_at = updated.len();
+        updated.extend_from_slice(format!("{container} 0 obj\n").as_bytes());
+        updated.extend_from_slice(&object_stream(
+            page_number,
+            &[replaced(&page, b"200 200", b"200 300")],
+        ));
+        updated.extend_from_slice(b"\nendobj\n");
+        let rows = [
+            Row {
+                number: page_number,
+                kind: XREF_TYPE_COMPRESSED,
+                second: container,
+                third: u16::MIN,
+            },
+            Row {
+                number: container,
+                kind: XREF_TYPE_DIRECT,
+                second: container_at,
+                third: u16::MIN,
+            },
+        ];
+        let at = updated.len();
+        let updated = closed_by(
+            updated,
+            &xref_stream(
+                stream_number,
+                at,
+                &rows,
+                stream_number + FIRST_OBJECT,
+                &format!(" /Prev {}", last_start_xref(&pdf)),
+            ),
+        );
+        let [signature] = exactly(
+            PdfDocument::parse(&updated)
+                .expect("the updated PDF parses")
+                .signatures(),
+            "one signature",
+        )
+        .clone();
+        assert_eq!(
+            signature.revision(),
+            Some(Revision::ChangedAfterSigning(DocumentChange::Content))
+        );
+    }
 }

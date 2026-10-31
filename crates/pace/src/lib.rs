@@ -43,7 +43,7 @@ mod public_contract_tests {
     use zeroize::{Zeroize, ZeroizeOnDrop};
 
     use super::{Can, PaceSession, Ssc, UnvalidatedCan};
-    use crate::crypto::brainpool_p384::AffinePoint;
+    use crate::crypto::brainpool_p384::Point;
     use crate::crypto::symmetric::Aes256Key;
 
     trait AmbiguousIfImplemented<Disambiguator, Marker> {
@@ -121,7 +121,7 @@ mod public_contract_tests {
         // by an explicit clone and can be wiped on request, so the
         // handshake's secret-dependent points never spread by implicit
         // copy and die with their zeroizing owner.
-        require_zeroize::<AffinePoint>();
-        let _ = <AffinePoint as AmbiguousIfImplemented<_, CopyMarker>>::marker;
+        require_zeroize::<Point>();
+        let _ = <Point as AmbiguousIfImplemented<_, CopyMarker>>::marker;
     }
 }

@@ -28,7 +28,7 @@
 //! session generator; agree an ephemeral shared point; and exchange and
 //! verify mutual authentication tokens.
 
-use crypto_bigint::U384;
+use bp384::elliptic_curve::bigint::Reduce as _;
 use subtle::ConstantTimeEq as _;
 use zeroize::{ZeroizeOnDrop, Zeroizing};
 
@@ -37,7 +37,7 @@ use refineid_ber::{BerEncodeError, BerError, BerTag, BerTlv};
 
 use crate::can::Can;
 use crate::commands::{GeneralAuthenticate, MseSetAt};
-use crate::crypto::brainpool_p384::{AffinePoint, n as brainpool_n};
+use crate::crypto::brainpool_p384::{FieldBytes, NonZeroScalar, Point, Scalar};
 use crate::crypto::container::{AesCbc, Ciphertext};
 use crate::crypto::symmetric::{
     AES_BLOCK, Aes256Key, CMAC_TAG_TRUNCATED, KdfParam, aes256_cbc_decrypt_no_padding,
@@ -102,9 +102,6 @@ const NONCE_LEN: usize = AES_BLOCK;
 
 /// The card's mutual-authentication token length.
 const AUTH_TOKEN_LEN: usize = CMAC_TAG_TRUNCATED;
-
-/// Length of a scalar draw, in bytes.
-const SCALAR_LEN: usize = 48;
 
 /// Mechanism-reference object tag inside `MSE:Set AT`.
 const TAG_MSE_MECHANISM: u8 = 0x80;
@@ -264,11 +261,11 @@ impl<E> From<CommandDataError> for PaceError<E> {
 #[derive(ZeroizeOnDrop)]
 pub(crate) struct PaceMidwayState {
     /// The card's key-agreement public point.
-    v_picc: AffinePoint,
+    v_picc: Point,
     /// The terminal's ephemeral private scalar.
-    u_pcd: U384,
+    u_pcd: NonZeroScalar,
     /// The terminal's key-agreement public point.
-    u_pcd_public: AffinePoint,
+    u_pcd_public: Point,
 }
 
 /// Run the full PACE-with-CAN handshake.
@@ -373,7 +370,7 @@ fn map_nonce_and_key_agreement<T: CardTransport>(
     nonce: &[u8; NONCE_LEN],
 ) -> Result<PaceMidwayState, PaceError<T::Error>> {
     let x_pcd = random_scalar_mod_n()?;
-    let x_pcd_public = AffinePoint::generator().scalar_mul(&x_pcd);
+    let x_pcd_public = Point::generator().scalar_mul(&x_pcd);
     let x_pcd_bytes = x_pcd_public
         .encode_uncompressed()
         .ok_or(PaceError::InvalidPoint)?;
@@ -389,14 +386,14 @@ fn map_nonce_and_key_agreement<T: CardTransport>(
     let response = exchange(transport, &command, "GA-2 map nonce")?;
     let outer = BerTlv::<DynamicAuthData>::parse(&response.body)?;
     let card_y = BerTlv::<MappingDataOut>::parse(outer.value())?;
-    let y_picc = AffinePoint::decode_uncompressed(card_y.value()).ok_or(PaceError::InvalidPoint)?;
+    let y_picc = Point::decode_uncompressed(card_y.value()).ok_or(PaceError::InvalidPoint)?;
     reject_reflection(&x_pcd_public, &y_picc)?;
 
     // The mapped generator and everything it is built from depend on
     // the nonce and the private scalar; each lives in a scrubbed owner.
     let h = Zeroizing::new(y_picc.scalar_mul(&x_pcd));
     let s_scalar = scalar_from_nonce(nonce);
-    let s_g = Zeroizing::new(AffinePoint::generator().scalar_mul(&s_scalar));
+    let s_g = Zeroizing::new(Point::generator().scalar_mul(&s_scalar));
     let mapped_g = Zeroizing::new(s_g.add(&h));
 
     let u_pcd = random_scalar_mod_n()?;
@@ -416,7 +413,7 @@ fn map_nonce_and_key_agreement<T: CardTransport>(
     let response = exchange(transport, &command, "GA-3 key agreement")?;
     let outer = BerTlv::<DynamicAuthData>::parse(&response.body)?;
     let card_v = BerTlv::<KeyAgreeOut>::parse(outer.value())?;
-    let v_picc = AffinePoint::decode_uncompressed(card_v.value()).ok_or(PaceError::InvalidPoint)?;
+    let v_picc = Point::decode_uncompressed(card_v.value()).ok_or(PaceError::InvalidPoint)?;
     reject_reflection(&u_pcd_public, &v_picc)?;
 
     Ok(PaceMidwayState {
@@ -433,11 +430,10 @@ pub(crate) fn run_mutual_authentication<T: CardTransport>(
     state: PaceMidwayState,
 ) -> Result<PaceSession, PaceError<T::Error>> {
     let shared = Zeroizing::new(state.v_picc.scalar_mul(&state.u_pcd));
-    let shared_x = Zeroizing::new(shared.coords.as_ref().ok_or(PaceError::InvalidPoint)?.0);
-    let shared_x_bytes = Zeroizing::new(shared_x.to_be_bytes());
+    let shared_x_bytes = shared.x_coordinate().ok_or(PaceError::InvalidPoint)?;
 
-    let k_enc = kdf_aes256(shared_x_bytes.as_ref(), KdfParam::Encryption);
-    let k_mac = kdf_aes256(shared_x_bytes.as_ref(), KdfParam::Mac);
+    let k_enc = kdf_aes256(shared_x_bytes.as_slice(), KdfParam::Encryption);
+    let k_mac = kdf_aes256(shared_x_bytes.as_slice(), KdfParam::Mac);
 
     let token_for_card = encode_auth_token(&state.v_picc).ok_or(PaceError::InvalidPoint)?;
     let t_pcd = aes256_cmac_truncated(k_mac.as_bytes(), &token_for_card);
@@ -476,7 +472,7 @@ pub(crate) fn run_mutual_authentication<T: CardTransport>(
 /// Build the authentication-token message-authentication input over a
 /// public point with the PACE mechanism identifier (BSI TR-03110-3
 /// section A.2.4). `None` for the point at infinity, a degenerate input.
-fn encode_auth_token(point: &AffinePoint) -> Option<Vec<u8>> {
+fn encode_auth_token(point: &Point) -> Option<Vec<u8>> {
     let point_bytes = point.encode_uncompressed()?;
     let mut inner = refineid_ber::BerEncoder::with_capacity(PACE_MECHANISM_OID.len());
     inner.push_tlv(TAG_ASN1_OID, PACE_MECHANISM_OID).ok()?;
@@ -491,52 +487,53 @@ fn encode_auth_token(point: &AffinePoint) -> Option<Vec<u8>> {
 /// check that the two key-agreement public keys differ; the mapping
 /// exchange gets the same check. Both run before anything derived from
 /// the card's point is computed or sent.
-fn reject_reflection<E>(ours: &AffinePoint, theirs: &AffinePoint) -> Result<(), PaceError<E>> {
+fn reject_reflection<E>(ours: &Point, theirs: &Point) -> Result<(), PaceError<E>> {
     if bool::from(ours.ct_eq(theirs)) {
         return Err(PaceError::ReflectedKey);
     }
     Ok(())
 }
 
-/// Draw a random scalar in the range one up to the subgroup order, by
-/// rejection sampling. The draw buffer and the scalar are both scrubbed
-/// owners: the scalar is a private key for the rest of the handshake.
-fn random_scalar_mod_n<E>() -> Result<Zeroizing<U384>, PaceError<E>> {
-    let order = brainpool_n();
+/// Draw a random scalar in the range one up to the subgroup order minus
+/// one, by rejection sampling: a draw is kept only when its big-endian
+/// value is a canonical, nonzero scalar. The draw buffer and the scalar
+/// are both scrubbed owners: the scalar is a private key for the rest of
+/// the handshake.
+fn random_scalar_mod_n<E>() -> Result<Zeroizing<NonZeroScalar>, PaceError<E>> {
     loop {
-        let mut buffer = Zeroizing::new([0_u8; SCALAR_LEN]);
-        rng::fill(buffer.as_mut()).map_err(PaceError::Random)?;
-        let candidate = Zeroizing::new(U384::from_be_slice(buffer.as_ref()));
-        let nonzero = *candidate != U384::ZERO;
-        let in_range = *candidate < order;
-        if nonzero && in_range {
-            return Ok(candidate);
+        let mut buffer = Zeroizing::new(FieldBytes::default());
+        rng::fill(buffer.as_mut_slice()).map_err(PaceError::Random)?;
+        if let Some(scalar) = NonZeroScalar::from_repr(*buffer).into_option() {
+            return Ok(Zeroizing::new(scalar));
         }
     }
 }
 
 /// Lift a nonce to a scalar by left-padding with zeros to the scalar
-/// width; the result is always below the subgroup order. The scalar is
-/// the CAN-protected mapping secret, so it is a scrubbed owner.
-fn scalar_from_nonce(nonce: &[u8; NONCE_LEN]) -> Zeroizing<U384> {
-    let mut padded = Zeroizing::new([0_u8; SCALAR_LEN]);
-    padded[SCALAR_LEN - NONCE_LEN..].copy_from_slice(nonce);
-    Zeroizing::new(U384::from_be_slice(padded.as_ref()))
+/// width; the value is always below the subgroup order, so the reduction
+/// leaves it unchanged. The scalar is the CAN-protected mapping secret,
+/// so it is a scrubbed owner.
+fn scalar_from_nonce(nonce: &[u8; NONCE_LEN]) -> Zeroizing<Scalar> {
+    let mut padded = Zeroizing::new(FieldBytes::default());
+    let pad = padded.len() - NONCE_LEN;
+    padded[pad..].copy_from_slice(nonce);
+    Zeroizing::new(Scalar::reduce(&*padded))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTH_TOKEN_LEN, AffinePoint, BSI_TR03110_ZERO_IV, DynamicAuthData, KdfParam,
-        NONCE_LEN as AES_NONCE_LEN, PACE_MECHANISM_OID, PaceError, PaceMidwayState, Ssc,
+        AUTH_TOKEN_LEN, BSI_TR03110_ZERO_IV, DynamicAuthData, KdfParam, NONCE_LEN as AES_NONCE_LEN,
+        NonZeroScalar, PACE_MECHANISM_OID, PaceError, PaceMidwayState, Point, Scalar, Ssc,
         TAG_AUTH_TOKEN_PCD, TAG_DYNAMIC_AUTH, aes256_cmac_truncated, encode_auth_token, kdf_aes256,
         random_scalar_mod_n, reject_reflection, scalar_from_nonce,
     };
     use crate::can::{Can, UnvalidatedCan};
     use crate::commands::GeneralAuthenticate;
-    use crate::crypto::brainpool_p384::n as brainpool_n;
     use crate::crypto::symmetric::{Aes256Key, aes256_cbc_encrypt_no_padding};
-    use crypto_bigint::U384;
+    use bp384::elliptic_curve::Curve as _;
+    use bp384::elliptic_curve::ff::PrimeField as _;
+    use bp384::{ArrayEncoding as _, BrainpoolP384r1, U384};
     use refineid_apdu::{
         APDU_HEADER_LEN, CardTransport, CommandApdu, CredentialCommand, ResponseApdu,
         TransportOutcome,
@@ -676,7 +673,7 @@ mod tests {
                         card_answer(TAG_MAPPING_PICC, &terminal_object::<MapPcdPublic>(command))
                     }
                     Reflect::KeyAgreement => {
-                        let generator = AffinePoint::generator()
+                        let generator = Point::generator()
                             .encode_uncompressed()
                             .expect("generator encodes");
                         card_answer(TAG_MAPPING_PICC, generator.as_bytes())
@@ -704,9 +701,9 @@ mod tests {
     /// its own (ICAO Doc 9303 Part 11 section 4.4).
     struct HonestCard {
         exchanges: usize,
-        mapped_generator: Option<AffinePoint>,
-        terminal_key_agreement: Option<AffinePoint>,
-        card_key_agreement: Option<AffinePoint>,
+        mapped_generator: Option<Point>,
+        terminal_key_agreement: Option<Point>,
+        card_key_agreement: Option<Point>,
         k_mac: Option<Aes256Key>,
     }
 
@@ -721,11 +718,11 @@ mod tests {
             }
         }
 
-        fn decode(bytes: &[u8]) -> AffinePoint {
-            AffinePoint::decode_uncompressed(bytes).expect("terminal point decodes")
+        fn decode(bytes: &[u8]) -> Point {
+            Point::decode_uncompressed(bytes).expect("terminal point decodes")
         }
 
-        fn encode(point: &AffinePoint) -> Vec<u8> {
+        fn encode(point: &Point) -> Vec<u8> {
             point
                 .encode_uncompressed()
                 .expect("finite point")
@@ -743,18 +740,17 @@ mod tests {
 
         fn map(&mut self, command: &CommandApdu) -> TransportOutcome {
             let terminal = Self::decode(&terminal_object::<MapPcdPublic>(command));
-            let card_scalar = U384::from(CARD_SCALAR);
-            let card_public = AffinePoint::generator().scalar_mul(&card_scalar);
+            let card_scalar = Scalar::from(CARD_SCALAR);
+            let card_public = Point::generator().scalar_mul(&card_scalar);
             let shared = terminal.scalar_mul(&card_scalar);
-            let nonce_point =
-                AffinePoint::generator().scalar_mul(&scalar_from_nonce(SYNTHETIC_NONCE));
+            let nonce_point = Point::generator().scalar_mul(&scalar_from_nonce(SYNTHETIC_NONCE));
             self.mapped_generator = Some(nonce_point.add(&shared));
             card_answer(TAG_MAPPING_PICC, &Self::encode(&card_public))
         }
 
         fn agree(&mut self, command: &CommandApdu) -> TransportOutcome {
             let terminal = Self::decode(&terminal_object::<KeyAgreePcdPublic>(command));
-            let card_scalar = U384::from(CARD_KEY_AGREEMENT_SCALAR);
+            let card_scalar = Scalar::from(CARD_KEY_AGREEMENT_SCALAR);
             let card_public = self
                 .mapped_generator
                 .as_ref()
@@ -762,11 +758,9 @@ mod tests {
                 .scalar_mul(&card_scalar);
             let shared_x = terminal
                 .scalar_mul(&card_scalar)
-                .coords
-                .expect("shared point is finite")
-                .0
-                .to_be_bytes();
-            self.k_mac = Some(kdf_aes256(shared_x.as_ref(), KdfParam::Mac));
+                .x_coordinate()
+                .expect("shared point is finite");
+            self.k_mac = Some(kdf_aes256(shared_x.as_slice(), KdfParam::Mac));
             self.terminal_key_agreement = Some(terminal);
             let answer = card_answer(TAG_KEY_AGREE_PICC, &Self::encode(&card_public));
             self.card_key_agreement = Some(card_public);
@@ -826,12 +820,12 @@ mod tests {
 
     #[test]
     fn reject_reflection_refuses_an_equal_point() {
-        let g = AffinePoint::generator();
+        let g = Point::generator();
         assert!(matches!(
             reject_reflection::<core::convert::Infallible>(&g, &g),
             Err(PaceError::ReflectedKey)
         ));
-        assert!(reject_reflection::<core::convert::Infallible>(&g, &g.double()).is_ok());
+        assert!(reject_reflection::<core::convert::Infallible>(&g, &g.add(&g)).is_ok());
     }
 
     #[test]
@@ -876,12 +870,13 @@ mod tests {
 
     #[test]
     fn random_scalars_are_in_range() {
-        let order = brainpool_n();
+        let order = BrainpoolP384r1::ORDER.get();
         for _round in 0..SCALAR_ROUNDS {
             let scalar = random_scalar_mod_n::<core::convert::Infallible>()
                 .expect("scalar generation succeeds");
-            let nonzero = *scalar != U384::ZERO;
-            let in_range = *scalar < order;
+            let value = U384::from_be_byte_array(scalar.to_repr());
+            let nonzero = value != U384::ZERO;
+            let in_range = value < order;
             assert!(nonzero);
             assert!(in_range);
         }
@@ -891,7 +886,7 @@ mod tests {
     fn nonce_lifts_to_a_zero_padded_scalar() {
         let nonce: [u8; NONCE_LEN] = core::array::from_fn(|i| u8::try_from(i + 1).unwrap_or(0));
         let scalar = scalar_from_nonce(&nonce);
-        let bytes = scalar.to_be_bytes();
+        let bytes = scalar.to_repr();
         assert!(bytes[..SCALAR_HIGH_ZEROS].iter().all(|&b| b == 0));
         assert_eq!(&bytes[SCALAR_HIGH_ZEROS..], &nonce[..]);
     }
@@ -904,7 +899,7 @@ mod tests {
 
     #[test]
     fn auth_token_wraps_the_oid_and_point() {
-        let token = encode_auth_token(&AffinePoint::generator()).expect("generator encodes");
+        let token = encode_auth_token(&Point::generator()).expect("generator encodes");
         // The two-byte public-key template tag, then a short-form length.
         assert_eq!(
             &token[..TEMPLATE_TAG_LEN],
@@ -952,23 +947,19 @@ mod tests {
         // A card-side scalar and a terminal-side scalar; the resulting
         // shared point is the same from either side by ECDH, so the
         // derived keys and the exchanged tokens agree.
-        let v_scalar = U384::from(CARD_SCALAR);
-        let u_scalar = U384::from(TERMINAL_SCALAR);
-        let g = AffinePoint::generator();
+        let v_scalar = Scalar::from(CARD_SCALAR);
+        let u_scalar = Scalar::from(TERMINAL_SCALAR);
+        let g = Point::generator();
         let v_picc = g.scalar_mul(&v_scalar);
         let u_pcd_public = g.scalar_mul(&u_scalar);
         let shared = u_pcd_public.scalar_mul(&v_scalar);
-        let shared_x = shared
-            .coords
-            .expect("shared point is finite")
-            .0
-            .to_be_bytes();
+        let shared_x = shared.x_coordinate().expect("shared point is finite");
         let mut x_bytes = [0_u8; SHARED_X_LEN];
-        x_bytes.copy_from_slice(shared_x.as_ref());
+        x_bytes.copy_from_slice(shared_x.as_slice());
         (
             PaceMidwayState {
                 v_picc,
-                u_pcd: u_scalar,
+                u_pcd: NonZeroScalar::new(u_scalar).expect("fixture scalar is nonzero"),
                 u_pcd_public,
             },
             x_bytes,

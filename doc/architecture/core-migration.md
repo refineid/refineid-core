@@ -111,9 +111,9 @@ The fourth slice admits the PACE secure channel in `refineid-pace`:
 - the `id-PACE-ECDH-GM-AES-CBC-CMAC-256` handshake over brainpoolP384r1
   with the Card Access Number as the password, and the
   secure-messaging layer that is itself a card transport;
-- the supporting primitives: brainpoolP384r1 field and point
-  arithmetic over fixed-width Montgomery form with no code-generating
-  macro, AES-CBC/ECB and AES-CMAC with the ICAO key derivation, the
+- the supporting primitives: brainpoolP384r1 point arithmetic from the
+  RustCrypto `bp384` crate with constant-time scalar multiplication,
+  AES-CBC/ECB and AES-CMAC with the ICAO key derivation, the
   algorithm-typed cipher and message-authentication containers, and the
   single fail-closed random seam.
 

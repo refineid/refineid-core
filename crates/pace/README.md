@@ -11,9 +11,10 @@ session keys; `SmTransport` wraps a raw transport with those keys and is
 itself a card transport, so the layers above it stay unaware of the
 protection and credential commands stay consumed exactly once end to end.
 
-The curve arithmetic is built on a macro-free fixed-width Montgomery form
-and pinned by the subgroup-order and homomorphism property tests; the
-symmetric primitives carry the NIST AES and CMAC known-answer vectors.
+The brainpoolP384r1 arithmetic comes from the RustCrypto `bp384` crate,
+whose scalar multiplication is constant time; the crate here holds only
+the SEC1 encoding border and the handshake's use of it. The symmetric
+primitives carry the NIST AES and CMAC known-answer vectors.
 The full four-round handshake is validated on hardware before being
 described as working.
 

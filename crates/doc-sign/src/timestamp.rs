@@ -538,7 +538,7 @@ fn authenticate_signer(
     }
     let mut embedded_revocation = ValidationMaterial::default();
     for choice in signed_data.revocation_info() {
-        match *choice {
+        match choice.choice() {
             RevocationInfoChoice::Crl(der) => embedded_revocation.crls.push(der.to_vec()),
             RevocationInfoChoice::OcspResponse(der) => {
                 embedded_revocation.ocsp_responses.push(der.to_vec());

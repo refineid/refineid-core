@@ -384,6 +384,28 @@ pub fn timestamp_token_imprinting(
     generated: DateTime,
     revocation_info: &[Vec<u8>],
 ) -> Vec<u8> {
+    timestamp_token_with(
+        tsa,
+        tsa_key,
+        imprint_algorithm,
+        imprint,
+        generated,
+        revocation_info,
+        &[],
+    )
+}
+
+/// As [`timestamp_token_imprinting`], the token's `SignerInfo`
+/// carrying `unsigned_attributes` (complete `Attribute` encodings).
+fn timestamp_token_with(
+    tsa: &[u8],
+    tsa_key: &TestKey,
+    imprint_algorithm: &[u8],
+    imprint: &[u8],
+    generated: DateTime,
+    revocation_info: &[Vec<u8>],
+    unsigned_attributes: &[Vec<u8>],
+) -> Vec<u8> {
     let mut message_imprint = imprint_algorithm.to_vec();
     message_imprint.extend_from_slice(&tlv(OCTET_STRING, imprint));
     let mut tst_info = tlv(INTEGER, [TST_INFO_VERSION]);
@@ -399,7 +421,201 @@ pub fn timestamp_token_imprinting(
     parts.econtent_type = known::TST_INFO;
     parts.signed_attributes = Some(attribute_set(&attributes));
     parts.revocation_info = revocation_info.to_vec();
+    parts.unsigned_attributes = unsigned_attributes.to_vec();
     cms(&parts)
+}
+
+/// An `archive-time-stamp-v3` token (`ETSI EN 319 122-1` clause
+/// 5.5.3): [`timestamp_token`] over `imprint`, carrying the
+/// `ats-hash-index-v3` unsigned attribute holding `hash_index`.
+#[must_use]
+pub fn archive_timestamp_token(
+    tsa: &[u8],
+    tsa_key: &TestKey,
+    algorithm: DigestAlgorithm,
+    imprint: &[u8],
+    generated: DateTime,
+    hash_index: &[u8],
+) -> Vec<u8> {
+    archive_timestamp_token_indexed(
+        tsa,
+        tsa_key,
+        algorithm,
+        imprint,
+        generated,
+        &[hash_index.to_vec()],
+    )
+}
+
+/// As [`archive_timestamp_token`], carrying one `ats-hash-index-v3`
+/// attribute for each of `hash_indexes`, so a test can give none or
+/// several.
+#[must_use]
+pub fn archive_timestamp_token_indexed(
+    tsa: &[u8],
+    tsa_key: &TestKey,
+    algorithm: DigestAlgorithm,
+    imprint: &[u8],
+    generated: DateTime,
+    hash_indexes: &[Vec<u8>],
+) -> Vec<u8> {
+    let attributes: Vec<Vec<u8>> = hash_indexes
+        .iter()
+        .map(|index| attribute(known::ATS_HASH_INDEX_V3, index))
+        .collect();
+    timestamp_token_with(
+        tsa,
+        tsa_key,
+        &algorithm.algorithm_identifier(),
+        imprint,
+        generated,
+        &[],
+        &attributes,
+    )
+}
+
+/// An `ATSHashIndexV3` (`ETSI EN 319 122-1` clause 5.5.2) under
+/// `algorithm`: the hash of each of `certificates`, of each of
+/// `revocation` (complete `RevocationInfoChoice` encodings), and of
+/// each of `attribute_values` (an `attrType` encoding followed by one
+/// value's).
+#[must_use]
+pub fn ats_hash_index_v3(
+    algorithm: DigestAlgorithm,
+    certificates: &[&[u8]],
+    revocation: &[&[u8]],
+    attribute_values: &[Vec<u8>],
+) -> Vec<u8> {
+    let hashes = |items: &mut dyn Iterator<Item = &[u8]>| {
+        tlv(
+            SEQUENCE,
+            items
+                .flat_map(|item| tlv(OCTET_STRING, algorithm.digest(item)))
+                .collect::<Vec<u8>>(),
+        )
+    };
+    let mut index = algorithm.algorithm_identifier();
+    index.extend_from_slice(&hashes(&mut certificates.iter().copied()));
+    index.extend_from_slice(&hashes(&mut revocation.iter().copied()));
+    index.extend_from_slice(&hashes(&mut attribute_values.iter().map(Vec::as_slice)));
+    tlv(SEQUENCE, index)
+}
+
+/// Append an incremental update to `pdf` (ISO 32000-1 sec.7.5.6) that
+/// writes each `(number, body)` as object `number` at generation zero,
+/// with a classic cross-reference section chained to the previous one
+/// and the trailer's `/Root` carried forward.
+///
+/// # Panics
+/// When `pdf` does not index or has no `/Root`.
+#[must_use]
+pub fn incremental_update(pdf: &[u8], objects: &[(u32, &[u8])]) -> Vec<u8> {
+    update(pdf, &at_generation_zero(objects), &Trailer::default())
+}
+
+/// As [`incremental_update`], the new trailer naming object `info` as
+/// the document information dictionary (ISO 32000-1 sec.14.3.3).
+///
+/// # Panics
+/// As [`incremental_update`].
+#[must_use]
+pub fn incremental_update_with_info(pdf: &[u8], objects: &[(u32, &[u8])], info: u32) -> Vec<u8> {
+    let trailer = Trailer {
+        info: Some(info),
+        root: None,
+    };
+    update(pdf, &at_generation_zero(objects), &trailer)
+}
+
+/// As [`incremental_update`], the new trailer naming object `root` at
+/// generation zero as the catalog.
+///
+/// # Panics
+/// As [`incremental_update`].
+#[must_use]
+pub fn incremental_update_with_root(pdf: &[u8], objects: &[(u32, &[u8])], root: u32) -> Vec<u8> {
+    let trailer = Trailer {
+        info: None,
+        root: Some(root),
+    };
+    update(pdf, &at_generation_zero(objects), &trailer)
+}
+
+/// As [`incremental_update`], each `(number, generation, body)`
+/// written at its own generation (ISO 32000-1 sec.7.5.6: an object
+/// whose number is reused after it is freed takes a higher one).
+///
+/// # Panics
+/// As [`incremental_update`].
+#[must_use]
+pub fn incremental_update_at_generation(pdf: &[u8], objects: &[(u32, u16, &[u8])]) -> Vec<u8> {
+    update(pdf, objects, &Trailer::default())
+}
+
+/// What an update's trailer names beyond `/Size` and `/Prev`.
+#[derive(Default)]
+struct Trailer {
+    /// The document information dictionary.
+    info: Option<u32>,
+    /// A catalog other than the previous trailer's.
+    root: Option<u32>,
+}
+
+/// `objects` at generation zero.
+fn at_generation_zero<'a>(objects: &[(u32, &'a [u8])]) -> Vec<(u32, u16, &'a [u8])> {
+    objects
+        .iter()
+        .map(|(number, body)| (*number, u16::MIN, *body))
+        .collect()
+}
+
+/// [`incremental_update`] with each object at its generation and the
+/// trailer naming what `trailer` says.
+fn update(pdf: &[u8], objects: &[(u32, u16, &[u8])], trailer: &Trailer) -> Vec<u8> {
+    use crate::pades::index::{PdfIndex, dictionary_integer, dictionary_reference};
+    let index = PdfIndex::parse(pdf).expect("the PDF indexes");
+    let root = trailer.root.map_or_else(
+        || {
+            dictionary_reference(index.trailer(), b"/Root")
+                .expect("a /Root")
+                .rendered()
+        },
+        |root| format!("{root} 0 R"),
+    );
+    let size = objects
+        .iter()
+        .map(|(number, _generation, _body)| number.saturating_add(1))
+        .chain(dictionary_integer(index.trailer(), b"/Size"))
+        .max()
+        .unwrap_or_default();
+    let previous = index.start_xref();
+    let mut out = pdf.to_vec();
+    if !out.ends_with(b"\n") {
+        out.push(b'\n');
+    }
+    let mut offsets = Vec::new();
+    for (number, generation, body) in objects {
+        offsets.push((*number, *generation, out.len()));
+        out.extend_from_slice(format!("{number} {generation} obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_at = out.len();
+    out.extend_from_slice(b"xref\n");
+    for (number, generation, offset) in offsets {
+        out.extend_from_slice(format!("{number} 1\n{offset:010} {generation:05} n \n").as_bytes());
+    }
+    let info = trailer
+        .info
+        .map(|info| format!(" /Info {info} 0 R"))
+        .unwrap_or_default();
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {size} /Root {root}{info} /Prev {previous} >>\nstartxref\n{xref_at}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    out
 }
 
 /// The `RevocationInfoChoice` carrying the `OCSPResponse` `response`

@@ -955,6 +955,22 @@ impl<'a> PdfIndex<'a> {
         xref_stream::stream_payload(self.pdf, offset, reference).map(Some)
     }
 
+    /// Every object the newest view of the document holds: the newest
+    /// in-use entry of each object number, in number order.
+    pub(crate) fn live_references(&self) -> Vec<PdfObjectReference> {
+        let mut live: Vec<PdfObjectReference> = self
+            .objects
+            .values()
+            .filter(|entry| !matches!(entry.location, XrefLocation::Free))
+            .map(|entry| PdfObjectReference {
+                number: entry.number,
+                generation: entry.generation,
+            })
+            .collect();
+        live.sort_by_key(|reference| (reference.number, reference.generation));
+        live
+    }
+
     /// The entry naming exactly `reference`, number and generation.
     fn live_entry(&self, reference: PdfObjectReference) -> Option<&XrefEntry> {
         self.objects

@@ -24,14 +24,16 @@
 
 pub use refineid_cms::testkit::{
     BIT_STRING, BOOLEAN, CONTEXT_0, CONTEXT_0_PRIMITIVE, CONTEXT_1, CONTEXT_2, CONTEXT_3,
-    CertificateSpec, CmsParts, DER_TRUE, ENUMERATED, GENERALIZED_TIME, INTEGER, KEY_USAGE_CA,
-    KEY_USAGE_CA_UNUSED, KEY_USAGE_CERT_SIGN, KEY_USAGE_CERT_SIGN_UNUSED,
-    KEY_USAGE_DIGITAL_SIGNATURE, KEY_USAGE_DIGITAL_SIGNATURE_UNUSED, NO_UNUSED_BITS, NULL,
-    OBJECT_IDENTIFIER, OCTET_STRING, SEQUENCE, SET, SIGNED_DATA_VERSION, SIGNER_INFO_VERSION,
-    TestCurve, TestKey, UTC_TIME, UTF8_STRING, X509_VERSION_3, attribute, attribute_set,
-    bit_string, ca_basic_constraints, ca_extensions, certificate, cms, content_attributes, day,
-    digest_algorithm_identifier, extended_key_usage, extension, generalized_time, key_usage, name,
-    signed, signed_body, tbs_certificate, timestamping_extensions, tlv, utc_time,
+    CertificateSpec, CmsParts, DER_TRUE, ENUMERATED, GENERALIZED_TIME, INTEGER, INTEGER_SIGN_BIT,
+    INTEGER_SIGN_PAD, KEY_USAGE_CA, KEY_USAGE_CA_UNUSED, KEY_USAGE_CERT_SIGN,
+    KEY_USAGE_CERT_SIGN_UNUSED, KEY_USAGE_DIGITAL_SIGNATURE, KEY_USAGE_DIGITAL_SIGNATURE_UNUSED,
+    NO_UNUSED_BITS, NULL, OBJECT_IDENTIFIER, OCTET_STRING, PRINTABLE_STRING, PSS_SALT_LEN,
+    SEQUENCE, SET, SIGNED_DATA_VERSION, SIGNER_INFO_VERSION, TestCurve, TestKey, TestKeyKind,
+    UTC_TIME, UTF8_STRING, X509_VERSION_3, attribute, attribute_set, bit_string,
+    ca_basic_constraints, ca_extensions, certificate, certificate_named, cms, content_attributes,
+    day, digest_algorithm_identifier, extended_key_usage, extension, generalized_time, key_usage,
+    name, name_of, positive_integer, signed, signed_body, tbs_certificate, tbs_certificate_named,
+    timestamping_extensions, tlv, utc_time,
 };
 
 use crate::cades::{DigestAlgorithm, SignatureAlgorithm};
@@ -47,6 +49,9 @@ pub const OCSP_SUCCESSFUL: u8 = 0x00;
 pub const TST_INFO_VERSION: u8 = 0x01;
 /// `TSTInfo.serialNumber` of every fixture token.
 pub const TOKEN_SERIAL: u8 = 0x01;
+/// The last day of the fixture month, for validity that outlasts every
+/// fixture instant.
+pub const FIXTURE_LAST_DAY: u8 = 30;
 /// A TSA policy under the documentation enterprise number 32473
 /// (RFC 5612).
 pub const TEST_POLICY: Oid<'static> =
@@ -55,18 +60,19 @@ pub const TEST_POLICY: Oid<'static> =
 /// The `CAdES` writer's name for `key`'s signatures.
 #[must_use]
 pub const fn cades_algorithm(key: &TestKey) -> SignatureAlgorithm {
-    match key.curve() {
-        TestCurve::P256 => SignatureAlgorithm::EcdsaSha256,
-        TestCurve::P384 => SignatureAlgorithm::EcdsaSha384,
+    match key.kind() {
+        TestKeyKind::Ecdsa(TestCurve::P256) => SignatureAlgorithm::EcdsaSha256,
+        TestKeyKind::Ecdsa(TestCurve::P384) => SignatureAlgorithm::EcdsaSha384,
+        TestKeyKind::Rsa => SignatureAlgorithm::RsaPkcs1Sha256,
     }
 }
 
 /// The digest `key`'s signatures are computed over.
 #[must_use]
 pub const fn digest_algorithm(key: &TestKey) -> DigestAlgorithm {
-    match key.curve() {
-        TestCurve::P256 => DigestAlgorithm::Sha256,
-        TestCurve::P384 => DigestAlgorithm::Sha384,
+    match key.kind() {
+        TestKeyKind::Ecdsa(TestCurve::P256) | TestKeyKind::Rsa => DigestAlgorithm::Sha256,
+        TestKeyKind::Ecdsa(TestCurve::P384) => DigestAlgorithm::Sha384,
     }
 }
 
@@ -245,24 +251,30 @@ pub fn timestamp_token(
     tst_info.extend_from_slice(&generalized_time(generated));
     let tst_info = tlv(SEQUENCE, tst_info);
     let hash = tsa_key.hash();
-    // ESSCertIDv2 with the DEFAULT SHA-256 hash algorithm left out
-    // (RFC 5035 sec.4).
+    let mut attributes = content_attributes(known::TST_INFO, hash, &tst_info);
+    attributes.push(signing_certificate_v2(tsa));
+    let mut parts = CmsParts::attached(tsa_key, tsa, &tst_info);
+    parts.econtent_type = known::TST_INFO;
+    parts.signed_attributes = Some(attribute_set(&attributes));
+    cms(&parts)
+}
+
+/// The ESS `signing-certificate-v2` attribute binding `certificate`:
+/// one `ESSCertIDv2` with the DEFAULT SHA-256 hash algorithm left out
+/// (RFC 5035 sec.4).
+#[must_use]
+pub fn signing_certificate_v2(certificate: &[u8]) -> Vec<u8> {
     let ess = tlv(
         SEQUENCE,
         tlv(
             SEQUENCE,
             tlv(
                 SEQUENCE,
-                tlv(OCTET_STRING, DigestAlgorithm::Sha256.digest(tsa)),
+                tlv(OCTET_STRING, DigestAlgorithm::Sha256.digest(certificate)),
             ),
         ),
     );
-    let mut attributes = content_attributes(known::TST_INFO, hash, &tst_info);
-    attributes.push(attribute(known::SIGNING_CERTIFICATE_V2, &ess));
-    let mut parts = CmsParts::attached(tsa_key, tsa, &tst_info);
-    parts.econtent_type = known::TST_INFO;
-    parts.signed_attributes = Some(attribute_set(&attributes));
-    cms(&parts)
+    attribute(known::SIGNING_CERTIFICATE_V2, &ess)
 }
 
 /// A minimal PDF: catalog, page tree, one page, a classic

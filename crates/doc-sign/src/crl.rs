@@ -262,7 +262,7 @@ impl Crl<'_> {
     /// # Errors
     /// As for `x509::verify_tbs_signature`.
     #[inline]
-    pub fn verify_signature(
+    pub(crate) fn verify_signature(
         &self,
         issuer_spki: &crate::x509::SpkiDer<'_>,
     ) -> Result<(), crate::x509::VerifyError> {
@@ -436,19 +436,6 @@ impl OwnedCrl {
     #[must_use]
     pub fn as_der(&self) -> &[u8] {
         &self.der
-    }
-
-    /// Verify the CRL signature against the issuer's SPKI. See
-    /// [`Crl::verify_signature`].
-    ///
-    /// # Errors
-    /// As for [`Crl::verify_signature`].
-    #[inline]
-    pub fn verify_signature(
-        &self,
-        issuer_spki: &crate::x509::SpkiDer<'_>,
-    ) -> Result<(), crate::x509::VerifyError> {
-        self.view().verify_signature(issuer_spki)
     }
 }
 

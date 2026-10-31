@@ -585,6 +585,12 @@ struct LocalExtent {
 }
 
 /// Read every entry the central directory lists.
+/// Whether `file` starts with a ZIP local file header, as every `ASiC`
+/// container does (`ETSI EN 319 162-1` clause A.1).
+pub(crate) fn starts_as_zip(file: &[u8]) -> bool {
+    Cursor::new(file).u32() == Some(SIGNATURE_LOCAL_HEADER)
+}
+
 fn read_zip(bytes: &[u8]) -> Result<Vec<LocatedEntry>, AsicReadError> {
     if Cursor::new(bytes).u32() != Some(SIGNATURE_LOCAL_HEADER) {
         return Err(AsicReadError::NotAZip);

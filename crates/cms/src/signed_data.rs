@@ -326,20 +326,20 @@ pub struct SignedData<'a> {
     /// Typed via [`crate::oid::Oid`] -- the BER parser validates
     /// the OID structure at the trust boundary, so consumers
     /// never compare against arbitrary `&[u8]`.
-    pub econtent_type_oid: crate::oid::Oid<'a>,
+    econtent_type_oid: crate::oid::Oid<'a>,
     /// Inner `eContent` OCTET STRING value bytes, `None` for a
     /// detached `SignedData` (RFC 5652 sec.5.2: `eContent` is
     /// OPTIONAL).
-    pub econtent_der: Option<&'a [u8]>,
+    econtent_der: Option<&'a [u8]>,
     /// Embedded certificates (typically the signer certificate
     /// and its issuers). Each entry is the raw DER of one cert
     /// SEQUENCE.
-    pub certificates_der: Vec<&'a [u8]>,
+    certificates_der: Vec<&'a [u8]>,
     /// The `crls` field's `RevocationInfoChoice` entries, in
     /// encoded order (RFC 5652 sec.10.2.1). Empty when absent.
-    pub revocation_info: Vec<RevocationInfoChoice<'a>>,
+    revocation_info: Vec<RevocationInfoChoice<'a>>,
     /// The sole signerInfo's fields.
-    pub signer: SignerInfo<'a>,
+    signer: SignerInfo<'a>,
 }
 
 /// CMS `SignerIdentifier` (RFC 5652 sec.5.3).
@@ -388,28 +388,28 @@ pub struct CmsAttribute<'a> {
 #[derive(Debug, Clone)]
 pub struct SignerInfo<'a> {
     /// Certificate identifier carried by the signerInfo.
-    pub signer_identifier: SignerIdentifier<'a>,
+    signer_identifier: SignerIdentifier<'a>,
     /// `digestAlgorithm`, a SHA-2 algorithm with NULL or absent
     /// parameters.
-    pub digest_algorithm: HashAlgorithm,
+    digest_algorithm: HashAlgorithm,
     /// `signatureAlgorithm`, whose hash is [`Self::digest_algorithm`].
-    pub signature_scheme: SignatureScheme,
+    signature_scheme: SignatureScheme,
     /// Signature value bytes (raw, no BIT STRING wrapper).
-    pub signature: &'a [u8],
+    signature: &'a [u8],
     /// If `signedAttrs` was present, the DER bytes of the
     /// **re-tagged** `SET OF Attribute` -- exactly the data the
     /// signature was computed over (RFC 5652 sec.5.4). `None`
     /// means "signature was computed directly over eContent".
-    pub signed_data_to_verify: Option<Vec<u8>>,
+    signed_data_to_verify: Option<Vec<u8>>,
     /// Signed attributes, in their encoded order. Empty when the
     /// signerInfo has no signed attributes.
-    pub signed_attributes: Vec<CmsAttribute<'a>>,
+    signed_attributes: Vec<CmsAttribute<'a>>,
     /// Unsigned attributes, in their encoded order. Empty when the
     /// signerInfo has no `unsignedAttrs`.
-    pub unsigned_attributes: Vec<CmsAttribute<'a>>,
+    unsigned_attributes: Vec<CmsAttribute<'a>>,
     /// `messageDigest` attribute value, when `signedAttrs` was
     /// present; its length is the digest algorithm's output length.
-    pub message_digest: Option<&'a [u8]>,
+    message_digest: Option<&'a [u8]>,
 }
 
 /// Owning wrapper around a parsed CMS `SignedData`.
@@ -507,6 +507,93 @@ impl<'a> SignedData<'a> {
         CmsHelpers::parse_signed_data_body(&SignedDataBody {
             body: signed_data_body,
         })
+    }
+
+    /// `EncapsulatedContentInfo.eContentType`.
+    #[must_use]
+    pub const fn econtent_type(&self) -> crate::oid::Oid<'a> {
+        self.econtent_type_oid
+    }
+
+    /// The `eContent` OCTET STRING value, `None` for a detached
+    /// `SignedData` (RFC 5652 sec.5.2).
+    #[must_use]
+    pub const fn econtent(&self) -> Option<&'a [u8]> {
+        self.econtent_der
+    }
+
+    /// `SignedData.certificates`, each the complete DER of one
+    /// certificate, in encoded order; empty when absent.
+    #[must_use]
+    pub fn certificates(&self) -> &[&'a [u8]] {
+        &self.certificates_der
+    }
+
+    /// `SignedData.crls`, in encoded order; empty when absent.
+    #[must_use]
+    pub fn revocation_info(&self) -> &[RevocationInfoChoice<'a>] {
+        &self.revocation_info
+    }
+
+    /// The sole signerInfo.
+    #[must_use]
+    pub const fn signer(&self) -> &SignerInfo<'a> {
+        &self.signer
+    }
+}
+
+impl<'a> SignerInfo<'a> {
+    /// `SignerInfo.sid`.
+    #[must_use]
+    pub const fn signer_identifier(&self) -> SignerIdentifier<'a> {
+        self.signer_identifier
+    }
+
+    /// `digestAlgorithm`, a SHA-2 algorithm with NULL or absent
+    /// parameters.
+    #[must_use]
+    pub const fn digest_algorithm(&self) -> HashAlgorithm {
+        self.digest_algorithm
+    }
+
+    /// `signatureAlgorithm`, whose hash is [`Self::digest_algorithm`].
+    #[must_use]
+    pub const fn signature_scheme(&self) -> SignatureScheme {
+        self.signature_scheme
+    }
+
+    /// The `signature` OCTET STRING value: the octets a
+    /// signature-time-stamp imprints (ETSI EN 319 122-1 sec.5.3).
+    #[must_use]
+    pub const fn signature(&self) -> &'a [u8] {
+        self.signature
+    }
+
+    /// The DER `SET OF Attribute` the signature covers, re-tagged
+    /// from `[0] IMPLICIT` (RFC 5652 sec.5.4); `None` when the
+    /// signerInfo has no signed attributes.
+    #[must_use]
+    pub fn signed_attributes_der(&self) -> Option<&[u8]> {
+        self.signed_data_to_verify.as_deref()
+    }
+
+    /// Signed attributes, in encoded order; empty when absent.
+    #[must_use]
+    pub fn signed_attributes(&self) -> &[CmsAttribute<'a>] {
+        &self.signed_attributes
+    }
+
+    /// Unsigned attributes, in encoded order; empty when absent.
+    #[must_use]
+    pub fn unsigned_attributes(&self) -> &[CmsAttribute<'a>] {
+        &self.unsigned_attributes
+    }
+
+    /// The `messageDigest` attribute value when signed attributes are
+    /// present; its length is the digest algorithm's output length.
+    #[must_use]
+    pub const fn message_digest(&self) -> Option<&'a [u8]> {
+        self.message_digest
     }
 }
 
@@ -1926,7 +2013,7 @@ mod tests {
         // must move past the encap stage (missing signerInfos, not
         // missing eContent); the full detached round trip -- parse,
         // supply external content, verify -- is covered by the
-        // `asic_verify` openssl interop test.
+        // openssl interop test.
         let encap = tlv(
             tag_byte::<Sequence>(),
             tlv(tag_byte::<BerOid>(), FIXTURE_ECONTENT_TYPE.as_bytes()),
@@ -2269,6 +2356,64 @@ mod tests {
             sd.verify(certificate_spki(&certificate))
                 .expect("kit signature verifies");
         }
+    }
+
+    /// The RSA-PSS salt of the kit signatures, ASCII.
+    const KIT_PSS_SALT: &[u8; testkit::PSS_SALT_LEN] = b"synthetic RSA-PSS salt, 32 bytes";
+
+    #[test]
+    fn the_rfc_9500_rsa_key_signs_certificates_and_cms() {
+        let key = TestKey::rsa_2048();
+        let certificate = testkit::certificate(
+            &CertificateSpec {
+                serial: KIT_SERIAL,
+                subject: "CMS Test RSA Signer",
+                issuer: "CMS Test RSA Signer",
+                not_before: testkit::day(KIT_NOT_BEFORE_DAY),
+                not_after: testkit::day(KIT_NOT_AFTER_DAY),
+                extensions: Vec::new(),
+            },
+            &key,
+            &key,
+        );
+        let parsed = Certificate::from_der(&certificate).expect("RSA certificate parses");
+        assert!(matches!(
+            parsed.spki.algorithm(),
+            crate::x509::PublicKeyAlgorithm::Rsa {
+                modulus_bits: crate::rsa::RsaModulus::MIN_BITS
+            }
+        ));
+        parsed
+            .verify_signed_by(parsed)
+            .expect("the self-signature verifies");
+
+        let der = testkit::cms(&CmsParts::attached(&key, &certificate, KIT_CONTENT));
+        let sd = SignedData::parse(&der).expect("RSA CMS parses");
+        assert_eq!(sd.signer().signature_scheme(), SignatureScheme::RsaPkcs1);
+        sd.verify(parsed.spki)
+            .expect("the RSA CMS signature verifies");
+
+        for algorithm in [
+            crate::x509::MessageSignatureAlgorithm::RsaPkcs1Sha256,
+            crate::x509::MessageSignatureAlgorithm::RsaPssSha256,
+        ] {
+            let salt = KIT_PSS_SALT;
+            let signature = match algorithm {
+                crate::x509::MessageSignatureAlgorithm::RsaPssSha256 => key
+                    .sign_pss_sha256(KIT_CONTENT, salt)
+                    .expect("an RSA key signs PSS"),
+                _ => key.sign(KIT_CONTENT),
+            };
+            parsed
+                .spki
+                .verify_message_signature(algorithm, KIT_CONTENT, &signature)
+                .expect("the message signature verifies");
+        }
+        assert!(
+            TestKey::derive(TestCurve::P256, b"ec")
+                .sign_pss_sha256(KIT_CONTENT, KIT_PSS_SALT)
+                .is_none()
+        );
     }
 
     #[test]

@@ -40,8 +40,8 @@ use core::fmt::Write as _;
 use crate::base64;
 use crate::cades::DigestAlgorithm;
 use crate::xades::{
-    DIGEST_METHOD_SHA256, DIGEST_METHOD_SHA384, NAMESPACE_DSIG, escape_attribute,
-    percent_encode_path,
+    DIGEST_METHOD_SHA256, DIGEST_METHOD_SHA384, DIGEST_METHOD_SHA512, NAMESPACE_DSIG,
+    escape_attribute, percent_encode_path,
 };
 
 /// Media type of an `ASiC-E` container.
@@ -238,6 +238,7 @@ const fn digest_method_uri(algorithm: DigestAlgorithm) -> &'static str {
     match algorithm {
         DigestAlgorithm::Sha256 => DIGEST_METHOD_SHA256,
         DigestAlgorithm::Sha384 => DIGEST_METHOD_SHA384,
+        DigestAlgorithm::Sha512 => DIGEST_METHOD_SHA512,
     }
 }
 

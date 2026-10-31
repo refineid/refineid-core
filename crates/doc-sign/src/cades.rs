@@ -37,7 +37,7 @@
 //! is a network operation and belongs above this module.
 
 use crate::ber::tlv;
-use crate::digest::{Sha256, Sha384};
+use crate::digest::{Sha256, Sha384, Sha512};
 use crate::validation::ValidationMaterial;
 use refineid_cms::oid;
 use refineid_cms::x509::Certificate;
@@ -84,13 +84,16 @@ const CMS_VERSION_V5: u8 = 0x05;
 /// Which digest the content and the attributes are hashed under.
 ///
 /// FINEID cards sign SHA-256 under RSA and both SHA-256 and SHA-384
-/// under ECDSA; nothing here offers SHA-1.
+/// under ECDSA; SHA-512 is read in documents other signers make.
+/// Nothing here offers MD5 or SHA-1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DigestAlgorithm {
     /// SHA-256 (FIPS 180-4).
     Sha256,
     /// SHA-384 (FIPS 180-4).
     Sha384,
+    /// SHA-512 (FIPS 180-4).
+    Sha512,
 }
 
 impl DigestAlgorithm {
@@ -100,17 +103,20 @@ impl DigestAlgorithm {
         match self {
             Self::Sha256 => Sha256::of(input).as_bytes().to_vec(),
             Self::Sha384 => Sha384::of(input).as_bytes().to_vec(),
+            Self::Sha512 => Sha512::of(input).as_bytes().to_vec(),
         }
     }
 
     /// The digest algorithm `oid` names, `None` for any other than
-    /// SHA-256 and SHA-384 (OIDs from RFC 5754 sec.2).
+    /// SHA-256, SHA-384 and SHA-512 (OIDs from RFC 5754 sec.2).
     #[must_use]
     pub fn from_oid(oid: oid::Oid<'_>) -> Option<Self> {
         if oid == oid::known::SHA256 {
             Some(Self::Sha256)
         } else if oid == oid::known::SHA384 {
             Some(Self::Sha384)
+        } else if oid == oid::known::SHA512 {
+            Some(Self::Sha512)
         } else {
             None
         }
@@ -122,6 +128,18 @@ impl DigestAlgorithm {
         match self {
             Self::Sha256 => crate::digest::SHA256_LEN,
             Self::Sha384 => crate::digest::SHA384_LEN,
+            Self::Sha512 => crate::digest::SHA512_LEN,
+        }
+    }
+
+    /// The digest algorithm a CMS `SignerInfo` names, whose border
+    /// admits the SHA-2 algorithms only.
+    #[must_use]
+    pub const fn from_cms(algorithm: refineid_cms::signed_data::HashAlgorithm) -> Self {
+        match algorithm {
+            refineid_cms::signed_data::HashAlgorithm::Sha256 => Self::Sha256,
+            refineid_cms::signed_data::HashAlgorithm::Sha384 => Self::Sha384,
+            refineid_cms::signed_data::HashAlgorithm::Sha512 => Self::Sha512,
         }
     }
 
@@ -131,6 +149,7 @@ impl DigestAlgorithm {
         match self {
             Self::Sha256 => oid::known::SHA256,
             Self::Sha384 => oid::known::SHA384,
+            Self::Sha512 => oid::known::SHA512,
         }
     }
 
@@ -143,6 +162,7 @@ impl DigestAlgorithm {
         let oid_der = match self {
             Self::Sha256 => tlv(TAG_OID, oid::known::SHA256.as_bytes()),
             Self::Sha384 => tlv(TAG_OID, oid::known::SHA384.as_bytes()),
+            Self::Sha512 => tlv(TAG_OID, oid::known::SHA512.as_bytes()),
         };
         tlv(TAG_SEQUENCE, &oid_der)
     }

@@ -237,6 +237,26 @@ impl Placeholder {
         algorithm.digest(&self.signed_octets())
     }
 
+    /// The placeholder with the last occurrence of `old`, the one in
+    /// the dictionary this placeholder adds, replaced by `new` of the
+    /// same length, so every offset stays true: a test writes a
+    /// dictionary entry the writer does not.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn respelled(mut self, old: &[u8], new: &[u8]) -> Self {
+        assert_eq!(old.len(), new.len(), "a respelling keeps every offset");
+        let at = self
+            .document
+            .windows(old.len())
+            .rposition(|window| window == old)
+            .expect("the placeholder carries the text");
+        self.document
+            .get_mut(at..at.saturating_add(old.len()))
+            .expect("in range")
+            .copy_from_slice(new);
+        self
+    }
+
     /// Splice the CMS into the reserved hole.
     ///
     /// Nothing moves: the DER is hex-encoded into the placeholder and

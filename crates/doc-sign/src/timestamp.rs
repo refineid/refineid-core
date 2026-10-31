@@ -196,16 +196,62 @@ impl core::error::Error for TimestampError {}
 pub struct VerifiedTimestampToken {
     /// Original `TimeStampToken` CMS `ContentInfo` DER, in transit to
     /// the unsigned attribute it is embedded as.
-    pub token: Vec<u8>,
+    token: Vec<u8>,
     /// The certificate that authenticated the token.
-    pub signer_certificate: OwnedCert,
+    signer_certificate: OwnedCert,
     /// Every distinct, parseable X.509 certificate embedded in the CMS
     /// `SignedData`, in encoded order. This includes the signer certificate;
     /// byte-identical duplicates are removed. Trust-path validation remains
     /// the caller's responsibility.
-    pub embedded_certificates: Vec<OwnedCert>,
+    embedded_certificates: Vec<OwnedCert>,
     /// Authenticated `TSTInfo.genTime`.
-    pub generated_at: DateTime,
+    generated_at: DateTime,
+}
+
+impl VerifiedTimestampToken {
+    /// The `TimeStampToken` `ContentInfo` DER, in transit to the
+    /// unsigned attribute it is embedded as.
+    #[must_use]
+    pub fn token(&self) -> &[u8] {
+        &self.token
+    }
+
+    /// The certificate that authenticated the token.
+    #[must_use]
+    pub const fn signer_certificate(&self) -> &OwnedCert {
+        &self.signer_certificate
+    }
+
+    /// Every distinct, parseable certificate the token embeds, the
+    /// signer's included, in encoded order.
+    #[must_use]
+    pub fn embedded_certificates(&self) -> &[OwnedCert] {
+        &self.embedded_certificates
+    }
+
+    /// Authenticated `TSTInfo.genTime`.
+    #[must_use]
+    pub const fn generated_at(&self) -> DateTime {
+        self.generated_at
+    }
+
+    /// A token assembled from its parts without verification, for
+    /// tests of the code that consumes verified tokens.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn from_parts_for_test(
+        token: Vec<u8>,
+        signer_certificate: OwnedCert,
+        embedded_certificates: Vec<OwnedCert>,
+        generated_at: DateTime,
+    ) -> Self {
+        Self {
+            token,
+            signer_certificate,
+            embedded_certificates,
+            generated_at,
+        }
+    }
 }
 
 /// Authenticated fields recovered while checking one timestamp token.
@@ -434,19 +480,19 @@ fn check_binding(
 fn parse_token(token: &[u8]) -> Result<(SignedData<'_>, TstInfo<'_>), TimestampError> {
     let signed_data = SignedData::parse(token)
         .map_err(|_ignored| TimestampError::Malformed("token is not CMS SignedData"))?;
-    if signed_data.econtent_type_oid != crate::oids::TST_INFO {
+    if signed_data.econtent_type() != crate::oids::TST_INFO {
         return Err(TimestampError::Malformed(
             "token eContentType is not TSTInfo",
         ));
     }
-    if signed_data.signer.signed_data_to_verify.is_none() {
+    if signed_data.signer().signed_attributes_der().is_none() {
         return Err(TimestampError::Malformed(
             "token signerInfo has no signed attributes",
         ));
     }
     let tst_info = parse_tst_info(
         signed_data
-            .econtent_der
+            .econtent()
             .ok_or(TimestampError::Malformed("token carries no TSTInfo"))?,
     )?;
     Ok((signed_data, tst_info))
@@ -483,7 +529,7 @@ fn authenticate_signer(
 /// Retain parseable CMS certificates while removing byte-identical repeats.
 fn parseable_embedded_certificates(signed_data: &SignedData<'_>) -> Vec<OwnedCert> {
     let mut certificates: Vec<OwnedCert> = Vec::new();
-    for certificate_der in &signed_data.certificates_der {
+    for certificate_der in signed_data.certificates() {
         if certificates
             .iter()
             .any(|existing| existing.as_der() == *certificate_der)
@@ -713,12 +759,12 @@ pub(crate) fn select_signer_certificate(
     signed_data: &SignedData<'_>,
 ) -> Result<OwnedCert, TimestampError> {
     let mut matches = Vec::new();
-    for cert_der in &signed_data.certificates_der {
+    for cert_der in signed_data.certificates() {
         let Ok(owned) = OwnedCert::from_der(cert_der) else {
             continue;
         };
         let certificate = owned.view();
-        if !certificate_matches_sid(&certificate, signed_data.signer.signer_identifier)? {
+        if !certificate_matches_sid(&certificate, signed_data.signer().signer_identifier())? {
             continue;
         }
         if !matches
@@ -1264,14 +1310,14 @@ pub(crate) fn verify_signing_certificate_attribute(
     certificate: &Certificate<'_>,
 ) -> Result<(), TimestampError> {
     let v1: Vec<&CmsAttribute<'_>> = signed_data
-        .signer
-        .signed_attributes
+        .signer()
+        .signed_attributes()
         .iter()
         .filter(|attribute| attribute.oid == crate::oids::SIGNING_CERTIFICATE)
         .collect();
     let v2: Vec<&CmsAttribute<'_>> = signed_data
-        .signer
-        .signed_attributes
+        .signer()
+        .signed_attributes()
         .iter()
         .filter(|attribute| attribute.oid == crate::oids::SIGNING_CERTIFICATE_V2)
         .collect();
@@ -1598,6 +1644,7 @@ mod tests {
     use crate::ber::{BerTlvAny, Oid as BerOid, tlv};
     use crate::cades::DigestAlgorithm;
     use crate::cms::{SignedData, SignerIdentifier};
+    use crate::testkit as kit;
     use refineid_cms::oid::known;
     use refineid_cms::x509::DateTime;
 
@@ -1796,7 +1843,7 @@ mod tests {
 
         let signed_data = SignedData::parse(&token_der).expect("fixture CMS parses");
         let mut tst_info = signed_data
-            .econtent_der
+            .econtent()
             .expect("token carries TSTInfo")
             .to_vec();
         tst_info.push(0x00);
@@ -1826,17 +1873,44 @@ mod tests {
     #[test]
     fn sid_must_select_one_distinct_embedded_certificate() {
         let token_der = unhex(TIMESTAMP_TOKEN_HEX);
-        let mut signed_data = SignedData::parse(&token_der).expect("fixture CMS parses");
+        let signed_data = SignedData::parse(&token_der).expect("fixture CMS parses");
         // The fixture embeds the same DER twice. That is one distinct
         // certificate, not an ambiguity.
         select_signer_certificate(&signed_data).expect("duplicate DER is de-duplicated");
 
-        signed_data.signer.signer_identifier =
-            SignerIdentifier::SubjectKeyIdentifier(b"not-the-signer");
+        // A structure whose certificates do not include the one its
+        // signer identifier names.
+        let key = kit::TestKey::derive(kit::TestCurve::P256, b"identified signer");
+        let signer = kit_certificate(&key, "Identified Signer");
+        let bystander = kit_certificate(&key, "Bystander");
+        let mut parts = kit::CmsParts::attached(&key, &signer, b"content");
+        parts.certificates = vec![bystander];
+        let der = kit::cms(&parts);
+        let unmatched = SignedData::parse(&der).expect("kit CMS parses");
         assert!(matches!(
-            select_signer_certificate(&signed_data),
+            unmatched.signer().signer_identifier(),
+            SignerIdentifier::IssuerAndSerialNumber { .. }
+        ));
+        assert!(matches!(
+            select_signer_certificate(&unmatched),
             Err(TimestampError::NoMatchingTsaCertificate)
         ));
+    }
+
+    /// A self-issued kit certificate for `key` named `common_name`.
+    fn kit_certificate(key: &kit::TestKey, common_name: &str) -> Vec<u8> {
+        kit::certificate(
+            &kit::CertificateSpec {
+                serial: kit::TOKEN_SERIAL,
+                subject: common_name,
+                issuer: common_name,
+                not_before: kit::day(kit::TOKEN_SERIAL),
+                not_after: kit::day(kit::FIXTURE_LAST_DAY),
+                extensions: kit::timestamping_extensions(),
+            },
+            key,
+            key,
+        )
     }
 
     #[test]
@@ -1859,13 +1933,24 @@ mod tests {
             Err(TimestampError::SigningCertificateAttributeInvalid)
         );
 
-        let mut missing = signed_data.clone();
-        missing.signer.signed_attributes.retain(|attribute| {
-            attribute.oid != crate::oids::SIGNING_CERTIFICATE
-                && attribute.oid != crate::oids::SIGNING_CERTIFICATE_V2
-        });
+        // A structure whose signed attributes carry no ESS binding.
+        let key = kit::TestKey::derive(kit::TestCurve::P256, b"unbound signer");
+        let unbound_signer = kit_certificate(&key, "Unbound Signer");
+        let der = kit::cms(&kit::CmsParts::attached(&key, &unbound_signer, b"content"));
+        let missing = SignedData::parse(&der).expect("kit CMS parses");
+        assert!(
+            missing
+                .signer()
+                .signed_attributes()
+                .iter()
+                .all(|attribute| {
+                    attribute.oid != crate::oids::SIGNING_CERTIFICATE
+                        && attribute.oid != crate::oids::SIGNING_CERTIFICATE_V2
+                })
+        );
+        let unbound = crate::test_support::parse_certificate_for_test(&unbound_signer);
         assert_eq!(
-            verify_signing_certificate_attribute(&missing, &certificate),
+            verify_signing_certificate_attribute(&missing, &unbound),
             Err(TimestampError::SigningCertificateAttributeInvalid)
         );
     }

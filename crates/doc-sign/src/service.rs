@@ -1358,11 +1358,11 @@ fn require_live_timestamp_time(
     let latest = received_at
         .unix_duration()
         .saturating_add(MAX_TIMESTAMP_CLOCK_SKEW);
-    let generated = token.generated_at.unix_duration();
+    let generated = token.generated_at().unix_duration();
     if generated < earliest || generated > latest {
         return Err(SignErrorKind::Timestamp(format!(
             "authenticated genTime {} is outside this request's clock-skew window",
-            token.generated_at
+            token.generated_at()
         )));
     }
     Ok(())
@@ -1487,7 +1487,7 @@ fn assemble_document(
             .collect();
         let reference_time = tokens
             .iter()
-            .map(|token| token.generated_at)
+            .map(|token| token.generated_at())
             .min()
             .unwrap_or_else(now_date_time);
         let signer_material = crate::material::collect_chains(&[ChainStart {
@@ -1504,7 +1504,7 @@ fn assemble_document(
     } else {
         ValidationMaterial::default()
     };
-    let token_bytes: Vec<Vec<u8>> = tokens.iter().map(|token| token.token.clone()).collect();
+    let token_bytes: Vec<Vec<u8>> = tokens.iter().map(|token| token.token().to_vec()).collect();
     // ASiC-E CAdES archives through a second manifest and a
     // timestamp over it, not through the signature, so it
     // branches here rather than after assembly.
@@ -1527,7 +1527,7 @@ fn assemble_document(
                 &token_bytes,
                 &material,
                 &manifest,
-                &token.token,
+                token.token(),
             )
             .map_err(SignErrorKind::Document)?;
         return Ok((archived, reported_timestamp_tokens(tokens.len(), true)));
@@ -1629,7 +1629,7 @@ fn archive_timestamp(
         covered_material,
     )?;
     placeholder
-        .finish(&token.token)
+        .finish(token.token())
         .map_err(|e| SignErrorKind::Document(DocumentError::Pdf(e)))
 }
 
@@ -1749,13 +1749,13 @@ fn embedded_timestamp_path(token: &VerifiedTimestampToken) -> Result<Vec<Vec<u8>
         return Err("no pinned TSA trust anchor is configured".to_owned());
     }
     let candidates: Vec<&[u8]> = token
-        .embedded_certificates
+        .embedded_certificates()
         .iter()
         .map(OwnedCert::as_der)
         .collect();
     crate::material::verify_chain_to_approved_anchor(
-        token.signer_certificate.as_der(),
-        token.generated_at,
+        token.signer_certificate().as_der(),
+        token.generated_at(),
         &anchors,
         &candidates,
     )
@@ -1766,7 +1766,7 @@ fn embedded_timestamp_path(token: &VerifiedTimestampToken) -> Result<Vec<Vec<u8>
 /// strictly pinned qualified TSA roots.
 ///
 /// Under no circumstances is an unvetted self-signed certificate,
-/// `token.signer_certificate`, or an intermediate CA accepted as an
+/// `token.signer_certificate()`, or an intermediate CA accepted as an
 /// implicit anchor.
 fn timestamp_anchor_ders() -> Vec<&'static [u8]> {
     crate::trust::PINNED_TSA_ROOT_DER
@@ -1788,14 +1788,14 @@ fn timestamp_validation_material(
         return Err("no pinned TSA trust anchor is configured".to_owned());
     }
     let candidates: Vec<&[u8]> = token
-        .embedded_certificates
+        .embedded_certificates()
         .iter()
         .map(OwnedCert::as_der)
         .collect();
     crate::material::collect_chains_with_candidates(
         &[ChainStart {
-            leaf_der: token.signer_certificate.as_der(),
-            reference_time: token.generated_at,
+            leaf_der: token.signer_certificate().as_der(),
+            reference_time: token.generated_at(),
             approved_anchor_ders: &anchors,
             nonce_policy: NoncePolicy::AllowMissingEcho,
             include_leaf: true,
@@ -2284,12 +2284,12 @@ mod tests {
             .ok_or("missing test trust anchor")?;
         let signer = OwnedCert::from_der(signer_der)?;
         let generated_at = signer.view().not_before;
-        Ok(VerifiedTimestampToken {
-            token: vec![1],
-            signer_certificate: signer.clone(),
-            embedded_certificates: vec![signer.clone()],
+        Ok(VerifiedTimestampToken::from_parts_for_test(
+            vec![1],
+            signer.clone(),
+            vec![signer.clone()],
             generated_at,
-        })
+        ))
     }
 
     #[test]
@@ -2298,7 +2298,7 @@ mod tests {
         let path = embedded_timestamp_path(&token)?;
         check(
             &path,
-            &vec![token.signer_certificate.into_der()],
+            &vec![token.signer_certificate().as_der().to_vec()],
             "the embedded pinned root terminates the path",
         )
     }
@@ -2362,14 +2362,14 @@ mod tests {
             ca_sig_ok.is_ok(),
             &format!("ca verify signed by root: {ca_sig_ok:?}"),
         )?;
-        let token = VerifiedTimestampToken {
-            token: vec![1],
-            signer_certificate: signer.clone(),
-            embedded_certificates: vec![signer.clone(), ca.clone()],
-            generated_at: DateTime::from_unix_duration(core::time::Duration::from_secs(
+        let token = VerifiedTimestampToken::from_parts_for_test(
+            vec![1],
+            signer.clone(),
+            vec![signer.clone(), ca.clone()],
+            DateTime::from_unix_duration(core::time::Duration::from_secs(
                 SECTIGO_TEST_VALIDITY_INSTANT,
             ))?,
-        };
+        );
         let path = embedded_timestamp_path(&token)?;
         check(&path.len(), &3, "path has exactly 3 certificates")?;
         check(
@@ -2393,7 +2393,7 @@ mod tests {
     fn archive_rejects_a_token_without_current_complete_evidence() -> TestResult {
         let token = self_anchored_token_fixture()?;
         let covered_material = ValidationMaterial {
-            certificates: vec![token.signer_certificate.as_der().to_vec()],
+            certificates: vec![token.signer_certificate().as_der().to_vec()],
             ..ValidationMaterial::default()
         };
         let error = authenticate_archive_timestamp_with(&token, &covered_material, |_token| {
@@ -2464,16 +2464,14 @@ mod tests {
             DateTime::from_unix_duration(core::time::Duration::from_secs(1_700_000_000))?;
         let received_at =
             DateTime::from_unix_duration(core::time::Duration::from_secs(1_700_000_030))?;
-        let signer = self_anchored_token_fixture()?.signer_certificate;
+        let signer = self_anchored_token_fixture()?.signer_certificate().clone();
         let token_at = |seconds| -> Result<VerifiedTimestampToken, Box<dyn core::error::Error>> {
-            Ok(VerifiedTimestampToken {
-                token: Vec::new(),
-                signer_certificate: signer.clone(),
-                embedded_certificates: Vec::new(),
-                generated_at: DateTime::from_unix_duration(core::time::Duration::from_secs(
-                    seconds,
-                ))?,
-            })
+            Ok(VerifiedTimestampToken::from_parts_for_test(
+                Vec::new(),
+                signer.clone(),
+                Vec::new(),
+                DateTime::from_unix_duration(core::time::Duration::from_secs(seconds))?,
+            ))
         };
 
         require_live_timestamp_time(&token_at(1_699_999_700)?, requested_at, received_at)?;
@@ -2501,13 +2499,13 @@ mod tests {
             &digest,
             DigestAlgorithm::Sha384,
         )?;
-        check_true(!token.token.is_empty(), "timestamp token returned")?;
+        check_true(!token.token().is_empty(), "timestamp token returned")?;
         check_true(
-            !token.signer_certificate.as_der().is_empty(),
+            !token.signer_certificate().as_der().is_empty(),
             "timestamp signer certificate authenticated",
         )?;
         check_true(
-            token.embedded_certificates.len() >= 2,
+            token.embedded_certificates().len() >= 2,
             "timestamp signer chain retained",
         )?;
         let path = embedded_timestamp_path(&token)?;

@@ -1261,6 +1261,15 @@ pub(crate) mod signing {
 
         /// The DER ECDSA signature over `message` hashed with `hash`.
         pub(crate) fn sign(&self, hash: HashAlgorithm, message: &[u8]) -> Signature<EcdsaDer> {
+            Signature::<EcdsaDer>::from_raw_concatenation(&self.sign_raw(hash, message))
+                .expect("two equal-width components encode")
+        }
+
+        /// The ECDSA signature over `message` hashed with `hash`, as
+        /// the fixed-width concatenation `r || s` of two order-width
+        /// integers (the form XML Signature 1.1 sec.6.4.3 and a card
+        /// return).
+        pub(crate) fn sign_raw(&self, hash: HashAlgorithm, message: &[u8]) -> Vec<u8> {
             let ctx = CurveCtx::new(&self.curve).expect("table curves build a context");
             let digest = hash.digest(message);
             let width = self.curve.n.len();
@@ -1294,8 +1303,7 @@ pub(crate) mod signing {
                 }
                 let mut raw = fixed_width(&r, width);
                 raw.extend_from_slice(&fixed_width(&s, width));
-                return Signature::<EcdsaDer>::from_raw_concatenation(&raw)
-                    .expect("two equal-width components encode");
+                return raw;
             }
         }
     }

@@ -76,6 +76,9 @@ pub(crate) const DIGEST_METHOD_SHA256: &str = "http://www.w3.org/2001/04/xmlenc#
 /// `SHA-384` digest method identifier (RFC 4051 sec.2.1).
 pub(crate) const DIGEST_METHOD_SHA384: &str = "http://www.w3.org/2001/04/xmldsig-more#sha384";
 
+/// `SHA-512` digest identifier (XML Signature 1.1 sec.6.2.4).
+pub(crate) const DIGEST_METHOD_SHA512: &str = "http://www.w3.org/2001/04/xmlenc#sha512";
+
 /// RSA PKCS#1 v1.5 with SHA-256 (RFC 6931 sec.2.3.2).
 pub(crate) const SIGNATURE_METHOD_RSA_SHA256: &str =
     "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
@@ -547,6 +550,7 @@ const fn digest_method_uri(algorithm: DigestAlgorithm) -> &'static str {
     match algorithm {
         DigestAlgorithm::Sha256 => DIGEST_METHOD_SHA256,
         DigestAlgorithm::Sha384 => DIGEST_METHOD_SHA384,
+        DigestAlgorithm::Sha512 => DIGEST_METHOD_SHA512,
     }
 }
 

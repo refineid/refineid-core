@@ -28,7 +28,8 @@
 //!   URIs (a bare-name reference drops comment nodes, sec.4.4.3.3),
 //!   sec.6.4 the `RSAwithSHA*` and `ECDSAwithSHA*` signature value
 //!   forms.
-//! - RFC 6931: the `xmldsig-more` digest and signature identifiers.
+//! - RFC 6931: the `xmldsig-more` digest and signature identifiers,
+//!   among them sec.2.3.10 `sha256-rsa-MGF1`.
 //! - `ETSI EN 319 132-1` V1.3.1: sec.4.3 the `SignedProperties`
 //!   reference and its `Type`, sec.5.2.2 `SigningCertificateV2`,
 //!   sec.5.3 `SignatureTimeStamp` over the canonicalised
@@ -43,8 +44,8 @@ use crate::validation::ValidationMaterial;
 use crate::verification::asic::{AsicContainer, Entry, percent_decode};
 use crate::verification::xml::{ATTRIBUTE_ID, Comments, ElementRef, XmlDocument, XmlError};
 use crate::xades::{
-    CANONICALIZATION_EXCLUSIVE, DIGEST_METHOD_SHA256, DIGEST_METHOD_SHA384, NAMESPACE_DSIG,
-    NAMESPACE_XADES, SIGNATURE_METHOD_ECDSA_SHA256, SIGNATURE_METHOD_ECDSA_SHA384,
+    CANONICALIZATION_EXCLUSIVE, DIGEST_METHOD_SHA256, DIGEST_METHOD_SHA384, DIGEST_METHOD_SHA512,
+    NAMESPACE_DSIG, NAMESPACE_XADES, SIGNATURE_METHOD_ECDSA_SHA256, SIGNATURE_METHOD_ECDSA_SHA384,
     SIGNATURE_METHOD_RSA_SHA256, SIGNATURE_METHOD_RSA_SHA384, TYPE_SIGNED_PROPERTIES,
 };
 use refineid_cms::x509::{MessageSignatureAlgorithm, OwnedCert};
@@ -58,14 +59,16 @@ const NAMESPACE_XADES_141: &str = "http://uri.etsi.org/01903/v1.4.1#";
 const CANONICALIZATION_EXCLUSIVE_COMMENTS: &str =
     "http://www.w3.org/2001/10/xml-exc-c14n#WithComments";
 
-/// `SHA-512` digest identifier (XML Signature 1.1 sec.6.2.4).
-const DIGEST_METHOD_SHA512: &str = "http://www.w3.org/2001/04/xmlenc#sha512";
-
 /// RSA PKCS#1 v1.5 with SHA-512 (RFC 6931 sec.2.3.2).
 const SIGNATURE_METHOD_RSA_SHA512: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512";
 
 /// ECDSA with SHA-512 (RFC 6931 sec.2.3.6).
 const SIGNATURE_METHOD_ECDSA_SHA512: &str = "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha512";
+
+/// RSASSA-PSS with SHA-256, MGF1 with SHA-256 and a salt of the
+/// digest's length (RFC 6931 sec.2.3.10, RFC 8017 sec.8.1).
+const SIGNATURE_METHOD_RSA_PSS_SHA256: &str =
+    "http://www.w3.org/2007/05/xmldsig-more#sha256-rsa-MGF1";
 
 /// `asic:XAdESSignatures`, the root of a signature file (EN 319 162-1
 /// annex A.5).
@@ -294,6 +297,7 @@ fn signature_method(uri: &str) -> Option<MessageSignatureAlgorithm> {
         SIGNATURE_METHOD_RSA_SHA256 => Some(MessageSignatureAlgorithm::RsaPkcs1Sha256),
         SIGNATURE_METHOD_RSA_SHA384 => Some(MessageSignatureAlgorithm::RsaPkcs1Sha384),
         SIGNATURE_METHOD_RSA_SHA512 => Some(MessageSignatureAlgorithm::RsaPkcs1Sha512),
+        SIGNATURE_METHOD_RSA_PSS_SHA256 => Some(MessageSignatureAlgorithm::RsaPssSha256),
         SIGNATURE_METHOD_ECDSA_SHA256 => Some(MessageSignatureAlgorithm::EcdsaSha256Raw),
         SIGNATURE_METHOD_ECDSA_SHA384 => Some(MessageSignatureAlgorithm::EcdsaSha384Raw),
         SIGNATURE_METHOD_ECDSA_SHA512 => Some(MessageSignatureAlgorithm::EcdsaSha512Raw),
@@ -889,7 +893,9 @@ mod tests {
     use crate::verification::asic::AsicContainer;
     use crate::verification::exactly;
     use crate::verification::xml::{Comments, XmlDocument, XmlError};
-    use crate::xades::{SignaturePlan, plan};
+    use crate::xades::{SIGNATURE_METHOD_RSA_SHA256, SignaturePlan, plan};
+    use refineid_cms::testkit::{self as kit, TestCurve, TestKey};
+    use refineid_cms::x509::OwnedCert;
 
     /// A certificate to name as the signer. Only its bytes matter here:
     /// they are parsed and digested, and nothing is signed with it.
@@ -1334,5 +1340,323 @@ mod tests {
         let (head, tail) = encoded.split_at(WRAP_COLUMN);
         let wrapped = document().replace(&encoded, &format!("{head}\n{tail}"));
         assert!(judged(&objects(), &wrapped).document_intact());
+    }
+
+    /// A synthetic signing time, inside every kit certificate's validity.
+    const KIT_SIGNING_TIME: SigningTime = SigningTime {
+        year: 2026,
+        month: 6,
+        day: KIT_SIGNED_DAY,
+        hour: KIT_HOUR,
+        minute: 0,
+        second: 0,
+    };
+
+    /// The day kit certificates start.
+    const KIT_FIRST_DAY: u8 = 1;
+    /// The day kit signatures and timestamps are made.
+    const KIT_SIGNED_DAY: u8 = 10;
+    /// The day kit certificates end.
+    const KIT_LAST_DAY: u8 = 28;
+    /// The hour of every kit instant.
+    const KIT_HOUR: u8 = 12;
+    /// Serial of the kit signer.
+    const KIT_SIGNER_SERIAL: u8 = 1;
+    /// Serial of the kit TSA.
+    const KIT_TSA_SERIAL: u8 = 2;
+    /// The salt of the kit RSA-PSS signature.
+    const KIT_PSS_SALT: &[u8; kit::PSS_SALT_LEN] = b"synthetic RSA-PSS salt, 32 bytes";
+
+    /// A self-issued kit certificate named `common_name` for `key`.
+    fn kit_certificate(key: &TestKey, common_name: &str, extensions: Vec<Vec<u8>>) -> Vec<u8> {
+        kit::certificate(
+            &kit::CertificateSpec {
+                serial: KIT_SIGNER_SERIAL,
+                subject: common_name,
+                issuer: common_name,
+                not_before: kit::day(KIT_FIRST_DAY),
+                not_after: kit::day(KIT_LAST_DAY),
+                extensions,
+            },
+            key,
+            key,
+        )
+    }
+
+    /// The writer's signature file over [`objects`], really signed by
+    /// `key` under `certificate`, with `timestamps` over its value.
+    fn signed_document(
+        key: &TestKey,
+        certificate: &[u8],
+        timestamps: impl FnOnce(&[u8]) -> Vec<Vec<u8>>,
+    ) -> String {
+        let owned = OwnedCert::from_der(certificate).expect("kit certificate parses");
+        let view = owned.view();
+        let parameters = SignerParameters {
+            certificate: &view,
+            digest_algorithm: DigestAlgorithm::Sha256,
+            signature_algorithm: crate::testkit::cades_algorithm(key),
+            signing_time: Some(KIT_SIGNING_TIME),
+        };
+        let plan = plan(&objects(), &parameters).expect("plan");
+        let value = key.sign_raw(plan.signed_info());
+        let tokens = timestamps(&value);
+        String::from_utf8(plan.finish(&value, &tokens, &ValidationMaterial::default()))
+            .expect("utf-8")
+    }
+
+    /// `document` with its `SignatureValue` replaced by `sign` over the
+    /// canonical `SignedInfo` the document now carries.
+    fn resign(document: &str, sign: impl FnOnce(&[u8]) -> Vec<u8>) -> String {
+        let parsed = XmlDocument::parse(document.as_bytes().to_vec()).expect("parses");
+        let signed_info = parsed
+            .elements()
+            .find(|element| element.is(NAMESPACE_DSIG, "SignedInfo"))
+            .expect("SignedInfo")
+            .canonicalize(Comments::Omitted);
+        let value = element(document, "<ds:SignatureValue", "</ds:SignatureValue>");
+        let open_end = value.find('>').expect("start tag ends") + 1;
+        let text = &value[open_end..value.len() - "</ds:SignatureValue>".len()];
+        document.replace(text, &base64::encode(&sign(&signed_info)))
+    }
+
+    /// `document` with one octet of its signature value changed.
+    fn flipped(document: &str) -> String {
+        let value = element(document, "<ds:SignatureValue", "</ds:SignatureValue>");
+        let open_end = value.find('>').expect("start tag ends") + 1;
+        let text = &value[open_end..value.len() - "</ds:SignatureValue>".len()];
+        let mut octets = base64::decode_wrapped(text).expect("base64");
+        let last = octets.last_mut().expect("a signature value");
+        *last = last.wrapping_add(1);
+        document.replace(text, &base64::encode(&octets))
+    }
+
+    /// A P-256 kit key and its certificate.
+    fn ecdsa_signer() -> (TestKey, Vec<u8>) {
+        let key = TestKey::derive(TestCurve::P256, b"xades signer");
+        let certificate = kit_certificate(&key, "XAdES ECDSA Signer", Vec::new());
+        (key, certificate)
+    }
+
+    /// The RFC 9500 RSA key and its certificate.
+    fn rsa_signer() -> (TestKey, Vec<u8>) {
+        let key = TestKey::rsa_2048();
+        let certificate = kit_certificate(&key, "XAdES RSA Signer", Vec::new());
+        (key, certificate)
+    }
+
+    #[test]
+    fn our_rsa_signature_is_intact_and_valid() {
+        let (key, certificate) = rsa_signer();
+        let document = signed_document(&key, &certificate, |_value| Vec::new());
+        let judgement = judged(&objects(), &document);
+        assert!(judgement.document_intact());
+        assert!(judgement.signature_valid());
+    }
+
+    #[test]
+    fn a_sha_512_reference_recomputes() {
+        let (key, certificate) = ecdsa_signer();
+        let owned = OwnedCert::from_der(&certificate).expect("kit certificate parses");
+        let view = owned.view();
+        let parameters = SignerParameters {
+            certificate: &view,
+            digest_algorithm: DigestAlgorithm::Sha512,
+            signature_algorithm: crate::testkit::cades_algorithm(&key),
+            signing_time: Some(KIT_SIGNING_TIME),
+        };
+        let plan = plan(&objects(), &parameters).expect("plan");
+        let value = key.sign_raw(plan.signed_info());
+        let document = String::from_utf8(plan.finish(&value, &[], &ValidationMaterial::default()))
+            .expect("utf-8");
+        assert!(document.contains(super::DIGEST_METHOD_SHA512));
+        let judgement = judged(&objects(), &document);
+        assert!(judgement.document_intact());
+        assert!(judgement.signature_valid());
+
+        let mut changed = objects();
+        changed[0].content = b"a different declaration".to_vec();
+        assert!(!judged(&changed, &document).document_intact());
+    }
+
+    #[test]
+    fn our_ecdsa_signature_is_intact_and_valid() {
+        let (key, certificate) = ecdsa_signer();
+        let document = signed_document(&key, &certificate, |_value| Vec::new());
+        let (container, signature) = read(&objects(), &document);
+        assert_eq!(signature.signer_certificate().as_der(), certificate);
+        let judgement = supported(signature.verify(&container));
+        assert!(judgement.document_intact());
+        assert!(judgement.signature_valid());
+    }
+
+    #[test]
+    fn a_third_party_rsa_pss_signature_verifies() {
+        let (key, certificate) = rsa_signer();
+        let document = signed_document(&key, &certificate, |_value| Vec::new());
+        let pss = document.replacen(
+            SIGNATURE_METHOD_RSA_SHA256,
+            super::SIGNATURE_METHOD_RSA_PSS_SHA256,
+            1,
+        );
+        let pss = resign(&pss, |signed_info| {
+            key.sign_pss_sha256(signed_info, KIT_PSS_SALT)
+                .expect("an RSA key signs PSS")
+        });
+        let judgement = judged(&objects(), &pss);
+        assert!(judgement.document_intact());
+        assert!(judgement.signature_valid());
+
+        // A PKCS#1 value under the PSS identifier does not verify.
+        let mislabelled = document.replacen(
+            SIGNATURE_METHOD_RSA_SHA256,
+            super::SIGNATURE_METHOD_RSA_PSS_SHA256,
+            1,
+        );
+        let mislabelled = resign(&mislabelled, |signed_info| key.sign(signed_info));
+        assert!(!judged(&objects(), &mislabelled).signature_valid());
+    }
+
+    #[test]
+    fn a_flipped_signature_byte_is_not_valid() {
+        let (key, certificate) = ecdsa_signer();
+        let document = signed_document(&key, &certificate, |_value| Vec::new());
+        let judgement = judged(&objects(), &flipped(&document));
+        assert!(judgement.document_intact());
+        assert!(!judgement.signature_valid());
+    }
+
+    #[test]
+    fn a_binding_naming_another_certificate_is_not_valid() {
+        let (key, certificate) = ecdsa_signer();
+        let other = kit_certificate(&key, "Another Holder", Vec::new());
+        let document = signed_document(&key, &certificate, |_value| Vec::new());
+        let rebound = redigest(
+            &document,
+            |properties| properties.replace(&digest(&certificate), &digest(&other)),
+            |signed_info| signed_info.to_owned(),
+        );
+        let rebound = resign(&rebound, |signed_info| key.sign_raw(signed_info));
+        let (container, signature) = read(&objects(), &rebound);
+        assert_eq!(signature.signer_certificate().as_der(), certificate);
+        let judgement = supported(signature.verify(&container));
+        assert!(judgement.document_intact());
+        assert!(!judgement.signature_valid());
+    }
+
+    #[test]
+    fn a_missing_signing_certificate_is_not_valid() {
+        let (key, certificate) = ecdsa_signer();
+        let document = signed_document(&key, &certificate, |_value| Vec::new());
+        let unbound = redigest(
+            &document,
+            |properties| {
+                let binding = element(
+                    properties,
+                    "<xades:SigningCertificateV2>",
+                    "</xades:SigningCertificateV2>",
+                );
+                properties.replace(binding, "")
+            },
+            |signed_info| signed_info.to_owned(),
+        );
+        assert!(!unbound.contains("SigningCertificate"));
+        let unbound = resign(&unbound, |signed_info| key.sign_raw(signed_info));
+        let judgement = judged(&objects(), &unbound);
+        assert!(judgement.document_intact());
+        assert!(!judgement.signature_valid());
+    }
+
+    #[test]
+    fn signature_timestamps_verify_and_archive_timestamps_are_counted() {
+        let (key, certificate) = ecdsa_signer();
+        let tsa_key = TestKey::derive(TestCurve::P256, b"xades tsa");
+        let tsa = kit::certificate(
+            &kit::CertificateSpec {
+                serial: KIT_TSA_SERIAL,
+                subject: "XAdES Time Stamping Unit",
+                issuer: "XAdES Time Stamping Unit",
+                not_before: kit::day(KIT_FIRST_DAY),
+                not_after: kit::day(KIT_LAST_DAY),
+                extensions: kit::timestamping_extensions(),
+            },
+            &tsa_key,
+            &tsa_key,
+        );
+        let document = signed_document(&key, &certificate, |value| {
+            vec![crate::testkit::timestamp_token(
+                &tsa,
+                &tsa_key,
+                DigestAlgorithm::Sha256,
+                &SignaturePlan::timestamp_digest(value, DigestAlgorithm::Sha256),
+                kit::day(KIT_SIGNED_DAY),
+            )]
+        });
+        let archive = format!(
+            "<xades141:ArchiveTimeStamp xmlns:xades141=\"{NAMESPACE_XADES_141}\">\
+             <ds:CanonicalizationMethod Algorithm=\"{CANONICALIZATION_EXCLUSIVE}\"/>\
+             <xades:EncapsulatedTimeStamp>{}</xades:EncapsulatedTimeStamp>\
+             </xades141:ArchiveTimeStamp>\n</xades:UnsignedSignatureProperties>",
+            base64::encode(FIRST_TOKEN)
+        );
+        let archived = document.replace("</xades:UnsignedSignatureProperties>", &archive);
+        let (container, signature) = read(&objects(), &archived);
+        let [timestamp] = exactly(signature.signature_timestamps(), "one signature timestamp");
+        let input = timestamp
+            .imprint_input()
+            .expect("exclusive canonicalisation");
+        let verified =
+            crate::timestamp::verify_token(timestamp.token(), |algorithm| algorithm.digest(input))
+                .expect("the signature timestamp verifies");
+        assert_eq!(verified.generated_at(), kit::day(KIT_SIGNED_DAY));
+        let judgement = supported(signature.verify(&container));
+        assert!(judgement.signature_valid());
+        assert_eq!(judgement.signature_timestamps_present(), 1);
+        assert_eq!(judgement.archive_timestamps_present(), 1);
+    }
+
+    #[test]
+    fn a_modified_data_file_leaves_the_signature_valid() {
+        let (key, certificate) = ecdsa_signer();
+        let document = signed_document(&key, &certificate, |_value| Vec::new());
+        let mut changed = objects();
+        changed[0].content = b"a different declaration".to_vec();
+        let judgement = judged(&changed, &document);
+        assert!(!judgement.document_intact());
+        assert!(judgement.signature_valid());
+    }
+
+    #[test]
+    fn a_respelled_signed_info_still_verifies() {
+        let (key, certificate) = ecdsa_signer();
+        let document = signed_document(&key, &certificate, |_value| Vec::new());
+        let canonical = element(&document, "<ds:SignedInfo", "</ds:SignedInfo>").to_owned();
+        let respelled = document.replace(&canonical, &respell(&canonical));
+        assert!(respelled != document);
+        let judgement = judged(&objects(), &respelled);
+        assert!(judgement.document_intact());
+        assert!(judgement.signature_valid());
+    }
+
+    #[test]
+    fn a_with_comments_reference_resigned_verifies() {
+        let (key, certificate) = ecdsa_signer();
+        let document = signed_document(&key, &certificate, |_value| Vec::new());
+        let open = "<xades:SignedSignatureProperties>";
+        let with_comment = redigest(
+            &document,
+            |properties| properties.replacen(open, &format!("{open}<!-- a note -->"), 1),
+            |signed_info| {
+                signed_info.replace(
+                    &format!("<ds:Transform Algorithm=\"{CANONICALIZATION_EXCLUSIVE}\">"),
+                    &format!("<ds:Transform Algorithm=\"{CANONICALIZATION_EXCLUSIVE_COMMENTS}\">"),
+                )
+            },
+        );
+        assert!(!judged(&objects(), &with_comment).signature_valid());
+        let resigned = resign(&with_comment, |signed_info| key.sign_raw(signed_info));
+        let judgement = judged(&objects(), &resigned);
+        assert!(judgement.document_intact());
+        assert!(judgement.signature_valid());
     }
 }

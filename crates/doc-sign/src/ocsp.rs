@@ -826,7 +826,7 @@ impl BasicOcspResponse<'_> {
     /// # Errors
     /// As for `x509::verify_tbs_signature`.
     #[inline]
-    pub fn verify_signature(
+    pub(crate) fn verify_signature(
         &self,
         signer_spki: &crate::x509::SpkiDer<'_>,
     ) -> Result<(), crate::x509::VerifyError> {

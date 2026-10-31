@@ -334,6 +334,11 @@ impl PdfSignature {
     }
 }
 
+/// Whether `file` starts with the header every PDF starts with.
+pub(crate) fn starts_as_pdf(file: &[u8]) -> bool {
+    file.starts_with(PDF_HEADER)
+}
+
 /// The signatures and validation store of one parsed PDF.
 #[derive(Debug, Clone)]
 pub struct PdfDocument<'a> {

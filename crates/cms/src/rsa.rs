@@ -16,7 +16,10 @@
 //!
 //! Just enough RSA to verify a CRL or OCSP response signed by
 //! the DVV CA chain. No key generation, no signing, no
-//! private-key handling -- this module never holds a secret.
+//! private-key handling -- this module never holds a secret. The
+//! one exception is the test signer in `signing`, compiled only
+//! for tests and the `testkit` feature, which signs with a
+//! published test key.
 //!
 //! Builds on `crypto-bigint`'s `BoxedUint` + `BoxedMontyForm`
 //! for arbitrary-precision modular exponentiation. Padding +
@@ -921,6 +924,174 @@ fn mgf1_sha256(seed: &[u8], output_len: usize) -> Result<Vec<u8>, RsaVerifyError
     }
     mask.truncate(output_len);
     Ok(mask)
+}
+
+/// RSA signing with a published test key, for fixtures only.
+///
+/// Compiled for this crate's tests and behind the `testkit` feature.
+/// Signing is the textbook `m^d mod n` over `crypto-bigint`, with no
+/// blinding and no CRT: the keys it holds are public test keys.
+#[cfg(any(test, feature = "testkit"))]
+pub(crate) mod signing {
+    use super::{
+        BITS_PER_BYTE, BITS_PER_BYTE_USIZE, BOXED_UINT_LIMB_BITS, EMSA_PKCS1_V15_BLOCK_TYPE,
+        EMSA_PKCS1_V15_LEADING_BYTE, EMSA_PKCS1_V15_PS_FILL, EMSA_PKCS1_V15_PS_OFFSET,
+        EMSA_PKCS1_V15_SEPARATOR, FULL_BYTE_MASK, PSS_DB_SEPARATOR, PSS_SHA256_SALT_BYTES,
+        PSS_TRAILER_FIELD, PSS_ZERO_PREFIX_BYTES, RsaModulus, RsaPublicExponent,
+        SHA256_DIGEST_INFO, SHA256_OUTPUT_BYTES, SHA384_DIGEST_INFO, SHA512_DIGEST_INFO,
+        mgf1_sha256,
+    };
+    use crate::signed_data::HashAlgorithm;
+    use crypto_bigint::{
+        BoxedUint, Odd,
+        modular::{BoxedMontyForm, BoxedMontyParams},
+    };
+    use sha2::{Digest as _, Sha256};
+
+    /// An RSA private key: the public modulus and exponent and the
+    /// private exponent `d`.
+    #[derive(Clone)]
+    pub(crate) struct RsaSigningKey {
+        /// `n`.
+        modulus: RsaModulus,
+        /// `e`.
+        exponent: RsaPublicExponent,
+        /// `d`, at the modulus precision.
+        private_exponent: BoxedUint,
+        /// Montgomery parameters for `n`.
+        params: BoxedMontyParams,
+    }
+
+    impl core::fmt::Debug for RsaSigningKey {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("RsaSigningKey")
+                .field("modulus_bits", &self.modulus.bit_length())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl RsaSigningKey {
+        /// The key with big-endian magnitudes `modulus`,
+        /// `public_exponent` and `private_exponent`; `None` when the
+        /// public parts are not an RSA public key or `d` is not below
+        /// `n`.
+        pub(crate) fn from_parts(
+            modulus: &[u8],
+            public_exponent: &[u8],
+            private_exponent: &[u8],
+        ) -> Option<Self> {
+            let modulus = RsaModulus::try_from_pkcs1(modulus).ok()?;
+            let exponent = RsaPublicExponent::try_from_pkcs1(public_exponent).ok()?;
+            let precision = Self::precision(&modulus)?;
+            let n = BoxedUint::from_be_slice(modulus.as_bytes(), precision).ok()?;
+            let d = BoxedUint::from_be_slice(private_exponent, precision).ok()?;
+            if d >= n {
+                return None;
+            }
+            let odd: Odd<BoxedUint> = Option::from(Odd::new(n))?;
+            Some(Self {
+                modulus,
+                exponent,
+                private_exponent: d,
+                params: BoxedMontyParams::new(odd),
+            })
+        }
+
+        /// The limb-aligned bit precision of `modulus`.
+        fn precision(modulus: &RsaModulus) -> Option<u32> {
+            Some(
+                u32::try_from(modulus.byte_len())
+                    .ok()?
+                    .checked_mul(BITS_PER_BYTE)?
+                    .next_multiple_of(BOXED_UINT_LIMB_BITS),
+            )
+        }
+
+        /// The modulus.
+        pub(crate) const fn modulus(&self) -> &RsaModulus {
+            &self.modulus
+        }
+
+        /// The public exponent.
+        pub(crate) const fn exponent(&self) -> &RsaPublicExponent {
+            &self.exponent
+        }
+
+        /// `encoded^d mod n` as exactly modulus-length octets.
+        fn private_operation(&self, encoded: &[u8]) -> Vec<u8> {
+            let precision = Self::precision(&self.modulus).expect("the key's own precision");
+            let m = BoxedUint::from_be_slice(encoded, precision).expect("encoded fits the modulus");
+            let s = BoxedMontyForm::new(m, &self.params)
+                .pow(&self.private_exponent)
+                .retrieve();
+            let bytes = s.to_be_bytes();
+            let width = self.modulus.byte_len();
+            let start = bytes.len().saturating_sub(width);
+            let mut out = vec![EMSA_PKCS1_V15_LEADING_BYTE; width.saturating_sub(bytes.len())];
+            out.extend_from_slice(bytes.get(start..).unwrap_or_default());
+            out
+        }
+
+        /// The RSASSA-PKCS1-v1_5 signature over `message` hashed with
+        /// `hash` (RFC 8017 sec.8.2.1, EMSA-PKCS1-v1_5 sec.9.2).
+        pub(crate) fn sign_pkcs1v15(&self, hash: HashAlgorithm, message: &[u8]) -> Vec<u8> {
+            let prefix = match hash {
+                HashAlgorithm::Sha256 => SHA256_DIGEST_INFO,
+                HashAlgorithm::Sha384 => SHA384_DIGEST_INFO,
+                HashAlgorithm::Sha512 => SHA512_DIGEST_INFO,
+            };
+            let mut digest_info = prefix.to_vec();
+            digest_info.extend_from_slice(&hash.digest(message));
+            let width = self.modulus.byte_len();
+            let fill = width
+                .checked_sub(digest_info.len() + EMSA_FRAME_BYTES)
+                .expect("a test modulus holds the DigestInfo");
+            let mut encoded = vec![EMSA_PKCS1_V15_LEADING_BYTE, EMSA_PKCS1_V15_BLOCK_TYPE];
+            encoded.resize(encoded.len() + fill, EMSA_PKCS1_V15_PS_FILL);
+            encoded.push(EMSA_PKCS1_V15_SEPARATOR);
+            encoded.extend_from_slice(&digest_info);
+            self.private_operation(&encoded)
+        }
+
+        /// The RSASSA-PSS signature over `message` with SHA-256,
+        /// MGF1-SHA-256 and `salt` (RFC 8017 sec.8.1.1, EMSA-PSS
+        /// sec.9.1.1).
+        pub(crate) fn sign_pss_sha256(
+            &self,
+            message: &[u8],
+            salt: &[u8; PSS_SHA256_SALT_BYTES],
+        ) -> Vec<u8> {
+            let encoded_bits = self.modulus.bit_length().saturating_sub(1);
+            let encoded_len = encoded_bits.div_ceil(BITS_PER_BYTE_USIZE);
+            let mut hasher = Sha256::new();
+            hasher.update([0_u8; PSS_ZERO_PREFIX_BYTES]);
+            hasher.update(Sha256::digest(message));
+            hasher.update(salt);
+            let hash = hasher.finalize();
+            let db_len = encoded_len - SHA256_OUTPUT_BYTES - 1;
+            let mut db = vec![0_u8; db_len - PSS_SHA256_SALT_BYTES - 1];
+            db.push(PSS_DB_SEPARATOR);
+            db.extend_from_slice(salt);
+            let mask = mgf1_sha256(&hash, db_len).expect("the mask length is in range");
+            let mut encoded: Vec<u8> = db
+                .iter()
+                .zip(mask)
+                .map(|(byte, mask)| byte ^ mask)
+                .collect();
+            let unused_bits = encoded_len * BITS_PER_BYTE_USIZE - encoded_bits;
+            if let Some(first) = encoded.first_mut() {
+                *first &= FULL_BYTE_MASK >> unused_bits;
+            }
+            encoded.extend_from_slice(&hash);
+            encoded.push(PSS_TRAILER_FIELD);
+            self.private_operation(&encoded)
+        }
+    }
+
+    /// EMSA-PKCS1-v1_5 octets around the padding string and the
+    /// `DigestInfo`: the leading zero, the block type and the
+    /// separator.
+    const EMSA_FRAME_BYTES: usize = EMSA_PKCS1_V15_PS_OFFSET + 1;
 }
 
 /// A platform hash-algorithm name not supported by [`HashAlg`].

@@ -21,7 +21,6 @@
 #![forbid(unsafe_code)]
 
 pub mod asic;
-pub mod asic_verify;
 pub mod base64;
 /// Canonical BER encoding and parsing primitives re-exported from `refineid_ber`.
 pub(crate) mod ber {

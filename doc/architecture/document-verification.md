@@ -73,9 +73,11 @@ For each signature the report carries independent facts:
   or as written. A same-document reference digests the subtree its
   `Id` names, under its canonicalisation transform or, without one,
   Canonical XML 1.0. For an XAdES counter-signature, the data files
-  are not required; a reference must instead resolve to the
-  `ds:SignatureValue` of the signature it counter-signs, and one whose
-  `Type` is `CountersignedSignature` but resolves elsewhere fails. For CAdES in a container, the ASiCManifest that binds
+  are not required; instead a reference whose `Type` is
+  `CountersignedSignature` must resolve to the `ds:SignatureValue` of
+  the signature the counter-signature is embedded in. One without that
+  `Type` is an ordinary reference and covers nothing, and one with it
+  that resolves elsewhere, another signature's value included, fails. For CAdES in a container, the ASiCManifest that binds
   the signature (one manifest with exactly one SigReference naming it)
   references every data file and at least one, and each digest
   recomputes. A reference the verifier cannot resolve fails this fact;
@@ -130,9 +132,12 @@ For each signature the report carries independent facts:
   the best revocation outcome kept, good before unavailable before
   revoked (RFC 5280 sec.6 accepts any valid path). Every certificate
   below the anchor is checked for revocation. The report carries the
-  path as certificates, the signer's issuer first and the anchor last;
-  without an anchored path it carries the path as far as verifiable
-  issuers in the evidence reach, which may be empty.
+  path as certificates, the signer's issuer first: anchored, ending in
+  the anchor, exactly when the chain is verified; otherwise partial,
+  as far as verifiable issuers in the evidence reach, which may be
+  empty. A signer that is itself not valid at the validation time or
+  not fit to sign has a partial path even when its issuers reach an
+  anchor; the path is then the one to that anchor.
 - **Proof of existence.** The earliest time proven by a timestamp whose
   authority chains to a trust anchor with the time-stamping role: a
   signature-time-stamp attribute over the signature value, a XAdES
@@ -204,13 +209,18 @@ holds a complete `ds:Signature` over that signature's
 signature in its own right: its references recomputed, its
 SignedProperties reference required, its SigningCertificate binding
 required, its chain, revocation and timestamps judged as any
-signature's, with the evidence of the signature it counter-signs
-added to its own. It is its own row, placed after the row of the
+signature's, with the evidence of every signature it is nested in
+added to its own, since their `CertificateValues` may carry its path
+(clause 5.4.2). It is its own row, placed after the row of the
 signature it counter-signs and naming that row; a counter-signature
-of a counter-signature names the counter-signature. A
+of a counter-signature names the counter-signature. Counter-signatures
+are judged four levels deep below a signature over the document; a
+deeper one is an unsupported row and nothing below it is read. A
 counter-signature that does not read is an unsupported row naming the
-same. The counter-signed signature's verdict does not depend on its
-counter-signatures.
+signature it counter-signs. A counter-signature sits in unsigned
+properties anyone can append to, so, like a timestamp, it decides
+nothing: whatever its own verdict, it changes neither the verdict of
+the signature it counter-signs nor the document's.
 
 A signature is valid when the document is intact, the signature is
 valid, the chain is verified at the validation time, and no revocation
@@ -229,9 +239,9 @@ to be and how far into the file its range reaches. A document
 timestamp credits the signatures whose revision ends where its own
 range starts or earlier.
 
-The document is valid when it has at least one signature, every
-signature is valid, and no signature is unsupported; counter-signature
-rows count as signatures.
+The document is valid when it has at least one signature over the
+document, every such signature is valid, and none of them is
+unsupported; counter-signature rows are reported and do not count.
 
 ## Signer identity
 
@@ -281,7 +291,7 @@ judged.
 | Id | Controller | Unsafe control action | Hazard | Constraint |
 |---|---|---|---|---|
 | UCA-105 | Verifier | Uses a timestamp's time as the validation time when the timestamp's authority is not anchored. | H-8 | CC-109: only an anchored token sets the validation time; others are reported unproven. |
-| UCA-106 | Verifier | Omits a signature or document timestamp it could not read from the report. | H-8 | CC-110: every signature dictionary, XAdES signature and counter-signature, signature timestamp and document timestamp found is reported. A signature the verifier cannot read is a row marked unsupported and blocks the document verdict. A signature timestamp or document timestamp that fails verification, cannot be computed, or is not anchored is reported with what it was found to be and decides nothing: no proof of existence, no verdict. Archive timestamps are counted and reported, never judged and never blocking. |
+| UCA-106 | Verifier | Omits a signature or document timestamp it could not read from the report. | H-8 | CC-110: every signature dictionary, XAdES signature and counter-signature, signature timestamp and document timestamp found is reported. A signature the verifier cannot read is a row marked unsupported and blocks the document verdict; a counter-signature, of any verdict, is a row that decides nothing. A signature timestamp or document timestamp that fails verification, cannot be computed, or is not anchored is reported with what it was found to be and decides nothing: no proof of existence, no verdict. Archive timestamps are counted and reported, never judged and never blocking. |
 | UCA-107 | Verifier | Reports revocation Good from a live answer while the chain is not verified, or Revoked without the revocation time. | H-8 | CC-111: revocation is reported with its evidence time and judged against the proof of existence; a live answer never upgrades a chain the pool did not verify. |
 | UCA-108 | Verifier | Reports a document intact when a reference could not be resolved or canonicalised. | H-8 | CC-112: an unresolvable reference fails the fact. |
 | UCA-109 | Shell | Renders a verdict from anchors or lists that are stale without saying so. | H-8 | CC-113: the report carries the anchors' fetch time; the shell shows it. |

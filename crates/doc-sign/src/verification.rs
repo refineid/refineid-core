@@ -57,7 +57,8 @@ use self::cades::{CadesReadError, CadesSignature, Content, EssBinding};
 use self::pdf::{ByteRange, PdfDocument, PdfReadError, SignatureKind, SubFilter};
 use self::trust::judge;
 pub use self::trust::{
-    AnchorError, AnchorRole, GrantedPeriod, MaterialPool, Revocation, TrustAnchor, TrustAnchors,
+    AnchorError, AnchorRole, CertificationPath, GrantedPeriod, MaterialPool, Revocation,
+    TrustAnchor, TrustAnchors,
 };
 use self::xades::{XadesReadError, XadesUnsupported, XadesVerdict};
 
@@ -151,10 +152,9 @@ impl SignerIdentity {
 pub struct TimestampAuthority {
     /// The certificate that signed the token.
     signer: OwnedCert,
-    /// The path above it, its issuer first; it ends in the
-    /// time-stamping anchor when the token is anchored, and runs as far
-    /// as the evidence reaches when it is not.
-    chain: Vec<OwnedCert>,
+    /// The path above it to a time-stamping anchor, or as far as the
+    /// evidence reaches.
+    chain: CertificationPath,
 }
 
 impl TimestampAuthority {
@@ -164,12 +164,11 @@ impl TimestampAuthority {
         &self.signer
     }
 
-    /// The certification path above the token's signer, its issuer
-    /// first and the anchor last when there is one; empty when the
-    /// signer is itself the anchor or nothing in the evidence issued
-    /// it.
+    /// The certification path above the token's signer, judged at the
+    /// token's time: anchored, its issuer first and the time-stamping
+    /// anchor last, or partial.
     #[must_use]
-    pub fn chain(&self) -> &[OwnedCert] {
+    pub const fn chain(&self) -> &CertificationPath {
         &self.chain
     }
 }
@@ -237,16 +236,15 @@ pub struct SignatureReport {
     signer: SignerIdentity,
     /// The signer certificate.
     signer_certificate: OwnedCert,
-    /// The certification path above the signer, its issuer first.
-    chain: Vec<OwnedCert>,
+    /// The certification path above the signer, anchored at the
+    /// validation time or partial.
+    chain: CertificationPath,
     /// Every byte the signature claims to cover digests to the value it
     /// states.
     document_intact: bool,
     /// The signature verifies under the signer's key, bound as the
     /// profile requires.
     signature_valid: bool,
-    /// A path to a certificate-issuing anchor at the validation time.
-    chain_verified: bool,
     /// The earliest time an anchored timestamp proves.
     proof_of_existence: Option<DateTime>,
     /// The signature's own timestamps, in encoded order.
@@ -274,13 +272,12 @@ impl SignatureReport {
         &self.signer_certificate
     }
 
-    /// The certification path above the signer, its issuer first: the
-    /// anchored path, ending in the certificate-issuing anchor, when
-    /// [`Self::chain_verified`]; otherwise the path as far as the
-    /// evidence reaches. Empty when the signer is itself the anchor or
-    /// nothing in the evidence issued it.
+    /// The certification path above the signer, its issuer first:
+    /// [`CertificationPath::Anchored`], ending in the certificate-issuing
+    /// anchor, when [`Self::chain_verified`]; otherwise
+    /// [`CertificationPath::Partial`], as far as the evidence reaches.
     #[must_use]
-    pub fn chain(&self) -> &[OwnedCert] {
+    pub const fn chain(&self) -> &CertificationPath {
         &self.chain
     }
 
@@ -305,7 +302,7 @@ impl SignatureReport {
     /// valid at that time.
     #[must_use]
     pub const fn chain_verified(&self) -> bool {
-        self.chain_verified
+        self.chain.is_anchored()
     }
 
     /// The earliest time an anchored timestamp proves: a signature
@@ -359,7 +356,7 @@ impl SignatureReport {
     pub fn is_valid(&self) -> bool {
         self.document_intact
             && self.signature_valid
-            && self.chain_verified
+            && self.chain.is_anchored()
             && !self.revocation.revoked_before(self.proof_of_existence)
     }
 
@@ -370,7 +367,7 @@ impl SignatureReport {
     /// the report is returned unchanged.
     #[must_use]
     pub const fn with_live_revocation(mut self, answer: Revocation) -> Self {
-        if self.chain_verified && matches!(self.revocation, Revocation::Unavailable) {
+        if self.chain.is_anchored() && matches!(self.revocation, Revocation::Unavailable) {
             self.revocation = answer;
         }
         self
@@ -401,7 +398,18 @@ pub enum UnsupportedSignature {
     /// An `XAdES` signature whose signing-certificate binding names a
     /// certificate it does not carry, so it has no signer to judge.
     XadesSignerNotCarried,
+    /// An `XAdES` counter-signature nested more than
+    /// [`MAX_COUNTER_SIGNATURE_DEPTH`] levels below the signature over
+    /// the document.
+    CounterSignatureTooDeep,
 }
+
+/// Most levels of `XAdES` counter-signatures judged below a signature
+/// over the document: a counter-signature, its counter-signature, and
+/// so on. EN 319 132-1 clause 5.2.7.2 allows chains of any length; a
+/// real one has one or two levels, and the bound keeps a hostile file
+/// from making the report as deep as its XML.
+pub const MAX_COUNTER_SIGNATURE_DEPTH: usize = 4;
 
 /// What became of one signature found in the document.
 #[derive(Debug, Clone)]
@@ -527,12 +535,19 @@ impl DocumentReport {
         self.anchors_fetched_at
     }
 
-    /// Whether the document is valid: it has at least one signature,
-    /// and every signature was judged and is valid. A document
-    /// timestamp that does not verify is reported and decides nothing.
+    /// Whether the document is valid: it has at least one signature
+    /// over the document itself, and every such signature was judged
+    /// and is valid. A document timestamp that does not verify, and an
+    /// `XAdES` counter-signature of any verdict, are reported and decide
+    /// nothing: both sit in unsigned material anyone can append to.
     #[must_use]
     pub fn is_valid(&self) -> bool {
-        !self.rows.is_empty() && self.rows.iter().all(SignatureRow::is_valid)
+        let mut signatures = self
+            .rows
+            .iter()
+            .filter(|row| row.counter_signs.is_none())
+            .peekable();
+        signatures.peek().is_some() && signatures.all(SignatureRow::is_valid)
     }
 
     /// This report with live revocation answers: `ask` is called for
@@ -546,7 +561,7 @@ impl DocumentReport {
     ) -> Self {
         for row in &mut self.rows {
             if let SignatureOutcome::Judged(report) = &mut row.outcome
-                && report.chain_verified
+                && report.chain.is_anchored()
                 && report.revocation == Revocation::Unavailable
             {
                 report.revocation = ask(report);
@@ -729,11 +744,12 @@ impl Context<'_> {
                 now: self.now,
             },
         );
+        let anchored = chain.path.is_anchored();
         let authority = TimestampAuthority {
             signer: verified.signer_certificate().clone(),
             chain: chain.path,
         };
-        if chain.anchored && !chain.revocation.revoked_before(Some(time)) {
+        if anchored && !chain.revocation.revoked_before(Some(time)) {
             TimestampReport::Anchored { time, authority }
         } else {
             TimestampReport::Claimed { time, authority }
@@ -781,7 +797,6 @@ impl Context<'_> {
             chain: chain.path,
             document_intact: facts.document_intact,
             signature_valid: facts.signature_valid,
-            chain_verified: chain.anchored,
             proof_of_existence,
             timestamps,
             archive_timestamps: facts.archive_timestamps,
@@ -914,7 +929,7 @@ impl Context<'_> {
                 )),
                 Ok(signatures) => {
                     for signature in &signatures {
-                        self.push_xades_rows(&container, signature, None, &mut rows);
+                        self.push_xades_rows(&container, signature, &[], &mut rows);
                     }
                 }
             }
@@ -927,30 +942,39 @@ impl Context<'_> {
 
     /// The row of one `XAdES` signature, then the rows of its
     /// counter-signatures, each naming the row it counter-signs.
-    /// `outer` is the signature this one counter-signs, with the row it
-    /// is reported in.
+    /// `enclosing` holds the signatures this one is nested in, the
+    /// outermost first, each with its row; the last is the one it
+    /// counter-signs. Past [`MAX_COUNTER_SIGNATURE_DEPTH`] levels a
+    /// counter-signature is an unsupported row and its own
+    /// counter-signatures are not read.
     fn push_xades_rows(
         &self,
         container: &AsicContainer,
         signature: &Result<xades::XadesSignature, XadesReadError>,
-        outer: Option<(usize, &xades::XadesSignature)>,
+        enclosing: &[(usize, &xades::XadesSignature)],
         rows: &mut Vec<SignatureRow>,
     ) {
         let row = rows.len();
-        let counter_signs = outer.map(|(row, _)| row);
+        let counter_signs = enclosing.last().map(|(row, _)| *row);
+        if enclosing.len() > MAX_COUNTER_SIGNATURE_DEPTH {
+            rows.push(
+                SignatureRow::unsupported(UnsupportedSignature::CounterSignatureTooDeep)
+                    .counter_signing(counter_signs),
+            );
+            return;
+        }
         match signature {
             Ok(signature) => {
+                let outer: Vec<&xades::XadesSignature> =
+                    enclosing.iter().map(|(_, outer)| *outer).collect();
                 rows.push(
-                    self.xades_row(container, signature, outer.map(|(_, outer)| outer))
+                    self.xades_row(container, signature, &outer)
                         .counter_signing(counter_signs),
                 );
+                let mut nested = enclosing.to_vec();
+                nested.push((row, signature));
                 for counter_signature in signature.counter_signatures() {
-                    self.push_xades_rows(
-                        container,
-                        counter_signature,
-                        Some((row, signature)),
-                        rows,
-                    );
+                    self.push_xades_rows(container, counter_signature, &nested, rows);
                 }
             }
             Err(error) => rows.push(
@@ -961,14 +985,15 @@ impl Context<'_> {
     }
 
     /// The row of one `XAdES` signature. A counter-signature's evidence
-    /// includes that of the signature it counter-signs, whose
-    /// `CertificateValues` may carry the counter-signer's path
-    /// (`ETSI EN 319 132-1` clause 5.4.2).
+    /// includes that of every signature in `enclosing`, the signatures
+    /// it is nested in, whose `CertificateValues` and `RevocationValues`
+    /// may carry the counter-signer's path (`ETSI EN 319 132-1` clause
+    /// 5.4.2).
     fn xades_row(
         &self,
         container: &AsicContainer,
         signature: &xades::XadesSignature,
-        outer: Option<&xades::XadesSignature>,
+        enclosing: &[&xades::XadesSignature],
     ) -> SignatureRow {
         let judgement = match signature.verify(container) {
             XadesVerdict::Unsupported(unsupported) => {
@@ -982,7 +1007,7 @@ impl Context<'_> {
         let mut pool = self.anchor_pool();
         pool.add_material(signature.embedded_material());
         pool.add_certificate_ders(signature.embedded_certificates());
-        if let Some(outer) = outer {
+        for outer in enclosing {
             pool.add_material(outer.embedded_material());
             pool.add_certificate_ders(outer.embedded_certificates());
         }

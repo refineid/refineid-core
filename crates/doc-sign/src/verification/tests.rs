@@ -4,9 +4,9 @@
 //! synthetic keys, certificates and evidence.
 
 use super::{
-    AnchorRole, DocumentFailure, DocumentFile, DocumentReport, GrantedPeriod, Revocation,
-    SignatureOutcome, SignatureReport, SignatureRow, SignerIdentity, TimestampReport, TrustAnchor,
-    TrustAnchors, UnsupportedProfile, UnsupportedSignature, exactly, verify,
+    AnchorRole, CertificationPath, DocumentFailure, DocumentFile, DocumentReport, GrantedPeriod,
+    Revocation, SignatureOutcome, SignatureReport, SignatureRow, SignerIdentity, TimestampReport,
+    TrustAnchor, TrustAnchors, UnsupportedProfile, UnsupportedSignature, exactly, verify,
 };
 use crate::asic::DataObject;
 use crate::cades::{DigestAlgorithm, SignatureAlgorithm, SignerParameters, SigningTime};
@@ -594,8 +594,8 @@ fn kinds(reports: &[TimestampReport]) -> Vec<Kind> {
 }
 
 /// The DER of each certificate of `path`.
-fn ders(path: &[OwnedCert]) -> Vec<&[u8]> {
-    path.iter().map(OwnedCert::as_der).collect()
+fn ders(path: &CertificationPath) -> Vec<&[u8]> {
+    path.certificates().iter().map(OwnedCert::as_der).collect()
 }
 
 /// Change one byte inside the first signed span.
@@ -762,7 +762,11 @@ fn an_untrusted_root_leaves_the_chain_unverified_but_names_the_issuer() {
     assert!(signature.signature_valid());
     assert!(!signature.chain_verified());
     assert_eq!(
-        signature.chain().first().map(OwnedCert::as_der),
+        signature
+            .chain()
+            .certificates()
+            .first()
+            .map(OwnedCert::as_der),
         Some(world.intermediate.as_slice())
     );
     assert!(!report.is_valid());
@@ -1047,7 +1051,7 @@ fn a_self_made_timestamp_is_unproven_and_the_signature_is_judged_at_now() {
     let authority = stamp.authority().expect("a verified token");
     assert_eq!(authority.signer().as_der(), world.rogue_tsa.as_slice());
     assert!(
-        authority.chain().is_empty(),
+        authority.chain().certificates().is_empty(),
         "the self-made root is not in the evidence"
     );
     assert_eq!(signature.proof_of_existence(), None);
@@ -1183,6 +1187,32 @@ fn the_signer_name_is_the_common_name_verbatim() {
         identity.identifier().map(|peuin| peuin.as_str()),
         Some(IDENTIFIER)
     );
+}
+
+/// The universal tag of `IA5String` (X.680 sec.8.4, Table 1).
+const IA5_STRING: u8 = 0x16;
+
+/// `domainComponent` (RFC 4519 sec.2.4), an `IA5String`.
+const DOMAIN_COMPONENT: refineid_cms::oid::Oid<'static> = refineid_cms::oid::Oid::const_new(
+    ::const_oid::ObjectIdentifier::new_unwrap("0.9.2342.19200300.100.1.25").as_bytes(),
+);
+
+/// A subject of `domainComponent` values only renders them as text
+/// under their short name `DC` (RFC 4514 sec.3), not as `#` hex.
+#[test]
+fn domain_components_render_as_text() {
+    let key = TestKey::derive(TestCurve::P256, b"person");
+    let certificate = certificate_named(
+        &spec(PERSON_SERIAL, PERSON, PERSON, Vec::new()),
+        &name_of(&[
+            (DOMAIN_COMPONENT, IA5_STRING, "org"),
+            (DOMAIN_COMPONENT, IA5_STRING, "example"),
+        ]),
+        &key,
+        &key,
+    );
+    let identity = SignerIdentity::of(&OwnedCert::from_der(&certificate).expect("parses"));
+    assert_eq!(identity.name(), "DC=example,DC=org");
 }
 
 /// `organizationName` (X.520, RFC 4519 sec.2.19).
@@ -1630,6 +1660,12 @@ impl World {
     /// The writer's `XAdES` signature file over the note, signed by the
     /// direct signer.
     fn xades_note(&self) -> String {
+        self.xades_note_with(&ValidationMaterial::default())
+    }
+
+    /// As [`Self::xades_note`], carrying `material` in the unsigned
+    /// properties.
+    fn xades_note_with(&self, material: &ValidationMaterial) -> String {
         let owned = OwnedCert::from_der(&self.direct_signer).expect("signer parses");
         let certificate = owned.view();
         let parameters = SignerParameters {
@@ -1640,7 +1676,7 @@ impl World {
         };
         let plan = crate::xades::plan(&note_objects(), &parameters).expect("plans");
         let value = self.signer_key.sign_raw(plan.signed_info());
-        String::from_utf8(plan.finish(&value, &[], &ValidationMaterial::default())).expect("utf-8")
+        String::from_utf8(plan.finish(&value, &[], material)).expect("utf-8")
     }
 
     /// The writer's signature file with `SignedInfo` and the
@@ -1669,13 +1705,28 @@ impl World {
 
     /// `document` with a counter-signature by the RSA signer whose
     /// `CountersignedSignature` reference digests `countersigned`,
-    /// carrying a `SigningCertificateV2` when `bound`.
+    /// carrying a `SigningCertificateV2` when `bound`, placed in the
+    /// outer signature's unsigned properties.
     fn counter_signed(&self, document: &str, countersigned: &[u8], bound: bool) -> String {
-        use crate::xades::{
-            CANONICALIZATION_EXCLUSIVE, DIGEST_METHOD_SHA256, NAMESPACE_DSIG,
-            SIGNATURE_METHOD_RSA_SHA256, TYPE_SIGNED_PROPERTIES,
+        let spec = CounterSpec {
+            bound,
+            ..CounterSpec::over(countersigned.to_vec())
         };
-        let binding = if bound {
+        let placed = place_in_outer(document, &self.counter_signature_xml(&spec));
+        self.sign_counter(&placed, &spec)
+    }
+
+    /// The `xades:CounterSignature` element `spec` describes, with its
+    /// properties digest and value still to be filled in by
+    /// [`Self::sign_counter`] once it is placed.
+    fn counter_signature_xml(&self, spec: &CounterSpec<'_>) -> String {
+        use crate::xades::{
+            DIGEST_METHOD_SHA256, NAMESPACE_DSIG, SIGNATURE_METHOD_RSA_SHA256,
+            TYPE_SIGNED_PROPERTIES,
+        };
+        let id = spec.id;
+        let uri = spec.canonicalization_uri;
+        let binding = if spec.bound {
             format!(
                 "<xades:SigningCertificateV2><xades:Cert><xades:CertDigest>\
                  <ds:DigestMethod Algorithm=\"{DIGEST_METHOD_SHA256}\"/>\
@@ -1686,49 +1737,143 @@ impl World {
         } else {
             String::new()
         };
+        let key_info = if spec.key_info {
+            format!(
+                "<ds:KeyInfo><ds:X509Data><ds:X509Certificate>{}</ds:X509Certificate>\
+                 </ds:X509Data></ds:KeyInfo>\n",
+                crate::base64::encode(&self.rsa_signer)
+            )
+        } else {
+            String::new()
+        };
         let transform = format!(
-            "<ds:Transforms><ds:Transform Algorithm=\"{CANONICALIZATION_EXCLUSIVE}\"/></ds:Transforms>\
+            "<ds:Transforms><ds:Transform Algorithm=\"{uri}\"/></ds:Transforms>\
              <ds:DigestMethod Algorithm=\"{DIGEST_METHOD_SHA256}\"/>"
         );
-        let counter = format!(
-            "<xades:UnsignedProperties><xades:UnsignedSignatureProperties>\
-             <xades:CounterSignature>\
-             <ds:Signature xmlns:ds=\"{NAMESPACE_DSIG}\" Id=\"{COUNTER_ID}\">\n\
+        let typed = if spec.typed {
+            format!(" Type=\"{}\"", super::xades::TYPE_COUNTERSIGNED_SIGNATURE)
+        } else {
+            String::new()
+        };
+        format!(
+            "<xades:CounterSignature>\
+             <ds:Signature xmlns:ds=\"{NAMESPACE_DSIG}\" Id=\"{id}\">\n\
              <ds:SignedInfo>\n\
-             <ds:CanonicalizationMethod Algorithm=\"{CANONICALIZATION_EXCLUSIVE}\"/>\n\
+             <ds:CanonicalizationMethod Algorithm=\"{uri}\"/>\n\
              <ds:SignatureMethod Algorithm=\"{SIGNATURE_METHOD_RSA_SHA256}\"/>\n\
-             <ds:Reference Type=\"{TYPE_COUNTERSIGNED}\" URI=\"#{OUTER_VALUE_ID}\">{transform}\
+             <ds:Reference{typed} URI=\"#{target}\">{transform}\
              <ds:DigestValue>{countersigned_digest}</ds:DigestValue></ds:Reference>\n\
-             <ds:Reference Type=\"{TYPE_SIGNED_PROPERTIES}\" URI=\"#{COUNTER_ID}-SIGNEDPROPS\">{transform}\
-             <ds:DigestValue>{PROPERTIES_DIGEST_PLACEHOLDER}</ds:DigestValue></ds:Reference>\n\
+             <ds:Reference Type=\"{TYPE_SIGNED_PROPERTIES}\" URI=\"#{id}-SIGNEDPROPS\">{transform}\
+             <ds:DigestValue>{PROPERTIES_DIGEST_PLACEHOLDER}-{id}</ds:DigestValue></ds:Reference>\n\
              </ds:SignedInfo>\n\
-             <ds:SignatureValue Id=\"{COUNTER_ID}-SIGVAL\">unsigned</ds:SignatureValue>\n\
-             <ds:KeyInfo><ds:X509Data><ds:X509Certificate>{certificate}</ds:X509Certificate>\
-             </ds:X509Data></ds:KeyInfo>\n\
-             <ds:Object><xades:QualifyingProperties Target=\"#{COUNTER_ID}\">\
-             <xades:SignedProperties Id=\"{COUNTER_ID}-SIGNEDPROPS\">\
+             <ds:SignatureValue Id=\"{id}-SIGVAL\">unsigned</ds:SignatureValue>\n\
+             {key_info}\
+             <ds:Object><xades:QualifyingProperties Target=\"#{id}\">\
+             <xades:SignedProperties Id=\"{id}-SIGNEDPROPS\">\
              <xades:SignedSignatureProperties>\
              <xades:SigningTime>2026-04-08T12:00:00Z</xades:SigningTime>{binding}\
              </xades:SignedSignatureProperties></xades:SignedProperties>\
              </xades:QualifyingProperties></ds:Object>\n\
              </ds:Signature>\
-             </xades:CounterSignature>\
-             </xades:UnsignedSignatureProperties></xades:UnsignedProperties>\n\
-             </xades:QualifyingProperties>",
-            TYPE_COUNTERSIGNED = super::xades::TYPE_COUNTERSIGNED_SIGNATURE,
-            countersigned_digest = digest_text(countersigned),
-            certificate = crate::base64::encode(&self.rsa_signer),
-        );
-        let placed = document.replacen("</xades:QualifyingProperties>", &counter, 1);
-        let exclusive = Canonicalization::exclusive(Comments::Omitted);
-        let properties_id = format!("{COUNTER_ID}-SIGNEDPROPS");
-        let digested = placed.replacen(
-            PROPERTIES_DIGEST_PLACEHOLDER,
-            &digest_text(&canonical_by_id(&placed, &properties_id, &exclusive)),
+             </xades:CounterSignature>",
+            target = spec.target_value_id,
+            countersigned_digest = digest_text(&spec.over),
+        )
+    }
+
+    /// `document`, holding the counter-signature `spec` describes, with
+    /// that counter-signature's properties digested and its value signed
+    /// by the RSA signer.
+    fn sign_counter(&self, document: &str, spec: &CounterSpec<'_>) -> String {
+        let properties_id = format!("{}-SIGNEDPROPS", spec.id);
+        let digested = document.replacen(
+            &format!("{PROPERTIES_DIGEST_PLACEHOLDER}-{}", spec.id),
+            &digest_text(&canonical_by_id(document, &properties_id, &spec.method)),
             1,
         );
-        resigned(&digested, COUNTER_ID, &exclusive, &self.rsa_key)
+        resigned(&digested, spec.id, &spec.method, &self.rsa_key)
     }
+}
+
+/// How a test counter-signature is written.
+struct CounterSpec<'a> {
+    /// Its `Id`, and the stem of its parts' identifiers.
+    id: &'a str,
+    /// The `Id` its counter-signing reference names.
+    target_value_id: &'a str,
+    /// The octets that reference's digest is computed over.
+    over: Vec<u8>,
+    /// Whether it carries `SigningCertificateV2`.
+    bound: bool,
+    /// Whether the reference carries the `CountersignedSignature` type.
+    typed: bool,
+    /// Whether it carries its certificate in `ds:KeyInfo`.
+    key_info: bool,
+    /// The canonicalisation its `SignedInfo` and transforms name.
+    canonicalization_uri: &'a str,
+    /// That canonicalisation.
+    method: Canonicalization,
+}
+
+impl CounterSpec<'_> {
+    /// An exclusive, bound, typed counter-signature over the writer's
+    /// signature value, digesting `over`.
+    fn over(over: Vec<u8>) -> Self {
+        CounterSpec {
+            id: COUNTER_ID,
+            target_value_id: OUTER_VALUE_ID,
+            over,
+            bound: true,
+            typed: true,
+            key_info: true,
+            canonicalization_uri: crate::xades::CANONICALIZATION_EXCLUSIVE,
+            method: Canonicalization::exclusive(Comments::Omitted),
+        }
+    }
+}
+
+/// `document` with the counter-signature `counter` added to the
+/// writer's outer signature's unsigned properties, after any already
+/// there.
+fn place_in_outer(document: &str, counter: &str) -> String {
+    match document.rfind("</xades:UnsignedSignatureProperties>") {
+        Some(at) => {
+            let mut placed = document.to_owned();
+            placed.insert_str(at, counter);
+            placed
+        }
+        None => document.replacen(
+            "</xades:QualifyingProperties>",
+            &format!(
+                "<xades:UnsignedProperties><xades:UnsignedSignatureProperties>{counter}\
+                 </xades:UnsignedSignatureProperties></xades:UnsignedProperties>\n\
+                 </xades:QualifyingProperties>"
+            ),
+            1,
+        ),
+    }
+}
+
+/// `document` with the counter-signature `counter` placed inside the
+/// counter-signature `id`, which has no unsigned properties yet.
+fn place_in_counter(document: &str, id: &str, counter: &str) -> String {
+    let marker = format!("Target=\"#{id}\">");
+    let start = document.find(&marker).expect("the counter-signature");
+    let close = "</xades:QualifyingProperties>";
+    let at = start
+        + document
+            .get(start..)
+            .and_then(|rest| rest.find(close))
+            .expect("its properties close");
+    let mut placed = document.to_owned();
+    placed.insert_str(
+        at,
+        &format!(
+            "<xades:UnsignedProperties><xades:UnsignedSignatureProperties>{counter}\
+             </xades:UnsignedSignatureProperties></xades:UnsignedProperties>"
+        ),
+    );
+    placed
 }
 
 /// The two rows of `report`: a signature and its counter-signature.
@@ -1865,7 +2010,7 @@ fn a_counter_signature_over_another_signature_value_is_not_valid() {
     assert!(!counter.document_intact());
     assert!(counter.signature_valid());
     assert!(!counter.is_valid());
-    assert!(!report.is_valid());
+    assert!(report.is_valid(), "a counter-signature decides nothing");
 }
 
 #[test]
@@ -1885,7 +2030,7 @@ fn a_counter_signature_without_a_signing_certificate_is_not_valid() {
     let counter = judged(counter);
     assert!(counter.document_intact());
     assert!(!counter.signature_valid());
-    assert!(!report.is_valid());
+    assert!(report.is_valid(), "a counter-signature decides nothing");
 }
 
 #[test]
@@ -1907,5 +2052,248 @@ fn an_unreadable_counter_signature_is_an_unsupported_row() {
         counter.outcome(),
         SignatureOutcome::Unsupported(UnsupportedSignature::XadesMalformed(_))
     ));
-    assert!(!report.is_valid());
+    assert!(report.is_valid(), "a counter-signature decides nothing");
+}
+
+/// The writer's signature value under `method`, as the counter-signing
+/// reference digests it.
+fn outer_value(document: &str, method: &Canonicalization) -> Vec<u8> {
+    canonical_by_id(document, OUTER_VALUE_ID, method)
+}
+
+/// The judged counter-signature row of `report`, after checking it
+/// names the first row.
+fn counter_report(report: &DocumentReport) -> &SignatureReport {
+    let [outer, counter] = xades_rows(report);
+    assert!(outer.is_valid());
+    assert_eq!(counter.counter_signs(), Some(0));
+    judged(counter)
+}
+
+/// A reference over the outer value without the
+/// `CountersignedSignature` type is an ordinary same-document reference
+/// and does not make the counter-signature cover it (EN 319 132-1
+/// clause 5.2.7.1).
+#[test]
+fn a_counter_signing_reference_needs_its_type() {
+    let world = World::new();
+    let document = world.xades_note();
+    let spec = CounterSpec {
+        typed: false,
+        ..CounterSpec::over(outer_value(
+            &document,
+            &Canonicalization::exclusive(Comments::Omitted),
+        ))
+    };
+    let signed = world.sign_counter(
+        &place_in_outer(&document, &world.counter_signature_xml(&spec)),
+        &spec,
+    );
+    let report = world.verify(xades_container_of(&signed)).expect("report");
+    let counter = counter_report(&report);
+    assert!(!counter.document_intact());
+    assert!(counter.signature_valid());
+}
+
+/// A counter-signature counter-signs the signature it is embedded in: a
+/// typed reference naming another signature's value, here a sibling
+/// counter-signature's, does not count (EN 319 132-1 clause 5.2.7.2).
+#[test]
+fn a_counter_signature_over_another_signature_s_value_is_not_accepted() {
+    let world = World::new();
+    let exclusive = Canonicalization::exclusive(Comments::Omitted);
+    let document = world.xades_note();
+    let first = CounterSpec::over(outer_value(&document, &exclusive));
+    let once = world.sign_counter(
+        &place_in_outer(&document, &world.counter_signature_xml(&first)),
+        &first,
+    );
+    let sibling_value = format!("{COUNTER_ID}-SIGVAL");
+    let second = CounterSpec {
+        id: "CS-2",
+        target_value_id: &sibling_value,
+        ..CounterSpec::over(canonical_by_id(&once, &sibling_value, &exclusive))
+    };
+    let twice = world.sign_counter(
+        &place_in_outer(&once, &world.counter_signature_xml(&second)),
+        &second,
+    );
+    let report = world.verify(xades_container_of(&twice)).expect("report");
+    let [outer, first, second] = exactly(report.rows(), "a signature and two counter-signatures");
+    assert!(outer.is_valid());
+    assert_eq!(first.counter_signs(), Some(0));
+    assert_eq!(second.counter_signs(), Some(0));
+    assert!(first.is_valid());
+    let second = judged(second);
+    assert!(
+        !second.document_intact(),
+        "it names a value it is not embedded under"
+    );
+    assert!(second.signature_valid());
+}
+
+/// A counter-signature under Canonical XML 1.1 throughout verifies.
+#[test]
+fn a_counter_signature_under_inclusive_canonicalisation_verifies() {
+    let world = World::new();
+    let method = Canonicalization {
+        algorithm: Algorithm::Canonical11,
+        comments: Comments::Omitted,
+    };
+    let document = world.xades_note();
+    let spec = CounterSpec {
+        canonicalization_uri: super::xades::CANONICALIZATION_INCLUSIVE_11,
+        method: method.clone(),
+        ..CounterSpec::over(outer_value(&document, &method))
+    };
+    let signed = world.sign_counter(
+        &place_in_outer(&document, &world.counter_signature_xml(&spec)),
+        &spec,
+    );
+    assert!(signed.contains(super::xades::CANONICALIZATION_INCLUSIVE_11));
+    let report = world.verify(xades_container_of(&signed)).expect("report");
+    assert!(counter_report(&report).is_valid());
+}
+
+/// A counter-signature nested in another, carrying no certificate of
+/// its own, finds its signer in the outermost signature's
+/// `CertificateValues`, and its row names the counter-signature it
+/// counter-signs.
+#[test]
+fn a_nested_counter_signer_is_found_in_an_enclosing_signature() {
+    let world = World::new();
+    let exclusive = Canonicalization::exclusive(Comments::Omitted);
+    let document = world.xades_note_with(&ValidationMaterial {
+        certificates: vec![world.rsa_signer.clone()],
+        ..ValidationMaterial::default()
+    });
+    let first = CounterSpec::over(outer_value(&document, &exclusive));
+    let once = world.sign_counter(
+        &place_in_outer(&document, &world.counter_signature_xml(&first)),
+        &first,
+    );
+    let first_value = format!("{COUNTER_ID}-SIGVAL");
+    let nested = CounterSpec {
+        id: "CS-2",
+        target_value_id: &first_value,
+        key_info: false,
+        ..CounterSpec::over(canonical_by_id(&once, &first_value, &exclusive))
+    };
+    let twice = world.sign_counter(
+        &place_in_counter(&once, COUNTER_ID, &world.counter_signature_xml(&nested)),
+        &nested,
+    );
+    let report = world.verify(xades_container_of(&twice)).expect("report");
+    let [outer, first, nested] = exactly(report.rows(), "a signature and a chain of two");
+    assert!(outer.is_valid());
+    assert_eq!(first.counter_signs(), Some(0));
+    assert!(first.is_valid());
+    assert_eq!(nested.counter_signs(), Some(1));
+    let nested = judged(nested);
+    assert_eq!(nested.signer().name(), RSA_SIGNER);
+    assert!(nested.is_valid());
+
+    // Without the certificate in any enclosing signature there is no
+    // signer to judge.
+    let carried_once = world.xades_note();
+    let first = CounterSpec::over(outer_value(&carried_once, &exclusive));
+    let once = world.sign_counter(
+        &place_in_outer(&carried_once, &world.counter_signature_xml(&first)),
+        &first,
+    );
+    let nested = CounterSpec {
+        id: "CS-2",
+        target_value_id: &first_value,
+        key_info: false,
+        ..CounterSpec::over(canonical_by_id(&once, &first_value, &exclusive))
+    };
+    let twice = world.sign_counter(
+        &place_in_counter(&once, COUNTER_ID, &world.counter_signature_xml(&nested)),
+        &nested,
+    );
+    let report = world.verify(xades_container_of(&twice)).expect("report");
+    let [_outer, _first, nested] = exactly(report.rows(), "a signature and a chain of two");
+    assert!(matches!(
+        nested.outcome(),
+        SignatureOutcome::Unsupported(UnsupportedSignature::XadesSignerNotCarried)
+    ));
+}
+
+/// Past [`super::MAX_COUNTER_SIGNATURE_DEPTH`] levels a counter-signature
+/// is an unsupported row and nothing below it is read; none of them
+/// decides the document.
+#[test]
+fn counter_signatures_nest_to_a_bounded_depth() {
+    use crate::xades::{CANONICALIZATION_EXCLUSIVE, NAMESPACE_DSIG};
+    let world = World::new();
+    let levels = super::MAX_COUNTER_SIGNATURE_DEPTH + 2;
+    let certificate = crate::base64::encode(&world.rsa_signer);
+    let mut inner = String::new();
+    for level in (1..=levels).rev() {
+        let unsigned = if inner.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<xades:UnsignedProperties><xades:UnsignedSignatureProperties>{inner}\
+                 </xades:UnsignedSignatureProperties></xades:UnsignedProperties>"
+            )
+        };
+        inner = format!(
+            "<xades:CounterSignature><ds:Signature xmlns:ds=\"{NAMESPACE_DSIG}\" Id=\"D{level}\">\
+             <ds:SignedInfo><ds:CanonicalizationMethod Algorithm=\"{CANONICALIZATION_EXCLUSIVE}\"/>\
+             </ds:SignedInfo><ds:SignatureValue Id=\"D{level}-SIGVAL\">AAAA</ds:SignatureValue>\
+             <ds:KeyInfo><ds:X509Data><ds:X509Certificate>{certificate}</ds:X509Certificate>\
+             </ds:X509Data></ds:KeyInfo><ds:Object>\
+             <xades:QualifyingProperties Target=\"#D{level}\">{unsigned}</xades:QualifyingProperties>\
+             </ds:Object></ds:Signature></xades:CounterSignature>"
+        );
+    }
+    let document = place_in_outer(&world.xades_note(), &inner);
+    let report = world.verify(xades_container_of(&document)).expect("report");
+    let rows = report.rows();
+    assert_eq!(
+        rows.len(),
+        super::MAX_COUNTER_SIGNATURE_DEPTH + 2,
+        "the outer row, the bounded levels and the refused one"
+    );
+    for (index, row) in rows.iter().enumerate().skip(1) {
+        assert_eq!(row.counter_signs(), Some(index - 1));
+    }
+    assert!(matches!(
+        rows.last().map(SignatureRow::outcome),
+        Some(SignatureOutcome::Unsupported(
+            UnsupportedSignature::CounterSignatureTooDeep
+        ))
+    ));
+    assert!(report.is_valid());
+}
+
+/// A same-document reference without a transform is canonicalised by
+/// Canonical XML 1.0 (XML Signature 1.1 clause 4.4.3.2).
+#[test]
+fn a_reference_without_a_transform_digests_canonical_xml_1_0() {
+    let world = World::new();
+    let document = world.xades_note();
+    let transforms = format!(
+        "<ds:Transforms>\n<ds:Transform Algorithm=\"{}\"></ds:Transform>\n</ds:Transforms>\n",
+        crate::xades::CANONICALIZATION_EXCLUSIVE
+    );
+    assert!(document.contains(&transforms));
+    let bare = document.replacen(&transforms, "", 1);
+    let inclusive = Canonicalization {
+        algorithm: Algorithm::Canonical10,
+        comments: Comments::Omitted,
+    };
+    let exclusive = Canonicalization::exclusive(Comments::Omitted);
+    let redigested = bare.replacen(
+        &digest_text(&canonical_by_id(&document, OUTER_PROPERTIES_ID, &exclusive)),
+        &digest_text(&canonical_by_id(&bare, OUTER_PROPERTIES_ID, &inclusive)),
+        1,
+    );
+    let signed = resigned(&redigested, OUTER_ID, &exclusive, &world.signer_key);
+    let report = world.verify(xades_container_of(&signed)).expect("report");
+    let signature = only(&report);
+    assert!(signature.document_intact());
+    assert!(signature.signature_valid());
+    assert!(report.is_valid());
 }

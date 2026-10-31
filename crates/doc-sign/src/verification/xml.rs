@@ -230,9 +230,12 @@ impl Canonicalization {
 /// The local name of `xml:base` (W3C XML Base sec.3).
 const XML_BASE: &str = "base";
 
+/// The local name of `xml:lang` (XML 1.0 sec.2.12).
+const XML_LANG: &str = "lang";
+
 /// The simple inheritable attributes of Canonical XML 1.1 sec.2.4,
 /// `xml:lang` and `xml:space`, by local name.
-const SIMPLE_INHERITABLE: [&str; 2] = ["lang", "space"];
+const SIMPLE_INHERITABLE: [&str; 2] = [XML_LANG, "space"];
 
 /// The `xml:` attributes the apex of a subset renders from its omitted
 /// ancestors.
@@ -240,9 +243,22 @@ const SIMPLE_INHERITABLE: [&str; 2] = ["lang", "space"];
 struct InheritedXml {
     /// Attributes taken from the nearest ancestor that carries them.
     added: Vec<Attribute>,
-    /// The fixed-up `xml:base` (Canonical XML 1.1 sec.2.4), replacing
-    /// the element's own; empty means none is rendered.
-    base: Option<String>,
+    /// What becomes of the element's `xml:base`.
+    base: BaseFixup,
+}
+
+/// The `xml:base` an element renders under Canonical XML 1.1 sec.2.4.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum BaseFixup {
+    /// No omitted ancestor carries `xml:base`: the element's own, if
+    /// any, is rendered as written.
+    #[default]
+    KeepOwn,
+    /// The joined value is empty, so no `xml:base` is rendered at all
+    /// ("in which case xml:base MUST NOT be rendered").
+    Suppress,
+    /// The joined value, rendered in place of the element's own.
+    Fixed(String),
 }
 
 /// One parsed attribute, namespace declarations excluded.
@@ -525,28 +541,6 @@ impl<'a> ElementRef<'a> {
         self.data().span.clone()
     }
 
-    /// The namespace `prefix` resolves to at this element: its own
-    /// declarations, then its ancestors'. `None` for the default
-    /// namespace means no default is in scope.
-    fn resolve(&self, prefix: Option<&str>) -> Option<&'a str> {
-        if prefix == Some(PREFIX_XML) {
-            return Some(NAMESPACE_XML);
-        }
-        let mut current = Some(*self);
-        while let Some(element) = current {
-            if let Some(declaration) = element
-                .data()
-                .declarations
-                .iter()
-                .find(|declaration| declaration.prefix.as_deref() == prefix)
-            {
-                return (!declaration.uri.is_empty()).then_some(declaration.uri.as_str());
-            }
-            current = element.parent();
-        }
-        None
-    }
-
     /// The element and its descendants under `method`, as the node set
     /// of this subtree: the form a same-document reference yields, and
     /// the form `ds:SignedInfo` is canonicalised in (W3C XML Signature
@@ -558,8 +552,29 @@ impl<'a> ElementRef<'a> {
         let mut out = String::new();
         let mut rendered = Vec::new();
         let inherited = self.inherited_xml_attributes(&method.algorithm);
-        self.render(&mut out, &mut rendered, method, &inherited);
+        let outer_scope = self
+            .parent()
+            .map_or_else(Vec::new, |parent| parent.in_scope());
+        self.render(&mut out, &mut rendered, method, &inherited, &outer_scope);
         out.into_bytes()
+    }
+
+    /// The namespace scope at this element: `parent_scope`, the scope
+    /// of its parent, with this element's own declarations in effect.
+    fn scope_from(
+        &self,
+        parent_scope: &[(Option<&'a str>, &'a str)],
+    ) -> Vec<(Option<&'a str>, &'a str)> {
+        let mut scope = parent_scope.to_vec();
+        for declaration in &self.data().declarations {
+            let prefix = declaration.prefix.as_deref();
+            let uri = declaration.uri.as_str();
+            match scope.iter_mut().find(|(seen, _)| *seen == prefix) {
+                Some(entry) => entry.1 = uri,
+                None => scope.push((prefix, uri)),
+            }
+        }
+        scope
     }
 
     /// The namespace declarations in scope at this element, the
@@ -634,7 +649,8 @@ impl<'a> ElementRef<'a> {
                             .attributes
                             .iter()
                             .find(|attribute| attribute.is_xml(local))
-                    }) {
+                    }) && !(local == XML_LANG && attribute.value.is_empty())
+                    {
                         inherited.added.push(attribute.clone());
                     }
                 }
@@ -644,7 +660,12 @@ impl<'a> ElementRef<'a> {
                     .rev()
                     .filter_map(|ancestor| ancestor.xml_attribute(XML_BASE))
                     .collect();
-                if !bases.is_empty() {
+                if bases.is_empty() {
+                    // An empty value is never rendered.
+                    if self.xml_attribute(XML_BASE) == Some("") {
+                        inherited.base = BaseFixup::Suppress;
+                    }
+                } else {
                     bases.extend(self.xml_attribute(XML_BASE));
                     let joined = bases
                         .iter()
@@ -653,7 +674,11 @@ impl<'a> ElementRef<'a> {
                         .map(str::to_owned)
                         .reduce(|reference, base| join_uri_references(&base, &reference))
                         .unwrap_or_default();
-                    inherited.base = Some(joined);
+                    inherited.base = if joined.is_empty() {
+                        BaseFixup::Suppress
+                    } else {
+                        BaseFixup::Fixed(joined)
+                    };
                 }
             }
         }
@@ -685,6 +710,7 @@ impl<'a> ElementRef<'a> {
         &self,
         rendered: &[(String, String)],
         algorithm: &Algorithm,
+        scope: &[(Option<&'a str>, &'a str)],
     ) -> Vec<(String, String)> {
         let data = self.data();
         let mut candidates: Vec<Option<&str>> = Vec::new();
@@ -707,7 +733,8 @@ impl<'a> ElementRef<'a> {
             }
             Algorithm::Canonical10 | Algorithm::Canonical11 => {
                 candidates.push(None);
-                for (prefix, _uri) in self.in_scope() {
+                for (prefix, _uri) in scope {
+                    let prefix = *prefix;
                     if !candidates.contains(&prefix) {
                         candidates.push(prefix);
                     }
@@ -720,7 +747,10 @@ impl<'a> ElementRef<'a> {
                 continue;
             }
             let key = prefix.unwrap_or_default();
-            let uri = self.resolve(prefix).unwrap_or_default();
+            let uri = scope
+                .iter()
+                .find(|(declared, _)| *declared == prefix)
+                .map_or("", |(_, uri)| *uri);
             let in_effect = rendered
                 .iter()
                 .rev()
@@ -748,27 +778,29 @@ impl<'a> ElementRef<'a> {
         rendered: &mut Vec<(String, String)>,
         method: &Canonicalization,
         inherited: &InheritedXml,
+        parent_scope: &[(Option<&'a str>, &'a str)],
     ) {
         let data = self.data();
         let scope_depth = rendered.len();
-        let declarations = self.declarations_to_render(rendered, &method.algorithm);
+        let scope = self.scope_from(parent_scope);
+        let declarations = self.declarations_to_render(rendered, &method.algorithm, &scope);
 
         let mut attributes: Vec<&Attribute> = data
             .attributes
             .iter()
-            .filter(|attribute| inherited.base.is_none() || !attribute.is_xml(XML_BASE))
+            .filter(|attribute| inherited.base == BaseFixup::KeepOwn || !attribute.is_xml(XML_BASE))
             .chain(&inherited.added)
             .collect();
-        let fixed_base = inherited
-            .base
-            .as_deref()
-            .filter(|base| !base.is_empty())
-            .map(|base| Attribute {
-                prefix: Some(PREFIX_XML.to_owned()),
-                local: XML_BASE.to_owned(),
-                namespace: Some(NAMESPACE_XML.to_owned()),
-                value: base.to_owned(),
-            });
+        let fixed_base = match &inherited.base {
+            BaseFixup::Fixed(base) => Some(base),
+            BaseFixup::KeepOwn | BaseFixup::Suppress => None,
+        }
+        .map(|base| Attribute {
+            prefix: Some(PREFIX_XML.to_owned()),
+            local: XML_BASE.to_owned(),
+            namespace: Some(NAMESPACE_XML.to_owned()),
+            value: base.to_owned(),
+        });
         attributes.extend(fixed_base.as_ref());
         // Attribute nodes sort by namespace URI, then local name; an
         // attribute in no namespace has the empty URI and sorts first.
@@ -805,7 +837,7 @@ impl<'a> ElementRef<'a> {
             match node {
                 Node::Element(index) => {
                     if let Some(child) = self.document.element(*index) {
-                        child.render(out, rendered, method, &below_apex);
+                        child.render(out, rendered, method, &below_apex, &scope);
                     }
                 }
                 Node::Text(text) => escape_text_into(out, text),
@@ -934,18 +966,11 @@ impl<'a> UriParts<'a> {
         let reference = reference
             .split_once('#')
             .map_or(reference, |(before, _fragment)| before);
-        let (scheme, rest) = match reference.find([':', '/', '?']) {
-            Some(colon)
-                if colon > 0
-                    && reference
-                        .get(colon..)
-                        .is_some_and(|tail| tail.starts_with(':')) =>
-            {
-                (
-                    reference.get(..colon),
-                    reference.get(colon.saturating_add(1)..).unwrap_or_default(),
-                )
-            }
+        // A scheme is a letter, then letters, digits, `+`, `-` or `.`,
+        // up to the first colon (RFC 3986 sec.3.1); anything else
+        // before a colon makes the whole a relative reference.
+        let (scheme, rest) = match reference.split_once(':') {
+            Some((scheme, rest)) if is_scheme(scheme) => (Some(scheme), rest),
             _ => (None, reference),
         };
         let (authority, rest) = match rest.strip_prefix("//") {
@@ -1056,9 +1081,10 @@ const DOT_DOT: &str = "..";
 const DOT: &str = ".";
 
 /// RFC 3986 sec.5.2.4 "Remove Dot Segments" as Canonical XML 1.1
-/// sec.2.4 modifies it: leading `../` segments of a relative path are
-/// kept, consecutive slashes collapse into one, and a trailing `..`
-/// gains a slash.
+/// sec.2.4 modifies it for `xml:base` joining: leading `../` segments
+/// of a relative path are kept, consecutive slashes collapse into one
+/// ("Replace multiple consecutive "/" characters with a single "/"
+/// character"), and a trailing `..` gains a slash.
 fn remove_dot_segments(path: &str) -> String {
     let absolute = path.starts_with('/');
     let mut kept: Vec<&str> = Vec::new();
@@ -1101,9 +1127,13 @@ const RELATIVE_NAMESPACE: &str = "relative namespace URI";
 /// document with a relative namespace URI, so the reader refuses one
 /// and no canonicalisation ever meets it.
 fn is_absolute_uri(uri: &str) -> bool {
-    let Some((scheme, _rest)) = uri.split_once(':') else {
-        return false;
-    };
+    uri.split_once(':')
+        .is_some_and(|(scheme, _rest)| is_scheme(scheme))
+}
+
+/// Whether `scheme` is an RFC 3986 sec.3.1 scheme: `ALPHA *( ALPHA /
+/// DIGIT / "+" / "-" / "." )`.
+fn is_scheme(scheme: &str) -> bool {
     let mut characters = scheme.chars();
     characters
         .next()
@@ -2337,5 +2367,197 @@ mod tests {
             ),
             r#"<z xmlns:a="urn:a" xmlns:u="urn:unused"></z>"#
         );
+    }
+
+    /// `xmlns:xml` bound to its own namespace is legal (Namespaces in
+    /// XML 1.0 sec.3) and never rendered; another URI for it is not.
+    #[test]
+    fn the_xml_prefix_may_be_declared_to_its_own_namespace() {
+        let document = parse(&format!(
+            "<r xmlns:xml=\"{}\" xml:lang=\"fi\"/>",
+            super::NAMESPACE_XML
+        ));
+        assert_eq!(
+            canonical(document.source(), Comments::Omitted),
+            r#"<r xml:lang="fi"></r>"#
+        );
+        assert!(matches!(
+            refuse("<r xmlns:xml='urn:other'/>"),
+            Some(XmlError::Malformed(_))
+        ));
+    }
+
+    /// A scheme is a letter then letters, digits, `+`, `-` or `.` (RFC
+    /// 3986 sec.3.1); anything else before a colon is a relative path.
+    #[test]
+    fn a_reference_has_a_scheme_only_when_rfc_3986_says_so() {
+        assert_eq!(
+            join_uri_references("http://a/b/", "1x:y"),
+            "http://a/b/1x:y"
+        );
+        assert_eq!(
+            join_uri_references("http://a/b/", "a/b:c"),
+            "http://a/b/a/b:c"
+        );
+        assert_eq!(join_uri_references("http://a/b/", "x+y.z-w:q"), "x+y.z-w:q");
+    }
+
+    /// Canonical XML 1.1 sec.2.4 reduces the values "in reverse document
+    /// order ... by first combining Xm with Xm-1, then the result with
+    /// Xm-2"; over this chain both orders land on the same value.
+    #[test]
+    fn a_three_level_xml_base_chain_joins_innermost_first() {
+        let document = parse(
+            r#"<a xml:base="http://example.org/a/b/"><b xml:base="c/d"><c xml:base="../e"/></b></a>"#,
+        );
+        assert_eq!(
+            under(
+                named(&document, "c"),
+                Algorithm::Canonical11,
+                Comments::Omitted
+            ),
+            r#"<c xml:base="http://example.org/a/b/e"></c>"#
+        );
+        assert_eq!(
+            join_uri_references(
+                "http://example.org/a/b/",
+                &join_uri_references("c/d", "../e")
+            ),
+            join_uri_references(
+                &join_uri_references("http://example.org/a/b/", "c/d"),
+                "../e"
+            )
+        );
+    }
+
+    /// Canonical XML 1.1 sec.2.4: an empty `xml:base` is not rendered,
+    /// whether it comes from the fix-up or stands alone on the apex,
+    /// and an empty `xml:lang` is not inherited.
+    #[test]
+    fn empty_xml_base_and_lang_are_not_rendered_under_1_1() {
+        let alone = parse(r#"<o><i xml:base=""/></o>"#);
+        assert_eq!(
+            under(
+                named(&alone, "i"),
+                Algorithm::Canonical11,
+                Comments::Omitted
+            ),
+            "<i></i>"
+        );
+        let lang = parse(r#"<o xml:lang="fi"><m xml:lang=""><i/></m></o>"#);
+        assert_eq!(
+            under(named(&lang, "i"), Algorithm::Canonical11, Comments::Omitted),
+            "<i></i>"
+        );
+        assert_eq!(
+            under(named(&lang, "i"), Algorithm::Canonical10, Comments::Omitted),
+            r#"<i xml:lang=""></i>"#
+        );
+    }
+
+    /// Canonical XML 1.0 sec.2.3: a processing instruction inside the
+    /// subset is rendered as `<?target data?>`, without the data's
+    /// leading space when it is empty, under every algorithm.
+    #[test]
+    fn processing_instructions_inside_the_subset_are_rendered() {
+        let document = parse("<o><i><?target  some data?><?bare?><c/></i></o>");
+        for algorithm in [
+            Algorithm::Canonical10,
+            Algorithm::Canonical11,
+            Algorithm::Exclusive(InclusivePrefixes::default()),
+        ] {
+            assert_eq!(
+                under(named(&document, "i"), algorithm, Comments::Omitted),
+                "<i><?target some data?><?bare?><c></c></i>"
+            );
+        }
+    }
+
+    /// Canonical XML 1.0 sec.2.3: in attribute values TAB, LF and CR are
+    /// written as character references, in text only CR.
+    #[test]
+    fn whitespace_characters_are_escaped_as_canonical_xml_says() {
+        assert_eq!(
+            canonical(
+                "<r a='&#9;&#10;&#13;'>&#9;&#10;&#13;</r>",
+                Comments::Omitted
+            ),
+            "<r a=\"&#x9;&#xA;&#xD;\">\t\n&#xD;</r>"
+        );
+    }
+
+    /// Exclusive XML Canonicalization sec.2.1, the document `elem1` is
+    /// enveloped in.
+    const EXC_2_1_ENVELOPED: &str = "<n0:pdu xmlns:n0=\"http://a.example\">\n      <n1:elem1 xmlns:n1=\"http://b.example\">\n          content\n      </n1:elem1>\n   </n0:pdu>";
+
+    /// `elem1` of sec.2.1 under Canonical XML, which carries `n0` in
+    /// from the context, as the recommendation shows it (its line
+    /// wrapping in the start tag removed).
+    const EXC_2_1_INCLUSIVE: &str = "<n1:elem1 xmlns:n0=\"http://a.example\" xmlns:n1=\"http://b.example\">\n          content\n      </n1:elem1>";
+
+    /// `elem1` of sec.2.1 under Exclusive XML Canonicalization: the
+    /// form it had before it was enveloped.
+    const EXC_2_1_EXCLUSIVE: &str =
+        "<n1:elem1 xmlns:n1=\"http://b.example\">\n          content\n      </n1:elem1>";
+
+    /// Exclusive XML Canonicalization sec.2.2, the first enveloping of
+    /// `elem2`.
+    const EXC_2_2_FIRST: &str = "<n0:local xmlns:n0=\"foo:bar\" xmlns:n3=\"ftp://example.org\">\n      <n1:elem2 xmlns:n1=\"http://example.net\" xml:lang=\"en\">\n          <n3:stuff xmlns:n3=\"ftp://example.org\"/>\n      </n1:elem2>\n   </n0:local>";
+
+    /// The second enveloping of `elem2` in sec.2.2.
+    const EXC_2_2_SECOND: &str = "<n2:pdu xmlns:n1=\"http://example.com\" xmlns:n2=\"http://foo.example\" xml:lang=\"fr\" xml:space=\"retain\">\n      <n1:elem2 xmlns:n1=\"http://example.net\" xml:lang=\"en\">\n          <n3:stuff xmlns:n3=\"ftp://example.org\"/>\n      </n1:elem2>\n   </n2:pdu>";
+
+    /// `elem2` of the first enveloping under Canonical XML: `n0` from
+    /// the context and `n3` elevated to the apex.
+    const EXC_2_2_FIRST_INCLUSIVE: &str = "<n1:elem2 xmlns:n0=\"foo:bar\" xmlns:n1=\"http://example.net\" xmlns:n3=\"ftp://example.org\" xml:lang=\"en\">\n          <n3:stuff></n3:stuff>\n      </n1:elem2>";
+
+    /// `elem2` of the second enveloping under Canonical XML: `n2` and
+    /// `xml:space` from the context, `n3` no longer elevated.
+    const EXC_2_2_SECOND_INCLUSIVE: &str = "<n1:elem2 xmlns:n1=\"http://example.net\" xmlns:n2=\"http://foo.example\" xml:lang=\"en\" xml:space=\"retain\">\n          <n3:stuff xmlns:n3=\"ftp://example.org\"></n3:stuff>\n      </n1:elem2>";
+
+    /// `elem2` under Exclusive XML Canonicalization, the same in both
+    /// envelopings.
+    const EXC_2_2_EXCLUSIVE: &str = "<n1:elem2 xmlns:n1=\"http://example.net\" xml:lang=\"en\">\n          <n3:stuff xmlns:n3=\"ftp://example.org\"></n3:stuff>\n      </n1:elem2>";
+
+    /// The worked examples of Exclusive XML Canonicalization sec.2.1 and
+    /// sec.2.2, under both the inclusive and the exclusive algorithm.
+    #[test]
+    fn the_exclusive_canonicalization_examples_canonicalise_as_shown() {
+        let exclusive = || Algorithm::Exclusive(InclusivePrefixes::default());
+        let enveloped = parse(EXC_2_1_ENVELOPED);
+        let elem1 = named(&enveloped, "elem1");
+        assert_eq!(
+            under(elem1, Algorithm::Canonical10, Comments::Omitted),
+            EXC_2_1_INCLUSIVE
+        );
+        assert_eq!(
+            under(elem1, exclusive(), Comments::Omitted),
+            EXC_2_1_EXCLUSIVE
+        );
+
+        let first = parse(EXC_2_2_FIRST);
+        let second = parse(EXC_2_2_SECOND);
+        assert_eq!(
+            under(
+                named(&first, "elem2"),
+                Algorithm::Canonical10,
+                Comments::Omitted
+            ),
+            EXC_2_2_FIRST_INCLUSIVE
+        );
+        assert_eq!(
+            under(
+                named(&second, "elem2"),
+                Algorithm::Canonical10,
+                Comments::Omitted
+            ),
+            EXC_2_2_SECOND_INCLUSIVE
+        );
+        for document in [&first, &second] {
+            assert_eq!(
+                under(named(document, "elem2"), exclusive(), Comments::Omitted),
+                EXC_2_2_EXCLUSIVE
+            );
+        }
     }
 }

@@ -28,14 +28,22 @@
 //!   token's `messageImprint` is computed over the octets of
 //!   `SignerInfo.signature`. No other attribute counts as a signature
 //!   timestamp.
-//! - `ETSI EN 319 122-1` V1.3.1 clause 5.5.3 and RFC 5126 sec.6.4.1:
-//!   `archive-time-stamp-v3` and `archive-time-stamp` (v2) attributes
-//!   are counted, not verified.
+//! - `ETSI EN 319 122-1` V1.3.1 clauses 5.5.2 and 5.5.3: each
+//!   `archive-time-stamp-v3` attribute holds exactly one value, and its
+//!   token carries one `ats-hash-index-v3`
+//!   unsigned attribute; every hash it lists must be the hash, under
+//!   its `hashIndAlgorithm`, of a certificate, a revocation value or an
+//!   unsigned attribute value present in the signature, and the token's
+//!   imprint is computed over the `eContentType`, the hash of the
+//!   signed data, the `SignerInfo` fields `version` through `signature`
+//!   and the index, in that order. The token is verified by the caller.
+//! - RFC 5126 sec.6.4.1: `archive-time-stamp` (v2) attributes are
+//!   counted, not verified.
 //! - `ETSI EN 319 122-2` level LT: the validation material travels in
 //!   `SignedData.certificates` and `SignedData.crls`, OCSP responses as
 //!   `id-ri-ocsp-response` (RFC 5940).
 
-use crate::ber::BerTlvAny;
+use crate::ber::{BerTlv, BerTlvAny, BerTlvIter, OctetString, Oid as OidTag, Sequence};
 use crate::cades::DigestAlgorithm;
 use crate::cms::{CmsAttribute, CmsError, OwnedSignedData, RevocationInfoChoice, SignedData};
 use crate::timestamp::{
@@ -126,6 +134,67 @@ impl CadesTimestamp {
     }
 }
 
+/// What an `archive-time-stamp-v3` token must imprint (`ETSI EN 319
+/// 122-1` clause 5.5.3): the `eContentType`, the hash of the signed
+/// data, the `SignerInfo` fields `version` through `signature` and the
+/// token's `ATSHashIndexV3`, each as encoded, in that order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveImprint {
+    /// `hashIndAlgorithm`, which must also be the token's imprint
+    /// algorithm (clause 5.5.2).
+    algorithm: DigestAlgorithm,
+    /// The octets the imprint digests.
+    input: Vec<u8>,
+}
+
+impl ArchiveImprint {
+    /// The digest the token's `messageImprint` must equal when it names
+    /// `algorithm`; `None` for an algorithm other than the index's
+    /// `hashIndAlgorithm`, which no token may imprint under.
+    #[must_use]
+    pub fn digest(&self, algorithm: DigestAlgorithm) -> Option<Vec<u8>> {
+        (algorithm == self.algorithm).then(|| algorithm.digest(&self.input))
+    }
+}
+
+/// One `archive-time-stamp-v3` token whose `ats-hash-index-v3` names
+/// only values the signature carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveTimestampV3 {
+    /// The RFC 3161 `TimeStampToken`, DER, for the timestamp verifier.
+    token: Vec<u8>,
+    /// What its imprint must digest.
+    imprint: ArchiveImprint,
+}
+
+impl ArchiveTimestampV3 {
+    /// The RFC 3161 `TimeStampToken`, DER, for the timestamp verifier.
+    #[must_use]
+    pub fn token(&self) -> &[u8] {
+        &self.token
+    }
+
+    /// What the token's message imprint must digest.
+    #[must_use]
+    pub const fn imprint(&self) -> &ArchiveImprint {
+        &self.imprint
+    }
+}
+
+/// One archive timestamp attribute value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CadesArchiveTimestamp {
+    /// One `archive-time-stamp-v3` attribute: its token ready to
+    /// verify, or the reason it cannot be valid: the attribute holds
+    /// more than one value, or the token's `ats-hash-index-v3` is
+    /// absent, repeated or malformed ([`TimestampError::Malformed`]), or names a value
+    /// the signature does not carry ([`TimestampError::ImprintMismatch`]).
+    V3(Result<ArchiveTimestampV3, TimestampError>),
+    /// An `archive-time-stamp` (v2, RFC 5126 sec.6.4.1), counted and not
+    /// verified.
+    V2,
+}
+
 /// The facts [`CadesSignature::verify`] establishes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CadesVerdict {
@@ -137,9 +206,9 @@ pub struct CadesVerdict {
     pub signature_valid: bool,
     /// The `signature-time-stamp` tokens, in encoded order.
     pub signature_timestamps: Vec<CadesTimestamp>,
-    /// How many `archive-time-stamp-v3` and `archive-time-stamp` (v2)
-    /// tokens are present; they are not verified.
-    pub archive_timestamps_present: usize,
+    /// The `archive-time-stamp-v3` and `archive-time-stamp` (v2)
+    /// tokens, in encoded order.
+    pub archive_timestamps: Vec<CadesArchiveTimestamp>,
 }
 
 /// One parsed `CAdES` signature: the structure, its signer certificate
@@ -263,16 +332,31 @@ impl CadesSignature {
             imprint_input: signer.signature().to_vec(),
         })
         .collect();
-        let archive_timestamps_present =
-            [known::ARCHIVE_TIME_STAMP_V2, known::ARCHIVE_TIME_STAMP_V3]
-                .into_iter()
-                .map(|oid| attribute_values(signer.unsigned_attributes(), oid).len())
-                .sum();
+        let signed_content = match content {
+            Content::Attached => signed.econtent().unwrap_or_default(),
+            Content::Detached { content } => content,
+        };
+        let mut archive_timestamps = Vec::new();
+        for attribute in signer.unsigned_attributes() {
+            let v3 = attribute.oid == known::ARCHIVE_TIME_STAMP_V3;
+            if !v3 && attribute.oid != known::ARCHIVE_TIME_STAMP_V2 {
+                continue;
+            }
+            let values = split_values(attribute.values_der);
+            if !v3 {
+                archive_timestamps.extend(values.iter().map(|_| CadesArchiveTimestamp::V2));
+                continue;
+            }
+            archive_timestamps.push(CadesArchiveTimestamp::V3(match values.as_slice() {
+                [token] => archive_timestamp_v3(&signed, signed_content, token),
+                _ => Err(MALFORMED_ARCHIVE_ATTRIBUTE),
+            }));
+        }
         CadesVerdict {
             document_intact,
             signature_valid,
             signature_timestamps,
-            archive_timestamps_present,
+            archive_timestamps,
         }
     }
 }
@@ -304,24 +388,166 @@ fn embedded_material(signed: &SignedData<'_>, signer_der: &[u8]) -> ValidationMa
 }
 
 /// The complete DER of every value of every attribute of type `oid`.
-/// A value whose TLV does not parse, or declares more octets than
-/// remain, makes the whole unread tail one value, so it is reported as
-/// present and fails to verify; no value is ever cut short.
 fn attribute_values<'a>(attributes: &[CmsAttribute<'a>], oid: Oid<'_>) -> Vec<&'a [u8]> {
+    attributes
+        .iter()
+        .filter(|attribute| attribute.oid == oid)
+        .flat_map(|attribute| split_values(attribute.values_der))
+        .collect()
+}
+
+/// The complete DER of every value in the contents of one attribute's
+/// `SET OF AttributeValue`. A value whose TLV does not parse, or
+/// declares more octets than remain, makes the whole unread tail one
+/// value, so it is reported as present and fails to verify; no value
+/// is ever cut short.
+fn split_values(values_der: &[u8]) -> Vec<&[u8]> {
     let mut values = Vec::new();
-    for attribute in attributes.iter().filter(|attribute| attribute.oid == oid) {
-        let mut rest = attribute.values_der;
-        while !rest.is_empty() {
-            let Some((value_der, tail)) = BerTlvAny::parse(rest)
-                .ok()
-                .and_then(|value| rest.split_at_checked(value.size()))
-            else {
-                values.push(rest);
-                break;
-            };
-            values.push(value_der);
-            rest = tail;
-        }
+    let mut rest = values_der;
+    while !rest.is_empty() {
+        let Some((value_der, tail)) = BerTlvAny::parse(rest)
+            .ok()
+            .and_then(|value| rest.split_at_checked(value.size()))
+        else {
+            values.push(rest);
+            break;
+        };
+        values.push(value_der);
+        rest = tail;
     }
     values
+}
+
+/// Why an `archive-time-stamp-v3` attribute holding other than exactly
+/// one value is refused (`ETSI EN 319 122-1` clause 5.5.3).
+const MALFORMED_ARCHIVE_ATTRIBUTE: TimestampError =
+    TimestampError::Malformed("archive-time-stamp-v3 holds more than one value");
+
+/// Why an `ats-hash-index-v3` does not read.
+const MALFORMED_HASH_INDEX: TimestampError = TimestampError::Malformed("ats-hash-index-v3");
+
+/// The `archive-time-stamp-v3` value `token` of the signature `signed`
+/// over `signed_content`, with what its imprint must digest, once its
+/// `ats-hash-index-v3` is validated (`ETSI EN 319 122-1` clause 5.5.2):
+/// the token carries exactly one such attribute with exactly one
+/// value, an `ATSHashIndexV3` under a digest this crate computes, and
+/// every hash it lists matches a `CertificateChoices` of
+/// `SignedData.certificates`, a `RevocationInfoChoice` of
+/// `SignedData.crls`, or an `attrType` followed by one of its values
+/// among the signer's unsigned attributes.
+fn archive_timestamp_v3(
+    signed: &SignedData<'_>,
+    signed_content: &[u8],
+    token: &[u8],
+) -> Result<ArchiveTimestampV3, TimestampError> {
+    let token_data = SignedData::parse(token)
+        .map_err(|_ignored| TimestampError::Malformed("token is not CMS SignedData"))?;
+    let indexes = attribute_values(
+        token_data.signer().unsigned_attributes(),
+        known::ATS_HASH_INDEX_V3,
+    );
+    let [index_der] = indexes.as_slice() else {
+        return Err(MALFORMED_HASH_INDEX);
+    };
+    let index = HashIndex::parse(index_der).ok_or(MALFORMED_HASH_INDEX)?;
+    let algorithm = index.algorithm;
+    let signer = signed.signer();
+    let certificates: Vec<Vec<u8>> = signed
+        .certificates()
+        .iter()
+        .map(|der| algorithm.digest(der))
+        .collect();
+    let revocation: Vec<Vec<u8>> = signed
+        .revocation_info_der()
+        .iter()
+        .map(|der| algorithm.digest(der))
+        .collect();
+    let attributes: Vec<Vec<u8>> = signer
+        .unsigned_attributes()
+        .iter()
+        .flat_map(|attribute| {
+            split_values(attribute.values_der)
+                .into_iter()
+                .map(move |value| algorithm.digest(&[attribute.type_der, value].concat()))
+        })
+        .collect();
+    let certificates_present = all_present(&index.certificates, &certificates);
+    let revocation_present = all_present(&index.revocation, &revocation);
+    let attributes_present = all_present(&index.unsigned_attributes, &attributes);
+    if !(certificates_present && revocation_present && attributes_present) {
+        return Err(TimestampError::ImprintMismatch);
+    }
+    let mut input = signed.econtent_type_der().to_vec();
+    input.extend_from_slice(&algorithm.digest(signed_content));
+    input.extend_from_slice(signer.archive_fields_der());
+    input.extend_from_slice(index_der);
+    Ok(ArchiveTimestampV3 {
+        token: token.to_vec(),
+        imprint: ArchiveImprint { algorithm, input },
+    })
+}
+
+/// Whether every hash in `listed` is one of `candidates`.
+fn all_present(listed: &[&[u8]], candidates: &[Vec<u8>]) -> bool {
+    listed.iter().all(|hash| {
+        candidates
+            .iter()
+            .any(|candidate| candidate.as_slice() == *hash)
+    })
+}
+
+/// One `ATSHashIndexV3` (`ETSI EN 319 122-1` clause 5.5.2), its hash
+/// lists borrowed from the encoding.
+struct HashIndex<'a> {
+    /// `hashIndAlgorithm`.
+    algorithm: DigestAlgorithm,
+    /// `certificatesHashIndex`.
+    certificates: Vec<&'a [u8]>,
+    /// `crlsHashIndex`.
+    revocation: Vec<&'a [u8]>,
+    /// `unsignedAttrValuesHashIndex`.
+    unsigned_attributes: Vec<&'a [u8]>,
+}
+
+impl<'a> HashIndex<'a> {
+    /// Read `der` as exactly one `ATSHashIndexV3`: an
+    /// `AlgorithmIdentifier` naming SHA-256, SHA-384 or SHA-512, then
+    /// three `SEQUENCE OF OCTET STRING`, each hash the algorithm's
+    /// length. `None` for anything else.
+    fn parse(der: &'a [u8]) -> Option<Self> {
+        let outer = BerTlv::<Sequence>::parse(der).ok()?;
+        if outer.size() != der.len() {
+            return None;
+        }
+        let mut fields = outer.iter_children();
+        let algorithm_identifier = fields.next()?.ok()?.expect::<Sequence>().ok()?;
+        let oid = algorithm_identifier
+            .iter_children()
+            .next()?
+            .ok()?
+            .expect::<OidTag>()
+            .ok()?;
+        let algorithm = DigestAlgorithm::from_oid(Oid::new(oid.value()).ok()?)?;
+        let mut list = || -> Option<Vec<&'a [u8]>> {
+            let list = fields.next()?.ok()?.expect::<Sequence>().ok()?;
+            BerTlvIter::new(list.value())
+                .map(|hash| {
+                    let hash = hash.ok()?.expect::<OctetString>().ok()?.value();
+                    (hash.len() == algorithm.digest_len()).then_some(hash)
+                })
+                .collect()
+        };
+        let certificates = list()?;
+        let revocation = list()?;
+        let unsigned_attributes = list()?;
+        if fields.next().is_some() {
+            return None;
+        }
+        Some(Self {
+            algorithm,
+            certificates,
+            revocation,
+            unsigned_attributes,
+        })
+    }
 }

@@ -4,9 +4,10 @@
 //! synthetic keys, certificates and evidence.
 
 use super::{
-    AnchorRole, CertificationPath, DocumentFailure, DocumentFile, DocumentReport, GrantedPeriod,
-    Revocation, SignatureOutcome, SignatureReport, SignatureRow, SignerIdentity, TimestampReport,
-    TrustAnchor, TrustAnchors, UnsupportedProfile, UnsupportedSignature, exactly, verify,
+    AnchorRole, ArchiveForm, CertificationPath, DocumentChange, DocumentFailure, DocumentFile,
+    DocumentReport, GrantedPeriod, Revision, Revocation, SignatureOutcome, SignatureReport,
+    SignatureRow, SignerIdentity, TimestampReport, TrustAnchor, TrustAnchors, UnsupportedProfile,
+    UnsupportedSignature, exactly, verify,
 };
 use crate::asic::DataObject;
 use crate::cades::{DigestAlgorithm, SignatureAlgorithm, SignerParameters, SigningTime};
@@ -638,7 +639,7 @@ fn a_level_b_pdf_is_intact_valid_and_anchored_without_proof_of_existence() {
     assert_eq!(signature.proof_of_existence(), None);
     assert!(signature.timestamps().is_empty());
     assert_eq!(signature.validation_time(), day(NOW));
-    assert!(signature.covers_whole_document());
+    assert_eq!(signature.revision(), Revision::WholeDocument);
     assert_eq!(signature.revocation(), Revocation::Unavailable);
     assert_eq!(signature.signer().name(), DIRECT_SIGNER);
     assert_eq!(ders(signature.chain()), [world.root.as_slice()]);
@@ -688,7 +689,7 @@ fn level_lt_chains_through_the_store_and_reads_a_later_ocsp_answer() {
     assert!(signature.document_intact());
     assert!(signature.signature_valid());
     assert!(signature.chain_verified());
-    assert!(!signature.covers_whole_document());
+    assert_eq!(signature.revision(), Revision::LaterRevisionsHarmless);
     assert_eq!(
         ders(signature.chain()),
         [world.intermediate.as_slice(), world.root.as_slice()]
@@ -808,7 +809,7 @@ fn a_document_timestamp_covering_the_signature_proves_existence() {
     assert!(signature.document_intact());
     assert!(signature.signature_valid());
     assert_eq!(signature.proof_of_existence(), Some(day(STAMPED)));
-    assert!(!signature.covers_whole_document());
+    assert_eq!(signature.revision(), Revision::LaterRevisionsHarmless);
     let [stamp] = exactly(report.document_timestamps(), "one document timestamp");
     assert_eq!(kind(stamp.timestamp()), Kind::Anchored(day(STAMPED)));
     assert_eq!(stamp.covers(), length);
@@ -1002,10 +1003,10 @@ fn serial_signatures_are_each_judged_against_their_own_range() {
     let [first, second] = exactly(report.rows(), "two signatures");
     let (first, second) = (judged(first), judged(second));
     assert_eq!(first.signer().name(), DIRECT_SIGNER);
-    assert!(!first.covers_whole_document());
+    assert_eq!(first.revision(), Revision::LaterRevisionsHarmless);
     assert!(first.is_valid());
     assert_eq!(second.signer().name(), RSA_SIGNER);
-    assert!(second.covers_whole_document());
+    assert_eq!(second.revision(), Revision::WholeDocument);
     assert!(second.is_valid());
     assert!(report.is_valid());
 }
@@ -2295,5 +2296,674 @@ fn a_reference_without_a_transform_digests_canonical_xml_1_0() {
     let signature = only(&report);
     assert!(signature.document_intact());
     assert!(signature.signature_valid());
+    assert!(report.is_valid());
+}
+
+/// Common name of the time-stamping root the archive timestamps chain
+/// to.
+const ARCHIVE_TSA_ROOT: &str = "Synthetic Archive Time Stamping Root";
+/// Common name of the TSA that issues the archive timestamps.
+const ARCHIVE_TSA: &str = "Synthetic Archive Time Stamping Unit";
+/// Archive time-stamping root serial.
+const ARCHIVE_TSA_ROOT_SERIAL: u8 = 11;
+/// Archive TSA serial.
+const ARCHIVE_TSA_SERIAL: u8 = 12;
+/// Day of the archive timestamps, after the signature timestamps.
+const ARCHIVED: u8 = 16;
+/// A validation day after every fixture certificate has expired.
+const EXPIRED: u8 = 29;
+/// The `XAdES` 1.4.1 namespace of `ArchiveTimeStamp` and
+/// `TimeStampValidationData` (`ETSI EN 319 132-1` clause 4.2).
+const NAMESPACE_XADES_141: &str = "http://uri.etsi.org/01903/v1.4.1#";
+
+/// The authority archive timestamps come from, under a root of its own.
+struct ArchiveAuthority {
+    /// The time-stamping root.
+    root: Vec<u8>,
+    /// The TSA key.
+    key: TestKey,
+    /// The TSA.
+    tsa: Vec<u8>,
+}
+
+impl ArchiveAuthority {
+    /// The archive authority's keys and certificates.
+    fn new() -> Self {
+        let root_key = TestKey::derive(TestCurve::P384, b"archive time-stamping root");
+        let key = TestKey::derive(TestCurve::P256, b"archive tsa");
+        Self {
+            root: certificate(
+                &spec(
+                    ARCHIVE_TSA_ROOT_SERIAL,
+                    ARCHIVE_TSA_ROOT,
+                    ARCHIVE_TSA_ROOT,
+                    ca_extensions(),
+                ),
+                &root_key,
+                &root_key,
+            ),
+            tsa: certificate(
+                &spec(
+                    ARCHIVE_TSA_SERIAL,
+                    ARCHIVE_TSA,
+                    ARCHIVE_TSA_ROOT,
+                    timestamping_extensions(),
+                ),
+                &key,
+                &root_key,
+            ),
+            key,
+        }
+    }
+
+    /// The anchors of a relying party years later: the signer's root,
+    /// and the archive authority's root, while the authority of the
+    /// signature timestamps is no longer listed.
+    fn anchors(&self, world: &World) -> TrustAnchors {
+        TrustAnchors::new(vec![
+            anchor(&world.root, AnchorRole::CertificateIssuing),
+            anchor(&self.root, AnchorRole::TimeStamping),
+        ])
+    }
+
+    /// A token from this authority at [`ARCHIVED`] over `input`.
+    fn token(&self, input: &[u8]) -> Vec<u8> {
+        timestamp_token(
+            &self.tsa,
+            &self.key,
+            DigestAlgorithm::Sha256,
+            &DigestAlgorithm::Sha256.digest(input),
+            day(ARCHIVED),
+        )
+    }
+}
+
+/// How an archive-time-stamp-v3 fixture departs from a sound one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveFault {
+    /// None.
+    Sound,
+    /// The hash index also names a certificate the signature does not
+    /// carry.
+    AbsentValue,
+    /// The signature timestamp the index names is replaced afterwards.
+    TamperedValue,
+    /// The archive attribute holds the token twice.
+    TwoValues,
+}
+
+/// `der` by `world`'s TSA at `on` over the signature value `signature`.
+fn signature_time_stamp(world: &World, signature: &[u8], on: u8) -> Vec<u8> {
+    attribute(
+        known::SIGNATURE_TIME_STAMP_TOKEN,
+        &timestamp_token(
+            &world.tsa,
+            &world.tsa_key,
+            DigestAlgorithm::Sha256,
+            &DigestAlgorithm::Sha256.digest(signature),
+            day(on),
+        ),
+    )
+}
+
+/// The minimal PDF signed by the direct signer at level LTA in the
+/// `CAdES` way: a signature timestamp from the world's TSA at
+/// [`STAMPED`], then an `archive-time-stamp-v3` from `archive` at
+/// [`ARCHIVED`] whose input is computed as `ETSI EN 319 122-1` clause
+/// 5.5.3 lists it, departing as `fault` says.
+fn archived_pdf(world: &World, archive: &ArchiveAuthority, fault: ArchiveFault) -> Vec<u8> {
+    let (key, der) = world.signer(Signer::Direct);
+    let placeholder = prepare(
+        &minimal_pdf(),
+        &SignatureMetadata::default(),
+        DEFAULT_SIGNATURE_CAPACITY,
+    )
+    .expect("prepares");
+    let content = placeholder.signed_octets();
+    let mut attributes = content_attributes(known::DATA, key.hash(), &content);
+    attributes.push(signing_certificate_v2(der));
+    let mut parts = CmsParts::detached(key, der, &content);
+    let signed_attributes = attribute_set(&attributes);
+    let signature = key.sign(&signed_attributes);
+    parts.signed_attributes = Some(signed_attributes);
+    parts.signature = Some(signature.clone());
+    parts.unsigned_attributes = vec![signature_time_stamp(world, &signature, STAMPED)];
+
+    let unarchived = cms(&parts);
+    let signed = crate::cms::SignedData::parse(&unarchived).expect("the CMS parses");
+    let attribute_values: Vec<Vec<u8>> = signed
+        .signer()
+        .unsigned_attributes()
+        .iter()
+        .map(|attribute| [attribute.type_der, attribute.values_der].concat())
+        .collect();
+    let mut certificates: Vec<&[u8]> = signed.certificates().to_vec();
+    if fault == ArchiveFault::AbsentValue {
+        certificates.push(&world.stranger);
+    }
+    let index = crate::testkit::ats_hash_index_v3(
+        DigestAlgorithm::Sha256,
+        &certificates,
+        signed.revocation_info_der(),
+        &attribute_values,
+    );
+    let mut input = signed.econtent_type_der().to_vec();
+    input.extend_from_slice(&DigestAlgorithm::Sha256.digest(&content));
+    input.extend_from_slice(signed.signer().archive_fields_der());
+    input.extend_from_slice(&index);
+    let token = crate::testkit::archive_timestamp_token(
+        &archive.tsa,
+        &archive.key,
+        DigestAlgorithm::Sha256,
+        &DigestAlgorithm::Sha256.digest(&input),
+        day(ARCHIVED),
+        &index,
+    );
+    if fault == ArchiveFault::TamperedValue {
+        parts.unsigned_attributes = vec![signature_time_stamp(world, &signature, ANSWERED)];
+    }
+    let archive_attribute = if fault == ArchiveFault::TwoValues {
+        let mut body = tlv(OBJECT_IDENTIFIER, known::ARCHIVE_TIME_STAMP_V3.as_bytes());
+        body.extend_from_slice(&tlv(crate::testkit::SET, [token.clone(), token].concat()));
+        tlv(SEQUENCE, body)
+    } else {
+        attribute(known::ARCHIVE_TIME_STAMP_V3, &token)
+    };
+    parts.unsigned_attributes.push(archive_attribute);
+    placeholder.finish(&cms(&parts)).expect("the CMS fits")
+}
+
+/// The archive timestamps of `signature` as kinds, each with its form.
+fn archive_kinds(signature: &SignatureReport) -> Vec<(ArchiveForm, Kind)> {
+    signature
+        .archive_timestamps()
+        .iter()
+        .map(|archive| (archive.form(), kind(archive.timestamp())))
+        .collect()
+}
+
+/// Verify `bytes` on [`EXPIRED`] under `anchors`.
+fn verify_expired(bytes: Vec<u8>, anchors: &TrustAnchors) -> DocumentReport {
+    verify(
+        &DocumentFile::from_file(bytes).expect("a known shape"),
+        anchors,
+        day(EXPIRED),
+    )
+    .expect("report")
+}
+
+#[test]
+fn an_lta_pdf_whose_signature_timestamp_authority_expired_stands_on_its_archive_timestamp() {
+    let world = World::new();
+    let archive = ArchiveAuthority::new();
+    let pdf = archived_pdf(&world, &archive, ArchiveFault::Sound);
+    let report = verify_expired(pdf.clone(), &archive.anchors(&world));
+    let signature = only(&report);
+    assert_eq!(kinds(signature.timestamps()), [Kind::Claimed(day(STAMPED))]);
+    assert_eq!(
+        archive_kinds(signature),
+        [(ArchiveForm::CadesV3, Kind::Anchored(day(ARCHIVED)))]
+    );
+    let [archived] = exactly(signature.archive_timestamps(), "one archive timestamp");
+    let authority = archived.timestamp().authority().expect("a verified token");
+    assert_eq!(ders(authority.chain()), [archive.root.as_slice()]);
+    assert_eq!(signature.proof_of_existence(), Some(day(ARCHIVED)));
+    assert_eq!(signature.validation_time(), day(ARCHIVED));
+    assert!(signature.chain_verified());
+    assert!(report.is_valid());
+
+    // Without the archive authority nothing proves existence, and the
+    // signer, expired by now, is judged now.
+    let unarchived = TrustAnchors::new(vec![anchor(&world.root, AnchorRole::CertificateIssuing)]);
+    let report = verify_expired(pdf, &unarchived);
+    assert_eq!(only(&report).proof_of_existence(), None);
+    assert!(!report.is_valid());
+}
+
+#[test]
+fn an_archive_index_naming_a_value_that_is_not_present_is_invalid() {
+    let world = World::new();
+    let archive = ArchiveAuthority::new();
+    let report = verify_expired(
+        archived_pdf(&world, &archive, ArchiveFault::AbsentValue),
+        &archive.anchors(&world),
+    );
+    let signature = only(&report);
+    assert_eq!(
+        archive_kinds(signature),
+        [(
+            ArchiveForm::CadesV3,
+            Kind::Invalid(TimestampError::ImprintMismatch)
+        )]
+    );
+    assert_eq!(signature.proof_of_existence(), None);
+    assert!(!report.is_valid());
+}
+
+#[test]
+fn a_tampered_indexed_value_makes_the_archive_timestamp_invalid() {
+    let world = World::new();
+    let archive = ArchiveAuthority::new();
+    let report = verify_expired(
+        archived_pdf(&world, &archive, ArchiveFault::TamperedValue),
+        &archive.anchors(&world),
+    );
+    let signature = only(&report);
+    assert_eq!(
+        archive_kinds(signature),
+        [(
+            ArchiveForm::CadesV3,
+            Kind::Invalid(TimestampError::ImprintMismatch)
+        )]
+    );
+    assert!(!report.is_valid());
+}
+
+#[test]
+fn a_v2_archive_timestamp_is_counted_and_not_judged() {
+    let world = World::new();
+    let pdf = world.foreign_pdf(Signer::Direct, &[], |parts| {
+        let token = timestamp_token(
+            &world.tsa,
+            &world.tsa_key,
+            DigestAlgorithm::Sha256,
+            &DigestAlgorithm::Sha256.digest(b"archive v2 input"),
+            day(ARCHIVED),
+        );
+        parts.unsigned_attributes = vec![attribute(known::ARCHIVE_TIME_STAMP_V2, &token)];
+    });
+    let report = world.verify(pdf).expect("report");
+    let signature = only(&report);
+    assert_eq!(
+        archive_kinds(signature),
+        [(ArchiveForm::CadesV2, Kind::Unsupported)]
+    );
+    assert_eq!(signature.proof_of_existence(), None);
+    assert!(report.is_valid());
+}
+
+/// The writer's `XAdES` signature over the note by the direct signer
+/// with a signature timestamp from the world's TSA at [`STAMPED`], a
+/// `TimeStampValidationData` carrying the time-stamping root, and an
+/// `ArchiveTimeStamp` from `archive` whose input is computed as `ETSI
+/// EN 319 132-1` clause 5.5.2.3 lists it; when `tamper` is set, the
+/// validation data is changed after the archive timestamp is made.
+fn archived_xades(world: &World, archive: &ArchiveAuthority, tamper: bool) -> Vec<u8> {
+    use crate::xades::{CANONICALIZATION_EXCLUSIVE, NAMESPACE_DSIG, NAMESPACE_XADES};
+    let owned = OwnedCert::from_der(&world.direct_signer).expect("signer parses");
+    let certificate = owned.view();
+    let parameters = SignerParameters {
+        certificate: &certificate,
+        digest_algorithm: DigestAlgorithm::Sha256,
+        signature_algorithm: SignatureAlgorithm::EcdsaSha256,
+        signing_time: Some(SIGNING_TIME),
+    };
+    let plan = crate::xades::plan(&note_objects(), &parameters).expect("plans");
+    let value = world.signer_key.sign_raw(plan.signed_info());
+    let stamp = timestamp_token(
+        &world.tsa,
+        &world.tsa_key,
+        DigestAlgorithm::Sha256,
+        &crate::xades::SignaturePlan::timestamp_digest(&value, DigestAlgorithm::Sha256),
+        day(STAMPED),
+    );
+    let document = String::from_utf8(plan.finish(&value, &[stamp], &ValidationMaterial::default()))
+        .expect("utf-8");
+    let close = "</xades:UnsignedSignatureProperties>";
+    let validation_data = format!(
+        "<xades141:TimeStampValidationData xmlns:xades141=\"{NAMESPACE_XADES_141}\">\
+         <xades:CertificateValues><xades:EncapsulatedX509Certificate>{}\
+         </xades:EncapsulatedX509Certificate></xades:CertificateValues>\
+         </xades141:TimeStampValidationData>",
+        crate::base64::encode(&world.tsa_root)
+    );
+    let document = document.replace(close, &format!("{validation_data}{close}"));
+
+    let method = Canonicalization::exclusive(Comments::Omitted);
+    let parsed = XmlDocument::parse(document.as_bytes().to_vec()).expect("parses");
+    let signature = parsed
+        .root()
+        .child(NAMESPACE_DSIG, "Signature")
+        .expect("signature");
+    let signed_info = signature
+        .child(NAMESPACE_DSIG, "SignedInfo")
+        .expect("SignedInfo");
+    let mut input = Vec::new();
+    for reference in signed_info.children_named(NAMESPACE_DSIG, "Reference") {
+        match reference
+            .attribute("URI")
+            .and_then(|uri| uri.strip_prefix('#'))
+        {
+            Some(id) => input.extend_from_slice(&canonical_by_id(&document, id, &method)),
+            None => input.extend_from_slice(NOTE),
+        }
+    }
+    input.extend_from_slice(&signed_info.canonicalize(&method));
+    for name in ["SignatureValue", "KeyInfo"] {
+        input.extend_from_slice(
+            &signature
+                .child(NAMESPACE_DSIG, name)
+                .expect("element")
+                .canonicalize(&method),
+        );
+    }
+    let unsigned = signature
+        .descendants()
+        .find(|element| element.is(NAMESPACE_XADES, "UnsignedSignatureProperties"))
+        .expect("unsigned properties");
+    for property in unsigned.children() {
+        input.extend_from_slice(&property.canonicalize(&method));
+    }
+    for object in signature.children_named(NAMESPACE_DSIG, "Object") {
+        if object
+            .child(NAMESPACE_XADES, "QualifyingProperties")
+            .is_none()
+        {
+            input.extend_from_slice(&object.canonicalize(&method));
+        }
+    }
+    let archive_xml = format!(
+        "<xades141:ArchiveTimeStamp xmlns:xades141=\"{NAMESPACE_XADES_141}\">\
+         <ds:CanonicalizationMethod Algorithm=\"{CANONICALIZATION_EXCLUSIVE}\"/>\
+         <xades:EncapsulatedTimeStamp>{}</xades:EncapsulatedTimeStamp>\
+         </xades141:ArchiveTimeStamp>",
+        crate::base64::encode(&archive.token(&input))
+    );
+    let mut archived = document.replace(close, &format!("{archive_xml}{close}"));
+    if tamper {
+        archived = archived.replacen(
+            &crate::base64::encode(&world.tsa_root),
+            &crate::base64::encode(&world.root),
+            1,
+        );
+    }
+    xades_container_of(&archived)
+}
+
+#[test]
+fn an_lta_xades_container_whose_signature_timestamp_authority_expired_stands_on_its_archive_timestamp()
+ {
+    let world = World::new();
+    let archive = ArchiveAuthority::new();
+    let report = verify_expired(
+        archived_xades(&world, &archive, false),
+        &archive.anchors(&world),
+    );
+    let signature = only(&report);
+    assert_eq!(kinds(signature.timestamps()), [Kind::Claimed(day(STAMPED))]);
+    assert_eq!(
+        archive_kinds(signature),
+        [(ArchiveForm::Xades, Kind::Anchored(day(ARCHIVED)))]
+    );
+    assert_eq!(signature.proof_of_existence(), Some(day(ARCHIVED)));
+    assert_eq!(signature.validation_time(), day(ARCHIVED));
+    assert!(report.is_valid());
+}
+
+#[test]
+fn changed_xades_validation_data_makes_the_archive_timestamp_invalid() {
+    let world = World::new();
+    let archive = ArchiveAuthority::new();
+    let report = verify_expired(
+        archived_xades(&world, &archive, true),
+        &archive.anchors(&world),
+    );
+    let signature = only(&report);
+    assert_eq!(
+        archive_kinds(signature),
+        [(
+            ArchiveForm::Xades,
+            Kind::Invalid(TimestampError::ImprintMismatch)
+        )]
+    );
+    assert!(!report.is_valid());
+}
+
+/// The object number of the content stream, form field or page a
+/// revision test adds to the minimal PDF, one past its last object.
+const ADDED_OBJECT: u32 = 4;
+/// The minimal PDF's catalog.
+const CATALOG_OBJECT: u32 = 1;
+/// The minimal PDF's page tree root.
+const PAGES_OBJECT: u32 = 2;
+/// The minimal PDF's one page.
+const PAGE_OBJECT: u32 = 3;
+/// The pages of the minimal PDF once one is added.
+const PAGES_AFTER_ADDING: u32 = 2;
+
+/// The newest body of object `number` of `pdf`.
+fn newest_body(pdf: &[u8], number: u32) -> Vec<u8> {
+    crate::pades::index::PdfIndex::parse(pdf)
+        .expect("indexes")
+        .object_body(number)
+        .expect("the object")
+}
+
+/// One past the highest object number of `pdf`, from its trailer.
+fn next_object(pdf: &[u8]) -> u32 {
+    let index = crate::pades::index::PdfIndex::parse(pdf).expect("indexes");
+    crate::pades::index::dictionary_integer(index.trailer(), b"/Size").expect("a /Size")
+}
+
+/// `body` with `old` replaced by `new` once.
+fn edited(body: &[u8], old: &str, new: &str) -> Vec<u8> {
+    let text = String::from_utf8(body.to_vec()).expect("ASCII");
+    assert!(text.contains(old), "{old} in the body");
+    text.replacen(old, new, 1).into_bytes()
+}
+
+/// The facts of the first signature of `pdf`, judged at [`NOW`].
+fn first_signature(world: &World, pdf: Vec<u8>) -> SignatureReport {
+    let report = world.verify(pdf).expect("report");
+    judged(report.rows().first().expect("a signature")).clone()
+}
+
+#[test]
+fn a_document_timestamp_and_validation_store_after_signing_change_nothing() {
+    let world = World::new();
+    let signed = world.pdf(Signer::Issued, Stamp::Anchored, &world.lt_material(None));
+    let report = world
+        .verify(with_document_timestamp(&world, &signed))
+        .expect("report");
+    let signature = only(&report);
+    assert_eq!(signature.revision(), Revision::LaterRevisionsHarmless);
+    assert!(signature.document_intact());
+    assert!(signature.is_valid());
+    assert!(report.is_valid());
+}
+
+#[test]
+fn a_second_signature_after_signing_changes_nothing() {
+    let world = World::new();
+    let once = world.pdf(Signer::Direct, Stamp::None, &ValidationMaterial::default());
+    let twice = world.sign_pdf(
+        once,
+        Signer::Rsa,
+        Stamp::None,
+        &ValidationMaterial::default(),
+    );
+    let report = world.verify(twice).expect("report");
+    let [first, second] = exactly(report.rows(), "two signatures");
+    assert_eq!(judged(first).revision(), Revision::LaterRevisionsHarmless);
+    assert!(judged(first).document_intact());
+    assert_eq!(judged(second).revision(), Revision::WholeDocument);
+    assert!(report.is_valid());
+}
+
+#[test]
+fn a_changed_page_content_stream_is_a_change_after_signing() {
+    let world = World::new();
+    let stream = |text: &str| format!("<< /Length {} >>\nstream\n{text}\nendstream", text.len());
+    let page = edited(
+        &newest_body(&minimal_pdf(), PAGE_OBJECT),
+        " >>",
+        &format!(" /Contents {ADDED_OBJECT} 0 R >>"),
+    );
+    let drawn = crate::testkit::incremental_update(
+        &minimal_pdf(),
+        &[
+            (ADDED_OBJECT, stream("0 0 m 10 10 l S").as_bytes()),
+            (PAGE_OBJECT, &page),
+        ],
+    );
+    let signed = world.sign_pdf(
+        drawn,
+        Signer::Direct,
+        Stamp::None,
+        &ValidationMaterial::default(),
+    );
+    let redrawn = crate::testkit::incremental_update(
+        &signed,
+        &[(ADDED_OBJECT, stream("0 0 m 20 20 l S").as_bytes())],
+    );
+    let signature = first_signature(&world, redrawn);
+    assert_eq!(
+        signature.revision(),
+        Revision::ChangedAfterSigning(DocumentChange::Content)
+    );
+    assert!(!signature.document_intact());
+    assert!(!signature.is_valid());
+}
+
+#[test]
+fn an_added_page_is_a_change_after_signing() {
+    let world = World::new();
+    let signed = world.pdf(Signer::Direct, Stamp::None, &ValidationMaterial::default());
+    let added = next_object(&signed);
+    let page = format!(
+        "<< /Type /Page /Parent {PAGES_OBJECT} 0 R {} >>",
+        core::str::from_utf8(MEDIA_BOX).expect("ASCII")
+    );
+    let pages = format!(
+        "<< /Type /Pages /Kids [{PAGE_OBJECT} 0 R {added} 0 R] /Count {PAGES_AFTER_ADDING} >>"
+    );
+    let extended = crate::testkit::incremental_update(
+        &signed,
+        &[(added, page.as_bytes()), (PAGES_OBJECT, pages.as_bytes())],
+    );
+    let signature = first_signature(&world, extended);
+    assert_eq!(
+        signature.revision(),
+        Revision::ChangedAfterSigning(DocumentChange::Pages)
+    );
+    assert!(!signature.document_intact());
+}
+
+#[test]
+fn a_changed_form_field_value_is_a_change_after_signing() {
+    let world = World::new();
+    let field = |value: &str| format!("<< /FT /Tx /T (Name) /V ({value}) >>");
+    let catalog = edited(
+        &newest_body(&minimal_pdf(), CATALOG_OBJECT),
+        " >>",
+        &format!(" /AcroForm << /Fields [{ADDED_OBJECT} 0 R] >> >>"),
+    );
+    let form = crate::testkit::incremental_update(
+        &minimal_pdf(),
+        &[
+            (ADDED_OBJECT, field("Before").as_bytes()),
+            (CATALOG_OBJECT, &catalog),
+        ],
+    );
+    let signed = world.sign_pdf(
+        form,
+        Signer::Direct,
+        Stamp::None,
+        &ValidationMaterial::default(),
+    );
+    let filled =
+        crate::testkit::incremental_update(&signed, &[(ADDED_OBJECT, field("After").as_bytes())]);
+    let signature = first_signature(&world, filled);
+    assert_eq!(
+        signature.revision(),
+        Revision::ChangedAfterSigning(DocumentChange::FormField)
+    );
+    assert!(!signature.document_intact());
+}
+
+#[test]
+fn an_added_annotation_is_a_change_after_signing() {
+    let world = World::new();
+    let signed = world.pdf(Signer::Direct, Stamp::None, &ValidationMaterial::default());
+    let added = next_object(&signed);
+    let note = "<< /Type /Annot /Subtype /Text /Rect [0 0 10 10] /Contents (Added) >>";
+    let page = edited(
+        &newest_body(&signed, PAGE_OBJECT),
+        "/Annots [",
+        &format!("/Annots [{added} 0 R "),
+    );
+    let annotated = crate::testkit::incremental_update(
+        &signed,
+        &[(added, note.as_bytes()), (PAGE_OBJECT, &page)],
+    );
+    let signature = first_signature(&world, annotated);
+    assert_eq!(
+        signature.revision(),
+        Revision::ChangedAfterSigning(DocumentChange::Annotation)
+    );
+    assert!(!signature.document_intact());
+}
+
+#[test]
+fn an_archive_attribute_holding_two_values_is_invalid() {
+    let world = World::new();
+    let archive = ArchiveAuthority::new();
+    let report = verify_expired(
+        archived_pdf(&world, &archive, ArchiveFault::TwoValues),
+        &archive.anchors(&world),
+    );
+    let signature = only(&report);
+    assert_eq!(
+        archive_kinds(signature),
+        [(
+            ArchiveForm::CadesV3,
+            Kind::Invalid(TimestampError::Malformed(
+                "archive-time-stamp-v3 holds more than one value"
+            ))
+        )]
+    );
+    assert_eq!(signature.proof_of_existence(), None);
+    assert!(!report.is_valid());
+}
+
+#[test]
+fn updated_document_information_and_metadata_change_nothing() {
+    let world = World::new();
+    let signed = world.pdf(Signer::Direct, Stamp::None, &ValidationMaterial::default());
+    let metadata = next_object(&signed);
+    let info = metadata.saturating_add(1);
+    let stream = |text: &str| {
+        format!(
+            "<< /Type /Metadata /Subtype /XML /Length {} >>\nstream\n{text}\nendstream",
+            text.len()
+        )
+    };
+    let information = |producer: &str| format!("<< /Producer ({producer}) >>");
+    let catalog = edited(
+        &newest_body(&signed, CATALOG_OBJECT),
+        "/Type /Catalog",
+        &format!("/Type /Catalog /Metadata {metadata} 0 R"),
+    );
+    let described = crate::testkit::incremental_update_with_info(
+        &signed,
+        &[
+            (metadata, stream("<x:xmpmeta/>").as_bytes()),
+            (info, information("Synthetic first").as_bytes()),
+            (CATALOG_OBJECT, &catalog),
+        ],
+        info,
+    );
+    let redescribed = crate::testkit::incremental_update_with_info(
+        &described,
+        &[
+            (metadata, stream("<x:xmpmeta></x:xmpmeta>").as_bytes()),
+            (info, information("Synthetic second").as_bytes()),
+        ],
+        info,
+    );
+    let report = world.verify(redescribed).expect("report");
+    let signature = only(&report);
+    assert_eq!(signature.revision(), Revision::LaterRevisionsHarmless);
+    assert!(signature.document_intact());
     assert!(report.is_valid());
 }

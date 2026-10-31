@@ -491,6 +491,15 @@ pub mod known {
     pub const ARCHIVE_TIME_STAMP_V3: Oid<'static> =
         Oid::const_new(::const_oid::ObjectIdentifier::new_unwrap("0.4.0.1733.2.4").as_bytes());
 
+    /// `0.4.0.19122.1.5` -- id-aa-ATSHashIndex-v3.
+    ///
+    /// ETSI EN 319 122-1 V1.3.1 clause 5.5.2. The ats-hash-index-v3
+    /// unsigned attribute of an archive-time-stamp-v3 token: the hashes
+    /// of the certificates, revocation values and unsigned attribute
+    /// values the archive timestamp protects.
+    pub const ATS_HASH_INDEX_V3: Oid<'static> =
+        Oid::const_new(::const_oid::ObjectIdentifier::new_unwrap("0.4.0.19122.1.5").as_bytes());
+
     // ---- OCSP response types (RFC 6960) ----
 
     /// `1.3.6.1.5.5.7.48.1.1` -- id-pkix-ocsp-basic.

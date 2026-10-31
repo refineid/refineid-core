@@ -36,12 +36,19 @@
 //! - `ETSI EN 319 142-2` V1.2.1 clause 4.2.3: `adbe.pkcs7.detached`
 //!   without the ESS binding, and annex A.4: serial signatures, each
 //!   against its own byte range.
+//! - `ETSI EN 319 122-1` V1.3.1 clause 5.5.3 and `ETSI EN 319 132-1`
+//!   V1.3.1 clause 5.5.2: an anchored archive timestamp proves the
+//!   existence of the signature with its validation material.
+//! - ISO 32000-1 sec.12.8.2.2 and sec.12.8.2.4: a later revision that
+//!   changes more than signatures, document timestamps and validation
+//!   material leaves the document not intact.
 //! - `ETSI EN 319 162-1` V1.1.1 annex A: `XAdES` signature files and
 //!   `CAdES` signatures over an `ASiCManifest`.
 
 pub mod asic;
 pub mod cades;
 pub mod pdf;
+pub mod revision;
 pub mod trust;
 pub mod xades;
 pub mod xml;
@@ -55,6 +62,7 @@ use refineid_cms::x509::{DateTime, OwnedCert};
 use self::asic::{AsicContainer, AsicReadError};
 use self::cades::{CadesReadError, CadesSignature, Content, EssBinding};
 use self::pdf::{ByteRange, PdfDocument, PdfReadError, SignatureKind, SubFilter};
+pub use self::revision::{DocumentChange, Revision};
 use self::trust::judge;
 pub use self::trust::{
     AnchorError, AnchorRole, CertificationPath, GrantedPeriod, MaterialPool, Revocation,
@@ -197,7 +205,8 @@ pub enum TimestampReport {
     /// The token does not verify, or imprints other data.
     Invalid(TimestampError),
     /// The token is not judged: an `XAdES` timestamp under a
-    /// canonicalisation this verifier does not compute, or a PDF
+    /// canonicalisation this verifier does not compute, an archive
+    /// timestamp of a form this verifier does not judge, or a PDF
     /// document timestamp whose range does not end a revision.
     Unsupported,
 }
@@ -229,6 +238,46 @@ impl TimestampReport {
     }
 }
 
+/// The form an archive timestamp takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveForm {
+    /// A `CAdES` `archive-time-stamp-v3` (`ETSI EN 319 122-1` clause
+    /// 5.5.3), judged.
+    CadesV3,
+    /// A `CAdES` `archive-time-stamp` (RFC 5126 sec.6.4.1), counted and
+    /// reported [`TimestampReport::Unsupported`].
+    CadesV2,
+    /// An `XAdES` `ArchiveTimeStamp` (`ETSI EN 319 132-1` clause 5.5.2),
+    /// judged when it is in the 1.4.1 namespace and its time-stamped
+    /// properties share its parent; reported
+    /// [`TimestampReport::Unsupported`] otherwise.
+    Xades,
+}
+
+/// One archive timestamp of a signature: a timestamp over the
+/// signature and its validation material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveTimestampReport {
+    /// The form it takes.
+    form: ArchiveForm,
+    /// What the token was found to be.
+    timestamp: TimestampReport,
+}
+
+impl ArchiveTimestampReport {
+    /// The form it takes.
+    #[must_use]
+    pub const fn form(&self) -> ArchiveForm {
+        self.form
+    }
+
+    /// What the token was found to be.
+    #[must_use]
+    pub const fn timestamp(&self) -> &TimestampReport {
+        &self.timestamp
+    }
+}
+
 /// One judged signature's facts.
 #[derive(Debug, Clone)]
 pub struct SignatureReport {
@@ -240,7 +289,7 @@ pub struct SignatureReport {
     /// validation time or partial.
     chain: CertificationPath,
     /// Every byte the signature claims to cover digests to the value it
-    /// states.
+    /// states, and no later revision changes what was signed.
     document_intact: bool,
     /// The signature verifies under the signer's key, bound as the
     /// profile requires.
@@ -249,14 +298,14 @@ pub struct SignatureReport {
     proof_of_existence: Option<DateTime>,
     /// The signature's own timestamps, in encoded order.
     timestamps: Vec<TimestampReport>,
-    /// Archive timestamps present, counted and not judged.
-    archive_timestamps: usize,
+    /// The archive timestamps, in encoded order.
+    archive_timestamps: Vec<ArchiveTimestampReport>,
     /// When the chain and revocation were judged.
     validation_time: DateTime,
     /// The revocation status of the path.
     revocation: Revocation,
-    /// Whether no bytes follow the signed revision.
-    covers_whole_document: bool,
+    /// What the revisions after the signed one do to the document.
+    revision: Revision,
 }
 
 impl SignatureReport {
@@ -282,8 +331,9 @@ impl SignatureReport {
     }
 
     /// Every byte the signature claims to cover digests to the value
-    /// the signature states, and, for a container, every data file is
-    /// covered.
+    /// the signature states, for a container every data file is
+    /// covered, and for a PDF no later revision changes what was signed
+    /// ([`Self::revision`]).
     #[must_use]
     pub const fn document_intact(&self) -> bool {
         self.document_intact
@@ -306,8 +356,8 @@ impl SignatureReport {
     }
 
     /// The earliest time an anchored timestamp proves: a signature
-    /// timestamp, or a document timestamp whose range covers this
-    /// signature.
+    /// timestamp, an archive timestamp, or a document timestamp whose
+    /// range covers this signature.
     #[must_use]
     pub const fn proof_of_existence(&self) -> Option<DateTime> {
         self.proof_of_existence
@@ -319,11 +369,10 @@ impl SignatureReport {
         &self.timestamps
     }
 
-    /// How many archive timestamps the signature carries; they are
-    /// counted, not judged.
+    /// The archive timestamps, in encoded order.
     #[must_use]
-    pub const fn archive_timestamps(&self) -> usize {
-        self.archive_timestamps
+    pub fn archive_timestamps(&self) -> &[ArchiveTimestampReport] {
+        &self.archive_timestamps
     }
 
     /// The proof of existence, else the `now` the caller passed: the
@@ -339,11 +388,14 @@ impl SignatureReport {
         self.revocation
     }
 
-    /// Whether no bytes follow the revision the signature covers.
-    /// Reported, not judged.
+    /// What the revisions after the one the signature covers do to
+    /// the document: none follow, they only add signatures, document
+    /// timestamps and validation material, or they change what was
+    /// signed, which also makes [`Self::document_intact`] false. Always
+    /// [`Revision::WholeDocument`] outside a PDF.
     #[must_use]
-    pub const fn covers_whole_document(&self) -> bool {
-        self.covers_whole_document
+    pub const fn revision(&self) -> Revision {
+        self.revision
     }
 
     /// Whether the signature is valid: the document is intact, the
@@ -682,28 +734,51 @@ struct Facts {
     signature_valid: bool,
     /// The signature's own timestamps.
     timestamps: Vec<Timestamp>,
-    /// Archive timestamps present.
-    archive_timestamps: usize,
+    /// The archive timestamps, each with its form.
+    archive_timestamps: Vec<(ArchiveForm, Timestamp)>,
     /// Proven times of the document timestamps covering the signature.
     covering_proofs: Vec<DateTime>,
-    /// Whether no bytes follow the signed revision.
-    covers_whole_document: bool,
+    /// What the revisions after the signed one do to the document.
+    revision: Revision,
     /// The evidence for this signature: the document's, the
     /// signature's own, and the anchors' certificates.
     pool: MaterialPool,
 }
 
-/// One signature timestamp as a reader found it.
+/// One timestamp as a reader found it.
 enum Timestamp {
-    /// A token and the octets its imprint must digest.
+    /// A token and what its imprint must digest.
     Token {
         /// The token DER.
         token: Vec<u8>,
-        /// The imprinted octets.
-        imprint_input: Vec<u8>,
+        /// What it imprints.
+        imprint: Imprint,
     },
     /// A token whose imprinted octets this verifier does not compute.
     Uncomputable,
+    /// A token found not valid before it is verified: an archive
+    /// timestamp whose hash index does not hold.
+    Refused(TimestampError),
+}
+
+/// What a token's message imprint must digest.
+enum Imprint {
+    /// These octets, under the token's own imprint algorithm.
+    Octets(Vec<u8>),
+    /// An `archive-time-stamp-v3` input, under its index's algorithm.
+    Archive(cades::ArchiveImprint),
+}
+
+impl Imprint {
+    /// The digest a token imprinting under `algorithm` must carry; an
+    /// archive input under another algorithm than its index's matches
+    /// no token.
+    fn digest(&self, algorithm: crate::cades::DigestAlgorithm) -> Vec<u8> {
+        match self {
+            Self::Octets(octets) => algorithm.digest(octets),
+            Self::Archive(imprint) => imprint.digest(algorithm).unwrap_or_default(),
+        }
+    }
 }
 
 impl Context<'_> {
@@ -760,23 +835,25 @@ impl Context<'_> {
     /// the proof of existence taken from the anchored ones, and the
     /// chain and revocation judged at the validation time.
     fn report(&self, facts: Facts) -> SignatureReport {
-        let timestamps: Vec<TimestampReport> = facts
-            .timestamps
+        let judge_one = |timestamp: &Timestamp| match timestamp {
+            Timestamp::Token { token, imprint } => {
+                self.judge_token(token, |algorithm| imprint.digest(algorithm), &facts.pool)
+            }
+            Timestamp::Uncomputable => TimestampReport::Unsupported,
+            Timestamp::Refused(error) => TimestampReport::Invalid(*error),
+        };
+        let timestamps: Vec<TimestampReport> = facts.timestamps.iter().map(judge_one).collect();
+        let archive_timestamps: Vec<ArchiveTimestampReport> = facts
+            .archive_timestamps
             .iter()
-            .map(|timestamp| match timestamp {
-                Timestamp::Token {
-                    token,
-                    imprint_input,
-                } => self.judge_token(
-                    token,
-                    |algorithm| algorithm.digest(imprint_input),
-                    &facts.pool,
-                ),
-                Timestamp::Uncomputable => TimestampReport::Unsupported,
+            .map(|(form, timestamp)| ArchiveTimestampReport {
+                form: *form,
+                timestamp: judge_one(timestamp),
             })
             .collect();
         let proof_of_existence = timestamps
             .iter()
+            .chain(archive_timestamps.iter().map(|archive| &archive.timestamp))
             .filter_map(TimestampReport::proven_time)
             .chain(facts.covering_proofs.iter().copied())
             .min();
@@ -795,14 +872,15 @@ impl Context<'_> {
             signer: SignerIdentity::of(&facts.signer),
             signer_certificate: facts.signer,
             chain: chain.path,
-            document_intact: facts.document_intact,
+            document_intact: facts.document_intact
+                && !matches!(facts.revision, Revision::ChangedAfterSigning(_)),
             signature_valid: facts.signature_valid,
             proof_of_existence,
             timestamps,
-            archive_timestamps: facts.archive_timestamps,
+            archive_timestamps,
             validation_time,
             revocation: chain.revocation,
-            covers_whole_document: facts.covers_whole_document,
+            revision: facts.revision,
         }
     }
 
@@ -859,12 +937,12 @@ impl Context<'_> {
                 }
                 SignatureKind::DocumentTimestamp => continue,
             };
-            if !found.ends_revision() {
+            let Some(revision) = found.revision() else {
                 rows.push(SignatureRow::unsupported(
                     UnsupportedSignature::PdfRangeNotARevision,
                 ));
                 continue;
-            }
+            };
             let signature = match CadesSignature::parse(found.cms()) {
                 Ok(signature) => signature,
                 Err(error) => {
@@ -894,9 +972,9 @@ impl Context<'_> {
                 document_intact: verdict.document_intact,
                 signature_valid: verdict.signature_valid && !baseline_time_attribute,
                 timestamps: cades_timestamps(&verdict.signature_timestamps),
-                archive_timestamps: verdict.archive_timestamps_present,
+                archive_timestamps: cades_archive_timestamps(verdict.archive_timestamps),
                 covering_proofs,
-                covers_whole_document: found.covers_whole_document(),
+                revision,
                 pool,
             })));
         }
@@ -1017,9 +1095,23 @@ impl Context<'_> {
             .map(|timestamp| match timestamp.imprint_input() {
                 Some(input) => Timestamp::Token {
                     token: timestamp.token().to_vec(),
-                    imprint_input: input.to_vec(),
+                    imprint: Imprint::Octets(input.to_vec()),
                 },
                 None => Timestamp::Uncomputable,
+            })
+            .collect();
+        let archive_timestamps = signature
+            .archive_timestamps(container)
+            .into_iter()
+            .map(|archive| {
+                let timestamp = match archive.imprint_input() {
+                    Some(input) => Timestamp::Token {
+                        token: archive.token().to_vec(),
+                        imprint: Imprint::Octets(input.to_vec()),
+                    },
+                    None => Timestamp::Uncomputable,
+                };
+                (ArchiveForm::Xades, timestamp)
             })
             .collect();
         SignatureRow::judged(self.report(Facts {
@@ -1027,9 +1119,9 @@ impl Context<'_> {
             document_intact: judgement.document_intact(),
             signature_valid: judgement.signature_valid(),
             timestamps,
-            archive_timestamps: judgement.archive_timestamps_present(),
+            archive_timestamps,
             covering_proofs: Vec::new(),
-            covers_whole_document: true,
+            revision: Revision::WholeDocument,
             pool,
         }))
     }
@@ -1056,9 +1148,9 @@ impl Context<'_> {
             document_intact: verdict.document_intact && container.manifest_intact(entry),
             signature_valid: verdict.signature_valid,
             timestamps: cades_timestamps(&verdict.signature_timestamps),
-            archive_timestamps: verdict.archive_timestamps_present,
+            archive_timestamps: cades_archive_timestamps(verdict.archive_timestamps),
             covering_proofs: Vec::new(),
-            covers_whole_document: true,
+            revision: Revision::WholeDocument,
             pool,
         }))
     }
@@ -1081,9 +1173,9 @@ impl Context<'_> {
             document_intact: verdict.document_intact,
             signature_valid: verdict.signature_valid,
             timestamps: cades_timestamps(&verdict.signature_timestamps),
-            archive_timestamps: verdict.archive_timestamps_present,
+            archive_timestamps: cades_archive_timestamps(verdict.archive_timestamps),
             covering_proofs: Vec::new(),
-            covers_whole_document: true,
+            revision: Revision::WholeDocument,
             pool,
         })))
     }
@@ -1095,7 +1187,29 @@ fn cades_timestamps(timestamps: &[cades::CadesTimestamp]) -> Vec<Timestamp> {
         .iter()
         .map(|timestamp| Timestamp::Token {
             token: timestamp.token().to_vec(),
-            imprint_input: timestamp.imprint_input().to_vec(),
+            imprint: Imprint::Octets(timestamp.imprint_input().to_vec()),
+        })
+        .collect()
+}
+
+/// The `CAdES` archive timestamps as the report judges them.
+fn cades_archive_timestamps(
+    timestamps: Vec<cades::CadesArchiveTimestamp>,
+) -> Vec<(ArchiveForm, Timestamp)> {
+    timestamps
+        .into_iter()
+        .map(|timestamp| match timestamp {
+            cades::CadesArchiveTimestamp::V3(Ok(archive)) => (
+                ArchiveForm::CadesV3,
+                Timestamp::Token {
+                    token: archive.token().to_vec(),
+                    imprint: Imprint::Archive(archive.imprint().clone()),
+                },
+            ),
+            cades::CadesArchiveTimestamp::V3(Err(error)) => {
+                (ArchiveForm::CadesV3, Timestamp::Refused(error))
+            }
+            cades::CadesArchiveTimestamp::V2 => (ArchiveForm::CadesV2, Timestamp::Uncomputable),
         })
         .collect()
 }

@@ -31,6 +31,9 @@
 //! - `ETSI EN 319 142-2` V1.2.1 clause 4.2.3 and 5.3: the signature
 //!   subfilters `adbe.pkcs7.detached` and `ETSI.CAdES.detached`.
 //!
+//! - ISO 32000-1 sec.12.8.2.2 and sec.12.8.2.4: what the revisions
+//!   after a signed one change is judged by [`super::revision`].
+//!
 //! Only the newest revision's catalog is read for the `/DSS`: an
 //! incremental update that extends the store rewrites it with the
 //! earlier entries carried forward.
@@ -43,6 +46,7 @@ use crate::pades::index::{
     complete_object_reference, dictionary_at, parse_usize, validation_references,
 };
 use crate::validation::ValidationMaterial;
+use crate::verification::revision::{Revision, later_revisions};
 use refineid_cms::x509::DateTime;
 
 /// The header every PDF file starts with (ISO 32000-1 sec.7.5.2).
@@ -299,12 +303,11 @@ pub struct PdfSignature {
     cms: Vec<u8>,
     /// The signed spans.
     byte_range: ByteRange,
-    /// Whether the second span ends at the end of the file.
-    covers_whole_document: bool,
     /// The `/M` entry, converted to UTC.
     signing_time_entry: Option<DateTime>,
-    /// Whether the range ends where a revision ends.
-    ends_revision: bool,
+    /// What the later revisions do to the revision the range ends;
+    /// `None` when the range does not end a revision.
+    revision: Option<Revision>,
 }
 
 impl PdfSignature {
@@ -328,11 +331,11 @@ impl PdfSignature {
         self.byte_range
     }
 
-    /// Whether the second span ends at the end of the file, so no
-    /// revision follows the one this signature covers.
+    /// What the revisions after the one this signature covers do to
+    /// the document; `None` when the range does not end a revision.
     #[must_use]
-    pub const fn covers_whole_document(&self) -> bool {
-        self.covers_whole_document
+    pub const fn revision(&self) -> Option<Revision> {
+        self.revision
     }
 
     /// The `/M` entry, converted to UTC; `None` when absent, when it
@@ -346,12 +349,13 @@ impl PdfSignature {
 
     /// Whether the signed spans end where a revision ends: just after
     /// an `%%EOF` marker and its end-of-line (ISO 32000-1 sec.7.5.5),
+    /// with the bytes up to there indexing as a document of their own,
     /// so the whole signed revision is covered (sec.12.8.1, `ETSI EN
     /// 319 142-1` V1.2.1 clause 5.1). A range cut elsewhere signs part
     /// of a revision and is not judged.
     #[must_use]
     pub const fn ends_revision(&self) -> bool {
-        self.ends_revision
+        self.revision.is_some()
     }
 }
 
@@ -396,7 +400,7 @@ impl<'a> PdfDocument<'a> {
             .object_dictionaries()
             .map_err(|error| PdfReadError::from_index(error, "object"))?;
         for dictionary in &dictionaries {
-            if let Some(signature) = signature_from_dictionary(dictionary, file)? {
+            if let Some(signature) = signature_from_dictionary(dictionary, file, &index)? {
                 signatures.push(signature);
             }
         }
@@ -449,6 +453,7 @@ impl<'a> PdfDocument<'a> {
 fn signature_from_dictionary(
     object: &ObjectDictionary,
     file: &[u8],
+    index: &PdfIndex<'_>,
 ) -> Result<Option<PdfSignature>, PdfReadError> {
     let dictionary = object.bytes.as_slice();
     let parsed = PdfDictionary::parse(dictionary)
@@ -507,9 +512,10 @@ fn signature_from_dictionary(
         kind,
         cms,
         byte_range,
-        covers_whole_document: byte_range.end() == file.len(),
         signing_time_entry,
-        ends_revision: ends_revision(file, byte_range.end()),
+        revision: ends_revision(file, byte_range.end())
+            .then(|| later_revisions(file, byte_range.end(), index))
+            .flatten(),
     }))
 }
 
@@ -836,6 +842,7 @@ mod tests {
         SignatureMetadata, append_validation_store, prepare, prepare_document_timestamp,
     };
     use crate::verification::exactly;
+    use crate::verification::revision::{DocumentChange, Revision};
     use refineid_cms::x509::DateTime;
 
     /// Signature space reserved by the fixtures, in bytes.
@@ -1228,7 +1235,7 @@ mod tests {
             SignatureKind::Signature(SubFilter::EtsiCadesDetached)
         );
         assert_eq!(signature.cms(), sequence(SYNTHETIC_SIGNED_DATA));
-        assert!(signature.covers_whole_document());
+        assert_eq!(signature.revision(), Some(Revision::WholeDocument));
         let (year, month, day, hour, minute, second) = SIGNING_TIME_UTC;
         assert_eq!(
             signature.signing_time_entry(),
@@ -1264,10 +1271,10 @@ mod tests {
             signature.kind(),
             SignatureKind::Signature(SubFilter::EtsiCadesDetached)
         );
-        assert!(!signature.covers_whole_document());
+        assert_eq!(signature.revision(), Some(Revision::LaterRevisionsHarmless));
         assert_eq!(timestamp.kind(), SignatureKind::DocumentTimestamp);
         assert_eq!(timestamp.cms(), sequence(SYNTHETIC_TIMESTAMP_TOKEN));
-        assert!(timestamp.covers_whole_document());
+        assert_eq!(timestamp.revision(), Some(Revision::WholeDocument));
         assert_eq!(timestamp.signing_time_entry(), None);
 
         // A document timestamp under any other subfilter is refused.
@@ -1284,9 +1291,9 @@ mod tests {
         let (twice, second_digest) = signed(&once);
         let document = PdfDocument::parse(&twice).expect("the twice-signed PDF parses");
         let [first, second] = exactly(document.signatures(), "two signatures");
-        assert!(!first.covers_whole_document());
+        assert_eq!(first.revision(), Some(Revision::LaterRevisionsHarmless));
         assert_eq!(first.byte_range().end(), once.len());
-        assert!(second.covers_whole_document());
+        assert_eq!(second.revision(), Some(Revision::WholeDocument));
         assert_eq!(
             document.digest(&second.byte_range(), DigestAlgorithm::Sha256),
             second_digest
@@ -1310,8 +1317,8 @@ mod tests {
         let document = PdfDocument::parse(&twice).expect("the twice-signed PDF parses");
         let [first, second] = exactly(document.signatures(), "two signatures");
         assert!(first.byte_range().end() < second.byte_range().end());
-        assert!(!first.covers_whole_document());
-        assert!(second.covers_whole_document());
+        assert_eq!(first.revision(), Some(Revision::LaterRevisionsHarmless));
+        assert_eq!(second.revision(), Some(Revision::WholeDocument));
         assert!(
             find_first(&twice, format!("\n{HIGH_SIZE} 0 obj").as_bytes())
                 < find_first(&twice, format!("\n{LOW_SIZE} 0 obj").as_bytes()),
@@ -1335,7 +1342,7 @@ mod tests {
         assert_eq!(store.ocsp_responses, [SYNTHETIC_OCSP_RESPONSE]);
         assert_eq!(store.crls, [SYNTHETIC_CRL]);
         let [signature] = exactly(document.signatures(), "exactly one signature");
-        assert!(!signature.covers_whole_document());
+        assert_eq!(signature.revision(), Some(Revision::LaterRevisionsHarmless));
     }
 
     #[test]
@@ -1832,7 +1839,10 @@ mod tests {
             document.digest(&signature.byte_range(), DigestAlgorithm::Sha256),
             digest
         );
-        assert!(!signature.covers_whole_document());
+        assert_eq!(
+            signature.revision(),
+            Some(Revision::ChangedAfterSigning(DocumentChange::Annotation))
+        );
     }
 
     #[test]

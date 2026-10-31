@@ -40,7 +40,9 @@
 //!   reference and its `Type`, sec.5.2.2 `SigningCertificateV2`,
 //!   sec.5.3 `SignatureTimeStamp` over the canonicalised
 //!   `ds:SignatureValue` element, sec.5.4 `CertificateValues` and
-//!   `RevocationValues`, sec.5.5 `ArchiveTimeStamp`, sec.5.2.7 the
+//!   `RevocationValues`, sec.5.5.1 `TimeStampValidationData`, sec.5.5.2
+//!   `ArchiveTimeStamp` and, in sec.5.5.2.3, the input of its imprint
+//!   when its time-stamped properties share its parent, sec.5.2.7 the
 //!   `CountersignedSignature` reference type and the enveloped
 //!   `CounterSignature`, whose reference digests the canonicalised
 //!   `ds:SignatureValue` of the signature it is embedded in, sec.4.5
@@ -190,6 +192,14 @@ const ELEMENT_ENCAPSULATED_TIMESTAMP: &str = "EncapsulatedTimeStamp";
 
 /// `xades:ArchiveTimeStamp`, in the 1.4.1 namespace or the 1.3.2 one.
 const ELEMENT_ARCHIVE_TIMESTAMP: &str = "ArchiveTimeStamp";
+
+/// `xades141:TimeStampValidationData` (EN 319 132-1 sec.5.5.1).
+const ELEMENT_TIMESTAMP_VALIDATION_DATA: &str = "TimeStampValidationData";
+
+/// `xades:Include`, which marks an `ArchiveTimeStamp` whose
+/// time-stamped properties do not share its parent (EN 319 132-1
+/// sec.5.5.2.4).
+const ELEMENT_INCLUDE: &str = "Include";
 
 /// `xades:CertificateValues`.
 const ELEMENT_CERTIFICATE_VALUES: &str = "CertificateValues";
@@ -475,6 +485,49 @@ impl SignatureTimestamp {
     }
 }
 
+/// One `EncapsulatedTimeStamp` of an `ArchiveTimeStamp`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveTimestamp {
+    /// The RFC 3161 token.
+    token: Vec<u8>,
+    /// What it must imprint.
+    imprint_input: Option<Vec<u8>>,
+}
+
+impl ArchiveTimestamp {
+    /// The RFC 3161 `TimeStampToken`, DER, for the timestamp verifier.
+    #[must_use]
+    pub fn token(&self) -> &[u8] {
+        &self.token
+    }
+
+    /// The octets the token's message imprint must digest (EN 319 132-1
+    /// sec.5.5.2.3): the octets every `ds:Reference` digests, in order;
+    /// then `ds:SignedInfo`, `ds:SignatureValue`, `ds:KeyInfo` when
+    /// present, every unsigned signature property before the
+    /// `ArchiveTimeStamp` and every `ds:Object` but the one holding
+    /// `QualifyingProperties`, each under the timestamp's
+    /// canonicalisation, Canonical XML 1.0 when it names none. `None`
+    /// when this verifier does not compute it: an `ArchiveTimeStamp` in
+    /// the 1.3.2 namespace, one with `xades:Include` children, one
+    /// under a canonicalisation this verifier does not compute, or a
+    /// reference whose octets it cannot resolve.
+    #[must_use]
+    pub fn imprint_input(&self) -> Option<&[u8]> {
+        self.imprint_input.as_deref()
+    }
+}
+
+/// One `ArchiveTimeStamp` as read: its tokens and the canonical octets
+/// its imprint digests after the references' octets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArchivePlan {
+    /// Every `EncapsulatedTimeStamp` token.
+    tokens: Vec<Vec<u8>>,
+    /// Steps 4 to 6 of EN 319 132-1 sec.5.5.2.3, when computed.
+    after_references: Option<Vec<u8>>,
+}
+
 /// A signature feature this verifier does not implement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XadesUnsupported {
@@ -505,8 +558,6 @@ pub struct XadesJudgement {
     signature_valid: bool,
     /// `SignatureTimeStamp` tokens present.
     signature_timestamps_present: usize,
-    /// `ArchiveTimeStamp` elements present.
-    archive_timestamps_present: usize,
 }
 
 impl XadesJudgement {
@@ -534,12 +585,6 @@ impl XadesJudgement {
     #[must_use]
     pub const fn signature_timestamps_present(&self) -> usize {
         self.signature_timestamps_present
-    }
-
-    /// How many `ArchiveTimeStamp` elements the signature carries.
-    #[must_use]
-    pub const fn archive_timestamps_present(&self) -> usize {
-        self.archive_timestamps_present
     }
 }
 
@@ -576,8 +621,8 @@ pub struct XadesSignature {
     binding: SignerBinding,
     /// Every `SignatureTimeStamp` token.
     signature_timestamps: Vec<SignatureTimestamp>,
-    /// How many `ArchiveTimeStamp` elements are present.
-    archive_timestamps: usize,
+    /// Every `ArchiveTimeStamp`, in document order.
+    archive_timestamps: Vec<ArchivePlan>,
     /// Whether this is a counter-signature, whose references must cover
     /// the `ds:SignatureValue` it counter-signs rather than the
     /// container's data files.
@@ -666,7 +711,7 @@ impl XadesSignature {
 
         let mut material = ValidationMaterial::default();
         let mut signature_timestamps = Vec::new();
-        let mut archive_timestamps = 0_usize;
+        let mut archive_timestamps = Vec::new();
         if let Some(unsigned) = unsigned {
             read_unsigned(
                 unsigned,
@@ -674,13 +719,8 @@ impl XadesSignature {
                 &mut material,
                 &mut signature_timestamps,
             )?;
-            archive_timestamps = unsigned
-                .children()
-                .filter(|child| {
-                    child.is(NAMESPACE_XADES_141, ELEMENT_ARCHIVE_TIMESTAMP)
-                        || child.is(NAMESPACE_XADES, ELEMENT_ARCHIVE_TIMESTAMP)
-                })
-                .count();
+            archive_timestamps =
+                read_archive_timestamps(signature, signed_info, signature_value_element, unsigned)?;
         }
 
         let binding = match signed_properties
@@ -852,8 +892,52 @@ impl XadesSignature {
             document_intact: self.document_intact(container),
             signature_valid: self.signature_valid(),
             signature_timestamps_present: self.signature_timestamps.len(),
-            archive_timestamps_present: self.archive_timestamps,
         })
+    }
+
+    /// Every `ArchiveTimeStamp` token, in document order, with the
+    /// octets its imprint must digest over the data files of
+    /// `container`.
+    #[must_use]
+    pub fn archive_timestamps(&self, container: &AsicContainer) -> Vec<ArchiveTimestamp> {
+        let references = self.reference_octets(container);
+        self.archive_timestamps
+            .iter()
+            .flat_map(|plan| {
+                let input = references
+                    .as_ref()
+                    .zip(plan.after_references.as_ref())
+                    .map(|(references, after)| [references.as_slice(), after].concat());
+                plan.tokens.iter().map(move |token| ArchiveTimestamp {
+                    token: token.clone(),
+                    imprint_input: input.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// The octets every `ds:Reference` digests, in order: a data file's
+    /// content, or a same-document element canonicalised as its
+    /// reference says (EN 319 132-1 sec.5.5.2.3 step 3). `None` when one
+    /// does not resolve.
+    fn reference_octets(&self, container: &AsicContainer) -> Option<Vec<u8>> {
+        let mut octets = Vec::new();
+        for reference in &self.references {
+            match &reference.target {
+                Target::DataFile(uri) => octets.extend_from_slice(
+                    container
+                        .data_files()
+                        .iter()
+                        .find(|entry| uri_names(uri, entry.name()))?
+                        .content(),
+                ),
+                Target::SignedProperties(element)
+                | Target::Countersigned(element)
+                | Target::SameDocument(element) => octets.extend_from_slice(element),
+                Target::Unresolvable => return None,
+            }
+        }
+        Some(octets)
     }
 
     /// Every reference matches, one covers the signed properties, and
@@ -913,26 +997,79 @@ impl XadesSignature {
     }
 }
 
+/// Decode every child `name` of `parent` as base64.
+fn encapsulated(
+    parent: ElementRef<'_>,
+    name: &'static str,
+) -> Result<Vec<Vec<u8>>, XadesReadError> {
+    parent
+        .children_named(NAMESPACE_XADES, name)
+        .map(|value| base64::decode_wrapped(&value.text()))
+        .collect::<Result<_, _>>()
+        .map_err(|_ignored| XadesReadError::Malformed("encapsulated value is not base64"))
+}
+
+/// Read every `ArchiveTimeStamp` of `unsigned`, in either namespace,
+/// with steps 4 to 6 of its imprint input (EN 319 132-1 sec.5.5.2.3)
+/// when it is in the 1.4.1 namespace, carries no `xades:Include` and
+/// names a canonicalisation this verifier computes.
+fn read_archive_timestamps(
+    signature: ElementRef<'_>,
+    signed_info: ElementRef<'_>,
+    signature_value: ElementRef<'_>,
+    unsigned: ElementRef<'_>,
+) -> Result<Vec<ArchivePlan>, XadesReadError> {
+    let mut plans = Vec::new();
+    let mut preceding: Vec<ElementRef<'_>> = Vec::new();
+    for property in unsigned.children() {
+        let current = property.is(NAMESPACE_XADES_141, ELEMENT_ARCHIVE_TIMESTAMP);
+        if current || property.is(NAMESPACE_XADES, ELEMENT_ARCHIVE_TIMESTAMP) {
+            let method = match property.child(NAMESPACE_DSIG, ELEMENT_CANONICALIZATION_METHOD) {
+                None => Some(default_canonicalization()),
+                Some(method) => canonicalization_method(method),
+            };
+            let distributed = property
+                .children_named(NAMESPACE_XADES, ELEMENT_INCLUDE)
+                .next()
+                .is_some();
+            let after_references = method.filter(|_| current && !distributed).map(|method| {
+                let mut octets = signed_info.canonicalize(&method);
+                octets.extend_from_slice(&signature_value.canonicalize(&method));
+                if let Some(key_info) = signature.child(NAMESPACE_DSIG, ELEMENT_KEY_INFO) {
+                    octets.extend_from_slice(&key_info.canonicalize(&method));
+                }
+                for earlier in &preceding {
+                    octets.extend_from_slice(&earlier.canonicalize(&method));
+                }
+                for object in signature.children_named(NAMESPACE_DSIG, ELEMENT_OBJECT) {
+                    if object
+                        .child(NAMESPACE_XADES, ELEMENT_QUALIFYING_PROPERTIES)
+                        .is_none()
+                    {
+                        octets.extend_from_slice(&object.canonicalize(&method));
+                    }
+                }
+                octets
+            });
+            plans.push(ArchivePlan {
+                tokens: encapsulated(property, ELEMENT_ENCAPSULATED_TIMESTAMP)?,
+                after_references,
+            });
+        }
+        preceding.push(property);
+    }
+    Ok(plans)
+}
+
 /// Read `xades:UnsignedSignatureProperties`: the signature timestamps
-/// and the validation material.
+/// and the validation material, that of `TimeStampValidationData`
+/// included.
 fn read_unsigned(
     unsigned: ElementRef<'_>,
     signature_value: ElementRef<'_>,
     material: &mut ValidationMaterial,
     timestamps: &mut Vec<SignatureTimestamp>,
 ) -> Result<(), XadesReadError> {
-    /// Decode every child `name` of `parent` as base64.
-    fn encapsulated(
-        parent: ElementRef<'_>,
-        name: &'static str,
-    ) -> Result<Vec<Vec<u8>>, XadesReadError> {
-        parent
-            .children_named(NAMESPACE_XADES, name)
-            .map(|value| base64::decode_wrapped(&value.text()))
-            .collect::<Result<_, _>>()
-            .map_err(|_ignored| XadesReadError::Malformed("encapsulated value is not base64"))
-    }
-
     for timestamp in unsigned.children_named(NAMESPACE_XADES, ELEMENT_SIGNATURE_TIMESTAMP) {
         // Without a CanonicalizationMethod the XML Signature default,
         // Canonical XML 1.0, applies (EN 319 132-1 sec.4.5).
@@ -948,12 +1085,21 @@ fn read_unsigned(
             });
         }
     }
-    for values in unsigned.children_named(NAMESPACE_XADES, ELEMENT_CERTIFICATE_VALUES) {
+    let holders: Vec<ElementRef<'_>> = core::iter::once(unsigned)
+        .chain(unsigned.children_named(NAMESPACE_XADES_141, ELEMENT_TIMESTAMP_VALIDATION_DATA))
+        .collect();
+    for values in holders
+        .iter()
+        .flat_map(|holder| holder.children_named(NAMESPACE_XADES, ELEMENT_CERTIFICATE_VALUES))
+    {
         material
             .certificates
             .extend(encapsulated(values, ELEMENT_ENCAPSULATED_CERTIFICATE)?);
     }
-    for values in unsigned.children_named(NAMESPACE_XADES, ELEMENT_REVOCATION_VALUES) {
+    for values in holders
+        .iter()
+        .flat_map(|holder| holder.children_named(NAMESPACE_XADES, ELEMENT_REVOCATION_VALUES))
+    {
         for crls in values.children_named(NAMESPACE_XADES, ELEMENT_CRL_VALUES) {
             material
                 .crls
@@ -1274,7 +1420,7 @@ mod tests {
             "the placeholder value verifies under no key"
         );
         assert_eq!(judgement.signature_timestamps_present(), 0);
-        assert_eq!(judgement.archive_timestamps_present(), 0);
+        assert!(signature.archive_timestamps(&container).is_empty());
     }
 
     #[test]
@@ -1504,7 +1650,13 @@ mod tests {
         let judgement = supported(signature.verify(&container));
         assert!(judgement.document_intact());
         assert_eq!(judgement.signature_timestamps_present(), collected.len());
-        assert_eq!(judgement.archive_timestamps_present(), 1);
+        let [archive] = exactly(
+            &signature.archive_timestamps(&container),
+            "one archive timestamp",
+        )
+        .clone();
+        assert_eq!(archive.token(), FIRST_TOKEN);
+        assert!(archive.imprint_input().is_some());
     }
 
     #[test]
@@ -1901,7 +2053,7 @@ mod tests {
         let judgement = supported(signature.verify(&container));
         assert!(judgement.signature_valid());
         assert_eq!(judgement.signature_timestamps_present(), 1);
-        assert_eq!(judgement.archive_timestamps_present(), 1);
+        assert_eq!(signature.archive_timestamps(&container).len(), 1);
     }
 
     #[test]

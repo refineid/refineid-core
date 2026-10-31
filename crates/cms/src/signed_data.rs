@@ -327,6 +327,9 @@ pub struct SignedData<'a> {
     /// the OID structure at the trust boundary, so consumers
     /// never compare against arbitrary `&[u8]`.
     econtent_type_oid: crate::oid::Oid<'a>,
+    /// The complete `eContentType` TLV as encoded, the first octets an
+    /// archive-time-stamp-v3 imprints (ETSI EN 319 122-1 clause 5.5.3).
+    econtent_type_der: &'a [u8],
     /// Inner `eContent` OCTET STRING value bytes, `None` for a
     /// detached `SignedData` (RFC 5652 sec.5.2: `eContent` is
     /// OPTIONAL).
@@ -338,6 +341,9 @@ pub struct SignedData<'a> {
     /// The `crls` field's `RevocationInfoChoice` entries, in
     /// encoded order (RFC 5652 sec.10.2.1). Empty when absent.
     revocation_info: Vec<RevocationInfoChoice<'a>>,
+    /// The complete TLV of each `RevocationInfoChoice`, as encoded and
+    /// in the order of [`Self::revocation_info`].
+    revocation_info_der: Vec<&'a [u8]>,
     /// The sole signerInfo's fields.
     signer: SignerInfo<'a>,
 }
@@ -384,6 +390,10 @@ pub enum RevocationInfoChoice<'a> {
 pub struct CmsAttribute<'a> {
     /// Attribute type OID.
     pub oid: crate::oid::Oid<'a>,
+    /// The complete `attrType` TLV as encoded, which an
+    /// ats-hash-index-v3 hashes with each value (ETSI EN 319 122-1
+    /// clause 5.5.2).
+    pub type_der: &'a [u8],
     /// Contents of the attribute's `SET OF AttributeValue`.
     pub values_der: &'a [u8],
 }
@@ -401,6 +411,8 @@ pub struct SignerInfo<'a> {
     signature_scheme: SignatureScheme,
     /// Signature value bytes (raw, no OCTET STRING wrapper).
     signature: &'a [u8],
+    /// The fields `version` through `signature`, as encoded.
+    archive_fields_der: &'a [u8],
     /// What the signature covers.
     signed: SignedOver<'a>,
     /// Unsigned attributes, in their encoded order. Empty when the
@@ -548,6 +560,22 @@ impl<'a> SignedData<'a> {
         &self.revocation_info
     }
 
+    /// The complete TLV of each `SignedData.crls` entry as encoded, in
+    /// the order of [`Self::revocation_info`]: the octets an
+    /// ats-hash-index-v3 hashes (ETSI EN 319 122-1 clause 5.5.2).
+    #[must_use]
+    pub fn revocation_info_der(&self) -> &[&'a [u8]] {
+        &self.revocation_info_der
+    }
+
+    /// The complete `eContentType` TLV as encoded: the first octets an
+    /// archive-time-stamp-v3 imprints (ETSI EN 319 122-1 clause 5.5.3
+    /// item 1).
+    #[must_use]
+    pub const fn econtent_type_der(&self) -> &'a [u8] {
+        self.econtent_type_der
+    }
+
     /// The sole signerInfo.
     #[must_use]
     pub const fn signer(&self) -> &SignerInfo<'a> {
@@ -580,6 +608,16 @@ impl<'a> SignerInfo<'a> {
     #[must_use]
     pub const fn signature(&self) -> &'a [u8] {
         self.signature
+    }
+
+    /// The fields `version`, `sid`, `digestAlgorithm`, `signedAttrs`,
+    /// `signatureAlgorithm` and `signature`, each a complete TLV as
+    /// encoded, in their order of appearance: the octets an
+    /// archive-time-stamp-v3 imprints after the signed data hash
+    /// (ETSI EN 319 122-1 clause 5.5.3 item 3).
+    #[must_use]
+    pub const fn archive_fields_der(&self) -> &'a [u8] {
+        self.archive_fields_der
     }
 
     /// The DER `SET OF Attribute` the signature covers, re-tagged
@@ -763,6 +801,10 @@ impl CmsHelpers {
         let econtent_type_oid = crate::oid::Oid::new(econtent_type.value()).or(Err(
             CmsError::UnexpectedStructure("eContentType OID malformed"),
         ))?;
+        let econtent_type_der = encap
+            .value()
+            .get(..econtent_type.size())
+            .ok_or(CmsError::UnexpectedStructure("eContentType truncated"))?;
         // `eContent [0] EXPLICIT` is optional: absent means the
         // detached form (RFC 5652 sec.5.2).
         let econtent_der = match e_it.next() {
@@ -802,6 +844,7 @@ impl CmsHelpers {
             field_index = field_index.saturating_add(1);
         }
         let mut revocation_info = Vec::new();
+        let mut revocation_info_der = Vec::new();
         if remaining
             .get(field_index)
             .is_some_and(|field| field.tag() == <Asn1ContentImplicit1 as BerTag>::TAG)
@@ -809,7 +852,7 @@ impl CmsHelpers {
             let crls = remaining
                 .get(field_index)
                 .ok_or(CmsError::UnexpectedStructure("crls missing"))?;
-            revocation_info = Self::parse_revocation_info(crls.value())?;
+            (revocation_info, revocation_info_der) = Self::parse_revocation_info(crls.value())?;
             field_index = field_index.saturating_add(1);
         }
 
@@ -860,9 +903,11 @@ impl CmsHelpers {
 
         Ok(SignedData {
             econtent_type_oid,
+            econtent_type_der,
             econtent_der,
             certificates_der,
             revocation_info,
+            revocation_info_der,
             signer,
         })
     }
@@ -1016,11 +1061,14 @@ impl CmsHelpers {
         Ok(result)
     }
 
-    /// Collect the `RevocationInfoChoice` entries and reject any
-    /// alternative RFC 5652 sec.10.2.1 does not define, and an empty
-    /// set.
-    fn parse_revocation_info(crls: &[u8]) -> Result<Vec<RevocationInfoChoice<'_>>, CmsError> {
+    /// Collect the `RevocationInfoChoice` entries, each with its
+    /// complete TLV, and reject any alternative RFC 5652 sec.10.2.1
+    /// does not define, and an empty set.
+    fn parse_revocation_info(
+        crls: &[u8],
+    ) -> Result<(Vec<RevocationInfoChoice<'_>>, Vec<&[u8]>), CmsError> {
         let mut result = Vec::new();
+        let mut encoded = Vec::new();
         let mut cursor = 0_usize;
         while cursor < crls.len() {
             let tail = crls
@@ -1031,6 +1079,7 @@ impl CmsHelpers {
             let choice_der = crls
                 .get(cursor..end)
                 .ok_or(CmsError::UnexpectedStructure("crls entry truncated"))?;
+            encoded.push(choice_der);
             if choice.tag() == <Sequence as BerTag>::TAG {
                 result.push(RevocationInfoChoice::Crl(choice_der));
             } else if choice.tag() == <Asn1ContentImplicit1 as BerTag>::TAG {
@@ -1077,7 +1126,7 @@ impl CmsHelpers {
         if result.is_empty() {
             return Err(CmsError::UnexpectedStructure("empty crls field"));
         }
-        Ok(result)
+        Ok((result, encoded))
     }
 
     /// Require a constructed IMPLICIT field to contain complete TLVs.
@@ -1159,8 +1208,13 @@ impl CmsHelpers {
         let signature = sig_octet.value();
 
         let mut unsigned_attributes = Vec::new();
+        let mut archive_fields_der = signer_info.body;
         if let Some(unsigned_attrs) = children.next() {
             let unsigned_attrs = unsigned_attrs?;
+            archive_fields_der = signer_info
+                .body
+                .get(..signer_info.body.len().saturating_sub(unsigned_attrs.size()))
+                .ok_or(CmsError::UnexpectedStructure("unsignedAttrs truncated"))?;
             if unsigned_attrs.tag() != <Asn1ContentImplicit1 as BerTag>::TAG {
                 return Err(CmsError::UnexpectedStructure(
                     "signerInfo trailing field is not unsignedAttrs",
@@ -1216,6 +1270,7 @@ impl CmsHelpers {
             digest_algorithm,
             signature_scheme,
             signature,
+            archive_fields_der,
             signed,
             unsigned_attributes,
         })
@@ -1304,6 +1359,10 @@ impl CmsHelpers {
                 .ok_or(CmsError::UnexpectedStructure("attribute missing OID"))??
                 .expect::<Oid>()
                 .or(Err(CmsError::UnexpectedStructure("attribute type not OID")))?;
+            let type_der = attr
+                .value()
+                .get(..oid.size())
+                .ok_or(CmsError::UnexpectedStructure("attribute OID truncated"))?;
             let oid = crate::oid::Oid::new(oid.value()).or(Err(CmsError::UnexpectedStructure(
                 "attribute OID malformed",
             )))?;
@@ -1348,6 +1407,7 @@ impl CmsHelpers {
             }
             attributes.push(CmsAttribute {
                 oid,
+                type_der,
                 values_der: values.value(),
             });
         }
@@ -2540,6 +2600,48 @@ mod tests {
         assert_eq!(only.values_der, token.as_slice());
         sd.verify(certificate_spki(&certificate))
             .expect("unsigned attributes are outside the signature");
+    }
+
+    #[test]
+    fn the_archive_imprint_fields_are_read_as_encoded() {
+        let (key, certificate) = kit_signer(TestCurve::P256);
+        let plain = testkit::cms(&CmsParts::attached(&key, &certificate, KIT_CONTENT));
+        let plain = SignedData::parse(&plain).expect("parses");
+        let mut parts = CmsParts::attached(&key, &certificate, KIT_CONTENT);
+        parts.signature = Some(plain.signer().signature().to_vec());
+        parts.unsigned_attributes = vec![testkit::attribute(
+            known::SIGNATURE_TIME_STAMP_TOKEN,
+            &tlv(testkit::SEQUENCE, b"token"),
+        )];
+        let der = testkit::cms(&parts);
+        let stamped = SignedData::parse(&der).expect("parses");
+        assert_eq!(
+            stamped.signer().archive_fields_der(),
+            plain.signer().archive_fields_der(),
+            "the unsigned attributes are not among the fields"
+        );
+        assert!(
+            stamped
+                .signer()
+                .archive_fields_der()
+                .ends_with(&tlv(testkit::OCTET_STRING, plain.signer().signature()))
+        );
+        assert_eq!(
+            stamped.econtent_type_der(),
+            tlv(testkit::OBJECT_IDENTIFIER, known::DATA.as_bytes())
+        );
+        let attribute = stamped
+            .signer()
+            .unsigned_attributes()
+            .first()
+            .expect("one unsigned attribute");
+        assert_eq!(
+            attribute.type_der,
+            tlv(
+                testkit::OBJECT_IDENTIFIER,
+                known::SIGNATURE_TIME_STAMP_TOKEN.as_bytes()
+            )
+        );
     }
 
     #[test]

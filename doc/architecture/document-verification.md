@@ -60,7 +60,8 @@ gives the core's pinned roots, each granted without bounds.
 For each signature the report carries independent facts:
 
 - **Document intact.** Every byte the signature claims to cover digests
-  to the value the signature states. For PDFs this is the ByteRange,
+  to the value the signature states, and no later revision changes the
+  document (see Revisions after signing). For PDFs this is the ByteRange,
   whose hole must be exactly this dictionary's own Contents, whose
   trailing bytes must be zero padding, and which must end where a
   revision ends, just after an `%%EOF` marker and its end-of-line; a
@@ -153,15 +154,44 @@ For each signature the report carries independent facts:
   whose authority is not anchored is shown with its claimed time and
   marked unproven; it moves nothing and blocks nothing. Only the
   `signature-time-stamp` attribute counts as a CAdES signature
-  timestamp. Archive timestamps of either version, CAdES or XAdES, are
-  reported only: counted, never judged, never a proof of existence,
-  and never blocking a verdict.
-- **Timestamps.** Each signature timestamp is reported as anchored
+  timestamp. An anchored archive timestamp is a proof of existence too:
+  it covers the signature with its validation material (EN 319 122-1
+  clause 5.5.3, EN 319 132-1 clause 5.5.2), so when the signature
+  timestamp's authority can no longer be anchored, the archive time is
+  the proof the signer's chain and revocation are judged at. A CAdES
+  `archive-time-stamp-v3` attribute holds exactly one value, else it
+  is invalid as malformed, and first has its `ats-hash-index-v3` validated:
+  the token carries exactly one, under SHA-256, SHA-384 or SHA-512,
+  and every hash it lists must be that of a certificate in
+  `SignedData.certificates`, an entry of `SignedData.crls`, or an
+  unsigned attribute's type followed by one of its values; a hash
+  naming nothing present makes the token invalid. Its imprint is then
+  recomputed over the `eContentType`, the hash of the signed data under
+  the index's algorithm, the `SignerInfo` fields `version` through
+  `signature` and the index, each as encoded, and the token must
+  imprint under that same algorithm. The token's authority is judged
+  from the document's evidence and the certificates and revocation
+  values of the token's own `SignedData`; certificate and revocation
+  values in the token's unsigned attributes are not consulted. An XAdES `ArchiveTimeStamp` in
+  the 1.4.1 namespace imprints, under its canonicalisation (Canonical
+  XML 1.0 when it names none), the octets every reference digests, in
+  order, then `ds:SignedInfo`, `ds:SignatureValue`, `ds:KeyInfo`, each
+  unsigned signature property before it in document order (a
+  `TimeStampValidationData` among them) and each `ds:Object` but the
+  one holding the qualifying properties (clause 5.5.2.3). The
+  certificates and revocation values of a `TimeStampValidationData`
+  join the evidence. A CAdES `archive-time-stamp` of version 2, an
+  XAdES `ArchiveTimeStamp` in the 1.3.2 namespace, and one with
+  `xades:Include` children (time-stamped properties not sharing its
+  parent, clause 5.5.2.4) are reported unsupported.
+- **Timestamps.** Each signature timestamp, and each archive
+  timestamp with its form (CAdES v3, CAdES v2, XAdES), is reported as anchored
   (with the time it proves), claimed (verified under an authority that
   is not anchored, with the time it claims), invalid (with the reason
   the token failed), or unsupported (an XAdES timestamp whose imprint
-  needs a canonicalisation the verifier does not compute, or a
-  document timestamp whose range does not end a revision). An XAdES
+  needs a canonicalisation the verifier does not compute, an archive
+  timestamp of a form not judged, or a document timestamp whose range
+  does not end a revision). An XAdES
   timestamp that names no canonicalisation imprints the
   `ds:SignatureValue` under Canonical XML 1.0 (EN 319 132-1 clause
   4.5). An anchored or claimed token is reported with its signer and
@@ -200,8 +230,32 @@ For each signature the report carries independent facts:
   shell's closure for exactly those signatures and applies the answer
   it returns, and `SignatureReport::with_live_revocation` does the same
   for one report. Every other fact is fixed when the report is made.
-- **Covers whole document.** Whether bytes follow the signed revision.
-  Reported, not judged.
+- **Revisions after signing.** For a PDF signature, what the
+  revisions after the one it signs do to the document (ISO 32000-1
+  sec.12.8.2.2 and sec.12.8.2.4): none follow; later revisions are
+  harmless; or the document was changed after signing, with the kind
+  of change. The signed revision is indexed on its own and compared
+  with the newest view object by object, values compared by meaning
+  (dictionaries by key, spacing ignored). A later revision is harmless
+  when it only adds signature and document timestamp dictionaries,
+  signature fields and their widgets, new objects their appearance
+  streams draw from, the `/DSS` and what it reaches,
+  cross-reference and object streams, and the document information
+  dictionary and the catalog's `/Metadata` stream (signing tools
+  update both, and neither changes what is rendered), and rewrites the
+  catalog only in `/DSS`, `/AcroForm`, `/Perms`, `/Extensions` and
+  `/Metadata`, the interactive form
+  only by adding signature fields to `/Fields` and changing
+  `/SigFlags`, `/DA` or `/DR`, and a page only by adding signature
+  widgets to `/Annots`. Anything else is a change after signing, typed
+  as the page tree, a form field, an annotation, the catalog, or
+  content (a content stream, a resource, any other object), the first
+  of these when several change. A change after signing makes the
+  document not intact, since the document the signer saw is not the
+  one the reader sees; harmless later revisions keep it intact. A
+  range whose bytes do not index as a document of their own does not
+  end a revision. Outside a PDF the signature always covers the whole
+  document.
 
 An XAdES `CounterSignature` in a signature's unsigned properties
 holds a complete `ds:Signature` over that signature's
@@ -291,7 +345,7 @@ judged.
 | Id | Controller | Unsafe control action | Hazard | Constraint |
 |---|---|---|---|---|
 | UCA-105 | Verifier | Uses a timestamp's time as the validation time when the timestamp's authority is not anchored. | H-8 | CC-109: only an anchored token sets the validation time; others are reported unproven. |
-| UCA-106 | Verifier | Omits a signature or document timestamp it could not read from the report. | H-8 | CC-110: every signature dictionary, XAdES signature and counter-signature, signature timestamp and document timestamp found is reported. A signature the verifier cannot read is a row marked unsupported and blocks the document verdict; a counter-signature, of any verdict, is a row that decides nothing. A signature timestamp or document timestamp that fails verification, cannot be computed, or is not anchored is reported with what it was found to be and decides nothing: no proof of existence, no verdict. Archive timestamps are counted and reported, never judged and never blocking. |
+| UCA-106 | Verifier | Omits a signature or document timestamp it could not read from the report. | H-8 | CC-110: every signature dictionary, XAdES signature and counter-signature, signature timestamp and document timestamp found is reported. A signature the verifier cannot read is a row marked unsupported and blocks the document verdict; a counter-signature, of any verdict, is a row that decides nothing. A signature timestamp, archive timestamp or document timestamp that fails verification, cannot be computed, or is not anchored is reported with what it was found to be and decides nothing: no proof of existence, no verdict. |
 | UCA-107 | Verifier | Reports revocation Good from a live answer while the chain is not verified, or Revoked without the revocation time. | H-8 | CC-111: revocation is reported with its evidence time and judged against the proof of existence; a live answer never upgrades a chain the pool did not verify. |
 | UCA-108 | Verifier | Reports a document intact when a reference could not be resolved or canonicalised. | H-8 | CC-112: an unresolvable reference fails the fact. |
 | UCA-109 | Shell | Renders a verdict from anchors or lists that are stale without saying so. | H-8 | CC-113: the report carries the anchors' fetch time; the shell shows it. |

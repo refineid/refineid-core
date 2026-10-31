@@ -230,6 +230,107 @@ fn name_dn_attribute(dn_der: &[u8], oid_body: Oid<'_>) -> Option<String> {
     found
 }
 
+/// The attribute types RFC 4514 sec.3 names by a short string, with
+/// that string; any other type is written as its dotted object
+/// identifier.
+const RFC4514_SHORT_NAMES: [(&str, &str); 9] = [
+    ("2.5.4.3", "CN"),
+    ("2.5.4.7", "L"),
+    ("2.5.4.8", "ST"),
+    ("2.5.4.10", "O"),
+    ("2.5.4.11", "OU"),
+    ("2.5.4.6", "C"),
+    ("2.5.4.9", "STREET"),
+    ("0.9.2342.19200300.100.1.25", "DC"),
+    ("0.9.2342.19200300.100.1.1", "UID"),
+];
+
+/// Characters RFC 4514 sec.2.4 escapes with a backslash anywhere in a
+/// value.
+const RFC4514_ESCAPED: [char; 7] = ['"', '+', ',', ';', '<', '>', '\\'];
+
+/// The NUL character, which RFC 4514 sec.2.4 escapes as a hex pair.
+const NUL: char = '\0';
+
+/// The escaped spelling of [`NUL`].
+const ESCAPED_NUL: &str = "\\00";
+
+/// `value` escaped as RFC 4514 sec.2.4 writes an attribute value.
+fn rfc4514_escape(value: &str, out: &mut String) {
+    let last = value.chars().count().saturating_sub(1);
+    for (position, character) in value.chars().enumerate() {
+        let leading = position == 0 && (character == '#' || character == ' ');
+        let trailing = position == last && character == ' ';
+        if leading || trailing || RFC4514_ESCAPED.contains(&character) {
+            out.push('\\');
+            out.push(character);
+        } else if character == NUL {
+            out.push_str(ESCAPED_NUL);
+        } else {
+            out.push(character);
+        }
+    }
+}
+
+/// `dn_der` as RFC 4514 sec.2 writes a distinguished name: the RDNs in
+/// reverse order separated by commas, the attributes of one RDN by
+/// plus signs, each `type=value`: a short-named type with its string
+/// value escaped, a type written as its dotted identifier (or a value
+/// that is not a directory string) with `#` and the hexadecimal BER
+/// encoding of the value.
+fn rfc4514_name(dn_der: &[u8]) -> Option<String> {
+    let name = AnyRef::from_der(dn_der).ok()?;
+    if name.tag() != Tag::Sequence {
+        return None;
+    }
+    let mut rdns = SliceReader::new(name.value()).ok()?;
+    let mut rendered: Vec<String> = Vec::new();
+    while !rdns.is_finished() {
+        let rdn = AnyRef::from_der(rdns.tlv_bytes().ok()?).ok()?;
+        if rdn.tag() != Tag::Set {
+            return None;
+        }
+        let mut atvs = SliceReader::new(rdn.value()).ok()?;
+        let mut parts: Vec<String> = Vec::new();
+        while !atvs.is_finished() {
+            let atv = AnyRef::from_der(atvs.tlv_bytes().ok()?).ok()?;
+            if atv.tag() != Tag::Sequence {
+                return None;
+            }
+            let mut fields = SliceReader::new(atv.value()).ok()?;
+            let oid = AnyRef::from_der(fields.tlv_bytes().ok()?).ok()?;
+            let value_der = fields.tlv_bytes().ok()?;
+            let value = AnyRef::from_der(value_der).ok()?;
+            if oid.tag() != Tag::ObjectIdentifier {
+                return None;
+            }
+            let dotted = ::const_oid::ObjectIdentifier::from_bytes(oid.value())
+                .ok()?
+                .to_string();
+            let short = RFC4514_SHORT_NAMES
+                .iter()
+                .find(|(number, _)| *number == dotted)
+                .map(|(_, short)| *short);
+            let mut part = short.map_or_else(|| dotted.clone(), str::to_owned);
+            part.push('=');
+            // A type written as its dotted identifier takes its value as
+            // `#` and the hexadecimal BER encoding (sec.2.4); so does a
+            // short-named one whose value is not a directory string.
+            match short.and(decode_directory_string(value)) {
+                Some(text) => rfc4514_escape(&text, &mut part),
+                None => {
+                    part.push('#');
+                    part.push_str(&crate::hexcodec::Hex::encode(value_der));
+                }
+            }
+            parts.push(part);
+        }
+        rendered.push(parts.join("+"));
+    }
+    rendered.reverse();
+    Some(rendered.join(","))
+}
+
 /// Extension methods for [`Name`] to extract identity attributes.
 pub trait NameExt {
     /// `commonName` (X.520 `cn`, OID 2.5.4.3).
@@ -243,6 +344,9 @@ pub trait NameExt {
 
     /// PEUIN / SATU from the `serialNumber` DN attribute (OID 2.5.4.5).
     fn peuin(&self) -> Option<Peuin>;
+    /// The name as RFC 4514 sec.2 writes it; `None` when the encoding
+    /// is not a `Name`.
+    fn rfc4514(&self) -> Option<String>;
 }
 
 impl NameExt for Name<'_> {
@@ -269,6 +373,10 @@ impl NameExt for Name<'_> {
 
     fn peuin(&self) -> Option<Peuin> {
         Peuin::new(&name_dn_attribute(self.as_der(), known::SERIAL_NUMBER)?).ok()
+    }
+
+    fn rfc4514(&self) -> Option<String> {
+        rfc4514_name(self.as_der())
     }
 }
 

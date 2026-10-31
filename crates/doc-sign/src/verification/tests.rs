@@ -5,8 +5,8 @@
 
 use super::{
     AnchorRole, DocumentFailure, DocumentFile, DocumentReport, GrantedPeriod, Revocation,
-    SignatureReport, SignatureRow, SignerIdentity, TimestampReport, TrustAnchor, TrustAnchors,
-    UnsupportedProfile, UnsupportedSignature, exactly, verify,
+    SignatureOutcome, SignatureReport, SignatureRow, SignerIdentity, TimestampReport, TrustAnchor,
+    TrustAnchors, UnsupportedProfile, UnsupportedSignature, exactly, verify,
 };
 use crate::asic::DataObject;
 use crate::cades::{DigestAlgorithm, SignatureAlgorithm, SignerParameters, SigningTime};
@@ -26,6 +26,7 @@ use crate::testkit::{
 use crate::timestamp::TimestampError;
 use crate::validation::ValidationMaterial;
 use crate::verification::cades::CadesReadError;
+use crate::verification::xml::{Algorithm, Canonicalization, Comments, XmlDocument};
 use refineid_cms::oid::known;
 use refineid_cms::signed_data::HashAlgorithm;
 use refineid_cms::x509::{DateTime, OwnedCert};
@@ -114,8 +115,12 @@ const SUBFILTER_UNKNOWN: &[u8] = b"/ETSI.CAdES.detacheX";
 const GIVEN: &str = "Given Second";
 /// Surname of the person certificate.
 const SURNAME: &str = "Surname";
-/// Common name of the person certificate.
-const PERSON: &str = "Surname Given";
+/// Common name of the person certificate, in the shape a FINEID
+/// certificate carries: surname, given names and identifier, the
+/// surname in capitals.
+const PERSON: &str = "SURNAME Given Second 99999999X";
+/// An organisation name holding a character RFC 4514 escapes.
+const ORGANISATION: &str = "Synthetic, Ltd";
 /// A synthetic electronic identifier of the right shape.
 const IDENTIFIER: &str = "99999999X";
 /// Bytes that are not a document.
@@ -553,11 +558,44 @@ fn only(report: &DocumentReport) -> &SignatureReport {
 
 /// The report of a judged row.
 fn judged(row: &SignatureRow) -> &SignatureReport {
-    match row {
-        SignatureRow::Judged(report) => Some(report),
-        SignatureRow::Unsupported(_) => None,
+    match row.outcome() {
+        SignatureOutcome::Judged(report) => Some(report),
+        SignatureOutcome::Unsupported(_) => None,
     }
     .expect("the signature was judged")
+}
+
+/// What a timestamp report was found to be, without its authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Kind {
+    /// Anchored at this time.
+    Anchored(DateTime),
+    /// Claiming this time.
+    Claimed(DateTime),
+    /// Invalid for this reason.
+    Invalid(TimestampError),
+    /// Not judged.
+    Unsupported,
+}
+
+/// The kind of `report`.
+fn kind(report: &TimestampReport) -> Kind {
+    match report {
+        TimestampReport::Anchored { time, .. } => Kind::Anchored(*time),
+        TimestampReport::Claimed { time, .. } => Kind::Claimed(*time),
+        TimestampReport::Invalid(error) => Kind::Invalid(*error),
+        TimestampReport::Unsupported => Kind::Unsupported,
+    }
+}
+
+/// The kinds of `reports`.
+fn kinds(reports: &[TimestampReport]) -> Vec<Kind> {
+    reports.iter().map(kind).collect()
+}
+
+/// The DER of each certificate of `path`.
+fn ders(path: &[OwnedCert]) -> Vec<&[u8]> {
+    path.iter().map(OwnedCert::as_der).collect()
 }
 
 /// Change one byte inside the first signed span.
@@ -603,10 +641,7 @@ fn a_level_b_pdf_is_intact_valid_and_anchored_without_proof_of_existence() {
     assert!(signature.covers_whole_document());
     assert_eq!(signature.revocation(), Revocation::Unavailable);
     assert_eq!(signature.signer().name(), DIRECT_SIGNER);
-    assert_eq!(
-        signature.issuer_certificate().map(OwnedCert::as_der),
-        Some(world.root.as_slice())
-    );
+    assert_eq!(ders(signature.chain()), [world.root.as_slice()]);
     assert!(signature.is_valid());
     assert!(report.document_timestamps().is_empty());
     assert_eq!(report.anchors_fetched_at(), None);
@@ -628,8 +663,16 @@ fn a_signature_timestamp_proves_existence() {
     assert!(signature.signature_valid());
     assert!(signature.chain_verified());
     assert_eq!(
-        signature.timestamps(),
-        [TimestampReport::Anchored { time: day(STAMPED) }]
+        kinds(signature.timestamps()),
+        [Kind::Anchored(day(STAMPED))]
+    );
+    let [stamp] = exactly(signature.timestamps(), "one timestamp");
+    let authority = stamp.authority().expect("a verified token");
+    assert_eq!(authority.signer().as_der(), world.tsa.as_slice());
+    assert_eq!(
+        ders(authority.chain()),
+        [world.tsa_root.as_slice()],
+        "the token signer's path ends in the time-stamping anchor"
     );
     assert_eq!(signature.proof_of_existence(), Some(day(STAMPED)));
     assert_eq!(signature.validation_time(), day(STAMPED));
@@ -647,8 +690,8 @@ fn level_lt_chains_through_the_store_and_reads_a_later_ocsp_answer() {
     assert!(signature.chain_verified());
     assert!(!signature.covers_whole_document());
     assert_eq!(
-        signature.issuer_certificate().map(OwnedCert::as_der),
-        Some(world.intermediate.as_slice())
+        ders(signature.chain()),
+        [world.intermediate.as_slice(), world.root.as_slice()]
     );
     assert_eq!(
         signature.revocation(),
@@ -719,7 +762,7 @@ fn an_untrusted_root_leaves_the_chain_unverified_but_names_the_issuer() {
     assert!(signature.signature_valid());
     assert!(!signature.chain_verified());
     assert_eq!(
-        signature.issuer_certificate().map(OwnedCert::as_der),
+        signature.chain().first().map(OwnedCert::as_der),
         Some(world.intermediate.as_slice())
     );
     assert!(!report.is_valid());
@@ -763,10 +806,7 @@ fn a_document_timestamp_covering_the_signature_proves_existence() {
     assert_eq!(signature.proof_of_existence(), Some(day(STAMPED)));
     assert!(!signature.covers_whole_document());
     let [stamp] = exactly(report.document_timestamps(), "one document timestamp");
-    assert_eq!(
-        stamp.timestamp(),
-        TimestampReport::Anchored { time: day(STAMPED) }
-    );
+    assert_eq!(kind(stamp.timestamp()), Kind::Anchored(day(STAMPED)));
     assert_eq!(stamp.covers(), length);
     assert!(report.is_valid());
 }
@@ -791,7 +831,7 @@ fn a_document_timestamp_over_other_bytes_is_invalid_and_proves_nothing() {
     let [stamp] = exactly(report.document_timestamps(), "one document timestamp");
     assert_eq!(
         stamp.timestamp(),
-        TimestampReport::Invalid(TimestampError::ImprintMismatch)
+        &TimestampReport::Invalid(TimestampError::ImprintMismatch)
     );
     assert!(only(&report).is_valid());
     assert!(
@@ -984,8 +1024,8 @@ fn an_unsupported_signature_is_its_own_row_and_blocks_the_document() {
     let [first, second] = exactly(report.rows(), "two signatures");
     assert!(first.is_valid());
     assert!(matches!(
-        second,
-        SignatureRow::Unsupported(UnsupportedSignature::PdfSubFilter)
+        second.outcome(),
+        SignatureOutcome::Unsupported(UnsupportedSignature::PdfSubFilter)
     ));
     assert!(!report.is_valid());
 }
@@ -1002,9 +1042,13 @@ fn a_self_made_timestamp_is_unproven_and_the_signature_is_judged_at_now() {
         .verify(world.pdf(Signer::Direct, Stamp::SelfMade, &material))
         .expect("report");
     let signature = only(&report);
-    assert_eq!(
-        signature.timestamps(),
-        [TimestampReport::Claimed { time: day(STAMPED) }]
+    assert_eq!(kinds(signature.timestamps()), [Kind::Claimed(day(STAMPED))]);
+    let [stamp] = exactly(signature.timestamps(), "one timestamp");
+    let authority = stamp.authority().expect("a verified token");
+    assert_eq!(authority.signer().as_der(), world.rogue_tsa.as_slice());
+    assert!(
+        authority.chain().is_empty(),
+        "the self-made root is not in the evidence"
     );
     assert_eq!(signature.proof_of_existence(), None);
     assert_eq!(signature.validation_time(), day(NOW));
@@ -1042,8 +1086,8 @@ fn a_timestamp_from_a_signing_anchor_is_not_anchored() {
     ]);
     let report = verify_under(pdf, &issuing_only).expect("report");
     assert_eq!(
-        only(&report).timestamps(),
-        [TimestampReport::Claimed { time: day(STAMPED) }]
+        kinds(only(&report).timestamps()),
+        [Kind::Claimed(day(STAMPED))]
     );
 }
 
@@ -1078,7 +1122,7 @@ fn a_live_answer_fills_only_an_unavailable_status_on_a_verified_chain() {
 }
 
 #[test]
-fn the_signer_identity_prefers_given_names_and_surname() {
+fn the_signer_name_is_the_common_name_verbatim() {
     let key = TestKey::derive(TestCurve::P256, b"person");
     let person = certificate_named(
         &spec(PERSON_SERIAL, PERSON, PERSON, Vec::new()),
@@ -1092,7 +1136,11 @@ fn the_signer_identity_prefers_given_names_and_surname() {
         &key,
     );
     let identity = SignerIdentity::of(&OwnedCert::from_der(&person).expect("parses"));
-    assert_eq!(identity.name(), format!("{GIVEN} {SURNAME}"));
+    assert_eq!(
+        identity.name(),
+        PERSON,
+        "neither recomposed nor case-changed"
+    );
     assert_eq!(
         identity.identifier().map(|peuin| peuin.as_str()),
         Some(IDENTIFIER)
@@ -1106,7 +1154,41 @@ fn the_signer_identity_prefers_given_names_and_surname() {
     let identity = SignerIdentity::of(&OwnedCert::from_der(&plain).expect("parses"));
     assert_eq!(identity.name(), DIRECT_SIGNER);
     assert!(identity.identifier().is_none());
+
+    // Without a commonName, the whole subject as RFC 4514 writes it:
+    // the last RDN first, a comma in a short-named value escaped, and a
+    // type without a short name as its dotted identifier with `#` and
+    // the hexadecimal encoding of its value.
+    let unnamed = certificate_named(
+        &spec(PERSON_SERIAL, PERSON, PERSON, Vec::new()),
+        &name_of(&[
+            (known::COUNTRY_NAME, PRINTABLE_STRING, "FI"),
+            (ORGANIZATION_NAME, UTF8_STRING, ORGANISATION),
+            (known::SURNAME, UTF8_STRING, SURNAME),
+            (known::SERIAL_NUMBER, PRINTABLE_STRING, IDENTIFIER),
+        ]),
+        &key,
+        &key,
+    );
+    let identity = SignerIdentity::of(&OwnedCert::from_der(&unnamed).expect("parses"));
+    assert_eq!(
+        identity.name(),
+        format!(
+            "2.5.4.5=#{},2.5.4.4=#{},O=Synthetic\\, Ltd,C=FI",
+            crate::hexcodec::Hex::encode(&tlv(PRINTABLE_STRING, IDENTIFIER.as_bytes())),
+            crate::hexcodec::Hex::encode(&tlv(UTF8_STRING, SURNAME.as_bytes())),
+        )
+    );
+    assert_eq!(
+        identity.identifier().map(|peuin| peuin.as_str()),
+        Some(IDENTIFIER)
+    );
 }
+
+/// `organizationName` (X.520, RFC 4519 sec.2.19).
+const ORGANIZATION_NAME: refineid_cms::oid::Oid<'static> = refineid_cms::oid::Oid::const_new(
+    ::const_oid::ObjectIdentifier::new_unwrap("2.5.4.10").as_bytes(),
+);
 
 /// An `AlgorithmIdentifier` of `oid`, with NULL parameters when `null`.
 fn algorithm(oid: refineid_cms::oid::Oid<'_>, null: bool) -> Vec<u8> {
@@ -1157,8 +1239,8 @@ fn a_disagreeing_signature_algorithm_is_refused() {
         .expect("report");
     let [row] = exactly(report.rows(), "one signature");
     assert!(matches!(
-        row,
-        SignatureRow::Unsupported(UnsupportedSignature::Cms(CadesReadError::Cms(
+        row.outcome(),
+        SignatureOutcome::Unsupported(UnsupportedSignature::Cms(CadesReadError::Cms(
             CmsError::AlgorithmMismatch
         )))
     ));
@@ -1185,8 +1267,8 @@ fn an_ecdsa_identifier_with_null_parameters_is_refused() {
         .expect("report");
     let [row] = exactly(report.rows(), "one signature");
     assert!(matches!(
-        row,
-        SignatureRow::Unsupported(UnsupportedSignature::Cms(CadesReadError::Cms(
+        row.outcome(),
+        SignatureOutcome::Unsupported(UnsupportedSignature::Cms(CadesReadError::Cms(
             CmsError::AlgorithmParameters
         )))
     ));
@@ -1220,8 +1302,8 @@ fn a_sha_512_imprint_verifies_and_a_wrong_length_imprint_is_refused() {
     let report = world.verify(sha512).expect("report");
     let signature = only(&report);
     assert_eq!(
-        signature.timestamps(),
-        [TimestampReport::Anchored { time: day(STAMPED) }]
+        kinds(signature.timestamps()),
+        [Kind::Anchored(day(STAMPED))]
     );
     assert_eq!(signature.proof_of_existence(), Some(day(STAMPED)));
     assert!(signature.is_valid());
@@ -1376,8 +1458,8 @@ fn the_content_type_attribute_must_name_data() {
     let report = world.verify(pdf).expect("report");
     let [row] = exactly(report.rows(), "one signature");
     assert!(matches!(
-        row,
-        SignatureRow::Unsupported(UnsupportedSignature::Cms(CadesReadError::Cms(
+        row.outcome(),
+        SignatureOutcome::Unsupported(UnsupportedSignature::Cms(CadesReadError::Cms(
             CmsError::UnexpectedStructure(_)
         )))
     ));
@@ -1442,8 +1524,8 @@ fn a_token_s_own_revocation_evidence_is_judged() {
 
     let report = world.verify(stamped_pdf(&[])).expect("report");
     assert_eq!(
-        only(&report).timestamps(),
-        [TimestampReport::Anchored { time: day(STAMPED) }]
+        kinds(only(&report).timestamps()),
+        [Kind::Anchored(day(STAMPED))]
     );
     let report = world
         .verify(stamped_pdf(&[crate::testkit::ocsp_revocation_info(
@@ -1451,7 +1533,379 @@ fn a_token_s_own_revocation_evidence_is_judged() {
         )]))
         .expect("report");
     assert_eq!(
-        only(&report).timestamps(),
-        [TimestampReport::Claimed { time: day(STAMPED) }]
+        kinds(only(&report).timestamps()),
+        [Kind::Claimed(day(STAMPED))]
     );
+}
+
+/// The note as the one data object of a container.
+fn note_objects() -> Vec<DataObject> {
+    vec![DataObject {
+        name: NOTE_NAME.to_owned(),
+        mime_type: NOTE_TYPE.to_owned(),
+        content: NOTE.to_vec(),
+    }]
+}
+
+/// The ASiC-E container holding the note and `signature_xml`.
+fn xades_container_of(signature_xml: &str) -> Vec<u8> {
+    crate::asic::xades_container(&note_objects(), signature_xml.as_bytes()).expect("fits")
+}
+
+/// The text of `document` from the first `open` through the next
+/// `close`.
+fn between<'a>(document: &'a str, open: &str, close: &str) -> &'a str {
+    let start = document.find(open).expect("element");
+    let end = document
+        .get(start..)
+        .and_then(|rest| rest.find(close))
+        .expect("end tag")
+        + start
+        + close.len();
+    document.get(start..end).expect("in range")
+}
+
+/// The character data of the first `ds:SignatureValue` of `document`.
+fn signature_value_text(document: &str) -> &str {
+    let element = between(document, "<ds:SignatureValue", "</ds:SignatureValue>");
+    let open_end = element.find('>').expect("start tag ends") + 1;
+    element
+        .get(open_end..element.len() - "</ds:SignatureValue>".len())
+        .expect("in range")
+}
+
+/// The element of `document` whose `Id` is `id`, under `method`.
+fn canonical_by_id(document: &str, id: &str, method: &Canonicalization) -> Vec<u8> {
+    XmlDocument::parse(document.as_bytes().to_vec())
+        .expect("parses")
+        .elements()
+        .find(|element| element.attribute("Id") == Some(id))
+        .expect("element with the Id")
+        .canonicalize(method)
+}
+
+/// The base64 SHA-256 of `octets`, as a `ds:DigestValue` spells it.
+fn digest_text(octets: &[u8]) -> String {
+    crate::base64::encode(&DigestAlgorithm::Sha256.digest(octets))
+}
+
+/// `document` with the `ds:SignatureValue` of its signature `id`
+/// replaced by `key`'s signature over that signature's `ds:SignedInfo`
+/// under `method`.
+fn resigned(document: &str, id: &str, method: &Canonicalization, key: &TestKey) -> String {
+    let parsed = XmlDocument::parse(document.as_bytes().to_vec()).expect("parses");
+    let signature = parsed
+        .elements()
+        .find(|element| element.attribute("Id") == Some(id))
+        .expect("the signature");
+    let signed_info = signature
+        .child(crate::xades::NAMESPACE_DSIG, "SignedInfo")
+        .expect("SignedInfo")
+        .canonicalize(method);
+    let value_id = format!("{id}-SIGVAL");
+    let value = parsed
+        .elements()
+        .find(|element| element.attribute("Id") == Some(value_id.as_str()))
+        .expect("the SignatureValue")
+        .text();
+    document.replacen(
+        &value,
+        &crate::base64::encode(&key.sign_raw(&signed_info)),
+        1,
+    )
+}
+
+/// The identifier of the writer's one signature.
+const OUTER_ID: &str = "SIG-1";
+/// The identifier of the writer's `SignedProperties`.
+const OUTER_PROPERTIES_ID: &str = "SIG-1-SIGNEDPROPS";
+/// The identifier of the writer's `SignatureValue`.
+const OUTER_VALUE_ID: &str = "SIG-1-SIGVAL";
+/// The identifier of the counter-signature.
+const COUNTER_ID: &str = "CS-1";
+/// Stands where the counter-signature's properties digest goes.
+const PROPERTIES_DIGEST_PLACEHOLDER: &str = "properties-digest-placeholder";
+
+impl World {
+    /// The writer's `XAdES` signature file over the note, signed by the
+    /// direct signer.
+    fn xades_note(&self) -> String {
+        let owned = OwnedCert::from_der(&self.direct_signer).expect("signer parses");
+        let certificate = owned.view();
+        let parameters = SignerParameters {
+            certificate: &certificate,
+            digest_algorithm: DigestAlgorithm::Sha256,
+            signature_algorithm: SignatureAlgorithm::EcdsaSha256,
+            signing_time: Some(SIGNING_TIME),
+        };
+        let plan = crate::xades::plan(&note_objects(), &parameters).expect("plans");
+        let value = self.signer_key.sign_raw(plan.signed_info());
+        String::from_utf8(plan.finish(&value, &[], &ValidationMaterial::default())).expect("utf-8")
+    }
+
+    /// The writer's signature file with `SignedInfo` and the
+    /// `SignedProperties` reference under the canonicalisation `uri`
+    /// names, as another producer writes them: the properties digest
+    /// recomputed and the signature value re-signed under `algorithm`.
+    fn recanonicalised(&self, uri: &str, algorithm: Algorithm) -> String {
+        let document = self.xades_note();
+        let method = Canonicalization {
+            algorithm,
+            comments: Comments::Omitted,
+        };
+        let exclusive = Canonicalization::exclusive(Comments::Omitted);
+        let renamed = document.replace(
+            &format!("Algorithm=\"{}\"", crate::xades::CANONICALIZATION_EXCLUSIVE),
+            &format!("Algorithm=\"{uri}\""),
+        );
+        assert!(renamed != document);
+        let redigested = renamed.replacen(
+            &digest_text(&canonical_by_id(&document, OUTER_PROPERTIES_ID, &exclusive)),
+            &digest_text(&canonical_by_id(&renamed, OUTER_PROPERTIES_ID, &method)),
+            1,
+        );
+        resigned(&redigested, OUTER_ID, &method, &self.signer_key)
+    }
+
+    /// `document` with a counter-signature by the RSA signer whose
+    /// `CountersignedSignature` reference digests `countersigned`,
+    /// carrying a `SigningCertificateV2` when `bound`.
+    fn counter_signed(&self, document: &str, countersigned: &[u8], bound: bool) -> String {
+        use crate::xades::{
+            CANONICALIZATION_EXCLUSIVE, DIGEST_METHOD_SHA256, NAMESPACE_DSIG,
+            SIGNATURE_METHOD_RSA_SHA256, TYPE_SIGNED_PROPERTIES,
+        };
+        let binding = if bound {
+            format!(
+                "<xades:SigningCertificateV2><xades:Cert><xades:CertDigest>\
+                 <ds:DigestMethod Algorithm=\"{DIGEST_METHOD_SHA256}\"/>\
+                 <ds:DigestValue>{}</ds:DigestValue>\
+                 </xades:CertDigest></xades:Cert></xades:SigningCertificateV2>",
+                digest_text(&self.rsa_signer)
+            )
+        } else {
+            String::new()
+        };
+        let transform = format!(
+            "<ds:Transforms><ds:Transform Algorithm=\"{CANONICALIZATION_EXCLUSIVE}\"/></ds:Transforms>\
+             <ds:DigestMethod Algorithm=\"{DIGEST_METHOD_SHA256}\"/>"
+        );
+        let counter = format!(
+            "<xades:UnsignedProperties><xades:UnsignedSignatureProperties>\
+             <xades:CounterSignature>\
+             <ds:Signature xmlns:ds=\"{NAMESPACE_DSIG}\" Id=\"{COUNTER_ID}\">\n\
+             <ds:SignedInfo>\n\
+             <ds:CanonicalizationMethod Algorithm=\"{CANONICALIZATION_EXCLUSIVE}\"/>\n\
+             <ds:SignatureMethod Algorithm=\"{SIGNATURE_METHOD_RSA_SHA256}\"/>\n\
+             <ds:Reference Type=\"{TYPE_COUNTERSIGNED}\" URI=\"#{OUTER_VALUE_ID}\">{transform}\
+             <ds:DigestValue>{countersigned_digest}</ds:DigestValue></ds:Reference>\n\
+             <ds:Reference Type=\"{TYPE_SIGNED_PROPERTIES}\" URI=\"#{COUNTER_ID}-SIGNEDPROPS\">{transform}\
+             <ds:DigestValue>{PROPERTIES_DIGEST_PLACEHOLDER}</ds:DigestValue></ds:Reference>\n\
+             </ds:SignedInfo>\n\
+             <ds:SignatureValue Id=\"{COUNTER_ID}-SIGVAL\">unsigned</ds:SignatureValue>\n\
+             <ds:KeyInfo><ds:X509Data><ds:X509Certificate>{certificate}</ds:X509Certificate>\
+             </ds:X509Data></ds:KeyInfo>\n\
+             <ds:Object><xades:QualifyingProperties Target=\"#{COUNTER_ID}\">\
+             <xades:SignedProperties Id=\"{COUNTER_ID}-SIGNEDPROPS\">\
+             <xades:SignedSignatureProperties>\
+             <xades:SigningTime>2026-04-08T12:00:00Z</xades:SigningTime>{binding}\
+             </xades:SignedSignatureProperties></xades:SignedProperties>\
+             </xades:QualifyingProperties></ds:Object>\n\
+             </ds:Signature>\
+             </xades:CounterSignature>\
+             </xades:UnsignedSignatureProperties></xades:UnsignedProperties>\n\
+             </xades:QualifyingProperties>",
+            TYPE_COUNTERSIGNED = super::xades::TYPE_COUNTERSIGNED_SIGNATURE,
+            countersigned_digest = digest_text(countersigned),
+            certificate = crate::base64::encode(&self.rsa_signer),
+        );
+        let placed = document.replacen("</xades:QualifyingProperties>", &counter, 1);
+        let exclusive = Canonicalization::exclusive(Comments::Omitted);
+        let properties_id = format!("{COUNTER_ID}-SIGNEDPROPS");
+        let digested = placed.replacen(
+            PROPERTIES_DIGEST_PLACEHOLDER,
+            &digest_text(&canonical_by_id(&placed, &properties_id, &exclusive)),
+            1,
+        );
+        resigned(&digested, COUNTER_ID, &exclusive, &self.rsa_key)
+    }
+}
+
+/// The two rows of `report`: a signature and its counter-signature.
+fn xades_rows(report: &DocumentReport) -> [&SignatureRow; 2] {
+    let [outer, counter] = exactly(report.rows(), "a signature and its counter-signature");
+    [outer, counter]
+}
+
+#[test]
+fn inclusive_canonical_xml_signed_info_and_properties_verify() {
+    let world = World::new();
+    for (uri, algorithm) in [
+        (
+            super::xades::CANONICALIZATION_INCLUSIVE_10,
+            Algorithm::Canonical10,
+        ),
+        (
+            super::xades::CANONICALIZATION_INCLUSIVE_11,
+            Algorithm::Canonical11,
+        ),
+    ] {
+        let document = world.recanonicalised(uri, algorithm);
+        assert!(document.contains(uri));
+        let report = world.verify(xades_container_of(&document)).expect("report");
+        let signature = only(&report);
+        assert!(signature.document_intact(), "{uri}");
+        assert!(signature.signature_valid(), "{uri}");
+        assert!(signature.chain_verified(), "{uri}");
+        assert!(report.is_valid(), "{uri}");
+
+        // Re-signed under exclusive canonicalisation, the value no
+        // longer verifies: the inclusive form differs.
+        let exclusive = resigned(
+            &document,
+            OUTER_ID,
+            &Canonicalization::exclusive(Comments::Omitted),
+            &world.signer_key,
+        );
+        let report = world
+            .verify(xades_container_of(&exclusive))
+            .expect("report");
+        assert!(!only(&report).signature_valid(), "{uri}");
+    }
+}
+
+/// Another producer's spelling of an inclusive `SignedInfo`: the
+/// redundant `ds` declaration gone (it is still in scope), empty
+/// elements self-closed, single quotes and whitespace inside tags.
+#[test]
+fn a_respelled_inclusive_signed_info_still_verifies() {
+    let world = World::new();
+    let document = world.recanonicalised(
+        super::xades::CANONICALIZATION_INCLUSIVE_10,
+        Algorithm::Canonical10,
+    );
+    let signed_info = between(&document, "<ds:SignedInfo", "</ds:SignedInfo>");
+    let mut respelled = signed_info
+        .replacen(
+            &format!(" xmlns:ds=\"{}\"", crate::xades::NAMESPACE_DSIG),
+            "",
+            1,
+        )
+        .replace("<ds:SignedInfo>", "<ds:SignedInfo >");
+    for element in [
+        "CanonicalizationMethod",
+        "SignatureMethod",
+        "DigestMethod",
+        "Transform",
+    ] {
+        respelled = respelled.replace(&format!("></ds:{element}>"), " />");
+    }
+    respelled = respelled.replace(
+        &format!("URI=\"{NOTE_NAME}\""),
+        &format!("URI = '{NOTE_NAME}'"),
+    );
+    assert!(respelled != signed_info);
+    let respelled = document.replacen(signed_info, &respelled, 1);
+    let report = world
+        .verify(xades_container_of(&respelled))
+        .expect("report");
+    let signature = only(&report);
+    assert!(signature.document_intact());
+    assert!(signature.signature_valid());
+    assert!(report.is_valid());
+}
+
+#[test]
+fn a_counter_signature_is_its_own_row_over_the_outer_signature_value() {
+    let world = World::new();
+    let document = world.xades_note();
+    let exclusive = Canonicalization::exclusive(Comments::Omitted);
+    let over = canonical_by_id(&document, OUTER_VALUE_ID, &exclusive);
+    let report = world
+        .verify(xades_container_of(
+            &world.counter_signed(&document, &over, true),
+        ))
+        .expect("report");
+    let [outer, counter] = xades_rows(&report);
+    assert_eq!(outer.counter_signs(), None);
+    assert_eq!(counter.counter_signs(), Some(0));
+    assert!(outer.is_valid());
+    let counter = judged(counter);
+    assert_eq!(counter.signer().name(), RSA_SIGNER);
+    assert!(counter.document_intact());
+    assert!(counter.signature_valid());
+    assert!(counter.chain_verified());
+    assert!(counter.is_valid());
+    assert!(report.is_valid());
+}
+
+#[test]
+fn a_counter_signature_over_another_signature_value_is_not_valid() {
+    let world = World::new();
+    let document = world.xades_note();
+    let exclusive = Canonicalization::exclusive(Comments::Omitted);
+    let real =
+        String::from_utf8(canonical_by_id(&document, OUTER_VALUE_ID, &exclusive)).expect("utf-8");
+    let value = signature_value_text(&document);
+    let mut octets = crate::base64::decode_wrapped(value).expect("base64");
+    let last = octets.last_mut().expect("a signature value");
+    *last = last.wrapping_add(1);
+    let tampered = real.replacen(value, &crate::base64::encode(&octets), 1);
+    assert!(tampered != real);
+    let report = world
+        .verify(xades_container_of(&world.counter_signed(
+            &document,
+            tampered.as_bytes(),
+            true,
+        )))
+        .expect("report");
+    let [outer, counter] = xades_rows(&report);
+    assert!(outer.is_valid(), "the outer verdict does not change");
+    let counter = judged(counter);
+    assert!(!counter.document_intact());
+    assert!(counter.signature_valid());
+    assert!(!counter.is_valid());
+    assert!(!report.is_valid());
+}
+
+#[test]
+fn a_counter_signature_without_a_signing_certificate_is_not_valid() {
+    let world = World::new();
+    let document = world.xades_note();
+    let exclusive = Canonicalization::exclusive(Comments::Omitted);
+    let over = canonical_by_id(&document, OUTER_VALUE_ID, &exclusive);
+    let report = world
+        .verify(xades_container_of(
+            &world.counter_signed(&document, &over, false),
+        ))
+        .expect("report");
+    let [outer, counter] = xades_rows(&report);
+    assert!(outer.is_valid());
+    assert_eq!(counter.counter_signs(), Some(0));
+    let counter = judged(counter);
+    assert!(counter.document_intact());
+    assert!(!counter.signature_valid());
+    assert!(!report.is_valid());
+}
+
+#[test]
+fn an_unreadable_counter_signature_is_an_unsupported_row() {
+    let world = World::new();
+    let document = world.xades_note().replacen(
+        "</xades:QualifyingProperties>",
+        "<xades:UnsignedProperties><xades:UnsignedSignatureProperties>\
+         <xades:CounterSignature></xades:CounterSignature>\
+         </xades:UnsignedSignatureProperties></xades:UnsignedProperties>\n\
+         </xades:QualifyingProperties>",
+        1,
+    );
+    let report = world.verify(xades_container_of(&document)).expect("report");
+    let [outer, counter] = xades_rows(&report);
+    assert!(outer.is_valid());
+    assert_eq!(counter.counter_signs(), Some(0));
+    assert!(matches!(
+        counter.outcome(),
+        SignatureOutcome::Unsupported(UnsupportedSignature::XadesMalformed(_))
+    ));
+    assert!(!report.is_valid());
 }

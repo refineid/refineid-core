@@ -48,9 +48,12 @@ mod stamp;
 mod xref_stream;
 
 pub use appearance::VisibleSignature;
+#[cfg(test)]
+use index::find_first;
 use index::{
-    PdfDictionary, PdfIndex, PdfObjectReference, PdfValueParser, complete_object_reference,
-    dictionary_integer, dictionary_reference, find_first, find_last, validation_references,
+    ARRAY_CLOSE, ARRAY_OPEN, PdfDictionary, PdfIndex, PdfObjectReference, PdfValueParser,
+    complete_object_reference, dictionary_integer, dictionary_reference, dictionary_value,
+    validation_references,
 };
 pub use stamp::StampLanguage;
 use std::collections::HashSet;
@@ -475,7 +478,7 @@ fn prepare_kind(
                 .object_body(array_number)
                 .ok_or(PdfError::MissingObject(array_number))?;
             let entry = format!("{field_number} 0 R");
-            let body = append_to_array(&array, 0, &entry);
+            let body = append_to_array_object(&array, &entry);
             offsets.push((
                 PdfObjectReference::fresh(array_number),
                 update_start.saturating_add(update.len()),
@@ -817,27 +820,24 @@ fn push_xref_and_trailer(
 fn trailer_carry_forward(trailer: &[u8]) -> String {
     let mut carried = String::new();
 
-    // `/ID` is an array written inline.
-    if let Some(at) = find_first(trailer, b"/ID") {
-        let rest = &trailer[at.saturating_add(b"/ID".len())..];
-        if let Some(open) = find_first(rest, b"[")
-            && let Some(close) = find_first(&rest[open..], b"]")
-        {
-            let array = &rest[open..=open.saturating_add(close)];
-            let _ignored = core::fmt::Write::write_fmt(
-                &mut carried,
-                format_args!(" /ID {}", String::from_utf8_lossy(array)),
-            );
-        }
+    // `/ID` is an array written inline (ISO 32000-1 sec.14.4); its value
+    // is carried as written.
+    if let Some(id) = dictionary_value(trailer, b"ID")
+        && id.starts_with(ARRAY_OPEN)
+    {
+        let _ignored = core::fmt::Write::write_fmt(
+            &mut carried,
+            format_args!(" /ID {}", String::from_utf8_lossy(id)),
+        );
     }
 
     // `/Info` is a reference to the document information dictionary,
     // which holds the title, author and dates. Dropping it does not
     // break the file, so nothing complains -- the signed document just
     // arrives with no title, and a reader shows the filename instead.
-    if let Some(number) = indirect_value(trailer, b"/Info") {
+    if let Some(info) = dictionary_reference(trailer, b"Info") {
         let _ignored =
-            core::fmt::Write::write_fmt(&mut carried, format_args!(" /Info {number} 0 R"));
+            core::fmt::Write::write_fmt(&mut carried, format_args!(" /Info {}", info.rendered()));
     }
     carried
 }
@@ -1174,49 +1174,78 @@ fn plan_field_list(index: &PdfIndex<'_>, catalog: &[u8], field_number: u32) -> F
 
     // `/AcroForm` held indirectly: the list is in that object, or in an
     // array the object points at.
-    if let Some(acroform_number) = indirect_value(catalog, b"/AcroForm")
-        && let Some(acroform) = index.object_body(acroform_number)
+    if let Some(acroform_reference) = dictionary_reference(catalog, b"AcroForm")
+        && let Some(acroform) = index.object_body(acroform_reference.number)
     {
-        if let Some(fields_number) = indirect_value(&acroform, b"/Fields")
-            && let Some(fields) = index.object_body(fields_number)
-        {
-            return FieldListTarget::Object(fields_number, append_to_array(&fields, 0, &entry));
-        }
-        if let Some(at) = find_first(&acroform, b"/Fields") {
-            return FieldListTarget::Object(
-                acroform_number,
-                append_to_array(&acroform, at, &entry),
-            );
-        }
-        // An `/AcroForm` with no `/Fields` at all: give it one.
-        return FieldListTarget::Object(
-            acroform_number,
-            insert_into_dictionary(&acroform, &format!("/Fields [{entry}]"), b"/Fields"),
-        );
+        return match field_list_edit(index, &acroform, &entry) {
+            FieldListEdit::Array(number, body) => FieldListTarget::Object(number, body),
+            FieldListEdit::Form(body) => FieldListTarget::Object(acroform_reference.number, body),
+        };
     }
 
-    // Held inline, or absent entirely.
-    find_first(catalog, b"/Fields").map_or_else(
-        || {
-            let acroform = format!("/AcroForm << /Fields [{entry}] /SigFlags 3 >>");
-            FieldListTarget::Catalog(insert_into_dictionary(catalog, &acroform, b"/AcroForm"))
-        },
-        |at| FieldListTarget::Catalog(append_to_array(catalog, at, &entry)),
-    )
+    // Held inline: edit the dictionary in place inside the catalog.
+    if let Some(span) = entry_span(catalog, b"AcroForm")
+        && catalog
+            .get(span.clone())
+            .is_some_and(|value| value.starts_with(index::DICTIONARY_OPEN))
+    {
+        let inline = catalog.get(span.clone()).unwrap_or_default();
+        return match field_list_edit(index, inline, &entry) {
+            FieldListEdit::Array(number, body) => FieldListTarget::Object(number, body),
+            FieldListEdit::Form(body) => FieldListTarget::Catalog(splice(catalog, span, &body)),
+        };
+    }
+
+    // Absent: give the catalog a form.
+    let acroform = format!("/AcroForm << /Fields [{entry}] /SigFlags 3 >>");
+    FieldListTarget::Catalog(insert_into_dictionary(catalog, &acroform, b"AcroForm"))
 }
 
-/// The object number of an indirect `key N 0 R`, if that is its shape.
-///
-/// Returns `None` when the key is absent or its value is written
-/// inline, which the caller has to tell apart.
-fn indirect_value(dictionary: &[u8], key: &[u8]) -> Option<u32> {
-    let at = find_first(dictionary, key)?;
-    let rest = dictionary.get(at.saturating_add(key.len())..)?;
-    let first = rest.iter().position(|byte| !byte.is_ascii_whitespace())?;
-    if !rest.get(first)?.is_ascii_digit() {
-        return None;
+/// How the field list inside one `/AcroForm` dictionary takes a field.
+enum FieldListEdit {
+    /// Reissue this array object, the indirect `/Fields`, with this body.
+    Array(u32, Vec<u8>),
+    /// Rewrite the `/AcroForm` dictionary itself to this.
+    Form(Vec<u8>),
+}
+
+/// Add `entry` to the `/Fields` of the `/AcroForm` dictionary `form`:
+/// into the array object an indirect `/Fields` names, into an inline
+/// array, or as a new `/Fields` when there is none.
+fn field_list_edit(index: &PdfIndex<'_>, form: &[u8], entry: &str) -> FieldListEdit {
+    if let Some(fields_reference) = dictionary_reference(form, b"Fields")
+        && let Some(fields) = index.object_body(fields_reference.number)
+    {
+        return FieldListEdit::Array(
+            fields_reference.number,
+            append_to_array_object(&fields, entry),
+        );
     }
-    leading_reference(rest)
+    match entry_span(form, b"Fields") {
+        Some(span) => FieldListEdit::Form(append_to_array_value(form, span, entry)),
+        None => FieldListEdit::Form(insert_into_dictionary(
+            form,
+            &format!("/Fields [{entry}]"),
+            b"Fields",
+        )),
+    }
+}
+
+/// The byte span of the value stored under `key` in the dictionary
+/// opening `dictionary`, found through the dictionary grammar; `None`
+/// when the key is absent, repeated or the bytes are not a dictionary.
+fn entry_span(dictionary: &[u8], key: &[u8]) -> Option<core::ops::Range<usize>> {
+    let parsed = PdfDictionary::parse_leading(dictionary).ok()?;
+    let entry = parsed.entry(key).ok()??;
+    Some(entry.value.clone())
+}
+
+/// `body` with the bytes at `span` replaced by `replacement`.
+fn splice(body: &[u8], span: core::ops::Range<usize>, replacement: &[u8]) -> Vec<u8> {
+    let mut out = body.get(..span.start).unwrap_or_default().to_vec();
+    out.extend_from_slice(replacement);
+    out.extend_from_slice(body.get(span.end..).unwrap_or_default());
+    out
 }
 
 /// Object numbers assigned to the three validation-material categories.
@@ -1533,27 +1562,7 @@ fn last_object_header(pdf: &[u8], header: &[u8]) -> Option<usize> {
 /// widget has to live on a page, and with an invisible `/Rect` any page
 /// serves; the first is the one a reader opens.
 fn first_page_number(index: &PdfIndex<'_>, catalog: &[u8]) -> Result<u32, PdfError> {
-    /// Depth bound. A page tree deeper than this is not a document, and
-    /// a `/Kids` cycle would otherwise spin here forever.
-    const MAX_DEPTH: usize = 32;
-
-    let mut number = dictionary_reference(catalog, b"/Pages")
-        .ok_or(PdfError::MissingPageTree)?
-        .number;
-    for _ in 0..MAX_DEPTH {
-        let node = index
-            .object_body(number)
-            .ok_or(PdfError::MissingObject(number))?;
-        let Some(kids_at) = find_first(&node, b"/Kids") else {
-            // No `/Kids`: this is a leaf, so it is the page.
-            return Ok(number);
-        };
-        let after = &node[kids_at.saturating_add(b"/Kids".len())..];
-        let open = find_first(after, b"[").ok_or(PdfError::MissingPageTree)?;
-        let first = &after[open.saturating_add(1)..];
-        number = leading_reference(first).ok_or(PdfError::MissingPageTree)?;
-    }
-    Err(PdfError::MissingPageTree)
+    page_leaf(index, catalog, |kids| kids.first().copied())
 }
 
 /// The object number of the last page.
@@ -1562,53 +1571,40 @@ fn first_page_number(index: &PdfIndex<'_>, catalog: &[u8]) -> Result<u32, PdfErr
 /// intermediate `/Pages` nodes until a leaf is reached. This is where a
 /// visible signature lives -- see [`signature_page`].
 fn last_page_number(index: &PdfIndex<'_>, catalog: &[u8]) -> Result<u32, PdfError> {
+    page_leaf(index, catalog, |kids| kids.last().copied())
+}
+
+/// Walk the page tree from the catalog's `/Pages`, at each node taking
+/// the kid `pick` chooses from its `/Kids`, until a node without
+/// `/Kids`: that leaf is the page. `/Kids` is read through the
+/// dictionary grammar, direct or as an indirect array, so a key such as
+/// `/Kidsx` or a `/Kids` inside a nested dictionary or a string is not
+/// taken for the node's own.
+fn page_leaf(
+    index: &PdfIndex<'_>,
+    catalog: &[u8],
+    pick: impl Fn(&[PdfObjectReference]) -> Option<PdfObjectReference>,
+) -> Result<u32, PdfError> {
     /// Depth bound. A page tree deeper than this is not a document, and
     /// a `/Kids` cycle would otherwise spin here forever.
     const MAX_DEPTH: usize = 32;
 
-    let mut number = dictionary_reference(catalog, b"/Pages")
+    let mut number = dictionary_reference(catalog, b"Pages")
         .ok_or(PdfError::MissingPageTree)?
         .number;
     for _ in 0..MAX_DEPTH {
         let node = index
             .object_body(number)
             .ok_or(PdfError::MissingObject(number))?;
-        let Some(kids_at) = find_first(&node, b"/Kids") else {
+        let Some(kids) = dictionary_value(&node, b"Kids") else {
             // No `/Kids`: this is a leaf, so it is the page.
             return Ok(number);
         };
-        let after = &node[kids_at.saturating_add(b"/Kids".len())..];
-        let open = find_first(after, b"[").ok_or(PdfError::MissingPageTree)?;
-        let members = &after[open.saturating_add(1)..];
-        let close = find_first(members, b"]").ok_or(PdfError::MissingPageTree)?;
-        number = last_reference(&members[..close]).ok_or(PdfError::MissingPageTree)?;
+        let kids =
+            validation_references(index, kids).map_err(|_unreadable| PdfError::MissingPageTree)?;
+        number = pick(&kids).ok_or(PdfError::MissingPageTree)?.number;
     }
     Err(PdfError::MissingPageTree)
-}
-
-/// The `N 0 R` closest to the end of `bytes`, or `None` without one.
-fn last_reference(bytes: &[u8]) -> Option<u32> {
-    let mut last = None;
-    let mut two_back: Option<&[u8]> = None;
-    let mut one_back: Option<&[u8]> = None;
-    for token in bytes
-        .split(u8::is_ascii_whitespace)
-        .filter(|token| !token.is_empty())
-    {
-        if token == b"R".as_slice() {
-            let generation_is_number =
-                one_back.is_some_and(|token| token.iter().all(u8::is_ascii_digit));
-            if generation_is_number {
-                let number = two_back
-                    .and_then(|token| core::str::from_utf8(token).ok())
-                    .and_then(|token| token.parse().ok());
-                last = number.or(last);
-            }
-        }
-        two_back = one_back;
-        one_back = Some(token);
-    }
-    last
 }
 
 /// Placement for a visible signature on its page.
@@ -1712,17 +1708,6 @@ fn dictionary_rectangle(dictionary: &[u8], name: &[u8]) -> Option<[f64; 4]> {
     }
 }
 
-/// The `N 0 R` at the start of `bytes`, skipping leading whitespace.
-fn leading_reference(bytes: &[u8]) -> Option<u32> {
-    let digits: Vec<u8> = bytes
-        .iter()
-        .skip_while(|byte| byte.is_ascii_whitespace())
-        .take_while(|byte| byte.is_ascii_digit())
-        .copied()
-        .collect();
-    String::from_utf8_lossy(&digits).parse().ok()
-}
-
 /// Where the widget reference has to be written.
 ///
 /// Three shapes, because real page trees use all of them: no `/Annots`
@@ -1740,61 +1725,75 @@ enum AnnotsTarget {
 /// Work out how to get `reference` into the page's `/Annots`.
 fn plan_annotation(page: &[u8], reference: u32) -> AnnotsTarget {
     let entry = format!("{reference} 0 R");
-    let Some(at) = find_first(page, b"/Annots") else {
+    let Some(span) = entry_span(page, b"Annots") else {
         // Absent. `insert_into_dictionary` is guarded on the key being
         // missing, which is exactly the case here.
         return AnnotsTarget::Page(insert_into_dictionary(
             page,
             &format!("/Annots [{entry}]"),
-            b"/Annots",
+            b"Annots",
         ));
     };
-    let after = at.saturating_add(b"/Annots".len());
-    let rest = &page[after..];
-    let first_token = rest
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-        .map(|index| rest[index]);
-    if first_token == Some(b'[') {
-        return AnnotsTarget::Page(append_to_array(page, after, &entry));
+    if page
+        .get(span.clone())
+        .is_some_and(|value| value.starts_with(ARRAY_OPEN))
+    {
+        return AnnotsTarget::Page(append_to_array_value(page, span, &entry));
     }
     // `/Annots 12 0 R`: the array is its own object.
-    leading_reference(rest).map_or_else(|| AnnotsTarget::Page(page.to_vec()), AnnotsTarget::Array)
+    page.get(span)
+        .and_then(|value| complete_object_reference(value).ok().flatten())
+        .map_or_else(
+            || AnnotsTarget::Page(page.to_vec()),
+            |array| AnnotsTarget::Array(array.number),
+        )
 }
 
-/// Insert `entry` just before the `]` of the array starting after
-/// `from`.
-fn append_to_array(body: &[u8], from: usize, entry: &str) -> Vec<u8> {
-    let Some(open) = find_first(&body[from..], b"[") else {
+/// `body` with ` entry` written before the closing `]` of the array
+/// value at `span`; unchanged when that value is not an array.
+fn append_to_array_value(body: &[u8], span: core::ops::Range<usize>, entry: &str) -> Vec<u8> {
+    let is_array = body
+        .get(span.clone())
+        .is_some_and(|value| value.starts_with(ARRAY_OPEN) && value.ends_with(ARRAY_CLOSE));
+    if !is_array {
         return body.to_vec();
-    };
-    let open = from.saturating_add(open);
-    let Some(close) = find_first(&body[open..], b"]") else {
-        return body.to_vec();
-    };
-    let close = open.saturating_add(close);
-    let mut out = body[..close].to_vec();
+    }
+    let close = span.end.saturating_sub(ARRAY_CLOSE.len());
+    let mut out = body.get(..close).unwrap_or_default().to_vec();
     out.extend_from_slice(b" ");
     out.extend_from_slice(entry.as_bytes());
-    out.extend_from_slice(&body[close..]);
+    out.extend_from_slice(body.get(close..).unwrap_or_default());
     out
 }
 
-/// Insert `entry` into the outermost dictionary of `object`, unless
-/// `key` is already present.
-fn insert_into_dictionary(object: &[u8], entry: &str, key: &[u8]) -> Vec<u8> {
-    let trimmed: Vec<u8> = object.to_vec();
-    if find_first(&trimmed, key).is_some() {
-        return trimmed;
+/// `body`, the body of an array object, with ` entry` appended to the
+/// array; unchanged when the body is not an array.
+fn append_to_array_object(body: &[u8], entry: &str) -> Vec<u8> {
+    let mut parser = PdfValueParser::new(body);
+    parser.skip_trivia();
+    match parser.value(1) {
+        Ok(span) => append_to_array_value(body, span, entry),
+        Err(_unreadable) => body.to_vec(),
     }
-    let Some(close) = find_last(&trimmed, b">>") else {
-        return trimmed;
+}
+
+/// Insert `entry` into the outermost dictionary of `object`, before its
+/// closing `>>` as the dictionary grammar finds it, unless `key` is
+/// already one of its keys; `object` unchanged when it does not open
+/// with a dictionary.
+fn insert_into_dictionary(object: &[u8], entry: &str, key: &[u8]) -> Vec<u8> {
+    let Ok(dictionary) = PdfDictionary::parse_leading(object) else {
+        return object.to_vec();
     };
-    let mut out = trimmed[..close].to_vec();
+    if !matches!(dictionary.entry(key), Ok(None)) {
+        return object.to_vec();
+    }
+    let close = dictionary.closing;
+    let mut out = object.get(..close).unwrap_or_default().to_vec();
     out.extend_from_slice(b"\n");
     out.extend_from_slice(entry.as_bytes());
-    out.extend_from_slice(b"\n>>");
-    out.extend_from_slice(&trimmed[close.saturating_add(2)..]);
+    out.extend_from_slice(b"\n");
+    out.extend_from_slice(object.get(close..).unwrap_or_default());
     out
 }
 
@@ -1813,8 +1812,8 @@ mod tests {
         AnnotsTarget, DEFAULT_SIGNATURE_CAPACITY, FieldListTarget, MAX_FIELD_NAME_BYTES,
         PdfDictionary, PdfError, PdfIndex, SignatureMetadata, StampLanguage, VisibleSignature,
         append_validation_store, complete_object_reference, dictionary_reference,
-        existing_field_names, last_object_header, last_reference, object_body, plan_annotation,
-        plan_field_list, prepare, prepare_document_timestamp, validation_references,
+        existing_field_names, last_object_header, object_body, plan_annotation, plan_field_list,
+        prepare, prepare_document_timestamp, validation_references,
     };
 
     const CERTIFICATE_DER: &[u8] =
@@ -2408,15 +2407,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn last_reference_takes_the_reference_closest_to_the_end() {
-        assert_eq!(last_reference(b"3 0 R 4 0 R"), Some(4));
-        assert_eq!(last_reference(b" 12 0 R "), Some(12));
-        assert_eq!(last_reference(b""), None);
-        assert_eq!(last_reference(b"3 0"), None);
-        assert_eq!(last_reference(b"not a reference"), None);
-    }
-
     /// `/Annots` comes in three shapes and all three occur in real
     /// files. Absent is the common case; a direct array must be
     /// appended to rather than replaced; an indirect reference names
@@ -2994,6 +2984,65 @@ trailer\n<< /Size 5 /Root 1 0 R /Info 4 0 R /ID[<AA><BB>] >>\nstartxref\n0\n%%EO
             text.contains(r"/Reason (a \(parenthesised\) reason)"),
             "parentheses must be escaped or the dictionary ends early"
         );
+    }
+
+    /// The page tree is walked through the dictionary grammar: a
+    /// `/Kidsx` key, a `/Kids` inside a nested dictionary and one
+    /// spelled inside a string are not the node's `/Kids`.
+    #[test]
+    fn the_page_tree_walk_reads_kids_through_the_grammar() {
+        let pdf = b"%PDF-1.7\n\
+1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Pages /Kidsx [9 0 R] /Extra << /Kids [8 0 R] >> \
+/Note (/Kids [7 0 R]) /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n\
+3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /Kids [7 0 R] >> >>\nendobj\n\
+4 0 obj\n<< /Type /Page /Parent 2 0 R /Kidsx [7 0 R] >>\nendobj\n";
+        let index = fragment_index(pdf);
+        let catalog = object_body(pdf, 1).expect("catalog");
+        assert_eq!(super::first_page_number(&index, &catalog), Ok(3));
+        assert_eq!(super::last_page_number(&index, &catalog), Ok(4));
+    }
+
+    /// `/ID` is carried forward only when it is the trailer's own key:
+    /// not from inside a string, a nested dictionary or a longer name.
+    #[test]
+    fn only_the_trailer_s_own_id_is_carried_forward() {
+        assert_eq!(
+            super::trailer_carry_forward(
+                b"<< /Size 5 /Root 1 0 R /Note (/ID [<AA><BB>]) /IDx [<CC>] \
+                  /Extra << /ID [<DD><EE>] >> >>"
+            ),
+            ""
+        );
+        assert_eq!(
+            super::trailer_carry_forward(
+                b"<< /Note (/ID [<AA><BB>]) /ID [<CC> <DD>] /Info 4 0 R >>"
+            ),
+            " /ID [<CC> <DD>] /Info 4 0 R"
+        );
+    }
+
+    /// A key is inserted into a dictionary only when the dictionary
+    /// itself lacks it, and before its own closing `>>`.
+    #[test]
+    fn insertion_finds_the_key_and_the_close_through_the_grammar() {
+        let page = b"<< /Type /Page /Note (/Annots) /Extra << /Annots [1 0 R] >> >>";
+        match plan_annotation(page, 9) {
+            AnnotsTarget::Page(body) => assert_eq!(
+                String::from_utf8_lossy(&body),
+                "<< /Type /Page /Note (/Annots) /Extra << /Annots [1 0 R] >> \n/Annots [9 0 R]\n>>"
+            ),
+            AnnotsTarget::Array(_) => panic!("the page has no /Annots of its own"),
+        }
+        let catalog = b"<< /Type /Catalog /AcroFormx 5 0 R /Pages 2 0 R >>";
+        let index = fragment_index(b"%PDF-1.7\n");
+        match plan_field_list(&index, catalog, 9) {
+            FieldListTarget::Catalog(body) => assert!(
+                String::from_utf8_lossy(&body)
+                    .contains("/AcroForm << /Fields [9 0 R] /SigFlags 3 >>")
+            ),
+            FieldListTarget::Object(..) => panic!("/AcroFormx is not /AcroForm"),
+        }
     }
 }
 

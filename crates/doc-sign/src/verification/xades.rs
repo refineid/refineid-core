@@ -12,13 +12,19 @@
 //! signature value against the container. Timestamp tokens are handed
 //! out with their imprint input for the caller's timestamp verifier.
 //!
-//! Canonicalisation is [`crate::verification::xml`]'s Exclusive XML
-//! Canonicalization. [`crate::xades`] writes its signed subtrees
-//! already in that form; other producers do not, and are canonicalised
-//! here before digesting. A signature whose `ds:SignedInfo` names
-//! another canonicalisation is reported unsupported; a reference whose
-//! transform is not exclusive canonicalisation cannot be recomputed and
-//! leaves the document not intact.
+//! Canonicalisation is [`crate::verification::xml`]'s: Canonical XML
+//! 1.0 and 1.1 and Exclusive XML Canonicalization 1.0, each with or
+//! without comments. [`crate::xades`] writes its signed subtrees already
+//! in exclusive canonical form; other producers do not, and are
+//! canonicalised here before digesting. A signature whose
+//! `ds:SignedInfo` names another canonicalisation, or a reference whose
+//! transform is another, is reported unsupported.
+//!
+//! A `xades:CounterSignature` in the unsigned properties holds a
+//! complete `ds:Signature` over this signature's `ds:SignatureValue`;
+//! it is read as a signature of its own, with a reference that must
+//! resolve to that element, and handed out beside the signature it
+//! counter-signs.
 //!
 //! # Conformance
 //!
@@ -34,7 +40,13 @@
 //!   reference and its `Type`, sec.5.2.2 `SigningCertificateV2`,
 //!   sec.5.3 `SignatureTimeStamp` over the canonicalised
 //!   `ds:SignatureValue` element, sec.5.4 `CertificateValues` and
-//!   `RevocationValues`, sec.5.5 `ArchiveTimeStamp`.
+//!   `RevocationValues`, sec.5.5 `ArchiveTimeStamp`, sec.5.2.7 the
+//!   `CountersignedSignature` reference type and the enveloped
+//!   `CounterSignature`, whose reference digests the canonicalised
+//!   `ds:SignatureValue` of the signature it is embedded in, sec.4.5
+//!   the canonicalisation of a node set.
+//! - W3C Canonical XML 1.0, Canonical XML 1.1 and Exclusive XML
+//!   Canonicalization 1.0: the algorithm identifiers.
 //! - `ETSI EN 319 162-1` V1.1.1 clause A.4: reference URIs resolve
 //!   against the container root.
 
@@ -43,7 +55,8 @@ use crate::base64;
 use crate::validation::ValidationMaterial;
 use crate::verification::asic::{AsicContainer, Entry, uri_names};
 use crate::verification::xml::{
-    ATTRIBUTE_ID, Comments, ElementRef, InclusivePrefixes, XmlDocument, XmlError,
+    ATTRIBUTE_ID, Algorithm, Canonicalization, Comments, ElementRef, InclusivePrefixes,
+    XmlDocument, XmlError,
 };
 use crate::xades::{
     CANONICALIZATION_EXCLUSIVE, DIGEST_METHOD_SHA256, DIGEST_METHOD_SHA384, DIGEST_METHOD_SHA512,
@@ -60,6 +73,30 @@ const NAMESPACE_XADES_141: &str = "http://uri.etsi.org/01903/v1.4.1#";
 /// Exclusive canonicalisation with comments (W3C xml-exc-c14n sec.4).
 const CANONICALIZATION_EXCLUSIVE_COMMENTS: &str =
     "http://www.w3.org/2001/10/xml-exc-c14n#WithComments";
+
+/// Canonical XML 1.0, without comments (W3C xml-c14n sec.1), the
+/// default for a node set (XML Signature 1.1 sec.4.4.3.2).
+pub(crate) const CANONICALIZATION_INCLUSIVE_10: &str =
+    "http://www.w3.org/TR/2001/REC-xml-c14n-20010315";
+
+/// Canonical XML 1.0 with comments.
+const CANONICALIZATION_INCLUSIVE_10_COMMENTS: &str =
+    "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments";
+
+/// Canonical XML 1.1, without comments (W3C xml-c14n11 sec.1).
+pub(crate) const CANONICALIZATION_INCLUSIVE_11: &str = "http://www.w3.org/2006/12/xml-c14n11";
+
+/// Canonical XML 1.1 with comments.
+const CANONICALIZATION_INCLUSIVE_11_COMMENTS: &str =
+    "http://www.w3.org/2006/12/xml-c14n11#WithComments";
+
+/// `Type` of the reference by which a counter-signature signs the
+/// `ds:SignatureValue` it counter-signs (EN 319 132-1 sec.5.2.7.1).
+pub(crate) const TYPE_COUNTERSIGNED_SIGNATURE: &str =
+    "http://uri.etsi.org/01903#CountersignedSignature";
+
+/// `xades:CounterSignature` (EN 319 132-1 sec.5.2.7.2).
+const ELEMENT_COUNTER_SIGNATURE: &str = "CounterSignature";
 
 /// RSA PKCS#1 v1.5 with SHA-512 (RFC 6931 sec.2.3.2).
 const SIGNATURE_METHOD_RSA_SHA512: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512";
@@ -314,35 +351,60 @@ fn signature_method(uri: &str) -> Option<MessageSignatureAlgorithm> {
     }
 }
 
-/// The comment mode an exclusive canonicalisation identifier names;
-/// `None` for every other canonicalisation.
-fn exclusive_mode(uri: &str) -> Option<Comments> {
+/// The algorithm and comment mode a canonicalisation identifier names;
+/// `None` for every canonicalisation this verifier does not compute.
+fn canonicalization_named(uri: &str) -> Option<(Algorithm, Comments)> {
+    let exclusive = || Algorithm::Exclusive(InclusivePrefixes::default());
     match uri {
-        CANONICALIZATION_EXCLUSIVE => Some(Comments::Omitted),
-        CANONICALIZATION_EXCLUSIVE_COMMENTS => Some(Comments::Retained),
+        CANONICALIZATION_EXCLUSIVE => Some((exclusive(), Comments::Omitted)),
+        CANONICALIZATION_EXCLUSIVE_COMMENTS => Some((exclusive(), Comments::Retained)),
+        CANONICALIZATION_INCLUSIVE_10 => Some((Algorithm::Canonical10, Comments::Omitted)),
+        CANONICALIZATION_INCLUSIVE_10_COMMENTS => {
+            Some((Algorithm::Canonical10, Comments::Retained))
+        }
+        CANONICALIZATION_INCLUSIVE_11 => Some((Algorithm::Canonical11, Comments::Omitted)),
+        CANONICALIZATION_INCLUSIVE_11_COMMENTS => {
+            Some((Algorithm::Canonical11, Comments::Retained))
+        }
         _ => None,
     }
 }
 
-/// The exclusive canonicalisation `method` names: its comment mode, and
-/// the prefixes of the one `ec:InclusiveNamespaces` child it may carry
-/// (xml-exc-c14n sec.4). `None` for another canonicalisation, any other
+/// The canonicalisation `method` names, read from its `Algorithm` and,
+/// for exclusive canonicalisation, the one `ec:InclusiveNamespaces`
+/// child it may carry (xml-exc-c14n sec.4). The inclusive algorithms
+/// take no parameter. `None` for another canonicalisation, any other
 /// child, or a `PrefixList` that does not parse.
-fn exclusive_method(method: ElementRef<'_>) -> Option<(Comments, InclusivePrefixes)> {
-    let comments = method
+fn canonicalization_method(method: ElementRef<'_>) -> Option<Canonicalization> {
+    let (algorithm, comments) = method
         .attribute(ATTRIBUTE_ALGORITHM)
-        .and_then(exclusive_mode)?;
+        .and_then(canonicalization_named)?;
     let mut children = method.children();
-    let prefixes = match (children.next(), children.next()) {
-        (None, _) => InclusivePrefixes::default(),
-        (Some(child), None)
+    let algorithm = match (algorithm, children.next(), children.next()) {
+        (algorithm, None, _) => algorithm,
+        (Algorithm::Exclusive(_), Some(child), None)
             if child.is(CANONICALIZATION_EXCLUSIVE, ELEMENT_INCLUSIVE_NAMESPACES) =>
         {
-            InclusivePrefixes::parse(child.attribute(ATTRIBUTE_PREFIX_LIST)?)?
+            Algorithm::Exclusive(InclusivePrefixes::parse(
+                child.attribute(ATTRIBUTE_PREFIX_LIST)?,
+            )?)
         }
         _ => return None,
     };
-    Some((comments, prefixes))
+    Some(Canonicalization {
+        algorithm,
+        comments,
+    })
+}
+
+/// Canonical XML 1.0 without comments: the canonicalisation of a node
+/// set no transform names (XML Signature 1.1 sec.4.4.3.2), and of a
+/// `SignatureTimeStamp` that names none (EN 319 132-1 sec.4.5).
+const fn default_canonicalization() -> Canonicalization {
+    Canonicalization {
+        algorithm: Algorithm::Canonical10,
+        comments: Comments::Omitted,
+    }
 }
 
 /// What a reference digests.
@@ -366,6 +428,9 @@ struct Reference {
     /// Whether it is the `SignedProperties` reference and resolves to
     /// this signature's own `xades:SignedProperties`.
     signed_properties: bool,
+    /// Whether it resolves to the `ds:SignatureValue` this signature
+    /// counter-signs.
+    countersigned: bool,
 }
 
 /// What the signed properties say about the signer certificate.
@@ -397,10 +462,10 @@ impl SignatureTimestamp {
     }
 
     /// The octets the token's message imprint must digest: the
-    /// `ds:SignatureValue` element under the exclusive canonicalisation
-    /// the timestamp names (EN 319 132-1 sec.5.3). `None` when it names
-    /// another canonicalisation, or none, which leaves the inclusive
-    /// default this verifier does not compute.
+    /// `ds:SignatureValue` element under the canonicalisation the
+    /// timestamp names, Canonical XML 1.0 when it names none (EN 319
+    /// 132-1 sec.5.3 and sec.4.5). `None` when it names one this
+    /// verifier does not compute.
     #[must_use]
     pub fn imprint_input(&self) -> Option<&[u8]> {
         self.imprint_input.as_deref()
@@ -410,9 +475,10 @@ impl SignatureTimestamp {
 /// A signature feature this verifier does not implement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XadesUnsupported {
-    /// `ds:SignedInfo` names a canonicalisation other than Exclusive
-    /// XML Canonicalization 1.0, or one with children other than an
-    /// `InclusiveNamespaces` prefix list.
+    /// `ds:SignedInfo` names a canonicalisation other than Canonical
+    /// XML 1.0 or 1.1 or Exclusive XML Canonicalization 1.0, or one
+    /// with children other than an exclusive `InclusiveNamespaces`
+    /// prefix list.
     SignedInfoCanonicalization,
     /// `ds:SignatureMethod` names an algorithm this verifier does not
     /// verify: SHA-1, MD5, DSA or any other.
@@ -421,7 +487,7 @@ pub enum XadesUnsupported {
     /// binding names an algorithm this verifier does not compute.
     DigestAlgorithm,
     /// A reference carries more than one transform, a transform other
-    /// than exclusive canonicalisation, or a transform over a data
+    /// than one of the canonicalisations, or a transform over a data
     /// file: a chain of octet streams (XML Signature 1.1 sec.4.4.3.3)
     /// this verifier does not model.
     TransformChain,
@@ -509,6 +575,13 @@ pub struct XadesSignature {
     signature_timestamps: Vec<SignatureTimestamp>,
     /// How many `ArchiveTimeStamp` elements are present.
     archive_timestamps: usize,
+    /// Whether this is a counter-signature, whose references must cover
+    /// the `ds:SignatureValue` it counter-signs rather than the
+    /// container's data files.
+    counter_signature: bool,
+    /// The signatures each `xades:CounterSignature` holds, in document
+    /// order, each read on its own.
+    counter_signatures: Vec<Result<XadesSignature, XadesReadError>>,
 }
 
 /// Read every `ds:Signature` in the container's signature files: in
@@ -551,13 +624,22 @@ fn file_signatures(
     }
     Ok(elements
         .into_iter()
-        .map(|element| XadesSignature::read(&document, element))
+        .map(|element| XadesSignature::read(&document, element, None, &[]))
         .collect())
 }
 
 impl XadesSignature {
-    /// Read one `ds:Signature`.
-    fn read(document: &XmlDocument, signature: ElementRef<'_>) -> Result<Self, XadesReadError> {
+    /// Read one `ds:Signature`. `countersigned` is the
+    /// `ds:SignatureValue` it counter-signs when it sits in a
+    /// `xades:CounterSignature`, and `outer_certificates` the
+    /// `CertificateValues` of that embedding signature, which may carry
+    /// a counter-signer's certificate (EN 319 132-1 sec.5.4.2 item 6).
+    fn read(
+        document: &XmlDocument,
+        signature: ElementRef<'_>,
+        countersigned: Option<ElementRef<'_>>,
+        outer_certificates: &[Vec<u8>],
+    ) -> Result<Self, XadesReadError> {
         let signed_info = signature
             .child(NAMESPACE_DSIG, ELEMENT_SIGNED_INFO)
             .ok_or(XadesReadError::Malformed("no SignedInfo"))?;
@@ -619,7 +701,13 @@ impl XadesSignature {
             .map(|certificate| base64::decode_wrapped(&certificate.text()))
             .collect::<Result<_, _>>()
             .map_err(|_ignored| XadesReadError::Malformed("X509Certificate is not base64"))?;
-        let signer = select_signer(&key_info_certificates, &material.certificates, &binding)?;
+        let candidates: Vec<Vec<u8>> = material
+            .certificates
+            .iter()
+            .chain(outer_certificates)
+            .cloned()
+            .collect();
+        let signer = select_signer(&key_info_certificates, &candidates, &binding)?;
         let mut unsupported = None;
         if binding == SignerBinding::Unverifiable {
             unsupported = Some(XadesUnsupported::DigestAlgorithm);
@@ -639,8 +727,8 @@ impl XadesSignature {
             .child(NAMESPACE_DSIG, ELEMENT_SIGNATURE_METHOD)
             .and_then(|method| method.attribute(ATTRIBUTE_ALGORITHM))
             .and_then(signature_method);
-        let signed_info_bytes = match exclusive_method(canonicalization) {
-            Some((comments, prefixes)) => signed_info.canonicalize_with(comments, &prefixes),
+        let signed_info_bytes = match canonicalization_method(canonicalization) {
+            Some(method) => signed_info.canonicalize(&method),
             None => {
                 unsupported = Some(XadesUnsupported::SignedInfoCanonicalization);
                 Vec::new()
@@ -652,12 +740,30 @@ impl XadesSignature {
 
         let mut references = Vec::new();
         for reference in signed_info.children_named(NAMESPACE_DSIG, ELEMENT_REFERENCE) {
-            match read_reference(document, reference, signed_properties)? {
+            match read_reference(document, reference, signed_properties, countersigned)? {
                 Ok(reference) => references.push(reference),
                 Err(feature) => {
                     unsupported.get_or_insert(feature);
                 }
             }
+        }
+
+        let mut counter_signatures = Vec::new();
+        for holder in unsigned.into_iter().flat_map(|unsigned| {
+            unsigned.children_named(NAMESPACE_XADES, ELEMENT_COUNTER_SIGNATURE)
+        }) {
+            let mut inner = holder.children();
+            counter_signatures.push(match (inner.next(), inner.next()) {
+                (Some(inner), None) if inner.is(NAMESPACE_DSIG, ELEMENT_SIGNATURE) => Self::read(
+                    document,
+                    inner,
+                    Some(signature_value_element),
+                    &material.certificates,
+                ),
+                _ => Err(XadesReadError::Malformed(
+                    "CounterSignature does not hold exactly one Signature",
+                )),
+            });
         }
 
         Ok(Self {
@@ -672,7 +778,18 @@ impl XadesSignature {
             binding,
             signature_timestamps,
             archive_timestamps,
+            counter_signature: countersigned.is_some(),
+            counter_signatures,
         })
+    }
+
+    /// The signatures this one's `xades:CounterSignature` properties
+    /// hold, in document order: each counter-signs this signature's
+    /// `ds:SignatureValue`, and each that does not read is an `Err`
+    /// beside the others.
+    #[must_use]
+    pub fn counter_signatures(&self) -> &[Result<Self, XadesReadError>] {
+        &self.counter_signatures
     }
 
     /// The signer certificate: the certificate the
@@ -728,7 +845,9 @@ impl XadesSignature {
     }
 
     /// Every reference matches, one covers the signed properties, and
-    /// every data file is covered.
+    /// every data file is covered; for a counter-signature, one covers
+    /// the `ds:SignatureValue` it counter-signs instead of the data
+    /// files (EN 319 132-1 sec.5.2.7.2).
     fn document_intact(&self, container: &AsicContainer) -> bool {
         let every_reference_matches = !self.references.is_empty()
             && self.references.iter().all(|reference| {
@@ -747,12 +866,18 @@ impl XadesSignature {
             .references
             .iter()
             .any(|reference| reference.signed_properties);
-        let files_covered = container.data_files().iter().all(|entry| {
-            self.references.iter().any(|reference| {
-                matches!(&reference.target, Target::DataFile(uri) if uri_names(uri, entry.name()))
+        let covered = if self.counter_signature {
+            self.references
+                .iter()
+                .any(|reference| reference.countersigned)
+        } else {
+            container.data_files().iter().all(|entry| {
+                self.references.iter().any(|reference| {
+                    matches!(&reference.target, Target::DataFile(uri) if uri_names(uri, entry.name()))
+                })
             })
-        });
-        every_reference_matches && properties_covered && files_covered
+        };
+        every_reference_matches && properties_covered && covered
     }
 
     /// The signature verifies and the mandatory signer binding is
@@ -796,12 +921,12 @@ fn read_unsigned(
 
     for timestamp in unsigned.children_named(NAMESPACE_XADES, ELEMENT_SIGNATURE_TIMESTAMP) {
         // Without a CanonicalizationMethod the XML Signature default,
-        // inclusive Canonical XML 1.0, applies (EN 319 132-1 sec.5.3),
-        // which this verifier does not compute.
-        let imprint_input = timestamp
-            .child(NAMESPACE_DSIG, ELEMENT_CANONICALIZATION_METHOD)
-            .and_then(exclusive_method)
-            .map(|(comments, prefixes)| signature_value.canonicalize_with(comments, &prefixes));
+        // Canonical XML 1.0, applies (EN 319 132-1 sec.4.5).
+        let method = match timestamp.child(NAMESPACE_DSIG, ELEMENT_CANONICALIZATION_METHOD) {
+            None => Some(default_canonicalization()),
+            Some(method) => canonicalization_method(method),
+        };
+        let imprint_input = method.map(|method| signature_value.canonicalize(&method));
         for token in encapsulated(timestamp, ELEMENT_ENCAPSULATED_TIMESTAMP)? {
             timestamps.push(SignatureTimestamp {
                 token,
@@ -870,6 +995,7 @@ fn read_reference(
     document: &XmlDocument,
     reference: ElementRef<'_>,
     signed_properties: Option<ElementRef<'_>>,
+    countersigned: Option<ElementRef<'_>>,
 ) -> Result<Result<Reference, XadesUnsupported>, XadesReadError> {
     let Some(digest) = DigestValue::read(reference, "Reference without a readable DigestValue")?
     else {
@@ -877,9 +1003,11 @@ fn read_reference(
     };
     let uri = reference.attribute(ATTRIBUTE_URI).unwrap_or_default();
     let claims_properties = reference.attribute(ATTRIBUTE_TYPE) == Some(TYPE_SIGNED_PROPERTIES);
+    let claims_countersigned =
+        reference.attribute(ATTRIBUTE_TYPE) == Some(TYPE_COUNTERSIGNED_SIGNATURE);
 
-    // At most one transform, and that one exclusive canonicalisation:
-    // anything else chains octet streams this verifier does not model.
+    // At most one transform, and that one a canonicalisation: anything
+    // else chains octet streams this verifier does not model.
     let transforms: Vec<ElementRef<'_>> = reference
         .child(NAMESPACE_DSIG, ELEMENT_TRANSFORMS)
         .into_iter()
@@ -888,7 +1016,7 @@ fn read_reference(
     let canonicalization = match transforms.as_slice() {
         [] => None,
         [transform] if transform.is(NAMESPACE_DSIG, ELEMENT_TRANSFORM) => {
-            match exclusive_method(*transform) {
+            match canonicalization_method(*transform) {
                 Some(method) => Some(method),
                 None => return Ok(Err(XadesUnsupported::TransformChain)),
             }
@@ -897,33 +1025,40 @@ fn read_reference(
     };
 
     let mut resolves_to_properties = false;
+    let mut resolves_to_countersigned = false;
     let target = if let Some(id) = uri.strip_prefix(FRAGMENT_MARK) {
         // A bare-name reference `#id` yields the element's subtree with
         // every comment node deleted (XML Signature 1.1 sec.4.4.3.3),
         // so a `WithComments` transform after it has no comment to
         // keep; only `#xpointer(id('id'))` retains them, and that form
-        // does not resolve here. Without a transform the node set would
-        // be serialised by inclusive Canonical XML. The reader refuses
-        // a repeated `Id`, so at most one element matches.
-        match (
-            document
-                .elements()
-                .find(|element| element.attribute(ATTRIBUTE_ID) == Some(id)),
-            canonicalization,
-        ) {
-            (Some(element), Some((_comments, prefixes))) => {
+        // does not resolve here. Without a transform the node set is
+        // serialised by Canonical XML 1.0 (sec.4.4.3.2). The reader
+        // refuses a repeated `Id`, so at most one element matches.
+        match document
+            .elements()
+            .find(|element| element.attribute(ATTRIBUTE_ID) == Some(id))
+        {
+            Some(element) => {
                 resolves_to_properties = signed_properties == Some(element);
-                if claims_properties && !resolves_to_properties {
+                resolves_to_countersigned = countersigned == Some(element);
+                if (claims_properties && !resolves_to_properties)
+                    || (claims_countersigned && !resolves_to_countersigned)
+                {
                     Target::Unresolvable
                 } else {
-                    Target::Canonical(element.canonicalize_with(Comments::Omitted, &prefixes))
+                    let algorithm =
+                        canonicalization.map_or(Algorithm::Canonical10, |method| method.algorithm);
+                    Target::Canonical(element.canonicalize(&Canonicalization {
+                        algorithm,
+                        comments: Comments::Omitted,
+                    }))
                 }
             }
-            _ => Target::Unresolvable,
+            None => Target::Unresolvable,
         }
     } else if canonicalization.is_some() {
         return Ok(Err(XadesUnsupported::TransformChain));
-    } else if uri.is_empty() || claims_properties {
+    } else if uri.is_empty() || claims_properties || claims_countersigned {
         Target::Unresolvable
     } else {
         Target::DataFile(uri.to_owned())
@@ -932,6 +1067,7 @@ fn read_reference(
         target,
         digest,
         signed_properties: claims_properties && resolves_to_properties,
+        countersigned: resolves_to_countersigned,
     }))
 }
 
@@ -942,13 +1078,13 @@ mod tests {
         NAMESPACE_XADES, NAMESPACE_XADES_141, XadesJudgement, XadesReadError, XadesSignature,
         XadesUnsupported, XadesVerdict, signatures,
     };
-    use crate::asic::{DataObject, xades_container};
+    use crate::asic::{DataObject, NAMESPACE_ASIC, xades_container};
     use crate::base64;
     use crate::cades::{DigestAlgorithm, SignatureAlgorithm, SignerParameters, SigningTime};
     use crate::validation::ValidationMaterial;
     use crate::verification::asic::AsicContainer;
     use crate::verification::exactly;
-    use crate::verification::xml::{Comments, XmlDocument, XmlError};
+    use crate::verification::xml::{Canonicalization, Comments, XmlDocument, XmlError};
     use crate::xades::{SIGNATURE_METHOD_RSA_SHA256, SignaturePlan, plan};
     use refineid_cms::testkit::{self as kit, TestCurve, TestKey};
     use refineid_cms::x509::OwnedCert;
@@ -977,9 +1113,13 @@ mod tests {
     /// The second synthetic timestamp token.
     const SECOND_TOKEN: &[u8] = b"second timestamp token";
 
-    /// Inclusive Canonical XML 1.1, a canonicalisation this reader does
-    /// not compute.
-    const CANONICALIZATION_INCLUSIVE_11: &str = "http://www.w3.org/2006/12/xml-c14n11";
+    /// Canonical XML 2.0 (W3C xml-c14n2 sec.1), a canonicalisation this
+    /// reader does not compute.
+    const CANONICALIZATION_20: &str = "http://www.w3.org/2010/xml-c14n2";
+
+    /// The enveloped-signature transform (XML Signature 1.1
+    /// sec.6.6.4), which this reader does not model.
+    const TRANSFORM_ENVELOPED: &str = "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
 
     /// Where the wrapped-value fixture breaks its base64 line.
     const WRAP_COLUMN: usize = 8;
@@ -1094,7 +1234,7 @@ mod tests {
         let canonical_properties = XmlDocument::parse(new_properties.clone().into_bytes())
             .expect("properties parse")
             .root()
-            .canonicalize(Comments::Omitted);
+            .canonicalize(&Canonicalization::exclusive(Comments::Omitted));
         let new_signed_info = signed_info(&old_signed_info.replace(
             &digest(old_properties.as_bytes()),
             &digest(&canonical_properties),
@@ -1162,7 +1302,7 @@ mod tests {
         let canonical_value = XmlDocument::parse(value.as_bytes().to_vec())
             .expect("parses")
             .root()
-            .canonicalize(Comments::Omitted);
+            .canonicalize(&Canonicalization::exclusive(Comments::Omitted));
         let properties = element(
             &document,
             "<xades:SignedProperties",
@@ -1201,8 +1341,8 @@ mod tests {
             .find(|element| element.is(NAMESPACE_XADES, "SignedProperties"))
             .expect("properties");
         assert!(
-            properties.canonicalize(Comments::Retained)
-                != properties.canonicalize(Comments::Omitted)
+            properties.canonicalize(&Canonicalization::exclusive(Comments::Retained))
+                != properties.canonicalize(&Canonicalization::exclusive(Comments::Omitted))
         );
         assert!(judged(&objects(), &with_comment).document_intact());
     }
@@ -1210,16 +1350,16 @@ mod tests {
     #[test]
     fn a_transform_chain_the_reader_does_not_model_is_unsupported() {
         let transform = format!("<ds:Transform Algorithm=\"{CANONICALIZATION_EXCLUSIVE}\">");
-        let inclusive = document().replace(
+        let enveloped = document().replace(
             &transform,
-            &format!("<ds:Transform Algorithm=\"{CANONICALIZATION_INCLUSIVE_11}\">"),
+            &format!("<ds:Transform Algorithm=\"{TRANSFORM_ENVELOPED}\">"),
         );
         let doubled = document().replace(
             &format!("{transform}</ds:Transform>"),
             &format!("{transform}</ds:Transform>{transform}</ds:Transform>"),
         );
         assert!(doubled != document());
-        for chained in [inclusive, doubled] {
+        for chained in [enveloped, doubled] {
             let (container, signature) = read(&objects(), &chained);
             assert_eq!(
                 signature.verify(&container),
@@ -1280,7 +1420,7 @@ mod tests {
         let document = XmlDocument::parse(wrapper.into_bytes()).expect("parses");
         let signed_info = document.root().children().next().expect("SignedInfo");
         assert_eq!(
-            signed_info.canonicalize(Comments::Omitted),
+            signed_info.canonicalize(&Canonicalization::exclusive(Comments::Omitted)),
             plan.signed_info()
         );
 
@@ -1310,7 +1450,8 @@ mod tests {
 
     /// Each `SignatureTimeStamp` token comes out with the canonical
     /// `SignatureValue` it must imprint; one naming no canonicalisation
-    /// has no imprint input; an `ArchiveTimeStamp` is counted apart.
+    /// imprints it under Canonical XML 1.0; an `ArchiveTimeStamp` is
+    /// counted apart.
     #[test]
     fn signature_timestamps_are_collected_with_their_imprint_input() {
         let tokens = vec![FIRST_TOKEN.to_vec(), SECOND_TOKEN.to_vec()];
@@ -1340,7 +1481,14 @@ mod tests {
         assert_eq!(second.token(), SECOND_TOKEN);
         assert_eq!(first.imprint_input(), Some(expected.as_bytes()));
         assert_eq!(second.imprint_input(), Some(expected.as_bytes()));
-        assert_eq!(unnamed.imprint_input(), None);
+        // No CanonicalizationMethod: Canonical XML 1.0, which renders
+        // the namespaces in scope at the element.
+        let inclusive = expected.replacen(
+            "<ds:SignatureValue ",
+            &format!("<ds:SignatureValue xmlns:asic=\"{NAMESPACE_ASIC}\" "),
+            1,
+        );
+        assert_eq!(unnamed.imprint_input(), Some(inclusive.as_bytes()));
         let judgement = supported(signature.verify(&container));
         assert!(judgement.document_intact());
         assert_eq!(judgement.signature_timestamps_present(), collected.len());
@@ -1366,12 +1514,12 @@ mod tests {
     fn another_signed_info_canonicalisation_is_unsupported() {
         let method =
             format!("<ds:CanonicalizationMethod Algorithm=\"{CANONICALIZATION_EXCLUSIVE}\">");
-        let inclusive = document().replacen(
+        let unknown = document().replacen(
             &method,
-            &format!("<ds:CanonicalizationMethod Algorithm=\"{CANONICALIZATION_INCLUSIVE_11}\">"),
+            &format!("<ds:CanonicalizationMethod Algorithm=\"{CANONICALIZATION_20}\">"),
             1,
         );
-        let (container, signature) = read(&objects(), &inclusive);
+        let (container, signature) = read(&objects(), &unknown);
         assert_eq!(
             signature.verify(&container),
             XadesVerdict::Unsupported(XadesUnsupported::SignedInfoCanonicalization)
@@ -1535,7 +1683,7 @@ mod tests {
             .elements()
             .find(|element| element.is(NAMESPACE_DSIG, "SignedInfo"))
             .expect("SignedInfo")
-            .canonicalize(Comments::Omitted);
+            .canonicalize(&Canonicalization::exclusive(Comments::Omitted));
         let value = element(document, "<ds:SignatureValue", "</ds:SignatureValue>");
         let open_end = value.find('>').expect("start tag ends") + 1;
         let text = &value[open_end..value.len() - "</ds:SignatureValue>".len()];

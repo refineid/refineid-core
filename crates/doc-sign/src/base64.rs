@@ -96,6 +96,21 @@ pub(crate) fn decode(input: &str) -> Result<Vec<u8>, &'static str> {
     Ok(out)
 }
 
+/// Decode `xsd:base64Binary` text: the strict alphabet and padding of
+/// [`decode`], with XML white space (space, tab, line feed, carriage
+/// return) allowed anywhere between characters, as producers wrap long
+/// values over lines.
+///
+/// # Errors
+/// As [`decode`], over the text with the white space removed.
+pub(crate) fn decode_wrapped(input: &str) -> Result<Vec<u8>, &'static str> {
+    let compact: String = input
+        .chars()
+        .filter(|character| !matches!(character, ' ' | '\t' | '\n' | '\r'))
+        .collect();
+    decode(&compact)
+}
+
 /// Decode one four-character quantum, of which the last
 /// `padding` characters are `=`.
 ///
@@ -208,5 +223,20 @@ mod tests {
         }
         // "Zm9h" is well-formed ("foa") and must keep decoding.
         assert_eq!(decode("Zm9h").expect("control decodes"), b"foa");
+    }
+
+    #[test]
+    fn wrapped_decoding_tolerates_line_breaks_and_keeps_strict_padding() {
+        assert_eq!(
+            decode_wrapped("Zm9v\nYmFy").expect("wrapped decodes"),
+            b"foobar"
+        );
+        assert_eq!(
+            decode_wrapped(" Zm9v\r\n\tYg==\n").expect("wrapped decodes"),
+            b"foob"
+        );
+        for bad in ["Zh==", "Zg=", "Z===", "Zm9v!", "Zg==\nZg=="] {
+            assert!(decode_wrapped(bad).is_err(), "{bad} must not decode");
+        }
     }
 }

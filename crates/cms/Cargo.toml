@@ -14,6 +14,11 @@ doctest = false
 [lints]
 workspace = true
 
+[features]
+# Test-only ECDSA signing over the verifier's curve arithmetic and the
+# fixture builders on top of it. Never enabled by a production build.
+testkit = []
+
 [dependencies]
 refineid-ber.workspace = true
 refineid-digest.workspace = true

@@ -42,23 +42,18 @@
 use crate::cades::DigestAlgorithm;
 
 mod appearance;
+pub(crate) mod index;
 mod spot;
 mod stamp;
 mod xref_stream;
 
 pub use appearance::VisibleSignature;
+use index::{
+    PdfDictionary, PdfIndex, PdfObjectReference, PdfValueParser, complete_object_reference,
+    dictionary_integer, dictionary_reference, find_first, find_last, validation_references,
+};
 pub use stamp::StampLanguage;
-use std::collections::{HashMap, HashSet};
-
-/// Most cross-reference entries a file may declare, through `/Size`, a
-/// classic subsection count or a stream's `/Index` pairs.
-///
-/// ISO 32000-1 Annex C, Table C.1, caps a file at 8 388 607 indirect
-/// objects, numbered from one; with entry zero, which heads the free
-/// list, that is two to the twenty-third entries. Every object number
-/// this reader admits is below this, so the merged index never holds
-/// more objects than this either.
-const MAX_XREF_ENTRIES: usize = 1 << 23;
+use std::collections::HashSet;
 
 /// Signature dictionary `/SubFilter` for `PAdES` (EN 319 142-1 sec.5.1).
 const SUBFILTER_PADES: &str = "/ETSI.CAdES.detached";
@@ -138,6 +133,14 @@ pub enum PdfError {
     },
     /// The document structure is corrupt or truncated.
     Corrupt,
+    /// A PDF value does not follow the value grammar, or a dictionary
+    /// repeats a key (ISO 32000-1 sec.7.3).
+    MalformedValue,
+    /// PDF values nest deeper than this reader accepts.
+    NestingTooDeep,
+    /// The `/Prev` chain holds more cross-reference sections than this
+    /// reader follows.
+    TooManyRevisions,
 }
 
 impl core::fmt::Display for PdfError {
@@ -164,6 +167,11 @@ impl core::fmt::Display for PdfError {
                 "the signature needs {needed} bytes but {capacity} were reserved"
             ),
             Self::Corrupt => f.write_str("the document structure is corrupt or truncated"),
+            Self::MalformedValue => f.write_str("a PDF value does not parse"),
+            Self::NestingTooDeep => f.write_str("PDF values nest too deeply"),
+            Self::TooManyRevisions => {
+                f.write_str("the cross-reference chain has too many sections")
+            }
         }
     }
 }
@@ -227,6 +235,26 @@ impl Placeholder {
     #[must_use]
     pub fn digest(&self, algorithm: DigestAlgorithm) -> Vec<u8> {
         algorithm.digest(&self.signed_octets())
+    }
+
+    /// The placeholder with the last occurrence of `old`, the one in
+    /// the dictionary this placeholder adds, replaced by `new` of the
+    /// same length, so every offset stays true: a test writes a
+    /// dictionary entry the writer does not.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn respelled(mut self, old: &[u8], new: &[u8]) -> Self {
+        assert_eq!(old.len(), new.len(), "a respelling keeps every offset");
+        let at = self
+            .document
+            .windows(old.len())
+            .rposition(|window| window == old)
+            .expect("the placeholder carries the text");
+        self.document
+            .get_mut(at..at.saturating_add(old.len()))
+            .expect("in range")
+            .copy_from_slice(new);
+        self
     }
 
     /// Splice the CMS into the reserved hole.
@@ -357,16 +385,12 @@ fn prepare_kind(
         return Err(PdfError::NotAPdf);
     }
     let index = PdfIndex::parse(pdf)?;
+    // The index refuses an encrypted document: the update this writer
+    // produces carries no crypt filter, so it would be unreadable.
     let trailer = index.trailer();
-    // An encrypted document needs every string and stream written
-    // under its own crypt filter. This writer emits neither, so the
-    // update it produces would be unreadable -- refuse rather than
-    // hand back something that opens and then fails.
-    if find_first(trailer, b"/Encrypt").is_some() {
-        return Err(PdfError::UnsupportedEncryption);
-    }
-    let catalog_number =
+    let catalog =
         dictionary_reference(trailer, b"/Root").ok_or(PdfError::MissingCatalogReference)?;
+    let catalog_number = catalog.number;
     let next_object = dictionary_integer(trailer, b"/Size").unwrap_or(0).max(1);
 
     // Object numbers for what the update adds.
@@ -374,14 +398,15 @@ fn prepare_kind(
     let field_number = next_object.saturating_add(1);
     let rendered_appearance = rendered_signature_appearance(kind, metadata);
     let new_size = field_number.saturating_add(if rendered_appearance.is_some() { 3 } else { 1 });
+    let catalog_reference = catalog;
     let catalog = index
-        .object_body(catalog_number)
+        .object_body_reference(catalog_reference)
         .ok_or(PdfError::MissingObject(catalog_number))?;
     let field_name = unique_field_name(&index, &catalog, kind, signature_number)?;
     let (page_number, page) = signature_page(&index, &catalog, rendered_appearance.is_some())?;
 
     let mut update = Vec::new();
-    let mut offsets: Vec<(u32, usize)> = Vec::new();
+    let mut offsets: Vec<(PdfObjectReference, usize)> = Vec::new();
     let base = pdf.len();
 
     // The original file must end with a newline before the update, or
@@ -393,7 +418,7 @@ fn prepare_kind(
     let update_start = out.len();
 
     // --- the signature dictionary, with placeholders ------------------
-    offsets.push((signature_number, update_start));
+    offsets.push((PdfObjectReference::fresh(signature_number), update_start));
     push_dictionary_head(&mut update, signature_number, kind, metadata);
     update.extend_from_slice(b"/ByteRange [");
     let byte_range_at = update_start.saturating_add(update.len());
@@ -419,7 +444,10 @@ fn prepare_kind(
         &field_name,
         rendered_appearance.as_ref(),
     ) {
-        offsets.push((number, update_start.saturating_add(update.len())));
+        offsets.push((
+            PdfObjectReference::fresh(number),
+            update_start.saturating_add(update.len()),
+        ));
         update.extend_from_slice(&object);
     }
 
@@ -434,7 +462,10 @@ fn prepare_kind(
     // is unverifiable exactly where it matters.
     match plan_annotation(&page, field_number) {
         AnnotsTarget::Page(body) => {
-            offsets.push((page_number, update_start.saturating_add(update.len())));
+            offsets.push((
+                PdfObjectReference::fresh(page_number),
+                update_start.saturating_add(update.len()),
+            ));
             update.extend_from_slice(format!("{page_number} 0 obj\n").as_bytes());
             update.extend_from_slice(&body);
             update.extend_from_slice(b"\nendobj\n");
@@ -445,7 +476,10 @@ fn prepare_kind(
                 .ok_or(PdfError::MissingObject(array_number))?;
             let entry = format!("{field_number} 0 R");
             let body = append_to_array(&array, 0, &entry);
-            offsets.push((array_number, update_start.saturating_add(update.len())));
+            offsets.push((
+                PdfObjectReference::fresh(array_number),
+                update_start.saturating_add(update.len()),
+            ));
             update.extend_from_slice(format!("{array_number} 0 obj\n").as_bytes());
             update.extend_from_slice(&body);
             update.extend_from_slice(b"\nendobj\n");
@@ -453,12 +487,12 @@ fn prepare_kind(
     }
 
     // --- the catalog, reissued with an AcroForm -----------------------
-    let (edited_number, edited_body) = match plan_field_list(&index, &catalog, field_number) {
-        FieldListTarget::Catalog(body) => (catalog_number, body),
-        FieldListTarget::Object(number, body) => (number, body),
+    let (edited, edited_body) = match plan_field_list(&index, &catalog, field_number) {
+        FieldListTarget::Catalog(body) => (catalog_reference, body),
+        FieldListTarget::Object(number, body) => (PdfObjectReference::fresh(number), body),
     };
-    offsets.push((edited_number, update_start.saturating_add(update.len())));
-    update.extend_from_slice(format!("{edited_number} 0 obj\n").as_bytes());
+    offsets.push((edited, update_start.saturating_add(update.len())));
+    update.extend_from_slice(format!("{} obj\n", edited.header()).as_bytes());
     update.extend_from_slice(&edited_body);
     update.extend_from_slice(b"\nendobj\n");
 
@@ -468,7 +502,7 @@ fn prepare_kind(
         update_start,
         &mut offsets,
         new_size,
-        catalog_number,
+        catalog_reference,
         &index,
     )?;
 
@@ -566,397 +600,6 @@ fn signature_field_objects(
     ]
 }
 
-/// Maximum nesting accepted while retaining existing PDF values.
-///
-/// The document security store can carry extension dictionaries and a
-/// `/VRI` tree that this writer must preserve without interpreting. A
-/// fixed bound keeps that preservation from becoming an unbounded parser
-/// recursion on an attacker-supplied PDF.
-const MAX_PDF_VALUE_DEPTH: usize = 64;
-
-/// One indirect PDF object reference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct PdfObjectReference {
-    number: u32,
-    generation: u16,
-}
-
-impl PdfObjectReference {
-    fn rendered(self) -> String {
-        format!("{} {} R", self.number, self.generation)
-    }
-}
-
-/// One top-level dictionary entry, retaining the exact value byte span.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PdfDictionaryEntry {
-    /// Decoded name bytes, without the leading slash.
-    name: Vec<u8>,
-    /// Exact value bytes in the dictionary source.
-    value: core::ops::Range<usize>,
-}
-
-/// A parsed top-level dictionary.
-struct PdfDictionary {
-    entries: Vec<PdfDictionaryEntry>,
-    /// Offset of the outer dictionary's closing `>>`.
-    closing: usize,
-}
-
-impl PdfDictionary {
-    /// Parse one complete dictionary, with only trivia around it.
-    fn parse(bytes: &[u8]) -> Result<Self, PdfError> {
-        let mut parser = PdfValueParser::new(bytes);
-        parser.skip_trivia();
-        let dictionary = parser.dictionary(1)?;
-        parser.require_end()?;
-        Ok(dictionary)
-    }
-
-    /// The sole entry whose decoded name equals `name`.
-    ///
-    /// Duplicate spellings such as `/DSS` and `/D#53S` are ambiguous;
-    /// refuse them instead of silently choosing which earlier store to
-    /// discard.
-    fn entry(&self, name: &[u8]) -> Result<Option<&PdfDictionaryEntry>, PdfError> {
-        let mut matching = self.entries.iter().filter(|entry| entry.name == name);
-        let found = matching.next();
-        if matching.next().is_some() {
-            return Err(PdfError::UnreadableValidationStore);
-        }
-        Ok(found)
-    }
-}
-
-/// Byte-oriented parser for the PDF value grammar needed to retain a DSS.
-struct PdfValueParser<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> PdfValueParser<'a> {
-    const fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
-    }
-
-    fn dictionary(&mut self, depth: usize) -> Result<PdfDictionary, PdfError> {
-        Self::check_depth(depth)?;
-        if !self.consume(b"<<") {
-            return Err(PdfError::UnreadableValidationStore);
-        }
-        let mut entries = Vec::new();
-        loop {
-            self.skip_trivia();
-            let closing = self.offset;
-            if self.consume(b">>") {
-                return Ok(PdfDictionary { entries, closing });
-            }
-            let name = self.name()?;
-            self.skip_trivia();
-            let value = self.value(depth)?;
-            entries.push(PdfDictionaryEntry { name, value });
-        }
-    }
-
-    fn value(&mut self, depth: usize) -> Result<core::ops::Range<usize>, PdfError> {
-        self.skip_trivia();
-        let start = self.offset;
-        if self.starts_with(b"<<") {
-            let _dictionary = self.dictionary(depth.saturating_add(1))?;
-        } else if self.consume(b"[") {
-            self.array_remainder(depth.saturating_add(1))?;
-        } else if self.consume(b"(") {
-            self.literal_string_remainder()?;
-        } else if self.consume(b"<") {
-            self.hex_string_remainder()?;
-        } else if self.starts_with(b"/") {
-            let _name = self.name()?;
-        } else {
-            let first = self.atom()?;
-            self.consume_reference_tail(first);
-        }
-        Ok(start..self.offset)
-    }
-
-    fn array_remainder(&mut self, depth: usize) -> Result<(), PdfError> {
-        Self::check_depth(depth)?;
-        loop {
-            self.skip_trivia();
-            if self.consume(b"]") {
-                return Ok(());
-            }
-            let _value = self.value(depth)?;
-        }
-    }
-
-    fn literal_string_remainder(&mut self) -> Result<(), PdfError> {
-        let mut depth = 1_usize;
-        while let Some(byte) = self.bytes.get(self.offset).copied() {
-            self.offset = self.offset.saturating_add(1);
-            match byte {
-                b'\\' => {
-                    let Some(escaped) = self.bytes.get(self.offset).copied() else {
-                        return Err(PdfError::UnreadableValidationStore);
-                    };
-                    self.offset = self.offset.saturating_add(1);
-                    if escaped == b'\r' && self.bytes.get(self.offset) == Some(&b'\n') {
-                        self.offset = self.offset.saturating_add(1);
-                    }
-                }
-                b'(' => {
-                    depth = depth.saturating_add(1);
-                    Self::check_depth(depth)?;
-                }
-                b')' => {
-                    depth = depth
-                        .checked_sub(1)
-                        .ok_or(PdfError::UnreadableValidationStore)?;
-                    if depth == 0 {
-                        return Ok(());
-                    }
-                }
-                _ => {}
-            }
-        }
-        Err(PdfError::UnreadableValidationStore)
-    }
-
-    fn hex_string_remainder(&mut self) -> Result<(), PdfError> {
-        while let Some(byte) = self.bytes.get(self.offset).copied() {
-            self.offset = self.offset.saturating_add(1);
-            if byte == b'>' {
-                return Ok(());
-            }
-        }
-        Err(PdfError::UnreadableValidationStore)
-    }
-
-    /// A name decoded according to PDF's `#xx` byte escapes.
-    fn name(&mut self) -> Result<Vec<u8>, PdfError> {
-        if !self.consume(b"/") {
-            return Err(PdfError::UnreadableValidationStore);
-        }
-        let mut decoded = Vec::new();
-        while let Some(byte) = self.bytes.get(self.offset).copied() {
-            if Self::is_whitespace(byte) || Self::is_delimiter(byte) {
-                break;
-            }
-            if byte == b'#' {
-                let high = self
-                    .bytes
-                    .get(self.offset.saturating_add(1))
-                    .and_then(|byte| Self::hex_digit(*byte));
-                let low = self
-                    .bytes
-                    .get(self.offset.saturating_add(2))
-                    .and_then(|byte| Self::hex_digit(*byte));
-                let (Some(high), Some(low)) = (high, low) else {
-                    return Err(PdfError::UnreadableValidationStore);
-                };
-                decoded.push(high.saturating_mul(16).saturating_add(low));
-                self.offset = self.offset.saturating_add(3);
-            } else {
-                decoded.push(byte);
-                self.offset = self.offset.saturating_add(1);
-            }
-        }
-        Ok(decoded)
-    }
-
-    /// One non-delimiter token.
-    fn atom(&mut self) -> Result<core::ops::Range<usize>, PdfError> {
-        let start = self.offset;
-        while self
-            .bytes
-            .get(self.offset)
-            .is_some_and(|byte| !Self::is_whitespace(*byte) && !Self::is_delimiter(*byte))
-        {
-            self.offset = self.offset.saturating_add(1);
-        }
-        if start == self.offset {
-            return Err(PdfError::UnreadableValidationStore);
-        }
-        Ok(start..self.offset)
-    }
-
-    /// Extend an atom value across `N N R` when that complete shape follows.
-    fn consume_reference_tail(&mut self, first: core::ops::Range<usize>) {
-        if parse_u32(&self.bytes[first]).is_none() {
-            return;
-        }
-        let after_first = self.offset;
-        let Some(_generation) = self.unsigned_u16() else {
-            self.offset = after_first;
-            return;
-        };
-        self.skip_trivia();
-        if !self.consume_keyword(b"R") {
-            self.offset = after_first;
-        }
-    }
-
-    /// A complete indirect reference at the current position.
-    fn reference(&mut self) -> Option<PdfObjectReference> {
-        let start = self.offset;
-        let number = self.unsigned_u32()?;
-        let Some(generation) = self.unsigned_u16() else {
-            self.offset = start;
-            return None;
-        };
-        self.skip_trivia();
-        if !self.consume_keyword(b"R") {
-            self.offset = start;
-            return None;
-        }
-        Some(PdfObjectReference { number, generation })
-    }
-
-    fn unsigned_u32(&mut self) -> Option<u32> {
-        self.unsigned_digits().and_then(parse_u32)
-    }
-
-    fn unsigned_u16(&mut self) -> Option<u16> {
-        self.unsigned_digits().and_then(parse_u16)
-    }
-
-    fn unsigned_digits(&mut self) -> Option<&'a [u8]> {
-        self.skip_trivia();
-        let start = self.offset;
-        while self.bytes.get(self.offset).is_some_and(u8::is_ascii_digit) {
-            self.offset = self.offset.saturating_add(1);
-        }
-        if start == self.offset
-            || self
-                .bytes
-                .get(self.offset)
-                .is_some_and(|byte| !Self::is_whitespace(*byte) && !Self::is_delimiter(*byte))
-        {
-            self.offset = start;
-            return None;
-        }
-        self.bytes.get(start..self.offset)
-    }
-
-    fn consume_keyword(&mut self, keyword: &[u8]) -> bool {
-        if !self.starts_with(keyword) {
-            return false;
-        }
-        let after = self.offset.saturating_add(keyword.len());
-        if self
-            .bytes
-            .get(after)
-            .is_some_and(|byte| !Self::is_whitespace(*byte) && !Self::is_delimiter(*byte))
-        {
-            return false;
-        }
-        self.offset = after;
-        true
-    }
-
-    fn require_end(&mut self) -> Result<(), PdfError> {
-        self.skip_trivia();
-        if self.offset == self.bytes.len() {
-            Ok(())
-        } else {
-            Err(PdfError::UnreadableValidationStore)
-        }
-    }
-
-    fn skip_trivia(&mut self) {
-        loop {
-            while self
-                .bytes
-                .get(self.offset)
-                .is_some_and(|byte| Self::is_whitespace(*byte))
-            {
-                self.offset = self.offset.saturating_add(1);
-            }
-            if self.bytes.get(self.offset) != Some(&b'%') {
-                return;
-            }
-            while self
-                .bytes
-                .get(self.offset)
-                .is_some_and(|byte| *byte != b'\r' && *byte != b'\n')
-            {
-                self.offset = self.offset.saturating_add(1);
-            }
-        }
-    }
-
-    fn consume(&mut self, token: &[u8]) -> bool {
-        if !self.starts_with(token) {
-            return false;
-        }
-        self.offset = self.offset.saturating_add(token.len());
-        true
-    }
-
-    fn starts_with(&self, token: &[u8]) -> bool {
-        self.bytes
-            .get(self.offset..)
-            .is_some_and(|rest| rest.starts_with(token))
-    }
-
-    const fn is_whitespace(byte: u8) -> bool {
-        byte == 0 || byte == b'\t' || byte == b'\n' || byte == 12 || byte == b'\r' || byte == b' '
-    }
-
-    const fn is_delimiter(byte: u8) -> bool {
-        matches!(byte, b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'/' | b'%')
-    }
-
-    const fn hex_digit(byte: u8) -> Option<u8> {
-        match byte {
-            b'0'..=b'9' => Some(byte - b'0'),
-            b'a'..=b'f' => Some(byte - b'a' + 10),
-            b'A'..=b'F' => Some(byte - b'A' + 10),
-            _ => None,
-        }
-    }
-
-    const fn check_depth(depth: usize) -> Result<(), PdfError> {
-        if depth <= MAX_PDF_VALUE_DEPTH {
-            Ok(())
-        } else {
-            Err(PdfError::UnreadableValidationStore)
-        }
-    }
-}
-
-/// Parse a value as exactly one indirect reference.
-fn complete_object_reference(value: &[u8]) -> Result<Option<PdfObjectReference>, PdfError> {
-    let mut parser = PdfValueParser::new(value);
-    parser.skip_trivia();
-    let reference = parser.reference();
-    if reference.is_some() {
-        parser.require_end()?;
-    }
-    Ok(reference)
-}
-
-/// Parse a DSS category as an array containing only indirect references.
-fn complete_reference_array(value: &[u8]) -> Result<Vec<PdfObjectReference>, PdfError> {
-    let mut parser = PdfValueParser::new(value);
-    parser.skip_trivia();
-    if !parser.consume(b"[") {
-        return Err(PdfError::UnreadableValidationStore);
-    }
-    PdfValueParser::check_depth(1)?;
-    let mut references = Vec::new();
-    loop {
-        parser.skip_trivia();
-        if parser.consume(b"]") {
-            parser.require_end()?;
-            return Ok(references);
-        }
-        let Some(reference) = parser.reference() else {
-            return Err(PdfError::UnreadableValidationStore);
-        };
-        references.push(reference);
-    }
-}
-
 /// Keep the first occurrence of each reference.
 fn ordered_unique_references(
     references: impl IntoIterator<Item = PdfObjectReference>,
@@ -979,23 +622,6 @@ fn reference_array_text(references: &[PdfObjectReference]) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     format!("[{body}]")
-}
-
-/// Resolve a direct or indirect DSS reference array.
-fn validation_references(
-    index: &PdfIndex<'_>,
-    value: &[u8],
-) -> Result<Vec<PdfObjectReference>, PdfError> {
-    let mut parser = PdfValueParser::new(value);
-    parser.skip_trivia();
-    if parser.starts_with(b"[") {
-        return complete_reference_array(value);
-    }
-    let reference = complete_object_reference(value)?.ok_or(PdfError::UnreadableValidationStore)?;
-    let array = index
-        .object_body_reference(reference)
-        .ok_or(PdfError::MissingObject(reference.number))?;
-    complete_reference_array(&array)
 }
 
 /// Replace one byte span without transcoding any retained PDF bytes.
@@ -1144,14 +770,14 @@ fn finish_placeholder(
 fn push_xref_and_trailer(
     update: &mut Vec<u8>,
     update_start: usize,
-    offsets: &mut [(u32, usize)],
+    offsets: &mut [(PdfObjectReference, usize)],
     size: u32,
-    catalog_number: u32,
+    catalog: PdfObjectReference,
     index: &PdfIndex<'_>,
 ) -> Result<(), PdfError> {
     let previous_xref = index.start_xref();
     let xref_at = update_start.saturating_add(update.len());
-    offsets.sort_unstable_by_key(|(number, _)| *number);
+    offsets.sort_unstable_by_key(|(reference, _)| reference.number);
     let carried = trailer_carry_forward(index.trailer());
     if index.newest_is_stream() {
         return xref_stream::push_stream_close(
@@ -1159,7 +785,7 @@ fn push_xref_and_trailer(
             xref_at,
             offsets,
             size,
-            catalog_number,
+            catalog,
             previous_xref,
             &carried,
         );
@@ -1167,8 +793,9 @@ fn push_xref_and_trailer(
     update.extend_from_slice(&cross_reference_section(offsets));
     update.extend_from_slice(
         format!(
-            "trailer\n<< /Size {size} /Root {catalog_number} 0 R /Prev {previous_xref}{carried}\
-             >>\nstartxref\n{xref_at}\n%%EOF\n"
+            "trailer\n<< /Size {size} /Root {} /Prev {previous_xref}{carried}\
+             >>\nstartxref\n{xref_at}\n%%EOF\n",
+            catalog.rendered()
         )
         .as_bytes(),
     );
@@ -1213,14 +840,6 @@ fn trailer_carry_forward(trailer: &[u8]) -> String {
             core::fmt::Write::write_fmt(&mut carried, format_args!(" /Info {number} 0 R"));
     }
     carried
-}
-
-/// Where the tokenizer is while walking an object body.
-enum Scan {
-    Regular,
-    Comment,
-    HexString,
-    LiteralString { depth: u32, escaped: bool },
 }
 
 /// Open the signature or timestamp dictionary and write its metadata.
@@ -1610,7 +1229,7 @@ struct ValidationObjectNumbers {
 /// Objects that make the newest catalog point at the merged store.
 struct ValidationStorePlan {
     next_object: u32,
-    objects: Vec<(u32, Vec<u8>)>,
+    objects: Vec<(PdfObjectReference, Vec<u8>)>,
 }
 
 /// Emit one stream for each distinct new evidence blob.
@@ -1619,14 +1238,17 @@ fn emit_validation_blobs(
     next_object: &mut u32,
     update_start: usize,
     update: &mut Vec<u8>,
-    offsets: &mut Vec<(u32, usize)>,
+    offsets: &mut Vec<(PdfObjectReference, usize)>,
 ) -> Vec<u32> {
     let unique = ordered_unique_blobs(blobs);
     let mut numbers = Vec::with_capacity(unique.len());
     for blob in unique {
         let number = *next_object;
         *next_object = (*next_object).saturating_add(1);
-        offsets.push((number, update_start.saturating_add(update.len())));
+        offsets.push((
+            PdfObjectReference::fresh(number),
+            update_start.saturating_add(update.len()),
+        ));
         update.extend_from_slice(
             format!("{number} 0 obj\n<< /Length {} >>\nstream\n", blob.len()).as_bytes(),
         );
@@ -1641,7 +1263,7 @@ fn emit_validation_blobs(
 fn validation_store_plan(
     index: &PdfIndex<'_>,
     catalog: &[u8],
-    catalog_number: u32,
+    catalog_reference: PdfObjectReference,
     next_object: u32,
     numbers: &ValidationObjectNumbers,
 ) -> Result<ValidationStorePlan, PdfError> {
@@ -1654,7 +1276,7 @@ fn validation_store_plan(
             next_object: next_object.saturating_add(1),
             objects: vec![
                 (
-                    store_number,
+                    PdfObjectReference::fresh(store_number),
                     validation_store_body(
                         &numbers.certificates,
                         &numbers.ocsp_responses,
@@ -1662,7 +1284,7 @@ fn validation_store_plan(
                     ),
                 ),
                 (
-                    catalog_number,
+                    catalog_reference,
                     insert_dictionary_entry(catalog, dictionary.closing, entry.as_bytes()),
                 ),
             ],
@@ -1673,9 +1295,6 @@ fn validation_store_plan(
         .get(value_span.clone())
         .ok_or(PdfError::UnreadableValidationStore)?;
     if let Some(reference) = complete_object_reference(value)? {
-        if reference.generation != 0 {
-            return Err(PdfError::UnreadableValidationStore);
-        }
         let store = index
             .object_body_reference(reference)
             .ok_or(PdfError::MissingObject(reference.number))?;
@@ -1688,7 +1307,7 @@ fn validation_store_plan(
         )?;
         return Ok(ValidationStorePlan {
             next_object,
-            objects: vec![(reference.number, merged)],
+            objects: vec![(reference, merged)],
         });
     }
 
@@ -1704,9 +1323,9 @@ fn validation_store_plan(
     Ok(ValidationStorePlan {
         next_object: next_object.saturating_add(1),
         objects: vec![
-            (store_number, merged),
+            (PdfObjectReference::fresh(store_number), merged),
             (
-                catalog_number,
+                catalog_reference,
                 replace_bytes(catalog, value_span, entry.as_bytes()),
             ),
         ],
@@ -1741,7 +1360,7 @@ pub fn append_validation_store(
     }
     let index = PdfIndex::parse(signed_pdf)?;
     let trailer = index.trailer();
-    let catalog_number =
+    let catalog_reference =
         dictionary_reference(trailer, b"/Root").ok_or(PdfError::MissingCatalogReference)?;
     let mut next_object = dictionary_integer(trailer, b"/Size").unwrap_or(0).max(1);
 
@@ -1751,7 +1370,7 @@ pub fn append_validation_store(
     }
     let update_start = out.len();
     let mut update = Vec::new();
-    let mut offsets: Vec<(u32, usize)> = Vec::new();
+    let mut offsets: Vec<(PdfObjectReference, usize)> = Vec::new();
 
     // Streams carry binary DER without PDF-string transcoding.
     let numbers = ValidationObjectNumbers {
@@ -1779,13 +1398,19 @@ pub fn append_validation_store(
     };
 
     let catalog = index
-        .object_body(catalog_number)
-        .ok_or(PdfError::MissingObject(catalog_number))?;
-    let plan = validation_store_plan(&index, &catalog, catalog_number, next_object, &numbers)?;
+        .object_body_reference(catalog_reference)
+        .ok_or(PdfError::MissingObject(catalog_reference.number))?;
+    let plan = validation_store_plan(&index, &catalog, catalog_reference, next_object, &numbers)
+        .map_err(|error| match error {
+            PdfError::MalformedValue | PdfError::NestingTooDeep => {
+                PdfError::UnreadableValidationStore
+            }
+            other => other,
+        })?;
     next_object = plan.next_object;
-    for (number, body) in plan.objects {
-        offsets.push((number, update_start.saturating_add(update.len())));
-        update.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+    for (reference, body) in plan.objects {
+        offsets.push((reference, update_start.saturating_add(update.len())));
+        update.extend_from_slice(format!("{} obj\n", reference.header()).as_bytes());
         update.extend_from_slice(&body);
         update.extend_from_slice(b"\nendobj\n");
     }
@@ -1795,7 +1420,7 @@ pub fn append_validation_store(
         update_start,
         &mut offsets,
         next_object,
-        catalog_number,
+        catalog_reference,
         &index,
     )?;
     out.extend_from_slice(&update);
@@ -1827,10 +1452,16 @@ fn write_byte_range(document: &mut [u8], at: usize, values: [usize; 4]) {
 /// Written as one subsection per object so the numbers need not be
 /// contiguous -- the catalog keeps its original number while the new
 /// objects take fresh ones at the end.
-fn cross_reference_section(offsets: &[(u32, usize)]) -> Vec<u8> {
+fn cross_reference_section(offsets: &[(PdfObjectReference, usize)]) -> Vec<u8> {
     let mut out = Vec::from("xref\n");
-    for (number, offset) in offsets {
-        out.extend_from_slice(format!("{number} 1\n{offset:010} 00000 n \n").as_bytes());
+    for (reference, offset) in offsets {
+        out.extend_from_slice(
+            format!(
+                "{} 1\n{offset:010} {:05} n \n",
+                reference.number, reference.generation
+            )
+            .as_bytes(),
+        );
     }
     out
 }
@@ -1851,408 +1482,6 @@ fn push_optional_text(out: &mut Vec<u8>, key: &str, value: Option<&str>) {
     out.extend_from_slice(b")\n");
 }
 
-/// The offset recorded by the file's last `startxref`.
-fn find_start_xref(pdf: &[u8]) -> Result<usize, PdfError> {
-    let at = find_last(pdf, b"startxref").ok_or(PdfError::MissingStartXref)?;
-    let tail = &pdf[at.saturating_add(b"startxref".len())..];
-    let digits: Vec<u8> = tail
-        .iter()
-        .skip_while(|byte| byte.is_ascii_whitespace())
-        .take_while(|byte| byte.is_ascii_digit())
-        .copied()
-        .collect();
-    if digits.is_empty() {
-        return Err(PdfError::MissingStartXref);
-    }
-    let text = String::from_utf8_lossy(&digits);
-    text.parse().map_err(|_ignored| PdfError::MissingStartXref)
-}
-
-/// Where one live object's bytes sit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum XrefLocation {
-    /// Free, or an entry type this reader does not know: the number
-    /// is claimed so older sections' copies stay shadowed, and a
-    /// reference to it resolves to nothing.
-    Free,
-    /// At a byte offset in the file, written as `N G obj`.
-    Direct {
-        /// The offset of the object header.
-        offset: usize,
-    },
-    /// Inside an object stream (ISO 32000-1 sec.7.5.7).
-    Compressed {
-        /// The object stream's own number.
-        container: u32,
-        /// The object's position among the stream's contents.
-        position: u32,
-    },
-}
-
-/// One object entry resolved from the xref chain.
-#[derive(Debug, Clone, Copy)]
-struct XrefEntry {
-    number: u32,
-    generation: u16,
-    location: XrefLocation,
-}
-
-/// The xref view of the current PDF revision, whichever shape its
-/// sections take.
-struct PdfIndex<'a> {
-    pdf: &'a [u8],
-    trailer: Vec<u8>,
-    start_xref: usize,
-    /// Whether the newest section is a cross-reference stream, which
-    /// decides the shape of the section an update appends.
-    newest_is_stream: bool,
-    /// The newest entry for each object number.
-    objects: HashMap<u32, XrefEntry>,
-}
-
-impl<'a> PdfIndex<'a> {
-    /// Maximum number of incremental updates followed through `/Prev`.
-    const MAX_XREF_DEPTH: usize = 64;
-
-    fn parse(pdf: &'a [u8]) -> Result<Self, PdfError> {
-        let start_xref = find_start_xref(pdf)?;
-        let mut next = Some(start_xref);
-        let mut visited = Vec::new();
-        let mut trailer = None;
-        let mut newest_is_stream = false;
-        let mut objects: HashMap<u32, XrefEntry> = HashMap::new();
-
-        for _ in 0..Self::MAX_XREF_DEPTH {
-            let Some(offset) = next else { break };
-            if visited.contains(&offset) {
-                return Err(PdfError::MissingTrailer);
-            }
-            visited.push(offset);
-
-            let section = parse_xref_section(pdf, offset)?;
-            if trailer.is_none() {
-                trailer = Some(section.trailer.clone());
-                newest_is_stream = section.is_stream;
-            }
-            for entry in section.entries {
-                // Newer xref sections win. Keep a newer free entry too:
-                // it deletes the object and must suppress older copies.
-                objects.entry(entry.number).or_insert(entry);
-            }
-            next = dictionary_usize(&section.trailer, b"/Prev");
-        }
-
-        Ok(Self {
-            pdf,
-            trailer: trailer.ok_or(PdfError::MissingTrailer)?,
-            start_xref,
-            newest_is_stream,
-            objects,
-        })
-    }
-
-    fn trailer(&self) -> &[u8] {
-        &self.trailer
-    }
-
-    const fn start_xref(&self) -> usize {
-        self.start_xref
-    }
-
-    /// Whether an update must close with a cross-reference stream.
-    const fn newest_is_stream(&self) -> bool {
-        self.newest_is_stream
-    }
-
-    fn object_body(&self, number: u32) -> Option<Vec<u8>> {
-        self.object_body_reference(PdfObjectReference {
-            number,
-            generation: 0,
-        })
-    }
-
-    fn object_body_reference(&self, reference: PdfObjectReference) -> Option<Vec<u8>> {
-        let entry = self
-            .objects
-            .get(&reference.number)
-            .filter(|entry| entry.generation == reference.generation)?;
-        match entry.location {
-            XrefLocation::Free => None,
-            XrefLocation::Direct { offset } => {
-                object_body_at(self.pdf, reference.number, reference.generation, offset)
-            }
-            XrefLocation::Compressed {
-                container,
-                position,
-            } => {
-                let carrier = self.objects.get(&container)?;
-                let XrefLocation::Direct { offset } = carrier.location else {
-                    return None;
-                };
-                xref_stream::compressed_body(self.pdf, offset, reference.number, position)
-            }
-        }
-    }
-}
-
-struct XrefSection {
-    trailer: Vec<u8>,
-    entries: Vec<XrefEntry>,
-    /// Whether the section is a cross-reference stream.
-    is_stream: bool,
-}
-
-fn parse_xref_section(pdf: &[u8], offset: usize) -> Result<XrefSection, PdfError> {
-    let mut cursor = skip_pdf_whitespace(pdf, offset);
-    let Some(rest) = pdf.get(cursor..) else {
-        return Err(PdfError::MissingStartXref);
-    };
-    if !rest.starts_with(b"xref") {
-        return xref_stream::parse_stream_section(pdf, cursor);
-    }
-    cursor = cursor.saturating_add(b"xref".len());
-
-    let mut entries = Vec::new();
-    loop {
-        let token = read_pdf_token(pdf, &mut cursor).ok_or(PdfError::MissingTrailer)?;
-        if token == b"trailer" {
-            let (trailer, _after) = dictionary_at(pdf, cursor).ok_or(PdfError::MissingTrailer)?;
-            if dictionary_usize(&trailer, b"/Size").is_some_and(|size| size > MAX_XREF_ENTRIES) {
-                return Err(PdfError::MissingTrailer);
-            }
-            return hybrid_merged(pdf, trailer, entries);
-        }
-
-        let start = parse_u32(token).ok_or(PdfError::MissingTrailer)?;
-        let count = parse_u32(read_pdf_token(pdf, &mut cursor).ok_or(PdfError::MissingTrailer)?)
-            .ok_or(PdfError::MissingTrailer)?;
-        let end = usize::try_from(start)
-            .ok()
-            .zip(usize::try_from(count).ok())
-            .and_then(|(start, count)| start.checked_add(count))
-            .ok_or(PdfError::MissingTrailer)?;
-        // The subsections together declare no more entries than the
-        // ceiling either.
-        let total = usize::try_from(count)
-            .ok()
-            .and_then(|count| entries.len().checked_add(count))
-            .ok_or(PdfError::MissingTrailer)?;
-        if end > MAX_XREF_ENTRIES || total > MAX_XREF_ENTRIES {
-            return Err(PdfError::MissingTrailer);
-        }
-
-        for index in 0..count {
-            let object_offset =
-                parse_usize(read_pdf_token(pdf, &mut cursor).ok_or(PdfError::MissingTrailer)?)
-                    .ok_or(PdfError::MissingTrailer)?;
-            let generation =
-                parse_u16(read_pdf_token(pdf, &mut cursor).ok_or(PdfError::MissingTrailer)?)
-                    .ok_or(PdfError::MissingTrailer)?;
-            let flag = read_pdf_token(pdf, &mut cursor).ok_or(PdfError::MissingTrailer)?;
-            let number = start.checked_add(index).ok_or(PdfError::MissingTrailer)?;
-            let location = if flag == b"n" {
-                XrefLocation::Direct {
-                    offset: object_offset,
-                }
-            } else {
-                XrefLocation::Free
-            };
-            entries.push(XrefEntry {
-                number,
-                generation,
-                location,
-            });
-        }
-    }
-}
-
-/// A classic table section, merged with the cross-reference stream a
-/// hybrid trailer names.
-///
-/// A hybrid revision keeps the authoritative copy of its entries in
-/// the stream its `/XRefStm` key points at; the table is the fallback
-/// for readers that predate streams (ISO 32000-1 sec.7.5.8.4). The
-/// stream's entries go first, so they win the newest-copy merge.
-fn hybrid_merged(
-    pdf: &[u8],
-    trailer: Vec<u8>,
-    entries: Vec<XrefEntry>,
-) -> Result<XrefSection, PdfError> {
-    let Some(hybrid) = dictionary_usize(&trailer, b"/XRefStm") else {
-        return Ok(XrefSection {
-            trailer,
-            entries,
-            is_stream: false,
-        });
-    };
-    let stream = xref_stream::parse_stream_section(pdf, skip_pdf_whitespace(pdf, hybrid))?;
-    let mut combined = stream.entries;
-    combined.extend(entries);
-    Ok(XrefSection {
-        trailer,
-        entries: combined,
-        is_stream: false,
-    })
-}
-
-fn skip_pdf_whitespace(pdf: &[u8], mut cursor: usize) -> usize {
-    while pdf.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-        cursor = cursor.saturating_add(1);
-    }
-    cursor
-}
-
-fn read_pdf_token<'a>(pdf: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
-    *cursor = skip_pdf_whitespace(pdf, *cursor);
-    let start = *cursor;
-    while pdf
-        .get(*cursor)
-        .is_some_and(|byte| !byte.is_ascii_whitespace())
-    {
-        *cursor = (*cursor).saturating_add(1);
-    }
-    (start < *cursor).then(|| &pdf[start..*cursor])
-}
-
-fn parse_usize(digits: &[u8]) -> Option<usize> {
-    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    let mut out = 0_usize;
-    for digit in digits {
-        out = out
-            .checked_mul(10)?
-            .checked_add(usize::from(digit.saturating_sub(b'0')))?;
-    }
-    Some(out)
-}
-
-fn parse_u32(digits: &[u8]) -> Option<u32> {
-    parse_usize(digits).and_then(|value| u32::try_from(value).ok())
-}
-
-fn parse_u16(digits: &[u8]) -> Option<u16> {
-    parse_usize(digits).and_then(|value| u16::try_from(value).ok())
-}
-
-fn dictionary_at(pdf: &[u8], cursor: usize) -> Option<(Vec<u8>, usize)> {
-    let start = skip_pdf_whitespace(pdf, cursor);
-    if !pdf.get(start..)?.starts_with(b"<<") {
-        return None;
-    }
-
-    let mut cursor = start;
-    let mut depth = 0_u32;
-    let mut state = Scan::Regular;
-    while cursor < pdf.len() {
-        let byte = pdf[cursor];
-        match state {
-            Scan::Regular => match byte {
-                b'%' => {
-                    state = Scan::Comment;
-                    cursor = cursor.saturating_add(1);
-                }
-                b'(' => {
-                    state = Scan::LiteralString {
-                        depth: 1,
-                        escaped: false,
-                    };
-                    cursor = cursor.saturating_add(1);
-                }
-                b'<' if pdf.get(cursor.saturating_add(1)) == Some(&b'<') => {
-                    depth = depth.saturating_add(1);
-                    cursor = cursor.saturating_add(2);
-                }
-                b'<' => {
-                    state = Scan::HexString;
-                    cursor = cursor.saturating_add(1);
-                }
-                b'>' if pdf.get(cursor.saturating_add(1)) == Some(&b'>') => {
-                    depth = depth.checked_sub(1)?;
-                    cursor = cursor.saturating_add(2);
-                    if depth == 0 {
-                        return Some((pdf[start..cursor].to_vec(), cursor));
-                    }
-                }
-                _ => cursor = cursor.saturating_add(1),
-            },
-            Scan::Comment => {
-                cursor = cursor.saturating_add(1);
-                if byte == b'\r' || byte == b'\n' {
-                    state = Scan::Regular;
-                }
-            }
-            Scan::HexString => {
-                cursor = cursor.saturating_add(1);
-                if byte == b'>' {
-                    state = Scan::Regular;
-                }
-            }
-            Scan::LiteralString {
-                mut depth,
-                mut escaped,
-            } => {
-                cursor = cursor.saturating_add(1);
-                if escaped {
-                    escaped = false;
-                    state = Scan::LiteralString { depth, escaped };
-                    continue;
-                }
-                match byte {
-                    b'\\' => {
-                        escaped = true;
-                        state = Scan::LiteralString { depth, escaped };
-                    }
-                    b'(' => {
-                        depth = depth.saturating_add(1);
-                        state = Scan::LiteralString { depth, escaped };
-                    }
-                    b')' => {
-                        depth = depth.checked_sub(1)?;
-                        if depth == 0 {
-                            state = Scan::Regular;
-                        } else {
-                            state = Scan::LiteralString { depth, escaped };
-                        }
-                    }
-                    _ => state = Scan::LiteralString { depth, escaped },
-                }
-            }
-        }
-    }
-    None
-}
-
-/// The `N 0 R` object number stored under `key`.
-fn dictionary_reference(dictionary: &[u8], key: &[u8]) -> Option<u32> {
-    let at = find_first(dictionary, key)?;
-    let rest = &dictionary[at.saturating_add(key.len())..];
-    let digits: Vec<u8> = rest
-        .iter()
-        .skip_while(|byte| byte.is_ascii_whitespace())
-        .take_while(|byte| byte.is_ascii_digit())
-        .copied()
-        .collect();
-    String::from_utf8_lossy(&digits).parse().ok()
-}
-
-/// The integer stored under `key`.
-fn dictionary_integer(dictionary: &[u8], key: &[u8]) -> Option<u32> {
-    dictionary_usize(dictionary, key).and_then(|value| u32::try_from(value).ok())
-}
-
-fn dictionary_usize(dictionary: &[u8], key: &[u8]) -> Option<usize> {
-    let at = find_first(dictionary, key)?;
-    let rest = &dictionary[at.saturating_add(key.len())..];
-    let digits: Vec<u8> = rest
-        .iter()
-        .skip_while(|byte| byte.is_ascii_whitespace())
-        .take_while(|byte| byte.is_ascii_digit())
-        .copied()
-        .collect();
-    parse_usize(&digits)
-}
-
 /// Test helper for small PDF fragments. Production reads through
 /// [`PdfIndex::object_body`].
 #[cfg(test)]
@@ -2261,18 +1490,6 @@ fn object_body(pdf: &[u8], number: u32) -> Option<Vec<u8>> {
         .ok()
         .and_then(|index| index.object_body(number))
         .or_else(|| raw_object_body(pdf, number))
-}
-
-fn object_body_at(pdf: &[u8], number: u32, generation: u16, offset: usize) -> Option<Vec<u8>> {
-    let mut cursor = offset;
-    let actual_number = parse_u32(read_pdf_token(pdf, &mut cursor)?)?;
-    let actual_generation = parse_u16(read_pdf_token(pdf, &mut cursor)?)?;
-    let keyword = read_pdf_token(pdf, &mut cursor)?;
-    if actual_number != number || actual_generation != generation || keyword != b"obj" {
-        return None;
-    }
-    let end = find_first(pdf.get(cursor..)?, b"endobj")?;
-    Some(pdf[cursor..cursor.saturating_add(end)].to_vec())
 }
 
 #[cfg(test)]
@@ -2320,7 +1537,9 @@ fn first_page_number(index: &PdfIndex<'_>, catalog: &[u8]) -> Result<u32, PdfErr
     /// a `/Kids` cycle would otherwise spin here forever.
     const MAX_DEPTH: usize = 32;
 
-    let mut number = dictionary_reference(catalog, b"/Pages").ok_or(PdfError::MissingPageTree)?;
+    let mut number = dictionary_reference(catalog, b"/Pages")
+        .ok_or(PdfError::MissingPageTree)?
+        .number;
     for _ in 0..MAX_DEPTH {
         let node = index
             .object_body(number)
@@ -2347,7 +1566,9 @@ fn last_page_number(index: &PdfIndex<'_>, catalog: &[u8]) -> Result<u32, PdfErro
     /// a `/Kids` cycle would otherwise spin here forever.
     const MAX_DEPTH: usize = 32;
 
-    let mut number = dictionary_reference(catalog, b"/Pages").ok_or(PdfError::MissingPageTree)?;
+    let mut number = dictionary_reference(catalog, b"/Pages")
+        .ok_or(PdfError::MissingPageTree)?
+        .number;
     for _ in 0..MAX_DEPTH {
         let node = index
             .object_body(number)
@@ -2456,7 +1677,8 @@ fn inherited_page_rectangle(
             return Some(crop);
         }
         media_box = media_box.or_else(|| dictionary_rectangle(&body, b"MediaBox"));
-        let Some(parent) = dictionary_reference(&body, b"/Parent") else {
+        let Some(parent) = dictionary_reference(&body, b"/Parent").map(|parent| parent.number)
+        else {
             break;
         };
         if parent == number {
@@ -2576,26 +1798,6 @@ fn insert_into_dictionary(object: &[u8], entry: &str, key: &[u8]) -> Vec<u8> {
     out
 }
 
-/// First occurrence of `needle`.
-fn find_first(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-/// Last occurrence of `needle`.
-fn find_last(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .rposition(|window| window == needle)
-}
-
 #[cfg(test)]
 mod tests {
     use crate::asic::DataObject;
@@ -2604,13 +1806,15 @@ mod tests {
     use crate::validation::ValidationMaterial;
     use std::collections::HashMap;
 
+    use super::index::{
+        MAX_PDF_VALUE_DEPTH, MAX_XREF_ENTRIES, XrefEntry, XrefLocation, parse_xref_section,
+    };
     use super::{
         AnnotsTarget, DEFAULT_SIGNATURE_CAPACITY, FieldListTarget, MAX_FIELD_NAME_BYTES,
-        MAX_XREF_ENTRIES, PdfDictionary, PdfError, PdfIndex, SignatureMetadata, StampLanguage,
-        VisibleSignature, XrefEntry, XrefLocation, append_validation_store,
-        complete_object_reference, dictionary_reference, existing_field_names, last_object_header,
-        last_reference, object_body, parse_xref_section, plan_annotation, plan_field_list, prepare,
-        prepare_document_timestamp, validation_references,
+        PdfDictionary, PdfError, PdfIndex, SignatureMetadata, StampLanguage, VisibleSignature,
+        append_validation_store, complete_object_reference, dictionary_reference,
+        existing_field_names, last_object_header, last_reference, object_body, plan_annotation,
+        plan_field_list, prepare, prepare_document_timestamp, validation_references,
     };
 
     const CERTIFICATE_DER: &[u8] =
@@ -2930,21 +2134,17 @@ mod tests {
                 );
             }
         }
-        PdfIndex {
-            pdf,
-            trailer: Vec::new(),
-            start_xref: 0,
-            newest_is_stream: false,
-            objects,
-        }
+        PdfIndex::from_entries(pdf, objects)
     }
 
     /// The stream objects named by one top-level DSS category.
     fn validation_object_bodies(pdf: &[u8], category: &[u8]) -> Vec<Vec<u8>> {
         let index = PdfIndex::parse(pdf).expect("PDF indexes");
-        let catalog_number =
+        let catalog_reference =
             dictionary_reference(index.trailer(), b"/Root").expect("catalog reference");
-        let catalog = index.object_body(catalog_number).expect("catalog object");
+        let catalog = index
+            .object_body_reference(catalog_reference)
+            .expect("catalog object");
         let catalog_dictionary = PdfDictionary::parse(&catalog).expect("catalog dictionary");
         let dss_entry = catalog_dictionary
             .entry(b"DSS")
@@ -3700,12 +2900,12 @@ trailer\n<< /Size 5 /Root 1 0 R /Info 4 0 R /ID[<AA><BB>] >>\nstartxref\n0\n%%EO
         let nested =
             |depth: usize| format!("<< /Future {}0{} >>", "[".repeat(depth), "]".repeat(depth));
         assert!(
-            PdfDictionary::parse(nested(63).as_bytes()).is_ok(),
-            "the root dictionary plus 63 arrays is the depth limit"
+            PdfDictionary::parse(nested(MAX_PDF_VALUE_DEPTH - 1).as_bytes()).is_ok(),
+            "the root dictionary plus one array fewer than the bound is the depth limit"
         );
         assert!(matches!(
-            PdfDictionary::parse(nested(64).as_bytes()),
-            Err(PdfError::UnreadableValidationStore)
+            PdfDictionary::parse(nested(MAX_PDF_VALUE_DEPTH).as_bytes()),
+            Err(PdfError::NestingTooDeep)
         ));
     }
 

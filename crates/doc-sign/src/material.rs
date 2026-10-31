@@ -38,10 +38,8 @@ use crate::validation::ValidationMaterial;
 use crate::x509_ext::CertificateExt;
 use refineid_cms::oid::Oid;
 use refineid_cms::x509::{
-    BasicConstraints, Certificate, DateTime, KeyUsage, KeyUsageMeta, Name, OwnedCert,
-    extract_key_usage,
+    BasicConstraints, Certificate, DateTime, KeyUsage, KeyUsageMeta, OwnedCert,
 };
-use sha1::{Digest as Sha1Digest, Sha1};
 
 use crate::ber::{
     BerTag, BerTlv, BerTlvAny, BerTlvIter, BitString, Boolean, Integer, OctetString, Oid as BerOid,
@@ -68,17 +66,11 @@ pub fn now_date_time() -> DateTime {
 /// Cap on a fetched certificate or OCSP response.
 const MAX_FETCH_BYTES: usize = 64 * 1024;
 
-/// SHA-1 output width, for the OCSP `CertID` hashes.
-const SHA1_OUTPUT_LEN: usize = 20;
-
-/// How far a responder's clock may run ahead of ours before its answer
-/// is treated as wrong rather than merely skewed.
-///
-/// `now` is read once before the walk, so every response is compared
-/// against a reading that predates its own round trip. Five minutes is
-/// the allowance validators conventionally give between two machines,
-/// and is small enough that a genuinely misdated response still fails.
-const MAX_CLOCK_SKEW: core::time::Duration = core::time::Duration::from_mins(5);
+// How far a responder's clock may run ahead of ours before its answer
+// is treated as wrong rather than merely skewed. `now` is read once
+// before the walk, so every response is compared against a reading
+// that predates its own round trip.
+use crate::verification::trust::MAX_CLOCK_SKEW;
 
 /// Maximum age of an OCSP answer whose responder omitted `nextUpdate`.
 ///
@@ -280,33 +272,6 @@ pub fn verify_chain_to_approved_anchor(
         &HttpEvidenceProvider,
         &mut collection,
     )
-}
-
-/// Legacy entry point retained only to fail closed while callers move to
-/// [`collect_chains`]. It has no anchor input and therefore cannot make
-/// an LT claim.
-///
-/// # Errors
-/// Always returns [`MaterialError::NoTrustAnchor`].
-#[deprecated(note = "use collect_chains with explicit per-chain approved anchors")]
-pub const fn collect(_signer_der: &[u8]) -> Result<ValidationMaterial, MaterialError> {
-    Err(MaterialError::NoTrustAnchor)
-}
-
-/// Legacy timestamp entry point that fails closed.
-///
-/// Callers must move verified timestamp signers into separate
-/// [`ChainStart`] values. Parsing every embedded CMS certificate is not
-/// path authentication.
-///
-/// # Errors
-/// Always returns [`MaterialError::NoTrustAnchor`].
-#[deprecated(note = "verify each timestamp and use collect_chains with its approved anchors")]
-pub const fn collect_with_timestamps(
-    _signer_der: &[u8],
-    _tokens: &[Vec<u8>],
-) -> Result<ValidationMaterial, MaterialError> {
-    Err(MaterialError::NoTrustAnchor)
 }
 
 /// Material plus every certificate available for later path starts.
@@ -1229,7 +1194,7 @@ fn collect_ocsp_status(
     failures: &mut Vec<String>,
 ) -> Result<(Option<Vec<u8>>, Option<String>), MaterialError> {
     let key_hash = ocsp::IssuerKeyHash::from_subject_public_key(&issuer.spki);
-    let name_hash = issuer_name_hash(&subject.issuer);
+    let name_hash = ocsp::IssuerNameHash::from_name(subject.issuer);
 
     for url in bounded_certificate_addresses(subject.ocsp_urls()) {
         let nonce = match ocsp::OcspNonce::random() {
@@ -1258,8 +1223,6 @@ fn collect_ocsp_status(
             &response,
             subject,
             issuer,
-            name_hash,
-            key_hash,
             &nonce,
             reference_time,
         ) {
@@ -1278,17 +1241,7 @@ fn collect_crl_status(
     reference_time: DateTime,
     failures: &mut Vec<String>,
 ) -> Result<Option<Vec<u8>>, MaterialError> {
-    let issuer_may_sign_crls = issuer
-        .extensions
-        .and_then(extract_key_usage)
-        .is_some_and(|usage| usage.crl_sign);
     for url in bounded_certificate_addresses(subject.crl_distribution_urls()) {
-        if !issuer_may_sign_crls {
-            failures.push(format!(
-                "{url}: issuer Key Usage does not permit CRL signing"
-            ));
-            break;
-        }
         let der = match http::get(&url, MAX_CRL_BYTES, http::USER_AGENT) {
             Ok(der) => der,
             Err(why) => {
@@ -1309,10 +1262,10 @@ fn collect_crl_status(
             continue;
         }
 
-        let verified = match VerifiedCrl::verify(&view, &issuer.spki) {
+        let verified = match VerifiedCrl::verify(&view, *issuer) {
             Ok(verified) => verified,
             Err(why) => {
-                failures.push(format!("{url}: signature: {why}"));
+                failures.push(format!("{url}: {why}"));
                 continue;
             }
         };
@@ -1366,17 +1319,11 @@ fn check_crl_times(
 /// status can only be read after signer identity, authorization, and
 /// signature verification; the type system says so rather than a
 /// comment.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Every argument is one thing the check needs and none can be derived from the others: the response, the certificate it should be about, the issuer that should have signed it, the two CertID hashes naming that issuer, the nonce sent, the clock reading the whole walk shares, and whether a missing echo is fatal. Bundling them into a struct would move the same eight values behind a name that adds nothing."
-)]
 fn check_response(
     nonce_policy: NoncePolicy,
     der: &[u8],
     subject: &Certificate<'_>,
     issuer: &Certificate<'_>,
-    name_hash: ocsp::IssuerNameHash,
-    key_hash: ocsp::IssuerKeyHash,
     nonce: &ocsp::OcspNonce,
     now: DateTime,
 ) -> Result<(), MaterialError> {
@@ -1393,38 +1340,40 @@ fn check_response(
         .basic
         .ok_or_else(|| MaterialError::Revocation("no basic response".to_owned()))?;
 
-    // Signed by the issuer, or by a responder the issuer delegated to per RFC 6960 §4.2.2.2.
-    let verified = ocsp::VerifiedOcspResponse::verify(&basic, &issuer.spki)
-        .ok()
-        .or_else(|| {
-            basic.embedded_cert_ders.iter().find_map(|embedded| {
-                let owned = OwnedCert::from_der(embedded).ok()?;
-                let responder = owned.view();
-                // 1. Responder certificate must be directly issued and signed by the CA (issuer)
-                if responder.issuer.as_der() != issuer.subject.as_der() {
-                    return None;
+    // Signed by the issuer, or by a responder the issuer delegated to
+    // (RFC 6960 sec.4.2.2.2); `ResponderID` selects which one.
+    let embedded: Vec<OwnedCert> = basic
+        .embedded_cert_ders
+        .iter()
+        .filter_map(|der| OwnedCert::from_der(der).ok())
+        .collect();
+    let mut refusal = None;
+    let verified = core::iter::once(*issuer)
+        .chain(embedded.iter().map(OwnedCert::view))
+        .find_map(
+            |signer| match ocsp::VerifiedOcspResponse::verify(&basic, signer, *issuer) {
+                Ok(verified) => Some(verified),
+                Err(ocsp::OcspVerifyError::ResponderIdMismatch) => None,
+                Err(why) => {
+                    refusal = Some(why);
+                    None
                 }
-                responder.verify_signed_by(*issuer).ok()?;
-                // 2. Responder certificate must be valid at `now`
-                validate_certificate_time(&responder, now).ok()?;
-                // 3. Responder must include the OCSPSigning Extended Key Usage
-                let profile = validate_path_extensions(&responder).ok()?;
-                if !profile.ocsp_signing_extended_key_usage {
-                    return None;
-                }
-                ocsp::VerifiedOcspResponse::verify(&basic, &responder.spki).ok()
-            })
-        })
+            },
+        )
         .ok_or_else(|| {
-            MaterialError::Revocation(
-                "signature verifies against neither the issuer nor an authorized delegated responder"
-                    .to_owned(),
-            )
+            MaterialError::Revocation(refusal.map_or_else(
+                || "no certificate matches the response's ResponderID".to_owned(),
+                |why| format!("responder not authorized: {why}"),
+            ))
         })?;
 
     // The nonce is what makes this answer this request's, rather than
     // one recorded earlier and replayed.
-    match basic.nonce.as_deref() {
+    match basic
+        .nonce
+        .as_ref()
+        .map(crate::ocsp::ResponseNonce::as_bytes)
+    {
         Some(echoed) if echoed == nonce.as_bytes() => {}
         Some(_) => {
             return Err(MaterialError::Revocation(
@@ -1453,12 +1402,7 @@ fn check_response(
         None => {}
     }
 
-    let subject_serial = subject.serial();
-    let Some(answer) = verified.single_responses().iter().find(|entry| {
-        entry
-            .cert_id
-            .matches_request(name_hash, key_hash, &subject_serial)
-    }) else {
+    let Some(answer) = verified.response_for(*subject) else {
         return Err(MaterialError::Revocation(
             "response carries no SingleResponse for this request's CertID".to_owned(),
         ));
@@ -1542,16 +1486,6 @@ fn check_ocsp_times(
         ));
     }
     Ok(())
-}
-
-/// SHA-1 of an issuer's DER name, as `CertID` wants it.
-fn issuer_name_hash(issuer: &Name<'_>) -> ocsp::IssuerNameHash {
-    let mut hash = <Sha1 as Sha1Digest>::new();
-    hash.update(issuer.as_der());
-    let out = hash.finalize();
-    let mut buffer = [0_u8; SHA1_OUTPUT_LEN];
-    buffer.copy_from_slice(&out);
-    ocsp::IssuerNameHash::new(buffer)
 }
 
 /// Keep certificate-advertised endpoints distinct and bounded in their
@@ -2088,24 +2022,6 @@ mod tests {
             &deep.enter(&MAX_DEPTH.to_le_bytes()),
             &Err(MaterialError::ChainTooDeep),
             "depth error",
-        )
-    }
-
-    #[test]
-    #[allow(
-        deprecated,
-        reason = "the test proves the temporary compatibility gates fail closed"
-    )]
-    fn legacy_anchorless_entry_points_fail_closed() -> TestResult {
-        check(
-            &collect(DVV_INTERMEDIATE_DER),
-            &Err(MaterialError::NoTrustAnchor),
-            "legacy signer collector",
-        )?;
-        check(
-            &collect_with_timestamps(DVV_INTERMEDIATE_DER, &[]),
-            &Err(MaterialError::NoTrustAnchor),
-            "legacy timestamp collector",
         )
     }
 

@@ -413,9 +413,7 @@ impl TokenKeyMaterial {
                     point: der_octet_string(point.as_bytes()),
                 })
             }
-            PublicKeyAlgorithm::Ec(_)
-            | PublicKeyAlgorithm::EcExplicit { .. }
-            | PublicKeyAlgorithm::Other => Err(CKR_DEVICE_ERROR),
+            PublicKeyAlgorithm::Ec(_) | PublicKeyAlgorithm::Other => Err(CKR_DEVICE_ERROR),
         }
     }
 

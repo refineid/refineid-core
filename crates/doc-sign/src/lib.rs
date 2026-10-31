@@ -21,7 +21,6 @@
 #![forbid(unsafe_code)]
 
 pub mod asic;
-pub mod asic_verify;
 pub mod base64;
 /// Canonical BER encoding and parsing primitives re-exported from `refineid_ber`.
 pub(crate) mod ber {
@@ -65,12 +64,15 @@ pub mod service;
 pub(crate) mod test_support;
 #[cfg(test)]
 pub(crate) mod test_util;
+#[cfg(any(test, feature = "testkit"))]
+pub mod testkit;
 pub mod text;
 pub mod timestamp;
 pub mod trust;
 pub mod trust_roots;
 pub mod uri;
 pub mod validation;
+pub mod verification;
 pub mod verify;
 pub mod x509_ext;
 pub mod xades;

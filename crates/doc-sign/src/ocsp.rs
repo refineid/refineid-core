@@ -29,14 +29,17 @@
 //!
 //! The request side also owns the nonce: [`OcspNonce`] draws the
 //! RFC 8954 randomness and [`build_request_with_nonce`] encodes the
-//! extension. Out of scope: responder signature verification (trust
-//! lives a layer up) and the HTTP transport (lib-core stays HTTP-free
-//! per the crate's charter).
+//! extension. [`VerifiedOcspResponse::verify`] authenticates and
+//! authorizes the responder (RFC 6960 sec.4.2.2.2) before any status
+//! can be read. Out of scope: the HTTP transport.
 
 use crate::ber::tlv;
 use crate::identity::CertSerial;
+use crate::x509_ext::CertificateExt as _;
 use refineid_cms::oid::{Oid, known};
-use refineid_cms::x509::{DateTime, X509Error};
+use refineid_cms::x509::{
+    Certificate, DateTime, Name, PathExtensionError, X509Error, path_extension_profile,
+};
 use spki::der::asn1::{AnyRef, ObjectIdentifier};
 use spki::der::{Decode as _, Reader as _, SliceReader, Tag, Tagged as _};
 
@@ -49,9 +52,20 @@ use spki::der::{Decode as _, Reader as _, SliceReader, Tag, Tagged as _};
 const OID_SHA1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.14.3.2.26");
 
 /// What [`OcspHelpers::parse_response_data`] takes out of a
-/// `ResponseData`: when the responder spoke, what it said about each
-/// certificate, and the nonce it echoed back if it echoed one.
-type ResponseDataParts = (DateTime, Vec<SingleResponse>, Option<Vec<u8>>);
+/// `ResponseData`: who signed, when the responder spoke, what it said
+/// about each certificate, and the nonce it echoed back if it echoed
+/// one.
+type ResponseDataParts<'a> = (
+    ResponderId<'a>,
+    DateTime,
+    Vec<SingleResponse>,
+    Option<ResponseNonce>,
+);
+
+/// Octets of a SHA-1 digest (FIPS 180-4 sec.1), the width of every
+/// `CertID` hash and of `ResponderID.byKey` (RFC 6960 sec.4.1.1,
+/// sec.4.2.1).
+const SHA1_LEN: usize = crate::digest::SHA1_LEN;
 
 /// `id-pkix-ocsp-nonce` (RFC 8954 sec.2.1).
 const OID_OCSP_NONCE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.48.1.2");
@@ -61,13 +75,20 @@ const OID_OCSP_NONCE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5
 /// match: the byte is what is on the wire, and it does not move when
 /// the `der` crate reorganises its tag types.
 const TAG_INTEGER: u8 = 0x02;
+
+/// Universal BOOLEAN (`0x01`).
+const TAG_BOOLEAN: u8 = 0x01;
+
+/// DER BOOLEAN TRUE (X.690 sec.11.1).
+const DER_TRUE: u8 = 0xFF;
 /// `OCTET STRING`.
 const TAG_OCTET_STRING: u8 = 0x04;
 /// `NULL`, always zero-length.
 const TAG_NULL: u8 = 0x05;
 /// `OBJECT IDENTIFIER`.
 const TAG_OID: u8 = 0x06;
-/// `GeneralizedTime`.
+/// `GeneralizedTime`, written only by the test fixtures.
+#[cfg(test)]
 const TAG_GENERALIZED_TIME: u8 = 0x18;
 /// `SEQUENCE`, constructed.
 const TAG_SEQUENCE: u8 = 0x30;
@@ -119,6 +140,13 @@ impl IssuerNameHash {
     #[must_use]
     pub const fn as_bytes(self) -> [u8; 20] {
         self.0
+    }
+
+    /// Compute the issuer-name hash from its exact DER `Name` (RFC 6960
+    /// sec.4.1.1).
+    #[must_use]
+    pub fn from_name(name: Name<'_>) -> Self {
+        Self::new(crate::digest::Sha1::of(name.as_der()).into_bytes())
     }
 }
 
@@ -176,6 +204,44 @@ impl OcspNonce {
     /// value (RFC 8954 sec.2.1).
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// `ResponderID.byKey` (RFC 6960 sec.4.2.1): SHA-1 of the responder's
+/// `subjectPublicKey` BIT STRING value, which the response names its
+/// signer by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResponderKeyHash([u8; SHA1_LEN]);
+
+impl ResponderKeyHash {
+    /// The key hash of the responder holding `spki`.
+    #[must_use]
+    pub fn from_subject_public_key(spki: &crate::x509::SpkiDer<'_>) -> Self {
+        Self(crate::digest::Sha1::of(spki.subject_public_key_bits()).into_bytes())
+    }
+}
+
+/// The nonce a response carries in `responseExtensions` (RFC 8954
+/// sec.2.1): one to thirty-two octets, as the responder wrote them.
+/// What a responder echoes, not the randomness a request draws; compare
+/// it with the request's [`OcspNonce`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResponseNonce(Vec<u8>);
+
+impl ResponseNonce {
+    /// Most octets RFC 8954 sec.2.1 allows a nonce.
+    const MAX_LEN: usize = 32;
+
+    /// The nonce `bytes` spell, `None` for an empty one or one longer
+    /// than RFC 8954 allows.
+    fn new(bytes: &[u8]) -> Option<Self> {
+        (!bytes.is_empty() && bytes.len() <= Self::MAX_LEN).then(|| Self(bytes.to_vec()))
+    }
+
+    /// The nonce octets.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 }
@@ -315,7 +381,7 @@ impl OcspHelpers {
         tlv(TAG_SEQUENCE, &tlv(TAG_SEQUENCE, &tbs_request))
     }
 
-    /// Decode `ResponseData` (RFC 6960 sec.4.2.1) into the three
+    /// Decode `ResponseData` (RFC 6960 sec.4.2.1) into the four
     /// things this crate takes from it.
     ///
     /// ```text
@@ -327,48 +393,124 @@ impl OcspHelpers {
     ///   responseExtensions [1] EXPLICIT Extensions OPTIONAL }
     /// ```
     ///
-    /// `[1]` cannot be read from the tag alone -- `responderID`
-    /// byName is `[1]` too -- so the two are told apart by position,
-    /// which is exactly what the ordering of a SEQUENCE guarantees: a
-    /// `[1]` before `producedAt` is the responder's name, one after
-    /// the responses is the extensions. Fields this crate does not
-    /// read are skipped rather than refused, so a responder adding
-    /// one it is entitled to add does not make its answer unreadable.
-    fn parse_response_data(der: &[u8]) -> Result<ResponseDataParts, X509Error> {
+    /// The fields are read in their specified order: an optional v1
+    /// version, the responder identity, `producedAt`, a non-empty list
+    /// of responses with no `CertID` twice, then the optional
+    /// extensions and nothing after them. `[1]` is told apart by
+    /// position -- before `producedAt` it is the responder's name,
+    /// after the responses the extensions.
+    fn parse_response_data(der: &[u8]) -> Result<ResponseDataParts<'_>, X509Error> {
         let mut reader = Self::sequence_reader(der, "OCSP tbsResponseData")?;
-        let mut produced_at: Option<DateTime> = None;
-        let mut responses: Vec<SingleResponse> = Vec::new();
-        let mut nonce: Option<Vec<u8>> = None;
-
-        while !reader.is_finished() {
-            let field = reader
+        let mut first = reader
+            .tlv_bytes()
+            .map_err(|_ignored| X509Error::UnexpectedStructure("OCSP responderID missing"))?;
+        if first.first() == Some(&TAG_CONTEXT_0) {
+            Self::parse_version(first)?;
+            first = reader
                 .tlv_bytes()
-                .map_err(|_ignored| X509Error::UnexpectedStructure("OCSP ResponseData field"))?;
-            match field.first() {
-                Some(&TAG_GENERALIZED_TIME) => produced_at = Some(Self::generalized_time(field)?),
-                Some(&TAG_SEQUENCE) => {
-                    let mut list = Self::sequence_reader(field, "OCSP responses")?;
-                    while !list.is_finished() {
-                        let entry = list.tlv_bytes().map_err(|_ignored| {
-                            X509Error::UnexpectedStructure("OCSP SingleResponse")
-                        })?;
-                        responses.push(Self::parse_single_response(entry)?);
-                    }
-                }
-                // responseExtensions, but only once producedAt has
-                // been seen; before that, a [1] is the responder name.
-                Some(&TAG_CONTEXT_1) if produced_at.is_some() => {
-                    nonce = Self::nonce_from_extensions(Self::value_of(field, "OCSP extensions")?)?;
-                }
-                _ => {}
+                .map_err(|_ignored| X509Error::UnexpectedStructure("OCSP responderID missing"))?;
+        }
+        let responder_id = Self::parse_responder_id(first)?;
+        let produced_at = Self::generalized_time(
+            reader
+                .tlv_bytes()
+                .map_err(|_ignored| X509Error::UnexpectedStructure("OCSP producedAt missing"))?,
+        )?;
+        let responses_der = reader
+            .tlv_bytes()
+            .map_err(|_ignored| X509Error::UnexpectedStructure("OCSP responses missing"))?;
+        let mut list = Self::sequence_reader(responses_der, "OCSP responses")?;
+        let mut responses: Vec<SingleResponse> = Vec::new();
+        let mut seen_cert_ids: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+        while !list.is_finished() {
+            let entry = list
+                .tlv_bytes()
+                .map_err(|_ignored| X509Error::UnexpectedStructure("OCSP SingleResponse"))?;
+            let response = Self::parse_single_response(entry)?;
+            // A response reports what was known when it was produced
+            // (RFC 6960 sec.2.2): no revocation after `producedAt`.
+            if let CertStatus::Revoked { revoked_at, .. } = response.status
+                && revoked_at > produced_at
+            {
+                return Err(X509Error::UnexpectedStructure(
+                    "OCSP revocationTime after producedAt",
+                ));
             }
+            // The CertID is the first element of the entry; DER makes
+            // equal CertIDs equal octets.
+            let cert_id_der = Self::sequence_reader(entry, "OCSP SingleResponse")?
+                .tlv_bytes()
+                .map_err(|_ignored| X509Error::UnexpectedStructure("OCSP CertID"))?;
+            if !seen_cert_ids.insert(cert_id_der) {
+                return Err(X509Error::UnexpectedStructure(
+                    "duplicate OCSP SingleResponse CertID",
+                ));
+            }
+            responses.push(response);
+        }
+        if responses.is_empty() {
+            return Err(X509Error::UnexpectedStructure("OCSP responses empty"));
         }
 
-        Ok((
-            produced_at.ok_or(X509Error::UnexpectedStructure("OCSP producedAt missing"))?,
-            responses,
-            nonce,
-        ))
+        let nonce = if reader.is_finished() {
+            None
+        } else {
+            let extensions = reader
+                .tlv_bytes()
+                .map_err(|_ignored| X509Error::UnexpectedStructure("OCSP responseExtensions"))?;
+            if extensions.first() != Some(&TAG_CONTEXT_1) {
+                return Err(X509Error::UnexpectedStructure(
+                    "OCSP unexpected ResponseData tail",
+                ));
+            }
+            Self::nonce_from_extensions(Self::value_of(extensions, "OCSP extensions")?)?
+        };
+        if !reader.is_finished() {
+            return Err(X509Error::UnexpectedStructure(
+                "OCSP trailing ResponseData fields",
+            ));
+        }
+
+        Ok((responder_id, produced_at, responses, nonce))
+    }
+
+    /// Decode the optional `ResponseData` version, accepting only v1.
+    fn parse_version(der: &[u8]) -> Result<(), X509Error> {
+        /// `Version` v1, encoded as INTEGER 0 (RFC 6960 sec.4.2.1).
+        const OCSP_VERSION_1: u8 = 0;
+        let inner = Self::value_of(der, "OCSP version")?;
+        let version = AnyRef::from_der(inner)
+            .map_err(|_ignored| X509Error::UnexpectedStructure("OCSP version"))?;
+        if version.tag() != Tag::Integer || version.value() != [OCSP_VERSION_1] {
+            return Err(X509Error::UnexpectedStructure("unsupported OCSP version"));
+        }
+        Ok(())
+    }
+
+    /// Decode the signer identity from its required CHOICE (RFC 6960
+    /// sec.4.2.1): `byName [1] Name` or `byKey [2] KeyHash`, the
+    /// latter a SHA-1 OCTET STRING.
+    fn parse_responder_id(der: &[u8]) -> Result<ResponderId<'_>, X509Error> {
+        match der.first() {
+            Some(&TAG_CONTEXT_1) => {
+                let name_der = Self::value_of(der, "OCSP responderID byName")?;
+                Ok(ResponderId::ByName(Name::try_from(name_der)?))
+            }
+            Some(&TAG_CONTEXT_2) => {
+                let wrapped = Self::value_of(der, "OCSP responderID byKey")?;
+                let key_hash = AnyRef::from_der(wrapped)
+                    .map_err(|_ignored| X509Error::UnexpectedStructure("OCSP responder keyHash"))?;
+                if key_hash.tag() != Tag::OctetString {
+                    return Err(X509Error::UnexpectedStructure("OCSP responder keyHash"));
+                }
+                let digest: [u8; SHA1_LEN] = key_hash
+                    .value()
+                    .try_into()
+                    .map_err(|_ignored| X509Error::UnexpectedStructure("OCSP responder keyHash"))?;
+                Ok(ResponderId::ByKey(ResponderKeyHash(digest)))
+            }
+            _ => Err(X509Error::UnexpectedStructure("OCSP responderID")),
+        }
     }
 
     /// Decode one `SingleResponse` (RFC 6960 sec.4.2.1).
@@ -492,43 +634,62 @@ impl OcspHelpers {
         }
     }
 
-    /// The nonce out of an `Extensions` SEQUENCE, if it carries one.
-    ///
-    /// RFC 8954: `extnValue` is an OCTET STRING whose content is
-    /// itself the DER OCTET STRING holding the nonce, so the value
-    /// sits two layers in.
-    fn nonce_from_extensions(extensions: &[u8]) -> Result<Option<Vec<u8>>, X509Error> {
+    /// Read `responseExtensions` (RFC 6960 sec.4.2.1): every
+    /// `Extension` whole (RFC 5280 sec.4.1: OID, `critical` written only
+    /// when TRUE, `extnValue`), the nonce (RFC 8954 sec.2.1) when one
+    /// is present, and a refusal for a critical extension other than the
+    /// nonce, which this reader does not process.
+    fn nonce_from_extensions(extensions: &[u8]) -> Result<Option<ResponseNonce>, X509Error> {
+        const MALFORMED: X509Error = X509Error::UnexpectedStructure("OCSP Extension");
         let mut reader = Self::sequence_reader(extensions, "OCSP Extensions")?;
+        let mut nonce = None;
         while !reader.is_finished() {
-            let extension = reader
-                .tlv_bytes()
-                .map_err(|_ignored| X509Error::UnexpectedStructure("OCSP Extension"))?;
+            let extension = reader.tlv_bytes().map_err(|_ignored| MALFORMED)?;
             let mut fields = Self::sequence_reader(extension, "OCSP Extension body")?;
-            let oid_tlv = fields
-                .tlv_bytes()
-                .map_err(|_ignored| X509Error::UnexpectedStructure("OCSP Extension OID"))?;
-            if Self::value_of(oid_tlv, "OCSP Extension OID")? != OID_OCSP_NONCE.as_bytes() {
+            let oid_tlv = fields.tlv_bytes().map_err(|_ignored| MALFORMED)?;
+            if oid_tlv.first() != Some(&TAG_OID) {
+                return Err(MALFORMED);
+            }
+            let is_nonce =
+                Self::value_of(oid_tlv, "OCSP Extension OID")? == OID_OCSP_NONCE.as_bytes();
+            let mut value = fields.tlv_bytes().map_err(|_ignored| MALFORMED)?;
+            let mut critical = false;
+            if value.first() == Some(&TAG_BOOLEAN) {
+                if Self::value_of(value, "OCSP Extension critical")? != [DER_TRUE] {
+                    return Err(MALFORMED);
+                }
+                critical = true;
+                value = fields.tlv_bytes().map_err(|_ignored| MALFORMED)?;
+            }
+            if value.first() != Some(&TAG_OCTET_STRING) || !fields.is_finished() {
+                return Err(MALFORMED);
+            }
+            if !is_nonce {
+                if critical {
+                    return Err(X509Error::UnexpectedStructure(
+                        "unsupported critical OCSP response extension",
+                    ));
+                }
                 continue;
             }
-            // Step past the optional critical BOOLEAN to extnValue.
-            while !fields.is_finished() {
-                let field = fields
-                    .tlv_bytes()
-                    .map_err(|_ignored| X509Error::UnexpectedStructure("OCSP extnValue"))?;
-                if field.first() == Some(&TAG_OCTET_STRING) {
-                    let inner = Self::value_of(field, "OCSP extnValue")?;
-                    // A responder that omits RFC 8954's inner wrapper
-                    // is read as having sent the bytes bare, rather
-                    // than as having sent nothing.
-                    return Ok(Some(if inner.first() == Some(&TAG_OCTET_STRING) {
-                        Self::value_of(inner, "OCSP nonce")?.to_vec()
-                    } else {
-                        inner.to_vec()
-                    }));
-                }
+            if nonce.is_some() {
+                return Err(X509Error::UnexpectedStructure("duplicate OCSP nonce"));
             }
+            let inner = Self::value_of(value, "OCSP extnValue")?;
+            // A responder that omits RFC 8954's inner wrapper is read as
+            // having sent the bytes bare, rather than as having sent
+            // nothing.
+            let bytes = if inner.first() == Some(&TAG_OCTET_STRING) {
+                Self::value_of(inner, "OCSP nonce")?
+            } else {
+                inner
+            };
+            nonce = Some(
+                ResponseNonce::new(bytes)
+                    .ok_or(X509Error::UnexpectedStructure("OCSP nonce length"))?,
+            );
         }
-        Ok(None)
+        Ok(nonce)
     }
 
     /// A reader over the body of a TLV that must be a SEQUENCE.
@@ -573,6 +734,73 @@ impl OcspHelpers {
 }
 
 // ----- Response side -----
+
+/// Identity of the certificate that signed an OCSP response.
+///
+/// RFC 6960 sec.4.2.2.3 requires the response signature to verify
+/// under a certificate selected by this field. Verifying under any
+/// embedded certificate without this match permits signer
+/// substitution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponderId<'a> {
+    /// `byName [1] Name` -- exact encoded subject name of the signer.
+    ByName(Name<'a>),
+    /// `byKey [2] KeyHash` -- SHA-1 of the signer's subject-public-key
+    /// BIT STRING contents, twenty octets.
+    ByKey(ResponderKeyHash),
+}
+
+impl ResponderId<'_> {
+    /// Whether `certificate` is the signer selected by this identity.
+    #[must_use]
+    pub fn matches_certificate(self, certificate: Certificate<'_>) -> bool {
+        match self {
+            Self::ByName(name) => name == certificate.subject,
+            Self::ByKey(expected) => {
+                ResponderKeyHash::from_subject_public_key(&certificate.spki) == expected
+            }
+        }
+    }
+}
+
+/// Why an OCSP response signer could not be authenticated and
+/// authorized for the certificate issuer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OcspVerifyError {
+    /// `ResponderID` did not select the certificate offered as the
+    /// signer.
+    ResponderIdMismatch,
+    /// The `BasicOCSPResponse` signature failed under the selected key.
+    Signature(crate::x509::VerifyError),
+    /// A delegated responder did not satisfy its issuer, validity,
+    /// CA, Name Constraints, EKU, or Key Usage profile.
+    UnauthorizedResponder(&'static str),
+    /// A delegated responder omitted `id-pkix-ocsp-nocheck`; accepting
+    /// it would require separate current revocation evidence for the
+    /// responder certificate.
+    ResponderRevocationRequired,
+    /// The `id-pkix-ocsp-nocheck` extension was duplicated, critical,
+    /// or did not contain exactly DER NULL.
+    MalformedNoCheck,
+}
+
+impl core::fmt::Display for OcspVerifyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::ResponderIdMismatch => {
+                f.write_str("ResponderID does not match the response signer")
+            }
+            Self::Signature(why) => write!(f, "response signature: {why}"),
+            Self::UnauthorizedResponder(why) => write!(f, "unauthorized responder: {why}"),
+            Self::ResponderRevocationRequired => {
+                f.write_str("delegated responder requires separate revocation evidence")
+            }
+            Self::MalformedNoCheck => f.write_str("malformed id-pkix-ocsp-nocheck extension"),
+        }
+    }
+}
+
+impl core::error::Error for OcspVerifyError {}
 
 /// Top-level `OCSPResponseStatus` (RFC 6960 sec.4.2.1).
 ///
@@ -644,6 +872,8 @@ pub struct OcspResponse<'a> {
     reason = "the parsed-once typed values (produced_at, tbs_response_data_der, signature_alg_oid, ...) are intentionally pub for read; responses is intentionally private behind the single_responses() accessor so callers read the typed per-entry SingleResponse values, not the raw Vec."
 )]
 pub struct BasicOcspResponse<'a> {
+    /// Certificate identity selected by the signed `ResponseData`.
+    pub responder_id: ResponderId<'a>,
     /// `producedAt` from `tbsResponseData` per RFC 6960 §4.2.1
     /// -- the time the responder signed this reply.
     pub produced_at: DateTime,
@@ -666,7 +896,7 @@ pub struct BasicOcspResponse<'a> {
     pub embedded_cert_ders: Vec<&'a [u8]>,
     /// The OCSP nonce (RFC 8954) echoed in `responseExtensions`,
     /// when present -- match it against the request nonce.
-    pub nonce: Option<Vec<u8>>,
+    pub nonce: Option<ResponseNonce>,
 }
 
 impl BasicOcspResponse<'_> {
@@ -675,7 +905,7 @@ impl BasicOcspResponse<'_> {
     /// # Errors
     /// As for `x509::verify_tbs_signature`.
     #[inline]
-    pub fn verify_signature(
+    pub(crate) fn verify_signature(
         &self,
         signer_spki: &crate::x509::SpkiDer<'_>,
     ) -> Result<(), crate::x509::VerifyError> {
@@ -710,40 +940,202 @@ impl BasicOcspResponse<'_> {
     }
 }
 
-/// A [`BasicOcspResponse`] whose responder signature has been
-/// verified against a signer SPKI.
+/// A [`BasicOcspResponse`] whose signer has been authenticated and
+/// authorized for one certificate issuer.
 ///
-/// Trust by construction (see `doc/typing-discipline.md`): the only
-/// production constructor is [`VerifiedOcspResponse::verify`], so
-/// holding this type is proof the response signature checked against
-/// a signer. Per-cert revocation status
-/// ([`crate::revocation::check_against_ocsp_response`] via
-/// `find_serial`) is reachable *only* through a
-/// verified response -- you cannot read a status off an unverified
-/// OCSP reply, by type.
+/// Trust by construction: the only production constructor is
+/// [`VerifiedOcspResponse::verify`], so holding this type is proof the
+/// response signature checked under the certificate `ResponderID`
+/// selects, and that this certificate may answer for the issuer.
+/// Per-certificate status is read through
+/// [`VerifiedOcspResponse::response_for`] by exact `CertID` under that
+/// issuer -- a status cannot be read off an unverified reply, by type.
 #[derive(Debug, Clone)]
 pub struct VerifiedOcspResponse<'a> {
     /// The verified inner response.
     basic: BasicOcspResponse<'a>,
+    /// The issuer's name and key hashes, under every `CertID` hash
+    /// algorithm this crate matches.
+    issuer: IssuerHashes,
+}
+
+/// An issuer's `CertID` hashes (RFC 6960 sec.4.1.1) under SHA-1 and
+/// SHA-256.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IssuerHashes {
+    /// SHA-1 of the issuer's `Name` DER.
+    sha1_name: Vec<u8>,
+    /// SHA-1 of the issuer's `subjectPublicKey` value.
+    sha1_key: Vec<u8>,
+    /// SHA-256 of the issuer's `Name` DER.
+    sha256_name: Vec<u8>,
+    /// SHA-256 of the issuer's `subjectPublicKey` value.
+    sha256_key: Vec<u8>,
+}
+
+/// A `CertID.hashAlgorithm` this crate matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CertIdHash {
+    /// SHA-1, the algorithm RFC 6960 requests carry.
+    Sha1,
+    /// SHA-256.
+    Sha256,
+}
+
+impl CertIdHash {
+    /// The algorithm the `CertID.hashAlgorithm` OID body names.
+    fn from_oid(oid: &[u8]) -> Option<Self> {
+        if oid == OID_SHA1.as_bytes() {
+            Some(Self::Sha1)
+        } else if oid == known::SHA256.as_bytes() {
+            Some(Self::Sha256)
+        } else {
+            None
+        }
+    }
+
+    /// The digest of `input` under this algorithm.
+    fn digest(self, input: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Sha1 => crate::digest::Sha1::of(input).into_bytes().to_vec(),
+            Self::Sha256 => crate::digest::Sha256::of(input).as_bytes().to_vec(),
+        }
+    }
+}
+
+impl IssuerHashes {
+    /// The hashes of `issuer`.
+    fn of(issuer: Certificate<'_>) -> Self {
+        let name = issuer.subject.as_der();
+        let key = issuer.spki.subject_public_key_bits();
+        Self {
+            sha1_name: CertIdHash::Sha1.digest(name),
+            sha1_key: CertIdHash::Sha1.digest(key),
+            sha256_name: CertIdHash::Sha256.digest(name),
+            sha256_key: CertIdHash::Sha256.digest(key),
+        }
+    }
+
+    /// The name and key hashes under `algorithm`.
+    fn under(&self, algorithm: CertIdHash) -> (&[u8], &[u8]) {
+        match algorithm {
+            CertIdHash::Sha1 => (&self.sha1_name, &self.sha1_key),
+            CertIdHash::Sha256 => (&self.sha256_name, &self.sha256_key),
+        }
+    }
 }
 
 impl<'a> VerifiedOcspResponse<'a> {
-    /// Verify `basic`'s responder signature against `signer_spki`
-    /// and, on success, wrap it as a [`VerifiedOcspResponse`]. The
-    /// only production door to a verified response.
+    /// Authenticate and authorize the certificate that signed `basic`
+    /// to answer for certificates `issuer` issued.
+    ///
+    /// The signer must match `ResponderID`, its key must verify the
+    /// response signature, and it must be either `issuer` itself or a
+    /// delegated responder (RFC 6960 sec.4.2.2.2): directly issued and
+    /// signed by `issuer`, valid at `producedAt`, carrying the
+    /// `id-kp-OCSPSigning` EKU, not a CA, without Name Constraints,
+    /// with a Key Usage that permits signing when it has one, and with
+    /// a valid `id-pkix-ocsp-nocheck` extension (sec.4.2.2.2.1). A
+    /// delegated responder without no-check would need separate
+    /// revocation evidence and is refused.
     ///
     /// # Errors
-    /// [`crate::x509::VerifyError`] when the signature does not
-    /// verify against `signer_spki`.
-    #[inline]
+    /// [`OcspVerifyError`] when signer identity, signature, delegated
+    /// authorization, or no-check semantics fail.
     pub fn verify(
         basic: &BasicOcspResponse<'a>,
-        signer_spki: &crate::x509::SpkiDer<'_>,
-    ) -> Result<Self, crate::x509::VerifyError> {
-        basic.verify_signature(signer_spki)?;
+        signer: Certificate<'_>,
+        issuer: Certificate<'_>,
+    ) -> Result<Self, OcspVerifyError> {
+        if !basic.responder_id.matches_certificate(signer) {
+            return Err(OcspVerifyError::ResponderIdMismatch);
+        }
+        basic
+            .verify_signature(&signer.spki)
+            .map_err(OcspVerifyError::Signature)?;
+        Self::authorize_signer(signer, issuer, basic.produced_at)?;
         Ok(Self {
             basic: basic.clone(),
+            issuer: IssuerHashes::of(issuer),
         })
+    }
+
+    /// Apply RFC 6960 sec.4.2.2.2 delegated-responder semantics.
+    fn authorize_signer(
+        signer: Certificate<'_>,
+        issuer: Certificate<'_>,
+        produced_at: DateTime,
+    ) -> Result<(), OcspVerifyError> {
+        // The issuer answering itself, or a delegate, must hold a
+        // certificate valid when it produced the response.
+        if produced_at < signer.not_before || produced_at > signer.not_after {
+            return Err(OcspVerifyError::UnauthorizedResponder(
+                "certificate was not valid at producedAt",
+            ));
+        }
+        if signer.raw_der == issuer.raw_der {
+            return Ok(());
+        }
+        if signer.issuer != issuer.subject {
+            return Err(OcspVerifyError::UnauthorizedResponder(
+                "certificate was not issued by the target issuer",
+            ));
+        }
+        signer
+            .verify_signed_by(issuer)
+            .map_err(|_why| OcspVerifyError::UnauthorizedResponder("certificate signature"))?;
+        let Some(extensions) = signer.extensions else {
+            return Err(OcspVerifyError::UnauthorizedResponder(
+                "certificate has no OCSP-signing EKU",
+            ));
+        };
+        Self::authorize_responder_extensions(extensions)
+    }
+
+    /// Strictly parse and authorize all delegated-responder extensions
+    /// once.
+    fn authorize_responder_extensions(extensions: &[u8]) -> Result<(), OcspVerifyError> {
+        let profile = path_extension_profile(extensions).map_err(|why| match why {
+            PathExtensionError::InvalidOcspNoCheck => OcspVerifyError::MalformedNoCheck,
+            PathExtensionError::Malformed(_)
+            | PathExtensionError::Duplicate
+            | PathExtensionError::UnsupportedCritical => OcspVerifyError::UnauthorizedResponder(
+                "malformed or unsupported certificate extensions",
+            ),
+        })?;
+        if profile.basic_constraints.ca {
+            return Err(OcspVerifyError::UnauthorizedResponder(
+                "delegated responder is a CA",
+            ));
+        }
+        if profile.name_constraints_present {
+            return Err(OcspVerifyError::UnauthorizedResponder(
+                "delegated responder carries CA-only Name Constraints",
+            ));
+        }
+        if !profile.extended_key_usage_present || !profile.ocsp_signing_extended_key_usage {
+            return Err(OcspVerifyError::UnauthorizedResponder(
+                "certificate has no OCSP-signing EKU",
+            ));
+        }
+        if profile
+            .key_usage
+            .is_some_and(|usage| !usage.key_usage.digital_signature)
+        {
+            return Err(OcspVerifyError::UnauthorizedResponder(
+                "certificate Key Usage forbids response signing",
+            ));
+        }
+        if !profile.ocsp_no_check_present {
+            return Err(OcspVerifyError::ResponderRevocationRequired);
+        }
+        Ok(())
+    }
+
+    /// The verified response.
+    #[must_use]
+    pub const fn basic(&self) -> &BasicOcspResponse<'a> {
+        &self.basic
     }
 
     /// The per-cert `SingleResponse` entries of this *verified*
@@ -755,14 +1147,46 @@ impl<'a> VerifiedOcspResponse<'a> {
         self.basic.single_responses()
     }
 
+    /// The entry whose `CertID`, under SHA-1 or SHA-256, names
+    /// `certificate` under the issuer this response was authenticated
+    /// for, if the response carries one. `certificate` must name that
+    /// issuer too, so a certificate from another issuer with the same
+    /// serial never matches.
+    #[must_use]
+    pub fn response_for(&self, certificate: Certificate<'_>) -> Option<&SingleResponse> {
+        let serial = certificate.serial();
+        self.single_responses().iter().find(|response| {
+            let Some(algorithm) = CertIdHash::from_oid(&response.cert_id.hash_algorithm_oid) else {
+                return false;
+            };
+            let (name, key) = self.issuer.under(algorithm);
+            algorithm.digest(certificate.issuer.as_der()) == name
+                && response.cert_id.issuer_name_hash == name
+                && response.cert_id.issuer_key_hash == key
+                && response.cert_id.serial == serial
+        })
+    }
+
     /// Test-only: wrap a basic response *without* verifying its
     /// signature, to exercise status-translation logic in isolation.
     /// `#[cfg(test)]`-gated, so the production "only door is
     /// `verify`" guarantee is unaffected.
     #[cfg(test)]
     #[must_use]
-    pub(crate) const fn from_unverified_basic_for_test(basic: BasicOcspResponse<'a>) -> Self {
-        Self { basic }
+    pub(crate) fn from_unverified_basic_for_test(
+        basic: BasicOcspResponse<'a>,
+        issuer_name: &[u8],
+        issuer_sha1_key: Vec<u8>,
+    ) -> Self {
+        Self {
+            basic,
+            issuer: IssuerHashes {
+                sha1_name: CertIdHash::Sha1.digest(issuer_name),
+                sha1_key: issuer_sha1_key,
+                sha256_name: CertIdHash::Sha256.digest(issuer_name),
+                sha256_key: Vec::new(),
+            },
+        }
     }
 }
 
@@ -795,22 +1219,6 @@ pub struct CertId {
     pub issuer_key_hash: Vec<u8>,
     /// `serialNumber` of the certificate this entry is about.
     pub serial: CertSerial,
-}
-
-impl CertId {
-    /// Whether this entry answers the exact request this module builds.
-    #[must_use]
-    pub fn matches_request(
-        &self,
-        issuer_name_hash: IssuerNameHash,
-        issuer_key_hash: IssuerKeyHash,
-        serial: &CertSerial,
-    ) -> bool {
-        self.hash_algorithm_oid == OID_SHA1.as_bytes()
-            && self.issuer_name_hash == issuer_name_hash.as_bytes()
-            && self.issuer_key_hash == issuer_key_hash.as_bytes()
-            && &self.serial == serial
-    }
 }
 
 /// `CertStatus` CHOICE.
@@ -1066,10 +1474,11 @@ impl<'a> BasicOcspResponse<'a> {
             }
         }
 
-        let (produced_at, responses, nonce) =
+        let (responder_id, produced_at, responses, nonce) =
             OcspHelpers::parse_response_data(tbs_response_data_der)?;
 
         Ok(BasicOcspResponse {
+            responder_id,
             produced_at,
             responses,
             tbs_response_data_der,
@@ -1268,7 +1677,7 @@ mod tests {
             }
         }
         assert_eq!(
-            found.as_deref(),
+            found.as_ref().map(super::ResponseNonce::as_bytes),
             Some(nonce.as_bytes()),
             "the nonce did not survive encode then decode"
         );
@@ -1401,7 +1810,10 @@ mod tests {
         let der = wrap_response(response_data(&single, Some(extensions)));
         let resp = super::OcspResponse::parse(&der).expect("parses");
         let basic = resp.basic.expect("basic present");
-        assert_eq!(basic.nonce.as_deref(), Some(&[0xDE, 0xAD, 0xBE, 0xEF][..]));
+        assert_eq!(
+            basic.nonce.as_ref().map(super::ResponseNonce::as_bytes),
+            Some(&[0xDE, 0xAD, 0xBE, 0xEF][..])
+        );
     }
 
     #[test]
@@ -1422,6 +1834,527 @@ mod tests {
             .expect("parses")
             .basic
             .expect("basic present");
-        assert_eq!(basic.nonce.as_deref(), Some(&[0x01, 0x02][..]));
+        assert_eq!(
+            basic.nonce.as_ref().map(super::ResponseNonce::as_bytes),
+            Some(&[0x01, 0x02][..])
+        );
+    }
+}
+
+#[cfg(test)]
+mod authorization_tests {
+    use super::{CertStatus, OcspResponse, OcspVerifyError, VerifiedOcspResponse};
+    use crate::testkit::{self, CertificateSpec, OcspSpec, ResponderName, TestCurve, TestKey};
+    use refineid_cms::x509::OwnedCert;
+
+    /// Name of the issuing CA.
+    const CA: &str = "Test Issuing CA";
+    /// Name of a CA that did not issue the subject.
+    const FOREIGN_CA: &str = "Test Foreign CA";
+    /// Name of the delegated responder.
+    const RESPONDER: &str = "Test OCSP Responder";
+    /// Serial of the CA certificate.
+    const CA_SERIAL: u8 = 1;
+    /// Serial of the certificate asked about.
+    const SUBJECT_SERIAL: u8 = 5;
+    /// Serial of the responder certificate.
+    const RESPONDER_SERIAL: u8 = 6;
+    /// First validity day of every certificate.
+    const VALID_FROM: u8 = 1;
+    /// Day the response is produced.
+    const PRODUCED: u8 = 10;
+    /// Day after `PRODUCED` the response expects to be replaced.
+    const NEXT_UPDATE: u8 = 11;
+    /// Last validity day of every certificate.
+    const VALID_TO: u8 = 28;
+    /// `Version` v1, INTEGER 0 (RFC 6960 sec.4.2.1).
+    const OCSP_V1: u8 = 0;
+    /// Twenty ASCII octets standing for a SHA-1 key hash.
+    const KEY_HASH_FILLER: &[u8] = b"twenty-octet keyhash";
+    /// Last validity day of a responder that expires before
+    /// `PRODUCED`.
+    const EXPIRED_BEFORE_PRODUCED: u8 = 5;
+
+    /// The issuing CA, the certificate asked about, and the keys.
+    struct Pki {
+        /// CA key.
+        ca_key: TestKey,
+        /// CA certificate.
+        ca: OwnedCert,
+        /// The certificate asked about.
+        subject: OwnedCert,
+    }
+
+    fn spec<'a>(
+        serial: u8,
+        subject: &'a str,
+        issuer: &'a str,
+        extensions: Vec<Vec<u8>>,
+    ) -> CertificateSpec<'a> {
+        CertificateSpec {
+            serial,
+            subject,
+            issuer,
+            not_before: testkit::day(VALID_FROM),
+            not_after: testkit::day(VALID_TO),
+            extensions,
+        }
+    }
+
+    fn pki() -> Pki {
+        let ca_key = TestKey::derive(TestCurve::P384, b"ocsp issuing ca");
+        let subject_key = TestKey::derive(TestCurve::P256, b"ocsp subject");
+        let ca = OwnedCert::from_der(&testkit::certificate(
+            &spec(CA_SERIAL, CA, CA, testkit::ca_extensions()),
+            &ca_key,
+            &ca_key,
+        ))
+        .expect("CA certificate parses");
+        let subject = OwnedCert::from_der(&testkit::certificate(
+            &spec(SUBJECT_SERIAL, "Test Subject", CA, Vec::new()),
+            &subject_key,
+            &ca_key,
+        ))
+        .expect("subject certificate parses");
+        Pki {
+            ca_key,
+            ca,
+            subject,
+        }
+    }
+
+    /// A good response about the subject, signed by `key` naming
+    /// `responder`.
+    fn response(pki: &Pki, key: &TestKey, responder: ResponderName<'_>) -> Vec<u8> {
+        testkit::ocsp_response(&OcspSpec {
+            responder_key: key,
+            responder,
+            issuer: &pki.ca,
+            serial: SUBJECT_SERIAL,
+            revoked: None,
+            produced_at: testkit::day(PRODUCED),
+            this_update: testkit::day(PRODUCED),
+            next_update: Some(testkit::day(NEXT_UPDATE)),
+            embedded: Vec::new(),
+            cert_id: crate::testkit::CertIdAlgorithm::Sha1,
+            revocation_reason: None,
+            response_extensions: Vec::new(),
+        })
+    }
+
+    /// Verify `der` with `signer` for the CA of `pki`.
+    fn verify(pki: &Pki, der: &[u8], signer: &OwnedCert) -> Result<CertStatus, OcspVerifyError> {
+        let parsed = OcspResponse::parse(der).expect("kit response parses");
+        let basic = parsed.basic.expect("successful response");
+        let verified = VerifiedOcspResponse::verify(&basic, signer.view(), pki.ca.view())?;
+        Ok(verified
+            .response_for(pki.subject.view())
+            .expect("the response is about the subject")
+            .status)
+    }
+
+    /// A responder certificate issued by `issuer_key` under the name
+    /// `issuer`, with `extensions`.
+    fn responder(
+        key: &TestKey,
+        issuer: &str,
+        issuer_key: &TestKey,
+        extensions: Vec<Vec<u8>>,
+    ) -> OwnedCert {
+        OwnedCert::from_der(&testkit::certificate(
+            &spec(RESPONDER_SERIAL, RESPONDER, issuer, extensions),
+            key,
+            issuer_key,
+        ))
+        .expect("responder certificate parses")
+    }
+
+    #[test]
+    fn the_issuer_may_sign_its_own_responses() {
+        let pki = pki();
+        let der = response(&pki, &pki.ca_key, ResponderName::ByName(CA));
+        assert_eq!(verify(&pki, &der, &pki.ca), Ok(CertStatus::Good));
+        let by_key = response(&pki, &pki.ca_key, ResponderName::ByKey(&pki.ca_key));
+        assert_eq!(verify(&pki, &by_key, &pki.ca), Ok(CertStatus::Good));
+    }
+
+    #[test]
+    fn a_delegated_responder_with_no_check_is_authorized() {
+        let pki = pki();
+        let key = TestKey::derive(TestCurve::P256, b"ocsp responder");
+        let certificate = responder(
+            &key,
+            CA,
+            &pki.ca_key,
+            testkit::ocsp_responder_extensions(true),
+        );
+        let der = response(&pki, &key, ResponderName::ByName(RESPONDER));
+        assert_eq!(verify(&pki, &der, &certificate), Ok(CertStatus::Good));
+        let by_key = response(&pki, &key, ResponderName::ByKey(&key));
+        assert_eq!(verify(&pki, &by_key, &certificate), Ok(CertStatus::Good));
+    }
+
+    #[test]
+    fn a_delegated_responder_without_no_check_is_refused() {
+        let pki = pki();
+        let key = TestKey::derive(TestCurve::P256, b"ocsp responder");
+        let certificate = responder(
+            &key,
+            CA,
+            &pki.ca_key,
+            testkit::ocsp_responder_extensions(false),
+        );
+        let der = response(&pki, &key, ResponderName::ByName(RESPONDER));
+        assert_eq!(
+            verify(&pki, &der, &certificate),
+            Err(OcspVerifyError::ResponderRevocationRequired)
+        );
+    }
+
+    #[test]
+    fn a_responder_another_ca_issued_is_refused() {
+        let pki = pki();
+        let foreign_key = TestKey::derive(TestCurve::P256, b"ocsp foreign ca");
+        let key = TestKey::derive(TestCurve::P256, b"ocsp responder");
+        let certificate = responder(
+            &key,
+            FOREIGN_CA,
+            &foreign_key,
+            testkit::ocsp_responder_extensions(true),
+        );
+        let der = response(&pki, &key, ResponderName::ByName(RESPONDER));
+        assert_eq!(
+            verify(&pki, &der, &certificate),
+            Err(OcspVerifyError::UnauthorizedResponder(
+                "certificate was not issued by the target issuer"
+            ))
+        );
+        let forged = responder(
+            &key,
+            CA,
+            &foreign_key,
+            testkit::ocsp_responder_extensions(true),
+        );
+        assert_eq!(
+            verify(&pki, &der, &forged),
+            Err(OcspVerifyError::UnauthorizedResponder(
+                "certificate signature"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_ca_responder_is_refused() {
+        let pki = pki();
+        let key = TestKey::derive(TestCurve::P256, b"ocsp responder");
+        let mut extensions = testkit::ocsp_responder_extensions(true);
+        extensions.push(testkit::ca_basic_constraints());
+        let certificate = responder(&key, CA, &pki.ca_key, extensions);
+        let der = response(&pki, &key, ResponderName::ByName(RESPONDER));
+        assert_eq!(
+            verify(&pki, &der, &certificate),
+            Err(OcspVerifyError::UnauthorizedResponder(
+                "delegated responder is a CA"
+            ))
+        );
+    }
+
+    #[test]
+    fn the_signer_must_be_the_one_responder_id_names() {
+        let pki = pki();
+        let key = TestKey::derive(TestCurve::P256, b"ocsp responder");
+        let certificate = responder(
+            &key,
+            CA,
+            &pki.ca_key,
+            testkit::ocsp_responder_extensions(true),
+        );
+        let der = response(&pki, &key, ResponderName::ByName(RESPONDER));
+        assert_eq!(
+            verify(&pki, &der, &pki.ca),
+            Err(OcspVerifyError::ResponderIdMismatch)
+        );
+        let impostor = response(&pki, &pki.ca_key, ResponderName::ByName(RESPONDER));
+        assert!(matches!(
+            verify(&pki, &impostor, &certificate),
+            Err(OcspVerifyError::Signature(_))
+        ));
+    }
+
+    /// A responder certificate valid from `from` to `to`.
+    fn responder_valid(
+        key: &TestKey,
+        issuer_key: &TestKey,
+        extensions: Vec<Vec<u8>>,
+        from: u8,
+        to: u8,
+    ) -> OwnedCert {
+        OwnedCert::from_der(&testkit::certificate(
+            &CertificateSpec {
+                serial: RESPONDER_SERIAL,
+                subject: RESPONDER,
+                issuer: CA,
+                not_before: testkit::day(from),
+                not_after: testkit::day(to),
+                extensions,
+            },
+            key,
+            issuer_key,
+        ))
+        .expect("responder certificate parses")
+    }
+
+    #[test]
+    fn a_responder_without_the_ocsp_signing_purpose_is_refused() {
+        let pki = pki();
+        let key = TestKey::derive(TestCurve::P256, b"ocsp responder");
+        let no_check = testkit::extension(
+            crate::oids::OCSP_NO_CHECK,
+            false,
+            &testkit::tlv(testkit::NULL, []),
+        );
+        let certificate = responder(&key, CA, &pki.ca_key, vec![no_check]);
+        let der = response(&pki, &key, ResponderName::ByName(RESPONDER));
+        assert_eq!(
+            verify(&pki, &der, &certificate),
+            Err(OcspVerifyError::UnauthorizedResponder(
+                "certificate has no OCSP-signing EKU"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_responder_whose_key_usage_forbids_signing_is_refused() {
+        let pki = pki();
+        let key = TestKey::derive(TestCurve::P256, b"ocsp responder");
+        let mut extensions = testkit::ocsp_responder_extensions(true);
+        extensions.push(testkit::key_usage(
+            testkit::KEY_USAGE_CERT_SIGN_UNUSED,
+            testkit::KEY_USAGE_CERT_SIGN,
+        ));
+        let certificate = responder(&key, CA, &pki.ca_key, extensions);
+        let der = response(&pki, &key, ResponderName::ByName(RESPONDER));
+        assert_eq!(
+            verify(&pki, &der, &certificate),
+            Err(OcspVerifyError::UnauthorizedResponder(
+                "certificate Key Usage forbids response signing"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_responder_expired_at_produced_at_is_refused() {
+        let pki = pki();
+        let key = TestKey::derive(TestCurve::P256, b"ocsp responder");
+        let certificate = responder_valid(
+            &key,
+            &pki.ca_key,
+            testkit::ocsp_responder_extensions(true),
+            VALID_FROM,
+            EXPIRED_BEFORE_PRODUCED,
+        );
+        let der = response(&pki, &key, ResponderName::ByName(RESPONDER));
+        assert_eq!(
+            verify(&pki, &der, &certificate),
+            Err(OcspVerifyError::UnauthorizedResponder(
+                "certificate was not valid at producedAt"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_key_hash_naming_another_key_is_refused() {
+        let pki = pki();
+        let other = TestKey::derive(TestCurve::P256, b"ocsp other key");
+        let der = response(&pki, &pki.ca_key, ResponderName::ByKey(&other));
+        assert_eq!(
+            verify(&pki, &der, &pki.ca),
+            Err(OcspVerifyError::ResponderIdMismatch)
+        );
+    }
+
+    #[test]
+    fn a_response_without_single_responses_is_refused() {
+        let pki = pki();
+        let mut data = testkit::tlv(testkit::CONTEXT_1, testkit::name(CA));
+        data.extend_from_slice(&testkit::generalized_time(testkit::day(PRODUCED)));
+        data.extend_from_slice(&testkit::tlv(testkit::SEQUENCE, []));
+        let basic = testkit::signed(&testkit::tlv(testkit::SEQUENCE, data), &pki.ca_key);
+        let mut bytes = testkit::tlv(
+            testkit::OBJECT_IDENTIFIER,
+            refineid_cms::oid::known::BASIC_OCSP_RESPONSE.as_bytes(),
+        );
+        bytes.extend_from_slice(&testkit::tlv(testkit::OCTET_STRING, basic));
+        let mut outer = testkit::tlv(testkit::ENUMERATED, [testkit::OCSP_SUCCESSFUL]);
+        outer.extend_from_slice(&testkit::tlv(
+            testkit::CONTEXT_0,
+            testkit::tlv(testkit::SEQUENCE, bytes),
+        ));
+        let der = testkit::tlv(testkit::SEQUENCE, outer);
+        assert!(OcspResponse::parse(&der).is_err());
+    }
+
+    #[test]
+    fn a_revocation_after_produced_at_is_refused() {
+        let pki = pki();
+        let der = testkit::ocsp_response(&OcspSpec {
+            responder_key: &pki.ca_key,
+            responder: ResponderName::ByName(CA),
+            issuer: &pki.ca,
+            serial: SUBJECT_SERIAL,
+            revoked: Some(testkit::day(NEXT_UPDATE)),
+            produced_at: testkit::day(PRODUCED),
+            this_update: testkit::day(PRODUCED),
+            next_update: Some(testkit::day(NEXT_UPDATE)),
+            embedded: Vec::new(),
+            cert_id: crate::testkit::CertIdAlgorithm::Sha1,
+            revocation_reason: None,
+            response_extensions: Vec::new(),
+        });
+        assert!(OcspResponse::parse(&der).is_err());
+        let reported = testkit::ocsp_response(&OcspSpec {
+            responder_key: &pki.ca_key,
+            responder: ResponderName::ByName(CA),
+            issuer: &pki.ca,
+            serial: SUBJECT_SERIAL,
+            revoked: Some(testkit::day(PRODUCED)),
+            produced_at: testkit::day(PRODUCED),
+            this_update: testkit::day(PRODUCED),
+            next_update: Some(testkit::day(NEXT_UPDATE)),
+            embedded: Vec::new(),
+            cert_id: crate::testkit::CertIdAlgorithm::Sha1,
+            revocation_reason: None,
+            response_extensions: Vec::new(),
+        });
+        assert!(matches!(
+            verify(&pki, &reported, &pki.ca),
+            Ok(CertStatus::Revoked { .. })
+        ));
+    }
+
+    #[test]
+    fn a_certificate_of_another_issuer_with_the_same_serial_does_not_match() {
+        let pki = pki();
+        let der = response(&pki, &pki.ca_key, ResponderName::ByName(CA));
+        let foreign_key = TestKey::derive(TestCurve::P256, b"ocsp foreign ca");
+        let namesake = OwnedCert::from_der(&testkit::certificate(
+            &spec(SUBJECT_SERIAL, "Test Subject", FOREIGN_CA, Vec::new()),
+            &TestKey::derive(TestCurve::P256, b"ocsp namesake"),
+            &foreign_key,
+        ))
+        .expect("namesake parses");
+        let parsed = OcspResponse::parse(&der).expect("kit response parses");
+        let basic = parsed.basic.expect("successful response");
+        let verified =
+            VerifiedOcspResponse::verify(&basic, pki.ca.view(), pki.ca.view()).expect("verifies");
+        assert!(verified.response_for(pki.subject.view()).is_some());
+        assert!(verified.response_for(namesake.view()).is_none());
+    }
+
+    #[test]
+    fn a_sha_256_cert_id_matches() {
+        let pki = pki();
+        let der = testkit::ocsp_response(&OcspSpec {
+            responder_key: &pki.ca_key,
+            responder: ResponderName::ByName(CA),
+            issuer: &pki.ca,
+            serial: SUBJECT_SERIAL,
+            revoked: None,
+            produced_at: testkit::day(PRODUCED),
+            this_update: testkit::day(PRODUCED),
+            next_update: Some(testkit::day(NEXT_UPDATE)),
+            embedded: Vec::new(),
+            cert_id: testkit::CertIdAlgorithm::Sha256,
+            revocation_reason: None,
+            response_extensions: Vec::new(),
+        });
+        assert_eq!(verify(&pki, &der, &pki.ca), Ok(CertStatus::Good));
+    }
+
+    #[test]
+    fn an_issuer_answering_itself_must_be_valid_at_produced_at() {
+        let pki = pki();
+        let short_lived = OwnedCert::from_der(&testkit::certificate(
+            &CertificateSpec {
+                serial: CA_SERIAL,
+                subject: CA,
+                issuer: CA,
+                not_before: testkit::day(VALID_FROM),
+                not_after: testkit::day(EXPIRED_BEFORE_PRODUCED),
+                extensions: testkit::ca_extensions(),
+            },
+            &pki.ca_key,
+            &pki.ca_key,
+        ))
+        .expect("CA certificate parses");
+        let der = response(&pki, &pki.ca_key, ResponderName::ByName(CA));
+        let parsed = OcspResponse::parse(&der).expect("kit response parses");
+        let basic = parsed.basic.expect("successful response");
+        assert_eq!(
+            VerifiedOcspResponse::verify(&basic, short_lived.view(), short_lived.view())
+                .map(|_verified| ()),
+            Err(OcspVerifyError::UnauthorizedResponder(
+                "certificate was not valid at producedAt"
+            ))
+        );
+    }
+
+    #[test]
+    fn an_unknown_critical_response_extension_is_refused() {
+        let pki = pki();
+        let with = |critical: bool| {
+            testkit::ocsp_response(&OcspSpec {
+                responder_key: &pki.ca_key,
+                responder: ResponderName::ByName(CA),
+                issuer: &pki.ca,
+                serial: SUBJECT_SERIAL,
+                revoked: None,
+                produced_at: testkit::day(PRODUCED),
+                this_update: testkit::day(PRODUCED),
+                next_update: Some(testkit::day(NEXT_UPDATE)),
+                embedded: Vec::new(),
+                cert_id: testkit::CertIdAlgorithm::Sha1,
+                revocation_reason: None,
+                response_extensions: vec![testkit::extension(
+                    crate::oids::CERTIFICATE_POLICIES,
+                    critical,
+                    &testkit::tlv(testkit::SEQUENCE, []),
+                )],
+            })
+        };
+        assert!(OcspResponse::parse(&with(false)).is_ok());
+        assert!(OcspResponse::parse(&with(true)).is_err());
+    }
+
+    #[test]
+    fn responder_id_and_version_are_consumed_whole() {
+        let name = testkit::name(CA);
+        let by_name = testkit::tlv(testkit::CONTEXT_1, &name);
+        assert!(super::OcspHelpers::parse_responder_id(&by_name).is_ok());
+        let mut trailing_name = name.clone();
+        trailing_name.extend_from_slice(&testkit::tlv(testkit::NULL, []));
+        assert!(
+            super::OcspHelpers::parse_responder_id(&testkit::tlv(
+                testkit::CONTEXT_1,
+                trailing_name
+            ))
+            .is_err()
+        );
+        let mut trailing_key = testkit::tlv(testkit::OCTET_STRING, KEY_HASH_FILLER);
+        trailing_key.extend_from_slice(&testkit::tlv(testkit::NULL, []));
+        assert!(
+            super::OcspHelpers::parse_responder_id(&testkit::tlv(testkit::CONTEXT_2, trailing_key))
+                .is_err()
+        );
+        let v1 = testkit::tlv(
+            testkit::CONTEXT_0,
+            testkit::tlv(testkit::INTEGER, [OCSP_V1]),
+        );
+        assert!(super::OcspHelpers::parse_version(&v1).is_ok());
+        let mut trailing = testkit::tlv(testkit::INTEGER, [OCSP_V1]);
+        trailing.extend_from_slice(&testkit::tlv(testkit::NULL, []));
+        assert!(
+            super::OcspHelpers::parse_version(&testkit::tlv(testkit::CONTEXT_0, trailing)).is_err()
+        );
     }
 }

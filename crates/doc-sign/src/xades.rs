@@ -68,7 +68,7 @@ use crate::validation::ValidationMaterial;
 pub(crate) const NAMESPACE_DSIG: &str = "http://www.w3.org/2000/09/xmldsig#";
 
 /// `XAdES` 1.3.2 namespace, the version `ASiC-E` and `BDOC` both name.
-const NAMESPACE_XADES: &str = "http://uri.etsi.org/01903/v1.3.2#";
+pub(crate) const NAMESPACE_XADES: &str = "http://uri.etsi.org/01903/v1.3.2#";
 
 /// `SHA-256` digest method identifier (RFC 4051 sec.2.1).
 pub(crate) const DIGEST_METHOD_SHA256: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
@@ -76,15 +76,34 @@ pub(crate) const DIGEST_METHOD_SHA256: &str = "http://www.w3.org/2001/04/xmlenc#
 /// `SHA-384` digest method identifier (RFC 4051 sec.2.1).
 pub(crate) const DIGEST_METHOD_SHA384: &str = "http://www.w3.org/2001/04/xmldsig-more#sha384";
 
+/// `SHA-512` digest identifier (XML Signature 1.1 sec.6.2.4).
+pub(crate) const DIGEST_METHOD_SHA512: &str = "http://www.w3.org/2001/04/xmlenc#sha512";
+
+/// RSA PKCS#1 v1.5 with SHA-256 (RFC 6931 sec.2.3.2).
+pub(crate) const SIGNATURE_METHOD_RSA_SHA256: &str =
+    "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
+
+/// RSA PKCS#1 v1.5 with SHA-384 (RFC 6931 sec.2.3.2).
+pub(crate) const SIGNATURE_METHOD_RSA_SHA384: &str =
+    "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384";
+
+/// ECDSA with SHA-256 (RFC 6931 sec.2.3.6).
+pub(crate) const SIGNATURE_METHOD_ECDSA_SHA256: &str =
+    "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256";
+
+/// ECDSA with SHA-384 (RFC 6931 sec.2.3.6).
+pub(crate) const SIGNATURE_METHOD_ECDSA_SHA384: &str =
+    "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384";
+
 /// Exclusive canonicalisation, without comments.
-const CANONICALIZATION_EXCLUSIVE: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
+pub(crate) const CANONICALIZATION_EXCLUSIVE: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
 
 /// `Type` marking the reference that covers the signed properties.
 ///
 /// Note the namespace has no minor version: `01903#SignedProperties`,
 /// not `01903/v1.3.2#`. It is a fixed string in `EN 319 132-1`, and
 /// verifiers match it literally.
-const TYPE_SIGNED_PROPERTIES: &str = "http://uri.etsi.org/01903#SignedProperties";
+pub(crate) const TYPE_SIGNED_PROPERTIES: &str = "http://uri.etsi.org/01903#SignedProperties";
 
 /// Identifier of the one signature this module writes.
 const SIGNATURE_ID: &str = "SIG-1";
@@ -531,16 +550,17 @@ const fn digest_method_uri(algorithm: DigestAlgorithm) -> &'static str {
     match algorithm {
         DigestAlgorithm::Sha256 => DIGEST_METHOD_SHA256,
         DigestAlgorithm::Sha384 => DIGEST_METHOD_SHA384,
+        DigestAlgorithm::Sha512 => DIGEST_METHOD_SHA512,
     }
 }
 
 /// The `SignatureMethod` identifier for a signature (RFC 4051 sec.2.3).
 const fn signature_method_uri(algorithm: SignatureAlgorithm) -> &'static str {
     match algorithm {
-        SignatureAlgorithm::RsaPkcs1Sha256 => "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
-        SignatureAlgorithm::RsaPkcs1Sha384 => "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384",
-        SignatureAlgorithm::EcdsaSha256 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256",
-        SignatureAlgorithm::EcdsaSha384 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384",
+        SignatureAlgorithm::RsaPkcs1Sha256 => SIGNATURE_METHOD_RSA_SHA256,
+        SignatureAlgorithm::RsaPkcs1Sha384 => SIGNATURE_METHOD_RSA_SHA384,
+        SignatureAlgorithm::EcdsaSha256 => SIGNATURE_METHOD_ECDSA_SHA256,
+        SignatureAlgorithm::EcdsaSha384 => SIGNATURE_METHOD_ECDSA_SHA384,
     }
 }
 

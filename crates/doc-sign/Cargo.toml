@@ -15,6 +15,9 @@ doctest = false
 
 [features]
 default = ["pcsc"]
+# Test-only fixture builders on the refineid-cms test signer. Never
+# enabled by a production build.
+testkit = ["refineid-cms/testkit"]
 pcsc = [
     "dep:refineid-apdu",
     "dep:refineid-auth",
@@ -49,6 +52,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 refineid-apdu.workspace = true
+refineid-cms = { workspace = true, features = ["testkit"] }
 refineid-auth.workspace = true
 refineid-pace.workspace = true
 refineid-pcsc.workspace = true

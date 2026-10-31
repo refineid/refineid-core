@@ -142,9 +142,6 @@ impl ConstantTimeEq for Point {
 #[cfg(test)]
 mod tests {
     use super::{FieldBytes, Point, SEC1_UNCOMPRESSED_LEN, Scalar};
-    use bp384::BrainpoolP384r1;
-    use bp384::elliptic_curve::Curve as _;
-    use bp384::elliptic_curve::bigint::Reduce as _;
     use bp384::elliptic_curve::sec1::Tag;
     use subtle::ConstantTimeEq as _;
     use zeroize::Zeroize as _;
@@ -198,20 +195,15 @@ mod tests {
     }
 
     #[test]
-    fn generator_times_order_is_the_identity() {
-        // `n` reduces to zero in the scalar field; the library's group law
-        // takes `n * G` and `(n - 1) * G + G` to the identity alike.
-        let order = Scalar::reduce(BrainpoolP384r1::ORDER.as_ref());
-        let identity = Point::generator().scalar_mul(&order);
+    fn generator_times_order_minus_one_plus_generator_is_the_identity() {
+        // `n` itself is zero in the scalar field, so the subgroup order is
+        // pinned through `(n - 1) * G + G`: a finite point that the
+        // generator completes to the identity.
+        let order_minus_one = Point::generator().scalar_mul(&(Scalar::ZERO - Scalar::ONE));
+        assert!(order_minus_one.encode_uncompressed().is_some());
+        let identity = order_minus_one.add(&Point::generator());
         assert!(identity.encode_uncompressed().is_none());
         assert!(identity.x_coordinate().is_none());
-        let order_minus_one = Point::generator().scalar_mul(&(Scalar::ZERO - Scalar::ONE));
-        assert!(
-            order_minus_one
-                .add(&Point::generator())
-                .encode_uncompressed()
-                .is_none()
-        );
     }
 
     #[test]

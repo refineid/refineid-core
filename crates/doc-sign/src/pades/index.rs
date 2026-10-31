@@ -26,20 +26,24 @@
 //! - ISO 32000-1 sec.7.5.7, sec.7.5.8: object and cross-reference
 //!   streams, read in `xref_stream`.
 
+use core::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use super::PdfError;
 use super::xref_stream;
 
 /// Most cross-reference entries a file may declare, through `/Size`, a
-/// classic subsection count or a stream's `/Index` pairs.
+/// classic subsection count or a stream's `/Index` pairs: this
+/// implementation's limit, two to the twentieth.
 ///
-/// ISO 32000-1 Annex C, Table C.1, caps a file at 8 388 607 indirect
-/// objects, numbered from one; with entry zero, which heads the free
-/// list, that is two to the twenty-third entries. Every object number
-/// this reader admits is below this, so the merged index never holds
-/// more objects than this either.
-pub(crate) const MAX_XREF_ENTRIES: usize = 1 << 23;
+/// ISO 32000-1 Annex C, Table C.1, allows up to 8 388 607 indirect
+/// objects, but a compressed cross-reference stream can declare that
+/// many from a few bytes, and every entry costs memory before any is
+/// checked. A signed document holds a few thousand objects; a million
+/// leaves room for the largest real files. Every object number this
+/// reader admits is below this, so the merged index never holds more
+/// objects than this either.
+pub(crate) const MAX_XREF_ENTRIES: usize = 1 << 20;
 
 /// Maximum nesting accepted while reading PDF values.
 ///
@@ -52,6 +56,10 @@ pub(crate) const MAX_PDF_VALUE_DEPTH: usize = 64;
 
 /// The NUL white-space character (ISO 32000-1 sec.7.2.2, Table 1).
 const NUL: u8 = 0x00;
+
+/// Opens a comment, which runs to the end of the line (ISO 32000-1
+/// sec.7.2.3).
+const COMMENT_MARK: u8 = b'%';
 
 /// The FORM FEED white-space character (ISO 32000-1 sec.7.2.2, Table 1).
 const FORM_FEED: u8 = 0x0C;
@@ -130,6 +138,10 @@ const KEY_XREF_STREAM: &[u8] = b"XRefStm";
 /// Trailer key of the number of entries (ISO 32000-1 sec.7.5.5).
 const KEY_SIZE: &[u8] = b"Size";
 
+/// Trailer key present on an encrypted revision (ISO 32000-1
+/// sec.7.6.1).
+const KEY_ENCRYPT: &[u8] = b"Encrypt";
+
 /// One indirect PDF object reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct PdfObjectReference {
@@ -140,6 +152,20 @@ pub(crate) struct PdfObjectReference {
 }
 
 impl PdfObjectReference {
+    /// A new object of an update: generation zero (ISO 32000-1
+    /// sec.7.5.6; an updated object keeps the generation it had).
+    pub(crate) const fn fresh(number: u32) -> Self {
+        Self {
+            number,
+            generation: 0,
+        }
+    }
+
+    /// `N G`, as an object header writes it before `obj`.
+    pub(crate) fn header(self) -> String {
+        format!("{} {}", self.number, self.generation)
+    }
+
     /// The reference as written: `N G R`.
     pub(crate) fn rendered(self) -> String {
         format!("{} {} R", self.number, self.generation)
@@ -462,7 +488,7 @@ impl<'a> PdfValueParser<'a> {
             {
                 self.offset = self.offset.saturating_add(1);
             }
-            if self.bytes.get(self.offset) != Some(&b'%') {
+            if self.bytes.get(self.offset) != Some(&COMMENT_MARK) {
                 return;
             }
             while self
@@ -668,6 +694,12 @@ pub(crate) struct PdfIndex<'a> {
     newest_is_stream: bool,
     /// The newest entry for each object number.
     objects: HashMap<u32, XrefEntry>,
+    /// Every section's own entries, newest section first.
+    sections: Vec<Vec<XrefEntry>>,
+    /// Object streams decoded so far, by file offset; `None` for one
+    /// that does not decode. Each is decoded once however many lookups
+    /// read it.
+    object_streams: RefCell<HashMap<usize, Option<xref_stream::ObjectStream>>>,
 }
 
 impl<'a> PdfIndex<'a> {
@@ -691,6 +723,7 @@ impl<'a> PdfIndex<'a> {
         let mut visited = HashSet::new();
         let mut newest: Option<(Vec<u8>, bool)> = None;
         let mut objects: HashMap<u32, XrefEntry> = HashMap::new();
+        let mut sections = Vec::new();
 
         while let Some(offset) = next {
             if visited.len() == Self::MAX_XREF_SECTIONS {
@@ -700,12 +733,24 @@ impl<'a> PdfIndex<'a> {
                 return Err(PdfError::MissingTrailer);
             }
             let section = parse_xref_section(pdf, offset)?;
+            // An encrypted revision anywhere in the chain leaves its
+            // strings and streams unreadable without the document key
+            // (ISO 32000-1 sec.7.6.1).
+            if PdfDictionary::parse(&section.trailer)
+                .map_err(|_ignored| PdfError::MissingTrailer)?
+                .entry(KEY_ENCRYPT)
+                .map_err(|_ignored| PdfError::MissingTrailer)?
+                .is_some()
+            {
+                return Err(PdfError::UnsupportedEncryption);
+            }
             next = trailer_offset(&section.trailer, KEY_PREV)?;
-            for entry in section.entries {
+            for entry in &section.entries {
                 // Newer sections win. A newer free entry is kept too:
                 // it deletes the object and must suppress older copies.
-                objects.entry(entry.number).or_insert(entry);
+                objects.entry(entry.number).or_insert(*entry);
             }
+            sections.push(section.entries);
             if newest.is_none() {
                 newest = Some((section.trailer, section.is_stream));
             }
@@ -718,19 +763,24 @@ impl<'a> PdfIndex<'a> {
             start_xref,
             newest_is_stream,
             objects,
+            sections,
+            object_streams: RefCell::new(HashMap::new()),
         })
     }
 
     /// An index over `objects` with an empty trailer, for tests that
     /// read fragments without a cross-reference chain.
     #[cfg(test)]
-    pub(crate) const fn from_entries(pdf: &'a [u8], objects: HashMap<u32, XrefEntry>) -> Self {
+    pub(crate) fn from_entries(pdf: &'a [u8], objects: HashMap<u32, XrefEntry>) -> Self {
+        let sections = vec![objects.values().copied().collect()];
         Self {
             pdf,
             trailer: Vec::new(),
             start_xref: 0,
             newest_is_stream: false,
             objects,
+            sections,
+            object_streams: RefCell::new(HashMap::new()),
         }
     }
 
@@ -771,70 +821,116 @@ impl<'a> PdfIndex<'a> {
                 position,
             } => {
                 let offset = self.container_offset(container)?;
-                xref_stream::compressed_body(self.pdf, offset, reference.number, position)
+                self.compressed_body(offset, reference.number, position)
             }
         }
     }
 
-    /// The dictionary of every live object that is one, or that opens
-    /// a stream with one, in object-number order, each with the file
+    /// Object `number` at `position` of the object stream at
+    /// `container_offset`, decoding the stream on first use only.
+    fn compressed_body(
+        &self,
+        container_offset: usize,
+        number: u32,
+        position: u32,
+    ) -> Option<Vec<u8>> {
+        self.object_streams
+            .borrow_mut()
+            .entry(container_offset)
+            .or_insert_with(|| xref_stream::ObjectStream::at(self.pdf, container_offset))
+            .as_ref()
+            .and_then(|stream| stream.body(number, position))
+    }
+
+    /// The dictionary of every object any cross-reference section lists
+    /// as in use, newest view or not, that is one or that opens a
+    /// stream with one, in object-number order, each with the file
     /// offset of its `<<` when the object is not inside an object
-    /// stream.
+    /// stream. An object a later revision frees or replaces is still
+    /// listed from the section that wrote it, so every signature ever
+    /// written is found; the same object listed by several sections is
+    /// listed once.
     ///
     /// Each object stream is decoded once however many objects it
-    /// holds. A live object that is some other value, such as a number
-    /// or an array, is left out.
+    /// holds. An object that is some other value, such as a number or
+    /// an array, is left out.
     ///
     /// # Errors
-    /// [`PdfError::MissingObject`] when a live entry does not lead to
-    /// an object with its number and generation, or a dictionary there
-    /// does not close: an unreadable object is never skipped, so a
-    /// malformed signature dictionary cannot hide.
+    /// [`PdfError::MissingObject`] when an in-use entry does not lead
+    /// to an object with its number and generation, its body is no
+    /// value, or a dictionary there does not close: an unreadable
+    /// object is never skipped, so a malformed signature dictionary
+    /// cannot hide.
     pub(crate) fn object_dictionaries(&self) -> Result<Vec<ObjectDictionary>, PdfError> {
-        let mut live: Vec<&XrefEntry> = self
-            .objects
-            .values()
-            .filter(|entry| entry.location != XrefLocation::Free)
-            .collect();
-        live.sort_unstable_by_key(|entry| (entry.number, entry.generation));
-        let mut containers: HashMap<u32, Option<xref_stream::ObjectStream>> = HashMap::new();
-        let mut dictionaries = Vec::new();
-        for entry in live {
-            let reference = PdfObjectReference {
-                number: entry.number,
-                generation: entry.generation,
-            };
-            let unreadable = PdfError::MissingObject(reference.number);
-            let dictionary = match entry.location {
-                XrefLocation::Free => None,
-                XrefLocation::Direct { offset } => {
-                    object_dictionary_at(self.pdf, reference, offset)
-                        .ok_or(unreadable)?
-                        .map(|(start, bytes)| (Some(start), bytes))
+        /// Where one object is written, for listing it once.
+        #[derive(PartialEq, Eq, Hash)]
+        enum Written {
+            /// At this header offset.
+            Direct(usize),
+            /// In the object stream at this offset, at this position.
+            Compressed(usize, u32),
+        }
+        let mut seen: HashSet<Written> = HashSet::new();
+        let mut found: Vec<(PdfObjectReference, ObjectDictionary)> = Vec::new();
+        for (section, entries) in self.sections.iter().enumerate() {
+            for entry in entries {
+                let reference = PdfObjectReference {
+                    number: entry.number,
+                    generation: entry.generation,
+                };
+                let unreadable = PdfError::MissingObject(reference.number);
+                let dictionary = match entry.location {
+                    XrefLocation::Free => continue,
+                    XrefLocation::Direct { offset } => {
+                        if !seen.insert(Written::Direct(offset)) {
+                            continue;
+                        }
+                        object_dictionary_at(self.pdf, reference, offset)
+                            .ok_or(unreadable)?
+                            .map(|(start, bytes)| (Some(start), bytes))
+                    }
+                    XrefLocation::Compressed {
+                        container,
+                        position,
+                    } => {
+                        let offset = self
+                            .section_container_offset(section, container)
+                            .ok_or(unreadable)?;
+                        if !seen.insert(Written::Compressed(offset, position)) {
+                            continue;
+                        }
+                        let body = self
+                            .compressed_body(offset, reference.number, position)
+                            .ok_or(unreadable)?;
+                        leading_dictionary(&body, 0)
+                            .ok_or(unreadable)?
+                            .map(|(_start, bytes)| (None, bytes))
+                    }
+                };
+                if let Some((file_offset, bytes)) = dictionary {
+                    found.push((reference, ObjectDictionary { file_offset, bytes }));
                 }
-                XrefLocation::Compressed {
-                    container,
-                    position,
-                } => {
-                    let body = containers
-                        .entry(container)
-                        .or_insert_with(|| {
-                            let offset = self.container_offset(container)?;
-                            xref_stream::ObjectStream::at(self.pdf, offset)
-                        })
-                        .as_ref()
-                        .and_then(|stream| stream.body(reference.number, position))
-                        .ok_or(unreadable)?;
-                    leading_dictionary(&body, 0)
-                        .ok_or(unreadable)?
-                        .map(|(_start, bytes)| (None, bytes))
-                }
-            };
-            if let Some((file_offset, bytes)) = dictionary {
-                dictionaries.push(ObjectDictionary { file_offset, bytes });
             }
         }
-        Ok(dictionaries)
+        found.sort_by_key(|(reference, _)| (reference.number, reference.generation));
+        Ok(found
+            .into_iter()
+            .map(|(_, dictionary)| dictionary)
+            .collect())
+    }
+
+    /// The offset of the object stream `container` as the section
+    /// `section` or an older one lists it.
+    fn section_container_offset(&self, section: usize, container: u32) -> Option<usize> {
+        self.sections.get(section..)?.iter().find_map(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry.number == container)
+                .and_then(|entry| match entry.location {
+                    XrefLocation::Direct { offset } => Some(offset),
+                    XrefLocation::Free | XrefLocation::Compressed { .. } => None,
+                })
+        })
     }
 
     /// The decoded payload of the stream object `reference` names.
@@ -924,7 +1020,7 @@ fn trailer_offset(trailer: &[u8], name: &[u8]) -> Result<Option<usize>, PdfError
 /// flag other than `n` or `f`, or a declared count past
 /// [`MAX_XREF_ENTRIES`].
 pub(crate) fn parse_xref_section(pdf: &[u8], offset: usize) -> Result<XrefSection, PdfError> {
-    let mut cursor = skip_pdf_whitespace(pdf, offset);
+    let mut cursor = skip_pdf_trivia(pdf, offset);
     let Some(rest) = pdf.get(cursor..) else {
         return Err(PdfError::MissingStartXref);
     };
@@ -1009,7 +1105,7 @@ fn hybrid_merged(
             is_stream: false,
         });
     };
-    let stream = xref_stream::parse_stream_section(pdf, skip_pdf_whitespace(pdf, hybrid))?;
+    let stream = xref_stream::parse_stream_section(pdf, skip_pdf_trivia(pdf, hybrid))?;
     let mut combined = stream.entries;
     combined.extend(entries);
     Ok(XrefSection {
@@ -1019,24 +1115,25 @@ fn hybrid_merged(
     })
 }
 
-/// The first offset at or after `cursor` that is not white space.
-pub(crate) fn skip_pdf_whitespace(pdf: &[u8], mut cursor: usize) -> usize {
-    while pdf
-        .get(cursor)
-        .is_some_and(|byte| PdfValueParser::is_whitespace(*byte))
-    {
-        cursor = cursor.saturating_add(1);
-    }
-    cursor
+/// The first offset at or after `cursor` that is neither white space
+/// nor inside a comment: ISO 32000-1 sec.7.2.3 lets a comment stand
+/// wherever white space may, and treats it as one white-space
+/// character.
+pub(crate) fn skip_pdf_trivia(pdf: &[u8], cursor: usize) -> usize {
+    let mut parser = PdfValueParser::new(pdf);
+    parser.offset = cursor;
+    parser.skip_trivia();
+    parser.offset
 }
 
-/// The next white-space delimited token at `cursor`, advancing it.
+/// The next token at `cursor`, delimited by white space or a comment,
+/// advancing `cursor` past it.
 pub(crate) fn read_pdf_token<'a>(pdf: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
-    *cursor = skip_pdf_whitespace(pdf, *cursor);
+    *cursor = skip_pdf_trivia(pdf, *cursor);
     let start = *cursor;
     while pdf
         .get(*cursor)
-        .is_some_and(|byte| !PdfValueParser::is_whitespace(*byte))
+        .is_some_and(|byte| !PdfValueParser::is_whitespace(*byte) && *byte != COMMENT_MARK)
     {
         *cursor = (*cursor).saturating_add(1);
     }
@@ -1072,7 +1169,7 @@ pub(crate) fn parse_u16(digits: &[u8]) -> Option<u16> {
 /// Strings and comments are skipped so a `>>` inside them does not
 /// close the dictionary.
 pub(crate) fn dictionary_at(pdf: &[u8], cursor: usize) -> Option<(Vec<u8>, usize)> {
-    let start = skip_pdf_whitespace(pdf, cursor);
+    let start = skip_pdf_trivia(pdf, cursor);
     if !pdf.get(start..)?.starts_with(DICTIONARY_OPEN) {
         return None;
     }
@@ -1168,6 +1265,25 @@ pub(crate) fn dictionary_value<'d>(dictionary: &'d [u8], key: &[u8]) -> Option<&
     dictionary.get(entry.value.clone())
 }
 
+/// The name `value` holds, decoded through the grammar (ISO 32000-1
+/// sec.7.3.5: `#xx` escapes), without its slash, or the one name of a
+/// one-element array; `None` for any other value.
+pub(crate) fn sole_name(value: &[u8]) -> Option<Vec<u8>> {
+    let mut parser = PdfValueParser::new(value);
+    parser.skip_trivia();
+    let in_array = parser.consume(ARRAY_OPEN);
+    parser.skip_trivia();
+    let name = parser.name().ok()?;
+    if in_array {
+        parser.skip_trivia();
+        if !parser.consume(ARRAY_CLOSE) {
+            return None;
+        }
+    }
+    parser.require_end().ok()?;
+    Some(name)
+}
+
 /// The indirect reference stored under `key`, generation included.
 pub(crate) fn dictionary_reference(dictionary: &[u8], key: &[u8]) -> Option<PdfObjectReference> {
     complete_object_reference(dictionary_value(dictionary, key)?)
@@ -1243,9 +1359,13 @@ fn object_dictionary_at(
 /// `None` when it opens one that does not close; `Some(None)` when the
 /// value is not a dictionary.
 fn leading_dictionary(bytes: &[u8], cursor: usize) -> Option<Option<(usize, Vec<u8>)>> {
-    let start = skip_pdf_whitespace(bytes, cursor);
+    let start = skip_pdf_trivia(bytes, cursor);
     if !bytes.get(start..)?.starts_with(DICTIONARY_OPEN) {
-        return Some(None);
+        // Another value is no dictionary; a body that is no value at
+        // all cannot be classified and is an error.
+        let mut parser = PdfValueParser::new(bytes);
+        parser.offset = start;
+        return parser.value(0).ok().map(|_value| None);
     }
     dictionary_at(bytes, start).map(|(dictionary, _end)| Some((start, dictionary)))
 }

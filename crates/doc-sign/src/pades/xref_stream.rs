@@ -18,7 +18,7 @@ use super::PdfError;
 use super::index::{
     ARRAY_CLOSE, ARRAY_OPEN, DICTIONARY_OPEN, MAX_XREF_ENTRIES, PdfDictionary, PdfObjectReference,
     PdfValueParser, XrefEntry, XrefLocation, XrefSection, dictionary_at, dictionary_usize,
-    dictionary_value, find_first, object_header_end, parse_u32, parse_usize,
+    dictionary_value, find_first, object_header_end, parse_u32, parse_usize, sole_name,
 };
 
 /// Bound on any one decoded stream, so a hostile document cannot make
@@ -100,10 +100,13 @@ const FIELD_THIRD: usize = 2;
 const BYTE_RADIX: usize = 1 << u8::BITS;
 
 /// `/Type` of a cross-reference stream (ISO 32000-1 sec.7.5.8.2).
-const TYPE_XREF: &[u8] = b"/XRef";
+const TYPE_XREF: &[u8] = b"XRef";
 
 /// `/Type` key.
 const KEY_TYPE: &[u8] = b"Type";
+
+/// The one filter this reader decodes (ISO 32000-1 sec.7.4.4).
+pub(crate) const FILTER_FLATE: &[u8] = b"FlateDecode";
 
 /// Stream dictionary key: the cross-reference entry field widths.
 const KEY_WIDTHS: &[u8] = b"W";
@@ -131,7 +134,11 @@ struct StreamObject {
 /// One cross-reference stream section at `offset`.
 pub(super) fn parse_stream_section(pdf: &[u8], offset: usize) -> Result<XrefSection, PdfError> {
     let object = parse_stream_object(pdf, offset)?;
-    if dictionary_value(&object.dictionary, KEY_TYPE).map(trim) != Some(TYPE_XREF) {
+    if dictionary_value(&object.dictionary, KEY_TYPE)
+        .and_then(sole_name)
+        .as_deref()
+        != Some(TYPE_XREF)
+    {
         return Err(PdfError::MissingTrailer);
     }
     let widths: [usize; ENTRY_FIELDS] = integer_array(&object.dictionary, KEY_WIDTHS)
@@ -151,17 +158,6 @@ pub(super) fn parse_stream_section(pdf: &[u8], offset: usize) -> Result<XrefSect
         entries,
         is_stream: true,
     })
-}
-
-/// One compressed object's bytes: its slice of the object stream at
-/// `container_offset` (ISO 32000-1 sec.7.5.7).
-pub(super) fn compressed_body(
-    pdf: &[u8],
-    container_offset: usize,
-    number: u32,
-    position: u32,
-) -> Option<Vec<u8>> {
-    ObjectStream::at(pdf, container_offset)?.body(number, position)
 }
 
 /// One object stream, decoded once so each object it holds can be
@@ -231,27 +227,29 @@ impl ObjectStream {
 pub(super) fn push_stream_close(
     update: &mut Vec<u8>,
     xref_at: usize,
-    offsets: &[(u32, usize)],
+    offsets: &[(PdfObjectReference, usize)],
     size: u32,
-    catalog_number: u32,
+    catalog: PdfObjectReference,
     previous_xref: usize,
     carried: &str,
 ) -> Result<(), PdfError> {
     let stream_number = size;
-    let mut entries: Vec<(u32, usize)> = offsets.to_vec();
-    entries.push((stream_number, xref_at));
-    entries.sort_unstable_by_key(|(number, _)| *number);
+    let mut entries: Vec<(PdfObjectReference, usize)> = offsets.to_vec();
+    entries.push((PdfObjectReference::fresh(stream_number), xref_at));
+    entries.sort_unstable_by_key(|(reference, _)| reference.number);
     let mut index = String::new();
     let mut rows: Vec<u8> = Vec::new();
-    for (number, offset) in &entries {
+    for (reference, offset) in &entries {
         let narrow = u32::try_from(*offset).map_err(|_ignored| PdfError::MissingStartXref)?;
-        let _ignored = core::fmt::Write::write_fmt(&mut index, format_args!("{number} 1 "));
+        let _ignored =
+            core::fmt::Write::write_fmt(&mut index, format_args!("{} 1 ", reference.number));
         rows.push(u8::try_from(TYPE_DIRECT).unwrap_or(1));
         rows.extend_from_slice(&narrow.to_be_bytes());
-        rows.extend_from_slice(&0_u16.to_be_bytes());
+        rows.extend_from_slice(&reference.generation.to_be_bytes());
     }
+    let catalog_number = catalog.rendered();
     let head = format!(
-        "{stream_number} 0 obj\n<< /Type /XRef /Size {} /Root {catalog_number} 0 R \
+        "{stream_number} 0 obj\n<< /Type /XRef /Size {} /Root {catalog_number} \
          /Prev {previous_xref}{carried} /Index [ {index}] /W [{} {} {}] /Length {} \
          >>\nstream\n",
         stream_number.saturating_add(1),
@@ -366,14 +364,11 @@ fn flate_only(dictionary: &[u8]) -> Result<bool, PdfError> {
     else {
         return Ok(false);
     };
-    let mut name = trim(&dictionary[entry.value.clone()]);
-    if let Some(inner) = name
-        .strip_prefix(b"[")
-        .and_then(|inner| inner.strip_suffix(b"]"))
-    {
-        name = trim(inner);
-    }
-    if name == b"/FlateDecode" {
+    let name = dictionary
+        .get(entry.value.clone())
+        .and_then(sole_name)
+        .ok_or(PdfError::UnsupportedCrossReferenceStream)?;
+    if name == FILTER_FLATE {
         Ok(true)
     } else {
         Err(PdfError::UnsupportedCrossReferenceStream)
@@ -859,5 +854,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Names compare decoded (ISO 32000-1 sec.7.3.5): `#58` is `X` and
+    /// `#44` is `D`.
+    #[test]
+    fn escaped_names_are_read_as_what_they_spell() {
+        let keys = format!("/Size 1 {WIDTHS} /Filter /Flate#44ecode");
+        let escaped = section(&keys, &empty_flate());
+        let plain: &[u8] = b"/Type /XRef";
+        let at = escaped
+            .windows(plain.len())
+            .position(|window| window == plain)
+            .expect("the type entry");
+        let mut respelled = escaped[..at].to_vec();
+        respelled.extend_from_slice(b"/Type /#58Ref");
+        respelled.extend_from_slice(&escaped[at + plain.len()..]);
+        assert_eq!(
+            parse_stream_section(&respelled, 0).map(|section| section.entries.len()),
+            parsed(
+                &format!("/Size 1 {WIDTHS} /Filter /FlateDecode"),
+                &empty_flate()
+            )
+        );
     }
 }

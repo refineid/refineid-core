@@ -53,7 +53,7 @@ use crate::x509_ext::NameExt;
 use refineid_cms::x509::{DateTime, OwnedCert};
 
 use self::asic::{AsicContainer, AsicReadError};
-use self::cades::{CadesReadError, CadesSignature, Content, ContentDigest, EssBinding};
+use self::cades::{CadesReadError, CadesSignature, Content, EssBinding};
 use self::pdf::{ByteRange, PdfDocument, PdfReadError, SignatureKind, SubFilter};
 use self::trust::judge;
 pub use self::trust::{
@@ -61,24 +61,22 @@ pub use self::trust::{
 };
 use self::xades::{XadesReadError, XadesUnsupported, XadesVerdict};
 
-/// What the first bytes of a file announce.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FileKind {
+/// A file by what its first bytes announce, each the complete file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileContent {
     /// A PDF.
-    Pdf,
+    Pdf(Vec<u8>),
     /// A ZIP archive, read as an `ASiC` container.
-    Zip,
+    Zip(Vec<u8>),
     /// A DER SEQUENCE, read as a CMS `ContentInfo`.
-    Der,
+    Der(Vec<u8>),
 }
 
 /// One file of a known shape: a PDF, a ZIP archive, or a DER SEQUENCE.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentFile {
-    /// The complete file.
-    bytes: Vec<u8>,
-    /// What its first bytes announce.
-    kind: FileKind,
+    /// The file, by its shape.
+    content: FileContent,
 }
 
 impl DocumentFile {
@@ -89,16 +87,16 @@ impl DocumentFile {
     /// # Errors
     /// [`DocumentFailure::NotASignedDocument`] for anything else.
     pub fn from_file(bytes: Vec<u8>) -> Result<Self, DocumentFailure> {
-        let kind = if pdf::starts_as_pdf(&bytes) {
-            FileKind::Pdf
+        let content = if pdf::starts_as_pdf(&bytes) {
+            FileContent::Pdf(bytes)
         } else if asic::starts_as_zip(&bytes) {
-            FileKind::Zip
+            FileContent::Zip(bytes)
         } else if bytes.first().copied().map(u16::from) == Some(<Sequence as BerTag>::TAG) {
-            FileKind::Der
+            FileContent::Der(bytes)
         } else {
             return Err(DocumentFailure::NotASignedDocument);
         };
-        Ok(Self { bytes, kind })
+        Ok(Self { content })
     }
 }
 
@@ -156,21 +154,25 @@ impl SignerIdentity {
 /// What one RFC 3161 timestamp token was found to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimestampReport {
-    /// The token verifies and imprints what it should. `anchored` says
-    /// whether its authority chains to a time-stamping anchor granted
-    /// at `time`; an unanchored token shows its claimed time and proves
-    /// nothing.
-    Verified {
+    /// The token verifies, imprints what it should, and its authority
+    /// chains to a time-stamping anchor granted at `time`: it proves
+    /// the signed data existed then.
+    Anchored {
         /// `genTime`.
         time: DateTime,
-        /// Whether the authority is anchored at `time`.
-        anchored: bool,
+    },
+    /// The token verifies and imprints what it should, but its
+    /// authority is not anchored: `time` is what the token claims and
+    /// proves nothing.
+    Claimed {
+        /// `genTime`.
+        time: DateTime,
     },
     /// The token does not verify, or imprints other data.
     Invalid(TimestampError),
-    /// The octets the token imprints are not computed by this verifier:
-    /// an `XAdES` timestamp under a canonicalisation other than Exclusive
-    /// XML Canonicalization.
+    /// The token is not judged: an `XAdES` timestamp under a
+    /// canonicalisation other than Exclusive XML Canonicalization, or a
+    /// PDF document timestamp whose range does not end a revision.
     Unsupported,
 }
 
@@ -180,22 +182,15 @@ impl TimestampReport {
     #[must_use]
     pub const fn proven_time(&self) -> Option<DateTime> {
         match *self {
-            Self::Verified {
-                time,
-                anchored: true,
-            } => Some(time),
-            Self::Verified {
-                anchored: false, ..
-            }
-            | Self::Invalid(_)
-            | Self::Unsupported => None,
+            Self::Anchored { time } => Some(time),
+            Self::Claimed { .. } | Self::Invalid(_) | Self::Unsupported => None,
         }
     }
 
     /// Whether the token verifies, anchored or not.
     #[must_use]
     pub const fn is_verified(&self) -> bool {
-        matches!(self, Self::Verified { .. })
+        matches!(self, Self::Anchored { .. } | Self::Claimed { .. })
     }
 }
 
@@ -317,15 +312,16 @@ impl SignatureReport {
     }
 
     /// Whether the signature is valid: the document is intact, the
-    /// signature is valid, the chain is verified, every timestamp it
-    /// carries verifies, and no revocation before the proof of
-    /// existence is known (any revocation, without a proof).
+    /// signature is valid, the chain is verified, and no revocation
+    /// before the proof of existence is known (any revocation, without
+    /// a proof). A timestamp that does not verify is reported and
+    /// decides nothing: it sits in unprotected attributes anyone can
+    /// append to.
     #[must_use]
     pub fn is_valid(&self) -> bool {
         self.document_intact
             && self.signature_valid
             && self.chain_verified
-            && self.timestamps.iter().all(TimestampReport::is_verified)
             && !self.revocation.revoked_before(self.proof_of_existence)
     }
 
@@ -349,6 +345,9 @@ pub enum UnsupportedSignature {
     /// A PDF signature dictionary under a subfilter other than
     /// `ETSI.CAdES.detached` and `adbe.pkcs7.detached`.
     PdfSubFilter,
+    /// A PDF signature whose `/ByteRange` does not end where a revision
+    /// ends, so it signs part of one.
+    PdfRangeNotARevision,
     /// A CMS signature this verifier does not read.
     Cms(CadesReadError),
     /// A `CAdES` signature in a container that no `ASiCManifest` names.
@@ -358,6 +357,12 @@ pub enum UnsupportedSignature {
     Xades(XadesUnsupported),
     /// The container's `XAdES` signature files could not be read.
     XadesFile(XadesReadError),
+    /// One `XAdES` signature lacks a part every signature has, or
+    /// carries one that does not decode.
+    XadesMalformed(XadesReadError),
+    /// An `XAdES` signature whose signing-certificate binding names a
+    /// certificate it does not carry, so it has no signer to judge.
+    XadesSignerNotCarried,
 }
 
 /// One signature found in the document.
@@ -436,16 +441,11 @@ impl DocumentReport {
     }
 
     /// Whether the document is valid: it has at least one signature,
-    /// every signature was judged and is valid, and every document
-    /// timestamp verifies.
+    /// and every signature was judged and is valid. A document
+    /// timestamp that does not verify is reported and decides nothing.
     #[must_use]
     pub fn is_valid(&self) -> bool {
-        !self.rows.is_empty()
-            && self.rows.iter().all(SignatureRow::is_valid)
-            && self
-                .document_timestamps
-                .iter()
-                .all(|stamp| stamp.timestamp.is_verified())
+        !self.rows.is_empty() && self.rows.iter().all(SignatureRow::is_valid)
     }
 
     /// This report with live revocation answers: `ask` is called for
@@ -546,10 +546,10 @@ pub fn verify(
     now: DateTime,
 ) -> Result<DocumentReport, DocumentFailure> {
     let context = Context { anchors, now };
-    let (rows, document_timestamps) = match file.kind {
-        FileKind::Pdf => context.verify_pdf(&file.bytes)?,
-        FileKind::Zip => (context.verify_asic(&file.bytes)?, Vec::new()),
-        FileKind::Der => (vec![context.verify_attached_cms(&file.bytes)?], Vec::new()),
+    let (rows, document_timestamps) = match &file.content {
+        FileContent::Pdf(bytes) => context.verify_pdf(bytes)?,
+        FileContent::Zip(bytes) => (context.verify_asic(bytes)?, Vec::new()),
+        FileContent::Der(bytes) => (vec![context.verify_attached_cms(bytes)?], Vec::new()),
     };
     if rows.is_empty() {
         return Err(DocumentFailure::NoSignatures);
@@ -630,17 +630,22 @@ impl Context<'_> {
         for certificate in verified.embedded_certificates() {
             pool.add_certificate(certificate.clone());
         }
+        pool.add_material(verified.embedded_revocation());
         let time = verified.generated_at();
         let chain = judge(
             verified.signer_certificate(),
             &pool,
             self.anchors,
             AnchorRole::TimeStamping,
-            time,
+            trust::When {
+                at: time,
+                now: self.now,
+            },
         );
-        TimestampReport::Verified {
-            time,
-            anchored: chain.anchored && !chain.revocation.revoked_before(Some(time)),
+        if chain.anchored && !chain.revocation.revoked_before(Some(time)) {
+            TimestampReport::Anchored { time }
+        } else {
+            TimestampReport::Claimed { time }
         }
     }
 
@@ -674,7 +679,10 @@ impl Context<'_> {
             &facts.pool,
             self.anchors,
             AnchorRole::CertificateIssuing,
-            validation_time,
+            trust::When {
+                at: validation_time,
+                now: self.now,
+            },
         );
         SignatureReport {
             signer: SignerIdentity::of(&facts.signer),
@@ -713,11 +721,15 @@ impl Context<'_> {
             .filter(|found| found.kind() == SignatureKind::DocumentTimestamp)
             .map(|found| {
                 let range = found.byte_range();
-                let timestamp = self.judge_token(
-                    found.cms(),
-                    |algorithm| document.digest(&range, algorithm),
-                    &base,
-                );
+                let timestamp = if found.ends_revision() {
+                    self.judge_token(
+                        found.cms(),
+                        |algorithm| document.digest(&range, algorithm),
+                        &base,
+                    )
+                } else {
+                    TimestampReport::Unsupported
+                };
                 (
                     DocumentTimestampReport {
                         timestamp,
@@ -741,6 +753,12 @@ impl Context<'_> {
                 }
                 SignatureKind::DocumentTimestamp => continue,
             };
+            if !found.ends_revision() {
+                rows.push(SignatureRow::Unsupported(
+                    UnsupportedSignature::PdfRangeNotARevision,
+                ));
+                continue;
+            }
             let signature = match CadesSignature::parse(found.cms()) {
                 Ok(signature) => signature,
                 Err(error) => {
@@ -749,11 +767,13 @@ impl Context<'_> {
                 }
             };
             let range = found.byte_range();
-            let digest = ContentDigest::of(
-                signature.digest_algorithm(),
-                &document.signed_octets(&range),
+            let signed_octets = document.signed_octets(&range);
+            let verdict = signature.verify(
+                Content::Detached {
+                    content: &signed_octets,
+                },
+                ess,
             );
-            let verdict = signature.verify(Content::Detached { digest: &digest }, ess);
             let baseline_time_attribute =
                 ess == EssBinding::Required && signature.has_signing_time_attribute();
             let mut pool = base.clone();
@@ -783,12 +803,15 @@ impl Context<'_> {
     fn verify_asic(&self, bytes: &[u8]) -> Result<Vec<SignatureRow>, DocumentFailure> {
         let container = AsicContainer::parse(bytes).map_err(|error| match error {
             AsicReadError::NotAZip => DocumentFailure::NotASignedDocument,
-            AsicReadError::Malformed(_) => {
+            AsicReadError::Malformed(_)
+            | AsicReadError::NoDataObjects
+            | AsicReadError::ManifestConflict => {
                 DocumentFailure::Unreadable(Unreadable::Container(error))
             }
             AsicReadError::Unsupported(_)
             | AsicReadError::MissingMimetype
-            | AsicReadError::UnknownMimetype => {
+            | AsicReadError::UnknownMimetype
+            | AsicReadError::UnexpectedMetadata => {
                 DocumentFailure::UnsupportedProfile(UnsupportedProfile::Container(error))
             }
         })?;
@@ -800,7 +823,12 @@ impl Context<'_> {
                 )),
                 Ok(signatures) => {
                     for signature in signatures {
-                        rows.push(self.xades_row(&container, &signature));
+                        rows.push(match signature {
+                            Ok(signature) => self.xades_row(&container, &signature),
+                            Err(error) => SignatureRow::Unsupported(
+                                UnsupportedSignature::XadesMalformed(error),
+                            ),
+                        });
                     }
                 }
             }
@@ -823,6 +851,9 @@ impl Context<'_> {
             }
             XadesVerdict::Judged(judgement) => judgement,
         };
+        let Some(signer) = signature.signer_certificate() else {
+            return SignatureRow::Unsupported(UnsupportedSignature::XadesSignerNotCarried);
+        };
         let mut pool = self.anchor_pool();
         pool.add_material(signature.embedded_material());
         pool.add_certificate_ders(signature.embedded_certificates());
@@ -838,7 +869,7 @@ impl Context<'_> {
             })
             .collect();
         SignatureRow::Judged(self.report(Facts {
-            signer: signature.signer_certificate().clone(),
+            signer: signer.clone(),
             document_intact: judgement.document_intact(),
             signature_valid: judgement.signature_valid(),
             timestamps,
@@ -858,8 +889,12 @@ impl Context<'_> {
         let Some(manifest) = entry.manifest() else {
             return SignatureRow::Unsupported(UnsupportedSignature::CadesWithoutManifest);
         };
-        let digest = ContentDigest::of(signature.digest_algorithm(), manifest.content());
-        let verdict = signature.verify(Content::Detached { digest: &digest }, EssBinding::Required);
+        let verdict = signature.verify(
+            Content::Detached {
+                content: manifest.content(),
+            },
+            EssBinding::Required,
+        );
         let mut pool = self.anchor_pool();
         pool.add_material(signature.embedded_material());
         SignatureRow::Judged(self.report(Facts {

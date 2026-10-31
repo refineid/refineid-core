@@ -236,14 +236,10 @@ fn stream_data(index: &PdfIndex<'_>, reference: PdfObjectReference) -> Option<Ve
     let Some(filter) = dictionary.entry(b"Filter").ok()? else {
         return Some(data.to_vec());
     };
-    let mut filter_name = trim(&body[filter.value.clone()]);
-    if let Some(inner) = filter_name
-        .strip_prefix(b"[")
-        .and_then(|inner| inner.strip_suffix(b"]"))
-    {
-        filter_name = trim(inner);
-    }
-    if filter_name == b"/FlateDecode" {
+    let filter_name = body
+        .get(filter.value.clone())
+        .and_then(super::index::sole_name)?;
+    if filter_name == super::xref_stream::FILTER_FLATE {
         miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(data, DECODED_LIMIT).ok()
     } else {
         None

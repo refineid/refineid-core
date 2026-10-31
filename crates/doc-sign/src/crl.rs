@@ -40,7 +40,7 @@
 
 use crate::identity::CertSerial;
 use refineid_cms::oid::Oid;
-use refineid_cms::x509::{Certificate, DateTime, X509Error, extract_key_usage};
+use refineid_cms::x509::{Certificate, DateTime, X509Error, path_extension_profile};
 use spki::der::asn1::{AnyRef, ObjectIdentifier};
 use spki::der::{Decode as _, Reader as _, SliceReader, Tag, TagNumber, Tagged as _};
 use x509_cert::crl::RevokedCert;
@@ -281,8 +281,9 @@ pub enum CrlVerifyError {
     /// The CRL issuer name is not the issuer certificate's subject
     /// name (RFC 5280 sec.5.1.2.3).
     IssuerNameMismatch,
-    /// The issuer certificate has no parseable Key Usage or does not
-    /// assert `cRLSign` (RFC 5280 sec.4.2.1.3).
+    /// The issuer certificate is not a CA (RFC 5280 sec.4.2.1.9), its
+    /// Key Usage is present and does not assert `cRLSign` (sec.4.2.1.3),
+    /// or its extensions do not parse strictly.
     IssuerNotAuthorized,
     /// The CRL signature did not verify under the issuer key.
     Signature(crate::x509::VerifyError),
@@ -321,9 +322,9 @@ pub struct VerifiedCrl<'a> {
 
 impl<'a> VerifiedCrl<'a> {
     /// Bind `crl` to `issuer`: the CRL issuer must be the issuer's
-    /// subject, the issuer's Key Usage must assert `cRLSign`, and the
-    /// CRL signature must verify under the issuer's key. The only
-    /// production door to a verified CRL.
+    /// subject, the issuer must be a CA whose Key Usage, when present,
+    /// asserts `cRLSign`, and the CRL signature must verify under the
+    /// issuer's key. The only production door to a verified CRL.
     ///
     /// # Errors
     /// [`CrlVerifyError`] when the name, authorization, or signature
@@ -332,10 +333,17 @@ impl<'a> VerifiedCrl<'a> {
         if crl.issuer != issuer.subject {
             return Err(CrlVerifyError::IssuerNameMismatch);
         }
-        let authorized = issuer
-            .extensions
-            .and_then(extract_key_usage)
-            .is_some_and(|usage| usage.crl_sign);
+        // The issuer is a CA (RFC 5280 sec.4.2.1.9) whose Key Usage, when
+        // present, asserts cRLSign (sec.4.2.1.3); extensions that do not
+        // parse strictly authorize nothing.
+        let authorized = issuer.extensions.is_some_and(|extensions| {
+            path_extension_profile(extensions).is_ok_and(|profile| {
+                profile.basic_constraints.ca
+                    && profile
+                        .key_usage
+                        .is_none_or(|usage| usage.key_usage.crl_sign)
+            })
+        });
         if !authorized {
             return Err(CrlVerifyError::IssuerNotAuthorized);
         }
@@ -1150,6 +1158,36 @@ mod tests {
         }
     }
 
+    /// `IssuingDistributionPoint.indirectCRL [4] IMPLICIT BOOLEAN`
+    /// (RFC 5280 sec.5.2.5).
+    const IDP_INDIRECT_CRL: u32 = 4;
+
+    /// DER BOOLEAN TRUE (X.690 sec.11.1).
+    const DER_TRUE: u8 = 0xFF;
+
+    #[test]
+    fn an_indirect_crl_is_refused() {
+        let indirect = Any::new(
+            Tag::ContextSpecific {
+                constructed: false,
+                number: spki::der::TagNumber(IDP_INDIRECT_CRL),
+            },
+            vec![DER_TRUE],
+        )
+        .expect("indirectCRL builds")
+        .to_der()
+        .expect("indirectCRL encodes");
+        let point = Any::new(Tag::Sequence, indirect).expect("IssuingDistributionPoint builds");
+        for critical in [true, false] {
+            let der = crl_with_extensions(vec![extension_with(
+                identifier(crate::oids::ISSUING_DISTRIBUTION_POINT),
+                critical,
+                &point.to_der().expect("IssuingDistributionPoint encodes"),
+            )]);
+            assert_eq!(Crl::parse(&der).err(), Some(CrlError::Scoped));
+        }
+    }
+
     #[test]
     fn unknown_critical_extension_is_refused() {
         let der = crl_with_extensions(vec![unlisted_extension(true)]);
@@ -1468,11 +1506,36 @@ mod issuer_binding_tests {
                 ),
             ],
         );
-        let without_key_usage = ca(&key, vec![testkit::ca_basic_constraints()]);
         let list = crl(CA, &key);
-        for refused in [issuer, without_key_usage] {
+        assert_eq!(
+            VerifiedCrl::verify(&list.view(), issuer.view()).map(|_verified| ()),
+            Err(CrlVerifyError::IssuerNotAuthorized)
+        );
+    }
+
+    #[test]
+    fn a_ca_without_key_usage_may_sign_crls() {
+        let key = TestKey::derive(TestCurve::P384, b"crl issuer");
+        let list = crl(CA, &key);
+        let issuer = ca(&key, vec![testkit::ca_basic_constraints()]);
+        VerifiedCrl::verify(&list.view(), issuer.view())
+            .expect("Key Usage constrains only when present");
+    }
+
+    #[test]
+    fn an_end_entity_with_crl_sign_is_refused() {
+        let key = TestKey::derive(TestCurve::P384, b"crl issuer");
+        let list = crl(CA, &key);
+        for extensions in [
+            vec![testkit::key_usage(
+                testkit::KEY_USAGE_CA_UNUSED,
+                testkit::KEY_USAGE_CA,
+            )],
+            Vec::new(),
+        ] {
+            let end_entity = ca(&key, extensions);
             assert_eq!(
-                VerifiedCrl::verify(&list.view(), refused.view()).map(|_verified| ()),
+                VerifiedCrl::verify(&list.view(), end_entity.view()).map(|_verified| ()),
                 Err(CrlVerifyError::IssuerNotAuthorized)
             );
         }

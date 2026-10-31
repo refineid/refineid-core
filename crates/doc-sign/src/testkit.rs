@@ -27,16 +27,18 @@ pub use refineid_cms::testkit::{
     CertificateSpec, CmsParts, DER_TRUE, ENUMERATED, GENERALIZED_TIME, INTEGER, INTEGER_SIGN_BIT,
     INTEGER_SIGN_PAD, KEY_USAGE_CA, KEY_USAGE_CA_UNUSED, KEY_USAGE_CERT_SIGN,
     KEY_USAGE_CERT_SIGN_UNUSED, KEY_USAGE_DIGITAL_SIGNATURE, KEY_USAGE_DIGITAL_SIGNATURE_UNUSED,
-    NO_UNUSED_BITS, NULL, OBJECT_IDENTIFIER, OCTET_STRING, PRINTABLE_STRING, PSS_SALT_LEN,
-    SEQUENCE, SET, SIGNED_DATA_VERSION, SIGNER_INFO_VERSION, TestCurve, TestKey, TestKeyKind,
-    UTC_TIME, UTF8_STRING, X509_VERSION_3, attribute, attribute_set, bit_string,
-    ca_basic_constraints, ca_extensions, certificate, certificate_named, cms, content_attributes,
-    day, digest_algorithm_identifier, extended_key_usage, extension, generalized_time, key_usage,
-    name, name_of, positive_integer, signed, signed_body, tbs_certificate, tbs_certificate_named,
+    KEY_USAGE_NON_REPUDIATION, KEY_USAGE_NON_REPUDIATION_UNUSED, NO_UNUSED_BITS, NULL,
+    OBJECT_IDENTIFIER, OCTET_STRING, PRINTABLE_STRING, PSS_SALT_LEN, SEQUENCE, SET,
+    SIGNED_DATA_VERSION, SIGNER_INFO_VERSION, TestCurve, TestKey, TestKeyKind, UTC_TIME,
+    UTF8_STRING, X509_VERSION_3, attribute, attribute_set, bit_string, ca_basic_constraints,
+    ca_extensions, certificate, certificate_named, cms, content_attributes, day,
+    digest_algorithm_identifier, extended_key_usage, extension, generalized_time, key_usage, name,
+    name_of, positive_integer, signed, signed_body, tbs_certificate, tbs_certificate_named,
     timestamping_extensions, tlv, utc_time,
 };
 
 use crate::cades::{DigestAlgorithm, SignatureAlgorithm};
+use crate::crl::CrlReason;
 use crate::ocsp::{IssuerKeyHash, IssuerNameHash};
 use refineid_cms::oid::{Oid, known};
 use refineid_cms::x509::{DateTime, OwnedCert};
@@ -90,7 +92,8 @@ pub fn ocsp_responder_extensions(no_check: bool) -> Vec<Vec<u8>> {
 }
 
 /// A CRL from `issuer`, listing `revoked` serials as revoked on
-/// `revoked_on`.
+/// `revoked_on`, carrying `cRLNumber` and `authorityKeyIdentifier`
+/// (RFC 5280 sec.5.2.1, sec.5.2.3).
 #[must_use]
 pub fn crl(
     issuer: &str,
@@ -100,14 +103,38 @@ pub fn crl(
     revoked: &[u8],
     revoked_on: DateTime,
 ) -> Vec<u8> {
+    crl_with_reason(
+        issuer,
+        issuer_key,
+        this_update,
+        next_update,
+        revoked,
+        revoked_on,
+        None,
+    )
+}
+
+/// As [`crl`], each entry carrying the `reasonCode` `reason` when given
+/// (RFC 5280 sec.5.3.1).
+#[must_use]
+pub fn crl_with_reason(
+    issuer: &str,
+    issuer_key: &TestKey,
+    this_update: DateTime,
+    next_update: Option<DateTime>,
+    revoked: &[u8],
+    revoked_on: DateTime,
+    reason: Option<CrlReason>,
+) -> Vec<u8> {
     signed(
-        &tbs_cert_list(
+        &tbs_cert_list_with_reason(
             issuer,
             issuer_key,
             this_update,
             next_update,
             revoked,
             revoked_on,
+            reason,
         ),
         issuer_key,
     )
@@ -123,6 +150,28 @@ pub fn tbs_cert_list(
     revoked: &[u8],
     revoked_on: DateTime,
 ) -> Vec<u8> {
+    tbs_cert_list_with_reason(
+        issuer,
+        issuer_key,
+        this_update,
+        next_update,
+        revoked,
+        revoked_on,
+        None,
+    )
+}
+
+/// The `TBSCertList` of [`crl_with_reason`].
+#[must_use]
+pub fn tbs_cert_list_with_reason(
+    issuer: &str,
+    issuer_key: &TestKey,
+    this_update: DateTime,
+    next_update: Option<DateTime>,
+    revoked: &[u8],
+    revoked_on: DateTime,
+    reason: Option<CrlReason>,
+) -> Vec<u8> {
     let mut tbs = tlv(INTEGER, [CRL_VERSION_2]);
     tbs.extend_from_slice(&issuer_key.algorithm_identifier());
     tbs.extend_from_slice(&name(issuer));
@@ -133,12 +182,35 @@ pub fn tbs_cert_list(
     if !revoked.is_empty() {
         let mut entries = Vec::new();
         for serial in revoked {
-            let mut entry = tlv(INTEGER, [*serial]);
+            let mut entry = positive_integer(&[*serial]);
             entry.extend_from_slice(&utc_time(revoked_on));
+            if let Some(reason) = reason {
+                entry.extend_from_slice(&tlv(
+                    SEQUENCE,
+                    extension(known::CRL_REASON, false, &tlv(ENUMERATED, [reason.code()])),
+                ));
+            }
             entries.extend_from_slice(&tlv(SEQUENCE, entry));
         }
         tbs.extend_from_slice(&tlv(SEQUENCE, entries));
     }
+    let spki = issuer_key.spki();
+    let key = refineid_cms::x509::SpkiDer::try_from(spki.as_slice()).expect("kit SPKI parses");
+    let key_identifier = tlv(
+        CONTEXT_0_PRIMITIVE,
+        crate::digest::Sha1::of(key.subject_public_key_bits()).into_bytes(),
+    );
+    let mut extensions = extension(
+        crate::oids::CRL_NUMBER,
+        false,
+        &positive_integer(&[TOKEN_SERIAL]),
+    );
+    extensions.extend_from_slice(&extension(
+        crate::oids::AUTHORITY_KEY_IDENTIFIER,
+        false,
+        &tlv(SEQUENCE, key_identifier),
+    ));
+    tbs.extend_from_slice(&tlv(CONTEXT_0, tlv(SEQUENCE, extensions)));
     tlv(SEQUENCE, tbs)
 }
 
@@ -164,6 +236,8 @@ pub struct OcspSpec<'a> {
     pub serial: u8,
     /// `Some(revocation time)` for a revoked answer, `None` for good.
     pub revoked: Option<DateTime>,
+    /// The `revocationReason` of a revoked answer, when it gives one.
+    pub revocation_reason: Option<CrlReason>,
     /// `producedAt`.
     pub produced_at: DateTime,
     /// `thisUpdate`.
@@ -172,29 +246,68 @@ pub struct OcspSpec<'a> {
     pub next_update: Option<DateTime>,
     /// Certificates carried in `BasicOCSPResponse.certs`.
     pub embedded: Vec<Vec<u8>>,
+    /// The `CertID.hashAlgorithm` the response names its certificate
+    /// under.
+    pub cert_id: CertIdAlgorithm,
+    /// Complete `Extension` encodings of `responseExtensions`; none
+    /// writes no field.
+    pub response_extensions: Vec<Vec<u8>>,
+}
+
+/// A `CertID.hashAlgorithm` a fixture response uses (RFC 6960
+/// sec.4.1.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertIdAlgorithm {
+    /// SHA-1, written with NULL parameters as requests write it.
+    Sha1,
+    /// SHA-256, parameters absent.
+    Sha256,
 }
 
 /// A successful `OCSPResponse` (RFC 6960 sec.4.2.1).
 #[must_use]
 pub fn ocsp_response(spec: &OcspSpec<'_>) -> Vec<u8> {
     let issuer = spec.issuer.view();
-    let mut hash_algorithm = tlv(OBJECT_IDENTIFIER, known::SHA1.as_bytes());
-    hash_algorithm.extend_from_slice(&tlv(NULL, []));
-    let mut cert_id = tlv(SEQUENCE, hash_algorithm);
-    cert_id.extend_from_slice(&tlv(
-        OCTET_STRING,
-        IssuerNameHash::from_name(issuer.subject).as_bytes(),
-    ));
-    cert_id.extend_from_slice(&tlv(
-        OCTET_STRING,
-        IssuerKeyHash::from_subject_public_key(&issuer.spki).as_bytes(),
-    ));
-    cert_id.extend_from_slice(&tlv(INTEGER, [spec.serial]));
+    let mut cert_id = match spec.cert_id {
+        CertIdAlgorithm::Sha1 => {
+            let mut hash_algorithm = tlv(OBJECT_IDENTIFIER, known::SHA1.as_bytes());
+            hash_algorithm.extend_from_slice(&tlv(NULL, []));
+            let mut cert_id = tlv(SEQUENCE, hash_algorithm);
+            cert_id.extend_from_slice(&tlv(
+                OCTET_STRING,
+                IssuerNameHash::from_name(issuer.subject).as_bytes(),
+            ));
+            cert_id.extend_from_slice(&tlv(
+                OCTET_STRING,
+                IssuerKeyHash::from_subject_public_key(&issuer.spki).as_bytes(),
+            ));
+            cert_id
+        }
+        CertIdAlgorithm::Sha256 => {
+            let mut cert_id = DigestAlgorithm::Sha256.algorithm_identifier();
+            cert_id.extend_from_slice(&tlv(
+                OCTET_STRING,
+                DigestAlgorithm::Sha256.digest(issuer.subject.as_der()),
+            ));
+            cert_id.extend_from_slice(&tlv(
+                OCTET_STRING,
+                DigestAlgorithm::Sha256.digest(issuer.spki.subject_public_key_bits()),
+            ));
+            cert_id
+        }
+    };
+    cert_id.extend_from_slice(&positive_integer(&[spec.serial]));
 
     let mut single = tlv(SEQUENCE, cert_id);
     match spec.revoked {
         None => single.extend_from_slice(&tlv(CONTEXT_0_PRIMITIVE, [])),
-        Some(at) => single.extend_from_slice(&tlv(CONTEXT_1, generalized_time(at))),
+        Some(at) => {
+            let mut revoked_info = generalized_time(at);
+            if let Some(reason) = spec.revocation_reason {
+                revoked_info.extend_from_slice(&tlv(CONTEXT_0, tlv(ENUMERATED, [reason.code()])));
+            }
+            single.extend_from_slice(&tlv(CONTEXT_1, revoked_info));
+        }
     }
     single.extend_from_slice(&generalized_time(spec.this_update));
     if let Some(next_update) = spec.next_update {
@@ -218,6 +331,12 @@ pub fn ocsp_response(spec: &OcspSpec<'_>) -> Vec<u8> {
     };
     response_data.extend_from_slice(&generalized_time(spec.produced_at));
     response_data.extend_from_slice(&tlv(SEQUENCE, tlv(SEQUENCE, single)));
+    if !spec.response_extensions.is_empty() {
+        response_data.extend_from_slice(&tlv(
+            CONTEXT_1,
+            tlv(SEQUENCE, spec.response_extensions.concat()),
+        ));
+    }
     let mut basic = signed_body(&tlv(SEQUENCE, response_data), spec.responder_key);
     if !spec.embedded.is_empty() {
         basic.extend_from_slice(&tlv(CONTEXT_0, tlv(SEQUENCE, spec.embedded.concat())));
@@ -242,12 +361,35 @@ pub fn timestamp_token(
     imprint: &[u8],
     generated: DateTime,
 ) -> Vec<u8> {
-    let mut message_imprint = algorithm.algorithm_identifier();
+    timestamp_token_imprinting(
+        tsa,
+        tsa_key,
+        &algorithm.algorithm_identifier(),
+        imprint,
+        generated,
+        &[],
+    )
+}
+
+/// As [`timestamp_token`], with the imprint's `AlgorithmIdentifier`
+/// written as given, so a test can name an algorithm the verifier
+/// refuses, and `revocation_info` (encoded `RevocationInfoChoice`s, see
+/// [`ocsp_revocation_info`]) in the token's `SignedData.crls`.
+#[must_use]
+pub fn timestamp_token_imprinting(
+    tsa: &[u8],
+    tsa_key: &TestKey,
+    imprint_algorithm: &[u8],
+    imprint: &[u8],
+    generated: DateTime,
+    revocation_info: &[Vec<u8>],
+) -> Vec<u8> {
+    let mut message_imprint = imprint_algorithm.to_vec();
     message_imprint.extend_from_slice(&tlv(OCTET_STRING, imprint));
     let mut tst_info = tlv(INTEGER, [TST_INFO_VERSION]);
     tst_info.extend_from_slice(&tlv(OBJECT_IDENTIFIER, TEST_POLICY.as_bytes()));
     tst_info.extend_from_slice(&tlv(SEQUENCE, message_imprint));
-    tst_info.extend_from_slice(&tlv(INTEGER, [TOKEN_SERIAL]));
+    tst_info.extend_from_slice(&positive_integer(&[TOKEN_SERIAL]));
     tst_info.extend_from_slice(&generalized_time(generated));
     let tst_info = tlv(SEQUENCE, tst_info);
     let hash = tsa_key.hash();
@@ -256,7 +398,20 @@ pub fn timestamp_token(
     let mut parts = CmsParts::attached(tsa_key, tsa, &tst_info);
     parts.econtent_type = known::TST_INFO;
     parts.signed_attributes = Some(attribute_set(&attributes));
+    parts.revocation_info = revocation_info.to_vec();
     cms(&parts)
+}
+
+/// The `RevocationInfoChoice` carrying the `OCSPResponse` `response`
+/// (RFC 5940 sec.4.1): `other` with `id-ri-ocsp-response`.
+#[must_use]
+pub fn ocsp_revocation_info(response: &[u8]) -> Vec<u8> {
+    let mut other = tlv(
+        OBJECT_IDENTIFIER,
+        known::OCSP_RESPONSE_REVOCATION_INFO.as_bytes(),
+    );
+    other.extend_from_slice(response);
+    tlv(CONTEXT_1, other)
 }
 
 /// The ESS `signing-certificate-v2` attribute binding `certificate`:

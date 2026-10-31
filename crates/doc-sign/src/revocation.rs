@@ -388,9 +388,7 @@ mod tests {
     };
     use crate::ber::{BerTag as _, Oid, Sequence, Set, Utf8String};
     use crate::crl::{Crl, VerifiedCrl};
-    use crate::ocsp::{
-        IssuerKeyHash, IssuerNameHash, OcspResponse, OcspResponseStatus, VerifiedOcspResponse,
-    };
+    use crate::ocsp::{OcspResponse, OcspResponseStatus, VerifiedOcspResponse};
     use crate::x509::{Certificate, DateTime};
 
     /// Wrap a parsed synthetic OCSP response as
@@ -402,13 +400,11 @@ mod tests {
         let basic = resp.basic.expect("basic OCSP body");
         VerifiedOcspResponse::from_unverified_basic_for_test(
             basic,
-            IssuerNameHash::new([FIXTURE_NAME_HASH_OCTET; crate::digest::SHA1_LEN]),
-            IssuerKeyHash::new([FIXTURE_KEY_HASH_OCTET; crate::digest::SHA1_LEN]),
+            &issuer_name(),
+            vec![FIXTURE_KEY_HASH_OCTET; crate::digest::SHA1_LEN],
         )
     }
 
-    /// Every octet of the fixture `CertID.issuerNameHash`.
-    const FIXTURE_NAME_HASH_OCTET: u8 = 0xAA;
     /// Every octet of the fixture `CertID.issuerKeyHash`.
     const FIXTURE_KEY_HASH_OCTET: u8 = 0xBB;
     /// Universal OCTET STRING, the tag of both `CertID` hashes.
@@ -599,7 +595,7 @@ mod tests {
         let cert_id = {
             let name_hash = wrap(
                 TAG_OCTET_STRING,
-                &[FIXTURE_NAME_HASH_OCTET; crate::digest::SHA1_LEN],
+                &crate::digest::Sha1::of(&issuer_name()).into_bytes(),
             );
             let key_hash = wrap(
                 TAG_OCTET_STRING,

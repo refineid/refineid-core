@@ -90,6 +90,11 @@ pub const KEY_USAGE_CERT_SIGN_UNUSED: u8 = 0x02;
 pub const KEY_USAGE_DIGITAL_SIGNATURE: u8 = 0x80;
 /// Unused bits after `digitalSignature`.
 pub const KEY_USAGE_DIGITAL_SIGNATURE_UNUSED: u8 = 0x07;
+/// Key Usage `nonRepudiation` (`contentCommitment`, RFC 5280
+/// sec.4.2.1.3): bit 1.
+pub const KEY_USAGE_NON_REPUDIATION: u8 = 0x40;
+/// Unused bits after `nonRepudiation`.
+pub const KEY_USAGE_NON_REPUDIATION_UNUSED: u8 = 0x06;
 
 /// The top bit of an INTEGER's first content octet, which marks a
 /// negative value (X.690 sec.8.3.3).
@@ -332,10 +337,11 @@ impl TestKey {
     }
 
     /// The RSASSA-PSS signature over `message` with SHA-256, MGF1
-    /// with SHA-256 and the 32-octet `salt` (RFC 8017 sec.8.1);
-    /// `None` for an ECDSA key.
+    /// with SHA-256 and `salt` (RFC 8017 sec.8.1), which the profile
+    /// fixes at [`PSS_SALT_LEN`] octets and a test may vary; `None` for
+    /// an ECDSA key.
     #[must_use]
-    pub fn sign_pss_sha256(&self, message: &[u8], salt: &[u8; PSS_SALT_LEN]) -> Option<Vec<u8>> {
+    pub fn sign_pss_sha256(&self, message: &[u8], salt: &[u8]) -> Option<Vec<u8>> {
         match &self.material {
             KeyMaterial::Ecdsa { .. } => None,
             KeyMaterial::Rsa(key) => Some(key.sign_pss_sha256(message, salt)),
@@ -540,8 +546,8 @@ pub fn timestamping_extensions() -> Vec<Vec<u8>> {
 /// What one certificate says about itself.
 #[derive(Debug, Clone)]
 pub struct CertificateSpec<'a> {
-    /// Serial number, with the top bit clear so the one-octet INTEGER
-    /// stays positive.
+    /// Serial number, encoded as a positive INTEGER (X.690 sec.8.3.2:
+    /// a sign octet before a top bit that is set).
     pub serial: u8,
     /// Subject common name.
     pub subject: &'a str,
@@ -577,7 +583,7 @@ pub fn tbs_certificate_named(
     issuer_key: &TestKey,
 ) -> Vec<u8> {
     let mut tbs = tlv(CONTEXT_0, tlv(INTEGER, [X509_VERSION_3]));
-    tbs.extend_from_slice(&tlv(INTEGER, [spec.serial]));
+    tbs.extend_from_slice(&positive_integer(&[spec.serial]));
     tbs.extend_from_slice(&issuer_key.algorithm_identifier());
     tbs.extend_from_slice(&name(spec.issuer));
     let mut validity = utc_time(spec.not_before);

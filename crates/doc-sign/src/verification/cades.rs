@@ -76,37 +76,16 @@ impl core::fmt::Display for CadesReadError {
 
 impl core::error::Error for CadesReadError {}
 
-/// The digest of content signed outside the structure, under a named
-/// algorithm.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContentDigest {
-    /// The algorithm the digest was computed under.
-    algorithm: DigestAlgorithm,
-    /// The digest, the algorithm's length.
-    value: Vec<u8>,
-}
-
-impl ContentDigest {
-    /// The digest of `content` under `algorithm`.
-    #[must_use]
-    pub fn of(algorithm: DigestAlgorithm, content: &[u8]) -> Self {
-        Self {
-            algorithm,
-            value: algorithm.digest(content),
-        }
-    }
-}
-
 /// Where the signed content is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Content<'a> {
     /// `eContent` is inside the structure.
     Attached,
-    /// The content is outside the structure; the caller digested it
-    /// under [`CadesSignature::digest_algorithm`].
+    /// The content is outside the structure: the octets the signature
+    /// claims to cover.
     Detached {
-        /// The digest of the external content.
-        digest: &'a ContentDigest,
+        /// The external content.
+        content: &'a [u8],
     },
 }
 
@@ -257,25 +236,23 @@ impl CadesSignature {
     pub fn verify(&self, content: Content<'_>, ess: EssBinding) -> CadesVerdict {
         let signed = self.signed_data.view();
         let signer = signed.signer();
-        let content_digest = match (content, signed.econtent()) {
-            (Content::Attached, Some(econtent)) => Some(self.digest_algorithm.digest(econtent)),
-            (Content::Detached { digest }, None) => {
-                (digest.algorithm == self.digest_algorithm).then(|| digest.value.clone())
-            }
-            (Content::Attached, None) | (Content::Detached { .. }, Some(_)) => None,
-        };
-        let document_intact =
-            content_digest.is_some_and(|digest| signer.message_digest() == Some(digest.as_slice()));
         let certificate = self.signer_certificate.view();
+        let judged = signed.judge(
+            certificate.spki,
+            match content {
+                Content::Attached => None,
+                Content::Detached { content } => Some(content),
+            },
+        );
         let ess_binds = match ess {
             EssBinding::Required => {
                 verify_signing_certificate_attribute(&signed, &certificate).is_ok()
             }
             EssBinding::NotRequired => true,
         };
-        let signature_valid = signed.econtent_type() == known::DATA
-            && ess_binds
-            && signed.verify_signer_signature(certificate.spki).is_ok();
+        let document_intact = judged.content_intact;
+        let signature_valid =
+            signed.econtent_type() == known::DATA && ess_binds && judged.signature.is_ok();
         let signature_timestamps = attribute_values(
             signer.unsigned_attributes(),
             known::SIGNATURE_TIME_STAMP_TOKEN,
@@ -319,30 +296,29 @@ fn embedded_material(signed: &SignedData<'_>, signer_der: &[u8]) -> ValidationMa
     for choice in signed.revocation_info() {
         match *choice {
             RevocationInfoChoice::Crl(der) => material.crls.push(der.to_vec()),
-            RevocationInfoChoice::Other { format, info_der } => {
-                if format == known::OCSP_RESPONSE_REVOCATION_INFO {
-                    material.ocsp_responses.push(info_der.to_vec());
-                }
-            }
+            RevocationInfoChoice::OcspResponse(der) => material.ocsp_responses.push(der.to_vec()),
+            RevocationInfoChoice::Other { .. } => {}
         }
     }
     material
 }
 
 /// The complete DER of every value of every attribute of type `oid`.
-/// A value set that does not parse to its end counts its unreadable
-/// tail as one value, so it is reported as present and fails to
-/// verify.
+/// A value whose TLV does not parse, or declares more octets than
+/// remain, makes the whole unread tail one value, so it is reported as
+/// present and fails to verify; no value is ever cut short.
 fn attribute_values<'a>(attributes: &[CmsAttribute<'a>], oid: Oid<'_>) -> Vec<&'a [u8]> {
     let mut values = Vec::new();
     for attribute in attributes.iter().filter(|attribute| attribute.oid == oid) {
         let mut rest = attribute.values_der;
         while !rest.is_empty() {
-            let Ok(value) = BerTlvAny::parse(rest) else {
+            let Some((value_der, tail)) = BerTlvAny::parse(rest)
+                .ok()
+                .and_then(|value| rest.split_at_checked(value.size()))
+            else {
                 values.push(rest);
                 break;
             };
-            let (value_der, tail) = rest.split_at(value.size().min(rest.len()));
             values.push(value_der);
             rest = tail;
         }

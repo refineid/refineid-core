@@ -67,9 +67,6 @@ const KEY_SIGNING_TIME: &[u8] = b"M";
 /// Trailer key referencing the catalog (ISO 32000-1 sec.7.5.5).
 const KEY_ROOT: &[u8] = b"Root";
 
-/// Trailer key present on an encrypted document (ISO 32000-1 sec.7.6.1).
-const KEY_ENCRYPT: &[u8] = b"Encrypt";
-
 /// Catalog key of the document security store
 /// (`ETSI EN 319 142-1` V1.2.1 clause 5.4.2.2).
 const KEY_DSS: &[u8] = b"DSS";
@@ -101,6 +98,18 @@ const SUBFILTER_ADBE_PKCS7_DETACHED: &[u8] = b"adbe.pkcs7.detached";
 /// `/SubFilter` of a document timestamp
 /// (`ETSI EN 319 142-1` V1.2.1 clause 5.4.3).
 const SUBFILTER_ETSI_RFC3161: &[u8] = b"ETSI.RFC3161";
+
+/// The marker closing every revision (ISO 32000-1 sec.7.5.5).
+const END_OF_FILE_MARKER: &[u8] = b"%%EOF";
+
+/// The end-of-line sequences of ISO 32000-1 sec.7.2.3.
+const END_OF_LINE_CRLF: &[u8] = b"\r\n";
+
+/// A lone LINE FEED end-of-line.
+const END_OF_LINE_LF: &[u8] = b"\n";
+
+/// A lone CARRIAGE RETURN end-of-line.
+const END_OF_LINE_CR: &[u8] = b"\r";
 
 /// Spans a `/ByteRange` names: one either side of the hole.
 const BYTE_RANGE_SPANS: usize = 2;
@@ -294,6 +303,8 @@ pub struct PdfSignature {
     covers_whole_document: bool,
     /// The `/M` entry, converted to UTC.
     signing_time_entry: Option<DateTime>,
+    /// Whether the range ends where a revision ends.
+    ends_revision: bool,
 }
 
 impl PdfSignature {
@@ -332,6 +343,16 @@ impl PdfSignature {
     pub const fn signing_time_entry(&self) -> Option<DateTime> {
         self.signing_time_entry
     }
+
+    /// Whether the signed spans end where a revision ends: just after
+    /// an `%%EOF` marker and its end-of-line (ISO 32000-1 sec.7.5.5),
+    /// so the whole signed revision is covered (sec.12.8.1, `ETSI EN
+    /// 319 142-1` V1.2.1 clause 5.1). A range cut elsewhere signs part
+    /// of a revision and is not judged.
+    #[must_use]
+    pub const fn ends_revision(&self) -> bool {
+        self.ends_revision
+    }
 }
 
 /// Whether `file` starts with the header every PDF starts with.
@@ -369,13 +390,6 @@ impl<'a> PdfDocument<'a> {
             .map_err(|error| PdfReadError::from_index(error, "cross-reference chain"))?;
         let trailer = PdfDictionary::parse(index.trailer())
             .map_err(|error| PdfReadError::from_index(error, "trailer"))?;
-        if trailer
-            .entry(KEY_ENCRYPT)
-            .map_err(|error| PdfReadError::from_index(error, "trailer"))?
-            .is_some()
-        {
-            return Err(PdfReadError::Unsupported("encrypted document"));
-        }
 
         let mut signatures = Vec::new();
         let dictionaries = index
@@ -495,7 +509,21 @@ fn signature_from_dictionary(
         byte_range,
         covers_whole_document: byte_range.end() == file.len(),
         signing_time_entry,
+        ends_revision: ends_revision(file, byte_range.end()),
     }))
+}
+
+/// Whether the first `end` bytes of `file` end with the `%%EOF` marker,
+/// followed by at most one end-of-line (ISO 32000-1 sec.7.5.5).
+fn ends_revision(file: &[u8], end: usize) -> bool {
+    let Some(signed) = file.get(..end) else {
+        return false;
+    };
+    let marker_end = [END_OF_LINE_CRLF, END_OF_LINE_LF, END_OF_LINE_CR]
+        .iter()
+        .find_map(|eol| signed.strip_suffix(*eol))
+        .unwrap_or(signed);
+    marker_end.ends_with(END_OF_FILE_MARKER)
 }
 
 /// The DER element a `/Contents` hex string carries, after checking
@@ -797,7 +825,10 @@ fn validation_store(
 mod tests {
     use core::mem::size_of;
 
-    use super::{PdfDate, PdfDocument, PdfReadError, SignatureKind, SubFilter, pdf_date};
+    use super::{
+        END_OF_FILE_MARKER, END_OF_LINE_CR, END_OF_LINE_CRLF, END_OF_LINE_LF, PdfDate, PdfDocument,
+        PdfReadError, SignatureKind, SubFilter, pdf_date,
+    };
     use crate::ber::{BerTag, Sequence, tlv};
     use crate::cades::DigestAlgorithm;
     use crate::pades::index::{PdfIndex, PdfObjectReference, find_first, find_last};
@@ -1610,6 +1641,13 @@ mod tests {
             read(&classic_pdf(&page_objects(), " /Encrypt 9 0 R")),
             Err(PdfReadError::Unsupported("encrypted document"))
         );
+        // An older revision's trailer counts as much as the newest.
+        let older = classic_pdf(&page_objects(), " /Encrypt 9 0 R");
+        let updated = append_update(&older, &[(EXTRA_OBJECT, "<< /Type /Annot >>")], "");
+        assert_eq!(
+            read(&updated),
+            Err(PdfReadError::Unsupported("encrypted document"))
+        );
     }
 
     #[test]
@@ -1723,5 +1761,131 @@ mod tests {
             read(&classic_pdf(&objects, "")),
             Err(PdfReadError::Malformed("object"))
         );
+    }
+
+    /// A comment stands where white space may (ISO 32000-1 sec.7.2.3):
+    /// before an object's value, a trailer's dictionary and the catalog.
+    #[test]
+    fn comments_count_as_white_space_where_a_value_starts() {
+        let base = classic_pdf(&page_objects(), "");
+        assert_eq!(read(&base), Ok(0));
+
+        let mut commented_catalog = page_objects();
+        commented_catalog[0] = format!("% a note\n{}", PAGE_OBJECTS[0]).into_bytes();
+        assert_eq!(read(&classic_pdf(&commented_catalog, "")), Ok(0));
+
+        let commented_trailer = replaced(&base, b"trailer\n<<", b"trailer\n% a note\n<<");
+        assert_eq!(read(&commented_trailer), Ok(0));
+
+        // A signature dictionary behind a comment is found: its range
+        // here contradicts the file, so the document is refused rather
+        // than read as unsigned.
+        let behind_a_comment = append_update(
+            &base,
+            &[(
+                EXTRA_OBJECT,
+                "% a note\n<< /Type /Sig /ByteRange [0 1 2 3] /Contents <00> >>",
+            )],
+            "",
+        );
+        assert!(matches!(
+            read(&behind_a_comment),
+            Err(PdfReadError::Malformed(_))
+        ));
+        let without_the_comment = append_update(
+            &base,
+            &[(
+                EXTRA_OBJECT,
+                "<< /Type /Sig /ByteRange [0 1 2 3] /Contents <00> >>",
+            )],
+            "",
+        );
+        assert_eq!(read(&behind_a_comment), read(&without_the_comment));
+    }
+
+    #[test]
+    fn an_object_body_that_is_no_value_is_an_error() {
+        let garbled = append_update(
+            &classic_pdf(&page_objects(), ""),
+            &[(EXTRA_OBJECT, "]")],
+            "",
+        );
+        assert!(matches!(read(&garbled), Err(PdfReadError::Malformed(_))));
+    }
+
+    /// A later revision that replaces the object number of an earlier
+    /// signature dictionary does not make that signature vanish.
+    #[test]
+    fn a_signature_replaced_in_a_later_revision_is_still_found() {
+        let (pdf, digest) = signed(&classic_pdf(&page_objects(), ""));
+        let dictionary_at = find_first(&pdf, b"/ByteRange").expect("a signature dictionary");
+        let header = find_last(&pdf[..dictionary_at], b" 0 obj").expect("its object header");
+        let line_start = find_last(&pdf[..header], b"\n").map_or(0, |at| at + 1);
+        let number: usize = core::str::from_utf8(&pdf[line_start..header])
+            .expect("ASCII")
+            .parse()
+            .expect("an object number");
+        let replaced = append_update(&pdf, &[(number, "<< /Type /Annot >>")], "");
+        let document = PdfDocument::parse(&replaced).expect("the updated PDF parses");
+        let [signature] = exactly(document.signatures(), "the replaced signature");
+        assert_eq!(
+            document.digest(&signature.byte_range(), DigestAlgorithm::Sha256),
+            digest
+        );
+        assert!(!signature.covers_whole_document());
+    }
+
+    #[test]
+    fn a_range_must_end_where_a_revision_ends() {
+        let (pdf, _digest) = signed(&classic_pdf(&page_objects(), ""));
+        assert!(only_signature(&pdf).ends_revision());
+        let marker = find_last(&pdf, END_OF_FILE_MARKER).expect("an end marker");
+        for end in [marker, marker + END_OF_FILE_MARKER.len() - 1] {
+            assert!(!super::ends_revision(&pdf, end), "cut at {end}");
+        }
+        for eol in [
+            END_OF_LINE_LF,
+            END_OF_LINE_CR,
+            END_OF_LINE_CRLF,
+            b"".as_slice(),
+        ] {
+            let mut revision = b"1 0 obj\nnull\nendobj\n".to_vec();
+            revision.extend_from_slice(END_OF_FILE_MARKER);
+            revision.extend_from_slice(eol);
+            assert!(super::ends_revision(&revision, revision.len()));
+        }
+    }
+
+    /// A catalog at generation one keeps its generation through the
+    /// signature update and the validation-store update.
+    #[test]
+    fn a_catalog_at_a_nonzero_generation_is_signed_and_extended() {
+        let base = classic_pdf(&page_objects(), "");
+        let catalog_offset = object_offset(&base, FIRST_OBJECT);
+        let mut generation_one = replaced(&base, b"\n1 0 obj", b"\n1 1 obj");
+        generation_one = replaced(
+            &generation_one,
+            entry_line(catalog_offset, IN_USE).as_bytes(),
+            format!(
+                "{catalog_offset:0width$} {PAGE_GENERATION:0generation$} {IN_USE} \n",
+                width = XREF_OFFSET_DIGITS,
+                generation = XREF_GENERATION_DIGITS
+            )
+            .as_bytes(),
+        );
+        generation_one = replaced(&generation_one, b"/Root 1 0 R", b"/Root 1 1 R");
+        assert_eq!(read(&generation_one), Ok(0));
+
+        let (signed, _digest) = signed(&generation_one);
+        assert!(find_first(&signed, b"/Root 1 1 R").is_some());
+        assert_eq!(read(&signed), Ok(1));
+        let stored = append_validation_store(&signed, &[SYNTHETIC_CERTIFICATE.to_vec()], &[], &[])
+            .expect("the store appends");
+        let document = PdfDocument::parse(&stored).expect("the extended PDF parses");
+        assert_eq!(
+            document.validation_store().certificates,
+            [SYNTHETIC_CERTIFICATE]
+        );
+        assert_eq!(document.signatures().len(), 1);
     }
 }

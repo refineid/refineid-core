@@ -66,14 +66,11 @@ pub fn now_date_time() -> DateTime {
 /// Cap on a fetched certificate or OCSP response.
 const MAX_FETCH_BYTES: usize = 64 * 1024;
 
-/// How far a responder's clock may run ahead of ours before its answer
-/// is treated as wrong rather than merely skewed.
-///
-/// `now` is read once before the walk, so every response is compared
-/// against a reading that predates its own round trip. Five minutes is
-/// the allowance validators conventionally give between two machines,
-/// and is small enough that a genuinely misdated response still fails.
-const MAX_CLOCK_SKEW: core::time::Duration = core::time::Duration::from_mins(5);
+// How far a responder's clock may run ahead of ours before its answer
+// is treated as wrong rather than merely skewed. `now` is read once
+// before the walk, so every response is compared against a reading
+// that predates its own round trip.
+use crate::verification::trust::MAX_CLOCK_SKEW;
 
 /// Maximum age of an OCSP answer whose responder omitted `nextUpdate`.
 ///
@@ -1372,7 +1369,11 @@ fn check_response(
 
     // The nonce is what makes this answer this request's, rather than
     // one recorded earlier and replayed.
-    match basic.nonce.as_deref() {
+    match basic
+        .nonce
+        .as_ref()
+        .map(crate::ocsp::ResponseNonce::as_bytes)
+    {
         Some(echoed) if echoed == nonce.as_bytes() => {}
         Some(_) => {
             return Err(MaterialError::Revocation(

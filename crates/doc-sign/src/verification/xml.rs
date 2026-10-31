@@ -17,7 +17,8 @@
 //!
 //! The canonicaliser renders one element and its descendants as
 //! Exclusive XML Canonicalization 1.0 does, with or without comments,
-//! and without an `InclusiveNamespaces PrefixList`.
+//! and with the prefixes of an `InclusiveNamespaces PrefixList`
+//! rendered as inclusive Canonical XML renders them.
 //!
 //! # Conformance
 //!
@@ -37,7 +38,10 @@
 //!   <https://www.w3.org/TR/xml-exc-c14n/> sec.3: a namespace
 //!   declaration is rendered on the outermost element of the subset
 //!   that visibly utilises its prefix, and `xml:` attributes are not
-//!   inherited from ancestors.
+//!   inherited from ancestors; sec.4: a prefix the `PrefixList` names
+//!   is rendered wherever it is in scope and differs from what the
+//!   nearest output ancestor rendered, `#default` naming the default
+//!   namespace.
 
 use core::ops::Range;
 
@@ -59,6 +63,12 @@ const PREFIX_XMLNS: &str = "xmlns";
 /// levels deep; the bound keeps the recursive canonicaliser's stack
 /// small whatever the input.
 const MAX_DEPTH: usize = 128;
+
+/// Most nodes (elements, text runs, comments and processing
+/// instructions) a document may hold. A signature file over a
+/// container of thousands of files holds tens of thousands; the bound
+/// keeps a hostile file from growing the tree without limit.
+const MAX_NODES: usize = 1 << 18;
 
 /// The byte order mark a UTF-8 document may start with (XML 1.0
 /// sec.4.3.3).
@@ -141,6 +151,8 @@ pub enum XmlError {
     Unsupported(&'static str),
     /// Elements nest deeper than this reader accepts.
     TooDeep,
+    /// The document holds more nodes than this reader accepts.
+    TooManyNodes,
 }
 
 impl core::fmt::Display for XmlError {
@@ -150,6 +162,7 @@ impl core::fmt::Display for XmlError {
             Self::Malformed(what) => write!(f, "malformed XML: {what}"),
             Self::Unsupported(what) => write!(f, "unsupported XML: {what}"),
             Self::TooDeep => f.write_str("XML elements nest too deeply"),
+            Self::TooManyNodes => f.write_str("XML document holds too many nodes"),
         }
     }
 }
@@ -468,16 +481,29 @@ impl<'a> ElementRef<'a> {
     /// transform yields), rendered by Canonical XML 1.0 sec.2.3.
     #[must_use]
     pub fn canonicalize(&self, comments: Comments) -> Vec<u8> {
+        self.canonicalize_with(comments, &InclusivePrefixes::default())
+    }
+
+    /// As [`Self::canonicalize`], rendering the prefixes `inclusive`
+    /// names as inclusive Canonical XML does (xml-exc-c14n sec.4).
+    #[must_use]
+    pub fn canonicalize_with(&self, comments: Comments, inclusive: &InclusivePrefixes) -> Vec<u8> {
         let mut out = String::new();
         let mut rendered = Vec::new();
-        self.render(&mut out, &mut rendered, comments);
+        self.render(&mut out, &mut rendered, comments, inclusive);
         out.into_bytes()
     }
 
     /// Render this element into `out`. `rendered` holds the namespace
     /// declarations in effect from output ancestors, innermost last,
     /// with the empty string standing for the default prefix.
-    fn render(&self, out: &mut String, rendered: &mut Vec<(String, String)>, comments: Comments) {
+    fn render(
+        &self,
+        out: &mut String,
+        rendered: &mut Vec<(String, String)>,
+        comments: Comments,
+        inclusive: &InclusivePrefixes,
+    ) {
         let data = self.data();
         let scope_depth = rendered.len();
 
@@ -490,6 +516,14 @@ impl<'a> ElementRef<'a> {
                 && !utilised.contains(&Some(prefix))
             {
                 utilised.push(Some(prefix));
+            }
+        }
+        // The prefixes the PrefixList names are rendered wherever they
+        // are in scope (xml-exc-c14n sec.4).
+        for listed in &inclusive.prefixes {
+            let prefix = (!listed.is_empty()).then_some(listed.as_str());
+            if !utilised.contains(&prefix) {
+                utilised.push(prefix);
             }
         }
         let mut declarations: Vec<(String, String)> = Vec::new();
@@ -547,7 +581,7 @@ impl<'a> ElementRef<'a> {
             match node {
                 Node::Element(index) => {
                     if let Some(child) = self.document.element(*index) {
-                        child.render(out, rendered, comments);
+                        child.render(out, rendered, comments, inclusive);
                     }
                 }
                 Node::Text(text) => escape_text_into(out, text),
@@ -576,6 +610,47 @@ impl<'a> ElementRef<'a> {
         rendered.truncate(scope_depth);
     }
 }
+
+/// The prefixes an `InclusiveNamespaces PrefixList` names
+/// (xml-exc-c14n sec.4), the default namespace as the empty string.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InclusivePrefixes {
+    /// The named prefixes; the empty string is `#default`.
+    prefixes: Vec<String>,
+}
+
+impl InclusivePrefixes {
+    /// The prefixes a `PrefixList` attribute value names: tokens
+    /// separated by white space, each `#default` or a prefix without a
+    /// colon. `None` for any other token.
+    #[must_use]
+    pub fn parse(list: &str) -> Option<Self> {
+        let mut prefixes = Vec::new();
+        for token in list.split(|character: char| XML_WHITE_SPACE.contains(&character)) {
+            if token.is_empty() {
+                continue;
+            }
+            let prefix = if token == PREFIX_LIST_DEFAULT {
+                String::new()
+            } else if token.contains(':') || token.starts_with('#') {
+                return None;
+            } else {
+                token.to_owned()
+            };
+            if !prefixes.contains(&prefix) {
+                prefixes.push(prefix);
+            }
+        }
+        Some(Self { prefixes })
+    }
+}
+
+/// The `PrefixList` token naming the default namespace (xml-exc-c14n
+/// sec.4).
+const PREFIX_LIST_DEFAULT: &str = "#default";
+
+/// XML white space (XML 1.0 sec.2.3 production 3).
+const XML_WHITE_SPACE: [char; 4] = [' ', '\t', '\n', '\r'];
 
 /// Append `prefix:local`, or `local` alone.
 fn push_qualified_name(out: &mut String, prefix: Option<&str>, local: &str) {
@@ -664,6 +739,8 @@ struct Parser<'a> {
     open: Vec<usize>,
     /// Every `Id` attribute value seen so far.
     ids: std::collections::HashSet<String>,
+    /// Nodes created so far, bounded by [`MAX_NODES`].
+    nodes: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -674,6 +751,7 @@ impl<'a> Parser<'a> {
             position: 0,
             elements: Vec::new(),
             open: Vec::new(),
+            nodes: 0,
             ids: std::collections::HashSet::new(),
         }
     }
@@ -922,20 +1000,20 @@ impl<'a> Parser<'a> {
                 self.end_tag(current)?;
             } else if self.eat(COMMENT_OPEN) {
                 let text = self.comment_body()?;
-                self.push_node(current, Node::Comment(text));
+                self.push_node(current, Node::Comment(text))?;
             } else if self.eat(CDATA_OPEN) {
                 let text = normalise_line_ends(self.until(CDATA_CLOSE, "unterminated CDATA")?);
-                self.push_text(current, &text);
+                self.push_text(current, &text)?;
             } else if self.at(DOCTYPE_OPEN) {
                 return Err(XmlError::Unsupported("document type declaration"));
             } else if self.at(PI_OPEN) {
                 let node = self.processing_instruction()?;
-                self.push_node(current, node);
+                self.push_node(current, node)?;
             } else if self.at("<") {
                 self.start_tag()?;
             } else {
                 let text = self.character_data()?;
-                self.push_text(current, &text);
+                self.push_text(current, &text)?;
             }
         }
         Ok(())
@@ -992,18 +1070,36 @@ impl<'a> Parser<'a> {
         resolved.ok_or(XmlError::Malformed("character reference"))
     }
 
+    /// Count one more node against [`MAX_NODES`].
+    fn count_node(&mut self) -> Result<(), XmlError> {
+        self.nodes = self.nodes.saturating_add(1);
+        if self.nodes > MAX_NODES {
+            return Err(XmlError::TooManyNodes);
+        }
+        Ok(())
+    }
+
     /// Append `node` to the children of the element at `parent`.
-    fn push_node(&mut self, parent: usize, node: Node) {
+    fn push_node(&mut self, parent: usize, node: Node) -> Result<(), XmlError> {
+        self.count_node()?;
         if let Some(element) = self.elements.get_mut(parent) {
             element.children.push(node);
         }
+        Ok(())
     }
 
     /// Append character data to `parent`, merging with a preceding
     /// text child.
-    fn push_text(&mut self, parent: usize, text: &str) {
+    fn push_text(&mut self, parent: usize, text: &str) -> Result<(), XmlError> {
         if text.is_empty() {
-            return;
+            return Ok(());
+        }
+        let merges = self
+            .elements
+            .get(parent)
+            .is_some_and(|element| matches!(element.children.last(), Some(Node::Text(_))));
+        if !merges {
+            self.count_node()?;
         }
         if let Some(element) = self.elements.get_mut(parent) {
             if let Some(Node::Text(previous)) = element.children.last_mut() {
@@ -1012,6 +1108,7 @@ impl<'a> Parser<'a> {
                 element.children.push(Node::Text(text.to_owned()));
             }
         }
+        Ok(())
     }
 
     /// A start tag or empty-element tag at `<`.
@@ -1019,6 +1116,7 @@ impl<'a> Parser<'a> {
         if self.open.len() >= MAX_DEPTH {
             return Err(XmlError::TooDeep);
         }
+        self.count_node()?;
         let start = self.position;
         self.expect("<", "start tag")?;
         let name = self.qualified_name()?;
@@ -1162,8 +1260,11 @@ impl<'a> Parser<'a> {
             element.attributes = attributes;
             element.span = start..self.position;
         }
-        if let Some(parent) = parent {
-            self.push_node(parent, Node::Element(index));
+        // The element was counted when its start tag opened.
+        if let Some(parent) = parent
+            && let Some(element) = self.elements.get_mut(parent)
+        {
+            element.children.push(Node::Element(index));
         }
         if !empty {
             self.open.push(index);
@@ -1285,7 +1386,7 @@ fn normalise_line_ends(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Comments, MAX_DEPTH, XmlDocument, XmlError};
+    use super::{Comments, InclusivePrefixes, MAX_DEPTH, MAX_NODES, XmlDocument, XmlError};
     use crate::verification::exactly;
 
     fn parse(text: &str) -> XmlDocument {
@@ -1458,11 +1559,46 @@ mod tests {
     /// (xml-exc-c14n sec.3), and the `xml` prefix is never declared.
     #[test]
     fn xml_attributes_stay_where_they_are_written() {
-        let document = parse(r#"<o xml:lang="fi"><i xml:space="preserve"/></o>"#);
+        let document = parse(
+            r#"<o xml:lang="fi" xml:base="urn:base" xml:space="default"><i xml:space="preserve"/></o>"#,
+        );
         let inner = document.root().children().next().expect("child");
         assert_eq!(
             String::from_utf8(inner.canonicalize(Comments::Omitted)).expect("utf-8"),
             r#"<i xml:space="preserve"></i>"#
+        );
+    }
+
+    /// A prefix the `PrefixList` names is rendered where it is in scope
+    /// and not yet in effect (xml-exc-c14n sec.4); others stay
+    /// exclusive.
+    #[test]
+    fn listed_prefixes_are_rendered_inclusively() {
+        let document = parse(
+            r#"<n0:o xmlns:n0="urn:zero" xmlns:n1="urn:one" xmlns:n2="urn:two" xmlns="urn:default"><n0:i><n0:j/></n0:i></n0:o>"#,
+        );
+        let inner = document.root().children().next().expect("child");
+        assert_eq!(
+            String::from_utf8(inner.canonicalize(Comments::Omitted)).expect("utf-8"),
+            r#"<n0:i xmlns:n0="urn:zero"><n0:j></n0:j></n0:i>"#
+        );
+        let listed = InclusivePrefixes::parse(" n1\t#default ").expect("a prefix list");
+        assert_eq!(
+            String::from_utf8(inner.canonicalize_with(Comments::Omitted, &listed)).expect("utf-8"),
+            r#"<n0:i xmlns="urn:default" xmlns:n0="urn:zero" xmlns:n1="urn:one"><n0:j></n0:j></n0:i>"#
+        );
+        assert_eq!(InclusivePrefixes::parse("n:1"), None);
+        assert_eq!(InclusivePrefixes::parse("#other"), None);
+    }
+
+    #[test]
+    fn the_node_count_is_bounded() {
+        let at_bound = format!("<a>{}</a>", "<b/>".repeat(MAX_NODES - 1));
+        assert!(XmlDocument::parse(at_bound.into_bytes()).is_ok());
+        let over = format!("<a>{}</a>", "<b/>".repeat(MAX_NODES));
+        assert_eq!(
+            XmlDocument::parse(over.into_bytes()).err(),
+            Some(XmlError::TooManyNodes)
         );
     }
 

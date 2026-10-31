@@ -37,12 +37,14 @@
 //! - RFC 5280 sec.5: a CRL counts only when the issuer signed it
 //!   ([`VerifiedCrl::verify`]).
 
-use crate::crl::{OwnedCrl, VerifiedCrl};
+use crate::crl::{CrlReason, OwnedCrl, VerifiedCrl};
 use crate::ocsp::{CertStatus, OcspResponseStatus, OwnedOcspResponse, VerifiedOcspResponse};
 use crate::revocation::{RevocationStatus, check_against_crl};
 use crate::trust::{PINNED_ROOT_DER, PINNED_TSA_ROOT_DER};
 use crate::validation::ValidationMaterial;
 use refineid_cms::x509::{Certificate, DateTime, OwnedCert, path_extension_profile};
+use refineid_digest::{SHA256_LEN, Sha256};
+use std::collections::HashSet;
 
 /// Most certificates searched above the signer before a path is
 /// abandoned. RFC 5280 sets no bound; a FINEID path is signer,
@@ -279,6 +281,8 @@ pub struct MaterialPool {
     ocsp_responses: Vec<OwnedOcspResponse>,
     /// Distinct CRLs.
     crls: Vec<OwnedCrl>,
+    /// The SHA-256 of every item held, so each is held once.
+    seen: HashSet<[u8; SHA256_LEN]>,
 }
 
 /// What the pool says about one certificate.
@@ -307,25 +311,83 @@ pub enum Revocation {
         at: DateTime,
     },
     /// A verified answer says revoked; `at` is the revocation time
-    /// from the CRL entry or the OCSP `revokedInfo`, the earliest when
-    /// several answers or certificates are revoked.
+    /// and `reason` the `CRLReason`, from the CRL entry or the OCSP
+    /// `revokedInfo`. Of several revocations a compromise is reported
+    /// first, then the earliest.
     Revoked {
         /// The revocation time.
         at: DateTime,
+        /// The `CRLReason`, when the evidence gives one.
+        reason: Option<CrlReason>,
     },
     /// No verified answer speaks for the validation time.
     Unavailable,
 }
 
 impl Revocation {
-    /// Whether a revocation precedes `proof_of_existence`, or any
-    /// revocation counts because there is no proof.
+    /// Whether the revocation invalidates what was signed before
+    /// `proof_of_existence`: a revocation at or before it, any
+    /// revocation when there is no proof, and a key, CA or attribute
+    /// authority compromise whatever its time, since a compromised key
+    /// proves nothing about when it signed (`ETSI EN 319 102-1` clause
+    /// 5.6.2, past certificate validation).
     #[must_use]
     pub fn revoked_before(self, proof_of_existence: Option<DateTime>) -> bool {
         match self {
-            Self::Revoked { at } => proof_of_existence.is_none_or(|proof| at <= proof),
+            Self::Revoked { at, reason } => {
+                reason.is_some_and(is_compromise)
+                    || proof_of_existence.is_none_or(|proof| at <= proof)
+            }
             Self::Good { .. } | Self::Unavailable => false,
         }
+    }
+
+    /// How a relying party ranks the status among the paths that reach
+    /// an anchor: good first, then unavailable, then revoked, the
+    /// latest non-compromise revocation before the rest.
+    fn preference(self) -> (u8, bool, Option<DateTime>) {
+        match self {
+            Self::Good { at } => (PREFER_GOOD, true, Some(at)),
+            Self::Unavailable => (PREFER_UNAVAILABLE, true, None),
+            Self::Revoked { at, reason } => {
+                (PREFER_REVOKED, !reason.is_some_and(is_compromise), Some(at))
+            }
+        }
+    }
+}
+
+/// Rank of a good status in [`Revocation::preference`].
+const PREFER_GOOD: u8 = 2;
+/// Rank of an unavailable status.
+const PREFER_UNAVAILABLE: u8 = 1;
+/// Rank of a revoked status.
+const PREFER_REVOKED: u8 = 0;
+
+/// Whether `reason` names a compromised key (RFC 5280 sec.5.3.1).
+const fn is_compromise(reason: CrlReason) -> bool {
+    matches!(
+        reason,
+        CrlReason::KeyCompromise | CrlReason::CaCompromise | CrlReason::AaCompromise
+    )
+}
+
+/// Of two revocations, the one to report: a compromise before any
+/// other, then the earlier.
+fn graver(
+    known: Option<(DateTime, Option<CrlReason>)>,
+    at: DateTime,
+    reason: Option<CrlReason>,
+) -> (DateTime, Option<CrlReason>) {
+    let Some((known_at, known_reason)) = known else {
+        return (at, reason);
+    };
+    let compromise = reason.is_some_and(is_compromise);
+    let known_compromise = known_reason.is_some_and(is_compromise);
+    match (known_compromise, compromise) {
+        (false, true) => (at, reason),
+        (true, false) => (known_at, known_reason),
+        _ if at < known_at => (at, reason),
+        _ => (known_at, known_reason),
     }
 }
 
@@ -334,8 +396,8 @@ impl Revocation {
 enum Answer {
     /// Good, with the evidence time.
     Good(DateTime),
-    /// Revoked, at this time.
-    Revoked(DateTime),
+    /// Revoked, at this time, for this reason.
+    Revoked(DateTime, Option<CrlReason>),
 }
 
 impl MaterialPool {
@@ -349,22 +411,18 @@ impl MaterialPool {
     pub fn add_material(&mut self, material: &ValidationMaterial) {
         self.add_certificate_ders(&material.certificates);
         for der in &material.ocsp_responses {
-            if self
-                .ocsp_responses
-                .iter()
-                .all(|known| known.as_der() != der.as_slice())
+            if !self.held(der)
                 && let Ok(response) = OwnedOcspResponse::from_der(der)
             {
+                self.hold(der);
                 self.ocsp_responses.push(response);
             }
         }
         for der in &material.crls {
-            if self
-                .crls
-                .iter()
-                .all(|known| known.as_der() != der.as_slice())
+            if !self.held(der)
                 && let Ok(crl) = OwnedCrl::from_der(der)
             {
+                self.hold(der);
                 self.crls.push(crl);
             }
         }
@@ -373,7 +431,9 @@ impl MaterialPool {
     /// Add DER certificates.
     pub fn add_certificate_ders(&mut self, ders: &[Vec<u8>]) {
         for der in ders {
-            if let Ok(certificate) = OwnedCert::from_der(der) {
+            if !self.held(der)
+                && let Ok(certificate) = OwnedCert::from_der(der)
+            {
                 self.add_certificate(certificate);
             }
         }
@@ -381,13 +441,20 @@ impl MaterialPool {
 
     /// Add one parsed certificate.
     pub fn add_certificate(&mut self, certificate: OwnedCert) {
-        if self
-            .certificates
-            .iter()
-            .all(|known| known.as_der() != certificate.as_der())
-        {
+        if !self.held(certificate.as_der()) {
+            self.hold(certificate.as_der());
             self.certificates.push(certificate);
         }
+    }
+
+    /// Whether an item with the DER `der` is already held.
+    fn held(&self, der: &[u8]) -> bool {
+        self.seen.contains(Sha256::of(der).as_bytes())
+    }
+
+    /// Record that an item with the DER `der`, which parsed, is held.
+    fn hold(&mut self, der: &[u8]) {
+        self.seen.insert(*Sha256::of(der).as_bytes());
     }
 
     /// Add every anchor's certificate, so a document need not carry
@@ -417,22 +484,27 @@ impl MaterialPool {
             .collect()
     }
 
-    /// Whether a path from the last certificate of `path` upward ends
-    /// in an anchor; on success `path` runs from the judged
-    /// certificate to the anchor.
-    fn anchored_above(
+    /// Every path from the last certificate of `path` upward to an
+    /// anchor, each running from the judged certificate to the anchor,
+    /// appended to `found` until it holds [`MAX_ANCHORED_PATHS`].
+    fn anchored_paths(
         &self,
         anchors: &TrustAnchors,
         role: AnchorRole,
         at: DateTime,
         path: &mut Vec<OwnedCert>,
-    ) -> bool {
-        if path.len() > MAX_PATH_DEPTH {
-            return false;
+        found: &mut Vec<Vec<OwnedCert>>,
+    ) {
+        if path.len() > MAX_PATH_DEPTH || found.len() >= MAX_ANCHORED_PATHS {
+            return;
         }
         let Some(top) = path.last().cloned() else {
-            return false;
+            return;
         };
+        if path.len() > 1 && anchors.is_anchor(top.view(), role, at) {
+            found.push(path.clone());
+            return;
+        }
         let step = Step {
             anchors,
             role,
@@ -444,14 +516,9 @@ impl MaterialPool {
                 continue;
             }
             path.push(issuer.clone());
-            if anchors.is_anchor(issuer.view(), role, at)
-                || self.anchored_above(anchors, role, at, path)
-            {
-                return true;
-            }
+            self.anchored_paths(anchors, role, at, path, found);
             path.pop();
         }
-        false
     }
 
     /// The revocation status of `certificate` from every verified OCSP
@@ -461,16 +528,16 @@ impl MaterialPool {
         &self,
         certificate: Certificate<'_>,
         issuer: Certificate<'_>,
-        at: DateTime,
+        when: When,
     ) -> Revocation {
         let ocsp = self
             .ocsp_responses
             .iter()
-            .filter_map(|response| self.ocsp_answer(response, certificate, issuer, at));
+            .filter_map(|response| self.ocsp_answer(response, certificate, issuer, when));
         let crl = self
             .crls
             .iter()
-            .filter_map(|crl| crl_answer(crl, certificate, issuer, at));
+            .filter_map(|crl| crl_answer(crl, certificate, issuer, when));
         strongest(ocsp.chain(crl))
     }
 
@@ -479,27 +546,24 @@ impl MaterialPool {
     /// against its issuer (RFC 5280 sec.6.1.3 (a)(3)). Revoked when any
     /// is, at the earliest revocation time; else unavailable when any
     /// is unanswered; else the judged certificate's good answer.
-    fn path_revocation(&self, path: &[OwnedCert], at: DateTime) -> Revocation {
+    fn path_revocation(&self, path: &[OwnedCert], when: When) -> Revocation {
         let mut first = None;
-        let mut earliest_revocation: Option<DateTime> = None;
+        let mut revoked: Option<(DateTime, Option<CrlReason>)> = None;
         let mut unanswered = false;
         for step in path.windows(2) {
             let [certificate, issuer] = step else {
                 continue;
             };
-            let revocation = self.revocation_of(certificate.view(), issuer.view(), at);
+            let revocation = self.revocation_of(certificate.view(), issuer.view(), when);
             match revocation {
-                Revocation::Revoked { at: revoked } => {
-                    earliest_revocation =
-                        Some(earliest_revocation.map_or(revoked, |known| known.min(revoked)));
-                }
+                Revocation::Revoked { at, reason } => revoked = Some(graver(revoked, at, reason)),
                 Revocation::Unavailable => unanswered = true,
                 Revocation::Good { .. } => {}
             }
             first.get_or_insert(revocation);
         }
-        match (earliest_revocation, unanswered) {
-            (Some(at), _) => Revocation::Revoked { at },
+        match (revoked, unanswered) {
+            (Some((at, reason)), _) => Revocation::Revoked { at, reason },
             (None, true) => Revocation::Unavailable,
             (None, false) => first.unwrap_or(Revocation::Unavailable),
         }
@@ -513,7 +577,7 @@ impl MaterialPool {
         response: &OwnedOcspResponse,
         certificate: Certificate<'_>,
         issuer: Certificate<'_>,
-        at: DateTime,
+        when: When,
     ) -> Option<Answer> {
         let view = response.view();
         if view.status != OcspResponseStatus::Successful {
@@ -533,9 +597,11 @@ impl MaterialPool {
                 let verified = VerifiedOcspResponse::verify(basic, candidate, issuer).ok()?;
                 let single = verified.response_for(certificate)?;
                 match single.status {
-                    CertStatus::Revoked { revoked_at, .. } => Some(Answer::Revoked(revoked_at)),
+                    CertStatus::Revoked { revoked_at, reason } => {
+                        Some(Answer::Revoked(revoked_at, reason))
+                    }
                     CertStatus::Good => {
-                        accepted_window(certificate, single.this_update, single.next_update, at)
+                        accepted_window(certificate, single.this_update, single.next_update, when)
                             .then_some(Answer::Good(basic.produced_at))
                     }
                     CertStatus::Unknown => None,
@@ -556,35 +622,68 @@ struct Step<'a> {
     intermediates_below: usize,
 }
 
+/// The two instants a judgement consults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct When {
+    /// The validation time: what the chain and the revocation are
+    /// judged at.
+    pub at: DateTime,
+    /// The verifier's clock: no evidence dated later than this, beyond
+    /// five minutes of clock skew, is accepted.
+    pub now: DateTime,
+}
+
+/// How far an answer may be dated ahead of the verifier's clock before
+/// it is treated as post-dated rather than merely skewed: the
+/// allowance validators conventionally give between two machines.
+pub(crate) const MAX_CLOCK_SKEW: core::time::Duration = core::time::Duration::from_mins(5);
+
+/// Most anchored paths judged for one certificate; RFC 5280 sec.6
+/// accepts any valid path, and a real one has a handful at most.
+const MAX_ANCHORED_PATHS: usize = 16;
+
 /// Judge `certificate` against `pool` and `anchors` for `role` at the
-/// validation time `at`.
+/// validation time `when.at`.
 ///
 /// `issuer` is reported whenever a pool certificate verifiably issued
 /// the certificate, anchored or not; `anchored` additionally needs the
-/// certificate valid at `at` and a path ending in an anchor for `role`
-/// granted at `at`. A certificate that is itself such an anchor is
-/// anchored when valid at `at`, with nothing below it to check for
-/// revocation. On an anchored path every certificate below the anchor
-/// is checked for revocation; without one only the certificate is,
-/// against `issuer`. The status is [`Revocation::Unavailable`] without
-/// an issuer: no unverified answer is ever reported.
+/// certificate valid at `at`, fit for the role, and a path ending in an
+/// anchor for `role` granted at `at`. Every anchored path is judged and
+/// the best revocation status kept (RFC 5280 sec.6 accepts any valid
+/// path): good, then unavailable, then revoked. A certificate that is
+/// itself such an anchor is anchored by its granted period alone, with
+/// nothing below it to check for revocation. Without an anchored path
+/// only the certificate is checked, against `issuer`. The status is
+/// [`Revocation::Unavailable`] without an issuer: no unverified answer
+/// is ever reported.
+///
+/// A document signer, judged for [`AnchorRole::CertificateIssuing`],
+/// is fit when it is no CA, its Key Usage, when present, asserts
+/// `digitalSignature` or `nonRepudiation`, and it carries no critical
+/// extension this verifier does not process (RFC 5280 sec.4.2.1.3,
+/// sec.4.2.1.9, sec.6.1.4 (m)). A time-stamping signer's profile is
+/// checked where its token is ([`crate::timestamp`]).
 #[must_use]
 pub fn judge(
     certificate: &OwnedCert,
     pool: &MaterialPool,
     anchors: &TrustAnchors,
     role: AnchorRole,
-    at: DateTime,
+    when: When,
 ) -> ChainVerdict {
     let view = certificate.view();
-    let valid = valid_at(view, at);
+    let at = when.at;
     if anchors.is_anchor(view, role, at) {
         return ChainVerdict {
             issuer: None,
-            anchored: valid,
+            anchored: true,
             revocation: Revocation::Unavailable,
         };
     }
+    let fit = match role {
+        AnchorRole::CertificateIssuing => fit_to_sign(view),
+        AnchorRole::TimeStamping => true,
+    };
     let step = Step {
         anchors,
         role,
@@ -592,25 +691,42 @@ pub fn judge(
         intermediates_below: 0,
     };
     let candidates = pool.issuers_of(view, &step);
-    let mut path = Vec::new();
-    let anchored_issuer = candidates.iter().copied().find(|issuer| {
-        path.clear();
-        path.push(certificate.clone());
-        path.push((*issuer).clone());
-        anchors.is_anchor(issuer.view(), role, at)
-            || pool.anchored_above(anchors, role, at, &mut path)
-    });
-    let issuer = anchored_issuer.or_else(|| candidates.first().copied());
-    let revocation = match (anchored_issuer, issuer) {
-        (Some(_), _) => pool.path_revocation(&path, at),
-        (None, Some(issuer)) => pool.revocation_of(view, issuer.view(), at),
-        (None, None) => Revocation::Unavailable,
+    let mut paths = Vec::new();
+    let mut path = vec![certificate.clone()];
+    pool.anchored_paths(anchors, role, at, &mut path, &mut paths);
+    let best = paths
+        .iter()
+        .map(|path| (path, pool.path_revocation(path, when)))
+        .max_by_key(|(_, revocation)| revocation.preference());
+    let (issuer, revocation) = match best {
+        Some((path, revocation)) => (path.get(1).cloned(), revocation),
+        None => {
+            let issuer = candidates.first().copied().cloned();
+            let revocation = issuer.as_ref().map_or(Revocation::Unavailable, |issuer| {
+                pool.revocation_of(view, issuer.view(), when)
+            });
+            (issuer, revocation)
+        }
     };
     ChainVerdict {
-        issuer: issuer.cloned(),
-        anchored: valid && anchored_issuer.is_some(),
+        issuer,
+        anchored: valid_at(view, at) && fit && best.is_some(),
         revocation,
     }
+}
+
+/// Whether `certificate` may sign documents: no CA, a Key Usage that,
+/// when present, asserts `digitalSignature` or `nonRepudiation`, and
+/// only critical extensions this verifier processes.
+fn fit_to_sign(certificate: Certificate<'_>) -> bool {
+    certificate.extensions.is_none_or(|extensions| {
+        path_extension_profile(extensions).is_ok_and(|profile| {
+            !profile.basic_constraints.ca
+                && profile.key_usage.is_none_or(|usage| {
+                    usage.key_usage.digital_signature || usage.key_usage.non_repudiation
+                })
+        })
+    })
 }
 
 /// What one CRL says about `certificate`, when `issuer` signed it and a
@@ -619,7 +735,7 @@ fn crl_answer(
     crl: &OwnedCrl,
     certificate: Certificate<'_>,
     issuer: Certificate<'_>,
-    at: DateTime,
+    when: When,
 ) -> Option<Answer> {
     let view = crl.view();
     let verified = VerifiedCrl::verify(&view, issuer).ok()?;
@@ -627,10 +743,13 @@ fn crl_answer(
     // acceptance window is applied below.
     match check_against_crl(certificate, &verified, view.this_update) {
         RevocationStatus::Good => {
-            accepted_window(certificate, view.this_update, view.next_update, at)
+            accepted_window(certificate, view.this_update, view.next_update, when)
                 .then_some(Answer::Good(view.this_update))
         }
-        RevocationStatus::Revoked { at: revoked, .. } => Some(Answer::Revoked(revoked)),
+        RevocationStatus::Revoked {
+            at: revoked,
+            reason,
+        } => Some(Answer::Revoked(revoked, reason)),
         RevocationStatus::Inapplicable(_)
         | RevocationStatus::Stale
         | RevocationStatus::NotYetValid
@@ -645,31 +764,37 @@ fn crl_answer(
 /// (`thisUpdate <= notAfter`). The second case is evidence gathered
 /// after signing, which a level-LT document embeds; it shows the
 /// certificate was not revoked when the signature already existed
-/// (`ETSI EN 319 102-1` clauses 5.2.5 and 5.6.2).
+/// (`ETSI EN 319 102-1` clauses 5.2.5 and 5.6.2). An answer dated
+/// later than the verifier's clock, beyond [`MAX_CLOCK_SKEW`], speaks
+/// for nothing.
 fn accepted_window(
     certificate: Certificate<'_>,
     this_update: DateTime,
     next_update: Option<DateTime>,
-    at: DateTime,
+    when: When,
 ) -> bool {
+    let at = when.at;
+    let post_dated =
+        this_update.unix_duration() > when.now.unix_duration().saturating_add(MAX_CLOCK_SKEW);
     let contains_at = this_update <= at && at <= next_update.unwrap_or(this_update);
     let issued_after_at = at <= this_update && this_update <= certificate.not_after;
-    contains_at || issued_after_at
+    !post_dated && (contains_at || issued_after_at)
 }
 
-/// A revoked answer outweighs any good one, the earliest revocation
-/// time reported; among good answers the latest evidence time is.
+/// A revoked answer outweighs any good one, a compromise or else the
+/// earliest revocation reported; among good answers the latest evidence
+/// time is.
 fn strongest(answers: impl Iterator<Item = Answer>) -> Revocation {
     let mut good: Option<DateTime> = None;
-    let mut revoked: Option<DateTime> = None;
+    let mut revoked: Option<(DateTime, Option<CrlReason>)> = None;
     for answer in answers {
         match answer {
-            Answer::Revoked(at) => revoked = Some(revoked.map_or(at, |known| known.min(at))),
+            Answer::Revoked(at, reason) => revoked = Some(graver(revoked, at, reason)),
             Answer::Good(at) => good = Some(good.map_or(at, |known| known.max(at))),
         }
     }
     match (revoked, good) {
-        (Some(at), _) => Revocation::Revoked { at },
+        (Some((at, reason)), _) => Revocation::Revoked { at, reason },
         (None, Some(at)) => Revocation::Good { at },
         (None, None) => Revocation::Unavailable,
     }
@@ -707,8 +832,9 @@ fn may_issue(certificate: Certificate<'_>, intermediates_below: usize) -> bool {
 mod tests {
     use super::{
         AnchorError, AnchorRole, GrantedPeriod, MaterialPool, Revocation, TrustAnchor,
-        TrustAnchors, judge,
+        TrustAnchors, When, judge,
     };
+    use crate::crl::CrlReason;
     use crate::testkit::{
         BOOLEAN, CertificateSpec, DER_TRUE, INTEGER, OcspSpec, ResponderName, SEQUENCE, TestCurve,
         TestKey, ca_extensions, certificate, crl, day, extension, key_usage, ocsp_response, tlv,
@@ -838,6 +964,14 @@ mod tests {
         ])
     }
 
+    /// Validation at noon of `validated`, the clock reading the same.
+    fn at(validated: u8) -> When {
+        When {
+            at: day(validated),
+            now: day(validated),
+        }
+    }
+
     /// No anchors.
     fn none() -> TrustAnchors {
         TrustAnchors::new(Vec::new())
@@ -878,6 +1012,9 @@ mod tests {
                 this_update: day(answered),
                 next_update: next_update.map(day),
                 embedded: Vec::new(),
+                cert_id: crate::testkit::CertIdAlgorithm::Sha1,
+                revocation_reason: None,
+                response_extensions: Vec::new(),
             })
         }
 
@@ -899,6 +1036,9 @@ mod tests {
                 this_update: day(ANSWERED),
                 next_update: Some(day(ENDS)),
                 embedded: Vec::new(),
+                cert_id: crate::testkit::CertIdAlgorithm::Sha1,
+                revocation_reason: None,
+                response_extensions: Vec::new(),
             })
         }
 
@@ -917,14 +1057,17 @@ mod tests {
     }
 
     /// The revocation `judge` reports for `chain.signer` over `pool`
-    /// with no anchors at `at`.
+    /// with no anchors at `at`, the clock reading [`ENDS`].
     fn signer_revocation(chain: &Chain, pool: &MaterialPool, at: u8) -> Revocation {
         judge(
             &chain.signer,
             pool,
             &none(),
             AnchorRole::CertificateIssuing,
-            day(at),
+            When {
+                at: day(at),
+                now: day(ENDS),
+            },
         )
         .revocation
     }
@@ -937,7 +1080,7 @@ mod tests {
             &chain.pool(),
             &issuing(&chain.root),
             AnchorRole::CertificateIssuing,
-            day(VALIDATED),
+            at(VALIDATED),
         );
         assert!(verdict.anchored);
         assert_eq!(
@@ -961,7 +1104,16 @@ mod tests {
         ]);
         let at = day(VALIDATED);
         let issuing_role = AnchorRole::CertificateIssuing;
-        assert!(!judge(&chain.signer, &chain.pool(), &stamping, issuing_role, at).anchored);
+        assert!(
+            !judge(
+                &chain.signer,
+                &chain.pool(),
+                &stamping,
+                issuing_role,
+                When { at, now: at }
+            )
+            .anchored
+        );
 
         let lapsed = TrustAnchors::new(vec![
             TrustAnchor::new(
@@ -971,14 +1123,23 @@ mod tests {
             )
             .expect("an anchor"),
         ]);
-        assert!(!judge(&chain.signer, &chain.pool(), &lapsed, issuing_role, at).anchored);
+        assert!(
+            !judge(
+                &chain.signer,
+                &chain.pool(),
+                &lapsed,
+                issuing_role,
+                When { at, now: at }
+            )
+            .anchored
+        );
         assert!(
             judge(
                 &chain.signer,
                 &chain.pool(),
                 &lapsed,
                 issuing_role,
-                day(EARLY)
+                self::at(EARLY)
             )
             .anchored
         );
@@ -1012,7 +1173,7 @@ mod tests {
             &pool,
             &anchors,
             AnchorRole::CertificateIssuing,
-            day(VALIDATED),
+            at(VALIDATED),
         );
         assert!(verdict.anchored);
     }
@@ -1047,7 +1208,7 @@ mod tests {
             &chain.pool(),
             &none(),
             AnchorRole::CertificateIssuing,
-            day(VALIDATED),
+            at(VALIDATED),
         );
         assert!(!verdict.anchored);
         assert_eq!(
@@ -1064,7 +1225,7 @@ mod tests {
             &chain.pool(),
             &issuing(&chain.root),
             AnchorRole::CertificateIssuing,
-            day(VALIDATED),
+            at(VALIDATED),
         );
         assert!(!verdict.anchored);
         assert!(verdict.issuer.is_none());
@@ -1079,7 +1240,7 @@ mod tests {
             &chain.pool(),
             &issuing(&chain.root),
             AnchorRole::CertificateIssuing,
-            day(VALIDATED),
+            at(VALIDATED),
         );
         assert!(!verdict.anchored);
         assert!(verdict.issuer.is_some());
@@ -1099,7 +1260,7 @@ mod tests {
             &chain.pool(),
             &issuing(&chain.root),
             AnchorRole::CertificateIssuing,
-            day(VALIDATED),
+            at(VALIDATED),
         );
         assert!(!verdict.anchored);
         assert!(verdict.issuer.is_none());
@@ -1145,9 +1306,9 @@ mod tests {
         let anchors = issuing(&chain.root);
         let at = day(VALIDATED);
         let role = AnchorRole::CertificateIssuing;
-        assert!(judge(&chain.signer, &pool, &anchors, role, at).anchored);
+        assert!(judge(&chain.signer, &pool, &anchors, role, When { at, now: at }).anchored);
         let deep = OwnedCert::from_der(&deep_signer).expect("signer parses");
-        assert!(!judge(&deep, &pool, &anchors, role, at).anchored);
+        assert!(!judge(&deep, &pool, &anchors, role, When { at, now: at }).anchored);
     }
 
     #[test]
@@ -1168,7 +1329,7 @@ mod tests {
             &pool,
             &none(),
             AnchorRole::CertificateIssuing,
-            day(VALIDATED),
+            at(VALIDATED),
         );
         assert!(!verdict.anchored);
     }
@@ -1185,7 +1346,7 @@ mod tests {
             &pool,
             &issuing(&chain.root),
             AnchorRole::CertificateIssuing,
-            day(VALIDATED),
+            at(VALIDATED),
         );
         assert_eq!(verdict.revocation, Revocation::Good { at: day(ANSWERED) });
     }
@@ -1194,12 +1355,15 @@ mod tests {
     fn a_verified_revoked_answer_carries_its_revocation_time_whatever_its_window() {
         let chain = chain(ENDS);
         let pool = chain.pool_with(
-            vec![chain.ocsp(true, ISSUED, Some(ENDED_EARLY))],
+            vec![chain.ocsp(true, REVOKED, Some(ENDED_EARLY))],
             Vec::new(),
         );
         assert_eq!(
             signer_revocation(&chain, &pool, VALIDATED),
-            Revocation::Revoked { at: day(REVOKED) }
+            Revocation::Revoked {
+                at: day(REVOKED),
+                reason: None
+            }
         );
     }
 
@@ -1250,6 +1414,9 @@ mod tests {
             this_update: day(ANSWERED),
             next_update: None,
             embedded: Vec::new(),
+            cert_id: crate::testkit::CertIdAlgorithm::Sha1,
+            revocation_reason: None,
+            response_extensions: Vec::new(),
         });
         let pool = chain.pool_with(vec![forged], Vec::new());
         assert_eq!(
@@ -1264,7 +1431,10 @@ mod tests {
         let pool = chain.pool_with(Vec::new(), vec![chain.crl(&[SIGNER_SERIAL])]);
         assert_eq!(
             signer_revocation(&chain, &pool, VALIDATED),
-            Revocation::Revoked { at: day(REVOKED) }
+            Revocation::Revoked {
+                at: day(REVOKED),
+                reason: None
+            }
         );
         let pool = chain.pool_with(Vec::new(), vec![chain.crl(&[ROOT_SERIAL])]);
         assert_eq!(
@@ -1285,10 +1455,16 @@ mod tests {
             &pool,
             &issuing(&chain.root),
             AnchorRole::CertificateIssuing,
-            day(VALIDATED),
+            at(VALIDATED),
         );
         assert!(verdict.anchored);
-        assert_eq!(verdict.revocation, Revocation::Revoked { at: day(REVOKED) });
+        assert_eq!(
+            verdict.revocation,
+            Revocation::Revoked {
+                at: day(REVOKED),
+                reason: None
+            }
+        );
     }
 
     #[test]
@@ -1303,9 +1479,15 @@ mod tests {
             &pool,
             &issuing(&chain.root),
             AnchorRole::CertificateIssuing,
-            day(VALIDATED),
+            at(VALIDATED),
         );
-        assert_eq!(verdict.revocation, Revocation::Revoked { at: day(REVOKED) });
+        assert_eq!(
+            verdict.revocation,
+            Revocation::Revoked {
+                at: day(REVOKED),
+                reason: None
+            }
+        );
     }
 
     #[test]
@@ -1317,7 +1499,7 @@ mod tests {
             &pool,
             &issuing(&chain.root),
             AnchorRole::CertificateIssuing,
-            day(VALIDATED),
+            at(VALIDATED),
         );
         assert!(verdict.anchored);
         assert_eq!(verdict.revocation, Revocation::Unavailable);
@@ -1344,7 +1526,10 @@ mod tests {
 
     #[test]
     fn a_revocation_counts_against_the_proof_of_existence() {
-        let revoked = Revocation::Revoked { at: day(REVOKED) };
+        let revoked = Revocation::Revoked {
+            at: day(REVOKED),
+            reason: None,
+        };
         assert!(revoked.revoked_before(None));
         assert!(revoked.revoked_before(Some(day(REVOKED))));
         assert!(revoked.revoked_before(Some(day(VALIDATED))));
@@ -1376,5 +1561,242 @@ mod tests {
         assert!(period.covers(day(ENDED_EARLY)));
         assert!(!period.covers(day(ANSWERED)));
         assert!(GrantedPeriod::unbounded().covers(day(ENDS)));
+    }
+
+    #[test]
+    fn an_issuer_without_basic_constraints_or_cert_sign_is_not_used() {
+        for extensions in [
+            vec![key_usage(KEY_USAGE_CA_UNUSED, KEY_USAGE_CA)],
+            vec![
+                crate::testkit::ca_basic_constraints(),
+                key_usage(
+                    crate::testkit::KEY_USAGE_DIGITAL_SIGNATURE_UNUSED,
+                    crate::testkit::KEY_USAGE_DIGITAL_SIGNATURE,
+                ),
+            ],
+        ] {
+            let chain = chain_with(ENDS, ENDS, extensions);
+            let verdict = judge(
+                &chain.signer,
+                &chain.pool(),
+                &issuing(&chain.root),
+                AnchorRole::CertificateIssuing,
+                at(VALIDATED),
+            );
+            assert!(!verdict.anchored);
+            assert!(verdict.issuer.is_none());
+        }
+    }
+
+    #[test]
+    fn a_crl_without_next_update_speaks_only_for_its_this_update_or_earlier() {
+        let chain = chain(ENDS);
+        let open_ended = crl(
+            INTERMEDIATE,
+            &chain.intermediate_key,
+            day(ANSWERED),
+            None,
+            &[ROOT_SERIAL],
+            day(REVOKED),
+        );
+        let pool = chain.pool_with(Vec::new(), vec![open_ended]);
+        assert_eq!(
+            signer_revocation(&chain, &pool, ANSWERED),
+            Revocation::Good { at: day(ANSWERED) }
+        );
+        assert_eq!(
+            signer_revocation(&chain, &pool, EARLY),
+            Revocation::Good { at: day(ANSWERED) }
+        );
+        assert_eq!(
+            signer_revocation(&chain, &pool, VALIDATED),
+            Revocation::Unavailable
+        );
+    }
+
+    #[test]
+    fn an_answer_dated_after_the_clock_is_refused() {
+        let chain = chain(ENDS);
+        let ocsp = chain.pool_with(vec![chain.good()], Vec::new());
+        let crl = chain.pool_with(Vec::new(), vec![chain.crl(&[ROOT_SERIAL])]);
+        for pool in [ocsp, crl] {
+            let judged_at = |now: u8| {
+                judge(
+                    &chain.signer,
+                    &pool,
+                    &none(),
+                    AnchorRole::CertificateIssuing,
+                    When {
+                        at: day(EARLY),
+                        now: day(now),
+                    },
+                )
+                .revocation
+            };
+            assert_eq!(judged_at(VALIDATED), Revocation::Good { at: day(ANSWERED) });
+            assert_eq!(judged_at(EARLY), Revocation::Unavailable, "post-dated");
+        }
+    }
+
+    /// A signer certificate issued by the chain's intermediate, with
+    /// `extensions`.
+    fn signer_with(chain: &Chain, extensions: Vec<Vec<u8>>) -> OwnedCert {
+        OwnedCert::from_der(&certificate(
+            &spec(SIGNER_SERIAL, SIGNER, INTERMEDIATE, ENDS, extensions),
+            &TestKey::derive(TestCurve::P256, b"signer"),
+            &chain.intermediate_key,
+        ))
+        .expect("signer parses")
+    }
+
+    #[test]
+    fn a_document_signer_must_be_fit_to_sign() {
+        let chain = chain(ENDS);
+        let judged = |signer: &OwnedCert| {
+            judge(
+                signer,
+                &chain.pool(),
+                &issuing(&chain.root),
+                AnchorRole::CertificateIssuing,
+                at(VALIDATED),
+            )
+            .anchored
+        };
+        let non_repudiation = key_usage(
+            crate::testkit::KEY_USAGE_NON_REPUDIATION_UNUSED,
+            crate::testkit::KEY_USAGE_NON_REPUDIATION,
+        );
+        let digital_signature = key_usage(
+            crate::testkit::KEY_USAGE_DIGITAL_SIGNATURE_UNUSED,
+            crate::testkit::KEY_USAGE_DIGITAL_SIGNATURE,
+        );
+        assert!(judged(&signer_with(&chain, vec![non_repudiation.clone()])));
+        assert!(judged(&signer_with(&chain, vec![digital_signature])));
+        let cert_sign_only = key_usage(
+            crate::testkit::KEY_USAGE_CERT_SIGN_UNUSED,
+            crate::testkit::KEY_USAGE_CERT_SIGN,
+        );
+        assert!(
+            !judged(&signer_with(&chain, vec![cert_sign_only])),
+            "no signing usage"
+        );
+        assert!(
+            !judged(&signer_with(
+                &chain,
+                vec![crate::testkit::ca_basic_constraints()]
+            )),
+            "a CA signs no document"
+        );
+        let unknown_critical =
+            extension(crate::oids::CERTIFICATE_POLICIES, true, &tlv(SEQUENCE, []));
+        assert!(
+            !judged(&signer_with(
+                &chain,
+                vec![non_repudiation, unknown_critical]
+            )),
+            "a critical extension this verifier does not process"
+        );
+    }
+
+    #[test]
+    fn the_best_of_several_anchored_paths_decides() {
+        let chain = chain(ENDS);
+        // The intermediate re-issued under another serial: the same name
+        // and key, so the signer chains through either.
+        let reissued = certificate(
+            &spec(
+                SUB_INTERMEDIATE_SERIAL,
+                INTERMEDIATE,
+                ROOT,
+                ENDS,
+                ca_extensions(),
+            ),
+            &chain.intermediate_key,
+            &chain.root_key,
+        );
+        let mut pool = MaterialPool::new();
+        pool.add_certificate_ders(&[reissued, chain.intermediate.clone(), chain.root.clone()]);
+        pool.add_material(&ValidationMaterial {
+            certificates: Vec::new(),
+            ocsp_responses: vec![chain.good(), chain.intermediate_ocsp(false)],
+            crls: Vec::new(),
+        });
+        let verdict = judge(
+            &chain.signer,
+            &pool,
+            &issuing(&chain.root),
+            AnchorRole::CertificateIssuing,
+            at(VALIDATED),
+        );
+        assert!(verdict.anchored);
+        assert_eq!(verdict.revocation, Revocation::Good { at: day(ANSWERED) });
+        assert_eq!(
+            verdict.issuer.map(OwnedCert::into_der),
+            Some(chain.intermediate.clone())
+        );
+    }
+
+    #[test]
+    fn a_compromise_counts_whatever_the_proof_of_existence() {
+        let compromised = Revocation::Revoked {
+            at: day(ANSWERED),
+            reason: Some(CrlReason::KeyCompromise),
+        };
+        let superseded = Revocation::Revoked {
+            at: day(ANSWERED),
+            reason: Some(CrlReason::Superseded),
+        };
+        assert!(compromised.revoked_before(Some(day(REVOKED))));
+        assert!(!superseded.revoked_before(Some(day(REVOKED))));
+
+        let chain = chain(ENDS);
+        for (reason, from_crl) in [
+            (CrlReason::KeyCompromise, true),
+            (CrlReason::CaCompromise, false),
+        ] {
+            let mut pool = chain.pool();
+            let issuer = OwnedCert::from_der(&chain.intermediate).expect("intermediate parses");
+            if from_crl {
+                pool.add_material(&ValidationMaterial {
+                    certificates: Vec::new(),
+                    ocsp_responses: Vec::new(),
+                    crls: vec![crate::testkit::crl_with_reason(
+                        INTERMEDIATE,
+                        &chain.intermediate_key,
+                        day(ANSWERED),
+                        Some(day(ENDS)),
+                        &[SIGNER_SERIAL],
+                        day(REVOKED),
+                        Some(reason),
+                    )],
+                });
+            } else {
+                pool.add_material(&ValidationMaterial {
+                    certificates: Vec::new(),
+                    ocsp_responses: vec![ocsp_response(&OcspSpec {
+                        responder_key: &chain.intermediate_key,
+                        responder: ResponderName::ByName(INTERMEDIATE),
+                        issuer: &issuer,
+                        serial: SIGNER_SERIAL,
+                        revoked: Some(day(REVOKED)),
+                        revocation_reason: Some(reason),
+                        produced_at: day(ANSWERED),
+                        this_update: day(ANSWERED),
+                        next_update: Some(day(ENDS)),
+                        embedded: Vec::new(),
+                        cert_id: crate::testkit::CertIdAlgorithm::Sha1,
+                        response_extensions: Vec::new(),
+                    })],
+                    crls: Vec::new(),
+                });
+            }
+            assert_eq!(
+                signer_revocation(&chain, &pool, VALIDATED),
+                Revocation::Revoked {
+                    at: day(REVOKED),
+                    reason: Some(reason)
+                }
+            );
+        }
     }
 }

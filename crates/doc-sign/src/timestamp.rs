@@ -54,7 +54,8 @@ use crate::ber::{
     Sequence, Utf8String, tlv,
 };
 use crate::cades::DigestAlgorithm;
-use crate::cms::{CmsAttribute, SignedData, SignerIdentifier};
+use crate::cms::{CmsAttribute, RevocationInfoChoice, SignedData, SignerIdentifier};
+use crate::validation::ValidationMaterial;
 use refineid_cms::oid::{Oid, known};
 use refineid_cms::x509::{Certificate, DateTime, Name, OwnedCert};
 use sha1::{Digest as _, Sha1};
@@ -204,11 +205,22 @@ pub struct VerifiedTimestampToken {
     /// byte-identical duplicates are removed. Trust-path validation remains
     /// the caller's responsibility.
     embedded_certificates: Vec<OwnedCert>,
+    /// The CRLs and `id-ri-ocsp-response` entries of the token's
+    /// `SignedData.crls`, for the caller's path judgement.
+    embedded_revocation: ValidationMaterial,
     /// Authenticated `TSTInfo.genTime`.
     generated_at: DateTime,
 }
 
 impl VerifiedTimestampToken {
+    /// The CRLs and OCSP responses the token's `SignedData.crls`
+    /// carries (RFC 5652 sec.10.2.1, RFC 5940), unverified: evidence
+    /// for the caller judging the authority's path.
+    #[must_use]
+    pub const fn embedded_revocation(&self) -> &ValidationMaterial {
+        &self.embedded_revocation
+    }
+
     /// The `TimeStampToken` `ContentInfo` DER, in transit to the
     /// unsigned attribute it is embedded as.
     #[must_use]
@@ -239,7 +251,7 @@ impl VerifiedTimestampToken {
     /// tests of the code that consumes verified tokens.
     #[cfg(test)]
     #[must_use]
-    pub(crate) const fn from_parts_for_test(
+    pub(crate) fn from_parts_for_test(
         token: Vec<u8>,
         signer_certificate: OwnedCert,
         embedded_certificates: Vec<OwnedCert>,
@@ -249,6 +261,7 @@ impl VerifiedTimestampToken {
             token,
             signer_certificate,
             embedded_certificates,
+            embedded_revocation: ValidationMaterial::default(),
             generated_at,
         }
     }
@@ -260,6 +273,8 @@ struct VerifiedBinding {
     signer_certificate: OwnedCert,
     /// Distinct parseable certificates carried by CMS.
     embedded_certificates: Vec<OwnedCert>,
+    /// The revocation answers carried by CMS.
+    embedded_revocation: ValidationMaterial,
     /// Authenticated `TSTInfo.genTime`.
     generated_at: DateTime,
 }
@@ -406,6 +421,7 @@ pub fn verified_token(
         token: token.to_vec(),
         signer_certificate: binding.signer_certificate,
         embedded_certificates: binding.embedded_certificates,
+        embedded_revocation: binding.embedded_revocation,
         generated_at: binding.generated_at,
     })
 }
@@ -450,6 +466,7 @@ pub fn verify_token(
         token: token.to_vec(),
         signer_certificate: binding.signer_certificate,
         embedded_certificates: binding.embedded_certificates,
+        embedded_revocation: binding.embedded_revocation,
         generated_at: binding.generated_at,
     })
 }
@@ -519,28 +536,33 @@ fn authenticate_signer(
         verify_signing_certificate_attribute(signed_data, &certificate)?;
         tsa_certificate_is_usable(&certificate, tst_info.gen_time)?;
     }
+    let mut embedded_revocation = ValidationMaterial::default();
+    for choice in signed_data.revocation_info() {
+        match *choice {
+            RevocationInfoChoice::Crl(der) => embedded_revocation.crls.push(der.to_vec()),
+            RevocationInfoChoice::OcspResponse(der) => {
+                embedded_revocation.ocsp_responses.push(der.to_vec());
+            }
+            RevocationInfoChoice::Other { .. } => {}
+        }
+    }
     Ok(VerifiedBinding {
         signer_certificate: signer,
         embedded_certificates: parseable_embedded_certificates(signed_data),
+        embedded_revocation,
         generated_at: tst_info.gen_time,
     })
 }
 
 /// Retain parseable CMS certificates while removing byte-identical repeats.
 fn parseable_embedded_certificates(signed_data: &SignedData<'_>) -> Vec<OwnedCert> {
-    let mut certificates: Vec<OwnedCert> = Vec::new();
-    for certificate_der in signed_data.certificates() {
-        if certificates
-            .iter()
-            .any(|existing| existing.as_der() == *certificate_der)
-        {
-            continue;
-        }
-        if let Ok(certificate) = OwnedCert::from_der(certificate_der) {
-            certificates.push(certificate);
-        }
-    }
-    certificates
+    let mut seen: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+    signed_data
+        .certificates()
+        .iter()
+        .filter(|der| seen.insert(der))
+        .filter_map(|der| OwnedCert::from_der(der).ok())
+        .collect()
 }
 
 /// Parsed RFC 3161 `TSTInfo` fields this module needs.
@@ -1897,6 +1919,31 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn two_instances_of_one_ess_attribute_are_refused() {
+        let key = kit::TestKey::derive(kit::TestCurve::P256, b"twice-bound signer");
+        let signer = kit_certificate(&key, "Twice Bound Signer");
+        let mut attributes = kit::content_attributes(known::DATA, key.hash(), b"content");
+        attributes.push(kit::signing_certificate_v2(&signer));
+        let once = kit::cms(&kit::CmsParts {
+            signed_attributes: Some(kit::attribute_set(&attributes)),
+            ..kit::CmsParts::attached(&key, &signer, b"content")
+        });
+        attributes.push(kit::signing_certificate_v2(&signer));
+        let twice = kit::cms(&kit::CmsParts {
+            signed_attributes: Some(kit::attribute_set(&attributes)),
+            ..kit::CmsParts::attached(&key, &signer, b"content")
+        });
+        let certificate = crate::test_support::parse_certificate_for_test(&signer);
+        let parsed = SignedData::parse(&once).expect("kit CMS parses");
+        verify_signing_certificate_attribute(&parsed, &certificate).expect("one instance binds");
+        let parsed = SignedData::parse(&twice).expect("kit CMS parses");
+        assert_eq!(
+            verify_signing_certificate_attribute(&parsed, &certificate),
+            Err(TimestampError::SigningCertificateAttributeInvalid)
+        );
+    }
+
     /// A self-issued kit certificate for `key` named `common_name`.
     fn kit_certificate(key: &kit::TestKey, common_name: &str) -> Vec<u8> {
         kit::certificate(
@@ -2327,6 +2374,34 @@ mod verify_token_tests {
         assert_eq!(
             verify_token(&token, |named| named.digest(STAMPED)),
             Err(TimestampError::NoUsableTsaCertificate)
+        );
+    }
+
+    #[test]
+    fn a_sha_1_imprint_is_refused() {
+        let (key, certificate) = tsa(TestCurve::P256);
+        let sha1 = testkit::tlv(
+            testkit::SEQUENCE,
+            testkit::tlv(
+                testkit::OBJECT_IDENTIFIER,
+                refineid_cms::oid::known::SHA1.as_bytes(),
+            ),
+        );
+        let imprint = {
+            use sha1::Digest as _;
+            sha1::Sha1::digest(STAMPED).to_vec()
+        };
+        let token = testkit::timestamp_token_imprinting(
+            &certificate,
+            &key,
+            &sha1,
+            &imprint,
+            testkit::day(GENERATED),
+            &[],
+        );
+        assert_eq!(
+            verify_token(&token, |algorithm| algorithm.digest(STAMPED)).map(|_token| ()),
+            Err(TimestampError::Malformed("imprint algorithm unsupported"))
         );
     }
 }

@@ -936,10 +936,9 @@ pub(crate) mod signing {
     use super::{
         BITS_PER_BYTE, BITS_PER_BYTE_USIZE, BOXED_UINT_LIMB_BITS, EMSA_PKCS1_V15_BLOCK_TYPE,
         EMSA_PKCS1_V15_LEADING_BYTE, EMSA_PKCS1_V15_PS_FILL, EMSA_PKCS1_V15_PS_OFFSET,
-        EMSA_PKCS1_V15_SEPARATOR, FULL_BYTE_MASK, PSS_DB_SEPARATOR, PSS_SHA256_SALT_BYTES,
-        PSS_TRAILER_FIELD, PSS_ZERO_PREFIX_BYTES, RsaModulus, RsaPublicExponent,
-        SHA256_DIGEST_INFO, SHA256_OUTPUT_BYTES, SHA384_DIGEST_INFO, SHA512_DIGEST_INFO,
-        mgf1_sha256,
+        EMSA_PKCS1_V15_SEPARATOR, FULL_BYTE_MASK, PSS_DB_SEPARATOR, PSS_TRAILER_FIELD,
+        PSS_ZERO_PREFIX_BYTES, RsaModulus, RsaPublicExponent, SHA256_DIGEST_INFO,
+        SHA256_OUTPUT_BYTES, SHA384_DIGEST_INFO, SHA512_DIGEST_INFO, mgf1_sha256,
     };
     use crate::signed_data::HashAlgorithm;
     use crypto_bigint::{
@@ -1054,13 +1053,9 @@ pub(crate) mod signing {
         }
 
         /// The RSASSA-PSS signature over `message` with SHA-256,
-        /// MGF1-SHA-256 and `salt` (RFC 8017 sec.8.1.1, EMSA-PSS
-        /// sec.9.1.1).
-        pub(crate) fn sign_pss_sha256(
-            &self,
-            message: &[u8],
-            salt: &[u8; PSS_SHA256_SALT_BYTES],
-        ) -> Vec<u8> {
+        /// MGF1-SHA-256 and `salt` of any length the modulus holds (RFC
+        /// 8017 sec.8.1.1, EMSA-PSS sec.9.1.1).
+        pub(crate) fn sign_pss_sha256(&self, message: &[u8], salt: &[u8]) -> Vec<u8> {
             let encoded_bits = self.modulus.bit_length().saturating_sub(1);
             let encoded_len = encoded_bits.div_ceil(BITS_PER_BYTE_USIZE);
             let mut hasher = Sha256::new();
@@ -1069,7 +1064,7 @@ pub(crate) mod signing {
             hasher.update(salt);
             let hash = hasher.finalize();
             let db_len = encoded_len - SHA256_OUTPUT_BYTES - 1;
-            let mut db = vec![0_u8; db_len - PSS_SHA256_SALT_BYTES - 1];
+            let mut db = vec![0_u8; db_len - salt.len() - 1];
             db.push(PSS_DB_SEPARATOR);
             db.extend_from_slice(salt);
             let mask = mgf1_sha256(&hash, db_len).expect("the mask length is in range");

@@ -657,10 +657,12 @@ impl Signature<EcdsaDer> {
 impl EcdsaHelpers {
     /// The magnitude of a positive, minimally encoded DER `INTEGER`
     /// body (X.690 sec.8.3.2), or [`EcdsaError::BadSignature`] for an
-    /// empty, negative or padded one.
+    /// empty, zero, negative or padded one: an ECDSA `r` or `s` lies
+    /// in `[1, n-1]` (FIPS 186-4 sec.6.4.2).
     fn positive_magnitude(value: &[u8]) -> Result<&[u8], EcdsaError> {
         match value {
             [first, ..] if first & HIGH_BIT_SET != 0 => Err(EcdsaError::BadSignature),
+            [DER_SIGN_PAD] => Err(EcdsaError::BadSignature),
             [DER_SIGN_PAD, second, ..] if second & HIGH_BIT_SET == 0 => {
                 Err(EcdsaError::BadSignature)
             }
@@ -1842,6 +1844,8 @@ mod tests {
             pair([integer(&[DER_SIGN_PAD, 1]), one.clone()].concat()),
             pair([integer(&[HIGH_BIT_SET]), one.clone()].concat()),
             pair([integer(&[]), one.clone()].concat()),
+            pair([integer(&[DER_SIGN_PAD]), one.clone()].concat()),
+            pair([one.clone(), integer(&[DER_SIGN_PAD])].concat()),
         ] {
             assert_eq!(
                 malformed.parse_ecdsa_signature(),

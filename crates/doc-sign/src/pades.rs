@@ -385,22 +385,12 @@ fn prepare_kind(
         return Err(PdfError::NotAPdf);
     }
     let index = PdfIndex::parse(pdf)?;
+    // The index refuses an encrypted document: the update this writer
+    // produces carries no crypt filter, so it would be unreadable.
     let trailer = index.trailer();
-    // An encrypted document needs every string and stream written
-    // under its own crypt filter. This writer emits neither, so the
-    // update it produces would be unreadable -- refuse rather than
-    // hand back something that opens and then fails.
-    if PdfDictionary::parse(trailer)
-        .map_err(|_ignored| PdfError::MissingTrailer)?
-        .entry(b"Encrypt")
-        .map_err(|_ignored| PdfError::MissingTrailer)?
-        .is_some()
-    {
-        return Err(PdfError::UnsupportedEncryption);
-    }
-    let catalog_number = dictionary_reference(trailer, b"/Root")
-        .ok_or(PdfError::MissingCatalogReference)?
-        .number;
+    let catalog =
+        dictionary_reference(trailer, b"/Root").ok_or(PdfError::MissingCatalogReference)?;
+    let catalog_number = catalog.number;
     let next_object = dictionary_integer(trailer, b"/Size").unwrap_or(0).max(1);
 
     // Object numbers for what the update adds.
@@ -408,14 +398,15 @@ fn prepare_kind(
     let field_number = next_object.saturating_add(1);
     let rendered_appearance = rendered_signature_appearance(kind, metadata);
     let new_size = field_number.saturating_add(if rendered_appearance.is_some() { 3 } else { 1 });
+    let catalog_reference = catalog;
     let catalog = index
-        .object_body(catalog_number)
+        .object_body_reference(catalog_reference)
         .ok_or(PdfError::MissingObject(catalog_number))?;
     let field_name = unique_field_name(&index, &catalog, kind, signature_number)?;
     let (page_number, page) = signature_page(&index, &catalog, rendered_appearance.is_some())?;
 
     let mut update = Vec::new();
-    let mut offsets: Vec<(u32, usize)> = Vec::new();
+    let mut offsets: Vec<(PdfObjectReference, usize)> = Vec::new();
     let base = pdf.len();
 
     // The original file must end with a newline before the update, or
@@ -427,7 +418,7 @@ fn prepare_kind(
     let update_start = out.len();
 
     // --- the signature dictionary, with placeholders ------------------
-    offsets.push((signature_number, update_start));
+    offsets.push((PdfObjectReference::fresh(signature_number), update_start));
     push_dictionary_head(&mut update, signature_number, kind, metadata);
     update.extend_from_slice(b"/ByteRange [");
     let byte_range_at = update_start.saturating_add(update.len());
@@ -453,7 +444,10 @@ fn prepare_kind(
         &field_name,
         rendered_appearance.as_ref(),
     ) {
-        offsets.push((number, update_start.saturating_add(update.len())));
+        offsets.push((
+            PdfObjectReference::fresh(number),
+            update_start.saturating_add(update.len()),
+        ));
         update.extend_from_slice(&object);
     }
 
@@ -468,7 +462,10 @@ fn prepare_kind(
     // is unverifiable exactly where it matters.
     match plan_annotation(&page, field_number) {
         AnnotsTarget::Page(body) => {
-            offsets.push((page_number, update_start.saturating_add(update.len())));
+            offsets.push((
+                PdfObjectReference::fresh(page_number),
+                update_start.saturating_add(update.len()),
+            ));
             update.extend_from_slice(format!("{page_number} 0 obj\n").as_bytes());
             update.extend_from_slice(&body);
             update.extend_from_slice(b"\nendobj\n");
@@ -479,7 +476,10 @@ fn prepare_kind(
                 .ok_or(PdfError::MissingObject(array_number))?;
             let entry = format!("{field_number} 0 R");
             let body = append_to_array(&array, 0, &entry);
-            offsets.push((array_number, update_start.saturating_add(update.len())));
+            offsets.push((
+                PdfObjectReference::fresh(array_number),
+                update_start.saturating_add(update.len()),
+            ));
             update.extend_from_slice(format!("{array_number} 0 obj\n").as_bytes());
             update.extend_from_slice(&body);
             update.extend_from_slice(b"\nendobj\n");
@@ -487,12 +487,12 @@ fn prepare_kind(
     }
 
     // --- the catalog, reissued with an AcroForm -----------------------
-    let (edited_number, edited_body) = match plan_field_list(&index, &catalog, field_number) {
-        FieldListTarget::Catalog(body) => (catalog_number, body),
-        FieldListTarget::Object(number, body) => (number, body),
+    let (edited, edited_body) = match plan_field_list(&index, &catalog, field_number) {
+        FieldListTarget::Catalog(body) => (catalog_reference, body),
+        FieldListTarget::Object(number, body) => (PdfObjectReference::fresh(number), body),
     };
-    offsets.push((edited_number, update_start.saturating_add(update.len())));
-    update.extend_from_slice(format!("{edited_number} 0 obj\n").as_bytes());
+    offsets.push((edited, update_start.saturating_add(update.len())));
+    update.extend_from_slice(format!("{} obj\n", edited.header()).as_bytes());
     update.extend_from_slice(&edited_body);
     update.extend_from_slice(b"\nendobj\n");
 
@@ -502,7 +502,7 @@ fn prepare_kind(
         update_start,
         &mut offsets,
         new_size,
-        catalog_number,
+        catalog_reference,
         &index,
     )?;
 
@@ -770,14 +770,14 @@ fn finish_placeholder(
 fn push_xref_and_trailer(
     update: &mut Vec<u8>,
     update_start: usize,
-    offsets: &mut [(u32, usize)],
+    offsets: &mut [(PdfObjectReference, usize)],
     size: u32,
-    catalog_number: u32,
+    catalog: PdfObjectReference,
     index: &PdfIndex<'_>,
 ) -> Result<(), PdfError> {
     let previous_xref = index.start_xref();
     let xref_at = update_start.saturating_add(update.len());
-    offsets.sort_unstable_by_key(|(number, _)| *number);
+    offsets.sort_unstable_by_key(|(reference, _)| reference.number);
     let carried = trailer_carry_forward(index.trailer());
     if index.newest_is_stream() {
         return xref_stream::push_stream_close(
@@ -785,7 +785,7 @@ fn push_xref_and_trailer(
             xref_at,
             offsets,
             size,
-            catalog_number,
+            catalog,
             previous_xref,
             &carried,
         );
@@ -793,8 +793,9 @@ fn push_xref_and_trailer(
     update.extend_from_slice(&cross_reference_section(offsets));
     update.extend_from_slice(
         format!(
-            "trailer\n<< /Size {size} /Root {catalog_number} 0 R /Prev {previous_xref}{carried}\
-             >>\nstartxref\n{xref_at}\n%%EOF\n"
+            "trailer\n<< /Size {size} /Root {} /Prev {previous_xref}{carried}\
+             >>\nstartxref\n{xref_at}\n%%EOF\n",
+            catalog.rendered()
         )
         .as_bytes(),
     );
@@ -1228,7 +1229,7 @@ struct ValidationObjectNumbers {
 /// Objects that make the newest catalog point at the merged store.
 struct ValidationStorePlan {
     next_object: u32,
-    objects: Vec<(u32, Vec<u8>)>,
+    objects: Vec<(PdfObjectReference, Vec<u8>)>,
 }
 
 /// Emit one stream for each distinct new evidence blob.
@@ -1237,14 +1238,17 @@ fn emit_validation_blobs(
     next_object: &mut u32,
     update_start: usize,
     update: &mut Vec<u8>,
-    offsets: &mut Vec<(u32, usize)>,
+    offsets: &mut Vec<(PdfObjectReference, usize)>,
 ) -> Vec<u32> {
     let unique = ordered_unique_blobs(blobs);
     let mut numbers = Vec::with_capacity(unique.len());
     for blob in unique {
         let number = *next_object;
         *next_object = (*next_object).saturating_add(1);
-        offsets.push((number, update_start.saturating_add(update.len())));
+        offsets.push((
+            PdfObjectReference::fresh(number),
+            update_start.saturating_add(update.len()),
+        ));
         update.extend_from_slice(
             format!("{number} 0 obj\n<< /Length {} >>\nstream\n", blob.len()).as_bytes(),
         );
@@ -1259,7 +1263,7 @@ fn emit_validation_blobs(
 fn validation_store_plan(
     index: &PdfIndex<'_>,
     catalog: &[u8],
-    catalog_number: u32,
+    catalog_reference: PdfObjectReference,
     next_object: u32,
     numbers: &ValidationObjectNumbers,
 ) -> Result<ValidationStorePlan, PdfError> {
@@ -1272,7 +1276,7 @@ fn validation_store_plan(
             next_object: next_object.saturating_add(1),
             objects: vec![
                 (
-                    store_number,
+                    PdfObjectReference::fresh(store_number),
                     validation_store_body(
                         &numbers.certificates,
                         &numbers.ocsp_responses,
@@ -1280,7 +1284,7 @@ fn validation_store_plan(
                     ),
                 ),
                 (
-                    catalog_number,
+                    catalog_reference,
                     insert_dictionary_entry(catalog, dictionary.closing, entry.as_bytes()),
                 ),
             ],
@@ -1291,9 +1295,6 @@ fn validation_store_plan(
         .get(value_span.clone())
         .ok_or(PdfError::UnreadableValidationStore)?;
     if let Some(reference) = complete_object_reference(value)? {
-        if reference.generation != 0 {
-            return Err(PdfError::UnreadableValidationStore);
-        }
         let store = index
             .object_body_reference(reference)
             .ok_or(PdfError::MissingObject(reference.number))?;
@@ -1306,7 +1307,7 @@ fn validation_store_plan(
         )?;
         return Ok(ValidationStorePlan {
             next_object,
-            objects: vec![(reference.number, merged)],
+            objects: vec![(reference, merged)],
         });
     }
 
@@ -1322,9 +1323,9 @@ fn validation_store_plan(
     Ok(ValidationStorePlan {
         next_object: next_object.saturating_add(1),
         objects: vec![
-            (store_number, merged),
+            (PdfObjectReference::fresh(store_number), merged),
             (
-                catalog_number,
+                catalog_reference,
                 replace_bytes(catalog, value_span, entry.as_bytes()),
             ),
         ],
@@ -1359,9 +1360,8 @@ pub fn append_validation_store(
     }
     let index = PdfIndex::parse(signed_pdf)?;
     let trailer = index.trailer();
-    let catalog_number = dictionary_reference(trailer, b"/Root")
-        .ok_or(PdfError::MissingCatalogReference)?
-        .number;
+    let catalog_reference =
+        dictionary_reference(trailer, b"/Root").ok_or(PdfError::MissingCatalogReference)?;
     let mut next_object = dictionary_integer(trailer, b"/Size").unwrap_or(0).max(1);
 
     let mut out = signed_pdf.to_vec();
@@ -1370,7 +1370,7 @@ pub fn append_validation_store(
     }
     let update_start = out.len();
     let mut update = Vec::new();
-    let mut offsets: Vec<(u32, usize)> = Vec::new();
+    let mut offsets: Vec<(PdfObjectReference, usize)> = Vec::new();
 
     // Streams carry binary DER without PDF-string transcoding.
     let numbers = ValidationObjectNumbers {
@@ -1398,9 +1398,9 @@ pub fn append_validation_store(
     };
 
     let catalog = index
-        .object_body(catalog_number)
-        .ok_or(PdfError::MissingObject(catalog_number))?;
-    let plan = validation_store_plan(&index, &catalog, catalog_number, next_object, &numbers)
+        .object_body_reference(catalog_reference)
+        .ok_or(PdfError::MissingObject(catalog_reference.number))?;
+    let plan = validation_store_plan(&index, &catalog, catalog_reference, next_object, &numbers)
         .map_err(|error| match error {
             PdfError::MalformedValue | PdfError::NestingTooDeep => {
                 PdfError::UnreadableValidationStore
@@ -1408,9 +1408,9 @@ pub fn append_validation_store(
             other => other,
         })?;
     next_object = plan.next_object;
-    for (number, body) in plan.objects {
-        offsets.push((number, update_start.saturating_add(update.len())));
-        update.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+    for (reference, body) in plan.objects {
+        offsets.push((reference, update_start.saturating_add(update.len())));
+        update.extend_from_slice(format!("{} obj\n", reference.header()).as_bytes());
         update.extend_from_slice(&body);
         update.extend_from_slice(b"\nendobj\n");
     }
@@ -1420,7 +1420,7 @@ pub fn append_validation_store(
         update_start,
         &mut offsets,
         next_object,
-        catalog_number,
+        catalog_reference,
         &index,
     )?;
     out.extend_from_slice(&update);
@@ -1452,10 +1452,16 @@ fn write_byte_range(document: &mut [u8], at: usize, values: [usize; 4]) {
 /// Written as one subsection per object so the numbers need not be
 /// contiguous -- the catalog keeps its original number while the new
 /// objects take fresh ones at the end.
-fn cross_reference_section(offsets: &[(u32, usize)]) -> Vec<u8> {
+fn cross_reference_section(offsets: &[(PdfObjectReference, usize)]) -> Vec<u8> {
     let mut out = Vec::from("xref\n");
-    for (number, offset) in offsets {
-        out.extend_from_slice(format!("{number} 1\n{offset:010} 00000 n \n").as_bytes());
+    for (reference, offset) in offsets {
+        out.extend_from_slice(
+            format!(
+                "{} 1\n{offset:010} {:05} n \n",
+                reference.number, reference.generation
+            )
+            .as_bytes(),
+        );
     }
     out
 }

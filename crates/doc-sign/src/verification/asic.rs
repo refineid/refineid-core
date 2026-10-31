@@ -73,6 +73,27 @@ const EXTENSION_XML: &str = ".xml";
 /// Extension of a detached `CMS` signature.
 const EXTENSION_P7S: &str = ".p7s";
 
+/// The other extension a `CAdES` signature file may carry (EN 319 162-1
+/// clause 4.4.3.1).
+const EXTENSION_P7M: &str = ".p7m";
+
+/// The OpenDocument manifest, `META-INF/manifest.xml`.
+const OPENDOCUMENT_MANIFEST: &str = "manifest.xml";
+
+/// `META-INF/container.xml`.
+const CONTAINER_XML: &str = "container.xml";
+
+/// What an `ASiCArchiveManifest` file's name contains (EN 319 162-1
+/// annex A.6).
+const ARCHIVE_MANIFEST_NAME_PART: &str = "ASiCArchiveManifest";
+
+/// What a time-stamp token file's name contains (EN 319 162-1 clause
+/// 4.4.3.3).
+const TIMESTAMP_NAME_PART: &str = "timestamp";
+
+/// Extension of a time-stamp token file.
+const EXTENSION_TST: &str = ".tst";
+
 /// Root element of an `ASiCManifest` (EN 319 162-1 annex A.5).
 const ELEMENT_MANIFEST: &str = "ASiCManifest";
 
@@ -221,6 +242,14 @@ pub enum AsicReadError {
     /// The `mimetype` entry names a media type other than `ASiC-E` or
     /// `BDOC`.
     UnknownMimetype,
+    /// `META-INF` holds an entry this reader does not name, or a
+    /// subdirectory.
+    UnexpectedMetadata,
+    /// The container holds no data object (EN 319 162-1 clause 4.2).
+    NoDataObjects,
+    /// An `ASiCManifest` binds a signature the container does not
+    /// hold, or two manifests bind the same signature.
+    ManifestConflict,
 }
 
 impl core::fmt::Display for AsicReadError {
@@ -232,6 +261,13 @@ impl core::fmt::Display for AsicReadError {
             Self::MissingMimetype => f.write_str("unsupported container: no mimetype entry"),
             Self::UnknownMimetype => {
                 f.write_str("unsupported container: the mimetype is neither ASiC-E nor BDOC")
+            }
+            Self::UnexpectedMetadata => {
+                f.write_str("unsupported container: an unknown entry in META-INF")
+            }
+            Self::NoDataObjects => f.write_str("malformed container: no data object"),
+            Self::ManifestConflict => {
+                f.write_str("malformed container: a manifest binds a signature ambiguously")
             }
         }
     }
@@ -363,26 +399,53 @@ impl AsicContainer {
                 data_files.push(entry);
                 continue;
             };
-            // Signature files sit directly in META-INF, not below it.
+            // Every entry of META-INF is one this reader names, and sits
+            // directly in it.
             if inside.contains(ENTRY_SEPARATOR) {
-                continue;
+                return Err(AsicReadError::UnexpectedMetadata);
             }
             if inside.contains(XADES_NAME_PART) && inside.ends_with(EXTENSION_XML) {
                 xades_signature_files.push(entry);
-            } else if inside.contains(CADES_NAME_PART) && inside.ends_with(EXTENSION_P7S) {
+            } else if inside.contains(CADES_NAME_PART)
+                && (inside.ends_with(EXTENSION_P7S) || inside.ends_with(EXTENSION_P7M))
+            {
                 cades_files.push(entry);
             } else if inside.contains(MANIFEST_NAME_PART) && inside.ends_with(EXTENSION_XML) {
                 manifests.push(entry);
+            } else if !is_passive_metadata(inside) {
+                return Err(AsicReadError::UnexpectedMetadata);
             }
         }
         let mimetype = mimetype.ok_or(AsicReadError::MissingMimetype)?;
+        if data_files.is_empty() {
+            return Err(AsicReadError::NoDataObjects);
+        }
+        // Each manifest with exactly one SigReference binds that one
+        // signature; one naming no signature here, or a second manifest
+        // binding a signature already bound, is refused.
+        let mut bound: Vec<(String, Entry)> = Vec::new();
+        for manifest in manifests {
+            let Some(reference) = sole_signature_reference(&manifest) else {
+                continue;
+            };
+            let Some(signature) = cades_files
+                .iter()
+                .find(|signature| uri_names(&reference, &signature.name))
+            else {
+                return Err(AsicReadError::ManifestConflict);
+            };
+            if bound.iter().any(|(name, _)| *name == signature.name) {
+                return Err(AsicReadError::ManifestConflict);
+            }
+            bound.push((signature.name.clone(), manifest));
+        }
         let cades_signatures = cades_files
             .into_iter()
             .map(|signature| {
-                let manifest = manifests
+                let manifest = bound
                     .iter()
-                    .find(|manifest| manifest_names(manifest, &signature.name))
-                    .cloned();
+                    .find(|(name, _)| *name == signature.name)
+                    .map(|(_, manifest)| manifest.clone());
                 CadesEntry {
                     signature,
                     manifest,
@@ -451,21 +514,17 @@ impl AsicContainer {
         if !root.is(NAMESPACE_ASIC, ELEMENT_MANIFEST) {
             return false;
         }
-        let mut sig_references = root.children_named(NAMESPACE_ASIC, ELEMENT_SIG_REFERENCE);
-        let names_signature = match (sig_references.next(), sig_references.next()) {
-            (Some(reference), None) => reference
-                .attribute(ATTRIBUTE_URI)
-                .and_then(percent_decode)
-                .is_some_and(|uri| uri == entry.signature.name),
-            _ => false,
-        };
+        let names_signature = sole_signature_reference(manifest)
+            .is_some_and(|reference| uri_names(&reference, &entry.signature.name));
         let mut referenced: HashSet<&str> = HashSet::new();
+        let mut references = 0_usize;
         for reference in root.children_named(NAMESPACE_ASIC, ELEMENT_DATA_OBJECT_REFERENCE) {
-            let Some(file) = reference
-                .attribute(ATTRIBUTE_URI)
-                .and_then(percent_decode)
-                .and_then(|name| self.data_file(&name))
-            else {
+            references = references.saturating_add(1);
+            let Some(file) = reference.attribute(ATTRIBUTE_URI).and_then(|uri| {
+                self.data_files
+                    .iter()
+                    .find(|file| uri_names(uri, &file.name))
+            }) else {
                 return false;
             };
             let Some(method) = reference
@@ -487,6 +546,7 @@ impl AsicContainer {
             referenced.insert(&file.name);
         }
         names_signature
+            && references > 0
             && self
                 .data_files
                 .iter()
@@ -494,21 +554,39 @@ impl AsicContainer {
     }
 }
 
-/// Whether `manifest` is an `ASiCManifest` whose `SigReference` names
-/// the entry `signature_name`. A manifest that does not parse names
-/// nothing.
-fn manifest_names(manifest: &Entry, signature_name: &str) -> bool {
-    let Ok(document) = XmlDocument::parse(manifest.content.clone()) else {
-        return false;
-    };
+/// The URI of the one `SigReference` of `manifest`, when it is an
+/// `ASiCManifest` holding exactly one; `None` for a manifest that does
+/// not parse or holds none or several.
+fn sole_signature_reference(manifest: &Entry) -> Option<String> {
+    let document = XmlDocument::parse(manifest.content.clone()).ok()?;
     let root = document.root();
     if !root.is(NAMESPACE_ASIC, ELEMENT_MANIFEST) {
-        return false;
+        return None;
     }
-    root.children_named(NAMESPACE_ASIC, ELEMENT_SIG_REFERENCE)
-        .filter_map(|reference| reference.attribute(ATTRIBUTE_URI))
-        .filter_map(percent_decode)
-        .any(|uri| uri == signature_name)
+    let mut references = root.children_named(NAMESPACE_ASIC, ELEMENT_SIG_REFERENCE);
+    match (references.next(), references.next()) {
+        (Some(reference), None) => reference.attribute(ATTRIBUTE_URI).map(str::to_owned),
+        _ => None,
+    }
+}
+
+/// Whether the reference `uri` names the entry `name`: percent-decoded
+/// (RFC 3986 sec.2.1), or as written, since producers differ on
+/// escaping entry names.
+pub(crate) fn uri_names(uri: &str, name: &str) -> bool {
+    uri == name || percent_decode(uri).is_some_and(|decoded| decoded == name)
+}
+
+/// Whether `inside`, a name directly in META-INF, is metadata the
+/// container may carry and this reader does not judge: the OpenDocument
+/// manifest a `BDOC` carries, the `container.xml` of the OEBPS profile,
+/// archive manifests and the timestamp tokens over them (EN 319 162-1
+/// clause 4.4.3.3 and annex A.6).
+fn is_passive_metadata(inside: &str) -> bool {
+    inside == OPENDOCUMENT_MANIFEST
+        || inside == CONTAINER_XML
+        || (inside.contains(ARCHIVE_MANIFEST_NAME_PART) && inside.ends_with(EXTENSION_XML))
+        || (inside.contains(TIMESTAMP_NAME_PART) && inside.ends_with(EXTENSION_TST))
 }
 
 /// Decode `%XX` escapes in a reference URI (RFC 3986 sec.2.1) into the
@@ -1081,9 +1159,9 @@ impl<'a> Cursor<'a> {
 mod tests {
     use super::{
         AsicContainer, AsicReadError, DOS_DIRECTORY_ATTRIBUTE, EXTRA_UNICODE_PATH, EXTRA_ZIP64,
-        FLAG_DATA_DESCRIPTOR, FLAG_ENCRYPTED, METHOD_DEFLATED, MIMETYPE_BDOC, Mimetype,
+        Entry, FLAG_DATA_DESCRIPTOR, FLAG_ENCRYPTED, METHOD_DEFLATED, MIMETYPE_BDOC, Mimetype,
         SIGNATURE_DATA_DESCRIPTOR, UNIX_DIRECTORY, UNIX_MODE_SHIFT, UNIX_REGULAR_FILE,
-        UNIX_SYMBOLIC_LINK, percent_decode,
+        UNIX_SYMBOLIC_LINK, percent_decode, uri_names,
     };
     use crate::asic::{DataObject, MIMETYPE_ASICE, MIMETYPE_ENTRY, crc32, plan};
     use crate::cades::DigestAlgorithm;
@@ -1447,7 +1525,9 @@ mod tests {
             Some(AsicReadError::UnknownMimetype)
         );
 
-        let bdoc = raw::Archive::with_mimetype(MIMETYPE_ENTRY.as_bytes(), MIMETYPE_BDOC.as_bytes());
+        let mut bdoc =
+            raw::Archive::with_mimetype(MIMETYPE_ENTRY.as_bytes(), MIMETYPE_BDOC.as_bytes());
+        bdoc.add(FIRST_NAME, TEXT);
         assert_eq!(
             parse(&bdoc.finish()).map(|container| container.mimetype()),
             Ok(Mimetype::Bdoc)
@@ -1687,9 +1767,10 @@ mod tests {
 
         let mut folder = raw::Declared::truthful(b"folder/", b"");
         folder.external = mode(UNIX_DIRECTORY);
-        assert!(
-            parse(&single(b"", &folder)).is_ok(),
-            "a real directory entry"
+        assert_eq!(
+            parse(&single(b"", &folder)).err(),
+            Some(AsicReadError::NoDataObjects),
+            "a real directory entry reads and is no data object"
         );
         assert_eq!(
             malformed(&single(TEXT, &raw::Declared::truthful(b"folder/", TEXT))),
@@ -1801,14 +1882,175 @@ mod tests {
             "URI=\"META-INF/signature2.p7s\"",
         );
         assert!(other_signature.as_str() != manifest);
-        let container = cades_container(&signed_objects(), Some(other_signature.into_bytes()));
-        let [cades] = exactly(container.cades_signatures(), "one CAdES signature");
-        assert!(
-            cades.manifest().is_none(),
-            "a manifest naming another signature is not paired"
+        assert_eq!(
+            cades_archive(&signed_objects(), &[other_signature.into_bytes()]).err(),
+            Some(AsicReadError::ManifestConflict),
+            "a manifest naming a signature the container does not hold"
         );
+    }
+
+    /// A `CAdES` container with `objects` and the manifests
+    /// `manifests`, named in turn, read back.
+    fn cades_archive(
+        objects: &[DataObject],
+        manifests: &[Vec<u8>],
+    ) -> Result<AsicContainer, AsicReadError> {
+        let mut archive = container();
+        for object in objects {
+            archive.add(object.name.as_bytes(), &object.content);
+        }
+        for (index, manifest) in manifests.iter().enumerate() {
+            let name = if index == 0 {
+                MANIFEST_NAME.to_owned()
+            } else {
+                format!("META-INF/ASiCManifest{index}.xml")
+            };
+            archive.add(name.as_bytes(), manifest);
+        }
+        archive.add(CADES_NAME.as_bytes(), CMS);
+        parse(&archive.finish())
+    }
+
+    /// The writer's manifest over [`signed_objects`].
+    fn writers_manifest() -> String {
+        String::from_utf8(
+            plan(signed_objects(), DigestAlgorithm::Sha256)
+                .manifest()
+                .to_vec(),
+        )
+        .expect("utf-8")
+    }
+
+    #[test]
+    fn a_decoy_with_two_sig_references_binds_nothing() {
+        let manifest = writers_manifest();
+        let reference = format!("<asic:SigReference URI=\"{CADES_NAME}\"");
+        let at = manifest
+            .find(&reference)
+            .expect("the writer names the signature");
+        let close = at + manifest[at..].find("/>").expect("self-closed") + "/>".len();
+        let element = &manifest[at..close];
+        let decoy = manifest.replacen(element, &format!("{element}{element}"), 1);
+        assert!(decoy.matches("SigReference").count() > manifest.matches("SigReference").count());
+        // The decoy comes first, the writer's manifest second.
+        let container = cades_archive(
+            &signed_objects(),
+            &[decoy.into_bytes(), manifest.clone().into_bytes()],
+        )
+        .expect("reads");
+        let [cades] = exactly(container.cades_signatures(), "one CAdES signature");
+        assert_eq!(
+            cades.manifest().map(Entry::content),
+            Some(manifest.as_bytes())
+        );
+        assert!(container.manifest_intact(cades));
+    }
+
+    #[test]
+    fn two_manifests_binding_one_signature_are_refused() {
+        let manifest = writers_manifest().into_bytes();
+        assert_eq!(
+            cades_archive(&signed_objects(), &[manifest.clone(), manifest]).err(),
+            Some(AsicReadError::ManifestConflict)
+        );
+    }
+
+    #[test]
+    fn a_manifest_without_data_object_references_is_not_intact() {
+        let empty = writers_manifest_without_references();
+        assert!(!String::from_utf8_lossy(&empty).contains("DataObjectReference"));
+        assert_eq!(
+            cades_archive(&[], core::slice::from_ref(&empty)).err(),
+            Some(AsicReadError::NoDataObjects),
+            "a container without data objects"
+        );
+        let container = cades_archive(&signed_objects(), &[writers_manifest_without_references()])
+            .expect("reads");
+        let [cades] = exactly(container.cades_signatures(), "one CAdES signature");
         assert!(!container.manifest_intact(cades));
     }
+
+    /// The writer's manifest with every `DataObjectReference` removed.
+    fn writers_manifest_without_references() -> Vec<u8> {
+        let manifest = writers_manifest();
+        let first = manifest
+            .find("<asic:DataObjectReference")
+            .expect("references");
+        let last = manifest
+            .rfind("</asic:DataObjectReference>")
+            .expect("references")
+            + "</asic:DataObjectReference>".len();
+        format!("{}{}", &manifest[..first], &manifest[last..]).into_bytes()
+    }
+
+    #[test]
+    fn unknown_metadata_and_subdirectories_of_meta_inf_are_refused() {
+        for name in ["META-INF/notes.txt", "META-INF/sub/signatures0.xml"] {
+            let mut archive = container();
+            archive.add(FIRST_NAME, TEXT);
+            archive.add(name.as_bytes(), b"<x/>");
+            assert_eq!(
+                parse(&archive.finish()).err(),
+                Some(AsicReadError::UnexpectedMetadata),
+                "{name}"
+            );
+        }
+        for name in ["META-INF/manifest.xml", "META-INF/container.xml"] {
+            let mut archive = container();
+            archive.add(FIRST_NAME, TEXT);
+            archive.add(name.as_bytes(), b"<x/>");
+            assert!(parse(&archive.finish()).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_p7m_signature_file_is_a_cades_signature() {
+        let manifest = writers_manifest().replace(CADES_NAME, P7M_NAME);
+        let mut archive = container();
+        for object in signed_objects() {
+            archive.add(object.name.as_bytes(), &object.content);
+        }
+        archive.add(MANIFEST_NAME.as_bytes(), manifest.as_bytes());
+        archive.add(P7M_NAME.as_bytes(), CMS);
+        let container = parse(&archive.finish()).expect("reads");
+        let [cades] = exactly(container.cades_signatures(), "one CAdES signature");
+        assert_eq!(cades.signature().name(), P7M_NAME);
+        assert!(container.manifest_intact(cades));
+    }
+
+    #[test]
+    fn a_reference_matches_an_entry_name_raw_or_decoded() {
+        assert!(uri_names("a%20b.txt", "a b.txt"));
+        assert!(uri_names("a%20b.txt", "a%20b.txt"));
+        assert!(!uri_names("a%20b.txt", "a%2520b.txt"));
+        let objects = vec![DataObject {
+            name: LITERAL_ESCAPE_NAME.to_owned(),
+            mime_type: "text/plain".to_owned(),
+            content: TEXT.to_vec(),
+        }];
+        let manifest = String::from_utf8(
+            plan(objects.clone(), DigestAlgorithm::Sha256)
+                .manifest()
+                .to_vec(),
+        )
+        .expect("utf-8");
+        // A producer that writes the name unescaped.
+        let raw = manifest.replace(
+            &format!("URI=\"{}\"", LITERAL_ESCAPE_NAME.replace('%', "%25")),
+            &format!("URI=\"{LITERAL_ESCAPE_NAME}\""),
+        );
+        for written in [manifest, raw] {
+            let container = cades_archive(&objects, &[written.into_bytes()]).expect("reads");
+            let [cades] = exactly(container.cades_signatures(), "one CAdES signature");
+            assert!(container.manifest_intact(cades));
+        }
+    }
+
+    /// A `CAdES` signature file with the `.p7m` extension.
+    const P7M_NAME: &str = "META-INF/signature.p7m";
+
+    /// An entry name holding a literal percent escape.
+    const LITERAL_ESCAPE_NAME: &str = "a%20b.txt";
 
     /// LATIN SMALL LETTER A WITH DIAERESIS, which UTF-8 spells as the
     /// two octets `%C3%A4` escape.

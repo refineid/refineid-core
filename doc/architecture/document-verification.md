@@ -62,13 +62,20 @@ For each signature the report carries independent facts:
 
 - **Document intact.** Every byte the signature claims to cover digests
   to the value the signature states. For PDFs this is the ByteRange,
-  whose hole must be exactly this dictionary's own Contents and whose
-  trailing bytes must be zero padding. For XAdES, every Reference
-  recomputes, the SignedProperties reference resolves to this
-  signature, and every data file in the container is covered. For
-  CAdES in a container, the ASiCManifest references every data file
-  and each digest recomputes. A reference the verifier cannot resolve
-  or canonicalise fails this fact; it never passes.
+  whose hole must be exactly this dictionary's own Contents, whose
+  trailing bytes must be zero padding, and which must end where a
+  revision ends, just after an `%%EOF` marker and its end-of-line; a
+  range cut elsewhere signs part of a revision and is an unsupported
+  row. Signature dictionaries are found in every cross-reference
+  section, so a signature a later revision freed or replaced is still
+  a row. For XAdES, every Reference recomputes, the SignedProperties
+  reference resolves to this signature, and every data file in the
+  container is covered; a reference URI names an entry percent-decoded
+  or as written. For CAdES in a container, the ASiCManifest that binds
+  the signature (one manifest with exactly one SigReference naming it)
+  references every data file and at least one, and each digest
+  recomputes. A reference the verifier cannot resolve fails this fact;
+  it never passes.
 - **Signature valid.** The CMS or XML signature verifies under the
   signer's public key, with the digest algorithm taken from the
   SignerInfo, the signature algorithm's hash equal to it, algorithm
@@ -88,13 +95,27 @@ For each signature the report carries independent facts:
   OCSP and CRL signers. A signature algorithm whose hash differs from
   the digest algorithm, or whose parameters break RFC 5754 or RFC
   5758, makes the signature unsupported; a scheme that does not fit
-  the signer key makes it not valid.
+  the signer key makes it not valid. The content-type signed
+  attribute must be present once and name `id-data`: absent, the CMS
+  structure is refused as unsupported; another type is not valid. In
+  XAdES a SignatureMethod or DigestMethod the verifier does not know,
+  a canonicalisation other than Exclusive XML Canonicalization (with
+  or without an `InclusiveNamespaces` prefix list, which is applied),
+  and a Reference with more than one transform or a transform over a
+  data file make the signature unsupported. A SigningCertificate
+  binding that names a certificate the signature does not carry leaves
+  it without a signer, and an unsupported row.
 - **Chain verified.** A path from the signer certificate to a trust
   anchor whose role is certificate issuing and whose granted period
   covers the validation time, built offline from the material pool:
   name chaining, signatures, validity at the validation time, basic
-  constraints, key usage, path length, no name constraints, depth
-  bound. Every certificate below the anchor is checked for revocation.
+  constraints, key usage, path length, no name constraints, no critical
+  extension the verifier does not process, depth bound. The signer
+  itself must be no CA, with a Key Usage that, when present, asserts
+  digitalSignature or nonRepudiation. Every anchored path is judged and
+  the best revocation outcome kept, good before unavailable before
+  revoked (RFC 5280 sec.6 accepts any valid path). Every certificate
+  below the anchor is checked for revocation.
 - **Proof of existence.** The earliest time proven by a timestamp whose
   authority chains to a trust anchor with the time-stamping role: a
   signature-time-stamp attribute over the signature value, a XAdES
@@ -103,35 +124,50 @@ For each signature the report carries independent facts:
   verifies under its own TSTInfo imprint algorithm and its signer must
   carry the time-stamping extended key usage, not be a CA, and be valid
   at the token's time. Its path to the anchor is judged at the token's
-  time from the document's evidence and the token's own certificates;
-  an authority revoked at or before that time is not anchored. A token
+  time from the document's evidence and the token's own certificates
+  and revocation answers; an authority revoked at or before that time
+  is not anchored, and one whose revocation is unavailable is
+  anchored, the same rule a signature follows. A token
   whose authority is not anchored is shown with its claimed time and
   marked unproven; it moves nothing and blocks nothing. Only the
   `signature-time-stamp` attribute counts as a CAdES signature
   timestamp. Archive timestamps of either version, CAdES or XAdES, are
   reported only: counted, never judged, never a proof of existence,
   and never blocking a verdict.
-- **Timestamps.** Each signature timestamp is reported as verified
-  (with its time and whether it is anchored), invalid (with the reason
+- **Timestamps.** Each signature timestamp is reported as anchored
+  (with the time it proves), claimed (verified under an authority that
+  is not anchored, with the time it claims), invalid (with the reason
   the token failed), or unsupported (an XAdES timestamp whose imprint
-  needs a canonicalisation other than Exclusive XML Canonicalization).
-  A signature carrying a signature timestamp that is invalid or
-  unsupported is not valid: the signature claims a proof the verifier
-  could not establish. A verified token whose authority is not
-  anchored blocks nothing.
+  needs a canonicalisation other than Exclusive XML Canonicalization,
+  or a document timestamp whose range does not end a revision).
+  A timestamp that is invalid, unsupported, or verified under an
+  authority that is not anchored is reported and decides nothing: it
+  sets no proof of existence and does not make the signature or the
+  document not valid (EN 319 102-1 clauses 5.4 and 5.6). Timestamps
+  sit in unsigned attributes or later revisions anyone can append, so
+  only the facts of the signature itself decide its verdict.
 - **Validation time.** The proof of existence when there is one,
   otherwise now. Chain validity and revocation are judged at this time.
 - **Revocation.** From the evidence in the file first: OCSP responses
   and CRLs that verify under an authorised responder or the issuer and
   whose window covers the validation time per EN 319 102-1 clause
-  5.2.5. The states are Good with the evidence time, Revoked with the
-  revocation time, and Unavailable. A certificate revoked before the
-  proof of existence makes the signature not valid; one revoked after
-  it does not, because the signature was proven to exist while the
-  certificate was good. Without a proof of existence any revocation
-  counts. OCSP and CRL answers are weighed together: any verified
-  revoked answer outweighs good ones, and the earliest revocation time
-  on the path is reported. The shell may ask the network only for a
+  5.2.5; an answer dated later than the verifier's clock, beyond five
+  minutes of skew, speaks for nothing. An OCSP answer matches its
+  certificate by a SHA-1 or SHA-256 CertID whose issuer hashes are
+  those of the issuer the path names, and a CRL issuer must be a CA
+  whose Key Usage, when present, asserts cRLSign. The states are Good
+  with the evidence time, Revoked with the revocation time and the
+  CRLReason when the evidence gives one, and Unavailable. A
+  certificate revoked before the proof of existence makes the
+  signature not valid; one revoked after it does not, because the
+  signature was proven to exist while the certificate was good, unless
+  the reason is keyCompromise, cACompromise or aACompromise: a
+  compromised key proves nothing about when it signed, so those
+  invalidate whatever the proof of existence. Without a proof of
+  existence any revocation counts. OCSP and CRL answers are weighed
+  together: any verified revoked answer outweighs good ones, a
+  compromise is reported before other reasons, and otherwise the
+  earliest revocation time on the path. The shell may ask the network only for a
   signature still Unavailable on a verified chain, and that answer is
   judged at now: `DocumentReport::with_live_revocation` calls the
   shell's closure for exactly those signatures and applies the answer
@@ -141,13 +177,15 @@ For each signature the report carries independent facts:
   Reported, not judged.
 
 A signature is valid when the document is intact, the signature is
-valid, the chain is verified at the validation time, every timestamp it
-carries verifies, and no revocation before the proof of existence is
-known. A signature the verifier cannot read (unsupported profile,
-algorithm or structure) gets its own row saying so, with a typed
-reason: a PDF subfilter other than the two above, a CMS structure the
-CMS border refuses, a CAdES signature no `ASiCManifest` names, an
-XAdES feature outside the scope, or XAdES signature files that do not
+valid, the chain is verified at the validation time, and no revocation
+that invalidates it is known (see Revocation). A signature the verifier
+cannot read (unsupported profile, algorithm or structure) gets its own
+row saying so, with a typed reason: a PDF subfilter other than the two
+above, a PDF range that does not end a revision, a CMS structure the
+CMS border refuses, a CAdES signature no `ASiCManifest` binds, an
+XAdES feature outside the scope, an XAdES signature without a carried
+signer, one XAdES signature that does not read (its neighbours in the
+same file are still judged), or XAdES signature files that do not
 read.
 
 Each PDF document timestamp is reported with what its token was found
@@ -156,8 +194,7 @@ timestamp credits the signatures whose revision ends where its own
 range starts or earlier.
 
 The document is valid when it has at least one signature, every
-signature is valid, no signature is unsupported, and every document
-timestamp verifies.
+signature is valid, and no signature is unsupported.
 
 ## Signer identity
 
@@ -171,9 +208,16 @@ string beside a flag.
 A file the verifier cannot judge is a typed failure, not a report: not
 a signed document (neither a PDF, a ZIP archive nor a DER SEQUENCE),
 unreadable with the reader's reason, no signatures, or an unsupported
-profile with the reason (a PDF or ZIP feature outside the readers, an
-archive that is not an ASiC-E or BDOC container, or a DER file that is
-not a CMS signature with attached content). A negative verdict is a
+profile with the reason (a PDF or ZIP feature outside the readers,
+encryption in any revision, an archive that is not an ASiC-E or BDOC
+container, a META-INF entry the reader does not name or a
+subdirectory of META-INF, or a DER file that is not a CMS signature
+with attached content). A container without a data object, and one
+whose manifests bind a signature it does not hold or bind one
+signature twice, is unreadable. The META-INF entries a container may
+carry are signature files, ASiC manifests, archive manifests and
+their timestamp tokens, and the OpenDocument `manifest.xml` and
+`container.xml`, which pass unexamined. A negative verdict is a
 report.
 
 ## STPA
@@ -196,7 +240,7 @@ judged.
 | Id | Controller | Unsafe control action | Hazard | Constraint |
 |---|---|---|---|---|
 | UCA-105 | Verifier | Uses a timestamp's time as the validation time when the timestamp's authority is not anchored. | H-8 | CC-109: only an anchored token sets the validation time; others are reported unproven. |
-| UCA-106 | Verifier | Omits a signature or document timestamp it could not read from the report. | H-8 | CC-110: every signature dictionary, signature timestamp and document timestamp found is reported. A signature the verifier cannot read is a row marked unsupported and blocks the document verdict. A signature timestamp that fails verification or cannot be computed makes its signature not valid; a document timestamp that fails verification makes the document not valid. A verified token whose authority is not anchored blocks nothing. Archive timestamps are counted and reported, never judged and never blocking. |
+| UCA-106 | Verifier | Omits a signature or document timestamp it could not read from the report. | H-8 | CC-110: every signature dictionary, signature timestamp and document timestamp found is reported. A signature the verifier cannot read is a row marked unsupported and blocks the document verdict. A signature timestamp or document timestamp that fails verification, cannot be computed, or is not anchored is reported with what it was found to be and decides nothing: no proof of existence, no verdict. Archive timestamps are counted and reported, never judged and never blocking. |
 | UCA-107 | Verifier | Reports revocation Good from a live answer while the chain is not verified, or Revoked without the revocation time. | H-8 | CC-111: revocation is reported with its evidence time and judged against the proof of existence; a live answer never upgrades a chain the pool did not verify. |
 | UCA-108 | Verifier | Reports a document intact when a reference could not be resolved or canonicalised. | H-8 | CC-112: an unresolvable reference fails the fact. |
 | UCA-109 | Shell | Renders a verdict from anchors or lists that are stale without saying so. | H-8 | CC-113: the report carries the anchors' fetch time; the shell shows it. |

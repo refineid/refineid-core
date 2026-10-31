@@ -797,9 +797,7 @@ fn sign_dispatch_by_alg<T: CardTransport>(
             Ok((signature.into_bytes(), verify))
         }
         PublicKeyAlgorithm::Ec(curve) => Err(SignErrorKind::UnsupportedCurve { curve }),
-        PublicKeyAlgorithm::EcExplicit { .. } | PublicKeyAlgorithm::Other => {
-            Err(SignErrorKind::UnsupportedKeyType)
-        }
+        PublicKeyAlgorithm::Other => Err(SignErrorKind::UnsupportedKeyType),
     }
 }
 
@@ -1753,10 +1751,10 @@ fn embedded_timestamp_path(token: &VerifiedTimestampToken) -> Result<Vec<Vec<u8>
     let candidates: Vec<&[u8]> = token
         .embedded_certificates
         .iter()
-        .map(Vec::as_slice)
+        .map(OwnedCert::as_der)
         .collect();
     crate::material::verify_chain_to_approved_anchor(
-        &token.signer_certificate,
+        token.signer_certificate.as_der(),
         token.generated_at,
         &anchors,
         &candidates,
@@ -1792,11 +1790,11 @@ fn timestamp_validation_material(
     let candidates: Vec<&[u8]> = token
         .embedded_certificates
         .iter()
-        .map(Vec::as_slice)
+        .map(OwnedCert::as_der)
         .collect();
     crate::material::collect_chains_with_candidates(
         &[ChainStart {
-            leaf_der: &token.signer_certificate,
+            leaf_der: token.signer_certificate.as_der(),
             reference_time: token.generated_at,
             approved_anchor_ders: &anchors,
             nonce_policy: NoncePolicy::AllowMissingEcho,
@@ -1843,9 +1841,7 @@ const fn document_signer<'a>(
         PublicKeyAlgorithm::Ec(EcCurve::Secp384r1) => {
             (DigestAlgorithm::Sha384, SignatureAlgorithm::EcdsaSha384)
         }
-        PublicKeyAlgorithm::Ec(_)
-        | PublicKeyAlgorithm::EcExplicit { .. }
-        | PublicKeyAlgorithm::Other => {
+        PublicKeyAlgorithm::Ec(_) | PublicKeyAlgorithm::Other => {
             return Err(SignErrorKind::UnsupportedDocumentKey);
         }
     };
@@ -2290,8 +2286,8 @@ mod tests {
         let generated_at = signer.view().not_before;
         Ok(VerifiedTimestampToken {
             token: vec![1],
-            signer_certificate: signer_der.to_vec(),
-            embedded_certificates: vec![signer_der.to_vec()],
+            signer_certificate: signer.clone(),
+            embedded_certificates: vec![signer.clone()],
             generated_at,
         })
     }
@@ -2302,7 +2298,7 @@ mod tests {
         let path = embedded_timestamp_path(&token)?;
         check(
             &path,
-            &vec![token.signer_certificate],
+            &vec![token.signer_certificate.into_der()],
             "the embedded pinned root terminates the path",
         )
     }
@@ -2368,8 +2364,8 @@ mod tests {
         )?;
         let token = VerifiedTimestampToken {
             token: vec![1],
-            signer_certificate: signer_der.clone(),
-            embedded_certificates: vec![signer_der.clone(), ca_der.clone()],
+            signer_certificate: signer.clone(),
+            embedded_certificates: vec![signer.clone(), ca.clone()],
             generated_at: DateTime::from_unix_duration(core::time::Duration::from_secs(
                 SECTIGO_TEST_VALIDITY_INSTANT,
             ))?,
@@ -2397,7 +2393,7 @@ mod tests {
     fn archive_rejects_a_token_without_current_complete_evidence() -> TestResult {
         let token = self_anchored_token_fixture()?;
         let covered_material = ValidationMaterial {
-            certificates: vec![token.signer_certificate.clone()],
+            certificates: vec![token.signer_certificate.as_der().to_vec()],
             ..ValidationMaterial::default()
         };
         let error = authenticate_archive_timestamp_with(&token, &covered_material, |_token| {
@@ -2468,10 +2464,11 @@ mod tests {
             DateTime::from_unix_duration(core::time::Duration::from_secs(1_700_000_000))?;
         let received_at =
             DateTime::from_unix_duration(core::time::Duration::from_secs(1_700_000_030))?;
+        let signer = self_anchored_token_fixture()?.signer_certificate;
         let token_at = |seconds| -> Result<VerifiedTimestampToken, Box<dyn core::error::Error>> {
             Ok(VerifiedTimestampToken {
                 token: Vec::new(),
-                signer_certificate: Vec::new(),
+                signer_certificate: signer.clone(),
                 embedded_certificates: Vec::new(),
                 generated_at: DateTime::from_unix_duration(core::time::Duration::from_secs(
                     seconds,
@@ -2506,7 +2503,7 @@ mod tests {
         )?;
         check_true(!token.token.is_empty(), "timestamp token returned")?;
         check_true(
-            !token.signer_certificate.is_empty(),
+            !token.signer_certificate.as_der().is_empty(),
             "timestamp signer certificate authenticated",
         )?;
         check_true(

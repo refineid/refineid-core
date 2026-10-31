@@ -474,18 +474,29 @@ pub mod known {
         ::const_oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.12").as_bytes(),
     );
 
+    /// `1.2.840.113549.1.9.16.2.48` -- id-aa-ets-archiveTimestampV2.
+    ///
+    /// RFC 5126 sec.6.4.1. The CAdES-A archive timestamp of the
+    /// previous generation, an unsigned attribute over the signed data,
+    /// the signature and its validation material.
+    pub const ARCHIVE_TIME_STAMP_V2: Oid<'static> = Oid::const_new(
+        ::const_oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.48").as_bytes(),
+    );
+
+    /// `0.4.0.1733.2.4` -- id-aa-ets-archiveTimestampV3.
+    ///
+    /// ETSI EN 319 122-1 V1.3.1 clause 5.5.3. The archive-time-stamp-v3
+    /// unsigned attribute: a timestamp token over the signed data, the
+    /// signature and the material its ats-hash-index-v3 protects.
+    pub const ARCHIVE_TIME_STAMP_V3: Oid<'static> =
+        Oid::const_new(::const_oid::ObjectIdentifier::new_unwrap("0.4.0.1733.2.4").as_bytes());
+
     // ---- OCSP response types (RFC 6960) ----
 
     /// `1.3.6.1.5.5.7.48.1.1` -- id-pkix-ocsp-basic.
     pub const BASIC_OCSP_RESPONSE: Oid<'static> = Oid::const_new(
         ::const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.48.1.1").as_bytes(),
     );
-
-    // ---- EC field type (ANSI X9.62) ----
-
-    /// `1.2.840.10045.1.1` -- prime-field.
-    pub const PRIME_FIELD: Oid<'static> =
-        Oid::const_new(::const_oid::ObjectIdentifier::new_unwrap("1.2.840.10045.1.1").as_bytes());
 
     // ---- PACE mechanism (BSI TR-03110-3) ----
 
@@ -608,6 +619,18 @@ mod tests {
     #[test]
     fn display_ad_ocsp() {
         assert_eq!(format!("{}", known::AD_OCSP), "1.3.6.1.5.5.7.48.1");
+    }
+
+    #[test]
+    fn display_archive_time_stamps() {
+        assert_eq!(
+            format!("{}", known::ARCHIVE_TIME_STAMP_V2),
+            "1.2.840.113549.1.9.16.2.48"
+        );
+        assert_eq!(
+            format!("{}", known::ARCHIVE_TIME_STAMP_V3),
+            "0.4.0.1733.2.4"
+        );
     }
 
     #[test]

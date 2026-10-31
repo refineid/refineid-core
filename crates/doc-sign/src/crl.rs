@@ -40,7 +40,7 @@
 
 use crate::identity::CertSerial;
 use refineid_cms::oid::Oid;
-use refineid_cms::x509::{DateTime, X509Error};
+use refineid_cms::x509::{Certificate, DateTime, X509Error, extract_key_usage};
 use spki::der::asn1::{AnyRef, ObjectIdentifier};
 use spki::der::{Decode as _, Reader as _, SliceReader, Tag, TagNumber, Tagged as _};
 use x509_cert::crl::RevokedCert;
@@ -275,12 +275,41 @@ impl Crl<'_> {
     }
 }
 
-/// A [`Crl`] whose issuer signature has been verified against a
-/// signer SPKI.
+/// Why a parsed CRL could not be bound to its claimed issuer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrlVerifyError {
+    /// The CRL issuer name is not the issuer certificate's subject
+    /// name (RFC 5280 sec.5.1.2.3).
+    IssuerNameMismatch,
+    /// The issuer certificate has no parseable Key Usage or does not
+    /// assert `cRLSign` (RFC 5280 sec.4.2.1.3).
+    IssuerNotAuthorized,
+    /// The CRL signature did not verify under the issuer key.
+    Signature(crate::x509::VerifyError),
+}
+
+impl core::fmt::Display for CrlVerifyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::IssuerNameMismatch => {
+                f.write_str("CRL issuer name does not match issuer certificate")
+            }
+            Self::IssuerNotAuthorized => {
+                f.write_str("issuer certificate Key Usage does not authorize cRLSign")
+            }
+            Self::Signature(why) => write!(f, "CRL signature: {why}"),
+        }
+    }
+}
+
+impl core::error::Error for CrlVerifyError {}
+
+/// A [`Crl`] whose issuer identity, `cRLSign` authorization, and
+/// signature have been verified against an issuer certificate.
 ///
 /// Trust by construction (see `doc/typing-discipline.md`): the only
 /// production constructor is [`VerifiedCrl::verify`], so holding this
-/// type is proof the CRL signature checked against a signer.
+/// type is proof the CRL is the issuer's.
 /// [`crate::revocation::check_against_crl`] takes a `VerifiedCrl`, so
 /// a CRL's revocation list cannot be consulted without a checked
 /// signature -- the same gate as [`crate::ocsp::VerifiedOcspResponse`].
@@ -291,18 +320,27 @@ pub struct VerifiedCrl<'a> {
 }
 
 impl<'a> VerifiedCrl<'a> {
-    /// Verify `crl`'s issuer signature against `signer_spki` and, on
-    /// success, wrap it. The only production door to a verified CRL.
+    /// Bind `crl` to `issuer`: the CRL issuer must be the issuer's
+    /// subject, the issuer's Key Usage must assert `cRLSign`, and the
+    /// CRL signature must verify under the issuer's key. The only
+    /// production door to a verified CRL.
     ///
     /// # Errors
-    /// [`crate::x509::VerifyError`] when the signature does not verify
-    /// against `signer_spki`.
-    #[inline]
-    pub fn verify(
-        crl: &Crl<'a>,
-        signer_spki: &crate::x509::SpkiDer<'_>,
-    ) -> Result<Self, crate::x509::VerifyError> {
-        crl.verify_signature(signer_spki)?;
+    /// [`CrlVerifyError`] when the name, authorization, or signature
+    /// check fails.
+    pub fn verify(crl: &Crl<'a>, issuer: Certificate<'_>) -> Result<Self, CrlVerifyError> {
+        if crl.issuer != issuer.subject {
+            return Err(CrlVerifyError::IssuerNameMismatch);
+        }
+        let authorized = issuer
+            .extensions
+            .and_then(extract_key_usage)
+            .is_some_and(|usage| usage.crl_sign);
+        if !authorized {
+            return Err(CrlVerifyError::IssuerNotAuthorized);
+        }
+        crl.verify_signature(&issuer.spki)
+            .map_err(CrlVerifyError::Signature)?;
         Ok(Self { crl: crl.clone() })
     }
 
@@ -440,13 +478,13 @@ impl<'a> Crl<'a> {
             .map_err(|_ignored| X509Error::UnexpectedStructure("tbsCertList"))?;
 
         // signatureAlgorithm AlgorithmIdentifier -- carry the OID body
-        // (the value of its `06 LL` TLV), borrowed from the input.
-        let sig_alg = AnyRef::from_der(
-            reader
-                .tlv_bytes()
-                .map_err(|_ignored| X509Error::UnexpectedStructure("CRL signatureAlgorithm"))?,
-        )
-        .map_err(|_ignored| X509Error::UnexpectedStructure("CRL signatureAlgorithm"))?;
+        // (the value of its `06 LL` TLV), borrowed from the input, and
+        // the whole TLV for the comparison with tbsCertList.signature.
+        let sig_alg_der = reader
+            .tlv_bytes()
+            .map_err(|_ignored| X509Error::UnexpectedStructure("CRL signatureAlgorithm"))?;
+        let sig_alg = AnyRef::from_der(sig_alg_der)
+            .map_err(|_ignored| X509Error::UnexpectedStructure("CRL signatureAlgorithm"))?;
         let mut alg_reader = SliceReader::new(sig_alg.value())
             .map_err(|_ignored| X509Error::UnexpectedStructure("CRL signatureAlgorithm body"))?;
         let alg_oid =
@@ -474,7 +512,16 @@ impl<'a> Crl<'a> {
         }
         let signature_bits = signature_octets(sig_bits.value(), "CRL signature BIT STRING")?;
 
-        parse_tbs_cert_list(tbs_der, der, signature_alg_oid, signature_bits)
+        let parsed = parse_tbs_cert_list(tbs_der, der, signature_alg_oid, signature_bits)?;
+        // RFC 5280 sec.5.1.1.2: signatureAlgorithm MUST contain the same
+        // algorithm identifier as tbsCertList.signature.
+        if parsed.tbs_signature_algorithm_der != sig_alg_der {
+            return Err(X509Error::UnexpectedStructure(
+                "CRL signatureAlgorithm differs from tbsCertList.signature",
+            )
+            .into());
+        }
+        Ok(parsed.crl)
     }
 }
 
@@ -489,13 +536,13 @@ impl<'a> Crl<'a> {
 ///
 /// The function does not verify the signature; it only parses
 /// the TBS payload. Signature verification lives on
-/// [`OwnedCrl::verify_signature`] in this module.
+/// [`VerifiedCrl::verify`] in this module.
 fn parse_tbs_cert_list<'a>(
     tbs_der: &'a [u8],
     raw: &'a [u8],
     signature_alg_oid: Oid<'a>,
     signature_bits: &'a [u8],
-) -> Result<Crl<'a>, CrlError> {
+) -> Result<ParsedTbsCertList<'a>, CrlError> {
     // TBSCertList ::= SEQUENCE {
     //     version                 INTEGER OPTIONAL,
     //     signature               AlgorithmIdentifier,
@@ -524,21 +571,22 @@ fn parse_tbs_cert_list<'a>(
     // Read the first field: if it is the version INTEGER, the
     // signature is the next field; otherwise this field WAS the
     // signature (version absent) and is already consumed.
-    let first = AnyRef::from_der(
-        reader
-            .tlv_bytes()
-            .map_err(|_ignored| X509Error::UnexpectedStructure("tbsCertList version/signature"))?,
-    )
-    .map_err(|_ignored| X509Error::UnexpectedStructure("tbsCertList version/signature"))?;
+    let first_der = reader
+        .tlv_bytes()
+        .map_err(|_ignored| X509Error::UnexpectedStructure("tbsCertList version/signature"))?;
+    let first = AnyRef::from_der(first_der)
+        .map_err(|_ignored| X509Error::UnexpectedStructure("tbsCertList version/signature"))?;
     let is_v2 = first.tag() == Tag::Integer;
-    if is_v2 {
+    let tbs_signature_algorithm_der = if is_v2 {
         if first.decode_as::<u8>().ok() != Some(CRL_VERSION_2) {
             return Err(X509Error::UnexpectedStructure("tbsCertList version").into());
         }
         reader
             .tlv_bytes()
-            .map_err(|_ignored| X509Error::UnexpectedStructure("tbsCertList signature"))?;
-    }
+            .map_err(|_ignored| X509Error::UnexpectedStructure("tbsCertList signature"))?
+    } else {
+        first_der
+    };
 
     // issuer Name -- exact bytes (byte-exact for OCSP issuer match).
     let issuer_dn_der = reader
@@ -596,16 +644,29 @@ fn parse_tbs_cert_list<'a>(
         }
     }
 
-    Ok(Crl {
-        raw_der: raw,
-        tbs_der,
-        issuer: crate::x509::Name::try_from(issuer_dn_der)?,
-        this_update,
-        next_update,
-        revoked_seq_value,
-        signature_alg_oid,
-        signature_bits,
+    Ok(ParsedTbsCertList {
+        crl: Crl {
+            raw_der: raw,
+            tbs_der,
+            issuer: crate::x509::Name::try_from(issuer_dn_der)?,
+            this_update,
+            next_update,
+            revoked_seq_value,
+            signature_alg_oid,
+            signature_bits,
+        },
+        tbs_signature_algorithm_der,
     })
+}
+
+/// A parsed `TBSCertList` and the exact `signature`
+/// `AlgorithmIdentifier` it carries, for the RFC 5280 sec.5.1.1.2
+/// comparison against the outer `signatureAlgorithm`.
+struct ParsedTbsCertList<'a> {
+    /// The CRL view.
+    crl: Crl<'a>,
+    /// `tbsCertList.signature`, tag and length included.
+    tbs_signature_algorithm_der: &'a [u8],
 }
 
 /// The optional trailing fields of `TBSCertList`, in their order.
@@ -1331,5 +1392,138 @@ mod tests {
             Crl::parse(&truncated),
             Err(CrlError::Malformed(X509Error::UnexpectedStructure(_)))
         ));
+    }
+}
+
+#[cfg(test)]
+mod issuer_binding_tests {
+    use super::{CrlError, CrlVerifyError, OwnedCrl, VerifiedCrl, X509Error};
+    use crate::testkit::{self, CertificateSpec, TestCurve, TestKey};
+    use refineid_cms::x509::OwnedCert;
+
+    /// Name of the issuing CA.
+    const CA: &str = "Test CRL Issuer";
+    /// Serial of the CA certificate.
+    const CA_SERIAL: u8 = 2;
+    /// Serial a fixture CRL lists.
+    const REVOKED_SERIAL: u8 = 4;
+    /// First validity day of the CA certificate.
+    const VALID_FROM: u8 = 1;
+    /// Day the CRL is issued, and the entry revoked.
+    const THIS_UPDATE: u8 = 10;
+    /// Day the next CRL is due.
+    const NEXT_UPDATE: u8 = 17;
+    /// Last validity day of the CA certificate.
+    const VALID_TO: u8 = 28;
+
+    /// A CA certificate for `key` with `extensions`.
+    fn ca(key: &TestKey, extensions: Vec<Vec<u8>>) -> OwnedCert {
+        OwnedCert::from_der(&testkit::certificate(
+            &CertificateSpec {
+                serial: CA_SERIAL,
+                subject: CA,
+                issuer: CA,
+                not_before: testkit::day(VALID_FROM),
+                not_after: testkit::day(VALID_TO),
+                extensions,
+            },
+            key,
+            key,
+        ))
+        .expect("CA certificate parses")
+    }
+
+    /// A CRL named for `issuer`, signed by `key`.
+    fn crl(issuer: &str, key: &TestKey) -> OwnedCrl {
+        OwnedCrl::from_der(&testkit::crl(
+            issuer,
+            key,
+            testkit::day(THIS_UPDATE),
+            Some(testkit::day(NEXT_UPDATE)),
+            &[REVOKED_SERIAL],
+            testkit::day(THIS_UPDATE),
+        ))
+        .expect("kit CRL parses")
+    }
+
+    #[test]
+    fn a_crl_binds_to_the_issuer_that_signed_it() {
+        let key = TestKey::derive(TestCurve::P384, b"crl issuer");
+        let issuer = ca(&key, testkit::ca_extensions());
+        let list = crl(CA, &key);
+        let view = list.view();
+        let verified =
+            VerifiedCrl::verify(&view, issuer.view()).expect("the issuer's CRL verifies");
+        assert_eq!(verified.as_crl().entries().count(), 1);
+    }
+
+    #[test]
+    fn a_crl_naming_another_issuer_is_refused() {
+        let key = TestKey::derive(TestCurve::P384, b"crl issuer");
+        let issuer = ca(&key, testkit::ca_extensions());
+        let list = crl("Test Other Issuer", &key);
+        assert_eq!(
+            VerifiedCrl::verify(&list.view(), issuer.view()).map(|_verified| ()),
+            Err(CrlVerifyError::IssuerNameMismatch)
+        );
+    }
+
+    #[test]
+    fn an_issuer_without_crl_sign_is_refused() {
+        let key = TestKey::derive(TestCurve::P384, b"crl issuer");
+        let issuer = ca(
+            &key,
+            vec![
+                testkit::ca_basic_constraints(),
+                testkit::key_usage(
+                    testkit::KEY_USAGE_CERT_SIGN_UNUSED,
+                    testkit::KEY_USAGE_CERT_SIGN,
+                ),
+            ],
+        );
+        let without_key_usage = ca(&key, vec![testkit::ca_basic_constraints()]);
+        let list = crl(CA, &key);
+        for refused in [issuer, without_key_usage] {
+            assert_eq!(
+                VerifiedCrl::verify(&list.view(), refused.view()).map(|_verified| ()),
+                Err(CrlVerifyError::IssuerNotAuthorized)
+            );
+        }
+    }
+
+    #[test]
+    fn a_crl_signed_by_another_key_is_refused() {
+        let key = TestKey::derive(TestCurve::P384, b"crl issuer");
+        let other = TestKey::derive(TestCurve::P384, b"crl impostor");
+        let issuer = ca(&key, testkit::ca_extensions());
+        let list = crl(CA, &other);
+        assert!(matches!(
+            VerifiedCrl::verify(&list.view(), issuer.view()),
+            Err(CrlVerifyError::Signature(_))
+        ));
+    }
+
+    #[test]
+    fn the_outer_algorithm_must_equal_the_tbs_one() {
+        let key = TestKey::derive(TestCurve::P256, b"crl issuer");
+        let other = TestKey::derive(TestCurve::P384, b"crl other algorithm");
+        let tbs = testkit::tbs_cert_list(
+            CA,
+            &key,
+            testkit::day(THIS_UPDATE),
+            Some(testkit::day(NEXT_UPDATE)),
+            &[],
+            testkit::day(THIS_UPDATE),
+        );
+        let mut body = tbs.clone();
+        body.extend_from_slice(&other.algorithm_identifier());
+        body.extend_from_slice(&testkit::bit_string(&key.sign(&tbs)));
+        let der = testkit::tlv(testkit::SEQUENCE, body);
+        assert_eq!(
+            OwnedCrl::from_der(&der).map(|_list| ()),
+            Err(CrlError::Malformed(X509Error::UnexpectedStructure(
+                "CRL signatureAlgorithm differs from tbsCertList.signature"
+            )))
+        );
     }
 }

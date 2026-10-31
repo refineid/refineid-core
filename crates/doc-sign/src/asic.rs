@@ -45,10 +45,10 @@ use crate::xades::{
 };
 
 /// Media type of an `ASiC-E` container.
-const MIMETYPE_ASICE: &str = "application/vnd.etsi.asic-e+zip";
+pub(crate) const MIMETYPE_ASICE: &str = "application/vnd.etsi.asic-e+zip";
 
 /// Entry name the media type must be stored under, first, uncompressed.
-const MIMETYPE_ENTRY: &str = "mimetype";
+pub(crate) const MIMETYPE_ENTRY: &str = "mimetype";
 
 /// Where the manifest lives, in the `CAdES` flavour.
 const MANIFEST_ENTRY: &str = "META-INF/ASiCManifest.xml";
@@ -364,13 +364,13 @@ struct ZipWriter {
 }
 
 /// Local file header signature.
-const SIGNATURE_LOCAL_HEADER: u32 = 0x0403_4B50;
+pub(crate) const SIGNATURE_LOCAL_HEADER: u32 = 0x0403_4B50;
 
 /// Central directory file header signature.
-const SIGNATURE_CENTRAL_HEADER: u32 = 0x0201_4B50;
+pub(crate) const SIGNATURE_CENTRAL_HEADER: u32 = 0x0201_4B50;
 
 /// End of central directory signature.
-const SIGNATURE_END_OF_DIRECTORY: u32 = 0x0605_4B50;
+pub(crate) const SIGNATURE_END_OF_DIRECTORY: u32 = 0x0605_4B50;
 
 /// Minimum version needed to extract: 2.0, meaning stored or deflated.
 const VERSION_NEEDED: u16 = 20;
@@ -382,7 +382,7 @@ const VERSION_MADE_BY: u16 = 0x0314;
 const REGULAR_FILE_EXTERNAL_ATTRIBUTES: u32 = 0x81A4_0000;
 
 /// Compression method 0: stored.
-const METHOD_STORED: u16 = 0;
+pub(crate) const METHOD_STORED: u16 = 0;
 
 /// General-purpose bit 11: the entry name is UTF-8 (APPNOTE 4.4.4).
 const UTF8_NAME_FLAG: u16 = 0x0800;

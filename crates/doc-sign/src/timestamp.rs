@@ -22,10 +22,12 @@
 //!
 //! # What is checked, and what is not
 //!
-//! [`verified_token`] (and the compatibility [`token`] wrapper) checks
+//! [`verified_token`] (and the [`token`] wrapper over it) checks
 //! that the token answers *this* request: that its
 //! `messageImprint` is the digest that was sent, and that the nonce
-//! comes back unchanged. It also verifies the token's CMS signature
+//! comes back unchanged. [`verify_token`] checks a token found in a
+//! document, whose own `TSTInfo` names the imprint algorithm. Both
+//! verify the token's CMS signature
 //! with the one embedded TSA certificate selected by CMS
 //! `SignerIdentifier` and the signed ESS certificate hash. The
 //! certificate must be an end entity whose sole critical Extended Key
@@ -52,7 +54,7 @@ use crate::ber::{
     Sequence, Utf8String, tlv,
 };
 use crate::cades::DigestAlgorithm;
-use crate::cms::{SignedAttribute, SignedData, SignerIdentifier};
+use crate::cms::{CmsAttribute, SignedData, SignerIdentifier};
 use refineid_cms::oid::{Oid, known};
 use refineid_cms::x509::{Certificate, DateTime, Name, OwnedCert};
 use sha1::{Digest as _, Sha1};
@@ -192,25 +194,26 @@ impl core::error::Error for TimestampError {}
 /// caller-approved trust anchor or is authorised by a trusted list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedTimestampToken {
-    /// Original `TimeStampToken` CMS `ContentInfo` DER.
+    /// Original `TimeStampToken` CMS `ContentInfo` DER, in transit to
+    /// the unsigned attribute it is embedded as.
     pub token: Vec<u8>,
-    /// DER of the certificate that authenticated the token.
-    pub signer_certificate: Vec<u8>,
+    /// The certificate that authenticated the token.
+    pub signer_certificate: OwnedCert,
     /// Every distinct, parseable X.509 certificate embedded in the CMS
     /// `SignedData`, in encoded order. This includes the signer certificate;
     /// byte-identical duplicates are removed. Trust-path validation remains
     /// the caller's responsibility.
-    pub embedded_certificates: Vec<Vec<u8>>,
+    pub embedded_certificates: Vec<OwnedCert>,
     /// Authenticated `TSTInfo.genTime`.
     pub generated_at: DateTime,
 }
 
 /// Authenticated fields recovered while checking one timestamp token.
 struct VerifiedBinding {
-    /// DER of the CMS signer certificate.
-    signer_certificate: Vec<u8>,
+    /// The CMS signer certificate.
+    signer_certificate: OwnedCert,
     /// Distinct parseable certificates carried by CMS.
-    embedded_certificates: Vec<Vec<u8>>,
+    embedded_certificates: Vec<OwnedCert>,
     /// Authenticated `TSTInfo.genTime`.
     generated_at: DateTime,
 }
@@ -361,6 +364,50 @@ pub fn verified_token(
     })
 }
 
+/// Verify a `TimeStampToken` found in a document, where the token
+/// itself names the imprint algorithm.
+///
+/// A verifier reading a signature does not know which digest the
+/// authority was asked for; the token's `TSTInfo.messageImprint` says.
+/// `imprint_of` computes the digest of the timestamped data under that
+/// algorithm, and the token is accepted when it matches. The signer
+/// certificate, its ESS binding and its fitness for timestamping at
+/// `genTime` are checked as for a fresh response; chaining the signer
+/// to a trust anchor remains the caller's work.
+///
+/// # Errors
+/// [`TimestampError::Malformed`] for a malformed token, an imprint
+/// algorithm this crate does not digest under, or an imprint whose
+/// length is not that algorithm's; [`TimestampError::ImprintMismatch`]
+/// for an imprint over other data; the signer errors of
+/// [`verified_token`] for a token whose signer does not authenticate.
+pub fn verify_token(
+    token: &[u8],
+    imprint_of: impl FnOnce(DigestAlgorithm) -> Vec<u8>,
+) -> Result<VerifiedTimestampToken, TimestampError> {
+    let (signed_data, tst_info) = parse_token(token)?;
+    let algorithm = DigestAlgorithm::from_oid(
+        Oid::new(tst_info.imprint_algorithm_oid)
+            .map_err(|_ignored| TimestampError::Malformed("imprint algorithm is not an OID"))?,
+    )
+    .ok_or(TimestampError::Malformed("imprint algorithm unsupported"))?;
+    if tst_info.message_imprint.len() != algorithm.digest_len() {
+        return Err(TimestampError::Malformed(
+            "messageImprint length differs from its hash algorithm",
+        ));
+    }
+    if tst_info.message_imprint != imprint_of(algorithm).as_slice() {
+        return Err(TimestampError::ImprintMismatch);
+    }
+    let binding = authenticate_signer(&signed_data, &tst_info)?;
+    Ok(VerifiedTimestampToken {
+        token: token.to_vec(),
+        signer_certificate: binding.signer_certificate,
+        embedded_certificates: binding.embedded_certificates,
+        generated_at: binding.generated_at,
+    })
+}
+
 /// Check the token answers this request and no other.
 fn check_binding(
     token: &[u8],
@@ -368,6 +415,23 @@ fn check_binding(
     expected_algorithm: DigestAlgorithm,
     nonce: Option<&[u8]>,
 ) -> Result<VerifiedBinding, TimestampError> {
+    let (signed_data, tst_info) = parse_token(token)?;
+    if tst_info.imprint_algorithm_oid != expected_algorithm.oid().as_bytes()
+        || tst_info.message_imprint != expected_digest
+    {
+        return Err(TimestampError::ImprintMismatch);
+    }
+    if let Some(nonce) = nonce
+        && tst_info.nonce != Some(positive_integer(nonce).as_slice())
+    {
+        return Err(TimestampError::NonceMismatch);
+    }
+    authenticate_signer(&signed_data, &tst_info)
+}
+
+/// Parse the token as an attached `SignedData` over a `TSTInfo` with
+/// signed attributes, the shape RFC 3161 sec.2.4.2 requires.
+fn parse_token(token: &[u8]) -> Result<(SignedData<'_>, TstInfo<'_>), TimestampError> {
     let signed_data = SignedData::parse(token)
         .map_err(|_ignored| TimestampError::Malformed("token is not CMS SignedData"))?;
     if signed_data.econtent_type_oid != crate::oids::TST_INFO {
@@ -380,50 +444,55 @@ fn check_binding(
             "token signerInfo has no signed attributes",
         ));
     }
-    let tst_info = parse_tst_info(signed_data.econtent_der)?;
-    if tst_info.imprint_algorithm_oid != expected_algorithm.oid().as_bytes()
-        || tst_info.message_imprint != expected_digest
+    let tst_info = parse_tst_info(
+        signed_data
+            .econtent_der
+            .ok_or(TimestampError::Malformed("token carries no TSTInfo"))?,
+    )?;
+    Ok((signed_data, tst_info))
+}
+
+/// Select the signer the token names, check that it signed the token,
+/// that the ESS attribute binds it, and that it was fit to timestamp
+/// at `genTime`.
+fn authenticate_signer(
+    signed_data: &SignedData<'_>,
+    tst_info: &TstInfo<'_>,
+) -> Result<VerifiedBinding, TimestampError> {
+    let signer = select_signer_certificate(signed_data)?;
     {
-        return Err(TimestampError::ImprintMismatch);
+        let certificate = signer.view();
+        if let Some(tsa) = tst_info.tsa
+            && !tsa_name_matches_certificate(tsa, certificate)?
+        {
+            return Err(TimestampError::TsaNameMismatch);
+        }
+        signed_data
+            .verify(certificate.spki)
+            .map_err(|_ignored| TimestampError::TokenSignatureInvalid)?;
+        verify_signing_certificate_attribute(signed_data, &certificate)?;
+        tsa_certificate_is_usable(&certificate, tst_info.gen_time)?;
     }
-    if let Some(nonce) = nonce
-        && tst_info.nonce != Some(positive_integer(nonce).as_slice())
-    {
-        return Err(TimestampError::NonceMismatch);
-    }
-    let signer = select_signer_certificate(&signed_data)?;
-    let certificate = signer.view();
-    if let Some(tsa) = tst_info.tsa
-        && !tsa_name_matches_certificate(tsa, certificate)?
-    {
-        return Err(TimestampError::TsaNameMismatch);
-    }
-    signed_data
-        .verify(certificate.spki.as_der())
-        .map_err(|_ignored| TimestampError::TokenSignatureInvalid)?;
-    verify_signing_certificate_attribute(&signed_data, &certificate)?;
-    tsa_certificate_is_usable(&certificate, tst_info.gen_time)?;
     Ok(VerifiedBinding {
-        signer_certificate: certificate.raw_der.to_vec(),
-        embedded_certificates: parseable_embedded_certificates(&signed_data),
+        signer_certificate: signer,
+        embedded_certificates: parseable_embedded_certificates(signed_data),
         generated_at: tst_info.gen_time,
     })
 }
 
 /// Retain parseable CMS certificates while removing byte-identical repeats.
-fn parseable_embedded_certificates(signed_data: &SignedData<'_>) -> Vec<Vec<u8>> {
-    let mut certificates = Vec::new();
+fn parseable_embedded_certificates(signed_data: &SignedData<'_>) -> Vec<OwnedCert> {
+    let mut certificates: Vec<OwnedCert> = Vec::new();
     for certificate_der in &signed_data.certificates_der {
-        // Port note: `Certificate::from_der` is crate-private in
-        // lib-core; the owned wrapper runs the same parse.
-        if OwnedCert::from_der(certificate_der).is_err()
-            || certificates
-                .iter()
-                .any(|existing: &Vec<u8>| existing.as_slice() == *certificate_der)
+        if certificates
+            .iter()
+            .any(|existing| existing.as_der() == *certificate_der)
         {
             continue;
         }
-        certificates.push(certificate_der.to_vec());
+        if let Ok(certificate) = OwnedCert::from_der(certificate_der) {
+            certificates.push(certificate);
+        }
     }
     certificates
 }
@@ -638,11 +707,11 @@ fn parse_generalized_time(value: &[u8]) -> Result<DateTime, TimestampError> {
 
 /// Select exactly one distinct embedded certificate by CMS SID.
 ///
-/// Port note: returns the owned wrapper because
-/// `Certificate::from_der` is crate-private in lib-core; callers
-/// bind the borrowed view (`owned.view()`) once and use it as
-/// before.
-fn select_signer_certificate(signed_data: &SignedData<'_>) -> Result<OwnedCert, TimestampError> {
+/// Returns the owned certificate; callers bind its borrowed view
+/// (`owned.view()`) once.
+pub(crate) fn select_signer_certificate(
+    signed_data: &SignedData<'_>,
+) -> Result<OwnedCert, TimestampError> {
     let mut matches = Vec::new();
     for cert_der in &signed_data.certificates_der {
         let Ok(owned) = OwnedCert::from_der(cert_der) else {
@@ -1190,17 +1259,17 @@ struct EssCertificateReference<'a> {
 
 /// Verify the unique signed `signingCertificate` or
 /// `signingCertificateV2` attribute against the selected signer.
-fn verify_signing_certificate_attribute(
+pub(crate) fn verify_signing_certificate_attribute(
     signed_data: &SignedData<'_>,
     certificate: &Certificate<'_>,
 ) -> Result<(), TimestampError> {
-    let v1: Vec<&SignedAttribute<'_>> = signed_data
+    let v1: Vec<&CmsAttribute<'_>> = signed_data
         .signer
         .signed_attributes
         .iter()
         .filter(|attribute| attribute.oid == crate::oids::SIGNING_CERTIFICATE)
         .collect();
-    let v2: Vec<&SignedAttribute<'_>> = signed_data
+    let v2: Vec<&CmsAttribute<'_>> = signed_data
         .signer
         .signed_attributes
         .iter()
@@ -1661,11 +1730,15 @@ mod tests {
             .expect("fixture token verifies");
         assert_eq!(verified.token, token_der);
         assert_eq!(
-            verified.signer_certificate,
+            verified.signer_certificate.as_der(),
             unhex(TIMESTAMP_CERTIFICATE_HEX)
         );
         assert_eq!(
-            verified.embedded_certificates,
+            verified
+                .embedded_certificates
+                .iter()
+                .map(refineid_cms::x509::OwnedCert::as_der)
+                .collect::<Vec<_>>(),
             vec![unhex(TIMESTAMP_CERTIFICATE_HEX)],
             "duplicate signer DER is retained once"
         );
@@ -1691,7 +1764,7 @@ mod tests {
         .expect("token with an embedded intermediate verifies");
 
         let signer = unhex(TIMESTAMP_CERTIFICATE_HEX);
-        assert_eq!(verified.signer_certificate, signer);
+        assert_eq!(verified.signer_certificate.as_der(), signer);
         assert_eq!(verified.embedded_certificates.len(), 2);
         assert!(
             verified
@@ -1704,7 +1777,7 @@ mod tests {
             verified
                 .embedded_certificates
                 .iter()
-                .any(|certificate| certificate == INTERMEDIATE_CERTIFICATE_DER),
+                .any(|certificate| certificate.as_der() == INTERMEDIATE_CERTIFICATE_DER),
             "intermediate certificate is retained"
         );
     }
@@ -1722,7 +1795,10 @@ mod tests {
         ));
 
         let signed_data = SignedData::parse(&token_der).expect("fixture CMS parses");
-        let mut tst_info = signed_data.econtent_der.to_vec();
+        let mut tst_info = signed_data
+            .econtent_der
+            .expect("token carries TSTInfo")
+            .to_vec();
         tst_info.push(0x00);
         assert!(matches!(
             parse_tst_info(&tst_info),
@@ -2048,5 +2124,124 @@ mod tests {
             body.extend_from_slice(&tlv(0xA0, tsa));
         }
         tlv(0x30, &body)
+    }
+}
+
+#[cfg(test)]
+mod verify_token_tests {
+    use super::{TimestampError, verify_token};
+    use crate::cades::DigestAlgorithm;
+    use crate::testkit::{self, CertificateSpec, TestCurve, TestKey};
+
+    /// The data a fixture token timestamps.
+    const STAMPED: &[u8] = b"signature value";
+    /// Data other than [`STAMPED`].
+    const OTHER: &[u8] = b"another signature value";
+    /// Serial of the fixture TSA certificate.
+    const TSA_SERIAL: u8 = 9;
+    /// First validity day of the TSA certificate.
+    const VALID_FROM: u8 = 1;
+    /// Day the token is generated.
+    const GENERATED: u8 = 10;
+    /// Last validity day of the TSA certificate.
+    const VALID_TO: u8 = 28;
+
+    /// A TSA key on `curve` and its self-issued end-entity certificate.
+    fn tsa(curve: TestCurve) -> (TestKey, Vec<u8>) {
+        let key = TestKey::derive(curve, b"time stamp authority");
+        let certificate = testkit::certificate(
+            &CertificateSpec {
+                serial: TSA_SERIAL,
+                subject: "Test Time Stamp Authority",
+                issuer: "Test Time Stamp Authority",
+                not_before: testkit::day(VALID_FROM),
+                not_after: testkit::day(VALID_TO),
+                extensions: testkit::timestamping_extensions(),
+            },
+            &key,
+            &key,
+        );
+        (key, certificate)
+    }
+
+    #[test]
+    fn a_token_verifies_under_its_own_imprint_algorithm() {
+        for (curve, algorithm) in [
+            (TestCurve::P256, DigestAlgorithm::Sha256),
+            (TestCurve::P384, DigestAlgorithm::Sha384),
+            (TestCurve::P256, DigestAlgorithm::Sha384),
+        ] {
+            let (key, certificate) = tsa(curve);
+            let token = testkit::timestamp_token(
+                &certificate,
+                &key,
+                algorithm,
+                &algorithm.digest(STAMPED),
+                testkit::day(GENERATED),
+            );
+            let mut asked = None;
+            let verified = verify_token(&token, |named| {
+                asked = Some(named);
+                named.digest(STAMPED)
+            })
+            .expect("kit token verifies");
+            assert_eq!(asked, Some(algorithm));
+            assert_eq!(verified.generated_at, testkit::day(GENERATED));
+            assert_eq!(verified.signer_certificate.as_der(), certificate.as_slice());
+            assert_eq!(verified.embedded_certificates.len(), 1);
+            assert_eq!(verified.token, token);
+        }
+    }
+
+    #[test]
+    fn a_token_over_other_data_is_refused() {
+        let (key, certificate) = tsa(TestCurve::P256);
+        let token = testkit::timestamp_token(
+            &certificate,
+            &key,
+            DigestAlgorithm::Sha256,
+            &DigestAlgorithm::Sha256.digest(STAMPED),
+            testkit::day(GENERATED),
+        );
+        assert_eq!(
+            verify_token(&token, |named| named.digest(OTHER)),
+            Err(TimestampError::ImprintMismatch)
+        );
+    }
+
+    #[test]
+    fn an_imprint_of_the_wrong_length_is_refused() {
+        let (key, certificate) = tsa(TestCurve::P384);
+        let token = testkit::timestamp_token(
+            &certificate,
+            &key,
+            DigestAlgorithm::Sha384,
+            &DigestAlgorithm::Sha256.digest(STAMPED),
+            testkit::day(GENERATED),
+        );
+        assert_eq!(
+            verify_token(&token, |named| named.digest(STAMPED)),
+            Err(TimestampError::Malformed(
+                "messageImprint length differs from its hash algorithm"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_token_outside_its_signer_validity_is_refused() {
+        /// A day after the TSA certificate expired.
+        const AFTER_EXPIRY: u8 = 29;
+        let (key, certificate) = tsa(TestCurve::P256);
+        let token = testkit::timestamp_token(
+            &certificate,
+            &key,
+            DigestAlgorithm::Sha256,
+            &DigestAlgorithm::Sha256.digest(STAMPED),
+            testkit::day(AFTER_EXPIRY),
+        );
+        assert_eq!(
+            verify_token(&token, |named| named.digest(STAMPED)),
+            Err(TimestampError::NoUsableTsaCertificate)
+        );
     }
 }

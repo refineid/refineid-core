@@ -14,10 +14,11 @@
 //! unfiltered -- a handful of entries buys nothing from compression,
 //! and unfiltered rows keep the update inspectable.
 
-use super::{
-    MAX_XREF_ENTRIES, PdfDictionary, PdfError, XrefEntry, XrefLocation, XrefSection, dictionary_at,
-    dictionary_usize, find_first, parse_u16, parse_u32, parse_usize, read_pdf_token,
-    skip_pdf_whitespace,
+use super::PdfError;
+use super::index::{
+    ARRAY_CLOSE, ARRAY_OPEN, DICTIONARY_OPEN, MAX_XREF_ENTRIES, PdfDictionary, PdfObjectReference,
+    PdfValueParser, XrefEntry, XrefLocation, XrefSection, dictionary_at, dictionary_usize,
+    dictionary_value, find_first, object_header_end, parse_u32, parse_usize,
 };
 
 /// Bound on any one decoded stream, so a hostile document cannot make
@@ -84,6 +85,41 @@ const PAIR_TOKENS: usize = 2;
 /// a two-byte generation.
 const WRITTEN_WIDTHS: [usize; ENTRY_FIELDS] = [1, 4, 2];
 
+/// Position of the type field in an entry row.
+const FIELD_TYPE: usize = 0;
+
+/// Position of the second field: the offset of a direct entry, the
+/// object stream number of a compressed one.
+const FIELD_SECOND: usize = 1;
+
+/// Position of the third field: the generation of a direct entry, the
+/// index inside the object stream of a compressed one.
+const FIELD_THIRD: usize = 2;
+
+/// Radix of one big-endian field byte.
+const BYTE_RADIX: usize = 1 << u8::BITS;
+
+/// `/Type` of a cross-reference stream (ISO 32000-1 sec.7.5.8.2).
+const TYPE_XREF: &[u8] = b"/XRef";
+
+/// `/Type` key.
+const KEY_TYPE: &[u8] = b"Type";
+
+/// Stream dictionary key: the cross-reference entry field widths.
+const KEY_WIDTHS: &[u8] = b"W";
+
+/// Stream dictionary key: the subsection pairs.
+const KEY_INDEX: &[u8] = b"Index";
+
+/// Stream dictionary key: the number of entries.
+const KEY_SIZE: &[u8] = b"Size";
+
+/// Object stream key: the offset of the first object.
+const KEY_FIRST: &[u8] = b"First";
+
+/// Object stream key: the number of objects.
+const KEY_COUNT: &[u8] = b"N";
+
 /// One stream object: its dictionary and its decoded payload.
 struct StreamObject {
     /// The stream dictionary, as written.
@@ -95,17 +131,17 @@ struct StreamObject {
 /// One cross-reference stream section at `offset`.
 pub(super) fn parse_stream_section(pdf: &[u8], offset: usize) -> Result<XrefSection, PdfError> {
     let object = parse_stream_object(pdf, offset)?;
-    if find_first(&object.dictionary, b"/XRef").is_none() {
+    if dictionary_value(&object.dictionary, KEY_TYPE).map(trim) != Some(TYPE_XREF) {
         return Err(PdfError::MissingTrailer);
     }
-    let widths: [usize; ENTRY_FIELDS] = integer_array(&object.dictionary, b"/W")
+    let widths: [usize; ENTRY_FIELDS] = integer_array(&object.dictionary, KEY_WIDTHS)
         .try_into()
         .map_err(|_ignored| PdfError::MissingTrailer)?;
-    let size = dictionary_usize(&object.dictionary, b"/Size").ok_or(PdfError::MissingTrailer)?;
+    let size = dictionary_usize(&object.dictionary, KEY_SIZE).ok_or(PdfError::MissingTrailer)?;
     if size > MAX_XREF_ENTRIES {
         return Err(PdfError::MissingTrailer);
     }
-    let mut subsections = integer_array(&object.dictionary, b"/Index");
+    let mut subsections = integer_array(&object.dictionary, KEY_INDEX);
     if subsections.is_empty() {
         subsections = vec![0, size];
     }
@@ -125,36 +161,68 @@ pub(super) fn compressed_body(
     number: u32,
     position: u32,
 ) -> Option<Vec<u8>> {
-    let object = parse_stream_object(pdf, container_offset).ok()?;
-    let first = dictionary_usize(&object.dictionary, b"/First")?;
-    let count = dictionary_usize(&object.dictionary, b"/N")?;
-    let position = usize::try_from(position).ok()?;
-    if position >= count || first > object.payload.len() {
-        return None;
+    ObjectStream::at(pdf, container_offset)?.body(number, position)
+}
+
+/// One object stream, decoded once so each object it holds can be
+/// sliced out of it (ISO 32000-1 sec.7.5.7).
+pub(super) struct ObjectStream {
+    /// Offset of the first object, past the leading number table.
+    first: usize,
+    /// How many objects the stream holds.
+    count: usize,
+    /// The decoded payload.
+    payload: Vec<u8>,
+}
+
+impl ObjectStream {
+    /// The object stream at `container_offset`, `None` when it does
+    /// not parse.
+    pub(super) fn at(pdf: &[u8], container_offset: usize) -> Option<Self> {
+        let object = parse_stream_object(pdf, container_offset).ok()?;
+        let first = dictionary_usize(&object.dictionary, KEY_FIRST)?;
+        let count = dictionary_usize(&object.dictionary, KEY_COUNT)?;
+        if first > object.payload.len() {
+            return None;
+        }
+        Some(Self {
+            first,
+            count,
+            payload: object.payload,
+        })
     }
-    let header = object.payload.get(..first)?;
-    let tokens: Vec<&[u8]> = header
-        .split(u8::is_ascii_whitespace)
-        .filter(|token| !token.is_empty())
-        .collect();
-    let declared = parse_u32(tokens.get(position.saturating_mul(PAIR_TOKENS)).copied()?)?;
-    if declared != number {
-        return None;
-    }
-    let offset_token = tokens
-        .get(position.saturating_mul(PAIR_TOKENS).saturating_add(1))
-        .copied()?;
-    let start = first.saturating_add(parse_usize(offset_token)?);
-    let next = position.saturating_add(1);
-    let end = if next < count {
-        let token = tokens
-            .get(next.saturating_mul(PAIR_TOKENS).saturating_add(1))
+
+    /// The bytes of object `number` at `position` in the stream,
+    /// `None` when the table does not name it there.
+    pub(super) fn body(&self, number: u32, position: u32) -> Option<Vec<u8>> {
+        let position = usize::try_from(position).ok()?;
+        if position >= self.count {
+            return None;
+        }
+        let header = self.payload.get(..self.first)?;
+        let tokens: Vec<&[u8]> = header
+            .split(|byte| PdfValueParser::is_whitespace(*byte))
+            .filter(|token| !token.is_empty())
+            .collect();
+        let declared = parse_u32(tokens.get(position.saturating_mul(PAIR_TOKENS)).copied()?)?;
+        if declared != number {
+            return None;
+        }
+        let offset_token = tokens
+            .get(position.saturating_mul(PAIR_TOKENS).saturating_add(1))
             .copied()?;
-        first.saturating_add(parse_usize(token)?)
-    } else {
-        object.payload.len()
-    };
-    object.payload.get(start..end).map(<[u8]>::to_vec)
+        let start = self.first.saturating_add(parse_usize(offset_token)?);
+        let next = position.saturating_add(1);
+        let end = if next < self.count {
+            let token = tokens
+                .get(next.saturating_mul(PAIR_TOKENS).saturating_add(1))
+                .copied()?;
+            self.first.saturating_add(parse_usize(token)?)
+        } else {
+            self.payload.len()
+        };
+        self.payload.get(start..end).map(<[u8]>::to_vec)
+    }
 }
 
 /// Close the revision with a cross-reference stream: one subsection
@@ -200,16 +268,32 @@ pub(super) fn push_stream_close(
     Ok(())
 }
 
-/// The stream object at `offset`, its payload decoded.
-fn parse_stream_object(pdf: &[u8], offset: usize) -> Result<StreamObject, PdfError> {
-    let mut cursor = skip_pdf_whitespace(pdf, offset);
-    let _number = parse_u32(read_pdf_token(pdf, &mut cursor).ok_or(PdfError::MissingTrailer)?)
-        .ok_or(PdfError::MissingTrailer)?;
-    let _generation = parse_u16(read_pdf_token(pdf, &mut cursor).ok_or(PdfError::MissingTrailer)?)
-        .ok_or(PdfError::MissingTrailer)?;
-    if read_pdf_token(pdf, &mut cursor).ok_or(PdfError::MissingTrailer)? != b"obj" {
+/// The decoded payload of the stream object `reference` at `offset`.
+///
+/// # Errors
+/// [`PdfError::MissingTrailer`] when the object at `offset` is not
+/// `reference` or not a stream, and
+/// [`PdfError::UnsupportedCrossReferenceStream`] for a filter other
+/// than `FlateDecode`.
+pub(super) fn stream_payload(
+    pdf: &[u8],
+    offset: usize,
+    reference: PdfObjectReference,
+) -> Result<Vec<u8>, PdfError> {
+    if object_header_end(pdf, reference, offset).is_none() {
         return Err(PdfError::MissingTrailer);
     }
+    parse_stream_object(pdf, offset).map(|object| object.payload)
+}
+
+/// The stream object at `offset`, its payload decoded.
+fn parse_stream_object(pdf: &[u8], offset: usize) -> Result<StreamObject, PdfError> {
+    let mut parser = PdfValueParser::new(pdf);
+    parser.offset = offset;
+    let number = parser.unsigned_u32().ok_or(PdfError::MissingTrailer)?;
+    let generation = parser.unsigned_u16().ok_or(PdfError::MissingTrailer)?;
+    let cursor = object_header_end(pdf, PdfObjectReference { number, generation }, offset)
+        .ok_or(PdfError::MissingTrailer)?;
     let (dictionary, after) = dictionary_at(pdf, cursor).ok_or(PdfError::MissingTrailer)?;
     let raw = raw_payload(pdf, after, &dictionary)?;
     let payload = decoded(&raw, &dictionary)?;
@@ -334,7 +418,7 @@ fn decode_parameters(dictionary: &[u8]) -> Result<Option<Vec<u8>>, PdfError> {
     };
     let Some(entry) = entry else { return Ok(None) };
     let value = trim(&dictionary[entry.value.clone()]);
-    if value.starts_with(b"<<") {
+    if value.starts_with(DICTIONARY_OPEN) {
         return Ok(Some(value.to_vec()));
     }
     // An indirect or array-shaped parameter set is not a shape this
@@ -463,50 +547,58 @@ fn entry_from_row(
         let mut value = 0_usize;
         for _ in 0..*width {
             value = value
-                .checked_mul(256)
+                .checked_mul(BYTE_RADIX)
                 .and_then(|wide| wide.checked_add(usize::from(row[at])))
                 .ok_or(PdfError::MissingTrailer)?;
             at = at.saturating_add(1);
         }
-        if position == 0 && *width == 0 {
+        if position == FIELD_TYPE && *width == 0 {
             value = TYPE_DIRECT;
         }
         fields[position] = value;
     }
-    let location = match fields[0] {
-        TYPE_DIRECT => XrefLocation::Direct { offset: fields[1] },
-        TYPE_COMPRESSED => XrefLocation::Compressed {
-            container: u32::try_from(fields[1]).map_err(|_ignored| PdfError::MissingTrailer)?,
-            position: u32::try_from(fields[2]).map_err(|_ignored| PdfError::MissingTrailer)?,
-        },
-        _ => XrefLocation::Free,
+    // A direct entry's third field is its generation; an object inside
+    // an object stream has generation zero (ISO 32000-1 Table 18).
+    let (location, generation) = match fields[FIELD_TYPE] {
+        TYPE_DIRECT => (
+            XrefLocation::Direct {
+                offset: fields[FIELD_SECOND],
+            },
+            u16::try_from(fields[FIELD_THIRD]).map_err(|_ignored| PdfError::MissingTrailer)?,
+        ),
+        TYPE_COMPRESSED => (
+            XrefLocation::Compressed {
+                container: u32::try_from(fields[FIELD_SECOND])
+                    .map_err(|_ignored| PdfError::MissingTrailer)?,
+                position: u32::try_from(fields[FIELD_THIRD])
+                    .map_err(|_ignored| PdfError::MissingTrailer)?,
+            },
+            0,
+        ),
+        _ => (XrefLocation::Free, 0),
     };
     Ok(XrefEntry {
         number,
-        generation: 0,
+        generation,
         location,
     })
 }
 
-/// The integer array under `key`, empty when absent or malformed.
+/// The direct integer array under `key`, empty when absent or
+/// malformed.
 fn integer_array(dictionary: &[u8], key: &[u8]) -> Vec<usize> {
-    let Some(at) = find_first(dictionary, key) else {
+    let Some(value) = dictionary_value(dictionary, key) else {
         return Vec::new();
     };
-    let rest = &dictionary[at.saturating_add(key.len())..];
-    let Some(open) = rest.iter().position(|byte| !byte.is_ascii_whitespace()) else {
-        return Vec::new();
-    };
-    if rest.get(open) != Some(&b'[') {
-        return Vec::new();
-    }
-    let body = &rest[open.saturating_add(1)..];
-    let Some(close) = find_first(body, b"]") else {
+    let Some(body) = trim(value)
+        .strip_prefix(ARRAY_OPEN)
+        .and_then(|inner| inner.strip_suffix(ARRAY_CLOSE))
+    else {
         return Vec::new();
     };
     let mut values = Vec::new();
-    for token in body[..close]
-        .split(u8::is_ascii_whitespace)
+    for token in body
+        .split(|byte| PdfValueParser::is_whitespace(*byte))
         .filter(|token| !token.is_empty())
     {
         let Some(value) = parse_usize(token) else {
@@ -521,11 +613,11 @@ fn integer_array(dictionary: &[u8], key: &[u8]) -> Vec<usize> {
 fn trim(bytes: &[u8]) -> &[u8] {
     let start = bytes
         .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
+        .position(|byte| !PdfValueParser::is_whitespace(*byte))
         .unwrap_or(bytes.len());
     let end = bytes
         .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
+        .rposition(|byte| !PdfValueParser::is_whitespace(*byte))
         .map_or(start, |found| found.saturating_add(1));
     &bytes[start..end]
 }

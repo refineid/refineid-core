@@ -27,4 +27,6 @@ mod hex;
 pub mod oid;
 pub mod rsa;
 pub mod signed_data;
+#[cfg(any(test, feature = "testkit"))]
+pub mod testkit;
 pub mod x509;

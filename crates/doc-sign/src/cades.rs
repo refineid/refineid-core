@@ -103,6 +103,28 @@ impl DigestAlgorithm {
         }
     }
 
+    /// The digest algorithm `oid` names, `None` for any other than
+    /// SHA-256 and SHA-384 (OIDs from RFC 5754 sec.2).
+    #[must_use]
+    pub fn from_oid(oid: oid::Oid<'_>) -> Option<Self> {
+        if oid == oid::known::SHA256 {
+            Some(Self::Sha256)
+        } else if oid == oid::known::SHA384 {
+            Some(Self::Sha384)
+        } else {
+            None
+        }
+    }
+
+    /// Output length in octets (FIPS 180-4 sec.1).
+    #[must_use]
+    pub const fn digest_len(self) -> usize {
+        match self {
+            Self::Sha256 => crate::digest::SHA256_LEN,
+            Self::Sha384 => crate::digest::SHA384_LEN,
+        }
+    }
+
     /// The OID for this digest algorithm.
     #[must_use]
     pub(crate) const fn oid(self) -> oid::Oid<'static> {

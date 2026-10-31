@@ -37,7 +37,7 @@
 //! not the first, because a mark sitting a little further in is worth
 //! more than one small enough for the very corner.
 
-use super::{
+use super::index::{
     PdfDictionary, PdfIndex, PdfObjectReference, PdfValueParser, complete_object_reference,
     complete_reference_array, parse_usize, validation_references,
 };
@@ -942,7 +942,7 @@ const fn hex_digit(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::PdfIndex;
+    use super::super::index::PdfIndex;
     use super::free;
 
     /// A one-page PDF whose page dictionary carries `page_extra`, with

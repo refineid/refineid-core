@@ -20,14 +20,19 @@
 //! - [`SignedData::parse`] -- accepts either the bare
 //!   `SignedData` SEQUENCE or the outer `ContentInfo`-wrapped
 //!   form.
-//! - [`SignedData`] holds the encapsulated content
-//!   (`econtent_der`), the embedded certificates, and the sole
-//!   signerInfo's signature material.
-//! - [`SignedData::verify`] verifies the signerInfo's signature
-//!   against a supplied signer public key. Handles
-//!   both the "signedAttrs present" path (sign over DER(SET OF
-//!   attrs)) and the "signedAttrs absent" path (sign over
-//!   eContent directly).
+//! - [`SignedData`] holds the encapsulated content when it is
+//!   attached, the embedded certificates and revocation information,
+//!   and the sole signerInfo with its signed and unsigned attributes.
+//! - [`SignedData::verify`] verifies the signature and the
+//!   `messageDigest` binding against attached content;
+//!   [`SignedData::verify_detached`] does the same against content
+//!   the caller supplies; [`SignedData::verify_signer_signature`]
+//!   checks the signature alone.
+//!
+//! The signerInfo's algorithms are refined at the border: the digest
+//! algorithm is a SHA-2 [`HashAlgorithm`], the signature algorithm is
+//! a [`SignatureScheme`] whose hash is the digest algorithm, and every
+//! `AlgorithmIdentifier` carries exactly the parameters its RFC fixes.
 //!
 //! Not in scope: countersignatures and non-X.509 certificate
 //! choices. Multiple signerInfos are rejected because every
@@ -36,6 +41,7 @@
 use refineid_ber::{
     BerTag, BerTlv, BerTlvAny, BerTlvIter, Integer, OctetString, Oid, Sequence, Set,
 };
+use refineid_digest::{SHA256_LEN, SHA384_LEN, SHA512_LEN};
 
 /// `[0] EXPLICIT` (the constructed context-class tag, number 0).
 ///
@@ -50,9 +56,11 @@ impl BerTag for Asn1ContentExplicit0 {
     const TAG: u16 = 0xA0;
 }
 
-/// `[1] IMPLICIT` (the constructed context-class tag, number 1).
+/// `[1] IMPLICIT` (the constructed context-class tag, number 1):
+/// `SignedData.crls`, `SignerInfo.unsignedAttrs`, and the `other`
+/// alternative of `RevocationInfoChoice` (RFC 5652 sec.10.2.1).
 #[derive(Debug, Clone, Copy)]
-struct Asn1ContentImplicit1;
+pub struct Asn1ContentImplicit1;
 impl BerTag for Asn1ContentImplicit1 {
     const TAG: u16 = 0xA1;
 }
@@ -63,11 +71,20 @@ struct SignerSubjectKeyIdentifier;
 impl BerTag for SignerSubjectKeyIdentifier {
     const TAG: u16 = 0x80;
 }
+
+/// ASN.1 universal `NULL` (X.690 sec.8.8), the only parameter form an
+/// RSA `AlgorithmIdentifier` may carry.
+#[derive(Debug, Clone, Copy)]
+struct Asn1Null;
+impl BerTag for Asn1Null {
+    const TAG: u16 = 0x05;
+}
+
 use crate::container::{EcdsaDer, RsaPkcs1Sha256, RsaPkcs1Sha384, RsaPkcs1Sha512, Signature};
 use crate::ecdsa::{self, EcdsaError};
 use crate::oid::known;
 use crate::rsa::{RsaPublicKey, RsaVerifyError, verify_pkcs1v15_sha384, verify_pkcs1v15_sha512};
-use crate::x509::{X509Error, extract_rsa_public_key};
+use crate::x509::{EcCurve, PublicKeyAlgorithm, SpkiDer, X509Error, extract_rsa_public_key};
 use sha2::{Digest as _, Sha256, Sha384, Sha512};
 
 // OID values are the typed `oid::known` constants (single source of
@@ -100,9 +117,18 @@ impl HashAlgorithm {
         }
     }
 
+    /// The OID naming this algorithm.
+    #[must_use]
+    pub const fn oid(self) -> crate::oid::Oid<'static> {
+        match self {
+            Self::Sha256 => known::SHA256,
+            Self::Sha384 => known::SHA384,
+            Self::Sha512 => known::SHA512,
+        }
+    }
+
     /// Compute the digest of `data` under this algorithm.
-    /// Returns the raw output bytes (32 / 48 / 64 bytes
-    /// respectively).
+    /// Returns the raw output bytes ([`Self::digest_len`] of them).
     #[must_use]
     pub fn digest(self, data: &[u8]) -> Vec<u8> {
         let bytes = data;
@@ -125,6 +151,16 @@ impl HashAlgorithm {
         }
     }
 
+    /// Output length in octets (FIPS 180-4 sec.1).
+    #[must_use]
+    pub const fn digest_len(self) -> usize {
+        match self {
+            Self::Sha256 => SHA256_LEN,
+            Self::Sha384 => SHA384_LEN,
+            Self::Sha512 => SHA512_LEN,
+        }
+    }
+
     /// Human-readable label ("SHA-256" / "SHA-384" / "SHA-512")
     /// used for diagnostic output.
     #[must_use]
@@ -135,6 +171,34 @@ impl HashAlgorithm {
             Self::Sha512 => "SHA-512",
         }
     }
+}
+
+/// The signature scheme of a `SignerInfo`, whose hash is always the
+/// signerInfo's digest algorithm.
+///
+/// RFC 5754 sec.3.2 names `sha{256,384,512}WithRSAEncryption`, RFC
+/// 5758 sec.3.2 `ecdsa-with-SHA{256,384,512}`; a scheme whose hash
+/// differs from `digestAlgorithm` is refused at the border. The bare
+/// key identifiers `rsaEncryption` (RFC 3370 sec.3.2) and
+/// `id-ecPublicKey` (RFC 5480 sec.2.1.1) take their hash from
+/// `digestAlgorithm` and map to the same two schemes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureScheme {
+    /// RSASSA-PKCS1-v1_5 (RFC 8017 sec.8.2).
+    RsaPkcs1,
+    /// ECDSA over P-256 or P-384 (FIPS 186-4 sec.6), the signature a
+    /// DER `Ecdsa-Sig-Value` (RFC 3279 sec.2.2.3).
+    Ecdsa,
+}
+
+/// How a known signature `AlgorithmIdentifier` may carry parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParameterRule {
+    /// NULL or absent: SHA-2 digests (RFC 5754 sec.2) and the RSA
+    /// signature identifiers (RFC 5754 sec.3.2, RFC 4055 sec.5).
+    NullOrAbsent,
+    /// Absent: the ECDSA signature identifiers (RFC 5758 sec.3.2).
+    Absent,
 }
 
 // ----- SignedData public surface -----
@@ -161,9 +225,33 @@ pub enum CmsError {
     /// `signatureAlgorithm` OID didn't match the RSA / ECDSA
     /// variants refineid supports.
     UnsupportedSignatureAlgorithm,
+    /// The signature algorithm names a hash other than the
+    /// signerInfo's `digestAlgorithm`.
+    AlgorithmMismatch,
+    /// An `AlgorithmIdentifier` carries parameters its algorithm does
+    /// not define: anything but NULL or absent for SHA-2 and RSA,
+    /// anything at all for ECDSA.
+    AlgorithmParameters,
+    /// The `messageDigest` attribute's length is not the digest
+    /// algorithm's output length.
+    MessageDigestLength,
+    /// The `SignedData` is detached -- it carries no `eContent` --
+    /// where the operation needs the content attached.
+    DetachedContent,
+    /// The `SignedData` carries `eContent` where the caller supplies
+    /// the content as detached.
+    AttachedContent,
     /// Signer cert exists but its SPKI didn't parse into a
-    /// supported RSA / ECDSA key.
+    /// supported RSA key or P-256 / P-384 EC key.
     BadSignerKey,
+    /// The signer's key is RSA where the scheme is ECDSA, or EC where
+    /// the scheme is RSA.
+    SignatureKeyMismatch,
+    /// The signature value does not have the shape the key fixes: an
+    /// RSA value of another length than the modulus, or an ECDSA
+    /// value that is not one canonical DER pair within the curve
+    /// order.
+    SignatureShape,
     /// `messageDigest` signed attribute didn't equal
     /// `Hash(eContent)`. Signature wasn't verified after this
     /// check failed (one of two PA preconditions per RFC 5652).
@@ -197,7 +285,30 @@ impl core::fmt::Display for CmsError {
             Self::UnsupportedSignatureAlgorithm => {
                 write!(f, "CMS: unsupported signature algorithm")
             }
-            Self::BadSignerKey => write!(f, "CMS: signer key did not parse as RSA"),
+            Self::AlgorithmMismatch => {
+                write!(
+                    f,
+                    "CMS: signature algorithm hash differs from digestAlgorithm"
+                )
+            }
+            Self::AlgorithmParameters => {
+                write!(f, "CMS: AlgorithmIdentifier parameters not allowed")
+            }
+            Self::MessageDigestLength => {
+                write!(
+                    f,
+                    "CMS: messageDigest length differs from the digest length"
+                )
+            }
+            Self::DetachedContent => write!(f, "CMS: detached SignedData carries no eContent"),
+            Self::AttachedContent => {
+                write!(f, "CMS: SignedData carries eContent, not detached content")
+            }
+            Self::BadSignerKey => write!(f, "CMS: signer key is not a supported RSA or EC key"),
+            Self::SignatureKeyMismatch => {
+                write!(f, "CMS: signature scheme does not fit the signer key")
+            }
+            Self::SignatureShape => write!(f, "CMS: signature value does not fit the signer key"),
             Self::SignerHashMismatch => write!(f, "CMS: messageDigest attr != hash(eContent)"),
             Self::Rsa(e) => write!(f, "CMS: RSA verify: {e}"),
             Self::Ecdsa(e) => write!(f, "CMS: ECDSA verify: {e}"),
@@ -216,12 +327,17 @@ pub struct SignedData<'a> {
     /// the OID structure at the trust boundary, so consumers
     /// never compare against arbitrary `&[u8]`.
     pub econtent_type_oid: crate::oid::Oid<'a>,
-    /// Inner `eContent` OCTET STRING value bytes.
-    pub econtent_der: &'a [u8],
+    /// Inner `eContent` OCTET STRING value bytes, `None` for a
+    /// detached `SignedData` (RFC 5652 sec.5.2: `eContent` is
+    /// OPTIONAL).
+    pub econtent_der: Option<&'a [u8]>,
     /// Embedded certificates (typically the signer certificate
     /// and its issuers). Each entry is the raw DER of one cert
     /// SEQUENCE.
     pub certificates_der: Vec<&'a [u8]>,
+    /// The `crls` field's `RevocationInfoChoice` entries, in
+    /// encoded order (RFC 5652 sec.10.2.1). Empty when absent.
+    pub revocation_info: Vec<RevocationInfoChoice<'a>>,
     /// The sole signerInfo's fields.
     pub signer: SignerInfo<'a>,
 }
@@ -240,10 +356,27 @@ pub enum SignerIdentifier<'a> {
     SubjectKeyIdentifier(&'a [u8]),
 }
 
-/// A structurally validated CMS attribute retained for profile-specific
-/// consumers such as RFC 3161 ESS certificate binding.
+/// One `RevocationInfoChoice` of a `SignedData.crls` field
+/// (RFC 5652 sec.10.2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SignedAttribute<'a> {
+pub enum RevocationInfoChoice<'a> {
+    /// `crl CertificateList`: the complete CRL DER.
+    Crl(&'a [u8]),
+    /// `other [1] IMPLICIT OtherRevocationInfoFormat`.
+    Other {
+        /// `otherRevInfoFormat`, e.g. `id-ri-ocsp-response` (RFC 5940).
+        format: crate::oid::Oid<'a>,
+        /// `otherRevInfo`: the complete DER of the one value that
+        /// follows the format OID.
+        info_der: &'a [u8],
+    },
+}
+
+/// A structurally validated CMS attribute (RFC 5652 sec.5.3), signed
+/// or unsigned, retained for profile-specific consumers such as
+/// RFC 3161 ESS certificate binding and `CAdES` timestamps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CmsAttribute<'a> {
     /// Attribute type OID.
     pub oid: crate::oid::Oid<'a>,
     /// Contents of the attribute's `SET OF AttributeValue`.
@@ -256,10 +389,11 @@ pub struct SignedAttribute<'a> {
 pub struct SignerInfo<'a> {
     /// Certificate identifier carried by the signerInfo.
     pub signer_identifier: SignerIdentifier<'a>,
-    /// `digestAlgorithm` OID body. Typed via [`crate::oid::Oid`].
-    pub digest_algorithm_oid: crate::oid::Oid<'a>,
-    /// `signatureAlgorithm` OID body. Typed via [`crate::oid::Oid`].
-    pub signature_algorithm_oid: crate::oid::Oid<'a>,
+    /// `digestAlgorithm`, a SHA-2 algorithm with NULL or absent
+    /// parameters.
+    pub digest_algorithm: HashAlgorithm,
+    /// `signatureAlgorithm`, whose hash is [`Self::digest_algorithm`].
+    pub signature_scheme: SignatureScheme,
     /// Signature value bytes (raw, no BIT STRING wrapper).
     pub signature: &'a [u8],
     /// If `signedAttrs` was present, the DER bytes of the
@@ -269,10 +403,12 @@ pub struct SignerInfo<'a> {
     pub signed_data_to_verify: Option<Vec<u8>>,
     /// Signed attributes, in their encoded order. Empty when the
     /// signerInfo has no signed attributes.
-    pub signed_attributes: Vec<SignedAttribute<'a>>,
+    pub signed_attributes: Vec<CmsAttribute<'a>>,
+    /// Unsigned attributes, in their encoded order. Empty when the
+    /// signerInfo has no `unsignedAttrs`.
+    pub unsigned_attributes: Vec<CmsAttribute<'a>>,
     /// `messageDigest` attribute value, when `signedAttrs` was
-    /// present. Used to cross-check that the signer's commitment
-    /// to the eContent hash matches what we'd compute ourselves.
+    /// present; its length is the digest algorithm's output length.
     pub message_digest: Option<&'a [u8]>,
 }
 
@@ -341,6 +477,10 @@ impl<'a> SignedData<'a> {
     /// The detection is by the outer tag byte; the function never
     /// touches the inner certificate / signature material beyond
     /// borrowing slices from `input` (lifetime-tied output).
+    ///
+    /// # Errors
+    /// [`CmsError`] for any structural, algorithm or attribute
+    /// invariant the input breaks.
     pub fn parse(input: &'a [u8]) -> Result<Self, CmsError> {
         // `split_first` fuses the empty-input check and the first-byte
         // peek into one pattern, leaving no bare indexing on `input[0]`.
@@ -396,11 +536,20 @@ struct SignerInfoBody<'a> {
 /// Parsed mandatory fields from a signed-attribute set.
 struct ParsedSignedAttributes<'a> {
     /// All attributes, retained for profile-specific validation.
-    attributes: Vec<SignedAttribute<'a>>,
+    attributes: Vec<CmsAttribute<'a>>,
     /// Unique `contentType` value.
     content_type: Option<crate::oid::Oid<'a>>,
     /// Unique `messageDigest` value.
     message_digest: Option<&'a [u8]>,
+}
+
+/// An `AlgorithmIdentifier` split into its OID and its optional
+/// parameters TLV.
+struct AlgorithmIdentifierParts<'a> {
+    /// `algorithm`.
+    oid: crate::oid::Oid<'a>,
+    /// `parameters`, when present.
+    parameters: Option<BerTlvAny<'a>>,
 }
 
 impl CmsHelpers {
@@ -506,13 +655,9 @@ impl CmsHelpers {
             CmsError::UnexpectedStructure("eContentType OID malformed"),
         ))?;
         // `eContent [0] EXPLICIT` is optional: absent means the
-        // detached form, where the caller supplies the content by
-        // overwriting `econtent_der` before `verify` (the `ASiC`
-        // verifier does this with the manifest bytes). Until then
-        // the field reads empty, and `verify` fails closed on any
-        // signature whose messageDigest does not match empty input.
+        // detached form (RFC 5652 sec.5.2).
         let econtent_der = match e_it.next() {
-            None => b"".as_slice(),
+            None => None,
             Some(field) => {
                 let explicit = field?.expect::<Asn1ContentExplicit0>().or(Err(
                     CmsError::UnexpectedStructure("eContent is not [0] EXPLICIT"),
@@ -526,7 +671,7 @@ impl CmsHelpers {
                     explicit.value(),
                     "trailing bytes in eContent",
                 )?;
-                econtent_octet.value()
+                Some(econtent_octet.value())
             }
         };
 
@@ -547,6 +692,7 @@ impl CmsHelpers {
             certificates_der = Self::parse_certificates(certificates.value())?;
             field_index = field_index.saturating_add(1);
         }
+        let mut revocation_info = Vec::new();
         if remaining
             .get(field_index)
             .is_some_and(|field| field.tag() == <Asn1ContentImplicit1 as BerTag>::TAG)
@@ -554,7 +700,7 @@ impl CmsHelpers {
             let crls = remaining
                 .get(field_index)
                 .ok_or(CmsError::UnexpectedStructure("crls missing"))?;
-            Self::validate_nonempty_tlv_stream(crls.value(), "empty crls field")?;
+            revocation_info = Self::parse_revocation_info(crls.value())?;
             field_index = field_index.saturating_add(1);
         }
 
@@ -597,7 +743,7 @@ impl CmsHelpers {
             },
             econtent_type_oid,
         )?;
-        if !digest_algorithm_oids.contains(&signer.digest_algorithm_oid) {
+        if !digest_algorithm_oids.contains(&signer.digest_algorithm.oid()) {
             return Err(CmsError::UnexpectedStructure(
                 "signer digestAlgorithm absent from SignedData set",
             ));
@@ -607,11 +753,13 @@ impl CmsHelpers {
             econtent_type_oid,
             econtent_der,
             certificates_der,
+            revocation_info,
             signer,
         })
     }
 
-    /// Parse and validate every `AlgorithmIdentifier` in the digest set.
+    /// Parse every `AlgorithmIdentifier` in the digest set; each
+    /// carries NULL or absent parameters (RFC 5754 sec.2).
     fn parse_digest_algorithms(
         digest_algorithms: &[u8],
     ) -> Result<Vec<crate::oid::Oid<'_>>, CmsError> {
@@ -623,7 +771,9 @@ impl CmsHelpers {
                     .or(Err(CmsError::UnexpectedStructure(
                         "digestAlgorithms entry not SEQUENCE",
                     )))?;
-            algorithms.push(Self::parse_algorithm_identifier(algorithm)?);
+            let parts = Self::parse_algorithm_identifier(algorithm)?;
+            Self::check_parameters(&parts, ParameterRule::NullOrAbsent)?;
+            algorithms.push(parts.oid);
         }
         if algorithms.is_empty() {
             return Err(CmsError::UnexpectedStructure("digestAlgorithms is empty"));
@@ -631,10 +781,11 @@ impl CmsHelpers {
         Ok(algorithms)
     }
 
-    /// Parse an `AlgorithmIdentifier` and reject extra children.
+    /// Split an `AlgorithmIdentifier` into its OID and optional
+    /// parameters, rejecting extra children.
     fn parse_algorithm_identifier(
         algorithm: BerTlv<'_, Sequence>,
-    ) -> Result<crate::oid::Oid<'_>, CmsError> {
+    ) -> Result<AlgorithmIdentifierParts<'_>, CmsError> {
         let mut it = algorithm.iter_children();
         let oid = it
             .next()
@@ -648,16 +799,84 @@ impl CmsHelpers {
         let oid = crate::oid::Oid::new(oid.value()).or(Err(CmsError::UnexpectedStructure(
             "AlgorithmIdentifier OID malformed",
         )))?;
-        if let Some(parameters) = it.next() {
-            parameters?;
-            if let Some(extra) = it.next() {
-                extra?;
-                return Err(CmsError::UnexpectedStructure(
-                    "AlgorithmIdentifier has trailing fields",
-                ));
+        let parameters = it.next().transpose()?;
+        if it.next().is_some() {
+            return Err(CmsError::UnexpectedStructure(
+                "AlgorithmIdentifier has trailing fields",
+            ));
+        }
+        Ok(AlgorithmIdentifierParts { oid, parameters })
+    }
+
+    /// Enforce the parameter form `rule` fixes.
+    fn check_parameters(
+        parts: &AlgorithmIdentifierParts<'_>,
+        rule: ParameterRule,
+    ) -> Result<(), CmsError> {
+        match (parts.parameters, rule) {
+            (None, _) => Ok(()),
+            (Some(parameters), ParameterRule::NullOrAbsent)
+                if parameters.tag() == <Asn1Null as BerTag>::TAG
+                    && parameters.value().is_empty() =>
+            {
+                Ok(())
+            }
+            (Some(_), ParameterRule::NullOrAbsent | ParameterRule::Absent) => {
+                Err(CmsError::AlgorithmParameters)
             }
         }
-        Ok(oid)
+    }
+
+    /// Classify `signatureAlgorithm` against `digest`, enforcing its
+    /// parameter form and that its hash is `digest`.
+    fn signature_scheme(
+        parts: &AlgorithmIdentifierParts<'_>,
+        digest: HashAlgorithm,
+    ) -> Result<SignatureScheme, CmsError> {
+        let (scheme, named_hash, rule) = match parts.oid {
+            oid if oid == known::SHA256_WITH_RSA => (
+                SignatureScheme::RsaPkcs1,
+                Some(HashAlgorithm::Sha256),
+                ParameterRule::NullOrAbsent,
+            ),
+            oid if oid == known::SHA384_WITH_RSA => (
+                SignatureScheme::RsaPkcs1,
+                Some(HashAlgorithm::Sha384),
+                ParameterRule::NullOrAbsent,
+            ),
+            oid if oid == known::SHA512_WITH_RSA => (
+                SignatureScheme::RsaPkcs1,
+                Some(HashAlgorithm::Sha512),
+                ParameterRule::NullOrAbsent,
+            ),
+            oid if oid == known::RSA_ENCRYPTION => {
+                (SignatureScheme::RsaPkcs1, None, ParameterRule::NullOrAbsent)
+            }
+            oid if oid == known::ECDSA_WITH_SHA256 => (
+                SignatureScheme::Ecdsa,
+                Some(HashAlgorithm::Sha256),
+                ParameterRule::Absent,
+            ),
+            oid if oid == known::ECDSA_WITH_SHA384 => (
+                SignatureScheme::Ecdsa,
+                Some(HashAlgorithm::Sha384),
+                ParameterRule::Absent,
+            ),
+            oid if oid == known::ECDSA_WITH_SHA512 => (
+                SignatureScheme::Ecdsa,
+                Some(HashAlgorithm::Sha512),
+                ParameterRule::Absent,
+            ),
+            oid if oid == known::EC_PUBLIC_KEY => {
+                (SignatureScheme::Ecdsa, None, ParameterRule::Absent)
+            }
+            _ => return Err(CmsError::UnsupportedSignatureAlgorithm),
+        };
+        Self::check_parameters(parts, rule)?;
+        if named_hash.is_some_and(|named| named != digest) {
+            return Err(CmsError::AlgorithmMismatch);
+        }
+        Ok(scheme)
     }
 
     /// Collect direct X.509 `Certificate` choices and reject every other
@@ -684,6 +903,62 @@ impl CmsHelpers {
                 .ok_or(CmsError::UnexpectedStructure("certificate truncated"))?;
             result.push(certificate_der);
             cursor = end;
+        }
+        Ok(result)
+    }
+
+    /// Collect the `RevocationInfoChoice` entries and reject any
+    /// alternative RFC 5652 sec.10.2.1 does not define, and an empty
+    /// set.
+    fn parse_revocation_info(crls: &[u8]) -> Result<Vec<RevocationInfoChoice<'_>>, CmsError> {
+        let mut result = Vec::new();
+        let mut cursor = 0_usize;
+        while cursor < crls.len() {
+            let tail = crls
+                .get(cursor..)
+                .ok_or(CmsError::UnexpectedStructure("crls cursor invalid"))?;
+            let choice = BerTlvAny::parse(tail)?;
+            let end = cursor.saturating_add(choice.size());
+            let choice_der = crls
+                .get(cursor..end)
+                .ok_or(CmsError::UnexpectedStructure("crls entry truncated"))?;
+            if choice.tag() == <Sequence as BerTag>::TAG {
+                result.push(RevocationInfoChoice::Crl(choice_der));
+            } else if choice.tag() == <Asn1ContentImplicit1 as BerTag>::TAG {
+                let mut fields = BerTlvIter::new(choice.value());
+                let format = fields
+                    .next()
+                    .ok_or(CmsError::UnexpectedStructure("otherRevInfoFormat missing"))??
+                    .expect::<Oid>()
+                    .or(Err(CmsError::UnexpectedStructure(
+                        "otherRevInfoFormat not OID",
+                    )))?;
+                let format = crate::oid::Oid::new(format.value()).or(Err(
+                    CmsError::UnexpectedStructure("otherRevInfoFormat OID malformed"),
+                ))?;
+                let info = fields
+                    .next()
+                    .ok_or(CmsError::UnexpectedStructure("otherRevInfo missing"))??;
+                if fields.next().is_some() {
+                    return Err(CmsError::UnexpectedStructure(
+                        "OtherRevocationInfoFormat has trailing fields",
+                    ));
+                }
+                let info_start = choice.value().len().saturating_sub(info.size());
+                let info_der = choice
+                    .value()
+                    .get(info_start..)
+                    .ok_or(CmsError::UnexpectedStructure("otherRevInfo truncated"))?;
+                result.push(RevocationInfoChoice::Other { format, info_der });
+            } else {
+                return Err(CmsError::UnexpectedStructure(
+                    "unsupported CMS RevocationInfoChoice entry",
+                ));
+            }
+            cursor = end;
+        }
+        if result.is_empty() {
+            return Err(CmsError::UnexpectedStructure("empty crls field"));
         }
         Ok(result)
     }
@@ -728,7 +1003,10 @@ impl CmsHelpers {
             .or(Err(CmsError::UnexpectedStructure(
                 "digestAlgorithm not SEQUENCE",
             )))?;
-        let digest_algorithm_oid = Self::parse_algorithm_identifier(digest_alg_seq)?;
+        let digest_parts = Self::parse_algorithm_identifier(digest_alg_seq)?;
+        let digest_algorithm = HashAlgorithm::from_oid(digest_parts.oid)
+            .ok_or(CmsError::UnsupportedDigestAlgorithm)?;
+        Self::check_parameters(&digest_parts, ParameterRule::NullOrAbsent)?;
 
         let after_digest = children.next().ok_or(CmsError::UnexpectedStructure(
             "signerInfo missing signature material",
@@ -748,7 +1026,10 @@ impl CmsHelpers {
                 .or(Err(CmsError::UnexpectedStructure(
                     "signatureAlgorithm not SEQUENCE",
                 )))?;
-        let signature_algorithm_oid = Self::parse_algorithm_identifier(sig_alg_seq)?;
+        let signature_scheme = Self::signature_scheme(
+            &Self::parse_algorithm_identifier(sig_alg_seq)?,
+            digest_algorithm,
+        )?;
         let sig_octet = children
             .next()
             .ok_or(CmsError::UnexpectedStructure(
@@ -760,6 +1041,7 @@ impl CmsHelpers {
             )))?;
         let signature = sig_octet.value();
 
+        let mut unsigned_attributes = Vec::new();
         if let Some(unsigned_attrs) = children.next() {
             let unsigned_attrs = unsigned_attrs?;
             if unsigned_attrs.tag() != <Asn1ContentImplicit1 as BerTag>::TAG {
@@ -767,7 +1049,10 @@ impl CmsHelpers {
                     "signerInfo trailing field is not unsignedAttrs",
                 ));
             }
-            let _discarded = Self::parse_attributes(unsigned_attrs.value(), false)?;
+            unsigned_attributes = Self::parse_attributes(unsigned_attrs.value(), false)?.attributes;
+            if unsigned_attributes.is_empty() {
+                return Err(CmsError::UnexpectedStructure("unsignedAttrs is empty"));
+            }
         }
         if children.next().is_some() {
             return Err(CmsError::UnexpectedStructure(
@@ -796,17 +1081,24 @@ impl CmsHelpers {
                         "signed contentType does not match eContentType",
                     ));
                 }
+                if parsed
+                    .message_digest
+                    .is_some_and(|digest| digest.len() != digest_algorithm.digest_len())
+                {
+                    return Err(CmsError::MessageDigestLength);
+                }
                 (Some(rebuilt), parsed.attributes, parsed.message_digest)
             } else {
                 (None, Vec::new(), None)
             };
         Ok(SignerInfo {
             signer_identifier,
-            digest_algorithm_oid,
-            signature_algorithm_oid,
+            digest_algorithm,
+            signature_scheme,
             signature,
             signed_data_to_verify,
             signed_attributes,
+            unsigned_attributes,
             message_digest,
         })
     }
@@ -936,7 +1228,7 @@ impl CmsHelpers {
                 )?;
                 message_digest = Some(value.value());
             }
-            attributes.push(SignedAttribute {
+            attributes.push(CmsAttribute {
                 oid,
                 values_der: values.value(),
             });
@@ -961,69 +1253,130 @@ impl CmsHelpers {
 }
 
 impl SignedData<'_> {
-    /// Verify the signerInfo's signature against `signer_spki_der`
-    /// (the signer certificate's SPKI). When `signedAttrs` was present, also
-    /// verifies that the `messageDigest` attribute matches
-    /// `hash(eContent)`.
+    /// Verify the signerInfo against `signer_spki`, the signer
+    /// certificate's key, over the attached `eContent`: with signed
+    /// attributes, `messageDigest` must equal the digest of the
+    /// content and the signature must cover the attributes (RFC 5652
+    /// sec.5.4); without them, the signature covers the content.
     ///
     /// # Errors
-    /// Cross-check failure, unsupported algorithm, or RSA
-    /// verifier rejection.
-    pub fn verify(&self, signer_spki_der: &[u8]) -> Result<(), CmsError> {
-        let digest_alg = HashAlgorithm::from_oid(self.signer.digest_algorithm_oid)
-            .ok_or(CmsError::UnsupportedDigestAlgorithm)?;
+    /// [`CmsError::DetachedContent`] when no `eContent` is attached;
+    /// [`CmsError::SignerHashMismatch`] when `messageDigest` binds
+    /// other content; otherwise as for
+    /// [`Self::verify_signer_signature`].
+    pub fn verify(&self, signer_spki: SpkiDer<'_>) -> Result<(), CmsError> {
+        let econtent = self.econtent_der.ok_or(CmsError::DetachedContent)?;
+        self.verify_content(signer_spki, econtent)
+    }
 
-        // Signed attributes are only safe when they bind the eContent.
-        // The parser enforces this invariant; keep the check here too so
-        // callers constructing the public struct cannot bypass it.
-        if self.signer.signed_data_to_verify.is_some() {
-            let md = self
-                .signer
-                .message_digest
-                .ok_or(CmsError::UnexpectedStructure(
-                    "signedAttrs missing messageDigest",
-                ))?;
-            let expected = digest_alg.digest(self.econtent_der);
-            if expected != md {
-                return Err(CmsError::SignerHashMismatch);
-            }
+    /// Verify a detached `SignedData` against `content`, the data the
+    /// caller holds outside the structure (RFC 5652 sec.5.2). The
+    /// checks are those of [`Self::verify`].
+    ///
+    /// # Errors
+    /// [`CmsError::AttachedContent`] when the structure carries its
+    /// own `eContent`; otherwise as for [`Self::verify`].
+    pub fn verify_detached(
+        &self,
+        signer_spki: SpkiDer<'_>,
+        content: &[u8],
+    ) -> Result<(), CmsError> {
+        if self.econtent_der.is_some() {
+            return Err(CmsError::AttachedContent);
         }
+        self.verify_content(signer_spki, content)
+    }
 
-        // The data we actually verify with the signature is
-        // either the re-tagged signedAttrs SET (when present),
-        // or eContent directly.
-        let payload: &[u8] = self
-            .signer
-            .signed_data_to_verify
-            .as_deref()
-            .unwrap_or(self.econtent_der);
+    /// Verify only the signerInfo's signature against `signer_spki`:
+    /// over the re-tagged `signedAttrs` SET when present (RFC 5652
+    /// sec.5.4), else over the attached `eContent`. The
+    /// `messageDigest` attribute is not compared with any content.
+    ///
+    /// # Errors
+    /// [`CmsError::DetachedContent`] when there are neither signed
+    /// attributes nor `eContent`; [`CmsError::BadSignerKey`],
+    /// [`CmsError::SignatureKeyMismatch`] or
+    /// [`CmsError::SignatureShape`] when the key or the value does not
+    /// fit the scheme; [`CmsError::Rsa`] / [`CmsError::Ecdsa`] when the
+    /// signature does not verify.
+    pub fn verify_signer_signature(&self, signer_spki: SpkiDer<'_>) -> Result<(), CmsError> {
+        let payload: &[u8] = match self.signer.signed_data_to_verify.as_deref() {
+            Some(attributes) => attributes,
+            None => self.econtent_der.ok_or(CmsError::DetachedContent)?,
+        };
+        self.signer.verify_over(signer_spki, payload)
+    }
 
-        verify_dispatch(&SignatureDispatch {
-            sig_alg_oid: self.signer.signature_algorithm_oid,
-            digest_alg_fallback: digest_alg,
-            signer_spki_der,
-            payload,
-            signature: self.signer.signature,
-        })
+    /// The `messageDigest` binding of `content`, then the signature
+    /// over the attributes or, without them, over `content`.
+    fn verify_content(&self, signer_spki: SpkiDer<'_>, content: &[u8]) -> Result<(), CmsError> {
+        match (
+            self.signer.signed_data_to_verify.as_deref(),
+            self.signer.message_digest,
+        ) {
+            (Some(attributes), Some(message_digest)) => {
+                if self.signer.digest_algorithm.digest(content) != message_digest {
+                    return Err(CmsError::SignerHashMismatch);
+                }
+                self.signer.verify_over(signer_spki, attributes)
+            }
+            (None, _) => self.signer.verify_over(signer_spki, content),
+            (Some(_), None) => Err(CmsError::UnexpectedStructure(
+                "signedAttrs missing messageDigest",
+            )),
+        }
     }
 }
 
-// `known::EC_PUBLIC_KEY` is *sometimes* the signatureAlgorithm OID in
-// a signerInfo -- the hash then comes from the signerInfo's
-// digestAlgorithm (handled via the `digest_alg_fallback` arm below).
-
-/// Inputs for CMS signer signature verification.
-struct SignatureDispatch<'a> {
-    /// Signature algorithm OID.
-    sig_alg_oid: crate::oid::Oid<'a>,
-    /// Digest algorithm from `SignerInfo`.
-    digest_alg_fallback: HashAlgorithm,
-    /// Signer SPKI DER.
-    signer_spki_der: &'a [u8],
-    /// Payload covered by the signature.
-    payload: &'a [u8],
-    /// Signature bytes.
-    signature: &'a [u8],
+impl SignerInfo<'_> {
+    /// Verify the signature value over `payload` under the signer's
+    /// scheme, after checking that the key fits the scheme and the
+    /// value fits the key.
+    fn verify_over(&self, signer_spki: SpkiDer<'_>, payload: &[u8]) -> Result<(), CmsError> {
+        match (self.signature_scheme, signer_spki.algorithm()) {
+            (SignatureScheme::RsaPkcs1, PublicKeyAlgorithm::Rsa { .. }) => {
+                let key =
+                    extract_rsa_public_key(signer_spki.as_der()).ok_or(CmsError::BadSignerKey)?;
+                // RFC 8017 sec.8.2.2 step 1: the signature is exactly
+                // the modulus length.
+                if self.signature.len() != key.modulus.byte_len() {
+                    return Err(CmsError::SignatureShape);
+                }
+                rsa_verify_with_hash(&RsaVerifyInput {
+                    key: &key,
+                    hash: self.digest_algorithm,
+                    payload,
+                    signature: self.signature,
+                })
+            }
+            (
+                SignatureScheme::Ecdsa,
+                PublicKeyAlgorithm::Ec(EcCurve::Secp256r1 | EcCurve::Secp384r1),
+            ) => {
+                let (curve, pubkey) =
+                    ecdsa::extract_ec_pubkey(signer_spki.as_der()).ok_or(CmsError::BadSignerKey)?;
+                let digest = self.digest_algorithm.digest(payload);
+                let sig = Signature::<EcdsaDer>::new(self.signature.to_vec());
+                ecdsa::verify_prehashed(&curve, &pubkey, &sig, &digest).map_err(|error| match error
+                {
+                    EcdsaError::BadSignature | EcdsaError::SigOutOfRange => {
+                        CmsError::SignatureShape
+                    }
+                    EcdsaError::BadModulus
+                    | EcdsaError::BadPublicKey
+                    | EcdsaError::NotInvertible
+                    | EcdsaError::VerifyFailed => CmsError::Ecdsa(error),
+                })
+            }
+            (SignatureScheme::RsaPkcs1, PublicKeyAlgorithm::Ec(_))
+            | (SignatureScheme::Ecdsa, PublicKeyAlgorithm::Rsa { .. }) => {
+                Err(CmsError::SignatureKeyMismatch)
+            }
+            (_, PublicKeyAlgorithm::Ec(_) | PublicKeyAlgorithm::Other) => {
+                Err(CmsError::BadSignerKey)
+            }
+        }
+    }
 }
 
 /// RSA signature verification input.
@@ -1038,63 +1391,13 @@ struct RsaVerifyInput<'a> {
     signature: &'a [u8],
 }
 
-/// Verify a `SignerInfo` signature, dispatching on the signature
-/// algorithm OID over the prehashed `payload`.
-///
-/// RFC 5652 §5.4 (message-digest computation) and RFC 5754 (RSA /
-/// ECDSA signature algorithms). The `digest_alg_fallback` is used
-/// when the signature OID is the bare key-type OID (`id-ecPublicKey`
-/// or `rsaEncryption`) -- some signers encode it that way (OpenSSL
-/// emits the bare `rsaEncryption`) and the digest is taken from `signerInfo.digestAlgorithm`.
-///
-/// Returns `Err(UnsupportedSignatureAlgorithm)` when the OID is
-/// outside the SHA-256/384/512 × RSA-PKCS1v15/ECDSA matrix this
-/// build supports; no PSS, no DSA, no Ed25519 here.
-fn verify_dispatch(input: &SignatureDispatch<'_>) -> Result<(), CmsError> {
-    // RSA-PKCS1v15 path.
-    let hash_for_rsa = match input.sig_alg_oid.as_bytes() {
-        v if v == known::SHA256_WITH_RSA.as_bytes() => Some(HashAlgorithm::Sha256),
-        v if v == known::SHA384_WITH_RSA.as_bytes() => Some(HashAlgorithm::Sha384),
-        v if v == known::SHA512_WITH_RSA.as_bytes() => Some(HashAlgorithm::Sha512),
-        v if v == known::RSA_ENCRYPTION.as_bytes() => Some(input.digest_alg_fallback),
-        _ => None,
-    };
-    if let Some(hash) = hash_for_rsa {
-        let key = extract_rsa_public_key(input.signer_spki_der).ok_or(CmsError::BadSignerKey)?;
-        return rsa_verify_with_hash(&RsaVerifyInput {
-            key: &key,
-            hash,
-            payload: input.payload,
-            signature: input.signature,
-        });
-    }
-    // ECDSA path.
-    let hash_for_ecdsa = match input.sig_alg_oid.as_bytes() {
-        v if v == known::ECDSA_WITH_SHA256.as_bytes() => Some(HashAlgorithm::Sha256),
-        v if v == known::ECDSA_WITH_SHA384.as_bytes() => Some(HashAlgorithm::Sha384),
-        v if v == known::ECDSA_WITH_SHA512.as_bytes() => Some(HashAlgorithm::Sha512),
-        v if v == known::EC_PUBLIC_KEY.as_bytes() => Some(input.digest_alg_fallback),
-        _ => None,
-    };
-    if let Some(hash) = hash_for_ecdsa {
-        let (curve, pubkey) =
-            ecdsa::extract_ec_pubkey(input.signer_spki_der).ok_or(CmsError::BadSignerKey)?;
-        let digest = hash.digest(input.payload);
-        let sig = Signature::<EcdsaDer>::new(input.signature.to_vec());
-        return ecdsa::verify_prehashed(&curve, &pubkey, &sig, &digest).map_err(CmsError::Ecdsa);
-    }
-    Err(CmsError::UnsupportedSignatureAlgorithm)
-}
-
 /// Verify an RSASSA-PKCS1-v1_5 signature with a runtime-chosen
 /// hash algorithm.
 ///
 /// RFC 8017 §8.2.2 (RSASSA-PKCS1-V1_5-VERIFY). The
 /// hash-algorithm-id step uses `HashAlgorithm` as a typed proxy
 /// so the verify path cannot mismatch SHA-256 emsa with SHA-384
-/// modulus padding etc. Returns `CmsError::BadRsaSignature` on
-/// verification failure rather than panicking, so a single bad
-/// signer info never aborts a multi-signer CMS verify.
+/// modulus padding etc.
 fn rsa_verify_with_hash(input: &RsaVerifyInput<'_>) -> Result<(), CmsError> {
     // The hash-algorithm marker comes from the BER
     // `signatureAlgorithm` OID -- known only at runtime, so the
@@ -1122,11 +1425,12 @@ fn rsa_verify_with_hash(input: &RsaVerifyInput<'_>) -> Result<(), CmsError> {
 mod tests {
 
     use super::{
-        Asn1ContentExplicit0, CmsError, CmsHelpers, HashAlgorithm, OwnedSignedData, SignedData,
-        SignerIdentifier, SignerInfo,
+        Asn1ContentExplicit0, CmsError, CmsHelpers, HashAlgorithm, OwnedSignedData,
+        RevocationInfoChoice, SignatureScheme, SignedData, SignerIdentifier,
     };
     use crate::oid::{Oid, known};
-    use crate::x509::Certificate;
+    use crate::testkit::{self, CertificateSpec, CmsParts, TestCurve, TestKey};
+    use crate::x509::{Certificate, SpkiDer};
     use refineid_ber::{
         BerTag, BerTlv, BerTlvIter, Integer, OctetString, Oid as BerOid, Sequence, Set,
     };
@@ -1376,30 +1680,9 @@ mod tests {
         hex::decode(cleaned).expect("fixture hex decodes")
     }
 
-    // Build a synthetic SignedData for verify() error-path tests (the
-    // struct fields are public). signedAttrs are treated as absent
-    // unless message_digest is Some.
-    fn synthetic<'a>(
-        econtent: &'a [u8],
-        digest_oid: &'a [u8],
-        sig_oid: &'a [u8],
-        message_digest: Option<&'a [u8]>,
-        signature: &'a [u8],
-    ) -> SignedData<'a> {
-        SignedData {
-            econtent_type_oid: FIXTURE_ECONTENT_TYPE,
-            econtent_der: econtent,
-            certificates_der: Vec::new(),
-            signer: SignerInfo {
-                signer_identifier: SignerIdentifier::SubjectKeyIdentifier(b"synthetic"),
-                digest_algorithm_oid: Oid::new(digest_oid).expect("digest OID well-formed"),
-                signature_algorithm_oid: Oid::new(sig_oid).expect("sig OID well-formed"),
-                signature,
-                signed_data_to_verify: None,
-                signed_attributes: Vec::new(),
-                message_digest,
-            },
-        }
+    /// The typed key of a fixture SPKI.
+    fn typed_spki(der: &[u8]) -> SpkiDer<'_> {
+        SpkiDer::try_from(der).expect("fixture SPKI parses")
     }
 
     /// Minimal structurally valid signerInfo, for parser cardinality
@@ -1542,7 +1825,8 @@ mod tests {
         let sd = SignedData::parse(&der).expect("parse RSA CMS");
         assert_eq!(sd.econtent_type_oid, FIXTURE_ECONTENT_TYPE);
         // eContent is the embedded LDSSecurityObject SEQUENCE.
-        assert_eq!(sd.econtent_der.first(), Some(&tag_byte::<Sequence>()));
+        let econtent = sd.econtent_der.expect("eContent is attached");
+        assert_eq!(econtent.first(), Some(&tag_byte::<Sequence>()));
         // Exactly the signer certificate was embedded.
         assert_eq!(sd.certificates_der.len(), 1);
         let cert = sd.certificates_der.first().expect("one cert");
@@ -1551,18 +1835,12 @@ mod tests {
         // messageDigest commitment decoded. OpenSSL emits the bare
         // rsaEncryption OID as the SignerInfo signatureAlgorithm
         // (RFC 5754); the digest comes from digestAlgorithm.
-        assert_eq!(
-            sd.signer.digest_algorithm_oid.as_bytes(),
-            known::SHA256.as_bytes()
-        );
-        assert_eq!(
-            sd.signer.signature_algorithm_oid.as_bytes(),
-            known::RSA_ENCRYPTION.as_bytes()
-        );
+        assert_eq!(sd.signer.digest_algorithm, HashAlgorithm::Sha256);
+        assert_eq!(sd.signer.signature_scheme, SignatureScheme::RsaPkcs1);
         assert!(sd.signer.signed_data_to_verify.is_some());
         // messageDigest attr == SHA-256(eContent).
         let md = sd.signer.message_digest.expect("messageDigest present");
-        assert_eq!(md, HashAlgorithm::Sha256.digest(sd.econtent_der).as_slice());
+        assert_eq!(md, HashAlgorithm::Sha256.digest(econtent).as_slice());
     }
 
     #[test]
@@ -1681,14 +1959,8 @@ mod tests {
         let sd = SignedData::parse(&der).expect("parse");
         assert!(sd.signer.signed_data_to_verify.is_none());
         assert!(sd.signer.message_digest.is_none());
-        assert_eq!(
-            sd.signer.digest_algorithm_oid.as_bytes(),
-            known::SHA256.as_bytes()
-        );
-        assert_eq!(
-            sd.signer.signature_algorithm_oid.as_bytes(),
-            known::RSA_ENCRYPTION.as_bytes()
-        );
+        assert_eq!(sd.signer.digest_algorithm, HashAlgorithm::Sha256);
+        assert_eq!(sd.signer.signature_scheme, SignatureScheme::RsaPkcs1);
     }
 
     #[test]
@@ -1752,7 +2024,8 @@ mod tests {
         let der = unhex(RSA_CMS_HEX);
         let spki = unhex(RSA_SPKI_HEX);
         let sd = SignedData::parse(&der).expect("parse");
-        sd.verify(&spki).expect("RSA signature verifies");
+        sd.verify(typed_spki(&spki))
+            .expect("RSA signature verifies");
     }
 
     #[test]
@@ -1760,7 +2033,8 @@ mod tests {
         let der = unhex(EC_CMS_HEX);
         let spki = unhex(EC_SPKI_HEX);
         let sd = SignedData::parse(&der).expect("parse");
-        sd.verify(&spki).expect("ECDSA signature verifies");
+        sd.verify(typed_spki(&spki))
+            .expect("ECDSA signature verifies");
     }
 
     #[test]
@@ -1770,7 +2044,7 @@ mod tests {
         let der = unhex(RSA_CMS_NOATTR_HEX);
         let spki = unhex(RSA_SPKI_HEX);
         let sd = SignedData::parse(&der).expect("parse");
-        sd.verify(&spki)
+        sd.verify(typed_spki(&spki))
             .expect("RSA signature over eContent verifies");
     }
 
@@ -1781,7 +2055,9 @@ mod tests {
         let der = unhex(RSA_CMS_HEX);
         let wrong = unhex(WRONG_RSA_SPKI_HEX);
         let sd = SignedData::parse(&der).expect("parse");
-        let err = sd.verify(&wrong).expect_err("wrong RSA key must fail");
+        let err = sd
+            .verify(typed_spki(&wrong))
+            .expect_err("wrong RSA key must fail");
         assert!(matches!(err, CmsError::Rsa(_)), "got {err:?}");
     }
 
@@ -1790,14 +2066,16 @@ mod tests {
         let der = unhex(EC_CMS_HEX);
         let wrong = unhex(WRONG_EC_SPKI_HEX);
         let sd = SignedData::parse(&der).expect("parse");
-        let err = sd.verify(&wrong).expect_err("wrong EC key must fail");
+        let err = sd
+            .verify(typed_spki(&wrong))
+            .expect_err("wrong EC key must fail");
         assert!(matches!(err, CmsError::Ecdsa(_)), "got {err:?}");
     }
 
     #[test]
     fn verify_rejects_mismatched_key_type() {
-        // RSA-signed CMS against an EC SPKI -> RSA key extraction fails
-        // -> BadSignerKey (and the symmetric EC-against-RSA case).
+        // RSA-signed CMS against an EC SPKI is a scheme that does not
+        // fit the key (and the symmetric EC-against-RSA case).
         let rsa = unhex(RSA_CMS_HEX);
         let ec = unhex(EC_CMS_HEX);
         let rsa_spki = unhex(RSA_SPKI_HEX);
@@ -1805,12 +2083,12 @@ mod tests {
         let rsa_sd = SignedData::parse(&rsa).expect("parse rsa");
         let ec_sd = SignedData::parse(&ec).expect("parse ec");
         assert!(matches!(
-            rsa_sd.verify(&ec_spki),
-            Err(CmsError::BadSignerKey)
+            rsa_sd.verify(typed_spki(&ec_spki)),
+            Err(CmsError::SignatureKeyMismatch)
         ));
         assert!(matches!(
-            ec_sd.verify(&rsa_spki),
-            Err(CmsError::BadSignerKey)
+            ec_sd.verify(typed_spki(&rsa_spki)),
+            Err(CmsError::SignatureKeyMismatch)
         ));
     }
 
@@ -1821,9 +2099,9 @@ mod tests {
         let der = unhex(RSA_CMS_HEX);
         let spki = unhex(RSA_SPKI_HEX);
         let mut sd = SignedData::parse(&der).expect("parse");
-        sd.econtent_der = b"tampered LDS content -- not what was signed";
+        sd.econtent_der = Some(b"tampered LDS content -- not what was signed");
         assert!(matches!(
-            sd.verify(&spki),
+            sd.verify(typed_spki(&spki)),
             Err(CmsError::SignerHashMismatch)
         ));
     }
@@ -1835,43 +2113,10 @@ mod tests {
         let mut sd = SignedData::parse(&der).expect("parse");
         sd.signer.message_digest = None;
         assert!(matches!(
-            sd.verify(&spki),
+            sd.verify(typed_spki(&spki)),
             Err(CmsError::UnexpectedStructure(
                 "signedAttrs missing messageDigest"
             ))
-        ));
-    }
-
-    #[test]
-    fn verify_rejects_unsupported_digest_algorithm() {
-        // digestAlgorithm OID is rsaEncryption -- not a SHA-2 variant.
-        let sd = synthetic(
-            b"x",
-            known::RSA_ENCRYPTION.as_bytes(),
-            known::SHA256_WITH_RSA.as_bytes(),
-            None,
-            b"",
-        );
-        assert!(matches!(
-            sd.verify(b""),
-            Err(CmsError::UnsupportedDigestAlgorithm)
-        ));
-    }
-
-    #[test]
-    fn verify_rejects_unsupported_signature_algorithm() {
-        // Valid SHA-256 digest OID, but a digest OID sits in the
-        // signatureAlgorithm slot -- outside the RSA/ECDSA matrix.
-        let sd = synthetic(
-            b"x",
-            known::SHA256.as_bytes(),
-            known::SHA256.as_bytes(),
-            None,
-            b"",
-        );
-        assert!(matches!(
-            sd.verify(b""),
-            Err(CmsError::UnsupportedSignatureAlgorithm)
         ));
     }
 
@@ -1914,7 +2159,7 @@ mod tests {
         );
         assert_eq!(
             CmsError::BadSignerKey.to_string(),
-            "CMS: signer key did not parse as RSA"
+            "CMS: signer key is not a supported RSA or EC key"
         );
         assert_eq!(
             CmsError::SignerHashMismatch.to_string(),
@@ -1929,7 +2174,7 @@ mod tests {
         let rsa_der = unhex(RSA_CMS_HEX);
         let rsa_err = SignedData::parse(&rsa_der)
             .expect("parse")
-            .verify(&unhex(WRONG_RSA_SPKI_HEX))
+            .verify(typed_spki(&unhex(WRONG_RSA_SPKI_HEX)))
             .expect_err("wrong key");
         assert!(
             rsa_err.to_string().starts_with("CMS: RSA verify:"),
@@ -1938,11 +2183,414 @@ mod tests {
         let ec_der = unhex(EC_CMS_HEX);
         let ec_err = SignedData::parse(&ec_der)
             .expect("parse")
-            .verify(&unhex(WRONG_EC_SPKI_HEX))
+            .verify(typed_spki(&unhex(WRONG_EC_SPKI_HEX)))
             .expect_err("wrong key");
         assert!(
             ec_err.to_string().starts_with("CMS: ECDSA verify:"),
             "{ec_err}"
         );
+    }
+
+    // ----- Fixtures signed by the test kit -----
+
+    /// Content every kit-signed fixture carries.
+    const KIT_CONTENT: &[u8] = b"document under signature";
+    /// Content other than [`KIT_CONTENT`].
+    const OTHER_CONTENT: &[u8] = b"another document";
+    /// Serial of the kit signer certificate.
+    const KIT_SERIAL: u8 = 7;
+    /// First validity day of the kit signer certificate.
+    const KIT_NOT_BEFORE_DAY: u8 = 1;
+    /// Last validity day of the kit signer certificate.
+    const KIT_NOT_AFTER_DAY: u8 = 30;
+    /// Width of an all-ones P-256 scalar, at or above the curve order.
+    const P256_SCALAR_LEN: usize = 32;
+    /// Every bit of a scalar octet set.
+    const ALL_BITS: u8 = 0xFF;
+    /// A one-octet INTEGER body with the sign bit set: negative.
+    const NEGATIVE_INTEGER_BODY: [u8; 1] = [0x80];
+    /// A two-octet INTEGER body whose leading zero octet is redundant.
+    const PADDED_INTEGER_BODY: &[u8] = &[0, 1];
+
+    /// A key on `curve` and a self-issued certificate for it.
+    fn kit_signer(curve: TestCurve) -> (TestKey, Vec<u8>) {
+        let key = TestKey::derive(curve, b"cms signer");
+        let certificate = testkit::certificate(
+            &CertificateSpec {
+                serial: KIT_SERIAL,
+                subject: "CMS Test Signer",
+                issuer: "CMS Test Signer",
+                not_before: testkit::day(KIT_NOT_BEFORE_DAY),
+                not_after: testkit::day(KIT_NOT_AFTER_DAY),
+                extensions: Vec::new(),
+            },
+            &key,
+            &key,
+        );
+        (key, certificate)
+    }
+
+    /// The SPKI of `certificate`.
+    fn certificate_spki(certificate: &[u8]) -> SpkiDer<'_> {
+        Certificate::from_der(certificate)
+            .expect("kit certificate parses")
+            .spki
+    }
+
+    /// An `AlgorithmIdentifier` for `oid` with `parameters` appended.
+    fn algorithm(oid: Oid<'_>, parameters: &[u8]) -> Vec<u8> {
+        let mut body = tlv(testkit::OBJECT_IDENTIFIER, oid.as_bytes());
+        body.extend_from_slice(parameters);
+        tlv(testkit::SEQUENCE, body)
+    }
+
+    /// DER NULL.
+    fn null() -> Vec<u8> {
+        tlv(testkit::NULL, b"")
+    }
+
+    /// An `Ecdsa-Sig-Value` of the given `INTEGER` bodies.
+    fn ecdsa_value(integers: &[&[u8]]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for integer in integers {
+            body.extend_from_slice(&tlv(testkit::INTEGER, integer));
+        }
+        tlv(testkit::SEQUENCE, body)
+    }
+
+    #[test]
+    fn kit_signatures_verify_on_both_curves() {
+        for curve in [TestCurve::P256, TestCurve::P384] {
+            let (key, certificate) = kit_signer(curve);
+            let der = testkit::cms(&CmsParts::attached(&key, &certificate, KIT_CONTENT));
+            let sd = SignedData::parse(&der).expect("kit CMS parses");
+            assert_eq!(sd.signer.signature_scheme, SignatureScheme::Ecdsa);
+            assert_eq!(sd.signer.digest_algorithm, key.hash());
+            sd.verify(certificate_spki(&certificate))
+                .expect("kit signature verifies");
+        }
+    }
+
+    #[test]
+    fn unsigned_attributes_are_retained_when_present() {
+        let (key, certificate) = kit_signer(TestCurve::P256);
+        let plain = testkit::cms(&CmsParts::attached(&key, &certificate, KIT_CONTENT));
+        assert!(
+            SignedData::parse(&plain)
+                .expect("parses")
+                .signer
+                .unsigned_attributes
+                .is_empty()
+        );
+
+        let mut parts = CmsParts::attached(&key, &certificate, KIT_CONTENT);
+        let token = tlv(testkit::SEQUENCE, b"token");
+        parts.unsigned_attributes = vec![testkit::attribute(
+            known::SIGNATURE_TIME_STAMP_TOKEN,
+            &token,
+        )];
+        let der = testkit::cms(&parts);
+        let sd = SignedData::parse(&der).expect("parses");
+        assert_eq!(sd.signer.unsigned_attributes.len(), 1);
+        let only = sd
+            .signer
+            .unsigned_attributes
+            .first()
+            .expect("one unsigned attribute");
+        assert_eq!(only.oid, known::SIGNATURE_TIME_STAMP_TOKEN);
+        assert_eq!(only.values_der, token.as_slice());
+        sd.verify(certificate_spki(&certificate))
+            .expect("unsigned attributes are outside the signature");
+    }
+
+    #[test]
+    fn empty_unsigned_attributes_are_refused() {
+        let (key, certificate) = kit_signer(TestCurve::P256);
+        let mut parts = CmsParts::attached(&key, &certificate, KIT_CONTENT);
+        parts.unsigned_attributes = vec![Vec::new()];
+        assert!(matches!(
+            SignedData::parse(&testkit::cms(&parts)),
+            Err(CmsError::UnexpectedStructure("unsignedAttrs is empty"))
+        ));
+    }
+
+    #[test]
+    fn revocation_info_choices_are_parsed_in_order() {
+        let (key, certificate) = kit_signer(TestCurve::P256);
+        let crl = tlv(testkit::SEQUENCE, b"crl");
+        let ocsp = tlv(testkit::SEQUENCE, b"ocsp");
+        let mut other = tlv(
+            testkit::OBJECT_IDENTIFIER,
+            known::OCSP_RESPONSE_REVOCATION_INFO.as_bytes(),
+        );
+        other.extend_from_slice(&ocsp);
+        let mut parts = CmsParts::attached(&key, &certificate, KIT_CONTENT);
+        parts.revocation_info = vec![crl.clone(), tlv(testkit::CONTEXT_1, other)];
+        let der = testkit::cms(&parts);
+        let sd = SignedData::parse(&der).expect("parses");
+        assert_eq!(
+            sd.revocation_info,
+            vec![
+                RevocationInfoChoice::Crl(&crl),
+                RevocationInfoChoice::Other {
+                    format: known::OCSP_RESPONSE_REVOCATION_INFO,
+                    info_der: &ocsp,
+                },
+            ]
+        );
+        assert!(
+            SignedData::parse(&testkit::cms(&CmsParts::attached(
+                &key,
+                &certificate,
+                KIT_CONTENT
+            )))
+            .expect("parses")
+            .revocation_info
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn unknown_or_empty_revocation_info_is_refused() {
+        let (key, certificate) = kit_signer(TestCurve::P256);
+        let mut unknown = CmsParts::attached(&key, &certificate, KIT_CONTENT);
+        unknown.revocation_info = vec![tlv(testkit::OCTET_STRING, b"neither")];
+        assert!(matches!(
+            SignedData::parse(&testkit::cms(&unknown)),
+            Err(CmsError::UnexpectedStructure(
+                "unsupported CMS RevocationInfoChoice entry"
+            ))
+        ));
+        let mut empty = CmsParts::attached(&key, &certificate, KIT_CONTENT);
+        empty.revocation_info = vec![Vec::new()];
+        assert!(matches!(
+            SignedData::parse(&testkit::cms(&empty)),
+            Err(CmsError::UnexpectedStructure("empty crls field"))
+        ));
+        let mut trailing = tlv(
+            testkit::OBJECT_IDENTIFIER,
+            known::OCSP_RESPONSE_REVOCATION_INFO.as_bytes(),
+        );
+        trailing.extend_from_slice(&tlv(testkit::SEQUENCE, b"one"));
+        trailing.extend_from_slice(&tlv(testkit::SEQUENCE, b"two"));
+        let mut extra = CmsParts::attached(&key, &certificate, KIT_CONTENT);
+        extra.revocation_info = vec![tlv(testkit::CONTEXT_1, trailing)];
+        assert!(matches!(
+            SignedData::parse(&testkit::cms(&extra)),
+            Err(CmsError::UnexpectedStructure(
+                "OtherRevocationInfoFormat has trailing fields"
+            ))
+        ));
+    }
+
+    #[test]
+    fn detached_content_has_typed_errors() {
+        let (key, certificate) = kit_signer(TestCurve::P384);
+        let signer_key = certificate_spki(&certificate);
+        let detached = testkit::cms(&CmsParts::detached(&key, &certificate, KIT_CONTENT));
+        let sd = SignedData::parse(&detached).expect("detached parses");
+        assert_eq!(sd.econtent_der, None);
+        assert_eq!(sd.verify(signer_key), Err(CmsError::DetachedContent));
+        sd.verify_detached(signer_key, KIT_CONTENT)
+            .expect("detached signature verifies over its content");
+        assert_eq!(
+            sd.verify_detached(signer_key, OTHER_CONTENT),
+            Err(CmsError::SignerHashMismatch)
+        );
+        sd.verify_signer_signature(signer_key)
+            .expect("the signature over the attributes needs no content");
+
+        let attached = testkit::cms(&CmsParts::attached(&key, &certificate, KIT_CONTENT));
+        let sd = SignedData::parse(&attached).expect("attached parses");
+        assert_eq!(
+            sd.verify_detached(signer_key, KIT_CONTENT),
+            Err(CmsError::AttachedContent)
+        );
+    }
+
+    #[test]
+    fn signer_signature_check_ignores_the_content_binding() {
+        let (key, certificate) = kit_signer(TestCurve::P256);
+        let der = testkit::cms(&CmsParts::attached(&key, &certificate, KIT_CONTENT));
+        let mut sd = SignedData::parse(&der).expect("parses");
+        sd.econtent_der = Some(OTHER_CONTENT);
+        let signer_key = certificate_spki(&certificate);
+        assert_eq!(sd.verify(signer_key), Err(CmsError::SignerHashMismatch));
+        sd.verify_signer_signature(signer_key)
+            .expect("the attributes are still what the key signed");
+    }
+
+    #[test]
+    fn signature_hash_must_be_the_digest_algorithm() {
+        let (key, certificate) = kit_signer(TestCurve::P256);
+        for signature_oid in [known::ECDSA_WITH_SHA384, known::SHA384_WITH_RSA] {
+            let mut parts = CmsParts::attached(&key, &certificate, KIT_CONTENT);
+            let parameters = if signature_oid == known::SHA384_WITH_RSA {
+                null()
+            } else {
+                Vec::new()
+            };
+            parts.signature_algorithm = Some(algorithm(signature_oid, &parameters));
+            assert!(matches!(
+                SignedData::parse(&testkit::cms(&parts)),
+                Err(CmsError::AlgorithmMismatch)
+            ));
+        }
+    }
+
+    #[test]
+    fn bare_key_identifiers_take_the_digest_algorithm() {
+        let (key, certificate) = kit_signer(TestCurve::P384);
+        let mut parts = CmsParts::attached(&key, &certificate, KIT_CONTENT);
+        parts.signature_algorithm = Some(algorithm(known::EC_PUBLIC_KEY, b""));
+        let der = testkit::cms(&parts);
+        let sd = SignedData::parse(&der).expect("id-ecPublicKey parses");
+        assert_eq!(sd.signer.signature_scheme, SignatureScheme::Ecdsa);
+        sd.verify(certificate_spki(&certificate))
+            .expect("the hash comes from digestAlgorithm");
+    }
+
+    #[test]
+    fn algorithm_parameters_have_their_fixed_shape() {
+        let (key, certificate) = kit_signer(TestCurve::P256);
+        let parse = |digest: Vec<u8>, signature: Vec<u8>| {
+            let mut parts = CmsParts::attached(&key, &certificate, KIT_CONTENT);
+            parts.digest_algorithm = digest;
+            parts.signature_algorithm = Some(signature);
+            let der = testkit::cms(&parts);
+            SignedData::parse(&der).map(|sd| sd.signer.signature_scheme)
+        };
+        let sha256 = |parameters: &[u8]| algorithm(known::SHA256, parameters);
+        let integer = tlv(testkit::INTEGER, [1_u8]);
+
+        assert_eq!(
+            parse(sha256(&null()), algorithm(known::ECDSA_WITH_SHA256, b"")),
+            Ok(SignatureScheme::Ecdsa)
+        );
+        assert_eq!(
+            parse(sha256(&integer), algorithm(known::ECDSA_WITH_SHA256, b"")),
+            Err(CmsError::AlgorithmParameters)
+        );
+        assert_eq!(
+            parse(sha256(b""), algorithm(known::ECDSA_WITH_SHA256, &null())),
+            Err(CmsError::AlgorithmParameters)
+        );
+        assert_eq!(
+            parse(sha256(b""), algorithm(known::SHA256_WITH_RSA, &null())),
+            Ok(SignatureScheme::RsaPkcs1)
+        );
+        assert_eq!(
+            parse(sha256(b""), algorithm(known::SHA256_WITH_RSA, b"")),
+            Ok(SignatureScheme::RsaPkcs1)
+        );
+        assert_eq!(
+            parse(sha256(b""), algorithm(known::SHA256_WITH_RSA, &integer)),
+            Err(CmsError::AlgorithmParameters)
+        );
+        assert_eq!(
+            parse(sha256(b""), algorithm(known::SHA256, b"")),
+            Err(CmsError::UnsupportedSignatureAlgorithm)
+        );
+        assert_eq!(
+            parse(
+                algorithm(known::SHA1, b""),
+                algorithm(known::ECDSA_WITH_SHA256, b"")
+            ),
+            Err(CmsError::UnsupportedDigestAlgorithm)
+        );
+    }
+
+    #[test]
+    fn message_digest_is_unique_and_digest_wide() {
+        let (key, certificate) = kit_signer(TestCurve::P384);
+        let content_type = testkit::attribute(
+            known::CONTENT_TYPE,
+            &tlv(testkit::OBJECT_IDENTIFIER, known::DATA.as_bytes()),
+        );
+        let digest_of = |hash: HashAlgorithm| {
+            testkit::attribute(
+                known::MESSAGE_DIGEST,
+                &tlv(testkit::OCTET_STRING, hash.digest(KIT_CONTENT)),
+            )
+        };
+        let parse = |attributes: Vec<Vec<u8>>| {
+            let mut parts = CmsParts::attached(&key, &certificate, KIT_CONTENT);
+            parts.signed_attributes = Some(testkit::attribute_set(&attributes));
+            let der = testkit::cms(&parts);
+            SignedData::parse(&der).map(|sd| sd.signer.message_digest.map(<[u8]>::len))
+        };
+
+        assert_eq!(
+            parse(vec![content_type.clone(), digest_of(HashAlgorithm::Sha384)]),
+            Ok(Some(HashAlgorithm::Sha384.digest_len()))
+        );
+        assert_eq!(
+            parse(vec![content_type.clone(), digest_of(HashAlgorithm::Sha256)]),
+            Err(CmsError::MessageDigestLength)
+        );
+        assert_eq!(
+            parse(vec![
+                content_type.clone(),
+                digest_of(HashAlgorithm::Sha384),
+                digest_of(HashAlgorithm::Sha256),
+            ]),
+            Err(CmsError::UnexpectedStructure(
+                "duplicate signed messageDigest attribute"
+            ))
+        );
+        assert_eq!(
+            parse(vec![content_type]),
+            Err(CmsError::UnexpectedStructure(
+                "signedAttrs missing messageDigest"
+            ))
+        );
+    }
+
+    #[test]
+    fn ecdsa_signature_value_must_fit_the_key() {
+        let (key, certificate) = kit_signer(TestCurve::P256);
+        let mut beyond_order = vec![0_u8];
+        beyond_order.extend(core::iter::repeat_n(ALL_BITS, P256_SCALAR_LEN));
+        let one: &[u8] = &[1];
+        let zero: &[u8] = &[0];
+        let shapes = [
+            ecdsa_value(&[one, one, one]),
+            ecdsa_value(&[one]),
+            ecdsa_value(&[PADDED_INTEGER_BODY, one]),
+            ecdsa_value(&[&NEGATIVE_INTEGER_BODY, one]),
+            ecdsa_value(&[zero, one]),
+            ecdsa_value(&[&beyond_order, one]),
+            tlv(testkit::OCTET_STRING, b"not a sequence"),
+        ];
+        for shape in shapes {
+            let mut parts = CmsParts::attached(&key, &certificate, KIT_CONTENT);
+            parts.signature = Some(shape);
+            let der = testkit::cms(&parts);
+            let sd = SignedData::parse(&der).expect("the value is opaque to the parser");
+            assert_eq!(
+                sd.verify(certificate_spki(&certificate)),
+                Err(CmsError::SignatureShape)
+            );
+        }
+        let mut trailing = key.sign(KIT_CONTENT);
+        trailing.push(0);
+        let mut parts = CmsParts::attached(&key, &certificate, KIT_CONTENT);
+        parts.signature = Some(trailing);
+        let der = testkit::cms(&parts);
+        let sd = SignedData::parse(&der).expect("parses");
+        assert_eq!(
+            sd.verify(certificate_spki(&certificate)),
+            Err(CmsError::SignatureShape)
+        );
+    }
+
+    #[test]
+    fn rsa_signature_value_must_be_modulus_wide() {
+        let der = unhex(RSA_CMS_HEX);
+        let key = unhex(RSA_SPKI_HEX);
+        let mut sd = SignedData::parse(&der).expect("parse");
+        let full = sd.signer.signature;
+        sd.signer.signature = full.get(1..).expect("signature is not empty");
+        assert_eq!(sd.verify(typed_spki(&key)), Err(CmsError::SignatureShape));
     }
 }

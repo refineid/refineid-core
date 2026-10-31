@@ -160,11 +160,7 @@ pub fn check_against_ocsp_response(
     response: &VerifiedOcspResponse<'_>,
     now: DateTime,
 ) -> RevocationStatus {
-    let Some(single) = response
-        .single_responses()
-        .iter()
-        .find(|r| r.cert_id.serial.as_bytes() == cert.serial_der)
-    else {
+    let Some(single) = response.response_for(cert) else {
         return RevocationStatus::Inapplicable(InapplicableReason::OcspNoEntryForSerial);
     };
     if now < single.this_update {
@@ -228,10 +224,8 @@ impl RevocationEvidence {
     ) -> Self {
         let status = check_against_ocsp_response(cert, verified, now);
         let valid_until = verified
-            .single_responses()
-            .iter()
-            .find(|r| r.cert_id.serial.as_bytes() == cert.serial_der)
-            .and_then(|r| r.next_update);
+            .response_for(cert)
+            .and_then(|response| response.next_update);
         Self {
             status,
             source: RevocationSource::Ocsp,
@@ -394,7 +388,9 @@ mod tests {
     };
     use crate::ber::{BerTag as _, Oid, Sequence, Set, Utf8String};
     use crate::crl::{Crl, VerifiedCrl};
-    use crate::ocsp::{OcspResponse, OcspResponseStatus, VerifiedOcspResponse};
+    use crate::ocsp::{
+        IssuerKeyHash, IssuerNameHash, OcspResponse, OcspResponseStatus, VerifiedOcspResponse,
+    };
     use crate::x509::{Certificate, DateTime};
 
     /// Wrap a parsed synthetic OCSP response as
@@ -404,8 +400,19 @@ mod tests {
     /// the response carries no basic body.
     fn verified_for_test(resp: OcspResponse<'_>) -> VerifiedOcspResponse<'_> {
         let basic = resp.basic.expect("basic OCSP body");
-        VerifiedOcspResponse::from_unverified_basic_for_test(basic)
+        VerifiedOcspResponse::from_unverified_basic_for_test(
+            basic,
+            IssuerNameHash::new([FIXTURE_NAME_HASH_OCTET; crate::digest::SHA1_LEN]),
+            IssuerKeyHash::new([FIXTURE_KEY_HASH_OCTET; crate::digest::SHA1_LEN]),
+        )
     }
+
+    /// Every octet of the fixture `CertID.issuerNameHash`.
+    const FIXTURE_NAME_HASH_OCTET: u8 = 0xAA;
+    /// Every octet of the fixture `CertID.issuerKeyHash`.
+    const FIXTURE_KEY_HASH_OCTET: u8 = 0xBB;
+    /// Universal OCTET STRING, the tag of both `CertID` hashes.
+    const TAG_OCTET_STRING: u8 = 0x04;
 
     // BER universal-class tag bytes the fixture builders below
     // splat into Vec<u8>.  The structural tags are derived from the
@@ -590,8 +597,14 @@ mod tests {
             wrap(0x30, &b)
         };
         let cert_id = {
-            let name_hash = wrap(0x04, &[0xAA; 20]);
-            let key_hash = wrap(0x04, &[0xBB; 20]);
+            let name_hash = wrap(
+                TAG_OCTET_STRING,
+                &[FIXTURE_NAME_HASH_OCTET; crate::digest::SHA1_LEN],
+            );
+            let key_hash = wrap(
+                TAG_OCTET_STRING,
+                &[FIXTURE_KEY_HASH_OCTET; crate::digest::SHA1_LEN],
+            );
             let serial_int = wrap(0x02, serial);
             let mut body = Vec::new();
             body.extend_from_slice(&alg);

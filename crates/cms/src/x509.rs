@@ -293,7 +293,7 @@ impl<'a> TryFrom<&'a [u8]> for Name<'a> {
 /// view tied to the input) so the rule-D-clean form is to wrap
 /// the bytes in an [`OwnedCert`] and call [`OwnedCert::view`]
 /// when a borrowed view is needed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedCert {
     /// `der` field.
     der: Vec<u8>,
@@ -427,8 +427,26 @@ impl<'a> Certificate<'a> {
                 "signature BIT STRING missing",
             ))?;
 
-        parse_tbs(tbs_der, der, signature_alg_oid, signature_bits)
+        let certificate = parse_tbs(tbs_der, der, signature_alg_oid, signature_bits)?;
+        // RFC 5280 sec.4.1.1.2: signatureAlgorithm MUST contain the
+        // same algorithm identifier as tbsCertificate.signature.
+        if certificate.tbs_signature_algorithm_der != sig_alg_tlv {
+            return Err(X509Error::UnexpectedStructure(
+                "signatureAlgorithm differs from tbsCertificate.signature",
+            ));
+        }
+        Ok(certificate.certificate)
     }
+}
+
+/// A parsed `TBSCertificate` and the exact `signature`
+/// `AlgorithmIdentifier` it carries, for the RFC 5280 sec.4.1.1.2
+/// comparison against the outer `signatureAlgorithm`.
+struct ParsedTbs<'a> {
+    /// The certificate view.
+    certificate: Certificate<'a>,
+    /// `tbsCertificate.signature`, tag and length included.
+    tbs_signature_algorithm_der: &'a [u8],
 }
 
 /// Decode a `TBSCertificate` SEQUENCE into a borrowing
@@ -439,14 +457,14 @@ impl<'a> Certificate<'a> {
 /// unwrapped SEQUENCE bytes (the parser pre-strips the outer
 /// tag); `raw` is the full certificate DER; `signature_alg_oid`
 /// and `signature_bits` come from the outer wrapper. Caller
-/// has already verified that the wrapper's `signatureAlgorithm`
-/// matches the TBS's inner `signature` field.
+/// compares the returned inner `signature` field with the wrapper's
+/// `signatureAlgorithm`.
 fn parse_tbs<'a>(
     tbs_der: &'a [u8],
     raw: &'a [u8],
     signature_alg_oid: Oid<'a>,
     signature_bits: &'a [u8],
-) -> Result<Certificate<'a>, X509Error> {
+) -> Result<ParsedTbs<'a>, X509Error> {
     // tbsCertificate ::= SEQUENCE {
     //     version         [0] EXPLICIT Version DEFAULT v1,
     //     serialNumber    INTEGER,
@@ -503,8 +521,9 @@ fn parse_tbs<'a>(
     // serialNumber INTEGER value bytes (no tag/length), as before.
     let serial_der = serial_any.value();
 
-    // signature AlgorithmIdentifier -- skip wholesale.
-    reader
+    // signature AlgorithmIdentifier -- kept whole for the comparison
+    // with the outer signatureAlgorithm.
+    let tbs_signature_algorithm_der = reader
         .tlv_bytes()
         .map_err(|_ignored| X509Error::UnexpectedStructure("TBS signature alg"))?;
 
@@ -563,18 +582,21 @@ fn parse_tbs<'a>(
         }
     }
 
-    Ok(Certificate {
-        raw_der: raw,
-        tbs_der,
-        serial_der,
-        issuer,
-        subject,
-        not_before,
-        not_after,
-        spki,
-        extensions,
-        signature_alg_oid,
-        signature_bits,
+    Ok(ParsedTbs {
+        certificate: Certificate {
+            raw_der: raw,
+            tbs_der,
+            serial_der,
+            issuer,
+            subject,
+            not_before,
+            not_after,
+            spki,
+            extensions,
+            signature_alg_oid,
+            signature_bits,
+        },
+        tbs_signature_algorithm_der,
     })
 }
 
@@ -730,10 +752,10 @@ impl SignatureAlgorithm {
 /// Outcome of a signature verification attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerifyError {
-    /// Algorithm OID isn't one this codec implements yet.
-    /// Supported today: RSA-PKCS1v15 SHA-256/384/512 and ECDSA
-    /// over P-256 / P-384 / P-521 / brainpool* with SHA-256 /
-    /// SHA-384 / SHA-512.
+    /// Algorithm OID isn't one this codec implements.
+    /// Supported: RSA-PKCS1v15 SHA-256/384/512 and ECDSA over the
+    /// named curves P-256 and P-384 with SHA-256 / SHA-384 /
+    /// SHA-512.
     Unsupported(SignatureAlgorithm),
     /// Issuer's SPKI didn't parse as the expected key type for
     /// the chosen signature algorithm (RSA SPKI when the sig
@@ -1155,14 +1177,6 @@ pub enum PublicKeyAlgorithm {
     /// `id-ecPublicKey` OID + a named-curve OID. The wrapped
     /// [`EcCurve`] carries the specific curve.
     Ec(EcCurve),
-    /// EC key with explicit curve parameters (parameters
-    /// encoded inline as an `ECParameters` SEQUENCE rather than
-    /// referenced by a named-curve OID).
-    EcExplicit {
-        /// Field prime's bit length, decoded from the inline
-        /// `ECParameters` SEQUENCE. `usize` is the natural fit.
-        bits: usize,
-    },
     /// Unrecognised algorithm OID. The caller still gets the
     /// raw OID bytes for diagnostics.
     Other,
@@ -1236,9 +1250,6 @@ impl PublicKeyAlgorithm {
         match self {
             Self::Rsa { modulus_bits } => format!("RSA, {modulus_bits}-bit modulus"),
             Self::Ec(curve) => format!("EC on {}", curve.label()),
-            Self::EcExplicit { bits } => {
-                format!("EC with explicit parameters ({bits}-bit field)")
-            }
             Self::Other => "unrecognised algorithm".to_owned(),
         }
     }
@@ -1248,42 +1259,6 @@ impl PublicKeyAlgorithm {
 /// (X.690 sec. 8.1), so a magnitude's bit width derives as its
 /// octet count times this constant, minus the leading zero bits.
 const BITS_PER_OCTET: usize = 8;
-
-/// Explicit `ECParameters` sequence value.
-struct ExplicitCurveParams<'a> {
-    /// `ECParameters` `SEQUENCE` value bytes.
-    seq_value: &'a [u8],
-}
-
-/// Walk an explicit-parameters EC `ECParameters` SEQUENCE and
-/// return the field prime's bit length. Returns `None` on
-/// shape mismatch.
-impl X509Helpers {
-    /// `explicit_curve_field_bits` associated function.
-    fn explicit_curve_field_bits(params: &ExplicitCurveParams<'_>) -> Option<usize> {
-        let mut it = BerTlvIter::new(params.seq_value);
-        let _version = it.next()?.ok()?;
-        let field_id = it.next()?.ok()?;
-        if field_id.tag() != <Sequence as BerTag>::TAG {
-            return None;
-        }
-        let mut fit = BerTlvIter::new(field_id.value());
-        let _field_type_oid = fit.next()?.ok()?;
-        let prime = fit.next()?.ok()?;
-        if prime.tag() != <Integer as BerTag>::TAG {
-            return None;
-        }
-        let bytes = prime.value().strip_prefix(&[0_u8]).unwrap_or(prime.value());
-        let first = *bytes.first()?;
-        // `u8::leading_zeros` is in 0..=8; widens to usize losslessly.
-        let leading_zeros = usize::try_from(first.leading_zeros()).ok()?;
-        // `bytes` non-empty (first() succeeded), so `bytes.len() >= 1`
-        // and `bytes.len() * 8 >= 8 > leading_zeros`; both ops can't
-        // overflow within reasonable EC parameter sizes.
-        let total_bits = bytes.len().checked_mul(BITS_PER_OCTET)?;
-        total_bits.checked_sub(leading_zeros)
-    }
-}
 
 impl PublicKeyAlgorithm {
     /// Classify an already-decoded `SubjectPublicKeyInfoRef` into its
@@ -1306,31 +1281,22 @@ impl PublicKeyAlgorithm {
             let modulus_bits = total_bits.checked_sub(leading_zeros)?;
             Some(Self::Rsa { modulus_bits })
         } else if alg_oid.as_bytes() == OID_EC_PUBLIC_KEY {
-            // EC: AlgorithmIdentifier.parameters is a named-curve OID or
-            // an explicit-parameters SEQUENCE.
-            let params = info.algorithm.parameters?;
-            match params.decode_as::<ObjectIdentifier>() {
-                Ok(curve_oid) => {
-                    let curve = match curve_oid.as_bytes() {
-                        v if v == OID_SECP256R1 => EcCurve::Secp256r1,
-                        v if v == OID_SECP384R1 => EcCurve::Secp384r1,
-                        v if v == OID_BRAINPOOL_P256R1 => EcCurve::BrainpoolP256r1,
-                        v if v == OID_BRAINPOOL_P384R1 => EcCurve::BrainpoolP384r1,
-                        _ => EcCurve::Other,
-                    };
-                    Some(Self::Ec(curve))
-                }
-                // Explicit ECParameters SEQUENCE -- field prime size for
-                // display. This esoteric form has no `spki` type, so the
-                // small structural walk stays hand-rolled.
-                Err(_ignored) => {
-                    let bits = X509Helpers::explicit_curve_field_bits(&ExplicitCurveParams {
-                        seq_value: params.value(),
-                    })
-                    .unwrap_or(0);
-                    Some(Self::EcExplicit { bits })
-                }
-            }
+            // EC: AlgorithmIdentifier.parameters is the namedCurve OID
+            // (RFC 5480 sec.2.1.1). Explicit `ECParameters` and
+            // `implicitCurve` are not used in PKIX and are refused.
+            let curve_oid = info
+                .algorithm
+                .parameters?
+                .decode_as::<ObjectIdentifier>()
+                .ok()?;
+            let curve = match curve_oid.as_bytes() {
+                v if v == OID_SECP256R1 => EcCurve::Secp256r1,
+                v if v == OID_SECP384R1 => EcCurve::Secp384r1,
+                v if v == OID_BRAINPOOL_P256R1 => EcCurve::BrainpoolP256r1,
+                v if v == OID_BRAINPOOL_P384R1 => EcCurve::BrainpoolP384r1,
+                _ => EcCurve::Other,
+            };
+            Some(Self::Ec(curve))
         } else {
             Some(Self::Other)
         }
@@ -2535,5 +2501,45 @@ mod tests {
         assert!(a < b);
         assert!(b < c);
         assert!(a < c);
+    }
+
+    #[test]
+    fn outer_signature_algorithm_must_equal_the_tbs_one() {
+        use crate::testkit::{self, CertificateSpec, TestCurve, TestKey};
+
+        /// Serial of the fixture certificate.
+        const SERIAL: u8 = 3;
+        /// First validity day.
+        const FIRST_DAY: u8 = 1;
+        /// Last validity day.
+        const LAST_DAY: u8 = 28;
+
+        let key = TestKey::derive(TestCurve::P256, b"x509 algorithm");
+        let other = TestKey::derive(TestCurve::P384, b"x509 algorithm");
+        let spec = CertificateSpec {
+            serial: SERIAL,
+            subject: "Algorithm Test",
+            issuer: "Algorithm Test",
+            not_before: testkit::day(FIRST_DAY),
+            not_after: testkit::day(LAST_DAY),
+            extensions: Vec::new(),
+        };
+        let matching = testkit::certificate(&spec, &key, &key);
+        let parsed = super::Certificate::from_der(&matching).expect("matching identifiers parse");
+        parsed
+            .verify_signed_by(parsed)
+            .expect("the kit signature verifies");
+
+        let tbs = testkit::tbs_certificate(&spec, &key, &key);
+        let mut body = tbs.clone();
+        body.extend_from_slice(&other.algorithm_identifier());
+        body.extend_from_slice(&testkit::bit_string(&key.sign(&tbs)));
+        let mismatched = testkit::tlv(testkit::SEQUENCE, body);
+        assert_eq!(
+            super::Certificate::from_der(&mismatched).map(|_parsed| ()),
+            Err(super::X509Error::UnexpectedStructure(
+                "signatureAlgorithm differs from tbsCertificate.signature"
+            ))
+        );
     }
 }

@@ -1047,21 +1047,19 @@ fn verify_signatures(
 
 /// Verify one detached `CAdES` over the manifest bytes.
 ///
-/// The manifest is supplied as the external content: the parsed
-/// structure's empty `eContent` is replaced before verification,
-/// which is exactly what "detached" means.
+/// The manifest is the external content of the detached signature
+/// (ETSI EN 319 162-1 V1.1.1 clause 4.4.4.2 item 3a).
 fn verify_signature<'a>(
     p7: &'a [u8],
     manifest: &'a [u8],
 ) -> Result<VerifiedSignature, DocumentVerifyError> {
-    let mut signed = SignedData::parse(p7)
+    let signed = SignedData::parse(p7)
         .map_err(|error| DocumentVerifyError::Cms(format!("signature does not parse: {error}")))?;
     if signed.econtent_type_oid != known::DATA {
         return Err(DocumentVerifyError::Cms(
             "signature eContentType is not id-data".to_owned(),
         ));
     }
-    signed.econtent_der = manifest;
     let mut matched: Option<(OwnedCert, Option<String>)> = None;
     for candidate in &signed.certificates_der {
         let owned = OwnedCert::from_der(candidate).map_err(|error| {
@@ -1087,7 +1085,7 @@ fn verify_signature<'a>(
         ));
     };
     let view = owned.view();
-    match signed.verify(view.spki.as_der()) {
+    match signed.verify_detached(view.spki, manifest) {
         Ok(()) => Ok(VerifiedSignature {
             signer_cn: cn,
             valid: true,

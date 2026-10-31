@@ -27,7 +27,7 @@ members = [
 exclude = ["crates/rapp/fuzz"]
 
 [workspace.package]
-version = "26.10.30"
+version = "26.10.31"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Petri Koistinen"]
@@ -57,6 +57,11 @@ pcsc = "2.9"
 aes = "0.9"
 cbc = "0.2"
 cmac = "0.8"
+# brainpoolP384r1 point arithmetic for PACE (crates/pace): field and
+# scalar arithmetic, SEC1 point decoding with the on-curve check, and the
+# constant-time fixed-window scalar multiplication. The default features
+# add PKCS#8 key encoding and getrandom, which the handshake does not use.
+bp384 = { version = "0.14", default-features = false, features = ["arithmetic"] }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 crypto-bigint = { version = "0.7", features = ["alloc", "zeroize"] }
 miniz_oxide = "0.9"

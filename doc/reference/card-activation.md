@@ -91,6 +91,13 @@ Observed on an Idemia Cosmo X organization card (see
   available and the counter fallback above applies.
 - The organization numbering, not the certificate date or issuer name,
   is what makes a card an organization card.
+- The qualified-signature key and PIN 2 are local to DF.ESIGN (FINEID
+  S4-2 v4.0 §4.2). The card answers `6A88` to the qualified signature
+  unless DF.ESIGN is the current DF, so qualified signing selects
+  DF.ESIGN by name from the MF, verifies PIN 2 there, and signs with the
+  DF.ESIGN-local key reference, the digest inline in one PSO:CDS. The
+  qualified key is RSA and signs RSASSA-PKCS1-v1_5. The authentication
+  key signs from the PKCS#15 application.
 - No FINEID S1 document for the Idemia Cosmo X is published: the DVV ATR
   technology note names "FINEID S1 v5.0" for it, and the newest published
   FINEID S1 is v4.2, for citizen cards. The card itself -- its EF.AOD and

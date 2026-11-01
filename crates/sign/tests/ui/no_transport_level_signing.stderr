@@ -1,0 +1,13 @@
+warning: unused import: `SignOps as _`
+ --> tests/ui/no_transport_level_signing.rs:3:29
+  |
+3 | use refineid_sign::{KeyRef, SignOps as _, SignScheme};
+  |                             ^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0599]: no method named `sign_prehashed_sha256_rsa` found for mutable reference `&mut T` in the current scope
+ --> tests/ui/no_transport_level_signing.rs:6:23
+  |
+6 |     let _ = transport.sign_prehashed_sha256_rsa(SignScheme::Organizational, KeyRef::Sign, digest);
+  |                       ^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `&mut T`

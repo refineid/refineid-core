@@ -57,7 +57,9 @@ use refineid_pcsc::{
 };
 use refineid_pkcs15::Pkcs15Ops as _;
 use refineid_pkcs15::{CertSlot, Pkcs15Error, UnvalidatedCertificate};
-use refineid_sign::{KeyRef, SignError, SignOps as _, SignScheme};
+use refineid_sign::{
+    KeyRef, QualifiedUnlockError, SignError, SignOps as _, SignScheme, SigningKey,
+};
 
 impl SignSlot {
     /// The key reference `MSE:SET DST` names for the key; a report's
@@ -379,30 +381,67 @@ fn resolve_pin_reference_scheme<T: CardTransport>(
         .map_err(|e| ReaderSignError::Transport(format!("{e}")))
 }
 
-/// VERIFY `pin` for `slot` under the resolved `scheme`.
+/// VERIFY `pin` for `slot` under the resolved `scheme` and hand back the
+/// slot's key, ready to sign one digest.
 ///
 /// The typed digits become the slot's [`Pin1`] or [`Pin2`], so a PIN
 /// outside that role's bounds is refused before any command. The citizen
 /// card is sent the padded stored-length block, the organization card
-/// the bare typed digits.
-fn verify_pin_with_scheme<T: CardTransport>(
-    transport: &mut T,
+/// the bare typed digits. PIN 2 goes through
+/// [`SignOps::unlock_qualified_key`], which on the organization card
+/// makes DF.ESIGN -- where the qualified key and PIN 2 live -- current
+/// before PIN 2 is sent.
+fn unlock_slot_key<'t, T: CardTransport>(
+    transport: &'t mut T,
     slot: SignSlot,
     scheme: PinReferenceScheme,
     pin: &PinBytes,
-) -> Result<VerifyOutcome, ReaderSignError> {
+) -> Result<SigningKey<'t, T>, ReaderSignError> {
     let secret = || UnvalidatedSecret::from_owned_bytes(pin.as_bytes().to_vec());
-    let verified = match slot.pin_role() {
+    let sign_scheme = SignScheme::from(scheme);
+    match slot.pin_role() {
         PinRole::Pin1 => {
             let pin1 = Pin1::reconstruct(secret()).map_err(|e| pin_policy_refusal(slot, e))?;
-            transport.verify_pin1_with_scheme(scheme, pin1)
+            let outcome = transport
+                .verify_pin1_with_scheme(scheme, pin1)
+                .map_err(|e| ReaderSignError::Transport(format!("{e}")))?;
+            match outcome {
+                VerifyOutcome::Ok => Ok(transport.authentication_key(sign_scheme)),
+                rejected @ (VerifyOutcome::WrongPin { .. }
+                | VerifyOutcome::Locked
+                | VerifyOutcome::Other(_)) => Err(ReaderSignError::PinRejected {
+                    slot,
+                    outcome: rejected,
+                }),
+            }
         }
         PinRole::Pin2 => {
             let pin2 = Pin2::reconstruct(secret()).map_err(|e| pin_policy_refusal(slot, e))?;
-            transport.verify_pin2_with_scheme(scheme, pin2)
+            transport
+                .unlock_qualified_key(sign_scheme, pin2)
+                .map_err(|e| unlock_err_to_kind(slot, e))
         }
-    };
-    verified.map_err(|e| ReaderSignError::Transport(format!("{e}")))
+    }
+}
+
+/// Hoist [`QualifiedUnlockError`] onto [`ReaderSignError`]: a refused
+/// PIN 2 is [`ReaderSignError::PinRejected`], a refused walk from the MF
+/// to DF.ESIGN is a sign-chain status, and the rest is transport.
+fn unlock_err_to_kind<TE: fmt::Display>(
+    slot: SignSlot,
+    e: QualifiedUnlockError<TE>,
+) -> ReaderSignError {
+    match e {
+        QualifiedUnlockError::PinRefused(outcome) => ReaderSignError::PinRejected { slot, outcome },
+        QualifiedUnlockError::Directory(Pkcs15Error::Status(sw)) => ReaderSignError::SignSw {
+            stage: "SELECT MF and DF.ESIGN",
+            sw: sw.as_u16(),
+        },
+        directory @ QualifiedUnlockError::Directory(_) => {
+            ReaderSignError::Transport(format!("{directory}"))
+        }
+        QualifiedUnlockError::Verify(verify) => ReaderSignError::Transport(format!("{verify}")),
+    }
 }
 
 /// Dispatch the per-cert sign chain: RSA (PKCS#1 v1.5 SHA-256) or
@@ -410,23 +449,18 @@ fn verify_pin_with_scheme<T: CardTransport>(
 /// local-verify outcome. Unsupported curves / non-RSA SPKIs raise
 /// the typed error kind without doing any APDU.
 fn sign_dispatch_by_alg<T: CardTransport>(
-    transport: &mut T,
+    key: SigningKey<'_, T>,
     slot: SignSlot,
-    scheme: PinReferenceScheme,
     cert: &Certificate<'_>,
     cert_algorithm: PublicKeyAlgorithm,
     input_bytes: &[u8],
     input_sha256: Sha256,
 ) -> Result<(Vec<u8>, LocalVerifyOutcome), ReaderSignError> {
-    let sign_scheme = match scheme {
-        PinReferenceScheme::Citizen => SignScheme::Citizen,
-        PinReferenceScheme::Organizational => SignScheme::Organizational,
-    };
     match cert_algorithm {
         PublicKeyAlgorithm::Rsa { .. } => {
             let core_digest = *input_sha256.as_bytes();
-            let signature = transport
-                .sign_prehashed_sha256_rsa(sign_scheme, slot.key_ref(), core_digest)
+            let signature = key
+                .sign_prehashed_sha256_rsa(core_digest)
                 .map_err(sign_err_to_kind)?;
             verify_against_certificate(
                 cert,
@@ -439,8 +473,8 @@ fn sign_dispatch_by_alg<T: CardTransport>(
         }
         PublicKeyAlgorithm::Ec(EcCurve::Secp384r1) => {
             let hash_sha384 = CoreSha384::of(input_bytes);
-            let signature = transport
-                .sign_prehashed_sha384_ecdsa(sign_scheme, slot.key_ref(), *hash_sha384.as_bytes())
+            let signature = key
+                .sign_prehashed_sha384_ecdsa(*hash_sha384.as_bytes())
                 .map_err(sign_err_to_kind)?;
             verify_against_certificate(
                 cert,
@@ -509,8 +543,10 @@ impl SigningSession for PcscCard {
 ///      its counter served -- holding no transaction while it asks.
 ///   4. Inside one transaction that ends with a card reset: refuse when
 ///      the card is not the one checked before the prompt, check the
-///      counter again, VERIFY, run MSE:SET DST -> PSO:HASH -> PSO:CDS,
-///      and verify the signature locally (Rule E7).
+///      counter again, VERIFY -- PIN 2 on an organization card after
+///      selecting DF.ESIGN, where its qualified key lives -- run the
+///      MSE:SET DST / PSO chain, and verify the signature locally
+///      (Rule E7).
 ///   5. Assemble the document and fetch its timestamps with the card
 ///      session closed, and write the output.
 ///
@@ -840,18 +876,6 @@ fn commit_on_card<T: CardTransport>(
         ));
     }
     check_slot_retry_floor(transport, slot, prepared.scheme)?;
-    let outcome = verify_pin_with_scheme(transport, slot, prepared.scheme, pin)?;
-    let pin_retries_after = match outcome {
-        VerifyOutcome::Ok => None,
-        rejected @ (VerifyOutcome::WrongPin { .. }
-        | VerifyOutcome::Locked
-        | VerifyOutcome::Other(_)) => {
-            return Err(ReaderSignError::PinRejected {
-                slot,
-                outcome: rejected,
-            });
-        }
-    };
 
     let signed_octets: &[u8] = prepared
         .plan
@@ -871,17 +895,17 @@ fn commit_on_card<T: CardTransport>(
     // right algRef, the right PSO:HASH hash size, and the right
     // signature-length expectation for each.
     let cert = prepared.cert_owned.view();
+    let key = unlock_slot_key(transport, slot, prepared.scheme, pin)?;
     let (signature_bytes, local_verify) = sign_dispatch_by_alg(
-        transport,
+        key,
         slot,
-        prepared.scheme,
         &cert,
         cert.spki.algorithm(),
         signed_octets,
         signed_sha256,
     )?;
     Ok(Committed {
-        pin_retries_after,
+        pin_retries_after: None,
         signature_bytes,
         local_verify,
     })
@@ -1262,9 +1286,9 @@ mod tests {
         use refineid_pcsc::{
             PcscError, ReaderAccessCap, ReaderBackend, ReaderId, ReaderInfo, ReaderPickError,
         };
-        use refineid_pkcs15::EF_TOKEN_INFO_FID;
-        use refineid_sign::RSA_3072_SIG_BYTES;
+        use refineid_pkcs15::{EF_TOKEN_INFO_FID, ESIGN_AID};
         use refineid_sign::commands::{MSE_INS, PSO_CDS_P1, PSO_INS};
+        use refineid_sign::{ORG_QUALIFIED_KEY_REF, RSA_3072_SIG_BYTES};
 
         use super::super::{
             CARD_CHANGED_DURING_PROMPT, ReaderSignError, Sha256, SignOptions, SignOutput,
@@ -1290,6 +1314,19 @@ mod tests {
         const DATA_INDEX: usize = HEADER_LEN + 1;
         /// Fill byte of the card's synthetic signature.
         const ANSWER_FILL: u8 = b'S';
+        /// The instructions an organization card sees last when it signs
+        /// with the qualified key.
+        const ORGANIZATIONAL_TAIL: [u8; 6] = [
+            VERIFY_INS,
+            SelectByAidNoFci::INS,
+            SelectByAidNoFci::INS,
+            VERIFY_INS,
+            MSE_INS,
+            PSO_INS,
+        ];
+        /// The instructions a citizen card sees last when it signs with
+        /// the qualified key.
+        const CITIZEN_TAIL: [u8; 5] = [VERIFY_INS, VERIFY_INS, MSE_INS, PSO_INS, PSO_INS];
         /// A PIN counter the retry floor serves (five, four or three).
         const TRIES_SERVED: u8 = 5;
         /// A PIN counter the retry floor refuses (two, one or none).
@@ -1330,6 +1367,9 @@ mod tests {
             signature: Vec<u8>,
             tries: PinRetries,
             verify_answer: StatusWord,
+            numbering: PinReferenceScheme,
+            in_esign: Cell<bool>,
+            qualified_key: Cell<bool>,
             swapped: Cell<bool>,
             selected: Cell<Selected>,
             credentials: RefCell<Vec<u8>>,
@@ -1380,6 +1420,9 @@ mod tests {
                     signature,
                     tries: PinRetries::from_nibble(tries).ok_or("not a counter value")?,
                     verify_answer,
+                    numbering: PinReferenceScheme::Citizen,
+                    in_esign: Cell::new(false),
+                    qualified_key: Cell::new(false),
                     swapped: Cell::new(false),
                     selected: Cell::new(Selected::Certificate),
                     credentials: RefCell::new(Vec::new()),
@@ -1389,6 +1432,17 @@ mod tests {
 
             fn served() -> Result<Self, &'static str> {
                 Self::new(TRIES_SERVED, StatusWord::Success)
+            }
+
+            /// A served card under the organization numbering: it
+            /// answers the citizen references "reference data not found".
+            fn organizational() -> Result<Self, &'static str> {
+                let Self(state) = Self::served()?;
+                let state = Rc::try_unwrap(state).map_err(|_| "fresh state")?;
+                Ok(Self(Rc::new(State {
+                    numbering: PinReferenceScheme::Organizational,
+                    ..state
+                })))
             }
 
             /// The P2 byte of every credential command the card saw.
@@ -1423,6 +1477,13 @@ mod tests {
                     .borrow_mut()
                     .push(ins.unwrap_or_default());
                 if ins == Some(VERIFY_INS) {
+                    let citizen_reference = [PinSlot::Pin1, PinSlot::Pin2]
+                        .map(|slot| PinReferenceScheme::Citizen.reference(slot))
+                        .iter()
+                        .any(|reference| apdu.get(P2_INDEX) == Some(reference));
+                    if self.0.numbering == PinReferenceScheme::Organizational && citizen_reference {
+                        return respond(Vec::new(), StatusWord::ReferenceDataNotFound);
+                    }
                     return respond(
                         Vec::new(),
                         StatusWord::PinIncorrect {
@@ -1431,6 +1492,9 @@ mod tests {
                     );
                 }
                 if ins == Some(SelectByAidNoFci::INS) {
+                    self.0
+                        .in_esign
+                        .set(apdu.get(DATA_INDEX..) == Some(ESIGN_AID));
                     let token_info = apdu.get(DATA_INDEX..) == Some(EF_TOKEN_INFO_FID.as_bytes());
                     self.0.selected.set(if token_info {
                         Selected::TokenInfo
@@ -1442,7 +1506,20 @@ mod tests {
                 if ins == Some(ReadBinary::INS) {
                     return self.read_binary(apdu);
                 }
+                if ins == Some(MSE_INS) {
+                    self.0
+                        .qualified_key
+                        .set(apdu.last() == Some(&ORG_QUALIFIED_KEY_REF));
+                }
                 if ins == Some(PSO_INS) && apdu.get(P1_INDEX) == Some(&PSO_CDS_P1) {
+                    // The organization card names its qualified key only
+                    // with DF.ESIGN current.
+                    if self.0.numbering == PinReferenceScheme::Organizational
+                        && self.0.qualified_key.get()
+                        && !self.0.in_esign.get()
+                    {
+                        return respond(Vec::new(), StatusWord::ReferenceDataNotFound);
+                    }
                     return respond(self.0.signature.clone(), StatusWord::Success);
                 }
                 if ins == Some(PSO_INS) || ins == Some(MSE_INS) {
@@ -1672,6 +1749,48 @@ mod tests {
         }
 
         #[test]
+        fn an_organization_card_verifies_pin2_in_esign_and_signs_there() -> TestResult {
+            let card = SyntheticCard::organizational()?;
+            let backend = SyntheticBackend::one_reader(true, card.clone());
+            let (mut pin, asked) = counting(|| {});
+            let result = sign_on(&backend, SignSlot::Qualified, &mut pin)?;
+            check_true(passed_verify(&result), "flow passed VERIFY")?;
+            check(&asked.get(), &1, "prompts")?;
+            check(
+                &card.credential_references(),
+                &vec![PinReferenceScheme::Organizational.reference(PinSlot::Pin2)],
+                "one VERIFY under the organization PIN 2 reference",
+            )?;
+            // The floor probe, SELECT MF, SELECT DF.ESIGN, VERIFY PIN 2,
+            // MSE:Set and the one inline PSO:CDS, with nothing between.
+            let instructions = card.instructions();
+            let tail = instructions
+                .get(instructions.len().saturating_sub(ORGANIZATIONAL_TAIL.len())..)
+                .ok_or("too few commands")?;
+            check(
+                &tail,
+                &ORGANIZATIONAL_TAIL.as_slice(),
+                "the qualified sequence",
+            )
+        }
+
+        #[test]
+        fn a_citizen_card_verifies_pin2_where_the_application_is_selected() -> TestResult {
+            let card = SyntheticCard::served()?;
+            let backend = SyntheticBackend::one_reader(true, card.clone());
+            let (mut pin, _asked) = counting(|| {});
+            let result = sign_on(&backend, SignSlot::Qualified, &mut pin)?;
+            check_true(passed_verify(&result), "flow passed VERIFY")?;
+            // The floor probe, VERIFY PIN 2, MSE:Set, PSO:HASH and the
+            // empty PSO:CDS: no directory change.
+            let instructions = card.instructions();
+            let tail = instructions
+                .get(instructions.len().saturating_sub(CITIZEN_TAIL.len())..)
+                .ok_or("too few commands")?;
+            check(&tail, &CITIZEN_TAIL.as_slice(), "the citizen sequence")
+        }
+
+        #[test]
         fn a_card_changed_during_the_prompt_is_refused_before_verify() -> TestResult {
             let card = SyntheticCard::served()?;
             let backend = SyntheticBackend::one_reader(true, card.clone());
@@ -1824,7 +1943,9 @@ mod tests {
         use refineid_auth::credentials::{FINEID_PIN2_MIN_LENGTH, PIN_MAX_LENGTH, PIN_MIN_LENGTH};
         use refineid_auth::{PinReferenceScheme, PinSlot};
 
-        use super::super::{SignSlot, verify_pin_with_scheme};
+        use refineid_apdu::iso7816::SelectFile;
+
+        use super::super::{SignSlot, unlock_slot_key};
         use crate::pin::PinBytes;
         use crate::test_util::{TestResult, check, check_true};
 
@@ -1837,17 +1958,32 @@ mod tests {
         /// A PIN at the longest length either role accepts.
         const LONGEST_PIN: &[u8] = b"135792468024";
 
-        /// Records every credential command's wire and accepts it.
+        /// Offset of INS in a command APDU (ISO 7816-4 s5.1).
+        const INS_INDEX: usize = 1;
+
+        /// Records every command's wire, plain and credential apart, and
+        /// accepts it.
         #[derive(Default)]
         struct Recorder {
+            plain: Vec<Vec<u8>>,
             commands: Vec<Vec<u8>>,
+        }
+
+        impl Recorder {
+            /// The INS byte of every plain command, in order.
+            fn plain_instructions(&self) -> Vec<Option<u8>> {
+                self.plain
+                    .iter()
+                    .map(|wire| wire.get(INS_INDEX).copied())
+                    .collect()
+            }
         }
 
         impl CardTransport for Recorder {
             type Error = String;
 
             fn transmit(&mut self, command: &CommandApdu) -> Result<TransportOutcome, Self::Error> {
-                self.commands.push(command.as_bytes().to_vec());
+                self.plain.push(command.as_bytes().to_vec());
                 Ok(TransportOutcome::Response(success()))
             }
 
@@ -1879,7 +2015,7 @@ mod tests {
                 let mut card = Recorder::default();
                 let pin = PinBytes::new(LONGEST_PIN.to_vec())?;
                 let scheme = PinReferenceScheme::Organizational;
-                verify_pin_with_scheme(&mut card, slot, scheme, &pin)?;
+                drop(unlock_slot_key(&mut card, slot, scheme, &pin)?);
                 let [wire] = card.commands.as_slice() else {
                     return Err("one VERIFY".into());
                 };
@@ -1894,6 +2030,18 @@ mod tests {
                     "Lc is the typed length",
                 )?;
                 check(&wire.get(DATA_INDEX..), &Some(LONGEST_PIN), "bare digits")?;
+                // PIN 2 is sent only once SELECT MF and SELECT DF.ESIGN
+                // made the qualified key's directory current; PIN 1 is
+                // sent where the caller selected.
+                let selects = match slot {
+                    SignSlot::Qualified => vec![Some(SelectFile::INS); 2],
+                    SignSlot::Authentication => Vec::new(),
+                };
+                check(
+                    &card.plain_instructions(),
+                    &selects,
+                    "SELECTs before VERIFY",
+                )?;
             }
             Ok(())
         }
@@ -1909,7 +2057,12 @@ mod tests {
             ] {
                 let mut card = Recorder::default();
                 let short = PinBytes::new(LONGEST_PIN[..short_length].to_vec())?;
-                verify_pin_with_scheme(&mut card, SignSlot::Qualified, scheme, &short)?;
+                drop(unlock_slot_key(
+                    &mut card,
+                    SignSlot::Qualified,
+                    scheme,
+                    &short,
+                )?);
                 let [wire] = card.commands.as_slice() else {
                     return Err("one VERIFY".into());
                 };

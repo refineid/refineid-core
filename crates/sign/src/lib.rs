@@ -21,10 +21,16 @@
 //! [`SignScheme`]): the citizen card loads the digest with PSO:HASH and
 //! signs an empty PSO:CDS, while the organizational card carries the
 //! digest inline in a single PSO:CDS and issues no PSO:HASH. Both
-//! families set the digital-signature template for either key. The PIN
-//! that gates the key must already be verified in the card session;
-//! these commands carry no credential material and use the plain
+//! families set the digital-signature template for either key. The
+//! signing commands carry no credential material and use the plain
 //! transport path.
+//!
+//! A signature is made through a [`SigningKey`]. The authentication key
+//! is named with PIN 1 already verified by the caller; the qualified key
+//! exists only as the result of [`SignOps::unlock_qualified_key`], which
+//! enters the directory the key lives in -- DF.ESIGN on the organizational
+//! card -- and verifies PIN 2 there, so the qualified key cannot be
+//! driven from any other context.
 //!
 //! The pre-hashed signing chains all fit the short-form command:
 //! RSASSA-PKCS1-v1_5 and RSASSA-PSS over SHA-256, SHA-384, or SHA-512
@@ -43,6 +49,8 @@ pub mod commands;
 pub mod container;
 
 use refineid_apdu::{CardTransport, CommandDataError, ResponseApdu, StatusWord, TransportOutcome};
+use refineid_auth::{AuthError, Pin2, PinOps as _, PinReferenceScheme, VerifyOutcome};
+use refineid_pkcs15::{Pkcs15Error, Pkcs15Ops as _};
 use zeroize::Zeroizing;
 
 use commands::{
@@ -78,6 +86,27 @@ pub enum SignScheme {
     Citizen,
     /// FINEID S4 numbering and chain: the organizational cards.
     Organizational,
+}
+
+impl SignScheme {
+    /// The credential numbering of the same card family.
+    const fn pin_numbering(self) -> PinReferenceScheme {
+        match self {
+            Self::Citizen => PinReferenceScheme::Citizen,
+            Self::Organizational => PinReferenceScheme::Organizational,
+        }
+    }
+}
+
+impl From<PinReferenceScheme> for SignScheme {
+    /// The signing family of the card whose credential numbering the
+    /// session resolved.
+    fn from(numbering: PinReferenceScheme) -> Self {
+        match numbering {
+            PinReferenceScheme::Citizen => Self::Citizen,
+            PinReferenceScheme::Organizational => Self::Organizational,
+        }
+    }
 }
 
 /// RSA-3072 modulus width in bytes. The signature and the decipher
@@ -173,356 +202,107 @@ impl<E> From<container::SignatureLengthError> for SignError<E> {
     }
 }
 
+/// Why the qualified-signature key was not made ready to sign.
+#[derive(Debug)]
+pub enum QualifiedUnlockError<E> {
+    /// DF.ESIGN could not be made current; PIN 2 was not sent.
+    Directory(Pkcs15Error<E>),
+    /// VERIFY PIN 2 failed in transport or assembly.
+    Verify(AuthError<E>),
+    /// The card refused PIN 2. Never [`VerifyOutcome::Ok`].
+    PinRefused(VerifyOutcome),
+}
+
+impl<E: core::fmt::Display> core::fmt::Display for QualifiedUnlockError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Directory(e) => write!(f, "select DF.ESIGN: {e}"),
+            Self::Verify(e) => write!(f, "VERIFY PIN 2: {e}"),
+            Self::PinRefused(outcome) => write!(f, "the card refused PIN 2: {outcome:?}"),
+        }
+    }
+}
+
+impl<E: core::fmt::Debug + core::fmt::Display + 'static> core::error::Error
+    for QualifiedUnlockError<E>
+{
+}
+
 /// Card-side private-key operations -- signing and RSA decipher --
 /// layered as default methods on every [`CardTransport`].
 ///
 /// Bring the trait into scope to use the methods; the blanket
 /// implementation applies to every transport, so a plain contact
 /// transport and a PACE secure-messaging transport both gain the same
-/// operations.
+/// operations. A signature is made through a [`SigningKey`]:
+/// [`SignOps::authentication_key`] names the PIN 1 key, and
+/// [`SignOps::unlock_qualified_key`] verifies PIN 2 in the context the
+/// qualified key lives in and hands back that key.
 pub trait SignOps: CardTransport {
-    /// Set the security environment for a signing key.
+    /// The authentication key, ready to sign one digest.
     ///
-    /// # Errors
-    ///
-    /// Transport failures, a state transition, or a non-success status
-    /// word.
-    fn mse_set(
-        &mut self,
-        scheme: SignScheme,
-        alg_ref: SignatureAlgRef,
-        key: KeyRef,
-    ) -> Result<(), SignError<Self::Error>>
+    /// PIN 1 must already be verified in the card session, and `scheme`
+    /// must be the family the session resolved. The key keeps its own
+    /// reference under both numberings and is reached from the PKCS#15
+    /// application.
+    fn authentication_key(&mut self, scheme: SignScheme) -> SigningKey<'_, Self>
     where
         Self: Sized,
     {
-        let command = MseSet {
-            alg_ref,
-            key_ref: key.reference(scheme),
+        SigningKey {
+            transport: self,
+            scheme,
+            key: KeyRef::Auth,
         }
-        .into_apdu()
-        .map_err(SignError::Command)?;
-        self.exchange(&command, "MSE:Set").map(drop)
     }
 
-    /// Ship a host-computed digest to the card.
+    /// VERIFY PIN 2 where the qualified-signature key lives and hand back
+    /// that key, ready to sign one digest.
+    ///
+    /// On the organizational card the qualified key and PIN 2 are local
+    /// to DF.ESIGN (FINEID S4-2 v4.0 section 4.2, SE#7 "local Signature
+    /// PIN SIG"; IAS-ECC v1.0.1 section 4.4 for the local key
+    /// reference), and the card answers `6A88` to the signature unless
+    /// DF.ESIGN is the current DF. So this selects DF.ESIGN by name from
+    /// the MF first and only then sends PIN 2. The citizen card is sent
+    /// PIN 2 in the context the caller selected, as before.
+    ///
+    /// The returned key borrows the transport exclusively, so no command
+    /// can move the card out of that context between the VERIFY and the
+    /// signature, and signing consumes it: one verification, one
+    /// signature. The caller applies the retry floor before calling.
     ///
     /// # Errors
     ///
-    /// Transport failures, a state transition, or a non-success status
-    /// word.
-    fn pso_hash(&mut self, hash: ExternalHashValue) -> Result<(), SignError<Self::Error>>
-    where
-        Self: Sized,
-    {
-        let command = PsoHashExternal { hash }
-            .into_apdu()
-            .map_err(SignError::Command)?;
-        self.exchange(&command, "PSO:HASH").map(drop)
-    }
-
-    /// Have the card sign the previously stored hash and return the raw
-    /// signature bytes.
-    ///
-    /// # Errors
-    ///
-    /// Transport failures, a state transition, or a non-success status
-    /// word.
-    fn pso_compute_signature(&mut self, le: u8) -> Result<Vec<u8>, SignError<Self::Error>>
-    where
-        Self: Sized,
-    {
-        let command = PsoComputeDigitalSignature.into_apdu(le);
-        Ok(self.exchange(&command, "PSO:CDS")?.body)
-    }
-
-    /// Ship the host digest inline and have the card sign it in one
-    /// PSO:CDS, the organizational chain's single signing command. The
-    /// digest arrives as [`ExternalHashValue`], so its wire length is the
-    /// one its hash function fixes; `le` is the expected-length byte for
-    /// the signature (see [`expected_length_le`]).
-    ///
-    /// # Errors
-    ///
-    /// Transport failures, a state transition, or a non-success status
-    /// word.
-    fn pso_compute_signature_over_digest(
-        &mut self,
-        hash: ExternalHashValue,
-        le: u8,
-    ) -> Result<Vec<u8>, SignError<Self::Error>>
-    where
-        Self: Sized,
-    {
-        let command = PsoComputeDigitalSignature
-            .into_apdu_with_digest(hash, le)
-            .map_err(SignError::Command)?;
-        Ok(self.exchange(&command, "PSO:CDS")?.body)
-    }
-
-    /// Sign a SHA-256 digest with an RSA-3072 key, returning its 384-byte
-    /// signature.
-    ///
-    /// The length is fixed to RSA-3072 because that is the only RSA size the
-    /// two key references [`KeyRef`] names carry on the cards that expose
-    /// them; a card exposing an RSA-4096 signing key here would first need
-    /// this length generalised to the key's modulus width. The key's PIN
-    /// must already be verified in the card session, and `scheme` must be
-    /// the family the session resolved. On an organizational card the
-    /// qualified key is local to DF.ESIGN, so that directory must be the
-    /// selected DF.
-    ///
-    /// # Errors
-    ///
-    /// Any stage failure, or a signature length other than
-    /// [`RSA_3072_SIG_BYTES`].
-    fn sign_prehashed_sha256_rsa(
+    /// [`QualifiedUnlockError::Directory`] when DF.ESIGN cannot be made
+    /// current (PIN 2 is not sent), [`QualifiedUnlockError::Verify`] on a
+    /// VERIFY transport failure, and [`QualifiedUnlockError::PinRefused`]
+    /// when the card refuses PIN 2.
+    fn unlock_qualified_key(
         &mut self,
         scheme: SignScheme,
-        key: KeyRef,
-        digest: [u8; SHA256_LEN],
-    ) -> Result<Signature<RsaPkcs1Sha256>, SignError<Self::Error>>
+        pin: Pin2,
+    ) -> Result<SigningKey<'_, Self>, QualifiedUnlockError<Self::Error>>
     where
         Self: Sized,
     {
-        let bytes = drive_chain(
-            self,
-            scheme,
-            SignatureAlgRef::SHA256_RSA_PKCS1,
-            key,
-            ExternalHashValue::Sha256(digest),
-            expected_length_le(RSA_3072_SIG_BYTES),
-        )?;
-        Ok(Signature::from_card_bytes(bytes)?)
-    }
-
-    /// Sign a SHA-384 digest with an RSA-3072 key under
-    /// RSASSA-PKCS1-v1_5, returning its 384-byte signature.
-    ///
-    /// Qualified document signatures use SHA-384 for both RSA and ECDSA
-    /// card profiles. The key's PIN must already be verified in the card
-    /// session, and `scheme` must be the family the session resolved. On an
-    /// organizational card the qualified key is local to DF.ESIGN, so that
-    /// directory must be the selected DF.
-    ///
-    /// # Errors
-    ///
-    /// Any stage failure, or a signature length other than
-    /// [`RSA_3072_SIG_BYTES`].
-    fn sign_prehashed_sha384_rsa(
-        &mut self,
-        scheme: SignScheme,
-        key: KeyRef,
-        digest: [u8; SHA384_LEN],
-    ) -> Result<Signature<RsaPkcs1Sha384>, SignError<Self::Error>>
-    where
-        Self: Sized,
-    {
-        let bytes = drive_chain(
-            self,
-            scheme,
-            SignatureAlgRef::SHA384_RSA_PKCS1,
-            key,
-            ExternalHashValue::Sha384(digest),
-            expected_length_le(RSA_3072_SIG_BYTES),
-        )?;
-        Ok(Signature::from_card_bytes(bytes)?)
-    }
-
-    /// Sign a SHA-512 digest with an RSA-3072 key under
-    /// RSASSA-PKCS1-v1_5, returning its 384-byte signature.
-    ///
-    /// The key's PIN must already be verified in the card session, and
-    /// `scheme` must be the family the session resolved. On an
-    /// organizational card the qualified key is local to DF.ESIGN, so
-    /// that directory must be the selected DF.
-    ///
-    /// # Errors
-    ///
-    /// Any stage failure, or a signature length other than
-    /// [`RSA_3072_SIG_BYTES`].
-    fn sign_prehashed_sha512_rsa(
-        &mut self,
-        scheme: SignScheme,
-        key: KeyRef,
-        digest: [u8; SHA512_LEN],
-    ) -> Result<Signature<RsaPkcs1Sha512>, SignError<Self::Error>>
-    where
-        Self: Sized,
-    {
-        let bytes = drive_chain(
-            self,
-            scheme,
-            SignatureAlgRef::SHA512_RSA_PKCS1,
-            key,
-            ExternalHashValue::Sha512(digest),
-            expected_length_le(RSA_3072_SIG_BYTES),
-        )?;
-        Ok(Signature::from_card_bytes(bytes)?)
-    }
-
-    /// Sign a SHA-256 digest with an RSA-3072 key under RSASSA-PSS,
-    /// returning its 384-byte signature.
-    ///
-    /// The card applies the PSS padding itself, so the chain matches the
-    /// pre-hashed PKCS#1 path -- only the algorithm reference differs.
-    /// PSS uses a card-generated salt, so signing the same digest twice
-    /// yields different bytes. As for the PKCS#1 path, the length is fixed
-    /// to RSA-3072, the only RSA size the key references expose. The key's
-    /// PIN must already be verified in the card session, and `scheme` must
-    /// be the family the session resolved.
-    ///
-    /// # Errors
-    ///
-    /// Any stage failure, or a signature length other than
-    /// [`RSA_3072_SIG_BYTES`].
-    fn sign_prehashed_sha256_rsa_pss(
-        &mut self,
-        scheme: SignScheme,
-        key: KeyRef,
-        digest: [u8; SHA256_LEN],
-    ) -> Result<Signature<RsaPssSha256>, SignError<Self::Error>>
-    where
-        Self: Sized,
-    {
-        let bytes = drive_chain(
-            self,
-            scheme,
-            SignatureAlgRef::SHA256_RSA_PSS,
-            key,
-            ExternalHashValue::Sha256(digest),
-            expected_length_le(RSA_3072_SIG_BYTES),
-        )?;
-        Ok(Signature::from_card_bytes(bytes)?)
-    }
-
-    /// Sign a SHA-384 digest with an RSA-3072 key under RSASSA-PSS,
-    /// returning its 384-byte signature.
-    ///
-    /// The card applies PSS with SHA-384, MGF1-SHA-384, and a 48-byte
-    /// salt. The key's PIN must already be verified in the card session,
-    /// and `scheme` must be the family the session resolved.
-    ///
-    /// # Errors
-    ///
-    /// Any stage failure, or a signature length other than
-    /// [`RSA_3072_SIG_BYTES`].
-    fn sign_prehashed_sha384_rsa_pss(
-        &mut self,
-        scheme: SignScheme,
-        key: KeyRef,
-        digest: [u8; SHA384_LEN],
-    ) -> Result<Signature<RsaPssSha384>, SignError<Self::Error>>
-    where
-        Self: Sized,
-    {
-        let bytes = drive_chain(
-            self,
-            scheme,
-            SignatureAlgRef::SHA384_RSA_PSS,
-            key,
-            ExternalHashValue::Sha384(digest),
-            expected_length_le(RSA_3072_SIG_BYTES),
-        )?;
-        Ok(Signature::from_card_bytes(bytes)?)
-    }
-
-    /// Sign a SHA-512 digest with an RSA-3072 key under RSASSA-PSS,
-    /// returning its 384-byte signature.
-    ///
-    /// The card applies PSS with SHA-512, MGF1-SHA-512, and a 64-byte
-    /// salt. The key's PIN must already be verified in the card session,
-    /// and `scheme` must be the family the session resolved.
-    ///
-    /// # Errors
-    ///
-    /// Any stage failure, or a signature length other than
-    /// [`RSA_3072_SIG_BYTES`].
-    fn sign_prehashed_sha512_rsa_pss(
-        &mut self,
-        scheme: SignScheme,
-        key: KeyRef,
-        digest: [u8; SHA512_LEN],
-    ) -> Result<Signature<RsaPssSha512>, SignError<Self::Error>>
-    where
-        Self: Sized,
-    {
-        let bytes = drive_chain(
-            self,
-            scheme,
-            SignatureAlgRef::SHA512_RSA_PSS,
-            key,
-            ExternalHashValue::Sha512(digest),
-            expected_length_le(RSA_3072_SIG_BYTES),
-        )?;
-        Ok(Signature::from_card_bytes(bytes)?)
-    }
-
-    /// Sign a SHA-256 digest with a P-384 key, returning the raw ECDSA
-    /// `r || s` signature.
-    ///
-    /// TLS 1.2 peers may negotiate ECDSA with SHA-256 even when the
-    /// certificate carries a P-384 key. The curve fixes the signature
-    /// width; the negotiated hash fixes this method's digest width and
-    /// algorithm reference. The key's PIN must already be verified in the
-    /// card session, and `scheme` must be the family the session resolved.
-    /// On an organizational card the qualified key is local to DF.ESIGN, so
-    /// that directory must be the selected DF.
-    ///
-    /// # Errors
-    ///
-    /// Any stage failure, or a signature length other than
-    /// [`ECDSA_P384_SIG_BYTES`].
-    fn sign_prehashed_sha256_ecdsa(
-        &mut self,
-        scheme: SignScheme,
-        key: KeyRef,
-        digest: [u8; SHA256_LEN],
-    ) -> Result<Signature<EcdsaP384>, SignError<Self::Error>>
-    where
-        Self: Sized,
-    {
-        let bytes = drive_chain(
-            self,
-            scheme,
-            SignatureAlgRef::SHA256_ECDSA,
-            key,
-            ExternalHashValue::Sha256(digest),
-            expected_length_le(ECDSA_P384_SIG_BYTES),
-        )?;
-        Ok(Signature::from_card_bytes(bytes)?)
-    }
-
-    /// Sign a SHA-384 digest with a P-384 key, returning the raw ECDSA
-    /// `r || s` signature.
-    ///
-    /// The key's PIN must already be verified in the card session, and
-    /// `scheme` must be the family the session resolved. On an
-    /// organizational card the qualified key is local to DF.ESIGN, so
-    /// that directory must be the selected DF.
-    ///
-    /// # Errors
-    ///
-    /// Any stage failure, or a signature length other than
-    /// [`ECDSA_P384_SIG_BYTES`].
-    fn sign_prehashed_sha384_ecdsa(
-        &mut self,
-        scheme: SignScheme,
-        key: KeyRef,
-        digest: [u8; SHA384_LEN],
-    ) -> Result<Signature<EcdsaP384>, SignError<Self::Error>>
-    where
-        Self: Sized,
-    {
-        let bytes = drive_chain(
-            self,
-            scheme,
-            SignatureAlgRef::SHA384_ECDSA,
-            key,
-            ExternalHashValue::Sha384(digest),
-            expected_length_le(ECDSA_P384_SIG_BYTES),
-        )?;
-        Ok(Signature::from_card_bytes(bytes)?)
+        if scheme == SignScheme::Organizational {
+            self.select_esign_directory()
+                .map_err(QualifiedUnlockError::Directory)?;
+        }
+        let outcome = self
+            .verify_pin2_with_scheme(scheme.pin_numbering(), pin)
+            .map_err(QualifiedUnlockError::Verify)?;
+        match outcome {
+            VerifyOutcome::Ok => Ok(SigningKey {
+                transport: self,
+                scheme,
+                key: KeyRef::Sign,
+            }),
+            refused @ (VerifyOutcome::WrongPin { .. }
+            | VerifyOutcome::Locked
+            | VerifyOutcome::Other(_)) => Err(QualifiedUnlockError::PinRefused(refused)),
+        }
     }
 
     /// Decipher an RSA cryptogram with a card private key, returning the
@@ -603,23 +383,237 @@ pub trait SignOps: CardTransport {
 
 impl<T: CardTransport + ?Sized> SignOps for T {}
 
-/// Drive the resolved signing chain end to end and return the raw
-/// signature bytes: MSE:Set, then either PSO:HASH plus an empty PSO:CDS
-/// (citizen) or a single inline-digest PSO:CDS (organizational).
-fn drive_chain<T: SignOps>(
-    transport: &mut T,
+/// A card private key ready to sign one digest: the transport, borrowed
+/// exclusively, with the card in the context the key is reached from.
+///
+/// Obtained from [`SignOps::authentication_key`] or, for the qualified
+/// key, from [`SignOps::unlock_qualified_key`] -- there is no other
+/// constructor, so the qualified key cannot be named without PIN 2
+/// verified in its directory. Each signing method consumes the key, so
+/// one key signs one digest.
+#[must_use = "a signing key does nothing until it signs"]
+pub struct SigningKey<'t, T: CardTransport> {
+    transport: &'t mut T,
     scheme: SignScheme,
-    alg_ref: SignatureAlgRef,
     key: KeyRef,
-    hash: ExternalHashValue,
-    le: u8,
-) -> Result<Vec<u8>, SignError<T::Error>> {
-    transport.mse_set(scheme, alg_ref, key)?;
-    match scheme {
-        SignScheme::Citizen => {
-            transport.pso_hash(hash)?;
-            transport.pso_compute_signature(le)
+}
+
+impl<T: CardTransport> core::fmt::Debug for SigningKey<'_, T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SigningKey")
+            .field("scheme", &self.scheme)
+            .field("key", &self.key)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T: CardTransport> SigningKey<'_, T> {
+    /// Sign a SHA-256 digest with an RSA-3072 key, returning its 384-byte
+    /// signature.
+    ///
+    /// The length is fixed to RSA-3072 because that is the only RSA size the
+    /// two key references [`KeyRef`] names carry on the cards that expose
+    /// them; a card exposing an RSA-4096 signing key here would first need
+    /// this length generalised to the key's modulus width.
+    ///
+    /// # Errors
+    ///
+    /// Any stage failure, or a signature length other than
+    /// [`RSA_3072_SIG_BYTES`].
+    pub fn sign_prehashed_sha256_rsa(
+        self,
+        digest: [u8; SHA256_LEN],
+    ) -> Result<Signature<RsaPkcs1Sha256>, SignError<T::Error>> {
+        let bytes = self.drive_chain(
+            SignatureAlgRef::SHA256_RSA_PKCS1,
+            ExternalHashValue::Sha256(digest),
+            expected_length_le(RSA_3072_SIG_BYTES),
+        )?;
+        Ok(Signature::from_card_bytes(bytes)?)
+    }
+
+    /// Sign a SHA-384 digest with an RSA-3072 key under
+    /// RSASSA-PKCS1-v1_5, returning its 384-byte signature.
+    ///
+    /// Qualified document signatures use SHA-384 for both RSA and ECDSA
+    /// card profiles.
+    ///
+    /// # Errors
+    ///
+    /// Any stage failure, or a signature length other than
+    /// [`RSA_3072_SIG_BYTES`].
+    pub fn sign_prehashed_sha384_rsa(
+        self,
+        digest: [u8; SHA384_LEN],
+    ) -> Result<Signature<RsaPkcs1Sha384>, SignError<T::Error>> {
+        let bytes = self.drive_chain(
+            SignatureAlgRef::SHA384_RSA_PKCS1,
+            ExternalHashValue::Sha384(digest),
+            expected_length_le(RSA_3072_SIG_BYTES),
+        )?;
+        Ok(Signature::from_card_bytes(bytes)?)
+    }
+
+    /// Sign a SHA-512 digest with an RSA-3072 key under
+    /// RSASSA-PKCS1-v1_5, returning its 384-byte signature.
+    ///
+    /// # Errors
+    ///
+    /// Any stage failure, or a signature length other than
+    /// [`RSA_3072_SIG_BYTES`].
+    pub fn sign_prehashed_sha512_rsa(
+        self,
+        digest: [u8; SHA512_LEN],
+    ) -> Result<Signature<RsaPkcs1Sha512>, SignError<T::Error>> {
+        let bytes = self.drive_chain(
+            SignatureAlgRef::SHA512_RSA_PKCS1,
+            ExternalHashValue::Sha512(digest),
+            expected_length_le(RSA_3072_SIG_BYTES),
+        )?;
+        Ok(Signature::from_card_bytes(bytes)?)
+    }
+
+    /// Sign a SHA-256 digest with an RSA-3072 key under RSASSA-PSS,
+    /// returning its 384-byte signature.
+    ///
+    /// The card applies the PSS padding itself, so the chain matches the
+    /// pre-hashed PKCS#1 path -- only the algorithm reference differs.
+    /// PSS uses a card-generated salt, so signing the same digest twice
+    /// yields different bytes. As for the PKCS#1 path, the length is fixed
+    /// to RSA-3072, the only RSA size the key references expose.
+    ///
+    /// # Errors
+    ///
+    /// Any stage failure, or a signature length other than
+    /// [`RSA_3072_SIG_BYTES`].
+    pub fn sign_prehashed_sha256_rsa_pss(
+        self,
+        digest: [u8; SHA256_LEN],
+    ) -> Result<Signature<RsaPssSha256>, SignError<T::Error>> {
+        let bytes = self.drive_chain(
+            SignatureAlgRef::SHA256_RSA_PSS,
+            ExternalHashValue::Sha256(digest),
+            expected_length_le(RSA_3072_SIG_BYTES),
+        )?;
+        Ok(Signature::from_card_bytes(bytes)?)
+    }
+
+    /// Sign a SHA-384 digest with an RSA-3072 key under RSASSA-PSS,
+    /// returning its 384-byte signature.
+    ///
+    /// The card applies PSS with SHA-384, MGF1-SHA-384, and a 48-byte
+    /// salt.
+    ///
+    /// # Errors
+    ///
+    /// Any stage failure, or a signature length other than
+    /// [`RSA_3072_SIG_BYTES`].
+    pub fn sign_prehashed_sha384_rsa_pss(
+        self,
+        digest: [u8; SHA384_LEN],
+    ) -> Result<Signature<RsaPssSha384>, SignError<T::Error>> {
+        let bytes = self.drive_chain(
+            SignatureAlgRef::SHA384_RSA_PSS,
+            ExternalHashValue::Sha384(digest),
+            expected_length_le(RSA_3072_SIG_BYTES),
+        )?;
+        Ok(Signature::from_card_bytes(bytes)?)
+    }
+
+    /// Sign a SHA-512 digest with an RSA-3072 key under RSASSA-PSS,
+    /// returning its 384-byte signature.
+    ///
+    /// The card applies PSS with SHA-512, MGF1-SHA-512, and a 64-byte
+    /// salt.
+    ///
+    /// # Errors
+    ///
+    /// Any stage failure, or a signature length other than
+    /// [`RSA_3072_SIG_BYTES`].
+    pub fn sign_prehashed_sha512_rsa_pss(
+        self,
+        digest: [u8; SHA512_LEN],
+    ) -> Result<Signature<RsaPssSha512>, SignError<T::Error>> {
+        let bytes = self.drive_chain(
+            SignatureAlgRef::SHA512_RSA_PSS,
+            ExternalHashValue::Sha512(digest),
+            expected_length_le(RSA_3072_SIG_BYTES),
+        )?;
+        Ok(Signature::from_card_bytes(bytes)?)
+    }
+
+    /// Sign a SHA-256 digest with a P-384 key, returning the raw ECDSA
+    /// `r || s` signature.
+    ///
+    /// TLS 1.2 peers may negotiate ECDSA with SHA-256 even when the
+    /// certificate carries a P-384 key. The curve fixes the signature
+    /// width; the negotiated hash fixes this method's digest width and
+    /// algorithm reference.
+    ///
+    /// # Errors
+    ///
+    /// Any stage failure, or a signature length other than
+    /// [`ECDSA_P384_SIG_BYTES`].
+    pub fn sign_prehashed_sha256_ecdsa(
+        self,
+        digest: [u8; SHA256_LEN],
+    ) -> Result<Signature<EcdsaP384>, SignError<T::Error>> {
+        let bytes = self.drive_chain(
+            SignatureAlgRef::SHA256_ECDSA,
+            ExternalHashValue::Sha256(digest),
+            expected_length_le(ECDSA_P384_SIG_BYTES),
+        )?;
+        Ok(Signature::from_card_bytes(bytes)?)
+    }
+
+    /// Sign a SHA-384 digest with a P-384 key, returning the raw ECDSA
+    /// `r || s` signature.
+    ///
+    /// # Errors
+    ///
+    /// Any stage failure, or a signature length other than
+    /// [`ECDSA_P384_SIG_BYTES`].
+    pub fn sign_prehashed_sha384_ecdsa(
+        self,
+        digest: [u8; SHA384_LEN],
+    ) -> Result<Signature<EcdsaP384>, SignError<T::Error>> {
+        let bytes = self.drive_chain(
+            SignatureAlgRef::SHA384_ECDSA,
+            ExternalHashValue::Sha384(digest),
+            expected_length_le(ECDSA_P384_SIG_BYTES),
+        )?;
+        Ok(Signature::from_card_bytes(bytes)?)
+    }
+
+    /// Drive the resolved signing chain end to end and return the raw
+    /// signature bytes: MSE:Set, then either PSO:HASH plus an empty
+    /// PSO:CDS (citizen) or a single inline-digest PSO:CDS
+    /// (organizational).
+    fn drive_chain(
+        self,
+        alg_ref: SignatureAlgRef,
+        hash: ExternalHashValue,
+        le: u8,
+    ) -> Result<Vec<u8>, SignError<T::Error>> {
+        let mse = MseSet {
+            alg_ref,
+            key_ref: self.key.reference(self.scheme),
         }
-        SignScheme::Organizational => transport.pso_compute_signature_over_digest(hash, le),
+        .into_apdu()
+        .map_err(SignError::Command)?;
+        self.transport.exchange(&mse, "MSE:Set")?;
+        let signature = match self.scheme {
+            SignScheme::Citizen => {
+                let load = PsoHashExternal { hash }
+                    .into_apdu()
+                    .map_err(SignError::Command)?;
+                self.transport.exchange(&load, "PSO:HASH")?;
+                PsoComputeDigitalSignature.into_apdu(le)
+            }
+            SignScheme::Organizational => PsoComputeDigitalSignature
+                .into_apdu_with_digest(hash, le)
+                .map_err(SignError::Command)?,
+        };
+        Ok(self.transport.exchange(&signature, "PSO:CDS")?.body)
     }
 }

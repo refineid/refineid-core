@@ -365,3 +365,40 @@ fn organization_card_activation_resets_each_pin_under_the_organizational_numberi
         ]
     );
 }
+
+/// A PIN at the longest length either role accepts.
+const LONGEST_DIGITS: &[u8] = b"135792468024";
+/// Wire offset of the data field: past the header and the Lc byte.
+const DATA_OFFSET: usize = 5;
+
+#[test]
+fn organization_card_activation_sets_twelve_digit_pins_unpadded() {
+    let mut transport = factory_organization_card();
+    let report = transport
+        .activate_card(
+            activation_code(PUK_DIGITS),
+            Some(pin1(LONGEST_DIGITS)),
+            Some(pin2(LONGEST_DIGITS)),
+        )
+        .expect("the PUK counter is pristine");
+    assert_eq!(report.pin1, Some(ManageOutcome::Ok));
+    assert_eq!(report.pin2, Some(ManageOutcome::Ok));
+    let resets: Vec<(Option<u8>, &[u8])> = transport
+        .commands
+        .iter()
+        .filter(|wire| {
+            matches!(
+                wire.get(P2_INDEX).copied(),
+                Some(PIN1_REFERENCE_ORGANIZATIONAL | PIN2_REFERENCE_ORGANIZATIONAL)
+            )
+        })
+        .map(|wire| (wire.get(P2_INDEX).copied(), &wire[DATA_OFFSET..]))
+        .collect();
+    assert_eq!(
+        resets,
+        [
+            (Some(PIN1_REFERENCE_ORGANIZATIONAL), LONGEST_DIGITS),
+            (Some(PIN2_REFERENCE_ORGANIZATIONAL), LONGEST_DIGITS),
+        ]
+    );
+}

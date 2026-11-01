@@ -14,9 +14,10 @@
 
 //! VERIFY PIN1 and PIN2 against a FINEID card.
 //!
-//! The typed PIN digits are right-padded with the pad byte to the
-//! slot's stored length and shipped as a credential command, consumed
-//! exactly once by the transport. Because `Pin1` and `Pin2` are
+//! On a citizen card the typed PIN digits are right-padded with the pad
+//! byte to the slot's stored length; on an organization card they travel
+//! bare at their typed length. Either way they are shipped as a
+//! credential command, consumed exactly once by the transport. Because `Pin1` and `Pin2` are
 //! validated at construction, no local re-check is needed and the slot
 //! is fixed by the argument type, so a PIN2 can never be sent to the
 //! PIN1 slot.
@@ -58,11 +59,6 @@ pub const PUK_REFERENCE: u8 = 0x83;
 /// identifier (FINEID S4-2 v4.0 section 4.3.2). The organizational
 /// unblock verifies the PUK under this reference before the reset.
 pub const PUK_REFERENCE_ORGANIZATIONAL: u8 = 0x12;
-
-/// Largest credential the organizational card stores; it compares at the
-/// typed length and caps every credential here (FINEID S4-2 v4.0
-/// section 4.3).
-pub const ORGANIZATIONAL_PIN_MAX_LENGTH: usize = 8;
 
 /// VERIFY instruction byte (ISO 7816-4 section 7.5.6).
 pub const VERIFY_INS: u8 = 0x20;
@@ -176,15 +172,6 @@ pub enum AuthError<E> {
     /// The credential command could not be assembled; unreachable for a
     /// validated PIN, kept fail-closed.
     Command(CredentialBodyError),
-    /// The organizational card stores credentials of at most
-    /// [`ORGANIZATIONAL_PIN_MAX_LENGTH`] digits and compares at the typed
-    /// length, so a credential outside that bound can never match; it is
-    /// refused locally before any command, so no retry is spent learning
-    /// it.
-    LengthUnsupported {
-        /// The maximum the card stores.
-        max: usize,
-    },
     /// The retry floor refused the credential before any command that
     /// carries it was sent. Returned by the operations that present the
     /// PUK, which read the PUK's counter themselves.
@@ -197,10 +184,6 @@ impl<E: core::fmt::Display> core::fmt::Display for AuthError<E> {
             Self::Transport(e) => write!(f, "auth transport: {e}"),
             Self::Outcome(outcome) => write!(f, "auth transport state: {outcome}"),
             Self::Command(e) => write!(f, "auth command: {e}"),
-            Self::LengthUnsupported { max } => write!(
-                f,
-                "auth: the organizational card stores credentials of at most {max} digits"
-            ),
             Self::RetryFloor(refusal) => write!(f, "{refusal}"),
         }
     }
@@ -262,8 +245,9 @@ pub(crate) const CREDENTIAL_BODY_SCRATCH: usize = 2 * PIN_STORED_LENGTH;
 /// `Lnew = Lc - Lold`. The stored length is the typed length of the
 /// current credential, so the groups are written back to back with no
 /// padding and no length prefix. FINEID S4-2 v4.0 sections 4.3.1 and
-/// 4.3.3 only bound each credential to 4..=8 digits and define no field
-/// layout of their own.
+/// 4.3.3 define no field layout of their own. Each group is a validated
+/// [`Pin1`], [`Pin2`] or PUK, so its length is already within the role's
+/// bounds on either numbering.
 pub(crate) fn write_credential_blocks(
     scheme: PinReferenceScheme,
     groups: &[&[u8]],
@@ -288,30 +272,16 @@ pub(crate) fn write_credential_blocks(
 /// command under `header` and `scheme`, transmit it once, and return the
 /// card's status word for the caller to classify.
 ///
-/// The organizational card compares at the typed length and caps every
-/// credential at [`ORGANIZATIONAL_PIN_MAX_LENGTH`], so a longer group can
-/// never match; it is refused locally before any command, so no retry is
-/// spent learning it.
-///
 /// # Errors
 ///
-/// [`AuthError`] on an unsupported length, a command-assembly failure, a
-/// transport failure, or a transport state transition.
+/// [`AuthError`] on a command-assembly failure, a transport failure, or a
+/// transport state transition.
 pub(crate) fn credential_exchange<T: CardTransport + ?Sized>(
     transport: &mut T,
     scheme: PinReferenceScheme,
     header: CommandHeader,
     groups: &[&[u8]],
 ) -> Result<StatusWord, AuthError<T::Error>> {
-    if matches!(scheme, PinReferenceScheme::Organizational) {
-        for group in groups {
-            if group.len() > ORGANIZATIONAL_PIN_MAX_LENGTH {
-                return Err(AuthError::LengthUnsupported {
-                    max: ORGANIZATIONAL_PIN_MAX_LENGTH,
-                });
-            }
-        }
-    }
     // The block owns the assembled credential octets in a zeroizing
     // buffer. Pre-fill it with the pad byte so the citizen padding falls
     // out of the untouched tail, as `write_credential_blocks` expects.
@@ -343,8 +313,8 @@ pub(crate) fn credential_exchange<T: CardTransport + ?Sized>(
 ///
 /// # Errors
 ///
-/// [`AuthError`] on an unsupported length, a command-assembly failure, a
-/// transport failure, or a transport state transition.
+/// [`AuthError`] on a command-assembly failure, a transport failure, or a
+/// transport state transition.
 pub(crate) fn verify_digits<T: CardTransport + ?Sized>(
     transport: &mut T,
     scheme: PinReferenceScheme,
@@ -406,8 +376,7 @@ pub trait PinOps: CardTransport {
     ///
     /// # Errors
     ///
-    /// As [`PinOps::verify_pin1`], plus [`AuthError::LengthUnsupported`]
-    /// when the organizational card cannot store the typed length.
+    /// As [`PinOps::verify_pin1`].
     fn verify_pin1_with_scheme(
         &mut self,
         scheme: PinReferenceScheme,
@@ -552,12 +521,12 @@ impl<T: CardTransport + ?Sized> PinOps for T {}
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthError, CREDENTIAL_BODY_MAX, CREDENTIAL_BODY_SCRATCH, ORGANIZATIONAL_PIN_MAX_LENGTH,
-        PIN_PAD_BYTE, PIN_STORED_LENGTH, PIN1_REFERENCE, PIN1_REFERENCE_ORGANIZATIONAL, PinOps,
+        CREDENTIAL_BODY_MAX, CREDENTIAL_BODY_SCRATCH, PIN_PAD_BYTE, PIN_STORED_LENGTH,
+        PIN1_REFERENCE, PIN1_REFERENCE_ORGANIZATIONAL, PIN2_REFERENCE_ORGANIZATIONAL, PinOps,
         PinReferenceScheme, PinSlot, PinStatus, VERIFY_INS, VERIFY_P1, VerifyOutcome,
         classify_pin_status_sw, classify_verify_sw, write_credential_blocks,
     };
-    use crate::credentials::{Pin1, UnvalidatedSecret};
+    use crate::credentials::{PIN_MAX_LENGTH, Pin1, Pin2, UnvalidatedSecret};
     use refineid_apdu::{
         ApduClass, CardTransport, CommandApdu, CredentialCommand, PinRetries, ResponseApdu,
         StatusWord, TransportOutcome,
@@ -569,6 +538,8 @@ mod tests {
     const PIN_FIXTURE_LEN: usize = 4;
     /// Digits shared by the exact-wire tests.
     const WIRE_DIGITS: &[u8] = b"1234";
+    /// A PIN at the longest length either role accepts.
+    const LONGEST_DIGITS: &[u8] = b"135792468024";
     /// Length of a VERIFY header: class, instruction, P1, P2.
     const HEADER_LENGTH: usize = 4;
 
@@ -590,6 +561,11 @@ mod tests {
     fn pin1(digits: &[u8]) -> Pin1 {
         Pin1::reconstruct(UnvalidatedSecret::from_owned_bytes(digits.to_vec()))
             .expect("valid PIN1 fixture")
+    }
+
+    fn pin2(digits: &[u8]) -> Pin2 {
+        Pin2::reconstruct(UnvalidatedSecret::from_owned_bytes(digits.to_vec()))
+            .expect("valid PIN2 fixture")
     }
 
     /// Records the last plain and credential wire the trait produced,
@@ -737,19 +713,31 @@ mod tests {
     }
 
     #[test]
-    fn length_unsupported_display_states_only_the_policy_bound() {
-        let error: AuthError<String> = AuthError::LengthUnsupported {
-            max: ORGANIZATIONAL_PIN_MAX_LENGTH,
-        };
-        let rendered = error.to_string();
+    fn organizational_verify_ships_a_twelve_digit_pin_unpadded() {
+        assert_eq!(LONGEST_DIGITS.len(), PIN_MAX_LENGTH);
+        let mut expected_pin1 = verify_header(PIN1_REFERENCE_ORGANIZATIONAL).to_vec();
+        expected_pin1.push(LONGEST_DIGITS.len() as u8);
+        expected_pin1.extend_from_slice(LONGEST_DIGITS);
+        let mut transport = WireRecorder::new(StatusWord::Success);
+        transport
+            .verify_pin1_with_scheme(PinReferenceScheme::Organizational, pin1(LONGEST_DIGITS))
+            .expect("scripted verify succeeds");
         assert_eq!(
-            rendered,
-            format!(
-                "auth: the organizational card stores credentials of at most {ORGANIZATIONAL_PIN_MAX_LENGTH} digits"
-            )
+            transport.credential.as_deref(),
+            Some(expected_pin1.as_slice())
         );
-        assert!(!rendered.contains("exceeds"));
-        assert!(!rendered.contains("PIN length"));
+
+        let mut expected_pin2 = verify_header(PIN2_REFERENCE_ORGANIZATIONAL).to_vec();
+        expected_pin2.push(LONGEST_DIGITS.len() as u8);
+        expected_pin2.extend_from_slice(LONGEST_DIGITS);
+        let mut transport = WireRecorder::new(StatusWord::Success);
+        transport
+            .verify_pin2_with_scheme(PinReferenceScheme::Organizational, pin2(LONGEST_DIGITS))
+            .expect("scripted verify succeeds");
+        assert_eq!(
+            transport.credential.as_deref(),
+            Some(expected_pin2.as_slice())
+        );
     }
 
     #[test]

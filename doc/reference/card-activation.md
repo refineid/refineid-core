@@ -102,10 +102,15 @@ Observed on an Idemia Cosmo X organization card (see
 
 ## PIN lengths
 
+Organization PINs follow the same bounds as citizen PINs: PIN 1 is 4–12
+digits and PIN 2 is 6–12. They are sent as the bare typed digits, with
+no padding. The Idemia Cosmo X organization card's EF.AOD lists PIN 1
+as 4–12 digits, where FINEID S4-2 v4.0 tables say 4–8, and DVV's
+organization card letter gives PIN 1 4–12 and PIN 2 6–12.
+
 The card's PKCS#15 EF.AOD (`4401`) gives each PIN's minimum and maximum
-length, and it is the authority: the Idemia Cosmo X organization card's
-EF.AOD lists PIN 1 as 4–12 digits, where FINEID S4-2 v4.0 tables say
-4–8. The GET DATA PIN container also carries a PIN policy with the
-minimum and maximum length (each within 4–64) and the try limit
-(FINEID S1 v4.2 §3.15.3). Both are read only where PINs are set
-(activation, change, reset); signing and login never need them.
+length, and it remains the authority. The GET DATA PIN container also
+carries a PIN policy with the minimum and maximum length (each within
+4–64) and the try limit (FINEID S1 v4.2 §3.15.3). Reading them where
+PINs are set (activation, change, reset) is planned work; signing and
+login never need them.

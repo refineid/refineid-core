@@ -182,11 +182,7 @@ impl CheckedOutPin1 {
                 return None;
             }
             Ok(VerifyOutcome::Locked | VerifyOutcome::Other(_))
-            | Err(
-                AuthError::Command(_)
-                | AuthError::LengthUnsupported { .. }
-                | AuthError::RetryFloor(_),
-            ) => return None,
+            | Err(AuthError::Command(_) | AuthError::RetryFloor(_)) => return None,
             Err(AuthError::Transport(error)) => Some(ExchangeFailure::of(error.kind())),
             Err(AuthError::Outcome(outcome)) => ExchangeFailure::of_outcome(outcome),
         };
@@ -501,7 +497,7 @@ mod tests {
         CredentialBodyError, PinRetries, StatusWord, TransportErrorExt, TransportErrorKind,
         TransportOutcome,
     };
-    use refineid_auth::{AuthError, ORGANIZATIONAL_PIN_MAX_LENGTH, PinStatus, VerifyOutcome};
+    use refineid_auth::{AuthError, PinStatus, VerifyOutcome};
     use refineid_pkcs15::TokenSerial;
     use refineid_sign::SignError;
 
@@ -879,13 +875,10 @@ mod tests {
 
     #[test]
     fn a_blocked_or_malformed_answer_destroys_the_held_pin1() {
-        let answers: [VerifyAnswer; 4] = [
+        let answers: [VerifyAnswer; 3] = [
             Ok(VerifyOutcome::Locked),
             Ok(VerifyOutcome::Other(StatusWord::SecurityNotSatisfied)),
             Err(AuthError::Command(CredentialBodyError::Empty)),
-            Err(AuthError::LengthUnsupported {
-                max: ORGANIZATIONAL_PIN_MAX_LENGTH,
-            }),
         ];
         for answer in answers {
             let mut cache = holding(random_pin());

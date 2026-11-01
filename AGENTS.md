@@ -233,6 +233,13 @@ rule in a line and points to the reading behind it; the readings live in
 - Update every caller, hook, CI job and document to the replacement in that
   same change instead of keeping the old entry point alive for them.
 
+## Certificates and trust
+
+- Certificates come from the card, which carries its own, or, for external
+  ones (EU eIDAS), from trusted lists at runtime. No certificates or
+  fingerprints are shipped in the software.
+- No pinning or other trust policy is added without the owner's decision.
+
 ## Independent review
 
 - Before a pull request merges, have its diff reviewed by a model from a

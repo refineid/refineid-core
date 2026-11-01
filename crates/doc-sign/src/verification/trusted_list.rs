@@ -95,8 +95,9 @@ pub const MAX_SERVICES: usize = 8192;
 pub const MAX_HISTORY: usize = 64;
 
 /// Most certificates one service digital identity may carry: they all
-/// represent one public key (TS 119 612 clause 5.5.3).
-pub const MAX_IDENTITY_CERTIFICATES: usize = 8;
+/// represent one public key (TS 119 612 clause 5.5.3). National lists
+/// in use list up to 13 renewals of one key in one identity.
+pub const MAX_IDENTITY_CERTIFICATES: usize = 32;
 
 /// The trusted-list namespace (TS 119 612 annex B.0).
 const NAMESPACE_TSL: &str = "http://uri.etsi.org/02231/v2#";

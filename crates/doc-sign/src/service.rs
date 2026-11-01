@@ -51,7 +51,7 @@ use refineid_cms::x509::{
 };
 use zeroize::Zeroizing;
 
-use crate::material::{ChainAnchor, ChainStart, NoncePolicy, now_date_time};
+use crate::material::{ChainAnchor, ChainStart, MaterialError, NoncePolicy, now_date_time};
 
 #[cfg(feature = "pcsc")]
 pub mod reader;
@@ -472,12 +472,19 @@ pub enum SignErrorKind {
     /// document signature with, but whose digest pairing is not one
     /// the formats name.
     UnsupportedDocumentKey(SignSlot),
-    /// The chain or revocation answers could not be collected.
+    /// The chain or revocation answers for one certificate path could
+    /// not be collected, or a verified answer says a certificate on it
+    /// is revoked ([`MaterialError::Revoked`]).
     ///
     /// Raised rather than falling back to a shorter-lived signature: a
     /// caller who asked for LT and silently got T would not be able to
     /// tell from the output.
-    Material(String),
+    Material {
+        /// Whose certificate path the material was collected for.
+        path: MaterialPath,
+        /// What went wrong while collecting.
+        error: MaterialError,
+    },
     /// The Time Stamp Authority could not be reached or refused.
     ///
     /// Raised rather than silently dropping the token: a caller who
@@ -542,7 +549,17 @@ impl fmt::Display for SignErrorKind {
                 "the {} certificate's key type cannot produce a document signature",
                 slot.key_label()
             ),
-            Self::Material(detail) => write!(f, "validation material: {detail}"),
+            Self::Material { path, error } => match path {
+                MaterialPath::Signer => write!(f, "validation material: signer path: {error}"),
+                MaterialPath::SignatureTimestamp { authority } => write!(
+                    f,
+                    "timestamp: {NO_SIGNATURE_TIMESTAMP} -- {authority}: {SIGNATURE_TIMESTAMP_WITHOUT_EVIDENCE}: {error}"
+                ),
+                MaterialPath::ArchiveTimestamp { authority } => write!(
+                    f,
+                    "timestamp: {NO_ARCHIVE_TIMESTAMP} -- {authority} {ARCHIVE_TIMESTAMP_WITHOUT_EVIDENCE} ({error}), trying the next"
+                ),
+            },
             Self::Timestamp(detail) => write!(f, "timestamp: {detail}"),
             Self::InputRead { path, source } => {
                 write!(f, "read input {}: {source}", path.display())
@@ -571,6 +588,111 @@ impl fmt::Display for SignErrorKind {
 }
 
 impl core::error::Error for SignErrorKind {}
+
+/// Whose certificate path a [`SignErrorKind::Material`] failure was
+/// collected for.
+///
+/// A timestamp authority's path fails the signing only when it was the
+/// sole authority configured: of several, one whose evidence fails is
+/// skipped, and losing all of them is a [`SignErrorKind::Timestamp`]
+/// that lists each refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaterialPath {
+    /// The signer certificate's path, up to a pinned root.
+    Signer,
+    /// The path of the authority that answered for a signature
+    /// timestamp, anchored on the certificates its token carries.
+    SignatureTimestamp {
+        /// The authority's address, as the request named it.
+        authority: String,
+    },
+    /// The path of the authority that answered for the archive
+    /// timestamp, anchored on the certificates its token carries.
+    ArchiveTimestamp {
+        /// The authority's address, as the request named it.
+        authority: String,
+    },
+}
+
+/// Why every signature timestamp authority's answer was lost.
+const NO_SIGNATURE_TIMESTAMP: &str = "no timestamp authority produced an acceptable token, so the signature would carry no attested time";
+/// Why one signature timestamp token was refused for its evidence.
+const SIGNATURE_TIMESTAMP_WITHOUT_EVIDENCE: &str = "returned a cryptographically valid token, but complete current validation evidence for its chain could not be collected";
+/// Why every archive timestamp authority's answer was lost.
+const NO_ARCHIVE_TIMESTAMP: &str = "no authority produced an acceptable archive timestamp";
+/// Why one archive timestamp token was refused for its evidence.
+const ARCHIVE_TIMESTAMP_WITHOUT_EVIDENCE: &str =
+    "returned an archive timestamp without complete current validation evidence";
+
+/// The one authority a request names, when it names exactly one.
+///
+/// Its failures are the signing's own: no alternative is left to try.
+fn sole_authority(authorities: &[String]) -> Option<&str> {
+    match authorities {
+        [only] => Some(only.as_str()),
+        _ => None,
+    }
+}
+
+/// Why a timestamp token's own certificate path or its evidence was
+/// refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TimestampEvidenceError {
+    /// The token embeds no certificate to anchor its path on.
+    NoEmbeddedCertificate,
+    /// No path verifies within the token's embedded chain.
+    EmbeddedPath(MaterialError),
+    /// The path's chain or current revocation evidence could not be
+    /// collected, or says a certificate on it is revoked.
+    Material(MaterialError),
+}
+
+impl fmt::Display for TimestampEvidenceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoEmbeddedCertificate => {
+                f.write_str("the token embeds no certificate usable as its chain anchor")
+            }
+            Self::EmbeddedPath(error) => {
+                write!(
+                    f,
+                    "no valid path within the token's embedded chain: {error}"
+                )
+            }
+            Self::Material(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl core::error::Error for TimestampEvidenceError {}
+
+/// Why an archive timestamp token was not selected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArchiveTimestampRefusal {
+    /// The token's path or its current evidence was refused.
+    Evidence(TimestampEvidenceError),
+    /// The token's verified path is empty.
+    EmptyPath,
+    /// A certificate on the token's path is not in the validation
+    /// store the token covers.
+    PathNotCovered,
+}
+
+impl fmt::Display for ArchiveTimestampRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Evidence(error) => write!(f, "{error}"),
+            Self::EmptyPath => {
+                f.write_str("outer timestamp has an empty authenticated certificate path")
+            }
+            Self::PathNotCovered => f.write_str(
+                "outer timestamp certificate path is not byte-for-byte covered by embedded LT material",
+            ),
+        }
+    }
+}
+
+impl core::error::Error for ArchiveTimestampRefusal {}
 
 /// Verify a card's signature over `signed_octets` against the public
 /// key of the certificate that names the card's key, before anything
@@ -813,9 +935,19 @@ fn collect_document_timestamps(
         if keep_material {
             match timestamp_validation_material(&token) {
                 Ok(evidence) => merge_material(&mut material, evidence),
+                Err(TimestampEvidenceError::Material(error))
+                    if sole_authority(authorities).is_some() =>
+                {
+                    return Err(SignErrorKind::Material {
+                        path: MaterialPath::SignatureTimestamp {
+                            authority: url.clone(),
+                        },
+                        error,
+                    });
+                }
                 Err(why) => {
                     refusals.push(format!(
-                        "{url}: returned a cryptographically valid token, but complete current validation evidence for its chain could not be collected: {why}"
+                        "{url}: {SIGNATURE_TIMESTAMP_WITHOUT_EVIDENCE}: {why}"
                     ));
                     continue;
                 }
@@ -830,7 +962,7 @@ fn collect_document_timestamps(
             refusals.join("; ")
         };
         return Err(SignErrorKind::Timestamp(format!(
-            "no timestamp authority produced an acceptable token, so the signature would carry no attested time -- {detail}"
+            "{NO_SIGNATURE_TIMESTAMP} -- {detail}"
         )));
     }
     for refusal in &refusals {
@@ -906,7 +1038,10 @@ fn assemble_document(
             include_leaf: false,
             include_anchor: true,
         }])
-        .map_err(|e| SignErrorKind::Material(format!("signer path: {e}")))?;
+        .map_err(|error| SignErrorKind::Material {
+            path: MaterialPath::Signer,
+            error,
+        })?;
         merge_material(&mut timestamp_material, signer_material);
         timestamp_material
     } else {
@@ -1095,11 +1230,24 @@ fn first_answering_token(
             algorithm,
         ) {
             Ok(token) => {
-                if let Err(why) = authenticate_archive_timestamp(&token, covered_material) {
-                    refusals.push(format!(
-                        "{url} returned an archive timestamp without complete current validation evidence ({why}), trying the next"
-                    ));
-                    continue;
+                match authenticate_archive_timestamp(&token, covered_material) {
+                    Ok(()) => {}
+                    Err(ArchiveTimestampRefusal::Evidence(TimestampEvidenceError::Material(
+                        error,
+                    ))) if sole_authority(urls).is_some() => {
+                        return Err(SignErrorKind::Material {
+                            path: MaterialPath::ArchiveTimestamp {
+                                authority: url.clone(),
+                            },
+                            error,
+                        });
+                    }
+                    Err(why) => {
+                        refusals.push(format!(
+                            "{url} {ARCHIVE_TIMESTAMP_WITHOUT_EVIDENCE} ({why}), trying the next"
+                        ));
+                        continue;
+                    }
                 }
                 for refusal in &refusals {
                     eprintln!("archive timestamp: {refusal}");
@@ -1112,10 +1260,7 @@ fn first_answering_token(
     Err(SignErrorKind::Timestamp(if urls.is_empty() {
         "an archive timestamp needs an authority".to_owned()
     } else {
-        format!(
-            "no authority produced an acceptable archive timestamp -- {}",
-            refusals.join("; ")
-        )
+        format!("{NO_ARCHIVE_TIMESTAMP} -- {}", refusals.join("; "))
     }))
 }
 
@@ -1129,7 +1274,7 @@ fn first_answering_token(
 fn authenticate_archive_timestamp(
     token: &VerifiedTimestampToken,
     covered_material: &ValidationMaterial,
-) -> Result<(), String> {
+) -> Result<(), ArchiveTimestampRefusal> {
     authenticate_archive_timestamp_with(token, covered_material, timestamp_validation_material)
 }
 
@@ -1137,13 +1282,14 @@ fn authenticate_archive_timestamp_with<F>(
     token: &VerifiedTimestampToken,
     covered_material: &ValidationMaterial,
     collect_evidence: F,
-) -> Result<(), String>
+) -> Result<(), ArchiveTimestampRefusal>
 where
-    F: FnOnce(&VerifiedTimestampToken) -> Result<ValidationMaterial, String>,
+    F: FnOnce(&VerifiedTimestampToken) -> Result<ValidationMaterial, TimestampEvidenceError>,
 {
-    let path = embedded_timestamp_path(token)?;
+    let path = embedded_timestamp_path(token).map_err(ArchiveTimestampRefusal::Evidence)?;
     require_archive_path_covered(&path, covered_material)?;
-    let _verified_current_evidence = collect_evidence(token)?;
+    let _verified_current_evidence =
+        collect_evidence(token).map_err(ArchiveTimestampRefusal::Evidence)?;
     Ok(())
 }
 
@@ -1158,9 +1304,9 @@ where
 fn require_archive_path_covered(
     path: &[Vec<u8>],
     covered_material: &ValidationMaterial,
-) -> Result<(), String> {
+) -> Result<(), ArchiveTimestampRefusal> {
     if path.is_empty() {
-        return Err("outer timestamp has an empty authenticated certificate path".to_owned());
+        return Err(ArchiveTimestampRefusal::EmptyPath);
     }
     if path
         .iter()
@@ -1168,10 +1314,7 @@ fn require_archive_path_covered(
     {
         return Ok(());
     }
-    Err(
-        "outer timestamp certificate path is not byte-for-byte covered by embedded LT material"
-            .to_owned(),
-    )
+    Err(ArchiveTimestampRefusal::PathNotCovered)
 }
 
 /// The token's certificate path, verified from its signer certificate
@@ -1182,10 +1325,12 @@ fn require_archive_path_covered(
 /// ([`ChainAnchor::Configured`]). What is still verified is internal
 /// consistency: names, signatures, validity windows and roles along
 /// the embedded chain.
-fn embedded_timestamp_path(token: &VerifiedTimestampToken) -> Result<Vec<Vec<u8>>, String> {
+fn embedded_timestamp_path(
+    token: &VerifiedTimestampToken,
+) -> Result<Vec<Vec<u8>>, TimestampEvidenceError> {
     let embedded = embedded_certificate_ders(token);
     if embedded.is_empty() {
-        return Err("the token embeds no certificate usable as its chain anchor".to_owned());
+        return Err(TimestampEvidenceError::NoEmbeddedCertificate);
     }
     crate::material::verify_chain_to_anchor(
         token.signer_certificate().as_der(),
@@ -1193,7 +1338,7 @@ fn embedded_timestamp_path(token: &VerifiedTimestampToken) -> Result<Vec<Vec<u8>
         ChainAnchor::Configured(&embedded),
         &embedded,
     )
-    .map_err(|e| format!("no valid path within the token's embedded chain: {e}"))
+    .map_err(TimestampEvidenceError::EmbeddedPath)
 }
 
 /// The certificates the token embeds, as DER.
@@ -1212,10 +1357,10 @@ fn embedded_certificate_ders(token: &VerifiedTimestampToken) -> Vec<&[u8]> {
 /// has no store and skips this entirely.
 fn timestamp_validation_material(
     token: &VerifiedTimestampToken,
-) -> Result<ValidationMaterial, String> {
+) -> Result<ValidationMaterial, TimestampEvidenceError> {
     let embedded = embedded_certificate_ders(token);
     if embedded.is_empty() {
-        return Err("the token embeds no certificate usable as its chain anchor".to_owned());
+        return Err(TimestampEvidenceError::NoEmbeddedCertificate);
     }
     crate::material::collect_chains_with_candidates(
         &[ChainStart {
@@ -1228,7 +1373,7 @@ fn timestamp_validation_material(
         }],
         &embedded,
     )
-    .map_err(|e| e.to_string())
+    .map_err(TimestampEvidenceError::Material)
 }
 
 /// Merge independently authenticated evidence without storing the same
@@ -1725,14 +1870,16 @@ mod tests {
             certificates: vec![token.signer_certificate().as_der().to_vec()],
             ..ValidationMaterial::default()
         };
+        let unavailable =
+            MaterialError::Revocation("current validation evidence unavailable".to_owned());
         let error = authenticate_archive_timestamp_with(&token, &covered_material, |_token| {
-            Err("current validation evidence unavailable".to_owned())
+            Err(TimestampEvidenceError::Material(unavailable.clone()))
         })
         .err()
         .ok_or("archive token unexpectedly survived missing validation evidence")?;
         check(
             &error,
-            &"current validation evidence unavailable".to_owned(),
+            &ArchiveTimestampRefusal::Evidence(TimestampEvidenceError::Material(unavailable)),
             "archive evidence failure",
         )
     }
@@ -1755,8 +1902,9 @@ mod tests {
         let error = require_archive_path_covered(&[rotated, identity], &covered_material)
             .err()
             .ok_or("rotated outer timestamp path unexpectedly passed LT coverage")?;
-        check_true(
-            error.contains("not byte-for-byte covered"),
+        check(
+            &error,
+            &ArchiveTimestampRefusal::PathNotCovered,
             "rotated path is rejected",
         )
     }
@@ -1878,6 +2026,41 @@ mod tests {
         check_true(
             successes > 0,
             "at least one configured authority produced a token with complete LT evidence",
+        )
+    }
+
+    #[test]
+    fn material_display_names_the_path() -> TestResult {
+        let error = MaterialError::Revocation("responder unreachable".to_owned());
+        let authority = "https://tsa.example".to_owned();
+        let material = |path| SignErrorKind::Material {
+            path,
+            error: error.clone(),
+        };
+        check(
+            &material(MaterialPath::Signer).to_string(),
+            &"validation material: signer path: revocation: responder unreachable".to_owned(),
+            "signer path",
+        )?;
+        check(
+            &material(MaterialPath::SignatureTimestamp {
+                authority: authority.clone(),
+            })
+            .to_string(),
+            &format!(
+                "timestamp: {NO_SIGNATURE_TIMESTAMP} -- {authority}: {SIGNATURE_TIMESTAMP_WITHOUT_EVIDENCE}: revocation: responder unreachable"
+            ),
+            "signature timestamp path",
+        )?;
+        check(
+            &material(MaterialPath::ArchiveTimestamp {
+                authority: authority.clone(),
+            })
+            .to_string(),
+            &format!(
+                "timestamp: {NO_ARCHIVE_TIMESTAMP} -- {authority} {ARCHIVE_TIMESTAMP_WITHOUT_EVIDENCE} (revocation: responder unreachable), trying the next"
+            ),
+            "archive timestamp path",
         )
     }
 

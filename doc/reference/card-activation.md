@@ -85,8 +85,10 @@ Observed on an Idemia Cosmo X organization card (see
 - Activation follows the §4.6.1 procedure under the organization
   numbering: the 8-digit activation code from the letter is the PUK, and
   RESET RETRY COUNTER sets PIN 1 and PIN 2. Both PINs ship blocked
-  (`63C0`), the PUK has 5 tries, and the PIN changed flag cannot be read,
-  so the counter fallback above applies.
+  (`63C0`) and the PUK has 5 tries. The card does not support the
+  FINEID S1 GET DATA PIN container: it answers `6A86` under every
+  organization and citizen PIN reference, so the PIN changed flag is not
+  available and the counter fallback above applies.
 - The organization numbering, not the certificate date or issuer name,
   is what makes a card an organization card.
 - No FINEID S1 document for the Idemia Cosmo X is published: the DVV ATR

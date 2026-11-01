@@ -18,13 +18,24 @@ Both citizen and organizational cards are supported.
 uses with the counter-safe probe, and the `_with_scheme` entry points act
 under an already-resolved numbering. The organizational card compares the
 typed PIN at its own length under its own references, with no padding.
-Organization PINs have the same bounds as citizen PINs -- PIN 1 4–12
-digits, PIN 2 6–12 -- held by the `Pin1` and `Pin2` role types, so a PIN
-outside them is refused at construction, before any command.
+The card is the authority on its PIN lengths: the `Pin1` and `Pin2` role
+types accept 4–12 digits and `Puk` 8–12, every length a FINEID card may
+list, and a value outside them is refused at construction, before any
+command. Signing and login send any such PIN to the card.
+
+Where PINs are set, `read_card_pin_lengths` reads the lengths the card
+lists: its EF.AOD first, then, on a citizen card, the PIN policy of a
+credential EF.AOD does not list. The resulting `CardPinLengths` carries
+the numbering it was mapped by. A listed range is used as listed, within
+what the role type carries; a credential the card does not list takes the
+FINEID bounds -- PIN 1 4–12 digits, PIN 2 6–12, PUK 8–12. Signing and
+login never read it.
 
 `PinManageOps` adds the card-mutating chains: `change_pin1`/`change_pin2`
-(CHANGE REFERENCE DATA) and `unblock_pin1`/`unblock_pin2` (RESET RETRY
-COUNTER). Unblocking presents a `Puk` -- its own non-clonable,
+(CHANGE REFERENCE DATA), `unblock_pin1`/`unblock_pin2` (RESET RETRY
+COUNTER) and `activate_card`. Each takes the session's `CardPinLengths`,
+acts under its numbering, and refuses an entry the card does not accept
+before any command. Unblocking presents a `Puk` -- its own non-clonable,
 zeroize-on-drop role type, which never authorises an operation and spends
 its own counter. Every unblock, and an activation that presents the
 activation code as the PUK, reads the PUK's counter first and refuses

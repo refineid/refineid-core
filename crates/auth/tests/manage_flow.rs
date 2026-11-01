@@ -134,8 +134,9 @@ fn change_pin1_resolves_the_citizen_numbering_then_updates() {
         cursor: 0,
         commands: vec![],
     };
+    let lengths = transport.read_card_pin_lengths().expect("lengths read");
     let outcome = transport
-        .change_pin1(pin1(b"1234"), pin1(b"5678"))
+        .change_pin1(&lengths, pin1(b"1234"), pin1(b"5678"))
         .expect("scripted change succeeds");
     assert_eq!(outcome, ManageOutcome::Ok);
     assert_eq!(transport.commands.len(), 1);
@@ -158,8 +159,9 @@ fn unblock_pin1_resolves_organizational_then_sends_the_two_command_flow() {
         cursor: 0,
         commands: vec![],
     };
+    let lengths = transport.read_card_pin_lengths().expect("lengths read");
     let outcome = transport
-        .unblock_pin1(puk(PUK_DIGITS), pin1(b"5678"))
+        .unblock_pin1(&lengths, puk(PUK_DIGITS), pin1(b"5678"))
         .expect("scripted unblock succeeds");
     assert_eq!(outcome, ManageOutcome::Ok);
     assert_eq!(transport.commands.len(), ORG_UNBLOCK_COMMAND_COUNT);
@@ -187,7 +189,8 @@ fn unblock_refuses_a_puk_below_the_floor_whatever_the_pin_counter() {
         cursor: 0,
         commands: vec![],
     };
-    let refused = transport.unblock_pin1(puk(PUK_DIGITS), pin1(b"5678"));
+    let lengths = transport.read_card_pin_lengths().expect("lengths read");
+    let refused = transport.unblock_pin1(&lengths, puk(PUK_DIGITS), pin1(b"5678"));
     assert!(matches!(
         refused,
         Err(AuthError::RetryFloor(RetryFloorRefusal::TriesBelowFloor {
@@ -208,8 +211,9 @@ fn unblock_serves_a_blocked_pin_while_the_puk_counter_is_at_the_floor() {
         cursor: 0,
         commands: vec![],
     };
+    let lengths = transport.read_card_pin_lengths().expect("lengths read");
     let outcome = transport
-        .unblock_pin2(puk(PUK_DIGITS), pin2(b"567890"))
+        .unblock_pin2(&lengths, puk(PUK_DIGITS), pin2(b"567890"))
         .expect("the PUK counter is at the floor");
     assert_eq!(outcome, ManageOutcome::Ok);
     assert_eq!(transport.commands.len(), 1);
@@ -226,7 +230,9 @@ fn activation_with_the_code_as_puk_follows_the_puk_floor() {
             cursor: 0,
             commands: vec![],
         };
+        let lengths = transport.read_card_pin_lengths().expect("lengths read");
         let result = transport.activate_card(
+            &lengths,
             activation_code(PUK_DIGITS),
             Some(pin1(b"5678")),
             Some(pin2(b"567890")),
@@ -340,8 +346,10 @@ fn health_of_a_citizen_card_follows_the_validity_start() {
 #[test]
 fn organization_card_activation_resets_each_pin_under_the_organizational_numbering() {
     let mut transport = factory_organization_card();
+    let lengths = transport.read_card_pin_lengths().expect("lengths read");
     let report = transport
         .activate_card(
+            &lengths,
             activation_code(PUK_DIGITS),
             Some(pin1(b"5678")),
             Some(pin2(b"567890")),
@@ -374,8 +382,10 @@ const DATA_OFFSET: usize = 5;
 #[test]
 fn organization_card_activation_sets_twelve_digit_pins_unpadded() {
     let mut transport = factory_organization_card();
+    let lengths = transport.read_card_pin_lengths().expect("lengths read");
     let report = transport
         .activate_card(
+            &lengths,
             activation_code(PUK_DIGITS),
             Some(pin1(LONGEST_DIGITS)),
             Some(pin2(LONGEST_DIGITS)),

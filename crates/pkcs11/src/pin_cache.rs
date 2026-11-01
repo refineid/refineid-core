@@ -182,7 +182,9 @@ impl CheckedOutPin1 {
                 return None;
             }
             Ok(VerifyOutcome::Locked | VerifyOutcome::Other(_))
-            | Err(AuthError::Command(_) | AuthError::RetryFloor(_)) => return None,
+            | Err(AuthError::Command(_) | AuthError::RetryFloor(_) | AuthError::PinLength(_)) => {
+                return None;
+            }
             Err(AuthError::Transport(error)) => Some(ExchangeFailure::of(error.kind())),
             Err(AuthError::Outcome(outcome)) => ExchangeFailure::of_outcome(outcome),
         };

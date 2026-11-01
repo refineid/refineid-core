@@ -640,6 +640,29 @@ pub trait Pkcs15Ops: CardTransport {
         Ok(UnvalidatedCertificate::new(bytes))
     }
 
+    /// Read and parse EF.AOD, the card's authentication objects, under
+    /// the PKCS#15 application.
+    ///
+    /// The file is read to its end: it holds several top-level objects
+    /// and may be zero-padded, so no single DER header sizes it.
+    ///
+    /// # Errors
+    ///
+    /// SELECT or read failures, or a directory that does not decode (see
+    /// [`crate::AuthenticationObjects::parse`]).
+    fn read_authentication_objects(
+        &mut self,
+    ) -> Result<crate::AuthenticationObjects, Pkcs15Error<Self::Error>>
+    where
+        Self: Sized,
+    {
+        self.select_pkcs15_application()?;
+        self.select_ef(crate::EF_AOD_FID)?;
+        let bytes = self.read_binary_to_end(None)?;
+        crate::AuthenticationObjects::parse(&bytes)
+            .map_err(|_parse_error| Pkcs15Error::InvalidData("EF.AOD"))
+    }
+
     /// Read and parse EF.TokenInfo.
     ///
     /// # Errors

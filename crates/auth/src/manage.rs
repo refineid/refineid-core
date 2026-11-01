@@ -21,9 +21,14 @@
 //! through the crate-private path and ships them only as credential
 //! commands, consumed exactly once.
 //!
-//! Every flow resolves the card's reference numbering first (the
-//! counter-safe probe on [`PinOps`]) and then presents the credential, so
-//! a resolution probe can never cost a typed entry. The citizen card
+//! A card-management session first reads the card's PIN lengths with
+//! [`PinManageOps::read_card_pin_lengths`], which resolves the card's
+//! reference numbering with the counter-safe probe on [`PinOps`] and reads
+//! the lengths the card lists. Every flow takes that
+//! [`CardPinLengths`], addresses the card under its numbering, and refuses
+//! an entry whose length the card does not accept before any command, so
+//! neither a resolution probe nor a length the card would refuse can cost
+//! a typed entry. The citizen card
 //! unblocks in one RESET RETRY COUNTER carrying the PUK and the new PIN;
 //! the organizational card takes two commands, verifying the PUK as its
 //! own object before a reset that carries only the new PIN (FINEID S4-2
@@ -35,7 +40,10 @@
 
 use refineid_apdu::{ApduClass, CardTransport, CommandHeader, PinRetries, StatusWord};
 
+use refineid_pkcs15::{Pkcs15Error, Pkcs15Ops};
+
 use crate::credentials::{Pin1, Pin2, Puk};
+use crate::pin_lengths::CardPinLengths;
 use crate::retry_risk::{FlooredCredential, check_retry_floor};
 use crate::verify::{
     AuthError, PinOps, PinReferenceScheme, PinSlot, PinStatus, VERIFY_INS, VERIFY_P1,
@@ -216,11 +224,10 @@ pub(crate) fn unblock<T: CardTransport + ?Sized>(
 /// [`CardTransport`].
 ///
 /// Bring the trait into scope to use the methods; the blanket
-/// implementation applies to every transport. The scheme-free entry
-/// points resolve the card's credential numbering first; a caller that
-/// will issue several operations resolves once with
-/// [`PinOps::resolve_pin_reference_scheme`] and passes the result to the
-/// `_with_scheme` forms.
+/// implementation applies to every transport. The change, unblock and
+/// activation operations take the [`CardPinLengths`] the session read
+/// with [`PinManageOps::read_card_pin_lengths`], and act under the
+/// numbering it was read by.
 ///
 /// These operations mutate the card and are not idempotent. A wrong
 /// current PIN or PUK spends a retry, and for the PUK exhaustion is
@@ -228,139 +235,189 @@ pub(crate) fn unblock<T: CardTransport + ?Sized>(
 /// retry floor to the PUK's counter themselves; a caller of a change
 /// must hold the retry floor for the current PIN before calling.
 pub trait PinManageOps: PinOps {
-    /// Change PIN1, presenting the current value and setting the new one,
-    /// resolving the card's numbering first.
+    /// Read the PIN 1, PIN 2 and PUK lengths the card accepts, resolving
+    /// the card's numbering first.
+    ///
+    /// Read once per card session where PINs are set -- activation,
+    /// change, reset -- and pass the result to those operations; the
+    /// signing and login paths never read it.
     ///
     /// # Errors
     ///
-    /// [`AuthError`] on a transport failure or state transition. A wrong
-    /// current PIN is not an error; it is [`ManageOutcome::WrongCredential`].
+    /// As [`PinManageOps::read_card_pin_lengths_with_scheme`].
+    fn read_card_pin_lengths(&mut self) -> Result<CardPinLengths, AuthError<Self::Error>>
+    where
+        Self: Sized,
+    {
+        let scheme = self.resolve_pin_reference_scheme()?;
+        self.read_card_pin_lengths_with_scheme(scheme)
+    }
+
+    /// Read the PIN 1, PIN 2 and PUK lengths the card accepts under an
+    /// explicit numbering.
+    ///
+    /// EF.AOD is read under the PKCS#15 application, which leaves that
+    /// application selected. A citizen card whose EF.AOD does not list a
+    /// credential is asked for that credential's PIN container, whose PIN
+    /// policy is the second source; the organization card supports no PIN
+    /// container and is not asked. An EF.AOD that cannot be selected, read
+    /// or decoded lists nothing, and a credential no source lists takes
+    /// its role type's FINEID bounds. Every command here is a read and
+    /// touches no retry counter.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Transport`] or [`AuthError::Outcome`] when the card
+    /// session fails during a read.
+    fn read_card_pin_lengths_with_scheme(
+        &mut self,
+        scheme: PinReferenceScheme,
+    ) -> Result<CardPinLengths, AuthError<Self::Error>>
+    where
+        Self: Sized,
+    {
+        let objects = match self.read_authentication_objects() {
+            Ok(objects) => Some(objects),
+            Err(Pkcs15Error::Transport(error)) => return Err(AuthError::Transport(error)),
+            Err(Pkcs15Error::Outcome(outcome)) => return Err(AuthError::Outcome(outcome)),
+            Err(
+                Pkcs15Error::Status(_)
+                | Pkcs15Error::Aid(_)
+                | Pkcs15Error::Command(_)
+                | Pkcs15Error::Empty
+                | Pkcs15Error::TooLarge
+                | Pkcs15Error::InvalidData(_),
+            ) => None,
+        };
+        let mut failure = None;
+        let lengths = CardPinLengths::from_card(scheme, objects.as_ref(), |reference| {
+            if failure.is_some() || scheme != PinReferenceScheme::Citizen {
+                return None;
+            }
+            match crate::activation::read_pin_policy_lengths(self, reference) {
+                Ok(range) => range,
+                Err(error) => {
+                    failure = Some(error);
+                    None
+                }
+            }
+        });
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(lengths),
+        }
+    }
+
+    /// Change PIN1, presenting the current value and setting the new one,
+    /// under the numbering `lengths` was read by.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::PinLength`] when the card does not accept the length
+    /// of either PIN; nothing is sent. [`AuthError`] on a transport
+    /// failure or state transition. A wrong current PIN is not an error;
+    /// it is [`ManageOutcome::WrongCredential`].
     fn change_pin1(
         &mut self,
+        lengths: &CardPinLengths,
         current: Pin1,
         new: Pin1,
     ) -> Result<ManageOutcome, AuthError<Self::Error>>
     where
         Self: Sized,
     {
-        let scheme = self.resolve_pin_reference_scheme()?;
-        self.change_pin1_with_scheme(scheme, current, new)
+        lengths.check_pin1(&current).map_err(AuthError::PinLength)?;
+        lengths.check_pin1(&new).map_err(AuthError::PinLength)?;
+        change(
+            self,
+            lengths.numbering(),
+            PinSlot::Pin1,
+            current.digits(),
+            new.digits(),
+        )
     }
 
-    /// Change PIN2, resolving the card's numbering first.
+    /// Change PIN2 under the numbering `lengths` was read by.
     ///
     /// # Errors
     ///
     /// As [`PinManageOps::change_pin1`].
     fn change_pin2(
         &mut self,
+        lengths: &CardPinLengths,
         current: Pin2,
         new: Pin2,
     ) -> Result<ManageOutcome, AuthError<Self::Error>>
     where
         Self: Sized,
     {
-        let scheme = self.resolve_pin_reference_scheme()?;
-        self.change_pin2_with_scheme(scheme, current, new)
+        lengths.check_pin2(&current).map_err(AuthError::PinLength)?;
+        lengths.check_pin2(&new).map_err(AuthError::PinLength)?;
+        change(
+            self,
+            lengths.numbering(),
+            PinSlot::Pin2,
+            current.digits(),
+            new.digits(),
+        )
     }
 
-    /// Change PIN1 under an explicit numbering.
+    /// Unblock PIN1 with the PUK, setting a new value, under the
+    /// numbering `lengths` was read by.
     ///
     /// # Errors
     ///
-    /// As [`PinManageOps::change_pin1`].
-    fn change_pin1_with_scheme(
-        &mut self,
-        scheme: PinReferenceScheme,
-        current: Pin1,
-        new: Pin1,
-    ) -> Result<ManageOutcome, AuthError<Self::Error>>
-    where
-        Self: Sized,
-    {
-        change(self, scheme, PinSlot::Pin1, current.digits(), new.digits())
-    }
-
-    /// Change PIN2 under an explicit numbering.
-    ///
-    /// # Errors
-    ///
-    /// As [`PinManageOps::change_pin1_with_scheme`].
-    fn change_pin2_with_scheme(
-        &mut self,
-        scheme: PinReferenceScheme,
-        current: Pin2,
-        new: Pin2,
-    ) -> Result<ManageOutcome, AuthError<Self::Error>>
-    where
-        Self: Sized,
-    {
-        change(self, scheme, PinSlot::Pin2, current.digits(), new.digits())
-    }
-
-    /// Unblock PIN1 with the PUK, setting a new value, resolving the
-    /// card's numbering first.
-    ///
-    /// # Errors
-    ///
+    /// [`AuthError::PinLength`] when the card does not accept the length
+    /// of the PUK or the new PIN; nothing is sent.
     /// [`AuthError::RetryFloor`] when the PUK's counter is below the
     /// retry floor, blocked or unreadable; nothing carrying the PUK is
     /// sent. [`AuthError`] on a transport failure or state transition. A
     /// wrong PUK is not an error; it is [`ManageOutcome::WrongCredential`]
     /// carrying the PUK's own remaining attempts.
-    fn unblock_pin1(&mut self, puk: Puk, new: Pin1) -> Result<ManageOutcome, AuthError<Self::Error>>
-    where
-        Self: Sized,
-    {
-        let scheme = self.resolve_pin_reference_scheme()?;
-        self.unblock_pin1_with_scheme(scheme, puk, new)
-    }
-
-    /// Unblock PIN2 with the PUK, resolving the card's numbering first.
-    ///
-    /// # Errors
-    ///
-    /// As [`PinManageOps::unblock_pin1`].
-    fn unblock_pin2(&mut self, puk: Puk, new: Pin2) -> Result<ManageOutcome, AuthError<Self::Error>>
-    where
-        Self: Sized,
-    {
-        let scheme = self.resolve_pin_reference_scheme()?;
-        self.unblock_pin2_with_scheme(scheme, puk, new)
-    }
-
-    /// Unblock PIN1 under an explicit numbering.
-    ///
-    /// # Errors
-    ///
-    /// As [`PinManageOps::unblock_pin1`].
-    fn unblock_pin1_with_scheme(
+    fn unblock_pin1(
         &mut self,
-        scheme: PinReferenceScheme,
+        lengths: &CardPinLengths,
         puk: Puk,
         new: Pin1,
     ) -> Result<ManageOutcome, AuthError<Self::Error>>
     where
         Self: Sized,
     {
-        unblock(self, scheme, PinSlot::Pin1, puk.digits(), new.digits())
+        lengths.check_puk(&puk).map_err(AuthError::PinLength)?;
+        lengths.check_pin1(&new).map_err(AuthError::PinLength)?;
+        unblock(
+            self,
+            lengths.numbering(),
+            PinSlot::Pin1,
+            puk.digits(),
+            new.digits(),
+        )
     }
 
-    /// Unblock PIN2 under an explicit numbering.
+    /// Unblock PIN2 with the PUK under the numbering `lengths` was read
+    /// by.
     ///
     /// # Errors
     ///
-    /// As [`PinManageOps::unblock_pin1_with_scheme`].
-    fn unblock_pin2_with_scheme(
+    /// As [`PinManageOps::unblock_pin1`].
+    fn unblock_pin2(
         &mut self,
-        scheme: PinReferenceScheme,
+        lengths: &CardPinLengths,
         puk: Puk,
         new: Pin2,
     ) -> Result<ManageOutcome, AuthError<Self::Error>>
     where
         Self: Sized,
     {
-        unblock(self, scheme, PinSlot::Pin2, puk.digits(), new.digits())
+        lengths.check_puk(&puk).map_err(AuthError::PinLength)?;
+        lengths.check_pin2(&new).map_err(AuthError::PinLength)?;
+        unblock(
+            self,
+            lengths.numbering(),
+            PinSlot::Pin2,
+            puk.digits(),
+            new.digits(),
+        )
     }
 
     /// Read a PIN's changed-since-manufacture record.
@@ -444,7 +501,12 @@ pub trait PinManageOps: PinOps {
 
     /// Activate a card awaiting activation under the scheme `code` was
     /// validated for (see
-    /// [`crate::activation::ActivationScheme::from_numbering_and_validity_start`]).
+    /// [`crate::activation::ActivationScheme::from_numbering_and_validity_start`]),
+    /// addressing the card under the numbering `lengths` was read by.
+    ///
+    /// Each supplied new PIN, and the activation entry presented with it
+    /// -- in place of the PUK, or of that PIN under the preset activation
+    /// PIN scheme -- is checked against `lengths` before any command.
     ///
     /// Under [`crate::activation::ActivationScheme::ActivationCodeIsPuk`]
     /// the activation code is presented as the PUK, so each unblock
@@ -452,12 +514,15 @@ pub trait PinManageOps: PinOps {
     ///
     /// # Errors
     ///
+    /// [`AuthError::PinLength`] when the card does not accept the length
+    /// of an entry; nothing is sent.
     /// [`AuthError::RetryFloor`] when the activation code is presented as
     /// the PUK and the PUK's counter is below the retry floor, blocked or
     /// unreadable. [`AuthError`] on a transport failure or state
     /// transition.
     fn activate_card(
         &mut self,
+        lengths: &CardPinLengths,
         code: crate::activation::ActivationCode,
         new_pin1: Option<Pin1>,
         new_pin2: Option<Pin2>,
@@ -466,7 +531,24 @@ pub trait PinManageOps: PinOps {
         Self: Sized,
     {
         let scheme = code.scheme();
-        let ref_scheme = self.resolve_pin_reference_scheme()?;
+        let code_length = code.digits().len();
+        let presented_as = |slot: PinSlot| match scheme {
+            crate::activation::ActivationScheme::PresetActivationPin => Some(slot),
+            crate::activation::ActivationScheme::ActivationCodeIsPuk => None,
+        };
+        if let Some(pin) = &new_pin1 {
+            lengths
+                .check_activation_entry(presented_as(PinSlot::Pin1), code_length)
+                .map_err(AuthError::PinLength)?;
+            lengths.check_pin1(pin).map_err(AuthError::PinLength)?;
+        }
+        if let Some(pin) = &new_pin2 {
+            lengths
+                .check_activation_entry(presented_as(PinSlot::Pin2), code_length)
+                .map_err(AuthError::PinLength)?;
+            lengths.check_pin2(pin).map_err(AuthError::PinLength)?;
+        }
+        let ref_scheme = lengths.numbering();
         let needs = self.activation_needs(scheme)?;
         let mut report = crate::activation::ActivationReport {
             scheme,
@@ -572,13 +654,12 @@ impl<T: CardTransport + ?Sized> PinManageOps for T {}
 #[cfg(test)]
 mod tests {
     use super::{
-        CHANGE_P1_CURRENT_THEN_NEW, CHANGE_REFERENCE_DATA_INS, ManageOutcome, PinManageOps,
-        RESET_P1_CODE_THEN_NEW, RESET_P1_NEW_ONLY, RESET_RETRY_COUNTER_INS, classify_manage_sw,
+        CHANGE_P1_CURRENT_THEN_NEW, CHANGE_REFERENCE_DATA_INS, CardPinLengths, ManageOutcome,
+        PinManageOps, RESET_P1_CODE_THEN_NEW, RESET_P1_NEW_ONLY, RESET_RETRY_COUNTER_INS,
+        classify_manage_sw,
     };
     use crate::activation::GET_DATA_INS;
-    use crate::credentials::{
-        PIN_MAX_LENGTH, PIN1_MIN_LENGTH, PIN2_MIN_LENGTH, Pin1, Pin2, Puk, UnvalidatedSecret,
-    };
+    use crate::credentials::{PIN_MAX_LENGTH, PIN_MIN_LENGTH, Pin1, Pin2, Puk, UnvalidatedSecret};
     use crate::verify::{CREDENTIAL_BODY_SCRATCH, VERIFY_INS, VERIFY_P1};
     use crate::{
         AuthError, FlooredCredential, PIN_STORED_LENGTH, PUK_REFERENCE_ORGANIZATIONAL,
@@ -745,8 +826,8 @@ mod tests {
     fn citizen_change_pin1_presents_current_then_new_padded_blocks() {
         let mut transport = Recorder::new(vec![StatusWord::Success]);
         let outcome = transport
-            .change_pin1_with_scheme(
-                PinReferenceScheme::Citizen,
+            .change_pin1(
+                &CardPinLengths::not_listed(PinReferenceScheme::Citizen),
                 pin1(CURRENT_DIGITS),
                 pin1(NEW_DIGITS),
             )
@@ -775,8 +856,8 @@ mod tests {
     fn organizational_change_pin1_presents_typed_length_blocks() {
         let mut transport = Recorder::new(vec![StatusWord::Success]);
         transport
-            .change_pin1_with_scheme(
-                PinReferenceScheme::Organizational,
+            .change_pin1(
+                &CardPinLengths::not_listed(PinReferenceScheme::Organizational),
                 pin1(CURRENT_DIGITS),
                 pin1(NEW_DIGITS),
             )
@@ -801,8 +882,8 @@ mod tests {
     fn citizen_unblock_pin1_presents_puk_then_new() {
         let mut transport = Recorder::new(vec![puk_counter_served(), StatusWord::Success]);
         let outcome = transport
-            .unblock_pin1_with_scheme(
-                PinReferenceScheme::Citizen,
+            .unblock_pin1(
+                &CardPinLengths::not_listed(PinReferenceScheme::Citizen),
                 puk(PUK_DIGITS),
                 pin1(NEW_DIGITS),
             )
@@ -839,13 +920,13 @@ mod tests {
                 assert!(check_retry_floor(slot.into(), status).is_err());
                 let mut transport = Recorder::new(vec![puk_counter_served(), StatusWord::Success]);
                 let outcome = match slot {
-                    PinSlot::Pin1 => transport.unblock_pin1_with_scheme(
-                        PinReferenceScheme::Citizen,
+                    PinSlot::Pin1 => transport.unblock_pin1(
+                        &CardPinLengths::not_listed(PinReferenceScheme::Citizen),
                         puk(PUK_DIGITS),
                         pin1(NEW_DIGITS),
                     ),
-                    PinSlot::Pin2 => transport.unblock_pin2_with_scheme(
-                        PinReferenceScheme::Citizen,
+                    PinSlot::Pin2 => transport.unblock_pin2(
+                        &CardPinLengths::not_listed(PinReferenceScheme::Citizen),
                         puk(PUK_DIGITS),
                         pin2(NEW_PIN2_DIGITS),
                     ),
@@ -867,12 +948,16 @@ mod tests {
     ) -> (Result<ManageOutcome, AuthError<String>>, Recorder) {
         let mut transport = Recorder::new(vec![probe, StatusWord::Success, StatusWord::Success]);
         let result = match slot {
-            PinSlot::Pin1 => {
-                transport.unblock_pin1_with_scheme(scheme, puk(PUK_DIGITS), pin1(NEW_DIGITS))
-            }
-            PinSlot::Pin2 => {
-                transport.unblock_pin2_with_scheme(scheme, puk(PUK_DIGITS), pin2(NEW_PIN2_DIGITS))
-            }
+            PinSlot::Pin1 => transport.unblock_pin1(
+                &CardPinLengths::not_listed(scheme),
+                puk(PUK_DIGITS),
+                pin1(NEW_DIGITS),
+            ),
+            PinSlot::Pin2 => transport.unblock_pin2(
+                &CardPinLengths::not_listed(scheme),
+                puk(PUK_DIGITS),
+                pin2(NEW_PIN2_DIGITS),
+            ),
         };
         (result, transport)
     }
@@ -961,8 +1046,8 @@ mod tests {
             StatusWord::AuthenticationBlocked,
             StatusWord::Success,
         ]);
-        let result = transport.unblock_pin1_with_scheme(
-            PinReferenceScheme::Citizen,
+        let result = transport.unblock_pin1(
+            &CardPinLengths::not_listed(PinReferenceScheme::Citizen),
             puk(PUK_DIGITS),
             pin1(NEW_DIGITS),
         );
@@ -987,8 +1072,8 @@ mod tests {
             StatusWord::AuthenticationBlocked,
             StatusWord::Success,
         ]);
-        let result = transport.unblock_pin1_with_scheme(
-            PinReferenceScheme::Citizen,
+        let result = transport.unblock_pin1(
+            &CardPinLengths::not_listed(PinReferenceScheme::Citizen),
             puk(PUK_DIGITS),
             pin1(NEW_DIGITS),
         );
@@ -1028,8 +1113,8 @@ mod tests {
             StatusWord::Success,
         ]);
         let outcome = transport
-            .unblock_pin1_with_scheme(
-                PinReferenceScheme::Organizational,
+            .unblock_pin1(
+                &CardPinLengths::not_listed(PinReferenceScheme::Organizational),
                 puk(PUK_DIGITS),
                 pin1(NEW_DIGITS),
             )
@@ -1069,8 +1154,8 @@ mod tests {
             StatusWord::PinIncorrect { retries: two },
         ]);
         let outcome = transport
-            .unblock_pin1_with_scheme(
-                PinReferenceScheme::Organizational,
+            .unblock_pin1(
+                &CardPinLengths::not_listed(PinReferenceScheme::Organizational),
                 puk(PUK_DIGITS),
                 pin1(NEW_DIGITS),
             )
@@ -1099,8 +1184,8 @@ mod tests {
 
         let mut transport = Recorder::new(vec![StatusWord::Success]);
         transport
-            .change_pin1_with_scheme(
-                PinReferenceScheme::Organizational,
+            .change_pin1(
+                &CardPinLengths::not_listed(PinReferenceScheme::Organizational),
                 pin1(LONGEST_CURRENT_DIGITS),
                 pin1(LONGEST_NEW_DIGITS),
             )
@@ -1115,8 +1200,8 @@ mod tests {
 
         let mut transport = Recorder::new(vec![StatusWord::Success]);
         transport
-            .change_pin2_with_scheme(
-                PinReferenceScheme::Organizational,
+            .change_pin2(
+                &CardPinLengths::not_listed(PinReferenceScheme::Organizational),
                 pin2(LONGEST_CURRENT_DIGITS),
                 pin2(LONGEST_NEW_DIGITS),
             )
@@ -1139,13 +1224,13 @@ mod tests {
                 StatusWord::Success,
             ]);
             let outcome = match slot {
-                PinSlot::Pin1 => transport.unblock_pin1_with_scheme(
-                    PinReferenceScheme::Organizational,
+                PinSlot::Pin1 => transport.unblock_pin1(
+                    &CardPinLengths::not_listed(PinReferenceScheme::Organizational),
                     puk(PUK_DIGITS),
                     pin1(LONGEST_NEW_DIGITS),
                 ),
-                PinSlot::Pin2 => transport.unblock_pin2_with_scheme(
-                    PinReferenceScheme::Organizational,
+                PinSlot::Pin2 => transport.unblock_pin2(
+                    &CardPinLengths::not_listed(PinReferenceScheme::Organizational),
                     puk(PUK_DIGITS),
                     pin2(LONGEST_NEW_DIGITS),
                 ),
@@ -1169,8 +1254,8 @@ mod tests {
         // Pin2, so a PIN that fails here has no path to any command.
         let longest_plus_one = back_to_back(LONGEST_NEW_DIGITS, &NEW_DIGITS[..1]);
         assert_eq!(longest_plus_one.len(), PIN_MAX_LENGTH + 1);
-        let pin1_short = &NEW_DIGITS[..PIN1_MIN_LENGTH - 1];
-        let pin2_short = &NEW_PIN2_DIGITS[..PIN2_MIN_LENGTH - 1];
+        let pin1_short = &NEW_DIGITS[..PIN_MIN_LENGTH - 1];
+        let pin2_short = &NEW_PIN2_DIGITS[..PIN_MIN_LENGTH - 1];
         let secret = |digits: &[u8]| UnvalidatedSecret::from_owned_bytes(digits.to_vec());
         assert!(Pin1::reconstruct(secret(&longest_plus_one)).is_err());
         assert!(Pin2::reconstruct(secret(&longest_plus_one)).is_err());

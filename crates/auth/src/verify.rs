@@ -34,6 +34,7 @@ use refineid_apdu::{
 };
 
 use crate::credentials::{Pin1, Pin2};
+use crate::pin_lengths::PinLengthRefusal;
 use crate::retry_risk::RetryFloorRefusal;
 
 /// Citizen-card PIN1 reference: the global authentication PIN (FINEID S1
@@ -176,6 +177,11 @@ pub enum AuthError<E> {
     /// carries it was sent. Returned by the operations that present the
     /// PUK, which read the PUK's counter themselves.
     RetryFloor(RetryFloorRefusal),
+    /// The card in session does not accept an entry's length; refused
+    /// before any command that carries it was sent. Returned by the
+    /// operations that take the card's
+    /// [`crate::pin_lengths::CardPinLengths`].
+    PinLength(PinLengthRefusal),
 }
 
 impl<E: core::fmt::Display> core::fmt::Display for AuthError<E> {
@@ -185,6 +191,7 @@ impl<E: core::fmt::Display> core::fmt::Display for AuthError<E> {
             Self::Outcome(outcome) => write!(f, "auth transport state: {outcome}"),
             Self::Command(e) => write!(f, "auth command: {e}"),
             Self::RetryFloor(refusal) => write!(f, "{refusal}"),
+            Self::PinLength(refusal) => write!(f, "{refusal}"),
         }
     }
 }

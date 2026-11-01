@@ -14,6 +14,6 @@
 
 //! Cryptographic primitives the PACE secure channel is built on.
 
-pub mod brainpool_p384;
 pub mod container;
+pub mod curve;
 pub mod symmetric;

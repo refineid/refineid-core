@@ -24,6 +24,7 @@
 pub mod activation;
 pub mod credentials;
 pub mod manage;
+pub mod pace_password;
 pub mod pin_lengths;
 pub mod retry_risk;
 pub mod verify;
@@ -38,6 +39,7 @@ pub use credentials::{
     CredentialRole, Pin1, Pin2, Puk, UnvalidatedSecret,
 };
 pub use manage::{ManageOutcome, PinManageOps, classify_manage_sw};
+pub use pace_password::{PACE_PASSWORD_KEY_LEN, PacePasswordKey};
 pub use pin_lengths::{
     CardLengthSource, CardPinLengths, CredentialLengths, ListedLength, PinLengthRefusal,
 };
@@ -60,7 +62,7 @@ mod public_contract_tests {
     use serde::{Serialize, de::DeserializeOwned};
     use zeroize::{Zeroize, ZeroizeOnDrop};
 
-    use super::{ActivationCode, Pin1, Pin2, Puk, UnvalidatedSecret};
+    use super::{ActivationCode, PacePasswordKey, Pin1, Pin2, Puk, UnvalidatedSecret};
 
     trait AmbiguousIfImplemented<Disambiguator, Marker> {
         fn marker() {}
@@ -96,6 +98,7 @@ mod public_contract_tests {
         require_zeroize_on_drop::<Pin2>();
         require_zeroize_on_drop::<Puk>();
         require_zeroize_on_drop::<ActivationCode>();
+        require_zeroize_on_drop::<PacePasswordKey>();
         require_zeroizable_boundary::<UnvalidatedSecret>();
 
         let _ = <ActivationCode as AmbiguousIfImplemented<_, CloneMarker>>::marker;
@@ -104,6 +107,13 @@ mod public_contract_tests {
         let _ = <ActivationCode as AmbiguousIfImplemented<_, SerializeMarker>>::marker;
         let _ = <ActivationCode as AmbiguousIfImplemented<_, DeserializeMarker>>::marker;
         let _ = <ActivationCode as AmbiguousIfImplemented<_, DisplayMarker>>::marker;
+
+        let _ = <PacePasswordKey as AmbiguousIfImplemented<_, CloneMarker>>::marker;
+        let _ = <PacePasswordKey as AmbiguousIfImplemented<_, CopyMarker>>::marker;
+        let _ = <PacePasswordKey as AmbiguousIfImplemented<_, ZeroizeMarker>>::marker;
+        let _ = <PacePasswordKey as AmbiguousIfImplemented<_, SerializeMarker>>::marker;
+        let _ = <PacePasswordKey as AmbiguousIfImplemented<_, DeserializeMarker>>::marker;
+        let _ = <PacePasswordKey as AmbiguousIfImplemented<_, DisplayMarker>>::marker;
 
         let _ = <Pin1 as AmbiguousIfImplemented<_, CloneMarker>>::marker;
         let _ = <Pin1 as AmbiguousIfImplemented<_, CopyMarker>>::marker;

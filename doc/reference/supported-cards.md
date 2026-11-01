@@ -91,7 +91,11 @@ Certificates - G5R", RSA keys):
   15). MSE:Set AT naming password reference 3 (PIN 1) or 4 (PIN 2) is
   accepted (`9000`), which BSI TR-03110-3 §B.14.1 defines as the password
   selected with its initial tries. The PACE password is PIN 1 or PIN 2
-  (FINEID S1 v4.0, organizational cards, §2.1).
+  (FINEID S1 v4.0, organizational cards, §2.1). PACE with either PIN
+  completes over NIST P-384 with a 32-byte encrypted nonce and counts as
+  that PIN verified: the authentication key, and after selecting DF.ESIGN
+  the qualified key, sign over secure messaging with no separate VERIFY.
+  See [PACE](pace.md).
 
 **Idemia ID.me IDeal Citiz 2.17-i**
 

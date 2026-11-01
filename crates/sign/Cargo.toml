@@ -16,4 +16,9 @@ workspace = true
 
 [dependencies]
 refineid-apdu.workspace = true
+refineid-auth.workspace = true
+refineid-pkcs15.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+trybuild.workspace = true

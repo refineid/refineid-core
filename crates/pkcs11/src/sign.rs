@@ -37,7 +37,7 @@
 //! seam even though we do not ship a full-chain hardware mock.
 
 use refineid_apdu::CardTransport;
-use refineid_sign::{KeyRef, SignError, SignOps, SignScheme, Signature};
+use refineid_sign::{SignError, SignOps, SignScheme, Signature};
 
 use crate::ck::{
     CKM_ECDSA, CKM_RSA_PKCS, CKR_DATA_INVALID, CKR_DATA_LEN_RANGE, CkMechanismType, CkRv, CkUlong,
@@ -351,11 +351,13 @@ pub(super) fn sign_with_card<T: CardTransport>(
 ) -> Result<Vec<u8>, SignError<T::Error>> {
     match input {
         CardSignInput::RsaSha256(digest) => transport
-            .sign_prehashed_sha256_rsa(SignScheme::Citizen, KeyRef::Auth, digest)
+            .authentication_key(SignScheme::Citizen)
+            .sign_prehashed_sha256_rsa(digest)
             .map(Signature::into_bytes),
         // Raw r || s -- already the CKM_ECDSA output format.
         CardSignInput::EcdsaP384(digest) => transport
-            .sign_prehashed_sha384_ecdsa(SignScheme::Citizen, KeyRef::Auth, digest)
+            .authentication_key(SignScheme::Citizen)
+            .sign_prehashed_sha384_ecdsa(digest)
             .map(Signature::into_bytes),
     }
 }

@@ -1272,11 +1272,15 @@ pub(crate) mod signing {
         /// integers (the form XML Signature 1.1 sec.6.4.3 and a card
         /// return).
         pub(crate) fn sign_raw(&self, hash: HashAlgorithm, message: &[u8]) -> Vec<u8> {
+            self.sign_raw_digest(hash, &hash.digest(message))
+        }
+
+        /// As [`Self::sign_raw`], over `digest`, a digest under `hash`
+        /// the caller computed: what a card signs after PSO:HASH.
+        pub(crate) fn sign_raw_digest(&self, hash: HashAlgorithm, digest: &[u8]) -> Vec<u8> {
             let ctx = CurveCtx::new(&self.curve).expect("table curves build a context");
-            let digest = hash.digest(message);
             let width = self.curve.n.len();
-            let e =
-                EcdsaHelpers::bytes_into_n(&EcdsaHelpers::digest_to_scalar(&digest, &ctx), &ctx);
+            let e = EcdsaHelpers::bytes_into_n(&EcdsaHelpers::digest_to_scalar(digest, &ctx), &ctx);
             let mut nonces = Rfc6979::new(
                 hash,
                 &fixed_width(&self.scalar, width),

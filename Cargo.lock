@@ -1074,6 +1074,7 @@ dependencies = [
  "refineid-pace",
  "refineid-pcsc",
  "refineid-pkcs15",
+ "refineid-remote",
  "refineid-sign",
  "sha1",
  "sha2 0.11.0",

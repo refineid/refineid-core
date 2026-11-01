@@ -336,6 +336,17 @@ impl TestKey {
         }
     }
 
+    /// The signature over `digest`, a digest under [`Self::hash`] the
+    /// caller computed, in the form a card returns it after PSO:HASH:
+    /// the fixed-width `r || s` for ECDSA, the PKCS#1 value for RSA.
+    #[must_use]
+    pub fn sign_digest_raw(&self, digest: &[u8]) -> Vec<u8> {
+        match &self.material {
+            KeyMaterial::Ecdsa { key, .. } => key.sign_raw_digest(self.hash(), digest),
+            KeyMaterial::Rsa(key) => key.sign_pkcs1v15_digest(self.hash(), digest),
+        }
+    }
+
     /// The RSASSA-PSS signature over `message` with SHA-256, MGF1
     /// with SHA-256 and `salt` (RFC 8017 sec.8.1), which the profile
     /// fixes at [`PSS_SALT_LEN`] octets and a test may vary; `None` for

@@ -1034,13 +1034,19 @@ pub(crate) mod signing {
         /// The RSASSA-PKCS1-v1_5 signature over `message` hashed with
         /// `hash` (RFC 8017 sec.8.2.1, EMSA-PKCS1-v1_5 sec.9.2).
         pub(crate) fn sign_pkcs1v15(&self, hash: HashAlgorithm, message: &[u8]) -> Vec<u8> {
+            self.sign_pkcs1v15_digest(hash, &hash.digest(message))
+        }
+
+        /// As [`Self::sign_pkcs1v15`], over `digest`, a digest under
+        /// `hash` the caller computed: what a card signs after PSO:HASH.
+        pub(crate) fn sign_pkcs1v15_digest(&self, hash: HashAlgorithm, digest: &[u8]) -> Vec<u8> {
             let prefix = match hash {
                 HashAlgorithm::Sha256 => SHA256_DIGEST_INFO,
                 HashAlgorithm::Sha384 => SHA384_DIGEST_INFO,
                 HashAlgorithm::Sha512 => SHA512_DIGEST_INFO,
             };
             let mut digest_info = prefix.to_vec();
-            digest_info.extend_from_slice(&hash.digest(message));
+            digest_info.extend_from_slice(digest);
             let width = self.modulus.byte_len();
             let fill = width
                 .checked_sub(digest_info.len() + EMSA_FRAME_BYTES)

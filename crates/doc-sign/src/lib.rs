@@ -55,6 +55,8 @@ pub mod ocsp;
 pub mod oids;
 pub mod pades;
 pub mod pin;
+#[cfg(feature = "pcsc")]
+pub mod remote;
 pub mod revocation;
 pub mod rng;
 pub use refineid_cms::rsa;

@@ -549,13 +549,37 @@ impl<'a> ElementRef<'a> {
     /// rendered as `method` says.
     #[must_use]
     pub fn canonicalize(&self, method: &Canonicalization) -> Vec<u8> {
+        self.render_subtree(method, None)
+    }
+
+    /// As [`Self::canonicalize`], with the subtree of `omitted`, an
+    /// element inside this one, left out of the node set: the
+    /// enveloped-signature transform, which removes the `ds:Signature`
+    /// that holds the reference from what the reference digests (W3C
+    /// XML Signature 1.1 sec.6.6.4). An `omitted` that is not inside
+    /// this element changes nothing.
+    #[must_use]
+    pub fn canonicalize_omitting(&self, method: &Canonicalization, omitted: Self) -> Vec<u8> {
+        self.render_subtree(method, Some(omitted.index))
+    }
+
+    /// Render this element as the apex of a subset, without the element
+    /// at `omitted`.
+    fn render_subtree(&self, method: &Canonicalization, omitted: Option<usize>) -> Vec<u8> {
         let mut out = String::new();
         let mut rendered = Vec::new();
         let inherited = self.inherited_xml_attributes(&method.algorithm);
         let outer_scope = self
             .parent()
             .map_or_else(Vec::new, |parent| parent.in_scope());
-        self.render(&mut out, &mut rendered, method, &inherited, &outer_scope);
+        self.render(
+            &mut out,
+            &mut rendered,
+            method,
+            &inherited,
+            &outer_scope,
+            omitted,
+        );
         out.into_bytes()
     }
 
@@ -686,7 +710,7 @@ impl<'a> ElementRef<'a> {
     }
 
     /// The value of this element's own `xml:` attribute `local`.
-    fn xml_attribute(&self, local: &str) -> Option<&'a str> {
+    pub(crate) fn xml_attribute(&self, local: &str) -> Option<&'a str> {
         self.data()
             .attributes
             .iter()
@@ -771,7 +795,8 @@ impl<'a> ElementRef<'a> {
     /// with the empty string standing for the default prefix.
     /// `inherited` holds the `xml:` attributes the apex takes from its
     /// omitted ancestors; it is empty below the apex, whose parent is
-    /// always in the output.
+    /// always in the output. The element at `omitted` and its subtree
+    /// are not rendered.
     fn render(
         &self,
         out: &mut String,
@@ -779,6 +804,7 @@ impl<'a> ElementRef<'a> {
         method: &Canonicalization,
         inherited: &InheritedXml,
         parent_scope: &[(Option<&'a str>, &'a str)],
+        omitted: Option<usize>,
     ) {
         let data = self.data();
         let scope_depth = rendered.len();
@@ -836,8 +862,10 @@ impl<'a> ElementRef<'a> {
         for node in &data.children {
             match node {
                 Node::Element(index) => {
-                    if let Some(child) = self.document.element(*index) {
-                        child.render(out, rendered, method, &below_apex, &scope);
+                    if omitted != Some(*index)
+                        && let Some(child) = self.document.element(*index)
+                    {
+                        child.render(out, rendered, method, &below_apex, &scope, omitted);
                     }
                 }
                 Node::Text(text) => escape_text_into(out, text),

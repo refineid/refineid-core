@@ -795,6 +795,26 @@ fn an_anchor_outside_its_granted_period_does_not_anchor() {
     let report = verify_under(pdf.clone(), &lapsed).expect("report");
     assert!(!only(&report).chain_verified());
     assert_eq!(report.anchors_fetched_at(), Some(day(ANSWERED)));
+    assert!(
+        !report.anchors_stale(),
+        "anchors from no list are never stale"
+    );
+
+    // Anchors from a list past its next update still anchor; the
+    // report says the list is stale.
+    let stale = world
+        .anchors()
+        .fetched(day(ANSWERED))
+        .valid_until(day(REVOKED_LATER));
+    let report = verify_under(pdf.clone(), &stale).expect("report");
+    assert!(only(&report).chain_verified());
+    assert!(report.anchors_stale());
+    let fresh = world.anchors().valid_until(day(ENDS));
+    assert!(
+        !verify_under(pdf.clone(), &fresh)
+            .expect("report")
+            .anchors_stale()
+    );
 
     // The root as a time-stamping anchor issues no signer.
     let wrong_role = TrustAnchors::new(vec![anchor(&world.root, AnchorRole::TimeStamping)]);

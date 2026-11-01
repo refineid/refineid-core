@@ -193,12 +193,112 @@ pub fn pinned_tsa_root_der_by_fingerprint(fingerprint: Sha256) -> Option<&'stati
         .map(|(_, (_, der))| *der)
 }
 
+/// The certificates entitled to sign the EU List of Trusted Lists
+/// (LOTL), as `(label, sha256)` pairs.
+///
+/// ETSI TS 119 612 V2.3.1 clause 5.3.13 and annex A.1: the LOTL is
+/// authenticated under the certificates the Official Journal of the
+/// European Union publishes for it, the notice the LOTL's own scheme
+/// information URI names: OJ C, C/2026/1944
+/// (`https://eur-lex.europa.eu/eli/C/2026/1944/oj`), the source of
+/// these certificates. The notice lists six certificates by SHA-256
+/// and SHA-1 digest, and each fingerprint here equals one of its
+/// SHA-256 digests; its electronic edition is authenticated by the
+/// Publications Office's XAdES seal over a manifest of its language
+/// versions. A future set is re-checked by comparing the SHA-256
+/// digests the new notice lists with the certificates the LOTL
+/// carries. The LOTL repeats the same
+/// set in the pointer to itself, and that pointer at LOTL sequence
+/// number 397 is the copy these bytes were taken from; the set equals
+/// the one the pivot LOTL 378 carries. The labels number the
+/// certificates in the order that pointer lists them.
+pub const LOTL_SIGNER_SHA256: &[(&str, Sha256)] = &[
+    (
+        "EU list of the lists signer 1",
+        Sha256::from_bytes([
+            0xD2, 0x06, 0x4F, 0xDD, 0x70, 0xF6, 0x98, 0x2D, 0xCC, 0x51, 0x6B, 0x86, 0xD9, 0xD5,
+            0xC5, 0x6A, 0xEA, 0x93, 0x94, 0x17, 0xC6, 0x24, 0xB2, 0xE4, 0x78, 0xC0, 0xB2, 0x9D,
+            0xE5, 0x4F, 0x84, 0x74,
+        ]),
+    ),
+    (
+        "EU list of the lists signer 2",
+        Sha256::from_bytes([
+            0xE0, 0xA6, 0x20, 0xFB, 0xB6, 0x74, 0x73, 0x62, 0xBB, 0x93, 0x3A, 0xC4, 0x41, 0x69,
+            0xD6, 0x76, 0xA5, 0x53, 0x44, 0x47, 0x16, 0xCF, 0x5F, 0x31, 0x60, 0x5F, 0x12, 0xA2,
+            0x2B, 0x83, 0x96, 0xB1,
+        ]),
+    ),
+    (
+        "EU list of the lists signer 3",
+        Sha256::from_bytes([
+            0xC0, 0x64, 0x1C, 0x4F, 0x7D, 0x56, 0xC4, 0x31, 0xB1, 0xC9, 0x24, 0x74, 0x2D, 0xB7,
+            0xFC, 0xE9, 0xC1, 0xEE, 0xF7, 0xD7, 0xFD, 0x21, 0x21, 0x13, 0xA2, 0x76, 0x84, 0x86,
+            0xB3, 0xAB, 0xCD, 0xC5,
+        ]),
+    ),
+    (
+        "EU list of the lists signer 4",
+        Sha256::from_bytes([
+            0xDF, 0x7E, 0x29, 0x36, 0x0C, 0x34, 0xB2, 0xB8, 0xD6, 0xD5, 0xF4, 0x03, 0x25, 0xC1,
+            0xD4, 0xD1, 0x2C, 0x99, 0x22, 0xCE, 0xCD, 0x33, 0xB7, 0x40, 0x76, 0x74, 0xA7, 0x4B,
+            0x2B, 0x3C, 0xA1, 0xE5,
+        ]),
+    ),
+    (
+        "EU list of the lists signer 5",
+        Sha256::from_bytes([
+            0xB6, 0x3D, 0x41, 0x67, 0x44, 0xE7, 0x09, 0x8B, 0xF9, 0xEC, 0x2C, 0xAA, 0x59, 0x6A,
+            0x93, 0xBC, 0x24, 0x68, 0xE3, 0x7F, 0x82, 0x84, 0xBA, 0x65, 0xEC, 0xC0, 0x61, 0x71,
+            0x1B, 0xCB, 0xAA, 0x18,
+        ]),
+    ),
+    (
+        "EU list of the lists signer 6",
+        Sha256::from_bytes([
+            0x23, 0x61, 0x03, 0xF0, 0x3A, 0x80, 0x31, 0xAE, 0x8F, 0x47, 0xF9, 0x05, 0x9B, 0xF8,
+            0xDE, 0x38, 0x56, 0x4C, 0xDB, 0xFE, 0xBE, 0xDD, 0xE4, 0xA5, 0x97, 0xD5, 0x0F, 0x89,
+            0x80, 0xAA, 0x65, 0x3B,
+        ]),
+    ),
+];
+
+/// Embedded DER for every certificate in [`LOTL_SIGNER_SHA256`], in
+/// the same order; the fingerprints are cross-checked at test time.
+pub const LOTL_SIGNER_DER: &[(&str, &[u8])] = &[
+    (
+        "EU list of the lists signer 1",
+        include_bytes!("../trust-anchors/eu-lotl-signer-1.der"),
+    ),
+    (
+        "EU list of the lists signer 2",
+        include_bytes!("../trust-anchors/eu-lotl-signer-2.der"),
+    ),
+    (
+        "EU list of the lists signer 3",
+        include_bytes!("../trust-anchors/eu-lotl-signer-3.der"),
+    ),
+    (
+        "EU list of the lists signer 4",
+        include_bytes!("../trust-anchors/eu-lotl-signer-4.der"),
+    ),
+    (
+        "EU list of the lists signer 5",
+        include_bytes!("../trust-anchors/eu-lotl-signer-5.der"),
+    ),
+    (
+        "EU list of the lists signer 6",
+        include_bytes!("../trust-anchors/eu-lotl-signer-6.der"),
+    ),
+];
+
 #[cfg(test)]
 mod tests {
     use super::{
-        PINNED_ROOT_DER, PINNED_ROOT_SHA256, PINNED_TSA_ROOT_DER, PINNED_TSA_ROOT_SHA256,
-        is_pinned_root, is_pinned_tsa_root, pinned_root_der_by_fingerprint, pinned_root_label,
-        pinned_tsa_root_der_by_fingerprint, pinned_tsa_root_label,
+        LOTL_SIGNER_DER, LOTL_SIGNER_SHA256, PINNED_ROOT_DER, PINNED_ROOT_SHA256,
+        PINNED_TSA_ROOT_DER, PINNED_TSA_ROOT_SHA256, is_pinned_root, is_pinned_tsa_root,
+        pinned_root_der_by_fingerprint, pinned_root_label, pinned_tsa_root_der_by_fingerprint,
+        pinned_tsa_root_label,
     };
     use crate::test_util::{TestResult, check, check_true};
     use refineid_digest::Sha256;
@@ -334,5 +434,31 @@ mod tests {
             &None,
             "pinned_tsa_root_label None for bogus",
         )
+    }
+
+    /// The embedded DER of each LOTL signer must hash to the pinned
+    /// fingerprint, and each must parse as a certificate.
+    #[test]
+    fn lotl_signer_fingerprints_match_pins() -> TestResult {
+        check(
+            &LOTL_SIGNER_DER.len(),
+            &LOTL_SIGNER_SHA256.len(),
+            "LOTL_SIGNER_DER and LOTL_SIGNER_SHA256 must have the same length",
+        )?;
+        for ((label_der, der), (label_pin, pin)) in
+            LOTL_SIGNER_DER.iter().zip(LOTL_SIGNER_SHA256.iter())
+        {
+            check(label_der, label_pin, "label order must match")?;
+            check(
+                &Sha256::of(der),
+                pin,
+                &format!("fingerprint mismatch for {label_der}"),
+            )?;
+            check_true(
+                refineid_cms::x509::OwnedCert::from_der(der).is_ok(),
+                &format!("{label_der} parses as a certificate"),
+            )?;
+        }
+        Ok(())
     }
 }

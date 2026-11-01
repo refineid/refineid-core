@@ -16,6 +16,11 @@ revised; this page resolves those names to the documents.
   -- Electronic ID Application (citizen eID): VERIFY, the MSE/PSO signing
   and decipher choreography, CHANGE REFERENCE DATA and RESET RETRY
   COUNTER, and the algorithm-reference tables.
+- [FINEID S1 v4.0, organizational cards](https://dvv.fi/documents/16079645/17324992/S1v40.pdf)
+  -- Electronic ID Application for the Idemia ID.me IDeal Citiz 2.17-i
+  organizational card: a delta on Gixel IAS ECC v1.0.1 adding secure
+  messaging, PACE with PIN 1 or PIN 2 in place of the CAN, and ECC. It
+  does not cover the Idemia Cosmo X.
 - [FINEID S4-1 v4.2](https://dvv.fi/documents/16079645/17324992/S4-1v42.pdf)
   -- Implementation profile 1 (citizen eID): key references and PIN
   lengths. The card generations implement earlier versions (v3.0, v3.1,

@@ -36,10 +36,10 @@ outcome, not an error.
 No verification, change, or unblock path is described as working against a
 real card until it is observed on hardware with the retry counter checked.
 The change and unblock chains are card-mutating and PUK-consuming -- and
-exhausting the PUK is terminal -- so they were not run to exhaustion on
-hardware; together with the organizational numbering, which no card was
-available to exercise, they rest on the specification and the behaviour
-reference.
+exhausting the PUK is terminal -- so they are not run to exhaustion on
+hardware and rest on the specification and the behaviour reference. The
+organizational numbering resolution is observed on an Idemia Cosmo X
+organization card.
 
 Constants are traced to the
 [DVV FINEID specifications](https://dvv.fi/en/fineid-specifications) (S1

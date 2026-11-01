@@ -14,16 +14,19 @@
 
 //! Card activation and PIN change records (FINEID S4-1 section 4.6).
 //!
-//! Evaluates whether a card requires activation and performs the initial
-//! PIN configuration. Cards issued before 13 January 2026 use the PUK as
-//! an activation code to unblock both PINs (section 4.6.1). Cards issued
-//! from that date ship with both PINs set to a single-use 7-digit preset
-//! activation PIN and require changing both PINs (section 4.6.2).
+//! Decides a card's activation scheme, evaluates whether each PIN awaits
+//! activation, and performs the initial PIN configuration. Under section
+//! 4.6.1 the PUK is the activation code that unblocks both PINs; it
+//! applies to organization cards and to citizen cards whose
+//! authentication certificate is valid from before 13 January 2026.
+//! Under section 4.6.2 both PINs ship set to one 7-digit preset
+//! activation PIN that each PIN is changed from; it applies to citizen
+//! cards whose authentication certificate is valid from that date.
 
 use core::fmt;
 
 use refineid_apdu::{ApduClass, CardTransport, CommandApdu, CommandHeader, PinRetries, StatusWord};
-use zeroize::ZeroizeOnDrop;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::credentials::{CredentialInputError, CredentialRole, SecretDigits, UnvalidatedSecret};
 use crate::manage::ManageOutcome;
@@ -88,25 +91,43 @@ const PRESET_ACTIVATION_PIN_DIGIT_COUNT: usize = 7;
 /// Number of digits for the activation code (PUK) under FINEID S4-1 section 4.6.1.
 const ACTIVATION_CODE_PUK_DIGIT_COUNT: usize = 8;
 
-/// How a card is activated, decided by its issuance generation (FINEID S4-1 section 4.6).
+/// How a card is activated (FINEID S4-1 v4.2 section 4.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivationScheme {
-    /// Section 4.6.1, issued before 13 January 2026: PINs ship blocked,
-    /// the activation code is the 8-digit PUK.
+    /// Section 4.6.1: PINs ship blocked, the activation code is the
+    /// 8-digit PUK, and RESET RETRY COUNTER sets each PIN. Citizen cards
+    /// issued before 13 January 2026 and organization cards.
     ActivationCodeIsPuk,
-    /// Section 4.6.2, issued from 13 January 2026: PINs ship set to the
-    /// single-use 7-digit activation PIN.
+    /// Section 4.6.2: PINs ship set to one 7-digit preset activation
+    /// PIN, and CHANGE REFERENCE DATA sets each PIN. Citizen cards issued
+    /// from 13 January 2026.
     PresetActivationPin,
 }
 
 impl ActivationScheme {
-    /// Classify activation scheme by the authentication certificate's notBefore date.
+    /// Decide the activation scheme from the card's resolved credential
+    /// numbering and its authentication certificate's validity start
+    /// (notBefore, epoch seconds).
+    ///
+    /// The organization numbering (FINEID S4-2 v4.0 section 4.2) means
+    /// section 4.6.1 whatever the date. Under the citizen numbering the
+    /// validity start decides: from 13 January 2026 section 4.6.2,
+    /// before it section 4.6.1. A citizen card whose validity start was
+    /// not read gives `None`, and no activation decision follows.
     #[must_use]
-    pub const fn from_validity_start(not_before_epoch_seconds: i64) -> Self {
-        if not_before_epoch_seconds >= DVV_PRESET_PIN_CUTOVER_EPOCH_SECONDS {
-            Self::PresetActivationPin
-        } else {
-            Self::ActivationCodeIsPuk
+    pub const fn from_numbering_and_validity_start(
+        numbering: PinReferenceScheme,
+        auth_certificate_validity_start: Option<i64>,
+    ) -> Option<Self> {
+        match numbering {
+            PinReferenceScheme::Organizational => Some(Self::ActivationCodeIsPuk),
+            PinReferenceScheme::Citizen => match auth_certificate_validity_start {
+                Some(not_before) if not_before >= DVV_PRESET_PIN_CUTOVER_EPOCH_SECONDS => {
+                    Some(Self::PresetActivationPin)
+                }
+                Some(_) => Some(Self::ActivationCodeIsPuk),
+                None => None,
+            },
         }
     }
 
@@ -167,7 +188,7 @@ pub const fn pin_awaits_activation(
     }
 }
 
-/// Which citizen-card PINs still await factory activation.
+/// Which PINs still await factory activation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CardActivationNeeds {
     /// Whether PIN1 still awaits its initial holder value.
@@ -187,9 +208,21 @@ impl CardActivationNeeds {
 /// A validated activation code or preset activation PIN.
 ///
 /// Ensures the entered digits strictly match the scheme-specific digit count
-/// (7 digits for preset PIN, 8 digits for PUK) and zeroizes on drop.
-#[derive(ZeroizeOnDrop)]
-pub struct ActivationCode(SecretDigits);
+/// (7 digits for preset PIN, 8 digits for PUK), carries the scheme it was
+/// validated for, and zeroizes on drop.
+pub struct ActivationCode {
+    digits: SecretDigits,
+    scheme: ActivationScheme,
+}
+
+impl Drop for ActivationCode {
+    fn drop(&mut self) {
+        self.digits.zeroize();
+    }
+}
+
+/// The digits are wiped by the `Drop` above; the scheme is not secret.
+impl ZeroizeOnDrop for ActivationCode {}
 
 impl ActivationCode {
     /// Reconstruct an activation code from unvalidated secret bytes.
@@ -203,12 +236,19 @@ impl ActivationCode {
         scheme: ActivationScheme,
     ) -> Result<Self, CredentialInputError> {
         let count = scheme.activation_entry_digit_count();
-        SecretDigits::reconstruct(input, CredentialRole::ActivationCode, count, count).map(Self)
+        SecretDigits::reconstruct(input, CredentialRole::ActivationCode, count, count)
+            .map(|digits| Self { digits, scheme })
+    }
+
+    /// The scheme whose digit count this code was validated against.
+    #[must_use]
+    pub const fn scheme(&self) -> ActivationScheme {
+        self.scheme
     }
 
     /// Borrow validated secret digits for credential commands.
     pub(crate) fn digits(&self) -> &[u8] {
-        self.0.secret_bytes()
+        self.digits.secret_bytes()
     }
 }
 
@@ -240,9 +280,11 @@ pub struct CredentialHealthReport {
     pub puk_status: PinStatus,
     /// Resolved credential numbering scheme.
     pub pin_reference_scheme: PinReferenceScheme,
-    /// Activation scheme if evaluated.
+    /// Activation scheme decided from the numbering and the
+    /// authentication certificate's validity start; `None` for a citizen
+    /// card whose validity start was not read.
     pub activation_scheme: Option<ActivationScheme>,
-    /// Activation needs if evaluated.
+    /// Activation needs under the decided scheme; `None` without one.
     pub activation_needs: Option<CardActivationNeeds>,
 }
 
@@ -362,7 +404,7 @@ mod tests {
         pin_awaits_activation, read_pin_change_record, read_puk_status_from_container,
     };
     use crate::credentials::UnvalidatedSecret;
-    use crate::verify::{AuthError, PinSlot, PinStatus};
+    use crate::verify::{AuthError, PinReferenceScheme, PinSlot, PinStatus};
     use refineid_apdu::{
         CardTransport, CommandApdu, CredentialCommand, PinRetries, ResponseApdu, StatusWord,
         TransportOutcome,
@@ -378,20 +420,59 @@ mod tests {
         UnvalidatedSecret::from_owned_bytes(bytes.to_vec())
     }
 
+    fn decide(
+        numbering: PinReferenceScheme,
+        validity_start: Option<i64>,
+    ) -> Option<ActivationScheme> {
+        ActivationScheme::from_numbering_and_validity_start(numbering, validity_start)
+    }
+
     #[test]
-    fn scheme_resolution_follows_cutover() {
+    fn citizen_numbering_follows_the_validity_start() {
+        let citizen = PinReferenceScheme::Citizen;
         assert_eq!(
-            ActivationScheme::from_validity_start(CUTOVER_BEFORE),
-            ActivationScheme::ActivationCodeIsPuk
+            decide(citizen, Some(CUTOVER_BEFORE)),
+            Some(ActivationScheme::ActivationCodeIsPuk)
         );
         assert_eq!(
-            ActivationScheme::from_validity_start(DVV_PRESET_PIN_CUTOVER_EPOCH_SECONDS),
-            ActivationScheme::PresetActivationPin
+            decide(citizen, Some(DVV_PRESET_PIN_CUTOVER_EPOCH_SECONDS)),
+            Some(ActivationScheme::PresetActivationPin)
         );
         assert_eq!(
-            ActivationScheme::from_validity_start(CUTOVER_AFTER),
-            ActivationScheme::PresetActivationPin
+            decide(citizen, Some(CUTOVER_AFTER)),
+            Some(ActivationScheme::PresetActivationPin)
         );
+    }
+
+    #[test]
+    fn organization_numbering_is_the_puk_scheme_whatever_the_date() {
+        for validity_start in [
+            Some(CUTOVER_BEFORE),
+            Some(DVV_PRESET_PIN_CUTOVER_EPOCH_SECONDS),
+            Some(CUTOVER_AFTER),
+            None,
+        ] {
+            assert_eq!(
+                decide(PinReferenceScheme::Organizational, validity_start),
+                Some(ActivationScheme::ActivationCodeIsPuk)
+            );
+        }
+    }
+
+    #[test]
+    fn citizen_numbering_without_a_validity_start_gives_no_scheme() {
+        assert_eq!(decide(PinReferenceScheme::Citizen, None), None);
+    }
+
+    #[test]
+    fn activation_code_carries_the_scheme_it_was_validated_for() {
+        for (digits, scheme) in [
+            (EXACT_7_DIGITS, ActivationScheme::PresetActivationPin),
+            (EXACT_8_DIGITS, ActivationScheme::ActivationCodeIsPuk),
+        ] {
+            let code = ActivationCode::reconstruct(input(digits), scheme).expect("exact length");
+            assert_eq!(code.scheme(), scheme);
+        }
     }
 
     #[test]

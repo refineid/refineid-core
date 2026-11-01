@@ -1,7 +1,7 @@
 // Copyright 2026 Petri Koistinen
 // Licensed under the Apache License, Version 2.0.
 
-//! Operation lifecycles of RAPP v26.10.29 section 8, with the requester and
+//! Operation lifecycles of RAPP v26.11.1 section 8, with the requester and
 //! custodian engines exchanging messages through their wire encoding.
 
 use refineid_rapp::{
@@ -48,6 +48,7 @@ fn signing(byte: u8) -> OperationRequest {
         byte,
         CardOperation::SignDocument {
             document_name: "Contract.pdf".to_owned(),
+            contained_files: None,
             key_profile: CardKeyProfile::EcdsaP256,
             algorithm: SignatureAlgorithm::EcdsaSha256,
             digest: vec![0xcc; SHA256_DIGEST_SIZE],

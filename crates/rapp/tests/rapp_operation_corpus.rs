@@ -1,7 +1,7 @@
 // Copyright 2026 Petri Koistinen
 // Licensed under the Apache License, Version 2.0.
 
-//! Byte-exact replay of the RAPP v26.10.29 operation-message corpus.
+//! Byte-exact replay of the RAPP v26.11.1 operation-message corpus.
 //!
 //! Every body decodes into its typed message and re-encodes to the identical
 //! bytes, so an independently written peer and this crate put the same bytes
@@ -10,15 +10,17 @@
 use std::collections::BTreeMap;
 
 use refineid_rapp::{
-    CardKeyProfile, CardOperation, CardOperationResult, CardPresence, CardReader,
-    CardStatusMessage, CertificateFingerprint, CertificateKind, Envelope, MessageType, OperationId,
-    PairId, ProgressEvent, ProtocolErrorMessage, ResultError, ResultStatus, SessionId,
-    SignatureAlgorithm, TypedMessage, WireValue, decode_deterministic_cbor,
-    encode_deterministic_cbor,
+    CardKeyProfile, CardOperation, CardOperationError, CardOperationResult, CardPresence,
+    CardReader, CardStatusMessage, CertificateFingerprint, CertificateKind, ContainedFiles,
+    Envelope, MessageType, OperationId, OperationRequest, OperationRequestRefusal, PairId,
+    ProfileName, ProgressEvent, ProtocolErrorMessage, RequestError, ResultError, ResultStatus,
+    SESSION_ID_SIZE, SessionId, SignatureAlgorithm, TypedMessage, WireError, WireValue,
+    decode_deterministic_cbor, encode_deterministic_cbor,
 };
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
-const CORPUS: &str = include_str!("../../../doc/protocols/vectors/rapp-operation-v26.10.29.json");
+const CORPUS: &str = include_str!("../../../doc/protocols/vectors/rapp-operation-v26.11.1.json");
 const SESSION_ID: SessionId = SessionId::from_array([0xbb; 16]);
 
 #[derive(Deserialize)]
@@ -28,16 +30,51 @@ struct Corpus {
     fixed_inputs: FixedInputs,
     vectors: Vec<Vector>,
     rejected: Vec<Vector>,
+    refused: Vec<RefusedVector>,
+    rejected_by_frame_bound: Vec<FrameBoundVector>,
+}
+
+/// A well-formed request the custodian answers with a rejected result.
+#[derive(Deserialize)]
+struct RefusedVector {
+    name: String,
+    message_type: String,
+    body_hex: String,
+    error: String,
 }
 
 #[derive(Deserialize)]
 struct FixedInputs {
+    operation_id_request: String,
     operation_id_result: String,
     operation_id_error: String,
     pair_id: String,
     certificate_der: String,
+    digest_sha256: String,
     local_start_ms: u64,
+    expires_after_ms: u64,
+    package_name: String,
+    package_files: Vec<String>,
 }
+
+/// A `sign_document` of a package too large to keep as bytes: the rule
+/// that rebuilds it, and what the rebuilt request must measure.
+#[derive(Deserialize)]
+struct FrameBoundVector {
+    name: String,
+    message_type: String,
+    document_name: String,
+    entry_bytes: usize,
+    entry_index_digits: usize,
+    frame_plaintext_limit: usize,
+    smallest_refused_count: usize,
+    admitted_envelope_length: usize,
+    refused_envelope_length: usize,
+    refused_body_sha256_hex: String,
+}
+
+/// The letter that pads a frame-bound entry to its length.
+const ENTRY_PADDING: char = 'x';
 
 #[derive(Deserialize)]
 struct Vector {
@@ -101,7 +138,7 @@ fn identifier(hex_text: &str) -> OperationId {
 fn corpus_names_this_protocol_version() {
     let corpus = corpus();
     assert_eq!(corpus.format, "fi.refineid.rapp.operation-vectors");
-    assert_eq!(corpus.protocol_document_version, "26.10.29");
+    assert_eq!(corpus.protocol_document_version, "26.11.1");
 }
 
 #[test]
@@ -306,4 +343,192 @@ fn a_batch_carries_its_documents_and_signatures_in_order() {
         panic!("the completed batch reads as signatures");
     };
     assert_eq!(signatures.len(), digests.len());
+}
+
+#[test]
+fn a_package_carries_its_name_and_every_file_in_order() {
+    let corpus = corpus();
+    let TypedMessage::OperationRequest(request) = find(&corpus, "request-sign-document-package")
+    else {
+        panic!("the package request is admitted");
+    };
+    let CardOperation::SignDocument {
+        document_name,
+        contained_files: Some(files),
+        key_profile,
+        algorithm,
+        ..
+    } = &request.operation
+    else {
+        panic!("the package request names a package");
+    };
+    assert_eq!(document_name, &corpus.fixed_inputs.package_name);
+    assert_eq!(files.names(), corpus.fixed_inputs.package_files.as_slice());
+    assert_eq!(*key_profile, CardKeyProfile::Rsa2048);
+    assert_eq!(*algorithm, SignatureAlgorithm::RsaPkcs1Sha256);
+
+    let TypedMessage::OperationRequest(single) = find(&corpus, "request-sign-document") else {
+        panic!("the single request is admitted");
+    };
+    assert!(matches!(
+        single.operation,
+        CardOperation::SignDocument {
+            contained_files: None,
+            ..
+        }
+    ));
+}
+
+/// Entry `index` of a frame-bound vector, by its rule.
+fn frame_bound_entry(vector: &FrameBoundVector, index: usize) -> String {
+    let mut entry = format!("{index:0width$}", width = vector.entry_index_digits);
+    while entry.len() < vector.entry_bytes {
+        entry.push(ENTRY_PADDING);
+    }
+    entry
+}
+
+/// The package request of a frame-bound vector with `count` entries, built
+/// without the admission check so that the refused one can be measured.
+fn frame_bound_request(
+    corpus: &Corpus,
+    vector: &FrameBoundVector,
+    count: usize,
+) -> OperationRequest {
+    let inputs = &corpus.fixed_inputs;
+    OperationRequest {
+        operation_id: identifier(&inputs.operation_id_request),
+        profile: ProfileName::DocumentSigning,
+        local_start_ms: inputs.local_start_ms,
+        expires_after_ms: inputs.expires_after_ms,
+        operation: CardOperation::SignDocument {
+            document_name: vector.document_name.clone(),
+            contained_files: Some(
+                ContainedFiles::reconstruct(
+                    (0..count)
+                        .map(|index| frame_bound_entry(vector, index))
+                        .collect(),
+                )
+                .expect("the entries are usable names"),
+            ),
+            key_profile: CardKeyProfile::Rsa2048,
+            algorithm: SignatureAlgorithm::RsaPkcs1Sha256,
+            digest: hex::decode(&inputs.digest_sha256).expect("valid hex"),
+        },
+    }
+}
+
+/// The `operation.request` body of `request` as the wire carries it.
+fn wire_body(request: &OperationRequest) -> BTreeMap<String, WireValue> {
+    let (action, context, payload) = request.wire_parts();
+    let mut body = BTreeMap::new();
+    body.insert(
+        "operation_id".into(),
+        WireValue::Bytes(request.operation_id.as_bytes().to_vec()),
+    );
+    body.insert(
+        "profile".into(),
+        WireValue::Text(request.profile.as_str().to_owned()),
+    );
+    body.insert("action".into(), WireValue::Text(action.to_owned()));
+    body.insert(
+        "expires_after_ms".into(),
+        WireValue::Unsigned(request.expires_after_ms),
+    );
+    body.insert("context".into(), WireValue::Map(context));
+    body.insert("payload".into(), WireValue::Map(payload));
+    body
+}
+
+/// The envelope of `body` at the widest sequence with a zero session.
+fn widest_envelope(body: BTreeMap<String, WireValue>) -> Result<Vec<u8>, WireError> {
+    Envelope::reconstruct(
+        MessageType::OperationRequest,
+        SessionId::from_array([u8::MIN; SESSION_ID_SIZE]),
+        u64::MAX,
+        body,
+    )?
+    .encode()
+}
+
+#[test]
+fn the_smallest_package_over_one_frame_is_refused_and_one_fewer_admitted() {
+    let corpus = corpus();
+    assert_eq!(corpus.rejected_by_frame_bound.len(), 1);
+    for vector in &corpus.rejected_by_frame_bound {
+        assert_eq!(vector.name, "request-sign-document-package-over-one-frame");
+        assert_eq!(
+            message_type(&vector.message_type),
+            MessageType::OperationRequest
+        );
+        assert_eq!(
+            vector.frame_plaintext_limit,
+            refineid_rapp::MAX_FRAME_PLAINTEXT
+        );
+
+        let refused = frame_bound_request(&corpus, vector, vector.smallest_refused_count);
+        let body = wire_body(&refused);
+        let digest = Sha256::digest(
+            encode_deterministic_cbor(&WireValue::Map(body.clone())).expect("the body encodes"),
+        );
+        assert_eq!(hex::encode(digest), vector.refused_body_sha256_hex);
+        assert_eq!(
+            widest_envelope(body.clone()),
+            Err(WireError::OversizedPlaintext {
+                got: vector.refused_envelope_length
+            })
+        );
+        assert_eq!(
+            refused.validate(),
+            Err(CardOperationError::PackageTooLarge),
+            "the requester refuses the package before sending"
+        );
+        assert_eq!(
+            OperationRequest::from_wire_body(body, corpus.fixed_inputs.local_start_ms),
+            Err(RequestError::Refused(OperationRequestRefusal {
+                operation_id: refused.operation_id,
+                error: ResultError::UnsupportedParameter,
+            })),
+            "the custodian refuses it at admission"
+        );
+
+        let admitted = frame_bound_request(&corpus, vector, vector.smallest_refused_count - 1);
+        let body = wire_body(&admitted);
+        assert_eq!(
+            widest_envelope(body.clone()).map(|bytes| bytes.len()),
+            Ok(vector.admitted_envelope_length)
+        );
+        assert_eq!(admitted.validate(), Ok(()));
+        assert_eq!(
+            OperationRequest::from_wire_body(body, corpus.fixed_inputs.local_start_ms)
+                .map(|request| request.operation),
+            Ok(admitted.operation)
+        );
+    }
+}
+
+#[test]
+fn every_refused_request_is_answered_with_its_rejection() {
+    let corpus = corpus();
+    assert!(!corpus.refused.is_empty());
+    let request_id = identifier(&corpus.fixed_inputs.operation_id_request);
+    for refused in &corpus.refused {
+        assert_eq!(refused.error, "unsupported_parameter", "{}", refused.name);
+        let vector = Vector {
+            name: refused.name.clone(),
+            message_type: refused.message_type.clone(),
+            body_hex: refused.body_hex.clone(),
+        };
+        assert_eq!(
+            decode(&vector, &corpus.fixed_inputs),
+            Ok(TypedMessage::OperationRequestRefused(
+                OperationRequestRefusal {
+                    operation_id: request_id,
+                    error: ResultError::UnsupportedParameter,
+                }
+            )),
+            "{}",
+            refused.name
+        );
+    }
 }

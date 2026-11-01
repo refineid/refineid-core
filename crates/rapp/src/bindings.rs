@@ -121,7 +121,7 @@ pub struct RappPairMetadata {
     pub profiles: Vec<String>,
     /// Pair-record creation time supplied by the platform wall clock.
     pub created_at_ms: u64,
-    /// Whether the peer confirmed storing its record (RAPP v26.10.29 §4.3
+    /// Whether the peer confirmed storing its record (RAPP v26.11.1 §4.3
     /// item 4). A record loaded unconfirmed survived a crash inside the
     /// confirmation window: it opens no session, routes nothing, and the
     /// caller revokes it.
@@ -188,7 +188,7 @@ pub enum RappBindingError {
     WrongPhase,
     /// The one-use pairing offer reached its monotonic deadline.
     OfferExpired,
-    /// The peer never confirmed that it stored the pairing (RAPP v26.10.29
+    /// The peer never confirmed that it stored the pairing (RAPP v26.11.1
     /// §4.3 item 4): the post-PAKE deadline passed in the storage phase, or
     /// a record loaded from the vault is unconfirmed. Such a record opens
     /// no session, routes nothing and is announced nowhere; the caller
@@ -203,9 +203,9 @@ pub enum RappBindingError {
     /// Referenced operation was not found in the active session.
     UnknownOperation,
     /// A pre-authentication attempt came within 500 ms of the previous one
-    /// (RAPP v26.10.29 §3.3 item 6); the caller refuses it and changes nothing.
+    /// (RAPP v26.11.1 §3.3 item 6); the caller refuses it and changes nothing.
     RateLimited,
-    /// The custodian answered `pairing-busy` (RAPP v26.10.29 §4.2, "Busy
+    /// The custodian answered `pairing-busy` (RAPP v26.11.1 §4.2, "Busy
     /// Refusal"): it cannot admit an attempt now. The answer's wait is read
     /// with [`rapp_pairing_busy_retry_after_ms`] and reported to
     /// [`RappPairingCandidates::busy`].
@@ -375,7 +375,7 @@ pub struct RappPairingBridge {
 
 #[uniffi::export]
 impl RappPairingBridge {
-    /// Create the custodian's offer (RAPP v26.10.29 §4.2) from a fresh
+    /// Create the custodian's offer (RAPP v26.11.1 §4.2) from a fresh
     /// platform-CSPRNG `offer_id`, the offered credential profiles, and the
     /// transport profiles the offer is served on.
     ///
@@ -405,7 +405,7 @@ impl RappPairingBridge {
     }
 
     /// Accept the offer bootstrap the requester received over the
-    /// transport `transport_profile` (RAPP v26.10.29 §4.2): the Bootstrap
+    /// transport `transport_profile` (RAPP v26.11.1 §4.2): the Bootstrap
     /// Characteristic value on BLE, or the custodian's first frame after the
     /// pairing preamble on the stream transport.
     ///
@@ -437,7 +437,7 @@ impl RappPairingBridge {
     }
 
     /// The custodian's bootstrap answer while its offer is live (RAPP
-    /// v26.10.29 §4.2, Bootstrap Read Flow): the offer,
+    /// v26.11.1 §4.2, Bootstrap Read Flow): the offer,
     /// `encode_deterministic_cbor(pairing-offer)`, while it can admit an
     /// attempt, and `encode_deterministic_cbor(pairing-busy)` while it
     /// cannot, because an attempt holds the offer or the 500 ms spacing has
@@ -474,7 +474,7 @@ impl RappPairingBridge {
 
     /// The `pairing-busy` the custodian sends on a pairing connection it
     /// refused while its offer is live, before closing the connection
-    /// (RAPP v26.10.29 §4.2, "Busy Refusal"). It carries the time until the
+    /// (RAPP v26.11.1 §4.2, "Busy Refusal"). It carries the time until the
     /// custodian can admit an attempt: the larger of the time left on the
     /// active attempt, the time left of this bridge's spacing, and
     /// `spacing_wait_ms`, held between 1 and 5000 ms. The platform calls it
@@ -545,7 +545,7 @@ impl RappPairingBridge {
     ///
     /// The code is parsed before anything else in the offer is touched: a
     /// code that is not six symbols of the pairing-code alphabet (RAPP
-    /// v26.10.29 section 3.1) is refused locally, the offer stays as it was,
+    /// v26.11.1 section 3.1) is refused locally, the offer stays as it was,
     /// and no attempt is admitted (section 3.3).
     ///
     /// # Errors
@@ -1550,7 +1550,7 @@ impl RappPairingBridge {
 }
 
 /// The CPace context of `offer` for the connection whose offer entry has
-/// `candidate_id` (RAPP v26.10.29 §6.1.1).
+/// `candidate_id` (RAPP v26.11.1 §6.1.1).
 fn pairing_context(
     offer: &PairingOffer,
     offer_hash: &[u8; 32],
@@ -2608,7 +2608,7 @@ impl RappPreAuthenticationLimiter {
 }
 
 /// What a requester does after a pairing connection closed without its
-/// custodian taking the code (RAPP v26.10.29 §4.2, "Trying Each Custodian in
+/// custodian taking the code (RAPP v26.11.1 §4.2, "Trying Each Custodian in
 /// Pairing Mode").
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum RappNextCandidate {
@@ -2639,7 +2639,7 @@ impl From<NextCandidate> for RappNextCandidate {
     }
 }
 
-/// The endpoint a requester opens next (RAPP v26.10.29 §4.2, "Trying Each
+/// The endpoint a requester opens next (RAPP v26.11.1 §4.2, "Trying Each
 /// Custodian in Pairing Mode" item 1).
 #[derive(Clone, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum RappNextEndpoint {
@@ -2660,7 +2660,7 @@ pub enum RappNextEndpoint {
 }
 
 /// The custodians in pairing mode a requester tries with one typed code
-/// (RAPP v26.10.29 §4.2, "Trying Each Custodian in Pairing Mode"). The
+/// (RAPP v26.11.1 §4.2, "Trying Each Custodian in Pairing Mode"). The
 /// platform creates one per submitted code, reports every endpoint
 /// discovery finds in pairing mode by its own name for it (a service
 /// instance, a peripheral identifier), opens the endpoints the ledger hands
@@ -2768,7 +2768,7 @@ impl RappPairingCandidates {
     /// `retry_after_ms`: the value [`rapp_pairing_busy_retry_after_ms`]
     /// read from its bootstrap or from the frame in place of CPace step 2,
     /// or zero when, on BLE, the custodian refused step 1 and then served
-    /// its offer (RAPP v26.10.29 §4.2, "Busy Refusal"). The endpoint is
+    /// its offer (RAPP v26.11.1 §4.2, "Busy Refusal"). The endpoint is
     /// opened again after its wait; nothing is shown to the user.
     ///
     /// # Errors
@@ -3241,7 +3241,7 @@ pub trait RappPairVault: Send + Sync {
 
     /// Atomically replace the record stored under an existing identifier:
     /// the confirmed form of a record inserted before the peer confirmed
-    /// its storage (RAPP v26.10.29 §4.3 item 4).
+    /// its storage (RAPP v26.11.1 §4.3 item 4).
     ///
     /// # Errors
     /// [`RappVaultError`] on an absent pair or unavailable storage.
@@ -3709,7 +3709,7 @@ pub fn rapp_pairing_preamble(profile_name: String) -> Result<Vec<u8>, RappBindin
 }
 
 /// The wait a custodian's `pairing-busy` asks for, in milliseconds (RAPP
-/// v26.10.29 §4.2, "PairingBusy Schema"): read from the bootstrap answer
+/// v26.11.1 §4.2, "PairingBusy Schema"): read from the bootstrap answer
 /// or the frame in place of CPace step 2 after a call returned
 /// [`RappBindingError::CustodianBusy`], for [`RappPairingCandidates::busy`].
 ///
@@ -3735,7 +3735,7 @@ pub fn rapp_stream_profile_name() -> String {
 }
 
 /// How long a requester that quits waits for its `service_withdrawn` closes
-/// to leave before it exits (RAPP v26.10.29 section 4.5 item 8), and one
+/// to leave before it exits (RAPP v26.11.1 section 4.5 item 8), and one
 /// whose holder turned remote use off waits for its `pairing_revoked` closes
 /// (section 4.6 item 6).
 #[uniffi::export]
@@ -3745,7 +3745,7 @@ pub const fn rapp_quit_withdrawal_bound_ms() -> u64 {
 }
 
 /// How long a pairing lives without an established session before it
-/// expires (RAPP v26.10.29 section 4.6 item 5).
+/// expires (RAPP v26.11.1 section 4.6 item 5).
 #[uniffi::export]
 #[must_use]
 pub const fn rapp_pairing_idle_expiry_ms() -> u64 {
@@ -3847,7 +3847,7 @@ impl RappPairRecord {
     /// Run `serve` while this record stays active, holding the record so a
     /// forget or revoke cannot land in the middle; `None`, without running
     /// `serve`, once the record is forgotten or revoked, since such a
-    /// pairing serves nothing (RAPP v26.10.29 §4.6).
+    /// pairing serves nothing (RAPP v26.11.1 §4.6).
     pub(super) fn serve_while_active<T>(
         &self,
         serve: impl FnOnce() -> Result<T, RappBindingError>,
@@ -4003,7 +4003,7 @@ fn decode_pair_record(encoded: &EncodedPairRecord) -> Result<PairRecord, RappBin
 }
 
 /// The BLE segmentation and reassembly receiver for one connection and one
-/// direction (RAPP v26.10.29 §5.3).
+/// direction (RAPP v26.11.1 §5.3).
 ///
 /// Any refused fragment zeroizes the partial frame; the caller then drops
 /// the connection.
@@ -4072,7 +4072,7 @@ impl RappBleSarReassembler {
 }
 
 /// The uniform SAR fragment payload capacity for a negotiated ATT MTU and
-/// any smaller value limit the platform reports (RAPP v26.10.29 §5.3).
+/// any smaller value limit the platform reports (RAPP v26.11.1 §5.3).
 ///
 /// # Errors
 /// [`RappBindingError::InvalidInput`] below an MTU of 512 or when the limit
@@ -5031,6 +5031,7 @@ mod routing_binding_tests {
                     .begin_sign_document(
                         operation_id(),
                         DOCUMENT_NAME.to_owned(),
+                        None,
                         RappCardKeyProfile::EcdsaP256,
                         RappSignatureAlgorithm::EcdsaSha256,
                         vec![DIGEST_BYTE; SHA256_DIGEST_SIZE],

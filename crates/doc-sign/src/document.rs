@@ -167,6 +167,8 @@ pub struct DocumentPlan {
 enum State {
     /// `CAdES`, with the content kept when it travels inside.
     Cades {
+        /// The document's name, as it was admitted.
+        name: String,
         /// The signed attributes, which are what gets signed.
         attributes: ToBeSigned,
         /// Whether the content travels inside.
@@ -176,6 +178,8 @@ enum State {
     },
     /// `PAdES`, with the hole reserved in the PDF.
     Pades {
+        /// The PDF's name, as it was admitted.
+        name: String,
         /// The signed attributes.
         attributes: ToBeSigned,
         /// The PDF with the signature hole waiting.
@@ -198,6 +202,20 @@ enum State {
 }
 
 impl DocumentPlan {
+    /// The names of the data objects the plan admitted, in the order
+    /// the signed document holds them: a container's entries in
+    /// container order, or a single document's one name.
+    #[must_use]
+    pub fn data_object_names(&self) -> Vec<&str> {
+        match self.state {
+            State::Cades { ref name, .. } | State::Pades { ref name, .. } => vec![name.as_str()],
+            State::AsicECades { ref container, .. } => container.object_names().collect(),
+            State::AsicEXades { ref objects, .. } => {
+                objects.iter().map(|object| object.name.as_str()).collect()
+            }
+        }
+    }
+
     /// The octets the card must sign.
     ///
     /// For the CMS formats this is the DER SET of signed attributes;
@@ -273,6 +291,7 @@ impl DocumentPlan {
                 attributes,
                 encapsulation,
                 content,
+                ..
             } => {
                 let der = for_cms(parameters.signature_algorithm, signature)?;
                 Ok(cades::signed_data(
@@ -288,6 +307,7 @@ impl DocumentPlan {
             State::Pades {
                 attributes,
                 placeholder,
+                ..
             } => {
                 let der = for_cms(parameters.signature_algorithm, signature)?;
                 // PAdES keeps its evidence in the document rather than
@@ -502,9 +522,10 @@ pub fn plan(
         Format::Cades | Format::CadesDetached => {
             // `is_single_file` was checked above, so there is exactly
             // one; `first` rather than an index keeps that provable.
-            let content = objects
-                .first()
-                .map(|o| o.content.clone())
+            let (name, content) = objects
+                .into_iter()
+                .next()
+                .map(|o| (o.name, o.content))
                 .unwrap_or_default();
             let digest = parameters.digest_algorithm.digest(&content);
             let attributes = cades::signed_attributes(parameters, &digest);
@@ -514,15 +535,17 @@ pub fn plan(
                 Encapsulation::Detached
             };
             State::Cades {
+                name,
                 attributes,
                 encapsulation,
                 content,
             }
         }
         Format::Pades => {
-            let pdf = objects
-                .first()
-                .map(|o| o.content.as_slice())
+            let (name, pdf) = objects
+                .into_iter()
+                .next()
+                .map(|o| (o.name, o.content))
                 .unwrap_or_default();
             // `PAdES` keeps the claimed signing time in the signature
             // dictionary's `/M`, and `EN 319 142-1 table 1` forbids the
@@ -538,12 +561,13 @@ pub fn plan(
                 pdf_metadata.signing_time = parameters.signing_time.map(pdf_date);
             }
             let placeholder =
-                pades::prepare(pdf, &pdf_metadata, pades::DEFAULT_SIGNATURE_CAPACITY)?;
+                pades::prepare(&pdf, &pdf_metadata, pades::DEFAULT_SIGNATURE_CAPACITY)?;
             let digest = placeholder.digest(parameters.digest_algorithm);
             let mut cms_parameters = *parameters;
             cms_parameters.signing_time = None;
             let attributes = cades::signed_attributes(&cms_parameters, &digest);
             State::Pades {
+                name,
                 attributes,
                 placeholder: Box::new(placeholder),
             }
@@ -672,6 +696,59 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{format:?} finish: {error}"));
             assert!(!output.is_empty(), "{format:?} produced nothing");
         }
+    }
+
+    /// The plan names the data objects it admitted, in the order the
+    /// signed document holds them.
+    #[test]
+    fn a_plan_names_its_admitted_objects_in_order() {
+        let certificate = crate::test_support::parse_certificate_for_test(CERTIFICATE_DER);
+        let parameters = signer(&certificate);
+        for format in [Format::AsicECades, Format::AsicEXades] {
+            let document_plan = plan(
+                format,
+                objects(3),
+                &parameters,
+                &SignatureMetadata::default(),
+            )
+            .unwrap_or_else(|error| panic!("{format:?} plan: {error}"));
+            assert_eq!(
+                document_plan.data_object_names(),
+                ["file0.txt", "file1.txt", "file2.txt"],
+                "{format:?} entries in container order"
+            );
+        }
+        for format in [Format::Cades, Format::CadesDetached] {
+            let document_plan = plan(
+                format,
+                objects(1),
+                &parameters,
+                &SignatureMetadata::default(),
+            )
+            .unwrap_or_else(|error| panic!("{format:?} plan: {error}"));
+            assert_eq!(
+                document_plan.data_object_names(),
+                ["file0.txt"],
+                "{format:?} names its one document"
+            );
+        }
+        let pdf = vec![DataObject {
+            name: "doc.pdf".to_owned(),
+            mime_type: "application/pdf".to_owned(),
+            content: minimal_pdf(),
+        }];
+        let document_plan = plan(
+            Format::Pades,
+            pdf,
+            &parameters,
+            &SignatureMetadata::default(),
+        )
+        .unwrap_or_else(|error| panic!("Pades plan: {error}"));
+        assert_eq!(
+            document_plan.data_object_names(),
+            ["doc.pdf"],
+            "the PDF's name"
+        );
     }
 
     /// A PDF that came out of `finish` is still a PDF, and an archive

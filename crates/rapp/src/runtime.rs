@@ -1,4 +1,4 @@
-//! An established session with its liveness (RAPP v26.10.29 section 8.3).
+//! An established session with its liveness (RAPP v26.11.1 section 8.3).
 
 use super::{
     AuthenticatedViolation, BinaryFrame, CloseReason, EndpointError, EstablishedEndpoint,

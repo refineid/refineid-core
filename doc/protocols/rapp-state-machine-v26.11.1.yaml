@@ -1,6 +1,6 @@
 protocol: RAPP
-document_version: "26.10.29"
-wire_version: "26.10.29"
+document_version: "26.11.1"
+wire_version: "26.11.1"
 
 semantics:
   instances: >

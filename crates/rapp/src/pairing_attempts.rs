@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! The pairing ceremony's attempt admission, post-PAKE deadlines and
-//! pre-authentication rate limit (RAPP v26.10.29 §3.3).
+//! pre-authentication rate limit (RAPP v26.11.1 §3.3).
 
 /// Non-extendable window from admission to a verified `T_A`.
 pub const CPACE_ATTEMPT_WINDOW_MS: u64 = 5_000;

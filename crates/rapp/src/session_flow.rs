@@ -34,7 +34,7 @@ pub struct SessionHandshake {
 
 impl SessionHandshake {
     /// Requester-only explicit session start over `transport`, the
-    /// transport profile of the connection (RAPP v26.10.29 §4.3).
+    /// transport profile of the connection (RAPP v26.11.1 §4.3).
     ///
     /// # Errors
     /// [`SessionError`] on a role violation or a handshake-construction
@@ -162,7 +162,7 @@ impl fmt::Debug for SessionHandshake {
 }
 
 /// A completed Noise KK session that is not healthy until `session.ready`:
-/// the Custodian sends it, the Requester verifies it (RAPP v26.10.29 section
+/// the Custodian sends it, the Requester verifies it (RAPP v26.11.1 section
 /// 7.1 item 5). A revoking endpoint sends the `pairing_revoked` close in its
 /// place (section 4.6 item 2).
 pub struct SessionAuthentication {
@@ -355,7 +355,7 @@ pub enum SessionError {
     /// Call contradicts the stored pair's endpoint role.
     RoleViolation,
     /// The peer never confirmed that it stored the pairing, so the record
-    /// opens no session (RAPP v26.10.29 section 4.3 item 4).
+    /// opens no session (RAPP v26.11.1 section 4.3 item 4).
     StorageUnconfirmed,
     /// Handshake or channel cryptography failed.
     Crypto(CryptoError),

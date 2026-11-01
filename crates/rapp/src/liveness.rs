@@ -1,4 +1,4 @@
-//! Session liveness (RAPP v26.10.29 section 8.3): a ping after 5 seconds of
+//! Session liveness (RAPP v26.11.1 section 8.3): a ping after 5 seconds of
 //! silence, the session's end after 30 seconds without any message.
 
 use core::fmt;

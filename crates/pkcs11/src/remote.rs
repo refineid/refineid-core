@@ -27,7 +27,7 @@
 //! A token is offered on a certificate whose fingerprint the phone
 //! confirmed on a session, and the module follows the offer: the token
 //! exists while the offer carries a certificate. The host keeps
-//! offering it between sessions as RAPP v26.10.29 section 8.4 item 3
+//! offering it between sessions as RAPP v26.11.1 section 8.4 item 3
 //! says, until the phone has been out of reach or has reported no card
 //! for the grace that section fixes (`IDENTITY_OFFER_GRACE_MS` in
 //! `refineid-rapp`) with no report of the card present in that time,
@@ -65,7 +65,7 @@ use crate::slot_kind::RemoteSlotId;
 pub const REMOTE_SIGN_DEADLINE: Duration = Duration::from_secs(30);
 
 /// The authentication certificate of the card the phone serves: one
-/// whose fingerprint the phone confirmed on a session (RAPP v26.10.29
+/// whose fingerprint the phone confirmed on a session (RAPP v26.11.1
 /// section 8.4 item 2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionCertificate(Vec<u8>);
@@ -101,7 +101,7 @@ impl RemoteOffer {
     /// `certificate` is present while the source offers the card: a
     /// certificate whose fingerprint the phone confirmed on a session,
     /// kept between sessions until the offer is withdrawn as RAPP
-    /// v26.10.29 section 8.4 item 3 says. The token exists exactly then.
+    /// v26.11.1 section 8.4 item 3 says. The token exists exactly then.
     #[must_use]
     pub const fn new(
         pair_id: RemoteSlotId,
@@ -231,7 +231,7 @@ pub trait RemoteTokenSource: Send + Sync {
     /// The one pairing offered right now, or none.
     ///
     /// The offer carries a certificate while the source offers the
-    /// card under RAPP v26.10.29 section 8.4 item 3, between sessions
+    /// card under RAPP v26.11.1 section 8.4 item 3, between sessions
     /// included; the module withdraws the token the moment the offer
     /// carries none, and raises a new token, with new object handles,
     /// when a certificate is offered again.

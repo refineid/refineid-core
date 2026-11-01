@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! The bootstrap answer a custodian in pairing mode serves on each
-//! transport (RAPP v26.10.29 §4.2): the `pairing-offer` while it can admit
+//! transport (RAPP v26.11.1 §4.2): the `pairing-offer` while it can admit
 //! an attempt, and `pairing-busy` while it cannot.
 
 use core::fmt;
@@ -23,19 +23,19 @@ use sha2::{Digest, Sha256};
 
 use super::{
     CPACE_KC2_SUITE, OFFER_ID_SIZE, OFFER_TTL_MS, OfferId, TransportCandidate, TransportProfile,
-    WIRE_VERSION_V26_10_29, WireError, WireValue, decode_deterministic_cbor,
+    WIRE_VERSION_V26_11_1, WireError, WireValue, decode_deterministic_cbor,
     encode_deterministic_cbor,
 };
 
 /// Upper bound on an encoded offer: the 509-byte ATT value capacity at the
-/// minimum ATT MTU of 512 (RAPP v26.10.29 §4.2).
+/// minimum ATT MTU of 512 (RAPP v26.11.1 §4.2).
 pub const MAX_OFFER_SIZE: usize = 509;
 
-/// Least `retry_after_ms` a `pairing-busy` carries (RAPP v26.10.29 §4.2,
+/// Least `retry_after_ms` a `pairing-busy` carries (RAPP v26.11.1 §4.2,
 /// "PairingBusy Schema").
 pub const PAIRING_BUSY_RETRY_AFTER_MIN_MS: u64 = 1;
 
-/// Greatest `retry_after_ms` a `pairing-busy` carries (RAPP v26.10.29 §4.2,
+/// Greatest `retry_after_ms` a `pairing-busy` carries (RAPP v26.11.1 §4.2,
 /// "PairingBusy Schema").
 pub const PAIRING_BUSY_RETRY_AFTER_MAX_MS: u64 = 5_000;
 
@@ -61,7 +61,7 @@ const BUSY_FIELDS: [&str; 3] = ["scheme", "version", RETRY_AFTER_FIELD];
 /// The scheme name both bootstrap answers carry.
 const SCHEME: &str = "rapp";
 
-/// Validated `pairing-offer` per RAPP v26.10.29 §4.2.
+/// Validated `pairing-offer` per RAPP v26.11.1 §4.2.
 ///
 /// Every transport entry is the registered entry of its profile, the entries
 /// are sorted by profile with no duplicates, and `offer_id` is random.
@@ -229,7 +229,7 @@ impl PairingOffer {
         Ok(self)
     }
 
-    /// Hash the deterministic offer per RAPP v26.10.29 §4.2.
+    /// Hash the deterministic offer per RAPP v26.11.1 §4.2.
     ///
     /// # Errors
     /// [`PairingOfferError`] when deterministic encoding fails.
@@ -309,7 +309,7 @@ impl fmt::Debug for PairingOffer {
 }
 
 /// The `pairing-busy` a custodian in pairing mode answers while it cannot
-/// admit an attempt (RAPP v26.10.29 §3.3 item 6, §4.2 "PairingBusy Schema"
+/// admit an attempt (RAPP v26.11.1 §3.3 item 6, §4.2 "PairingBusy Schema"
 /// and "Busy Refusal").
 ///
 /// It carries only the time until the custodian can admit an attempt,
@@ -393,7 +393,7 @@ impl PairingBusy {
     }
 }
 
-/// What a requester reads from a custodian in pairing mode (RAPP v26.10.29
+/// What a requester reads from a custodian in pairing mode (RAPP v26.11.1
 /// §4.2, Bootstrap Read Flow item 3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootstrapAnswer {
@@ -496,12 +496,12 @@ impl fmt::Display for PairingOfferError {
 
 impl core::error::Error for PairingOfferError {}
 
-/// The bootstrap answers' version triple, `[26, 10, 29]`.
+/// The bootstrap answers' version triple, `[26, 11, 1]`.
 fn version_triple() -> Vec<WireValue> {
     vec![
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.0)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.1)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.2)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_1.0)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_1.1)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_1.2)),
     ]
 }
 
@@ -657,7 +657,7 @@ mod tests {
         PairingOfferError, RETRY_AFTER_FIELD, SCHEME, version_value,
     };
     use crate::{
-        OfferId, ProfileName, TransportCandidate, TransportProfile, WIRE_VERSION_V26_10_29,
+        OfferId, ProfileName, TransportCandidate, TransportProfile, WIRE_VERSION_V26_11_1,
         WireValue, encode_deterministic_cbor,
     };
 
@@ -781,9 +781,9 @@ mod tests {
         wrong_version.insert(
             "version".to_owned(),
             WireValue::Array(vec![
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.0)),
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.1)),
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.2) + 1),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_1.0)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_1.1)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_1.2) + 1),
             ]),
         );
         assert_eq!(

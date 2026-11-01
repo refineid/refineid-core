@@ -1,4 +1,4 @@
-//! Custodian-side operations of one session (RAPP v26.10.29 section 8).
+//! Custodian-side operations of one session (RAPP v26.11.1 section 8).
 
 use core::fmt;
 use std::collections::BTreeSet;
@@ -12,7 +12,7 @@ use super::{
 };
 
 /// Most operation identifiers one session remembers for the duplicate check
-/// of RAPP v26.10.29 section 8.1 item 1. A local resource bound: one session
+/// of RAPP v26.11.1 section 8.1 item 1. A local resource bound: one session
 /// is one workstation, and a requester that starts more operations than this
 /// on one session has its session closed.
 pub const MAX_SEEN_OPERATION_IDS: usize = 4_096;

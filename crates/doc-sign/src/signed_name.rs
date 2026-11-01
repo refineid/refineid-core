@@ -48,6 +48,20 @@ const NAME_SEPARATOR: &str = "-";
 /// first input.
 #[must_use]
 pub fn signed_document_path(inputs: &[PathBuf], format: Format, signed_at: DateTime) -> PathBuf {
+    let (stem, extension) = stem_and_extension(inputs, format);
+    let time = signed_at
+        .to_string()
+        .replace(TIME_SEPARATOR, FILE_NAME_TIME_SEPARATOR);
+    let name = format!("{stem}{NAME_SEPARATOR}{SIGNED_LABEL}{NAME_SEPARATOR}{time}.{extension}");
+    inputs
+        .first()
+        .and_then(|first| first.parent())
+        .map_or_else(|| PathBuf::from(&name), |dir| dir.join(&name))
+}
+
+/// The stem and the extension of the signed form of `inputs`, as
+/// [`signed_document_path`] names them.
+fn stem_and_extension(inputs: &[PathBuf], format: Format) -> (String, String) {
     let single = match inputs {
         [only] => Some(only.as_path()),
         _ => None,
@@ -59,14 +73,7 @@ pub fn signed_document_path(inputs: &[PathBuf], format: Format, signed_at: DateT
         (Format::Pades, Some(own)) => own.to_string_lossy(),
         _ => format.extension().into(),
     };
-    let time = signed_at
-        .to_string()
-        .replace(TIME_SEPARATOR, FILE_NAME_TIME_SEPARATOR);
-    let name = format!("{stem}{NAME_SEPARATOR}{SIGNED_LABEL}{NAME_SEPARATOR}{time}.{extension}");
-    inputs
-        .first()
-        .and_then(|first| first.parent())
-        .map_or_else(|| PathBuf::from(&name), |dir| dir.join(&name))
+    (stem.into_owned(), extension.into_owned())
 }
 
 /// The earliest authenticated `genTime` among a signature's verified
@@ -123,6 +130,16 @@ impl PendingSignedName {
     pub fn path(&self, best: Option<BestSignatureTime>) -> PathBuf {
         let at = best.map_or(self.clock, BestSignatureTime::instant);
         signed_document_path(&self.inputs, self.format, at)
+    }
+
+    /// The file name without its time: `<stem>-signed.<extension>`.
+    /// The time is the best-signature-time, which exists only once the
+    /// signature is timestamped, so a name shown before signing names
+    /// the document by the rest.
+    #[must_use]
+    pub fn file_name_without_time(&self) -> String {
+        let (stem, extension) = stem_and_extension(&self.inputs, self.format);
+        format!("{stem}{NAME_SEPARATOR}{SIGNED_LABEL}.{extension}")
     }
 }
 
@@ -230,6 +247,33 @@ mod tests {
             &named(&["report.pdf"], Format::Pades)?,
             &PathBuf::from("report-signed-2001-02-03T04-05-06Z.pdf"),
             "relative",
+        )
+    }
+
+    #[test]
+    fn the_name_without_time_drops_only_the_time() -> TestResult {
+        let set = PendingSignedName::new(
+            vec![
+                PathBuf::from("/documents/report.pdf"),
+                PathBuf::from("/attachments/notes.txt"),
+            ],
+            Format::AsicEXades,
+            signed_at()?,
+        );
+        check(
+            &set.file_name_without_time(),
+            &"portfolio-signed.asice".to_owned(),
+            "portfolio",
+        )?;
+        let one = PendingSignedName::new(
+            vec![PathBuf::from("/documents/report.pdf")],
+            Format::AsicECades,
+            signed_at()?,
+        );
+        check(
+            &one.file_name_without_time(),
+            &"report-signed.asice".to_owned(),
+            "one file",
         )
     }
 

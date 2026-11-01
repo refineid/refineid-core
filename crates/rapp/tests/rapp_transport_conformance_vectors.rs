@@ -1,7 +1,7 @@
 // Copyright 2026 Petri Koistinen
 // Licensed under the Apache License, Version 2.0.
 
-//! Replay of the RAPP v26.10.29 transport-bound corpus sections: pairing
+//! Replay of the RAPP v26.11.1 transport-bound corpus sections: pairing
 //! offers, busy answers, CPace KC2 transcripts per transport, both Noise transcripts per
 //! transport (cross-checked against snow).
 
@@ -16,7 +16,7 @@ use refineid_rapp::{
 use serde::Deserialize;
 use sha2::{Sha512, digest::common::BlockSizeUser};
 
-const CORPUS: &str = include_str!("../../../doc/protocols/vectors/rapp-v26.10.29.json");
+const CORPUS: &str = include_str!("../../../doc/protocols/vectors/rapp-v26.11.1.json");
 
 #[derive(Deserialize)]
 struct Corpus {
@@ -223,7 +223,7 @@ const CPACE_DSI: &[u8] = b"CPaceRistretto255";
 
 /// The generator string is lv(DSI) || lv(PRS) || lv(zero padding) || lv(C) ||
 /// lv(SID), and its first three fields fill exactly one SHA-512 input block
-/// (RAPP v26.10.29 section 6.1.2).
+/// (RAPP v26.11.1 section 6.1.2).
 #[test]
 fn generator_strings_fill_one_hash_block_before_the_context() {
     let block = <Sha512 as BlockSizeUser>::block_size();

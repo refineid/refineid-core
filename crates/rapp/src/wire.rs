@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 
 use zeroize::{Zeroize, Zeroizing};
 
-use super::{MAX_FRAME_PLAINTEXT, SESSION_ID_SIZE, SessionId, WIRE_VERSION_V26_10_29};
+use super::{MAX_FRAME_PLAINTEXT, SESSION_ID_SIZE, SessionId, WIRE_VERSION_V26_11_1};
 
 const MAX_NESTING_DEPTH: usize = 8;
 const MAX_TEXT_SIZE: usize = 4_096;
@@ -170,9 +170,9 @@ impl Envelope {
         map.insert(
             "version".to_owned(),
             WireValue::Array(vec![
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.0)),
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.1)),
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.2)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_1.0)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_1.1)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_1.2)),
             ]),
         );
         map.insert(
@@ -209,9 +209,9 @@ impl Envelope {
         let version = take_array(&mut map, "version")?;
         if version.as_slice()
             != [
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.0)),
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.1)),
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.2)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_1.0)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_1.1)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_1.2)),
             ]
         {
             return Err(WireError::UnsupportedVersion);
@@ -1162,9 +1162,9 @@ mod tests {
         assert_eq!(
             envelope_version,
             &WireValue::Array(vec![
-                WireValue::Unsigned(u64::from(crate::WIRE_VERSION_V26_10_29.0)),
-                WireValue::Unsigned(u64::from(crate::WIRE_VERSION_V26_10_29.1)),
-                WireValue::Unsigned(u64::from(crate::WIRE_VERSION_V26_10_29.2)),
+                WireValue::Unsigned(u64::from(crate::WIRE_VERSION_V26_11_1.0)),
+                WireValue::Unsigned(u64::from(crate::WIRE_VERSION_V26_11_1.1)),
+                WireValue::Unsigned(u64::from(crate::WIRE_VERSION_V26_11_1.2)),
             ])
         );
     }

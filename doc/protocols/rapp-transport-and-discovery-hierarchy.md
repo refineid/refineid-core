@@ -1,8 +1,8 @@
 # Remote Authorization Proxy Protocol (RAPP)
 ## Transport and Discovery Hierarchy Specification
 
-- **Document Version**: `26.10.29`
-- **Protocol Versions**: `26.10.29`
+- **Document Version**: `26.11.1`
+- **Protocol Versions**: `26.11.1`
 - **Status**: Normative Specification / Architecture Blueprint
 - **Change Controller**: RefineID Project
 - **Applies To**: `refineid-core`, `refineid-unix`, `refineid-windows`, `refineid-apple`, `refineid-android`
@@ -59,7 +59,7 @@ In the diagram, Bluetooth Low Energy (BLE) is the Bluetooth transport; discovery
 ### 2.1 The Custodian (Phone)
 The mobile device is the authoritative security anchor:
 - **Custody of Secrets**: It interacts directly with the physical smart card over ISO/IEC 7816 / ISO/IEC 14443 contactless NFC.
-- **Protected Path**: PIN1 is entered by the holder on the phone and held only in the Custodian's memory, never in storage (RAPP v26.10.29 §11 item 2). PIN2 (Qualified Electronic Signature) prompts appear exclusively on the phone's protected display.
+- **Protected Path**: PIN1 is entered by the holder on the phone and held only in the Custodian's memory, never in storage (RAPP v26.11.1 §11 item 2). PIN2 (Qualified Electronic Signature) prompts appear exclusively on the phone's protected display.
 - **Listener Gating**: The phone must not bind any network listening socket or broadcast advertisements unless the user has explicitly enabled "Allow Remote Card Reader" in application settings. When disabled, the listener is immediately terminated and unannounced.
 
 ### 2.2 The Requester (Workstation)
@@ -104,11 +104,11 @@ Bluetooth (BLE)
   - Custodian runs `StreamRelayListener` on a dynamic, ephemeral TCP port (`bind(0)`).
   - Custodian advertises service type `_refineid-stream._tcp.local.` via mDNS.
   - Requester runs `StreamRelayBrowser`, receives the PTR (pointer), SRV (service) and text (TXT) (text) records, and initiates an **outbound** TCP `connect()` to the phone's advertised IP and port.
-- **Wire Profile**: Governed normatively by RAPP v26.10.29 §2.2.2. Each frame is a 2-byte unsigned big-endian length followed by 1 to 65535 payload bytes. The Requester's first frame is the routing preamble `["rapp-stream", purpose, routing]` (RAPP v26.10.29 §2.2.1). After a `"pairing"` preamble the Custodian's first frame is the encoded `pairing-offer` (§4.2); after a `"session"` preamble the Custodian routed the Requester sends `Noise_KK` message 1.
+- **Wire Profile**: Governed normatively by RAPP v26.11.1 §2.2.2. Each frame is a 2-byte unsigned big-endian length followed by 1 to 65535 payload bytes. The Requester's first frame is the routing preamble `["rapp-stream", purpose, routing]` (RAPP v26.11.1 §2.2.1). After a `"pairing"` preamble the Custodian's first frame is the encoded `pairing-offer` (§4.2); after a `"session"` preamble the Custodian routed the Requester sends `Noise_KK` message 1.
 
 ### 3.3 Bluetooth / BLE Proximity Transport (`fi.refineid.rapp.ble`)
 - **Applicability**: The last resort: a proximity transport for when no IP network is shared (no Wi-Fi, a virtual machine or container without a usable network, no router), across supported platforms (iOS, Android, Linux/BSD, Windows, macOS).
-- **Normative Specification**: Governed normatively by RAPP v26.10.29 §2–§5.
+- **Normative Specification**: Governed normatively by RAPP v26.11.1 §2–§5.
 - **Wire Profile**: The canonical cross-platform wire profile is GATT-based `fi.refineid.rapp.ble`:
   - Primary Service Universally Unique Identifier (UUID): `7E39FD01-A6B5-4D78-9E11-37E28E9545F1`
   - Channel Characteristic UUID: `7E39FD02-A6B5-4D78-9E11-37E28E9545F1` (Requester writes via `ATT_WRITE_REQ`; Custodian indicates via `ATT_HANDLE_VALUE_IND`)
@@ -122,8 +122,8 @@ Bluetooth (BLE)
 Because mDNS discovery broadcasts on multicast UDP port 5353 (IPv4 `224.0.0.251`, IPv6 `ff02::fb`), packets are visible to all devices on the local Layer 2 broadcast domain. In compliance with IETF [RFC 8882](https://www.rfc-editor.org/rfc/rfc8882.html) (*DNS-SD Privacy and Security Requirements*) and RefineID privacy rules:
 
 ### 4.1 No Stable Pairing Identifier on the Wire
-- **Keys from the static agreement**: Every value that names a stored pairing outside its encrypted channel -- discovery hints (§4.3), withdrawal hints (§4.3) and session routing tags -- is keyed by the pairing's static X25519 agreement (X25519 is the Diffie-Hellman function over Curve25519, RFC 7748) under its own Hash-based Message Authentication Code (HMAC)-based Key Derivation Function (HKDF) label (RAPP v26.10.29 §4.3). Only the pairing's two endpoints can compute or recognise these values.
-- **Fresh per connection**: The Requester's session routing preamble carries a fresh random nonce and the routing tag it keys (RAPP v26.10.29 §2.2.1), sent point-to-point over the established TCP stream or BLE Channel Characteristic in `Phase::Routing`. No routing value recurs across connections, so preambles cannot be linked to one another or to discovery records.
+- **Keys from the static agreement**: Every value that names a stored pairing outside its encrypted channel -- discovery hints (§4.3), withdrawal hints (§4.3) and session routing tags -- is keyed by the pairing's static X25519 agreement (X25519 is the Diffie-Hellman function over Curve25519, RFC 7748) under its own Hash-based Message Authentication Code (HMAC)-based Key Derivation Function (HKDF) label (RAPP v26.11.1 §4.3). Only the pairing's two endpoints can compute or recognise these values.
+- **Fresh per connection**: The Requester's session routing preamble carries a fresh random nonce and the routing tag it keys (RAPP v26.11.1 §2.2.1), sent point-to-point over the established TCP stream or BLE Channel Characteristic in `Phase::Routing`. No routing value recurs across connections, so preambles cannot be linked to one another or to discovery records.
 - **Zero Public Broadcast of stable values**: `pair_id`, static public keys, and any other stable per-pairing value must never be published in mDNS PTR, SRV, or TXT records, nor broadcast in unauthenticated BLE advertising packets.
 
 ### 4.2 Public DNS-SD Identifiers and Ephemeral Lifecycle
@@ -149,7 +149,7 @@ The Custodian publishes three distinct discovery modes:
      v=1
      mode=pairing
      ```
-   - Nothing derived from the pairing code or the offer is published. The Requester obtains the offer over the connection (RAPP v26.10.29 §4.2).
+   - Nothing derived from the pairing code or the offer is published. The Requester obtains the offer over the connection (RAPP v26.11.1 §4.2).
 
 2. **Session Reconnect Mode (`mode=session`)**:
    - Active when "Allow Remote Card Reader" is enabled and the phone is ready for operational card requests.
@@ -158,20 +158,20 @@ The Custodian publishes three distinct discovery modes:
      v=1
      mode=session
      ```
-     No pairing values, hashes, or hints are published. Requesters on the local subnet that hold a usable pairing connect to the advertised endpoint and present a fresh session routing preamble inside the point-to-point stream in the Routing phase (RAPP v26.10.29 §2.2.1). If no stored pairing keyed its tag, the TCP connection is immediately closed.
+     No pairing values, hashes, or hints are published. Requesters on the local subnet that hold a usable pairing connect to the advertised endpoint and present a fresh session routing preamble inside the point-to-point stream in the Routing phase (RAPP v26.11.1 §2.2.1). If no stored pairing keyed its tag, the TCP connection is immediately closed.
    - **Optional Rotating Discovery Hints (Multi-Device Coexistence)**:
-     To avoid trial connections in high-density enterprise environments with multiple active Custodians, the Custodian publishes truncated, rotating HMAC hints for the 4 most recently used stored pairings (use time and tie order as for withdrawn records, RAPP v26.10.29 §4.5):
+     To avoid trial connections in high-density enterprise environments with multiple active Custodians, the Custodian publishes truncated, rotating HMAC hints for the 4 most recently used stored pairings (use time and tie order as for withdrawn records, RAPP v26.11.1 §4.5):
      $$\text{hint}_i = \text{first 8 bytes of }\text{HMAC-SHA-256}(K_{\text{disc}, i}, \text{epoch\_be64})$$
      where:
-     - $K_{\text{disc}, i}$ = HKDF-SHA-256 ([RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html)) with salt $\text{pair\_id}_i$, input keying material the pairing's static X25519 agreement, $\text{info} = $ `"rapp-discovery-hint"` (ASCII), and $L = 32$ (RAPP v26.10.29 §4.3).
+     - $K_{\text{disc}, i}$ = HKDF-SHA-256 ([RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html)) with salt $\text{pair\_id}_i$, input keying material the pairing's static X25519 agreement, $\text{info} = $ `"rapp-discovery-hint"` (ASCII), and $L = 32$ (RAPP v26.11.1 §4.3).
      - $\text{epoch} = \lfloor \text{unix\_time} / 900 \rfloor$ (15-minute rotation window), and $\text{epoch\_be64}$ is that value as an unsigned 64-bit big-endian integer (8 bytes), the entire HMAC message.
      - TXT Attribute: `hints=` followed by at most 4 hints, each 16 lowercase hexadecimal digits, separated by commas without spaces (e.g. `hints=054526c9fdd3b180`).
-     - The `discovery_hint` vectors of `vectors/rapp-routing-v26.10.29.json` pin the bytes.
-     Requesters evaluate candidate hints for the current and adjacent epoch ($\text{epoch} \pm 1$) against their stored pairings before initiating TCP connections; the window tolerates a clock difference of at least 15 minutes and up to just under 30 minutes, and implementations must not widen it. A record with `hints` holds 1 to 4 entries; an empty `hints` value is malformed. The `discovery_record` and `announcement_selection` vectors of `vectors/rapp-routing-v26.10.29.json` pin parsing and selection.
+     - The `discovery_hint` vectors of `vectors/rapp-routing-v26.11.1.json` pin the bytes.
+     Requesters evaluate candidate hints for the current and adjacent epoch ($\text{epoch} \pm 1$) against their stored pairings before initiating TCP connections; the window tolerates a clock difference of at least 15 minutes and up to just under 30 minutes, and implementations must not widen it. A record with `hints` holds 1 to 4 entries; an empty `hints` value is malformed. The `discovery_record` and `announcement_selection` vectors of `vectors/rapp-routing-v26.11.1.json` pin parsing and selection.
    - A `mode=session` record carries the keys `v` and `mode`, optionally `hints`, and no other.
 
 3. **Withdrawn Mode (`mode=withdrawn`)**:
-   - Published for 2 to 10 seconds on the current service instance after the user turns remote access off or quits the application, once open sessions are closed and connections are no longer accepted; the service is then unregistered (RAPP v26.10.29 §4.5).
+   - Published for 2 to 10 seconds on the current service instance after the user turns remote access off or quits the application, once open sessions are closed and connections are no longer accepted; the service is then unregistered (RAPP v26.11.1 §4.5).
    - TXT Attributes, and no others:
      ```text
      v=1

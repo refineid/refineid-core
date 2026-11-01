@@ -17,10 +17,12 @@
 //! The requester -- the computer's app -- drives RAPP itself and
 //! implements [`RemoteSigner`] over it: [`RemoteSigner::signature_certificate`]
 //! is `read_certificate` with kind `signature`, and
-//! [`RemoteSigner::sign`] is one `sign_document` for a batch of one or
-//! one `batch_sign_documents` for several (RAPP v26.10.29 section 9.3).
-//! The phone shows the document names, asks for PIN 2 once on its own
-//! screen, and its card signs each digest; no PIN reaches this
+//! [`RemoteSigner::sign`] is one `sign_document` for a batch of one --
+//! a single document, or a package carrying the names of the files it
+//! holds -- or one `batch_sign_documents` for several single documents
+//! (RAPP v26.11.1 section 9.3). The phone shows the document names, and
+//! under a package's name every file it holds, asks for PIN 2 once on
+//! its own screen, and its card signs each digest; no PIN reaches this
 //! computer, and no document byte reaches the phone.
 //!
 //! [`sign_on_phone`] does everything else, sharing the local card
@@ -56,15 +58,12 @@ use crate::service::{
 };
 use crate::x509_ext::NameExt as _;
 
-/// The UTF-8 byte length of one document name the phone shows: RAPP
-/// v26.10.29 section 9.3, `document_name` and each of
-/// `document_names`, `tstr .size (1..256)`.
+/// The UTF-8 byte length of one name the phone shows: RAPP v26.11.1
+/// section 9.3, `document_name` and each entry of `document_names` and
+/// of `contained_files`, `tstr .size (1..256)`.
 const DOCUMENT_NAME_BYTES: RangeInclusive<usize> = 1..=MAX_DOCUMENT_NAME_BYTES;
 /// The upper bound of [`DOCUMENT_NAME_BYTES`].
 const MAX_DOCUMENT_NAME_BYTES: usize = 256;
-/// Between the file names of a container's files in its one document
-/// name.
-const CONTAINER_NAME_SEPARATOR: &str = ", ";
 /// Modulus width of the RAPP key profile `rsa_2048` (section 9.2).
 const RSA_2048_MODULUS_BITS: usize = 2048;
 /// Modulus width of the RAPP key profile `rsa_3072` (section 9.2).
@@ -120,7 +119,7 @@ impl fmt::Debug for UnvalidatedPhoneSignature {
 /// Why the paired phone produced no certificate or no signatures.
 ///
 /// The requester maps its own protocol's outcomes onto this closed
-/// set: RAPP v26.10.29 section 10.3 names the `operation.result` errors,
+/// set: RAPP v26.11.1 section 10.3 names the `operation.result` errors,
 /// and a session or link that ends before the result arrives is
 /// [`Self::Unreachable`] (section 9.3: an interrupted batch delivers no
 /// signature).
@@ -197,19 +196,18 @@ impl fmt::Display for PhoneCertificateError {
 
 impl core::error::Error for PhoneCertificateError {}
 
-/// The name the phone shows the holder for one document: the file's
-/// name, or for a container the names of the files it carries, joined
-/// in the order they are signed. Its UTF-8 length is within RAPP
-/// v26.10.29 section 9.3's bound.
+/// The name the phone shows the holder for one document, RAPP's
+/// `document_name`: a single document's file name, or a package's own
+/// name, the file name of the container the signing writes. Its UTF-8
+/// length is within RAPP v26.11.1 section 9.3's bound.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentName(String);
 
 impl DocumentName {
-    /// The name from the files' names, refused outside the bound.
-    fn of_files<'a>(names: impl Iterator<Item = &'a str>) -> Result<Self, SignErrorKind> {
-        let joined = names.collect::<Vec<_>>().join(CONTAINER_NAME_SEPARATOR);
-        if DOCUMENT_NAME_BYTES.contains(&joined.len()) {
-            Ok(Self(joined))
+    /// The name from a file name, refused outside the bound.
+    fn of_file(name: &str) -> Result<Self, SignErrorKind> {
+        if DOCUMENT_NAME_BYTES.contains(&name.len()) {
+            Ok(Self(name.to_owned()))
         } else {
             Err(SignErrorKind::DocumentNameLength)
         }
@@ -222,12 +220,49 @@ impl DocumentName {
     }
 }
 
-/// One document the phone is asked to sign: the name it shows and the
-/// digest its card signs.
+/// The files a package holds, as the phone shows them under the
+/// package's name and as RAPP's `contained_files` carries them (section
+/// 9.3): the names of the container's data objects, as the container
+/// holds them, in container order. Each is within the section 9.3 name
+/// bound, and a package holds at least one. That they are usable entry
+/// names -- unique, none under `META-INF/` in any letter case -- is the
+/// container plan's predicate (`document::plan`), checked before this
+/// is built from the plan's objects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainedFiles(Vec<String>);
+
+impl ContainedFiles {
+    /// The entry names of a planned container, refused when there are
+    /// none or one is outside the bound.
+    fn of_plan_objects(names: Vec<String>) -> Result<Self, SignErrorKind> {
+        if names.is_empty() {
+            Err(SignErrorKind::Document(document::DocumentError::NoInput))
+        } else if names
+            .iter()
+            .all(|name| DOCUMENT_NAME_BYTES.contains(&name.len()))
+        {
+            Ok(Self(names))
+        } else {
+            Err(SignErrorKind::DocumentNameLength)
+        }
+    }
+
+    /// The entries, in container order.
+    #[must_use]
+    pub fn names(&self) -> &[String] {
+        &self.0
+    }
+}
+
+/// One document the phone is asked to sign: the name it shows, the files
+/// it lists under that name for a package, and the digest its card
+/// signs.
 #[derive(Debug, Clone)]
 pub struct PhoneDocument {
     /// The name shown to the holder.
     name: DocumentName,
+    /// The files a package holds; `None` for a single document.
+    contained_files: Option<ContainedFiles>,
     /// The digest, with the batch's key profile and algorithm.
     request: SignatureRequest,
 }
@@ -237,6 +272,14 @@ impl PhoneDocument {
     #[must_use]
     pub const fn name(&self) -> &DocumentName {
         &self.name
+    }
+
+    /// The files the phone lists under the name when this document is a
+    /// package, sent as RAPP's `contained_files`; `None` for a single
+    /// document, which sends none.
+    #[must_use]
+    pub const fn contained_files(&self) -> Option<&ContainedFiles> {
+        self.contained_files.as_ref()
     }
 
     /// The digest the card signs: exactly what the document's format
@@ -253,7 +296,7 @@ impl PhoneDocument {
 /// Every document of one signing, in signing order, under one key
 /// profile and one algorithm read off the phone's certificate. The
 /// phone answers with one signature per document, in the same order.
-/// Never empty.
+/// Never empty; a package is the only document of its batch.
 #[derive(Debug, Clone)]
 pub struct PhoneSigningBatch {
     /// The certificate key's RAPP profile.
@@ -292,7 +335,7 @@ impl PhoneSigningBatch {
 /// at most once per [`sign_on_phone`].
 pub trait RemoteSigner {
     /// The certificate of the phone's card's qualified-signature key:
-    /// `read_certificate` with kind `signature` (RAPP v26.10.29
+    /// `read_certificate` with kind `signature` (RAPP v26.11.1
     /// section 9.3).
     ///
     /// # Errors
@@ -301,9 +344,11 @@ pub trait RemoteSigner {
 
     /// Ask the phone to sign every document of `batch` under one
     /// consent and one PIN 2 entry on the phone: `sign_document` for a
-    /// batch of one, `batch_sign_documents` for several, carrying the
-    /// batch's names, key profile, algorithm and digests in order.
-    /// Returns the phone's signatures in the order it gave them.
+    /// batch of one, with the package's `contained_files` when that
+    /// document has them, `batch_sign_documents` for several single
+    /// documents, carrying the batch's names, key profile, algorithm and
+    /// digests in order. Returns the phone's signatures in the order it
+    /// gave them.
     ///
     /// # Errors
     /// The phone's refusal; no signature of a refused batch is used.
@@ -422,7 +467,9 @@ struct PreparedDocument {
 /// Steps:
 ///
 ///   1. Check every document's request, as the local path does before
-///      it opens a reader.
+///      it opens a reader, and that a package is the only document: a
+///      package is signed with its own `sign_document`, never in a
+///      batch.
 ///   2. Read the phone's certificate ([`RemoteSigner::signature_certificate`])
 ///      and refuse it unless it is a qualified-signature certificate
 ///      with a key a document signature can be made with.
@@ -454,6 +501,13 @@ pub fn sign_on_phone(
     for options in &documents {
         options.document.validate_signing_policy()?;
         ensure_visible_signature_format(&options.document)?;
+    }
+    if documents.len() > 1
+        && documents
+            .iter()
+            .any(|options| !options.document.format.is_single_file())
+    {
+        return Err(SignErrorKind::PackageInBatch);
     }
     let certificate = PhoneSignatureCertificate::from_phone(
         signer
@@ -493,7 +547,6 @@ fn prepare_document(
         options.document.signing_time,
     )?;
     let objects = load_data_objects(&options.input, &options.document, &input_bytes)?;
-    let name = DocumentName::of_files(objects.iter().map(|object| object.name.as_str()))?;
     let plan = document::plan(
         options.document.format,
         objects,
@@ -501,6 +554,7 @@ fn prepare_document(
         &options.document.metadata,
     )
     .map_err(SignErrorKind::Document)?;
+    let (name, contained_files) = phone_names(&plan, &options)?;
     let (algorithm, verifier) = phone_algorithm(parameters.signature_algorithm);
     let digest = parameters.digest_algorithm.digest(plan.to_be_signed());
     let request = SignatureRequest::new(certificate.key_profile, algorithm, digest).map_err(
@@ -511,9 +565,53 @@ fn prepare_document(
         input_len,
         input_sha256,
         plan,
-        phone_document: PhoneDocument { name, request },
+        phone_document: PhoneDocument {
+            name,
+            contained_files,
+            request,
+        },
         verifier,
     })
+}
+
+/// The name the phone shows for a planned document and, for a package,
+/// the files it lists under it: the plan's admitted data objects, in
+/// the order the signed document holds them.
+fn phone_names(
+    plan: &DocumentPlan,
+    options: &PhoneSignOptions,
+) -> Result<(DocumentName, Option<ContainedFiles>), SignErrorKind> {
+    let objects = plan.data_object_names();
+    if options.document.format.is_single_file() {
+        // The plan admitted exactly one object for a single-file format.
+        let only = objects
+            .first()
+            .ok_or(SignErrorKind::Document(document::DocumentError::NoInput))?;
+        Ok((DocumentName::of_file(only)?, None))
+    } else {
+        Ok((
+            DocumentName::of_file(&package_name(&options.output))?,
+            Some(ContainedFiles::of_plan_objects(
+                objects.into_iter().map(str::to_owned).collect(),
+            )?),
+        ))
+    }
+}
+
+/// A package's own name: the file name of the container the signing
+/// writes. A path given by the caller is the name as written; the
+/// default signed name carries the best-signature-time, which exists
+/// only once the signature is timestamped, so the phone is shown that
+/// name without its time. Empty when the output path names no file,
+/// which the name bound refuses.
+fn package_name(output: &SignOutput) -> String {
+    match output {
+        SignOutput::At(path) => path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        SignOutput::SignedName(pending) => pending.file_name_without_time(),
+    }
 }
 
 /// The batch the phone is asked to sign: every prepared document, in
@@ -619,6 +717,7 @@ mod tests {
     use crate::cades::SigningTime;
     use crate::document::Format;
     use crate::pades::SignatureMetadata;
+    use crate::signed_name::PendingSignedName;
     use crate::test_util::{TempDir, TestResult, check, check_true};
     use crate::testkit::{
         CertificateSpec, KEY_USAGE_DIGITAL_SIGNATURE, KEY_USAGE_DIGITAL_SIGNATURE_UNUSED,
@@ -692,6 +791,7 @@ mod tests {
         key_profile: RemoteKeyProfile,
         algorithm: RemoteSignatureAlgorithm,
         names: Vec<String>,
+        contained_files: Vec<Option<Vec<String>>>,
         digests: Vec<Vec<u8>>,
     }
 
@@ -759,6 +859,15 @@ mod tests {
                     .documents()
                     .iter()
                     .map(|document| document.name().as_str().to_owned())
+                    .collect(),
+                contained_files: batch
+                    .documents()
+                    .iter()
+                    .map(|document| {
+                        document
+                            .contained_files()
+                            .map(|files| files.names().to_vec())
+                    })
                     .collect(),
                 digests: batch
                     .documents()
@@ -862,10 +971,20 @@ mod tests {
             let Some(batch) = phone.batches.first() else {
                 return Err("no batch".into());
             };
+            let (shown, listed) = if format.is_single_file() {
+                (name.clone(), None)
+            } else {
+                (format!("signed-{name}"), Some(vec![name.clone()]))
+            };
             check(
                 &batch.names,
-                &vec![name.clone()],
-                "the phone shows the file",
+                &vec![shown],
+                "the phone shows the file, or the package's own name",
+            )?;
+            check(
+                &batch.contained_files,
+                &vec![listed],
+                "a package lists the file it holds",
             )?;
             check(&batch.key_profile, &RemoteKeyProfile::EcdsaP384, "profile")?;
             check(
@@ -964,8 +1083,8 @@ mod tests {
     }
 
     #[test]
-    fn a_container_of_several_files_is_one_document() -> TestResult {
-        let dir = TempDir::new("phone-container")?;
+    fn a_package_is_named_by_its_container_and_lists_every_file_in_order() -> TestResult {
+        let dir = TempDir::new("phone-package")?;
         let second = dir.write("annex.txt", b"annex")?;
         let mut document = one(&dir, Format::AsicEXades, "letter.txt", b"letter", 0)?;
         document.document.additional_inputs.push(second);
@@ -979,11 +1098,164 @@ mod tests {
         };
         check(
             &batch.names,
-            &vec!["letter.txt, annex.txt".to_owned()],
-            "one name for the container",
+            &vec!["signed-letter.txt".to_owned()],
+            "the container's own name",
         )?;
-        check(&batch.digests.len(), &1, "one digest for the container")?;
+        check(
+            &batch.contained_files,
+            &vec![Some(vec!["letter.txt".to_owned(), "annex.txt".to_owned()])],
+            "every file the package holds, in container order",
+        )?;
+        check(&batch.digests.len(), &1, "one digest for the package")?;
         require_verified(&output)
+    }
+
+    #[test]
+    fn a_package_lists_the_planned_entries_not_the_inputs() -> TestResult {
+        let dir = TempDir::new("phone-package-planned")?;
+        let inbox = dir.path().join("inbox");
+        std::fs::create_dir(&inbox)?;
+        let first = inbox.join("letter.txt");
+        std::fs::write(&first, b"letter")?;
+        let second = dir.write("annex.txt", b"annex")?;
+        let options = || {
+            let mut document = request(Format::AsicECades, 0);
+            document.additional_inputs.push(second.clone());
+            PhoneSignOptions {
+                output: SignOutput::At(dir.path().join("dossier.asice")),
+                input: first.clone(),
+                document,
+            }
+        };
+        let mut phone = ScriptedPhone::p384(Answer::Sign);
+        let certificate = PhoneSignatureCertificate::from_phone(
+            phone.signature_certificate().map_err(|_| "certificate")?,
+        )?;
+        let prepared = prepare_document(options(), &certificate)?;
+        let planned: Vec<String> = prepared
+            .plan
+            .data_object_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        check(
+            &planned,
+            &vec!["letter.txt".to_owned(), "annex.txt".to_owned()],
+            "the plan's entries are file names, in container order",
+        )?;
+        sign_on_phone(&mut phone, vec![options()])?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some(batch) = phone.batches.first() else {
+            return Err("no batch".into());
+        };
+        check(
+            &batch.contained_files,
+            &vec![Some(planned)],
+            "the phone lists exactly the planned entries",
+        )?;
+        check(
+            &batch.names,
+            &vec!["dossier.asice".to_owned()],
+            "the container's own name",
+        )
+    }
+
+    #[test]
+    fn a_package_under_the_default_name_is_shown_without_its_time() -> TestResult {
+        let dir = TempDir::new("phone-package-default-name")?;
+        let first = dir.write("letter.txt", b"letter")?;
+        let second = dir.write("annex.txt", b"annex")?;
+        let mut document = request(Format::AsicEXades, 0);
+        document.additional_inputs.push(second.clone());
+        let options = PhoneSignOptions {
+            output: SignOutput::SignedName(PendingSignedName::new(
+                vec![first.clone(), second],
+                Format::AsicEXades,
+                day(VERIFIED_ON),
+            )),
+            input: first,
+            document,
+        };
+        let mut phone = ScriptedPhone::p384(Answer::Sign);
+        let reports = sign_on_phone(&mut phone, vec![options])?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some(batch) = phone.batches.first() else {
+            return Err("no batch".into());
+        };
+        check(
+            &batch.names,
+            &vec!["portfolio-signed.asice".to_owned()],
+            "the default name without the best-signature-time",
+        )?;
+        let Some(report) = reports.first() else {
+            return Err("no report".into());
+        };
+        let written = report
+            .signature_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        check_true(
+            written.starts_with("portfolio-signed-") && written.ends_with(".asice"),
+            "the written name is the shown name with its time",
+        )
+    }
+
+    #[test]
+    fn a_package_of_one_file_still_lists_its_file() -> TestResult {
+        let dir = TempDir::new("phone-package-of-one")?;
+        let document = one(&dir, Format::AsicECades, "letter.txt", b"letter", 0)?;
+        let mut phone = ScriptedPhone::p384(Answer::Sign);
+        sign_on_phone(&mut phone, vec![document])?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some(batch) = phone.batches.first() else {
+            return Err("no batch".into());
+        };
+        check(
+            &batch.contained_files,
+            &vec![Some(vec!["letter.txt".to_owned()])],
+            "the one file",
+        )
+    }
+
+    #[test]
+    fn a_single_document_lists_no_files() -> TestResult {
+        let dir = TempDir::new("phone-single")?;
+        let document = one(&dir, Format::Pades, "letter.pdf", &minimal_pdf(), 0)?;
+        let mut phone = ScriptedPhone::p384(Answer::Sign);
+        sign_on_phone(&mut phone, vec![document])?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some(batch) = phone.batches.first() else {
+            return Err("no batch".into());
+        };
+        check(
+            &batch.names,
+            &vec!["letter.pdf".to_owned()],
+            "the file's name",
+        )?;
+        check(&batch.contained_files, &vec![None], "no files listed")
+    }
+
+    #[test]
+    fn a_package_never_joins_a_batch() -> TestResult {
+        let dir = TempDir::new("phone-package-in-batch")?;
+        let package = one(&dir, Format::AsicEXades, "letter.txt", b"letter", 0)?;
+        let single = one(&dir, Format::Pades, "memo.pdf", &minimal_pdf(), 1)?;
+        let outputs = [package.output.path(None), single.output.path(None)];
+        let mut phone = ScriptedPhone::p384(Answer::Sign);
+        check_true(
+            matches!(
+                sign_on_phone(&mut phone, vec![package, single]),
+                Err(SignErrorKind::PackageInBatch)
+            ),
+            "the package is refused a place in the batch",
+        )?;
+        check_true(phone.batches.is_empty(), "nothing went to the phone")?;
+        require_nothing_written(&outputs)
     }
 
     /// Require that none of `paths` exists.
@@ -1119,24 +1391,51 @@ mod tests {
     fn document_names_follow_the_rapp_bound() -> TestResult {
         let at_bound = "n".repeat(MAX_DOCUMENT_NAME_BYTES);
         check(
-            &DocumentName::of_files([at_bound.as_str()].into_iter())?.as_str(),
+            &DocumentName::of_file(&at_bound)?.as_str(),
             &at_bound.as_str(),
             "a name at the bound",
         )?;
         let over = "n".repeat(MAX_DOCUMENT_NAME_BYTES.saturating_add(1));
         check_true(
             matches!(
-                DocumentName::of_files([over.as_str()].into_iter()),
+                DocumentName::of_file(&over),
                 Err(SignErrorKind::DocumentNameLength)
             ),
             "a name over the bound",
         )?;
         check_true(
             matches!(
-                DocumentName::of_files(core::iter::empty()),
+                DocumentName::of_file(""),
                 Err(SignErrorKind::DocumentNameLength)
             ),
             "an empty name",
+        )
+    }
+
+    #[test]
+    fn contained_files_follow_the_rapp_bound_entry_by_entry() -> TestResult {
+        let at_bound = "n".repeat(MAX_DOCUMENT_NAME_BYTES);
+        let files =
+            ContainedFiles::of_plan_objects(vec!["letter.txt".to_owned(), at_bound.clone()])?;
+        check(
+            &files.names(),
+            &["letter.txt".to_owned(), at_bound].as_slice(),
+            "entries at and under the bound, in order",
+        )?;
+        let over = "n".repeat(MAX_DOCUMENT_NAME_BYTES.saturating_add(1));
+        check_true(
+            matches!(
+                ContainedFiles::of_plan_objects(vec!["letter.txt".to_owned(), over]),
+                Err(SignErrorKind::DocumentNameLength)
+            ),
+            "an entry over the bound refuses the package, never shortened",
+        )?;
+        check_true(
+            matches!(
+                ContainedFiles::of_plan_objects(Vec::new()),
+                Err(SignErrorKind::Document(document::DocumentError::NoInput))
+            ),
+            "an empty package is refused",
         )
     }
 }

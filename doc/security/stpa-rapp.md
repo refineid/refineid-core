@@ -2,7 +2,7 @@
 
 **Status:** Reviewed by the owner on 2026-10-22 with RAPP v26.10.22
 **Date:** 2026-10-18
-**Applies to:** RAPP v26.10.29 (`doc/protocols/rapp-v26.10.29.md`), the
+**Applies to:** RAPP v26.11.1 (`doc/protocols/rapp-v26.11.1.md`), the
 transport and discovery hierarchy, and the requester and custodian
 applications built on them
 
@@ -1974,9 +1974,10 @@ waits, and no new outcome exists.
 well as through a card in the computer's reader: `remote::sign_on_phone`
 plans every document around the certificate the phone returns, sends
 every digest in one `RemoteSigner::sign` call, which the requester
-carries as one `sign_document` or `batch_sign_documents` (specification
-§9.3), and finishes each document on the same path as a local
-signature. This is the requester's path from the chosen file to the
+carries as one `sign_document` -- for a single document, or for a
+package with the names of every file it holds -- or as one
+`batch_sign_documents` of single documents (specification §9.3), and
+finishes each document on the same path as a local signature. This is the requester's path from the chosen file to the
 digest that UCA-15 and CC-12 ask to be analysed as its own control
 loop. PIN 2 is typed only on the phone (§11 items 2 and 4). Losses and
 hazards are this record's: L-1, L-5; H-1, H-5.
@@ -1984,9 +1985,9 @@ hazards are this record's: L-1, L-5; H-1, H-5.
 ### 35.2 Control structure
 
 The requester's signing flow is the controller. Its control actions
-are to send the batch -- each document's name and digest, with one key
-profile and one algorithm -- and, after the answer, to finish and write
-each signed document. Its process model is which certificate the
+are to send the batch -- each document's name and digest, for a package
+the names of the files it holds, with one key profile and one algorithm
+-- and, after the answer, to finish and write each signed document. Its process model is which certificate the
 phone's card signs under and which digest belongs to which document.
 Its feedback is the certificate from `read_certificate`, and either one
 signature per document or a refusal. The custodian shows the names,
@@ -1999,7 +2000,7 @@ its only feedback that the card signed what was planned.
 | ID | Controller | Control action | Type | Context | Hazard |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | UCA-105 | Requester | Send a document's digest | P | When it is not the digest of exactly the octets that document's format signs: another file, a plan built around another certificate, or a hash the algorithm does not name. The holder consents to the name and the card signs something else. | H-1 |
-| UCA-106 | Requester | Show a document's name in the batch | P | When the name at a position is not the file whose digest is at that position, or a container's name leaves out a file it signs. | H-1, H-5 |
+| UCA-106 | Requester | Show a document's name in the batch | P | When the name at a position is not the file whose digest is at that position, or a package is shown without a file it holds, or under another name than the container's own entry names. | H-1, H-5 |
 | UCA-107 | Requester | Finish and write a signed document | P | When the phone's signature is over another digest, by a key the certificate does not certify, at another document's position, or one of more or fewer signatures than documents: a document that does not verify, or carries another document's signature, is written as signed. | H-5 |
 | UCA-108 | Requester | Build the batch on the phone's certificate | P | When the certificate is not the card's qualified-signature certificate, such as the authentication certificate: the documents name a certificate that does not certify the qualified key. | H-5 |
 | UCA-109 | Requester | Write the documents of a batch | T | Before every signature of the batch has been checked, so a later failure leaves part of the batch written. | H-5 |
@@ -2009,7 +2010,7 @@ its only feedback that the card signed what was planned.
 | ID | Constraint | Closes |
 | :--- | :--- | :--- |
 | CC-109 | Each digest is the signer parameters' digest of `DocumentPlan::to_be_signed` of the plan built around the phone's certificate. The digest and signature algorithm come from that certificate's key through `document_signer`, the one function the local card path uses too, and RAPP's `algorithm` maps from it name for name: `rsa_pkcs1_sha256` with SHA-256 for RSA, the card adding the DigestInfo as for a local card; `ecdsa_sha384` with SHA-384 for P-384. `SignatureRequest` refuses a digest of the wrong length or an algorithm the key profile does not support. | UCA-105 |
-| CC-110 | The core names each document from the files its plan signs, a container's files joined in signing order, within §9.3's 1 to 256 bytes; a longer name is refused, never shortened. The requester sends the batch's names and digests in the batch's order and changes neither. | UCA-106 |
+| CC-110 | The core names a single document by its file and a package by the container the signing writes, each within §9.3's 1 to 256 bytes, and lists a package's files as `contained_files`: the container's own entry names, the names its manifest and signature cover, in container order, each within the same bound. A name or entry over the bound is refused, never shortened; a package whose request does not encode in one frame is refused at the requester's wire border (`PackageTooLarge`) and at the custodian's admission (`unsupported_parameter`), as CC-105 bounds a batch, and no entry is dropped to make it fit. A package is the only document of its `sign_document`; it never joins a batch. The requester sends the names, entries and digests in the batch's order and changes none of them. | UCA-106 |
 | CC-111 | Nothing is finished until the answer has exactly one signature per document and each verifies against the phone certificate's key over its own position's signed octets; any other answer refuses the whole batch and writes nothing. Each document is finished only after the whole batch has passed, and the phone is asked at most once per signing. | UCA-107, UCA-109 |
 | CC-112 | The phone's certificate is admitted only when its key usage asserts nonRepudiation and its key is RSA of 2048 or 3072 bits or ECDSA on P-384, before any digest is sent. | UCA-108 |
 

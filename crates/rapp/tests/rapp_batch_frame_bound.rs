@@ -2,7 +2,7 @@
 // Licensed under the Apache License, Version 2.0.
 
 //! A batch is admitted only when its completed result travels in one frame
-//! (RAPP v26.10.29 section 7.2 item 4, section 9.3), and a seal the frame
+//! (RAPP v26.11.1 section 7.2 item 4, section 9.3), and a seal the frame
 //! limit refuses leaves the send sequence where it was (section 7.2 item 3).
 
 use std::collections::BTreeMap;

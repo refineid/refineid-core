@@ -1,7 +1,7 @@
 {
   "format": "fi.refineid.rapp.operation-vectors",
-  "protocol_document_version": "26.10.29",
-  "provenance": "Derived by tools/rapp-vectors/generate.py from the inputs in this file and RAPP v26.10.29 sections 7.1, 9 and 10.3: the CDDL of every operation message body, with standard-library primitives checked against RFC 7748 section 6.1, RFC 8439 section 2.8.2 and RFC 9496 appendix A.1; the engine is not used.",
+  "protocol_document_version": "26.11.1",
+  "provenance": "Derived by tools/rapp-vectors/generate.py from the inputs in this file and RAPP v26.11.1 sections 7.1, 9 and 10.3: the CDDL of every operation message body, with standard-library primitives checked against RFC 7748 section 6.1, RFC 8439 section 2.8.2 and RFC 9496 appendix A.1; the engine is not used.",
   "fixed_inputs": {
     "operation_id_request": "11111111111111111111111111111111",
     "operation_id_result": "22222222222222222222222222222222",
@@ -36,6 +36,18 @@
       "busy": "Another operation of this session is live.",
       "duplicate_operation": "The operation identifier was already used on this session.",
       "operation_failed": "The operation could not be carried out."
+    },
+    "package_name": "Dossier.asice",
+    "package_files": [
+      "Contract.pdf",
+      "Annex.pdf",
+      "Photo of the site.jpg"
+    ],
+    "package_reserved_entry": "META-INF/signatures0.xml",
+    "package_over_one_frame": {
+      "document_name": "Dossier.asice",
+      "entry_bytes": 256,
+      "entry_index_digits": 4
     }
   },
   "vectors": [
@@ -68,6 +80,11 @@
       "name": "request-sign-document",
       "message_type": "OperationRequest",
       "body_hex": "a666616374696f6e6d7369676e5f646f63756d656e7467636f6e74657874a16d646f63756d656e745f6e616d656c436f6e74726163742e706466677061796c6f6164a3666469676573745830dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd69616c676f726974686d6c65636473615f7368613338346b6b65795f70726f66696c656a65636473615f703338346770726f66696c65781c66692e726566696e6569642e646f63756d656e742d7369676e696e676c6f7065726174696f6e5f6964501111111111111111111111111111111170657870697265735f61667465725f6d731a0001d4c0"
+    },
+    {
+      "name": "request-sign-document-package",
+      "message_type": "OperationRequest",
+      "body_hex": "a666616374696f6e6d7369676e5f646f63756d656e7467636f6e74657874a26d646f63756d656e745f6e616d656d446f73736965722e61736963656f636f6e7461696e65645f66696c6573836c436f6e74726163742e70646669416e6e65782e7064667550686f746f206f662074686520736974652e6a7067677061796c6f6164a3666469676573745820cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc69616c676f726974686d707273615f706b6373315f7368613235366b6b65795f70726f66696c65687273615f323034386770726f66696c65781c66692e726566696e6569642e646f63756d656e742d7369676e696e676c6f7065726174696f6e5f6964501111111111111111111111111111111170657870697265735f61667465725f6d731a0001d4c0"
     },
     {
       "name": "request-batch-sign-documents",
@@ -240,6 +257,48 @@
       "name": "error-unregistered-name",
       "message_type": "Error",
       "body_hex": "a2676d65737361676568556e6b6e6f776e2e6a6572726f725f6e616d6571756e6b6e6f776e5f6f7065726174696f6e"
+    }
+  ],
+  "rejected_by_frame_bound": [
+    {
+      "name": "request-sign-document-package-over-one-frame",
+      "message_type": "OperationRequest",
+      "document_name": "Dossier.asice",
+      "entry_bytes": 256,
+      "entry_index_digits": 4,
+      "entry_rule": "entry i, counted from 0, is its zero-padded decimal index of entry_index_digits digits padded with the letter x to entry_bytes bytes; the payload is that of request-sign-document-package",
+      "envelope_rule": "the operation.request envelope at sequence 2^64-1 with a session_id of 16 zero bytes",
+      "frame_plaintext_limit": 65519,
+      "smallest_refused_count": 252,
+      "admitted_envelope_length": 65362,
+      "refused_envelope_length": 65621,
+      "refused_body_sha256_hex": "c8fcaddcae4ef202642cf6fa51eaff744f84d85d5e2e3353ecafcc8d4aed33b7"
+    }
+  ],
+  "refused": [
+    {
+      "name": "request-sign-document-package-without-entries",
+      "message_type": "OperationRequest",
+      "body_hex": "a666616374696f6e6d7369676e5f646f63756d656e7467636f6e74657874a26d646f63756d656e745f6e616d656d446f73736965722e61736963656f636f6e7461696e65645f66696c657380677061796c6f6164a3666469676573745820cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc69616c676f726974686d707273615f706b6373315f7368613235366b6b65795f70726f66696c65687273615f323034386770726f66696c65781c66692e726566696e6569642e646f63756d656e742d7369676e696e676c6f7065726174696f6e5f6964501111111111111111111111111111111170657870697265735f61667465725f6d731a0001d4c0",
+      "error": "unsupported_parameter"
+    },
+    {
+      "name": "request-sign-document-package-repeated-entry",
+      "message_type": "OperationRequest",
+      "body_hex": "a666616374696f6e6d7369676e5f646f63756d656e7467636f6e74657874a26d646f63756d656e745f6e616d656d446f73736965722e61736963656f636f6e7461696e65645f66696c6573826c436f6e74726163742e7064666c436f6e74726163742e706466677061796c6f6164a3666469676573745820cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc69616c676f726974686d707273615f706b6373315f7368613235366b6b65795f70726f66696c65687273615f323034386770726f66696c65781c66692e726566696e6569642e646f63756d656e742d7369676e696e676c6f7065726174696f6e5f6964501111111111111111111111111111111170657870697265735f61667465725f6d731a0001d4c0",
+      "error": "unsupported_parameter"
+    },
+    {
+      "name": "request-sign-document-package-reserved-entry",
+      "message_type": "OperationRequest",
+      "body_hex": "a666616374696f6e6d7369676e5f646f63756d656e7467636f6e74657874a26d646f63756d656e745f6e616d656d446f73736965722e61736963656f636f6e7461696e65645f66696c6573846c436f6e74726163742e70646669416e6e65782e7064667550686f746f206f662074686520736974652e6a706778184d4554412d494e462f7369676e617475726573302e786d6c677061796c6f6164a3666469676573745820cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc69616c676f726974686d707273615f706b6373315f7368613235366b6b65795f70726f66696c65687273615f323034386770726f66696c65781c66692e726566696e6569642e646f63756d656e742d7369676e696e676c6f7065726174696f6e5f6964501111111111111111111111111111111170657870697265735f61667465725f6d731a0001d4c0",
+      "error": "unsupported_parameter"
+    },
+    {
+      "name": "request-sign-document-package-entry-over-bound",
+      "message_type": "OperationRequest",
+      "body_hex": "a666616374696f6e6d7369676e5f646f63756d656e7467636f6e74657874a26d646f63756d656e745f6e616d656d446f73736965722e61736963656f636f6e7461696e65645f66696c6573846c436f6e74726163742e70646669416e6e65782e7064667550686f746f206f662074686520736974652e6a70677901016e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e677061796c6f6164a3666469676573745820cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc69616c676f726974686d707273615f706b6373315f7368613235366b6b65795f70726f66696c65687273615f323034386770726f66696c65781c66692e726566696e6569642e646f63756d656e742d7369676e696e676c6f7065726174696f6e5f6964501111111111111111111111111111111170657870697265735f61667465725f6d731a0001d4c0",
+      "error": "unsupported_parameter"
     }
   ]
 }

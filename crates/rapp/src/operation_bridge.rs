@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Closed generated binding for the operations of one RAPP session
-//! (RAPP v26.10.29 section 8).
+//! (RAPP v26.11.1 section 8).
 //!
 //! The platform transports only opaque encrypted frames and receives bounded
 //! semantic actions. It never receives a generic decrypted protocol message,
@@ -25,12 +25,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use super::{
     AuthorizedCardCommand, BinaryFrame, CardIdentity, CardInspection, CardKeyProfile,
     CardOperation, CardOperationResult, CardPresence, CardReader, CardStatusMessage,
-    CertificateFingerprint, CertificateKind, CloseReason, EndpointError, EstablishedSessionRuntime,
-    OperationId, OperationRequest, OperationResultMessage, OperationViolation, PingChallenge,
-    ProfileName, ProxyDispatch, ProxyEngineError, ProxyFailure, ProxyOperationEngine,
-    ProxySessionCloseAction, RequesterDispatch, RequesterEngineError, RequesterOperationEngine,
-    ResultError, RuntimeError, RuntimePoll, RuntimeReceive, SignatureAlgorithm, TypedMessage,
-    UserApproval,
+    CertificateFingerprint, CertificateKind, CloseReason, ContainedFiles, EndpointError,
+    EstablishedSessionRuntime, OperationId, OperationRequest, OperationResultMessage,
+    OperationViolation, PingChallenge, ProfileName, ProxyDispatch, ProxyEngineError, ProxyFailure,
+    ProxyOperationEngine, ProxySessionCloseAction, RequesterDispatch, RequesterEngineError,
+    RequesterOperationEngine, ResultError, RuntimeError, RuntimePoll, RuntimeReceive,
+    SignatureAlgorithm, TypedMessage, UserApproval,
     bindings::{RappBindingError, RappPairRecord, RappSessionBridge, fixed_array},
 };
 
@@ -141,8 +141,12 @@ const fn exported_algorithm(value: SignatureAlgorithm) -> RappSignatureAlgorithm
 pub struct RappOperationDescriptor {
     /// Registered operation name.
     pub kind: RappOperationKind,
-    /// Requester-asserted origin or document name shown to the authorizer.
+    /// Requester-asserted origin or document name shown to the authorizer;
+    /// for a package, the package's own name.
     pub display_context: Option<String>,
+    /// The files a package holds, shown under its name in container order;
+    /// present exactly when a `sign_document` signs a package (section 9.3).
+    pub contained_files: Option<Vec<String>>,
     /// Expected key profile of the selected certificate.
     pub key_profile: Option<RappCardKeyProfile>,
     /// Exact signature algorithm.
@@ -161,6 +165,7 @@ impl From<&CardOperation> for RappOperationDescriptor {
             CardOperation::InspectCard => Self {
                 kind: RappOperationKind::InspectCard,
                 display_context: None,
+                contained_files: None,
                 key_profile: None,
                 algorithm: None,
                 digest: Vec::new(),
@@ -170,6 +175,7 @@ impl From<&CardOperation> for RappOperationDescriptor {
             CardOperation::ReadIdentity => Self {
                 kind: RappOperationKind::ReadIdentity,
                 display_context: None,
+                contained_files: None,
                 key_profile: None,
                 algorithm: None,
                 digest: Vec::new(),
@@ -181,6 +187,7 @@ impl From<&CardOperation> for RappOperationDescriptor {
             } => Self {
                 kind: RappOperationKind::ReadAuthenticationCertificate,
                 display_context: None,
+                contained_files: None,
                 key_profile: None,
                 algorithm: None,
                 digest: Vec::new(),
@@ -192,6 +199,7 @@ impl From<&CardOperation> for RappOperationDescriptor {
             } => Self {
                 kind: RappOperationKind::ReadSignatureCertificate,
                 display_context: None,
+                contained_files: None,
                 key_profile: None,
                 algorithm: None,
                 digest: Vec::new(),
@@ -206,6 +214,7 @@ impl From<&CardOperation> for RappOperationDescriptor {
             } => Self {
                 kind: RappOperationKind::BrowserAuthenticate,
                 display_context: Some(origin.clone()),
+                contained_files: None,
                 key_profile: Some(exported_key_profile(*key_profile)),
                 algorithm: Some(exported_algorithm(*algorithm)),
                 digest: digest.clone(),
@@ -214,12 +223,14 @@ impl From<&CardOperation> for RappOperationDescriptor {
             },
             CardOperation::SignDocument {
                 document_name,
+                contained_files,
                 key_profile,
                 algorithm,
                 digest,
             } => Self {
                 kind: RappOperationKind::SignDocument,
                 display_context: Some(document_name.clone()),
+                contained_files: contained_files.as_ref().map(|files| files.names().to_vec()),
                 key_profile: Some(exported_key_profile(*key_profile)),
                 algorithm: Some(exported_algorithm(*algorithm)),
                 digest: digest.clone(),
@@ -234,6 +245,7 @@ impl From<&CardOperation> for RappOperationDescriptor {
             } => Self {
                 kind: RappOperationKind::BatchSignDocuments,
                 display_context: None,
+                contained_files: None,
                 key_profile: Some(exported_key_profile(*key_profile)),
                 algorithm: Some(exported_algorithm(*algorithm)),
                 digest: Vec::new(),
@@ -244,7 +256,7 @@ impl From<&CardOperation> for RappOperationDescriptor {
     }
 }
 
-/// Progress events exposed to platform callers (RAPP v26.10.29 section 8.2).
+/// Progress events exposed to platform callers (RAPP v26.11.1 section 8.2).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum RappProgressEvent {
     /// Another session's operation holds the card.
@@ -280,7 +292,7 @@ impl From<super::ProgressEvent> for RappProgressEvent {
 }
 
 /// Whether a contact card reader is connected to the custodian (RAPP
-/// v26.10.29 section 8.4 item 1).
+/// v26.11.1 section 8.4 item 1).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum RappCardReader {
     /// A contact card reader is connected: built in, or attached to a port.
@@ -857,11 +869,14 @@ impl RappOperationBridge {
         )
     }
 
-    /// Begin a document signature over a document digest.
+    /// Begin a document signature over a document digest. A package names
+    /// the files it holds in `contained_files`, in container order; a
+    /// single document passes `None` (section 9.3).
     ///
     /// # Errors
-    /// [`RappBindingError`] on invalid input, an ungranted profile, or the
-    /// wrong protocol phase.
+    /// [`RappBindingError`] on invalid input, including a package whose
+    /// request does not fit one frame, an ungranted profile, or the wrong
+    /// protocol phase.
     #[allow(
         clippy::too_many_arguments,
         reason = "the closed action schema fixes every request field"
@@ -870,18 +885,24 @@ impl RappOperationBridge {
         &self,
         operation_id: Vec<u8>,
         document_name: String,
+        contained_files: Option<Vec<String>>,
         key_profile: RappCardKeyProfile,
         algorithm: RappSignatureAlgorithm,
         digest: Vec<u8>,
         local_start_ms: u64,
         expires_after_ms: u64,
     ) -> Result<RappBridgeAction, RappBindingError> {
+        let contained_files = contained_files
+            .map(ContainedFiles::reconstruct)
+            .transpose()
+            .map_err(|_| RappBindingError::InvalidInput)?;
         self.begin_operation(
             &operation_id,
             local_start_ms,
             expires_after_ms,
             CardOperation::SignDocument {
                 document_name,
+                contained_files,
                 key_profile: key_profile.into(),
                 algorithm: algorithm.into(),
                 digest,

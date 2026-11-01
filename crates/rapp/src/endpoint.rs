@@ -1,5 +1,5 @@
 //! Established-session endpoint: failures close the session and never the
-//! pairing (RAPP v26.10.29 section 10.1).
+//! pairing (RAPP v26.11.1 section 10.1).
 
 use super::{
     BinaryFrame, CloseReason, CryptoError, MessageError, MessageType, OpenError, PairId,

@@ -96,8 +96,9 @@ pub use offer::{
 };
 pub use operation::{
     CardIdentity, CardInspection, CardKeyProfile, CardOperation, CardOperationError,
-    CardOperationResult, CertificateKind, CredentialKind, DEFAULT_OPERATION_LIFETIME_MS,
-    OperationRequest, OperationRequestRefusal, RequestError, SignatureAlgorithm,
+    CardOperationResult, CertificateKind, ContainedFiles, CredentialKind,
+    DEFAULT_OPERATION_LIFETIME_MS, OperationRequest, OperationRequestRefusal, RequestError,
+    SignatureAlgorithm,
 };
 pub use pair_keys::{DegenerateAgreement, PAIR_KEY_SIZE};
 pub(crate) use pair_keys::{derive_pair_key, mac as pair_key_mac};
@@ -153,7 +154,7 @@ pub use types::{
     MAX_FRAME_SIZE, MINIMUM_REMAINING_ATTEMPTS, NOISE_TAG_SIZE, OFFER_ID_SIZE, OFFER_TTL_MS,
     OPERATION_ID_SIZE, OfferId, OperationId, PAIR_ID_SIZE, PAIRING_SECRET_SIZE, PairId,
     PairingSecret, ProfileName, QUIT_WITHDRAWAL_BOUND_MS, SESSION_ID_SIZE,
-    SESSION_READY_NONCE_SIZE, SessionId, WIRE_VERSION_V26_10_29, X25519_KEY_SIZE,
+    SESSION_READY_NONCE_SIZE, SessionId, WIRE_VERSION_V26_11_1, X25519_KEY_SIZE,
 };
 pub use wire::{
     Envelope, MessageType, SequenceGuard, WireError, WireValue, decode_deterministic_cbor,

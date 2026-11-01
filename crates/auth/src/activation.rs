@@ -91,11 +91,11 @@ const ACTIVATION_CODE_PUK_DIGIT_COUNT: usize = 8;
 /// How a card is activated, decided by its issuance generation (FINEID S4-1 section 4.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivationScheme {
-    /// Section 4.6.1, issued before 13 January 2026: RSA citizen certificates,
-    /// PINs ship blocked, the activation code is the 8-digit PUK.
+    /// Section 4.6.1, issued before 13 January 2026: PINs ship blocked,
+    /// the activation code is the 8-digit PUK.
     ActivationCodeIsPuk,
-    /// Section 4.6.2, issued from 13 January 2026: ECC citizen certificates,
-    /// PINs ship set to the single-use 7-digit activation PIN.
+    /// Section 4.6.2, issued from 13 January 2026: PINs ship set to the
+    /// single-use 7-digit activation PIN.
     PresetActivationPin,
 }
 
@@ -126,10 +126,45 @@ impl ActivationScheme {
 pub enum PinChangeRecord {
     /// Changed at least once since manufacture.
     Changed,
-    /// Never changed: factory state under the preset-PIN scheme.
+    /// Never changed: the factory state under either scheme.
     Unchanged,
     /// Absent or carrying an unrecognised flag value.
     Unreadable,
+}
+
+/// Whether one PIN still awaits factory activation (FINEID S4-1 section 4.6).
+///
+/// The PIN changed flag is the authority under both schemes: activation
+/// sets it for each PIN, so `Unchanged` is the factory state and
+/// `Changed` means the holder has set the PIN at least once. Under
+/// section 4.6.1 the factory PINs are blocked, and the card reports that
+/// either as a blocked method or as an exhausted counter; a blocked PIN
+/// whose flag says `Changed` was activated and then used up, and belongs
+/// to PUK recovery instead.
+///
+/// When the flag cannot be read, section 4.6.1 falls back to the
+/// counter: a blocked or exhausted PIN is served the activation, which
+/// is the same RESET RETRY COUNTER under the PUK that recovery sends.
+/// Section 4.6.2 then answers `false`, because presenting the
+/// activation PIN to a PIN the holder already set spends a retry.
+#[must_use]
+pub const fn pin_awaits_activation(
+    scheme: ActivationScheme,
+    record: PinChangeRecord,
+    status: PinStatus,
+) -> bool {
+    match record {
+        PinChangeRecord::Unchanged => true,
+        PinChangeRecord::Changed => false,
+        PinChangeRecord::Unreadable => match scheme {
+            ActivationScheme::PresetActivationPin => false,
+            ActivationScheme::ActivationCodeIsPuk => match status {
+                PinStatus::Locked => true,
+                PinStatus::Remaining(retries) => retries.is_exhausted(),
+                PinStatus::Verified | PinStatus::NoInfo | PinStatus::Other(_) => false,
+            },
+        },
+    }
 }
 
 /// Which citizen-card PINs still await factory activation.
@@ -324,12 +359,13 @@ mod tests {
         DVV_PRESET_PIN_CUTOVER_EPOCH_SECONDS, PIN_ATTRIBUTES_LEN, PIN_ATTRIBUTES_TAG_HIGH,
         PIN_ATTRIBUTES_TAG_LOW, PIN_CHANGED_FLAG_CHANGED, PIN_CHANGED_FLAG_UNCHANGED,
         PIN_CHANGED_LEN, PIN_CHANGED_TAG_HIGH, PIN_CHANGED_TAG_LOW, PinChangeRecord,
-        read_pin_change_record, read_puk_status_from_container,
+        pin_awaits_activation, read_pin_change_record, read_puk_status_from_container,
     };
     use crate::credentials::UnvalidatedSecret;
     use crate::verify::{AuthError, PinSlot, PinStatus};
     use refineid_apdu::{
-        CardTransport, CommandApdu, CredentialCommand, ResponseApdu, StatusWord, TransportOutcome,
+        CardTransport, CommandApdu, CredentialCommand, PinRetries, ResponseApdu, StatusWord,
+        TransportOutcome,
     };
 
     const CUTOVER_BEFORE: i64 = 1_700_000_000;
@@ -393,6 +429,104 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// Retry count of a credential nobody has tried yet.
+    const RETRIES_PRISTINE: u8 = 5;
+    /// Retry count of a credential with no tries left.
+    const RETRIES_EXHAUSTED: u8 = 0;
+
+    fn remaining(count: u8) -> PinStatus {
+        PinStatus::Remaining(PinRetries::from_nibble(count).expect("fits a nibble"))
+    }
+
+    fn pristine() -> PinStatus {
+        remaining(RETRIES_PRISTINE)
+    }
+
+    fn exhausted() -> PinStatus {
+        remaining(RETRIES_EXHAUSTED)
+    }
+
+    /// A factory-fresh section 4.6.1 card can answer its blocked PINs
+    /// with an exhausted counter rather than a blocked method; the
+    /// unchanged flag is what marks it as awaiting activation.
+    #[test]
+    fn unchanged_flag_awaits_activation_whatever_the_counter() {
+        for scheme in [
+            ActivationScheme::ActivationCodeIsPuk,
+            ActivationScheme::PresetActivationPin,
+        ] {
+            for status in [
+                exhausted(),
+                pristine(),
+                PinStatus::Locked,
+                PinStatus::NoInfo,
+            ] {
+                assert!(pin_awaits_activation(
+                    scheme,
+                    PinChangeRecord::Unchanged,
+                    status
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn changed_flag_never_awaits_activation() {
+        for scheme in [
+            ActivationScheme::ActivationCodeIsPuk,
+            ActivationScheme::PresetActivationPin,
+        ] {
+            for status in [
+                exhausted(),
+                pristine(),
+                PinStatus::Locked,
+                PinStatus::Verified,
+            ] {
+                assert!(!pin_awaits_activation(
+                    scheme,
+                    PinChangeRecord::Changed,
+                    status
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn unreadable_flag_falls_back_to_a_blocked_counter_under_the_puk_scheme() {
+        let scheme = ActivationScheme::ActivationCodeIsPuk;
+        let unreadable = PinChangeRecord::Unreadable;
+        assert!(pin_awaits_activation(scheme, unreadable, PinStatus::Locked));
+        assert!(pin_awaits_activation(scheme, unreadable, exhausted()));
+        assert!(!pin_awaits_activation(scheme, unreadable, pristine()));
+        assert!(!pin_awaits_activation(
+            scheme,
+            unreadable,
+            PinStatus::Verified
+        ));
+        assert!(!pin_awaits_activation(
+            scheme,
+            unreadable,
+            PinStatus::NoInfo
+        ));
+    }
+
+    #[test]
+    fn unreadable_flag_never_awaits_activation_under_the_preset_scheme() {
+        let scheme = ActivationScheme::PresetActivationPin;
+        for status in [
+            exhausted(),
+            pristine(),
+            PinStatus::Locked,
+            PinStatus::NoInfo,
+        ] {
+            assert!(!pin_awaits_activation(
+                scheme,
+                PinChangeRecord::Unreadable,
+                status
+            ));
+        }
     }
 
     #[test]

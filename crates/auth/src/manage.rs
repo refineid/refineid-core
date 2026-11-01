@@ -382,13 +382,12 @@ pub trait PinManageOps: PinOps {
         crate::activation::read_pin_change_record(self, slot)
     }
 
-    /// Report factory activation needs under `scheme`.
+    /// Report factory activation needs under `scheme`, one PIN at a time
+    /// (FINEID S4-1 v4.2 section 4.6; see
+    /// [`crate::activation::pin_awaits_activation`]).
     ///
-    /// Under FINEID S4-1 v4.2 section 4.6.1 (cards issued before 13 January 2026),
-    /// cards ship with PINs blocked (`PinStatus::Locked`), activated by unblocking
-    /// with the PUK. Under section 4.6.2 (cards issued from 13 January 2026),
-    /// cards ship with preset activation PINs and their factory status is identified
-    /// by the unchanged flag (`PinChangeRecord::Unchanged`) in the PIN container.
+    /// Reads each PIN's changed flag and retry status; both reads leave
+    /// every counter untouched.
     ///
     /// # Errors
     ///
@@ -400,27 +399,15 @@ pub trait PinManageOps: PinOps {
     where
         Self: Sized,
     {
-        let pin1 = match scheme {
-            crate::activation::ActivationScheme::PresetActivationPin => {
-                let record = self.read_pin_change_record(PinSlot::Pin1)?;
-                matches!(record, crate::activation::PinChangeRecord::Unchanged)
-            }
-            crate::activation::ActivationScheme::ActivationCodeIsPuk => {
-                let status = self.pin_status(PinSlot::Pin1)?;
-                matches!(status, PinStatus::Locked)
-            }
+        let mut awaits = |slot: PinSlot| -> Result<bool, AuthError<Self::Error>> {
+            let record = self.read_pin_change_record(slot)?;
+            let status = self.pin_status(slot)?;
+            Ok(crate::activation::pin_awaits_activation(
+                scheme, record, status,
+            ))
         };
-
-        let pin2 = match scheme {
-            crate::activation::ActivationScheme::PresetActivationPin => {
-                let record = self.read_pin_change_record(PinSlot::Pin2)?;
-                matches!(record, crate::activation::PinChangeRecord::Unchanged)
-            }
-            crate::activation::ActivationScheme::ActivationCodeIsPuk => {
-                let status = self.pin_status(PinSlot::Pin2)?;
-                matches!(status, PinStatus::Locked)
-            }
-        };
+        let pin1 = awaits(PinSlot::Pin1)?;
+        let pin2 = awaits(PinSlot::Pin2)?;
 
         Ok(crate::activation::CardActivationNeeds { pin1, pin2 })
     }

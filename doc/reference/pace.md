@@ -69,6 +69,21 @@ ASCII digits, which are their own ISO/IEC 8859-1 octets, so both are
 encoded as the digits as they stand. A PIN's key is derived in
 `refineid-auth`, which owns the digits; the handshake receives the key.
 
+## The channel knows its password
+
+`run_pace` returns a `PaceSession<O>`, and `SmTransport<T, O>` keeps
+`O`, the proof of the password that opened the session: `OpenedByCan`,
+`OpenedByPin1` or `OpenedByPin2`. Only the handshake mints one, and the
+session is not clonable, so the proof cannot be copied or relabelled.
+The organization card counts the PACE password verified on the channel
+(FINEID S4-2 v4.0 §6), observed on hardware for both PINs. A channel PIN
+2 opened therefore reaches the qualified-signature key without a VERIFY
+(`refineid-sign`, `qualified_key_after_pin2_pace`). Its proof carries
+one PIN 2 presentation, spent by the one qualified key it unlocks and
+kept spent across `into_parts` and `SmTransport::new`: PIN 2 is entered
+for every signature (FINEID S4-1 v4.2 §4.1, §8.1.7), so a second
+signature on the channel takes a VERIFY.
+
 ## A PIN password and the retry floor
 
 A failed PACE with a PIN spends one of the PIN's tries. The organization

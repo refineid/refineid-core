@@ -24,8 +24,7 @@ use refineid_apdu::{
 };
 use refineid_ber::{BerEncoder, BerTag, Integer, Oid, Sequence, Set};
 use refineid_pace::{
-    Can, CardAccess, PaceDomain, PaceError, PaceMapping, PacePassword, UnvalidatedCan,
-    read_card_access, run_pace,
+    Can, CardAccess, PaceDomain, PaceError, PaceMapping, UnvalidatedCan, read_card_access, run_pace,
 };
 
 /// A valid six-digit Card Access Number fixture.
@@ -143,8 +142,7 @@ fn card_access_reads_and_names_the_generic_suite() {
 fn opening_status_word_failure_names_the_stage() {
     let (mut card, card_access) = scripted(status_response(StatusWord::SecurityNotSatisfied));
     let can = fixture_can();
-    let error = run_pace(&mut card, &card_access, PacePassword::Can(&can))
-        .expect_err("a rejected opening fails");
+    let error = run_pace(&mut card, &card_access, &can).expect_err("a rejected opening fails");
     assert!(card.saw_mse, "the opening MSE:Set AT must be issued");
     assert!(matches!(
         error,
@@ -156,8 +154,7 @@ fn opening_status_word_failure_names_the_stage() {
 fn transport_state_transition_surfaces_as_an_outcome() {
     let (mut card, card_access) = scripted(TransportOutcome::NoCard);
     let can = fixture_can();
-    let error =
-        run_pace(&mut card, &card_access, PacePassword::Can(&can)).expect_err("a lost card fails");
+    let error = run_pace(&mut card, &card_access, &can).expect_err("a lost card fails");
     assert!(matches!(
         error,
         PaceError::Outcome(TransportOutcome::NoCard)

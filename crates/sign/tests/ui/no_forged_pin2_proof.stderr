@@ -1,0 +1,5 @@
+error[E0451]: field `unspent` of struct `OpenedByPin2` is private
+ --> tests/ui/no_forged_pin2_proof.rs:4:20
+  |
+4 |     OpenedByPin2 { unspent: true }
+  |                    ^^^^^^^ private field

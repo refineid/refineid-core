@@ -63,31 +63,31 @@ use crate::rng;
 
 /// Dynamic-authentication-data template tag, wrapping every round's
 /// payload (BSI TR-03110-3 section A.5).
-struct DynamicAuthData;
+pub(crate) struct DynamicAuthData;
 impl BerTag for DynamicAuthData {
     const TAG: u16 = 0x7C;
 }
 
 /// The card's encrypted-nonce response payload.
-struct EncryptedNonce;
+pub(crate) struct EncryptedNonce;
 impl BerTag for EncryptedNonce {
     const TAG: u16 = 0x80;
 }
 
 /// The card's mapping-data response.
-struct MappingDataOut;
+pub(crate) struct MappingDataOut;
 impl BerTag for MappingDataOut {
     const TAG: u16 = 0x82;
 }
 
 /// The card's key-agreement response.
-struct KeyAgreeOut;
+pub(crate) struct KeyAgreeOut;
 impl BerTag for KeyAgreeOut {
     const TAG: u16 = 0x84;
 }
 
 /// The card's authentication-token response.
-struct AuthTokenOut;
+pub(crate) struct AuthTokenOut;
 impl BerTag for AuthTokenOut {
     const TAG: u16 = 0x86;
 }
@@ -108,7 +108,7 @@ const SW_PASSWORD_DEACTIVATED: u16 = 0x6283;
 
 /// All-zero initialisation vector for the encrypted-nonce decryption
 /// (BSI TR-03110-3 section A.5.1.2).
-const BSI_TR03110_ZERO_IV: [u8; AES_BLOCK] = [0_u8; AES_BLOCK];
+pub(crate) const BSI_TR03110_ZERO_IV: [u8; AES_BLOCK] = [0_u8; AES_BLOCK];
 
 /// The longest encrypted nonce accepted. The chip chooses the nonce
 /// length as a multiple of the block size (ICAO Doc 9303 Part 11 section
@@ -130,14 +130,14 @@ pub(crate) const TAG_MSE_PASSWORD: u8 = 0x83;
 /// Domain-reference object tag inside `MSE:Set AT`.
 pub(crate) const TAG_MSE_DOMAIN: u8 = 0x84;
 /// The dynamic-authentication-data envelope tag as a one-byte value.
-const TAG_DYNAMIC_AUTH: u8 = 0x7C;
+pub(crate) const TAG_DYNAMIC_AUTH: u8 = 0x7C;
 /// Map-nonce request object tag: the terminal's ephemeral public key.
-const TAG_MAP_PCD_PUBLIC: u8 = 0x81;
+pub(crate) const TAG_MAP_PCD_PUBLIC: u8 = 0x81;
 /// Key-agreement request object tag: the terminal's ephemeral public
 /// key.
-const TAG_KEY_AGREE_PCD_PUBLIC: u8 = 0x83;
+pub(crate) const TAG_KEY_AGREE_PCD_PUBLIC: u8 = 0x83;
 /// Mutual-authentication request object tag: the terminal's token.
-const TAG_AUTH_TOKEN_PCD: u8 = 0x85;
+pub(crate) const TAG_AUTH_TOKEN_PCD: u8 = 0x85;
 /// Public-key data template tag (BSI TR-03110-3 section B.7).
 const TAG_PUBLIC_KEY_TEMPLATE: u16 = 0x7F49;
 /// ASN.1 universal object-identifier tag.
@@ -145,22 +145,139 @@ const TAG_ASN1_OID: u8 = 0x06;
 /// EC-point object tag inside the public-key template.
 const TAG_PUBLIC_KEY_POINT: u8 = 0x86;
 
-/// The password a PACE handshake authenticates the channel with.
+/// A password a PACE handshake authenticates the channel with: the
+/// [`Can`], or a [`Pin1`] or [`Pin2`] of an organizational card.
 ///
-/// Borrowed: PACE never sends the password, it derives the nonce key
-/// from it, and the holder keeps custody -- an organizational card's PIN
-/// is still needed for the VERIFY that follows on the channel.
-#[derive(Debug)]
-pub enum PacePassword<'a> {
-    /// The Card Access Number printed on a citizen card.
-    Can(&'a Can),
-    /// PIN 1 of an organizational card.
-    Pin1(&'a Pin1),
-    /// PIN 2 of an organizational card.
-    Pin2(&'a Pin2),
+/// Sealed: exactly these three implement it. Each names the
+/// [`PacePassword::OpenedBy`] proof the session it opens carries, so the
+/// password that authenticated a channel is part of the channel's type.
+/// The handshake borrows the password -- PACE never sends it, it derives
+/// the nonce key from it -- and the holder keeps custody.
+pub trait PacePassword: sealed::Sealed {
+    /// What the opened session carries as the proof of its password.
+    type OpenedBy;
 }
 
-impl PacePassword<'_> {
+/// The seal and the crate-private view of a password.
+pub(crate) mod sealed {
+    use super::{Can, Pin1, Pin2};
+
+    /// Implemented only here, for the three PACE passwords.
+    pub trait Sealed {
+        /// The password as the handshake drives it.
+        fn password(&self) -> Password<'_>;
+
+        /// The proof a session this password opened carries.
+        fn opened_by(&self) -> <Self as super::PacePassword>::OpenedBy
+        where
+            Self: super::PacePassword;
+    }
+
+    /// The password as the handshake drives it.
+    #[derive(Debug)]
+    pub enum Password<'a> {
+        /// The Card Access Number printed on a citizen card.
+        Can(&'a Can),
+        /// PIN 1 of an organizational card.
+        Pin1(&'a Pin1),
+        /// PIN 2 of an organizational card.
+        Pin2(&'a Pin2),
+    }
+}
+
+use sealed::Password;
+
+/// Proof that the Card Access Number opened a PACE session. It proves
+/// no cardholder verification.
+#[derive(Debug)]
+pub struct OpenedByCan(pub(crate) ());
+
+/// Proof that PIN 1 opened a PACE session: the organizational card
+/// counts PIN 1 verified in that session (FINEID S4-2 v4.0 section 6).
+#[derive(Debug)]
+pub struct OpenedByPin1(pub(crate) ());
+
+/// Proof that PIN 2 opened a PACE session: the organizational card
+/// counts PIN 2 verified in that session (FINEID S4-2 v4.0 section 6),
+/// so the qualified-signature key signs over the channel without a
+/// VERIFY.
+///
+/// The proof carries the one PIN 2 presentation the handshake made.
+/// It is spent once, by the qualified key it unlocks: PIN 2 is entered
+/// for every signature (FINEID S4-1 v4.2 sections 4.1 and 8.1.7), so a
+/// second signature on the same channel takes a fresh VERIFY.
+#[derive(Debug)]
+pub struct OpenedByPin2 {
+    unspent: bool,
+}
+
+/// The PIN 2 presentation of a PACE session was already spent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pin2PresentationSpent;
+
+impl core::fmt::Display for Pin2PresentationSpent {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("PACE: the PIN 2 presentation of this session is spent")
+    }
+}
+
+impl core::error::Error for Pin2PresentationSpent {}
+
+impl OpenedByPin2 {
+    /// Spend the session's PIN 2 presentation.
+    pub(crate) const fn spend(&mut self) -> Result<(), Pin2PresentationSpent> {
+        if self.unspent {
+            self.unspent = false;
+            Ok(())
+        } else {
+            Err(Pin2PresentationSpent)
+        }
+    }
+}
+
+impl PacePassword for Can {
+    type OpenedBy = OpenedByCan;
+}
+
+impl PacePassword for Pin1 {
+    type OpenedBy = OpenedByPin1;
+}
+
+impl PacePassword for Pin2 {
+    type OpenedBy = OpenedByPin2;
+}
+
+impl sealed::Sealed for Can {
+    fn password(&self) -> Password<'_> {
+        Password::Can(self)
+    }
+
+    fn opened_by(&self) -> OpenedByCan {
+        OpenedByCan(())
+    }
+}
+
+impl sealed::Sealed for Pin1 {
+    fn password(&self) -> Password<'_> {
+        Password::Pin1(self)
+    }
+
+    fn opened_by(&self) -> OpenedByPin1 {
+        OpenedByPin1(())
+    }
+}
+
+impl sealed::Sealed for Pin2 {
+    fn password(&self) -> Password<'_> {
+        Password::Pin2(self)
+    }
+
+    fn opened_by(&self) -> OpenedByPin2 {
+        OpenedByPin2 { unspent: true }
+    }
+}
+
+impl Password<'_> {
     /// The `MSE:Set AT` password reference. The organizational card
     /// enables PACE under the security-data-object identifier of the PIN
     /// (FINEID S4-2 v4.0 section 6), the PIN AUTH and PIN SIG
@@ -215,13 +332,8 @@ impl PasswordKey {
 }
 
 /// The two session keys and the send sequence counter a completed PACE
-/// handshake produces.
-///
-/// Not clonable: one PACE run establishes one channel, and duplicating the
-/// keys would let two channels share a send sequence counter -- a repeated
-/// CBC IV and CMAC input. The fields are crate-private; the only sink is
-/// [`crate::SmTransport::new`], which consumes the session.
-pub struct PaceSession {
+/// handshake derives.
+pub(crate) struct SessionKeys {
     /// The AES-256 secure-messaging encryption key.
     pub(crate) k_enc: Aes256Key,
     /// The AES-256 secure-messaging message-authentication key.
@@ -230,7 +342,29 @@ pub struct PaceSession {
     pub(crate) ssc: Ssc,
 }
 
-impl core::fmt::Debug for PaceSession {
+impl core::fmt::Debug for SessionKeys {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("SessionKeys([redacted])")
+    }
+}
+
+/// A completed PACE session: its keys and send sequence counter, and the
+/// proof `O` of the password that opened it ([`OpenedByCan`],
+/// [`OpenedByPin1`] or [`OpenedByPin2`]).
+///
+/// Not clonable: one PACE run establishes one channel, and duplicating the
+/// keys would let two channels share a send sequence counter -- a repeated
+/// CBC IV and CMAC input -- and would duplicate a PIN 2 presentation. The
+/// fields are crate-private; only [`run_pace`] creates a session, and the
+/// only sink is [`crate::SmTransport::new`], which consumes it.
+pub struct PaceSession<O> {
+    /// The session keys and counter.
+    pub(crate) keys: SessionKeys,
+    /// The proof of the password that opened the session.
+    pub(crate) opened_by: O,
+}
+
+impl<O> core::fmt::Debug for PaceSession<O> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("PaceSession([redacted])")
     }
@@ -402,7 +536,9 @@ pub(crate) type ScalarSource<'a> = &'a mut dyn FnMut(&mut [u8]) -> Result<(), rn
 /// refuses the opening command from an application context, so select
 /// the master file first when the prior state is unknown. On success,
 /// wrap the same transport in the secure-messaging layer and run the
-/// protected command chain through it.
+/// protected command chain through it. The session's type names the
+/// password that opened it: a session PIN 2 opened is a
+/// `PaceSession<OpenedByPin2>`, which no other password produces.
 ///
 /// A wrong Card Access Number spends no counter and surfaces as a
 /// status-word or token-mismatch failure. A PIN password is checked
@@ -416,21 +552,25 @@ pub(crate) type ScalarSource<'a> = &'a mut dyn FnMut(&mut [u8]) -> Result<(), rn
 /// Any EF.CardAccess, retry-floor, transport, BER, status-word,
 /// off-curve-point, or token-mismatch failure encountered during the
 /// handshake; see [`PaceError`].
-pub fn run_pace<T: CardTransport>(
+pub fn run_pace<T: CardTransport, P: PacePassword>(
     transport: &mut T,
     card_access: &CardAccess,
-    password: PacePassword<'_>,
-) -> Result<PaceSession, PaceError<T::Error>> {
-    run_pace_drawing(transport, card_access, &password, &mut rng::fill)
+    password: &P,
+) -> Result<PaceSession<P::OpenedBy>, PaceError<T::Error>> {
+    let keys = run_pace_drawing(transport, card_access, &password.password(), &mut rng::fill)?;
+    Ok(PaceSession {
+        keys,
+        opened_by: password.opened_by(),
+    })
 }
 
 /// [`run_pace`] with the terminal's scalars drawn from `draw`.
 pub(crate) fn run_pace_drawing<T: CardTransport>(
     transport: &mut T,
     card_access: &CardAccess,
-    password: &PacePassword<'_>,
+    password: &Password<'_>,
     draw: ScalarSource<'_>,
-) -> Result<PaceSession, PaceError<T::Error>> {
+) -> Result<SessionKeys, PaceError<T::Error>> {
     let suite = card_access
         .generic_mapping_suite()
         .ok_or(PaceError::NoSupportedSuite)?;
@@ -447,9 +587,9 @@ pub(crate) fn run_pace_drawing<T: CardTransport>(
 fn handshake<C: PaceCurve, T: CardTransport>(
     transport: &mut T,
     suite: PaceInfo,
-    password: &PacePassword<'_>,
+    password: &Password<'_>,
     draw: ScalarSource<'_>,
-) -> Result<PaceSession, PaceError<T::Error>> {
+) -> Result<SessionKeys, PaceError<T::Error>> {
     set_authentication_template(transport, suite, password)?;
     // The mapping nonce lives in a scrubbed buffer for its whole lifetime.
     let nonce = get_encrypted_nonce(transport, password)?;
@@ -474,7 +614,7 @@ fn transmit<T: CardTransport>(
 /// section B.14.2).
 fn exchange_round<T: CardTransport>(
     transport: &mut T,
-    password: &PacePassword<'_>,
+    password: &Password<'_>,
     command: &refineid_apdu::CommandApdu,
     stage: &'static str,
 ) -> Result<ResponseApdu, PaceError<T::Error>> {
@@ -496,7 +636,7 @@ fn exchange_round<T: CardTransport>(
 fn set_authentication_template<T: CardTransport>(
     transport: &mut T,
     suite: PaceInfo,
-    password: &PacePassword<'_>,
+    password: &Password<'_>,
 ) -> Result<(), PaceError<T::Error>> {
     let mechanism = suite.protocol_oid();
     let mut encoder = refineid_ber::BerEncoder::with_capacity(mechanism.len());
@@ -533,7 +673,7 @@ fn set_authentication_template<T: CardTransport>(
 /// 4.4.3.3).
 fn get_encrypted_nonce<T: CardTransport>(
     transport: &mut T,
-    password: &PacePassword<'_>,
+    password: &Password<'_>,
 ) -> Result<Zeroizing<Vec<u8>>, PaceError<T::Error>> {
     let request = refineid_ber::tlv(TAG_DYNAMIC_AUTH, [])?;
     let command = GeneralAuthenticate {
@@ -575,7 +715,7 @@ fn get_encrypted_nonce<T: CardTransport>(
 /// run the ephemeral ECDH on it.
 fn map_nonce_and_key_agreement<C: PaceCurve, T: CardTransport>(
     transport: &mut T,
-    password: &PacePassword<'_>,
+    password: &Password<'_>,
     nonce: &[u8],
     draw: ScalarSource<'_>,
 ) -> Result<PaceMidwayState<C>, PaceError<T::Error>> {
@@ -638,9 +778,9 @@ fn map_nonce_and_key_agreement<C: PaceCurve, T: CardTransport>(
 pub(crate) fn run_mutual_authentication<C: PaceCurve, T: CardTransport>(
     transport: &mut T,
     suite: PaceInfo,
-    password: &PacePassword<'_>,
+    password: &Password<'_>,
     state: PaceMidwayState<C>,
-) -> Result<PaceSession, PaceError<T::Error>> {
+) -> Result<SessionKeys, PaceError<T::Error>> {
     let shared = Zeroizing::new(state.v_picc.scalar_mul(&state.u_pcd));
     let shared_x_bytes = shared.x_coordinate().ok_or(PaceError::InvalidPoint)?;
 
@@ -675,7 +815,7 @@ pub(crate) fn run_mutual_authentication<C: PaceCurve, T: CardTransport>(
         return Err(PaceError::AuthMismatch);
     }
 
-    Ok(PaceSession {
+    Ok(SessionKeys {
         k_enc,
         k_mac,
         ssc: Ssc::INITIAL,
@@ -685,7 +825,10 @@ pub(crate) fn run_mutual_authentication<C: PaceCurve, T: CardTransport>(
 /// Build the authentication-token message-authentication input over a
 /// public point with the suite's protocol identifier (BSI TR-03110-3
 /// section A.2.4). `None` for the point at infinity, a degenerate input.
-fn encode_auth_token<C: PaceCurve>(suite: PaceInfo, point: &Point<C>) -> Option<Vec<u8>> {
+pub(crate) fn encode_auth_token<C: PaceCurve>(
+    suite: PaceInfo,
+    point: &Point<C>,
+) -> Option<Vec<u8>> {
     let mechanism = suite.protocol_oid();
     let point_bytes = point.encode_uncompressed()?;
     let mut inner = refineid_ber::BerEncoder::with_capacity(mechanism.len());
@@ -735,7 +878,7 @@ fn random_scalar_mod_n<C: PaceCurve, E>(
 /// the order maps the same as its reduction. The reduction is Horner's
 /// rule in the library's scalar field, one octet at a time. The scalar
 /// is the password-protected mapping secret, so it is a scrubbed owner.
-fn scalar_from_nonce<C: PaceCurve>(nonce: &[u8]) -> Zeroizing<Scalar<C>> {
+pub(crate) fn scalar_from_nonce<C: PaceCurve>(nonce: &[u8]) -> Zeroizing<Scalar<C>> {
     let radix = Scalar::<C>::from(OCTET_RADIX);
     let mut scalar = Zeroizing::new(Scalar::<C>::ZERO);
     for &octet in nonce {
@@ -750,7 +893,7 @@ fn scalar_from_nonce<C: PaceCurve>(nonce: &[u8]) -> Zeroizing<Scalar<C>> {
 mod tests {
     use super::{
         AUTH_TOKEN_LEN, BSI_TR03110_ZERO_IV, DynamicAuthData, KdfParam, NonZeroScalar,
-        PASSWORD_REF_CAN, PaceError, PaceMidwayState, PacePassword, Point, SW_PASSWORD_DEACTIVATED,
+        PASSWORD_REF_CAN, PaceError, PaceMidwayState, Password, Point, SW_PASSWORD_DEACTIVATED,
         Scalar, Ssc, TAG_AUTH_TOKEN_PCD, TAG_DYNAMIC_AUTH, TAG_MSE_DOMAIN, TAG_MSE_MECHANISM,
         TAG_MSE_PASSWORD, aes256_cmac_truncated, encode_auth_token, kdf_aes256,
         random_scalar_mod_n, reject_reflection, run_pace_drawing, scalar_from_nonce,
@@ -1176,8 +1319,8 @@ mod tests {
     fn run<C: PaceCurve>(
         card: &mut HonestCard<C>,
         card_access: &CardAccess,
-        password: &PacePassword<'_>,
-    ) -> Result<super::PaceSession, PaceError<String>> {
+        password: &Password<'_>,
+    ) -> Result<super::SessionKeys, PaceError<String>> {
         run_pace_drawing(card, card_access, password, &mut super::rng::fill)
     }
 
@@ -1195,7 +1338,7 @@ mod tests {
         let suite = generic(PaceDomain::BrainpoolP384r1, &card_access);
         let mut card = HonestCard::<bp384::BrainpoolP384r1>::new(suite, PASSWORD_REF_CAN);
         let can = can();
-        let session = run(&mut card, &card_access, &PacePassword::Can(&can)).expect("succeeds");
+        let session = run(&mut card, &card_access, &Password::Can(&can)).expect("succeeds");
         assert_eq!(card.exchanges, EXCHANGES_THROUGH_TOKENS);
         assert_eq!(session.ssc, Ssc::INITIAL);
         assert_eq!(
@@ -1210,11 +1353,32 @@ mod tests {
         let suite = generic(PaceDomain::NistP256, &card_access);
         let mut card = HonestCard::<p256::NistP256>::new(suite, pin2_ref());
         let pin = pin2();
-        let session = run(&mut card, &card_access, &PacePassword::Pin2(&pin)).expect("succeeds");
+        let session = run(&mut card, &card_access, &Password::Pin2(&pin)).expect("succeeds");
         assert_eq!(card.exchanges, EXCHANGES_THROUGH_TOKENS);
         assert_eq!(
             session.k_mac.as_bytes(),
             card.k_mac.expect("key agreement ran").as_bytes()
+        );
+    }
+
+    #[test]
+    fn a_pin2_session_carries_one_presentation_across_a_rebuild() {
+        let card_access = p256_only_access();
+        let suite = generic(PaceDomain::NistP256, &card_access);
+        let mut card = HonestCard::<p256::NistP256>::new(suite, pin2_ref());
+        let pin = pin2();
+        let session = super::run_pace(&mut card, &card_access, &pin).expect("succeeds");
+        let mut channel = crate::SmTransport::new(card, session);
+        assert_eq!(channel.spend_pin2_presentation(), Ok(()));
+        assert_eq!(
+            channel.spend_pin2_presentation(),
+            Err(super::Pin2PresentationSpent)
+        );
+        let (card, session) = channel.into_parts();
+        let mut channel = crate::SmTransport::new(card, session);
+        assert_eq!(
+            channel.spend_pin2_presentation(),
+            Err(super::Pin2PresentationSpent)
         );
     }
 
@@ -1233,7 +1397,7 @@ mod tests {
         let session = run_pace_drawing(
             &mut card,
             &card_access,
-            &PacePassword::Pin1(&pin),
+            &Password::Pin1(&pin),
             &mut |buffer| {
                 source.fill(buffer);
                 Ok(())
@@ -1325,7 +1489,7 @@ mod tests {
         let mut card = HonestCard::<p384::NistP384>::new(suite, pin1_ref());
         card.nonce_reply = Some(vec![u8::MAX; length]);
         let pin = pin1();
-        let result = run(&mut card, &card_access, &PacePassword::Pin1(&pin)).map(|_session| ());
+        let result = run(&mut card, &card_access, &Password::Pin1(&pin)).map(|_session| ());
         (card.exchanges, result)
     }
 
@@ -1393,9 +1557,9 @@ mod tests {
             let mut card = HonestCard::<p384::NistP384>::new(suite, password_ref);
             let (can, pin1, pin2) = (can(), pin1(), pin2());
             let password = match credential {
-                PasswordKind::Can => PacePassword::Can(&can),
-                PasswordKind::Pin1 => PacePassword::Pin1(&pin1),
-                PasswordKind::Pin2 => PacePassword::Pin2(&pin2),
+                PasswordKind::Can => Password::Can(&can),
+                PasswordKind::Pin1 => Password::Pin1(&pin1),
+                PasswordKind::Pin2 => Password::Pin2(&pin2),
             };
             run(&mut card, &card_access, &password).expect("succeeds");
             assert_eq!(
@@ -1428,7 +1592,7 @@ mod tests {
         let mut card = HonestCard::<p384::NistP384>::new(suite, pin1_ref());
         card.mse_status = status;
         let pin = pin1();
-        let result = run(&mut card, &card_access, &PacePassword::Pin1(&pin)).map(|_session| ());
+        let result = run(&mut card, &card_access, &Password::Pin1(&pin)).map(|_session| ());
         (card.exchanges, result)
     }
 
@@ -1505,7 +1669,7 @@ mod tests {
         let mut card = HonestCard::<bp384::BrainpoolP384r1>::new(suite, PASSWORD_REF_CAN);
         card.mse_status = counter(TRIES_BELOW_FLOOR);
         let can = can();
-        let result = run(&mut card, &card_access, &PacePassword::Can(&can));
+        let result = run(&mut card, &card_access, &Password::Can(&can));
         assert_eq!(card.exchanges, EXCHANGES_THROUGH_MSE);
         assert!(matches!(result, Err(PaceError::Status("MSE:Set AT", _))));
     }
@@ -1517,7 +1681,7 @@ mod tests {
         let mut card = HonestCard::<p384::NistP384>::new(suite, pin2_ref());
         card.token_status = counter(TRIES_AFTER_ONE_WRONG);
         let pin = pin2();
-        let result = run(&mut card, &card_access, &PacePassword::Pin2(&pin));
+        let result = run(&mut card, &card_access, &Password::Pin2(&pin));
         assert_eq!(card.exchanges, EXCHANGES_THROUGH_TOKENS);
         assert!(matches!(
             result,
@@ -1531,7 +1695,7 @@ mod tests {
         let suite = generic(PaceDomain::NistP384, &access(organizational_card_access()));
         let mut card = HonestCard::<p384::NistP384>::new(suite, pin1_ref());
         let pin = pin1();
-        let result = run(&mut card, &card_access, &PacePassword::Pin1(&pin));
+        let result = run(&mut card, &card_access, &Password::Pin1(&pin));
         assert_eq!(card.exchanges, 0);
         assert!(matches!(result, Err(PaceError::NoSupportedSuite)));
     }
@@ -1541,8 +1705,8 @@ mod tests {
         let can = can();
         let pin = pin1();
         assert_eq!(
-            PacePassword::Can(&can).key().as_bytes(),
-            PacePassword::Pin1(&pin).key().as_bytes()
+            Password::Can(&can).key().as_bytes(),
+            Password::Pin1(&pin).key().as_bytes()
         );
     }
 
@@ -1616,7 +1780,7 @@ mod tests {
         let result = run_pace_drawing(
             &mut peer,
             &access(citizen_card_access()),
-            &PacePassword::Can(&can),
+            &Password::Can(&can),
             &mut super::rng::fill,
         )
         .map(|_session| ());
@@ -1783,13 +1947,9 @@ mod tests {
         let (state, shared_x) = mutual_auth_state();
         let mut transport = mutual_auth_transport(suite, &state, &shared_x, None);
         let can = can();
-        let session = super::run_mutual_authentication(
-            &mut transport,
-            suite,
-            &PacePassword::Can(&can),
-            state,
-        )
-        .expect("round succeeds");
+        let session =
+            super::run_mutual_authentication(&mut transport, suite, &Password::Can(&can), state)
+                .expect("round succeeds");
         assert!(transport.called);
         assert_eq!(session.ssc, Ssc::INITIAL);
         assert_eq!(
@@ -1806,13 +1966,9 @@ mod tests {
         bad_token[0] = u8::MAX;
         let mut transport = mutual_auth_transport(suite, &state, &shared_x, Some(bad_token));
         let can = can();
-        let error = super::run_mutual_authentication(
-            &mut transport,
-            suite,
-            &PacePassword::Can(&can),
-            state,
-        )
-        .expect_err("a tampered token fails the check");
+        let error =
+            super::run_mutual_authentication(&mut transport, suite, &Password::Can(&can), state)
+                .expect_err("a tampered token fails the check");
         assert!(matches!(error, PaceError::AuthMismatch));
     }
 }

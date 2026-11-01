@@ -193,9 +193,12 @@ The seventh slice admits organizational card support across
   no PSO:HASH step -- the shape the organizational card requires and the
   citizen card refuses, which is why the resolved numbering picks the
   chain. The qualified key and PIN 2 are local to DF.ESIGN (FINEID S4-2
-  v4.0 section 4.2), so the qualified key exists only as the result of
-  `unlock_qualified_key`, which selects DF.ESIGN by name and verifies
-  PIN 2 there, and holds the transport until its one signature is made.
+  v4.0 section 4.2), so the qualified key exists only where PIN 2 was
+  presented for it, with DF.ESIGN current: `unlock_qualified_key`
+  selects DF.ESIGN by name and verifies PIN 2 there, and
+  `qualified_key_after_pin2_pace` (fifteenth slice) selects it on a
+  secure channel PIN 2 opened; either holds the transport until its one
+  signature is made.
 
 PSO:COMPUTE DIGITAL SIGNATURE runs under the digital-signature template
 for the authentication key as well as the qualified-signature key,
@@ -352,6 +355,18 @@ S1 v4.0, organizational cards, section 2.1) over NIST curves:
   6). A PIN's nonce key is derived in `refineid-auth`, which owns the
   digits, from the same character-string encoding as the CAN (BSI
   TR-03110-3 table 5);
+- the session `run_pace` returns carries, in its type, the proof of the
+  password that opened it -- `OpenedByCan`, `OpenedByPin1` or
+  `OpenedByPin2` -- and the secure-messaging transport keeps it, so a
+  channel's type says which credential the card counts verified on it.
+  The organizational card counts the PACE password verified (FINEID
+  S4-2 v4.0 section 6), so on a channel PIN 2 opened
+  `Pin2ChannelSignOps::qualified_key_after_pin2_pace` in `refineid-sign`
+  enters DF.ESIGN and hands back the qualified key without a VERIFY:
+  the PIN is not sent a second time. Only `SmTransport<_, OpenedByPin2>`
+  has the method, so a channel the CAN or PIN 1 opened does not compile
+  into it; the proof carries one PIN 2 presentation, spent by the one
+  key it unlocks, and a further signature on the channel takes a VERIFY;
 - with a PIN, `MSE:Set AT`'s answer is read as the PIN's tries left and
   `check_retry_floor` decides before the first `GENERAL AUTHENTICATE`; a
   counter answer to a later round is a typed wrong PIN;
@@ -439,6 +454,17 @@ there and the DF.ESIGN-local key reference, it produced an inline-digest
 RSASSA-PKCS1-v1_5 SHA-256 signature that verified against the qualified
 certificate. `unlock_qualified_key` composes exactly that sequence; the
 composition itself is covered by scripted-transport tests.
+
+On the same card, PACE with PIN 1 and with PIN 2 completed through
+`run_pace`, and each counted as that PIN verified: over the resulting
+secure channel the authentication key signed with no VERIFY, and on the
+PIN 2 channel, after SELECT MF and SELECT DF.ESIGN by name, the
+qualified key produced an inline-digest RSASSA-PKCS1-v1_5 signature
+with no VERIFY; both verified against the card's certificates. An empty
+VERIFY over secure messaging, the counter-safe probe, does not report
+the PACE-verified state on this card. `qualified_key_after_pin2_pace`
+composes that qualified sequence; the composition itself is covered by
+scripted tests over the real handshake and secure-messaging layer.
 
 ## Quarantined until redesigned
 

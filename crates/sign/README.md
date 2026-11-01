@@ -18,13 +18,19 @@ unchanged.
 A signature is made through a `SigningKey`, which borrows the transport
 exclusively and signs one digest. `SignOps::authentication_key` names the
 authentication key, whose PIN 1 the caller has verified.
-`SignOps::unlock_qualified_key` is the only way to the qualified key: it
-takes the `Pin2`, and on the organizational card -- whose qualified key
-and PIN 2 are local to DF.ESIGN (FINEID S4-2 v4.0 section 4.2) -- first
-selects DF.ESIGN by name from the MF, then verifies PIN 2 there; the
-citizen card is sent PIN 2 where the caller selected. While the key lives
-no other command can reach the card, so the MSE:SET and PSO:CDS run in
-the directory PIN 2 was verified in.
+There are two ways to the qualified key, both where PIN 2 was presented
+for it. `SignOps::unlock_qualified_key` takes the `Pin2`, and on the
+organizational card -- whose qualified key and PIN 2 are local to
+DF.ESIGN (FINEID S4-2 v4.0 section 4.2) -- first selects DF.ESIGN by name
+from the MF, then verifies PIN 2 there; the citizen card is sent PIN 2
+where the caller selected. `Pin2ChannelSignOps::qualified_key_after_pin2_pace`
+exists only on `SmTransport<_, OpenedByPin2>`, a secure channel PACE
+opened with PIN 2, which the card counts as PIN 2 verified (section 6):
+it selects DF.ESIGN the same way and sends no PIN, spending the
+channel's one PIN 2 presentation. A channel the CAN or PIN 1 opened has
+no such method. While the key lives no other command can reach the
+card, so the MSE:SET and PSO:CDS run in the directory PIN 2 was
+presented for.
 
 `SigningKey::sign_prehashed_sha256_rsa`, `sign_prehashed_sha384_rsa`, and
 `sign_prehashed_sha512_rsa` cover the RSA keys under RSASSA-PKCS1;

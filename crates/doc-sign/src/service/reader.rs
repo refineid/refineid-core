@@ -50,7 +50,7 @@ use refineid_cms::x509::{
     Certificate, EcCurve, MessageSignatureAlgorithm, OwnedCert, PublicKeyAlgorithm,
 };
 use refineid_digest::Sha384 as CoreSha384;
-use refineid_pace::{Can, PaceError, PacePassword, SmTransport, read_card_access, run_pace};
+use refineid_pace::{Can, PaceError, SmTransport, read_card_access, run_pace};
 use refineid_pcsc::{
     PcscCard, PcscError, PcscTransactionCard, ReaderAccessCap, ReaderBackend,
     ReaderBackendOps as _, ReaderFilter, ReaderPickError,
@@ -642,8 +642,8 @@ where
                 .map_err(|e| ReaderSignError::Pace(format!("SELECT MF before PACE: {e}")))?;
             // EF.CardAccess names the domain parameter PACE runs over.
             let card_access = read_card_access(&mut transport).map_err(|e| pace_err_to_kind(&e))?;
-            let session = run_pace(&mut transport, &card_access, PacePassword::Can(&can))
-                .map_err(|e| pace_err_to_kind(&e))?;
+            let session =
+                run_pace(&mut transport, &card_access, &can).map_err(|e| pace_err_to_kind(&e))?;
             drop(can);
             let mut sm = SmTransport::new(transport, session);
             sm.select_pkcs15_application()

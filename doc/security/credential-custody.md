@@ -48,7 +48,12 @@ only through that batch's signatures and destroyed at its end. It is never
 kept between operations.
 
 Each use is still reconstructed as `Pin2`, consumed by an at-most-once
-credential command, and zeroized on every success or error path. PIN2 must
+credential command, and zeroized on every success or error path. On an
+organizational card a use may instead be the PACE handshake that opens
+the secure channel with PIN 2: the handshake derives its nonce key from
+the PIN and never sends it, and the channel carries one PIN 2
+presentation that unlocks one qualified signature, so that signature
+sends no VERIFY. PIN2 must
 never be clonable, serializable, persisted, placed on a command line, stored
 in an environment variable, or rendered by `Debug`, tracing, panic, or error
 output.

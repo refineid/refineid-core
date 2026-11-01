@@ -59,6 +59,15 @@ jobs:
       - name: Test the RAPP bindings
         run: cargo test -p refineid-rapp --features bindings --locked
 
+      - name: Build the document-signing library without PC/SC
+        run: cargo build -p refineid-doc-sign --no-default-features --locked
+
+      - name: Lint the document-signing library without PC/SC
+        run: cargo clippy -p refineid-doc-sign --no-default-features --all-targets --locked -- -D warnings
+
+      - name: Test the document-signing library without PC/SC
+        run: cargo test -p refineid-doc-sign --no-default-features --locked
+
       - name: Build documentation without warnings
         env:
           RUSTDOCFLAGS: -D warnings
@@ -68,6 +77,11 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc -p refineid-rapp --features bindings --no-deps --locked
+
+      - name: Build the document-signing documentation without PC/SC
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc -p refineid-doc-sign --no-default-features --no-deps --locked
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21

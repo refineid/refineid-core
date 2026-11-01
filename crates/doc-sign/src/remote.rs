@@ -321,9 +321,8 @@ pub struct PhoneSignOptions {
     pub input: PathBuf,
     /// Where the signed document is written.
     pub output: SignOutput,
-    /// The format and level. [`DocumentRequest::expected_serial`] must
-    /// be `None`: the phone's card is bound by the certificate the
-    /// phone returns, which the batch is built on.
+    /// The format and level. The phone's card is bound by the
+    /// certificate the phone returns, which the batch is built on.
     pub document: DocumentRequest,
 }
 
@@ -455,11 +454,6 @@ pub fn sign_on_phone(
     for options in &documents {
         options.document.validate_signing_policy()?;
         ensure_visible_signature_format(&options.document)?;
-        if options.document.expected_serial.is_some() {
-            return Err(SignErrorKind::DisplayedCard(
-                "a phone's card is bound by its certificate, not by a displayed serial".to_owned(),
-            ));
-        }
     }
     let certificate = PhoneSignatureCertificate::from_phone(
         signer
@@ -671,7 +665,6 @@ mod tests {
             additional_inputs: Vec::new(),
             signing_time: signing_time(index),
             metadata: SignatureMetadata::default(),
-            expected_serial: None,
             archive: false,
             long_term: false,
             timestamp_authorities: Vec::new(),
@@ -1110,20 +1103,8 @@ mod tests {
     }
 
     #[test]
-    fn a_displayed_serial_and_an_empty_batch_are_refused() -> TestResult {
-        let dir = TempDir::new("phone-refused-requests")?;
-        let mut document = one(&dir, Format::Pades, "report.pdf", &minimal_pdf(), 0)?;
-        document.document.expected_serial = Some(crate::identity::TokenSerial::new(
-            "displayed-card".to_owned(),
-        ));
+    fn an_empty_batch_is_refused() -> TestResult {
         let mut phone = ScriptedPhone::p384(Answer::Sign);
-        check_true(
-            matches!(
-                sign_on_phone(&mut phone, vec![document]),
-                Err(SignErrorKind::DisplayedCard(_))
-            ),
-            "a displayed serial has no meaning for the phone's card",
-        )?;
         check_true(
             matches!(
                 sign_on_phone(&mut phone, Vec::new()),

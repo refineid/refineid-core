@@ -34,8 +34,14 @@ cargo clippy -p refineid-rapp -- -D warnings
 cargo clippy -p refineid-rapp --features bindings -- -D warnings
 cargo clippy -p refineid-rapp --features bindings --all-targets -- -D warnings
 cargo test -p refineid-rapp --features bindings
+# The document-signing library as a platform without PC/SC builds it:
+# the local-reader session off, the phone path and the shared finish on.
+cargo build -p refineid-doc-sign --no-default-features
+cargo clippy -p refineid-doc-sign --no-default-features --all-targets -- -D warnings
+cargo test -p refineid-doc-sign --no-default-features
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 RUSTDOCFLAGS="-D warnings" cargo doc -p refineid-rapp --features bindings --no-deps
+RUSTDOCFLAGS="-D warnings" cargo doc -p refineid-doc-sign --no-default-features --no-deps
 if command -v cargo-audit > /dev/null 2>&1; then
     cargo audit
 fi

@@ -102,15 +102,42 @@ Observed on an Idemia Cosmo X organization card (see
 
 ## PIN lengths
 
-Organization PINs follow the same bounds as citizen PINs: PIN 1 is 4–12
-digits and PIN 2 is 6–12. They are sent as the bare typed digits, with
-no padding. The Idemia Cosmo X organization card's EF.AOD lists PIN 1
-as 4–12 digits, where FINEID S4-2 v4.0 tables say 4–8, and DVV's
-organization card letter gives PIN 1 4–12 and PIN 2 6–12.
+The card is the authority on its PIN and PUK lengths. The `Pin1` and
+`Pin2` role types accept 4–12 digits and `Puk` 8–12: every length a
+FINEID card may list, up to the 12-digit stored length the commands
+carry. Signing and login do not read the card's lengths, so they send any
+4–12-digit PIN 1 or PIN 2 to the card, which decides. Organization PINs
+are sent as the bare typed digits, with no padding.
 
-The card's PKCS#15 EF.AOD (`4401`) gives each PIN's minimum and maximum
-length, and it remains the authority. The GET DATA PIN container also
-carries a PIN policy with the minimum and maximum length (each within
-4–64) and the try limit (FINEID S1 v4.2 §3.15.3). Reading them where
-PINs are set (activation, change, reset) is planned work; signing and
-login never need them.
+Where PINs are set -- activation, change and reset -- the card's lengths
+are read once per session with `PinManageOps::read_card_pin_lengths`:
+
+1. **EF.AOD** (`4401`, FINEID S4-1 v4.2 §8.1.5; FINEID S4-2 v4.0
+   §4.6.10, §4.7.10) is the authority. Each password object's
+   `pwdReference` is mapped to PIN 1, PIN 2 or the PUK under the card's
+   resolved numbering, with or without the local high bit; a reference
+   no numbering uses is not consulted, and a credential listed twice is
+   not listed. The range is `minLength` to `maxLength`, or to
+   `storedLength` when `maxLength` is absent.
+2. **The PIN policy** in the GET DATA PIN container (FINEID S1 v4.2
+   §3.15.3, minimum and maximum each within 4–64) is read only on a
+   citizen card, and only for a credential EF.AOD does not list. The
+   organization card answers `6A86` to that GET DATA and is not asked.
+3. **The FINEID bounds** -- PIN 1 4–12 digits, PIN 2 6–12, PUK 8–12
+   (FINEID S4-1 v4.2 §4.1, §8.1.5) -- apply to a credential neither
+   source lists, including when EF.AOD cannot be selected, read or
+   decoded.
+
+A listed range is used as the card lists it, within what the role type
+carries: a listed maximum above 12 is taken as 12, and a listed minimum
+below the role type's minimum as that minimum. A card listing PIN 1 up
+to 8 digits takes 4–8; a card listing PIN 2 from 4 digits takes 4–12.
+The change, unblock and activation operations check every entry -- the
+current PIN, the PUK, the activation code in the role it is presented
+as, and each new PIN -- against these lengths before any command.
+
+The Idemia Cosmo X organization card's EF.AOD lists PIN 1
+("perustunnusluku") with `minLength` 4, `storedLength` 12, `maxLength`
+12 and `pwdReference` 3, so its PIN 1 takes 4–12 digits. DVV's
+organization card letter gives PIN 1 4–12 and PIN 2 6–12, where the
+FINEID S4-2 v4.0 tables say 4–8 for PIN 1.

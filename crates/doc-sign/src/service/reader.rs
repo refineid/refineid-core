@@ -41,7 +41,7 @@ use crate::signed_name::BestSignatureTime;
 use crate::x509_ext::NameExt;
 use refineid_apdu::CardTransport;
 use refineid_apdu::status_word::StatusWord;
-use refineid_auth::credentials::{PIN_MAX_LENGTH, PIN1_MIN_LENGTH, PIN2_MIN_LENGTH};
+use refineid_auth::credentials::{PIN_MAX_LENGTH, PIN_MIN_LENGTH};
 use refineid_auth::{
     CredentialInputError, Pin1, Pin2, PinOps as _, PinReferenceScheme, PinSlot, RetryFloorRefusal,
     UnvalidatedSecret, VerifyOutcome, check_retry_floor,
@@ -359,10 +359,7 @@ fn pin_policy_refusal(slot: SignSlot, error: CredentialInputError) -> ReaderSign
             max: expected_max,
         },
         CredentialInputError::Empty { .. } => PinPolicyReason::WrongLength {
-            min: match slot.pin_role() {
-                PinRole::Pin1 => PIN1_MIN_LENGTH,
-                PinRole::Pin2 => PIN2_MIN_LENGTH,
-            },
+            min: PIN_MIN_LENGTH,
             max: PIN_MAX_LENGTH,
         },
     };
@@ -1824,11 +1821,11 @@ mod tests {
             CardTransport, CommandApdu, CredentialCommand, ResponseApdu, StatusWord,
             TransportOutcome,
         };
-        use refineid_auth::credentials::{PIN_MAX_LENGTH, PIN2_MIN_LENGTH};
+        use refineid_auth::credentials::{FINEID_PIN2_MIN_LENGTH, PIN_MAX_LENGTH, PIN_MIN_LENGTH};
         use refineid_auth::{PinReferenceScheme, PinSlot};
 
-        use super::super::{ReaderSignError, SignSlot, verify_pin_with_scheme};
-        use crate::pin::{PinBytes, PinPolicyReason};
+        use super::super::{SignSlot, verify_pin_with_scheme};
+        use crate::pin::PinBytes;
         use crate::test_util::{TestResult, check, check_true};
 
         /// Offset of P2 in a command APDU (ISO 7816-4 s5.1).
@@ -1902,31 +1899,33 @@ mod tests {
         }
 
         #[test]
-        fn a_pin2_below_the_minimum_is_refused_before_any_command() -> TestResult {
+        fn a_pin2_below_the_fineid_minimum_reaches_the_card() -> TestResult {
+            // Signing does not read the card's PIN lengths, so every PIN 2
+            // the role type carries goes to the card, which decides.
+            let short_length = FINEID_PIN2_MIN_LENGTH - 1;
             for scheme in [
                 PinReferenceScheme::Citizen,
                 PinReferenceScheme::Organizational,
             ] {
                 let mut card = Recorder::default();
-                let short = PinBytes::new(LONGEST_PIN[..PIN2_MIN_LENGTH - 1].to_vec())?;
-                let refused =
-                    verify_pin_with_scheme(&mut card, SignSlot::Qualified, scheme, &short);
-                check_true(
-                    matches!(
-                        refused,
-                        Err(ReaderSignError::PinPolicy {
-                            slot: SignSlot::Qualified,
-                            reason: PinPolicyReason::WrongLength {
-                                min: PIN2_MIN_LENGTH,
-                                max: PIN_MAX_LENGTH,
-                            },
-                        })
-                    ),
-                    "PIN 2 policy refusal",
+                let short = PinBytes::new(LONGEST_PIN[..short_length].to_vec())?;
+                verify_pin_with_scheme(&mut card, SignSlot::Qualified, scheme, &short)?;
+                let [wire] = card.commands.as_slice() else {
+                    return Err("one VERIFY".into());
+                };
+                check(
+                    &wire.get(P2_INDEX).copied(),
+                    &Some(scheme.reference(PinSlot::Pin2)),
+                    "PIN 2 reference",
                 )?;
-                check_true(card.commands.is_empty(), "no command sent")?;
             }
             Ok(())
+        }
+
+        #[test]
+        fn a_pin_below_the_role_minimum_never_becomes_a_pin() -> TestResult {
+            let shorter = LONGEST_PIN[..PIN_MIN_LENGTH - 1].to_vec();
+            check_true(PinBytes::new(shorter).is_err(), "refused at entry")
         }
 
         #[test]

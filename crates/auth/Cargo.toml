@@ -16,6 +16,8 @@ workspace = true
 
 [dependencies]
 refineid-apdu.workspace = true
+refineid-ber.workspace = true
+refineid-pkcs15.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 zeroize.workspace = true

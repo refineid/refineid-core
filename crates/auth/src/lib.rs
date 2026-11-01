@@ -24,6 +24,7 @@
 pub mod activation;
 pub mod credentials;
 pub mod manage;
+pub mod pin_lengths;
 pub mod retry_risk;
 pub mod verify;
 
@@ -37,6 +38,10 @@ pub use credentials::{
     CredentialRole, Pin1, Pin2, Puk, UnvalidatedSecret,
 };
 pub use manage::{ManageOutcome, PinManageOps, classify_manage_sw};
+pub use pin_lengths::{
+    CardLengthSource, CardPinLengths, CredentialLengths, ListedLength, PinLengthRefusal,
+};
+pub use refineid_pkcs15::PasswordLengthRange;
 pub use retry_risk::{
     FlooredCredential, PinRetryRisk, RetryFloorRefusal, check_retry_floor,
     pin1_status_permits_reusable_cache,

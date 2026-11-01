@@ -26,6 +26,8 @@
 use core::fmt;
 
 use refineid_apdu::{ApduClass, CardTransport, CommandApdu, CommandHeader, PinRetries, StatusWord};
+use refineid_ber::{BerTlvAny, BerTlvIter};
+use refineid_pkcs15::PasswordLengthRange;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::credentials::{CredentialInputError, CredentialRole, SecretDigits, UnvalidatedSecret};
@@ -46,13 +48,13 @@ const GET_DATA_P2: u8 = 0xFF;
 const GET_DATA_LE: u8 = 0x00;
 
 /// Constructed template tag in PIN container request (FINEID S1 v4.2 section 3.15.2).
-const PIN_CONTAINER_TEMPLATE_TAG: u8 = 0xA0;
+pub(crate) const PIN_CONTAINER_TEMPLATE_TAG: u8 = 0xA0;
 /// Template length in PIN container request.
 const PIN_CONTAINER_TEMPLATE_LEN: u8 = 3;
 /// PIN reference tag inside request template.
-const PIN_CONTAINER_REF_TAG: u8 = 0x83;
+pub(crate) const PIN_CONTAINER_REF_TAG: u8 = 0x83;
 /// PIN reference value length.
-const PIN_CONTAINER_REF_LEN: u8 = 1;
+pub(crate) const PIN_CONTAINER_REF_LEN: u8 = 1;
 
 /// High byte of PIN changed tag (DF 2F, FINEID S1 v4.2 section 3.15.3).
 const PIN_CHANGED_TAG_HIGH: u8 = 0xDF;
@@ -79,6 +81,21 @@ const PIN_ATTRIBUTES_LEN: u8 = 4;
 const PIN_ATTRIBUTES_WINDOW_LEN: usize = 7;
 /// Offset of tries remaining byte in PIN attributes window.
 const PIN_ATTRIBUTES_TRIES_OFFSET: usize = 3;
+
+/// PIN policy tag (DF 3F, FINEID S1 v4.2 section 3.15.3 Table 19).
+pub(crate) const PIN_POLICY_TAG: u16 = 0xDF3F;
+/// Value length of the PIN policy.
+pub(crate) const PIN_POLICY_LEN: usize = 20;
+/// Offset of the PIN minimum length in the PIN policy value, after the
+/// maximum try limit.
+pub(crate) const PIN_POLICY_MIN_LENGTH_OFFSET: usize = 1;
+/// Offset of the PIN maximum length in the PIN policy value.
+pub(crate) const PIN_POLICY_MAX_LENGTH_OFFSET: usize = 2;
+/// Lowest PIN length the PIN policy can state (FINEID S1 v4.2 section
+/// 3.15.3).
+const PIN_POLICY_LENGTH_FLOOR: u8 = 4;
+/// Highest PIN length the PIN policy can state.
+const PIN_POLICY_LENGTH_CEILING: u8 = 64;
 
 /// Length byte offset in a two-byte tag TLV window.
 const TLV_LENGTH_OFFSET: usize = 2;
@@ -288,19 +305,9 @@ pub struct CredentialHealthReport {
     pub activation_needs: Option<CardActivationNeeds>,
 }
 
-/// Read a PIN's changed-since-manufacture record from the card's PIN container.
-///
-/// # Errors
-///
-/// Returns [`AuthError`] on transport failure or state transition.
-pub fn read_pin_change_record<T: CardTransport + ?Sized>(
-    transport: &mut T,
-    slot: PinSlot,
-) -> Result<PinChangeRecord, AuthError<T::Error>> {
-    let reference = match slot {
-        PinSlot::Pin1 => PIN1_REFERENCE,
-        PinSlot::Pin2 => PIN2_REFERENCE,
-    };
+/// The GET DATA command that reads the PIN container of `reference`
+/// (FINEID S1 v4.2 section 3.15.2), or `None` if it does not assemble.
+fn pin_container_query(reference: u8) -> Option<CommandApdu> {
     let header = CommandHeader {
         class: ApduClass::Plain,
         instruction: GET_DATA_INS,
@@ -314,9 +321,76 @@ pub fn read_pin_change_record<T: CardTransport + ?Sized>(
         PIN_CONTAINER_REF_LEN,
         reference,
     ];
-    let apdu = match CommandApdu::case_4(header, &data, GET_DATA_LE) {
-        Ok(cmd) => cmd,
-        Err(_) => return Ok(PinChangeRecord::Unreadable),
+    CommandApdu::case_4(header, &data, GET_DATA_LE).ok()
+}
+
+/// Read the length range of the PIN policy in the PIN container of
+/// `reference` (FINEID S1 v4.2 section 3.15.3, Table 19): the policy's
+/// second octet is the minimum length and its third the maximum, each in
+/// the range the specification gives. `None` when the card refuses the
+/// read, the container carries no policy, or the policy's lengths fall
+/// outside that range or admit nothing.
+///
+/// # Errors
+///
+/// Returns [`AuthError`] on transport failure or state transition.
+pub(crate) fn read_pin_policy_lengths<T: CardTransport + ?Sized>(
+    transport: &mut T,
+    reference: u8,
+) -> Result<Option<PasswordLengthRange>, AuthError<T::Error>> {
+    let Some(apdu) = pin_container_query(reference) else {
+        return Ok(None);
+    };
+    let outcome = transport.transmit(&apdu).map_err(AuthError::Transport)?;
+    let response = outcome.into_response().map_err(AuthError::Outcome)?;
+    if response.status_word() != StatusWord::Success {
+        return Ok(None);
+    }
+    let Ok(template) = BerTlvAny::parse(&response.body) else {
+        return Ok(None);
+    };
+    if template.tag() != u16::from(PIN_CONTAINER_TEMPLATE_TAG) {
+        return Ok(None);
+    }
+    let policy = BerTlvIter::new(template.value())
+        .map_while(Result::ok)
+        .find(|element| element.tag() == PIN_POLICY_TAG);
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+    let value = policy.value();
+    if value.len() != PIN_POLICY_LEN {
+        return Ok(None);
+    }
+    let (Some(&min), Some(&max)) = (
+        value.get(PIN_POLICY_MIN_LENGTH_OFFSET),
+        value.get(PIN_POLICY_MAX_LENGTH_OFFSET),
+    ) else {
+        return Ok(None);
+    };
+    let in_specified_range =
+        |length: u8| (PIN_POLICY_LENGTH_FLOOR..=PIN_POLICY_LENGTH_CEILING).contains(&length);
+    if !in_specified_range(min) || !in_specified_range(max) {
+        return Ok(None);
+    }
+    Ok(PasswordLengthRange::new(min, max))
+}
+
+/// Read a PIN's changed-since-manufacture record from the card's PIN container.
+///
+/// # Errors
+///
+/// Returns [`AuthError`] on transport failure or state transition.
+pub fn read_pin_change_record<T: CardTransport + ?Sized>(
+    transport: &mut T,
+    slot: PinSlot,
+) -> Result<PinChangeRecord, AuthError<T::Error>> {
+    let reference = match slot {
+        PinSlot::Pin1 => PIN1_REFERENCE,
+        PinSlot::Pin2 => PIN2_REFERENCE,
+    };
+    let Some(apdu) = pin_container_query(reference) else {
+        return Ok(PinChangeRecord::Unreadable);
     };
     let outcome = transport.transmit(&apdu).map_err(AuthError::Transport)?;
     let response = outcome.into_response().map_err(AuthError::Outcome)?;
@@ -350,22 +424,8 @@ pub fn read_pin_change_record<T: CardTransport + ?Sized>(
 pub fn read_puk_status_from_container<T: CardTransport + ?Sized>(
     transport: &mut T,
 ) -> Result<PinStatus, AuthError<T::Error>> {
-    let header = CommandHeader {
-        class: ApduClass::Plain,
-        instruction: GET_DATA_INS,
-        p1: GET_DATA_P1,
-        p2: GET_DATA_P2,
-    };
-    let data = [
-        PIN_CONTAINER_TEMPLATE_TAG,
-        PIN_CONTAINER_TEMPLATE_LEN,
-        PIN_CONTAINER_REF_TAG,
-        PIN_CONTAINER_REF_LEN,
-        PUK_REFERENCE,
-    ];
-    let apdu = match CommandApdu::case_4(header, &data, GET_DATA_LE) {
-        Ok(cmd) => cmd,
-        Err(_) => return Ok(PinStatus::NoInfo),
+    let Some(apdu) = pin_container_query(PUK_REFERENCE) else {
+        return Ok(PinStatus::NoInfo);
     };
     let outcome = transport.transmit(&apdu).map_err(AuthError::Transport)?;
     let response = outcome.into_response().map_err(AuthError::Outcome)?;

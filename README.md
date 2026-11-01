@@ -21,8 +21,9 @@ crates stay transport-agnostic and country-profile-neutral.
 - `crates/auth` (`refineid-auth`) -- PIN and PUK role types, VERIFY
   PIN1/PIN2 over the credential-command path for both citizen and
   organizational cards, the counter-safe status probe that resolves the
-  card's credential numbering, the CHANGE REFERENCE DATA and RESET RETRY
-  COUNTER (unblock) chains, and the retry-risk policy.
+  card's credential numbering, the PIN and PUK lengths the card lists,
+  the CHANGE REFERENCE DATA and RESET RETRY COUNTER (unblock) chains, and
+  the retry-risk policy.
 - `crates/ber` (`refineid-ber`) -- minimal BER-TLV encoder and decoder
   with a typed tag layer.
 - `crates/build-number` (`refineid-build-number`) -- the build number `B`
@@ -46,8 +47,9 @@ crates stay transport-agnostic and country-profile-neutral.
   and refused locally, so software never re-offers a known-bad value and
   burns another card retry.
 - `crates/pkcs15` (`refineid-pkcs15`) -- PKCS#15 file-system reads:
-  selection, bounded reads, certificates as plain DER, EF.TokenInfo, and
-  the typed chip-serial forms.
+  selection, bounded reads, certificates as plain DER, EF.TokenInfo, the
+  password objects' length ranges from EF.AOD, and the typed chip-serial
+  forms.
 - `crates/rapp` (`refineid-rapp`) -- the transport-independent Remote
   Authorization Proxy Protocol core: offer and pairing lifecycle, the
   mandatory Noise `XXpsk3` handshake and transport cipher, session and

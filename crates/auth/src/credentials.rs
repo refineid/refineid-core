@@ -27,11 +27,19 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::verify::PinSlot;
 
-/// Minimum PIN1 length from FINEID S4-1 v4.2 section 4.1.
-pub const PIN1_MIN_LENGTH: usize = 4;
-/// Minimum PIN2 length from FINEID S4-1 v4.2 section 4.1.
-pub const PIN2_MIN_LENGTH: usize = 6;
-/// Stored length for both PIN roles from FINEID S4-1 v4.2 section 4.1.
+/// Shortest PIN either PIN role type accepts. The card in session is the
+/// authority on its PIN lengths, and the signing and login paths do not
+/// read them, so [`Pin1`] and [`Pin2`] accept every length a FINEID card
+/// may list: down to the PIN 1 minimum of FINEID S4-1 v4.2 section 4.1.
+pub const PIN_MIN_LENGTH: usize = 4;
+/// Minimum PIN1 length from FINEID S4-1 v4.2 section 4.1; the fallback
+/// when the card lists no PIN 1 length.
+pub const FINEID_PIN1_MIN_LENGTH: usize = 4;
+/// Minimum PIN2 length from FINEID S4-1 v4.2 section 4.1; the fallback
+/// when the card lists no PIN 2 length.
+pub const FINEID_PIN2_MIN_LENGTH: usize = 6;
+/// Stored length for both PIN roles from FINEID S4-1 v4.2 section 4.1;
+/// the longest PIN either PIN role type carries.
 pub const PIN_MAX_LENGTH: usize = 12;
 /// Minimum PUK length from FINEID S4-1 v4.2 section 8.1.5 (EF.AOD): the
 /// unblocking password is eight to twelve digits. The 7-digit preset
@@ -189,9 +197,9 @@ impl Pin1 {
     /// # Errors
     ///
     /// Returns [`CredentialInputError`] unless the input is
-    /// [`PIN1_MIN_LENGTH`] through [`PIN_MAX_LENGTH`] ASCII digits.
+    /// [`PIN_MIN_LENGTH`] through [`PIN_MAX_LENGTH`] ASCII digits.
     pub fn reconstruct(input: UnvalidatedSecret) -> Result<Self, CredentialInputError> {
-        SecretDigits::reconstruct(input, CredentialRole::Pin1, PIN1_MIN_LENGTH, PIN_MAX_LENGTH)
+        SecretDigits::reconstruct(input, CredentialRole::Pin1, PIN_MIN_LENGTH, PIN_MAX_LENGTH)
             .map(Self)
     }
 
@@ -232,9 +240,9 @@ impl Pin2 {
     /// # Errors
     ///
     /// Returns [`CredentialInputError`] unless the input is
-    /// [`PIN2_MIN_LENGTH`] through [`PIN_MAX_LENGTH`] ASCII digits.
+    /// [`PIN_MIN_LENGTH`] through [`PIN_MAX_LENGTH`] ASCII digits.
     pub fn reconstruct(input: UnvalidatedSecret) -> Result<Self, CredentialInputError> {
-        SecretDigits::reconstruct(input, CredentialRole::Pin2, PIN2_MIN_LENGTH, PIN_MAX_LENGTH)
+        SecretDigits::reconstruct(input, CredentialRole::Pin2, PIN_MIN_LENGTH, PIN_MAX_LENGTH)
             .map(Self)
     }
 
@@ -430,12 +438,12 @@ impl core::error::Error for CredentialInputError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        CredentialInputError, CredentialRole, PIN_MAX_LENGTH, PIN1_MIN_LENGTH, PIN2_MIN_LENGTH,
-        PUK_MAX_LENGTH, PUK_MIN_LENGTH, Pin1, Pin2, Puk, UnvalidatedSecret,
+        CredentialInputError, CredentialRole, FINEID_PIN2_MIN_LENGTH, PIN_MAX_LENGTH,
+        PIN_MIN_LENGTH, PUK_MAX_LENGTH, PUK_MIN_LENGTH, Pin1, Pin2, Puk, UnvalidatedSecret,
     };
     use zeroize::Zeroize;
-    const PIN1_TOO_SHORT_LENGTH: usize = PIN1_MIN_LENGTH - 1;
-    const PIN2_TOO_SHORT_LENGTH: usize = PIN2_MIN_LENGTH - 1;
+    const PIN1_TOO_SHORT_LENGTH: usize = PIN_MIN_LENGTH - 1;
+    const PIN2_TOO_SHORT_LENGTH: usize = PIN_MIN_LENGTH - 1;
     const TOO_LONG_LENGTH: usize = PIN_MAX_LENGTH + 1;
     const PUK_TOO_SHORT_LENGTH: usize = PUK_MIN_LENGTH - 1;
     const PUK_TOO_LONG_LENGTH: usize = PUK_MAX_LENGTH + 1;
@@ -460,23 +468,20 @@ mod tests {
         let pin1 = Pin1::reconstruct(input(b"1234")).expect("valid PIN1 fixture");
         let pin2 = Pin2::reconstruct(input(b"123456")).expect("valid PIN2 fixture");
 
-        assert_eq!(pin1.digit_count(), PIN1_MIN_LENGTH);
+        assert_eq!(pin1.digit_count(), PIN_MIN_LENGTH);
         assert_eq!(pin1.0.secret_bytes(), b"1234");
-        assert_eq!(pin2.digit_count(), PIN2_MIN_LENGTH);
+        assert_eq!(pin2.digit_count(), FINEID_PIN2_MIN_LENGTH);
         assert_eq!(pin2.0.secret_bytes(), b"123456");
     }
 
     #[test]
-    fn role_specific_minimums_are_enforced() {
-        let error = Pin2::reconstruct(input(b"1234")).expect_err("fixture is too short for PIN2");
-        assert_eq!(
-            error,
-            CredentialInputError::WrongLength {
-                role: CredentialRole::Pin2,
-                expected_min: PIN2_MIN_LENGTH,
-                expected_max: super::PIN_MAX_LENGTH,
-            }
-        );
+    fn pin2_accepts_lengths_below_the_fineid_minimum() {
+        // The card is the authority on PIN 2's length; the role type
+        // accepts every length from the PIN minimum.
+        for length in PIN_MIN_LENGTH..FINEID_PIN2_MIN_LENGTH {
+            let pin2 = Pin2::reconstruct(digits(length)).expect("valid PIN2 fixture");
+            assert_eq!(pin2.digit_count(), length);
+        }
     }
 
     #[test]
@@ -491,22 +496,22 @@ mod tests {
             Pin1::reconstruct(digits(PIN1_TOO_SHORT_LENGTH)),
             Err(CredentialInputError::WrongLength {
                 role: CredentialRole::Pin1,
-                expected_min: PIN1_MIN_LENGTH,
+                expected_min: PIN_MIN_LENGTH,
                 expected_max: PIN_MAX_LENGTH,
             })
         ));
-        assert!(Pin1::reconstruct(digits(PIN1_MIN_LENGTH)).is_ok());
+        assert!(Pin1::reconstruct(digits(PIN_MIN_LENGTH)).is_ok());
         assert!(Pin1::reconstruct(digits(PIN_MAX_LENGTH)).is_ok());
         assert!(matches!(
             Pin1::reconstruct(digits(TOO_LONG_LENGTH)),
             Err(CredentialInputError::WrongLength {
                 role: CredentialRole::Pin1,
-                expected_min: PIN1_MIN_LENGTH,
+                expected_min: PIN_MIN_LENGTH,
                 expected_max: PIN_MAX_LENGTH,
             })
         ));
         assert!(matches!(
-            Pin1::reconstruct(non_ascii_digits(PIN1_MIN_LENGTH)),
+            Pin1::reconstruct(non_ascii_digits(PIN_MIN_LENGTH)),
             Err(CredentialInputError::NonDigit {
                 role: CredentialRole::Pin1,
             })
@@ -525,22 +530,22 @@ mod tests {
             Pin2::reconstruct(digits(PIN2_TOO_SHORT_LENGTH)),
             Err(CredentialInputError::WrongLength {
                 role: CredentialRole::Pin2,
-                expected_min: PIN2_MIN_LENGTH,
+                expected_min: PIN_MIN_LENGTH,
                 expected_max: PIN_MAX_LENGTH,
             })
         ));
-        assert!(Pin2::reconstruct(digits(PIN2_MIN_LENGTH)).is_ok());
+        assert!(Pin2::reconstruct(digits(PIN_MIN_LENGTH)).is_ok());
         assert!(Pin2::reconstruct(digits(PIN_MAX_LENGTH)).is_ok());
         assert!(matches!(
             Pin2::reconstruct(digits(TOO_LONG_LENGTH)),
             Err(CredentialInputError::WrongLength {
                 role: CredentialRole::Pin2,
-                expected_min: PIN2_MIN_LENGTH,
+                expected_min: PIN_MIN_LENGTH,
                 expected_max: PIN_MAX_LENGTH,
             })
         ));
         assert!(matches!(
-            Pin2::reconstruct(non_ascii_digits(PIN2_MIN_LENGTH)),
+            Pin2::reconstruct(non_ascii_digits(PIN_MIN_LENGTH)),
             Err(CredentialInputError::NonDigit {
                 role: CredentialRole::Pin2,
             })
@@ -610,7 +615,7 @@ mod tests {
         let wrong_len =
             Pin1::reconstruct(input(b"12")).expect_err("fixture is below minimum length");
         let expected_wrong_len = format!(
-            "WrongLength {{ role: Pin1, expected_min: {PIN1_MIN_LENGTH}, expected_max: {PIN_MAX_LENGTH} }}"
+            "WrongLength {{ role: Pin1, expected_min: {PIN_MIN_LENGTH}, expected_max: {PIN_MAX_LENGTH} }}"
         );
         assert_eq!(format!("{wrong_len:?}"), expected_wrong_len);
 
@@ -627,7 +632,7 @@ mod tests {
         let wrong_len =
             Pin1::reconstruct(input(b"12")).expect_err("fixture is below minimum length");
         let expected_wrong_len =
-            format!("PIN1 must contain {PIN1_MIN_LENGTH}-{PIN_MAX_LENGTH} digits");
+            format!("PIN1 must contain {PIN_MIN_LENGTH}-{PIN_MAX_LENGTH} digits");
         assert_eq!(wrong_len.to_string(), expected_wrong_len);
 
         let non_digit =

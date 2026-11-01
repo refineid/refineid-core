@@ -58,7 +58,7 @@ produce two distinct `cdylib` artifacts:
      attestations.
    - **Key Reference**: `KEY_REF_SIGN` (PIN2-gated, NIST P-384).
    - **Certificate**: Qualified Signature Certificate (`EF.CD #2` / `EF.4332`).
-   - **PIN Policy**: PIN2 (6–12 digits). Strictly `CKA_ALWAYS_AUTHENTICATE = TRUE`.
+   - **PIN Policy**: PIN2 (4–12 digits; the card decides). Strictly `CKA_ALWAYS_AUTHENTICATE = TRUE`.
      The card chip drops PIN verification after every single signature
      (`userConsent = 1`); zero software caching.
    - **Consumers**: GnuPG (`gnupg-pkcs11-scd`), Sequoia PGP, PDF/PAdES signers,

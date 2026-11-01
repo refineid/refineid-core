@@ -51,6 +51,7 @@ pub mod live;
 pub mod pdf;
 pub mod revision;
 pub mod trust;
+pub mod trusted_list;
 pub mod xades;
 pub mod xml;
 
@@ -643,6 +644,9 @@ pub struct DocumentReport {
     document_timestamps: Vec<DocumentTimestampReport>,
     /// When the anchors' lists were fetched.
     anchors_fetched_at: Option<DateTime>,
+    /// Whether a list the anchors came from was past its next update
+    /// at the verifier's clock.
+    anchors_stale: bool,
 }
 
 impl DocumentReport {
@@ -663,6 +667,14 @@ impl DocumentReport {
     #[must_use]
     pub const fn anchors_fetched_at(&self) -> Option<DateTime> {
         self.anchors_fetched_at
+    }
+
+    /// Whether a list the anchors came from was past its next update
+    /// when the report was made. The anchors counted all the same; the
+    /// shell shows that they come from a stale list.
+    #[must_use]
+    pub const fn anchors_stale(&self) -> bool {
+        self.anchors_stale
     }
 
     /// Whether the document is valid: it has at least one signature
@@ -790,6 +802,7 @@ pub fn verify(
         rows,
         document_timestamps,
         anchors_fetched_at: anchors.fetched_at(),
+        anchors_stale: anchors.lists_valid_until().is_some_and(|until| until < now),
     })
 }
 

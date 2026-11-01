@@ -34,17 +34,13 @@ Every input has one origin, one border and one constructor.
 | The clock | `now` passed by the caller | The current time, used only where no proven time exists. |
 | Validation evidence inside the file | `MaterialPool` | Parsed certificates, OCSP responses and CRLs from the DSS, the CMS, or the container. Each is parsed once, at the border. |
 
-Trust anchors come from two sources the application shell combines
-before calling the verifier: the pinned roots the core ships (the DVV
-roots and the time-stamping root the signing side uses), and the EU
-trusted lists. The list of the lists is verified under the Commission's
-list-signing certificates the core pins; each national list is verified
-under the certificate the list of the lists names for it; the qualified
-certificate-issuing and time-stamping services in each list become
-anchors for the periods in which their status was granted. The lists are
-fetched and cached by the shell; a verdict uses the cached lists and the
-report says when they were fetched. The verifier itself does no network
-access.
+Trust anchors come from two sources `TrustAnchors::from_trusted_lists`
+combines: the pinned roots the core ships (the DVV roots and the
+time-stamping root the signing side uses), and the EU trusted lists
+(see Trusted lists). The lists are fetched and cached by the shell; a
+verdict uses the cached lists and the report says when they were
+fetched and whether one of them is stale. The verifier itself does no
+network access.
 
 An anchor is the subject name and public key of its certificate (RFC
 5280 sec.6.1.1): a path ends at the first certificate that carries an
@@ -54,6 +50,107 @@ validity and extensions are not consulted; its granted periods are.
 Any certificate can be an anchor: a root, an issuing CA a trusted list
 names, or a time-stamping unit's own certificate. `TrustAnchors::pinned`
 gives the core's pinned roots, each granted without bounds.
+
+## Trusted lists
+
+The EU trusted lists (ETSI TS 119 612) are a trust input: what they
+name as a qualified service becomes an anchor. They enter through one
+border, `verification::trusted_list::TrustedList::read`, which takes
+the bytes of one list and the certificates entitled to sign it, and
+hands out typed facts or a typed refusal.
+
+A list is read only when its enveloped XAdES signature verifies. The
+`ds:SignedInfo` carries exactly two references (annex B): one to the
+list and one to the signed properties; any other count is refused
+before anything is computed. The `ds:KeyInfo` certificate the
+`SigningCertificate` property names is one of the entitled
+certificates, byte for byte (TS 119 612 annex A.1 authenticates a list
+by the digest of its signer certificate), and the `ds:SignedInfo`
+signature verifies under it before any reference digest is computed,
+so a forged list costs one signature verification, not a
+canonicalisation of the list. Then the reference to the list carries
+the enveloped-signature transform and a canonicalisation and digests
+the list without its signature (annex B.1), and the reference of the
+`SignedProperties` type digests this signature's signed properties; a
+reference the verifier cannot recompute, or a digest or signature value
+that does not match, refuses the list. The signer
+certificate's own validity and revocation are not consulted: the lists
+are a direct trust model in which issuing a new list deprecates the
+old one (annex A.2).
+
+The list of the lists is read under the Commission certificates the
+core pins (`trust::LOTL_SIGNER_DER`), the ones the Official Journal
+notice named by the list's scheme information URI publishes: OJ C,
+C/2026/1944 (`https://eur-lex.europa.eu/eli/C/2026/1944/oj`). The
+notice lists six certificates by SHA-256 and SHA-1 digest, and the
+SHA-256 digest of each pinned certificate equals one of them; the
+notice's electronic edition is authenticated by the Publications
+Office's XAdES seal over a manifest of its language versions. A future
+set is re-checked the same way: compare the SHA-256 digests the new
+notice lists with the certificates the list of the lists carries in its
+pointer to itself. Each
+national list is read under the certificates the list of the lists
+carries in the pointer to it. Pointers are followed one level, from the
+list of the lists to the national lists: a national list's own pointers
+are read and never fetched. Only pointers that declare the EU member
+state list type and the machine-processable media type are followed;
+the pointer to the list of the lists itself and to human-readable forms
+are not. A national list that does not arrive, does not read, is not
+signed by a pointer certificate or is not a member state list is
+reported with its reason beside the lists that read, and yields no
+anchor. Bounds are named constants in `verification::trusted_list`:
+the size of a list, the pointers and services of a list, the history
+entries of a service, the certificates of an identity and of a pointer;
+a list beyond one is refused.
+
+A service of type `CA/QC` yields certificate-issuing anchors, one of
+type `TSA/QTST` time-stamping anchors: one anchor per certificate of
+its digital identity (TS 119 612 clause 5.5.3: the certificates
+represent one public key). A certificate that is base64 but not a
+certificate this core reads (the national lists carry some from the
+1990s) is counted and left out, since nothing can be anchored on it; a
+service none of whose certificates read yields no anchor and the count
+says why. Its granted periods come from its status
+and status history (clauses 5.5.4, 5.5.5, 5.5.10 and 5.6), every entry
+walked in time order: a period opens at a status that grants and
+closes at the next that does not, open-ended while the current status
+grants. An entry recorded under another service type does not grant
+and closes an open period, so a time the service was of another type
+is never bridged. Of entries starting at one instant the most recent
+fact counts last: the history, listed newest first, from its last entry
+to its first, then the current status; a period that closes at the
+instant it opened is left out. `granted` grants for both types. For a
+certificate service `undersupervision`, `accredited` and
+`supervisionincessation`, the statuses held under Directive 1999/93/EC,
+grant too, until 1 July 2016 00:00 UTC at the latest: the Regulation
+applies from then (its article 52(2)) and annex J moved every such
+service to `granted` or `withdrawn`, so a period one of them opens
+closes then, and one starting later grants nothing; after that only
+`granted` opens a period. A certificate issued under supervision in
+2015 is as qualified as one issued under a granted status. For a time-stamping service they grant
+nothing: annex J turned them into `withdrawn`, since qualified
+time-stamps did not exist before the Regulation. Every other status,
+`withdrawn` first among them, grants nothing. A service of another type
+yields no anchor.
+
+A list past its `NextUpdate` is stale (clause 5.3.15). The anchors
+taken from a stale list still count: a stale list is the last one its
+operator published, the statuses in it were granted when it was issued,
+and un-anchoring every qualified signature of a territory because a
+cache aged is a loss no relying party expects. The report says so
+instead (`DocumentReport::anchors_stale`, judged against the verifier's
+clock from the earliest `NextUpdate` of the lists the anchors came
+from), beside the fetch time, and the shell shows both and fetches
+again. A closed list, one without a `NextUpdate`, never goes stale.
+
+Fetching and caching are the shell's. `TrustedLists::fetch` fetches the
+list of the lists from its published location and the national lists
+over the crate's HTTP transport, and returns beside the lists one
+`CachedList` per list that read: the location, the fetch time, the
+list's next update and its bytes. The shell stores the records and
+hands them back to `TrustedLists::from_cache`, which verifies every
+signature again; it fetches again once a record's next update has
+passed or on its own schedule. The core writes no file.
 
 ## What is judged, per signature
 
@@ -405,10 +502,12 @@ operations. Verification adds one loss and one hazard.
 
 Control structure: the relying party reads the report the application
 shell renders from the verifier's facts. The shell supplies the file,
-the anchors and the clock, and may fetch live revocation. Feedback the
-relying party needs: which facts hold, at which time they were judged,
-how fresh the anchors and evidence are, and which signatures were not
-judged.
+the anchors and the clock, and may fetch live revocation. The anchors
+are themselves fed by the trusted lists the shell fetches and the
+reader verifies, so the lists are a trust input whose forgery or age
+reaches every verdict. Feedback the relying party needs: which facts
+hold, at which time they were judged, how fresh the anchors and
+evidence are, and which signatures were not judged.
 
 | Id | Controller | Unsafe control action | Hazard | Constraint |
 |---|---|---|---|---|
@@ -419,6 +518,10 @@ judged.
 | UCA-109 | Shell | Renders a verdict from anchors or lists that are stale without saying so. | H-8 | CC-113: the report carries the anchors' fetch time; the shell shows it. |
 | UCA-110 | Verifier | Judges a signature under a trust anchor outside the period its service status was granted. | H-8 | CC-114: anchors carry granted periods and are matched at the validation time. |
 | UCA-111 | Shell | Renders a claimed signing time, a claimed timestamp time, or the signer an unjudged row names as established. | H-8 | CC-115: claims are typed apart from proofs: the claimed signing time and a token's claimed time are their own accessors, never the proof of existence, and an unjudged row's signer sits only in the unsupported outcome; the shell labels each a claim. |
+| UCA-112 | Trusted-list reader | Takes anchors from a list whose signature is not by a certificate entitled to sign it: a forged or substituted list of the lists or national list. | H-8 | CC-116: a list yields nothing until its enveloped signature verifies under the pinned Commission certificates (the list of the lists, as the Official Journal notice publishes them) or the pointer's certificates (a national list), the signer compared byte for byte; the list of the lists is the only source of a national list's signers. The `ds:SignedInfo` carries exactly two references, any other count refused before anything is computed, and its signature is verified before any reference digest, so a forged list costs one signature verification. |
+| UCA-113 | Shell | Renders a verdict from anchors taken from a list past its next update without saying so. | H-8 | CC-117: the reader types staleness from `NextUpdate`; the anchors carry the earliest one and the report says whether it has passed; the shell shows it with the fetch time and fetches again. |
+| UCA-114 | Trusted-list reader | Anchors a service at a time its status did not grant: a withdrawn service, or one before it was granted. | H-8 | CC-118: the granted periods are derived from the current status and the whole history in time order, closed at the first status that does not grant, an entry of another service type included; at one instant the most recent status counts last; a Directive 1999/93/EC status grants only a certificate service and only until 1 July 2016; a status that grants is named per service type, and a service never granted yields no anchor. |
+| UCA-115 | Trusted-list reader | Follows pointers from list to list, or reads a list without bound, so one list controls what is fetched and how much is parsed. | H-8 | CC-119: the list of the lists is followed one level to the national lists and no further; size, pointers, services, history and identity certificates are bounded by named constants and a list beyond one is refused whole. |
 
 Loss scenario: a document carries a self-made timestamp token whose
 time lies inside the signer certificate's validity, while the
@@ -426,6 +529,12 @@ certificate is in fact revoked since. Without CC-109 the verifier judges
 the chain at the token's time and reports valid; with it the token is
 unproven, the signature is judged at now, the revocation is found, and
 the report says not valid.
+
+Loss scenario: a trusted list is substituted on the wire for one that
+lists an attacker's CA as a qualified certificate service. Without
+CC-116 the attacker's CA anchors every signature it issues; with it
+the substituted list is not signed by a pointer certificate, is
+reported unreadable, and the anchors are those of the lists that read.
 
 ## References
 

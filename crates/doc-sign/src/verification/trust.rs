@@ -205,6 +205,10 @@ pub struct TrustAnchors {
     /// When the shell fetched the lists the anchors came from; `None`
     /// for anchors that come from no list.
     fetched_at: Option<DateTime>,
+    /// The earliest next update the lists the anchors came from
+    /// announce; the anchors come from a stale list after it. `None`
+    /// for anchors from no list, or from closed lists.
+    lists_valid_until: Option<DateTime>,
 }
 
 impl TrustAnchors {
@@ -214,6 +218,7 @@ impl TrustAnchors {
         Self {
             anchors,
             fetched_at: None,
+            lists_valid_until: None,
         }
     }
 
@@ -247,6 +252,14 @@ impl TrustAnchors {
         self
     }
 
+    /// These anchors, taken from lists whose earliest next update is
+    /// `until`: from then on they come from a stale list.
+    #[must_use]
+    pub const fn valid_until(mut self, until: DateTime) -> Self {
+        self.lists_valid_until = Some(until);
+        self
+    }
+
     /// Every anchor.
     #[must_use]
     pub fn anchors(&self) -> &[TrustAnchor] {
@@ -257,6 +270,13 @@ impl TrustAnchors {
     #[must_use]
     pub const fn fetched_at(&self) -> Option<DateTime> {
         self.fetched_at
+    }
+
+    /// The earliest next update the lists the anchors came from
+    /// announce; `None` for anchors from no list.
+    #[must_use]
+    pub const fn lists_valid_until(&self) -> Option<DateTime> {
+        self.lists_valid_until
     }
 
     /// Whether `certificate` is an anchor for `role` at `at`.

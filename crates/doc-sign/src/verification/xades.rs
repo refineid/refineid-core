@@ -116,28 +116,28 @@ const SIGNATURE_METHOD_RSA_PSS_SHA256: &str =
 const ELEMENT_XADES_SIGNATURES: &str = "XAdESSignatures";
 
 /// `ds:Signature`.
-const ELEMENT_SIGNATURE: &str = "Signature";
+pub(crate) const ELEMENT_SIGNATURE: &str = "Signature";
 
 /// `ds:SignedInfo`.
-const ELEMENT_SIGNED_INFO: &str = "SignedInfo";
+pub(crate) const ELEMENT_SIGNED_INFO: &str = "SignedInfo";
 
 /// `ds:SignatureValue`.
-const ELEMENT_SIGNATURE_VALUE: &str = "SignatureValue";
+pub(crate) const ELEMENT_SIGNATURE_VALUE: &str = "SignatureValue";
 
 /// `ds:CanonicalizationMethod`.
-const ELEMENT_CANONICALIZATION_METHOD: &str = "CanonicalizationMethod";
+pub(crate) const ELEMENT_CANONICALIZATION_METHOD: &str = "CanonicalizationMethod";
 
 /// `ds:SignatureMethod`.
-const ELEMENT_SIGNATURE_METHOD: &str = "SignatureMethod";
+pub(crate) const ELEMENT_SIGNATURE_METHOD: &str = "SignatureMethod";
 
 /// `ds:Reference`.
-const ELEMENT_REFERENCE: &str = "Reference";
+pub(crate) const ELEMENT_REFERENCE: &str = "Reference";
 
 /// `ds:Transforms`.
-const ELEMENT_TRANSFORMS: &str = "Transforms";
+pub(crate) const ELEMENT_TRANSFORMS: &str = "Transforms";
 
 /// `ds:Transform`.
-const ELEMENT_TRANSFORM: &str = "Transform";
+pub(crate) const ELEMENT_TRANSFORM: &str = "Transform";
 
 /// `ds:DigestMethod`.
 const ELEMENT_DIGEST_METHOD: &str = "DigestMethod";
@@ -146,34 +146,34 @@ const ELEMENT_DIGEST_METHOD: &str = "DigestMethod";
 const ELEMENT_DIGEST_VALUE: &str = "DigestValue";
 
 /// `ds:KeyInfo`.
-const ELEMENT_KEY_INFO: &str = "KeyInfo";
+pub(crate) const ELEMENT_KEY_INFO: &str = "KeyInfo";
 
 /// `ds:X509Data`.
-const ELEMENT_X509_DATA: &str = "X509Data";
+pub(crate) const ELEMENT_X509_DATA: &str = "X509Data";
 
 /// `ds:X509Certificate`.
-const ELEMENT_X509_CERTIFICATE: &str = "X509Certificate";
+pub(crate) const ELEMENT_X509_CERTIFICATE: &str = "X509Certificate";
 
 /// `ds:Object`.
-const ELEMENT_OBJECT: &str = "Object";
+pub(crate) const ELEMENT_OBJECT: &str = "Object";
 
 /// `xades:QualifyingProperties`.
-const ELEMENT_QUALIFYING_PROPERTIES: &str = "QualifyingProperties";
+pub(crate) const ELEMENT_QUALIFYING_PROPERTIES: &str = "QualifyingProperties";
 
 /// `xades:SignedProperties`.
-const ELEMENT_SIGNED_PROPERTIES: &str = "SignedProperties";
+pub(crate) const ELEMENT_SIGNED_PROPERTIES: &str = "SignedProperties";
 
 /// `xades:SignedSignatureProperties`.
-const ELEMENT_SIGNED_SIGNATURE_PROPERTIES: &str = "SignedSignatureProperties";
+pub(crate) const ELEMENT_SIGNED_SIGNATURE_PROPERTIES: &str = "SignedSignatureProperties";
 
 /// `xades:SigningTime`.
 const ELEMENT_SIGNING_TIME: &str = "SigningTime";
 
 /// `xades:SigningCertificateV2`.
-const ELEMENT_SIGNING_CERTIFICATE_V2: &str = "SigningCertificateV2";
+pub(crate) const ELEMENT_SIGNING_CERTIFICATE_V2: &str = "SigningCertificateV2";
 
 /// `xades:SigningCertificate`.
-const ELEMENT_SIGNING_CERTIFICATE: &str = "SigningCertificate";
+pub(crate) const ELEMENT_SIGNING_CERTIFICATE: &str = "SigningCertificate";
 
 /// `xades:Cert`.
 const ELEMENT_CERT: &str = "Cert";
@@ -233,16 +233,16 @@ const ELEMENT_INCLUSIVE_NAMESPACES: &str = "InclusiveNamespaces";
 const ATTRIBUTE_PREFIX_LIST: &str = "PrefixList";
 
 /// The attribute every algorithm-naming element carries.
-const ATTRIBUTE_ALGORITHM: &str = "Algorithm";
+pub(crate) const ATTRIBUTE_ALGORITHM: &str = "Algorithm";
 
 /// A reference's target.
-const ATTRIBUTE_URI: &str = "URI";
+pub(crate) const ATTRIBUTE_URI: &str = "URI";
 
 /// A reference's declared type.
-const ATTRIBUTE_TYPE: &str = "Type";
+pub(crate) const ATTRIBUTE_TYPE: &str = "Type";
 
 /// Marks a same-document reference (XML Signature 1.1 sec.4.4.3.3).
-const FRAGMENT_MARK: char = '#';
+pub(crate) const FRAGMENT_MARK: char = '#';
 
 /// Why a signature file yielded no signatures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,7 +313,7 @@ impl DigestMethod {
 /// A `ds:DigestValue` under a known `ds:DigestMethod`, its length the
 /// method's.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DigestValue {
+pub(crate) struct DigestValue {
     /// The method.
     method: DigestMethod,
     /// The value, [`DigestMethod::len`] octets.
@@ -324,7 +324,10 @@ impl DigestValue {
     /// Read the `ds:DigestMethod` and `ds:DigestValue` children of
     /// `parent`. `Ok(None)` when the method is unknown, so the digest
     /// cannot be recomputed.
-    fn read(parent: ElementRef<'_>, what: &'static str) -> Result<Option<Self>, XadesReadError> {
+    pub(crate) fn read(
+        parent: ElementRef<'_>,
+        what: &'static str,
+    ) -> Result<Option<Self>, XadesReadError> {
         let text = parent
             .child(NAMESPACE_DSIG, ELEMENT_DIGEST_VALUE)
             .ok_or(XadesReadError::Malformed(what))?
@@ -345,13 +348,13 @@ impl DigestValue {
     }
 
     /// Whether `input` digests to this value.
-    fn matches(&self, input: &[u8]) -> bool {
+    pub(crate) fn matches(&self, input: &[u8]) -> bool {
         self.method.digest(input) == self.value
     }
 }
 
 /// The signature algorithm a `SignatureMethod` `Algorithm` names.
-fn signature_method(uri: &str) -> Option<MessageSignatureAlgorithm> {
+pub(crate) fn signature_method(uri: &str) -> Option<MessageSignatureAlgorithm> {
     match uri {
         SIGNATURE_METHOD_RSA_SHA256 => Some(MessageSignatureAlgorithm::RsaPkcs1Sha256),
         SIGNATURE_METHOD_RSA_SHA384 => Some(MessageSignatureAlgorithm::RsaPkcs1Sha384),
@@ -388,7 +391,7 @@ fn canonicalization_named(uri: &str) -> Option<(Algorithm, Comments)> {
 /// child it may carry (xml-exc-c14n sec.4). The inclusive algorithms
 /// take no parameter. `None` for another canonicalisation, any other
 /// child, or a `PrefixList` that does not parse.
-fn canonicalization_method(method: ElementRef<'_>) -> Option<Canonicalization> {
+pub(crate) fn canonicalization_method(method: ElementRef<'_>) -> Option<Canonicalization> {
     let (algorithm, comments) = method
         .attribute(ATTRIBUTE_ALGORITHM)
         .and_then(canonicalization_named)?;
@@ -413,7 +416,7 @@ fn canonicalization_method(method: ElementRef<'_>) -> Option<Canonicalization> {
 /// Canonical XML 1.0 without comments: the canonicalisation of a node
 /// set no transform names (XML Signature 1.1 sec.4.4.3.2), and of a
 /// `SignatureTimeStamp` that names none (EN 319 132-1 sec.4.5).
-const fn default_canonicalization() -> Canonicalization {
+pub(crate) const fn default_canonicalization() -> Canonicalization {
     Canonicalization {
         algorithm: Algorithm::Canonical10,
         comments: Comments::Omitted,
@@ -1244,7 +1247,9 @@ fn read_unsigned(
 /// Read the first `xades:Cert/xades:CertDigest` of a signing
 /// certificate property: in `SigningCertificateV2` and
 /// `SigningCertificate` alike the first `Cert` names the signer.
-fn read_cert_digest(property: ElementRef<'_>) -> Result<Option<DigestValue>, XadesReadError> {
+pub(crate) fn read_cert_digest(
+    property: ElementRef<'_>,
+) -> Result<Option<DigestValue>, XadesReadError> {
     const MALFORMED: &str = "SigningCertificate without a readable CertDigest";
     let digest = property
         .child(NAMESPACE_XADES, ELEMENT_CERT)
@@ -1374,7 +1379,7 @@ fn single_signing_time(properties: ElementRef<'_>) -> Option<DateTime> {
     xml_date_time(&only.text())
 }
 
-fn xml_date_time(text: &str) -> Option<DateTime> {
+pub(crate) fn xml_date_time(text: &str) -> Option<DateTime> {
     /// Separator of date and time.
     const DATE_TIME_SEPARATOR: char = 'T';
     /// Separator of the date fields.

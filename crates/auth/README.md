@@ -38,7 +38,7 @@ acts under its numbering, and refuses an entry the card does not accept
 before any command. Unblocking presents a `Puk` -- its own non-clonable,
 zeroize-on-drop role type, which never authorises an operation and spends
 its own counter. Every unblock, and an activation that presents the
-activation code as the PUK, reads the PUK's counter first and refuses
+activation PIN as the PUK, reads the PUK's counter first and refuses
 below the floor before anything carrying the PUK is sent. The citizen
 card unblocks in one command; the
 organizational card verifies the PUK as its own object and then resets

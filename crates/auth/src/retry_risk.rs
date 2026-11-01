@@ -46,7 +46,7 @@ pub enum FlooredCredential {
     Pin2,
     /// The PUK, presented by RESET RETRY COUNTER or the organizational
     /// card's PUK VERIFY; on cards that ship with blocked PINs the
-    /// activation code is presented under the PUK's counter.
+    /// activation PIN is presented under the PUK's counter.
     Puk,
 }
 

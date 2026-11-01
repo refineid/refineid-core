@@ -85,7 +85,7 @@ pub enum CredentialRole {
     /// setting a new value. It never authorises an operation, and it
     /// spends its own counter.
     Puk,
-    /// Activation code or preset activation PIN (FINEID S4-1 section 4.6).
+    /// Activation PIN of either FINEID S4-1 section 4.6 scheme.
     ActivationCode,
 }
 

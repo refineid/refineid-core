@@ -509,14 +509,14 @@ pub trait PinManageOps: PinOps {
     /// PIN scheme -- is checked against `lengths` before any command.
     ///
     /// Under [`crate::activation::ActivationScheme::ActivationCodeIsPuk`]
-    /// the activation code is presented as the PUK, so each unblock
+    /// the activation PIN is presented as the PUK, so each unblock
     /// applies the retry floor to the PUK's counter first.
     ///
     /// # Errors
     ///
     /// [`AuthError::PinLength`] when the card does not accept the length
     /// of an entry; nothing is sent.
-    /// [`AuthError::RetryFloor`] when the activation code is presented as
+    /// [`AuthError::RetryFloor`] when the activation PIN is presented as
     /// the PUK and the PUK's counter is below the retry floor, blocked or
     /// unreadable. [`AuthError`] on a transport failure or state
     /// transition.

@@ -16,7 +16,7 @@
 //!
 //! Decides a card's activation scheme, evaluates whether each PIN awaits
 //! activation, and performs the initial PIN configuration. Under section
-//! 4.6.1 the PUK is the activation code that unblocks both PINs; it
+//! 4.6.1 the PUK is the activation PIN that unblocks both PINs; it
 //! applies to organization cards and to citizen cards whose
 //! authentication certificate is valid from before 13 January 2026.
 //! Under section 4.6.2 both PINs ship set to one 7-digit preset
@@ -105,13 +105,13 @@ const DVV_PRESET_PIN_CUTOVER_EPOCH_SECONDS: i64 = 1_768_262_400;
 
 /// Number of digits for the preset activation PIN under FINEID S4-1 section 4.6.2.
 const PRESET_ACTIVATION_PIN_DIGIT_COUNT: usize = 7;
-/// Number of digits for the activation code (PUK) under FINEID S4-1 section 4.6.1.
+/// Number of digits for the activation PIN (PUK) under FINEID S4-1 section 4.6.1.
 const ACTIVATION_CODE_PUK_DIGIT_COUNT: usize = 8;
 
 /// How a card is activated (FINEID S4-1 v4.2 section 4.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivationScheme {
-    /// Section 4.6.1: PINs ship blocked, the activation code is the
+    /// Section 4.6.1: PINs ship blocked, the activation PIN is the
     /// 8-digit PUK, and RESET RETRY COUNTER sets each PIN. Citizen cards
     /// issued before 13 January 2026 and organization cards.
     ActivationCodeIsPuk,
@@ -222,7 +222,7 @@ impl CardActivationNeeds {
     }
 }
 
-/// A validated activation code or preset activation PIN.
+/// A validated activation PIN of either scheme.
 ///
 /// Ensures the entered digits strictly match the scheme-specific digit count
 /// (7 digits for preset PIN, 8 digits for PUK), carries the scheme it was
@@ -242,7 +242,7 @@ impl Drop for ActivationCode {
 impl ZeroizeOnDrop for ActivationCode {}
 
 impl ActivationCode {
-    /// Reconstruct an activation code from unvalidated secret bytes.
+    /// Reconstruct an activation PIN from unvalidated secret bytes.
     ///
     /// # Errors
     ///

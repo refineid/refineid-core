@@ -26,11 +26,15 @@
 //! transport path.
 //!
 //! A signature is made through a [`SigningKey`]. The authentication key
-//! is named with PIN 1 already verified by the caller; the qualified key
-//! exists only as the result of [`SignOps::unlock_qualified_key`], which
-//! enters the directory the key lives in -- DF.ESIGN on the organizational
-//! card -- and verifies PIN 2 there, so the qualified key cannot be
-//! driven from any other context.
+//! is named with PIN 1 already verified by the caller. The qualified key
+//! exists only where PIN 2 was presented for it, and only in the
+//! directory it lives in -- DF.ESIGN on the organizational card: from
+//! [`SignOps::unlock_qualified_key`], which enters that directory and
+//! sends VERIFY PIN 2 there, or from
+//! [`Pin2ChannelSignOps::qualified_key_after_pin2_pace`] on a secure
+//! channel PIN 2 itself opened, which enters the directory and sends no
+//! PIN at all. A channel the Card Access Number or PIN 1 opened has no
+//! such method, so it cannot reach the qualified key without a VERIFY.
 //!
 //! The pre-hashed signing chains all fit the short-form command:
 //! RSASSA-PKCS1-v1_5 and RSASSA-PSS over SHA-256, SHA-384, or SHA-512
@@ -50,6 +54,7 @@ pub mod container;
 
 use refineid_apdu::{CardTransport, CommandDataError, ResponseApdu, StatusWord, TransportOutcome};
 use refineid_auth::{AuthError, Pin2, PinOps as _, PinReferenceScheme, VerifyOutcome};
+use refineid_pace::{OpenedByPin2, Pin2PresentationSpent, SmTransport};
 use refineid_pkcs15::{Pkcs15Error, Pkcs15Ops as _};
 use zeroize::Zeroizing;
 
@@ -228,6 +233,85 @@ impl<E: core::fmt::Debug + core::fmt::Display + 'static> core::error::Error
 {
 }
 
+/// Why the qualified-signature key was not made ready on a secure channel
+/// PIN 2 opened.
+#[derive(Debug)]
+pub enum Pin2ChannelError<E> {
+    /// The channel's PIN 2 presentation was already spent on an earlier
+    /// qualified key; nothing was sent. A further signature on the channel
+    /// takes [`SignOps::unlock_qualified_key`].
+    PresentationSpent(Pin2PresentationSpent),
+    /// DF.ESIGN could not be made current.
+    Directory(Pkcs15Error<E>),
+}
+
+impl<E: core::fmt::Display> core::fmt::Display for Pin2ChannelError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::PresentationSpent(e) => write!(f, "{e}"),
+            Self::Directory(e) => write!(f, "select DF.ESIGN: {e}"),
+        }
+    }
+}
+
+impl<E: core::fmt::Debug + core::fmt::Display + 'static> core::error::Error
+    for Pin2ChannelError<E>
+{
+}
+
+/// The qualified-signature key on a PACE secure channel that PIN 2
+/// opened.
+///
+/// Implemented only for `SmTransport<T, OpenedByPin2>`: the channel's type
+/// is the proof that the card authenticated PACE with PIN 2, which only
+/// `refineid_pace::run_pace` given a [`Pin2`] produces. A channel the Card
+/// Access Number or PIN 1 opened does not implement it.
+pub trait Pin2ChannelSignOps: CardTransport + Sized {
+    /// Enter DF.ESIGN and hand back the qualified-signature key, ready to
+    /// sign one digest, without sending PIN 2 again.
+    ///
+    /// PACE with PIN 2 is the organizational card's PIN 2 presentation:
+    /// the card enables PACE under the PIN SIG reference (FINEID S4-2 v4.0
+    /// section 6) and counts PIN 2 verified on the channel, so a VERIFY
+    /// would transmit the PIN once more for nothing. The key is local to
+    /// DF.ESIGN (section 4.2), so this selects DF.ESIGN by name from the
+    /// MF, as [`SignOps::unlock_qualified_key`] does, and names the key by
+    /// [`ORG_QUALIFIED_KEY_REF`] in the organizational chain. PIN PACE
+    /// exists only on the organizational card, so the chain is not a
+    /// parameter.
+    ///
+    /// The channel carries one PIN 2 presentation and this spends it,
+    /// before any command, whatever follows: one presentation, one
+    /// signature. The returned key borrows the channel exclusively and
+    /// signing consumes it.
+    ///
+    /// # Errors
+    ///
+    /// [`Pin2ChannelError::PresentationSpent`] when the presentation was
+    /// already spent (nothing is sent), and
+    /// [`Pin2ChannelError::Directory`] when DF.ESIGN cannot be made
+    /// current.
+    fn qualified_key_after_pin2_pace(
+        &mut self,
+    ) -> Result<SigningKey<'_, Self>, Pin2ChannelError<Self::Error>>;
+}
+
+impl<T: CardTransport> Pin2ChannelSignOps for SmTransport<T, OpenedByPin2> {
+    fn qualified_key_after_pin2_pace(
+        &mut self,
+    ) -> Result<SigningKey<'_, Self>, Pin2ChannelError<Self::Error>> {
+        self.spend_pin2_presentation()
+            .map_err(Pin2ChannelError::PresentationSpent)?;
+        self.select_esign_directory()
+            .map_err(Pin2ChannelError::Directory)?;
+        Ok(SigningKey {
+            transport: self,
+            scheme: SignScheme::Organizational,
+            key: KeyRef::Sign,
+        })
+    }
+}
+
 /// Card-side private-key operations -- signing and RSA decipher --
 /// layered as default methods on every [`CardTransport`].
 ///
@@ -387,9 +471,11 @@ impl<T: CardTransport + ?Sized> SignOps for T {}
 /// exclusively, with the card in the context the key is reached from.
 ///
 /// Obtained from [`SignOps::authentication_key`] or, for the qualified
-/// key, from [`SignOps::unlock_qualified_key`] -- there is no other
-/// constructor, so the qualified key cannot be named without PIN 2
-/// verified in its directory. Each signing method consumes the key, so
+/// key, from [`SignOps::unlock_qualified_key`] or
+/// [`Pin2ChannelSignOps::qualified_key_after_pin2_pace`] -- there is no
+/// other constructor, so the qualified key cannot be named without PIN 2
+/// presented for it, by VERIFY or by the PACE that opened the channel,
+/// and its directory current. Each signing method consumes the key, so
 /// one key signs one digest.
 #[must_use = "a signing key does nothing until it signs"]
 pub struct SigningKey<'t, T: CardTransport> {

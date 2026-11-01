@@ -32,13 +32,18 @@ pub(crate) mod crypto;
 pub mod handshake;
 pub mod rng;
 pub mod secure_messaging;
+#[cfg(feature = "testkit")]
+pub mod testkit;
 
 pub use can::{CAN_DIGITS, Can, CanError, UnvalidatedCan};
 pub use card_access::{
     CardAccess, CardAccessError, EF_CARD_ACCESS_FID, PaceDomain, PaceInfo, PaceMapping,
     UnvalidatedCardAccess, read_card_access,
 };
-pub use handshake::{PASSWORD_REF_CAN, PaceError, PacePassword, PaceSession, Ssc, run_pace};
+pub use handshake::{
+    OpenedByCan, OpenedByPin1, OpenedByPin2, PASSWORD_REF_CAN, PaceError, PacePassword,
+    PaceSession, Pin2PresentationSpent, Ssc, run_pace,
+};
 pub use secure_messaging::{SmError, SmTransport};
 
 #[cfg(test)]
@@ -48,7 +53,7 @@ mod public_contract_tests {
     use serde::{Serialize, de::DeserializeOwned};
     use zeroize::{Zeroize, ZeroizeOnDrop};
 
-    use super::{Can, PaceSession, Ssc, UnvalidatedCan};
+    use super::{Can, OpenedByCan, OpenedByPin1, OpenedByPin2, PaceSession, Ssc, UnvalidatedCan};
     use crate::crypto::curve::Point;
     use crate::crypto::symmetric::Aes256Key;
 
@@ -104,10 +109,17 @@ mod public_contract_tests {
         // voids the CBC/CMAC integrity of every message under the key.
         // The session must therefore be unique by construction: no Clone,
         // no Copy, and no serialisation that would let it be revived.
-        let _ = <PaceSession as AmbiguousIfImplemented<_, CloneMarker>>::marker;
-        let _ = <PaceSession as AmbiguousIfImplemented<_, CopyMarker>>::marker;
-        let _ = <PaceSession as AmbiguousIfImplemented<_, SerializeMarker>>::marker;
-        let _ = <PaceSession as AmbiguousIfImplemented<_, DeserializeMarker>>::marker;
+        let _ = <PaceSession<OpenedByPin2> as AmbiguousIfImplemented<_, CloneMarker>>::marker;
+        let _ = <PaceSession<OpenedByPin2> as AmbiguousIfImplemented<_, CopyMarker>>::marker;
+        let _ = <PaceSession<OpenedByPin2> as AmbiguousIfImplemented<_, SerializeMarker>>::marker;
+        let _ = <PaceSession<OpenedByPin2> as AmbiguousIfImplemented<_, DeserializeMarker>>::marker;
+
+        // The password proofs are minted only by the handshake: a copy of
+        // a PIN 2 proof would be a second, unspent PIN 2 presentation.
+        let _ = <OpenedByCan as AmbiguousIfImplemented<_, CloneMarker>>::marker;
+        let _ = <OpenedByPin1 as AmbiguousIfImplemented<_, CloneMarker>>::marker;
+        let _ = <OpenedByPin2 as AmbiguousIfImplemented<_, CloneMarker>>::marker;
+        let _ = <OpenedByPin2 as AmbiguousIfImplemented<_, CopyMarker>>::marker;
 
         // The session key is custody, not data: it erases on drop and can
         // neither be copied nor serialised out of the crate.

@@ -14,6 +14,12 @@ doctest = false
 [lints]
 workspace = true
 
+[features]
+# A synthetic organizational card that answers the real handshake and
+# plays the card side of secure messaging, for the tests of the crates
+# layered on the channel. Never enabled by a production build.
+testkit = []
+
 [dependencies]
 refineid-apdu.workspace = true
 refineid-auth.workspace = true

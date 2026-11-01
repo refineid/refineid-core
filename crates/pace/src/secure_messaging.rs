@@ -43,25 +43,25 @@ use crate::crypto::symmetric::{
     AES_BLOCK, Aes256Key, aes256_cbc_decrypt_no_padding, aes256_cbc_encrypt_no_padding,
     aes256_cmac_truncated, aes256_ecb_encrypt_block,
 };
-use crate::handshake::{PaceSession, Ssc};
+use crate::handshake::{OpenedByPin2, PaceSession, Pin2PresentationSpent, SessionKeys, Ssc};
 
 /// Cryptogram object tag: the encrypted, padded command or response
 /// body. The first value byte is the padding-content indicator.
-const TAG_CRYPTOGRAM: u8 = 0x87;
+pub(crate) const TAG_CRYPTOGRAM: u8 = 0x87;
 /// Cryptogram object tag for odd instructions (ISO 7816-4:2020 section 6.2.3.1):
 /// ciphertext directly without padding-content indicator.
 const TAG_CRYPTOGRAM_ODD: u8 = 0x85;
 /// Bit indicating an odd instruction code in ISO/IEC 7816-4 (least significant bit of INS).
 const INS_ODD_MASK: u8 = 0x01;
 /// Protected expected-length object tag.
-const TAG_PROTECTED_LE: u8 = 0x97;
+pub(crate) const TAG_PROTECTED_LE: u8 = 0x97;
 /// Protected status-word object tag.
-const TAG_PROTECTED_STATUS: u8 = 0x99;
+pub(crate) const TAG_PROTECTED_STATUS: u8 = 0x99;
 /// Message-authentication object tag.
-const TAG_MAC: u8 = 0x8E;
+pub(crate) const TAG_MAC: u8 = 0x8E;
 
 /// Padding-content indicator for ISO 7816-4 padding.
-const PADDING_INDICATOR: u8 = 0x01;
+pub(crate) const PADDING_INDICATOR: u8 = 0x01;
 /// ISO 7816-4 padding marker byte.
 const PAD_MARKER: u8 = 0x80;
 /// ISO 7816-4 padding filler byte.
@@ -107,7 +107,7 @@ const DIRECT_OFFSET_MAX: u16 = 0x7FFF;
 const SFI_OFFSET_MAX: u16 = 0x07FF;
 
 /// The command-header length in bytes.
-const HEADER_LEN: usize = 4;
+pub(crate) const HEADER_LEN: usize = 4;
 /// Length of a protected status word, in bytes.
 const STATUS_LEN: usize = 2;
 /// Length of the truncated message-authentication tag, in bytes.
@@ -116,13 +116,19 @@ const MAC_LEN: usize = 8;
 /// A secure-messaging channel over a raw transport with an established
 /// PACE session.
 ///
+/// `O` is the proof of the password that opened the session
+/// ([`crate::OpenedByCan`], [`crate::OpenedByPin1`] or
+/// [`crate::OpenedByPin2`]); it travels with the keys, so the channel's
+/// type says which credential the card counts verified on it.
+///
 /// No `Debug`: the channel holds the session keys, which must never
 /// reach a formatter.
-pub struct SmTransport<T: CardTransport> {
+pub struct SmTransport<T: CardTransport, O> {
     inner: T,
     k_enc: Aes256Key,
     k_mac: Aes256Key,
     ssc: Ssc,
+    opened_by: O,
 }
 
 /// A failure from the secure-messaging layer.
@@ -174,15 +180,18 @@ impl<E: TransportErrorExt> TransportErrorExt for SmError<E> {
     }
 }
 
-impl<T: CardTransport> SmTransport<T> {
-    /// Adopt the keys and counter from a completed PACE handshake. The
-    /// session is consumed, so the caller keeps no copy of the keys.
-    pub fn new(inner: T, session: PaceSession) -> Self {
+impl<T: CardTransport, O> SmTransport<T, O> {
+    /// Adopt the keys, counter and password proof from a completed PACE
+    /// handshake. The session is consumed, so the caller keeps no copy
+    /// of the keys.
+    pub fn new(inner: T, session: PaceSession<O>) -> Self {
+        let PaceSession { keys, opened_by } = session;
         Self {
             inner,
-            k_enc: session.k_enc,
-            k_mac: session.k_mac,
-            ssc: session.ssc,
+            k_enc: keys.k_enc,
+            k_mac: keys.k_mac,
+            ssc: keys.ssc,
+            opened_by,
         }
     }
 
@@ -195,14 +204,18 @@ impl<T: CardTransport> SmTransport<T> {
     /// a caller that holds the field open can rebuild the channel on the next
     /// exchange without a fresh PACE handshake. The returned [`PaceSession`]
     /// carries the advanced send-sequence counter, so the rebuilt channel stays
-    /// in step with the card. It is the inverse of [`Self::new`].
-    pub fn into_parts(self) -> (T, PaceSession) {
+    /// in step with the card, and the password proof as it stands, a spent
+    /// PIN 2 presentation staying spent. It is the inverse of [`Self::new`].
+    pub fn into_parts(self) -> (T, PaceSession<O>) {
         (
             self.inner,
             PaceSession {
-                k_enc: self.k_enc,
-                k_mac: self.k_mac,
-                ssc: self.ssc,
+                keys: SessionKeys {
+                    k_enc: self.k_enc,
+                    k_mac: self.k_mac,
+                    ssc: self.ssc,
+                },
+                opened_by: self.opened_by,
             },
         )
     }
@@ -377,7 +390,7 @@ impl<T: CardTransport> SmTransport<T> {
     }
 }
 
-impl<T: CardTransport> SmTransport<T> {
+impl<T: CardTransport, O> SmTransport<T, O> {
     /// One protected exchange: wrap, transmit, authenticate.
     fn transmit_single(&mut self, plain: &[u8]) -> Result<TransportOutcome, SmError<T::Error>> {
         let (header, body) = self.wrap(plain)?;
@@ -477,7 +490,21 @@ fn split_protected_read<E>(command: &[u8]) -> Result<Option<FragmentPair>, SmErr
     )))
 }
 
-impl<T: CardTransport> CardTransport for SmTransport<T> {
+impl<T: CardTransport> SmTransport<T, OpenedByPin2> {
+    /// Spend the one PIN 2 presentation the handshake made on this
+    /// channel; the qualified-signature key it unlocks is the only
+    /// consumer.
+    ///
+    /// # Errors
+    ///
+    /// [`Pin2PresentationSpent`] when the presentation was already
+    /// spent; the card then needs a fresh VERIFY PIN 2 on the channel.
+    pub const fn spend_pin2_presentation(&mut self) -> Result<(), Pin2PresentationSpent> {
+        self.opened_by.spend()
+    }
+}
+
+impl<T: CardTransport, O> CardTransport for SmTransport<T, O> {
     type Error = SmError<T::Error>;
 
     fn transmit(&mut self, command: &CommandApdu) -> Result<TransportOutcome, Self::Error> {
@@ -510,7 +537,7 @@ impl<T: CardTransport> CardTransport for SmTransport<T> {
 
 /// ISO 7816-4 padding: append the marker, then filler to the next block
 /// boundary. Padding is never empty.
-fn iso7816_4_pad(data: &[u8]) -> Vec<u8> {
+pub(crate) fn iso7816_4_pad(data: &[u8]) -> Vec<u8> {
     let full_blocks = data.len().div_euclid(AES_BLOCK);
     let capacity = full_blocks.saturating_add(1).saturating_mul(AES_BLOCK);
     let mut out = Vec::with_capacity(capacity);
@@ -524,7 +551,7 @@ fn iso7816_4_pad(data: &[u8]) -> Vec<u8> {
 
 /// Inverse of [`iso7816_4_pad`]: strip trailing filler and the marker.
 /// A malformed padding leaves the input unchanged.
-fn iso7816_4_unpad(data: &[u8]) -> Vec<u8> {
+pub(crate) fn iso7816_4_unpad(data: &[u8]) -> Vec<u8> {
     let trailing_filler = data
         .iter()
         .rev()
@@ -573,11 +600,13 @@ fn decode_short_apdu(apdu: &[u8]) -> Option<(&[u8], Option<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AES_BLOCK, Aes256Key, LE_ALL_BYTES, PaceSession, SM_READ_BINARY_MAX_LE, SmError,
-        SmTransport, Ssc, TAG_CRYPTOGRAM, TAG_CRYPTOGRAM_ODD, TAG_MAC, TAG_PROTECTED_STATUS,
-        aes256_cbc_encrypt_no_padding, aes256_cmac_truncated, aes256_ecb_encrypt_block,
-        decode_short_apdu, iso7816_4_pad, iso7816_4_unpad, split_protected_read,
+        AES_BLOCK, Aes256Key, LE_ALL_BYTES, PaceSession, SM_READ_BINARY_MAX_LE, SessionKeys,
+        SmError, SmTransport, Ssc, TAG_CRYPTOGRAM, TAG_CRYPTOGRAM_ODD, TAG_MAC,
+        TAG_PROTECTED_STATUS, aes256_cbc_encrypt_no_padding, aes256_cmac_truncated,
+        aes256_ecb_encrypt_block, decode_short_apdu, iso7816_4_pad, iso7816_4_unpad,
+        split_protected_read,
     };
+    use crate::handshake::OpenedByCan;
     use refineid_apdu::{
         ApduClass, CardTransport, CommandApdu, CommandHeader, CredentialCommand, ResponseApdu,
         StatusWord, TransportOutcome,
@@ -663,11 +692,14 @@ mod tests {
         }
     }
 
-    fn session() -> PaceSession {
+    fn session() -> PaceSession<OpenedByCan> {
         PaceSession {
-            k_enc: Aes256Key::from_bytes([K_ENC_FILL; KEY_LEN]).expect("non-sentinel key"),
-            k_mac: Aes256Key::from_bytes([K_MAC_FILL; KEY_LEN]).expect("non-sentinel key"),
-            ssc: Ssc::INITIAL,
+            keys: SessionKeys {
+                k_enc: Aes256Key::from_bytes([K_ENC_FILL; KEY_LEN]).expect("non-sentinel key"),
+                k_mac: Aes256Key::from_bytes([K_MAC_FILL; KEY_LEN]).expect("non-sentinel key"),
+                ssc: Ssc::INITIAL,
+            },
+            opened_by: OpenedByCan(()),
         }
     }
 

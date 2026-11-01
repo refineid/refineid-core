@@ -1,0 +1,11 @@
+error[E0599]: no method named `qualified_key_after_pin2_pace` found for mutable reference `&mut SmTransport<T, OpenedByCan>` in the current scope
+ --> tests/ui/no_qualified_key_on_can_or_pin1_channel.rs:6:21
+  |
+6 |     let _ = channel.qualified_key_after_pin2_pace();
+  |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `&mut SmTransport<T, OpenedByCan>`
+
+error[E0599]: no method named `qualified_key_after_pin2_pace` found for mutable reference `&mut SmTransport<T, OpenedByPin1>` in the current scope
+  --> tests/ui/no_qualified_key_on_can_or_pin1_channel.rs:10:21
+   |
+10 |     let _ = channel.qualified_key_after_pin2_pace();
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `&mut SmTransport<T, OpenedByPin1>`

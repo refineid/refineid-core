@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+ --> tests/ui/no_relabelled_pace_session.rs:8:29
+  |
+8 |     SmTransport::new(inner, session)
+  |     ----------------        ^^^^^^^ expected `PaceSession<OpenedByPin2>`, found `PaceSession<OpenedByCan>`
+  |     |
+  |     arguments to this function are incorrect
+  |
+  = note: expected struct `PaceSession<OpenedByPin2>`
+             found struct `PaceSession<OpenedByCan>`
+note: associated function defined here
+ --> $WORKSPACE/crates/pace/src/secure_messaging.rs
+  |
+  |     pub fn new(inner: T, session: PaceSession<O>) -> Self {
+  |            ^^^

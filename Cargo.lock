@@ -1233,6 +1233,7 @@ version = "26.11.1"
 dependencies = [
  "refineid-apdu",
  "refineid-auth",
+ "refineid-pace",
  "refineid-pkcs15",
  "trybuild",
  "zeroize",

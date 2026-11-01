@@ -63,9 +63,35 @@ completeness, not targeted. Observed hardware coverage is in the
 **Idemia Cosmo X**
 
 - ATR: `3B DD 96 00 80 31 FE 45 00 31 B8 64 04 29 EC C1 73 94 01 80 83 49`
-- Observed on a DVV test organization card; its activation is in
-  [card activation](card-activation.md).
 - ATS: `3B 89 80 01 00 31 B8 64 04 29 EC C1 73 94 01 80 83`
+- Also observed: the PC/SC contactless answer
+  `3B 8D 80 01 00 31 B8 64 04 29 EC C1 73 94 01 80 83 04` on a DVV test
+  organization card.
+
+Observed on an activated DVV test organization card (issuer "DVV TEST
+Certificates - G5R", RSA keys):
+
+- EF.TokenInfo label "Organisaatiokortti"; organization numbering, with
+  EF.AOD listing PIN 1 4–12, PIN 2 6–12 and the PUK 8–12 digits. Activation
+  is in [card activation](card-activation.md).
+- The authentication certificate subject carries the organization
+  (`O=`), the holder's first given name (`GN`) and surname (`SN`), and a
+  common name of surname, given name and identifier. Further given names
+  are not on the card.
+- Contact: VERIFY PIN 1 and PIN 2, RSA-PSS with the authentication key,
+  and RSA decipher work after selecting the PKCS#15 application.
+- The qualified-signature key and PIN 2 are local to DF.ESIGN: PSO:COMPUTE
+  DIGITAL SIGNATURE answers `6A88` unless DF.ESIGN is the current directory.
+  With DF.ESIGN selected, VERIFY PIN 2 and an RSA PKCS#1 v1.5 SHA-256
+  signature with the organization qualified key reference work.
+- Contactless: the card has no CAN. Before PACE it answers `6985` to every
+  read except EF.CardAccess. EF.CardAccess lists
+  `id-PACE-ECDH-GM-AES-CBC-CMAC-256` and `id-PACE-ECDH-IM-AES-CBC-CMAC-256`,
+  each with NIST P-256 and P-384 (standardized domain parameters 12 and
+  15). MSE:Set AT naming password reference 3 (PIN 1) or 4 (PIN 2) is
+  accepted (`9000`), which BSI TR-03110-3 §B.14.1 defines as the password
+  selected with its initial tries. The PACE password is PIN 1 or PIN 2
+  (FINEID S1 v4.0, organizational cards, §2.1).
 
 **Idemia ID.me IDeal Citiz 2.17-i**
 

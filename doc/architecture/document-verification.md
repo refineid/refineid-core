@@ -348,8 +348,10 @@ signature files that do not read.
 
 Each PDF document timestamp is reported with what its token was found
 to be and how far into the file its range reaches. A document
-timestamp credits the signatures whose revision ends where its own
-range starts or earlier.
+timestamp covers the signatures whose revision ends where its own
+range starts or earlier. Each judged signature names the document
+timestamps that cover it, in document order and whatever each was
+found to be; the anchored ones count toward its proof of existence.
 
 A signature row not judged names the signer its certificate
 identifies when one does: a PDF signature under another subfilter or

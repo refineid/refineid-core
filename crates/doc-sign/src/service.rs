@@ -175,8 +175,10 @@ pub enum SignSlot {
 }
 
 impl SignSlot {
-    /// The key reference `MSE:SET DST` names.
-    const fn key_ref(self) -> KeyRef {
+    /// The key reference `MSE:SET DST` names for the key; a report's
+    /// [`SignReport::slot`] gives the one it signed with.
+    #[must_use]
+    pub const fn key_ref(self) -> KeyRef {
         match self {
             Self::Authentication => KeyRef::Auth,
             Self::Qualified => KeyRef::Sign,
@@ -3080,6 +3082,32 @@ mod tests {
         let s2 = report.to_string();
         check_true(!s2.contains("cert DER:"), "no cert der line")?;
         check_true(!s2.contains("retries after verify"), "no retry line")
+    }
+
+    #[test]
+    fn each_slot_names_its_own_key_pin_and_certificate() -> TestResult {
+        check(
+            &SignSlot::Authentication.key_ref(),
+            &KeyRef::Auth,
+            "auth key",
+        )?;
+        check(&SignSlot::Qualified.key_ref(), &KeyRef::Sign, "sign key")?;
+        check(
+            &SignSlot::Authentication.pin_role(),
+            &PinRole::Pin1,
+            "auth PIN",
+        )?;
+        check(&SignSlot::Qualified.pin_role(), &PinRole::Pin2, "sign PIN")?;
+        check(
+            &SignSlot::Authentication.cert_slot(),
+            &CertSlot::Authentication,
+            "auth cert",
+        )?;
+        check(
+            &SignSlot::Qualified.cert_slot(),
+            &CertSlot::Signature,
+            "sign cert",
+        )
     }
 
     // ---- Output: a default name never replaces a file. ----

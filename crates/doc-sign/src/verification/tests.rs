@@ -819,7 +819,25 @@ fn a_document_timestamp_covering_the_signature_proves_existence() {
     let [stamp] = exactly(report.document_timestamps(), "one document timestamp");
     assert_eq!(kind(stamp.timestamp()), Kind::Anchored(day(STAMPED)));
     assert_eq!(stamp.covers(), length);
+    assert_eq!(
+        signature.covering_document_timestamps(),
+        report.document_timestamps(),
+        "the signature names the document timestamp that covers it"
+    );
     assert!(report.is_valid());
+}
+
+#[test]
+fn a_signature_without_a_document_timestamp_is_covered_by_none() {
+    let world = World::new();
+    let report = world
+        .verify(world.pdf(
+            Signer::Direct,
+            Stamp::Anchored,
+            &ValidationMaterial::default(),
+        ))
+        .expect("report");
+    assert!(only(&report).covering_document_timestamps().is_empty());
 }
 
 #[test]
@@ -853,6 +871,11 @@ fn a_document_timestamp_over_other_bytes_is_invalid_and_proves_nothing() {
         "the token's claim is reported beside its failure"
     );
     assert_eq!(stamp.timestamp().proven_time(), None);
+    assert_eq!(
+        only(&report).covering_document_timestamps(),
+        report.document_timestamps(),
+        "a covering document timestamp is named whatever it was found to be"
+    );
     assert!(only(&report).is_valid());
     assert!(
         report.is_valid(),

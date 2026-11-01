@@ -321,6 +321,9 @@ pub struct SignatureReport {
     signature_valid: bool,
     /// The earliest time an anchored timestamp proves.
     proof_of_existence: Option<DateTime>,
+    /// The PDF document timestamps whose range covers the signature,
+    /// in document order.
+    covering_document_timestamps: Vec<DocumentTimestampReport>,
     /// The signature's own timestamps, in encoded order.
     timestamps: Vec<TimestampReport>,
     /// The archive timestamps, in encoded order.
@@ -388,6 +391,15 @@ impl SignatureReport {
     #[must_use]
     pub const fn proof_of_existence(&self) -> Option<DateTime> {
         self.proof_of_existence
+    }
+
+    /// The PDF document timestamps whose range covers the revision this
+    /// signature signs (`ETSI EN 319 142-1` clause 5.4.3), in document
+    /// order, whatever each was found to be; empty outside a PDF. The
+    /// anchored ones count toward [`Self::proof_of_existence`].
+    #[must_use]
+    pub fn covering_document_timestamps(&self) -> &[DocumentTimestampReport] {
+        &self.covering_document_timestamps
     }
 
     /// The signing time the signature claims, from the signer's own
@@ -505,7 +517,7 @@ pub const MAX_COUNTER_SIGNATURE_DEPTH: usize = 4;
 #[derive(Debug, Clone)]
 pub enum SignatureOutcome {
     /// The signature was judged.
-    Judged(SignatureReport),
+    Judged(Box<SignatureReport>),
     /// The signature was found and not judged.
     Unsupported {
         /// Why.
@@ -528,9 +540,9 @@ pub struct SignatureRow {
 
 impl SignatureRow {
     /// A judged signature that counter-signs nothing.
-    const fn judged(report: SignatureReport) -> Self {
+    fn judged(report: SignatureReport) -> Self {
         Self {
-            outcome: SignatureOutcome::Judged(report),
+            outcome: SignatureOutcome::Judged(Box::new(report)),
             counter_signs: None,
         }
     }
@@ -802,8 +814,9 @@ struct Facts {
     timestamps: Vec<Timestamp>,
     /// The archive timestamps.
     archive_timestamps: Vec<ArchiveFact>,
-    /// Proven times of the document timestamps covering the signature.
-    covering_proofs: Vec<DateTime>,
+    /// The document timestamps whose range covers the signature, in
+    /// document order.
+    covering: Vec<DocumentTimestampReport>,
     /// What the revisions after the signed one do to the document.
     revision: Revision,
     /// The signing time the signature claims.
@@ -966,7 +979,12 @@ impl Context<'_> {
         let primary = timestamps
             .iter()
             .filter_map(TimestampReport::proven_time)
-            .chain(facts.covering_proofs.iter().copied())
+            .chain(
+                facts
+                    .covering
+                    .iter()
+                    .filter_map(|stamp| stamp.timestamp.proven_time()),
+            )
             .min();
         let archived = archive_timestamps
             .iter()
@@ -1004,6 +1022,7 @@ impl Context<'_> {
             revocation: chain.revocation,
             revision: facts.revision,
             claimed_signing_time: facts.claimed_signing_time,
+            covering_document_timestamps: facts.covering,
         }
     }
 
@@ -1089,10 +1108,10 @@ impl Context<'_> {
                 ess == EssBinding::Required && signature.has_signing_time_attribute();
             let mut pool = base.clone();
             pool.add_material(signature.embedded_material());
-            let covering_proofs = stamps
+            let covering = stamps
                 .iter()
                 .filter(|(_, stamp_range)| stamp_range.hole().start >= range.end())
-                .filter_map(|(stamp, _)| stamp.timestamp.proven_time())
+                .map(|(stamp, _)| stamp.clone())
                 .collect();
             rows.push(SignatureRow::judged(self.report(Facts {
                 signer: signature.signer_certificate().clone(),
@@ -1100,7 +1119,7 @@ impl Context<'_> {
                 signature_valid: verdict.signature_valid && !baseline_time_attribute,
                 timestamps: cades_timestamps(&verdict.signature_timestamps),
                 archive_timestamps: cades_archive_timestamps(verdict.archive_timestamps),
-                covering_proofs,
+                covering,
                 revision,
                 claimed_signing_time: signature.signing_time().or(found.signing_time_entry()),
                 pool,
@@ -1263,7 +1282,7 @@ impl Context<'_> {
             signature_valid: judgement.signature_valid(),
             timestamps,
             archive_timestamps,
-            covering_proofs: Vec::new(),
+            covering: Vec::new(),
             revision: Revision::WholeDocument,
             claimed_signing_time: signature.signing_time(),
             pool,
@@ -1296,7 +1315,7 @@ impl Context<'_> {
             signature_valid: verdict.signature_valid,
             timestamps: cades_timestamps(&verdict.signature_timestamps),
             archive_timestamps: cades_archive_timestamps(verdict.archive_timestamps),
-            covering_proofs: Vec::new(),
+            covering: Vec::new(),
             revision: Revision::WholeDocument,
             claimed_signing_time: signature.signing_time(),
             pool,
@@ -1322,7 +1341,7 @@ impl Context<'_> {
             signature_valid: verdict.signature_valid,
             timestamps: cades_timestamps(&verdict.signature_timestamps),
             archive_timestamps: cades_archive_timestamps(verdict.archive_timestamps),
-            covering_proofs: Vec::new(),
+            covering: Vec::new(),
             revision: Revision::WholeDocument,
             claimed_signing_time: signature.signing_time(),
             pool,

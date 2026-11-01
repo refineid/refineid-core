@@ -5,7 +5,7 @@
 //! [`HttpTransport`] trait, keeping `refineid-doc-sign` purely Safe Rust.
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::RwLock;
 
 use crate::uri::{Scheme, Uri};
@@ -137,14 +137,23 @@ impl HttpError {
 
 /// Pluggable HTTP transport interface for revocation and timestamp queries.
 ///
-/// [`get`](Self::get) and [`post`](Self::post) serve URLs a certificate
-/// published. They receive the addresses [`guard_destination`] vetted for
-/// the URL's host: the transport connects to one of those addresses and
-/// never resolves the host again, and it follows a redirect only to a URL
-/// that itself passes [`guard_destination`], connecting to the addresses
-/// that call returns. The transport names its own client in the
-/// requests it sends, `User-Agent` included.
+/// The transport resolves host names ([`resolve`](Self::resolve)) with
+/// whatever resolver the platform trusts. [`get`](Self::get) and
+/// [`post`](Self::post) serve URLs a certificate published. They receive
+/// the addresses [`guard_destination`] vetted for the URL's host, from
+/// the transport's own answers: the transport connects to one of those
+/// addresses and never resolves the host again, and it follows a
+/// redirect only to a URL that itself passes [`guard_destination`],
+/// connecting to the addresses that call returns. The transport names
+/// its own client in the requests it sends, `User-Agent` included.
 pub trait HttpTransport: Send + Sync {
+    /// The addresses `host` (a name or an address literal) resolves to,
+    /// each with `port`.
+    ///
+    /// # Errors
+    /// The resolver's failure.
+    fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, HttpError>;
+
     /// Perform an HTTP GET request to one of the vetted `addresses`.
     fn get(
         &self,
@@ -179,6 +188,13 @@ pub trait HttpTransport: Send + Sync {
 pub struct DefaultHttpTransport;
 
 impl HttpTransport for DefaultHttpTransport {
+    fn resolve(&self, _host: &str, _port: u16) -> Result<Vec<SocketAddr>, HttpError> {
+        Err(HttpError::Io(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "HTTP transport not configured for refineid-doc-sign",
+        )))
+    }
+
     fn get(
         &self,
         _url: &Uri,
@@ -246,13 +262,21 @@ pub fn clear_http_transport() {
 /// non-2xx HTTP status, malformed HTTP framing, body exceeding
 /// `max_bytes`.
 pub fn get(url: &Uri, max_bytes: usize) -> Result<Vec<u8>, HttpError> {
-    let addresses = guard_destination(url)?;
+    with_transport(|transport| {
+        let addresses = guard_destination(transport, url)?;
+        transport.get(url, &addresses, max_bytes)
+    })
+}
+
+/// Run `operation` on the registered transport, or on the
+/// not-configured stub, which refuses everything.
+fn with_transport<R>(operation: impl FnOnce(&dyn HttpTransport) -> R) -> R {
     if let Ok(guard) = GLOBAL_TRANSPORT.read()
         && let Some(transport) = guard.as_ref()
     {
-        return transport.get(url, &addresses, max_bytes);
+        return operation(transport.as_ref());
     }
-    DefaultHttpTransport.get(url, &addresses, max_bytes)
+    operation(&DefaultHttpTransport)
 }
 
 /// POST `body` to a certificate-published `url` with the supplied
@@ -268,13 +292,10 @@ pub fn post(
     body: &[u8],
     max_bytes: usize,
 ) -> Result<Vec<u8>, HttpError> {
-    let addresses = guard_destination(url)?;
-    if let Ok(guard) = GLOBAL_TRANSPORT.read()
-        && let Some(transport) = guard.as_ref()
-    {
-        return transport.post(url, &addresses, content_type, body, max_bytes);
-    }
-    DefaultHttpTransport.post(url, &addresses, content_type, body, max_bytes)
+    with_transport(|transport| {
+        let addresses = guard_destination(transport, url)?;
+        transport.post(url, &addresses, content_type, body, max_bytes)
+    })
 }
 
 /// POST to an explicitly configured timestamp authority.
@@ -395,8 +416,9 @@ fn is_non_public_v6(v6: Ipv6Addr) -> bool {
         || DOCUMENTATION_V6.contains(v6)
 }
 
-/// SSRF guard for certificate-published URLs: resolve the host and
-/// refuse any answer that is not a public unicast address.
+/// SSRF guard for certificate-published URLs: resolve the host through
+/// `transport` and refuse any answer that is not a public unicast
+/// address.
 ///
 /// Returns the vetted socket addresses, so the transport connects to
 /// exactly what was checked rather than resolving the name again.
@@ -404,14 +426,14 @@ fn is_non_public_v6(v6: Ipv6Addr) -> bool {
 /// test timestamp authority may live on a private network.
 ///
 /// # Errors
-/// [`HttpError::UnsafeDestination`] when the host does not resolve,
-/// resolves to nothing, or any answer is non-public.
-pub fn guard_destination(url: &Uri) -> Result<Vec<SocketAddr>, HttpError> {
+/// The transport's resolver failure; [`HttpError::UnsafeDestination`]
+/// when the host resolves to nothing, or any answer is non-public.
+pub fn guard_destination(
+    transport: &dyn HttpTransport,
+    url: &Uri,
+) -> Result<Vec<SocketAddr>, HttpError> {
     let host = url.host().to_string();
-    let answers: Vec<SocketAddr> = (host.as_str(), url.port())
-        .to_socket_addrs()
-        .map_err(|error| HttpError::UnsafeDestination(format!("resolve {host}: {error}")))?
-        .collect();
+    let answers = transport.resolve(&host, url.port())?;
     if answers.is_empty() {
         return Err(HttpError::UnsafeDestination(format!(
             "{host} resolved to no addresses"
@@ -438,9 +460,9 @@ pub fn authority_redirect_ok(from: &Uri, to: &Uri) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        BENCHMARKING, DOCUMENTATION_V6, HttpError, HttpTransport, RESERVED_V4, SocketAddr,
-        THIS_NETWORK, Uri, clear_http_transport, get, guard_destination, is_non_public, post,
-        set_http_transport,
+        BENCHMARKING, DOCUMENTATION_V6, DefaultHttpTransport, HttpError, HttpTransport,
+        RESERVED_V4, SocketAddr, THIS_NETWORK, Uri, clear_http_transport, get, guard_destination,
+        is_non_public, post, set_http_transport,
     };
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -466,14 +488,83 @@ mod tests {
     /// Content type passed by the post test; no body is ever sent.
     const TEST_CONTENT_TYPE: &str = "application/octet-stream";
 
+    /// A name a resolver answers with the loopback address.
+    const LOOPBACK_NAME: &str = "localhost";
+    /// A name a resolver answers with a public address.
+    const PUBLIC_NAME: &str = "public.example";
+    /// A name a resolver answers with a public and a loopback address.
+    const MIXED_NAME: &str = "mixed.example";
+    /// A name a resolver answers with nothing.
+    const EMPTY_NAME: &str = "empty.example";
+
     fn uri(text: &str) -> Uri {
         Uri::parse(text.to_owned()).expect("test URL parses")
+    }
+
+    /// A transport whose resolver reads address literals and knows the
+    /// names above; it serves nothing.
+    struct ScriptedResolver;
+
+    impl HttpTransport for ScriptedResolver {
+        fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, HttpError> {
+            let at = |ip: IpAddr| SocketAddr::new(ip, port);
+            if let Ok(ip) = host.parse::<IpAddr>() {
+                return Ok(vec![at(ip)]);
+            }
+            match host {
+                LOOPBACK_NAME => Ok(vec![at(IpAddr::V4(Ipv4Addr::LOCALHOST))]),
+                PUBLIC_NAME => Ok(vec![at(IpAddr::V4(PUBLIC_V4))]),
+                MIXED_NAME => Ok(vec![
+                    at(IpAddr::V4(PUBLIC_V4)),
+                    at(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                ]),
+                EMPTY_NAME => Ok(Vec::new()),
+                _ => Err(HttpError::Io(std::io::Error::from(
+                    std::io::ErrorKind::NotFound,
+                ))),
+            }
+        }
+
+        fn get(
+            &self,
+            _url: &Uri,
+            _addresses: &[SocketAddr],
+            _max_bytes: usize,
+        ) -> Result<Vec<u8>, HttpError> {
+            Ok(Vec::new())
+        }
+
+        fn post(
+            &self,
+            _url: &Uri,
+            _addresses: &[SocketAddr],
+            _content_type: &str,
+            _body: &[u8],
+            _max_bytes: usize,
+        ) -> Result<Vec<u8>, HttpError> {
+            Ok(Vec::new())
+        }
+
+        fn post_authority(
+            &self,
+            _url: &Uri,
+            _content_type: &str,
+            _body: &[u8],
+            _max_bytes: usize,
+            _auth_header: Option<&str>,
+        ) -> Result<Vec<u8>, HttpError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn guarded(url: &str) -> Result<Vec<SocketAddr>, HttpError> {
+        guard_destination(&ScriptedResolver, &uri(url))
     }
 
     #[test]
     fn loopback_name_is_refused() {
         assert!(matches!(
-            guard_destination(&uri("http://localhost/")),
+            guarded("http://localhost/"),
             Err(HttpError::UnsafeDestination(_))
         ));
     }
@@ -481,8 +572,38 @@ mod tests {
     #[test]
     fn loopback_literal_is_refused() {
         assert!(matches!(
-            guard_destination(&uri("http://127.0.0.1/")),
+            guarded("http://127.0.0.1/"),
             Err(HttpError::UnsafeDestination(_))
+        ));
+    }
+
+    #[test]
+    fn the_guard_checks_every_answer_the_transport_resolves() {
+        let public = uri("http://public.example/");
+        let vetted = guard_destination(&ScriptedResolver, &public).expect("a public name passes");
+        assert_eq!(
+            vetted,
+            vec![SocketAddr::new(IpAddr::V4(PUBLIC_V4), public.port())]
+        );
+        assert!(matches!(
+            guarded("http://mixed.example/"),
+            Err(HttpError::UnsafeDestination(_))
+        ));
+        assert!(matches!(
+            guarded("http://empty.example/"),
+            Err(HttpError::UnsafeDestination(_))
+        ));
+        assert!(matches!(
+            guarded("http://unknown.example/"),
+            Err(HttpError::Io(_))
+        ));
+    }
+
+    #[test]
+    fn without_a_transport_nothing_resolves() {
+        assert!(matches!(
+            guard_destination(&DefaultHttpTransport, &uri("http://9.9.9.9/")),
+            Err(HttpError::Io(_))
         ));
     }
 
@@ -528,7 +649,7 @@ mod tests {
     fn a_public_address_passes() {
         assert!(!is_non_public(IpAddr::V4(PUBLIC_V4)));
         assert!(!is_non_public(IpAddr::V6(PUBLIC_V4.to_ipv6_mapped())));
-        let vetted = guard_destination(&uri("http://9.9.9.9/")).expect("a public literal passes");
+        let vetted = guarded("http://9.9.9.9/").expect("a public literal passes");
         assert!(
             vetted
                 .iter()
@@ -542,6 +663,10 @@ mod tests {
     struct RecordingTransport;
 
     impl HttpTransport for RecordingTransport {
+        fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, HttpError> {
+            ScriptedResolver.resolve(host, port)
+        }
+
         fn get(
             &self,
             _url: &Uri,

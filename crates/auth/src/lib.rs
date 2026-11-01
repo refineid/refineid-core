@@ -29,7 +29,7 @@ pub mod verify;
 
 pub use activation::{
     ActivationCode, ActivationReport, ActivationScheme, CardActivationNeeds,
-    CredentialHealthReport, PinChangeRecord, read_pin_change_record,
+    CredentialHealthReport, PinChangeRecord, pin_awaits_activation, read_pin_change_record,
     read_puk_status_from_container,
 };
 pub use credentials::{

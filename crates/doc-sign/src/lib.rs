@@ -60,6 +60,7 @@ pub mod rng;
 pub use refineid_cms::rsa;
 #[cfg(feature = "pcsc")]
 pub mod service;
+pub mod signed_name;
 #[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(test)]

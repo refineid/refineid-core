@@ -65,7 +65,7 @@ pub const PUK_REFERENCE_ORGANIZATIONAL: u8 = 0x12;
 pub const ORGANIZATIONAL_PIN_MAX_LENGTH: usize = 8;
 
 /// VERIFY instruction byte (ISO 7816-4 section 7.5.6).
-pub(crate) const VERIFY_INS: u8 = 0x20;
+pub const VERIFY_INS: u8 = 0x20;
 /// VERIFY P1 selecting the verify operation.
 pub(crate) const VERIFY_P1: u8 = 0x00;
 

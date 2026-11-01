@@ -30,11 +30,12 @@
 //! without this material becomes uncheckable. Collecting it at signing
 //! time freezes the evidence while it is still there to freeze.
 
-use crate::crl::{OwnedCrl, VerifiedCrl};
+use crate::crl::{CrlReason, OwnedCrl, VerifiedCrl};
 use crate::ocsp;
 use crate::revocation::{self, RevocationStatus};
 use crate::uri::Uri;
 use crate::validation::ValidationMaterial;
+use crate::verification::trust::graver;
 use crate::x509_ext::CertificateExt;
 use refineid_cms::oid::Oid;
 use refineid_cms::x509::{
@@ -132,12 +133,23 @@ pub enum MaterialError {
     Rng(String),
     /// A responder was unreachable, or its answer did not hold up.
     Revocation(String),
-    /// The responder says the signing certificate is revoked.
+    /// A verified answer says a certificate on the path is revoked.
     ///
     /// Not a failure of the machinery: the answer arrived, was checked,
     /// and says the key should no longer be used. Embedding it would
-    /// build a long-term signature whose own evidence refutes it.
-    Revoked(String),
+    /// build a long-term signature whose own evidence refutes it. Of
+    /// several revoked certificates on a path the gravest is reported:
+    /// a compromise before any other reason, then the earliest
+    /// (the same rule as [`crate::verification::Revocation`]).
+    Revoked {
+        /// The revocation time the answer states.
+        revoked_at: DateTime,
+        /// The `CRLReason` the answer states, when it states one
+        /// (RFC 5280 sec.5.3.1).
+        reason: Option<CrlReason>,
+        /// Where the answer came from and what it said.
+        detail: String,
+    },
 }
 
 impl core::fmt::Display for MaterialError {
@@ -152,7 +164,7 @@ impl core::fmt::Display for MaterialError {
             Self::ChainTooDeep => f.write_str("certificate chain exceeds the depth limit"),
             Self::Rng(detail) => write!(f, "no random nonce: {detail}"),
             Self::Revocation(detail) => write!(f, "revocation: {detail}"),
-            Self::Revoked(detail) => write!(f, "certificate revoked: {detail}"),
+            Self::Revoked { detail, .. } => write!(f, "certificate revoked: {detail}"),
         }
     }
 }
@@ -170,6 +182,61 @@ pub enum NoncePolicy {
     AllowMissingEcho,
 }
 
+/// Where a certificate path may stop.
+#[derive(Debug, Clone, Copy)]
+pub enum ChainAnchor<'a> {
+    /// At one of these exact DER certificates, approved by policy for
+    /// the path's role.
+    Approved(&'a [&'a [u8]]),
+    /// At a certificate the configured service presented itself, such
+    /// as the chain a timestamp token embeds: its self-issued
+    /// certificates; without any, every one other than the leaf; the
+    /// leaf only when it presented nothing else.
+    ///
+    /// The service is trusted as configured. What is still checked is
+    /// that the presented chain holds together: names, signatures,
+    /// validity and roles up to the anchor, and current status for every
+    /// certificate below it. Above an anchor that is not self-issued
+    /// the collector climbs further, best effort, for the parents and
+    /// their status, so the store answers for the service's own
+    /// certificate too.
+    Configured(&'a [&'a [u8]]),
+}
+
+impl<'a> ChainAnchor<'a> {
+    /// The exact certificates a path from `leaf_der` may stop at.
+    fn anchor_ders(self, leaf_der: &[u8]) -> Vec<&'a [u8]> {
+        match self {
+            Self::Approved(anchors) => anchors.to_vec(),
+            Self::Configured(presented) => {
+                let self_issued: Vec<&[u8]> = presented
+                    .iter()
+                    .copied()
+                    .filter(|der| {
+                        OwnedCert::from_der(der).is_ok_and(|certificate| {
+                            let view = certificate.view();
+                            view.issuer.as_der() == view.subject.as_der()
+                        })
+                    })
+                    .collect();
+                if !self_issued.is_empty() {
+                    return self_issued;
+                }
+                let above_leaf: Vec<&[u8]> = presented
+                    .iter()
+                    .copied()
+                    .filter(|der| *der != leaf_der)
+                    .collect();
+                if above_leaf.is_empty() {
+                    presented.to_vec()
+                } else {
+                    above_leaf
+                }
+            }
+        }
+    }
+}
+
 /// One independently authenticated certificate path to preserve.
 ///
 /// A signer path and every timestamp path get separate starts so each
@@ -183,8 +250,8 @@ pub struct ChainStart<'a> {
     /// Authenticated instant at which the path must be valid: signing
     /// time for the card signer, timestamp `genTime` for a TSA.
     pub reference_time: DateTime,
-    /// Exact DER identities at which this path is allowed to stop.
-    pub approved_anchor_ders: &'a [&'a [u8]],
+    /// Where this path is allowed to stop.
+    pub anchor: ChainAnchor<'a>,
     /// Freshness rule for the path's OCSP requests.
     pub nonce_policy: NoncePolicy,
     /// Whether the leaf itself belongs in the output store. The card
@@ -194,16 +261,29 @@ pub struct ChainStart<'a> {
     /// Whether the exact approved terminal certificate belongs in the
     /// output store. A card root can be omitted because it is already a
     /// local trust decision; a TSA path's anchor must travel with the
-    /// path so an offline validator can reconstruct it.
+    /// path so an offline validator can reconstruct it. A
+    /// [`ChainAnchor::Configured`] anchor always travels: it is not a
+    /// local trust decision, and the parents climbed above it would
+    /// otherwise travel without it.
     pub include_anchor: bool,
+}
+
+impl ChainStart<'_> {
+    /// Whether the path's anchor belongs in the output store.
+    const fn keeps_anchor(&self) -> bool {
+        self.include_anchor || matches!(self.anchor, ChainAnchor::Configured(_))
+    }
 }
 
 /// Collect authenticated LT material for every supplied chain.
 ///
 /// Every non-anchor certificate must have a cryptographically verified,
 /// current OCSP response or CRL. Every child-to-issuer signature is
-/// verified, and a path ends only at a byte-identical anchor supplied
-/// for that specific [`ChainStart`]. Partial material is never returned.
+/// verified, and a path ends only at a byte-identical anchor of that
+/// specific [`ChainStart`]. Partial material is never returned. A
+/// revoked answer does not end the walk: every certificate on every
+/// path is still asked about, and the gravest revocation found is the
+/// result.
 ///
 /// # Errors
 /// [`MaterialError`] when any path, issuer, trust anchor, or revocation
@@ -238,26 +318,26 @@ pub fn collect_chains_with_candidates(
     )
 }
 
-/// Verify one certificate path to an exact policy-approved anchor.
+/// Verify one certificate path to an exact anchor of `anchor`.
 ///
 /// This is the trust decision used for a level-T timestamp: certificate
 /// signatures, issuer roles, validity at the authenticated token time,
-/// cycles, and the explicit terminal identity are all checked. It does
+/// cycles, and the terminal identity are all checked. It does
 /// not require a revocation responder to be online and does not claim LT
 /// evidence. Call [`collect_chains_with_candidates`] when the verified
 /// path and current status objects must also be embedded.
 ///
-/// The returned path contains the leaf first and the approved anchor
-/// last. Supplied candidates may satisfy issuer links but never become
+/// The returned path contains the leaf first and the anchor last.
+/// Supplied candidates may satisfy issuer links but never become
 /// implicit anchors.
 ///
 /// # Errors
 /// [`MaterialError`] when the path is malformed, invalid, cyclic, too
-/// deep, or cannot reach one of `approved_anchor_ders`.
-pub fn verify_chain_to_approved_anchor(
+/// deep, or cannot reach an anchor of `anchor`.
+pub fn verify_chain_to_anchor(
     leaf_der: &[u8],
     reference_time: DateTime,
-    approved_anchor_ders: &[&[u8]],
+    anchor: ChainAnchor<'_>,
     candidate_ders: &[&[u8]],
 ) -> Result<Vec<Vec<u8>>, MaterialError> {
     let mut collection = Collection::default();
@@ -268,7 +348,7 @@ pub fn verify_chain_to_approved_anchor(
     verify_chain_with(
         leaf_der,
         reference_time,
-        approved_anchor_ders,
+        &anchor.anchor_ders(leaf_der),
         &HttpEvidenceProvider,
         &mut collection,
     )
@@ -313,8 +393,7 @@ struct HttpEvidenceProvider;
 
 impl EvidenceProvider for HttpEvidenceProvider {
     fn fetch_issuer(&self, url: &Uri) -> Result<Vec<u8>, String> {
-        let fetched =
-            http::get(url, MAX_FETCH_BYTES, http::USER_AGENT).map_err(|e| e.to_string())?;
+        let fetched = http::get(url, MAX_FETCH_BYTES).map_err(|e| e.to_string())?;
         // A `.crt` served as PEM is ordinary, whatever the content
         // type says. The validation store carries the canonical DER.
         crate::text::decode_cert_pem_or_der(&fetched)
@@ -356,10 +435,39 @@ fn collect_chains_seeded_with<P: EvidenceProvider>(
     for candidate in candidate_ders {
         push_candidate(&mut collection, candidate);
     }
+    let mut revoked = None;
     for start in starts {
-        walk(*start, evidence_time, provider, &mut collection)?;
+        walk(
+            *start,
+            evidence_time,
+            provider,
+            &mut collection,
+            &mut revoked,
+        )?;
     }
-    Ok(collection.material)
+    revoked.map_or(Ok(collection.material), Err)
+}
+
+/// Keep in `kept` the graver of it and `found`, both
+/// [`MaterialError::Revoked`]: a compromise outranks any other reason,
+/// then the earlier revocation time does.
+fn keep_graver(kept: &mut Option<MaterialError>, found: MaterialError) {
+    let MaterialError::Revoked {
+        revoked_at, reason, ..
+    } = found
+    else {
+        return;
+    };
+    let known = match kept {
+        Some(MaterialError::Revoked {
+            revoked_at, reason, ..
+        }) => Some((*revoked_at, *reason)),
+        _ => None,
+    };
+    match known {
+        Some(pair) if graver(Some(pair), revoked_at, reason) == pair => {}
+        _ => *kept = Some(found),
+    }
 }
 
 /// Per-path cycle and depth guard.
@@ -385,14 +493,19 @@ impl WalkGuard {
     }
 }
 
-/// Walk one path to one of its own explicitly approved anchors.
+/// Walk one path to one of its own anchors.
+///
+/// A revoked answer goes into `revoked` ([`keep_graver`]) and the walk
+/// goes on; any other failure ends it.
 fn walk<P: EvidenceProvider>(
     start: ChainStart<'_>,
     evidence_time: DateTime,
     provider: &P,
     collection: &mut Collection,
+    revoked: &mut Option<MaterialError>,
 ) -> Result<(), MaterialError> {
-    if start.approved_anchor_ders.is_empty() {
+    let anchors = start.anchor.anchor_ders(start.leaf_der);
+    if anchors.is_empty() {
         return Err(MaterialError::NoTrustAnchor);
     }
     let mut current_der = start.leaf_der.to_vec();
@@ -410,9 +523,19 @@ fn walk<P: EvidenceProvider>(
         validate_certificate_time(&current_view, start.reference_time)?;
         guard.enter(&current_der)?;
 
-        if is_approved_anchor(&current_der, start.approved_anchor_ders) {
-            if start.include_anchor {
+        if is_approved_anchor(&current_der, &anchors) {
+            if start.keeps_anchor() {
                 push_certificate(&mut collection.material, &current_der);
+            }
+            if matches!(start.anchor, ChainAnchor::Configured(_)) {
+                enrich_above_anchor(
+                    &current_der,
+                    start,
+                    evidence_time,
+                    provider,
+                    collection,
+                    revoked,
+                );
             }
             return Ok(());
         }
@@ -428,9 +551,10 @@ fn walk<P: EvidenceProvider>(
             &current_view,
             start.reference_time,
             subordinate_ca_count,
-            start.approved_anchor_ders,
+            &anchors,
             &collection.candidates,
             provider,
+            IssuerCheck::Path,
         )?;
         let issuer = OwnedCert::from_der(&issuer_der)
             .map_err(|e| MaterialError::InvalidIssuer(format!("parse: {e}")))?;
@@ -443,22 +567,82 @@ fn walk<P: EvidenceProvider>(
             &issuer_view,
             start.reference_time,
             subordinate_ca_count,
-            is_approved_anchor(&issuer_der, start.approved_anchor_ders),
+            is_approved_anchor(&issuer_der, &anchors),
         )?;
 
-        let evidence = provider.status(
+        match provider.status(
             start.nonce_policy,
             &current_view,
             &issuer_view,
             evidence_time,
-        )?;
-        push_status(&mut collection.material, evidence);
+        ) {
+            Ok(evidence) => push_status(&mut collection.material, evidence),
+            Err(found @ MaterialError::Revoked { .. }) => keep_graver(revoked, found),
+            Err(other) => return Err(other),
+        }
 
-        let issuer_is_anchor = is_approved_anchor(&issuer_der, start.approved_anchor_ders);
+        let issuer_is_anchor = is_approved_anchor(&issuer_der, &anchors);
         push_candidate(collection, &issuer_der);
-        if !issuer_is_anchor || start.include_anchor {
+        if !issuer_is_anchor || start.keeps_anchor() {
             push_certificate(&mut collection.material, &issuer_der);
         }
+        current_der = issuer_der;
+    }
+}
+
+/// Add, best effort, the parent certificates and current status above
+/// a [`ChainAnchor::Configured`] anchor that is not self-issued.
+///
+/// The anchor ends the strict path, so its own status is never asked
+/// there; a timestamp token anchored on an intermediate would otherwise
+/// leave the authority's certificate without evidence. The strict
+/// result below the anchor stands whatever happens here: a parent or
+/// status that cannot be found or authenticated ends the climb quietly.
+/// A verified revoked answer is kept like one below the anchor.
+fn enrich_above_anchor<P: EvidenceProvider>(
+    anchor_der: &[u8],
+    start: ChainStart<'_>,
+    evidence_time: DateTime,
+    provider: &P,
+    collection: &mut Collection,
+    revoked: &mut Option<MaterialError>,
+) {
+    let mut current_der = anchor_der.to_vec();
+    let mut guard = WalkGuard::default();
+    while guard.enter(&current_der).is_ok() {
+        let Ok(current) = OwnedCert::from_der(&current_der) else {
+            return;
+        };
+        let current_view = current.view();
+        if current_view.issuer.as_der() == current_view.subject.as_der() {
+            return;
+        }
+        let Ok(issuer_der) = find_issuer(
+            &current_view,
+            start.reference_time,
+            0,
+            &[],
+            &collection.candidates,
+            provider,
+            IssuerCheck::AboveAnchor,
+        ) else {
+            return;
+        };
+        let Ok(issuer) = OwnedCert::from_der(&issuer_der) else {
+            return;
+        };
+        match provider.status(
+            start.nonce_policy,
+            &current_view,
+            &issuer.view(),
+            evidence_time,
+        ) {
+            Ok(evidence) => push_status(&mut collection.material, evidence),
+            Err(found @ MaterialError::Revoked { .. }) => keep_graver(revoked, found),
+            Err(_unavailable) => {}
+        }
+        push_candidate(collection, &issuer_der);
+        push_certificate(&mut collection.material, &issuer_der);
         current_der = issuer_der;
     }
 }
@@ -504,6 +688,7 @@ fn verify_chain_with<P: EvidenceProvider>(
             approved_anchor_ders,
             &collection.candidates,
             provider,
+            IssuerCheck::Path,
         )?;
         let issuer = OwnedCert::from_der(&issuer_der)
             .map_err(|e| MaterialError::InvalidIssuer(format!("parse: {e}")))?;
@@ -519,7 +704,18 @@ fn verify_chain_with<P: EvidenceProvider>(
     }
 }
 
-/// Find one directly valid issuer in approved anchors, material already
+/// How strictly [`find_issuer`] checks the issuer it returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IssuerCheck {
+    /// The certification path's intermediate policy, except for an
+    /// anchor.
+    Path,
+    /// Name, validity and signature only, as for an anchor: a parent
+    /// above an anchor adds status evidence, never trust.
+    AboveAnchor,
+}
+
+/// Find one directly valid issuer in the anchors, material already
 /// discovered by another path, or the subject's AIA locations.
 fn find_issuer<P: EvidenceProvider>(
     subject: &Certificate<'_>,
@@ -528,6 +724,7 @@ fn find_issuer<P: EvidenceProvider>(
     anchors: &[&[u8]],
     candidates: &[Vec<u8>],
     provider: &P,
+    check: IssuerCheck,
 ) -> Result<Vec<u8>, MaterialError> {
     for candidate_der in anchors
         .iter()
@@ -545,7 +742,7 @@ fn find_issuer<P: EvidenceProvider>(
             &candidate.view(),
             reference_time,
             subordinate_ca_count,
-            is_approved_anchor(candidate_der, anchors),
+            check == IssuerCheck::AboveAnchor || is_approved_anchor(candidate_der, anchors),
         )
         .is_ok()
         {
@@ -581,7 +778,7 @@ fn find_issuer<P: EvidenceProvider>(
             &candidate.view(),
             reference_time,
             subordinate_ca_count,
-            is_approved_anchor(&candidate_der, anchors),
+            check == IssuerCheck::AboveAnchor || is_approved_anchor(&candidate_der, anchors),
         ) {
             Ok(()) => return Ok(candidate_der),
             Err(why) => failures.push(format!("{url}: {why}")),
@@ -1210,7 +1407,6 @@ fn collect_ocsp_status(
             "application/ocsp-request",
             request.as_der(),
             MAX_FETCH_BYTES,
-            http::USER_AGENT,
         ) {
             Ok(response) => response,
             Err(why) => {
@@ -1227,7 +1423,7 @@ fn collect_ocsp_status(
             reference_time,
         ) {
             Ok(()) => return Ok((Some(response), None)),
-            Err(revoked @ MaterialError::Revoked(_)) => return Err(revoked),
+            Err(revoked @ MaterialError::Revoked { .. }) => return Err(revoked),
             Err(why) => failures.push(format!("{url}: {why}")),
         }
     }
@@ -1242,44 +1438,62 @@ fn collect_crl_status(
     failures: &mut Vec<String>,
 ) -> Result<Option<Vec<u8>>, MaterialError> {
     for url in bounded_certificate_addresses(subject.crl_distribution_urls()) {
-        let der = match http::get(&url, MAX_CRL_BYTES, http::USER_AGENT) {
+        let der = match http::get(&url, MAX_CRL_BYTES) {
             Ok(der) => der,
             Err(why) => {
                 failures.push(format!("{url}: {why}"));
                 continue;
             }
         };
-        let list = match OwnedCrl::from_der(&der) {
-            Ok(list) => list,
-            Err(why) => {
-                failures.push(format!("{url}: parse: {why}"));
-                continue;
+        match check_crl(&der, subject, issuer, reference_time) {
+            Ok(()) => return Ok(Some(der)),
+            Err(MaterialError::Revoked {
+                revoked_at,
+                reason,
+                detail,
+            }) => {
+                return Err(MaterialError::Revoked {
+                    revoked_at,
+                    reason,
+                    detail: format!("{url}: {detail}"),
+                });
             }
-        };
-        let view = list.view();
-        if let Err(why) = check_crl_times(view.this_update, view.next_update, reference_time) {
-            failures.push(format!("{url}: {why}"));
-            continue;
-        }
-
-        let verified = match VerifiedCrl::verify(&view, *issuer) {
-            Ok(verified) => verified,
-            Err(why) => {
-                failures.push(format!("{url}: {why}"));
-                continue;
-            }
-        };
-        match revocation::check_against_crl(*subject, &verified, reference_time) {
-            RevocationStatus::Good => return Ok(Some(der)),
-            RevocationStatus::Revoked { at, reason } => {
-                return Err(MaterialError::Revoked(format!(
-                    "{url}: revoked {at} ({reason:?})"
-                )));
-            }
-            other => failures.push(format!("{url}: list unusable ({other:?})")),
+            Err(why) => failures.push(format!("{url}: {why}")),
         }
     }
     Ok(None)
+}
+
+/// Check one full CRL about `subject`: it parses, is current at
+/// `reference_time`, is signed by `issuer`, and says good.
+///
+/// # Errors
+/// [`MaterialError::Revoked`] when the list revokes `subject`;
+/// [`MaterialError::Revocation`] when it is no usable answer.
+pub(crate) fn check_crl(
+    der: &[u8],
+    subject: &Certificate<'_>,
+    issuer: &Certificate<'_>,
+    reference_time: DateTime,
+) -> Result<(), MaterialError> {
+    let list = OwnedCrl::from_der(der)
+        .map_err(|why| MaterialError::Revocation(format!("parse: {why}")))?;
+    let view = list.view();
+    check_crl_times(view.this_update, view.next_update, reference_time)
+        .map_err(|why| MaterialError::Revocation(why.to_owned()))?;
+    let verified = VerifiedCrl::verify(&view, *issuer)
+        .map_err(|why| MaterialError::Revocation(why.to_string()))?;
+    match revocation::check_against_crl(*subject, &verified, reference_time) {
+        RevocationStatus::Good => Ok(()),
+        RevocationStatus::Revoked { at, reason } => Err(MaterialError::Revoked {
+            revoked_at: at,
+            reason,
+            detail: format!("revoked {at} ({reason:?})"),
+        }),
+        other => Err(MaterialError::Revocation(format!(
+            "list unusable ({other:?})"
+        ))),
+    }
 }
 
 /// Require a bounded, current validity interval on a CRL.
@@ -1319,7 +1533,7 @@ fn check_crl_times(
 /// status can only be read after signer identity, authorization, and
 /// signature verification; the type system says so rather than a
 /// comment.
-fn check_response(
+pub(crate) fn check_response(
     nonce_policy: NoncePolicy,
     der: &[u8],
     subject: &Certificate<'_>,
@@ -1419,9 +1633,11 @@ fn check_response(
     // response carried the same serial more than once.
     match answer.status {
         ocsp::CertStatus::Good => Ok(()),
-        ocsp::CertStatus::Revoked { revoked_at, .. } => {
-            Err(MaterialError::Revoked(format!("revoked at {revoked_at}")))
-        }
+        ocsp::CertStatus::Revoked { revoked_at, reason } => Err(MaterialError::Revoked {
+            revoked_at,
+            reason,
+            detail: format!("revoked at {revoked_at}"),
+        }),
         ocsp::CertStatus::Unknown => Err(MaterialError::Revocation(
             "responder does not know this certificate".to_owned(),
         )),
@@ -1533,7 +1749,7 @@ mod tests {
         Ok(ChainStart {
             leaf_der,
             reference_time: reference_time()?,
-            approved_anchor_ders: anchors,
+            anchor: ChainAnchor::Approved(anchors),
             nonce_policy: NoncePolicy::RequireEcho,
             include_leaf,
             include_anchor: false,
@@ -1613,6 +1829,196 @@ mod tests {
                 "no authenticated current answer".to_owned(),
             ))
         }
+    }
+
+    /// Answers revoked for every certificate asked about, each time
+    /// with the next of `answers`.
+    #[derive(Debug)]
+    struct RevokedEvidence {
+        answers: Vec<(DateTime, Option<CrlReason>)>,
+        statuses: Cell<usize>,
+    }
+
+    impl EvidenceProvider for RevokedEvidence {
+        fn fetch_issuer(&self, _url: &Uri) -> Result<Vec<u8>, String> {
+            Err("offline fixture has no fetched issuer".to_owned())
+        }
+
+        fn status(
+            &self,
+            _nonce_policy: NoncePolicy,
+            _subject: &Certificate<'_>,
+            _issuer: &Certificate<'_>,
+            _evidence_time: DateTime,
+        ) -> Result<StatusEvidence, MaterialError> {
+            let asked = self.statuses.get();
+            self.statuses.set(asked.saturating_add(1));
+            let (revoked_at, reason) = *self
+                .answers
+                .get(asked)
+                .ok_or_else(|| MaterialError::Revocation("no scripted answer".to_owned()))?;
+            Err(MaterialError::Revoked {
+                revoked_at,
+                reason,
+                detail: format!("answer {asked}"),
+            })
+        }
+    }
+
+    /// The revocation time and reason a result states.
+    fn revocation_of(
+        result: Result<ValidationMaterial, MaterialError>,
+    ) -> Result<(DateTime, Option<CrlReason>), Box<dyn core::error::Error>> {
+        match result {
+            Err(MaterialError::Revoked {
+                revoked_at, reason, ..
+            }) => Ok((revoked_at, reason)),
+            other => Err(format!("expected a revocation, got {other:?}").into()),
+        }
+    }
+
+    #[test]
+    fn a_revocation_does_not_end_the_walk_and_the_gravest_is_reported() -> TestResult {
+        let earlier = DateTime::new(2026, 1, 1, 0, 0, 0)?;
+        let later = DateTime::new(2026, 6, 1, 0, 0, 0)?;
+        let anchors = [DVV_ROOT_ECC_DER];
+        let chain = start(DVV_INTERMEDIATE_DER, &anchors, false)?;
+        for (answers, gravest) in [
+            (
+                vec![
+                    (earlier, Some(CrlReason::Superseded)),
+                    (later, Some(CrlReason::KeyCompromise)),
+                ],
+                (later, Some(CrlReason::KeyCompromise)),
+            ),
+            (
+                vec![
+                    (later, Some(CrlReason::CaCompromise)),
+                    (earlier, Some(CrlReason::Superseded)),
+                ],
+                (later, Some(CrlReason::CaCompromise)),
+            ),
+            (vec![(later, None), (earlier, None)], (earlier, None)),
+        ] {
+            let provider = RevokedEvidence {
+                answers,
+                statuses: Cell::new(0),
+            };
+            let result = collect_chains_with(&[chain, chain], reference_time()?, &provider);
+            check(&provider.statuses.get(), &2, "both paths were asked")?;
+            check(&revocation_of(result)?, &gravest, "the gravest revocation")?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_configured_anchor_prefers_self_issued_then_above_the_leaf() -> TestResult {
+        let leaf = DVV_INTERMEDIATE_DER;
+        check(
+            &ChainAnchor::Configured(&[leaf, DVV_ROOT_ECC_DER]).anchor_ders(leaf),
+            &vec![DVV_ROOT_ECC_DER],
+            "self-issued certificates are the anchors",
+        )?;
+        check(
+            &ChainAnchor::Configured(&[leaf, APED_OCSP_DER]).anchor_ders(leaf),
+            &vec![APED_OCSP_DER],
+            "without a self-issued one, everything above the leaf",
+        )?;
+        check(
+            &ChainAnchor::Configured(&[leaf]).anchor_ders(leaf),
+            &vec![leaf],
+            "the leaf only when nothing else was presented",
+        )?;
+        check(
+            &ChainAnchor::Approved(&[leaf]).anchor_ders(DVV_ROOT_ECC_DER),
+            &vec![leaf],
+            "approved anchors are taken as given",
+        )
+    }
+
+    #[test]
+    fn a_configured_anchor_collects_status_above_itself() -> TestResult {
+        let presented = [DVV_INTERMEDIATE_DER];
+        let configured = ChainStart {
+            anchor: ChainAnchor::Configured(&presented),
+            ..start(DVV_INTERMEDIATE_DER, &[], true)?
+        };
+        let provider = GoodEvidence::default();
+        let material = collect_chains_seeded_with(
+            &[configured],
+            &[DVV_ROOT_ECC_DER],
+            reference_time()?,
+            &provider,
+        )?;
+        check(&provider.statuses.get(), &1, "the anchor's own status")?;
+        check(
+            &material.certificates,
+            &vec![DVV_INTERMEDIATE_DER.to_vec(), DVV_ROOT_ECC_DER.to_vec()],
+            "the anchor and its parent travel",
+        )?;
+        check(
+            &material.ocsp_responses,
+            &vec![TEST_STATUS.to_vec()],
+            "the anchor's status travels",
+        )?;
+
+        let approved = start(DVV_INTERMEDIATE_DER, &presented, true)?;
+        let provider = GoodEvidence::default();
+        let material = collect_chains_seeded_with(
+            &[approved],
+            &[DVV_ROOT_ECC_DER],
+            reference_time()?,
+            &provider,
+        )?;
+        check(
+            &provider.statuses.get(),
+            &0,
+            "an approved anchor ends the walk",
+        )?;
+        check(&material.ocsp_responses.len(), &0, "no status above it")
+    }
+
+    #[test]
+    fn a_configured_anchor_travels_with_the_parents_climbed_above_it() -> TestResult {
+        let presented = [DVV_INTERMEDIATE_DER];
+        let configured = ChainStart {
+            anchor: ChainAnchor::Configured(&presented),
+            include_anchor: false,
+            ..start(DVV_INTERMEDIATE_DER, &[], false)?
+        };
+        let material = collect_chains_seeded_with(
+            &[configured],
+            &[DVV_ROOT_ECC_DER],
+            reference_time()?,
+            &GoodEvidence::default(),
+        )?;
+        check(
+            &material.certificates,
+            &vec![DVV_INTERMEDIATE_DER.to_vec(), DVV_ROOT_ECC_DER.to_vec()],
+            "the configured anchor and its parent",
+        )
+    }
+
+    #[test]
+    fn a_status_unavailable_above_a_configured_anchor_leaves_the_path_standing() -> TestResult {
+        let presented = [DVV_INTERMEDIATE_DER];
+        let configured = ChainStart {
+            anchor: ChainAnchor::Configured(&presented),
+            ..start(DVV_INTERMEDIATE_DER, &[], false)?
+        };
+        let provider = MissingEvidence::default();
+        let material = collect_chains_seeded_with(
+            &[configured],
+            &[DVV_ROOT_ECC_DER],
+            reference_time()?,
+            &provider,
+        )?;
+        check(
+            &provider.statuses.get(),
+            &1,
+            "the anchor's status was asked",
+        )?;
+        check(&material.ocsp_responses.len(), &0, "no status to keep")
     }
 
     #[test]

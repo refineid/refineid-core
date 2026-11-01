@@ -65,7 +65,7 @@ use crate::xades::{
     NAMESPACE_DSIG, NAMESPACE_XADES, SIGNATURE_METHOD_ECDSA_SHA256, SIGNATURE_METHOD_ECDSA_SHA384,
     SIGNATURE_METHOD_RSA_SHA256, SIGNATURE_METHOD_RSA_SHA384, TYPE_SIGNED_PROPERTIES,
 };
-use refineid_cms::x509::{MessageSignatureAlgorithm, OwnedCert};
+use refineid_cms::x509::{DateTime, MessageSignatureAlgorithm, OwnedCert};
 use refineid_digest::{SHA256_LEN, SHA384_LEN, SHA512_LEN, Sha256, Sha384, Sha512};
 
 /// `XAdES` 1.4.1 namespace, home of `ArchiveTimeStamp` (`ETSI EN
@@ -165,6 +165,9 @@ const ELEMENT_SIGNED_PROPERTIES: &str = "SignedProperties";
 
 /// `xades:SignedSignatureProperties`.
 const ELEMENT_SIGNED_SIGNATURE_PROPERTIES: &str = "SignedSignatureProperties";
+
+/// `xades:SigningTime`.
+const ELEMENT_SIGNING_TIME: &str = "SigningTime";
 
 /// `xades:SigningCertificateV2`.
 const ELEMENT_SIGNING_CERTIFICATE_V2: &str = "SigningCertificateV2";
@@ -670,6 +673,8 @@ pub struct XadesSignature {
     references: Vec<Reference>,
     /// The `SigningCertificate` binding.
     binding: SignerBinding,
+    /// The `SigningTime` property, when present and readable.
+    signing_time: Option<DateTime>,
     /// Every `SignatureTimeStamp` token.
     signature_timestamps: Vec<SignatureTimestamp>,
     /// Every `ArchiveTimeStamp`, in document order.
@@ -774,15 +779,15 @@ impl XadesSignature {
                 read_archive_timestamps(signature, signed_info, signature_value_element, unsigned)?;
         }
 
-        let binding = match signed_properties
-            .and_then(|properties| {
-                properties.child(NAMESPACE_XADES, ELEMENT_SIGNED_SIGNATURE_PROPERTIES)
-            })
-            .and_then(|properties| {
-                properties
-                    .child(NAMESPACE_XADES, ELEMENT_SIGNING_CERTIFICATE_V2)
-                    .or_else(|| properties.child(NAMESPACE_XADES, ELEMENT_SIGNING_CERTIFICATE))
-            }) {
+        let signed_signature_properties = signed_properties.and_then(|properties| {
+            properties.child(NAMESPACE_XADES, ELEMENT_SIGNED_SIGNATURE_PROPERTIES)
+        });
+        let signing_time = signed_signature_properties.and_then(single_signing_time);
+        let binding = match signed_signature_properties.and_then(|properties| {
+            properties
+                .child(NAMESPACE_XADES, ELEMENT_SIGNING_CERTIFICATE_V2)
+                .or_else(|| properties.child(NAMESPACE_XADES, ELEMENT_SIGNING_CERTIFICATE))
+        }) {
             None => SignerBinding::Absent,
             Some(property) => read_cert_digest(property)?
                 .map_or(SignerBinding::Unverifiable, SignerBinding::Digest),
@@ -879,6 +884,7 @@ impl XadesSignature {
             signature_value,
             references,
             binding,
+            signing_time,
             signature_timestamps,
             archive_timestamps,
             counter_signature: countersigned.is_some(),
@@ -893,6 +899,15 @@ impl XadesSignature {
     #[must_use]
     pub fn counter_signatures(&self) -> &[Result<Self, XadesReadError>] {
         &self.counter_signatures
+    }
+
+    /// The time the `SigningTime` property claims (`ETSI EN 319 132-1`
+    /// clause 5.2.1), as UTC; `None` when absent or not an
+    /// `xsd:dateTime` with a time zone. A claim of the signer's clock,
+    /// proving nothing.
+    #[must_use]
+    pub const fn signing_time(&self) -> Option<DateTime> {
+        self.signing_time
     }
 
     /// The signer certificate: the certificate the
@@ -1341,8 +1356,192 @@ fn read_reference(
     Ok(Ok(Reference { target, digest }))
 }
 
+/// An `xsd:dateTime` (XML Schema Part 2 sec.3.2.7) with a time zone,
+/// as UTC: `YYYY-MM-DDThh:mm:ss`, optional fractional seconds, then
+/// `Z` or an offset `+hh:mm` / `-hh:mm`. Fractional seconds, one or
+/// more digits, are dropped. A value without a time zone names no instant, an offset
+/// beyond `14:00` or with minutes of sixty or more is malformed, and an
+/// instant before 1970 is not representable; each yields `None`.
+/// The instant the one `SigningTime` of `properties` names; `None`
+/// without one, with more than one (`ETSI EN 319 132-1` clause 5.2.1
+/// allows at most one), or with one that does not read.
+fn single_signing_time(properties: ElementRef<'_>) -> Option<DateTime> {
+    let mut times = properties.children_named(NAMESPACE_XADES, ELEMENT_SIGNING_TIME);
+    let only = times.next()?;
+    if times.next().is_some() {
+        return None;
+    }
+    xml_date_time(&only.text())
+}
+
+fn xml_date_time(text: &str) -> Option<DateTime> {
+    /// Separator of date and time.
+    const DATE_TIME_SEPARATOR: char = 'T';
+    /// Separator of the date fields.
+    const DATE_SEPARATOR: char = '-';
+    /// Separator of the clock fields and of the offset's.
+    const CLOCK_SEPARATOR: char = ':';
+    /// Start of fractional seconds.
+    const FRACTION_SEPARATOR: char = '.';
+    /// The UTC time zone designator.
+    const UTC_DESIGNATOR: char = 'Z';
+    /// Sign of an offset east of UTC.
+    const EAST: char = '+';
+    /// Sign of an offset west of UTC.
+    const WEST: char = '-';
+    /// Seconds in a minute.
+    const SECONDS_PER_MINUTE: u64 = 60;
+    /// Minutes in an hour.
+    const MINUTES_PER_HOUR: u64 = 60;
+    /// The largest offset's hours (XML Schema Part 2 sec.3.2.7.3:
+    /// `14:00`).
+    const MAX_OFFSET_HOURS: u64 = 14;
+    /// The largest offset, in minutes.
+    const MAX_OFFSET_MINUTES: u64 = MAX_OFFSET_HOURS * MINUTES_PER_HOUR;
+
+    /// One or more ASCII digits.
+    fn digits(text: &str) -> bool {
+        !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+    }
+
+    /// One field of ASCII digits.
+    fn field<T: core::str::FromStr>(text: &str) -> Option<T> {
+        digits(text).then(|| text.parse().ok()).flatten()
+    }
+
+    /// Exactly three digit fields separated by `separator`.
+    fn three<T: core::str::FromStr>(text: &str, separator: char) -> Option<(T, T, T)> {
+        let mut fields = text.split(separator);
+        let first = field(fields.next()?)?;
+        let second = field(fields.next()?)?;
+        let third = field(fields.next()?)?;
+        fields.next().is_none().then_some((first, second, third))
+    }
+
+    let text = text.trim();
+    let (date, time) = text.split_once(DATE_TIME_SEPARATOR)?;
+    let (year, month, day): (u16, u16, u16) = three(date, DATE_SEPARATOR)?;
+    let (month, day) = (u8::try_from(month).ok()?, u8::try_from(day).ok()?);
+    let (clock, east_of_utc, offset) = if let Some(clock) = time.strip_suffix(UTC_DESIGNATOR) {
+        (clock, true, None)
+    } else {
+        let at = time.rfind([EAST, WEST])?;
+        let (clock, zone) = time.split_at(at);
+        let mut zone_chars = zone.chars();
+        let east = zone_chars.next() == Some(EAST);
+        let (hours, minutes) = zone_chars.as_str().split_once(CLOCK_SEPARATOR)?;
+        let hours: u64 = field(hours)?;
+        let minutes: u64 = field(minutes)?;
+        if minutes >= MINUTES_PER_HOUR {
+            return None;
+        }
+        let offset_minutes = hours.checked_mul(MINUTES_PER_HOUR)?.checked_add(minutes)?;
+        if offset_minutes > MAX_OFFSET_MINUTES {
+            return None;
+        }
+        let seconds = offset_minutes.checked_mul(SECONDS_PER_MINUTE)?;
+        (clock, east, Some(core::time::Duration::from_secs(seconds)))
+    };
+    let whole = match clock.split_once(FRACTION_SEPARATOR) {
+        None => clock,
+        Some((whole, fraction)) if digits(fraction) => whole,
+        Some(_) => return None,
+    };
+    let (hour, minute, second): (u8, u8, u8) = three(whole, CLOCK_SEPARATOR)?;
+    let local = DateTime::new(year, month, day, hour, minute, second).ok()?;
+    let Some(offset) = offset else {
+        return Some(local);
+    };
+    let local = local.unix_duration();
+    let utc = if east_of_utc {
+        local.checked_sub(offset)?
+    } else {
+        local.checked_add(offset)?
+    };
+    DateTime::from_unix_duration(utc).ok()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_xml_date_time_reads_as_utc() {
+        /// Noon UTC.
+        const UTC: &str = "2026-06-15T12:00:00Z";
+        /// The same instant two hours east of UTC, with a fraction.
+        const EAST: &str = "2026-06-15T14:00:00.250+02:00";
+        /// The same instant three hours west of UTC.
+        const WEST: &str = "2026-06-15T09:00:00-03:00";
+        /// No time zone: no instant.
+        const FLOATING: &str = "2026-06-15T12:00:00";
+        let noon = refineid_cms::x509::DateTime::new(2026, 6, 15, 12, 0, 0).expect("noon");
+        assert_eq!(super::xml_date_time(UTC), Some(noon));
+        assert_eq!(super::xml_date_time(EAST), Some(noon));
+        assert_eq!(super::xml_date_time(WEST), Some(noon));
+        assert_eq!(super::xml_date_time(FLOATING), None);
+    }
+
+    #[test]
+    fn an_unrepresentable_or_malformed_xml_date_time_is_none() {
+        /// A second before the epoch.
+        const BEFORE_EPOCH: &str = "1969-12-31T23:59:59Z";
+        /// Half an hour after the epoch, written an hour east of UTC:
+        /// half an hour before the epoch.
+        const EAST_OF_EPOCH: &str = "1970-01-01T00:30:00+01:00";
+        /// An offset with sixty minutes.
+        const SIXTY_MINUTES: &str = "2026-06-15T12:00:00+01:60";
+        /// An offset beyond fourteen hours.
+        const FIFTEEN_HOURS: &str = "2026-06-15T12:00:00+15:00";
+        /// A month that does not fit its field.
+        const WIDE_MONTH: &str = "2026-300-15T12:00:00Z";
+        /// Fractions that are not one or more digits.
+        const LETTER_FRACTION: &str = "2026-06-15T12:00:00.abcZ";
+        const EMPTY_FRACTION: &str = "2026-06-15T12:00:00.Z";
+        const TWO_FRACTIONS: &str = "2026-06-15T12:00:00.1.2Z";
+        /// An offset hidden in the fraction ahead of a `Z`.
+        const OFFSET_IN_FRACTION: &str = "2026-06-15T14:00:00.000+02:00Z";
+        /// A signed field.
+        const SIGNED_YEAR: &str = "+2026-06-15T12:00:00Z";
+        for text in [
+            BEFORE_EPOCH,
+            EAST_OF_EPOCH,
+            SIXTY_MINUTES,
+            FIFTEEN_HOURS,
+            WIDE_MONTH,
+            LETTER_FRACTION,
+            EMPTY_FRACTION,
+            TWO_FRACTIONS,
+            OFFSET_IN_FRACTION,
+            SIGNED_YEAR,
+        ] {
+            assert_eq!(super::xml_date_time(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn more_than_one_signing_time_claims_none() {
+        let properties = |times: &[&str]| {
+            let inner: String = times
+                .iter()
+                .map(|time| format!("<x:SigningTime>{time}</x:SigningTime>"))
+                .collect();
+            format!(
+                "<x:SignedSignatureProperties xmlns:x=\"{NAMESPACE_XADES}\">{inner}</x:SignedSignatureProperties>"
+            )
+        };
+        let read = |times: &[&str]| {
+            let document = XmlDocument::parse(properties(times).into_bytes()).expect("parses");
+            super::single_signing_time(document.root())
+        };
+        /// Noon UTC, and an hour later.
+        const NOON: &str = "2026-06-15T12:00:00Z";
+        const ONE: &str = "2026-06-15T13:00:00Z";
+        let noon = refineid_cms::x509::DateTime::new(2026, 6, 15, 12, 0, 0).expect("noon");
+        assert_eq!(read(&[NOON]), Some(noon));
+        assert_eq!(read(&[NOON, ONE]), None);
+        assert_eq!(read(&[NOON, NOON]), None);
+        assert_eq!(read(&[]), None);
+    }
+
     use super::{
         CANONICALIZATION_EXCLUSIVE, CANONICALIZATION_EXCLUSIVE_COMMENTS, NAMESPACE_DSIG,
         NAMESPACE_XADES, NAMESPACE_XADES_141, XadesJudgement, XadesReadError, XadesSignature,

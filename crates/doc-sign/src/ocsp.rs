@@ -68,7 +68,8 @@ type ResponseDataParts<'a> = (
 const SHA1_LEN: usize = crate::digest::SHA1_LEN;
 
 /// `id-pkix-ocsp-nonce` (RFC 8954 sec.2.1).
-const OID_OCSP_NONCE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.48.1.2");
+pub(crate) const OID_OCSP_NONCE: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.48.1.2");
 
 /// DER tags this module writes, and dispatches on when reading.
 /// Reading a tag is a byte comparison rather than a `der::Tag`

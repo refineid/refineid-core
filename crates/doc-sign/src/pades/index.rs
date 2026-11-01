@@ -12,7 +12,8 @@
 //! a string is not a key.
 //!
 //! Every count the file declares is bounded before anything is
-//! allocated for it: [`MAX_XREF_ENTRIES`] entries per file,
+//! allocated for it: [`MAX_XREF_ENTRIES`] entries per section,
+//! [`MAX_XREF_ENTRIES_READ`] entries across the `/Prev` chain,
 //! [`PdfIndex::MAX_XREF_SECTIONS`] sections in the `/Prev` chain, and
 //! [`MAX_PDF_VALUE_DEPTH`] levels of value nesting. A file past a bound
 //! is refused with an error; nothing is read in part.
@@ -44,6 +45,13 @@ use super::xref_stream;
 /// reader admits is below this, so the merged index never holds more
 /// objects than this either.
 pub(crate) const MAX_XREF_ENTRIES: usize = 1 << 20;
+
+/// Most cross-reference entries read across every section of the
+/// `/Prev` chain together: this implementation's limit, two to the
+/// twenty-third, the ISO 32000-1 Annex C, Table C.1, object ceiling
+/// with entry zero. Eight sections at [`MAX_XREF_ENTRIES`] fit; a chain
+/// of sections that each repeat a large table does not.
+pub(crate) const MAX_XREF_ENTRIES_READ: usize = 1 << 23;
 
 /// Maximum nesting accepted while reading PDF values.
 ///
@@ -712,7 +720,8 @@ impl<'a> PdfIndex<'a> {
     /// # Errors
     /// [`PdfError::MissingStartXref`] without a usable `startxref`,
     /// [`PdfError::MissingTrailer`] when a section, a trailer or a
-    /// `/Prev` link does not read or the chain loops,
+    /// `/Prev` link does not read, the chain loops, or the sections
+    /// together hold more than [`MAX_XREF_ENTRIES_READ`] entries,
     /// [`PdfError::TooManyRevisions`] past
     /// [`Self::MAX_XREF_SECTIONS`], and
     /// [`PdfError::UnsupportedCrossReferenceStream`] for a stream
@@ -724,6 +733,7 @@ impl<'a> PdfIndex<'a> {
         let mut newest: Option<(Vec<u8>, bool)> = None;
         let mut objects: HashMap<u32, XrefEntry> = HashMap::new();
         let mut sections = Vec::new();
+        let mut read = 0_usize;
 
         while let Some(offset) = next {
             if visited.len() == Self::MAX_XREF_SECTIONS {
@@ -733,6 +743,7 @@ impl<'a> PdfIndex<'a> {
                 return Err(PdfError::MissingTrailer);
             }
             let section = parse_xref_section(pdf, offset)?;
+            read = entries_read(read, section.entries.len())?;
             // An encrypted revision anywhere in the chain leaves its
             // strings and streams unreadable without the document key
             // (ISO 32000-1 sec.7.6.1).
@@ -1026,6 +1037,16 @@ fn trailer_offset(trailer: &[u8], name: &[u8]) -> Result<Option<usize>, PdfError
         .get(entry.value.clone())
         .ok_or(PdfError::MissingTrailer)?;
     parse_usize(value).map(Some).ok_or(PdfError::MissingTrailer)
+}
+
+/// The entries read across the chain once `more` are added to `read`.
+///
+/// # Errors
+/// [`PdfError::MissingTrailer`] past [`MAX_XREF_ENTRIES_READ`].
+fn entries_read(read: usize, more: usize) -> Result<usize, PdfError> {
+    read.checked_add(more)
+        .filter(|total| *total <= MAX_XREF_ENTRIES_READ)
+        .ok_or(PdfError::MissingTrailer)
 }
 
 /// The cross-reference section at `offset`: a classic table, or a
@@ -1404,4 +1425,27 @@ pub(crate) fn find_last(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .rposition(|window| window == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_XREF_ENTRIES, MAX_XREF_ENTRIES_READ, PdfError, entries_read};
+
+    #[test]
+    fn the_chain_reads_no_more_entries_than_its_total() {
+        let full_sections = MAX_XREF_ENTRIES_READ / MAX_XREF_ENTRIES;
+        let mut read = 0;
+        for _ in 0..full_sections {
+            read = entries_read(read, MAX_XREF_ENTRIES).expect("within the total");
+        }
+        assert_eq!(read, MAX_XREF_ENTRIES_READ);
+        assert!(matches!(
+            entries_read(read, 1),
+            Err(PdfError::MissingTrailer)
+        ));
+        assert!(matches!(
+            entries_read(usize::MAX, 1),
+            Err(PdfError::MissingTrailer)
+        ));
+    }
 }

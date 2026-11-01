@@ -248,10 +248,11 @@ impl VerifiedTimestampToken {
     }
 
     /// A token assembled from its parts without verification, for
-    /// tests of the code that consumes verified tokens.
-    #[cfg(test)]
+    /// tests of the code that consumes verified tokens; compiled for
+    /// this crate's tests and behind the `testkit` feature.
+    #[cfg(any(test, feature = "testkit"))]
     #[must_use]
-    pub(crate) fn from_parts_for_test(
+    pub fn from_parts_for_test(
         token: Vec<u8>,
         signer_certificate: OwnedCert,
         embedded_certificates: Vec<OwnedCert>,
@@ -490,6 +491,16 @@ fn check_binding(
         return Err(TimestampError::NonceMismatch);
     }
     authenticate_signer(&signed_data, &tst_info)
+}
+
+/// The `TSTInfo.genTime` a token claims, read without verifying the
+/// token: what it says, not what it proves. `None` when the token does
+/// not parse as far as its `TSTInfo` (RFC 3161 sec.2.4.2).
+#[must_use]
+pub fn claimed_generation_time(token: &[u8]) -> Option<DateTime> {
+    parse_token(token)
+        .ok()
+        .map(|(_signed_data, tst_info)| tst_info.gen_time)
 }
 
 /// Parse the token as an attached `SignedData` over a `TSTInfo` with

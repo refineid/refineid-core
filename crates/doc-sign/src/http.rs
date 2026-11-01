@@ -10,13 +10,6 @@ use std::sync::RwLock;
 
 use crate::uri::{Scheme, Uri};
 
-/// Honest `User-Agent`: project, crate version, contact URL.
-pub const USER_AGENT: &str = concat!(
-    "RefineID/",
-    env!("CARGO_PKG_VERSION"),
-    " (+https://www.refineid.fi/)"
-);
-
 /// Errors from `get` / `post` / `post_authority`. Same shape across platforms
 /// so callers handle errors uniformly.
 #[derive(Debug)]
@@ -149,7 +142,8 @@ impl HttpError {
 /// the URL's host: the transport connects to one of those addresses and
 /// never resolves the host again, and it follows a redirect only to a URL
 /// that itself passes [`guard_destination`], connecting to the addresses
-/// that call returns.
+/// that call returns. The transport names its own client in the
+/// requests it sends, `User-Agent` included.
 pub trait HttpTransport: Send + Sync {
     /// Perform an HTTP GET request to one of the vetted `addresses`.
     fn get(
@@ -157,7 +151,6 @@ pub trait HttpTransport: Send + Sync {
         url: &Uri,
         addresses: &[SocketAddr],
         max_bytes: usize,
-        user_agent: &str,
     ) -> Result<Vec<u8>, HttpError>;
 
     /// Perform an HTTP POST request to one of the vetted `addresses`.
@@ -168,7 +161,6 @@ pub trait HttpTransport: Send + Sync {
         content_type: &str,
         body: &[u8],
         max_bytes: usize,
-        user_agent: &str,
     ) -> Result<Vec<u8>, HttpError>;
 
     /// Perform an HTTP POST request to an authority endpoint with optional credentials.
@@ -178,7 +170,6 @@ pub trait HttpTransport: Send + Sync {
         content_type: &str,
         body: &[u8],
         max_bytes: usize,
-        user_agent: &str,
         auth_header: Option<&str>,
     ) -> Result<Vec<u8>, HttpError>;
 }
@@ -193,7 +184,6 @@ impl HttpTransport for DefaultHttpTransport {
         _url: &Uri,
         _addresses: &[SocketAddr],
         _max_bytes: usize,
-        _user_agent: &str,
     ) -> Result<Vec<u8>, HttpError> {
         Err(HttpError::Io(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -208,7 +198,6 @@ impl HttpTransport for DefaultHttpTransport {
         _content_type: &str,
         _body: &[u8],
         _max_bytes: usize,
-        _user_agent: &str,
     ) -> Result<Vec<u8>, HttpError> {
         Err(HttpError::Io(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -222,7 +211,6 @@ impl HttpTransport for DefaultHttpTransport {
         _content_type: &str,
         _body: &[u8],
         _max_bytes: usize,
-        _user_agent: &str,
         _auth_header: Option<&str>,
     ) -> Result<Vec<u8>, HttpError> {
         Err(HttpError::Io(io::Error::new(
@@ -257,14 +245,14 @@ pub fn clear_http_transport() {
 /// public addresses only; otherwise URL parse failure, TCP failure,
 /// non-2xx HTTP status, malformed HTTP framing, body exceeding
 /// `max_bytes`.
-pub fn get(url: &Uri, max_bytes: usize, user_agent: &str) -> Result<Vec<u8>, HttpError> {
+pub fn get(url: &Uri, max_bytes: usize) -> Result<Vec<u8>, HttpError> {
     let addresses = guard_destination(url)?;
     if let Ok(guard) = GLOBAL_TRANSPORT.read()
         && let Some(transport) = guard.as_ref()
     {
-        return transport.get(url, &addresses, max_bytes, user_agent);
+        return transport.get(url, &addresses, max_bytes);
     }
-    DefaultHttpTransport.get(url, &addresses, max_bytes, user_agent)
+    DefaultHttpTransport.get(url, &addresses, max_bytes)
 }
 
 /// POST `body` to a certificate-published `url` with the supplied
@@ -279,15 +267,14 @@ pub fn post(
     content_type: &str,
     body: &[u8],
     max_bytes: usize,
-    user_agent: &str,
 ) -> Result<Vec<u8>, HttpError> {
     let addresses = guard_destination(url)?;
     if let Ok(guard) = GLOBAL_TRANSPORT.read()
         && let Some(transport) = guard.as_ref()
     {
-        return transport.post(url, &addresses, content_type, body, max_bytes, user_agent);
+        return transport.post(url, &addresses, content_type, body, max_bytes);
     }
-    DefaultHttpTransport.post(url, &addresses, content_type, body, max_bytes, user_agent)
+    DefaultHttpTransport.post(url, &addresses, content_type, body, max_bytes)
 }
 
 /// POST to an explicitly configured timestamp authority.
@@ -301,7 +288,6 @@ pub fn post_authority(
     content_type: &str,
     body: &[u8],
     max_bytes: usize,
-    user_agent: &str,
     authorization: Option<&str>,
 ) -> Result<Vec<u8>, HttpError> {
     if authorization.is_some() && url.scheme() != Scheme::Https {
@@ -310,23 +296,9 @@ pub fn post_authority(
     if let Ok(guard) = GLOBAL_TRANSPORT.read()
         && let Some(transport) = guard.as_ref()
     {
-        return transport.post_authority(
-            url,
-            content_type,
-            body,
-            max_bytes,
-            user_agent,
-            authorization,
-        );
+        return transport.post_authority(url, content_type, body, max_bytes, authorization);
     }
-    DefaultHttpTransport.post_authority(
-        url,
-        content_type,
-        body,
-        max_bytes,
-        user_agent,
-        authorization,
-    )
+    DefaultHttpTransport.post_authority(url, content_type, body, max_bytes, authorization)
 }
 
 /// An IPv4 prefix: network address and prefix length in bits.
@@ -575,7 +547,6 @@ mod tests {
             _url: &Uri,
             _addresses: &[SocketAddr],
             _max_bytes: usize,
-            _user_agent: &str,
         ) -> Result<Vec<u8>, HttpError> {
             TRANSPORT_CALLED.store(true, Ordering::SeqCst);
             Ok(Vec::new())
@@ -588,7 +559,6 @@ mod tests {
             _content_type: &str,
             _body: &[u8],
             _max_bytes: usize,
-            _user_agent: &str,
         ) -> Result<Vec<u8>, HttpError> {
             TRANSPORT_CALLED.store(true, Ordering::SeqCst);
             Ok(Vec::new())
@@ -600,7 +570,6 @@ mod tests {
             _content_type: &str,
             _body: &[u8],
             _max_bytes: usize,
-            _user_agent: &str,
             _auth_header: Option<&str>,
         ) -> Result<Vec<u8>, HttpError> {
             TRANSPORT_CALLED.store(true, Ordering::SeqCst);
@@ -611,7 +580,7 @@ mod tests {
     #[test]
     fn get_consults_guard_before_transport() {
         set_http_transport(Box::new(RecordingTransport));
-        let result = get(&uri("http://127.0.0.1/"), TEST_MAX_BYTES, super::USER_AGENT);
+        let result = get(&uri("http://127.0.0.1/"), TEST_MAX_BYTES);
         clear_http_transport();
         assert!(matches!(result, Err(HttpError::UnsafeDestination(_))));
         assert!(!TRANSPORT_CALLED.load(Ordering::SeqCst));
@@ -625,7 +594,6 @@ mod tests {
             TEST_CONTENT_TYPE,
             &[],
             TEST_MAX_BYTES,
-            super::USER_AGENT,
         );
         clear_http_transport();
         assert!(matches!(result, Err(HttpError::UnsafeDestination(_))));

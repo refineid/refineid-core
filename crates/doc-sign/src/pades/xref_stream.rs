@@ -37,6 +37,17 @@ const MAX_PREDICTOR_COLUMNS: usize = 256;
 /// refused when the field is decoded, not by its declared width.
 const MAX_FIELD_WIDTH: usize = size_of::<u64>();
 
+/// Most `/Index` pairs this reader accepts, an implementation limit:
+/// one subsection per object of a revision that changes 65 536
+/// non-adjacent objects.
+const MAX_INDEX_PAIRS: usize = 1 << 16;
+
+/// Numbers in one `/Index` pair: the first object number and the count.
+const INDEX_PAIR: usize = 2;
+
+/// The `/Columns` value when the key is absent (ISO 32000-1 Table 8).
+const DEFAULT_COLUMNS: usize = 1;
+
 /// The predictor value meaning none was applied.
 const NO_PREDICTOR: usize = 1;
 
@@ -141,18 +152,24 @@ pub(super) fn parse_stream_section(pdf: &[u8], offset: usize) -> Result<XrefSect
     {
         return Err(PdfError::MissingTrailer);
     }
-    let widths: [usize; ENTRY_FIELDS] = integer_array(&object.dictionary, KEY_WIDTHS)
-        .try_into()
-        .map_err(|_ignored| PdfError::MissingTrailer)?;
+    let widths: [usize; ENTRY_FIELDS] =
+        integer_array(&object.dictionary, KEY_WIDTHS, ENTRY_FIELDS)?
+            .ok_or(PdfError::MissingTrailer)?
+            .try_into()
+            .map_err(|_ignored| PdfError::MissingTrailer)?;
     let size = dictionary_usize(&object.dictionary, KEY_SIZE).ok_or(PdfError::MissingTrailer)?;
     if size > MAX_XREF_ENTRIES {
         return Err(PdfError::MissingTrailer);
     }
-    let mut subsections = integer_array(&object.dictionary, KEY_INDEX);
-    if subsections.is_empty() {
-        subsections = vec![0, size];
-    }
-    let entries = stream_entries(&object.payload, &widths, &subsections)?;
+    // `/Index` defaults to one subsection of every object below `/Size`
+    // (ISO 32000-1 Table 17).
+    let subsections = integer_array(
+        &object.dictionary,
+        KEY_INDEX,
+        MAX_INDEX_PAIRS.saturating_mul(INDEX_PAIR),
+    )?
+    .unwrap_or_else(|| vec![0, size]);
+    let entries = stream_entries(&object.payload, &widths, &subsections, size)?;
     Ok(XrefSection {
         trailer: object.dictionary,
         entries,
@@ -400,7 +417,11 @@ fn unpredicted(data: Vec<u8>, dictionary: &[u8]) -> Result<Vec<u8>, PdfError> {
     {
         return Err(PdfError::UnsupportedCrossReferenceStream);
     }
-    let columns = dictionary_usize(&parameters, b"/Columns").unwrap_or(1);
+    let columns = match dictionary_value(&parameters, b"/Columns") {
+        None => DEFAULT_COLUMNS,
+        Some(_) => dictionary_usize(&parameters, b"/Columns")
+            .ok_or(PdfError::UnsupportedCrossReferenceStream)?,
+    };
     if columns == 0 || columns > MAX_PREDICTOR_COLUMNS {
         return Err(PdfError::UnsupportedCrossReferenceStream);
     }
@@ -488,25 +509,28 @@ fn stream_entries(
     payload: &[u8],
     widths: &[usize; ENTRY_FIELDS],
     subsections: &[usize],
+    size: usize,
 ) -> Result<Vec<XrefEntry>, PdfError> {
     if widths.iter().any(|width| *width > MAX_FIELD_WIDTH) {
         return Err(PdfError::MissingTrailer);
     }
     let row_length = widths.iter().sum::<usize>();
-    let (pairs, odd) = subsections.as_chunks::<2>();
+    let (pairs, odd) = subsections.as_chunks::<INDEX_PAIR>();
     if row_length == 0 || !odd.is_empty() {
         return Err(PdfError::MissingTrailer);
     }
-    // Every declared entry is a number below the file-wide ceiling and
-    // a full row of the payload, and the pairs together declare no more
-    // entries than the ceiling; all hold before anything is pushed.
+    // Every declared entry is a number below `/Size` (one greater than
+    // the highest object number the section uses, ISO 32000-1 Table 17)
+    // and below the file-wide ceiling, and a full row of the payload,
+    // and the pairs together declare no more entries than the ceiling;
+    // all hold before anything is allocated.
     let mut declared = 0_usize;
     for [first, count] in pairs {
         let end = first.checked_add(*count).ok_or(PdfError::MissingTrailer)?;
         declared = declared
             .checked_add(*count)
             .ok_or(PdfError::MissingTrailer)?;
-        if end > MAX_XREF_ENTRIES || declared > MAX_XREF_ENTRIES {
+        if end > size || end > MAX_XREF_ENTRIES || declared > MAX_XREF_ENTRIES {
             return Err(PdfError::MissingTrailer);
         }
     }
@@ -549,9 +573,10 @@ fn entry_from_row(
     for (position, width) in widths.iter().enumerate() {
         let mut value = 0_usize;
         for _ in 0..*width {
+            let byte = row.get(at).copied().ok_or(PdfError::MissingTrailer)?;
             value = value
                 .checked_mul(BYTE_RADIX)
-                .and_then(|wide| wide.checked_add(usize::from(row[at])))
+                .and_then(|wide| wide.checked_add(usize::from(byte)))
                 .ok_or(PdfError::MissingTrailer)?;
             at = at.saturating_add(1);
         }
@@ -587,29 +612,36 @@ fn entry_from_row(
     })
 }
 
-/// The direct integer array under `key`, empty when absent or
-/// malformed.
-fn integer_array(dictionary: &[u8], key: &[u8]) -> Vec<usize> {
+/// The direct array of non-negative integers under `key`; `None` when
+/// the key is absent.
+///
+/// # Errors
+/// [`PdfError::MissingTrailer`] when the value is not a bracketed list
+/// of non-negative integers, or once it holds more than `limit`
+/// numbers; collecting stops there.
+fn integer_array(
+    dictionary: &[u8],
+    key: &[u8],
+    limit: usize,
+) -> Result<Option<Vec<usize>>, PdfError> {
     let Some(value) = dictionary_value(dictionary, key) else {
-        return Vec::new();
+        return Ok(None);
     };
-    let Some(body) = trim(value)
+    let body = trim(value)
         .strip_prefix(ARRAY_OPEN)
         .and_then(|inner| inner.strip_suffix(ARRAY_CLOSE))
-    else {
-        return Vec::new();
-    };
+        .ok_or(PdfError::MissingTrailer)?;
     let mut values = Vec::new();
     for token in body
         .split(|byte| PdfValueParser::is_whitespace(*byte))
         .filter(|token| !token.is_empty())
     {
-        let Some(value) = parse_usize(token) else {
-            return Vec::new();
-        };
-        values.push(value);
+        if values.len() == limit {
+            return Err(PdfError::MissingTrailer);
+        }
+        values.push(parse_usize(token).ok_or(PdfError::MissingTrailer)?);
     }
-    values
+    Ok(Some(values))
 }
 
 /// `bytes` without leading and trailing PDF whitespace.
@@ -628,8 +660,9 @@ fn trim(bytes: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_FIELD_WIDTH, MAX_PREDICTOR_COLUMNS, MAX_XREF_ENTRIES, PNG_NONE, PdfError, TYPE_DIRECT,
-        XrefLocation, parse_stream_section, png_unfiltered,
+        ENTRY_FIELDS, INDEX_PAIR, MAX_FIELD_WIDTH, MAX_INDEX_PAIRS, MAX_PREDICTOR_COLUMNS,
+        MAX_XREF_ENTRIES, PNG_NONE, PdfError, TYPE_DIRECT, XrefLocation, entry_from_row,
+        parse_stream_section, png_unfiltered,
     };
 
     /// zlib compression level for test payloads; any level decodes.
@@ -712,6 +745,58 @@ mod tests {
     }
 
     #[test]
+    fn malformed_columns_are_refused() {
+        for columns in ["-1", "1.5", "/One", "1 0 R"] {
+            let keys = format!(
+                "/Size 1 {WIDTHS} /Filter /FlateDecode \
+                 /DecodeParms << /Predictor 12 /Columns {columns} >>"
+            );
+            assert_eq!(
+                parsed(&keys, &empty_flate()),
+                Err(PdfError::UnsupportedCrossReferenceStream),
+                "{columns}"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_columns_default_to_one() {
+        // One one-byte row behind its filter byte decodes only when the
+        // row is one column wide.
+        let rows = miniz_oxide::deflate::compress_to_vec_zlib(&[PNG_NONE, u8::MIN], LEVEL);
+        let keys = "/Size 1 /W [0 0 1] /Filter /FlateDecode /DecodeParms << /Predictor 12 >>";
+        assert_eq!(parsed(keys, &rows), Ok(1));
+    }
+
+    #[test]
+    fn an_index_over_the_pair_ceiling_is_refused() {
+        let numbers = MAX_INDEX_PAIRS.saturating_mul(INDEX_PAIR);
+        let over = vec!["0"; numbers + INDEX_PAIR].join(" ");
+        let keys = format!("/Size 1 /Index [{over}] {WIDTHS}");
+        assert_eq!(parsed(&keys, &free_rows(1)), Err(PdfError::MissingTrailer));
+        // At the ceiling the pairs are read; empty pairs declare nothing.
+        let mut at = vec!["0"; numbers - INDEX_PAIR];
+        at.extend(["0", "1"]);
+        let keys = format!("/Size 1 /Index [{}] {WIDTHS}", at.join(" "));
+        assert_eq!(parsed(&keys, &free_rows(1)), Ok(1));
+    }
+
+    #[test]
+    fn a_row_shorter_than_its_widths_is_refused_not_indexed() {
+        let widths = [1, 2, 2];
+        let full: usize = widths.iter().sum();
+        assert_eq!(widths.len(), ENTRY_FIELDS);
+        for short in 0..full {
+            assert_eq!(
+                entry_from_row(0, &vec![0; short], &widths).map(|entry| entry.number),
+                Err(PdfError::MissingTrailer),
+                "{short} bytes"
+            );
+        }
+        assert!(entry_from_row(0, &vec![0; full], &widths).is_ok());
+    }
+
+    #[test]
     fn zero_columns_is_refused() {
         let keys = format!(
             "/Size 1 {WIDTHS} /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 0 >>"
@@ -789,8 +874,64 @@ mod tests {
     fn index_past_the_object_ceiling_is_refused() {
         let keys = format!("/Size 1 /Index [{MAX_XREF_ENTRIES} 1] {WIDTHS}");
         assert_eq!(parsed(&keys, &free_rows(1)), Err(PdfError::MissingTrailer));
-        let keys = format!("/Size 1 /Index [{} 1] {WIDTHS}", MAX_XREF_ENTRIES - 1);
+        let keys = format!(
+            "/Size {MAX_XREF_ENTRIES} /Index [{} 1] {WIDTHS}",
+            MAX_XREF_ENTRIES - 1
+        );
         assert_eq!(parsed(&keys, &free_rows(1)), Ok(1));
+    }
+
+    #[test]
+    fn index_past_the_declared_size_is_refused() {
+        let declared = 2;
+        for index in ["[0 3]", "[1 2]", "[0 1 2 1]"] {
+            let keys = format!("/Size {declared} /Index {index} {WIDTHS}");
+            assert_eq!(
+                parsed(&keys, &free_rows(declared + 1)),
+                Err(PdfError::MissingTrailer),
+                "{index}"
+            );
+        }
+        let keys = format!("/Size {declared} /Index [0 1 1 1] {WIDTHS}");
+        assert_eq!(parsed(&keys, &free_rows(declared)), Ok(declared));
+        let keys = format!("/Size 1 /Index [{} 1] {WIDTHS}", usize::MAX);
+        assert_eq!(parsed(&keys, &free_rows(1)), Err(PdfError::MissingTrailer));
+    }
+
+    #[test]
+    fn zero_widths_make_no_entries_from_no_bytes() {
+        let declared = 4;
+        let keys = format!("/Size {declared} /W [0 0 0]");
+        assert_eq!(parsed(&keys, &[]), Err(PdfError::MissingTrailer));
+    }
+
+    #[test]
+    fn a_malformed_index_or_widths_array_is_refused_not_defaulted() {
+        for index in [
+            "0 1", "[0 -1]", "[0 1.5]", "[0 /One]", "[[0 1]]", "5 0 R", "<< >>",
+        ] {
+            let keys = format!("/Size 1 /Index {index} {WIDTHS}");
+            assert_eq!(
+                parsed(&keys, &free_rows(1)),
+                Err(PdfError::MissingTrailer),
+                "/Index {index}"
+            );
+        }
+        for widths in ["1 2 2", "[1 -2 2]", "[1 2 /Two]", "5 0 R"] {
+            let keys = format!("/Size 1 /W {widths}");
+            assert_eq!(
+                parsed(&keys, &free_rows(1)),
+                Err(PdfError::MissingTrailer),
+                "/W {widths}"
+            );
+        }
+        assert_eq!(
+            parsed("/Size 1", &free_rows(1)),
+            Err(PdfError::MissingTrailer),
+            "an absent /W"
+        );
+        let keys = format!("/Size 1 {WIDTHS}");
+        assert_eq!(parsed(&keys, &free_rows(1)), Ok(1), "an absent /Index");
     }
 
     #[test]

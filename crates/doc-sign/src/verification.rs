@@ -12,11 +12,11 @@
 //! [`DocumentTimestampReport`] per PDF document timestamp. The design
 //! is `doc/architecture/document-verification.md`.
 //!
-//! The verifier does no network access. A shell that wants a live
+//! [`verify`] does no network access. A shell that wants a live
 //! revocation answer for a signature the file says nothing about asks
-//! for one itself and hands it to [`DocumentReport::with_live_revocation`],
-//! which applies it only where the file left revocation unavailable on
-//! a verified chain.
+//! for one with [`live::live_revocation`] and hands it to
+//! [`DocumentReport::with_live_revocation`], which applies it only
+//! where the file left revocation unavailable on a verified chain.
 //!
 //! Each reader below is the single border for its format: it checks
 //! every structural rule its specification states and hands out typed
@@ -47,6 +47,7 @@
 
 pub mod asic;
 pub mod cades;
+pub mod live;
 pub mod pdf;
 pub mod revision;
 pub mod trust;
@@ -55,7 +56,7 @@ pub mod xml;
 
 use crate::ber::{BerTag, Sequence};
 use crate::identity::Peuin;
-use crate::timestamp::{TimestampError, verify_token};
+use crate::timestamp::{TimestampError, claimed_generation_time, verify_token};
 use crate::validation::ValidationMaterial;
 use crate::x509_ext::NameExt;
 use refineid_cms::x509::{DateTime, OwnedCert};
@@ -204,12 +205,22 @@ pub enum TimestampReport {
         authority: TimestampAuthority,
     },
     /// The token does not verify, or imprints other data.
-    Invalid(TimestampError),
+    Invalid {
+        /// Why.
+        error: TimestampError,
+        /// The `genTime` the token claims, when it parses that far;
+        /// proving nothing.
+        claimed_time: Option<DateTime>,
+    },
     /// The token is not judged: an `XAdES` timestamp under a
     /// canonicalisation this verifier does not compute, an archive
     /// timestamp of a form this verifier does not judge, or a PDF
     /// document timestamp whose range does not end a revision.
-    Unsupported,
+    Unsupported {
+        /// The `genTime` the token claims, when there is a token and it
+        /// parses that far; proving nothing.
+        claimed_time: Option<DateTime>,
+    },
 }
 
 impl TimestampReport {
@@ -219,7 +230,20 @@ impl TimestampReport {
     pub const fn proven_time(&self) -> Option<DateTime> {
         match self {
             Self::Anchored { time, .. } => Some(*time),
-            Self::Claimed { .. } | Self::Invalid(_) | Self::Unsupported => None,
+            Self::Claimed { .. } | Self::Invalid { .. } | Self::Unsupported { .. } => None,
+        }
+    }
+
+    /// The `genTime` the token states, whatever it proves: the proven
+    /// time of an anchored token, the claim of every other token that
+    /// parses as far as its `TSTInfo`.
+    #[must_use]
+    pub const fn claimed_time(&self) -> Option<DateTime> {
+        match self {
+            Self::Anchored { time, .. } | Self::Claimed { time, .. } => Some(*time),
+            Self::Invalid { claimed_time, .. } | Self::Unsupported { claimed_time } => {
+                *claimed_time
+            }
         }
     }
 
@@ -234,7 +258,7 @@ impl TimestampReport {
     pub const fn authority(&self) -> Option<&TimestampAuthority> {
         match self {
             Self::Anchored { authority, .. } | Self::Claimed { authority, .. } => Some(authority),
-            Self::Invalid(_) | Self::Unsupported => None,
+            Self::Invalid { .. } | Self::Unsupported { .. } => None,
         }
     }
 }
@@ -307,6 +331,8 @@ pub struct SignatureReport {
     revocation: Revocation,
     /// What the revisions after the signed one do to the document.
     revision: Revision,
+    /// The signing time the signature claims.
+    claimed_signing_time: Option<DateTime>,
 }
 
 impl SignatureReport {
@@ -362,6 +388,17 @@ impl SignatureReport {
     #[must_use]
     pub const fn proof_of_existence(&self) -> Option<DateTime> {
         self.proof_of_existence
+    }
+
+    /// The signing time the signature claims, from the signer's own
+    /// clock and proving nothing: the CMS `signing-time` signed
+    /// attribute (RFC 5652 sec.11.3), else for a PDF signature its
+    /// `/M` entry (ISO 32000-1 sec.12.8.1, Table 252); the `XAdES`
+    /// `SigningTime` property (`ETSI EN 319 132-1` clause 5.2.1).
+    /// `None` when the signature claims none it states readably.
+    #[must_use]
+    pub const fn claimed_signing_time(&self) -> Option<DateTime> {
+        self.claimed_signing_time
     }
 
     /// The signature's own timestamps, in encoded order.
@@ -470,7 +507,13 @@ pub enum SignatureOutcome {
     /// The signature was judged.
     Judged(SignatureReport),
     /// The signature was found and not judged.
-    Unsupported(UnsupportedSignature),
+    Unsupported {
+        /// Why.
+        reason: UnsupportedSignature,
+        /// The holder the signer certificate names, when the signature
+        /// identifies one; unverified, since nothing was judged.
+        signer: Option<SignerIdentity>,
+    },
 }
 
 /// One signature found in the document.
@@ -494,8 +537,19 @@ impl SignatureRow {
 
     /// A signature found and not judged, that counter-signs nothing.
     const fn unsupported(reason: UnsupportedSignature) -> Self {
+        Self::unsupported_by(reason, None)
+    }
+
+    /// A signature found and not judged whose signer certificate is
+    /// `signer`, that counter-signs nothing.
+    fn unsupported_signed_by(reason: UnsupportedSignature, signer: &OwnedCert) -> Self {
+        Self::unsupported_by(reason, Some(SignerIdentity::of(signer)))
+    }
+
+    /// A signature found and not judged, its signer as identified.
+    const fn unsupported_by(reason: UnsupportedSignature, signer: Option<SignerIdentity>) -> Self {
         Self {
-            outcome: SignatureOutcome::Unsupported(reason),
+            outcome: SignatureOutcome::Unsupported { reason, signer },
             counter_signs: None,
         }
     }
@@ -523,12 +577,23 @@ impl SignatureRow {
         self.counter_signs
     }
 
+    /// The holder the signer certificate names: a judged signature's
+    /// [`SignatureReport::signer`], or the signer an unsupported one
+    /// identifies; `None` when nothing identifies one.
+    #[must_use]
+    pub const fn signer(&self) -> Option<&SignerIdentity> {
+        match &self.outcome {
+            SignatureOutcome::Judged(report) => Some(&report.signer),
+            SignatureOutcome::Unsupported { signer, .. } => signer.as_ref(),
+        }
+    }
+
     /// Whether the signature was judged and is valid.
     #[must_use]
     pub fn is_valid(&self) -> bool {
         match &self.outcome {
             SignatureOutcome::Judged(report) => report.is_valid(),
-            SignatureOutcome::Unsupported(_) => false,
+            SignatureOutcome::Unsupported { .. } => false,
         }
     }
 }
@@ -741,6 +806,8 @@ struct Facts {
     covering_proofs: Vec<DateTime>,
     /// What the revisions after the signed one do to the document.
     revision: Revision,
+    /// The signing time the signature claims.
+    claimed_signing_time: Option<DateTime>,
     /// The evidence for this signature: the document's, the
     /// signature's own, and the anchors' certificates.
     pool: MaterialPool,
@@ -755,8 +822,9 @@ enum Timestamp {
         /// What it imprints.
         imprint: Imprint,
     },
-    /// A token whose imprinted octets this verifier does not compute.
-    Uncomputable,
+    /// A token whose imprinted octets this verifier does not compute,
+    /// with the `genTime` it claims when there is one.
+    Uncomputable(Option<DateTime>),
     /// A token found not valid before it is verified: an archive
     /// timestamp whose hash index does not hold.
     Refused(TimestampError),
@@ -816,7 +884,12 @@ impl Context<'_> {
     ) -> TimestampReport {
         let verified = match verify_token(token, imprint_of) {
             Ok(verified) => verified,
-            Err(error) => return TimestampReport::Invalid(error),
+            Err(error) => {
+                return TimestampReport::Invalid {
+                    error,
+                    claimed_time: claimed_generation_time(token),
+                };
+            }
         };
         let mut pool = pool.clone();
         for certificate in verified.embedded_certificates() {
@@ -862,8 +935,13 @@ impl Context<'_> {
             Timestamp::Token { token, imprint } => {
                 self.judge_token(token, |algorithm| imprint.digest(algorithm), pool)
             }
-            Timestamp::Uncomputable => TimestampReport::Unsupported,
-            Timestamp::Refused(error) => TimestampReport::Invalid(*error),
+            Timestamp::Uncomputable(claimed_time) => TimestampReport::Unsupported {
+                claimed_time: *claimed_time,
+            },
+            Timestamp::Refused(error) => TimestampReport::Invalid {
+                error: *error,
+                claimed_time: None,
+            },
         };
         let timestamps: Vec<TimestampReport> = facts
             .timestamps
@@ -925,6 +1003,7 @@ impl Context<'_> {
             validation_time,
             revocation: chain.revocation,
             revision: facts.revision,
+            claimed_signing_time: facts.claimed_signing_time,
         }
     }
 
@@ -956,7 +1035,9 @@ impl Context<'_> {
                         &base,
                     )
                 } else {
-                    TimestampReport::Unsupported
+                    TimestampReport::Unsupported {
+                        claimed_time: claimed_generation_time(found.cms()),
+                    }
                 };
                 (
                     DocumentTimestampReport {
@@ -974,16 +1055,18 @@ impl Context<'_> {
                 SignatureKind::Signature(SubFilter::EtsiCadesDetached) => EssBinding::Required,
                 SignatureKind::Signature(SubFilter::AdbePkcs7Detached) => EssBinding::NotRequired,
                 SignatureKind::Signature(SubFilter::EtsiRfc3161 | SubFilter::Other) => {
-                    rows.push(SignatureRow::unsupported(
+                    rows.push(unsupported_cms(
                         UnsupportedSignature::PdfSubFilter,
+                        found.cms(),
                     ));
                     continue;
                 }
                 SignatureKind::DocumentTimestamp => continue,
             };
             let Some(revision) = found.revision() else {
-                rows.push(SignatureRow::unsupported(
+                rows.push(unsupported_cms(
                     UnsupportedSignature::PdfRangeNotARevision,
+                    found.cms(),
                 ));
                 continue;
             };
@@ -1019,6 +1102,7 @@ impl Context<'_> {
                 archive_timestamps: cades_archive_timestamps(verdict.archive_timestamps),
                 covering_proofs,
                 revision,
+                claimed_signing_time: signature.signing_time().or(found.signing_time_entry()),
                 pool,
             })));
         }
@@ -1079,8 +1163,13 @@ impl Context<'_> {
         let row = rows.len();
         let counter_signs = enclosing.last().map(|(row, _)| *row);
         if enclosing.len() > MAX_COUNTER_SIGNATURE_DEPTH {
+            let signer = signature
+                .as_ref()
+                .ok()
+                .and_then(xades::XadesSignature::signer_certificate)
+                .map(SignerIdentity::of);
             rows.push(
-                SignatureRow::unsupported(UnsupportedSignature::CounterSignatureTooDeep)
+                SignatureRow::unsupported_by(UnsupportedSignature::CounterSignatureTooDeep, signer)
                     .counter_signing(counter_signs),
             );
             return;
@@ -1119,7 +1208,10 @@ impl Context<'_> {
     ) -> SignatureRow {
         let judgement = match signature.verify(container) {
             XadesVerdict::Unsupported(unsupported) => {
-                return SignatureRow::unsupported(UnsupportedSignature::Xades(unsupported));
+                return SignatureRow::unsupported_by(
+                    UnsupportedSignature::Xades(unsupported),
+                    signature.signer_certificate().map(SignerIdentity::of),
+                );
             }
             XadesVerdict::Judged(judgement) => judgement,
         };
@@ -1141,7 +1233,7 @@ impl Context<'_> {
                     token: timestamp.token().to_vec(),
                     imprint: Imprint::Octets(input.to_vec()),
                 },
-                None => Timestamp::Uncomputable,
+                None => Timestamp::Uncomputable(claimed_generation_time(timestamp.token())),
             })
             .collect();
         let archive_timestamps = signature
@@ -1153,7 +1245,9 @@ impl Context<'_> {
                         token: archive.token().to_vec(),
                         imprint: Imprint::Octets(input.clone()),
                     },
-                    xades::ArchiveInput::Uncomputable(_) => Timestamp::Uncomputable,
+                    xades::ArchiveInput::Uncomputable(_) => {
+                        Timestamp::Uncomputable(claimed_generation_time(archive.token()))
+                    }
                 };
                 ArchiveFact {
                     form: ArchiveForm::Xades,
@@ -1171,6 +1265,7 @@ impl Context<'_> {
             archive_timestamps,
             covering_proofs: Vec::new(),
             revision: Revision::WholeDocument,
+            claimed_signing_time: signature.signing_time(),
             pool,
         }))
     }
@@ -1182,7 +1277,10 @@ impl Context<'_> {
             Err(error) => return SignatureRow::unsupported(UnsupportedSignature::Cms(error)),
         };
         let Some(manifest) = entry.manifest() else {
-            return SignatureRow::unsupported(UnsupportedSignature::CadesWithoutManifest);
+            return SignatureRow::unsupported_signed_by(
+                UnsupportedSignature::CadesWithoutManifest,
+                signature.signer_certificate(),
+            );
         };
         let verdict = signature.verify(
             Content::Detached {
@@ -1200,6 +1298,7 @@ impl Context<'_> {
             archive_timestamps: cades_archive_timestamps(verdict.archive_timestamps),
             covering_proofs: Vec::new(),
             revision: Revision::WholeDocument,
+            claimed_signing_time: signature.signing_time(),
             pool,
         }))
     }
@@ -1225,8 +1324,20 @@ impl Context<'_> {
             archive_timestamps: cades_archive_timestamps(verdict.archive_timestamps),
             covering_proofs: Vec::new(),
             revision: Revision::WholeDocument,
+            claimed_signing_time: signature.signing_time(),
             pool,
         })))
+    }
+}
+
+/// The row of a PDF signature not judged, its signer taken from its
+/// CMS structure when that parses.
+fn unsupported_cms(reason: UnsupportedSignature, cms: &[u8]) -> SignatureRow {
+    match CadesSignature::parse(cms) {
+        Ok(signature) => {
+            SignatureRow::unsupported_signed_by(reason, signature.signer_certificate())
+        }
+        Err(_unreadable) => SignatureRow::unsupported(reason),
     }
 }
 
@@ -1263,7 +1374,7 @@ fn cades_archive_timestamps(timestamps: Vec<cades::CadesArchiveTimestamp>) -> Ve
             },
             cades::CadesArchiveTimestamp::V2 => ArchiveFact {
                 form: ArchiveForm::CadesV2,
-                timestamp: Timestamp::Uncomputable,
+                timestamp: Timestamp::Uncomputable(None),
                 covered: ValidationMaterial::default(),
                 authority_material: ValidationMaterial::default(),
             },

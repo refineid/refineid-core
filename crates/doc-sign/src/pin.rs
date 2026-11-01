@@ -176,6 +176,109 @@ impl fmt::Display for PinPolicyReason {
 
 impl core::error::Error for PinPolicyReason {}
 
+/// Why a PIN entry produced no PIN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinEntryError {
+    /// The holder ended the entry without a PIN.
+    Cancelled,
+    /// No entry could be offered: no terminal, no dialog.
+    Unavailable,
+    /// What was entered is not a PIN.
+    NotAPin(PinRoleError),
+}
+
+impl fmt::Display for PinEntryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("PIN entry ended without a PIN"),
+            Self::Unavailable => f.write_str("no PIN entry is available"),
+            Self::NotAPin(reason) => write!(f, "PIN entry: {reason}"),
+        }
+    }
+}
+
+impl core::error::Error for PinEntryError {}
+
+/// Which PIN a flow asks for (FINEID S1 v4.2 §3.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinRole {
+    /// PIN 1, which gates the authentication key.
+    Pin1,
+    /// PIN 2, which gates the qualified-signature key.
+    Pin2,
+}
+
+/// Where a signing flow gets the PIN, at the moment it is needed:
+/// after the card is found, checked and its retry counter served,
+/// right before VERIFY.
+pub trait PinSource {
+    /// The PIN for `role`, asked for now unless the source already
+    /// holds that PIN.
+    ///
+    /// # Errors
+    /// [`PinEntryError`] when the entry produced no PIN.
+    fn pin(&mut self, role: PinRole) -> Result<&PinBytes, PinEntryError>;
+
+    /// The PIN [`Self::pin`] gave did not end in a signature -- the card
+    /// refused it, the card changed, or the flow failed before or after
+    /// VERIFY; a source that keeps it forgets it, so a later use asks
+    /// again.
+    fn forget(&mut self);
+}
+
+/// A [`PinSource`] that runs its prompt at first use and gives the
+/// answer to every later use for the same [`PinRole`] until a use does
+/// not end in a signature: a run signing several documents asks once
+/// and presents the same PIN to each VERIFY. A request for the other
+/// role forgets the held PIN and asks again. A failed prompt is not
+/// remembered. The PIN is held in memory only and zeroizes when this
+/// drops or is forgotten.
+pub struct PromptedPin<F> {
+    prompt: F,
+    answer: Option<(PinRole, PinBytes)>,
+}
+
+impl<F> PromptedPin<F>
+where
+    F: FnMut(PinRole) -> Result<PinBytes, PinEntryError>,
+{
+    /// A source that asks `prompt` for a role's PIN when it is first
+    /// needed.
+    #[must_use]
+    pub const fn new(prompt: F) -> Self {
+        Self {
+            prompt,
+            answer: None,
+        }
+    }
+}
+
+impl<F> PinSource for PromptedPin<F>
+where
+    F: FnMut(PinRole) -> Result<PinBytes, PinEntryError>,
+{
+    fn pin(&mut self, role: PinRole) -> Result<&PinBytes, PinEntryError> {
+        if self.answer.as_ref().is_none_or(|(held, _)| *held != role) {
+            self.answer = None;
+            self.answer = Some((role, (self.prompt)(role)?));
+        }
+        self.answer
+            .as_ref()
+            .map(|(_, pin)| pin)
+            .ok_or(PinEntryError::Unavailable)
+    }
+
+    fn forget(&mut self) {
+        self.answer = None;
+    }
+}
+
+impl<F> fmt::Debug for PromptedPin<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PromptedPin([redacted])")
+    }
+}
+
 fn validate_digits(bytes: &[u8], min: usize, max: usize) -> Result<(), PinRoleError> {
     if bytes.is_empty() {
         return Err(PinRoleError::Empty);
@@ -235,5 +338,85 @@ mod tests {
             err_non_digit.to_string(),
             "PIN must contain only ASCII digits"
         );
+    }
+
+    /// A synthetic PIN in the shape every PIN role accepts.
+    const SYNTHETIC_PIN: &[u8] = b"123456";
+
+    /// A boxed PIN prompt.
+    type Prompt = Box<dyn FnMut(PinRole) -> Result<PinBytes, PinEntryError>>;
+
+    fn counting() -> (PromptedPin<Prompt>, std::rc::Rc<core::cell::Cell<usize>>) {
+        let asked = std::rc::Rc::new(core::cell::Cell::new(0));
+        let counter = std::rc::Rc::clone(&asked);
+        let source = PromptedPin::new(Box::new(move |_role| {
+            counter.set(counter.get() + 1);
+            PinBytes::new(SYNTHETIC_PIN.to_vec()).map_err(PinEntryError::NotAPin)
+        }) as Prompt);
+        (source, asked)
+    }
+
+    #[test]
+    fn a_prompted_pin_asks_only_when_needed_and_then_once() {
+        let (mut source, asked) = counting();
+        assert_eq!(asked.get(), 0, "nothing asked before use");
+        assert_eq!(
+            source.pin(PinRole::Pin2).map(PinBytes::as_bytes),
+            Ok(SYNTHETIC_PIN)
+        );
+        assert_eq!(
+            source.pin(PinRole::Pin2).map(PinBytes::as_bytes),
+            Ok(SYNTHETIC_PIN)
+        );
+        assert_eq!(asked.get(), 1, "asked once for every use");
+    }
+
+    #[test]
+    fn a_forgotten_pin_is_asked_again() {
+        let (mut source, asked) = counting();
+        assert!(source.pin(PinRole::Pin2).is_ok());
+        source.forget();
+        assert!(source.pin(PinRole::Pin2).is_ok());
+        assert_eq!(asked.get(), 2, "asked again after the card refused it");
+    }
+
+    #[test]
+    fn a_held_pin_is_never_given_for_the_other_role() {
+        let roles = std::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+        let seen = std::rc::Rc::clone(&roles);
+        let mut source = PromptedPin::new(move |role| {
+            seen.borrow_mut().push(role);
+            PinBytes::new(SYNTHETIC_PIN.to_vec()).map_err(PinEntryError::NotAPin)
+        });
+        assert!(source.pin(PinRole::Pin2).is_ok());
+        assert!(source.pin(PinRole::Pin1).is_ok());
+        assert!(source.pin(PinRole::Pin1).is_ok());
+        assert_eq!(
+            *roles.borrow(),
+            vec![PinRole::Pin2, PinRole::Pin1],
+            "the other role is asked for, the same role is not"
+        );
+    }
+
+    #[test]
+    fn a_failed_prompt_is_not_remembered() {
+        let mut attempts = 0;
+        let mut source = PromptedPin::new(move |_role| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(PinEntryError::Cancelled)
+            } else {
+                PinBytes::new(SYNTHETIC_PIN.to_vec()).map_err(PinEntryError::NotAPin)
+            }
+        });
+        assert_eq!(
+            source.pin(PinRole::Pin2).err(),
+            Some(PinEntryError::Cancelled)
+        );
+        assert_eq!(
+            source.pin(PinRole::Pin2).map(PinBytes::as_bytes),
+            Ok(SYNTHETIC_PIN)
+        );
+        assert_eq!(format!("{source:?}"), "PromptedPin([redacted])");
     }
 }

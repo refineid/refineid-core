@@ -193,11 +193,17 @@ struct World {
 
 /// The extensions of a document signer: a critical Key Usage asserting
 /// `nonRepudiation`, as a qualified signing certificate carries.
+/// The OCSP responders and CRL distribution point the signers name.
+const OCSP_FIRST: &str = "http://ocsp-one.example/";
+const OCSP_SECOND: &str = "http://ocsp-two.example/";
+const CRL_POINT: &str = "http://crl.example/root.crl";
+
 fn signer_extensions() -> Vec<Vec<u8>> {
-    vec![key_usage(
-        KEY_USAGE_NON_REPUDIATION_UNUSED,
-        KEY_USAGE_NON_REPUDIATION,
-    )]
+    vec![
+        key_usage(KEY_USAGE_NON_REPUDIATION_UNUSED, KEY_USAGE_NON_REPUDIATION),
+        crate::testkit::ocsp_access(&[OCSP_FIRST, OCSP_SECOND]),
+        crate::testkit::crl_distribution_points(&[CRL_POINT]),
+    ]
 }
 
 /// A certificate valid from [`ISSUED`] to [`ENDS`].
@@ -561,7 +567,7 @@ fn only(report: &DocumentReport) -> &SignatureReport {
 fn judged(row: &SignatureRow) -> &SignatureReport {
     match row.outcome() {
         SignatureOutcome::Judged(report) => Some(report),
-        SignatureOutcome::Unsupported(_) => None,
+        SignatureOutcome::Unsupported { .. } => None,
     }
     .expect("the signature was judged")
 }
@@ -584,8 +590,8 @@ fn kind(report: &TimestampReport) -> Kind {
     match report {
         TimestampReport::Anchored { time, .. } => Kind::Anchored(*time),
         TimestampReport::Claimed { time, .. } => Kind::Claimed(*time),
-        TimestampReport::Invalid(error) => Kind::Invalid(*error),
-        TimestampReport::Unsupported => Kind::Unsupported,
+        TimestampReport::Invalid { error, .. } => Kind::Invalid(*error),
+        TimestampReport::Unsupported { .. } => Kind::Unsupported,
     }
 }
 
@@ -813,7 +819,25 @@ fn a_document_timestamp_covering_the_signature_proves_existence() {
     let [stamp] = exactly(report.document_timestamps(), "one document timestamp");
     assert_eq!(kind(stamp.timestamp()), Kind::Anchored(day(STAMPED)));
     assert_eq!(stamp.covers(), length);
+    assert_eq!(
+        signature.covering_document_timestamps(),
+        report.document_timestamps(),
+        "the signature names the document timestamp that covers it"
+    );
     assert!(report.is_valid());
+}
+
+#[test]
+fn a_signature_without_a_document_timestamp_is_covered_by_none() {
+    let world = World::new();
+    let report = world
+        .verify(world.pdf(
+            Signer::Direct,
+            Stamp::Anchored,
+            &ValidationMaterial::default(),
+        ))
+        .expect("report");
+    assert!(only(&report).covering_document_timestamps().is_empty());
 }
 
 #[test]
@@ -834,9 +858,23 @@ fn a_document_timestamp_over_other_bytes_is_invalid_and_proves_nothing() {
         .expect("report");
     assert_eq!(only(&report).proof_of_existence(), None);
     let [stamp] = exactly(report.document_timestamps(), "one document timestamp");
-    assert_eq!(
+    assert!(matches!(
         stamp.timestamp(),
-        &TimestampReport::Invalid(TimestampError::ImprintMismatch)
+        TimestampReport::Invalid {
+            error: TimestampError::ImprintMismatch,
+            claimed_time: Some(_),
+        }
+    ));
+    assert_eq!(
+        stamp.timestamp().claimed_time(),
+        Some(day(STAMPED)),
+        "the token's claim is reported beside its failure"
+    );
+    assert_eq!(stamp.timestamp().proven_time(), None);
+    assert_eq!(
+        only(&report).covering_document_timestamps(),
+        report.document_timestamps(),
+        "a covering document timestamp is named whatever it was found to be"
     );
     assert!(only(&report).is_valid());
     assert!(
@@ -1030,9 +1068,53 @@ fn an_unsupported_signature_is_its_own_row_and_blocks_the_document() {
     assert!(first.is_valid());
     assert!(matches!(
         second.outcome(),
-        SignatureOutcome::Unsupported(UnsupportedSignature::PdfSubFilter)
+        SignatureOutcome::Unsupported {
+            reason: UnsupportedSignature::PdfSubFilter,
+            ..
+        }
     ));
+    assert_eq!(
+        second.signer().map(SignerIdentity::name),
+        Some(DIRECT_SIGNER),
+        "the unjudged signature still names its signer"
+    );
+    assert_eq!(
+        first.signer().map(SignerIdentity::name),
+        Some(DIRECT_SIGNER)
+    );
     assert!(!report.is_valid());
+}
+
+#[test]
+fn every_format_reports_the_signing_time_it_claims() {
+    let world = World::new();
+    let pdf = world.pdf(Signer::Direct, Stamp::None, &ValidationMaterial::default());
+    for (what, file) in [
+        ("PAdES, from /M", pdf),
+        ("ASiC-E XAdES", world.note(Format::AsicEXades)),
+        ("ASiC-E CAdES", world.note(Format::AsicECades)),
+        ("attached CAdES", world.note(Format::Cades)),
+    ] {
+        let report = world.verify(file).expect("report");
+        assert_eq!(
+            only(&report).claimed_signing_time(),
+            Some(day(STAMPED)),
+            "{what}"
+        );
+    }
+}
+
+#[test]
+fn a_pdf_signing_time_attribute_outranks_its_m_entry() {
+    let world = World::new();
+    let signing_time = attribute(known::SIGNING_TIME, &utc_time(day(REVOKED_EARLY)));
+    let report = world
+        .verify(world.foreign_pdf(Signer::Direct, &[signing_time], |_parts| {}))
+        .expect("report");
+    assert_eq!(
+        only(&report).claimed_signing_time(),
+        Some(day(REVOKED_EARLY))
+    );
 }
 
 /// The loss scenario of the design: a self-made timestamp whose time
@@ -1271,9 +1353,10 @@ fn a_disagreeing_signature_algorithm_is_refused() {
     let [row] = exactly(report.rows(), "one signature");
     assert!(matches!(
         row.outcome(),
-        SignatureOutcome::Unsupported(UnsupportedSignature::Cms(CadesReadError::Cms(
-            CmsError::AlgorithmMismatch
-        )))
+        SignatureOutcome::Unsupported {
+            reason: UnsupportedSignature::Cms(CadesReadError::Cms(CmsError::AlgorithmMismatch)),
+            ..
+        }
     ));
     assert!(!report.is_valid());
 
@@ -1299,9 +1382,10 @@ fn an_ecdsa_identifier_with_null_parameters_is_refused() {
     let [row] = exactly(report.rows(), "one signature");
     assert!(matches!(
         row.outcome(),
-        SignatureOutcome::Unsupported(UnsupportedSignature::Cms(CadesReadError::Cms(
-            CmsError::AlgorithmParameters
-        )))
+        SignatureOutcome::Unsupported {
+            reason: UnsupportedSignature::Cms(CadesReadError::Cms(CmsError::AlgorithmParameters)),
+            ..
+        }
     ));
 }
 
@@ -1348,7 +1432,10 @@ fn a_sha_512_imprint_verifies_and_a_wrong_length_imprint_is_refused() {
     assert!(signature.signature_valid());
     assert!(matches!(
         signature.timestamps(),
-        [TimestampReport::Invalid(TimestampError::Malformed(_))]
+        [TimestampReport::Invalid {
+            error: TimestampError::Malformed(_),
+            ..
+        }]
     ));
     assert_eq!(signature.proof_of_existence(), None);
     assert!(
@@ -1401,10 +1488,13 @@ fn a_signature_timestamp_over_other_bytes_is_invalid() {
         )
         .expect("report");
     let signature = only(&report);
-    assert_eq!(
+    assert!(matches!(
         signature.timestamps(),
-        [TimestampReport::Invalid(TimestampError::ImprintMismatch)]
-    );
+        [TimestampReport::Invalid {
+            error: TimestampError::ImprintMismatch,
+            claimed_time: Some(_),
+        }]
+    ));
     assert!(signature.signature_valid());
     assert_eq!(signature.proof_of_existence(), None);
     assert!(
@@ -1490,9 +1580,12 @@ fn the_content_type_attribute_must_name_data() {
     let [row] = exactly(report.rows(), "one signature");
     assert!(matches!(
         row.outcome(),
-        SignatureOutcome::Unsupported(UnsupportedSignature::Cms(CadesReadError::Cms(
-            CmsError::UnexpectedStructure(_)
-        )))
+        SignatureOutcome::Unsupported {
+            reason: UnsupportedSignature::Cms(CadesReadError::Cms(CmsError::UnexpectedStructure(
+                _
+            ))),
+            ..
+        }
     ));
 }
 
@@ -2051,7 +2144,10 @@ fn an_unreadable_counter_signature_is_an_unsupported_row() {
     assert_eq!(counter.counter_signs(), Some(0));
     assert!(matches!(
         counter.outcome(),
-        SignatureOutcome::Unsupported(UnsupportedSignature::XadesMalformed(_))
+        SignatureOutcome::Unsupported {
+            reason: UnsupportedSignature::XadesMalformed(_),
+            ..
+        }
     ));
     assert!(report.is_valid(), "a counter-signature decides nothing");
 }
@@ -2216,7 +2312,10 @@ fn a_nested_counter_signer_is_found_in_an_enclosing_signature() {
     let [_outer, _first, nested] = exactly(report.rows(), "a signature and a chain of two");
     assert!(matches!(
         nested.outcome(),
-        SignatureOutcome::Unsupported(UnsupportedSignature::XadesSignerNotCarried)
+        SignatureOutcome::Unsupported {
+            reason: UnsupportedSignature::XadesSignerNotCarried,
+            ..
+        }
     ));
 }
 
@@ -2262,9 +2361,10 @@ fn counter_signatures_nest_to_a_bounded_depth() {
     }
     assert!(matches!(
         rows.last().map(SignatureRow::outcome),
-        Some(SignatureOutcome::Unsupported(
-            UnsupportedSignature::CounterSignatureTooDeep
-        ))
+        Some(SignatureOutcome::Unsupported {
+            reason: UnsupportedSignature::CounterSignatureTooDeep,
+            ..
+        })
     ));
     assert!(report.is_valid());
 }
@@ -3605,4 +3705,253 @@ fn validation_data_after_an_archive_timestamp_serves_that_timestamp_alone() {
     );
     assert_eq!(kinds, [(ArchiveForm::Xades, Kind::Claimed(day(ARCHIVED)))]);
     assert!(!valid);
+}
+
+/// What a scripted OCSP responder answers, in turn.
+#[derive(Debug, Clone, Copy)]
+enum Responder {
+    /// Bytes that are no OCSP response.
+    Garbage,
+    /// A good answer echoing the request's nonce, produced on the day.
+    Good(u8),
+    /// A revoked answer echoing the request's nonce.
+    Revoked(u8),
+    /// A good answer whose nonce is not the request's.
+    ChangedNonce,
+    /// A good pre-produced answer that echoes no nonce.
+    NoNonce,
+}
+
+/// Bytes a responder returns that are no OCSP response.
+const NOT_AN_ANSWER: &[u8] = b"not an answer";
+/// A nonce no request carried.
+const OTHER_NONCE: &[u8] = b"another request's nonce";
+
+/// The value of the nonce extension `request` carries: the content of
+/// its `extnValue` (RFC 8954 sec.2.1).
+fn request_nonce(request: &[u8]) -> Vec<u8> {
+    let oid = crate::ocsp::OID_OCSP_NONCE.as_bytes();
+    let at = request
+        .windows(oid.len())
+        .position(|window| window == oid)
+        .expect("the request carries a nonce")
+        .saturating_add(oid.len());
+    refineid_ber::BerTlvAny::parse(&request[at..])
+        .expect("extnValue")
+        .value()
+        .to_vec()
+}
+
+/// Answers from scripted responders, counting the exchanges.
+struct ScriptedAnswers<'w> {
+    world: &'w World,
+    ocsp: Vec<Responder>,
+    crls: Vec<Vec<u8>>,
+    ocsp_asked: core::cell::Cell<usize>,
+    crl_asked: core::cell::Cell<usize>,
+}
+
+impl<'w> ScriptedAnswers<'w> {
+    fn new(world: &'w World, ocsp: Vec<Responder>, crls: Vec<Vec<u8>>) -> Self {
+        Self {
+            world,
+            ocsp,
+            crls,
+            ocsp_asked: core::cell::Cell::new(0),
+            crl_asked: core::cell::Cell::new(0),
+        }
+    }
+
+    /// The root's answer about the direct signer, echoing `nonce`.
+    fn root_answer(&self, nonce: Option<&[u8]>, revoked: Option<u8>, produced: u8) -> Vec<u8> {
+        let nonce_oid = crate::ocsp::OID_OCSP_NONCE;
+        let issuer = OwnedCert::from_der(&self.world.root).expect("issuer parses");
+        ocsp_response(&OcspSpec {
+            responder_key: &self.world.root_key,
+            responder: ResponderName::ByName(ROOT),
+            issuer: &issuer,
+            serial: DIRECT_SIGNER_SERIAL,
+            revoked: revoked.map(day),
+            produced_at: day(produced),
+            this_update: day(produced),
+            next_update: None,
+            embedded: Vec::new(),
+            cert_id: crate::testkit::CertIdAlgorithm::Sha1,
+            revocation_reason: None,
+            response_extensions: nonce
+                .map(|nonce| {
+                    crate::testkit::extension(
+                        refineid_cms::oid::Oid::const_new(nonce_oid.as_bytes()),
+                        false,
+                        nonce,
+                    )
+                })
+                .into_iter()
+                .collect(),
+        })
+    }
+}
+
+impl super::live::AnswerSource for ScriptedAnswers<'_> {
+    fn ocsp(&self, _url: &crate::uri::Uri, request: &[u8]) -> Option<Vec<u8>> {
+        let turn = self.ocsp_asked.get();
+        self.ocsp_asked.set(turn.saturating_add(1));
+        let echoed = request_nonce(request);
+        Some(match *self.ocsp.get(turn)? {
+            Responder::Garbage => NOT_AN_ANSWER.to_vec(),
+            Responder::Good(produced) => self.root_answer(Some(&echoed), None, produced),
+            Responder::Revoked(on) => self.root_answer(Some(&echoed), Some(on), NOW),
+            Responder::ChangedNonce => self.root_answer(
+                Some(&tlv(crate::testkit::OCTET_STRING, OTHER_NONCE)),
+                None,
+                NOW,
+            ),
+            Responder::NoNonce => self.root_answer(None, None, NOW),
+        })
+    }
+
+    fn crl(&self, _url: &crate::uri::Uri) -> Option<Vec<u8>> {
+        let turn = self.crl_asked.get();
+        self.crl_asked.set(turn.saturating_add(1));
+        self.crls.get(turn).cloned()
+    }
+}
+
+/// The direct signer's PDF, unstamped, judged at [`NOW`].
+fn unstamped_direct(world: &World) -> DocumentReport {
+    let pdf = world.pdf(Signer::Direct, Stamp::None, &ValidationMaterial::default());
+    world.verify(pdf).expect("report")
+}
+
+#[test]
+fn a_live_lookup_judges_what_the_responders_answer() {
+    let world = World::new();
+    let anchors = world.anchors();
+    let report = unstamped_direct(&world);
+    let signature = only(&report);
+    assert_eq!(signature.revocation(), Revocation::Unavailable);
+    for (what, ocsp, expected) in [
+        (
+            "good",
+            vec![Responder::Good(NOW)],
+            Revocation::Good { at: day(NOW) },
+        ),
+        (
+            "revoked",
+            vec![Responder::Revoked(REVOKED_LATER)],
+            Revocation::Revoked {
+                at: day(REVOKED_LATER),
+                reason: None,
+            },
+        ),
+        ("silent", Vec::new(), Revocation::Unavailable),
+    ] {
+        let source = ScriptedAnswers::new(&world, ocsp, Vec::new());
+        let live = super::live::live_revocation_from(signature, &anchors, day(NOW), &source);
+        assert_eq!(live, expected, "{what}");
+    }
+}
+
+#[test]
+fn a_live_lookup_asks_the_next_responder_after_one_that_does_not_hold_up() {
+    let world = World::new();
+    let anchors = world.anchors();
+    let report = unstamped_direct(&world);
+    let source = ScriptedAnswers::new(
+        &world,
+        vec![Responder::Garbage, Responder::Good(NOW)],
+        Vec::new(),
+    );
+    let live = super::live::live_revocation_from(only(&report), &anchors, day(NOW), &source);
+    assert_eq!(live, Revocation::Good { at: day(NOW) });
+    assert_eq!(source.ocsp_asked.get(), 2, "both responders were asked");
+    assert_eq!(source.crl_asked.get(), 0, "no list once OCSP answered");
+}
+
+#[test]
+fn a_live_lookup_falls_back_to_the_crl_when_no_responder_holds_up() {
+    let world = World::new();
+    let anchors = world.anchors();
+    let report = unstamped_direct(&world);
+    let list = crate::testkit::crl(
+        ROOT,
+        &world.root_key,
+        day(NOW),
+        Some(day(ENDS)),
+        &[DIRECT_SIGNER_SERIAL],
+        day(REVOKED_LATER),
+    );
+    let source = ScriptedAnswers::new(
+        &world,
+        vec![Responder::Garbage, Responder::Garbage],
+        vec![list],
+    );
+    let live = super::live::live_revocation_from(only(&report), &anchors, day(NOW), &source);
+    assert_eq!(
+        live,
+        Revocation::Revoked {
+            at: day(REVOKED_LATER),
+            reason: None,
+        }
+    );
+    assert_eq!(source.ocsp_asked.get(), 2);
+    assert_eq!(source.crl_asked.get(), 1);
+}
+
+#[test]
+fn a_live_answer_whose_nonce_changed_is_no_answer() {
+    let world = World::new();
+    let anchors = world.anchors();
+    let report = unstamped_direct(&world);
+    let source = ScriptedAnswers::new(&world, vec![Responder::ChangedNonce], Vec::new());
+    let live = super::live::live_revocation_from(only(&report), &anchors, day(NOW), &source);
+    assert_eq!(live, Revocation::Unavailable);
+}
+
+#[test]
+fn a_live_answer_that_echoes_no_nonce_is_an_answer() {
+    let world = World::new();
+    let anchors = world.anchors();
+    let report = unstamped_direct(&world);
+    let source = ScriptedAnswers::new(&world, vec![Responder::NoNonce], Vec::new());
+    let live = super::live::live_revocation_from(only(&report), &anchors, day(NOW), &source);
+    assert_eq!(live, Revocation::Good { at: day(NOW) });
+}
+
+#[test]
+fn a_live_lookup_judges_the_path_at_the_proof_of_existence() {
+    let world = World::new();
+    let anchors = world.anchors();
+    let pdf = world.pdf(
+        Signer::Direct,
+        Stamp::Anchored,
+        &ValidationMaterial::default(),
+    );
+    let report = verify_expired(pdf, &anchors);
+    let signature = only(&report);
+    assert_eq!(signature.validation_time(), day(STAMPED));
+    assert!(signature.chain_verified());
+    // Answered on the signer's last valid day, asked a day later.
+    let source = ScriptedAnswers::new(&world, vec![Responder::Good(ENDS)], Vec::new());
+    let live = super::live::live_revocation_from(signature, &anchors, day(EXPIRED), &source);
+    assert_eq!(
+        live,
+        Revocation::Good { at: day(ENDS) },
+        "the signer expired before now and was valid at the proven time"
+    );
+}
+
+#[test]
+fn a_live_lookup_asks_nothing_for_an_unanchored_chain() {
+    let world = World::new();
+    let pdf = world.pdf(Signer::Direct, Stamp::None, &ValidationMaterial::default());
+    let strangers = TrustAnchors::new(vec![anchor(
+        &world.stranger,
+        AnchorRole::CertificateIssuing,
+    )]);
+    let report = verify_under(pdf, &strangers).expect("report");
+    let source = ScriptedAnswers::new(&world, vec![Responder::Revoked(REVOKED_LATER)], Vec::new());
+    let live = super::live::live_revocation_from(only(&report), &strangers, day(NOW), &source);
+    assert_eq!(live, Revocation::Unavailable);
+    assert_eq!(source.ocsp_asked.get(), 0);
 }

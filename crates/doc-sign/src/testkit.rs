@@ -679,3 +679,42 @@ pub fn minimal_pdf() -> Vec<u8> {
     );
     pdf
 }
+
+/// The `GeneralName` choice `uniformResourceIdentifier` (RFC 5280
+/// sec.4.2.1.6).
+const GENERAL_NAME_URI_CHOICE: u8 = 6;
+/// `uniformResourceIdentifier [6] IA5String`, implicitly tagged.
+const GENERAL_NAME_URI: u8 = CONTEXT_0_PRIMITIVE | GENERAL_NAME_URI_CHOICE;
+
+/// An `authorityInfoAccess` extension naming `urls` as OCSP responders
+/// (RFC 5280 sec.4.2.2.1).
+#[must_use]
+pub fn ocsp_access(urls: &[&str]) -> Vec<u8> {
+    let mut descriptions = Vec::new();
+    for url in urls {
+        let mut description = tlv(OBJECT_IDENTIFIER, known::AD_OCSP.as_bytes());
+        description.extend_from_slice(&tlv(GENERAL_NAME_URI, url.as_bytes()));
+        descriptions.extend_from_slice(&tlv(SEQUENCE, description));
+    }
+    extension(
+        known::AUTHORITY_INFO_ACCESS,
+        false,
+        &tlv(SEQUENCE, descriptions),
+    )
+}
+
+/// A `cRLDistributionPoints` extension naming `urls`, one distribution
+/// point each, by `fullName` (RFC 5280 sec.4.2.1.13).
+#[must_use]
+pub fn crl_distribution_points(urls: &[&str]) -> Vec<u8> {
+    let mut points = Vec::new();
+    for url in urls {
+        let full_name = tlv(CONTEXT_0, tlv(GENERAL_NAME_URI, url.as_bytes()));
+        points.extend_from_slice(&tlv(SEQUENCE, tlv(CONTEXT_0, full_name)));
+    }
+    extension(
+        known::CRL_DISTRIBUTION_POINTS,
+        false,
+        &tlv(SEQUENCE, points),
+    )
+}

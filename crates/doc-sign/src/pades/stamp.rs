@@ -46,6 +46,17 @@ const LANGUAGE_FINNISH: u16 = 0x0b;
 /// `LANG_SWEDISH` of winnt.h.
 const LANGUAGE_SWEDISH: u16 = 0x1d;
 
+/// The language code of a POSIX locale name, `language[_territory][.codeset][@modifier]`
+/// (POSIX.1-2017 XBD 8.2), ends at the first of these.
+const LOCALE_LANGUAGE_ENDS: [char; 3] = ['_', '.', '@'];
+/// The ISO 639-1 codes of the languages the stamp carries besides English.
+const LANGUAGE_CODE_FINNISH: &str = "fi";
+const LANGUAGE_CODE_SWEDISH: &str = "sv";
+/// The locale variables that name the language of messages, in the order
+/// POSIX.1-2017 XBD 8.2 gives them precedence.
+#[cfg(unix)]
+const MESSAGE_LOCALE_VARIABLES: [&str; 3] = ["LC_ALL", "LC_MESSAGES", "LANG"];
+
 impl StampLanguage {
     /// The stamp language of a Windows language identifier, judged by
     /// its primary language whatever its region; English for any
@@ -57,6 +68,41 @@ impl StampLanguage {
             LANGUAGE_SWEDISH => Self::Swedish,
             _ => Self::English,
         }
+    }
+
+    /// The stamp language of a POSIX locale name, judged by its language
+    /// code whatever its territory or codeset; English for any language
+    /// the stamp does not carry, `C` and `POSIX` included.
+    #[must_use]
+    pub fn for_locale(name: &str) -> Self {
+        let code = name.split(LOCALE_LANGUAGE_ENDS).next().unwrap_or_default();
+        if code.eq_ignore_ascii_case(LANGUAGE_CODE_FINNISH) {
+            Self::Finnish
+        } else if code.eq_ignore_ascii_case(LANGUAGE_CODE_SWEDISH) {
+            Self::Swedish
+        } else {
+            Self::English
+        }
+    }
+
+    /// The stamp language of the process's message locale: the first of
+    /// `LC_ALL`, `LC_MESSAGES` and `LANG` set and non-empty; English when
+    /// none is.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn for_process_locale() -> Self {
+        Self::for_message_locale(|name| std::env::var(name).ok())
+    }
+
+    /// The stamp language of the first message locale variable `lookup`
+    /// finds set and non-empty; English when none is.
+    #[cfg(unix)]
+    fn for_message_locale(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        MESSAGE_LOCALE_VARIABLES
+            .iter()
+            .filter_map(|name| lookup(name))
+            .find(|value| !value.is_empty())
+            .map_or(Self::English, |value| Self::for_locale(&value))
     }
 }
 
@@ -717,6 +763,99 @@ mod tests {
         SWEDISH_WORDS, StampLanguage, centre_layout, literal, operators, operators_tilted,
         representable, tilt_degrees,
     };
+
+    #[test]
+    fn the_stamp_language_follows_the_language_code_of_the_locale() {
+        for (locale, language) in [
+            ("fi_FI.UTF-8", StampLanguage::Finnish),
+            ("fi", StampLanguage::Finnish),
+            ("sv_SE.UTF-8", StampLanguage::Swedish),
+            ("sv_FI@euro", StampLanguage::Swedish),
+            ("en_US.UTF-8", StampLanguage::English),
+            ("fil_PH.UTF-8", StampLanguage::English),
+            ("de_DE.UTF-8", StampLanguage::English),
+            ("C", StampLanguage::English),
+            ("POSIX", StampLanguage::English),
+            ("", StampLanguage::English),
+        ] {
+            assert_eq!(StampLanguage::for_locale(locale), language, "{locale}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_message_locale_is_the_first_variable_set_and_non_empty() {
+        let lookup = |set: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                set.iter()
+                    .find(|(variable, _)| *variable == name)
+                    .map(|(_, value)| (*value).to_owned())
+            }
+        };
+        for (set, language) in [
+            (
+                &[("LC_ALL", "sv_SE.UTF-8"), ("LANG", "fi_FI.UTF-8")][..],
+                StampLanguage::Swedish,
+            ),
+            (
+                &[("LC_ALL", ""), ("LC_MESSAGES", "fi_FI.UTF-8")][..],
+                StampLanguage::Finnish,
+            ),
+            (&[("LANG", "sv_FI.UTF-8")][..], StampLanguage::Swedish),
+            (&[("LANG", "")][..], StampLanguage::English),
+            (&[][..], StampLanguage::English),
+        ] {
+            assert_eq!(StampLanguage::for_message_locale(lookup(set)), language);
+        }
+    }
+
+    /// The reference renderer's streams, tilt line left out; see the
+    /// header of each file for its origin.
+    const REFERENCE_FINNISH: &str =
+        include_str!("../../test-vectors/verification-stamp-finnish.txt");
+    const REFERENCE_SWEDISH: &str =
+        include_str!("../../test-vectors/verification-stamp-swedish.txt");
+    const REFERENCE_ENGLISH: &str =
+        include_str!("../../test-vectors/verification-stamp-english.txt");
+    /// A fixture's header lines are PDF comments.
+    const FIXTURE_COMMENT: char = '%';
+    /// The tilt's rotation is the third operator line.
+    const TILT_LINE: usize = 2;
+
+    #[test]
+    fn the_operators_match_the_reference_renderer_but_for_the_tilt() {
+        for (language, reference) in [
+            (StampLanguage::Finnish, REFERENCE_FINNISH),
+            (StampLanguage::Swedish, REFERENCE_SWEDISH),
+            (StampLanguage::English, REFERENCE_ENGLISH),
+        ] {
+            let expected: Vec<&str> = reference
+                .lines()
+                .filter(|line| !line.starts_with(FIXTURE_COMMENT))
+                .collect();
+            let mark = text(language);
+            let mut actual: Vec<&str> = mark.lines().collect();
+            let tilt = actual.remove(TILT_LINE);
+            assert!(tilt.ends_with(" 0 0 cm"), "{language:?} tilt line");
+            assert_eq!(actual, expected, "{language:?}");
+        }
+    }
+
+    #[test]
+    fn the_english_mark_carries_the_english_advice_and_no_holder_name() {
+        let mark = text(StampLanguage::English);
+        let blocks = text_blocks(&mark);
+        assert_eq!(blocks[2], ENGLISH_WORDS.concat());
+        for word in ENGLISH_WORDS {
+            assert!(mark.contains(&format!("({word}) Tj")), "{word}");
+        }
+        assert!(!mark.contains("Test Signer"));
+        assert_eq!(
+            mark.matches(" Tj").count(),
+            FINNISH_BAND.chars().count() + SWEDISH_BAND.chars().count() + ENGLISH_WORDS.len(),
+            "only the band glyphs and the four middle lines are text"
+        );
+    }
 
     fn text(language: StampLanguage) -> String {
         String::from_utf8(operators(language)).expect("ASCII operators")

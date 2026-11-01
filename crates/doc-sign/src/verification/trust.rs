@@ -400,7 +400,7 @@ const fn is_compromise(reason: CrlReason) -> bool {
 
 /// Of two revocations, the one to report: a compromise before any
 /// other, then the earlier.
-fn graver(
+pub(crate) fn graver(
     known: Option<(DateTime, Option<CrlReason>)>,
     at: DateTime,
     reason: Option<CrlReason>,

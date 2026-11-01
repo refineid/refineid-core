@@ -29,7 +29,7 @@ use refineid_apdu::{ApduClass, CommandApdu, CommandDataError, CommandHeader};
 use crate::container::RsaCryptogram;
 
 /// MANAGE SECURITY ENVIRONMENT instruction.
-const MSE_INS: u8 = 0x22;
+pub const MSE_INS: u8 = 0x22;
 /// MSE P1 selecting SET for computation and decipherment.
 const MSE_P1_SET: u8 = 0x41;
 /// MSE P2 for the digital-signature template (DST). It is the only
@@ -49,7 +49,7 @@ const CRDO_VALUE_LEN: u8 = 0x01;
 
 /// PERFORM SECURITY OPERATION instruction, shared by HASH and COMPUTE
 /// DIGITAL SIGNATURE.
-const PSO_INS: u8 = 0x2A;
+pub const PSO_INS: u8 = 0x2A;
 /// PSO:HASH P1.
 const PSO_HASH_P1: u8 = 0x90;
 /// PSO:HASH P2 for the external / final hash form.
@@ -61,7 +61,7 @@ const PSO_HASH_TAG_VALUE: u8 = 0x90;
 const HASH_VALUE_HEADER_LEN: usize = 2;
 
 /// PSO:COMPUTE DIGITAL SIGNATURE P1.
-const PSO_CDS_P1: u8 = 0x9E;
+pub const PSO_CDS_P1: u8 = 0x9E;
 /// PSO:COMPUTE DIGITAL SIGNATURE P2.
 const PSO_CDS_P2: u8 = 0x9A;
 /// Expected-length byte requesting every available byte of the

@@ -53,7 +53,7 @@ use crate::timestamp::{
 };
 use crate::validation::ValidationMaterial;
 use refineid_cms::oid::{Oid, known};
-use refineid_cms::x509::OwnedCert;
+use refineid_cms::x509::{DateTime, OwnedCert};
 
 /// Why a structure is not a `CAdES` signature this reader verifies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,6 +257,9 @@ pub struct CadesSignature {
     embedded_material: ValidationMaterial,
     /// Whether a `signing-time` signed attribute is present.
     has_signing_time: bool,
+    /// The `signing-time` value, when exactly one attribute holds
+    /// exactly one readable value.
+    signing_time: Option<DateTime>,
 }
 
 impl CadesSignature {
@@ -269,7 +272,13 @@ impl CadesSignature {
     /// its signer certificate exactly once.
     pub fn parse(cms: &[u8]) -> Result<Self, CadesReadError> {
         let signed_data = OwnedSignedData::from_der(cms).map_err(CadesReadError::Cms)?;
-        let (digest_algorithm, signer_certificate, embedded_material, has_signing_time) = {
+        let (
+            digest_algorithm,
+            signer_certificate,
+            embedded_material,
+            has_signing_time,
+            signing_time,
+        ) = {
             let signed = signed_data.view();
             let signer = signed.signer();
             if signer.signed_attributes_der().is_none() {
@@ -284,11 +293,17 @@ impl CadesSignature {
                     _ => CadesReadError::SignerCertificateMissing,
                 })?;
             let material = embedded_material(&signed, signer_certificate.as_der());
-            let signing_time = signer
-                .signed_attributes()
+            let attributes = signer.signed_attributes();
+            let has_signing_time = attributes
                 .iter()
                 .any(|attribute| attribute.oid == known::SIGNING_TIME);
-            (digest_algorithm, signer_certificate, material, signing_time)
+            (
+                digest_algorithm,
+                signer_certificate,
+                material,
+                has_signing_time,
+                single_signing_time(attributes),
+            )
         };
         Ok(Self {
             signed_data,
@@ -296,6 +311,7 @@ impl CadesSignature {
             signer_certificate,
             embedded_material,
             has_signing_time,
+            signing_time,
         })
     }
 
@@ -324,6 +340,14 @@ impl CadesSignature {
     #[must_use]
     pub const fn has_signing_time_attribute(&self) -> bool {
         self.has_signing_time
+    }
+
+    /// The time the `signing-time` signed attribute claims (RFC 5652
+    /// sec.11.3); `None` when absent, repeated, multi-valued or
+    /// unreadable. A claim of the signer's clock, proving nothing.
+    #[must_use]
+    pub const fn signing_time(&self) -> Option<DateTime> {
+        self.signing_time
     }
 
     /// Whether the structure carries its content as `eContent`.
@@ -425,6 +449,25 @@ fn embedded_material(signed: &SignedData<'_>, signer_der: &[u8]) -> ValidationMa
         }
     }
     material
+}
+
+/// The `signing-time` attribute's value, when there is exactly one such
+/// attribute with exactly one value: a `Time`, `UTCTime` or
+/// `GeneralizedTime` (RFC 5652 sec.11.3).
+fn single_signing_time(attributes: &[CmsAttribute<'_>]) -> Option<DateTime> {
+    use spki::der::Decode as _;
+    use spki::der::asn1::{GeneralizedTime, UtcTime};
+    let present = attributes
+        .iter()
+        .filter(|attribute| attribute.oid == known::SIGNING_TIME)
+        .count();
+    match attribute_values(attributes, known::SIGNING_TIME).as_slice() {
+        [value] if present == 1 => UtcTime::from_der(value)
+            .map(|time| time.to_date_time())
+            .or_else(|_ignored| GeneralizedTime::from_der(value).map(|time| time.to_date_time()))
+            .ok(),
+        _ => None,
+    }
 }
 
 /// The complete DER of every value of every attribute of type `oid`.

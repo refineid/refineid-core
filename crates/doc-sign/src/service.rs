@@ -38,8 +38,9 @@ use crate::digest::Sha256;
 use crate::document::{self, DocumentError, DocumentPlan, Format};
 use crate::identity::{CommonName, TokenSerial, render_token_serial};
 use crate::pades::SignatureMetadata;
-use crate::pin::{PinBytes, PinPolicyReason};
+use crate::pin::{PinBytes, PinEntryError, PinPolicyReason, PinRole, PinSource};
 use crate::rng;
+use crate::signed_name::{BestSignatureTime, PendingSignedName};
 use crate::timestamp::{self, TimestampError, VerifiedTimestampToken};
 use crate::uri::{Scheme, Uri};
 use crate::validation::ValidationMaterial;
@@ -59,15 +60,15 @@ use refineid_cms::x509::{
 use refineid_digest::Sha384 as CoreSha384;
 use refineid_pace::{self, Can, PaceError, SmTransport, run_pace_with_can};
 use refineid_pcsc::{
-    PcscBackend, PcscError, ReaderAccessCap, ReaderBackend as _, ReaderBackendOps as _,
-    ReaderFilter, ReaderPickError,
+    PcscCard, PcscError, PcscTransactionCard, ReaderAccessCap, ReaderBackend,
+    ReaderBackendOps as _, ReaderFilter, ReaderPickError,
 };
 use refineid_pkcs15::Pkcs15Ops as _;
 use refineid_pkcs15::{CertSlot, Pkcs15Error, UnvalidatedCertificate};
 use refineid_sign::{KeyRef, SignError, SignOps as _, SignScheme};
 use zeroize::Zeroizing;
 
-use crate::material::{ChainStart, NoncePolicy, now_date_time};
+use crate::material::{ChainAnchor, ChainStart, NoncePolicy, now_date_time};
 
 /// Maximum tolerated difference between this host and a live TSA.
 ///
@@ -161,22 +162,77 @@ impl fmt::Debug for TimestampCredentials {
     }
 }
 
-/// The key that signs documents: the qualified-signature key, gated by
-/// PIN 2, whose certificate is EF.4332 (FINEID S1 v4.2 §3.5).
-const SIGNING_KEY: KeyRef = KeyRef::Sign;
+/// Which on-card key signs (FINEID S1 v4.2 §3.5): the key, the PIN
+/// that gates it, and the certificate its public key pairs with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignSlot {
+    /// The authentication key: key reference `KeyRef::Auth`, gated by
+    /// PIN 1, certificate EF.4331.
+    Authentication,
+    /// The qualified-signature key: key reference `KeyRef::Sign`, gated
+    /// by PIN 2, certificate EF.4332.
+    Qualified,
+}
 
-/// The PIN that gates [`SIGNING_KEY`].
-const SIGNING_PIN: PinSlot = PinSlot::Pin2;
+impl SignSlot {
+    /// The key reference `MSE:SET DST` names for the key; a report's
+    /// [`SignReport::slot`] gives the one it signed with.
+    #[must_use]
+    pub const fn key_ref(self) -> KeyRef {
+        match self {
+            Self::Authentication => KeyRef::Auth,
+            Self::Qualified => KeyRef::Sign,
+        }
+    }
 
-/// The certificate whose public key pairs with [`SIGNING_KEY`], read
-/// once at session start and reused by the local verify.
-const SIGNING_CERT: CertSlot = CertSlot::Signature;
+    /// The PIN that gates the key.
+    const fn pin_slot(self) -> PinSlot {
+        match self {
+            Self::Authentication => PinSlot::Pin1,
+            Self::Qualified => PinSlot::Pin2,
+        }
+    }
 
-/// The PIN's name as the activation letter prints it.
-const SIGNING_PIN_LABEL: &str = "PIN2";
+    /// The certificate whose public key pairs with the key, read once
+    /// at session start and reused by the local verify.
+    const fn cert_slot(self) -> CertSlot {
+        match self {
+            Self::Authentication => CertSlot::Authentication,
+            Self::Qualified => CertSlot::Signature,
+        }
+    }
 
-/// The key's name in reports and errors.
-const SIGNING_KEY_LABEL: &str = "qualified-signature";
+    /// The PIN the key's VERIFY presents.
+    #[must_use]
+    pub const fn pin_role(self) -> PinRole {
+        match self {
+            Self::Authentication => PinRole::Pin1,
+            Self::Qualified => PinRole::Pin2,
+        }
+    }
+
+    /// The PIN's name as the activation letter prints it.
+    #[must_use]
+    pub const fn pin_label(self) -> &'static str {
+        match self {
+            Self::Authentication => "PIN1",
+            Self::Qualified => "PIN2",
+        }
+    }
+
+    /// The key's name in reports and errors.
+    #[must_use]
+    pub const fn key_label(self) -> &'static str {
+        match self {
+            Self::Authentication => "authentication",
+            Self::Qualified => "qualified-signature",
+        }
+    }
+}
+
+/// Why the flow refuses to VERIFY when the card in the reader after the
+/// PIN prompt is not the card checked before it.
+pub const CARD_CHANGED_DURING_PROMPT: &str = "the card changed while the PIN was entered";
 
 /// A document signature rather than a bare one.
 ///
@@ -289,12 +345,11 @@ pub struct SignOptions {
     /// and sent to the card via `PSO:HASH` per FINEID S1
     /// v4.2 §3.5.
     pub input: PathBuf,
-    /// Filesystem path where the resulting raw RSA-PKCS#1 v1.5
-    /// signature bytes will be written (no envelope).
-    pub output: PathBuf,
-    /// PIN value the operator entered for the targeted slot.
-    /// Consumed and zeroized at function return.
-    pub pin: PinBytes,
+    /// Where the raw signature, or the finished document when
+    /// [`Self::document`] is set, is written.
+    pub output: SignOutput,
+    /// Which key signs.
+    pub slot: SignSlot,
     /// Optional output path for the DER bytes of the on-card cert
     /// that produced the signature. Pairs the signature with the
     /// cert it can be verified against -- enables offline
@@ -318,12 +373,58 @@ pub struct SignOptions {
     pub document: Option<DocumentRequest>,
 }
 
+/// Where [`SignOptions`] writes its result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignOutput {
+    /// This path, created or replaced.
+    At(PathBuf),
+    /// The default signed-document name, carrying the signature's
+    /// best-signature-time once the signature exists. Created new: it
+    /// never replaces an existing file.
+    SignedName(PendingSignedName),
+}
+
+impl SignOutput {
+    /// The path, given the signature's best-signature-time.
+    #[must_use]
+    pub fn path(&self, best: Option<BestSignatureTime>) -> PathBuf {
+        match self {
+            Self::At(path) => path.clone(),
+            Self::SignedName(pending) => pending.path(best),
+        }
+    }
+
+    /// Write `bytes` to [`Self::path`] and return that path.
+    fn write(
+        &self,
+        best: Option<BestSignatureTime>,
+        bytes: &[u8],
+    ) -> Result<PathBuf, SignErrorKind> {
+        use std::io::Write as _;
+        let path = self.path(best);
+        let written = match self {
+            Self::At(_) => std::fs::write(&path, bytes),
+            Self::SignedName(_) => std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .and_then(|mut file| file.write_all(bytes)),
+        };
+        match written {
+            Ok(()) => Ok(path),
+            Err(source) => Err(SignErrorKind::SignatureWrite { path, source }),
+        }
+    }
+}
+
 /// One reader's worth of sign output.
 #[derive(Debug, Clone)]
 pub struct SignReport {
     /// PC/SC reader name the sign APDU chain landed against.
     /// Tier 0 `String` from `ReaderId::as_str().to_owned()`.
     pub reader: String,
+    /// Which key signed.
+    pub slot: SignSlot,
     /// Length of the input file in bytes.
     pub input_len: u64,
     /// SHA-256 of the input.
@@ -341,6 +442,10 @@ pub struct SignReport {
     /// not a count of distinct authorities: one authority may issue
     /// both kinds of token.
     pub timestamps: usize,
+    /// The earliest `genTime` of the validated signature timestamps,
+    /// the signature's best-signature-time (ETSI EN 319 102-1 clause
+    /// 5.5); `None` without one, when a default name carries the clock.
+    pub best_signature_time: Option<BestSignatureTime>,
     /// Size of the file that was written.
     ///
     /// Equal to `signature_len` for a bare sign, and the size of the
@@ -435,7 +540,7 @@ pub enum SignErrorKind {
     /// The slot's certificate uses a key this crate can build a
     /// document signature with, but whose digest pairing is not one
     /// the formats name.
-    UnsupportedDocumentKey,
+    UnsupportedDocumentKey(SignSlot),
     /// The chain or revocation answers could not be collected.
     ///
     /// Raised rather than falling back to a shorter-lived signature: a
@@ -466,6 +571,8 @@ pub enum SignErrorKind {
     },
     /// VERIFY of the slot's PIN returned a non-Ok outcome.
     PinRejected {
+        /// Which key's PIN the VERIFY targeted.
+        slot: SignSlot,
         /// Card-side outcome (`WrongPin{retries}`, `Locked`,
         /// `AuthenticationFailed`, ...).
         outcome: VerifyOutcome,
@@ -474,9 +581,13 @@ pub enum SignErrorKind {
     /// shared retry floor, blocked, or unreadable, so no VERIFY was
     /// sent. The counter is unaffected.
     RetryFloor(RetryFloorRefusal),
+    /// The PIN entry produced no PIN; nothing was sent to the card.
+    PinEntry(PinEntryError),
     /// Local-policy rejection (PIN length / non-digit) before any
     /// APDU went out. Counter is unaffected.
     PinPolicy {
+        /// Which key's PIN was refused.
+        slot: SignSlot,
         /// Specific local-policy failure (e.g. `TooShort`,
         /// `NonDigit`).
         reason: PinPolicyReason,
@@ -501,19 +612,23 @@ pub enum SignErrorKind {
     InputTooLong(usize),
     /// The on-card cert is missing or unparseable.
     CertUnavailable {
+        /// Which key's certificate was read.
+        slot: SignSlot,
         /// Human-readable detail from the cert reader / parser.
         /// Tier 0 `String`; presentational.
         detail: String,
     },
     /// Cert was readable but its public key type is not supported
     /// (not RSA, not ECDSA P-384, or uses explicit EC params).
-    UnsupportedKeyType,
+    UnsupportedKeyType(SignSlot),
     /// Cert carries an EC key on a curve other than secp384r1.
     /// The Newer-scheme sign chain handles only secp384r1 + SHA-384
     /// (S4-1 v4.2 §4.2); the other supported curve OIDs land here
     /// rather than at the wire layer where the card would reject
     /// the algRef byte.
     UnsupportedCurve {
+        /// Which key's certificate carried the curve.
+        slot: SignSlot,
         /// Curve the cert was issued on.
         curve: EcCurve,
     },
@@ -541,6 +656,7 @@ impl fmt::Display for SignErrorKind {
         match self {
             Self::ReaderPick(e) => write!(f, "{e}"),
             Self::RetryFloor(refusal) => write!(f, "{refusal}"),
+            Self::PinEntry(error) => write!(f, "{error}"),
             Self::Pcsc(e) => write!(f, "PC/SC: {e}"),
             Self::Document(e) => write!(f, "{e}"),
             Self::VisibleSignatureFormat => {
@@ -549,9 +665,10 @@ impl fmt::Display for SignErrorKind {
             Self::DisplayedCard(detail) => write!(f, "displayed card: {detail}"),
             Self::Material(detail) => write!(f, "validation material: {detail}"),
             Self::Timestamp(detail) => write!(f, "timestamp: {detail}"),
-            Self::UnsupportedDocumentKey => write!(
+            Self::UnsupportedDocumentKey(slot) => write!(
                 f,
-                "the {SIGNING_KEY_LABEL} certificate's key type cannot produce a document signature"
+                "the {} certificate's key type cannot produce a document signature",
+                slot.key_label()
             ),
             Self::InputRead { path, source } => {
                 write!(f, "read input {}: {source}", path.display())
@@ -560,32 +677,42 @@ impl fmt::Display for SignErrorKind {
                 write!(f, "write signature {}: {source}", path.display())
             }
             Self::PinRejected {
+                slot,
                 outcome: VerifyOutcome::WrongPin { retries_left },
             } => {
                 write!(
                     f,
-                    "{SIGNING_PIN_LABEL} rejected (wrong PIN, {retries_left} retries left)"
+                    "{} rejected (wrong PIN, {retries_left} retries left)",
+                    slot.pin_label()
                 )
             }
             Self::PinRejected {
+                slot,
                 outcome: VerifyOutcome::Locked,
             } => {
                 write!(
                     f,
-                    "{SIGNING_PIN_LABEL} is blocked -- card needs a PUK unblock"
+                    "{} is blocked -- card needs a PUK unblock",
+                    slot.pin_label()
                 )
             }
             Self::PinRejected {
+                slot,
                 outcome: VerifyOutcome::Other(sw),
             } => {
                 let sw_val = sw.as_u16();
-                write!(f, "{SIGNING_PIN_LABEL} verify: unexpected SW={sw_val:#06X}")
+                write!(
+                    f,
+                    "{} verify: unexpected SW={sw_val:#06X}",
+                    slot.pin_label()
+                )
             }
             Self::PinRejected {
                 outcome: VerifyOutcome::Ok,
+                ..
             } => write!(f, "internal: PinRejected(Ok) is not an error state"),
-            Self::PinPolicy { reason } => {
-                write!(f, "{SIGNING_PIN_LABEL} rejected locally: {reason}")
+            Self::PinPolicy { slot, reason } => {
+                write!(f, "{} rejected locally: {reason}", slot.pin_label())
             }
             Self::SignSw { stage, sw } => {
                 write!(f, "sign chain failed at {stage}: SW={sw:#06X}")
@@ -599,22 +726,25 @@ impl fmt::Display for SignErrorKind {
             Self::InputTooLong(n) => {
                 write!(f, "{n}-byte signing input exceeds the card command length")
             }
-            Self::CertUnavailable { detail } => {
+            Self::CertUnavailable { slot, detail } => {
                 write!(
                     f,
-                    "{SIGNING_KEY_LABEL} cert unavailable for local verify: {detail}"
+                    "{} cert unavailable for local verify: {detail}",
+                    slot.key_label()
                 )
             }
-            Self::UnsupportedKeyType => {
+            Self::UnsupportedKeyType(slot) => {
                 write!(
                     f,
-                    "{SIGNING_KEY_LABEL} cert has an unsupported key type (not RSA, not ECDSA P-384, or explicit EC params)"
+                    "{} cert has an unsupported key type (not RSA, not ECDSA P-384, or explicit EC params)",
+                    slot.key_label()
                 )
             }
-            Self::UnsupportedCurve { curve } => {
+            Self::UnsupportedCurve { slot, curve } => {
                 write!(
                     f,
-                    "{SIGNING_KEY_LABEL} cert is EC on {} ({}-bit); refineid currently only signs ECDSA on secp384r1",
+                    "{} cert is EC on {} ({}-bit); refineid currently only signs ECDSA on secp384r1",
+                    slot.key_label(),
                     curve.label(),
                     curve.bits()
                 )
@@ -668,10 +798,11 @@ const ORGANIZATIONAL_PIN_STORED_LENGTH: usize = 8;
 
 /// Organizational length window plus ASCII-digit shape. A
 /// rejection here doesn't burn a card-side retry counter slot.
-fn validate_org_pin_policy(ascii: &[u8]) -> Result<(), SignErrorKind> {
+fn validate_org_pin_policy(slot: SignSlot, ascii: &[u8]) -> Result<(), SignErrorKind> {
     if ascii.len() < ORGANIZATIONAL_PIN_MIN_LENGTH || ascii.len() > ORGANIZATIONAL_PIN_STORED_LENGTH
     {
         return Err(SignErrorKind::PinPolicy {
+            slot,
             reason: PinPolicyReason::WrongLength {
                 min: ORGANIZATIONAL_PIN_MIN_LENGTH,
                 max: ORGANIZATIONAL_PIN_STORED_LENGTH,
@@ -680,6 +811,7 @@ fn validate_org_pin_policy(ascii: &[u8]) -> Result<(), SignErrorKind> {
     }
     if ascii.iter().any(|b| !b.is_ascii_digit()) {
         return Err(SignErrorKind::PinPolicy {
+            slot,
             reason: PinPolicyReason::NonDigit,
         });
     }
@@ -705,19 +837,19 @@ fn resolve_pin_reference_scheme<T: CardTransport>(
 /// the organizational path sends unpadded digits capped at 8 bytes.
 fn verify_pin_with_scheme<T: CardTransport>(
     transport: &mut T,
-    slot: PinSlot,
+    slot: SignSlot,
     scheme: PinReferenceScheme,
     pin: &PinBytes,
 ) -> Result<VerifyOutcome, SignErrorKind> {
     let digits = pin.as_bytes();
     if scheme == PinReferenceScheme::Organizational {
-        validate_org_pin_policy(digits)?;
+        validate_org_pin_policy(slot, digits)?;
     }
     let header = CommandHeader {
         class: ApduClass::Plain,
         instruction: 0x20, // INS VERIFY
         p1: 0x00,
-        p2: scheme.reference(slot),
+        p2: scheme.reference(slot.pin_slot()),
     };
     let mut block = UnvalidatedCredentialBlock::zeroed();
     block.buffer().fill(0x00);
@@ -751,6 +883,7 @@ fn verify_pin_with_scheme<T: CardTransport>(
 /// the typed error kind without doing any APDU.
 fn sign_dispatch_by_alg<T: CardTransport>(
     transport: &mut T,
+    slot: SignSlot,
     scheme: PinReferenceScheme,
     cert: &Certificate<'_>,
     cert_algorithm: PublicKeyAlgorithm,
@@ -765,7 +898,7 @@ fn sign_dispatch_by_alg<T: CardTransport>(
         PublicKeyAlgorithm::Rsa { .. } => {
             let core_digest = *input_sha256.as_bytes();
             let signature = transport
-                .sign_prehashed_sha256_rsa(sign_scheme, SIGNING_KEY, core_digest)
+                .sign_prehashed_sha256_rsa(sign_scheme, slot.key_ref(), core_digest)
                 .map_err(sign_err_to_kind)?;
             let verify = match cert.spki.verify_message_signature(
                 MessageSignatureAlgorithm::RsaPkcs1Sha256,
@@ -782,7 +915,7 @@ fn sign_dispatch_by_alg<T: CardTransport>(
         PublicKeyAlgorithm::Ec(EcCurve::Secp384r1) => {
             let hash_sha384 = CoreSha384::of(input_bytes);
             let signature = transport
-                .sign_prehashed_sha384_ecdsa(sign_scheme, SIGNING_KEY, *hash_sha384.as_bytes())
+                .sign_prehashed_sha384_ecdsa(sign_scheme, slot.key_ref(), *hash_sha384.as_bytes())
                 .map_err(sign_err_to_kind)?;
             let verify = match cert.spki.verify_message_signature(
                 MessageSignatureAlgorithm::EcdsaSha384Raw,
@@ -796,40 +929,86 @@ fn sign_dispatch_by_alg<T: CardTransport>(
             };
             Ok((signature.into_bytes(), verify))
         }
-        PublicKeyAlgorithm::Ec(curve) => Err(SignErrorKind::UnsupportedCurve { curve }),
-        PublicKeyAlgorithm::Other => Err(SignErrorKind::UnsupportedKeyType),
+        PublicKeyAlgorithm::Ec(curve) => Err(SignErrorKind::UnsupportedCurve { slot, curve }),
+        PublicKeyAlgorithm::Other => Err(SignErrorKind::UnsupportedKeyType(slot)),
     }
 }
 
-/// Drive the full sign flow for a card's qualified signing slot.
+/// A card session the signing flow drives: a reset in place, which
+/// PACE starts from, and one PIN-bearing transaction ended with a card
+/// reset.
+pub trait SigningSession: CardTransport + Sized {
+    /// The transport the PIN sequence's body receives.
+    type Sequence<'a>: CardTransport;
+
+    /// Reset the card in place, returning it to its post-ATR state.
+    ///
+    /// # Errors
+    /// The backend's reset failure.
+    fn reset_card(&mut self) -> Result<(), PcscError>;
+
+    /// Run `body` inside one transaction that ends with a card reset,
+    /// consuming the session.
+    ///
+    /// # Errors
+    /// The backend's failure to begin or to end the transaction.
+    fn pin_sequence<R>(
+        self,
+        body: impl for<'a> FnOnce(Self::Sequence<'a>) -> R,
+    ) -> Result<R, PcscError>;
+}
+
+impl SigningSession for PcscCard {
+    type Sequence<'a> = PcscTransactionCard<'a, 'a>;
+
+    fn reset_card(&mut self) -> Result<(), PcscError> {
+        self.reset()
+    }
+
+    fn pin_sequence<R>(
+        self,
+        body: impl for<'a> FnOnce(Self::Sequence<'a>) -> R,
+    ) -> Result<R, PcscError> {
+        Self::pin_sequence(self, |card: PcscTransactionCard<'_, '_>| body(card))
+    }
+}
+
+/// Drive the full sign flow for `options.slot` on the one reader with a
+/// card.
 ///
 /// FINEID S1 v4.2 §3.5 + §3.6 + §3.7. Steps:
 ///
-///   1. Open a PIN-sequence transport against the picked reader.
-///   2. Inside one PC/SC transaction: select the FINEID PKCS#15
-///      application, then the slot's cert; read the SPKI for the
-///      local verify step.
-///   3. VERIFY the slot's PIN; consume `options` so the
-///      [`PinBytes`] zeroize on return (Rule E1).
-///   4. MSE:SET DST -> PSO:HASH -> PSO:CDS chain.
-///   5. Local verify against the SPKI (Rule E7); refuse to
-///      hand back a signature that doesn't verify. The
-///      transaction ends with a card reset.
-///   6. Assemble the document and fetch its timestamps with the
-///      card session closed.
+///   1. Open a PIN-sequence session against the picked reader; on the
+///      contactless interface, establish PACE from `options.can`.
+///   2. Select the FINEID PKCS#15 application, read the slot's
+///      certificate, bind the document to it and to the displayed
+///      card, and check the PIN's retry counter against the floor.
+///   3. Ask `pin` for the PIN -- only now, with the card in hand and
+///      its counter served -- holding no transaction while it asks.
+///   4. Inside one transaction that ends with a card reset: refuse when
+///      the card is not the one checked before the prompt, check the
+///      counter again, VERIFY, run MSE:SET DST -> PSO:HASH -> PSO:CDS,
+///      and verify the signature locally (Rule E7).
+///   5. Assemble the document and fetch its timestamps with the card
+///      session closed, and write the output.
 ///
-/// Returns a [`SignReport`] carrying the signature bytes,
-/// local-verify outcome, and audit metadata. The function never
-/// panics across the FFI / CLI boundary.
+/// A PIN that did not end in a signature is forgotten by `pin`
+/// ([`PinSource::forget`]), so a source shared across documents asks
+/// again rather than present it twice.
 ///
 /// # Errors
 /// Every failure surfaces as [`SignErrorKind`]: reader / card /
 /// PIN failures, sign-chain SW failures, cert or TSA failures,
 /// and input / output I/O failures.
-pub fn sign_qualified(
-    backend: PcscBackend,
+pub fn sign<B>(
+    backend: &B,
     mut options: SignOptions,
-) -> Result<SignReport, SignErrorKind> {
+    pin: &mut dyn PinSource,
+) -> Result<SignReport, SignErrorKind>
+where
+    B: ReaderBackend<Error = PcscError>,
+    B::Transport: SigningSession,
+{
     if let Some(request) = options.document.as_ref() {
         request.validate_signing_policy()?;
     }
@@ -845,21 +1024,13 @@ pub fn sign_qualified(
     // `usize` fits in `u64`; 64-bit `usize` IS `u64`).
     let input_len: u64 = u64::try_from(input_bytes.len()).unwrap_or(u64::MAX);
     let input_sha256 = Sha256::of(&input_bytes);
+    let slot = options.slot;
 
-    // The PIN sequence -- certificate read, VERIFY and the PSO
-    // chain -- runs inside one PC/SC transaction that ends with a
-    // card reset. Document assembly, which talks to timestamp and
-    // revocation authorities, runs after the card session is
-    // closed, so the reader is never held across network I/O.
     let mut transport = backend.open_session(&reader_id, ReaderAccessCap::PinSequence)?;
 
-    // SELECT the FINEID PKCS#15 application first. The qualified-
-    // signature cert (EF.4332) lives under DF.5016 and the card
-    // needs the PKCS#15 application active before we can navigate
-    // there from the post-ATR state. Without this the SELECT
-    // chain on EF.4332 returns SW=6A82 ("file not found"). For
-    // the auth slot the read_certificate path does its own SELECT
-    // PKCS#15, so this is a no-op-with-extra-APDU there.
+    // SELECT the FINEID PKCS#15 application first: the slot's cert
+    // lives under it, and the card needs it active before the cert can
+    // be selected from the post-ATR state.
     //
     // Over the contactless interface the card refuses every
     // pre-PACE command with SW 6982 -- PKCS#15 only opens inside
@@ -871,16 +1042,22 @@ pub fn sign_qualified(
     // restriction (FINEID S4-1 v4.2 s8.1.7-9), which is what
     // licenses contactless signing at all.
     let on_card = match transport.select_pkcs15_application() {
-        Ok(()) => transport.pin_sequence(|mut card| {
-            // The probe above ran outside the transaction; the
-            // application context this sequence relies on is
-            // established inside it.
-            card.select_pkcs15_application()
-                .map_err(|e| SignErrorKind::CertUnavailable {
-                    detail: format!("select pkcs15 app: {e}"),
-                })?;
-            sign_on_card(&mut card, &options, &input_bytes, input_sha256)
-        })??,
+        Ok(()) => {
+            let prepared = prepare_on_card(&mut transport, &options, &input_bytes)?;
+            let presented = present_pin(pin, slot, |pin_bytes| {
+                transport.pin_sequence(|mut card| {
+                    commit_in_transaction(
+                        &mut card,
+                        slot,
+                        &prepared,
+                        pin_bytes,
+                        &input_bytes,
+                        input_sha256,
+                    )
+                })?
+            });
+            finish_on_card(prepared, presented?)
+        }
         Err(Pkcs15Error::Status(StatusWord::SecurityNotSatisfied)) => {
             let Some(can) = options.can.take() else {
                 return Err(SignErrorKind::NeedCan);
@@ -892,34 +1069,47 @@ pub fn sign_qualified(
             // outside MF, so MSE:Set AT answers SW=0x6999), and a
             // CAN suspended by an earlier failed PACE, which the
             // card reports exactly like a wrong CAN until it is
-            // reset (BSI TR-03110-3 §2.4). Both observed on a
-            // production card over an ACR1581 PICC slot,
-            // 2026-07-24.
+            // reset (BSI TR-03110-3 §2.4).
             transport
-                .reset()
+                .reset_card()
                 .map_err(|e| SignErrorKind::Pace(format!("reset before PACE: {e}")))?;
-            // PACE, the secure channel and the signing chain are
-            // one transaction. PACE's MSE:Set AT is only accepted
-            // in MF context: the reset lands the card there
-            // already; selecting MF inside the transaction makes
-            // the requirement explicit and survives a backend
-            // whose reset leaves selection elsewhere. The proven
-            // contactless flow in refineid-lib-ffi does the same.
-            transport.pin_sequence(|mut card| {
-                card.select_mf()
-                    .map_err(|e| SignErrorKind::Pace(format!("SELECT MF before PACE: {e}")))?;
-                let session =
-                    run_pace_with_can(&mut card, can).map_err(|e| pace_err_to_kind(&e))?;
-                let mut sm = SmTransport::new(card, session);
-                sm.select_pkcs15_application()
-                    .map_err(|e| SignErrorKind::CertUnavailable {
-                        detail: format!("select pkcs15 app under SM: {e}"),
-                    })?;
-                sign_on_card(&mut sm, &options, &input_bytes, input_sha256)
-            })??
+            // PACE's MSE:Set AT is only accepted in MF context: the
+            // reset lands the card there already; selecting MF makes
+            // the requirement explicit and survives a backend whose
+            // reset leaves selection elsewhere.
+            transport
+                .select_mf()
+                .map_err(|e| SignErrorKind::Pace(format!("SELECT MF before PACE: {e}")))?;
+            let session =
+                run_pace_with_can(&mut transport, can).map_err(|e| pace_err_to_kind(&e))?;
+            let mut sm = SmTransport::new(transport, session);
+            sm.select_pkcs15_application()
+                .map_err(|e| SignErrorKind::CertUnavailable {
+                    slot,
+                    detail: format!("select pkcs15 app under SM: {e}"),
+                })?;
+            let prepared = prepare_on_card(&mut sm, &options, &input_bytes)?;
+            // The secure channel's keys and counter carry into the
+            // transaction: the card is not reset between the two.
+            let (transport, session) = sm.into_parts();
+            let presented = present_pin(pin, slot, |pin_bytes| {
+                transport.pin_sequence(|card| {
+                    let mut sm = SmTransport::new(card, session);
+                    commit_in_transaction(
+                        &mut sm,
+                        slot,
+                        &prepared,
+                        pin_bytes,
+                        &input_bytes,
+                        input_sha256,
+                    )
+                })?
+            });
+            finish_on_card(prepared, presented?)
         }
         Err(e) => {
             return Err(SignErrorKind::CertUnavailable {
+                slot,
                 detail: format!("select pkcs15 app: {e}"),
             });
         }
@@ -928,12 +1118,9 @@ pub fn sign_qualified(
 
     let signature_len = chain.signature_bytes.len();
     let output_len = chain.output_bytes.len();
-    std::fs::write(&options.output, &chain.output_bytes).map_err(|source| {
-        SignErrorKind::SignatureWrite {
-            path: options.output.clone(),
-            source,
-        }
-    })?;
+    let signature_path = options
+        .output
+        .write(chain.best_signature_time, &chain.output_bytes)?;
 
     let cert_path = if let Some(path) = &options.save_cert {
         std::fs::write(path, chain.cert_der.as_bytes()).map_err(|source| {
@@ -949,17 +1136,241 @@ pub fn sign_qualified(
 
     Ok(SignReport {
         reader: reader_id.as_str().to_owned(),
+        slot,
         input_len,
         input_sha256,
-        signature_path: options.output,
+        signature_path,
         cert_path,
         signature_len,
         timestamps: chain.timestamps,
+        best_signature_time: chain.best_signature_time,
         output_len,
         cert_subject_cn: chain.cert_subject_cn,
         pin_retries_after: chain.pin_retries_after,
         local_verify: chain.local_verify,
     })
+}
+
+/// Ask `pin` for `slot`'s PIN and hand it to `verify`. Unless the card
+/// signed, the source forgets the PIN: one the card refused, one typed
+/// for a card that has since changed, or one whose sequence failed
+/// before or after VERIFY is never presented again.
+fn present_pin(
+    pin: &mut dyn PinSource,
+    slot: SignSlot,
+    verify: impl FnOnce(&PinBytes) -> Result<Committed, SignErrorKind>,
+) -> Result<Committed, SignErrorKind> {
+    let outcome = verify(pin.pin(slot.pin_role()).map_err(SignErrorKind::PinEntry)?);
+    if outcome.is_err() {
+        pin.forget();
+    }
+    outcome
+}
+
+/// The PIN transaction's body on either interface: select the PKCS#15
+/// application -- the preparation ran outside the transaction, and the
+/// context VERIFY relies on is established inside it -- then
+/// [`commit_on_card`].
+fn commit_in_transaction<T: CardTransport>(
+    transport: &mut T,
+    slot: SignSlot,
+    prepared: &Prepared,
+    pin: &PinBytes,
+    input_bytes: &[u8],
+    input_sha256: Sha256,
+) -> Result<Committed, SignErrorKind> {
+    transport
+        .select_pkcs15_application()
+        .map_err(|e| SignErrorKind::CertUnavailable {
+            slot,
+            detail: format!("select pkcs15 app: {e}"),
+        })?;
+    commit_on_card(transport, slot, prepared, pin, input_bytes, input_sha256)
+}
+
+/// What the card established before the PIN prompt: the slot's
+/// certificate, the document bound to it, the PIN reference numbering
+/// and the card's serial.
+struct Prepared {
+    /// DER of the slot cert.
+    cert_der: UnvalidatedCertificate,
+    /// The same certificate, parsed.
+    cert_owned: OwnedCert,
+    /// The half-built document the signature completes, when a format
+    /// was asked for.
+    plan: Option<DocumentPlan>,
+    /// The PIN reference numbering the card declared.
+    scheme: PinReferenceScheme,
+    /// The serial EF.TokenInfo named before the prompt.
+    serial: Option<TokenSerial>,
+}
+
+/// What VERIFY and the sign chain produced.
+struct Committed {
+    /// Retry count surfaced by a non-Ok VERIFY status word.
+    pin_retries_after: Option<u8>,
+    /// Raw signature bytes off the card.
+    signature_bytes: Vec<u8>,
+    /// Rule E7 local-verify outcome.
+    local_verify: LocalVerifyOutcome,
+}
+
+/// The card-facing preparation both interface paths share once the
+/// PKCS#15 application is selected on `transport`: cert read + parse,
+/// the document bound to the cert and the displayed card, the PIN
+/// reference numbering, and the retry floor. Runs before the PIN is
+/// asked for, so a missing cert, a swapped card, a malformed request
+/// or a counter below the floor ends the flow without a prompt.
+fn prepare_on_card<T: CardTransport>(
+    transport: &mut T,
+    options: &SignOptions,
+    input_bytes: &[u8],
+) -> Result<Prepared, SignErrorKind> {
+    let slot = options.slot;
+    let cert_der = transport
+        .read_certificate(slot.cert_slot())
+        .or_else(|_| {
+            let alt = match slot.cert_slot() {
+                CertSlot::Authentication => CertSlot::AuthenticationAlt,
+                CertSlot::Signature => CertSlot::SignatureAlt,
+                other => other,
+            };
+            transport.read_certificate(alt)
+        })
+        .map_err(|e| SignErrorKind::CertUnavailable {
+            slot,
+            detail: format!("read: {e}"),
+        })?;
+    let cert_owned =
+        OwnedCert::from_der(cert_der.as_bytes()).map_err(|e| SignErrorKind::CertUnavailable {
+            slot,
+            detail: format!("parse: {e}"),
+        })?;
+
+    // What the card will sign, for a document: a structure built around
+    // the certificate just read -- CAdES signed attributes, or a
+    // canonical ds:SignedInfo -- which is why this cannot happen before
+    // the card is open.
+    let plan = match options.document {
+        None => None,
+        Some(ref request) => {
+            ensure_displayed_card(transport, request)?;
+            let cert = cert_owned.view();
+            let parameters =
+                document_signer(&cert, cert.spki.algorithm(), slot, request.signing_time)?;
+            let objects = load_data_objects(options, request, input_bytes)?;
+            ensure_visible_signature_format(request)?;
+            Some(
+                document::plan(request.format, objects, &parameters, &request.metadata)
+                    .map_err(SignErrorKind::Document)?,
+            )
+        }
+    };
+
+    // The reference numbering is the card's to declare (citizen
+    // S1 v4.2 vs organizational S4-2 v4.0), resolved by
+    // counter-safe probes before any PIN is asked for.
+    let scheme = resolve_pin_reference_scheme(transport)?;
+    check_slot_retry_floor(transport, slot, scheme)?;
+    let serial = live_token_serial(transport)?;
+    Ok(Prepared {
+        cert_der,
+        cert_owned,
+        plan,
+        scheme,
+        serial,
+    })
+}
+
+/// Refuse when the slot's PIN counter is below the shared retry floor.
+fn check_slot_retry_floor<T: CardTransport>(
+    transport: &mut T,
+    slot: SignSlot,
+    scheme: PinReferenceScheme,
+) -> Result<(), SignErrorKind> {
+    let status = transport
+        .pin_status_with_scheme(scheme, slot.pin_slot())
+        .map_err(|e| SignErrorKind::Transport(format!("{e}")))?;
+    check_retry_floor(slot.pin_slot().into(), status).map_err(SignErrorKind::RetryFloor)
+}
+
+/// VERIFY and the sign chain, inside the PIN transaction.
+///
+/// The prompt is the one moment the card is out of the flow's hands,
+/// so the card that answers VERIFY must be the card prepared: its
+/// serial is read again and compared, and its counter checked against
+/// the floor again, before the PIN is sent.
+fn commit_on_card<T: CardTransport>(
+    transport: &mut T,
+    slot: SignSlot,
+    prepared: &Prepared,
+    pin: &PinBytes,
+    input_bytes: &[u8],
+    input_sha256: Sha256,
+) -> Result<Committed, SignErrorKind> {
+    if live_token_serial(transport)? != prepared.serial {
+        return Err(SignErrorKind::DisplayedCard(
+            CARD_CHANGED_DURING_PROMPT.to_owned(),
+        ));
+    }
+    check_slot_retry_floor(transport, slot, prepared.scheme)?;
+    let outcome = verify_pin_with_scheme(transport, slot, prepared.scheme, pin)?;
+    let pin_retries_after = match outcome {
+        VerifyOutcome::Ok => None,
+        rejected @ (VerifyOutcome::WrongPin { .. }
+        | VerifyOutcome::Locked
+        | VerifyOutcome::Other(_)) => {
+            return Err(SignErrorKind::PinRejected {
+                slot,
+                outcome: rejected,
+            });
+        }
+    };
+
+    let signed_octets: &[u8] = prepared
+        .plan
+        .as_ref()
+        .map_or(input_bytes, DocumentPlan::to_be_signed);
+    // The RSA path signs this digest; the ECDSA path recomputes its
+    // own SHA-384 from the same octets. Both stay in step with the
+    // digest named in `document_signer`.
+    let signed_sha256 = match prepared.plan {
+        None => input_sha256,
+        Some(_) => Sha256::of(signed_octets),
+    };
+
+    // Branch on cert public-key shape per FINEID S4-1 v4.2 §4.2:
+    // Older-scheme cards have an RSA-3072 key; Newer-scheme cards
+    // have ECC P-384 (secp384r1) + SHA-384. The PSO chain selects the
+    // right algRef, the right PSO:HASH hash size, and the right
+    // signature-length expectation for each.
+    let cert = prepared.cert_owned.view();
+    let (signature_bytes, local_verify) = sign_dispatch_by_alg(
+        transport,
+        slot,
+        prepared.scheme,
+        &cert,
+        cert.spki.algorithm(),
+        signed_octets,
+        signed_sha256,
+    )?;
+    Ok(Committed {
+        pin_retries_after,
+        signature_bytes,
+        local_verify,
+    })
+}
+
+/// The card's part of the signature, once the transaction has ended.
+fn finish_on_card(prepared: Prepared, committed: Committed) -> CardSignOutput {
+    CardSignOutput {
+        cert_der: prepared.cert_der,
+        cert_owned: prepared.cert_owned,
+        pin_retries_after: committed.pin_retries_after,
+        signature_bytes: committed.signature_bytes,
+        local_verify: committed.local_verify,
+        plan: prepared.plan,
+    }
 }
 
 /// What the card produced inside the PIN sequence: everything
@@ -980,8 +1391,8 @@ struct CardSignOutput {
     plan: Option<DocumentPlan>,
 }
 
-/// Output of [`finish_signature`]: what `sign_qualified` still
-/// needs once the document is assembled.
+/// Output of [`finish_signature`]: what [`sign`] still needs once the
+/// document is assembled.
 struct SignChainOutput {
     /// DER of the slot cert that produced the signature.
     cert_der: UnvalidatedCertificate,
@@ -994,123 +1405,13 @@ struct SignChainOutput {
     signature_bytes: Vec<u8>,
     /// Timestamp tokens actually obtained.
     timestamps: usize,
-    /// What gets written to `--out`: the raw signature for a bare
+    /// The earliest validated signature timestamp's `genTime`.
+    best_signature_time: Option<BestSignatureTime>,
+    /// What gets written to the output: the raw signature for a bare
     /// sign, or the finished document when a format was asked for.
     output_bytes: Vec<u8>,
     /// Rule E7 local-verify outcome.
     local_verify: LocalVerifyOutcome,
-}
-
-/// The card-facing sign chain both interface paths share once
-/// the PKCS#15 application is selected on `transport`: cert
-/// read + parse, VERIFY of the slot PIN, and the MSE/PSO sign
-/// dispatch with its local verify. Generic over
-/// [`CardTransport`] so the same code runs on the plain contact
-/// channel and inside the PACE [`SmTransport`] on contactless.
-/// It runs inside the PIN-sequence transaction and touches no
-/// network.
-fn sign_on_card<T: CardTransport>(
-    transport: &mut T,
-    options: &SignOptions,
-    input_bytes: &[u8],
-    input_sha256: Sha256,
-) -> Result<CardSignOutput, SignErrorKind> {
-    let cert_der = transport
-        .read_certificate(SIGNING_CERT)
-        .or_else(|_| {
-            let alt = match SIGNING_CERT {
-                CertSlot::Authentication => CertSlot::AuthenticationAlt,
-                CertSlot::Signature => CertSlot::SignatureAlt,
-                other => other,
-            };
-            transport.read_certificate(alt)
-        })
-        .map_err(|e| SignErrorKind::CertUnavailable {
-            detail: format!("read: {e}"),
-        })?;
-    let cert_owned =
-        OwnedCert::from_der(cert_der.as_bytes()).map_err(|e| SignErrorKind::CertUnavailable {
-            detail: format!("parse: {e}"),
-        })?;
-    // Bind the view once: `view()` re-parses the DER on each call.
-    let cert = cert_owned.view();
-    let cert_algorithm = cert.spki.algorithm();
-
-    // What the card actually signs. For a raw signature that is the
-    // input file. For a document it is a structure built around the
-    // certificate we just read -- CAdES signed attributes, or a
-    // canonical ds:SignedInfo -- which is why this cannot happen
-    // before the card is open.
-    let document = match options.document {
-        None => None,
-        Some(ref request) => {
-            ensure_displayed_card(transport, request)?;
-            let parameters = document_signer(&cert, cert_algorithm, request.signing_time)?;
-            let objects = load_data_objects(options, request, input_bytes)?;
-            ensure_visible_signature_format(request)?;
-            let plan = document::plan(request.format, objects, &parameters, &request.metadata)
-                .map_err(SignErrorKind::Document)?;
-            Some((plan, parameters))
-        }
-    };
-    let signed_octets: &[u8] = match document {
-        None => input_bytes,
-        Some((ref plan, _)) => plan.to_be_signed(),
-    };
-
-    // VERIFY PIN only after the document has been built and bound to
-    // this live card. A card swap or malformed request therefore cannot
-    // consume a PIN retry.
-    //
-    // The reference numbering is the card's to declare (citizen
-    // S1 v4.2 vs organizational S4-2 v4.0), resolved by
-    // counter-safe probes before the typed PIN is spent.
-    let scheme = resolve_pin_reference_scheme(transport)?;
-    let status = transport
-        .pin_status_with_scheme(scheme, SIGNING_PIN)
-        .map_err(|e| SignErrorKind::Transport(format!("{e}")))?;
-    check_retry_floor(SIGNING_PIN.into(), status).map_err(SignErrorKind::RetryFloor)?;
-    let outcome = verify_pin_with_scheme(transport, SIGNING_PIN, scheme, &options.pin)?;
-    let pin_retries_after = match outcome {
-        VerifyOutcome::Ok => None,
-        rejected @ (VerifyOutcome::WrongPin { .. }
-        | VerifyOutcome::Locked
-        | VerifyOutcome::Other(_)) => {
-            return Err(SignErrorKind::PinRejected { outcome: rejected });
-        }
-    };
-
-    // The RSA path signs this digest; the ECDSA path recomputes its
-    // own SHA-384 from the same octets. Both stay in step with the
-    // digest named in `document_signer`.
-    let signed_sha256 = match document {
-        None => input_sha256,
-        Some(_) => Sha256::of(signed_octets),
-    };
-
-    // Branch on cert public-key shape per FINEID S4-1 v4.2 §4.2:
-    // Older-scheme cards have an RSA-3072 auth key; Newer-scheme
-    // cards have ECC P-384 (secp384r1) + SHA-384. The PSO chain
-    // selects the right algRef, the right PSO:HASH hash size,
-    // and the right signature-length expectation for each.
-    let (signature_bytes, local_verify) = sign_dispatch_by_alg(
-        transport,
-        scheme,
-        &cert_owned.view(),
-        cert_algorithm,
-        signed_octets,
-        signed_sha256,
-    )?;
-
-    let plan = document.map(|(plan, _parameters)| plan);
-    Ok(CardSignOutput {
-        cert_der,
-        cert_owned,
-        pin_retries_after,
-        signature_bytes,
-        local_verify,
-        plan,
-    })
 }
 
 /// Complete the signature once the card session is closed.
@@ -1134,12 +1435,21 @@ fn finish_signature(
     } = on_card;
     let cert = cert_owned.view();
     let cert_subject_cn = cert.subject.common_name();
-    let (output_bytes, timestamps) = match (options.document.as_ref(), plan) {
+    let assembled = match (options.document.as_ref(), plan) {
         (Some(request), Some(plan)) => {
-            let parameters = document_signer(&cert, cert.spki.algorithm(), request.signing_time)?;
+            let parameters = document_signer(
+                &cert,
+                cert.spki.algorithm(),
+                options.slot,
+                request.signing_time,
+            )?;
             assemble_document(options, plan, &parameters, &signature_bytes, &cert_der)?
         }
-        (None, _) | (Some(_), None) => (signature_bytes.clone(), 0),
+        (None, _) | (Some(_), None) => AssembledDocument {
+            bytes: signature_bytes.clone(),
+            timestamps: 0,
+            best_signature_time: None,
+        },
     };
 
     Ok(SignChainOutput {
@@ -1147,8 +1457,9 @@ fn finish_signature(
         cert_subject_cn,
         pin_retries_after,
         signature_bytes,
-        timestamps,
-        output_bytes,
+        timestamps: assembled.timestamps,
+        best_signature_time: assembled.best_signature_time,
+        output_bytes: assembled.bytes,
         local_verify,
     })
 }
@@ -1175,11 +1486,18 @@ fn ensure_displayed_card<T: CardTransport>(
     let Some(expected) = request.expected_serial.as_ref() else {
         return Ok(());
     };
+    let live = live_token_serial(transport)?;
+    ensure_expected_serial(expected, live.as_ref())
+}
+
+/// The serial of the card in the reader, as EF.TokenInfo names it.
+fn live_token_serial<T: CardTransport>(
+    transport: &mut T,
+) -> Result<Option<TokenSerial>, SignErrorKind> {
     let token = transport.read_token_info().map_err(|error| {
         SignErrorKind::DisplayedCard(format!("cannot re-read EF.TokenInfo: {error}"))
     })?;
-    let live = token.serial_number_hex().cloned().map(render_token_serial);
-    ensure_expected_serial(expected, live.as_ref())
+    Ok(token.serial_number_hex().cloned().map(render_token_serial))
 }
 
 fn ensure_expected_serial(
@@ -1285,7 +1603,6 @@ fn post_timestamp_query_once(
                 "application/timestamp-query",
                 timestamp_query_der,
                 max_response,
-                crate::http::USER_AGENT,
                 None,
             )
         },
@@ -1296,7 +1613,6 @@ fn post_timestamp_query_once(
                     "application/timestamp-query",
                     timestamp_query_der,
                     max_response,
-                    crate::http::USER_AGENT,
                     Some(header),
                 )
             })
@@ -1454,7 +1770,7 @@ fn assemble_document(
     parameters: &SignerParameters<'_>,
     signature_bytes: &[u8],
     cert_der: &UnvalidatedCertificate,
-) -> Result<(Vec<u8>, usize), SignErrorKind> {
+) -> Result<AssembledDocument, SignErrorKind> {
     // The timestamp is over the signature, so it can only be
     // fetched now. That is a network round trip with the card
     // still held exclusively; the alternative is dropping the
@@ -1493,7 +1809,7 @@ fn assemble_document(
         let signer_material = crate::material::collect_chains(&[ChainStart {
             leaf_der: cert_der.as_bytes(),
             reference_time,
-            approved_anchor_ders: &signer_anchors,
+            anchor: ChainAnchor::Approved(&signer_anchors),
             nonce_policy: NoncePolicy::RequireEcho,
             include_leaf: false,
             include_anchor: true,
@@ -1530,7 +1846,7 @@ fn assemble_document(
                 token.token(),
             )
             .map_err(SignErrorKind::Document)?;
-        return Ok((archived, reported_timestamp_tokens(tokens.len(), true)));
+        return Ok(AssembledDocument::new(archived, &tokens, true));
     }
     let document = plan
         .finish(parameters, signature_bytes, &token_bytes, &material)
@@ -1552,10 +1868,40 @@ fn assemble_document(
     } else {
         (document, false)
     };
-    Ok((
+    Ok(AssembledDocument::new(
         bytes,
-        reported_timestamp_tokens(tokens.len(), archive_timestamp_obtained),
+        &tokens,
+        archive_timestamp_obtained,
     ))
+}
+
+/// A finished document and what its timestamps established.
+struct AssembledDocument {
+    /// The document.
+    bytes: Vec<u8>,
+    /// Timestamp tokens obtained, the archive timestamp included.
+    timestamps: usize,
+    /// The earliest validated signature timestamp's `genTime`.
+    best_signature_time: Option<BestSignatureTime>,
+}
+
+impl AssembledDocument {
+    /// `bytes`, timestamped by `signature_timestamps` and, when
+    /// `archive_timestamp_obtained`, an archive timestamp.
+    fn new(
+        bytes: Vec<u8>,
+        signature_timestamps: &[VerifiedTimestampToken],
+        archive_timestamp_obtained: bool,
+    ) -> Self {
+        Self {
+            bytes,
+            timestamps: reported_timestamp_tokens(
+                signature_timestamps.len(),
+                archive_timestamp_obtained,
+            ),
+            best_signature_time: BestSignatureTime::of_signature_timestamps(signature_timestamps),
+        }
+    }
 }
 
 fn reported_timestamp_tokens(
@@ -1737,71 +2083,58 @@ fn require_archive_path_covered(
 }
 
 /// The token's certificate path, verified from its signer certificate
-/// to a pinned qualified TSA root anchor.
+/// through the token's embedded certificates to one of them.
 ///
 /// The authority is trusted as configured -- whoever names one answers
-/// for it. What is still verified is internal consistency: the signer
-/// must chain, with valid signatures and validity windows, through the
-/// token's embedded certificates to a pinned qualified TSA root.
+/// for it -- so no trusted list or pinned root gates it
+/// ([`ChainAnchor::Configured`]). What is still verified is internal
+/// consistency: names, signatures, validity windows and roles along
+/// the embedded chain.
 fn embedded_timestamp_path(token: &VerifiedTimestampToken) -> Result<Vec<Vec<u8>>, String> {
-    let anchors = timestamp_anchor_ders();
-    if anchors.is_empty() {
-        return Err("no pinned TSA trust anchor is configured".to_owned());
+    let embedded = embedded_certificate_ders(token);
+    if embedded.is_empty() {
+        return Err("the token embeds no certificate usable as its chain anchor".to_owned());
     }
-    let candidates: Vec<&[u8]> = token
+    crate::material::verify_chain_to_anchor(
+        token.signer_certificate().as_der(),
+        token.generated_at(),
+        ChainAnchor::Configured(&embedded),
+        &embedded,
+    )
+    .map_err(|e| format!("no valid path within the token's embedded chain: {e}"))
+}
+
+/// The certificates the token embeds, as DER.
+fn embedded_certificate_ders(token: &VerifiedTimestampToken) -> Vec<&[u8]> {
+    token
         .embedded_certificates()
         .iter()
         .map(OwnedCert::as_der)
-        .collect();
-    crate::material::verify_chain_to_approved_anchor(
-        token.signer_certificate().as_der(),
-        token.generated_at(),
-        &anchors,
-        &candidates,
-    )
-    .map_err(|e| format!("no valid path to a pinned TSA anchor: {e}"))
-}
-
-/// The approved trust anchors a timestamp path may stop at:
-/// strictly pinned qualified TSA roots.
-///
-/// Under no circumstances is an unvetted self-signed certificate,
-/// `token.signer_certificate()`, or an intermediate CA accepted as an
-/// implicit anchor.
-fn timestamp_anchor_ders() -> Vec<&'static [u8]> {
-    crate::trust::PINNED_TSA_ROOT_DER
-        .iter()
-        .map(|(_label, der)| *der)
         .collect()
 }
 
 /// Collect chain and current revocation evidence for one token,
-/// anchored strictly on pinned qualified TSA roots.
+/// anchored on the certificates the token itself carries.
 ///
 /// LT and LTA retain the result for their validation store; level T
 /// has no store and skips this entirely.
 fn timestamp_validation_material(
     token: &VerifiedTimestampToken,
 ) -> Result<ValidationMaterial, String> {
-    let anchors = timestamp_anchor_ders();
-    if anchors.is_empty() {
-        return Err("no pinned TSA trust anchor is configured".to_owned());
+    let embedded = embedded_certificate_ders(token);
+    if embedded.is_empty() {
+        return Err("the token embeds no certificate usable as its chain anchor".to_owned());
     }
-    let candidates: Vec<&[u8]> = token
-        .embedded_certificates()
-        .iter()
-        .map(OwnedCert::as_der)
-        .collect();
     crate::material::collect_chains_with_candidates(
         &[ChainStart {
             leaf_der: token.signer_certificate().as_der(),
             reference_time: token.generated_at(),
-            approved_anchor_ders: &anchors,
+            anchor: ChainAnchor::Configured(&embedded),
             nonce_policy: NoncePolicy::AllowMissingEcho,
             include_leaf: true,
             include_anchor: true,
         }],
-        &candidates,
+        &embedded,
     )
     .map_err(|e| e.to_string())
 }
@@ -1832,6 +2165,7 @@ fn merge_unique(into: &mut Vec<Vec<u8>>, from: Vec<Vec<u8>>) {
 const fn document_signer<'a>(
     cert: &'a Certificate<'a>,
     cert_algorithm: PublicKeyAlgorithm,
+    slot: SignSlot,
     signing_time: SigningTime,
 ) -> Result<SignerParameters<'a>, SignErrorKind> {
     let (digest_algorithm, signature_algorithm) = match cert_algorithm {
@@ -1842,7 +2176,7 @@ const fn document_signer<'a>(
             (DigestAlgorithm::Sha384, SignatureAlgorithm::EcdsaSha384)
         }
         PublicKeyAlgorithm::Ec(_) | PublicKeyAlgorithm::Other => {
-            return Err(SignErrorKind::UnsupportedDocumentKey);
+            return Err(SignErrorKind::UnsupportedDocumentKey(slot));
         }
     };
     Ok(SignerParameters {
@@ -1950,8 +2284,9 @@ impl fmt::Display for SignReport {
         writeln!(f, "reader: {}", self.reader)?;
         writeln!(
             f,
-            "key: {SIGNING_KEY_LABEL} (key ref {:#04X})",
-            SIGNING_KEY.as_byte()
+            "key: {} (key ref {:#04X})",
+            self.slot.key_label(),
+            self.slot.key_ref().as_byte()
         )?;
         if let Some(cn) = &self.cert_subject_cn {
             writeln!(f, "cert subject CN: {cn}")?;
@@ -1977,11 +2312,12 @@ impl fmt::Display for SignReport {
             writeln!(f, "cert DER: {}", p.display())?;
         }
         if let Some(r) = self.pin_retries_after {
-            writeln!(f, "{SIGNING_PIN_LABEL} retries after verify: {r}")?;
+            writeln!(f, "{} retries after verify: {r}", self.slot.pin_label())?;
         }
         writeln!(
             f,
-            "local verify (against on-card {SIGNING_KEY_LABEL} cert pubkey): {}",
+            "local verify (against on-card {} cert pubkey): {}",
+            self.slot.key_label(),
             self.local_verify,
         )?;
         Ok(())
@@ -2293,44 +2629,18 @@ mod tests {
     }
 
     #[test]
-    fn embedded_path_terminates_at_pinned_tsa_anchor() -> TestResult {
+    fn embedded_path_terminates_at_the_tokens_self_issued_certificate() -> TestResult {
         let token = self_anchored_token_fixture()?;
         let path = embedded_timestamp_path(&token)?;
         check(
             &path,
             &vec![token.signer_certificate().as_der().to_vec()],
-            "the embedded pinned root terminates the path",
+            "the embedded self-issued signer terminates the path",
         )
     }
 
     #[test]
-    fn timestamp_anchors_include_pinned_tsa_roots_and_exclude_unpinned_certificates() -> TestResult
-    {
-        let signer_der =
-            include_bytes!("../test-vectors/sectigo-qualified-tsa-signer-3.der").to_vec();
-        let ca_der = include_bytes!("../test-vectors/sectigo-qualified-tsa-ca-r35.der").to_vec();
-        let anchors = timestamp_anchor_ders();
-        check_true(!anchors.is_empty(), "anchors contain pinned TSA roots")?;
-        let pinned_der = crate::trust::PINNED_TSA_ROOT_DER
-            .first()
-            .ok_or("pinned TSA root missing")?
-            .1;
-        check_true(
-            anchors.contains(&pinned_der),
-            "Sectigo Qualified Time Stamping Root R45 is in anchors",
-        )?;
-        check_true(
-            !anchors.contains(&signer_der.as_slice()),
-            "token signer certificate is not an anchor",
-        )?;
-        check_true(
-            !anchors.contains(&ca_der.as_slice()),
-            "token intermediate certificate is not an anchor",
-        )
-    }
-
-    #[test]
-    fn sectigo_timestamp_path_walks_to_pinned_root() -> TestResult {
+    fn sectigo_timestamp_path_runs_as_deep_as_the_token_embeds() -> TestResult {
         const SECTIGO_TEST_VALIDITY_INSTANT: u64 = 1_700_000_000;
         let signer_der =
             include_bytes!("../test-vectors/sectigo-qualified-tsa-signer-3.der").to_vec();
@@ -2342,50 +2652,30 @@ mod tests {
         let signer = OwnedCert::from_der(&signer_der)?;
         let ca = OwnedCert::from_der(&ca_der)?;
         let root = OwnedCert::from_der(root_der)?;
-        check(
-            &signer.view().issuer.as_der(),
-            &ca.view().subject.as_der(),
-            "signer issuer equals ca subject",
-        )?;
-        check(
-            &ca.view().issuer.as_der(),
-            &root.view().subject.as_der(),
-            "ca issuer equals root subject",
-        )?;
-        let sig_ok = signer.view().verify_signed_by(ca.view());
-        check_true(
-            sig_ok.is_ok(),
-            &format!("signer verify signed by ca: {sig_ok:?}"),
-        )?;
-        let ca_sig_ok = ca.view().verify_signed_by(root.view());
-        check_true(
-            ca_sig_ok.is_ok(),
-            &format!("ca verify signed by root: {ca_sig_ok:?}"),
-        )?;
+        let generated_at = DateTime::from_unix_duration(core::time::Duration::from_secs(
+            SECTIGO_TEST_VALIDITY_INSTANT,
+        ))?;
         let token = VerifiedTimestampToken::from_parts_for_test(
             vec![1],
             signer.clone(),
             vec![signer.clone(), ca.clone()],
-            DateTime::from_unix_duration(core::time::Duration::from_secs(
-                SECTIGO_TEST_VALIDITY_INSTANT,
-            ))?,
+            generated_at,
         );
-        let path = embedded_timestamp_path(&token)?;
-        check(&path.len(), &3, "path has exactly 3 certificates")?;
         check(
-            path.first().ok_or("missing leaf in path")?,
-            &signer_der,
-            "path leaf is Sectigo Signer #3",
+            &embedded_timestamp_path(&token)?,
+            &vec![signer_der.clone(), ca_der.clone()],
+            "without an embedded root the path stops at the embedded CA",
         )?;
+        let token = VerifiedTimestampToken::from_parts_for_test(
+            vec![1],
+            signer.clone(),
+            vec![signer, ca, root],
+            generated_at,
+        );
         check(
-            path.get(1).ok_or("missing ca in path")?,
-            &ca_der,
-            "path intermediate is Sectigo CA R35",
-        )?;
-        check(
-            path.get(2).ok_or("missing root in path")?,
-            &root_der.to_vec(),
-            "path anchor is Sectigo Root R45",
+            &embedded_timestamp_path(&token)?,
+            &vec![signer_der, ca_der, root_der.to_vec()],
+            "an embedded self-issued root ends the path",
         )
     }
 
@@ -2563,6 +2853,7 @@ mod tests {
     #[test]
     fn pin_rejected_display_renders_the_pin_and_outcome() -> TestResult {
         let wrong = SignErrorKind::PinRejected {
+            slot: SignSlot::Qualified,
             outcome: VerifyOutcome::WrongPin {
                 retries_left: pin_retries(2)?,
             },
@@ -2573,6 +2864,7 @@ mod tests {
         check_true(wrong.contains("retries left"), "wrong-pin counter")?;
 
         let locked = SignErrorKind::PinRejected {
+            slot: SignSlot::Qualified,
             outcome: VerifyOutcome::Locked,
         }
         .to_string();
@@ -2580,6 +2872,7 @@ mod tests {
         check_true(locked.contains("blocked"), "locked reason")?;
 
         let other = SignErrorKind::PinRejected {
+            slot: SignSlot::Qualified,
             outcome: VerifyOutcome::Other(StatusWord::Other(0x6A88)),
         }
         .to_string();
@@ -2588,6 +2881,7 @@ mod tests {
         // The internal "can't happen" arm still renders a line
         // rather than panicking.
         let internal = SignErrorKind::PinRejected {
+            slot: SignSlot::Qualified,
             outcome: VerifyOutcome::Ok,
         }
         .to_string();
@@ -2598,6 +2892,7 @@ mod tests {
     fn sign_chain_and_crypto_error_display() -> TestResult {
         check_true(
             SignErrorKind::PinPolicy {
+                slot: SignSlot::Qualified,
                 reason: PinPolicyReason::NonDigit,
             }
             .to_string()
@@ -2621,6 +2916,7 @@ mod tests {
         )?;
         check_true(
             SignErrorKind::CertUnavailable {
+                slot: SignSlot::Qualified,
                 detail: "read: timeout".to_owned(),
             }
             .to_string()
@@ -2628,13 +2924,14 @@ mod tests {
             "cert unavailable",
         )?;
         check_true(
-            SignErrorKind::UnsupportedKeyType
+            SignErrorKind::UnsupportedKeyType(SignSlot::Qualified)
                 .to_string()
                 .contains("qualified-signature cert has an unsupported key type"),
             "unsupported key type",
         )?;
         check_true(
             SignErrorKind::UnsupportedCurve {
+                slot: SignSlot::Qualified,
                 curve: EcCurve::Secp256r1,
             }
             .to_string()
@@ -2708,12 +3005,14 @@ mod tests {
     fn sample_report(cn: Option<CommonName>) -> SignReport {
         SignReport {
             reader: "OMNIKEY 5422".to_owned(),
+            slot: SignSlot::Qualified,
             input_len: 11,
             input_sha256: Sha256::of(b"hello world"),
             signature_path: PathBuf::from("/tmp/out.sig"),
             cert_path: Some(PathBuf::from("/tmp/out.crt")),
             signature_len: 384,
             timestamps: 0,
+            best_signature_time: None,
             output_len: 384,
             cert_subject_cn: cn,
             pin_retries_after: None,
@@ -2783,5 +3082,646 @@ mod tests {
         let s2 = report.to_string();
         check_true(!s2.contains("cert DER:"), "no cert der line")?;
         check_true(!s2.contains("retries after verify"), "no retry line")
+    }
+
+    #[test]
+    fn each_slot_names_its_own_key_pin_and_certificate() -> TestResult {
+        check(
+            &SignSlot::Authentication.key_ref(),
+            &KeyRef::Auth,
+            "auth key",
+        )?;
+        check(&SignSlot::Qualified.key_ref(), &KeyRef::Sign, "sign key")?;
+        check(
+            &SignSlot::Authentication.pin_role(),
+            &PinRole::Pin1,
+            "auth PIN",
+        )?;
+        check(&SignSlot::Qualified.pin_role(), &PinRole::Pin2, "sign PIN")?;
+        check(
+            &SignSlot::Authentication.cert_slot(),
+            &CertSlot::Authentication,
+            "auth cert",
+        )?;
+        check(
+            &SignSlot::Qualified.cert_slot(),
+            &CertSlot::Signature,
+            "sign cert",
+        )
+    }
+
+    // ---- Output: a default name never replaces a file. ----
+
+    fn pending_name(
+        dir: &std::path::Path,
+    ) -> Result<PendingSignedName, Box<dyn core::error::Error>> {
+        Ok(PendingSignedName::new(
+            vec![dir.join("report.pdf")],
+            Format::Pades,
+            crate::testkit::day(1),
+        ))
+    }
+
+    #[test]
+    fn a_default_name_never_replaces_an_existing_file() -> TestResult {
+        let dir = crate::test_util::TempDir::new("signed-name-taken")?;
+        let output = SignOutput::SignedName(pending_name(dir.path())?);
+        let taken = output.path(None);
+        std::fs::write(&taken, b"earlier")?;
+        let refused = output.write(None, b"signed");
+        check_true(
+            matches!(
+                &refused,
+                Err(SignErrorKind::SignatureWrite { path, source })
+                    if *path == taken && source.kind() == std::io::ErrorKind::AlreadyExists
+            ),
+            "refused",
+        )?;
+        check(
+            &std::fs::read(&taken)?,
+            &b"earlier".to_vec(),
+            "left as it was",
+        )
+    }
+
+    #[test]
+    fn a_default_name_is_written_when_free_and_a_given_path_is_replaced() -> TestResult {
+        let dir = crate::test_util::TempDir::new("signed-name-free")?;
+        let output = SignOutput::SignedName(pending_name(dir.path())?);
+        let written = output.write(None, b"signed")?;
+        check(&written, &output.path(None), "the default name")?;
+        check(&std::fs::read(&written)?, &b"signed".to_vec(), "written")?;
+        let given = SignOutput::At(written.clone());
+        check(&given.write(None, b"again")?, &written, "the given path")?;
+        check(&std::fs::read(&written)?, &b"again".to_vec(), "replaced")
+    }
+
+    // ---- The flow on a synthetic card: the PIN is asked for only once
+    // the card is found and its counter served, the card is bound
+    // across the prompt, and a refused PIN is forgotten. ----
+
+    mod synthetic_card {
+        use core::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        use refineid_apdu::iso7816::{ReadBinary, SelectByAidNoFci};
+        use refineid_apdu::{
+            CardTransport, CommandApdu, CredentialCommand, PinRetries, ResponseApdu, StatusWord,
+            TransportOutcome,
+        };
+        use refineid_auth::verify::VERIFY_INS;
+        use refineid_auth::{PinReferenceScheme, PinSlot};
+        use refineid_ber::{BerEncoder, BerTag, Integer, OctetString, Sequence};
+        use refineid_pcsc::{
+            PcscError, ReaderAccessCap, ReaderBackend, ReaderId, ReaderInfo, ReaderPickError,
+        };
+        use refineid_pkcs15::EF_TOKEN_INFO_FID;
+        use refineid_sign::RSA_3072_SIG_BYTES;
+        use refineid_sign::commands::{MSE_INS, PSO_CDS_P1, PSO_INS};
+
+        use super::super::{
+            CARD_CHANGED_DURING_PROMPT, Sha256, SignErrorKind, SignOptions, SignOutput, SignReport,
+            SignSlot, SigningSession, commit_in_transaction, prepare_on_card, sign,
+        };
+        use crate::pin::{PinBytes, PinEntryError, PinRole, PinSource, PromptedPin};
+        use crate::test_util::{TempDir, TestResult, check, check_true};
+        use crate::testkit::{
+            CertificateSpec, FIXTURE_LAST_DAY, TestCurve, TestKey, certificate, day,
+        };
+
+        /// Synthetic reader name.
+        const SYNTHETIC_READER: &str = "Synthetic Card Reader";
+        /// Offset of INS in a command APDU (ISO 7816-4 s5.1).
+        const INS_INDEX: usize = 1;
+        /// Offset of P1 in a command APDU (ISO 7816-4 s5.1).
+        const P1_INDEX: usize = 2;
+        /// Offset of P2 in a command APDU (ISO 7816-4 s5.1).
+        const P2_INDEX: usize = 3;
+        /// Length of the CLA INS P1 P2 header (ISO 7816-4 s5.1).
+        const HEADER_LEN: usize = 4;
+        /// Offset of a short command's data field: the header and `Lc`.
+        const DATA_INDEX: usize = HEADER_LEN + 1;
+        /// Fill byte of the card's synthetic signature.
+        const ANSWER_FILL: u8 = b'S';
+        /// A PIN counter the retry floor serves (five, four or three).
+        const TRIES_SERVED: u8 = 5;
+        /// A PIN counter the retry floor refuses (two, one or none).
+        const TRIES_BELOW_FLOOR: u8 = 2;
+        /// The counter a refused VERIFY reports.
+        const TRIES_AFTER_WRONG: u8 = 4;
+        /// The certificate the card holds in every slot: a public root
+        /// standing in for the card's own.
+        const CERTIFICATE: &[u8] = include_bytes!("../trust-anchors/dvv-gov-root-ca-g3-rsa.der");
+        /// `TokenInfo.version` of the synthetic card.
+        const TOKEN_INFO_VERSION: u8 = 0;
+        /// The synthetic card's serial, and the one a swapped card has.
+        const SERIAL: &[u8] = b"SYNTHETIC0001";
+        const OTHER_SERIAL: &[u8] = b"SYNTHETIC0002";
+        /// A synthetic PIN in the shape every PIN role accepts.
+        const SYNTHETIC_PIN: &[u8] = b"123456";
+        /// Synthetic message to sign.
+        const MESSAGE: &[u8] = b"synthetic message";
+        /// Seed of the signing card's synthetic key.
+        const SIGNING_SEED: &[u8] = b"synthetic signing card";
+        /// Serial and name of the signing card's certificate.
+        const CERTIFICATE_SERIAL: u8 = 1;
+        const SIGNER_NAME: &str = "Synthetic Signer";
+        /// First day of the certificate's validity.
+        const FIRST_DAY: u8 = 1;
+
+        /// What the card serves on READ BINARY.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Selected {
+            Certificate,
+            TokenInfo,
+        }
+
+        /// The card's state, shared by every session the backend opens.
+        #[derive(Debug)]
+        struct State {
+            certificate: Vec<u8>,
+            signature: Vec<u8>,
+            tries: PinRetries,
+            verify_answer: StatusWord,
+            swapped: Cell<bool>,
+            selected: Cell<Selected>,
+            credentials: RefCell<Vec<u8>>,
+            instructions: RefCell<Vec<u8>>,
+        }
+
+        #[derive(Debug, Clone)]
+        struct SyntheticCard(Rc<State>);
+
+        impl SyntheticCard {
+            fn new(tries: u8, verify_answer: StatusWord) -> Result<Self, &'static str> {
+                Self::holding(
+                    CERTIFICATE.to_vec(),
+                    vec![ANSWER_FILL; RSA_3072_SIG_BYTES],
+                    tries,
+                    verify_answer,
+                )
+            }
+
+            /// A card whose key signs [`MESSAGE`] so the local verify
+            /// passes: a synthetic P-384 key and its own certificate.
+            fn signing() -> Result<Self, &'static str> {
+                let key = TestKey::derive(TestCurve::P384, SIGNING_SEED);
+                let spec = CertificateSpec {
+                    serial: CERTIFICATE_SERIAL,
+                    subject: SIGNER_NAME,
+                    issuer: SIGNER_NAME,
+                    not_before: day(FIRST_DAY),
+                    not_after: day(FIXTURE_LAST_DAY),
+                    extensions: Vec::new(),
+                };
+                Self::holding(
+                    certificate(&spec, &key, &key),
+                    key.sign_raw(MESSAGE),
+                    TRIES_SERVED,
+                    StatusWord::Success,
+                )
+            }
+
+            fn holding(
+                certificate: Vec<u8>,
+                signature: Vec<u8>,
+                tries: u8,
+                verify_answer: StatusWord,
+            ) -> Result<Self, &'static str> {
+                Ok(Self(Rc::new(State {
+                    certificate,
+                    signature,
+                    tries: PinRetries::from_nibble(tries).ok_or("not a counter value")?,
+                    verify_answer,
+                    swapped: Cell::new(false),
+                    selected: Cell::new(Selected::Certificate),
+                    credentials: RefCell::new(Vec::new()),
+                    instructions: RefCell::new(Vec::new()),
+                })))
+            }
+
+            fn served() -> Result<Self, &'static str> {
+                Self::new(TRIES_SERVED, StatusWord::Success)
+            }
+
+            /// The P2 byte of every credential command the card saw.
+            fn credential_references(&self) -> Vec<u8> {
+                self.0.credentials.borrow().clone()
+            }
+
+            fn token_info(&self) -> Vec<u8> {
+                let serial = if self.0.swapped.get() {
+                    OTHER_SERIAL
+                } else {
+                    SERIAL
+                };
+                let tag = |tag: u16| u8::try_from(tag).unwrap_or_default();
+                let mut inner = BerEncoder::default();
+                let _version = inner.push_tlv(tag(<Integer as BerTag>::TAG), [TOKEN_INFO_VERSION]);
+                let _serial = inner.push_tlv(tag(<OctetString as BerTag>::TAG), serial);
+                let mut outer = BerEncoder::default();
+                let _sequence = outer.push_tlv(tag(<Sequence as BerTag>::TAG), inner.finish());
+                outer.finish()
+            }
+
+            /// The INS byte of every command the card saw, in order.
+            fn instructions(&self) -> Vec<u8> {
+                self.0.instructions.borrow().clone()
+            }
+
+            fn answer(&self, apdu: &[u8]) -> ResponseApdu {
+                let ins = apdu.get(INS_INDEX).copied();
+                self.0
+                    .instructions
+                    .borrow_mut()
+                    .push(ins.unwrap_or_default());
+                if ins == Some(VERIFY_INS) {
+                    return respond(
+                        Vec::new(),
+                        StatusWord::PinIncorrect {
+                            retries: self.0.tries,
+                        },
+                    );
+                }
+                if ins == Some(SelectByAidNoFci::INS) {
+                    let token_info = apdu.get(DATA_INDEX..) == Some(EF_TOKEN_INFO_FID.as_bytes());
+                    self.0.selected.set(if token_info {
+                        Selected::TokenInfo
+                    } else {
+                        Selected::Certificate
+                    });
+                    return respond(Vec::new(), StatusWord::Success);
+                }
+                if ins == Some(ReadBinary::INS) {
+                    return self.read_binary(apdu);
+                }
+                if ins == Some(PSO_INS) && apdu.get(P1_INDEX) == Some(&PSO_CDS_P1) {
+                    return respond(self.0.signature.clone(), StatusWord::Success);
+                }
+                if ins == Some(PSO_INS) || ins == Some(MSE_INS) {
+                    return respond(Vec::new(), StatusWord::Success);
+                }
+                respond(Vec::new(), StatusWord::FileNotFound)
+            }
+
+            fn read_binary(&self, apdu: &[u8]) -> ResponseApdu {
+                let (Some(&high), Some(&low), Some(&le)) =
+                    (apdu.get(P1_INDEX), apdu.get(P2_INDEX), apdu.last())
+                else {
+                    return respond(Vec::new(), StatusWord::FileNotFound);
+                };
+                let file = match self.0.selected.get() {
+                    Selected::Certificate => self.0.certificate.clone(),
+                    Selected::TokenInfo => self.token_info(),
+                };
+                let offset = usize::from(u16::from_be_bytes([high, low]));
+                let end = offset.saturating_add(usize::from(le)).min(file.len());
+                let body = file.get(offset..end).map_or_else(Vec::new, <[u8]>::to_vec);
+                respond(body, StatusWord::Success)
+            }
+        }
+
+        fn respond(body: Vec<u8>, status: StatusWord) -> ResponseApdu {
+            let [sw1, sw2] = status.as_u16().to_be_bytes();
+            ResponseApdu { body, sw1, sw2 }
+        }
+
+        impl CardTransport for SyntheticCard {
+            type Error = PcscError;
+
+            fn transmit(&mut self, command: &CommandApdu) -> Result<TransportOutcome, Self::Error> {
+                Ok(TransportOutcome::Response(self.answer(command.as_bytes())))
+            }
+
+            fn transmit_credential(
+                &mut self,
+                command: CredentialCommand,
+            ) -> Result<TransportOutcome, Self::Error> {
+                let (ins, reference) = command.expose_wire(|wire| {
+                    (wire.get(INS_INDEX).copied(), wire.get(P2_INDEX).copied())
+                });
+                self.0
+                    .instructions
+                    .borrow_mut()
+                    .push(ins.unwrap_or_default());
+                self.0
+                    .credentials
+                    .borrow_mut()
+                    .push(reference.unwrap_or_default());
+                Ok(TransportOutcome::Response(respond(
+                    Vec::new(),
+                    self.0.verify_answer,
+                )))
+            }
+        }
+
+        impl SigningSession for SyntheticCard {
+            type Sequence<'a> = Self;
+
+            fn reset_card(&mut self) -> Result<(), PcscError> {
+                Ok(())
+            }
+
+            fn pin_sequence<R>(
+                self,
+                body: impl for<'a> FnOnce(Self::Sequence<'a>) -> R,
+            ) -> Result<R, PcscError> {
+                Ok(body(self))
+            }
+        }
+
+        /// Readers and the card in them.
+        struct SyntheticBackend {
+            readers: Vec<ReaderInfo>,
+            card: SyntheticCard,
+        }
+
+        impl SyntheticBackend {
+            fn one_reader(card_present: bool, card: SyntheticCard) -> Self {
+                Self {
+                    readers: vec![ReaderInfo {
+                        id: ReaderId::new(SYNTHETIC_READER.to_owned()),
+                        card_present,
+                        card_events: 0,
+                    }],
+                    card,
+                }
+            }
+        }
+
+        impl ReaderBackend for SyntheticBackend {
+            type Transport = SyntheticCard;
+            type Error = PcscError;
+
+            fn enumerate(&self) -> Result<Vec<ReaderInfo>, Self::Error> {
+                Ok(self.readers.clone())
+            }
+
+            fn card_events(&self, _reader: &ReaderId) -> Result<u32, Self::Error> {
+                Ok(0)
+            }
+
+            fn open_exclusive(
+                &self,
+                _reader: &ReaderId,
+                _access: ReaderAccessCap,
+            ) -> Result<Self::Transport, Self::Error> {
+                Ok(self.card.clone())
+            }
+        }
+
+        /// A boxed PIN prompt.
+        type Prompt = Box<dyn FnMut(PinRole) -> Result<PinBytes, PinEntryError>>;
+
+        /// A PIN source that counts its prompts and runs `during` inside
+        /// each one.
+        fn counting(during: impl Fn() + 'static) -> (PromptedPin<Prompt>, Rc<Cell<usize>>) {
+            let asked = Rc::new(Cell::new(0_usize));
+            let counter = Rc::clone(&asked);
+            let source = PromptedPin::new(Box::new(move |_role| {
+                counter.set(counter.get().saturating_add(1));
+                during();
+                PinBytes::new(SYNTHETIC_PIN.to_vec()).map_err(PinEntryError::NotAPin)
+            }) as Prompt);
+            (source, asked)
+        }
+
+        fn sign_on(
+            backend: &SyntheticBackend,
+            slot: SignSlot,
+            pin: &mut dyn PinSource,
+        ) -> Result<Result<SignReport, SignErrorKind>, Box<dyn core::error::Error>> {
+            let dir = TempDir::new("sign-pin-late")?;
+            let input = dir.write("message.txt", MESSAGE)?;
+            let options = SignOptions {
+                input,
+                output: SignOutput::At(dir.path().join("signature.bin")),
+                slot,
+                save_cert: None,
+                reader_filter: None,
+                can: None,
+                document: None,
+            };
+            Ok(sign(backend, options, pin))
+        }
+
+        /// The synthetic card cannot make a signature that verifies, so a
+        /// flow that got past VERIFY ends at local verify.
+        fn passed_verify(result: &Result<SignReport, SignErrorKind>) -> bool {
+            matches!(
+                result,
+                Err(SignErrorKind::LocalVerifyFailed(_)
+                    | SignErrorKind::UnexpectedSignatureLength(_))
+            )
+        }
+
+        #[test]
+        fn no_reader_fails_before_the_pin_is_asked() -> TestResult {
+            let backend = SyntheticBackend {
+                readers: Vec::new(),
+                card: SyntheticCard::served()?,
+            };
+            let (mut pin, asked) = counting(|| {});
+            let result = sign_on(&backend, SignSlot::Qualified, &mut pin)?;
+            check_true(
+                matches!(
+                    result,
+                    Err(SignErrorKind::ReaderPick(ReaderPickError::NoReaders))
+                ),
+                "no readers",
+            )?;
+            check(&asked.get(), &0, "prompts")
+        }
+
+        #[test]
+        fn no_card_fails_before_the_pin_is_asked() -> TestResult {
+            let backend = SyntheticBackend::one_reader(false, SyntheticCard::served()?);
+            let (mut pin, asked) = counting(|| {});
+            let result = sign_on(&backend, SignSlot::Qualified, &mut pin)?;
+            check_true(
+                matches!(
+                    result,
+                    Err(SignErrorKind::ReaderPick(ReaderPickError::NoCardPresent))
+                ),
+                "no card",
+            )?;
+            check(&asked.get(), &0, "prompts")
+        }
+
+        #[test]
+        fn retry_floor_refuses_before_the_pin_is_asked() -> TestResult {
+            let card = SyntheticCard::new(TRIES_BELOW_FLOOR, StatusWord::Success)?;
+            let backend = SyntheticBackend::one_reader(true, card.clone());
+            let (mut pin, asked) = counting(|| {});
+            let result = sign_on(&backend, SignSlot::Qualified, &mut pin)?;
+            check_true(
+                matches!(result, Err(SignErrorKind::RetryFloor(_))),
+                "retry floor",
+            )?;
+            check(&asked.get(), &0, "prompts")?;
+            check(&card.credential_references().len(), &0, "no VERIFY")
+        }
+
+        #[test]
+        fn a_served_card_asks_for_the_pin_once_and_verifies_the_slots_pin() -> TestResult {
+            for (slot, pin_slot) in [
+                (SignSlot::Qualified, PinSlot::Pin2),
+                (SignSlot::Authentication, PinSlot::Pin1),
+            ] {
+                let card = SyntheticCard::served()?;
+                let backend = SyntheticBackend::one_reader(true, card.clone());
+                let (mut pin, asked) = counting(|| {});
+                let result = sign_on(&backend, slot, &mut pin)?;
+                check_true(passed_verify(&result), "flow passed VERIFY")?;
+                check(&asked.get(), &1, "prompts")?;
+                check(
+                    &card.credential_references(),
+                    &vec![PinReferenceScheme::Citizen.reference(pin_slot)],
+                    "one VERIFY of the slot's PIN",
+                )?;
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn a_card_changed_during_the_prompt_is_refused_before_verify() -> TestResult {
+            let card = SyntheticCard::served()?;
+            let backend = SyntheticBackend::one_reader(true, card.clone());
+            let swapped = Rc::clone(&card.0);
+            let (mut pin, asked) = counting(move || swapped.swapped.set(true));
+            let result = sign_on(&backend, SignSlot::Qualified, &mut pin)?;
+            check_true(
+                matches!(
+                    &result,
+                    Err(SignErrorKind::DisplayedCard(detail))
+                        if detail == CARD_CHANGED_DURING_PROMPT
+                ),
+                "card changed",
+            )?;
+            check(&asked.get(), &1, "prompts")?;
+            check(&card.credential_references().len(), &0, "no VERIFY")
+        }
+
+        #[test]
+        fn one_source_asks_once_for_several_documents() -> TestResult {
+            let card = SyntheticCard::signing()?;
+            let backend = SyntheticBackend::one_reader(true, card.clone());
+            let (mut pin, asked) = counting(|| {});
+            for _document in 0..2 {
+                let report = sign_on(&backend, SignSlot::Qualified, &mut pin)??;
+                check_true(report.local_verify.is_ok(), "signed and verified")?;
+            }
+            check(&asked.get(), &1, "asked once")?;
+            check(
+                &card.credential_references().len(),
+                &2,
+                "VERIFY per document",
+            )
+        }
+
+        #[test]
+        fn a_pin_typed_for_a_swapped_card_is_never_presented() -> TestResult {
+            let card = SyntheticCard::served()?;
+            let backend = SyntheticBackend::one_reader(true, card.clone());
+            let swapped = Rc::clone(&card.0);
+            let (mut pin, asked) = counting(move || swapped.swapped.set(true));
+            let refused = sign_on(&backend, SignSlot::Qualified, &mut pin)?;
+            check_true(
+                matches!(&refused, Err(SignErrorKind::DisplayedCard(_))),
+                "card changed",
+            )?;
+            let second = sign_on(&backend, SignSlot::Qualified, &mut pin)?;
+            check_true(passed_verify(&second), "the new card is signed with")?;
+            check(&asked.get(), &2, "asked again for the new card")?;
+            check(
+                &card.credential_references().len(),
+                &1,
+                "one VERIFY, with the PIN typed for the new card",
+            )
+        }
+
+        #[test]
+        fn a_pin_held_for_one_slot_is_not_given_to_the_other() -> TestResult {
+            let card = SyntheticCard::signing()?;
+            let backend = SyntheticBackend::one_reader(true, card.clone());
+            let (mut pin, asked) = counting(|| {});
+            for slot in [SignSlot::Qualified, SignSlot::Authentication] {
+                let report = sign_on(&backend, slot, &mut pin)??;
+                check_true(report.local_verify.is_ok(), "signed and verified")?;
+            }
+            check(&asked.get(), &2, "asked for each slot's PIN")?;
+            check(
+                &card.credential_references(),
+                &vec![
+                    PinReferenceScheme::Citizen.reference(PinSlot::Pin2),
+                    PinReferenceScheme::Citizen.reference(PinSlot::Pin1),
+                ],
+                "each VERIFY targets its own slot",
+            )
+        }
+
+        #[test]
+        fn the_pin_transaction_selects_the_application_before_verify() -> TestResult {
+            let dir = TempDir::new("sign-select-first")?;
+            let input = dir.write("message.txt", MESSAGE)?;
+            let options = SignOptions {
+                input,
+                output: SignOutput::At(dir.path().join("signature.bin")),
+                slot: SignSlot::Qualified,
+                save_cert: None,
+                reader_filter: None,
+                can: None,
+                document: None,
+            };
+            let mut card = SyntheticCard::served()?;
+            let prepared = prepare_on_card(&mut card, &options, MESSAGE)?;
+            card.0.instructions.borrow_mut().clear();
+            let pin = PinBytes::new(SYNTHETIC_PIN.to_vec())?;
+            let committed = commit_in_transaction(
+                &mut card,
+                SignSlot::Qualified,
+                &prepared,
+                &pin,
+                MESSAGE,
+                Sha256::of(MESSAGE),
+            );
+            check_true(
+                matches!(
+                    committed,
+                    Err(SignErrorKind::LocalVerifyFailed(_)
+                        | SignErrorKind::UnexpectedSignatureLength(_))
+                ),
+                "passed VERIFY",
+            )?;
+            let instructions = card.instructions();
+            check(
+                &instructions.first().copied(),
+                &Some(SelectByAidNoFci::INS),
+                "the transaction opens with a SELECT",
+            )?;
+            let verify = instructions
+                .iter()
+                .rposition(|ins| *ins == VERIFY_INS)
+                .ok_or("no VERIFY")?;
+            check_true(verify > 0, "VERIFY after the SELECT")
+        }
+
+        #[test]
+        fn a_refused_pin_is_asked_again_for_the_next_document() -> TestResult {
+            let wrong = StatusWord::PinIncorrect {
+                retries: PinRetries::from_nibble(TRIES_AFTER_WRONG).ok_or("counter")?,
+            };
+            let card = SyntheticCard::new(TRIES_SERVED, wrong)?;
+            let backend = SyntheticBackend::one_reader(true, card);
+            let (mut pin, asked) = counting(|| {});
+            for _document in 0..2 {
+                let result = sign_on(&backend, SignSlot::Qualified, &mut pin)?;
+                check_true(
+                    matches!(result, Err(SignErrorKind::PinRejected { .. })),
+                    "PIN refused",
+                )?;
+            }
+            check(&asked.get(), &2, "asked again after the refusal")
+        }
     }
 }

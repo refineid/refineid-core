@@ -217,7 +217,10 @@ For each signature the report carries independent facts:
   the token failed), or unsupported (an XAdES timestamp whose imprint
   needs a canonicalisation the verifier does not compute, an archive
   timestamp of a form not judged, or a document timestamp whose range
-  does not end a revision). An XAdES
+  does not end a revision). An invalid or unsupported token also
+  carries the `genTime` it claims when it parses as far as its
+  `TSTInfo`, read without verification and proving nothing, so the
+  shell can show the time beside the word that it is unproven. An XAdES
   timestamp that names no canonicalisation imprints the
   `ds:SignatureValue` under Canonical XML 1.0 (EN 319 132-1 clause
   4.5). An anchored or claimed token is reported with its signer and
@@ -231,6 +234,13 @@ For each signature the report carries independent facts:
   only the facts of the signature itself decide its verdict.
 - **Validation time.** The proof of existence when there is one,
   otherwise now. Chain validity and revocation are judged at this time.
+- **Claimed signing time.** The time the signer's own clock wrote into
+  the signature, reported as a claim that proves nothing and decides
+  nothing: the CMS `signing-time` signed attribute when exactly one
+  holds exactly one `UTCTime` or `GeneralizedTime` (RFC 5652
+  sec.11.3), else for a PDF signature its `/M` entry; for XAdES the
+  `SigningTime` property, an `xsd:dateTime` with a time zone (EN 319
+  132-1 clause 5.2.1). Absent or unreadable, the report says none.
 - **Revocation.** From the evidence in the file first: OCSP responses
   and CRLs that verify under an authorised responder or the issuer and
   whose window covers the validation time per EN 319 102-1 clause
@@ -255,7 +265,15 @@ For each signature the report carries independent facts:
   judged at now: `DocumentReport::with_live_revocation` calls the
   shell's closure for exactly those signatures and applies the answer
   it returns, and `SignatureReport::with_live_revocation` does the same
-  for one report. Every other fact is fixed when the report is made.
+  for one report. `live::live_revocation` is that closure's body: for
+  each certificate below the anchor on the signature's anchored path
+  it asks the OCSP responders the certificate names (with a nonce,
+  RFC 6960) and, without an answer, its CRL distribution points, at
+  most three addresses of each kind, over the crate's HTTP transport;
+  the answers join a pool with the path and the anchors, and the
+  signer is judged again at now under the same rules as the file's
+  own evidence. A responder that does not answer, or an answer that
+  does not hold up, leaves the status Unavailable. Every other fact is fixed when the report is made.
 - **Revisions after signing.** For a PDF signature, what the
   revisions after the one it signs do to the document (ISO 32000-1
   sec.12.8.2.2 and sec.12.8.2.4): none follow; later revisions are
@@ -330,8 +348,18 @@ signature files that do not read.
 
 Each PDF document timestamp is reported with what its token was found
 to be and how far into the file its range reaches. A document
-timestamp credits the signatures whose revision ends where its own
-range starts or earlier.
+timestamp covers the signatures whose revision ends where its own
+range starts or earlier. Each judged signature names the document
+timestamps that cover it, in document order and whatever each was
+found to be; the anchored ones count toward its proof of existence.
+
+A signature row not judged names the signer its certificate
+identifies when one does: a PDF signature under another subfilter or
+over a range that does not end a revision whose CMS structure still
+parses, a CAdES signature no manifest binds, and an XAdES signature
+with a feature the verifier does not implement or nested too deep.
+The name is what the certificate says, unverified, since nothing was
+judged.
 
 The document is valid when it has at least one signature over the
 document, every such signature is valid, and none of them is
@@ -390,6 +418,7 @@ judged.
 | UCA-108 | Verifier | Reports a document intact when a reference could not be resolved or canonicalised. | H-8 | CC-112: an unresolvable reference fails the fact. |
 | UCA-109 | Shell | Renders a verdict from anchors or lists that are stale without saying so. | H-8 | CC-113: the report carries the anchors' fetch time; the shell shows it. |
 | UCA-110 | Verifier | Judges a signature under a trust anchor outside the period its service status was granted. | H-8 | CC-114: anchors carry granted periods and are matched at the validation time. |
+| UCA-111 | Shell | Renders a claimed signing time, a claimed timestamp time, or the signer an unjudged row names as established. | H-8 | CC-115: claims are typed apart from proofs: the claimed signing time and a token's claimed time are their own accessors, never the proof of existence, and an unjudged row's signer sits only in the unsupported outcome; the shell labels each a claim. |
 
 Loss scenario: a document carries a self-made timestamp token whose
 time lies inside the signer certificate's validity, while the

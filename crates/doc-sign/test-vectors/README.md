@@ -30,3 +30,10 @@ Copied here so timestamp chain verification tests can exercise the full 3-certif
 The self-signed *United Nations CSCA* root certificate (RSA, `sha256WithRSAEncryption`) from the ICAO PKD.
 The `verify` tests use it as a public RSA-PKCS1v15-SHA256 accept case:
 a self-signed certificate's signature verifies under its own key over its own TBS bytes, so no private key is needed.
+
+## `verification-stamp-{finnish,swedish,english}.txt`
+
+The verification stamp's content stream for each middle-line language, as `pades::prepare` renders it,
+with the random tilt's rotation line left out.
+The `stamp` tests compare every other operator line verbatim, so any change to the mark's geometry,
+glyph placement or text shows up as a fixture difference to review.

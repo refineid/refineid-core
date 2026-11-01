@@ -186,9 +186,8 @@ The seventh slice admits organizational card support across
   re-probes under the organizational numbering -- so a session drives the
   numbering the card in hand actually uses;
 - organizational VERIFY: the typed PIN is compared at its own length with
-  no padding and under the organizational references, and a PIN longer
-  than the organizational maximum is refused locally, before any command
-  spends a retry learning it;
+  no padding and under the organizational references, within the same
+  PIN 1 and PIN 2 bounds as on a citizen card;
 - organizational signing: the qualified key is named by its local
   DF.ESIGN reference, and the digest rides inline in a single PSO:CDS with
   no PSO:HASH step -- the shape the organizational card requires and the
@@ -220,8 +219,7 @@ The eighth slice admits PIN change and unblock in `refineid-auth`:
   one command carrying the PUK and the new PIN; the organizational card
   verifies the PUK as its own object first and then resets with only the
   new PIN, and a refused PUK ends the flow before the reset;
-- each resolves the credential numbering first, refuses an over-length
-  organizational credential before any command, and reports a typed
+- each resolves the credential numbering first and reports a typed
   outcome that names a wrong current-PIN-or-PUK separately from a locked
   method.
 

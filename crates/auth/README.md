@@ -5,8 +5,8 @@ Reviewed FINEID PIN role types and verification.
 Raw input exists only in `UnvalidatedSecret`; consuming construction
 validates once and reconstructs the non-clonable, zeroizing `Pin1` and
 `Pin2` role types. `verify_pin1` and `verify_pin2` consume a validated
-PIN through a crate-private path, pad it to the stored length, and ship
-it only as a credential command, consumed exactly once; the slot is
+PIN through a crate-private path, pad it to the stored length on a
+citizen card, and ship it only as a credential command, consumed exactly once; the slot is
 fixed by the argument type. The counter-safe status probe reads the
 retry state without spending a counter, and `check_retry_floor` serves a
 PIN 1, PIN 2 or PUK attempt only at five, four or three tries left -- the
@@ -17,9 +17,10 @@ Both citizen and organizational cards are supported.
 `resolve_pin_reference_scheme` settles which credential numbering the card
 uses with the counter-safe probe, and the `_with_scheme` entry points act
 under an already-resolved numbering. The organizational card compares the
-typed PIN at its own length under its own references, with no padding, and
-a PIN longer than the organizational maximum is refused locally before any
-command spends a retry.
+typed PIN at its own length under its own references, with no padding.
+Organization PINs have the same bounds as citizen PINs -- PIN 1 4–12
+digits, PIN 2 6–12 -- held by the `Pin1` and `Pin2` role types, so a PIN
+outside them is refused at construction, before any command.
 
 `PinManageOps` adds the card-mutating chains: `change_pin1`/`change_pin2`
 (CHANGE REFERENCE DATA) and `unblock_pin1`/`unblock_pin2` (RESET RETRY

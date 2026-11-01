@@ -36,17 +36,15 @@ use super::{
 use crate::digest::Sha256;
 use crate::document::{self, DocumentPlan};
 use crate::identity::{CommonName, TokenSerial, render_token_serial};
-use crate::pin::{PinBytes, PinEntryError, PinPolicyReason, PinSource};
+use crate::pin::{PinBytes, PinEntryError, PinPolicyReason, PinRole, PinSource};
 use crate::signed_name::BestSignatureTime;
 use crate::x509_ext::NameExt;
-use refineid_apdu::command::{
-    CommandHeader, CredentialBody, CredentialCommand, UnvalidatedCredentialBlock,
-};
+use refineid_apdu::CardTransport;
 use refineid_apdu::status_word::StatusWord;
-use refineid_apdu::{ApduClass, CardTransport};
+use refineid_auth::credentials::{PIN_MAX_LENGTH, PIN1_MIN_LENGTH, PIN2_MIN_LENGTH};
 use refineid_auth::{
-    PinOps as _, PinReferenceScheme, PinSlot, RetryFloorRefusal, VerifyOutcome, check_retry_floor,
-    classify_verify_sw,
+    CredentialInputError, Pin1, Pin2, PinOps as _, PinReferenceScheme, PinSlot, RetryFloorRefusal,
+    UnvalidatedSecret, VerifyOutcome, check_retry_floor,
 };
 use refineid_cms::x509::{
     Certificate, EcCurve, MessageSignatureAlgorithm, OwnedCert, PublicKeyAlgorithm,
@@ -347,31 +345,28 @@ impl From<SignErrorKind> for ReaderSignError {
     }
 }
 
-/// Organizational PIN minimum length (S4-2 v4.0 §4.2).
-const ORGANIZATIONAL_PIN_MIN_LENGTH: usize = 4;
-/// Organizational PIN stored (padded) length.
-const ORGANIZATIONAL_PIN_STORED_LENGTH: usize = 8;
-
-/// Organizational length window plus ASCII-digit shape. A
-/// rejection here doesn't burn a card-side retry counter slot.
-fn validate_org_pin_policy(slot: SignSlot, ascii: &[u8]) -> Result<(), ReaderSignError> {
-    if ascii.len() < ORGANIZATIONAL_PIN_MIN_LENGTH || ascii.len() > ORGANIZATIONAL_PIN_STORED_LENGTH
-    {
-        return Err(ReaderSignError::PinPolicy {
-            slot,
-            reason: PinPolicyReason::WrongLength {
-                min: ORGANIZATIONAL_PIN_MIN_LENGTH,
-                max: ORGANIZATIONAL_PIN_STORED_LENGTH,
+/// The local-policy refusal for a PIN that is not a valid `slot` PIN.
+/// Nothing has been sent to the card, so no retry is spent.
+fn pin_policy_refusal(slot: SignSlot, error: CredentialInputError) -> ReaderSignError {
+    let reason = match error {
+        CredentialInputError::NonDigit { .. } => PinPolicyReason::NonDigit,
+        CredentialInputError::WrongLength {
+            expected_min,
+            expected_max,
+            ..
+        } => PinPolicyReason::WrongLength {
+            min: expected_min,
+            max: expected_max,
+        },
+        CredentialInputError::Empty { .. } => PinPolicyReason::WrongLength {
+            min: match slot.pin_role() {
+                PinRole::Pin1 => PIN1_MIN_LENGTH,
+                PinRole::Pin2 => PIN2_MIN_LENGTH,
             },
-        });
-    }
-    if ascii.iter().any(|b| !b.is_ascii_digit()) {
-        return Err(ReaderSignError::PinPolicy {
-            slot,
-            reason: PinPolicyReason::NonDigit,
-        });
-    }
-    Ok(())
+            max: PIN_MAX_LENGTH,
+        },
+    };
+    ReaderSignError::PinPolicy { slot, reason }
 }
 
 /// Ask the card which reference numbering it speaks.
@@ -389,48 +384,28 @@ fn resolve_pin_reference_scheme<T: CardTransport>(
 
 /// VERIFY `pin` for `slot` under the resolved `scheme`.
 ///
-/// The citizen path sends 12-byte padded credential command;
-/// the organizational path sends unpadded digits capped at 8 bytes.
+/// The typed digits become the slot's [`Pin1`] or [`Pin2`], so a PIN
+/// outside that role's bounds is refused before any command. The citizen
+/// card is sent the padded stored-length block, the organization card
+/// the bare typed digits.
 fn verify_pin_with_scheme<T: CardTransport>(
     transport: &mut T,
     slot: SignSlot,
     scheme: PinReferenceScheme,
     pin: &PinBytes,
 ) -> Result<VerifyOutcome, ReaderSignError> {
-    let digits = pin.as_bytes();
-    if scheme == PinReferenceScheme::Organizational {
-        validate_org_pin_policy(slot, digits)?;
-    }
-    let header = CommandHeader {
-        class: ApduClass::Plain,
-        instruction: 0x20, // INS VERIFY
-        p1: 0x00,
-        p2: scheme.reference(slot.pin_slot()),
-    };
-    let mut block = UnvalidatedCredentialBlock::zeroed();
-    block.buffer().fill(0x00);
-    let total = match scheme {
-        PinReferenceScheme::Citizen => {
-            let copy_len = digits.len().min(12);
-            block.buffer()[..copy_len].copy_from_slice(&digits[..copy_len]);
-            12
+    let secret = || UnvalidatedSecret::from_owned_bytes(pin.as_bytes().to_vec());
+    let verified = match slot.pin_role() {
+        PinRole::Pin1 => {
+            let pin1 = Pin1::reconstruct(secret()).map_err(|e| pin_policy_refusal(slot, e))?;
+            transport.verify_pin1_with_scheme(scheme, pin1)
         }
-        PinReferenceScheme::Organizational => {
-            let copy_len = digits.len().min(ORGANIZATIONAL_PIN_STORED_LENGTH);
-            block.buffer()[..copy_len].copy_from_slice(&digits[..copy_len]);
-            copy_len
+        PinRole::Pin2 => {
+            let pin2 = Pin2::reconstruct(secret()).map_err(|e| pin_policy_refusal(slot, e))?;
+            transport.verify_pin2_with_scheme(scheme, pin2)
         }
     };
-    block.set_filled(total);
-    let body = CredentialBody::from_block(block)
-        .map_err(|e| ReaderSignError::Transport(format!("assemble credential body: {e}")))?;
-    let command = CredentialCommand::assemble(header, body);
-    let response = transport
-        .transmit_credential(command)
-        .map_err(|e| ReaderSignError::Transport(format!("{e}")))?
-        .into_response()
-        .map_err(|outcome| ReaderSignError::Transport(format!("{outcome}")))?;
-    Ok(classify_verify_sw(response.status_word()))
+    verified.map_err(|e| ReaderSignError::Transport(format!("{e}")))
 }
 
 /// Dispatch the per-cert sign chain: RSA (PKCS#1 v1.5 SHA-256) or
@@ -1839,6 +1814,127 @@ mod tests {
                 )?;
             }
             check(&asked.get(), &2, "asked again after the refusal")
+        }
+    }
+
+    // ---- Signing VERIFY wire: the slot's PIN role bounds the typed
+    // digits, and the organization card is sent them bare. ----
+    mod verify_wire {
+        use refineid_apdu::{
+            CardTransport, CommandApdu, CredentialCommand, ResponseApdu, StatusWord,
+            TransportOutcome,
+        };
+        use refineid_auth::credentials::{PIN_MAX_LENGTH, PIN2_MIN_LENGTH};
+        use refineid_auth::{PinReferenceScheme, PinSlot};
+
+        use super::super::{ReaderSignError, SignSlot, verify_pin_with_scheme};
+        use crate::pin::{PinBytes, PinPolicyReason};
+        use crate::test_util::{TestResult, check, check_true};
+
+        /// Offset of P2 in a command APDU (ISO 7816-4 s5.1).
+        const P2_INDEX: usize = 3;
+        /// Offset of `Lc` in a short command APDU (ISO 7816-4 s5.1).
+        const LC_INDEX: usize = 4;
+        /// Offset of a short command's data field: the header and `Lc`.
+        const DATA_INDEX: usize = LC_INDEX + 1;
+        /// A PIN at the longest length either role accepts.
+        const LONGEST_PIN: &[u8] = b"135792468024";
+
+        /// Records every credential command's wire and accepts it.
+        #[derive(Default)]
+        struct Recorder {
+            commands: Vec<Vec<u8>>,
+        }
+
+        impl CardTransport for Recorder {
+            type Error = String;
+
+            fn transmit(&mut self, command: &CommandApdu) -> Result<TransportOutcome, Self::Error> {
+                self.commands.push(command.as_bytes().to_vec());
+                Ok(TransportOutcome::Response(success()))
+            }
+
+            fn transmit_credential(
+                &mut self,
+                command: CredentialCommand,
+            ) -> Result<TransportOutcome, Self::Error> {
+                self.commands.push(command.expose_wire(<[u8]>::to_vec));
+                Ok(TransportOutcome::Response(success()))
+            }
+        }
+
+        fn success() -> ResponseApdu {
+            let [sw1, sw2] = StatusWord::Success.as_u16().to_be_bytes();
+            ResponseApdu {
+                body: Vec::new(),
+                sw1,
+                sw2,
+            }
+        }
+
+        #[test]
+        fn organization_signing_verify_sends_a_twelve_digit_pin_unpadded() -> TestResult {
+            check(&LONGEST_PIN.len(), &PIN_MAX_LENGTH, "fixture length")?;
+            for (slot, pin_slot) in [
+                (SignSlot::Qualified, PinSlot::Pin2),
+                (SignSlot::Authentication, PinSlot::Pin1),
+            ] {
+                let mut card = Recorder::default();
+                let pin = PinBytes::new(LONGEST_PIN.to_vec())?;
+                let scheme = PinReferenceScheme::Organizational;
+                verify_pin_with_scheme(&mut card, slot, scheme, &pin)?;
+                let [wire] = card.commands.as_slice() else {
+                    return Err("one VERIFY".into());
+                };
+                check(
+                    &wire.get(P2_INDEX).copied(),
+                    &Some(scheme.reference(pin_slot)),
+                    "organization reference",
+                )?;
+                check(
+                    &wire.get(LC_INDEX).copied().map(usize::from),
+                    &Some(LONGEST_PIN.len()),
+                    "Lc is the typed length",
+                )?;
+                check(&wire.get(DATA_INDEX..), &Some(LONGEST_PIN), "bare digits")?;
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn a_pin2_below_the_minimum_is_refused_before_any_command() -> TestResult {
+            for scheme in [
+                PinReferenceScheme::Citizen,
+                PinReferenceScheme::Organizational,
+            ] {
+                let mut card = Recorder::default();
+                let short = PinBytes::new(LONGEST_PIN[..PIN2_MIN_LENGTH - 1].to_vec())?;
+                let refused =
+                    verify_pin_with_scheme(&mut card, SignSlot::Qualified, scheme, &short);
+                check_true(
+                    matches!(
+                        refused,
+                        Err(ReaderSignError::PinPolicy {
+                            slot: SignSlot::Qualified,
+                            reason: PinPolicyReason::WrongLength {
+                                min: PIN2_MIN_LENGTH,
+                                max: PIN_MAX_LENGTH,
+                            },
+                        })
+                    ),
+                    "PIN 2 policy refusal",
+                )?;
+                check_true(card.commands.is_empty(), "no command sent")?;
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn a_thirteen_digit_pin_never_becomes_a_pin() -> TestResult {
+            let mut longer = LONGEST_PIN.to_vec();
+            longer.extend_from_slice(&LONGEST_PIN[..1]);
+            check(&longer.len(), &(PIN_MAX_LENGTH + 1), "fixture length")?;
+            check_true(PinBytes::new(longer).is_err(), "refused at entry")
         }
     }
 }

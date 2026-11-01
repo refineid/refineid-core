@@ -268,9 +268,7 @@ pub trait PinManageOps: PinOps {
     ///
     /// # Errors
     ///
-    /// As [`PinManageOps::change_pin1`], plus
-    /// [`AuthError::LengthUnsupported`] when the organizational card
-    /// cannot store the typed length.
+    /// As [`PinManageOps::change_pin1`].
     fn change_pin1_with_scheme(
         &mut self,
         scheme: PinReferenceScheme,
@@ -335,9 +333,7 @@ pub trait PinManageOps: PinOps {
     ///
     /// # Errors
     ///
-    /// As [`PinManageOps::unblock_pin1`], plus
-    /// [`AuthError::LengthUnsupported`] when the organizational card
-    /// cannot store the typed length.
+    /// As [`PinManageOps::unblock_pin1`].
     fn unblock_pin1_with_scheme(
         &mut self,
         scheme: PinReferenceScheme,
@@ -580,12 +576,13 @@ mod tests {
         RESET_P1_CODE_THEN_NEW, RESET_P1_NEW_ONLY, RESET_RETRY_COUNTER_INS, classify_manage_sw,
     };
     use crate::activation::GET_DATA_INS;
-    use crate::credentials::{Pin1, Pin2, Puk, UnvalidatedSecret};
+    use crate::credentials::{
+        PIN_MAX_LENGTH, PIN1_MIN_LENGTH, PIN2_MIN_LENGTH, Pin1, Pin2, Puk, UnvalidatedSecret,
+    };
     use crate::verify::{CREDENTIAL_BODY_SCRATCH, VERIFY_INS, VERIFY_P1};
     use crate::{
-        AuthError, FlooredCredential, ORGANIZATIONAL_PIN_MAX_LENGTH, PIN_STORED_LENGTH,
-        PUK_REFERENCE_ORGANIZATIONAL, PinReferenceScheme, PinSlot, PinStatus, RetryFloorRefusal,
-        check_retry_floor,
+        AuthError, FlooredCredential, PIN_STORED_LENGTH, PUK_REFERENCE_ORGANIZATIONAL,
+        PinReferenceScheme, PinSlot, PinStatus, RetryFloorRefusal, check_retry_floor,
     };
     use refineid_apdu::{
         ApduClass, CardTransport, CommandApdu, CredentialCommand, PinRetries, ResponseApdu,
@@ -636,6 +633,10 @@ mod tests {
     const CURRENT_DIGITS: &[u8] = b"1234";
     /// A valid new-PIN fixture.
     const NEW_DIGITS: &[u8] = b"5678";
+    /// A current PIN at the longest length either role accepts.
+    const LONGEST_CURRENT_DIGITS: &[u8] = b"135792468024";
+    /// A new PIN at the longest length either role accepts.
+    const LONGEST_NEW_DIGITS: &[u8] = b"975318642086";
 
     fn response(sw: StatusWord) -> ResponseApdu {
         let [sw1, sw2] = sw.as_u16().to_be_bytes();
@@ -1082,23 +1083,99 @@ mod tests {
         assert_eq!(transport.commands.len(), ORG_UNBLOCK_COMMAND_COUNT - 1);
     }
 
+    /// The current and new PIN, back to back at their typed lengths, as
+    /// the organizational CHANGE REFERENCE DATA carries them.
+    fn back_to_back(current: &[u8], new: &[u8]) -> Vec<u8> {
+        let mut both = current.to_vec();
+        both.extend_from_slice(new);
+        both
+    }
+
     #[test]
-    fn organizational_change_refuses_an_overlong_new_pin_before_any_command() {
-        let overlong = b"123456789";
-        let mut transport = Recorder::new(vec![]);
-        let error = transport
+    fn organizational_change_sends_twelve_digit_pins_unpadded() {
+        assert_eq!(LONGEST_CURRENT_DIGITS.len(), PIN_MAX_LENGTH);
+        assert_eq!(LONGEST_NEW_DIGITS.len(), PIN_MAX_LENGTH);
+        let expected = back_to_back(LONGEST_CURRENT_DIGITS, LONGEST_NEW_DIGITS);
+
+        let mut transport = Recorder::new(vec![StatusWord::Success]);
+        transport
             .change_pin1_with_scheme(
                 PinReferenceScheme::Organizational,
-                pin1(CURRENT_DIGITS),
-                pin1(overlong),
+                pin1(LONGEST_CURRENT_DIGITS),
+                pin1(LONGEST_NEW_DIGITS),
             )
-            .expect_err("the organizational card caps a credential at eight");
-        let is_length_error = matches!(error, AuthError::LengthUnsupported { .. });
-        assert!(is_length_error);
-        if let AuthError::LengthUnsupported { max } = error {
-            assert_eq!(max, ORGANIZATIONAL_PIN_MAX_LENGTH);
+            .expect("scripted change succeeds");
+        let wire = &transport.commands[0];
+        assert_eq!(
+            wire[P2_INDEX],
+            PinReferenceScheme::Organizational.reference(PinSlot::Pin1)
+        );
+        assert_eq!(usize::from(wire[LC_INDEX]), expected.len());
+        assert_eq!(&wire[DATA_OFFSET..], expected.as_slice());
+
+        let mut transport = Recorder::new(vec![StatusWord::Success]);
+        transport
+            .change_pin2_with_scheme(
+                PinReferenceScheme::Organizational,
+                pin2(LONGEST_CURRENT_DIGITS),
+                pin2(LONGEST_NEW_DIGITS),
+            )
+            .expect("scripted change succeeds");
+        let wire = &transport.commands[0];
+        assert_eq!(
+            wire[P2_INDEX],
+            PinReferenceScheme::Organizational.reference(PinSlot::Pin2)
+        );
+        assert_eq!(usize::from(wire[LC_INDEX]), expected.len());
+        assert_eq!(&wire[DATA_OFFSET..], expected.as_slice());
+    }
+
+    #[test]
+    fn organizational_unblock_sets_a_twelve_digit_pin_unpadded() {
+        for slot in [PinSlot::Pin1, PinSlot::Pin2] {
+            let mut transport = Recorder::new(vec![
+                puk_counter_served(),
+                StatusWord::Success,
+                StatusWord::Success,
+            ]);
+            let outcome = match slot {
+                PinSlot::Pin1 => transport.unblock_pin1_with_scheme(
+                    PinReferenceScheme::Organizational,
+                    puk(PUK_DIGITS),
+                    pin1(LONGEST_NEW_DIGITS),
+                ),
+                PinSlot::Pin2 => transport.unblock_pin2_with_scheme(
+                    PinReferenceScheme::Organizational,
+                    puk(PUK_DIGITS),
+                    pin2(LONGEST_NEW_DIGITS),
+                ),
+            }
+            .expect("scripted unblock succeeds");
+            assert_eq!(outcome, ManageOutcome::Ok);
+            let reset = &transport.commands[ORG_UNBLOCK_COMMAND_COUNT - 1];
+            assert_eq!(reset[INS_INDEX], RESET_RETRY_COUNTER_INS);
+            assert_eq!(
+                reset[P2_INDEX],
+                PinReferenceScheme::Organizational.reference(slot)
+            );
+            assert_eq!(usize::from(reset[LC_INDEX]), LONGEST_NEW_DIGITS.len());
+            assert_eq!(&reset[DATA_OFFSET..], LONGEST_NEW_DIGITS);
         }
-        assert!(transport.commands.is_empty());
+    }
+
+    #[test]
+    fn a_pin_outside_the_role_bounds_never_becomes_a_credential() {
+        // Change, unblock and activation take only a validated Pin1 or
+        // Pin2, so a PIN that fails here has no path to any command.
+        let longest_plus_one = back_to_back(LONGEST_NEW_DIGITS, &NEW_DIGITS[..1]);
+        assert_eq!(longest_plus_one.len(), PIN_MAX_LENGTH + 1);
+        let pin1_short = &NEW_DIGITS[..PIN1_MIN_LENGTH - 1];
+        let pin2_short = &NEW_PIN2_DIGITS[..PIN2_MIN_LENGTH - 1];
+        let secret = |digits: &[u8]| UnvalidatedSecret::from_owned_bytes(digits.to_vec());
+        assert!(Pin1::reconstruct(secret(&longest_plus_one)).is_err());
+        assert!(Pin2::reconstruct(secret(&longest_plus_one)).is_err());
+        assert!(Pin1::reconstruct(secret(pin1_short)).is_err());
+        assert!(Pin2::reconstruct(secret(pin2_short)).is_err());
     }
 
     #[test]

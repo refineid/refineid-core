@@ -24,6 +24,7 @@ pcsc = [
     "dep:refineid-pace",
     "dep:refineid-pcsc",
     "dep:refineid-pkcs15",
+    "dep:refineid-remote",
     "dep:refineid-sign",
 ]
 
@@ -36,6 +37,7 @@ refineid-digest.workspace = true
 refineid-pace = { workspace = true, optional = true }
 refineid-pcsc = { workspace = true, optional = true }
 refineid-pkcs15 = { workspace = true, optional = true }
+refineid-remote = { workspace = true, optional = true }
 refineid-sign = { workspace = true, optional = true }
 
 const-oid.workspace = true

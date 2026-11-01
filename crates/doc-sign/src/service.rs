@@ -30,7 +30,7 @@
 //! choreography stays in lockstep.
 
 use core::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::asic::DataObject;
 use crate::cades::{DigestAlgorithm, SignatureAlgorithm, SignerParameters, SigningTime};
@@ -39,6 +39,7 @@ use crate::document::{self, DocumentError, DocumentPlan, Format};
 use crate::identity::{CommonName, TokenSerial, render_token_serial};
 use crate::pades::SignatureMetadata;
 use crate::pin::{PinBytes, PinEntryError, PinPolicyReason, PinRole, PinSource};
+use crate::remote::{DocumentName, PhoneCertificateError, PhoneRefusal};
 use crate::rng;
 use crate::signed_name::{BestSignatureTime, PendingSignedName};
 use crate::timestamp::{self, TimestampError, VerifiedTimestampToken};
@@ -310,7 +311,7 @@ impl DocumentRequest {
     /// asking for a PIN. Archive still normalizes to LT through
     /// [`Self::requires_long_term_material`]; this only catches missing
     /// authorities and formats whose archive construction is absent.
-    fn validate_signing_policy(&self) -> Result<(), SignErrorKind> {
+    pub(crate) fn validate_signing_policy(&self) -> Result<(), SignErrorKind> {
         if self.requires_long_term_material() && self.timestamp_authorities.is_empty() {
             return Err(SignErrorKind::Timestamp(
                 "LT and LTA signatures need at least one timestamp authority".to_owned(),
@@ -395,7 +396,7 @@ impl SignOutput {
     }
 
     /// Write `bytes` to [`Self::path`] and return that path.
-    fn write(
+    pub(crate) fn write(
         &self,
         best: Option<BestSignatureTime>,
         bytes: &[u8],
@@ -417,12 +418,30 @@ impl SignOutput {
     }
 }
 
-/// One reader's worth of sign output.
+/// Where the private-key operation ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SigningDevice {
+    /// A card in this computer's reader, named as PC/SC names the
+    /// reader.
+    Reader(String),
+    /// The card held by the paired phone, reached over RAPP.
+    PairedPhone,
+}
+
+impl fmt::Display for SigningDevice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Reader(name) => write!(f, "reader: {name}"),
+            Self::PairedPhone => f.write_str("signed on: the paired phone"),
+        }
+    }
+}
+
+/// One document's or one bare signature's worth of sign output.
 #[derive(Debug, Clone)]
 pub struct SignReport {
-    /// PC/SC reader name the sign APDU chain landed against.
-    /// Tier 0 `String` from `ReaderId::as_str().to_owned()`.
-    pub reader: String,
+    /// Where the private-key operation ran.
+    pub device: SigningDevice,
     /// Which key signed.
     pub slot: SignSlot,
     /// Length of the input file in bytes.
@@ -649,6 +668,36 @@ pub enum SignErrorKind {
     /// PACE establishment failed for a non-CAN reason. Tier 0
     /// `String`; presentational copy of the upstream error.
     Pace(String),
+    /// The paired phone answered the signing or the certificate read
+    /// with a refusal; nothing was written.
+    Phone(PhoneRefusal),
+    /// The certificate the paired phone returned is not a
+    /// qualified-signature certificate this flow can sign with;
+    /// refused before any digest went to the phone.
+    PhoneCertificate(PhoneCertificateError),
+    /// The paired phone returned a different number of signatures than
+    /// the batch had documents; nothing was written.
+    PhoneSignatureCount {
+        /// Documents in the batch.
+        expected: usize,
+        /// Signatures the phone returned.
+        got: usize,
+    },
+    /// A signature the paired phone returned does not verify against
+    /// the phone's certificate over that document's signed octets;
+    /// nothing was written.
+    PhoneSignatureInvalid {
+        /// The document whose signature failed.
+        document: DocumentName,
+        /// The verifier's diagnostic.
+        detail: String,
+    },
+    /// A document's name, as the phone would show it to the holder,
+    /// is empty or longer than RAPP v26.10.29 section 9.3 allows;
+    /// refused before any digest went to the phone.
+    DocumentNameLength,
+    /// The phone path was given no document to sign.
+    NoDocuments,
 }
 
 impl fmt::Display for SignErrorKind {
@@ -759,6 +808,22 @@ impl fmt::Display for SignErrorKind {
             ),
             Self::BadCan => write!(f, "PACE failed: the CAN did not match the card"),
             Self::Pace(s) => write!(f, "PACE: {s}"),
+            Self::Phone(refusal) => write!(f, "phone: {refusal}"),
+            Self::PhoneCertificate(error) => write!(f, "phone certificate: {error}"),
+            Self::PhoneSignatureCount { expected, got } => write!(
+                f,
+                "the phone returned {got} signatures for {expected} documents"
+            ),
+            Self::PhoneSignatureInvalid { document, detail } => write!(
+                f,
+                "the phone's signature of {} does not verify: {detail}",
+                document.as_str()
+            ),
+            Self::DocumentNameLength => write!(
+                f,
+                "the document name does not fit the phone's consent display"
+            ),
+            Self::NoDocuments => f.write_str("no document to sign"),
         }
     }
 }
@@ -900,38 +965,47 @@ fn sign_dispatch_by_alg<T: CardTransport>(
             let signature = transport
                 .sign_prehashed_sha256_rsa(sign_scheme, slot.key_ref(), core_digest)
                 .map_err(sign_err_to_kind)?;
-            let verify = match cert.spki.verify_message_signature(
+            verify_against_certificate(
+                cert,
                 MessageSignatureAlgorithm::RsaPkcs1Sha256,
                 input_bytes,
                 signature.as_bytes(),
-            ) {
-                Ok(()) => LocalVerifyOutcome::Ok,
-                Err(e) => {
-                    return Err(SignErrorKind::LocalVerifyFailed(format!("{e}")));
-                }
-            };
-            Ok((signature.into_bytes(), verify))
+            )
+            .map_err(SignErrorKind::LocalVerifyFailed)?;
+            Ok((signature.into_bytes(), LocalVerifyOutcome::Ok))
         }
         PublicKeyAlgorithm::Ec(EcCurve::Secp384r1) => {
             let hash_sha384 = CoreSha384::of(input_bytes);
             let signature = transport
                 .sign_prehashed_sha384_ecdsa(sign_scheme, slot.key_ref(), *hash_sha384.as_bytes())
                 .map_err(sign_err_to_kind)?;
-            let verify = match cert.spki.verify_message_signature(
+            verify_against_certificate(
+                cert,
                 MessageSignatureAlgorithm::EcdsaSha384Raw,
                 input_bytes,
                 signature.as_bytes(),
-            ) {
-                Ok(()) => LocalVerifyOutcome::Ok,
-                Err(e) => {
-                    return Err(SignErrorKind::LocalVerifyFailed(format!("{e}")));
-                }
-            };
-            Ok((signature.into_bytes(), verify))
+            )
+            .map_err(SignErrorKind::LocalVerifyFailed)?;
+            Ok((signature.into_bytes(), LocalVerifyOutcome::Ok))
         }
         PublicKeyAlgorithm::Ec(curve) => Err(SignErrorKind::UnsupportedCurve { slot, curve }),
         PublicKeyAlgorithm::Other => Err(SignErrorKind::UnsupportedKeyType(slot)),
     }
+}
+
+/// Verify a card's signature over `signed_octets` against the public
+/// key of the certificate that names the card's key, before anything
+/// built on the signature is finished or written. A local card's
+/// signature and a paired phone's go through this one check.
+pub(crate) fn verify_against_certificate(
+    cert: &Certificate<'_>,
+    algorithm: MessageSignatureAlgorithm,
+    signed_octets: &[u8],
+    signature: &[u8],
+) -> Result<(), String> {
+    cert.spki
+        .verify_message_signature(algorithm, signed_octets, signature)
+        .map_err(|e| format!("{e}"))
 }
 
 /// A card session the signing flow drives: a reset in place, which
@@ -1135,7 +1209,7 @@ where
     };
 
     Ok(SignReport {
-        reader: reader_id.as_str().to_owned(),
+        device: SigningDevice::Reader(reader_id.as_str().to_owned()),
         slot,
         input_len,
         input_sha256,
@@ -1258,7 +1332,7 @@ fn prepare_on_card<T: CardTransport>(
             let cert = cert_owned.view();
             let parameters =
                 document_signer(&cert, cert.spki.algorithm(), slot, request.signing_time)?;
-            let objects = load_data_objects(options, request, input_bytes)?;
+            let objects = load_data_objects(&options.input, request, input_bytes)?;
             ensure_visible_signature_format(request)?;
             Some(
                 document::plan(request.format, objects, &parameters, &request.metadata)
@@ -1433,17 +1507,10 @@ fn finish_signature(
         local_verify,
         plan,
     } = on_card;
-    let cert = cert_owned.view();
-    let cert_subject_cn = cert.subject.common_name();
+    let cert_subject_cn = cert_owned.view().subject.common_name();
     let assembled = match (options.document.as_ref(), plan) {
         (Some(request), Some(plan)) => {
-            let parameters = document_signer(
-                &cert,
-                cert.spki.algorithm(),
-                options.slot,
-                request.signing_time,
-            )?;
-            assemble_document(options, plan, &parameters, &signature_bytes, &cert_der)?
+            finish_document(request, plan, &cert_owned, options.slot, &signature_bytes)?
         }
         (None, _) | (Some(_), None) => AssembledDocument {
             bytes: signature_bytes.clone(),
@@ -1468,7 +1535,9 @@ fn finish_signature(
 ///
 /// Runs before PIN verification, so a misplaced mark cannot consume a
 /// PIN retry.
-fn ensure_visible_signature_format(request: &DocumentRequest) -> Result<(), SignErrorKind> {
+pub(crate) fn ensure_visible_signature_format(
+    request: &DocumentRequest,
+) -> Result<(), SignErrorKind> {
     if request.metadata.visible_signature.is_some() && request.format != Format::Pades {
         return Err(SignErrorKind::VisibleSignatureFormat);
     }
@@ -1698,14 +1767,14 @@ struct CollectedTimestamps {
 /// revocation evidence for each retained token, anchored on the
 /// certificates the token itself carries.
 fn collect_document_timestamps(
-    request: Option<&DocumentRequest>,
+    request: &DocumentRequest,
     authorities: &[String],
     plan: &DocumentPlan,
     parameters: &SignerParameters<'_>,
     signature_bytes: &[u8],
 ) -> Result<CollectedTimestamps, SignErrorKind> {
-    let keep_material = request.is_some_and(DocumentRequest::requires_long_term_material);
-    let credentials = request.and_then(|request| request.timestamp_credentials.as_ref());
+    let keep_material = request.requires_long_term_material();
+    let credentials = request.timestamp_credentials.as_ref();
     let mut tokens = Vec::with_capacity(authorities.len());
     let mut material = ValidationMaterial::default();
     let mut refusals = Vec::new();
@@ -1738,10 +1807,7 @@ fn collect_document_timestamps(
         }
         tokens.push(token);
     }
-    if (!authorities.is_empty()
-        || request.is_some_and(DocumentRequest::requires_long_term_material))
-        && tokens.is_empty()
-    {
+    if (!authorities.is_empty() || keep_material) && tokens.is_empty() {
         let detail = if refusals.is_empty() {
             "no timestamp authority was configured".to_owned()
         } else {
@@ -1757,37 +1823,47 @@ fn collect_document_timestamps(
     Ok(CollectedTimestamps { tokens, material })
 }
 
+/// Finish one document from the signature its signer returned: the
+/// one path after the private-key operation, whether a card in this
+/// computer's reader or the paired phone's card signed.
+///
+/// The signature has already been verified against `cert`'s public
+/// key over [`DocumentPlan::to_be_signed`]. The signer parameters are
+/// rebuilt from `cert` exactly as the plan was built, so the finished
+/// structure names the digest and algorithm the signature carries.
+pub(crate) fn finish_document(
+    request: &DocumentRequest,
+    plan: DocumentPlan,
+    cert: &OwnedCert,
+    slot: SignSlot,
+    signature_bytes: &[u8],
+) -> Result<AssembledDocument, SignErrorKind> {
+    let view = cert.view();
+    let parameters = document_signer(&view, view.spki.algorithm(), slot, request.signing_time)?;
+    assemble_document(request, plan, &parameters, signature_bytes, cert.as_der())
+}
+
 /// Fetch the timestamps and evidence a document signature asked for,
 /// then assemble it.
 ///
 /// Everything here needs the network and the signature both, so it can
-/// only run once the card has answered -- and it runs with the card
-/// still held, because the signer parameters borrow a certificate that
-/// lives only for this session.
+/// only run once the signer has answered; it runs with no card session
+/// held.
 fn assemble_document(
-    options: &SignOptions,
+    request: &DocumentRequest,
     plan: DocumentPlan,
     parameters: &SignerParameters<'_>,
     signature_bytes: &[u8],
-    cert_der: &UnvalidatedCertificate,
+    leaf_der: &[u8],
 ) -> Result<AssembledDocument, SignErrorKind> {
     // The timestamp is over the signature, so it can only be
-    // fetched now. That is a network round trip with the card
-    // still held exclusively; the alternative is dropping the
-    // card and re-reading the certificate to rebuild
-    // `parameters`, which trades a held reader for a second
-    // card session.
-    let request = options.document.as_ref();
-    let authorities = options
-        .document
-        .as_ref()
-        .map(|request| request.timestamp_authorities.as_slice())
-        .unwrap_or_default();
+    // fetched now.
+    let authorities = request.timestamp_authorities.as_slice();
     let CollectedTimestamps {
         tokens,
         material: mut timestamp_material,
     } = collect_document_timestamps(request, authorities, &plan, parameters, signature_bytes)?;
-    let keep_material = request.is_some_and(DocumentRequest::requires_long_term_material);
+    let keep_material = request.requires_long_term_material();
     let material = if keep_material {
         // The tokens go in too, so the store answers for the
         // authorities that attested the time as well as for the
@@ -1807,7 +1883,7 @@ fn assemble_document(
             .min()
             .unwrap_or_else(now_date_time);
         let signer_material = crate::material::collect_chains(&[ChainStart {
-            leaf_der: cert_der.as_bytes(),
+            leaf_der,
             reference_time,
             anchor: ChainAnchor::Approved(&signer_anchors),
             nonce_policy: NoncePolicy::RequireEcho,
@@ -1824,14 +1900,14 @@ fn assemble_document(
     // ASiC-E CAdES archives through a second manifest and a
     // timestamp over it, not through the signature, so it
     // branches here rather than after assembly.
-    if request.is_some_and(|r| r.archive)
+    if request.archive
         && let Some(manifest) =
             plan.archive_manifest(parameters, signature_bytes, parameters.digest_algorithm)
     {
         let digest = parameters.digest_algorithm.digest(&manifest);
         let token = first_answering_token(
             authorities,
-            request.and_then(|request| request.timestamp_credentials.as_ref()),
+            request.timestamp_credentials.as_ref(),
             &digest,
             parameters.digest_algorithm,
             &material,
@@ -1854,12 +1930,12 @@ fn assemble_document(
     // The archive timestamp goes over the finished document,
     // validation store and all, so it can only be taken once
     // everything else is in place.
-    let (bytes, archive_timestamp_obtained) = if request.is_some_and(|r| r.archive) {
+    let (bytes, archive_timestamp_obtained) = if request.archive {
         (
             archive_timestamp(
                 &document,
                 authorities,
-                request.and_then(|request| request.timestamp_credentials.as_ref()),
+                request.timestamp_credentials.as_ref(),
                 parameters.digest_algorithm,
                 &material,
             )?,
@@ -1876,13 +1952,13 @@ fn assemble_document(
 }
 
 /// A finished document and what its timestamps established.
-struct AssembledDocument {
+pub(crate) struct AssembledDocument {
     /// The document.
-    bytes: Vec<u8>,
+    pub(crate) bytes: Vec<u8>,
     /// Timestamp tokens obtained, the archive timestamp included.
-    timestamps: usize,
+    pub(crate) timestamps: usize,
     /// The earliest validated signature timestamp's `genTime`.
-    best_signature_time: Option<BestSignatureTime>,
+    pub(crate) best_signature_time: Option<BestSignatureTime>,
 }
 
 impl AssembledDocument {
@@ -2162,7 +2238,7 @@ fn merge_unique(into: &mut Vec<Vec<u8>>, from: Vec<Vec<u8>>) {
 /// certificate names, under the one chain `sign_dispatch_by_alg`
 /// drives for that key shape. Naming a different digest here would
 /// produce a structure that claims one thing and carries another.
-const fn document_signer<'a>(
+pub(crate) const fn document_signer<'a>(
     cert: &'a Certificate<'a>,
     cert_algorithm: PublicKeyAlgorithm,
     slot: SignSlot,
@@ -2192,12 +2268,12 @@ const fn document_signer<'a>(
 /// The primary input is already in memory, so it is reused rather
 /// than read twice; a container that signed a file which changed
 /// between the two reads would attest something that never existed.
-fn load_data_objects(
-    options: &SignOptions,
+pub(crate) fn load_data_objects(
+    input: &Path,
     request: &DocumentRequest,
     input_bytes: &[u8],
 ) -> Result<Vec<DataObject>, SignErrorKind> {
-    let mut objects = vec![data_object(&options.input, input_bytes.to_vec())];
+    let mut objects = vec![data_object(input, input_bytes.to_vec())];
     for path in &request.additional_inputs {
         let content = std::fs::read(path).map_err(|source| SignErrorKind::InputRead {
             path: path.clone(),
@@ -2213,7 +2289,7 @@ fn load_data_objects(
 /// The name is the file name alone: a container entry called
 /// `/home/someone/dossier.pdf` would leak a path and break the
 /// archive layout both.
-fn data_object(path: &std::path::Path, content: Vec<u8>) -> DataObject {
+fn data_object(path: &Path, content: Vec<u8>) -> DataObject {
     let name = path
         .file_name()
         .map_or_else(|| "file".to_owned(), |n| n.to_string_lossy().into_owned());
@@ -2228,7 +2304,7 @@ fn data_object(path: &std::path::Path, content: Vec<u8>) -> DataObject {
 ///
 /// A guess is all this can be, and it is recorded in the signature,
 /// so the fallback is the honest one rather than a plausible one.
-fn media_type_for(path: &std::path::Path) -> &'static str {
+fn media_type_for(path: &Path) -> &'static str {
     match path
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
@@ -2281,7 +2357,7 @@ fn sign_err_to_kind<TE: fmt::Display>(e: SignError<TE>) -> SignErrorKind {
 
 impl fmt::Display for SignReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "reader: {}", self.reader)?;
+        writeln!(f, "{}", self.device)?;
         writeln!(
             f,
             "key: {} (key ref {:#04X})",
@@ -3004,7 +3080,7 @@ mod tests {
 
     fn sample_report(cn: Option<CommonName>) -> SignReport {
         SignReport {
-            reader: "OMNIKEY 5422".to_owned(),
+            device: SigningDevice::Reader("OMNIKEY 5422".to_owned()),
             slot: SignSlot::Qualified,
             input_len: 11,
             input_sha256: Sha256::of(b"hello world"),

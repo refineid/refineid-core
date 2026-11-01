@@ -62,6 +62,15 @@ cmac = "0.8"
 # constant-time fixed-window scalar multiplication. The default features
 # add PKCS#8 key encoding and getrandom, which the handshake does not use.
 bp384 = { version = "0.14", default-features = false, features = ["arithmetic"] }
+# NIST P-256 and P-384 point arithmetic for PACE (crates/pace): the
+# standardized domain parameters the organizational cards publish in
+# EF.CardAccess, in the same RustCrypto family and elliptic-curve
+# version as bp384, with the same arithmetic-only feature set.
+p256 = { version = "0.14", default-features = false, features = ["arithmetic"] }
+p384 = { version = "0.14", default-features = false, features = ["arithmetic"] }
+# The curve-generic traits the PACE handshake is written against, the
+# one version bp384, p256 and p384 share.
+elliptic-curve = { version = "0.14", default-features = false, features = ["arithmetic", "sec1"] }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 crypto-bigint = { version = "0.7", features = ["alloc", "zeroize"] }
 miniz_oxide = "0.9"
@@ -69,7 +78,9 @@ curve25519-dalek = { version = "4.1", default-features = false, features = ["all
 getrandom = "0.4"
 hmac = "0.13"
 proc-macro2 = { version = "1", features = ["span-locations"] }
-sha2 = "0.11"
+# The zeroize feature wipes the hasher state on drop: SHA-256 absorbs
+# PIN and CAN digits for the PACE password key.
+sha2 = { version = "0.11", features = ["zeroize"] }
 # Legacy signature-digest support for CMS verification only: older CSCA
 # self-signatures still use SHA-1 family algorithms.
 sha1 = "0.11"

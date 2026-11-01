@@ -64,7 +64,9 @@ completeness, not targeted. Observed hardware coverage is in the
 
 - ATR: `3B DD 96 00 80 31 FE 45 00 31 B8 64 04 29 EC C1 73 94 01 80 83 49`
 - Observed on a DVV test organization card; its activation is in
-  [card activation](card-activation.md).
+  [card activation](card-activation.md), and its contactless access --
+  PACE with PIN 1 or PIN 2 over NIST P-384, with a 32-byte nonce -- in
+  [PACE](pace.md).
 - ATS: `3B 89 80 01 00 31 B8 64 04 29 EC C1 73 94 01 80 83`
 
 **Idemia ID.me IDeal Citiz 2.17-i**

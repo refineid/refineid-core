@@ -50,7 +50,7 @@ use refineid_cms::x509::{
     Certificate, EcCurve, MessageSignatureAlgorithm, OwnedCert, PublicKeyAlgorithm,
 };
 use refineid_digest::Sha384 as CoreSha384;
-use refineid_pace::{Can, PaceError, SmTransport, run_pace_with_can};
+use refineid_pace::{Can, PaceError, PacePassword, SmTransport, read_card_access, run_pace};
 use refineid_pcsc::{
     PcscCard, PcscError, PcscTransactionCard, ReaderAccessCap, ReaderBackend,
     ReaderBackendOps as _, ReaderFilter, ReaderPickError,
@@ -596,15 +596,19 @@ where
             transport
                 .reset_card()
                 .map_err(|e| ReaderSignError::Pace(format!("reset before PACE: {e}")))?;
-            // PACE's MSE:Set AT is only accepted in MF context: the
-            // reset lands the card there already; selecting MF makes
-            // the requirement explicit and survives a backend whose
-            // reset leaves selection elsewhere.
+            // EF.CardAccess is read from the MF and PACE's MSE:Set AT
+            // is only accepted in MF context: the reset lands the card
+            // there already; selecting MF makes the requirement
+            // explicit and survives a backend whose reset leaves
+            // selection elsewhere.
             transport
                 .select_mf()
                 .map_err(|e| ReaderSignError::Pace(format!("SELECT MF before PACE: {e}")))?;
-            let session =
-                run_pace_with_can(&mut transport, can).map_err(|e| pace_err_to_kind(&e))?;
+            // EF.CardAccess names the domain parameter PACE runs over.
+            let card_access = read_card_access(&mut transport).map_err(|e| pace_err_to_kind(&e))?;
+            let session = run_pace(&mut transport, &card_access, PacePassword::Can(&can))
+                .map_err(|e| pace_err_to_kind(&e))?;
+            drop(can);
             let mut sm = SmTransport::new(transport, session);
             sm.select_pkcs15_application()
                 .map_err(|e| ReaderSignError::CertUnavailable {

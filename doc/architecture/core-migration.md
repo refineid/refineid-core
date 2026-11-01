@@ -331,6 +331,36 @@ feature so a host library can own the symbol. RAPP's wire, channels,
 transports and stores stay outside the core. Covered by unit tests over a
 scripted source; the phone path is not recorded as hardware-validated.
 
+The fifteenth slice extends `refineid-pace` to the organizational cards,
+which authenticate PACE with PIN 1 or PIN 2 in place of the CAN (FINEID
+S1 v4.0, organizational cards, section 2.1) over NIST curves:
+
+- `CardAccess`, reconstructed from the card's EF.CardAccess, keeps the
+  `PACEInfo` suites the crate implements -- AES-256 generic or
+  integrated mapping, version 2, over NIST P-256, NIST P-384 or
+  brainpoolP384r1 by their BSI TR-03110-3 table 4 identifiers -- and
+  names the generic-mapping suite the handshake runs, preferring P-384,
+  then brainpoolP384r1, then P-256;
+- `run_pace` takes the card access and a `PacePassword`: the `Can`, or a
+  `Pin1` or `Pin2` from `refineid-auth`, under the password references
+  the organizational card enables PACE with (FINEID S4-2 v4.0 section
+  6). A PIN's nonce key is derived in `refineid-auth`, which owns the
+  digits, from the same character-string encoding as the CAN (BSI
+  TR-03110-3 table 5);
+- with a PIN, `MSE:Set AT`'s answer is read as the PIN's tries left and
+  `check_retry_floor` decides before the first `GENERAL AUTHENTICATE`; a
+  counter answer to a later round is a typed wrong PIN;
+- the generic mapping is written once over the RustCrypto
+  `elliptic-curve` traits, with the point arithmetic of `p256` and
+  `p384` beside `bp384`, all three on one `elliptic-curve` version and
+  arithmetic only.
+
+A failed PACE with a PIN spends a try, so the slice is retry-consuming:
+the parse, the wire, the floor refusals and full handshakes over all
+three curves are covered by scripted tests, and PACE with a PIN is not
+described as working until it is observed on hardware with the counter
+read before and after.
+
 ## Hardware validation
 
 Slices two through five have been exercised against two citizen card

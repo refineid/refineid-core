@@ -15,14 +15,18 @@
 //! The PACE secure channel for FINEID cards.
 //!
 //! The Card Access Number input type is the trust boundary for the
-//! password; the handshake drives `id-PACE-ECDH-GM-AES-CBC-CMAC-256`
-//! over brainpoolP384r1 and hands its session keys to the
-//! secure-messaging layer, which is itself a card transport so the
-//! layers above it stay unaware of the protection. Values crossing a
+//! citizen cards' password, and the PIN types of `refineid-auth` for the
+//! organizational cards'. EF.CardAccess is parsed into the PACE suites
+//! the card publishes; the handshake drives
+//! `id-PACE-ECDH-GM-AES-CBC-CMAC-256` over the domain parameter it
+//! picks there -- NIST P-384, brainpoolP384r1 or NIST P-256 -- and hands
+//! its session keys to the secure-messaging layer, which is itself a
+//! card transport so the layers above it stay unaware of the protection. Values crossing a
 //! trust boundary are deconstructed, validated once, and reconstructed
 //! as types whose constructors preserve their invariants.
 
 pub mod can;
+pub mod card_access;
 pub mod commands;
 pub(crate) mod crypto;
 pub mod handshake;
@@ -30,9 +34,11 @@ pub mod rng;
 pub mod secure_messaging;
 
 pub use can::{CAN_DIGITS, Can, CanError, UnvalidatedCan};
-pub use handshake::{
-    DOMAIN_REF_BRAINPOOL_P384_R1, PASSWORD_REF_CAN, PaceError, PaceSession, Ssc, run_pace_with_can,
+pub use card_access::{
+    CardAccess, CardAccessError, EF_CARD_ACCESS_FID, PaceDomain, PaceInfo, PaceMapping,
+    UnvalidatedCardAccess, read_card_access,
 };
+pub use handshake::{PASSWORD_REF_CAN, PaceError, PacePassword, PaceSession, Ssc, run_pace};
 pub use secure_messaging::{SmError, SmTransport};
 
 #[cfg(test)]
@@ -43,7 +49,7 @@ mod public_contract_tests {
     use zeroize::{Zeroize, ZeroizeOnDrop};
 
     use super::{Can, PaceSession, Ssc, UnvalidatedCan};
-    use crate::crypto::brainpool_p384::Point;
+    use crate::crypto::curve::Point;
     use crate::crypto::symmetric::Aes256Key;
 
     trait AmbiguousIfImplemented<Disambiguator, Marker> {
@@ -121,7 +127,7 @@ mod public_contract_tests {
         // by an explicit clone and can be wiped on request, so the
         // handshake's secret-dependent points never spread by implicit
         // copy and die with their zeroizing owner.
-        require_zeroize::<Point>();
-        let _ = <Point as AmbiguousIfImplemented<_, CopyMarker>>::marker;
+        require_zeroize::<Point<p384::NistP384>>();
+        let _ = <Point<p384::NistP384> as AmbiguousIfImplemented<_, CopyMarker>>::marker;
     }
 }

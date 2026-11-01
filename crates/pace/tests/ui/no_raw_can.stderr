@@ -1,5 +1,5 @@
-error[E0599]: no method named `as_bytes` found for struct `Can` in the current scope
+error[E0599]: no method named `as_bytes` found for struct `refineid_pace::Can` in the current scope
  --> tests/ui/no_raw_can.rs:6:17
   |
 6 |     let _ = can.as_bytes();
-  |                 ^^^^^^^^ method not found in `Can`
+  |                 ^^^^^^^^ method not found in `refineid_pace::Can`

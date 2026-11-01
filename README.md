@@ -40,8 +40,9 @@ crates stay transport-agnostic and country-profile-neutral.
   reading and parsing (EF.COM inventory, TD1 MRZ, encoded face). The
   read data is shown, not authenticated: there is no passive
   authentication.
-- `crates/pace` (`refineid-pace`) -- Card Access Number input type, the
-  PACE handshake, and secure messaging.
+- `crates/pace` (`refineid-pace`) -- Card Access Number input type,
+  EF.CardAccess parsing, the PACE handshake with a CAN or a PIN as the
+  password, and secure messaging.
 - `crates/pin-cache` (`refineid-pin-cache`) -- process-lifetime negative
   PIN cache: a card-rejected PIN is retained only as a keyed fingerprint
   and refused locally, so software never re-offers a known-bad value and

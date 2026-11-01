@@ -23,11 +23,11 @@
 use refineid_apdu::{ApduClass, CommandApdu, CommandDataError, CommandHeader};
 
 /// `MANAGE SECURITY ENVIRONMENT` instruction.
-const MSE_INS: u8 = 0x22;
+pub(crate) const MSE_INS: u8 = 0x22;
 /// P1 for `MSE:Set` used to configure verification.
-const MSE_P1_SET_AT: u8 = 0xC1;
+pub(crate) const MSE_P1_SET_AT: u8 = 0xC1;
 /// P2 selecting the authentication template.
-const MSE_P2_AUTH_TEMPLATE: u8 = 0xA4;
+pub(crate) const MSE_P2_AUTH_TEMPLATE: u8 = 0xA4;
 
 /// `GENERAL AUTHENTICATE` instruction.
 const GA_INS: u8 = 0x86;

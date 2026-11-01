@@ -99,6 +99,12 @@ Observed on an Idemia Cosmo X organization card (see
   ID.me IDeal Citiz 2.17-i, not the Cosmo X. On those cards PACE
   authenticates the holder with PIN 1 or PIN 2 instead of the CAN
   (FINEID S1 v4.0, organizational cards, §2.1).
+- On the contactless interface the Cosmo X answers `6985` to every
+  command until PACE runs. Its EF.CardAccess lists generic and
+  integrated mapping over NIST P-256 and P-384, and `MSE:Set AT` accepts
+  PIN 1 (reference 3) and PIN 2 (reference 4) as the PACE password,
+  answering `9000` at five tries left. PACE with a PIN, its retry floor
+  and the curve choice are in [PACE](pace.md).
 
 ## PIN lengths
 

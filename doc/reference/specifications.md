@@ -44,6 +44,6 @@ revised; this page resolves those names to the documents.
 
 Cited by identifier, published by their standards bodies rather than DVV:
 ISO/IEC 7816 (parts 3, 4, 5, 8, and 15); BSI TR-03110-3 (PACE); RFC 5639
-(brainpoolP384r1); NIST SP 800-38A and 800-38B (the AES and CMAC
+(brainpoolP384r1); NIST SP 800-186 (P-256 and P-384); NIST SP 800-38A and 800-38B (the AES and CMAC
 known-answer vectors); and RFC 5280, RFC 5480, and RFC 8017 (X.509,
 elliptic-curve subject public keys, and PKCS#1).

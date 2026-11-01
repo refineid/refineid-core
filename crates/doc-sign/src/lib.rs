@@ -17,6 +17,16 @@
 //! Provides cross-platform incremental PDF signing, ASiC-E container creation,
 //! CAdES/XAdES generation, RFC 3161 timestamps, and long-term validation (LTA)
 //! evidence collection.
+//!
+//! Everything builds without a card reader: planning a document around
+//! a signing certificate, the shared finish (timestamps, long-term
+//! material, the output file), signing through the paired phone
+//! ([`remote`]), verification, and the request, report and error types
+//! of [`service`]. The `pcsc` feature, on by default, adds the one part
+//! that drives a card in this computer's reader, `service::reader`, and
+//! with it the card-side crates it is built on. A platform without
+//! PC/SC builds with `--no-default-features` and brings its own card
+//! session to the same finish.
 
 #![forbid(unsafe_code)]
 
@@ -55,12 +65,10 @@ pub mod ocsp;
 pub mod oids;
 pub mod pades;
 pub mod pin;
-#[cfg(feature = "pcsc")]
 pub mod remote;
 pub mod revocation;
 pub mod rng;
 pub use refineid_cms::rsa;
-#[cfg(feature = "pcsc")]
 pub mod service;
 pub mod signed_name;
 #[cfg(test)]

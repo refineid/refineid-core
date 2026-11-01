@@ -18,13 +18,16 @@ default = ["pcsc"]
 # Test-only fixture builders on the refineid-cms test signer. Never
 # enabled by a production build.
 testkit = ["refineid-cms/testkit"]
+# Signing with a card in this computer's reader (`service::reader`) and
+# the card-side crates it is built on. Off, the crate still plans,
+# finishes, verifies and signs through the paired phone; a platform
+# without PC/SC brings its own card session.
 pcsc = [
     "dep:refineid-apdu",
     "dep:refineid-auth",
     "dep:refineid-pace",
     "dep:refineid-pcsc",
     "dep:refineid-pkcs15",
-    "dep:refineid-remote",
     "dep:refineid-sign",
 ]
 
@@ -37,7 +40,7 @@ refineid-digest.workspace = true
 refineid-pace = { workspace = true, optional = true }
 refineid-pcsc = { workspace = true, optional = true }
 refineid-pkcs15 = { workspace = true, optional = true }
-refineid-remote = { workspace = true, optional = true }
+refineid-remote.workspace = true
 refineid-sign = { workspace = true, optional = true }
 
 const-oid.workspace = true
@@ -53,13 +56,7 @@ zeroize.workspace = true
 
 
 [dev-dependencies]
-refineid-apdu.workspace = true
 refineid-cms = { workspace = true, features = ["testkit"] }
-refineid-auth.workspace = true
-refineid-pace.workspace = true
-refineid-pcsc.workspace = true
-refineid-pkcs15.workspace = true
-refineid-sign.workspace = true
 trybuild.workspace = true
 
 [lints]

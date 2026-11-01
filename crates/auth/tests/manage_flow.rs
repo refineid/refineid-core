@@ -21,8 +21,9 @@ use refineid_apdu::{
 };
 use refineid_auth::{
     ActivationCode, ActivationScheme, AuthError, FlooredCredential, ManageOutcome, PIN1_REFERENCE,
-    PIN1_REFERENCE_ORGANIZATIONAL, PIN2_REFERENCE, PUK_REFERENCE, PUK_REFERENCE_ORGANIZATIONAL,
-    Pin1, Pin2, PinManageOps, Puk, RetryFloorRefusal, UnvalidatedSecret,
+    PIN1_REFERENCE_ORGANIZATIONAL, PIN2_REFERENCE, PIN2_REFERENCE_ORGANIZATIONAL, PUK_REFERENCE,
+    PUK_REFERENCE_ORGANIZATIONAL, Pin1, Pin2, PinManageOps, Puk, RetryFloorRefusal,
+    UnvalidatedSecret,
 };
 
 /// Wire index of the P2 reference byte.
@@ -226,7 +227,6 @@ fn activation_with_the_code_as_puk_follows_the_puk_floor() {
             commands: vec![],
         };
         let result = transport.activate_card(
-            ActivationScheme::ActivationCodeIsPuk,
             activation_code(PUK_DIGITS),
             Some(pin1(b"5678")),
             Some(pin2(b"567890")),
@@ -253,4 +253,115 @@ fn activation_with_the_code_as_puk_follows_the_puk_floor() {
         ));
         assert_eq!(sent, 0);
     }
+}
+
+/// An authentication certificate validity start before 13 January 2026.
+const VALID_FROM_BEFORE_CUTOVER: i64 = 1_700_000_000;
+/// An authentication certificate validity start after 13 January 2026.
+const VALID_FROM_AFTER_CUTOVER: i64 = 1_800_000_000;
+/// Retry count of a PIN blocked at the factory and reported as a counter.
+const RETRIES_EXHAUSTED: u8 = 0;
+/// Credential commands an organizational activation of both PINs sends:
+/// a PUK VERIFY then a RESET RETRY COUNTER per PIN.
+const ORG_ACTIVATION_COMMAND_COUNT: usize = 4;
+
+/// An organization card fresh from the factory: the citizen reference is
+/// not found, the organizational PINs answer an exhausted counter, and
+/// the PIN container does not answer the citizen-numbered GET DATA.
+fn factory_organization_card() -> ResolvingRecorder {
+    ResolvingRecorder {
+        citizen_probe: StatusWord::ReferenceDataNotFound,
+        organizational_probe: counter(RETRIES_EXHAUSTED),
+        puk_probe: counter(RETRIES_PRISTINE),
+        responses: vec![StatusWord::Success; ORG_ACTIVATION_COMMAND_COUNT],
+        cursor: 0,
+        commands: vec![],
+    }
+}
+
+#[test]
+fn health_of_an_organization_card_is_the_puk_scheme_whatever_the_date() {
+    for validity_start in [
+        Some(VALID_FROM_BEFORE_CUTOVER),
+        Some(VALID_FROM_AFTER_CUTOVER),
+        None,
+    ] {
+        let report = factory_organization_card()
+            .probe_credential_health(validity_start)
+            .expect("scripted probe completes");
+        assert_eq!(
+            report.activation_scheme,
+            Some(ActivationScheme::ActivationCodeIsPuk)
+        );
+        let needs = report.activation_needs.expect("a scheme was decided");
+        assert!(needs.pin1 && needs.pin2);
+    }
+}
+
+#[test]
+fn health_of_a_citizen_card_follows_the_validity_start() {
+    let citizen_card = || ResolvingRecorder {
+        citizen_probe: StatusWord::AuthenticationBlocked,
+        organizational_probe: StatusWord::ReferenceDataNotFound,
+        puk_probe: counter(RETRIES_PRISTINE),
+        responses: vec![],
+        cursor: 0,
+        commands: vec![],
+    };
+    let before = citizen_card()
+        .probe_credential_health(Some(VALID_FROM_BEFORE_CUTOVER))
+        .expect("scripted probe completes");
+    assert_eq!(
+        before.activation_scheme,
+        Some(ActivationScheme::ActivationCodeIsPuk)
+    );
+    let needs = before.activation_needs.expect("a scheme was decided");
+    assert!(needs.pin1 && needs.pin2);
+
+    // Section 4.6.2 with the flag unreadable makes no activation decision,
+    // whatever the counter says.
+    let after = citizen_card()
+        .probe_credential_health(Some(VALID_FROM_AFTER_CUTOVER))
+        .expect("scripted probe completes");
+    assert_eq!(
+        after.activation_scheme,
+        Some(ActivationScheme::PresetActivationPin)
+    );
+    let needs = after.activation_needs.expect("a scheme was decided");
+    assert!(!needs.any());
+
+    let unread = citizen_card()
+        .probe_credential_health(None)
+        .expect("scripted probe completes");
+    assert_eq!(unread.activation_scheme, None);
+    assert_eq!(unread.activation_needs, None);
+}
+
+#[test]
+fn organization_card_activation_resets_each_pin_under_the_organizational_numbering() {
+    let mut transport = factory_organization_card();
+    let report = transport
+        .activate_card(
+            activation_code(PUK_DIGITS),
+            Some(pin1(b"5678")),
+            Some(pin2(b"567890")),
+        )
+        .expect("the PUK counter is pristine");
+    assert_eq!(report.scheme, ActivationScheme::ActivationCodeIsPuk);
+    assert_eq!(report.pin1, Some(ManageOutcome::Ok));
+    assert_eq!(report.pin2, Some(ManageOutcome::Ok));
+    let references: Vec<Option<u8>> = transport
+        .commands
+        .iter()
+        .map(|wire| wire.get(P2_INDEX).copied())
+        .collect();
+    assert_eq!(
+        references,
+        [
+            Some(PUK_REFERENCE_ORGANIZATIONAL),
+            Some(PIN1_REFERENCE_ORGANIZATIONAL),
+            Some(PUK_REFERENCE_ORGANIZATIONAL),
+            Some(PIN2_REFERENCE_ORGANIZATIONAL),
+        ]
+    );
 }

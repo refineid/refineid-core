@@ -195,7 +195,6 @@ The seventh slice admits organizational card support across
   citizen card refuses, which is why the resolved numbering picks the
   chain.
 
-This slice also corrects the signing environment admitted in the sixth:
 PSO:COMPUTE DIGITAL SIGNATURE runs under the digital-signature template
 for the authentication key as well as the qualified-signature key,
 matching the specification -- which defines only hash, digital-signature,
@@ -203,10 +202,11 @@ and confidentiality templates for the operation, no authentication one --
 and the behaviour reference. The organizational reconstruction is traced
 to the FINEID S4-2 and S4-1 specifications and cross-checked against the
 country-neutral behaviour reference that is exercised against live
-organizational cards. No organizational path is described as
-hardware-validated here: no organizational card was available for
-verification, so the organizational VERIFY and signing chains rest on the
-specification and the behaviour reference rather than an observed card.
+organizational cards. The numbering resolution is observed on an Idemia
+Cosmo X organization card, which answers the citizen PIN 1 reference
+with "reference data not found" and the organizational references with
+their states; the organizational VERIFY and signing chains rest on the
+specification and the behaviour reference.
 
 The eighth slice admits PIN change and unblock in `refineid-auth`:
 

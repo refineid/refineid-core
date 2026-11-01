@@ -18,18 +18,35 @@ the scheme must be known before the form opens.
 
 ## What decides the scheme
 
-**The authentication certificate's validity start, and nothing else.**
-DVV names the cutover by date; a certificate issued from 13 January 2026
-is §4.6.2, one issued before it §4.6.1. An organizational issuer, or a
-certificate whose validity start cannot be read, gives no scheme and no
-activation decision.
+The card's credential numbering first, then the authentication
+certificate's validity start:
+
+1. **Organization numbering** (FINEID S4-2 v4.0 §4.2, see
+   [organization cards](#organization-cards)) means §4.6.1, whatever the
+   certificate date.
+2. **Citizen numbering** (FINEID S1 v4.2): the authentication
+   certificate's validity start decides. DVV names the cutover by date; a
+   certificate valid from 13 January 2026 is §4.6.2, one valid from
+   before it §4.6.1.
+3. A citizen-numbered card whose validity start cannot be read gives no
+   scheme and no activation decision.
+
+`refineid_auth::ActivationScheme::from_numbering_and_validity_start`
+takes the resolved `PinReferenceScheme` and the validity start (epoch
+seconds, `None` when unread) and returns the scheme or `None`; it is the
+one place the decision is made. `PinManageOps::probe_credential_health`
+takes the validity start, resolves the numbering, and reports the
+decided scheme with the activation needs under it. An `ActivationCode`
+is validated against a scheme and carries it, so
+`PinManageOps::activate_card` runs the command chain of the scheme its
+digit count was checked for.
 
 Signals that do **not** decide it, each disproven by a real card:
 
 | Signal | Why it fails |
 | --- | --- |
-| Chip generation in the ATR or NFC historical bytes | DVV H6 cards (produced 2023 – mid 2025, §4.6.1) and H8 cards (2026, §4.6.2) are both Thales MultiApp v5.0 with the same ATR |
-| Certificate key family / issuer suffix ("…E" for ECC, "…R" for RSA) | H6 cards carry ECC certificates from an "…E" issuer and still use §4.6.1 |
+| Chip generation in the ATR or NFC historical bytes | Thales MultiApp v5.0 citizen cards issued before 13 January 2026 (§4.6.1) and from that date (§4.6.2) present the same ATR |
+| Certificate key family / issuer suffix ("…E" for ECC, "…R" for RSA) | Thales MultiApp v5.0 citizen cards issued before 13 January 2026 carry ECC certificates from an "…E" issuer and use §4.6.1 |
 | Issuer name containing "Organisational" | test organization cards are issued by "DVV TEST Certificates - G5R", the same naming as citizen cards |
 
 ## Whether a PIN still awaits activation
@@ -40,17 +57,24 @@ the other waiting.
 - The **PIN changed flag** (GET DATA PIN container, FINEID S1 v4.2
   §3.15.3) decides under both schemes: unchanged means the PIN awaits
   activation, changed means the holder has set it.
+- The flag is optional: the card returns it only if "Return PIN changed
+  flag" was set when the applet was personalized (FINEID S1 v4.2
+  §3.15.2, §3.15.3). A card without it is judged by the counter fallback
+  below.
 - A §4.6.1 PIN blocked at the factory answers the counter-safe VERIFY
   probe with an exhausted counter (`63C0`, "0 tries left"), not only with
   "blocked" (`6983`); both mean the same here.
 - When the flag cannot be read, §4.6.1 falls back to the counter: a
   blocked, invalidated or exhausted PIN awaits activation (the same PUK
-  reset recovery would send). §4.6.2 makes no activation decision without
-  the flag.
+  reset recovery would send), and a usable or verified PIN does not.
+- When the flag cannot be read under §4.6.2, no activation decision is
+  made: `pin_awaits_activation` answers `false` whatever the counter, so
+  the activation PIN is never presented to a PIN the holder may already
+  have set.
 
 ## Organization cards
 
-Observed on a DVV O6 organization card (Idemia Cosmo X, see
+Observed on an Idemia Cosmo X organization card (see
 [supported cards](supported-cards.md)):
 
 - The card answers the citizen PIN reference with "reference data not
@@ -65,11 +89,21 @@ Observed on a DVV O6 organization card (Idemia Cosmo X, see
   so the counter fallback above applies.
 - The organization numbering, not the certificate date or issuer name,
   is what makes a card an organization card.
+- No FINEID S1 document for the Idemia Cosmo X is published: the DVV ATR
+  technology note names "FINEID S1 v5.0" for it, and the newest published
+  FINEID S1 is v4.2, for citizen cards. The card itself -- its EF.AOD and
+  the counter-safe probes -- is the authority for this card.
+- The published FINEID S1 v4.0 for organizational cards covers the Idemia
+  ID.me IDeal Citiz 2.17-i, not the Cosmo X. On those cards PACE
+  authenticates the holder with PIN 1 or PIN 2 instead of the CAN
+  (FINEID S1 v4.0, organizational cards, §2.1).
 
 ## PIN lengths
 
 The card's PKCS#15 EF.AOD (`4401`) gives each PIN's minimum and maximum
-length, and it is the authority: the O6 organization card's EF.AOD lists
-PIN 1 as 4–12 digits, where FINEID S4-2 v4.0 tables say 4–8. EF.AOD is
-read only where PINs are set (activation, change, reset); signing and
-login never need it.
+length, and it is the authority: the Idemia Cosmo X organization card's
+EF.AOD lists PIN 1 as 4–12 digits, where FINEID S4-2 v4.0 tables say
+4–8. The GET DATA PIN container also carries a PIN policy with the
+minimum and maximum length (each within 4–64) and the try limit
+(FINEID S1 v4.2 §3.15.3). Both are read only where PINs are set
+(activation, change, reset); signing and login never need them.

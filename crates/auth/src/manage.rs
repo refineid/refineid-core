@@ -446,7 +446,9 @@ pub trait PinManageOps: PinOps {
         self.probe_puk_status_with_scheme(scheme)
     }
 
-    /// Activate a card awaiting activation under `scheme`.
+    /// Activate a card awaiting activation under the scheme `code` was
+    /// validated for (see
+    /// [`crate::activation::ActivationScheme::from_numbering_and_validity_start`]).
     ///
     /// Under [`crate::activation::ActivationScheme::ActivationCodeIsPuk`]
     /// the activation code is presented as the PUK, so each unblock
@@ -460,7 +462,6 @@ pub trait PinManageOps: PinOps {
     /// transition.
     fn activate_card(
         &mut self,
-        scheme: crate::activation::ActivationScheme,
         code: crate::activation::ActivationCode,
         new_pin1: Option<Pin1>,
         new_pin2: Option<Pin2>,
@@ -468,6 +469,7 @@ pub trait PinManageOps: PinOps {
     where
         Self: Sized,
     {
+        let scheme = code.scheme();
         let ref_scheme = self.resolve_pin_reference_scheme()?;
         let needs = self.activation_needs(scheme)?;
         let mut report = crate::activation::ActivationReport {
@@ -528,12 +530,19 @@ pub trait PinManageOps: PinOps {
 
     /// Probe overall credential status and health summary for UI display.
     ///
+    /// The activation scheme is decided from the resolved numbering and
+    /// `auth_certificate_validity_start`, the authentication
+    /// certificate's notBefore in epoch seconds, `None` when it was not
+    /// read (see
+    /// [`crate::activation::ActivationScheme::from_numbering_and_validity_start`]).
+    /// Activation needs are read only when a scheme is decided.
+    ///
     /// # Errors
     ///
     /// [`AuthError`] on a transport failure or state transition.
     fn probe_credential_health(
         &mut self,
-        activation_scheme: Option<crate::activation::ActivationScheme>,
+        auth_certificate_validity_start: Option<i64>,
     ) -> Result<crate::activation::CredentialHealthReport, AuthError<Self::Error>>
     where
         Self: Sized,
@@ -542,6 +551,11 @@ pub trait PinManageOps: PinOps {
         let pin1_status = self.pin_status_with_scheme(ref_scheme, PinSlot::Pin1)?;
         let pin2_status = self.pin_status_with_scheme(ref_scheme, PinSlot::Pin2)?;
         let puk_status = self.probe_puk_status_with_scheme(ref_scheme)?;
+        let activation_scheme =
+            crate::activation::ActivationScheme::from_numbering_and_validity_start(
+                ref_scheme,
+                auth_certificate_validity_start,
+            );
         let activation_needs = match activation_scheme {
             Some(scheme) => Some(self.activation_needs(scheme)?),
             None => None,

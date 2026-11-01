@@ -27,7 +27,7 @@ applies one rule, `check_retry_floor` in `refineid-auth`:
   section 10.2).
 - **The PUK follows the same floor.** FINEID S1 v4.2 leaves the PUK's try
   limit to card personalization; RefineID presents the PUK -- to unblock
-  a PIN, or as the activation code on a card that ships with blocked
+  a PIN, or as the activation PIN on a card that ships with blocked
   PINs -- only at five, four or three PUK tries left; a PUK the card
   reports verified carries no count and is refused. A blocked PUK
   cannot be recovered, so a PUK refusal names no other credential. The

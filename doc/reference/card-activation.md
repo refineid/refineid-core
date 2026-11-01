@@ -10,11 +10,16 @@ FINEID S4-1 v4.2 §4.6 defines two procedures:
 
 | Scheme | Cards | Factory state | Activation |
 | --- | --- | --- | --- |
-| §4.6.1, activation code is the PUK | issued before 13 January 2026 | PIN 1 and PIN 2 blocked | RESET RETRY COUNTER with the 8-digit code (the PUK) for each PIN |
+| §4.6.1, activation PIN is the PUK | issued before 13 January 2026 | PIN 1 and PIN 2 blocked | RESET RETRY COUNTER with the 8-digit code (the PUK) for each PIN |
 | §4.6.2, preset activation PIN | issued from 13 January 2026 | PIN 1 and PIN 2 set to one 7-digit activation PIN | CHANGE REFERENCE DATA from the activation PIN for each PIN |
 
 The wrong digit count burns a try, and the wrong command is refused, so
 the scheme must be known before the form opens.
+
+Under both schemes the credential in the activation letter carries
+DVV's official name from the letters: "Activation PIN", Finnish
+"aktivointitunnusluku", Swedish "aktiveringskod". User-facing text uses
+these terms for either scheme.
 
 ## What decides the scheme
 
@@ -83,7 +88,7 @@ Observed on an Idemia Cosmo X organization card (see
   as an organization card. Its EF.TokenInfo label reads
   "Organisaatiokortti" (citizen cards: "HENKILOKORTTI").
 - Activation follows the §4.6.1 procedure under the organization
-  numbering: the 8-digit activation code from the letter is the PUK, and
+  numbering: the 8-digit activation PIN from the letter is the PUK, and
   RESET RETRY COUNTER sets PIN 1 and PIN 2. Both PINs ship blocked
   (`63C0`) and the PUK has 5 tries. The card does not support the
   FINEID S1 GET DATA PIN container: it answers `6A86` under every
@@ -140,7 +145,7 @@ carries: a listed maximum above 12 is taken as 12, and a listed minimum
 below the role type's minimum as that minimum. A card listing PIN 1 up
 to 8 digits takes 4–8; a card listing PIN 2 from 4 digits takes 4–12.
 The change, unblock and activation operations check every entry -- the
-current PIN, the PUK, the activation code in the role it is presented
+current PIN, the PUK, the activation PIN in the role it is presented
 as, and each new PIN -- against these lengths before any command.
 
 The Idemia Cosmo X organization card's EF.AOD lists PIN 1

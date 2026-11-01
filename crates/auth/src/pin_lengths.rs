@@ -1037,10 +1037,10 @@ mod tests {
         let lengths = narrow_lengths(PinReferenceScheme::Organizational);
         let code = |scheme: ActivationScheme| {
             ActivationCode::reconstruct(secret(scheme.activation_entry_digit_count()), scheme)
-                .expect("valid activation code")
+                .expect("valid activation PIN")
         };
         let mut card = SimulatedCard::new(PinReferenceScheme::Organizational, None);
-        // The 8-digit activation code stands in for a PUK the card lists
+        // The 8-digit activation PIN stands in for a PUK the card lists
         // from twelve digits.
         let refused = card.activate_card(
             &lengths,

@@ -32,6 +32,9 @@ completeness, not targeted. Observed hardware coverage is in the
 
 - ATR: `3B 7F 96 00 00 80 31 B8 65 B0 85 05 00 11 12 24 60 82 90 00`
 - ATS: `14 78 77 95 02 80 31 B8 65 B0 85 05 00 11 12 24 60 82 90 00`
+- Also observed: ATR `3B 7F 96 00 00 80 31 B8 65 B0 85 05 10 24 12 24 60 82 90 00`
+  on DVV H6 and H8 test cards. The platform does not decide the
+  activation scheme; see [card activation](card-activation.md).
 
 **Gemalto MultiApp v4.2**
 
@@ -59,6 +62,8 @@ completeness, not targeted. Observed hardware coverage is in the
 **Idemia Cosmo X**
 
 - ATR: `3B DD 96 00 80 31 FE 45 00 31 B8 64 04 29 EC C1 73 94 01 80 83 49`
+- Observed as the DVV O6 organization card; its activation is in
+  [card activation](card-activation.md).
 - ATS: `3B 89 80 01 00 31 B8 64 04 29 EC C1 73 94 01 80 83`
 
 **Idemia ID.me IDeal Citiz 2.17-i**

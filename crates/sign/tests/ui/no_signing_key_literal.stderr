@@ -1,0 +1,11 @@
+error[E0451]: fields `transport`, `scheme` and `key` of struct `SigningKey` are private
+ --> tests/ui/no_signing_key_literal.rs:6:9
+  |
+5 |     SigningKey {
+  |     ---------- in this type
+6 |         transport,
+  |         ^^^^^^^^^ private field
+7 |         scheme: SignScheme::Organizational,
+  |         ^^^^^^ private field
+8 |         key: KeyRef::Sign,
+  |         ^^^ private field

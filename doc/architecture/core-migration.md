@@ -192,7 +192,10 @@ The seventh slice admits organizational card support across
   DF.ESIGN reference, and the digest rides inline in a single PSO:CDS with
   no PSO:HASH step -- the shape the organizational card requires and the
   citizen card refuses, which is why the resolved numbering picks the
-  chain.
+  chain. The qualified key and PIN 2 are local to DF.ESIGN (FINEID S4-2
+  v4.0 section 4.2), so the qualified key exists only as the result of
+  `unlock_qualified_key`, which selects DF.ESIGN by name and verifies
+  PIN 2 there, and holds the transport until its one signature is made.
 
 PSO:COMPUTE DIGITAL SIGNATURE runs under the digital-signature template
 for the authentication key as well as the qualified-signature key,
@@ -204,8 +207,10 @@ country-neutral behaviour reference that is exercised against live
 organizational cards. The numbering resolution is observed on an Idemia
 Cosmo X organization card, which answers the citizen PIN 1 reference
 with "reference data not found" and the organizational references with
-their states; the organizational VERIFY and signing chains rest on the
-specification and the behaviour reference.
+their states. The organizational VERIFY, the authentication key's PSS
+chain and the qualified key's RSASSA-PKCS1-v1_5 chain are observed on the
+same card (see below); the organizational ECDSA chains rest on
+scripted-transport tests.
 
 The eighth slice admits PIN change and unblock in `refineid-auth`:
 
@@ -421,6 +426,19 @@ scripted tests could not: the card, being T=0, rejected the maximum-
 length Le with a wrong-length status for the short ECDSA response, so the
 signing chain now sends the exact short-form length as Le for a signature
 that fits it, and the maximum encoding only for the wider RSA response.
+
+The organizational chains have been exercised on an Idemia Cosmo X
+organization card over contact, through these crates, with every VERIFY
+framed by the counter-safe probe and run with the correct PIN. VERIFY
+PIN 1 and PIN 2 succeeded under the organizational references. The
+authentication key produced an inline-digest RSASSA-PSS SHA-256
+signature that verified against the authentication certificate. The
+qualified key answered `6A88` to PSO:CDS while the PKCS#15 application
+was the current DF; with DF.ESIGN selected by name, PIN 2 verified
+there and the DF.ESIGN-local key reference, it produced an inline-digest
+RSASSA-PKCS1-v1_5 SHA-256 signature that verified against the qualified
+certificate. `unlock_qualified_key` composes exactly that sequence; the
+composition itself is covered by scripted-transport tests.
 
 ## Quarantined until redesigned
 

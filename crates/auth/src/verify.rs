@@ -64,14 +64,14 @@ pub const PUK_REFERENCE_ORGANIZATIONAL: u8 = 0x12;
 /// VERIFY instruction byte (ISO 7816-4 section 7.5.6).
 pub const VERIFY_INS: u8 = 0x20;
 /// VERIFY P1 selecting the verify operation.
-pub(crate) const VERIFY_P1: u8 = 0x00;
+pub const VERIFY_P1: u8 = 0x00;
 
 /// FINEID stored length for both PIN slots: the padded block length in
 /// bytes (FINEID S1 v4.2 section 3.5).
 pub const PIN_STORED_LENGTH: usize = 12;
 /// Padding byte applied to the right of the typed digits; FINEID cards
 /// reject any other padding value.
-const PIN_PAD_BYTE: u8 = 0x00;
+pub const PIN_PAD_BYTE: u8 = 0x00;
 
 /// Which PIN slot a status probe targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

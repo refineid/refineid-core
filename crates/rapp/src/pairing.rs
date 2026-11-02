@@ -17,8 +17,18 @@ use super::{
 
 const X25519_KEY_SIZE: usize = 32;
 
-/// Format version for encoded pairing records.
-pub const PAIR_RECORD_FORMAT_VERSION: u64 = 8;
+/// Format of encoded pairing records, named by the RAPP version that last
+/// changed the record's layout: `[Year, Month, Day]`, stored as a
+/// three-element array like the wire version.
+pub const PAIR_RECORD_FORMAT_VERSION: (u16, u16, u16) = (26, 11, 2);
+
+fn pair_record_format_value() -> WireValue {
+    WireValue::Array(vec![
+        WireValue::Unsigned(u64::from(PAIR_RECORD_FORMAT_VERSION.0)),
+        WireValue::Unsigned(u64::from(PAIR_RECORD_FORMAT_VERSION.1)),
+        WireValue::Unsigned(u64::from(PAIR_RECORD_FORMAT_VERSION.2)),
+    ])
+}
 
 /// Active long-term pairing material.
 ///
@@ -555,10 +565,7 @@ fn encode_with_times(
         EndpointRole::Proxy => "proxy",
     };
     let mut value = Zeroizing::new(WireValue::Map(BTreeMap::from([
-        (
-            "format_version".to_owned(),
-            WireValue::Unsigned(PAIR_RECORD_FORMAT_VERSION),
-        ),
+        ("format_version".to_owned(), pair_record_format_value()),
         (
             "pair_id".to_owned(),
             WireValue::Bytes(record.pair_id().as_bytes().to_vec()),
@@ -659,7 +666,7 @@ pub fn decode_pair_record(encoded: &EncodedPairRecord) -> Result<PairRecord, Pai
     if map.keys().any(|key| !expected.contains(&key.as_str())) {
         return Err(PairRecordCodecError::InvalidInput);
     }
-    if take_unsigned(map, "format_version")? != PAIR_RECORD_FORMAT_VERSION {
+    if take_value(map, "format_version")? != pair_record_format_value() {
         return Err(PairRecordCodecError::UnsupportedVersion);
     }
     let pair_id = PairId::reconstruct(&take_bytes(map, "pair_id")?)
@@ -1188,6 +1195,29 @@ mod tests {
         let reread = EncodedPairRecord::from_stored(encoded.as_bytes().to_vec());
         let decoded = decode_pair_record(&reread).expect("decode succeeds");
         assert_eq!(decoded.pair_id(), test_record(0x42).pair_id());
+    }
+
+    #[test]
+    fn a_record_of_another_format_is_refused() {
+        let encoded = encode_pair_record(&test_record(0x42)).expect("encode succeeds");
+        let crate::WireValue::Map(mut map) =
+            crate::decode_deterministic_cbor(encoded.as_bytes()).expect("decodes")
+        else {
+            panic!("a pair record is a map");
+        };
+        let (year, month, _) = super::PAIR_RECORD_FORMAT_VERSION;
+        map.insert(
+            "format_version".to_owned(),
+            crate::WireValue::Array(vec![
+                crate::WireValue::Unsigned(u64::from(year)),
+                crate::WireValue::Unsigned(u64::from(month)),
+            ]),
+        );
+        let other = crate::encode_deterministic_cbor(&crate::WireValue::Map(map)).expect("encodes");
+        assert_eq!(
+            decode_pair_record(&EncodedPairRecord::from_stored(other)).err(),
+            Some(super::PairRecordCodecError::UnsupportedVersion)
+        );
     }
 
     #[test]

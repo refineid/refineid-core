@@ -1,5 +1,9 @@
 # Blameless postmortems
 
+Terms: RAPP is the protocol between a phone that holds the card (the
+custodian) and a computer that uses it remotely (the requester); STPA is
+System-Theoretic Process Analysis (see `doc/stpa.md`).
+
 Proven failures, written down so the next design does not repeat them.
 Each entry is blameless: it names what happened, how it showed in
 practice, the cause in the system or the design, and the rule that
@@ -18,10 +22,14 @@ in one session's memory is lost.
 - **Why:** the protocol had messages but no defined life cycle. The
   computer knew two cases, connected and lost, so an active teardown fell
   into "lost" and triggered reconnection.
-- **Rule:** every session end carries a reason, and the reasons are typed
-  so that reconnect logic cannot consume a deliberate end as a network
-  error. A peer that stops serving says so before closing the transport;
-  the other side accepts it at once and waits for the next announcement.
+- **Rule:** a graceful end and an abrupt loss are different events. A peer
+  that stops serving on purpose says so, with a typed reason, before
+  closing the transport; the other side accepts it at once, shows the peer
+  as unavailable and dials again only when the peer announces itself. An
+  abrupt loss (crash, killed app, lost radio field) gives no notice; it is
+  detected by a bounded timeout and is the only case that reconnects. The
+  reason types keep reconnect logic from consuming a deliberate end as a
+  network error.
 
 ### Define the whole state machine, both roles, every event
 
@@ -54,7 +62,10 @@ in one session's memory is lost.
   instead of replacing the first.
 - **Why:** the custodian had no rule that one computer has one pairing.
 - **Rule:** a peer's identity is its long-term key; a new pairing from the
-  same key replaces the old record. Display names are labels only.
+  same key replaces the old record. Display names are labels only. Where a
+  reinstall or re-pairing rotates the key, the protocol defines how the old
+  record is revoked or replaced; a key change must not leave two records
+  for one computer.
 
 ### A failed write must never be silent
 
@@ -62,24 +73,29 @@ in one session's memory is lost.
   word, and the user only learned it from the agent session.
 - **Why:** keychain and file write statuses were dropped or folded into a
   generic failure.
-- **Rule:** every persistent write returns its status to a place the user
-  sees; out-of-space has its own message. Keep a list of writes that have
-  no user-visible error place and treat that list as debt.
+- **Rule:** no write fails silently. A failed persistent write reaches the
+  user-visible error place of its operation, and out-of-space has its own
+  message; a write with no such place is recorded as debt until it has
+  one.
 
 ### Apply STPA to the life cycle, not only to the messages
 
-- **What we learned:** every bug above is a controller acting on a stale
-  process model (the other side's state). STPA finds these before
-  hardware does when the analysis covers the life cycle: who believes
-  what about the peer, and what feedback keeps that belief true.
+- **What we learned:** most bugs above are a controller acting on a stale
+  process model of the other side; the silent write is a missing feedback
+  path. An STPA that covers the life cycle (who believes what about the
+  peer, and which feedback keeps that belief true) points at these cells
+  before hardware does.
+- **Rule:** every lifecycle message and state in a protocol between two
+  parties is part of its STPA control structure, with its feedback named.
 
 ## Cards and transports
 
 ### Never decide by ATR bytes one transport omits
 
-- **What failed:** the iPhone reports the organisation card's answer to
-  reset as `3B 80 11 81 10`, without historical bytes, while PC/SC readers
-  include them. Code keyed the stored organisation identity on historical
+- **What failed:** a contactless card has no answer to reset of its own;
+  each transport builds one. A PC/SC reader's contactless ATR carries the
+  card's historical bytes, while the iPhone reports the organisation card
+  as `3B 80 11 81 10`, with none. Code keyed the stored organisation identity on historical
   bytes, and decided whether a PIN operation needs PACE by the ATR; both
   failed on the phone.
 - **Rule:** decide by the card's answers to commands (for example `6985`
@@ -92,8 +108,8 @@ in one session's memory is lost.
   `6985`, a select-by-name fallback made the iPhone's NFC slot report a
   malformed response and end the session before PACE.
 - **Rule:** after a card refuses before PACE, send only what PACE needs.
-  Every fallback is tested on every transport, the phone's NFC slot
-  included, before it ships.
+  Every fallback is tested on every transport we ship (PC/SC contact,
+  PC/SC contactless, iPhone NFC, Android NFC) before it ships.
 
 ### An aborted PACE with a PIN costs a try
 
@@ -121,12 +137,15 @@ in one session's memory is lost.
   counts as the PIN verified. A counter-safe probe (MSE:Set AT without a
   password) answered the first question without spending a try; one
   traced handshake answered the second.
+- **Rule:** where a specification is silent, a command that cannot change
+  card state may answer it; anything that can spend a try waits for the
+  owner's go and a recovery path (here a correct VERIFY on contact).
 
 ## Working method
 
 - **Parallel builds filled the disk twice.** Several agents building in
-  separate worktrees at once ran a 460 GB disk out of space and stopped
-  every tool. Run one heavy build per platform at a time and delete build
+  separate worktrees at once ran the disk out of space and stopped
+  every tool. Run one heavy build per machine at a time and delete build
   output of merged work.
 - **A test harness shares the card with the product.** Running the
   hardware harness on a slot while the token driver read it wedged the

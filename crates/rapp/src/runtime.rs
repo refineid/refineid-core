@@ -41,17 +41,29 @@ impl EstablishedSessionRuntime {
         self.endpoint.close_session();
     }
 
-    /// Seal an authenticated `session.close` carrying `reason`, then close
-    /// the session; the caller delivers the frame and drops the link.
+    /// Seal an authenticated `session.close` carrying `reason`; the caller
+    /// delivers the frame and waits for the peer's echo, which
+    /// [`Self::receive`] reports as [`RuntimeReceive::CloseAcknowledged`],
+    /// within its bound, then drops the link (RAPP v26.11.2 section 7.1
+    /// item 7). Liveness stops; nothing more is sent.
     ///
     /// # Errors
-    /// [`EndpointError`] when the session is already closed or the notice
-    /// cannot be sealed; the session is closed either way.
+    /// [`EndpointError`] when the session is already closed, its close was
+    /// sent, or the notice cannot be sealed; the session is then closed.
     pub fn close_with_reason(&mut self, reason: CloseReason) -> Result<BinaryFrame, EndpointError> {
         let notice = TypedMessage::SessionClose(SessionCloseMessage { reason });
         let sealed = self.endpoint.send(&notice);
-        self.close_session();
+        self.liveness.close();
+        if sealed.is_err() {
+            self.close_session();
+        }
         sealed
+    }
+
+    /// Whether this endpoint sent a close and waits for the peer's echo.
+    #[must_use]
+    pub const fn awaits_close_echo(&self) -> bool {
+        self.endpoint.awaits_close_echo()
     }
 
     /// Close after an operation engine found the peer's traffic violating
@@ -72,7 +84,7 @@ impl EstablishedSessionRuntime {
                 notice,
             },
             ReceiveOutcome::SessionClosed(outcome) => RuntimeReceive::SessionClosed(outcome),
-            ReceiveOutcome::Message(message) => RuntimeReceive::Message(message),
+            other => runtime_outcome(other),
         }
     }
 
@@ -107,26 +119,11 @@ impl EstablishedSessionRuntime {
                     PongDisposition::IgnoredUnmatched => RuntimeReceive::IgnoredStalePong,
                 })
             }
-            ReceiveOutcome::Message(TypedMessage::SessionClose(close)) => {
-                self.close_session();
-                Ok(RuntimeReceive::PeerClosed(close.reason))
-            }
             ReceiveOutcome::Message(message) => Ok(RuntimeReceive::Message(message)),
-            ReceiveOutcome::SessionClosed(outcome) => {
+            ReceiveOutcome::IgnoredWhileClosing => Ok(RuntimeReceive::IgnoredWhileClosing),
+            other => {
                 self.liveness.close();
-                Ok(RuntimeReceive::SessionClosed(outcome))
-            }
-            ReceiveOutcome::ViolationClosed {
-                violation,
-                outcome,
-                notice,
-            } => {
-                self.liveness.close();
-                Ok(RuntimeReceive::ViolationClosed {
-                    violation,
-                    outcome,
-                    notice,
-                })
+                Ok(runtime_outcome(other))
             }
         }
     }
@@ -154,6 +151,28 @@ impl EstablishedSessionRuntime {
     }
 }
 
+/// The runtime form of an endpoint outcome that carries no liveness.
+fn runtime_outcome(outcome: ReceiveOutcome) -> RuntimeReceive {
+    match outcome {
+        ReceiveOutcome::Message(message) => RuntimeReceive::Message(message),
+        ReceiveOutcome::PeerClosed { reason, echo } => RuntimeReceive::PeerClosed { reason, echo },
+        ReceiveOutcome::CloseAcknowledged { reason, crossing } => {
+            RuntimeReceive::CloseAcknowledged { reason, crossing }
+        }
+        ReceiveOutcome::IgnoredWhileClosing => RuntimeReceive::IgnoredWhileClosing,
+        ReceiveOutcome::SessionClosed(outcome) => RuntimeReceive::SessionClosed(outcome),
+        ReceiveOutcome::ViolationClosed {
+            violation,
+            outcome,
+            notice,
+        } => RuntimeReceive::ViolationClosed {
+            violation,
+            outcome,
+            notice,
+        },
+    }
+}
+
 /// Where a runtime fault occurred.
 #[derive(Debug)]
 pub enum RuntimeError {
@@ -176,10 +195,30 @@ pub enum RuntimeReceive {
     IgnoredStalePong,
     /// A frame failed authentication; the session closed.
     SessionClosed(SecurityOutcome),
-    /// The peer closed the session with an authenticated notice.
-    PeerClosed(CloseReason),
-    /// Authenticated traffic violated the protocol; the session closed and
-    /// the pairing stays. Deliver `notice`, then drop the link.
+    /// The peer closed the session with an authenticated notice; deliver
+    /// `echo`, the close that acknowledges it, when it could be sealed, then
+    /// drop the link (RAPP v26.11.2 section 7.1 item 7).
+    PeerClosed {
+        /// The received reason.
+        reason: CloseReason,
+        /// The sealed echo.
+        echo: Option<BinaryFrame>,
+    },
+    /// The echo of this endpoint's close arrived, or, with `crossing`, a
+    /// close with another reason that crossed it; the session closed. Act
+    /// on a crossing reason; drop the link.
+    CloseAcknowledged {
+        /// The received reason.
+        reason: CloseReason,
+        /// The received reason differs from the one this endpoint sent.
+        crossing: bool,
+    },
+    /// A message arrived while this endpoint waits for the echo of its
+    /// close; it is ignored.
+    IgnoredWhileClosing,
+    /// Authenticated traffic violated the protocol; the session closes and
+    /// the pairing stays. Deliver `notice`, wait for its echo, then drop the
+    /// link.
     ViolationClosed {
         /// The violation.
         violation: AuthenticatedViolation,

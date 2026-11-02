@@ -42,6 +42,17 @@ pub const MINIMUM_REMAINING_ATTEMPTS: u8 = 3;
 /// session open or the card reported absent (RAPP v26.11.2 section 8.4
 /// item 3).
 pub const IDENTITY_OFFER_GRACE_MS: u64 = 120_000;
+/// How long a requester redials on its own back-off after a loss of the
+/// session, or after a dial that ended before `session.ready`, counted from
+/// the loss or from the first failed dial since the custodian last appeared
+/// (RAPP v26.11.2 section 8.3 item 3). It equals
+/// [`IDENTITY_OFFER_GRACE_MS`].
+pub const REDIAL_WINDOW_MS: u64 = IDENTITY_OFFER_GRACE_MS;
+/// How long a requester keeps a pairing its user forgot with no session
+/// open: within this bound it opens at most one connection to deliver the
+/// `pairing_revoked` close, then destroys the key (RAPP v26.11.2 section
+/// 4.6 item 6).
+pub const REVOCATION_ATTEMPT_BOUND_MS: u64 = 10_000;
 /// How long a requester that quits waits for its `service_withdrawn` closes
 /// to leave before it exits (RAPP v26.11.2 section 4.5 item 8), and one
 /// whose holder turned remote use off waits for its `pairing_revoked` closes

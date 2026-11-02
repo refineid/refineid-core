@@ -289,11 +289,11 @@ fn a_withdrawn_custodian_is_dialed_only_after_it_announces_itself() {
             }
         }
         assert!(
-            !rule.actions.iter().any(|action| matches!(
-                action.as_str(),
-                "schedule_redial" | "start_presence_hold" | "start_offer_grace"
-            )),
-            "withdrawn redials, holds or offers"
+            !rule
+                .actions
+                .iter()
+                .any(|action| matches!(action.as_str(), "schedule_redial" | "start_offer_grace")),
+            "withdrawn redials or offers"
         );
     }
 }

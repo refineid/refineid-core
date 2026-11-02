@@ -194,8 +194,8 @@ Notes:
   `switched_on` exactly while `no_remote_card_presented` holds, that is while
   no identity is offered, a running grace included.
 - **Off is forget.** `holder_turns_off` raises `forget_pairing` for the held
-  pairing. With a session open the close goes out at once, within
-  `quit_withdrawal_bound_ms`; with none, the pairing goes to `revoking` and
+  pairing. With a session open the close goes out at once and the
+  requester waits at most `quit_withdrawal_bound_ms` for its echo; with none, the pairing goes to `revoking` and
   makes one attempt of at most `revocation_attempt_bound_ms` (10 000 ms) to
   reach the custodian and send the close as the first message of a session
   (section 8, RAPP §4.6 item 6). Every forget the user starts makes this
@@ -517,9 +517,9 @@ The `pairing` machine. Two of its paths matter most for the lifecycle:
   close at once and destroys the key. From `paired_disconnected` it goes to
   `revoking` on both endpoints. A custodian keeps the key for the close for at
   most `revocation_notice_days` (`notice_window_expired`); a requester keeps
-  it only for its one attempt: `revocation_notice_sent` when the close left,
-  or `revocation_attempt_ended` when `revocation_attempt_bound_ms` passed
-  (X-09, INV-18).
+  it only for its one attempt: `revocation_notice_sent` when the custodian
+  echoed the close, or `revocation_attempt_ended` when
+  `revocation_attempt_bound_ms` passed (X-09, X-12, INV-18).
 - **Idle expiry by role.** On a custodian `idle_expired` goes to `revoking`,
   and the close goes out on the next session within the notice window. On a
   requester it goes straight to `revoked`: the record is marked revoked, the
@@ -574,6 +574,18 @@ and runs `record_peer_display_name`. No `operation.request` is admitted before
 `session.hello`, and any other first message from the requester but a
 revocation close is a protocol violation (X-11).
 
+Every close is acknowledged (RAPP §7.1 item 7, X-12): an endpoint that
+receives an authenticated `session.close`, whatever its reason, answers with a
+`session.close` carrying the same reason (`echo_peer_close`) and closes the
+transport. An endpoint that sent a close waits in `closing` for that echo,
+sends nothing more and ignores every other message; a close arriving then is
+the echo, or a close that crossed its own, and is never answered. The wait is
+at most `quit_withdrawal_bound_ms`, or, in a requester's revocation attempt,
+the rest of `revocation_attempt_bound_ms`. The echo is the evidence that the
+peer acted on the close, such as forgetting the pairing; without it the close
+is not known to have been delivered, and idle expiry and the loss handling
+apply as before (UCA-124, CC-123).
+
 <!-- figure: session -->
 ```
  +--------+ connect  +------------+ transport up +----------------+ ready  +---------+
@@ -591,6 +603,9 @@ revocation close is a protocol violation (X-11).
 ```
 
 ### 9.2 What a received close does
+
+Each received close below is answered with its echo before the transport
+closes.
 
 | Reason received | Requester: view of the custodian | Requester: pairing | Custodian: pairing and list |
 | :--- | :--- | :--- | :--- |
@@ -616,6 +631,7 @@ revocation close is a protocol violation (X-11).
 | X-09 | a requester's pairing enters `revoking` | at most one dial within `revocation_attempt_bound_ms`, then `revocation_notice_sent` or `revocation_attempt_ended` |
 | X-10 | a requester's pairing becomes active | every other pairing it holds receives `forget_pairing` |
 | X-11 | a custodian's session is `healthy` | no `operation.request` is admitted before `session.hello`, and any other first message but a revocation close is a protocol violation |
+| X-12 | an endpoint receives an authenticated `session.close` | it answers with a `session.close` carrying the same reason and closes the transport, unless it waits for the echo of its own close, which the received close then is |
 
 ### 9.4 Lifecycle invariants
 
@@ -680,4 +696,5 @@ endpoint finds, matches, replaces or revokes a pairing by its name (INV-19).
 
 The STPA of these machines is section 36 of the
 [RAPP STPA record](../security/stpa-rapp.md), with unsafe control
-actions UCA-110 to UCA-122 and controller constraints CC-113 to CC-121.
+actions UCA-110 to UCA-122 and UCA-124, and controller constraints CC-113
+to CC-121 and CC-123.

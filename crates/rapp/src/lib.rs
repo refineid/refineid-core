@@ -22,12 +22,14 @@
 #[cfg(feature = "bindings")]
 uniffi::setup_scaffolding!();
 
+mod announcement;
 mod authorization;
 #[cfg(feature = "bindings")]
 pub mod bindings;
 pub mod ble_sar;
 pub mod cpace;
 mod crypto;
+mod display_name;
 mod endpoint;
 mod liveness;
 mod message;
@@ -46,6 +48,7 @@ mod requester_engine;
 mod result;
 mod routing;
 mod runtime;
+mod session_end;
 mod session_flow;
 mod state;
 mod stream;
@@ -55,6 +58,9 @@ mod types;
 mod wire;
 mod withdrawal;
 
+pub use announcement::{
+    CardAnnouncement, INSTANCE_NAME_PREFIX, INSTANCE_NAME_RANDOM_SIZE, fresh_instance_name,
+};
 pub use authorization::{
     AuthorizationError, AuthorizationStage, AuthorizationTransaction, AuthorizedCardCommand,
     AuthorizedSafeRead, OperationProgressMessage, PendingCardCommand, PrerequisitesOutcome,
@@ -76,6 +82,7 @@ pub use crypto::{
     PairingHandshakeParameters, SecureChannel, SessionHandshakeParameters, compute_grants_hash,
     derive_pair_id, derive_session_id, generate_pair_key_material,
 };
+pub use display_name::{DISPLAY_NAME_MAX_BYTES, DisplayName, DisplayNameError};
 pub use endpoint::{
     AuthenticatedViolation, EndpointError, EstablishedEndpoint, OperationViolation, ReceiveOutcome,
 };
@@ -86,8 +93,8 @@ pub use liveness::{
 pub use message::{
     CardPresence, CardReader, CardStatusMessage, LivenessMessage, MessageError,
     NegotiatedParameters, PairingAbortMessage, PairingConfirmMessage, PairingHelloMessage,
-    PairingStoredMessage, ProtocolErrorMessage, SessionCloseMessage, SessionParameters,
-    SessionReadyMessage, TypedMessage,
+    PairingStoredMessage, ProtocolErrorMessage, SessionCloseMessage, SessionHelloMessage,
+    SessionParameters, SessionReadyMessage, TypedMessage,
 };
 pub use offer::{
     BootstrapAnswer, MAX_OFFER_SIZE, PAIRING_BUSY_RETRY_AFTER_MAX_MS,
@@ -105,8 +112,8 @@ pub(crate) use pair_keys::{derive_pair_key, mac as pair_key_mac};
 pub use pairing::{
     EncodedPairRecord, PAIR_RECORD_FORMAT_VERSION, PAIRING_IDLE_EXPIRY_DAYS,
     PAIRING_IDLE_EXPIRY_MS, PairRecord, PairRecordCodecError, PairRecordError,
-    REVOCATION_NOTICE_DAYS, REVOCATION_NOTICE_MS, SweepError, SweepOutcome, decode_pair_record,
-    encode_pair_record,
+    REVOCATION_NOTICE_DAYS, REVOCATION_NOTICE_MS, RecordStoreError, SweepOutcome,
+    decode_pair_record, encode_pair_record,
 };
 pub use pairing_attempts::{
     CPACE_ATTEMPT_WINDOW_MS, CpaceAttemptSlot, POST_PAKE_CONFIRMATION_MS, POST_PAKE_HANDSHAKE_MS,
@@ -134,8 +141,10 @@ pub use routing::{
     SESSION_ROUTING_SIZE, SessionRouting, discovery_epoch, route_session,
 };
 pub use runtime::{EstablishedSessionRuntime, RuntimeError, RuntimePoll, RuntimeReceive};
+pub use session_end::RequesterSessionEnd;
 pub use session_flow::{
-    ExplicitUserIntent, ReadyOutcome, SessionAuthentication, SessionError, SessionHandshake,
+    CloseEcho, ExplicitUserIntent, ReadyOutcome, SessionAuthentication, SessionError,
+    SessionHandshake,
 };
 pub use state::{
     Action, EndpointRole, Guards, OperationEvent, OperationState, PairingEvent, PairingState,
@@ -153,8 +162,9 @@ pub use types::{
     MANDATORY_PAIRING_SUITE, MANDATORY_SESSION_SUITE, MAX_ACTIVE_OPERATIONS, MAX_FRAME_PLAINTEXT,
     MAX_FRAME_SIZE, MINIMUM_REMAINING_ATTEMPTS, NOISE_TAG_SIZE, OFFER_ID_SIZE, OFFER_TTL_MS,
     OPERATION_ID_SIZE, OfferId, OperationId, PAIR_ID_SIZE, PAIRING_SECRET_SIZE, PairId,
-    PairingSecret, ProfileName, QUIT_WITHDRAWAL_BOUND_MS, SESSION_ID_SIZE,
-    SESSION_READY_NONCE_SIZE, SessionId, WIRE_VERSION_V26_11_2, X25519_KEY_SIZE,
+    PairingSecret, ProfileName, QUIT_WITHDRAWAL_BOUND_MS, REDIAL_WINDOW_MS,
+    REVOCATION_ATTEMPT_BOUND_MS, SESSION_ID_SIZE, SESSION_READY_NONCE_SIZE, SessionId,
+    WIRE_VERSION_V26_11_2, X25519_KEY_SIZE,
 };
 pub use wire::{
     Envelope, MessageType, SequenceGuard, WireError, WireValue, decode_deterministic_cbor,

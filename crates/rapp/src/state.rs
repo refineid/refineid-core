@@ -431,6 +431,9 @@ pub enum Action {
     SendLivenessPing,
     /// Keep the received close reason for the user.
     RecordPeerCloseReason,
+    /// Answer the received session.close with a session.close carrying the
+    /// same reason, the echo that acknowledges it (section 7.1 item 7).
+    EchoPeerClose,
     /// Send session.close with reason user_disconnect.
     SendCloseUserDisconnect,
     /// Send session.close with reason normal.
@@ -955,18 +958,18 @@ impl SessionState {
                 },
             },
             (Self::Authenticating, E::HandshakeCompleteWhileRevoking) => Transition {
-                state: Self::Closed,
-                actions: &[
-                    A::DeriveSessionIdentifiers,
-                    A::SendClosePairingRevoked,
-                    A::DestroySessionMaterial,
-                ],
+                state: Self::Closing,
+                actions: &[A::DeriveSessionIdentifiers, A::SendClosePairingRevoked],
             },
             (Self::Authenticating, E::PeerCloseReceived) => {
                 require_role(role, EndpointRole::Requester)?;
                 Transition {
                     state: Self::Closed,
-                    actions: &[A::RecordPeerCloseReason, A::DestroySessionMaterial],
+                    actions: &[
+                        A::RecordPeerCloseReason,
+                        A::EchoPeerClose,
+                        A::DestroySessionMaterial,
+                    ],
                 }
             }
             (Self::Authenticating, E::ReadyVerified) => {
@@ -1041,7 +1044,11 @@ impl SessionState {
             }
             (Self::Healthy, E::PeerCloseReceived) => Transition {
                 state: Self::Closing,
-                actions: &[A::RecordPeerCloseReason, A::ShowDisconnecting],
+                actions: &[
+                    A::RecordPeerCloseReason,
+                    A::EchoPeerClose,
+                    A::ShowDisconnecting,
+                ],
             },
             (Self::Healthy, E::TransportFailed) => Transition {
                 state: Self::Closing,
@@ -1076,8 +1083,13 @@ impl SessionState {
                 ],
             },
             (Self::Closing, E::PeerCloseReceived) => Transition {
-                state: Self::Closing,
-                actions: &[],
+                state: Self::Closed,
+                actions: &[
+                    A::RecordPeerCloseReason,
+                    A::DestroySessionMaterial,
+                    A::DestroyCredentialBuffers,
+                    A::ShowConnectionStopped,
+                ],
             },
             (Self::Closing, E::TransportFailed) => Transition {
                 state: Self::Closing,

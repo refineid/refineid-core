@@ -15,16 +15,28 @@
 //! End-to-end cryptographic interoperability through the public RAPP API.
 
 use refineid_rapp::{
-    AuthenticatedViolation, BinaryFrame, BootstrapAnswer, CardOperation, CloseReason,
-    CpaceKc2Initiator, CpaceKc2Responder, EndpointError, EndpointRole, EstablishedEndpoint,
-    EstablishedSessionRuntime, ExplicitUserIntent, HandshakeChannel, HandshakeRole, MessageType,
-    OfferId, OperationId, OperationRequest, PairRecord, PairingCode, PairingHandshake,
-    PairingOffer, PairingSecret, PairingState, ProfileName, RappState, ReadyOutcome,
-    ReceiveOutcome, RuntimeReceive, SecureChannel, SessionAuthentication, SessionCloseMessage,
-    SessionError, SessionHandshake, SessionHandshakeParameters, SessionParameters,
-    SessionReadyMessage, SessionState, TransportProfile, TypedMessage, compute_grants_hash,
-    encode_kc2_step1_frame, generate_pair_key_material, standard_pairing_context_v2,
+    AuthenticatedViolation, BinaryFrame, BootstrapAnswer, CardOperation, CloseEcho, CloseReason,
+    CpaceKc2Initiator, CpaceKc2Responder, DisplayName, EndpointError, EndpointRole,
+    EstablishedEndpoint, EstablishedSessionRuntime, ExplicitUserIntent, HandshakeChannel,
+    HandshakeRole, MessageType, OfferId, OperationId, OperationRequest, PairRecord, PairingCode,
+    PairingHandshake, PairingOffer, PairingSecret, PairingState, ProfileName, RappState,
+    ReadyOutcome, ReceiveOutcome, RuntimeReceive, SecureChannel, SessionAuthentication,
+    SessionCloseMessage, SessionError, SessionHandshake, SessionHandshakeParameters,
+    SessionHelloMessage, SessionParameters, SessionReadyMessage, SessionState, TransportProfile,
+    TypedMessage, compute_grants_hash, encode_kc2_step1_frame, generate_pair_key_material,
+    standard_pairing_context_v2,
 };
+
+/// The name the requester sends for itself.
+const REQUESTER_NAME: &str = "macOS - example-host";
+/// The name the custodian sends for itself.
+const CUSTODIAN_NAME: &str = "iPhone 16";
+/// The custodian's name after its holder renamed the phone.
+const RENAMED_CUSTODIAN: &str = "Kitchen iPhone";
+
+fn name(text: &str) -> DisplayName {
+    DisplayName::parse(text.to_owned()).expect("a valid name")
+}
 
 #[allow(
     clippy::too_many_lines,
@@ -91,13 +103,13 @@ fn paired_records() -> (PairRecord, PairRecord) {
     assert_eq!(requester.pair_id(), proxy.pair_id());
 
     let requester_hello = requester
-        .send_hello("Requester".into(), "macOS".into())
+        .send_hello(name(REQUESTER_NAME), "macOS".into())
         .expect("requester hello seals");
     proxy
         .receive_hello(&requester_hello, 100)
         .expect("proxy verifies requester hello");
     let proxy_hello = proxy
-        .send_hello("Authorization proxy".into(), "iOS".into())
+        .send_hello(name(CUSTODIAN_NAME), "iOS".into())
         .expect("proxy hello seals");
     requester
         .receive_hello(&proxy_hello, 100)
@@ -152,6 +164,8 @@ fn paired_records() -> (PairRecord, PairRecord) {
     assert!(requester_record.is_storage_confirmed());
     assert!(proxy_record.is_storage_confirmed());
     assert_eq!(requester_record.pair_id(), proxy_record.pair_id());
+    assert_eq!(requester_record.peer_display_name(), &name(CUSTODIAN_NAME));
+    assert_eq!(proxy_record.peer_display_name(), &name(REQUESTER_NAME));
     assert_eq!(requester_record.grants_hash(), proxy_record.grants_hash());
     assert_eq!(requester_record.profiles(), proxy_record.profiles());
     assert_eq!(
@@ -279,25 +293,48 @@ fn pairing_and_fresh_session_interoperate_end_to_end() {
     let (mut requester, mut proxy) = authenticating_sessions(&requester_record, &proxy_record);
 
     assert!(matches!(
-        requester.send_ready(ready_nonce()),
+        requester.send_ready(ready_nonce(), &name(REQUESTER_NAME)),
+        Err(SessionError::RoleViolation)
+    ));
+    assert!(matches!(
+        proxy.send_hello(&name(CUSTODIAN_NAME)),
         Err(SessionError::RoleViolation)
     ));
     let proxy_ready = proxy
-        .send_ready(ready_nonce())
+        .send_ready(ready_nonce(), &name(RENAMED_CUSTODIAN))
         .expect("custodian session.ready seals");
+    match requester
+        .receive_ready(&proxy_ready, READY_AT_MS)
+        .expect("requester reads the custodian's first message")
+    {
+        ReadyOutcome::Verified { custodian_name } => {
+            assert_eq!(custodian_name, name(RENAMED_CUSTODIAN));
+        }
+        other => panic!("session.ready was not verified: {other:?}"),
+    }
+    let hello = requester
+        .send_hello(&name(REQUESTER_NAME))
+        .expect("requester session.hello seals");
     assert!(matches!(
-        requester
-            .receive_ready(&proxy_ready, READY_AT_MS)
-            .expect("requester reads the custodian's first message"),
-        ReadyOutcome::Verified
+        requester.send_hello(&name(REQUESTER_NAME)),
+        Err(SessionError::DuplicateHello)
     ));
 
     let mut requester = requester
         .into_established()
-        .expect("requester becomes healthy once it verified ready");
+        .expect("requester becomes healthy once it verified ready and sent its hello");
     let mut proxy = proxy
         .into_established()
         .expect("custodian becomes healthy once it sent ready");
+    match proxy
+        .receive(&hello, READY_AT_MS)
+        .expect("custodian reads the hello")
+    {
+        ReceiveOutcome::Message(TypedMessage::SessionHello(received)) => {
+            assert_eq!(received.display_name, name(REQUESTER_NAME));
+        }
+        other => panic!("the hello was not admitted: {other:?}"),
+    }
     assert!(requester.state().operation_admission_permitted());
     assert!(proxy.state().operation_admission_permitted());
 
@@ -337,6 +374,7 @@ fn pairing_and_fresh_session_interoperate_end_to_end() {
             grants_hash: requester_record.grants_hash(),
         },
         nonce: [0x71; 32],
+        display_name: name(CUSTODIAN_NAME),
     });
     assert!(matches!(
         requester.send(&wrong_phase),
@@ -355,6 +393,7 @@ fn an_authenticated_wrong_phase_message_closes_the_session_and_keeps_the_pairing
             grants_hash,
         },
         nonce: [0x82; 32],
+        display_name: name(CUSTODIAN_NAME),
     });
     let frame = sender
         .seal(
@@ -387,8 +426,16 @@ fn an_authenticated_wrong_phase_message_closes_the_session_and_keeps_the_pairing
     );
     assert_eq!(receiver.state().pairing, PairingState::PairedConnected);
     assert_eq!(receiver.state().session, SessionState::Closing);
+    assert!(
+        receiver.awaits_close_echo(),
+        "the violation close awaits its echo"
+    );
     assert!(matches!(
         receiver.receive(&frame, 10_001),
+        Ok(ReceiveOutcome::SessionClosed(_))
+    ));
+    assert!(matches!(
+        receiver.receive(&frame, 10_002),
         Err(EndpointError::SessionClosed)
     ));
 }
@@ -396,8 +443,30 @@ fn an_authenticated_wrong_phase_message_closes_the_session_and_keeps_the_pairing
 /// Monotonic instant the sessions start at.
 const SESSION_START_MS: u64 = 1_000;
 
+/// The requester's `session.hello`, sealed on its raw channel and read by
+/// the custodian, as every session starts (RAPP section 7.1 item 6).
+fn greet(requester: &mut SecureChannel, proxy: &mut EstablishedEndpoint) {
+    let hello = TypedMessage::SessionHello(SessionHelloMessage {
+        display_name: name(REQUESTER_NAME),
+    });
+    let frame = requester
+        .seal(
+            hello.message_type(),
+            hello.to_wire_body().expect("session.hello encodes"),
+        )
+        .expect("session.hello seals");
+    assert!(matches!(
+        proxy
+            .receive(&frame, SESSION_START_MS)
+            .expect("hello opens"),
+        ReceiveOutcome::Message(TypedMessage::SessionHello(_))
+    ));
+}
+
 fn established_runtimes() -> (EstablishedSessionRuntime, EstablishedSessionRuntime) {
-    let (pair_id, requester, proxy, _) = raw_established_channels();
+    let (pair_id, mut requester, proxy, _) = raw_established_channels();
+    let mut proxy = healthy_proxy(pair_id, proxy);
+    greet(&mut requester, &mut proxy);
     let requester = EstablishedEndpoint::new(
         pair_id,
         requester,
@@ -409,51 +478,144 @@ fn established_runtimes() -> (EstablishedSessionRuntime, EstablishedSessionRunti
     );
     (
         EstablishedSessionRuntime::new(requester, SESSION_START_MS),
-        EstablishedSessionRuntime::new(healthy_proxy(pair_id, proxy), SESSION_START_MS),
+        EstablishedSessionRuntime::new(proxy, SESSION_START_MS),
     )
 }
 
-#[test]
-fn custodian_withdrawal_close_reaches_the_requester_with_its_reason() {
-    let (mut requester, mut proxy) = established_runtimes();
-    let frame = proxy
-        .close_with_reason(CloseReason::ServiceWithdrawn)
+/// `sender` closes with `reason`; `receiver` answers with the echo, which
+/// `sender` reads as the acknowledgement of its close (RAPP section 7.1
+/// item 7).
+fn close_is_acknowledged(
+    sender: &mut EstablishedSessionRuntime,
+    receiver: &mut EstablishedSessionRuntime,
+    reason: CloseReason,
+) {
+    let frame = sender
+        .close_with_reason(reason)
         .expect("close notice seals");
+    assert!(sender.awaits_close_echo());
+    let echo = match receiver
+        .receive(&frame, SESSION_START_MS)
+        .expect("close notice opens")
+    {
+        RuntimeReceive::PeerClosed {
+            reason: received,
+            echo: Some(echo),
+        } if received == reason => echo,
+        other => panic!("{reason:?} was not answered with its echo: {other:?}"),
+    };
     assert!(matches!(
-        requester
-            .receive(&frame, SESSION_START_MS)
-            .expect("close notice opens"),
-        RuntimeReceive::PeerClosed(CloseReason::ServiceWithdrawn)
+        sender.receive(&echo, SESSION_START_MS).expect("the echo opens"),
+        RuntimeReceive::CloseAcknowledged {
+            reason: acknowledged,
+            crossing: false,
+        } if acknowledged == reason
     ));
+    assert!(!sender.awaits_close_echo());
+}
+
+#[test]
+fn custodian_withdrawal_close_reaches_the_requester_and_is_echoed() {
+    let (mut requester, mut proxy) = established_runtimes();
+    close_is_acknowledged(&mut proxy, &mut requester, CloseReason::ServiceWithdrawn);
     assert!(proxy.close_with_reason(CloseReason::Normal).is_err());
 }
 
 #[test]
-fn requester_withdrawal_close_reaches_the_custodian_with_its_reason() {
+fn requester_withdrawal_close_reaches_the_custodian_and_is_echoed() {
     let (mut requester, mut proxy) = established_runtimes();
-    let frame = requester
-        .close_with_reason(CloseReason::ServiceWithdrawn)
-        .expect("close notice seals");
-    assert!(matches!(
-        proxy
-            .receive(&frame, SESSION_START_MS)
-            .expect("close notice opens"),
-        RuntimeReceive::PeerClosed(CloseReason::ServiceWithdrawn)
-    ));
+    close_is_acknowledged(&mut requester, &mut proxy, CloseReason::ServiceWithdrawn);
     assert!(requester.close_with_reason(CloseReason::Normal).is_err());
 }
 
 #[test]
-fn a_revocation_notice_is_a_session_only_message() {
+fn a_revocation_notice_is_echoed() {
     let (mut requester, mut proxy) = established_runtimes();
-    let frame = requester
+    close_is_acknowledged(&mut requester, &mut proxy, CloseReason::PairingRevoked);
+}
+
+#[test]
+fn every_close_reason_is_echoed_and_the_echo_is_never_answered() {
+    for reason in [
+        CloseReason::Normal,
+        CloseReason::Complete,
+        CloseReason::UserDisconnect,
+        CloseReason::Policy,
+        CloseReason::ProtocolViolation,
+        CloseReason::PairingRevoked,
+        CloseReason::Shutdown,
+        CloseReason::CardUnavailable,
+        CloseReason::ServiceWithdrawn,
+    ] {
+        let (mut requester, mut proxy) = established_runtimes();
+        close_is_acknowledged(&mut proxy, &mut requester, reason);
+        assert!(
+            proxy.close_with_reason(reason).is_err(),
+            "nothing more is sent once the echo arrived"
+        );
+    }
+}
+
+#[test]
+fn closes_that_cross_acknowledge_each_other() {
+    let (mut requester, mut proxy) = established_runtimes();
+    let from_requester = requester
+        .close_with_reason(CloseReason::ServiceWithdrawn)
+        .expect("requester close seals");
+    let from_proxy = proxy
         .close_with_reason(CloseReason::PairingRevoked)
-        .expect("close notice seals");
+        .expect("custodian close seals");
+    assert!(matches!(
+        requester
+            .receive(&from_proxy, SESSION_START_MS)
+            .expect("opens"),
+        RuntimeReceive::CloseAcknowledged {
+            reason: CloseReason::PairingRevoked,
+            crossing: true,
+        }
+    ));
     assert!(matches!(
         proxy
-            .receive(&frame, SESSION_START_MS)
-            .expect("close notice opens"),
-        RuntimeReceive::PeerClosed(CloseReason::PairingRevoked)
+            .receive(&from_requester, SESSION_START_MS)
+            .expect("opens"),
+        RuntimeReceive::CloseAcknowledged {
+            reason: CloseReason::ServiceWithdrawn,
+            crossing: true,
+        }
+    ));
+}
+
+#[test]
+fn a_closing_endpoint_ignores_everything_but_the_echo() {
+    let (mut requester, mut proxy) = established_runtimes();
+    let close = requester
+        .close_with_reason(CloseReason::ServiceWithdrawn)
+        .expect("requester close seals");
+    let status = proxy
+        .endpoint_mut()
+        .send(&TypedMessage::CardStatus(
+            refineid_rapp::CardStatusMessage {
+                card: refineid_rapp::CardPresence::Absent,
+                reader: refineid_rapp::CardReader::Absent,
+            },
+        ))
+        .expect("card status seals");
+    assert!(matches!(
+        requester.receive(&status, SESSION_START_MS).expect("opens"),
+        RuntimeReceive::IgnoredWhileClosing
+    ));
+    let RuntimeReceive::PeerClosed {
+        echo: Some(echo), ..
+    } = proxy.receive(&close, SESSION_START_MS).expect("opens")
+    else {
+        panic!("the close was not echoed");
+    };
+    assert!(matches!(
+        requester.receive(&echo, SESSION_START_MS).expect("opens"),
+        RuntimeReceive::CloseAcknowledged {
+            reason: CloseReason::ServiceWithdrawn,
+            crossing: false,
+        }
     ));
 }
 
@@ -464,28 +626,41 @@ fn a_revoking_custodian_sends_the_close_in_place_of_ready() {
     let notice = proxy
         .send_revocation_notice()
         .expect("the close is the custodian's first message");
-    assert!(matches!(
-        requester
-            .receive_ready(&notice, READY_AT_MS)
-            .expect("requester reads the custodian's first message"),
-        ReadyOutcome::PeerClosed(CloseReason::PairingRevoked)
-    ));
+    let echo = match requester
+        .receive_ready(&notice, READY_AT_MS)
+        .expect("requester reads the custodian's first message")
+    {
+        ReadyOutcome::PeerClosed {
+            reason: CloseReason::PairingRevoked,
+            echo: Some(echo),
+        } => echo,
+        other => panic!("the revocation close was not echoed: {other:?}"),
+    };
     assert!(matches!(
         requester.into_established(),
         Err(SessionError::ReadyIncomplete)
     ));
     assert!(matches!(
-        proxy.send_ready(ready_nonce()),
+        proxy.send_ready(ready_nonce(), &name(CUSTODIAN_NAME)),
         Err(SessionError::Closed)
     ));
+    assert_eq!(
+        proxy
+            .receive_close_echo(&echo, READY_AT_MS)
+            .expect("the custodian reads the echo"),
+        CloseEcho::Acknowledged {
+            reason: CloseReason::PairingRevoked,
+            crossing: false,
+        }
+    );
 }
 
 #[test]
 fn a_revoking_requester_sends_the_close_as_its_first_message() {
     let (requester_record, proxy_record) = paired_records();
     let (mut requester, mut proxy) = authenticating_sessions(&requester_record, &proxy_record);
-    proxy
-        .send_ready(ready_nonce())
+    let ready = proxy
+        .send_ready(ready_nonce(), &name(CUSTODIAN_NAME))
         .expect("custodian session.ready seals");
     let notice = requester
         .send_revocation_notice()
@@ -494,12 +669,31 @@ fn a_revoking_requester_sends_the_close_as_its_first_message() {
         proxy.into_established().expect("custodian is healthy"),
         SESSION_START_MS,
     );
-    assert!(matches!(
-        proxy
-            .receive(&notice, SESSION_START_MS)
-            .expect("the close opens"),
-        RuntimeReceive::PeerClosed(CloseReason::PairingRevoked)
-    ));
+    let RuntimeReceive::PeerClosed {
+        reason: CloseReason::PairingRevoked,
+        echo: Some(echo),
+    } = proxy
+        .receive(&notice, SESSION_START_MS)
+        .expect("the close opens")
+    else {
+        panic!("the revocation close was not echoed");
+    };
+    assert_eq!(
+        requester
+            .receive_close_echo(&ready, SESSION_START_MS)
+            .expect("the requester reads the ready"),
+        CloseEcho::Ignored,
+        "the custodian's session.ready is ignored while the echo is awaited"
+    );
+    assert_eq!(
+        requester
+            .receive_close_echo(&echo, SESSION_START_MS)
+            .expect("the requester reads the echo"),
+        CloseEcho::Acknowledged {
+            reason: CloseReason::PairingRevoked,
+            crossing: false,
+        }
+    );
 }
 
 #[test]
@@ -507,7 +701,7 @@ fn a_custodian_that_sent_ready_cannot_send_the_revocation_close_first() {
     let (requester_record, proxy_record) = paired_records();
     let (_, mut proxy) = authenticating_sessions(&requester_record, &proxy_record);
     proxy
-        .send_ready(ready_nonce())
+        .send_ready(ready_nonce(), &name(CUSTODIAN_NAME))
         .expect("custodian session.ready seals");
     assert!(matches!(
         proxy.send_revocation_notice(),
@@ -518,14 +712,86 @@ fn a_custodian_that_sent_ready_cannot_send_the_revocation_close_first() {
 #[test]
 fn requester_close_reaches_the_custodian_with_its_reason() {
     let (mut requester, mut proxy) = established_runtimes();
+    close_is_acknowledged(&mut requester, &mut proxy, CloseReason::UserDisconnect);
+}
+
+/// A requester whose first message is not `session.hello` or a
+/// `pairing_revoked` close.
+fn first_message_without_hello(message: &TypedMessage) -> ReceiveOutcome {
+    let (pair_id, mut requester, proxy, _) = raw_established_channels();
+    let mut proxy = healthy_proxy(pair_id, proxy);
     let frame = requester
-        .close_with_reason(CloseReason::UserDisconnect)
-        .expect("close notice seals");
+        .seal(
+            message.message_type(),
+            message.to_wire_body().expect("the message encodes"),
+        )
+        .expect("the message seals");
+    proxy.receive(&frame, SESSION_START_MS).expect("receive")
+}
+
+#[test]
+fn the_custodian_admits_no_request_before_session_hello() {
+    let request = OperationRequest::reconstruct(
+        OperationId::from_array([0x70; 16]),
+        ProfileName::CardStatus,
+        400,
+        5_000,
+        CardOperation::ReadIdentity,
+    )
+    .expect("the typed read request is valid");
+    for first in [
+        TypedMessage::OperationRequest(request),
+        TypedMessage::SessionClose(SessionCloseMessage {
+            reason: CloseReason::ServiceWithdrawn,
+        }),
+        TypedMessage::LivenessPing(refineid_rapp::LivenessMessage {
+            challenge: refineid_rapp::PingChallenge::reconstruct([0x72; 32]),
+        }),
+    ] {
+        let expected = first.message_type();
+        match first_message_without_hello(&first) {
+            ReceiveOutcome::ViolationClosed {
+                violation: AuthenticatedViolation::UnexpectedPhase(message_type),
+                notice,
+                ..
+            } => {
+                assert_eq!(message_type, expected);
+                assert!(notice.is_some(), "the protocol_violation close is sealed");
+            }
+            other => panic!("{expected:?} first was admitted: {other:?}"),
+        }
+    }
     assert!(matches!(
-        proxy
-            .receive(&frame, SESSION_START_MS)
-            .expect("close notice opens"),
-        RuntimeReceive::PeerClosed(CloseReason::UserDisconnect)
+        first_message_without_hello(&TypedMessage::SessionClose(SessionCloseMessage {
+            reason: CloseReason::PairingRevoked,
+        })),
+        ReceiveOutcome::PeerClosed {
+            reason: CloseReason::PairingRevoked,
+            echo: Some(_),
+        }
+    ));
+}
+
+#[test]
+fn a_second_session_hello_closes_the_session() {
+    let (pair_id, mut requester, proxy, _) = raw_established_channels();
+    let mut proxy = healthy_proxy(pair_id, proxy);
+    greet(&mut requester, &mut proxy);
+    let hello = TypedMessage::SessionHello(SessionHelloMessage {
+        display_name: name(REQUESTER_NAME),
+    });
+    let frame = requester
+        .seal(
+            hello.message_type(),
+            hello.to_wire_body().expect("session.hello encodes"),
+        )
+        .expect("session.hello seals");
+    assert!(matches!(
+        proxy.receive(&frame, SESSION_START_MS).expect("receive"),
+        ReceiveOutcome::ViolationClosed {
+            violation: AuthenticatedViolation::UnexpectedPhase(MessageType::SessionHello),
+            ..
+        }
     ));
 }
 
@@ -646,14 +912,14 @@ fn cpace_bootstrap_pairing_and_fresh_session_interoperate_end_to_end() {
     let mut proxy_confirm = proxy.into_confirmation().expect("proxy confirms");
 
     let req_hello = requester_confirm
-        .send_hello("desktop".into(), "macos".into())
+        .send_hello(name(REQUESTER_NAME), "macOS".into())
         .expect("requester hello sends");
     proxy_confirm
         .receive_hello(&req_hello, 100)
         .expect("proxy receives hello");
 
     let proxy_hello = proxy_confirm
-        .send_hello("phone".into(), "ios".into())
+        .send_hello(name(CUSTODIAN_NAME), "iOS".into())
         .expect("proxy hello sends");
     requester_confirm
         .receive_hello(&proxy_hello, 100)

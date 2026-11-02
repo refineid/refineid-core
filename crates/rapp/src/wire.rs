@@ -68,6 +68,8 @@ pub enum MessageType {
     PairingStored,
     /// Session-ready parameter echo.
     SessionReady,
+    /// The requester's first session message, carrying its name.
+    SessionHello,
     /// Authenticated close notice.
     SessionClose,
     /// Liveness challenge.
@@ -96,6 +98,7 @@ impl MessageType {
             Self::PairingAbort => "pairing.abort",
             Self::PairingStored => "pairing.stored",
             Self::SessionReady => "session.ready",
+            Self::SessionHello => "session.hello",
             Self::SessionClose => "session.close",
             Self::LivenessPing => "liveness.ping",
             Self::LivenessPong => "liveness.pong",
@@ -114,6 +117,7 @@ impl MessageType {
             "pairing.abort" => Ok(Self::PairingAbort),
             "pairing.stored" => Ok(Self::PairingStored),
             "session.ready" => Ok(Self::SessionReady),
+            "session.hello" => Ok(Self::SessionHello),
             "session.close" => Ok(Self::SessionClose),
             "liveness.ping" => Ok(Self::LivenessPing),
             "liveness.pong" => Ok(Self::LivenessPong),
@@ -808,7 +812,17 @@ fn validate_body(
                 field_type: F::Bytes(32),
                 optional: false,
             },
+            FieldSpec {
+                name: "display_name",
+                field_type: F::Text,
+                optional: false,
+            },
         ],
+        M::SessionHello => &[FieldSpec {
+            name: "display_name",
+            field_type: F::Text,
+            optional: false,
+        }],
         M::SessionClose => &[FieldSpec {
             name: "reason",
             field_type: F::Text,

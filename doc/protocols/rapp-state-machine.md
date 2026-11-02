@@ -694,7 +694,6 @@ endpoint finds, matches, replaces or revokes a pairing by its name (INV-19).
 
 ## 12. Analysis
 
-The STPA of these machines is section 36 of the
+The STPA of these machines is in the
 [RAPP STPA record](../security/stpa-rapp.md), with unsafe control
-actions UCA-110 to UCA-122 and UCA-124, and controller constraints CC-113
-to CC-121 and CC-123.
+actions UCA-110 to UCA-124 and controller constraints CC-113 to CC-123.

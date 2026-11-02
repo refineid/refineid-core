@@ -86,6 +86,12 @@ example and the record for RAPP and its applications.
 - A small change records its analysis in the pull request, and a change
   with no control action or feedback to analyse says so in one line. A
   change to the control structure updates the STPA record that covers it.
+- A lesson from a real incident goes into the record as a short
+  "Smart Card Office" story: Alice the phone, Bob the computer, Carol
+  the cardholder and the customary cryptography cast, a few lines on how
+  the day goes right or wrong, the one-line lesson, then its L, H, UCA
+  and CC references. Invented names only; no characters, quotes or plots
+  from television, no dates, no owner data.
 
 ## The floor
 

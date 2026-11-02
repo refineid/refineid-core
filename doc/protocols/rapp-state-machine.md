@@ -1,6 +1,6 @@
 # RAPP v26.11.2 state machine
 
-**Status:** Draft — awaiting owner stamp\
+**Status:** Stamped, reviewed by the owner\
 **Applies to:** [RAPP v26.11.2](rapp-v26.11.2.md), the
 [transport and discovery hierarchy](rapp-transport-and-discovery-hierarchy.md),
 the [formal state machine](rapp-state-machine-v26.11.2.yaml) and the

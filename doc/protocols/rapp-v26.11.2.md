@@ -1,7 +1,7 @@
 # Remote Authorization Proxy Protocol (RAPP) v26.11.2
 ## Pairing and Session Protocol over the BLE and Stream Transports
 
-Status: Draft — awaiting owner stamp\
+Status: Stamped specification, reviewed by the owner\
 Document version: 26.11.2\
 Wire version: `[26, 11, 2]` (`[Year, Month, Day]`)\
 Offer version: `[26, 11, 2]`\

@@ -13,7 +13,7 @@
   header: context {
     if counter(page).get().first() > 1 [
       #set text(8pt, fill: muted)
-      RAPP v26.11.2 state machine #h(1fr) Draft — awaiting owner stamp
+      RAPP v26.11.2 state machine #h(1fr) Stamped, reviewed by the owner
     ]
   },
   footer: context [
@@ -61,7 +61,7 @@
   #v(12mm)
   #line(length: 60%, stroke: 0.8pt + accent)
   #v(4mm)
-  #text(10pt)[Draft — awaiting owner stamp]
+  #text(10pt)[Stamped, reviewed by the owner]
 ]
 
 #outline(depth: 2, indent: 1.2em)

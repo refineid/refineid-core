@@ -4,9 +4,11 @@ The PACE secure channel for FINEID cards.
 
 The handshake authenticates the channel with a `PacePassword`: the Card
 Access Number of a citizen card, or PIN 1 or PIN 2 of an organizational
-card. A CAN is printed on the card, but it is sensitive access data
-because it enables PACE access to the chip; the validated `Can` is
-opaque, non-clonable, and zeroizing, and the handshake consumes it
+card. A personal card's CAN is six digits printed on the card, and it
+is a secret handled like the PINs (see
+[credential custody](../../doc/security/credential-custody.md)); on an
+organizational card PIN 1 or PIN 2 opens PACE instead. The validated
+`Can` is opaque, non-clonable, and zeroizing, and the handshake consumes it
 through a crate-private path. A PIN's PACE key is derived in
 `refineid-auth`, which owns the digits, and a PIN password passes the
 retry floor before any try can be spent.

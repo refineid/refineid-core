@@ -1,9 +1,9 @@
 # Credential custody
 
-This is the contract for PIN-bearing code. The public tree implements the
-refined input types, the credential-command ownership types, and the PKCS#11
-module's held PIN1 (`crates/pkcs11/src/pin_cache.rs`), which follows the rules
-below.
+This is the contract for code that bears a PIN, the PUK or the CAN. The
+public tree implements the refined input types, the credential-command
+ownership types, and the PKCS#11 module's held PIN1
+(`crates/pkcs11/src/pin_cache.rs`), which follows the rules below.
 
 See also [Security and Usability Balance](security-and-usability-balance.md) for
 the architectural consensus on unattended PIN 1 authentication and explicit
@@ -133,19 +133,38 @@ not persisted.
 
 ## Card Access Number custody
 
-The CAN is a different credential class from the PINs: printed on the card
-face, it authenticates the terminal's visual access to the card, not the
-user, and a wrong value costs a failed PACE handshake, not a retry counter.
-Its threat model is the contactless attacker in radio range without sight
-of the card -- for whom a software leak (a log line, a trace, a crash
-report) is the only route to the value. Custody therefore still applies in
-full: `Can` is non-clonable, zeroizing, redacted, and exports no raw value.
+The CAN is a secret, handled like PIN 1, PIN 2, the PUK and the activation
+PIN. Printed on the face of a citizen card, it authenticates the terminal's
+visual access to the card, not the user, and a wrong value costs a failed
+PACE handshake, not a retry counter. Its threat model is the contactless
+attacker in radio range without sight of the card, for whom a software
+leak (a log line, a trace, a crash report, a field on screen) is the only
+route to the value. Custody therefore applies in full:
 
-Remembering a CAN across sessions in an operating-system keystore, under
-user consent, is a legitimate product choice for this class. Persistence
+- the CAN is never displayed back to the user: no screen, field, status
+  line or command output shows a stored or entered CAN; a row may state
+  in words that a CAN is stored;
+- it is never logged in any build, neither its digits nor its length;
+- it never travels over a network: no RAPP message, diagnostic report,
+  export or crash report carries it;
+- entry fields hide it by default, with a reveal control while typing,
+  like the PIN fields; CLI entry is echo-off; and
+- `Can` is non-clonable, zeroizing, redacted, and exports no raw value.
+
+A citizen card's CAN is six digits (ICAO Doc 9303 Part 5 section 3.2.3).
+On an organization card the access number is PIN 1 or PIN 2, four to
+twelve digits: PACE opens with the PIN (see [PACE](../reference/pace.md)),
+the value is a PIN role type, never a `Can`, and it follows the PIN
+custody above. It is never stored.
+
+A citizen card's CAN is stored but secret: a client may remember it
+across sessions so the holder does not retype it, only in the platform's
+secure credential storage (a keychain, a DPAPI-protected store, an
+Android Keystore-backed store, the desktop secret service), never in a
+plain file, a preference store or an environment variable. Persistence
 happens upstream of the border, never through it: the input surface that
-collected the digits stores its own copy at collection time, and a keystore
-read is another input surface -- its bytes re-enter through
+collected the digits stores its own copy at collection time, and a
+secure-store read is another input surface -- its bytes re-enter through
 `UnvalidatedCan` and `Can::reconstruct`, which rejects a corrupted or
 foreign value. The sealed type never grows an export path to serve
 storage; a client that needs the digits at some point keeps them upstream
@@ -161,7 +180,8 @@ of that point.
   that cannot replay it.
 - APDU tracing classifies and redacts before any hexadecimal formatting or sink
   call.
-- UI entry uses an operating-system secure text field. CLI entry is echo-off
-  and reads from a terminal, never argv or the environment.
+- UI entry of a PIN, the PUK, the activation PIN or the CAN uses an
+  operating-system secure text field, hidden by default. CLI entry is
+  echo-off and reads from a terminal, never argv or the environment.
 
 These rules are release gates, not best-effort guidance.

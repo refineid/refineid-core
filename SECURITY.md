@@ -21,17 +21,20 @@ Do not post real credentials, personal data, or anything that identifies an
 individual — in a public issue or anywhere else. Synthetic values and
 structural descriptions are enough to work from.
 
-## Inviolable Rule #1: PIN codes never travel over the network
+## Inviolable Rule #1: PIN codes and the CAN never travel over the network
 
-PIN codes (PIN1 and PIN2) NEVER leave the mobile device when accessed via RAPP.
-RAPP must absolutely deny and preclude all attempts to transport PIN codes
-anywhere:
+PIN codes (PIN1 and PIN2) and the CAN NEVER leave the mobile device when
+accessed via RAPP. RAPP must absolutely deny and preclude all attempts to
+transport them anywhere:
 
-- The protocol wire format has no field or message for PIN codes.
+- The protocol wire format has no field or message for PIN codes or the CAN.
 - PIN1 remains in protected on-device cache on the phone.
 - PIN2 prompts appear exclusively on the mobile device's screen.
 - The host computer operates via a protected authentication path without any
   PIN prompts or transport.
+- The CAN is a secret like the PINs: never displayed back, never logged, never
+  read from argv or the environment, hidden by default on entry, and stored
+  only in the platform's secure credential store.
 
 ## Inviolable Rule #2: Zero PIN and PIN-length logging across all environments
 

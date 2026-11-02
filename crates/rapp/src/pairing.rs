@@ -11,14 +11,14 @@ use zeroize::Zeroizing;
 
 use super::wire::encode_deterministic_cbor_into;
 use super::{
-    EndpointRole, GrantsHash, PairId, ProfileName, WireValue, decode_deterministic_cbor,
-    encode_deterministic_cbor,
+    DisplayName, EndpointRole, GrantsHash, PairId, ProfileName, WireValue,
+    decode_deterministic_cbor, encode_deterministic_cbor,
 };
 
 const X25519_KEY_SIZE: usize = 32;
 
 /// Format version for encoded pairing records.
-pub const PAIR_RECORD_FORMAT_VERSION: u64 = 7;
+pub const PAIR_RECORD_FORMAT_VERSION: u64 = 8;
 
 /// Active long-term pairing material.
 ///
@@ -34,14 +34,16 @@ pub struct PairRecord {
     remote_static_public: [u8; X25519_KEY_SIZE],
     grants_hash: GrantsHash,
     profiles: Vec<ProfileName>,
+    peer_display_name: DisplayName,
     created_at_ms: u64,
     storage_confirmed: bool,
     forgotten_at_ms: Option<u64>,
     last_session_at_ms: Option<u64>,
 }
 
-/// Days a forgotten pairing keeps its key to deliver the `pairing_revoked`
-/// close on a later session (RAPP v26.11.2 section 4.6 item 3).
+/// Days a custodian keeps the key of a forgotten pairing to deliver the
+/// `pairing_revoked` close on a later session (RAPP v26.11.2 section 4.6
+/// item 3).
 pub const REVOCATION_NOTICE_DAYS: u64 = 30;
 /// Days a pairing lives without an established session before it expires
 /// (RAPP v26.11.2 section 4.6 item 5).
@@ -69,27 +71,32 @@ pub enum SweepOutcome {
     Expired,
 }
 
-/// Why a sweep changed nothing although its pairing needed a change.
+/// Why a change to a stored record changed nothing: a sweep, or a new
+/// display name of the peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SweepError<E> {
+pub enum RecordStoreError<E> {
     /// The changed record could not be encoded; nothing was handed to the
     /// store.
     Encoding(PairRecordCodecError),
     /// The store refused the changed record. The record is as it was, and
-    /// the next sweep repeats the whole step.
+    /// the next sweep or session repeats the whole step.
     Store(E),
 }
 
-impl<E: fmt::Display> fmt::Display for SweepError<E> {
+impl<E: fmt::Display> fmt::Display for RecordStoreError<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Encoding(error) => write!(formatter, "the swept record did not encode: {error}"),
-            Self::Store(error) => write!(formatter, "the store refused the swept record: {error}"),
+            Self::Encoding(error) => {
+                write!(formatter, "the changed record did not encode: {error}")
+            }
+            Self::Store(error) => {
+                write!(formatter, "the store refused the changed record: {error}")
+            }
         }
     }
 }
 
-impl<E: fmt::Debug + fmt::Display> core::error::Error for SweepError<E> {}
+impl<E: fmt::Debug + fmt::Display> core::error::Error for RecordStoreError<E> {}
 
 /// A pair record in its stored form, on its way to or from the
 /// device-only store. It carries the static private key, so it is zeroized
@@ -143,6 +150,10 @@ impl PairRecord {
     /// confirms it only through an [`ActivePairing`](crate::ActivePairing)
     /// (RAPP v26.11.2 section 4.3 item 4).
     ///
+    /// `peer_display_name` is the name the peer sent in its
+    /// `pairing.hello` (section 4.3 item 4): the record has a name for its
+    /// whole life.
+    ///
     /// # Errors
     /// [`PairRecordError`] on an all-zero static key or an empty profile set.
     #[allow(
@@ -157,6 +168,7 @@ impl PairRecord {
         remote_static_public: [u8; X25519_KEY_SIZE],
         grants_hash: GrantsHash,
         profiles: Vec<ProfileName>,
+        peer_display_name: DisplayName,
         created_at_ms: u64,
     ) -> Result<Self, PairRecordError> {
         if local_static_private.iter().all(|byte| *byte == 0)
@@ -177,6 +189,7 @@ impl PairRecord {
             remote_static_public,
             grants_hash,
             profiles,
+            peer_display_name,
             created_at_ms,
             storage_confirmed: true,
             forgotten_at_ms: None,
@@ -218,6 +231,43 @@ impl PairRecord {
     #[must_use]
     pub fn profiles(&self) -> &[ProfileName] {
         &self.profiles
+    }
+
+    /// The name the peer last sent for itself, as the record stores it
+    /// (section 4.3 item 4).
+    #[must_use]
+    pub const fn peer_display_name(&self) -> &DisplayName {
+        &self.peer_display_name
+    }
+
+    /// Keep `name`, the display name the peer sent at the start of a
+    /// session, as the record's (section 4.3 item 4). A name equal to the
+    /// stored one changes nothing and stores nothing
+    /// (`Ok(false)`). A different one is handed, in the changed record,
+    /// encoded, to `store`, and replaces the name in this record only once
+    /// `store` returned `Ok` (`Ok(true)`). A refused store leaves the old
+    /// name, and the session goes on; the next session tries again.
+    ///
+    /// # Errors
+    /// [`RecordStoreError::Store`] with the store's error, and
+    /// [`RecordStoreError::Encoding`] when the changed record does not
+    /// encode; the record keeps its old name in both.
+    pub fn record_peer_display_name<E>(
+        &mut self,
+        name: &DisplayName,
+        store: impl FnOnce(&EncodedPairRecord) -> Result<(), E>,
+    ) -> Result<bool, RecordStoreError<E>> {
+        if &self.peer_display_name == name {
+            return Ok(false);
+        }
+        let previous = core::mem::replace(&mut self.peer_display_name, name.clone());
+        let stored = encode_pair_record(self)
+            .map_err(RecordStoreError::Encoding)
+            .and_then(|encoded| store(&encoded).map_err(RecordStoreError::Store));
+        if stored.is_err() {
+            self.peer_display_name = previous;
+        }
+        stored.map(|()| true)
     }
 
     /// Pair creation time supplied by the platform wall clock.
@@ -268,13 +318,24 @@ impl PairRecord {
         self
     }
 
-    /// Whether a forgotten record has kept its key for
-    /// [`REVOCATION_NOTICE_MS`]; it is then destroyed untold.
+    /// Whether a forgotten record has kept its key as long as its role
+    /// allows, at `now_ms`, milliseconds since the Unix epoch; it is then
+    /// destroyed untold. A custodian keeps it for [`REVOCATION_NOTICE_MS`]
+    /// (section 4.6 item 3); a requester for one bounded attempt of
+    /// [`REVOCATION_ATTEMPT_BOUND_MS`](crate::REVOCATION_ATTEMPT_BOUND_MS)
+    /// (section 4.6 item 6), and at once when `now_ms` is earlier than the
+    /// revocation, since a clock set back cannot show that the bound has
+    /// not passed.
     #[must_use]
     pub const fn revocation_notice_expired(&self, now_ms: u64) -> bool {
-        match self.forgotten_at_ms {
-            Some(at_ms) => now_ms.saturating_sub(at_ms) >= REVOCATION_NOTICE_MS,
-            None => false,
+        let Some(at_ms) = self.forgotten_at_ms else {
+            return false;
+        };
+        match self.role {
+            EndpointRole::Proxy => now_ms.saturating_sub(at_ms) >= REVOCATION_NOTICE_MS,
+            EndpointRole::Requester => {
+                now_ms < at_ms || now_ms - at_ms >= super::REVOCATION_ATTEMPT_BOUND_MS
+            }
         }
     }
 
@@ -321,22 +382,22 @@ impl PairRecord {
     /// session to it is established and when that session ends.
     ///
     /// # Errors
-    /// [`SweepError::Store`] with the store's error, and
-    /// [`SweepError::Encoding`] when the changed record does not encode; the
+    /// [`RecordStoreError::Store`] with the store's error, and
+    /// [`RecordStoreError::Encoding`] when the changed record does not encode; the
     /// record is unchanged in both.
     pub fn sweep<E>(
         &mut self,
         now_ms: u64,
         session_established: bool,
         store: impl FnOnce(&EncodedPairRecord) -> Result<(), E>,
-    ) -> Result<SweepOutcome, SweepError<E>> {
+    ) -> Result<SweepOutcome, RecordStoreError<E>> {
         let plan = self.plan_sweep(now_ms, session_established);
         if plan.outcome == SweepOutcome::Kept {
             return Ok(plan.outcome);
         }
         let encoded = encode_with_times(self, plan.forgotten_at_ms, plan.last_session_at_ms)
-            .map_err(SweepError::Encoding)?;
-        store(&encoded).map_err(SweepError::Store)?;
+            .map_err(RecordStoreError::Encoding)?;
+        store(&encoded).map_err(RecordStoreError::Store)?;
         self.last_session_at_ms = plan.last_session_at_ms;
         self.forgotten_at_ms = plan.forgotten_at_ms;
         Ok(plan.outcome)
@@ -408,6 +469,7 @@ impl fmt::Debug for PairRecord {
             .field("remote_static_public", &"[public key]")
             .field("grants_hash", &self.grants_hash)
             .field("profiles", &self.profiles)
+            .field("peer_display_name", &self.peer_display_name)
             .field("created_at_ms", &self.created_at_ms)
             .field("storage_confirmed", &self.storage_confirmed)
             .field("forgotten_at_ms", &self.forgotten_at_ms)
@@ -473,6 +535,9 @@ pub fn encode_pair_record(record: &PairRecord) -> Result<EncodedPairRecord, Pair
     )
 }
 
+/// Map key of the peer's display name in the stored form.
+const PEER_DISPLAY_NAME_KEY: &str = "peer_display_name";
+
 /// Map key of the static private key in the stored form.
 const LOCAL_STATIC_PRIVATE_KEY: &str = "local_static_private";
 
@@ -524,6 +589,10 @@ fn encode_with_times(
                     .map(|profile| WireValue::Text(profile.as_str().to_owned()))
                     .collect(),
             ),
+        ),
+        (
+            PEER_DISPLAY_NAME_KEY.to_owned(),
+            WireValue::Text(record.peer_display_name().as_str().to_owned()),
         ),
         (
             "created_at_ms".to_owned(),
@@ -581,6 +650,7 @@ pub fn decode_pair_record(encoded: &EncodedPairRecord) -> Result<PairRecord, Pai
         "remote_static_public",
         "grants_hash",
         "profiles",
+        PEER_DISPLAY_NAME_KEY,
         "created_at_ms",
         "storage_confirmed",
         "forgotten_at_ms",
@@ -608,6 +678,8 @@ pub fn decode_pair_record(encoded: &EncodedPairRecord) -> Result<PairRecord, Pai
         .into_iter()
         .map(|name| ProfileName::parse(&name).ok_or(PairRecordCodecError::InvalidInput))
         .collect::<Result<Vec<_>, _>>()?;
+    let peer_display_name = DisplayName::parse(take_text(map, PEER_DISPLAY_NAME_KEY)?)
+        .map_err(|_| PairRecordCodecError::InvalidInput)?;
     let created_at_ms = take_unsigned(map, "created_at_ms")?;
     let storage_confirmed = take_bool(map, "storage_confirmed")?;
     let forgotten_at_ms = take_optional_unsigned(map, "forgotten_at_ms")?;
@@ -623,6 +695,7 @@ pub fn decode_pair_record(encoded: &EncodedPairRecord) -> Result<PairRecord, Pai
         remote_static_public,
         grants_hash,
         profiles,
+        peer_display_name,
         created_at_ms,
     )
     .map_err(PairRecordCodecError::InvalidRecord)?;
@@ -741,10 +814,12 @@ fn take_text_array(
 #[cfg(test)]
 mod tests {
     use super::{
-        EncodedPairRecord, EndpointRole, GrantsHash, MILLISECONDS_PER_DAY,
+        DisplayName, EncodedPairRecord, EndpointRole, GrantsHash, MILLISECONDS_PER_DAY,
         PAIRING_IDLE_EXPIRY_DAYS, PAIRING_IDLE_EXPIRY_MS, PairId, PairRecord, ProfileName,
-        REVOCATION_NOTICE_MS, SweepError, SweepOutcome, decode_pair_record, encode_pair_record,
+        REVOCATION_NOTICE_MS, RecordStoreError, SweepOutcome, decode_pair_record,
+        encode_pair_record,
     };
+    use crate::REVOCATION_ATTEMPT_BOUND_MS;
     use core::convert::Infallible;
 
     const CREATED_AT_MS: u64 = 1_700_000_000_000;
@@ -882,7 +957,7 @@ mod tests {
         let mut record = test_record(0x42);
         assert_eq!(
             record.sweep(expired_at_ms, false, |_| Err("store unavailable")),
-            Err(SweepError::Store("store unavailable"))
+            Err(RecordStoreError::Store("store unavailable"))
         );
         assert_eq!(
             record.forgotten_at_ms(),
@@ -983,17 +1058,90 @@ mod tests {
     }
 
     fn test_record(id_byte: u8) -> PairRecord {
+        record_as(id_byte, EndpointRole::Proxy)
+    }
+
+    fn record_as(id_byte: u8, role: EndpointRole) -> PairRecord {
         PairRecord::new(
             PairId::from_array([id_byte; 16]),
-            EndpointRole::Requester,
+            role,
             [id_byte.wrapping_add(2); 32],
             [id_byte.wrapping_add(3); 32],
             [id_byte.wrapping_add(4); 32],
             GrantsHash::from_array([id_byte.wrapping_add(5); 32]),
             vec![ProfileName::Authentication, ProfileName::CardStatus],
+            name(PEER_NAME),
             CREATED_AT_MS,
         )
         .expect("valid pair record")
+    }
+
+    const PEER_NAME: &str = "macOS - example-host";
+    const RENAMED_PEER: &str = "macOS - renamed-host";
+
+    fn name(text: &str) -> DisplayName {
+        DisplayName::parse(text.to_owned()).expect("a valid name")
+    }
+
+    #[test]
+    fn the_peer_name_round_trips_with_the_record() {
+        let decoded = decode_pair_record(&encode_pair_record(&test_record(0x42)).expect("encode"))
+            .expect("decode");
+        assert_eq!(decoded.peer_display_name(), &name(PEER_NAME));
+    }
+
+    #[test]
+    fn an_equal_name_stores_nothing() {
+        let mut record = test_record(0x42);
+        assert_eq!(
+            record.record_peer_display_name(&name(PEER_NAME), |_| -> Result<(), Infallible> {
+                unreachable!("an equal name stores nothing")
+            }),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn a_new_name_is_stored_before_it_replaces_the_old_one() {
+        let mut record = test_record(0x42);
+        let mut stored = None;
+        assert_eq!(
+            record.record_peer_display_name(&name(RENAMED_PEER), |encoded| {
+                stored = Some(encoded.as_bytes().to_vec());
+                Ok::<(), Infallible>(())
+            }),
+            Ok(true)
+        );
+        assert_eq!(record.peer_display_name(), &name(RENAMED_PEER));
+        let stored = decode_pair_record(&EncodedPairRecord::from_stored(
+            stored.expect("the new name is stored"),
+        ))
+        .expect("decode");
+        assert_eq!(stored.peer_display_name(), &name(RENAMED_PEER));
+    }
+
+    #[test]
+    fn a_refused_store_keeps_the_old_name() {
+        let mut record = test_record(0x42);
+        assert_eq!(
+            record.record_peer_display_name(&name(RENAMED_PEER), |_| Err("store unavailable")),
+            Err(RecordStoreError::Store("store unavailable"))
+        );
+        assert_eq!(record.peer_display_name(), &name(PEER_NAME));
+    }
+
+    #[test]
+    fn a_requester_keeps_a_forgotten_key_for_one_bounded_attempt() {
+        let forgotten = record_as(0x42, EndpointRole::Requester).forgotten(FORGOTTEN_AT_MS);
+        assert!(!forgotten.revocation_notice_expired(FORGOTTEN_AT_MS));
+        assert!(
+            !forgotten.revocation_notice_expired(FORGOTTEN_AT_MS + REVOCATION_ATTEMPT_BOUND_MS - 1)
+        );
+        assert!(forgotten.revocation_notice_expired(FORGOTTEN_AT_MS + REVOCATION_ATTEMPT_BOUND_MS));
+        assert!(
+            forgotten.revocation_notice_expired(FORGOTTEN_AT_MS - 1),
+            "a clock set back cannot keep the key"
+        );
     }
 
     #[test]

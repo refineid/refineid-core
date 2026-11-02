@@ -829,6 +829,112 @@
           ]
         }
       ]
+    },
+    {
+      "name": "a-received-close-is-echoed",
+      "section": "7.1 item 7, 4.6 item 4",
+      "machine": "session",
+      "role": "custodian",
+      "start": "healthy",
+      "steps": [
+        {
+          "event": "peer_close_received",
+          "outcome": "transition",
+          "state": "closing",
+          "actions": [
+            "record_peer_close_reason",
+            "echo_peer_close",
+            "show_disconnecting"
+          ]
+        },
+        {
+          "event": "close_complete_or_deadline",
+          "outcome": "transition",
+          "state": "closed",
+          "actions": [
+            "destroy_session_material",
+            "destroy_credential_buffers",
+            "show_connection_stopped"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "the-echo-ends-the-wait-unanswered",
+      "section": "7.1 item 7, 4.5 item 8",
+      "machine": "session",
+      "role": "requester",
+      "start": "healthy",
+      "steps": [
+        {
+          "event": "service_withdrawn",
+          "outcome": "transition",
+          "state": "closing",
+          "actions": [
+            "send_close_service_withdrawn",
+            "show_disconnecting"
+          ]
+        },
+        {
+          "event": "peer_close_received",
+          "outcome": "transition",
+          "state": "closed",
+          "actions": [
+            "record_peer_close_reason",
+            "destroy_session_material",
+            "destroy_credential_buffers",
+            "show_connection_stopped"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "a-revoking-requester-waits-for-the-echo",
+      "section": "7.1 item 7, 4.6 items 2 and 6",
+      "machine": "session",
+      "role": "requester",
+      "start": "authenticating",
+      "steps": [
+        {
+          "event": "handshake_complete_while_revoking",
+          "outcome": "transition",
+          "state": "closing",
+          "actions": [
+            "derive_session_identifiers",
+            "send_close_pairing_revoked"
+          ]
+        },
+        {
+          "event": "peer_close_received",
+          "outcome": "transition",
+          "state": "closed",
+          "actions": [
+            "record_peer_close_reason",
+            "destroy_session_material",
+            "destroy_credential_buffers",
+            "show_connection_stopped"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "a-close-in-place-of-ready-is-echoed",
+      "section": "7.1 item 7, 4.6 item 4",
+      "machine": "session",
+      "role": "requester",
+      "start": "authenticating",
+      "steps": [
+        {
+          "event": "peer_close_received",
+          "outcome": "transition",
+          "state": "closed",
+          "actions": [
+            "record_peer_close_reason",
+            "echo_peer_close",
+            "destroy_session_material"
+          ]
+        }
+      ]
     }
   ]
 }

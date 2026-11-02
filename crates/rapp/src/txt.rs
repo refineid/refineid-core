@@ -33,8 +33,11 @@ pub const MODE_KEY: &str = "mode";
 /// Separator between hint-list entries.
 pub const ENTRY_SEPARATOR: char = ',';
 
+/// Hexadecimal digits that encode one byte.
+const HEX_DIGITS_PER_BYTE: usize = 2;
+
 /// Hexadecimal digits per encoded entry.
-const ENTRY_HEX_DIGITS: usize = HINT_SIZE * 2;
+const ENTRY_HEX_DIGITS: usize = HINT_SIZE * HEX_DIGITS_PER_BYTE;
 
 /// Lowercase hexadecimal alphabet of the encoded entries.
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -99,8 +102,14 @@ pub fn values<'a, const N: usize>(
 /// One hint as 16 lowercase hexadecimal digits.
 #[must_use]
 pub fn encode_entry(entry: &[u8; HINT_SIZE]) -> String {
-    let mut text = String::with_capacity(ENTRY_HEX_DIGITS);
-    for byte in entry {
+    lower_hex(entry)
+}
+
+/// `bytes` as lowercase hexadecimal digits, two per byte.
+#[must_use]
+pub fn lower_hex(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(bytes.len() * HEX_DIGITS_PER_BYTE);
+    for byte in bytes {
         text.push(char::from(HEX_DIGITS[usize::from(byte >> NIBBLE_BITS)]));
         text.push(char::from(HEX_DIGITS[usize::from(byte & NIBBLE_MASK)]));
     }

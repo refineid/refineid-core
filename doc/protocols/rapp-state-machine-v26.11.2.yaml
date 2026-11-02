@@ -143,8 +143,8 @@ actions:
   end_pairing_search: "close the pairing connection, stop browsing mode=pairing and drop the typed code"
   start_session_discovery: "browse mode=session and scan for the RAPP BLE advertisement, continuously, and start a requester_view_of_custodian in idle for the active pairing"
   stop_session_discovery: "if discovery runs: raise pairing_left for the requester_view_of_custodian unless it has ended, then stop browsing and scanning and purge transient discovery caches; a revoking pairing's one attempt keeps the discovery it needs until it ends, and the caches are purged then"
-  withdraw_requester: "send session.close service_withdrawn on every open session, closing a connection not yet open without a notice (section 4.5 item 8)"
-  withdraw_requester_within_quit_bound: "withdraw as withdraw_requester and wait at most quit_withdrawal_bound_ms for the closes to leave"
+  withdraw_requester: "send session.close service_withdrawn on every open session and wait for each echo as section 7.1 item 7 says, closing a connection not yet open without a notice (section 4.5 item 8)"
+  withdraw_requester_within_quit_bound: "withdraw as withdraw_requester and wait at most quit_withdrawal_bound_ms for the custodians' echoes of the closes (section 7.1 item 7)"
   forget_held_pairing: "raise forget_pairing for the pairing the requester holds, if any; its revocation runs as section 4.6 item 6 says"
   forget_previous_pairing: "raise forget_pairing for the pairing held before the one just stored, if any; a requester holds one pairing, and its revocation runs as section 4.6 item 6 says"
   sweep_stored_pairings: "revoke every record found unconfirmed (section 4.3 item 4), destroy the key of a requester's revoking pairing whose revocation_attempt_bound_ms has passed, then run the idle-expiry sweep (section 4.6 item 5), before serving or dialing anything"
@@ -159,8 +159,8 @@ actions:
   register_fresh_instance: "register the stream service under a fresh random instance name with the mode=session record and start the listener"
   start_ble_advertising: "advertise the RAPP BLE service"
   stop_ble_advertising: "stop advertising the RAPP BLE service"
-  withdraw_custodian: "send session.close service_withdrawn on every open session and close its link, stop accepting connections, and replace the TXT record of the current instance with the withdrawn record, in this order (section 4.5 item 3)"
-  withdraw_custodian_sessions: "send session.close service_withdrawn on every open session and close its link, and stop accepting connections; there is no instance whose record to replace"
+  withdraw_custodian: "send session.close service_withdrawn on every open session, wait at most quit_withdrawal_bound_ms for each echo and close its link, stop accepting connections, and replace the TXT record of the current instance with the withdrawn record, in this order (section 4.5 item 3)"
+  withdraw_custodian_sessions: "send session.close service_withdrawn on every open session, wait at most quit_withdrawal_bound_ms for each echo and close its link, and stop accepting connections; there is no instance whose record to replace"
   withdraw_custodian_best_effort: "withdraw as withdraw_custodian as far as the platform lets a quitting process"
   unregister_service: "unregister the stream service instance and cancel the withdrawn record's timer"
   update_txt_in_place: "replace the current instance's TXT record in place, without unregistering"
@@ -178,6 +178,7 @@ actions:
   start_liveness: "start the 5-second silence ping and the 30-second silence limit"
   send_liveness_ping: "send liveness.ping with a fresh challenge"
   record_peer_close_reason: "keep the received close reason for the user"
+  echo_peer_close: "answer the received session.close with a session.close carrying the same reason, the echo that acknowledges it (section 7.1 item 7, CC-123)"
   send_close_user_disconnect: "send session.close with reason user_disconnect"
   send_close_normal: "send session.close with reason normal"
   send_close_protocol_violation: "send session.close with reason protocol_violation"
@@ -412,7 +413,7 @@ pairing:
       to: revoked
       actions: [mark_record_revoked, destroy_pair_keys, withdraw_identity]
     - from: revoking
-      event: revocation_notice_sent        # produced by the next session sending the close as its first message
+      event: revocation_notice_sent        # produced by the next session sending the close as its first message, once the peer echoed it or the wait for the echo ended
       role: both
       to: revoked
       actions: [destroy_pair_keys]
@@ -449,7 +450,8 @@ session:
     - closed
   notes:
     - "entering healthy produces session_healthy; entering closed after healthy was reached produces session_closed, or peer_withdrawal_notice on a custodian whose session the requester closed with reason service_withdrawn"
-    - "handshake_complete_while_revoking produces revocation_notice_sent; a received close with reason pairing_revoked produces peer_revocation_notice"
+    - "a session that handshake_complete_while_revoking moved to closing produces revocation_notice_sent when it reaches closed: on the peer's echo or when the wait for it ends; a received close with reason pairing_revoked produces peer_revocation_notice"
+    - "closing after this endpoint sent a close waits for the peer's echo (section 7.1 item 7): it sends nothing more, ignores every message but a session.close, and a session.close arriving then is the echo, or a close that crossed this endpoint's, and is not answered"
     - "entering closing produces session_closed for the session's operation"
     - "closed is terminal for the instance"
   transitions:
@@ -486,15 +488,15 @@ session:
       to: authenticating
       actions: [derive_session_identifiers]
     - from: authenticating
-      event: handshake_complete_while_revoking   # the pairing is revoking: the close is the session's first message
+      event: handshake_complete_while_revoking   # the pairing is revoking: the close is the session's first message, and closing waits for its echo
       role: both
-      to: closed
-      actions: [derive_session_identifiers, send_close_pairing_revoked, destroy_session_material]
+      to: closing
+      actions: [derive_session_identifiers, send_close_pairing_revoked]
     - from: authenticating
-      event: peer_close_received           # a revoking custodian's close in place of session.ready
+      event: peer_close_received           # a revoking custodian's close in place of session.ready, echoed
       role: requester
       to: closed
-      actions: [record_peer_close_reason, destroy_session_material]
+      actions: [record_peer_close_reason, echo_peer_close, destroy_session_material]
     - from: authenticating
       event: ready_verified                # session.ready verified, with the custodian's current display name
       role: requester
@@ -557,10 +559,10 @@ session:
       to: closing
       actions: [send_close_card_unavailable, show_disconnecting]
     - from: healthy
-      event: peer_close_received
+      event: peer_close_received           # answered with the echo, then the transport closes
       role: both
       to: closing
-      actions: [record_peer_close_reason, show_disconnecting]
+      actions: [record_peer_close_reason, echo_peer_close, show_disconnecting]
     - from: healthy
       event: transport_failed
       role: both
@@ -587,10 +589,10 @@ session:
       to: closed
       actions: [destroy_session_material, close_candidate, show_connection_stopped]
     - from: closing
-      event: peer_close_received
+      event: peer_close_received           # the echo of this endpoint's close, or a close that crossed it: acted on, never answered
       role: both
-      to: closing
-      actions: []
+      to: closed
+      actions: [record_peer_close_reason, destroy_session_material, destroy_credential_buffers, show_connection_stopped]
     - from: closing
       event: transport_failed
       role: both
@@ -981,6 +983,9 @@ cross_component_rules:
   - id: X-10
     when: a_requester_pairing_becomes_active
     require: every_other_pairing_it_holds_receives_forget_pairing
+  - id: X-12
+    when: an_endpoint_receives_an_authenticated_session_close
+    require: it_answers_with_a_session_close_carrying_the_same_reason_and_closes_the_transport_unless_it_waits_for_the_echo_of_its_own_close_which_the_received_close_then_is
 
 invariants:
   - id: INV-01

@@ -3,8 +3,8 @@
 use core::fmt;
 
 use super::{
-    BinaryFrame, CryptoError, EndpointRole, HandshakeChannel, HandshakeRole, MessageError,
-    NegotiatedParameters, OpenError, PairKeyMaterial, PairRecord, PairRecordError,
+    BinaryFrame, CryptoError, DisplayName, EndpointRole, HandshakeChannel, HandshakeRole,
+    MessageError, NegotiatedParameters, OpenError, PairKeyMaterial, PairRecord, PairRecordError,
     PairingConfirmMessage, PairingHandshakeParameters, PairingHelloMessage, PairingOffer,
     PairingOfferError, PairingSecret, PairingStoredMessage, ProfileName, SecureChannel,
     TransportCandidate, TypedMessage, compute_grants_hash,
@@ -240,13 +240,15 @@ impl PairingConfirmation {
         self.pair_id
     }
 
-    /// Send the local peer label and exact negotiated-parameter echo.
+    /// Send this endpoint's display name and platform description with the
+    /// exact negotiated-parameter echo (section 4.3 item 3).
     ///
     /// # Errors
-    /// [`PairingError`] on a duplicate hello or a seal failure.
+    /// [`PairingError`] on a duplicate hello, a platform description that
+    /// is blank or longer than 256 bytes, or a seal failure.
     pub fn send_hello(
         &mut self,
-        display_name: String,
+        display_name: DisplayName,
         platform: String,
     ) -> Result<BinaryFrame, PairingError> {
         if self.local_hello_sent {
@@ -402,6 +404,10 @@ impl PairingConfirmation {
             return Err(PairingError::GrantMismatch);
         }
         let grants_hash = compute_grants_hash(&local_grants).map_err(PairingError::Crypto)?;
+        let peer_display_name = self
+            .peer_hello
+            .map(|hello| hello.display_name)
+            .ok_or(PairingError::HelloIncomplete)?;
         let local_private = self.local_keys.with_private_key(|bytes| *bytes);
         let record = PairRecord::new(
             self.pair_id,
@@ -411,6 +417,7 @@ impl PairingConfirmation {
             self.remote_static_public,
             grants_hash,
             local_grants,
+            peer_display_name,
             created_at_ms,
         )
         .map_err(PairingError::PairRecord)?
@@ -687,6 +694,10 @@ mod tests {
         STREAM_CANDIDATE_ID, TransportProfile, generate_pair_key_material,
     };
 
+    fn display_name(text: &str) -> crate::DisplayName {
+        crate::DisplayName::parse(text.to_owned()).expect("a valid name")
+    }
+
     /// Synthetic one-use offer identifier.
     const OFFER_ID_BYTE: u8 = b'o';
     /// Synthetic bearer pairing secret.
@@ -740,13 +751,13 @@ mod tests {
         let mut requester = requester.into_confirmation().expect("requester confirms");
         let mut proxy = proxy.into_confirmation().expect("proxy confirms");
         let requester_hello = requester
-            .send_hello("Requester".into(), "test".into())
+            .send_hello(display_name("Requester"), "test".into())
             .expect("requester hello");
         proxy
             .receive_hello(&requester_hello, CONFIRMATION_AT_MS)
             .expect("proxy reads hello");
         let proxy_hello = proxy
-            .send_hello("Proxy".into(), "test".into())
+            .send_hello(display_name("Proxy"), "test".into())
             .expect("proxy hello");
         requester
             .receive_hello(&proxy_hello, CONFIRMATION_AT_MS)

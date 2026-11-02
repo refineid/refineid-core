@@ -4,8 +4,8 @@ use refineid_rapp::{
     Action, EndpointRole, Guards, IDENTITY_OFFER_GRACE_MS, LIVENESS_PING_AFTER_SILENCE_MS,
     MINIMUM_REMAINING_ATTEMPTS, OFFER_TTL_MS, OperationEvent, OperationState,
     PAIRING_CANDIDATES_MAX, PAIRING_IDLE_EXPIRY_DAYS, PairingEvent, PairingState,
-    QUIT_WITHDRAWAL_BOUND_MS, REVOCATION_NOTICE_DAYS, SESSION_SILENCE_LIMIT_MS, SessionEvent,
-    SessionState,
+    QUIT_WITHDRAWAL_BOUND_MS, REDIAL_WINDOW_MS, REVOCATION_ATTEMPT_BOUND_MS,
+    REVOCATION_NOTICE_DAYS, SESSION_SILENCE_LIMIT_MS, SessionEvent, SessionState,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -34,6 +34,8 @@ struct Constants {
     pairing_idle_expiry_days: u64,
     identity_offer_grace_ms: u64,
     quit_withdrawal_bound_ms: u64,
+    redial_window_ms: u64,
+    revocation_attempt_bound_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -134,6 +136,11 @@ fn formal_constants_are_the_engine_constants() {
     assert_eq!(constants.pairing_idle_expiry_days, PAIRING_IDLE_EXPIRY_DAYS);
     assert_eq!(constants.identity_offer_grace_ms, IDENTITY_OFFER_GRACE_MS);
     assert_eq!(constants.quit_withdrawal_bound_ms, QUIT_WITHDRAWAL_BOUND_MS);
+    assert_eq!(constants.redial_window_ms, REDIAL_WINDOW_MS);
+    assert_eq!(
+        constants.revocation_attempt_bound_ms,
+        REVOCATION_ATTEMPT_BOUND_MS
+    );
 }
 
 #[test]
@@ -558,6 +565,7 @@ const fn formal_action_name(action: Action) -> &'static str {
         Action::StartLiveness => "start_liveness",
         Action::SendLivenessPing => "send_liveness_ping",
         Action::RecordPeerCloseReason => "record_peer_close_reason",
+        Action::EchoPeerClose => "echo_peer_close",
         Action::SendCloseUserDisconnect => "send_close_user_disconnect",
         Action::SendCloseNormal => "send_close_normal",
         Action::SendCloseProtocolViolation => "send_close_protocol_violation",
@@ -870,3 +878,41 @@ const OPERATION_EVENTS: &[(&str, OperationEvent)] = &[
         OperationEvent::ResultCancelledReceived,
     ),
 ];
+
+#[test]
+fn a_received_close_is_echoed_and_an_echo_is_never_answered() {
+    let model = model();
+    let received = model
+        .session
+        .transitions
+        .iter()
+        .filter(|rule| rule.event == "peer_close_received")
+        .collect::<Vec<_>>();
+    assert!(!received.is_empty(), "the model names received closes");
+    for rule in received {
+        let echoes = rule
+            .actions
+            .iter()
+            .any(|action| action == "echo_peer_close");
+        for from in rule.from.values() {
+            assert_eq!(
+                echoes,
+                from != "closing",
+                "{from}: a close is echoed unless it is the echo awaited in closing"
+            );
+        }
+    }
+    for rule in &model.session.transitions {
+        let sends_close = rule
+            .actions
+            .iter()
+            .any(|action| action.starts_with("send_close_"));
+        if sends_close {
+            assert_eq!(
+                rule.to, "closing",
+                "{}: a sent close waits for its echo in closing",
+                rule.event
+            );
+        }
+    }
+}

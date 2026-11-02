@@ -158,9 +158,8 @@ an empty desk stops after a bounded time.
 - L-3; H-3, H-4, H-5. UCA-110, UCA-111, UCA-112, UCA-113, UCA-114,
   UCA-95, UCA-124.
 - CC-113, CC-114, CC-115, CC-98, CC-123.
-- Spec §4.5 items 3, 4, 6, 8 and 9; §8.3; §4.7. The echo of CC-123 is
-  the owner's decision and not yet in the spec, which still has the
-  receiver close without a close of its own (§4.5 item 9, §4.6 item 4).
+- Spec §4.5 items 3, 4, 6, 8 and 9; §8.3; §4.7; the echo of CC-123 is
+  §7.1 item 7.
 
 ### 2. Ghosting on goodbye
 
@@ -819,7 +818,7 @@ the requester; a part named after a colon is one program of it.
 | CC-120 | Every `pairing.hello` carries the sender's display name, stored in the pair record in the same commit; every session carries both current names, and a changed name replaces the stored one. | §4.3 items 3, 4; §7.1 |
 | CC-121 | A failed store of the pair record ends the pairing with `pairing.abort` and tells the user why. | §4.3 item 4 |
 | CC-122 | Only the holder's click moves the computer's remote-use switch; a revocation by the phone or idle expiry leaves it on and offers the code entry. | §4.7, hierarchy §5.2 |
-| CC-123 | A goodbye is acknowledged: the receiver of a `session.close` answers with its own close carrying the same reason, then closes the transport. The sender waits for the echo within its existing bound (1 s with a session open, the 10 s revocation attempt) and treats a goodbye without the echo as not known to be delivered: the stated limit for that case applies (R-1, R-2, R-9). | Owner decision; spec pending (§4.5 item 9 and §4.6 item 4 still say the receiver sends no close of its own) |
+| CC-123 | A goodbye is acknowledged: the receiver of a `session.close` answers with its own close carrying the same reason, then closes the transport. The sender waits for the echo within its existing bound (1 s with a session open, the 10 s revocation attempt) and treats a goodbye without the echo as not known to be delivered: the stated limit for that case applies (R-1, R-2, R-9). | §7.1 item 7; §4.5 items 8 and 9; §4.6 item 4; X-12 |
 
 ### Retired identifiers
 

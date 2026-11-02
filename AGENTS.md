@@ -253,6 +253,12 @@ rule in a line and points to the reading behind it; the readings live in
 - Check every finding against the code. Fix the real ones and list the
   rejected ones, with the reason, in the pull request description.
 
+## Blameless postmortems
+
+Read [doc/process/blameless-postmortems.md](doc/process/blameless-postmortems.md)
+before designing a protocol, a card path or shared state, and add an entry
+whenever something fails on real hardware or in real use.
+
 ## Working method
 
 Read [doc/process/working-method.md](doc/process/working-method.md) before starting: the roles (front agent, implementation agents), what a brief contains, the feedback loops, and which documentation is kept. The same file is in every RefineID repository.

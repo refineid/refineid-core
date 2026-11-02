@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use refineid_rapp::{
     GrantsHash, HandshakeRole, MANDATORY_SESSION_SUITE, MessageType, PairId,
-    SessionHandshakeParameters, WIRE_VERSION_V26_10_29, WireValue, X25519_KEY_SIZE,
+    SessionHandshakeParameters, WIRE_VERSION_V26_11_2, WireValue, X25519_KEY_SIZE,
     generate_pair_key_material,
     noise::{KK_HANDSHAKE_MESSAGE_SIZE, KkHandshakeState},
 };
@@ -15,13 +15,13 @@ use refineid_rapp::{
 /// The wire version as the prologue carries it.
 fn wire_version_value() -> WireValue {
     WireValue::Array(vec![
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.0)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.1)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.2)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_2.0)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_2.1)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_2.2)),
     ])
 }
 
-/// The session prologue of the fixed transcript (RAPP v26.10.29 section 4.3):
+/// The session prologue of the fixed transcript (RAPP v26.11.2 section 4.3):
 /// the corpus pair identifier, an all-0x77 grants hash, and the BLE profile.
 fn session_prologue_ble() -> Vec<u8> {
     let pair_id = hex::decode("8ab9b8bcde5c6eec845d9b1ca0d3a7be").expect("valid pair_id hex");
@@ -72,7 +72,7 @@ fn native_kk_replays_the_fixed_transcript() {
         .expect("message 1");
     assert_eq!(
         hex::encode(&message[..length]),
-        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b14ef0478228710e44f4f3e03ed3ba23863"
+        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b14841a17d74c9cb1b68cbf32153d71a706"
     );
     assert_eq!(
         responder
@@ -85,7 +85,7 @@ fn native_kk_replays_the_fixed_transcript() {
         .expect("message 2");
     assert_eq!(
         hex::encode(&message[..length]),
-        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6baa7fc0d941a201f3848c13901d59a929"
+        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b5b12ea65411750a31f522bfd56db2238"
     );
     assert_eq!(
         initiator
@@ -93,12 +93,12 @@ fn native_kk_replays_the_fixed_transcript() {
             .expect("read 2"),
         0
     );
-    let expected_hash = "0abb2b43e92eb3bdcb93d989051db55d9cfb0f1e3e2b5a8bd413519fac338d8b76570f2048869d14cdd976bdbaf49e2fc1a7fe2058860601ff8e7e9ad8221e06";
+    let expected_hash = "d3e83da2c741bab3a262c8045c5df9057e924615f966e34c3f52371b1d527e017c952c56355389ef7732d85954e0108ede65f18502cc57d84aa96efafe32642d";
     assert_eq!(hex::encode(initiator.handshake_hash()), expected_hash);
     assert_eq!(hex::encode(responder.handshake_hash()), expected_hash);
     assert_eq!(
         hex::encode(refineid_rapp::derive_session_id(&initiator.handshake_hash()).as_bytes()),
-        "a1bc14e17bf2b2e067312496bcc088b2"
+        "dc00fec2b6861e9f0e0bfd623a2b513e"
     );
 
     let mut initiator_transport = initiator.into_transport().expect("initiator transport");
@@ -505,15 +505,15 @@ fn test_generate_standard_noise_kk_vector() {
 
     assert_eq!(
         hex::encode(msg1_wire),
-        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b14ef0478228710e44f4f3e03ed3ba23863"
+        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b14841a17d74c9cb1b68cbf32153d71a706"
     );
     assert_eq!(
         hex::encode(msg2_wire),
-        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6baa7fc0d941a201f3848c13901d59a929"
+        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b5b12ea65411750a31f522bfd56db2238"
     );
     assert_eq!(
         hex::encode(final_h),
-        "0abb2b43e92eb3bdcb93d989051db55d9cfb0f1e3e2b5a8bd413519fac338d8b76570f2048869d14cdd976bdbaf49e2fc1a7fe2058860601ff8e7e9ad8221e06"
+        "d3e83da2c741bab3a262c8045c5df9057e924615f966e34c3f52371b1d527e017c952c56355389ef7732d85954e0108ede65f18502cc57d84aa96efafe32642d"
     );
     assert_eq!(
         hex::encode(init_c1),
@@ -525,7 +525,7 @@ fn test_generate_standard_noise_kk_vector() {
     );
     assert_eq!(
         hex::encode(session_id.as_bytes()),
-        "a1bc14e17bf2b2e067312496bcc088b2"
+        "dc00fec2b6861e9f0e0bfd623a2b513e"
     );
 }
 
@@ -591,7 +591,7 @@ fn test_standard_noise_kk_vector_matches_snow_implementation() {
     assert_eq!(len1, 48);
     assert_eq!(
         hex::encode(&buf[..len1]),
-        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b14ef0478228710e44f4f3e03ed3ba23863"
+        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b14841a17d74c9cb1b68cbf32153d71a706"
     );
     let plen1 = resp
         .read_message(&buf[..len1], &mut payload)
@@ -605,7 +605,7 @@ fn test_standard_noise_kk_vector_matches_snow_implementation() {
     assert_eq!(len2, 48);
     assert_eq!(
         hex::encode(&buf[..len2]),
-        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6baa7fc0d941a201f3848c13901d59a929"
+        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b5b12ea65411750a31f522bfd56db2238"
     );
     let plen2 = init
         .read_message(&buf[..len2], &mut payload)
@@ -616,7 +616,7 @@ fn test_standard_noise_kk_vector_matches_snow_implementation() {
     let snow_hash = init.get_handshake_hash();
     assert_eq!(
         hex::encode(snow_hash),
-        "0abb2b43e92eb3bdcb93d989051db55d9cfb0f1e3e2b5a8bd413519fac338d8b76570f2048869d14cdd976bdbaf49e2fc1a7fe2058860601ff8e7e9ad8221e06"
+        "d3e83da2c741bab3a262c8045c5df9057e924615f966e34c3f52371b1d527e017c952c56355389ef7732d85954e0108ede65f18502cc57d84aa96efafe32642d"
     );
     assert_eq!(resp.get_handshake_hash(), snow_hash);
 

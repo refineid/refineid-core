@@ -26,8 +26,8 @@ from primitives import (  # noqa: E402
     noise_xxpsk3, scalar_mult, selftest, sha256, sha512, x25519, x25519_public,
 )
 
-VERSION = [26, 10, 29]
-DOCUMENT = "26.10.29"
+VERSION = [26, 11, 2]
+DOCUMENT = "26.11.2"
 OFFER_TTL_MS = 300000
 BUSY_RETRY_AFTER_MIN_MS = 1
 BUSY_RETRY_AFTER_MAX_MS = 5000
@@ -45,6 +45,12 @@ SHA512_BLOCK = 128
 DISCOVERY_EPOCH_SECONDS = 900
 WITHDRAWAL_COUNTER_SECONDS = 60
 GENERATOR = "tools/rapp-vectors/generate.py"
+# The largest plaintext one transport frame carries (section 7.2 item 4): the
+# 65535-byte frame less the 16-byte AEAD tag.
+FRAME_PLAINTEXT_LIMIT = 65519
+# The widest encoding of an envelope's sequence (section 7.2 item 3).
+MAX_SEQUENCE = 2 ** 64 - 1
+SESSION_ID_SIZE = 16
 # Rejected envelopes that test the version field itself keep their own; every
 # other one carries the stamped version, so it fails for its stated reason.
 VERSION_ENVELOPE_VECTORS = ("missing-version", "wrong-version-type", "unsupported-version")
@@ -223,7 +229,7 @@ def with_hint(value, hint):
 def main_corpus(d):
     d["format"] = "fi.refineid.rapp.conformance"
     d["protocol_document_version"] = DOCUMENT
-    d["provenance"] = provenance("sections 4.2, 4.3, 6.1 to 6.3 and 7.2")
+    d["provenance"] = provenance("sections 4.2, 4.3, 6.1 to 6.3, 7.1 and 7.2")
     for e in d["cpace_kc2"]:
         e.update(cpace(e))
     for e in d["pairing_offer"]:
@@ -246,7 +252,55 @@ def main_corpus(d):
         envelope = cbor_decode(h(e["canonical_cbor_hex"]))
         envelope["version"] = VERSION
         e["canonical_cbor_hex"] = cbor(envelope).hex()
+    for e in d["pairing_hello"]:
+        e.update(pairing_hello(e))
+    for e in d["session_name"]:
+        e.update(session_name(e))
     return d
+
+
+def session_name(e):
+    """A session.ready or session.hello envelope carrying a display name (sections 4.3 item 4 and 7.1),
+    and whether the receiver replaces the name its pair record holds."""
+    body = {}
+    if e["message"] == "session.ready":
+        body = {"parameters": {"version": VERSION, "suite": SESSION_SUITE, "transport_profile": e["transport_profile"],
+                               "candidate_id": CANDIDATE[e["transport_profile"]],
+                               "grants_hash": h(e["grants_hash_hex"])},
+                "nonce": h(e["nonce_hex"])}
+    if e["display_name"] is not None:
+        body["display_name"] = hello_display_name(e)
+    envelope = {"version": VERSION, "session_id": h(e["session_id_hex"]), "sequence": 0,
+                "type": e["message"], "body": body}
+    name = body.get("display_name")
+    accepted = e["expected"] == "accepted"
+    return {"display_name_utf8_length": None if name is None else len(name.encode("utf-8")),
+            "record_name_after": (name if accepted else e["record_name_before"]),
+            "record_rewritten": accepted and name != e["record_name_before"],
+            "envelope_cbor_hex": cbor(envelope).hex()}
+
+
+def hello_display_name(e):
+    """The display_name a pairing_hello vector sends: its text, repeated `repeat` times when given."""
+    name = e["display_name"]
+    return name["text"] * name.get("repeat", 1) if isinstance(name, dict) else name
+
+
+def pairing_hello(e):
+    """A pairing.hello envelope (sections 4.3 item 3 and 7.1) with the vector's display name."""
+    body = {"parameters": {"version": VERSION, "suite": PAIRING_SUITE, "offer_hash": h(e["offer_hash_hex"]),
+                           "transport_profile": e["transport_profile"],
+                           "candidate_id": CANDIDATE[e["transport_profile"]]},
+            "platform": e["platform"]}
+    if e["display_name"] is not None:
+        body["display_name"] = hello_display_name(e)
+    if "requested_profiles" in e:
+        body["requested_profiles"] = e["requested_profiles"]
+    envelope = {"version": VERSION, "session_id": h(e["session_id_hex"]), "sequence": 0,
+                "type": "pairing.hello", "body": body}
+    name = body.get("display_name")
+    return {"display_name_utf8_length": None if name is None else len(name.encode("utf-8")),
+            "envelope_cbor_hex": cbor(envelope).hex()}
 
 
 def typed(v):
@@ -336,6 +390,16 @@ def withdrawal_corpus(d):
     return d
 
 
+def lifecycle_corpus(d):
+    d["format"] = "fi.refineid.rapp.lifecycle-vectors"
+    d["protocol_document_version"] = DOCUMENT
+    d["provenance"] = (f"Written independently from RAPP v{DOCUMENT} sections 4.5, 4.6 and 8.3 and hierarchy "
+                       "specification section 5.2: each scenario walks one lifecycle machine of "
+                       f"rapp-state-machine-v{DOCUMENT}.yaml from a start state through events, naming the state "
+                       f"and the ordered actions after each. {GENERATOR} keeps only the metadata current.")
+    return d
+
+
 def ble_sar_corpus(d):
     d["format"] = "fi.refineid.rapp.ble-sar-vectors"
     d["protocol_document_version"] = DOCUMENT
@@ -356,6 +420,8 @@ def operation_corpus(d):
     def request(profile, action, context, payload):
         return {"operation_id": request_id, "profile": profile, "action": action, "context": context,
                 "payload": payload, "expires_after_ms": f["expires_after_ms"]}
+
+    package_payload = {"digest": h(f["digest_sha256"]), "algorithm": "rsa_pkcs1_sha256", "key_profile": "rsa_2048"}
 
     def result(status, error=None, response=None):
         body = {"operation_id": result_id, "status": status}
@@ -389,6 +455,9 @@ def operation_corpus(d):
         ("request-sign-document", "OperationRequest",
          request(sign, "sign_document", {"document_name": f["document_name"]},
                  {"digest": h(f["digest_sha384"]), "algorithm": "ecdsa_sha384", "key_profile": "ecdsa_p384"})),
+        ("request-sign-document-package", "OperationRequest",
+         request(sign, "sign_document", package_context(f["package_name"], f["package_files"]),
+                 {"digest": h(f["digest_sha256"]), "algorithm": "rsa_pkcs1_sha256", "key_profile": "rsa_2048"})),
         ("request-batch-sign-documents", "OperationRequest",
          request(sign, "batch_sign_documents", {"document_names": f["batch_document_names"]},
                  {"digests": [h(x) for x in f["batch_digests_sha256"]], "algorithm": "ecdsa_sha256",
@@ -446,15 +515,80 @@ def operation_corpus(d):
     ]
     d["vectors"] = [{"name": n, "message_type": m, "body_hex": cbor(b).hex()} for n, m, b in vectors]
     d["rejected"] = [{"name": n, "message_type": m, "body_hex": cbor(b).hex()} for n, m, b in rejected]
+    # Well-formed requests the custodian answers with a rejected result rather than a closed session.
+    refused = [
+        ("request-sign-document-package-without-entries", "OperationRequest",
+         request(sign, "sign_document", package_context(f["package_name"], []), package_payload)),
+        ("request-sign-document-package-repeated-entry", "OperationRequest",
+         request(sign, "sign_document", package_context(f["package_name"], f["package_files"][:1] * 2),
+                 package_payload)),
+        ("request-sign-document-package-reserved-entry", "OperationRequest",
+         request(sign, "sign_document",
+                 package_context(f["package_name"], f["package_files"] + [f["package_reserved_entry"]]),
+                 package_payload)),
+        ("request-sign-document-package-entry-over-bound", "OperationRequest",
+         request(sign, "sign_document",
+                 package_context(f["package_name"], f["package_files"] + ["n" * (DISPLAY_NAME_LIMIT + 1)]),
+                 package_payload)),
+    ]
+    d["refused"] = [{"name": n, "message_type": m, "body_hex": cbor(b).hex(), "error": "unsupported_parameter"}
+                    for n, m, b in refused]
+    d["rejected_by_frame_bound"] = [package_over_one_frame(
+        f["package_over_one_frame"], lambda context: request(sign, "sign_document", context, package_payload))]
     return d
 
 
+# The longest name the custodian shows (sections 9.2 and 9.3): origin, document_name,
+# an entry of document_names or of contained_files.
+DISPLAY_NAME_LIMIT = 256
+
+
+def package_context(name, files):
+    """The sign_document context of a package (section 9.3)."""
+    return {"document_name": name, "contained_files": files}
+
+
+def package_over_one_frame(e, request):
+    """The smallest package whose sign_document request exceeds one frame (section 9.3).
+
+    Entry i, counted from 0, is its zero-padded decimal index of entry_index_digits digits
+    padded with the letter x to entry_bytes bytes. The envelope is the request at the widest
+    sequence with a zero session_id. The body itself is too long to keep; its digest is.
+    """
+    def entry(i):
+        index = f"{i:0{e['entry_index_digits']}d}"
+        return index + "x" * (e["entry_bytes"] - len(index))
+
+    def envelope(count):
+        body = request(package_context(e["document_name"], [entry(i) for i in range(count)]))
+        return body, cbor({"version": VERSION, "type": "operation.request", "session_id": bytes(SESSION_ID_SIZE),
+                           "sequence": MAX_SEQUENCE, "body": body})
+
+    count = 1
+    while len(envelope(count)[1]) <= FRAME_PLAINTEXT_LIMIT:
+        count += 1
+    body, encoded = envelope(count)
+    return {"name": "request-sign-document-package-over-one-frame", "message_type": "OperationRequest",
+            "document_name": e["document_name"], "entry_bytes": e["entry_bytes"],
+            "entry_index_digits": e["entry_index_digits"],
+            "entry_rule": ("entry i, counted from 0, is its zero-padded decimal index of entry_index_digits "
+                           "digits padded with the letter x to entry_bytes bytes; the payload is that of "
+                           "request-sign-document-package"),
+            "envelope_rule": "the operation.request envelope at sequence 2^64-1 with a session_id of 16 zero bytes",
+            "frame_plaintext_limit": FRAME_PLAINTEXT_LIMIT,
+            "smallest_refused_count": count,
+            "admitted_envelope_length": len(envelope(count - 1)[1]),
+            "refused_envelope_length": len(encoded),
+            "refused_body_sha256_hex": sha256(cbor(body)).hex()}
+
+
 CORPORA = {
-    "rapp-v26.10.29.json": main_corpus,
-    "rapp-routing-v26.10.29.json": routing_corpus,
-    "rapp-withdrawal-v26.10.29.json": withdrawal_corpus,
-    "rapp-ble-sar-v26.10.29.json": ble_sar_corpus,
-    "rapp-operation-v26.10.29.json": operation_corpus,
+    "rapp-v26.11.2.json": main_corpus,
+    "rapp-routing-v26.11.2.json": routing_corpus,
+    "rapp-withdrawal-v26.11.2.json": withdrawal_corpus,
+    "rapp-ble-sar-v26.11.2.json": ble_sar_corpus,
+    "rapp-operation-v26.11.2.json": operation_corpus,
+    "rapp-lifecycle-v26.11.2.json": lifecycle_corpus,
 }
 
 

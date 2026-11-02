@@ -131,6 +131,12 @@ impl ContainerPlan {
         algorithm.digest(&self.manifest)
     }
 
+    /// The data objects' entry names, in the order the archive holds
+    /// them.
+    pub fn object_names(&self) -> impl Iterator<Item = &str> {
+        self.objects.iter().map(|object| object.name.as_str())
+    }
+
     /// Write the finished `.asice` archive.
     ///
     /// Entry order is fixed and load-bearing: `mimetype` first for the

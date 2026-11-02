@@ -206,8 +206,13 @@ pub enum CardOperation {
     },
     /// Sign a document digest after local authorizer consent.
     SignDocument {
-        /// Human-readable document name shown by the authorizer.
+        /// Human-readable document name shown by the authorizer; for a
+        /// package, the package's own name (section 9.3).
         document_name: String,
+        /// The files the document holds when it is a package, shown by the
+        /// authorizer under its name; `None` for a single document
+        /// (section 9.3).
+        contained_files: Option<ContainedFiles>,
         /// Expected public-key profile, verified again by the authorizer.
         key_profile: CardKeyProfile,
         /// Exact signature algorithm.
@@ -230,8 +235,59 @@ pub enum CardOperation {
     },
 }
 
-/// Byte length of one batch document name (section 9.3).
-const BATCH_DOCUMENT_NAME_BYTES: core::ops::RangeInclusive<usize> = 1..=256;
+/// Byte length of one name the authorizer shows: `origin` (section 9.2),
+/// `document_name`, an entry of `document_names` or of `contained_files`
+/// (section 9.3), `tstr .size (1..256)`.
+const DISPLAY_NAME_BYTES: core::ops::RangeInclusive<usize> = 1..=256;
+
+/// The directory an ASiC-E container reserves for its manifest and
+/// signatures; no entry of `contained_files` lies under it (section 9.3).
+const CONTAINER_RESERVED_DIRECTORY: &str = "META-INF/";
+
+/// The files a package holds, as `sign_document`'s `contained_files`
+/// carries them (section 9.3): the names of the data objects as the
+/// container holds them, in container order, at least one, each within
+/// the 1 to 256 byte name bound and not blank, unique, none under
+/// `META-INF/` in any letter case.
+///
+/// Whether the request they travel in encodes in one frame is the
+/// request's predicate, checked by [`OperationRequest::validate`], which
+/// sees the whole request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContainedFiles(Vec<String>);
+
+impl ContainedFiles {
+    /// The entries of a package, in container order.
+    ///
+    /// # Errors
+    /// [`CardOperationError::InvalidDisplayContext`] for an entry outside
+    /// the name bound or blank; [`CardOperationError::InvalidField`]
+    /// naming `contained_files` for no entry, a repeated entry, or an
+    /// entry under the container's reserved directory.
+    pub fn reconstruct(names: Vec<String>) -> Result<Self, CardOperationError> {
+        if names.is_empty() {
+            return Err(CardOperationError::InvalidField("contained_files"));
+        }
+        for (index, name) in names.iter().enumerate() {
+            if !DISPLAY_NAME_BYTES.contains(&name.len()) || name.trim().is_empty() {
+                return Err(CardOperationError::InvalidDisplayContext);
+            }
+            let reserved = name
+                .get(..CONTAINER_RESERVED_DIRECTORY.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(CONTAINER_RESERVED_DIRECTORY));
+            if reserved || names[..index].contains(name) {
+                return Err(CardOperationError::InvalidField("contained_files"));
+            }
+        }
+        Ok(Self(names))
+    }
+
+    /// The entries, in container order; never empty.
+    #[must_use]
+    pub fn names(&self) -> &[String] {
+        &self.0
+    }
+}
 
 impl CardOperation {
     /// Whether this action commands a private key behind a PIN, and so needs
@@ -282,6 +338,7 @@ impl CardOperation {
             } => validate_named_digest(origin, *key_profile, *algorithm, digest),
             Self::SignDocument {
                 document_name,
+                contained_files: _,
                 key_profile,
                 algorithm,
                 digest,
@@ -296,9 +353,6 @@ impl CardOperation {
                     return Err(CardOperationError::InvalidField("digests"));
                 }
                 for (name, digest) in document_names.iter().zip(digests) {
-                    if !BATCH_DOCUMENT_NAME_BYTES.contains(&name.len()) {
-                        return Err(CardOperationError::InvalidDisplayContext);
-                    }
                     validate_named_digest(name, *key_profile, *algorithm, digest)?;
                 }
                 ensure_batch_result_fits_one_frame(digests.len(), *key_profile)
@@ -343,6 +397,7 @@ impl CardOperation {
             }
             Self::SignDocument {
                 document_name,
+                contained_files,
                 key_profile,
                 algorithm,
                 digest,
@@ -351,6 +406,14 @@ impl CardOperation {
                     "document_name".into(),
                     WireValue::Text(document_name.clone()),
                 );
+                if let Some(files) = contained_files {
+                    context.insert(
+                        "contained_files".into(),
+                        WireValue::Array(
+                            files.names().iter().cloned().map(WireValue::Text).collect(),
+                        ),
+                    );
+                }
                 payload.insert(
                     "key_profile".into(),
                     WireValue::Text(key_profile.wire_name().into()),
@@ -414,18 +477,15 @@ impl CardOperation {
             },
             "sign_document" => Self::SignDocument {
                 document_name: take_text(&mut context, "document_name")?,
+                contained_files: take_optional_text_array(&mut context, "contained_files")?
+                    .map(ContainedFiles::reconstruct)
+                    .transpose()?,
                 key_profile: CardKeyProfile::parse(&take_text(&mut payload, "key_profile")?)?,
                 algorithm: SignatureAlgorithm::parse(&take_text(&mut payload, "algorithm")?)?,
                 digest: take_bytes(&mut payload, "digest")?,
             },
             "batch_sign_documents" => Self::BatchSignDocuments {
-                document_names: take_array(&mut context, "document_names")?
-                    .into_iter()
-                    .map(|value| match value {
-                        WireValue::Text(name) => Ok(name),
-                        _ => Err(CardOperationError::InvalidField("document_names")),
-                    })
-                    .collect::<Result<_, _>>()?,
+                document_names: take_text_array(&mut context, "document_names")?,
                 key_profile: CardKeyProfile::parse(&take_text(&mut payload, "key_profile")?)?,
                 algorithm: SignatureAlgorithm::parse(&take_text(&mut payload, "algorithm")?)?,
                 digests: take_array(&mut payload, "digests")?
@@ -487,11 +547,13 @@ impl OperationRequest {
         Ok(request)
     }
 
-    /// Validates time bounds and operation parameters.
+    /// Validates time bounds and operation parameters, and that a package's
+    /// request travels in one frame (section 9.3).
     ///
     /// # Errors
     /// [`CardOperationError`] on a zero lifetime, a profile that does not own
-    /// the action, or invalid operation parameters.
+    /// the action, invalid operation parameters, or a package whose request
+    /// exceeds one frame.
     pub fn validate(&self) -> Result<(), CardOperationError> {
         if self.expires_after_ms == 0 {
             return Err(CardOperationError::InvalidLifetime);
@@ -499,7 +561,37 @@ impl OperationRequest {
         if self.profile != self.operation.required_profile() {
             return Err(CardOperationError::ProfileActionMismatch);
         }
-        self.operation.validate()
+        self.operation.validate()?;
+        if let CardOperation::SignDocument {
+            contained_files: Some(_),
+            ..
+        } = &self.operation
+        {
+            self.ensure_request_fits_one_frame()?;
+        }
+        Ok(())
+    }
+
+    /// Check that this request travels in one frame (section 7.2 item 4):
+    /// its `operation.request` envelope at the widest sequence encoding is
+    /// built and encoded against the single-frame limit.
+    ///
+    /// # Errors
+    /// [`CardOperationError::PackageTooLarge`] when that envelope exceeds one
+    /// frame; any other encoding failure as itself.
+    fn ensure_request_fits_one_frame(&self) -> Result<(), CardOperationError> {
+        let envelope = Envelope::reconstruct(
+            MessageType::OperationRequest,
+            SessionId::from_array([u8::MIN; SESSION_ID_SIZE]),
+            u64::MAX,
+            self.wire_body(),
+        )
+        .map_err(CardOperationError::Wire)?;
+        match envelope.encode() {
+            Ok(_) => Ok(()),
+            Err(WireError::OversizedPlaintext { .. }) => Err(CardOperationError::PackageTooLarge),
+            Err(error) => Err(CardOperationError::Wire(error)),
+        }
     }
 
     /// Local deadline on the continuous clock with an endpoint-specific
@@ -536,6 +628,13 @@ impl OperationRequest {
     /// # Errors
     /// [`CardOperationError`] on an invalid request or an encoding failure.
     pub fn to_wire_body(&self) -> Result<BTreeMap<String, WireValue>, CardOperationError> {
+        self.validate()?;
+        Ok(self.wire_body())
+    }
+
+    /// The `operation.request` body of this request as the wire carries it,
+    /// valid or not.
+    fn wire_body(&self) -> BTreeMap<String, WireValue> {
         let (action, context, payload) = self.wire_parts();
         let mut body = BTreeMap::new();
         body.insert(
@@ -547,14 +646,13 @@ impl OperationRequest {
             WireValue::Text(self.profile.as_str().to_owned()),
         );
         body.insert("action".into(), WireValue::Text(action.to_owned()));
-        self.validate()?;
         body.insert(
             "expires_after_ms".into(),
             WireValue::Unsigned(self.expires_after_ms),
         );
         body.insert("context".into(), WireValue::Map(context));
         body.insert("payload".into(), WireValue::Map(payload));
-        Ok(body)
+        body
     }
 
     /// Parses an authenticated `operation.request` body.
@@ -735,7 +833,7 @@ fn validate_named_digest(
     algorithm: SignatureAlgorithm,
     digest: &[u8],
 ) -> Result<(), CardOperationError> {
-    if display_name.trim().is_empty() || display_name.len() > 512 {
+    if display_name.trim().is_empty() || !DISPLAY_NAME_BYTES.contains(&display_name.len()) {
         return Err(CardOperationError::InvalidDisplayContext);
     }
     if digest.len() != algorithm.digest_size() {
@@ -793,6 +891,9 @@ pub enum CardOperationError {
     KeyAlgorithmMismatch,
     /// The signatures of the batch do not fit one result frame.
     BatchTooLarge,
+    /// The request of a package, with every file it holds, does not fit one
+    /// frame.
+    PackageTooLarge,
     /// A fixed-size identifier could not be reconstructed.
     InvalidIdentifier,
     /// Action is not registered under the named credential profile.
@@ -862,6 +963,34 @@ fn take_array(
     match map.remove(field) {
         Some(WireValue::Array(value)) => Ok(value),
         _ => Err(CardOperationError::InvalidField(field)),
+    }
+}
+
+/// A present array of text values; a missing field or any other value type
+/// is a schema violation.
+fn take_text_array(
+    map: &mut BTreeMap<String, WireValue>,
+    field: &'static str,
+) -> Result<Vec<String>, CardOperationError> {
+    take_array(map, field)?
+        .into_iter()
+        .map(|value| match value {
+            WireValue::Text(name) => Ok(name),
+            _ => Err(CardOperationError::InvalidField(field)),
+        })
+        .collect()
+}
+
+/// An array of text values when the field is present, `None` when it is
+/// absent; a present field of any other shape is a schema violation.
+fn take_optional_text_array(
+    map: &mut BTreeMap<String, WireValue>,
+    field: &'static str,
+) -> Result<Option<Vec<String>>, CardOperationError> {
+    if map.contains_key(field) {
+        take_text_array(map, field).map(Some)
+    } else {
+        Ok(None)
     }
 }
 

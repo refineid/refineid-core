@@ -2,7 +2,7 @@
 
 **Status:** Reviewed by the owner on 2026-10-22 with RAPP v26.10.22
 **Date:** 2026-10-18
-**Applies to:** RAPP v26.10.29 (`doc/protocols/rapp-v26.10.29.md`), the
+**Applies to:** RAPP v26.11.2 (`doc/protocols/rapp-v26.11.2.md`), the
 transport and discovery hierarchy, and the requester and custodian
 applications built on them
 
@@ -166,9 +166,13 @@ the fact; a timeout or an inference from silence is not feedback.
 
 Each UCA follows the form "controller provides or omits control action
 in context", and is one of: not provided when needed (N), provided when
-unsafe (P), or provided too early, too late, or out of order (T). No
-control action in this system is a continuous one, so the duration type
-does not apply. Physical degradation of an actuator is not a UCA; it is a
+unsafe (P), provided too early, too late, or out of order (T), or, for
+a continuous control action, stopped too soon or applied too long (D).
+Two control actions are continuous: a requester dialing a custodian,
+which goes on as a search, a scan and redials until a session opens, and
+a requester offering a custodian's identity to local consumers, which
+holds from the moment it starts until it is withdrawn (section 36). For
+them the fourth type applies; every other control action is discrete. Physical degradation of an actuator is not a UCA; it is a
 loss scenario (6.6).
 
 | ID | Controller | Control action | Type | Context | Hazard |
@@ -1781,6 +1785,14 @@ until it expires, a lost computer's pairing is live, and the holder
 forgets it on the phone. A wall clock set far ahead expires pairings
 early, costing a new pairing, and one set back delays expiry by as much.
 
+Reopened by section 36: the phone listing a computer that forgot it is
+not harmless. It is a state shown to the holder that is not the
+system's (H-5), and after the holder pairs the same computer again the
+phone lists it twice, with nothing to tell the entries apart. Section 36
+replaces "told nothing" with one bounded attempt to deliver the close
+(UCA-116, CC-118); the residual narrows to an attempt that does not
+reach the phone.
+
 ## 30. The custodian's memory of operation identifiers
 
 ### 30.1 Scope
@@ -1974,9 +1986,10 @@ waits, and no new outcome exists.
 well as through a card in the computer's reader: `remote::sign_on_phone`
 plans every document around the certificate the phone returns, sends
 every digest in one `RemoteSigner::sign` call, which the requester
-carries as one `sign_document` or `batch_sign_documents` (specification
-§9.3), and finishes each document on the same path as a local
-signature. This is the requester's path from the chosen file to the
+carries as one `sign_document` -- for a single document, or for a
+package with the names of every file it holds -- or as one
+`batch_sign_documents` of single documents (specification §9.3), and
+finishes each document on the same path as a local signature. This is the requester's path from the chosen file to the
 digest that UCA-15 and CC-12 ask to be analysed as its own control
 loop. PIN 2 is typed only on the phone (§11 items 2 and 4). Losses and
 hazards are this record's: L-1, L-5; H-1, H-5.
@@ -1984,9 +1997,9 @@ hazards are this record's: L-1, L-5; H-1, H-5.
 ### 35.2 Control structure
 
 The requester's signing flow is the controller. Its control actions
-are to send the batch -- each document's name and digest, with one key
-profile and one algorithm -- and, after the answer, to finish and write
-each signed document. Its process model is which certificate the
+are to send the batch -- each document's name and digest, for a package
+the names of the files it holds, with one key profile and one algorithm
+-- and, after the answer, to finish and write each signed document. Its process model is which certificate the
 phone's card signs under and which digest belongs to which document.
 Its feedback is the certificate from `read_certificate`, and either one
 signature per document or a refusal. The custodian shows the names,
@@ -1999,7 +2012,7 @@ its only feedback that the card signed what was planned.
 | ID | Controller | Control action | Type | Context | Hazard |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | UCA-105 | Requester | Send a document's digest | P | When it is not the digest of exactly the octets that document's format signs: another file, a plan built around another certificate, or a hash the algorithm does not name. The holder consents to the name and the card signs something else. | H-1 |
-| UCA-106 | Requester | Show a document's name in the batch | P | When the name at a position is not the file whose digest is at that position, or a container's name leaves out a file it signs. | H-1, H-5 |
+| UCA-106 | Requester | Show a document's name in the batch | P | When the name at a position is not the file whose digest is at that position, or a package is shown without a file it holds, or under another name than the container's own entry names. | H-1, H-5 |
 | UCA-107 | Requester | Finish and write a signed document | P | When the phone's signature is over another digest, by a key the certificate does not certify, at another document's position, or one of more or fewer signatures than documents: a document that does not verify, or carries another document's signature, is written as signed. | H-5 |
 | UCA-108 | Requester | Build the batch on the phone's certificate | P | When the certificate is not the card's qualified-signature certificate, such as the authentication certificate: the documents name a certificate that does not certify the qualified key. | H-5 |
 | UCA-109 | Requester | Write the documents of a batch | T | Before every signature of the batch has been checked, so a later failure leaves part of the batch written. | H-5 |
@@ -2009,7 +2022,7 @@ its only feedback that the card signed what was planned.
 | ID | Constraint | Closes |
 | :--- | :--- | :--- |
 | CC-109 | Each digest is the signer parameters' digest of `DocumentPlan::to_be_signed` of the plan built around the phone's certificate. The digest and signature algorithm come from that certificate's key through `document_signer`, the one function the local card path uses too, and RAPP's `algorithm` maps from it name for name: `rsa_pkcs1_sha256` with SHA-256 for RSA, the card adding the DigestInfo as for a local card; `ecdsa_sha384` with SHA-384 for P-384. `SignatureRequest` refuses a digest of the wrong length or an algorithm the key profile does not support. | UCA-105 |
-| CC-110 | The core names each document from the files its plan signs, a container's files joined in signing order, within §9.3's 1 to 256 bytes; a longer name is refused, never shortened. The requester sends the batch's names and digests in the batch's order and changes neither. | UCA-106 |
+| CC-110 | The core names a single document by its file and a package by the container the signing writes, each within §9.3's 1 to 256 bytes, and lists a package's files as `contained_files`: the container's own entry names, the names its manifest and signature cover, in container order, each within the same bound. A name or entry over the bound is refused, never shortened; a package whose request does not encode in one frame is refused at the requester's wire border (`PackageTooLarge`) and at the custodian's admission (`unsupported_parameter`), as CC-105 bounds a batch, and no entry is dropped to make it fit. A package is the only document of its `sign_document`; it never joins a batch. The requester sends the names, entries and digests in the batch's order and changes none of them. | UCA-106 |
 | CC-111 | Nothing is finished until the answer has exactly one signature per document and each verifies against the phone certificate's key over its own position's signed octets; any other answer refuses the whole batch and writes nothing. Each document is finished only after the whole batch has passed, and the phone is asked at most once per signing. | UCA-107, UCA-109 |
 | CC-112 | The phone's certificate is admitted only when its key usage asserts nonRepudiation and its key is RSA of 2048 or 3072 bits or ECDSA on P-384, before any digest is sent. | UCA-108 |
 
@@ -2017,3 +2030,184 @@ Residual, accepted: once every signature has verified, each document
 finishes on its own, so a timestamp authority that refuses one document
 leaves the others written and the refused one reported. The file the
 user chose reaching `PhoneSignOptions` stays the requester's (CC-12).
+
+## 36. The lifecycle of remote use and service
+
+### 36.1 Scope
+
+RAPP v26.11.2 states the lifecycle above the pairing and session
+machines as three machines with an answer for every state and event
+(specification §4.7, `rapp-state-machine-v26.11.2.yaml`): the
+requester's remote use, its view of the custodian, and the custodian's
+service; how the custodian's holder sees each computer is the
+presentation of its pairing states. The owner's
+decisions of 2026-11-02 fix their open points. A custodian's remote
+access off is a pause: withdrawal as specification §4.5 says, pairings
+kept, and on again announces at once. A requester's remote use off
+forgets its one pairing, with the close on an open session or, with
+none, one attempt of at most `revocation_attempt_bound_ms` (10 s) to
+deliver it, and keeps no forgotten pairing. The requester's switch moves
+only by its user's click. A requester treats a session end by its reason:
+`pairing_revoked` forgets, `service_withdrawn` withdraws the custodian's
+presence until it announces itself again, a protocol violation waits for
+the custodian's next announcement without redialing, and anything else
+is a loss,
+redialed at once within `redial_window_ms`. The
+requester presents the custodian only through its card: anything but a
+connected, confirmed card is "no remote card", with no reason shown.
+`pairing.hello` carries each endpoint's display name, required, kept in
+the pair record and refreshed on every session, and never used to find a
+pairing. Custodians are phones
+with NFC; computers, iPads and Android tablets are requesters. Losses
+and hazards are this record's: L-3, L-4; H-3, H-4, H-5, H-6, H-7.
+
+The theme is process-model staleness. In each case below a controller
+kept acting on a belief about the other endpoint, or about its own
+storage, after the fact had changed, because the change had no feedback
+path, or the path existed and the controller did not change its action.
+
+### 36.2 Control structure
+
+```
+            +---------------- Cardholder -----------------+
+   switch,  |  ^ the remote card, or none        switch,  |  ^ list of computers
+   pair     v  |                                 forget   v  |
+   +-------------------------+                  +-------------------------+
+   | Requester               |  session close   | Custodian               |
+   | model: its view of the  |<=================| model: its view of each |
+   |  custodian, offer,      |  reasons, ready, |  computer, pairings,    |
+   |  its one pairing        |  card.status     |  sessions               |
+   |                         |=================>|                         |
+   +--+----------------+-----+  pairing_revoked +-----+-------------------+
+      | dial           ^ records,                     | advertise, withdraw
+      v                | advertisements               v
+   +-------------------+--------------------------------------+
+   |           Discovery: mDNS/DNS-SD records, BLE            |
+   +----------------------------------------------------------+
+      | offer identity              ^ store result
+      v                             |
+   +-----------------+        +-----------+
+   | Local consumer  |        | Disk, key |
+   +-----------------+        | store     |
+                              +-----------+
+```
+
+The requester learns of the custodian only through discovery records,
+BLE advertisements and the session with its close reasons; the custodian
+learns of the requester only through sessions and their close reasons.
+Every stale belief below is one of these channels failing to carry a
+change, or a controller not acting on what it carried.
+
+### 36.3 Unsafe control actions
+
+| ID | Controller | Control action | Type | Context | Hazard |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| UCA-110 | Custodian | Withdraw service | N | When the holder turns remote access off: the phone stops serving but sends no `service_withdrawn` and publishes no withdrawn record, so every requester's model says "lost, coming back". | H-3, H-5 |
+| UCA-111 | Custodian | Revoke every pairing | P | When the holder meant only to stop serving: pairings both sides need are destroyed without `pairing_revoked`, and turning remote access on again serves nothing. | H-4, H-7 |
+| UCA-112 | Requester | Offer the custodian's identity | D | Applied too long after a verified withdrawal: the close or the record said the phone stopped serving, and the identity stayed for the loss grace. | H-3 |
+| UCA-113 | Requester | Dial the custodian | D | Applied too long: after a verified withdrawal, or after dials the custodian refuses, the requester keeps dialing, scanning or redialing on its own timer without end. | H-5, H-6 |
+| UCA-114 | Requester | Show the custodian's state ("Connecting to the phone…", paused, out of range) | P | When the holder can do nothing with it: the phone is off, withdrawn, out of sight or being redialed, the text describes the requester's intent rather than the system, and the holder waits for something that is not happening. | H-5 |
+| UCA-115 | Requester | Dial the custodian | T | Too late after the custodian serves again: a running BLE scan or a polling interval holds the dial for up to 30 s. | H-7 |
+| UCA-116 | Requester | Tell the custodian it forgot the pairing | N | When the holder turns remote use off with no session open, or the close does not leave within its second: the phone keeps listing and serving a pairing the computer no longer holds, and lists the computer twice after the holder pairs it again. UCA-9's context, narrowed; section 29 accepted it. | H-4, H-5 |
+| UCA-117 | Custodian | Supersede an older pairing on a new pairing | P | By display name: a different computer that carries the same name loses its pairing silently. | H-4, H-7 |
+| UCA-118 | Custodian | Supersede an older pairing on a new pairing | N | When the old record has no name, or the custodian keeps both: the list shows two entries for one computer. | H-5 |
+| UCA-119 | Custodian or requester | Show the peer in the list or a PIN prompt | P | Without its name, because the name lived apart from the record and was lost while the record survived, or under a name the peer no longer carries because it was renamed after pairing. | H-5 |
+| UCA-120 | Requester or custodian | Report the pairing made | P | When its own durable store of the record failed (full disk): the holder believes the device is paired, and the peer holds an unconfirmed record until its deadline. | H-4, H-5 |
+| UCA-121 | Custodian | Verify PIN 1 with the remembered PIN | P | After the card refused that PIN: the remembered PIN is sent again and spends a try; the retry floor (INV-10) bounds it. | H-1 |
+| UCA-122 | Custodian | Hold the card session | D | Applied too long: a held card session that never ends blocks every later card event, so card arrivals, removals and operations go unseen. | H-3, H-7 |
+| UCA-123 | Requester | Dial the custodian to deliver its revocation | D | Applied too long: the forgotten pairing's attempt goes on beyond its bound, or past a kill and relaunch, or the key is kept for it, so a computer the holder switched off keeps reaching for the phone and holds a key it no longer needs. | H-6, H-4 |
+
+UCA-110 and UCA-112 are cases of UCA-3 and UCA-5; UCA-113 extends UCA-6
+from "a dial hangs" to "a dial never stops"; UCA-114 is a case of UCA-7
+and narrows CC-95; UCA-116 is UCA-9 as section 29 accepted it; UCA-120
+mirrors UCA-8 on an endpoint's own storage; UCA-121 is a breach of CC-66;
+UCA-122 belongs with section 12's held card session (UCA-46). They are
+listed here because each now has a named cell in the state model that
+enforces its constraint.
+
+### 36.4 Loss scenarios
+
+**The phone said nothing (UCA-110, UCA-111, UCA-112, UCA-113, UCA-114).**
+The holder turns the phone's remote access off. A switch path written as
+"forget everything" rather than "stop serving" closes the sessions
+without a reason and destroys the pairings. The computer has two ways to
+learn that a phone stopped serving, the close reason and the withdrawn
+record; neither arrives, and it reads the remaining evidence, silence, as
+a loss, correctly by its rules. It keeps the identity for the grace,
+holds the record, then dials; each dial fails silently and its rule says
+try again; its screen says it is connecting. The phone turned on again
+serves nothing, because nothing is left to serve. Even with the phone
+withdrawing as specified, a requester that scans for BLE in the withdrawn
+state, and shows the scan as connecting, receives the feedback and does
+not change its action.
+
+**The computer forgot alone (UCA-116, UCA-117, UCA-118, UCA-119).** The
+holder turns remote use off with no session open. Under section 29 the
+key went at once and nothing was sent; the phone kept a pairing that no
+longer existed and listed it, and after the holder paired the same
+computer again it listed two. The phone cannot link them: every ceremony
+makes fresh keys, which is what keeps a computer unlinkable to observers
+(H-6). The one controller that knew the old pairing was dead, the
+computer, had already destroyed the means to say so. Filling the gap from
+the display name builds a model on evidence that identifies nothing: two
+computers with one name lose each other's pairing, and a record whose
+name was lost is out of reach.
+
+**The store that failed quietly (UCA-120).** A full disk made the record's
+write fail. The holder's feedback was the ceremony's end, not the
+write's result; the peer, waiting for `pairing.stored`, revoked at its
+deadline, and the holder had no word why remote use did not work.
+
+**Remembered and held too long (UCA-121, UCA-122).** A remembered PIN 1
+kept as valid after the card refused it, and a held card session kept as
+if the card were still there after the driver wedged, are the same
+staleness on the card side. They belong with sections 12 and 22 and are
+listed here because they share the cause.
+
+**The attempt that does not stop (UCA-123).** The bounded revocation
+attempt is remote activity after the holder turned remote use off. Left
+unbounded it would be UCA-91 again, and a key kept for it would be the
+lingering forgotten pairing the owner ruled out.
+
+### 36.5 Controller constraints
+
+| ID | Constraint | Enforced in | Closes |
+| :--- | :--- | :--- | :--- |
+| CC-113 | A custodian's remote access off is withdrawal and only withdrawal: the closes, the withdrawn record replacing the TXT record in place, unregistration after 2 to 10 s, every pairing kept; no path behind the switch revokes. Turning it on again serves at once under a fresh instance name. Specification §4.5 items 3 and 4. | `custodian_service`; X-08; INV-14 | UCA-110, UCA-111 |
+| CC-114 | A requester that receives `service_withdrawn` or `card_unavailable`, or matches a withdrawn record, withdraws the custodian's identity at once and dials, offers and holds nothing until the custodian announces itself again: a `mode=session` record appears or the BLE advertisement is first seen after the withdrawal; a BLE scan meanwhile is passive and a consumer's request is refused at once. A `card_unavailable` close gets no grace, since a certificate whose key cannot be used is never offered, and the custodian announces itself again under a fresh instance name when it can serve a card. Specification §4.5 item 6, §8.4 item 5. | `requester_view_of_custodian` state `withdrawn`; X-06; INV-16 | UCA-112, UCA-113 |
+| CC-115 | A requester dials only when the custodian appears, when a local consumer asks, or within `redial_window_ms` (120 s, equal to the identity grace) of a loss or of the first failed dial since the custodian appeared; never on a free-running timer. A loss opens the window at once, in sight or not; an authenticated protocol violation opens none and the requester waits for the custodian's next appearance, since a peer that broke the protocol once (a version mismatch, most likely) breaks it again until one endpoint is updated; outside a window a requester holds nothing and waits for an appearance or a consumer. What the user sees after a loss follows only the identity grace. Specification §4.5 item 6, §8.3. | `requester_view_of_custodian` state `connecting` and its window guards; X-07 | UCA-113 |
+| CC-116 | A requester presents the custodian only through its card: the identity while a session confirms it, otherwise no remote card, whatever the reason, with no text naming the custodian's state; dialing and scanning are never shown. The one exception is the line that the phone forgot this computer after its `pairing_revoked`. This supersedes CC-95's "waiting" and "connected" as states of the switch; the switch shows on or off, and blocked for the computer's own Bluetooth or permissions. Specification §4.7. | `requester_view_of_custodian` presentation | UCA-114 |
+| CC-117 | Discovery is continuous while remote use is on and not suspended, and a `mode=session` record that appears is dialed at once, before any BLE scan still running. Hierarchy specification §3.2, specification §8.3. | `requester_view_of_custodian` `record_appeared` | UCA-115 |
+| CC-118 | A requester's forget sends the close on an open session within 1 s. With none open, every forget the holder makes, turning remote use off (with or without a local card present) or pairing another phone, makes one attempt of at most `revocation_attempt_bound_ms` (10 s) to reach the custodian and send the close as the session's first message, then destroys the key whether or not it went; the attempt offers no identity and starts no operation, and is CC-86's only exception. Automatic drops send nothing: idle expiry destroys the key at once, and a local card only suspends remote use. A requester keeps no revoking pairing beyond the bound, and the start sweep destroys one whose bound passed while the process was down. This supersedes CC-100's "destroyed at once and owed nothing". Specification §4.6 item 6. | `pairing` `revoking` with `revocation_attempt_ended`; X-09; INV-18 | UCA-116, UCA-118, UCA-123 |
+| CC-119 | No endpoint finds, matches, replaces or revokes a pairing by its display name or anything the peer says about itself; an old pairing goes by its own `pairing_revoked` (CC-118) or by idle expiry. Specification §4.3 item 3. | INV-19 | UCA-117, UCA-118 |
+| CC-120 | Every `pairing.hello` carries the sender's display name, 1 to 256 bytes and not blank, with an operating-system prefix ("macOS - host", "Android - tablet name") only where the name does not already say the platform, so an iPhone or iPad sends its own or its model name; it is part of the pair record, stored and destroyed with it in one commit, so a record has a name for its whole life. Every session carries both endpoints' current names, the custodian's in `session.ready` and the requester's in `session.hello`, and a name that differs replaces the record's; a failed store keeps the old name and the session goes on, so a renamed device is shown by its new name from its next session. Specification §4.3 items 3 and 4, §7.1. | INV-20; `pairing_hello` vectors | UCA-119 |
+| CC-121 | A failed store of the pair record ends the pairing: `pairing.abort`, no `pairing.stored`, the candidate keys destroyed, and the user told the pairing could not be stored, with the platform's cause. Specification §4.3 item 4. | `pairing` `pair_record_store_failed` | UCA-120 |
+| CC-122 | Only the holder's click moves a requester's remote-use switch; its position is stored and restored at launch. A revocation from the custodian or idle expiry leaves it on and offers the code entry; a requester holds one pairing, and pairing another phone, offered while no remote card is presented, replaces it. This supersedes CC-101's "remote use turns off" when the last pairing ends other than by the click. Hierarchy specification §5.2. | `requester_remote_use`; X-10; INV-17 | UCA-114, UCA-116 |
+| CC-66, CC-43 | (existing) A remembered PIN 1 ends when the card refuses it; no belief about the card's security status between operations. | credential memory | UCA-121 |
+| CC-41 | (existing) The hold follows the slot, and a slot that no longer holds a valid card ends the held session at once. | held card session | UCA-122 |
+
+Residual, accepted:
+
+- An endpoint that crashes, is ended by its operating system, loses
+  power, or quits on a platform that gives no quit signal sends nothing:
+  no withdrawal and no revocation close. Its peer sees a loss and handles
+  it within the bounded windows (the 120 s redial window
+  and grace), and a pairing it meant to forget stays on the peer until
+  idle expiry. No message can come from an endpoint that is gone
+  (specification §4.6 item 8; UCA-95's residual stands).
+- A close on an open session that does not leave within its second is
+  dropped and gets no second attempt (UCA-116's second context).
+- A revocation attempt that does not reach the phone in 10 s, because the
+  phone is off, away or withdrawn, leaves the phone listing the computer
+  until its idle expiry, up to 30 days. With fresh keys per pairing the
+  phone cannot tell a re-paired computer from a new one, and lists both
+  until then (specification §4.6 item 7); CC-118 and CC-119 narrow
+  UCA-118 to this case.
+- The revocation attempt is remote activity, up to 10 s, after the holder
+  turned remote use off or paired another phone, also while a local card
+  is present; it offers no identity and starts no operation. An idle
+  expiry on the requester makes no attempt; the phone, measuring the same
+  silence, expires the pairing at about the same time.
+- A loss keeps the identity offered for the grace of specification §8.4
+  item 3, up to 120 s, while the requester shows the card; a withdrawal
+  ends it at once.

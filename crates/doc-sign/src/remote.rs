@@ -20,7 +20,7 @@
 //! [`RemoteSigner::sign`] is one `sign_document` for a batch of one --
 //! a single document, or a package carrying the names of the files it
 //! holds -- or one `batch_sign_documents` for several single documents
-//! (RAPP v26.11.1 section 9.3). The phone shows the document names, and
+//! (RAPP v26.11.2 section 9.3). The phone shows the document names, and
 //! under a package's name every file it holds, asks for PIN 2 once on
 //! its own screen, and its card signs each digest; no PIN reaches this
 //! computer, and no document byte reaches the phone.
@@ -58,7 +58,7 @@ use crate::service::{
 };
 use crate::x509_ext::NameExt as _;
 
-/// The UTF-8 byte length of one name the phone shows: RAPP v26.11.1
+/// The UTF-8 byte length of one name the phone shows: RAPP v26.11.2
 /// section 9.3, `document_name` and each entry of `document_names` and
 /// of `contained_files`, `tstr .size (1..256)`.
 const DOCUMENT_NAME_BYTES: RangeInclusive<usize> = 1..=MAX_DOCUMENT_NAME_BYTES;
@@ -119,7 +119,7 @@ impl fmt::Debug for UnvalidatedPhoneSignature {
 /// Why the paired phone produced no certificate or no signatures.
 ///
 /// The requester maps its own protocol's outcomes onto this closed
-/// set: RAPP v26.11.1 section 10.3 names the `operation.result` errors,
+/// set: RAPP v26.11.2 section 10.3 names the `operation.result` errors,
 /// and a session or link that ends before the result arrives is
 /// [`Self::Unreachable`] (section 9.3: an interrupted batch delivers no
 /// signature).
@@ -199,7 +199,7 @@ impl core::error::Error for PhoneCertificateError {}
 /// The name the phone shows the holder for one document, RAPP's
 /// `document_name`: a single document's file name, or a package's own
 /// name, the file name of the container the signing writes. Its UTF-8
-/// length is within RAPP v26.11.1 section 9.3's bound.
+/// length is within RAPP v26.11.2 section 9.3's bound.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentName(String);
 
@@ -335,7 +335,7 @@ impl PhoneSigningBatch {
 /// at most once per [`sign_on_phone`].
 pub trait RemoteSigner {
     /// The certificate of the phone's card's qualified-signature key:
-    /// `read_certificate` with kind `signature` (RAPP v26.11.1
+    /// `read_certificate` with kind `signature` (RAPP v26.11.2
     /// section 9.3).
     ///
     /// # Errors

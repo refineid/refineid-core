@@ -2,7 +2,7 @@
 // Licensed under the Apache License, Version 2.0.
 
 //! A `sign_document` of a package carries the names of every file it
-//! holds (RAPP v26.11.1 section 9.3): present exactly for a package, each
+//! holds (RAPP v26.11.2 section 9.3): present exactly for a package, each
 //! entry within the name bound, unique and outside `META-INF/`, and the
 //! whole request within one frame (section 7.2 item 4). A single document
 //! carries none.

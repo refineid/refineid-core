@@ -26,8 +26,8 @@ from primitives import (  # noqa: E402
     noise_xxpsk3, scalar_mult, selftest, sha256, sha512, x25519, x25519_public,
 )
 
-VERSION = [26, 11, 1]
-DOCUMENT = "26.11.1"
+VERSION = [26, 11, 2]
+DOCUMENT = "26.11.2"
 OFFER_TTL_MS = 300000
 BUSY_RETRY_AFTER_MIN_MS = 1
 BUSY_RETRY_AFTER_MAX_MS = 5000
@@ -229,7 +229,7 @@ def with_hint(value, hint):
 def main_corpus(d):
     d["format"] = "fi.refineid.rapp.conformance"
     d["protocol_document_version"] = DOCUMENT
-    d["provenance"] = provenance("sections 4.2, 4.3, 6.1 to 6.3 and 7.2")
+    d["provenance"] = provenance("sections 4.2, 4.3, 6.1 to 6.3, 7.1 and 7.2")
     for e in d["cpace_kc2"]:
         e.update(cpace(e))
     for e in d["pairing_offer"]:
@@ -252,7 +252,55 @@ def main_corpus(d):
         envelope = cbor_decode(h(e["canonical_cbor_hex"]))
         envelope["version"] = VERSION
         e["canonical_cbor_hex"] = cbor(envelope).hex()
+    for e in d["pairing_hello"]:
+        e.update(pairing_hello(e))
+    for e in d["session_name"]:
+        e.update(session_name(e))
     return d
+
+
+def session_name(e):
+    """A session.ready or session.hello envelope carrying a display name (sections 4.3 item 4 and 7.1),
+    and whether the receiver replaces the name its pair record holds."""
+    body = {}
+    if e["message"] == "session.ready":
+        body = {"parameters": {"version": VERSION, "suite": SESSION_SUITE, "transport_profile": e["transport_profile"],
+                               "candidate_id": CANDIDATE[e["transport_profile"]],
+                               "grants_hash": h(e["grants_hash_hex"])},
+                "nonce": h(e["nonce_hex"])}
+    if e["display_name"] is not None:
+        body["display_name"] = hello_display_name(e)
+    envelope = {"version": VERSION, "session_id": h(e["session_id_hex"]), "sequence": 0,
+                "type": e["message"], "body": body}
+    name = body.get("display_name")
+    accepted = e["expected"] == "accepted"
+    return {"display_name_utf8_length": None if name is None else len(name.encode("utf-8")),
+            "record_name_after": (name if accepted else e["record_name_before"]),
+            "record_rewritten": accepted and name != e["record_name_before"],
+            "envelope_cbor_hex": cbor(envelope).hex()}
+
+
+def hello_display_name(e):
+    """The display_name a pairing_hello vector sends: its text, repeated `repeat` times when given."""
+    name = e["display_name"]
+    return name["text"] * name.get("repeat", 1) if isinstance(name, dict) else name
+
+
+def pairing_hello(e):
+    """A pairing.hello envelope (sections 4.3 item 3 and 7.1) with the vector's display name."""
+    body = {"parameters": {"version": VERSION, "suite": PAIRING_SUITE, "offer_hash": h(e["offer_hash_hex"]),
+                           "transport_profile": e["transport_profile"],
+                           "candidate_id": CANDIDATE[e["transport_profile"]]},
+            "platform": e["platform"]}
+    if e["display_name"] is not None:
+        body["display_name"] = hello_display_name(e)
+    if "requested_profiles" in e:
+        body["requested_profiles"] = e["requested_profiles"]
+    envelope = {"version": VERSION, "session_id": h(e["session_id_hex"]), "sequence": 0,
+                "type": "pairing.hello", "body": body}
+    name = body.get("display_name")
+    return {"display_name_utf8_length": None if name is None else len(name.encode("utf-8")),
+            "envelope_cbor_hex": cbor(envelope).hex()}
 
 
 def typed(v):
@@ -339,6 +387,16 @@ def withdrawal_corpus(d):
             e["txt"] = [[k2, with_hint(v, hint) if k2.lower() == "withdrawn" else v] for k2, v in e["txt"]]
     for e in d["session_close"]:
         e["body_cbor_hex"] = cbor({"reason": e["reason"]}).hex()
+    return d
+
+
+def lifecycle_corpus(d):
+    d["format"] = "fi.refineid.rapp.lifecycle-vectors"
+    d["protocol_document_version"] = DOCUMENT
+    d["provenance"] = (f"Written independently from RAPP v{DOCUMENT} sections 4.5, 4.6 and 8.3 and hierarchy "
+                       "specification section 5.2: each scenario walks one lifecycle machine of "
+                       f"rapp-state-machine-v{DOCUMENT}.yaml from a start state through events, naming the state "
+                       f"and the ordered actions after each. {GENERATOR} keeps only the metadata current.")
     return d
 
 
@@ -525,11 +583,12 @@ def package_over_one_frame(e, request):
 
 
 CORPORA = {
-    "rapp-v26.11.1.json": main_corpus,
-    "rapp-routing-v26.11.1.json": routing_corpus,
-    "rapp-withdrawal-v26.11.1.json": withdrawal_corpus,
-    "rapp-ble-sar-v26.11.1.json": ble_sar_corpus,
-    "rapp-operation-v26.11.1.json": operation_corpus,
+    "rapp-v26.11.2.json": main_corpus,
+    "rapp-routing-v26.11.2.json": routing_corpus,
+    "rapp-withdrawal-v26.11.2.json": withdrawal_corpus,
+    "rapp-ble-sar-v26.11.2.json": ble_sar_corpus,
+    "rapp-operation-v26.11.2.json": operation_corpus,
+    "rapp-lifecycle-v26.11.2.json": lifecycle_corpus,
 }
 
 

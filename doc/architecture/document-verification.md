@@ -237,7 +237,8 @@ For each signature the report carries independent facts:
   not fit to sign has a partial path even when its issuers reach an
   anchor; the path is then the one to that anchor.
 - **Proof of existence.** The earliest time proven by a timestamp whose
-  authority chains to a trust anchor with the time-stamping role: a
+  authority chains to a trust anchor with the time-stamping role (the
+  standard's best-signature-time, EN 319 102-1): a
   signature-time-stamp attribute over the signature value, a XAdES
   SignatureTimeStamp over the canonicalised SignatureValue, or a PDF
   document timestamp whose ByteRange covers this signature. A token

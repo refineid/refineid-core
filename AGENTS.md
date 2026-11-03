@@ -155,9 +155,9 @@ before and the correction made the core better.
   the RFCs -- not assumed from memory.
 - Cite specifications by document and section; never copy spec text
   verbatim into the tree.
-- New files carry `Copyright 2026 Petri Koistinen` with no email address
-  and HTTPS license URLs; shell scripts carry the one-line form under
-  the shebang.
+- New source files carry `Copyright 2026 Petri Koistinen` with no email
+  address and HTTPS license URLs; shell scripts carry the one-line form
+  under the shebang.
 
 ## Worktree policy
 

@@ -203,8 +203,8 @@ rule in a line and points to the reading behind it; the readings live in
 
 - Comments explain what the code does now and the constraints it honors.
   Past bugs, previous implementations, and explanations of what a fix changed
-  belong in commit messages, not source comments. No measurement dates or
-  provenance in comments.
+  belong in commit messages, not source comments. No measurement dates
+  in comments.
 
 ## Commits and integration
 

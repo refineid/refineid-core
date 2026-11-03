@@ -29,7 +29,13 @@ applies one rule, `check_retry_floor` in `refineid-auth`:
   limit to card personalization; RefineID presents the PUK -- to unblock
   a PIN, or as the activation PIN on a card that ships with blocked
   PINs -- only at five, four or three PUK tries left; a PUK the card
-  reports verified carries no count and is refused. A blocked PUK
+  reports verified carries no count and is refused. A PACE handshake
+  with the PUK or a PIN as the password is a presentation too: the
+  `MSE:Set AT` answer is the counter, read before the first `GENERAL
+  AUTHENTICATE`. On the channel it opens, a further presentation of
+  the same credential is floored on the channel's record of that
+  answer, lowered by every later refusal and never raised (see
+  [PACE](../reference/pace.md)). A blocked PUK
   cannot be recovered, so a PUK refusal names no other credential. The
   unblock is gated by the PUK's counter alone: it stays available
   whatever the PIN 1 and PIN 2 counters read, a blocked PIN included.

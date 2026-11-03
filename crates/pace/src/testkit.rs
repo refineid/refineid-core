@@ -141,6 +141,7 @@ pub struct OrganizationalCard {
     answers: VecDeque<ResponseApdu>,
     protected_commands: Vec<Vec<u8>>,
     credential_commands: usize,
+    mse_status: StatusWord,
 }
 
 impl OrganizationalCard {
@@ -172,7 +173,17 @@ impl OrganizationalCard {
             answers: answers.into(),
             protected_commands: Vec::new(),
             credential_commands: 0,
+            mse_status: StatusWord::Success,
         }
+    }
+
+    /// The same card answering `MSE:Set AT` with `status` in place of
+    /// success: a counter, which BSI TR-03110-3 section B.14.1 reports
+    /// for a PIN or PUK below its initial tries.
+    #[must_use]
+    pub const fn answering_mse_with(mut self, status: StatusWord) -> Self {
+        self.mse_status = status;
+        self
     }
 
     /// Every plain command the card recovered from the protected
@@ -454,7 +465,12 @@ impl CardTransport for OrganizationalCard {
                 if command.as_bytes() != self.expected_mse()?.as_slice() {
                     return Err("unexpected MSE:Set AT".to_owned());
                 }
-                Ok(TransportOutcome::Response(success(Vec::new())))
+                let [sw1, sw2] = self.mse_status.as_u16().to_be_bytes();
+                Ok(TransportOutcome::Response(ResponseApdu {
+                    body: Vec::new(),
+                    sw1,
+                    sw2,
+                }))
             }
             EXCHANGE_NONCE => self.encrypted_nonce(),
             EXCHANGE_MAPPING => self.map(command),

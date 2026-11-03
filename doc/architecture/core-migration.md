@@ -370,6 +370,15 @@ S1 v4.0, organizational cards, section 2.1) over NIST curves:
 - with a PIN, `MSE:Set AT`'s answer is read as the PIN's tries left and
   `check_retry_floor` decides before the first `GENERAL AUTHENTICATE`; a
   counter answer to a later round is a typed wrong PIN;
+- the PUK is a fourth PACE password, under the organization numbering's
+  PUK reference, floored the same way and reported as a typed wrong PUK;
+  the channel it opens, and the one PIN 1 opens, carry the counter the
+  floor served, lowered by every later refusal, and are the only
+  channels with the PIN resets (`PukPaceChannelOps`) and the PIN 1
+  change (`Pin1PaceChannelOps`) of `refineid-auth`, each taking an
+  explicit `ChannelProof` -- rely on the handshake or present the
+  credential again -- because which one the card accepts is a hardware
+  finding;
 - the generic mapping is written once over the RustCrypto
   `elliptic-curve` traits, with the point arithmetic of `p256` and
   `p384` beside `bp384`, all three on one `elliptic-curve` version and

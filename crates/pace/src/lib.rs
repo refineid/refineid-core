@@ -15,8 +15,8 @@
 //! The PACE secure channel for FINEID cards.
 //!
 //! The Card Access Number input type is the trust boundary for the
-//! citizen cards' password, and the PIN types of `refineid-auth` for the
-//! organizational cards'. EF.CardAccess is parsed into the PACE suites
+//! citizen cards' password, and the PIN and PUK types of `refineid-auth`
+//! for the organizational cards'. EF.CardAccess is parsed into the PACE suites
 //! the card publishes; the handshake drives
 //! `id-PACE-ECDH-GM-AES-CBC-CMAC-256` over the domain parameter it
 //! picks there -- NIST P-384, brainpoolP384r1 or NIST P-256 -- and hands
@@ -27,12 +27,14 @@
 
 pub mod can;
 pub mod card_access;
+#[cfg(test)]
+mod channel_tests;
 pub mod commands;
 pub(crate) mod crypto;
 pub mod handshake;
 pub mod rng;
 pub mod secure_messaging;
-#[cfg(feature = "testkit")]
+#[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 
 pub use can::{CAN_DIGITS, Can, CanError, UnvalidatedCan};
@@ -41,8 +43,8 @@ pub use card_access::{
     UnvalidatedCardAccess, read_card_access,
 };
 pub use handshake::{
-    OpenedByCan, OpenedByPin1, OpenedByPin2, PASSWORD_REF_CAN, PaceError, PacePassword,
-    PaceSession, Pin2PresentationSpent, Ssc, run_pace,
+    OpenedByCan, OpenedByPin1, OpenedByPin2, OpenedByPuk, PASSWORD_REF_CAN, PaceError,
+    PacePassword, PaceSession, Pin2PresentationSpent, Ssc, run_pace,
 };
 pub use secure_messaging::{SmError, SmTransport};
 
@@ -53,7 +55,9 @@ mod public_contract_tests {
     use serde::{Serialize, de::DeserializeOwned};
     use zeroize::{Zeroize, ZeroizeOnDrop};
 
-    use super::{Can, OpenedByCan, OpenedByPin1, OpenedByPin2, PaceSession, Ssc, UnvalidatedCan};
+    use super::{
+        Can, OpenedByCan, OpenedByPin1, OpenedByPin2, OpenedByPuk, PaceSession, Ssc, UnvalidatedCan,
+    };
     use crate::crypto::curve::Point;
     use crate::crypto::symmetric::Aes256Key;
 
@@ -120,6 +124,9 @@ mod public_contract_tests {
         let _ = <OpenedByPin1 as AmbiguousIfImplemented<_, CloneMarker>>::marker;
         let _ = <OpenedByPin2 as AmbiguousIfImplemented<_, CloneMarker>>::marker;
         let _ = <OpenedByPin2 as AmbiguousIfImplemented<_, CopyMarker>>::marker;
+        let _ = <OpenedByPuk as AmbiguousIfImplemented<_, CloneMarker>>::marker;
+        let _ = <OpenedByPuk as AmbiguousIfImplemented<_, CopyMarker>>::marker;
+        let _ = <OpenedByPin1 as AmbiguousIfImplemented<_, CopyMarker>>::marker;
 
         // The session key is custody, not data: it erases on drop and can
         // neither be copied nor serialised out of the crate.

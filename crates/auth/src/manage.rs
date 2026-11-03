@@ -52,25 +52,26 @@ use crate::verify::{
 
 /// CHANGE REFERENCE DATA instruction (ISO 7816-8; FINEID S1 v4.2
 /// section 3.11).
-const CHANGE_REFERENCE_DATA_INS: u8 = 0x24;
+pub const CHANGE_REFERENCE_DATA_INS: u8 = 0x24;
 /// CHANGE REFERENCE DATA P1: the data field carries the current
 /// reference data followed by the new. The organizational card accepts
 /// no other P1 and splits the field at its stored length (IAS ECC v1.0.1
 /// section 9.4.2).
-const CHANGE_P1_CURRENT_THEN_NEW: u8 = 0x00;
+pub const CHANGE_P1_CURRENT_THEN_NEW: u8 = 0x00;
 
 /// RESET RETRY COUNTER instruction (ISO 7816-8; FINEID S1 v4.2
 /// section 3.12).
-const RESET_RETRY_COUNTER_INS: u8 = 0x2C;
+pub const RESET_RETRY_COUNTER_INS: u8 = 0x2C;
 /// RESET RETRY COUNTER P1: the data field carries the unblocking code
 /// followed by the new reference data. This is the citizen card's
 /// single-command form.
-const RESET_P1_CODE_THEN_NEW: u8 = 0x00;
+pub const RESET_P1_CODE_THEN_NEW: u8 = 0x00;
 /// RESET RETRY COUNTER P1: the data field carries only the new reference
-/// data; the unblocking credential was verified as its own object first.
-/// The organizational card's second command (FINEID S4-2 v4.0
-/// section 4.3.2).
-const RESET_P1_NEW_ONLY: u8 = 0x02;
+/// data. The organizational card's reset after the PUK is verified as its
+/// own object (FINEID S4-2 v4.0 section 4.3.2), and the reset BSI
+/// TR-03110-3 section B.7.1 sends on a channel PACE opened with the PUK
+/// or the PIN (section B.14.11).
+pub const RESET_P1_NEW_ONLY: u8 = 0x02;
 
 /// Outcome of a credential-update round trip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,31 +194,51 @@ pub(crate) fn unblock<T: CardTransport + ?Sized>(
             Ok(classify_manage_sw(status))
         }
         PinReferenceScheme::Organizational => {
-            let verify_header = CommandHeader {
-                class: ApduClass::Plain,
-                instruction: VERIFY_INS,
-                p1: VERIFY_P1,
-                p2: scheme.puk_reference(),
-            };
-            let verified = classify_manage_sw(credential_exchange(
-                transport,
-                scheme,
-                verify_header,
-                &[puk],
-            )?);
+            let verified = verify_puk(transport, scheme, puk)?;
             if !matches!(verified, ManageOutcome::Ok) {
                 return Ok(verified);
             }
-            let reset_header = CommandHeader {
-                class: ApduClass::Plain,
-                instruction: RESET_RETRY_COUNTER_INS,
-                p1: RESET_P1_NEW_ONLY,
-                p2: scheme.reference(slot),
-            };
-            let status = credential_exchange(transport, scheme, reset_header, &[new])?;
-            Ok(classify_manage_sw(status))
+            reset_new_only(transport, scheme, slot, new)
         }
     }
+}
+
+/// VERIFY the PUK as its own object under `scheme`'s PUK reference, the
+/// organizational card's first unblock command (FINEID S4-2 v4.0 section
+/// 4.3.2). The caller has applied the retry floor to the PUK's counter.
+pub(crate) fn verify_puk<T: CardTransport + ?Sized>(
+    transport: &mut T,
+    scheme: PinReferenceScheme,
+    puk: &[u8],
+) -> Result<ManageOutcome, AuthError<T::Error>> {
+    let header = CommandHeader {
+        class: ApduClass::Plain,
+        instruction: VERIFY_INS,
+        p1: VERIFY_P1,
+        p2: scheme.puk_reference(),
+    };
+    let status = credential_exchange(transport, scheme, header, &[puk])?;
+    Ok(classify_manage_sw(status))
+}
+
+/// RESET RETRY COUNTER for `slot` carrying only the new PIN, under P1
+/// [`RESET_P1_NEW_ONLY`]. It presents no credential, so it spends no
+/// try; the card accepts it only when its security state already
+/// authorises the reset.
+pub(crate) fn reset_new_only<T: CardTransport + ?Sized>(
+    transport: &mut T,
+    scheme: PinReferenceScheme,
+    slot: PinSlot,
+    new: &[u8],
+) -> Result<ManageOutcome, AuthError<T::Error>> {
+    let header = CommandHeader {
+        class: ApduClass::Plain,
+        instruction: RESET_RETRY_COUNTER_INS,
+        p1: RESET_P1_NEW_ONLY,
+        p2: scheme.reference(slot),
+    };
+    let status = credential_exchange(transport, scheme, header, &[new])?;
+    Ok(classify_manage_sw(status))
 }
 
 /// PIN change and unblock operations, layered as default methods on every

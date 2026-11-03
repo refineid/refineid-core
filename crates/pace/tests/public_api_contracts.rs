@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Compile-fail contracts for sensitive public types.
+//! Compile-fail contracts for sensitive public types and for the
+//! operations only a channel opened with the matching password offers.
 
 #[test]
-fn sensitive_values_have_no_public_raw_access() {
+fn sensitive_values_and_channel_proofs_have_no_public_path() {
     let cases = trybuild::TestCases::new();
-    cases.compile_fail("tests/ui/no_raw_*.rs");
+    cases.compile_fail("tests/ui/no_*.rs");
 }

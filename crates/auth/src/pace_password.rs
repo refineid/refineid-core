@@ -12,29 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The PACE password key of a PIN.
+//! The PACE password key of a PIN or the PUK.
 //!
 //! The FINEID organizational cards authenticate the PACE channel with
 //! PIN 1 or PIN 2 in place of the Card Access Number (FINEID S1 v4.0,
-//! organizational cards, section 2.1). PACE never sends the password:
-//! both sides derive `K_pi = KDF_pi(pi)` from it and the card encrypts
-//! its nonce under that key (BSI TR-03110-3 sections 4.2 and A.2.3).
-//! This module derives `K_pi` here, inside the crate that owns the
-//! digits, so the PACE handshake receives the derived key and never the
-//! PIN.
+//! organizational cards, section 2.1), and with the PUK, whose identifier
+//! the card lists beside the PINs' (FINEID S4-2 v4.0 sections 4.2 and 6),
+//! to unblock a PIN (BSI TR-03110-3 sections B.7.1 and B.14.1). PACE
+//! never sends the password: both sides derive `K_pi = KDF_pi(pi)` from
+//! it and the card encrypts its nonce under that key (BSI TR-03110-3
+//! sections 4.2 and A.2.3). This module derives `K_pi` here, inside the
+//! crate that owns the digits, so the PACE handshake receives the derived
+//! key and never the credential.
 //!
-//! The PIN's password encoding is its character string, each character
-//! one ISO/IEC 8859-1 octet (BSI TR-03110-3 table 5 and appendix
-//! D.2.1.4). The ASCII digits a validated PIN holds are their own
-//! ISO/IEC 8859-1 octets, so the encoding is the validated digits as
-//! they stand -- the same encoding the Card Access Number uses.
+//! The password encoding of a PIN and of the PUK is its character string,
+//! each character one ISO/IEC 8859-1 octet (BSI TR-03110-3 table 5 and
+//! appendix D.2.1.4). The ASCII digits a validated credential holds are
+//! their own ISO/IEC 8859-1 octets, so the encoding is the validated
+//! digits as they stand -- the same encoding the Card Access Number
+//! uses.
 
 use core::fmt;
 
 use sha2::{Digest as _, Sha256};
 use zeroize::ZeroizeOnDrop;
 
-use crate::credentials::{Pin1, Pin2};
+use crate::credentials::{Pin1, Pin2, Puk};
 
 /// Length of the PACE password key for an AES-256 mechanism: the whole
 /// SHA-256 output (BSI TR-03110-3 section A.2.3.2).
@@ -46,13 +49,14 @@ pub const PACE_PASSWORD_KEY_LEN: usize = 32;
 const KDF_COUNTER_PASSWORD: u32 = 3;
 
 /// `K_pi`, the AES-256 key a PACE handshake decrypts the card's nonce
-/// with, derived from a PIN.
+/// with, derived from a PIN or the PUK.
 ///
-/// Secret custody: it determines the PIN by exhaustive search over the
-/// digit space, so it is treated as the PIN itself. Not `Clone` or
-/// `Copy`, zeroized on drop, redacted from every formatter, and produced
-/// only by [`Pin1::pace_password_key`] and [`Pin2::pace_password_key`].
-/// Its one consumer is the PACE handshake.
+/// Secret custody: it determines the credential by exhaustive search over
+/// the digit space, so it is treated as the credential itself. Not
+/// `Clone` or `Copy`, zeroized on drop, redacted from every formatter, and
+/// produced only by [`Pin1::pace_password_key`],
+/// [`Pin2::pace_password_key`] and [`Puk::pace_password_key`]. Its one
+/// consumer is the PACE handshake.
 #[derive(ZeroizeOnDrop)]
 pub struct PacePasswordKey([u8; PACE_PASSWORD_KEY_LEN]);
 
@@ -98,17 +102,28 @@ impl Pin2 {
     }
 }
 
+impl Puk {
+    /// The PACE password key for this PUK, for a PACE handshake that
+    /// authenticates the channel with the PUK.
+    #[must_use]
+    pub fn pace_password_key(&self) -> PacePasswordKey {
+        PacePasswordKey::derive(self.digits())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use sha2::{Digest as _, Sha256};
 
     use super::{KDF_COUNTER_PASSWORD, PacePasswordKey};
-    use crate::credentials::{Pin1, Pin2, UnvalidatedSecret};
+    use crate::credentials::{Pin1, Pin2, Puk, UnvalidatedSecret};
 
     /// A synthetic PIN.
     const PIN_TEXT: &[u8] = b"123456";
     /// A second synthetic PIN.
     const OTHER_PIN_TEXT: &[u8] = b"654321";
+    /// A synthetic PUK, eight digits.
+    const PUK_TEXT: &[u8] = b"12345678";
 
     fn pin1(text: &[u8]) -> Pin1 {
         Pin1::reconstruct(UnvalidatedSecret::from_owned_bytes(text.to_vec())).expect("valid PIN 1")
@@ -136,6 +151,16 @@ mod tests {
             pin1(PIN_TEXT).pace_password_key().as_bytes()
                 != pin1(OTHER_PIN_TEXT).pace_password_key().as_bytes()
         );
+    }
+
+    #[test]
+    fn the_puk_key_is_the_same_derivation_over_its_digits() {
+        let puk = Puk::reconstruct(UnvalidatedSecret::from_owned_bytes(PUK_TEXT.to_vec()))
+            .expect("valid PUK");
+        let mut preimage = PUK_TEXT.to_vec();
+        preimage.extend_from_slice(&KDF_COUNTER_PASSWORD.to_be_bytes());
+        let expected: [u8; super::PACE_PASSWORD_KEY_LEN] = Sha256::digest(&preimage).into();
+        assert_eq!(puk.pace_password_key().as_bytes(), &expected);
     }
 
     #[test]

@@ -1,9 +1,9 @@
 # Remote Authorization Proxy Protocol (RAPP)
 ## Transport and Discovery Hierarchy Specification
 
-- **Document Version**: `26.10.29`
-- **Protocol Versions**: `26.10.29`
-- **Status**: Normative Specification / Architecture Blueprint
+- **Document Version**: `26.11.2`
+- **Protocol Versions**: `26.11.2`
+- **Status**: Draft — awaiting owner stamp
 - **Change Controller**: RefineID Project
 - **Applies To**: `refineid-core`, `refineid-unix`, `refineid-windows`, `refineid-apple`, `refineid-android`
 
@@ -29,7 +29,7 @@ In the diagram, Bluetooth Low Energy (BLE) is the Bluetooth transport; discovery
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
 │                               CUSTODIAN                                │
-│                      (iOS / Android Phone)                             │
+│                 (iPhone / Android phone, with NFC)                     │
 │                                                                        │
 │  • Hardware Security Root: Secure Enclave / StrongBox / TEE / Biometrics│
 │  • Physical Custody: NFC interface to FINEID Identity Card             │
@@ -46,7 +46,7 @@ In the diagram, Bluetooth Low Energy (BLE) is the Bluetooth transport; discovery
                                     │
 ┌───────────────────────────────────┴────────────────────────────────────┐
 │                             REQUESTER                                  │
-│                 (Linux/BSD, Windows 10/11, macOS)                      │
+│      (Linux/BSD, Windows 10/11, macOS, iPad, Android tablet)          │
 │                                                                        │
 │  • First-Class Workstations: refineid-unix, refineid-windows, apple    │
 │  • Default State: Pure Local Card Reader (PC/SC via CCID / slot)       │
@@ -57,13 +57,13 @@ In the diagram, Bluetooth Low Energy (BLE) is the Bluetooth transport; discovery
 ```
 
 ### 2.1 The Custodian (Phone)
-The mobile device is the authoritative security anchor:
+The Custodian is a phone that reads the card over NFC: an iPhone or an Android phone. The mobile device is the authoritative security anchor:
 - **Custody of Secrets**: It interacts directly with the physical smart card over ISO/IEC 7816 / ISO/IEC 14443 contactless NFC.
-- **Protected Path**: PIN1 is entered by the holder on the phone and held only in the Custodian's memory, never in storage (RAPP v26.10.29 §11 item 2). PIN2 (Qualified Electronic Signature) prompts appear exclusively on the phone's protected display.
-- **Listener Gating**: The phone must not bind any network listening socket or broadcast advertisements unless the user has explicitly enabled "Allow Remote Card Reader" in application settings. When disabled, the listener is immediately terminated and unannounced.
+- **Protected Path**: PIN1 is entered by the holder on the phone and held only in the Custodian's memory, never in storage (RAPP v26.11.2 §11 item 2). PIN2 (Qualified Electronic Signature) prompts appear exclusively on the phone's protected display.
+- **Listener Gating**: The phone must not bind any network listening socket or broadcast advertisements unless the user has explicitly enabled "Allow Remote Card Reader" in application settings. Turning it off is withdrawal (RAPP v26.11.2 §4.5 item 3): the phone closes its sessions with `service_withdrawn`, stops accepting, publishes the withdrawn record and unregisters, and keeps every pairing. Turning it on serves at once under a fresh instance name (§4.2), with the pairings it kept.
 
 ### 2.2 The Requester (Workstation)
-Desktop platforms (`refineid-unix`, `refineid-windows`, macOS):
+A Requester is a computer (Linux or BSD with `refineid-unix`, Windows with `refineid-windows`, macOS) or a tablet: an iPad or an Android tablet. A tablet is a Requester only: it uses a card in a reader attached to it or a phone's card over RAPP, never serves a card to other devices, and follows the workstation rules of §5 like any computer.
 - **No Inbound Application TCP Listeners**: Workstations must not open inbound application TCP listening ports, bind network sockets for incoming TCP traffic, or prompt users for administrative inbound firewall modifications. Discovery operates via outbound queries and standard operating system (OS)-level multicast reception (UDP port 5353) or platform discovery services.
 - **Outbound Client Model**: Workstations establish outbound TCP connections (`connect()`) to the Custodian's advertised endpoint. Outbound connections eliminate the need for application-specific inbound TCP firewall rules (though enterprise egress policies or network discovery filters may still apply).
 - **Zero PIN Knowledge**: Workstations operate via `CKF_PROTECTED_AUTHENTICATION_PATH` and never handle, log, or prompt for card PINs.
@@ -104,11 +104,12 @@ Bluetooth (BLE)
   - Custodian runs `StreamRelayListener` on a dynamic, ephemeral TCP port (`bind(0)`).
   - Custodian advertises service type `_refineid-stream._tcp.local.` via mDNS.
   - Requester runs `StreamRelayBrowser`, receives the PTR (pointer), SRV (service) and text (TXT) (text) records, and initiates an **outbound** TCP `connect()` to the phone's advertised IP and port.
-- **Wire Profile**: Governed normatively by RAPP v26.10.29 §2.2.2. Each frame is a 2-byte unsigned big-endian length followed by 1 to 65535 payload bytes. The Requester's first frame is the routing preamble `["rapp-stream", purpose, routing]` (RAPP v26.10.29 §2.2.1). After a `"pairing"` preamble the Custodian's first frame is the encoded `pairing-offer` (§4.2); after a `"session"` preamble the Custodian routed the Requester sends `Noise_KK` message 1.
+- **Continuous Discovery**: While remote use is on and not suspended, the Requester browses continuously, never by polling, so a `mode=session` record that appears is seen at once and dialed before any BLE scan still running for the pairing (RAPP v26.11.2 §8.3).
+- **Wire Profile**: Governed normatively by RAPP v26.11.2 §2.2.2. Each frame is a 2-byte unsigned big-endian length followed by 1 to 65535 payload bytes. The Requester's first frame is the routing preamble `["rapp-stream", purpose, routing]` (RAPP v26.11.2 §2.2.1). After a `"pairing"` preamble the Custodian's first frame is the encoded `pairing-offer` (§4.2); after a `"session"` preamble the Custodian routed the Requester sends `Noise_KK` message 1.
 
 ### 3.3 Bluetooth / BLE Proximity Transport (`fi.refineid.rapp.ble`)
 - **Applicability**: The last resort: a proximity transport for when no IP network is shared (no Wi-Fi, a virtual machine or container without a usable network, no router), across supported platforms (iOS, Android, Linux/BSD, Windows, macOS).
-- **Normative Specification**: Governed normatively by RAPP v26.10.29 §2–§5.
+- **Normative Specification**: Governed normatively by RAPP v26.11.2 §2–§5.
 - **Wire Profile**: The canonical cross-platform wire profile is GATT-based `fi.refineid.rapp.ble`:
   - Primary Service Universally Unique Identifier (UUID): `7E39FD01-A6B5-4D78-9E11-37E28E9545F1`
   - Channel Characteristic UUID: `7E39FD02-A6B5-4D78-9E11-37E28E9545F1` (Requester writes via `ATT_WRITE_REQ`; Custodian indicates via `ATT_HANDLE_VALUE_IND`)
@@ -122,8 +123,8 @@ Bluetooth (BLE)
 Because mDNS discovery broadcasts on multicast UDP port 5353 (IPv4 `224.0.0.251`, IPv6 `ff02::fb`), packets are visible to all devices on the local Layer 2 broadcast domain. In compliance with IETF [RFC 8882](https://www.rfc-editor.org/rfc/rfc8882.html) (*DNS-SD Privacy and Security Requirements*) and RefineID privacy rules:
 
 ### 4.1 No Stable Pairing Identifier on the Wire
-- **Keys from the static agreement**: Every value that names a stored pairing outside its encrypted channel -- discovery hints (§4.3), withdrawal hints (§4.3) and session routing tags -- is keyed by the pairing's static X25519 agreement (X25519 is the Diffie-Hellman function over Curve25519, RFC 7748) under its own Hash-based Message Authentication Code (HMAC)-based Key Derivation Function (HKDF) label (RAPP v26.10.29 §4.3). Only the pairing's two endpoints can compute or recognise these values.
-- **Fresh per connection**: The Requester's session routing preamble carries a fresh random nonce and the routing tag it keys (RAPP v26.10.29 §2.2.1), sent point-to-point over the established TCP stream or BLE Channel Characteristic in `Phase::Routing`. No routing value recurs across connections, so preambles cannot be linked to one another or to discovery records.
+- **Keys from the static agreement**: Every value that names a stored pairing outside its encrypted channel -- discovery hints (§4.3), withdrawal hints (§4.3) and session routing tags -- is keyed by the pairing's static X25519 agreement (X25519 is the Diffie-Hellman function over Curve25519, RFC 7748) under its own Hash-based Message Authentication Code (HMAC)-based Key Derivation Function (HKDF) label (RAPP v26.11.2 §4.3). Only the pairing's two endpoints can compute or recognise these values.
+- **Fresh per connection**: The Requester's session routing preamble carries a fresh random nonce and the routing tag it keys (RAPP v26.11.2 §2.2.1), sent point-to-point over the established TCP stream or BLE Channel Characteristic in `Phase::Routing`. No routing value recurs across connections, so preambles cannot be linked to one another or to discovery records.
 - **Zero Public Broadcast of stable values**: `pair_id`, static public keys, and any other stable per-pairing value must never be published in mDNS PTR, SRV, or TXT records, nor broadcast in unauthenticated BLE advertising packets.
 
 ### 4.2 Public DNS-SD Identifiers and Ephemeral Lifecycle
@@ -149,7 +150,7 @@ The Custodian publishes three distinct discovery modes:
      v=1
      mode=pairing
      ```
-   - Nothing derived from the pairing code or the offer is published. The Requester obtains the offer over the connection (RAPP v26.10.29 §4.2).
+   - Nothing derived from the pairing code or the offer is published. The Requester obtains the offer over the connection (RAPP v26.11.2 §4.2).
 
 2. **Session Reconnect Mode (`mode=session`)**:
    - Active when "Allow Remote Card Reader" is enabled and the phone is ready for operational card requests.
@@ -158,20 +159,21 @@ The Custodian publishes three distinct discovery modes:
      v=1
      mode=session
      ```
-     No pairing values, hashes, or hints are published. Requesters on the local subnet that hold a usable pairing connect to the advertised endpoint and present a fresh session routing preamble inside the point-to-point stream in the Routing phase (RAPP v26.10.29 §2.2.1). If no stored pairing keyed its tag, the TCP connection is immediately closed.
+     No pairing values, hashes, or hints are published. Requesters on the local subnet that hold a usable pairing connect to the advertised endpoint and present a fresh session routing preamble inside the point-to-point stream in the Routing phase (RAPP v26.11.2 §2.2.1). If no stored pairing keyed its tag, the TCP connection is immediately closed.
    - **Optional Rotating Discovery Hints (Multi-Device Coexistence)**:
-     To avoid trial connections in high-density enterprise environments with multiple active Custodians, the Custodian publishes truncated, rotating HMAC hints for the 4 most recently used stored pairings (use time and tie order as for withdrawn records, RAPP v26.10.29 §4.5):
+     To avoid trial connections in high-density enterprise environments with multiple active Custodians, the Custodian publishes truncated, rotating HMAC hints for the 4 most recently used stored pairings (use time and tie order as for withdrawn records, RAPP v26.11.2 §4.5):
      $$\text{hint}_i = \text{first 8 bytes of }\text{HMAC-SHA-256}(K_{\text{disc}, i}, \text{epoch\_be64})$$
      where:
-     - $K_{\text{disc}, i}$ = HKDF-SHA-256 ([RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html)) with salt $\text{pair\_id}_i$, input keying material the pairing's static X25519 agreement, $\text{info} = $ `"rapp-discovery-hint"` (ASCII), and $L = 32$ (RAPP v26.10.29 §4.3).
+     - $K_{\text{disc}, i}$ = HKDF-SHA-256 ([RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html)) with salt $\text{pair\_id}_i$, input keying material the pairing's static X25519 agreement, $\text{info} = $ `"rapp-discovery-hint"` (ASCII), and $L = 32$ (RAPP v26.11.2 §4.3).
      - $\text{epoch} = \lfloor \text{unix\_time} / 900 \rfloor$ (15-minute rotation window), and $\text{epoch\_be64}$ is that value as an unsigned 64-bit big-endian integer (8 bytes), the entire HMAC message.
      - TXT Attribute: `hints=` followed by at most 4 hints, each 16 lowercase hexadecimal digits, separated by commas without spaces (e.g. `hints=054526c9fdd3b180`).
-     - The `discovery_hint` vectors of `vectors/rapp-routing-v26.10.29.json` pin the bytes.
-     Requesters evaluate candidate hints for the current and adjacent epoch ($\text{epoch} \pm 1$) against their stored pairings before initiating TCP connections; the window tolerates a clock difference of at least 15 minutes and up to just under 30 minutes, and implementations must not widen it. A record with `hints` holds 1 to 4 entries; an empty `hints` value is malformed. The `discovery_record` and `announcement_selection` vectors of `vectors/rapp-routing-v26.10.29.json` pin parsing and selection.
-   - A `mode=session` record carries the keys `v` and `mode`, optionally `hints`, and no other.
+     - The `discovery_hint` vectors of `vectors/rapp-routing-v26.11.2.json` pin the bytes.
+     When the epoch changes the Custodian replaces the TXT record of its current instance in place, keeping the instance registered and its name unchanged.
+     Requesters evaluate candidate hints for the current and adjacent epoch ($\text{epoch} \pm 1$) against their stored pairings before initiating TCP connections; the window tolerates a clock difference of at least 15 minutes and up to just under 30 minutes, and implementations must not widen it. A record with `hints` holds 1 to 4 entries; an empty `hints` value is malformed. The `discovery_record` and `announcement_selection` vectors of `vectors/rapp-routing-v26.11.2.json` pin parsing and selection.
+   - A `mode=session` record carries the keys `v` and `mode`, optionally `hints`, and no other. A record without `hints` puts the Custodian in sight for every pairing the Requester holds; routing decides (RAPP v26.11.2 §8.3).
 
 3. **Withdrawn Mode (`mode=withdrawn`)**:
-   - Published for 2 to 10 seconds on the current service instance after the user turns remote access off or quits the application, once open sessions are closed and connections are no longer accepted; the service is then unregistered (RAPP v26.10.29 §4.5).
+   - Published for 2 to 10 seconds on the current service instance after the user turns remote access off or quits the application, once open sessions are closed and connections are no longer accepted, by replacing the instance's TXT record in place; the service is then unregistered (RAPP v26.11.2 §4.5).
    - TXT Attributes, and no others:
      ```text
      v=1
@@ -179,7 +181,7 @@ The Custodian publishes three distinct discovery modes:
      withdrawn=<entry_1>,<entry_2>,...,<entry_8>
      ```
    - Exactly 8 entries of 16 lowercase hexadecimal digits, separated by commas without spaces: the withdrawal hints of the 8 most recently used stored pairings, the rest random fillers, all in random order. A withdrawal hint is keyed by the pairing's static X25519 agreement and bound to the instance portion of the service instance name and a one-minute counter.
-   - A Requester honours the record only on the instance it associates with the pairing and only while it holds no open session to it; it then withdraws the Custodian's presence at once and does not dial until it discovers `mode=session` again. Anything else is unannounced loss under the Requester's own hold.
+   - A Requester honours the record only on the instance it associates with the pairing and only while it holds no open session to it; it then withdraws the Custodian's presence at once and neither dials, offers nor holds anything for it until the Custodian announces itself again with a `mode=session` record or a BLE advertisement first seen after the withdrawal. Anything else is unannounced loss, which withdraws nothing; a lost session is redialed within the redial window (RAPP v26.11.2 §4.5 item 6, §8.3).
 
 ---
 
@@ -188,22 +190,21 @@ The Custodian publishes three distinct discovery modes:
 To maintain clean, unobtrusive operation on enterprise and personal workstations:
 
 ### 5.1 Local Card Reader by Default
-- RefineID desktop applications (`refineid-unix`, `refineid-windows`, `refineid-apple`) operate strictly as **Local Card Reader Software** until a phone is paired, and whenever remote use is off or suspended (§5.2).
+- RefineID requester applications (`refineid-unix`, `refineid-windows`, `refineid-apple` on macOS and iPad, `refineid-android` on an Android tablet) operate strictly as **Local Card Reader Software** until a phone is paired, and whenever remote use is off or suspended (§5.2).
 - The application monitors local Personal Computer/Smart Card (PC/SC) smart card readers (integrated laptop slots, USB CCID readers via `pcscd` or `winscard`).
-- Background radio scanning, mDNS service browsing, and network polling run only while remote use is on (§5.2); while it is off, nothing remote runs.
+- Background radio scanning, mDNS service browsing, and network polling run only while remote use is on (§5.2); while it is off, nothing remote runs apart from the bounded revocation attempt that follows the holder's click turning it off (RAPP §4.6 item 6).
 
 ### 5.2 Remote Use Is the Pairing
-- A workstation offers one switch for remote use, and the switch is the pairing. The holder's click turns remote use on and off. At every launch, after a quit, a restart or a software update, and at a start at login, the workstation first sweeps its pairings for idle expiry (RAPP §4.6 item 5) and then restores remote use on only while an active pairing (RAPP §4.3 item 4) remains, and off otherwise; a change of the stored pairing format drops the pairings, so remote use then starts off and the holder pairs again. When the last pairing ends other than by the holder's click, remote use turns off (below). Sleep leaves remote use as it was. With no pairing, remote use on means that the workstation offers the entry for the pairing code a phone shows (RAPP §3) and browses `mode=pairing` only while a code is being tried (RAPP §4.2).
-- While remote use is off the workstation is Local Card Reader Software only (§5.1): it browses no mDNS, scans no BLE, dials no phone for any reason, offers no identity from a phone, and needs and requests no local-network or Bluetooth permission from the operating system.
-- Only the holder turns remote use on, and turning it on is the only moment the workstation asks for those permissions; a launch that restores it on asks for none.
+- A workstation offers one switch for remote use and holds at most one pairing. Only the holder's own click turns the switch on or off; the workstation stores its position and restores it at every launch, after a quit, a restart or a software update, and at a start at login. A launch first sweeps the pairing for idle expiry (RAPP §4.6 item 5); then, with the switch on, the workstation holds remote use with its active pairing (RAPP §4.3 item 4), or offers the entry for the pairing code a phone shows (RAPP §3) when it holds none. A change of the stored pairing format drops every stored pairing; the switch stays as the holder left it. Sleep leaves remote use as it was.
+- While remote use is off the workstation is Local Card Reader Software only (§5.1): it browses no mDNS, scans no BLE, dials no phone, offers no identity from a phone, and needs and requests no local-network or Bluetooth permission from the operating system. The one exception is the bounded revocation attempt of RAPP §4.6 item 6 that follows the click turning remote use off.
+- Turning remote use on is the only moment the workstation asks for those permissions; a launch that restores it on asks for none.
 - While remote use is on and not suspended:
-  1. The Requester activates the mDNS browser and/or the BLE scanner.
-  2. Paired Custodians appear in the reader selection list when discovered.
-  3. Outbound connections are established on demand when the card is consulted or, under the offering rule (RAPP §8.4), held while an identity is offered.
-- The holder's click turning remote use off forgets every pairing the workstation holds (RAPP §4.6 item 6): the workstation closes every open session with `session.close` reason `"pairing_revoked"`, waiting at most 1 second for the closes to leave as for quitting, and destroys every pairing's key at once; a phone with no session open is told nothing and forgets the computer by its own idle expiry (RAPP §4.6 item 5). The workstation withdraws every identity offered from a phone at once, and halts the scanners, closes any idle outbound sockets and purges transient discovery caches. Only the holder's own click does this, and the switch is the workstation's only control that forgets a pairing. Turning remote use on again asks for a new pairing code.
-- A pairing that ends any other way, because the phone revoked it (RAPP §4.6 item 4) or it expired after 30 days without a session (RAPP §4.6 item 5), is gone as if forgotten; when the last one goes, remote use turns off.
-- A card in a reader attached to the workstation suspends remote use while it is present: the workstation withdraws (RAPP §4.5 item 8), closing every open session with `session.close` reason `"service_withdrawn"`, and holds no phone session, starts no dial, scan or pairing attempt, and offers no phone identity (STPA CC-86). A pairing search under way ends, and the typed code is dropped. When the card leaves, remote use resumes as it was: with a pairing, discovery and dialing start again without a code; with none, the code entry is offered again. Suspension leaves the switch on.
-- Quitting the application while remote use is on is the Requester's withdrawal too (RAPP §4.5 item 8): the workstation closes every open session with `"service_withdrawn"` and keeps every pairing, and its next launch restores remote use on while a pairing remains.
+  1. With no pairing, the workstation offers the code entry and browses `mode=pairing` only while a code is being tried (RAPP §4.2).
+  2. With a pairing, the Requester browses mDNS and scans BLE continuously, dials as RAPP §8.3 says, and offers the phone's identity as RAPP §8.4 says. While no remote card is presented it shows no remote card and nothing about the phone (RAPP §4.7), and it offers the code entry again: pairing another phone replaces the pairing (RAPP §4.6 item 6).
+- The holder's click turning remote use off forgets the pairing the workstation holds (RAPP §4.6 item 6): with a session open the workstation closes it with `session.close` reason `"pairing_revoked"`, waiting at most 1 second for the phone's echo of the close as for quitting (RAPP §7.1 item 7); with none open it makes one attempt of at most `revocation_attempt_bound_ms` (10 seconds) to reach the phone and deliver the close, whether or not a local card is present; pairing another phone forgets the old pairing the same way; it destroys the pairing's key when the phone's echo of the close has arrived or the bound has passed. The workstation withdraws every identity offered from a phone at once, halts the scanners once the attempt is over, closes idle outbound sockets and purges transient discovery caches. It keeps no forgotten pairing. A phone the close did not reach forgets the computer by its own idle expiry (RAPP §4.6 item 5).
+- A pairing that ends any other way, because the phone revoked it (RAPP §4.6 item 4) or it expired after 30 days without a session (RAPP §4.6 item 5, dropped silently), is gone as if forgotten; the switch stays on and the workstation offers the code entry. After the phone's revocation it shows that the phone forgot this computer.
+- A card in a reader attached to the workstation suspends remote use while it is present: the workstation withdraws (RAPP §4.5 item 8), closing every open session with `session.close` reason `"service_withdrawn"`, and holds no phone session, starts no dial, scan or pairing attempt, and offers no phone identity (STPA CC-86), apart from the one revocation attempt that the holder's own forget makes (RAPP §4.6 item 6). The pairing is kept and nothing more is sent. A pairing search under way ends, and the typed code is dropped. When the card leaves, remote use resumes as it was: with a pairing, discovery and dialing start again without a code; with none, the code entry is offered again. Suspension leaves the switch on.
+- Quitting the application while remote use is on is the Requester's withdrawal too (RAPP §4.5 item 8): the workstation closes every open session with `"service_withdrawn"` and keeps its pairing, and its next launch restores remote use as the switch was left.
 
 ---
 
@@ -214,5 +215,5 @@ To maintain clean, unobtrusive operation on enterprise and personal workstations
 | **`refineid-core`** | Protocol Core | Keep the transport preference order and the `fi.refineid.stream` stream profile framing to designate Custodian as listener and Requester as dialer. Define RFC 8882 discovery token formats and rotation. |
 | **`refineid-unix`** | Requester (Linux, BSD) | Keep `pcscd` default; implement outbound `StreamRelayBrowser` using native mDNS (`avahi` / `systemd-resolved`); provide graphical user interface (GUI) toggle in `refineid-gui-fltk`; maintain zero open listening ports. |
 | **`refineid-windows`** | Requester (Windows 10/11) | Remove `FirewallService.cs` and inbound TCP listener (port 47110); implement outbound `StreamRelayBrowser` using supported `Windows.Devices.Enumeration` or Win32 `DnsServiceBrowse`; add explicit opt-in toggle in `RefineID-winui`. |
-| **`refineid-apple`** | Custodian (iOS) & Requester (macOS) | Implement the Apple-to-Apple direct transport `NWListener(includePeerToPeer: true)` / `NWBrowser` direct peer-to-peer (P2P) for Apple-to-Apple; maintain `StreamRelayListener` on iOS gated by "Allow Remote Reader" setting; adhere to RFC 8882 ephemeral discovery names. |
-| **`refineid-android`** | Custodian (Android) | Maintain `StreamRelayListener` (`_refineid-stream._tcp` via `NsdManager`) gated by "Allow Remote Reader" setting; support BLE peripheral GATT `fi.refineid.rapp.ble`. |
+| **`refineid-apple`** | Custodian (iPhone) & Requester (macOS, iPad) | Implement the Apple-to-Apple direct transport `NWListener(includePeerToPeer: true)` / `NWBrowser` direct peer-to-peer (P2P) for Apple-to-Apple; maintain `StreamRelayListener` on iOS gated by "Allow Remote Reader" setting; adhere to RFC 8882 ephemeral discovery names. |
+| **`refineid-android`** | Custodian (Android phone) & Requester (Android tablet) | Maintain `StreamRelayListener` (`_refineid-stream._tcp` via `NsdManager`) gated by "Allow Remote Reader" setting; support BLE peripheral GATT `fi.refineid.rapp.ble`. |

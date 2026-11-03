@@ -1,0 +1,940 @@
+{
+  "format": "fi.refineid.rapp.lifecycle-vectors",
+  "protocol_document_version": "26.11.2",
+  "provenance": "Written independently from RAPP v26.11.2 sections 4.5, 4.6 and 8.3 and hierarchy specification section 5.2: each scenario walks one lifecycle machine of rapp-state-machine-v26.11.2.yaml from a start state through events, naming the state and the ordered actions after each. tools/rapp-vectors/generate.py keeps only the metadata current.",
+  "scenarios": [
+    {
+      "name": "withdrawal-close-stops-dialing",
+      "section": "4.5 item 6",
+      "machine": "requester_view_of_custodian",
+      "role": "requester",
+      "start": "connected",
+      "steps": [
+        {
+          "event": "close_service_withdrawn",
+          "outcome": "transition",
+          "state": "withdrawn",
+          "actions": [
+            "withdraw_identity"
+          ]
+        },
+        {
+          "event": "sight_lost",
+          "outcome": "ignored",
+          "state": "withdrawn",
+          "actions": []
+        },
+        {
+          "event": "redial_due",
+          "outcome": "cannot_happen"
+        },
+        {
+          "event": "consumer_request",
+          "outcome": "transition",
+          "state": "withdrawn",
+          "actions": [
+            "refuse_consumer_request"
+          ]
+        },
+        {
+          "event": "record_appeared",
+          "outcome": "transition",
+          "state": "connecting",
+          "actions": [
+            "open_session_dial"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "withdrawn-record-without-session",
+      "section": "4.5 item 6",
+      "machine": "requester_view_of_custodian",
+      "role": "requester",
+      "start": "idle",
+      "steps": [
+        {
+          "event": "withdrawn_record_matched",
+          "outcome": "transition",
+          "state": "withdrawn",
+          "actions": [
+            "withdraw_identity"
+          ]
+        },
+        {
+          "event": "withdrawn_record_matched",
+          "outcome": "ignored",
+          "state": "withdrawn",
+          "actions": []
+        },
+        {
+          "event": "advertisement_appeared",
+          "outcome": "transition",
+          "state": "connecting",
+          "actions": [
+            "open_session_dial"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "withdrawal-aborts-a-dial",
+      "section": "4.5 item 6",
+      "machine": "requester_view_of_custodian",
+      "role": "requester",
+      "start": "connecting",
+      "steps": [
+        {
+          "event": "withdrawn_record_matched",
+          "outcome": "transition",
+          "state": "withdrawn",
+          "actions": [
+            "abort_dial",
+            "end_redial_window",
+            "withdraw_identity"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "loss-redials-within-the-window",
+      "section": "4.5 item 6, 8.3",
+      "machine": "requester_view_of_custodian",
+      "role": "requester",
+      "start": "connected",
+      "steps": [
+        {
+          "event": "session_lost",
+          "outcome": "transition",
+          "state": "connecting",
+          "actions": [
+            "start_offer_grace",
+            "schedule_redial"
+          ]
+        },
+        {
+          "event": "sight_lost",
+          "outcome": "ignored",
+          "state": "connecting",
+          "actions": []
+        },
+        {
+          "event": "redial_due",
+          "outcome": "transition",
+          "state": "connecting",
+          "actions": [
+            "open_session_dial"
+          ]
+        },
+        {
+          "event": "dial_failed",
+          "guards": [
+            "within_redial_window"
+          ],
+          "outcome": "transition",
+          "state": "connecting",
+          "actions": [
+            "schedule_redial"
+          ]
+        },
+        {
+          "event": "redial_window_ended",
+          "guards": [
+            "no_dial_running"
+          ],
+          "outcome": "transition",
+          "state": "idle",
+          "actions": [
+            "end_redial_window"
+          ]
+        },
+        {
+          "event": "redial_due",
+          "outcome": "cannot_happen"
+        }
+      ]
+    },
+    {
+      "name": "window-ends-during-a-dial",
+      "section": "8.3",
+      "machine": "requester_view_of_custodian",
+      "role": "requester",
+      "start": "connecting",
+      "steps": [
+        {
+          "event": "redial_window_ended",
+          "guards": [
+            "dial_running"
+          ],
+          "outcome": "transition",
+          "state": "connecting",
+          "actions": []
+        },
+        {
+          "event": "dial_failed",
+          "guards": [
+            "redial_window_spent"
+          ],
+          "outcome": "transition",
+          "state": "idle",
+          "actions": [
+            "end_redial_window"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "other-close-reason-is-a-loss",
+      "section": "4.5 item 6",
+      "machine": "requester_view_of_custodian",
+      "role": "requester",
+      "start": "connected",
+      "steps": [
+        {
+          "event": "close_other_reason",
+          "outcome": "transition",
+          "state": "connecting",
+          "actions": [
+            "start_offer_grace",
+            "schedule_redial"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "protocol-violation-waits-for-the-next-announcement",
+      "section": "4.5 item 6, 10.1",
+      "machine": "requester_view_of_custodian",
+      "role": "requester",
+      "start": "connected",
+      "steps": [
+        {
+          "event": "session_protocol_violation",
+          "outcome": "transition",
+          "state": "idle",
+          "actions": [
+            "start_offer_grace"
+          ]
+        },
+        {
+          "event": "redial_due",
+          "outcome": "cannot_happen"
+        },
+        {
+          "event": "record_appeared",
+          "outcome": "transition",
+          "state": "connecting",
+          "actions": [
+            "open_session_dial"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "violation-before-ready-stops-the-window",
+      "section": "4.5 item 6",
+      "machine": "requester_view_of_custodian",
+      "role": "requester",
+      "start": "connecting",
+      "steps": [
+        {
+          "event": "session_protocol_violation",
+          "outcome": "transition",
+          "state": "idle",
+          "actions": [
+            "abort_dial",
+            "end_redial_window"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "revoked-close-forgets",
+      "section": "4.6 item 4",
+      "machine": "requester_view_of_custodian",
+      "role": "requester",
+      "start": "connected",
+      "steps": [
+        {
+          "event": "close_pairing_revoked",
+          "outcome": "transition",
+          "state": "ended",
+          "actions": [
+            "withdraw_identity",
+            "show_peer_forgot"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "stream-appearance-pre-empts-a-dial",
+      "section": "8.3",
+      "machine": "requester_view_of_custodian",
+      "role": "requester",
+      "start": "connecting",
+      "steps": [
+        {
+          "event": "record_appeared",
+          "outcome": "transition",
+          "state": "connecting",
+          "actions": [
+            "abort_dial",
+            "open_session_dial"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "consumer-request-from-idle",
+      "section": "8.4 item 3",
+      "machine": "requester_view_of_custodian",
+      "role": "requester",
+      "start": "idle",
+      "steps": [
+        {
+          "event": "consumer_request",
+          "outcome": "transition",
+          "state": "connecting",
+          "actions": [
+            "open_session_dial"
+          ]
+        },
+        {
+          "event": "dial_succeeded",
+          "outcome": "transition",
+          "state": "connected",
+          "actions": [
+            "end_redial_window"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "switch-off-forgets-the-pairing",
+      "section": "hierarchy 5.2",
+      "machine": "requester_remote_use",
+      "role": "requester",
+      "start": "switched_on",
+      "steps": [
+        {
+          "event": "holder_turns_off",
+          "outcome": "transition",
+          "state": "switched_off",
+          "actions": [
+            "forget_held_pairing",
+            "hide_code_entry",
+            "stop_session_discovery"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "revocation-attempt-ends-at-its-bound",
+      "section": "4.6 item 6",
+      "machine": "pairing",
+      "role": "requester",
+      "start": "paired_disconnected",
+      "steps": [
+        {
+          "event": "forget_pairing",
+          "guards": [
+            "local_user_action"
+          ],
+          "outcome": "transition",
+          "state": "revoking",
+          "actions": [
+            "mark_record_revoked",
+            "withdraw_identity",
+            "show_forgotten"
+          ]
+        },
+        {
+          "event": "notice_window_expired",
+          "outcome": "cannot_happen"
+        },
+        {
+          "event": "revocation_attempt_ended",
+          "outcome": "transition",
+          "state": "revoked",
+          "actions": [
+            "destroy_pair_keys"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "revocation-attempt-delivers-the-close",
+      "section": "4.6 item 6",
+      "machine": "pairing",
+      "role": "requester",
+      "start": "paired_disconnected",
+      "steps": [
+        {
+          "event": "forget_pairing",
+          "guards": [
+            "local_user_action"
+          ],
+          "outcome": "transition",
+          "state": "revoking",
+          "actions": [
+            "mark_record_revoked",
+            "withdraw_identity",
+            "show_forgotten"
+          ]
+        },
+        {
+          "event": "revocation_notice_sent",
+          "outcome": "transition",
+          "state": "revoked",
+          "actions": [
+            "destroy_pair_keys"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "switch-off-in-session-sends-the-close",
+      "section": "4.6 item 6",
+      "machine": "pairing",
+      "role": "requester",
+      "start": "paired_connected",
+      "steps": [
+        {
+          "event": "forget_pairing",
+          "guards": [
+            "local_user_action"
+          ],
+          "outcome": "transition",
+          "state": "revoked",
+          "actions": [
+            "mark_record_revoked",
+            "send_close_pairing_revoked",
+            "close_session",
+            "destroy_pair_keys",
+            "withdraw_identity",
+            "show_forgotten"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "custodian-revocation-keeps-the-switch-on",
+      "section": "hierarchy 5.2",
+      "machine": "requester_remote_use",
+      "role": "requester",
+      "start": "switched_on",
+      "steps": [
+        {
+          "event": "last_pairing_ended",
+          "outcome": "transition",
+          "state": "switched_on",
+          "actions": [
+            "stop_session_discovery",
+            "show_code_entry"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "pairing-another-phone-replaces-the-pairing",
+      "section": "hierarchy 5.2",
+      "machine": "requester_remote_use",
+      "role": "requester",
+      "start": "switched_on",
+      "steps": [
+        {
+          "event": "code_typed",
+          "guards": [
+            "no_remote_card_presented"
+          ],
+          "outcome": "transition",
+          "state": "searching",
+          "actions": [
+            "hide_code_entry",
+            "stop_session_discovery",
+            "start_pairing_search"
+          ]
+        },
+        {
+          "event": "pairing_stored",
+          "outcome": "transition",
+          "state": "switched_on",
+          "actions": [
+            "end_pairing_search",
+            "forget_previous_pairing",
+            "start_session_discovery"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "no-code-entry-beside-a-remote-card",
+      "section": "hierarchy 5.2",
+      "machine": "requester_remote_use",
+      "role": "requester",
+      "start": "switched_on",
+      "steps": [
+        {
+          "event": "code_typed",
+          "guards": [
+            "remote_card_presented"
+          ],
+          "outcome": "cannot_happen"
+        }
+      ]
+    },
+    {
+      "name": "launch-restores-the-switch-with-no-pairing",
+      "section": "hierarchy 5.2",
+      "machine": "requester_remote_use",
+      "role": "requester",
+      "start": "not_running",
+      "steps": [
+        {
+          "event": "launched",
+          "guards": [
+            "remote_use_switch_on",
+            "no_local_card",
+            "holds_no_active_pairing"
+          ],
+          "outcome": "transition",
+          "state": "switched_on",
+          "actions": [
+            "show_code_entry"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "custodian-switch-off-is-withdrawal",
+      "section": "4.5 item 3",
+      "machine": "custodian_service",
+      "role": "custodian",
+      "start": "serving",
+      "steps": [
+        {
+          "event": "holder_turns_off",
+          "outcome": "transition",
+          "state": "withdrawing",
+          "actions": [
+            "cancel_offer",
+            "withdraw_custodian",
+            "stop_ble_advertising"
+          ]
+        },
+        {
+          "event": "withdrawn_record_elapsed",
+          "outcome": "transition",
+          "state": "switched_off",
+          "actions": [
+            "unregister_service"
+          ]
+        },
+        {
+          "event": "holder_turns_on",
+          "outcome": "transition",
+          "state": "serving",
+          "actions": [
+            "register_fresh_instance",
+            "start_ble_advertising"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "custodian-switch-on-during-withdrawal",
+      "section": "4.5 item 3",
+      "machine": "custodian_service",
+      "role": "custodian",
+      "start": "withdrawing",
+      "steps": [
+        {
+          "event": "holder_turns_on",
+          "outcome": "transition",
+          "state": "serving",
+          "actions": [
+            "unregister_service",
+            "register_fresh_instance",
+            "start_ble_advertising"
+          ]
+        },
+        {
+          "event": "withdrawn_record_elapsed",
+          "outcome": "cannot_happen"
+        }
+      ]
+    },
+    {
+      "name": "custodian-pairing-keeps-serving",
+      "section": "4.2",
+      "machine": "custodian_service",
+      "role": "custodian",
+      "start": "serving",
+      "steps": [
+        {
+          "event": "holder_starts_pairing",
+          "guards": [
+            "no_offer_up"
+          ],
+          "outcome": "transition",
+          "state": "serving",
+          "actions": []
+        },
+        {
+          "event": "holder_starts_pairing",
+          "guards": [
+            "offer_up"
+          ],
+          "outcome": "cannot_happen"
+        },
+        {
+          "event": "offer_ended",
+          "outcome": "ignored",
+          "state": "serving",
+          "actions": []
+        }
+      ]
+    },
+    {
+      "name": "computer-withdrew",
+      "section": "4.5 item 9",
+      "machine": "pairing",
+      "role": "custodian",
+      "start": "paired_connected",
+      "steps": [
+        {
+          "event": "peer_withdrawal_notice",
+          "outcome": "transition",
+          "state": "paired_disconnected",
+          "actions": [
+            "record_last_session",
+            "show_peer_withdrawn"
+          ]
+        },
+        {
+          "event": "session_healthy",
+          "outcome": "transition",
+          "state": "paired_connected",
+          "actions": [
+            "record_last_session",
+            "show_connected"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "computer-revocation-delivered",
+      "section": "4.6 item 4",
+      "machine": "pairing",
+      "role": "custodian",
+      "start": "paired_disconnected",
+      "steps": [
+        {
+          "event": "peer_revocation_notice",
+          "outcome": "transition",
+          "state": "revoked",
+          "actions": [
+            "mark_record_revoked",
+            "close_session",
+            "destroy_pair_keys",
+            "withdraw_identity",
+            "show_peer_forgot"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "store-failure-ends-the-pairing",
+      "section": "4.3 item 4",
+      "machine": "pairing",
+      "role": "requester",
+      "start": "confirming",
+      "steps": [
+        {
+          "event": "pair_record_store_failed",
+          "outcome": "transition",
+          "state": "unpaired",
+          "actions": [
+            "send_pairing_abort_best_effort",
+            "destroy_candidate_keys",
+            "close_candidate",
+            "show_pairing_not_stored"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "requester-sends-its-name-on-every-session",
+      "section": "4.3 item 4, 7.1",
+      "machine": "session",
+      "role": "requester",
+      "start": "authenticating",
+      "steps": [
+        {
+          "event": "ready_verified",
+          "guards": [
+            "ready_parameters_match"
+          ],
+          "outcome": "transition",
+          "state": "healthy",
+          "actions": [
+            "record_peer_display_name",
+            "send_session_hello",
+            "start_liveness",
+            "show_connected"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "custodian-records-the-requester-name",
+      "section": "4.3 item 4, 7.1",
+      "machine": "session",
+      "role": "custodian",
+      "start": "authenticating",
+      "steps": [
+        {
+          "event": "handshake_complete",
+          "outcome": "transition",
+          "state": "healthy",
+          "actions": [
+            "derive_session_identifiers",
+            "send_session_ready",
+            "send_card_status",
+            "start_liveness"
+          ]
+        },
+        {
+          "event": "session_hello_received",
+          "outcome": "transition",
+          "state": "healthy",
+          "actions": [
+            "record_peer_display_name"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "card-unavailable-drops-the-identity-at-once",
+      "section": "4.5 item 6, 8.4 item 5",
+      "machine": "requester_view_of_custodian",
+      "role": "requester",
+      "start": "connected",
+      "steps": [
+        {
+          "event": "close_card_unavailable",
+          "outcome": "transition",
+          "state": "withdrawn",
+          "actions": [
+            "withdraw_identity"
+          ]
+        },
+        {
+          "event": "consumer_request",
+          "outcome": "transition",
+          "state": "withdrawn",
+          "actions": [
+            "refuse_consumer_request"
+          ]
+        },
+        {
+          "event": "redial_due",
+          "outcome": "cannot_happen"
+        },
+        {
+          "event": "record_appeared",
+          "outcome": "transition",
+          "state": "connecting",
+          "actions": [
+            "open_session_dial"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "custodian-announces-when-the-card-is-back",
+      "section": "8.4 item 5",
+      "machine": "custodian_service",
+      "role": "custodian",
+      "start": "serving",
+      "steps": [
+        {
+          "event": "card_available_again",
+          "outcome": "transition",
+          "state": "serving",
+          "actions": [
+            "reannounce_service"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "requester-idle-expiry-is-silent",
+      "section": "4.6 item 5",
+      "machine": "pairing",
+      "role": "requester",
+      "start": "paired_disconnected",
+      "steps": [
+        {
+          "event": "idle_expired",
+          "outcome": "transition",
+          "state": "revoked",
+          "actions": [
+            "mark_record_revoked",
+            "destroy_pair_keys",
+            "withdraw_identity"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "custodian-idle-expiry-keeps-the-key-for-the-close",
+      "section": "4.6 item 5",
+      "machine": "pairing",
+      "role": "custodian",
+      "start": "paired_disconnected",
+      "steps": [
+        {
+          "event": "idle_expired",
+          "outcome": "transition",
+          "state": "revoking",
+          "actions": [
+            "mark_record_revoked",
+            "withdraw_identity"
+          ]
+        },
+        {
+          "event": "notice_window_expired",
+          "outcome": "transition",
+          "state": "revoked",
+          "actions": [
+            "destroy_pair_keys"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "switch-off-with-a-local-card-attempts-too",
+      "section": "4.6 item 6, hierarchy 5.2",
+      "machine": "requester_remote_use",
+      "role": "requester",
+      "start": "suspended",
+      "steps": [
+        {
+          "event": "holder_turns_off",
+          "outcome": "transition",
+          "state": "switched_off",
+          "actions": [
+            "forget_held_pairing"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "a-received-close-is-echoed",
+      "section": "7.1 item 7, 4.6 item 4",
+      "machine": "session",
+      "role": "custodian",
+      "start": "healthy",
+      "steps": [
+        {
+          "event": "peer_close_received",
+          "outcome": "transition",
+          "state": "closing",
+          "actions": [
+            "record_peer_close_reason",
+            "echo_peer_close",
+            "show_disconnecting"
+          ]
+        },
+        {
+          "event": "close_complete_or_deadline",
+          "outcome": "transition",
+          "state": "closed",
+          "actions": [
+            "destroy_session_material",
+            "destroy_credential_buffers",
+            "show_connection_stopped"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "the-echo-ends-the-wait-unanswered",
+      "section": "7.1 item 7, 4.5 item 8",
+      "machine": "session",
+      "role": "requester",
+      "start": "healthy",
+      "steps": [
+        {
+          "event": "service_withdrawn",
+          "outcome": "transition",
+          "state": "closing",
+          "actions": [
+            "send_close_service_withdrawn",
+            "show_disconnecting"
+          ]
+        },
+        {
+          "event": "peer_close_received",
+          "outcome": "transition",
+          "state": "closed",
+          "actions": [
+            "record_peer_close_reason",
+            "destroy_session_material",
+            "destroy_credential_buffers",
+            "show_connection_stopped"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "a-revoking-requester-waits-for-the-echo",
+      "section": "7.1 item 7, 4.6 items 2 and 6",
+      "machine": "session",
+      "role": "requester",
+      "start": "authenticating",
+      "steps": [
+        {
+          "event": "handshake_complete_while_revoking",
+          "outcome": "transition",
+          "state": "closing",
+          "actions": [
+            "derive_session_identifiers",
+            "send_close_pairing_revoked"
+          ]
+        },
+        {
+          "event": "peer_close_received",
+          "outcome": "transition",
+          "state": "closed",
+          "actions": [
+            "record_peer_close_reason",
+            "destroy_session_material",
+            "destroy_credential_buffers",
+            "show_connection_stopped"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "a-close-in-place-of-ready-is-echoed",
+      "section": "7.1 item 7, 4.6 item 4",
+      "machine": "session",
+      "role": "requester",
+      "start": "authenticating",
+      "steps": [
+        {
+          "event": "peer_close_received",
+          "outcome": "transition",
+          "state": "closed",
+          "actions": [
+            "record_peer_close_reason",
+            "echo_peer_close",
+            "destroy_session_material"
+          ]
+        }
+      ]
+    }
+  ]
+}

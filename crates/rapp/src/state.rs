@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! The pairing, session and operation machines of the RAPP state model
-//! (`doc/protocols/rapp-state-machine-v26.10.29.yaml`), and the runtime state
+//! (`doc/protocols/rapp-state-machine-v26.11.2.yaml`), and the runtime state
 //! an endpoint keeps. No failure revokes a pairing; a user does, idle expiry
 //! does, and the peer's revocation notice does.
 
@@ -41,9 +41,10 @@ pub struct Guards {
     pub transcript_matches: bool,
     /// Both pairing.confirm granted_profiles sets are equal.
     pub granted_sets_equal: bool,
-    /// The requester's remote use is on, no card is in a reader attached to
-    /// it, a stored pairing is active, or forgotten and owing its revocation
-    /// close, and its custodian's discovery hint is in sight.
+    /// Either the requester's remote use is on, no card is in a reader
+    /// attached to it, and an active pairing's view of the custodian is
+    /// connecting; or, whatever remote use and the local reader are, a
+    /// pairing its user forgot is within its one revocation attempt.
     pub initiation_permitted: bool,
     /// The routing tag matched an active stored pairing and its nonce is not in the replay memory.
     pub pairing_routed: bool,
@@ -171,6 +172,9 @@ pub enum PairingEvent {
     BothConfirmed,
     /// The pairing was aborted, denied, or missed its deadline.
     DeniedAbortedOrTimedOut,
+    /// Both pairing.confirm messages arrived and the atomic store of the
+    /// pair record failed: nothing is stored and no pairing.stored is sent.
+    PairRecordStoreFailed,
     /// The peer's pairing.stored arrived.
     PeerStorageConfirmed,
     /// A session of the pairing became healthy.
@@ -178,8 +182,9 @@ pub enum PairingEvent {
     /// The session closed.
     SessionClosed,
     /// The local user forgot the pairing; on a requester, by turning remote
-    /// use off, which forgets every pairing it holds and, with no session
-    /// open, owes the custodian nothing (section 4.6 item 6).
+    /// use off or by pairing another phone, which forgets the one pairing it
+    /// holds; with no session open it keeps the key for one bounded
+    /// revocation attempt (section 4.6 item 6).
     ForgetPairing,
     /// The idle-expiry sweep, with a session to the pairing established or
     /// with none and the pairing short of the idle limit (section 4.6 item
@@ -191,8 +196,11 @@ pub enum PairingEvent {
     IdleExpired,
     /// The revocation close went out as a session's first message.
     RevocationNoticeSent,
-    /// The revocation notice window passed.
+    /// The revocation notice window passed (custodian).
     NoticeWindowExpired,
+    /// The requester's revocation attempt bound passed without the close
+    /// sent (section 4.6 item 6).
+    RevocationAttemptEnded,
     /// A session.close with reason pairing_revoked arrived.
     PeerRevocationNotice,
     /// The requester closed the session with reason service_withdrawn: the
@@ -222,6 +230,8 @@ pub enum SessionEvent {
     CandidateFailure,
     /// An authenticated message violated the protocol.
     AuthenticatedProtocolViolation,
+    /// The requester's session.hello arrived with its current display name.
+    SessionHelloReceived,
     /// Nothing arrived for the liveness ping interval.
     PeerSilent,
     /// Nothing arrived for the session silence limit.
@@ -390,6 +400,16 @@ pub enum Action {
     ShowPeerWithdrawn,
     /// Erase the revoked record.
     ClearResidualPairRecord,
+    /// Send session.hello with the requester's current display name as the
+    /// session's first message.
+    SendSessionHello,
+    /// Check the peer's display name as at pairing and, where it differs
+    /// from the pair record's, replace the record's name; a failed store
+    /// keeps the old name and the session goes on.
+    RecordPeerDisplayName,
+    /// Tell the user the pairing failed because the record could not be
+    /// stored, with the platform's cause.
+    ShowPairingNotStored,
     /// Connect to the custodian's advertised endpoint or peripheral.
     OpenTransport,
     /// Send the session routing preamble with a fresh routing tag.
@@ -411,6 +431,9 @@ pub enum Action {
     SendLivenessPing,
     /// Keep the received close reason for the user.
     RecordPeerCloseReason,
+    /// Answer the received session.close with a session.close carrying the
+    /// same reason, the echo that acknowledges it (section 7.1 item 7).
+    EchoPeerClose,
     /// Send session.close with reason user_disconnect.
     SendCloseUserDisconnect,
     /// Send session.close with reason normal.
@@ -725,6 +748,15 @@ impl PairingState {
                     A::CloseCandidate,
                 ],
             },
+            (Self::Confirming, E::PairRecordStoreFailed) => Transition {
+                state: Self::Unpaired,
+                actions: &[
+                    A::SendPairingAbortBestEffort,
+                    A::DestroyCandidateKeys,
+                    A::CloseCandidate,
+                    A::ShowPairingNotStored,
+                ],
+            },
             (Self::StorageConfirming, E::PeerStorageConfirmed) => Transition {
                 state: Self::PairedDisconnected,
                 actions: &[A::MarkRecordConfirmed, A::ClosePairingChannel],
@@ -768,20 +800,9 @@ impl PairingState {
             }
             (Self::PairedDisconnected, E::ForgetPairing) => {
                 require(guards.local_user_action)?;
-                match role {
-                    EndpointRole::Proxy => Transition {
-                        state: Self::Revoking,
-                        actions: &[A::MarkRecordRevoked, A::WithdrawIdentity, A::ShowForgotten],
-                    },
-                    EndpointRole::Requester => Transition {
-                        state: Self::Revoked,
-                        actions: &[
-                            A::MarkRecordRevoked,
-                            A::DestroyPairKeys,
-                            A::WithdrawIdentity,
-                            A::ShowForgotten,
-                        ],
-                    },
+                Transition {
+                    state: Self::Revoking,
+                    actions: &[A::MarkRecordRevoked, A::WithdrawIdentity, A::ShowForgotten],
                 }
             }
             (Self::PairedConnected, E::ExpiryCheck) => Transition {
@@ -792,18 +813,38 @@ impl PairingState {
                 state: Self::PairedDisconnected,
                 actions: &[],
             },
-            (Self::PairedDisconnected, E::IdleExpired) => Transition {
-                state: Self::Revoking,
-                actions: &[A::MarkRecordRevoked, A::WithdrawIdentity],
+            (Self::PairedDisconnected, E::IdleExpired) => match role {
+                EndpointRole::Proxy => Transition {
+                    state: Self::Revoking,
+                    actions: &[A::MarkRecordRevoked, A::WithdrawIdentity],
+                },
+                EndpointRole::Requester => Transition {
+                    state: Self::Revoked,
+                    actions: &[
+                        A::MarkRecordRevoked,
+                        A::DestroyPairKeys,
+                        A::WithdrawIdentity,
+                    ],
+                },
             },
             (Self::Revoking, E::RevocationNoticeSent) => Transition {
                 state: Self::Revoked,
                 actions: &[A::DestroyPairKeys],
             },
-            (Self::Revoking, E::NoticeWindowExpired) => Transition {
-                state: Self::Revoked,
-                actions: &[A::DestroyPairKeys],
-            },
+            (Self::Revoking, E::NoticeWindowExpired) => {
+                require_role(role, EndpointRole::Proxy)?;
+                Transition {
+                    state: Self::Revoked,
+                    actions: &[A::DestroyPairKeys],
+                }
+            }
+            (Self::Revoking, E::RevocationAttemptEnded) => {
+                require_role(role, EndpointRole::Requester)?;
+                Transition {
+                    state: Self::Revoked,
+                    actions: &[A::DestroyPairKeys],
+                }
+            }
             (Self::PairedDisconnected, E::PeerRevocationNotice) => Transition {
                 state: Self::Revoked,
                 actions: &[
@@ -917,18 +958,18 @@ impl SessionState {
                 },
             },
             (Self::Authenticating, E::HandshakeCompleteWhileRevoking) => Transition {
-                state: Self::Closed,
-                actions: &[
-                    A::DeriveSessionIdentifiers,
-                    A::SendClosePairingRevoked,
-                    A::DestroySessionMaterial,
-                ],
+                state: Self::Closing,
+                actions: &[A::DeriveSessionIdentifiers, A::SendClosePairingRevoked],
             },
             (Self::Authenticating, E::PeerCloseReceived) => {
                 require_role(role, EndpointRole::Requester)?;
                 Transition {
                     state: Self::Closed,
-                    actions: &[A::RecordPeerCloseReason, A::DestroySessionMaterial],
+                    actions: &[
+                        A::RecordPeerCloseReason,
+                        A::EchoPeerClose,
+                        A::DestroySessionMaterial,
+                    ],
                 }
             }
             (Self::Authenticating, E::ReadyVerified) => {
@@ -936,7 +977,12 @@ impl SessionState {
                 require(guards.ready_parameters_match)?;
                 Transition {
                     state: Self::Healthy,
-                    actions: &[A::StartLiveness, A::ShowConnected],
+                    actions: &[
+                        A::RecordPeerDisplayName,
+                        A::SendSessionHello,
+                        A::StartLiveness,
+                        A::ShowConnected,
+                    ],
                 }
             }
             (Self::Authenticating, E::CandidateFailure) => Transition {
@@ -951,6 +997,13 @@ impl SessionState {
                 state: Self::Closing,
                 actions: &[A::SendCloseProtocolViolation, A::ShowDisconnecting],
             },
+            (Self::Healthy, E::SessionHelloReceived) => {
+                require_role(role, EndpointRole::Proxy)?;
+                Transition {
+                    state: Self::Healthy,
+                    actions: &[A::RecordPeerDisplayName],
+                }
+            }
             (Self::Healthy, E::PeerSilent) => Transition {
                 state: Self::Healthy,
                 actions: &[A::SendLivenessPing],
@@ -991,7 +1044,11 @@ impl SessionState {
             }
             (Self::Healthy, E::PeerCloseReceived) => Transition {
                 state: Self::Closing,
-                actions: &[A::RecordPeerCloseReason, A::ShowDisconnecting],
+                actions: &[
+                    A::RecordPeerCloseReason,
+                    A::EchoPeerClose,
+                    A::ShowDisconnecting,
+                ],
             },
             (Self::Healthy, E::TransportFailed) => Transition {
                 state: Self::Closing,
@@ -1026,8 +1083,13 @@ impl SessionState {
                 ],
             },
             (Self::Closing, E::PeerCloseReceived) => Transition {
-                state: Self::Closing,
-                actions: &[],
+                state: Self::Closed,
+                actions: &[
+                    A::RecordPeerCloseReason,
+                    A::DestroySessionMaterial,
+                    A::DestroyCredentialBuffers,
+                    A::ShowConnectionStopped,
+                ],
             },
             (Self::Closing, E::TransportFailed) => Transition {
                 state: Self::Closing,

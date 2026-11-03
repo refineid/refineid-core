@@ -4,13 +4,13 @@ use refineid_rapp::{
     Action, EndpointRole, Guards, IDENTITY_OFFER_GRACE_MS, LIVENESS_PING_AFTER_SILENCE_MS,
     MINIMUM_REMAINING_ATTEMPTS, OFFER_TTL_MS, OperationEvent, OperationState,
     PAIRING_CANDIDATES_MAX, PAIRING_IDLE_EXPIRY_DAYS, PairingEvent, PairingState,
-    QUIT_WITHDRAWAL_BOUND_MS, REVOCATION_NOTICE_DAYS, SESSION_SILENCE_LIMIT_MS, SessionEvent,
-    SessionState,
+    QUIT_WITHDRAWAL_BOUND_MS, REDIAL_WINDOW_MS, REVOCATION_ATTEMPT_BOUND_MS,
+    REVOCATION_NOTICE_DAYS, SESSION_SILENCE_LIMIT_MS, SessionEvent, SessionState,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
-const MODEL: &str = include_str!("../../../doc/protocols/rapp-state-machine-v26.10.29.yaml");
+const MODEL: &str = include_str!("../../../doc/protocols/rapp-state-machine-v26.11.2.yaml");
 
 #[derive(Deserialize)]
 struct Model {
@@ -34,6 +34,8 @@ struct Constants {
     pairing_idle_expiry_days: u64,
     identity_offer_grace_ms: u64,
     quit_withdrawal_bound_ms: u64,
+    redial_window_ms: u64,
+    revocation_attempt_bound_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -111,7 +113,7 @@ fn guard_is_registered(guard: &str) -> bool {
 
 #[test]
 fn formal_document_version_is_the_reviewed_revision() {
-    assert_eq!(model().document_version, "26.10.29");
+    assert_eq!(model().document_version, "26.11.2");
 }
 
 #[test]
@@ -134,6 +136,11 @@ fn formal_constants_are_the_engine_constants() {
     assert_eq!(constants.pairing_idle_expiry_days, PAIRING_IDLE_EXPIRY_DAYS);
     assert_eq!(constants.identity_offer_grace_ms, IDENTITY_OFFER_GRACE_MS);
     assert_eq!(constants.quit_withdrawal_bound_ms, QUIT_WITHDRAWAL_BOUND_MS);
+    assert_eq!(constants.redial_window_ms, REDIAL_WINDOW_MS);
+    assert_eq!(
+        constants.revocation_attempt_bound_ms,
+        REVOCATION_ATTEMPT_BOUND_MS
+    );
 }
 
 #[test]
@@ -255,7 +262,6 @@ fn no_pairing_expires_while_a_session_to_it_is_established() {
             rule.from.values().all(|from| from == "paired_disconnected"),
             "a pairing expires only with no session established"
         );
-        assert_eq!(rule.role, "both", "both endpoints expire a pairing");
         assert!(
             rule.actions.iter().all(|action| !is_notice(action)),
             "idle expiry is silent"
@@ -288,6 +294,12 @@ fn nothing_reaches_a_phone_while_remote_use_is_off_or_suspended() {
             .guards
             .get(guard)
             .unwrap_or_else(|| panic!("the model names {guard}"));
+        if guard == "initiation_permitted" {
+            assert!(
+                statement.contains("revocation_attempt_bound_ms"),
+                "{guard} names the one revocation attempt as its only exception"
+            );
+        }
         for condition in REMOTE_USE_CONDITIONS {
             assert!(
                 statement.contains(condition),
@@ -338,7 +350,7 @@ fn nothing_reaches_a_phone_while_remote_use_is_off_or_suspended() {
 }
 
 #[test]
-fn a_requester_that_forgets_with_no_session_open_owes_nothing() {
+fn a_requester_that_forgets_with_no_session_open_makes_one_bounded_attempt() {
     let forgotten = PairingState::PairedDisconnected
         .transition(
             EndpointRole::Requester,
@@ -346,9 +358,28 @@ fn a_requester_that_forgets_with_no_session_open_owes_nothing() {
             all_guards(),
         )
         .expect("the holder turns remote use off");
-    assert_eq!(forgotten.state, PairingState::Revoked);
-    assert!(forgotten.actions.contains(&Action::DestroyPairKeys));
-    assert!(!forgotten.actions.contains(&Action::SendClosePairingRevoked));
+    assert_eq!(forgotten.state, PairingState::Revoking);
+    assert!(!forgotten.actions.contains(&Action::DestroyPairKeys));
+    for event in [
+        PairingEvent::RevocationNoticeSent,
+        PairingEvent::RevocationAttemptEnded,
+    ] {
+        let ended = PairingState::Revoking
+            .transition(EndpointRole::Requester, event, all_guards())
+            .expect("the attempt ends with the close sent or at its bound");
+        assert_eq!(ended.state, PairingState::Revoked);
+        assert_eq!(ended.actions, &[Action::DestroyPairKeys]);
+    }
+    assert!(
+        PairingState::Revoking
+            .transition(
+                EndpointRole::Requester,
+                PairingEvent::NoticeWindowExpired,
+                all_guards(),
+            )
+            .is_err(),
+        "a requester keeps no revoking pairing for the notice window"
+    );
     let custodian = PairingState::PairedDisconnected
         .transition(
             EndpointRole::Proxy,
@@ -520,6 +551,9 @@ const fn formal_action_name(action: Action) -> &'static str {
         Action::ShowForgotten => "show_forgotten",
         Action::ShowPeerForgot => "show_peer_forgot",
         Action::ShowPeerWithdrawn => "show_peer_withdrawn",
+        Action::ShowPairingNotStored => "show_pairing_not_stored",
+        Action::SendSessionHello => "send_session_hello",
+        Action::RecordPeerDisplayName => "record_peer_display_name",
         Action::ClearResidualPairRecord => "clear_residual_pair_record",
         Action::OpenTransport => "open_transport",
         Action::SendSessionPreamble => "send_session_preamble",
@@ -531,6 +565,7 @@ const fn formal_action_name(action: Action) -> &'static str {
         Action::StartLiveness => "start_liveness",
         Action::SendLivenessPing => "send_liveness_ping",
         Action::RecordPeerCloseReason => "record_peer_close_reason",
+        Action::EchoPeerClose => "echo_peer_close",
         Action::SendCloseUserDisconnect => "send_close_user_disconnect",
         Action::SendCloseNormal => "send_close_normal",
         Action::SendCloseProtocolViolation => "send_close_protocol_violation",
@@ -753,6 +788,14 @@ const PAIRING_EVENTS: &[(&str, PairingEvent)] = &[
     ("idle_expired", PairingEvent::IdleExpired),
     ("revocation_notice_sent", PairingEvent::RevocationNoticeSent),
     ("notice_window_expired", PairingEvent::NoticeWindowExpired),
+    (
+        "revocation_attempt_ended",
+        PairingEvent::RevocationAttemptEnded,
+    ),
+    (
+        "pair_record_store_failed",
+        PairingEvent::PairRecordStoreFailed,
+    ),
     ("peer_revocation_notice", PairingEvent::PeerRevocationNotice),
     ("peer_withdrawal_notice", PairingEvent::PeerWithdrawalNotice),
 ];
@@ -773,6 +816,7 @@ const SESSION_EVENTS: &[(&str, SessionEvent)] = &[
         "authenticated_protocol_violation",
         SessionEvent::AuthenticatedProtocolViolation,
     ),
+    ("session_hello_received", SessionEvent::SessionHelloReceived),
     ("peer_silent", SessionEvent::PeerSilent),
     ("silence_limit_reached", SessionEvent::SilenceLimitReached),
     ("user_disconnect", SessionEvent::UserDisconnect),
@@ -834,3 +878,41 @@ const OPERATION_EVENTS: &[(&str, OperationEvent)] = &[
         OperationEvent::ResultCancelledReceived,
     ),
 ];
+
+#[test]
+fn a_received_close_is_echoed_and_an_echo_is_never_answered() {
+    let model = model();
+    let received = model
+        .session
+        .transitions
+        .iter()
+        .filter(|rule| rule.event == "peer_close_received")
+        .collect::<Vec<_>>();
+    assert!(!received.is_empty(), "the model names received closes");
+    for rule in received {
+        let echoes = rule
+            .actions
+            .iter()
+            .any(|action| action == "echo_peer_close");
+        for from in rule.from.values() {
+            assert_eq!(
+                echoes,
+                from != "closing",
+                "{from}: a close is echoed unless it is the echo awaited in closing"
+            );
+        }
+    }
+    for rule in &model.session.transitions {
+        let sends_close = rule
+            .actions
+            .iter()
+            .any(|action| action.starts_with("send_close_"));
+        if sends_close {
+            assert_eq!(
+                rule.to, "closing",
+                "{}: a sent close waits for its echo in closing",
+                rule.event
+            );
+        }
+    }
+}

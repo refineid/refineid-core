@@ -32,7 +32,7 @@ use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::{
-    BinaryFrame, OFFER_ID_SIZE, OfferId, PairingSecret, WIRE_VERSION_V26_10_29, WireValue,
+    BinaryFrame, OFFER_ID_SIZE, OfferId, PairingSecret, WIRE_VERSION_V26_11_2, WireValue,
     encode_deterministic_cbor,
 };
 
@@ -73,7 +73,7 @@ const CPACE_RISTRETTO255_DSI: &[u8] = b"CPaceRistretto255";
 const CPACE_RISTRETTO255_ISK_DSI: &[u8] = b"CPaceRistretto255_ISK";
 /// SHA-512 input block size in bytes (draft-irtf-cfrg-cpace-21).
 const SHA512_INPUT_BLOCK_SIZE: usize = 128;
-/// Pairing context array domain identifier (RAPP v26.10.29 §6.1.1).
+/// Pairing context array domain identifier (RAPP v26.11.2 §6.1.1).
 const CPACE_CONTEXT_DOMAIN: &str = "rapp-pairing-context";
 /// Domain separation prefix for KC2 transcript hash ($TH$).
 const CPACE_TRANSCRIPT_PREFIX: &[u8] = b"rapp-cpace-transcript";
@@ -94,7 +94,7 @@ type HmacSha512 = Hmac<Sha512>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CpaceError {
     /// The entered pairing code is not six symbols of the pairing-code
-    /// alphabet (RAPP v26.10.29 section 3.1).
+    /// alphabet (RAPP v26.11.2 section 3.1).
     InvalidCode,
     /// Random scalar generation produced an invalid/zero scalar.
     InvalidScalar,
@@ -208,13 +208,13 @@ pub fn calculate_isk(
 }
 
 /// Symbols of the pairing code, in order: Crockford's Base32 alphabet
-/// without `I`, `L`, `O` and `U` (RAPP v26.10.29 section 3.1).
+/// without `I`, `L`, `O` and `U` (RAPP v26.11.2 section 3.1).
 pub const PAIRING_CODE_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-/// Symbols in a complete pairing code (RAPP v26.10.29 section 3.1).
+/// Symbols in a complete pairing code (RAPP v26.11.2 section 3.1).
 pub const PAIRING_CODE_LENGTH: usize = 6;
-/// Separator the display inserts between groups (RAPP v26.10.29 section 3.2).
+/// Separator the display inserts between groups (RAPP v26.11.2 section 3.2).
 const PAIRING_CODE_GROUP_SEPARATOR: char = ' ';
-/// Separator a user may type between groups (RAPP v26.10.29 section 3.1).
+/// Separator a user may type between groups (RAPP v26.11.2 section 3.1).
 const PAIRING_CODE_TYPED_SEPARATOR: char = '-';
 
 /// A complete pairing code: exactly six uppercase symbols of
@@ -224,7 +224,7 @@ pub struct PairingCode([u8; PAIRING_CODE_LENGTH]);
 
 impl PairingCode {
     /// Parse an entered code: folds lowercase to uppercase, drops spaces
-    /// and hyphens, and refuses anything else (RAPP v26.10.29 section 3.1).
+    /// and hyphens, and refuses anything else (RAPP v26.11.2 section 3.1).
     ///
     /// # Errors
     /// [`CpaceError::InvalidCode`] for a symbol outside the alphabet or a
@@ -254,7 +254,7 @@ impl PairingCode {
     }
 
     /// The password octets: the UTF-8 encoding of the six uppercase
-    /// symbols (RAPP v26.10.29 section 3.1).
+    /// symbols (RAPP v26.11.2 section 3.1).
     const fn as_prs(&self) -> &[u8; PAIRING_CODE_LENGTH] {
         &self.0
     }
@@ -266,12 +266,12 @@ impl fmt::Debug for PairingCode {
     }
 }
 
-/// Encodes a deterministic CBOR pairing context array conforming to RAPP v26.10.29 §6.1.1.
+/// Encodes a deterministic CBOR pairing context array conforming to RAPP v26.11.2 §6.1.1.
 ///
 /// ```cddl
 /// pairing-context = [
 ///   "rapp-pairing-context",
-///   [26, 10, 29],                                                              ; wire version [Year, Month, Day]
+///   [26, 11, 2],                                                              ; wire version [Year, Month, Day]
 ///   "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512", ; full suite literal
 ///   tstr,                                                                    ; transport profile of the connection
 ///   tstr,                                                                    ; candidate_id of its offer entry
@@ -311,7 +311,7 @@ pub fn encode_pairing_context_v2(
 
 /// Encodes the RAPP pairing context for the offer hash, the transport profile
 /// of the connection, and the candidate identifier of its offer entry
-/// (RAPP v26.10.29 §6.1.1).
+/// (RAPP v26.11.2 §6.1.1).
 ///
 /// # Errors
 /// [`CpaceError::MalformedFrame`] if CBOR serialization fails.
@@ -322,9 +322,9 @@ pub fn standard_pairing_context_v2(
 ) -> Result<Vec<u8>, CpaceError> {
     encode_pairing_context_v2(
         [
-            u64::from(WIRE_VERSION_V26_10_29.0),
-            u64::from(WIRE_VERSION_V26_10_29.1),
-            u64::from(WIRE_VERSION_V26_10_29.2),
+            u64::from(WIRE_VERSION_V26_11_2.0),
+            u64::from(WIRE_VERSION_V26_11_2.1),
+            u64::from(WIRE_VERSION_V26_11_2.2),
         ],
         CPACE_KC2_SUITE,
         transport_profile,
@@ -387,7 +387,7 @@ pub fn calculate_generator_kc2(
     Ok(point)
 }
 
-/// Computes the 64-byte CPace KC2 transcript hash $TH$ per RAPP v26.10.29 §6.1.3:
+/// Computes the 64-byte CPace KC2 transcript hash $TH$ per RAPP v26.11.2 §6.1.3:
 /// `SHA-512(lv_cat(["rapp-cpace-transcript", SID, C, Y_A, Y_B]))`.
 #[must_use]
 pub fn calculate_transcript_hash_v2(
@@ -424,7 +424,7 @@ pub fn hkdf_expand_sha512_32(prk: &[u8; CPACE_PRK_SIZE], info: &[u8]) -> [u8; 32
     out
 }
 
-/// Computes a 32-byte mutual confirmation tag (FIRST32 of HMAC-SHA-512) per RAPP v26.10.29 §6.1.3:
+/// Computes a 32-byte mutual confirmation tag (FIRST32 of HMAC-SHA-512) per RAPP v26.11.2 §6.1.3:
 /// `FIRST32(HMAC-SHA512(key, lv_cat([tag_prefix, TH])))`.
 #[must_use]
 pub fn calculate_confirmation_tag(
@@ -1092,8 +1092,8 @@ mod tests {
         let sid_array: [u8; 32] = sid_bytes.as_slice().try_into().expect("sid is 32 bytes");
         let offer_id = OfferId::from_array(sid_array);
 
-        // 1. Context C, whose BLE length RAPP v26.10.29 section 6.1.1 states.
-        const BLE_CONTEXT_LENGTH: usize = 178;
+        // 1. Context C, whose BLE length RAPP v26.11.2 section 6.1.1 states.
+        const BLE_CONTEXT_LENGTH: usize = 177;
         let context = standard_pairing_context_v2(
             &offer_hash_bytes,
             crate::BLE_PROFILE,
@@ -1102,11 +1102,11 @@ mod tests {
         .expect("context cbor");
         assert_eq!(context.len(), BLE_CONTEXT_LENGTH);
         let expected_context_hex = concat!(
-            "8874726170702d70616972696e672d636f6e7465787483181a0a181d784543504143452d52495354",
-            "523235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f32353531",
-            "395f436861436861506f6c795f5348413531327466692e726566696e6569642e726170702e626c65",
-            "63626c655820303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f6972",
-            "657175657374657269637573746f6469616e"
+            "8874726170702d70616972696e672d636f6e7465787483181a0b02784543504143452d5249535452",
+            "3235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f3235353139",
+            "5f436861436861506f6c795f5348413531327466692e726566696e6569642e726170702e626c6563",
+            "626c655820303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f697265",
+            "7175657374657269637573746f6469616e"
         );
         assert_eq!(hex::encode(&context), expected_context_hex);
 
@@ -1117,7 +1117,7 @@ mod tests {
         let g_bytes = g.compress().to_bytes();
         assert_eq!(
             hex::encode(g_bytes),
-            "e42b59baf5303ffedc19f23eff53a3edcae3a445f341a9a7ad9bdb539cb6f96a"
+            "0aa7124360c0f941e1f089ea92cf33cd033289a125cb5a9649463852cc17191b"
         );
 
         // 3. Option B Scalars: 64 repeated bytes
@@ -1141,7 +1141,7 @@ mod tests {
             .expect("alice init succeeds");
         assert_eq!(
             hex::encode(msg1),
-            "d2dffea88b9ab5273623fabe2ccce4ab19dbcf0f5cf51dd561da2f7e28ad4b53"
+            "bc59c6d505f288193600eec2537d2d1bb84cd1a4ca7a9fde40bb8517a60cb730"
         );
 
         // 5. Step 2: Responder processes Y_A and outputs Y_B || T_B (64 bytes)
@@ -1151,22 +1151,22 @@ mod tests {
         assert_eq!(msg2.len(), 64);
         assert_eq!(
             hex::encode(&msg2[..32]),
-            "188f4056e57d5e21565e6befdc4a0891fe3da632e630ab15c03a89ec73a06656"
+            "b220d9441a5e39130b65c5d105810f05855251c80d7da0d0f51caa91cb6c527d"
         );
         assert_eq!(
             hex::encode(&msg2[32..]),
-            "dd8e35869eaf7805b0ad8eaaccf3a946944d2194ff22a6658585da5ff1e6eb19"
+            "18f5a324eb1143b812e303818b31abbd40377924915a225e4220a0a6c4096ee8"
         );
 
         // 6. Step 3: Initiator verifies T_B and outputs T_A (32 bytes) + PSK
         let (msg3, alice_secret) = alice.process_step2(&msg2).expect("alice step2 succeeds");
         assert_eq!(
             hex::encode(msg3),
-            "abc796b5ceef5e4de7cb62b7e4a24a4a75cb4d798fcae4197f283f53ca62e4f7"
+            "d4675eceb7dae7b7303658d71ca44ca72e322dfe495600db894ad71a8553e6ab"
         );
         assert_eq!(
             hex::encode(alice_secret.expose()),
-            "654a6b4cb686460070ccccbede2106b066920026ca3882126a7f9624a25c1c0b"
+            "ac0d3192e30c74a3f3d83354b8857c542d9a8d1d1579980b7f1e2212baa5c7af"
         );
 
         // 7. Responder verifies T_A and completes with PSK
@@ -1175,7 +1175,7 @@ mod tests {
             .expect("bob step3 succeeds");
         assert_eq!(
             hex::encode(bob_secret.expose()),
-            "654a6b4cb686460070ccccbede2106b066920026ca3882126a7f9624a25c1c0b"
+            "ac0d3192e30c74a3f3d83354b8857c542d9a8d1d1579980b7f1e2212baa5c7af"
         );
         assert_eq!(alice_secret.expose(), bob_secret.expose());
 
@@ -1189,7 +1189,7 @@ mod tests {
         assert_eq!(ya_point * scalar_b, k_point);
         assert_eq!(
             hex::encode(k_point.compress().to_bytes()),
-            "0a632e1ba588de540d6210af5b38f1234bfc90d973797f2e244f43570665b731"
+            "8cf6e9962ad9b679824c84555964c044647f94d8151fed39f4105184efa6a94f"
         );
 
         let isk = calculate_isk(
@@ -1202,39 +1202,39 @@ mod tests {
         );
         assert_eq!(
             hex::encode(isk),
-            "70028d87f25e53ea661b092155050e5f16a2726b0cb816a21b758b5df7c1664ff151657b524b9b4fc5f0cadc51dab3c12774db478a4ce86fe6931cb2d18e8135"
+            "04308c062eac831a2370aab5bfdf07e0a9bc23d7644ba22d77c61dd2a06a6cf60d43455b9ef003683ce1139b2e35d1f1d745e7f9d67d2f2b837d90f3e8a10243"
         );
 
         let th = calculate_transcript_hash_v2(&sid_bytes, &context, &msg1, &yb_arr);
         assert_eq!(
             hex::encode(th),
-            "0bbc0909784bb42d1f414800c8ffa8bac89e4b30df7c20abe163abf71b0c4d736e64812a540241aa8de4c534cea01d731dca11a05d325fe23be59e3d28eef25f"
+            "572d91f789a0ea05c6dcbdcdee12e4dcbe6c5538b278b320ed2f9d83f04455c3badcf952aebbaf5ba980ebf10c83afad93523ec7a334ce057543e0029536d3e1"
         );
 
         let keys = derive_kc2_keys(&isk, &th);
         assert_eq!(
             hex::encode(keys.prk()),
-            "2de30af31f92e28e1057577c9e090ae3bbf272ed7c99d0e02fbac1db81d3abdb56a2710d7caa1c153ed2d50faeb23fbdc0e6ba665f3c344b68c8f0c35101c3c1"
+            "e5546ebb5fdc781439bc35784685ca8af7f551d905c116eeb892924db7b5eef3c1736db1e634011149860f8e0b40b9c31c0ad2780fdf293d8d44d347c5c6ce22"
         );
         assert_eq!(
             hex::encode(keys.psk()),
-            "654a6b4cb686460070ccccbede2106b066920026ca3882126a7f9624a25c1c0b"
+            "ac0d3192e30c74a3f3d83354b8857c542d9a8d1d1579980b7f1e2212baa5c7af"
         );
         assert_eq!(
             hex::encode(keys.k_a()),
-            "6e852151e65e6133afddb9bc3b039bee9bcf83b0c9c653f107ab6395795c6a71"
+            "7680f911b5f9b0ae5d400d67b2432e9c95d32d745b718e8c0eb1166afeb07e34"
         );
         assert_eq!(
             hex::encode(keys.k_b()),
-            "8d2e386b55273697db6b39ace2365f80669f7f3577e5adb50f6aa07523ea346a"
+            "aebb5fef24d95aada473d772ca15e6ee588ca69321d4d457557b72e4d2c65a60"
         );
         assert_eq!(
             hex::encode(keys.tag_a()),
-            "abc796b5ceef5e4de7cb62b7e4a24a4a75cb4d798fcae4197f283f53ca62e4f7"
+            "d4675eceb7dae7b7303658d71ca44ca72e322dfe495600db894ad71a8553e6ab"
         );
         assert_eq!(
             hex::encode(keys.tag_b()),
-            "dd8e35869eaf7805b0ad8eaaccf3a946944d2194ff22a6658585da5ff1e6eb19"
+            "18f5a324eb1143b812e303818b31abbd40377924915a225e4220a0a6c4096ee8"
         );
     }
 

@@ -8,6 +8,13 @@ implementation. Each slice below was reconstructed for the public tree; none
 was copied together with private metadata, credentials, fixtures, or
 deployment details.
 
+Public trees are re-derived minimal cuts of the project's private
+development tree, which stays the frontier: less code is less to audit.
+Findings discovered in a cut flow back to the frontier as the single
+source of truth. Shared fixtures and behavior references are what
+survives a re-derivation, not code-level sync, so that is where joint
+investment goes.
+
 ## Slice records
 
 - **Input types.** Publication under Apache-2.0 directed on 2026-07-19 for

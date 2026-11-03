@@ -86,6 +86,12 @@ example and the record for RAPP and its applications.
 - A small change records its analysis in the pull request, and a change
   with no control action or feedback to analyse says so in one line. A
   change to the control structure updates the STPA record that covers it.
+- A lesson from a real incident goes into the record as a short
+  "Smart Card Office" story: Alice the phone, Bob the computer, Carol
+  the cardholder and the customary cryptography cast, a few lines on how
+  the day goes right or wrong, the one-line lesson, then its L, H, UCA
+  and CC references. Invented names only; no characters, quotes or plots
+  from television, no dates, no owner data.
 
 ## The floor
 
@@ -112,8 +118,13 @@ Mechanical requirements, all of them, before any commit:
   pinned protocol corpus) are the sole, temporary exception;
 - new dependencies are exceptional and justified; nothing that drags a
   second DER stack or duplicates what a crate here already does;
+- prefer a maintained cryptography crate over own arithmetic: when a
+  crate carries the curve, delete the own code, and remove code paths
+  for parameter encodings with no consumer instead of validating them;
 - safe Rust only; protocol, parsing, and secret handling never in
-  `unsafe`.
+  `unsafe`;
+- `rust-toolchain.toml` selects the stable channel; never pin a Rust
+  release.
 
 ## The floor is not the goal
 
@@ -142,6 +153,11 @@ before and the correction made the core better.
 - Claims about card behaviour, cryptography, or platform interfaces are
   verified against a primary source -- the FINEID specifications, ISO,
   the RFCs -- not assumed from memory.
+- Cite specifications by document and section; never copy spec text
+  verbatim into the tree.
+- New source files carry `Copyright 2026 Petri Koistinen` with no email
+  address and HTTPS license URLs; shell scripts carry the one-line form
+  under the shebang.
 
 ## Worktree policy
 
@@ -155,11 +171,22 @@ before and the correction made the core better.
 - Never put a git worktree under `/tmp`. It is cleared on reboot and takes the
   branch's only checkout with it.
 - One task, one worktree, one branch, one pull request (see [doc/process/agent-worktrees.md](doc/process/agent-worktrees.md)).
-- Run `./scripts/agent-housekeeping.sh` to monitor worktrees and verify compliance.
+- Clean worktrees at the start and end of every task: run
+  `./scripts/agent-housekeeping.sh --clean` before creating your worktree
+  and again before finishing. It removes only worktrees whose branch is
+  merged into main, whose tree is clean, that hold no unpushed commits,
+  and that have been idle for over a day; everything else is left alone.
+  If your own branch just merged and is too fresh for `--clean` to take,
+  remove it yourself once its tree is clean and pushed, then delete the
+  branch and fast-forward local main. If your pull request is still open
+  when you finish, leave the worktree in place — a later start-clean reaps
+  it after merge. Verify with `git worktree list`.
 
 ## Working discipline
 
 - Never poll background commands or set rapid check timers (e.g. 10s-30s). When running builds, tests, or async tasks, execute asynchronously and wait strictly for system completion notifications.
+- If something is not working, it is a bug in our code or harness, not
+  a card limitation, until exchange-level evidence says otherwise.
 
 ## Protocol specifications
 
@@ -170,6 +197,8 @@ before and the correction made the core better.
   pull requests.
 - Document and protocol versions are stamped by the project owner; never
   invent one.
+- Document stamps are UTC dates. Only the owner amends a stamp in
+  place, and only while its UTC day has not passed.
 
 ## Rules live here, not in an agent's memory
 
@@ -183,7 +212,8 @@ rule in a line and points to the reading behind it; the readings live in
 
 - Comments explain what the code does now and the constraints it honors.
   Past bugs, previous implementations, and explanations of what a fix changed
-  belong in commit messages, not source comments.
+  belong in commit messages, not source comments. No measurement dates
+  in comments.
 
 ## Commits and integration
 
@@ -240,6 +270,8 @@ rule in a line and points to the reading behind it; the readings live in
   ones (EU eIDAS), from trusted lists at runtime. No certificates or
   fingerprints are shipped in the software.
 - No pinning or other trust policy is added without the owner's decision.
+- Describe what the code does and cite the source; ask the owner before
+  changing trust behavior.
 
 ## Independent review
 

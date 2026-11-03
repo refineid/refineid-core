@@ -3,20 +3,23 @@
 use core::fmt;
 
 use super::{
-    AuthenticatedViolation, BinaryFrame, CloseReason, CryptoError, EndpointRole,
+    AuthenticatedViolation, BinaryFrame, CloseReason, CryptoError, DisplayName, EndpointRole,
     EstablishedEndpoint, HandshakeChannel, HandshakeRole, MessageError, OpenError, PairKeyMaterial,
     PairRecord, PairingState, RappState, SecureChannel, SessionCloseMessage,
-    SessionHandshakeParameters, SessionParameters, SessionReadyMessage, SessionState,
-    TransportProfile, TypedMessage,
+    SessionHandshakeParameters, SessionHelloMessage, SessionParameters, SessionReadyMessage,
+    SessionState, TransportProfile, TypedMessage,
 };
 
-/// Evidence supplied by the requester integration that the user explicitly
-/// initiated this new session. RAPP never automatically reconnects.
+/// Evidence supplied by the requester integration that this dial is one
+/// the requester may make (RAPP v26.11.2 section 8.3): the custodian
+/// appeared, a local consumer asked for the card, a redial within the
+/// redial window, or a revoking pairing's one attempt (section 4.6 item 6).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExplicitUserIntent(());
 
 impl ExplicitUserIntent {
-    /// Record a fresh local user action at the platform boundary.
+    /// Record at the platform boundary that the dial is one section 8.3
+    /// admits.
     #[must_use]
     pub const fn record() -> Self {
         Self(())
@@ -34,7 +37,7 @@ pub struct SessionHandshake {
 
 impl SessionHandshake {
     /// Requester-only explicit session start over `transport`, the
-    /// transport profile of the connection (RAPP v26.10.29 §4.3).
+    /// transport profile of the connection (RAPP v26.11.2 §4.3).
     ///
     /// # Errors
     /// [`SessionError`] on a role violation or a handshake-construction
@@ -50,8 +53,8 @@ impl SessionHandshake {
         Self::begin(pair, transport)
     }
 
-    /// Proxy-side response to one incoming connection over `transport`. This never
-    /// initiates a connection or automatic reconnection.
+    /// Proxy-side response to one incoming connection over `transport`. A
+    /// custodian never dials.
     ///
     /// # Errors
     /// [`SessionError`] on a role violation or a handshake-construction
@@ -143,6 +146,8 @@ impl SessionHandshake {
             expected_parameters: self.expected_parameters,
             channel: Some(completion.secure_channel),
             ready: false,
+            hello_sent: false,
+            close_sent: None,
             _local_keys: self.local_keys,
         })
     }
@@ -162,9 +167,10 @@ impl fmt::Debug for SessionHandshake {
 }
 
 /// A completed Noise KK session that is not healthy until `session.ready`:
-/// the Custodian sends it, the Requester verifies it (RAPP v26.10.29 section
-/// 7.1 item 5). A revoking endpoint sends the `pairing_revoked` close in its
-/// place (section 4.6 item 2).
+/// the Custodian sends it, the Requester verifies it and answers with
+/// `session.hello` (RAPP v26.11.2 section 7.1 items 5 and 6). A revoking
+/// endpoint sends the `pairing_revoked` close in their place (section 4.6
+/// item 2).
 pub struct SessionAuthentication {
     role: EndpointRole,
     pair_id: super::PairId,
@@ -172,35 +178,49 @@ pub struct SessionAuthentication {
     expected_parameters: SessionParameters,
     channel: Option<SecureChannel>,
     ready: bool,
+    hello_sent: bool,
+    close_sent: Option<CloseReason>,
     _local_keys: PairKeyMaterial,
 }
 
 impl SessionAuthentication {
     /// The Custodian's `session.ready`: the exact session parameters with a
-    /// caller-generated fresh nonce. The session is then healthy.
+    /// caller-generated fresh nonce and the Custodian's current
+    /// `display_name` (section 4.3 item 4). The session is then healthy.
     ///
     /// # Errors
     /// [`SessionError`] for a Requester, a second ready, a closed channel, or
     /// a seal failure.
-    pub fn send_ready(&mut self, nonce: [u8; 32]) -> Result<BinaryFrame, SessionError> {
+    pub fn send_ready(
+        &mut self,
+        nonce: [u8; 32],
+        display_name: &DisplayName,
+    ) -> Result<BinaryFrame, SessionError> {
         if self.role != EndpointRole::Proxy {
             return Err(SessionError::RoleViolation);
         }
         if self.ready {
             return Err(SessionError::DuplicateReady);
         }
+        if self.close_sent.is_some() {
+            return Err(SessionError::Closed);
+        }
         let frame = self.seal(&TypedMessage::SessionReady(SessionReadyMessage {
             parameters: self.expected_parameters.clone(),
             nonce,
+            display_name: display_name.clone(),
         }))?;
         self.ready = true;
         Ok(frame)
     }
 
     /// The Requester reads the Custodian's first message: `session.ready`,
-    /// or a close in its place. Anything else, and ready parameters that
-    /// differ from the local view, close the session with a sealed
-    /// `protocol_violation` notice; the pairing stays (section 10.1 item 2).
+    /// or a close in its place. Anything else, ready parameters that differ
+    /// from the local view, and a missing, blank or over-long
+    /// `display_name`, close the session with a sealed `protocol_violation`
+    /// notice; the pairing stays (section 4.3 item 4, section 10.1 item 2).
+    /// A verified ready gives the Custodian's display name; answer it with
+    /// [`Self::send_hello`].
     ///
     /// # Errors
     /// [`SessionError`] for a Custodian, a ready already verified, a closed
@@ -216,6 +236,9 @@ impl SessionAuthentication {
         }
         if self.ready {
             return Err(SessionError::DuplicateReady);
+        }
+        if self.close_sent.is_some() {
+            return Err(SessionError::Closed);
         }
         let channel = self.channel.as_mut().ok_or(SessionError::Closed)?;
         let envelope = match channel.open(frame) {
@@ -233,14 +256,24 @@ impl SessionAuthentication {
                 if ready.parameters == self.expected_parameters =>
             {
                 self.ready = true;
-                ReadyOutcome::Verified
+                ReadyOutcome::Verified {
+                    custodian_name: ready.display_name,
+                }
             }
             Ok(TypedMessage::SessionReady(_)) => {
                 self.close_for_violation(AuthenticatedViolation::ReadyParameterMismatch)
             }
             Ok(TypedMessage::SessionClose(close)) => {
+                let echo = self
+                    .seal(&TypedMessage::SessionClose(SessionCloseMessage {
+                        reason: close.reason,
+                    }))
+                    .ok();
                 self.channel = None;
-                ReadyOutcome::PeerClosed(close.reason)
+                ReadyOutcome::PeerClosed {
+                    reason: close.reason,
+                    echo,
+                }
             }
             Ok(message) => self.close_for_violation(AuthenticatedViolation::UnexpectedPhase(
                 message.message_type(),
@@ -249,9 +282,35 @@ impl SessionAuthentication {
         })
     }
 
+    /// The Requester's `session.hello`, its first message once it verified
+    /// `session.ready`, carrying its current `display_name` (section 7.1
+    /// item 6). The Requester promotes the session only after sending it.
+    ///
+    /// # Errors
+    /// [`SessionError`] for a Custodian, before the ready is verified, on a
+    /// second hello, a closed channel, or a seal failure.
+    pub fn send_hello(&mut self, display_name: &DisplayName) -> Result<BinaryFrame, SessionError> {
+        if self.role != EndpointRole::Requester {
+            return Err(SessionError::RoleViolation);
+        }
+        if !self.ready {
+            return Err(SessionError::ReadyIncomplete);
+        }
+        if self.hello_sent {
+            return Err(SessionError::DuplicateHello);
+        }
+        let frame = self.seal(&TypedMessage::SessionHello(SessionHelloMessage {
+            display_name: display_name.clone(),
+        }))?;
+        self.hello_sent = true;
+        Ok(frame)
+    }
+
     /// The first and only message of a session whose pairing this endpoint
     /// revoked: the sealed `session.close` with reason `pairing_revoked`
-    /// (section 4.6 item 2). The session closes; no card session starts.
+    /// (section 4.6 item 2). No card session starts; the session waits for
+    /// the peer's echo, read with [`Self::receive_close_echo`] (section 7.1
+    /// item 7).
     ///
     /// # Errors
     /// [`SessionError`] after the Custodian sent `session.ready`, on a closed
@@ -260,20 +319,64 @@ impl SessionAuthentication {
         if self.role == EndpointRole::Proxy && self.ready {
             return Err(SessionError::DuplicateReady);
         }
+        if self.close_sent.is_some() {
+            return Err(SessionError::Closed);
+        }
         let sealed = self.seal(&TypedMessage::SessionClose(SessionCloseMessage {
             reason: CloseReason::PairingRevoked,
         }));
-        self.channel = None;
+        match sealed {
+            Ok(_) => self.close_sent = Some(CloseReason::PairingRevoked),
+            Err(_) => self.channel = None,
+        }
         sealed
     }
 
-    /// Promote to a healthy endpoint once the Custodian sent, or the
-    /// Requester verified, `session.ready`.
+    /// One frame from the peer while this endpoint waits for the echo of
+    /// the close it sent in place of `session.ready` or `session.hello`
+    /// (section 7.1 item 7): a close is the echo, or a close that crossed
+    /// this endpoint's, and ends the session unanswered; any other
+    /// authenticated message, the Custodian's `session.ready` and
+    /// `card.status` included, is ignored; a frame that fails
+    /// authentication ends the session.
     ///
     /// # Errors
-    /// [`SessionError`] before ready or when the channel is closed.
+    /// [`SessionError::Closed`] when no close of this endpoint awaits its
+    /// echo.
+    pub fn receive_close_echo(
+        &mut self,
+        frame: &BinaryFrame,
+        now_ms: u64,
+    ) -> Result<CloseEcho, SessionError> {
+        let sent = self.close_sent.ok_or(SessionError::Closed)?;
+        let channel = self.channel.as_mut().ok_or(SessionError::Closed)?;
+        let outcome = match channel
+            .open(frame)
+            .map(|envelope| TypedMessage::from_envelope(envelope, now_ms))
+        {
+            Ok(Ok(TypedMessage::SessionClose(close))) => CloseEcho::Acknowledged {
+                reason: close.reason,
+                crossing: close.reason != sent,
+            },
+            Ok(_) => return Ok(CloseEcho::Ignored),
+            Err(_) => CloseEcho::Closed,
+        };
+        self.channel = None;
+        Ok(outcome)
+    }
+
+    /// Promote to a healthy endpoint once the Custodian sent
+    /// `session.ready`, or the Requester verified it and sent
+    /// `session.hello`.
+    ///
+    /// # Errors
+    /// [`SessionError`] before ready or the Requester's hello, or when the
+    /// channel is closed.
     pub fn into_established(mut self) -> Result<EstablishedEndpoint, SessionError> {
-        if !self.ready {
+        if self.close_sent.is_some() {
+            return Err(SessionError::Closed);
+        }
+        if !self.ready || (self.role == EndpointRole::Requester && !self.hello_sent) {
             return Err(SessionError::ReadyIncomplete);
         }
         let channel = self.channel.take().ok_or(SessionError::Closed)?;
@@ -308,7 +411,11 @@ impl SessionAuthentication {
                 reason: CloseReason::ProtocolViolation,
             }))
             .ok();
-        self.channel = None;
+        if notice.is_some() {
+            self.close_sent = Some(CloseReason::ProtocolViolation);
+        } else {
+            self.channel = None;
+        }
         ReadyOutcome::ViolationClosed { violation, notice }
     }
 }
@@ -325,6 +432,7 @@ impl fmt::Debug for SessionAuthentication {
                 &self.channel.as_ref().map(|_| "[secure channel]"),
             )
             .field("ready", &self.ready)
+            .field("hello_sent", &self.hello_sent)
             .finish_non_exhaustive()
     }
 }
@@ -332,15 +440,27 @@ impl fmt::Debug for SessionAuthentication {
 /// What the Requester's reading of the Custodian's first message gives.
 #[derive(Debug)]
 pub enum ReadyOutcome {
-    /// The parameters match; promote with
+    /// The parameters match and the Custodian named itself: keep the name
+    /// in the pair record (section 4.3 item 4), send
+    /// [`SessionAuthentication::send_hello`], then promote with
     /// [`SessionAuthentication::into_established`].
-    Verified,
+    Verified {
+        /// The Custodian's current display name.
+        custodian_name: DisplayName,
+    },
     /// The Custodian closed the session in place of `session.ready`, as a
-    /// revoking Custodian does; the session is closed.
-    PeerClosed(CloseReason),
-    /// Authenticated traffic violated the protocol; the session is closed
-    /// and the pairing stays. Deliver `notice`, the sealed
-    /// `protocol_violation` close, then drop the link.
+    /// revoking Custodian does; the session is closed. Deliver `echo`, the
+    /// close that acknowledges it, then drop the link (section 7.1 item 7).
+    PeerClosed {
+        /// The received reason.
+        reason: CloseReason,
+        /// The sealed echo, when it could be sealed.
+        echo: Option<BinaryFrame>,
+    },
+    /// Authenticated traffic violated the protocol; the session closes and
+    /// the pairing stays. Deliver `notice`, the sealed `protocol_violation`
+    /// close, wait for its echo with
+    /// [`SessionAuthentication::receive_close_echo`], then drop the link.
     ViolationClosed {
         /// The violation.
         violation: AuthenticatedViolation,
@@ -349,13 +469,32 @@ pub enum ReadyOutcome {
     },
 }
 
+/// One frame read while waiting for the echo of this endpoint's close
+/// (section 7.1 item 7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseEcho {
+    /// The echo arrived, or, with `crossing`, a close with another reason
+    /// that crossed this endpoint's; act on a crossing reason. The session
+    /// closed; drop the link.
+    Acknowledged {
+        /// The received reason.
+        reason: CloseReason,
+        /// The received reason differs from the one this endpoint sent.
+        crossing: bool,
+    },
+    /// Another message; it is ignored and the wait goes on.
+    Ignored,
+    /// A frame failed authentication; the session closed.
+    Closed,
+}
+
 /// Session establishment failure.
 #[derive(Debug)]
 pub enum SessionError {
     /// Call contradicts the stored pair's endpoint role.
     RoleViolation,
     /// The peer never confirmed that it stored the pairing, so the record
-    /// opens no session (RAPP v26.10.29 section 4.3 item 4).
+    /// opens no session (RAPP v26.11.2 section 4.3 item 4).
     StorageUnconfirmed,
     /// Handshake or channel cryptography failed.
     Crypto(CryptoError),
@@ -368,7 +507,10 @@ pub enum SessionError {
     UnexpectedPairId,
     /// `session.ready` was already sent or verified.
     DuplicateReady,
-    /// Promotion was attempted before `session.ready`.
+    /// `session.hello` was already sent.
+    DuplicateHello,
+    /// Promotion was attempted before `session.ready`, or, on the
+    /// Requester, before `session.hello`.
     ReadyIncomplete,
     /// Channel is already closed.
     Closed,

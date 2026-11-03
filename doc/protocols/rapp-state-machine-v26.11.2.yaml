@@ -1,0 +1,1032 @@
+protocol: RAPP
+document_version: "26.11.2"
+wire_version: "26.11.2"
+
+semantics:
+  instances: >
+    Machines describe instances. A requester_remote_use instance exists per
+    requester and a custodian_service instance per custodian. A
+    requester_view_of_custodian instance exists per active pairing on a
+    requester while its remote use is on with discovery running. How the
+    holder sees each computer on a custodian is the custodian's pairing
+    machine and its presentation.
+    A pairing instance exists per stored or
+    in-progress peer relationship; unpaired is the absence of one. A session
+    instance exists per connection; a custodian holds as many as requesters
+    dial. An operation instance exists per operation_id within one session;
+    none is the absence of one, and it is also where an operation goes when
+    its session ends, since nothing of an operation outlives its session.
+  roles: >
+    Every transition names a role: requester, custodian, or both. An endpoint
+    implements exactly the transitions whose role includes it. The custodian
+    is a phone that reads the card over NFC (an iPhone or an Android phone);
+    a requester is a computer (macOS, Windows, Linux or BSD), an iPad or
+    an Android tablet, which never serves a card. A lifecycle machine names its one role at
+    its top.
+  from_lists: "a list-valued from is shorthand for one rule per listed state"
+  no_wildcards: >
+    Any input without a matching transition from the current state is handled
+    by exactly one unexpected_input_policy class.
+  actions_are_ordered: true
+  lifecycle_cells: >
+    The three lifecycle machines (requester_remote_use,
+    requester_view_of_custodian, custodian_service) list every state and every event, and each
+    state and event pair is covered by exactly one of: a transition (one or
+    more rules told apart by guards that between them cover every case), an
+    ignored entry (the event changes nothing in that state), or a
+    cannot_happen entry with the reason it cannot occur. Their actions name
+    the pairing and session actions above where those apply. The daily
+    idle-expiry sweep of section 4.6 item 5 runs in every running state
+    through the pairing machine (expiry_check, idle_expired) and changes no
+    lifecycle state by itself; a pairing it ends reaches the lifecycle
+    machines as last_pairing_ended or pairing_left.
+  presentation: >
+    A requester shows the custodian only through its card: while a session
+    confirms a card the identity is offered and shown; in every other state
+    of requester_view_of_custodian it shows no remote card, whatever the
+    reason, and names no state of the custodian. The one exception is the
+    line saying the phone forgot this computer after a pairing_revoked close
+    (show_peer_forgot). Dialing and scanning are background behaviour and
+    are never shown.
+
+constants:
+  live_operations_per_session: 1
+  card_commands_per_operation: 1
+  pairing_candidates_max: 8
+  minimum_remaining_attempts: 3
+  offer_ttl_ms: 300000
+  liveness_ping_after_silence_ms: 5000
+  session_silence_limit_ms: 30000
+  revocation_notice_days: 30
+  pairing_idle_expiry_days: 30
+  identity_offer_grace_ms: 120000
+  quit_withdrawal_bound_ms: 1000
+  redial_window_ms: 120000
+  revocation_attempt_bound_ms: 10000
+  display_name_max_bytes: 256
+
+guards:
+  user_initiated: "an explicit local user action started this event"
+  local_user_action: "the event originates from the local user's own action, never the peer: on a requester the click turning remote use off, or pairing another phone, which forgets the pairing it replaces"
+  transcript_matches: "the completed handshake used the expected prologue and empty handshake payloads"
+  granted_sets_equal: "both pairing.confirm granted_profiles sets are equal"
+  initiation_permitted: "either the requester's remote use is on, no card is in a reader attached to it, and an active pairing's requester_view_of_custodian is connecting; or, whatever remote use and the local reader are, a pairing its user forgot (remote use turned off, or the pairing replaced by another) is revoking within its revocation_attempt_bound_ms and has not yet opened its one connection"
+  pairing_routed: "the routing tag matched an active stored pairing and its nonce is not in the replay memory"
+  ready_parameters_match: "received session.ready parameters equal the local view"
+  pair_record_store_failed: "the atomic store of the pair record failed: nothing was stored"
+  holds_active_pairing: "the requester holds an active pairing"
+  holds_no_active_pairing: "the requester holds no active pairing"
+  local_card_present: "a card is in a reader attached to the requester"
+  no_local_card: "no card is in a reader attached to the requester"
+  remote_use_switch_on: "the holder left the requester's remote-use switch on"
+  remote_use_switch_off: "the holder left the requester's remote-use switch off"
+  remote_card_presented: "the requester offers its custodian's identity: a session confirmed the card, or the grace of section 8.4 item 3 is running"
+  no_remote_card_presented: "the requester offers no identity from its custodian: remote_card_presented does not hold"
+  within_redial_window: "a redial window, opened at the last loss of a session or at the first failed dial since the custodian last appeared, has not ended"
+  redial_window_spent: "the redial window opened since the custodian last appeared, or since the last loss, has ended"
+  dial_running: "a dial for the pairing is being set up"
+  no_dial_running: "no dial for the pairing is being set up; the next one is due on the back-off"
+  offer_up: "the custodian offers a pairing (the pairing machine is offering or exchanging)"
+  no_offer_up: "the custodian offers no pairing"
+  remote_access_on: "the custodian's holder left remote access on"
+  remote_access_off: "the custodian's holder left remote access off"
+  untried_pairing_candidate: "the requester's remote use is on, no card is in a reader attached to it, an endpoint found in pairing mode is not yet opened for the typed code or answered busy and its retry-after has passed, and fewer than pairing_candidates_max pairing connections were opened for it"
+
+actions:
+  generate_offer: "create the offer with a fresh random offer_id and offer_ttl_ms"
+  generate_pairing_code: "draw the 6-character pairing code"
+  advertise_pairing_mode: "publish the mode=pairing record"
+  display_pairing_code: "show the pairing code on the custodian"
+  hide_pairing_code: "remove the pairing code from the screen"
+  destroy_offer: "erase the offer and its pairing code and stop advertising it"
+  read_offer: "obtain the offer over the pairing connection and validate it"
+  begin_cpace_initiator: "send CPace step 1 from the typed pairing code"
+  try_next_candidate: "open a pairing connection to the next endpoint found in pairing mode and not yet opened for the typed code, or waiting out a busy answer whose retry-after has passed"
+  admit_attempt: "admit the attempt before sending CPace step 2 and arm its deadline"
+  end_failed_attempt: "end the failed attempt; the offer stays as it was"
+  answer_busy: "send pairing-busy with the time until an attempt can be admitted, and close the connection"
+  defer_candidate: "keep the endpoint for another opening no sooner than its retry-after, after the other endpoints waiting"
+  show_wrong_code: "tell the user the pairing code was not accepted, naming no custodian"
+  show_none_in_pairing_mode: "tell the user that no custodian in pairing mode was found"
+  consume_offer: "mark the offer consumed once T_A verified"
+  derive_pairing_secret: "derive the PSK for the pairing handshake from the CPace key schedule"
+  begin_pairing_handshake: "run Noise_XXpsk3 with the PSK"
+  derive_channel_identifiers: "derive session_id and pair_id from the handshake hash"
+  destroy_pairing_secret: "erase the PSK and the CPace intermediate values"
+  send_pairing_hello: "send pairing.hello with the negotiated-parameter echo"
+  send_pairing_confirm: "grant the requested profiles the offer allows and send pairing.confirm"
+  send_pairing_abort_best_effort: "send pairing.abort if the channel is usable"
+  destroy_candidate_keys: "erase unstored static and ephemeral keys"
+  close_candidate: "close the candidate connection"
+  store_pair_record_atomically: "store pair keys, pair_id, grants, grants_hash and the unconfirmed mark in one commit"
+  send_pairing_stored: "send pairing.stored carrying the derived pair_id"
+  mark_record_confirmed: "rewrite the stored record as confirmed"
+  close_pairing_channel: "close the authenticated pairing channel"
+  revoke_unconfirmed_pair_record: "revoke the stored record the peer never confirmed"
+  mark_record_revoked: "mark the record revoked; it serves nothing from now on and its key is kept only for the close"
+  send_close_pairing_revoked: "send session.close with reason pairing_revoked as the session's first or next message"
+  close_session: "raise close_requested_by_pairing for the live session"
+  destroy_pair_keys: "erase the pairing's static private key"
+  record_last_session: "keep the wall-clock time in the record as the latest time the pairing had an established session"
+  withdraw_identity: "stop offering the pairing's credentials to local consumers"
+  show_connected: "show that the paired peer is connected"
+  show_paired_disconnected: "show that the paired peer is not connected"
+  show_forgotten: "show that this endpoint forgot the peer"
+  show_peer_forgot: "show that the peer forgot this endpoint"
+  show_peer_withdrawn: "show the paired computer as off, not merely disconnected, until the pairing's next session"
+  clear_residual_pair_record: "erase the revoked record"
+  show_pairing_not_stored: "tell the user the pairing failed because the record could not be stored, with the platform's cause"
+  request_remote_permissions: "ask the operating system for local-network and Bluetooth permission"
+  show_code_entry: "offer the entry for the pairing code a phone shows"
+  hide_code_entry: "take the code entry away"
+  start_pairing_search: "browse mode=pairing and try the custodians found with the typed code (section 4.2)"
+  end_pairing_search: "close the pairing connection, stop browsing mode=pairing and drop the typed code"
+  start_session_discovery: "browse mode=session and scan for the RAPP BLE advertisement, continuously, and start a requester_view_of_custodian in idle for the active pairing"
+  stop_session_discovery: "if discovery runs: raise pairing_left for the requester_view_of_custodian unless it has ended, then stop browsing and scanning and purge transient discovery caches; a revoking pairing's one attempt keeps the discovery it needs until it ends, and the caches are purged then"
+  withdraw_requester: "send session.close service_withdrawn on every open session and wait for each echo as section 7.1 item 7 says, closing a connection not yet open without a notice (section 4.5 item 8)"
+  withdraw_requester_within_quit_bound: "withdraw as withdraw_requester and wait at most quit_withdrawal_bound_ms for the custodians' echoes of the closes (section 7.1 item 7)"
+  forget_held_pairing: "raise forget_pairing for the pairing the requester holds, if any; its revocation runs as section 4.6 item 6 says"
+  forget_previous_pairing: "raise forget_pairing for the pairing held before the one just stored, if any; a requester holds one pairing, and its revocation runs as section 4.6 item 6 says"
+  sweep_stored_pairings: "revoke every record found unconfirmed (section 4.3 item 4), destroy the key of a requester's revoking pairing whose revocation_attempt_bound_ms has passed, then run the idle-expiry sweep (section 4.6 item 5), before serving or dialing anything"
+  open_session_dial: "start one dial, raising connect for the pairing's session, unless one is already being set up; a redial window runs on"
+  abort_dial: "abandon the dial being set up, closing its connection without a notice"
+  schedule_redial: "open the redial window if none is open since the custodian's last appearance or the last loss, and arm the next back-off within it; after a loss the first redial is due at once"
+  end_redial_window: "end the redial window and cancel any back-off"
+  start_offer_grace: "keep the identity offered under the identity_offer_grace_ms grace of section 8.4 item 3"
+  request_local_close: "raise local_close_requested for the pairing's session if it is still healthy"
+  reannounce_service: "register the stream service under a fresh instance name in place of the current one and restart the BLE advertisement, so every requester sees the custodian appear"
+  refuse_consumer_request: "answer the local consumer at once that no remote card is available; dial nothing"
+  register_fresh_instance: "register the stream service under a fresh random instance name with the mode=session record and start the listener"
+  start_ble_advertising: "advertise the RAPP BLE service"
+  stop_ble_advertising: "stop advertising the RAPP BLE service"
+  withdraw_custodian: "send session.close service_withdrawn on every open session, wait at most quit_withdrawal_bound_ms for each echo and close its link, stop accepting connections, and replace the TXT record of the current instance with the withdrawn record, in this order (section 4.5 item 3)"
+  withdraw_custodian_sessions: "send session.close service_withdrawn on every open session, wait at most quit_withdrawal_bound_ms for each echo and close its link, and stop accepting connections; there is no instance whose record to replace"
+  withdraw_custodian_best_effort: "withdraw as withdraw_custodian as far as the platform lets a quitting process"
+  unregister_service: "unregister the stream service instance and cancel the withdrawn record's timer"
+  update_txt_in_place: "replace the current instance's TXT record in place, without unregistering"
+  republish_on_current_interfaces: "publish the current instance on the interfaces now available, keeping its name"
+  cancel_offer: "raise offer_expired_or_cancelled for the offer, if one is up"
+  open_transport: "connect to the custodian's advertised endpoint or peripheral"
+  send_session_preamble: "send the session routing preamble with a fresh routing tag"
+  begin_kk_initiator: "start the session handshake in the initiator role"
+  begin_kk_responder: "start the session handshake in the responder role"
+  derive_session_identifiers: "derive session_id from the handshake hash"
+  send_session_ready: "send session.ready with the session-parameter echo and the custodian's current display name"
+  send_session_hello: "send session.hello with the requester's current display name as the session's first message"
+  record_peer_display_name: "check the peer's display name as at pairing and, where it differs from the pair record's, replace the record's name atomically; a failed store keeps the old name and the session goes on"
+  send_card_status: "send card.status with presence, reader attachment and the certificate fingerprint"
+  start_liveness: "start the 5-second silence ping and the 30-second silence limit"
+  send_liveness_ping: "send liveness.ping with a fresh challenge"
+  record_peer_close_reason: "keep the received close reason for the user"
+  echo_peer_close: "answer the received session.close with a session.close carrying the same reason, the echo that acknowledges it (section 7.1 item 7, CC-123)"
+  send_close_user_disconnect: "send session.close with reason user_disconnect"
+  send_close_normal: "send session.close with reason normal"
+  send_close_protocol_violation: "send session.close with reason protocol_violation"
+  send_close_service_withdrawn: "send session.close with reason service_withdrawn"
+  send_close_card_unavailable: "send session.close with reason card_unavailable"
+  note_close_notice_impossible: "record that no close notice can be sent"
+  proceed_without_close_notice: "continue closing without further sends"
+  destroy_session_material: "erase session keys, handshake state and buffers"
+  destroy_credential_buffers: "erase credential buffers tied to the session"
+  show_disconnecting: "show that the session is closing"
+  show_connection_stopped: "show that the session ended"
+  start_expiry_clock: "take the deadline on the continuous clock"
+  send_error_busy: "send error busy naming the operation"
+  send_error_duplicate_operation: "send error duplicate_operation naming the operation"
+  send_result_unauthorized: "send operation.result rejected with unauthorized"
+  send_result_unsupported_parameter: "send operation.result rejected with unsupported_parameter or invalid_lifetime"
+  send_progress_queued: "send operation.progress queued, once"
+  present_consent: "ask the holder for a PIN the custodian does not hold, showing the admitted request; nothing when the custodian holds PIN 1 for a browser authentication"
+  send_progress_consent_shown: "send operation.progress consent_shown when a PIN prompt is on screen, since entering the PIN is the holder's consent; nothing when no prompt is shown"
+  dismiss_consent: "remove the PIN prompt"
+  execute_read: "run the read-only card commands"
+  check_retry_floor: "read the remaining attempts of the PIN the command needs"
+  consume_card_command: "consume the one-shot card command"
+  send_progress_waiting_for_card: "send operation.progress waiting_for_card"
+  send_progress_card_wait_ended: "send operation.progress card_wait_ended"
+  prompt_pin_again: "tell the holder the PIN was wrong, with the attempts left, and prompt again"
+  send_result_completed: "send operation.result completed with the response"
+  send_result_user_cancelled: "send operation.result rejected with user_cancelled"
+  send_result_retry_floor: "send operation.result rejected with retry_floor"
+  send_result_card_error: "send operation.result rejected with card_error"
+  send_result_operation_expired: "send operation.result cancelled with operation_expired"
+  clear_operation_credentials: "zeroize credentials collected for the operation"
+  continue_card_exchange_locally: "let the card command finish; never interrupt or repeat it"
+  discard_answer: "drop the card's answer; no session carries it"
+  release_card: "let the next queued operation take the card"
+  show_progress: "show the operation's progress to the user"
+  release_result: "hand the response to the requesting application"
+  release_failure: "tell the requesting application why the operation ended"
+  report_operation_lost: "tell the requesting application that the operation ended with its session"
+
+pairing:
+  initial: unpaired
+  presentation:                 # how the custodian's holder sees each computer
+    paired_connected: "listed under its stored display name, connected"
+    paired_disconnected: "listed under its stored display name, not connected; after the computer's service_withdrawn, off until the pairing's next session (show_peer_withdrawn, section 4.5 item 9)"
+    revoking: "not listed"
+    revoked: "not listed"
+  states:
+    - unpaired
+    - offering              # custodian only
+    - exchanging            # CPace
+    - handshaking           # Noise_XXpsk3
+    - confirming
+    - storage_confirming
+    - paired_disconnected
+    - paired_connected
+    - revoking              # key kept for the pairing_revoked close
+    - revoked
+  transitions:
+    - from: unpaired
+      event: start_pairing
+      role: custodian
+      guard: user_initiated
+      to: offering
+      actions: [generate_offer, generate_pairing_code, advertise_pairing_mode, display_pairing_code]
+    - from: offering
+      event: offer_expired_or_cancelled
+      role: custodian
+      to: unpaired
+      actions: [destroy_offer, hide_pairing_code]
+    - from: offering
+      event: attempt_started
+      role: custodian
+      to: exchanging
+      actions: [admit_attempt]
+    - from: unpaired
+      event: code_entered
+      role: requester
+      guard: user_initiated
+      to: exchanging
+      actions: [read_offer, begin_cpace_initiator]
+    - from: exchanging
+      event: attempt_failed
+      role: custodian
+      to: offering
+      actions: [end_failed_attempt]
+    - from: offering
+      event: attempt_refused              # a pairing connection arrived inside the 500 ms spacing
+      role: custodian
+      to: offering
+      actions: [answer_busy]
+    - from: exchanging
+      event: attempt_refused              # a pairing connection arrived while an attempt is active
+      role: custodian
+      to: exchanging
+      actions: [answer_busy]
+    - from: exchanging
+      event: candidate_busy                # the endpoint opened answered pairing-busy
+      role: requester
+      guard: untried_pairing_candidate
+      to: exchanging
+      actions: [close_candidate, defer_candidate, try_next_candidate, read_offer, begin_cpace_initiator]
+    - from: exchanging
+      event: attempt_failed                # the endpoint opened did not take the code: its custodian refused it, or it served no offer it could try
+      role: requester
+      guard: untried_pairing_candidate
+      to: exchanging
+      actions: [close_candidate, try_next_candidate, read_offer, begin_cpace_initiator]
+    - from: exchanging
+      event: last_candidate_failed         # every custodian tried refused the code, or answered busy at the connection limit, and no endpoint is left to open
+      role: requester
+      to: unpaired
+      actions: [close_candidate, show_wrong_code]
+    - from: exchanging
+      event: no_custodian_tried            # no endpoint served an offer to try and the search ended
+      role: requester
+      to: unpaired
+      actions: [close_candidate, show_none_in_pairing_mode]
+    - from: exchanging
+      event: search_interrupted            # a card in a reader attached to the requester, or the holder turning remote use off, ends the search; the code entry is offered again once remote use resumes
+      role: requester
+      to: unpaired
+      actions: [close_candidate]
+    - from: exchanging
+      event: offer_expired_or_cancelled
+      role: custodian
+      to: unpaired
+      actions: [destroy_offer, hide_pairing_code, close_candidate]
+    - from: exchanging
+      event: key_confirmed
+      role: custodian
+      to: handshaking
+      actions: [consume_offer, hide_pairing_code, derive_pairing_secret, begin_pairing_handshake]
+    - from: exchanging
+      event: key_confirmed
+      role: requester
+      to: handshaking
+      actions: [derive_pairing_secret, begin_pairing_handshake]
+    - from: handshaking
+      event: handshake_authenticated
+      role: requester
+      guard: transcript_matches
+      to: confirming
+      actions: [derive_channel_identifiers, destroy_pairing_secret, send_pairing_hello]
+    - from: handshaking
+      event: handshake_authenticated
+      role: custodian
+      guard: transcript_matches
+      to: confirming
+      actions: [derive_channel_identifiers, destroy_pairing_secret]
+    - from: handshaking
+      event: handshake_failed
+      role: both
+      to: unpaired
+      actions: [destroy_pairing_secret, destroy_candidate_keys, close_candidate]
+    - from: confirming
+      event: hello_verified
+      role: custodian
+      to: confirming
+      actions: [send_pairing_confirm]
+    - from: confirming
+      event: both_confirmed                # raised once the atomic store succeeded; a failed store raises pair_record_store_failed in its place
+      role: both
+      guard: granted_sets_equal
+      to: storage_confirming
+      actions: [store_pair_record_atomically, send_pairing_stored]
+    - from: confirming
+      event: denied_aborted_or_timed_out
+      role: both
+      to: unpaired
+      actions: [send_pairing_abort_best_effort, destroy_candidate_keys, close_candidate]
+    - from: confirming
+      event: pair_record_store_failed      # both pairing.confirm messages arrived and the atomic store failed: nothing is stored and no pairing.stored is sent
+      role: both
+      to: unpaired
+      actions: [send_pairing_abort_best_effort, destroy_candidate_keys, close_candidate, show_pairing_not_stored]
+    - from: storage_confirming
+      event: peer_storage_confirmed
+      role: both
+      to: paired_disconnected
+      actions: [mark_record_confirmed, close_pairing_channel]
+    - from: storage_confirming
+      event: denied_aborted_or_timed_out   # also a pairing.stored naming another pair_id
+      role: both
+      to: unpaired
+      actions: [revoke_unconfirmed_pair_record, destroy_pair_keys, close_candidate]
+    - from: paired_disconnected
+      event: session_healthy               # produced by the session machine entering healthy
+      role: both
+      to: paired_connected
+      actions: [record_last_session, show_connected]
+    - from: paired_connected
+      event: session_closed                # produced by the session machine entering closed
+      role: both
+      to: paired_disconnected
+      actions: [record_last_session, show_paired_disconnected]
+    - from: paired_connected
+      event: peer_withdrawal_notice        # produced in place of session_closed by a session the requester closed with reason service_withdrawn
+      role: custodian
+      to: paired_disconnected
+      actions: [record_last_session, show_peer_withdrawn]
+    - from: paired_connected
+      event: forget_pairing                # on a requester, the holder turning remote use off, or pairing another phone, forgets the pairing it holds; the close leaves within quit_withdrawal_bound_ms or is dropped
+      role: both
+      guard: local_user_action
+      to: revoked
+      actions: [mark_record_revoked, send_close_pairing_revoked, close_session, destroy_pair_keys, withdraw_identity, show_forgotten]
+    - from: paired_disconnected
+      event: forget_pairing                # on a requester with no session open, the key is kept for one revocation attempt of revocation_attempt_bound_ms after the holder's switch-off with no local card present; every forget a requester's user makes keeps it so; automatic drops (idle expiry) go straight to revoked
+      role: both
+      guard: local_user_action
+      to: revoking
+      actions: [mark_record_revoked, withdraw_identity, show_forgotten]
+    - from: paired_connected
+      event: expiry_check                  # the idle-expiry sweep with a session established: it records the session and never expires the pairing
+      role: both
+      to: paired_connected
+      actions: [record_last_session]
+    - from: paired_disconnected
+      event: expiry_check                  # the sweep with no session established, short of the idle limit
+      role: both
+      to: paired_disconnected
+      actions: []
+    - from: paired_disconnected
+      event: idle_expired                  # the sweep with no session established, pairing_idle_expiry_days past the latest recorded session or the creation; silent
+      role: custodian
+      to: revoking
+      actions: [mark_record_revoked, withdraw_identity]
+    - from: paired_disconnected
+      event: idle_expired                  # a requester drops an idle pairing silently: no revocation attempt
+      role: requester
+      to: revoked
+      actions: [mark_record_revoked, destroy_pair_keys, withdraw_identity]
+    - from: revoking
+      event: revocation_notice_sent        # produced by the next session sending the close as its first message, once the peer echoed it or the wait for the echo ended
+      role: both
+      to: revoked
+      actions: [destroy_pair_keys]
+    - from: revoking
+      event: notice_window_expired         # revocation_notice_days after the revocation
+      role: custodian
+      to: revoked
+      actions: [destroy_pair_keys]
+    - from: revoking
+      event: revocation_attempt_ended      # revocation_attempt_bound_ms after the revocation without the close sent: the requester keeps no revoking pairing longer
+      role: requester
+      to: revoked
+      actions: [destroy_pair_keys]
+    - from: [paired_disconnected, paired_connected, revoking]
+      event: peer_revocation_notice        # session.close with reason pairing_revoked, also in place of session.ready
+      role: both
+      to: revoked
+      actions: [mark_record_revoked, close_session, destroy_pair_keys, withdraw_identity, show_peer_forgot]
+    - from: revoked
+      event: forget_pairing
+      role: both
+      guard: local_user_action
+      to: unpaired
+      actions: [clear_residual_pair_record]
+
+session:
+  initial: absent
+  states:
+    - absent
+    - connecting            # requester only
+    - authenticating
+    - healthy
+    - closing
+    - closed
+  notes:
+    - "entering healthy produces session_healthy; entering closed after healthy was reached produces session_closed, or peer_withdrawal_notice on a custodian whose session the requester closed with reason service_withdrawn"
+    - "a session that handshake_complete_while_revoking moved to closing produces revocation_notice_sent when it reaches closed: on the peer's echo or when the wait for it ends; a received close with reason pairing_revoked produces peer_revocation_notice"
+    - "closing after this endpoint sent a close waits for the peer's echo (section 7.1 item 7): it sends nothing more, ignores every message but a session.close, and a session.close arriving then is the echo, or a close that crossed this endpoint's, and is not answered"
+    - "entering closing produces session_closed for the session's operation"
+    - "closed is terminal for the instance"
+  transitions:
+    - from: absent
+      event: connect
+      role: requester
+      guard: initiation_permitted
+      to: connecting
+      actions: [open_transport]
+    - from: absent
+      event: preamble_received
+      role: custodian
+      guard: pairing_routed
+      to: authenticating
+      actions: [begin_kk_responder]
+    - from: connecting
+      event: transport_connected
+      role: requester
+      to: authenticating
+      actions: [send_session_preamble, begin_kk_initiator]
+    - from: connecting
+      event: transport_failed
+      role: requester
+      to: closed
+      actions: [destroy_session_material, show_connection_stopped]
+    - from: authenticating
+      event: handshake_complete
+      role: custodian
+      to: healthy
+      actions: [derive_session_identifiers, send_session_ready, send_card_status, start_liveness]
+    - from: authenticating
+      event: handshake_complete
+      role: requester
+      to: authenticating
+      actions: [derive_session_identifiers]
+    - from: authenticating
+      event: handshake_complete_while_revoking   # the pairing is revoking: the close is the session's first message, and closing waits for its echo
+      role: both
+      to: closing
+      actions: [derive_session_identifiers, send_close_pairing_revoked]
+    - from: authenticating
+      event: peer_close_received           # a revoking custodian's close in place of session.ready, echoed
+      role: requester
+      to: closed
+      actions: [record_peer_close_reason, echo_peer_close, destroy_session_material]
+    - from: authenticating
+      event: ready_verified                # session.ready verified, with the custodian's current display name
+      role: requester
+      guard: ready_parameters_match
+      to: healthy
+      actions: [record_peer_display_name, send_session_hello, start_liveness, show_connected]
+    - from: authenticating
+      event: candidate_failure             # before authentication: the connection closes, nothing stored changes
+      role: both
+      to: closed
+      actions: [destroy_session_material, close_candidate]
+    - from: authenticating
+      event: transport_failed
+      role: both
+      to: closed
+      actions: [destroy_session_material, show_connection_stopped]
+    - from: authenticating
+      event: authenticated_protocol_violation
+      role: both
+      to: closing
+      actions: [send_close_protocol_violation, show_disconnecting]
+    - from: healthy
+      event: session_hello_received        # the requester's first message, with its current display name
+      role: custodian
+      to: healthy
+      actions: [record_peer_display_name]
+    - from: healthy
+      event: peer_silent                   # liveness_ping_after_silence_ms without a message
+      role: both
+      to: healthy
+      actions: [send_liveness_ping]
+    - from: healthy
+      event: silence_limit_reached         # session_silence_limit_ms without a message
+      role: both
+      to: closing
+      actions: [note_close_notice_impossible, show_disconnecting]
+    - from: healthy
+      event: user_disconnect
+      role: both
+      to: closing
+      actions: [send_close_user_disconnect, show_disconnecting]
+    - from: healthy
+      event: local_close_requested
+      role: both
+      to: closing
+      actions: [send_close_normal, show_disconnecting]
+    - from: healthy
+      event: service_withdrawn             # the endpoint withdraws: a custodian's remote access off, a local card suspending a requester's remote use, or the application quits
+      role: both
+      to: closing
+      actions: [send_close_service_withdrawn, show_disconnecting]
+    - from: [connecting, authenticating]
+      event: service_withdrawn             # a requester's connection whose session is not yet open closes without a notice
+      role: requester
+      to: closed
+      actions: [destroy_session_material, close_candidate, show_connection_stopped]
+    - from: healthy
+      event: card_unavailable
+      role: custodian
+      to: closing
+      actions: [send_close_card_unavailable, show_disconnecting]
+    - from: healthy
+      event: peer_close_received           # answered with the echo, then the transport closes
+      role: both
+      to: closing
+      actions: [record_peer_close_reason, echo_peer_close, show_disconnecting]
+    - from: healthy
+      event: transport_failed
+      role: both
+      to: closing
+      actions: [note_close_notice_impossible, show_disconnecting]
+    - from: healthy
+      event: session_integrity_failed      # a frame failed authenticated decryption or framing
+      role: both
+      to: closing
+      actions: [note_close_notice_impossible, show_disconnecting]
+    - from: healthy
+      event: authenticated_protocol_violation   # version, session_id, sequence or message misuse
+      role: both
+      to: closing
+      actions: [send_close_protocol_violation, show_disconnecting]
+    - from: healthy
+      event: close_requested_by_pairing
+      role: both
+      to: closing
+      actions: [show_disconnecting]
+    - from: [connecting, authenticating]
+      event: close_requested_by_pairing
+      role: both
+      to: closed
+      actions: [destroy_session_material, close_candidate, show_connection_stopped]
+    - from: closing
+      event: peer_close_received           # the echo of this endpoint's close, or a close that crossed it: acted on, never answered
+      role: both
+      to: closed
+      actions: [record_peer_close_reason, destroy_session_material, destroy_credential_buffers, show_connection_stopped]
+    - from: closing
+      event: transport_failed
+      role: both
+      to: closing
+      actions: [proceed_without_close_notice]
+    - from: closing
+      event: close_complete_or_deadline
+      role: both
+      to: closed
+      actions: [destroy_session_material, destroy_credential_buffers, show_connection_stopped]
+
+operation:
+  initial: none
+  states:
+    - none
+    - requested
+    - queued                # custodian only
+    - awaiting_consent      # custodian only
+    - executing
+    - completed
+    - rejected
+    - cancelled
+  transitions:
+    - from: none
+      event: request_received          # identifier unseen, no live operation, profile granted
+      role: custodian
+      to: requested
+      actions: [start_expiry_clock]
+    - from: none
+      event: request_duplicate
+      role: custodian
+      to: none
+      actions: [send_error_duplicate_operation]
+    - from: none
+      event: request_while_busy
+      role: custodian
+      to: none
+      actions: [send_error_busy]
+    - from: none
+      event: request_unauthorized
+      role: custodian
+      to: rejected
+      actions: [send_result_unauthorized]
+    - from: none
+      event: request_unsupported
+      role: custodian
+      to: rejected
+      actions: [send_result_unsupported_parameter]
+    - from: requested
+      event: card_held_elsewhere
+      role: custodian
+      to: queued
+      actions: [send_progress_queued]
+    - from: [requested, queued]
+      event: card_acquired_for_consent
+      role: custodian
+      to: awaiting_consent
+      actions: [present_consent, send_progress_consent_shown]
+    - from: [requested, queued]
+      event: card_acquired_for_read
+      role: custodian
+      to: executing
+      actions: [execute_read]
+    - from: awaiting_consent
+      event: user_denied
+      role: custodian
+      to: rejected
+      actions: [dismiss_consent, send_result_user_cancelled, release_card]
+    - from: awaiting_consent
+      event: user_approved
+      role: custodian
+      to: executing
+      actions: [dismiss_consent, check_retry_floor, consume_card_command]
+    - from: executing
+      event: waiting_for_card
+      role: custodian
+      to: executing
+      actions: [send_progress_waiting_for_card]
+    - from: executing
+      event: card_found
+      role: custodian
+      to: executing
+      actions: [send_progress_card_wait_ended]
+    - from: executing
+      event: wrong_pin
+      role: custodian
+      to: executing
+      actions: [prompt_pin_again]
+    - from: executing
+      event: retry_floor_refused
+      role: custodian
+      to: rejected
+      actions: [clear_operation_credentials, send_result_retry_floor, release_card]
+    - from: executing
+      event: card_success
+      role: custodian
+      to: completed
+      actions: [clear_operation_credentials, send_result_completed, release_card]
+    - from: executing
+      event: card_error
+      role: custodian
+      to: rejected
+      actions: [clear_operation_credentials, send_result_card_error, release_card]
+    - from: [requested, queued, awaiting_consent]
+      event: request_expired
+      role: custodian
+      to: cancelled
+      actions: [dismiss_consent, send_result_operation_expired, release_card]
+    - from: [requested, queued, awaiting_consent]
+      event: session_closed
+      role: custodian
+      to: none
+      actions: [dismiss_consent, clear_operation_credentials, release_card]
+    - from: executing
+      event: session_closed
+      role: custodian
+      to: none
+      actions: [continue_card_exchange_locally, discard_answer, clear_operation_credentials, release_card]
+    - from: none
+      event: request_sent
+      role: requester
+      to: requested
+      actions: []
+    - from: requested
+      event: progress_received
+      role: requester
+      to: requested
+      actions: [show_progress]
+    - from: requested
+      event: result_completed_received
+      role: requester
+      to: completed
+      actions: [release_result]
+    - from: requested
+      event: result_rejected_received  # an operation.result rejected, or an error busy or duplicate_operation
+      role: requester
+      to: rejected
+      actions: [release_failure]
+    - from: requested
+      event: result_cancelled_received
+      role: requester
+      to: cancelled
+      actions: [release_failure]
+    - from: requested
+      event: session_closed
+      role: requester
+      to: none
+      actions: [report_operation_lost]
+
+requester_remote_use:
+  role: requester
+  initial: switched_off
+  states:
+    - switched_off          # nothing remote runs; no pairing is active (a revoking pairing's one attempt aside)
+    - switched_on                    # remote use on, not suspended; with a pairing, discovery and its requester_view_of_custodian run; the code entry is shown exactly while no_remote_card_presented holds
+    - searching             # a typed code is being tried (section 4.2)
+    - suspended             # a card in a reader attached to the requester; the requester withdrew
+    - not_running           # no process; the switch position and the pairing stay stored
+  events:
+    - holder_turns_on
+    - holder_turns_off
+    - code_typed
+    - pairing_stored        # the pairing machine reached paired_disconnected
+    - pairing_failed        # the pairing machine went back to unpaired: wrong code, none found, abort, deadline, store failed
+    - local_card_inserted
+    - local_card_removed
+    - holder_quits
+    - launched              # also a start at login, after a restart or an update; raised after sweep_stored_pairings, so its guards read the swept pairings
+    - process_ended         # ended by the operating system, or a crash
+    - last_pairing_ended    # the held pairing stopped being active other than by the holder: the custodian's pairing_revoked, or idle expiry
+    - sleep_or_wake
+  transitions:
+    - {from: switched_off, event: holder_turns_on, guard: no_local_card, to: switched_on, actions: [request_remote_permissions, show_code_entry]}
+    - {from: switched_off, event: holder_turns_on, guard: local_card_present, to: suspended, actions: [request_remote_permissions]}
+    - {from: [switched_off, searching, suspended], event: holder_quits, to: not_running, actions: []}
+    - {from: switched_on, event: holder_quits, to: not_running, actions: [withdraw_requester_within_quit_bound]}
+    - {from: [switched_off, switched_on, searching, suspended], event: process_ended, to: not_running, actions: []}
+    - {from: switched_on, event: holder_turns_off, to: switched_off, actions: [forget_held_pairing, hide_code_entry, stop_session_discovery]}
+    - {from: switched_on, event: code_typed, guard: no_remote_card_presented, to: searching, actions: [hide_code_entry, stop_session_discovery, start_pairing_search]}
+    - {from: switched_on, event: local_card_inserted, to: suspended, actions: [hide_code_entry, withdraw_requester, stop_session_discovery]}
+    - {from: switched_on, event: last_pairing_ended, to: switched_on, actions: [stop_session_discovery, show_code_entry]}
+    - {from: searching, event: holder_turns_off, to: switched_off, actions: [end_pairing_search, forget_held_pairing]}
+    - {from: searching, event: pairing_stored, to: switched_on, actions: [end_pairing_search, forget_previous_pairing, start_session_discovery]}
+    - {from: searching, event: pairing_failed, guard: holds_active_pairing, to: switched_on, actions: [end_pairing_search, start_session_discovery, show_code_entry]}
+    - {from: searching, event: pairing_failed, guard: holds_no_active_pairing, to: switched_on, actions: [end_pairing_search, show_code_entry]}
+    - {from: searching, event: local_card_inserted, to: suspended, actions: [end_pairing_search]}
+    - {from: suspended, event: holder_turns_off, to: switched_off, actions: [forget_held_pairing]}
+    - {from: suspended, event: local_card_removed, guard: holds_active_pairing, to: switched_on, actions: [start_session_discovery, show_code_entry]}
+    - {from: suspended, event: local_card_removed, guard: holds_no_active_pairing, to: switched_on, actions: [show_code_entry]}
+    - {from: not_running, event: launched, guard: remote_use_switch_off, to: switched_off, actions: []}
+    - {from: not_running, event: launched, guard: [remote_use_switch_on, local_card_present], to: suspended, actions: []}
+    - {from: not_running, event: launched, guard: [remote_use_switch_on, no_local_card, holds_active_pairing], to: switched_on, actions: [start_session_discovery, show_code_entry]}
+    - {from: not_running, event: launched, guard: [remote_use_switch_on, no_local_card, holds_no_active_pairing], to: switched_on, actions: [show_code_entry]}
+  ignored:
+    - {from: switched_off, event: [local_card_inserted, local_card_removed], reason: "remote use is off; the local reader works as it always does"}
+    - {from: [switched_off, switched_on, searching, suspended], event: sleep_or_wake, reason: "sleep is not withdrawal (section 4.5); a session that dies in sleep is a loss to requester_view_of_custodian, and a search it breaks ends as pairing_failed"}
+    - {from: searching, event: last_pairing_ended, reason: "the pairing being replaced ended; the search goes on and its result decides through holds_active_pairing"}
+    - {from: suspended, event: local_card_inserted, reason: "remote use is already suspended"}
+    - {from: suspended, event: last_pairing_ended, reason: "the card's removal finds no active pairing and offers the code entry"}
+  cannot_happen:
+    - {from: [switched_on, searching, suspended], event: holder_turns_on, reason: "the switch is already on"}
+    - {from: switched_off, event: holder_turns_off, reason: "the switch is already off"}
+    - {from: [switched_off, searching, suspended], event: code_typed, reason: "the code entry is offered only in switched_on, while no remote card is presented (hierarchy specification section 5.2)"}
+    - {from: switched_on, event: code_typed, guard: remote_card_presented, reason: "the code entry is not offered while a remote card is presented"}
+    - {from: [switched_off, switched_on, suspended], event: [pairing_stored, pairing_failed], reason: "no pairing search runs; a local card ends one with search_interrupted"}
+    - {from: [switched_on, searching], event: local_card_removed, reason: "no local card is present in that state; one arriving moves to suspended"}
+    - {from: [switched_off, switched_on, searching, suspended], event: launched, reason: "a running process does not launch"}
+    - {from: switched_off, event: last_pairing_ended, reason: "no active pairing is held while remote use is off"}
+    - {from: not_running, event: [holder_turns_on, holder_turns_off, code_typed, pairing_stored, pairing_failed, local_card_inserted, local_card_removed, holder_quits, process_ended, last_pairing_ended, sleep_or_wake], reason: "no process runs to take the event; launched reads the stored switch, the local reader and the pairing afresh"}
+
+requester_view_of_custodian:
+  role: requester
+  initial: idle
+  states:
+    - idle        # no session, no redial window: the requester dials only when the custodian appears or a consumer asks; also where a protocol violation leaves it
+    - connecting  # a dial is being set up, or due on the back-off within redial_window_ms
+    - connected   # session healthy
+    - withdrawn   # verified withdrawal, or a card_unavailable close: no dial and no offer until the custodian announces itself again
+    - ended       # the pairing stopped being active, or remote use left on
+  presentation:
+    idle: "no remote card, or the identity still offered under a running grace of section 8.4 item 3"
+    connecting: "no remote card, or the identity still offered under a running grace of section 8.4 item 3"
+    connected: "the remote card, once a session confirmed it (section 8.4)"
+    withdrawn: "no remote card"
+    ended: "nothing of this pairing; after the custodian's pairing_revoked, the line that the phone forgot this computer"
+  events:
+    - record_appeared            # a mode=session record that matches the pairing's hint, or carries none, appears: first sight, a fresh instance name, or back after vanishing
+    - advertisement_appeared     # the RAPP BLE advertisement is first seen after it was out of sight, an edge; a scan in withdrawn is passive
+    - withdrawn_record_matched   # a withdrawn record on the associated instance verifies (section 4.5 item 6)
+    - sight_lost                 # a sight of the custodian goes: its record, a malformed or unmatched withdrawn record, or the BLE advertisement
+    - consumer_request           # a local consumer asks for the card with no session open
+    - redial_due                 # the back-off within the redial window passed
+    - redial_window_ended        # redial_window_ms passed since the window opened
+    - dial_succeeded             # session.ready verified
+    - dial_failed                # the dial ended before session.ready: refused, routing refused by a silent close, handshake failed, timeout, empty BLE scan window
+    - close_service_withdrawn    # session.close service_withdrawn received
+    - close_pairing_revoked      # session.close pairing_revoked received, also in place of session.ready
+    - close_card_unavailable     # session.close card_unavailable received: the custodian can serve no card
+    - close_other_reason         # session.close with any other reason received: normal, complete, user_disconnect, policy, shutdown
+    - session_protocol_violation # the session ended for an authenticated protocol violation: the custodian's close with reason protocol_violation, or one this requester detected and closed with
+    - session_lost               # transport loss, session_silence_limit_ms of silence, or an AEAD or framing failure
+    - pairing_left               # the pairing stopped being active on this requester, or discovery stopped
+  transitions:
+    - {from: [idle, withdrawn], event: [record_appeared, advertisement_appeared], to: connecting, actions: [open_session_dial]}
+    - {from: connecting, event: record_appeared, to: connecting, actions: [abort_dial, open_session_dial]}
+    - {from: connecting, event: advertisement_appeared, to: connecting, actions: [open_session_dial]}
+    - {from: idle, event: withdrawn_record_matched, to: withdrawn, actions: [withdraw_identity]}
+    - {from: connecting, event: withdrawn_record_matched, to: withdrawn, actions: [abort_dial, end_redial_window, withdraw_identity]}
+    - {from: [idle, connecting], event: consumer_request, to: connecting, actions: [open_session_dial]}
+    - {from: withdrawn, event: consumer_request, to: withdrawn, actions: [refuse_consumer_request]}
+    - {from: connecting, event: redial_due, to: connecting, actions: [open_session_dial]}
+    - {from: connecting, event: redial_window_ended, guard: no_dial_running, to: idle, actions: [end_redial_window]}
+    - {from: connecting, event: redial_window_ended, guard: dial_running, to: connecting, actions: []}
+    - {from: connecting, event: dial_succeeded, to: connected, actions: [end_redial_window]}
+    - {from: connecting, event: dial_failed, guard: within_redial_window, to: connecting, actions: [schedule_redial]}
+    - {from: connecting, event: dial_failed, guard: redial_window_spent, to: idle, actions: [end_redial_window]}
+    - {from: connected, event: [close_service_withdrawn, close_card_unavailable], to: withdrawn, actions: [withdraw_identity]}
+    - {from: [connecting, connected], event: close_pairing_revoked, to: ended, actions: [withdraw_identity, show_peer_forgot]}
+    - {from: connected, event: [close_other_reason, session_lost], to: connecting, actions: [start_offer_grace, schedule_redial]}
+    - {from: connected, event: session_protocol_violation, to: idle, actions: [start_offer_grace]}
+    - {from: connecting, event: session_protocol_violation, to: idle, actions: [abort_dial, end_redial_window]}
+    - {from: [idle, withdrawn], event: pairing_left, to: ended, actions: [withdraw_identity]}
+    - {from: connecting, event: pairing_left, to: ended, actions: [abort_dial, end_redial_window, withdraw_identity]}
+    - {from: connected, event: pairing_left, to: ended, actions: [withdraw_identity, request_local_close]}
+  ignored:
+    - {from: idle, event: sight_lost, reason: "idle waits for an appearance or a consumer whatever is in sight"}
+    - {from: connecting, event: sight_lost, reason: "the redial window runs on; its dials go to the remembered endpoint or a BLE scan"}
+    - {from: connected, event: [record_appeared, advertisement_appeared, withdrawn_record_matched, sight_lost], reason: "an open session outranks discovery (section 4.5 item 6)"}
+    - {from: withdrawn, event: [withdrawn_record_matched, sight_lost], reason: "already withdrawn; the withdrawn record's unregistration announces nothing"}
+  cannot_happen:
+    - {from: connected, event: consumer_request, reason: "a session is open; the request goes on it"}
+    - {from: [idle, connected, withdrawn], event: [redial_due, redial_window_ended], reason: "no redial window runs in that state"}
+    - {from: [idle, connected, withdrawn], event: [dial_succeeded, dial_failed], reason: "no dial is being set up"}
+    - {from: [idle, withdrawn], event: [close_service_withdrawn, close_card_unavailable, close_pairing_revoked, close_other_reason, session_lost, session_protocol_violation], reason: "no session or dial exists to carry it"}
+    - {from: connecting, event: [close_service_withdrawn, close_card_unavailable, close_other_reason, session_lost], reason: "these follow session.ready; before it a custodian's revoking close is close_pairing_revoked and anything else ends the dial as dial_failed"}
+    - {from: ended, event: [record_appeared, advertisement_appeared, withdrawn_record_matched, sight_lost, consumer_request, redial_due, redial_window_ended, dial_succeeded, dial_failed, close_service_withdrawn, close_card_unavailable, close_pairing_revoked, close_other_reason, session_lost, session_protocol_violation, pairing_left], reason: "the instance has ended; discovery started later starts a new one in idle"}
+
+custodian_service:
+  role: custodian
+  initial: switched_off
+  states:
+    - switched_off   # no listener, record or advertisement; pairings kept
+    - serving        # stream listener, mode=session record, BLE advertisement; an offer may be up beside them (the pairing machine)
+    - withdrawing    # withdrawn record published, accepting nothing, for 2 to 10 seconds
+    - limited        # the operating system took the stream listener away (iOS in the background): BLE only, no record
+    - not_running    # no process; pairings and the remote-access setting kept
+  events:
+    - holder_turns_on
+    - holder_turns_off
+    - holder_starts_pairing
+    - offer_ended               # consumed, expired or cancelled
+    - serving_limited_by_os
+    - serving_restored_by_os
+    - holder_quits
+    - launched                  # also a boot or an update restart; raised after sweep_stored_pairings
+    - process_ended             # ended by the operating system, or a crash
+    - withdrawn_record_elapsed  # the 2 to 10 seconds of section 4.5 item 3 passed
+    - network_changed
+    - hint_epoch_rolled         # the 15-minute discovery-hint epoch changed
+    - card_available_again      # a card the custodian can serve is back after it closed sessions with card_unavailable
+  transitions:
+    - {from: serving, event: card_available_again, to: serving, actions: [reannounce_service]}
+    - {from: switched_off, event: holder_turns_on, to: serving, actions: [register_fresh_instance, start_ble_advertising]}
+    - {from: withdrawing, event: holder_turns_on, to: serving, actions: [unregister_service, register_fresh_instance, start_ble_advertising]}
+    - {from: serving, event: holder_turns_off, to: withdrawing, actions: [cancel_offer, withdraw_custodian, stop_ble_advertising]}
+    - {from: limited, event: holder_turns_off, to: switched_off, actions: [withdraw_custodian_sessions, stop_ble_advertising]}
+    - {from: serving, event: holder_starts_pairing, guard: no_offer_up, to: serving, actions: []}
+    - {from: serving, event: serving_limited_by_os, to: limited, actions: [cancel_offer]}
+    - {from: limited, event: serving_restored_by_os, to: serving, actions: [register_fresh_instance]}
+    - {from: [serving, limited], event: holder_quits, to: not_running, actions: [withdraw_custodian_best_effort]}
+    - {from: [switched_off, withdrawing], event: holder_quits, to: not_running, actions: []}
+    - {from: [switched_off, serving, withdrawing, limited], event: process_ended, to: not_running, actions: []}
+    - {from: withdrawing, event: withdrawn_record_elapsed, to: switched_off, actions: [unregister_service]}
+    - {from: serving, event: network_changed, to: serving, actions: [republish_on_current_interfaces]}
+    - {from: serving, event: hint_epoch_rolled, to: serving, actions: [update_txt_in_place]}
+    - {from: not_running, event: launched, guard: remote_access_on, to: serving, actions: [register_fresh_instance, start_ble_advertising]}
+    - {from: not_running, event: launched, guard: remote_access_off, to: switched_off, actions: []}
+  ignored:
+    - {from: serving, event: offer_ended, reason: "the pairing machine ends the offer; the service is unchanged"}
+    - {from: switched_off, event: [serving_limited_by_os, serving_restored_by_os, network_changed, hint_epoch_rolled], reason: "nothing is served"}
+    - {from: withdrawing, event: [serving_limited_by_os, serving_restored_by_os, network_changed, hint_epoch_rolled], reason: "the withdrawal runs to its end as far as the platform lets it"}
+    - {from: limited, event: [network_changed, hint_epoch_rolled], reason: "no record is published while limited; BLE carries no hint"}
+    - {from: [switched_off, withdrawing, limited], event: card_available_again, reason: "nothing to announce now; serving again registers a fresh instance anyway"}
+  cannot_happen:
+    - {from: [serving, limited], event: holder_turns_on, reason: "remote access is already on"}
+    - {from: [switched_off, withdrawing], event: holder_turns_off, reason: "remote access is already off"}
+    - {from: [switched_off, withdrawing, limited], event: holder_starts_pairing, reason: "the pairing control is offered only while the custodian serves in the foreground"}
+    - {from: serving, event: holder_starts_pairing, guard: offer_up, reason: "an offer is already up"}
+    - {from: [switched_off, withdrawing, limited], event: offer_ended, reason: "no offer exists; leaving serving cancels it"}
+    - {from: limited, event: serving_limited_by_os, reason: "already limited"}
+    - {from: serving, event: serving_restored_by_os, reason: "not limited"}
+    - {from: [switched_off, serving, withdrawing, limited], event: launched, reason: "a running process does not launch"}
+    - {from: [switched_off, serving, limited], event: withdrawn_record_elapsed, reason: "the withdrawn record runs only in withdrawing; turning remote access on there unregisters the withdrawn instance and cancels its timer"}
+    - {from: not_running, event: [holder_turns_on, holder_turns_off, holder_starts_pairing, offer_ended, serving_limited_by_os, serving_restored_by_os, holder_quits, process_ended, withdrawn_record_elapsed, network_changed, hint_epoch_rolled, card_available_again], reason: "no process runs to take the event"}
+
+unexpected_input_policy:
+  - class: before_authentication
+    applies: >
+      a malformed preamble, an unrouted or replayed routing tag, a short MTU,
+      a frame out of order, or any input a pairing or session handshake does
+      not expect
+    handling: [close_candidate]
+    pairing_effect: none
+  - class: on_a_session
+    applies: >
+      a link drop, a timeout, an AEAD failure, a wrong version, session_id or
+      sequence, or a message the receiving role never receives
+    handling: [close_session]
+    pairing_effect: none
+  - class: inside_an_operation
+    applies: >
+      an unknown operation_id, an unsupported parameter, or a card that
+      refused or did not answer
+    handling: [reject_operation]
+    pairing_effect: none
+
+cross_component_rules:
+  - id: X-01
+    when: pairing_leaves_paired_connected_with_a_live_session
+    require: session_receives_close_requested_by_pairing
+  - id: X-02
+    when: session_enters_closing
+    require: the_session_operation_receives_session_closed
+  - id: X-03
+    when: operation_admission
+    require: pairing_paired_connected_and_session_healthy_and_no_live_operation_on_the_session
+  - id: X-04
+    when: an_operation_needs_the_card
+    require: one_operation_holds_the_card_across_every_session_in_arrival_order
+  - id: X-05
+    when: card_presence_card_or_reader_attachment_changes
+    require: every_healthy_session_receives_card_status
+  - id: X-06
+    when: a_requester_receives_service_withdrawn_or_matches_a_withdrawn_record
+    require: requester_view_of_custodian_enters_withdrawn_and_dials_offers_and_holds_nothing_until_record_appeared_or_advertisement_appeared
+  - id: X-07
+    when: a_requester_dials
+    require: the_dial_follows_an_appearance_a_consumer_request_or_a_redial_due_within_redial_window_ms
+  - id: X-08
+    when: a_custodian_holder_turns_remote_access_off
+    require: every_pairing_is_untouched_and_withdraw_custodian_runs
+  - id: X-09
+    when: a_requester_pairing_enters_revoking
+    require: at_most_one_dial_within_revocation_attempt_bound_ms_then_revocation_notice_sent_or_revocation_attempt_ended
+  - id: X-11
+    when: a_custodian_session_is_healthy
+    require: no_operation_request_is_admitted_before_session_hello_and_any_other_first_message_but_a_revocation_close_is_an_authenticated_protocol_violation
+  - id: X-10
+    when: a_requester_pairing_becomes_active
+    require: every_other_pairing_it_holds_receives_forget_pairing
+  - id: X-12
+    when: an_endpoint_receives_an_authenticated_session_close
+    require: it_answers_with_a_session_close_carrying_the_same_reason_and_closes_the_transport_unless_it_waits_for_the_echo_of_its_own_close_which_the_received_close_then_is
+
+invariants:
+  - id: INV-01
+    statement: no_operation_without_a_confirmed_pairing
+  - id: INV-02
+    statement: new_operations_only_while_the_session_is_healthy
+  - id: INV-03
+    statement: no_private_key_command_before_the_holder_consents
+  - id: INV-04
+    statement: one_live_operation_per_session
+  - id: INV-05
+    statement: one_card_command_per_operation
+  - id: INV-06
+    statement: an_operation_identifier_is_used_once_per_session
+  - id: INV-07
+    statement: one_operation_on_the_card_at_a_time_across_sessions
+  - id: INV-08
+    statement: no_failure_revokes_a_pairing
+  - id: INV-09
+    statement: pin_can_and_puk_never_leave_the_custodian
+  - id: INV-10
+    statement: no_pin_verification_below_minimum_remaining_attempts
+  - id: INV-11
+    statement: version_suite_grants_and_transport_are_transcript_bound
+  - id: INV-12
+    statement: session_keys_and_credential_buffers_destroyed_on_close
+  - id: INV-13
+    statement: nothing_of_an_operation_outlives_its_session
+  - id: INV-14
+    statement: no_withdrawal_revokes_a_pairing
+  - id: INV-15
+    statement: no_pairing_expires_while_a_session_to_it_is_established
+  - id: INV-16
+    statement: no_dial_and_no_offer_while_the_requester_view_of_custodian_is_withdrawn
+  - id: INV-17
+    statement: a_requester_holds_at_most_one_active_pairing
+  - id: INV-18
+    statement: a_requester_keeps_a_revoking_pairing_at_most_revocation_attempt_bound_ms
+  - id: INV-19
+    statement: no_pairing_is_found_matched_or_replaced_by_its_display_name
+  - id: INV-20
+    statement: the_display_name_lives_in_the_pair_record_and_dies_with_it
+  - id: INV-21
+    statement: every_session_carries_both_endpoints_current_display_names

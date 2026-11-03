@@ -1,0 +1,1036 @@
+{
+  "cpace_kc2": [
+    {
+      "candidate_id": "ble",
+      "context_hex": "8874726170702d70616972696e672d636f6e7465787483181a0b02784543504143452d52495354523235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f32353531395f436861436861506f6c795f5348413531327466692e726566696e6569642e726170702e626c6563626c6558206e0b03f362a81029af53003c55ecb9bde3045918ae4f21c16a9b72879ab7ddc66972657175657374657269637573746f6469616e",
+      "context_length": 177,
+      "generator_hex": "063b4855036e76627325ded43c45a26501b2a37977cca2592c4436bbb67a4832",
+      "name": "kc2-ble",
+      "offer_hash_hex": "6e0b03f362a81029af53003c55ecb9bde3045918ae4f21c16a9b72879ab7ddc6",
+      "offer_id_hex": "1010101010101010101010101010101010101010101010101010101010101010",
+      "pairing_code": "7KX4M9",
+      "step1_hex": "105c9a1d783b460923a99409ccb2eac2a8b482557d6e1d6dff24acc717b4c934",
+      "step2_hex": "feb511957dad4e162ac6a5efc5eb8f16c2f472bb66f438dacb8d4b7afa2117747184c28afbf66756d8b640909ce19ddba4f209c14bdb4235ce144673540e6b73",
+      "step3_hex": "22aa1321222f0f2bea54508a6bf6ceef479a81ebc698fe3d2fe2751d06ce62a5",
+      "test_only_initiator_random_hex": "33333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333",
+      "test_only_responder_random_hex": "44444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444",
+      "transport_profile": "fi.refineid.rapp.ble"
+    },
+    {
+      "candidate_id": "stream",
+      "context_hex": "8874726170702d70616972696e672d636f6e7465787483181a0b02784543504143452d52495354523235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f32353531395f436861436861506f6c795f5348413531327266692e726566696e6569642e73747265616d6673747265616d58206e0b03f362a81029af53003c55ecb9bde3045918ae4f21c16a9b72879ab7ddc66972657175657374657269637573746f6469616e",
+      "context_length": 178,
+      "generator_hex": "10400a2c68a62f8df946f56ee05c75dbb41c1f62c649bb25251a96bbbe95d462",
+      "name": "kc2-stream",
+      "offer_hash_hex": "6e0b03f362a81029af53003c55ecb9bde3045918ae4f21c16a9b72879ab7ddc6",
+      "offer_id_hex": "1010101010101010101010101010101010101010101010101010101010101010",
+      "pairing_code": "7KX4M9",
+      "step1_hex": "8429921786cab91435d7860d92844ec2680ec7a48ca49f03d2a85a09dfe6cb0c",
+      "step2_hex": "56d980cfd7474264985e43ac08512913a0153d062b1c86398c82807d80456e04eb54132faabecd8f11b122d40cd6b95dbbdd41349780a8df2111b180e86435aa",
+      "step3_hex": "f2c5a2cb1e4da5b0e077a8b87462d7effc8d01a5262d2714458b822f5580eadf",
+      "test_only_initiator_random_hex": "33333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333",
+      "test_only_responder_random_hex": "44444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444",
+      "transport_profile": "fi.refineid.stream"
+    }
+  ],
+  "deterministic_cbor": [
+    {
+      "encoded_hex": "00",
+      "name": "unsigned-zero",
+      "value": {
+        "kind": "unsigned",
+        "value": 0
+      }
+    },
+    {
+      "encoded_hex": "17",
+      "name": "unsigned-last-immediate",
+      "value": {
+        "kind": "unsigned",
+        "value": 23
+      }
+    },
+    {
+      "encoded_hex": "1818",
+      "name": "unsigned-first-byte",
+      "value": {
+        "kind": "unsigned",
+        "value": 24
+      }
+    },
+    {
+      "encoded_hex": "18ff",
+      "name": "unsigned-last-byte",
+      "value": {
+        "kind": "unsigned",
+        "value": 255
+      }
+    },
+    {
+      "encoded_hex": "190100",
+      "name": "unsigned-first-u16",
+      "value": {
+        "kind": "unsigned",
+        "value": 256
+      }
+    },
+    {
+      "encoded_hex": "20",
+      "name": "negative-one",
+      "value": {
+        "kind": "negative",
+        "value": -1
+      }
+    },
+    {
+      "encoded_hex": "37",
+      "name": "negative-last-immediate",
+      "value": {
+        "kind": "negative",
+        "value": -24
+      }
+    },
+    {
+      "encoded_hex": "3818",
+      "name": "negative-first-byte",
+      "value": {
+        "kind": "negative",
+        "value": -25
+      }
+    },
+    {
+      "encoded_hex": "430001ff",
+      "name": "byte-string",
+      "value": {
+        "hex": "0001ff",
+        "kind": "bytes"
+      }
+    },
+    {
+      "encoded_hex": "6452415050",
+      "name": "text-string",
+      "value": {
+        "kind": "text",
+        "value": "RAPP"
+      }
+    },
+    {
+      "encoded_hex": "f5",
+      "name": "boolean",
+      "value": {
+        "kind": "bool",
+        "value": true
+      }
+    },
+    {
+      "encoded_hex": "f6",
+      "name": "null",
+      "value": {
+        "kind": "null"
+      }
+    },
+    {
+      "encoded_hex": "83016178f4",
+      "name": "heterogeneous-array",
+      "value": {
+        "items": [
+          {
+            "kind": "unsigned",
+            "value": 1
+          },
+          {
+            "kind": "text",
+            "value": "x"
+          },
+          {
+            "kind": "bool",
+            "value": false
+          }
+        ],
+        "kind": "array"
+      }
+    },
+    {
+      "encoded_hex": "a2617a0162616102",
+      "name": "rfc8949-map-key-order",
+      "value": {
+        "entries": [
+          {
+            "key": "aa",
+            "value": {
+              "kind": "unsigned",
+              "value": 2
+            }
+          },
+          {
+            "key": "z",
+            "value": {
+              "kind": "unsigned",
+              "value": 1
+            }
+          }
+        ],
+        "kind": "map"
+      }
+    },
+    {
+      "encoded_hex": "a1616182f6420102",
+      "name": "nested-values",
+      "value": {
+        "entries": [
+          {
+            "key": "a",
+            "value": {
+              "items": [
+                {
+                  "kind": "null"
+                },
+                {
+                  "hex": "0102",
+                  "kind": "bytes"
+                }
+              ],
+              "kind": "array"
+            }
+          }
+        ],
+        "kind": "map"
+      }
+    }
+  ],
+  "format": "fi.refineid.rapp.conformance",
+  "grant_enforcement": [
+    {
+      "expected": "accepted",
+      "granted_profiles": [
+        "fi.refineid.card-status"
+      ],
+      "name": "granted-card-status",
+      "requested_profile": "fi.refineid.card-status"
+    },
+    {
+      "expected": "profile_not_granted",
+      "granted_profiles": [
+        "fi.refineid.authentication"
+      ],
+      "name": "card-status-not-granted",
+      "requested_profile": "fi.refineid.card-status"
+    },
+    {
+      "expected": "profile_not_granted",
+      "granted_profiles": [],
+      "name": "empty-grant-set",
+      "requested_profile": "fi.refineid.card-status"
+    }
+  ],
+  "grants_hash": [
+    {
+      "canonical_cbor_hex": "81781a66692e726566696e6569642e61757468656e7469636174696f6e",
+      "name": "authentication-only",
+      "profiles": [
+        "fi.refineid.authentication"
+      ],
+      "sha256_hex": "c7eeddabd990c83a823b4d2866d4f2f0e70d38e58ff961c5b209ea199f49fb71"
+    },
+    {
+      "canonical_cbor_hex": "82781a66692e726566696e6569642e61757468656e7469636174696f6e7766692e726566696e6569642e636172642d737461747573",
+      "name": "authentication-and-card-status",
+      "profiles": [
+        "fi.refineid.authentication",
+        "fi.refineid.card-status"
+      ],
+      "sha256_hex": "b44e47930fe605d14a3bcf433ac27f0ebd77a152c309490f7db2e854d038e943"
+    },
+    {
+      "canonical_cbor_hex": "82781a66692e726566696e6569642e61757468656e7469636174696f6e7766692e726566696e6569642e636172642d737461747573",
+      "name": "input-order-is-not-semantic",
+      "profiles": [
+        "fi.refineid.card-status",
+        "fi.refineid.authentication"
+      ],
+      "sha256_hex": "b44e47930fe605d14a3bcf433ac27f0ebd77a152c309490f7db2e854d038e943"
+    }
+  ],
+  "identifier_derivation": [
+    {
+      "handshake_hash_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "name": "zero-handshake-hash",
+      "pair_id_hex": "3068cd52b9a5bfeff40801b5c32c92a4",
+      "session_id_hex": "8bf9f5d29f938076a40181b0cff866c7"
+    },
+    {
+      "handshake_hash_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+      "name": "incrementing-handshake-hash",
+      "pair_id_hex": "7739e31da04cb64444f4ff318e3e0ecd",
+      "session_id_hex": "3c00f80ee878ff959f939c208c32229a"
+    }
+  ],
+  "noise_handshake": [
+    {
+      "handshake_hash_hex": "d20c23fd751af36fdf019264920ac658dc713fdcb24ef1d9927db19187ffa85a0cddfcabbb88c2b660d7bc3a1a6aac9ec85d88ada064cd441750aa56e0c18e6f",
+      "initiator_static_public_hex": "7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13",
+      "messages_hex": [
+        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b14c3f920a57a7659675279cb54d48c8deb",
+        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b5d2e5945bc2b211c807592da57d72728cf713a87420d8f24fc6894d55760bb70f1aeb9141c7d2a696cce16e5248ffc6b6dfcb2d28847b2ca8061627171828f19",
+        "833dfea961fbaa4ffcf981d64d355d775ddf662bb00cdedce9e9b3324ceb667d16085b6a70ba912d075f1e81e28370bf07ceeda34e2e42d769018e7d7cfca848"
+      ],
+      "name": "pairing-xxpsk3-fixed-transcript-ble",
+      "offer_hash_hex": "6666666666666666666666666666666666666666666666666666666666666666",
+      "pair_id_hex": "b9970d72f91811d11600575d4634b67b",
+      "prologue_hex": "856c726170702d70616972696e6783181a0b02784543504143452d52495354523235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f32353531395f436861436861506f6c795f534841353132582066666666666666666666666666666666666666666666666666666666666666667466692e726566696e6569642e726170702e626c65",
+      "responder_static_public_hex": "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20",
+      "session_id_hex": "969655c1fd1efa9ee8a6f8b0796f7080",
+      "suite": "Noise_XXpsk3_25519_ChaChaPoly_SHA512",
+      "test_only_initiator_ephemeral_private_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+      "test_only_initiator_static_private_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "test_only_pairing_secret_hex": "5555555555555555555555555555555555555555555555555555555555555555",
+      "test_only_responder_ephemeral_private_hex": "4444444444444444444444444444444444444444444444444444444444444444",
+      "test_only_responder_static_private_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+      "transport_profile": "fi.refineid.rapp.ble"
+    },
+    {
+      "handshake_hash_hex": "b71aa53a42cb43a92756d4471ed5880564c57ddcea5b54142b7abfaec4f0663bc592bf23fe3e73ade0329d8fa654602d32c5f43b9b04e0090f0bc61ed2176b4b",
+      "initiator_static_public_hex": "7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13",
+      "messages_hex": [
+        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b147a2b88e982b5a2f61941f5947e4a6947",
+        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b5d2e5945bc2b211c807592da57d72728cf713a87420d8f24fc6894d55760bb70047cc0fa1449a7784b0d4baf2679acc0c453e58ddf8682d77b867f156e610917",
+        "833dfea961fbaa4ffcf981d64d355d775ddf662bb00cdedce9e9b3324ceb667d1e31bf2ee5e19bb58f2c3f7d04962b78e1e0a110019877c8ce31f18f453927eb"
+      ],
+      "name": "pairing-xxpsk3-fixed-transcript-stream",
+      "offer_hash_hex": "6666666666666666666666666666666666666666666666666666666666666666",
+      "pair_id_hex": "1bbbd1c950b51bbbd2065f632d8925fe",
+      "prologue_hex": "856c726170702d70616972696e6783181a0b02784543504143452d52495354523235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f32353531395f436861436861506f6c795f534841353132582066666666666666666666666666666666666666666666666666666666666666667266692e726566696e6569642e73747265616d",
+      "responder_static_public_hex": "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20",
+      "session_id_hex": "0551df7b0722c80c3f786b6546214b9c",
+      "suite": "Noise_XXpsk3_25519_ChaChaPoly_SHA512",
+      "test_only_initiator_ephemeral_private_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+      "test_only_initiator_static_private_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "test_only_pairing_secret_hex": "5555555555555555555555555555555555555555555555555555555555555555",
+      "test_only_responder_ephemeral_private_hex": "4444444444444444444444444444444444444444444444444444444444444444",
+      "test_only_responder_static_private_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+      "transport_profile": "fi.refineid.stream"
+    },
+    {
+      "c1_initiator_to_responder_hex": "271245e9b5ffc357a6d442e04a376531bd3a0f81d69d7b97eaa132cc81d209ab",
+      "c2_responder_to_initiator_hex": "f3364ea960fcb3b95518b6029e2fbac8d1f259e630fa53beb63cf647e672ca40",
+      "grants_hash_hex": "7777777777777777777777777777777777777777777777777777777777777777",
+      "handshake_hash_hex": "d3e83da2c741bab3a262c8045c5df9057e924615f966e34c3f52371b1d527e017c952c56355389ef7732d85954e0108ede65f18502cc57d84aa96efafe32642d",
+      "initiator_static_public_hex": "7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13",
+      "messages_hex": [
+        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b14841a17d74c9cb1b68cbf32153d71a706",
+        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b5b12ea65411750a31f522bfd56db2238"
+      ],
+      "name": "session-kk-fixed-transcript-ble",
+      "pair_id_hex": "8ab9b8bcde5c6eec845d9b1ca0d3a7be",
+      "prologue_hex": "866c726170702d73657373696f6e83181a0b0278204e6f6973655f4b4b5f32353531395f436861436861506f6c795f534841353132508ab9b8bcde5c6eec845d9b1ca0d3a7be582077777777777777777777777777777777777777777777777777777777777777777466692e726566696e6569642e726170702e626c65",
+      "responder_static_public_hex": "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20",
+      "session_id_hex": "dc00fec2b6861e9f0e0bfd623a2b513e",
+      "suite": "Noise_KK_25519_ChaChaPoly_SHA512",
+      "test_only_initiator_ephemeral_private_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+      "test_only_initiator_static_private_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "test_only_responder_ephemeral_private_hex": "4444444444444444444444444444444444444444444444444444444444444444",
+      "test_only_responder_static_private_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+      "transport_profile": "fi.refineid.rapp.ble"
+    },
+    {
+      "c1_initiator_to_responder_hex": "271245e9b5ffc357a6d442e04a376531bd3a0f81d69d7b97eaa132cc81d209ab",
+      "c2_responder_to_initiator_hex": "f3364ea960fcb3b95518b6029e2fbac8d1f259e630fa53beb63cf647e672ca40",
+      "grants_hash_hex": "7777777777777777777777777777777777777777777777777777777777777777",
+      "handshake_hash_hex": "6c7b03a65240a0af39eb552a8a14b7a45d1a73e122ce457011ded44926d68e37aabcffedffc70afe3fdc50d56648be52e373c7dcd9a7691275230b204036c403",
+      "initiator_static_public_hex": "7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13",
+      "messages_hex": [
+        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b149f02198d882beed4c6f7711cb7da179f",
+        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6bc86be87d019d7a6ba79174fedcd6a9c6"
+      ],
+      "name": "session-kk-fixed-transcript-stream",
+      "pair_id_hex": "8ab9b8bcde5c6eec845d9b1ca0d3a7be",
+      "prologue_hex": "866c726170702d73657373696f6e83181a0b0278204e6f6973655f4b4b5f32353531395f436861436861506f6c795f534841353132508ab9b8bcde5c6eec845d9b1ca0d3a7be582077777777777777777777777777777777777777777777777777777777777777777266692e726566696e6569642e73747265616d",
+      "responder_static_public_hex": "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20",
+      "session_id_hex": "b3d803dbf20e7c1a5a5d35ae5145a6d7",
+      "suite": "Noise_KK_25519_ChaChaPoly_SHA512",
+      "test_only_initiator_ephemeral_private_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+      "test_only_initiator_static_private_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "test_only_responder_ephemeral_private_hex": "4444444444444444444444444444444444444444444444444444444444444444",
+      "test_only_responder_static_private_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+      "transport_profile": "fi.refineid.stream"
+    }
+  ],
+  "pairing_offer": [
+    {
+      "encoded_hex": "a766736368656d6564726170706673756974657381784543504143452d52495354523235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f32353531395f436861436861506f6c795f5348413531326776657273696f6e83181a0b02686f666665725f6964582010101010101010101010101010101010101010101010101010101010101010106870726f66696c6573837766692e726566696e6569642e636172642d737461747573781a66692e726566696e6569642e61757468656e7469636174696f6e781c66692e726566696e6569642e646f63756d656e742d7369676e696e676a7472616e73706f72747381a36770726f66696c657466692e726566696e6569642e726170702e626c656a706172616d6574657273a16c736572766963655f75756964782437453339464430312d413642352d344437382d394531312d3337453238453935343546316c63616e6469646174655f696463626c656c6f666665725f74746c5f6d731a000493e0",
+      "encoded_length": 380,
+      "name": "offer-ble",
+      "offer_hash_hex": "148492fa5d3f6e5bb76f7005bcb2a92b81b67bb52293e843255c91f42c42f0c1",
+      "offer_id_hex": "1010101010101010101010101010101010101010101010101010101010101010",
+      "profiles": [
+        "fi.refineid.card-status",
+        "fi.refineid.authentication",
+        "fi.refineid.document-signing"
+      ],
+      "transport_profiles": [
+        "fi.refineid.rapp.ble"
+      ]
+    },
+    {
+      "encoded_hex": "a766736368656d6564726170706673756974657381784543504143452d52495354523235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f32353531395f436861436861506f6c795f5348413531326776657273696f6e83181a0b02686f666665725f6964582010101010101010101010101010101010101010101010101010101010101010106870726f66696c6573837766692e726566696e6569642e636172642d737461747573781a66692e726566696e6569642e61757468656e7469636174696f6e781c66692e726566696e6569642e646f63756d656e742d7369676e696e676a7472616e73706f72747381a36770726f66696c657266692e726566696e6569642e73747265616d6a706172616d6574657273a06c63616e6469646174655f69646673747265616d6c6f666665725f74746c5f6d731a000493e0",
+      "encoded_length": 330,
+      "name": "offer-stream",
+      "offer_hash_hex": "97a2bfce98c89e821f1f8f963e7566dcad4bc038ac16f3f54066dcca66f9c1a6",
+      "offer_id_hex": "1010101010101010101010101010101010101010101010101010101010101010",
+      "profiles": [
+        "fi.refineid.card-status",
+        "fi.refineid.authentication",
+        "fi.refineid.document-signing"
+      ],
+      "transport_profiles": [
+        "fi.refineid.stream"
+      ]
+    },
+    {
+      "encoded_hex": "a766736368656d6564726170706673756974657381784543504143452d52495354523235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f32353531395f436861436861506f6c795f5348413531326776657273696f6e83181a0b02686f666665725f6964582010101010101010101010101010101010101010101010101010101010101010106870726f66696c6573837766692e726566696e6569642e636172642d737461747573781a66692e726566696e6569642e61757468656e7469636174696f6e781c66692e726566696e6569642e646f63756d656e742d7369676e696e676a7472616e73706f72747382a36770726f66696c657466692e726566696e6569642e726170702e626c656a706172616d6574657273a16c736572766963655f75756964782437453339464430312d413642352d344437382d394531312d3337453238453935343546316c63616e6469646174655f696463626c65a36770726f66696c657266692e726566696e6569642e73747265616d6a706172616d6574657273a06c63616e6469646174655f69646673747265616d6c6f666665725f74746c5f6d731a000493e0",
+      "encoded_length": 440,
+      "name": "offer-ble-and-stream",
+      "offer_hash_hex": "8acb089611320af49007a0da6c2da4d5472a553363c3c8d472585c333d60117a",
+      "offer_id_hex": "1010101010101010101010101010101010101010101010101010101010101010",
+      "profiles": [
+        "fi.refineid.card-status",
+        "fi.refineid.authentication",
+        "fi.refineid.document-signing"
+      ],
+      "transport_profiles": [
+        "fi.refineid.rapp.ble",
+        "fi.refineid.stream"
+      ]
+    }
+  ],
+  "protocol_document_version": "26.11.2",
+  "rejected_cbor": [
+    {
+      "encoded_hex": "1817",
+      "error": "NonCanonical",
+      "name": "non-minimal-integer"
+    },
+    {
+      "encoded_hex": "a2616101616102",
+      "error": "DuplicateMapKey",
+      "name": "duplicate-map-key"
+    },
+    {
+      "encoded_hex": "a10102",
+      "error": "NonTextMapKey",
+      "name": "non-text-map-key"
+    },
+    {
+      "encoded_hex": "61ff",
+      "error": "InvalidUtf8",
+      "name": "invalid-utf8"
+    },
+    {
+      "encoded_hex": "0000",
+      "error": "TrailingData",
+      "name": "trailing-data"
+    },
+    {
+      "encoded_hex": "9fff",
+      "error": "ForbiddenCborType",
+      "name": "indefinite-length"
+    },
+    {
+      "encoded_hex": "c000",
+      "error": "ForbiddenCborType",
+      "name": "unregistered-tag"
+    },
+    {
+      "encoded_hex": "81818181818181818100",
+      "error": "NestingTooDeep",
+      "name": "excessive-nesting"
+    }
+  ],
+  "rejected_envelope": [
+    {
+      "canonical_cbor_hex": "a464626f6479a1696368616c6c656e67655820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb64747970656d6c6976656e6573732e70696e676873657175656e6365006a73657373696f6e5f696450aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "error": "MissingField { field: \"version\" }",
+      "name": "missing-version"
+    },
+    {
+      "canonical_cbor_hex": "a664626f6479a1696368616c6c656e67655820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb64747970656d6c6976656e6573732e70696e6766667574757265016776657273696f6e83181a0b026873657175656e6365006a73657373696f6e5f696450aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "error": "UnknownField",
+      "name": "unknown-envelope-field"
+    },
+    {
+      "canonical_cbor_hex": "a564626f6479a1696368616c6c656e67655820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb64747970656d6c6976656e6573732e70696e676776657273696f6e63302e316873657175656e6365006a73657373696f6e5f696450aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "error": "WrongType { field: \"version\" }",
+      "name": "wrong-version-type"
+    },
+    {
+      "canonical_cbor_hex": "a564626f6479a1696368616c6c656e67655820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb64747970656d6c6976656e6573732e70696e676776657273696f6e8200026873657175656e6365006a73657373696f6e5f696450aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "error": "UnsupportedVersion",
+      "name": "unsupported-version"
+    },
+    {
+      "canonical_cbor_hex": "a564626f6479a1696368616c6c656e67655820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb64747970656e6675747572652e6d6573736167656776657273696f6e83181a0b026873657175656e6365006a73657373696f6e5f696450aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "error": "UnknownMessageType",
+      "name": "unknown-message-type"
+    },
+    {
+      "canonical_cbor_hex": "a564626f6479a1696368616c6c656e67655820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb64747970656d6c6976656e6573732e70696e676776657273696f6e83181a0b026873657175656e6365006a73657373696f6e5f69644faaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "error": "WrongLength { field: \"session_id\", expected: 16, got: 15 }",
+      "name": "wrong-session-id-length"
+    },
+    {
+      "canonical_cbor_hex": "a564626f6479a1696368616c6c656e67655820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb64747970656d6c6976656e6573732e70696e676776657273696f6e83181a0b026873657175656e6365647a65726f6a73657373696f6e5f696450aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "error": "WrongType { field: \"sequence\" }",
+      "name": "wrong-sequence-type"
+    },
+    {
+      "canonical_cbor_hex": "a564626f64798064747970656d6c6976656e6573732e70696e676776657273696f6e83181a0b026873657175656e6365006a73657373696f6e5f696450aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "error": "WrongType { field: \"body\" }",
+      "name": "wrong-body-type"
+    },
+    {
+      "canonical_cbor_hex": "a664626f6479a1696368616c6c656e67655820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb64747970656d6c6976656e6573732e70696e676776657273696f6e83181a0b0268637269746963616c806873657175656e6365006a73657373696f6e5f696450aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "error": "UnknownField",
+      "name": "critical-is-an-unknown-field"
+    },
+    {
+      "canonical_cbor_hex": "a664626f6479a1696368616c6c656e67655820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb64747970656d6c6976656e6573732e70696e676776657273696f6e83181a0b026873657175656e6365006a657874656e73696f6e73a06a73657373696f6e5f696450aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "error": "UnknownField",
+      "name": "extensions-is-an-unknown-field"
+    }
+  ],
+  "sequence_guard": [
+    {
+      "accepted_sequences": [],
+      "expected": "accepted",
+      "expected_next_receive": 1,
+      "guard_session_id_hex": "000102030405060708090a0b0c0d0e0f",
+      "incoming_sequence": 0,
+      "incoming_session_id_hex": "000102030405060708090a0b0c0d0e0f",
+      "name": "initial-zero"
+    },
+    {
+      "accepted_sequences": [
+        0,
+        1
+      ],
+      "expected": "accepted",
+      "expected_next_receive": 3,
+      "guard_session_id_hex": "000102030405060708090a0b0c0d0e0f",
+      "incoming_sequence": 2,
+      "incoming_session_id_hex": "000102030405060708090a0b0c0d0e0f",
+      "name": "sequential-after-two"
+    },
+    {
+      "accepted_sequences": [
+        0
+      ],
+      "expected": "wrong_sequence",
+      "expected_next_receive": 1,
+      "guard_session_id_hex": "000102030405060708090a0b0c0d0e0f",
+      "incoming_sequence": 0,
+      "incoming_session_id_hex": "000102030405060708090a0b0c0d0e0f",
+      "name": "replayed-zero"
+    },
+    {
+      "accepted_sequences": [
+        0
+      ],
+      "expected": "wrong_sequence",
+      "expected_next_receive": 1,
+      "guard_session_id_hex": "000102030405060708090a0b0c0d0e0f",
+      "incoming_sequence": 2,
+      "incoming_session_id_hex": "000102030405060708090a0b0c0d0e0f",
+      "name": "forward-gap"
+    },
+    {
+      "accepted_sequences": [
+        0,
+        1
+      ],
+      "expected": "wrong_sequence",
+      "expected_next_receive": 2,
+      "guard_session_id_hex": "000102030405060708090a0b0c0d0e0f",
+      "incoming_sequence": 0,
+      "incoming_session_id_hex": "000102030405060708090a0b0c0d0e0f",
+      "name": "rollback-after-two"
+    },
+    {
+      "accepted_sequences": [],
+      "expected": "wrong_session",
+      "expected_next_receive": 0,
+      "guard_session_id_hex": "000102030405060708090a0b0c0d0e0f",
+      "incoming_sequence": 0,
+      "incoming_session_id_hex": "f0e0d0c0b0a090807060504030201000",
+      "name": "wrong-session"
+    }
+  ],
+  "wire_version": [
+    {
+      "expected": "accepted",
+      "name": "current-version",
+      "version": [
+        26,
+        11,
+        2
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "superseded-v26-11-1",
+      "version": [
+        26,
+        11,
+        1
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "superseded-v26-10-29",
+      "version": [
+        26,
+        10,
+        29
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "superseded-v26-10-18",
+      "version": [
+        26,
+        10,
+        18
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "superseded-v26-10-10",
+      "version": [
+        26,
+        10,
+        10
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "superseded-v26-10-9",
+      "version": [
+        26,
+        10,
+        9
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "superseded-v26-10-1",
+      "version": [
+        26,
+        10,
+        1
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "legacy-v26-9-28-downgrade",
+      "version": [
+        26,
+        9,
+        28
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "downgrade-to-earlier-patch",
+      "version": [
+        26,
+        10,
+        8
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "downgrade-to-26-8",
+      "version": [
+        26,
+        8,
+        0
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "downgrade-to-pre-release-zero",
+      "version": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "unknown-major",
+      "version": [
+        27,
+        0,
+        0
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "historical-two-element-version",
+      "version": [
+        26,
+        10
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "four-element-version",
+      "version": [
+        26,
+        10,
+        21,
+        1
+      ]
+    },
+    {
+      "expected": "unsupported_version",
+      "name": "empty-version",
+      "version": []
+    }
+  ],
+  "provenance": "Derived by tools/rapp-vectors/generate.py from the inputs in this file and RAPP v26.11.2 sections 4.2, 4.3, 6.1 to 6.3, 7.1 and 7.2, with standard-library primitives checked against RFC 7748 section 6.1, RFC 8439 section 2.8.2 and RFC 9496 appendix A.1; the engine is not used.",
+  "pairing_busy": [
+    {
+      "name": "least-wait",
+      "retry_after_ms": 1,
+      "encoded_hex": "a366736368656d6564726170706776657273696f6e83181a0b026e72657472795f61667465725f6d7301"
+    },
+    {
+      "name": "spacing-wait",
+      "retry_after_ms": 500,
+      "encoded_hex": "a366736368656d6564726170706776657273696f6e83181a0b026e72657472795f61667465725f6d731901f4"
+    },
+    {
+      "name": "greatest-wait",
+      "retry_after_ms": 5000,
+      "encoded_hex": "a366736368656d6564726170706776657273696f6e83181a0b026e72657472795f61667465725f6d73191388"
+    }
+  ],
+  "rejected_pairing_busy": [
+    {
+      "name": "zero-wait",
+      "encoded_hex": "a366736368656d6564726170706776657273696f6e83181a0b026e72657472795f61667465725f6d7300",
+      "error": "RetryAfterOutOfRange { got: 0 }"
+    },
+    {
+      "name": "wait-above-greatest",
+      "encoded_hex": "a366736368656d6564726170706776657273696f6e83181a0b026e72657472795f61667465725f6d73191389",
+      "error": "RetryAfterOutOfRange { got: 5001 }"
+    },
+    {
+      "name": "missing-wait",
+      "encoded_hex": "a266736368656d6564726170706776657273696f6e83181a0b02",
+      "error": "MissingField { field: \"retry_after_ms\" }"
+    },
+    {
+      "name": "wrong-version",
+      "encoded_hex": "a366736368656d6564726170706776657273696f6e83181a0b036e72657472795f61667465725f6d731901f4",
+      "error": "UnsupportedVersion"
+    },
+    {
+      "name": "extra-field",
+      "encoded_hex": "a466736368656d6564726170706776657273696f6e83181a0b026c6f666665725f74746c5f6d731a000493e06e72657472795f61667465725f6d731901f4",
+      "error": "UnknownField"
+    }
+  ],
+  "pairing_hello": [
+    {
+      "name": "computer-name",
+      "sender": "requester",
+      "transport_profile": "fi.refineid.stream",
+      "offer_hash_hex": "c129129733dbfca4196c41c03e9467ea755b1cf5235d8a0cae9c7ba3b5e73872",
+      "session_id_hex": "27833b2d7cebcdde820b867c5e342124",
+      "platform": "macOS",
+      "display_name": "macOS - example-host",
+      "expected": "accepted",
+      "rule": "a computer names itself \"OS - Hostname\" (section 4.3 item 3)",
+      "requested_profiles": [
+        "fi.refineid.authentication",
+        "fi.refineid.card-status"
+      ],
+      "display_name_utf8_length": 20,
+      "envelope_cbor_hex": "a564626f6479a468706c6174666f726d656d61634f536a706172616d6574657273a5657375697465784543504143452d52495354523235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f32353531395f436861436861506f6c795f5348413531326776657273696f6e83181a0b026a6f666665725f686173685820c129129733dbfca4196c41c03e9467ea755b1cf5235d8a0cae9c7ba3b5e738726c63616e6469646174655f69646673747265616d717472616e73706f72745f70726f66696c657266692e726566696e6569642e73747265616d6c646973706c61795f6e616d65746d61634f53202d206578616d706c652d686f7374727265717565737465645f70726f66696c657382781a66692e726566696e6569642e61757468656e7469636174696f6e7766692e726566696e6569642e636172642d73746174757364747970656d70616972696e672e68656c6c6f6776657273696f6e83181a0b026873657175656e6365006a73657373696f6e5f69645027833b2d7cebcdde820b867c5e342124"
+    },
+    {
+      "name": "computer-name-non-ascii",
+      "sender": "requester",
+      "transport_profile": "fi.refineid.stream",
+      "offer_hash_hex": "c129129733dbfca4196c41c03e9467ea755b1cf5235d8a0cae9c7ba3b5e73872",
+      "session_id_hex": "27833b2d7cebcdde820b867c5e342124",
+      "platform": "Linux",
+      "display_name": "Linux - työasema",
+      "expected": "accepted",
+      "rule": "the name is UTF-8; the bound counts bytes (section 7.1)",
+      "requested_profiles": [
+        "fi.refineid.authentication",
+        "fi.refineid.card-status"
+      ],
+      "display_name_utf8_length": 17,
+      "envelope_cbor_hex": "a564626f6479a468706c6174666f726d654c696e75786a706172616d6574657273a5657375697465784543504143452d52495354523235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f32353531395f436861436861506f6c795f5348413531326776657273696f6e83181a0b026a6f666665725f686173685820c129129733dbfca4196c41c03e9467ea755b1cf5235d8a0cae9c7ba3b5e738726c63616e6469646174655f69646673747265616d717472616e73706f72745f70726f66696c657266692e726566696e6569642e73747265616d6c646973706c61795f6e616d65714c696e7578202d207479c3b66173656d61727265717565737465645f70726f66696c657382781a66692e726566696e6569642e61757468656e7469636174696f6e7766692e726566696e6569642e636172642d73746174757364747970656d70616972696e672e68656c6c6f6776657273696f6e83181a0b026873657175656e6365006a73657373696f6e5f69645027833b2d7cebcdde820b867c5e342124"
+    },
+    {
+      "name": "phone-name",
+      "sender": "custodian",
+      "transport_profile": "fi.refineid.rapp.ble",
+      "offer_hash_hex": "c129129733dbfca4196c41c03e9467ea755b1cf5235d8a0cae9c7ba3b5e73872",
+      "session_id_hex": "27833b2d7cebcdde820b867c5e342124",
+      "platform": "iOS",
+      "display_name": "iPhone 16",
+      "expected": "accepted",
+      "rule": "an iPhone or iPad sends its own or its model name, which already says the platform, without an operating-system prefix (section 4.3 item 3)",
+      "display_name_utf8_length": 9,
+      "envelope_cbor_hex": "a564626f6479a368706c6174666f726d63694f536a706172616d6574657273a5657375697465784543504143452d52495354523235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f32353531395f436861436861506f6c795f5348413531326776657273696f6e83181a0b026a6f666665725f686173685820c129129733dbfca4196c41c03e9467ea755b1cf5235d8a0cae9c7ba3b5e738726c63616e6469646174655f696463626c65717472616e73706f72745f70726f66696c657466692e726566696e6569642e726170702e626c656c646973706c61795f6e616d65696950686f6e6520313664747970656d70616972696e672e68656c6c6f6776657273696f6e83181a0b026873657175656e6365006a73657373696f6e5f69645027833b2d7cebcdde820b867c5e342124"
+    },
+    {
+      "name": "tablet-name",
+      "sender": "requester",
+      "transport_profile": "fi.refineid.stream",
+      "offer_hash_hex": "c129129733dbfca4196c41c03e9467ea755b1cf5235d8a0cae9c7ba3b5e73872",
+      "session_id_hex": "27833b2d7cebcdde820b867c5e342124",
+      "platform": "iPadOS",
+      "display_name": "iPad Pro 11-inch (M4)",
+      "expected": "accepted",
+      "rule": "an iPad is a requester and sends its model name without a prefix (section 4.3 item 3)",
+      "requested_profiles": [
+        "fi.refineid.authentication",
+        "fi.refineid.card-status"
+      ],
+      "display_name_utf8_length": 21,
+      "envelope_cbor_hex": "a564626f6479a468706c6174666f726d66695061644f536a706172616d6574657273a5657375697465784543504143452d52495354523235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f32353531395f436861436861506f6c795f5348413531326776657273696f6e83181a0b026a6f666665725f686173685820c129129733dbfca4196c41c03e9467ea755b1cf5235d8a0cae9c7ba3b5e738726c63616e6469646174655f69646673747265616d717472616e73706f72745f70726f66696c657266692e726566696e6569642e73747265616d6c646973706c61795f6e616d6575695061642050726f2031312d696e636820284d3429727265717565737465645f70726f66696c657382781a66692e726566696e6569642e61757468656e7469636174696f6e7766692e726566696e6569642e636172642d73746174757364747970656d70616972696e672e68656c6c6f6776657273696f6e83181a0b026873657175656e6365006a73657373696f6e5f69645027833b2d7cebcdde820b867c5e342124"
+    },
+    {
+      "name": "android-tablet-name",
+      "sender": "requester",
+      "transport_profile": "fi.refineid.stream",
+      "offer_hash_hex": "c129129733dbfca4196c41c03e9467ea755b1cf5235d8a0cae9c7ba3b5e73872",
+      "session_id_hex": "27833b2d7cebcdde820b867c5e342124",
+      "platform": "Android",
+      "display_name": "Android - Example Tablet",
+      "expected": "accepted",
+      "rule": "an Android tablet's name does not say the platform, so it carries the prefix (section 4.3 item 3)",
+      "requested_profiles": [
+        "fi.refineid.authentication",
+        "fi.refineid.card-status"
+      ],
+      "display_name_utf8_length": 24,
+      "envelope_cbor_hex": "a564626f6479a468706c6174666f726d67416e64726f69646a706172616d6574657273a5657375697465784543504143452d52495354523235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f32353531395f436861436861506f6c795f5348413531326776657273696f6e83181a0b026a6f666665725f686173685820c129129733dbfca4196c41c03e9467ea755b1cf5235d8a0cae9c7ba3b5e738726c63616e6469646174655f69646673747265616d717472616e73706f72745f70726f66696c657266692e726566696e6569642e73747265616d6c646973706c61795f6e616d657818416e64726f6964202d204578616d706c65205461626c6574727265717565737465645f70726f66696c657382781a66692e726566696e6569642e61757468656e7469636174696f6e7766692e726566696e6569642e636172642d73746174757364747970656d70616972696e672e68656c6c6f6776657273696f6e83181a0b026873657175656e6365006a73657373696f6e5f69645027833b2d7cebcdde820b867c5e342124"
+    },
+    {
+      "name": "name-at-bound",
+      "sender": "requester",
+      "transport_profile": "fi.refineid.stream",
+      "offer_hash_hex": "c129129733dbfca4196c41c03e9467ea755b1cf5235d8a0cae9c7ba3b5e73872",
+      "session_id_hex": "27833b2d7cebcdde820b867c5e342124",
+      "platform": "Windows",
+      "display_name": {
+        "text": "a",
+        "repeat": 256
+      },
+      "expected": "accepted",
+      "rule": "256 bytes is the longest name (section 7.1)",
+      "requested_profiles": [
+        "fi.refineid.authentication",
+        "fi.refineid.card-status"
+      ],
+      "display_name_utf8_length": 256,
+      "envelope_cbor_hex": "a564626f6479a468706c6174666f726d6757696e646f77736a706172616d6574657273a5657375697465784543504143452d52495354523235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f32353531395f436861436861506f6c795f5348413531326776657273696f6e83181a0b026a6f666665725f686173685820c129129733dbfca4196c41c03e9467ea755b1cf5235d8a0cae9c7ba3b5e738726c63616e6469646174655f69646673747265616d717472616e73706f72745f70726f66696c657266692e726566696e6569642e73747265616d6c646973706c61795f6e616d6579010061616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161727265717565737465645f70726f66696c657382781a66692e726566696e6569642e61757468656e7469636174696f6e7766692e726566696e6569642e636172642d73746174757364747970656d70616972696e672e68656c6c6f6776657273696f6e83181a0b026873657175656e6365006a73657373696f6e5f69645027833b2d7cebcdde820b867c5e342124"
+    },
+    {
+      "name": "name-over-bound",
+      "sender": "requester",
+      "transport_profile": "fi.refineid.stream",
+      "offer_hash_hex": "c129129733dbfca4196c41c03e9467ea755b1cf5235d8a0cae9c7ba3b5e73872",
+      "session_id_hex": "27833b2d7cebcdde820b867c5e342124",
+      "platform": "Windows",
+      "display_name": {
+        "text": "a",
+        "repeat": 257
+      },
+      "expected": "rejected",
+      "rule": "a name over 256 bytes is a protocol violation; a sender shortens its name to fit (section 7.1)",
+      "requested_profiles": [
+        "fi.refineid.authentication",
+        "fi.refineid.card-status"
+      ],
+      "display_name_utf8_length": 257,
+      "envelope_cbor_hex": "a564626f6479a468706c6174666f726d6757696e646f77736a706172616d6574657273a5657375697465784543504143452d52495354523235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f32353531395f436861436861506f6c795f5348413531326776657273696f6e83181a0b026a6f666665725f686173685820c129129733dbfca4196c41c03e9467ea755b1cf5235d8a0cae9c7ba3b5e738726c63616e6469646174655f69646673747265616d717472616e73706f72745f70726f66696c657266692e726566696e6569642e73747265616d6c646973706c61795f6e616d657901016161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161727265717565737465645f70726f66696c657382781a66692e726566696e6569642e61757468656e7469636174696f6e7766692e726566696e6569642e636172642d73746174757364747970656d70616972696e672e68656c6c6f6776657273696f6e83181a0b026873657175656e6365006a73657373696f6e5f69645027833b2d7cebcdde820b867c5e342124"
+    },
+    {
+      "name": "name-missing",
+      "sender": "requester",
+      "transport_profile": "fi.refineid.stream",
+      "offer_hash_hex": "c129129733dbfca4196c41c03e9467ea755b1cf5235d8a0cae9c7ba3b5e73872",
+      "session_id_hex": "27833b2d7cebcdde820b867c5e342124",
+      "platform": "macOS",
+      "display_name": null,
+      "expected": "rejected",
+      "rule": "display_name is required (section 7.1)",
+      "requested_profiles": [
+        "fi.refineid.authentication",
+        "fi.refineid.card-status"
+      ],
+      "display_name_utf8_length": null,
+      "envelope_cbor_hex": "a564626f6479a368706c6174666f726d656d61634f536a706172616d6574657273a5657375697465784543504143452d52495354523235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f32353531395f436861436861506f6c795f5348413531326776657273696f6e83181a0b026a6f666665725f686173685820c129129733dbfca4196c41c03e9467ea755b1cf5235d8a0cae9c7ba3b5e738726c63616e6469646174655f69646673747265616d717472616e73706f72745f70726f66696c657266692e726566696e6569642e73747265616d727265717565737465645f70726f66696c657382781a66692e726566696e6569642e61757468656e7469636174696f6e7766692e726566696e6569642e636172642d73746174757364747970656d70616972696e672e68656c6c6f6776657273696f6e83181a0b026873657175656e6365006a73657373696f6e5f69645027833b2d7cebcdde820b867c5e342124"
+    },
+    {
+      "name": "name-empty",
+      "sender": "custodian",
+      "transport_profile": "fi.refineid.stream",
+      "offer_hash_hex": "c129129733dbfca4196c41c03e9467ea755b1cf5235d8a0cae9c7ba3b5e73872",
+      "session_id_hex": "27833b2d7cebcdde820b867c5e342124",
+      "platform": "Android",
+      "display_name": "",
+      "expected": "rejected",
+      "rule": "an empty name is a protocol violation (section 7.1)",
+      "display_name_utf8_length": 0,
+      "envelope_cbor_hex": "a564626f6479a368706c6174666f726d67416e64726f69646a706172616d6574657273a5657375697465784543504143452d52495354523235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f32353531395f436861436861506f6c795f5348413531326776657273696f6e83181a0b026a6f666665725f686173685820c129129733dbfca4196c41c03e9467ea755b1cf5235d8a0cae9c7ba3b5e738726c63616e6469646174655f69646673747265616d717472616e73706f72745f70726f66696c657266692e726566696e6569642e73747265616d6c646973706c61795f6e616d656064747970656d70616972696e672e68656c6c6f6776657273696f6e83181a0b026873657175656e6365006a73657373696f6e5f69645027833b2d7cebcdde820b867c5e342124"
+    },
+    {
+      "name": "name-blank",
+      "sender": "requester",
+      "transport_profile": "fi.refineid.stream",
+      "offer_hash_hex": "c129129733dbfca4196c41c03e9467ea755b1cf5235d8a0cae9c7ba3b5e73872",
+      "session_id_hex": "27833b2d7cebcdde820b867c5e342124",
+      "platform": "macOS",
+      "display_name": " \t ",
+      "expected": "rejected",
+      "rule": "a name of white space alone is a protocol violation (section 7.1)",
+      "requested_profiles": [
+        "fi.refineid.authentication",
+        "fi.refineid.card-status"
+      ],
+      "display_name_utf8_length": 3,
+      "envelope_cbor_hex": "a564626f6479a468706c6174666f726d656d61634f536a706172616d6574657273a5657375697465784543504143452d52495354523235352d5348413531322d524150502d4b4332202b204e6f6973655f585870736b335f32353531395f436861436861506f6c795f5348413531326776657273696f6e83181a0b026a6f666665725f686173685820c129129733dbfca4196c41c03e9467ea755b1cf5235d8a0cae9c7ba3b5e738726c63616e6469646174655f69646673747265616d717472616e73706f72745f70726f66696c657266692e726566696e6569642e73747265616d6c646973706c61795f6e616d6563200920727265717565737465645f70726f66696c657382781a66692e726566696e6569642e61757468656e7469636174696f6e7766692e726566696e6569642e636172642d73746174757364747970656d70616972696e672e68656c6c6f6776657273696f6e83181a0b026873657175656e6365006a73657373696f6e5f69645027833b2d7cebcdde820b867c5e342124"
+    }
+  ],
+  "session_name": [
+    {
+      "name": "ready-same-name",
+      "message": "session.ready",
+      "session_id_hex": "cdf395e1e1e0d0f3aaba5908c912afb5",
+      "display_name": "iPhone 16",
+      "record_name_before": "iPhone 16",
+      "expected": "accepted",
+      "rule": "the custodian's name in session.ready equals the record's; nothing is rewritten (section 4.3 item 4)",
+      "transport_profile": "fi.refineid.stream",
+      "grants_hash_hex": "dd0ba7729d3f131153151de6866d5b0f1cac0d09161b2c9843c30e7e6200b009",
+      "nonce_hex": "c2065ef51c3ed2b1077069bfd88eaa74c3310061ae7a37042022b1d0bfd46214",
+      "display_name_utf8_length": 9,
+      "record_name_after": "iPhone 16",
+      "record_rewritten": false,
+      "envelope_cbor_hex": "a564626f6479a3656e6f6e63655820c2065ef51c3ed2b1077069bfd88eaa74c3310061ae7a37042022b1d0bfd462146a706172616d6574657273a565737569746578204e6f6973655f4b4b5f32353531395f436861436861506f6c795f5348413531326776657273696f6e83181a0b026b6772616e74735f686173685820dd0ba7729d3f131153151de6866d5b0f1cac0d09161b2c9843c30e7e6200b0096c63616e6469646174655f69646673747265616d717472616e73706f72745f70726f66696c657266692e726566696e6569642e73747265616d6c646973706c61795f6e616d65696950686f6e6520313664747970656d73657373696f6e2e72656164796776657273696f6e83181a0b026873657175656e6365006a73657373696f6e5f696450cdf395e1e1e0d0f3aaba5908c912afb5"
+    },
+    {
+      "name": "ready-renamed",
+      "message": "session.ready",
+      "session_id_hex": "cdf395e1e1e0d0f3aaba5908c912afb5",
+      "display_name": "Kitchen iPhone",
+      "record_name_before": "iPhone 16",
+      "expected": "accepted",
+      "rule": "a renamed phone's new name replaces the record's (section 4.3 item 4)",
+      "transport_profile": "fi.refineid.stream",
+      "grants_hash_hex": "dd0ba7729d3f131153151de6866d5b0f1cac0d09161b2c9843c30e7e6200b009",
+      "nonce_hex": "c2065ef51c3ed2b1077069bfd88eaa74c3310061ae7a37042022b1d0bfd46214",
+      "display_name_utf8_length": 14,
+      "record_name_after": "Kitchen iPhone",
+      "record_rewritten": true,
+      "envelope_cbor_hex": "a564626f6479a3656e6f6e63655820c2065ef51c3ed2b1077069bfd88eaa74c3310061ae7a37042022b1d0bfd462146a706172616d6574657273a565737569746578204e6f6973655f4b4b5f32353531395f436861436861506f6c795f5348413531326776657273696f6e83181a0b026b6772616e74735f686173685820dd0ba7729d3f131153151de6866d5b0f1cac0d09161b2c9843c30e7e6200b0096c63616e6469646174655f69646673747265616d717472616e73706f72745f70726f66696c657266692e726566696e6569642e73747265616d6c646973706c61795f6e616d656e4b69746368656e206950686f6e6564747970656d73657373696f6e2e72656164796776657273696f6e83181a0b026873657175656e6365006a73657373696f6e5f696450cdf395e1e1e0d0f3aaba5908c912afb5"
+    },
+    {
+      "name": "ready-name-missing",
+      "message": "session.ready",
+      "session_id_hex": "cdf395e1e1e0d0f3aaba5908c912afb5",
+      "display_name": null,
+      "record_name_before": "iPhone 16",
+      "expected": "rejected",
+      "rule": "session.ready without display_name is an authenticated protocol violation; the record keeps its name (section 7.1)",
+      "transport_profile": "fi.refineid.stream",
+      "grants_hash_hex": "dd0ba7729d3f131153151de6866d5b0f1cac0d09161b2c9843c30e7e6200b009",
+      "nonce_hex": "c2065ef51c3ed2b1077069bfd88eaa74c3310061ae7a37042022b1d0bfd46214",
+      "display_name_utf8_length": null,
+      "record_name_after": "iPhone 16",
+      "record_rewritten": false,
+      "envelope_cbor_hex": "a564626f6479a2656e6f6e63655820c2065ef51c3ed2b1077069bfd88eaa74c3310061ae7a37042022b1d0bfd462146a706172616d6574657273a565737569746578204e6f6973655f4b4b5f32353531395f436861436861506f6c795f5348413531326776657273696f6e83181a0b026b6772616e74735f686173685820dd0ba7729d3f131153151de6866d5b0f1cac0d09161b2c9843c30e7e6200b0096c63616e6469646174655f69646673747265616d717472616e73706f72745f70726f66696c657266692e726566696e6569642e73747265616d64747970656d73657373696f6e2e72656164796776657273696f6e83181a0b026873657175656e6365006a73657373696f6e5f696450cdf395e1e1e0d0f3aaba5908c912afb5"
+    },
+    {
+      "name": "ready-name-blank",
+      "message": "session.ready",
+      "session_id_hex": "cdf395e1e1e0d0f3aaba5908c912afb5",
+      "display_name": "   ",
+      "record_name_before": "iPhone 16",
+      "expected": "rejected",
+      "rule": "a blank name closes the session; the record keeps its name (section 4.3 item 4)",
+      "transport_profile": "fi.refineid.stream",
+      "grants_hash_hex": "dd0ba7729d3f131153151de6866d5b0f1cac0d09161b2c9843c30e7e6200b009",
+      "nonce_hex": "c2065ef51c3ed2b1077069bfd88eaa74c3310061ae7a37042022b1d0bfd46214",
+      "display_name_utf8_length": 3,
+      "record_name_after": "iPhone 16",
+      "record_rewritten": false,
+      "envelope_cbor_hex": "a564626f6479a3656e6f6e63655820c2065ef51c3ed2b1077069bfd88eaa74c3310061ae7a37042022b1d0bfd462146a706172616d6574657273a565737569746578204e6f6973655f4b4b5f32353531395f436861436861506f6c795f5348413531326776657273696f6e83181a0b026b6772616e74735f686173685820dd0ba7729d3f131153151de6866d5b0f1cac0d09161b2c9843c30e7e6200b0096c63616e6469646174655f69646673747265616d717472616e73706f72745f70726f66696c657266692e726566696e6569642e73747265616d6c646973706c61795f6e616d656320202064747970656d73657373696f6e2e72656164796776657273696f6e83181a0b026873657175656e6365006a73657373696f6e5f696450cdf395e1e1e0d0f3aaba5908c912afb5"
+    },
+    {
+      "name": "hello-same-name",
+      "message": "session.hello",
+      "session_id_hex": "cdf395e1e1e0d0f3aaba5908c912afb5",
+      "display_name": "macOS - example-host",
+      "record_name_before": "macOS - example-host",
+      "expected": "accepted",
+      "rule": "the requester's name in session.hello equals the record's (section 4.3 item 4)",
+      "display_name_utf8_length": 20,
+      "record_name_after": "macOS - example-host",
+      "record_rewritten": false,
+      "envelope_cbor_hex": "a564626f6479a16c646973706c61795f6e616d65746d61634f53202d206578616d706c652d686f737464747970656d73657373696f6e2e68656c6c6f6776657273696f6e83181a0b026873657175656e6365006a73657373696f6e5f696450cdf395e1e1e0d0f3aaba5908c912afb5"
+    },
+    {
+      "name": "hello-renamed",
+      "message": "session.hello",
+      "session_id_hex": "cdf395e1e1e0d0f3aaba5908c912afb5",
+      "display_name": "macOS - renamed-host",
+      "record_name_before": "macOS - example-host",
+      "expected": "accepted",
+      "rule": "a renamed computer's new name replaces the record's (section 4.3 item 4)",
+      "display_name_utf8_length": 20,
+      "record_name_after": "macOS - renamed-host",
+      "record_rewritten": true,
+      "envelope_cbor_hex": "a564626f6479a16c646973706c61795f6e616d65746d61634f53202d2072656e616d65642d686f737464747970656d73657373696f6e2e68656c6c6f6776657273696f6e83181a0b026873657175656e6365006a73657373696f6e5f696450cdf395e1e1e0d0f3aaba5908c912afb5"
+    },
+    {
+      "name": "hello-name-over-bound",
+      "message": "session.hello",
+      "session_id_hex": "cdf395e1e1e0d0f3aaba5908c912afb5",
+      "display_name": {
+        "text": "a",
+        "repeat": 257
+      },
+      "record_name_before": "macOS - example-host",
+      "expected": "rejected",
+      "rule": "a name over 256 bytes closes the session; the record keeps its name (section 7.1)",
+      "display_name_utf8_length": 257,
+      "record_name_after": "macOS - example-host",
+      "record_rewritten": false,
+      "envelope_cbor_hex": "a564626f6479a16c646973706c61795f6e616d65790101616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616164747970656d73657373696f6e2e68656c6c6f6776657273696f6e83181a0b026873657175656e6365006a73657373696f6e5f696450cdf395e1e1e0d0f3aaba5908c912afb5"
+    },
+    {
+      "name": "hello-name-missing",
+      "message": "session.hello",
+      "session_id_hex": "cdf395e1e1e0d0f3aaba5908c912afb5",
+      "display_name": null,
+      "record_name_before": "macOS - example-host",
+      "expected": "rejected",
+      "rule": "session.hello without display_name is an authenticated protocol violation (section 7.1)",
+      "display_name_utf8_length": null,
+      "record_name_after": "macOS - example-host",
+      "record_rewritten": false,
+      "envelope_cbor_hex": "a564626f6479a064747970656d73657373696f6e2e68656c6c6f6776657273696f6e83181a0b026873657175656e6365006a73657373696f6e5f696450cdf395e1e1e0d0f3aaba5908c912afb5"
+    }
+  ]
+}

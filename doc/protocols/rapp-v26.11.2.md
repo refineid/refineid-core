@@ -1,19 +1,19 @@
-# Remote Authorization Proxy Protocol (RAPP) v26.10.29
+# Remote Authorization Proxy Protocol (RAPP) v26.11.2
 ## Pairing and Session Protocol over the BLE and Stream Transports
 
 Status: Stamped specification, reviewed by the owner\
-Document version: 26.10.29\
-Wire version: `[26, 10, 29]` (`[Year, Month, Day]`)\
-Offer version: `[26, 10, 29]`\
+Document version: 26.11.2\
+Wire version: `[26, 11, 2]` (`[Year, Month, Day]`)\
+Offer version: `[26, 11, 2]`\
 Transport Profiles: `"fi.refineid.rapp.ble"`, `"fi.refineid.stream"` (§2.2)\
-Date: 2026-10-29\
+Date: 2026-11-02\
 Change controller: RefineID project
 
 ---
 
 ## Abstract
 
-This specification defines the pairing protocol and the operational protocol of the Remote Authorization Proxy Protocol (RAPP v26.10.29), carried over any registered transport profile (§2.2): the **Bluetooth Low Energy (BLE) Direct Proximity Transport Profile** (`"fi.refineid.rapp.ble"`) and the **Local Internet Protocol (IP) Stream Transport Profile** (`"fi.refineid.stream"`). Pairing, offer bootstrap, sessions, and operations are identical on every transport; only framing, routing, and discovery differ.
+This specification defines the pairing protocol and the operational protocol of the Remote Authorization Proxy Protocol (RAPP v26.11.2), carried over any registered transport profile (§2.2): the **Bluetooth Low Energy (BLE) Direct Proximity Transport Profile** (`"fi.refineid.rapp.ble"`) and the **Local Internet Protocol (IP) Stream Transport Profile** (`"fi.refineid.stream"`). Pairing, offer bootstrap, sessions, and operations are identical on every transport; only framing, routing, and discovery differ.
 
 A user's mobile device acts as the Custodian holding physical custody of the Finnish Electronic Identification (FINEID) identity card over Near Field Communication (NFC). The workstation acts as a Requester. On BLE the Custodian is the Generic Attribute Profile (GATT) Peripheral and the Requester the GATT Central. The Peripheral is the side that advertises, accepts the connection, and serves the data (the GATT Server); the Central is the side that scans, connects, and reads or writes that data (the GATT Client). On the stream transport the Custodian listens and the Requester dials.
 
@@ -27,26 +27,27 @@ To support upper-layer messages (such as X.509 certificate chains or document si
 
 ### 1.1 Scope and Standalone Specification Model
 
-This document defines the complete, standalone normative specification for the **Remote Authorization Proxy Protocol (RAPP) version 26.10.29**. It encompasses:
+This document defines the complete, standalone normative specification for the **Remote Authorization Proxy Protocol (RAPP) version 26.11.2**. It encompasses:
 - The **Transport Profile Registry** (§2.2) with the **BLE Transport Profile** (`"fi.refineid.rapp.ble"`) and the **Local IP Stream Transport Profile** (`"fi.refineid.stream"`).
 - The **pairing protocol** utilizing `CPaceRistretto255`, 6-character Crockford Base32 human factors, atomic attempt admission, and authenticated `Noise_XXpsk3` channel binding.
 - The **BLE SAR Adaptation Layer** with latched invariant total lengths and stop-and-wait flow control.
 - The **Authenticated Message Envelope**, sequential sequencing, and session multiplexing.
 - The **operation model** (§8): one operation at a time on the card, queued across sessions, forgotten with its session.
 - The **Registered Credential Profiles and Actions** for card status inspection, browser authentication, and qualified document signing.
-- **Service Withdrawal** (§4.5): the Custodian's notice, keyed by each pairing's static agreement, that it has stopped serving, on discovery and on open sessions, and the Requester's notice, on open sessions, that it has stopped using remote access.
-- **Pairing Storage Confirmation and Revocation** (§4.3, §4.6): each endpoint confirms its stored trust record before the pairing is active, an endpoint that forgets a pairing tells the other with a `pairing_revoked` close, in session or as the first message of the next session, and a pairing with no session for 30 days expires on each endpoint.
+- **Service Withdrawal** (§4.5): the Custodian's notice, keyed by each pairing's static agreement, that it has stopped serving, on discovery and on open sessions, and the Requester's notice, on open sessions, that it has stopped using remote access; how a Requester treats each way a session ends.
+- **Pairing Storage Confirmation and Revocation** (§4.3, §4.6): each endpoint confirms its stored trust record before the pairing is active, an endpoint that forgets a pairing tells the other with a `pairing_revoked` close, in session, as the first message of the next session or, on a Requester, in one bounded attempt, and a pairing with no session for 30 days expires on each endpoint.
+- **Lifecycle** (§4.7): the Requester's remote use and its view of the Custodian, and the Custodian's service and its view of each computer, as machines with a stated answer for every state and event, formalized in `rapp-state-machine-v26.11.2.yaml` and explained in `rapp-state-machine.md`.
 - **Card Presence** (§8.4): the Custodian's in-session notice of the card it holds and of whether a card reader is attached to it; a Requester's offer to local consumers follows the card, eventually consistent.
 - **Concurrent Multi-Client Serving** (§8): the Custodian serves every paired Requester over its own session; card operations are serialized on the single card.
 - The **Failure Semantics, Retry Protection, and PIN Contracts**.
 
-This document is completely self-contained: all normative schemas, protocol state machines, cryptographic bindings, error handling rules, and wire formats required to implement, verify, and audit RAPP v26.10.29 are defined herein.
+This document is completely self-contained: all normative schemas, protocol state machines, cryptographic bindings, error handling rules, and wire formats required to implement, verify, and audit RAPP v26.11.2 are defined herein.
 
 - **Migration and Compatibility**:
-  RAPP v26.10.29 runs the same pairing and session protocol over every registered transport profile (§2.2). Its wire and offer versions are `[26, 10, 29]` (`[Year, Month, Day]`). It does not interoperate with other RAPP versions. Implementations must conform strictly to the schemas and state machines defined in this standalone specification.
+  RAPP v26.11.2 runs the same pairing and session protocol over every registered transport profile (§2.2). Its wire and offer versions are `[26, 11, 2]` (`[Year, Month, Day]`). It does not interoperate with other RAPP versions. Implementations must conform strictly to the schemas and state machines defined in this standalone specification.
 - **Wire and Offer Versioning**:
-  - Offer version: `[26, 10, 29]` in `pairing-offer`.
-  - Wire version: `[26, 10, 29]` (`[Year, Month, Day]`) in channel envelopes, pairing context, and handshake prologues.
+  - Offer version: `[26, 11, 2]` in `pairing-offer`.
+  - Wire version: `[26, 11, 2]` (`[Year, Month, Day]`) in channel envelopes, pairing context, and handshake prologues.
 - **Role Mapping**:
   - **Requester**: Corresponds to the RAPP Requester. On BLE it operates as GATT Client (Central); on the stream transport it dials the Custodian.
   - **Custodian**: Corresponds to the mobile device acting as the RAPP Authorization Proxy while holding exclusive physical NFC custody of the Credential Holder (FINEID Card). On BLE it operates as GATT Server (Peripheral); on the stream transport it listens.
@@ -55,8 +56,8 @@ This document is completely self-contained: all normative schemas, protocol stat
 
 ### 1.2 Terminology and Requirements Language
 
-* **Custodian**: the server. The mobile phone that holds the identity card over NFC and serves it to its clients. In BLE topology, the Custodian operates as the **GATT Server (Peripheral)**.
-* **Requester**: the client. The computer that asks the Custodian for authentication or qualified signatures. In BLE topology, the Requester operates as the **GATT Client (Central)**.
+* **Custodian**: the server. A mobile phone with NFC (an iPhone or an Android phone) that holds the identity card over NFC and serves it to its clients. In BLE topology, the Custodian operates as the **GATT Server (Peripheral)**.
+* **Requester**: the client. A computer (macOS, Windows, Linux or BSD), an iPad or an Android tablet that asks the Custodian for authentication or qualified signatures. A tablet is a Requester only: it uses a card in a reader attached to it or a phone's card over RAPP, and never serves a card. In BLE topology, the Requester operates as the **GATT Client (Central)**.
 * **Crockford Base32 Code**: A 6-character human-readable alphanumeric code sampled uniformly from Crockford's unambiguous Base32 alphabet.
 
 ---
@@ -65,8 +66,8 @@ This document is completely self-contained: all normative schemas, protocol stat
 
 ### 2.1 Transport Architecture & Protocol Lifecycle
 
-- **Wire Version**: `[26, 10, 29]` (`[Year, Month, Day]`)
-- **Offer Version**: `[26, 10, 29]`
+- **Wire Version**: `[26, 11, 2]` (`[Year, Month, Day]`)
+- **Offer Version**: `[26, 11, 2]`
 - **Transport Profiles**: registered in §2.2
 
 The transport acts as the underlying point-to-point bearer for RAPP frames. CPace establishes the 32-byte pre-shared key (PSK) that seeds mutual pairing authentication (`Noise_XXpsk3`), replay protection, monotonic sequence counters, and typed at-most-once operation dispatch. Every phase below runs unchanged on every registered transport profile; "transport frame" means one SAR-reassembled message on BLE (§5.3) and one length-prefixed frame on the stream transport (§2.2.2).
@@ -75,7 +76,7 @@ The transport acts as the underlying point-to-point bearer for RAPP frames. CPac
 - **Phase 0: Routing**: Every connection starts with exactly one routing preamble transport frame from the Requester (§2.2). For purpose `"pairing"` with an active offer, the connection proceeds to the offer bootstrap. For purpose `"session"` whose routing tag a stored pairing keyed (§2.2.1), the connection transitions to the Noise session phase.
 - **Phase 1: Offer Bootstrap**: The Requester obtains the canonical `pairing-offer`, carrying a fresh random 32-byte `offer_id`, the CPace session identifier (SID), over the transport in use (§4.2): on BLE by reading the Bootstrap Characteristic, on the stream transport as the Custodian's first transport frame after the pairing preamble. Both peers compute the canonical `offer_hash` and bind the transport entry of the offer that names the transport profile in use.
 - **Phase 2: CPace Key Agreement & Confirmation**: Execute the `CPaceRistretto255` key confirmation variant 2 (KC2) profile, one transport frame per CPace message, with Context $C$ binding, mutually authenticating via Hash-based Message Authentication Code (HMAC) tags $T_B$ and $T_A$ to establish $PSK$ via HMAC-based Key Derivation Function (HKDF)-Expand. On success, transition to the Noise pairing phase and consume the offer.
-- **Phase 3: Noise_XXpsk3 Pairing**: Perform the authenticated pairing handshake with prologue bound to canonical `offer_hash`, wire version `[26, 10, 29]`, suite, and the transport profile in use. Immediately on handshake completion, derive pairing-channel `session_id` and `pair_id`. Exchange `pairing.hello` (parameter echo using `session_id`) and `pairing.confirm` (capability grants), deriving `grants_hash`.
+- **Phase 3: Noise_XXpsk3 Pairing**: Perform the authenticated pairing handshake with prologue bound to canonical `offer_hash`, wire version `[26, 11, 2]`, suite, and the transport profile in use. Immediately on handshake completion, derive pairing-channel `session_id` and `pair_id`. Exchange `pairing.hello` (parameter echo using `session_id`) and `pairing.confirm` (capability grants), deriving `grants_hash`.
 - **Phase 4: Pair Storage and Confirmation**: Atomically store the pairing trust record (`pair_id`, `grants_hash`, peer static public key, and local private key), then send `pairing.stored`. The pairing is active on an endpoint only once it has both stored its record and received the peer's `pairing.stored` (§4.3). A stored pairing is not bound to the transport it was created on; sessions may use any registered transport.
 - **Subsequent Operational Sessions**: Operational connections start in the Routing phase, route by a fresh routing tag (§2.2.1), and open a fresh `Noise_KK` session with an independent operational `session_id`, bound to the transport profile of that connection.
 
@@ -136,7 +137,7 @@ The Custodian routes a `"session"` preamble as follows:
 2. On no match the Custodian closes the connection without changing stored state.
 3. On a match it consults its replay memory: the nonces of the 256 most recently routed sessions. A nonce already there closes the connection; otherwise the nonce is added, displacing the oldest, and the connection proceeds to the Noise session phase for the matched pairing.
 
-A preamble that does not decode, names another profile's domain, carries an unregistered purpose, a non-empty value with `"pairing"`, or a value other than 32 bytes with `"session"` closes the connection (§10.1) without changing stored state. An encoded preamble longer than 64 bytes is rejected before parsing. A `"session"` preamble encodes to 55 bytes on the stream transport and 52 bytes on BLE. The `routing_tag` and `routing_preamble` vectors of `vectors/rapp-routing-v26.10.29.json` pin the bytes.
+A preamble that does not decode, names another profile's domain, carries an unregistered purpose, a non-empty value with `"pairing"`, or a value other than 32 bytes with `"session"` closes the connection (§10.1) without changing stored state. An encoded preamble longer than 64 bytes is rejected before parsing. A `"session"` preamble encodes to 55 bytes on the stream transport and 52 bytes on BLE. The `routing_tag` and `routing_preamble` vectors of `vectors/rapp-routing-v26.11.2.json` pin the bytes.
 
 The routing tag only selects a pairing; it authenticates nothing. Authentication is established exclusively by the `Noise_KK` handshake that follows.
 
@@ -241,7 +242,7 @@ The Custodian must:
 
 ### 4.2 Bootstrap Discovery & PairingOffer Schema
 
-The Custodian creates the `pairing-offer` when the user starts a pairing ceremony and serves it on every transport it accepts pairing connections on.
+The Custodian creates the `pairing-offer` when the user starts a pairing ceremony and serves it on every transport it accepts pairing connections on. The Custodian offers its user the start of a ceremony only while its remote access is on and it serves in the foreground. Offering a pairing does not end its service: its sessions stay open and it routes new session connections as before (§8.3).
 
 The SID used in CPace must be an independent 32-byte cryptographic random value (`offer_id`) generated by the Custodian upon creating the offer, on every transport. It must not be derived from the pairing code. The Requester never derives an offer; it always obtains it through the offer bootstrap of the transport in use.
 
@@ -249,7 +250,7 @@ The SID used in CPace must be an independent 32-byte cryptographic random value 
 ```cddl
 pairing-offer = {
   "scheme": "rapp",
-  "version": [26, 10, 29],       ; offer version triple
+  "version": [26, 11, 2],       ; offer version triple
   "offer_id": bstr .size 32,    ; 32-byte cryptographic random SID
   "suites": [
     "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512"
@@ -276,7 +277,7 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
 ```cddl
 pairing-busy = {
   "scheme": "rapp",
-  "version": [26, 10, 29],       ; offer version triple
+  "version": [26, 11, 2],       ; offer version triple
   "retry_after_ms": 1..5000,     ; milliseconds until the Custodian can admit an attempt
 }
 ```
@@ -285,7 +286,7 @@ The bootstrap answer of a Custodian in pairing mode is `pairing-offer` while it 
 #### Bootstrap Read Flow:
 1. **BLE**: the Custodian exposes the **RAPP Bootstrap Characteristic** (`7E39FD03-A6B5-4D78-9E11-37E28E9545F1`, Read-only). The Requester connects, sends the `"pairing"` routing preamble (§5.2), and performs an `ATT_READ_REQ` on this characteristic to obtain `encode_deterministic_cbor(pairing-offer)`, or `encode_deterministic_cbor(pairing-busy)` while the Custodian cannot admit an attempt.
 2. **Stream**: after receiving the `"pairing"` routing preamble, the Custodian sends `encode_deterministic_cbor(pairing-offer)`, or `encode_deterministic_cbor(pairing-busy)` while it cannot admit an attempt, as its first transport frame; after `pairing-busy` it closes the connection. A Custodian with no active offer closes the connection instead.
-3. The Requester decodes the bootstrap answer. A `pairing-busy` is a busy refusal ("Busy Refusal" below). An offer is rejected unless it is deterministic CBOR matching the schema, carries version `[26, 10, 29]`, lists an acceptable suite, and contains a `transports` entry whose `profile` is the transport profile of the connection. Unsupported suites terminate the pairing flow immediately before CPace; automatic downgrade or fallback to unconfirmed legacy suites is strictly prohibited.
+3. The Requester decodes the bootstrap answer. A `pairing-busy` is a busy refusal ("Busy Refusal" below). An offer is rejected unless it is deterministic CBOR matching the schema, carries version `[26, 11, 2]`, lists an acceptable suite, and contains a `transports` entry whose `profile` is the transport profile of the connection. Unsupported suites terminate the pairing flow immediately before CPace; automatic downgrade or fallback to unconfirmed legacy suites is strictly prohibited.
 4. Both peers bind the `candidate_id` of that entry and the connection's transport profile (§4.3, §6.1.1), use `offer_id` as SID for CPace, and compute `offer_hash` for the Noise pairing prologue.
 5. A deterministic encoding of `pairing-offer` with the KC2 suite, the three registered profiles, and both transport entries stays within the 509-byte ATT value capacity at the minimum ATT Maximum Transmission Unit (MTU) of 512.
 
@@ -312,13 +313,13 @@ A `mode=pairing` record and a BLE advertisement carry nothing derived from the c
    ```cddl
    pairing-prologue = [
      "rapp-pairing",
-     [26, 10, 29],                                                         ; wire version [Year, Month, Day]
+     [26, 11, 2],                                                         ; wire version [Year, Month, Day]
      "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512", ; cryptographic suite name
      bstr .size 32,                                                       ; offer_hash
      tstr                                                                 ; transport profile of the connection (§2.2)
    ]
    ```
-   $$\text{prologue} = \text{encode\_deterministic\_cbor}(\text{pairing-prologue}) \quad (146\text{ bytes on BLE, 144 bytes on stream})$$
+   $$\text{prologue} = \text{encode\_deterministic\_cbor}(\text{pairing-prologue}) \quad (145\text{ bytes on BLE, 143 bytes on stream})$$
 
 2. **Immediate Channel Identifier Derivation**:
    Immediately upon completing the `Noise_XXpsk3` handshake, both peers derive the channel identifiers from the completed handshake hash $h$ in strict order:
@@ -330,8 +331,10 @@ A `mode=pairing` record and a BLE advertisement carry nothing derived from the c
    The derived `session_id` immediately scopes the pairing-channel envelopes for `pairing.hello` and `pairing.confirm`.
 
 3. **Parameter Echo & Mutual Grants**:
-   - Inside the established pairing channel, peers exchange `pairing.hello`.
-   - `pairing.hello` echoes `offer_hash`, the bound transport profile and `candidate_id` (§4.2), wire version `[26, 10, 29]`, suite name, display name, platform description, and requester's requested profiles.
+   - Inside the established pairing channel, each peer sends `pairing.hello`.
+   - `pairing.hello` echoes `offer_hash`, the bound transport profile and `candidate_id` (§4.2), wire version `[26, 11, 2]`, suite name, the sender's display name, its platform description, and, from the Requester, its requested profiles.
+   - **Display name**: every `pairing.hello` carries the sender's display name, the name the peer shows for it (§11 item 1). It is required and not blank: 1 to 256 bytes of UTF-8 holding at least one character that is not white space (§7.1); a `pairing.hello` without one aborts the pairing with an authenticated protocol violation. A name that already says the platform carries no operating-system prefix; any other name is prefixed by the operating system's own name, joined by a space, a hyphen and a space (`<operating system> - <name>`). A computer names itself by its host name with the prefix: `macOS - example-host`, `Windows - EXAMPLE-HOST`, `Linux - example-host`, `FreeBSD - example-host`. An iPhone and an iPad name themselves without a prefix, by the name their user gave them where the platform lets the application read it and by their model name otherwise: `iPhone 16`, `iPad Pro 11-inch (M4)`. An Android tablet names itself with the prefix, `Android - Example Tablet`, and an Android phone by its device name without a prefix: the name its user gave it where the platform lets the application read it, and its model name otherwise. A sender whose name would be longer than 256 bytes shortens the device's name at a character boundary until it fits. The `platform` field names the sender's operating system, likewise 1 to 256 bytes and not blank. The operating system's name is its own: `macOS`, `Windows`, `Linux`, `FreeBSD`, `OpenBSD`, `iPadOS`, `Android`. The name is sent again at the start of every session (§7.1, `session.ready` and `session.hello`), so a renamed device's new name reaches its peer with its next session.
+   - **Names identify nothing**: a display name is a label for people. No endpoint finds, matches, replaces or revokes a pairing by its display name, its platform or anything else the peer says about itself; a pairing is known only by its `pair_id` and keys.
    - Custodian verifies matching echoes. Any mismatch aborts with an authenticated protocol violation.
    - The Custodian automatically grants the valid requested profiles matching its pairing offer (since possession and entry of the 30-bit pairing code constitutes user authorization), and transmits `pairing.confirm` carrying granted profiles. Requester echoes and confirms. Both granted sets must be identical.
    - Derive `grants_hash` from the confirmed, canonically sorted grant set:
@@ -346,6 +349,10 @@ A `mode=pairing` record and a BLE advertisement carry nothing derived from the c
      - `grants_hash` and confirmed granted profiles
      - Remote peer's static public key
      - Local static private key
+     - The peer's display name from its `pairing.hello`
+   - The display name is part of the record: it is stored and destroyed with the record in one commit, so a record has a name for its whole life.
+   - **Keeping the name current**: on every session the Custodian sends its current display name in `session.ready` and the Requester sends its own in `session.hello` (§7.1). The receiver checks the name as at pairing (item 3); a missing, blank or over-long name is an authenticated protocol violation that closes the session and keeps the pairing (§10.1 item 2). A valid name that differs from the one in the pair record replaces it there, atomically. If that store fails, the record keeps its old name and the session goes on; the next session tries again.
+   - If the store fails, as on a full disk or a key store that refuses, nothing is stored: the endpoint sends no `pairing.stored`, sends `pairing.abort`, destroys the candidate keys, closes the connection and tells its user that the pairing could not be stored, with the cause its platform gives. A peer that stored its record revokes it at the deadline below.
    - Once its record is durably stored, each endpoint sends `pairing.stored` carrying the derived `pair_id` (§7.1). An endpoint treats the pairing as active only after it has both stored its own record and received the peer's `pairing.stored`; until then it neither routes nor dials for the pairing, and announces it in no discovery or withdrawal record. The stored record carries whether the peer confirmed it, and the endpoint rewrites the record as confirmed when the peer's `pairing.stored` arrives: a record found unconfirmed at a later start was stored inside a confirmation window the endpoint did not complete, and the endpoint revokes it (§4.6) before serving anything. A `pairing.stored` whose `pair_id` differs from the derived one aborts the pairing: the endpoint revokes the record it stored (§4.6). If the deadline of §3.3 item 7 passes without the peer's `pairing.stored`, the endpoint revokes the record it stored (§4.6), so a pairing that only one side holds does not survive.
    - The pairing channel is cleanly closed once both `pairing.stored` messages have been exchanged.
 
@@ -359,13 +366,13 @@ A `mode=pairing` record and a BLE advertisement carry nothing derived from the c
      ```text
      K_x = HKDF-SHA-256(salt = pair_id, IKM = X25519(local static private, peer static public), info, L = 32)
      ```
-     with `info` `"rapp-routing"` for routing tags (§2.2.1), `"rapp-discovery-hint"` for discovery hints (hierarchy specification §4.3), and `"rapp-withdrawal"` for withdrawal hints (§4.5). Both endpoints obtain the same agreement from their own private key and the peer's public key. An agreement equal to the identity point yields no key; such a pairing is never announced or routed. The `pair_keys` vectors of `vectors/rapp-routing-v26.10.29.json` pin the keys.
+     with `info` `"rapp-routing"` for routing tags (§2.2.1), `"rapp-discovery-hint"` for discovery hints (hierarchy specification §4.3), and `"rapp-withdrawal"` for withdrawal hints (§4.5). Both endpoints obtain the same agreement from their own private key and the peer's public key. An agreement equal to the identity point yields no key; such a pairing is never announced or routed. The `pair_keys` vectors of `vectors/rapp-routing-v26.11.2.json` pin the keys.
    - **Routing privacy**: A routing tag is fresh for every connection and computationally unlinkable without `K_route`, so an observer of preambles cannot tell whether two connections belong to the same pairing, and no routing value recurs. A replayed preamble is refused in the Routing phase while its nonce is in the Custodian's replay memory; a preamble replayed after its nonce has left the memory reaches `Noise_KK` message 1, which the replaying party cannot complete. That timing difference reveals only that some stored pairing once routed that preamble, which the observer already saw; it is mitigated by single-flight connection serialization and the pre-authentication limiter (§3.3).
    - Session Prologue:
      ```cddl
      session-prologue = [
        "rapp-session",
-       [26, 10, 29],                                                         ; wire version [Year, Month, Day]
+       [26, 11, 2],                                                         ; wire version [Year, Month, Day]
        "Noise_KK_25519_ChaChaPoly_SHA512",                              ; suite name
        pair_id,                                                         ; bstr .size 16
        grants_hash,                                                     ; bstr .size 32
@@ -383,7 +390,7 @@ A transparent radio frequency (RF) relay that forwards packets between distant r
 
 ### 4.5 Service Withdrawal
 
-An endpoint **withdraws** when it deliberately stops serving, or stops using, remote access for every stored pairing and keeps the pairings. A Custodian withdraws when its user turns remote access off or quits the application. A Requester withdraws when a card in a reader attached to the computer suspends remote use (hierarchy specification §5.2), and when its user quits the application. Nothing else is withdrawal: suspension or termination by the operating system, sleep, loss of the network, and a session restart with reason `"normal"` or `"shutdown"` (§7.2) are not, and a Requester's user turning remote use off forgets its pairings, which is revocation (§4.6). Withdrawal revokes no pairing; a Custodian serves again with its next `mode=session` advertisement, and a Requester dials again once the card that suspended remote use leaves the reader or, after it quit, at its next launch. Items 1 to 7 are the Custodian's withdrawal and how a Requester receives it; items 8 and 9 are the Requester's withdrawal and how a Custodian receives it.
+An endpoint **withdraws** when it deliberately stops serving, or stops using, remote access for every stored pairing and keeps the pairings. A Custodian withdraws when its user turns remote access off or quits the application. A Requester withdraws when a card in a reader attached to the computer suspends remote use (hierarchy specification §5.2), and when its user quits the application. Nothing else is withdrawal: suspension or termination by the operating system, sleep, loss of the network, and a session restart with reason `"normal"` or `"shutdown"` (§7.2) are not, and a Requester's user turning remote use off forgets its pairing, which is revocation (§4.6). Withdrawal revokes no pairing; a Custodian serves again with its next `mode=session` advertisement, and a Requester dials again once the card that suspended remote use leaves the reader or, after it quit, at its next launch. A Custodian whose user turns remote access on again serves at once: it registers its stream service under a fresh instance name (hierarchy specification §4.2) with the `mode=session` record and advertises over BLE, whether or not a withdrawal is still being announced, with every pairing it kept. Items 1 to 7 are the Custodian's withdrawal and how a Requester receives it; items 8 and 9 are the Requester's withdrawal and how a Custodian receives it.
 
 1. **Withdrawal Key**:
    Each stored pairing has a withdrawal key that both endpoints derive from their static keys, the static agreement $S$ serving as the IKM, and that never crosses the wire:
@@ -393,14 +400,16 @@ An endpoint **withdraws** when it deliberately stops serving, or stops using, re
 
 2. **Withdrawal Hint**:
    $$\text{whint} = \text{first 8 bytes of }\text{HMAC-SHA-256}(K_{\text{wd}}, \text{len} \parallel \text{instance} \parallel \text{counter\_be64})$$
-   where $\text{instance}$ is the instance portion of the DNS-SD service instance name the Custodian publishes ([RFC 6763](https://www.rfc-editor.org/rfc/rfc6763.html) §4.1): the name exactly as published, without the service type (`_refineid-stream._tcp`) and the domain (`local.`), as UTF-8 octets, 1 to 63 octets (hierarchy specification §4.2). Instance names may contain dots; a value ending in a service type or domain suffix is a misuse and is refused. $\text{len}$ is its length as one octet, and $\text{counter} = \lfloor \text{unix\_time} / 60 \rfloor$ as an unsigned 64-bit big-endian integer. The `withdrawal_key` and `withdrawal_hint` vectors of `vectors/rapp-withdrawal-v26.10.29.json` pin the bytes.
+   where $\text{instance}$ is the instance portion of the DNS-SD service instance name the Custodian publishes ([RFC 6763](https://www.rfc-editor.org/rfc/rfc6763.html) §4.1): the name exactly as published, without the service type (`_refineid-stream._tcp`) and the domain (`local.`), as UTF-8 octets, 1 to 63 octets (hierarchy specification §4.2). Instance names may contain dots; a value ending in a service type or domain suffix is a misuse and is refused. $\text{len}$ is its length as one octet, and $\text{counter} = \lfloor \text{unix\_time} / 60 \rfloor$ as an unsigned 64-bit big-endian integer. The `withdrawal_key` and `withdrawal_hint` vectors of `vectors/rapp-withdrawal-v26.11.2.json` pin the bytes.
 
 3. **Custodian Order**:
    On withdrawal the Custodian, in this order:
-   1. sends `session.close` with reason `"service_withdrawn"` (§7.1) on every open operational session and closes its link;
+   1. sends `session.close` with reason `"service_withdrawn"` (§7.1) on every open operational session, waits at most 1 second (`quit_withdrawal_bound_ms`) for each Requester's echo of it (§7.1 item 7), and closes its link;
    2. stops accepting connections;
-   3. replaces the TXT record of its current `_refineid-stream._tcp` service instance with the withdrawn record (item 4);
+   3. replaces the TXT record of its current `_refineid-stream._tcp` service instance with the withdrawn record (item 4), in place, without unregistering the instance first;
    4. unregisters the service after at least 2 and at most 10 seconds.
+
+   It stops advertising over BLE when it stops accepting connections.
 
    Withdrawal ends every session, and with it every operation, as §8.1 item 3 says.
 
@@ -421,45 +430,70 @@ An endpoint **withdraws** when it deliberately stops serving, or stops using, re
    - **Open session first.** While the Requester holds an established session to the pairing, discovery records do not change its presence. An authenticated `session.close` with reason `"service_withdrawn"` is a **verified withdrawal**; any other close reason, or loss of the session, is not.
    - **Discovery.** Without an open session, a Requester honours a withdrawn record only on the service instance it currently associates with the pairing: the instance whose discovery hint matched the pairing, or the instance it last established a session to. It parses the record and computes the pairing's hint for that instance and for $\text{counter} - 1$, $\text{counter}$ and $\text{counter} + 1$ of its own clock, comparing every entry in constant time. A match is a **verified withdrawal**. Because the window is one counter step either side of $\lfloor t/60 \rfloor$, it tolerates a clock difference of at least 60 seconds and, depending on where both times fall within their minutes, up to just under 120 seconds. Implementations must not widen it.
    - **Malformed records.** A record with a key other than `v`, `mode` and `withdrawn` (in any case), a repeated key (in any case), a `v` other than `1`, a `mode` other than `withdrawn`, or a `withdrawn` value that is not exactly 8 lowercase 16-digit entries is malformed, as is a `hints` attribute beside `withdrawn`.
-   - **Effect.** On a verified withdrawal the Requester withdraws the pairing's presence at once: it stops offering the Custodian's credentials to local consumers and does not dial the Custodian again until it discovers it in `mode=session` or sees its BLE advertisement. It changes no stored pairing state and shows no error.
-   - **Unannounced loss.** A malformed record, a withdrawn record without a match, a record on another instance, or a service that disappears without one is unannounced loss; the Requester applies its own hold before withdrawing presence, so that a brief discovery gap does not withdraw a Custodian that is still serving.
-
+   - **Effect.** On a verified withdrawal the Requester withdraws the pairing's presence at once: it stops offering the Custodian's credentials to local consumers, drops any dial being set up, and neither dials, offers nor holds anything for the Custodian until the Custodian announces itself again: a `mode=session` record for the pairing appears (§8.3), or the RAPP BLE advertisement is first seen after the withdrawal. While withdrawn it may scan for BLE passively; seeing an advertisement that was already in sight is not an announcement. A local consumer that asks for the card meanwhile is answered at once that no remote card is available, and nothing is dialed. The withdrawn record's later unregistration announces nothing. The Requester changes no stored pairing state and shows no error.
+   - **Unannounced loss.** A malformed record, a withdrawn record without a match, a record on another instance, or a service that disappears without one is unannounced loss: it withdraws nothing, and the Requester goes on as the next item says.
+   - **How a session ends.** A Requester treats the end of a session to the pairing by what ended it:
+     1. A `session.close` with reason `"pairing_revoked"` received (§4.6 item 4), or the Requester's own revocation close sent (§4.6 items 1 and 6): the Requester forgets the pairing.
+     2. A `session.close` with reason `"service_withdrawn"` received: a verified withdrawal, with the effect above. A `session.close` with reason `"card_unavailable"` has the same effect (§8.4 item 5): the Requester drops the Custodian's identity at once, without the grace of §8.4 item 3, never offering a certificate whose key cannot be used, and waits for the Custodian to announce itself again.
+     3. An authenticated protocol violation, the Custodian's `session.close` with reason `"protocol_violation"` or one the Requester detects and closes with (§10.1 item 2): the Requester keeps the pairing and does not redial; it dials again only when the Custodian next appears (§8.3) or a local consumer asks. A version mismatch is the likely cause, which an update of either endpoint may fix.
+     4. Anything else, a loss of the session (transport close, the silence limit of §8.3, an AEAD or framing failure) or a close with reason `"normal"`, `"complete"`, `"user_disconnect"`, `"policy"` or `"shutdown"`: a **loss**. A loss opens the redial window of §8.3 at once, whether or not the Custodian is still in sight; its redials go to the endpoint the Requester last reached or to a BLE scan. What the user sees after a loss comes only from the offer to local consumers, which follows §8.4 item 3.
 7. **Authenticity and Replay**:
-   Only the two endpoints of a pairing know its static agreement, so no other party can compute a withdrawal hint; observing sessions, routing preambles or discovery records does not help. A party on the local link that recorded a genuine withdrawn record can republish it under the same instance name for at most about three minutes (the counter window), and only while the Requester still associates that instance with the pairing; instance names are fresh on every advertisement start (hierarchy specification §4.2). The effect is the same as a spoofed multicast DNS (mDNS) goodbye without the Requester's hold: presence is withdrawn until the Custodian is next discovered. These bounds assume the Requester's clock is not under the attacker's control; an attacker who can move the Requester's time, for example through an unauthenticated Network Time Protocol (NTP) source, can stretch the replay window for as long as it controls that clock, with the same effect and no other. Random fillers keep the record the same size whatever the number of stored pairings, and the hints are unlinkable across instances and minutes.
+   Only the two endpoints of a pairing know its static agreement, so no other party can compute a withdrawal hint; observing sessions, routing preambles or discovery records does not help. A party on the local link that recorded a genuine withdrawn record can republish it under the same instance name for at most about three minutes (the counter window), and only while the Requester still associates that instance with the pairing; instance names are fresh on every advertisement start (hierarchy specification §4.2). The effect is the same as a spoofed multicast DNS (mDNS) goodbye: presence is withdrawn until the Custodian is next discovered. These bounds assume the Requester's clock is not under the attacker's control; an attacker who can move the Requester's time, for example through an unauthenticated Network Time Protocol (NTP) source, can stretch the replay window for as long as it controls that clock, with the same effect and no other. Random fillers keep the record the same size whatever the number of stored pairings, and the hints are unlinkable across instances and minutes.
 
 8. **Requester Withdrawal**:
    On withdrawal the Requester, in this order:
-   1. sends `session.close` with reason `"service_withdrawn"` (§7.1) on every open operational session, one whose `session.ready` it verified, and closes its link; a connection whose session is not yet open it closes without a notice;
+   1. sends `session.close` with reason `"service_withdrawn"` (§7.1) on every open operational session, one whose `session.ready` it verified, waits for each Custodian's echo of it as §7.1 item 7 says, and closes its link; a connection whose session is not yet open it closes without a notice;
    2. stops dialing and browsing for every pairing; a Requester that a local card suspended resumes once the card leaves the reader. Hierarchy specification §5.2 lists what else a workstation stops.
 
    It keeps every stored pairing. A Requester publishes no discovery record and no BLE advertisement, so it announces nothing else. Withdrawal ends every session, and with it every operation, as §8.1 item 3 says.
 
-   Quitting is best effort: a Requester that quits sends its closes before it exits and waits at most 1 second for them to leave, written to the stream connection or, on BLE, acknowledged by each write's response. A close that has not left by then is dropped, and the Custodian sees that session as lost.
+   Quitting is best effort: a Requester that quits sends its closes before it exits and waits at most 1 second for the Custodians' echoes (§7.1 item 7). A close not echoed by then is not known to have been delivered: the Requester exits all the same, and a Custodian the close did not reach sees that session as lost.
 
 9. **Custodian Behavior**:
-   An authenticated `session.close` with reason `"service_withdrawn"` from a Requester is that Requester's **withdrawal**; any other close reason, or loss of the session, is not. Both endpoints send this reason, and receiving it is never a protocol violation; only the paired Requester can send it, inside the session's authenticated channel. The Custodian closes that session without a close of its own, keeps the pairing, and records that the computer withdrew. Its user interface may show that computer as off, not merely disconnected, until the next session from that pairing, and shows no error. It goes on serving every pairing, that one included, and accepts the Requester's next dial as any other.
+   An authenticated `session.close` with reason `"service_withdrawn"` from a Requester is that Requester's **withdrawal**; any other close reason, or loss of the session, is not. Both endpoints send this reason, and receiving it is never a protocol violation; only the paired Requester can send it, inside the session's authenticated channel. The Custodian answers with its own `session.close` carrying `"service_withdrawn"` (§7.1 item 7) and closes that session, keeps the pairing, and records that the computer withdrew. Its user interface may show that computer as off, not merely disconnected, until the next session from that pairing, and shows no error. It goes on serving every pairing, that one included, and accepts the Requester's next dial as any other.
 
 ### 4.6 Pairing Revocation
 
-An endpoint **revokes** a pairing when its user forgets it, when the pairing expires (item 5), when a pairing fails after its record was stored (§4.3), when the confirmation deadline of §4.3 item 4 passes, or when its peer tells it so. A Requester's user forgets its pairings by turning remote use off (item 6). The record is marked revoked at once and serves nothing from then on. Whichever endpoint revokes, Custodian or Requester, tells the other with `session.close` carrying reason `"pairing_revoked"` (§7.1), so that the peer forgets the pairing on its side too, except as items 3 and 6 say:
+An endpoint **revokes** a pairing when its user forgets it, when the pairing expires (item 5), when a pairing fails after its record was stored (§4.3), when the confirmation deadline of §4.3 item 4 passes, or when its peer tells it so. A Requester holds at most one pairing; its user forgets it by turning remote use off, and by pairing another Custodian, which replaces it (item 6). The record is marked revoked at once and serves nothing from then on. Whichever endpoint revokes, Custodian or Requester, tells the other with `session.close` carrying reason `"pairing_revoked"` (§7.1), so that the peer forgets the pairing on its side too, except as items 3 and 6 say:
 
 1. **In Session**:
    If the revoking endpoint holds an open session to the peer, it sends the close at once.
 
 2. **On the Next Session**:
-   Otherwise the endpoint keeps the static private key for the close alone. A Custodian goes on announcing the pairing's discovery hint (hierarchy specification §4.3) and a Requester goes on dialing when the hint is in sight while its remote use is on (hierarchy specification §5.2), as if nothing had changed; on the next session with the peer the revoking endpoint completes the handshake of §6.3, sends the close as its first message, and no card session starts.
+   Otherwise the endpoint keeps the static private key for the close alone. A Custodian goes on announcing the pairing's discovery hint (hierarchy specification §4.3) as if nothing had changed, and a Requester makes one bounded attempt (item 6); on the next session with the peer the revoking endpoint completes the handshake of §6.3, sends the close as its first message, waits for the peer's echo as §7.1 item 7 says, and no card session starts.
 
 3. **Key Destruction**:
-   The static private key is destroyed once the close has been sent, or 30 days after the revocation, whichever comes first. A pairing not yet confirmed, and a revocation the confirmation deadline causes, destroy the key at once and tell nobody; turning remote use off destroys it as item 6 says.
+   The static private key is destroyed once the close has been sent and the wait for its echo has ended (§7.1 item 7), or, on a Custodian, 30 days after the revocation (`revocation_notice_days`), whichever comes first; a Requester destroys it as item 6 says. A pairing not yet confirmed, and a revocation the confirmation deadline causes, destroy the key at once and tell nobody.
 
 4. **Receiving the Close**:
-   An endpoint that receives `session.close` with reason `"pairing_revoked"` at any point of a session revokes the pairing at once, destroys its key, withdraws any identity it offers for the pairing (§8.4), answers with no close of its own, and closes the transport.
+   An endpoint that receives `session.close` with reason `"pairing_revoked"` at any point of a session revokes the pairing at once, destroys its key, withdraws any identity it offers for the pairing (§8.4), answers with its own `session.close` carrying `"pairing_revoked"` (§7.1 item 7), and closes the transport. That echo tells the revoking endpoint that its peer forgot the pairing.
 
 5. **Idle Expiry**:
-   A pairing that has had no established session for 30 days (`pairing_idle_expiry_days`) expires. A session is established from the moment the Custodian sends, or the Requester verifies, its `session.ready` until it ends. Each endpoint keeps with the stored pairing the latest wall-clock time at which it had a session to the pairing established, noting it at least when a session is established and when it ends; an earlier reading, as from a clock set back, does not replace a later one, and while the pairing has had none, that time is its creation. The endpoint revokes the pairing once that time is 30 days past. A pairing never expires while a session to it is established: every check for expiry takes whether a session to the pairing is established, and with one it notes the time instead. Custodian and Requester apply this each on its own, by their own clocks, and check for expiry when they start and at least once a day while they run. Expiry is silent: nothing is sent at that moment, since the peer has been out of reach, and no user is interrupted. Items 2 to 4 then apply as to any revocation, so a peer that opens a session within the notice window receives the `pairing_revoked` close. Idle expiry is also how a Custodian forgets a Requester that forgot the pairing while no session was open (item 6).
+   A pairing that has had no established session for 30 days (`pairing_idle_expiry_days`) expires. A session is established from the moment the Custodian sends, or the Requester verifies, its `session.ready` until it ends. Each endpoint keeps with the stored pairing the latest wall-clock time at which it had a session to the pairing established, noting it at least when a session is established and when it ends; an earlier reading, as from a clock set back, does not replace a later one, and while the pairing has had none, that time is its creation. The endpoint revokes the pairing once that time is 30 days past. A pairing never expires while a session to it is established: every check for expiry takes whether a session to the pairing is established, and with one it notes the time instead. Custodian and Requester apply this each on its own, by their own clocks, and check for expiry when they start and at least once a day while they run. Expiry is silent: nothing is sent at that moment, since the peer has been out of reach, and no user is interrupted. On a Custodian items 2 to 4 then apply as to any revocation, so a Requester that opens a session within the notice window receives the `pairing_revoked` close; a Requester destroys the key of an expired pairing at once (item 6). Idle expiry is also how a Custodian forgets a Requester whose revocation attempt did not reach it (item 6).
 
-6. **Remote Use Off**:
-   A Requester's user forgets every pairing the Requester holds by turning remote use off (hierarchy specification §5.2). On every open session the Requester sends the close as item 1 says and waits at most 1 second for it to leave, as for quitting (§4.5 item 8), then destroys the static private key of every pairing. A pairing with no session open is told nothing, and item 2 does not apply to it; a close that has not left within the second is dropped. The Custodian of such a pairing forgets it by idle expiry (item 5).
+6. **Requester Revocation**:
+   A Requester's user forgets the pairing the Requester holds by turning remote use off (hierarchy specification §5.2), and by pairing another Custodian: once the new pairing is active (§4.3 item 4) the Requester forgets the one it held. With a session open the Requester sends the close as item 1 says and waits at most 1 second for the Custodian's echo (§7.1 item 7), as for quitting (§4.5 item 8), then destroys the static private key; a close not echoed within the second is not known to have reached the Custodian, which then forgets the computer by idle expiry (item 5). With no session open, every forget its user makes, turning remote use off or replacing the pairing, makes one bounded attempt to deliver the close, whether or not a card is in a reader attached to the Requester: within `revocation_attempt_bound_ms` = 10000 ms of the revocation it opens at most one connection to the Custodian: to the instance it associates with the pairing while that is in sight, otherwise to the first instance or BLE peripheral it discovers for the pairing in that time, keeping the discovery it needs running until the attempt ends; completes the handshake of §6.3 and sends the close as its first message; it destroys the key when the Custodian's echo of the close arrives (§7.1 item 7), or when the bound passes, whichever comes first. The attempt runs whether remote use is off or suspended by a local card, and is the only remote activity then; it offers no identity and starts no operation. A pairing that ends without its user's action sends nothing: a Requester's idle expiry (item 5) destroys the key at once, and a local card only suspends remote use and keeps the pairing (§4.5 item 8). A Requester keeps no revoking pairing longer than the bound. A Custodian the attempt does not reach forgets the computer by idle expiry (item 5).
+
+7. **No Stable Requester Identity**:
+   Every pairing ceremony makes fresh static keys on both endpoints (§4.3 item 4), so a Custodian cannot tell that a new pairing comes from a computer it was paired with before, and does not try: names identify nothing (§4.3 item 3). A pairing a Requester forgot leaves the Custodian's list when the Requester's revocation close reaches it (items 1 and 6), and otherwise by idle expiry after 30 days without a session (item 5); until then the Custodian lists it beside the new one. This is a known limit of fresh keys per pairing.
+
+8. **Ends That Send Nothing**:
+   An endpoint that crashes, is ended by its operating system or loses power sends nothing: no withdrawal, no revocation close. Its peer sees a loss and handles it as one, within the bounded windows of §4.5 item 6 and §8.3, and a pairing the dead endpoint meant to forget stays on the peer until the 30-day idle expiry (item 5). No protocol can send a message from an endpoint that is gone; this is a known limit.
+
+### 4.7 Lifecycle
+
+The lifecycle of both endpoints is three machines above the pairing and session machines, and the presentation of the Custodian's pairing states. [rapp-state-machine-v26.11.2.yaml](rapp-state-machine-v26.11.2.yaml) states every state and event of each, with a transition, an ignored event or a reason why the event cannot happen in every cell; [rapp-state-machine.md](rapp-state-machine.md) explains them with diagrams; the `scenarios` of `vectors/rapp-lifecycle-v26.11.2.json` walk them.
+
+| Machine | Instances | What it holds |
+| :--- | :--- | :--- |
+| `requester_remote_use` | one per Requester | the remote-use switch, the code entry and pairing search, suspension by a local card, launch and quit (hierarchy specification §5.2) |
+| `requester_view_of_custodian` | one per active pairing while remote use is on with discovery running | idle, connecting within the redial window, connected, or withdrawn (§4.5 item 6, §8.3) |
+| `custodian_service` | one per Custodian | remote access off, serving (with or without an offer up), withdrawing, limited by the operating system (§4.5 items 3 and 4) |
+| `pairing` (presentation) | one per stored pairing on a Custodian | how the holder sees each computer: connected, not connected, off after its withdrawal, or no longer listed (§4.5 item 9, §4.6) |
+
+**Presenting the Custodian on a Requester.** A Requester presents the Custodian only through its card. While a session confirms a card (§8.4) the identity is offered and shown; in every other state, whether the Custodian is out of sight, withdrawn, lost, being dialed or held, the Requester shows no remote card, exactly as if no phone were there, and names neither the Custodian's state nor a reason. Dialing, scanning and redialing run in the background within the bounds of §4.5 item 6 and §8.3 and are never shown. The one line that names the Custodian is the notice, after a `"pairing_revoked"` close from it (§4.6 item 4), that the phone forgot this computer. In that state the user's actions are the ordinary ones: use a card in a reader attached to the computer, pair another phone, which replaces the pairing (§4.6 item 6), or turn remote use off.
+
+**Turning the Custodian's remote access off** is withdrawal and only withdrawal (§4.5 items 3 and 4): every pairing is kept, and turning it on again serves at once under a fresh instance name. **Turning the Requester's remote use off** forgets its pairing (§4.6 item 6). The Requester's switch goes off only by its user's action: a revocation from the Custodian or idle expiry leaves it on and offers the code entry (hierarchy specification §5.2).
 
 ---
 
@@ -524,14 +558,14 @@ A reassembled frame goes to the handler of the phase the connection is in, the R
 
 ### 6. Normative Cryptographic Protocols
 
-RAPP v26.10.29 specifies three normative cryptographic protocols:
+RAPP v26.11.2 specifies three normative cryptographic protocols:
 1. **`CPaceRistretto255`**: the PAKE of the pairing ceremony (§6.1).
 2. **`Noise_XXpsk3`**: the pairing handshake that turns the PAKE result into a stored pairing (§6.2).
 3. **`Noise_KK`**: the session handshake between paired endpoints (§6.3).
 
 ### 6.1 CPaceRistretto255 KC2 Profile (draft-irtf-cfrg-cpace-21, RFC 9496, RFC 5869)
 
-RAPP v26.10.29 specifies the **`CPaceRistretto255-KC2`** application profile over [draft-irtf-cfrg-cpace-21](https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-cpace-21), [RFC 9496](https://www.rfc-editor.org/rfc/rfc9496.html), and [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html):
+RAPP v26.11.2 specifies the **`CPaceRistretto255-KC2`** application profile over [draft-irtf-cfrg-cpace-21](https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-cpace-21), [RFC 9496](https://www.rfc-editor.org/rfc/rfc9496.html), and [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html):
 
 #### 6.1.1 Cryptographic Suite Definition
 - **Group**: Prime-order Ristretto255 group (order $q = 2^{252} + 27742317777372353535851937790883648493$).
@@ -547,7 +581,7 @@ RAPP v26.10.29 specifies the **`CPaceRistretto255-KC2`** application profile ove
   ```cddl
   pairing-context = [
     "rapp-pairing-context",
-    [26, 10, 29],                                                              ; wire version [Year, Month, Day]
+    [26, 11, 2],                                                              ; wire version [Year, Month, Day]
     "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512", ; full suite literal
     tstr,                                                                    ; transport profile of the connection (§2.2)
     tstr,                                                                    ; candidate_id of its offer entry (§4.2)
@@ -556,7 +590,7 @@ RAPP v26.10.29 specifies the **`CPaceRistretto255-KC2`** application profile ove
     "custodian"                                                              ; responder role B
   ]
   ```
-  $$C = \text{encode\_deterministic\_cbor}(\text{pairing-context}) \quad (178\text{ bytes on BLE, 179 bytes on stream})$$
+  $$C = \text{encode\_deterministic\_cbor}(\text{pairing-context}) \quad (177\text{ bytes on BLE, 178 bytes on stream})$$
   Both parties' associated data (AD) is empty:
   $$\text{CI} = C, \quad \text{AD}_A = \emptyset, \quad \text{AD}_B = \emptyset$$
   Role strings designate protocol roles, not device identities: the Requester is the initiator ($A$) and the Custodian the responder ($B$) on every transport.
@@ -573,7 +607,7 @@ The generator point $G$ is derived from the password-related string (PRS), the 6
    - $|\text{lv}(\text{PRS})| = |\text{LEB128}(|\text{PRS}|)| + |\text{PRS}| = 1 + 6 = 7\text{ bytes}$
    - Yielding $\text{len\_zpad} = 128 - 1 - 7 - 18 = 102\text{ bytes}$ of zeros.
 3. **Generator String & Point Evaluation**:
-   $$\text{gen\_str} = \text{lv\_cat}(\text{DSI}, \text{PRS}, \text{zero\_bytes}(102), C, \text{SID}) \quad (341\text{ bytes on BLE, 342 bytes on stream})$$
+   $$\text{gen\_str} = \text{lv\_cat}(\text{DSI}, \text{PRS}, \text{zero\_bytes}(102), C, \text{SID}) \quad (340\text{ bytes on BLE, 341 bytes on stream})$$
    $$G = \text{MapToGroup}(\text{SHA-512}(\text{gen\_str}))$$
    where $\text{SID} = \text{offer\_id}$. $G = \mathcal{O}$ aborts as §6.1.1 says.
 
@@ -680,7 +714,7 @@ The generator point $G$ is derived from the password-related string (PRS), the 6
 
 ### 6.4 Session Handshake Vectors
 
-The entries `"session-kk-fixed-transcript-ble"` and `"session-kk-fixed-transcript-stream"` of `doc/protocols/vectors/rapp-v26.10.29.json` pin, for fixed static and ephemeral keys and a fixed session prologue, both handshake messages, the final handshake hash $h$, the directional keys $c_1$ and $c_2$ and the `session_id` of §6.3, one entry per transport profile. An implementation reproduces them byte for byte.
+The entries `"session-kk-fixed-transcript-ble"` and `"session-kk-fixed-transcript-stream"` of `doc/protocols/vectors/rapp-v26.11.2.json` pin, for fixed static and ephemeral keys and a fixed session prologue, both handshake messages, the final handshake hash $h$, the directional keys $c_1$ and $c_2$ and the `session_id` of §6.3, one entry per transport profile. An implementation reproduces them byte for byte.
 
 ---
 
@@ -691,7 +725,7 @@ Every message inside the Noise pairing phase or the Noise session phase is a det
 
 ```cddl
 rapp-message = {
-  "version": [26, 10, 29],
+  "version": [26, 11, 2],
   "session_id": bstr .size 16,
   "sequence": uint,
   message
@@ -702,6 +736,7 @@ message //= ( "type": "pairing.confirm",    "body": pairing-confirm-body )
 message //= ( "type": "pairing.abort",      "body": pairing-abort-body )
 message //= ( "type": "pairing.stored",     "body": pairing-stored-body )
 message //= ( "type": "session.ready",      "body": session-ready-body )
+message //= ( "type": "session.hello",      "body": session-hello-body )
 message //= ( "type": "session.close",      "body": session-close-body )
 message //= ( "type": "liveness.ping",      "body": liveness-ping-body )
 message //= ( "type": "liveness.pong",      "body": liveness-pong-body )
@@ -714,13 +749,13 @@ message //= ( "type": "error",              "body": error-body )
 ; 1. Pairing Peer Introduction
 pairing-hello-body = {
   "parameters": negotiated-parameters,
-  "display_name": tstr,
-  "platform": tstr,
+  "display_name": tstr .size (1..256),   ; the sender's name, not blank (§4.3 item 3)
+  "platform": tstr .size (1..256),       ; the sender's platform description, not blank
   ? "requested_profiles": [* tstr]
 }
 
 negotiated-parameters = {
-  "version": [26, 10, 29],
+  "version": [26, 11, 2],
   "suite": "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512",
   "offer_hash": bstr .size 32,
   "transport_profile": tstr,   ; transport profile of the connection (§2.2)
@@ -745,11 +780,17 @@ pairing-stored-body = {
 ; 5. Session Ready
 session-ready-body = {
   "parameters": session-parameters,
-  "nonce": bstr .size 32
+  "nonce": bstr .size 32,
+  "display_name": tstr .size (1..256)    ; the Custodian's current name, not blank (§4.3 items 3 and 4)
+}
+
+; 5a. Session Hello
+session-hello-body = {
+  "display_name": tstr .size (1..256)    ; the Requester's current name, not blank (§4.3 items 3 and 4)
 }
 
 session-parameters = {
-  "version": [26, 10, 29],
+  "version": [26, 11, 2],
   "suite": "Noise_KK_25519_ChaChaPoly_SHA512",
   "transport_profile": tstr,   ; transport profile of the connection (§2.2)
   "candidate_id": tstr,        ; its registered candidate_id (§2.2)
@@ -828,21 +869,22 @@ card-status-body = {
 ```
 
 #### Message Semantics:
-1. **`pairing.hello`**: Sent by the Requester in the Noise pairing phase right after the handshake. Echoes the negotiated parameters, the peer's display name and platform, and the requested profile names. The Custodian checks every echoed parameter against its offer; any difference aborts the pairing.
+1. **`pairing.hello`**: Sent by each endpoint in the Noise pairing phase right after the handshake. Echoes the negotiated parameters and carries the sender's display name and platform (§4.3 item 3); the Requester's also carries `requested_profiles`, exactly the profiles of the offer, and the Custodian's carries no `requested_profiles` field; a Requester's hello without it, or a Custodian's with it, aborts the pairing. Each endpoint checks every echoed parameter against the offer; any difference, and a missing, blank or over-long `display_name` or `platform`, aborts the pairing.
 2. **`pairing.confirm`**: Sent by the Custodian with the profiles it grants from those requested, then echoed by the Requester. Both verify the lists are identical before deriving `grants_hash` (§4.3).
 3. **`pairing.abort`**: Sent by either endpoint to cancel a pairing before the records are stored, with a reason for display. Ephemeral keys are destroyed at once.
 4. **`pairing.stored`**: Sent by each endpoint once its pairing record is durably stored, carrying the derived `pair_id`. An endpoint treats the pairing as active only after receiving it (§4.3 item 4).
-5. **`session.ready`**: Sent by the Custodian on completing the `Noise_KK` handshake, echoing the session parameters with a fresh random 32-byte `nonce`.
-6. **`session.close`**: Sent by either endpoint to end a session, with a registered reason.
-7. **`liveness.ping`** and **`liveness.pong`**: Keepalive sent by either endpoint with a fresh 32-byte `challenge`, echoed exactly by the peer.
-8. **`operation.request`**: Sent by the Requester to start a credential action under a registered profile (§8, §9).
-9. **`operation.result`**: Sent by the Custodian with the outcome of the operation: its status and the response, or the error (§8).
-10. **`operation.progress`**: Sent by the Custodian while an operation is pending, for every change of its state: queued behind another session's operation, a PIN prompt on screen, waiting for the card, card found (§8.2).
-11. **`card.status`**: Sent by the Custodian once right after `session.ready` and again whenever the card it holds changes (present or absent, and which card, by the fingerprint of its authentication certificate) or a card reader is attached to it or detached (§8.4).
-12. **`error`**: Sent on a protocol condition that is not an operation outcome, such as a second request while one operation of the session is live; schema and codes in §10.3.
+5. **`session.ready`**: Sent by the Custodian on completing the `Noise_KK` handshake, echoing the session parameters with a fresh random 32-byte `nonce` and carrying the Custodian's current display name (§4.3 item 4).
+6. **`session.hello`**: Sent by the Requester as its first message once it has verified `session.ready`, carrying its current display name (§4.3 item 4); a Requester whose pairing is revoking sends its `pairing_revoked` close instead (§4.6 item 2). A Custodian that receives any other message first, apart from that close, closes the session as an authenticated protocol violation. The Custodian sends `card.status` (§8.4) without waiting for it, and admits no `operation.request` before it.
+7. **`session.close`**: Sent by either endpoint to end a session, with a registered reason. A close is acknowledged. An endpoint that receives an authenticated `session.close`, whatever its reason and wherever in the session, in place of `session.ready` and as the Requester's first message included, acts on it, answers with its own `session.close` carrying the same reason (the **echo**), and closes the transport. The sender of a close sends nothing more on the session, ignores every message but a `session.close`, and closes the transport once the echo arrives or its wait ends: at most 1 second (`quit_withdrawal_bound_ms`), and, in a Requester's revocation attempt, until `revocation_attempt_bound_ms` ends (§4.6 item 6). The echo is the evidence that the peer received the close and acted on it, for example forgot the pairing. Without the echo inside the wait the close is not known to have been delivered, and the stated limits apply: a pairing the peer was told to forget leaves it by idle expiry (§4.6 items 5 and 8), and a peer told of a withdrawal sees a loss. An echo is never answered: a `session.close` that arrives while an endpoint waits for the echo of its own close is that echo, whatever its reason, so two closes that cross acknowledge each other; the endpoint still acts on the reason it received. An endpoint that ends a session on an AEAD or framing failure or on the silence limit (§8.3) sends no close and waits for nothing (STPA UCA-124, CC-123).
+8. **`liveness.ping`** and **`liveness.pong`**: Keepalive sent by either endpoint with a fresh 32-byte `challenge`, echoed exactly by the peer.
+9. **`operation.request`**: Sent by the Requester to start a credential action under a registered profile (§8, §9).
+10. **`operation.result`**: Sent by the Custodian with the outcome of the operation: its status and the response, or the error (§8).
+11. **`operation.progress`**: Sent by the Custodian while an operation is pending, for every change of its state: queued behind another session's operation, a PIN prompt on screen, waiting for the card, card found (§8.2).
+12. **`card.status`**: Sent by the Custodian once right after `session.ready` and again whenever the card it holds changes (present or absent, and which card, by the fingerprint of its authentication certificate) or a card reader is attached to it or detached (§8.4).
+13. **`error`**: Sent on a protocol condition that is not an operation outcome, such as a second request while one operation of the session is live; schema and codes in §10.3.
 
 ### 7.2 Envelope Rules
-1. **Version**: `version` is `[26, 10, 29]`, as `[Year, Month, Day]`. A version mismatch in a Noise prologue fails the handshake's AEAD: the link drops and stored pairings stay. An authenticated envelope with any other version closes the session.
+1. **Version**: `version` is `[26, 11, 2]`, as `[Year, Month, Day]`. A version mismatch in a Noise prologue fails the handshake's AEAD: the link drops and stored pairings stay. An authenticated envelope with any other version closes the session.
 2. **Session**: `session_id` is the identifier derived from the handshake hash of the phase the envelope belongs to, the pairing `session_id` of §6.2 or the operational `session_id` of §6.3. An envelope with another `session_id` closes the session.
 3. **Sequence**: `sequence` starts at 0 in each direction and increases by exactly 1 per envelope; it equals the nonce of the Noise cipher state that encrypted the envelope. The first envelope received in a direction has `sequence` 0 and each accepted envelope raises the expected value by 1. An envelope whose `sequence` is not the expected value closes the session. A session ends as §8.3 says; the counter never wraps in practice, and an endpoint that would exceed $2^{64}-1$ closes the session with reason `"normal"`.
 4. **Encapsulation**: The `rapp-message` is encoded as deterministic CBOR (RFC 8949 Section 4.2) and encrypted with ChaCha20-Poly1305 under the direction's Noise cipher state, giving the ciphertext and a 16-byte tag. The ciphertext is one transport frame (§2.2).
@@ -870,7 +912,14 @@ An operation is one credential action, an authentication signature, a document s
 
 ### 8.3 Session Lifetime
 
-A session lives as long as both endpoints are in sight. An endpoint that has heard nothing from its peer for 5 seconds sends `liveness.ping`; the peer answers `liveness.pong` at once. Thirty seconds without any message from the peer, or a transport close, ends the session (§10.1 item 2). While it has not withdrawn (§4.5), a Requester keeps a session open to every paired Custodian whose discovery hint is in sight (hierarchy specification §4.3), dialing when the hint appears and again, after a close, when it is next seen, so that an operation can start at once and the Custodian's state reaches the Requester as it changes. A Custodian holds as many sessions as Requesters dial (§2.2.2).
+A session lives as long as both endpoints are in sight. An endpoint that has heard nothing from its peer for 5 seconds sends `liveness.ping`; the peer answers `liveness.pong` at once. Thirty seconds without any message from the peer, or a transport close, ends the session (§10.1 item 2). While it has not withdrawn (§4.5), a Requester keeps a session open to its paired Custodian while the Custodian is in sight, so that an operation can start at once and the Custodian's state reaches the Requester as it changes. A Custodian holds as many sessions as Requesters dial (§2.2.2), and goes on serving them while it offers a pairing (§4.2).
+
+The Custodian is **in sight** while a `mode=session` record whose discovery hint matches the pairing (hierarchy specification §4.3), or a `mode=session` record that carries no hints, or the RAPP BLE advertisement, is seen; routing decides whether a hint-less record belongs to the pairing. The Custodian **appears** when such a record comes into sight, for the first time, under a fresh instance name, or back after vanishing, and when the BLE advertisement is first seen after it was out of sight. A Requester dials only:
+1. when the Custodian appears;
+2. when a local consumer asks for the card with no session open (§8.4 item 3);
+3. within the **redial window**: after a loss of the session (§4.5 item 6, item 4; a protocol violation opens no window), or after a dial that ended before `session.ready`, the Requester redials with a back-off of its own for at most `redial_window_ms` = 120000 ms, counted from the loss or from the first failed dial since the Custodian last appeared. The window equals `identity_offer_grace_ms` (§8.4 item 3), so the Requester stops redialing when it would stop offering the Custodian's identity after a loss. When the window has passed without a session, the Requester dials again only when the Custodian next appears or a consumer asks.
+
+No dial runs on a timer outside the redial window, and none while the Custodian is withdrawn (§4.5 item 6). Two connections are outside these rules: a pairing connection while a code is tried (§4.2), and a revoking pairing's one attempt (§4.6 item 6), which runs whether or not the Custodian is withdrawn. A `mode=session` record that appears is dialed at once, before any BLE scan still running for the pairing (hierarchy specification §3). Dialing, scanning and redialing are never shown to the user (§4.7).
 
 ### 8.4 Card Presence and Identity Offering
 
@@ -881,11 +930,11 @@ A Requester that offers the Custodian's credentials to local consumers (a browse
 2. **Which Card**:
    While `card_present` is true, `certificate_fingerprint` carries the SHA-256 digest of the Distinguished Encoding Rules (DER) encoding of the card's authentication certificate; while it is false the field is 32 zero bytes. A Requester compares a present card's fingerprint with the fingerprint of the certificates it holds for the pairing and, on any difference or when it holds none, reads the certificates afresh (§9) before offering anything; a report of absence is not a different card; it offers only an identity whose fingerprint the Custodian confirmed on a session.
 3. **Offering Rule**:
-   A Requester offers a pairing's credentials to local consumers on a certificate whose fingerprint the Custodian confirmed on a session, and keeps offering it between sessions: when a request arrives with no session open, the Requester dials the Custodian and holds the request until a session opens or the consumer's own deadline passes. It withdraws the offer when, for 120 seconds, no session to the Custodian has been open or the Custodian has reported absence, with no `card.status` reporting the card present in that time; at once when the pairing is forgotten or revoked (§4.6); at once when the Requester itself withdraws (§4.5 item 8); and at once when a session reports a different card present (item 2). It offers again as soon as a session confirms the card. Discovery records (hierarchy specification §4.3) tell a Requester whom to dial; they never justify an offer.
+   A Requester offers a pairing's credentials to local consumers on a certificate whose fingerprint the Custodian confirmed on a session, and keeps offering it between sessions: when a request arrives with no session open, the Requester dials the Custodian and holds the request until a session opens or the consumer's own deadline passes. It withdraws the offer when, for 120 seconds, no session to the Custodian has been open or the Custodian has reported absence, with no `card.status` reporting the card present in that time; at once when the pairing is forgotten or revoked (§4.6); at once when the Requester itself withdraws (§4.5 item 8); at once on a verified withdrawal of the Custodian, or its `"card_unavailable"` close (§4.5 item 6); and at once when a session reports a different card present (item 2). It offers again as soon as a session confirms the card. Discovery records (hierarchy specification §4.3) tell a Requester whom to dial; they never justify an offer.
 4. **Privacy**:
    `card.status` travels only inside the AEAD-encrypted session. No discovery record, advertisement, or plaintext frame reflects the card's presence or the Custodian's card reader.
 5. **Ending the Session**:
-   A Custodian that can no longer serve any card for the rest of the session closes it with reason `"card_unavailable"`; a Custodian that expects the card back keeps the session open and reports presence through `card.status`.
+   A Custodian that can no longer serve any card for the rest of the session closes it with reason `"card_unavailable"`; a Custodian that expects the card back keeps the session open and reports presence through `card.status`. A Requester that receives a `"card_unavailable"` close withdraws the Custodian's identity at once, does not redial, and waits for the Custodian's next announcement (§4.5 item 6). A Custodian that closed sessions with `"card_unavailable"` announces itself again when it can serve a card once more: it registers its stream service under a fresh instance name in place of the current one and restarts its BLE advertisement, so every Requester sees it appear (§8.3).
 6. **Asking for the Card**:
    A Requester that asks its user for the card names the Custodian's card reader only while the latest `card.status` on an open session reports the card absent and `reader_attached` true, and then asks for the card in that reader. Otherwise it asks the user to present the card to the Custodian. `reader_attached` changes no offer: item 3 alone governs offering and withdrawal.
 
@@ -961,13 +1010,20 @@ The profiles a pairing can grant (§4.3), and the actions of each:
   - Payload: `{"kind": "signature"}`.
   - Response: `certificate` (DER-encoded X.509 signature certificate bytes).
 - **`sign_document`**:
-  - Context: `document_name` (`tstr .size (1..256)`, e.g. `"Employment_Contract_2026.pdf"`).
+  - Context:
+    ```cddl
+    sign-document-context = {
+      "document_name": tstr .size (1..256),          ; e.g. "Employment_Contract_2026.pdf"
+      ? "contained_files": [+ tstr .size (1..256)]  ; present exactly when the document is a package
+    }
+    ```
+    A package is a document that carries files: an ASiC-E container. `document_name` is the package's own name. `contained_files` is present exactly when the document is a package and absent for a single document: the names of the data objects the package holds, as the container holds them (the entry names its manifest and signature cover), in container order, each unique, none under `META-INF/` in any letter case, UTF-8. A package of one file sends its one entry. The request encodes in one transport frame (§7.2 item 4): the Requester refuses a package whose request does not fit, and never shortens the list or an entry; an entry outside `tstr .size (1..256)` is refused. The Custodian validates each entry as it validates an entry of `document_names`.
   - Payload: `key_profile`, `algorithm`, `digest` (pre-hashed document digest).
-  - PIN: PIN 2 on the Custodian's screen, with the document name.
+  - PIN: PIN 2 on the Custodian's screen, with the document name and, for a package, the full list of `contained_files` under it, shown as the full list of a batch is shown.
   - Signature Wire Format: as §9.2.
   - Response: `signature` (`bstr`).
 - **`batch_sign_documents`**:
-  - Context: `document_names` (`[+ tstr .size (1..256)]`, the documents' display names, in order).
+  - Context: `document_names` (`[+ tstr .size (1..256)]`, the documents' display names, in order). Every entry of a batch is a single document; a package is signed with `sign_document`.
   - Payload:
     - `key_profile`, `algorithm`.
     - `digests` (`[+ bstr]`, one per document, in the same order).
@@ -984,7 +1040,7 @@ The profiles a pairing can grant (§4.3), and the actions of each:
 What an endpoint does when something goes wrong depends on how much it knows about its peer:
 
 1. **Before authentication**: a malformed preamble, an unrouted or replayed routing tag, a short MTU, a frame out of order. The endpoint closes the connection; nothing stored changes.
-2. **On a session**: a link drop, a timeout, an AEAD failure, a wrong version, a wrong `session_id` or `sequence`. A bit flip and an attacker look the same, so the endpoint closes the session and keeps the pairing; every operation of the session is over (§8). The card is never touched on the way out.
+2. **On a session**: a link drop, a timeout, an AEAD failure, a wrong version, a wrong `session_id` or `sequence`. A bit flip and an attacker look the same, so the endpoint closes the session and keeps the pairing; every operation of the session is over (§8). The card is never touched on the way out. A Requester redials a session that ended this way within the redial window (§8.3), except one that ended for an authenticated protocol violation, which it does not redial until the Custodian next appears (§4.5 item 6).
 3. **Inside an operation**: an unknown `operation_id`, an unsupported parameter, a credential the card refused. The endpoint rejects that operation with `operation.result` or `error` (§10.3); the session and the pairing stay.
 
 No failure revokes an active pairing: an active pairing is revoked by its user, by idle expiry, or by its peer's `pairing_revoked` close (§4.6). A pairing whose confirmation fails is undone as §4.3 item 4 says.
@@ -1021,7 +1077,7 @@ The same names appear in the `error` field of `operation.result`, except `"busy"
 
 ## 11. PINs and Secrets
 
-1. **What the holder sees is what is signed**: A PIN prompt on the Custodian shows the operation it authorizes and names the paired computer that asked by its pairing's name, the `display_name` of its `pairing.hello` (§7.1). For authentication: the operation and the card holder's name; the prompt names no site and does not show the request's `context`, since no Requester can know the site. For document signing: the `document_name`, or the full list of names for a batch.
+1. **What the holder sees is what is signed**: A PIN prompt on the Custodian shows the operation it authorizes and names the paired computer that asked by the display name stored in its pair record, the `display_name` of its `pairing.hello` (§4.3 items 3 and 4). For authentication: the operation and the card holder's name; the prompt names no site and does not show the request's `context`, since no Requester can know the site. For document signing: the `document_name`, or the full list of names for a batch; for a package, its name and every file it holds.
 2. **PIN 1 and PIN 2**: PIN 1 is asked once and held only in the Custodian's memory, never in storage, until the card is removed or replaced (§8.4 item 1), the card rejects it, the holder clears it, the Custodian's process ends or the device restarts; while it is held, a browser authentication runs without a prompt. PIN 2 is entered by the holder on the Custodian for every signature or batch and kept no longer; nothing signs unattended.
 3. **Documents stay home**: Document bytes and unhashed browser data never cross RAPP; the Requester hashes locally and sends the digest.
 4. **Secrets never on the wire**: PIN 1, PIN 2, the card access number (CAN) and the PUK have no representation in any RAPP message and never traverse any transport. The Custodian presents them to the card itself; a Requester receives only the signature or the result.
@@ -1041,4 +1097,5 @@ The same names appear in the `error` field of `operation.result`, except `"busy"
 | **Tracking** | Records discovery records and routing preambles over time to recognise a phone or link a computer's connections. | Discovery hints rotate every 15 minutes and routing tags are fresh per connection; both are keyed by the pairing's static agreement, which never crosses the wire (§2.2.1, §4.3, hierarchy specification §4.3). No stable pairing identifier is ever sent in clear. |
 | **Routing replay** | Replays a captured routing preamble to probe presence or cause work. | The tag selects a pairing and authenticates nothing. A nonce in the replay memory of 256 routed sessions is refused in the Routing phase; an older replay reaches `Noise_KK` message 1 and fails. The pre-authentication limiter bounds the work (§3.3). |
 | **Withdrawal forgery or replay** | Publishes a forged `mode=withdrawn` record, or republishes a recorded one. | Withdrawal hints are keyed by the static agreement and cannot be forged. A recorded record counts only on the instance the Requester associates with the pairing and within one minute of its counter, and only withdraws presence until the Custodian is next discovered; a spoofed clock widens that window and nothing more. A replayed `hints=` value only makes a Requester dial an endpoint that then fails routing. An open session ignores records and ends only on an authenticated `session.close` (§4.5). |
-| **Stale pairing** | Uses the stored pairing of a computer or phone its holder lost, sold or stopped using: recognises the other endpoint's discovery hints, or dials it and asks for operations. | Every key operation needs the holder's PIN on the Custodian, except a browser authentication while the Custodian holds PIN 1 (§8.2 item 3, §11 item 2). A pairing with no session for 30 days expires on each endpoint (§4.6 item 5), and the user of either endpoint can forget it at once (§4.6). |
+| **Stale pairing** | Uses the stored pairing of a computer or phone its holder lost, sold or stopped using: recognises the other endpoint's discovery hints, or dials it and asks for operations. | Every key operation needs the holder's PIN on the Custodian, except a browser authentication while the Custodian holds PIN 1 (§8.2 item 3, §11 item 2). A pairing with no session for 30 days expires on each endpoint (§4.6 item 5), and the user of either endpoint can forget it at once (§4.6); a Requester's forget reaches the Custodian when its session is open or its one bounded attempt finds the Custodian (§4.6 item 6). |
+| **Name impersonation** | Pairs a device under the display name of another computer or phone the holder knows. | Pairing needs the code on the holder's screen (§3). A display name is a label only: nothing finds, matches or replaces a pairing by it (§4.3 item 3), so a borrowed name changes no other pairing. |

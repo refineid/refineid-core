@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 
 use zeroize::{Zeroize, Zeroizing};
 
-use super::{MAX_FRAME_PLAINTEXT, SESSION_ID_SIZE, SessionId, WIRE_VERSION_V26_10_29};
+use super::{MAX_FRAME_PLAINTEXT, SESSION_ID_SIZE, SessionId, WIRE_VERSION_V26_11_2};
 
 const MAX_NESTING_DEPTH: usize = 8;
 const MAX_TEXT_SIZE: usize = 4_096;
@@ -68,6 +68,8 @@ pub enum MessageType {
     PairingStored,
     /// Session-ready parameter echo.
     SessionReady,
+    /// The requester's first session message, carrying its name.
+    SessionHello,
     /// Authenticated close notice.
     SessionClose,
     /// Liveness challenge.
@@ -96,6 +98,7 @@ impl MessageType {
             Self::PairingAbort => "pairing.abort",
             Self::PairingStored => "pairing.stored",
             Self::SessionReady => "session.ready",
+            Self::SessionHello => "session.hello",
             Self::SessionClose => "session.close",
             Self::LivenessPing => "liveness.ping",
             Self::LivenessPong => "liveness.pong",
@@ -114,6 +117,7 @@ impl MessageType {
             "pairing.abort" => Ok(Self::PairingAbort),
             "pairing.stored" => Ok(Self::PairingStored),
             "session.ready" => Ok(Self::SessionReady),
+            "session.hello" => Ok(Self::SessionHello),
             "session.close" => Ok(Self::SessionClose),
             "liveness.ping" => Ok(Self::LivenessPing),
             "liveness.pong" => Ok(Self::LivenessPong),
@@ -170,9 +174,9 @@ impl Envelope {
         map.insert(
             "version".to_owned(),
             WireValue::Array(vec![
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.0)),
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.1)),
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.2)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_2.0)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_2.1)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_2.2)),
             ]),
         );
         map.insert(
@@ -209,9 +213,9 @@ impl Envelope {
         let version = take_array(&mut map, "version")?;
         if version.as_slice()
             != [
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.0)),
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.1)),
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.2)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_2.0)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_2.1)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_2.2)),
             ]
         {
             return Err(WireError::UnsupportedVersion);
@@ -808,7 +812,17 @@ fn validate_body(
                 field_type: F::Bytes(32),
                 optional: false,
             },
+            FieldSpec {
+                name: "display_name",
+                field_type: F::Text,
+                optional: false,
+            },
         ],
+        M::SessionHello => &[FieldSpec {
+            name: "display_name",
+            field_type: F::Text,
+            optional: false,
+        }],
         M::SessionClose => &[FieldSpec {
             name: "reason",
             field_type: F::Text,
@@ -1162,9 +1176,9 @@ mod tests {
         assert_eq!(
             envelope_version,
             &WireValue::Array(vec![
-                WireValue::Unsigned(u64::from(crate::WIRE_VERSION_V26_10_29.0)),
-                WireValue::Unsigned(u64::from(crate::WIRE_VERSION_V26_10_29.1)),
-                WireValue::Unsigned(u64::from(crate::WIRE_VERSION_V26_10_29.2)),
+                WireValue::Unsigned(u64::from(crate::WIRE_VERSION_V26_11_2.0)),
+                WireValue::Unsigned(u64::from(crate::WIRE_VERSION_V26_11_2.1)),
+                WireValue::Unsigned(u64::from(crate::WIRE_VERSION_V26_11_2.2)),
             ])
         );
     }

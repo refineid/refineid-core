@@ -3,12 +3,14 @@
 use core::fmt;
 use std::collections::BTreeMap;
 
+use super::display_name::check_label;
 use super::{
     CERTIFICATE_FINGERPRINT_SIZE, CPACE_KC2_SUITE, CardOperationError, CertificateFingerprint,
-    CloseReason, Envelope, GrantsHash, LIVENESS_CHALLENGE_SIZE, MANDATORY_PAIRING_SUITE,
-    MANDATORY_SESSION_SUITE, MessageType, OperationId, OperationProgressMessage, OperationRequest,
-    OperationRequestRefusal, OperationResultMessage, PairId, PingChallenge, ProfileName,
-    RequestError, ResultError, SESSION_READY_NONCE_SIZE, WIRE_VERSION_V26_10_29, WireValue,
+    CloseReason, DisplayName, Envelope, GrantsHash, LIVENESS_CHALLENGE_SIZE,
+    MANDATORY_PAIRING_SUITE, MANDATORY_SESSION_SUITE, MessageType, OperationId,
+    OperationProgressMessage, OperationRequest, OperationRequestRefusal, OperationResultMessage,
+    PairId, PingChallenge, ProfileName, RequestError, ResultError, SESSION_READY_NONCE_SIZE,
+    WIRE_VERSION_V26_11_2, WireValue,
 };
 
 /// Pairing-channel parameter echo.
@@ -27,9 +29,11 @@ pub struct NegotiatedParameters {
 pub struct PairingHelloMessage {
     /// Negotiated-parameter echo bound to the local view.
     pub parameters: NegotiatedParameters,
-    /// Peer-chosen label, not an identity.
-    pub display_name: String,
-    /// Peer platform description, not an identity.
+    /// The sender's display name: a label, not an identity (section 4.3
+    /// item 3).
+    pub display_name: DisplayName,
+    /// The sender's platform description, 1 to 256 bytes and not blank:
+    /// a label, not an identity.
     pub platform: String,
     /// Profiles the requester asks to be granted.
     pub requested_profiles: Option<Vec<ProfileName>>,
@@ -104,6 +108,16 @@ pub struct SessionReadyMessage {
     pub parameters: SessionParameters,
     /// Fresh random nonce for this ready proof.
     pub nonce: [u8; SESSION_READY_NONCE_SIZE],
+    /// The custodian's current display name (section 4.3 item 4).
+    pub display_name: DisplayName,
+}
+
+/// The requester's first message once it verified `session.ready`,
+/// carrying its current display name (section 7.1 item 6).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionHelloMessage {
+    /// The requester's current display name (section 4.3 item 4).
+    pub display_name: DisplayName,
 }
 
 /// Authenticated close notice.
@@ -120,7 +134,7 @@ pub struct LivenessMessage {
     pub challenge: PingChallenge,
 }
 
-/// An `error` message (RAPP v26.10.29 sections 7.1 and 10.3): a registered
+/// An `error` message (RAPP v26.11.2 sections 7.1 and 10.3): a registered
 /// name and, when it concerns one, the operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProtocolErrorMessage {
@@ -182,8 +196,10 @@ pub enum TypedMessage {
     PairingAbort(PairingAbortMessage),
     /// The sender's pairing trust record is durably stored.
     PairingStored(PairingStoredMessage),
-    /// Session-ready parameter echo and nonce.
+    /// Session-ready parameter echo, nonce and the custodian's name.
     SessionReady(SessionReadyMessage),
+    /// The requester's name, its first message of a session.
+    SessionHello(SessionHelloMessage),
     /// Authenticated close notice.
     SessionClose(SessionCloseMessage),
     /// Liveness challenge.
@@ -227,6 +243,9 @@ impl TypedMessage {
             MessageType::SessionReady => {
                 Self::SessionReady(session_ready_from_body(envelope.body)?)
             }
+            MessageType::SessionHello => {
+                Self::SessionHello(session_hello_from_body(envelope.body)?)
+            }
             MessageType::SessionClose => {
                 Self::SessionClose(session_close_from_body(envelope.body)?)
             }
@@ -264,6 +283,7 @@ impl TypedMessage {
             Self::PairingAbort(_) => MessageType::PairingAbort,
             Self::PairingStored(_) => MessageType::PairingStored,
             Self::SessionReady(_) => MessageType::SessionReady,
+            Self::SessionHello(_) => MessageType::SessionHello,
             Self::SessionClose(_) => MessageType::SessionClose,
             Self::LivenessPing(_) => MessageType::LivenessPing,
             Self::LivenessPong(_) => MessageType::LivenessPong,
@@ -288,6 +308,7 @@ impl TypedMessage {
             Self::PairingAbort(value) => pairing_abort_to_body(value),
             Self::PairingStored(value) => Ok(pairing_stored_to_body(*value)),
             Self::SessionReady(value) => session_ready_to_body(value),
+            Self::SessionHello(value) => Ok(session_hello_to_body(value)),
             Self::SessionClose(value) => Ok(session_close_to_body(*value)),
             Self::LivenessPing(value) | Self::LivenessPong(value) => Ok(liveness_to_body(*value)),
             Self::OperationRequest(value) => value.to_wire_body().map_err(MessageError::Operation),
@@ -303,8 +324,7 @@ impl TypedMessage {
 fn pairing_hello_to_body(
     value: &PairingHelloMessage,
 ) -> Result<BTreeMap<String, WireValue>, MessageError> {
-    validate_label(&value.display_name, "display_name")?;
-    validate_label(&value.platform, "platform")?;
+    validate_name(&value.platform, "platform")?;
     validate_transport_name(&value.parameters.transport_profile, "transport_profile")?;
     validate_label(&value.parameters.candidate_id, "candidate_id")?;
     if let Some(profiles) = value.requested_profiles.as_ref() {
@@ -317,7 +337,7 @@ fn pairing_hello_to_body(
     );
     body.insert(
         "display_name".into(),
-        WireValue::Text(value.display_name.clone()),
+        WireValue::Text(value.display_name.as_str().to_owned()),
     );
     body.insert("platform".into(), WireValue::Text(value.platform.clone()));
     if let Some(profiles) = value.requested_profiles.as_ref() {
@@ -330,7 +350,7 @@ fn pairing_hello_from_body(
     mut body: BTreeMap<String, WireValue>,
 ) -> Result<PairingHelloMessage, MessageError> {
     let parameters = negotiated_parameters_from_map(take_map(&mut body, "parameters")?)?;
-    let display_name = take_text(&mut body, "display_name")?;
+    let display_name = take_display_name(&mut body)?;
     let platform = take_text(&mut body, "platform")?;
     let requested_profiles = match body.remove("requested_profiles") {
         None => None,
@@ -338,8 +358,7 @@ fn pairing_hello_from_body(
         Some(_) => return Err(MessageError::InvalidField("requested_profiles")),
     };
     require_empty(&body)?;
-    validate_label(&display_name, "display_name")?;
-    validate_label(&platform, "platform")?;
+    validate_name(&platform, "platform")?;
     Ok(PairingHelloMessage {
         parameters,
         display_name,
@@ -515,6 +534,10 @@ fn session_ready_to_body(
     let mut body = BTreeMap::new();
     body.insert("parameters".into(), WireValue::Map(parameters));
     body.insert("nonce".into(), WireValue::Bytes(value.nonce.to_vec()));
+    body.insert(
+        "display_name".into(),
+        WireValue::Text(value.display_name.as_str().to_owned()),
+    );
     Ok(body)
 }
 
@@ -523,6 +546,7 @@ fn session_ready_from_body(
 ) -> Result<SessionReadyMessage, MessageError> {
     let mut parameters = take_map(&mut body, "parameters")?;
     let nonce = take_fixed::<SESSION_READY_NONCE_SIZE>(&mut body, "nonce")?;
+    let display_name = take_display_name(&mut body)?;
     require_empty(&body)?;
     require_version(&mut parameters)?;
     let suite = take_text(&mut parameters, "suite")?;
@@ -544,7 +568,35 @@ fn session_ready_from_body(
             grants_hash,
         },
         nonce,
+        display_name,
     })
+}
+
+fn session_hello_to_body(value: &SessionHelloMessage) -> BTreeMap<String, WireValue> {
+    BTreeMap::from([(
+        "display_name".into(),
+        WireValue::Text(value.display_name.as_str().to_owned()),
+    )])
+}
+
+fn session_hello_from_body(
+    mut body: BTreeMap<String, WireValue>,
+) -> Result<SessionHelloMessage, MessageError> {
+    let display_name = take_display_name(&mut body)?;
+    require_empty(&body)?;
+    Ok(SessionHelloMessage { display_name })
+}
+
+/// The `display_name` field, checked as section 7.1 bounds it.
+fn take_display_name(body: &mut BTreeMap<String, WireValue>) -> Result<DisplayName, MessageError> {
+    DisplayName::parse(take_text(body, "display_name")?)
+        .map_err(|_| MessageError::InvalidField("display_name"))
+}
+
+/// A `platform` value: bounded and checked as a display name is (section
+/// 7.1).
+fn validate_name(value: &str, field: &'static str) -> Result<(), MessageError> {
+    check_label(value).map_err(|_| MessageError::InvalidField(field))
 }
 
 fn session_close_to_body(value: SessionCloseMessage) -> BTreeMap<String, WireValue> {
@@ -661,9 +713,9 @@ fn validate_profile_set(profiles: &[ProfileName]) -> Result<(), MessageError> {
 
 fn version_value() -> WireValue {
     WireValue::Array(vec![
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.0)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.1)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_10_29.2)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_2.0)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_2.1)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_2.2)),
     ])
 }
 
@@ -823,7 +875,7 @@ mod tests {
         MessageError, close_reason_name, parse_close_reason, require_version, version_value,
     };
     use crate::CloseReason;
-    use crate::{WIRE_VERSION_V26_10_29, WireValue};
+    use crate::{WIRE_VERSION_V26_11_2, WireValue};
     use std::collections::BTreeMap;
 
     /// Named so the test states which version is being refused. This constant is
@@ -899,7 +951,7 @@ mod tests {
     fn scalar_version_is_refused() {
         assert_eq!(
             require_version(&mut map_with(WireValue::Unsigned(u64::from(
-                WIRE_VERSION_V26_10_29.0
+                WIRE_VERSION_V26_11_2.0
             )))),
             Err(MessageError::InvalidField("version"))
         );

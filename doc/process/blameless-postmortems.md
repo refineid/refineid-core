@@ -153,3 +153,22 @@ in one session's memory is lost.
 - **Merge policy.** Pull requests are squash merged; GitHub CI reports
   afterwards and does not gate a merge. Rebasing onto main before merging
   is churn.
+- **A chained cleanup deleted the only copy of a secret.** A `;`-chained
+  command failed early and its trailing `rm` ran in the wrong checkout,
+  deleting a git-ignored signing key (recovered from backup). Destructive
+  steps run alone, after the preceding step is confirmed, never at the
+  end of a chain; signing secrets are never copied or removed by agents.
+- **A behavior change merged unannounced.** A login command started
+  exiting 1 outside 2xx, mentioned only in the pull request body.
+  Anything beyond the brief is told to the owner in chat before merging;
+  the pull request description does not count.
+- **A machine changed beyond the brief.** A hosts line landed on the
+  owner's computer unapproved and was reported only afterwards. A step
+  beyond the brief is announced in chat first and waits for the owner's
+  word.
+- **A merge waited for no card.** A PACE change merged before its
+  real-card run, which became a follow-up issue. A hardware acceptance
+  item blocks the merge.
+- **Footers leaked into history.** Squash merges without an explicit
+  body copied pull request footers into commit bodies. The squash is
+  always given the commit's own body explicitly.

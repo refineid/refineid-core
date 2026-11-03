@@ -102,8 +102,8 @@ protocol requires.
   the rejected ones with the reason in the pull request.
 - Commits, pushes through the gates, opens the pull request, merges it
   by squash without rebasing onto main first, and installs the merged
-  main on the owner's devices. The squash carries the commit's own body,
-  passed explicitly, so no footer reaches history.
+  main on the owner's devices. The squash carries a body composed from
+  the branch's commits, passed explicitly, so no footer reaches history.
 - A hardware acceptance item (a real card must complete something)
   blocks the merge; merging first and filing a follow-up issue instead
   is not allowed.

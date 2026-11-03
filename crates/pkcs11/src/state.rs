@@ -757,6 +757,23 @@ impl ModuleState {
         self.sessions.len()
     }
 
+    /// Raise a phone-served token on a remote slot from a certificate,
+    /// as an offer carrying it would, for tests that drive the entry
+    /// points without a source.
+    #[cfg(test)]
+    pub(crate) fn raise_remote_token_for_test(
+        &mut self,
+        slot_id: CkSlotId,
+        certificate: &crate::remote::SessionCertificate,
+    ) -> TokenObjects {
+        let pair_id = *self
+            .slot_kind(slot_id)
+            .and_then(SlotKind::remote_pair_id)
+            .expect("a remote slot");
+        let objects = remote_token_objects(&pair_id, certificate).expect("a FINEID certificate");
+        self.cache_token(slot_id, objects)
+    }
+
     /// Test-only constructor that injects a fixed slot table so the
     /// session / slot bookkeeping can be exercised without hardware.
     #[cfg(test)]

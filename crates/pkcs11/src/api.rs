@@ -62,7 +62,7 @@ use crate::slot_kind::SlotKind;
 use crate::state::{
     MODULE, ModuleState, PIN1_MAX_DIGITS, PIN1_MIN_DIGITS, Session, SlotRecord, session_state,
 };
-use crate::token::{AttrValue, ObjectKind, TokenObjects};
+use crate::token::{AttrValue, KeyGate, ObjectKind, TokenObjects};
 
 /// Cryptoki interface version this module implements (`2.40`, OASIS
 /// PKCS#11 v2.40). Reported in [`CkInfo::cryptoki_version`] and the
@@ -446,8 +446,8 @@ unsafe extern "C" fn c_get_token_info(slot_id: CkSlotId, info: CkTokenInfoPtr) -
     };
     let rv = if slot.card_present() {
         let kind = slot.kind().clone();
-        let serial = match module.ensure_token(slot_id) {
-            Ok(objects) => objects.token_serial().to_owned(),
+        let (serial, key_gate) = match module.ensure_token(slot_id) {
+            Ok(objects) => (objects.token_serial().to_owned(), objects.key_gate()),
             Err(error) => {
                 diag!("C_GetTokenInfo slot={slot_id} ensure_token error={error:#06x}");
                 return error;
@@ -461,10 +461,9 @@ unsafe extern "C" fn c_get_token_info(slot_id: CkSlotId, info: CkTokenInfoPtr) -
                 return error;
             }
         };
-        let is_remote = kind.is_remote();
         // SAFETY: caller guarantees info is a writable CK_TOKEN_INFO.
         unsafe {
-            info.write(token_info_value(&serial, pin1_status, is_remote));
+            info.write(token_info_value(&serial, pin1_status, key_gate));
         }
         CKR_OK
     } else {
@@ -506,7 +505,10 @@ const TOKEN_LABEL_PHONE: &str = "Phone (PIN 1)";
 /// carries the module identity in principle, but `p11-kit-proxy`
 /// masks it with its own, so the token manufacturer is the only
 /// producer hint that reaches proxy consumers.
-fn token_info_value(serial: &str, pin1_status: PinStatus, is_remote: bool) -> CkTokenInfo {
+///
+/// The login flags follow the token's [`KeyGate`], the same value
+/// that sets the private key's `CKA_PRIVATE`.
+fn token_info_value(serial: &str, pin1_status: PinStatus, key_gate: KeyGate) -> CkTokenInfo {
     // With `pin-change` enabled the token is not write-protected, so
     // NSS offers "Change Password" -> C_SetPIN. In the default
     // (login-only) build the token reports write-protected and NSS
@@ -517,21 +519,23 @@ fn token_info_value(serial: &str, pin1_status: PinStatus, is_remote: bool) -> Ck
     #[cfg(not(feature = "pin-change"))]
     let base_flags =
         CKF_LOGIN_REQUIRED | CKF_USER_PIN_INITIALIZED | CKF_TOKEN_INITIALIZED | CKF_WRITE_PROTECTED;
-    let flags = if is_remote {
-        // Remote readers (Android/iPhone) authenticate on-device. The PIN
-        // is never typed on or transmitted by this computer.
-        // Omit CKF_LOGIN_REQUIRED so browsers / NSS do not pop up a PIN dialog.
-        CKF_USER_PIN_INITIALIZED
-            | CKF_TOKEN_INITIALIZED
-            | CKF_WRITE_PROTECTED
-            | CKF_PROTECTED_AUTHENTICATION_PATH
-    } else {
-        base_flags | user_pin_status_flags(pin1_status)
-    };
-    let label = if is_remote {
-        padded_field(TOKEN_LABEL_PHONE)
-    } else {
-        padded_field(TOKEN_LABEL_IDENTIFY)
+    let (flags, label) = match key_gate {
+        KeyGate::Login => (
+            base_flags | user_pin_status_flags(pin1_status),
+            padded_field(TOKEN_LABEL_IDENTIFY),
+        ),
+        // The phone verifies PIN 1 and asks the holder for each
+        // signature; no function of this token needs a login on this
+        // computer, so CKF_LOGIN_REQUIRED is clear and NSS asks for no
+        // password. A caller that logs in anyway takes the protected
+        // authentication path with no PIN.
+        KeyGate::Device => (
+            CKF_USER_PIN_INITIALIZED
+                | CKF_TOKEN_INITIALIZED
+                | CKF_WRITE_PROTECTED
+                | CKF_PROTECTED_AUTHENTICATION_PATH,
+            padded_field(TOKEN_LABEL_PHONE),
+        ),
     };
     CkTokenInfo {
         label,
@@ -815,9 +819,10 @@ unsafe extern "C" fn c_login(
         return CKR_DEVICE_ERROR;
     };
     // Protected authentication path: PIN1 is never typed on or
-    // transmitted by this computer; the mobile device holds credentials
-    // in protected on-device storage. Reached only for a slot admitted
-    // from the host's source.
+    // transmitted by this computer, and the phone is not contacted.
+    // The token requires no login and its objects are public, so the
+    // login changes only the session state the caller reads back.
+    // Reached only for a slot admitted from the host's source.
     if kind.is_remote() {
         if !module.slot(slot_id).is_some_and(SlotRecord::card_present) {
             return CKR_TOKEN_NOT_PRESENT;
@@ -1259,6 +1264,13 @@ unsafe extern "C" fn c_sign_init(
 /// touching the card, and only runs the card operation once the
 /// caller has provided a large-enough buffer, so a size probe never
 /// wastes a card round trip.
+///
+/// A local token's key is a private object: the held PIN1 from
+/// `C_Login` is presented to the card, and without one the signature
+/// is refused with [`CKR_USER_NOT_LOGGED_IN`]. A phone-served token's
+/// key is a public object ([`KeyGate::Device`]): the phone verifies
+/// PIN 1 and asks the holder, so the session's login state does not
+/// gate the request.
 unsafe extern "C" fn c_sign(
     session: CkSessionHandle,
     data: CkBytePtr,
@@ -2161,8 +2173,8 @@ mod tests {
     use refineid_auth::PinStatus;
 
     use super::{
-        FUNCTION_LIST, c_get_info, c_sign, describe_template, padded_field, token_info_value,
-        user_pin_status_flags,
+        FUNCTION_LIST, KeyGate, c_get_info, c_sign, describe_template, padded_field,
+        token_info_value, user_pin_status_flags,
     };
     use crate::ck::{
         CKA_ID, CKF_USER_PIN_COUNT_LOW, CKF_USER_PIN_FINAL_TRY, CKF_USER_PIN_LOCKED, CKR_OK,
@@ -2230,7 +2242,7 @@ mod tests {
             CKS_RO_USER_FUNCTIONS, CKU_USER, CkSessionInfo,
         };
         use crate::slot_kind::{PAIR_ID_SIZE, RemoteSlotId};
-        use crate::state::{MODULE, ModuleState, SlotRecord};
+        use crate::state::{ModuleState, SlotRecord};
 
         let pair_id = RemoteSlotId::parse(&"a5".repeat(PAIR_ID_SIZE)).expect("valid pair id");
         let present = SlotRecord::remote_for_test(1, pair_id, "Alpha Phone", "alpha-desk", true);
@@ -2238,7 +2250,7 @@ mod tests {
         let mut state = ModuleState::from_parts_for_test(vec![present, absent], 3);
         let with_token = state.open_session(1, CKF_SERIAL_SESSION);
         let without_token = state.open_session(2, CKF_SERIAL_SESSION);
-        *MODULE.lock().expect("module lock") = Some(state);
+        let _module = installed_module(state);
 
         let session_state = |session: CkSessionHandle| {
             let mut info: CkSessionInfo = unsafe { core::mem::zeroed() };
@@ -2264,8 +2276,225 @@ mod tests {
         let rv = unsafe { super::c_login(without_token, CKU_USER, core::ptr::null_mut(), 0) };
         assert_eq!(rv, crate::ck::CKR_TOKEN_NOT_PRESENT);
         assert_eq!(session_state(without_token), CKS_RO_PUBLIC_SESSION);
+    }
 
-        *MODULE.lock().expect("module lock") = None;
+    /// Serialises the tests that install a [`ModuleState`] as the
+    /// process-global module.
+    static MODULE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The process-global module, installed for one test and cleared
+    /// when the test ends.
+    struct InstalledModule {
+        _turn: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for InstalledModule {
+        fn drop(&mut self) {
+            if let Ok(mut module) = crate::state::MODULE.lock() {
+                *module = None;
+            }
+        }
+    }
+
+    fn installed_module(state: crate::state::ModuleState) -> InstalledModule {
+        let turn = MODULE_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *crate::state::MODULE.lock().expect("module lock") = Some(state);
+        InstalledModule { _turn: turn }
+    }
+
+    /// The signature every request to the test source is answered
+    /// with.
+    const PHONE_SIGNATURE_BYTE: u8 = 7;
+
+    /// Requests the answering phone has been handed in this process.
+    static PHONE_REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// A phone that answers every request with a signature and counts
+    /// the requests in [`PHONE_REQUESTS`].
+    struct AnsweringPhone;
+
+    impl crate::remote::RemoteTokenSource for AnsweringPhone {
+        fn offered(&self) -> Option<crate::remote::RemoteOffer> {
+            None
+        }
+
+        fn sign(
+            &self,
+            _pair_id: &crate::slot_kind::RemoteSlotId,
+            _request: &refineid_remote::SignatureRequest,
+            _context: &refineid_remote::DisplayText,
+            _deadline: core::time::Duration,
+        ) -> Result<Vec<u8>, crate::remote::RemoteSignError> {
+            PHONE_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![
+                PHONE_SIGNATURE_BYTE;
+                crate::sign::ECDSA_P384_SIGNATURE_BYTES
+            ])
+        }
+
+        fn stop(&self) {}
+    }
+
+    /// Install the answering phone as the process's source, once.
+    fn install_answering_phone() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            crate::remote::install_remote_source(Box::new(AnsweringPhone))
+                .expect("the first source installed in this process");
+        });
+    }
+
+    fn phone_requests() -> usize {
+        PHONE_REQUESTS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The token flags follow the key gate: a token gated by `C_Login`
+    /// requires a login; a phone-served token requires none and reports
+    /// the protected authentication path a login would take.
+    #[test]
+    fn the_token_flags_follow_the_key_gate() {
+        use crate::ck::{
+            CKF_LOGIN_REQUIRED, CKF_PROTECTED_AUTHENTICATION_PATH, CKF_TOKEN_INITIALIZED,
+            CKF_USER_PIN_INITIALIZED, CKF_WRITE_PROTECTED,
+        };
+        let pristine = PinStatus::Remaining(
+            PinRetries::from_nibble(5).expect("test retry count fits the status-word nibble"),
+        );
+        let phone = token_info_value("REMOTE-a5a5a5a5", PinStatus::Verified, KeyGate::Device);
+        assert_eq!(
+            phone.flags,
+            CKF_USER_PIN_INITIALIZED
+                | CKF_TOKEN_INITIALIZED
+                | CKF_WRITE_PROTECTED
+                | CKF_PROTECTED_AUTHENTICATION_PATH
+        );
+        let card = token_info_value("TEST123", pristine, KeyGate::Login);
+        assert_ne!(card.flags & CKF_LOGIN_REQUIRED, 0);
+        assert_eq!(card.flags & CKF_PROTECTED_AUTHENTICATION_PATH, 0);
+    }
+
+    /// A phone-served token signs in a public session and in a user
+    /// session alike: no login gates the key, its objects are public
+    /// and found before a login, the session state reports the login
+    /// as it stands, and every `C_Sign` reaches the phone once.
+    #[test]
+    fn a_remote_slot_signs_with_or_without_login() {
+        use crate::ck::{
+            CK_FALSE, CK_INVALID_HANDLE, CK_TRUE, CKA_CLASS, CKA_PRIVATE, CKF_SERIAL_SESSION,
+            CKM_ECDSA, CKO_PRIVATE_KEY, CKS_RO_PUBLIC_SESSION, CKS_RO_USER_FUNCTIONS, CKU_USER,
+            CkAttribute, CkBbool, CkMechanism, CkObjectHandle, CkSessionInfo,
+        };
+        use crate::slot_kind::{PAIR_ID_SIZE, RemoteSlotId};
+        use crate::state::{ModuleState, SlotRecord};
+        use crate::token::ObjectKind;
+
+        /// A P-384 certificate as a phone's session would confirm it.
+        const PHONE_CERT_DER: &[u8] =
+            include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+
+        install_answering_phone();
+        let pair_id = RemoteSlotId::parse(&"a5".repeat(PAIR_ID_SIZE)).expect("valid pair id");
+        let slot = SlotRecord::remote_for_test(1, pair_id, "Alpha Phone", "alpha-desk", true);
+        let mut state = ModuleState::from_parts_for_test(vec![slot], 2);
+        let token = state.raise_remote_token_for_test(
+            1,
+            &crate::remote::SessionCertificate::new(PHONE_CERT_DER.to_vec()),
+        );
+        let key = token.handle(ObjectKind::PrivateKey);
+        let session = state.open_session(1, CKF_SERIAL_SESSION);
+        let _module = installed_module(state);
+
+        let session_state = || {
+            let mut info: CkSessionInfo = unsafe { core::mem::zeroed() };
+            assert_eq!(
+                unsafe { super::c_get_session_info(session, &mut info) },
+                CKR_OK
+            );
+            info.state
+        };
+        let sign = || {
+            let mut mechanism = CkMechanism {
+                mechanism: CKM_ECDSA,
+                p_parameter: core::ptr::null_mut(),
+                ul_parameter_len: 0,
+            };
+            assert_eq!(
+                unsafe { super::c_sign_init(session, &mut mechanism, key) },
+                CKR_OK
+            );
+            let mut digest: Vec<u8> = (1..=refineid_digest::SHA384_LEN)
+                .map(|byte| u8::try_from(byte).expect("a digest byte"))
+                .collect();
+            let mut signature = vec![0_u8; crate::sign::ECDSA_P384_SIGNATURE_BYTES];
+            let mut signature_len = ulong_of(signature.len());
+            let rv = unsafe {
+                c_sign(
+                    session,
+                    digest.as_mut_ptr(),
+                    ulong_of(digest.len()),
+                    signature.as_mut_ptr(),
+                    &mut signature_len,
+                )
+            };
+            (rv, signature)
+        };
+        let phone_signature = vec![PHONE_SIGNATURE_BYTE; crate::sign::ECDSA_P384_SIGNATURE_BYTES];
+
+        // The key is a public object, visible to a public session.
+        let mut class = CKO_PRIVATE_KEY;
+        let mut find = CkAttribute {
+            attr_type: CKA_CLASS,
+            p_value: core::ptr::addr_of_mut!(class).cast(),
+            ul_value_len: ulong_of(core::mem::size_of_val(&class)),
+        };
+        assert_eq!(
+            unsafe { super::c_find_objects_init(session, &mut find, 1) },
+            CKR_OK
+        );
+        let mut found: CkObjectHandle = CK_INVALID_HANDLE;
+        let mut count: CkUlong = 0;
+        assert_eq!(
+            unsafe { super::c_find_objects(session, &mut found, 1, &mut count) },
+            CKR_OK
+        );
+        assert_eq!((found, count), (key, 1));
+        assert_eq!(unsafe { super::c_find_objects_final(session) }, CKR_OK);
+        let mut private: CkBbool = CK_TRUE;
+        let mut read = CkAttribute {
+            attr_type: CKA_PRIVATE,
+            p_value: core::ptr::addr_of_mut!(private).cast(),
+            ul_value_len: ulong_of(core::mem::size_of_val(&private)),
+        };
+        assert_eq!(
+            unsafe { super::c_get_attribute_value(session, key, &mut read, 1) },
+            CKR_OK
+        );
+        assert_eq!(private, CK_FALSE);
+
+        assert_eq!(session_state(), CKS_RO_PUBLIC_SESSION);
+        let before = phone_requests();
+        assert_eq!(sign(), (CKR_OK, phone_signature.clone()));
+        assert_eq!(session_state(), CKS_RO_PUBLIC_SESSION);
+
+        let rv = unsafe { super::c_login(session, CKU_USER, core::ptr::null_mut(), 0) };
+        assert_eq!(rv, CKR_OK);
+        assert_eq!(session_state(), CKS_RO_USER_FUNCTIONS);
+        assert_eq!(sign(), (CKR_OK, phone_signature.clone()));
+
+        assert_eq!(unsafe { super::c_logout(session) }, CKR_OK);
+        assert_eq!(session_state(), CKS_RO_PUBLIC_SESSION);
+        assert_eq!(sign(), (CKR_OK, phone_signature));
+
+        // The login never contacted the phone: one request per
+        // signature.
+        const SIGNATURES: usize = 3;
+        assert_eq!(phone_requests(), before + SIGNATURES);
+    }
+
+    fn ulong_of(value: usize) -> CkUlong {
+        CkUlong::try_from(value).expect("a length fits CK_ULONG")
     }
 
     #[test]
@@ -2281,7 +2510,7 @@ mod tests {
         let expected: [CkUtf8Char; 32] = padded_field("RefineID");
         let retries =
             PinRetries::from_nibble(5).expect("test retry count fits the status-word nibble");
-        let token = token_info_value("TEST123", PinStatus::Remaining(retries), false);
+        let token = token_info_value("TEST123", PinStatus::Remaining(retries), KeyGate::Login);
         assert_eq!(token.manufacturer_id, expected);
         let mut info: CkInfo = unsafe { core::mem::zeroed() };
         assert_eq!(unsafe { c_get_info(&mut info) }, CKR_OK);

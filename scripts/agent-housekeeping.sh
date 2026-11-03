@@ -13,9 +13,10 @@
 # unpushed commits, then deletes the merged branch. A branch counts as
 # merged when main contains it by ancestry, or when every one of its
 # changes is already in main by patch: each commit on its own, or the
-# branch's whole diff as one squash. Anything else — uncommitted changes,
-# unpushed commits, or an unmerged branch — is reported with its latest
-# commit message and never destroyed.
+# branch's whole diff as one squash. A live claim is tested first, so a
+# fresh or dirty worktree is never removed even when its branch is merged.
+# Anything else — uncommitted changes, unpushed commits, or an unmerged
+# branch — is reported with its latest commit message and never destroyed.
 
 set -euo pipefail
 
@@ -131,7 +132,9 @@ while IFS= read -r line; do
       echo "  branch: ${branch} (merged: ${merged}, dirty: ${dirty}, unpushed: ${unpushed})"
       echo "  activity: ${activity}"
       [[ -n "${latest_subject}" ]] && echo "  latest: ${latest_subject}"
-      if [[ -n "${merged_test}" && "${dirty}" == "no" && "${unpushed}" == "0" ]]; then
+      if [[ "${activity}" == fresh* || "${dirty}" == "yes" ]]; then
+        echo "  verdict: KEEP (live claim)"
+      elif [[ -n "${merged_test}" && "${dirty}" == "no" && "${unpushed}" == "0" ]]; then
         if [[ "${clean}" == "1" ]]; then
           git worktree remove "${path}"
           # A squash-merged branch is not an ancestor of main, so -d
@@ -141,8 +144,6 @@ while IFS= read -r line; do
         else
           echo "  verdict: REMOVE (rerun with --clean)"
         fi
-      elif [[ "${activity}" == fresh* || "${dirty}" == "yes" ]]; then
-        echo "  verdict: KEEP (live claim)"
       else
         echo "  verdict: REVIEW (needs an owner decision)"
       fi

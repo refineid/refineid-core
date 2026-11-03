@@ -35,7 +35,7 @@ pub mod secure_messaging;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 
-pub use can::{CAN_DIGITS, Can, CanError, UnvalidatedCan};
+pub use can::{CAN_DIGITS, CAN_MAX_DIGITS, CAN_MIN_DIGITS, Can, CanError, UnvalidatedCan};
 pub use card_access::{
     CardAccess, CardAccessError, EF_CARD_ACCESS_FID, PaceDomain, PaceInfo, PaceMapping,
     UnvalidatedCardAccess, read_card_access,

@@ -1,0 +1,67 @@
+error[E0599]: the method `change_pin1_after_pin1_pace` exists for mutable reference `&mut SmTransport<T, OpenedByCan>`, but its trait bounds were not satisfied
+ --> tests/ui/no_pin1_change_without_pin1_channel.rs:6:21
+  |
+6 |     let _ = channel.change_pin1_after_pin1_pace(l, new, ChannelProof::PaceHandshake);
+  |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^ method cannot be called on `&mut SmTransport<T, OpenedByCan>` due to unsatisfied trait bounds
+  |
+ ::: src/secure_messaging.rs
+  |
+  | pub struct SmTransport<T: CardTransport, O> {
+  | ------------------------------------------- doesn't satisfy `SmTransport<T, OpenedByCan>: Pin1PaceChannelOps` or `SmTransport<T, OpenedByCan>: Pin1PaceChannel`
+  |
+  = note: the following trait bounds were not satisfied:
+          `SmTransport<T, OpenedByCan>: Pin1PaceChannel`
+          which is required by `SmTransport<T, OpenedByCan>: Pin1PaceChannelOps`
+          `&mut SmTransport<T, OpenedByCan>: Pin1PaceChannel`
+          which is required by `&mut SmTransport<T, OpenedByCan>: Pin1PaceChannelOps`
+
+error[E0599]: the method `change_pin1_after_pin1_pace` exists for mutable reference `&mut SmTransport<T, OpenedByPin2>`, but its trait bounds were not satisfied
+  --> tests/ui/no_pin1_change_without_pin1_channel.rs:10:21
+   |
+10 |     let _ = channel.change_pin1_after_pin1_pace(l, new, ChannelProof::PaceHandshake);
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^ method cannot be called on `&mut SmTransport<T, OpenedByPin2>` due to unsatisfied trait bounds
+   |
+  ::: src/secure_messaging.rs
+   |
+   | pub struct SmTransport<T: CardTransport, O> {
+   | ------------------------------------------- doesn't satisfy `SmTransport<T, OpenedByPin2>: Pin1PaceChannelOps` or `SmTransport<T, OpenedByPin2>: Pin1PaceChannel`
+   |
+   = note: the following trait bounds were not satisfied:
+           `SmTransport<T, OpenedByPin2>: Pin1PaceChannel`
+           which is required by `SmTransport<T, OpenedByPin2>: Pin1PaceChannelOps`
+           `&mut SmTransport<T, OpenedByPin2>: Pin1PaceChannel`
+           which is required by `&mut SmTransport<T, OpenedByPin2>: Pin1PaceChannelOps`
+
+error[E0599]: the method `change_pin1_after_pin1_pace` exists for mutable reference `&mut SmTransport<T, OpenedByPuk>`, but its trait bounds were not satisfied
+  --> tests/ui/no_pin1_change_without_pin1_channel.rs:14:21
+   |
+14 |     let _ = channel.change_pin1_after_pin1_pace(l, new, ChannelProof::PaceHandshake);
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+  ::: src/secure_messaging.rs
+   |
+   | pub struct SmTransport<T: CardTransport, O> {
+   | ------------------------------------------- doesn't satisfy `SmTransport<T, OpenedByPuk>: Pin1PaceChannelOps` or `SmTransport<T, OpenedByPuk>: Pin1PaceChannel`
+   |
+   = note: the following trait bounds were not satisfied:
+           `SmTransport<T, OpenedByPuk>: Pin1PaceChannel`
+           which is required by `SmTransport<T, OpenedByPuk>: Pin1PaceChannelOps`
+           `&mut SmTransport<T, OpenedByPuk>: Pin1PaceChannel`
+           which is required by `&mut SmTransport<T, OpenedByPuk>: Pin1PaceChannelOps`
+
+error[E0599]: the method `change_pin1_after_pin1_pace` exists for mutable reference `&mut T`, but its trait bounds were not satisfied
+  --> tests/ui/no_pin1_change_without_pin1_channel.rs:18:23
+   |
+18 |     let _ = transport.change_pin1_after_pin1_pace(l, new, ChannelProof::PaceHandshake);
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^ method cannot be called on `&mut T` due to unsatisfied trait bounds
+   |
+   = note: the following trait bounds were not satisfied:
+           `T: Pin1PaceChannel`
+           which is required by `T: Pin1PaceChannelOps`
+           `&mut T: Pin1PaceChannel`
+           which is required by `&mut T: Pin1PaceChannelOps`
+   = help: items from traits can only be used if the type parameter is bounded by the trait
+help: the following trait defines an item `change_pin1_after_pin1_pace`, perhaps you need to restrict type parameter `T` with it:
+   |
+17 | fn plain<T: CardTransport + Pin1PaceChannelOps>(transport: &mut T, l: &CardPinLengths, new: Pin1) {
+   |                           ++++++++++++++++++++

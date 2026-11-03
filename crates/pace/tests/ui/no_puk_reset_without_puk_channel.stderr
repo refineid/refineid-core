@@ -1,0 +1,67 @@
+error[E0599]: the method `reset_pin1_after_puk_pace` exists for mutable reference `&mut SmTransport<T, OpenedByCan>`, but its trait bounds were not satisfied
+ --> tests/ui/no_puk_reset_without_puk_channel.rs:6:21
+  |
+6 |     let _ = channel.reset_pin1_after_puk_pace(l, new, ChannelProof::PaceHandshake);
+  |                     ^^^^^^^^^^^^^^^^^^^^^^^^^ method cannot be called on `&mut SmTransport<T, OpenedByCan>` due to unsatisfied trait bounds
+  |
+ ::: src/secure_messaging.rs
+  |
+  | pub struct SmTransport<T: CardTransport, O> {
+  | ------------------------------------------- doesn't satisfy `SmTransport<T, OpenedByCan>: PukPaceChannelOps` or `SmTransport<T, OpenedByCan>: PukPaceChannel`
+  |
+  = note: the following trait bounds were not satisfied:
+          `SmTransport<T, OpenedByCan>: PukPaceChannel`
+          which is required by `SmTransport<T, OpenedByCan>: PukPaceChannelOps`
+          `&mut SmTransport<T, OpenedByCan>: PukPaceChannel`
+          which is required by `&mut SmTransport<T, OpenedByCan>: PukPaceChannelOps`
+
+error[E0599]: the method `reset_pin1_after_puk_pace` exists for mutable reference `&mut SmTransport<T, OpenedByPin1>`, but its trait bounds were not satisfied
+  --> tests/ui/no_puk_reset_without_puk_channel.rs:10:21
+   |
+10 |     let _ = channel.reset_pin1_after_puk_pace(l, new, ChannelProof::PaceHandshake);
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+  ::: src/secure_messaging.rs
+   |
+   | pub struct SmTransport<T: CardTransport, O> {
+   | ------------------------------------------- doesn't satisfy `SmTransport<T, OpenedByPin1>: PukPaceChannelOps` or `SmTransport<T, OpenedByPin1>: PukPaceChannel`
+   |
+   = note: the following trait bounds were not satisfied:
+           `SmTransport<T, OpenedByPin1>: PukPaceChannel`
+           which is required by `SmTransport<T, OpenedByPin1>: PukPaceChannelOps`
+           `&mut SmTransport<T, OpenedByPin1>: PukPaceChannel`
+           which is required by `&mut SmTransport<T, OpenedByPin1>: PukPaceChannelOps`
+
+error[E0599]: the method `reset_pin1_after_puk_pace` exists for mutable reference `&mut SmTransport<T, OpenedByPin2>`, but its trait bounds were not satisfied
+  --> tests/ui/no_puk_reset_without_puk_channel.rs:14:21
+   |
+14 |     let _ = channel.reset_pin1_after_puk_pace(l, new, ChannelProof::PaceHandshake);
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^ method cannot be called on `&mut SmTransport<T, OpenedByPin2>` due to unsatisfied trait bounds
+   |
+  ::: src/secure_messaging.rs
+   |
+   | pub struct SmTransport<T: CardTransport, O> {
+   | ------------------------------------------- doesn't satisfy `SmTransport<T, OpenedByPin2>: PukPaceChannelOps` or `SmTransport<T, OpenedByPin2>: PukPaceChannel`
+   |
+   = note: the following trait bounds were not satisfied:
+           `SmTransport<T, OpenedByPin2>: PukPaceChannel`
+           which is required by `SmTransport<T, OpenedByPin2>: PukPaceChannelOps`
+           `&mut SmTransport<T, OpenedByPin2>: PukPaceChannel`
+           which is required by `&mut SmTransport<T, OpenedByPin2>: PukPaceChannelOps`
+
+error[E0599]: the method `reset_pin1_after_puk_pace` exists for mutable reference `&mut T`, but its trait bounds were not satisfied
+  --> tests/ui/no_puk_reset_without_puk_channel.rs:18:23
+   |
+18 |     let _ = transport.reset_pin1_after_puk_pace(l, new, ChannelProof::PaceHandshake);
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^^ method cannot be called on `&mut T` due to unsatisfied trait bounds
+   |
+   = note: the following trait bounds were not satisfied:
+           `T: PukPaceChannel`
+           which is required by `T: PukPaceChannelOps`
+           `&mut T: PukPaceChannel`
+           which is required by `&mut T: PukPaceChannelOps`
+   = help: items from traits can only be used if the type parameter is bounded by the trait
+help: the following trait defines an item `reset_pin1_after_puk_pace`, perhaps you need to restrict type parameter `T` with it:
+   |
+17 | fn plain<T: CardTransport + PukPaceChannelOps>(transport: &mut T, l: &CardPinLengths, new: Pin1) {
+   |                           +++++++++++++++++++

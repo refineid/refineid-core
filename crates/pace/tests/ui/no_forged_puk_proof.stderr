@@ -1,0 +1,11 @@
+error[E0451]: field `counter` of struct `OpenedByPuk` is private
+ --> tests/ui/no_forged_puk_proof.rs:5:19
+  |
+5 |     OpenedByPuk { counter: PinStatus::NoInfo }
+  |                   ^^^^^^^ private field
+
+error[E0451]: field `counter` of struct `OpenedByPin1` is private
+ --> tests/ui/no_forged_puk_proof.rs:9:20
+  |
+9 |     OpenedByPin1 { counter: PinStatus::NoInfo }
+  |                    ^^^^^^^ private field

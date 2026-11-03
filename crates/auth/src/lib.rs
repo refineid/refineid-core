@@ -24,6 +24,7 @@
 pub mod activation;
 pub mod credentials;
 pub mod manage;
+pub mod pace_channel;
 pub mod pace_password;
 pub mod pin_lengths;
 pub mod retry_risk;
@@ -39,6 +40,10 @@ pub use credentials::{
     CredentialRole, Pin1, Pin2, Puk, UnvalidatedSecret,
 };
 pub use manage::{ManageOutcome, PinManageOps, classify_manage_sw};
+pub use pace_channel::{
+    ChannelProof, Pin1PaceChannel, Pin1PaceChannelOps, PukPaceChannel, PukPaceChannelOps,
+    lowered_counter,
+};
 pub use pace_password::{PACE_PASSWORD_KEY_LEN, PacePasswordKey};
 pub use pin_lengths::{
     CardLengthSource, CardPinLengths, CredentialLengths, ListedLength, PinLengthRefusal,

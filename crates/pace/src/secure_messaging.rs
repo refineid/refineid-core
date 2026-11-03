@@ -36,6 +36,7 @@ use refineid_apdu::{
     ApduClass, CardTransport, CommandApdu, CommandHeader, CredentialCommand, ResponseApdu,
     StatusWord, TransportErrorExt, TransportErrorKind, TransportOutcome,
 };
+use refineid_auth::{ManageOutcome, Pin1PaceChannel, PinStatus, PukPaceChannel};
 use refineid_ber::BerTlvIter;
 
 use crate::crypto::container::{AesCbc, Ciphertext};
@@ -43,7 +44,9 @@ use crate::crypto::symmetric::{
     AES_BLOCK, Aes256Key, aes256_cbc_decrypt_no_padding, aes256_cbc_encrypt_no_padding,
     aes256_cmac_truncated, aes256_ecb_encrypt_block,
 };
-use crate::handshake::{OpenedByPin2, PaceSession, Pin2PresentationSpent, SessionKeys, Ssc};
+use crate::handshake::{
+    OpenedByPin1, OpenedByPin2, OpenedByPuk, PaceSession, Pin2PresentationSpent, SessionKeys, Ssc,
+};
 
 /// Cryptogram object tag: the encrypted, padded command or response
 /// body. The first value byte is the padding-content indicator.
@@ -117,9 +120,9 @@ const MAC_LEN: usize = 8;
 /// PACE session.
 ///
 /// `O` is the proof of the password that opened the session
-/// ([`crate::OpenedByCan`], [`crate::OpenedByPin1`] or
-/// [`crate::OpenedByPin2`]); it travels with the keys, so the channel's
-/// type says which credential the card counts verified on it.
+/// ([`crate::OpenedByCan`], [`crate::OpenedByPin1`],
+/// [`crate::OpenedByPin2`] or [`crate::OpenedByPuk`]); it travels with
+/// the keys, so the channel's type says which credential opened it.
 ///
 /// No `Debug`: the channel holds the session keys, which must never
 /// reach a formatter.
@@ -501,6 +504,30 @@ impl<T: CardTransport> SmTransport<T, OpenedByPin2> {
     /// spent; the card then needs a fresh VERIFY PIN 2 on the channel.
     pub const fn spend_pin2_presentation(&mut self) -> Result<(), Pin2PresentationSpent> {
         self.opened_by.spend()
+    }
+}
+
+/// The channel only a PACE handshake with the PUK opens: the PIN resets
+/// of `refineid_auth::PukPaceChannelOps` run on it.
+impl<T: CardTransport> PukPaceChannel for SmTransport<T, OpenedByPuk> {
+    fn puk_counter(&self) -> PinStatus {
+        self.opened_by.counter()
+    }
+
+    fn lower_puk_counter(&mut self, answer: ManageOutcome) {
+        self.opened_by.lower(answer);
+    }
+}
+
+/// The channel only a PACE handshake with PIN 1 opens: the PIN 1 change
+/// of `refineid_auth::Pin1PaceChannelOps` runs on it.
+impl<T: CardTransport> Pin1PaceChannel for SmTransport<T, OpenedByPin1> {
+    fn pin1_counter(&self) -> PinStatus {
+        self.opened_by.counter()
+    }
+
+    fn lower_pin1_counter(&mut self, answer: ManageOutcome) {
+        self.opened_by.lower(answer);
     }
 }
 

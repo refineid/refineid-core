@@ -19,7 +19,8 @@
 //! contactless interface. The citizen cards take the Card Access Number
 //! as the password; the organizational cards take PIN 1 or PIN 2
 //! instead (FINEID S1 v4.0, organizational cards, section 2.1, and
-//! FINEID S4-2 v4.0 section 6). This driver runs
+//! FINEID S4-2 v4.0 section 6), or the PUK to unblock a PIN (BSI
+//! TR-03110-3 sections B.7.1 and B.14.1). This driver runs
 //! `id-PACE-ECDH-GM-AES-CBC-CMAC-256` (BSI TR-03110-3 section A.5, ICAO
 //! Doc 9303 Part 11 section 4.4) over the standardized domain parameter
 //! the card's EF.CardAccess lists, preferring NIST P-384, then
@@ -30,10 +31,10 @@
 //! The wire flow is `MSE:Set AT` followed by four `GENERAL AUTHENTICATE`
 //! rounds: fetch and decrypt the card nonce; map the nonce to a session
 //! generator; agree an ephemeral shared point; and exchange and verify
-//! mutual authentication tokens. With a PIN as the password the card
-//! spends a try on a failed handshake, so `MSE:Set AT`'s answer is read
-//! as the PIN's tries left and the retry floor decides before the first
-//! `GENERAL AUTHENTICATE` is sent.
+//! mutual authentication tokens. With a PIN or the PUK as the password
+//! the card spends a try on a failed handshake, so `MSE:Set AT`'s answer
+//! is read as the credential's tries left and the retry floor decides
+//! before the first `GENERAL AUTHENTICATE` is sent.
 
 use elliptic_curve::ff::Field as _;
 use elliptic_curve::{FieldBytes, NonZeroScalar, Scalar};
@@ -44,8 +45,8 @@ use refineid_apdu::{
     CardTransport, CommandDataError, PinRetries, ResponseApdu, StatusWord, TransportOutcome,
 };
 use refineid_auth::{
-    FlooredCredential, PacePasswordKey, Pin1, Pin2, PinReferenceScheme, PinSlot, PinStatus,
-    RetryFloorRefusal, check_retry_floor,
+    FlooredCredential, ManageOutcome, PacePasswordKey, Pin1, Pin2, PinReferenceScheme, PinSlot,
+    PinStatus, Puk, RetryFloorRefusal, check_retry_floor, lowered_counter,
 };
 use refineid_ber::{BerEncodeError, BerError, BerTag, BerTlv};
 use refineid_pkcs15::Pkcs15Error;
@@ -102,6 +103,11 @@ pub const PASSWORD_REF_CAN: u8 = 0x02;
 /// B.14.1).
 const ORGANIZATIONAL_PIN_INITIAL_TRIES: u8 = 5;
 
+/// The tries the PUK of the organizational card starts with (FINEID S4-2
+/// v4.0 section 4.3.2), which `MSE:Set AT` answers as success in the same
+/// way.
+const ORGANIZATIONAL_PUK_INITIAL_TRIES: u8 = 5;
+
 /// `MSE:Set AT` warning: the password is deactivated (BSI TR-03110-3
 /// section B.14.1).
 const SW_PASSWORD_DEACTIVATED: u16 = 0x6283;
@@ -146,9 +152,9 @@ const TAG_ASN1_OID: u8 = 0x06;
 const TAG_PUBLIC_KEY_POINT: u8 = 0x86;
 
 /// A password a PACE handshake authenticates the channel with: the
-/// [`Can`], or a [`Pin1`] or [`Pin2`] of an organizational card.
+/// [`Can`], or a [`Pin1`], [`Pin2`] or [`Puk`] of an organizational card.
 ///
-/// Sealed: exactly these three implement it. Each names the
+/// Sealed: exactly these four implement it. Each names the
 /// [`PacePassword::OpenedBy`] proof the session it opens carries, so the
 /// password that authenticated a channel is part of the channel's type.
 /// The handshake borrows the password -- PACE never sends it, it derives
@@ -160,15 +166,17 @@ pub trait PacePassword: sealed::Sealed {
 
 /// The seal and the crate-private view of a password.
 pub(crate) mod sealed {
-    use super::{Can, Pin1, Pin2};
+    use super::{Can, Pin1, Pin2, PinStatus, Puk};
 
-    /// Implemented only here, for the three PACE passwords.
+    /// Implemented only here, for the four PACE passwords.
     pub trait Sealed {
         /// The password as the handshake drives it.
         fn password(&self) -> Password<'_>;
 
-        /// The proof a session this password opened carries.
-        fn opened_by(&self) -> <Self as super::PacePassword>::OpenedBy
+        /// The proof a session this password opened carries; `counter` is
+        /// the state the retry floor served at `MSE:Set AT`, `None` for
+        /// the Card Access Number.
+        fn opened_by(&self, counter: Option<PinStatus>) -> <Self as super::PacePassword>::OpenedBy
         where
             Self: super::PacePassword;
     }
@@ -182,6 +190,8 @@ pub(crate) mod sealed {
         Pin1(&'a Pin1),
         /// PIN 2 of an organizational card.
         Pin2(&'a Pin2),
+        /// The PUK of an organizational card.
+        Puk(&'a Puk),
     }
 }
 
@@ -194,8 +204,51 @@ pub struct OpenedByCan(pub(crate) ());
 
 /// Proof that PIN 1 opened a PACE session: the organizational card
 /// counts PIN 1 verified in that session (FINEID S4-2 v4.0 section 6).
+///
+/// It keeps PIN 1's counter as the card last reported it on the channel:
+/// the `MSE:Set AT` answer the retry floor served, lowered by every later
+/// refusal and never raised (see `refineid_auth::Pin1PaceChannel`).
 #[derive(Debug)]
-pub struct OpenedByPin1(pub(crate) ());
+pub struct OpenedByPin1 {
+    counter: PinStatus,
+}
+
+/// Proof that the PUK opened a PACE session, the channel a blocked PIN
+/// is set on (BSI TR-03110-3 section B.7.1).
+///
+/// It keeps the PUK's counter as the card last reported it on the
+/// channel: the `MSE:Set AT` answer the retry floor served, lowered by
+/// every later refusal and never raised (see
+/// `refineid_auth::PukPaceChannel`). Whether the organizational card
+/// counts the PUK verified on the channel is a hardware finding.
+#[derive(Debug)]
+pub struct OpenedByPuk {
+    counter: PinStatus,
+}
+
+impl OpenedByPin1 {
+    /// PIN 1's counter as last reported on the channel.
+    pub(crate) const fn counter(&self) -> PinStatus {
+        self.counter
+    }
+
+    /// Lower the record by the card's answer to a PIN 1 presentation.
+    pub(crate) const fn lower(&mut self, answer: ManageOutcome) {
+        self.counter = lowered_counter(self.counter, answer);
+    }
+}
+
+impl OpenedByPuk {
+    /// The PUK's counter as last reported on the channel.
+    pub(crate) const fn counter(&self) -> PinStatus {
+        self.counter
+    }
+
+    /// Lower the record by the card's answer to a PUK presentation.
+    pub(crate) const fn lower(&mut self, answer: ManageOutcome) {
+        self.counter = lowered_counter(self.counter, answer);
+    }
+}
 
 /// Proof that PIN 2 opened a PACE session: the organizational card
 /// counts PIN 2 verified in that session (FINEID S4-2 v4.0 section 6),
@@ -247,12 +300,16 @@ impl PacePassword for Pin2 {
     type OpenedBy = OpenedByPin2;
 }
 
+impl PacePassword for Puk {
+    type OpenedBy = OpenedByPuk;
+}
+
 impl sealed::Sealed for Can {
     fn password(&self) -> Password<'_> {
         Password::Can(self)
     }
 
-    fn opened_by(&self) -> OpenedByCan {
+    fn opened_by(&self, _counter: Option<PinStatus>) -> OpenedByCan {
         OpenedByCan(())
     }
 }
@@ -262,8 +319,10 @@ impl sealed::Sealed for Pin1 {
         Password::Pin1(self)
     }
 
-    fn opened_by(&self) -> OpenedByPin1 {
-        OpenedByPin1(())
+    fn opened_by(&self, counter: Option<PinStatus>) -> OpenedByPin1 {
+        OpenedByPin1 {
+            counter: counter.unwrap_or(PinStatus::NoInfo),
+        }
     }
 }
 
@@ -272,61 +331,86 @@ impl sealed::Sealed for Pin2 {
         Password::Pin2(self)
     }
 
-    fn opened_by(&self) -> OpenedByPin2 {
+    fn opened_by(&self, _counter: Option<PinStatus>) -> OpenedByPin2 {
         OpenedByPin2 { unspent: true }
+    }
+}
+
+impl sealed::Sealed for Puk {
+    fn password(&self) -> Password<'_> {
+        Password::Puk(self)
+    }
+
+    fn opened_by(&self, counter: Option<PinStatus>) -> OpenedByPuk {
+        OpenedByPuk {
+            counter: counter.unwrap_or(PinStatus::NoInfo),
+        }
     }
 }
 
 impl Password<'_> {
     /// The `MSE:Set AT` password reference. The organizational card
-    /// enables PACE under the security-data-object identifier of the PIN
-    /// (FINEID S4-2 v4.0 section 6), the PIN AUTH and PIN SIG
-    /// identifiers its VERIFY uses (section 4.3); BSI TR-03110-3 section
-    /// B.14.1 assigns the same two references.
+    /// enables PACE under the security-data-object identifier of the
+    /// credential (FINEID S4-2 v4.0 section 6), the PIN AUTH, PIN SIG and
+    /// PIN PUK identifiers its VERIFY uses (sections 4.2 and 4.3); BSI
+    /// TR-03110-3 section B.14.1 assigns the same two PIN references.
+    /// The PUK has a reference only under the organizational numbering.
     const fn reference(&self) -> u8 {
         match self {
             Self::Can(_) => PASSWORD_REF_CAN,
             Self::Pin1(_) => PinReferenceScheme::Organizational.reference(PinSlot::Pin1),
             Self::Pin2(_) => PinReferenceScheme::Organizational.reference(PinSlot::Pin2),
+            Self::Puk(_) => PinReferenceScheme::Organizational.puk_reference(),
         }
     }
 
-    /// The PIN whose retry counter a failed handshake spends; `None` for
-    /// the Card Access Number, which has no counter.
+    /// The credential whose retry counter a failed handshake spends;
+    /// `None` for the Card Access Number, which has no counter.
     const fn floored_credential(&self) -> Option<FlooredCredential> {
         match self {
             Self::Can(_) => None,
             Self::Pin1(_) => Some(FlooredCredential::Pin1),
             Self::Pin2(_) => Some(FlooredCredential::Pin2),
+            Self::Puk(_) => Some(FlooredCredential::Puk),
         }
     }
 
     /// `K_pi`, the nonce key (BSI TR-03110-3 section A.2.3): the
     /// password's character string under the password counter. A PIN's
-    /// key is derived inside the crate that owns the PIN.
+    /// or the PUK's key is derived inside the crate that owns it.
     fn key(&self) -> PasswordKey {
         match self {
             Self::Can(can) => {
                 PasswordKey::Can(kdf_aes256(can.password_bytes(), KdfParam::Password))
             }
-            Self::Pin1(pin) => PasswordKey::Pin(pin.pace_password_key()),
-            Self::Pin2(pin) => PasswordKey::Pin(pin.pace_password_key()),
+            Self::Pin1(pin) => PasswordKey::Credential(pin.pace_password_key()),
+            Self::Pin2(pin) => PasswordKey::Credential(pin.pace_password_key()),
+            Self::Puk(puk) => PasswordKey::Credential(puk.pace_password_key()),
         }
     }
 }
 
-/// A derived nonce key, from either password class; both zeroize on
-/// drop.
+/// The tries `credential` starts with on the organizational card, which
+/// `MSE:Set AT` reports as success.
+const fn initial_tries(credential: FlooredCredential) -> u8 {
+    match credential {
+        FlooredCredential::Pin1 | FlooredCredential::Pin2 => ORGANIZATIONAL_PIN_INITIAL_TRIES,
+        FlooredCredential::Puk => ORGANIZATIONAL_PUK_INITIAL_TRIES,
+    }
+}
+
+/// A derived nonce key, from the Card Access Number or from a credential
+/// `refineid-auth` owns; both zeroize on drop.
 enum PasswordKey {
     Can(Aes256Key),
-    Pin(PacePasswordKey),
+    Credential(PacePasswordKey),
 }
 
 impl PasswordKey {
     const fn as_bytes(&self) -> &[u8; AES_KEY_LEN] {
         match self {
             Self::Can(key) => key.as_bytes(),
-            Self::Pin(key) => key.as_bytes(),
+            Self::Credential(key) => key.as_bytes(),
         }
     }
 }
@@ -350,7 +434,7 @@ impl core::fmt::Debug for SessionKeys {
 
 /// A completed PACE session: its keys and send sequence counter, and the
 /// proof `O` of the password that opened it ([`OpenedByCan`],
-/// [`OpenedByPin1`] or [`OpenedByPin2`]).
+/// [`OpenedByPin1`], [`OpenedByPin2`] or [`OpenedByPuk`]).
 ///
 /// Not clonable: one PACE run establishes one channel, and duplicating the
 /// keys would let two channels share a send sequence counter -- a repeated
@@ -425,16 +509,23 @@ pub enum PaceError<E> {
     /// EF.CardAccess lists no generic-mapping AES-256 suite over a
     /// domain parameter this crate implements.
     NoSupportedSuite,
-    /// The retry floor refused the PIN before any `GENERAL
+    /// The retry floor refused the PIN or the PUK before any `GENERAL
     /// AUTHENTICATE` was sent: the card reported two, one or no tries
-    /// left, or the PIN blocked.
+    /// left, or the credential blocked.
     RetryFloor(RetryFloorRefusal),
-    /// The card reports the PIN password deactivated (BSI TR-03110-3
-    /// section B.14.1); nothing was sent after `MSE:Set AT`.
+    /// The card reports the PIN or PUK password deactivated (BSI
+    /// TR-03110-3 section B.14.1); nothing was sent after `MSE:Set AT`.
     PasswordDeactivated,
     /// The card refused the handshake with a PIN password and reports
     /// the tries left (BSI TR-03110-3 section B.14.2): a wrong PIN.
     WrongPin {
+        /// The tries the card reports left.
+        retries_left: PinRetries,
+    },
+    /// The card refused the handshake with the PUK as the password and
+    /// reports the PUK's tries left: a wrong PUK. A blocked PUK cannot be
+    /// recovered.
+    WrongPuk {
         /// The tries the card reports left.
         retries_left: PinRetries,
     },
@@ -470,11 +561,19 @@ impl<E: core::fmt::Display> core::fmt::Display for PaceError<E> {
                 f.write_str("PACE: EF.CardAccess lists no suite this software runs")
             }
             Self::RetryFloor(refusal) => write!(f, "{refusal}"),
-            Self::PasswordDeactivated => f.write_str("PACE: the card reports the PIN deactivated"),
+            Self::PasswordDeactivated => {
+                f.write_str("PACE: the card reports the password deactivated")
+            }
             Self::WrongPin { retries_left } => {
                 write!(
                     f,
                     "PACE: the card refused the PIN, {retries_left} tries left"
+                )
+            }
+            Self::WrongPuk { retries_left } => {
+                write!(
+                    f,
+                    "PACE: the card refused the PUK, {retries_left} tries left"
                 )
             }
             Self::Ber(e) => write!(f, "PACE BER: {e}"),
@@ -541,11 +640,14 @@ pub(crate) type ScalarSource<'a> = &'a mut dyn FnMut(&mut [u8]) -> Result<(), rn
 /// `PaceSession<OpenedByPin2>`, which no other password produces.
 ///
 /// A wrong Card Access Number spends no counter and surfaces as a
-/// status-word or token-mismatch failure. A PIN password is checked
-/// against the retry floor before the first `GENERAL AUTHENTICATE`: at
-/// two, one or no tries left, or a blocked or deactivated PIN, nothing
-/// further is sent. A wrong PIN surfaces as [`PaceError::WrongPin`] with
-/// the tries the card reports left.
+/// status-word or token-mismatch failure. A PIN or PUK password is
+/// checked against the retry floor before the first `GENERAL
+/// AUTHENTICATE`: at two, one or no tries left, or a blocked or
+/// deactivated credential, nothing further is sent. A wrong PIN surfaces
+/// as [`PaceError::WrongPin`] and a wrong PUK as [`PaceError::WrongPuk`],
+/// each with the tries the card reports left. A session the PUK opened is
+/// a `PaceSession<OpenedByPuk>`, the channel the PIN resets of
+/// `refineid_auth::PukPaceChannelOps` run on.
 ///
 /// # Errors
 ///
@@ -557,11 +659,20 @@ pub fn run_pace<T: CardTransport, P: PacePassword>(
     card_access: &CardAccess,
     password: &P,
 ) -> Result<PaceSession<P::OpenedBy>, PaceError<T::Error>> {
-    let keys = run_pace_drawing(transport, card_access, &password.password(), &mut rng::fill)?;
+    let completed = run_pace_drawing(transport, card_access, &password.password(), &mut rng::fill)?;
     Ok(PaceSession {
-        keys,
-        opened_by: password.opened_by(),
+        keys: completed.keys,
+        opened_by: password.opened_by(completed.counter),
     })
+}
+
+/// What a completed handshake hands to the session.
+pub(crate) struct Completed {
+    /// The session keys and counter.
+    pub(crate) keys: SessionKeys,
+    /// The credential state the retry floor served at `MSE:Set AT`;
+    /// `None` for the Card Access Number.
+    pub(crate) counter: Option<PinStatus>,
 }
 
 /// [`run_pace`] with the terminal's scalars drawn from `draw`.
@@ -570,7 +681,7 @@ pub(crate) fn run_pace_drawing<T: CardTransport>(
     card_access: &CardAccess,
     password: &Password<'_>,
     draw: ScalarSource<'_>,
-) -> Result<SessionKeys, PaceError<T::Error>> {
+) -> Result<Completed, PaceError<T::Error>> {
     let suite = card_access
         .generic_mapping_suite()
         .ok_or(PaceError::NoSupportedSuite)?;
@@ -589,12 +700,13 @@ fn handshake<C: PaceCurve, T: CardTransport>(
     suite: PaceInfo,
     password: &Password<'_>,
     draw: ScalarSource<'_>,
-) -> Result<SessionKeys, PaceError<T::Error>> {
-    set_authentication_template(transport, suite, password)?;
+) -> Result<Completed, PaceError<T::Error>> {
+    let counter = set_authentication_template(transport, suite, password)?;
     // The mapping nonce lives in a scrubbed buffer for its whole lifetime.
     let nonce = get_encrypted_nonce(transport, password)?;
     let state = map_nonce_and_key_agreement::<C, T>(transport, password, &nonce, draw)?;
-    run_mutual_authentication(transport, suite, password, state)
+    let keys = run_mutual_authentication(transport, suite, password, state)?;
+    Ok(Completed { keys, counter })
 }
 
 /// Transmit a replay-safe command and demand a real response.
@@ -610,8 +722,8 @@ fn transmit<T: CardTransport>(
 }
 
 /// Transmit one `GENERAL AUTHENTICATE` round and demand success. With a
-/// PIN password, a counter answer names a wrong PIN (BSI TR-03110-3
-/// section B.14.2).
+/// PIN or PUK password, a counter answer names a wrong credential (BSI
+/// TR-03110-3 section B.14.2).
 fn exchange_round<T: CardTransport>(
     transport: &mut T,
     password: &Password<'_>,
@@ -623,7 +735,15 @@ fn exchange_round<T: CardTransport>(
         return Ok(response);
     }
     match (password.floored_credential(), response.status_word()) {
-        (Some(_pin), StatusWord::PinIncorrect { retries }) => Err(PaceError::WrongPin {
+        (Some(FlooredCredential::Puk), StatusWord::PinIncorrect { retries }) => {
+            Err(PaceError::WrongPuk {
+                retries_left: retries,
+            })
+        }
+        (
+            Some(FlooredCredential::Pin1 | FlooredCredential::Pin2),
+            StatusWord::PinIncorrect { retries },
+        ) => Err(PaceError::WrongPin {
             retries_left: retries,
         }),
         (_, status) => Err(PaceError::Status(stage, status)),
@@ -631,13 +751,14 @@ fn exchange_round<T: CardTransport>(
 }
 
 /// Step one: announce the mechanism, password reference, and domain,
-/// then, for a PIN, read the answer as the PIN's tries left and apply
-/// the retry floor.
+/// then, for a PIN or the PUK, read the answer as the credential's tries
+/// left and apply the retry floor. Returns the state the floor served,
+/// `None` for the Card Access Number.
 fn set_authentication_template<T: CardTransport>(
     transport: &mut T,
     suite: PaceInfo,
     password: &Password<'_>,
-) -> Result<(), PaceError<T::Error>> {
+) -> Result<Option<PinStatus>, PaceError<T::Error>> {
     let mechanism = suite.protocol_oid();
     let mut encoder = refineid_ber::BerEncoder::with_capacity(mechanism.len());
     encoder.push_tlv(TAG_MSE_MECHANISM, mechanism)?;
@@ -651,20 +772,21 @@ fn set_authentication_template<T: CardTransport>(
     let status = response.status_word();
     let Some(credential) = password.floored_credential() else {
         return if response.is_ok() {
-            Ok(())
+            Ok(None)
         } else {
             Err(PaceError::Status("MSE:Set AT", status))
         };
     };
     let pin_status = match status {
-        StatusWord::Success => PinRetries::from_nibble(ORGANIZATIONAL_PIN_INITIAL_TRIES)
+        StatusWord::Success => PinRetries::from_nibble(initial_tries(credential))
             .map_or(PinStatus::NoInfo, PinStatus::Remaining),
         StatusWord::PinIncorrect { retries } if retries.is_exhausted() => PinStatus::Locked,
         StatusWord::PinIncorrect { retries } => PinStatus::Remaining(retries),
         StatusWord::Other(SW_PASSWORD_DEACTIVATED) => return Err(PaceError::PasswordDeactivated),
         other => return Err(PaceError::Status("MSE:Set AT", other)),
     };
-    check_retry_floor(credential, pin_status).map_err(PaceError::RetryFloor)
+    check_retry_floor(credential, pin_status).map_err(PaceError::RetryFloor)?;
+    Ok(Some(pin_status))
 }
 
 /// Step two: fetch and decrypt the card's nonce: a non-zero multiple of
@@ -917,8 +1039,8 @@ mod tests {
         ResponseApdu, StatusWord, TransportOutcome,
     };
     use refineid_auth::{
-        FlooredCredential, Pin1, Pin2, PinReferenceScheme, PinSlot, RetryFloorRefusal,
-        UnvalidatedSecret,
+        FlooredCredential, PUK_REFERENCE_ORGANIZATIONAL, Pin1, Pin2, PinReferenceScheme, PinSlot,
+        PinStatus, Puk, RetryFloorRefusal, UnvalidatedSecret,
     };
     use refineid_ber::{BerTag, BerTlv};
 
@@ -962,6 +1084,8 @@ mod tests {
     /// A synthetic password: six ASCII digits, valid as a CAN and as a
     /// PIN.
     const PASSWORD_TEXT: &str = "123456";
+    /// A synthetic PUK: eight ASCII digits, the PUK's shortest length.
+    const PUK_TEXT: &[u8] = b"20481632";
     /// A synthetic nonce, one AES block of ASCII.
     const SYNTHETIC_NONCE: &[u8; NONCE_LEN] = b"synthetic nonce.";
     /// A synthetic nonce, two AES blocks of ASCII, as the organizational
@@ -1042,6 +1166,11 @@ mod tests {
             PASSWORD_TEXT.as_bytes().to_vec(),
         ))
         .expect("fixture is a valid PIN 2")
+    }
+
+    fn puk() -> Puk {
+        Puk::reconstruct(UnvalidatedSecret::from_owned_bytes(PUK_TEXT.to_vec()))
+            .expect("fixture is a valid PUK")
     }
 
     fn access(bytes: Vec<u8>) -> CardAccess {
@@ -1174,6 +1303,7 @@ mod tests {
         k_mac: Option<Aes256Key>,
         nonce: Vec<u8>,
         nonce_reply: Option<Vec<u8>>,
+        password: &'static [u8],
     }
 
     impl<C: PaceCurve> HonestCard<C> {
@@ -1191,6 +1321,7 @@ mod tests {
                 k_mac: None,
                 nonce: SYNTHETIC_NONCE.to_vec(),
                 nonce_reply: None,
+                password: PASSWORD_TEXT.as_bytes(),
             }
         }
 
@@ -1210,7 +1341,7 @@ mod tests {
         /// password's ASCII digits with this crate's own KDF, so a PIN
         /// password is checked against the CAN encoding.
         fn encrypted_nonce(&self) -> Vec<u8> {
-            let k_pi = kdf_aes256(PASSWORD_TEXT.as_bytes(), KdfParam::Password);
+            let k_pi = kdf_aes256(self.password, KdfParam::Password);
             aes256_cbc_encrypt_no_padding(k_pi.as_bytes(), &BSI_TR03110_ZERO_IV, &self.nonce)
                 .expect("one block")
                 .as_bytes()
@@ -1321,6 +1452,14 @@ mod tests {
         card_access: &CardAccess,
         password: &Password<'_>,
     ) -> Result<super::SessionKeys, PaceError<String>> {
+        run_counted(card, card_access, password).map(|completed| completed.keys)
+    }
+
+    fn run_counted<C: PaceCurve>(
+        card: &mut HonestCard<C>,
+        card_access: &CardAccess,
+        password: &Password<'_>,
+    ) -> Result<super::Completed, PaceError<String>> {
         run_pace_drawing(card, card_access, password, &mut super::rng::fill)
     }
 
@@ -1462,11 +1601,11 @@ mod tests {
             .x_coordinate()
             .expect("finite");
         assert_eq!(
-            session.k_enc.as_bytes(),
+            session.keys.k_enc.as_bytes(),
             kdf_aes256(shared_x.as_slice(), KdfParam::Encryption).as_bytes()
         );
         assert_eq!(
-            session.k_mac.as_bytes(),
+            session.keys.k_mac.as_bytes(),
             card.k_mac.expect("key agreement ran").as_bytes()
         );
     }
@@ -1698,6 +1837,126 @@ mod tests {
         let result = run(&mut card, &card_access, &Password::Pin1(&pin));
         assert_eq!(card.exchanges, 0);
         assert!(matches!(result, Err(PaceError::NoSupportedSuite)));
+    }
+
+    /// A PUK handshake on the organizational suite, NIST P-384 with the
+    /// card's two-block nonce, whose card answers `MSE:Set AT` with
+    /// `mse_status`.
+    fn puk_run_with_mse_status(
+        mse_status: StatusWord,
+    ) -> (
+        HonestCard<p384::NistP384>,
+        Result<super::Completed, PaceError<String>>,
+    ) {
+        let card_access = access(organizational_card_access());
+        let suite = generic(PaceDomain::NistP384, &card_access);
+        let mut card = HonestCard::<p384::NistP384>::new(suite, PUK_REFERENCE_ORGANIZATIONAL);
+        card.password = PUK_TEXT;
+        card.nonce = TWO_BLOCK_NONCE.to_vec();
+        card.mse_status = mse_status;
+        let puk = puk();
+        let result = run_counted(&mut card, &card_access, &Password::Puk(&puk));
+        (card, result)
+    }
+
+    #[test]
+    fn the_puk_is_announced_under_the_organizational_puk_reference_and_completes() {
+        let (card, result) = puk_run_with_mse_status(StatusWord::Success);
+        let completed = result.expect("the card accepts the PUK");
+        assert_eq!(card.exchanges, EXCHANGES_THROUGH_TOKENS);
+        let suite = generic(PaceDomain::NistP384, &access(organizational_card_access()));
+        assert_eq!(
+            card.commands[EXCHANGE_MSE],
+            expected_mse_wire(suite, PUK_REFERENCE_ORGANIZATIONAL)
+        );
+        assert_eq!(
+            completed.keys.k_mac.as_bytes(),
+            card.k_mac.expect("key agreement ran").as_bytes()
+        );
+    }
+
+    #[test]
+    fn the_puk_reference_is_the_organizational_numbering_s_puk() {
+        assert_eq!(
+            Password::Puk(&puk()).reference(),
+            PinReferenceScheme::Organizational.puk_reference()
+        );
+    }
+
+    #[test]
+    fn a_success_answer_is_the_puk_s_initial_tries_and_travels_to_the_session() {
+        let (_card, result) = puk_run_with_mse_status(StatusWord::Success);
+        let counter = result.expect("succeeds").counter;
+        assert!(matches!(
+            counter,
+            Some(PinStatus::Remaining(tries)) if tries.get() == super::ORGANIZATIONAL_PUK_INITIAL_TRIES
+        ));
+    }
+
+    #[test]
+    fn the_floor_serves_the_puk_at_three_tries_and_the_session_keeps_the_count() {
+        let (card, result) = puk_run_with_mse_status(counter(TRIES_AT_FLOOR));
+        assert_eq!(card.exchanges, EXCHANGES_THROUGH_TOKENS);
+        assert!(matches!(
+            result.expect("succeeds").counter,
+            Some(PinStatus::Remaining(tries)) if tries.get() == TRIES_AT_FLOOR
+        ));
+    }
+
+    #[test]
+    fn the_floor_refuses_the_puk_at_two_one_and_no_tries_and_sends_nothing_further() {
+        for tries in [TRIES_BELOW_FLOOR, TRIES_SUSPENDED] {
+            let (card, result) = puk_run_with_mse_status(counter(tries));
+            assert_eq!(card.exchanges, EXCHANGES_THROUGH_MSE);
+            assert!(matches!(
+                result,
+                Err(PaceError::RetryFloor(RetryFloorRefusal::TriesBelowFloor {
+                    credential: FlooredCredential::Puk,
+                    remaining,
+                })) if remaining.get() == tries
+            ));
+        }
+        let (card, result) = puk_run_with_mse_status(counter(0));
+        assert_eq!(card.exchanges, EXCHANGES_THROUGH_MSE);
+        assert!(matches!(
+            result,
+            Err(PaceError::RetryFloor(RetryFloorRefusal::Blocked {
+                credential: FlooredCredential::Puk,
+            }))
+        ));
+    }
+
+    #[test]
+    fn a_deactivated_or_unknown_puk_reference_sends_nothing_further() {
+        let (card, result) = puk_run_with_mse_status(StatusWord::from_u16(SW_PASSWORD_DEACTIVATED));
+        assert_eq!(card.exchanges, EXCHANGES_THROUGH_MSE);
+        assert!(matches!(result, Err(PaceError::PasswordDeactivated)));
+
+        let (card, result) = puk_run_with_mse_status(StatusWord::ReferenceDataNotFound);
+        assert_eq!(card.exchanges, EXCHANGES_THROUGH_MSE);
+        assert!(matches!(
+            result,
+            Err(PaceError::Status(
+                "MSE:Set AT",
+                StatusWord::ReferenceDataNotFound
+            ))
+        ));
+    }
+
+    #[test]
+    fn a_counter_answer_to_a_puk_handshake_is_a_wrong_puk() {
+        let card_access = access(organizational_card_access());
+        let suite = generic(PaceDomain::NistP384, &card_access);
+        let mut card = HonestCard::<p384::NistP384>::new(suite, PUK_REFERENCE_ORGANIZATIONAL);
+        card.password = PUK_TEXT;
+        card.token_status = counter(TRIES_AFTER_ONE_WRONG);
+        let puk = puk();
+        let result = run(&mut card, &card_access, &Password::Puk(&puk));
+        assert_eq!(card.exchanges, EXCHANGES_THROUGH_TOKENS);
+        assert!(matches!(
+            result,
+            Err(PaceError::WrongPuk { retries_left }) if retries_left.get() == TRIES_AFTER_ONE_WRONG
+        ));
     }
 
     #[test]

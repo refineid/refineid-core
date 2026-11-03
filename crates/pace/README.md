@@ -18,11 +18,14 @@ publishes. `run_pace` drives `id-PACE-ECDH-GM-AES-CBC-CMAC-256` over the
 domain parameter it picks there -- NIST P-384, brainpoolP384r1, or NIST
 P-256 -- and returns the session: its keys and, in its type, the proof
 of the password that opened it (`OpenedByCan`, `OpenedByPin1`,
-`OpenedByPin2`). `SmTransport` wraps a raw transport with those keys,
-keeps the proof, and is itself a card transport, so the layers above it
-stay unaware of the protection, credential commands stay consumed
-exactly once end to end, and a layer that needs PIN 2 verified can ask
-for a channel PIN 2 opened by its type. The `testkit` feature adds a
+`OpenedByPin2`, `OpenedByPuk`). `SmTransport` wraps a raw transport with
+those keys, keeps the proof, and is itself a card transport, so the
+layers above it stay unaware of the protection, credential commands stay
+consumed exactly once end to end, and a layer that needs PIN 2 verified
+can ask for a channel PIN 2 opened by its type. A channel the PUK opened
+implements `refineid_auth::PukPaceChannel`, where the PIN resets of
+activation and unblock run, and a channel PIN 1 opened implements
+`refineid_auth::Pin1PaceChannel`, where PIN 1 is changed. The `testkit` feature adds a
 synthetic organization card for the tests of those layers; no
 production build enables it.
 

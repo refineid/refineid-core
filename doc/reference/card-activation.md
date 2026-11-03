@@ -117,6 +117,11 @@ Observed on an Idemia Cosmo X organization card (see
   PIN 1 (reference 3) and PIN 2 (reference 4) as the PACE password,
   answering `9000` at five tries left. PACE with a PIN, its retry floor
   and the curve choice are in [PACE](pace.md).
+- With both PINs blocked, PACE with a PIN is refused, so contactless
+  activation runs on a channel PACE opened with the PUK (reference
+  `12`, which `MSE:Set AT` accepts with `9000`): one RESET RETRY
+  COUNTER per PIN, as [PACE](pace.md) describes. Which proof the card
+  accepts on that channel has not been observed.
 
 ## PIN lengths
 

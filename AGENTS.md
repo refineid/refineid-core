@@ -118,8 +118,13 @@ Mechanical requirements, all of them, before any commit:
   pinned protocol corpus) are the sole, temporary exception;
 - new dependencies are exceptional and justified; nothing that drags a
   second DER stack or duplicates what a crate here already does;
+- prefer a maintained cryptography crate over own arithmetic: when a
+  crate carries the curve, delete the own code, and remove code paths
+  for parameter encodings with no consumer instead of validating them;
 - safe Rust only; protocol, parsing, and secret handling never in
-  `unsafe`.
+  `unsafe`;
+- `rust-toolchain.toml` selects the stable channel; never pin a Rust
+  release.
 
 ## The floor is not the goal
 
@@ -148,6 +153,11 @@ before and the correction made the core better.
 - Claims about card behaviour, cryptography, or platform interfaces are
   verified against a primary source -- the FINEID specifications, ISO,
   the RFCs -- not assumed from memory.
+- Cite specifications by document and section; never copy spec text
+  verbatim into the tree.
+- New files carry `Copyright 2026 Petri Koistinen` with no email address
+  and HTTPS license URLs; shell scripts carry the one-line form under
+  the shebang.
 
 ## Worktree policy
 
@@ -166,6 +176,8 @@ before and the correction made the core better.
 ## Working discipline
 
 - Never poll background commands or set rapid check timers (e.g. 10s-30s). When running builds, tests, or async tasks, execute asynchronously and wait strictly for system completion notifications.
+- If something is not working, it is a bug in our code or harness, not
+  a card limitation, until exchange-level evidence says otherwise.
 
 ## Protocol specifications
 
@@ -176,6 +188,8 @@ before and the correction made the core better.
   pull requests.
 - Document and protocol versions are stamped by the project owner; never
   invent one.
+- Document stamps are UTC dates. Only the owner amends a stamp in
+  place, and only while its UTC day has not passed.
 
 ## Rules live here, not in an agent's memory
 
@@ -189,7 +203,8 @@ rule in a line and points to the reading behind it; the readings live in
 
 - Comments explain what the code does now and the constraints it honors.
   Past bugs, previous implementations, and explanations of what a fix changed
-  belong in commit messages, not source comments.
+  belong in commit messages, not source comments. No measurement dates or
+  provenance in comments.
 
 ## Commits and integration
 
@@ -246,6 +261,8 @@ rule in a line and points to the reading behind it; the readings live in
   ones (EU eIDAS), from trusted lists at runtime. No certificates or
   fingerprints are shipped in the software.
 - No pinning or other trust policy is added without the owner's decision.
+- Describe what the code does and cite the source; ask the owner before
+  changing trust behavior.
 
 ## Independent review
 

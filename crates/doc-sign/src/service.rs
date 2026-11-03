@@ -63,6 +63,9 @@ pub mod reader;
 /// outside this window must not choose the certificate-validation instant.
 const MAX_TIMESTAMP_CLOCK_SKEW: core::time::Duration = core::time::Duration::from_mins(5);
 
+// A timestamp authority meters tokens and holds concurrent requests
+// (HTTP 429), so finishing stays sequential and bounded.
+
 /// Initial wait after a transient timestamp-authority failure.
 const TIMESTAMP_RETRY_INITIAL_DELAY: core::time::Duration = core::time::Duration::from_secs(1);
 /// Ceiling for repeated timestamp-authority retries.

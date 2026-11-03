@@ -30,10 +30,16 @@
 use core::fmt;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-/// Number of ASCII digits in a FINEID Card Access Number.
+/// Number of ASCII digits in a FINEID Card Access Number for citizen cards.
 ///
 /// ICAO Doc 9303 Part 5 section 3.2.3 specifies a six-digit numeric CAN.
 pub const CAN_DIGITS: usize = 6;
+
+/// Minimum number of ASCII digits in a FINEID Card Access Number (FINEID S1 v4.0).
+pub const CAN_MIN_DIGITS: usize = 4;
+
+/// Maximum number of ASCII digits in a FINEID Card Access Number (FINEID S1 v4.0).
+pub const CAN_MAX_DIGITS: usize = 12;
 
 /// Explicitly unvalidated, owned CAN text at an input boundary.
 ///
@@ -64,7 +70,10 @@ impl fmt::Debug for UnvalidatedCan {
 /// public raw-value accessor. A future PACE command constructor will consume
 /// it through a crate-private path.
 #[derive(ZeroizeOnDrop)]
-pub struct Can([u8; CAN_DIGITS]);
+pub struct Can {
+    bytes: [u8; CAN_MAX_DIGITS],
+    len: u8,
+}
 
 impl fmt::Debug for Can {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -77,7 +86,7 @@ impl fmt::Debug for Can {
 pub enum CanError {
     /// No bytes were supplied.
     Empty,
-    /// The candidate did not contain exactly [`CAN_DIGITS`] bytes.
+    /// The candidate did not contain between [`CAN_MIN_DIGITS`] and [`CAN_MAX_DIGITS`] bytes.
     WrongLength,
     /// The candidate contained a non-ASCII-digit byte.
     NonDigit,
@@ -94,22 +103,25 @@ impl Can {
         if bytes.is_empty() {
             return Err(CanError::Empty);
         }
-        if bytes.len() != CAN_DIGITS {
+        if bytes.len() < CAN_MIN_DIGITS || bytes.len() > CAN_MAX_DIGITS {
             return Err(CanError::WrongLength);
         }
         if bytes.iter().any(|byte| !byte.is_ascii_digit()) {
             return Err(CanError::NonDigit);
         }
 
-        let mut reconstructed = [0_u8; CAN_DIGITS];
-        reconstructed.copy_from_slice(bytes);
-        Ok(Self(reconstructed))
+        let mut reconstructed = [0_u8; CAN_MAX_DIGITS];
+        reconstructed[..bytes.len()].copy_from_slice(bytes);
+        Ok(Self {
+            bytes: reconstructed,
+            len: bytes.len() as u8,
+        })
     }
 
     /// Number of validated CAN digits.
     #[must_use]
     pub const fn digit_count(&self) -> usize {
-        CAN_DIGITS
+        self.len as usize
     }
 
     /// Borrow the validated digits for the PACE key-derivation step.
@@ -117,8 +129,8 @@ impl Can {
     /// This is the crate-private path the handshake consumes the CAN
     /// through: the value never leaves this crate as raw bytes, and no
     /// public `as_bytes` accessor exists.
-    pub(crate) const fn password_bytes(&self) -> &[u8; CAN_DIGITS] {
-        &self.0
+    pub(crate) fn password_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
     }
 }
 
@@ -127,7 +139,10 @@ impl fmt::Display for CanError {
         match self {
             Self::Empty => f.write_str("CAN cannot be empty"),
             Self::WrongLength => {
-                write!(f, "CAN must contain exactly {CAN_DIGITS} digits")
+                write!(
+                    f,
+                    "CAN must contain between {CAN_MIN_DIGITS} and {CAN_MAX_DIGITS} digits"
+                )
             }
             Self::NonDigit => f.write_str("CAN must contain ASCII digits only"),
         }
@@ -138,7 +153,7 @@ impl core::error::Error for CanError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{CAN_DIGITS, Can, CanError, UnvalidatedCan};
+    use super::{CAN_DIGITS, CAN_MAX_DIGITS, CAN_MIN_DIGITS, Can, CanError, UnvalidatedCan};
 
     fn input(text: &str) -> UnvalidatedCan {
         UnvalidatedCan::from_owned_text(text.to_owned())
@@ -148,18 +163,27 @@ mod tests {
     fn valid_input_is_reconstructed_once() {
         let can = Can::reconstruct(input("123456")).expect("fixture is a valid CAN");
         assert_eq!(can.digit_count(), CAN_DIGITS);
-        assert_eq!(can.0, *b"123456");
+        assert_eq!(can.password_bytes(), b"123456");
+    }
+
+    #[test]
+    fn variable_lengths() {
+        for valid in ["1234", "12345", "123456", "12345678", "123456789012"] {
+            let can = Can::reconstruct(input(valid)).expect("valid CAN candidate");
+            assert_eq!(can.digit_count(), valid.len());
+            assert_eq!(can.password_bytes(), valid.as_bytes());
+        }
     }
 
     #[test]
     fn structural_failures_are_typed() {
         assert!(matches!(Can::reconstruct(input("")), Err(CanError::Empty)));
         assert!(matches!(
-            Can::reconstruct(input("12345")),
+            Can::reconstruct(input("123")),
             Err(CanError::WrongLength)
         ));
         assert!(matches!(
-            Can::reconstruct(input("1234567")),
+            Can::reconstruct(input("1234567890123")),
             Err(CanError::WrongLength)
         ));
         assert!(matches!(
@@ -177,7 +201,7 @@ mod tests {
         let wrong_len = CanError::WrongLength;
         assert_eq!(
             format!("{wrong_len}"),
-            format!("CAN must contain exactly {CAN_DIGITS} digits")
+            format!("CAN must contain between {CAN_MIN_DIGITS} and {CAN_MAX_DIGITS} digits")
         );
         assert_eq!(format!("{wrong_len:?}"), "WrongLength");
 

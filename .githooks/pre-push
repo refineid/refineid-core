@@ -8,7 +8,8 @@
 # The gate verifies the commit being pushed, not whatever happens to be
 # checked out: when the pushed commit is the clean HEAD of this tree it
 # runs here, and otherwise in a temporary worktree of that commit, with
-# this tree's build cache.
+# a build cache of its own under this tree's target directory, so no
+# binary built there is ever reused here.
 set -eu
 
 root=$(git rev-parse --show-toplevel)
@@ -27,7 +28,7 @@ while read -r _local_ref local_sha _remote_ref _remote_sha; do
     git worktree add --detach --quiet "$tmp" "$local_sha"
     trap 'git worktree remove --force "$tmp"' EXIT INT TERM
     echo "pre-push: verifying $(git rev-parse --short "$local_sha") in a clean worktree"
-    (cd "$tmp" && CARGO_TARGET_DIR="$root/target" "$tmp/scripts/verify-push.sh")
+    (cd "$tmp" && CARGO_TARGET_DIR="$root/target/pushed-commit" "$tmp/scripts/verify-push.sh")
     git worktree remove --force "$tmp"
     trap - EXIT INT TERM
 done

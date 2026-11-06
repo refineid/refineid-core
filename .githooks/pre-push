@@ -4,7 +4,30 @@
 # Mandatory pre-push gate; enabled per clone by scripts/install-hooks.sh.
 # Bypassing it (--no-verify or otherwise) is prohibited for every
 # contributor, human or AI agent alike.
+#
+# The gate verifies the commit being pushed, not whatever happens to be
+# checked out: when the pushed commit is the clean HEAD of this tree it
+# runs here, and otherwise in a temporary worktree of that commit, with
+# this tree's build cache.
 set -eu
 
 root=$(git rev-parse --show-toplevel)
-exec "$root/scripts/verify-push.sh"
+zero=0000000000000000000000000000000000000000
+head=$(git rev-parse HEAD)
+
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+    if [ "$local_sha" = "$zero" ]; then
+        continue
+    fi
+    if [ "$local_sha" = "$head" ] && git diff --quiet && git diff --cached --quiet; then
+        "$root/scripts/verify-push.sh"
+        continue
+    fi
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/refineid-core-push.XXXXXX")
+    git worktree add --detach --quiet "$tmp" "$local_sha"
+    trap 'git worktree remove --force "$tmp"' EXIT INT TERM
+    echo "pre-push: verifying $(git rev-parse --short "$local_sha") in a clean worktree"
+    (cd "$tmp" && CARGO_TARGET_DIR="$root/target" "$tmp/scripts/verify-push.sh")
+    git worktree remove --force "$tmp"
+    trap - EXIT INT TERM
+done

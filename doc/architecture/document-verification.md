@@ -224,7 +224,12 @@ For each signature the report carries independent facts:
   covers the validation time, built offline from the material pool:
   name chaining, signatures, validity at the validation time, basic
   constraints, key usage, path length, no name constraints, no critical
-  extension the verifier does not process, depth bound. The signer
+  extension the verifier does not process, depth bound. The search
+  for anchored paths, and apart from it the partial path, spends a
+  bounded number of signature verifications; a search that spends them
+  all keeps the paths it has found, so an issuer graph the evidence
+  inflates can only leave the chain unverified, never verify it. The
+  signer
   itself must be no CA, with a Key Usage that, when present, asserts
   digitalSignature or nonRepudiation. Every anchored path is judged and
   the best revocation outcome kept, good before unavailable before

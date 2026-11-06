@@ -517,7 +517,15 @@ impl MaterialPool {
     /// for `role` at `at` or a CA valid at `at` allowed to issue with
     /// `intermediates_below` CA certificates between it and the end
     /// entity.
-    fn issuers_of(&self, child: Certificate<'_>, step: &Step<'_>) -> Vec<&OwnedCert> {
+    ///
+    /// Each signature verification is paid from `budget`; a candidate
+    /// the budget cannot pay for is no issuer.
+    fn issuers_of(
+        &self,
+        child: Certificate<'_>,
+        step: &Step<'_>,
+        budget: &mut SearchBudget,
+    ) -> Vec<&OwnedCert> {
         self.certificates
             .iter()
             .filter(|candidate| {
@@ -526,6 +534,7 @@ impl MaterialPool {
                     && view.subject == child.issuer
                     && (step.anchors.is_anchor(view, step.role, step.at)
                         || (valid_at(view, step.at) && may_issue(view, step.intermediates_below)))
+                    && budget.spend()
                     && child.verify_signed_by(view).is_ok()
             })
             .collect()
@@ -534,8 +543,10 @@ impl MaterialPool {
     /// The path above `certificate` as far as it goes without reaching
     /// an anchor: at each step the first pool certificate that
     /// verifiably issued the one below and is not yet on the path, up to
-    /// [`MAX_PATH_DEPTH`] certificates.
+    /// [`MAX_PATH_DEPTH`] certificates and
+    /// [`MAX_PATH_SEARCH_VERIFICATIONS`] signature verifications.
     fn partial_path(&self, certificate: &OwnedCert, step: &Step<'_>) -> Vec<OwnedCert> {
+        let mut budget = SearchBudget::new();
         let mut path: Vec<OwnedCert> = Vec::new();
         let mut top = certificate.clone();
         while path.len() < MAX_PATH_DEPTH {
@@ -544,7 +555,7 @@ impl MaterialPool {
                 ..*step
             };
             let Some(issuer) = self
-                .issuers_of(top.view(), &below)
+                .issuers_of(top.view(), &below, &mut budget)
                 .into_iter()
                 .find(|issuer| {
                     issuer.as_der() != certificate.as_der()
@@ -562,6 +573,12 @@ impl MaterialPool {
     /// Every path from the last certificate of `path` upward to an
     /// anchor, each running from the judged certificate to the anchor,
     /// appended to `found` until it holds [`MAX_ANCHORED_PATHS`].
+    ///
+    /// The search is depth first in pool order and pays every signature
+    /// verification from `budget`. Once the budget is spent it expands
+    /// no further, keeping the paths found so far: every one of them is
+    /// verified whole, so a spent budget only leaves paths unfound, as
+    /// if the evidence lacked them.
     fn anchored_paths(
         &self,
         anchors: &TrustAnchors,
@@ -569,6 +586,7 @@ impl MaterialPool {
         at: DateTime,
         path: &mut Vec<OwnedCert>,
         found: &mut Vec<Vec<OwnedCert>>,
+        budget: &mut SearchBudget,
     ) {
         if path.len() > MAX_PATH_DEPTH || found.len() >= MAX_ANCHORED_PATHS {
             return;
@@ -580,18 +598,21 @@ impl MaterialPool {
             found.push(path.clone());
             return;
         }
+        if budget.is_spent() {
+            return;
+        }
         let step = Step {
             anchors,
             role,
             at,
             intermediates_below: path.len().saturating_sub(1),
         };
-        for issuer in self.issuers_of(top.view(), &step) {
+        for issuer in self.issuers_of(top.view(), &step, budget) {
             if path.iter().any(|seen| seen.as_der() == issuer.as_der()) {
                 continue;
             }
             path.push(issuer.clone());
-            self.anchored_paths(anchors, role, at, path, found);
+            self.anchored_paths(anchors, role, at, path, found, budget);
             path.pop();
         }
     }
@@ -697,6 +718,44 @@ struct Step<'a> {
     intermediates_below: usize,
 }
 
+/// The signature verifications a path search may still spend, from
+/// [`MAX_PATH_SEARCH_VERIFICATIONS`].
+#[derive(Debug)]
+struct SearchBudget {
+    /// Verifications left.
+    remaining: usize,
+}
+
+impl SearchBudget {
+    /// A full budget.
+    const fn new() -> Self {
+        Self {
+            remaining: MAX_PATH_SEARCH_VERIFICATIONS,
+        }
+    }
+
+    /// Pay for one verification; `false`, paying nothing, when the
+    /// budget is spent.
+    const fn spend(&mut self) -> bool {
+        let Some(remaining) = self.remaining.checked_sub(1) else {
+            return false;
+        };
+        self.remaining = remaining;
+        true
+    }
+
+    /// Whether no verification is left.
+    const fn is_spent(&self) -> bool {
+        self.remaining == 0
+    }
+
+    /// The verifications paid so far.
+    #[cfg(test)]
+    const fn spent(&self) -> usize {
+        MAX_PATH_SEARCH_VERIFICATIONS - self.remaining
+    }
+}
+
 /// The two instants a judgement consults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct When {
@@ -717,6 +776,17 @@ pub(crate) const MAX_CLOCK_SKEW: core::time::Duration = core::time::Duration::fr
 /// accepts any valid path, and a real one has a handful at most.
 const MAX_ANCHORED_PATHS: usize = 16;
 
+/// Most signature verifications one path search spends: the search
+/// for anchored paths, and apart from it the partial path. The pool is
+/// filled from the document, so its issuer graph is the document's to
+/// choose: certificates that share a name and a key all issue one
+/// another, and the paths through them grow factorially with their
+/// number. Each certificate a path climbs to costs one verification
+/// that succeeds, so the budget pays for [`MAX_ANCHORED_PATHS`] paths
+/// of [`MAX_PATH_DEPTH`] certificates each, sharing nothing; a FINEID
+/// path, signer, intermediate, root, costs two.
+const MAX_PATH_SEARCH_VERIFICATIONS: usize = MAX_ANCHORED_PATHS * MAX_PATH_DEPTH;
+
 /// Judge `certificate` against `pool` and `anchors` for `role` at the
 /// validation time `when.at`.
 ///
@@ -725,8 +795,12 @@ const MAX_ANCHORED_PATHS: usize = 16;
 /// certificate valid at `at`, fit for the role, and a path ending in an
 /// anchor for `role` granted at `at`. Every anchored path is judged and
 /// the best revocation status kept (RFC 5280 sec.6 accepts any valid
-/// path): good, then unavailable, then revoked. A certificate that is
-/// itself such an anchor is anchored by its granted period alone, with
+/// path): good, then unavailable, then revoked. The search keeps at
+/// most `MAX_ANCHORED_PATHS` paths and spends at most
+/// `MAX_PATH_SEARCH_VERIFICATIONS` signature verifications, and the
+/// partial path as many again; a spent budget leaves paths unfound and
+/// never anchors one the evidence does not verify. A certificate that
+/// is itself such an anchor is anchored by its granted period alone, with
 /// nothing below it to check for revocation. Without an anchored path
 /// only the certificate is checked, against the first issuer of the
 /// partial path. The status is [`Revocation::Unavailable`] without an
@@ -766,7 +840,14 @@ pub fn judge(
     };
     let mut paths = Vec::new();
     let mut path = vec![certificate.clone()];
-    pool.anchored_paths(anchors, role, at, &mut path, &mut paths);
+    pool.anchored_paths(
+        anchors,
+        role,
+        at,
+        &mut path,
+        &mut paths,
+        &mut SearchBudget::new(),
+    );
     let best = paths
         .iter()
         .map(|path| (path, pool.path_revocation(path, when)))
@@ -909,8 +990,8 @@ fn may_issue(certificate: Certificate<'_>, intermediates_below: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnchorError, AnchorRole, GrantedPeriod, MaterialPool, Revocation, TrustAnchor,
-        TrustAnchors, When, judge,
+        AnchorError, AnchorRole, GrantedPeriod, MAX_PATH_DEPTH, MAX_PATH_SEARCH_VERIFICATIONS,
+        MaterialPool, Revocation, SearchBudget, TrustAnchor, TrustAnchors, When, judge,
     };
     use crate::crl::CrlReason;
     use crate::testkit::{
@@ -955,6 +1036,25 @@ mod tests {
     const ENDS: u8 = 28;
     /// A `pathLenConstraint` admitting no intermediate below.
     const PATH_LEN_ZERO: u8 = 0;
+    /// Common name of the certificates that all issue one another.
+    const LOOPING: &str = "Synthetic Looping CA";
+    /// Serial of the first looping certificate, above every other
+    /// serial here.
+    const FIRST_LOOPING_SERIAL: u8 = 16;
+    /// Looping certificates in the adversarial pool: enough that a
+    /// search through every path of up to [`MAX_PATH_DEPTH`]
+    /// certificates among them would spend many times
+    /// [`MAX_PATH_SEARCH_VERIFICATIONS`].
+    const LOOPING_CERTIFICATES: u8 = 6;
+    /// Verifications a two-step path costs: the signer under the
+    /// intermediate, the intermediate under the root.
+    const TWO_STEP_VERIFICATIONS: usize = 2;
+    /// Paths above the signer when its issuer is also re-issued: one
+    /// through each issuer certificate.
+    const REISSUED_PATHS: usize = 2;
+    /// Verifications two two-step paths through two issuers of the
+    /// signer cost: the signer under each, each under the root.
+    const TWO_PATH_VERIFICATIONS: usize = 4;
 
     /// Root, intermediate and signer, each with its key.
     struct Chain {
@@ -1905,5 +2005,111 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// The anchored paths `pool` holds above `signer` for certificate
+    /// issuing at [`VALIDATED`], and the verifications the search paid.
+    fn search(
+        pool: &MaterialPool,
+        signer: &OwnedCert,
+        anchors: &TrustAnchors,
+    ) -> (Vec<Vec<OwnedCert>>, usize) {
+        let mut budget = SearchBudget::new();
+        let mut found = Vec::new();
+        pool.anchored_paths(
+            anchors,
+            AnchorRole::CertificateIssuing,
+            day(VALIDATED),
+            &mut vec![signer.clone()],
+            &mut found,
+            &mut budget,
+        );
+        (found, budget.spent())
+    }
+
+    #[test]
+    fn a_pool_of_certificates_issuing_one_another_spends_the_budget_and_anchors_nothing() {
+        let chain = chain(ENDS);
+        // One key under one name, reissued under many serials and
+        // self-issued: every one verifiably issued every other, and none
+        // reaches the anchor.
+        let looping_key = TestKey::derive(TestCurve::P256, b"looping");
+        let looping: Vec<Vec<u8>> = (FIRST_LOOPING_SERIAL..)
+            .take(usize::from(LOOPING_CERTIFICATES))
+            .map(|serial| {
+                certificate(
+                    &spec(serial, LOOPING, LOOPING, ENDS, ca_extensions()),
+                    &looping_key,
+                    &looping_key,
+                )
+            })
+            .collect();
+        let looped_signer = OwnedCert::from_der(&certificate(
+            &spec(SIGNER_SERIAL, SIGNER, LOOPING, ENDS, Vec::new()),
+            &TestKey::derive(TestCurve::P256, b"looped signer"),
+            &looping_key,
+        ))
+        .expect("signer parses");
+        let mut pool = chain.pool();
+        pool.add_certificate_ders(&looping);
+        let anchors = issuing(&chain.root);
+
+        let (found, spent) = search(&pool, &looped_signer, &anchors);
+        assert!(found.is_empty());
+        assert_eq!(spent, MAX_PATH_SEARCH_VERIFICATIONS, "the bound ends it");
+
+        let verdict = judge(
+            &looped_signer,
+            &pool,
+            &anchors,
+            AnchorRole::CertificateIssuing,
+            at(VALIDATED),
+        );
+        assert!(!verdict.path.is_anchored());
+        assert!(!verdict.path.certificates().is_empty());
+        assert!(verdict.path.certificates().len() <= MAX_PATH_DEPTH);
+
+        // The real chain in the same pool is untouched by the loop.
+        let (found, spent) = search(&pool, &chain.signer, &anchors);
+        assert_eq!(found.len(), 1);
+        assert_eq!(spent, TWO_STEP_VERIFICATIONS);
+        assert!(
+            judge(
+                &chain.signer,
+                &pool,
+                &anchors,
+                AnchorRole::CertificateIssuing,
+                at(VALIDATED),
+            )
+            .path
+            .is_anchored()
+        );
+    }
+
+    #[test]
+    fn real_paths_cost_a_verification_per_step() {
+        let chain = chain(ENDS);
+        let anchors = issuing(&chain.root);
+        let (found, spent) = search(&chain.pool(), &chain.signer, &anchors);
+        assert_eq!(found.len(), 1);
+        assert_eq!(spent, TWO_STEP_VERIFICATIONS);
+
+        // The intermediate re-issued under another serial: two paths.
+        let reissued = certificate(
+            &spec(
+                SUB_INTERMEDIATE_SERIAL,
+                INTERMEDIATE,
+                ROOT,
+                ENDS,
+                ca_extensions(),
+            ),
+            &chain.intermediate_key,
+            &chain.root_key,
+        );
+        let mut pool = chain.pool();
+        pool.add_certificate_ders(&[reissued]);
+        let (found, spent) = search(&pool, &chain.signer, &anchors);
+        assert_eq!(found.len(), REISSUED_PATHS);
+        assert_eq!(spent, TWO_PATH_VERIFICATIONS);
     }
 }

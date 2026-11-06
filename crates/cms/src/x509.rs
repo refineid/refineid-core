@@ -264,11 +264,12 @@ impl Certificate<'_> {
 
 /// A typed X.509 `Name` (Distinguished Name) view.
 ///
-/// Wraps the DER bytes of a `RDNSequence`, with attribute lookups as
-/// methods so callers pass a `Name`, never a raw `&[u8]` DN blob. The
-/// bytes are already parse-validated when the `Name` comes from a
-/// [`Certificate`]; [`Name::try_from`] is the boundary that mints one
-/// from raw bytes.
+/// Wraps the DER bytes of a `RDNSequence` so callers pass a `Name`,
+/// never a raw `&[u8]` DN blob. A `Name` is one DER TLV; the
+/// `RelativeDistinguishedName`s inside it are not walked. That is
+/// enough for what consumers do with it: compare it byte for byte with
+/// another name, and hash it for an OCSP `IssuerNameHash`.
+/// [`Name::try_from`] is the boundary that mints one from raw bytes.
 ///
 /// `PartialEq`/`Eq` compare the underlying DN DER byte-for-byte --
 /// the exact-match test certificate-chain building uses to pair a
@@ -281,9 +282,9 @@ pub struct Name<'a> {
 }
 
 impl<'a> Name<'a> {
-    /// Wrap DN bytes already validated upstream (e.g. the
-    /// `subject`/`issuer` field of a parsed [`Certificate`]). No
-    /// re-check -- the cert parse established the structure.
+    /// Wrap DN bytes taken whole from a parsed structure (e.g. the
+    /// `subject`/`issuer` field of a parsed [`Certificate`]), whose
+    /// parser read them as one TLV. No further check.
     #[must_use]
     pub(crate) const fn from_validated(dn_der: &'a [u8]) -> Self {
         Self { dn_der }
@@ -296,8 +297,9 @@ impl<'a> Name<'a> {
     }
 }
 
-/// Boundary parser: mint a [`Name`] from raw DN DER, validating it
-/// decodes as a `RDNSequence` SEQUENCE.
+/// Boundary parser: mint a [`Name`] from raw DN DER. Checks that the
+/// bytes are exactly one DER TLV with the SEQUENCE tag; the
+/// `RelativeDistinguishedName`s inside are not walked (see [`Name`]).
 impl<'a> TryFrom<&'a [u8]> for Name<'a> {
     type Error = X509Error;
     fn try_from(dn_der: &'a [u8]) -> Result<Self, X509Error> {
@@ -557,9 +559,8 @@ fn parse_tbs<'a>(
         .tlv_bytes()
         .map_err(|_ignored| X509Error::UnexpectedStructure("TBS signature alg"))?;
 
-    // issuer Name -- the whole SEQUENCE bytes (tag/len/value).
-    // The cert-parse walk validated the SEQUENCE structure, so wrap
-    // via the already-validated constructor.
+    // issuer Name -- the whole TLV bytes (tag/len/value), read as one
+    // TLV by the walk above and wrapped as they are.
     let issuer = Name::from_validated(
         reader
             .tlv_bytes()

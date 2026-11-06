@@ -42,7 +42,8 @@ activation PIN as the PUK, reads the PUK's counter first and refuses
 below the floor before anything carrying the PUK is sent. An activation
 by the preset activation PIN reads each PIN's counter and refuses at two
 or one tries left for either PIN before any CHANGE REFERENCE DATA; at no
-tries left, blocked, or unreadable the card answers for itself. The citizen
+tries left or blocked the card answers for itself; an unreadable
+counter refuses, as everywhere. The citizen
 card unblocks in one command; the
 organizational card verifies the PUK as its own object and then resets
 with only the new PIN. A wrong current PIN or PUK is reported as a typed

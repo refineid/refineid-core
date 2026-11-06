@@ -44,7 +44,7 @@ use refineid_pkcs15::{Pkcs15Error, Pkcs15Ops};
 
 use crate::credentials::{Pin1, Pin2, Puk};
 use crate::pin_lengths::CardPinLengths;
-use crate::retry_risk::{FlooredCredential, check_retry_floor};
+use crate::retry_risk::{FlooredCredential, PinRetryRisk, RetryFloorRefusal, check_retry_floor};
 use crate::verify::{
     AuthError, PinOps, PinReferenceScheme, PinSlot, PinStatus, VERIFY_INS, VERIFY_P1,
     credential_exchange,
@@ -241,6 +241,89 @@ pub(crate) fn reset_new_only<T: CardTransport + ?Sized>(
     Ok(classify_manage_sw(status))
 }
 
+/// Refuse an activation PIN change where it would spend one of the
+/// PIN's last two tries, or where the counter cannot be read and so a
+/// last try might be spent unknowingly. At no tries left or blocked the
+/// change goes to the card: it answers for itself and spends nothing,
+/// and which code the holder has in hand (this scheme's activation PIN,
+/// or a PUK) is inferred, never known, so the software does not close
+/// a recovery the card would allow.
+///
+/// # Errors
+///
+/// [`RetryFloorRefusal::TriesBelowFloor`] at two or one tries left;
+/// [`RetryFloorRefusal::CounterUnreadable`] at a count above five or a
+/// status that carries no counter.
+const fn check_activation_last_tries(
+    credential: FlooredCredential,
+    status: PinStatus,
+) -> Result<(), RetryFloorRefusal> {
+    match status {
+        PinStatus::Remaining(remaining) => match PinRetryRisk::from_retries(remaining) {
+            Some(risk) if risk.spends_a_last_try() => Err(RetryFloorRefusal::TriesBelowFloor {
+                credential,
+                remaining,
+            }),
+            Some(_) => Ok(()),
+            None => Err(RetryFloorRefusal::CounterUnreadable { credential }),
+        },
+        PinStatus::Verified | PinStatus::Locked => Ok(()),
+        PinStatus::NoInfo | PinStatus::Other(_) => {
+            Err(RetryFloorRefusal::CounterUnreadable { credential })
+        }
+    }
+}
+
+/// What one activation reading found for each PIN: whether it awaits
+/// activation, and the counter-safe status that reading took.
+struct ActivationReading {
+    /// Which PINs await activation.
+    needs: crate::activation::CardActivationNeeds,
+    /// PIN 1's status, read under the reading's numbering.
+    pin1: PinStatus,
+    /// PIN 2's status, read under the reading's numbering.
+    pin2: PinStatus,
+}
+
+impl ActivationReading {
+    /// The status this reading took for `slot`.
+    const fn status(&self, slot: PinSlot) -> PinStatus {
+        match slot {
+            PinSlot::Pin1 => self.pin1,
+            PinSlot::Pin2 => self.pin2,
+        }
+    }
+}
+
+/// Read each PIN's changed flag and its counter-safe status under
+/// `numbering`, PIN 1 then PIN 2, and judge under `scheme` whether it
+/// awaits activation (see [`crate::activation::pin_awaits_activation`]).
+/// Every command here is a read and touches no retry counter.
+fn read_activation<T: CardTransport>(
+    transport: &mut T,
+    scheme: crate::activation::ActivationScheme,
+    numbering: PinReferenceScheme,
+) -> Result<ActivationReading, AuthError<T::Error>> {
+    let mut read = |slot: PinSlot| -> Result<(bool, PinStatus), AuthError<T::Error>> {
+        let record = crate::activation::read_pin_change_record(transport, slot)?;
+        let status = transport.pin_status_with_scheme(numbering, slot)?;
+        Ok((
+            crate::activation::pin_awaits_activation(scheme, record, status),
+            status,
+        ))
+    };
+    let (pin1_awaits, pin1) = read(PinSlot::Pin1)?;
+    let (pin2_awaits, pin2) = read(PinSlot::Pin2)?;
+    Ok(ActivationReading {
+        needs: crate::activation::CardActivationNeeds {
+            pin1: pin1_awaits,
+            pin2: pin2_awaits,
+        },
+        pin1,
+        pin2,
+    })
+}
+
 /// PIN change and unblock operations, layered as default methods on every
 /// [`CardTransport`].
 ///
@@ -253,8 +336,10 @@ pub(crate) fn reset_new_only<T: CardTransport + ?Sized>(
 /// These operations mutate the card and are not idempotent. A wrong
 /// current PIN or PUK spends a retry, and for the PUK exhaustion is
 /// terminal. The unblock and activation-by-PUK operations apply the
-/// retry floor to the PUK's counter themselves; a caller of a change
-/// must hold the retry floor for the current PIN before calling.
+/// retry floor to the PUK's counter themselves, and activation by the
+/// preset activation PIN applies it to the counter of each PIN it
+/// changes; a caller of a change must hold the retry floor for the
+/// current PIN before calling.
 pub trait PinManageOps: PinOps {
     /// Read the PIN 1, PIN 2 and PUK lengths the card accepts, resolving
     /// the card's numbering first.
@@ -460,8 +545,9 @@ pub trait PinManageOps: PinOps {
     /// (FINEID S4-1 v4.2 section 4.6; see
     /// [`crate::activation::pin_awaits_activation`]).
     ///
-    /// Reads each PIN's changed flag and retry status; both reads leave
-    /// every counter untouched.
+    /// Resolves the card's numbering, then reads each PIN's changed flag
+    /// and retry status under it; every read leaves every counter
+    /// untouched.
     ///
     /// # Errors
     ///
@@ -473,17 +559,8 @@ pub trait PinManageOps: PinOps {
     where
         Self: Sized,
     {
-        let mut awaits = |slot: PinSlot| -> Result<bool, AuthError<Self::Error>> {
-            let record = self.read_pin_change_record(slot)?;
-            let status = self.pin_status(slot)?;
-            Ok(crate::activation::pin_awaits_activation(
-                scheme, record, status,
-            ))
-        };
-        let pin1 = awaits(PinSlot::Pin1)?;
-        let pin2 = awaits(PinSlot::Pin2)?;
-
-        Ok(crate::activation::CardActivationNeeds { pin1, pin2 })
+        let numbering = self.resolve_pin_reference_scheme()?;
+        read_activation(self, scheme, numbering).map(|reading| reading.needs)
     }
 
     /// Probe the PUK retry status without side effects under an explicit `scheme`.
@@ -533,13 +610,25 @@ pub trait PinManageOps: PinOps {
     /// the activation PIN is presented as the PUK, so each unblock
     /// applies the retry floor to the PUK's counter first.
     ///
+    /// Under [`crate::activation::ActivationScheme::PresetActivationPin`]
+    /// the activation PIN is presented as the current value of each PIN
+    /// it activates, and a wrong one spends that PIN's own try. Each
+    /// PIN's changed flag and counter-safe status are read first, under
+    /// the numbering of `lengths`, PIN 1 then PIN 2; the retry floor is
+    /// applied to the status of every PIN about to be changed before the
+    /// first CHANGE REFERENCE DATA. A refusal for either PIN sends no
+    /// CHANGE REFERENCE DATA at all, so the card is left as it was; a
+    /// caller that wants PIN 1 activated alone passes no new PIN 2.
+    ///
     /// # Errors
     ///
     /// [`AuthError::PinLength`] when the card does not accept the length
     /// of an entry; nothing is sent.
-    /// [`AuthError::RetryFloor`] when the activation PIN is presented as
-    /// the PUK and the PUK's counter is below the retry floor, blocked or
-    /// unreadable. [`AuthError`] on a transport failure or state
+    /// [`AuthError::RetryFloor`] under either scheme when the counter of
+    /// the credential the activation PIN is presented as -- the PUK, or
+    /// the PIN 1 or PIN 2 it activates -- is below the retry floor,
+    /// blocked or unreadable; nothing carrying the activation PIN is sent
+    /// to that credential. [`AuthError`] on a transport failure or state
     /// transition.
     fn activate_card(
         &mut self,
@@ -570,7 +659,23 @@ pub trait PinManageOps: PinOps {
             lengths.check_pin2(pin).map_err(AuthError::PinLength)?;
         }
         let ref_scheme = lengths.numbering();
-        let needs = self.activation_needs(scheme)?;
+        let reading = read_activation(self, scheme, ref_scheme)?;
+        let needs = reading.needs;
+        match scheme {
+            crate::activation::ActivationScheme::PresetActivationPin => {
+                let changes = [
+                    (PinSlot::Pin1, needs.pin1 && new_pin1.is_some()),
+                    (PinSlot::Pin2, needs.pin2 && new_pin2.is_some()),
+                ];
+                for (slot, changed) in changes {
+                    if changed {
+                        check_activation_last_tries(slot.into(), reading.status(slot))
+                            .map_err(AuthError::RetryFloor)?;
+                    }
+                }
+            }
+            crate::activation::ActivationScheme::ActivationCodeIsPuk => {}
+        }
         let mut report = crate::activation::ActivationReport {
             scheme,
             pin1: None,
@@ -679,7 +784,10 @@ mod tests {
         PinManageOps, RESET_P1_CODE_THEN_NEW, RESET_P1_NEW_ONLY, RESET_RETRY_COUNTER_INS,
         classify_manage_sw,
     };
-    use crate::activation::GET_DATA_INS;
+    use crate::activation::{
+        ActivationCode, ActivationReport, ActivationScheme, GET_DATA_INS,
+        PIN_CHANGED_FLAG_UNCHANGED, PIN_CHANGED_LEN, PIN_CHANGED_TAG_HIGH, PIN_CHANGED_TAG_LOW,
+    };
     use crate::credentials::{PIN_MAX_LENGTH, PIN_MIN_LENGTH, Pin1, Pin2, Puk, UnvalidatedSecret};
     use crate::verify::{CREDENTIAL_BODY_SCRATCH, VERIFY_INS, VERIFY_P1};
     use crate::{
@@ -764,6 +872,12 @@ mod tests {
         StatusWord::PinIncorrect {
             retries: PinRetries::from_nibble(count).expect("fits a nibble"),
         }
+    }
+
+    /// A PIN's counter-safe probe answer at `count` tries left, the same
+    /// status word the PUK probe answers.
+    fn pin_counter(count: u8) -> StatusWord {
+        puk_counter(count)
     }
 
     /// A PUK probe answer the floor serves.
@@ -1339,6 +1453,228 @@ mod tests {
             .probe_puk_status_with_scheme(PinReferenceScheme::Citizen)
             .expect_err("must propagate transport error");
         assert!(matches!(err, AuthError::Transport(_)));
+    }
+
+    /// A preset activation PIN fixture, seven digits.
+    const ACTIVATION_PIN_DIGITS: &[u8] = b"7654321";
+    /// Commands a preset activation of both PINs sends: the PIN 1
+    /// container read and counter probe, the same for PIN 2, then one
+    /// CHANGE REFERENCE DATA per PIN.
+    const PRESET_ACTIVATION_INSTRUCTIONS: &[u8] = &[
+        GET_DATA_INS,
+        VERIFY_INS,
+        GET_DATA_INS,
+        VERIFY_INS,
+        CHANGE_REFERENCE_DATA_INS,
+        CHANGE_REFERENCE_DATA_INS,
+    ];
+    /// Wire index of the first CHANGE REFERENCE DATA in a preset
+    /// activation of both PINs.
+    const PRESET_PIN1_CHANGE_INDEX: usize = 4;
+    /// Wire index of the second CHANGE REFERENCE DATA in a preset
+    /// activation of both PINs.
+    const PRESET_PIN2_CHANGE_INDEX: usize = 5;
+
+    /// A citizen card under the preset activation PIN scheme: its PIN
+    /// container reports each PIN unchanged since manufacture, its
+    /// counter-safe probes answer the scripted status of each PIN, and
+    /// every credential command succeeds. Records every command's wire in
+    /// order.
+    struct PresetCard {
+        pin1_probe: StatusWord,
+        pin2_probe: StatusWord,
+        commands: Vec<Vec<u8>>,
+    }
+
+    impl PresetCard {
+        fn new(pin1_probe: StatusWord, pin2_probe: StatusWord) -> Self {
+            Self {
+                pin1_probe,
+                pin2_probe,
+                commands: vec![],
+            }
+        }
+
+        /// Activate under the preset scheme with the citizen numbering.
+        fn activate(
+            &mut self,
+            new_pin1: Option<Pin1>,
+            new_pin2: Option<Pin2>,
+        ) -> Result<ActivationReport, AuthError<String>> {
+            let code = ActivationCode::reconstruct(
+                UnvalidatedSecret::from_owned_bytes(ACTIVATION_PIN_DIGITS.to_vec()),
+                ActivationScheme::PresetActivationPin,
+            )
+            .expect("valid preset activation PIN fixture");
+            self.activate_card(
+                &CardPinLengths::not_listed(PinReferenceScheme::Citizen),
+                code,
+                new_pin1,
+                new_pin2,
+            )
+        }
+
+        fn sent_a_change(&self) -> bool {
+            self.commands
+                .iter()
+                .any(|wire| wire[INS_INDEX] == CHANGE_REFERENCE_DATA_INS)
+        }
+    }
+
+    impl CardTransport for PresetCard {
+        type Error = String;
+
+        fn transmit(&mut self, command: &CommandApdu) -> Result<TransportOutcome, Self::Error> {
+            let wire = command.as_bytes().to_vec();
+            let pin1_reference = PinReferenceScheme::Citizen.reference(PinSlot::Pin1);
+            let pin2_reference = PinReferenceScheme::Citizen.reference(PinSlot::Pin2);
+            let answer = match (wire[INS_INDEX], wire[P2_INDEX]) {
+                (GET_DATA_INS, _) => ResponseApdu {
+                    body: vec![
+                        PIN_CHANGED_TAG_HIGH,
+                        PIN_CHANGED_TAG_LOW,
+                        PIN_CHANGED_LEN,
+                        PIN_CHANGED_FLAG_UNCHANGED,
+                    ],
+                    ..response(StatusWord::Success)
+                },
+                (VERIFY_INS, reference) if reference == pin1_reference => response(self.pin1_probe),
+                (VERIFY_INS, reference) if reference == pin2_reference => response(self.pin2_probe),
+                _ => response(StatusWord::ReferenceDataNotFound),
+            };
+            self.commands.push(wire);
+            Ok(TransportOutcome::Response(answer))
+        }
+
+        fn transmit_credential(
+            &mut self,
+            command: CredentialCommand,
+        ) -> Result<TransportOutcome, Self::Error> {
+            self.commands.push(command.expose_wire(<[u8]>::to_vec));
+            Ok(TransportOutcome::Response(response(StatusWord::Success)))
+        }
+    }
+
+    #[test]
+    fn preset_activation_changes_each_pin_at_or_above_the_floor() {
+        for probe in [
+            pin_counter(RETRIES_PRISTINE),
+            pin_counter(RETRIES_ONE_SPENT),
+            pin_counter(RETRIES_FLOOR),
+            StatusWord::Success,
+        ] {
+            let mut card = PresetCard::new(probe, probe);
+            let report = card
+                .activate(Some(pin1(NEW_DIGITS)), Some(pin2(NEW_PIN2_DIGITS)))
+                .expect("both counters are served");
+            assert_eq!(report.pin1, Some(ManageOutcome::Ok));
+            assert_eq!(report.pin2, Some(ManageOutcome::Ok));
+            let instructions: Vec<u8> = card.commands.iter().map(|wire| wire[INS_INDEX]).collect();
+            assert_eq!(instructions, PRESET_ACTIVATION_INSTRUCTIONS);
+            for (index, slot) in [
+                (PRESET_PIN1_CHANGE_INDEX, PinSlot::Pin1),
+                (PRESET_PIN2_CHANGE_INDEX, PinSlot::Pin2),
+            ] {
+                let change = &card.commands[index];
+                assert_eq!(change[P1_INDEX], CHANGE_P1_CURRENT_THEN_NEW);
+                assert_eq!(
+                    change[P2_INDEX],
+                    PinReferenceScheme::Citizen.reference(slot)
+                );
+                assert_eq!(
+                    &change[DATA_OFFSET..DATA_OFFSET + ACTIVATION_PIN_DIGITS.len()],
+                    ACTIVATION_PIN_DIGITS
+                );
+            }
+        }
+    }
+
+    /// The card's probes with `slot` answering `probe` and the other PIN
+    /// pristine.
+    fn preset_card_with(slot: PinSlot, probe: StatusWord) -> PresetCard {
+        let pristine = pin_counter(RETRIES_PRISTINE);
+        match slot {
+            PinSlot::Pin1 => PresetCard::new(probe, pristine),
+            PinSlot::Pin2 => PresetCard::new(pristine, probe),
+        }
+    }
+
+    #[test]
+    fn preset_activation_never_presents_the_activation_pin_at_the_last_two_tries() {
+        for slot in [PinSlot::Pin1, PinSlot::Pin2] {
+            for count in [RETRIES_BELOW_FLOOR, RETRIES_LOCKDOWN_IMMINENT] {
+                let mut card = preset_card_with(slot, pin_counter(count));
+                let result = card.activate(Some(pin1(NEW_DIGITS)), Some(pin2(NEW_PIN2_DIGITS)));
+                let refused = matches!(
+                    result,
+                    Err(AuthError::RetryFloor(RetryFloorRefusal::TriesBelowFloor {
+                        credential,
+                        remaining,
+                    })) if credential == FlooredCredential::from(slot) && remaining.get() == count
+                );
+                assert!(refused, "{count} tries left must refuse the activation");
+                // A refusal for PIN 2 also holds back PIN 1's change.
+                assert!(!card.sent_a_change());
+            }
+        }
+    }
+
+    #[test]
+    fn preset_activation_lets_the_card_answer_an_exhausted_or_blocked_pin() {
+        // Which code the holder has is inferred, not known: at no tries
+        // left or blocked the card decides and spends nothing, so the
+        // change goes out rather than closing a recovery here.
+        for slot in [PinSlot::Pin1, PinSlot::Pin2] {
+            for probe in [
+                pin_counter(RETRIES_EXHAUSTED),
+                StatusWord::AuthenticationBlocked,
+            ] {
+                let mut card = preset_card_with(slot, probe);
+                let result = card.activate(Some(pin1(NEW_DIGITS)), Some(pin2(NEW_PIN2_DIGITS)));
+                assert!(
+                    !matches!(result, Err(AuthError::RetryFloor(_))),
+                    "{probe:?} must not be refused by the software"
+                );
+                assert!(card.sent_a_change());
+            }
+        }
+    }
+
+    #[test]
+    fn preset_activation_never_presents_the_activation_pin_to_an_unreadable_counter() {
+        // An unreadable counter might hide a last try; nothing is sent.
+        for slot in [PinSlot::Pin1, PinSlot::Pin2] {
+            let credential = FlooredCredential::from(slot);
+            let mut card = preset_card_with(slot, StatusWord::AuthenticationFailed);
+            let unreadable = card.activate(Some(pin1(NEW_DIGITS)), Some(pin2(NEW_PIN2_DIGITS)));
+            assert!(matches!(
+                unreadable,
+                Err(AuthError::RetryFloor(
+                    RetryFloorRefusal::CounterUnreadable { credential: refused }
+                )) if refused == credential
+            ));
+            assert!(!card.sent_a_change());
+        }
+    }
+
+    #[test]
+    fn preset_activation_of_pin1_alone_is_not_gated_by_pin2() {
+        let mut card = preset_card_with(PinSlot::Pin2, pin_counter(RETRIES_LOCKDOWN_IMMINENT));
+        let report = card
+            .activate(Some(pin1(NEW_DIGITS)), None)
+            .expect("PIN 1's counter is served");
+        assert_eq!(report.pin1, Some(ManageOutcome::Ok));
+        assert_eq!(report.pin2, None);
+        let changes: Vec<u8> = card
+            .commands
+            .iter()
+            .filter(|wire| wire[INS_INDEX] == CHANGE_REFERENCE_DATA_INS)
+            .map(|wire| wire[P2_INDEX])
+            .collect();
+        assert_eq!(
+            changes,
+            [PinReferenceScheme::Citizen.reference(PinSlot::Pin1)]
+        );
     }
 
     #[test]

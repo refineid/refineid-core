@@ -52,7 +52,11 @@ credential the activation PIN is presented as. Under §4.6.1 that is the
 PUK, whose counter is read before each command that carries it. Under
 §4.6.2 it is each PIN to be changed: the counters of PIN 1 and PIN 2 are
 read before the first CHANGE REFERENCE DATA, so a refusal for PIN 2
-leaves PIN 1 unchanged too.
+leaves PIN 1 unchanged too. Only two or one tries left refuse there. At
+no tries left, blocked, or with no readable counter the change goes to
+the card, which refuses by itself and spends nothing: the scheme, and so
+which code the holder has in hand, is inferred from the card, and the
+software must not close a recovery the card would allow.
 
 Signals that do **not** decide it, each disproven by a real card:
 

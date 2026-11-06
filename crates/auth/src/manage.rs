@@ -44,7 +44,7 @@ use refineid_pkcs15::{Pkcs15Error, Pkcs15Ops};
 
 use crate::credentials::{Pin1, Pin2, Puk};
 use crate::pin_lengths::CardPinLengths;
-use crate::retry_risk::{FlooredCredential, check_retry_floor};
+use crate::retry_risk::{FlooredCredential, PinRetryRisk, RetryFloorRefusal, check_retry_floor};
 use crate::verify::{
     AuthError, PinOps, PinReferenceScheme, PinSlot, PinStatus, VERIFY_INS, VERIFY_P1,
     credential_exchange,
@@ -239,6 +239,32 @@ pub(crate) fn reset_new_only<T: CardTransport + ?Sized>(
     };
     let status = credential_exchange(transport, scheme, header, &[new])?;
     Ok(classify_manage_sw(status))
+}
+
+/// Refuse an activation PIN change only where it would spend one of the
+/// PIN's last two tries. Every other reading goes to the card: at no
+/// tries left, blocked, or with no readable counter, the card answers
+/// for itself and spends nothing, and which code the holder has in hand
+/// (this scheme's activation PIN, or a PUK) is inferred, never known,
+/// so the software does not close a recovery the card would allow.
+///
+/// # Errors
+///
+/// [`RetryFloorRefusal::TriesBelowFloor`] at two or one tries left.
+const fn check_activation_last_tries(
+    credential: FlooredCredential,
+    status: PinStatus,
+) -> Result<(), RetryFloorRefusal> {
+    match status {
+        PinStatus::Remaining(remaining) => match PinRetryRisk::from_retries(remaining) {
+            Some(risk) if risk.spends_a_last_try() => Err(RetryFloorRefusal::TriesBelowFloor {
+                credential,
+                remaining,
+            }),
+            Some(_) | None => Ok(()),
+        },
+        PinStatus::Verified | PinStatus::Locked | PinStatus::NoInfo | PinStatus::Other(_) => Ok(()),
+    }
 }
 
 /// What one activation reading found for each PIN: whether it awaits
@@ -636,7 +662,7 @@ pub trait PinManageOps: PinOps {
                 ];
                 for (slot, changed) in changes {
                     if changed {
-                        check_retry_floor(slot.into(), reading.status(slot))
+                        check_activation_last_tries(slot.into(), reading.status(slot))
                             .map_err(AuthError::RetryFloor)?;
                     }
                 }
@@ -1567,13 +1593,9 @@ mod tests {
     }
 
     #[test]
-    fn preset_activation_never_presents_the_activation_pin_below_the_floor() {
+    fn preset_activation_never_presents_the_activation_pin_at_the_last_two_tries() {
         for slot in [PinSlot::Pin1, PinSlot::Pin2] {
-            for count in [
-                RETRIES_BELOW_FLOOR,
-                RETRIES_LOCKDOWN_IMMINENT,
-                RETRIES_EXHAUSTED,
-            ] {
+            for count in [RETRIES_BELOW_FLOOR, RETRIES_LOCKDOWN_IMMINENT] {
                 let mut card = preset_card_with(slot, pin_counter(count));
                 let result = card.activate(Some(pin1(NEW_DIGITS)), Some(pin2(NEW_PIN2_DIGITS)));
                 let refused = matches!(
@@ -1591,27 +1613,24 @@ mod tests {
     }
 
     #[test]
-    fn preset_activation_never_presents_the_activation_pin_to_a_blocked_or_unreadable_pin() {
+    fn preset_activation_lets_the_card_answer_an_exhausted_blocked_or_unreadable_pin() {
+        // Which code the holder has is inferred, not known: at no tries
+        // left, blocked, or unreadable the card decides and spends nothing,
+        // so the change goes out rather than closing a recovery here.
         for slot in [PinSlot::Pin1, PinSlot::Pin2] {
-            let credential = FlooredCredential::from(slot);
-            let mut card = preset_card_with(slot, StatusWord::AuthenticationBlocked);
-            let blocked = card.activate(Some(pin1(NEW_DIGITS)), Some(pin2(NEW_PIN2_DIGITS)));
-            assert!(matches!(
-                blocked,
-                Err(AuthError::RetryFloor(RetryFloorRefusal::Blocked { credential: refused }))
-                    if refused == credential
-            ));
-            assert!(!card.sent_a_change());
-
-            let mut card = preset_card_with(slot, StatusWord::AuthenticationFailed);
-            let unreadable = card.activate(Some(pin1(NEW_DIGITS)), Some(pin2(NEW_PIN2_DIGITS)));
-            assert!(matches!(
-                unreadable,
-                Err(AuthError::RetryFloor(
-                    RetryFloorRefusal::CounterUnreadable { credential: refused }
-                )) if refused == credential
-            ));
-            assert!(!card.sent_a_change());
+            for probe in [
+                pin_counter(RETRIES_EXHAUSTED),
+                StatusWord::AuthenticationBlocked,
+                StatusWord::AuthenticationFailed,
+            ] {
+                let mut card = preset_card_with(slot, probe);
+                let result = card.activate(Some(pin1(NEW_DIGITS)), Some(pin2(NEW_PIN2_DIGITS)));
+                assert!(
+                    !matches!(result, Err(AuthError::RetryFloor(_))),
+                    "{probe:?} must not be refused by the software"
+                );
+                assert!(card.sent_a_change());
+            }
         }
     }
 

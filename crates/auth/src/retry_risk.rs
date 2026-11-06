@@ -118,6 +118,13 @@ impl PinRetryRisk {
         }
     }
 
+    /// Whether an attempt here would spend one of the last two tries:
+    /// two or one left. Exhausted is not this state: at no tries left
+    /// the card refuses by itself and spends nothing.
+    pub(crate) const fn spends_a_last_try(self) -> bool {
+        matches!(self, Self::CriticalThreatLevel | Self::LockdownImminent)
+    }
+
     /// Whether an attempt is served at this state: five, four or three
     /// tries left.
     const fn is_above_floor(self) -> bool {

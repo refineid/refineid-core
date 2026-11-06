@@ -346,6 +346,13 @@ pub struct ChainVerdict {
     /// The revocation status of the anchored path, or of the judged
     /// certificate alone against its issuer when there is no path.
     pub revocation: Revocation,
+    /// The search for anchored paths spent every one of its
+    /// [`MAX_PATH_SEARCH_VERIFICATIONS`] signature verifications and
+    /// may have stopped before a path it would otherwise have found:
+    /// the evidence held far more verifiable issuers than any
+    /// legitimate document carries. Never set by a search that ended
+    /// on its own.
+    pub search_exhausted: bool,
 }
 
 /// The revocation status the evidence establishes.
@@ -826,6 +833,7 @@ pub fn judge(
         return ChainVerdict {
             path: CertificationPath::Anchored(Vec::new()),
             revocation: Revocation::Unavailable,
+            search_exhausted: false,
         };
     }
     let fit = match role {
@@ -840,14 +848,9 @@ pub fn judge(
     };
     let mut paths = Vec::new();
     let mut path = vec![certificate.clone()];
-    pool.anchored_paths(
-        anchors,
-        role,
-        at,
-        &mut path,
-        &mut paths,
-        &mut SearchBudget::new(),
-    );
+    let mut budget = SearchBudget::new();
+    pool.anchored_paths(anchors, role, at, &mut path, &mut paths, &mut budget);
+    let search_exhausted = budget.is_spent();
     let best = paths
         .iter()
         .map(|path| (path, pool.path_revocation(path, when)))
@@ -869,8 +872,8 @@ pub fn judge(
         } else {
             CertificationPath::Partial(path)
         },
-
         revocation,
+        search_exhausted,
     }
 }
 
@@ -2068,22 +2071,22 @@ mod tests {
         assert!(!verdict.path.is_anchored());
         assert!(!verdict.path.certificates().is_empty());
         assert!(verdict.path.certificates().len() <= MAX_PATH_DEPTH);
+        // The verdict says why: the search ran out, not the evidence.
+        assert!(verdict.search_exhausted);
 
         // The real chain in the same pool is untouched by the loop.
         let (found, spent) = search(&pool, &chain.signer, &anchors);
         assert_eq!(found.len(), 1);
         assert_eq!(spent, TWO_STEP_VERIFICATIONS);
-        assert!(
-            judge(
-                &chain.signer,
-                &pool,
-                &anchors,
-                AnchorRole::CertificateIssuing,
-                at(VALIDATED),
-            )
-            .path
-            .is_anchored()
+        let verdict = judge(
+            &chain.signer,
+            &pool,
+            &anchors,
+            AnchorRole::CertificateIssuing,
+            at(VALIDATED),
         );
+        assert!(verdict.path.is_anchored());
+        assert!(!verdict.search_exhausted);
     }
 
     #[test]

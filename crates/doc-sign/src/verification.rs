@@ -314,6 +314,9 @@ pub struct SignatureReport {
     /// The certification path above the signer, anchored at the
     /// validation time or partial.
     chain: CertificationPath,
+    /// The chain search spent its whole verification budget
+    /// ([`Self::chain_search_exhausted`]).
+    chain_search_exhausted: bool,
     /// Every byte the signature claims to cover digests to the value it
     /// states, and no later revision changes what was signed.
     document_intact: bool,
@@ -384,6 +387,18 @@ impl SignatureReport {
     #[must_use]
     pub const fn chain_verified(&self) -> bool {
         self.chain.is_anchored()
+    }
+
+    /// The search for the signer's chain spent its whole budget of
+    /// signature verifications and may have stopped before a path it
+    /// would otherwise have found. The evidence held far more
+    /// verifiable issuers than any legitimate document carries, so a
+    /// shell reports this as the reason the chain is not verified
+    /// rather than as missing evidence. Never set when the search ended
+    /// on its own.
+    #[must_use]
+    pub const fn chain_search_exhausted(&self) -> bool {
+        self.chain_search_exhausted
     }
 
     /// The earliest time an anchored timestamp proves: a signature
@@ -1025,6 +1040,7 @@ impl Context<'_> {
             signer: SignerIdentity::of(&facts.signer),
             signer_certificate: facts.signer,
             chain: chain.path,
+            chain_search_exhausted: chain.search_exhausted,
             document_intact: facts.document_intact
                 && !matches!(facts.revision, Revision::ChangedAfterSigning(_)),
             signature_valid: facts.signature_valid,

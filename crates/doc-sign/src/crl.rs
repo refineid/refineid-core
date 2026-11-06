@@ -41,7 +41,7 @@
 use crate::identity::CertSerial;
 use refineid_cms::oid::Oid;
 use refineid_cms::x509::{
-    Certificate, DateTime, X509Error, path_extension_profile, signature_octets,
+    Certificate, DateTime, SignatureOctets, X509Error, path_extension_profile,
 };
 use spki::der::asn1::{AnyRef, ObjectIdentifier};
 use spki::der::{Decode as _, Reader as _, SliceReader, Tag, TagNumber, Tagged as _};
@@ -236,7 +236,7 @@ pub struct Crl<'a> {
     pub signature_alg_oid: Oid<'a>,
     /// Outer signature BIT STRING value with its zero unused-bits
     /// leading byte stripped.
-    pub signature_bits: &'a [u8],
+    pub signature_bits: SignatureOctets<'a>,
 }
 
 impl Crl<'_> {
@@ -489,7 +489,7 @@ impl<'a> Crl<'a> {
         if sig_bits.tag() != Tag::BitString {
             return Err(X509Error::UnexpectedStructure("CRL signature not BIT STRING").into());
         }
-        let signature_bits = signature_octets(sig_bits.value(), "CRL signature BIT STRING")?;
+        let signature_bits = SignatureOctets::parse(sig_bits.value(), "CRL signature BIT STRING")?;
 
         let parsed = parse_tbs_cert_list(tbs_der, der, signature_alg_oid, signature_bits)?;
         // RFC 5280 sec.5.1.1.2: signatureAlgorithm MUST contain the same
@@ -520,7 +520,7 @@ fn parse_tbs_cert_list<'a>(
     tbs_der: &'a [u8],
     raw: &'a [u8],
     signature_alg_oid: Oid<'a>,
-    signature_bits: &'a [u8],
+    signature_bits: SignatureOctets<'a>,
 ) -> Result<ParsedTbsCertList<'a>, CrlError> {
     // TBSCertList ::= SEQUENCE {
     //     version                 INTEGER OPTIONAL,

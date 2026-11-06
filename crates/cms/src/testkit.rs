@@ -758,7 +758,7 @@ impl<'a> CmsParts<'a> {
 pub fn cms(parts: &CmsParts<'_>) -> Vec<u8> {
     let signer = Certificate::from_der(parts.signer).expect("signer parses");
     let mut sid = signer.issuer.as_der().to_vec();
-    sid.extend_from_slice(&tlv(INTEGER, signer.serial_der));
+    sid.extend_from_slice(&tlv(INTEGER, signer.serial_der.as_bytes()));
     let covered = parts
         .signed_attributes
         .clone()

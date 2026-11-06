@@ -2236,7 +2236,7 @@ mod tests {
             sd.signer.signer_identifier,
             SignerIdentifier::IssuerAndSerialNumber {
                 issuer_der: cert.issuer.as_der(),
-                serial_number: cert.serial_der,
+                serial_number: cert.serial_der.as_bytes(),
             }
         );
     }
@@ -2611,7 +2611,10 @@ mod tests {
             &key,
         );
         let parsed = Certificate::from_der(&certificate).expect("the certificate parses");
-        assert_eq!(parsed.serial_der, [testkit::INTEGER_SIGN_PAD, HIGH_SERIAL]);
+        assert_eq!(
+            parsed.serial_der.as_bytes(),
+            [testkit::INTEGER_SIGN_PAD, HIGH_SERIAL]
+        );
         let der = testkit::cms(&CmsParts::attached(&key, &certificate, KIT_CONTENT));
         SignedData::parse(&der)
             .expect("the CMS parses")

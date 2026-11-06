@@ -271,7 +271,7 @@ impl CaObject {
         let label =
             extract_common_name(&view.subject).unwrap_or_else(|| "CA Certificate".to_owned());
         let id = Sha1::of(view.spki.as_der());
-        let serial_der = der_integer(view.serial_der);
+        let serial_der = der_integer(view.serial_der.as_bytes());
         Self {
             cert,
             id,
@@ -574,7 +574,7 @@ impl TokenObjects {
         let auth_cert_id = Sha1::of(view.spki.as_der());
         let auth_cert_label =
             extract_common_name(&view.subject).unwrap_or_else(|| DEFAULT_LABEL.to_owned());
-        let auth_cert_serial_der = der_integer(view.serial_der);
+        let auth_cert_serial_der = der_integer(view.serial_der.as_bytes());
         let ca_store = RefinedTrustStore::default();
         Ok(Self {
             auth_cert,

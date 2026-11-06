@@ -693,7 +693,7 @@ fn issuer_and_serial(certificate: &Certificate<'_>) -> Vec<u8> {
     // because the parser preserves any leading sign byte for OCSP and
     // CRL comparison. It has to be re-wrapped here, and writing it raw
     // produces a structure OpenSSL rejects at exactly this offset.
-    body.extend_from_slice(&tlv(TAG_INTEGER, certificate.serial_der));
+    body.extend_from_slice(&tlv(TAG_INTEGER, certificate.serial_der.as_bytes()));
     tlv(TAG_SEQUENCE, &body)
 }
 

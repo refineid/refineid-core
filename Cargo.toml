@@ -27,7 +27,7 @@ members = [
 exclude = ["crates/rapp/fuzz"]
 
 [workspace.package]
-version = "26.11.3"
+version = "26.11.6"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Petri Koistinen"]
@@ -92,6 +92,11 @@ spki = "0.8"
 x509-cert = { version = "0.3", default-features = false }
 # Test-fixture hex decoding.
 hex = "0.4"
+# Real and effective user and group ids, read through a safe API, so
+# the PKCS#11 module can refuse its persistent CA cache inside a
+# privileged (root, set-user-id or set-group-id) host process. Unix only;
+# the `process` feature alone carries the id getters.
+rustix = { version = "1", default-features = false, features = ["process"] }
 subtle = "2"
 rustc_lexer = "0.1"
 serde = "1"

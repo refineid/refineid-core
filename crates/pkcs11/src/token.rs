@@ -965,15 +965,34 @@ impl TokenObjects {
 
 /// Resolve the filesystem directory used for caching on-card CA certificates.
 ///
-/// Cache-directory integrity relies on the OS user profile's access control
-/// lists (ACLs) to prevent unauthorized modification of cached CA certificates
-/// by other users. Local attackers possessing access to the user profile are
+/// The directory comes from the environment: `REFINEID_CA_CACHE_DIR`, else the
+/// platform's per-user cache location (`LOCALAPPDATA` or `APPDATA` on Windows,
+/// `HOME` on macOS, `XDG_CACHE_HOME` or `HOME` on other Unix systems).
+///
+/// On Unix a privileged process has no persistent cache: when the effective
+/// user id is root, or the effective user or group id differs from the real one
+/// (set-user-id, set-group-id), this returns `None` and the CA certificates are
+/// read from the card each time. Such a process, for example a PAM stack under
+/// `sudo` or a display manager, may have inherited its environment from an
+/// unprivileged caller, and must not create, write or delete files in a
+/// location that caller chose.
+///
+/// On Unix the writer creates missing cache directories with mode 0700
+/// (`CA_CACHE_DIR_MODE`) and cache files with mode 0600 (`CA_CACHE_FILE_MODE`),
+/// both narrowed further by the umask; it leaves the mode of an existing
+/// directory as it is. Cache-directory integrity otherwise relies on the user
+/// profile's access control to keep other users from modifying cached CA
+/// certificates. Local attackers possessing access to the user profile are
 /// out of scope.
 ///
 /// The cache is shared across all identity cards inserted for this user profile
 /// and seeded across sessions. Cached certificates are untrusted intermediates
 /// (served with `CKA_TRUSTED = CK_FALSE`), never ambient trust anchors.
 fn persistent_ca_dir() -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    if is_privileged_process(current_process_ids()) {
+        return None;
+    }
     if let Ok(dir) = std::env::var("REFINEID_CA_CACHE_DIR")
         && !dir.is_empty()
     {
@@ -1029,6 +1048,46 @@ fn persistent_ca_dir() -> Option<std::path::PathBuf> {
     }
     None
 }
+
+/// The real and effective user and group ids of a Unix process.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+struct ProcessIds {
+    real_uid: rustix::process::Uid,
+    effective_uid: rustix::process::Uid,
+    real_gid: rustix::process::Gid,
+    effective_gid: rustix::process::Gid,
+}
+
+/// Whether a process with these ids runs with privileges its environment
+/// cannot be trusted to direct: effective uid root, or an effective user or
+/// group id that differs from the real one (set-user-id, set-group-id).
+#[cfg(unix)]
+const fn is_privileged_process(ids: ProcessIds) -> bool {
+    ids.effective_uid.is_root()
+        || ids.effective_uid.as_raw() != ids.real_uid.as_raw()
+        || ids.effective_gid.as_raw() != ids.real_gid.as_raw()
+}
+
+/// Read the calling process's real and effective user and group ids.
+#[cfg(unix)]
+fn current_process_ids() -> ProcessIds {
+    ProcessIds {
+        real_uid: rustix::process::getuid(),
+        effective_uid: rustix::process::geteuid(),
+        real_gid: rustix::process::getgid(),
+        effective_gid: rustix::process::getegid(),
+    }
+}
+
+/// Mode of a CA cache directory the writer creates: owner read, write and
+/// search only.
+#[cfg(unix)]
+const CA_CACHE_DIR_MODE: u32 = 0o700;
+
+/// Mode of a CA cache file the writer creates: owner read and write only.
+#[cfg(unix)]
+const CA_CACHE_FILE_MODE: u32 = 0o600;
 
 const MAX_CA_CERTS: usize = 16;
 const MAX_CA_CERT_BYTES: u64 = 65536;
@@ -1131,7 +1190,14 @@ fn persist_ca_cert_to(dir: &std::path::Path, cert: &OwnedCert) {
     if !meets_ca_persistence_policy(cert) {
         return;
     }
-    if std::fs::create_dir_all(dir).is_err() {
+    let mut dir_builder = std::fs::DirBuilder::new();
+    dir_builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        dir_builder.mode(CA_CACHE_DIR_MODE);
+    }
+    if dir_builder.create(dir).is_err() {
         return;
     }
     let der = cert.as_der();
@@ -1143,14 +1209,17 @@ fn persist_ca_cert_to(dir: &std::path::Path, cert: &OwnedCert) {
     }
     let temp_name = format!(".{hex_name}.tmp.{}", std::process::id());
     let temp_path = dir.join(temp_name);
-    let write_res = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .and_then(|mut f| {
-            f.write_all(der)?;
-            f.flush()
-        });
+    let mut open_options = std::fs::OpenOptions::new();
+    open_options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        open_options.mode(CA_CACHE_FILE_MODE);
+    }
+    let write_res = open_options.open(&temp_path).and_then(|mut f| {
+        f.write_all(der)?;
+        f.flush()
+    });
     if write_res.is_ok() {
         if std::fs::rename(&temp_path, &final_path).is_err() {
             let _ = std::fs::remove_file(&temp_path);
@@ -1964,6 +2033,114 @@ mod tests {
         assert!(objects.object_exists(ObjectKind::Ca(0)));
         assert!(!objects.object_exists(ObjectKind::Ca(1)));
         assert_eq!(objects.all_object_kinds().len(), 4);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn privileged_process_predicate() {
+        use rustix::process::{Gid, RawGid, RawUid, Uid};
+
+        const USER_ID: RawUid = 1000;
+        const OTHER_USER_ID: RawUid = 1001;
+        const GROUP_ID: RawGid = 100;
+        const OTHER_GROUP_ID: RawGid = 101;
+
+        let ids =
+            |real_uid: RawUid, effective_uid: RawUid, real_gid: RawGid, effective_gid: RawGid| {
+                super::ProcessIds {
+                    real_uid: Uid::from_raw(real_uid),
+                    effective_uid: Uid::from_raw(effective_uid),
+                    real_gid: Gid::from_raw(real_gid),
+                    effective_gid: Gid::from_raw(effective_gid),
+                }
+            };
+        let root = Uid::ROOT.as_raw();
+        let root_group = Gid::ROOT.as_raw();
+
+        // An ordinary user process keeps its cache.
+        assert!(!super::is_privileged_process(ids(
+            USER_ID, USER_ID, GROUP_ID, GROUP_ID
+        )));
+        // A user whose real and effective group is 0 is not privileged
+        // by that alone.
+        assert!(!super::is_privileged_process(ids(
+            USER_ID, USER_ID, root_group, root_group
+        )));
+        // Root, whether started as root or through set-user-id root.
+        assert!(super::is_privileged_process(ids(
+            root, root, root_group, root_group
+        )));
+        assert!(super::is_privileged_process(ids(
+            root, root, GROUP_ID, GROUP_ID
+        )));
+        assert!(super::is_privileged_process(ids(
+            USER_ID, root, GROUP_ID, GROUP_ID
+        )));
+        // Set-user-id to another unprivileged user.
+        assert!(super::is_privileged_process(ids(
+            USER_ID,
+            OTHER_USER_ID,
+            GROUP_ID,
+            GROUP_ID
+        )));
+        // Set-group-id, to group 0 or to another group.
+        assert!(super::is_privileged_process(ids(
+            USER_ID, USER_ID, GROUP_ID, root_group
+        )));
+        assert!(super::is_privileged_process(ids(
+            USER_ID,
+            USER_ID,
+            GROUP_ID,
+            OTHER_GROUP_ID
+        )));
+        // A root process that dropped its effective uid to a user while
+        // its real uid stays root.
+        assert!(super::is_privileged_process(ids(
+            root, USER_ID, GROUP_ID, GROUP_ID
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_ca_writer_creates_private_dirs_and_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const TEST_CA_1_DER: &[u8] =
+            include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+        // The permission bits of `st_mode`: owner, group and other rwx.
+        const PERMISSION_BITS: u32 = 0o777;
+
+        let unique_name = format!("refineid-test-ca-cache-modes-{}", std::process::id());
+        let temp_dir = std::env::temp_dir().join(unique_name);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).expect("create test base dir");
+
+        let parent_dir = temp_dir.join("refineid");
+        let cache_dir = parent_dir.join("ca-certificates");
+        let cert1 = OwnedCert::from_der(TEST_CA_1_DER).expect("valid cert1");
+        super::persist_ca_cert_to(&cache_dir, &cert1);
+
+        let mode_of = |path: &std::path::Path| {
+            std::fs::metadata(path)
+                .expect("cache path metadata")
+                .permissions()
+                .mode()
+                & PERMISSION_BITS
+        };
+        assert_eq!(mode_of(&parent_dir), super::CA_CACHE_DIR_MODE);
+        assert_eq!(mode_of(&cache_dir), super::CA_CACHE_DIR_MODE);
+
+        let files: Vec<std::path::PathBuf> = std::fs::read_dir(&cache_dir)
+            .expect("read cache dir")
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(files.len(), 1);
+        for file in &files {
+            assert_eq!(mode_of(file), super::CA_CACHE_FILE_MODE);
+        }
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

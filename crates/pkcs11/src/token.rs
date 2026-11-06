@@ -1706,9 +1706,11 @@ fn clear_positive(pin_cache: &Arc<Mutex<PinSafetyCache>>) {
 ///
 /// Mirrors [`card_sign`]'s proven chain: open the card, select the
 /// PKCS#15 application (reference-data commands are refused from MF
-/// context the same way VERIFY is), then run `CHANGE REFERENCE
-/// DATA` with the current + new PIN pair in one command -- no prior
-/// VERIFY is needed. The card is dropped before returning. On `Ok`
+/// context the same way VERIFY is), probe PIN1 and resolve the card's
+/// numbering in one counter-safe probe, hold the retry floor, read the
+/// PIN lengths the card accepts under that numbering, then run `CHANGE
+/// REFERENCE DATA` with the current + new PIN pair in one command -- no
+/// prior VERIFY is needed. The card is dropped before returning. On `Ok`
 /// the card has reset the retry counter and cleared its PIN
 /// presentation, so the caller must refresh any cached PIN1.
 ///
@@ -1719,8 +1721,9 @@ fn clear_positive(pin_cache: &Arc<Mutex<PinSafetyCache>>) {
 /// # Errors
 /// [`CKR_PIN_INCORRECT`] when the current PIN is wrong,
 /// [`CKR_PIN_LOCKED`] when the slot is blocked,
-/// [`CKR_PIN_LEN_RANGE`] on a length rejection (local policy or
-/// card-side), [`CKR_DEVICE_ERROR`] on any card / transport failure.
+/// [`CKR_PIN_LEN_RANGE`] when the new PIN's length is outside the
+/// FINEID bounds or the lengths the card accepts,
+/// [`CKR_DEVICE_ERROR`] on any card / transport failure.
 #[cfg(feature = "pin-change")]
 #[expect(
     clippy::redundant_pub_crate,
@@ -1732,19 +1735,21 @@ pub(super) fn card_change_pin1(
     new_pin1: PinBytes,
 ) -> Result<(), CkRv> {
     let backend = PcscBackend;
-    // SELECT -> probe -> CHANGE REFERENCE DATA is one held
-    // transaction, ended with a card reset; both PINs arrived with
-    // the call.
+    // SELECT -> probe -> length read -> CHANGE REFERENCE DATA is one
+    // held transaction, ended with a card reset; both PINs arrived
+    // with the call.
     let card = backend
         .open_session(reader, ReaderAccessCap::PinSequence)
         .map_err(|_open_err| CKR_DEVICE_ERROR)?;
     card.pin_sequence(|mut card| -> Result<(), CkRv> {
         card.select_pkcs15_application()
             .map_err(|_select_err| CKR_DEVICE_ERROR)?;
-        // The empty-body VERIFY probe consumes no retry. Apply the same
-        // retry floor as login and signing before CHANGE REFERENCE DATA.
-        let status = card
-            .pin_status(PinSlot::Pin1)
+        // The empty-body VERIFY probe consumes no retry and resolves the
+        // numbering the length read and the change address. Apply the
+        // same retry floor as login and signing before CHANGE REFERENCE
+        // DATA.
+        let (scheme, status) = card
+            .pin1_status_and_scheme()
             .map_err(|_probe_err| CKR_DEVICE_ERROR)?;
         pin1_verify_guard(status)?;
         let curr_secret =
@@ -1757,9 +1762,25 @@ pub(super) fn card_change_pin1(
         let Ok(new_pin) = refineid_auth::Pin1::reconstruct(new_secret) else {
             return Err(CKR_PIN_LEN_RANGE);
         };
+        // Reads only; no retry counter is touched.
+        let lengths = card
+            .read_card_pin_lengths_with_scheme(scheme)
+            .map_err(|_lengths_err| CKR_DEVICE_ERROR)?;
+        // A current PIN of a length the card does not accept cannot be
+        // the card's PIN1, so it is refused as incorrect, as above;
+        // the length refusal left for `change_pin1` is the new PIN's.
+        if lengths.check_pin1(&curr_pin).is_err() {
+            return Err(CKR_PIN_INCORRECT);
+        }
         let outcome = card
-            .change_pin1(curr_pin, new_pin)
-            .map_err(|_change_err| CKR_DEVICE_ERROR)?;
+            .change_pin1(&lengths, curr_pin, new_pin)
+            .map_err(|change_err| match change_err {
+                refineid_auth::AuthError::PinLength(_) => CKR_PIN_LEN_RANGE,
+                refineid_auth::AuthError::Transport(_)
+                | refineid_auth::AuthError::Outcome(_)
+                | refineid_auth::AuthError::Command(_)
+                | refineid_auth::AuthError::RetryFloor(_) => CKR_DEVICE_ERROR,
+            })?;
         match outcome {
             refineid_auth::ManageOutcome::Ok => Ok(()),
             refineid_auth::ManageOutcome::WrongCredential { .. } => Err(CKR_PIN_INCORRECT),

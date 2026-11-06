@@ -41,5 +41,8 @@ hex.workspace = true
 spki.workspace = true
 zeroize.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 trybuild.workspace = true

@@ -1185,6 +1185,7 @@ dependencies = [
  "refineid-remote",
  "refineid-sign",
  "refineid-x509",
+ "rustix",
  "spki",
  "trybuild",
  "zeroize",

@@ -73,6 +73,30 @@ deliberately no default log path: the module runs inside the
 browser's address space, and an implicit file in a world-writable
 directory would be a symlink-attack surface. The environment is read
 once per process.
+On Unix a log file the module creates gets mode 0600; an existing file
+keeps its mode, and the path is opened as given, following symlinks.
+A privileged Unix process -- effective uid root, or an effective user or
+group id that differs from the real one -- ignores `REFINEID_PKCS11_LOG`,
+because its environment may come from an unprivileged caller; there
+`REFINEID_DEBUG=1` still writes to stderr, a descriptor the host already
+holds rather than a path the environment names.
+
+## CA certificate cache
+
+CA certificates read from the card are kept, as untrusted intermediates
+(`CKA_TRUSTED` false), in a per-user cache directory so later sessions
+can serve them without reading them again: `REFINEID_CA_CACHE_DIR`,
+else `XDG_CACHE_HOME/refineid/ca-certificates` or
+`~/.cache/refineid/ca-certificates` on Linux and BSD,
+`~/Library/Caches/fi.refineid/ca-certificates` on macOS, and
+`LOCALAPPDATA` or `APPDATA` under `refineid\ca-certificates` on Windows.
+On Unix the module creates missing cache directories with mode 0700 and
+cache files with mode 0600, and leaves existing directories as they are.
+A privileged Unix process -- effective uid root, or an effective user or
+group id that differs from the real one, such as a PAM stack under
+`sudo` or a display manager -- has no persistent cache and reads the CA
+certificates from the card each time, because its environment may come
+from an unprivileged caller.
 
 ## Example programs and hardware rigs
 

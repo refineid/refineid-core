@@ -74,6 +74,8 @@ pub mod ck;
 mod diag;
 pub mod pin;
 pub mod pin_cache;
+#[cfg(unix)]
+mod privilege;
 pub mod remote;
 mod sign;
 pub mod slot_kind;

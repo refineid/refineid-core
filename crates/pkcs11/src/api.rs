@@ -138,6 +138,25 @@ fn usize_from_ulong(value: CkUlong) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
 }
 
+/// Most octets read from a caller's PIN buffer: one past the longest
+/// PIN [`PinBytes`] accepts, so an overlong PIN is still read as
+/// overlong and refused, never cut down to an accepted one.
+const PIN_READ_LIMIT: usize = PinBytes::MAX_LENGTH.saturating_add(1);
+
+/// Copy the caller's PIN at `pin_ptr`, of `pin_len` octets, reading at
+/// most [`PIN_READ_LIMIT`] of them. The copy goes straight into
+/// [`PinBytes::new`], which zeroizes it; it is never logged.
+///
+/// # Safety
+/// `pin_ptr` is non-null and points to `pin_len` readable octets, as
+/// PKCS#11 v2.40 requires of the caller.
+unsafe fn caller_pin(pin_ptr: CkUtf8CharPtr, pin_len: CkUlong) -> Vec<u8> {
+    let length = usize_from_ulong(pin_len).min(PIN_READ_LIMIT);
+    // SAFETY: the caller guarantees `pin_len` readable octets at
+    // `pin_ptr`, and `length` is at most `pin_len`.
+    unsafe { core::slice::from_raw_parts(pin_ptr, length) }.to_vec()
+}
+
 /// Space-pad `text` into a fixed-width PKCS#11 field. Fields are
 /// blank-padded (0x20), never NUL-terminated; over-long text is
 /// truncated to `N` bytes.
@@ -841,13 +860,11 @@ unsafe extern "C" fn c_login(
     if pin_ptr.is_null() {
         return CKR_ARGUMENTS_BAD;
     }
-    let length = usize_from_ulong(pin_len);
     // Hard rule: neither PIN bytes nor PIN lengths are ever logged.
     diag!("C_Login session={session} user_type={user_type}");
-    // SAFETY: caller guarantees pin_ptr points to `pin_len` bytes;
-    // the bytes are copied straight into a zeroizing PinBytes and
-    // never logged (PIN secrecy rule).
-    let caller_bytes = unsafe { core::slice::from_raw_parts(pin_ptr, length) }.to_vec();
+    // SAFETY: pin_ptr is non-null (checked above) and the caller
+    // guarantees it points to `pin_len` bytes.
+    let caller_bytes = unsafe { caller_pin(pin_ptr, pin_len) };
 
     let pin1 = match PinBytes::new(caller_bytes) {
         Ok(pin) => pin,
@@ -2549,5 +2566,30 @@ mod tests {
             CKF_USER_PIN_LOCKED
         );
         assert_eq!(user_pin_status_flags(PinStatus::NoInfo), 0);
+    }
+
+    /// A caller's PIN buffer is read up to one octet past the longest
+    /// PIN: an overlong PIN stays overlong and is refused for its
+    /// length, and a PIN of the longest length is read whole.
+    #[test]
+    fn a_caller_pin_is_read_up_to_one_past_the_longest() {
+        use crate::pin::{PinBytes, PinRoleError};
+
+        /// The digit every fixture PIN octet holds.
+        const DIGIT: u8 = b'5';
+        let read = |buffer: &mut Vec<u8>| {
+            let pin_len = CkUlong::try_from(buffer.len()).expect("fixture length fits");
+            // SAFETY: the buffer holds `pin_len` octets and outlives the
+            // call.
+            PinBytes::new(unsafe { super::caller_pin(buffer.as_mut_ptr(), pin_len) })
+        };
+
+        let mut longest = vec![DIGIT; PinBytes::MAX_LENGTH];
+        assert!(read(&mut longest).is_ok());
+        let mut overlong = vec![DIGIT; super::PIN_READ_LIMIT.saturating_mul(2)];
+        assert!(matches!(
+            read(&mut overlong),
+            Err(PinRoleError::WrongLength { .. })
+        ));
     }
 }

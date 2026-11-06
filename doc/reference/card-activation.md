@@ -46,6 +46,14 @@ is validated against a scheme and carries it, so
 `PinManageOps::activate_card` runs the command chain of the scheme its
 digit count was checked for.
 
+Activation applies the retry floor
+([credential custody](../security/credential-custody.md)) to the
+credential the activation PIN is presented as. Under §4.6.1 that is the
+PUK, whose counter is read before each command that carries it. Under
+§4.6.2 it is each PIN to be changed: the counters of PIN 1 and PIN 2 are
+read before the first CHANGE REFERENCE DATA, so a refusal for PIN 2
+leaves PIN 1 unchanged too.
+
 Signals that do **not** decide it, each disproven by a real card:
 
 | Signal | Why it fails |

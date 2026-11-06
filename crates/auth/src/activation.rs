@@ -57,17 +57,17 @@ pub(crate) const PIN_CONTAINER_REF_TAG: u8 = 0x83;
 pub(crate) const PIN_CONTAINER_REF_LEN: u8 = 1;
 
 /// High byte of PIN changed tag (DF 2F, FINEID S1 v4.2 section 3.15.3).
-const PIN_CHANGED_TAG_HIGH: u8 = 0xDF;
+pub(crate) const PIN_CHANGED_TAG_HIGH: u8 = 0xDF;
 /// Low byte of PIN changed tag (DF 2F, FINEID S1 v4.2 section 3.15.3).
-const PIN_CHANGED_TAG_LOW: u8 = 0x2F;
+pub(crate) const PIN_CHANGED_TAG_LOW: u8 = 0x2F;
 /// Value length for PIN changed tag.
-const PIN_CHANGED_LEN: u8 = 1;
+pub(crate) const PIN_CHANGED_LEN: u8 = 1;
 /// PIN changed window length in bytes: 2 tag bytes, 1 len byte, 1 flag byte.
 const PIN_CHANGED_WINDOW_LEN: usize = 4;
 /// Offset of flag byte in PIN changed window.
 const PIN_CHANGED_FLAG_OFFSET: usize = 3;
 /// Flag indicating PIN has not been changed since manufacture.
-const PIN_CHANGED_FLAG_UNCHANGED: u8 = 0x00;
+pub(crate) const PIN_CHANGED_FLAG_UNCHANGED: u8 = 0x00;
 /// Flag indicating PIN has been changed since manufacture.
 const PIN_CHANGED_FLAG_CHANGED: u8 = 0x01;
 

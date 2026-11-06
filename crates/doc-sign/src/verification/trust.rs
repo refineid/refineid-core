@@ -347,7 +347,7 @@ pub struct ChainVerdict {
     /// certificate alone against its issuer when there is no path.
     pub revocation: Revocation,
     /// The search for anchored paths spent every one of its
-    /// [`MAX_PATH_SEARCH_VERIFICATIONS`] signature verifications and
+    /// `MAX_PATH_SEARCH_VERIFICATIONS` signature verifications and
     /// may have stopped before a path it would otherwise have found:
     /// the evidence held far more verifiable issuers than any
     /// legitimate document carries. Never set by a search that ended

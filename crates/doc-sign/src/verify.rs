@@ -257,7 +257,10 @@ mod tests {
         let der = decode_cert_pem_or_der(ICAO_CSCA_PEM).ok_or("decode pem")?;
         let cert = OwnedCert::from_der(&der).map_err(|e| format!("parse: {e}"))?;
         let view = cert.view();
-        Ok((view.tbs_der.to_vec(), view.signature_bits.to_vec()))
+        Ok((
+            view.tbs_der.to_vec(),
+            view.signature_bits.as_bytes().to_vec(),
+        ))
     }
 
     #[test]

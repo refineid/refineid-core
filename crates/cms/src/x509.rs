@@ -157,6 +157,85 @@ impl core::fmt::Display for X509Error {
 
 impl core::error::Error for X509Error {}
 
+/// The unused-bits octet a DER signature BIT STRING carries: a
+/// signature is whole octets, so none of its bits are unused
+/// (X.690 sec.8.6.2.2).
+pub const SIGNATURE_BIT_STRING_UNUSED_BITS: u8 = 0;
+
+/// The signature octets of a signed structure, as its signature BIT
+/// STRING carried them: never empty, and taken from a value whose
+/// unused-bits octet was [`SIGNATURE_BIT_STRING_UNUSED_BITS`]. A
+/// value exists only through [`Self::parse`], so every holder of one
+/// holds a well-formed signature, whatever path built it.
+///
+/// Shared by every signed structure the workspace reads -- the
+/// certificate (RFC 5280 sec.4.1.1.3), the CRL (sec.5.1.1.3) and the
+/// `BasicOCSPResponse` (RFC 6960 sec.4.2.1). RSA signatures are `k`
+/// octets (the modulus length); ECDSA signatures are a DER
+/// `SEQUENCE { r, s }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignatureOctets<'a> {
+    /// The octets after the unused-bits octet.
+    octets: &'a [u8],
+}
+
+impl<'a> SignatureOctets<'a> {
+    /// The signature octets of a signature BIT STRING's value. `what`
+    /// names the field in the error.
+    ///
+    /// # Errors
+    /// [`X509Error::UnexpectedStructure`] carrying `what` when the
+    /// unused-bits octet is not zero or no signature octet follows it.
+    pub const fn parse(bit_string_value: &'a [u8], what: &'static str) -> Result<Self, X509Error> {
+        match bit_string_value {
+            [SIGNATURE_BIT_STRING_UNUSED_BITS, octets @ ..] if !octets.is_empty() => {
+                Ok(Self { octets })
+            }
+            _ => Err(X509Error::UnexpectedStructure(what)),
+        }
+    }
+
+    /// The signature octets.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &'a [u8] {
+        self.octets
+    }
+}
+
+/// A certificate's `serialNumber`, the value octets of its INTEGER
+/// (RFC 5280 sec.4.1.2.2): no tag, no length, the leading sign octet
+/// kept as encoded, so OCSP and CRL comparisons see what the issuer
+/// wrote. A value exists only through [`Self::parse`], which checked
+/// the INTEGER tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SerialNumber<'a> {
+    /// The INTEGER value octets.
+    octets: &'a [u8],
+}
+
+impl<'a> SerialNumber<'a> {
+    /// The serial number held in `element`, which must be an INTEGER.
+    ///
+    /// # Errors
+    /// [`X509Error::UnexpectedStructure`] when `element` is not an
+    /// INTEGER.
+    pub fn parse(element: spki::der::asn1::AnyRef<'a>) -> Result<Self, X509Error> {
+        use spki::der::{Tag, Tagged as _};
+        if element.tag() != Tag::Integer {
+            return Err(X509Error::UnexpectedStructure("serialNumber not INTEGER"));
+        }
+        Ok(Self {
+            octets: element.value(),
+        })
+    }
+
+    /// The INTEGER value octets.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &'a [u8] {
+        self.octets
+    }
+}
+
 // ----- Types -----
 
 /// X.509 v3 certificate, parsed for card-status purposes.
@@ -171,10 +250,8 @@ pub struct Certificate<'a> {
     /// `tbsCertificate` SEQUENCE bytes including its outer tag +
     /// length -- exactly the bytes covered by the signature.
     pub tbs_der: &'a [u8],
-    /// `serialNumber` INTEGER value bytes (no tag, no length).
-    /// Preserved as-is so the leading sign byte (if any) is
-    /// caller-visible for OCSP and CRL comparisons.
-    pub serial_der: &'a [u8],
+    /// `serialNumber` ([`SerialNumber`]).
+    pub serial_der: SerialNumber<'a>,
     /// `issuer` Distinguished Name (the whole `Name` SEQUENCE,
     /// outer tag/length included). Typed [`Name`] so attribute
     /// lookups are methods and the DN bytes -- needed for an OCSP
@@ -206,11 +283,8 @@ pub struct Certificate<'a> {
     /// Typed via [`crate::oid::Oid`] -- the parser validates the
     /// OID structure at the cert-parse trust boundary.
     pub signature_alg_oid: Oid<'a>,
-    /// `signature` BIT STRING value bytes, with the leading
-    /// "unused bits" byte stripped. RSA signatures are `k`
-    /// bytes (modulus length); ECDSA signatures are a DER
-    /// `SEQUENCE { r, s }`.
-    pub signature_bits: &'a [u8],
+    /// The `signature` octets ([`SignatureOctets`]).
+    pub signature_bits: SignatureOctets<'a>,
 }
 
 impl Certificate<'_> {
@@ -237,11 +311,12 @@ impl Certificate<'_> {
 
 /// A typed X.509 `Name` (Distinguished Name) view.
 ///
-/// Wraps the DER bytes of a `RDNSequence`, with attribute lookups as
-/// methods so callers pass a `Name`, never a raw `&[u8]` DN blob. The
-/// bytes are already parse-validated when the `Name` comes from a
-/// [`Certificate`]; [`Name::try_from`] is the boundary that mints one
-/// from raw bytes.
+/// Wraps the DER bytes of a `RDNSequence` so callers pass a `Name`,
+/// never a raw `&[u8]` DN blob. A `Name` is one DER TLV; the
+/// `RelativeDistinguishedName`s inside it are not walked. That is
+/// enough for what consumers do with it: compare it byte for byte with
+/// another name, and hash it for an OCSP `IssuerNameHash`.
+/// [`Name::try_from`] is the boundary that mints one from raw bytes.
 ///
 /// `PartialEq`/`Eq` compare the underlying DN DER byte-for-byte --
 /// the exact-match test certificate-chain building uses to pair a
@@ -254,9 +329,9 @@ pub struct Name<'a> {
 }
 
 impl<'a> Name<'a> {
-    /// Wrap DN bytes already validated upstream (e.g. the
-    /// `subject`/`issuer` field of a parsed [`Certificate`]). No
-    /// re-check -- the cert parse established the structure.
+    /// Wrap DN bytes taken whole from a parsed structure (e.g. the
+    /// `subject`/`issuer` field of a parsed [`Certificate`]), whose
+    /// parser read them as one TLV. No further check.
     #[must_use]
     pub(crate) const fn from_validated(dn_der: &'a [u8]) -> Self {
         Self { dn_der }
@@ -269,8 +344,9 @@ impl<'a> Name<'a> {
     }
 }
 
-/// Boundary parser: mint a [`Name`] from raw DN DER, validating it
-/// decodes as a `RDNSequence` SEQUENCE.
+/// Boundary parser: mint a [`Name`] from raw DN DER. Checks that the
+/// bytes are exactly one DER TLV with the SEQUENCE tag; the
+/// `RelativeDistinguishedName`s inside are not walked (see [`Name`]).
 impl<'a> TryFrom<&'a [u8]> for Name<'a> {
     type Error = X509Error;
     fn try_from(dn_der: &'a [u8]) -> Result<Self, X509Error> {
@@ -417,15 +493,14 @@ impl<'a> Certificate<'a> {
             X509Error::UnexpectedStructure("signatureAlgorithm OID malformed"),
         ))?;
 
-        // signature BIT STRING -- strip the leading "unused bits" octet.
+        // signature BIT STRING (RFC 5280 sec.4.1.1.3) -- whole octets
+        // behind a zero unused-bits octet.
         let sig_any = AnyRef::from_der(sig_tlv)
             .map_err(|_ignored| X509Error::UnexpectedStructure("signature not a TLV"))?;
-        let signature_bits = sig_any
-            .value()
-            .get(1..)
-            .ok_or(X509Error::UnexpectedStructure(
-                "signature BIT STRING missing",
-            ))?;
+        if sig_any.tag() != Tag::BitString {
+            return Err(X509Error::UnexpectedStructure("signature not BIT STRING"));
+        }
+        let signature_bits = SignatureOctets::parse(sig_any.value(), "signature BIT STRING")?;
 
         let certificate = parse_tbs(tbs_der, der, signature_alg_oid, signature_bits)?;
         // RFC 5280 sec.4.1.1.2: signatureAlgorithm MUST contain the
@@ -463,7 +538,7 @@ fn parse_tbs<'a>(
     tbs_der: &'a [u8],
     raw: &'a [u8],
     signature_alg_oid: Oid<'a>,
-    signature_bits: &'a [u8],
+    signature_bits: SignatureOctets<'a>,
 ) -> Result<ParsedTbs<'a>, X509Error> {
     // tbsCertificate ::= SEQUENCE {
     //     version         [0] EXPLICIT Version DEFAULT v1,
@@ -518,8 +593,7 @@ fn parse_tbs<'a>(
     } else {
         first
     };
-    // serialNumber INTEGER value bytes (no tag/length), as before.
-    let serial_der = serial_any.value();
+    let serial_der = SerialNumber::parse(serial_any)?;
 
     // signature AlgorithmIdentifier -- kept whole for the comparison
     // with the outer signatureAlgorithm.
@@ -527,9 +601,8 @@ fn parse_tbs<'a>(
         .tlv_bytes()
         .map_err(|_ignored| X509Error::UnexpectedStructure("TBS signature alg"))?;
 
-    // issuer Name -- the whole SEQUENCE bytes (tag/len/value).
-    // The cert-parse walk validated the SEQUENCE structure, so wrap
-    // via the already-validated constructor.
+    // issuer Name -- the whole TLV bytes (tag/len/value), read as one
+    // TLV by the walk above and wrapped as they are.
     let issuer = Name::from_validated(
         reader
             .tlv_bytes()
@@ -908,8 +981,8 @@ pub struct TbsSignature<'a> {
     pub tbs_der: &'a [u8],
     /// Signature algorithm OID.
     pub signature_alg_oid: Oid<'a>,
-    /// Signature BIT STRING payload.
-    pub signature_bits: &'a [u8],
+    /// The signature octets.
+    pub signature_bits: SignatureOctets<'a>,
     /// Issuer `SubjectPublicKeyInfo`.
     pub issuer_spki: SpkiDer<'a>,
 }
@@ -939,20 +1012,20 @@ pub fn verify_tbs_signature(
         SignatureAlgorithm::Sha256WithRsa => {
             let k =
                 extract_rsa_public_key(issuer_spki.as_der()).ok_or(VerifyError::BadIssuerKey)?;
-            let sig = Signature::<RsaPkcs1Sha256>::new(signature_bits.to_vec());
+            let sig = Signature::<RsaPkcs1Sha256>::new(signature_bits.as_bytes().to_vec());
             k.verify_pkcs1v15_sha256(tbs_der, &sig)
                 .map_err(VerifyError::Rsa)
         }
         SignatureAlgorithm::Sha384WithRsa => {
             let k =
                 extract_rsa_public_key(issuer_spki.as_der()).ok_or(VerifyError::BadIssuerKey)?;
-            let sig = Signature::<RsaPkcs1Sha384>::new(signature_bits.to_vec());
+            let sig = Signature::<RsaPkcs1Sha384>::new(signature_bits.as_bytes().to_vec());
             verify_pkcs1v15_sha384(&k, tbs_der, &sig).map_err(VerifyError::Rsa)
         }
         SignatureAlgorithm::Sha512WithRsa => {
             let k =
                 extract_rsa_public_key(issuer_spki.as_der()).ok_or(VerifyError::BadIssuerKey)?;
-            let sig = Signature::<RsaPkcs1Sha512>::new(signature_bits.to_vec());
+            let sig = Signature::<RsaPkcs1Sha512>::new(signature_bits.as_bytes().to_vec());
             verify_pkcs1v15_sha512(&k, tbs_der, &sig).map_err(VerifyError::Rsa)
         }
         SignatureAlgorithm::EcdsaWithSha256
@@ -972,7 +1045,7 @@ pub fn verify_tbs_signature(
             } else {
                 Sha512::digest(tbs_der).to_vec()
             };
-            let sig = Signature::<EcdsaDer>::new(signature_bits.to_vec());
+            let sig = Signature::<EcdsaDer>::new(signature_bits.as_bytes().to_vec());
             verify_prehashed(&curve, &pubkey, &sig, &digest).map_err(VerifyError::Ecdsa)
         }
         SignatureAlgorithm::Other => Err(VerifyError::Unsupported(alg)),
@@ -2400,7 +2473,7 @@ mod tests {
             extensions: None,
         });
         let parsed = Certificate::from_der(&cert).expect("parses");
-        assert_eq!(parsed.serial_der, FIXTURE_SERIAL);
+        assert_eq!(parsed.serial_der.as_bytes(), FIXTURE_SERIAL);
         assert_eq!(
             parsed.not_before,
             DateTime::new(NOT_BEFORE_YEAR, 1, 1, 0, 0, 0).expect("valid notBefore")
@@ -2540,6 +2613,140 @@ mod tests {
             Err(super::X509Error::UnexpectedStructure(
                 "signatureAlgorithm differs from tbsCertificate.signature"
             ))
+        );
+    }
+
+    /// The kit key, the spec and the TBS of the strictness fixtures.
+    fn strictness_fixture() -> (crate::testkit::TestKey, Vec<u8>) {
+        use crate::testkit::{self, CertificateSpec, TestCurve, TestKey};
+
+        /// Serial of the fixture certificate.
+        const SERIAL: u8 = 5;
+        /// First validity day.
+        const FIRST_DAY: u8 = 1;
+        /// Last validity day.
+        const LAST_DAY: u8 = 28;
+
+        let key = TestKey::derive(TestCurve::P256, b"x509 strictness");
+        let spec = CertificateSpec {
+            serial: SERIAL,
+            subject: "Strictness Test",
+            issuer: "Strictness Test",
+            not_before: testkit::day(FIRST_DAY),
+            not_after: testkit::day(LAST_DAY),
+            extensions: Vec::new(),
+        };
+        let tbs = testkit::tbs_certificate(&spec, &key, &key);
+        (key, tbs)
+    }
+
+    /// `SEQUENCE { tbs, signatureAlgorithm, signature }` with the
+    /// signature value carried in a TLV of `tag` behind `unused_bits`.
+    fn certificate_with_signature_encoding(
+        key: &crate::testkit::TestKey,
+        tbs: &[u8],
+        tag: u8,
+        unused_bits: u8,
+    ) -> Vec<u8> {
+        use crate::testkit;
+
+        let mut value = vec![unused_bits];
+        value.extend_from_slice(&key.sign(tbs));
+        let mut body = tbs.to_vec();
+        body.extend_from_slice(&key.algorithm_identifier());
+        body.extend_from_slice(&testkit::tlv(tag, value));
+        testkit::tlv(testkit::SEQUENCE, body)
+    }
+
+    #[test]
+    fn signature_octets_need_zero_unused_bits_and_content() {
+        let unused = super::SIGNATURE_BIT_STRING_UNUSED_BITS;
+        assert_eq!(
+            super::SignatureOctets::parse(&[unused, b's'], "test").map(|octets| octets.as_bytes()),
+            Ok(&b"s"[..])
+        );
+        assert!(super::SignatureOctets::parse(&[unused], "test").is_err());
+        assert!(super::SignatureOctets::parse(&[], "test").is_err());
+        assert!(super::SignatureOctets::parse(&[unused + 1, b's'], "test").is_err());
+    }
+
+    #[test]
+    fn certificate_signature_must_be_a_bit_string_without_unused_bits() {
+        use crate::testkit;
+
+        let (key, tbs) = strictness_fixture();
+        let canonical = certificate_with_signature_encoding(
+            &key,
+            &tbs,
+            testkit::BIT_STRING,
+            super::SIGNATURE_BIT_STRING_UNUSED_BITS,
+        );
+        let parsed = Certificate::from_der(&canonical).expect("the canonical encoding parses");
+        parsed
+            .verify_signed_by(parsed)
+            .expect("the kit signature verifies");
+
+        let unused_bits = certificate_with_signature_encoding(
+            &key,
+            &tbs,
+            testkit::BIT_STRING,
+            super::SIGNATURE_BIT_STRING_UNUSED_BITS + 1,
+        );
+        assert_eq!(
+            Certificate::from_der(&unused_bits).map(|_parsed| ()),
+            Err(X509Error::UnexpectedStructure("signature BIT STRING"))
+        );
+
+        let octet_string = certificate_with_signature_encoding(
+            &key,
+            &tbs,
+            testkit::OCTET_STRING,
+            super::SIGNATURE_BIT_STRING_UNUSED_BITS,
+        );
+        assert_eq!(
+            Certificate::from_der(&octet_string).map(|_parsed| ()),
+            Err(X509Error::UnexpectedStructure("signature not BIT STRING"))
+        );
+    }
+
+    #[test]
+    fn certificate_serial_number_must_be_an_integer() {
+        use crate::testkit;
+
+        /// Serial value octet of the fixture certificate.
+        const SERIAL: u8 = 7;
+        /// First validity day.
+        const FIRST_DAY: u8 = 1;
+        /// Last validity day.
+        const LAST_DAY: u8 = 28;
+
+        let (key, _tbs) = strictness_fixture();
+        // A v3 TBSCertificate as the kit writes it, with the serial
+        // value carried under `serial_tag`.
+        let tbs_with_serial_tag = |serial_tag: u8| {
+            let mut tbs = testkit::tlv(
+                testkit::CONTEXT_0,
+                testkit::tlv(testkit::INTEGER, [testkit::X509_VERSION_3]),
+            );
+            tbs.extend_from_slice(&testkit::tlv(serial_tag, [SERIAL]));
+            tbs.extend_from_slice(&key.algorithm_identifier());
+            tbs.extend_from_slice(&testkit::name("Serial Test"));
+            let mut validity = testkit::utc_time(testkit::day(FIRST_DAY));
+            validity.extend_from_slice(&testkit::utc_time(testkit::day(LAST_DAY)));
+            tbs.extend_from_slice(&testkit::tlv(testkit::SEQUENCE, validity));
+            tbs.extend_from_slice(&testkit::name("Serial Test"));
+            tbs.extend_from_slice(&key.spki());
+            testkit::tlv(testkit::SEQUENCE, tbs)
+        };
+
+        let integer = testkit::signed(&tbs_with_serial_tag(testkit::INTEGER), &key);
+        let parsed = Certificate::from_der(&integer).expect("an INTEGER serial parses");
+        assert_eq!(parsed.serial_der.as_bytes(), [SERIAL]);
+
+        let octet_string = testkit::signed(&tbs_with_serial_tag(testkit::OCTET_STRING), &key);
+        assert_eq!(
+            Certificate::from_der(&octet_string).map(|_parsed| ()),
+            Err(X509Error::UnexpectedStructure("serialNumber not INTEGER"))
         );
     }
 }

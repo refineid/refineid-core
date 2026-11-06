@@ -461,4 +461,22 @@ mod tests {
         }
         Ok(())
     }
+
+    /// Every bundled anchor -- the pinned roots, the pinned TSA root
+    /// and the LOTL signers -- passes the certificate parser.
+    #[test]
+    fn every_bundled_anchor_parses_as_a_certificate() -> TestResult {
+        for (label, der) in PINNED_ROOT_DER
+            .iter()
+            .chain(PINNED_TSA_ROOT_DER)
+            .chain(LOTL_SIGNER_DER)
+        {
+            check(
+                &refineid_cms::x509::OwnedCert::from_der(der).map(|_parsed| ()),
+                &Ok(()),
+                &format!("{label} parses as a certificate"),
+            )?;
+        }
+        Ok(())
+    }
 }

@@ -824,9 +824,8 @@ fn certificate_matches_sid(
         SignerIdentifier::IssuerAndSerialNumber {
             issuer_der,
             serial_number,
-        } => Ok(
-            certificate.issuer.as_der() == issuer_der && certificate.serial_der == serial_number
-        ),
+        } => Ok(certificate.issuer.as_der() == issuer_der
+            && certificate.serial_der.as_bytes() == serial_number),
         SignerIdentifier::SubjectKeyIdentifier(wanted) => {
             let Some(extensions) = certificate.extensions else {
                 return Ok(false);
@@ -1543,7 +1542,7 @@ fn issuer_serial_matches(
         .map_err(|_ignored| TimestampError::SigningCertificateAttributeInvalid)?
         .expect::<Integer>()
         .map_err(|_ignored| TimestampError::SigningCertificateAttributeInvalid)?;
-    Ok(issuer_matches && serial.value() == certificate.serial_der)
+    Ok(issuer_matches && serial.value() == certificate.serial_der.as_bytes())
 }
 
 /// Parse one exact typed TLV.

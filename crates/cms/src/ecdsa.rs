@@ -248,6 +248,9 @@ impl Sec1UncompressedPoint {
 /// Montgomery params for `p` and for `n`, plus the base point
 /// in affine form.
 struct CurveCtx {
+    /// Octet width of a field element, and so of each coordinate of
+    /// an uncompressed point (SEC 1 sec.2.3.3, sec.2.3.5).
+    field_len: usize,
     /// Bit precision used for `p`-side arithmetic (multiple of 64).
     bits_p: u32,
     /// Bit precision used for `n`-side arithmetic.
@@ -260,6 +263,9 @@ struct CurveCtx {
     a: BoxedUint,
     /// Weierstrass coefficient `b` in `y^2 = x^3 + ax + b`.
     b: BoxedUint,
+    /// Field prime `p`, in non-Montgomery form for the coordinate
+    /// range check.
+    p_uint: BoxedUint,
     /// Subgroup order `n`, in non-Montgomery form for boundary checks.
     n_uint: BoxedUint,
     /// Base point `G` in affine coordinates.
@@ -363,18 +369,21 @@ impl CurveCtx {
         let b = EcdsaHelpers::boxed(curve.b.as_slice(), bits_p)?;
         let gx = EcdsaHelpers::boxed(curve.gx.as_slice(), bits_p)?;
         let gy = EcdsaHelpers::boxed(curve.gy.as_slice(), bits_p)?;
-        let p_odd: Odd<BoxedUint> = Option::from(Odd::new(p_uint)).ok_or(EcdsaError::BadModulus)?;
+        let p_odd: Odd<BoxedUint> =
+            Option::from(Odd::new(p_uint.clone())).ok_or(EcdsaError::BadModulus)?;
         let n_odd: Odd<BoxedUint> =
             Option::from(Odd::new(n_uint.clone())).ok_or(EcdsaError::BadModulus)?;
         let p_params = BoxedMontyParams::new(p_odd);
         let n_params = BoxedMontyParams::new(n_odd);
         Ok(Self {
+            field_len: curve.p.len(),
             bits_p,
             bits_n,
             p_params,
             n_params,
             a,
             b,
+            p_uint,
             n_uint,
             g: AffinePoint { xy: Some((gx, gy)) },
         })
@@ -496,6 +505,42 @@ impl CurveCtx {
         acc
     }
 
+    /// The affine point `pubkey_sec1` encodes, validated as a public
+    /// key on this curve: SEC 1 sec.3.2.2.1 steps 2 and 3, with the
+    /// encoding of sec.2.3.4. Each coordinate is exactly
+    /// [`Self::field_len`] octets and a field element below `p`
+    /// (sec.2.3.6), so one key has one accepted encoding, and the
+    /// point lies on the curve.
+    ///
+    /// # Errors
+    /// [`EcdsaError::BadPublicKey`] for any other encoding or a point
+    /// off the curve.
+    fn public_key(&self, pubkey_sec1: &Sec1UncompressedPoint) -> Result<AffinePoint, EcdsaError> {
+        let q = pubkey_sec1.parse_affine(self)?;
+        if !self.is_on_curve(&q) {
+            return Err(EcdsaError::BadPublicKey);
+        }
+        Ok(q)
+    }
+
+    /// The field element `bytes` encodes: exactly [`Self::field_len`]
+    /// octets holding an integer below `p` (SEC 1 sec.2.3.6).
+    ///
+    /// # Errors
+    /// [`EcdsaError::BadPublicKey`] for another width or a value of
+    /// `p` or more.
+    fn field_element(&self, bytes: &[u8]) -> Result<BoxedUint, EcdsaError> {
+        if bytes.len() != self.field_len {
+            return Err(EcdsaError::BadPublicKey);
+        }
+        let value =
+            BoxedUint::from_be_slice(bytes, self.bits_p).map_err(|_e| EcdsaError::BadPublicKey)?;
+        if value >= self.p_uint {
+            return Err(EcdsaError::BadPublicKey);
+        }
+        Ok(value)
+    }
+
     /// Test `Q.y^2 == Q.x^3 + a*Q.x + b mod p`.
     fn is_on_curve(&self, q: &AffinePoint) -> bool {
         let Some((qx, qy)) = &q.xy else { return false };
@@ -533,10 +578,7 @@ pub(crate) fn verify_prehashed(
     message_digest: &[u8],
 ) -> Result<(), EcdsaError> {
     let ctx = CurveCtx::new(curve)?;
-    let q = pubkey_sec1.parse_affine(ctx.bits_p)?;
-    if !ctx.is_on_curve(&q) {
-        return Err(EcdsaError::BadPublicKey);
-    }
+    let q = ctx.public_key(pubkey_sec1)?;
     let (r_bytes, s_bytes) = signature_der.parse_ecdsa_signature()?;
     let r = EcdsaHelpers::boxed(r_bytes.as_slice(), ctx.bits_n)?;
     let s = EcdsaHelpers::boxed(s_bytes.as_slice(), ctx.bits_n)?;
@@ -574,25 +616,23 @@ impl Sec1UncompressedPoint {
     ///
     /// SEC1 §2.3.4. Rejects compressed (`02`/`03`) and hybrid
     /// (`06`/`07`) encodings -- the FINEID profile pins
-    /// uncompressed form (FINEID S2 §5.1) -- and rejects bodies
-    /// whose length is not twice the coordinate width. Does not
-    /// run the on-curve check; the caller (`verify_prehashed`)
-    /// does that next.
-    fn parse_affine(&self, bits_p: u32) -> Result<AffinePoint, EcdsaError> {
+    /// uncompressed form (FINEID S2 §5.1) -- rejects bodies
+    /// whose length is not twice the curve's field width, and
+    /// rejects a coordinate of `p` or more (§2.3.6). Does not
+    /// run the on-curve check; the caller
+    /// ([`CurveCtx::public_key`]) does that next.
+    fn parse_affine(&self, ctx: &CurveCtx) -> Result<AffinePoint, EcdsaError> {
         let bytes = self.as_bytes();
         if bytes.first().copied() != Some(SEC1_UNCOMPRESSED_TAG) {
             return Err(EcdsaError::BadPublicKey);
         }
         let body = bytes.get(1..).ok_or(EcdsaError::BadPublicKey)?;
-        if !body.len().is_multiple_of(POINT_COORDINATE_COUNT) || body.is_empty() {
+        if body.len() != ctx.field_len.saturating_mul(POINT_COORDINATE_COUNT) {
             return Err(EcdsaError::BadPublicKey);
         }
-        // body.len() is even and non-zero so `body.len() >> 1` is
-        // exact and >= 1; bit-shift sidesteps clippy::integer_division.
-        let half: usize = body.len() >> 1_u32;
-        let (x_bytes, y_bytes) = body.split_at(half);
-        let x = EcdsaHelpers::boxed(x_bytes, bits_p)?;
-        let y = EcdsaHelpers::boxed(y_bytes, bits_p)?;
+        let (x_bytes, y_bytes) = body.split_at(ctx.field_len);
+        let x = ctx.field_element(x_bytes)?;
+        let y = ctx.field_element(y_bytes)?;
         Ok(AffinePoint { xy: Some((x, y)) })
     }
 }
@@ -1416,6 +1456,7 @@ mod tests {
     };
     use crate::container::{EcdsaDer, EcdsaP256, EcdsaP384, Signature};
     use crate::hex::Hex;
+    use crypto_bigint::{BoxedUint, Resize as _};
 
     /// Universal OBJECT IDENTIFIER tag.
     const OID_TAG: u8 = 0x06;
@@ -1914,6 +1955,122 @@ mod tests {
             let der = spki(refused);
             assert!(super::extract_ec_pubkey(&der).is_none());
             assert!(crate::x509::SpkiDer::try_from(der.as_slice()).is_err());
+        }
+    }
+
+    /// The curves the verifier's table carries.
+    const TABLE_CURVES: &[crate::oid::Oid<'static>] =
+        &[crate::oid::known::SECP256R1, crate::oid::known::SECP384R1];
+
+    /// The table curve `oid` and its verification context.
+    fn table_curve(oid: crate::oid::Oid<'_>) -> (super::Curve, super::CurveCtx) {
+        let curve = EcdsaHelpers::named_curve_from_oid(oid).expect("a table curve");
+        let ctx = super::CurveCtx::new(&curve).expect("table curves build a context");
+        (curve, ctx)
+    }
+
+    /// The uncompressed encoding of `(x, y)` under `ctx`, each
+    /// coordinate written as its full field width.
+    fn encode(ctx: &super::CurveCtx, x: &BoxedUint, y: &BoxedUint) -> Vec<u8> {
+        let width = ctx.field_len;
+        let full = |value: &BoxedUint| {
+            let bytes = value.to_be_bytes();
+            bytes
+                .get(bytes.len().saturating_sub(width)..)
+                .expect("a field-width tail")
+                .to_vec()
+        };
+        sec1(&full(x), &full(y))
+    }
+
+    /// A curve point whose `x` is a small integer and whose `y` has a
+    /// zero leading octet at the field width, so that `x + p` still
+    /// fits the field width and both coordinates also fit one octet
+    /// less.
+    ///
+    /// Both table primes are 3 mod 4, so `v^((p + 1) / 4)` is a square
+    /// root of `v` whenever `v` has one; each candidate is confirmed
+    /// with the on-curve check.
+    fn point_with_short_coordinates(ctx: &super::CurveCtx) -> (BoxedUint, BoxedUint) {
+        /// `(p + 1) / 4` is `p + 1` shifted right by two bits.
+        const QUARTER_SHIFT: u32 = 2;
+        /// Candidate `x` values tried before giving up.
+        const CANDIDATES: u64 = 4096;
+        let one = BoxedUint::one_with_precision(ctx.bits_p);
+        let root_exponent = ctx.p_uint.wrapping_add(&one).shr(QUARTER_SHIFT);
+        (0..CANDIDATES)
+            .find_map(|candidate| {
+                let x = BoxedUint::from(candidate).resize(ctx.bits_p);
+                let x_m = ctx.p_mont(&x);
+                let rhs = &(&(&(&x_m * &x_m) * &x_m) + &(&ctx.p_mont(&ctx.a) * &x_m))
+                    + &ctx.p_mont(&ctx.b);
+                let root = rhs.pow(&root_exponent).retrieve();
+                let negated = ctx.p_uint.wrapping_sub(&root);
+                [root, negated].into_iter().find_map(|y| {
+                    let point = super::AffinePoint {
+                        xy: Some((x.clone(), y.clone())),
+                    };
+                    let leading = y.to_be_bytes().first().copied();
+                    (ctx.is_on_curve(&point) && leading == Some(0)).then_some((x.clone(), y))
+                })
+            })
+            .expect("a small point exists among the candidates")
+    }
+
+    #[test]
+    fn public_key_coordinates_are_field_elements_of_the_field_width() {
+        for &oid in TABLE_CURVES {
+            let (curve, ctx) = table_curve(oid);
+            let public_key = |bytes: Vec<u8>| {
+                super::Sec1UncompressedPoint::from_bytes(bytes)
+                    .map_err(|_e| EcdsaError::BadPublicKey)
+                    .and_then(|point| ctx.public_key(&point))
+                    .map(|_point| ())
+            };
+
+            // The base point, canonical, then with x = p and y = p.
+            assert_eq!(public_key(sec1(&curve.gx, &curve.gy)), Ok(()));
+            assert_eq!(
+                public_key(sec1(&curve.p, &curve.gy)),
+                Err(EcdsaError::BadPublicKey)
+            );
+            assert_eq!(
+                public_key(sec1(&curve.gx, &curve.p)),
+                Err(EcdsaError::BadPublicKey)
+            );
+            // The base point with each coordinate one octet too wide.
+            let wide = |coordinate: &[u8]| [&[0][..], coordinate].concat();
+            assert_eq!(
+                public_key(sec1(&wide(&curve.gx), &wide(&curve.gy))),
+                Err(EcdsaError::BadPublicKey)
+            );
+
+            // A point the on-curve check alone cannot tell from its
+            // aliases: x + p reduces to x, and both coordinates fit one
+            // octet less than the field width.
+            let (x, y) = point_with_short_coordinates(&ctx);
+            let canonical = encode(&ctx, &x, &y);
+            assert_eq!(public_key(canonical.clone()), Ok(()));
+
+            let x_alias = ctx.p_uint.wrapping_add(&x);
+            assert!(ctx.is_on_curve(&super::AffinePoint {
+                xy: Some((x_alias.clone(), y.clone()))
+            }));
+            assert_eq!(
+                public_key(encode(&ctx, &x_alias, &y)),
+                Err(EcdsaError::BadPublicKey)
+            );
+
+            let short_width = ctx.field_len.saturating_sub(1);
+            let shorten = |value: &BoxedUint| {
+                let bytes = value.to_be_bytes();
+                bytes
+                    .get(bytes.len().saturating_sub(short_width)..)
+                    .expect("the coordinate without its leading octet")
+                    .to_vec()
+            };
+            let short = sec1(&shorten(&x), &shorten(&y));
+            assert_eq!(public_key(short), Err(EcdsaError::BadPublicKey));
         }
     }
 }

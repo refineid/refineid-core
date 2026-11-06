@@ -397,7 +397,7 @@ pub trait CertificateExt {
 
 impl CertificateExt for Certificate<'_> {
     fn serial(&self) -> CertSerial {
-        CertSerial::from_bytes(self.serial_der.to_vec())
+        CertSerial::from_bytes(self.serial_der.as_bytes().to_vec())
     }
 
     fn crl_distribution_urls(&self) -> Vec<Uri> {

@@ -40,29 +40,13 @@
 
 use crate::identity::CertSerial;
 use refineid_cms::oid::Oid;
-use refineid_cms::x509::{Certificate, DateTime, X509Error, path_extension_profile};
+use refineid_cms::x509::{
+    Certificate, DateTime, SignatureOctets, X509Error, path_extension_profile,
+};
 use spki::der::asn1::{AnyRef, ObjectIdentifier};
 use spki::der::{Decode as _, Reader as _, SliceReader, Tag, TagNumber, Tagged as _};
 use x509_cert::crl::RevokedCert;
 use x509_cert::ext::{Extension, Extensions};
-
-/// The unused-bits octet a DER signature BIT STRING carries: a
-/// signature is whole octets, so none of its bits are unused
-/// (X.690 sec.8.6.2.2).
-pub(crate) const SIGNATURE_BIT_STRING_UNUSED_BITS: u8 = 0;
-
-/// The signature octets of a signature BIT STRING's value: its
-/// unused-bits octet must be [`SIGNATURE_BIT_STRING_UNUSED_BITS`] and
-/// at least one octet must follow. `what` names the field in the error.
-pub(crate) fn signature_octets<'a>(
-    bit_string_value: &'a [u8],
-    what: &'static str,
-) -> Result<&'a [u8], X509Error> {
-    match bit_string_value {
-        [SIGNATURE_BIT_STRING_UNUSED_BITS, octets @ ..] if !octets.is_empty() => Ok(octets),
-        _ => Err(X509Error::UnexpectedStructure(what)),
-    }
-}
 
 /// The `Version` value of a v2 CRL (RFC 5280 sec.5.1.2.1: `v2(1)`).
 /// A v1 CRL omits the field and carries no extensions at either level
@@ -252,7 +236,7 @@ pub struct Crl<'a> {
     pub signature_alg_oid: Oid<'a>,
     /// Outer signature BIT STRING value with its zero unused-bits
     /// leading byte stripped.
-    pub signature_bits: &'a [u8],
+    pub signature_bits: SignatureOctets<'a>,
 }
 
 impl Crl<'_> {
@@ -505,7 +489,7 @@ impl<'a> Crl<'a> {
         if sig_bits.tag() != Tag::BitString {
             return Err(X509Error::UnexpectedStructure("CRL signature not BIT STRING").into());
         }
-        let signature_bits = signature_octets(sig_bits.value(), "CRL signature BIT STRING")?;
+        let signature_bits = SignatureOctets::parse(sig_bits.value(), "CRL signature BIT STRING")?;
 
         let parsed = parse_tbs_cert_list(tbs_der, der, signature_alg_oid, signature_bits)?;
         // RFC 5280 sec.5.1.1.2: signatureAlgorithm MUST contain the same
@@ -536,7 +520,7 @@ fn parse_tbs_cert_list<'a>(
     tbs_der: &'a [u8],
     raw: &'a [u8],
     signature_alg_oid: Oid<'a>,
-    signature_bits: &'a [u8],
+    signature_bits: SignatureOctets<'a>,
 ) -> Result<ParsedTbsCertList<'a>, CrlError> {
     // TBSCertList ::= SEQUENCE {
     //     version                 INTEGER OPTIONAL,
@@ -1331,18 +1315,6 @@ mod tests {
             Crl::parse(&der),
             Err(CrlError::Malformed(X509Error::UnexpectedStructure(_)))
         ));
-    }
-
-    #[test]
-    fn signature_octets_need_zero_unused_bits_and_content() {
-        let unused = super::SIGNATURE_BIT_STRING_UNUSED_BITS;
-        assert_eq!(
-            super::signature_octets(&[unused, b's'], "test"),
-            Ok(&b"s"[..])
-        );
-        assert!(super::signature_octets(&[unused], "test").is_err());
-        assert!(super::signature_octets(&[], "test").is_err());
-        assert!(super::signature_octets(&[unused + 1, b's'], "test").is_err());
     }
 
     /// The top-level TLVs of a SEQUENCE's value.

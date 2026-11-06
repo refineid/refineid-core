@@ -38,7 +38,8 @@ use crate::identity::CertSerial;
 use crate::x509_ext::CertificateExt as _;
 use refineid_cms::oid::{Oid, known};
 use refineid_cms::x509::{
-    Certificate, DateTime, Name, PathExtensionError, X509Error, path_extension_profile,
+    Certificate, DateTime, Name, PathExtensionError, SignatureOctets, X509Error,
+    path_extension_profile,
 };
 use spki::der::asn1::{AnyRef, ObjectIdentifier};
 use spki::der::{Decode as _, Reader as _, SliceReader, Tag, Tagged as _};
@@ -889,7 +890,7 @@ pub struct BasicOcspResponse<'a> {
     pub signature_alg_oid: Oid<'a>,
     /// Outer `signature` BIT STRING value with the unused-bits
     /// leading byte stripped.
-    pub signature_bits: &'a [u8],
+    pub signature_bits: SignatureOctets<'a>,
     /// DER bytes of each optional cert in the `[0] EXPLICIT
     /// certs SEQUENCE OF Certificate` field. Empty when the
     /// responder didn't embed any chain certs (it expects the
@@ -1449,8 +1450,7 @@ impl<'a> BasicOcspResponse<'a> {
                 "OCSP signature not BIT STRING",
             ));
         }
-        let signature_bits =
-            crate::crl::signature_octets(sig_bits.value(), "OCSP signature BIT STRING")?;
+        let signature_bits = SignatureOctets::parse(sig_bits.value(), "OCSP signature BIT STRING")?;
 
         // Optional [0] EXPLICIT certs SEQUENCE OF Certificate.
         let mut embedded_cert_ders: Vec<&[u8]> = Vec::new();
@@ -1509,8 +1509,8 @@ mod tests {
     /// so only a fixture writes it.
     const TAG_CONTEXT_2_PRIMITIVE: u8 = 0x82;
     use crate::ber::tlv;
-    use crate::crl::SIGNATURE_BIT_STRING_UNUSED_BITS;
     use crate::identity::CertSerial;
+    use refineid_cms::x509::SIGNATURE_BIT_STRING_UNUSED_BITS;
     use spki::der::{DateTime, Reader as _};
 
     /// Arbitrary distinct issuer hashes -- the values are irrelevant

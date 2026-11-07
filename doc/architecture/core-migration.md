@@ -322,7 +322,15 @@ applies.
 The fourteenth slice admits the paired phone as a PKCS#11 slot in
 `refineid-pkcs11`, behind one seam: a host installs a `RemoteTokenSource`
 before it hands out the function list, and the module reads from it, at
-every slot refresh, the one pairing offered right now. An offer carries a
+every call that can tell a caller whether the phone's token is there or
+what it holds, the one pairing offered right now. A browser may make
+those calls without listing the slots first, so a reading on them is a
+request for the card: the source dials the phone and may hold the call
+up to one shared bound, `REMOTE_WAKE_WAIT`, for a session to confirm
+the card; no call is granted a wait for a short memo after a wait that
+raised the token, nor for a longer quiet after one that raised none, a
+call arriving during a wait shares it, and the non-blocking slot-event
+poll never waits. An offer carries a
 certificate whose fingerprint the phone confirmed on a session, and keeps
 carrying it between sessions until the host withdraws it as RAPP
 v26.11.2 section 8.4 item 3 says; the token exists exactly then, its

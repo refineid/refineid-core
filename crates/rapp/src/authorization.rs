@@ -298,6 +298,9 @@ pub enum ProgressEvent {
     WaitingForCard,
     /// The card was found or the wait is over.
     CardWaitEnded,
+    /// The custodian's device is locked; the holder is told on the lock
+    /// screen and the operation waits for the unlock (section 8.2 item 3).
+    WaitingForUnlock,
 }
 
 impl ProgressEvent {
@@ -309,6 +312,7 @@ impl ProgressEvent {
             Self::ConsentShown => "consent_shown",
             Self::WaitingForCard => "waiting_for_card",
             Self::CardWaitEnded => "card_wait_ended",
+            Self::WaitingForUnlock => "waiting_for_unlock",
         }
     }
 
@@ -322,6 +326,7 @@ impl ProgressEvent {
             "consent_shown" => Self::ConsentShown,
             "waiting_for_card" => Self::WaitingForCard,
             "card_wait_ended" => Self::CardWaitEnded,
+            "waiting_for_unlock" => Self::WaitingForUnlock,
             _ => return Err(CardOperationError::InvalidField("event")),
         })
     }
@@ -402,11 +407,12 @@ mod tests {
     use super::*;
     use crate::OperationId;
 
-    const EVENTS: [(ProgressEvent, &str); 4] = [
+    const EVENTS: [(ProgressEvent, &str); 5] = [
         (ProgressEvent::Queued, "queued"),
         (ProgressEvent::ConsentShown, "consent_shown"),
         (ProgressEvent::WaitingForCard, "waiting_for_card"),
         (ProgressEvent::CardWaitEnded, "card_wait_ended"),
+        (ProgressEvent::WaitingForUnlock, "waiting_for_unlock"),
     ];
 
     #[test]

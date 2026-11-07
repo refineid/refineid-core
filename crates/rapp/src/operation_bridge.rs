@@ -267,6 +267,9 @@ pub enum RappProgressEvent {
     WaitingForCard,
     /// The card was found or the wait is over.
     CardWaitEnded,
+    /// The custodian's device is locked; the holder is told on the lock
+    /// screen and the operation waits for the unlock.
+    WaitingForUnlock,
 }
 
 impl From<RappProgressEvent> for super::ProgressEvent {
@@ -276,6 +279,7 @@ impl From<RappProgressEvent> for super::ProgressEvent {
             RappProgressEvent::ConsentShown => Self::ConsentShown,
             RappProgressEvent::WaitingForCard => Self::WaitingForCard,
             RappProgressEvent::CardWaitEnded => Self::CardWaitEnded,
+            RappProgressEvent::WaitingForUnlock => Self::WaitingForUnlock,
         }
     }
 }
@@ -287,6 +291,7 @@ impl From<super::ProgressEvent> for RappProgressEvent {
             super::ProgressEvent::ConsentShown => Self::ConsentShown,
             super::ProgressEvent::WaitingForCard => Self::WaitingForCard,
             super::ProgressEvent::CardWaitEnded => Self::CardWaitEnded,
+            super::ProgressEvent::WaitingForUnlock => Self::WaitingForUnlock,
         }
     }
 }

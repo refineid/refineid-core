@@ -74,7 +74,7 @@ elliptic-curve = { version = "0.14", default-features = false, features = ["arit
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 crypto-bigint = { version = "0.7", features = ["alloc", "zeroize"] }
 miniz_oxide = "0.9"
-curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "zeroize"] }
+curve25519-dalek = { version = "5.0", default-features = false, features = ["alloc", "zeroize"] }
 getrandom = "0.4"
 hmac = "0.13"
 proc-macro2 = { version = "1", features = ["span-locations"] }

@@ -1,0 +1,27 @@
+# Copyright 2026 Petri Koistinen. SPDX-License-Identifier: Apache-2.0
+#
+# gitleaks configuration: the default rules, minus three things that hold
+# no secret. A Cargo.lock lists package names, versions, sources and
+# checksums and nothing else; the published RAPP test vectors are example
+# values of the protocol; and the protocol specifications name the
+# domain-separation strings of the key schedule.
+
+title = "refineid-core"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Cargo lockfiles hold no secrets"
+paths = ['''(^|/)Cargo\.lock$''']
+
+[[allowlists]]
+description = "published protocol test vectors"
+paths = ['''^docs?/protocols/vectors/.*\.json$''']
+
+[[allowlists]]
+description = "domain-separation strings named in the protocol specifications"
+condition = "AND"
+regexTarget = "line"
+paths = ['''^docs?/protocols/rapp-v[0-9.]+\.md$''']
+regexes = ['''Key DSI: `[A-Za-z0-9_]+`''']

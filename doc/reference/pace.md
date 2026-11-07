@@ -143,11 +143,11 @@ answers with the PIN's state before any try is spent (BSI TR-03110-3
 | `63C4`, `63C3` | four or three tries left | served |
 | `63C2` | two tries left | refused |
 | `63C1` | one try left; the PIN is suspended | refused |
-| `63C0` | the PIN is blocked | refused |
+| `63C0` | no tries left; the credential is blocked | refused for a PIN; served for the PUK, which the card then answers for itself |
 | `6283` | the PIN is deactivated | refused |
 
 The rule is `check_retry_floor` from `refineid-auth`, the one floor
-every surface applies (see
+every surface applies, with the PUK's own last-tries arm (see
 [credential custody](../security/credential-custody.md)). On a refusal
 nothing after `MSE:Set AT` is sent. A `63CX` answer to a `GENERAL
 AUTHENTICATE` is a wrong PIN or a wrong PUK, reported with the tries

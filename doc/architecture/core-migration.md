@@ -371,7 +371,9 @@ S1 v4.0, organizational cards, section 2.1) over NIST curves:
   `check_retry_floor` decides before the first `GENERAL AUTHENTICATE`; a
   counter answer to a later round is a typed wrong PIN;
 - the PUK is a fourth PACE password, under the organization numbering's
-  PUK reference, floored the same way and reported as a typed wrong PUK;
+  PUK reference, floored by the PUK's last-tries rule (served at no
+  tries left, where the card answers for itself) and reported as a typed
+  wrong PUK;
   the channel it opens, and the one PIN 1 opens, carry the counter the
   floor served, lowered by every later refusal, and are the only
   channels with the PIN resets (`PukPaceChannelOps`) and the PIN 1

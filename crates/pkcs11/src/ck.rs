@@ -660,6 +660,11 @@ pub const CKO_CERTIFICATE: CkUlong = 0x0000_0001;
 pub const CKO_PUBLIC_KEY: CkUlong = 0x0000_0002;
 /// `CKO_PRIVATE_KEY`: object class for a private key.
 pub const CKO_PRIVATE_KEY: CkUlong = 0x0000_0003;
+/// `CKO_PROFILE` (pkcs11t.h, new in v3.0): object class of a profile
+/// object, which names one PKCS#11 profile the token implements
+/// (v3.0 base specification s4.14). The header assigns it nine, the
+/// class after `CKO_OTP_KEY`.
+pub const CKO_PROFILE: CkUlong = 0x0000_0009;
 /// `CKC_X_509`: certificate type for an X.509 public-key cert.
 pub const CKC_X_509: CkUlong = 0x0000_0000;
 /// `CK_CERTIFICATE_CATEGORY` value `token user` (v2.40 s4.6.2 table
@@ -744,6 +749,35 @@ pub const CKA_EC_PARAMS: CkAttributeType = 0x0000_0180;
 pub const CKA_EC_POINT: CkAttributeType = 0x0000_0181;
 /// `CKA_ALWAYS_AUTHENTICATE`: per-op re-auth flag (false here).
 pub const CKA_ALWAYS_AUTHENTICATE: CkAttributeType = 0x0000_0202;
+/// `CKA_PROFILE_ID` (pkcs11t.h, v3.0): the [`CkProfileId`] a
+/// [`CKO_PROFILE`] object carries. The header places it at 1537, the
+/// first attribute of its own block, one past six times 256.
+pub const CKA_PROFILE_ID: CkAttributeType = 0x0000_0601;
+
+// ---- Profile identifiers (CKP_*, pkcs11t.h, v3.0) ----
+//
+// A profile object (`CKO_PROFILE`) names one profile of the PKCS#11
+// profiles specification that the token implements. This token
+// claims exactly one, `CKP_PUBLIC_CERTIFICATES_TOKEN`, and never
+// `CKP_AUTHENTICATION_TOKEN` (see `token.rs`, `ObjectKind`). The
+// header numbers the profiles from one in the order of the profiles
+// document.
+
+/// `CK_PROFILE_ID` (pkcs11t.h, v3.0): a profile identifier, a
+/// [`CkUlong`].
+pub type CkProfileId = CkUlong;
+/// `CKP_AUTHENTICATION_TOKEN` (pkcs11t.h, v3.0): the third profile,
+/// a token used for authentication. This module never claims it;
+/// the constant exists so a test can assert that no profile object
+/// answers it.
+pub const CKP_AUTHENTICATION_TOKEN: CkProfileId = 0x0000_0003;
+/// `CKP_PUBLIC_CERTIFICATES_TOKEN` (pkcs11t.h, v3.0): the fourth
+/// profile, a token whose certificates are readable without a login.
+/// NSS reads it as the token being friendly: its certificate and
+/// trust objects are searched as soon as the token is present
+/// instead of after the session's first login
+/// (`lib/pk11wrap/pk11slot.c`, `PK11_IsFriendly`).
+pub const CKP_PUBLIC_CERTIFICATES_TOKEN: CkProfileId = 0x0000_0004;
 
 // ---- NSS vendor-defined trust objects (pkcs11n.h) ----
 //

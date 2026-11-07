@@ -14,7 +14,9 @@
 
 //! Slot / token / object model over PC/SC.
 //!
-//! A FINEID token exposes the authentication certificate
+//! A FINEID token exposes one profile object ([`ObjectKind::Profile`],
+//! handle [`OBJ_PROFILE`]) declaring that its certificates are readable
+//! without a login, the authentication certificate
 //! ([`ObjectKind::Certificate`], handle [`OBJ_CERTIFICATE`]), its
 //! public key ([`ObjectKind::PublicKey`], handle [`OBJ_PUBLIC_KEY`],
 //! for consumers such as p11tool / libp11 that enumerate public
@@ -24,7 +26,9 @@
 //! and for each CA certificate an NSS trust record ([`ObjectKind::Trust`],
 //! the handle range after the CA certificates) that marks it a trust
 //! anchor for client authentication and email only, for exactly as
-//! long as the CA certificate object itself exists.
+//! long as the CA certificate object itself exists. The profile object
+//! is what lets NSS search the certificates and trust records as soon
+//! as the card is present rather than after a login.
 //! All authentication objects carry the same [`crate::ck::CKA_ID`] so NSS
 //! pairs them.
 //!
@@ -75,14 +79,14 @@ use crate::ck::{
     CKA_ISSUER, CKA_KEY_TYPE, CKA_LABEL, CKA_LOCAL, CKA_MODIFIABLE, CKA_MODULUS, CKA_MODULUS_BITS,
     CKA_NEVER_EXTRACTABLE, CKA_NSS_CERT_MD5_HASH, CKA_NSS_CERT_SHA1_HASH,
     CKA_NSS_TRUST_CLIENT_AUTH, CKA_NSS_TRUST_CODE_SIGNING, CKA_NSS_TRUST_EMAIL_PROTECTION,
-    CKA_NSS_TRUST_SERVER_AUTH, CKA_NSS_TRUST_STEP_UP_APPROVED, CKA_PRIVATE, CKA_PUBLIC_EXPONENT,
-    CKA_SENSITIVE, CKA_SERIAL_NUMBER, CKA_SIGN, CKA_SIGN_RECOVER, CKA_SUBJECT, CKA_TOKEN,
-    CKA_TRUSTED, CKA_UNWRAP, CKA_VALUE, CKA_VERIFY, CKA_WRAP, CKC_X_509, CKK_EC, CKK_RSA,
-    CKO_CERTIFICATE, CKO_NSS_TRUST, CKO_PRIVATE_KEY, CKO_PUBLIC_KEY, CKR_DATA_INVALID,
-    CKR_DATA_LEN_RANGE, CKR_DEVICE_ERROR, CKR_MECHANISM_INVALID, CKR_OK, CKR_PIN_INCORRECT,
-    CKR_PIN_LOCKED, CKR_SIGNATURE_INVALID, CKR_SIGNATURE_LEN_RANGE, CKR_USER_NOT_LOGGED_IN,
-    CKT_NSS_MUST_VERIFY_TRUST, CKT_NSS_TRUSTED_DELEGATOR, CkAttributeType, CkBbool, CkObjectHandle,
-    CkRv, CkTrust, CkUlong,
+    CKA_NSS_TRUST_SERVER_AUTH, CKA_NSS_TRUST_STEP_UP_APPROVED, CKA_PRIVATE, CKA_PROFILE_ID,
+    CKA_PUBLIC_EXPONENT, CKA_SENSITIVE, CKA_SERIAL_NUMBER, CKA_SIGN, CKA_SIGN_RECOVER, CKA_SUBJECT,
+    CKA_TOKEN, CKA_TRUSTED, CKA_UNWRAP, CKA_VALUE, CKA_VERIFY, CKA_WRAP, CKC_X_509, CKK_EC,
+    CKK_RSA, CKO_CERTIFICATE, CKO_NSS_TRUST, CKO_PRIVATE_KEY, CKO_PROFILE, CKO_PUBLIC_KEY,
+    CKP_PUBLIC_CERTIFICATES_TOKEN, CKR_DATA_INVALID, CKR_DATA_LEN_RANGE, CKR_DEVICE_ERROR,
+    CKR_MECHANISM_INVALID, CKR_OK, CKR_PIN_INCORRECT, CKR_PIN_LOCKED, CKR_SIGNATURE_INVALID,
+    CKR_SIGNATURE_LEN_RANGE, CKR_USER_NOT_LOGGED_IN, CKT_NSS_MUST_VERIFY_TRUST,
+    CKT_NSS_TRUSTED_DELEGATOR, CkAttributeType, CkBbool, CkObjectHandle, CkRv, CkTrust, CkUlong,
 };
 use crate::sign::{
     CardSignInput, DigestInfoHash, ECDSA_P384_SIGNATURE_BYTES, Mechanism, RSA3072_MODULUS_BITS,
@@ -99,13 +103,17 @@ pub const OBJ_PRIVATE_KEY: CkObjectHandle = 2;
 /// Object handle for the authentication public key, derived from the
 /// certificate SPKI. Shares [`CKA_ID`] with the other two objects.
 pub const OBJ_PUBLIC_KEY: CkObjectHandle = 3;
+/// Object handle for the token's one profile object
+/// ([`ObjectKind::Profile`]). Fixed for the process; the object is a
+/// constant of the module, not of the card.
+pub const OBJ_PROFILE: CkObjectHandle = 4;
 /// Base object handle for on-card and persisted CA certificates.
 /// Subsequent CA certificates receive sequential handles: `OBJ_CA_BASE + index`.
 /// The range is [`MAX_CA_OBJECTS`] wide; the NSS trust record of the CA
 /// certificate at `index` follows it at
 /// `OBJ_CA_BASE + MAX_CA_OBJECTS + index`, so a trust record's handle
 /// names its certificate by the same index.
-pub const OBJ_CA_BASE: CkObjectHandle = 4;
+pub const OBJ_CA_BASE: CkObjectHandle = 5;
 /// The CA certificate slots this module reads from the card, in the
 /// order they are read: the issuing CA (EF.4336), then the root
 /// (EF.4334).
@@ -164,13 +172,15 @@ const EC_PARAMS_SECP384R1: [u8; 7] = [0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x22];
 
 /// Which of the token's objects an attribute query refers to.
 ///
-/// HARD LIMIT: never add a `CKO_PROFILE` object (or any object
-/// answering `CKA_PROFILE_ID` = `CKP_AUTHENTICATION_TOKEN`). NSS
-/// reads that profile as permission to log in proactively and
-/// prompts for PIN1 at Firefox startup, before the user asked for
-/// anything -- a blocker-severity regression when it was tried
-/// (eager PIN1 from `CKP_AUTHENTICATION_TOKEN`). PIN prompts must
-/// appear only when a TLS handshake actually needs the key.
+/// HARD LIMIT: the token claims exactly one profile,
+/// [`CKP_PUBLIC_CERTIFICATES_TOKEN`], through [`Self::Profile`]. Never
+/// add a second `CKO_PROFILE` object, and never one answering
+/// `CKA_PROFILE_ID` = `CKP_AUTHENTICATION_TOKEN`: that profile invites
+/// a client to log in proactively, and a PIN prompt must appear only
+/// when a TLS handshake actually needs the key, never at browser
+/// startup. The public-certificates profile asserts nothing about the
+/// key or the login; it only says the certificates are readable
+/// without one, which they are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectKind {
     /// The X.509 authentication certificate ([`CKO_CERTIFICATE`]).
@@ -180,6 +190,12 @@ pub enum ObjectKind {
     PublicKey,
     /// The authentication private key ([`CKO_PRIVATE_KEY`]).
     PrivateKey,
+    /// The profile object ([`CKO_PROFILE`]) claiming
+    /// [`CKP_PUBLIC_CERTIFICATES_TOKEN`]: the token's certificates
+    /// are readable without a login. Built from specification
+    /// constants alone, so it exists on every token the module raises,
+    /// local or phone-served, whatever the card carries.
+    Profile,
     /// Dynamic CA certificate object at index `usize`.
     Ca(usize),
     /// The NSS trust record ([`CKO_NSS_TRUST`]) of the CA certificate
@@ -202,6 +218,7 @@ impl ObjectKind {
             OBJ_CERTIFICATE => Some(Self::Certificate),
             OBJ_PRIVATE_KEY => Some(Self::PrivateKey),
             OBJ_PUBLIC_KEY => Some(Self::PublicKey),
+            OBJ_PROFILE => Some(Self::Profile),
             h if h >= OBJ_CA_BASE => {
                 let offset = usize::try_from(h - OBJ_CA_BASE).ok()?;
                 match offset {
@@ -221,6 +238,7 @@ impl ObjectKind {
             Self::Certificate => OBJ_CERTIFICATE,
             Self::PrivateKey => OBJ_PRIVATE_KEY,
             Self::PublicKey => OBJ_PUBLIC_KEY,
+            Self::Profile => OBJ_PROFILE,
             Self::Ca(idx) => OBJ_CA_BASE.saturating_add(handle_offset(idx)),
             Self::Trust(idx) => {
                 OBJ_CA_BASE.saturating_add(handle_offset(idx.saturating_add(MAX_CA_OBJECTS)))
@@ -686,6 +704,30 @@ fn non_empty(bytes: &[u8]) -> Option<&[u8]> {
     if bytes.is_empty() { None } else { Some(bytes) }
 }
 
+/// Attribute lookup for the profile object ([`ObjectKind::Profile`]):
+/// a public, unmodifiable token object of class [`CKO_PROFILE`] whose
+/// [`CKA_PROFILE_ID`] is [`CKP_PUBLIC_CERTIFICATES_TOKEN`] (PKCS#11
+/// v3.0 base specification s4.14). It reads nothing from the card, so
+/// every token answers it the same way.
+///
+/// NSS searches the profile objects of a token as soon as it is
+/// present, before any login, with a template of [`CKA_TOKEN`] true and
+/// [`CKA_CLASS`] `CKO_PROFILE`, and reads each one's `CKA_PROFILE_ID`
+/// (`lib/pk11wrap/pk11slot.c`, `PK11_InitToken` and
+/// `pk11_ReadProfileList`); finding this profile makes the token
+/// friendly (`PK11_IsFriendly`), so its certificate and trust objects
+/// are searched without waiting for a login (`lib/dev/devutil.c`,
+/// `search_for_objects`).
+fn profile_attribute(attr: CkAttributeType) -> Option<AttrValue<'static>> {
+    match attr {
+        CKA_CLASS => Some(ulong_attr(CKO_PROFILE)),
+        CKA_PROFILE_ID => Some(ulong_attr(CKP_PUBLIC_CERTIFICATES_TOKEN)),
+        CKA_TOKEN => Some(bool_attr(CK_TRUE)),
+        CKA_PRIVATE | CKA_MODIFIABLE => Some(bool_attr(CK_FALSE)),
+        _ => None,
+    }
+}
+
 impl TokenObjects {
     /// Build token objects from the card's leaf authentication certificate
     /// DER bytes, gated by `key_gate`. Initializes an empty trust store
@@ -806,6 +848,7 @@ impl TokenObjects {
             ObjectKind::Certificate => self.certificate_attribute(attr),
             ObjectKind::PublicKey => self.public_key_attribute(attr),
             ObjectKind::PrivateKey => self.private_key_attribute(attr),
+            ObjectKind::Profile => profile_attribute(attr),
             ObjectKind::Ca(_) => self.ca_attribute(kind, attr),
             ObjectKind::Trust(_) => self.trust_attribute(kind, attr),
         }
@@ -817,7 +860,10 @@ impl TokenObjects {
     pub(crate) fn ca_object_for_kind(&self, kind: ObjectKind) -> Option<&CaObject> {
         match kind {
             ObjectKind::Ca(idx) | ObjectKind::Trust(idx) => self.ca_store.get(idx),
-            ObjectKind::Certificate | ObjectKind::PrivateKey | ObjectKind::PublicKey => None,
+            ObjectKind::Certificate
+            | ObjectKind::PrivateKey
+            | ObjectKind::PublicKey
+            | ObjectKind::Profile => None,
         }
     }
 
@@ -1091,20 +1137,24 @@ impl TokenObjects {
     #[must_use]
     pub(crate) fn object_exists(&self, kind: ObjectKind) -> bool {
         match kind {
-            ObjectKind::Certificate | ObjectKind::PublicKey | ObjectKind::PrivateKey => true,
+            ObjectKind::Certificate
+            | ObjectKind::PublicKey
+            | ObjectKind::PrivateKey
+            | ObjectKind::Profile => true,
             ObjectKind::Ca(idx) | ObjectKind::Trust(idx) => self.ca_store.get(idx).is_some(),
         }
     }
 
     /// Return all active object kinds present on this token: the
-    /// three authentication objects, then each CA certificate, then
-    /// each CA certificate's trust record.
+    /// three authentication objects, the profile object, then each CA
+    /// certificate, then each CA certificate's trust record.
     #[must_use]
     pub(crate) fn all_object_kinds(&self) -> Vec<ObjectKind> {
         let mut kinds = vec![
             ObjectKind::Certificate,
             ObjectKind::PublicKey,
             ObjectKind::PrivateKey,
+            ObjectKind::Profile,
         ];
         for idx in 0..self.ca_store.len() {
             kinds.push(ObjectKind::Ca(idx));
@@ -2012,8 +2062,8 @@ mod tests {
 
     use super::{
         DER_LONG_FORM_ONE_OCTET, DER_TAG_INTEGER, DER_TAG_OCTET_STRING, OBJ_CERTIFICATE,
-        OBJ_PRIVATE_KEY, OBJ_PUBLIC_KEY, ObjectKind, OwnedCert, der_integer, der_octet_string,
-        pin1_verify_guard,
+        OBJ_PRIVATE_KEY, OBJ_PROFILE, OBJ_PUBLIC_KEY, ObjectKind, OwnedCert, der_integer,
+        der_octet_string, pin1_verify_guard,
     };
     use crate::ck::{CKR_DEVICE_ERROR, CKR_PIN_LOCKED};
 
@@ -2060,10 +2110,73 @@ mod tests {
             ObjectKind::from_handle(OBJ_PUBLIC_KEY),
             Some(ObjectKind::PublicKey)
         );
+        assert_eq!(
+            ObjectKind::from_handle(OBJ_PROFILE),
+            Some(ObjectKind::Profile)
+        );
         assert_eq!(ObjectKind::from_handle(0), None);
         assert_eq!(ObjectKind::Certificate.handle(), OBJ_CERTIFICATE);
         assert_eq!(ObjectKind::PrivateKey.handle(), OBJ_PRIVATE_KEY);
         assert_eq!(ObjectKind::PublicKey.handle(), OBJ_PUBLIC_KEY);
+        assert_eq!(ObjectKind::Profile.handle(), OBJ_PROFILE);
+    }
+
+    /// The profile object is a constant of the module: a public,
+    /// unmodifiable token object claiming the public-certificates
+    /// profile and no other, on a login-gated token with no CA
+    /// certificate as much as on one with them.
+    #[test]
+    fn the_profile_object_claims_public_certificates_only() {
+        use crate::ck::{
+            CK_FALSE, CK_TRUE, CKA_CLASS, CKA_LABEL, CKA_MODIFIABLE, CKA_PRIVATE, CKA_PROFILE_ID,
+            CKA_TOKEN, CKO_PROFILE, CKP_AUTHENTICATION_TOKEN, CKP_PUBLIC_CERTIFICATES_TOKEN,
+        };
+
+        const TEST_CA_1_DER: &[u8] =
+            include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+        let mut objects =
+            super::TokenObjects::from_cert_der(TEST_CA_1_DER.to_vec(), super::KeyGate::Login)
+                .expect("token objects from cert der");
+
+        let ulong = |value: crate::ck::CkUlong| value.to_ne_bytes().to_vec();
+        let profile_class = [(CKA_CLASS, ulong(CKO_PROFILE))];
+        let profiles = |objects: &super::TokenObjects| {
+            objects
+                .all_object_kinds()
+                .into_iter()
+                .filter(|kind| objects.matches(*kind, &profile_class))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(profiles(&objects), vec![ObjectKind::Profile]);
+        objects.push_ca_cert(OwnedCert::from_der(TEST_CA_1_DER).expect("valid cert"));
+        assert_eq!(profiles(&objects), vec![ObjectKind::Profile]);
+
+        let read = |attr| {
+            objects
+                .attribute(ObjectKind::Profile, attr)
+                .and_then(|value| value.as_bytes().map(<[u8]>::to_vec))
+        };
+        assert_eq!(read(CKA_CLASS), Some(ulong(CKO_PROFILE)));
+        assert_eq!(
+            read(CKA_PROFILE_ID),
+            Some(ulong(CKP_PUBLIC_CERTIFICATES_TOKEN))
+        );
+        assert_eq!(read(CKA_TOKEN), Some(vec![CK_TRUE]));
+        assert_eq!(read(CKA_PRIVATE), Some(vec![CK_FALSE]));
+        assert_eq!(read(CKA_MODIFIABLE), Some(vec![CK_FALSE]));
+        assert_eq!(read(CKA_LABEL), None);
+
+        // NSS's own search template, then the one profile this token
+        // must never claim.
+        let nss_template = [(CKA_TOKEN, vec![CK_TRUE]), (CKA_CLASS, ulong(CKO_PROFILE))];
+        assert!(objects.matches(ObjectKind::Profile, &nss_template));
+        let authentication_token = [(CKA_PROFILE_ID, ulong(CKP_AUTHENTICATION_TOKEN))];
+        assert!(
+            objects
+                .all_object_kinds()
+                .into_iter()
+                .all(|kind| !objects.matches(kind, &authentication_token))
+        );
     }
 
     #[test]
@@ -2200,6 +2313,7 @@ mod tests {
                 ObjectKind::Certificate,
                 ObjectKind::PublicKey,
                 ObjectKind::PrivateKey,
+                ObjectKind::Profile,
                 ObjectKind::Ca(0),
                 ObjectKind::Trust(0),
             ]
@@ -2424,6 +2538,7 @@ mod tests {
                 ObjectKind::Certificate,
                 ObjectKind::PublicKey,
                 ObjectKind::PrivateKey,
+                ObjectKind::Profile,
                 ObjectKind::Ca(0),
                 ObjectKind::Ca(1),
                 ObjectKind::Trust(0),

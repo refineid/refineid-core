@@ -67,6 +67,17 @@ use crate::token::{AttrValue, KeyGate, ObjectKind, TokenObjects};
 /// Cryptoki interface version this module implements (`2.40`, OASIS
 /// PKCS#11 v2.40). Reported in [`CkInfo::cryptoki_version`] and the
 /// vtable version.
+///
+/// The token's `CKO_PROFILE` object (a v3.0 object class) needs no
+/// higher version: NSS reads the profile objects of every token it
+/// initialises, whatever version the module reports
+/// (`lib/pk11wrap/pk11slot.c`, `PK11_InitToken`,
+/// `pk11_ReadProfileList`, `PK11_IsFriendly`). A `3.0` here would be
+/// wrong: the same value sits in [`FUNCTION_LIST`], and NSS takes a
+/// vtable version of `3.0` or later as a `CK_FUNCTION_LIST_3_0` with
+/// the message-based entries after `C_WaitForSlotEvent`
+/// (`lib/pk11wrap/pk11cxt.c`, `PK11_CheckPKCS11Version` with the
+/// function table), which this v2.40 table does not have.
 const CRYPTOKI_VERSION: CkVersion = CkVersion {
     major: 2,
     minor: 40,
@@ -2508,6 +2519,136 @@ mod tests {
         // signature.
         const SIGNATURES: usize = 3;
         assert_eq!(phone_requests(), before + SIGNATURES);
+    }
+
+    /// The profile object is found without any login, on a token
+    /// whose key a login gates: by NSS's own template (a token object
+    /// of class `CKO_PROFILE`), by class alone and by an empty
+    /// template; it answers the public-certificates profile and no
+    /// other profile object exists.
+    #[test]
+    fn the_profile_object_is_found_without_login() {
+        use crate::ck::{
+            CK_FALSE, CK_INVALID_HANDLE, CK_TRUE, CKA_CLASS, CKA_MODIFIABLE, CKA_PRIVATE,
+            CKA_PROFILE_ID, CKA_TOKEN, CKF_SERIAL_SESSION, CKO_PROFILE, CKP_AUTHENTICATION_TOKEN,
+            CKP_PUBLIC_CERTIFICATES_TOKEN, CKS_RO_PUBLIC_SESSION, CkAttribute, CkBbool,
+            CkObjectHandle, CkSessionInfo,
+        };
+        use crate::state::{ModuleState, SlotRecord};
+        use crate::token::{KeyGate, ObjectKind, TokenObjects};
+
+        /// A P-384 certificate standing in for the card's.
+        const CARD_CERT_DER: &[u8] =
+            include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+        /// More handles than the token has objects.
+        const HANDLE_ROOM: usize = 64;
+
+        let slot = SlotRecord::local_for_test(1, "Test Reader 00 00");
+        let mut state = ModuleState::from_parts_for_test(vec![slot], 2);
+        let objects = TokenObjects::from_cert_der(CARD_CERT_DER.to_vec(), KeyGate::Login)
+            .expect("token objects from cert der");
+        let token = state.raise_token_for_test(1, objects);
+        let profile = token.handle(ObjectKind::Profile);
+        let session = state.open_session(1, CKF_SERIAL_SESSION);
+        let _module = installed_module(state);
+
+        let mut info: CkSessionInfo = unsafe { core::mem::zeroed() };
+        assert_eq!(
+            unsafe { super::c_get_session_info(session, &mut info) },
+            CKR_OK
+        );
+        assert_eq!(info.state, CKS_RO_PUBLIC_SESSION);
+
+        let find = |template: &mut [CkAttribute]| {
+            assert_eq!(
+                unsafe {
+                    super::c_find_objects_init(
+                        session,
+                        template.as_mut_ptr(),
+                        ulong_of(template.len()),
+                    )
+                },
+                CKR_OK
+            );
+            let mut found = vec![CK_INVALID_HANDLE; HANDLE_ROOM];
+            let mut count: CkUlong = 0;
+            assert_eq!(
+                unsafe {
+                    super::c_find_objects(
+                        session,
+                        found.as_mut_ptr(),
+                        ulong_of(found.len()),
+                        &mut count,
+                    )
+                },
+                CKR_OK
+            );
+            assert_eq!(unsafe { super::c_find_objects_final(session) }, CKR_OK);
+            found.truncate(usize::try_from(count).expect("a count the buffer held"));
+            found
+        };
+        let attribute = |attr_type, value: *mut u8, len| {
+            let mut read = CkAttribute {
+                attr_type,
+                p_value: value.cast(),
+                ul_value_len: ulong_of(len),
+            };
+            assert_eq!(
+                unsafe { super::c_get_attribute_value(session, profile, &mut read, 1) },
+                CKR_OK
+            );
+            assert_eq!(read.ul_value_len, ulong_of(len));
+        };
+
+        // NSS's template: a token object of class CKO_PROFILE.
+        let mut token_object: CkBbool = CK_TRUE;
+        let mut class = CKO_PROFILE;
+        let mut nss_template = [
+            CkAttribute {
+                attr_type: CKA_TOKEN,
+                p_value: core::ptr::addr_of_mut!(token_object).cast(),
+                ul_value_len: ulong_of(core::mem::size_of_val(&token_object)),
+            },
+            CkAttribute {
+                attr_type: CKA_CLASS,
+                p_value: core::ptr::addr_of_mut!(class).cast(),
+                ul_value_len: ulong_of(core::mem::size_of_val(&class)),
+            },
+        ];
+        assert_eq!(find(&mut nss_template), vec![profile]);
+        let mut by_class = [nss_template[1]];
+        assert_eq!(find(&mut by_class), vec![profile]);
+        assert!(find(&mut []).contains(&profile));
+
+        let mut profile_id: CkUlong = 0;
+        attribute(
+            CKA_PROFILE_ID,
+            core::ptr::addr_of_mut!(profile_id).cast(),
+            core::mem::size_of_val(&profile_id),
+        );
+        assert_eq!(profile_id, CKP_PUBLIC_CERTIFICATES_TOKEN);
+        for (attr_type, expected) in [
+            (CKA_TOKEN, CK_TRUE),
+            (CKA_PRIVATE, CK_FALSE),
+            (CKA_MODIFIABLE, CK_FALSE),
+        ] {
+            let mut flag: CkBbool = !expected;
+            attribute(
+                attr_type,
+                core::ptr::addr_of_mut!(flag),
+                core::mem::size_of_val(&flag),
+            );
+            assert_eq!(flag, expected);
+        }
+
+        // No object claims the authentication-token profile.
+        let mut forbidden = CKP_AUTHENTICATION_TOKEN;
+        let mut by_forbidden_id = [CkAttribute {
+            attr_type: CKA_PROFILE_ID,
+            p_value: core::ptr::addr_of_mut!(forbidden).cast(),
+            ul_value_len: ulong_of(core::mem::size_of_val(&forbidden)),
+        }];
+        assert_eq!(find(&mut by_forbidden_id), Vec::<CkObjectHandle>::new());
     }
 
     fn ulong_of(value: usize) -> CkUlong {

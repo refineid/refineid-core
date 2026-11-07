@@ -5,9 +5,9 @@
 
 use super::{
     AnchorRole, ArchiveForm, CertificationPath, DocumentChange, DocumentFailure, DocumentFile,
-    DocumentReport, GrantedPeriod, Revision, Revocation, SignatureOutcome, SignatureReport,
-    SignatureRow, SignerIdentity, TimestampReport, TrustAnchor, TrustAnchors, UnsupportedProfile,
-    UnsupportedSignature, exactly, verify,
+    DocumentReport, GrantedPeriod, Indeterminate, Revision, Revocation, SignatureOutcome,
+    SignatureReport, SignatureRow, SignerIdentity, TimestampReport, TrustAnchor, TrustAnchors,
+    UnsupportedProfile, UnsupportedSignature, Verdict, exactly, verify,
 };
 use crate::asic::DataObject;
 use crate::cades::{DigestAlgorithm, SignatureAlgorithm, SignerParameters, SigningTime};
@@ -558,6 +558,10 @@ fn verify_under(bytes: Vec<u8>, anchors: &TrustAnchors) -> Result<DocumentReport
 }
 
 /// The one judged signature of a report.
+/// The verdict on a fixture that carries no revocation evidence and
+/// fetches none: nothing proven wrong, the revocation status unknown.
+const UNCONFIRMED_REVOCATION: Verdict = Verdict::Indeterminate(Indeterminate::RevocationUnknown);
+
 fn only(report: &DocumentReport) -> &SignatureReport {
     let [row] = exactly(report.rows(), "one signature");
     judged(row)
@@ -649,10 +653,10 @@ fn a_level_b_pdf_is_intact_valid_and_anchored_without_proof_of_existence() {
     assert_eq!(signature.revocation(), Revocation::Unavailable);
     assert_eq!(signature.signer().name(), DIRECT_SIGNER);
     assert_eq!(ders(signature.chain()), [world.root.as_slice()]);
-    assert!(signature.is_valid());
+    assert_eq!(signature.verdict(), UNCONFIRMED_REVOCATION);
     assert!(report.document_timestamps().is_empty());
     assert_eq!(report.anchors_fetched_at(), None);
-    assert!(report.is_valid());
+    assert_eq!(report.verdict(), UNCONFIRMED_REVOCATION);
 }
 
 #[test]
@@ -683,7 +687,7 @@ fn a_signature_timestamp_proves_existence() {
     );
     assert_eq!(signature.proof_of_existence(), Some(day(STAMPED)));
     assert_eq!(signature.validation_time(), day(STAMPED));
-    assert!(signature.is_valid());
+    assert_eq!(signature.verdict(), UNCONFIRMED_REVOCATION);
 }
 
 #[test]
@@ -704,7 +708,7 @@ fn level_lt_chains_through_the_store_and_reads_a_later_ocsp_answer() {
         signature.revocation(),
         Revocation::Good { at: day(ANSWERED) }
     );
-    assert!(report.is_valid());
+    assert_eq!(report.verdict(), Verdict::Valid);
 }
 
 #[test]
@@ -749,8 +753,8 @@ fn a_revocation_after_the_proof_of_existence_leaves_the_signature_valid() {
             reason: None,
         }
     );
-    assert!(signature.is_valid());
-    assert!(report.is_valid());
+    assert_eq!(signature.verdict(), Verdict::Valid);
+    assert_eq!(report.verdict(), Verdict::Valid);
 }
 
 #[test]
@@ -844,7 +848,7 @@ fn a_document_timestamp_covering_the_signature_proves_existence() {
         report.document_timestamps(),
         "the signature names the document timestamp that covers it"
     );
-    assert!(report.is_valid());
+    assert_eq!(report.verdict(), UNCONFIRMED_REVOCATION);
 }
 
 #[test]
@@ -896,9 +900,10 @@ fn a_document_timestamp_over_other_bytes_is_invalid_and_proves_nothing() {
         report.document_timestamps(),
         "a covering document timestamp is named whatever it was found to be"
     );
-    assert!(only(&report).is_valid());
-    assert!(
-        report.is_valid(),
+    assert_eq!(only(&report).verdict(), UNCONFIRMED_REVOCATION);
+    assert_eq!(
+        report.verdict(),
+        UNCONFIRMED_REVOCATION,
         "a document timestamp that fails decides nothing"
     );
 }
@@ -940,7 +945,7 @@ fn both_subfilters_verify_and_only_pades_requires_the_ess_binding() {
         signature.signature_valid(),
         "adbe.pkcs7.detached needs no ESS"
     );
-    assert!(report.is_valid());
+    assert_eq!(report.verdict(), UNCONFIRMED_REVOCATION);
 
     let report = world.verify(unbound(SUBFILTER_PADES)).expect("report");
     let signature = only(&report);
@@ -966,7 +971,11 @@ fn a_pades_signature_with_a_signing_time_attribute_is_not_valid() {
     let report = world
         .verify(world.foreign_pdf(Signer::Direct, &[], |_parts| {}))
         .expect("report");
-    assert!(only(&report).is_valid(), "the same signature without it");
+    assert_eq!(
+        only(&report).verdict(),
+        UNCONFIRMED_REVOCATION,
+        "the same signature without it"
+    );
 }
 
 #[test]
@@ -980,7 +989,7 @@ fn an_rsa_2048_pades_signature_verifies() {
     assert!(signature.signature_valid());
     assert!(signature.chain_verified());
     assert_eq!(signature.signer().name(), RSA_SIGNER);
-    assert!(report.is_valid());
+    assert_eq!(report.verdict(), UNCONFIRMED_REVOCATION);
 }
 
 #[test]
@@ -993,7 +1002,7 @@ fn an_asic_e_xades_container_verifies() {
     assert!(signature.document_intact());
     assert!(signature.signature_valid());
     assert!(signature.chain_verified());
-    assert!(report.is_valid());
+    assert_eq!(report.verdict(), UNCONFIRMED_REVOCATION);
 }
 
 #[test]
@@ -1006,7 +1015,7 @@ fn an_asic_e_cades_container_verifies() {
     assert!(signature.document_intact());
     assert!(signature.signature_valid());
     assert!(signature.chain_verified());
-    assert!(report.is_valid());
+    assert_eq!(report.verdict(), UNCONFIRMED_REVOCATION);
 }
 
 #[test]
@@ -1017,7 +1026,7 @@ fn an_attached_cades_file_verifies() {
     assert!(signature.document_intact());
     assert!(signature.signature_valid());
     assert!(signature.chain_verified());
-    assert!(report.is_valid());
+    assert_eq!(report.verdict(), UNCONFIRMED_REVOCATION);
 }
 
 #[test]
@@ -1062,11 +1071,11 @@ fn serial_signatures_are_each_judged_against_their_own_range() {
     let (first, second) = (judged(first), judged(second));
     assert_eq!(first.signer().name(), DIRECT_SIGNER);
     assert_eq!(first.revision(), Revision::LaterRevisionsHarmless);
-    assert!(first.is_valid());
+    assert_eq!(first.verdict(), UNCONFIRMED_REVOCATION);
     assert_eq!(second.signer().name(), RSA_SIGNER);
     assert_eq!(second.revision(), Revision::WholeDocument);
-    assert!(second.is_valid());
-    assert!(report.is_valid());
+    assert_eq!(second.verdict(), UNCONFIRMED_REVOCATION);
+    assert_eq!(report.verdict(), UNCONFIRMED_REVOCATION);
 }
 
 #[test]
@@ -1085,7 +1094,7 @@ fn an_unsupported_signature_is_its_own_row_and_blocks_the_document() {
     let twice = placeholder.finish(&cms(&parts)).expect("fits");
     let report = world.verify(twice).expect("report");
     let [first, second] = exactly(report.rows(), "two signatures");
-    assert!(first.is_valid());
+    assert_eq!(first.verdict(), UNCONFIRMED_REVOCATION);
     assert!(matches!(
         second.outcome(),
         SignatureOutcome::Unsupported {
@@ -1176,7 +1185,7 @@ fn a_self_made_timestamp_is_unproven_and_the_signature_is_judged_at_now() {
         .expect("report");
     let signature = only(&report);
     assert_eq!(signature.proof_of_existence(), Some(day(STAMPED)));
-    assert!(signature.is_valid());
+    assert_eq!(signature.verdict(), Verdict::Valid);
 }
 
 #[test]
@@ -1424,7 +1433,7 @@ fn a_signature_timestamp_verifies_under_its_own_imprint_algorithm() {
             .expect("report");
         let signature = only(&report);
         assert_eq!(signature.proof_of_existence(), Some(day(STAMPED)));
-        assert!(signature.is_valid());
+        assert_eq!(signature.verdict(), UNCONFIRMED_REVOCATION);
     }
 }
 
@@ -1441,7 +1450,7 @@ fn a_sha_512_imprint_verifies_and_a_wrong_length_imprint_is_refused() {
         [Kind::Anchored(day(STAMPED))]
     );
     assert_eq!(signature.proof_of_existence(), Some(day(STAMPED)));
-    assert!(signature.is_valid());
+    assert_eq!(signature.verdict(), UNCONFIRMED_REVOCATION);
 
     // A SHA-256 imprint of SHA-512 length.
     let wrong_length = world.foreign_timestamped_pdf(DigestAlgorithm::Sha256, |signature| {
@@ -1458,8 +1467,9 @@ fn a_sha_512_imprint_verifies_and_a_wrong_length_imprint_is_refused() {
         }]
     ));
     assert_eq!(signature.proof_of_existence(), None);
-    assert!(
-        signature.is_valid(),
+    assert_eq!(
+        signature.verdict(),
+        UNCONFIRMED_REVOCATION,
         "a timestamp that fails decides nothing"
     );
 }
@@ -1492,7 +1502,7 @@ fn a_sha_512_pades_signature_verifies_under_ecdsa_and_rsa() {
         let signature = only(&report);
         assert!(signature.document_intact(), "{signer:?}");
         assert!(signature.signature_valid(), "{signer:?}");
-        assert!(signature.is_valid(), "{signer:?}");
+        assert_eq!(signature.verdict(), UNCONFIRMED_REVOCATION, "{signer:?}");
     }
     assert_eq!(DigestAlgorithm::from_oid(known::SHA1), None);
 }
@@ -1517,8 +1527,9 @@ fn a_signature_timestamp_over_other_bytes_is_invalid() {
     ));
     assert!(signature.signature_valid());
     assert_eq!(signature.proof_of_existence(), None);
-    assert!(
-        signature.is_valid(),
+    assert_eq!(
+        signature.verdict(),
+        UNCONFIRMED_REVOCATION,
         "a timestamp that fails decides nothing"
     );
 }
@@ -2016,7 +2027,7 @@ fn inclusive_canonical_xml_signed_info_and_properties_verify() {
         assert!(signature.document_intact(), "{uri}");
         assert!(signature.signature_valid(), "{uri}");
         assert!(signature.chain_verified(), "{uri}");
-        assert!(report.is_valid(), "{uri}");
+        assert_eq!(report.verdict(), UNCONFIRMED_REVOCATION, "{uri}");
 
         // Re-signed under exclusive canonicalisation, the value no
         // longer verifies: the inclusive form differs.
@@ -2071,7 +2082,7 @@ fn a_respelled_inclusive_signed_info_still_verifies() {
     let signature = only(&report);
     assert!(signature.document_intact());
     assert!(signature.signature_valid());
-    assert!(report.is_valid());
+    assert_eq!(report.verdict(), UNCONFIRMED_REVOCATION);
 }
 
 #[test]
@@ -2088,14 +2099,14 @@ fn a_counter_signature_is_its_own_row_over_the_outer_signature_value() {
     let [outer, counter] = xades_rows(&report);
     assert_eq!(outer.counter_signs(), None);
     assert_eq!(counter.counter_signs(), Some(0));
-    assert!(outer.is_valid());
+    assert_eq!(outer.verdict(), UNCONFIRMED_REVOCATION);
     let counter = judged(counter);
     assert_eq!(counter.signer().name(), RSA_SIGNER);
     assert!(counter.document_intact());
     assert!(counter.signature_valid());
     assert!(counter.chain_verified());
-    assert!(counter.is_valid());
-    assert!(report.is_valid());
+    assert_eq!(counter.verdict(), UNCONFIRMED_REVOCATION);
+    assert_eq!(report.verdict(), UNCONFIRMED_REVOCATION);
 }
 
 #[test]
@@ -2119,12 +2130,20 @@ fn a_counter_signature_over_another_signature_value_is_not_valid() {
         )))
         .expect("report");
     let [outer, counter] = xades_rows(&report);
-    assert!(outer.is_valid(), "the outer verdict does not change");
+    assert_eq!(
+        outer.verdict(),
+        UNCONFIRMED_REVOCATION,
+        "the outer verdict does not change"
+    );
     let counter = judged(counter);
     assert!(!counter.document_intact());
     assert!(counter.signature_valid());
     assert!(!counter.is_valid());
-    assert!(report.is_valid(), "a counter-signature decides nothing");
+    assert_eq!(
+        report.verdict(),
+        UNCONFIRMED_REVOCATION,
+        "a counter-signature decides nothing"
+    );
 }
 
 #[test]
@@ -2139,12 +2158,16 @@ fn a_counter_signature_without_a_signing_certificate_is_not_valid() {
         ))
         .expect("report");
     let [outer, counter] = xades_rows(&report);
-    assert!(outer.is_valid());
+    assert_eq!(outer.verdict(), UNCONFIRMED_REVOCATION);
     assert_eq!(counter.counter_signs(), Some(0));
     let counter = judged(counter);
     assert!(counter.document_intact());
     assert!(!counter.signature_valid());
-    assert!(report.is_valid(), "a counter-signature decides nothing");
+    assert_eq!(
+        report.verdict(),
+        UNCONFIRMED_REVOCATION,
+        "a counter-signature decides nothing"
+    );
 }
 
 #[test]
@@ -2160,7 +2183,7 @@ fn an_unreadable_counter_signature_is_an_unsupported_row() {
     );
     let report = world.verify(xades_container_of(&document)).expect("report");
     let [outer, counter] = xades_rows(&report);
-    assert!(outer.is_valid());
+    assert_eq!(outer.verdict(), UNCONFIRMED_REVOCATION);
     assert_eq!(counter.counter_signs(), Some(0));
     assert!(matches!(
         counter.outcome(),
@@ -2169,7 +2192,11 @@ fn an_unreadable_counter_signature_is_an_unsupported_row() {
             ..
         }
     ));
-    assert!(report.is_valid(), "a counter-signature decides nothing");
+    assert_eq!(
+        report.verdict(),
+        UNCONFIRMED_REVOCATION,
+        "a counter-signature decides nothing"
+    );
 }
 
 /// The writer's signature value under `method`, as the counter-signing
@@ -2182,7 +2209,7 @@ fn outer_value(document: &str, method: &Canonicalization) -> Vec<u8> {
 /// names the first row.
 fn counter_report(report: &DocumentReport) -> &SignatureReport {
     let [outer, counter] = xades_rows(report);
-    assert!(outer.is_valid());
+    assert_eq!(outer.verdict(), UNCONFIRMED_REVOCATION);
     assert_eq!(counter.counter_signs(), Some(0));
     judged(counter)
 }
@@ -2237,10 +2264,10 @@ fn a_counter_signature_over_another_signature_s_value_is_not_accepted() {
     );
     let report = world.verify(xades_container_of(&twice)).expect("report");
     let [outer, first, second] = exactly(report.rows(), "a signature and two counter-signatures");
-    assert!(outer.is_valid());
+    assert_eq!(outer.verdict(), UNCONFIRMED_REVOCATION);
     assert_eq!(first.counter_signs(), Some(0));
     assert_eq!(second.counter_signs(), Some(0));
-    assert!(first.is_valid());
+    assert_eq!(first.verdict(), UNCONFIRMED_REVOCATION);
     let second = judged(second);
     assert!(
         !second.document_intact(),
@@ -2269,7 +2296,7 @@ fn a_counter_signature_under_inclusive_canonicalisation_verifies() {
     );
     assert!(signed.contains(super::xades::CANONICALIZATION_INCLUSIVE_11));
     let report = world.verify(xades_container_of(&signed)).expect("report");
-    assert!(counter_report(&report).is_valid());
+    assert_eq!(counter_report(&report).verdict(), UNCONFIRMED_REVOCATION);
 }
 
 /// A counter-signature nested in another, carrying no certificate of
@@ -2302,13 +2329,13 @@ fn a_nested_counter_signer_is_found_in_an_enclosing_signature() {
     );
     let report = world.verify(xades_container_of(&twice)).expect("report");
     let [outer, first, nested] = exactly(report.rows(), "a signature and a chain of two");
-    assert!(outer.is_valid());
+    assert_eq!(outer.verdict(), UNCONFIRMED_REVOCATION);
     assert_eq!(first.counter_signs(), Some(0));
-    assert!(first.is_valid());
+    assert_eq!(first.verdict(), UNCONFIRMED_REVOCATION);
     assert_eq!(nested.counter_signs(), Some(1));
     let nested = judged(nested);
     assert_eq!(nested.signer().name(), RSA_SIGNER);
-    assert!(nested.is_valid());
+    assert_eq!(nested.verdict(), UNCONFIRMED_REVOCATION);
 
     // Without the certificate in any enclosing signature there is no
     // signer to judge.
@@ -2386,7 +2413,7 @@ fn counter_signatures_nest_to_a_bounded_depth() {
             ..
         })
     ));
-    assert!(report.is_valid());
+    assert_eq!(report.verdict(), UNCONFIRMED_REVOCATION);
 }
 
 /// A same-document reference without a transform is canonicalised by
@@ -2416,7 +2443,7 @@ fn a_reference_without_a_transform_digests_canonical_xml_1_0() {
     let signature = only(&report);
     assert!(signature.document_intact());
     assert!(signature.signature_valid());
-    assert!(report.is_valid());
+    assert_eq!(report.verdict(), UNCONFIRMED_REVOCATION);
 }
 
 /// Common name of the time-stamping root the archive timestamps chain
@@ -2719,7 +2746,7 @@ fn an_lta_pdf_whose_signature_timestamp_authority_expired_stands_on_its_archive_
     assert_eq!(signature.proof_of_existence(), Some(day(ARCHIVED)));
     assert_eq!(signature.validation_time(), day(ARCHIVED));
     assert!(signature.chain_verified());
-    assert!(report.is_valid());
+    assert_eq!(report.verdict(), UNCONFIRMED_REVOCATION);
 
     // Without the archive authority nothing proves existence, and the
     // signer, expired by now, is judged now.
@@ -2788,7 +2815,7 @@ fn a_v2_archive_timestamp_is_counted_and_not_judged() {
         [(ArchiveForm::CadesV2, Kind::Unsupported)]
     );
     assert_eq!(signature.proof_of_existence(), None);
-    assert!(report.is_valid());
+    assert_eq!(report.verdict(), UNCONFIRMED_REVOCATION);
 }
 
 /// How an `XAdES` archive fixture departs from a sound one.
@@ -2972,7 +2999,7 @@ fn an_lta_xades_container_whose_signature_timestamp_authority_expired_stands_on_
     );
     assert_eq!(signature.proof_of_existence(), Some(day(ARCHIVED)));
     assert_eq!(signature.validation_time(), day(ARCHIVED));
-    assert!(report.is_valid());
+    assert_eq!(report.verdict(), UNCONFIRMED_REVOCATION);
 }
 
 #[test]
@@ -3043,8 +3070,8 @@ fn a_document_timestamp_and_validation_store_after_signing_change_nothing() {
     let signature = only(&report);
     assert_eq!(signature.revision(), Revision::LaterRevisionsHarmless);
     assert!(signature.document_intact());
-    assert!(signature.is_valid());
-    assert!(report.is_valid());
+    assert_eq!(signature.verdict(), Verdict::Valid);
+    assert_eq!(report.verdict(), Verdict::Valid);
 }
 
 #[test]
@@ -3062,7 +3089,7 @@ fn a_second_signature_after_signing_changes_nothing() {
     assert_eq!(judged(first).revision(), Revision::LaterRevisionsHarmless);
     assert!(judged(first).document_intact());
     assert_eq!(judged(second).revision(), Revision::WholeDocument);
-    assert!(report.is_valid());
+    assert_eq!(report.verdict(), UNCONFIRMED_REVOCATION);
 }
 
 #[test]
@@ -3240,7 +3267,7 @@ fn updated_document_information_and_metadata_change_nothing() {
     let signature = only(&report);
     assert_eq!(signature.revision(), Revision::LaterRevisionsHarmless);
     assert!(signature.document_intact());
-    assert!(report.is_valid());
+    assert_eq!(report.verdict(), UNCONFIRMED_REVOCATION);
 }
 
 /// The archive kinds and chain verdict of `pdf`'s one signature on
@@ -3249,13 +3276,13 @@ fn judged_on_expiry(
     world: &World,
     archive: &ArchiveAuthority,
     bytes: Vec<u8>,
-) -> (Vec<(ArchiveForm, Kind)>, bool, bool) {
+) -> (Vec<(ArchiveForm, Kind)>, bool, Verdict) {
     let report = verify_expired(bytes, &archive.anchors(world));
     let signature = only(&report);
     (
         archive_kinds(signature),
         signature.chain_verified(),
-        report.is_valid(),
+        report.verdict(),
     )
 }
 
@@ -3263,7 +3290,7 @@ fn judged_on_expiry(
 fn material_the_archive_index_covers_is_used_at_the_archive_time() {
     let world = World::new();
     let archive = ArchiveAuthority::new();
-    let (kinds, chain, valid) = judged_on_expiry(
+    let (kinds, chain, verdict) = judged_on_expiry(
         &world,
         &archive,
         archived_pdf(&world, &archive, ArchiveFault::IntermediateCovered),
@@ -3273,14 +3300,14 @@ fn material_the_archive_index_covers_is_used_at_the_archive_time() {
         [(ArchiveForm::CadesV3, Kind::Anchored(day(ARCHIVED)))]
     );
     assert!(chain);
-    assert!(valid);
+    assert_eq!(verdict, UNCONFIRMED_REVOCATION);
 }
 
 #[test]
 fn a_certificate_added_after_the_archive_timestamp_is_not_used_at_the_archive_time() {
     let world = World::new();
     let archive = ArchiveAuthority::new();
-    let (kinds, chain, valid) = judged_on_expiry(
+    let (kinds, chain, verdict) = judged_on_expiry(
         &world,
         &archive,
         archived_pdf(&world, &archive, ArchiveFault::IntermediateAfter),
@@ -3293,14 +3320,14 @@ fn a_certificate_added_after_the_archive_timestamp_is_not_used_at_the_archive_ti
         !chain,
         "the intermediate is not covered by the archive index"
     );
-    assert!(!valid);
+    assert_ne!(verdict, Verdict::Valid);
 }
 
 #[test]
 fn an_unsigned_attribute_after_the_archive_timestamp_is_not_demanded() {
     let world = World::new();
     let archive = ArchiveAuthority::new();
-    let (kinds, _chain, valid) = judged_on_expiry(
+    let (kinds, _chain, verdict) = judged_on_expiry(
         &world,
         &archive,
         archived_pdf(&world, &archive, ArchiveFault::AttributeAfter),
@@ -3309,7 +3336,7 @@ fn an_unsigned_attribute_after_the_archive_timestamp_is_not_demanded() {
         kinds,
         [(ArchiveForm::CadesV3, Kind::Anchored(day(ARCHIVED)))]
     );
-    assert!(valid);
+    assert_eq!(verdict, UNCONFIRMED_REVOCATION);
 }
 
 #[test]
@@ -3338,7 +3365,7 @@ fn a_token_with_no_index_or_two_is_invalid() {
         (ArchiveFault::NoIndex, "ats-hash-index-v3 absent"),
         (ArchiveFault::TwoIndexes, "ats-hash-index-v3 repeated"),
     ] {
-        let (kinds, _chain, valid) =
+        let (kinds, _chain, verdict) =
             judged_on_expiry(&world, &archive, archived_pdf(&world, &archive, fault));
         assert_eq!(
             kinds,
@@ -3347,7 +3374,7 @@ fn a_token_with_no_index_or_two_is_invalid() {
                 Kind::Invalid(TimestampError::Malformed(reason))
             )]
         );
-        assert!(!valid);
+        assert_ne!(verdict, Verdict::Valid);
     }
 }
 
@@ -3355,22 +3382,22 @@ fn a_token_with_no_index_or_two_is_invalid() {
 fn xades_material_after_the_archive_timestamp_is_not_used_at_the_archive_time() {
     let world = World::new();
     let archive = ArchiveAuthority::new();
-    let (kinds, chain, valid) = judged_on_expiry(
+    let (kinds, chain, verdict) = judged_on_expiry(
         &world,
         &archive,
         archived_xades(&world, &archive, XadesArchiveFault::IntermediateBefore),
     );
     assert_eq!(kinds, [(ArchiveForm::Xades, Kind::Anchored(day(ARCHIVED)))]);
     assert!(chain);
-    assert!(valid);
-    let (kinds, chain, valid) = judged_on_expiry(
+    assert_eq!(verdict, UNCONFIRMED_REVOCATION);
+    let (kinds, chain, verdict) = judged_on_expiry(
         &world,
         &archive,
         archived_xades(&world, &archive, XadesArchiveFault::IntermediateAfter),
     );
     assert_eq!(kinds, [(ArchiveForm::Xades, Kind::Anchored(day(ARCHIVED)))]);
     assert!(!chain, "the intermediate follows the archive timestamp");
-    assert!(!valid);
+    assert_ne!(verdict, Verdict::Valid);
 }
 
 /// The object number `key` references in `body`, as `/Key N 0 R` or
@@ -3706,7 +3733,7 @@ fn reference_cycles_end_and_are_changes() {
 fn validation_data_after_an_archive_timestamp_serves_that_timestamp_alone() {
     let world = World::new();
     let archive = ArchiveAuthority::new();
-    let (kinds, chain, valid) = judged_on_expiry(
+    let (kinds, chain, verdict) = judged_on_expiry(
         &world,
         &archive,
         archived_xades(&world, &archive, XadesArchiveFault::AuthorityDataAfter),
@@ -3716,15 +3743,15 @@ fn validation_data_after_an_archive_timestamp_serves_that_timestamp_alone() {
         !chain,
         "the signer's intermediate in that validation data is not used for the signer"
     );
-    assert!(!valid);
+    assert_ne!(verdict, Verdict::Valid);
 
-    let (kinds, _chain, valid) = judged_on_expiry(
+    let (kinds, _chain, verdict) = judged_on_expiry(
         &world,
         &archive,
         archived_xades(&world, &archive, XadesArchiveFault::AuthorityDataMissing),
     );
     assert_eq!(kinds, [(ArchiveForm::Xades, Kind::Claimed(day(ARCHIVED)))]);
-    assert!(!valid);
+    assert_ne!(verdict, Verdict::Valid);
 }
 
 /// What a scripted OCSP responder answers, in turn.

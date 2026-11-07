@@ -304,6 +304,39 @@ impl ArchiveTimestampReport {
     }
 }
 
+/// The verdict on a signature or a document, as `ETSI EN 319 102-1`
+/// clause 5.1.3 states one: three answers, each meaning one thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Everything the verdict needs was established: the document is
+    /// intact, the signature verifies, the signer's chain reaches an
+    /// anchor, and a verified revocation answer speaks for the signer.
+    Valid,
+    /// Nothing is proven wrong, but something the verdict needs could
+    /// not be established; the reason names the first such thing. A
+    /// relying party treats the signature as unconfirmed, not as bad.
+    Indeterminate(Indeterminate),
+    /// Something is proven wrong: the document changed, the signature
+    /// does not verify, or the signer was revoked before the proof of
+    /// existence.
+    NotValid,
+}
+
+/// What an [`Verdict::Indeterminate`] verdict could not establish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Indeterminate {
+    /// No path from the signer to a certificate-issuing anchor was found
+    /// in the evidence.
+    NoCertificateChain,
+    /// The chain search spent its whole budget of signature
+    /// verifications before it could finish
+    /// ([`SignatureReport::chain_search_exhausted`]).
+    ChainSearchExhausted,
+    /// No verified revocation answer speaks for the signer at the
+    /// validation time ([`Revocation::Unavailable`]).
+    RevocationUnknown,
+}
+
 /// One judged signature's facts.
 #[derive(Debug, Clone)]
 pub struct SignatureReport {
@@ -464,18 +497,39 @@ impl SignatureReport {
         self.revision
     }
 
-    /// Whether the signature is valid: the document is intact, the
-    /// signature is valid, the chain is verified, and no revocation
-    /// before the proof of existence is known (any revocation, without
-    /// a proof). A timestamp that does not verify is reported and
-    /// decides nothing: it sits in unprotected attributes anyone can
-    /// append to.
+    /// The verdict on the signature. Not valid when the document
+    /// changed, the signature does not verify, or a revocation before
+    /// the proof of existence is known (any revocation, without a
+    /// proof). Otherwise indeterminate when the chain is not anchored
+    /// or no verified revocation answer speaks for the signer, naming
+    /// the first; otherwise valid. A timestamp that does not verify is
+    /// reported and decides nothing: it sits in unprotected attributes
+    /// anyone can append to.
+    #[must_use]
+    pub fn verdict(&self) -> Verdict {
+        if !self.document_intact
+            || !self.signature_valid
+            || self.revocation.revoked_before(self.proof_of_existence)
+        {
+            return Verdict::NotValid;
+        }
+        if !self.chain.is_anchored() {
+            return Verdict::Indeterminate(if self.chain_search_exhausted {
+                Indeterminate::ChainSearchExhausted
+            } else {
+                Indeterminate::NoCertificateChain
+            });
+        }
+        if matches!(self.revocation, Revocation::Unavailable) {
+            return Verdict::Indeterminate(Indeterminate::RevocationUnknown);
+        }
+        Verdict::Valid
+    }
+
+    /// Whether the verdict is [`Verdict::Valid`].
     #[must_use]
     pub fn is_valid(&self) -> bool {
-        self.document_intact
-            && self.signature_valid
-            && self.chain.is_anchored()
-            && !self.revocation.revoked_before(self.proof_of_existence)
+        self.verdict() == Verdict::Valid
     }
 
     /// This report with `answer`, a revocation answer the shell fetched
@@ -616,13 +670,22 @@ impl SignatureRow {
         }
     }
 
-    /// Whether the signature was judged and is valid.
+    /// The verdict on the signature: the judged report's, or not valid
+    /// for a signature whose profile this verifier does not implement,
+    /// which it can confirm nothing about.
+    #[must_use]
+    pub fn verdict(&self) -> Verdict {
+        match &self.outcome {
+            SignatureOutcome::Judged(report) => report.verdict(),
+            SignatureOutcome::Unsupported { .. } => Verdict::NotValid,
+        }
+    }
+
+    /// Whether the signature was judged and its verdict is
+    /// [`Verdict::Valid`].
     #[must_use]
     pub fn is_valid(&self) -> bool {
-        match &self.outcome {
-            SignatureOutcome::Judged(report) => report.is_valid(),
-            SignatureOutcome::Unsupported { .. } => false,
-        }
+        self.verdict() == Verdict::Valid
     }
 }
 
@@ -692,19 +755,35 @@ impl DocumentReport {
         self.anchors_stale
     }
 
-    /// Whether the document is valid: it has at least one signature
-    /// over the document itself, and every such signature was judged
-    /// and is valid. A document timestamp that does not verify, and an
-    /// `XAdES` counter-signature of any verdict, are reported and decide
-    /// nothing: both sit in unsigned material anyone can append to.
+    /// The verdict on the document, from the signatures over the
+    /// document itself: not valid when there is none or any is not
+    /// valid, otherwise indeterminate when any is, with the first such
+    /// reason, otherwise valid. A document timestamp that does not
+    /// verify, and an `XAdES` counter-signature of any verdict, are
+    /// reported and decide nothing: both sit in unsigned material anyone
+    /// can append to.
     #[must_use]
-    pub fn is_valid(&self) -> bool {
-        let mut signatures = self
+    pub fn verdict(&self) -> Verdict {
+        let verdicts: Vec<Verdict> = self
             .rows
             .iter()
             .filter(|row| row.counter_signs.is_none())
-            .peekable();
-        signatures.peek().is_some() && signatures.all(SignatureRow::is_valid)
+            .map(SignatureRow::verdict)
+            .collect();
+        if verdicts.is_empty() || verdicts.contains(&Verdict::NotValid) {
+            return Verdict::NotValid;
+        }
+        verdicts
+            .iter()
+            .copied()
+            .find(|verdict| matches!(verdict, Verdict::Indeterminate(_)))
+            .unwrap_or(Verdict::Valid)
+    }
+
+    /// Whether the verdict on the document is [`Verdict::Valid`].
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.verdict() == Verdict::Valid
     }
 
     /// This report with live revocation answers: `ask` is called for

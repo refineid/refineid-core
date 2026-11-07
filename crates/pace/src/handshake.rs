@@ -260,9 +260,10 @@ impl OpenedByPuk {
 /// It is spent once, by the qualified key it unlocks: PIN 2 is entered
 /// for every signature (FINEID S4-1 v4.2 sections 4.1 and 8.1.7), so a
 /// second signature on the same channel takes a fresh VERIFY inside the
-/// channel. For that VERIFY it keeps PIN 2's counter as the card last
-/// reported it: the `MSE:Set AT` answer the retry floor served, settled
-/// by every VERIFY's answer on the channel (see
+/// channel. For that VERIFY, and for a PIN 2 change, it keeps PIN 2's
+/// counter as the card last reported it: the `MSE:Set AT` answer the
+/// retry floor served, settled by every VERIFY's answer and lowered by
+/// every change's answer on the channel (see
 /// `refineid_auth::Pin2PaceChannel`).
 #[derive(Debug)]
 pub struct OpenedByPin2 {
@@ -291,6 +292,11 @@ impl OpenedByPin2 {
     /// Settle the record by the card's answer to a PIN 2 VERIFY.
     pub(crate) const fn settle(&mut self, answer: VerifyOutcome) {
         self.counter = counter_after_verify(self.counter, answer);
+    }
+
+    /// Lower the record by the card's answer to a PIN 2 change.
+    pub(crate) const fn lower(&mut self, answer: ManageOutcome) {
+        self.counter = lowered_counter(self.counter, answer);
     }
 
     /// Spend the session's PIN 2 presentation.

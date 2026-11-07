@@ -381,7 +381,9 @@ S1 v4.0, organizational cards, section 2.1) over NIST curves:
   the channel it opens, and the one PIN 1 opens, carry the counter the
   floor served, lowered by every later refusal, and are the only
   channels with the PIN resets (`PukPaceChannelOps`) and the PIN 1
-  change (`Pin1PaceChannelOps`) of `refineid-auth`, each taking an
+  change (`Pin1PaceChannelOps`) of `refineid-auth`, as the channel PIN 2
+  opens is the only one with the PIN 2 change (`Pin2PaceChannelOps`),
+  each taking an
   explicit `ChannelProof` -- rely on the handshake or present the
   credential again -- because which one the card accepts is a hardware
   finding;

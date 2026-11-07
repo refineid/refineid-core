@@ -37,12 +37,13 @@
  * only Fr values reach those facts. This bounds the Diffie-Hellman variants
  * of each rule.
  *
- * An envelope's fields are its AEAD associated data and its plaintext is
- * the constant 'empty'. AEAD binds both alike. The fields are values the
- * attacker chose or can derive, a fresh ready nonce, or a card signature,
- * which has no destructor in this theory, so no lemma rests on him reading
- * them. This leaves the AEAD destructor no variable plaintext to reach,
- * which completes the deconstructions.
+ * A channel envelope's fields are its AEAD associated data and its
+ * plaintext is the constant 'empty'. AEAD binds both alike. The fields are
+ * values the attacker chose or can derive, a fresh ready nonce, or a card
+ * signature, which has no destructor in this theory, so no lemma rests on
+ * him reading them. The only variable plaintexts left are the two static
+ * public keys of the Noise_XXpsk3 handshake, and the deconstructions
+ * complete.
  */
 
 theory RAPP_v26_11_2

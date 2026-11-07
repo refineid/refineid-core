@@ -166,8 +166,10 @@ beside them.
   forged offer is part of the model.
 - **Tamarin theories.** Secret scalars read from state facts carry the
   fresh sort, since only `Fr` values reach those facts; this bounds the
-  Diffie-Hellman variants of each rule. An envelope's fields are its AEAD
-  associated data and its plaintext is a constant; AEAD binds both alike,
+  Diffie-Hellman variants of each rule. A channel envelope's fields are
+  its AEAD associated data and its plaintext is a constant; the
+  Noise_XXpsk3 handshake still encrypts the two static public keys as its
+  plaintext. AEAD binds both alike,
   and the fields are values the attacker chose or can derive, a fresh
   ready nonce, or a card signature, which has no destructor in the theory,
   so no lemma rests on him reading them. The Custodian's record is a

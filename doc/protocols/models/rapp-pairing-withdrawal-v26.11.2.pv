@@ -1,0 +1,252 @@
+(* Copyright 2026 Petri Koistinen
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *)
+
+
+(* Symbolic model of RAPP v26.11.2 service withdrawal (doc/protocols/
+ * rapp-v26.11.2.md, "the spec": §4.5) for ProVerif, one of four pairing
+ * files that each check one group of properties. A stored pairing is taken
+ * as given: rapp-pairing-agreement-v26.11.2.pv and
+ * rapp-pairing-secrecy-v26.11.2.pv check that a pairing made with the code
+ * establishes secret pair-specific static keys on which both ends agree.
+ * README.md in this directory states the abstraction, the attacker model
+ * and the properties with the STPA ids (doc/security/stpa-rapp.md) each
+ * one checks.
+ *
+ * Roles: Alice the phone (Custodian) and Bob the computer (Requester).
+ * Every transport is the one public channel [pub]. Pairings with Bob are
+ * honest; one pairing is compromised (the attacker chose the Requester's
+ * static key and holds its secret). Alice publishes withdrawn records for
+ * any instance name and counter; Bob verifies them.
+ *)
+
+(* ------------------------------------------------------------------ *)
+(* Channels                                                             *)
+(* ------------------------------------------------------------------ *)
+
+free pub: channel.                 (* every RAPP transport, spec §2.2 *)
+
+
+(* Markers that the honest endpoints encrypt under each key whose secrecy
+ * is queried; the attacker learns a marker exactly when it learns a key. *)
+free sec_psk_r, sec_psk_c: bitstring [private].
+free sec_route_r, sec_route_c: bitstring [private].
+free sec_disc_c, sec_wd_c: bitstring [private].
+free sec_static_r, sec_static_c: bitstring [private].
+
+(* ------------------------------------------------------------------ *)
+(* Primitives                                                           *)
+(* ------------------------------------------------------------------ *)
+
+(* The attacker sends only well-typed values. X25519 keys and Ristretto255
+ * points are distinct types: the groups are unrelated, and no honest
+ * computation relates a value of one to a value of the other. *)
+set ignoreTypes = false.
+
+(* X25519 (RFC 7748) for Noise and the static agreement (spec §6.2,
+ * §4.3 item 5): secret scalars, public keys, and the agreement. *)
+type xsec.
+type xpub.
+fun xpk(xsec): xpub.
+fun xdh(xpub, xsec): bitstring.
+equation forall x: xsec, y: xsec; xdh(xpk(x), y) = xdh(xpk(y), x).
+
+(* Ristretto255 for CPace (spec §6.1.1): scalars and points over a base
+ * that is a variable, since the generator depends on the code. *)
+type cscalar.
+type cpoint.
+fun cpt(cpoint, cscalar): cpoint.
+fun cdh(cpoint, cscalar): bitstring.
+equation forall b: cpoint, x: cscalar, y: cscalar; cdh(cpt(b, x), y) = cdh(cpt(b, y), x).
+
+(* CPace generator, spec §6.1.2: MapToGroup(SHA-512(lv_cat(DSI, PRS,
+ * zero padding, C, SID))). *)
+fun h2g(bitstring, bitstring, bitstring): cpoint.
+
+(* Encodings of keys and points as octets. *)
+fun xpub2b(xpub): bitstring [data, typeConverter].
+fun xsec2b(xsec): bitstring [data, typeConverter].
+
+(* SHA-256 and SHA-512, each input labelled as the spec labels it. *)
+fun H(bitstring): bitstring.
+(* SHA-512 as MixHash of the Noise handshake hash (Noise revision 34
+ * §5.2). *)
+fun hh(bitstring): bitstring.
+
+(* HMAC-SHA-256 and HMAC-SHA-512; HKDF-Extract and HKDF-Expand of
+ * RFC 5869 are both one HMAC (spec §2.2.1, §4.3 item 5, §6.1.3). *)
+fun hmac(bitstring, bitstring): bitstring.
+
+(* Noise HKDF(ck, ikm, n) of Noise revision 34 §4.3: the new chaining key,
+ * the cipher key, and the third output of MixKeyAndHash. *)
+fun nck(bitstring, bitstring): bitstring.
+fun nk(bitstring, bitstring): bitstring.
+fun nk3(bitstring, bitstring): bitstring.
+fun nh(bitstring, bitstring): bitstring.
+(* Split() of spec §6.3. *)
+fun sp1(bitstring): bitstring.
+fun sp2(bitstring): bitstring.
+
+(* ChaCha20-Poly1305 with key, nonce, associated data and plaintext.
+ * MixHash of a handshake ciphertext (Noise revision 34 §5.2) is modelled
+ * as MixHash of its nonce and plaintext, which keeps the symbolic
+ * handshake hash small. Every input of the real handshake hash is public,
+ * so each endpoint publishes its final handshake hash; the attacker knows
+ * it as he would in the real protocol. *)
+fun aead(bitstring, bitstring, bitstring, bitstring): bitstring.
+reduc forall k: bitstring, n: bitstring, a: bitstring, m: bitstring;
+  aead_open(k, n, a, aead(k, n, a, m)) = m.
+
+(* The card's signatures: authentication key and qualified signature key. *)
+fun spk(bitstring): bitstring.
+fun sign(bitstring, bitstring): bitstring.
+reduc forall sk: bitstring, m: bitstring; sig_msg(sign(sk, m)) = m.
+
+(* Transport profile to its routing preamble domain and candidate_id,
+ * spec §2.2 table. *)
+fun dom(bitstring): bitstring.
+fun cand(bitstring): bitstring.
+
+(* Query markers only; not part of the protocol. *)
+fun mark(bitstring, bitstring): bitstring.
+reduc forall k: bitstring, m: bitstring; unmark(k, mark(k, m)) = m.
+
+(* ------------------------------------------------------------------ *)
+(* Constants: labels, suites, message types, profiles                   *)
+(* ------------------------------------------------------------------ *)
+
+const empty: bitstring [data].
+const wire_version, scheme_rapp, suite_pairing, suite_session: bitstring [data].
+const transports_all, offer_ttl: bitstring [data].
+const role_requester, role_custodian: bitstring [data].
+const pn_xx, pn_kk: bitstring [data].
+
+const lbl_offer_hash, lbl_ctx, lbl_isk, lbl_transcript: bitstring [data].
+const lbl_psk, lbl_ka, lbl_kb, lbl_ta, lbl_tb: bitstring [data].
+const lbl_pairing_prologue, lbl_session_prologue: bitstring [data].
+const lbl_session_id, lbl_pair_id, lbl_grants, lbl_cert_fp: bitstring [data].
+const lbl_routing, lbl_disc, lbl_wd: bitstring [data].
+
+const n0, n1, n2, n3, n4: bitstring [data].   (* sequence = Noise nonce, spec §7.2 item 3 *)
+
+const purpose_session, mode_session, mode_withdrawn: bitstring [data].
+
+const t_pairing_hello, t_pairing_confirm, t_pairing_stored: bitstring [data].
+const t_session_ready, t_session_hello, t_session_close: bitstring [data].
+const t_card_status, t_op_request, t_op_result: bitstring [data].
+
+const prof_auth, prof_docsign, prof_status: bitstring [data].
+const act_browser_auth, act_sign_document: bitstring [data].
+const st_completed, st_rejected: bitstring [data].
+const yes, no: bitstring [data].
+
+const name_alice, plat_alice, name_bob, plat_bob: bitstring [data].
+
+(* Model bookkeeping: whether Carol typed the code into Bob (honest) or
+ * into a compromised computer (leaked). No message carries it. *)
+const honest, leaked: bitstring [data].
+
+(* Stored pairing records, spec §4.3 item 4: the Custodian's and the
+ * Requester's. *)
+table custodian_pairs(bitstring, bitstring, bitstring, bitstring, xsec, xpub, xpub, bitstring).
+table requester_pairs(bitstring, bitstring, xsec, xpub, xpub).
+
+(* ------------------------------------------------------------------ *)
+(* Events                                                             *)
+(* ------------------------------------------------------------------ *)
+
+event CustodianWithdrew(bitstring, bitstring, bitstring, bitstring).
+event RequesterVerifiedWithdrawal(bitstring, bitstring, bitstring).
+
+(* ------------------------------------------------------------------ *)
+(* Queries                                                            *)
+(* ------------------------------------------------------------------ *)
+
+(* A withdrawn record Bob verifies was published by Alice for that pairing,
+ * instance and counter; a replay inside the counter window is the
+ * accepted limit of spec §4.5 item 7, so agreement is not injective.
+ * Spec §4.5 items 1, 2, 6 and 7; STPA CC-114, UCA-112, H-7. *)
+query pid: bitstring, ins: bitstring, ctr: bitstring;
+  event(RequesterVerifiedWithdrawal(pid, ins, ctr))
+    ==> event(CustodianWithdrew(honest, pid, ins, ctr)).
+
+(* Withdrawal hint, spec §4.5 items 1 and 2: the record for any instance
+ * name and counter. The discovery hint of hierarchy §4.3 is a MAC under
+ * K_disc of the epoch alone; the model queries the secrecy of K_disc and
+ * does not run the hint as an oracle. *)
+let CustodianAnnouncements(kind: bitstring, pid: bitstring, skc: xsec, pkr: xpub) =
+  let kwd = hmac(hmac(pid, xdh(pkr, skc)), lbl_wd) in
+  let kdisc = hmac(hmac(pid, xdh(pkr, skc)), lbl_disc) in
+  ( ( in(pub, (ins: bitstring, ctr: bitstring));
+        event CustodianWithdrew(kind, pid, ins, ctr);
+        out(pub, (mode_withdrawn, ins, ctr, hmac(kwd, (ins, ctr)))) )
+  | ( if kind = honest then
+        ( out(pub, mark(kwd, sec_wd_c))
+        | out(pub, mark(kdisc, sec_disc_c))
+        | out(pub, mark(hmac(hmac(pid, xdh(pkr, skc)), lbl_routing), sec_route_c))
+        | out(pub, mark(xsec2b(skc), sec_static_c)) ) ) ).
+
+
+(* Bob checks a withdrawn record on the instance he associates with the
+ * pairing (spec §4.5 item 6). *)
+let RequesterWithdrawalCheck(pid: bitstring, skr: xsec, pkc: xpub) =
+  let kwd = hmac(hmac(pid, xdh(pkc, skr)), lbl_wd) in
+  in(pub, (=mode_withdrawn, ins: bitstring, ctr: bitstring, w: bitstring));
+  if w = hmac(kwd, (ins, ctr)) then
+  event RequesterVerifiedWithdrawal(pid, ins, ctr).
+
+
+(* ------------------------------------------------------------------ *)
+(* Stored pairings                                                    *)
+(* ------------------------------------------------------------------ *)
+
+(* A pairing Carol made with Bob: fresh pair-specific static keys on both
+ * ends, both records stored (spec §4.3 item 4). pair_id is derivable from
+ * the public pairing transcript, so the attacker knows it. *)
+let HonestPairing =
+  new skc: xsec;
+  new skr: xsec;
+  new pid: bitstring;
+  let pkc = xpk(skc) in
+  let pkr = xpk(skr) in
+  let granted = (prof_auth, prof_docsign, prof_status) in
+  let gh = H((lbl_grants, granted)) in
+  insert custodian_pairs(honest, pid, gh, granted, skc, pkc, pkr, name_bob);
+  insert requester_pairs(pid, gh, skr, pkr, pkc);
+  out(pub, (pid, pkc, pkr)).
+
+(* The pairing a compromised computer made with Carol's code: the attacker
+ * chooses the Requester's static key and display name. *)
+let CompromisedPairing =
+  new skc: xsec;
+  new pid: bitstring;
+  let pkc = xpk(skc) in
+  out(pub, (pid, pkc));
+  in(pub, (pkr: xpub, nm: bitstring));
+  let granted = (prof_auth, prof_docsign, prof_status) in
+  let gh = H((lbl_grants, granted)) in
+  insert custodian_pairs(leaked, pid, gh, granted, skc, pkc, pkr, nm).
+
+(* ------------------------------------------------------------------ *)
+(* The system                                                         *)
+(* ------------------------------------------------------------------ *)
+
+process
+    ( ! HonestPairing )
+  | CompromisedPairing
+  | ( ! get custodian_pairs(kind: bitstring, pid: bitstring, gh: bitstring, granted: bitstring,
+                            skc: xsec, pkc: xpub, pkr: xpub, nm: bitstring) in
+        CustodianAnnouncements(kind, pid, skc, pkr) )
+  | ( ! get requester_pairs(pid: bitstring, gh: bitstring, skr: xsec, pkr: xpub, pkc: xpub) in
+        RequesterWithdrawalCheck(pid, skr, pkc) )

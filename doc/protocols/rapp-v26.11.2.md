@@ -1044,6 +1044,8 @@ What an endpoint does when something goes wrong depends on how much it knows abo
 2. **On a session**: a link drop, a timeout, an AEAD failure, a wrong version, a wrong `session_id` or `sequence`. A bit flip and an attacker look the same, so the endpoint closes the session and keeps the pairing; every operation of the session is over (§8). The card is never touched on the way out. A Requester redials a session that ended this way within the redial window (§8.3), except one that ended for an authenticated protocol violation, which it does not redial until the Custodian next appears (§4.5 item 6).
 3. **Inside an operation**: an unknown `operation_id`, an unsupported parameter, a credential the card refused. The endpoint rejects that operation with `operation.result` or `error` (§10.3); the session and the pairing stay.
 
+4. **Unknown vocabulary**: a message type, a progress event, a status, an error name or a field value this version does not define. The endpoint treats it as malformed and fails as items 1 to 3 say for its stage; it never ignores it. There is one version of RAPP, every peer updates together, and an endpoint that meets a word it does not know is talking to a peer it must not trust to mean the same thing. Tolerating unknown vocabulary would let two versions drift apart silently; failing loudly is the design (maintainer decision 2026-11-07).
+
 No failure revokes an active pairing: an active pairing is revoked by its user, by idle expiry, or by its peer's `pairing_revoked` close (§4.6). A pairing whose confirmation fails is undone as §4.3 item 4 says.
 
 ### 10.2 PIN Entry and the Retry Floor

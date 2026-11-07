@@ -133,6 +133,12 @@ todo = "deny"
 unimplemented = "deny"
 unwrap_used = "deny"
 
+# Bounded debug info: keeps line tables for panic/test backtraces while
+# eliminating heavy DWARF type descriptions. Inherited by [profile.test].
+# See doc/process/agent-worktrees.md.
+[profile.dev]
+debug = 1
+
 [profile.release]
 codegen-units = 1
 lto = "fat"

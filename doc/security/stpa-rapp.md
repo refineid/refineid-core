@@ -719,6 +719,7 @@ the requester; a part named after a colon is one program of it.
 | UCA-122 | Phone | Holds a card session that blocks every later card event. | D | H-3, H-7 | CC-41 |
 | UCA-123 | Computer | Keeps trying to deliver its revocation beyond the bound. | D | H-4, H-6 | CC-118 |
 | UCA-124 | Either | Acts as if the peer received its goodbye (`service_withdrawn` or `pairing_revoked` close) when the peer never did. | P | H-4, H-5 | CC-123 |
+| UCA-125 | Computer | Sends a made-up file name, or one the asking program supplied, for a signature whose program named no document. | P | H-1, H-5 | CC-124 |
 
 ### Controller constraints in force
 
@@ -821,6 +822,7 @@ the requester; a part named after a colon is one program of it.
 | CC-121 | A failed store of the pair record ends the pairing with `pairing.abort` and tells the user why. | §4.3 item 4 |
 | CC-122 | Only the holder's click moves the computer's remote-use switch; a revocation by the phone or idle expiry leaves it on and offers the code entry. | §4.7, hierarchy §5.2 |
 | CC-123 | A goodbye is acknowledged: the receiver of a `session.close` answers with its own close carrying the same reason, then closes the transport. The sender waits for the echo within its existing bound (1 s with a session open, the 10 s revocation attempt) and treats a goodbye without the echo as not known to be delivered: the stated limit for that case applies (R-1, R-2, R-9). | §7.1 item 7; §4.5 items 8 and 9; §4.6 item 4; X-12 |
+| CC-124 | A signature a program asks for with a digest alone carries, as its `document_name`, a description the computer composes: the program as the computer identifies its image, the computer, and that no document was named. Refusing the request instead would leave the holder no way to sign from such a program. | §9.3; §11 item 1 |
 
 ### Retired identifiers
 

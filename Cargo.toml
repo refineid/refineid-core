@@ -84,6 +84,10 @@ sha2 = { version = "0.11", features = ["zeroize"] }
 # Legacy signature-digest support for CMS verification only: older CSCA
 # self-signatures still use SHA-1 family algorithms.
 sha1 = "0.11"
+# MD5 for one legacy lookup key only: the `CKA_NSS_CERT_MD5_HASH`
+# attribute NSS carries on every trust object (crates/pkcs11). It is
+# never a trust, integrity or signature decision.
+md-5 = "0.11"
 # Compile-time dotted-decimal OID parser for the cms `oid::known` table.
 const-oid = { version = "0.10", default-features = false }
 # Typed SubjectPublicKeyInfo parsing (re-exports `der`).

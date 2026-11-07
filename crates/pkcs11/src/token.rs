@@ -19,8 +19,12 @@
 //! public key ([`ObjectKind::PublicKey`], handle [`OBJ_PUBLIC_KEY`],
 //! for consumers such as p11tool / libp11 that enumerate public
 //! keys), its auth private key ([`ObjectKind::PrivateKey`], handle
-//! [`OBJ_PRIVATE_KEY`]), and dynamic CA certificates read from card silicon
-//! and persisted cache ([`ObjectKind::Ca`], handles starting at [`OBJ_CA_BASE`]).
+//! [`OBJ_PRIVATE_KEY`]), dynamic CA certificates read from card silicon
+//! and persisted cache ([`ObjectKind::Ca`], handles starting at [`OBJ_CA_BASE`]),
+//! and for each CA certificate an NSS trust record ([`ObjectKind::Trust`],
+//! the handle range after the CA certificates) that marks it a trust
+//! anchor for client authentication and email only, for exactly as
+//! long as the CA certificate object itself exists.
 //! All authentication objects carry the same [`crate::ck::CKA_ID`] so NSS
 //! pairs them.
 //!
@@ -45,7 +49,9 @@ use refineid_cms::container::{EcdsaP384, RsaPkcs1Sha256, Signature};
 use refineid_cms::x509::{
     EcCurve, Name, OwnedCert, PublicKeyAlgorithm, SpkiDer, extract_rsa_public_key,
 };
-use refineid_digest::{SHA256_LEN, SHA384_LEN, SHA512_LEN, Sha1, Sha224, Sha256, Sha384, Sha512};
+use refineid_digest::{
+    Md5, SHA256_LEN, SHA384_LEN, SHA512_LEN, Sha1, Sha224, Sha256, Sha384, Sha512,
+};
 use refineid_pcsc::{PcscBackend, PcscCard, ReaderAccessCap, ReaderBackend as _, ReaderId};
 use refineid_pkcs15::{
     CertSlot, Pkcs15Ops as _, TokenSerial, derive_printed_serial, render_token_serial,
@@ -66,13 +72,17 @@ use crate::ck::{
     CK_CERTIFICATE_CATEGORY_AUTHORITY, CK_CERTIFICATE_CATEGORY_TOKEN_USER, CK_FALSE, CK_TRUE,
     CKA_ALWAYS_AUTHENTICATE, CKA_ALWAYS_SENSITIVE, CKA_CERTIFICATE_CATEGORY, CKA_CERTIFICATE_TYPE,
     CKA_CLASS, CKA_DERIVE, CKA_EC_PARAMS, CKA_EC_POINT, CKA_ENCRYPT, CKA_EXTRACTABLE, CKA_ID,
-    CKA_ISSUER, CKA_KEY_TYPE, CKA_LABEL, CKA_LOCAL, CKA_MODULUS, CKA_MODULUS_BITS,
-    CKA_NEVER_EXTRACTABLE, CKA_PRIVATE, CKA_PUBLIC_EXPONENT, CKA_SENSITIVE, CKA_SERIAL_NUMBER,
-    CKA_SIGN, CKA_SIGN_RECOVER, CKA_SUBJECT, CKA_TOKEN, CKA_TRUSTED, CKA_UNWRAP, CKA_VALUE,
-    CKA_VERIFY, CKA_WRAP, CKC_X_509, CKK_EC, CKK_RSA, CKO_CERTIFICATE, CKO_PRIVATE_KEY,
-    CKO_PUBLIC_KEY, CKR_DATA_INVALID, CKR_DATA_LEN_RANGE, CKR_DEVICE_ERROR, CKR_MECHANISM_INVALID,
-    CKR_OK, CKR_PIN_INCORRECT, CKR_PIN_LOCKED, CKR_SIGNATURE_INVALID, CKR_SIGNATURE_LEN_RANGE,
-    CKR_USER_NOT_LOGGED_IN, CkAttributeType, CkBbool, CkObjectHandle, CkRv, CkUlong,
+    CKA_ISSUER, CKA_KEY_TYPE, CKA_LABEL, CKA_LOCAL, CKA_MODIFIABLE, CKA_MODULUS, CKA_MODULUS_BITS,
+    CKA_NEVER_EXTRACTABLE, CKA_NSS_CERT_MD5_HASH, CKA_NSS_CERT_SHA1_HASH,
+    CKA_NSS_TRUST_CLIENT_AUTH, CKA_NSS_TRUST_CODE_SIGNING, CKA_NSS_TRUST_EMAIL_PROTECTION,
+    CKA_NSS_TRUST_SERVER_AUTH, CKA_NSS_TRUST_STEP_UP_APPROVED, CKA_PRIVATE, CKA_PUBLIC_EXPONENT,
+    CKA_SENSITIVE, CKA_SERIAL_NUMBER, CKA_SIGN, CKA_SIGN_RECOVER, CKA_SUBJECT, CKA_TOKEN,
+    CKA_TRUSTED, CKA_UNWRAP, CKA_VALUE, CKA_VERIFY, CKA_WRAP, CKC_X_509, CKK_EC, CKK_RSA,
+    CKO_CERTIFICATE, CKO_NSS_TRUST, CKO_PRIVATE_KEY, CKO_PUBLIC_KEY, CKR_DATA_INVALID,
+    CKR_DATA_LEN_RANGE, CKR_DEVICE_ERROR, CKR_MECHANISM_INVALID, CKR_OK, CKR_PIN_INCORRECT,
+    CKR_PIN_LOCKED, CKR_SIGNATURE_INVALID, CKR_SIGNATURE_LEN_RANGE, CKR_USER_NOT_LOGGED_IN,
+    CKT_NSS_MUST_VERIFY_TRUST, CKT_NSS_TRUSTED_DELEGATOR, CkAttributeType, CkBbool, CkObjectHandle,
+    CkRv, CkTrust, CkUlong,
 };
 use crate::sign::{
     CardSignInput, DigestInfoHash, ECDSA_P384_SIGNATURE_BYTES, Mechanism, RSA3072_MODULUS_BITS,
@@ -91,7 +101,24 @@ pub const OBJ_PRIVATE_KEY: CkObjectHandle = 2;
 pub const OBJ_PUBLIC_KEY: CkObjectHandle = 3;
 /// Base object handle for on-card and persisted CA certificates.
 /// Subsequent CA certificates receive sequential handles: `OBJ_CA_BASE + index`.
+/// The range is [`MAX_CA_OBJECTS`] wide; the NSS trust record of the CA
+/// certificate at `index` follows it at
+/// `OBJ_CA_BASE + MAX_CA_OBJECTS + index`, so a trust record's handle
+/// names its certificate by the same index.
 pub const OBJ_CA_BASE: CkObjectHandle = 4;
+/// The CA certificate slots this module reads from the card, in the
+/// order they are read: the issuing CA (EF.4336), then the root
+/// (EF.4334).
+const ON_CARD_CA_SLOTS: &[CertSlot] = &[CertSlot::IssuingCaEcc, CertSlot::RootCa];
+/// The most CA certificate objects one token carries: the persisted
+/// cache's bound plus the slots read from the card.
+/// [`RefinedTrustStore`] holds no more, which keeps every
+/// [`ObjectKind::Ca`] handle inside its range and every
+/// [`ObjectKind::Trust`] handle inside the range that follows.
+const MAX_CA_OBJECTS: usize = MAX_CA_CERTS + ON_CARD_CA_SLOTS.len();
+/// One past the last handle offset, from [`OBJ_CA_BASE`], of a trust
+/// record: the CA certificate range and the trust range together.
+const CA_AND_TRUST_HANDLE_OFFSETS: usize = MAX_CA_OBJECTS * 2;
 /// The handle range one raised token occupies. Each token the module
 /// raises takes the next range, so a handle of a withdrawn token
 /// names no object of the token that replaced it.
@@ -135,7 +162,7 @@ const DIGEST_INFO_SHA256_PREFIX: [u8; 19] = [
 /// (RFC 5480 s2.1.1; SEC2 v2 s2.6.1).
 const EC_PARAMS_SECP384R1: [u8; 7] = [0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x22];
 
-/// Which of the token's three objects an attribute query refers to.
+/// Which of the token's objects an attribute query refers to.
 ///
 /// HARD LIMIT: never add a `CKO_PROFILE` object (or any object
 /// answering `CKA_PROFILE_ID` = `CKP_AUTHENTICATION_TOKEN`). NSS
@@ -155,6 +182,15 @@ pub enum ObjectKind {
     PrivateKey,
     /// Dynamic CA certificate object at index `usize`.
     Ca(usize),
+    /// The NSS trust record ([`CKO_NSS_TRUST`]) of the CA certificate
+    /// at index `usize`; exists exactly when that [`Self::Ca`] does.
+    Trust(usize),
+}
+
+/// A handle offset for a CA certificate or trust index; an index no
+/// handle can carry saturates to a handle that names nothing.
+fn handle_offset(index: usize) -> CkObjectHandle {
+    CkObjectHandle::try_from(index).unwrap_or(CkObjectHandle::MAX)
 }
 
 impl ObjectKind {
@@ -167,8 +203,12 @@ impl ObjectKind {
             OBJ_PRIVATE_KEY => Some(Self::PrivateKey),
             OBJ_PUBLIC_KEY => Some(Self::PublicKey),
             h if h >= OBJ_CA_BASE => {
-                let idx = usize::try_from(h - OBJ_CA_BASE).ok()?;
-                Some(Self::Ca(idx))
+                let offset = usize::try_from(h - OBJ_CA_BASE).ok()?;
+                match offset {
+                    o if o < MAX_CA_OBJECTS => Some(Self::Ca(o)),
+                    o if o < CA_AND_TRUST_HANDLE_OFFSETS => Some(Self::Trust(o - MAX_CA_OBJECTS)),
+                    _ => None,
+                }
             }
             _ => None,
         }
@@ -181,8 +221,10 @@ impl ObjectKind {
             Self::Certificate => OBJ_CERTIFICATE,
             Self::PrivateKey => OBJ_PRIVATE_KEY,
             Self::PublicKey => OBJ_PUBLIC_KEY,
-            Self::Ca(idx) => OBJ_CA_BASE
-                .saturating_add(CkObjectHandle::try_from(idx).unwrap_or(CkObjectHandle::MAX)),
+            Self::Ca(idx) => OBJ_CA_BASE.saturating_add(handle_offset(idx)),
+            Self::Trust(idx) => {
+                OBJ_CA_BASE.saturating_add(handle_offset(idx.saturating_add(MAX_CA_OBJECTS)))
+            }
         }
     }
 }
@@ -212,13 +254,20 @@ impl AttrValue<'_> {
     }
 }
 
-/// A parsed and verified CA certificate object on the token.
+/// A parsed and verified CA certificate object on the token, with the
+/// digests of its DER that its NSS trust record carries.
 #[derive(Debug, Clone)]
 pub struct CaObject {
     cert: OwnedCert,
+    /// [`CKA_ID`]: SHA-1 of the SPKI DER.
     id: Sha1,
     label: String,
     serial_der: Vec<u8>,
+    /// [`CKA_NSS_CERT_SHA1_HASH`]: SHA-1 of the whole certificate DER.
+    der_sha1: Sha1,
+    /// [`CKA_NSS_CERT_MD5_HASH`]: MD5 of the whole certificate DER, a
+    /// lookup key NSS carries on every trust record and nothing more.
+    der_md5: Md5,
 }
 
 fn extract_common_name(name: &Name<'_>) -> Option<String> {
@@ -272,11 +321,15 @@ impl CaObject {
             extract_common_name(&view.subject).unwrap_or_else(|| "CA Certificate".to_owned());
         let id = Sha1::of(view.spki.as_der());
         let serial_der = der_integer(view.serial_der.as_bytes());
+        let der_sha1 = Sha1::of(cert.as_der());
+        let der_md5 = Md5::of(cert.as_der());
         Self {
             cert,
             id,
             label,
             serial_der,
+            der_sha1,
+            der_md5,
         }
     }
 
@@ -294,12 +347,27 @@ impl CaObject {
     pub(crate) fn serial_der(&self) -> &[u8] {
         &self.serial_der
     }
+
+    #[must_use]
+    pub(crate) fn der_sha1_bytes(&self) -> &[u8] {
+        self.der_sha1.as_bytes()
+    }
+
+    #[must_use]
+    pub(crate) fn der_md5_bytes(&self) -> &[u8] {
+        self.der_md5.as_bytes()
+    }
 }
 
 /// An invariant-preserving trust store that guarantees:
 /// 1. Zero duplicate certificates (enforced at insertion by DER comparison).
 /// 2. Stable discovery order and sequential handle indexing (`OBJ_CA_BASE + index`).
 /// 3. Total operations — no indexing panics, no out-of-bounds states.
+/// 4. At most [`MAX_CA_OBJECTS`] certificates, so every index has a
+///    certificate handle and a trust handle in their ranges; a
+///    certificate offered to a full store is not admitted. The two
+///    sources are each bounded below that: the persisted cache by
+///    [`MAX_CA_CERTS`], the card by [`ON_CARD_CA_SLOTS`].
 #[derive(Debug, Default, Clone)]
 pub struct RefinedTrustStore {
     distinct_anchors: Vec<CaObject>,
@@ -328,7 +396,7 @@ impl RefinedTrustStore {
         expect(dead_code, reason = "prepends anchors for tests and dynamic updates")
     )]
     pub fn prepend_anchor(&mut self, anchor: CaObject) {
-        if self.contains(&anchor.cert) {
+        if self.contains(&anchor.cert) || self.is_full() {
             return;
         }
         let mut updated = Vec::with_capacity(self.distinct_anchors.len().saturating_add(1));
@@ -337,12 +405,18 @@ impl RefinedTrustStore {
         self.distinct_anchors = updated;
     }
 
-    /// Append an anchor if not already present.
+    /// Append an anchor if not already present and the store has room.
     pub fn push_anchor(&mut self, anchor: CaObject) {
-        if self.contains(&anchor.cert) {
+        if self.contains(&anchor.cert) || self.is_full() {
             return;
         }
         self.distinct_anchors.push(anchor);
+    }
+
+    /// Whether the store holds [`MAX_CA_OBJECTS`] certificates.
+    #[must_use]
+    fn is_full(&self) -> bool {
+        self.distinct_anchors.len() >= MAX_CA_OBJECTS
     }
 
     /// Check if a certificate is present in the store.
@@ -433,6 +507,60 @@ impl TokenKeyMaterial {
         }
     }
 }
+
+/// An NSS trust level this token asserts for one purpose; the two of
+/// NSS's levels this module ever answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NssTrustLevel {
+    /// [`CKT_NSS_TRUSTED_DELEGATOR`]: an anchor; certificates the CA
+    /// issued are trusted for the purpose.
+    TrustedDelegator,
+    /// [`CKT_NSS_MUST_VERIFY_TRUST`]: nothing asserted; a chain must
+    /// reach some other anchor. Not a distrust (that would be
+    /// [`crate::ck::CKT_NSS_NOT_TRUSTED`]).
+    MustVerifyTrust,
+}
+
+impl NssTrustLevel {
+    /// The `CK_TRUST` value NSS reads.
+    const fn ck_trust(self) -> CkTrust {
+        match self {
+            Self::TrustedDelegator => CKT_NSS_TRUSTED_DELEGATOR,
+            Self::MustVerifyTrust => CKT_NSS_MUST_VERIFY_TRUST,
+        }
+    }
+}
+
+/// What a token asserts about a CA certificate, per NSS purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NssTrustRecord {
+    /// [`CKA_NSS_TRUST_SERVER_AUTH`].
+    server_auth: NssTrustLevel,
+    /// [`CKA_NSS_TRUST_CLIENT_AUTH`].
+    client_auth: NssTrustLevel,
+    /// [`CKA_NSS_TRUST_CODE_SIGNING`].
+    code_signing: NssTrustLevel,
+    /// [`CKA_NSS_TRUST_EMAIL_PROTECTION`].
+    email_protection: NssTrustLevel,
+}
+
+/// The trust every CA certificate on this token carries: an anchor for
+/// the holder's own uses of the card, TLS client authentication and
+/// email, and no assertion for the purposes the card has nothing to
+/// do with, TLS server authentication and code signing. The DVV roots
+/// are in no Mozilla-derived root store, and this token does not add
+/// them to one: a web site chaining to the DVV root stays unverified.
+///
+/// In NSS's own flags (`lib/pki/certificate.c`,
+/// `nssTrust_ToCERTCertTrust`) the record reads as trusted client CA
+/// for TLS and trusted CA for email, which `certutil -L` prints as the
+/// trust string `T,C,`.
+const CARD_CA_TRUST: NssTrustRecord = NssTrustRecord {
+    server_auth: NssTrustLevel::MustVerifyTrust,
+    client_auth: NssTrustLevel::TrustedDelegator,
+    code_signing: NssTrustLevel::MustVerifyTrust,
+    email_protection: NssTrustLevel::TrustedDelegator,
+};
 
 /// What authenticates the holder before the authentication key signs.
 ///
@@ -679,14 +807,53 @@ impl TokenObjects {
             ObjectKind::PublicKey => self.public_key_attribute(attr),
             ObjectKind::PrivateKey => self.private_key_attribute(attr),
             ObjectKind::Ca(_) => self.ca_attribute(kind, attr),
+            ObjectKind::Trust(_) => self.trust_attribute(kind, attr),
         }
     }
 
-    /// Look up the CA certificate object matching `kind` by dynamic index.
+    /// Look up the CA certificate object matching `kind` by dynamic
+    /// index: the certificate object itself, or the one a trust
+    /// record belongs to.
     pub(crate) fn ca_object_for_kind(&self, kind: ObjectKind) -> Option<&CaObject> {
         match kind {
-            ObjectKind::Ca(idx) => self.ca_store.get(idx),
+            ObjectKind::Ca(idx) | ObjectKind::Trust(idx) => self.ca_store.get(idx),
             ObjectKind::Certificate | ObjectKind::PrivateKey | ObjectKind::PublicKey => None,
+        }
+    }
+
+    /// Attribute lookup for the NSS trust record of the CA certificate
+    /// `kind` names.
+    ///
+    /// NSS finds the record by [`CKA_CLASS`], [`CKA_ISSUER`] and
+    /// [`CKA_SERIAL_NUMBER`] (`lib/dev/devtoken.c`,
+    /// `nssToken_FindTrustForCertificate`), the same issuer and serial
+    /// the certificate object answers, then reads the label, the two
+    /// certificate digests, the subject and the four purpose levels
+    /// (`lib/dev/devutil.c`, `create_trust`). The MD5 digest is a
+    /// lookup key NSS carries on every record it reads or writes; no
+    /// decision rests on it.
+    fn trust_attribute(&self, kind: ObjectKind, attr: CkAttributeType) -> Option<AttrValue<'_>> {
+        let ca = self.ca_object_for_kind(kind)?;
+        let view = ca.cert.view();
+        match attr {
+            CKA_CLASS => Some(ulong_attr(CKO_NSS_TRUST)),
+            CKA_TOKEN => Some(bool_attr(CK_TRUE)),
+            CKA_PRIVATE | CKA_MODIFIABLE | CKA_NSS_TRUST_STEP_UP_APPROVED => {
+                Some(bool_attr(CK_FALSE))
+            }
+            CKA_LABEL => Some(AttrValue::Borrowed(ca.label_bytes())),
+            CKA_ISSUER => non_empty(view.issuer.as_der()).map(AttrValue::Borrowed),
+            CKA_SUBJECT => non_empty(view.subject.as_der()).map(AttrValue::Borrowed),
+            CKA_SERIAL_NUMBER => non_empty(ca.serial_der()).map(AttrValue::Borrowed),
+            CKA_NSS_CERT_SHA1_HASH => Some(AttrValue::Borrowed(ca.der_sha1_bytes())),
+            CKA_NSS_CERT_MD5_HASH => Some(AttrValue::Borrowed(ca.der_md5_bytes())),
+            CKA_NSS_TRUST_SERVER_AUTH => Some(ulong_attr(CARD_CA_TRUST.server_auth.ck_trust())),
+            CKA_NSS_TRUST_CLIENT_AUTH => Some(ulong_attr(CARD_CA_TRUST.client_auth.ck_trust())),
+            CKA_NSS_TRUST_CODE_SIGNING => Some(ulong_attr(CARD_CA_TRUST.code_signing.ck_trust())),
+            CKA_NSS_TRUST_EMAIL_PROTECTION => {
+                Some(ulong_attr(CARD_CA_TRUST.email_protection.ck_trust()))
+            }
+            _ => None,
         }
     }
 
@@ -699,10 +866,10 @@ impl TokenObjects {
             CKA_CERTIFICATE_TYPE => Some(ulong_attr(CKC_X_509)),
             CKA_CERTIFICATE_CATEGORY => Some(ulong_attr(CK_CERTIFICATE_CATEGORY_AUTHORITY)),
             CKA_TOKEN => Some(bool_attr(CK_TRUE)),
-            // Token CA certificates are intermediate path-building candidates for NSS
-            // client-certificate TLS authentication, not ambient trust anchors for
-            // server verification (PKCS#11 v2.40 §4.4: CKA_TRUSTED; NSS lib/pk11wrap/pk11cert.c
-            // imports token certificates into its session cache without requiring CKA_TRUSTED).
+            // The PKCS#11 trust bit stays false: the certificate's trust,
+            // per purpose, is the companion trust record's to state
+            // (PKCS#11 v2.40 s4.4: CKA_TRUSTED; NSS lib/pk11wrap/pk11cert.c
+            // imports token certificates without requiring CKA_TRUSTED).
             CKA_PRIVATE | CKA_TRUSTED => Some(bool_attr(CK_FALSE)),
             CKA_LABEL => Some(AttrValue::Borrowed(ca.label_bytes())),
             CKA_ID => Some(AttrValue::Borrowed(ca.id_bytes())),
@@ -925,11 +1092,13 @@ impl TokenObjects {
     pub(crate) fn object_exists(&self, kind: ObjectKind) -> bool {
         match kind {
             ObjectKind::Certificate | ObjectKind::PublicKey | ObjectKind::PrivateKey => true,
-            ObjectKind::Ca(idx) => self.ca_store.get(idx).is_some(),
+            ObjectKind::Ca(idx) | ObjectKind::Trust(idx) => self.ca_store.get(idx).is_some(),
         }
     }
 
-    /// Return all active object kinds present on this token.
+    /// Return all active object kinds present on this token: the
+    /// three authentication objects, then each CA certificate, then
+    /// each CA certificate's trust record.
     #[must_use]
     pub(crate) fn all_object_kinds(&self) -> Vec<ObjectKind> {
         let mut kinds = vec![
@@ -939,6 +1108,9 @@ impl TokenObjects {
         ];
         for idx in 0..self.ca_store.len() {
             kinds.push(ObjectKind::Ca(idx));
+        }
+        for idx in 0..self.ca_store.len() {
+            kinds.push(ObjectKind::Trust(idx));
         }
         kinds
     }
@@ -1273,9 +1445,9 @@ pub(super) fn build_token_objects(reader: &ReaderId) -> Result<TokenObjects, CkR
         .iter()
         .any(|ca| ca.view().subject.as_der() == leaf_issuer.as_der());
     if !has_leaf_issuer {
-        let on_card_cas: Vec<OwnedCert> = [CertSlot::IssuingCaEcc, CertSlot::RootCa]
-            .into_iter()
-            .filter_map(|slot| read_optional_ca_cert(&mut card, slot))
+        let on_card_cas: Vec<OwnedCert> = ON_CARD_CA_SLOTS
+            .iter()
+            .filter_map(|slot| read_optional_ca_cert(&mut card, *slot))
             .filter(meets_ca_persistence_policy)
             .collect();
         for ca in &on_card_cas {
@@ -2022,7 +2194,16 @@ mod tests {
         objects.push_ca_cert(cert1);
         assert!(objects.object_exists(ObjectKind::Ca(0)));
         assert!(!objects.object_exists(ObjectKind::Ca(1)));
-        assert_eq!(objects.all_object_kinds().len(), 4);
+        assert_eq!(
+            objects.all_object_kinds(),
+            vec![
+                ObjectKind::Certificate,
+                ObjectKind::PublicKey,
+                ObjectKind::PrivateKey,
+                ObjectKind::Ca(0),
+                ObjectKind::Trust(0),
+            ]
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -2219,6 +2400,200 @@ mod tests {
         assert!(!objects.object_exists(ObjectKind::Ca(0)));
         const HIGH_OUT_OF_BOUNDS_INDEX: usize = 9999;
         assert!(!objects.object_exists(ObjectKind::Ca(HIGH_OUT_OF_BOUNDS_INDEX)));
+    }
+
+    /// NSS finds a certificate's trust record by class, issuer and
+    /// serial number, the template of
+    /// `nssToken_FindTrustForCertificate`. The record exists exactly
+    /// while its certificate object does, answers the certificate's
+    /// label and subject, and matches no other certificate's template.
+    #[test]
+    fn each_ca_certificate_has_one_trust_record_found_by_issuer_and_serial() {
+        const CA_1_DER: &[u8] =
+            include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+        const CA_2_DER: &[u8] = include_bytes!("../ca-certs/dvv-gov-root-ca-g3-ecc.der");
+        let mut objects =
+            super::TokenObjects::from_cert_der(CA_1_DER.to_vec(), super::KeyGate::Login)
+                .expect("token objects from cert der");
+        assert!(!objects.object_exists(ObjectKind::Trust(0)));
+        objects.push_ca_cert(OwnedCert::from_der(CA_1_DER).expect("valid CA 1"));
+        objects.push_ca_cert(OwnedCert::from_der(CA_2_DER).expect("valid CA 2"));
+        assert_eq!(
+            objects.all_object_kinds(),
+            vec![
+                ObjectKind::Certificate,
+                ObjectKind::PublicKey,
+                ObjectKind::PrivateKey,
+                ObjectKind::Ca(0),
+                ObjectKind::Ca(1),
+                ObjectKind::Trust(0),
+                ObjectKind::Trust(1),
+            ]
+        );
+        assert!(!objects.object_exists(ObjectKind::Trust(objects.ca_store.len())));
+        let bytes = |kind, attr| {
+            objects
+                .attribute(kind, attr)
+                .and_then(|value| value.as_bytes().map(<[u8]>::to_vec))
+                .expect("attribute present")
+        };
+        for (ca, trust) in [
+            (ObjectKind::Ca(0), ObjectKind::Trust(0)),
+            (ObjectKind::Ca(1), ObjectKind::Trust(1)),
+        ] {
+            let template = vec![
+                (crate::ck::CKA_CLASS, bytes(trust, crate::ck::CKA_CLASS)),
+                (crate::ck::CKA_ISSUER, bytes(ca, crate::ck::CKA_ISSUER)),
+                (
+                    crate::ck::CKA_SERIAL_NUMBER,
+                    bytes(ca, crate::ck::CKA_SERIAL_NUMBER),
+                ),
+            ];
+            let found: Vec<ObjectKind> = objects
+                .all_object_kinds()
+                .into_iter()
+                .filter(|kind| objects.matches(*kind, &template))
+                .collect();
+            assert_eq!(found, vec![trust]);
+            assert_eq!(
+                bytes(trust, crate::ck::CKA_LABEL),
+                bytes(ca, crate::ck::CKA_LABEL)
+            );
+            assert_eq!(
+                bytes(trust, crate::ck::CKA_SUBJECT),
+                bytes(ca, crate::ck::CKA_SUBJECT)
+            );
+        }
+    }
+
+    /// A trust record is a public, unmodifiable token object of the
+    /// NSS trust class carrying the digests of its certificate's DER
+    /// and the card's trust: an anchor for client authentication and
+    /// email, nothing asserted for server authentication and code
+    /// signing, no step-up. It carries no certificate value or key id
+    /// of its own.
+    #[test]
+    fn a_trust_record_marks_the_ca_for_client_auth_and_email_only() {
+        use crate::ck::{
+            CK_FALSE, CK_TRUE, CKA_CLASS, CKA_ID, CKA_MODIFIABLE, CKA_NSS_CERT_MD5_HASH,
+            CKA_NSS_CERT_SHA1_HASH, CKA_NSS_TRUST_CLIENT_AUTH, CKA_NSS_TRUST_CODE_SIGNING,
+            CKA_NSS_TRUST_EMAIL_PROTECTION, CKA_NSS_TRUST_SERVER_AUTH,
+            CKA_NSS_TRUST_STEP_UP_APPROVED, CKA_PRIVATE, CKA_TOKEN, CKA_VALUE, CKO_NSS_TRUST,
+            CKT_NSS_MUST_VERIFY_TRUST, CKT_NSS_TRUSTED_DELEGATOR,
+        };
+        const LEAF_DER: &[u8] =
+            include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+        const ROOT_DER: &[u8] = include_bytes!("../ca-certs/dvv-gov-root-ca-g3-ecc.der");
+        let mut objects =
+            super::TokenObjects::from_cert_der(LEAF_DER.to_vec(), super::KeyGate::Login)
+                .expect("token objects from cert der");
+        objects.push_ca_cert(OwnedCert::from_der(ROOT_DER).expect("valid root"));
+        let trust = ObjectKind::Trust(0);
+        let attr = |attr| objects.attribute(trust, attr);
+        assert_eq!(attr(CKA_CLASS), Some(super::ulong_attr(CKO_NSS_TRUST)));
+        assert_eq!(attr(CKA_TOKEN), Some(super::bool_attr(CK_TRUE)));
+        assert_eq!(attr(CKA_PRIVATE), Some(super::bool_attr(CK_FALSE)));
+        assert_eq!(attr(CKA_MODIFIABLE), Some(super::bool_attr(CK_FALSE)));
+        assert_eq!(
+            attr(CKA_NSS_TRUST_STEP_UP_APPROVED),
+            Some(super::bool_attr(CK_FALSE))
+        );
+        assert_eq!(
+            attr(CKA_NSS_CERT_SHA1_HASH),
+            Some(super::AttrValue::Borrowed(
+                refineid_digest::Sha1::of(ROOT_DER).as_bytes()
+            ))
+        );
+        assert_eq!(
+            attr(CKA_NSS_CERT_MD5_HASH),
+            Some(super::AttrValue::Borrowed(
+                refineid_digest::Md5::of(ROOT_DER).as_bytes()
+            ))
+        );
+        assert_eq!(
+            attr(CKA_NSS_TRUST_CLIENT_AUTH),
+            Some(super::ulong_attr(CKT_NSS_TRUSTED_DELEGATOR))
+        );
+        assert_eq!(
+            attr(CKA_NSS_TRUST_EMAIL_PROTECTION),
+            Some(super::ulong_attr(CKT_NSS_TRUSTED_DELEGATOR))
+        );
+        assert_eq!(
+            attr(CKA_NSS_TRUST_SERVER_AUTH),
+            Some(super::ulong_attr(CKT_NSS_MUST_VERIFY_TRUST))
+        );
+        assert_eq!(
+            attr(CKA_NSS_TRUST_CODE_SIGNING),
+            Some(super::ulong_attr(CKT_NSS_MUST_VERIFY_TRUST))
+        );
+        assert_eq!(attr(CKA_VALUE), None);
+        assert_eq!(attr(CKA_ID), None);
+    }
+
+    /// Trust handles follow the certificate handles by index; both
+    /// ranges are [`super::MAX_CA_OBJECTS`] wide and end.
+    #[test]
+    fn trust_handle_round_trip_and_bounds() {
+        let last = super::MAX_CA_OBJECTS - 1;
+        assert_eq!(
+            ObjectKind::Trust(0).handle(),
+            super::OBJ_CA_BASE + super::handle_offset(super::MAX_CA_OBJECTS)
+        );
+        for kind in [
+            ObjectKind::Ca(0),
+            ObjectKind::Ca(last),
+            ObjectKind::Trust(0),
+            ObjectKind::Trust(1),
+            ObjectKind::Trust(last),
+        ] {
+            assert_eq!(ObjectKind::from_handle(kind.handle()), Some(kind));
+        }
+        assert_eq!(
+            ObjectKind::from_handle(ObjectKind::Trust(super::MAX_CA_OBJECTS).handle()),
+            None
+        );
+        assert_eq!(
+            ObjectKind::from_handle(
+                super::OBJ_CA_BASE + super::handle_offset(super::CA_AND_TRUST_HANDLE_OFFSETS)
+            ),
+            None
+        );
+    }
+
+    /// The store admits no more certificates than its handle range
+    /// carries, so the last admitted certificate and its trust record
+    /// are both reachable by handle and nothing beyond them exists.
+    #[test]
+    fn the_store_admits_no_more_than_its_handle_range() {
+        const CA_DER: &[u8] = include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+        let mut store = super::RefinedTrustStore::default();
+        // Distinct DER per variant: the last byte of the signature value
+        // differs, which parsing does not check.
+        for variant in 0..=super::MAX_CA_OBJECTS {
+            let mut der = CA_DER.to_vec();
+            *der.last_mut().expect("non-empty DER") =
+                u8::try_from(variant).expect("variant count fits a byte");
+            store.push_anchor(super::CaObject::new(
+                OwnedCert::from_der(&der).expect("variant parses"),
+            ));
+        }
+        assert_eq!(store.len(), super::MAX_CA_OBJECTS);
+
+        let mut objects =
+            super::TokenObjects::from_cert_der(CA_DER.to_vec(), super::KeyGate::Login)
+                .expect("token objects from cert der");
+        objects.ca_store = store;
+        let last = super::MAX_CA_OBJECTS - 1;
+        assert_eq!(
+            objects.kind_of(objects.handle(ObjectKind::Trust(last))),
+            Some(ObjectKind::Trust(last))
+        );
+        assert_eq!(
+            objects.kind_of(objects.handle(ObjectKind::Ca(last))),
+            Some(ObjectKind::Ca(last))
+        );
+        assert!(!objects.object_exists(ObjectKind::Trust(super::MAX_CA_OBJECTS)));
+        assert!(!objects.object_exists(ObjectKind::Ca(super::MAX_CA_OBJECTS)));
     }
 
     #[test]

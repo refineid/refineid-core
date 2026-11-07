@@ -152,6 +152,23 @@ DVV root while a FINEID card is in the reader and at no other time.
 Nothing is written to the NSS database and no policy file or root
 privilege is involved.
 
+When NSS reads the records: the token is a hardware slot that requires
+login, and NSS searches the certificates and trust records of such a
+token only once the user has logged in to it, unless the token is
+marked friendly, that is, its certificates are declared publicly
+readable (NSS `lib/dev/devutil.c`, `search_for_objects`;
+`lib/pk11wrap/pk11slot.c`, `PK11_IsFriendly`). A module registered
+with `modutil -add ... -mechanisms FRIENDLY` is friendly; the Firefox
+`SecurityDevices` policy registers without that flag. So in a Firefox
+that loads the module through the policy, the DVV root is trusted
+from the session's first PIN login on, which the first TLS client
+authentication or the certificate manager triggers; nothing in the
+records prompts for a PIN by itself. Making the token friendly is an
+owner's decision: either the registration flag, or a `CKO_PROFILE`
+object with `CKP_PUBLIC_CERTIFICATES_TOKEN`, which NSS honours the
+same way (and which is not the `CKP_AUTHENTICATION_TOKEN` profile the
+module must never present, see `token.rs`).
+
 ## Example programs and hardware rigs
 
 This repository carries no example programs or hardware rigs for the

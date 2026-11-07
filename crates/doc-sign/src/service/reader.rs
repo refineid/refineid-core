@@ -1799,7 +1799,12 @@ mod tests {
             )?;
             check(&asked.get(), &0, "prompts")?;
             check(&card.credential_references().len(), &0, "no VERIFY")?;
-            check_true(!output.exists(), "nothing saved")
+            check_true(!output.exists(), "nothing saved")?;
+            check(
+                &std::fs::read_dir(dir.path())?.count(),
+                &1,
+                "only the input, under no other name",
+            )
         }
 
         #[test]

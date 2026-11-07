@@ -389,7 +389,7 @@ pub fn check_path_reachable(
         Ok(_path) => Ok(()),
         // The walk stops at the first link it would fetch: what that
         // link holds is the collection's to judge after signing.
-        Err(_) if provider.deferred.get() => Ok(()),
+        Err(MaterialError::NoIssuer(_)) if provider.deferred.get() => Ok(()),
         Err(error) => Err(error),
     }
 }

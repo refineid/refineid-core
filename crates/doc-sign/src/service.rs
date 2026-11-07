@@ -509,10 +509,11 @@ const NAME_SEPARATOR: &str = "-";
 
 impl fmt::Display for BelowRequestedLevel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let missing = if self.reached >= BaselineLevel::Lt {
-            "without an archive timestamp"
-        } else {
-            "without long-term validation material"
+        let missing = match (self.reached, self.requested) {
+            (BaselineLevel::B, BaselineLevel::T) => "without a timestamp",
+            (BaselineLevel::B, _) => "without a timestamp or long-term validation material",
+            (BaselineLevel::Lt | BaselineLevel::Lta, _) => "without an archive timestamp",
+            (BaselineLevel::T, _) => "without long-term validation material",
         };
         write!(
             f,
@@ -1288,8 +1289,10 @@ fn assemble_document(
 ///
 /// Only a failure to obtain the level's material lowers it: a
 /// timestamp that cannot be had, or validation material that cannot be
-/// collected. A verified answer that a certificate is revoked is never
-/// lowered past, and neither is any other failure.
+/// collected (no anchor, no issuer, no revocation answer). A verified
+/// answer that a certificate is revoked, a certificate that is
+/// malformed, expired or wrongly issued, and every other failure are
+/// never lowered past.
 #[cfg(debug_assertions)]
 fn assemble_at_highest_level(
     request: &DocumentRequest,
@@ -1345,21 +1348,34 @@ fn assemble_at_highest_level(
 #[cfg(debug_assertions)]
 const fn level_below_failure(level: BaselineLevel, error: &SignErrorKind) -> Option<BaselineLevel> {
     match error {
-        SignErrorKind::Material {
-            error: MaterialError::Revoked { .. },
-            ..
-        } => None,
-        SignErrorKind::Material {
-            path: MaterialPath::Signer,
-            ..
-        } if matches!(level, BaselineLevel::Lt | BaselineLevel::Lta) => Some(BaselineLevel::T),
-        SignErrorKind::Material { .. } | SignErrorKind::Timestamp(_) => level.lower(),
+        SignErrorKind::Material { path, error } if material_missing(error) => match path {
+            MaterialPath::Signer if matches!(level, BaselineLevel::Lt | BaselineLevel::Lta) => {
+                Some(BaselineLevel::T)
+            }
+            _ => level.lower(),
+        },
+        SignErrorKind::Timestamp(_) => level.lower(),
         _ => None,
     }
 }
 
+/// Whether `error` says the material could not be had, rather than
+/// that a certificate on the path is unusable.
+#[cfg(debug_assertions)]
+const fn material_missing(error: &MaterialError) -> bool {
+    matches!(
+        error,
+        MaterialError::NoChain
+            | MaterialError::NoTrustAnchor
+            | MaterialError::NoIssuer(_)
+            | MaterialError::Revocation(_)
+            | MaterialError::Rng(_)
+    )
+}
+
 /// Assemble the document at exactly the level `request` asks for, or
-/// fail.
+/// fail: every path that cannot reach the level returns an error, so
+/// an `Ok` is a document at that level.
 fn assemble_at_requested_level(
     request: &DocumentRequest,
     plan: DocumentPlan,
@@ -2073,6 +2089,14 @@ mod tests {
             ),
             &None,
             "a document failure is not a level failure",
+        )?;
+        check(
+            &level_below_failure(
+                BaselineLevel::Lta,
+                &signer(MaterialError::Certificate("expired".to_owned())),
+            ),
+            &None,
+            "an unusable certificate is not missing material",
         )
     }
 

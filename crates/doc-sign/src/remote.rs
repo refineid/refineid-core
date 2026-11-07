@@ -1263,7 +1263,40 @@ mod tests {
             phone.batches.is_empty(),
             "the phone was never asked to sign",
         )?;
-        check_true(!output.exists(), "nothing saved")
+        check_true(!output.exists(), "nothing saved")?;
+        check(&signed_files(&dir)?, &0, "no file under any name")
+    }
+
+    /// How many files in `dir` are signed outputs, under any name.
+    fn signed_files(dir: &TempDir) -> Result<usize, Box<dyn core::error::Error>> {
+        let mut count = 0_usize;
+        for entry in std::fs::read_dir(dir.path())? {
+            if entry?.file_name().to_string_lossy().starts_with("signed-") {
+                count = count.saturating_add(1);
+            }
+        }
+        Ok(count)
+    }
+
+    #[test]
+    fn a_release_build_writes_nothing_when_the_level_is_lost_after_signing() -> TestResult {
+        let dir = TempDir::new("phone-release-after-signing")?;
+        let mut phone = ScriptedPhone::p384(Answer::Sign);
+        let mut document = one(&dir, Format::Pades, "contract.pdf", &minimal_pdf(), 0)?;
+        document.document = DocumentRequest {
+            // The signer's own certificate as its anchor: the path is
+            // complete before signing, and the level is lost only when
+            // no timestamp authority answers afterwards.
+            signer_anchors: vec![phone.certificate.clone()],
+            ..unreachable_lta(SigningBuild::Release)
+        };
+        let reports = sign_on_phone(&mut phone, vec![document])?;
+        check(&phone.batches.len(), &1, "the phone signed")?;
+        check_true(
+            matches!(reports.as_slice(), [Err(SignErrorKind::Timestamp(_))]),
+            "refused for the lost timestamp",
+        )?;
+        check(&signed_files(&dir)?, &0, "no file under any name")
     }
 
     #[cfg(debug_assertions)]

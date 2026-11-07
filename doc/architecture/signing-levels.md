@@ -50,8 +50,10 @@ The document is saved at the highest level actually reached:
 
 Only a failure to obtain a level's material lowers the level: a
 timestamp that cannot be had, or validation material that cannot be
-collected. A verified answer that a certificate is revoked is refused
-as in a release build, and so is every other failure.
+collected (no anchor, no issuer, no revocation answer). A verified
+answer that a certificate is revoked, a certificate that is malformed,
+expired or wrongly issued, and every other failure are refused as in a
+release build.
 
 The saved document says what it is in two places:
 

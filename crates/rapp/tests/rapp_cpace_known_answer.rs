@@ -116,6 +116,6 @@ fn kc2_generator_reproduces_pinned_synthetic_vector() {
 
     assert_eq!(
         to_hex(&generator.compress().to_bytes()),
-        "0aa7124360c0f941e1f089ea92cf33cd033289a125cb5a9649463852cc17191b"
+        "52e4547af867b43a814c78038b675a754fa8d8885c00b648489906152db21e39"
     );
 }

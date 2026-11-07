@@ -1,5 +1,7 @@
 # Common-core migration policy
 
+See [two-implementations.md](two-implementations.md) for why the Swift engine in `refineid-apple` is a deliberate second reference implementation and the Windows duplication is not.
+
 This repository receives reviewed snapshots, not a dump of the original
 development tree or its history. Each slice must be independently buildable,
 licensed, scrubbed, and understandable without private context.

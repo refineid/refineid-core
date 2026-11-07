@@ -9,6 +9,22 @@ See also [Security and Usability Balance](security-and-usability-balance.md) for
 the architectural consensus on unattended PIN 1 authentication and explicit
 batch signing for PIN 2.
 
+The PIN custody below is a settled product decision, not an open question.
+Holding PIN 1 is a convenience that the product requires: services such as
+web sites that demand a PIN 1 authentication on every page are unusable
+without it. PIN 2 is held only for a batch the holder sees whole, and for
+no longer than that batch takes. A review that proposes dropping the held
+PIN 1, prompting for it on every use, or lengthening PIN 2 custody is
+answered by reference to this document and closed. The exact length of
+custody is not debated either: PIN 1 lasts until an invalidation event,
+PIN 2 the minimum that completes the job. What is never negotiable is
+persistence: no PIN, in any form, is written to any store that survives
+the process, a device restart, the card leaving the reader, or the RAPP
+identity being forgotten. The platform may hold PIN 1 for the process in a
+component the operating system owns and reaps, as the macOS
+CryptoTokenKit extension does with the operating system's own PIN prompt
+filling it; that is still process memory, not storage.
+
 ## The retry floor: never the software that locks the card
 
 RefineID never spends an attempt that could block the card. Before any
@@ -126,7 +142,11 @@ Held PIN1 is destroyed on:
   compared with the count read when the card accepted the value;
 - a wrong, blocked or malformed PIN response, or a retry counter that went
   down;
-- process exit, device restart, or the user clearing it; and
+- process exit, device restart, or the user clearing it;
+- the phone forgetting the card's identity. The computer side of a RAPP
+  pairing holds no PIN 1 for a remote card: the phone reports its own
+  PIN 1 state and the computer keeps only a logged-in flag, which goes
+  with the slot when the pairing is forgotten; and
 - a probe reporting anything but five tries left or PIN1 verified: a lower
   count, a blocked PIN, or no readable state.
 

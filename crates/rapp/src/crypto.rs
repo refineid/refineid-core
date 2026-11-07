@@ -89,9 +89,9 @@ pub struct PairingHandshakeParameters<'a> {
     pub role: HandshakeRole,
     /// Fresh pair-specific local static key.
     pub local_keys: &'a PairKeyMaterial,
-    /// One-use QR bearer secret mixed as `psk3`.
+    /// Pairing pre-shared key from CPace, mixed as `psk3`.
     pub pairing_secret: &'a PairingSecret,
-    /// Hash of the pairing offer with the bearer secret removed.
+    /// Hash of the canonical pairing offer.
     pub offer_hash: [u8; 32],
     /// Selected registered transport profile.
     pub transport_profile: &'a str,

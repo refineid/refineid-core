@@ -700,7 +700,7 @@ mod tests {
 
     /// Synthetic one-use offer identifier.
     const OFFER_ID_BYTE: u8 = b'o';
-    /// Synthetic bearer pairing secret.
+    /// Synthetic pairing secret for the test.
     const PAIRING_SECRET_BYTE: u8 = b's';
     /// A pair identifier no ceremony derives, for the mismatch test.
     const FOREIGN_PAIR_ID_BYTE: u8 = b'x';

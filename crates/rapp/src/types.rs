@@ -71,7 +71,7 @@ pub const OPERATION_ID_SIZE: usize = 16;
 pub const CERTIFICATE_FINGERPRINT_SIZE: usize = 32;
 /// Byte length of a grant-set hash.
 pub const GRANTS_HASH_SIZE: usize = 32;
-/// Byte length of the one-use QR pairing secret.
+/// Byte length of the pairing pre-shared key CPace establishes.
 pub const PAIRING_SECRET_SIZE: usize = 32;
 /// Byte length of a fresh bilateral session-ready nonce.
 pub const SESSION_READY_NONCE_SIZE: usize = 32;
@@ -182,7 +182,8 @@ public_identifier!(
     "Hash binding the granted profile set."
 );
 
-/// One-use 256-bit pairing bearer secret.
+/// The 256-bit pairing pre-shared key CPace establishes, mixed into
+/// `Noise_XXpsk3` as `psk3`.
 ///
 /// It is non-clonable, always redacted, and zeroized on drop. Only the RAPP
 /// cryptographic layer can borrow its bytes.

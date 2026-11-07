@@ -31,6 +31,13 @@
 //!   valid. A verified revoked answer counts whatever its window, and
 //!   carries its revocation time so the caller can weigh it against
 //!   the proof of existence.
+//! - RFC 5280 sec.5.3.1 and `ETSI EN 319 102-1` clause 5.6.2: a
+//!   revocation for key, CA or attribute authority compromise says the
+//!   key is compromised, not one certificate carrying it. [`judge`]
+//!   therefore revokes every anchored path through a certificate
+//!   carrying the same subject public key, cross-certificates under
+//!   other issuers included, before ranking the paths
+//!   ([`CompromisedKey`]).
 //! - RFC 6960 sec.4.2.2.2: an OCSP answer counts only when its signer
 //!   is the issuer or a responder the issuer delegated
 //!   ([`VerifiedOcspResponse::verify`]).
@@ -323,6 +330,11 @@ pub struct ChainVerdict {
     /// The revocation status of the anchored path, or of the judged
     /// certificate alone against its issuer when there is no path.
     pub revocation: Revocation,
+    /// The compromise that decided `revocation`, naming the certificate
+    /// it was found on: one of the reported path, or one carrying the
+    /// same key on another anchored path. `None` when no compromise
+    /// decided it.
+    pub compromise: Option<CompromisedKey>,
     /// The search for anchored paths spent every one of its
     /// `MAX_PATH_SEARCH_VERIFICATIONS` signature verifications and
     /// may have stopped before a path it would otherwise have found:
@@ -374,16 +386,127 @@ impl Revocation {
     }
 
     /// How a relying party ranks the status among the paths that reach
-    /// an anchor: good first, then unavailable, then revoked, the
-    /// latest non-compromise revocation before the rest.
-    fn preference(self) -> (u8, bool, Option<DateTime>) {
+    /// an anchor and carry no compromised key: good first, then
+    /// unavailable, then revoked, the latest revocation before the
+    /// rest. A compromise never reaches the ranking: [`judge`] revokes
+    /// every path carrying the compromised key before it ranks.
+    fn preference(self) -> (u8, Option<DateTime>) {
         match self {
-            Self::Good { at } => (PREFER_GOOD, true, Some(at)),
-            Self::Unavailable => (PREFER_UNAVAILABLE, true, None),
-            Self::Revoked { at, reason } => {
-                (PREFER_REVOKED, !reason.is_some_and(is_compromise), Some(at))
-            }
+            Self::Good { at } => (PREFER_GOOD, Some(at)),
+            Self::Unavailable => (PREFER_UNAVAILABLE, None),
+            Self::Revoked { at, .. } => (PREFER_REVOKED, Some(at)),
         }
+    }
+}
+
+/// A compromise revocation found on one certificate of an anchored
+/// path. The revocation says the key is compromised (RFC 5280
+/// sec.5.3.1), and a compromised key proves nothing about when it
+/// signed (`ETSI EN 319 102-1` clause 5.6.2), so it revokes every
+/// anchored path through a certificate carrying the same subject public
+/// key, the cross-certificates that carry it under other issuers
+/// included, whatever those paths' own answers say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompromisedKey {
+    /// The certificate the compromise revocation was found on.
+    certificate: OwnedCert,
+    /// The revocation time.
+    at: DateTime,
+    /// The reason; always one [`is_compromise`] recognises.
+    reason: CrlReason,
+}
+
+impl CompromisedKey {
+    /// The compromise `revocation` reports about `certificate`, when
+    /// it is one.
+    fn found(certificate: &OwnedCert, revocation: Revocation) -> Option<Self> {
+        match revocation {
+            Revocation::Revoked {
+                at,
+                reason: Some(reason),
+            } if is_compromise(reason) => Some(Self {
+                certificate: certificate.clone(),
+                at,
+                reason,
+            }),
+            Revocation::Revoked { .. } | Revocation::Good { .. } | Revocation::Unavailable => None,
+        }
+    }
+
+    /// The certificate the compromise revocation was found on.
+    #[must_use]
+    pub const fn certificate(&self) -> &OwnedCert {
+        &self.certificate
+    }
+
+    /// The revocation time.
+    #[must_use]
+    pub const fn at(&self) -> DateTime {
+        self.at
+    }
+
+    /// The compromise reason.
+    #[must_use]
+    pub const fn reason(&self) -> CrlReason {
+        self.reason
+    }
+
+    /// The status it imposes on every path carrying its key.
+    const fn revocation(&self) -> Revocation {
+        Revocation::Revoked {
+            at: self.at,
+            reason: Some(self.reason),
+        }
+    }
+
+    /// Whether a certificate of `path` carries the compromised key: the
+    /// same `SubjectPublicKeyInfo`, byte for byte.
+    fn shares_key_with(&self, path: &[OwnedCert]) -> bool {
+        let key = self.certificate.view().spki.as_der();
+        path.iter()
+            .any(|certificate| certificate.view().spki.as_der() == key)
+    }
+
+    /// Of two compromises, the one to report: the earlier.
+    fn graver(self, other: Self) -> Self {
+        if other.at < self.at { other } else { self }
+    }
+}
+
+/// One anchored path with the revocation status of each certificate
+/// below its anchor.
+struct JudgedPath<'a> {
+    /// The path, the judged certificate first and the anchor last.
+    path: &'a [OwnedCert],
+    /// The status of each certificate below the anchor, the judged
+    /// certificate's first, each against its issuer.
+    steps: Vec<Revocation>,
+}
+
+impl JudgedPath<'_> {
+    /// The status of the path as a whole ([`path_status`]).
+    fn status(&self) -> Revocation {
+        path_status(&self.steps)
+    }
+
+    /// Every compromise found on the path.
+    fn compromises(&self) -> impl Iterator<Item = CompromisedKey> + '_ {
+        self.path
+            .iter()
+            .zip(&self.steps)
+            .filter_map(|(certificate, step)| CompromisedKey::found(certificate, *step))
+    }
+
+    /// Whether a certificate of the path carries `compromised`'s key.
+    fn carries(&self, compromised: &CompromisedKey) -> bool {
+        compromised.shares_key_with(self.path)
+    }
+
+    /// Whether `compromised` was found on this path's own certificate.
+    fn holds(&self, compromised: &CompromisedKey) -> bool {
+        self.path
+            .iter()
+            .any(|certificate| certificate.as_der() == compromised.certificate.as_der())
     }
 }
 
@@ -621,32 +744,20 @@ impl MaterialPool {
         strongest(ocsp.chain(crl))
     }
 
-    /// The revocation status of `path`, judged certificate first and
-    /// anchor last: every certificate below the anchor is checked
-    /// against its issuer (RFC 5280 sec.6.1.3 (a)(3)). Revoked when any
-    /// is, at the earliest revocation time; else unavailable when any
-    /// is unanswered; else the judged certificate's good answer.
-    fn path_revocation(&self, path: &[OwnedCert], when: When) -> Revocation {
-        let mut first = None;
-        let mut revoked: Option<(DateTime, Option<CrlReason>)> = None;
-        let mut unanswered = false;
-        for step in path.windows(2) {
-            let [certificate, issuer] = step else {
-                continue;
-            };
-            let revocation = self.revocation_of(certificate.view(), issuer.view(), when);
-            match revocation {
-                Revocation::Revoked { at, reason } => revoked = Some(graver(revoked, at, reason)),
-                Revocation::Unavailable => unanswered = true,
-                Revocation::Good { .. } => {}
-            }
-            first.get_or_insert(revocation);
-        }
-        match (revoked, unanswered) {
-            (Some((at, reason)), _) => Revocation::Revoked { at, reason },
-            (None, true) => Revocation::Unavailable,
-            (None, false) => first.unwrap_or(Revocation::Unavailable),
-        }
+    /// The anchored `path`, judged certificate first and anchor last,
+    /// with every certificate below the anchor checked against its
+    /// issuer (RFC 5280 sec.6.1.3 (a)(3)).
+    fn judge_path<'a>(&self, path: &'a [OwnedCert], when: When) -> JudgedPath<'a> {
+        let steps = path
+            .windows(2)
+            .filter_map(|step| {
+                let [certificate, issuer] = step else {
+                    return None;
+                };
+                Some(self.revocation_of(certificate.view(), issuer.view(), when))
+            })
+            .collect();
+        JudgedPath { path, steps }
     }
 
     /// What one OCSP response says about `certificate`, when its signer
@@ -777,9 +888,16 @@ const MAX_PATH_SEARCH_VERIFICATIONS: usize = MAX_ANCHORED_PATHS * MAX_PATH_DEPTH
 /// `path` is reported whenever a pool certificate verifiably issued the
 /// certificate, anchored or not; `anchored` additionally needs the
 /// certificate valid at `at`, fit for the role, and a path ending in an
-/// anchor for `role` granted at `at`. Every anchored path is judged and
-/// the best revocation status kept (RFC 5280 sec.6 accepts any valid
-/// path): good, then unavailable, then revoked. The search keeps at
+/// anchor for `role` granted at `at`. Every anchored path is judged. A
+/// compromise revocation found on any certificate of any of them is
+/// decisive across paths: every path through a certificate carrying the
+/// same subject public key is revoked by it, whatever its own answers
+/// said, and the verdict names the certificate it was found on
+/// ([`ChainVerdict::compromise`]); when every path is, the one the
+/// compromise was found on is reported. Of the paths that remain the
+/// best revocation status is kept (RFC 5280 sec.6 accepts any valid
+/// path): good, then unavailable, then revoked. A revocation of a
+/// certificate on no path found is not consulted. The search keeps at
 /// most `MAX_ANCHORED_PATHS` paths and spends at most
 /// `MAX_PATH_SEARCH_VERIFICATIONS` signature verifications, and the
 /// partial path as many again; a spent budget leaves paths unfound and
@@ -810,6 +928,7 @@ pub fn judge(
         return ChainVerdict {
             path: CertificationPath::Anchored(Vec::new()),
             revocation: Revocation::Unavailable,
+            compromise: None,
             search_exhausted: false,
         };
     }
@@ -828,21 +947,40 @@ pub fn judge(
     let mut budget = SearchBudget::new();
     pool.anchored_paths(anchors, role, at, &mut path, &mut paths, &mut budget);
     let search_exhausted = budget.is_spent();
-    let best = paths
+    let judged: Vec<JudgedPath<'_>> = paths
         .iter()
-        .map(|path| (path, pool.path_revocation(path, when)))
-        .max_by_key(|(_, revocation)| revocation.preference());
-    let (path, revocation) = match best {
-        Some((path, revocation)) => (path.get(1..).unwrap_or_default().to_vec(), revocation),
+        .map(|path| pool.judge_path(path, when))
+        .collect();
+    let compromised: Vec<CompromisedKey> =
+        judged.iter().flat_map(JudgedPath::compromises).collect();
+    let best = judged
+        .iter()
+        .filter(|path| !compromised.iter().any(|key| path.carries(key)))
+        .map(|path| (path.path, path.status(), None))
+        .max_by_key(|(_, revocation, _)| revocation.preference())
+        .or_else(|| {
+            // Every path carries a compromised key: the gravest
+            // compromise, on the path it was found on.
+            let compromise = compromised.into_iter().reduce(CompromisedKey::graver)?;
+            let path = judged.iter().find(|path| path.holds(&compromise))?;
+            Some((path.path, compromise.revocation(), Some(compromise)))
+        });
+    let found = best.is_some();
+    let (path, revocation, compromise) = match best {
+        Some((path, revocation, compromise)) => (
+            path.get(1..).unwrap_or_default().to_vec(),
+            revocation,
+            compromise,
+        ),
         None => {
             let path = pool.partial_path(certificate, &step);
             let revocation = path.first().map_or(Revocation::Unavailable, |issuer| {
                 pool.revocation_of(view, issuer.view(), when)
             });
-            (path, revocation)
+            (path, revocation, None)
         }
     };
-    let anchored = valid_at(view, at) && fit && best.is_some();
+    let anchored = valid_at(view, at) && fit && found;
     ChainVerdict {
         path: if anchored {
             CertificationPath::Anchored(path)
@@ -850,6 +988,7 @@ pub fn judge(
             CertificationPath::Partial(path)
         },
         revocation,
+        compromise,
         search_exhausted,
     }
 }
@@ -920,6 +1059,28 @@ fn accepted_window(
     !post_dated && (contains_at || issued_after_at)
 }
 
+/// The status of a path from the statuses of its certificates below
+/// the anchor, the judged certificate's first: revoked when any is, a
+/// compromise or else the earliest revocation reported; else
+/// unavailable when any is unanswered; else the judged certificate's
+/// good answer.
+fn path_status(steps: &[Revocation]) -> Revocation {
+    let mut revoked: Option<(DateTime, Option<CrlReason>)> = None;
+    let mut unanswered = false;
+    for step in steps {
+        match *step {
+            Revocation::Revoked { at, reason } => revoked = Some(graver(revoked, at, reason)),
+            Revocation::Unavailable => unanswered = true,
+            Revocation::Good { .. } => {}
+        }
+    }
+    match (revoked, unanswered) {
+        (Some((at, reason)), _) => Revocation::Revoked { at, reason },
+        (None, true) => Revocation::Unavailable,
+        (None, false) => steps.first().copied().unwrap_or(Revocation::Unavailable),
+    }
+}
+
 /// A revoked answer outweighs any good one, a compromise or else the
 /// earliest revocation reported; among good answers the latest evidence
 /// time is.
@@ -970,13 +1131,15 @@ fn may_issue(certificate: Certificate<'_>, intermediates_below: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnchorError, AnchorRole, GrantedPeriod, MAX_PATH_DEPTH, MAX_PATH_SEARCH_VERIFICATIONS,
-        MaterialPool, Revocation, SearchBudget, TrustAnchor, TrustAnchors, When, judge,
+        AnchorError, AnchorRole, ChainVerdict, GrantedPeriod, MAX_PATH_DEPTH,
+        MAX_PATH_SEARCH_VERIFICATIONS, MaterialPool, Revocation, SearchBudget, TrustAnchor,
+        TrustAnchors, When, judge,
     };
     use crate::crl::CrlReason;
     use crate::testkit::{
         BOOLEAN, CertificateSpec, DER_TRUE, INTEGER, OcspSpec, ResponderName, SEQUENCE, TestCurve,
-        TestKey, ca_extensions, certificate, crl, day, extension, key_usage, ocsp_response, tlv,
+        TestKey, ca_extensions, certificate, crl, crl_with_reason, day, extension, key_usage,
+        ocsp_response, tlv,
     };
     use crate::validation::ValidationMaterial;
     use refineid_cms::oid::known;
@@ -999,6 +1162,20 @@ mod tests {
     const SIGNER_SERIAL: u8 = 3;
     /// Second intermediate serial.
     const SUB_INTERMEDIATE_SERIAL: u8 = 4;
+    /// Common name of a second root, which cross-certifies the
+    /// intermediate.
+    const SECOND_ROOT: &str = "Synthetic Second Root CA";
+    /// Second root serial.
+    const SECOND_ROOT_SERIAL: u8 = 5;
+    /// Serial of the intermediate's cross-certificate under the second
+    /// root.
+    const CROSS_SERIAL: u8 = 6;
+    /// Common name of a third root, which cross-certifies the second.
+    const THIRD_ROOT: &str = "Synthetic Third Root CA";
+    /// Third root serial.
+    const THIRD_ROOT_SERIAL: u8 = 7;
+    /// Serial of the second root's cross-certificate under the third.
+    const SECOND_CROSS_SERIAL: u8 = 8;
     /// Day every certificate starts.
     const ISSUED: u8 = 1;
     /// Day of a revocation.
@@ -1963,6 +2140,305 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// The chain plus a second root that cross-certifies the
+    /// intermediate's name and key: two anchored paths above the
+    /// signer, through two certificates carrying one key.
+    struct CrossCertified {
+        /// The chain under the first root.
+        chain: Chain,
+        /// Second root key.
+        second_root_key: TestKey,
+        /// Self-signed second root.
+        second_root: Vec<u8>,
+        /// The intermediate's name and key, issued by the second root.
+        cross: Vec<u8>,
+    }
+
+    /// A cross-certified fixture.
+    fn cross_certified() -> CrossCertified {
+        let chain = chain(ENDS);
+        let second_root_key = TestKey::derive(TestCurve::P384, b"second root");
+        let second_root = certificate(
+            &spec(
+                SECOND_ROOT_SERIAL,
+                SECOND_ROOT,
+                SECOND_ROOT,
+                ENDS,
+                ca_extensions(),
+            ),
+            &second_root_key,
+            &second_root_key,
+        );
+        let cross = certificate(
+            &spec(
+                CROSS_SERIAL,
+                INTERMEDIATE,
+                SECOND_ROOT,
+                ENDS,
+                ca_extensions(),
+            ),
+            &chain.intermediate_key,
+            &second_root_key,
+        );
+        CrossCertified {
+            chain,
+            second_root_key,
+            second_root,
+            cross,
+        }
+    }
+
+    impl CrossCertified {
+        /// Both roots trusted for certificate issuing.
+        fn anchors(&self) -> TrustAnchors {
+            TrustAnchors::new(
+                [&self.chain.root, &self.second_root]
+                    .into_iter()
+                    .map(|root| {
+                        TrustAnchor::new(
+                            OwnedCert::from_der(root).expect("root parses"),
+                            AnchorRole::CertificateIssuing,
+                            vec![GrantedPeriod::unbounded()],
+                        )
+                        .expect("an anchor")
+                    })
+                    .collect(),
+            )
+        }
+
+        /// The pool a document carrying both intermediates and both
+        /// roots gives, plus `crls`.
+        fn pool_with(&self, crls: Vec<Vec<u8>>) -> MaterialPool {
+            let mut pool = self.chain.pool();
+            pool.add_certificate_ders(&[self.cross.clone(), self.second_root.clone()]);
+            pool.add_material(&ValidationMaterial {
+                certificates: Vec::new(),
+                ocsp_responses: Vec::new(),
+                crls,
+            });
+            pool
+        }
+
+        /// The second root's CRL listing the cross-certificate as
+        /// revoked on [`REVOKED`] for `reason`.
+        fn cross_crl(&self, reason: CrlReason) -> Vec<u8> {
+            crl_with_reason(
+                SECOND_ROOT,
+                &self.second_root_key,
+                day(ANSWERED),
+                Some(day(ENDS)),
+                &[CROSS_SERIAL],
+                day(REVOKED),
+                Some(reason),
+            )
+        }
+
+        /// A CRL from `issuer` listing nothing on either path: a good
+        /// answer about every certificate it speaks for.
+        fn silent_crl(issuer: &str, issuer_key: &TestKey) -> Vec<u8> {
+            crl(
+                issuer,
+                issuer_key,
+                day(ANSWERED),
+                Some(day(ENDS)),
+                &[SUB_INTERMEDIATE_SERIAL],
+                day(REVOKED),
+            )
+        }
+
+        /// The signer judged over `pool` under both roots at
+        /// [`VALIDATED`].
+        fn judge(&self, pool: &MaterialPool) -> ChainVerdict {
+            judge(
+                &self.chain.signer,
+                pool,
+                &self.anchors(),
+                AnchorRole::CertificateIssuing,
+                at(VALIDATED),
+            )
+        }
+    }
+
+    #[test]
+    fn a_compromised_cross_certificate_revokes_every_path_carrying_its_key() {
+        let fixture = cross_certified();
+        // The path under the first root has no revocation data; the one
+        // under the second finds its intermediate revoked for CA
+        // compromise.
+        let pool = fixture.pool_with(vec![fixture.cross_crl(CrlReason::CaCompromise)]);
+        let verdict = fixture.judge(&pool);
+        assert!(verdict.path.is_anchored());
+        assert_eq!(
+            verdict.revocation,
+            Revocation::Revoked {
+                at: day(REVOKED),
+                reason: Some(CrlReason::CaCompromise)
+            }
+        );
+        assert!(
+            verdict.revocation.revoked_before(Some(day(ENDS))),
+            "whatever the proof of existence"
+        );
+        let compromise = verdict.compromise.clone().expect("the compromise is named");
+        assert_eq!(compromise.certificate().as_der(), fixture.cross);
+        assert_eq!(compromise.at(), day(REVOKED));
+        assert_eq!(compromise.reason(), CrlReason::CaCompromise);
+        assert_eq!(
+            der_path(&verdict),
+            [fixture.cross.clone(), fixture.second_root.clone()],
+            "reported on the path it was found on"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_revocation_on_one_path_leaves_the_best_path_to_decide() {
+        let fixture = cross_certified();
+        for reason in [CrlReason::Unspecified, CrlReason::Superseded] {
+            let pool = fixture.pool_with(vec![fixture.cross_crl(reason)]);
+            let verdict = fixture.judge(&pool);
+            assert!(verdict.path.is_anchored());
+            assert_eq!(verdict.revocation, Revocation::Unavailable);
+            assert_eq!(verdict.compromise, None);
+            assert_eq!(
+                der_path(&verdict),
+                [
+                    fixture.chain.intermediate.clone(),
+                    fixture.chain.root.clone()
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn a_compromised_signer_revokes_every_path() {
+        let fixture = cross_certified();
+        let chain = &fixture.chain;
+        let pool = fixture.pool_with(vec![
+            CrossCertified::silent_crl(ROOT, &chain.root_key),
+            CrossCertified::silent_crl(SECOND_ROOT, &fixture.second_root_key),
+            crl_with_reason(
+                INTERMEDIATE,
+                &chain.intermediate_key,
+                day(ANSWERED),
+                Some(day(ENDS)),
+                &[SIGNER_SERIAL],
+                day(REVOKED),
+                Some(CrlReason::KeyCompromise),
+            ),
+        ]);
+        let verdict = fixture.judge(&pool);
+        assert!(verdict.path.is_anchored());
+        assert_eq!(
+            verdict.revocation,
+            Revocation::Revoked {
+                at: day(REVOKED),
+                reason: Some(CrlReason::KeyCompromise)
+            }
+        );
+        assert_eq!(
+            verdict
+                .compromise
+                .map(|compromise| compromise.certificate().as_der().to_vec()),
+            Some(chain.signer.as_der().to_vec())
+        );
+    }
+
+    #[test]
+    fn a_compromise_reaches_only_the_paths_carrying_its_key() {
+        let fixture = cross_certified();
+        // The second root is not an anchor itself; a third root
+        // cross-certifies its name and key and lists that certificate
+        // as CA-compromised. The path under the first root carries
+        // neither key.
+        let third_root_key = TestKey::derive(TestCurve::P384, b"third root");
+        let third_root = certificate(
+            &spec(
+                THIRD_ROOT_SERIAL,
+                THIRD_ROOT,
+                THIRD_ROOT,
+                ENDS,
+                ca_extensions(),
+            ),
+            &third_root_key,
+            &third_root_key,
+        );
+        let second_cross = certificate(
+            &spec(
+                SECOND_CROSS_SERIAL,
+                SECOND_ROOT,
+                THIRD_ROOT,
+                ENDS,
+                ca_extensions(),
+            ),
+            &fixture.second_root_key,
+            &third_root_key,
+        );
+        let mut pool = fixture.pool_with(vec![crl_with_reason(
+            THIRD_ROOT,
+            &third_root_key,
+            day(ANSWERED),
+            Some(day(ENDS)),
+            &[SECOND_CROSS_SERIAL],
+            day(REVOKED),
+            Some(CrlReason::CaCompromise),
+        )]);
+        pool.add_certificate_ders(&[second_cross.clone(), third_root.clone()]);
+        let judged = |anchors: &[&[u8]]| {
+            judge(
+                &fixture.chain.signer,
+                &pool,
+                &TrustAnchors::new(
+                    anchors
+                        .iter()
+                        .map(|root| {
+                            TrustAnchor::new(
+                                OwnedCert::from_der(root).expect("root parses"),
+                                AnchorRole::CertificateIssuing,
+                                vec![GrantedPeriod::unbounded()],
+                            )
+                            .expect("an anchor")
+                        })
+                        .collect(),
+                ),
+                AnchorRole::CertificateIssuing,
+                at(VALIDATED),
+            )
+        };
+
+        // Under the third root alone the only path carries the
+        // compromised certificate itself.
+        let verdict = judged(&[&third_root]);
+        assert!(verdict.path.is_anchored());
+        assert_eq!(
+            verdict.revocation,
+            Revocation::Revoked {
+                at: day(REVOKED),
+                reason: Some(CrlReason::CaCompromise)
+            }
+        );
+        assert_eq!(
+            verdict
+                .compromise
+                .map(|compromise| compromise.certificate().as_der().to_vec()),
+            Some(second_cross)
+        );
+
+        // With the first root trusted too, its path carries neither
+        // the intermediate's cross-certificate nor the compromised key
+        // and decides.
+        let verdict = judged(&[&fixture.chain.root, &third_root]);
+        assert!(verdict.path.is_anchored());
+        assert_eq!(verdict.revocation, Revocation::Unavailable);
+        assert_eq!(verdict.compromise, None);
+        assert_eq!(
+            der_path(&verdict),
+            [
+                fixture.chain.intermediate.clone(),
+                fixture.chain.root.clone()
+            ]
+        );
     }
 
     /// The anchored paths `pool` holds above `signer` for certificate

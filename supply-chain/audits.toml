@@ -1,4 +1,14 @@
 
 # cargo-vet audits file
 
-[audits]
+[[audits.winnow]]
+who = "Petri Koistinen"
+criteria = "safe-to-deploy"
+delta = "1.0.4 -> 1.0.5"
+notes = "Mechanical changes from the crate's own lint pass: Self in place of type names, suffixed integer literals, elided lifetimes on the Caseless impls; one new impl (HexUint for usize) and Range-typed occurrence arguments on two combinators. No unsafe code in the diff. The crate sits under the TOML parsers used by tooling, not on the card path."
+
+[[audits.zeroize]]
+who = "Petri Koistinen"
+criteria = "safe-to-deploy"
+delta = "1.9.0 -> 1.9.1"
+notes = "Zeroizing no longer derives Debug (the wrapped secret is not printed); Vec zeroing wipes the spare capacity before clear so elements are wiped once; the internal optimization_barrier calls after volatile writes are removed; the fallback barrier reads the byte as MaybeUninit. The project's fixed arrays and byte vectors still end in the same volatile writes."

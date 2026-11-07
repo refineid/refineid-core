@@ -298,7 +298,7 @@ pub const fn check_retry_floor(
 /// [`RetryFloorRefusal::TriesBelowFloor`] at two or one tries left;
 /// [`RetryFloorRefusal::CounterUnreadable`] at a count above five or a
 /// status that carries no counter.
-pub(crate) const fn check_last_tries(
+pub const fn check_last_tries(
     credential: FlooredCredential,
     status: PinStatus,
 ) -> Result<(), RetryFloorRefusal> {

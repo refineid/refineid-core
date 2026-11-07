@@ -42,9 +42,11 @@ pub const MAX_FRAME_PLAINTEXT: usize = 65_519;
 pub const MAX_ACTIVE_OPERATIONS: usize = 1;
 /// Pairing-offer lifetime in milliseconds (RAPP v26.11.2 §3.3, §4.2).
 pub const OFFER_TTL_MS: u64 = 300_000;
-/// Fewest tries left at which a Custodian sends a PIN verification (RAPP
-/// v26.11.2 section 10.2). The floor itself is `check_retry_floor` in
-/// `refineid-auth`, which every surface applies.
+/// Fewest tries left at which a PIN verification may spend a try (RAPP
+/// v26.11.2 section 10.2): a Custodian refuses at two or one. It is not a
+/// bound on what is sent: at zero or blocked the verification goes to the
+/// card, which answers for itself and spends nothing. The floor itself is
+/// `check_retry_floor` in `refineid-auth`, which every surface applies.
 pub const MINIMUM_REMAINING_ATTEMPTS: u8 = 3;
 /// How long a requester keeps offering a confirmed certificate with no
 /// session open or the card reported absent (RAPP v26.11.2 section 8.4

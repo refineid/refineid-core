@@ -341,8 +341,10 @@ signature; the card refused, and Alice reported the outcome as unknown.
 
 **The good day.** A remembered PIN ends when the card refuses it. Alice
 reads the tries left before any PIN command, and again after any
-outcome she could not see; with fewer than three tries left she sends
-nothing and tells Carol why. She checks PIN 1 before every signature.
+outcome she could not see; with two or one tries left, or a count she
+cannot read, she sends nothing and tells Carol why. With no tries left
+the card answers for itself and spends nothing. She checks PIN 1 before
+every signature.
 A refusal is reported as a refusal.
 
 **Lesson:** a PIN try is Carol's, not the software's. Never spend one on
@@ -662,7 +664,7 @@ the requester; a part named after a colon is one program of it.
 | UCA-66 | Phone | Admits a session on a second transport that cuts an operation. | P | H-5, H-7 | CC-74 |
 | UCA-67 | Phone | Keeps its network listener published while suspended. | P | H-5, H-7 | CC-68 |
 | UCA-68 | Phone | Commands an NFC card from the background. | P | H-5, H-7 | CC-69 |
-| UCA-69 | Phone | Reports the card absent while locked only because protected data is unavailable. | P | H-7 | CC-70 |
+| UCA-69 | Phone | Reports the card absent while locked only because protected data is unavailable. A locked phone admits the session and answers card status, but starts no credential use (`credential-custody.md`). | P | H-7 | CC-70 |
 | UCA-70 | Computer | Opens a second Bluetooth link from another of its programs. | P | H-5, H-7 | CC-78 |
 | UCA-71 | Computer | Keeps dialing the network address of a suspended phone. | P | H-7 | CC-72 |
 | UCA-72 | Phone | Refuses a Bluetooth write with an error that starts operating-system bonding. | P | H-5 | CC-73 |
@@ -771,7 +773,7 @@ the requester; a part named after a colon is one program of it.
 | CC-66 | PIN 1 is asked once and held only in memory, until the card is removed or replaced, refuses it, the holder clears it, the process ends or the device restarts. PIN 2 is asked for every signature or batch. The PIN prompt is the consent. | §8.2 item 3, §11 item 2 |
 | CC-68 | In the background, with Bluetooth serving, the phone closes an idle stream session and unpublishes its stream listener; it publishes again in the foreground. | |
 | CC-69 | An NFC card command from the background first summons the holder (a notification and `waiting_for_card`) for a bounded wait; otherwise the operation ends with `card_error`. | §8.2 item 4 (`waiting_for_card`) |
-| CC-70 | While the phone is locked and protected data is unavailable, it keeps the card status it last read. | |
+| CC-70 | While the phone is locked and protected data is unavailable, it keeps the card status it last read. It admits the session and answers card status, but starts no credential use (`credential-custody.md`). | §8.2 item 3 |
 | CC-72 | A stream dial that fails while discovery still shows the phone sends the next dial over Bluetooth. | |
 | CC-73 | A refused or closed Bluetooth link answers writes with "write not permitted", never an authentication or encryption error. | |
 | CC-74 | No session is displaced or refused for being busy, on any transport, and no session cuts another's admitted operation. | §8.2 item 2, §8.3 |

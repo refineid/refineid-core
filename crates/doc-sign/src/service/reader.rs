@@ -29,9 +29,10 @@ use core::fmt;
 use std::path::PathBuf;
 
 use super::{
-    AssembledDocument, DocumentRequest, LocalVerifyOutcome, SignErrorKind, SignOutput, SignReport,
-    SignSlot, SigningDevice, document_signer, ensure_visible_signature_format, finish_document,
-    load_data_objects, verify_against_certificate,
+    AssembledDocument, BelowRequestedLevel, DocumentRequest, LocalVerifyOutcome, SignErrorKind,
+    SignOutput, SignReport, SignSlot, SigningDevice, document_signer,
+    ensure_visible_signature_format, finish_document, load_data_objects,
+    verify_against_certificate,
 };
 use crate::digest::Sha256;
 use crate::document::{self, DocumentPlan};
@@ -686,9 +687,11 @@ where
 
     let signature_len = chain.signature_bytes.len();
     let output_len = chain.output_bytes.len();
-    let signature_path = options
-        .output
-        .write(chain.best_signature_time, &chain.output_bytes)?;
+    let signature_path = options.output.write(
+        chain.best_signature_time,
+        chain.below_requested_level.as_ref(),
+        &chain.output_bytes,
+    )?;
 
     let cert_path = if let Some(path) = &options.save_cert {
         std::fs::write(path, chain.cert_der.as_bytes()).map_err(|source| {
@@ -716,6 +719,7 @@ where
         cert_subject_cn: chain.cert_subject_cn,
         pin_retries_after: chain.pin_retries_after,
         local_verify: chain.local_verify,
+        below_requested_level: chain.below_requested_level,
     })
 }
 
@@ -831,6 +835,7 @@ fn prepare_on_card<T: CardTransport>(
                 document_signer(&cert, cert.spki.algorithm(), slot, request.signing_time)?;
             let objects = load_data_objects(&options.input, request, input_bytes)?;
             ensure_visible_signature_format(request)?;
+            request.check_signer_path(cert_der.as_bytes())?;
             Some(
                 document::plan(request.format, objects, &parameters, &request.metadata)
                     .map_err(SignErrorKind::Document)?,
@@ -973,6 +978,9 @@ struct SignChainOutput {
     output_bytes: Vec<u8>,
     /// Rule E7 local-verify outcome.
     local_verify: LocalVerifyOutcome,
+    /// Set when a development build saved the document below the
+    /// requested level.
+    below_requested_level: Option<BelowRequestedLevel>,
 }
 
 /// Complete the signature once the card session is closed.
@@ -1003,6 +1011,7 @@ fn finish_signature(
             bytes: signature_bytes.clone(),
             timestamps: 0,
             best_signature_time: None,
+            below_requested: None,
         },
     };
 
@@ -1015,6 +1024,7 @@ fn finish_signature(
         best_signature_time: assembled.best_signature_time,
         output_bytes: assembled.bytes,
         local_verify,
+        below_requested_level: assembled.below_requested,
     })
 }
 
@@ -1725,6 +1735,71 @@ mod tests {
                 "no card",
             )?;
             check(&asked.get(), &0, "prompts")
+        }
+
+        #[test]
+        fn a_release_build_refuses_an_unreachable_signer_path_before_the_pin() -> TestResult {
+            use crate::cades::SigningTime;
+            use crate::document::Format;
+            use crate::material::MaterialError;
+            use crate::pades::SignatureMetadata;
+            use crate::service::{DocumentRequest, MaterialPath, SignErrorKind, SigningBuild};
+
+            /// An anchor unrelated to the card's self-signed certificate.
+            const UNRELATED_ANCHOR: &[u8] =
+                include_bytes!("../../test-vectors/dvv-gov-root-ca-g3-ecc.der");
+            /// A claimed signing time inside the certificate's validity.
+            const SIGNING_YEAR: u16 = 2026;
+            const SIGNING_MONTH: u8 = 1;
+
+            let card = SyntheticCard::served()?;
+            let backend = SyntheticBackend::one_reader(true, card.clone());
+            let (mut pin, asked) = counting(|| {});
+            let dir = TempDir::new("sign-unreachable-path")?;
+            let input = dir.write("message.txt", MESSAGE)?;
+            let output = dir.path().join("message.p7s");
+            let options = SignOptions {
+                input,
+                output: SignOutput::At(output.clone()),
+                slot: SignSlot::Qualified,
+                save_cert: None,
+                reader_filter: None,
+                can: None,
+                expected_serial: None,
+                document: Some(DocumentRequest {
+                    format: Format::CadesDetached,
+                    additional_inputs: Vec::new(),
+                    signing_time: SigningTime {
+                        year: SIGNING_YEAR,
+                        month: SIGNING_MONTH,
+                        day: FIRST_DAY,
+                        hour: 0,
+                        minute: 0,
+                        second: 0,
+                    },
+                    metadata: SignatureMetadata::default(),
+                    archive: false,
+                    long_term: true,
+                    signer_anchors: vec![UNRELATED_ANCHOR.to_vec()],
+                    timestamp_authorities: vec!["https://tsa.invalid/".to_owned()],
+                    timestamp_credentials: None,
+                    build: SigningBuild::Release,
+                }),
+            };
+            let result = sign(&backend, options, &mut pin);
+            check_true(
+                matches!(
+                    result,
+                    Err(ReaderSignError::Document(SignErrorKind::Material {
+                        path: MaterialPath::Signer,
+                        error: MaterialError::NoIssuer(_),
+                    }))
+                ),
+                "refused for the signer path",
+            )?;
+            check(&asked.get(), &0, "prompts")?;
+            check(&card.credential_references().len(), &0, "no VERIFY")?;
+            check_true(!output.exists(), "nothing saved")
         }
 
         #[test]

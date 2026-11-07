@@ -302,6 +302,14 @@ rule in a line and points to the reading behind it; the readings live in
 - Describe what the code does and cite the source; ask the owner before
   changing trust behavior.
 
+## Signing levels
+
+- A release build saves a document only at the long-term level asked
+  for and otherwise refuses with the reason; a development build saves
+  the level reached under a `-dev-<level>` name. The switch is
+  `debug_assertions`, never a runtime setting:
+  [doc/architecture/signing-levels.md](doc/architecture/signing-levels.md).
+
 ## Independent review
 
 - Before a pull request merges, have its diff reviewed by a model from a

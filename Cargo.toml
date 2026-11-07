@@ -24,7 +24,7 @@ members = [
 ]
 # The cargo-fuzz harness builds with its own profile and nightly
 # toolchain, so it stays outside the workspace.
-exclude = ["crates/rapp/fuzz"]
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "26.11.7"
@@ -122,6 +122,9 @@ zeroize = { version = "1", features = ["zeroize_derive"] }
 [workspace.lints.rust]
 missing_docs = "warn"
 unsafe_code = "deny"
+# `kani` is set by `cargo kani` for the proof harnesses; `flux` is set by
+# the Flux refinement-type checker.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(flux)'] }
 
 [workspace.lints.rustdoc]
 bare_urls = "deny"

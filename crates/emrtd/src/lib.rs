@@ -35,3 +35,6 @@ pub use ops::{EmrtdCardProfile, EmrtdOps};
 pub use portrait::{CardFaceImage, ImageFormat, parse_card_face_image};
 pub use reader::{decode_outer_total_length, read_emrtd_file};
 pub use sfi::{SFI_EF_COM, SFI_EF_DG1, SFI_EF_DG2, SFI_EF_DG7, Sfi};
+
+#[cfg(kani)]
+mod proofs;

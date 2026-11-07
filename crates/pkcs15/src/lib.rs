@@ -37,3 +37,6 @@ pub use fs::{
 pub use refineid_x509::UnvalidatedCertificate;
 pub use token_info::TokenInfo;
 pub use token_serial::{PrintedSerial, TokenSerial, derive_printed_serial, render_token_serial};
+
+#[cfg(kani)]
+mod proofs;

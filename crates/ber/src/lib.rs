@@ -241,6 +241,12 @@ pub enum BerError {
     /// The tag ran to three or more octets; this crate frames only one-
     /// and two-octet tags.
     UnsupportedTagForm,
+    /// An INTEGER whose content does not fit the unsigned field it
+    /// decodes into: no content octets at all, more octets than the
+    /// field holds, or the sign bit set (ITU-T X.690 section 8.3), as
+    /// for the PKCS#15 `TokenInfo` version INTEGER (ISO/IEC 7816-15
+    /// section 8.2) read into a `u32`.
+    IntegerOutOfRange,
     /// Tag mismatch when promoting an untyped TLV to a typed one.
     UnexpectedTag {
         /// The tag the typed marker requires.
@@ -257,6 +263,7 @@ impl fmt::Display for BerError {
             Self::Truncated => f.write_str("BER: truncated input"),
             Self::UnsupportedLengthForm => f.write_str("BER: length form not supported"),
             Self::UnsupportedTagForm => f.write_str("BER: tag form not supported"),
+            Self::IntegerOutOfRange => f.write_str("BER: INTEGER does not fit its field"),
             Self::UnexpectedTag { expected, got } => {
                 write!(f, "BER: expected tag {expected:#X}, got {got:#X}")
             }
@@ -556,6 +563,9 @@ pub struct Set;
 impl BerTag for Set {
     const TAG: u16 = 0x31;
 }
+
+#[cfg(kani)]
+mod proofs;
 
 #[cfg(test)]
 mod tests {

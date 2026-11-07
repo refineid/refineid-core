@@ -43,8 +43,8 @@ use refineid_apdu::CardTransport;
 use refineid_apdu::status_word::StatusWord;
 use refineid_auth::credentials::{PIN_MAX_LENGTH, PIN_MIN_LENGTH};
 use refineid_auth::{
-    CredentialInputError, Pin1, Pin2, PinOps as _, PinReferenceScheme, PinSlot, RetryFloorRefusal,
-    UnvalidatedSecret, VerifyOutcome, check_retry_floor,
+    AuthError, CredentialInputError, Pin1, Pin2, PinOps as _, PinReferenceScheme, PinSlot,
+    RetryFloorRefusal, UnvalidatedSecret, VerifyOutcome, check_retry_floor,
 };
 use refineid_cms::x509::{
     Certificate, EcCurve, MessageSignatureAlgorithm, OwnedCert, PublicKeyAlgorithm,
@@ -403,7 +403,10 @@ fn unlock_slot_key<'t, T: CardTransport>(
             let pin1 = Pin1::reconstruct(secret()).map_err(|e| pin_policy_refusal(slot, e))?;
             let outcome = transport
                 .verify_pin1_with_scheme(scheme, pin1)
-                .map_err(|e| ReaderSignError::Transport(format!("{e}")))?;
+                .map_err(|e| match e {
+                    AuthError::RetryFloor(refusal) => ReaderSignError::RetryFloor(refusal),
+                    other => ReaderSignError::Transport(format!("{other}")),
+                })?;
             match outcome {
                 VerifyOutcome::Ok => Ok(transport.authentication_key(sign_scheme)),
                 rejected @ (VerifyOutcome::WrongPin { .. }
@@ -438,6 +441,9 @@ fn unlock_err_to_kind<TE: fmt::Display>(
         },
         directory @ QualifiedUnlockError::Directory(_) => {
             ReaderSignError::Transport(format!("{directory}"))
+        }
+        QualifiedUnlockError::Verify(AuthError::RetryFloor(refusal)) => {
+            ReaderSignError::RetryFloor(refusal)
         }
         QualifiedUnlockError::Verify(verify) => ReaderSignError::Transport(format!("{verify}")),
     }
@@ -847,7 +853,10 @@ fn prepare_on_card<T: CardTransport>(
     })
 }
 
-/// Refuse when the slot's PIN counter is below the shared retry floor.
+/// Refuse when the slot's PIN counter is below the shared retry floor,
+/// before the PIN is asked for. The VERIFY applies the same rule on its
+/// own probe when the PIN is presented; this earlier reading spares the
+/// holder a prompt whose entry would not be sent.
 fn check_slot_retry_floor<T: CardTransport>(
     transport: &mut T,
     slot: SignSlot,
@@ -863,8 +872,8 @@ fn check_slot_retry_floor<T: CardTransport>(
 ///
 /// The prompt is the one moment the card is out of the flow's hands,
 /// so the card that answers VERIFY must be the card prepared: its
-/// serial is read again and compared, and its counter checked against
-/// the floor again, before the PIN is sent.
+/// serial is read again and compared before the PIN is sent. The VERIFY
+/// then reads the counter again and applies the retry floor itself.
 fn commit_on_card<T: CardTransport>(
     transport: &mut T,
     slot: SignSlot,
@@ -878,7 +887,6 @@ fn commit_on_card<T: CardTransport>(
             CARD_CHANGED_DURING_PROMPT.to_owned(),
         ));
     }
-    check_slot_retry_floor(transport, slot, prepared.scheme)?;
 
     let signed_octets: &[u8] = prepared
         .plan
@@ -1318,21 +1326,24 @@ mod tests {
         /// Fill byte of the card's synthetic signature.
         const ANSWER_FILL: u8 = b'S';
         /// The instructions an organization card sees last when it signs
-        /// with the qualified key.
+        /// with the qualified key: SELECT MF, SELECT DF.ESIGN, the
+        /// VERIFY's own counter probe, VERIFY PIN 2, MSE:Set and the one
+        /// inline PSO:CDS.
         const ORGANIZATIONAL_TAIL: [u8; 6] = [
+            SelectByAidNoFci::INS,
+            SelectByAidNoFci::INS,
             VERIFY_INS,
-            SelectByAidNoFci::INS,
-            SelectByAidNoFci::INS,
             VERIFY_INS,
             MSE_INS,
             PSO_INS,
         ];
         /// The instructions a citizen card sees last when it signs with
-        /// the qualified key.
+        /// the qualified key: the VERIFY's own counter probe, VERIFY
+        /// PIN 2, MSE:Set, PSO:HASH and the empty PSO:CDS.
         const CITIZEN_TAIL: [u8; 5] = [VERIFY_INS, VERIFY_INS, MSE_INS, PSO_INS, PSO_INS];
         /// A PIN counter the retry floor serves (five, four or three).
         const TRIES_SERVED: u8 = 5;
-        /// A PIN counter the retry floor refuses (two, one or none).
+        /// A PIN counter the retry floor refuses (two or one).
         const TRIES_BELOW_FLOOR: u8 = 2;
         /// The counter a refused VERIFY reports.
         const TRIES_AFTER_WRONG: u8 = 4;
@@ -1764,8 +1775,9 @@ mod tests {
                 &vec![PinReferenceScheme::Organizational.reference(PinSlot::Pin2)],
                 "one VERIFY under the organization PIN 2 reference",
             )?;
-            // The floor probe, SELECT MF, SELECT DF.ESIGN, VERIFY PIN 2,
-            // MSE:Set and the one inline PSO:CDS, with nothing between.
+            // SELECT MF, SELECT DF.ESIGN, the VERIFY's counter probe,
+            // VERIFY PIN 2, MSE:Set and the one inline PSO:CDS, with
+            // nothing between.
             let instructions = card.instructions();
             let tail = instructions
                 .get(instructions.len().saturating_sub(ORGANIZATIONAL_TAIL.len())..)
@@ -1784,8 +1796,8 @@ mod tests {
             let (mut pin, _asked) = counting(|| {});
             let result = sign_on(&backend, SignSlot::Qualified, &mut pin)?;
             check_true(passed_verify(&result), "flow passed VERIFY")?;
-            // The floor probe, VERIFY PIN 2, MSE:Set, PSO:HASH and the
-            // empty PSO:CDS: no directory change.
+            // The VERIFY's counter probe, VERIFY PIN 2, MSE:Set, PSO:HASH
+            // and the empty PSO:CDS: no directory change.
             let instructions = card.instructions();
             let tail = instructions
                 .get(instructions.len().saturating_sub(CITIZEN_TAIL.len())..)
@@ -1944,6 +1956,7 @@ mod tests {
             TransportOutcome,
         };
         use refineid_auth::credentials::{FINEID_PIN2_MIN_LENGTH, PIN_MAX_LENGTH, PIN_MIN_LENGTH};
+        use refineid_auth::verify::VERIFY_INS;
         use refineid_auth::{PinReferenceScheme, PinSlot};
 
         use refineid_apdu::iso7816::SelectFile;
@@ -2035,15 +2048,17 @@ mod tests {
                 check(&wire.get(DATA_INDEX..), &Some(LONGEST_PIN), "bare digits")?;
                 // PIN 2 is sent only once SELECT MF and SELECT DF.ESIGN
                 // made the qualified key's directory current; PIN 1 is
-                // sent where the caller selected.
-                let selects = match slot {
+                // sent where the caller selected. Either VERIFY probes
+                // the counter first.
+                let mut plain = match slot {
                     SignSlot::Qualified => vec![Some(SelectFile::INS); 2],
                     SignSlot::Authentication => Vec::new(),
                 };
+                plain.push(Some(VERIFY_INS));
                 check(
                     &card.plain_instructions(),
-                    &selects,
-                    "SELECTs before VERIFY",
+                    &plain,
+                    "SELECTs and the counter probe before VERIFY",
                 )?;
             }
             Ok(())

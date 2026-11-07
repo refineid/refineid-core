@@ -53,7 +53,10 @@ pub mod commands;
 pub mod container;
 
 use refineid_apdu::{CardTransport, CommandDataError, ResponseApdu, StatusWord, TransportOutcome};
-use refineid_auth::{AuthError, Pin2, PinOps as _, PinReferenceScheme, VerifyOutcome};
+use refineid_auth::{
+    AuthError, FlooredCredential, Pin2, Pin2PaceChannel as _, Pin2PaceChannelOps as _, PinOps as _,
+    PinReferenceScheme, VerifyOutcome, check_retry_floor,
+};
 use refineid_pace::{OpenedByPin2, Pin2PresentationSpent, SmTransport};
 use refineid_pkcs15::{Pkcs15Error, Pkcs15Ops as _};
 use zeroize::Zeroizing;
@@ -239,7 +242,7 @@ impl<E: core::fmt::Debug + core::fmt::Display + 'static> core::error::Error
 pub enum Pin2ChannelError<E> {
     /// The channel's PIN 2 presentation was already spent on an earlier
     /// qualified key; nothing was sent. A further signature on the channel
-    /// takes [`SignOps::unlock_qualified_key`].
+    /// takes [`Pin2ChannelSignOps::unlock_qualified_key_after_pin2_pace`].
     PresentationSpent(Pin2PresentationSpent),
     /// DF.ESIGN could not be made current.
     Directory(Pkcs15Error<E>),
@@ -294,6 +297,32 @@ pub trait Pin2ChannelSignOps: CardTransport + Sized {
     fn qualified_key_after_pin2_pace(
         &mut self,
     ) -> Result<SigningKey<'_, Self>, Pin2ChannelError<Self::Error>>;
+
+    /// VERIFY PIN 2 once more inside the channel and hand back the
+    /// qualified-signature key: the way every signature after the first
+    /// presents PIN 2 on a channel PIN 2 opened.
+    ///
+    /// The organizational card does not answer the counter-safe empty
+    /// VERIFY over secure messaging with a counter, so the retry floor
+    /// is applied to the channel's own record of PIN 2's counter
+    /// (`refineid_auth::Pin2PaceChannel`) and no probe is sent: refused
+    /// at two or one tries left or an unknown record before any command,
+    /// sent otherwise. DF.ESIGN is then made current, as
+    /// [`SignOps::unlock_qualified_key`] does; the card's answer settles
+    /// the record. On a plain transport, [`SignOps::unlock_qualified_key`]
+    /// floors on the probe instead.
+    ///
+    /// # Errors
+    ///
+    /// [`QualifiedUnlockError::Directory`] when DF.ESIGN cannot be made
+    /// current (PIN 2 is not sent), [`QualifiedUnlockError::Verify`] on a
+    /// retry-floor refusal (`AuthError::RetryFloor`, PIN 2 is not sent)
+    /// or a VERIFY transport failure, and
+    /// [`QualifiedUnlockError::PinRefused`] when the card refuses PIN 2.
+    fn unlock_qualified_key_after_pin2_pace(
+        &mut self,
+        pin: Pin2,
+    ) -> Result<SigningKey<'_, Self>, QualifiedUnlockError<Self::Error>>;
 }
 
 impl<T: CardTransport> Pin2ChannelSignOps for SmTransport<T, OpenedByPin2> {
@@ -309,6 +338,32 @@ impl<T: CardTransport> Pin2ChannelSignOps for SmTransport<T, OpenedByPin2> {
             scheme: SignScheme::Organizational,
             key: KeyRef::Sign,
         })
+    }
+
+    fn unlock_qualified_key_after_pin2_pace(
+        &mut self,
+        pin: Pin2,
+    ) -> Result<SigningKey<'_, Self>, QualifiedUnlockError<Self::Error>> {
+        // The floor first, so a refusal sends nothing, not even the
+        // directory selection; the VERIFY applies it again to the same
+        // record, at no cost.
+        check_retry_floor(FlooredCredential::Pin2, self.pin2_counter())
+            .map_err(|refusal| QualifiedUnlockError::Verify(AuthError::RetryFloor(refusal)))?;
+        self.select_esign_directory()
+            .map_err(QualifiedUnlockError::Directory)?;
+        let outcome = self
+            .verify_pin2_after_pin2_pace(pin)
+            .map_err(QualifiedUnlockError::Verify)?;
+        match outcome {
+            VerifyOutcome::Ok => Ok(SigningKey {
+                transport: self,
+                scheme: SignScheme::Organizational,
+                key: KeyRef::Sign,
+            }),
+            refused @ (VerifyOutcome::WrongPin { .. }
+            | VerifyOutcome::Locked
+            | VerifyOutcome::Other(_)) => Err(QualifiedUnlockError::PinRefused(refused)),
+        }
     }
 }
 
@@ -354,14 +409,20 @@ pub trait SignOps: CardTransport {
     /// The returned key borrows the transport exclusively, so no command
     /// can move the card out of that context between the VERIFY and the
     /// signature, and signing consumes it: one verification, one
-    /// signature. The caller applies the retry floor before calling.
+    /// signature. The VERIFY reads PIN 2's counter without spending a
+    /// try and applies the retry floor itself before PIN 2 is sent. On a
+    /// channel PACE opened with PIN 2 that probe is not answered with a
+    /// counter, so a further signature there takes
+    /// [`Pin2ChannelSignOps::unlock_qualified_key_after_pin2_pace`],
+    /// floored on the channel's record.
     ///
     /// # Errors
     ///
     /// [`QualifiedUnlockError::Directory`] when DF.ESIGN cannot be made
     /// current (PIN 2 is not sent), [`QualifiedUnlockError::Verify`] on a
-    /// VERIFY transport failure, and [`QualifiedUnlockError::PinRefused`]
-    /// when the card refuses PIN 2.
+    /// VERIFY transport failure or a retry-floor refusal
+    /// (`AuthError::RetryFloor`; PIN 2 is not sent), and
+    /// [`QualifiedUnlockError::PinRefused`] when the card refuses PIN 2.
     fn unlock_qualified_key(
         &mut self,
         scheme: SignScheme,

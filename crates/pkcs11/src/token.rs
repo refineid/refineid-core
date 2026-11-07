@@ -1620,11 +1620,20 @@ pub(super) fn card_sign(
             clear_positive(pin_cache);
             return Err(CKR_DEVICE_ERROR);
         };
+        // A blocked PIN 1 is the card's to answer, but a held value is
+        // never handed out for one; the lock is reported as the reason.
+        let no_pin_to_present = match pin1_status {
+            PinStatus::Locked => CKR_PIN_LOCKED,
+            PinStatus::Verified
+            | PinStatus::Remaining(_)
+            | PinStatus::NoInfo
+            | PinStatus::Other(_) => CKR_USER_NOT_LOGGED_IN,
+        };
         let checkout = pin_cache
             .lock()
             .map_err(|_poisoned| CKR_DEVICE_ERROR)?
             .checkout_pin1(&serial, card_events, pin1_status)
-            .ok_or(CKR_USER_NOT_LOGGED_IN)?;
+            .ok_or(no_pin_to_present)?;
         let secret =
             refineid_auth::UnvalidatedSecret::from_owned_bytes(checkout.pin().as_bytes().to_vec());
         let Ok(pin1) = refineid_auth::Pin1::reconstruct(secret) else {
@@ -1929,17 +1938,28 @@ fn settle_login(
     }
 }
 
-/// Apply the shared retry floor before every PIN1-bearing APDU. A PIN1
-/// at two, one or no tries left, or blocked, answers as locked, since
-/// this module never spends those attempts; a counter the card did not
-/// report is a device error.
+/// Apply the shared retry floor to the PIN 1 status login and signing
+/// read for the cache's sake, so a refusal is reported before the held
+/// or typed value is consulted. The VERIFY applies the same rule itself
+/// on its own probe; this is the same answer earlier, not a second
+/// rule. A PIN 1 at two or one tries left answers as locked, since this
+/// module never spends those attempts; a counter the card did not report
+/// is a device error. At no tries left or blocked the VERIFY goes to the
+/// card, whose answer is reported.
 const fn pin1_verify_guard(status: PinStatus) -> Result<(), CkRv> {
     match check_retry_floor(FlooredCredential::Pin1, status) {
         Ok(()) => Ok(()),
-        Err(RetryFloorRefusal::TriesBelowFloor { .. } | RetryFloorRefusal::Blocked { .. }) => {
-            Err(CKR_PIN_LOCKED)
-        }
-        Err(RetryFloorRefusal::CounterUnreadable { .. }) => Err(CKR_DEVICE_ERROR),
+        Err(refusal) => Err(retry_floor_rv(refusal)),
+    }
+}
+
+/// The return value a retry-floor refusal answers: `CKR_PIN_LOCKED` at
+/// two or one tries left, `CKR_DEVICE_ERROR` at a counter the card did
+/// not report.
+const fn retry_floor_rv(refusal: RetryFloorRefusal) -> CkRv {
+    match refusal {
+        RetryFloorRefusal::TriesBelowFloor { .. } => CKR_PIN_LOCKED,
+        RetryFloorRefusal::CounterUnreadable { .. } => CKR_DEVICE_ERROR,
     }
 }
 
@@ -1966,11 +1986,12 @@ fn clear_positive(pin_cache: &Arc<Mutex<PinSafetyCache>>) {
 ///
 /// Mirrors [`card_sign`]'s proven chain: open the card, select the
 /// PKCS#15 application (reference-data commands are refused from MF
-/// context the same way VERIFY is), probe PIN1 and resolve the card's
-/// numbering in one counter-safe probe, hold the retry floor, read the
-/// PIN lengths the card accepts under that numbering, then run `CHANGE
-/// REFERENCE DATA` with the current + new PIN pair in one command -- no
-/// prior VERIFY is needed. The card is dropped before returning. On `Ok`
+/// context the same way VERIFY is), resolve the card's numbering with
+/// a counter-safe probe, read the PIN lengths the card accepts under
+/// that numbering, then run `CHANGE REFERENCE DATA` with the current +
+/// new PIN pair in one command -- no prior VERIFY is needed. The change
+/// reads PIN 1's counter and applies the retry floor itself before the
+/// command goes out. The card is dropped before returning. On `Ok`
 /// the card has reset the retry counter and cleared its PIN
 /// presentation, so the caller must refresh any cached PIN1.
 ///
@@ -1980,10 +2001,12 @@ fn clear_positive(pin_cache: &Arc<Mutex<PinSafetyCache>>) {
 ///
 /// # Errors
 /// [`CKR_PIN_INCORRECT`] when the current PIN is wrong,
-/// [`CKR_PIN_LOCKED`] when the slot is blocked,
+/// [`CKR_PIN_LOCKED`] when the slot is blocked or the retry floor
+/// refuses the change at two or one tries left,
 /// [`CKR_PIN_LEN_RANGE`] when the new PIN's length is outside the
 /// FINEID bounds or the lengths the card accepts,
-/// [`CKR_DEVICE_ERROR`] on any card / transport failure.
+/// [`CKR_DEVICE_ERROR`] on any card / transport failure, an unreadable
+/// counter among them.
 #[cfg(feature = "pin-change")]
 #[expect(
     clippy::redundant_pub_crate,
@@ -2005,13 +2028,12 @@ pub(super) fn card_change_pin1(
         card.select_pkcs15_application()
             .map_err(|_select_err| CKR_DEVICE_ERROR)?;
         // The empty-body VERIFY probe consumes no retry and resolves the
-        // numbering the length read and the change address. Apply the
-        // same retry floor as login and signing before CHANGE REFERENCE
-        // DATA.
-        let (scheme, status) = card
-            .pin1_status_and_scheme()
+        // numbering the length read and the change address. The change
+        // itself probes PIN 1's counter again and applies the retry
+        // floor before CHANGE REFERENCE DATA.
+        let scheme = card
+            .resolve_pin_reference_scheme()
             .map_err(|_probe_err| CKR_DEVICE_ERROR)?;
-        pin1_verify_guard(status)?;
         let curr_secret =
             refineid_auth::UnvalidatedSecret::from_owned_bytes(current_pin1.as_bytes().to_vec());
         let Ok(curr_pin) = refineid_auth::Pin1::reconstruct(curr_secret) else {
@@ -2036,10 +2058,10 @@ pub(super) fn card_change_pin1(
             .change_pin1(&lengths, curr_pin, new_pin)
             .map_err(|change_err| match change_err {
                 refineid_auth::AuthError::PinLength(_) => CKR_PIN_LEN_RANGE,
+                refineid_auth::AuthError::RetryFloor(refusal) => retry_floor_rv(refusal),
                 refineid_auth::AuthError::Transport(_)
                 | refineid_auth::AuthError::Outcome(_)
-                | refineid_auth::AuthError::Command(_)
-                | refineid_auth::AuthError::RetryFloor(_) => CKR_DEVICE_ERROR,
+                | refineid_auth::AuthError::Command(_) => CKR_DEVICE_ERROR,
             })?;
         match outcome {
             refineid_auth::ManageOutcome::Ok => Ok(()),
@@ -2068,7 +2090,7 @@ mod tests {
     use crate::ck::{CKR_DEVICE_ERROR, CKR_PIN_LOCKED};
 
     #[test]
-    fn pin1_verify_guard_serves_only_five_four_and_three_tries() {
+    fn pin1_verify_guard_refuses_the_last_two_tries_and_an_unreadable_counter() {
         let retries = |count| {
             PinRetries::from_nibble(count).expect("test retry count fits the status-word nibble")
         };
@@ -2084,11 +2106,11 @@ mod tests {
             pin1_verify_guard(PinStatus::Remaining(retries(1))),
             Err(CKR_PIN_LOCKED)
         );
-        assert_eq!(
-            pin1_verify_guard(PinStatus::Remaining(retries(0))),
-            Err(CKR_PIN_LOCKED)
-        );
-        assert_eq!(pin1_verify_guard(PinStatus::Locked), Err(CKR_PIN_LOCKED));
+        // At no tries left or blocked the VERIFY goes to the card, which
+        // answers blocked and spends nothing.
+        assert_eq!(pin1_verify_guard(PinStatus::Remaining(retries(0))), Ok(()));
+        assert_eq!(pin1_verify_guard(PinStatus::Locked), Ok(()));
+        assert_eq!(pin1_verify_guard(PinStatus::Verified), Ok(()));
         assert_eq!(pin1_verify_guard(PinStatus::NoInfo), Err(CKR_DEVICE_ERROR));
         assert_eq!(
             pin1_verify_guard(PinStatus::Other(StatusWord::from_bytes(0x6F, 0x00))),

@@ -46,7 +46,8 @@ use refineid_apdu::{
 };
 use refineid_auth::{
     FlooredCredential, ManageOutcome, PacePasswordKey, Pin1, Pin2, PinReferenceScheme, PinSlot,
-    PinStatus, Puk, RetryFloorRefusal, check_retry_floor, lowered_counter,
+    PinStatus, Puk, RetryFloorRefusal, VerifyOutcome, check_retry_floor, counter_after_verify,
+    lowered_counter,
 };
 use refineid_ber::{BerEncodeError, BerError, BerTag, BerTlv};
 use refineid_pkcs15::Pkcs15Error;
@@ -258,10 +259,15 @@ impl OpenedByPuk {
 /// The proof carries the one PIN 2 presentation the handshake made.
 /// It is spent once, by the qualified key it unlocks: PIN 2 is entered
 /// for every signature (FINEID S4-1 v4.2 sections 4.1 and 8.1.7), so a
-/// second signature on the same channel takes a fresh VERIFY.
+/// second signature on the same channel takes a fresh VERIFY inside the
+/// channel. For that VERIFY it keeps PIN 2's counter as the card last
+/// reported it: the `MSE:Set AT` answer the retry floor served, settled
+/// by every VERIFY's answer on the channel (see
+/// `refineid_auth::Pin2PaceChannel`).
 #[derive(Debug)]
 pub struct OpenedByPin2 {
     unspent: bool,
+    counter: PinStatus,
 }
 
 /// The PIN 2 presentation of a PACE session was already spent.
@@ -277,6 +283,16 @@ impl core::fmt::Display for Pin2PresentationSpent {
 impl core::error::Error for Pin2PresentationSpent {}
 
 impl OpenedByPin2 {
+    /// PIN 2's counter as last reported on the channel.
+    pub(crate) const fn counter(&self) -> PinStatus {
+        self.counter
+    }
+
+    /// Settle the record by the card's answer to a PIN 2 VERIFY.
+    pub(crate) const fn settle(&mut self, answer: VerifyOutcome) {
+        self.counter = counter_after_verify(self.counter, answer);
+    }
+
     /// Spend the session's PIN 2 presentation.
     pub(crate) const fn spend(&mut self) -> Result<(), Pin2PresentationSpent> {
         if self.unspent {
@@ -331,8 +347,11 @@ impl sealed::Sealed for Pin2 {
         Password::Pin2(self)
     }
 
-    fn opened_by(&self, _counter: Option<PinStatus>) -> OpenedByPin2 {
-        OpenedByPin2 { unspent: true }
+    fn opened_by(&self, counter: Option<PinStatus>) -> OpenedByPin2 {
+        OpenedByPin2 {
+            unspent: true,
+            counter: counter.unwrap_or(PinStatus::NoInfo),
+        }
     }
 }
 
@@ -510,8 +529,8 @@ pub enum PaceError<E> {
     /// domain parameter this crate implements.
     NoSupportedSuite,
     /// The retry floor refused the PIN or the PUK before any `GENERAL
-    /// AUTHENTICATE` was sent: the card reported two, one or no tries
-    /// left, or the credential blocked.
+    /// AUTHENTICATE` was sent: the card reported two or one tries left,
+    /// or no readable counter.
     RetryFloor(RetryFloorRefusal),
     /// The card reports the PIN or PUK password deactivated (BSI
     /// TR-03110-3 section B.14.1); nothing was sent after `MSE:Set AT`.
@@ -642,8 +661,9 @@ pub(crate) type ScalarSource<'a> = &'a mut dyn FnMut(&mut [u8]) -> Result<(), rn
 /// A wrong Card Access Number spends no counter and surfaces as a
 /// status-word or token-mismatch failure. A PIN or PUK password is
 /// checked against the retry floor before the first `GENERAL
-/// AUTHENTICATE`: at two, one or no tries left, or a blocked or
-/// deactivated credential, nothing further is sent. A wrong PIN surfaces
+/// AUTHENTICATE`: at two or one tries left, or a deactivated credential,
+/// nothing further is sent; at no tries left the handshake goes on and
+/// the card answers for itself. A wrong PIN surfaces
 /// as [`PaceError::WrongPin`] and a wrong PUK as [`PaceError::WrongPuk`],
 /// each with the tries the card reports left. A session the PUK opened is
 /// a `PaceSession<OpenedByPuk>`, the channel the PIN resets of
@@ -1769,15 +1789,12 @@ mod tests {
     }
 
     #[test]
-    fn the_floor_refuses_a_blocked_pin_and_sends_nothing_further() {
+    fn the_floor_lets_the_card_answer_a_blocked_pin() {
+        // A blocked PIN is the card's to refuse, at no cost: the
+        // handshake goes on past `MSE:Set AT` like it does for the PUK.
         let (exchanges, result) = pin1_run_with_mse_status(counter(0));
-        assert_eq!(exchanges, EXCHANGES_THROUGH_MSE);
-        assert!(matches!(
-            result,
-            Err(PaceError::RetryFloor(RetryFloorRefusal::Blocked {
-                credential: FlooredCredential::Pin1,
-            }))
-        ));
+        assert_eq!(exchanges, EXCHANGES_THROUGH_TOKENS);
+        assert!(result.is_ok(), "the card answers for itself");
     }
 
     #[test]

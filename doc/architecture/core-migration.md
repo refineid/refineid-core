@@ -138,8 +138,10 @@ The fifth slice admits PIN verification in `refineid-auth`:
 - the counter-safe status probe reads the retry state without spending a
   counter, on the plain path with no credential;
 - the typed outcomes and status-word classifiers, and the retry floor
-  every surface stops at: a PIN 1 or PIN 2 attempt is served only at
-  five, four or three tries left.
+  the VERIFY itself applies to the probe it sends first: a PIN 1 or
+  PIN 2 attempt is refused at two or one tries left or an unreadable
+  counter, and sent otherwise, the card answering for itself at zero or
+  blocked.
 
 VERIFY is retry-consuming: the classifiers, the credential-command wire,
 and the retry-risk policy are covered by scripted-transport and unit
@@ -373,7 +375,7 @@ S1 v4.0, organizational cards, section 2.1) over NIST curves:
   `check_retry_floor` decides before the first `GENERAL AUTHENTICATE`; a
   counter answer to a later round is a typed wrong PIN;
 - the PUK is a fourth PACE password, under the organization numbering's
-  PUK reference, floored by the PUK's last-tries rule (served at no
+  PUK reference, floored by the same rule as the PINs (served at no
   tries left, where the card answers for itself) and reported as a typed
   wrong PUK;
   the channel it opens, and the one PIN 1 opens, carry the counter the

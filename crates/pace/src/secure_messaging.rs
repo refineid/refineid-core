@@ -36,7 +36,9 @@ use refineid_apdu::{
     ApduClass, CardTransport, CommandApdu, CommandHeader, CredentialCommand, ResponseApdu,
     StatusWord, TransportErrorExt, TransportErrorKind, TransportOutcome,
 };
-use refineid_auth::{ManageOutcome, Pin1PaceChannel, PinStatus, PukPaceChannel};
+use refineid_auth::{
+    ManageOutcome, Pin1PaceChannel, Pin2PaceChannel, PinStatus, PukPaceChannel, VerifyOutcome,
+};
 use refineid_ber::BerTlvIter;
 
 use crate::crypto::container::{AesCbc, Ciphertext};
@@ -516,6 +518,19 @@ impl<T: CardTransport> PukPaceChannel for SmTransport<T, OpenedByPuk> {
 
     fn lower_puk_counter(&mut self, answer: ManageOutcome) {
         self.opened_by.lower(answer);
+    }
+}
+
+/// The channel only a PACE handshake with PIN 2 opens: the PIN 2
+/// presentation of `refineid_auth::Pin2PaceChannelOps` runs on it,
+/// floored on this record and never on a probe over secure messaging.
+impl<T: CardTransport> Pin2PaceChannel for SmTransport<T, OpenedByPin2> {
+    fn pin2_counter(&self) -> PinStatus {
+        self.opened_by.counter()
+    }
+
+    fn settle_pin2_counter(&mut self, answer: VerifyOutcome) {
+        self.opened_by.settle(answer);
     }
 }
 

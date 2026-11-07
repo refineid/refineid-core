@@ -13,6 +13,7 @@
 // limitations under the License.
 
 //! PIN management on channels PACE opened with the PUK and with PIN 1,
+//! and the PIN 2 presentation on a channel PACE opened with PIN 2,
 //! over the real handshake and secure-messaging layer against the
 //! synthetic organizational card. The card side recovers every protected
 //! command, so the tests pin the plain wire the card received, assembled
@@ -26,12 +27,13 @@ use refineid_auth::manage::{
 use refineid_auth::verify::{VERIFY_INS, VERIFY_P1};
 use refineid_auth::{
     AuthError, CardPinLengths, ChannelProof, FlooredCredential, ManageOutcome, Pin1,
-    Pin1PaceChannel as _, Pin1PaceChannelOps as _, Pin2, PinReferenceScheme, PinSlot, PinStatus,
-    Puk, PukPaceChannel as _, PukPaceChannelOps as _, RetryFloorRefusal, UnvalidatedSecret,
+    Pin1PaceChannel as _, Pin1PaceChannelOps as _, Pin2, Pin2PaceChannel as _,
+    Pin2PaceChannelOps as _, PinReferenceScheme, PinSlot, PinStatus, Puk, PukPaceChannel as _,
+    PukPaceChannelOps as _, RetryFloorRefusal, UnvalidatedSecret, VerifyOutcome,
 };
 
 use crate::testkit::{OrganizationalCard, organizational_card_access};
-use crate::{OpenedByPin1, OpenedByPuk, SmTransport, run_pace};
+use crate::{OpenedByPin1, OpenedByPin2, OpenedByPuk, SmTransport, run_pace};
 
 /// A synthetic PUK, eight ASCII digits.
 const SYNTHETIC_PUK: &[u8] = b"31415926";
@@ -41,6 +43,11 @@ const SYNTHETIC_PIN1: &[u8] = b"2718";
 const NEW_PIN1: &[u8] = b"161803";
 /// A synthetic new PIN 2.
 const NEW_PIN2: &[u8] = b"141421";
+/// A synthetic PIN 2, the one PACE opened the PIN 2 channel with.
+const SYNTHETIC_PIN2: &[u8] = b"173205";
+/// A PIN's initial tries on the organizational card (FINEID S4-2 v4.0
+/// section 4.3).
+const PIN_INITIAL_TRIES: u8 = 5;
 /// A PIN 2 the role type carries but shorter than the FINEID PIN 2
 /// minimum a card that lists no length is held to (FINEID S4-1 v4.2
 /// section 4.1).
@@ -163,6 +170,119 @@ fn pin1_channel_answering(
     )
     .expect("the synthetic card accepts PIN 1");
     SmTransport::new(card, session)
+}
+
+fn pin2_channel_answering(
+    mse: StatusWord,
+    answers: Vec<ResponseApdu>,
+) -> SmTransport<OrganizationalCard, OpenedByPin2> {
+    let mut card = OrganizationalCard::new(
+        PinReferenceScheme::Organizational.reference(PinSlot::Pin2),
+        SYNTHETIC_PIN2,
+        answers,
+    )
+    .answering_mse_with(mse);
+    let session = run_pace(
+        &mut card,
+        &organizational_card_access(),
+        &pin2(SYNTHETIC_PIN2),
+    )
+    .expect("the synthetic card accepts PIN 2");
+    SmTransport::new(card, session)
+}
+
+fn verify_pin2_wire() -> Vec<u8> {
+    plain(
+        VERIFY_INS,
+        VERIFY_P1,
+        PinReferenceScheme::Organizational.reference(PinSlot::Pin2),
+        &[SYNTHETIC_PIN2],
+    )
+}
+
+#[test]
+fn a_pin2_channel_starts_from_the_mse_answer() {
+    let channel = pin2_channel_answering(StatusWord::Success, Vec::new());
+    assert_eq!(
+        channel.pin2_counter(),
+        PinStatus::Remaining(tries(PIN_INITIAL_TRIES))
+    );
+    let channel = pin2_channel_answering(counter(TRIES_AT_FLOOR), Vec::new());
+    assert_eq!(
+        channel.pin2_counter(),
+        PinStatus::Remaining(tries(TRIES_AT_FLOOR))
+    );
+}
+
+#[test]
+fn presenting_pin2_again_sends_the_verify_alone_and_an_accepted_one_leaves_pin2_verified() {
+    let mut channel =
+        pin2_channel_answering(counter(TRIES_AT_FLOOR), vec![answer(StatusWord::Success)]);
+    let outcome = channel
+        .verify_pin2_after_pin2_pace(pin2(SYNTHETIC_PIN2))
+        .expect("served at the floor");
+    assert_eq!(outcome, VerifyOutcome::Ok);
+    assert_eq!(channel.pin2_counter(), PinStatus::Verified);
+    let card = channel.into_inner();
+    assert_eq!(
+        card.protected_commands(),
+        [verify_pin2_wire()],
+        "the VERIFY alone: no counter-safe probe over the channel"
+    );
+    assert_eq!(card.credential_commands(), 1);
+}
+
+#[test]
+fn a_refused_pin2_lowers_the_record_and_the_floor_then_refuses_with_nothing_sent() {
+    let mut channel = pin2_channel_answering(
+        counter(TRIES_AT_FLOOR),
+        vec![answer(counter(TRIES_BELOW_FLOOR))],
+    );
+    let outcome = channel
+        .verify_pin2_after_pin2_pace(pin2(SYNTHETIC_PIN2))
+        .expect("sent");
+    assert_eq!(
+        outcome,
+        VerifyOutcome::WrongPin {
+            retries_left: tries(TRIES_BELOW_FLOOR)
+        }
+    );
+    assert_eq!(
+        channel.pin2_counter(),
+        PinStatus::Remaining(tries(TRIES_BELOW_FLOOR))
+    );
+    let refused = channel.verify_pin2_after_pin2_pace(pin2(SYNTHETIC_PIN2));
+    assert!(matches!(
+        refused,
+        Err(AuthError::RetryFloor(RetryFloorRefusal::TriesBelowFloor {
+            credential: FlooredCredential::Pin2,
+            remaining,
+        })) if remaining.get() == TRIES_BELOW_FLOOR
+    ));
+    let card = channel.into_inner();
+    assert_eq!(card.protected_commands(), [verify_pin2_wire()]);
+}
+
+#[test]
+fn a_blocked_answer_to_pin2_ends_presentations_on_the_channel_at_the_card_s_word() {
+    // The record reads blocked, which the floor serves: the card is the
+    // one to refuse, and spends nothing doing so.
+    let mut channel = pin2_channel_answering(
+        counter(TRIES_AT_FLOOR),
+        vec![
+            answer(StatusWord::AuthenticationBlocked),
+            answer(StatusWord::AuthenticationBlocked),
+        ],
+    );
+    let first = channel
+        .verify_pin2_after_pin2_pace(pin2(SYNTHETIC_PIN2))
+        .expect("sent");
+    assert_eq!(first, VerifyOutcome::Locked);
+    assert_eq!(channel.pin2_counter(), PinStatus::Locked);
+    let second = channel
+        .verify_pin2_after_pin2_pace(pin2(SYNTHETIC_PIN2))
+        .expect("the card answers for itself");
+    assert_eq!(second, VerifyOutcome::Locked);
 }
 
 #[test]

@@ -108,6 +108,7 @@ not stated, so each operation takes `ChannelProof`, named at every call:
 | --- | --- | --- | --- |
 | `reset_pin1_after_puk_pace`, `reset_pin2_after_puk_pace` | `OpenedByPuk` | RESET RETRY COUNTER with the new PIN only | VERIFY the PUK (`12`), then the same reset |
 | `change_pin1_after_pin1_pace` | `OpenedByPin1` | RESET RETRY COUNTER with the new PIN only | CHANGE REFERENCE DATA with the current and new PIN |
+| `qualified_key_after_pin2_pace`, `unlock_qualified_key_after_pin2_pace` (`refineid-sign`) | `OpenedByPin2` | the qualified key once, on the handshake's presentation | VERIFY PIN 2 (`04`) in DF.ESIGN for every later signature, floored on the channel's record |
 
 `PaceHandshake` presents no credential and spends no try; a card that
 does not count the handshake answers it with a refusal such as `6982`.
@@ -143,11 +144,11 @@ answers with the PIN's state before any try is spent (BSI TR-03110-3
 | `63C4`, `63C3` | four or three tries left | served |
 | `63C2` | two tries left | refused |
 | `63C1` | one try left; the PIN is suspended | refused |
-| `63C0` | no tries left; the credential is blocked | refused for a PIN; served for the PUK, which the card then answers for itself |
+| `63C0` | no tries left; the credential is blocked | served; the card answers for itself and spends nothing |
 | `6283` | the PIN is deactivated | refused |
 
 The rule is `check_retry_floor` from `refineid-auth`, the one floor
-every surface applies, with the PUK's own last-tries arm (see
+every credential follows (see
 [credential custody](../security/credential-custody.md)). On a refusal
 nothing after `MSE:Set AT` is sent. A `63CX` answer to a `GENERAL
 AUTHENTICATE` is a wrong PIN or a wrong PUK, reported with the tries

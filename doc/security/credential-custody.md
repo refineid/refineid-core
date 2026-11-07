@@ -28,32 +28,37 @@ filling it; that is still process memory, not storage.
 ## The retry floor: never the software that locks the card
 
 RefineID never spends an attempt that could block the card. Before any
-command that can spend a PIN 1, PIN 2 or PUK try -- VERIFY, CHANGE
-REFERENCE DATA presenting the current PIN, or RESET RETRY COUNTER and
-the organizational card's PUK VERIFY presenting the PUK -- every surface
-reads the card's tries left for that credential without spending one and
-applies one rule, `check_retry_floor` in `refineid-auth`:
+command that can spend a PIN 1, PIN 2, PUK or activation-code try --
+VERIFY, CHANGE REFERENCE DATA presenting the current PIN, or RESET
+RETRY COUNTER and the organizational card's PUK VERIFY presenting the
+PUK -- the primitive in `refineid-auth` that sends it reads the card's
+tries left for that credential without spending one and applies one
+rule, `check_retry_floor`, the same for every credential. The
+primitives enforce it themselves, so no caller can spend a try by
+mistake; a caller that has read the counter for a purpose of its own
+applies the same rule earlier, to refuse before it asks for the entry.
 
-- **Served**: five, four or three tries left, or PIN 1 or PIN 2 already
-  verified in the card's current security context.
-- **Refused**: two, one or no tries left, a blocked credential, and any
-  answer that carries no readable count. Nothing is sent, and the refusal
-  names the credential and the tries left, never candidate credential
-  data. RAPP answers a PIN refusal as `retry_floor` (RAPP v26.11.2
-  section 10.2).
-- **The PUK has its own floor: the last tries.** FINEID S1 v4.2 leaves
-  the PUK's try limit to card personalization; RefineID presents the
-  PUK -- to unblock a PIN, or as the activation PIN on a card that ships
-  with blocked PINs -- at five, four, three or zero PUK tries left, and
-  at a PUK the card reports blocked. It refuses at two or one tries
-  left, and at a counter it cannot read; a PUK the card reports verified
-  carries no count and is refused. At zero tries, or blocked, the
-  command goes to the card: the card answers for itself and spends
-  nothing, and RefineID cannot know whether the code in the holder's
-  hand is a PUK or an activation code, so it never closes a recovery
-  the card would allow. A PACE handshake with the PUK or a PIN as the
-  password is a presentation too: the `MSE:Set AT` answer is the
-  counter, read before the first `GENERAL AUTHENTICATE`. On the channel
+- **Refused**: two or one tries left, and any answer that carries no
+  readable count -- a status with no counter, a count above five, and
+  a PUK the card reports verified, which carries no count of the try a
+  wrong PUK would spend. Nothing is sent, and the refusal names the
+  credential and the tries left, never candidate credential data. RAPP
+  answers a PIN refusal as `retry_floor` (RAPP v26.11.2 section 10.2).
+- **Sent**: five, four or three tries left, and PIN 1 or PIN 2 reported
+  verified in the card's current security context. Sent also at no
+  tries left and at a credential the card reports blocked: the card
+  answers for itself and spends nothing, and RefineID cannot know
+  whether the code in the holder's hand is a PUK or an activation code,
+  so it never closes a recovery the card would allow. The blocked
+  answer is the card's, reported as it came.
+- **The PUK is read on the same scale.** FINEID S1 v4.2 leaves the
+  PUK's try limit to card personalization; RefineID presents the PUK --
+  to unblock a PIN, or as the activation PIN on a card that ships with
+  blocked PINs -- under the rule above, on the PUK's own counter,
+  whatever the target PIN's counter reads. A PACE handshake with the
+  PUK or a PIN as the password is a presentation too: the `MSE:Set AT`
+  answer is the counter, read before the first `GENERAL AUTHENTICATE`.
+  On the channel
   it opens, a further presentation of the same credential is floored on
   the channel's record of that answer, lowered by every later refusal
   and never raised (see [PACE](../reference/pace.md)). A blocked PUK

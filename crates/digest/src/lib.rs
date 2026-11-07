@@ -28,7 +28,9 @@
 //! names the SHA-1/SHA-2 family for callers that receive the algorithm as a
 //! string and need its digest length. The digest bytes themselves are not
 //! hand-rolled: `of` delegates to the `sha2` crate; the wrapper adds only
-//! the name and the length contract.
+//! the name and the length contract. [`Sha1`] and [`Md5`] exist for
+//! legacy verification and for lookup keys other software fixes, never
+//! for a decision this software takes.
 
 use sha2::Digest as _;
 
@@ -42,6 +44,8 @@ pub const SHA256_LEN: usize = 32;
 pub const SHA384_LEN: usize = 48;
 /// SHA-512 digest length in bytes (FIPS 180-4 section 1: a 512-bit digest).
 pub const SHA512_LEN: usize = 64;
+/// MD5 digest length in bytes (RFC 1321 section 3.5: a 128-bit digest).
+pub const MD5_LEN: usize = 16;
 
 /// A SHA-1 digest value.
 ///
@@ -81,6 +85,51 @@ impl Sha1 {
     /// Consume the value and return the owned digest bytes.
     #[must_use]
     pub const fn into_bytes(self) -> [u8; SHA1_LEN] {
+        self.0
+    }
+}
+
+/// An MD5 digest value.
+///
+/// Exactly [`MD5_LEN`] bytes, bound to the algorithm by its type. MD5 is
+/// broken as a cryptographic hash and exists here for one lookup key
+/// only: the `CKA_NSS_CERT_MD5_HASH` attribute NSS reads from and writes
+/// on every trust object (NSS `lib/dev/devutil.c` and `devtoken.c`).
+/// Nothing here signs, verifies, pins or decides trust with it. The
+/// field is private: a value exists only through [`Md5::of`] (a live
+/// digest) or [`Md5::from_bytes`] (a caller-asserted precomputed
+/// digest).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Md5([u8; MD5_LEN]);
+
+impl Md5 {
+    /// Compute the MD5 digest of `data` with the `md-5` crate.
+    #[must_use]
+    pub fn of(data: &[u8]) -> Self {
+        let out = md5::Md5::digest(data);
+        let mut bytes = [0_u8; MD5_LEN];
+        bytes.copy_from_slice(&out);
+        Self(bytes)
+    }
+
+    /// Wrap a precomputed MD5 digest.
+    ///
+    /// The caller asserts the bytes are an MD5 digest; the constructor
+    /// cannot verify that without the original message.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; MD5_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    /// Borrow the digest bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; MD5_LEN] {
+        &self.0
+    }
+
+    /// Consume the value and return the owned digest bytes.
+    #[must_use]
+    pub const fn into_bytes(self) -> [u8; MD5_LEN] {
         self.0
     }
 }

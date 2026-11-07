@@ -19,3 +19,5 @@ workspace = true
 sha2.workspace = true
 # Verification-only legacy digests (older CSCA self-signatures).
 sha1.workspace = true
+# Lookup-key-only legacy digest (the NSS trust-object MD5 attribute).
+md-5.workspace = true

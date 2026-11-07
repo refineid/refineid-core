@@ -164,6 +164,16 @@ before and the correction made the core better.
   address and HTTPS license URLs; shell scripts carry the one-line form
   under the shebang.
 
+Push over HTTPS. Git opens the connection to the remote before the
+pre-push gate runs, and a gate that takes longer than about ten minutes
+lets GitHub drop an idle SSH connection, so the push fails after the
+gate passed. Every RefineID clone on the maintainer's machines therefore
+carries an HTTPS push URL (`git remote set-url --push origin
+https://github.com/refineid/<repo>.git`, credentials from `gh auth
+setup-git`) while fetching stays over SSH. If a push reports a broken
+pipe or "failed to push some refs" right after "pre-push gates passed",
+this is the cause; do not answer it by bypassing the hook.
+
 ## Worktree policy
 
 - Reading does not require a worktree; writing does. The main checkout is

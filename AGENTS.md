@@ -18,6 +18,8 @@ may predate its own review:
   dependence with reason, no ducks at the border.
 - [doc/security/credential-custody.md](doc/security/credential-custody.md)
   -- how secrets move.
+- [doc/security/certificate-custody.md](doc/security/certificate-custody.md)
+  -- what is kept of the card's certificates, where, and for how long.
 - [doc/architecture/case-study-refinement-types-vec-insert.md](doc/architecture/case-study-refinement-types-vec-insert.md)
   -- case study: why `<alloc::vec::Vec>::insert` is bad code, progress and preservation,
   and refinement typing across collections.

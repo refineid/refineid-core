@@ -1,0 +1,555 @@
+/*
+ * Copyright 2026 Petri Koistinen
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/*
+ * Symbolic model of RAPP v26.11.2 operational sessions and operations
+ * (doc/protocols/rapp-v26.11.2.md, "the spec": §2.2.1, §4.3 item 5, §4.5,
+ * §4.6, §6.3, §7, §8, §9, §11) for Tamarin. A stored pairing is taken as
+ * given; rapp-pairing-v26.11.2.spthy and the ProVerif pairing files address
+ * the pairing itself. Its lemmas correspond to the ProVerif session files,
+ * plus the revocation property that needs mutable state. README.md lists
+ * every property with the STPA ids (doc/security/stpa-rapp.md) it checks.
+ *
+ * Roles: Alice the phone (Custodian), Bob the computer (Requester), Carol
+ * the cardholder and the card. Every transport is the Dolev-Yao network
+ * (In/Out). The phone, the card and Carol are honest; the phone reaches
+ * the card and Carol through linear facts, never the network. A computer
+ * is honest (Bob, who receives the code from Carol) or compromised (the
+ * code is given to the attacker, who runs the Requester role himself).
+ *
+ * Noise_KK keeps every Diffie-Hellman token of the spec in its order; the
+ * chaining key and handshake hash are modelled as hashes over the tokens
+ * and public values each step has mixed so far.
+ *
+ * The Custodian's record is a persistent fact holding its immutable values.
+ * With the flag REVOCATION (-D=REVOCATION) a linear CustodianAlive token is
+ * consumed and reproduced by sessions and card commands and consumed by
+ * revocation, and the revocation lemma is present. Without the flag the
+ * phone serves regardless of revocation, which only adds traces, so the
+ * other lemmas hold for the theory with the token as well.
+ *
+ * Secret scalars read from state facts carry the fresh sort (~), since
+ * only Fr values reach those facts. This bounds the Diffie-Hellman variants
+ * of each rule.
+ *
+ * An envelope's fields are its AEAD associated data and its plaintext is
+ * the constant 'empty'. AEAD binds both alike. The fields are values the
+ * attacker chose or can derive, a fresh ready nonce, or a card signature,
+ * which has no destructor in this theory, so no lemma rests on him reading
+ * them. This leaves the AEAD destructor no variable plaintext to reach,
+ * which completes the deconstructions.
+ */
+
+theory RAPP_v26_11_2
+begin
+
+builtins: diffie-hellman, hashing
+
+functions:
+  aead/4, aead_open/4,      // ChaCha20-Poly1305: key, nonce, ad, plaintext
+  mac/2,                    // HMAC-SHA-256 / HMAC-SHA-512
+  cardsig/2, spk/1,         // the card's private-key signature and public key
+  dom/1, cand/1             // transport profile to preamble domain and candidate_id (spec §2.2)
+
+equations:
+  aead_open(k, n, a, aead(k, n, a, m)) = m
+
+/* ------------------------------------------------------------------ */
+/* Restrictions                                                        */
+/* ------------------------------------------------------------------ */
+
+restriction Equality:
+  "All x y #i. Eq(x, y) @ i ==> x = y"
+
+restriction Inequality:
+  "All x y #i. Neq(x, y) @ i ==> not (x = y)"
+
+restriction OnlyOnce:
+  "All t #i #j. OnlyOnce(t) @ i & OnlyOnce(t) @ j ==> #i = #j"
+
+/* A received point or agreement that is the identity is rejected
+ * (spec §6.1.1, §6.1.3, §6.3 "Messages", §4.3 item 5). */
+restriction NotNeutral:
+  "All x #i. NotNeutral(x) @ i ==> not (x = DH_neutral)"
+
+/* ------------------------------------------------------------------ */
+/* The card, its PINs and the cardholder                               */
+/* ------------------------------------------------------------------ */
+
+/* A pairing Carol made with Bob: fresh pair-specific static keys on both
+ * ends, both records stored (spec §4.3 item 4). pair_id is derivable from
+ * the public pairing transcript. */
+#ifdef REVOCATION
+rule Honest_Pairing:
+  let grants = <'fi.refineid.authentication', 'fi.refineid.document-signing', 'fi.refineid.card-status'>
+      gh = h(<'grants', grants>)
+      pkc = 'g' ^ ~skc
+      pkr = 'g' ^ ~skr
+      ag = pkr ^ ~skc
+  in
+  [ Fr(~skc), Fr(~skr), Fr(~pid) ]
+--[ Drawn(~skc), Drawn(~skr)
+  , CustodianPairingActive('honest', ~pid, gh, pkc, pkr, 'bob')
+  , Secret('honest', mac(h(<'hkdf-extract', ~pid, ag>), 'rapp-routing'))
+  , Secret('honest', mac(h(<'hkdf-extract', ~pid, ag>), 'rapp-withdrawal'))
+  , Secret('honest', mac(h(<'hkdf-extract', ~pid, ag>), 'rapp-discovery-hint')) ]->
+  [ !CustodianPair('honest', ~pid, gh, grants, ~skc, pkr, 'bob')
+  , CustodianAlive(~pid)
+  , !CustodianAnnounce('honest', ~pid, ~skc, pkr)
+  , !RequesterPair(~pid, gh, ~skr, pkr, pkc)
+  , Out(<~pid, pkc, pkr>) ]
+#else
+rule Honest_Pairing:
+  let grants = <'fi.refineid.authentication', 'fi.refineid.document-signing', 'fi.refineid.card-status'>
+      gh = h(<'grants', grants>)
+      pkc = 'g' ^ ~skc
+      pkr = 'g' ^ ~skr
+      ag = pkr ^ ~skc
+  in
+  [ Fr(~skc), Fr(~skr), Fr(~pid) ]
+--[ Drawn(~skc), Drawn(~skr)
+  , CustodianPairingActive('honest', ~pid, gh, pkc, pkr, 'bob')
+  , Secret('honest', mac(h(<'hkdf-extract', ~pid, ag>), 'rapp-routing'))
+  , Secret('honest', mac(h(<'hkdf-extract', ~pid, ag>), 'rapp-withdrawal'))
+  , Secret('honest', mac(h(<'hkdf-extract', ~pid, ag>), 'rapp-discovery-hint')) ]->
+  [ !CustodianPair('honest', ~pid, gh, grants, ~skc, pkr, 'bob')
+  , !CustodianAnnounce('honest', ~pid, ~skc, pkr)
+  , !RequesterPair(~pid, gh, ~skr, pkr, pkc)
+  , Out(<~pid, pkc, pkr>) ]
+#endif
+
+/* A pairing a compromised computer made with Carol's code: the attacker
+ * chooses the Requester's static key and display name. */
+#ifdef REVOCATION
+rule Compromised_Pairing:
+  let grants = <'fi.refineid.authentication', 'fi.refineid.document-signing', 'fi.refineid.card-status'>
+      gh = h(<'grants', grants>)
+      pkc = 'g' ^ ~skc
+  in
+  [ Fr(~skc), Fr(~pid), In(<pkr, nm>) ]
+--[ Drawn(~skc), NotNeutral(pkr), NotNeutral(pkr ^ ~skc)
+  , CustodianPairingActive('leaked', ~pid, gh, pkc, pkr, nm) ]->
+  [ !CustodianPair('leaked', ~pid, gh, grants, ~skc, pkr, nm)
+  , CustodianAlive(~pid)
+  , !CustodianAnnounce('leaked', ~pid, ~skc, pkr)
+  , Out(<~pid, pkc>) ]
+#else
+rule Compromised_Pairing:
+  let grants = <'fi.refineid.authentication', 'fi.refineid.document-signing', 'fi.refineid.card-status'>
+      gh = h(<'grants', grants>)
+      pkc = 'g' ^ ~skc
+  in
+  [ Fr(~skc), Fr(~pid), In(<pkr, nm>) ]
+--[ Drawn(~skc), NotNeutral(pkr), NotNeutral(pkr ^ ~skc)
+  , CustodianPairingActive('leaked', ~pid, gh, pkc, pkr, nm) ]->
+  [ !CustodianPair('leaked', ~pid, gh, grants, ~skc, pkr, nm)
+  , !CustodianAnnounce('leaked', ~pid, ~skc, pkr)
+  , Out(<~pid, pkc>) ]
+#endif
+
+/* One card on the phone: authentication key, qualified signature key,
+ * PIN 1, PIN 2 and the CAN (spec §9, §11 item 4). The certificates are
+ * public; the fingerprint is that of the authentication certificate
+ * (spec §8.4 item 2). */
+rule Card_Setup:
+  [ Fr(~ska), Fr(~sks), Fr(~pin1), Fr(~pin2), Fr(~can) ]
+--[ OnlyOnce('card'), CardSecrets(~pin1, ~pin2, ~can) ]->
+  [ !Card(~ska, ~sks, ~pin1, ~pin2, ~can)
+  , !PhoneHolds(~pin1, ~can, h(<'cert-fp', spk(~ska)>))
+  , !CarolPin2(~pin2)
+  , Out(<spk(~ska), spk(~sks)>) ]
+
+/* Carol reads the prompt on the phone and enters PIN 2 there (spec §8.2
+ * item 3, §11 item 1). */
+rule Cardholder_Consents:
+  [ Prompt(nm, docname, d, ~r), !CarolPin2(pin2) ]
+--[ HolderConsents(nm, docname, d) ]->
+  [ PinEntered(~r, pin2) ]
+
+/* The card signs only with the right PIN after the secure channel the
+ * CAN opens. */
+rule Card_Sign_Auth:
+  [ CardCommand(can, pin1, 'browser_authenticate', d, ~rc), !Card(ska, sks, pin1, pin2, can) ]
+--[ CardSigns('browser_authenticate', d) ]->
+  [ CardAnswer(~rc, cardsig(ska, d)) ]
+
+rule Card_Sign_Qes:
+  [ CardCommand(can, pin2, 'sign_document', d, ~rc), !Card(ska, sks, pin1, pin2, can) ]
+--[ CardSigns('sign_document', d) ]->
+  [ CardAnswer(~rc, cardsig(sks, d)) ]
+
+
+/* Alice forgets the computer (spec §4.6): the record serves nothing from
+ * then on. */
+#ifdef REVOCATION
+rule Custodian_Revoke:
+  [ !CustodianPair(kind, pid, gh, grants, ~skc, pkr, nm)
+  , CustodianAlive(pid) ]
+--[ Revoked(pid) ]->
+  [ ]
+#endif
+
+
+rule Custodian_Withdrawn_Record:
+  let kwd = mac(h(<'hkdf-extract', pid, pkr ^ ~skc>), 'rapp-withdrawal')
+  in
+  [ !CustodianAnnounce(kind, pid, ~skc, pkr), In(<ins, ctr>) ]
+--[ CustodianWithdrew(kind, pid, ins, ctr) ]->
+  [ Out(<'withdrawn', ins, ctr, mac(kwd, <ins, ctr>)>) ]
+
+rule Custodian_Discovery_Hint:
+  let kdisc = mac(h(<'hkdf-extract', pid, pkr ^ ~skc>), 'rapp-discovery-hint')
+  in
+  [ !CustodianAnnounce(kind, pid, ~skc, pkr), In(epoch) ]
+-->
+  [ Out(<'session', epoch, mac(kdisc, epoch)>) ]
+
+rule Requester_Withdrawal_Check:
+  let kwd = mac(h(<'hkdf-extract', pid, pkc ^ ~skr>), 'rapp-withdrawal')
+  in
+  [ !RequesterPair(pid, gh, ~skr, pkr, pkc), In(<'withdrawn', ins, ctr, w>) ]
+--[ Eq(w, mac(kwd, <ins, ctr>)), RequesterVerifiedWithdrawal(pid, ins, ctr) ]->
+  [ ]
+
+
+/* Routing preamble and -> e, es, ss (Requester). */
+rule Requester_Session_Start:
+  let kroute = mac(h(<'hkdf-extract', pid, pkc ^ ~skr>), 'rapp-routing')
+      pro = <'rapp-session', '26.11.2', 'kk', pid, gh, tp, pkr, pkc>
+      eip = 'g' ^ ~ei
+      k_es = h(<'kk-es', pro, eip, pkc ^ ~ei>)
+      k_ss = h(<'kk-ss', k_es, pkc ^ ~skr>)
+      t1 = aead(k_ss, '0', <pro, eip>, 'empty')
+  in
+  [ !RequesterPair(pid, gh, ~skr, pkr, pkc), In(tp), Fr(~rn), Fr(~ei) ]
+--[ Drawn(~ei) ]->
+  [ RequesterSession1(pid, gh, ~skr, pkr, pkc, tp, ~ei, k_ss, t1)
+  , Out(<dom(tp), 'session', ~rn, mac(kroute, <dom(tp), ~rn>)>)
+  , Out(<eip, t1>) ]
+
+/* Routing match, <- e, ee, se, session.ready and card.status (Custodian).
+ * A session reads the record, so a revoked pairing opens none. */
+#ifdef REVOCATION
+rule Custodian_Session:
+  let kroute = mac(h(<'hkdf-extract', pid, pkr ^ ~skc>), 'rapp-routing')
+      pkc = 'g' ^ ~skc
+      pro = <'rapp-session', '26.11.2', 'kk', pid, gh, tp, pkr, pkc>
+      k_es = h(<'kk-es', pro, ei, ei ^ ~skc>)
+      k_ss = h(<'kk-ss', k_es, pkr ^ ~skc>)
+      erp = 'g' ^ ~er
+      k_ee = h(<'kk-ee', k_ss, ei ^ ~er>)
+      k_se = h(<'kk-se', k_ee, pkr ^ ~er>)
+      t2 = aead(k_se, '0', <pro, ei, t1, erp>, 'empty')
+      krc = h(<'split-1', k_se>)
+      kcr = h(<'split-2', k_se>)
+      ssid = h(<'rapp-session-id', pro, ei, t1, erp, t2>)
+  in
+  [ !CustodianPair(kind, pid, gh, grants, ~skc, pkr, nm)
+  , CustodianAlive(pid)
+  , !PhoneHolds(pin1, can, fp)
+  , In(tp)
+  , In(<dom(tp), 'session', rn, tag>)
+  , In(<ei, t1>)
+  , Fr(~er), Fr(~rnonce) ]
+--[ Drawn(~er), Eq(tag, mac(kroute, <dom(tp), rn>)), NotNeutral(ei), NotNeutral(ei ^ ~skc), NotNeutral(ei ^ ~er)
+  , Eq(t1, aead(k_ss, '0', <pro, ei>, 'empty'))
+  , CustodianSessionReady(kind, pid, ssid)
+  , CustodianSentCardStatus(kind, pid, ssid, fp)
+  , Secret(kind, krc), Secret(kind, kcr) ]->
+  [ CustodianAlive(pid)
+  , CustodianAwaitHello(kind, pid, ssid, krc, kcr, grants, nm)
+  , Out(<erp, t2>)
+  , Out(aead(kcr, '0', <'session.ready', ssid, <'26.11.2', 'kk', tp, cand(tp), gh>, ~rnonce, 'alice'>, 'empty'))
+  , Out(aead(kcr, '1', <'card.status', ssid, 'present', 'no-reader', fp>, 'empty')) ]
+#else
+rule Custodian_Session:
+  let kroute = mac(h(<'hkdf-extract', pid, pkr ^ ~skc>), 'rapp-routing')
+      pkc = 'g' ^ ~skc
+      pro = <'rapp-session', '26.11.2', 'kk', pid, gh, tp, pkr, pkc>
+      k_es = h(<'kk-es', pro, ei, ei ^ ~skc>)
+      k_ss = h(<'kk-ss', k_es, pkr ^ ~skc>)
+      erp = 'g' ^ ~er
+      k_ee = h(<'kk-ee', k_ss, ei ^ ~er>)
+      k_se = h(<'kk-se', k_ee, pkr ^ ~er>)
+      t2 = aead(k_se, '0', <pro, ei, t1, erp>, 'empty')
+      krc = h(<'split-1', k_se>)
+      kcr = h(<'split-2', k_se>)
+      ssid = h(<'rapp-session-id', pro, ei, t1, erp, t2>)
+  in
+  [ !CustodianPair(kind, pid, gh, grants, ~skc, pkr, nm)
+  , !PhoneHolds(pin1, can, fp)
+  , In(tp)
+  , In(<dom(tp), 'session', rn, tag>)
+  , In(<ei, t1>)
+  , Fr(~er), Fr(~rnonce) ]
+--[ Drawn(~er), Eq(tag, mac(kroute, <dom(tp), rn>)), NotNeutral(ei), NotNeutral(ei ^ ~skc), NotNeutral(ei ^ ~er)
+  , Eq(t1, aead(k_ss, '0', <pro, ei>, 'empty'))
+  , CustodianSessionReady(kind, pid, ssid)
+  , CustodianSentCardStatus(kind, pid, ssid, fp)
+  , Secret(kind, krc), Secret(kind, kcr) ]->
+  [ CustodianAwaitHello(kind, pid, ssid, krc, kcr, grants, nm)
+  , Out(<erp, t2>)
+  , Out(aead(kcr, '0', <'session.ready', ssid, <'26.11.2', 'kk', tp, cand(tp), gh>, ~rnonce, 'alice'>, 'empty'))
+  , Out(aead(kcr, '1', <'card.status', ssid, 'present', 'no-reader', fp>, 'empty')) ]
+#endif
+
+/* <- received (Requester). */
+rule Requester_Session_Keys:
+  let pro = <'rapp-session', '26.11.2', 'kk', pid, gh, tp, pkr, pkc>
+      eip = 'g' ^ ~ei
+      k_ee = h(<'kk-ee', k_ss, erp ^ ~ei>)
+      k_se = h(<'kk-se', k_ee, erp ^ ~skr>)
+      krc = h(<'split-1', k_se>)
+      kcr = h(<'split-2', k_se>)
+      ssid = h(<'rapp-session-id', pro, eip, t1, erp, t2>)
+  in
+  [ RequesterSession1(pid, gh, ~skr, pkr, pkc, tp, ~ei, k_ss, t1), In(<erp, t2>) ]
+--[ NotNeutral(erp), NotNeutral(erp ^ ~ei), Eq(t2, aead(k_se, '0', <pro, eip, t1, erp>, 'empty')) ]->
+  [ RequesterSession2(pid, gh, tp, ssid, krc, kcr) ]
+
+/* session.ready with matching parameters, card.status, session.hello
+ * (spec §7.1 items 5, 6 and 12). */
+rule Requester_Session_Ready:
+  [ RequesterSession2(pid, gh, tp, ssid, krc, kcr)
+  , In(aead(kcr, '0', <'session.ready', ssid, <'26.11.2', 'kk', tp, cand(tp), gh>, rnonce, nmc>, 'empty'))
+  , In(aead(kcr, '1', <'card.status', ssid, present, reader, fp>, 'empty')) ]
+--[ RequesterSessionReady(pid, ssid)
+  , RequesterAcceptsCardStatus(pid, ssid, fp)
+  , SecretRequester(krc), SecretRequester(kcr) ]->
+  [ RequesterOpSlot(pid, ssid, krc, kcr, '1', '2')
+  , Out(aead(krc, '0', <'session.hello', ssid, 'bob'>, 'empty')) ]
+
+/* No operation is admitted before session.hello (spec §7.1 item 6). */
+rule Custodian_Session_Hello:
+  [ CustodianAwaitHello(kind, pid, ssid, krc, kcr, grants, nm)
+  , In(aead(krc, '0', <'session.hello', ssid, nm_now>, 'empty')) ]
+-->
+  [ CustodianOpSlot(kind, pid, ssid, krc, kcr, grants, nm, '1', '2', 'none') ]
+
+
+/* Bob sends a request with a fresh operation_id at the next sequence;
+ * profile, action, context and digest come from a local program. Two
+ * operations per session: request sequences 1 and 2, results 2 and 3. */
+rule Requester_Op_Send:
+  [ RequesterOpSlot(pid, ssid, krc, kcr, sq, rsq), Fr(~op), In(<pr, ac, cx, d>) ]
+--[ RequesterSendsOp(pid, ssid, ~op, pr, ac, cx, d) ]->
+  [ RequesterOpWait(pid, ssid, krc, kcr, sq, rsq, ~op)
+  , Out(aead(krc, sq, <'operation.request', ssid, ~op, pr, ac, cx, d>, 'empty')) ]
+
+rule Requester_Op_Result_1:
+  [ RequesterOpWait(pid, ssid, krc, kcr, '1', '2', op)
+  , In(aead(kcr, '2', <'operation.result', ssid, op, st, s>, 'empty')) ]
+--[ RequesterGetsResult(pid, ssid, op, s) ]->
+  [ RequesterOpSlot(pid, ssid, krc, kcr, '2', '3') ]
+
+rule Requester_Op_Result_2:
+  [ RequesterOpWait(pid, ssid, krc, kcr, '2', '3', op)
+  , In(aead(kcr, '3', <'operation.result', ssid, op, st, s>, 'empty')) ]
+--[ RequesterGetsResult(pid, ssid, op, s) ]->
+  [ RequesterAwaitClose(pid, ssid, kcr) ]
+
+rule Requester_Close:
+  [ RequesterAwaitClose(pid, ssid, kcr)
+  , In(aead(kcr, '4', <'session.close', ssid, reason>, 'empty')) ]
+--[ RequesterAcceptsClose(pid, ssid, reason) ]->
+  [ ]
+
+/* Alice receives a request at the expected sequence; an operation_id the
+ * session has seen is refused (spec §7.2 item 3, §8.1 item 1). */
+rule Custodian_Op_Receive:
+  [ CustodianOpSlot(kind, pid, ssid, krc, kcr, grants, nm, sq, rsq, last)
+  , In(aead(krc, sq, <'operation.request', ssid, op, pr, ac, cx, d>, 'empty')) ]
+--[ Neq(op, last) ]->
+  [ CustodianOpLive(kind, pid, ssid, krc, kcr, grants, nm, sq, rsq, op, pr, ac, cx, d) ]
+
+/* A qualified signature, granted by the pairing: Carol's PIN 2 on a
+ * prompt naming the paired computer and the document (spec §8.2 items 1
+ * and 3, §9.3, §11 item 1). */
+rule Custodian_Op_Prompt:
+  [ CustodianOpLive(kind, pid, ssid, krc, kcr, <ga, 'fi.refineid.document-signing', gs>, nm, sq, rsq, op,
+                    'fi.refineid.document-signing', 'sign_document', cx, d)
+  , Fr(~r) ]
+-->
+  [ CustodianOpPin(kind, pid, ssid, krc, kcr, <ga, 'fi.refineid.document-signing', gs>, nm, sq, rsq, op,
+                   'fi.refineid.document-signing', 'sign_document', cx, d, ~r)
+  , Prompt(nm, cx, d, ~r) ]
+
+/* The card is commanded while the record is held (CC-106). */
+#ifdef REVOCATION
+rule Custodian_Op_Command_Qes:
+  [ CustodianOpPin(kind, pid, ssid, krc, kcr, grants, nm, sq, rsq, op, pr, ac, cx, d, r)
+  , PinEntered(r, p)
+  , !CustodianPair(kind, pid, gh, grants, ~skc, pkr, nm)
+  , CustodianAlive(pid)
+  , !PhoneHolds(pin1, can, fp)
+  , Fr(~rc) ]
+--[ CustodianCommandsCard(kind, pid, ssid, op, nm, pr, ac, cx, d) ]->
+  [ CustodianAlive(pid)
+  , CustodianOpCard(kind, pid, ssid, krc, kcr, grants, nm, sq, rsq, op, ~rc)
+  , CardCommand(can, p, ac, d, ~rc) ]
+#else
+rule Custodian_Op_Command_Qes:
+  [ CustodianOpPin(kind, pid, ssid, krc, kcr, grants, nm, sq, rsq, op, pr, ac, cx, d, r)
+  , PinEntered(r, p)
+  , !CustodianPair(kind, pid, gh, grants, ~skc, pkr, nm)
+  , !PhoneHolds(pin1, can, fp)
+  , Fr(~rc) ]
+--[ CustodianCommandsCard(kind, pid, ssid, op, nm, pr, ac, cx, d) ]->
+  [ CustodianOpCard(kind, pid, ssid, krc, kcr, grants, nm, sq, rsq, op, ~rc)
+  , CardCommand(can, p, ac, d, ~rc) ]
+#endif
+
+/* A browser authentication, granted by the pairing, with the PIN 1 the
+ * phone holds in memory (spec §11 item 2, STPA R-4). */
+#ifdef REVOCATION
+rule Custodian_Op_Command_Auth:
+  [ CustodianOpLive(kind, pid, ssid, krc, kcr, <'fi.refineid.authentication', gd, gs>, nm, sq, rsq, op,
+                    'fi.refineid.authentication', 'browser_authenticate', cx, d)
+  , !CustodianPair(kind, pid, gh, <'fi.refineid.authentication', gd, gs>, ~skc, pkr, nm)
+  , CustodianAlive(pid)
+  , !PhoneHolds(pin1, can, fp)
+  , Fr(~rc) ]
+--[ CustodianCommandsCard(kind, pid, ssid, op, nm, 'fi.refineid.authentication', 'browser_authenticate', cx, d) ]->
+  [ CustodianAlive(pid)
+  , CustodianOpCard(kind, pid, ssid, krc, kcr, <'fi.refineid.authentication', gd, gs>, nm, sq, rsq, op, ~rc)
+  , CardCommand(can, pin1, 'browser_authenticate', d, ~rc) ]
+#else
+rule Custodian_Op_Command_Auth:
+  [ CustodianOpLive(kind, pid, ssid, krc, kcr, <'fi.refineid.authentication', gd, gs>, nm, sq, rsq, op,
+                    'fi.refineid.authentication', 'browser_authenticate', cx, d)
+  , !CustodianPair(kind, pid, gh, <'fi.refineid.authentication', gd, gs>, ~skc, pkr, nm)
+  , !PhoneHolds(pin1, can, fp)
+  , Fr(~rc) ]
+--[ CustodianCommandsCard(kind, pid, ssid, op, nm, 'fi.refineid.authentication', 'browser_authenticate', cx, d) ]->
+  [ CustodianOpCard(kind, pid, ssid, krc, kcr, <'fi.refineid.authentication', gd, gs>, nm, sq, rsq, op, ~rc)
+  , CardCommand(can, pin1, 'browser_authenticate', d, ~rc) ]
+#endif
+
+/* The result goes back at Alice's next sequence; the slot advances. */
+rule Custodian_Op_Result_1:
+  [ CustodianOpCard(kind, pid, ssid, krc, kcr, grants, nm, '1', '2', op, rc), CardAnswer(rc, s) ]
+--[ CustodianSentResult(kind, pid, ssid, op, s) ]->
+  [ CustodianOpSlot(kind, pid, ssid, krc, kcr, grants, nm, '2', '3', op)
+  , Out(aead(kcr, '2', <'operation.result', ssid, op, 'completed', s>, 'empty')) ]
+
+rule Custodian_Op_Result_2:
+  [ CustodianOpCard(kind, pid, ssid, krc, kcr, grants, nm, '2', '3', op, rc), CardAnswer(rc, s) ]
+--[ CustodianSentResult(kind, pid, ssid, op, s) ]->
+  [ CustodianCloseSlot(kind, pid, ssid, kcr)
+  , Out(aead(kcr, '3', <'operation.result', ssid, op, 'completed', s>, 'empty')) ]
+
+/* The close and its reason, any value (spec §7.1 item 7). */
+rule Custodian_Close:
+  [ CustodianCloseSlot(kind, pid, ssid, kcr), In(reason) ]
+--[ CustodianSentClose(kind, pid, ssid, reason) ]->
+  [ Out(aead(kcr, '4', <'session.close', ssid, reason>, 'empty')) ]
+
+/* ------------------------------------------------------------------ */
+/* Lemmas                                                              */
+/* ------------------------------------------------------------------ */
+
+/* The scalars honest rules draw and the code of an honest ceremony are
+ * never known to the attacker: none of them is ever sent. Later lemmas
+ * reuse these. */
+lemma scalars_secret [reuse]:
+  "All x #i. Drawn(x) @ i ==> not (Ex #j. K(x) @ j)"
+
+/* Sanity: an honest pairing, session and qualified signature can run. */
+lemma executable_signature:
+  exists-trace
+  "Ex pid ssid op nm cx d s #i #j.
+      CustodianCommandsCard('honest', pid, ssid, op, nm, 'fi.refineid.document-signing', 'sign_document', cx, d) @ i
+    & RequesterGetsResult(pid, ssid, op, s) @ j"
+
+/* (a) PIN 1, PIN 2 and the CAN never reach the wire (spec §11 item 4). */
+lemma pin1_secret:
+  "All p1 p2 c #i. CardSecrets(p1, p2, c) @ i ==> not (Ex #j. K(p1) @ j)"
+
+lemma pin2_secret:
+  "All p1 p2 c #i. CardSecrets(p1, p2, c) @ i ==> not (Ex #j. K(p2) @ j)"
+
+lemma can_secret:
+  "All p1 p2 c #i. CardSecrets(p1, p2, c) @ i ==> not (Ex #j. K(c) @ j)"
+
+/* (b) The pairing secret, static keys and keys of the static agreement
+ * of a pairing whose code Carol typed into Bob stay secret. */
+lemma custodian_keys_secret [reuse]:
+  "All x #i. Secret('honest', x) @ i ==> not (Ex #j. K(x) @ j)"
+
+lemma requester_keys_secret [reuse]:
+  "All x #i. SecretRequester(x) @ i ==> not (Ex #j. K(x) @ j)"
+
+/* Session handshake authenticates Alice to Bob. */
+lemma session_authentication:
+  "All pid ssid #i. RequesterSessionReady(pid, ssid) @ i
+  ==> Ex #j. CustodianSessionReady('honest', pid, ssid) @ j & j < i"
+
+/* (c) and (e) Injective agreement on the request. */
+lemma request_agreement_injective:
+  "All pid ssid op nm pr ac cx d #i.
+      CustodianCommandsCard('honest', pid, ssid, op, nm, pr, ac, cx, d) @ i
+  ==> (Ex #j. RequesterSendsOp(pid, ssid, op, pr, ac, cx, d) @ j & j < i)
+    & not (Ex nm2 #i2. CustodianCommandsCard('honest', pid, ssid, op, nm2, pr, ac, cx, d) @ i2 & not (#i2 = #i))"
+
+/* (d) No card command outside an active pairing. */
+lemma command_needs_active_pairing:
+  "All k pid ssid op nm pr ac cx d #i.
+      CustodianCommandsCard(k, pid, ssid, op, nm, pr, ac, cx, d) @ i
+  ==> Ex gh pkc pkr #j. CustodianPairingActive(k, pid, gh, pkc, pkr, nm) @ j & j < i"
+
+/* (d) The card signs only what the phone commanded. */
+lemma card_signs_only_commanded:
+  "All ac d #i. CardSigns(ac, d) @ i
+  ==> Ex k pid ssid op nm pr cx #j. CustodianCommandsCard(k, pid, ssid, op, nm, pr, ac, cx, d) @ j & j < i"
+
+/* (d) A signature Bob accepts is one Alice returned for that request. */
+lemma result_authentication:
+  "All pid ssid op s #i. RequesterGetsResult(pid, ssid, op, s) @ i
+  ==> Ex #j. CustodianSentResult('honest', pid, ssid, op, s) @ j & j < i"
+
+/* Consent: every qualified signature runs under Carol's PIN 2 entry on a
+ * prompt naming the stored computer name and the document. */
+lemma consent_for_qualified_signature:
+  "All k pid ssid op nm cx d #i.
+      CustodianCommandsCard(k, pid, ssid, op, nm, 'fi.refineid.document-signing', 'sign_document', cx, d) @ i
+  ==> (Ex #j. HolderConsents(nm, cx, d) @ j & j < i)"
+
+/* Card presence comes from Alice on the authenticated session. */
+lemma card_status_authentication:
+  "All pid ssid fp #i. RequesterAcceptsCardStatus(pid, ssid, fp) @ i
+  ==> Ex #j. CustodianSentCardStatus('honest', pid, ssid, fp) @ j & j < i"
+
+/* A close reason Bob acts on is one Alice sent on that session. */
+lemma close_authentication:
+  "All pid ssid r #i. RequesterAcceptsClose(pid, ssid, r) @ i
+  ==> Ex #j. CustodianSentClose('honest', pid, ssid, r) @ j & j < i"
+
+/* A withdrawn record Bob verifies came from Alice for that pairing,
+ * instance and counter (non-injective: spec §4.5 item 7). */
+lemma withdrawal_authentication:
+  "All pid ins ctr #i. RequesterVerifiedWithdrawal(pid, ins, ctr) @ i
+  ==> Ex #j. CustodianWithdrew('honest', pid, ins, ctr) @ j & j < i"
+
+#ifdef REVOCATION
+/* A pairing Alice revoked opens no session and commands the card for no
+ * request after the revocation (spec §4.6; STPA UCA-102, CC-106). */
+lemma no_service_after_revocation [use_induction]:
+  "All pid #r. Revoked(pid) @ r
+  ==> (not (Ex k ssid #j. CustodianSessionReady(k, pid, ssid) @ j & r < j))
+    & (not (Ex k ssid op nm pr ac cx d #j. CustodianCommandsCard(k, pid, ssid, op, nm, pr, ac, cx, d) @ j & r < j))"
+#endif
+
+end

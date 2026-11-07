@@ -28,7 +28,8 @@ Two symbolic (Dolev-Yao) models of the stamped protocol
 | [`rapp-session-secrecy-v26.11.2.pv`](rapp-session-secrecy-v26.11.2.pv) | ProVerif 2.05 | Sessions over stored pairings with one operation each, the card and Carol: secrecy of PIN 1, PIN 2, the CAN and the session keys; session authentication; card commands only on active pairings and only as commanded; card presence. |
 | [`rapp-session-requests-v26.11.2.pv`](rapp-session-requests-v26.11.2.pv) | ProVerif 2.05 | Sessions with two operations each and one abstract card command: injective agreement on requests. |
 | [`rapp-session-consent-v26.11.2.pv`](rapp-session-consent-v26.11.2.pv) | ProVerif 2.05 | Sessions with one operation each, the card and Carol, and the close: consent for qualified signatures; authenticity of results and close reasons. |
-| [`rapp-v26.11.2.spthy`](rapp-v26.11.2.spthy) | Tamarin 1.12 | The whole protocol in one model with the properties of the ProVerif files as lemmas, plus revocation, which needs mutable state. |
+| [`rapp-pairing-v26.11.2.spthy`](rapp-pairing-v26.11.2.spthy) | Tamarin 1.12 | The pairing: offer, CPace, Noise_XXpsk3 and the pairing channel, with the pairing lemmas. |
+| [`rapp-session-v26.11.2.spthy`](rapp-session-v26.11.2.spthy) | Tamarin 1.12 | Sessions and operations over stored pairings taken as given, the card and Carol, withdrawn records, and revocation, which needs mutable state. |
 
 The ProVerif model is split so that each part fits a small verification
 budget: four pairing files and three session files, one per property
@@ -163,6 +164,20 @@ beside them.
 - **Offer profiles.** The offer lists the three registered profiles
   (spec §9). Bob reads them from the unauthenticated bootstrap, so a
   forged offer is part of the model.
+- **Tamarin theories.** Secret scalars read from state facts carry the
+  fresh sort, since only `Fr` values reach those facts; this bounds the
+  Diffie-Hellman variants of each rule. A channel envelope's fields are
+  its AEAD associated data and its plaintext is a constant; the
+  Noise_XXpsk3 handshake still encrypts the two static public keys as its
+  plaintext. AEAD binds both alike,
+  and the fields are values the attacker chose or can derive, a fresh
+  ready nonce, or a card signature, which has no destructor in the theory,
+  so no lemma rests on him reading them. The Custodian's record is a
+  persistent fact. Revocation adds a linear token that sessions and card
+  commands consume and reproduce, present only with `-D=REVOCATION`;
+  without it the phone serves regardless of revocation, which only adds
+  traces. The session theory takes stored pairings as given, like the
+  ProVerif session files.
 - **ProVerif phases.** The ProVerif model hands each phase to the next
   through tables: the CPace PSK, the opened pairing channel, and the
   stored pairing record. This keeps the Horn-clause translation finite
@@ -180,29 +195,30 @@ In "Checked by", Ps is `rapp-pairing-secrecy-v26.11.2.pv`, Pg is
 `rapp-pairing-withdrawal-v26.11.2.pv`, Ss is
 `rapp-session-secrecy-v26.11.2.pv`, Sr is
 `rapp-session-requests-v26.11.2.pv`, Sc is
-`rapp-session-consent-v26.11.2.pv` and T is `rapp-v26.11.2.spthy`.
+`rapp-session-consent-v26.11.2.pv`, Tp is `rapp-pairing-v26.11.2.spthy`
+and Ts is `rapp-session-v26.11.2.spthy`.
 
 | # | Property | Checked by | Spec | STPA and state machine |
 | :--- | :--- | :--- | :--- | :--- |
-| a1 | PIN 1 is never known to the attacker, with honest and compromised computers paired. | Ss, T | §11 item 4, §10.2 | L-1, L-2, H-1, CC-66, INV-09 |
-| a2 | PIN 2 likewise. | Ss, T | §11 items 2 and 4 | L-1, L-2, L-5, H-1, CC-66, INV-09 |
-| a3 | The CAN likewise. | Ss, T | §11 item 4 | L-4, INV-09 |
-| b1 | The CPace PSK of an honest ceremony is secret, on both ends. | Ps, T | §6.1.3, §6.1.4 | H-1, H-4 |
-| b2 | The pair-specific static private keys of an honest pairing are secret. | Ps, T | §4.3 item 4 | H-1, H-4, UCA-102 |
-| b3 | The keys of the static agreement (`K_route`, `K_disc`, `K_wd`) are secret, so routing tags, discovery hints and withdrawal hints identify the pairing to its two ends only. | Ps, T | §2.2.1, §4.3 item 5, §4.5 item 1 | H-6, L-4, UCA-14 |
-| b4 | The session transport keys of an honest pairing are secret. | Ss, T | §6.3 | H-1, H-6 |
+| a1 | PIN 1 is never known to the attacker, with honest and compromised computers paired. | Ss, Ts | §11 item 4, §10.2 | L-1, L-2, H-1, CC-66, INV-09 |
+| a2 | PIN 2 likewise. | Ss, Ts | §11 items 2 and 4 | L-1, L-2, L-5, H-1, CC-66, INV-09 |
+| a3 | The CAN likewise. | Ss, Ts | §11 item 4 | L-4, INV-09 |
+| b1 | The CPace PSK of an honest ceremony is secret, on both ends. | Ps, Tp | §6.1.3, §6.1.4 | H-1, H-4 |
+| b2 | The pair-specific static private keys of an honest pairing are secret. | Ps, Tp, Ts | §4.3 item 4 | H-1, H-4, UCA-102 |
+| b3 | The keys of the static agreement (`K_route`, `K_disc`, `K_wd`) are secret, so routing tags, discovery hints and withdrawal hints identify the pairing to its two ends only. | Ps, Ts | §2.2.1, §4.3 item 5, §4.5 item 1 | H-6, L-4, UCA-14 |
+| b4 | The session transport keys of an honest pairing are secret. | Ss, Ts | §6.3 | H-1, H-6 |
 | b5 | Offline guessing: after any run the attacker cannot tell the code from a random value (`weaksecret`). | Pg | §3.3 "Guessing Bound", §12 | CC-107, Story 14 |
-| b6 | Pairing cannot complete without the code, and both ends agree. When Alice holds an honest pairing active, Bob stored that pairing (same `pair_id`, grants hash, both static keys, Bob's display name). When Bob holds it active, Alice stored it. | Pa, T | §3.3 item 5, §4.3 items 3 and 4 | H-4, CC-1, CC-119, CC-120, UCA-8, UCA-120 |
-| b7 | Session authentication: a session Bob holds ready is one that Alice opened for the same pairing. | Ss, T | §6.3, §7.1 items 5 and 6 | CC-4, UCA-102 |
-| c, e | Injective agreement on the request. Every card command Alice issues on an honest pairing's session answers one distinct request that Bob sent on that same session, with the same `operation_id`, profile, action, context and digest. A replayed, reflected or cross-session request obtains no second command. | Sr, T | §7.2 items 2 and 3, §8.1 item 1 | H-1, H-2, UCA-15, CC-104 |
-| d1 | No card command outside an active pairing, for any computer: the command belongs to a pairing that Alice stored and saw confirmed. | Ss, T | §4.3 item 4, §8.2 item 1 | CC-1, UCA-8, X-03, INV-01 |
-| d2 | The card signs only what Alice commanded. | Ss, T | §11 item 4 | H-1 |
-| d3 | A result Bob accepts is one that Alice returned for that request on that session. | Sc, T | §8.2 item 5 | H-3 |
-| f1 | Consent. Every qualified signature runs under Carol's PIN 2 entry on a prompt that named the paired computer by its stored display name and showed that request's document name and digest. In ProVerif the correspondence is injective: one entry per signature. | Sc, T | §8.2 item 3, §11 items 1 and 2 | L-1, L-5, H-1, CC-66, CC-75, CC-85, UCA-1, UCA-73, INV-03 |
-| f2 | Card presence comes from Alice on the authenticated session: a `card.status` that Bob accepts is one that Alice sent on that session. | Ss, T | §8.4 items 1 to 4 | H-3, CC-4, CC-60, UCA-16, UCA-63 |
-| f3 | A close reason Bob acts on (`pairing_revoked`, `service_withdrawn`, `card_unavailable` and the rest) is one that Alice sent on that session. | Sc, T | §4.5 item 6, §4.6 item 4, §7.1 item 7 | H-4, H-7, CC-2, CC-22, CC-114 |
-| f4 | A withdrawn record that Bob verifies was published by Alice for that pairing, instance and counter. The agreement is not injective: a replay inside the counter window is the limit that spec §4.5 item 7 accepts. | Pw, T | §4.5 items 1, 2, 6 and 7 | H-7, CC-114, UCA-112 |
-| f5 | Revocation. After Alice revokes a pairing, it opens no session and the card is commanded for no request of it. | T | §4.6 | UCA-102, CC-106, H-4 |
+| b6 | Pairing cannot complete without the code, and both ends agree. When Alice holds an honest pairing active, Bob stored that pairing (same `pair_id`, grants hash, both static keys, Bob's display name). When Bob holds it active, Alice stored it. | Pa, Tp | §3.3 item 5, §4.3 items 3 and 4 | H-4, CC-1, CC-119, CC-120, UCA-8, UCA-120 |
+| b7 | Session authentication: a session Bob holds ready is one that Alice opened for the same pairing. | Ss, Ts | §6.3, §7.1 items 5 and 6 | CC-4, UCA-102 |
+| c, e | Injective agreement on the request. Every card command Alice issues on an honest pairing's session answers one distinct request that Bob sent on that same session, with the same `operation_id`, profile, action, context and digest. A replayed, reflected or cross-session request obtains no second command. | Sr, Ts | §7.2 items 2 and 3, §8.1 item 1 | H-1, H-2, UCA-15, CC-104 |
+| d1 | No card command outside an active pairing, for any computer: the command belongs to a pairing that Alice stored and saw confirmed. | Ss, Ts | §4.3 item 4, §8.2 item 1 | CC-1, UCA-8, X-03, INV-01 |
+| d2 | The card signs only what Alice commanded. | Ss, Ts | §11 item 4 | H-1 |
+| d3 | A result Bob accepts is one that Alice returned for that request on that session. | Sc, Ts | §8.2 item 5 | H-3 |
+| f1 | Consent. Every qualified signature runs under Carol's PIN 2 entry on a prompt that named the paired computer by its stored display name and showed that request's document name and digest. In ProVerif the correspondence is injective: one entry per signature. | Sc, Ts | §8.2 item 3, §11 items 1 and 2 | L-1, L-5, H-1, CC-66, CC-75, CC-85, UCA-1, UCA-73, INV-03 |
+| f2 | Card presence comes from Alice on the authenticated session: a `card.status` that Bob accepts is one that Alice sent on that session. | Ss, Ts | §8.4 items 1 to 4 | H-3, CC-4, CC-60, UCA-16, UCA-63 |
+| f3 | A close reason Bob acts on (`pairing_revoked`, `service_withdrawn`, `card_unavailable` and the rest) is one that Alice sent on that session. | Sc, Ts | §4.5 item 6, §4.6 item 4, §7.1 item 7 | H-4, H-7, CC-2, CC-22, CC-114 |
+| f4 | A withdrawn record that Bob verifies was published by Alice for that pairing, instance and counter. The agreement is not injective: a replay inside the counter window is the limit that spec §4.5 item 7 accepts. | Pw, Ts | §4.5 items 1, 2, 6 and 7 | H-7, CC-114, UCA-112 |
+| f5 | Revocation. After Alice revokes a pairing, it opens no session and the card is commanded for no request of it. | Ts | §4.6 | UCA-102, CC-106, H-4 |
 
 The STPA record names no hazard for the PINs reaching the wire. Rule 1
 of [AGENTS.md](../../../AGENTS.md) and spec §11 item 4 state it, and
@@ -230,13 +246,13 @@ the guessing file reports `Weak secret code_w is true.`.
 ### Tamarin
 
 ```sh
-tamarin-prover --prove rapp-v26.11.2.spthy
+tamarin-prover --prove rapp-pairing-v26.11.2.spthy
+tamarin-prover --prove rapp-session-v26.11.2.spthy
+tamarin-prover -D=REVOCATION --prove=no_service_after_revocation rapp-session-v26.11.2.spthy
 ```
 
-Every lemma is expected to be reported `verified`, and
-`executable_signature` (an `exists-trace` sanity lemma) to find its
-trace. If the well-formedness check reports open chains from the AEAD
-destructor, rerun with `--auto-sources`.
+`--prove=<lemma>` proves one lemma. The revocation lemma and the
+revocation token exist only with `-D=REVOCATION`.
 
 ## Verification status
 
@@ -317,13 +333,54 @@ reported the same eight secrecy results above, all true. Its remaining
 queries were still saturating after more than three hours at about
 9.7 GiB, and its log ends there with no further result.
 
-### `rapp-v26.11.2.spthy`: no result
+### Tamarin
 
-A Tamarin 1.12 run on the same host loaded the theory and passed the
-derivation checks. After more than four and a half hours it had not
-printed a lemma result: Tamarin itself had used 8 s of CPU and its Maude
-child the rest, one core continuously. No lemma of this file has been
-verified or falsified.
+Tamarin 1.12 with Maude 3.5.1 on the same host, one run at a time, under
+`nice -n 10`, with `ulimit -v 16000000` and a timeout per run. "Out of
+memory" means Tamarin stopped at that limit.
+
+`rapp-pairing-v26.11.2.spthy`, one run of four lemmas, all wellformedness
+checks successful with the derivation check untimed: 34 s, peak
+1.72 GiB.
+
+| Lemma | Result |
+| :--- | :--- |
+| `scalars_secret` | verified (17 steps) |
+| `honest_code_secret` | verified (2 steps) |
+| `requester_psk_secret` | verified (141 steps) |
+| `custodian_psk_secret` | verified (72 steps) |
+| `pairing_agreement_requester` | no result: out of memory after 278 s |
+| `pairing_agreement_custodian` | no result: out of memory after 203 s |
+| `custodian_keys_secret`, `requester_keys_secret` | no result in this file: out of memory or 300 s timeout in the earlier single theory |
+
+`rapp-session-v26.11.2.spthy`, one run of eleven lemmas, derivation check
+untimed and successful: 13 s, peak 0.77 GiB; `pin1_secret` and
+`pin2_secret` in a second run: 13 s, peak 0.34 GiB.
+
+| Lemma | Result |
+| :--- | :--- |
+| `scalars_secret` | verified (12 steps) |
+| `pin1_secret`, `pin2_secret`, `can_secret` | verified (2 steps each) |
+| `custodian_keys_secret` | verified (42 steps) |
+| `requester_keys_secret` | verified (22 steps) |
+| `session_authentication` | verified (14 steps) |
+| `command_needs_active_pairing` | verified (22 steps) |
+| `card_signs_only_commanded` | verified (18 steps) |
+| `card_status_authentication` | verified (25 steps) |
+| `consent_for_qualified_signature` | verified (11 steps) |
+| `withdrawal_authentication` | verified (10 steps) |
+| `result_authentication` | no result: 300 s timeout |
+| `close_authentication` | no result: out of memory after 88 s |
+| `request_agreement_injective` | no result: out of memory after 297 s |
+| `no_service_after_revocation` (`-D=REVOCATION`) | no result: out of memory after 289 s |
+| `executable_signature` | no result: out of memory after 160 s in the earlier single theory |
+
+The single-theory Tamarin model these two files replace never reached a
+lemma. Its first run was stopped after 4 h 51 min, Tamarin having used
+8 s of CPU and Maude the rest. In a run that logged Maude's input and
+output, Maude's variant computation for the rule `Requester_XX_Msg3` had
+produced 4,924 variants and was still running when a five-minute limit
+ended it; the rules before it had 1 to 48 variants each.
 
 ### Reachability of the premises
 

@@ -2133,7 +2133,7 @@ mod tests {
         };
 
         const TEST_CA_1_DER: &[u8] =
-            include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+            include_bytes!("../test-certs/fineid-intermediate-01-citizen-g4e.der");
         let mut objects =
             super::TokenObjects::from_cert_der(TEST_CA_1_DER.to_vec(), super::KeyGate::Login)
                 .expect("token objects from cert der");
@@ -2236,9 +2236,9 @@ mod tests {
         const OUT_OF_BOUNDS_INDEX: usize = 99;
 
         const TEST_CA_1_DER: &[u8] =
-            include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+            include_bytes!("../test-certs/fineid-intermediate-01-citizen-g4e.der");
         const TEST_CA_2_DER: &[u8] =
-            include_bytes!("../ca-certs/fineid-intermediate-02-citizen-g4r.der");
+            include_bytes!("../test-certs/fineid-intermediate-02-citizen-g4r.der");
 
         let cert1 = OwnedCert::from_der(TEST_CA_1_DER).expect("valid cert1");
         let cert2 = OwnedCert::from_der(TEST_CA_2_DER).expect("valid cert2");
@@ -2271,7 +2271,7 @@ mod tests {
     #[test]
     fn persistent_ca_roundtrip_and_pruning() {
         const TEST_CA_1_DER: &[u8] =
-            include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+            include_bytes!("../test-certs/fineid-intermediate-01-citizen-g4e.der");
 
         let unique_name = format!("refineid-test-ca-cache-pkcs11-{}", std::process::id());
         let temp_dir = std::env::temp_dir().join(unique_name);
@@ -2328,7 +2328,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         const TEST_CA_1_DER: &[u8] =
-            include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+            include_bytes!("../test-certs/fineid-intermediate-01-citizen-g4e.der");
         // The permission bits of `st_mode`: owner, group and other rwx.
         const PERMISSION_BITS: u32 = 0o777;
 
@@ -2372,7 +2372,8 @@ mod tests {
         // Non-CA extension OID (2.5.29.20: CRL Number) DER OBJECT IDENTIFIER TLV
         const NON_CA_EXTENSION_OID_DER: &[u8] = b"\x06\x03\x55\x1d\x14";
 
-        const CA_DER: &[u8] = include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+        const CA_DER: &[u8] =
+            include_bytes!("../test-certs/fineid-intermediate-01-citizen-g4e.der");
         let mut leaf_der = CA_DER.to_vec();
         let pos = leaf_der
             .windows(BASIC_CONSTRAINTS_OID_DER.len())
@@ -2417,7 +2418,8 @@ mod tests {
         use spki::der::Encode as _;
         use spki::der::asn1::UtcTime;
 
-        const CA_DER: &[u8] = include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+        const CA_DER: &[u8] =
+            include_bytes!("../test-certs/fineid-intermediate-01-citizen-g4e.der");
         let parsed_fixture = OwnedCert::from_der(CA_DER).expect("valid fixture DER");
 
         // Dynamically encode the fixture's actual parsed notAfter as ASN.1 UTCTime TLV
@@ -2478,12 +2480,12 @@ mod tests {
     #[test]
     fn all_published_ca_fixtures_assert_ca_basic_constraints() {
         let fixtures: [&[u8]; 6] = [
-            include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der"),
-            include_bytes!("../ca-certs/fineid-intermediate-02-citizen-g4r.der"),
-            include_bytes!("../ca-certs/fineid-intermediate-00-citizen-g3.der"),
-            include_bytes!("../ca-certs/fineid-intermediate-03-organisation-g4r.der"),
-            include_bytes!("../ca-certs/dvv-gov-root-ca-g3-ecc.der"),
-            include_bytes!("../ca-certs/dvv-gov-root-ca-g3-rsa.der"),
+            include_bytes!("../test-certs/fineid-intermediate-01-citizen-g4e.der"),
+            include_bytes!("../test-certs/fineid-intermediate-02-citizen-g4r.der"),
+            include_bytes!("../test-certs/fineid-intermediate-00-citizen-g3.der"),
+            include_bytes!("../test-certs/fineid-intermediate-03-organisation-g4r.der"),
+            include_bytes!("../test-certs/dvv-gov-root-ca-g3-ecc.der"),
+            include_bytes!("../test-certs/dvv-gov-root-ca-g3-rsa.der"),
         ];
 
         for der in fixtures {
@@ -2507,7 +2509,7 @@ mod tests {
         assert_eq!(ObjectKind::Ca(1).handle(), super::OBJ_CA_BASE + 1);
 
         const TEST_CA_1_DER: &[u8] =
-            include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+            include_bytes!("../test-certs/fineid-intermediate-01-citizen-g4e.der");
         let objects =
             super::TokenObjects::from_cert_der(TEST_CA_1_DER.to_vec(), super::KeyGate::Login)
                 .expect("token objects from cert der");
@@ -2524,8 +2526,8 @@ mod tests {
     #[test]
     fn each_ca_certificate_has_one_trust_record_found_by_issuer_and_serial() {
         const CA_1_DER: &[u8] =
-            include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
-        const CA_2_DER: &[u8] = include_bytes!("../ca-certs/dvv-gov-root-ca-g3-ecc.der");
+            include_bytes!("../test-certs/fineid-intermediate-01-citizen-g4e.der");
+        const CA_2_DER: &[u8] = include_bytes!("../test-certs/dvv-gov-root-ca-g3-ecc.der");
         let mut objects =
             super::TokenObjects::from_cert_der(CA_1_DER.to_vec(), super::KeyGate::Login)
                 .expect("token objects from cert der");
@@ -2597,8 +2599,8 @@ mod tests {
             CKT_NSS_MUST_VERIFY_TRUST, CKT_NSS_TRUSTED_DELEGATOR,
         };
         const LEAF_DER: &[u8] =
-            include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
-        const ROOT_DER: &[u8] = include_bytes!("../ca-certs/dvv-gov-root-ca-g3-ecc.der");
+            include_bytes!("../test-certs/fineid-intermediate-01-citizen-g4e.der");
+        const ROOT_DER: &[u8] = include_bytes!("../test-certs/dvv-gov-root-ca-g3-ecc.der");
         let mut objects =
             super::TokenObjects::from_cert_der(LEAF_DER.to_vec(), super::KeyGate::Login)
                 .expect("token objects from cert der");
@@ -2680,7 +2682,8 @@ mod tests {
     /// are both reachable by handle and nothing beyond them exists.
     #[test]
     fn the_store_admits_no_more_than_its_handle_range() {
-        const CA_DER: &[u8] = include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+        const CA_DER: &[u8] =
+            include_bytes!("../test-certs/fineid-intermediate-01-citizen-g4e.der");
         let mut store = super::RefinedTrustStore::default();
         // Distinct DER per variant: the last byte of the signature value
         // differs, which parsing does not check.
@@ -2714,7 +2717,7 @@ mod tests {
     #[test]
     fn not_after_boundary_inclusivity() {
         const TEST_CA_1_DER: &[u8] =
-            include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+            include_bytes!("../test-certs/fineid-intermediate-01-citizen-g4e.der");
         let cert = OwnedCert::from_der(TEST_CA_1_DER).expect("valid cert");
         let view = cert.view();
         let not_before = view.not_before.unix_duration();
@@ -3001,7 +3004,7 @@ mod tests {
     #[test]
     fn the_key_gate_decides_whether_the_private_key_is_private() {
         const CERT_DER: &[u8] =
-            include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+            include_bytes!("../test-certs/fineid-intermediate-01-citizen-g4e.der");
         let card = super::TokenObjects::from_cert_der(CERT_DER.to_vec(), super::KeyGate::Login)
             .expect("parses");
         let phone = super::remote_token_objects(
@@ -3034,9 +3037,10 @@ mod tests {
     /// discovery.
     #[test]
     fn the_remote_key_follows_the_certificate() {
-        const EC_DER: &[u8] = include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+        const EC_DER: &[u8] =
+            include_bytes!("../test-certs/fineid-intermediate-01-citizen-g4e.der");
         const RSA_4096_DER: &[u8] =
-            include_bytes!("../ca-certs/fineid-intermediate-02-citizen-g4r.der");
+            include_bytes!("../test-certs/fineid-intermediate-02-citizen-g4r.der");
         const P256_DER: &[u8] = include_bytes!("../test-certs/p256-alpha.der");
         let ec = super::TokenObjects::from_cert_der(EC_DER.to_vec(), super::KeyGate::Device)
             .expect("parses");

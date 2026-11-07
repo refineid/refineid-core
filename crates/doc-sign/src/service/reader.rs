@@ -1338,7 +1338,7 @@ mod tests {
         const TRIES_AFTER_WRONG: u8 = 4;
         /// The certificate the card holds in every slot: a public root
         /// standing in for the card's own.
-        const CERTIFICATE: &[u8] = include_bytes!("../../trust-anchors/dvv-gov-root-ca-g3-rsa.der");
+        const CERTIFICATE: &[u8] = include_bytes!("../../test-vectors/dvv-gov-root-ca-g3-rsa.der");
         /// `TokenInfo.version` of the synthetic card.
         const TOKEN_INFO_VERSION: u8 = 0;
         /// The synthetic card's serial, and the one a swapped card has.

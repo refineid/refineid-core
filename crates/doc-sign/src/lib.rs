@@ -80,7 +80,6 @@ pub mod testkit;
 pub mod text;
 pub mod timestamp;
 pub mod trust;
-pub mod trust_roots;
 pub mod uri;
 pub mod validation;
 pub mod verification;

@@ -232,8 +232,18 @@ pub struct DocumentRequest {
     ///
     /// Costs a handful of network round trips at signing time and buys
     /// a signature that still checks when the responder is gone.
-    /// [`Self::archive`] always enables this operation too.
+    /// [`Self::archive`] always enables this operation too, and both
+    /// need [`Self::signer_anchors`].
     pub long_term: bool,
+    /// The DER certificates the signer's path may end at when
+    /// long-term material is collected: the issuing CA and root CA
+    /// read from the card (`EF.4336`, `EF.4334`) when one is present,
+    /// or the certificate-issuing anchors the EU trusted lists name
+    /// (`verification::TrustAnchors::from_trusted_lists`). The core
+    /// ships no root to fall back on, so a request for long-term
+    /// material with no anchor here is refused before the reader is
+    /// opened ([`MaterialError::NoTrustAnchor`]).
+    pub signer_anchors: Vec<Vec<u8>>,
     /// URLs of RFC 3161 Time Stamp Authorities, when the signature is
     /// to carry an attested time rather than a claimed one.
     ///
@@ -263,12 +273,19 @@ impl DocumentRequest {
     /// Reject an impossible requested level before opening a reader or
     /// asking for a PIN. Archive still normalizes to LT through
     /// [`Self::requires_long_term_material`]; this only catches missing
-    /// authorities and formats whose archive construction is absent.
+    /// authorities, missing signer anchors and formats whose archive
+    /// construction is absent.
     pub(crate) fn validate_signing_policy(&self) -> Result<(), SignErrorKind> {
         if self.requires_long_term_material() && self.timestamp_authorities.is_empty() {
             return Err(SignErrorKind::Timestamp(
                 "LT and LTA signatures need at least one timestamp authority".to_owned(),
             ));
+        }
+        if self.requires_long_term_material() && self.signer_anchors.is_empty() {
+            return Err(SignErrorKind::Material {
+                path: MaterialPath::Signer,
+                error: MaterialError::NoTrustAnchor,
+            });
         }
         if self.timestamp_credentials.is_some() {
             if self.timestamp_authorities.len() != 1 {
@@ -608,7 +625,8 @@ impl core::error::Error for SignErrorKind {}
 /// that lists each refusal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MaterialPath {
-    /// The signer certificate's path, up to a pinned root.
+    /// The signer certificate's path, up to one of the request's
+    /// signer anchors.
     Signer,
     /// The path of the authority that answered for a signature
     /// timestamp, anchored on the certificates its token carries.
@@ -1031,10 +1049,7 @@ fn assemble_document(
         // selection checks that exact coverage and revalidates current
         // evidence before accepting the outer token. A later archive
         // revision is where refreshed evidence for that token belongs.
-        let signer_anchors: Vec<&[u8]> = crate::trust::PINNED_ROOT_DER
-            .iter()
-            .map(|(_label, der)| *der)
-            .collect();
+        let signer_anchors: Vec<&[u8]> = request.signer_anchors.iter().map(Vec::as_slice).collect();
         let reference_time = tokens
             .iter()
             .map(|token| token.generated_at())
@@ -1718,6 +1733,7 @@ mod tests {
             metadata: SignatureMetadata::default(),
             archive: false,
             long_term: false,
+            signer_anchors: Vec::new(),
             timestamp_authorities: Vec::new(),
             timestamp_credentials: None,
         }
@@ -1761,8 +1777,21 @@ mod tests {
             .timestamp_authorities
             .push("https://tsa.example/qualified".to_owned());
         check_true(
+            matches!(
+                request.validate_signing_policy(),
+                Err(SignErrorKind::Material {
+                    path: MaterialPath::Signer,
+                    error: MaterialError::NoTrustAnchor,
+                })
+            ),
+            "long-term material without a signer anchor is refused before card access",
+        )?;
+        request
+            .signer_anchors
+            .push(include_bytes!("../test-vectors/dvv-gov-root-ca-g3-ecc.der").to_vec());
+        check_true(
             request.validate_signing_policy().is_ok(),
-            "archive with authority is normalized to LT",
+            "archive with authority and anchor is normalized to LT",
         )?;
         // Derived fixture password: deterministic for the vector,
         // but not a literal credential a scanner could mistake
@@ -1806,13 +1835,14 @@ mod tests {
         )
     }
 
+    /// A self-issued certificate standing in for a time-stamping
+    /// authority's: a test fixture, not a trust anchor.
+    const SELF_ISSUED_TSA_DER: &[u8] =
+        include_bytes!("../test-vectors/sectigo-qualified-time-stamping-root-r45.der");
+
     fn self_anchored_token_fixture() -> Result<VerifiedTimestampToken, Box<dyn core::error::Error>>
     {
-        let signer_der = crate::trust::PINNED_TSA_ROOT_DER
-            .first()
-            .map(|(_label, der)| *der)
-            .ok_or("missing test trust anchor")?;
-        let signer = OwnedCert::from_der(signer_der)?;
+        let signer = OwnedCert::from_der(SELF_ISSUED_TSA_DER)?;
         let generated_at = signer.view().not_before;
         Ok(VerifiedTimestampToken::from_parts_for_test(
             vec![1],
@@ -1839,10 +1869,7 @@ mod tests {
         let signer_der =
             include_bytes!("../test-vectors/sectigo-qualified-tsa-signer-3.der").to_vec();
         let ca_der = include_bytes!("../test-vectors/sectigo-qualified-tsa-ca-r35.der").to_vec();
-        let root_der = crate::trust::PINNED_TSA_ROOT_DER
-            .first()
-            .ok_or("pinned TSA root missing")?
-            .1;
+        let root_der = SELF_ISSUED_TSA_DER;
         let signer = OwnedCert::from_der(&signer_der)?;
         let ca = OwnedCert::from_der(&ca_der)?;
         let root = OwnedCert::from_der(root_der)?;
@@ -2107,14 +2134,14 @@ mod tests {
 
     #[test]
     fn sign_report_display_renders_all_present_fields() -> TestResult {
-        // Pull a real CommonName off a bundled cert rather than
+        // Pull a real CommonName off a fixture certificate rather than
         // constructing one (the field is private to lib-core).
         let cert = OwnedCert::from_der(
-            include_bytes!("../trust-anchors/dvv-gov-root-ca-g3-rsa.der").as_slice(),
+            include_bytes!("../test-vectors/dvv-gov-root-ca-g3-rsa.der").as_slice(),
         )
-        .map_err(|e| format!("parse anchor: {e}"))?;
+        .map_err(|e| format!("parse fixture: {e}"))?;
         let cn = cert.view().subject.common_name();
-        check_true(cn.is_some(), "anchor has a CN")?;
+        check_true(cn.is_some(), "fixture has a CN")?;
 
         let s = sample_report(cn).to_string();
         check_true(s.contains("reader: OMNIKEY 5422"), "reader line")?;

@@ -34,13 +34,19 @@ Every input has one origin, one border and one constructor.
 | The clock | `now` passed by the caller | The current time, used only where no proven time exists. |
 | Validation evidence inside the file | `MaterialPool` | Parsed certificates, OCSP responses and CRLs from the DSS, the CMS, or the container. Each is parsed once, at the border. |
 
-Trust anchors come from two sources `TrustAnchors::from_trusted_lists`
-combines: the pinned roots the core ships (the DVV roots and the
-time-stamping root the signing side uses), and the EU trusted lists
-(see Trusted lists). The lists are fetched and cached by the shell; a
-verdict uses the cached lists and the report says when they were
-fetched and whether one of them is stale. The verifier itself does no
-network access.
+Trust anchors come from one source, the EU trusted lists (see Trusted
+lists), through `TrustAnchors::from_trusted_lists`. The core ships no
+root: the only certificates in the tree are the six list-signing
+certificates the Official Journal publishes (`trust::LOTL_SIGNER_DER`),
+which bootstrap the lists and anchor nothing themselves. The Finnish
+list names DVV's services by their issuing CA certificates, the
+certificates a card's own chain starts at, so a path from a FINEID
+signer ends at that issuing CA. The lists are fetched and cached by the
+shell; a verdict uses the cached lists and the report says when they
+were fetched and whether one of them is stale. A fresh install that has
+never fetched the lists has no anchor and verifies nothing until it has
+fetched them once; from then on it works offline from the cache. The
+verifier itself does no network access.
 
 An anchor is the subject name and public key of its certificate (RFC
 5280 sec.6.1.1): a path ends at the first certificate that carries an
@@ -48,8 +54,10 @@ anchor's name and key, for the role the path needs, at a time inside
 one of the anchor's granted periods. The anchor certificate's own
 validity and extensions are not consulted; its granted periods are.
 Any certificate can be an anchor: a root, an issuing CA a trusted list
-names, or a time-stamping unit's own certificate. `TrustAnchors::pinned`
-gives the core's pinned roots, each granted without bounds.
+names, or a time-stamping unit's own certificate. The signing side's
+long-term material collection takes the signer's anchors the same way,
+from the request (`DocumentRequest::signer_anchors`): the issuing CA
+and root read from the card when one is present, or the lists' anchors.
 
 ## Trusted lists
 

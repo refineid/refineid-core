@@ -40,7 +40,6 @@
 use crate::crl::{CrlReason, OwnedCrl, VerifiedCrl};
 use crate::ocsp::{CertStatus, OcspResponseStatus, OwnedOcspResponse, VerifiedOcspResponse};
 use crate::revocation::{RevocationStatus, check_against_crl};
-use crate::trust::{PINNED_ROOT_DER, PINNED_TSA_ROOT_DER};
 use crate::validation::ValidationMaterial;
 use refineid_cms::x509::{Certificate, DateTime, OwnedCert, path_extension_profile};
 use refineid_digest::{SHA256_LEN, Sha256};
@@ -220,28 +219,6 @@ impl TrustAnchors {
             fetched_at: None,
             lists_valid_until: None,
         }
-    }
-
-    /// The roots the core pins: the DVV roots for certificate issuing
-    /// and the time-stamping root the signing side uses, each granted
-    /// without bounds.
-    #[must_use]
-    pub fn pinned() -> Self {
-        let issuing = PINNED_ROOT_DER
-            .iter()
-            .map(|(_label, der)| (*der, AnchorRole::CertificateIssuing));
-        let stamping = PINNED_TSA_ROOT_DER
-            .iter()
-            .map(|(_label, der)| (*der, AnchorRole::TimeStamping));
-        Self::new(
-            issuing
-                .chain(stamping)
-                .filter_map(|(der, role)| {
-                    let certificate = OwnedCert::from_der(der).ok()?;
-                    TrustAnchor::new(certificate, role, vec![GrantedPeriod::unbounded()]).ok()
-                })
-                .collect(),
-        )
     }
 
     /// These anchors, taken from lists the shell fetched at
@@ -1371,28 +1348,6 @@ mod tests {
             at(VALIDATED),
         );
         assert!(verdict.path.is_anchored());
-    }
-
-    #[test]
-    fn the_pinned_anchors_carry_both_roles() {
-        let pinned = TrustAnchors::pinned();
-        assert!(
-            pinned
-                .anchors()
-                .iter()
-                .any(|anchor| anchor.role() == AnchorRole::CertificateIssuing)
-        );
-        assert!(
-            pinned
-                .anchors()
-                .iter()
-                .any(|anchor| anchor.role() == AnchorRole::TimeStamping)
-        );
-        assert_eq!(
-            pinned.anchors().len(),
-            crate::trust::PINNED_ROOT_DER.len() + crate::trust::PINNED_TSA_ROOT_DER.len()
-        );
-        assert_eq!(pinned.fetched_at(), None);
     }
 
     #[test]

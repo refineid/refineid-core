@@ -1732,8 +1732,8 @@ mod tests {
     /// the G3 ECC root below.
     const DVV_INTERMEDIATE_DER: &[u8] =
         include_bytes!("../test-vectors/fineid-intermediate-01-citizen-g4e.der");
-    const DVV_ROOT_ECC_DER: &[u8] = include_bytes!("../trust-anchors/dvv-gov-root-ca-g3-ecc.der");
-    const DVV_ROOT_RSA_DER: &[u8] = include_bytes!("../trust-anchors/dvv-gov-root-ca-g3-rsa.der");
+    const DVV_ROOT_ECC_DER: &[u8] = include_bytes!("../test-vectors/dvv-gov-root-ca-g3-ecc.der");
+    const DVV_ROOT_RSA_DER: &[u8] = include_bytes!("../test-vectors/dvv-gov-root-ca-g3-rsa.der");
     const APED_OCSP_DER: &[u8] = include_bytes!("../test-vectors/aped-ocsp-response.der");
     const TEST_STATUS: &[u8] = b"authenticated-status-test-sentinel";
 

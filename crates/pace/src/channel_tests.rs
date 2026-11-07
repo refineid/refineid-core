@@ -12,14 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! PIN management on channels PACE opened with the PUK and with PIN 1,
+//! PIN management on channels PACE opened with the PUK, PIN 1 and PIN 2,
 //! and the PIN 2 presentation on a channel PACE opened with PIN 2,
 //! over the real handshake and secure-messaging layer against the
 //! synthetic organizational card. The card side recovers every protected
 //! command, so the tests pin the plain wire the card received, assembled
 //! from the serializer's own named constants.
 
-use refineid_apdu::{ApduClass, PinRetries, ResponseApdu, StatusWord};
+use refineid_apdu::iso7816::{
+    SelectByAidNoFci, SelectFile, SelectFileResponseMode, SelectFileTarget,
+};
+use refineid_apdu::{Aid, ApduClass, FileId, PinRetries, ResponseApdu, StatusWord};
 use refineid_auth::manage::{
     CHANGE_P1_CURRENT_THEN_NEW, CHANGE_REFERENCE_DATA_INS, RESET_P1_NEW_ONLY,
     RESET_RETRY_COUNTER_INS,
@@ -27,10 +30,12 @@ use refineid_auth::manage::{
 use refineid_auth::verify::{VERIFY_INS, VERIFY_P1};
 use refineid_auth::{
     AuthError, CardPinLengths, ChannelProof, FlooredCredential, ManageOutcome, Pin1,
-    Pin1PaceChannel as _, Pin1PaceChannelOps as _, Pin2, Pin2PaceChannel as _,
+    Pin1PaceChannel as _, Pin1PaceChannelOps as _, Pin2, Pin2ChangeError, Pin2PaceChannel as _,
     Pin2PaceChannelOps as _, PinReferenceScheme, PinSlot, PinStatus, Puk, PukPaceChannel as _,
     PukPaceChannelOps as _, RetryFloorRefusal, UnvalidatedSecret, VerifyOutcome,
 };
+
+use refineid_pkcs15::ESIGN_AID;
 
 use crate::testkit::{OrganizationalCard, organizational_card_access};
 use crate::{OpenedByPin1, OpenedByPin2, OpenedByPuk, SmTransport, run_pace};
@@ -552,4 +557,176 @@ fn an_accepted_pin1_change_sends_current_and_new_and_keeps_the_record() {
             &[SYNTHETIC_PIN1, NEW_PIN1],
         )]
     );
+}
+
+/// The SELECT of the MF that starts the way into DF.ESIGN.
+fn select_mf_wire() -> Vec<u8> {
+    SelectFile {
+        class: ApduClass::Plain,
+        target: SelectFileTarget::AnyByFileId(Some(FileId::MF)),
+        response_mode: SelectFileResponseMode::None,
+    }
+    .into_apdu()
+    .as_bytes()
+    .to_vec()
+}
+
+/// The SELECT of DF.ESIGN by its published name.
+fn select_esign_by_name_wire() -> Vec<u8> {
+    SelectByAidNoFci {
+        aid: Aid::from_slice(ESIGN_AID).expect("the published name is an AID"),
+    }
+    .into_apdu()
+    .as_bytes()
+    .to_vec()
+}
+
+fn change_pin2_wire() -> Vec<u8> {
+    plain(
+        CHANGE_REFERENCE_DATA_INS,
+        CHANGE_P1_CURRENT_THEN_NEW,
+        PinReferenceScheme::Organizational.reference(PinSlot::Pin2),
+        &[SYNTHETIC_PIN2, NEW_PIN2],
+    )
+}
+
+/// The card's answers to the two SELECTs into DF.ESIGN, then `change`.
+fn into_esign_then(change: StatusWord) -> Vec<ResponseApdu> {
+    vec![
+        answer(StatusWord::Success),
+        answer(StatusWord::Success),
+        answer(change),
+    ]
+}
+
+fn change_pin2_presenting_again(
+    channel: &mut SmTransport<OrganizationalCard, OpenedByPin2>,
+) -> Result<ManageOutcome, Pin2ChangeError<crate::SmError<String>>> {
+    channel.change_pin2_after_pin2_pace(
+        &lengths(),
+        pin2(NEW_PIN2),
+        ChannelProof::PresentAgain(pin2(SYNTHETIC_PIN2)),
+    )
+}
+
+#[test]
+fn an_accepted_pin2_change_enters_esign_sends_current_and_new_and_keeps_the_record() {
+    let mut channel =
+        pin2_channel_answering(StatusWord::Success, into_esign_then(StatusWord::Success));
+    let before = channel.pin2_counter();
+    let outcome = change_pin2_presenting_again(&mut channel).expect("sent");
+    assert_eq!(outcome, ManageOutcome::Ok);
+    assert_eq!(channel.pin2_counter(), before);
+    let card = channel.into_inner();
+    assert_eq!(
+        card.protected_commands(),
+        [
+            select_mf_wire(),
+            select_esign_by_name_wire(),
+            change_pin2_wire()
+        ],
+        "DF.ESIGN, then the change alone: no counter-safe probe, no VERIFY"
+    );
+    assert_eq!(card.credential_commands(), 1);
+}
+
+#[test]
+fn a_refused_pin2_change_lowers_the_record_to_the_reported_tries() {
+    let mut channel = pin2_channel_answering(
+        StatusWord::Success,
+        into_esign_then(counter(TRIES_BELOW_FLOOR)),
+    );
+    let outcome = change_pin2_presenting_again(&mut channel).expect("sent");
+    assert_eq!(
+        outcome,
+        ManageOutcome::WrongCredential {
+            retries_left: tries(TRIES_BELOW_FLOOR)
+        }
+    );
+    assert_eq!(
+        channel.pin2_counter(),
+        PinStatus::Remaining(tries(TRIES_BELOW_FLOOR))
+    );
+}
+
+#[test]
+fn a_pin2_change_at_two_tries_left_is_refused_with_nothing_sent() {
+    let mut channel = pin2_channel_answering(
+        StatusWord::Success,
+        into_esign_then(counter(TRIES_BELOW_FLOOR)),
+    );
+    let _ = change_pin2_presenting_again(&mut channel).expect("sent");
+    let refused = change_pin2_presenting_again(&mut channel);
+    assert!(matches!(
+        refused,
+        Err(Pin2ChangeError::Auth(AuthError::RetryFloor(
+            RetryFloorRefusal::TriesBelowFloor {
+                credential: FlooredCredential::Pin2,
+                remaining,
+            }
+        ))) if remaining.get() == TRIES_BELOW_FLOOR
+    ));
+    let card = channel.into_inner();
+    assert_eq!(
+        card.protected_commands(),
+        [
+            select_mf_wire(),
+            select_esign_by_name_wire(),
+            change_pin2_wire()
+        ],
+        "the first change alone: the refusal sends not even the SELECT into DF.ESIGN"
+    );
+    assert_eq!(card.credential_commands(), 1);
+}
+
+#[test]
+fn the_handshake_proof_changes_pin2_in_esign_with_a_reset_carrying_only_the_new_pin() {
+    let mut channel =
+        pin2_channel_answering(StatusWord::Success, into_esign_then(StatusWord::Success));
+    let outcome = channel
+        .change_pin2_after_pin2_pace(&lengths(), pin2(NEW_PIN2), ChannelProof::PaceHandshake)
+        .expect("sent");
+    assert_eq!(outcome, ManageOutcome::Ok);
+    assert_eq!(
+        channel.into_inner().protected_commands(),
+        [
+            select_mf_wire(),
+            select_esign_by_name_wire(),
+            reset_wire(PinSlot::Pin2, NEW_PIN2)
+        ]
+    );
+}
+
+#[test]
+fn a_new_pin2_the_card_does_not_accept_is_refused_before_any_command() {
+    let mut channel = pin2_channel_answering(StatusWord::Success, Vec::new());
+    let refused = channel.change_pin2_after_pin2_pace(
+        &lengths(),
+        pin2(SHORT_PIN2),
+        ChannelProof::PresentAgain(pin2(SYNTHETIC_PIN2)),
+    );
+    assert!(matches!(
+        refused,
+        Err(Pin2ChangeError::Auth(AuthError::PinLength(_)))
+    ));
+    assert!(channel.into_inner().protected_commands().is_empty());
+}
+
+#[test]
+fn a_directory_the_card_refuses_sends_no_pin2() {
+    // Both SELECT shapes into the MF are refused; the change never goes.
+    let refusals = vec![
+        answer(StatusWord::FileNotFound),
+        answer(StatusWord::FileNotFound),
+    ];
+    let mut channel = pin2_channel_answering(StatusWord::Success, refusals);
+    let refused = change_pin2_presenting_again(&mut channel);
+    assert!(matches!(refused, Err(Pin2ChangeError::Directory(_))));
+    assert_eq!(
+        channel.pin2_counter(),
+        PinStatus::Remaining(tries(PIN_INITIAL_TRIES))
+    );
+    let card = channel.into_inner();
+    assert_eq!(card.credential_commands(), 0);
+    assert_eq!(card.answers_left(), 0);
 }

@@ -12,24 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! PIN management on a secure channel PACE opened with the PUK or PIN 1,
-//! and the PIN 2 presentation on a channel PACE opened with PIN 2.
+//! PIN management on a secure channel PACE opened with the PUK, PIN 1 or
+//! PIN 2, and the PIN 2 presentation on a channel PACE opened with PIN 2.
 //!
 //! The organizational card answers every command on its contactless
 //! interface only after PACE, and enables PACE with PIN 1, PIN 2 or the
 //! PUK (FINEID S4-2 v4.0 sections 4.2 and 6). A channel PACE opened with
 //! the PUK is where a blocked PIN is set -- the activation of a card
 //! that ships with blocked PINs (FINEID S4-1 v4.2 section 4.6.1) and the
-//! unblock -- and a channel PACE opened with PIN 1 is where PIN 1 is
-//! changed. BSI TR-03110-3 section B.7.1 has the terminal unblock or
-//! change the PIN on such a channel with RESET RETRY COUNTER carrying only
-//! the new PIN: PACE with the PUK or the PIN is the authorisation, and the
-//! credential is not sent again. FINEID S4-2 v4.0 section 4.3 states the
+//! unblock -- and a channel PACE opened with PIN 1 or PIN 2 is where
+//! that PIN is changed. BSI TR-03110-3 section B.7.1 has the terminal
+//! unblock or change the PIN on such a channel with RESET RETRY COUNTER
+//! carrying only the new PIN: PACE with the PUK or the PIN is the
+//! authorisation, and the credential is not sent again. FINEID S4-2 v4.0 section 4.3 states the
 //! reset's contactless access condition as the PUK's security
 //! environment together with PACE, and the change's as PACE alone, with
 //! the current PIN in the command (IAS ECC v1.0.1 section 9.4.2). Whether
 //! the organizational card counts a completed PACE with the PUK, or with
-//! PIN 1, as the authorisation its reset needs is not stated there, so
+//! a PIN, as the authorisation its reset needs is not stated there, so
 //! each operation takes the choice as a [`ChannelProof`]: rely on the
 //! handshake, or present the credential once more inside the channel.
 //! Real hardware decides which one the card accepts.
@@ -52,6 +52,7 @@
 //! no second probe is made.
 
 use refineid_apdu::CardTransport;
+use refineid_pkcs15::{Pkcs15Error, Pkcs15Ops as _};
 
 use crate::credentials::{Pin1, Pin2, Puk};
 use crate::manage::{ManageOutcome, change, reset_new_only, verify_puk};
@@ -132,9 +133,37 @@ pub trait Pin2PaceChannel: CardTransport {
     /// Settle the record by the card's answer to a PIN 2 VERIFY on this
     /// channel; see [`counter_after_verify`].
     fn settle_pin2_counter(&mut self, answer: VerifyOutcome);
+
+    /// Lower the record by the card's answer to a PIN 2 change on this
+    /// channel; see [`lowered_counter`]. An accepted change leaves the
+    /// record as it stands.
+    fn lower_pin2_counter(&mut self, answer: ManageOutcome);
 }
 
-/// The PIN 2 presentation on a channel PACE opened with PIN 2.
+/// Why a PIN 2 change on a channel PACE opened with PIN 2 was not made.
+#[derive(Debug)]
+pub enum Pin2ChangeError<E> {
+    /// A refusal before any command, or a failure of the change command
+    /// itself: [`AuthError::PinLength`] and [`AuthError::RetryFloor`]
+    /// send nothing.
+    Auth(AuthError<E>),
+    /// DF.ESIGN could not be made current; no PIN was sent.
+    Directory(Pkcs15Error<E>),
+}
+
+impl<E: core::fmt::Display> core::fmt::Display for Pin2ChangeError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Auth(e) => write!(f, "change Signature PIN 2: {e}"),
+            Self::Directory(e) => write!(f, "select DF.ESIGN: {e}"),
+        }
+    }
+}
+
+impl<E: core::fmt::Debug + core::fmt::Display + 'static> core::error::Error for Pin2ChangeError<E> {}
+
+/// The PIN 2 presentation and the PIN 2 change on a channel PACE opened
+/// with PIN 2.
 ///
 /// Exists only on a [`Pin2PaceChannel`]. The organizational card does
 /// not answer the counter-safe empty VERIFY over secure messaging with a
@@ -161,6 +190,66 @@ pub trait Pin2PaceChannelOps: Pin2PaceChannel + Sized {
         let outcome = verify_digits(self, CHANNEL_NUMBERING, PinSlot::Pin2, pin.digits())?;
         self.settle_pin2_counter(outcome);
         Ok(outcome)
+    }
+
+    /// Set `new` as PIN 2, from DF.ESIGN.
+    ///
+    /// PIN 2 is the Signature PIN SIG, local to DF.ESIGN (FINEID S4-2
+    /// v4.0 section 4.2), and DF.ESIGN is the directory every PIN 2
+    /// command of the organizational card has been observed in, so this
+    /// selects DF.ESIGN by name from the MF before the change, after
+    /// every refusal that sends nothing. Under
+    /// [`ChannelProof::PaceHandshake`] one RESET RETRY COUNTER carries
+    /// only the new PIN, the change BSI TR-03110-3 section B.7.1 defines
+    /// after PACE with the PIN; nothing presents PIN 2. Under
+    /// [`ChannelProof::PresentAgain`] the retry floor is applied to the
+    /// channel's PIN 2 record, one CHANGE REFERENCE DATA carries the
+    /// current PIN and the new one, and the record is lowered by the
+    /// answer.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::PinLength`] when the card does not accept the length
+    /// of an entry, and [`AuthError::RetryFloor`] when the PIN 2 record
+    /// reads two or one tries left or is unknown, both under
+    /// [`Pin2ChangeError::Auth`]; nothing is sent either way. At no tries
+    /// left or blocked the card answers for itself.
+    /// [`Pin2ChangeError::Directory`] when DF.ESIGN cannot be made
+    /// current; no PIN is sent. [`Pin2ChangeError::Auth`] on a transport
+    /// failure or state transition of the change. A wrong current PIN is
+    /// [`ManageOutcome::WrongCredential`]; a reset the card does not
+    /// authorise on this channel is [`ManageOutcome::Other`].
+    fn change_pin2_after_pin2_pace(
+        &mut self,
+        lengths: &CardPinLengths,
+        new: Pin2,
+        proof: ChannelProof<Pin2>,
+    ) -> Result<ManageOutcome, Pin2ChangeError<Self::Error>> {
+        lengths
+            .check_pin2(&new)
+            .map_err(|refusal| Pin2ChangeError::Auth(AuthError::PinLength(refusal)))?;
+        if let ChannelProof::PresentAgain(current) = &proof {
+            lengths
+                .check_pin2(current)
+                .map_err(|refusal| Pin2ChangeError::Auth(AuthError::PinLength(refusal)))?;
+            check_retry_floor(FlooredCredential::Pin2, self.pin2_counter())
+                .map_err(|refusal| Pin2ChangeError::Auth(AuthError::RetryFloor(refusal)))?;
+        }
+        self.select_esign_directory()
+            .map_err(Pin2ChangeError::Directory)?;
+        let scheme = CHANNEL_NUMBERING;
+        match proof {
+            ChannelProof::PaceHandshake => {
+                reset_new_only(self, scheme, PinSlot::Pin2, new.digits())
+                    .map_err(Pin2ChangeError::Auth)
+            }
+            ChannelProof::PresentAgain(current) => {
+                let outcome = change(self, scheme, PinSlot::Pin2, current.digits(), new.digits())
+                    .map_err(Pin2ChangeError::Auth)?;
+                self.lower_pin2_counter(outcome);
+                Ok(outcome)
+            }
+        }
     }
 }
 

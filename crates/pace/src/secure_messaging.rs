@@ -522,8 +522,9 @@ impl<T: CardTransport> PukPaceChannel for SmTransport<T, OpenedByPuk> {
 }
 
 /// The channel only a PACE handshake with PIN 2 opens: the PIN 2
-/// presentation of `refineid_auth::Pin2PaceChannelOps` runs on it,
-/// floored on this record and never on a probe over secure messaging.
+/// presentation and the PIN 2 change of `refineid_auth::Pin2PaceChannelOps`
+/// run on it, floored on this record and never on a probe over secure
+/// messaging.
 impl<T: CardTransport> Pin2PaceChannel for SmTransport<T, OpenedByPin2> {
     fn pin2_counter(&self) -> PinStatus {
         self.opened_by.counter()
@@ -531,6 +532,10 @@ impl<T: CardTransport> Pin2PaceChannel for SmTransport<T, OpenedByPin2> {
 
     fn settle_pin2_counter(&mut self, answer: VerifyOutcome) {
         self.opened_by.settle(answer);
+    }
+
+    fn lower_pin2_counter(&mut self, answer: ManageOutcome) {
+        self.opened_by.lower(answer);
     }
 }
 

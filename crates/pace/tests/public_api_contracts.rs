@@ -15,6 +15,9 @@
 //! Compile-fail contracts for sensitive public types and for the
 //! operations only a channel opened with the matching password offers.
 
+// trybuild compiles the fixtures by running cargo, a process Miri cannot
+// start, so the interpreter builds this file without the test.
+#[cfg(not(miri))]
 #[test]
 fn sensitive_values_and_channel_proofs_have_no_public_path() {
     let cases = trybuild::TestCases::new();

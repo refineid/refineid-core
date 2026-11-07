@@ -18,3 +18,11 @@ workspace = true
 refineid-apdu.workspace = true
 refineid-ber.workspace = true
 refineid-x509.workspace = true
+
+# The loop bound `cargo kani` checks the proof harnesses in
+# src/proofs.rs under: two more than the longest input a harness walks
+# (MAX_VERSION_OCTETS), as a harness walks every length from zero to that bound
+# and each walk reads every byte. Kani's unwinding assertions fail the
+# proof if any loop could run longer.
+[package.metadata.kani.flags]
+default-unwind = "7"

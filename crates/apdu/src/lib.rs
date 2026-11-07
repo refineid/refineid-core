@@ -48,6 +48,9 @@ pub use transport::{
     CardTransport, ResponseApdu, TransportErrorExt, TransportErrorKind, TransportOutcome,
 };
 
+#[cfg(kani)]
+mod proofs;
+
 #[cfg(test)]
 mod build_version_tests {
     use refineid_build_number::is_build_number;

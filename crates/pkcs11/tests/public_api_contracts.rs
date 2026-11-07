@@ -14,6 +14,9 @@
 
 //! Compile-fail contracts for sensitive public types.
 
+// trybuild compiles the fixtures by running cargo, a process Miri cannot
+// start, so the interpreter builds this file without the test.
+#[cfg(not(miri))]
 #[test]
 fn sensitive_values_have_no_public_raw_access() {
     let cases = trybuild::TestCases::new();

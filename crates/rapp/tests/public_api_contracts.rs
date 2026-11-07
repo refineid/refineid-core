@@ -14,6 +14,9 @@
 
 //! Compile-fail contracts for the pairing record's public surface.
 
+// trybuild compiles the fixtures by running cargo, a process Miri cannot
+// start, so the interpreter builds this file without the test.
+#[cfg(not(miri))]
 #[test]
 fn idle_expiry_is_decided_only_by_the_sweep() {
     let cases = trybuild::TestCases::new();

@@ -14,6 +14,9 @@
 
 //! Compile-fail contracts for the signing keys.
 
+// trybuild compiles the fixtures by running cargo, a process Miri cannot
+// start, so the interpreter builds this file without the test.
+#[cfg(not(miri))]
 #[test]
 fn the_qualified_key_exists_only_through_its_unlock() {
     let cases = trybuild::TestCases::new();

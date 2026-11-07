@@ -24,3 +24,11 @@ zeroize.workspace = true
 refineid-build-number.workspace = true
 serde.workspace = true
 trybuild.workspace = true
+
+# The loop bound `cargo kani` checks the proof harnesses in
+# src/proofs.rs under: two more than the longest run of octets a harness
+# compares byte by byte (SHORT_APDU_DATA_MAX, one full chained chunk),
+# as the comparison is a loop over its length. Kani's unwinding
+# assertions fail the proof if any loop could run longer.
+[package.metadata.kani.flags]
+default-unwind = "257"

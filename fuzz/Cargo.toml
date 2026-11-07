@@ -1,0 +1,111 @@
+# Copyright 2026 Petri Koistinen. Licensed under the Apache License, Version 2.0.
+#
+# cargo-fuzz targets, one per border constructor of the parsing crates.
+# A workspace of its own: cargo-fuzz builds it with a nightly toolchain and
+# the sanitizer flags it sets, and libfuzzer-sys stays out of the main
+# workspace's dependency graph.
+
+[package]
+name = "refineid-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = []
+
+[dependencies]
+libfuzzer-sys = "0.4"
+refineid-apdu = { path = "../crates/apdu" }
+refineid-atr = { path = "../crates/atr" }
+refineid-ber = { path = "../crates/ber" }
+refineid-cms = { path = "../crates/cms" }
+refineid-doc-sign = { path = "../crates/doc-sign", default-features = false }
+refineid-emrtd = { path = "../crates/emrtd" }
+refineid-pace = { path = "../crates/pace" }
+refineid-pkcs15 = { path = "../crates/pkcs15" }
+refineid-rapp = { path = "../crates/rapp" }
+refineid-x509 = { path = "../crates/x509" }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
+
+[[bin]]
+name = "apdu"
+path = "fuzz_targets/apdu.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "atr"
+path = "fuzz_targets/atr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ber"
+path = "fuzz_targets/ber.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cms"
+path = "fuzz_targets/cms.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "doc_sign"
+path = "fuzz_targets/doc_sign.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "emrtd"
+path = "fuzz_targets/emrtd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pace"
+path = "fuzz_targets/pace.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pkcs15"
+path = "fuzz_targets/pkcs15.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rapp"
+path = "fuzz_targets/rapp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "x509"
+path = "fuzz_targets/x509.rs"
+test = false
+doc = false
+bench = false

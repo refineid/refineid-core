@@ -145,6 +145,14 @@ If the policy itself seems wrong, say so openly in the commit body or the
 review instead of engineering around it; the policy has been corrected
 before and the correction made the core better.
 
+## Verification lanes
+
+Fuzz targets, Kani harnesses, Flux signatures and the RAPP protocol
+models run nightly on the build server, never in the hooks; a red lane
+is fixed in the next change that touches the code. The lanes, what each
+claims, and the one in-source annotation dialect are in
+[doc/process/verification-lanes.md](doc/process/verification-lanes.md).
+
 ## Commits and publication
 
 - Imperative subject, explanatory body; no attribution trailers of any

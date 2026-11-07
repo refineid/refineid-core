@@ -25,6 +25,13 @@ use crate::token_serial::{TokenSerial, hex_encode};
 /// `TokenInfo`, the alternate location for the label string.
 const TAG_TOKEN_INFO_LABEL_IMPLICIT: u16 = 0x80;
 
+/// The sign bit of an INTEGER's leading content octet (ITU-T X.690
+/// section 8.3.3).
+const INTEGER_SIGN_BIT: u8 = 0x80;
+
+/// The octets of the `u32` that holds `TokenInfo.version`.
+const VERSION_OCTETS: usize = core::mem::size_of::<u32>();
+
 /// Subset of PKCS#15 `TokenInfo` that card-status surfaces need, per
 /// ISO/IEC 7816-15 section 8.2.
 ///
@@ -94,10 +101,7 @@ impl TokenInfo {
                 got: version_tlv.tag(),
             });
         }
-        let mut version: u32 = 0;
-        for &byte in version_tlv.value() {
-            version = (version << u8::BITS) | u32::from(byte);
-        }
+        let version = unsigned_version(version_tlv.value())?;
         next += 1;
 
         // serialNumber: OPTIONAL OCTET STRING.
@@ -137,6 +141,20 @@ impl TokenInfo {
     }
 }
 
+/// The `TokenInfo.version` INTEGER content as a `u32`: one to four
+/// octets with the sign bit clear (ITU-T X.690 section 8.3).
+pub(crate) fn unsigned_version(content: &[u8]) -> Result<u32, BerError> {
+    let negative = content
+        .first()
+        .is_some_and(|&leading| leading & INTEGER_SIGN_BIT != 0);
+    if content.is_empty() || negative || content.len() > VERSION_OCTETS {
+        return Err(BerError::IntegerOutOfRange);
+    }
+    Ok(content
+        .iter()
+        .fold(0, |version, &byte| (version << u8::BITS) | u32::from(byte)))
+}
+
 /// Whether `tag` is one of the universal string tags a PKCS#15 `Label`
 /// uses.
 fn is_label_string(tag: u16) -> bool {
@@ -145,7 +163,9 @@ fn is_label_string(tag: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use refineid_ber::{BerEncoder, BerTag, Integer, OctetString, Sequence, Utf8String, tlv};
+    use refineid_ber::{
+        BerEncoder, BerError, BerTag, Integer, OctetString, Sequence, Utf8String, tlv,
+    };
 
     use super::TokenInfo;
     use crate::token_serial::{derive_printed_serial, render_token_serial};
@@ -160,6 +180,9 @@ mod tests {
     const FIXTURE_LABEL: &str = "Demo Card";
     /// Version integer in the fixture.
     const FIXTURE_VERSION: u32 = 1;
+    /// A leading content octet that widens a version INTEGER past four
+    /// octets without setting its sign bit.
+    const FIXTURE_VERSION_OCTET: u8 = 1;
 
     fn universal_tag(tag: u16) -> u8 {
         u8::try_from(tag).expect("universal tags fit one byte")
@@ -238,6 +261,45 @@ mod tests {
             tlv(universal_tag(<Integer as BerTag>::TAG), [1_u8]).expect("fixture encodes");
         assert!(TokenInfo::parse(&not_a_sequence).is_err());
         assert!(TokenInfo::parse(&[]).is_err());
+    }
+
+    /// A TokenInfo SEQUENCE whose version INTEGER carries `content`.
+    fn version_der(content: &[u8]) -> Vec<u8> {
+        let version = tlv(universal_tag(<Integer as BerTag>::TAG), content).expect("encodes");
+        tlv(universal_tag(<Sequence as BerTag>::TAG), version).expect("fixture encodes")
+    }
+
+    #[test]
+    fn the_widest_unsigned_version_is_accepted() {
+        let info = TokenInfo::parse(&version_der(&i32::MAX.to_be_bytes()))
+            .expect("a four-octet positive version parses");
+        assert_eq!(i32::try_from(info.version()), Ok(i32::MAX));
+    }
+
+    #[test]
+    fn a_version_wider_than_its_field_is_refused() {
+        let mut five_octets = vec![FIXTURE_VERSION_OCTET];
+        five_octets.extend_from_slice(&FIXTURE_VERSION.to_be_bytes());
+        assert_eq!(
+            TokenInfo::parse(&version_der(&five_octets)).map(|info| info.version()),
+            Err(BerError::IntegerOutOfRange)
+        );
+    }
+
+    #[test]
+    fn a_version_without_content_octets_is_refused() {
+        assert_eq!(
+            TokenInfo::parse(&version_der(&[])).map(|info| info.version()),
+            Err(BerError::IntegerOutOfRange)
+        );
+    }
+
+    #[test]
+    fn a_negative_version_is_refused() {
+        assert_eq!(
+            TokenInfo::parse(&version_der(&i8::MIN.to_be_bytes())).map(|info| info.version()),
+            Err(BerError::IntegerOutOfRange)
+        );
     }
 
     #[test]

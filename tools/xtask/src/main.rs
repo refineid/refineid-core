@@ -19,7 +19,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
-use proc_macro2::{Span, TokenStream, TokenTree};
+use proc_macro2::{Spacing, Span, TokenStream, TokenTree};
 use rustc_lexer::TokenKind;
 use syn::ext::IdentExt;
 use syn::parse::Parser;
@@ -240,12 +240,29 @@ fn is_ignored_root_path(root: &Path, path: &Path) -> bool {
     if relative == Path::new("Cargo.lock") {
         return true;
     }
+    if FUZZ_GENERATED_PATHS
+        .iter()
+        .any(|generated| relative.starts_with(generated))
+    {
+        return true;
+    }
     matches!(
         relative.components().next(),
         Some(std::path::Component::Normal(name))
             if name == OsStr::new(".git") || name == OsStr::new("target")
     )
 }
+
+/// Output cargo-fuzz writes inside the fuzz workspace: its build directory,
+/// lock file, the corpora and crash artifacts libFuzzer generates, and
+/// coverage data. None of it is authored source.
+const FUZZ_GENERATED_PATHS: &[&str] = &[
+    "fuzz/target",
+    "fuzz/Cargo.lock",
+    "fuzz/corpus",
+    "fuzz/artifacts",
+    "fuzz/coverage",
+];
 
 /// Subtrees admitted before they satisfy the numeric and source-indirection
 /// policy. The RAPP engine arrived from the RefineID mono repository as the
@@ -575,7 +592,8 @@ impl<'path> MagicNumberVisitor<'path> {
         for (index, pair) in tokens.windows(TOKEN_PAIR_WIDTH).enumerate() {
             if let [TokenTree::Ident(ident), TokenTree::Punct(punctuation)] = pair {
                 let name = normalized_ident(ident);
-                if punctuation.as_char() == '!' {
+                // A joint `!` opens the `!=` operator, not a macro call.
+                if punctuation.as_char() == '!' && punctuation.spacing() == Spacing::Alone {
                     let is_qualified = index > 0
                         && matches!(
                             tokens.get(index - 1),
@@ -740,7 +758,9 @@ impl<'ast> Visit<'ast> for MagicNumberVisitor<'_> {
             );
         } else if path_is_ident(node.path(), "derive") {
             self.inspect_derive_attribute(node);
-        } else if !is_trusted_inert_attribute(node.path()) {
+        } else if !is_trusted_inert_attribute(node.path())
+            && !is_trusted_qualified_path(node.path(), TRUSTED_QUALIFIED_ATTRIBUTES)
+        {
             self.record(
                 node.path().span(),
                 ViolationKind::SourceIndirection("unapproved attribute macro"),
@@ -847,7 +867,10 @@ impl<'ast> Visit<'ast> for MagicNumberVisitor<'_> {
                 node.path.span(),
                 ViolationKind::SourceIndirection("include!"),
             );
-        } else if !path_is_ident(&node.path, "macro_rules") && !is_trusted_macro(&node.path) {
+        } else if !path_is_ident(&node.path, "macro_rules")
+            && !is_trusted_macro(&node.path)
+            && !is_trusted_qualified_path(&node.path, TRUSTED_QUALIFIED_MACROS)
+        {
             self.record(
                 node.path.span(),
                 ViolationKind::SourceIndirection("unapproved opaque macro"),
@@ -873,8 +896,32 @@ fn is_trusted_macro(path: &syn::Path) -> bool {
     is_trusted_macro_name(&normalized_ident(&segment.ident))
 }
 
+/// Attribute macros admitted by their full path: `kani::proof` marks a
+/// Kani proof harness, and exists only in a build `cargo kani` makes.
+const TRUSTED_QUALIFIED_ATTRIBUTES: &[&[&str]] = &[&["kani", "proof"]];
+
+/// Function-like macros admitted by their full path: `libfuzzer_sys::fuzz_target`
+/// is the entry point of a cargo-fuzz target.
+const TRUSTED_QUALIFIED_MACROS: &[&[&str]] = &[&["libfuzzer_sys", "fuzz_target"]];
+
+/// Whether `path` spells, segment for segment and with no leading `::` or
+/// generic arguments, one of the reviewed `trusted` paths.
+fn is_trusted_qualified_path(path: &syn::Path, trusted: &[&[&str]]) -> bool {
+    path.leading_colon.is_none()
+        && trusted.iter().any(|expected| {
+            path.segments.len() == expected.len()
+                && path
+                    .segments
+                    .iter()
+                    .zip(expected.iter())
+                    .all(|(segment, name)| {
+                        segment.arguments.is_none() && ident_is(&segment.ident, name)
+                    })
+        })
+}
+
 fn is_trusted_inert_attribute(path: &syn::Path) -> bool {
-    ["cfg", "doc", "must_use", "test"]
+    ["cfg", "doc", "must_use", "no_main", "test"]
         .iter()
         .any(|name| path_is_ident(path, name))
 }
@@ -1209,6 +1256,46 @@ mod tests {
     }
 
     #[test]
+    fn only_the_reviewed_proof_and_fuzz_entry_points_are_accepted() {
+        assert!(source_indirections("#[kani::proof] fn harness() {}").is_empty());
+        assert!(
+            source_indirections("#![no_main] libfuzzer_sys::fuzz_target!(|bytes: &[u8]| {});")
+                .is_empty()
+        );
+        assert_eq!(
+            source_indirections("#[kani::unwind] fn harness() {}"),
+            ["unapproved attribute macro"]
+        );
+        assert_eq!(
+            source_indirections("#[::kani::proof] fn harness() {}"),
+            ["unapproved attribute macro"]
+        );
+        assert_eq!(
+            source_indirections("#[proof] fn harness() {}"),
+            ["unapproved attribute macro"]
+        );
+        assert_eq!(
+            source_indirections("fn f() { fuzz_target!(|bytes: &[u8]| {}); }"),
+            ["unapproved opaque macro"]
+        );
+        assert_eq!(
+            source_indirections("fn f() { other::fuzz_target!(|bytes: &[u8]| {}); }"),
+            ["unapproved opaque macro"]
+        );
+        assert_eq!(
+            source_indirections(
+                "libfuzzer_sys::fuzz_target!(|bytes: &[u8]| { hidden::emit!(); });"
+            ),
+            ["nested unapproved opaque macro"]
+        );
+        assert!(source_indirections("fn f(a: u8, b: u8) { assert!(a != b); }").is_empty());
+        assert_eq!(
+            source_indirections("fn f() { assert!(hidden ! ()); }"),
+            ["nested unapproved opaque macro"]
+        );
+    }
+
+    #[test]
     fn non_rust_text_has_a_strict_zero_radix_policy() {
         let source = concat!(
             "wire value 0",
@@ -1307,6 +1394,26 @@ mod tests {
         assert!(!is_ignored_root_path(
             root,
             Path::new("/workspace/crates/apdu/Cargo.lock")
+        ));
+        for generated in [
+            "/workspace/fuzz/target/debug/build",
+            "/workspace/fuzz/Cargo.lock",
+            "/workspace/fuzz/corpus/ber/input",
+            "/workspace/fuzz/artifacts/ber/crash",
+            "/workspace/fuzz/coverage/ber",
+        ] {
+            assert!(
+                is_ignored_root_path(root, Path::new(generated)),
+                "{generated}"
+            );
+        }
+        assert!(!is_ignored_root_path(
+            root,
+            Path::new("/workspace/fuzz/fuzz_targets/ber.rs")
+        ));
+        assert!(!is_ignored_root_path(
+            root,
+            Path::new("/workspace/fuzz/Cargo.toml")
         ));
     }
 

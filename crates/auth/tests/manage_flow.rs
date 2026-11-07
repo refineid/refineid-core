@@ -246,11 +246,7 @@ fn activation_with_the_code_as_puk_follows_the_puk_floor() {
     assert_eq!(report.pin2, Some(ManageOutcome::Ok));
     assert_eq!(sent, ACTIVATION_COMMAND_COUNT);
 
-    for probe in [
-        counter(TWO_RETRIES),
-        counter(RETRIES_LOCKDOWN_IMMINENT),
-        StatusWord::AuthenticationBlocked,
-    ] {
+    for probe in [counter(TWO_RETRIES), counter(RETRIES_LOCKDOWN_IMMINENT)] {
         let (refused, sent) = activate(probe);
         assert!(matches!(
             refused,
@@ -259,6 +255,14 @@ fn activation_with_the_code_as_puk_follows_the_puk_floor() {
         ));
         assert_eq!(sent, 0);
     }
+
+    // A blocked PUK is the card's to refuse: the activation goes out
+    // and the card answers for itself.
+    let (served, sent) = activate(StatusWord::AuthenticationBlocked);
+    let report = served.expect("the card answers for itself");
+    assert_eq!(report.pin1, Some(ManageOutcome::Ok));
+    assert_eq!(report.pin2, Some(ManageOutcome::Ok));
+    assert_eq!(sent, ACTIVATION_COMMAND_COUNT);
 }
 
 /// An authentication certificate validity start before 13 January 2026.

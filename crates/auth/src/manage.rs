@@ -44,7 +44,7 @@ use refineid_pkcs15::{Pkcs15Error, Pkcs15Ops};
 
 use crate::credentials::{Pin1, Pin2, Puk};
 use crate::pin_lengths::CardPinLengths;
-use crate::retry_risk::{FlooredCredential, PinRetryRisk, RetryFloorRefusal, check_retry_floor};
+use crate::retry_risk::{FlooredCredential, check_last_tries, check_retry_floor};
 use crate::verify::{
     AuthError, PinOps, PinReferenceScheme, PinSlot, PinStatus, VERIFY_INS, VERIFY_P1,
     credential_exchange,
@@ -165,9 +165,11 @@ fn puk_status<T: CardTransport + ?Sized>(
 
 /// Unblock `slot`, resetting its retry counter and setting `new`.
 ///
-/// The PUK's counter is read first and the retry floor applied to it;
-/// at two, one or no tries left, a blocked PUK, or no readable counter,
-/// nothing that carries the PUK is sent. The citizen card then unblocks
+/// The PUK's counter is read first and the PUK's floor applied to it:
+/// at two or one tries left, or no readable counter, nothing that
+/// carries the PUK is sent; at no tries left or a blocked PUK the card
+/// is let answer for itself, as which code the holder has in hand is
+/// never known. The citizen card then unblocks
 /// in one RESET RETRY COUNTER carrying the PUK and the new PIN. The
 /// organizational card verifies the PUK as its own object first, and
 /// only an accepted PUK lets the reset -- carrying only the new PIN --
@@ -239,39 +241,6 @@ pub(crate) fn reset_new_only<T: CardTransport + ?Sized>(
     };
     let status = credential_exchange(transport, scheme, header, &[new])?;
     Ok(classify_manage_sw(status))
-}
-
-/// Refuse an activation PIN change where it would spend one of the
-/// PIN's last two tries, or where the counter cannot be read and so a
-/// last try might be spent unknowingly. At no tries left or blocked the
-/// change goes to the card: it answers for itself and spends nothing,
-/// and which code the holder has in hand (this scheme's activation PIN,
-/// or a PUK) is inferred, never known, so the software does not close
-/// a recovery the card would allow.
-///
-/// # Errors
-///
-/// [`RetryFloorRefusal::TriesBelowFloor`] at two or one tries left;
-/// [`RetryFloorRefusal::CounterUnreadable`] at a count above five or a
-/// status that carries no counter.
-const fn check_activation_last_tries(
-    credential: FlooredCredential,
-    status: PinStatus,
-) -> Result<(), RetryFloorRefusal> {
-    match status {
-        PinStatus::Remaining(remaining) => match PinRetryRisk::from_retries(remaining) {
-            Some(risk) if risk.spends_a_last_try() => Err(RetryFloorRefusal::TriesBelowFloor {
-                credential,
-                remaining,
-            }),
-            Some(_) => Ok(()),
-            None => Err(RetryFloorRefusal::CounterUnreadable { credential }),
-        },
-        PinStatus::Verified | PinStatus::Locked => Ok(()),
-        PinStatus::NoInfo | PinStatus::Other(_) => {
-            Err(RetryFloorRefusal::CounterUnreadable { credential })
-        }
-    }
 }
 
 /// What one activation reading found for each PIN: whether it awaits
@@ -669,7 +638,7 @@ pub trait PinManageOps: PinOps {
                 ];
                 for (slot, changed) in changes {
                     if changed {
-                        check_activation_last_tries(slot.into(), reading.status(slot))
+                        check_last_tries(slot.into(), reading.status(slot))
                             .map_err(AuthError::RetryFloor)?;
                     }
                 }
@@ -1117,14 +1086,10 @@ mod tests {
     }
 
     #[test]
-    fn the_puk_is_never_presented_at_two_one_or_zero_tries_left() {
+    fn the_puk_is_never_presented_at_two_or_one_tries_left() {
         for &scheme in SCHEMES {
             for slot in [PinSlot::Pin1, PinSlot::Pin2] {
-                for count in [
-                    RETRIES_BELOW_FLOOR,
-                    RETRIES_LOCKDOWN_IMMINENT,
-                    RETRIES_EXHAUSTED,
-                ] {
+                for count in [RETRIES_BELOW_FLOOR, RETRIES_LOCKDOWN_IMMINENT] {
                     let (result, transport) = unblock_against(scheme, slot, puk_counter(count));
                     let refused = matches!(
                         result,
@@ -1141,18 +1106,26 @@ mod tests {
     }
 
     #[test]
-    fn a_blocked_or_unreadable_puk_is_never_presented() {
+    fn the_puk_goes_to_the_card_at_zero_tries_left_or_blocked() {
+        // The card answers for itself and spends nothing; whether the
+        // holder's code is a PUK or an activation code is never known,
+        // so the recovery is not closed here.
         for &scheme in SCHEMES {
-            let (blocked, transport) =
-                unblock_against(scheme, PinSlot::Pin1, StatusWord::AuthenticationBlocked);
-            assert!(matches!(
-                blocked,
-                Err(AuthError::RetryFloor(RetryFloorRefusal::Blocked {
-                    credential: FlooredCredential::Puk
-                }))
-            ));
-            assert_eq!(transport.commands.len(), PROBE_ONLY_COMMAND_COUNT);
+            for slot in [PinSlot::Pin1, PinSlot::Pin2] {
+                for probe in [
+                    puk_counter(RETRIES_EXHAUSTED),
+                    StatusWord::AuthenticationBlocked,
+                ] {
+                    let (result, transport) = unblock_against(scheme, slot, probe);
+                    assert_eq!(result.expect("sent to the card"), ManageOutcome::Ok);
+                    assert!(transport.commands.len() > PROBE_ONLY_COMMAND_COUNT);
+                }
+            }
         }
+    }
+
+    #[test]
+    fn an_unreadable_puk_counter_is_never_presented() {
         // The organizational card answers the probe without a counter:
         // nothing further is read, and the PUK is refused.
         let (unreadable, transport) = unblock_against(
@@ -1172,10 +1145,10 @@ mod tests {
     }
 
     #[test]
-    fn the_citizen_puk_container_counter_gates_the_unblock() {
+    fn a_citizen_puk_container_reporting_blocked_lets_the_card_answer() {
         // The citizen probe answers without a counter, so the PIN
         // container is read; a container that reports the PUK blocked
-        // refuses before the reset.
+        // no longer refuses: the reset goes out and the card decides.
         let mut transport = Recorder::new(vec![
             StatusWord::AuthenticationFailed,
             StatusWord::AuthenticationBlocked,
@@ -1186,17 +1159,12 @@ mod tests {
             puk(PUK_DIGITS),
             pin1(NEW_DIGITS),
         );
-        assert!(matches!(
-            result,
-            Err(AuthError::RetryFloor(RetryFloorRefusal::Blocked {
-                credential: FlooredCredential::Puk
-            }))
-        ));
+        assert_eq!(result.expect("sent to the card"), ManageOutcome::Ok);
         assert!(
             transport
                 .commands
                 .iter()
-                .all(|wire| wire[INS_INDEX] != RESET_RETRY_COUNTER_INS)
+                .any(|wire| wire[INS_INDEX] == RESET_RETRY_COUNTER_INS)
         );
     }
 
@@ -1212,13 +1180,10 @@ mod tests {
             puk(PUK_DIGITS),
             pin1(NEW_DIGITS),
         );
-        assert!(matches!(
-            result,
-            Err(AuthError::RetryFloor(RetryFloorRefusal::Blocked {
-                credential: FlooredCredential::Puk
-            }))
-        ));
-        assert_eq!(transport.commands.len(), CONTAINER_READ_COMMAND_COUNT);
+        // The container reports the PUK blocked; the reset still goes
+        // out after the read, for the card to answer.
+        assert_eq!(result.expect("sent to the card"), ManageOutcome::Ok);
+        assert!(transport.commands.len() > CONTAINER_READ_COMMAND_COUNT);
         assert_eq!(transport.commands[1][INS_INDEX], GET_DATA_INS);
     }
 

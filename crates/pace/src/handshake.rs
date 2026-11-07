@@ -1904,7 +1904,7 @@ mod tests {
     }
 
     #[test]
-    fn the_floor_refuses_the_puk_at_two_one_and_no_tries_and_sends_nothing_further() {
+    fn the_floor_refuses_the_puk_at_two_and_one_tries_and_sends_nothing_further() {
         for tries in [TRIES_BELOW_FLOOR, TRIES_SUSPENDED] {
             let (card, result) = puk_run_with_mse_status(counter(tries));
             assert_eq!(card.exchanges, EXCHANGES_THROUGH_MSE);
@@ -1916,13 +1916,18 @@ mod tests {
                 })) if remaining.get() == tries
             ));
         }
+    }
+
+    #[test]
+    fn the_floor_lets_the_card_answer_a_puk_at_no_tries() {
+        // A blocked PUK is the card's to refuse, at no cost: the
+        // handshake goes on past `MSE:Set AT` and the session carries
+        // the blocked state the card reported.
         let (card, result) = puk_run_with_mse_status(counter(0));
-        assert_eq!(card.exchanges, EXCHANGES_THROUGH_MSE);
+        assert_eq!(card.exchanges, EXCHANGES_THROUGH_TOKENS);
         assert!(matches!(
-            result,
-            Err(PaceError::RetryFloor(RetryFloorRefusal::Blocked {
-                credential: FlooredCredential::Puk,
-            }))
+            result.expect("the card answers for itself").counter,
+            Some(PinStatus::Locked)
         ));
     }
 

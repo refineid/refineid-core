@@ -232,15 +232,22 @@ impl core::error::Error for RetryFloorRefusal {}
 /// attempt may be sent, given the counter-safe status the card reported
 /// for that credential.
 ///
-/// Served at five, four or three tries left, and when the card reports
-/// PIN 1 or PIN 2 verified in the current security context -- a
-/// successful verification resets the counter to its maximum. Refused at
-/// two, one or no tries left, at a blocked credential, and at any status
-/// that carries no readable counter: a count above five, and a PUK
-/// reported verified, which carries no count of the try a wrong PUK
-/// would spend. PIN 2
-/// is still presented fresh for every signature; passing the floor is
-/// not an authorization.
+/// A PIN is served at five, four or three tries left, and when the card
+/// reports it verified in the current security context -- a successful
+/// verification resets the counter to its maximum. It is refused at
+/// two, one or no tries left, blocked, and at any status that carries
+/// no readable counter. PIN 2 is still presented fresh for every
+/// signature; passing the floor is not an authorization.
+///
+/// The PUK follows the last-tries rule ([`check_last_tries`]): refused
+/// at two or one tries left and at an unreadable counter -- a count
+/// above five, and a PUK reported verified, which carries no count of
+/// the try a wrong PUK would spend -- but at no tries left, or blocked,
+/// the command goes to the card. The card answers for itself and spends
+/// nothing, and which code the holder has in hand (a PUK, or the
+/// activation code of a card that ships with blocked PINs) is inferred,
+/// never known, so the software does not close a recovery the card
+/// would allow.
 ///
 /// # Errors
 ///
@@ -250,20 +257,61 @@ pub const fn check_retry_floor(
     credential: FlooredCredential,
     status: PinStatus,
 ) -> Result<(), RetryFloorRefusal> {
-    match status {
-        PinStatus::Verified => match credential {
-            FlooredCredential::Pin1 | FlooredCredential::Pin2 => Ok(()),
-            FlooredCredential::Puk => Err(RetryFloorRefusal::CounterUnreadable { credential }),
+    match credential {
+        FlooredCredential::Pin1 | FlooredCredential::Pin2 => match status {
+            PinStatus::Verified => Ok(()),
+            PinStatus::Remaining(remaining) => match PinRetryRisk::from_retries(remaining) {
+                Some(risk) if risk.is_above_floor() => Ok(()),
+                Some(_) => Err(RetryFloorRefusal::TriesBelowFloor {
+                    credential,
+                    remaining,
+                }),
+                None => Err(RetryFloorRefusal::CounterUnreadable { credential }),
+            },
+            PinStatus::Locked => Err(RetryFloorRefusal::Blocked { credential }),
+            PinStatus::NoInfo | PinStatus::Other(_) => {
+                Err(RetryFloorRefusal::CounterUnreadable { credential })
+            }
         },
+        FlooredCredential::Puk => match status {
+            PinStatus::Verified => Err(RetryFloorRefusal::CounterUnreadable { credential }),
+            other => check_last_tries(credential, other),
+        },
+    }
+}
+
+/// The last-tries rule: refuse a command where it would spend one of
+/// the credential's last two tries, or where the counter cannot be read
+/// and so a last try might be spent unknowingly. At no tries left or
+/// blocked the command goes to the card: it answers for itself and
+/// spends nothing. A credential reported verified is served; the PUK's
+/// arm of [`check_retry_floor`] refuses that reading first, as it
+/// carries no count.
+///
+/// This is the rule for the PUK and for the activation PIN of a card
+/// that ships with blocked PINs: which code the holder has in hand is
+/// inferred, never known, so the software does not close a recovery the
+/// card would allow.
+///
+/// # Errors
+///
+/// [`RetryFloorRefusal::TriesBelowFloor`] at two or one tries left;
+/// [`RetryFloorRefusal::CounterUnreadable`] at a count above five or a
+/// status that carries no counter.
+pub const fn check_last_tries(
+    credential: FlooredCredential,
+    status: PinStatus,
+) -> Result<(), RetryFloorRefusal> {
+    match status {
         PinStatus::Remaining(remaining) => match PinRetryRisk::from_retries(remaining) {
-            Some(risk) if risk.is_above_floor() => Ok(()),
-            Some(_) => Err(RetryFloorRefusal::TriesBelowFloor {
+            Some(risk) if risk.spends_a_last_try() => Err(RetryFloorRefusal::TriesBelowFloor {
                 credential,
                 remaining,
             }),
+            Some(_) => Ok(()),
             None => Err(RetryFloorRefusal::CounterUnreadable { credential }),
         },
-        PinStatus::Locked => Err(RetryFloorRefusal::Blocked { credential }),
+        PinStatus::Verified | PinStatus::Locked => Ok(()),
         PinStatus::NoInfo | PinStatus::Other(_) => {
             Err(RetryFloorRefusal::CounterUnreadable { credential })
         }
@@ -383,8 +431,8 @@ mod tests {
     }
 
     #[test]
-    fn two_one_and_zero_tries_are_refused_for_both_pins_and_the_puk() {
-        for &credential in CREDENTIALS {
+    fn two_one_and_zero_tries_are_refused_for_both_pins() {
+        for credential in [FlooredCredential::Pin1, FlooredCredential::Pin2] {
             for &count in REFUSED {
                 assert_eq!(
                     check_retry_floor(credential, remaining(count)),
@@ -394,6 +442,26 @@ mod tests {
                     })
                 );
             }
+        }
+    }
+
+    #[test]
+    fn two_and_one_tries_are_refused_for_the_puk() {
+        for count in [RETRIES_BELOW_FLOOR, RETRIES_LOCKDOWN_IMMINENT] {
+            assert_eq!(
+                check_retry_floor(FlooredCredential::Puk, remaining(count)),
+                Err(RetryFloorRefusal::TriesBelowFloor {
+                    credential: FlooredCredential::Puk,
+                    remaining: retries(count),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn the_puk_goes_to_the_card_at_no_tries_left_or_blocked() {
+        for status in [remaining(RETRIES_EXHAUSTED), PinStatus::Locked] {
+            assert_eq!(check_retry_floor(FlooredCredential::Puk, status), Ok(()));
         }
     }
 
@@ -408,11 +476,13 @@ mod tests {
                 credential: FlooredCredential::Puk
             })
         );
-        for &credential in CREDENTIALS {
+        for credential in [FlooredCredential::Pin1, FlooredCredential::Pin2] {
             assert_eq!(
                 check_retry_floor(credential, PinStatus::Locked),
                 Err(RetryFloorRefusal::Blocked { credential })
             );
+        }
+        for &credential in CREDENTIALS {
             for status in [
                 PinStatus::NoInfo,
                 PinStatus::Other(StatusWord::from_u16(UNMODELED_SW)),
@@ -445,10 +515,10 @@ mod tests {
 
     #[test]
     fn a_puk_refusal_names_the_puk_and_the_tries_left_and_no_other_credential() {
-        let refusals = REFUSED
-            .iter()
-            .map(|&count| (Some(count), remaining(count)))
-            .chain([(None, PinStatus::Locked), (None, PinStatus::NoInfo)]);
+        let refusals = [RETRIES_BELOW_FLOOR, RETRIES_LOCKDOWN_IMMINENT]
+            .into_iter()
+            .map(|count| (Some(count), remaining(count)))
+            .chain([(None, PinStatus::NoInfo)]);
         for (count, status) in refusals {
             let text = check_retry_floor(FlooredCredential::Puk, status)
                 .expect_err("refused")

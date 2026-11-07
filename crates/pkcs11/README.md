@@ -24,12 +24,16 @@ Implemented:
   under a counter below pristine it only bridges to the next operation.
   It is presented to the card inside each sign, never logged, and never written to storage
   (see [credential custody](../../doc/security/credential-custody.md)).
-- Objects: `C_FindObjectsInit` / `C_FindObjects` / `C_FindObjectsFinal` and `C_GetAttributeValue` over three objects
-  -- the authentication certificate (`CKO_CERTIFICATE`, `CKC_X_509`),
+- Objects: `C_FindObjectsInit` / `C_FindObjects` / `C_FindObjectsFinal` and `C_GetAttributeValue` over
+  the authentication certificate (`CKO_CERTIFICATE`, `CKC_X_509`),
   its public key (`CKO_PUBLIC_KEY`, from the certificate SPKI, for
   consumers such as p11tool / libp11 that enumerate public keys),
-  and its private key (`CKO_PRIVATE_KEY`, `CKK_RSA` or `CKK_EC`).
-  They share one `CKA_ID` so NSS pairs them.
+  its private key (`CKO_PRIVATE_KEY`, `CKK_RSA` or `CKK_EC`),
+  the CA certificates the card carries (`CKO_CERTIFICATE`,
+  `CK_CERTIFICATE_CATEGORY_AUTHORITY`), and one NSS trust record
+  (`CKO_NSS_TRUST`) per CA certificate -- see
+  [NSS trust records](#nss-trust-records).
+  The three authentication objects share one `CKA_ID` so NSS pairs them.
   The private key answers `CKA_EXTRACTABLE` false and
   `CKA_NEVER_EXTRACTABLE` / `CKA_ALWAYS_SENSITIVE` true -- the FINEID
   key never leaves the card.
@@ -97,6 +101,56 @@ group id that differs from the real one, such as a PAM stack under
 `sudo` or a display manager -- has no persistent cache and reads the CA
 certificates from the card each time, because its environment may come
 from an unprivileged caller.
+
+## NSS trust records
+
+A FINEID card carries the certificates of its issuing CA (EF.4336)
+and of the DVV root (EF.4334), and the module presents both as
+certificate objects. NSS trusts a certificate on a token only when the
+token also presents a trust record for it, so the module presents, next
+to each CA certificate object, one object of NSS's vendor class
+`CKO_NSS_TRUST` (NSS `lib/util/pkcs11n.h`; the standard `CKO_TRUST`
+class of PKCS#11 v3.2 applies only to modules reporting that version,
+and this one reports 2.40). NSS finds the record by `CKA_CLASS`,
+`CKA_ISSUER` and `CKA_SERIAL_NUMBER` (NSS `lib/dev/devtoken.c`,
+`nssToken_FindTrustForCertificate`), the same issuer and serial the
+certificate object answers, and reads from it the label, the
+certificate's SHA-1 and MD5 digests (`CKA_NSS_CERT_SHA1_HASH`,
+`CKA_NSS_CERT_MD5_HASH`; the MD5 is a lookup key every NSS trust record
+carries, never a decision), the subject, and one trust level per
+purpose:
+
+| Purpose | Attribute | Level |
+| --- | --- | --- |
+| TLS client authentication | `CKA_NSS_TRUST_CLIENT_AUTH` | `CKT_NSS_TRUSTED_DELEGATOR` |
+| Email protection (S/MIME) | `CKA_NSS_TRUST_EMAIL_PROTECTION` | `CKT_NSS_TRUSTED_DELEGATOR` |
+| TLS server authentication | `CKA_NSS_TRUST_SERVER_AUTH` | `CKT_NSS_MUST_VERIFY_TRUST` |
+| Code signing | `CKA_NSS_TRUST_CODE_SIGNING` | `CKT_NSS_MUST_VERIFY_TRUST` |
+
+`CKT_NSS_TRUSTED_DELEGATOR` makes the CA a trust anchor for the
+purpose: NSS accepts a chain that ends at it. `CKT_NSS_MUST_VERIFY_TRUST`
+asserts nothing for the purpose: a chain through the CA must reach some
+other anchor, so a web site or a signed program chaining to the DVV root
+is no more trusted than before. It is not `CKT_NSS_NOT_TRUSTED`, which
+would be an active distrust. `CKA_NSS_TRUST_STEP_UP_APPROVED` is false,
+the record is a public, unmodifiable token object, and `certutil -L`
+shows the pair as the trust string `T,C,` (trusted client CA for TLS,
+trusted CA for email, nothing for object signing).
+
+The purposes follow the card: the holder uses it to authenticate as a
+TLS client and to sign and encrypt mail. The DVV roots are in no
+Mozilla-derived root store (DVV has not applied to Mozilla's root
+program), and this module does not put them in one.
+
+A trust record exists exactly while its CA certificate object does: it
+is built with the token's objects and dropped with them when the card
+leaves the reader, with the certificate objects, the private key and
+the held PIN. A CA certificate served from the per-user cache (above)
+gets the same record as one just read from the card, since the cache
+only ever holds certificates read from a card, so Firefox trusts the
+DVV root while a FINEID card is in the reader and at no other time.
+Nothing is written to the NSS database and no policy file or root
+privilege is involved.
 
 ## Example programs and hardware rigs
 

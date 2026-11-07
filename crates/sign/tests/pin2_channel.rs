@@ -197,11 +197,15 @@ const SIGNATURE_COMMANDS: usize = 4;
 fn a_second_signature_on_the_channel_takes_a_protected_verify() {
     let digest = [DIGEST_FILL; SHA256_LEN];
     let signature = vec![SIG_FILL; RSA_3072_SIG_BYTES];
+    // The second key: SELECT MF, SELECT DF.ESIGN, the VERIFY's own
+    // counter probe (answered verified by this card), the protected
+    // VERIFY, MSE:Set and PSO:CDS.
     let mut channel = pin2_channel(vec![
         success(vec![]),
         success(vec![]),
         success(vec![]),
         success(signature.clone()),
+        success(vec![]),
         success(vec![]),
         success(vec![]),
         success(vec![]),

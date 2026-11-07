@@ -354,14 +354,16 @@ pub trait SignOps: CardTransport {
     /// The returned key borrows the transport exclusively, so no command
     /// can move the card out of that context between the VERIFY and the
     /// signature, and signing consumes it: one verification, one
-    /// signature. The caller applies the retry floor before calling.
+    /// signature. The VERIFY reads PIN 2's counter without spending a
+    /// try and applies the retry floor itself before PIN 2 is sent.
     ///
     /// # Errors
     ///
     /// [`QualifiedUnlockError::Directory`] when DF.ESIGN cannot be made
     /// current (PIN 2 is not sent), [`QualifiedUnlockError::Verify`] on a
-    /// VERIFY transport failure, and [`QualifiedUnlockError::PinRefused`]
-    /// when the card refuses PIN 2.
+    /// VERIFY transport failure or a retry-floor refusal
+    /// (`AuthError::RetryFloor`; PIN 2 is not sent), and
+    /// [`QualifiedUnlockError::PinRefused`] when the card refuses PIN 2.
     fn unlock_qualified_key(
         &mut self,
         scheme: SignScheme,

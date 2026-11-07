@@ -510,8 +510,8 @@ pub enum PaceError<E> {
     /// domain parameter this crate implements.
     NoSupportedSuite,
     /// The retry floor refused the PIN or the PUK before any `GENERAL
-    /// AUTHENTICATE` was sent: the card reported two, one or no tries
-    /// left, or the credential blocked.
+    /// AUTHENTICATE` was sent: the card reported two or one tries left,
+    /// or no readable counter.
     RetryFloor(RetryFloorRefusal),
     /// The card reports the PIN or PUK password deactivated (BSI
     /// TR-03110-3 section B.14.1); nothing was sent after `MSE:Set AT`.
@@ -642,8 +642,9 @@ pub(crate) type ScalarSource<'a> = &'a mut dyn FnMut(&mut [u8]) -> Result<(), rn
 /// A wrong Card Access Number spends no counter and surfaces as a
 /// status-word or token-mismatch failure. A PIN or PUK password is
 /// checked against the retry floor before the first `GENERAL
-/// AUTHENTICATE`: at two, one or no tries left, or a blocked or
-/// deactivated credential, nothing further is sent. A wrong PIN surfaces
+/// AUTHENTICATE`: at two or one tries left, or a deactivated credential,
+/// nothing further is sent; at no tries left the handshake goes on and
+/// the card answers for itself. A wrong PIN surfaces
 /// as [`PaceError::WrongPin`] and a wrong PUK as [`PaceError::WrongPuk`],
 /// each with the tries the card reports left. A session the PUK opened is
 /// a `PaceSession<OpenedByPuk>`, the channel the PIN resets of
@@ -1769,15 +1770,12 @@ mod tests {
     }
 
     #[test]
-    fn the_floor_refuses_a_blocked_pin_and_sends_nothing_further() {
+    fn the_floor_lets_the_card_answer_a_blocked_pin() {
+        // A blocked PIN is the card's to refuse, at no cost: the
+        // handshake goes on past `MSE:Set AT` like it does for the PUK.
         let (exchanges, result) = pin1_run_with_mse_status(counter(0));
-        assert_eq!(exchanges, EXCHANGES_THROUGH_MSE);
-        assert!(matches!(
-            result,
-            Err(PaceError::RetryFloor(RetryFloorRefusal::Blocked {
-                credential: FlooredCredential::Pin1,
-            }))
-        ));
+        assert_eq!(exchanges, EXCHANGES_THROUGH_TOKENS);
+        assert!(result.is_ok(), "the card answers for itself");
     }
 
     #[test]

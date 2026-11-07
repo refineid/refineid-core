@@ -36,12 +36,15 @@
 //! The channel types live in `refineid-pace`, which implements
 //! [`PukPaceChannel`] and [`Pin1PaceChannel`] only for the channels the
 //! matching password opened; the operations here exist only on those
-//! channels. Presenting the credential again is floored like every other
-//! presentation, on the channel's own record of the counter: the
-//! `MSE:Set AT` answer that opened the channel, lowered by every later
-//! answer that reported fewer tries. The counter-safe empty VERIFY is not
-//! the source, because the organizational card does not answer it over
-//! secure messaging with a counter.
+//! channels. Presenting the credential again is floored by the one rule
+//! every presentation follows (`check_retry_floor`), on the channel's
+//! own record of the counter: the `MSE:Set AT` answer that opened the
+//! channel, lowered by every later answer that reported fewer tries. The
+//! record stands in for the counter-safe probe the plain primitives
+//! send, because the organizational card does not answer the empty
+//! VERIFY over secure messaging with a counter; the operations here send
+//! the crate-private commands directly, so the record is read once and
+//! no second probe is made.
 
 use refineid_apdu::CardTransport;
 
@@ -156,8 +159,9 @@ pub trait PukPaceChannelOps: PukPaceChannel + Sized {
     /// # Errors
     ///
     /// [`AuthError::PinLength`] when the card does not accept the length
-    /// of an entry, and [`AuthError::RetryFloor`] when the PUK record is
-    /// below the floor, blocked or unknown; nothing is sent either way.
+    /// of an entry, and [`AuthError::RetryFloor`] when the PUK record
+    /// reads two or one tries left or is unknown; nothing is sent either
+    /// way. At no tries left or blocked the card answers for itself.
     /// [`AuthError`] on a transport failure or state transition. A
     /// refused PUK is [`ManageOutcome::WrongCredential`]; a reset the card
     /// does not authorise on this channel is [`ManageOutcome::Other`].
@@ -206,8 +210,9 @@ pub trait Pin1PaceChannelOps: Pin1PaceChannel + Sized {
     /// # Errors
     ///
     /// [`AuthError::PinLength`] when the card does not accept the length
-    /// of an entry, and [`AuthError::RetryFloor`] when the PIN 1 record is
-    /// below the floor, blocked or unknown; nothing is sent either way.
+    /// of an entry, and [`AuthError::RetryFloor`] when the PIN 1 record
+    /// reads two or one tries left or is unknown; nothing is sent either
+    /// way. At no tries left or blocked the card answers for itself.
     /// [`AuthError`] on a transport failure or state transition. A wrong
     /// current PIN is [`ManageOutcome::WrongCredential`]; a reset the card
     /// does not authorise on this channel is [`ManageOutcome::Other`].

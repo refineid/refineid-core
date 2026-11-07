@@ -315,7 +315,7 @@ was 51 ms.
 A run of the earlier single pairing file, which these four files replace,
 reported the same eight secrecy results above, all true. Its remaining
 queries were still saturating after more than three hours at about
-9.7 GiB.
+9.7 GiB, and its log ends there with no further result.
 
 ### `rapp-v26.11.2.spthy`: no result
 
@@ -324,10 +324,34 @@ derivation checks and was still proving after three hours; it ended
 without a summary. No lemma of this file has been verified or
 falsified.
 
-### Not run
+### Reachability of the premises
 
-A reachability check, which shows that no correspondence above holds
-only because its premise never happens, has not been run.
+Each correspondence above could hold only because its premise never
+happens, so each premise event was also queried for reachability, on
+scratch copies of the files whose queries are replaced by the plain event
+(not part of this directory: a reachable event reports `is false`). Same
+host and limits as above. Every line below reports `is false` with
+`A trace has been found.`, without any assumed hypothesis. The session
+copies omit the `hh` resolution hint, which changes no derivable fact and
+which otherwise keeps ProVerif from completing traces.
+
+| Copy of | Premises shown reachable | Time | Peak memory |
+| :--- | :--- | :--- | :--- |
+| `rapp-pairing-agreement` | `CustodianPairingActive(honest, ...)`, `RequesterPairingActive` | 34 s | 0.99 GiB |
+| `rapp-pairing-withdrawal` | `RequesterVerifiedWithdrawal` | under 0.1 s | 13 MiB |
+| `rapp-session-secrecy` | `RequesterSessionReady`; `CustodianCommandsCard` for an honest document signature, an honest browser authentication and a compromised pairing; `CardSigns` for both actions; `RequesterAcceptsCardStatus` | 7 s | 0.26 GiB |
+| `rapp-session-requests` | `CustodianCommandsCard(honest, ...)` | 53 s | 0.53 GiB |
+| `rapp-session-consent` | `CustodianCommandsCard` for a document signature, honest and compromised | 9 s | 0.30 GiB |
+| `rapp-session-consent`, minimal scenario | `RequesterGetsResult`, `RequesterAcceptsClose` | 5 s | 0.20 GiB |
+
+The minimal scenario has one honest pairing, one session on each side and
+no compromised pairing; a trace in it is a trace of the full file, whose
+other processes can stay idle. On the full file ProVerif found derivations
+for these two premises but did not complete a trace within about ten
+minutes, and those runs were stopped.
+
+`rapp-pairing-secrecy` and `rapp-pairing-guessing` have no correspondence
+queries, so they have no premises to check.
 
 ## What the models leave out
 
@@ -355,6 +379,13 @@ only because its premise never happens, has not been run.
   resistance: unlinkability of routing tags and hints across connections
   (spec §4.3 item 5 "Routing privacy") is not modelled. b3 checks only
   the secrecy of their keys.
+- **Identity and low-order points.** ProVerif's Diffie-Hellman
+  abstraction has no identity or low-order element, so the ProVerif
+  models cannot exercise the rejection of such points that spec §6.1.1
+  and §6.3 require (an identity CPace generator, peer point or shared
+  point, an all-zero X25519 key). They assume it. The Tamarin model
+  states the same assumption as a restriction that excludes the neutral
+  element.
 - **Compromise of the phone or the card**, and forward secrecy after a
   static key leaks.
 - **What a compromised computer may ask for.** A computer that holds a

@@ -346,13 +346,15 @@ pub(crate) fn verify_under_floor<T: CardTransport + ?Sized>(
 
 /// Assemble and send the VERIFY credential command for `slot` under
 /// `scheme`, classifying the card's status word. The caller has applied
-/// the retry floor to the slot's counter ([`verify_under_floor`]).
+/// the retry floor to the slot's counter: [`verify_under_floor`] to the
+/// probe's answer on a plain transport, the PIN 2 channel operation to
+/// the channel's own record.
 ///
 /// # Errors
 ///
 /// [`AuthError`] on a command-assembly failure, a transport failure, or a
 /// transport state transition.
-fn verify_digits<T: CardTransport + ?Sized>(
+pub(crate) fn verify_digits<T: CardTransport + ?Sized>(
     transport: &mut T,
     scheme: PinReferenceScheme,
     slot: PinSlot,

@@ -108,6 +108,7 @@ not stated, so each operation takes `ChannelProof`, named at every call:
 | --- | --- | --- | --- |
 | `reset_pin1_after_puk_pace`, `reset_pin2_after_puk_pace` | `OpenedByPuk` | RESET RETRY COUNTER with the new PIN only | VERIFY the PUK (`12`), then the same reset |
 | `change_pin1_after_pin1_pace` | `OpenedByPin1` | RESET RETRY COUNTER with the new PIN only | CHANGE REFERENCE DATA with the current and new PIN |
+| `qualified_key_after_pin2_pace`, `unlock_qualified_key_after_pin2_pace` (`refineid-sign`) | `OpenedByPin2` | the qualified key once, on the handshake's presentation | VERIFY PIN 2 (`04`) in DF.ESIGN for every later signature, floored on the channel's record |
 
 `PaceHandshake` presents no credential and spends no try; a card that
 does not count the handshake answers it with a refusal such as `6982`.

@@ -46,7 +46,8 @@ use refineid_apdu::{
 };
 use refineid_auth::{
     FlooredCredential, ManageOutcome, PacePasswordKey, Pin1, Pin2, PinReferenceScheme, PinSlot,
-    PinStatus, Puk, RetryFloorRefusal, check_retry_floor, lowered_counter,
+    PinStatus, Puk, RetryFloorRefusal, VerifyOutcome, check_retry_floor, counter_after_verify,
+    lowered_counter,
 };
 use refineid_ber::{BerEncodeError, BerError, BerTag, BerTlv};
 use refineid_pkcs15::Pkcs15Error;
@@ -258,10 +259,15 @@ impl OpenedByPuk {
 /// The proof carries the one PIN 2 presentation the handshake made.
 /// It is spent once, by the qualified key it unlocks: PIN 2 is entered
 /// for every signature (FINEID S4-1 v4.2 sections 4.1 and 8.1.7), so a
-/// second signature on the same channel takes a fresh VERIFY.
+/// second signature on the same channel takes a fresh VERIFY inside the
+/// channel. For that VERIFY it keeps PIN 2's counter as the card last
+/// reported it: the `MSE:Set AT` answer the retry floor served, settled
+/// by every VERIFY's answer on the channel (see
+/// `refineid_auth::Pin2PaceChannel`).
 #[derive(Debug)]
 pub struct OpenedByPin2 {
     unspent: bool,
+    counter: PinStatus,
 }
 
 /// The PIN 2 presentation of a PACE session was already spent.
@@ -277,6 +283,16 @@ impl core::fmt::Display for Pin2PresentationSpent {
 impl core::error::Error for Pin2PresentationSpent {}
 
 impl OpenedByPin2 {
+    /// PIN 2's counter as last reported on the channel.
+    pub(crate) const fn counter(&self) -> PinStatus {
+        self.counter
+    }
+
+    /// Settle the record by the card's answer to a PIN 2 VERIFY.
+    pub(crate) const fn settle(&mut self, answer: VerifyOutcome) {
+        self.counter = counter_after_verify(self.counter, answer);
+    }
+
     /// Spend the session's PIN 2 presentation.
     pub(crate) const fn spend(&mut self) -> Result<(), Pin2PresentationSpent> {
         if self.unspent {
@@ -331,8 +347,11 @@ impl sealed::Sealed for Pin2 {
         Password::Pin2(self)
     }
 
-    fn opened_by(&self, _counter: Option<PinStatus>) -> OpenedByPin2 {
-        OpenedByPin2 { unspent: true }
+    fn opened_by(&self, counter: Option<PinStatus>) -> OpenedByPin2 {
+        OpenedByPin2 {
+            unspent: true,
+            counter: counter.unwrap_or(PinStatus::NoInfo),
+        }
     }
 }
 

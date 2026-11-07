@@ -24,9 +24,12 @@
 use refineid_apdu::iso7816::{
     SelectByAidNoFci, SelectFile, SelectFileResponseMode, SelectFileTarget,
 };
-use refineid_apdu::{Aid, ApduClass, FileId, ResponseApdu, StatusWord};
+use refineid_apdu::{Aid, ApduClass, FileId, PinRetries, ResponseApdu, StatusWord};
 use refineid_auth::verify::VERIFY_INS;
-use refineid_auth::{Pin2, PinReferenceScheme, PinSlot, UnvalidatedSecret};
+use refineid_auth::{
+    AuthError, FlooredCredential, Pin2, PinReferenceScheme, PinSlot, RetryFloorRefusal,
+    UnvalidatedSecret, VerifyOutcome,
+};
 use refineid_pace::testkit::{OrganizationalCard, organizational_card_access};
 use refineid_pace::{OpenedByPin2, Pin2PresentationSpent, SmTransport, run_pace};
 use refineid_pkcs15::ESIGN_AID;
@@ -35,7 +38,8 @@ use refineid_sign::commands::{
     expected_length_le,
 };
 use refineid_sign::{
-    KeyRef, Pin2ChannelError, Pin2ChannelSignOps as _, RSA_3072_SIG_BYTES, SignOps as _, SignScheme,
+    KeyRef, Pin2ChannelError, Pin2ChannelSignOps as _, QualifiedUnlockError, RSA_3072_SIG_BYTES,
+    SignScheme,
 };
 
 /// A synthetic PIN 2, ASCII digits within the organizational bounds.
@@ -47,6 +51,12 @@ const SIG_FILL: u8 = 0xC3;
 /// Index of the instruction byte in a plain command (ISO/IEC 7816-4
 /// section 5.1).
 const INS_INDEX: usize = 1;
+/// Length of a header-only command: the counter-safe probe's shape.
+const HEADER_LENGTH: usize = 4;
+/// The lowest count the retry floor serves.
+const TRIES_AT_FLOOR: u8 = 3;
+/// The highest count the retry floor refuses.
+const TRIES_BELOW_FLOOR: u8 = 2;
 
 fn pin2() -> Pin2 {
     Pin2::reconstruct(UnvalidatedSecret::from_owned_bytes(SYNTHETIC_PIN2.to_vec()))
@@ -54,8 +64,19 @@ fn pin2() -> Pin2 {
 }
 
 fn success(body: Vec<u8>) -> ResponseApdu {
-    let [sw1, sw2] = StatusWord::Success.as_u16().to_be_bytes();
-    ResponseApdu { body, sw1, sw2 }
+    ResponseApdu {
+        body,
+        ..status(StatusWord::Success)
+    }
+}
+
+fn status(sw: StatusWord) -> ResponseApdu {
+    let [sw1, sw2] = sw.as_u16().to_be_bytes();
+    ResponseApdu {
+        body: Vec::new(),
+        sw1,
+        sw2,
+    }
 }
 
 fn select_mf_wire() -> Vec<u8> {
@@ -100,11 +121,33 @@ fn pso_cds_inline_wire(hash: ExternalHashValue, le: u8) -> Vec<u8> {
 /// Open a channel with PACE under PIN 2 against a card that answers the
 /// protected commands with `answers`.
 fn pin2_channel(answers: Vec<ResponseApdu>) -> SmTransport<OrganizationalCard, OpenedByPin2> {
-    let mut card = OrganizationalCard::new(
+    pin2_channel_with(OrganizationalCard::new(
         PinReferenceScheme::Organizational.reference(PinSlot::Pin2),
         SYNTHETIC_PIN2,
         answers,
-    );
+    ))
+}
+
+/// Open a channel with PACE under PIN 2 against a card whose `MSE:Set
+/// AT` reports `tries` left for PIN 2.
+fn pin2_channel_opened_at(
+    tries: u8,
+    answers: Vec<ResponseApdu>,
+) -> SmTransport<OrganizationalCard, OpenedByPin2> {
+    let card = OrganizationalCard::new(
+        PinReferenceScheme::Organizational.reference(PinSlot::Pin2),
+        SYNTHETIC_PIN2,
+        answers,
+    )
+    .answering_mse_with(StatusWord::PinIncorrect {
+        retries: PinRetries::from_nibble(tries).expect("counter value"),
+    });
+    pin2_channel_with(card)
+}
+
+fn pin2_channel_with(
+    mut card: OrganizationalCard,
+) -> SmTransport<OrganizationalCard, OpenedByPin2> {
     let pin = pin2();
     let session = run_pace(&mut card, &organizational_card_access(), &pin)
         .expect("the synthetic card accepts PIN 2");
@@ -115,6 +158,14 @@ fn no_verify(commands: &[Vec<u8>]) -> bool {
     commands
         .iter()
         .all(|command| command.get(INS_INDEX) != Some(&VERIFY_INS))
+}
+
+/// Whether no header-only VERIFY, the counter-safe probe, is among
+/// `commands`.
+fn no_probe(commands: &[Vec<u8>]) -> bool {
+    commands
+        .iter()
+        .all(|command| command.get(INS_INDEX) != Some(&VERIFY_INS) || command.len() > HEADER_LENGTH)
 }
 
 #[test]
@@ -197,15 +248,14 @@ const SIGNATURE_COMMANDS: usize = 4;
 fn a_second_signature_on_the_channel_takes_a_protected_verify() {
     let digest = [DIGEST_FILL; SHA256_LEN];
     let signature = vec![SIG_FILL; RSA_3072_SIG_BYTES];
-    // The second key: SELECT MF, SELECT DF.ESIGN, the VERIFY's own
-    // counter probe (answered verified by this card), the protected
-    // VERIFY, MSE:Set and PSO:CDS.
+    // The second key: SELECT MF, SELECT DF.ESIGN, the protected VERIFY
+    // floored on the channel's record, MSE:Set and PSO:CDS. No
+    // counter-safe probe goes over the channel.
     let mut channel = pin2_channel(vec![
         success(vec![]),
         success(vec![]),
         success(vec![]),
         success(signature.clone()),
-        success(vec![]),
         success(vec![]),
         success(vec![]),
         success(vec![]),
@@ -218,12 +268,80 @@ fn a_second_signature_on_the_channel_takes_a_protected_verify() {
         .sign_prehashed_sha256_rsa(digest)
         .expect("first signature");
     channel
-        .unlock_qualified_key(SignScheme::Organizational, pin2())
+        .unlock_qualified_key_after_pin2_pace(pin2())
         .expect("the second key verifies PIN 2 on the channel")
         .sign_prehashed_sha256_rsa(digest)
         .expect("second signature");
 
     let card = channel.into_inner();
     assert_eq!(card.credential_commands(), 1, "one protected VERIFY");
+    assert_eq!(card.answers_left(), 0);
+    assert!(
+        no_probe(card.protected_commands()),
+        "no header-only VERIFY crossed the channel"
+    );
+}
+
+/// Commands the first signature on the channel sends: SELECT MF, SELECT
+/// DF.ESIGN, MSE:Set and PSO:CDS.
+const FIRST_SIGNATURE_COMMANDS: usize = 4;
+/// Commands a second unlock the card refuses sends: SELECT MF, SELECT
+/// DF.ESIGN and the protected VERIFY.
+const REFUSED_UNLOCK_COMMANDS: usize = 3;
+
+#[test]
+fn a_channel_recording_two_tries_left_refuses_pin2_with_nothing_sent() {
+    let digest = [DIGEST_FILL; SHA256_LEN];
+    let signature = vec![SIG_FILL; RSA_3072_SIG_BYTES];
+    let wrong = StatusWord::PinIncorrect {
+        retries: PinRetries::from_nibble(TRIES_BELOW_FLOOR).expect("counter value"),
+    };
+    // Opened at three tries left; one refused VERIFY lowers the record
+    // to two, and the floor then refuses the next with no traffic.
+    let mut channel = pin2_channel_opened_at(
+        TRIES_AT_FLOOR,
+        vec![
+            success(vec![]),
+            success(vec![]),
+            success(vec![]),
+            success(signature),
+            success(vec![]),
+            success(vec![]),
+            status(wrong),
+        ],
+    );
+    channel
+        .qualified_key_after_pin2_pace()
+        .expect("first key")
+        .sign_prehashed_sha256_rsa(digest)
+        .expect("first signature");
+    let refused = channel
+        .unlock_qualified_key_after_pin2_pace(pin2())
+        .expect_err("the card refuses PIN 2");
+    assert!(matches!(
+        refused,
+        QualifiedUnlockError::PinRefused(VerifyOutcome::WrongPin { .. })
+    ));
+    let floored = channel
+        .unlock_qualified_key_after_pin2_pace(pin2())
+        .expect_err("the floor refuses before anything is sent");
+    assert!(matches!(
+        floored,
+        QualifiedUnlockError::Verify(AuthError::RetryFloor(RetryFloorRefusal::TriesBelowFloor {
+            credential: FlooredCredential::Pin2,
+            ..
+        }))
+    ));
+    let card = channel.into_inner();
+    assert_eq!(
+        card.credential_commands(),
+        1,
+        "PIN 2 crossed the channel once"
+    );
+    assert_eq!(
+        card.protected_commands().len(),
+        FIRST_SIGNATURE_COMMANDS + REFUSED_UNLOCK_COMMANDS,
+        "nothing followed the floor's refusal"
+    );
     assert_eq!(card.answers_left(), 0);
 }

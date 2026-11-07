@@ -612,7 +612,7 @@ the requester; a part named after a colon is one program of it.
 | UCA-13 | Phone | Reports a card present when no card can answer. | P | H-3 | CC-65 |
 | UCA-14 | Phone | Publishes a discovery or withdrawal value derivable from a stable identifier. | P | H-6 | Spec §4.1, §4.3, §4.5 |
 | UCA-15 | Computer | Sends a digest that is not of the document the user chose. | P | H-1 | CC-12, CC-109 |
-| UCA-16 | Computer: browser module | Offers the cached certificate while another card is on the phone. | P | H-3, H-5 | CC-19, CC-60 |
+| UCA-16 | Computer: browser module | Offers the certificate it holds in memory while another card is on the phone. | P | H-3, H-5 | CC-19, CC-60 |
 | UCA-17 | Computer: browser module | Holds a session for hours with no login wanted. | D | H-6, H-7 | R-10 |
 | UCA-18 | Computer: browser module | Redials after `pairing_revoked` before the record is marked revoked. | P | H-4 | CC-22 |
 | UCA-19 | Computer: browser module | Holds the pairing lock while the record lacks a certificate, so nothing fetches it. | P | H-5, H-7 | CC-18 |
@@ -731,8 +731,8 @@ the requester; a part named after a colon is one program of it.
 | CC-10 | The computer treats keychain and token queries as hints and never withdraws an identity on their answer alone. | |
 | CC-11 | The computer bounds every dial and every operation with its own deadline, so a local program always gets an answer. | |
 | CC-12 | The computer's path from the chosen file to the digest it sends is analysed and tested as its own loop (CC-109 to CC-112). | |
-| CC-18 | Whichever process on the computer holds the session fetches a missing certificate and writes it to the pairing record; the read spends no PIN try. | |
-| CC-19 | The computer checks every signature against the cached certificate's key before handing it on; a signature that fails is a device error, never handed on, and the cache is dropped so the next session reads the card again. | |
+| CC-18 | Whichever process on the computer holds the session reads a missing certificate on it and holds it in memory only; no store keeps it ([certificate custody](certificate-custody.md)), and the read spends no PIN try. | |
+| CC-19 | The computer checks every signature against the confirmed certificate's key before handing it on; a signature that fails is a device error, never handed on, and the certificate is dropped so the next session reads the card again. | |
 | CC-20 | The browser module's operation deadline is one named constant below the browsers' handshake timeouts, sent as the operation's lifetime; a late result ends with its session. | §8.1 |
 | CC-22 | A `pairing_revoked` close marks the record revoked before any new dial. | §4.6 item 4 |
 | CC-23 | The pairing lock is a session lock that the kernel releases when its holder exits; record rewrites are atomic renames after a re-read; the session holder re-reads the record at every ping and ends a revoked pairing's session with `pairing_revoked`. | §4.6 item 1 |
@@ -860,5 +860,5 @@ the requester; a part named after a colon is one program of it.
 | R-11 | Over Bluetooth a Mac reaches the phone only while its app runs, and an NFC command from the background needs the holder to answer a notification. An iPad's extension dials its own session beside its app's. | The phone serves all of them (CC-58). |
 | R-12 | The phone's own preparation of a reader card may run between two card exchanges of one operation. | It never splits one exchange and sends no PIN. |
 | R-13 | A wall clock set far ahead expires pairings early; one set back delays expiry. | A new pairing; the recorded time never moves back. |
-| R-14 | A card other than the cached one that shares the access number signs one login challenge that is never delivered; a renewed card costs one failed login. | The check of CC-19 drops the cache. |
+| R-14 | A card other than the one read that shares the access number signs one login challenge that is never delivered; a renewed card costs one failed login. | The check of CC-19 drops the certificate. |
 | R-15 | A timestamp authority that refuses one document of a batch leaves the others written. | The refused one is reported. |

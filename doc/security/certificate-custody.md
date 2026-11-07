@@ -35,40 +35,32 @@ issuing CA beside it. Privileged processes (a PAM module, a display
 manager, anything running as root) read from the card and write no
 cache.
 
-## Personal certificates: memory only, one bounded exception
+## Personal certificates: memory only, no exception
 
-The holder's certificates are held in memory while the card is in the
-reader or the phone session is open, and dropped when the card leaves,
-the session ends or the process exits. No platform writes them to any
-store that survives the process, with one exception.
+The holder's certificates are on a computer only while the card is in a
+reader there or the paired phone is reachable. They are held in memory,
+and dropped when the card leaves, when the phone is no longer reachable
+or its session's grace ends (RAPP v26.11.2 section 8.4 item 3), and when
+the process exits. No platform writes them to any store that outlives
+that: no file, no keychain item, no pairing record, no cache. There is
+no exception.
 
-The exception is the pairing record of a computer paired with a phone
-(RAPP). A browser asks the PKCS#11 token for certificates at its first
-TLS handshake, and a browser offered none resumes that handshake and
-never asks again, so the identity must be offered before the phone has
-answered. The record therefore keeps the paired card's authentication
-certificate, under these bounds:
+A browser asks a PKCS#11 token for certificates at its first TLS
+handshake and does not ask again, so a token for a paired phone that
+holds no certificate yet wakes the phone and waits a bounded time for a
+session to read one. It never offers a stored copy instead.
 
-- a computer holds at most one pairing per operating-system user, and
-  pairing another phone replaces it, so the record never accumulates a
-  history of people;
-- the certificate is dropped from the record after 7 days without a
-  session (`CERTIFICATE_RETENTION_DAYS`), while the pairing itself lives
-  on to the protocol's 30-day expiry and the certificate is read again
-  from the phone at the next session;
-- the record is erased when the holder forgets the pairing, when the
-  pairing is revoked, and when it expires.
-
-The reason for the bound is the shared computer: nobody should be able
-to read from it who has ever used an identity card there. Seven days
-keeps the browser working for a card in weekly use and leaves nothing
-behind for one that is not.
+The owner decided this on 2026-11-08, replacing a 7-day retention in the
+pairing record: a retained certificate lists people who are not there
+and offers an identity nobody can use.
 
 ## What the card is asked for
 
-A session that has unexpired CA certificates cached and, for a paired
-phone, the authentication certificate in the record, reads no
+A session that has unexpired CA certificates cached reads no CA
 certificate from the card until an operation needs one the cache lacks.
+The holder's authentication certificate is read once per presence: when
+the card enters the reader, or on the first session after the phone
+became reachable, and kept in memory while that presence lasts.
 A signature always reads what it signs with from the card; the
 certificate it embeds is the one the card holds at that moment, never a
 cached copy.

@@ -258,6 +258,9 @@ pub struct DocumentRequest {
     /// Credentials are deliberately limited to one authority so they can
     /// never be replayed to a fallback host.
     pub timestamp_credentials: Option<TimestampCredentials>,
+    /// Which build is signing: what happens when the requested level
+    /// cannot be reached. A shell passes [`SigningBuild::THIS`].
+    pub build: SigningBuild,
 }
 
 impl DocumentRequest {
@@ -281,7 +284,10 @@ impl DocumentRequest {
                 "LT and LTA signatures need at least one timestamp authority".to_owned(),
             ));
         }
-        if self.requires_long_term_material() && self.signer_anchors.is_empty() {
+        if self.build == SigningBuild::Release
+            && self.requires_long_term_material()
+            && self.signer_anchors.is_empty()
+        {
             return Err(SignErrorKind::Material {
                 path: MaterialPath::Signer,
                 error: MaterialError::NoTrustAnchor,
@@ -306,6 +312,228 @@ impl DocumentRequest {
         }
         Ok(())
     }
+
+    /// The baseline level this request asks for.
+    #[must_use]
+    pub const fn requested_level(&self) -> BaselineLevel {
+        if self.archive {
+            BaselineLevel::Lta
+        } else if self.long_term {
+            BaselineLevel::Lt
+        } else if self.timestamp_authorities.is_empty() {
+            BaselineLevel::B
+        } else {
+            BaselineLevel::T
+        }
+    }
+
+    /// This request lowered to `level`: the same document, asking for
+    /// no more than `level` adds.
+    #[cfg(debug_assertions)]
+    fn lowered_to(&self, level: BaselineLevel) -> Self {
+        let mut lowered = self.clone();
+        lowered.archive = self.archive && level >= BaselineLevel::Lta;
+        lowered.long_term = self.requires_long_term_material() && level >= BaselineLevel::Lt;
+        if level == BaselineLevel::B {
+            lowered.timestamp_authorities.clear();
+            lowered.timestamp_credentials = None;
+        }
+        lowered
+    }
+
+    /// Refuse, before the private-key operation and so before any PIN
+    /// prompt, a release-build request for long-term material whose
+    /// signer path, at the claimed signing time, can never reach one of
+    /// its anchors ([`crate::material::check_path_reachable`]): the issuer is
+    /// neither among the anchors nor reachable through a CA Issuers
+    /// address. Without it the material could not be collected after
+    /// signing, and a release build saves nothing below the requested
+    /// level. A development build lets the signing go on and saves the
+    /// level it reaches.
+    ///
+    /// # Errors
+    /// [`SignErrorKind::Material`] on the signer path.
+    pub(crate) fn check_signer_path(&self, leaf_der: &[u8]) -> Result<(), SignErrorKind> {
+        if self.build != SigningBuild::Release || !self.requires_long_term_material() {
+            return Ok(());
+        }
+        let signer_path = |error| SignErrorKind::Material {
+            path: MaterialPath::Signer,
+            error,
+        };
+        let time = self.signing_time;
+        let signing_time = DateTime::new(
+            time.year,
+            time.month,
+            time.day,
+            time.hour,
+            time.minute,
+            time.second,
+        )
+        .map_err(|error| {
+            signer_path(MaterialError::Certificate(format!("signing time: {error}")))
+        })?;
+        let anchors: Vec<&[u8]> = self.signer_anchors.iter().map(Vec::as_slice).collect();
+        crate::material::check_path_reachable(leaf_der, signing_time, &anchors).map_err(signer_path)
+    }
+}
+
+/// Which build is signing, fixed when the program is compiled.
+///
+/// The rule, for every platform: a development build may make a
+/// document without long-term validation material, and a release build
+/// makes only the long-term level its request asks for. The switch is
+/// `debug_assertions`, the build profile's and never a runtime
+/// setting: [`Self::THIS`] is [`Self::Development`] in a build with
+/// debug assertions and [`Self::Release`] in one without, and
+/// [`Self::Development`] does not exist without them, so a release
+/// build cannot name it. A shell passes [`Self::THIS`] in every
+/// [`DocumentRequest`] it builds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SigningBuild {
+    /// A signature whose requested level cannot be reached is refused
+    /// with the reason, and nothing is saved.
+    #[default]
+    Release,
+    /// A signature whose requested level cannot be reached is saved at
+    /// the highest level reached, under a name that says so
+    /// ([`BelowRequestedLevel::file_suffix`]), and the report says why
+    /// ([`SignReport::below_requested_level`]).
+    #[cfg(debug_assertions)]
+    Development,
+}
+
+impl SigningBuild {
+    /// This build's kind: [`Self::Development`] with debug assertions.
+    #[cfg(debug_assertions)]
+    pub const THIS: Self = Self::Development;
+    /// This build's kind: [`Self::Release`] without debug assertions.
+    #[cfg(not(debug_assertions))]
+    pub const THIS: Self = Self::Release;
+}
+
+/// The baseline level a signature reaches, as the baseline profiles
+/// name them: `PAdES` (ETSI EN 319 142-1 clause 6), `CAdES` (EN 319
+/// 122-1 clause 6) and `XAdES` (EN 319 132-1 clause 6), which an
+/// `ASiC-E` container's signature carries (EN 319 162-1 clause 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BaselineLevel {
+    /// `B-B`: the signature, its time the signer's word.
+    B,
+    /// `B-T`: with an attested time.
+    T,
+    /// `B-LT`: with the validation material embedded.
+    Lt,
+    /// `B-LTA`: with an archive timestamp over that material.
+    Lta,
+}
+
+impl BaselineLevel {
+    /// The level's name: `B-B`, `B-T`, `B-LT` or `B-LTA`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::B => "B-B",
+            Self::T => "B-T",
+            Self::Lt => "B-LT",
+            Self::Lta => "B-LTA",
+        }
+    }
+
+    /// The next level down, `None` below `B-B`.
+    #[cfg(debug_assertions)]
+    const fn lower(self) -> Option<Self> {
+        match self {
+            Self::B => None,
+            Self::T => Some(Self::B),
+            Self::Lt => Some(Self::T),
+            Self::Lta => Some(Self::Lt),
+        }
+    }
+}
+
+impl fmt::Display for BaselineLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// The word that marks a development-build document's file name.
+const DEVELOPMENT_LABEL: &str = "dev";
+
+/// A development build's document saved below the level its request
+/// asked for: which level it reached and why it reached no higher.
+///
+/// Only a [`SigningBuild::Development`] signing produces one; a
+/// release build refuses instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BelowRequestedLevel {
+    /// The document's format.
+    pub format: Format,
+    /// The level the request asked for.
+    pub requested: BaselineLevel,
+    /// The level the saved document has.
+    pub reached: BaselineLevel,
+    /// Why each higher level failed, highest first, as the refusal a
+    /// release build would have given.
+    pub reasons: Vec<String>,
+}
+
+impl BelowRequestedLevel {
+    /// What the file name carries before its extension, so the
+    /// document cannot pass for a release build's: `-dev-B-T`.
+    #[must_use]
+    pub fn file_suffix(&self) -> String {
+        format!(
+            "{NAME_SEPARATOR}{DEVELOPMENT_LABEL}{NAME_SEPARATOR}{}",
+            self.reached
+        )
+    }
+
+    /// `path` with [`Self::file_suffix`] before its extension.
+    #[must_use]
+    pub fn mark(&self, path: &Path) -> PathBuf {
+        let mut name = path.file_stem().unwrap_or_default().to_os_string();
+        name.push(self.file_suffix());
+        if let Some(extension) = path.extension() {
+            name.push(".");
+            name.push(extension);
+        }
+        path.with_file_name(name)
+    }
+}
+
+/// What joins a file stem and [`BelowRequestedLevel::file_suffix`]'s
+/// parts.
+const NAME_SEPARATOR: &str = "-";
+
+impl fmt::Display for BelowRequestedLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let missing = match (self.reached, self.requested) {
+            (BaselineLevel::B, BaselineLevel::T) => "without a timestamp",
+            (BaselineLevel::B, _) => "without a timestamp or long-term validation material",
+            (BaselineLevel::Lt | BaselineLevel::Lta, _) => "without an archive timestamp",
+            (BaselineLevel::T, _) => "without long-term validation material",
+        };
+        write!(
+            f,
+            "development build: saved as {} {}, {missing}, not the {} a release build requires: {}",
+            format_family(self.format),
+            self.reached,
+            self.requested,
+            self.reasons.join("; ")
+        )
+    }
+}
+
+/// The signature family a format's level is named in.
+const fn format_family(format: Format) -> &'static str {
+    match format {
+        Format::Pades => "PAdES",
+        Format::Cades | Format::CadesDetached => "CAdES",
+        Format::AsicECades => "ASiC-E CAdES",
+        Format::AsicEXades => "ASiC-E XAdES",
+    }
 }
 
 /// Where a signing writes its result.
@@ -329,14 +557,21 @@ impl SignOutput {
         }
     }
 
-    /// Write `bytes` to [`Self::path`] and return that path.
+    /// Write `bytes` to [`Self::path`], marked by `below` when a
+    /// development build saves a document below the requested level
+    /// ([`BelowRequestedLevel::mark`]), and return that path.
     pub(crate) fn write(
         &self,
         best: Option<BestSignatureTime>,
+        below: Option<&BelowRequestedLevel>,
         bytes: &[u8],
     ) -> Result<PathBuf, SignErrorKind> {
         use std::io::Write as _;
         let path = self.path(best);
+        let path = match below {
+            Some(below) => below.mark(&path),
+            None => path,
+        };
         let written = match self {
             Self::At(_) => std::fs::write(&path, bytes),
             Self::SignedName(_) => std::fs::OpenOptions::new()
@@ -420,6 +655,11 @@ pub struct SignReport {
     /// CLI exit-status and the human report don't conflate the
     /// three.
     pub local_verify: LocalVerifyOutcome,
+    /// Set only by a development build that saved the document below
+    /// the requested level: the level reached and why. The holder is
+    /// to be shown it; `None` for a document at the requested level and
+    /// for a bare signature.
+    pub below_requested_level: Option<BelowRequestedLevel>,
 }
 
 /// Whether refineid re-verified the on-card signature against
@@ -1020,12 +1260,123 @@ pub(crate) fn finish_document(
 }
 
 /// Fetch the timestamps and evidence a document signature asked for,
-/// then assemble it.
+/// then assemble it, as the request's [`SigningBuild`] says.
 ///
 /// Everything here needs the network and the signature both, so it can
 /// only run once the signer has answered; it runs with no card session
 /// held.
 fn assemble_document(
+    request: &DocumentRequest,
+    plan: DocumentPlan,
+    parameters: &SignerParameters<'_>,
+    signature_bytes: &[u8],
+    leaf_der: &[u8],
+) -> Result<AssembledDocument, SignErrorKind> {
+    match request.build {
+        SigningBuild::Release => {
+            assemble_at_requested_level(request, plan, parameters, signature_bytes, leaf_der)
+        }
+        #[cfg(debug_assertions)]
+        SigningBuild::Development => {
+            assemble_at_highest_level(request, &plan, parameters, signature_bytes, leaf_der)
+        }
+    }
+}
+
+/// A development build's assembly: the requested level, or else the
+/// highest level below it that can be reached, with the reasons the
+/// higher ones failed.
+///
+/// Only a failure to obtain the level's material lowers it: a
+/// timestamp that cannot be had, or validation material that cannot be
+/// collected (no anchor, no issuer, no revocation answer). A verified
+/// answer that a certificate is revoked, a certificate that is
+/// malformed, expired or wrongly issued, and every other failure are
+/// never lowered past.
+#[cfg(debug_assertions)]
+fn assemble_at_highest_level(
+    request: &DocumentRequest,
+    plan: &DocumentPlan,
+    parameters: &SignerParameters<'_>,
+    signature_bytes: &[u8],
+    leaf_der: &[u8],
+) -> Result<AssembledDocument, SignErrorKind> {
+    let requested = request.requested_level();
+    let mut level = requested;
+    let mut reasons: Vec<String> = Vec::new();
+    loop {
+        let attempt = request.lowered_to(level);
+        match assemble_at_requested_level(
+            &attempt,
+            plan.clone(),
+            parameters,
+            signature_bytes,
+            leaf_der,
+        ) {
+            Ok(mut assembled) => {
+                // An assembly succeeds only at the level it was asked for.
+                let reached = attempt.requested_level();
+                if reached < requested {
+                    assembled.below_requested = Some(BelowRequestedLevel {
+                        format: request.format,
+                        requested,
+                        reached,
+                        reasons,
+                    });
+                }
+                return Ok(assembled);
+            }
+            Err(error) => {
+                let Some(next) = level_below_failure(level, &error) else {
+                    return Err(error);
+                };
+                let reason = error.to_string();
+                if reasons.last() != Some(&reason) {
+                    reasons.push(reason);
+                }
+                level = next;
+            }
+        }
+    }
+}
+
+/// The level a development build tries after `error` at `level`, or
+/// `None` when `error` is not one a lower level answers.
+///
+/// The signer's own path fails the same way at LT as at LTA, so a
+/// signer-path failure goes straight to `B-T`.
+#[cfg(debug_assertions)]
+const fn level_below_failure(level: BaselineLevel, error: &SignErrorKind) -> Option<BaselineLevel> {
+    match error {
+        SignErrorKind::Material { path, error } if material_missing(error) => match path {
+            MaterialPath::Signer if matches!(level, BaselineLevel::Lt | BaselineLevel::Lta) => {
+                Some(BaselineLevel::T)
+            }
+            _ => level.lower(),
+        },
+        SignErrorKind::Timestamp(_) => level.lower(),
+        _ => None,
+    }
+}
+
+/// Whether `error` says the material could not be had, rather than
+/// that a certificate on the path is unusable.
+#[cfg(debug_assertions)]
+const fn material_missing(error: &MaterialError) -> bool {
+    matches!(
+        error,
+        MaterialError::NoChain
+            | MaterialError::NoTrustAnchor
+            | MaterialError::NoIssuer(_)
+            | MaterialError::Revocation(_)
+            | MaterialError::Rng(_)
+    )
+}
+
+/// Assemble the document at exactly the level `request` asks for, or
+/// fail: every path that cannot reach the level returns an error, so
+/// an `Ok` is a document at that level.
+fn assemble_at_requested_level(
     request: &DocumentRequest,
     plan: DocumentPlan,
     parameters: &SignerParameters<'_>,
@@ -1135,6 +1486,9 @@ pub(crate) struct AssembledDocument {
     pub(crate) timestamps: usize,
     /// The earliest validated signature timestamp's `genTime`.
     pub(crate) best_signature_time: Option<BestSignatureTime>,
+    /// Set when a development build saved the document below the
+    /// requested level.
+    pub(crate) below_requested: Option<BelowRequestedLevel>,
 }
 
 impl AssembledDocument {
@@ -1152,6 +1506,7 @@ impl AssembledDocument {
                 archive_timestamp_obtained,
             ),
             best_signature_time: BestSignatureTime::of_signature_timestamps(signature_timestamps),
+            below_requested: None,
         }
     }
 }
@@ -1546,6 +1901,9 @@ impl fmt::Display for SignReport {
             self.slot.key_label(),
             self.local_verify,
         )?;
+        if let Some(below) = &self.below_requested_level {
+            writeln!(f, "{below}")?;
+        }
         Ok(())
     }
 }
@@ -1555,6 +1913,192 @@ mod tests {
     use super::*;
     use crate::test_util::{TestResult, check, check_true};
     use crate::x509_ext::NameExt as _;
+
+    /// The ECC root, a self-signed certificate that names no CA
+    /// Issuers address.
+    const ROOT_ECC: &[u8] = include_bytes!("../test-vectors/dvv-gov-root-ca-g3-ecc.der");
+    /// The RSA root, unrelated to the ECC root.
+    const ROOT_RSA: &[u8] = include_bytes!("../test-vectors/dvv-gov-root-ca-g3-rsa.der");
+
+    /// An LTA request with one authority and the RSA root as the only
+    /// signer anchor, signing in `build`.
+    fn lta_request(build: SigningBuild) -> DocumentRequest {
+        DocumentRequest {
+            archive: true,
+            long_term: true,
+            signer_anchors: vec![ROOT_RSA.to_vec()],
+            timestamp_authorities: vec!["https://tsa.example/qualified".to_owned()],
+            build,
+            ..pades_request()
+        }
+    }
+
+    #[test]
+    fn this_build_signs_as_its_profile_says() -> TestResult {
+        #[cfg(debug_assertions)]
+        let expected = SigningBuild::Development;
+        #[cfg(not(debug_assertions))]
+        let expected = SigningBuild::Release;
+        check(&SigningBuild::THIS, &expected, "the build profile decides")?;
+        check(
+            &SigningBuild::default(),
+            &SigningBuild::Release,
+            "the default is the release rule",
+        )
+    }
+
+    #[test]
+    fn a_release_build_refuses_an_unreachable_signer_path_before_signing() -> TestResult {
+        let refused = lta_request(SigningBuild::Release).check_signer_path(ROOT_ECC);
+        check_true(
+            matches!(
+                &refused,
+                Err(SignErrorKind::Material {
+                    path: MaterialPath::Signer,
+                    error: MaterialError::NoIssuer(_),
+                })
+            ),
+            "no issuer among the anchors and no CA Issuers address",
+        )?;
+        check(
+            &refused.map_err(|error| error.to_string()),
+            &Err("validation material: signer path: no issuer certificate: certificate has no CA Issuers address and is not an approved anchor".to_owned()),
+            "the reason the holder is shown",
+        )?;
+        let mut level_b = lta_request(SigningBuild::Release);
+        level_b.archive = false;
+        level_b.long_term = false;
+        check_true(
+            level_b.check_signer_path(ROOT_ECC).is_ok(),
+            "a level that needs no material checks no path",
+        )
+    }
+
+    #[test]
+    fn the_requested_level_follows_the_request() -> TestResult {
+        let mut request = lta_request(SigningBuild::Release);
+        check(&request.requested_level(), &BaselineLevel::Lta, "archive")?;
+        request.archive = false;
+        check(&request.requested_level(), &BaselineLevel::Lt, "long term")?;
+        request.long_term = false;
+        check(&request.requested_level(), &BaselineLevel::T, "authority")?;
+        request.timestamp_authorities.clear();
+        check(&request.requested_level(), &BaselineLevel::B, "none")
+    }
+
+    #[test]
+    fn a_marked_name_carries_the_reached_level_before_the_extension() -> TestResult {
+        let below = BelowRequestedLevel {
+            format: Format::Pades,
+            requested: BaselineLevel::Lta,
+            reached: BaselineLevel::T,
+            reasons: vec!["validation material: signer path: no anchor".to_owned()],
+        };
+        check(&below.file_suffix(), &"-dev-B-T".to_owned(), "suffix")?;
+        check(
+            &below.mark(Path::new(
+                "/documents/report-signed-2001-02-03T04-05-06Z.pdf",
+            )),
+            &PathBuf::from("/documents/report-signed-2001-02-03T04-05-06Z-dev-B-T.pdf"),
+            "default name",
+        )?;
+        check(
+            &below.mark(Path::new("contract")),
+            &PathBuf::from("contract-dev-B-T"),
+            "no extension",
+        )?;
+        check(
+            &below.to_string(),
+            &"development build: saved as PAdES B-T, without long-term validation material, not the B-LTA a release build requires: validation material: signer path: no anchor".to_owned(),
+            "what the holder is told",
+        )
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_development_build_signs_on_without_an_anchor_or_a_reachable_path() -> TestResult {
+        let mut request = lta_request(SigningBuild::Development);
+        check_true(
+            request.check_signer_path(ROOT_ECC).is_ok(),
+            "the path is left to the finish, which lowers the level",
+        )?;
+        request.signer_anchors.clear();
+        check_true(
+            request.validate_signing_policy().is_ok(),
+            "no anchor lowers the level instead of refusing",
+        )?;
+        request.build = SigningBuild::Release;
+        check_true(
+            request.validate_signing_policy().is_err(),
+            "the release build refuses the same request",
+        )
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn only_a_missing_material_or_timestamp_lowers_the_level() -> TestResult {
+        let signer = |error| SignErrorKind::Material {
+            path: MaterialPath::Signer,
+            error,
+        };
+        check(
+            &level_below_failure(BaselineLevel::Lta, &signer(MaterialError::NoTrustAnchor)),
+            &Some(BaselineLevel::T),
+            "the signer path fails alike at LT",
+        )?;
+        check(
+            &level_below_failure(
+                BaselineLevel::Lta,
+                &SignErrorKind::Timestamp("archive".to_owned()),
+            ),
+            &Some(BaselineLevel::Lt),
+            "an archive timestamp lost",
+        )?;
+        check(
+            &level_below_failure(
+                BaselineLevel::T,
+                &SignErrorKind::Timestamp("tsa".to_owned()),
+            ),
+            &Some(BaselineLevel::B),
+            "the signature timestamp lost",
+        )?;
+        check(
+            &level_below_failure(
+                BaselineLevel::B,
+                &SignErrorKind::Timestamp("tsa".to_owned()),
+            ),
+            &None,
+            "nothing below B-B",
+        )?;
+        check(
+            &level_below_failure(
+                BaselineLevel::Lta,
+                &signer(MaterialError::Revoked {
+                    revoked_at: crate::testkit::day(1),
+                    reason: None,
+                    detail: "revoked".to_owned(),
+                }),
+            ),
+            &None,
+            "a revoked certificate is never signed below its level",
+        )?;
+        check(
+            &level_below_failure(
+                BaselineLevel::Lta,
+                &SignErrorKind::Document(DocumentError::NoInput),
+            ),
+            &None,
+            "a document failure is not a level failure",
+        )?;
+        check(
+            &level_below_failure(
+                BaselineLevel::Lta,
+                &signer(MaterialError::Certificate("expired".to_owned())),
+            ),
+            &None,
+            "an unusable certificate is not missing material",
+        )
+    }
 
     #[test]
     fn timestamp_credentials_are_encoded_and_redacted() -> TestResult {
@@ -1736,6 +2280,7 @@ mod tests {
             signer_anchors: Vec::new(),
             timestamp_authorities: Vec::new(),
             timestamp_credentials: None,
+            build: SigningBuild::Release,
         }
     }
 
@@ -2129,6 +2674,7 @@ mod tests {
             cert_subject_cn: cn,
             pin_retries_after: None,
             local_verify: LocalVerifyOutcome::Ok,
+            below_requested_level: None,
         }
     }
 
@@ -2221,7 +2767,7 @@ mod tests {
         let output = SignOutput::SignedName(pending_name(dir.path())?);
         let taken = output.path(None);
         std::fs::write(&taken, b"earlier")?;
-        let refused = output.write(None, b"signed");
+        let refused = output.write(None, None, b"signed");
         check_true(
             matches!(
                 &refused,
@@ -2241,11 +2787,15 @@ mod tests {
     fn a_default_name_is_written_when_free_and_a_given_path_is_replaced() -> TestResult {
         let dir = crate::test_util::TempDir::new("signed-name-free")?;
         let output = SignOutput::SignedName(pending_name(dir.path())?);
-        let written = output.write(None, b"signed")?;
+        let written = output.write(None, None, b"signed")?;
         check(&written, &output.path(None), "the default name")?;
         check(&std::fs::read(&written)?, &b"signed".to_vec(), "written")?;
         let given = SignOutput::At(written.clone());
-        check(&given.write(None, b"again")?, &written, "the given path")?;
+        check(
+            &given.write(None, None, b"again")?,
+            &written,
+            "the given path",
+        )?;
         check(&std::fs::read(&written)?, &b"again".to_vec(), "replaced")
     }
 }

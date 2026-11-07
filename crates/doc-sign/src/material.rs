@@ -354,6 +354,72 @@ pub fn verify_chain_to_anchor(
     )
 }
 
+/// Whether `leaf_der` can still reach an exact anchor of `anchors`,
+/// judged from the certificates at hand and without the network.
+///
+/// The check a signing makes before the PIN is asked for: a path whose
+/// next link is neither among `anchors` nor reachable through a CA
+/// Issuers address can never be completed, so the long-term material
+/// the signature needs cannot be collected after the signature exists.
+/// A link that would be fetched from a CA Issuers address is not
+/// fetched here; it is left to the collection after signing, which
+/// judges it.
+///
+/// # Errors
+/// [`MaterialError`] when the path, judged offline, can never reach
+/// an anchor of `anchors`: [`MaterialError::NoTrustAnchor`] without
+/// one, [`MaterialError::NoIssuer`] at a certificate that names no CA
+/// Issuers address and has no issuer among `anchors`, or a malformed,
+/// expired or invalid link on the way.
+pub fn check_path_reachable(
+    leaf_der: &[u8],
+    reference_time: DateTime,
+    anchors: &[&[u8]],
+) -> Result<(), MaterialError> {
+    let provider = OfflineEvidence::default();
+    let mut collection = Collection::default();
+    push_candidate(&mut collection, leaf_der);
+    match verify_chain_with(
+        leaf_der,
+        reference_time,
+        anchors,
+        &provider,
+        &mut collection,
+    ) {
+        Ok(_path) => Ok(()),
+        // The walk stops at the first link it would fetch: what that
+        // link holds is the collection's to judge after signing.
+        Err(MaterialError::NoIssuer(_)) if provider.deferred.get() => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Evidence from nothing: records that a link would have been fetched
+/// from a CA Issuers address, and fetches nothing.
+#[derive(Debug, Default)]
+struct OfflineEvidence {
+    deferred: core::cell::Cell<bool>,
+}
+
+impl EvidenceProvider for OfflineEvidence {
+    fn fetch_issuer(&self, _url: &Uri) -> Result<Vec<u8>, String> {
+        self.deferred.set(true);
+        Err("left to the collection after signing".to_owned())
+    }
+
+    fn status(
+        &self,
+        _nonce_policy: NoncePolicy,
+        _subject: &Certificate<'_>,
+        _issuer: &Certificate<'_>,
+        _evidence_time: DateTime,
+    ) -> Result<StatusEvidence, MaterialError> {
+        Err(MaterialError::Revocation(
+            "status is not asked before signing".to_owned(),
+        ))
+    }
+}
+
 /// Material plus every certificate available for later path starts.
 /// Candidate retention is separate from output retention: a card signer
 /// already carried by the signature may still issue another supplied
@@ -2252,6 +2318,46 @@ mod tests {
         check_true(
             name_error.contains("Name Constraints"),
             "unsupported name constraint fails closed",
+        )
+    }
+
+    #[test]
+    fn a_path_to_an_anchor_at_hand_is_reachable_before_signing() -> TestResult {
+        let anchors = [DVV_ROOT_ECC_DER];
+        check(
+            &check_path_reachable(DVV_INTERMEDIATE_DER, reference_time()?, &anchors),
+            &Ok(()),
+            "issuer among the anchors",
+        )
+    }
+
+    #[test]
+    fn a_link_behind_a_ca_issuers_address_is_left_to_the_collection() -> TestResult {
+        let unrelated = [DVV_ROOT_RSA_DER];
+        check(
+            &check_path_reachable(DVV_INTERMEDIATE_DER, reference_time()?, &unrelated),
+            &Ok(()),
+            "the intermediate names a CA Issuers address, fetched only after signing",
+        )
+    }
+
+    #[test]
+    fn a_certificate_without_issuer_or_address_is_refused_before_signing() -> TestResult {
+        let unrelated = [DVV_ROOT_RSA_DER];
+        let error = check_path_reachable(DVV_ROOT_ECC_DER, reference_time()?, &unrelated)
+            .err()
+            .ok_or("a root outside the anchors unexpectedly reachable")?;
+        check(
+            &error,
+            &MaterialError::NoIssuer(
+                "certificate has no CA Issuers address and is not an approved anchor".to_owned(),
+            ),
+            "no issuer and nowhere to fetch one",
+        )?;
+        check(
+            &check_path_reachable(DVV_INTERMEDIATE_DER, reference_time()?, &[]),
+            &Err(MaterialError::NoTrustAnchor),
+            "no anchor at all",
         )
     }
 

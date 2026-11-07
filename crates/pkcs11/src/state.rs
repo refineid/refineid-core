@@ -120,6 +120,20 @@ impl SlotRecord {
         &self.reader_identity
     }
 
+    /// A local reader slot holding a card, for tests that drive the
+    /// entry points without hardware.
+    #[cfg(test)]
+    pub(crate) fn local_for_test(id: CkSlotId, reader: &str) -> Self {
+        Self {
+            id,
+            kind: SlotKind::Local {
+                reader: ReaderId::new(reader.to_owned()),
+            },
+            card_present: true,
+            reader_identity: ReaderIdentity::default(),
+        }
+    }
+
     /// A remote slot, for tests that need one without a source.
     #[cfg(test)]
     pub(crate) fn remote_for_test(
@@ -771,6 +785,18 @@ impl ModuleState {
             .and_then(SlotKind::remote_pair_id)
             .expect("a remote slot");
         let objects = remote_token_objects(&pair_id, certificate).expect("a FINEID certificate");
+        self.cache_token(slot_id, objects)
+    }
+
+    /// Raise a token built elsewhere on a slot, as the slot refresh
+    /// would after reading the card, for tests that drive the entry
+    /// points without hardware.
+    #[cfg(test)]
+    pub(crate) fn raise_token_for_test(
+        &mut self,
+        slot_id: CkSlotId,
+        objects: TokenObjects,
+    ) -> TokenObjects {
         self.cache_token(slot_id, objects)
     }
 

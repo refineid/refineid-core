@@ -30,8 +30,10 @@ Implemented:
   consumers such as p11tool / libp11 that enumerate public keys),
   its private key (`CKO_PRIVATE_KEY`, `CKK_RSA` or `CKK_EC`),
   the CA certificates the card carries (`CKO_CERTIFICATE`,
-  `CK_CERTIFICATE_CATEGORY_AUTHORITY`), and one NSS trust record
-  (`CKO_NSS_TRUST`) per CA certificate -- see
+  `CK_CERTIFICATE_CATEGORY_AUTHORITY`), one NSS trust record
+  (`CKO_NSS_TRUST`) per CA certificate, and one profile object
+  (`CKO_PROFILE`, `CKP_PUBLIC_CERTIFICATES_TOKEN`) declaring the
+  certificates readable without a login -- see
   [NSS trust records](#nss-trust-records).
   The three authentication objects share one `CKA_ID` so NSS pairs them.
   The private key answers `CKA_EXTRACTABLE` false and
@@ -152,22 +154,28 @@ DVV root while a FINEID card is in the reader and at no other time.
 Nothing is written to the NSS database and no policy file or root
 privilege is involved.
 
-When NSS reads the records: the token is a hardware slot that requires
-login, and NSS searches the certificates and trust records of such a
-token only once the user has logged in to it, unless the token is
-marked friendly, that is, its certificates are declared publicly
-readable (NSS `lib/dev/devutil.c`, `search_for_objects`;
-`lib/pk11wrap/pk11slot.c`, `PK11_IsFriendly`). A module registered
-with `modutil -add ... -mechanisms FRIENDLY` is friendly; the Firefox
-`SecurityDevices` policy registers without that flag. So in a Firefox
-that loads the module through the policy, the DVV root is trusted
-from the session's first PIN login on, which the first TLS client
-authentication or the certificate manager triggers; nothing in the
-records prompts for a PIN by itself. Making the token friendly is an
-owner's decision: either the registration flag, or a `CKO_PROFILE`
-object with `CKP_PUBLIC_CERTIFICATES_TOKEN`, which NSS honours the
-same way (and which is not the `CKP_AUTHENTICATION_TOKEN` profile the
-module must never present, see `token.rs`).
+When NSS reads the records: NSS searches the certificates and trust
+records of a hardware token that requires a login only once the user
+has logged in to it, unless the token is friendly, that is, declares
+its certificates publicly readable (NSS `lib/dev/devutil.c`,
+`search_for_objects`; `lib/pk11wrap/pk11slot.c`, `PK11_IsFriendly`).
+This token is friendly by its own declaration: it presents one profile
+object (class `CKO_PROFILE`, a PKCS#11 v3.0 object class) whose
+`CKA_PROFILE_ID` is `CKP_PUBLIC_CERTIFICATES_TOKEN`, as a public,
+unmodifiable token object. NSS reads the profile objects of every
+token when the token appears, before any login and whatever cryptoki
+version the module reports (`PK11_InitToken`, `pk11_ReadProfileList`
+in `pk11slot.c`; this module keeps reporting 2.40), so the DVV root is
+trusted from the moment a FINEID card is in the reader, with no PIN
+login and no `modutil -add ... -mechanisms FRIENDLY` registration
+flag; the Firefox `SecurityDevices` policy registration is enough.
+The declaration is true: the card hands out its certificates, the
+issuing CA and the DVV root to anyone, and no PIN, PUK or CAN is
+involved in reading them. The profile says nothing about the key:
+the private key stays a private object on a card in a local reader,
+and a PIN prompt appears only when a TLS handshake needs the key.
+This is the only profile the token claims; in particular it never
+presents `CKP_AUTHENTICATION_TOKEN` (see `token.rs`, `ObjectKind`).
 
 ## Example programs and hardware rigs
 

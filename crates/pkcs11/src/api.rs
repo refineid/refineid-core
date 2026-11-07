@@ -524,11 +524,14 @@ unsafe extern "C" fn c_get_token_info(slot_id: CkSlotId, info: CkTokenInfoPtr) -
 /// physical card. The PIN's name is written as the card documents
 /// name it, "Basic PIN 1", with no parentheses.
 ///
-/// The Finnish and Swedish forms use DVV's own words for the PINs,
-/// "perustunnusluku" and "allekirjoitustunnusluku", "grundläggande
-/// kod" and "signaturkod" (dvv.fi, PIN-tunnuslukujen hallinta), with
-/// the PIN's number after the word: "Perustunnusluku 1",
-/// "Allekirjoitustunnusluku 2"; "Grundläggande kod 1", "Signaturkod 2".
+/// The Finnish and Swedish forms use the preferred terms of the
+/// Finnish public-sector Certification vocabulary
+/// (sanastot.suomi.fi, concepts "basic PIN" and "signature PIN"),
+/// which DVV's pages follow: "perustunnusluku" and
+/// "allekirjoitustunnusluku", "grund PIN" and "signaturkod", with the
+/// PIN's number after the term: "Perustunnusluku 1",
+/// "Allekirjoitustunnusluku 2"; "Grund PIN 1", "Signaturkod 2".
+/// "Grundkod", which the Apple app once used, is in neither source.
 /// A short "Perus-PIN 1" was considered and dropped: it is correct
 /// Finnish only with the hyphen (Kielitoimiston ohjepankki,
 /// "Yhdysmerkki yhdyssanassa, jossa lyhenne, numero tms.": a compound
@@ -539,7 +542,7 @@ unsafe extern "C" fn c_get_token_info(slot_id: CkSlotId, info: CkTokenInfoPtr) -
 /// The string matches the Apple `TokenExtension` localisation key:
 ///   English  "Basic PIN 1"
 ///   Finnish  "Perustunnusluku 1"
-///   Swedish  "Grundläggande kod 1"
+///   Swedish  "Grund PIN 1"
 const TOKEN_LABEL_IDENTIFY: &str = "Basic PIN 1";
 /// Fixed token label for a card served by a paired phone, which
 /// verifies PIN 1 itself: NSS shows no PIN prompt for it, and the

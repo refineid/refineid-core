@@ -319,10 +319,11 @@ queries were still saturating after more than three hours at about
 
 ### `rapp-v26.11.2.spthy`: no result
 
-A Tamarin 1.12 run on the same host loaded the theory, passed the
-derivation checks and had not finished when this was recorded, after
-more than three hours. No lemma of this file has been verified or
-falsified.
+A Tamarin 1.12 run on the same host loaded the theory and passed the
+derivation checks. After more than four and a half hours it had not
+printed a lemma result: Tamarin itself had used 8 s of CPU and its Maude
+child the rest, one core continuously. No lemma of this file has been
+verified or falsified.
 
 ### Reachability of the premises
 

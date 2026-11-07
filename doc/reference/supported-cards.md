@@ -84,7 +84,9 @@ Certificates - G5R", RSA keys):
   DIGITAL SIGNATURE answers `6A88` unless DF.ESIGN is the current directory.
   With DF.ESIGN selected, VERIFY PIN 2 and an RSA PKCS#1 v1.5 SHA-256
   signature with the organization qualified key reference work.
-- Contactless: the card has no CAN. Before PACE it answers `6985` to every
+- Contactless: the card has no separate CAN; PIN 1 or PIN 2 takes its
+  place as the PACE password, so a holder enters a PIN where a citizen
+  card asks for the CAN. Before PACE it answers `6985` to every
   read except EF.CardAccess. EF.CardAccess lists
   `id-PACE-ECDH-GM-AES-CBC-CMAC-256` and `id-PACE-ECDH-IM-AES-CBC-CMAC-256`,
   each with NIST P-256 and P-384 (standardized domain parameters 12 and

@@ -52,8 +52,14 @@ fn main() {
     }
 }
 
+/// The workspace this run checks: two directories above the manifest
+/// `cargo run` names at run time, never the one compiled in, so a
+/// binary built in one checkout and reused from another, as a shared
+/// target directory allows, still checks the checkout it runs in.
 fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .expect("cargo run sets CARGO_MANIFEST_DIR for xtask");
+    Path::new(&manifest_dir)
         .parent()
         .and_then(Path::parent)
         .expect("xtask is stored at tools/xtask")

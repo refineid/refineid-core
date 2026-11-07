@@ -12,10 +12,14 @@ root=$(git rev-parse --show-toplevel)
 # The workspace version is the UTC day the tree was last committed on.
 # When the day has changed since the stamp, the commit carries a fresh
 # stamp, so no build published from main names an earlier day.
-stamped=$("$root/scripts/version-stamp.sh")
-if [ -n "$stamped" ]; then
-    echo "$stamped"
-    git add "$root/Cargo.toml" "$root/Cargo.lock"
+# The workspace version names the UTC day of the last code-level change.
+# A commit that touches only documentation, workflows or hooks keeps it.
+if git diff --cached --name-only | grep -q -v -E '^(\.github/|\.githooks/|doc/|docs/)|\.md$|^LICENSE|^\.gitignore$|^\.editorconfig$' ; then
+    stamped=$("$root/scripts/version-stamp.sh")
+    if [ -n "$stamped" ]; then
+        echo "$stamped"
+        git add "$root/Cargo.toml" "$root/Cargo.lock"
+    fi
 fi
 
 # Mandatory fast quality gates; bypassing them (--no-verify or

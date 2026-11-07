@@ -320,8 +320,8 @@ queries were still saturating after more than three hours at about
 ### `rapp-v26.11.2.spthy`: no result
 
 A Tamarin 1.12 run on the same host loaded the theory, passed the
-derivation checks and was still proving after three hours; it ended
-without a summary. No lemma of this file has been verified or
+derivation checks and had not finished when this was recorded, after
+more than three hours. No lemma of this file has been verified or
 falsified.
 
 ### Reachability of the premises

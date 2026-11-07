@@ -222,8 +222,8 @@ impl<E: core::fmt::Display> core::fmt::Display for QualifiedUnlockError<E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Directory(e) => write!(f, "select DF.ESIGN: {e}"),
-            Self::Verify(e) => write!(f, "VERIFY PIN 2: {e}"),
-            Self::PinRefused(outcome) => write!(f, "the card refused PIN 2: {outcome:?}"),
+            Self::Verify(e) => write!(f, "VERIFY Signature PIN 2: {e}"),
+            Self::PinRefused(outcome) => write!(f, "the card refused Signature PIN 2: {outcome:?}"),
         }
     }
 }

@@ -21,6 +21,11 @@ may predate its own review:
 - [doc/architecture/case-study-refinement-types-vec-insert.md](doc/architecture/case-study-refinement-types-vec-insert.md)
   -- case study: why `<alloc::vec::Vec>::insert` is bad code, progress and preservation,
   and refinement typing across collections.
+- [doc/architecture/two-implementations.md](doc/architecture/two-implementations.md)
+  -- why the Swift engine in `refineid-apple` is a deliberate second
+  reference implementation of the card stack and RAPP, what makes that
+  an asset (one document, one set of vectors, both engines pass them),
+  and why the Windows duplication is not one.
 
 ## Rule #1: PIN codes and the CAN NEVER travel over any network
 

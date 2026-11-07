@@ -2449,7 +2449,7 @@ mod tests {
 
         /// A P-384 certificate as a phone's session would confirm it.
         const PHONE_CERT_DER: &[u8] =
-            include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+            include_bytes!("../test-certs/fineid-intermediate-01-citizen-g4e.der");
 
         install_answering_phone();
         let pair_id = RemoteSlotId::parse(&"a5".repeat(PAIR_ID_SIZE)).expect("valid pair id");
@@ -2568,7 +2568,7 @@ mod tests {
 
         /// A P-384 certificate standing in for the card's.
         const CARD_CERT_DER: &[u8] =
-            include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+            include_bytes!("../test-certs/fineid-intermediate-01-citizen-g4e.der");
         /// More handles than the token has objects.
         const HANDLE_ROOM: usize = 64;
 

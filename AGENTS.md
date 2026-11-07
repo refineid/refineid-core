@@ -291,10 +291,14 @@ rule in a line and points to the reading behind it; the readings live in
 
 ## Certificates and trust
 
-- Certificates come from the card, which carries its own, or, for external
-  ones (EU eIDAS), from trusted lists at runtime. No certificates or
-  fingerprints are shipped in the software.
-- No pinning or other trust policy is added without the owner's decision.
+- The only certificates shipped are the EU Official Journal's
+  list-signing certificates (`crates/doc-sign/trust-anchors/`), which
+  bootstrap the EU trusted lists. Every other anchor comes from the card
+  when one is present (`EF.4334` root CA, `EF.4336` issuing CA) or from
+  the trusted lists at runtime. Certificates under a `test-vectors/` or
+  `test-certs/` directory are `#[cfg(test)]` fixtures, never anchors.
+- No other certificate, fingerprint, pin or trust policy is added without
+  the owner's decision (recorded in `crates/doc-sign/src/trust.rs`).
 - Describe what the code does and cite the source; ask the owner before
   changing trust behavior.
 

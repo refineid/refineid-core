@@ -1069,11 +1069,11 @@ mod tests {
     /// A P-384 certificate as the source would offer it after checking
     /// it on its session.
     const OFFERED_CERT_DER: &[u8] =
-        include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+        include_bytes!("../test-certs/fineid-intermediate-01-citizen-g4e.der");
 
     /// Another P-384 certificate, for the offer that replaces the
     /// first.
-    const REPLACEMENT_CERT_DER: &[u8] = include_bytes!("../ca-certs/dvv-gov-root-ca-g3-ecc.der");
+    const REPLACEMENT_CERT_DER: &[u8] = include_bytes!("../test-certs/dvv-gov-root-ca-g3-ecc.der");
 
     fn offer(pair_hex: &str, certificate: Option<&[u8]>) -> crate::remote::RemoteOffer {
         crate::remote::RemoteOffer::new(

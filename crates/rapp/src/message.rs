@@ -10,7 +10,7 @@ use super::{
     MANDATORY_PAIRING_SUITE, MANDATORY_SESSION_SUITE, MessageType, OperationId,
     OperationProgressMessage, OperationRequest, OperationRequestRefusal, OperationResultMessage,
     PairId, PingChallenge, ProfileName, RequestError, ResultError, SESSION_READY_NONCE_SIZE,
-    WIRE_VERSION_V26_11_2, WireValue,
+    WIRE_VERSION, WireValue,
 };
 
 /// Pairing-channel parameter echo.
@@ -713,9 +713,9 @@ fn validate_profile_set(profiles: &[ProfileName]) -> Result<(), MessageError> {
 
 fn version_value() -> WireValue {
     WireValue::Array(vec![
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_2.0)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_2.1)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_2.2)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION.0)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION.1)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION.2)),
     ])
 }
 
@@ -875,7 +875,7 @@ mod tests {
         MessageError, close_reason_name, parse_close_reason, require_version, version_value,
     };
     use crate::CloseReason;
-    use crate::{WIRE_VERSION_V26_11_2, WireValue};
+    use crate::{WIRE_VERSION, WireValue};
     use std::collections::BTreeMap;
 
     /// Named so the test states which version is being refused. This constant is
@@ -951,7 +951,7 @@ mod tests {
     fn scalar_version_is_refused() {
         assert_eq!(
             require_version(&mut map_with(WireValue::Unsigned(u64::from(
-                WIRE_VERSION_V26_11_2.0
+                WIRE_VERSION.0
             )))),
             Err(MessageError::InvalidField("version"))
         );

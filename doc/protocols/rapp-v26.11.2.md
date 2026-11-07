@@ -2,9 +2,10 @@
 ## Pairing and Session Protocol over the BLE and Stream Transports
 
 Status: Stamped specification, reviewed by the owner\
-Document version: 26.11.2\
-Wire version: `[26, 11, 2]` (`[Year, Month, Day]`)\
-Offer version: `[26, 11, 2]`\
+Document version: 26.11.2 (section numbering; cited as "RAPP v26.11.2 section N")\
+Wire version: `[26, 11, 7]` (`[Year, Month, Day]`; bumped whenever the wire vocabulary changes, §10.1 item 4)\
+Offer version: `[26, 11, 7]`\
+Wire version history: `[26, 11, 2]` stamped specification; `[26, 11, 7]` adds the `waiting_for_unlock` progress event (§8.2 item 3)\
 Transport Profiles: `"fi.refineid.rapp.ble"`, `"fi.refineid.stream"` (§2.2)\
 Date: 2026-11-02\
 Change controller: RefineID project
@@ -44,10 +45,10 @@ This document defines the complete, standalone normative specification for the *
 This document is completely self-contained: all normative schemas, protocol state machines, cryptographic bindings, error handling rules, and wire formats required to implement, verify, and audit RAPP v26.11.2 are defined herein.
 
 - **Migration and Compatibility**:
-  RAPP v26.11.2 runs the same pairing and session protocol over every registered transport profile (§2.2). Its wire and offer versions are `[26, 11, 2]` (`[Year, Month, Day]`). It does not interoperate with other RAPP versions. Implementations must conform strictly to the schemas and state machines defined in this standalone specification.
+  RAPP v26.11.2 runs the same pairing and session protocol over every registered transport profile (§2.2). Its wire and offer versions are `[26, 11, 7]` (`[Year, Month, Day]`). It does not interoperate with other RAPP versions. Implementations must conform strictly to the schemas and state machines defined in this standalone specification.
 - **Wire and Offer Versioning**:
-  - Offer version: `[26, 11, 2]` in `pairing-offer`.
-  - Wire version: `[26, 11, 2]` (`[Year, Month, Day]`) in channel envelopes, pairing context, and handshake prologues.
+  - Offer version: `[26, 11, 7]` in `pairing-offer`.
+  - Wire version: `[26, 11, 7]` (`[Year, Month, Day]`) in channel envelopes, pairing context, and handshake prologues; the triple changes with every change of wire vocabulary (§10.1 item 4), the document keeps its section numbering.
 - **Role Mapping**:
   - **Requester**: Corresponds to the RAPP Requester. On BLE it operates as GATT Client (Central); on the stream transport it dials the Custodian.
   - **Custodian**: Corresponds to the mobile device acting as the RAPP Authorization Proxy while holding exclusive physical NFC custody of the Credential Holder (FINEID Card). On BLE it operates as GATT Server (Peripheral); on the stream transport it listens.
@@ -66,8 +67,8 @@ This document is completely self-contained: all normative schemas, protocol stat
 
 ### 2.1 Transport Architecture & Protocol Lifecycle
 
-- **Wire Version**: `[26, 11, 2]` (`[Year, Month, Day]`)
-- **Offer Version**: `[26, 11, 2]`
+- **Wire Version**: `[26, 11, 7]` (`[Year, Month, Day]`)
+- **Offer Version**: `[26, 11, 7]`
 - **Transport Profiles**: registered in §2.2
 
 The transport acts as the underlying point-to-point bearer for RAPP frames. CPace establishes the 32-byte pre-shared key (PSK) that seeds mutual pairing authentication (`Noise_XXpsk3`), replay protection, monotonic sequence counters, and typed at-most-once operation dispatch. Every phase below runs unchanged on every registered transport profile; "transport frame" means one SAR-reassembled message on BLE (§5.3) and one length-prefixed frame on the stream transport (§2.2.2).
@@ -76,7 +77,7 @@ The transport acts as the underlying point-to-point bearer for RAPP frames. CPac
 - **Phase 0: Routing**: Every connection starts with exactly one routing preamble transport frame from the Requester (§2.2). For purpose `"pairing"` with an active offer, the connection proceeds to the offer bootstrap. For purpose `"session"` whose routing tag a stored pairing keyed (§2.2.1), the connection transitions to the Noise session phase.
 - **Phase 1: Offer Bootstrap**: The Requester obtains the canonical `pairing-offer`, carrying a fresh random 32-byte `offer_id`, the CPace session identifier (SID), over the transport in use (§4.2): on BLE by reading the Bootstrap Characteristic, on the stream transport as the Custodian's first transport frame after the pairing preamble. Both peers compute the canonical `offer_hash` and bind the transport entry of the offer that names the transport profile in use.
 - **Phase 2: CPace Key Agreement & Confirmation**: Execute the `CPaceRistretto255` key confirmation variant 2 (KC2) profile, one transport frame per CPace message, with Context $C$ binding, mutually authenticating via Hash-based Message Authentication Code (HMAC) tags $T_B$ and $T_A$ to establish $PSK$ via HMAC-based Key Derivation Function (HKDF)-Expand. On success, transition to the Noise pairing phase and consume the offer.
-- **Phase 3: Noise_XXpsk3 Pairing**: Perform the authenticated pairing handshake with prologue bound to canonical `offer_hash`, wire version `[26, 11, 2]`, suite, and the transport profile in use. Immediately on handshake completion, derive pairing-channel `session_id` and `pair_id`. Exchange `pairing.hello` (parameter echo using `session_id`) and `pairing.confirm` (capability grants), deriving `grants_hash`.
+- **Phase 3: Noise_XXpsk3 Pairing**: Perform the authenticated pairing handshake with prologue bound to canonical `offer_hash`, wire version `[26, 11, 7]`, suite, and the transport profile in use. Immediately on handshake completion, derive pairing-channel `session_id` and `pair_id`. Exchange `pairing.hello` (parameter echo using `session_id`) and `pairing.confirm` (capability grants), deriving `grants_hash`.
 - **Phase 4: Pair Storage and Confirmation**: Atomically store the pairing trust record (`pair_id`, `grants_hash`, peer static public key, and local private key), then send `pairing.stored`. The pairing is active on an endpoint only once it has both stored its record and received the peer's `pairing.stored` (§4.3). A stored pairing is not bound to the transport it was created on; sessions may use any registered transport.
 - **Subsequent Operational Sessions**: Operational connections start in the Routing phase, route by a fresh routing tag (§2.2.1), and open a fresh `Noise_KK` session with an independent operational `session_id`, bound to the transport profile of that connection.
 
@@ -250,7 +251,7 @@ The SID used in CPace must be an independent 32-byte cryptographic random value 
 ```cddl
 pairing-offer = {
   "scheme": "rapp",
-  "version": [26, 11, 2],       ; offer version triple
+  "version": [26, 11, 7],       ; offer version triple
   "offer_id": bstr .size 32,    ; 32-byte cryptographic random SID
   "suites": [
     "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512"
@@ -277,7 +278,7 @@ $$\text{offer\_hash} = \text{SHA-256}(\text{encode\_deterministic\_cbor}(\text{p
 ```cddl
 pairing-busy = {
   "scheme": "rapp",
-  "version": [26, 11, 2],       ; offer version triple
+  "version": [26, 11, 7],       ; offer version triple
   "retry_after_ms": 1..5000,     ; milliseconds until the Custodian can admit an attempt
 }
 ```
@@ -286,7 +287,7 @@ The bootstrap answer of a Custodian in pairing mode is `pairing-offer` while it 
 #### Bootstrap Read Flow:
 1. **BLE**: the Custodian exposes the **RAPP Bootstrap Characteristic** (`7E39FD03-A6B5-4D78-9E11-37E28E9545F1`, Read-only). The Requester connects, sends the `"pairing"` routing preamble (§5.2), and performs an `ATT_READ_REQ` on this characteristic to obtain `encode_deterministic_cbor(pairing-offer)`, or `encode_deterministic_cbor(pairing-busy)` while the Custodian cannot admit an attempt.
 2. **Stream**: after receiving the `"pairing"` routing preamble, the Custodian sends `encode_deterministic_cbor(pairing-offer)`, or `encode_deterministic_cbor(pairing-busy)` while it cannot admit an attempt, as its first transport frame; after `pairing-busy` it closes the connection. A Custodian with no active offer closes the connection instead.
-3. The Requester decodes the bootstrap answer. A `pairing-busy` is a busy refusal ("Busy Refusal" below). An offer is rejected unless it is deterministic CBOR matching the schema, carries version `[26, 11, 2]`, lists an acceptable suite, and contains a `transports` entry whose `profile` is the transport profile of the connection. Unsupported suites terminate the pairing flow immediately before CPace; automatic downgrade or fallback to unconfirmed legacy suites is strictly prohibited.
+3. The Requester decodes the bootstrap answer. A `pairing-busy` is a busy refusal ("Busy Refusal" below). An offer is rejected unless it is deterministic CBOR matching the schema, carries version `[26, 11, 7]`, lists an acceptable suite, and contains a `transports` entry whose `profile` is the transport profile of the connection. Unsupported suites terminate the pairing flow immediately before CPace; automatic downgrade or fallback to unconfirmed legacy suites is strictly prohibited.
 4. Both peers bind the `candidate_id` of that entry and the connection's transport profile (§4.3, §6.1.1), use `offer_id` as SID for CPace, and compute `offer_hash` for the Noise pairing prologue.
 5. A deterministic encoding of `pairing-offer` with the KC2 suite, the three registered profiles, and both transport entries stays within the 509-byte ATT value capacity at the minimum ATT Maximum Transmission Unit (MTU) of 512.
 
@@ -313,7 +314,7 @@ A `mode=pairing` record and a BLE advertisement carry nothing derived from the c
    ```cddl
    pairing-prologue = [
      "rapp-pairing",
-     [26, 11, 2],                                                         ; wire version [Year, Month, Day]
+     [26, 11, 7],                                                         ; wire version [Year, Month, Day]
      "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512", ; cryptographic suite name
      bstr .size 32,                                                       ; offer_hash
      tstr                                                                 ; transport profile of the connection (§2.2)
@@ -332,7 +333,7 @@ A `mode=pairing` record and a BLE advertisement carry nothing derived from the c
 
 3. **Parameter Echo & Mutual Grants**:
    - Inside the established pairing channel, each peer sends `pairing.hello`.
-   - `pairing.hello` echoes `offer_hash`, the bound transport profile and `candidate_id` (§4.2), wire version `[26, 11, 2]`, suite name, the sender's display name, its platform description, and, from the Requester, its requested profiles.
+   - `pairing.hello` echoes `offer_hash`, the bound transport profile and `candidate_id` (§4.2), wire version `[26, 11, 7]`, suite name, the sender's display name, its platform description, and, from the Requester, its requested profiles.
    - **Display name**: every `pairing.hello` carries the sender's display name, the name the peer shows for it (§11 item 1). It is required and not blank: 1 to 256 bytes of UTF-8 holding at least one character that is not white space (§7.1); a `pairing.hello` without one aborts the pairing with an authenticated protocol violation. A name that already says the platform carries no operating-system prefix; any other name is prefixed by the operating system's own name, joined by a space, a hyphen and a space (`<operating system> - <name>`). A computer names itself by its host name with the prefix: `macOS - example-host`, `Windows - EXAMPLE-HOST`, `Linux - example-host`, `FreeBSD - example-host`. An iPhone and an iPad name themselves without a prefix, by the name their user gave them where the platform lets the application read it and by their model name otherwise: `iPhone 16`, `iPad Pro 11-inch (M4)`. An Android tablet names itself with the prefix, `Android - Example Tablet`, and an Android phone by its device name without a prefix: the name its user gave it where the platform lets the application read it, and its model name otherwise. A sender whose name would be longer than 256 bytes shortens the device's name at a character boundary until it fits. The `platform` field names the sender's operating system, likewise 1 to 256 bytes and not blank. The operating system's name is its own: `macOS`, `Windows`, `Linux`, `FreeBSD`, `OpenBSD`, `iPadOS`, `Android`. The name is sent again at the start of every session (§7.1, `session.ready` and `session.hello`), so a renamed device's new name reaches its peer with its next session.
    - **Names identify nothing**: a display name is a label for people. No endpoint finds, matches, replaces or revokes a pairing by its display name, its platform or anything else the peer says about itself; a pairing is known only by its `pair_id` and keys.
    - Custodian verifies matching echoes. Any mismatch aborts with an authenticated protocol violation.
@@ -372,7 +373,7 @@ A `mode=pairing` record and a BLE advertisement carry nothing derived from the c
      ```cddl
      session-prologue = [
        "rapp-session",
-       [26, 11, 2],                                                         ; wire version [Year, Month, Day]
+       [26, 11, 7],                                                         ; wire version [Year, Month, Day]
        "Noise_KK_25519_ChaChaPoly_SHA512",                              ; suite name
        pair_id,                                                         ; bstr .size 16
        grants_hash,                                                     ; bstr .size 32
@@ -581,7 +582,7 @@ RAPP v26.11.2 specifies the **`CPaceRistretto255-KC2`** application profile over
   ```cddl
   pairing-context = [
     "rapp-pairing-context",
-    [26, 11, 2],                                                              ; wire version [Year, Month, Day]
+    [26, 11, 7],                                                              ; wire version [Year, Month, Day]
     "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512", ; full suite literal
     tstr,                                                                    ; transport profile of the connection (§2.2)
     tstr,                                                                    ; candidate_id of its offer entry (§4.2)
@@ -725,7 +726,7 @@ Every message inside the Noise pairing phase or the Noise session phase is a det
 
 ```cddl
 rapp-message = {
-  "version": [26, 11, 2],
+  "version": [26, 11, 7],
   "session_id": bstr .size 16,
   "sequence": uint,
   message
@@ -755,7 +756,7 @@ pairing-hello-body = {
 }
 
 negotiated-parameters = {
-  "version": [26, 11, 2],
+  "version": [26, 11, 7],
   "suite": "CPACE-RISTR255-SHA512-RAPP-KC2 + Noise_XXpsk3_25519_ChaChaPoly_SHA512",
   "offer_hash": bstr .size 32,
   "transport_profile": tstr,   ; transport profile of the connection (§2.2)
@@ -790,7 +791,7 @@ session-hello-body = {
 }
 
 session-parameters = {
-  "version": [26, 11, 2],
+  "version": [26, 11, 7],
   "suite": "Noise_KK_25519_ChaChaPoly_SHA512",
   "transport_profile": tstr,   ; transport profile of the connection (§2.2)
   "candidate_id": tstr,        ; its registered candidate_id (§2.2)
@@ -857,6 +858,7 @@ progress-event-val =
   / "consent_shown"
   / "waiting_for_card"
   / "card_wait_ended"
+  / "waiting_for_unlock" ; the Custodian's device is locked (§8.2 item 3); added 2026-11-07
 
 ; 12. Card Presence
 card-status-body = {
@@ -879,12 +881,12 @@ card-status-body = {
 8. **`liveness.ping`** and **`liveness.pong`**: Keepalive sent by either endpoint with a fresh 32-byte `challenge`, echoed exactly by the peer.
 9. **`operation.request`**: Sent by the Requester to start a credential action under a registered profile (§8, §9).
 10. **`operation.result`**: Sent by the Custodian with the outcome of the operation: its status and the response, or the error (§8).
-11. **`operation.progress`**: Sent by the Custodian while an operation is pending, for every change of its state: queued behind another session's operation, a PIN prompt on screen, waiting for the card, card found (§8.2).
+11. **`operation.progress`**: Sent by the Custodian while an operation is pending, for every change of its state: queued behind another session's operation, waiting for the holder to unlock the Custodian's device, a PIN prompt on screen, waiting for the card, card found (§8.2). A Requester shows each event to its user: feedback is never withheld in the name of security.
 12. **`card.status`**: Sent by the Custodian once right after `session.ready` and again whenever the card it holds changes (present or absent, and which card, by the fingerprint of its authentication certificate) or a card reader is attached to it or detached (§8.4).
 13. **`error`**: Sent on a protocol condition that is not an operation outcome, such as a second request while one operation of the session is live; schema and codes in §10.3.
 
 ### 7.2 Envelope Rules
-1. **Version**: `version` is `[26, 11, 2]`, as `[Year, Month, Day]`. A version mismatch in a Noise prologue fails the handshake's AEAD: the link drops and stored pairings stay. An authenticated envelope with any other version closes the session.
+1. **Version**: `version` is `[26, 11, 7]`, as `[Year, Month, Day]`. A version mismatch in a Noise prologue fails the handshake's AEAD: the link drops and stored pairings stay. An authenticated envelope with any other version closes the session.
 2. **Session**: `session_id` is the identifier derived from the handshake hash of the phase the envelope belongs to, the pairing `session_id` of §6.2 or the operational `session_id` of §6.3. An envelope with another `session_id` closes the session.
 3. **Sequence**: `sequence` starts at 0 in each direction and increases by exactly 1 per envelope; it equals the nonce of the Noise cipher state that encrypted the envelope. The first envelope received in a direction has `sequence` 0 and each accepted envelope raises the expected value by 1. An envelope whose `sequence` is not the expected value closes the session. A session ends as §8.3 says; the counter never wraps in practice, and an endpoint that would exceed $2^{64}-1$ closes the session with reason `"normal"`.
 4. **Encapsulation**: The `rapp-message` is encoded as deterministic CBOR (RFC 8949 Section 4.2) and encrypted with ChaCha20-Poly1305 under the direction's Noise cipher state, giving the ciphertext and a 16-byte tag. The ciphertext is one transport frame (§2.2).
@@ -905,7 +907,7 @@ An operation is one credential action, an authentication signature, a document s
 
 1. **Authorization**: The requested profile must be among the pairing's `granted_profiles`; otherwise `operation.result` with `status` `"rejected"` and `error` `"unauthorized"`.
 2. **Queue**: The card serves one operation at a time, across every session the Custodian holds. Operations take the card in the order they arrived. While an operation of another session holds the card, the Custodian sends the waiting operation `operation.progress` with event `"queued"`, once when it joins the queue; when its turn comes it proceeds. An operation that expires in the queue is cancelled as §8.1 item 2 says.
-3. **PIN**: An action that needs a PIN (§9) takes it on the Custodian. When the Custodian does not hold the PIN, it asks the holder on its own screen and, once the prompt is on screen, sends `operation.progress` with event `"consent_shown"`: entering the PIN is the holder's consent, and there is no other consent view; a browser authentication whose PIN 1 the Custodian holds (§11 item 2) runs without a prompt. The prompt renders from a snapshot of the request taken at admission; nothing that arrives later changes it. If the holder declines, the operation ends with `status` `"rejected"` and `error` `"user_cancelled"`; no card command is sent.
+3. **PIN**: A credential action (§9) runs only while the Custodian's device is unlocked. While its lock screen is up, whatever secures it, the Custodian starts no credential command: it sends `operation.progress` with event `"waiting_for_unlock"`, shows the request on the lock screen (which computer asks, and whether it is a login with PIN 1 or a signature with PIN 2), and continues when the holder unlocks within the operation's deadline (§8.1 item 2); the holder is not asked for a PIN the Custodian holds. A card command already sent when the device locks runs to its answer (§8.1 item 3): the holder who approved and then locked the phone gets the result. A device with no lock screen configured is never locked; that is the holder's choice. An action that needs a PIN (§9) takes it on the Custodian. When the Custodian does not hold the PIN, it asks the holder on its own screen and, once the prompt is on screen, sends `operation.progress` with event `"consent_shown"`: entering the PIN is the holder's consent, and there is no other consent view; a browser authentication whose PIN 1 the Custodian holds (§11 item 2) runs without a prompt. The prompt renders from a snapshot of the request taken at admission; nothing that arrives later changes it. If the holder declines, the operation ends with `status` `"rejected"` and `error` `"user_cancelled"`; no card command is sent.
 4. **Card**: The Custodian checks the retry floor (§10.2) and commands the card over NFC or through its reader. While it waits for the holder to present the card it sends `operation.progress` with event `"waiting_for_card"`, and `"card_wait_ended"` when the card is found or the wait is over.
 5. **Result**: The Custodian sends `operation.result` with `status` `"completed"` and the response, `"rejected"` with the error, or `"cancelled"` with the error.
 6. **Reads**: A read-only action (`inspect_card`, `read_identity`, `read_certificate`) commands no private key and no PIN. It takes its turn in the queue and asks the holder nothing.
@@ -1043,6 +1045,8 @@ What an endpoint does when something goes wrong depends on how much it knows abo
 2. **On a session**: a link drop, a timeout, an AEAD failure, a wrong version, a wrong `session_id` or `sequence`. A bit flip and an attacker look the same, so the endpoint closes the session and keeps the pairing; every operation of the session is over (§8). The card is never touched on the way out. A Requester redials a session that ended this way within the redial window (§8.3), except one that ended for an authenticated protocol violation, which it does not redial until the Custodian next appears (§4.5 item 6).
 3. **Inside an operation**: an unknown `operation_id`, an unsupported parameter, a credential the card refused. The endpoint rejects that operation with `operation.result` or `error` (§10.3); the session and the pairing stay.
 
+4. **Unknown vocabulary**: a message type, a progress event, a status, an error name or a field value this version does not define. The endpoint treats it as malformed and fails as items 1 to 3 say for its stage; it never ignores it. There is one version of RAPP, every peer updates together, and an endpoint that meets a word it does not know is talking to a peer it must not trust to mean the same thing. Tolerating unknown vocabulary would let two versions drift apart silently; failing loudly is the design (maintainer decision 2026-11-07).
+
 No failure revokes an active pairing: an active pairing is revoked by its user, by idle expiry, or by its peer's `pairing_revoked` close (§4.6). A pairing whose confirmation fails is undone as §4.3 item 4 says.
 
 ### 10.2 PIN Entry and the Retry Floor
@@ -1078,7 +1082,7 @@ The same names appear in the `error` field of `operation.result`, except `"busy"
 ## 11. PINs and Secrets
 
 1. **What the holder sees is what is signed**: A PIN prompt on the Custodian shows the operation it authorizes and names the paired computer that asked by the display name stored in its pair record, the `display_name` of its `pairing.hello` (§4.3 items 3 and 4). For authentication: the operation and the card holder's name; the prompt names no site and does not show the request's `context`, since no Requester can know the site. For document signing: the `document_name`, or the full list of names for a batch; for a package, its name and every file it holds.
-2. **PIN 1 and PIN 2**: PIN 1 is asked once and held only in the Custodian's memory, never in storage, until the card is removed or replaced (§8.4 item 1), the card rejects it, the holder clears it, the Custodian's process ends or the device restarts; while it is held, a browser authentication runs without a prompt. PIN 2 is entered by the holder on the Custodian for every signature or batch and kept no longer; nothing signs unattended.
+2. **PIN 1 and PIN 2**: PIN 1 is asked once and held only in the Custodian's memory, never in storage, until the card is removed or replaced (§8.4 item 1), the card rejects it, the holder clears it, the Custodian's process ends or the device restarts; while it is held, a browser authentication runs without a prompt. PIN 2 is entered by the holder on the Custodian for every signature or batch and kept no longer; nothing signs unattended. Neither PIN is used while the Custodian's device is locked: the request waits, visible on the lock screen, for the holder to unlock (§8.2 item 3), and the held PIN 1 is kept through the wait.
 3. **Documents stay home**: Document bytes and unhashed browser data never cross RAPP; the Requester hashes locally and sends the digest.
 4. **Secrets never on the wire**: PIN 1, PIN 2, the card access number (CAN) and the PUK have no representation in any RAPP message and never traverse any transport. The Custodian presents them to the card itself; a Requester receives only the signature or the result.
 

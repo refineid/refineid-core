@@ -20,6 +20,20 @@ RefineID rejects both extremes. Our goal is a **sane, refined balance of securit
 
 ---
 
+### 1.1 Feedback First
+STPA treats feedback as part of the control structure: a controller
+without feedback cannot act correctly. RefineID therefore never withholds
+feedback in the name of security. The computer is told why it waits (a
+queue, a lock screen, a PIN prompt, a card wait); the phone shows what is
+asked and by whom. If giving that feedback would break the security
+model, the model is broken and gets fixed; the feedback stays.
+
+### 1.2 One Job, Finished
+A holder who approves a login or a signature and then locks the phone
+has done the natural thing. The operation already on the wire runs to
+its answer; the next one waits for the unlock. The software is there to
+protect and serve, not to drop an approved job on a technicality.
+
 ## 2. The Physical Air-Gap: The True Security Anchor
 
 The fundamental security guarantee of a smart card is that **the private key never leaves the physical chip**.
@@ -49,6 +63,11 @@ PIN 1 protects the **Authentication Role** (identification, TLS client-certifica
   - The click in the browser on the computer **is the human action and intent**.
   - If the card is present (in a reader or on the paired phone proxy) and PIN 1 is held, the operation executes **unattended and seamlessly** (RAPP v26.11.2 section 11 item 2).
   - Requiring a second, redundant "Approve" tap on a phone screen for every routine webpage login is security theater that adds friction without providing meaningful protection.
+
+### 3.1.1 A Locked Phone Serves Nothing
+- When the card is on a paired phone, the phone performs no credential operation while its lock screen is up: no held-PIN 1 login, no PIN prompt, no signature. The request is shown on the lock screen and the computer is told to say "unlock your phone"; unlocking continues it without a PIN prompt when PIN 1 is held.
+- The lock is not an invalidation: the identity, the pairing and the held PIN 1 stay.
+- A phone with no lock screen is never locked. Whether to use auto-lock is the holder's decision, not policed.
 
 ### 3.2 Invalidation Events
 Held PIN 1 is forgotten immediately when:

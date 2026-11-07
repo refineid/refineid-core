@@ -24,7 +24,7 @@ use super::{
     BinaryFrame, CPACE_KC2_SUITE, Envelope, FrameError, GRANTS_HASH_SIZE, GrantsHash,
     MANDATORY_PAIRING_SUITE, MANDATORY_SESSION_SUITE, MAX_FRAME_PLAINTEXT, MAX_FRAME_SIZE,
     MessageType, NOISE_TAG_SIZE, PAIR_ID_SIZE, PairId, PairingSecret, ProfileName, SESSION_ID_SIZE,
-    SequenceGuard, SessionId, WIRE_VERSION_V26_11_2, WireError, WireValue, X25519_KEY_SIZE,
+    SequenceGuard, SessionId, WIRE_VERSION, WireError, WireValue, X25519_KEY_SIZE,
     encode_deterministic_cbor,
     noise::{KkHandshakeState, NoiseTransport},
 };
@@ -540,9 +540,9 @@ fn session_prologue(
 
 fn version_value() -> WireValue {
     WireValue::Array(vec![
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_2.0)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_2.1)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_2.2)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION.0)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION.1)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION.2)),
     ])
 }
 

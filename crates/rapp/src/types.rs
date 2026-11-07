@@ -16,8 +16,16 @@ use core::fmt;
 use sha2::{Digest, Sha256};
 use zeroize::ZeroizeOnDrop;
 
-/// RAPP v26.11.2 wire version triple [Year, Month, Day].
-pub const WIRE_VERSION_V26_11_2: (u16, u16, u16) = (26, 11, 2);
+/// The RAPP wire version triple [Year, Month, Day], carried in channel
+/// envelopes, the pairing context and the handshake prologues.
+///
+/// There is one version of RAPP and every peer updates together: the
+/// triple is bumped whenever the wire vocabulary changes, so that a peer
+/// left behind fails at the handshake rather than later on a word it
+/// does not know (RAPP v26.11.2 section 10.1 item 4). History: `[26, 11,
+/// 2]` the stamped specification; `[26, 11, 7]` adds the
+/// `waiting_for_unlock` progress event.
+pub const WIRE_VERSION: (u16, u16, u16) = (26, 11, 7);
 /// Mandatory RAPP pairing Noise suite.
 pub const MANDATORY_PAIRING_SUITE: &str = "Noise_XXpsk3_25519_ChaChaPoly_SHA512";
 /// Mandatory RAPP session Noise suite (RAPP v26.11.2 section 6.3).

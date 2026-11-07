@@ -136,6 +136,25 @@ transport failure keeps the value; the retry counter read before the next use
 decides: a counter below the one read before the failed attempt means the card
 refused the PIN, and the value is destroyed instead of sent again.
 
+## A locked phone serves nothing
+
+A phone that holds the card for a paired computer (RAPP) performs no
+credential operation while its lock screen is up, whatever secures the
+screen: no login with the held PIN 1, no PIN 1 or PIN 2 prompt, no
+signature. To an ordinary person a locked phone is locked from any use,
+and locking it in a hurry must also stop the card. The identity, the
+pairing and the held PIN 1 stay: a lock is not an invalidation event.
+The request is shown on the lock screen, naming the computer and the
+action, and the computer is told (`operation.progress` event
+`waiting_for_unlock`, RAPP v26.11.2 section 8.2 item 3) so it can say
+"unlock your phone" instead of a silent wait. Unlocking continues the
+request: a held PIN 1 signs with no prompt, a PIN 2 request opens its
+consent screen. A card command already on the wire when the phone locks
+runs to its answer, so the holder who approved and then locked the phone
+gets the result and the card is never left half-way. A phone with no
+lock screen configured is never locked; that is the holder's choice and
+not policed.
+
 ## Mandatory invalidation
 
 Held PIN1 is destroyed on:

@@ -23,8 +23,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     CPACE_KC2_SUITE, OFFER_ID_SIZE, OFFER_TTL_MS, OfferId, TransportCandidate, TransportProfile,
-    WIRE_VERSION_V26_11_2, WireError, WireValue, decode_deterministic_cbor,
-    encode_deterministic_cbor,
+    WIRE_VERSION, WireError, WireValue, decode_deterministic_cbor, encode_deterministic_cbor,
 };
 
 /// Upper bound on an encoded offer: the 509-byte ATT value capacity at the
@@ -496,12 +495,12 @@ impl fmt::Display for PairingOfferError {
 
 impl core::error::Error for PairingOfferError {}
 
-/// The bootstrap answers' version triple, `[26, 11, 2]`.
+/// The bootstrap answers' version triple, `[26, 11, 7]`.
 fn version_triple() -> Vec<WireValue> {
     vec![
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_2.0)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_2.1)),
-        WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_2.2)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION.0)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION.1)),
+        WireValue::Unsigned(u64::from(WIRE_VERSION.2)),
     ]
 }
 
@@ -657,8 +656,8 @@ mod tests {
         PairingOfferError, RETRY_AFTER_FIELD, SCHEME, version_value,
     };
     use crate::{
-        OfferId, ProfileName, TransportCandidate, TransportProfile, WIRE_VERSION_V26_11_2,
-        WireValue, encode_deterministic_cbor,
+        OfferId, ProfileName, TransportCandidate, TransportProfile, WIRE_VERSION, WireValue,
+        encode_deterministic_cbor,
     };
 
     fn profiles() -> Vec<String> {
@@ -781,9 +780,9 @@ mod tests {
         wrong_version.insert(
             "version".to_owned(),
             WireValue::Array(vec![
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_2.0)),
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_2.1)),
-                WireValue::Unsigned(u64::from(WIRE_VERSION_V26_11_2.2) + 1),
+                WireValue::Unsigned(u64::from(WIRE_VERSION.0)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION.1)),
+                WireValue::Unsigned(u64::from(WIRE_VERSION.2) + 1),
             ]),
         );
         assert_eq!(

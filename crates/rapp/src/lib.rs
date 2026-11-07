@@ -164,7 +164,7 @@ pub use types::{
     OPERATION_ID_SIZE, OfferId, OperationId, PAIR_ID_SIZE, PAIRING_SECRET_SIZE, PairId,
     PairingSecret, ProfileName, QUIT_WITHDRAWAL_BOUND_MS, REDIAL_WINDOW_MS,
     REVOCATION_ATTEMPT_BOUND_MS, SESSION_ID_SIZE, SESSION_READY_NONCE_SIZE, SessionId,
-    WIRE_VERSION_V26_11_2, X25519_KEY_SIZE,
+    WIRE_VERSION, X25519_KEY_SIZE,
 };
 pub use wire::{
     Envelope, MessageType, SequenceGuard, WireError, WireValue, decode_deterministic_cbor,

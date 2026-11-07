@@ -156,7 +156,7 @@ claims, and the one in-source annotation dialect are in
 ## Commits and publication
 
 - Imperative subject, explanatory body; no attribution trailers of any
-  kind.
+  kind. The tracked `commit-msg` hook refuses a message that carries one.
 - This is a public repository. No private paths, no unpublished project
   context, no personal data, and no secrets -- test PINs and card
   numbers included -- in any file, fixture, comment, or commit message.

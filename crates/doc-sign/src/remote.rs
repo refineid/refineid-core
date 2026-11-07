@@ -156,7 +156,7 @@ impl fmt::Display for PhoneRefusal {
             Self::Expired => "the phone did not answer in time",
             Self::CardUnavailable => "the phone's card did not answer",
             Self::RetryFloor => {
-                "the card's remaining PIN 2 tries are reserved for the card issuer's software"
+                "the card's remaining Signature PIN 2 tries are reserved for the card issuer's software"
             }
             Self::NotGranted => "the pairing is not granted document signing",
             Self::Unsupported => "the phone refused the request's parameters",

@@ -270,7 +270,7 @@ pub struct Pin2PresentationSpent;
 
 impl core::fmt::Display for Pin2PresentationSpent {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("PACE: the PIN 2 presentation of this session is spent")
+        f.write_str("PACE: the Signature PIN 2 presentation of this session is spent")
     }
 }
 

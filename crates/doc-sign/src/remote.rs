@@ -133,8 +133,9 @@ pub enum PhoneRefusal {
     /// The phone's card did not answer: no card within the wait, the
     /// field lost, a transmission fault (`card_error`).
     CardUnavailable,
-    /// The card reports fewer than three PIN 2 tries left, so the phone
-    /// sent no verification (`retry_floor`).
+    /// The phone ended the request at the retry floor (`retry_floor`):
+    /// two or one PIN 2 tries left or an unreadable counter, with no
+    /// verification sent, or no tries left or a blocked PIN 2.
     RetryFloor,
     /// The pairing is not granted document signing (`unauthorized`).
     NotGranted,

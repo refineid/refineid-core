@@ -3100,7 +3100,8 @@ impl RappPairRecord {
     /// [`RappSessionBridge::deliver_revocation_notice`], waits at most
     /// [`rapp_quit_withdrawal_bound_ms`] for the custodian's echo with
     /// [`RappSessionBridge::receive_close_echo`], and calls [`Self::revoke`]
-    /// on the echo (`CloseAcknowledged`) alone (§7.1 item 7). A failed
+    /// on `CloseAcknowledged` with `close_reason` `PairingRevoked` alone
+    /// (§7.1 item 7); a crossing close of another reason keeps the record. A failed
     /// connection or a close without its echo keeps the record for the
     /// custodian's next appearance, until [`Self::revocation_notice_expired`]
     /// says its idle expiry passed. The record offers no identity and starts
@@ -3109,8 +3110,9 @@ impl RappPairRecord {
     /// With a session open, forget the record here, close the session with
     /// reason `pairing_revoked`, wait at most
     /// [`rapp_quit_withdrawal_bound_ms`] for the echo (`CloseAcknowledged`
-    /// from the operation bridge), and call [`Self::revoke`] on the echo; a
-    /// custodian calls it once the wait ended either way.
+    /// from the operation bridge with `close_reason` `PairingRevoked`), and
+    /// call [`Self::revoke`] on it; a custodian calls it once the wait ended
+    /// either way.
     ///
     /// # Errors
     /// [`RappBindingError`] on an already-revoked record or a storage
@@ -3513,9 +3515,7 @@ impl RappSessionBridge {
     ) -> Result<Vec<u8>, RappBindingError> {
         let nonce = fixed_array(nonce)?;
         let display_name = display_name_input(display_name)?;
-        if self.is_forgotten()? {
-            return Err(RappBindingError::WrongPhase);
-        }
+        let record = self.unforgotten_record()?;
         let mut state = self.lock_state()?;
         let SessionBridgeState::Authentication(authentication) = &mut *state else {
             return Err(RappBindingError::WrongPhase);
@@ -3530,6 +3530,7 @@ impl RappSessionBridge {
                 _ => RappBindingError::ProtocolFailure,
             });
         drop(state);
+        drop(record);
         frame
     }
 
@@ -3574,9 +3575,9 @@ impl RappSessionBridge {
     ) -> Result<RappBridgeAction, RappBindingError> {
         let frame = BinaryFrame::reconstruct(bytes).map_err(|_| RappBindingError::InvalidInput)?;
         let display_name = display_name_input(display_name)?;
-        if self.is_forgotten()? {
-            return Err(RappBindingError::WrongPhase);
-        }
+        // The record is held, then the state (the one lock order), from the
+        // forgotten check to the hello, so no forget lands between them.
+        let record = self.unforgotten_record()?;
         let mut state = self.lock_state()?;
         let SessionBridgeState::Authentication(authentication) = &mut *state else {
             return Err(RappBindingError::WrongPhase);
@@ -3587,6 +3588,7 @@ impl RappSessionBridge {
                     .send_hello(&display_name)
                     .map_err(|_| RappBindingError::ProtocolFailure);
                 drop(state);
+                drop(record);
                 let hello = hello?;
                 // A refused store keeps the old name; the next session tries again.
                 let _ = self
@@ -3608,6 +3610,7 @@ impl RappSessionBridge {
                     *state = SessionBridgeState::Closed;
                 }
                 drop(state);
+                drop(record);
                 return Ok(action.with_requester_end());
             }
             Err(super::SessionError::IntegrityFailure) => {
@@ -3617,6 +3620,7 @@ impl RappSessionBridge {
         };
         *state = SessionBridgeState::Closed;
         drop(state);
+        drop(record);
         Ok(action.with_requester_end())
     }
 
@@ -3627,8 +3631,12 @@ impl RappSessionBridge {
     ///
     /// - `CloseAcknowledged`: the peer's echo arrived, or a close with
     ///   another reason crossed this one, in `close_reason`; drop the link.
-    ///   After a revocation close the peer forgot the pairing; revoke the
-    ///   record with [`RappPairRecord::revoke`].
+    ///   After a revocation close the peer forgot the pairing only when
+    ///   `close_reason` is `PairingRevoked`, its echo or its own revocation
+    ///   crossing this one; then revoke the record with
+    ///   [`RappPairRecord::revoke`]. A crossing close with another reason
+    ///   is not the echo: a requester keeps the record in its revocation
+    ///   backlog (RAPP §4.6 item 6).
     /// - `NoAction`: another message, such as the Custodian's
     ///   `session.ready` or `card.status`; it is ignored and the wait goes
     ///   on.
@@ -3697,9 +3705,7 @@ impl RappSessionBridge {
     /// [`RappBindingError`] on the wrong phase, a forgotten record, or a
     /// ready not yet sent or verified.
     pub fn enter_established(&self) -> Result<(), RappBindingError> {
-        if self.is_forgotten()? {
-            return Err(RappBindingError::WrongPhase);
-        }
+        let record = self.unforgotten_record()?;
         let mut state = self.lock_state()?;
         let previous = core::mem::replace(&mut *state, SessionBridgeState::Failed);
         let SessionBridgeState::Authentication(authentication) = previous else {
@@ -3710,6 +3716,7 @@ impl RappSessionBridge {
             .map_err(|_| RappBindingError::ProtocolFailure)?;
         *state = SessionBridgeState::Established(endpoint);
         drop(state);
+        drop(record);
         Ok(())
     }
 
@@ -3730,13 +3737,26 @@ impl RappSessionBridge {
     /// `CloseAcknowledged` or the wait ends (§7.1 item 7), drop the link,
     /// then destroy the record with [`RappPairRecord::revoke`].
     ///
+    /// `now_ms` is milliseconds since the Unix epoch: a record whose
+    /// notice expired then ([`RappPairRecord::revocation_notice_expired`])
+    /// sends nothing, and the caller revokes it untold (§4.6 item 3).
+    ///
     /// # Errors
     /// [`RappBindingError::WrongPhase`] outside authentication, after the
-    /// Custodian's `session.ready`, or for a record that is not forgotten,
-    /// and [`RappBindingError::ProtocolFailure`] when the close cannot be
+    /// Custodian's `session.ready`, for a record that is not forgotten, or
+    /// for one whose notice expired at `now_ms`, and
+    /// [`RappBindingError::ProtocolFailure`] when the close cannot be
     /// sealed.
-    pub fn deliver_revocation_notice(&self) -> Result<Vec<u8>, RappBindingError> {
-        if !self.is_forgotten()? {
+    pub fn deliver_revocation_notice(&self, now_ms: u64) -> Result<Vec<u8>, RappBindingError> {
+        let record = self
+            .pair
+            .record
+            .lock()
+            .map_err(|_| RappBindingError::LocalStateFailure)?;
+        let owes_notice = record.as_ref().is_some_and(|record| {
+            record.forgotten_at_ms().is_some() && !record.revocation_notice_expired(now_ms)
+        });
+        if !owes_notice {
             return Err(RappBindingError::WrongPhase);
         }
         let mut state = self.lock_state()?;
@@ -3751,6 +3771,7 @@ impl RappSessionBridge {
             *state = SessionBridgeState::Closed;
         }
         drop(state);
+        drop(record);
         sealed
             .map(super::BinaryFrame::into_bytes)
             .map_err(|_| RappBindingError::ProtocolFailure)
@@ -3821,9 +3842,19 @@ impl RappSessionBridge {
             .map_err(|_| RappBindingError::LocalStateFailure)
     }
 
-    fn is_forgotten(&self) -> Result<bool, RappBindingError> {
-        self.pair
-            .with_record(|record| Ok(record.forgotten_at_ms().is_some()))
+    /// The pair record, held: [`RappBindingError::WrongPhase`] once it is
+    /// revoked or forgotten. Holding it across a step on the session state
+    /// (always taken after it) keeps a forget from landing in that step.
+    fn unforgotten_record(&self) -> Result<MutexGuard<'_, Option<PairRecord>>, RappBindingError> {
+        let record = self
+            .pair
+            .record
+            .lock()
+            .map_err(|_| RappBindingError::LocalStateFailure)?;
+        match record.as_ref() {
+            Some(held) if held.forgotten_at_ms().is_none() => Ok(record),
+            _ => Err(RappBindingError::WrongPhase),
+        }
     }
 
     /// Hand the established endpoint to an operation bridge, with the
@@ -5609,7 +5640,7 @@ mod routing_binding_tests {
                 Err(RappBindingError::WrongPhase)
             ));
             let notice = custodian
-                .deliver_revocation_notice()
+                .deliver_revocation_notice(CREATED_AT_MS)
                 .expect("the close is the first message");
             let closed = requester
                 .receive_ready(notice, NOW_MS, REQUESTER_NAME.to_owned())
@@ -5646,7 +5677,7 @@ mod routing_binding_tests {
                 RappOperationBridge::begin_proxy(custodian, MAXIMUM_LIFETIME_MS, NOW_MS)
                     .expect("custodian operations");
             let notice = requester
-                .deliver_revocation_notice()
+                .deliver_revocation_notice(CREATED_AT_MS)
                 .expect("the close is the first message");
             let closed = custodian
                 .receive_frame(notice, NOW_MS)
@@ -5723,6 +5754,7 @@ mod routing_binding_tests {
         fn custodian_appears(
             requester_record: &Arc<RappPairRecord>,
             custodian_record: &Arc<RappPairRecord>,
+            appeared_ms: u64,
         ) -> RappBridgeAction {
             let (requester, custodian) = authenticating(requester_record, custodian_record);
             let ready = custodian
@@ -5733,7 +5765,7 @@ mod routing_binding_tests {
                 RappOperationBridge::begin_proxy(custodian, MAXIMUM_LIFETIME_MS, NOW_MS)
                     .expect("custodian operations");
             let notice = requester
-                .deliver_revocation_notice()
+                .deliver_revocation_notice(appeared_ms)
                 .expect("the close is the first message");
             let closed = custodian
                 .receive_frame(notice, NOW_MS)
@@ -5781,7 +5813,7 @@ mod routing_binding_tests {
                     .expect("expiry"),
                 "the forgotten pairing is still in the backlog"
             );
-            let echo = custodian_appears(&requester_record, &custodian_record());
+            let echo = custodian_appears(&requester_record, &custodian_record(), appeared_ms);
             destroy_on_echo(&echo, &requester_record, &vault, appeared_ms);
         }
 
@@ -5842,6 +5874,94 @@ mod routing_binding_tests {
         }
 
         #[test]
+        fn a_forget_between_ready_and_established_establishes_nothing() {
+            let vault = storing_vault();
+            let requester_record = super::record(
+                REQUESTER_BYTE,
+                CUSTODIAN_BYTE,
+                PAIR_BYTE,
+                EndpointRole::Requester,
+            );
+            let (requester, custodian) = authenticating(&requester_record, &custodian_record());
+            let ready = custodian
+                .send_ready(nonce(), CUSTODIAN_NAME.to_owned())
+                .expect("custodian sends ready");
+            requester
+                .receive_ready(ready, NOW_MS, REQUESTER_NAME.to_owned())
+                .expect("the hello leaves while the record serves");
+            requester_record
+                .forget(Arc::clone(&vault) as Arc<dyn RappPairVault>, SESSION_AT_MS)
+                .expect("forget");
+            assert!(
+                matches!(
+                    requester.enter_established(),
+                    Err(RappBindingError::WrongPhase)
+                ),
+                "a record forgotten after its hello never establishes the session"
+            );
+        }
+
+        #[test]
+        fn an_expired_backlog_entry_sends_no_close() {
+            let vault = storing_vault();
+            let requester_record = forgotten_requester(PAIR_BYTE, &vault);
+            let (requester, _custodian) = authenticating(&requester_record, &custodian_record());
+            let expiry_ms = SESSION_AT_MS + PAIRING_IDLE_EXPIRY_MS;
+            assert!(
+                matches!(
+                    requester.deliver_revocation_notice(expiry_ms),
+                    Err(RappBindingError::WrongPhase)
+                ),
+                "an expired key delivers nothing; the caller revokes the record untold"
+            );
+            assert!(
+                requester_record
+                    .revocation_notice_expired(expiry_ms)
+                    .expect("expiry")
+            );
+        }
+
+        #[test]
+        fn a_crossing_close_of_another_reason_is_not_the_revocation_echo() {
+            let vault = storing_vault();
+            let requester_record = forgotten_requester(PAIR_BYTE, &vault);
+            let (requester, custodian) = authenticating(&requester_record, &custodian_record());
+            let ready = custodian
+                .send_ready(nonce(), CUSTODIAN_NAME.to_owned())
+                .expect("custodian sends ready");
+            custodian.enter_established().expect("custodian is healthy");
+            let custodian =
+                RappOperationBridge::begin_proxy(custodian, MAXIMUM_LIFETIME_MS, NOW_MS)
+                    .expect("custodian operations");
+            let withdrawal = custodian
+                .close_with_reason(RappCloseReason::ServiceWithdrawn)
+                .expect("the custodian withdraws");
+            requester
+                .deliver_revocation_notice(SESSION_AT_MS + day_ms())
+                .expect("the close is the first message");
+            assert_eq!(
+                requester
+                    .receive_close_echo(ready, NOW_MS)
+                    .expect("the ready is read")
+                    .kind,
+                RappBridgeActionKind::NoAction
+            );
+            let crossed = requester
+                .receive_close_echo(frame(withdrawal), NOW_MS)
+                .expect("the crossing close is read");
+            assert_eq!(crossed.kind, RappBridgeActionKind::CloseAcknowledged);
+            assert_eq!(
+                crossed.close_reason,
+                Some(RappCloseReason::ServiceWithdrawn),
+                "only a pairing_revoked answer lets the requester destroy the record"
+            );
+            assert!(
+                requester_record.metadata().is_ok(),
+                "the record stays in the backlog"
+            );
+        }
+
+        #[test]
         fn two_forgotten_pairings_pending_at_once_both_resolve() {
             let first_vault = storing_vault();
             let second_vault = storing_vault();
@@ -5855,10 +5975,11 @@ mod routing_binding_tests {
                         .expect("expiry")
                 );
             }
-            let second_echo = custodian_appears(&second, &super::custodian(OTHER_PAIR_BYTE));
+            let second_echo =
+                custodian_appears(&second, &super::custodian(OTHER_PAIR_BYTE), appeared_ms);
             destroy_on_echo(&second_echo, &second, &second_vault, appeared_ms);
             assert!(first.metadata().is_ok(), "the other one still waits");
-            let first_echo = custodian_appears(&first, &custodian_record());
+            let first_echo = custodian_appears(&first, &custodian_record(), appeared_ms);
             destroy_on_echo(&first_echo, &first, &first_vault, appeared_ms);
         }
 

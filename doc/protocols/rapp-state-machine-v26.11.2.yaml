@@ -69,7 +69,7 @@ guards:
   local_user_action: "the event originates from the local user's own action, never the peer: on a requester the click turning remote use off, or pairing another phone, which forgets the pairing it replaces"
   transcript_matches: "the completed handshake used the expected prologue and empty handshake payloads"
   granted_sets_equal: "both pairing.confirm granted_profiles sets are equal"
-  initiation_permitted: "either the requester's remote use is on, no card is in a reader attached to it, and an active pairing's requester_view_of_custodian is connecting; or, whatever remote use and the local reader are, a pairing its user forgot (remote use turned off, or the pairing replaced by another) is revoking in the revocation backlog, its custodian appeared for it since its last connection (a mode=session record carrying its discovery hint appeared, or the RAPP BLE advertisement was first seen), and no connection for it is open"
+  initiation_permitted: "either the requester's remote use is on, no card is in a reader attached to it, and an active pairing's requester_view_of_custodian is connecting; or, whatever remote use and the local reader are, a pairing its user forgot (remote use turned off, or the pairing replaced by another) is revoking in the revocation backlog, its idle expiry has not passed (pairing_idle_expiry_days after its latest established session), its custodian appeared for it since its last connection (a mode=session record carrying its discovery hint appeared, or the RAPP BLE advertisement was first seen), no connection for it is open, and the connection goes by the route that appeared"
   pairing_routed: "the routing tag matched an active stored pairing and its nonce is not in the replay memory"
   ready_parameters_match: "received session.ready parameters equal the local view"
   pair_record_store_failed: "the atomic store of the pair record failed: nothing was stored"
@@ -976,7 +976,7 @@ cross_component_rules:
     require: every_pairing_is_untouched_and_withdraw_custodian_runs
   - id: X-09
     when: a_requester_pairing_enters_revoking
-    require: one_dial_each_time_its_custodian_appears_and_none_on_a_timer_until_revocation_notice_sent_peer_revocation_notice_or_notice_window_expired
+    require: one_dial_by_the_route_that_appeared_each_time_its_custodian_appears_and_none_on_a_timer_until_revocation_notice_sent_peer_revocation_notice_or_notice_window_expired
   - id: X-11
     when: a_custodian_session_is_healthy
     require: no_operation_request_is_admitted_before_session_hello_and_any_other_first_message_but_a_revocation_close_is_an_authenticated_protocol_violation

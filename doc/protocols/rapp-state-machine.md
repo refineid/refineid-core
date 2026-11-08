@@ -199,8 +199,10 @@ Notes:
   out at once and the requester waits at most `quit_withdrawal_bound_ms` for
   its echo. With none, or without the echo, the requester keeps browsing for
   the pairing's discovery hint and scanning for the RAPP BLE advertisement,
-  and each time the custodian appears it opens one connection that sends the
-  close as the session's first message. Every forget the user starts does
+  and each time the custodian appears it opens one connection, by the route
+  that appeared (the stream for a session record, Bluetooth for an
+  advertisement, never both), that sends the close as the session's first
+  message. Every forget the user starts does
   this: switching remote use off, with or without a local card present, and
   replacing the pairing by pairing another phone. The forgotten pairing
   offers no identity and starts no operation; it goes on the custodian's
@@ -637,7 +639,7 @@ closes.
 | X-06 | a requester receives `service_withdrawn` or matches a withdrawn record | its view enters `withdrawn` and dials, offers and holds nothing until `record_appeared` or `advertisement_appeared` |
 | X-07 | a requester dials | the dial follows an appearance, a consumer request, or a `redial_due` within `redial_window_ms` |
 | X-08 | a custodian's holder turns remote access off | every pairing is untouched and the withdrawal runs |
-| X-09 | a requester's pairing enters `revoking` | one dial each time its custodian appears and none on a timer, until `revocation_notice_sent`, `peer_revocation_notice` or `notice_window_expired` |
+| X-09 | a requester's pairing enters `revoking` | one dial, by the route that appeared, each time its custodian appears and none on a timer, until `revocation_notice_sent`, `peer_revocation_notice` or `notice_window_expired` |
 | X-10 | a requester's pairing becomes active | every other pairing it holds receives `forget_pairing` |
 | X-11 | a custodian's session is `healthy` | no `operation.request` is admitted before `session.hello`, and any other first message but a revocation close is a protocol violation |
 | X-12 | an endpoint receives an authenticated `session.close` | it answers with a `session.close` carrying the same reason and closes the transport, unless it waits for the echo of its own close, which the received close then is |

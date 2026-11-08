@@ -196,11 +196,10 @@ pub enum PairingEvent {
     IdleExpired,
     /// The revocation close went out as a session's first message.
     RevocationNoticeSent,
-    /// The revocation notice window passed (custodian).
+    /// The revocation notice window passed: on a custodian
+    /// `revocation_notice_days` after the revocation, on a requester when
+    /// the pairing's idle expiry would have passed (section 4.6 item 3).
     NoticeWindowExpired,
-    /// The requester's revocation attempt bound passed without the close
-    /// sent (section 4.6 item 6).
-    RevocationAttemptEnded,
     /// A session.close with reason pairing_revoked arrived.
     PeerRevocationNotice,
     /// The requester closed the session with reason service_withdrawn: the
@@ -786,16 +785,28 @@ impl PairingState {
             }
             (Self::PairedConnected, E::ForgetPairing) => {
                 require(guards.local_user_action)?;
-                Transition {
-                    state: Self::Revoked,
-                    actions: &[
-                        A::MarkRecordRevoked,
-                        A::SendClosePairingRevoked,
-                        A::CloseSession,
-                        A::DestroyPairKeys,
-                        A::WithdrawIdentity,
-                        A::ShowForgotten,
-                    ],
+                match role {
+                    EndpointRole::Proxy => Transition {
+                        state: Self::Revoked,
+                        actions: &[
+                            A::MarkRecordRevoked,
+                            A::SendClosePairingRevoked,
+                            A::CloseSession,
+                            A::DestroyPairKeys,
+                            A::WithdrawIdentity,
+                            A::ShowForgotten,
+                        ],
+                    },
+                    EndpointRole::Requester => Transition {
+                        state: Self::Revoking,
+                        actions: &[
+                            A::MarkRecordRevoked,
+                            A::SendClosePairingRevoked,
+                            A::CloseSession,
+                            A::WithdrawIdentity,
+                            A::ShowForgotten,
+                        ],
+                    },
                 }
             }
             (Self::PairedDisconnected, E::ForgetPairing) => {
@@ -831,20 +842,10 @@ impl PairingState {
                 state: Self::Revoked,
                 actions: &[A::DestroyPairKeys],
             },
-            (Self::Revoking, E::NoticeWindowExpired) => {
-                require_role(role, EndpointRole::Proxy)?;
-                Transition {
-                    state: Self::Revoked,
-                    actions: &[A::DestroyPairKeys],
-                }
-            }
-            (Self::Revoking, E::RevocationAttemptEnded) => {
-                require_role(role, EndpointRole::Requester)?;
-                Transition {
-                    state: Self::Revoked,
-                    actions: &[A::DestroyPairKeys],
-                }
-            }
+            (Self::Revoking, E::NoticeWindowExpired) => Transition {
+                state: Self::Revoked,
+                actions: &[A::DestroyPairKeys],
+            },
             (Self::PairedDisconnected, E::PeerRevocationNotice) => Transition {
                 state: Self::Revoked,
                 actions: &[

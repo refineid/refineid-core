@@ -1,6 +1,6 @@
 protocol: RAPP
 document_version: "26.11.2"
-wire_version: "26.11.2"
+wire_version: "26.11.8"
 
 semantics:
   instances: >
@@ -62,7 +62,6 @@ constants:
   identity_offer_grace_ms: 120000
   quit_withdrawal_bound_ms: 1000
   redial_window_ms: 120000
-  revocation_attempt_bound_ms: 10000
   display_name_max_bytes: 256
 
 guards:
@@ -70,7 +69,7 @@ guards:
   local_user_action: "the event originates from the local user's own action, never the peer: on a requester the click turning remote use off, or pairing another phone, which forgets the pairing it replaces"
   transcript_matches: "the completed handshake used the expected prologue and empty handshake payloads"
   granted_sets_equal: "both pairing.confirm granted_profiles sets are equal"
-  initiation_permitted: "either the requester's remote use is on, no card is in a reader attached to it, and an active pairing's requester_view_of_custodian is connecting; or, whatever remote use and the local reader are, a pairing its user forgot (remote use turned off, or the pairing replaced by another) is revoking within its revocation_attempt_bound_ms and has not yet opened its one connection"
+  initiation_permitted: "either the requester's remote use is on, no card is in a reader attached to it, and an active pairing's requester_view_of_custodian is connecting; or, whatever remote use and the local reader are, a pairing its user forgot (remote use turned off, or the pairing replaced by another) is revoking in the revocation backlog, its custodian appeared for it since its last connection (a mode=session record carrying its discovery hint appeared, or the RAPP BLE advertisement was first seen), and no connection for it is open"
   pairing_routed: "the routing tag matched an active stored pairing and its nonce is not in the replay memory"
   ready_parameters_match: "received session.ready parameters equal the local view"
   pair_record_store_failed: "the atomic store of the pair record failed: nothing was stored"
@@ -142,12 +141,12 @@ actions:
   start_pairing_search: "browse mode=pairing and try the custodians found with the typed code (section 4.2)"
   end_pairing_search: "close the pairing connection, stop browsing mode=pairing and drop the typed code"
   start_session_discovery: "browse mode=session and scan for the RAPP BLE advertisement, continuously, and start a requester_view_of_custodian in idle for the active pairing"
-  stop_session_discovery: "if discovery runs: raise pairing_left for the requester_view_of_custodian unless it has ended, then stop browsing and scanning and purge transient discovery caches; a revoking pairing's one attempt keeps the discovery it needs until it ends, and the caches are purged then"
+  stop_session_discovery: "if discovery runs: raise pairing_left for the requester_view_of_custodian unless it has ended, then stop browsing and scanning and purge transient discovery caches; the revocation backlog keeps the discovery it needs while a forgotten pairing waits in it, and the caches are purged once it is empty"
   withdraw_requester: "send session.close service_withdrawn on every open session and wait for each echo as section 7.1 item 7 says, closing a connection not yet open without a notice (section 4.5 item 8)"
   withdraw_requester_within_quit_bound: "withdraw as withdraw_requester and wait at most quit_withdrawal_bound_ms for the custodians' echoes of the closes (section 7.1 item 7)"
   forget_held_pairing: "raise forget_pairing for the pairing the requester holds, if any; its revocation runs as section 4.6 item 6 says"
   forget_previous_pairing: "raise forget_pairing for the pairing held before the one just stored, if any; a requester holds one pairing, and its revocation runs as section 4.6 item 6 says"
-  sweep_stored_pairings: "revoke every record found unconfirmed (section 4.3 item 4), destroy the key of a requester's revoking pairing whose revocation_attempt_bound_ms has passed, then run the idle-expiry sweep (section 4.6 item 5), before serving or dialing anything"
+  sweep_stored_pairings: "revoke every record found unconfirmed (section 4.3 item 4), destroy the key of a requester's revoking pairing whose idle expiry would have passed (pairing_idle_expiry_days after its latest established session, or its creation), then run the idle-expiry sweep (section 4.6 item 5), before serving or dialing anything"
   open_session_dial: "start one dial, raising connect for the pairing's session, unless one is already being set up; a redial window runs on"
   abort_dial: "abandon the dial being set up, closing its connection without a notice"
   schedule_redial: "open the redial window if none is open since the custodian's last appearance or the last loss, and arm the next back-off within it; after a loss the first redial is due at once"
@@ -381,13 +380,19 @@ pairing:
       to: paired_disconnected
       actions: [record_last_session, show_peer_withdrawn]
     - from: paired_connected
-      event: forget_pairing                # on a requester, the holder turning remote use off, or pairing another phone, forgets the pairing it holds; the close leaves within quit_withdrawal_bound_ms or is dropped
-      role: both
+      event: forget_pairing                # the custodian's holder forgets the computer in session; the close leaves within quit_withdrawal_bound_ms
+      role: custodian
       guard: local_user_action
       to: revoked
       actions: [mark_record_revoked, send_close_pairing_revoked, close_session, destroy_pair_keys, withdraw_identity, show_forgotten]
+    - from: paired_connected
+      event: forget_pairing                # the holder turning remote use off, or pairing another phone, forgets the pairing it holds in session; the close leaves at once and the key stays in the revocation backlog until the custodian's echo
+      role: requester
+      guard: local_user_action
+      to: revoking
+      actions: [mark_record_revoked, send_close_pairing_revoked, close_session, withdraw_identity, show_forgotten]
     - from: paired_disconnected
-      event: forget_pairing                # on a requester with no session open, the key is kept for one revocation attempt of revocation_attempt_bound_ms after the holder's switch-off with no local card present; every forget a requester's user makes keeps it so; automatic drops (idle expiry) go straight to revoked
+      event: forget_pairing                # with no session open the key is kept for the close; on a requester the pairing joins the revocation backlog, whatever remote use and the local reader are; automatic drops (idle expiry) go straight to revoked
       role: both
       guard: local_user_action
       to: revoking
@@ -413,18 +418,13 @@ pairing:
       to: revoked
       actions: [mark_record_revoked, destroy_pair_keys, withdraw_identity]
     - from: revoking
-      event: revocation_notice_sent        # produced by the next session sending the close as its first message, once the peer echoed it or the wait for the echo ended
+      event: revocation_notice_sent        # produced by the session that sent the close: on a custodian once the peer echoed it or the wait for the echo ended, on a requester only on the peer's echo
       role: both
       to: revoked
       actions: [destroy_pair_keys]
     - from: revoking
-      event: notice_window_expired         # revocation_notice_days after the revocation
-      role: custodian
-      to: revoked
-      actions: [destroy_pair_keys]
-    - from: revoking
-      event: revocation_attempt_ended      # revocation_attempt_bound_ms after the revocation without the close sent: the requester keeps no revoking pairing longer
-      role: requester
+      event: notice_window_expired         # on a custodian revocation_notice_days after the revocation; on a requester when the pairing's idle expiry would have passed, pairing_idle_expiry_days after its latest established session or its creation
+      role: both
       to: revoked
       actions: [destroy_pair_keys]
     - from: [paired_disconnected, paired_connected, revoking]
@@ -450,7 +450,7 @@ session:
     - closed
   notes:
     - "entering healthy produces session_healthy; entering closed after healthy was reached produces session_closed, or peer_withdrawal_notice on a custodian whose session the requester closed with reason service_withdrawn"
-    - "a session that handshake_complete_while_revoking moved to closing produces revocation_notice_sent when it reaches closed: on the peer's echo or when the wait for it ends; a received close with reason pairing_revoked produces peer_revocation_notice"
+    - "a session that sent its pairing's revocation close, as its first message after handshake_complete_while_revoking or in session after close_requested_by_pairing, produces revocation_notice_sent when it reaches closed: on a custodian on the peer's echo or when the wait for it ends, on a requester only on the peer's echo (peer_close_received), so a requester's close without its echo leaves the pairing revoking; a received close with reason pairing_revoked produces peer_revocation_notice"
     - "closing after this endpoint sent a close waits for the peer's echo (section 7.1 item 7): it sends nothing more, ignores every message but a session.close, and a session.close arriving then is the echo, or a close that crossed this endpoint's, and is not answered"
     - "entering closing produces session_closed for the session's operation"
     - "closed is terminal for the instance"
@@ -746,7 +746,7 @@ requester_remote_use:
   role: requester
   initial: switched_off
   states:
-    - switched_off          # nothing remote runs; no pairing is active (a revoking pairing's one attempt aside)
+    - switched_off          # nothing remote runs; no pairing is active (the revocation backlog aside)
     - switched_on                    # remote use on, not suspended; with a pairing, discovery and its requester_view_of_custodian run; the code entry is shown exactly while no_remote_card_presented holds
     - searching             # a typed code is being tried (section 4.2)
     - suspended             # a card in a reader attached to the requester; the requester withdrew
@@ -976,7 +976,7 @@ cross_component_rules:
     require: every_pairing_is_untouched_and_withdraw_custodian_runs
   - id: X-09
     when: a_requester_pairing_enters_revoking
-    require: at_most_one_dial_within_revocation_attempt_bound_ms_then_revocation_notice_sent_or_revocation_attempt_ended
+    require: one_dial_each_time_its_custodian_appears_and_none_on_a_timer_until_revocation_notice_sent_peer_revocation_notice_or_notice_window_expired
   - id: X-11
     when: a_custodian_session_is_healthy
     require: no_operation_request_is_admitted_before_session_hello_and_any_other_first_message_but_a_revocation_close_is_an_authenticated_protocol_violation
@@ -1023,7 +1023,7 @@ invariants:
   - id: INV-17
     statement: a_requester_holds_at_most_one_active_pairing
   - id: INV-18
-    statement: a_requester_keeps_a_revoking_pairing_at_most_revocation_attempt_bound_ms
+    statement: a_requester_keeps_a_revoking_pairing_until_its_custodian_echoes_the_close_or_its_idle_expiry_would_have_passed
   - id: INV-19
     statement: no_pairing_is_found_matched_or_replaced_by_its_display_name
   - id: INV-20

@@ -36,9 +36,7 @@ struct Model {
 struct Constants {
     session_silence_limit_ms: u64,
     identity_offer_grace_ms: u64,
-    quit_withdrawal_bound_ms: u64,
     redial_window_ms: u64,
-    revocation_attempt_bound_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -335,7 +333,6 @@ fn lifecycle_constants_agree_with_the_stamped_ones() {
         constants.identity_offer_grace_ms
     );
     assert!(constants.session_silence_limit_ms < constants.redial_window_ms);
-    assert!(constants.revocation_attempt_bound_ms > constants.quit_withdrawal_bound_ms);
 }
 
 #[test]

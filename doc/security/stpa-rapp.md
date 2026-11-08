@@ -175,19 +175,24 @@ The mirror case: Alice forgot Bob, but Bob's notebook still said
 **The good day.** Whoever forgets says so, and the other side answers
 with the same words. With a conversation open, Bob sends "we're done"
 and waits up to a second for Alice's "we're done" back. With none open,
-he makes one attempt of at most ten seconds to reach Alice, say it and
-hear the echo, then destroys his keys whether or not it came. When Alice forgets Bob, she
+or when the echo did not come, Bob keeps the forgotten pairing in a
+backlog, serving nothing from it, and watches for Alice. Days later she
+walks back into the office; Bob sees her, says it as the first thing,
+hears the echo, and only then destroys his keys. Had she never come back,
+Bob would have let the pairing go thirty days after their last
+conversation, as Alice does on her side. When Alice forgets Bob, she
 tells him in the open conversation or as the first thing in the next
 one, and Bob marks his notebook before he dials again. Bob then shows
 one line: the phone forgot this computer.
 
-**Lesson:** no ghosting, but no stalking either: one bounded attempt to
-say goodbye, and a known limit when it fails.
+**Lesson:** no ghosting, but no stalking either: say goodbye the next
+time you meet, never by calling on a timer, and let go when the pairing
+would have expired anyway.
 
 - L-3; H-4, H-5. UCA-9, UCA-116, UCA-123, UCA-18, UCA-42.
 - CC-2, CC-118, CC-123, CC-22, CC-40, CC-116.
-- Spec §4.6 items 1, 2, 4 and 6; §4.6 item 7 states the known limit
-  (residual R-2).
+- Spec §4.6 items 1 to 4 and 6; §4.6 item 7 says the phone forgets the
+  computer the next time they meet (residual R-2).
 
 ### 3. The nameless colleague
 
@@ -717,7 +722,7 @@ the requester; a part named after a colon is one program of it.
 | UCA-120 | Either | Reports the pairing made when its own store failed. | P | H-4, H-5 | CC-121 |
 | UCA-121 | Phone | Sends a remembered PIN 1 again after the card refused it. | P | H-1 | CC-66, CC-43; spec §10.2 |
 | UCA-122 | Phone | Holds a card session that blocks every later card event. | D | H-3, H-7 | CC-41 |
-| UCA-123 | Computer | Keeps trying to deliver its revocation beyond the bound. | D | H-4, H-6 | CC-118 |
+| UCA-123 | Computer | Keeps trying to deliver its revocation past the pairing's idle expiry, or dials for it on a timer rather than when the phone appears. | D | H-4, H-6 | CC-118 | Every forget a computer's user makes marks the record forgotten and keeps its key for the `pairing_revoked` close alone, in a revocation backlog apart from the one active pairing; a forgotten record offers no identity, starts no operation, presents no card and is never selected. The close goes out at once on an open session; otherwise, and when its echo did not come within 1 s, the computer watches for the phone's discovery hint or BLE advertisement and opens one connection each time the phone appears, never on a timer. The key and record go on the phone's echo, or 30 days after the pairing's last established session, whichever is first. Several forgotten pairings may wait at once. Automatic drops send nothing. | §4.6 items 3 and 6 |
 | UCA-124 | Either | Acts as if the peer received its goodbye (`service_withdrawn` or `pairing_revoked` close) when the peer never did. | P | H-4, H-5 | CC-123 |
 | UCA-125 | Computer | Sends a made-up file name, or one the asking program supplied, for a signature whose program named no document. | P | H-1, H-5 | CC-124 |
 | CC-125 | Every browser-module call that can show whether the phone's token is there or what it holds reads the phone first, as a request for the card: with no session open the computer dials, and the call waits at most 3 s for a session to confirm the card. No call is granted a wait for 5 s after a wait that raised the token, nor for 30 s after one that raised none; a call during a wait shares it; the non-blocking event poll never waits. The token stands only on a certificate the phone confirmed on a session. | §8.4 item 3 |
@@ -791,7 +796,7 @@ the requester; a part named after a colon is one program of it.
 | CC-83 | The computer tries every phone in pairing mode with the typed code, one at a time, at most 8 connections, before it reports the code as not accepted. | §4.2 |
 | CC-84 | Until a code is accepted the computer names no phone. | §4.2 |
 | CC-85 | The PIN prompt names the paired computer by its stored display name and never a website; the operation context is not shown. | §11 item 1 |
-| CC-86 | While a card is in a reader attached to the computer, the computer holds no phone session, dials and scans nothing, and offers no phone identity; local presence is read at each decision. The only exception is the one revocation attempt of CC-118. | Hierarchy §5.2 |
+| CC-86 | While a card is in a reader attached to the computer, the computer holds no phone session, dials and scans nothing, and offers no phone identity; local presence is read at each decision. The only exception is the revocation backlog of CC-118. | Hierarchy §5.2 |
 | CC-87 | When the local card leaves, discovery and dialing resume at once with the same pairing. | Hierarchy §5.2 |
 | CC-88 | A signature goes to the local card whenever one is in a local reader; the phone signs only when none is. | |
 | CC-89 | Forgetting asks no confirmation, and the display then follows what is stored. | |
@@ -801,7 +806,7 @@ the requester; a part named after a colon is one program of it.
 | CC-93 | The NFC field has no idle limit of its own: it ends when the slot is gone, a keep-alive or operation goes unanswered, 50 s after it was asked for, serving stops, or the last session closes. | |
 | CC-96 | The computer asks for network and Bluetooth permission only when the holder turns remote use on. | Hierarchy §5.2 |
 | CC-98 | A computer that withdraws, for a local card or on quitting, sends `service_withdrawn` on every open session and keeps its pairing; quitting waits at most 1 s. The phone shows that computer as off until its next session. | §4.5 items 8, 9 |
-| CC-100 | The holder's click turning remote use off forgets the pairing: it closes sessions, withdraws every phone identity, halts discovery, and asks no confirmation. Apart from pairing another phone, it is the computer's only forget. | §4.6 item 6, hierarchy §5.2 |
+| CC-100 | The holder's click turning remote use off forgets the pairing: it closes sessions, withdraws every phone identity, halts discovery apart from the revocation backlog of CC-118, and asks no confirmation. Apart from pairing another phone, it is the computer's only forget. | §4.6 item 6, hierarchy §5.2 |
 | CC-102 | A local card suspends remote use while present: the computer withdraws as CC-98 says and tries no pairing code; when the card leaves, remote use resumes with the same pairing. | §4.5 item 8, hierarchy §5.2 |
 | CC-103 | Each endpoint revokes a pairing with no established session for 30 days, by its own clock and never during a session; the recorded time only moves forward; expiry sends nothing. | §4.6 item 5 |
 | CC-104 | The phone remembers at most 4096 operation identifiers per session; past that, a fresh identifier closes that session alone. | |
@@ -823,7 +828,7 @@ the requester; a part named after a colon is one program of it.
 | CC-120 | Every `pairing.hello` carries the sender's display name, stored in the pair record in the same commit; every session carries both current names, and a changed name replaces the stored one. | §4.3 items 3, 4; §7.1 |
 | CC-121 | A failed store of the pair record ends the pairing with `pairing.abort` and tells the user why. | §4.3 item 4 |
 | CC-122 | Only the holder's click moves the computer's remote-use switch; a revocation by the phone or idle expiry leaves it on and offers the code entry. | §4.7, hierarchy §5.2 |
-| CC-123 | A goodbye is acknowledged: the receiver of a `session.close` answers with its own close carrying the same reason, then closes the transport. The sender waits for the echo within its existing bound (1 s with a session open, the 10 s revocation attempt) and treats a goodbye without the echo as not known to be delivered: the stated limit for that case applies (R-1, R-2, R-9). | §7.1 item 7; §4.5 items 8 and 9; §4.6 item 4; X-12 |
+| CC-123 | A goodbye is acknowledged: the receiver of a `session.close` answers with its own close carrying the same reason, then closes the transport. The sender waits for the echo within its existing bound (1 s) and treats a goodbye without the echo as not known to be delivered: a computer keeps a forgotten pairing whose close was not echoed in its revocation backlog (CC-118), and otherwise the stated limit for that case applies (R-1, R-2, R-9). | §7.1 item 7; §4.5 items 8 and 9; §4.6 item 4; X-12 |
 | CC-124 | A signature a program asks for with a digest alone carries, as its `document_name`, a description the computer composes: the program as the computer identifies its image, the computer, and that no document was named. Refusing the request instead would leave the holder no way to sign from such a program. | §9.3; §11 item 1 |
 
 ### Retired identifiers
@@ -852,7 +857,7 @@ the requester; a part named after a colon is one program of it.
 | ID | Risk | Bound |
 | :--- | :--- | :--- |
 | R-1 | An endpoint that crashes, is killed by its operating system or loses power sends nothing: no withdrawal, no revocation. | The peer sees a loss: 30 s of silence ends the session, and the redial window and identity grace end after 120 s. A pairing it meant to forget lasts until idle expiry (§4.6 item 8). |
-| R-2 | A revocation not known to reach the phone (no session, attempt failed, or no echo within the bound) leaves the phone listing the computer, twice after a new pairing, since fresh keys make the two unlinkable. | Idle expiry, up to 30 days (§4.6 item 7). The computer holds no key, so nobody can use the old pairing. |
+| R-2 | A computer that does not meet the phone again before the forgotten pairing's idle expiry passes cannot deliver its revocation: the phone lists the computer, twice after a new pairing, since fresh keys make the two unlinkable. | Idle expiry, at most 30 days after the pairing's last session (§4.6 items 5 and 7). The computer destroys its key at the same time, so nobody can use the old pairing. |
 | R-3 | A computer may offer an identity whose phone has left. | 120 s; a login then fails after the program's deadline (§8.4 item 3). |
 | R-4 | While the phone holds PIN 1, a paired computer can obtain login signatures without a prompt: one per tap for an NFC card, several within one warm field, none needed for a card in a reader. | Ends when the card is removed or replaced, refuses the PIN, the process ends or the device restarts; a warm field lasts at most 50 s (CC-93). Spec §11 item 2. |
 | R-5 | The platform's NFC slot has its own life and pause; a request that meets its end pays the pause. | Retried within the request's deadline (CC-42). |

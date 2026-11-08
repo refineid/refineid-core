@@ -3094,20 +3094,23 @@ impl RappPairRecord {
     ///
     /// A custodian keeps the key for the next session, at most 30 days. A
     /// requester, whose user forgets by turning remote use off or by pairing
-    /// another phone, local card or not, makes one bounded attempt (§4.6
-    /// item 6): within [`rapp_revocation_attempt_bound_ms`], counted from
-    /// `forgotten_at_ms`, it opens at most one connection to the custodian,
-    /// sends the close with [`RappSessionBridge::deliver_revocation_notice`],
-    /// waits for the custodian's echo with
+    /// another phone, local card or not, keeps the forgotten record in its
+    /// revocation backlog (§4.6 item 6): each time the custodian appears for
+    /// the pairing it opens at most one connection, sends the close with
+    /// [`RappSessionBridge::deliver_revocation_notice`], waits at most
+    /// [`rapp_quit_withdrawal_bound_ms`] for the custodian's echo with
     /// [`RappSessionBridge::receive_close_echo`], and calls [`Self::revoke`]
-    /// once the echo arrived (`CloseAcknowledged`) or the bound passed,
-    /// whichever comes first (§7.1 item 7). The attempt offers no identity
-    /// and starts no operation.
+    /// on the echo (`CloseAcknowledged`) alone (§7.1 item 7). A failed
+    /// connection or a close without its echo keeps the record for the
+    /// custodian's next appearance, until [`Self::revocation_notice_expired`]
+    /// says its idle expiry passed. The record offers no identity and starts
+    /// no operation.
     ///
-    /// With a session open, close it with reason `pairing_revoked` instead,
-    /// wait at most [`rapp_quit_withdrawal_bound_ms`] for the echo
-    /// (`CloseAcknowledged` from the operation bridge), then call
-    /// [`Self::revoke`].
+    /// With a session open, forget the record here, close the session with
+    /// reason `pairing_revoked`, wait at most
+    /// [`rapp_quit_withdrawal_bound_ms`] for the echo (`CloseAcknowledged`
+    /// from the operation bridge), and call [`Self::revoke`] on the echo; a
+    /// custodian calls it once the wait ended either way.
     ///
     /// # Errors
     /// [`RappBindingError`] on an already-revoked record or a storage
@@ -3149,10 +3152,11 @@ impl RappPairRecord {
 
     /// Whether a forgotten record kept its key as long as its role allows,
     /// at `now_ms`, milliseconds since the Unix epoch: a custodian 30 days
-    /// without a session to deliver the close, a requester
-    /// [`rapp_revocation_attempt_bound_ms`] (also when `now_ms` is earlier
-    /// than the forget). Destroy it then with [`Self::revoke`]; a requester
-    /// checks this at launch, before serving or dialing anything.
+    /// after the forget, a requester until the pairing's idle expiry would
+    /// have passed, 30 days after its latest recorded session or its
+    /// creation (RAPP §4.6 item 3). Destroy it then with [`Self::revoke`];
+    /// a requester checks this at launch, before serving or dialing
+    /// anything, and at least once a day.
     ///
     /// # Errors
     /// [`RappBindingError`] when the record was already revoked.
@@ -3175,8 +3179,8 @@ impl RappPairRecord {
     /// On a requester an expired pairing is then revoked at once, as
     /// [`Self::revoke`] does: nothing is sent (RAPP §4.6 item 6). Should
     /// that revocation fail, the record is stored forgotten, and the next
-    /// sweep revokes it, as it revokes any forgotten requester record past
-    /// [`rapp_revocation_attempt_bound_ms`].
+    /// sweep revokes it, as it revokes any forgotten requester record whose
+    /// idle expiry would have passed ([`Self::revocation_notice_expired`]).
     ///
     /// Sweep every pairing at launch and at least once a day, and sweep a
     /// pairing with `session_established` true once
@@ -3261,9 +3265,9 @@ impl RappPairRecord {
     /// Irreversibly delete active secret material and retain only a local
     /// tombstone. The in-memory private key is dropped only after the vault
     /// confirms deletion; `revoked_at_ms` is milliseconds since the Unix
-    /// epoch. A requester whose holder turns remote use off revokes every
-    /// pairing this way, after the closes of its open sessions left or
-    /// their bound passed (RAPP §4.6 item 6).
+    /// epoch. A requester revokes a pairing its user forgot this way on
+    /// the custodian's echo of its `pairing_revoked` close, or once
+    /// [`Self::revocation_notice_expired`] holds (RAPP §4.6 items 3 and 6).
     ///
     /// # Errors
     /// [`RappBindingError`] on an already-revoked record or a storage
@@ -3555,12 +3559,13 @@ impl RappSessionBridge {
     ///
     /// The pairing stays in every case but a received `PairingRevoked`. A
     /// requester whose record is forgotten does not wait for `session.ready`:
-    /// it calls [`Self::deliver_revocation_notice`] instead.
+    /// it calls [`Self::deliver_revocation_notice`] instead, and this call
+    /// refuses it, so a forgotten record never sends `session.hello`.
     ///
     /// # Errors
     /// [`RappBindingError::InvalidInput`] on an oversized frame or a blank
     /// or over-long name, read before the frame, and [`RappBindingError`]
-    /// on the wrong phase or a Custodian.
+    /// on the wrong phase, a forgotten record or a Custodian.
     pub fn receive_ready(
         &self,
         bytes: Vec<u8>,
@@ -3569,6 +3574,9 @@ impl RappSessionBridge {
     ) -> Result<RappBridgeAction, RappBindingError> {
         let frame = BinaryFrame::reconstruct(bytes).map_err(|_| RappBindingError::InvalidInput)?;
         let display_name = display_name_input(display_name)?;
+        if self.is_forgotten()? {
+            return Err(RappBindingError::WrongPhase);
+        }
         let mut state = self.lock_state()?;
         let SessionBridgeState::Authentication(authentication) = &mut *state else {
             return Err(RappBindingError::WrongPhase);
@@ -3626,10 +3634,10 @@ impl RappSessionBridge {
     ///   on.
     /// - `SessionClosed`: a frame failed authentication; drop the link.
     ///
-    /// The wait is the caller's: at most [`rapp_quit_withdrawal_bound_ms`],
-    /// and in a requester's revocation attempt until
-    /// [`rapp_revocation_attempt_bound_ms`] ends; without the echo the close
-    /// is not known to have been delivered.
+    /// The wait is the caller's: at most [`rapp_quit_withdrawal_bound_ms`];
+    /// without the echo the close is not known to have been delivered, and
+    /// a requester keeps the forgotten record for the next session (RAPP
+    /// §4.6 item 6).
     ///
     /// # Errors
     /// [`RappBindingError::InvalidInput`] on an oversized frame, and
@@ -3954,8 +3962,8 @@ pub fn rapp_stream_profile_name() -> String {
 
 /// How long a requester that quits waits for its `service_withdrawn` closes
 /// to leave before it exits (RAPP v26.11.2 section 4.5 item 8), and one
-/// whose holder turned remote use off waits for its `pairing_revoked` closes
-/// (section 4.6 item 6).
+/// whose user forgot a pairing waits for the echo of its `pairing_revoked`
+/// close (section 4.6 item 6).
 #[uniffi::export]
 #[must_use]
 pub const fn rapp_quit_withdrawal_bound_ms() -> u64 {
@@ -3970,15 +3978,6 @@ pub const fn rapp_quit_withdrawal_bound_ms() -> u64 {
 #[must_use]
 pub const fn rapp_redial_window_ms() -> u64 {
     super::REDIAL_WINDOW_MS
-}
-
-/// How long a requester keeps a pairing its user forgot with no session
-/// open, for its one attempt to deliver the `pairing_revoked` close (RAPP
-/// v26.11.2 section 4.6 item 6).
-#[uniffi::export]
-#[must_use]
-pub const fn rapp_revocation_attempt_bound_ms() -> u64 {
-    super::REVOCATION_ATTEMPT_BOUND_MS
 }
 
 /// Most UTF-8 bytes a display name or platform description carries (RAPP
@@ -4657,20 +4656,28 @@ mod routing_binding_tests {
     }
 
     #[test]
-    fn a_requester_keeps_a_forgotten_key_only_for_its_attempt() {
+    fn a_requester_keeps_a_forgotten_key_until_its_idle_expiry_would_pass() {
         let pair = requester();
-        pair.forget(ReplacingVault::shared(), REVOKED_AT_MS)
+        let vault = ReplacingVault::shared();
+        assert_eq!(
+            pair.sweep(
+                Arc::clone(&vault) as Arc<dyn RappPairVault>,
+                SESSION_AT_MS,
+                true
+            )
+            .expect("sweep"),
+            RappSweepOutcome::Recorded
+        );
+        pair.forget(vault as Arc<dyn RappPairVault>, REVOKED_AT_MS)
             .expect("forget");
         assert!(
             !pair
-                .revocation_notice_expired(REVOKED_AT_MS)
-                .expect("bound")
+                .revocation_notice_expired(SESSION_AT_MS + PAIRING_IDLE_EXPIRY_MS - 1)
+                .expect("expiry")
         );
         assert!(
-            pair.revocation_notice_expired(
-                REVOKED_AT_MS + super::rapp_revocation_attempt_bound_ms()
-            )
-            .expect("bound")
+            pair.revocation_notice_expired(SESSION_AT_MS + PAIRING_IDLE_EXPIRY_MS)
+                .expect("expiry")
         );
     }
 
@@ -4817,27 +4824,39 @@ mod routing_binding_tests {
 
         let pair = requester();
         let vault = ReplacingVault::shared();
+        assert_eq!(
+            pair.sweep(
+                Arc::clone(&vault) as Arc<dyn RappPairVault>,
+                SESSION_AT_MS,
+                true
+            )
+            .expect("sweep"),
+            RappSweepOutcome::Recorded
+        );
         pair.forget(Arc::clone(&vault) as Arc<dyn RappPairVault>, SESSION_AT_MS)
             .expect("forget");
         assert_eq!(
             pair.sweep(
                 Arc::clone(&vault) as Arc<dyn RappPairVault>,
-                SESSION_AT_MS + super::rapp_revocation_attempt_bound_ms() - 1,
+                SESSION_AT_MS + PAIRING_IDLE_EXPIRY_MS - 1,
                 false
             )
             .expect("sweep"),
             RappSweepOutcome::Kept
         );
-        assert!(pair.metadata().is_ok(), "the attempt still runs");
+        assert!(
+            pair.metadata().is_ok(),
+            "the forgotten pairing waits in the backlog for its custodian"
+        );
         pair.sweep(
             vault as Arc<dyn RappPairVault>,
-            SESSION_AT_MS + super::rapp_revocation_attempt_bound_ms(),
+            SESSION_AT_MS + PAIRING_IDLE_EXPIRY_MS,
             false,
         )
         .expect("sweep");
         assert!(
             pair.metadata().is_err(),
-            "a requester keeps no forgotten key past its attempt"
+            "a custodian that never appears: the key goes 30 days after the last session"
         );
     }
 
@@ -5081,9 +5100,10 @@ mod routing_binding_tests {
     /// The session phase of one stored pairing, both ends in memory.
     mod session_bridge {
         use super::{
-            CREATED_AT_MS, CUSTODIAN_BYTE, CUSTODIAN_NAME, PAIR_BYTE, REQUESTER_BYTE,
-            REQUESTER_NAME, RappPairRecord, RappPairVault, ReplacingVault, StoringVault,
-            record_serving,
+            CREATED_AT_MS, CUSTODIAN_BYTE, CUSTODIAN_NAME, OTHER_PAIR_BYTE, PAIR_BYTE,
+            PAIRING_IDLE_EXPIRY_DAYS, PAIRING_IDLE_EXPIRY_MS, REQUESTER_BYTE, REQUESTER_NAME,
+            RappPairRecord, RappPairVault, RappSweepOutcome, ReplacingVault, SESSION_AT_MS,
+            StoringVault, record_serving,
         };
         use crate::operation_bridge::{RappRequesterSessionEnd, rapp_requester_session_end};
 
@@ -5649,6 +5669,197 @@ mod routing_binding_tests {
                 acknowledged.close_reason,
                 Some(RappCloseReason::PairingRevoked)
             );
+        }
+
+        /// Days the custodian stays out of reach after the requester's user
+        /// forgot the pairing (RAPP section 4.6 item 6).
+        const CUSTODIAN_AWAY_DAYS: u64 = 5;
+
+        fn day_ms() -> u64 {
+            PAIRING_IDLE_EXPIRY_MS / PAIRING_IDLE_EXPIRY_DAYS
+        }
+
+        fn storing_vault() -> Arc<StoringVault> {
+            Arc::new(StoringVault {
+                bytes: Vec::new(),
+                revoked: Mutex::new(false),
+            })
+        }
+
+        /// A requester record for `pair` that had its last session at
+        /// `SESSION_AT_MS` and that its user forgot a day later.
+        fn forgotten_requester(pair: u8, vault: &Arc<StoringVault>) -> Arc<RappPairRecord> {
+            let record = super::record(
+                REQUESTER_BYTE,
+                CUSTODIAN_BYTE,
+                pair,
+                EndpointRole::Requester,
+            );
+            assert_eq!(
+                record
+                    .sweep(
+                        Arc::clone(vault) as Arc<dyn RappPairVault>,
+                        SESSION_AT_MS,
+                        true
+                    )
+                    .expect("sweep"),
+                RappSweepOutcome::Recorded
+            );
+            assert_eq!(
+                record
+                    .forget(
+                        Arc::clone(vault) as Arc<dyn RappPairVault>,
+                        SESSION_AT_MS + day_ms()
+                    )
+                    .expect("forget"),
+                crate::bindings::RappForgetOutcome::NoticePending
+            );
+            record
+        }
+
+        /// The custodian appears for the forgotten pairing: one session
+        /// delivers the close as the requester's first message, the custodian
+        /// echoes it, and the requester reads the echo.
+        fn custodian_appears(
+            requester_record: &Arc<RappPairRecord>,
+            custodian_record: &Arc<RappPairRecord>,
+        ) -> RappBridgeAction {
+            let (requester, custodian) = authenticating(requester_record, custodian_record);
+            let ready = custodian
+                .send_ready(nonce(), CUSTODIAN_NAME.to_owned())
+                .expect("custodian sends ready");
+            custodian.enter_established().expect("custodian is healthy");
+            let custodian =
+                RappOperationBridge::begin_proxy(custodian, MAXIMUM_LIFETIME_MS, NOW_MS)
+                    .expect("custodian operations");
+            let notice = requester
+                .deliver_revocation_notice()
+                .expect("the close is the first message");
+            let closed = custodian
+                .receive_frame(notice, NOW_MS)
+                .expect("custodian reads the close");
+            assert_echoed(&closed);
+            assert_eq!(closed.close_reason, Some(RappCloseReason::PairingRevoked));
+            assert_eq!(
+                requester
+                    .receive_close_echo(ready, NOW_MS)
+                    .expect("the ready is read")
+                    .kind,
+                RappBridgeActionKind::NoAction,
+                "the custodian's ready is ignored while the echo is awaited"
+            );
+            requester
+                .receive_close_echo(frame(closed), NOW_MS)
+                .expect("the requester reads the echo")
+        }
+
+        /// The requester read the custodian's echo of its close: it destroys
+        /// the key and the record.
+        fn destroy_on_echo(
+            echo: &RappBridgeAction,
+            record: &Arc<RappPairRecord>,
+            vault: &Arc<StoringVault>,
+            now_ms: u64,
+        ) {
+            assert_eq!(echo.kind, RappBridgeActionKind::CloseAcknowledged);
+            assert_eq!(echo.close_reason, Some(RappCloseReason::PairingRevoked));
+            record
+                .revoke(Arc::clone(vault) as Arc<dyn RappPairVault>, now_ms)
+                .expect("revoke");
+            assert!(*vault.revoked.lock().expect("lock"));
+            assert!(record.metadata().is_err(), "the key and record are gone");
+        }
+
+        #[test]
+        fn a_forgotten_pairing_whose_custodian_appears_days_later_is_destroyed_on_the_echo() {
+            let vault = storing_vault();
+            let requester_record = forgotten_requester(PAIR_BYTE, &vault);
+            let appeared_ms = SESSION_AT_MS + (1 + CUSTODIAN_AWAY_DAYS) * day_ms();
+            assert!(
+                !requester_record
+                    .revocation_notice_expired(appeared_ms)
+                    .expect("expiry"),
+                "the forgotten pairing is still in the backlog"
+            );
+            let echo = custodian_appears(&requester_record, &custodian_record());
+            destroy_on_echo(&echo, &requester_record, &vault, appeared_ms);
+        }
+
+        #[test]
+        fn a_forgotten_pairing_whose_custodian_never_appears_goes_at_last_session_plus_30_days() {
+            let vault = storing_vault();
+            let requester_record = forgotten_requester(PAIR_BYTE, &vault);
+            let expiry_ms = SESSION_AT_MS + PAIRING_IDLE_EXPIRY_MS;
+            for now_ms in [SESSION_AT_MS + day_ms(), expiry_ms - 1] {
+                assert!(
+                    !requester_record
+                        .revocation_notice_expired(now_ms)
+                        .expect("expiry")
+                );
+                requester_record
+                    .sweep(Arc::clone(&vault) as Arc<dyn RappPairVault>, now_ms, false)
+                    .expect("sweep");
+                assert!(requester_record.metadata().is_ok());
+            }
+            assert!(
+                requester_record
+                    .revocation_notice_expired(expiry_ms)
+                    .expect("expiry")
+            );
+            requester_record
+                .sweep(
+                    Arc::clone(&vault) as Arc<dyn RappPairVault>,
+                    expiry_ms,
+                    false,
+                )
+                .expect("sweep");
+            assert!(*vault.revoked.lock().expect("lock"));
+            assert!(requester_record.metadata().is_err());
+        }
+
+        #[test]
+        fn a_forgotten_requester_record_serves_no_session() {
+            let vault = storing_vault();
+            let requester_record = forgotten_requester(PAIR_BYTE, &vault);
+            let (requester, custodian) = authenticating(&requester_record, &custodian_record());
+            let ready = custodian
+                .send_ready(nonce(), CUSTODIAN_NAME.to_owned())
+                .expect("custodian sends ready");
+            assert!(
+                matches!(
+                    requester.receive_ready(ready, NOW_MS, REQUESTER_NAME.to_owned()),
+                    Err(RappBindingError::WrongPhase)
+                ),
+                "a forgotten record sends no session.hello"
+            );
+            assert!(
+                matches!(
+                    requester.enter_established(),
+                    Err(RappBindingError::WrongPhase)
+                ),
+                "a forgotten record never establishes a session, so it offers no identity and starts no operation"
+            );
+        }
+
+        #[test]
+        fn two_forgotten_pairings_pending_at_once_both_resolve() {
+            let first_vault = storing_vault();
+            let second_vault = storing_vault();
+            let first = forgotten_requester(PAIR_BYTE, &first_vault);
+            let second = forgotten_requester(OTHER_PAIR_BYTE, &second_vault);
+            let appeared_ms = SESSION_AT_MS + (1 + CUSTODIAN_AWAY_DAYS) * day_ms();
+            for record in [&first, &second] {
+                assert!(
+                    !record
+                        .revocation_notice_expired(appeared_ms)
+                        .expect("expiry")
+                );
+            }
+            let second_echo = custodian_appears(&second, &super::custodian(OTHER_PAIR_BYTE));
+            destroy_on_echo(&second_echo, &second, &second_vault, appeared_ms);
+            assert!(first.metadata().is_ok(), "the other one still waits");
+            let first_echo = custodian_appears(&first, &custodian_record());
+            destroy_on_echo(&first_echo, &first, &first_vault, appeared_ms);
         }
 
         /// The custodian admitted a document signature and awaits the

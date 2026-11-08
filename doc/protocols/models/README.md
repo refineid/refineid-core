@@ -14,22 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# Symbolic models of RAPP v26.11.2
+# Symbolic models of RAPP v26.11.8
 
 Two symbolic (Dolev-Yao) models of the stamped protocol
-[RAPP v26.11.2](../rapp-v26.11.2.md) ("the spec"):
+[RAPP v26.11.8](../rapp-v26.11.8.md) ("the spec"):
 
 | File | Tool | What it states |
 | :--- | :--- | :--- |
-| [`rapp-pairing-secrecy-v26.11.2.pv`](rapp-pairing-secrecy-v26.11.2.pv) | ProVerif 2.05 | The pairing (offer, CPace, Noise_XXpsk3, the pairing channel, stored records) with withdrawn records published: secrecy of the PSK, the static keys and the keys of the static agreement. |
-| [`rapp-pairing-guessing-v26.11.2.pv`](rapp-pairing-guessing-v26.11.2.pv) | ProVerif 2.05 | The pairing: no offline guessing of the code (`weaksecret`). |
-| [`rapp-pairing-agreement-v26.11.2.pv`](rapp-pairing-agreement-v26.11.2.pv) | ProVerif 2.05 | The pairing: pairing cannot complete without the code, and both ends agree on what they store. |
-| [`rapp-pairing-withdrawal-v26.11.2.pv`](rapp-pairing-withdrawal-v26.11.2.pv) | ProVerif 2.05 | Stored pairings taken as given, withdrawn records published and verified: withdrawal authenticity. |
-| [`rapp-session-secrecy-v26.11.2.pv`](rapp-session-secrecy-v26.11.2.pv) | ProVerif 2.05 | Sessions over stored pairings with one operation each, the card and Carol: secrecy of PIN 1, PIN 2, the CAN and the session keys; session authentication; card commands only on active pairings and only as commanded; card presence. |
-| [`rapp-session-requests-v26.11.2.pv`](rapp-session-requests-v26.11.2.pv) | ProVerif 2.05 | Sessions with two operations each and one abstract card command: injective agreement on requests. |
-| [`rapp-session-consent-v26.11.2.pv`](rapp-session-consent-v26.11.2.pv) | ProVerif 2.05 | Sessions with one operation each, the card and Carol, and the close: consent for qualified signatures; authenticity of results and close reasons. |
-| [`rapp-pairing-v26.11.2.spthy`](rapp-pairing-v26.11.2.spthy) | Tamarin 1.12 | The pairing: offer, CPace, Noise_XXpsk3 and the pairing channel, with the pairing lemmas. |
-| [`rapp-session-v26.11.2.spthy`](rapp-session-v26.11.2.spthy) | Tamarin 1.12 | Sessions and operations over stored pairings taken as given, the card and Carol, withdrawn records, and revocation, which needs mutable state. |
+| [`rapp-pairing-secrecy-v26.11.8.pv`](rapp-pairing-secrecy-v26.11.8.pv) | ProVerif 2.05 | The pairing (offer, CPace, Noise_XXpsk3, the pairing channel, stored records) with withdrawn records published: secrecy of the PSK, the static keys and the keys of the static agreement. |
+| [`rapp-pairing-guessing-v26.11.8.pv`](rapp-pairing-guessing-v26.11.8.pv) | ProVerif 2.05 | The pairing: no offline guessing of the code (`weaksecret`). |
+| [`rapp-pairing-agreement-v26.11.8.pv`](rapp-pairing-agreement-v26.11.8.pv) | ProVerif 2.05 | The pairing: pairing cannot complete without the code, and both ends agree on what they store. |
+| [`rapp-pairing-withdrawal-v26.11.8.pv`](rapp-pairing-withdrawal-v26.11.8.pv) | ProVerif 2.05 | Stored pairings taken as given, withdrawn records published and verified: withdrawal authenticity. |
+| [`rapp-session-secrecy-v26.11.8.pv`](rapp-session-secrecy-v26.11.8.pv) | ProVerif 2.05 | Sessions over stored pairings with one operation each, the card and Carol: secrecy of PIN 1, PIN 2, the CAN and the session keys; session authentication; card commands only on active pairings and only as commanded; card presence. |
+| [`rapp-session-requests-v26.11.8.pv`](rapp-session-requests-v26.11.8.pv) | ProVerif 2.05 | Sessions with two operations each and one abstract card command: injective agreement on requests. |
+| [`rapp-session-consent-v26.11.8.pv`](rapp-session-consent-v26.11.8.pv) | ProVerif 2.05 | Sessions with one operation each, the card and Carol, and the close: consent for qualified signatures; authenticity of results and close reasons. |
+| [`rapp-pairing-v26.11.8.spthy`](rapp-pairing-v26.11.8.spthy) | Tamarin 1.12 | The pairing: offer, CPace, Noise_XXpsk3 and the pairing channel, with the pairing lemmas. |
+| [`rapp-session-v26.11.8.spthy`](rapp-session-v26.11.8.spthy) | Tamarin 1.12 | Sessions and operations over stored pairings taken as given, the card and Carol, withdrawn records, and revocation, which needs mutable state. |
 
 The ProVerif model is split so that each part fits a small verification
 budget: four pairing files and three session files, one per property
@@ -58,7 +58,7 @@ Each property is tied to the losses (L), hazards (H), unsafe control
 actions (UCA) and controller constraints (CC) of the
 [RAPP STPA record](../../security/stpa-rapp.md), and to the state
 machine invariants (INV, X) of
-[rapp-state-machine-v26.11.2.yaml](../rapp-state-machine-v26.11.2.yaml).
+[rapp-state-machine-v26.11.8.yaml](../rapp-state-machine-v26.11.8.yaml).
 The models follow the spec. Where the engine in `crates/rapp` does
 something the spec does not state, the model follows the spec.
 
@@ -189,14 +189,14 @@ beside them.
 
 ## Properties
 
-In "Checked by", Ps is `rapp-pairing-secrecy-v26.11.2.pv`, Pg is
-`rapp-pairing-guessing-v26.11.2.pv`, Pa is
-`rapp-pairing-agreement-v26.11.2.pv`, Pw is
-`rapp-pairing-withdrawal-v26.11.2.pv`, Ss is
-`rapp-session-secrecy-v26.11.2.pv`, Sr is
-`rapp-session-requests-v26.11.2.pv`, Sc is
-`rapp-session-consent-v26.11.2.pv`, Tp is `rapp-pairing-v26.11.2.spthy`
-and Ts is `rapp-session-v26.11.2.spthy`.
+In "Checked by", Ps is `rapp-pairing-secrecy-v26.11.8.pv`, Pg is
+`rapp-pairing-guessing-v26.11.8.pv`, Pa is
+`rapp-pairing-agreement-v26.11.8.pv`, Pw is
+`rapp-pairing-withdrawal-v26.11.8.pv`, Ss is
+`rapp-session-secrecy-v26.11.8.pv`, Sr is
+`rapp-session-requests-v26.11.8.pv`, Sc is
+`rapp-session-consent-v26.11.8.pv`, Tp is `rapp-pairing-v26.11.8.spthy`
+and Ts is `rapp-session-v26.11.8.spthy`.
 
 | # | Property | Checked by | Spec | STPA and state machine |
 | :--- | :--- | :--- | :--- | :--- |
@@ -229,13 +229,13 @@ items a1 to a3 cite the losses and the custody constraint it protects.
 ### ProVerif
 
 ```sh
-proverif rapp-pairing-secrecy-v26.11.2.pv
-proverif rapp-pairing-guessing-v26.11.2.pv
-proverif rapp-pairing-agreement-v26.11.2.pv
-proverif rapp-pairing-withdrawal-v26.11.2.pv
-proverif rapp-session-secrecy-v26.11.2.pv
-proverif rapp-session-requests-v26.11.2.pv
-proverif rapp-session-consent-v26.11.2.pv
+proverif rapp-pairing-secrecy-v26.11.8.pv
+proverif rapp-pairing-guessing-v26.11.8.pv
+proverif rapp-pairing-agreement-v26.11.8.pv
+proverif rapp-pairing-withdrawal-v26.11.8.pv
+proverif rapp-session-secrecy-v26.11.8.pv
+proverif rapp-session-requests-v26.11.8.pv
+proverif rapp-session-consent-v26.11.8.pv
 ```
 
 Each file is checked on its own and reports the queries of its group.
@@ -246,9 +246,9 @@ the guessing file reports `Weak secret code_w is true.`.
 ### Tamarin
 
 ```sh
-tamarin-prover --prove rapp-pairing-v26.11.2.spthy
-tamarin-prover --prove rapp-session-v26.11.2.spthy
-tamarin-prover -D=REVOCATION --prove=no_service_after_revocation rapp-session-v26.11.2.spthy
+tamarin-prover --prove rapp-pairing-v26.11.8.spthy
+tamarin-prover --prove rapp-session-v26.11.8.spthy
+tamarin-prover -D=REVOCATION --prove=no_service_after_revocation rapp-session-v26.11.8.spthy
 ```
 
 `--prove=<lemma>` proves one lemma. The revocation lemma and the
@@ -263,7 +263,7 @@ both as reported by GNU `time`.
 The session files here differ from the copies that ran only in their
 opening comments.
 
-### `rapp-session-secrecy-v26.11.2.pv`: complete, 114 s, peak 1.74 GiB
+### `rapp-session-secrecy-v26.11.8.pv`: complete, 114 s, peak 1.74 GiB
 
 ```
 RESULT not attacker_bitstring(pin1[]) is true.
@@ -277,13 +277,13 @@ RESULT event(CardSigns(ac,d_3)) ==> event(CustodianCommandsCard(k,pid_4,ssid_2,o
 RESULT event(RequesterAcceptsCardStatus(pid_4,ssid_2,fp_2)) ==> event(CustodianSentCardStatus(honest,pid_4,ssid_2,fp_2)) is true.
 ```
 
-### `rapp-session-requests-v26.11.2.pv`: complete, 580 s, peak 6.20 GiB
+### `rapp-session-requests-v26.11.8.pv`: complete, 580 s, peak 6.20 GiB
 
 ```
 RESULT inj-event(CustodianCommandsCard(honest,pid_4,ssid_2,op,nm_2,pr,ac,cx,d)) ==> inj-event(RequesterSendsOp(pid_4,ssid_2,op,pr,ac,cx,d)) is true.
 ```
 
-### `rapp-session-consent-v26.11.2.pv`: complete, 59 s, peak 0.99 GiB
+### `rapp-session-consent-v26.11.8.pv`: complete, 59 s, peak 0.99 GiB
 
 ```
 RESULT inj-event(CustodianCommandsCard(k,pid_4,ssid_2,op,nm_3,prof_docsign,act_sign_document,cx,d_3)) ==> inj-event(HolderConsents(nm_3,cx,d_3)) is true.
@@ -291,7 +291,7 @@ RESULT event(RequesterGetsResult(pid_4,ssid_2,op,s)) ==> event(CustodianSentResu
 RESULT event(RequesterAcceptsClose(pid_4,ssid_2,r_1)) ==> event(CustodianSentClose(honest,pid_4,ssid_2,r_1)) is true.
 ```
 
-### `rapp-pairing-secrecy-v26.11.2.pv`: complete, 38 s, peak 0.89 GiB
+### `rapp-pairing-secrecy-v26.11.8.pv`: complete, 38 s, peak 0.89 GiB
 
 ```
 RESULT not attacker_bitstring(sec_psk_r[]) is true.
@@ -304,20 +304,20 @@ RESULT not attacker_bitstring(sec_disc_c[]) is true.
 RESULT not attacker_bitstring(sec_wd_c[]) is true.
 ```
 
-### `rapp-pairing-guessing-v26.11.2.pv`: complete, 169 s, peak 1.49 GiB
+### `rapp-pairing-guessing-v26.11.8.pv`: complete, 169 s, peak 1.49 GiB
 
 ```
 RESULT Weak secret code_w is true.
 ```
 
-### `rapp-pairing-agreement-v26.11.2.pv`: complete, 45 s, peak 1.23 GiB
+### `rapp-pairing-agreement-v26.11.8.pv`: complete, 45 s, peak 1.23 GiB
 
 ```
 RESULT event(CustodianPairingActive(honest,pid_4,gh_2,pkc_4,pkr_4,nm_1)) ==> event(RequesterStored(pid_4,gh_2,pkc_4,pkr_4,nm_1)) is true.
 RESULT event(RequesterPairingActive(pid_4,gh_2,pkc_4,pkr_4,nm_1)) ==> event(CustodianStored(honest,pid_4,gh_2,pkc_4,pkr_4,nm_1)) is true.
 ```
 
-### `rapp-pairing-withdrawal-v26.11.2.pv`: complete, under 0.1 s, peak 13 MiB
+### `rapp-pairing-withdrawal-v26.11.8.pv`: complete, under 0.1 s, peak 13 MiB
 
 ```
 RESULT event(RequesterVerifiedWithdrawal(pid_4,ins_2,ctr_2)) ==> event(CustodianWithdrew(honest,pid_4,ins_2,ctr_2)) is true.
@@ -339,7 +339,7 @@ Tamarin 1.12 with Maude 3.5.1 on the same host, one run at a time, under
 `nice -n 10`, with `ulimit -v 16000000` and a timeout per run. "Out of
 memory" means Tamarin stopped at that limit.
 
-`rapp-pairing-v26.11.2.spthy`, one run of four lemmas, all wellformedness
+`rapp-pairing-v26.11.8.spthy`, one run of four lemmas, all wellformedness
 checks successful with the derivation check untimed: 34 s, peak
 1.72 GiB.
 
@@ -353,7 +353,7 @@ checks successful with the derivation check untimed: 34 s, peak
 | `pairing_agreement_custodian` | no result: out of memory after 203 s |
 | `custodian_keys_secret`, `requester_keys_secret` | no result in this file: out of memory or 300 s timeout in the earlier single theory |
 
-`rapp-session-v26.11.2.spthy`, one run of eleven lemmas, derivation check
+`rapp-session-v26.11.8.spthy`, one run of eleven lemmas, derivation check
 untimed and successful: 13 s, peak 0.77 GiB; `pin1_secret` and
 `pin2_secret` in a second run: 13 s, peak 0.34 GiB.
 

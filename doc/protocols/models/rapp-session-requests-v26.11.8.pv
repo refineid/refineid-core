@@ -14,11 +14,11 @@
  *)
 
 
-(* Symbolic model of RAPP v26.11.2 operational sessions and operations
- * (doc/protocols/rapp-v26.11.2.md, "the spec": §2.2.1, §4.3 item 5,
+(* Symbolic model of RAPP v26.11.8 operational sessions and operations
+ * (doc/protocols/rapp-v26.11.8.md, "the spec": §2.2.1, §4.3 item 5,
  * §6.3, §7, §8, §9, §11) for ProVerif, one of three session files that
  * each check one group of properties. A stored pairing is taken as given:
- * rapp-pairing-secrecy-v26.11.2.pv and rapp-pairing-agreement-v26.11.2.pv
+ * rapp-pairing-secrecy-v26.11.8.pv and rapp-pairing-agreement-v26.11.8.pv
  * check that a pairing made with the code establishes secret
  * pair-specific static keys on which both ends agree.
  * README.md in this directory states the abstraction, the attacker model
@@ -32,22 +32,19 @@
  * static key and holds its secret, as a computer that received Carol's
  * code does) and serves any number of sessions.
  *
- * This file checks consent for qualified signatures and the authenticity
- * of results and close reasons. One operation per session: each signature
- * is its own operation, and every operation ends its session's work. *)
+ * This file checks injective agreement on requests. Two operations per
+ * session exercise the sequence numbers and the operation_id check; the
+ * card is one abstract signing command, since the property concerns the
+ * request, not the PIN that authorizes it. *)
 
 (* ------------------------------------------------------------------ *)
 (* Channels and secrets                                               *)
 (* ------------------------------------------------------------------ *)
 
 free pub: channel.                 (* every RAPP transport, spec §2.2 *)
-free nfc: channel [private].       (* phone to card, NFC or its reader *)
-free screen: channel [private].    (* the phone's PIN prompt to Carol, spec §8.2 item 3 *)
 
-(* Phone-local secrets of Carol's card, spec §11 item 4. *)
-free pin1: bitstring [private].
-free pin2: bitstring [private].
-free can: bitstring [private].
+(* The card's signing key, used by one abstract card command. *)
+free sk_card: bitstring [private].
 
 (* Markers that the honest endpoints encrypt under each session key; the
  * attacker learns a marker exactly when it learns the key. *)
@@ -196,52 +193,16 @@ event RequesterAcceptsClose(bitstring, bitstring, bitstring).
 (* Queries                                                            *)
 (* ------------------------------------------------------------------ *)
 
-(* Consent: every qualified signature runs under one PIN 2 entry by Carol
- * on the phone, made on a prompt that named the paired computer by its
- * stored display name and showed that request's document name and
- * digest. Spec §8.2 item 3, §11 items 1 and 2; STPA H-1, L-1, L-5,
- * CC-66, CC-75, CC-85, UCA-1, UCA-73. *)
-query k: bitstring, pid: bitstring, ssid: bitstring, op: bitstring, nm: bitstring,
-      cx: bitstring, d: bitstring;
-  inj-event(CustodianCommandsCard(k, pid, ssid, op, nm, prof_docsign, act_sign_document, cx, d))
-    ==> inj-event(HolderConsents(nm, cx, d)).
-
-(* A signature Bob accepts is one Alice returned for that request on that
- *   session (spec §8.2 item 5; STPA H-3).
- * A close reason Bob acts on (pairing_revoked, service_withdrawn,
- *   card_unavailable and the rest) is one Alice sent on that session
- *   (spec §4.5 item 6, §4.6 item 4, §7.1 item 7; STPA CC-2, CC-22,
- *   CC-114, H-4, H-7). *)
-query pid: bitstring, ssid: bitstring, op: bitstring, s: bitstring, r: bitstring;
-  event(RequesterGetsResult(pid, ssid, op, s))
-    ==> event(CustodianSentResult(honest, pid, ssid, op, s));
-  event(RequesterAcceptsClose(pid, ssid, r))
-    ==> event(CustodianSentClose(honest, pid, ssid, r)).
-
-(* ------------------------------------------------------------------ *)
-(* The card and the cardholder                                          *)
-(* ------------------------------------------------------------------ *)
-
-(* The card answers a private-key command only with its PIN after the
- * secure channel the CAN opens; PIN 1 for the authentication key, PIN 2
- * for the qualified signature key (spec §9). *)
-let Card(sk_auth: bitstring, sk_sign: bitstring) =
-    ( ! in(nfc, (=can, =pin1, =act_browser_auth, d: bitstring, rc: channel));
-        event CardSigns(act_browser_auth, d);
-        out(rc, sign(sk_auth, d)) )
-  | ( ! in(nfc, (=can, =pin2, =act_sign_document, d: bitstring, rc: channel));
-        event CardSigns(act_sign_document, d);
-        out(rc, sign(sk_sign, d)) ).
-
-(* Carol reads the prompt on the phone and enters PIN 2 there (spec §8.2
- * item 3, §11 item 1). The prompt shows the paired computer's stored
- * name and the document name, rendered from a snapshot of the request;
- * her entry answers that prompt, so it carries what the prompt showed. *)
-let Cardholder =
-  ! in(screen, (nm: bitstring, docname: bitstring, d: bitstring, r: channel));
-    event HolderConsents(nm, docname, d);
-    out(r, (pin2, nm, docname, d)).
-
+(* Injective agreement on the request: every card command Alice issues on
+ * an honest pairing's session answers one distinct request Bob sent on
+ * that very session, with the same identifier, profile, action, context
+ * and digest; a replayed, reflected or cross-session request obtains no
+ * second command. Spec §7.2 items 2 and 3, §8.1 item 1; STPA H-1, H-2,
+ * CC-104, UCA-15. *)
+query pid: bitstring, ssid: bitstring, op: bitstring, nm: bitstring,
+      pr: bitstring, ac: bitstring, cx: bitstring, d: bitstring;
+  inj-event(CustodianCommandsCard(honest, pid, ssid, op, nm, pr, ac, cx, d))
+    ==> inj-event(RequesterSendsOp(pid, ssid, op, pr, ac, cx, d)).
 
 (* ------------------------------------------------------------------ *)
 (* Alice: operational session, spec §2.2.1, §4.3 item 5, §6.3, §7, §8 *)
@@ -305,26 +266,25 @@ let CustodianSession(kind: bitstring, pid: bitstring, gh: bitstring, granted: bi
        (op1: bitstring, pr1: bitstring, ac1: bitstring, cx1: bitstring, d1: bitstring))
       = aead_open(krc, n1, empty, m1) in
   let (g_auth: bitstring, g_sign: bitstring, g_status: bitstring) = granted in
-  if pr1 = prof_docsign && ac1 = act_sign_document && g_sign = prof_docsign then
-  ( out(screen, (nm, cx1, d1, r1));
-    in(r1, (p1: bitstring, =nm, =cx1, =d1));
-    event CustodianCommandsCard(kind, pid, ssid, op1, nm, pr1, ac1, cx1, d1);
-    out(nfc, (can, p1, ac1, d1, rc1));
-    in(rc1, s1: bitstring);
-    event CustodianSentResult(kind, pid, ssid, op1, s1);
-    out(pub, aead(kcr, n2, empty, (wire_version, ssid, n2, t_op_result, (op1, st_completed, s1))));
-    in(pub, reason: bitstring);
-    event CustodianSentClose(kind, pid, ssid, reason);
-    out(pub, aead(kcr, n3, empty, (wire_version, ssid, n3, t_session_close, reason))) )
-  else if pr1 = prof_auth && ac1 = act_browser_auth && g_auth = prof_auth then
+  if (pr1 = prof_docsign && ac1 = act_sign_document && g_sign = prof_docsign) || (pr1 = prof_auth && ac1 = act_browser_auth && g_auth = prof_auth) then
   ( event CustodianCommandsCard(kind, pid, ssid, op1, nm, pr1, ac1, cx1, d1);
-    out(nfc, (can, pin1, ac1, d1, rc1));
-    in(rc1, s1: bitstring);
+    let s1 = sign(sk_card, (ac1, d1)) in
     event CustodianSentResult(kind, pid, ssid, op1, s1);
     out(pub, aead(kcr, n2, empty, (wire_version, ssid, n2, t_op_result, (op1, st_completed, s1))));
-    in(pub, reason: bitstring);
-    event CustodianSentClose(kind, pid, ssid, reason);
-    out(pub, aead(kcr, n3, empty, (wire_version, ssid, n3, t_session_close, reason))) )
+  (* Operation 2: request at sequence n2, result at n3. *)
+  in(pub, m2: bitstring);
+  let (=wire_version, =ssid, =n2, =t_op_request,
+       (op2: bitstring, pr2: bitstring, ac2: bitstring, cx2: bitstring, d2: bitstring))
+      = aead_open(krc, n2, empty, m2) in
+  (* An operation_id the session has seen is refused (spec §8.1 item 1). *)
+  if op2 <> op1 then
+  if (pr2 = prof_docsign && ac2 = act_sign_document && g_sign = prof_docsign) || (pr2 = prof_auth && ac2 = act_browser_auth && g_auth = prof_auth) then
+  ( event CustodianCommandsCard(kind, pid, ssid, op2, nm, pr2, ac2, cx2, d2);
+    let s2 = sign(sk_card, (ac2, d2)) in
+    event CustodianSentResult(kind, pid, ssid, op2, s2);
+    out(pub, aead(kcr, n3, empty, (wire_version, ssid, n3, t_op_result, (op2, st_completed, s2))));
+    0 )
+ )
  ) ).
 
 (* ------------------------------------------------------------------ *)
@@ -384,11 +344,14 @@ let RequesterSession(pid: bitstring, gh: bitstring, skr: xsec, pkr: xpub, pkc: x
   let (=wire_version, =ssid, =n2, =t_op_result, (=op1, st1: bitstring, s1: bitstring))
       = aead_open(kcr, n2, empty, mr1) in
   event RequesterGetsResult(pid, ssid, op1, s1);
-  (* The close and its reason (spec §7.1 item 7). *)
-  in(pub, mc: bitstring);
-  let (=wire_version, =ssid, =n3, =t_session_close, reason: bitstring)
-      = aead_open(kcr, n3, empty, mc) in
-  event RequesterAcceptsClose(pid, ssid, reason).
+  (* Operation 2: fresh operation_id (spec §8.1 item 1). *)
+  in(pub, (pr2: bitstring, ac2: bitstring, cx2: bitstring, d2: bitstring));
+  event RequesterSendsOp(pid, ssid, op2, pr2, ac2, cx2, d2);
+  out(pub, aead(krc, n2, empty, (wire_version, ssid, n2, t_op_request, (op2, pr2, ac2, cx2, d2))));
+  in(pub, mr2: bitstring);
+  let (=wire_version, =ssid, =n3, =t_op_result, (=op2, st2: bitstring, s2: bitstring))
+      = aead_open(kcr, n3, empty, mr2) in
+  event RequesterGetsResult(pid, ssid, op2, s2).
 
 (* ------------------------------------------------------------------ *)
 (* Stored pairings                                                      *)
@@ -429,14 +392,10 @@ let CompromisedPairing =
 (* ------------------------------------------------------------------ *)
 
 process
-  new sk_auth: bitstring;
-  new sk_sign: bitstring;
-  (* The card's certificates are public (spec §9.1, §9.2). *)
-  out(pub, spk(sk_auth));
-  out(pub, spk(sk_sign));
-  let fp = H((lbl_cert_fp, spk(sk_auth))) in
-  ( Card(sk_auth, sk_sign)
-  | Cardholder
+  (* The card's certificate fingerprint (spec §8.4 item 2). *)
+  let fp = H((lbl_cert_fp, spk(sk_card))) in
+  out(pub, spk(sk_card));
+  ( 0
   | ( ! HonestPairing )
   | CompromisedPairing
   (* Each session draws its fresh values (Noise ephemeral, ready nonce,

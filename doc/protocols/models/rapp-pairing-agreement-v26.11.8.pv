@@ -14,10 +14,10 @@
  *)
 
 
-(* Symbolic model of the RAPP v26.11.2 pairing (doc/protocols/rapp-v26.11.2.md,
+(* Symbolic model of the RAPP v26.11.8 pairing (doc/protocols/rapp-v26.11.8.md,
  * "the spec": §3, §4.2 to §4.5, §6.1, §6.2) for ProVerif, one of four
  * pairing files that each check one group of properties. The session files
- * rapp-session-*-v26.11.2.pv take a stored pairing as given. README.md in
+ * rapp-session-*-v26.11.8.pv take a stored pairing as given. README.md in
  * this directory states the abstraction, the attacker model and the
  * properties with the STPA ids (doc/security/stpa-rapp.md) each one checks.
  *
@@ -30,7 +30,8 @@
  * published to the attacker, who then runs the Requester role himself
  * with keys of his own.
  *
- * This file checks that the code admits no offline guessing.
+ * This file checks that pairing cannot complete without the code and that
+ * both ends agree on the pairing they store.
  *)
 
 (* ------------------------------------------------------------------ *)
@@ -59,6 +60,11 @@ free sec_static_r, sec_static_c: bitstring [private].
  * points are distinct types: the groups are unrelated, and no honest
  * computation relates a value of one to a value of the other. *)
 set ignoreTypes = false.
+
+(* Resolution setting only: hypotheses of derived clauses are not checked
+ * for redundancy, which costs more than it saves with the large event
+ * terms of this file. It changes no derivable fact. *)
+set redundantHypElim = false.
 
 (* X25519 (RFC 7748) for Noise and the static agreement (spec §6.2,
  * §4.3 item 5): secret scalars, public keys, and the agreement. *)
@@ -192,10 +198,15 @@ event RequesterVerifiedWithdrawal(bitstring, bitstring, bitstring).
 (* Queries                                                            *)
 (* ------------------------------------------------------------------ *)
 
-(* CPace admits no offline guessing of the code: after the protocol the
- * attacker cannot tell the real code from a random value. Spec §3.3
- * "Guessing Bound", §12 "Eavesdropping"; STPA Story 14, CC-107. *)
-weaksecret code_w.
+(* Pairing cannot complete without the code, and both ends agree on the
+ * pairing: pair_id, grants, both static keys and Bob's display name.
+ * Spec §3.3 item 5, §4.3 items 3 and 4; STPA H-4, CC-1, CC-119, CC-120,
+ * UCA-8, UCA-120. *)
+query pid: bitstring, gh: bitstring, pkc: xpub, pkr: xpub, nm: bitstring;
+  event(CustodianPairingActive(honest, pid, gh, pkc, pkr, nm))
+    ==> event(RequesterStored(pid, gh, pkc, pkr, nm));
+  event(RequesterPairingActive(pid, gh, pkc, pkr, nm))
+    ==> event(CustodianStored(honest, pid, gh, pkc, pkr, nm)).
 
 (* ------------------------------------------------------------------ *)
 (* Alice: pairing, spec §3.3, §4.2, §4.3, §6.1, §6.2                     *)

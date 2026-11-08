@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Replays the `pairing_hello` and `session_name` vectors (RAPP v26.11.2
+//! Replays the `pairing_hello` and `session_name` vectors (RAPP v26.11.8
 //! sections 4.3 items 3 and 4, and 7.1): every accepted envelope decodes
 //! to the name it carries and the engine encodes the same bytes, every
 //! rejected one is refused, and the pair record keeps or replaces its name
@@ -28,7 +28,7 @@ use refineid_rapp::{
 };
 use serde::Deserialize;
 
-const CORPUS: &str = include_str!("../../../doc/protocols/vectors/rapp-v26.11.2.json");
+const CORPUS: &str = include_str!("../../../doc/protocols/vectors/rapp-v26.11.8.json");
 
 /// Monotonic instant the messages are read at; no operation is involved.
 const RECEIVED_AT_MS: u64 = 1;
@@ -308,7 +308,7 @@ fn session_names_replay_and_update_the_record() {
 
 #[test]
 fn the_name_bound_is_the_formal_constant() {
-    let model = include_str!("../../../doc/protocols/rapp-state-machine-v26.11.2.yaml");
+    let model = include_str!("../../../doc/protocols/rapp-state-machine-v26.11.8.yaml");
     let line = model
         .lines()
         .find_map(|line| line.trim().strip_prefix("display_name_max_bytes:"))

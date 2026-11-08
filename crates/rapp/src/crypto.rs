@@ -548,7 +548,7 @@ fn version_value() -> WireValue {
 
 #[cfg(test)]
 mod tests {
-    /// RAPP v26.11.2 section 4.3 item 1: the pairing prologue on BLE is 145 bytes.
+    /// RAPP v26.11.8 section 4.3 item 1: the pairing prologue on BLE is 145 bytes.
     #[test]
     fn pairing_prologue_matches_the_specified_length() {
         const BLE_PAIRING_PROLOGUE_LENGTH: usize = 145;

@@ -22,7 +22,7 @@ rest was an idiom.
 ## What makes it an asset rather than a cost
 
 - **The document and the vectors are the source of truth, not either
-  engine.** The RAPP document (`doc/protocols/rapp-v26.11.2.md`) and
+  engine.** The RAPP document (`doc/protocols/rapp-v26.11.8.md`) and
   the FINEID card specifications define the behaviour. The conformance
   corpora under `doc/protocols/vectors/` are derived by
   `tools/rapp-vectors/generate.py` from standard-library primitives,

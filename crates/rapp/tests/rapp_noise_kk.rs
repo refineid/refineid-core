@@ -21,7 +21,7 @@ fn wire_version_value() -> WireValue {
     ])
 }
 
-/// The session prologue of the fixed transcript (RAPP v26.11.2 section 4.3):
+/// The session prologue of the fixed transcript (RAPP v26.11.8 section 4.3):
 /// the corpus pair identifier, an all-0x77 grants hash, and the BLE profile.
 fn session_prologue_ble() -> Vec<u8> {
     let pair_id = hex::decode("8ab9b8bcde5c6eec845d9b1ca0d3a7be").expect("valid pair_id hex");

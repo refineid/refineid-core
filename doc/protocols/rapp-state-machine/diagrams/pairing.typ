@@ -1,5 +1,5 @@
 #import "style.typ": *
-// Pairing, both sides (rapp-state-machine-v26.11.2.yaml, `pairing`).
+// Pairing, both sides (rapp-state-machine-v26.11.8.yaml, `pairing`).
 #set text(font: ("Helvetica Neue", "Helvetica", "Arial"))
 #let w = 34mm
 #diagram(

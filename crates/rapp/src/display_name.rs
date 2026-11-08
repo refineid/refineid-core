@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The name an endpoint gives itself (RAPP v26.11.2 section 4.3 item 3).
+//! The name an endpoint gives itself (RAPP v26.11.8 section 4.3 item 3).
 
 use core::fmt;
 
 /// Most UTF-8 bytes a `display_name` or a `platform` carries (RAPP
-/// v26.11.2 section 7.1, `display_name_max_bytes`).
+/// v26.11.8 section 7.1, `display_name_max_bytes`).
 pub const DISPLAY_NAME_MAX_BYTES: usize = 256;
 
 /// The name an endpoint sends for itself in `pairing.hello`,

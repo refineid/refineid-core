@@ -73,7 +73,7 @@ const CPACE_RISTRETTO255_DSI: &[u8] = b"CPaceRistretto255";
 const CPACE_RISTRETTO255_ISK_DSI: &[u8] = b"CPaceRistretto255_ISK";
 /// SHA-512 input block size in bytes (draft-irtf-cfrg-cpace-21).
 const SHA512_INPUT_BLOCK_SIZE: usize = 128;
-/// Pairing context array domain identifier (RAPP v26.11.2 §6.1.1).
+/// Pairing context array domain identifier (RAPP v26.11.8 §6.1.1).
 const CPACE_CONTEXT_DOMAIN: &str = "rapp-pairing-context";
 /// Domain separation prefix for KC2 transcript hash ($TH$).
 const CPACE_TRANSCRIPT_PREFIX: &[u8] = b"rapp-cpace-transcript";
@@ -94,7 +94,7 @@ type HmacSha512 = Hmac<Sha512>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CpaceError {
     /// The entered pairing code is not six symbols of the pairing-code
-    /// alphabet (RAPP v26.11.2 section 3.1).
+    /// alphabet (RAPP v26.11.8 section 3.1).
     InvalidCode,
     /// Random scalar generation produced an invalid/zero scalar.
     InvalidScalar,
@@ -208,13 +208,13 @@ pub fn calculate_isk(
 }
 
 /// Symbols of the pairing code, in order: Crockford's Base32 alphabet
-/// without `I`, `L`, `O` and `U` (RAPP v26.11.2 section 3.1).
+/// without `I`, `L`, `O` and `U` (RAPP v26.11.8 section 3.1).
 pub const PAIRING_CODE_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-/// Symbols in a complete pairing code (RAPP v26.11.2 section 3.1).
+/// Symbols in a complete pairing code (RAPP v26.11.8 section 3.1).
 pub const PAIRING_CODE_LENGTH: usize = 6;
-/// Separator the display inserts between groups (RAPP v26.11.2 section 3.2).
+/// Separator the display inserts between groups (RAPP v26.11.8 section 3.2).
 const PAIRING_CODE_GROUP_SEPARATOR: char = ' ';
-/// Separator a user may type between groups (RAPP v26.11.2 section 3.1).
+/// Separator a user may type between groups (RAPP v26.11.8 section 3.1).
 const PAIRING_CODE_TYPED_SEPARATOR: char = '-';
 
 /// A complete pairing code: exactly six uppercase symbols of
@@ -224,7 +224,7 @@ pub struct PairingCode([u8; PAIRING_CODE_LENGTH]);
 
 impl PairingCode {
     /// Parse an entered code: folds lowercase to uppercase, drops spaces
-    /// and hyphens, and refuses anything else (RAPP v26.11.2 section 3.1).
+    /// and hyphens, and refuses anything else (RAPP v26.11.8 section 3.1).
     ///
     /// # Errors
     /// [`CpaceError::InvalidCode`] for a symbol outside the alphabet or a
@@ -254,7 +254,7 @@ impl PairingCode {
     }
 
     /// The password octets: the UTF-8 encoding of the six uppercase
-    /// symbols (RAPP v26.11.2 section 3.1).
+    /// symbols (RAPP v26.11.8 section 3.1).
     const fn as_prs(&self) -> &[u8; PAIRING_CODE_LENGTH] {
         &self.0
     }
@@ -266,7 +266,7 @@ impl fmt::Debug for PairingCode {
     }
 }
 
-/// Encodes a deterministic CBOR pairing context array conforming to RAPP v26.11.2 §6.1.1.
+/// Encodes a deterministic CBOR pairing context array conforming to RAPP v26.11.8 §6.1.1.
 ///
 /// ```cddl
 /// pairing-context = [
@@ -311,7 +311,7 @@ pub fn encode_pairing_context_v2(
 
 /// Encodes the RAPP pairing context for the offer hash, the transport profile
 /// of the connection, and the candidate identifier of its offer entry
-/// (RAPP v26.11.2 §6.1.1).
+/// (RAPP v26.11.8 §6.1.1).
 ///
 /// # Errors
 /// [`CpaceError::MalformedFrame`] if CBOR serialization fails.
@@ -387,7 +387,7 @@ pub fn calculate_generator_kc2(
     Ok(point)
 }
 
-/// Computes the 64-byte CPace KC2 transcript hash $TH$ per RAPP v26.11.2 §6.1.3:
+/// Computes the 64-byte CPace KC2 transcript hash $TH$ per RAPP v26.11.8 §6.1.3:
 /// `SHA-512(lv_cat(["rapp-cpace-transcript", SID, C, Y_A, Y_B]))`.
 #[must_use]
 pub fn calculate_transcript_hash_v2(
@@ -424,7 +424,7 @@ pub fn hkdf_expand_sha512_32(prk: &[u8; CPACE_PRK_SIZE], info: &[u8]) -> [u8; 32
     out
 }
 
-/// Computes a 32-byte mutual confirmation tag (FIRST32 of HMAC-SHA-512) per RAPP v26.11.2 §6.1.3:
+/// Computes a 32-byte mutual confirmation tag (FIRST32 of HMAC-SHA-512) per RAPP v26.11.8 §6.1.3:
 /// `FIRST32(HMAC-SHA512(key, lv_cat([tag_prefix, TH])))`.
 #[must_use]
 pub fn calculate_confirmation_tag(
@@ -1092,7 +1092,7 @@ mod tests {
         let sid_array: [u8; 32] = sid_bytes.as_slice().try_into().expect("sid is 32 bytes");
         let offer_id = OfferId::from_array(sid_array);
 
-        // 1. Context C, whose BLE length RAPP v26.11.2 section 6.1.1 states.
+        // 1. Context C, whose BLE length RAPP v26.11.8 section 6.1.1 states.
         const BLE_CONTEXT_LENGTH: usize = 177;
         let context = standard_pairing_context_v2(
             &offer_hash_bytes,

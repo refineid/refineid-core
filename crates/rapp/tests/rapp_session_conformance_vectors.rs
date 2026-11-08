@@ -10,7 +10,7 @@ use refineid_rapp::{
 };
 use serde::Deserialize;
 
-const CORPUS: &str = include_str!("../../../doc/protocols/vectors/rapp-v26.11.2.json");
+const CORPUS: &str = include_str!("../../../doc/protocols/vectors/rapp-v26.11.8.json");
 
 #[derive(Deserialize)]
 struct Corpus {

@@ -15,10 +15,10 @@
  */
 
 /*
- * Symbolic model of the RAPP v26.11.2 pairing (doc/protocols/
- * rapp-v26.11.2.md, "the spec": §3, §4.2 to §4.4, §6.1, §6.2) for Tamarin:
+ * Symbolic model of the RAPP v26.11.8 pairing (doc/protocols/
+ * rapp-v26.11.8.md, "the spec": §3, §4.2 to §4.4, §6.1, §6.2) for Tamarin:
  * the offer, CPace, Noise_XXpsk3 and the pairing channel.
- * rapp-session-v26.11.2.spthy takes a stored pairing as given. README.md
+ * rapp-session-v26.11.8.spthy takes a stored pairing as given. README.md
  * lists every property with the STPA ids (doc/security/stpa-rapp.md) it
  * checks.
  *
@@ -87,7 +87,7 @@ restriction NotNeutral:
  * signing and card status. */
 rule Offer_Honest:
   let grants = <'fi.refineid.authentication', 'fi.refineid.document-signing', 'fi.refineid.card-status'>
-      offer = <'rapp', '26.11.2', ~oid, 'kc2-xxpsk3', grants, 'transports', '300000'>
+      offer = <'rapp', '26.11.8', ~oid, 'kc2-xxpsk3', grants, 'transports', '300000'>
       oh = h(<'offer-hash', offer>)
   in
   [ Fr(~oid), Fr(~pw) ]
@@ -97,7 +97,7 @@ rule Offer_Honest:
 /* An offer whose code Carol types into a compromised computer. */
 rule Offer_Leaked:
   let grants = <'fi.refineid.authentication', 'fi.refineid.document-signing', 'fi.refineid.card-status'>
-      offer = <'rapp', '26.11.2', ~oid, 'kc2-xxpsk3', grants, 'transports', '300000'>
+      offer = <'rapp', '26.11.8', ~oid, 'kc2-xxpsk3', grants, 'transports', '300000'>
       oh = h(<'offer-hash', offer>)
   in
   [ Fr(~oid), Fr(~pw) ]
@@ -107,7 +107,7 @@ rule Offer_Leaked:
 /* CPace step 2 (Custodian). Attempts under one offer share SID and code
  * and are unbounded (spec §3.3 item 5). */
 rule Custodian_CPace_Step2:
-  let ctx = <'rapp-pairing-context', '26.11.2', 'kc2-xxpsk3', tp, cand(tp), oh, 'requester', 'custodian'>
+  let ctx = <'rapp-pairing-context', '26.11.8', 'kc2-xxpsk3', tp, cand(tp), oh, 'requester', 'custodian'>
       gen = h(<'CPaceRistretto255', pw, ctx, oid>)
       yb = gen ^ ~xb
       kk = ya ^ ~xb
@@ -131,9 +131,9 @@ rule Custodian_CPace_Step3:
 /* CPace step 1 (Requester): Bob reads the offer over the transport and
  * uses the code Carol typed once. */
 rule Requester_CPace_Step1:
-  let offer = <'rapp', '26.11.2', oid, 'kc2-xxpsk3', grants, 'transports', '300000'>
+  let offer = <'rapp', '26.11.8', oid, 'kc2-xxpsk3', grants, 'transports', '300000'>
       oh = h(<'offer-hash', offer>)
-      ctx = <'rapp-pairing-context', '26.11.2', 'kc2-xxpsk3', tp, cand(tp), oh, 'requester', 'custodian'>
+      ctx = <'rapp-pairing-context', '26.11.8', 'kc2-xxpsk3', tp, cand(tp), oh, 'requester', 'custodian'>
       gen = h(<'CPaceRistretto255', pw, ctx, oid>)
   in
   [ BobTyped(pw), In(offer), In(tp), Fr(~xa) ]
@@ -161,7 +161,7 @@ rule Requester_CPace_Step3:
 /* <- e, ee, s, es (Custodian). Fresh pair-specific static key (§4.3
  * item 4). */
 rule Custodian_XX_Msg2:
-  let pro = <'rapp-pairing', '26.11.2', 'kc2-xxpsk3', oh, tp>
+  let pro = <'rapp-pairing', '26.11.8', 'kc2-xxpsk3', oh, tp>
       erp = 'g' ^ ~er
       pkc = 'g' ^ ~skc
       dee = ei ^ ~er
@@ -178,7 +178,7 @@ rule Custodian_XX_Msg2:
 
 /* <- received; -> s, se, psk (Requester), then pairing.hello. */
 rule Requester_XX_Msg3:
-  let pro = <'rapp-pairing', '26.11.2', 'kc2-xxpsk3', oh, tp>
+  let pro = <'rapp-pairing', '26.11.8', 'kc2-xxpsk3', oh, tp>
       eip = 'g' ^ ~ei
       pkr = 'g' ^ ~skr
       dee = erp ^ ~ei
@@ -196,7 +196,7 @@ rule Requester_XX_Msg3:
       kcr = h(<'split-2', k_psk>)
       psid = h(<'rapp-session-id', hfin>)
       pid = h(<'rapp-pair-id', hfin>)
-      params = <'26.11.2', 'kc2-xxpsk3', oh, tp, cand(tp)>
+      params = <'26.11.8', 'kc2-xxpsk3', oh, tp, cand(tp)>
   in
   [ RequesterXX1(grants, oh, tp, psk, ~skr, ~ei), In(<erp, c_s, t2>) ]
 --[ NotNeutral(erp), NotNeutral(dee), NotNeutral(des), NotNeutral(dse)
@@ -209,7 +209,7 @@ rule Requester_XX_Msg3:
 
 /* -> received (Custodian); the pairing channel opens. */
 rule Custodian_XX_Done:
-  let pro = <'rapp-pairing', '26.11.2', 'kc2-xxpsk3', oh, tp>
+  let pro = <'rapp-pairing', '26.11.8', 'kc2-xxpsk3', oh, tp>
       erp = 'g' ^ ~er
       pkr = aead_open(k_es, '1', <pro, ei, erp, c_s, t2>, c_si)
       dse = pkr ^ ~er
@@ -231,7 +231,7 @@ rule Custodian_XX_Done:
 /* pairing.hello echo checked, Alice's hello and pairing.confirm sent
  * (spec §4.3 item 3, §7.1 items 1 and 2). */
 rule Custodian_Pairing_Hello:
-  let params = <'26.11.2', 'kc2-xxpsk3', oh, tp, cand(tp)>
+  let params = <'26.11.8', 'kc2-xxpsk3', oh, tp, cand(tp)>
   in
   [ CustodianPairHello(kind, pid, psid, krc, kcr, grants, oh, tp, ~skc, pkr)
   , In(aead(krc, '0', <'pairing.hello', psid, params, nm, grants>, 'empty')) ]

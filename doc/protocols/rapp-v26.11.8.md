@@ -1,20 +1,21 @@
-# Remote Authorization Proxy Protocol (RAPP) v26.11.2
+# Remote Authorization Proxy Protocol (RAPP) v26.11.8
 ## Pairing and Session Protocol over the BLE and Stream Transports
 
 Status: Stamped specification, reviewed by the owner\
-Document version: 26.11.2 (section numbering; cited as "RAPP v26.11.2 section N")\
+Document version: 26.11.8 (section numbering; cited as "RAPP v26.11.8 section N")\
 Wire version: `[26, 11, 8]` (`[Year, Month, Day]`; bumped whenever the wire vocabulary changes, §10.1 item 4)\
 Offer version: `[26, 11, 8]`\
 Wire version history: `[26, 11, 2]` stamped specification; `[26, 11, 7]` adds the `waiting_for_unlock` progress event (§8.2 item 3); `[26, 11, 8]` keeps a forgotten pairing on the Requester until the Custodian echoes its `pairing_revoked` close (§4.6)\
+Document history: 26.11.2 stamped specification; 26.11.8 restamps the document with the wire version, and lets a Requester show its connecting to the Custodian it has just paired (§4.7)\
 Transport Profiles: `"fi.refineid.rapp.ble"`, `"fi.refineid.stream"` (§2.2)\
-Date: 2026-11-02\
+Date: 2026-11-08\
 Change controller: RefineID project
 
 ---
 
 ## Abstract
 
-This specification defines the pairing protocol and the operational protocol of the Remote Authorization Proxy Protocol (RAPP v26.11.2), carried over any registered transport profile (§2.2): the **Bluetooth Low Energy (BLE) Direct Proximity Transport Profile** (`"fi.refineid.rapp.ble"`) and the **Local Internet Protocol (IP) Stream Transport Profile** (`"fi.refineid.stream"`). Pairing, offer bootstrap, sessions, and operations are identical on every transport; only framing, routing, and discovery differ.
+This specification defines the pairing protocol and the operational protocol of the Remote Authorization Proxy Protocol (RAPP v26.11.8), carried over any registered transport profile (§2.2): the **Bluetooth Low Energy (BLE) Direct Proximity Transport Profile** (`"fi.refineid.rapp.ble"`) and the **Local Internet Protocol (IP) Stream Transport Profile** (`"fi.refineid.stream"`). Pairing, offer bootstrap, sessions, and operations are identical on every transport; only framing, routing, and discovery differ.
 
 A user's mobile device acts as the Custodian holding physical custody of the Finnish Electronic Identification (FINEID) identity card over Near Field Communication (NFC). The workstation acts as a Requester. On BLE the Custodian is the Generic Attribute Profile (GATT) Peripheral and the Requester the GATT Central. The Peripheral is the side that advertises, accepts the connection, and serves the data (the GATT Server); the Central is the side that scans, connects, and reads or writes that data (the GATT Client). On the stream transport the Custodian listens and the Requester dials.
 
@@ -28,7 +29,7 @@ To support upper-layer messages (such as X.509 certificate chains or document si
 
 ### 1.1 Scope and Standalone Specification Model
 
-This document defines the complete, standalone normative specification for the **Remote Authorization Proxy Protocol (RAPP) version 26.11.2**. It encompasses:
+This document defines the complete, standalone normative specification for the **Remote Authorization Proxy Protocol (RAPP) version 26.11.8**. It encompasses:
 - The **Transport Profile Registry** (§2.2) with the **BLE Transport Profile** (`"fi.refineid.rapp.ble"`) and the **Local IP Stream Transport Profile** (`"fi.refineid.stream"`).
 - The **pairing protocol** utilizing `CPaceRistretto255`, 6-character Crockford Base32 human factors, atomic attempt admission, and authenticated `Noise_XXpsk3` channel binding.
 - The **BLE SAR Adaptation Layer** with latched invariant total lengths and stop-and-wait flow control.
@@ -37,15 +38,15 @@ This document defines the complete, standalone normative specification for the *
 - The **Registered Credential Profiles and Actions** for card status inspection, browser authentication, and qualified document signing.
 - **Service Withdrawal** (§4.5): the Custodian's notice, keyed by each pairing's static agreement, that it has stopped serving, on discovery and on open sessions, and the Requester's notice, on open sessions, that it has stopped using remote access; how a Requester treats each way a session ends.
 - **Pairing Storage Confirmation and Revocation** (§4.3, §4.6): each endpoint confirms its stored trust record before the pairing is active, an endpoint that forgets a pairing tells the other with a `pairing_revoked` close, in session, as the first message of the next session, which a Requester keeps looking for until the Custodian echoes the close, and a pairing with no session for 30 days expires on each endpoint.
-- **Lifecycle** (§4.7): the Requester's remote use and its view of the Custodian, and the Custodian's service and its view of each computer, as machines with a stated answer for every state and event, formalized in `rapp-state-machine-v26.11.2.yaml` and explained in `rapp-state-machine.md`.
+- **Lifecycle** (§4.7): the Requester's remote use and its view of the Custodian, and the Custodian's service and its view of each computer, as machines with a stated answer for every state and event, formalized in `rapp-state-machine-v26.11.8.yaml` and explained in `rapp-state-machine.md`.
 - **Card Presence** (§8.4): the Custodian's in-session notice of the card it holds and of whether a card reader is attached to it; a Requester's offer to local consumers follows the card, eventually consistent.
 - **Concurrent Multi-Client Serving** (§8): the Custodian serves every paired Requester over its own session; card operations are serialized on the single card.
 - The **Failure Semantics, Retry Protection, and PIN Contracts**.
 
-This document is completely self-contained: all normative schemas, protocol state machines, cryptographic bindings, error handling rules, and wire formats required to implement, verify, and audit RAPP v26.11.2 are defined herein.
+This document is completely self-contained: all normative schemas, protocol state machines, cryptographic bindings, error handling rules, and wire formats required to implement, verify, and audit RAPP v26.11.8 are defined herein.
 
 - **Migration and Compatibility**:
-  RAPP v26.11.2 runs the same pairing and session protocol over every registered transport profile (§2.2). Its wire and offer versions are `[26, 11, 8]` (`[Year, Month, Day]`). It does not interoperate with other RAPP versions. Implementations must conform strictly to the schemas and state machines defined in this standalone specification.
+  RAPP v26.11.8 runs the same pairing and session protocol over every registered transport profile (§2.2). Its wire and offer versions are `[26, 11, 8]` (`[Year, Month, Day]`). It does not interoperate with other RAPP versions. Implementations must conform strictly to the schemas and state machines defined in this standalone specification.
 - **Wire and Offer Versioning**:
   - Offer version: `[26, 11, 8]` in `pairing-offer`.
   - Wire version: `[26, 11, 8]` (`[Year, Month, Day]`) in channel envelopes, pairing context, and handshake prologues; the triple changes with every change of wire vocabulary (§10.1 item 4), the document keeps its section numbering.
@@ -138,7 +139,7 @@ The Custodian routes a `"session"` preamble as follows:
 2. On no match the Custodian closes the connection without changing stored state.
 3. On a match it consults its replay memory: the nonces of the 256 most recently routed sessions. A nonce already there closes the connection; otherwise the nonce is added, displacing the oldest, and the connection proceeds to the Noise session phase for the matched pairing.
 
-A preamble that does not decode, names another profile's domain, carries an unregistered purpose, a non-empty value with `"pairing"`, or a value other than 32 bytes with `"session"` closes the connection (§10.1) without changing stored state. An encoded preamble longer than 64 bytes is rejected before parsing. A `"session"` preamble encodes to 55 bytes on the stream transport and 52 bytes on BLE. The `routing_tag` and `routing_preamble` vectors of `vectors/rapp-routing-v26.11.2.json` pin the bytes.
+A preamble that does not decode, names another profile's domain, carries an unregistered purpose, a non-empty value with `"pairing"`, or a value other than 32 bytes with `"session"` closes the connection (§10.1) without changing stored state. An encoded preamble longer than 64 bytes is rejected before parsing. A `"session"` preamble encodes to 55 bytes on the stream transport and 52 bytes on BLE. The `routing_tag` and `routing_preamble` vectors of `vectors/rapp-routing-v26.11.8.json` pin the bytes.
 
 The routing tag only selects a pairing; it authenticates nothing. Authentication is established exclusively by the `Noise_KK` handshake that follows.
 
@@ -367,7 +368,7 @@ A `mode=pairing` record and a BLE advertisement carry nothing derived from the c
      ```text
      K_x = HKDF-SHA-256(salt = pair_id, IKM = X25519(local static private, peer static public), info, L = 32)
      ```
-     with `info` `"rapp-routing"` for routing tags (§2.2.1), `"rapp-discovery-hint"` for discovery hints (hierarchy specification §4.3), and `"rapp-withdrawal"` for withdrawal hints (§4.5). Both endpoints obtain the same agreement from their own private key and the peer's public key. An agreement equal to the identity point yields no key; such a pairing is never announced or routed. The `pair_keys` vectors of `vectors/rapp-routing-v26.11.2.json` pin the keys.
+     with `info` `"rapp-routing"` for routing tags (§2.2.1), `"rapp-discovery-hint"` for discovery hints (hierarchy specification §4.3), and `"rapp-withdrawal"` for withdrawal hints (§4.5). Both endpoints obtain the same agreement from their own private key and the peer's public key. An agreement equal to the identity point yields no key; such a pairing is never announced or routed. The `pair_keys` vectors of `vectors/rapp-routing-v26.11.8.json` pin the keys.
    - **Routing privacy**: A routing tag is fresh for every connection and computationally unlinkable without `K_route`, so an observer of preambles cannot tell whether two connections belong to the same pairing, and no routing value recurs. A replayed preamble is refused in the Routing phase while its nonce is in the Custodian's replay memory; a preamble replayed after its nonce has left the memory reaches `Noise_KK` message 1, which the replaying party cannot complete. That timing difference reveals only that some stored pairing once routed that preamble, which the observer already saw; it is mitigated by single-flight connection serialization and the pre-authentication limiter (§3.3).
    - Session Prologue:
      ```cddl
@@ -401,7 +402,7 @@ An endpoint **withdraws** when it deliberately stops serving, or stops using, re
 
 2. **Withdrawal Hint**:
    $$\text{whint} = \text{first 8 bytes of }\text{HMAC-SHA-256}(K_{\text{wd}}, \text{len} \parallel \text{instance} \parallel \text{counter\_be64})$$
-   where $\text{instance}$ is the instance portion of the DNS-SD service instance name the Custodian publishes ([RFC 6763](https://www.rfc-editor.org/rfc/rfc6763.html) §4.1): the name exactly as published, without the service type (`_refineid-stream._tcp`) and the domain (`local.`), as UTF-8 octets, 1 to 63 octets (hierarchy specification §4.2). Instance names may contain dots; a value ending in a service type or domain suffix is a misuse and is refused. $\text{len}$ is its length as one octet, and $\text{counter} = \lfloor \text{unix\_time} / 60 \rfloor$ as an unsigned 64-bit big-endian integer. The `withdrawal_key` and `withdrawal_hint` vectors of `vectors/rapp-withdrawal-v26.11.2.json` pin the bytes.
+   where $\text{instance}$ is the instance portion of the DNS-SD service instance name the Custodian publishes ([RFC 6763](https://www.rfc-editor.org/rfc/rfc6763.html) §4.1): the name exactly as published, without the service type (`_refineid-stream._tcp`) and the domain (`local.`), as UTF-8 octets, 1 to 63 octets (hierarchy specification §4.2). Instance names may contain dots; a value ending in a service type or domain suffix is a misuse and is refused. $\text{len}$ is its length as one octet, and $\text{counter} = \lfloor \text{unix\_time} / 60 \rfloor$ as an unsigned 64-bit big-endian integer. The `withdrawal_key` and `withdrawal_hint` vectors of `vectors/rapp-withdrawal-v26.11.8.json` pin the bytes.
 
 3. **Custodian Order**:
    On withdrawal the Custodian, in this order:
@@ -483,7 +484,7 @@ An endpoint **revokes** a pairing when its user forgets it, when the pairing exp
 
 ### 4.7 Lifecycle
 
-The lifecycle of both endpoints is three machines above the pairing and session machines, and the presentation of the Custodian's pairing states. [rapp-state-machine-v26.11.2.yaml](rapp-state-machine-v26.11.2.yaml) states every state and event of each, with a transition, an ignored event or a reason why the event cannot happen in every cell; [rapp-state-machine.md](rapp-state-machine.md) explains them with diagrams; the `scenarios` of `vectors/rapp-lifecycle-v26.11.2.json` walk them.
+The lifecycle of both endpoints is three machines above the pairing and session machines, and the presentation of the Custodian's pairing states. [rapp-state-machine-v26.11.8.yaml](rapp-state-machine-v26.11.8.yaml) states every state and event of each, with a transition, an ignored event or a reason why the event cannot happen in every cell; [rapp-state-machine.md](rapp-state-machine.md) explains them with diagrams; the `scenarios` of `vectors/rapp-lifecycle-v26.11.8.json` walk them.
 
 | Machine | Instances | What it holds |
 | :--- | :--- | :--- |
@@ -492,7 +493,7 @@ The lifecycle of both endpoints is three machines above the pairing and session 
 | `custodian_service` | one per Custodian | remote access off, serving (with or without an offer up), withdrawing, limited by the operating system (§4.5 items 3 and 4) |
 | `pairing` (presentation) | one per stored pairing on a Custodian | how the holder sees each computer: connected, not connected, off after its withdrawal, or no longer listed (§4.5 item 9, §4.6) |
 
-**Presenting the Custodian on a Requester.** A Requester presents the Custodian only through its card. While a session confirms a card (§8.4) the identity is offered and shown; in every other state, whether the Custodian is out of sight, withdrawn, lost, being dialed or held, the Requester shows no remote card, exactly as if no phone were there, and names neither the Custodian's state nor a reason. Dialing, scanning and redialing run in the background within the bounds of §4.5 item 6 and §8.3 and are never shown. The one line that names the Custodian is the notice, after a `"pairing_revoked"` close from it (§4.6 item 4), that the phone forgot this computer. In that state the user's actions are the ordinary ones: use a card in a reader attached to the computer, pair another phone, which replaces the pairing (§4.6 item 6), or turn remote use off.
+**Presenting the Custodian on a Requester.** A Requester presents the Custodian only through its card. While a session confirms a card (§8.4) the identity is offered and shown; in every other state, whether the Custodian is out of sight, withdrawn, lost, being dialed or held, the Requester shows no remote card, exactly as if no phone were there, and names neither the Custodian's state nor a reason. Dialing, scanning and redialing run in the background within the bounds of §4.5 item 6 and §8.3 and are never shown, with one exception: a pairing ceremony its user has just completed. From the ceremony's completion (§4.3 item 4) until the first session over that pairing reports the Custodian's card status (§8.4), or until `redial_window_ms` has passed, the Requester shows that it is connecting to the Custodian, named by the display name of its `pairing.hello` (§4.3 item 3), in place of the code entry; the ceremony's user is waiting for that connection and nothing else answers them. The one other line that names the Custodian is the notice, after a `"pairing_revoked"` close from it (§4.6 item 4), that the phone forgot this computer. In that state the user's actions are the ordinary ones: use a card in a reader attached to the computer, pair another phone, which replaces the pairing (§4.6 item 6), or turn remote use off.
 
 **Turning the Custodian's remote access off** is withdrawal and only withdrawal (§4.5 items 3 and 4): every pairing is kept, and turning it on again serves at once under a fresh instance name. **Turning the Requester's remote use off** forgets its pairing (§4.6 item 6). The Requester's switch goes off only by its user's action: a revocation from the Custodian or idle expiry leaves it on and offers the code entry (hierarchy specification §5.2).
 
@@ -559,14 +560,14 @@ A reassembled frame goes to the handler of the phase the connection is in, the R
 
 ### 6. Normative Cryptographic Protocols
 
-RAPP v26.11.2 specifies three normative cryptographic protocols:
+RAPP v26.11.8 specifies three normative cryptographic protocols:
 1. **`CPaceRistretto255`**: the PAKE of the pairing ceremony (§6.1).
 2. **`Noise_XXpsk3`**: the pairing handshake that turns the PAKE result into a stored pairing (§6.2).
 3. **`Noise_KK`**: the session handshake between paired endpoints (§6.3).
 
 ### 6.1 CPaceRistretto255 KC2 Profile (draft-irtf-cfrg-cpace-21, RFC 9496, RFC 5869)
 
-RAPP v26.11.2 specifies the **`CPaceRistretto255-KC2`** application profile over [draft-irtf-cfrg-cpace-21](https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-cpace-21), [RFC 9496](https://www.rfc-editor.org/rfc/rfc9496.html), and [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html):
+RAPP v26.11.8 specifies the **`CPaceRistretto255-KC2`** application profile over [draft-irtf-cfrg-cpace-21](https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-cpace-21), [RFC 9496](https://www.rfc-editor.org/rfc/rfc9496.html), and [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html):
 
 #### 6.1.1 Cryptographic Suite Definition
 - **Group**: Prime-order Ristretto255 group (order $q = 2^{252} + 27742317777372353535851937790883648493$).
@@ -715,7 +716,7 @@ The generator point $G$ is derived from the password-related string (PRS), the 6
 
 ### 6.4 Session Handshake Vectors
 
-The entries `"session-kk-fixed-transcript-ble"` and `"session-kk-fixed-transcript-stream"` of `doc/protocols/vectors/rapp-v26.11.2.json` pin, for fixed static and ephemeral keys and a fixed session prologue, both handshake messages, the final handshake hash $h$, the directional keys $c_1$ and $c_2$ and the `session_id` of §6.3, one entry per transport profile. An implementation reproduces them byte for byte.
+The entries `"session-kk-fixed-transcript-ble"` and `"session-kk-fixed-transcript-stream"` of `doc/protocols/vectors/rapp-v26.11.8.json` pin, for fixed static and ephemeral keys and a fixed session prologue, both handshake messages, the final handshake hash $h$, the directional keys $c_1$ and $c_2$ and the `session_id` of §6.3, one entry per transport profile. An implementation reproduces them byte for byte.
 
 ---
 

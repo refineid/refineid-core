@@ -1,5 +1,5 @@
 //! Established-session endpoint: failures close the session and never the
-//! pairing (RAPP v26.11.2 section 10.1).
+//! pairing (RAPP v26.11.8 section 10.1).
 
 use super::{
     BinaryFrame, CloseReason, CryptoError, EndpointRole, MessageError, MessageType, OpenError,
@@ -14,7 +14,7 @@ use core::fmt;
 /// first message, or a `pairing_revoked` close in its place; any other
 /// first message, and a `session.hello` anywhere else, closes the session
 /// as an authenticated protocol violation, so no `operation.request` is
-/// admitted before the Requester named itself (RAPP v26.11.2 section 7.1
+/// admitted before the Requester named itself (RAPP v26.11.8 section 7.1
 /// item 6).
 ///
 /// A close is acknowledged (section 7.1 item 7): a received

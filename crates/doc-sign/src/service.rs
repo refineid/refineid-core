@@ -798,12 +798,12 @@ pub enum SignErrorKind {
     },
     /// A document's name, or the name of a file a package holds, as
     /// the phone would show it to the holder, is empty or longer than
-    /// RAPP v26.11.2 section 9.3 allows; refused before any digest went
+    /// RAPP v26.11.8 section 9.3 allows; refused before any digest went
     /// to the phone.
     DocumentNameLength,
     /// A package was offered to the phone together with other documents.
     /// A package is signed with its own `sign_document`; a batch holds
-    /// single documents only (RAPP v26.11.2 section 9.3). Refused before
+    /// single documents only (RAPP v26.11.8 section 9.3). Refused before
     /// any digest went to the phone.
     PackageInBatch,
     /// The phone path was given no document to sign.

@@ -61,7 +61,7 @@ PIN 1 protects the **Authentication Role** (identification, TLS client-certifica
 - There is **no arbitrary countdown timer** evicting PIN 1 from memory.
 - When the user is sitting at their computer and clicks *"Log in with Identity Card"* on a website:
   - The click in the browser on the computer **is the human action and intent**.
-  - If the card is present (in a reader or on the paired phone proxy) and PIN 1 is held, the operation executes **unattended and seamlessly** (RAPP v26.11.2 section 11 item 2).
+  - If the card is present (in a reader or on the paired phone proxy) and PIN 1 is held, the operation executes **unattended and seamlessly** (RAPP v26.11.8 section 11 item 2).
   - Requiring a second, redundant "Approve" tap on a phone screen for every routine webpage login is security theater that adds friction without providing meaningful protection.
 
 ### 3.1.1 A Locked Phone Serves Nothing
@@ -119,7 +119,7 @@ Pairing is an explicit, mutually authenticated ceremony. Direct unauthenticated 
 
 Human users occasionally mistype digits. The security model must be resilient and forgiving of ordinary human error:
 - A mistyped PIN is told to the holder on the phone, with the attempts the card still allows, and the phone prompts again; the computer learns only the operation's outcome.
-- The phone refuses a PIN verification at two or one remaining attempts or an unreadable counter and sends it otherwise; at no attempts left or a blocked PIN the card answers for itself and spends nothing, so RefineID never blocks a card (RAPP v26.11.2 section 10.2).
+- The phone refuses a PIN verification at two or one remaining attempts or an unreadable counter and sends it otherwise; at no attempts left or a blocked PIN the card answers for itself and spends nothing, so RefineID never blocks a card (RAPP v26.11.8 section 10.2).
 - No failure revokes a pairing: a failure closes the connection or the session, or rejects one operation. Pairings are revoked only by their users.
 
 ---

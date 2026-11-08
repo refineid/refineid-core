@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! How a requester treats the end of a session to its custodian (RAPP
-//! v26.11.2 section 4.5 item 6, "How a session ends").
+//! v26.11.8 section 4.5 item 6, "How a session ends").
 
 use super::CloseReason;
 

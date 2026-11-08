@@ -333,7 +333,7 @@ call arriving during a wait shares it, and the non-blocking slot-event
 poll never waits. An offer carries a
 certificate whose fingerprint the phone confirmed on a session, and keeps
 carrying it between sessions until the host withdraws it as RAPP
-v26.11.2 section 8.4 item 3 says; the token exists exactly then, its
+v26.11.8 section 8.4 item 3 says; the token exists exactly then, its
 objects are built from that certificate and the persisted CA
 certificates, and its serial names the pairing. A withdrawn or replaced
 token is a new token when it reappears: every raised token takes its own

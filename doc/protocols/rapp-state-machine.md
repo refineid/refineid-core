@@ -1,10 +1,10 @@
-# RAPP v26.11.2 state machine
+# RAPP v26.11.8 state machine
 
 **Status:** Stamped, reviewed by the owner\
-**Applies to:** [RAPP v26.11.2](rapp-v26.11.2.md), the
+**Applies to:** [RAPP v26.11.8](rapp-v26.11.8.md), the
 [transport and discovery hierarchy](rapp-transport-and-discovery-hierarchy.md),
-the [formal state machine](rapp-state-machine-v26.11.2.yaml) and the
-[lifecycle scenarios](vectors/rapp-lifecycle-v26.11.2.json)
+the [formal state machine](rapp-state-machine-v26.11.8.yaml) and the
+[lifecycle scenarios](vectors/rapp-lifecycle-v26.11.8.json)
 
 ---
 
@@ -258,7 +258,7 @@ stops.
 | State | Session | Dials | User sees |
 | :--- | :--- | :--- | :--- |
 | `idle` | none | when the custodian appears or a consumer asks | no remote card, or the identity still under a running grace |
-| `connecting` | being set up, or due on the back-off | within `redial_window_ms`, at once on an appearance or a consumer request | no remote card, or the identity still under a running grace |
+| `connecting` | being set up, or due on the back-off | within `redial_window_ms`, at once on an appearance or a consumer request | no remote card, or the identity still under a running grace; right after this requester's own pairing, that it connects to the phone just paired |
 | `connected` | healthy | no | the remote card, once a session confirmed it |
 | `withdrawn` | none | never, until the custodian announces itself | no remote card |
 | `ended` | none | never | nothing of this pairing; after the custodian's `pairing_revoked`, the line that the phone forgot this computer |
@@ -268,8 +268,13 @@ Whether the custodian is out of sight, withdrawn, lost or being dialed, the
 requester shows no remote card, exactly as if no phone were there, and names
 neither the custodian's state nor a reason. What it shows after a loss comes
 only from the grace of RAPP §8.4 item 3. Dialing, scanning and redialing are
-background behaviour bounded by the redial window and are never shown. The
-one line that names the custodian is the notice, after its `pairing_revoked`,
+background behaviour bounded by the redial window and are never shown, with
+one exception: right after the requester's own pairing ceremony, until the
+first session over the pairing reports the card status or `redial_window_ms`
+has passed, the requester shows that it is connecting to the custodian it has
+just paired, by the name the custodian gave in `pairing.hello`, in place of
+the code entry; the user who typed the code waits for exactly that. The one
+other line that names the custodian is the notice, after its `pairing_revoked`,
 that the phone forgot this computer. In every state the user's actions are the
 ordinary ones: use a card in a reader attached to the computer, pair another
 phone (which replaces the pairing), or turn remote use off.

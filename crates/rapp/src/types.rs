@@ -22,7 +22,7 @@ use zeroize::ZeroizeOnDrop;
 /// There is one version of RAPP and every peer updates together: the
 /// triple is bumped whenever the wire vocabulary changes, so that a peer
 /// left behind fails at the handshake rather than later on a word it
-/// does not know (RAPP v26.11.2 section 10.1 item 4). History: `[26, 11,
+/// does not know (RAPP v26.11.8 section 10.1 item 4). History: `[26, 11,
 /// 2]` the stamped specification; `[26, 11, 7]` adds the
 /// `waiting_for_unlock` progress event; `[26, 11, 8]` keeps a forgotten
 /// pairing on the Requester until the Custodian echoes its
@@ -30,7 +30,7 @@ use zeroize::ZeroizeOnDrop;
 pub const WIRE_VERSION: (u16, u16, u16) = (26, 11, 8);
 /// Mandatory RAPP pairing Noise suite.
 pub const MANDATORY_PAIRING_SUITE: &str = "Noise_XXpsk3_25519_ChaChaPoly_SHA512";
-/// Mandatory RAPP session Noise suite (RAPP v26.11.2 section 6.3).
+/// Mandatory RAPP session Noise suite (RAPP v26.11.8 section 6.3).
 pub const MANDATORY_SESSION_SUITE: &str = "Noise_KK_25519_ChaChaPoly_SHA512";
 /// Byte length of an X25519 public or private key.
 pub const X25519_KEY_SIZE: usize = 32;
@@ -42,26 +42,26 @@ pub const MAX_FRAME_SIZE: usize = 65_535;
 pub const MAX_FRAME_PLAINTEXT: usize = 65_519;
 /// Maximum simultaneously active operations at an authorization proxy.
 pub const MAX_ACTIVE_OPERATIONS: usize = 1;
-/// Pairing-offer lifetime in milliseconds (RAPP v26.11.2 §3.3, §4.2).
+/// Pairing-offer lifetime in milliseconds (RAPP v26.11.8 §3.3, §4.2).
 pub const OFFER_TTL_MS: u64 = 300_000;
 /// Fewest tries left at which a PIN verification may spend a try (RAPP
-/// v26.11.2 section 10.2): a Custodian refuses at two or one. It is not a
+/// v26.11.8 section 10.2): a Custodian refuses at two or one. It is not a
 /// bound on what is sent: at zero or blocked the verification goes to the
 /// card, which answers for itself and spends nothing. The floor itself is
 /// `check_retry_floor` in `refineid-auth`, which every surface applies.
 pub const MINIMUM_REMAINING_ATTEMPTS: u8 = 3;
 /// How long a requester keeps offering a confirmed certificate with no
-/// session open or the card reported absent (RAPP v26.11.2 section 8.4
+/// session open or the card reported absent (RAPP v26.11.8 section 8.4
 /// item 3).
 pub const IDENTITY_OFFER_GRACE_MS: u64 = 120_000;
 /// How long a requester redials on its own back-off after a loss of the
 /// session, or after a dial that ended before `session.ready`, counted from
 /// the loss or from the first failed dial since the custodian last appeared
-/// (RAPP v26.11.2 section 8.3 item 3). It equals
+/// (RAPP v26.11.8 section 8.3 item 3). It equals
 /// [`IDENTITY_OFFER_GRACE_MS`].
 pub const REDIAL_WINDOW_MS: u64 = IDENTITY_OFFER_GRACE_MS;
 /// How long a requester that quits waits for its `service_withdrawn` closes
-/// to leave before it exits (RAPP v26.11.2 section 4.5 item 8), and one
+/// to leave before it exits (RAPP v26.11.8 section 4.5 item 8), and one
 /// whose user forgot a pairing waits for the echo of its `pairing_revoked`
 /// close (section 4.6 item 6).
 pub const QUIT_WITHDRAWAL_BOUND_MS: u64 = 1_000;

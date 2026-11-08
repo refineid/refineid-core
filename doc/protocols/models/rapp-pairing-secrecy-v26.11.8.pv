@@ -14,10 +14,10 @@
  *)
 
 
-(* Symbolic model of the RAPP v26.11.2 pairing (doc/protocols/rapp-v26.11.2.md,
+(* Symbolic model of the RAPP v26.11.8 pairing (doc/protocols/rapp-v26.11.8.md,
  * "the spec": §3, §4.2 to §4.5, §6.1, §6.2) for ProVerif, one of four
  * pairing files that each check one group of properties. The session files
- * rapp-session-*-v26.11.2.pv take a stored pairing as given. README.md in
+ * rapp-session-*-v26.11.8.pv take a stored pairing as given. README.md in
  * this directory states the abstraction, the attacker model and the
  * properties with the STPA ids (doc/security/stpa-rapp.md) each one checks.
  *

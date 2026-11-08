@@ -40,7 +40,7 @@ cache.
 The holder's certificates are on a computer only while the card is in a
 reader there or the paired phone is reachable. They are held in memory,
 and dropped when the card leaves, when the phone is no longer reachable
-or its session's grace ends (RAPP v26.11.2 section 8.4 item 3), and when
+or its session's grace ends (RAPP v26.11.8 section 8.4 item 3), and when
 the process exits. No platform writes them to any store that outlives
 that: no file, no keychain item, no pairing record, no cache. There is
 no exception.

@@ -21,7 +21,7 @@
   tr(<susp>, <notrun>, [quit], label-side: left),
 )
 #align(center, text(6.8pt)[
-  _off: forget_ also leaves `searching` and `suspended`, each with the one bounded revocation attempt; a local card present does not stop it.\
+  _off: forget_ also leaves `searching` and `suspended`, each putting the pairing into the revocation backlog; a local card present does not stop it.\
   _quit_ leaves every running state for `not_running`; from `switched_on` it first sends `service_withdrawn`, waiting at most 1 s.
   A launch restores the stored switch: `switched_on` or `suspended` as the local card says, `switched_off` otherwise.
 ])

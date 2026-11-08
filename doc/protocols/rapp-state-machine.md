@@ -94,8 +94,8 @@ A requester holds at most one pairing (INV-17), so it runs at most one
    +--------------+ ---------------------------> +-------------+
    | switched_off |                              | switched_on | --+ last pairing ended:
    |              | <--------------------------- |             | <-+ code entry shown
-   +--------------+   holder: off (forget, one   +-------------+
-     ^   ^    ^       bounded revocation attempt) |  ^   |  ^
+   +--------------+   holder: off (forget, into  +-------------+
+     ^   ^    ^       the revocation backlog)     |  ^   |  ^
      |   |    |                      code typed,  |  |   |  | card out
      |   |    |                      no remote    v  |   |  |
      |   |    |                      card  +-----------+ |  |
@@ -113,7 +113,7 @@ A requester holds at most one pairing (INV-17), so it runs at most one
 
 | State | Remote activity | Pairing | User sees |
 | :--- | :--- | :--- | :--- |
-| `switched_off` | none, apart from the one bounded revocation attempt of a pairing its user forgot | none active | the switch off; the local reader only |
+| `switched_off` | none, apart from the revocation backlog of pairings its user forgot | none active | the switch off; the local reader only |
 | `switched_on` | with a pairing: browses `mode=session` and scans BLE continuously; one `requester_view_of_custodian` | none or one active | the remote card while one is presented; otherwise no remote card and the code entry |
 | `searching` | browses `mode=pairing` and tries the custodians found (RAPP §4.2) | the old one, if any, until the new one is stored | the code being tried |
 | `suspended` | none: it withdrew (RAPP §4.5 item 8) | kept | the local card |
@@ -194,15 +194,22 @@ Notes:
   `switched_on` exactly while `no_remote_card_presented` holds, that is while
   no identity is offered, a running grace included.
 - **Off is forget.** `holder_turns_off` raises `forget_pairing` for the held
-  pairing. With a session open the close goes out at once and the
-  requester waits at most `quit_withdrawal_bound_ms` for its echo; with none, the pairing goes to `revoking` and
-  makes one attempt of at most `revocation_attempt_bound_ms` (10 000 ms) to
-  reach the custodian and send the close as the first message of a session
-  (section 8, RAPP §4.6 item 6). Every forget the user starts makes this
-  attempt: switching remote use off, with or without a local card present,
-  and replacing the pairing by pairing another phone. It offers no identity
-  and starts no operation, and no forgotten pairing remains after it. It is
-  the only exception to CC-86: a local card present does not stop it.
+  pairing, which goes to `revoking` and joins the requester's revocation
+  backlog (section 8, RAPP §4.6 item 6). With a session open the close goes
+  out at once and the requester waits at most `quit_withdrawal_bound_ms` for
+  its echo. With none, or without the echo, the requester keeps browsing for
+  the pairing's discovery hint and scanning for the RAPP BLE advertisement,
+  and each time the custodian appears it opens one connection, by the route
+  that appeared (the stream for a session record, Bluetooth for an
+  advertisement, never both), that sends the close as the session's first
+  message. Every forget the user starts does
+  this: switching remote use off, with or without a local card present, and
+  replacing the pairing by pairing another phone. The forgotten pairing
+  offers no identity and starts no operation; it goes on the custodian's
+  echo, or when its idle expiry would have passed, `pairing_idle_expiry_days`
+  after its latest established session. Several forgotten pairings may wait
+  at once. The backlog is the only exception to CC-86: a local card present
+  does not stop it.
   Automatic drops send nothing: idle expiry goes straight to `revoked` on the
   requester (section 8), and a local card only suspends remote use and keeps
   the pairing.
@@ -210,11 +217,11 @@ Notes:
   of the custodian; a failed search with the pairing still held starts it
   again. A pairing stored in `searching` replaces the one held
   (`forget_previous_pairing`, X-10): the old pairing is forgotten as at
-  switch-off, with its one revocation attempt.
+  switch-off, into the revocation backlog.
 - **Discovery and the view.** `start_session_discovery` starts a
   `requester_view_of_custodian` in `idle`; `stop_session_discovery` ends it
-  with `pairing_left`. A revoking pairing's one attempt keeps the discovery it
-  needs until it ends.
+  with `pairing_left`. The revocation backlog keeps the discovery it needs
+  while a forgotten pairing waits in it.
 - **Permissions.** `holder_turns_on` is the only moment the requester asks the
   operating system for local-network and Bluetooth permission; `launched` asks
   for none.
@@ -513,13 +520,17 @@ unrelated pairing (section 11).
 
 The `pairing` machine. Two of its paths matter most for the lifecycle:
 
-- **Requester forget.** `forget_pairing` from `paired_connected` sends the
-  close at once and destroys the key. From `paired_disconnected` it goes to
-  `revoking` on both endpoints. A custodian keeps the key for the close for at
-  most `revocation_notice_days` (`notice_window_expired`); a requester keeps
-  it only for its one attempt: `revocation_notice_sent` when the custodian
-  echoed the close, or `revocation_attempt_ended` when
-  `revocation_attempt_bound_ms` passed (X-09, X-12, INV-18).
+- **Forget.** On a custodian `forget_pairing` from `paired_connected` sends
+  the close at once and destroys the key; from `paired_disconnected` it goes
+  to `revoking`, and the key is kept for the close for at most
+  `revocation_notice_days` (`notice_window_expired`). On a requester
+  `forget_pairing` goes to `revoking` from either state, sending the close at
+  once from `paired_connected`, and the pairing waits in the revocation
+  backlog: `revocation_notice_sent` when the custodian echoed the close, or
+  `notice_window_expired` when the pairing's idle expiry would have passed,
+  `pairing_idle_expiry_days` after its latest established session. A close
+  without its echo leaves it `revoking` for the custodian's next appearance
+  (X-09, X-12, INV-18).
 - **Idle expiry by role.** On a custodian `idle_expired` goes to `revoking`,
   and the close goes out on the next session within the notice window. On a
   requester it goes straight to `revoked`: the record is marked revoked, the
@@ -553,9 +564,9 @@ The `pairing` machine. Two of its paths matter most for the lifecycle:
  | revoked  | <----------- | revoking | <-------- | paired_disconnected | -----------> | paired_connected |
  +----------+  30 days     +----------+  expiry   +---------------------+ <----------- +------------------+
    ^   ^      (custodian),                                                session closed      |
-   |   |      attempt bound                                                                   |
-   |   |      (requester)                                                                     |
-   |   +--- forget: close now -----------------------------------------------------------------+
+   |   |      echo, idle                                                                      |
+   |   |      expiry (requester)                                                              |
+   |   +--- custodian forget: close now -------------------------------------------------------+
    +------- peer pairing_revoked (any paired state)
 ```
 
@@ -580,11 +591,11 @@ receives an authenticated `session.close`, whatever its reason, answers with a
 transport. An endpoint that sent a close waits in `closing` for that echo,
 sends nothing more and ignores every other message; a close arriving then is
 the echo, or a close that crossed its own, and is never answered. The wait is
-at most `quit_withdrawal_bound_ms`, or, in a requester's revocation attempt,
-the rest of `revocation_attempt_bound_ms`. The echo is the evidence that the
-peer acted on the close, such as forgetting the pairing; without it the close
-is not known to have been delivered, and idle expiry and the loss handling
-apply as before (UCA-124, CC-123).
+at most `quit_withdrawal_bound_ms`. The echo is the evidence that the peer
+acted on the close, such as forgetting the pairing; without it the close is
+not known to have been delivered: a requester keeps the forgotten pairing in
+its revocation backlog for the next session, and idle expiry and the loss
+handling apply as before (UCA-124, CC-123).
 
 <!-- figure: session -->
 ```
@@ -628,7 +639,7 @@ closes.
 | X-06 | a requester receives `service_withdrawn` or matches a withdrawn record | its view enters `withdrawn` and dials, offers and holds nothing until `record_appeared` or `advertisement_appeared` |
 | X-07 | a requester dials | the dial follows an appearance, a consumer request, or a `redial_due` within `redial_window_ms` |
 | X-08 | a custodian's holder turns remote access off | every pairing is untouched and the withdrawal runs |
-| X-09 | a requester's pairing enters `revoking` | at most one dial within `revocation_attempt_bound_ms`, then `revocation_notice_sent` or `revocation_attempt_ended` |
+| X-09 | a requester's pairing enters `revoking` | one dial, by the route that appeared, each time its custodian appears and none on a timer, until `revocation_notice_sent`, `peer_revocation_notice` or `notice_window_expired` |
 | X-10 | a requester's pairing becomes active | every other pairing it holds receives `forget_pairing` |
 | X-11 | a custodian's session is `healthy` | no `operation.request` is admitted before `session.hello`, and any other first message but a revocation close is a protocol violation |
 | X-12 | an endpoint receives an authenticated `session.close` | it answers with a `session.close` carrying the same reason and closes the transport, unless it waits for the echo of its own close, which the received close then is |
@@ -641,7 +652,7 @@ closes.
 | INV-15 | No pairing expires while a session to it is established. |
 | INV-16 | No dial and no offer while the requester's view of the custodian is `withdrawn`. |
 | INV-17 | A requester holds at most one active pairing. |
-| INV-18 | A requester keeps a revoking pairing at most `revocation_attempt_bound_ms`. |
+| INV-18 | A requester keeps a revoking pairing until its custodian echoes the close or the pairing's idle expiry would have passed. |
 | INV-19 | No pairing is found, matched or replaced by its display name. |
 | INV-20 | The display name lives in the pair record and dies with it. |
 | INV-21 | Every session carries both endpoints' current display names. |
@@ -652,7 +663,7 @@ The custodian is a phone that reads the card over NFC: an iPhone or an Android
 phone. A requester is a computer (macOS, Windows, Linux or BSD), an iPad or an
 Android tablet; a tablet uses a card in a reader attached to it or a phone's
 card over RAPP and never serves a card. The requester rules of this document,
-the switch that forgets and its one bounded revocation attempt included, apply
+the switch that forgets and its revocation backlog included, apply
 to tablets as to computers.
 
 Each endpoint sends its display name in `pairing.hello`, and again on every

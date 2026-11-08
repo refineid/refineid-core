@@ -24,8 +24,10 @@ use zeroize::ZeroizeOnDrop;
 /// left behind fails at the handshake rather than later on a word it
 /// does not know (RAPP v26.11.2 section 10.1 item 4). History: `[26, 11,
 /// 2]` the stamped specification; `[26, 11, 7]` adds the
-/// `waiting_for_unlock` progress event.
-pub const WIRE_VERSION: (u16, u16, u16) = (26, 11, 7);
+/// `waiting_for_unlock` progress event; `[26, 11, 8]` keeps a forgotten
+/// pairing on the Requester until the Custodian echoes its
+/// `pairing_revoked` close.
+pub const WIRE_VERSION: (u16, u16, u16) = (26, 11, 8);
 /// Mandatory RAPP pairing Noise suite.
 pub const MANDATORY_PAIRING_SUITE: &str = "Noise_XXpsk3_25519_ChaChaPoly_SHA512";
 /// Mandatory RAPP session Noise suite (RAPP v26.11.2 section 6.3).
@@ -58,15 +60,10 @@ pub const IDENTITY_OFFER_GRACE_MS: u64 = 120_000;
 /// (RAPP v26.11.2 section 8.3 item 3). It equals
 /// [`IDENTITY_OFFER_GRACE_MS`].
 pub const REDIAL_WINDOW_MS: u64 = IDENTITY_OFFER_GRACE_MS;
-/// How long a requester keeps a pairing its user forgot with no session
-/// open: within this bound it opens at most one connection to deliver the
-/// `pairing_revoked` close, then destroys the key (RAPP v26.11.2 section
-/// 4.6 item 6).
-pub const REVOCATION_ATTEMPT_BOUND_MS: u64 = 10_000;
 /// How long a requester that quits waits for its `service_withdrawn` closes
 /// to leave before it exits (RAPP v26.11.2 section 4.5 item 8), and one
-/// whose holder turned remote use off waits for its `pairing_revoked` closes
-/// (section 4.6 item 6).
+/// whose user forgot a pairing waits for the echo of its `pairing_revoked`
+/// close (section 4.6 item 6).
 pub const QUIT_WITHDRAWAL_BOUND_MS: u64 = 1_000;
 
 /// Byte length of an offer identifier.

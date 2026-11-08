@@ -416,7 +416,8 @@ queries, so they have no premises to check.
 - **Timing.** The 500 ms attempt spacing, the 5-second attempt deadline,
   the offer's 5-minute life, the post-PAKE deadlines, the liveness and
   silence limits, the redial window, the identity grace, idle expiry and
-  the revocation attempt bound. A symbolic attacker never guesses the
+  the time a forgotten pairing waits in the Requester's revocation
+  backlog. A symbolic attacker never guesses the
   code online. The online guessing bound of spec §3.3 (at most 600 tries
   per offer) is arithmetic, not a symbolic property.
 - **Discovery.** BLE advertisements, DNS-SD names, TXT records,

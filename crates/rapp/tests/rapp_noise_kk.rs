@@ -72,7 +72,7 @@ fn native_kk_replays_the_fixed_transcript() {
         .expect("message 1");
     assert_eq!(
         hex::encode(&message[..length]),
-        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b14d3a6bf89a68db327632dd39e7b401fff"
+        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b14df94b1233e17f3c5672c310712bfab2f"
     );
     assert_eq!(
         responder
@@ -85,7 +85,7 @@ fn native_kk_replays_the_fixed_transcript() {
         .expect("message 2");
     assert_eq!(
         hex::encode(&message[..length]),
-        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b2906033f054ab97054713b81d254f424"
+        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b1b589e2259efbe1e1a2b73a201b332fc"
     );
     assert_eq!(
         initiator
@@ -93,12 +93,12 @@ fn native_kk_replays_the_fixed_transcript() {
             .expect("read 2"),
         0
     );
-    let expected_hash = "cccac9506210c221842e65571777efc14e5816e2cacd4603797b3d92d025d5780cbb0c725c678d3142ba9b92f34d37d4e78de01b4516439150c5581b5fe204c3";
+    let expected_hash = "63c75b0a9e2c85eeff82cc2ce87ab0cd0c9f38b4a17b8939daad28d33b8c3db4607b76f930b3c13da18dbd72dd6ed2b6ffc7fd400dcb37f096b8a001165d8ea8";
     assert_eq!(hex::encode(initiator.handshake_hash()), expected_hash);
     assert_eq!(hex::encode(responder.handshake_hash()), expected_hash);
     assert_eq!(
         hex::encode(refineid_rapp::derive_session_id(&initiator.handshake_hash()).as_bytes()),
-        "81041e82d592686e7421fa27846ca263"
+        "6c409ec46516280c062baede297595ce"
     );
 
     let mut initiator_transport = initiator.into_transport().expect("initiator transport");
@@ -505,15 +505,15 @@ fn test_generate_standard_noise_kk_vector() {
 
     assert_eq!(
         hex::encode(msg1_wire),
-        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b14d3a6bf89a68db327632dd39e7b401fff"
+        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b14df94b1233e17f3c5672c310712bfab2f"
     );
     assert_eq!(
         hex::encode(msg2_wire),
-        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b2906033f054ab97054713b81d254f424"
+        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b1b589e2259efbe1e1a2b73a201b332fc"
     );
     assert_eq!(
         hex::encode(final_h),
-        "cccac9506210c221842e65571777efc14e5816e2cacd4603797b3d92d025d5780cbb0c725c678d3142ba9b92f34d37d4e78de01b4516439150c5581b5fe204c3"
+        "63c75b0a9e2c85eeff82cc2ce87ab0cd0c9f38b4a17b8939daad28d33b8c3db4607b76f930b3c13da18dbd72dd6ed2b6ffc7fd400dcb37f096b8a001165d8ea8"
     );
     assert_eq!(
         hex::encode(init_c1),
@@ -525,7 +525,7 @@ fn test_generate_standard_noise_kk_vector() {
     );
     assert_eq!(
         hex::encode(session_id.as_bytes()),
-        "81041e82d592686e7421fa27846ca263"
+        "6c409ec46516280c062baede297595ce"
     );
 }
 
@@ -591,7 +591,7 @@ fn test_standard_noise_kk_vector_matches_snow_implementation() {
     assert_eq!(len1, 48);
     assert_eq!(
         hex::encode(&buf[..len1]),
-        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b14d3a6bf89a68db327632dd39e7b401fff"
+        "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b14df94b1233e17f3c5672c310712bfab2f"
     );
     let plen1 = resp
         .read_message(&buf[..len1], &mut payload)
@@ -605,7 +605,7 @@ fn test_standard_noise_kk_vector_matches_snow_implementation() {
     assert_eq!(len2, 48);
     assert_eq!(
         hex::encode(&buf[..len2]),
-        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b2906033f054ab97054713b81d254f424"
+        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b1b589e2259efbe1e1a2b73a201b332fc"
     );
     let plen2 = init
         .read_message(&buf[..len2], &mut payload)
@@ -616,7 +616,7 @@ fn test_standard_noise_kk_vector_matches_snow_implementation() {
     let snow_hash = init.get_handshake_hash();
     assert_eq!(
         hex::encode(snow_hash),
-        "cccac9506210c221842e65571777efc14e5816e2cacd4603797b3d92d025d5780cbb0c725c678d3142ba9b92f34d37d4e78de01b4516439150c5581b5fe204c3"
+        "63c75b0a9e2c85eeff82cc2ce87ab0cd0c9f38b4a17b8939daad28d33b8c3db4607b76f930b3c13da18dbd72dd6ed2b6ffc7fd400dcb37f096b8a001165d8ea8"
     );
     assert_eq!(resp.get_handshake_hash(), snow_hash);
 

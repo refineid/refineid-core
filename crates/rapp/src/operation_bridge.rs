@@ -579,8 +579,7 @@ pub struct RappBridgeAction {
     /// This endpoint sent a close and waits for the peer's echo (RAPP
     /// section 7.1 item 7): keep the link and feed what arrives to the
     /// bridge until it gives `CloseAcknowledged` or the wait ends, at most
-    /// `rapp_quit_withdrawal_bound_ms()`, and in a requester's revocation
-    /// attempt until `rapp_revocation_attempt_bound_ms()` ends.
+    /// `rapp_quit_withdrawal_bound_ms()`.
     pub awaits_close_echo: bool,
     /// Registered reason of a session closed by an authenticated notice,
     /// sent or received.

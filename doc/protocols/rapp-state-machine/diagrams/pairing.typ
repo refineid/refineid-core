@@ -28,12 +28,14 @@
   tr(<pd>, <pc>, [session healthy], shift: 3pt, label-side: left),
   tr(<pc>, <pd>, [session closed], shift: 3pt, label-side: left),
   tr(<pd>, <rk>, [forget, idle expiry], label-side: right),
-  tr(<pc>, <rd>, [forget: close now], label-side: left),
-  tr(<rk>, <rd>, [close sent; time bound], label-side: left),
+  tr(<pc>, <rd>, [custodian forget: close now], label-side: left),
+  tr(<rk>, <rd>, [close sent or echoed; time bound], label-side: left),
 )
 #align(center, text(6.8pt)[
   _both confirmed_: the record is stored and `pairing.stored` sent. A failed handshake also returns `handshaking` to `unpaired`.\
-  _time bound_: on a custodian `revocation_notice_days`, on a requester `revocation_attempt_bound_ms`.
+  _close sent or echoed_: a custodian once its close was sent and the wait for the echo ended, a requester on the echo alone.\
+  _time bound_: on a custodian `revocation_notice_days` after the forget, on a requester `pairing_idle_expiry_days` after the latest session.\
+  A requester's forget in session goes to `revoking` too, with the close sent at once.
   _idle expiry_ leads to `revoking` on a custodian only; a requester's goes straight to `revoked`, silently.
   A peer's `pairing_revoked` moves any paired state to `revoked`.
 ])

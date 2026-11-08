@@ -28,7 +28,7 @@ from primitives import (  # noqa: E402
 
 # The wire version triple: bumped whenever the wire vocabulary changes
 # (RAPP v26.11.2 section 10.1 item 4). The corpora keep the document's name.
-VERSION = [26, 11, 7]
+VERSION = [26, 11, 8]
 DOCUMENT = "26.11.2"
 OFFER_TTL_MS = 300000
 BUSY_RETRY_AFTER_MIN_MS = 1

@@ -308,10 +308,10 @@ impl PairRecord {
         self
     }
 
-    /// When its user forgot the pairing, or it expired (section 4.6 item 5),
-    /// while no session was open: the record serves nothing from then on
-    /// and keeps its key only to deliver the `pairing_revoked` close on the
-    /// next session (section 4.6 item 2).
+    /// When its user forgot the pairing, or it expired (section 4.6 item 5):
+    /// the record serves nothing from then on and keeps its key only to
+    /// deliver the `pairing_revoked` close on the next session (section 4.6
+    /// item 2), on a requester until the custodian echoes it (item 6).
     #[must_use]
     pub const fn forgotten_at_ms(&self) -> Option<u64> {
         self.forgotten_at_ms
@@ -330,12 +330,13 @@ impl PairRecord {
 
     /// Whether a forgotten record has kept its key as long as its role
     /// allows, at `now_ms`, milliseconds since the Unix epoch; it is then
-    /// destroyed untold. A custodian keeps it for [`REVOCATION_NOTICE_MS`]
-    /// (section 4.6 item 3); a requester for one bounded attempt of
-    /// [`REVOCATION_ATTEMPT_BOUND_MS`](crate::REVOCATION_ATTEMPT_BOUND_MS)
-    /// (section 4.6 item 6), and at once when `now_ms` is earlier than the
-    /// revocation, since a clock set back cannot show that the bound has
-    /// not passed.
+    /// destroyed untold (section 4.6 item 3). A custodian keeps it for
+    /// [`REVOCATION_NOTICE_MS`] after the forget. A requester keeps it in
+    /// its revocation backlog until the custodian echoes the close or the
+    /// pairing's idle expiry would have passed: [`PAIRING_IDLE_EXPIRY_MS`]
+    /// after its latest recorded session, or its creation while it has had
+    /// none, counted as [`Self::sweep`] counts and not from the forget
+    /// (section 4.6 item 6).
     #[must_use]
     pub const fn revocation_notice_expired(&self, now_ms: u64) -> bool {
         let Some(at_ms) = self.forgotten_at_ms else {
@@ -343,9 +344,7 @@ impl PairRecord {
         };
         match self.role {
             EndpointRole::Proxy => now_ms.saturating_sub(at_ms) >= REVOCATION_NOTICE_MS,
-            EndpointRole::Requester => {
-                now_ms < at_ms || now_ms - at_ms >= super::REVOCATION_ATTEMPT_BOUND_MS
-            }
+            EndpointRole::Requester => self.idle_limit_reached(now_ms),
         }
     }
 
@@ -826,7 +825,6 @@ mod tests {
         REVOCATION_NOTICE_MS, RecordStoreError, SweepOutcome, decode_pair_record,
         encode_pair_record,
     };
-    use crate::REVOCATION_ATTEMPT_BOUND_MS;
     use core::convert::Infallible;
 
     const CREATED_AT_MS: u64 = 1_700_000_000_000;
@@ -1138,17 +1136,31 @@ mod tests {
     }
 
     #[test]
-    fn a_requester_keeps_a_forgotten_key_for_one_bounded_attempt() {
-        let forgotten = record_as(0x42, EndpointRole::Requester).forgotten(FORGOTTEN_AT_MS);
-        assert!(!forgotten.revocation_notice_expired(FORGOTTEN_AT_MS));
+    fn a_requester_keeps_a_forgotten_key_until_its_idle_expiry_would_pass() {
+        let last_session_ms = CREATED_AT_MS + MILLISECONDS_PER_DAY;
+        let forgotten_ms = last_session_ms + MILLISECONDS_PER_DAY;
+        let forgotten = record_as(0x42, EndpointRole::Requester)
+            .with_session_at(last_session_ms)
+            .forgotten(forgotten_ms);
+        let expiry_ms = last_session_ms + PAIRING_IDLE_EXPIRY_MS;
+        assert!(!forgotten.revocation_notice_expired(forgotten_ms));
+        assert!(!forgotten.revocation_notice_expired(expiry_ms - 1));
         assert!(
-            !forgotten.revocation_notice_expired(FORGOTTEN_AT_MS + REVOCATION_ATTEMPT_BOUND_MS - 1)
+            forgotten.revocation_notice_expired(expiry_ms),
+            "30 days after the last session, not after the forget"
         );
-        assert!(forgotten.revocation_notice_expired(FORGOTTEN_AT_MS + REVOCATION_ATTEMPT_BOUND_MS));
+        assert!(forgotten.revocation_notice_expired(forgotten_ms + REVOCATION_NOTICE_MS - 1));
         assert!(
-            forgotten.revocation_notice_expired(FORGOTTEN_AT_MS - 1),
-            "a clock set back cannot keep the key"
+            !forgotten.revocation_notice_expired(forgotten_ms - 1),
+            "a clock set back counts as no time passed, as idle expiry does"
         );
+    }
+
+    #[test]
+    fn a_requester_forgetting_a_pairing_past_its_idle_limit_destroys_it_at_once() {
+        let forgotten = record_as(0x42, EndpointRole::Requester)
+            .forgotten(CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS);
+        assert!(forgotten.revocation_notice_expired(CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS));
     }
 
     #[test]

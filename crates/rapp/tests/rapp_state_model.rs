@@ -4,8 +4,8 @@ use refineid_rapp::{
     Action, EndpointRole, Guards, IDENTITY_OFFER_GRACE_MS, LIVENESS_PING_AFTER_SILENCE_MS,
     MINIMUM_REMAINING_ATTEMPTS, OFFER_TTL_MS, OperationEvent, OperationState,
     PAIRING_CANDIDATES_MAX, PAIRING_IDLE_EXPIRY_DAYS, PairingEvent, PairingState,
-    QUIT_WITHDRAWAL_BOUND_MS, REDIAL_WINDOW_MS, REVOCATION_ATTEMPT_BOUND_MS,
-    REVOCATION_NOTICE_DAYS, SESSION_SILENCE_LIMIT_MS, SessionEvent, SessionState,
+    QUIT_WITHDRAWAL_BOUND_MS, REDIAL_WINDOW_MS, REVOCATION_NOTICE_DAYS, SESSION_SILENCE_LIMIT_MS,
+    SessionEvent, SessionState,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -35,7 +35,6 @@ struct Constants {
     identity_offer_grace_ms: u64,
     quit_withdrawal_bound_ms: u64,
     redial_window_ms: u64,
-    revocation_attempt_bound_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -137,10 +136,6 @@ fn formal_constants_are_the_engine_constants() {
     assert_eq!(constants.identity_offer_grace_ms, IDENTITY_OFFER_GRACE_MS);
     assert_eq!(constants.quit_withdrawal_bound_ms, QUIT_WITHDRAWAL_BOUND_MS);
     assert_eq!(constants.redial_window_ms, REDIAL_WINDOW_MS);
-    assert_eq!(
-        constants.revocation_attempt_bound_ms,
-        REVOCATION_ATTEMPT_BOUND_MS
-    );
 }
 
 #[test]
@@ -296,8 +291,8 @@ fn nothing_reaches_a_phone_while_remote_use_is_off_or_suspended() {
             .unwrap_or_else(|| panic!("the model names {guard}"));
         if guard == "initiation_permitted" {
             assert!(
-                statement.contains("revocation_attempt_bound_ms"),
-                "{guard} names the one revocation attempt as its only exception"
+                statement.contains("revocation backlog"),
+                "{guard} names the revocation backlog as its only exception"
             );
         }
         for condition in REMOTE_USE_CONDITIONS {
@@ -350,36 +345,35 @@ fn nothing_reaches_a_phone_while_remote_use_is_off_or_suspended() {
 }
 
 #[test]
-fn a_requester_that_forgets_with_no_session_open_makes_one_bounded_attempt() {
-    let forgotten = PairingState::PairedDisconnected
-        .transition(
-            EndpointRole::Requester,
-            PairingEvent::ForgetPairing,
-            all_guards(),
-        )
-        .expect("the holder turns remote use off");
-    assert_eq!(forgotten.state, PairingState::Revoking);
-    assert!(!forgotten.actions.contains(&Action::DestroyPairKeys));
+fn a_requester_keeps_every_pairing_its_user_forgot_until_the_echo_or_its_expiry() {
+    for (from, held) in [
+        (PairingState::PairedDisconnected, "with no session open"),
+        (PairingState::PairedConnected, "in session"),
+    ] {
+        let forgotten = from
+            .transition(
+                EndpointRole::Requester,
+                PairingEvent::ForgetPairing,
+                all_guards(),
+            )
+            .unwrap_or_else(|_| panic!("the holder forgets the pairing {held}"));
+        assert_eq!(forgotten.state, PairingState::Revoking, "{held}");
+        assert!(
+            !forgotten.actions.contains(&Action::DestroyPairKeys),
+            "{held}: the key stays for the close"
+        );
+        assert!(forgotten.actions.contains(&Action::WithdrawIdentity));
+    }
     for event in [
         PairingEvent::RevocationNoticeSent,
-        PairingEvent::RevocationAttemptEnded,
+        PairingEvent::NoticeWindowExpired,
     ] {
         let ended = PairingState::Revoking
             .transition(EndpointRole::Requester, event, all_guards())
-            .expect("the attempt ends with the close sent or at its bound");
+            .expect("the echo arrives, or the idle expiry would have passed");
         assert_eq!(ended.state, PairingState::Revoked);
         assert_eq!(ended.actions, &[Action::DestroyPairKeys]);
     }
-    assert!(
-        PairingState::Revoking
-            .transition(
-                EndpointRole::Requester,
-                PairingEvent::NoticeWindowExpired,
-                all_guards(),
-            )
-            .is_err(),
-        "a requester keeps no revoking pairing for the notice window"
-    );
     let custodian = PairingState::PairedDisconnected
         .transition(
             EndpointRole::Proxy,
@@ -388,6 +382,14 @@ fn a_requester_that_forgets_with_no_session_open_makes_one_bounded_attempt() {
         )
         .expect("the custodian's user forgets the computer");
     assert_eq!(custodian.state, PairingState::Revoking);
+    let in_session = PairingState::PairedConnected
+        .transition(
+            EndpointRole::Proxy,
+            PairingEvent::ForgetPairing,
+            all_guards(),
+        )
+        .expect("the custodian's user forgets the computer in session");
+    assert_eq!(in_session.state, PairingState::Revoked);
 }
 
 #[test]
@@ -788,10 +790,6 @@ const PAIRING_EVENTS: &[(&str, PairingEvent)] = &[
     ("idle_expired", PairingEvent::IdleExpired),
     ("revocation_notice_sent", PairingEvent::RevocationNoticeSent),
     ("notice_window_expired", PairingEvent::NoticeWindowExpired),
-    (
-        "revocation_attempt_ended",
-        PairingEvent::RevocationAttemptEnded,
-    ),
     (
         "pair_record_store_failed",
         PairingEvent::PairRecordStoreFailed,

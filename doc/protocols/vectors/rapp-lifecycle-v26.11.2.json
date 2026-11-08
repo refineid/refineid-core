@@ -329,8 +329,8 @@
       ]
     },
     {
-      "name": "revocation-attempt-ends-at-its-bound",
-      "section": "4.6 item 6",
+      "name": "a-forgotten-pairing-goes-at-its-idle-expiry",
+      "section": "4.6 items 3 and 6",
       "machine": "pairing",
       "role": "requester",
       "start": "paired_disconnected",
@@ -350,10 +350,6 @@
         },
         {
           "event": "notice_window_expired",
-          "outcome": "cannot_happen"
-        },
-        {
-          "event": "revocation_attempt_ended",
           "outcome": "transition",
           "state": "revoked",
           "actions": [
@@ -363,7 +359,7 @@
       ]
     },
     {
-      "name": "revocation-attempt-delivers-the-close",
+      "name": "a-forgotten-pairing-goes-on-the-echo",
       "section": "4.6 item 6",
       "machine": "pairing",
       "role": "requester",
@@ -405,14 +401,21 @@
             "local_user_action"
           ],
           "outcome": "transition",
-          "state": "revoked",
+          "state": "revoking",
           "actions": [
             "mark_record_revoked",
             "send_close_pairing_revoked",
             "close_session",
-            "destroy_pair_keys",
             "withdraw_identity",
             "show_forgotten"
+          ]
+        },
+        {
+          "event": "revocation_notice_sent",
+          "outcome": "transition",
+          "state": "revoked",
+          "actions": [
+            "destroy_pair_keys"
           ]
         }
       ]
@@ -814,7 +817,7 @@
       ]
     },
     {
-      "name": "switch-off-with-a-local-card-attempts-too",
+      "name": "switch-off-with-a-local-card-forgets-too",
       "section": "4.6 item 6, hierarchy 5.2",
       "machine": "requester_remote_use",
       "role": "requester",

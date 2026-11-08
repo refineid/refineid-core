@@ -134,7 +134,7 @@ pub struct LivenessMessage {
     pub challenge: PingChallenge,
 }
 
-/// An `error` message (RAPP v26.11.2 sections 7.1 and 10.3): a registered
+/// An `error` message (RAPP v26.11.8 sections 7.1 and 10.3): a registered
 /// name and, when it concerns one, the operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProtocolErrorMessage {

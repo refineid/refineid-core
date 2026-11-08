@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! The pairing, session and operation machines of the RAPP state model
-//! (`doc/protocols/rapp-state-machine-v26.11.2.yaml`), and the runtime state
+//! (`doc/protocols/rapp-state-machine-v26.11.8.yaml`), and the runtime state
 //! an endpoint keeps. No failure revokes a pairing; a user does, idle expiry
 //! does, and the peer's revocation notice does.
 

@@ -14,11 +14,11 @@
  *)
 
 
-(* Symbolic model of RAPP v26.11.2 operational sessions and operations
- * (doc/protocols/rapp-v26.11.2.md, "the spec": §2.2.1, §4.3 item 5,
+(* Symbolic model of RAPP v26.11.8 operational sessions and operations
+ * (doc/protocols/rapp-v26.11.8.md, "the spec": §2.2.1, §4.3 item 5,
  * §6.3, §7, §8, §9, §11) for ProVerif, one of three session files that
  * each check one group of properties. A stored pairing is taken as given:
- * rapp-pairing-secrecy-v26.11.2.pv and rapp-pairing-agreement-v26.11.2.pv
+ * rapp-pairing-secrecy-v26.11.8.pv and rapp-pairing-agreement-v26.11.8.pv
  * check that a pairing made with the code establishes secret
  * pair-specific static keys on which both ends agree.
  * README.md in this directory states the abstraction, the attacker model

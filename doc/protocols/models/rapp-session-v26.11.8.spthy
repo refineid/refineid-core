@@ -15,10 +15,10 @@
  */
 
 /*
- * Symbolic model of RAPP v26.11.2 operational sessions and operations
- * (doc/protocols/rapp-v26.11.2.md, "the spec": §2.2.1, §4.3 item 5, §4.5,
+ * Symbolic model of RAPP v26.11.8 operational sessions and operations
+ * (doc/protocols/rapp-v26.11.8.md, "the spec": §2.2.1, §4.3 item 5, §4.5,
  * §4.6, §6.3, §7, §8, §9, §11) for Tamarin. A stored pairing is taken as
- * given; rapp-pairing-v26.11.2.spthy and the ProVerif pairing files address
+ * given; rapp-pairing-v26.11.8.spthy and the ProVerif pairing files address
  * the pairing itself. Its lemmas correspond to the ProVerif session files,
  * plus the revocation property that needs mutable state. README.md lists
  * every property with the STPA ids (doc/security/stpa-rapp.md) it checks.
@@ -228,7 +228,7 @@ rule Requester_Withdrawal_Check:
 /* Routing preamble and -> e, es, ss (Requester). */
 rule Requester_Session_Start:
   let kroute = mac(h(<'hkdf-extract', pid, pkc ^ ~skr>), 'rapp-routing')
-      pro = <'rapp-session', '26.11.2', 'kk', pid, gh, tp, pkr, pkc>
+      pro = <'rapp-session', '26.11.8', 'kk', pid, gh, tp, pkr, pkc>
       eip = 'g' ^ ~ei
       k_es = h(<'kk-es', pro, eip, pkc ^ ~ei>)
       k_ss = h(<'kk-ss', k_es, pkc ^ ~skr>)
@@ -246,7 +246,7 @@ rule Requester_Session_Start:
 rule Custodian_Session:
   let kroute = mac(h(<'hkdf-extract', pid, pkr ^ ~skc>), 'rapp-routing')
       pkc = 'g' ^ ~skc
-      pro = <'rapp-session', '26.11.2', 'kk', pid, gh, tp, pkr, pkc>
+      pro = <'rapp-session', '26.11.8', 'kk', pid, gh, tp, pkr, pkc>
       k_es = h(<'kk-es', pro, ei, ei ^ ~skc>)
       k_ss = h(<'kk-ss', k_es, pkr ^ ~skc>)
       erp = 'g' ^ ~er
@@ -272,13 +272,13 @@ rule Custodian_Session:
   [ CustodianAlive(pid)
   , CustodianAwaitHello(kind, pid, ssid, krc, kcr, grants, nm)
   , Out(<erp, t2>)
-  , Out(aead(kcr, '0', <'session.ready', ssid, <'26.11.2', 'kk', tp, cand(tp), gh>, ~rnonce, 'alice'>, 'empty'))
+  , Out(aead(kcr, '0', <'session.ready', ssid, <'26.11.8', 'kk', tp, cand(tp), gh>, ~rnonce, 'alice'>, 'empty'))
   , Out(aead(kcr, '1', <'card.status', ssid, 'present', 'no-reader', fp>, 'empty')) ]
 #else
 rule Custodian_Session:
   let kroute = mac(h(<'hkdf-extract', pid, pkr ^ ~skc>), 'rapp-routing')
       pkc = 'g' ^ ~skc
-      pro = <'rapp-session', '26.11.2', 'kk', pid, gh, tp, pkr, pkc>
+      pro = <'rapp-session', '26.11.8', 'kk', pid, gh, tp, pkr, pkc>
       k_es = h(<'kk-es', pro, ei, ei ^ ~skc>)
       k_ss = h(<'kk-ss', k_es, pkr ^ ~skc>)
       erp = 'g' ^ ~er
@@ -302,13 +302,13 @@ rule Custodian_Session:
   , Secret(kind, krc), Secret(kind, kcr) ]->
   [ CustodianAwaitHello(kind, pid, ssid, krc, kcr, grants, nm)
   , Out(<erp, t2>)
-  , Out(aead(kcr, '0', <'session.ready', ssid, <'26.11.2', 'kk', tp, cand(tp), gh>, ~rnonce, 'alice'>, 'empty'))
+  , Out(aead(kcr, '0', <'session.ready', ssid, <'26.11.8', 'kk', tp, cand(tp), gh>, ~rnonce, 'alice'>, 'empty'))
   , Out(aead(kcr, '1', <'card.status', ssid, 'present', 'no-reader', fp>, 'empty')) ]
 #endif
 
 /* <- received (Requester). */
 rule Requester_Session_Keys:
-  let pro = <'rapp-session', '26.11.2', 'kk', pid, gh, tp, pkr, pkc>
+  let pro = <'rapp-session', '26.11.8', 'kk', pid, gh, tp, pkr, pkc>
       eip = 'g' ^ ~ei
       k_ee = h(<'kk-ee', k_ss, erp ^ ~ei>)
       k_se = h(<'kk-se', k_ee, erp ^ ~skr>)
@@ -324,7 +324,7 @@ rule Requester_Session_Keys:
  * (spec §7.1 items 5, 6 and 12). */
 rule Requester_Session_Ready:
   [ RequesterSession2(pid, gh, tp, ssid, krc, kcr)
-  , In(aead(kcr, '0', <'session.ready', ssid, <'26.11.2', 'kk', tp, cand(tp), gh>, rnonce, nmc>, 'empty'))
+  , In(aead(kcr, '0', <'session.ready', ssid, <'26.11.8', 'kk', tp, cand(tp), gh>, rnonce, nmc>, 'empty'))
   , In(aead(kcr, '1', <'card.status', ssid, present, reader, fp>, 'empty')) ]
 --[ RequesterSessionReady(pid, ssid)
   , RequesterAcceptsCardStatus(pid, ssid, fp)

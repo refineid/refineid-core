@@ -1,6 +1,6 @@
 # STPA of the Remote Authorization Proxy Protocol
 
-**Applies to:** RAPP v26.11.2 ([rapp-v26.11.2.md](../protocols/rapp-v26.11.2.md),
+**Applies to:** RAPP v26.11.8 ([rapp-v26.11.8.md](../protocols/rapp-v26.11.8.md),
 written "spec" below), the
 [transport and discovery hierarchy](../protocols/rapp-transport-and-discovery-hierarchy.md)
 ("hierarchy"), and the phone and computer applications built on them.
@@ -244,11 +244,17 @@ Carol's own retry did nothing and nothing said why.
 
 **The good day.** Bob shows one thing: the remote card, or no remote
 card. Dialing, scanning and redialing happen in the background and are
-never shown. The one message that names Alice is the one Carol can act
-on: the phone forgot this computer.
+never shown. The messages that name Alice are ones Carol can use: the
+phone forgot this computer, which she can act on, and, right after Carol
+typed Alice's code, that Bob is connecting to her. That one answers Carol's own action
+and ends when Alice's card shows, Alice has none, or the redial window
+ends; showing the
+empty code entry instead told Carol the pairing she had just made had
+failed.
 
 **Lesson:** a status that is always on is noise. Show the result; speak
-up only when the reader can do something about it.
+up only when the reader can do something about it, or when silence would
+read as the failure of what they just did.
 
 - L-3; H-5. UCA-114, UCA-64, UCA-7, UCA-92, UCA-53, UCA-49.
 - CC-116, CC-62 (the states stay distinct on the wire, where programs
@@ -821,9 +827,9 @@ the requester; a part named after a colon is one program of it.
 | CC-113 | The phone's remote access off is withdrawal only: every pairing is kept, and turning it on again serves at once under a fresh instance name. | §4.5 items 3, 4 |
 | CC-114 | On `service_withdrawn`, `card_unavailable` or a matched withdrawn record, the computer withdraws the identity at once and dials nothing until the phone announces itself again. | §4.5 item 6, §8.4 item 5 |
 | CC-115 | The computer dials only when the phone appears, when a local program asks, or within the 120 s redial window after a loss or a first failed dial; a protocol violation opens no window; no dial runs on a free-running timer. | §8.3 |
-| CC-116 | The computer presents the phone only through its card: the identity while a session confirms it, otherwise "no remote card" with no reason. Dialing and scanning are never shown. The one exception is the line that the phone forgot this computer. The switch shows on or off, and blocked for the computer's own Bluetooth or permissions. | §4.7 |
+| CC-116 | The computer presents the phone only through its card: the identity while a session confirms it, otherwise "no remote card" with no reason. Dialing and scanning are never shown. The exceptions are the line that the phone forgot this computer, and, from a pairing ceremony this computer's user completed until the phone's identity or a request for its card is shown, the phone reports no card, or `redial_window_ms` passes, that it is connecting to the phone just paired. The switch shows on or off, and blocked for the computer's own Bluetooth or permissions. | §4.7 |
 | CC-117 | Discovery runs continuously while remote use is on, and a session record that appears is dialed at once, before any Bluetooth scan. | §8.3 |
-| CC-118 | A computer's forget sends the close on an open session within 1 s; with none open it makes one attempt of at most 10 s; then the key is destroyed either way. Automatic drops send nothing. | §4.6 item 6 |
+| CC-118 | A computer's forget is agreed, not assumed: the forgotten pairing keeps its key for the `pairing_revoked` close alone, in the revocation backlog. The close goes out at once on an open session; otherwise, or without its echo within 1 s, the computer opens one connection each time the phone appears, by the route that appeared, whose first message is the close. Only the phone's echo, or its own `pairing_revoked`, destroys the key and the record; the pairing's idle expiry ends the wait untold. Automatic drops send nothing. | §4.6 items 3 and 6, §7.1 item 7 |
 | CC-119 | Nothing finds, matches, replaces or revokes a pairing by its display name or anything else the peer says about itself. | §4.3 item 3 |
 | CC-120 | Every `pairing.hello` carries the sender's display name, stored in the pair record in the same commit; every session carries both current names, and a changed name replaces the stored one. | §4.3 items 3, 4; §7.1 |
 | CC-121 | A failed store of the pair record ends the pairing with `pairing.abort` and tells the user why. | §4.3 item 4 |

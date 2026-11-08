@@ -1,5 +1,5 @@
 #import "style.typ": *
-// One session instance (rapp-state-machine-v26.11.2.yaml, `session`).
+// One session instance (rapp-state-machine-v26.11.8.yaml, `session`).
 #set text(font: ("Helvetica Neue", "Helvetica", "Arial"))
 #diagram(
   spacing: (13mm, 16mm),

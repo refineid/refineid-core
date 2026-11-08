@@ -43,7 +43,7 @@ applies the same rule earlier, to refuse before it asks for the entry.
   a PUK the card reports verified, which carries no count of the try a
   wrong PUK would spend. Nothing is sent, and the refusal names the
   credential and the tries left, never candidate credential data. RAPP
-  answers a PIN refusal as `retry_floor` (RAPP v26.11.2 section 10.2).
+  answers a PIN refusal as `retry_floor` (RAPP v26.11.8 section 10.2).
 - **Sent**: five, four or three tries left, and PIN 1 or PIN 2 reported
   verified in the card's current security context. Sent also at no
   tries left and at a credential the card reports blocked: the card
@@ -75,7 +75,7 @@ five tries left or as PIN 1 verified (below).
 
 FINEID S4-1 v4.2 sections 4.1 and 8.1.7 require manual PIN entry for every
 qualified-signature operation. PIN2 is entered for every signature, or once
-for a batch the holder sees whole (RAPP v26.11.2 section 9.3); it is carried
+for a batch the holder sees whole (RAPP v26.11.8 section 9.3); it is carried
 only through that batch's signatures and destroyed at its end. It is never
 kept between operations.
 
@@ -110,7 +110,7 @@ key. The current specification is published on the
 PIN1 is held in process memory from the first card-confirmed successful use
 until one of the invalidation events below; there is no idle window or
 countdown. It is never written to storage -- not to a keychain, a keystore, a
-credential manager or a file -- so it never survives a restart (RAPP v26.11.2
+credential manager or a file -- so it never survives a restart (RAPP v26.11.8
 section 11 item 2).
 
 Reusable retention is allowed only when the PIN1 retry counter is at its
@@ -151,7 +151,7 @@ and locking it in a hurry must also stop the card. The identity, the
 pairing and the held PIN 1 stay: a lock is not an invalidation event.
 The request is shown on the lock screen, naming the computer and the
 action, and the computer is told (`operation.progress` event
-`waiting_for_unlock`, RAPP v26.11.2 section 8.2 item 3) so it can say
+`waiting_for_unlock`, RAPP v26.11.8 section 8.2 item 3) so it can say
 "unlock your phone" instead of a silent wait. Unlocking continues the
 request: a held PIN 1 signs with no prompt, a PIN 2 request opens its
 consent screen. A card command already on the wire when the phone locks

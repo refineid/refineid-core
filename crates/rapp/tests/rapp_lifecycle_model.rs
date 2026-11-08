@@ -9,8 +9,8 @@
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 
-const MODEL: &str = include_str!("../../../doc/protocols/rapp-state-machine-v26.11.2.yaml");
-const CORPUS: &str = include_str!("../../../doc/protocols/vectors/rapp-lifecycle-v26.11.2.json");
+const MODEL: &str = include_str!("../../../doc/protocols/rapp-state-machine-v26.11.8.yaml");
+const CORPUS: &str = include_str!("../../../doc/protocols/vectors/rapp-lifecycle-v26.11.8.json");
 
 /// The three lifecycle machines, each with its one role.
 const LIFECYCLE_MACHINES: &[(&str, &str)] = &[

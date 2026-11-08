@@ -1,4 +1,4 @@
-//! An established session with its liveness (RAPP v26.11.2 section 8.3).
+//! An established session with its liveness (RAPP v26.11.8 section 8.3).
 
 use super::{
     AuthenticatedViolation, BinaryFrame, CloseReason, EndpointError, EstablishedEndpoint,
@@ -44,7 +44,7 @@ impl EstablishedSessionRuntime {
     /// Seal an authenticated `session.close` carrying `reason`; the caller
     /// delivers the frame and waits for the peer's echo, which
     /// [`Self::receive`] reports as [`RuntimeReceive::CloseAcknowledged`],
-    /// within its bound, then drops the link (RAPP v26.11.2 section 7.1
+    /// within its bound, then drops the link (RAPP v26.11.8 section 7.1
     /// item 7). Liveness stops; nothing more is sent.
     ///
     /// # Errors
@@ -197,7 +197,7 @@ pub enum RuntimeReceive {
     SessionClosed(SecurityOutcome),
     /// The peer closed the session with an authenticated notice; deliver
     /// `echo`, the close that acknowledges it, when it could be sealed, then
-    /// drop the link (RAPP v26.11.2 section 7.1 item 7).
+    /// drop the link (RAPP v26.11.8 section 7.1 item 7).
     PeerClosed {
         /// The received reason.
         reason: CloseReason,

@@ -52,11 +52,11 @@ pub struct PairRecord {
 }
 
 /// Days a custodian keeps the key of a forgotten pairing to deliver the
-/// `pairing_revoked` close on a later session (RAPP v26.11.2 section 4.6
+/// `pairing_revoked` close on a later session (RAPP v26.11.8 section 4.6
 /// item 3).
 pub const REVOCATION_NOTICE_DAYS: u64 = 30;
 /// Days a pairing lives without an established session before it expires
-/// (RAPP v26.11.2 section 4.6 item 5).
+/// (RAPP v26.11.8 section 4.6 item 5).
 pub const PAIRING_IDLE_EXPIRY_DAYS: u64 = 30;
 const MILLISECONDS_PER_DAY: u64 = 86_400_000;
 /// How long a forgotten pairing keeps its key for the close.
@@ -64,7 +64,7 @@ pub const REVOCATION_NOTICE_MS: u64 = REVOCATION_NOTICE_DAYS * MILLISECONDS_PER_
 /// How long a pairing lives without an established session.
 pub const PAIRING_IDLE_EXPIRY_MS: u64 = PAIRING_IDLE_EXPIRY_DAYS * MILLISECONDS_PER_DAY;
 
-/// What an idle-expiry sweep did with one pairing (RAPP v26.11.2 section
+/// What an idle-expiry sweep did with one pairing (RAPP v26.11.8 section
 /// 4.6 item 5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SweepOutcome {
@@ -158,7 +158,7 @@ impl PairRecord {
     /// Constructs a validated pairing record whose storage the peer has
     /// confirmed. The pairing flow builds its record unconfirmed and
     /// confirms it only through an [`ActivePairing`](crate::ActivePairing)
-    /// (RAPP v26.11.2 section 4.3 item 4).
+    /// (RAPP v26.11.8 section 4.3 item 4).
     ///
     /// `peer_display_name` is the name the peer sent in its
     /// `pairing.hello` (section 4.3 item 4): the record has a name for its

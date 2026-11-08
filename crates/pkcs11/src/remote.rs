@@ -33,7 +33,7 @@
 //! `C_GetSlotList` call at all, and it keeps the answer it got. A
 //! reading on each of these calls may therefore
 //! wait, for at most [`REMOTE_WAKE_WAIT`], while the source dials the
-//! phone and a session confirms the card (RAPP v26.11.2 section 8.4
+//! phone and a session confirms the card (RAPP v26.11.8 section 8.4
 //! item 3: a request with no session open dials the Custodian and is
 //! held). No call is granted a wait for [`REMOTE_WAKE_MEMO`] after a
 //! wait that raised the token, nor for [`REMOTE_WAKE_QUIET`] after one
@@ -49,7 +49,7 @@
 //! A token is offered on a certificate whose fingerprint the phone
 //! confirmed on a session, and the module follows the offer: the token
 //! exists while the offer carries a certificate. The host keeps
-//! offering it between sessions as RAPP v26.11.2 section 8.4 item 3
+//! offering it between sessions as RAPP v26.11.8 section 8.4 item 3
 //! says, until the phone has been out of reach or has reported no card
 //! for the grace that section fixes (`IDENTITY_OFFER_GRACE_MS` in
 //! `refineid-rapp`) with no report of the card present in that time,
@@ -107,7 +107,7 @@ pub const REMOTE_WAKE_MEMO: Duration = Duration::from_secs(5);
 pub const REMOTE_WAKE_QUIET: Duration = Duration::from_secs(30);
 
 /// The authentication certificate of the card the phone serves: one
-/// whose fingerprint the phone confirmed on a session (RAPP v26.11.2
+/// whose fingerprint the phone confirmed on a session (RAPP v26.11.8
 /// section 8.4 item 2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionCertificate(Vec<u8>);
@@ -143,7 +143,7 @@ impl RemoteOffer {
     /// `certificate` is present while the source offers the card: a
     /// certificate whose fingerprint the phone confirmed on a session,
     /// kept between sessions until the offer is withdrawn as RAPP
-    /// v26.11.2 section 8.4 item 3 says. The token exists exactly then.
+    /// v26.11.8 section 8.4 item 3 says. The token exists exactly then.
     #[must_use]
     pub const fn new(
         pair_id: RemoteSlotId,
@@ -272,14 +272,14 @@ pub trait RemoteTokenSource: Send + Sync {
     /// The one pairing offered right now, or none.
     ///
     /// The offer carries a certificate while the source offers the
-    /// card under RAPP v26.11.2 section 8.4 item 3, between sessions
+    /// card under RAPP v26.11.8 section 8.4 item 3, between sessions
     /// included; the module withdraws the token the moment the offer
     /// carries none, and raises a new token, with new object handles,
     /// when a certificate is offered again.
     ///
     /// When the pairing's slot stands without a token and no session
     /// to the phone is open, the call is a request for the card: the
-    /// source dials the phone (RAPP v26.11.2 section 8.3) and waits up
+    /// source dials the phone (RAPP v26.11.8 section 8.3) and waits up
     /// to `wait` for a session to confirm the card, then answers with
     /// what it offers. It answers at once otherwise, and always within
     /// `wait`, its own start-up included; a zero `wait` never blocks

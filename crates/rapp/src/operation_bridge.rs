@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Closed generated binding for the operations of one RAPP session
-//! (RAPP v26.11.2 section 8).
+//! (RAPP v26.11.8 section 8).
 //!
 //! The platform transports only opaque encrypted frames and receives bounded
 //! semantic actions. It never receives a generic decrypted protocol message,
@@ -257,7 +257,7 @@ impl From<&CardOperation> for RappOperationDescriptor {
     }
 }
 
-/// Progress events exposed to platform callers (RAPP v26.11.2 section 8.2).
+/// Progress events exposed to platform callers (RAPP v26.11.8 section 8.2).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum RappProgressEvent {
     /// Another session's operation holds the card.
@@ -298,7 +298,7 @@ impl From<super::ProgressEvent> for RappProgressEvent {
 }
 
 /// Whether a contact card reader is connected to the custodian (RAPP
-/// v26.11.2 section 8.4 item 1).
+/// v26.11.8 section 8.4 item 1).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum RappCardReader {
     /// A contact card reader is connected: built in, or attached to a port.

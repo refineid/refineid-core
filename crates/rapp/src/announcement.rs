@@ -15,7 +15,7 @@
 //! The custodian's fresh announcements: a fresh instance name whenever
 //! advertising starts or restarts (hierarchy specification section 4.2),
 //! and the announcement owed once a card is back after its sessions closed
-//! with `card_unavailable` (RAPP v26.11.2 section 8.4 item 5).
+//! with `card_unavailable` (RAPP v26.11.8 section 8.4 item 5).
 
 use super::{InstanceName, RandomUnavailable};
 

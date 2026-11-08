@@ -6,14 +6,14 @@
 #let muted = rgb("#5b6773")
 #let rule = rgb("#c9d1d9")
 
-#set document(title: "RAPP v26.11.2 state machine")
+#set document(title: "RAPP v26.11.8 state machine")
 #set page(
   paper: "a4",
   margin: (x: 18mm, top: 20mm, bottom: 18mm),
   header: context {
     if counter(page).get().first() > 1 [
       #set text(8pt, fill: muted)
-      RAPP v26.11.2 state machine #h(1fr) Stamped, reviewed by the owner
+      RAPP v26.11.8 state machine #h(1fr) Stamped, reviewed by the owner
     ]
   },
   footer: context [
@@ -57,7 +57,7 @@
 // Title page.
 #page(header: none, footer: none)[
   #v(30mm)
-  #text(30pt, weight: "bold", fill: accent)[RAPP v26.11.2\ state machine]
+  #text(30pt, weight: "bold", fill: accent)[RAPP v26.11.8\ state machine]
   #v(12mm)
   #line(length: 60%, stroke: 0.8pt + accent)
   #v(4mm)

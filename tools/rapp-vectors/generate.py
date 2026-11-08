@@ -27,9 +27,9 @@ from primitives import (  # noqa: E402
 )
 
 # The wire version triple: bumped whenever the wire vocabulary changes
-# (RAPP v26.11.2 section 10.1 item 4). The corpora keep the document's name.
+# (RAPP v26.11.8 section 10.1 item 4). The corpora keep the document's name.
 VERSION = [26, 11, 8]
-DOCUMENT = "26.11.2"
+DOCUMENT = "26.11.8"
 OFFER_TTL_MS = 300000
 BUSY_RETRY_AFTER_MIN_MS = 1
 BUSY_RETRY_AFTER_MAX_MS = 5000
@@ -585,12 +585,12 @@ def package_over_one_frame(e, request):
 
 
 CORPORA = {
-    "rapp-v26.11.2.json": main_corpus,
-    "rapp-routing-v26.11.2.json": routing_corpus,
-    "rapp-withdrawal-v26.11.2.json": withdrawal_corpus,
-    "rapp-ble-sar-v26.11.2.json": ble_sar_corpus,
-    "rapp-operation-v26.11.2.json": operation_corpus,
-    "rapp-lifecycle-v26.11.2.json": lifecycle_corpus,
+    "rapp-v26.11.8.json": main_corpus,
+    "rapp-routing-v26.11.8.json": routing_corpus,
+    "rapp-withdrawal-v26.11.8.json": withdrawal_corpus,
+    "rapp-ble-sar-v26.11.8.json": ble_sar_corpus,
+    "rapp-operation-v26.11.8.json": operation_corpus,
+    "rapp-lifecycle-v26.11.8.json": lifecycle_corpus,
 }
 
 

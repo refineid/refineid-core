@@ -14,11 +14,11 @@
  *)
 
 
-(* Symbolic model of RAPP v26.11.2 service withdrawal (doc/protocols/
- * rapp-v26.11.2.md, "the spec": §4.5) for ProVerif, one of four pairing
+(* Symbolic model of RAPP v26.11.8 service withdrawal (doc/protocols/
+ * rapp-v26.11.8.md, "the spec": §4.5) for ProVerif, one of four pairing
  * files that each check one group of properties. A stored pairing is taken
- * as given: rapp-pairing-agreement-v26.11.2.pv and
- * rapp-pairing-secrecy-v26.11.2.pv check that a pairing made with the code
+ * as given: rapp-pairing-agreement-v26.11.8.pv and
+ * rapp-pairing-secrecy-v26.11.8.pv check that a pairing made with the code
  * establishes secret pair-specific static keys on which both ends agree.
  * README.md in this directory states the abstraction, the attacker model
  * and the properties with the STPA ids (doc/security/stpa-rapp.md) each

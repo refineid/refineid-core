@@ -11,7 +11,7 @@ use super::{
 };
 
 /// Evidence supplied by the requester integration that this dial is one
-/// the requester may make (RAPP v26.11.2 section 8.3): the custodian
+/// the requester may make (RAPP v26.11.8 section 8.3): the custodian
 /// appeared, a local consumer asked for the card, a redial within the
 /// redial window, or a revoking pairing's one attempt (section 4.6 item 6).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,7 +37,7 @@ pub struct SessionHandshake {
 
 impl SessionHandshake {
     /// Requester-only explicit session start over `transport`, the
-    /// transport profile of the connection (RAPP v26.11.2 §4.3).
+    /// transport profile of the connection (RAPP v26.11.8 §4.3).
     ///
     /// # Errors
     /// [`SessionError`] on a role violation or a handshake-construction
@@ -168,7 +168,7 @@ impl fmt::Debug for SessionHandshake {
 
 /// A completed Noise KK session that is not healthy until `session.ready`:
 /// the Custodian sends it, the Requester verifies it and answers with
-/// `session.hello` (RAPP v26.11.2 section 7.1 items 5 and 6). A revoking
+/// `session.hello` (RAPP v26.11.8 section 7.1 items 5 and 6). A revoking
 /// endpoint sends the `pairing_revoked` close in their place (section 4.6
 /// item 2).
 pub struct SessionAuthentication {
@@ -494,7 +494,7 @@ pub enum SessionError {
     /// Call contradicts the stored pair's endpoint role.
     RoleViolation,
     /// The peer never confirmed that it stored the pairing, so the record
-    /// opens no session (RAPP v26.11.2 section 4.3 item 4).
+    /// opens no session (RAPP v26.11.8 section 4.3 item 4).
     StorageUnconfirmed,
     /// Handshake or channel cryptography failed.
     Crypto(CryptoError),

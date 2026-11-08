@@ -1,0 +1,65 @@
+# The EU DSS validator the independent validation gate runs, pinned:
+# DSS 6.5.1 (digital-signature-service, released 2026-10-14) from Maven
+# Central, group eu.europa.ec.joinup.sd-dss, and its runtime closure as
+# Maven resolved it for dss-validation, dss-policy-jaxb, dss-cms-object,
+# dss-pades-pdfbox, dss-cades, dss-xades, dss-asic-cades,
+# dss-asic-xades, dss-utils-apache-commons, dss-crl-parser-x509crl and
+# slf4j-nop. Each line is the jar's SHA-256 and its coordinates; the
+# jar is fetched from repo1.maven.org/maven2 by its coordinates and
+# refused unless its SHA-256 matches. scripts/dss-gate.sh reads it.
+c928d60665c6415fb1c39775cf95cfc44f7f4580cf5ab01b1c380ebffd76887f  com.fasterxml.woodstox:woodstox-core:6.5.1
+b9e24b7dd6e07495562ea96531be3130c96dba4d78e1dfd88adbbdebf4332871  com.sun.activation:jakarta.activation:2.0.1
+9f91115f449384886f572bd62c8812ee1004273d4b5c85cac65179ad4c16990f  com.sun.istack:istack-commons-runtime:4.0.1
+ba005f304cef92a3dede24a38ad5ac9b8afccf0d8f75839d6c1338634cf7f6e4  commons-codec:commons-codec:1.18.0
+2b9a7b1f726fb86216dbd2c8321eabe0221dbd5b1be81c18e1cb53811b104758  commons-io:commons-io:2.22.0
+d175dbd751dd782a63bde28c7a039520e971f25e84b79c19b8435edc3603e0dc  commons-logging:commons-logging:1.4.0
+76640b1f47035da75337d624557aaf948df4933f6d19c36dbe3b620f9bddf721  eu.europa.ec.joinup.sd-dss:dss-alert:6.5.1
+526e06a716f851a21b6d08d4a6c54a45f3799b74695e25a11192599a6d9de988  eu.europa.ec.joinup.sd-dss:dss-asic-cades:6.5.1
+b9c36647989f8728978127b25db1a96bf6d5a2970056a41d54761ded6ca4589a  eu.europa.ec.joinup.sd-dss:dss-asic-common:6.5.1
+50053530596ebe3441d2619379bf644880c17d99ca7ec6dc6ae0f57d261c702d  eu.europa.ec.joinup.sd-dss:dss-asic-xades:6.5.1
+5eef82c33a652d62835799669c97897b87fc9a9996a6ca358c2521fd0750fec5  eu.europa.ec.joinup.sd-dss:dss-cades:6.5.1
+d766f4c73347ea95baf61a7e5c9bdfbf094487f31a2090e035cd30dd4bc9dc6c  eu.europa.ec.joinup.sd-dss:dss-cms-object:6.5.1
+394c818f246125f2ee06146b7d4085bdcedc8cb044e0c39f0fbcbc4bf375f939  eu.europa.ec.joinup.sd-dss:dss-cms:6.5.1
+98b0e6d6a0c8fcdfb447a1dbc724db17ab40fa5d83f79613cc084ab243c93d1c  eu.europa.ec.joinup.sd-dss:dss-crl-parser-x509crl:6.5.1
+1f4531373432659ff1577a1fe69d9e64acced6ea6db3d9145f9dd7403dc6bd4b  eu.europa.ec.joinup.sd-dss:dss-crl-parser:6.5.1
+3e05f8df288a12f76a13b7ab1c1334f6414b9abad557720be95c66610e975220  eu.europa.ec.joinup.sd-dss:dss-detailed-report-jaxb:6.5.1
+c339a38e5db439caab8fea02636b4aa77c73cffdf03cece0aaa8d8a2ac2cc7c9  eu.europa.ec.joinup.sd-dss:dss-diagnostic-jaxb:6.5.1
+5431df4d0cb33c620fedb18d0d858dfd815808e50dbaf6ebaee4e783c42a2554  eu.europa.ec.joinup.sd-dss:dss-document:6.5.1
+01c81e7c0dd53d55cf6bf72deb2346b60c5e339825d7b5bf6ea22a9ad616a18b  eu.europa.ec.joinup.sd-dss:dss-enumerations:6.5.1
+20829b5c26feca7a6566ea8700bc8cf4016d70d607f95c45e4cb5f2d19e4dabf  eu.europa.ec.joinup.sd-dss:dss-i18n:6.5.1
+fd12a00f81a2efb2de0f7e5edd28df3eb1ccaf51a1be5742710ee725bf1627db  eu.europa.ec.joinup.sd-dss:dss-jaxb-common:6.5.1
+b20f4392bac848846c23f502a12926d99f68e7b21a632d91f86dd12bafce6e1f  eu.europa.ec.joinup.sd-dss:dss-jaxb-parsers:6.5.1
+997a9c1974d2f72aee13f9cd39ab9d1e35f0ae553d9c0d50bd05d3db6b2b46b4  eu.europa.ec.joinup.sd-dss:dss-model:6.5.1
+be5930bb5e66d97fa44fe6b4b3c67aee61bbbd87a0a6c9b88205d172d23b2959  eu.europa.ec.joinup.sd-dss:dss-pades-pdfbox:6.5.1
+ddb74ea6b1d59def5f4434a9f1bcf4e9d8b68236d457455682b310bf7d9fb5fd  eu.europa.ec.joinup.sd-dss:dss-pades:6.5.1
+a7b6190222f8ed018c4e7305469d26c091a23c635e34b0af611205bf83ae4a71  eu.europa.ec.joinup.sd-dss:dss-policy-jaxb:6.5.1
+637f038fff59ff27730eca0f2ddf80ef351bc68cc3516672e76b9fcf921932be  eu.europa.ec.joinup.sd-dss:dss-simple-certificate-report-jaxb:6.5.1
+58ef0e4ddc36b37970d2b4e6112502ecbc25db48c4badbfef351b3b7a2973c41  eu.europa.ec.joinup.sd-dss:dss-simple-report-jaxb:6.5.1
+63d48cb2c8ea85b5ebcef5443b3f26cc13bbff189606540fb0e148657a45220e  eu.europa.ec.joinup.sd-dss:dss-spi:6.5.1
+62aaa0e764c7b364256000a0e98feb948089641bcb43a8070d0bf07bd6fdebb9  eu.europa.ec.joinup.sd-dss:dss-utils-apache-commons:6.5.1
+c2bcc1176bf1b1e447dfa779bca689efa9f33d1b356d87e44f61d5b88b03cef1  eu.europa.ec.joinup.sd-dss:dss-utils:6.5.1
+853034ada02bef6653c8df8ed09c284ad6e6428a98098edd06ea140e5ad8cda3  eu.europa.ec.joinup.sd-dss:dss-validation:6.5.1
+b9b77518a3186ace086dd4af7b5ac863a408e9997e492e6e900a96abd8897c14  eu.europa.ec.joinup.sd-dss:dss-xades:6.5.1
+d500ec144aabdecc5cdd399898835a7fbeb052e13f1eb1dabe330d1fee9ced49  eu.europa.ec.joinup.sd-dss:dss-xml-common:6.5.1
+998df67148d18cf750e8b714b49efe1134c759d1a03a9dcfab2fa11d17df0844  eu.europa.ec.joinup.sd-dss:dss-xml-utils:6.5.1
+949601c4545a53a4aa0a6b24edfc43d249f9ed3dec1de1e1edd33e625ddb953e  eu.europa.ec.joinup.sd-dss:specs-trusted-list-v211:6.5.1
+ccfffb0249f62c2b6a7b0e409ebc070530fd3210337767778fc92375d97ef7e0  eu.europa.ec.joinup.sd-dss:specs-trusted-list:6.5.1
+957687d68fe3af3fdadd4a23cb8f50296fde1449da92477fbebd3318228180eb  eu.europa.ec.joinup.sd-dss:specs-validation-report:6.5.1
+6b009cf19061c90a4badabb7c4870d08bdb2eab40ff3a8a7bedc1f1c13fd5f8c  eu.europa.ec.joinup.sd-dss:specs-xades:6.5.1
+cff449c6f58831b1401e6a5a5b8937a3b93bea44089016b97801b07fdbcfdccc  eu.europa.ec.joinup.sd-dss:specs-xmldsig:6.5.1
+b8fb4bee3ff5b5c1ef77144d8411316018d7bbd41fcf1ede0646f7978546b867  jakarta.xml.bind:jakarta.xml.bind-api:3.0.1
+4e0d0896bac5356cead277bac0283f09813e14417e3e84e0c86b573b54d218a3  org.apache.commons:commons-collections4:4.6.0
+a2af247ec4db6eb8947e18e23e0433e4871a7c5d0a40e1f92e46ede54ae1defe  org.apache.commons:commons-lang3:3.21.0
+a1915c24e3edbe0ecec93896dfbf6d41427810b663ade97bd4e8bae86ec3fdab  org.apache.pdfbox:fontbox:3.0.8
+36a0e04001010b4c764857817412b96339930b19755e728959805cc0352061b2  org.apache.pdfbox:pdfbox-io:3.0.8
+97647cfbde61ebcfc06b4cf8c9b0ffcaaee073396eceb4a7f6836a9b9128903c  org.apache.pdfbox:pdfbox:3.0.8
+395eccc3496063ac7b1d6af2422a11670ee5ded807f51542818eccd5fbb5e20c  org.apache.santuario:xmlsec:3.0.6
+8d8b41a4b149bdae8d331f059a578870954d1e3ff29f8269a9eb3ee19a7e4ef7  org.bouncycastle:bcpkix-jdk18on:1.86
+2af190b300cbb0b35e248ccf5f4a06b6072030aeb3da7a98ec73abe5b4cb371f  org.bouncycastle:bcprov-jdk18on:1.86
+1c268e15f785aafb1e4670d8d6e5f856f69475e96c162dadcd1ff9b350e9139f  org.bouncycastle:bcutil-jdk18on:1.86
+678567e48b51a42c65c699f266539ad3d676d4b1a5b0ad7d89ece8b9d5772579  org.codehaus.woodstox:stax2-api:4.2.1
+f9a360b939597643b2676e35fc497afb561d20e8a513128a5c0070366db11bbd  org.glassfish.jaxb:jaxb-core:3.0.2
+7b3a3784b9c6e343a8d38fc108602ba810177f03f2d8d1e7258b1cef7fd9d4c7  org.glassfish.jaxb:jaxb-runtime:3.0.2
+b4bcf94fb0a759456e2521724513baec94b78e93127544af162e3cff08d93343  org.glassfish.jaxb:txw2:3.0.2
+7e1446499b359675d8aabe6af2de86b85e72ae8a2a932c0b40d0e5ba57097439  org.slf4j:slf4j-api:2.0.20
+6522080396fb339e99bae40d329a06d18d3190dc864020ac4ca943519d0fd85b  org.slf4j:slf4j-nop:2.0.20

@@ -39,6 +39,11 @@ cargo test -p refineid-rapp --features bindings
 cargo build -p refineid-doc-sign --no-default-features
 cargo clippy -p refineid-doc-sign --no-default-features --all-targets -- -D warnings
 cargo test -p refineid-doc-sign --no-default-features
+# The independent validation gate: the EU DSS library judges every
+# format at the level a release build must reach. It needs a JDK, so it
+# runs here and not at commit (doc/process/independent-validation.md).
+cargo clippy -p refineid-doc-sign --features testkit --all-targets -- -D warnings
+sh "$root/scripts/dss-gate.sh"
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 RUSTDOCFLAGS="-D warnings" cargo doc -p refineid-rapp --features bindings --no-deps
 RUSTDOCFLAGS="-D warnings" cargo doc -p refineid-doc-sign --no-default-features --no-deps

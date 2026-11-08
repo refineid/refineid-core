@@ -253,7 +253,8 @@ empty code entry instead told Carol the pairing she had just made had
 failed.
 
 **Lesson:** a status that is always on is noise. Show the result; speak
-up only when the reader can do something about it.
+up only when the reader can do something about it, or when silence would
+read as the failure of what they just did.
 
 - L-3; H-5. UCA-114, UCA-64, UCA-7, UCA-92, UCA-53, UCA-49.
 - CC-116, CC-62 (the states stay distinct on the wire, where programs

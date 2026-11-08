@@ -44,16 +44,15 @@ semantics:
     A requester shows the custodian only through its card: while a session
     confirms a card the identity is offered and shown; in every other state
     of requester_view_of_custodian it shows no remote card, whatever the
-    reason, and names no state of the custodian. The one exception is the
+    reason, and names no state of the custodian, with two exceptions: the
     line saying the phone forgot this computer after a pairing_revoked close
-    (show_peer_forgot). Dialing and scanning are background behaviour and
-    are never shown, except right after this requester's own pairing
-    ceremony: from its completion until the requester shows the custodian's
-    identity or a request for its card, the custodian reports no card, or
-    redial_window_ms has passed, connecting
-    shows that the requester is connecting to the custodian the ceremony
-    just paired, by its pairing.hello display name, in place of the code
-    entry (section 4.7).
+    (show_peer_forgot), and, right after this requester's own pairing
+    ceremony, the line saying it connects to the custodian just paired, by
+    its pairing.hello display name, in place of the code entry. That line
+    lasts from the ceremony's completion until the requester shows the
+    custodian's identity or a request for its card, the custodian reports
+    no card, or redial_window_ms has passed (section 4.7). Dialing and
+    scanning are otherwise background behaviour and are never shown.
 
 constants:
   live_operations_per_session: 1

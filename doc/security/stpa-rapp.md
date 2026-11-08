@@ -244,9 +244,9 @@ Carol's own retry did nothing and nothing said why.
 
 **The good day.** Bob shows one thing: the remote card, or no remote
 card. Dialing, scanning and redialing happen in the background and are
-never shown. The messages that name Alice are the ones Carol can act
-on: the phone forgot this computer, and, right after Carol typed Alice's
-code, that Bob is connecting to her. That one answers Carol's own action
+never shown. The messages that name Alice are ones Carol can use: the
+phone forgot this computer, which she can act on, and, right after Carol
+typed Alice's code, that Bob is connecting to her. That one answers Carol's own action
 and ends with the first card status or the redial window; showing the
 empty code entry instead told Carol the pairing she had just made had
 failed.

@@ -1757,7 +1757,7 @@ mod tests {
             let (mut pin, asked) = counting(|| {});
             let dir = TempDir::new("sign-unreachable-path")?;
             let input = dir.write("message.txt", MESSAGE)?;
-            let output = dir.path().join("message.p7s");
+            let output = dir.path().join("message.asice");
             let options = SignOptions {
                 input,
                 output: SignOutput::At(output.clone()),
@@ -1767,7 +1767,7 @@ mod tests {
                 can: None,
                 expected_serial: None,
                 document: Some(DocumentRequest {
-                    format: Format::CadesDetached,
+                    format: Format::AsicEXades,
                     additional_inputs: Vec::new(),
                     signing_time: SigningTime {
                         year: SIGNING_YEAR,
@@ -1778,7 +1778,7 @@ mod tests {
                         second: 0,
                     },
                     metadata: SignatureMetadata::default(),
-                    archive: false,
+                    archive: true,
                     long_term: true,
                     signer_anchors: vec![UNRELATED_ANCHOR.to_vec()],
                     timestamp_authorities: vec!["https://tsa.invalid/".to_owned()],

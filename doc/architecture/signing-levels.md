@@ -1,10 +1,38 @@
 # Signing levels in release and development builds
 
 The owner's rule, for every platform: a development build may make a
-document without long-term validation material; a release build makes
-only the long-term level its request asks for, `B-LTA` where the format
-has an archive construction (`PAdES`, `ASiC-E` with `CAdES`) and `B-LT`
-where it does not yet (`CAdES`, `XAdES`, `ASiC-E` with `XAdES`).
+document below the long-term archival level and names it by the level
+it reached; a release build makes only `B-LTA` documents, for every
+format. `B-LT` is not long-term enough: its evidence is protected by
+nothing once the signature timestamp's authority or algorithm is no
+longer trusted.
+
+Each format reaches `B-LTA` by its own archive construction:
+
+- `PAdES`: a document timestamp revision over the signature and its
+  `/DSS` (`ETSI EN 319 142-1` V1.2.1 clause 5.4.3).
+- `ASiC-E` with `XAdES`: an `xadesv141:ArchiveTimeStamp` after the
+  `CertificateValues` and `RevocationValues`, its imprint computed as
+  `ETSI EN 319 132-1` V1.3.1 clause 5.5.2.3 states for the not
+  distributed case (`ETSI EN 319 162-1` V1.1.1 clause 4.4.5 item 1;
+  `ETSI EN 319 132-1` clause 6.3 table 2 makes the 1.4.1 namespace
+  mandatory at `B-LTA`). The writer spells every unsigned property in
+  exclusive canonical form, so the imprint input is the document's own
+  bytes.
+- `ASiC-E` with `CAdES`: `META-INF/ASiCArchiveManifest.xml`
+  referencing the data objects, the `ASiCManifest` and the signature,
+  and `META-INF/timestamp.tst` over it (`ETSI EN 319 162-1` V1.1.1
+  clause 4.4.5 item 2 a) and annex A.7).
+- Standalone `CAdES` (`.p7m`, `.p7s`) would need an
+  `archive-time-stamp-v3` with its `ats-hash-index-v3` (`ETSI EN 319
+  122-1` clause 5.5.3), which is not built. A release build refuses it
+  before the card or the phone is asked to sign; a development build
+  saves it at `B-LT` under a `-dev-B-LT` name.
+
+The archive timestamp's authority must be one whose certificate path is
+already in the validation material the token covers
+(`require_archive_path_covered`), because nothing can be added under
+the token after it is taken.
 
 ## The switch
 
@@ -22,8 +50,13 @@ profile's, and never by a setting, a flag or the environment:
 
 ## Release builds
 
-A signature whose requested level cannot be reached is refused with the
-reason, and nothing is saved.
+A request below `B-LTA`, or for a format without an archive
+construction, is refused before anything is signed
+(`DocumentRequest::validate_signing_policy`): `a release build signs
+only at B-LTA, not <format> <level>`, or `this format has no archive
+timestamp here, so it cannot reach B-LTA`. A signature whose `B-LTA`
+cannot be reached after signing is refused with the reason, and nothing
+is saved.
 
 - Before the private-key operation, and so before the PIN 2 prompt or
   the phone's consent, `DocumentRequest::check_signer_path` judges the
@@ -44,7 +77,8 @@ reason, and nothing is saved.
 
 The document is saved at the highest level actually reached:
 
-- LTA requested and the archive timestamp lost: `B-LT`.
+- LTA requested and the archive timestamp lost, or the format has no
+  archive construction: `B-LT`.
 - The signer's material cannot be collected: `B-T`.
 - No timestamp authority answered: `B-B`.
 

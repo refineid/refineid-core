@@ -278,6 +278,12 @@ pub enum ArchiveForm {
     /// properties share its parent; reported
     /// [`TimestampReport::Unsupported`] otherwise.
     Xades,
+    /// An `ASiCArchiveManifest` of an `ASiC-E` container with `CAdES`
+    /// and the token over it (`ETSI EN 319 162-1` V1.1.1 clause 4.4.5
+    /// item 2 a) and annex A.7), judged; a manifest whose references
+    /// do not hold, or whose token is missing, is
+    /// [`TimestampReport::Invalid`].
+    AsicArchiveManifest,
 }
 
 /// One archive timestamp of a signature: a timestamp over the
@@ -1432,12 +1438,33 @@ impl Context<'_> {
         );
         let mut pool = self.anchor_pool();
         pool.add_material(signature.embedded_material());
+        let mut archive_timestamps = cades_archive_timestamps(verdict.archive_timestamps);
+        // A.7 item 1: the signature carries its full material in
+        // SignedData before the first archive manifest is added, so
+        // that is what the manifest's token protects.
+        archive_timestamps.extend(container.archive_manifests_of(entry).into_iter().map(
+            |archive| ArchiveFact {
+                form: ArchiveForm::AsicArchiveManifest,
+                timestamp: match (archive.broken(), archive.token()) {
+                    (Some(why), _) => Timestamp::Refused(TimestampError::Malformed(why)),
+                    (None, None) => Timestamp::Refused(TimestampError::Malformed(
+                        "the archive manifest's time-stamp token is missing",
+                    )),
+                    (None, Some(token)) => Timestamp::Token {
+                        token: token.to_vec(),
+                        imprint: Imprint::Octets(archive.manifest().to_vec()),
+                    },
+                },
+                covered: signature.embedded_material().clone(),
+                authority_material: ValidationMaterial::default(),
+            },
+        ));
         SignatureRow::judged(self.report(Facts {
             signer: signature.signer_certificate().clone(),
             document_intact: verdict.document_intact && container.manifest_intact(entry),
             signature_valid: verdict.signature_valid,
             timestamps: cades_timestamps(&verdict.signature_timestamps),
-            archive_timestamps: cades_archive_timestamps(verdict.archive_timestamps),
+            archive_timestamps,
             covering: Vec::new(),
             revision: Revision::WholeDocument,
             claimed_signing_time: signature.signing_time(),

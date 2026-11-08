@@ -15,7 +15,7 @@
 //! Generated-binding boundary for the authenticated RAPP pairing ceremony.
 //!
 //! The foreign application transports opaque bounded frames. Noise state,
-//! one-use QR ownership, authenticated parameter checks, and grant equality
+//! pairing-secret ownership, authenticated parameter checks, and grant equality
 //! remain inside Rust. Completed private pair material stays inside the opaque
 //! [`RappPairRecord`] until a device-only vault adapter is supplied.
 

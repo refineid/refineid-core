@@ -108,7 +108,8 @@ from an unprivileged caller.
 
 A FINEID card carries the certificates of its issuing CA (EF.4336)
 and of the DVV root (EF.4334), and the module presents both as
-certificate objects. NSS trusts a certificate on a token only when the
+certificate objects; it ships no CA certificate of its own, and the
+DER files under `test-certs/` are `#[cfg(test)]` fixtures only. NSS trusts a certificate on a token only when the
 token also presents a trust record for it, so the module presents, next
 to each CA certificate object, one object of NSS's vendor class
 `CKO_NSS_TRUST` (NSS `lib/util/pkcs11n.h`; the standard `CKO_TRUST`

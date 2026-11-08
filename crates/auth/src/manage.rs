@@ -32,11 +32,18 @@
 //! unblocks in one RESET RETRY COUNTER carrying the PUK and the new PIN;
 //! the organizational card takes two commands, verifying the PUK as its
 //! own object before a reset that carries only the new PIN (FINEID S4-2
-//! v4.0 section 4.3.2). A wrong PUK spends the PUK's own counter, and
-//! exhausting it is terminal for the card, so every flow that presents
-//! the PUK reads the PUK's counter without spending a try and applies
-//! the retry floor to it before the first command that carries the PUK.
-//! The target PIN's counter does not gate the unblock.
+//! v4.0 section 4.3.2).
+//!
+//! Every flow here that presents a credential -- the current PIN of a
+//! change, the PUK of an unblock, the activation code -- reads that
+//! credential's counter without spending a try and applies the one
+//! retry floor ([`crate::retry_risk::check_retry_floor`]) to it before
+//! the first command that carries the credential: refused at two or one
+//! tries left or an unreadable counter; sent otherwise, the card
+//! answering for itself at zero or blocked. The primitives enforce the
+//! rule themselves, so no caller can spend a try by mistake. A wrong PUK
+//! spends the PUK's own counter, and exhausting it is terminal for the
+//! card; the target PIN's counter does not gate the unblock.
 
 use refineid_apdu::{ApduClass, CardTransport, CommandHeader, PinRetries, StatusWord};
 
@@ -133,6 +140,27 @@ pub(crate) fn change<T: CardTransport + ?Sized>(
     Ok(classify_manage_sw(status))
 }
 
+/// Read `slot`'s counter under `scheme` without spending a try, apply
+/// the retry floor to it, then send one CHANGE REFERENCE DATA
+/// ([`change`]) presenting `current` and setting `new`.
+///
+/// # Errors
+///
+/// [`AuthError::RetryFloor`] at two or one tries left or an unreadable
+/// counter; nothing carrying the current PIN is sent. [`AuthError`] on a
+/// transport failure or state transition.
+fn change_under_floor<T: CardTransport>(
+    transport: &mut T,
+    scheme: PinReferenceScheme,
+    slot: PinSlot,
+    current: &[u8],
+    new: &[u8],
+) -> Result<ManageOutcome, AuthError<T::Error>> {
+    let status = transport.pin_status_with_scheme(scheme, slot)?;
+    check_last_tries(slot.into(), status).map_err(AuthError::RetryFloor)?;
+    change(transport, scheme, slot, current, new)
+}
+
 /// Read the PUK's retry status under `scheme` without spending a try.
 ///
 /// Both numberings answer a Case 1 VERIFY (header only, no Lc, no data)
@@ -165,11 +193,12 @@ fn puk_status<T: CardTransport + ?Sized>(
 
 /// Unblock `slot`, resetting its retry counter and setting `new`.
 ///
-/// The PUK's counter is read first and the PUK's floor applied to it:
-/// at two or one tries left, or no readable counter, nothing that
-/// carries the PUK is sent; at no tries left or a blocked PUK the card
-/// is let answer for itself, as which code the holder has in hand is
-/// never known. The citizen card then unblocks
+/// The PUK's counter is read first and the one retry floor applied to
+/// it, the same rule every credential follows: at two or one tries
+/// left, or no readable counter (a PUK reported verified among them),
+/// nothing that carries the PUK is sent; at no tries left or a blocked
+/// PUK the card is let answer for itself, as which code the holder has
+/// in hand is never known. The citizen card then unblocks
 /// in one RESET RETRY COUNTER carrying the PUK and the new PIN. The
 /// organizational card verifies the PUK as its own object first, and
 /// only an accepted PUK lets the reset -- carrying only the new PIN --
@@ -304,11 +333,12 @@ fn read_activation<T: CardTransport>(
 ///
 /// These operations mutate the card and are not idempotent. A wrong
 /// current PIN or PUK spends a retry, and for the PUK exhaustion is
-/// terminal. The unblock and activation-by-PUK operations apply the
-/// retry floor to the PUK's counter themselves, and activation by the
-/// preset activation PIN applies it to the counter of each PIN it
-/// changes; a caller of a change must hold the retry floor for the
-/// current PIN before calling.
+/// terminal. Every operation reads the counter of the credential it
+/// presents without spending a try and applies the retry floor to it
+/// itself: a change to the current PIN's counter, the unblock and
+/// activation by PUK to the PUK's, and activation by the preset
+/// activation PIN to the counter of each PIN it changes. No caller can
+/// spend a try by mistake.
 pub trait PinManageOps: PinOps {
     /// Read the PIN 1, PIN 2 and PUK lengths the card accepts, resolving
     /// the card's numbering first.
@@ -384,14 +414,18 @@ pub trait PinManageOps: PinOps {
     }
 
     /// Change PIN1, presenting the current value and setting the new one,
-    /// under the numbering `lengths` was read by.
+    /// under the numbering `lengths` was read by. PIN 1's counter is read
+    /// first without spending a try and the retry floor applied to it.
     ///
     /// # Errors
     ///
     /// [`AuthError::PinLength`] when the card does not accept the length
-    /// of either PIN; nothing is sent. [`AuthError`] on a transport
-    /// failure or state transition. A wrong current PIN is not an error;
-    /// it is [`ManageOutcome::WrongCredential`].
+    /// of either PIN; nothing is sent. [`AuthError::RetryFloor`] when the
+    /// card reports two or one tries left or no readable counter;
+    /// nothing carrying the current PIN is sent. [`AuthError`] on a
+    /// transport failure or state transition. A wrong current PIN is not
+    /// an error; it is [`ManageOutcome::WrongCredential`], and a blocked
+    /// PIN is [`ManageOutcome::Locked`], the card's own answer.
     fn change_pin1(
         &mut self,
         lengths: &CardPinLengths,
@@ -403,7 +437,7 @@ pub trait PinManageOps: PinOps {
     {
         lengths.check_pin1(&current).map_err(AuthError::PinLength)?;
         lengths.check_pin1(&new).map_err(AuthError::PinLength)?;
-        change(
+        change_under_floor(
             self,
             lengths.numbering(),
             PinSlot::Pin1,
@@ -412,7 +446,9 @@ pub trait PinManageOps: PinOps {
         )
     }
 
-    /// Change PIN2 under the numbering `lengths` was read by.
+    /// Change PIN2 under the numbering `lengths` was read by. PIN 2's
+    /// counter is read first without spending a try and the retry floor
+    /// applied to it.
     ///
     /// # Errors
     ///
@@ -428,7 +464,7 @@ pub trait PinManageOps: PinOps {
     {
         lengths.check_pin2(&current).map_err(AuthError::PinLength)?;
         lengths.check_pin2(&new).map_err(AuthError::PinLength)?;
-        change(
+        change_under_floor(
             self,
             lengths.numbering(),
             PinSlot::Pin2,
@@ -444,9 +480,9 @@ pub trait PinManageOps: PinOps {
     ///
     /// [`AuthError::PinLength`] when the card does not accept the length
     /// of the PUK or the new PIN; nothing is sent.
-    /// [`AuthError::RetryFloor`] when the PUK's counter is below the
-    /// retry floor, blocked or unreadable; nothing carrying the PUK is
-    /// sent. [`AuthError`] on a transport failure or state transition. A
+    /// [`AuthError::RetryFloor`] when the PUK's counter reads two or one
+    /// tries left or cannot be read; nothing carrying the PUK is sent.
+    /// [`AuthError`] on a transport failure or state transition. A
     /// wrong PUK is not an error; it is [`ManageOutcome::WrongCredential`]
     /// carrying the PUK's own remaining attempts.
     fn unblock_pin1(
@@ -595,9 +631,9 @@ pub trait PinManageOps: PinOps {
     /// of an entry; nothing is sent.
     /// [`AuthError::RetryFloor`] under either scheme when the counter of
     /// the credential the activation PIN is presented as -- the PUK, or
-    /// the PIN 1 or PIN 2 it activates -- is below the retry floor,
-    /// blocked or unreadable; nothing carrying the activation PIN is sent
-    /// to that credential. [`AuthError`] on a transport failure or state
+    /// the PIN 1 or PIN 2 it activates -- reads two or one tries left or
+    /// cannot be read; nothing carrying the activation PIN is sent to
+    /// that credential. [`AuthError`] on a transport failure or state
     /// transition.
     fn activate_card(
         &mut self,
@@ -636,6 +672,10 @@ pub trait PinManageOps: PinOps {
                     (PinSlot::Pin1, needs.pin1 && new_pin1.is_some()),
                     (PinSlot::Pin2, needs.pin2 && new_pin2.is_some()),
                 ];
+                // The activation reading already holds each PIN's
+                // counter-safe status, so the one rule is applied to it
+                // here and the changes below go out without a second
+                // probe.
                 for (slot, changed) in changes {
                     if changed {
                         check_last_tries(slot.into(), reading.status(slot))
@@ -783,6 +823,12 @@ mod tests {
     const CONTAINER_READ_COMMAND_COUNT: usize = 2;
     /// Commands the citizen unblock sends: the PUK probe, then the reset.
     const CITIZEN_UNBLOCK_COMMAND_COUNT: usize = 2;
+    /// Commands a change sends: the PIN's counter probe, then the CHANGE
+    /// REFERENCE DATA.
+    const CHANGE_COMMAND_COUNT: usize = 2;
+    /// Wire index of the CHANGE REFERENCE DATA in a change: after the
+    /// counter probe.
+    const CHANGE_INDEX: usize = 1;
     /// Highest retry count below the retry floor.
     const RETRIES_BELOW_FLOOR: u8 = 2;
     /// Retry count one wrong try from lockout.
@@ -927,8 +973,8 @@ mod tests {
     }
 
     #[test]
-    fn citizen_change_pin1_presents_current_then_new_padded_blocks() {
-        let mut transport = Recorder::new(vec![StatusWord::Success]);
+    fn citizen_change_pin1_probes_the_counter_then_presents_current_then_new_padded_blocks() {
+        let mut transport = Recorder::new(vec![pin_counter(RETRIES_PRISTINE), StatusWord::Success]);
         let outcome = transport
             .change_pin1(
                 &CardPinLengths::not_listed(PinReferenceScheme::Citizen),
@@ -937,8 +983,15 @@ mod tests {
             )
             .expect("scripted change succeeds");
         assert_eq!(outcome, ManageOutcome::Ok);
-        assert_eq!(transport.commands.len(), 1);
-        let wire = &transport.commands[0];
+        assert_eq!(transport.commands.len(), CHANGE_COMMAND_COUNT);
+        let probe = &transport.commands[0];
+        assert_eq!(probe[INS_INDEX], VERIFY_INS);
+        assert_eq!(
+            probe[P2_INDEX],
+            PinReferenceScheme::Citizen.reference(PinSlot::Pin1)
+        );
+        assert_eq!(probe.len(), LC_INDEX, "the probe carries no data field");
+        let wire = &transport.commands[CHANGE_INDEX];
         assert_eq!(wire[CLA_INDEX], ApduClass::Plain.as_byte());
         assert_eq!(wire[INS_INDEX], CHANGE_REFERENCE_DATA_INS);
         assert_eq!(wire[P1_INDEX], CHANGE_P1_CURRENT_THEN_NEW);
@@ -958,7 +1011,7 @@ mod tests {
 
     #[test]
     fn organizational_change_pin1_presents_typed_length_blocks() {
-        let mut transport = Recorder::new(vec![StatusWord::Success]);
+        let mut transport = Recorder::new(vec![pin_counter(RETRIES_PRISTINE), StatusWord::Success]);
         transport
             .change_pin1(
                 &CardPinLengths::not_listed(PinReferenceScheme::Organizational),
@@ -966,7 +1019,7 @@ mod tests {
                 pin1(NEW_DIGITS),
             )
             .expect("scripted change succeeds");
-        let wire = &transport.commands[0];
+        let wire = &transport.commands[CHANGE_INDEX];
         assert_eq!(wire[INS_INDEX], CHANGE_REFERENCE_DATA_INS);
         assert_eq!(
             wire[P2_INDEX],
@@ -1014,11 +1067,7 @@ mod tests {
     #[test]
     fn the_puk_sets_a_new_pin_where_the_retry_floor_refuses_an_attempt() {
         for slot in [PinSlot::Pin1, PinSlot::Pin2] {
-            for count in [
-                RETRIES_BELOW_FLOOR,
-                RETRIES_LOCKDOWN_IMMINENT,
-                RETRIES_EXHAUSTED,
-            ] {
+            for count in [RETRIES_BELOW_FLOOR, RETRIES_LOCKDOWN_IMMINENT] {
                 let status =
                     PinStatus::Remaining(PinRetries::from_nibble(count).expect("fits a nibble"));
                 assert!(check_retry_floor(slot.into(), status).is_err());
@@ -1282,7 +1331,7 @@ mod tests {
         assert_eq!(LONGEST_NEW_DIGITS.len(), PIN_MAX_LENGTH);
         let expected = back_to_back(LONGEST_CURRENT_DIGITS, LONGEST_NEW_DIGITS);
 
-        let mut transport = Recorder::new(vec![StatusWord::Success]);
+        let mut transport = Recorder::new(vec![pin_counter(RETRIES_PRISTINE), StatusWord::Success]);
         transport
             .change_pin1(
                 &CardPinLengths::not_listed(PinReferenceScheme::Organizational),
@@ -1290,7 +1339,7 @@ mod tests {
                 pin1(LONGEST_NEW_DIGITS),
             )
             .expect("scripted change succeeds");
-        let wire = &transport.commands[0];
+        let wire = &transport.commands[CHANGE_INDEX];
         assert_eq!(
             wire[P2_INDEX],
             PinReferenceScheme::Organizational.reference(PinSlot::Pin1)
@@ -1298,7 +1347,7 @@ mod tests {
         assert_eq!(usize::from(wire[LC_INDEX]), expected.len());
         assert_eq!(&wire[DATA_OFFSET..], expected.as_slice());
 
-        let mut transport = Recorder::new(vec![StatusWord::Success]);
+        let mut transport = Recorder::new(vec![pin_counter(RETRIES_PRISTINE), StatusWord::Success]);
         transport
             .change_pin2(
                 &CardPinLengths::not_listed(PinReferenceScheme::Organizational),
@@ -1306,13 +1355,123 @@ mod tests {
                 pin2(LONGEST_NEW_DIGITS),
             )
             .expect("scripted change succeeds");
-        let wire = &transport.commands[0];
+        let wire = &transport.commands[CHANGE_INDEX];
         assert_eq!(
             wire[P2_INDEX],
             PinReferenceScheme::Organizational.reference(PinSlot::Pin2)
         );
         assert_eq!(usize::from(wire[LC_INDEX]), expected.len());
         assert_eq!(&wire[DATA_OFFSET..], expected.as_slice());
+    }
+
+    /// Change `slot` under `scheme` against a card whose counter probe
+    /// answers `probe` and whose change, if sent, answers `change`.
+    fn change_against(
+        scheme: PinReferenceScheme,
+        slot: PinSlot,
+        probe: StatusWord,
+        change: StatusWord,
+    ) -> (Result<ManageOutcome, AuthError<String>>, Recorder) {
+        let mut transport = Recorder::new(vec![probe, change]);
+        let lengths = CardPinLengths::not_listed(scheme);
+        let result = match slot {
+            PinSlot::Pin1 => {
+                transport.change_pin1(&lengths, pin1(CURRENT_DIGITS), pin1(NEW_DIGITS))
+            }
+            PinSlot::Pin2 => {
+                transport.change_pin2(&lengths, pin2(NEW_PIN2_DIGITS), pin2(NEW_PIN2_DIGITS))
+            }
+        };
+        (result, transport)
+    }
+
+    #[test]
+    fn a_change_at_the_last_two_tries_sends_only_the_probe() {
+        // The caller has probed nothing; the primitive still refuses.
+        for &scheme in SCHEMES {
+            for slot in [PinSlot::Pin1, PinSlot::Pin2] {
+                for count in [RETRIES_BELOW_FLOOR, RETRIES_LOCKDOWN_IMMINENT] {
+                    let (refused, transport) =
+                        change_against(scheme, slot, pin_counter(count), StatusWord::Success);
+                    assert!(matches!(
+                        refused,
+                        Err(AuthError::RetryFloor(RetryFloorRefusal::TriesBelowFloor {
+                            credential,
+                            remaining,
+                        })) if credential == FlooredCredential::from(slot)
+                            && remaining.get() == count
+                    ));
+                    assert_eq!(transport.commands.len(), PROBE_ONLY_COMMAND_COUNT);
+                    let probe = &transport.commands[0];
+                    assert_eq!(probe[INS_INDEX], VERIFY_INS);
+                    assert_eq!(probe[P2_INDEX], scheme.reference(slot));
+                    assert_eq!(probe.len(), LC_INDEX, "no digits on the wire");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_change_at_an_unreadable_counter_sends_only_the_probe() {
+        for &scheme in SCHEMES {
+            let (refused, transport) = change_against(
+                scheme,
+                PinSlot::Pin1,
+                StatusWord::AuthenticationFailed,
+                StatusWord::Success,
+            );
+            assert!(matches!(
+                refused,
+                Err(AuthError::RetryFloor(
+                    RetryFloorRefusal::CounterUnreadable {
+                        credential: FlooredCredential::Pin1
+                    }
+                ))
+            ));
+            assert_eq!(transport.commands.len(), PROBE_ONLY_COMMAND_COUNT);
+        }
+    }
+
+    #[test]
+    fn a_change_at_no_tries_left_or_blocked_goes_to_the_card() {
+        for &scheme in SCHEMES {
+            for slot in [PinSlot::Pin1, PinSlot::Pin2] {
+                for probe in [
+                    pin_counter(RETRIES_EXHAUSTED),
+                    StatusWord::AuthenticationBlocked,
+                ] {
+                    let (outcome, transport) =
+                        change_against(scheme, slot, probe, StatusWord::AuthenticationBlocked);
+                    assert_eq!(
+                        outcome.expect("the card answers for itself"),
+                        ManageOutcome::Locked
+                    );
+                    assert_eq!(transport.commands.len(), CHANGE_COMMAND_COUNT);
+                    let change = &transport.commands[CHANGE_INDEX];
+                    assert_eq!(change[INS_INDEX], CHANGE_REFERENCE_DATA_INS);
+                    assert_eq!(change[P2_INDEX], scheme.reference(slot));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_change_is_served_at_five_four_three_tries_left_and_a_verified_pin() {
+        for probe in [
+            pin_counter(RETRIES_PRISTINE),
+            pin_counter(RETRIES_ONE_SPENT),
+            pin_counter(RETRIES_FLOOR),
+            StatusWord::Success,
+        ] {
+            let (outcome, transport) = change_against(
+                PinReferenceScheme::Citizen,
+                PinSlot::Pin2,
+                probe,
+                StatusWord::Success,
+            );
+            assert_eq!(outcome.expect("served"), ManageOutcome::Ok);
+            assert_eq!(transport.commands.len(), CHANGE_COMMAND_COUNT);
+        }
     }
 
     #[test]

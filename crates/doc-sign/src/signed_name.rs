@@ -311,7 +311,7 @@ mod tests {
 
     /// A certificate standing in for a timestamp signer; only the
     /// generation time is consulted.
-    const SIGNER_DER: &[u8] = include_bytes!("../trust-anchors/dvv-gov-root-ca-g3-rsa.der");
+    const SIGNER_DER: &[u8] = include_bytes!("../test-vectors/dvv-gov-root-ca-g3-rsa.der");
 
     fn token_at(
         generated_at: DateTime,

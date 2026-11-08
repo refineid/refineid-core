@@ -587,7 +587,7 @@ fn sign_list(unsigned: &str, key: &TestKey, certificate: &[u8], method: &str) ->
     signed.into_bytes()
 }
 
-/// The anchors `lists` yield beside the pinned roots.
+/// The anchors `lists` yield.
 fn listed_anchors(lists: &TrustedLists) -> TrustAnchors {
     TrustAnchors::from_trusted_lists(lists)
 }
@@ -675,8 +675,11 @@ fn granted_periods_follow_the_status_history() {
     );
 
     let anchors = listed_anchors(&lists);
-    let pinned = TrustAnchors::pinned().anchors().len();
-    assert_eq!(anchors.anchors().len(), pinned + 2);
+    assert_eq!(
+        anchors.anchors().len(),
+        2,
+        "the two granted services anchor and nothing else does"
+    );
     assert_eq!(anchors.fetched_at(), Some(day(FETCHED)));
     assert_eq!(anchors.lists_valid_until(), Some(day(NEXT_UPDATE)));
 }
@@ -795,9 +798,8 @@ fn a_list_signed_by_an_unlisted_key_is_refused() {
         Err(ListFailure::Unreadable(TrustedListError::SignerNotEntitled))
     );
     assert_eq!(cache.len(), 1, "an unreadable list is not cached");
-    assert_eq!(
-        listed_anchors(&lists).anchors().len(),
-        TrustAnchors::pinned().anchors().len(),
+    assert!(
+        listed_anchors(&lists).anchors().is_empty(),
         "no anchor comes from a list that did not read"
     );
 }
@@ -832,7 +834,7 @@ fn a_stale_list_still_anchors_and_says_so() {
     let anchors = listed_anchors(&lists);
     assert_eq!(
         anchors.anchors().len(),
-        TrustAnchors::pinned().anchors().len() + 2,
+        2,
         "anchors from a stale list still count"
     );
     assert_eq!(anchors.lists_valid_until(), Some(day(NEXT_UPDATE)));

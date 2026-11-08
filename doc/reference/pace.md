@@ -90,7 +90,7 @@ kept spent across `into_parts` and `SmTransport::new`: PIN 2 is entered
 for every signature (FINEID S4-1 v4.2 §4.1, §8.1.7), so a second
 signature on the channel takes a VERIFY.
 
-## PIN management on a PUK or PIN 1 channel
+## PIN management on a PUK, PIN 1 or PIN 2 channel
 
 On the contactless interface the organization card answers nothing
 before PACE, and its PINs ship blocked (FINEID S4-1 v4.2 §4.6.1), so
@@ -100,14 +100,18 @@ with the PUK or the PIN by RESET RETRY COUNTER carrying only the new PIN
 (§B.14.11). FINEID S4-2 v4.0 §4.3 states the reset's contactless access
 condition as the PUK's security environment together with PACE, and the
 change's as PACE alone with the current PIN in the command (IAS ECC
-v1.0.1 §9.4.2 allows no other form). Whether the card counts a completed
-PACE with the PUK, or with PIN 1, as the authorisation its reset needs is
-not stated, so each operation takes `ChannelProof`, named at every call:
+v1.0.1 §9.4.2 allows no other form); the PIN SIG object, PIN 2, carries
+the same conditions as PIN AUTH (§4.3.3). Whether the card counts a
+completed PACE with the PUK, or with a PIN, as the authorisation its
+reset needs is not stated, so each operation takes `ChannelProof`, named
+at every call:
 
 | Operation | Channel | `PaceHandshake` | `PresentAgain` |
 | --- | --- | --- | --- |
 | `reset_pin1_after_puk_pace`, `reset_pin2_after_puk_pace` | `OpenedByPuk` | RESET RETRY COUNTER with the new PIN only | VERIFY the PUK (`12`), then the same reset |
 | `change_pin1_after_pin1_pace` | `OpenedByPin1` | RESET RETRY COUNTER with the new PIN only | CHANGE REFERENCE DATA with the current and new PIN |
+| `change_pin2_after_pin2_pace` | `OpenedByPin2` | SELECT DF.ESIGN, then RESET RETRY COUNTER with the new PIN only | SELECT DF.ESIGN, then CHANGE REFERENCE DATA with the current and new PIN |
+| `qualified_key_after_pin2_pace`, `unlock_qualified_key_after_pin2_pace` (`refineid-sign`) | `OpenedByPin2` | the qualified key once, on the handshake's presentation | VERIFY PIN 2 (`04`) in DF.ESIGN for every later signature, floored on the channel's record |
 
 `PaceHandshake` presents no credential and spends no try; a card that
 does not count the handshake answers it with a refusal such as `6982`.
@@ -125,7 +129,21 @@ counter is unchanged afterwards. The PIN 1 change under `PaceHandshake`
 is refused with `6982` and accepted under `PresentAgain`; the PIN 1
 counter is unchanged after either. A caller resets with `PaceHandshake`
 and changes PIN 1 with `PresentAgain`. PIN 2's reset needs DF.ESIGN
-selected, where its reference is local.
+selected, where its reference is local; the caller selects it before
+`reset_pin2_after_puk_pace`.
+
+PIN 2 is the local Signature PIN SIG of DF.ESIGN (FINEID S4-2 v4.0
+§4.2), and DF.ESIGN is where every PIN 2 command of the organization
+card has been observed: the reset above, the qualified signature, and
+the Apple engine's PIN 2 change on a PIN 2 channel, CHANGE REFERENCE
+DATA with the current and new PIN from DF.ESIGN, observed on an Idemia
+Cosmo X organization card over a reader's antenna with every counter at
+five afterwards. So `change_pin2_after_pin2_pace` selects DF.ESIGN by
+name from the MF itself, after its length and floor refusals and before
+the change; a directory the card refuses is
+`Pin2ChangeError::Directory`, and no PIN is sent. A caller changes PIN
+2 with `PresentAgain`, as PIN 1. Through this crate the PIN 2 change is
+covered by scripted tests; it has not run on hardware.
 
 ## A PIN or PUK password and the retry floor
 
@@ -143,11 +161,11 @@ answers with the PIN's state before any try is spent (BSI TR-03110-3
 | `63C4`, `63C3` | four or three tries left | served |
 | `63C2` | two tries left | refused |
 | `63C1` | one try left; the PIN is suspended | refused |
-| `63C0` | no tries left; the credential is blocked | refused for a PIN; served for the PUK, which the card then answers for itself |
+| `63C0` | no tries left; the credential is blocked | served; the card answers for itself and spends nothing |
 | `6283` | the PIN is deactivated | refused |
 
 The rule is `check_retry_floor` from `refineid-auth`, the one floor
-every surface applies, with the PUK's own last-tries arm (see
+every credential follows (see
 [credential custody](../security/credential-custody.md)). On a refusal
 nothing after `MSE:Set AT` is sent. A `63CX` answer to a `GENERAL
 AUTHENTICATE` is a wrong PIN or a wrong PUK, reported with the tries

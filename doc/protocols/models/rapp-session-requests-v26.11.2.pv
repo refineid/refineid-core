@@ -1,0 +1,411 @@
+(* Copyright 2026 Petri Koistinen
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *)
+
+
+(* Symbolic model of RAPP v26.11.2 operational sessions and operations
+ * (doc/protocols/rapp-v26.11.2.md, "the spec": §2.2.1, §4.3 item 5,
+ * §6.3, §7, §8, §9, §11) for ProVerif, one of three session files that
+ * each check one group of properties. A stored pairing is taken as given:
+ * rapp-pairing-secrecy-v26.11.2.pv and rapp-pairing-agreement-v26.11.2.pv
+ * check that a pairing made with the code establishes secret
+ * pair-specific static keys on which both ends agree.
+ * README.md in this directory states the abstraction, the attacker model
+ * and the properties with the STPA ids (doc/security/stpa-rapp.md) each
+ * one checks.
+ *
+ * Roles: Alice the phone (Custodian), Bob the computer (Requester), Carol
+ * the cardholder and the card. Every transport is the one public channel
+ * [pub]. The phone, the card and Carol are honest. Pairings with Bob are
+ * honest; one pairing is compromised (the attacker chose the Requester's
+ * static key and holds its secret, as a computer that received Carol's
+ * code does) and serves any number of sessions.
+ *
+ * This file checks injective agreement on requests. Two operations per
+ * session exercise the sequence numbers and the operation_id check; the
+ * card is one abstract signing command, since the property concerns the
+ * request, not the PIN that authorizes it. *)
+
+(* ------------------------------------------------------------------ *)
+(* Channels and secrets                                               *)
+(* ------------------------------------------------------------------ *)
+
+free pub: channel.                 (* every RAPP transport, spec §2.2 *)
+
+(* The card's signing key, used by one abstract card command. *)
+free sk_card: bitstring [private].
+
+(* Markers that the honest endpoints encrypt under each session key; the
+ * attacker learns a marker exactly when it learns the key. *)
+free sec_sess_r, sec_sess_c: bitstring [private].
+
+(* ------------------------------------------------------------------ *)
+(* Primitives                                                           *)
+(* ------------------------------------------------------------------ *)
+
+(* The attacker sends only well-typed values. X25519 keys and Ristretto255
+ * points are distinct types: the groups are unrelated, and no honest
+ * computation relates a value of one to a value of the other. *)
+set ignoreTypes = false.
+
+(* X25519 (RFC 7748) for Noise and the static agreement (spec §6.2,
+ * §4.3 item 5): secret scalars, public keys, and the agreement. *)
+type xsec.
+type xpub.
+fun xpk(xsec): xpub.
+fun xdh(xpub, xsec): bitstring.
+equation forall x: xsec, y: xsec; xdh(xpk(x), y) = xdh(xpk(y), x).
+
+(* Ristretto255 for CPace (spec §6.1.1): scalars and points over a base
+ * that is a variable, since the generator depends on the code. *)
+type cscalar.
+type cpoint.
+fun cpt(cpoint, cscalar): cpoint.
+fun cdh(cpoint, cscalar): bitstring.
+equation forall b: cpoint, x: cscalar, y: cscalar; cdh(cpt(b, x), y) = cdh(cpt(b, y), x).
+
+(* CPace generator, spec §6.1.2: MapToGroup(SHA-512(lv_cat(DSI, PRS,
+ * zero padding, C, SID))). *)
+fun h2g(bitstring, bitstring, bitstring): cpoint.
+
+(* Encodings of keys and points as octets. *)
+fun xpub2b(xpub): bitstring [data, typeConverter].
+fun xsec2b(xsec): bitstring [data, typeConverter].
+
+(* SHA-256 and SHA-512, each input labelled as the spec labels it. *)
+fun H(bitstring): bitstring.
+(* SHA-512 as MixHash of the Noise handshake hash (Noise revision 34
+ * §5.2). Every input of the handshake hash is public; the resolution
+ * hint below makes ProVerif look for a key before it rebuilds a hash it
+ * can always rebuild. It changes no derivable fact. *)
+fun hh(bitstring): bitstring.
+nounif x: bitstring; attacker(hh( *x)).
+
+(* HMAC-SHA-256 and HMAC-SHA-512; HKDF-Extract and HKDF-Expand of
+ * RFC 5869 are both one HMAC (spec §2.2.1, §4.3 item 5, §6.1.3). *)
+fun hmac(bitstring, bitstring): bitstring.
+
+(* Noise HKDF(ck, ikm, n) of Noise revision 34 §4.3: the new chaining key,
+ * the cipher key, and the third output of MixKeyAndHash. *)
+fun nck(bitstring, bitstring): bitstring.
+fun nk(bitstring, bitstring): bitstring.
+fun nk3(bitstring, bitstring): bitstring.
+fun nh(bitstring, bitstring): bitstring.
+(* Split() of spec §6.3. *)
+fun sp1(bitstring): bitstring.
+fun sp2(bitstring): bitstring.
+
+(* ChaCha20-Poly1305 with key, nonce, associated data and plaintext.
+ * MixHash of a handshake ciphertext (Noise revision 34 §5.2) is modelled
+ * as MixHash of its nonce and plaintext, which keeps the symbolic
+ * handshake hash small. Every input of the real handshake hash is public,
+ * so each endpoint publishes its final handshake hash; the attacker knows
+ * it as he would in the real protocol. *)
+fun aead(bitstring, bitstring, bitstring, bitstring): bitstring.
+reduc forall k: bitstring, n: bitstring, a: bitstring, m: bitstring;
+  aead_open(k, n, a, aead(k, n, a, m)) = m.
+
+(* The card's signatures: authentication key and qualified signature key. *)
+fun spk(bitstring): bitstring.
+fun sign(bitstring, bitstring): bitstring.
+reduc forall sk: bitstring, m: bitstring; sig_msg(sign(sk, m)) = m.
+
+(* Transport profile to its routing preamble domain and candidate_id,
+ * spec §2.2 table. *)
+fun dom(bitstring): bitstring.
+fun cand(bitstring): bitstring.
+
+(* Query markers only; not part of the protocol. *)
+fun mark(bitstring, bitstring): bitstring.
+reduc forall k: bitstring, m: bitstring; unmark(k, mark(k, m)) = m.
+
+(* ------------------------------------------------------------------ *)
+(* Constants: labels, suites, message types, profiles                   *)
+(* ------------------------------------------------------------------ *)
+
+const empty: bitstring [data].
+const wire_version, scheme_rapp, suite_pairing, suite_session: bitstring [data].
+const transports_all, offer_ttl: bitstring [data].
+const role_requester, role_custodian: bitstring [data].
+const pn_xx, pn_kk: bitstring [data].
+
+const lbl_offer_hash, lbl_ctx, lbl_isk, lbl_transcript: bitstring [data].
+const lbl_psk, lbl_ka, lbl_kb, lbl_ta, lbl_tb: bitstring [data].
+const lbl_pairing_prologue, lbl_session_prologue: bitstring [data].
+const lbl_session_id, lbl_pair_id, lbl_grants, lbl_cert_fp: bitstring [data].
+const lbl_routing, lbl_disc, lbl_wd: bitstring [data].
+
+const n0, n1, n2, n3, n4: bitstring [data].   (* sequence = Noise nonce, spec §7.2 item 3 *)
+
+const purpose_session, mode_session, mode_withdrawn: bitstring [data].
+
+const t_pairing_hello, t_pairing_confirm, t_pairing_stored: bitstring [data].
+const t_session_ready, t_session_hello, t_session_close: bitstring [data].
+const t_card_status, t_op_request, t_op_result: bitstring [data].
+
+const prof_auth, prof_docsign, prof_status: bitstring [data].
+const act_browser_auth, act_sign_document: bitstring [data].
+const st_completed, st_rejected: bitstring [data].
+const yes, no: bitstring [data].
+
+const name_alice, plat_alice, name_bob, plat_bob: bitstring [data].
+
+(* Model bookkeeping: whether Carol typed the code into Bob (honest) or
+ * into a compromised computer (leaked). No message carries it. *)
+const honest, leaked: bitstring [data].
+
+
+(* Stored pairing records, spec §4.3 item 4: the Custodian's and the
+ * Requester's. *)
+table custodian_pairs(bitstring, bitstring, bitstring, bitstring, xsec, xpub, xpub, bitstring).
+table requester_pairs(bitstring, bitstring, xsec, xpub, xpub).
+
+(* ------------------------------------------------------------------ *)
+(* Events                                                             *)
+(* ------------------------------------------------------------------ *)
+
+event CustodianPairingActive(bitstring, bitstring, bitstring, xpub, xpub, bitstring).
+event CustodianSessionReady(bitstring, bitstring, bitstring).
+event RequesterSessionReady(bitstring, bitstring).
+event CustodianSentCardStatus(bitstring, bitstring, bitstring, bitstring).
+event RequesterAcceptsCardStatus(bitstring, bitstring, bitstring).
+event RequesterSendsOp(bitstring, bitstring, bitstring, bitstring, bitstring, bitstring, bitstring).
+event HolderConsents(bitstring, bitstring, bitstring).
+event CustodianCommandsCard(bitstring, bitstring, bitstring, bitstring, bitstring, bitstring, bitstring, bitstring, bitstring).
+event CardSigns(bitstring, bitstring).
+event CustodianSentResult(bitstring, bitstring, bitstring, bitstring, bitstring).
+event RequesterGetsResult(bitstring, bitstring, bitstring, bitstring).
+event CustodianSentClose(bitstring, bitstring, bitstring, bitstring).
+event RequesterAcceptsClose(bitstring, bitstring, bitstring).
+
+(* ------------------------------------------------------------------ *)
+(* Queries                                                            *)
+(* ------------------------------------------------------------------ *)
+
+(* Injective agreement on the request: every card command Alice issues on
+ * an honest pairing's session answers one distinct request Bob sent on
+ * that very session, with the same identifier, profile, action, context
+ * and digest; a replayed, reflected or cross-session request obtains no
+ * second command. Spec §7.2 items 2 and 3, §8.1 item 1; STPA H-1, H-2,
+ * CC-104, UCA-15. *)
+query pid: bitstring, ssid: bitstring, op: bitstring, nm: bitstring,
+      pr: bitstring, ac: bitstring, cx: bitstring, d: bitstring;
+  inj-event(CustodianCommandsCard(honest, pid, ssid, op, nm, pr, ac, cx, d))
+    ==> inj-event(RequesterSendsOp(pid, ssid, op, pr, ac, cx, d)).
+
+(* ------------------------------------------------------------------ *)
+(* Alice: operational session, spec §2.2.1, §4.3 item 5, §6.3, §7, §8 *)
+(* ------------------------------------------------------------------ *)
+
+
+let CustodianSession(kind: bitstring, pid: bitstring, gh: bitstring, granted: bitstring,
+                     skc: xsec, pkc: xpub, pkr: xpub, nm: bitstring,
+                     fp: bitstring, er: xsec, rnonce: bitstring,
+                     r1: channel, rc1: channel, r2: channel, rc2: channel) =
+  (* Routing phase: the tag keyed by the static agreement selects the
+   * pairing; it authenticates nothing (spec §2.2.1). *)
+  in(pub, tp: bitstring);
+  in(pub, (=dom(tp), =purpose_session, rn: bitstring, tag: bitstring));
+  let kroute = hmac(hmac(pid, xdh(pkr, skc)), lbl_routing) in
+  if tag = hmac(kroute, (dom(tp), rn)) then
+  (* Noise_KK responder. Pre-messages: initiator static, then responder
+   * static (spec §6.3 "Initialization"). *)
+  let prologue = (lbl_session_prologue, wire_version, suite_session, pid, gh, tp) in
+  let h3 = hh((hh((hh((pn_kk, prologue)), pkr)), pkc)) in
+  let ck0 = pn_kk in
+  in(pub, (ei: xpub, c1: bitstring));
+  let h4 = hh((h3, ei)) in
+  let d_es = xdh(ei, skc) in
+  let ck1 = nck(ck0, d_es) in
+  let d_ss = xdh(pkr, skc) in
+  let ck2 = nck(ck1, d_ss) in
+  let k2 = nk(ck1, d_ss) in
+  if aead_open(k2, n0, h4, c1) = empty then
+  let h5 = hh((h4, (n0, empty))) in
+  let erp = xpk(er) in
+  let h6 = hh((h5, erp)) in
+  let d_ee = xdh(ei, er) in
+  let ck3 = nck(ck2, d_ee) in
+  let d_se = xdh(pkr, er) in
+  let ck4 = nck(ck3, d_se) in
+  let k4 = nk(ck3, d_se) in
+  let c2 = aead(k4, n0, h6, empty) in
+  let h7 = hh((h6, (n0, empty))) in
+  out(pub, (erp, c2));
+  out(pub, h7);
+  let krc = sp1(ck4) in
+  let kcr = sp2(ck4) in
+  let ssid = H((lbl_session_id, h7)) in
+  (* session.ready, then card.status at once (spec §7.1 items 5 and 12). *)
+  event CustodianSessionReady(kind, pid, ssid);
+  out(pub, aead(kcr, n0, empty, (wire_version, ssid, n0, t_session_ready,
+        ((wire_version, suite_session, tp, cand(tp), gh), rnonce, name_alice))));
+  event CustodianSentCardStatus(kind, pid, ssid, fp);
+  out(pub, aead(kcr, n1, empty, (wire_version, ssid, n1, t_card_status, (yes, no, fp))));
+  ( ( if kind = honest then out(pub, mark(kcr, sec_sess_c)) )
+  | (
+  (* No operation is admitted before session.hello (spec §7.1 item 6,
+   * state machine X-11). *)
+  in(pub, mh: bitstring);
+  let (=wire_version, =ssid, =n0, =t_session_hello, nm_now: bitstring)
+      = aead_open(krc, n0, empty, mh) in
+  (* Operation 1: request at sequence n1, result at n2. *)
+  in(pub, m1: bitstring);
+  let (=wire_version, =ssid, =n1, =t_op_request,
+       (op1: bitstring, pr1: bitstring, ac1: bitstring, cx1: bitstring, d1: bitstring))
+      = aead_open(krc, n1, empty, m1) in
+  let (g_auth: bitstring, g_sign: bitstring, g_status: bitstring) = granted in
+  if (pr1 = prof_docsign && ac1 = act_sign_document && g_sign = prof_docsign) || (pr1 = prof_auth && ac1 = act_browser_auth && g_auth = prof_auth) then
+  ( event CustodianCommandsCard(kind, pid, ssid, op1, nm, pr1, ac1, cx1, d1);
+    let s1 = sign(sk_card, (ac1, d1)) in
+    event CustodianSentResult(kind, pid, ssid, op1, s1);
+    out(pub, aead(kcr, n2, empty, (wire_version, ssid, n2, t_op_result, (op1, st_completed, s1))));
+  (* Operation 2: request at sequence n2, result at n3. *)
+  in(pub, m2: bitstring);
+  let (=wire_version, =ssid, =n2, =t_op_request,
+       (op2: bitstring, pr2: bitstring, ac2: bitstring, cx2: bitstring, d2: bitstring))
+      = aead_open(krc, n2, empty, m2) in
+  (* An operation_id the session has seen is refused (spec §8.1 item 1). *)
+  if op2 <> op1 then
+  if (pr2 = prof_docsign && ac2 = act_sign_document && g_sign = prof_docsign) || (pr2 = prof_auth && ac2 = act_browser_auth && g_auth = prof_auth) then
+  ( event CustodianCommandsCard(kind, pid, ssid, op2, nm, pr2, ac2, cx2, d2);
+    let s2 = sign(sk_card, (ac2, d2)) in
+    event CustodianSentResult(kind, pid, ssid, op2, s2);
+    out(pub, aead(kcr, n3, empty, (wire_version, ssid, n3, t_op_result, (op2, st_completed, s2))));
+    0 )
+ )
+ ) ).
+
+(* ------------------------------------------------------------------ *)
+(* Bob, the computer                                                  *)
+(* ------------------------------------------------------------------ *)
+
+let RequesterSession(pid: bitstring, gh: bitstring, skr: xsec, pkr: xpub, pkc: xpub,
+                     rn: bitstring, ei: xsec, op1: bitstring, op2: bitstring) =
+  in(pub, tp: bitstring);
+  let kroute = hmac(hmac(pid, xdh(pkc, skr)), lbl_routing) in
+  out(pub, (dom(tp), purpose_session, rn, hmac(kroute, (dom(tp), rn))));
+  let prologue = (lbl_session_prologue, wire_version, suite_session, pid, gh, tp) in
+  let h3 = hh((hh((hh((pn_kk, prologue)), pkr)), pkc)) in
+  let ck0 = pn_kk in
+  (* -> e, es, ss *)
+  let eip = xpk(ei) in
+  let h4 = hh((h3, eip)) in
+  let d_es = xdh(pkc, ei) in
+  let ck1 = nck(ck0, d_es) in
+  let d_ss = xdh(pkc, skr) in
+  let ck2 = nck(ck1, d_ss) in
+  let k2 = nk(ck1, d_ss) in
+  let c1 = aead(k2, n0, h4, empty) in
+  let h5 = hh((h4, (n0, empty))) in
+  out(pub, (eip, c1));
+  (* <- e, ee, se *)
+  in(pub, (erp: xpub, c2: bitstring));
+  let h6 = hh((h5, erp)) in
+  let d_ee = xdh(erp, ei) in
+  let ck3 = nck(ck2, d_ee) in
+  let d_se = xdh(erp, skr) in
+  let ck4 = nck(ck3, d_se) in
+  let k4 = nk(ck3, d_se) in
+  if aead_open(k4, n0, h6, c2) = empty then
+  let h7 = hh((h6, (n0, empty))) in
+  out(pub, h7);
+  let krc = sp1(ck4) in
+  let kcr = sp2(ck4) in
+  let ssid = H((lbl_session_id, h7)) in
+  (* session.ready with matching parameters (spec §7.1 item 5). *)
+  in(pub, m0: bitstring);
+  let (=wire_version, =ssid, =n0, =t_session_ready,
+       ((=wire_version, =suite_session, =tp, =cand(tp), =gh), rnonce: bitstring, nmc: bitstring))
+      = aead_open(kcr, n0, empty, m0) in
+  event RequesterSessionReady(pid, ssid);
+  out(pub, mark(krc, sec_sess_r));
+  in(pub, mcs: bitstring);
+  let (=wire_version, =ssid, =n1, =t_card_status, (present: bitstring, reader: bitstring, fp: bitstring))
+      = aead_open(kcr, n1, empty, mcs) in
+  event RequesterAcceptsCardStatus(pid, ssid, fp);
+  out(pub, aead(krc, n0, empty, (wire_version, ssid, n0, t_session_hello, name_bob)));
+  (* Operation 1: fresh operation_id (spec §8.1 item 1). *)
+  in(pub, (pr1: bitstring, ac1: bitstring, cx1: bitstring, d1: bitstring));
+  event RequesterSendsOp(pid, ssid, op1, pr1, ac1, cx1, d1);
+  out(pub, aead(krc, n1, empty, (wire_version, ssid, n1, t_op_request, (op1, pr1, ac1, cx1, d1))));
+  in(pub, mr1: bitstring);
+  let (=wire_version, =ssid, =n2, =t_op_result, (=op1, st1: bitstring, s1: bitstring))
+      = aead_open(kcr, n2, empty, mr1) in
+  event RequesterGetsResult(pid, ssid, op1, s1);
+  (* Operation 2: fresh operation_id (spec §8.1 item 1). *)
+  in(pub, (pr2: bitstring, ac2: bitstring, cx2: bitstring, d2: bitstring));
+  event RequesterSendsOp(pid, ssid, op2, pr2, ac2, cx2, d2);
+  out(pub, aead(krc, n2, empty, (wire_version, ssid, n2, t_op_request, (op2, pr2, ac2, cx2, d2))));
+  in(pub, mr2: bitstring);
+  let (=wire_version, =ssid, =n3, =t_op_result, (=op2, st2: bitstring, s2: bitstring))
+      = aead_open(kcr, n3, empty, mr2) in
+  event RequesterGetsResult(pid, ssid, op2, s2).
+
+(* ------------------------------------------------------------------ *)
+(* Stored pairings                                                      *)
+(* ------------------------------------------------------------------ *)
+
+(* A pairing Carol made with Bob: fresh pair-specific static keys on both
+ * ends, both records stored (spec §4.3 item 4). pair_id is derivable from
+ * the public pairing transcript, so the attacker knows it. *)
+let HonestPairing =
+  new skc: xsec;
+  new skr: xsec;
+  new pid: bitstring;
+  let pkc = xpk(skc) in
+  let pkr = xpk(skr) in
+  let granted = (prof_auth, prof_docsign, prof_status) in
+  let gh = H((lbl_grants, granted)) in
+  event CustodianPairingActive(honest, pid, gh, pkc, pkr, name_bob);
+  insert custodian_pairs(honest, pid, gh, granted, skc, pkc, pkr, name_bob);
+  insert requester_pairs(pid, gh, skr, pkr, pkc);
+  out(pub, (pid, pkc, pkr)).
+
+(* The pairing a compromised computer made with Carol's code: the attacker
+ * chooses the Requester's static key and display name. One such pairing
+ * serves any number of sessions. *)
+let CompromisedPairing =
+  new skc: xsec;
+  new pid: bitstring;
+  let pkc = xpk(skc) in
+  out(pub, (pid, pkc));
+  in(pub, (pkr: xpub, nm: bitstring));
+  let granted = (prof_auth, prof_docsign, prof_status) in
+  let gh = H((lbl_grants, granted)) in
+  event CustodianPairingActive(leaked, pid, gh, pkc, pkr, nm);
+  insert custodian_pairs(leaked, pid, gh, granted, skc, pkc, pkr, nm).
+
+(* ------------------------------------------------------------------ *)
+(* The system                                                         *)
+(* ------------------------------------------------------------------ *)
+
+process
+  (* The card's certificate fingerprint (spec §8.4 item 2). *)
+  let fp = H((lbl_cert_fp, spk(sk_card))) in
+  out(pub, spk(sk_card));
+  ( 0
+  | ( ! HonestPairing )
+  | CompromisedPairing
+  (* Each session draws its fresh values (Noise ephemeral, ready nonce,
+   * prompt and card reply channels; routing nonce, ephemeral and
+   * operation identifiers) before it reads the stored record. *)
+  | ( ! new er: xsec; new rnonce: bitstring;
+        new r1: channel; new rc1: channel; new r2: channel; new rc2: channel;
+        get custodian_pairs(kind: bitstring, pid: bitstring, gh: bitstring, granted: bitstring,
+                            skc: xsec, pkc: xpub, pkr: xpub, nm: bitstring) in
+        CustodianSession(kind, pid, gh, granted, skc, pkc, pkr, nm, fp, er, rnonce, r1, rc1, r2, rc2) )
+  | ( ! new rn: bitstring; new ei: xsec; new op1: bitstring; new op2: bitstring;
+        get requester_pairs(pid: bitstring, gh: bitstring, skr: xsec, pkr: xpub, pkc: xpub) in
+        RequesterSession(pid, gh, skr, pkr, pkc, rn, ei, op1, op2) ) )

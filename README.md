@@ -94,6 +94,7 @@ Constraints are traced to the
 [ICAO Doc 9303](https://www.icao.int/publications/doc-series/doc-9303), and
 the ISO/IEC 7816 series. See
 [credential custody](doc/security/credential-custody.md),
+[certificate custody](doc/security/certificate-custody.md),
 the [core migration policy](doc/architecture/core-migration.md),
 [public provenance](doc/governance/public-provenance.md), the
 [FINEID specifications](doc/reference/specifications.md), and the

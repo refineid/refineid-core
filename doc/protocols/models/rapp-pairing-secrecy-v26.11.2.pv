@@ -1,0 +1,485 @@
+(* Copyright 2026 Petri Koistinen
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *)
+
+
+(* Symbolic model of the RAPP v26.11.2 pairing (doc/protocols/rapp-v26.11.2.md,
+ * "the spec": §3, §4.2 to §4.5, §6.1, §6.2) for ProVerif, one of four
+ * pairing files that each check one group of properties. The session files
+ * rapp-session-*-v26.11.2.pv take a stored pairing as given. README.md in
+ * this directory states the abstraction, the attacker model and the
+ * properties with the STPA ids (doc/security/stpa-rapp.md) each one checks.
+ *
+ * Roles: Alice the phone (Custodian) and Bob the computer (Requester);
+ * Carol the cardholder types the code Alice shows. Every transport (BLE,
+ * stream, the Apple peer-to-peer link) is the one public channel [pub]:
+ * the attacker reads, drops, reorders, replays and forges every frame and
+ * serves forged offers. Alice is honest. A computer is honest (Bob, who
+ * receives the code from Carol) or compromised: one ceremony's code is
+ * published to the attacker, who then runs the Requester role himself
+ * with keys of his own.
+ *
+ * This file checks the secrecy of the PSK, the static keys and the keys of
+ * the static agreement; stored pairings publish withdrawn records, so the
+ * attacker sees the MACs under K_wd.
+ *)
+
+(* ------------------------------------------------------------------ *)
+(* Channels                                                             *)
+(* ------------------------------------------------------------------ *)
+
+free pub: channel.                 (* every RAPP transport, spec §2.2 *)
+
+(* The pairing code of the honest ceremonies, the subject of the
+ * offline-guessing query. A compromised computer's ceremony draws a fresh
+ * code and publishes it. *)
+free code_w: bitstring [private].
+
+(* Markers that the honest endpoints encrypt under each key whose secrecy
+ * is queried; the attacker learns a marker exactly when it learns a key. *)
+free sec_psk_r, sec_psk_c: bitstring [private].
+free sec_route_r, sec_route_c: bitstring [private].
+free sec_disc_c, sec_wd_c: bitstring [private].
+free sec_static_r, sec_static_c: bitstring [private].
+
+(* ------------------------------------------------------------------ *)
+(* Primitives                                                           *)
+(* ------------------------------------------------------------------ *)
+
+(* The attacker sends only well-typed values. X25519 keys and Ristretto255
+ * points are distinct types: the groups are unrelated, and no honest
+ * computation relates a value of one to a value of the other. *)
+set ignoreTypes = false.
+
+(* X25519 (RFC 7748) for Noise and the static agreement (spec §6.2,
+ * §4.3 item 5): secret scalars, public keys, and the agreement. *)
+type xsec.
+type xpub.
+fun xpk(xsec): xpub.
+fun xdh(xpub, xsec): bitstring.
+equation forall x: xsec, y: xsec; xdh(xpk(x), y) = xdh(xpk(y), x).
+
+(* Ristretto255 for CPace (spec §6.1.1): scalars and points over a base
+ * that is a variable, since the generator depends on the code. *)
+type cscalar.
+type cpoint.
+fun cpt(cpoint, cscalar): cpoint.
+fun cdh(cpoint, cscalar): bitstring.
+equation forall b: cpoint, x: cscalar, y: cscalar; cdh(cpt(b, x), y) = cdh(cpt(b, y), x).
+
+(* CPace generator, spec §6.1.2: MapToGroup(SHA-512(lv_cat(DSI, PRS,
+ * zero padding, C, SID))). *)
+fun h2g(bitstring, bitstring, bitstring): cpoint.
+
+(* Encodings of keys and points as octets. *)
+fun xpub2b(xpub): bitstring [data, typeConverter].
+fun xsec2b(xsec): bitstring [data, typeConverter].
+
+(* SHA-256 and SHA-512, each input labelled as the spec labels it. *)
+fun H(bitstring): bitstring.
+(* SHA-512 as MixHash of the Noise handshake hash (Noise revision 34
+ * §5.2). *)
+fun hh(bitstring): bitstring.
+
+(* HMAC-SHA-256 and HMAC-SHA-512; HKDF-Extract and HKDF-Expand of
+ * RFC 5869 are both one HMAC (spec §2.2.1, §4.3 item 5, §6.1.3). *)
+fun hmac(bitstring, bitstring): bitstring.
+
+(* Noise HKDF(ck, ikm, n) of Noise revision 34 §4.3: the new chaining key,
+ * the cipher key, and the third output of MixKeyAndHash. *)
+fun nck(bitstring, bitstring): bitstring.
+fun nk(bitstring, bitstring): bitstring.
+fun nk3(bitstring, bitstring): bitstring.
+fun nh(bitstring, bitstring): bitstring.
+(* Split() of spec §6.3. *)
+fun sp1(bitstring): bitstring.
+fun sp2(bitstring): bitstring.
+
+(* ChaCha20-Poly1305 with key, nonce, associated data and plaintext.
+ * MixHash of a handshake ciphertext (Noise revision 34 §5.2) is modelled
+ * as MixHash of its nonce and plaintext, which keeps the symbolic
+ * handshake hash small. Every input of the real handshake hash is public,
+ * so each endpoint publishes its final handshake hash; the attacker knows
+ * it as he would in the real protocol. *)
+fun aead(bitstring, bitstring, bitstring, bitstring): bitstring.
+reduc forall k: bitstring, n: bitstring, a: bitstring, m: bitstring;
+  aead_open(k, n, a, aead(k, n, a, m)) = m.
+
+(* The card's signatures: authentication key and qualified signature key. *)
+fun spk(bitstring): bitstring.
+fun sign(bitstring, bitstring): bitstring.
+reduc forall sk: bitstring, m: bitstring; sig_msg(sign(sk, m)) = m.
+
+(* Transport profile to its routing preamble domain and candidate_id,
+ * spec §2.2 table. *)
+fun dom(bitstring): bitstring.
+fun cand(bitstring): bitstring.
+
+(* Query markers only; not part of the protocol. *)
+fun mark(bitstring, bitstring): bitstring.
+reduc forall k: bitstring, m: bitstring; unmark(k, mark(k, m)) = m.
+
+(* ------------------------------------------------------------------ *)
+(* Constants: labels, suites, message types, profiles                   *)
+(* ------------------------------------------------------------------ *)
+
+const empty: bitstring [data].
+const wire_version, scheme_rapp, suite_pairing, suite_session: bitstring [data].
+const transports_all, offer_ttl: bitstring [data].
+const role_requester, role_custodian: bitstring [data].
+const pn_xx, pn_kk: bitstring [data].
+
+const lbl_offer_hash, lbl_ctx, lbl_isk, lbl_transcript: bitstring [data].
+const lbl_psk, lbl_ka, lbl_kb, lbl_ta, lbl_tb: bitstring [data].
+const lbl_pairing_prologue, lbl_session_prologue: bitstring [data].
+const lbl_session_id, lbl_pair_id, lbl_grants, lbl_cert_fp: bitstring [data].
+const lbl_routing, lbl_disc, lbl_wd: bitstring [data].
+
+const n0, n1, n2, n3, n4: bitstring [data].   (* sequence = Noise nonce, spec §7.2 item 3 *)
+
+const purpose_session, mode_session, mode_withdrawn: bitstring [data].
+
+const t_pairing_hello, t_pairing_confirm, t_pairing_stored: bitstring [data].
+const t_session_ready, t_session_hello, t_session_close: bitstring [data].
+const t_card_status, t_op_request, t_op_result: bitstring [data].
+
+const prof_auth, prof_docsign, prof_status: bitstring [data].
+const act_browser_auth, act_sign_document: bitstring [data].
+const st_completed, st_rejected: bitstring [data].
+const yes, no: bitstring [data].
+
+const name_alice, plat_alice, name_bob, plat_bob: bitstring [data].
+
+(* Model bookkeeping: whether Carol typed the code into Bob (honest) or
+ * into a compromised computer (leaked). No message carries it. *)
+const honest, leaked: bitstring [data].
+
+(* Stored pairing records, spec §4.3 item 4: the Custodian's and the
+ * Requester's. *)
+table custodian_pairs(bitstring, bitstring, bitstring, bitstring, xsec, xpub, xpub, bitstring).
+table requester_pairs(bitstring, bitstring, xsec, xpub, xpub).
+(* PSKs a confirmed CPace run handed to Noise (spec §6.1.4). *)
+table custodian_psks(bitstring, bitstring, bitstring, bitstring, bitstring, xsec, xsec).
+table requester_psks(bitstring, bitstring, bitstring, bitstring, xsec, xsec).
+(* Pairing channels a completed Noise_XXpsk3 handshake opened (spec §4.3
+ * item 2). *)
+table custodian_channels(bitstring, bitstring, bitstring, bitstring, bitstring, xsec,
+                         xpub, xpub, bitstring, bitstring, bitstring, bitstring).
+table requester_channels(bitstring, bitstring, bitstring, bitstring, xsec, xpub,
+                         xpub, bitstring, bitstring, bitstring, bitstring).
+
+(* ------------------------------------------------------------------ *)
+(* Events                                                               *)
+(* ------------------------------------------------------------------ *)
+
+event CustodianStored(bitstring, bitstring, bitstring, xpub, xpub, bitstring).
+event CustodianPairingActive(bitstring, bitstring, bitstring, xpub, xpub, bitstring).
+event RequesterStored(bitstring, bitstring, xpub, xpub, bitstring).
+event RequesterPairingActive(bitstring, bitstring, xpub, xpub, bitstring).
+event CustodianWithdrew(bitstring, bitstring, bitstring, bitstring).
+event RequesterVerifiedWithdrawal(bitstring, bitstring, bitstring).
+
+(* ------------------------------------------------------------------ *)
+(* Queries                                                            *)
+(* ------------------------------------------------------------------ *)
+
+(* Secrecy, for a pairing whose code Carol typed into Bob: the CPace PSK
+ * (spec §6.1.3, §6.1.4), the pair-specific static keys (spec §4.3 item 4)
+ * and the keys of the static agreement for routing, discovery hints and
+ * withdrawal hints (spec §2.2.1, §4.3 item 5, §4.5 item 1).
+ * STPA H-1, H-4, H-6, L-4, UCA-14, UCA-102. *)
+query attacker(sec_psk_r); attacker(sec_psk_c);
+      attacker(sec_static_r); attacker(sec_static_c);
+      attacker(sec_route_r); attacker(sec_route_c);
+      attacker(sec_disc_c); attacker(sec_wd_c).
+
+(* Withdrawal hint, spec §4.5 items 1 and 2: the record for any instance
+ * name and counter. The discovery hint of hierarchy §4.3 is a MAC under
+ * K_disc of the epoch alone; the model queries the secrecy of K_disc and
+ * does not run the hint as an oracle. *)
+let CustodianAnnouncements(kind: bitstring, pid: bitstring, skc: xsec, pkr: xpub) =
+  let kwd = hmac(hmac(pid, xdh(pkr, skc)), lbl_wd) in
+  let kdisc = hmac(hmac(pid, xdh(pkr, skc)), lbl_disc) in
+  ( ( in(pub, (ins: bitstring, ctr: bitstring));
+        event CustodianWithdrew(kind, pid, ins, ctr);
+        out(pub, (mode_withdrawn, ins, ctr, hmac(kwd, (ins, ctr)))) )
+  | ( if kind = honest then
+        ( out(pub, mark(kwd, sec_wd_c))
+        | out(pub, mark(kdisc, sec_disc_c))
+        | out(pub, mark(hmac(hmac(pid, xdh(pkr, skc)), lbl_routing), sec_route_c))
+        | out(pub, mark(xsec2b(skc), sec_static_c)) ) ) ).
+
+
+(* ------------------------------------------------------------------ *)
+(* Alice: pairing, spec §3.3, §4.2, §4.3, §6.1, §6.2                     *)
+(* ------------------------------------------------------------------ *)
+
+let CustodianPairing(kind: bitstring, oh: bitstring, tp: bitstring,
+                     granted: bitstring, psk: bitstring, skc: xsec, er: xsec) =
+  let pkc = xpk(skc) in
+  (* Noise_XXpsk3 responder, prologue bound to offer_hash and the
+   * transport profile (spec §4.3 item 1, §6.2). *)
+  let prologue = (lbl_pairing_prologue, wire_version, suite_pairing, oh, tp) in
+  let h1 = hh((pn_xx, prologue)) in
+  let ck0 = pn_xx in
+  (* -> e  (PSK mode: e is also mixed into the key) *)
+  in(pub, (ei: xpub, c1: bitstring));
+  let h2 = hh((h1, ei)) in
+  let ck1 = nck(ck0, xpub2b(ei)) in
+  let k1 = nk(ck0, xpub2b(ei)) in
+  if aead_open(k1, n0, h2, c1) = empty then
+  let h3 = hh((h2, (n0, empty))) in
+  (* <- e, ee, s, es *)
+  let erp = xpk(er) in
+  let h4 = hh((h3, erp)) in
+  let ck2 = nck(ck1, xpub2b(erp)) in
+  let d_ee = xdh(ei, er) in
+  let ck3 = nck(ck2, d_ee) in
+  let k3 = nk(ck2, d_ee) in
+  let c2 = aead(k3, n0, h4, xpub2b(pkc)) in
+  let h5 = hh((h4, (n0, pkc))) in
+  let d_es = xdh(ei, skc) in
+  let ck4 = nck(ck3, d_es) in
+  let k4 = nk(ck3, d_es) in
+  let c3 = aead(k4, n0, h5, empty) in
+  let h6 = hh((h5, (n0, empty))) in
+  out(pub, (erp, c2, c3));
+  (* -> s, se, psk *)
+  in(pub, (c4: bitstring, c5: bitstring));
+  let xpub2b(pkr: xpub) = aead_open(k4, n1, h6, c4) in
+  let h7 = hh((h6, (n1, pkr))) in
+  let d_se = xdh(pkr, er) in
+  let ck5 = nck(ck4, d_se) in
+  let ck6 = nck(ck5, psk) in
+  let k6 = nk3(ck5, psk) in
+  let h8 = hh((h7, nh(ck5, psk))) in
+  if aead_open(k6, n0, h8, c5) = empty then
+  let h9 = hh((h8, (n0, empty))) in
+  out(pub, h9);
+  let krc = sp1(ck6) in
+  let kcr = sp2(ck6) in
+  let psid = H((lbl_session_id, h9)) in
+  let pid = H((lbl_pair_id, h9)) in
+  (* The handshake hands the pairing channel on (spec §4.3 item 2). *)
+  insert custodian_channels(kind, oh, tp, granted, psk, skc, pkc, pkr, krc, kcr, psid, pid).
+
+(* pairing.hello echo, pairing.confirm, pairing.stored (spec §4.3 items 3
+ * and 4, §7.1 items 1 to 4). The Custodian grants the requested profiles
+ * of its offer. *)
+let CustodianPairingChannel(kind: bitstring, oh: bitstring, tp: bitstring, granted: bitstring,
+                            psk: bitstring, skc: xsec, pkc: xpub, pkr: xpub,
+                            krc: bitstring, kcr: bitstring, psid: bitstring, pid: bitstring) =
+  let params = (wire_version, suite_pairing, oh, tp, cand(tp)) in
+  in(pub, m1: bitstring);
+  let (=wire_version, =psid, =n0, =t_pairing_hello, (=params, nm: bitstring, plat: bitstring, =granted))
+      = aead_open(krc, n0, empty, m1) in
+  out(pub, aead(kcr, n0, empty, (wire_version, psid, n0, t_pairing_hello, (params, name_alice, plat_alice))));
+  out(pub, aead(kcr, n1, empty, (wire_version, psid, n1, t_pairing_confirm, granted)));
+  in(pub, m2: bitstring);
+  let (=wire_version, =psid, =n1, =t_pairing_confirm, =granted) = aead_open(krc, n1, empty, m2) in
+  let gh = H((lbl_grants, granted)) in
+  event CustodianStored(kind, pid, gh, pkc, pkr, nm);
+  out(pub, aead(kcr, n2, empty, (wire_version, psid, n2, t_pairing_stored, pid)));
+  in(pub, m3: bitstring);
+  let (=wire_version, =psid, =n2, =t_pairing_stored, =pid) = aead_open(krc, n2, empty, m3) in
+  (* Active once both records are stored and confirmed. *)
+  event CustodianPairingActive(kind, pid, gh, pkc, pkr, nm);
+  (* The pairing trust record (spec §4.3 item 4); sessions and
+   * announcements read it. *)
+  insert custodian_pairs(kind, pid, gh, granted, skc, pkc, pkr, nm);
+  if kind = honest then out(pub, mark(psk, sec_psk_c)).
+
+(* One offer: a fresh 32-byte offer_id as the CPace SID (spec §4.2), the
+ * code pw on Alice's screen, and the CPace responder. Attempts under one
+ * offer share the SID and the code and are replicated, so the model
+ * covers several guesses per offer (spec §3.3 item 5, "Multi-Attempt
+ * Replay Resistance"). The offer lists the three registered profiles
+ * (spec §9) as slots for authentication, document signing and card
+ * status. *)
+let CustodianOffer(kind: bitstring, pw: bitstring) =
+  new offer_id: bitstring;
+  let granted = (prof_auth, prof_docsign, prof_status) in
+  let offer = (scheme_rapp, wire_version, offer_id, suite_pairing, granted, transports_all, offer_ttl) in
+  let oh = H((lbl_offer_hash, offer)) in
+  (* Offer bootstrap: unauthenticated (spec §4.2 "Bootstrap Read Flow"). *)
+  out(pub, offer);
+  ! (
+    (* Fresh values of this attempt, drawn before any input: the CPace
+     * scalar, and the pair-specific static key and Noise ephemeral used
+     * if the attempt succeeds (spec §4.3 item 4). *)
+    new xb: cscalar;
+    new skc: xsec;
+    new er: xsec;
+    in(pub, tp: bitstring);
+    let ctx = (lbl_ctx, wire_version, suite_pairing, tp, cand(tp), oh, role_requester, role_custodian) in
+    let gen = h2g(pw, ctx, offer_id) in
+    (* CPace step 1 from the Requester; step 2 back (spec §6.1.3). *)
+    in(pub, ya: cpoint);
+    let yb = cpt(gen, xb) in
+    let isk = H((lbl_isk, offer_id, cdh(ya, xb), ya, yb)) in
+    let th = H((lbl_transcript, offer_id, ctx, ya, yb)) in
+    let prk = hmac(th, isk) in
+    let psk = hmac(prk, lbl_psk) in
+    let ka = hmac(prk, lbl_ka) in
+    let kb = hmac(prk, lbl_kb) in
+    out(pub, (yb, hmac(kb, (lbl_tb, th))));
+    (* Step 3: T_A consumes the offer and hands off to Noise (§6.1.4). *)
+    in(pub, ta: bitstring);
+    if ta = hmac(ka, (lbl_ta, th)) then
+    insert custodian_psks(kind, oh, tp, granted, psk, skc, er)
+  ).
+
+
+(* ------------------------------------------------------------------ *)
+(* Bob, the computer                                                  *)
+(* ------------------------------------------------------------------ *)
+
+(* Bob's long-term key markers. *)
+let RequesterKeyMarkers(pid: bitstring, skr: xsec, pkc: xpub) =
+    out(pub, mark(xsec2b(skr), sec_static_r))
+  | out(pub, mark(hmac(hmac(pid, xdh(pkc, skr)), lbl_routing), sec_route_r)).
+
+
+(* Bob's pairing ceremony with the code Carol typed (spec §3.1, §4.2,
+ * §6.1.3, §6.2, §4.3). *)
+let RequesterPairing(pw: bitstring) =
+  (* Fresh values of the ceremony, drawn before any input: the CPace
+   * scalar, the pair-specific static key and the Noise ephemeral. *)
+  new xa: cscalar;
+  new skr: xsec;
+  new ei: xsec;
+  (* Offer bootstrap over the transport in use. *)
+  in(pub, offer: bitstring);
+  let (=scheme_rapp, =wire_version, offer_id: bitstring, =suite_pairing,
+       granted: bitstring, =transports_all, =offer_ttl) = offer in
+  let oh = H((lbl_offer_hash, offer)) in
+  in(pub, tp: bitstring);
+  let ctx = (lbl_ctx, wire_version, suite_pairing, tp, cand(tp), oh, role_requester, role_custodian) in
+  let gen = h2g(pw, ctx, offer_id) in
+  (* CPace step 1. *)
+  let ya = cpt(gen, xa) in
+  out(pub, ya);
+  (* Step 2: verify T_B, then send T_A. *)
+  in(pub, (yb: cpoint, tb: bitstring));
+  let isk = H((lbl_isk, offer_id, cdh(yb, xa), ya, yb)) in
+  let th = H((lbl_transcript, offer_id, ctx, ya, yb)) in
+  let prk = hmac(th, isk) in
+  let psk = hmac(prk, lbl_psk) in
+  let ka = hmac(prk, lbl_ka) in
+  let kb = hmac(prk, lbl_kb) in
+  if tb = hmac(kb, (lbl_tb, th)) then
+  out(pub, hmac(ka, (lbl_ta, th)));
+  insert requester_psks(oh, tp, granted, psk, skr, ei).
+
+(* Bob's Noise_XXpsk3 initiator with the PSK of his CPace run. *)
+let RequesterHandshake(oh: bitstring, tp: bitstring, granted: bitstring, psk: bitstring,
+                       skr: xsec, ei: xsec) =
+  let pkr = xpk(skr) in
+  (* Noise_XXpsk3 initiator. *)
+  let prologue = (lbl_pairing_prologue, wire_version, suite_pairing, oh, tp) in
+  let h1 = hh((pn_xx, prologue)) in
+  let ck0 = pn_xx in
+  let eip = xpk(ei) in
+  let h2 = hh((h1, eip)) in
+  let ck1 = nck(ck0, xpub2b(eip)) in
+  let k1 = nk(ck0, xpub2b(eip)) in
+  let c1 = aead(k1, n0, h2, empty) in
+  let h3 = hh((h2, (n0, empty))) in
+  out(pub, (eip, c1));
+  in(pub, (erp: xpub, c2: bitstring, c3: bitstring));
+  let h4 = hh((h3, erp)) in
+  let ck2 = nck(ck1, xpub2b(erp)) in
+  let d_ee = xdh(erp, ei) in
+  let ck3 = nck(ck2, d_ee) in
+  let k3 = nk(ck2, d_ee) in
+  let xpub2b(pkc: xpub) = aead_open(k3, n0, h4, c2) in
+  let h5 = hh((h4, (n0, pkc))) in
+  let d_es = xdh(pkc, ei) in
+  let ck4 = nck(ck3, d_es) in
+  let k4 = nk(ck3, d_es) in
+  if aead_open(k4, n0, h5, c3) = empty then
+  let h6 = hh((h5, (n0, empty))) in
+  let c4 = aead(k4, n1, h6, xpub2b(pkr)) in
+  let h7 = hh((h6, (n1, pkr))) in
+  let d_se = xdh(erp, skr) in
+  let ck5 = nck(ck4, d_se) in
+  let ck6 = nck(ck5, psk) in
+  let k6 = nk3(ck5, psk) in
+  let h8 = hh((h7, nh(ck5, psk))) in
+  let c5 = aead(k6, n0, h8, empty) in
+  let h9 = hh((h8, (n0, empty))) in
+  out(pub, (c4, c5));
+  out(pub, h9);
+  let krc = sp1(ck6) in
+  let kcr = sp2(ck6) in
+  let psid = H((lbl_session_id, h9)) in
+  let pid = H((lbl_pair_id, h9)) in
+  insert requester_channels(oh, tp, granted, psk, skr, pkr, pkc, krc, kcr, psid, pid).
+
+(* Bob's side of the pairing channel. *)
+let RequesterPairingChannel(oh: bitstring, tp: bitstring, granted: bitstring, psk: bitstring,
+                            skr: xsec, pkr: xpub, pkc: xpub,
+                            krc: bitstring, kcr: bitstring, psid: bitstring, pid: bitstring) =
+  let params = (wire_version, suite_pairing, oh, tp, cand(tp)) in
+  (* pairing.hello with the requested profiles: exactly the offer's. *)
+  out(pub, aead(krc, n0, empty, (wire_version, psid, n0, t_pairing_hello, (params, name_bob, plat_bob, granted))));
+  in(pub, m1: bitstring);
+  let (=wire_version, =psid, =n0, =t_pairing_hello, (=params, nmc: bitstring, platc: bitstring))
+      = aead_open(kcr, n0, empty, m1) in
+  in(pub, m2: bitstring);
+  let (=wire_version, =psid, =n1, =t_pairing_confirm, =granted) = aead_open(kcr, n1, empty, m2) in
+  out(pub, aead(krc, n1, empty, (wire_version, psid, n1, t_pairing_confirm, granted)));
+  let gh = H((lbl_grants, granted)) in
+  event RequesterStored(pid, gh, pkc, pkr, name_bob);
+  out(pub, aead(krc, n2, empty, (wire_version, psid, n2, t_pairing_stored, pid)));
+  in(pub, m3: bitstring);
+  let (=wire_version, =psid, =n2, =t_pairing_stored, =pid) = aead_open(kcr, n2, empty, m3) in
+  event RequesterPairingActive(pid, gh, pkc, pkr, name_bob);
+  insert requester_pairs(pid, gh, skr, pkr, pkc);
+  out(pub, mark(psk, sec_psk_r)).
+
+
+(* ------------------------------------------------------------------ *)
+(* The system                                                         *)
+(* ------------------------------------------------------------------ *)
+
+process
+  (* Ceremonies whose code Carol typed into Bob. They share one code,
+   * which only adds to what a guess of it could test. *)
+    ( ! ( CustodianOffer(honest, code_w) | RequesterPairing(code_w) ) )
+  (* The ceremony whose code Carol typed into a compromised computer;
+   * its offer admits any number of attempts. *)
+  | ( new pw: bitstring; out(pub, pw); CustodianOffer(leaked, pw) )
+  (* Every confirmed CPace run hands its PSK to Noise. *)
+  | ( ! get custodian_psks(kind: bitstring, oh: bitstring, tp: bitstring, granted: bitstring,
+                           psk: bitstring, skc: xsec, er: xsec) in
+        CustodianPairing(kind, oh, tp, granted, psk, skc, er) )
+  | ( ! get requester_psks(oh: bitstring, tp: bitstring, granted: bitstring, psk: bitstring,
+                           skr: xsec, ei: xsec) in
+        RequesterHandshake(oh, tp, granted, psk, skr, ei) )
+  (* Every opened pairing channel runs its exchange. *)
+  | ( ! get custodian_channels(kind: bitstring, oh: bitstring, tp: bitstring, granted: bitstring,
+                               psk: bitstring, skc: xsec, pkc: xpub, pkr: xpub,
+                               krc: bitstring, kcr: bitstring, psid: bitstring, pid: bitstring) in
+        CustodianPairingChannel(kind, oh, tp, granted, psk, skc, pkc, pkr, krc, kcr, psid, pid) )
+  | ( ! get requester_channels(oh: bitstring, tp: bitstring, granted: bitstring, psk: bitstring,
+                               skr: xsec, pkr: xpub, pkc: xpub,
+                               krc: bitstring, kcr: bitstring, psid: bitstring, pid: bitstring) in
+        RequesterPairingChannel(oh, tp, granted, psk, skr, pkr, pkc, krc, kcr, psid, pid) )
+  (* Every stored pairing publishes withdrawn records and its key markers. *)
+  | ( ! get custodian_pairs(kind: bitstring, pid: bitstring, gh: bitstring, granted: bitstring,
+                            skc: xsec, pkc: xpub, pkr: xpub, nm: bitstring) in
+        CustodianAnnouncements(kind, pid, skc, pkr) )
+  | ( ! get requester_pairs(pid: bitstring, gh: bitstring, skr: xsec, pkr: xpub, pkc: xpub) in
+        RequesterKeyMarkers(pid, skr, pkc) ) 

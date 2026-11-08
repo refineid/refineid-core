@@ -12,44 +12,55 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! PIN management on a secure channel PACE opened with the PUK or PIN 1.
+//! PIN management on a secure channel PACE opened with the PUK, PIN 1 or
+//! PIN 2, and the PIN 2 presentation on a channel PACE opened with PIN 2.
 //!
 //! The organizational card answers every command on its contactless
 //! interface only after PACE, and enables PACE with PIN 1, PIN 2 or the
 //! PUK (FINEID S4-2 v4.0 sections 4.2 and 6). A channel PACE opened with
 //! the PUK is where a blocked PIN is set -- the activation of a card
 //! that ships with blocked PINs (FINEID S4-1 v4.2 section 4.6.1) and the
-//! unblock -- and a channel PACE opened with PIN 1 is where PIN 1 is
-//! changed. BSI TR-03110-3 section B.7.1 has the terminal unblock or
-//! change the PIN on such a channel with RESET RETRY COUNTER carrying only
-//! the new PIN: PACE with the PUK or the PIN is the authorisation, and the
-//! credential is not sent again. FINEID S4-2 v4.0 section 4.3 states the
+//! unblock -- and a channel PACE opened with PIN 1 or PIN 2 is where
+//! that PIN is changed. BSI TR-03110-3 section B.7.1 has the terminal
+//! unblock or change the PIN on such a channel with RESET RETRY COUNTER
+//! carrying only the new PIN: PACE with the PUK or the PIN is the
+//! authorisation, and the credential is not sent again. FINEID S4-2 v4.0 section 4.3 states the
 //! reset's contactless access condition as the PUK's security
 //! environment together with PACE, and the change's as PACE alone, with
 //! the current PIN in the command (IAS ECC v1.0.1 section 9.4.2). Whether
 //! the organizational card counts a completed PACE with the PUK, or with
-//! PIN 1, as the authorisation its reset needs is not stated there, so
+//! a PIN, as the authorisation its reset needs is not stated there, so
 //! each operation takes the choice as a [`ChannelProof`]: rely on the
 //! handshake, or present the credential once more inside the channel.
 //! Real hardware decides which one the card accepts.
 //!
 //! The channel types live in `refineid-pace`, which implements
-//! [`PukPaceChannel`] and [`Pin1PaceChannel`] only for the channels the
-//! matching password opened; the operations here exist only on those
-//! channels. Presenting the credential again is floored like every other
-//! presentation, on the channel's own record of the counter: the
-//! `MSE:Set AT` answer that opened the channel, lowered by every later
-//! answer that reported fewer tries. The counter-safe empty VERIFY is not
-//! the source, because the organizational card does not answer it over
-//! secure messaging with a counter.
+//! [`PukPaceChannel`], [`Pin1PaceChannel`] and [`Pin2PaceChannel`] only
+//! for the channels the matching password opened; the operations here
+//! exist only on those channels. A channel PACE opened with PIN 2 signs
+//! once on the handshake's presentation, and every further signature on
+//! it presents PIN 2 again with
+//! [`Pin2PaceChannelOps::verify_pin2_after_pin2_pace`]. Presenting the
+//! credential again is floored by the one rule
+//! every presentation follows (`check_retry_floor`), on the channel's
+//! own record of the counter: the `MSE:Set AT` answer that opened the
+//! channel, lowered by every later answer that reported fewer tries. The
+//! record stands in for the counter-safe probe the plain primitives
+//! send, because the organizational card does not answer the empty
+//! VERIFY over secure messaging with a counter; the operations here send
+//! the crate-private commands directly, so the record is read once and
+//! no second probe is made.
 
 use refineid_apdu::CardTransport;
+use refineid_pkcs15::{Pkcs15Error, Pkcs15Ops as _};
 
 use crate::credentials::{Pin1, Pin2, Puk};
 use crate::manage::{ManageOutcome, change, reset_new_only, verify_puk};
 use crate::pin_lengths::CardPinLengths;
 use crate::retry_risk::{FlooredCredential, check_retry_floor};
-use crate::verify::{AuthError, PinReferenceScheme, PinSlot, PinStatus};
+use crate::verify::{
+    AuthError, PinReferenceScheme, PinSlot, PinStatus, VerifyOutcome, verify_digits,
+};
 
 /// The numbering every operation here addresses the card under. PACE
 /// with a PIN or the PUK exists only on the organizational card (FINEID
@@ -107,6 +118,163 @@ pub trait Pin1PaceChannel: CardTransport {
     fn lower_pin1_counter(&mut self, answer: ManageOutcome);
 }
 
+/// A secure channel PACE opened with PIN 2.
+///
+/// Implemented by `refineid-pace` for the channel only a handshake with a
+/// [`Pin2`] produces. The channel keeps PIN 2's counter as the card last
+/// reported it: the `MSE:Set AT` answer the retry floor served, then
+/// every VERIFY's answer on the channel ([`counter_after_verify`]). An
+/// accepted VERIFY leaves PIN 2 verified with its counter at the limit,
+/// so it is the one answer that raises the record.
+pub trait Pin2PaceChannel: CardTransport {
+    /// PIN 2's counter as the card last reported it on this channel.
+    fn pin2_counter(&self) -> PinStatus;
+
+    /// Settle the record by the card's answer to a PIN 2 VERIFY on this
+    /// channel; see [`counter_after_verify`].
+    fn settle_pin2_counter(&mut self, answer: VerifyOutcome);
+
+    /// Lower the record by the card's answer to a PIN 2 change on this
+    /// channel; see [`lowered_counter`]. An accepted change leaves the
+    /// record as it stands.
+    fn lower_pin2_counter(&mut self, answer: ManageOutcome);
+}
+
+/// Why a PIN 2 change on a channel PACE opened with PIN 2 was not made.
+#[derive(Debug)]
+pub enum Pin2ChangeError<E> {
+    /// A refusal before any command, or a failure of the change command
+    /// itself: [`AuthError::PinLength`] and [`AuthError::RetryFloor`]
+    /// send nothing.
+    Auth(AuthError<E>),
+    /// DF.ESIGN could not be made current; no PIN was sent.
+    Directory(Pkcs15Error<E>),
+}
+
+impl<E: core::fmt::Display> core::fmt::Display for Pin2ChangeError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Auth(e) => write!(f, "change Signature PIN 2: {e}"),
+            Self::Directory(e) => write!(f, "select DF.ESIGN: {e}"),
+        }
+    }
+}
+
+impl<E: core::fmt::Debug + core::fmt::Display + 'static> core::error::Error for Pin2ChangeError<E> {}
+
+/// The PIN 2 presentation and the PIN 2 change on a channel PACE opened
+/// with PIN 2.
+///
+/// Exists only on a [`Pin2PaceChannel`]. The organizational card does
+/// not answer the counter-safe empty VERIFY over secure messaging with a
+/// counter, so the floor is applied to the channel's own record instead
+/// of a probe, and no probe is sent.
+pub trait Pin2PaceChannelOps: Pin2PaceChannel + Sized {
+    /// VERIFY PIN 2 inside the channel under the retry floor on the
+    /// channel's record: refused at two or one tries left or an unknown
+    /// record, sent otherwise. The card's answer settles the record.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::RetryFloor`] when the record reads two or one tries
+    /// left or is unknown; nothing is sent. [`AuthError`] on a transport
+    /// failure or state transition. A wrong PIN is
+    /// [`VerifyOutcome::WrongPin`], a blocked PIN
+    /// [`VerifyOutcome::Locked`], the card's own answers.
+    fn verify_pin2_after_pin2_pace(
+        &mut self,
+        pin: Pin2,
+    ) -> Result<VerifyOutcome, AuthError<Self::Error>> {
+        check_retry_floor(FlooredCredential::Pin2, self.pin2_counter())
+            .map_err(AuthError::RetryFloor)?;
+        let outcome = verify_digits(self, CHANNEL_NUMBERING, PinSlot::Pin2, pin.digits())?;
+        self.settle_pin2_counter(outcome);
+        Ok(outcome)
+    }
+
+    /// Set `new` as PIN 2, from DF.ESIGN.
+    ///
+    /// PIN 2 is the Signature PIN SIG, local to DF.ESIGN (FINEID S4-2
+    /// v4.0 section 4.2), and DF.ESIGN is the directory every PIN 2
+    /// command of the organizational card has been observed in, so this
+    /// selects DF.ESIGN by name from the MF before the change, after
+    /// every refusal that sends nothing. Under
+    /// [`ChannelProof::PaceHandshake`] one RESET RETRY COUNTER carries
+    /// only the new PIN, the change BSI TR-03110-3 section B.7.1 defines
+    /// after PACE with the PIN; nothing presents PIN 2. Under
+    /// [`ChannelProof::PresentAgain`] the retry floor is applied to the
+    /// channel's PIN 2 record, one CHANGE REFERENCE DATA carries the
+    /// current PIN and the new one, and the record is lowered by the
+    /// answer.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::PinLength`] when the card does not accept the length
+    /// of an entry, and [`AuthError::RetryFloor`] when the PIN 2 record
+    /// reads two or one tries left or is unknown, both under
+    /// [`Pin2ChangeError::Auth`]; nothing is sent either way. At no tries
+    /// left or blocked the card answers for itself.
+    /// [`Pin2ChangeError::Directory`] when DF.ESIGN cannot be made
+    /// current; no PIN is sent. [`Pin2ChangeError::Auth`] on a transport
+    /// failure or state transition of the change. A wrong current PIN is
+    /// [`ManageOutcome::WrongCredential`]; a reset the card does not
+    /// authorise on this channel is [`ManageOutcome::Other`].
+    fn change_pin2_after_pin2_pace(
+        &mut self,
+        lengths: &CardPinLengths,
+        new: Pin2,
+        proof: ChannelProof<Pin2>,
+    ) -> Result<ManageOutcome, Pin2ChangeError<Self::Error>> {
+        lengths
+            .check_pin2(&new)
+            .map_err(|refusal| Pin2ChangeError::Auth(AuthError::PinLength(refusal)))?;
+        if let ChannelProof::PresentAgain(current) = &proof {
+            lengths
+                .check_pin2(current)
+                .map_err(|refusal| Pin2ChangeError::Auth(AuthError::PinLength(refusal)))?;
+            check_retry_floor(FlooredCredential::Pin2, self.pin2_counter())
+                .map_err(|refusal| Pin2ChangeError::Auth(AuthError::RetryFloor(refusal)))?;
+        }
+        self.select_esign_directory()
+            .map_err(Pin2ChangeError::Directory)?;
+        let scheme = CHANNEL_NUMBERING;
+        match proof {
+            ChannelProof::PaceHandshake => {
+                reset_new_only(self, scheme, PinSlot::Pin2, new.digits())
+                    .map_err(Pin2ChangeError::Auth)
+            }
+            ChannelProof::PresentAgain(current) => {
+                let outcome = change(self, scheme, PinSlot::Pin2, current.digits(), new.digits())
+                    .map_err(Pin2ChangeError::Auth)?;
+                self.lower_pin2_counter(outcome);
+                Ok(outcome)
+            }
+        }
+    }
+}
+
+impl<T: Pin2PaceChannel> Pin2PaceChannelOps for T {}
+
+/// The counter `record` after the card answered a VERIFY with `answer`.
+///
+/// An accepted VERIFY sets the counter to its limit and the verified
+/// flag (FINEID S1 v4.2 section 3.5), so the record reads verified
+/// whatever it held. Every other answer lowers the record as
+/// [`lowered_counter`] does: a wrong PIN to the tries the card reports,
+/// or blocked at none; a blocked answer to blocked; an unknown answer to
+/// unknown, which the floor refuses.
+#[must_use]
+pub const fn counter_after_verify(record: PinStatus, answer: VerifyOutcome) -> PinStatus {
+    match answer {
+        VerifyOutcome::Ok => PinStatus::Verified,
+        VerifyOutcome::WrongPin { retries_left } => {
+            lowered_counter(record, ManageOutcome::WrongCredential { retries_left })
+        }
+        VerifyOutcome::Locked => lowered_counter(record, ManageOutcome::Locked),
+        VerifyOutcome::Other(sw) => lowered_counter(record, ManageOutcome::Other(sw)),
+    }
+}
+
 /// The counter `record` after the card answered a presentation with
 /// `answer`, never higher than `record`.
 ///
@@ -156,8 +324,9 @@ pub trait PukPaceChannelOps: PukPaceChannel + Sized {
     /// # Errors
     ///
     /// [`AuthError::PinLength`] when the card does not accept the length
-    /// of an entry, and [`AuthError::RetryFloor`] when the PUK record is
-    /// below the floor, blocked or unknown; nothing is sent either way.
+    /// of an entry, and [`AuthError::RetryFloor`] when the PUK record
+    /// reads two or one tries left or is unknown; nothing is sent either
+    /// way. At no tries left or blocked the card answers for itself.
     /// [`AuthError`] on a transport failure or state transition. A
     /// refused PUK is [`ManageOutcome::WrongCredential`]; a reset the card
     /// does not authorise on this channel is [`ManageOutcome::Other`].
@@ -206,8 +375,9 @@ pub trait Pin1PaceChannelOps: Pin1PaceChannel + Sized {
     /// # Errors
     ///
     /// [`AuthError::PinLength`] when the card does not accept the length
-    /// of an entry, and [`AuthError::RetryFloor`] when the PIN 1 record is
-    /// below the floor, blocked or unknown; nothing is sent either way.
+    /// of an entry, and [`AuthError::RetryFloor`] when the PIN 1 record
+    /// reads two or one tries left or is unknown; nothing is sent either
+    /// way. At no tries left or blocked the card answers for itself.
     /// [`AuthError`] on a transport failure or state transition. A wrong
     /// current PIN is [`ManageOutcome::WrongCredential`]; a reset the card
     /// does not authorise on this channel is [`ManageOutcome::Other`].
@@ -268,13 +438,15 @@ mod tests {
     use refineid_pkcs15::PasswordLengthRange;
 
     use super::{
-        CHANNEL_NUMBERING, ChannelProof, PukPaceChannel, PukPaceChannelOps as _, lowered_counter,
+        CHANNEL_NUMBERING, ChannelProof, PukPaceChannel, PukPaceChannelOps as _,
+        counter_after_verify, lowered_counter,
     };
     use crate::credentials::{Pin1, Puk, UnvalidatedSecret};
     use crate::manage::ManageOutcome;
     use crate::pin_lengths::CardPinLengths;
     use crate::verify::AuthError;
     use crate::verify::PinStatus;
+    use crate::verify::VerifyOutcome;
 
     /// Tries of a pristine credential.
     const PRISTINE: u8 = 5;
@@ -377,6 +549,55 @@ mod tests {
         assert_eq!(
             lowered_counter(remaining(BELOW_FLOOR), wrong(PRISTINE)),
             remaining(BELOW_FLOOR)
+        );
+    }
+
+    #[test]
+    fn an_accepted_verify_leaves_the_record_verified_whatever_it_held() {
+        for record in [
+            remaining(PRISTINE),
+            remaining(BELOW_FLOOR),
+            PinStatus::Locked,
+            PinStatus::NoInfo,
+        ] {
+            assert_eq!(
+                counter_after_verify(record, VerifyOutcome::Ok),
+                PinStatus::Verified
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_verify_lowers_the_record_like_any_presentation() {
+        let wrong_verify = |count| VerifyOutcome::WrongPin {
+            retries_left: tries(count),
+        };
+        assert_eq!(
+            counter_after_verify(remaining(PRISTINE), wrong_verify(BELOW_FLOOR)),
+            remaining(BELOW_FLOOR)
+        );
+        assert_eq!(
+            counter_after_verify(PinStatus::Verified, wrong_verify(AT_FLOOR)),
+            remaining(AT_FLOOR)
+        );
+        assert_eq!(
+            counter_after_verify(remaining(AT_FLOOR), wrong_verify(0)),
+            PinStatus::Locked
+        );
+        assert_eq!(
+            counter_after_verify(remaining(PRISTINE), VerifyOutcome::Locked),
+            PinStatus::Locked
+        );
+        assert_eq!(
+            counter_after_verify(
+                remaining(PRISTINE),
+                VerifyOutcome::Other(StatusWord::from_u16(UNMODELED_SW))
+            ),
+            PinStatus::NoInfo
+        );
+        assert_eq!(
+            counter_after_verify(PinStatus::Locked, wrong_verify(PRISTINE)),
+            PinStatus::Locked
         );
     }
 

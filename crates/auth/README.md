@@ -8,10 +8,14 @@ validates once and reconstructs the non-clonable, zeroizing `Pin1` and
 PIN through a crate-private path, pad it to the stored length on a
 citizen card, and ship it only as a credential command, consumed exactly once; the slot is
 fixed by the argument type. The counter-safe status probe reads the
-retry state without spending a counter, and `check_retry_floor` serves a
-PIN 1, PIN 2 or PUK attempt only at five, four or three tries left -- the
-one floor every surface stops at. Setting a new PIN with the PUK is gated
-by the PUK's own counter, not the target PIN's.
+retry state without spending a counter, and every VERIFY, change,
+unblock and activation sends that probe first and applies
+`check_retry_floor` to its answer -- the one rule for every credential:
+refused at two or one tries left or an unreadable counter, sent
+otherwise, the card answering for itself at zero or blocked. The
+primitives enforce it themselves, so no caller can spend a try by
+mistake. Setting a new PIN with the PUK is gated by the PUK's own
+counter, not the target PIN's.
 
 Both citizen and organizational cards are supported.
 `resolve_pin_reference_scheme` settles which credential numbering the card

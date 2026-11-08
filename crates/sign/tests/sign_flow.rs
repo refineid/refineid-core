@@ -28,7 +28,8 @@ use refineid_apdu::{
 };
 use refineid_auth::verify::{PIN_PAD_BYTE, VERIFY_INS, VERIFY_P1};
 use refineid_auth::{
-    PIN_STORED_LENGTH, Pin2, PinReferenceScheme, PinSlot, UnvalidatedSecret, VerifyOutcome,
+    AuthError, FlooredCredential, PIN_STORED_LENGTH, Pin2, PinReferenceScheme, PinSlot,
+    RetryFloorRefusal, UnvalidatedSecret, VerifyOutcome,
 };
 use refineid_pkcs15::{DF_ESIGN_FID, ESIGN_AID, Pkcs15Error};
 use refineid_sign::commands::{
@@ -46,6 +47,10 @@ const DIGEST_FILL: u8 = 0x5A;
 const SIG_FILL: u8 = 0xC3;
 /// The counter a refused VERIFY reports.
 const TRIES_AFTER_WRONG: u8 = 4;
+/// The counter of a pristine PIN 2, which the retry floor serves.
+const TRIES_PRISTINE: u8 = 5;
+/// The highest counter the retry floor refuses.
+const TRIES_BELOW_FLOOR: u8 = 2;
 /// SELECT P1 for a child DF under the current DF, the fallback the
 /// directory walk tries second (FINEID S1 v4.2 section 3.2.2).
 const SELECT_CHILD_DF_P1: u8 = 0x01;
@@ -193,6 +198,24 @@ fn select_esign_by_name_wire() -> Vec<u8> {
     .to_vec()
 }
 
+/// The counter-safe probe of PIN 2 under `scheme`: a VERIFY header with
+/// no data field, which every VERIFY carrying PIN 2 sends first.
+fn probe_pin2_wire(scheme: PinReferenceScheme) -> Vec<u8> {
+    vec![
+        ApduClass::Plain.as_byte(),
+        VERIFY_INS,
+        VERIFY_P1,
+        scheme.reference(PinSlot::Pin2),
+    ]
+}
+
+/// The probe's answer at `tries` left, a count the retry floor serves.
+fn probe_served(tries: u8) -> ResponseApdu {
+    status(StatusWord::PinIncorrect {
+        retries: PinRetries::from_nibble(tries).expect("counter value"),
+    })
+}
+
 /// VERIFY PIN 2 under `scheme`: the organizational card is sent the bare
 /// digits, the citizen card the block padded to the stored length.
 fn verify_pin2_wire(scheme: PinReferenceScheme) -> Vec<u8> {
@@ -322,6 +345,11 @@ fn citizen_qualified_ecdsa_p384_verifies_pin2_in_place_and_signs_over_the_loaded
     assert_eq!(mse.last().copied(), Some(KEY_REF_SIGN));
     let mut transport = Scripted::with_paths(vec![
         (
+            Path::Plain,
+            probe_pin2_wire(PinReferenceScheme::Citizen),
+            probe_served(TRIES_PRISTINE),
+        ),
+        (
             Path::Credential,
             verify_pin2_wire(PinReferenceScheme::Citizen),
             success(vec![]),
@@ -377,8 +405,9 @@ fn citizen_ecdsa_p384_sha256_uses_the_negotiated_hash_reference() {
 }
 
 /// The organizational qualified sequence up to the signature: SELECT MF,
-/// SELECT DF.ESIGN by name, VERIFY PIN 2 under the organizational
-/// reference there, and MSE:Set naming the DF.ESIGN-local key.
+/// SELECT DF.ESIGN by name, the counter-safe probe of PIN 2, VERIFY
+/// PIN 2 under the organizational reference there, and MSE:Set naming
+/// the DF.ESIGN-local key.
 fn organizational_unlock_steps(alg: SignatureAlgRef) -> Vec<(Path, Vec<u8>, ResponseApdu)> {
     let mse = mse_wire(SignScheme::Organizational, alg, KeyRef::Sign);
     // The organizational qualified key is named by its local reference,
@@ -387,6 +416,11 @@ fn organizational_unlock_steps(alg: SignatureAlgRef) -> Vec<(Path, Vec<u8>, Resp
     vec![
         (Path::Plain, select_mf_wire(), success(vec![])),
         (Path::Plain, select_esign_by_name_wire(), success(vec![])),
+        (
+            Path::Plain,
+            probe_pin2_wire(PinReferenceScheme::Organizational),
+            probe_served(TRIES_PRISTINE),
+        ),
         (
             Path::Credential,
             verify_pin2_wire(PinReferenceScheme::Organizational),
@@ -416,7 +450,7 @@ fn organizational_qualified_rsa_enters_esign_verifies_pin2_and_signs_inline() {
     assert_eq!(result.as_bytes(), signature.as_slice());
     assert!(
         transport.drained(),
-        "SELECT MF, SELECT DF.ESIGN, VERIFY, MSE:Set and one PSO:CDS, nothing else"
+        "SELECT MF, SELECT DF.ESIGN, the probe, VERIFY, MSE:Set and one PSO:CDS, nothing else"
     );
 }
 
@@ -514,6 +548,11 @@ fn a_refused_pin2_yields_no_key() {
         (Path::Plain, select_mf_wire(), success(vec![])),
         (Path::Plain, select_esign_by_name_wire(), success(vec![])),
         (
+            Path::Plain,
+            probe_pin2_wire(PinReferenceScheme::Organizational),
+            probe_served(TRIES_PRISTINE),
+        ),
+        (
             Path::Credential,
             verify_pin2_wire(PinReferenceScheme::Organizational),
             status(wrong),
@@ -528,6 +567,32 @@ fn a_refused_pin2_yields_no_key() {
         QualifiedUnlockError::PinRefused(VerifyOutcome::WrongPin { .. })
     ));
     assert!(transport.drained(), "no MSE:Set after a refused PIN 2");
+}
+
+#[test]
+fn a_pin2_at_two_tries_left_is_refused_after_the_probe_and_never_sent() {
+    // The script ends at the probe: a VERIFY carrying PIN 2 would fail it.
+    let mut transport = Scripted::with_paths(vec![
+        (Path::Plain, select_mf_wire(), success(vec![])),
+        (Path::Plain, select_esign_by_name_wire(), success(vec![])),
+        (
+            Path::Plain,
+            probe_pin2_wire(PinReferenceScheme::Organizational),
+            probe_served(TRIES_BELOW_FLOOR),
+        ),
+    ]);
+
+    let error = transport
+        .unlock_qualified_key(SignScheme::Organizational, pin2())
+        .expect_err("the retry floor refuses PIN 2");
+    assert!(matches!(
+        error,
+        QualifiedUnlockError::Verify(AuthError::RetryFloor(RetryFloorRefusal::TriesBelowFloor {
+            credential: FlooredCredential::Pin2,
+            ..
+        }))
+    ));
+    assert!(transport.drained(), "nothing after the probe");
 }
 
 #[test]

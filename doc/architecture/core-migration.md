@@ -138,8 +138,10 @@ The fifth slice admits PIN verification in `refineid-auth`:
 - the counter-safe status probe reads the retry state without spending a
   counter, on the plain path with no credential;
 - the typed outcomes and status-word classifiers, and the retry floor
-  every surface stops at: a PIN 1 or PIN 2 attempt is served only at
-  five, four or three tries left.
+  the VERIFY itself applies to the probe it sends first: a PIN 1 or
+  PIN 2 attempt is refused at two or one tries left or an unreadable
+  counter, and sent otherwise, the card answering for itself at zero or
+  blocked.
 
 VERIFY is retry-consuming: the classifiers, the credential-command wire,
 and the retry-risk policy are covered by scripted-transport and unit
@@ -320,7 +322,15 @@ applies.
 The fourteenth slice admits the paired phone as a PKCS#11 slot in
 `refineid-pkcs11`, behind one seam: a host installs a `RemoteTokenSource`
 before it hands out the function list, and the module reads from it, at
-every slot refresh, the one pairing offered right now. An offer carries a
+every call that can tell a caller whether the phone's token is there or
+what it holds, the one pairing offered right now. A browser may make
+those calls without listing the slots first, so a reading on them is a
+request for the card: the source dials the phone and may hold the call
+up to one shared bound, `REMOTE_WAKE_WAIT`, for a session to confirm
+the card; no call is granted a wait for a short memo after a wait that
+raised the token, nor for a longer quiet after one that raised none, a
+call arriving during a wait shares it, and the non-blocking slot-event
+poll never waits. An offer carries a
 certificate whose fingerprint the phone confirmed on a session, and keeps
 carrying it between sessions until the host withdraws it as RAPP
 v26.11.2 section 8.4 item 3 says; the token exists exactly then, its
@@ -373,13 +383,15 @@ S1 v4.0, organizational cards, section 2.1) over NIST curves:
   `check_retry_floor` decides before the first `GENERAL AUTHENTICATE`; a
   counter answer to a later round is a typed wrong PIN;
 - the PUK is a fourth PACE password, under the organization numbering's
-  PUK reference, floored by the PUK's last-tries rule (served at no
+  PUK reference, floored by the same rule as the PINs (served at no
   tries left, where the card answers for itself) and reported as a typed
   wrong PUK;
   the channel it opens, and the one PIN 1 opens, carry the counter the
   floor served, lowered by every later refusal, and are the only
   channels with the PIN resets (`PukPaceChannelOps`) and the PIN 1
-  change (`Pin1PaceChannelOps`) of `refineid-auth`, each taking an
+  change (`Pin1PaceChannelOps`) of `refineid-auth`, as the channel PIN 2
+  opens is the only one with the PIN 2 change (`Pin2PaceChannelOps`),
+  each taking an
   explicit `ChannelProof` -- rely on the handshake or present the
   credential again -- because which one the card accepts is a hardware
   finding;

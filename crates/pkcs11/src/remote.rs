@@ -21,8 +21,30 @@
 //! authentication certificate, and a way to hand that phone a
 //! [`SignatureRequest`] and get the signature bytes back. A host
 //! installs one [`RemoteTokenSource`] before the function list is
-//! handed out; the module reads offers from it at every slot refresh
-//! and dispatches `C_Sign` to it for a remote slot.
+//! handed out; the module reads the offer from it at every call that
+//! can tell a caller whether the phone's token is there or what it
+//! holds, and dispatches `C_Sign` to it for a remote slot.
+//!
+//! A browser asks for the token at a time of its own choosing and may
+//! ask only once: during a TLS handshake Firefox learns whether the
+//! token is there from `C_GetSlotInfo`, and reads it through
+//! `C_GetTokenInfo`, `C_OpenSession` and the object search; it lists
+//! the slots only every few seconds, so a handshake may make no
+//! `C_GetSlotList` call at all, and it keeps the answer it got. A
+//! reading on each of these calls may therefore
+//! wait, for at most [`REMOTE_WAKE_WAIT`], while the source dials the
+//! phone and a session confirms the card (RAPP v26.11.2 section 8.4
+//! item 3: a request with no session open dials the Custodian and is
+//! held). No call is granted a wait for [`REMOTE_WAKE_MEMO`] after a
+//! wait that raised the token, nor for [`REMOTE_WAKE_QUIET`] after one
+//! that raised none, so the many calls of one handshake, and a
+//! browser polling the slot, answer at once; a call made while
+//! another waits waits with it, never longer than the bound from its
+//! own start. The non-blocking slot-event poll never waits. The
+//! module offers only what the source offers on that reading, and the
+//! source offers only a certificate the phone confirmed on a session;
+//! the wait is for that confirmation, and discovery alone never raises
+//! a token.
 //!
 //! A token is offered on a certificate whose fingerprint the phone
 //! confirmed on a session, and the module follows the offer: the token
@@ -47,7 +69,8 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::time::Duration;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use refineid_remote::{DisplayText, SignatureRequest};
 
@@ -63,6 +86,25 @@ use crate::slot_kind::RemoteSlotId;
 /// within what a TLS peer waits for the handshake. It travels with
 /// every request as the operation's lifetime.
 pub const REMOTE_SIGN_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The longest one PKCS#11 call waits for the paired phone to raise
+/// its token: the source dials the phone and reads its card within it
+/// on a local network, and a browser's TLS handshake tolerates it.
+/// The one bound on every wait for the token, whichever call asks.
+pub const REMOTE_WAKE_WAIT: Duration = Duration::from_secs(3);
+
+/// After a wait that raised the token, how long later calls read the
+/// source without being granted a wait: the calls of one handshake
+/// that follow it answer at once from what the wait found.
+pub const REMOTE_WAKE_MEMO: Duration = Duration::from_secs(5);
+
+/// After a wait that raised no token, how long later calls read the
+/// source without waiting: longer than one handshake's calls and a
+/// browser's slot polling between them, so a phone out of reach holds
+/// a browser for one [`REMOTE_WAKE_WAIT`] at a time. The source keeps
+/// dialing meanwhile and raises the token when a session confirms the
+/// card.
+pub const REMOTE_WAKE_QUIET: Duration = Duration::from_secs(30);
 
 /// The authentication certificate of the card the phone serves: one
 /// whose fingerprint the phone confirmed on a session (RAPP v26.11.2
@@ -84,7 +126,7 @@ impl SessionCertificate {
     }
 }
 
-/// What one paired phone offers at the moment of a slot refresh.
+/// What one paired phone offers at the moment it is read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteOffer {
     pair_id: RemoteSlotId,
@@ -221,12 +263,11 @@ impl core::error::Error for RemoteSignError {}
 /// A host's paired phone, as the module sees it.
 ///
 /// Every method may be called from any thread the host runs PKCS#11
-/// on. [`RemoteTokenSource::offered`] runs under the module lock at
-/// every slot refresh and so answers from state the host already
-/// holds, without a network round trip. [`RemoteTokenSource::sign`]
-/// runs with the module lock released and may take as long as the
-/// holder takes to answer on the phone, up to the deadline it is
-/// given.
+/// on, and each runs with the module lock released.
+/// [`RemoteTokenSource::offered`] answers from state the host already
+/// holds, waiting only as long as it is told. [`RemoteTokenSource::sign`]
+/// may take as long as the holder takes to answer on the phone, up to
+/// the deadline it is given.
 pub trait RemoteTokenSource: Send + Sync {
     /// The one pairing offered right now, or none.
     ///
@@ -235,7 +276,16 @@ pub trait RemoteTokenSource: Send + Sync {
     /// included; the module withdraws the token the moment the offer
     /// carries none, and raises a new token, with new object handles,
     /// when a certificate is offered again.
-    fn offered(&self) -> Option<RemoteOffer>;
+    ///
+    /// When the pairing's slot stands without a token and no session
+    /// to the phone is open, the call is a request for the card: the
+    /// source dials the phone (RAPP v26.11.2 section 8.3) and waits up
+    /// to `wait` for a session to confirm the card, then answers with
+    /// what it offers. It answers at once otherwise, and always within
+    /// `wait`, its own start-up included; a zero `wait` never blocks
+    /// and dials nothing. The module passes at most
+    /// [`REMOTE_WAKE_WAIT`].
+    fn offered(&self, wait: Duration) -> Option<RemoteOffer>;
 
     /// Asks the phone of `pair_id` to sign `request`, showing
     /// `context` to the holder, and returns the signature bytes in
@@ -300,9 +350,315 @@ pub(crate) fn installed() -> Option<&'static dyn RemoteTokenSource> {
     REMOTE_SOURCE.get().map(AsRef::as_ref)
 }
 
+/// Whether a reading may wait for the phone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Patience {
+    /// The caller asks for the token: the reading may wait as the
+    /// [`WakeGate`] allows.
+    Wake,
+    /// The caller must not block: the reading answers at once.
+    AtOnce,
+}
+
+/// What one reading of the installed source found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemoteReading {
+    /// No host installed a source: no remote slot exists.
+    NoSource,
+    /// The source's offer on this reading.
+    Offer(Option<RemoteOffer>),
+}
+
+/// The last wait a [`WakeGate`] granted.
+#[derive(Debug, Clone, Copy)]
+struct GrantedWait {
+    /// When the reading that was granted it began.
+    at: Instant,
+    /// Whether the reading ended with a token offered.
+    raised: bool,
+}
+
+/// Grants the waits of the readings: at most `wait` from a reading's
+/// own start, none for `memo` after a wait that raised the token, and
+/// none for `quiet` after a wait that raised none.
+///
+/// A waiting reading holds the gate, so a reading that arrives
+/// meanwhile waits for its answer instead of starting a wait of its
+/// own, and reads at once when the gate opens.
+#[derive(Debug)]
+pub(crate) struct WakeGate {
+    wait: Duration,
+    memo: Duration,
+    quiet: Duration,
+    last: Mutex<Option<GrantedWait>>,
+}
+
+impl WakeGate {
+    /// A gate granting `wait` per reading, none for `memo` after a
+    /// wait that raised the token and none for `quiet` after one that
+    /// raised none.
+    pub(crate) const fn new(wait: Duration, memo: Duration, quiet: Duration) -> Self {
+        Self {
+            wait,
+            memo,
+            quiet,
+            last: Mutex::new(None),
+        }
+    }
+
+    /// Reads `source` with the wait this gate grants.
+    pub(crate) fn read(
+        &self,
+        source: &dyn RemoteTokenSource,
+        patience: Patience,
+    ) -> Option<RemoteOffer> {
+        if patience == Patience::AtOnce {
+            return source.offered(Duration::ZERO);
+        }
+        let asked = Instant::now();
+        let Ok(mut last) = self.last.lock() else {
+            return source.offered(Duration::ZERO);
+        };
+        let now = Instant::now();
+        let resting = last.is_some_and(|granted| {
+            let window = if granted.raised {
+                self.memo
+            } else {
+                self.quiet
+            };
+            now.saturating_duration_since(granted.at) < window
+        });
+        let wait = if resting {
+            Duration::ZERO
+        } else {
+            self.wait
+                .saturating_sub(now.saturating_duration_since(asked))
+        };
+        if wait.is_zero() {
+            drop(last);
+            return source.offered(Duration::ZERO);
+        }
+        let offer = source.offered(wait);
+        *last = Some(GrantedWait {
+            at: now,
+            raised: offer.as_ref().and_then(RemoteOffer::certificate).is_some(),
+        });
+        offer
+    }
+
+    /// Forgets the last granted wait.
+    #[cfg(test)]
+    pub(crate) fn reset(&self) {
+        if let Ok(mut last) = self.last.lock() {
+            *last = None;
+        }
+    }
+}
+
+/// The gate every reading of the installed source passes.
+static WAKE_GATE: WakeGate = WakeGate::new(REMOTE_WAKE_WAIT, REMOTE_WAKE_MEMO, REMOTE_WAKE_QUIET);
+
+/// Reads the installed source through the process's [`WakeGate`].
+///
+/// Never called with the module lock held: a reading may wait.
+pub(crate) fn read_installed(patience: Patience) -> RemoteReading {
+    installed().map_or(RemoteReading::NoSource, |source| {
+        RemoteReading::Offer(WAKE_GATE.read(source, patience))
+    })
+}
+
+/// Forgets the process gate's last granted wait, for tests that
+/// drive the entry points one after another.
+#[cfg(test)]
+pub(crate) fn reset_wake_gate_for_test() {
+    WAKE_GATE.reset();
+}
+
 #[cfg(test)]
 mod tests {
-    use super::RemoteSignError;
+    use super::{
+        Duration, Instant, Patience, RemoteOffer, RemoteSignError, RemoteTokenSource,
+        SessionCertificate, WakeGate,
+    };
+    use std::sync::Mutex;
+    use std::sync::mpsc::{Sender, channel};
+
+    /// The bound the tested gates grant a reading.
+    const TEST_WAIT: Duration = Duration::from_millis(200);
+    /// The tested gates' rest after a wait that raised the token.
+    const TEST_MEMO: Duration = Duration::from_millis(300);
+    /// The tested gates' rest after a wait that raised none.
+    const TEST_QUIET: Duration = Duration::from_millis(600);
+    /// How long into a wait an answering phone's session confirms the
+    /// card.
+    const ANSWERS_AFTER: Duration = Duration::from_millis(50);
+    /// What the scheduler may add to a reading beyond its wait.
+    const SCHEDULING_SLACK: Duration = Duration::from_millis(500);
+
+    fn test_gate() -> WakeGate {
+        WakeGate::new(TEST_WAIT, TEST_MEMO, TEST_QUIET)
+    }
+
+    /// A phone the gate is read against: its session confirms the card
+    /// `answers_after` into a wait long enough, or never, and it holds
+    /// a wait it cannot answer to its end, as a source must not exceed.
+    struct GatePhone {
+        answers_after: Option<Duration>,
+        raised: Mutex<bool>,
+        waits: Mutex<Vec<Duration>>,
+        /// Told when a reading starts a wait.
+        began: Mutex<Option<Sender<()>>>,
+    }
+
+    impl GatePhone {
+        fn new(answers_after: Option<Duration>) -> Self {
+            Self {
+                answers_after,
+                raised: Mutex::new(false),
+                waits: Mutex::new(Vec::new()),
+                began: Mutex::new(None),
+            }
+        }
+
+        fn offer(raised: bool) -> RemoteOffer {
+            RemoteOffer::new(
+                crate::slot_kind::RemoteSlotId::parse(&"a5".repeat(crate::slot_kind::PAIR_ID_SIZE))
+                    .expect("valid pair id"),
+                "Alpha Phone".to_owned(),
+                refineid_remote::DisplayText::new("alpha-desk".to_owned()).expect("bounded text"),
+                raised.then(|| SessionCertificate::new(b"confirmed certificate".to_vec())),
+            )
+        }
+
+        /// The waits granted that were not zero.
+        fn granted(&self) -> Vec<Duration> {
+            self.waits
+                .lock()
+                .expect("waits lock")
+                .iter()
+                .copied()
+                .filter(|wait| !wait.is_zero())
+                .collect()
+        }
+    }
+
+    impl RemoteTokenSource for GatePhone {
+        fn offered(&self, wait: Duration) -> Option<RemoteOffer> {
+            self.waits.lock().expect("waits lock").push(wait);
+            let raised = *self.raised.lock().expect("raised lock");
+            if raised || wait.is_zero() {
+                return Some(Self::offer(raised));
+            }
+            if let Some(began) = self.began.lock().expect("began lock").as_ref() {
+                let _ = began.send(());
+            }
+            match self.answers_after {
+                Some(after) if after <= wait => {
+                    std::thread::sleep(after);
+                    *self.raised.lock().expect("raised lock") = true;
+                    Some(Self::offer(true))
+                }
+                _ => {
+                    std::thread::sleep(wait);
+                    Some(Self::offer(false))
+                }
+            }
+        }
+
+        fn sign(
+            &self,
+            _pair_id: &crate::slot_kind::RemoteSlotId,
+            _request: &refineid_remote::SignatureRequest,
+            _context: &refineid_remote::DisplayText,
+            _deadline: Duration,
+        ) -> Result<Vec<u8>, RemoteSignError> {
+            Err(RemoteSignError::Unreachable)
+        }
+
+        fn stop(&self) {}
+    }
+
+    fn carries_token(offer: Option<&RemoteOffer>) -> bool {
+        offer.and_then(RemoteOffer::certificate).is_some()
+    }
+
+    /// A phone out of reach holds a reading no longer than the bound,
+    /// and the readings after it answer at once until the quiet ends;
+    /// then a reading may wait again.
+    #[test]
+    fn an_absent_phone_holds_one_reading_per_quiet() {
+        let gate = test_gate();
+        let phone = GatePhone::new(None);
+        let started = Instant::now();
+        assert!(!carries_token(gate.read(&phone, Patience::Wake).as_ref()));
+        assert!(started.elapsed() < TEST_WAIT + SCHEDULING_SLACK);
+
+        let again = Instant::now();
+        assert!(!carries_token(gate.read(&phone, Patience::Wake).as_ref()));
+        assert!(!carries_token(gate.read(&phone, Patience::Wake).as_ref()));
+        assert!(again.elapsed() < SCHEDULING_SLACK);
+        assert_eq!(phone.granted().len(), 1);
+        assert!(phone.granted().iter().all(|wait| *wait <= TEST_WAIT));
+
+        std::thread::sleep(TEST_QUIET);
+        let _ = gate.read(&phone, Patience::Wake);
+        assert_eq!(phone.granted().len(), 2);
+    }
+
+    /// A phone that answers raises the token within the bound, and the
+    /// readings after it are granted no wait until the memo ends.
+    #[test]
+    fn a_raised_token_answers_the_readings_after_it_at_once() {
+        let gate = test_gate();
+        let phone = GatePhone::new(Some(ANSWERS_AFTER));
+        let started = Instant::now();
+        assert!(carries_token(gate.read(&phone, Patience::Wake).as_ref()));
+        assert!(started.elapsed() < TEST_WAIT);
+        assert!(carries_token(gate.read(&phone, Patience::Wake).as_ref()));
+        assert_eq!(phone.granted().len(), 1);
+
+        std::thread::sleep(TEST_MEMO);
+        assert!(carries_token(gate.read(&phone, Patience::Wake).as_ref()));
+        assert_eq!(phone.granted().len(), 2);
+    }
+
+    /// A reading that arrives while another waits shares that wait:
+    /// it answers within the bound from its own start, and starts no
+    /// wait of its own.
+    #[test]
+    fn a_reading_during_a_wait_shares_it() {
+        let gate = std::sync::Arc::new(test_gate());
+        let phone = std::sync::Arc::new(GatePhone::new(None));
+        let (began, waiting) = channel();
+        *phone.began.lock().expect("began lock") = Some(began);
+        let first = {
+            let gate = std::sync::Arc::clone(&gate);
+            let phone = std::sync::Arc::clone(&phone);
+            std::thread::spawn(move || gate.read(phone.as_ref(), Patience::Wake))
+        };
+        waiting.recv().expect("the first reading waits");
+        let started = Instant::now();
+        assert!(!carries_token(
+            gate.read(phone.as_ref(), Patience::Wake).as_ref()
+        ));
+        assert!(started.elapsed() < TEST_WAIT + SCHEDULING_SLACK);
+        assert!(!carries_token(
+            first.join().expect("first reading").as_ref()
+        ));
+        assert_eq!(phone.granted().len(), 1);
+    }
+
+    /// A reading that must not block is granted no wait, even with the
+    /// gate open.
+    #[test]
+    fn a_reading_that_must_not_block_waits_for_nothing() {
+        let gate = test_gate();
+        let phone = GatePhone::new(None);
+        let started = Instant::now();
+        assert!(!carries_token(gate.read(&phone, Patience::AtOnce).as_ref()));
+        assert!(started.elapsed() < SCHEDULING_SLACK);
+        assert!(phone.granted().is_empty());
+    }
     use crate::ck::{
         CKR_DEVICE_ERROR, CKR_DEVICE_REMOVED, CKR_FUNCTION_CANCELED, CKR_MECHANISM_INVALID,
         CKR_PIN_INCORRECT, CKR_PIN_LOCKED, CKR_TOKEN_NOT_PRESENT,

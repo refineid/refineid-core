@@ -52,6 +52,8 @@ const ROGUE_TSA_ROOT: &str = "Synthetic Self-made Time Stamping Root";
 const ROGUE_TSA: &str = "Synthetic Self-made Time Stamping Unit";
 /// Common name of a root nobody trusts.
 const STRANGER: &str = "Synthetic Stranger CA";
+/// A second root, cross-certifying the intermediate's name and key.
+const SECOND_ROOT: &str = "Synthetic Second Root CA";
 
 /// Root serial.
 const ROOT_SERIAL: u8 = 1;
@@ -73,6 +75,11 @@ const TSA_ROOT_SERIAL: u8 = 8;
 const ROGUE_TSA_SERIAL: u8 = 9;
 /// RSA signer serial.
 const RSA_SIGNER_SERIAL: u8 = 10;
+/// Second root serial.
+const SECOND_ROOT_SERIAL: u8 = 11;
+/// Serial of the intermediate's cross-certificate under the second
+/// root.
+const CROSS_SERIAL: u8 = 12;
 
 /// Day every certificate starts.
 const ISSUED: u8 = 1;
@@ -733,6 +740,85 @@ fn a_signer_revoked_before_the_proof_of_existence_is_not_valid() {
     );
     assert!(!signature.is_valid());
     assert!(!report.is_valid());
+}
+
+#[test]
+fn a_compromise_on_another_path_to_an_anchor_makes_the_signature_not_valid() {
+    let world = World::new();
+    // A second trusted root cross-certifies the intermediate, so the
+    // signer has two anchored paths through one intermediate key. The
+    // first path answers good; the second root's CRL revokes its
+    // cross-certificate after the proof of existence.
+    let second_root_key = TestKey::derive(TestCurve::P384, b"second root");
+    let second_root = certificate(
+        &spec(
+            SECOND_ROOT_SERIAL,
+            SECOND_ROOT,
+            SECOND_ROOT,
+            ca_extensions(),
+        ),
+        &second_root_key,
+        &second_root_key,
+    );
+    let cross = certificate(
+        &spec(CROSS_SERIAL, INTERMEDIATE, SECOND_ROOT, ca_extensions()),
+        &world.intermediate_key,
+        &second_root_key,
+    );
+    let anchors = TrustAnchors::new(vec![
+        anchor(&world.root, AnchorRole::CertificateIssuing),
+        anchor(&second_root, AnchorRole::CertificateIssuing),
+        anchor(&world.tsa_root, AnchorRole::TimeStamping),
+    ]);
+    for (reason, decisive) in [
+        (CrlReason::CaCompromise, true),
+        (CrlReason::Superseded, false),
+    ] {
+        let mut material = world.lt_material(None);
+        material
+            .certificates
+            .extend([cross.clone(), second_root.clone()]);
+        material.crls.push(crate::testkit::crl_with_reason(
+            SECOND_ROOT,
+            &second_root_key,
+            day(NOW),
+            Some(day(ENDS)),
+            &[CROSS_SERIAL],
+            day(REVOKED_LATER),
+            Some(reason),
+        ));
+        let pdf = world.pdf(Signer::Issued, Stamp::Anchored, &material);
+        let report = verify_under(pdf, &anchors).expect("report");
+        let signature = only(&report);
+        assert!(signature.chain_verified());
+        assert_eq!(signature.proof_of_existence(), Some(day(STAMPED)));
+        if decisive {
+            assert_eq!(
+                signature.revocation(),
+                Revocation::Revoked {
+                    at: day(REVOKED_LATER),
+                    reason: Some(reason),
+                }
+            );
+            assert_eq!(
+                signature
+                    .compromise()
+                    .map(|compromise| compromise.certificate().as_der()),
+                Some(cross.as_slice()),
+                "the report names the certificate the compromise was found on"
+            );
+            assert_eq!(signature.verdict(), Verdict::NotValid);
+            assert_eq!(report.verdict(), Verdict::NotValid);
+        } else {
+            assert_eq!(
+                signature.revocation(),
+                Revocation::Good { at: day(ANSWERED) },
+                "the path that answers good decides"
+            );
+            assert_eq!(signature.compromise(), None);
+            assert_eq!(signature.verdict(), Verdict::Valid);
+        }
+    }
 }
 
 #[test]

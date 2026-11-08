@@ -195,7 +195,10 @@ pub enum CardOperation {
     },
     /// Authenticate a browser challenge after local authorizer consent.
     BrowserAuthenticate {
-        /// Human-readable relying-party origin shown by the authorizer.
+        /// The requester's own label for what is asking, such as
+        /// `<program> on <host>`. No requester can know the site, so it
+        /// names none, and the authorizer does not show it (section 11
+        /// item 1).
         origin: String,
         /// Expected public-key profile, verified again by the authorizer.
         key_profile: CardKeyProfile,
@@ -235,7 +238,7 @@ pub enum CardOperation {
     },
 }
 
-/// Byte length of one name the authorizer shows: `origin` (section 9.2),
+/// Byte length of one requester-supplied label: `origin` (section 9.2),
 /// `document_name`, an entry of `document_names` or of `contained_files`
 /// (section 9.3), `tstr .size (1..256)`.
 const DISPLAY_NAME_BYTES: core::ops::RangeInclusive<usize> = 1..=256;

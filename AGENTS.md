@@ -18,6 +18,8 @@ may predate its own review:
   dependence with reason, no ducks at the border.
 - [doc/security/credential-custody.md](doc/security/credential-custody.md)
   -- how secrets move.
+- [doc/security/certificate-custody.md](doc/security/certificate-custody.md)
+  -- what is kept of the card's certificates, where, and for how long.
 - [doc/architecture/case-study-refinement-types-vec-insert.md](doc/architecture/case-study-refinement-types-vec-insert.md)
   -- case study: why `<alloc::vec::Vec>::insert` is bad code, progress and preservation,
   and refinement typing across collections.
@@ -156,7 +158,7 @@ claims, and the one in-source annotation dialect are in
 ## Commits and publication
 
 - Imperative subject, explanatory body; no attribution trailers of any
-  kind.
+  kind. The tracked `commit-msg` hook refuses a message that carries one.
 - This is a public repository. No private paths, no unpublished project
   context, no personal data, and no secrets -- test PINs and card
   numbers included -- in any file, fixture, comment, or commit message.
@@ -289,12 +291,24 @@ rule in a line and points to the reading behind it; the readings live in
 
 ## Certificates and trust
 
-- Certificates come from the card, which carries its own, or, for external
-  ones (EU eIDAS), from trusted lists at runtime. No certificates or
-  fingerprints are shipped in the software.
-- No pinning or other trust policy is added without the owner's decision.
+- The only certificates shipped are the EU Official Journal's
+  list-signing certificates (`crates/doc-sign/trust-anchors/`), which
+  bootstrap the EU trusted lists. Every other anchor comes from the card
+  when one is present (`EF.4334` root CA, `EF.4336` issuing CA) or from
+  the trusted lists at runtime. Certificates under a `test-vectors/` or
+  `test-certs/` directory are `#[cfg(test)]` fixtures, never anchors.
+- No other certificate, fingerprint, pin or trust policy is added without
+  the owner's decision (recorded in `crates/doc-sign/src/trust.rs`).
 - Describe what the code does and cite the source; ask the owner before
   changing trust behavior.
+
+## Signing levels
+
+- A release build saves a document only at the long-term level asked
+  for and otherwise refuses with the reason; a development build saves
+  the level reached under a `-dev-<level>` name. The switch is
+  `debug_assertions`, never a runtime setting:
+  [doc/architecture/signing-levels.md](doc/architecture/signing-levels.md).
 
 ## Independent review
 

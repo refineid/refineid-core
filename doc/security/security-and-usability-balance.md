@@ -119,7 +119,7 @@ Pairing is an explicit, mutually authenticated ceremony. Direct unauthenticated 
 
 Human users occasionally mistype digits. The security model must be resilient and forgiving of ordinary human error:
 - A mistyped PIN is told to the holder on the phone, with the attempts the card still allows, and the phone prompts again; the computer learns only the operation's outcome.
-- The phone verifies a PIN only while the card reports at least three remaining attempts, so RefineID never blocks a card (RAPP v26.11.2 section 10.2).
+- The phone refuses a PIN verification at two or one remaining attempts or an unreadable counter and sends it otherwise; at no attempts left or a blocked PIN the card answers for itself and spends nothing, so RefineID never blocks a card (RAPP v26.11.2 section 10.2).
 - No failure revokes a pairing: a failure closes the connection or the session, or rejects one operation. Pairings are revoked only by their users.
 
 ---

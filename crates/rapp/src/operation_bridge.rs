@@ -141,8 +141,9 @@ const fn exported_algorithm(value: SignatureAlgorithm) -> RappSignatureAlgorithm
 pub struct RappOperationDescriptor {
     /// Registered operation name.
     pub kind: RappOperationKind,
-    /// Requester-asserted origin or document name shown to the authorizer;
-    /// for a package, the package's own name.
+    /// Requester-asserted text: the document name shown to the authorizer,
+    /// for a package the package's own name; or a browser authentication's
+    /// `origin`, which the authorizer does not show (section 11 item 1).
     pub display_context: Option<String>,
     /// The files a package holds, shown under its name in container order;
     /// present exactly when a `sign_document` signs a package (section 9.3).
@@ -1295,8 +1296,9 @@ impl RappOperationBridge {
         self.finish_failure(&operation_id, ProxyFailure::RequestInvalidOrUnsupported)
     }
 
-    /// The retry floor refused before any verification: the card reports
-    /// fewer than three remaining attempts for the PIN (section 10.2).
+    /// The retry floor ended the operation: two or one remaining attempts
+    /// for the PIN or an unreadable counter, with no verification sent, or
+    /// no tries left or a blocked PIN (section 10.2).
     ///
     /// # Errors
     /// [`RappBindingError`] on invalid input or the wrong protocol phase.

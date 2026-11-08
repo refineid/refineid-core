@@ -1193,16 +1193,18 @@ impl TrustedLists {
 }
 
 impl TrustAnchors {
-    /// The anchors a relying party takes from `lists`: the pinned
-    /// roots ([`Self::pinned`]) beside one anchor per certificate of
-    /// every qualified certificate-issuing and time-stamping service
-    /// the national lists carry, granted for the periods its status
-    /// history grants ([`TrustService::granted_periods`]). The anchors
-    /// are fetched at the lists' fetch time and valid until the
-    /// earliest next update ([`TrustedLists::valid_until`]).
+    /// The anchors a relying party takes from `lists`: one anchor per
+    /// certificate of every qualified certificate-issuing and
+    /// time-stamping service the national lists carry, granted for the
+    /// periods its status history grants
+    /// ([`TrustService::granted_periods`]), and nothing else: the core
+    /// ships no root beside the list-signing certificates
+    /// ([`crate::trust`]). The anchors are fetched at the lists' fetch
+    /// time and valid until the earliest next update
+    /// ([`TrustedLists::valid_until`]).
     #[must_use]
     pub fn from_trusted_lists(lists: &TrustedLists) -> Self {
-        let mut anchors = Self::pinned().anchors().to_vec();
+        let mut anchors = Vec::new();
         for list in lists
             .national
             .iter()

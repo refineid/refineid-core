@@ -34,13 +34,19 @@ Every input has one origin, one border and one constructor.
 | The clock | `now` passed by the caller | The current time, used only where no proven time exists. |
 | Validation evidence inside the file | `MaterialPool` | Parsed certificates, OCSP responses and CRLs from the DSS, the CMS, or the container. Each is parsed once, at the border. |
 
-Trust anchors come from two sources `TrustAnchors::from_trusted_lists`
-combines: the pinned roots the core ships (the DVV roots and the
-time-stamping root the signing side uses), and the EU trusted lists
-(see Trusted lists). The lists are fetched and cached by the shell; a
-verdict uses the cached lists and the report says when they were
-fetched and whether one of them is stale. The verifier itself does no
-network access.
+Trust anchors come from one source, the EU trusted lists (see Trusted
+lists), through `TrustAnchors::from_trusted_lists`. The core ships no
+root: the only certificates in the tree are the six list-signing
+certificates the Official Journal publishes (`trust::LOTL_SIGNER_DER`),
+which bootstrap the lists and anchor nothing themselves. The Finnish
+list names DVV's services by their issuing CA certificates, the
+certificates a card's own chain starts at, so a path from a FINEID
+signer ends at that issuing CA. The lists are fetched and cached by the
+shell; a verdict uses the cached lists and the report says when they
+were fetched and whether one of them is stale. A fresh install that has
+never fetched the lists has no anchor and verifies nothing until it has
+fetched them once; from then on it works offline from the cache. The
+verifier itself does no network access.
 
 An anchor is the subject name and public key of its certificate (RFC
 5280 sec.6.1.1): a path ends at the first certificate that carries an
@@ -48,8 +54,10 @@ anchor's name and key, for the role the path needs, at a time inside
 one of the anchor's granted periods. The anchor certificate's own
 validity and extensions are not consulted; its granted periods are.
 Any certificate can be an anchor: a root, an issuing CA a trusted list
-names, or a time-stamping unit's own certificate. `TrustAnchors::pinned`
-gives the core's pinned roots, each granted without bounds.
+names, or a time-stamping unit's own certificate. The signing side's
+long-term material collection takes the signer's anchors the same way,
+from the request (`DocumentRequest::signer_anchors`): the issuing CA
+and root read from the card when one is present, or the lists' anchors.
 
 ## Trusted lists
 
@@ -231,9 +239,23 @@ For each signature the report carries independent facts:
   inflates can only leave the chain unverified, never verify it. The
   signer
   itself must be no CA, with a Key Usage that, when present, asserts
-  digitalSignature or nonRepudiation. Every anchored path is judged and
-  the best revocation outcome kept, good before unavailable before
-  revoked (RFC 5280 sec.6 accepts any valid path). Every certificate
+  digitalSignature or nonRepudiation. Every anchored path is judged.
+  A compromise revocation (keyCompromise, cACompromise or
+  aACompromise) found on any certificate of any of them is decisive
+  across paths: every path through a certificate carrying the same
+  subject public key, the cross-certificates that carry it under other
+  issuers included, is revoked by it whatever its own evidence said,
+  and the report names the certificate the compromise was found on
+  (`SignatureReport::compromise`); a compromised signer, which is on
+  every path, revokes them all. Of the paths that remain the best
+  revocation outcome is kept, good before unavailable before revoked
+  (RFC 5280 sec.6 accepts any valid path). The maintainer decided the
+  cross-path rule on 2026-11-07: a CRL reason of compromise speaks of
+  the key, not of one certificate carrying it, a compromised key proves
+  nothing about when it signed (EN 319 102-1 clause 5.6.2), and a
+  path whose evidence is silent about the key must not outrank the
+  path whose evidence speaks. A revocation of a certificate on no path
+  the verifier built is not consulted. Every certificate
   below the anchor is checked for revocation. The report carries the
   path as certificates, the signer's issuer first: anchored, ending in
   the anchor, exactly when the chain is verified; otherwise partial,
@@ -528,6 +550,7 @@ evidence are, and which signatures were not judged.
 | UCA-113 | Shell | Renders a verdict from anchors taken from a list past its next update without saying so. | H-8 | CC-117: the reader types staleness from `NextUpdate`; the anchors carry the earliest one and the report says whether it has passed; the shell shows it with the fetch time and fetches again. |
 | UCA-114 | Trusted-list reader | Anchors a service at a time its status did not grant: a withdrawn service, or one before it was granted. | H-8 | CC-118: the granted periods are derived from the current status and the whole history in time order, closed at the first status that does not grant, an entry of another service type included; at one instant the most recent status counts last; a Directive 1999/93/EC status grants only a certificate service and only until 1 July 2016; a status that grants is named per service type, and a service never granted yields no anchor. |
 | UCA-115 | Trusted-list reader | Follows pointers from list to list, or reads a list without bound, so one list controls what is fetched and how much is parsed. | H-8 | CC-119: the list of the lists is followed one level to the national lists and no further; size, pointers, services, history and identity certificates are bounded by named constants and a list beyond one is refused whole. |
+| UCA-125 | Verifier | Reports the revocation outcome of a path whose evidence is silent while a certificate carrying the same key is revoked for compromise on another anchored path it built. | H-8 | CC-124: a compromise revocation found on any anchored path revokes every path carrying the same subject public key before the paths are ranked, and the report names the certificate it was found on. |
 
 Loss scenario: a document carries a self-made timestamp token whose
 time lies inside the signer certificate's validity, while the

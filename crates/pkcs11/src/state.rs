@@ -37,7 +37,7 @@ use refineid_pcsc::{
 use refineid_pkcs15::{Pkcs15Error, Pkcs15Ops as _};
 
 use crate::pin_cache::PinSafetyCache;
-use crate::remote::{RemoteOffer, RemoteTokenSource};
+use crate::remote::{RemoteOffer, RemoteReading};
 use crate::slot_kind::SlotKind;
 
 use crate::ck::{
@@ -231,6 +231,14 @@ impl Session {
         Some(find.remaining.drain(..wanted).collect())
     }
 
+    /// Drop what the active find has yet to return, keeping it open
+    /// for `C_FindObjectsFinal`.
+    pub(crate) fn exhaust_find(&mut self) {
+        if let Some(find) = self.find.as_mut() {
+            find.remaining.clear();
+        }
+    }
+
     /// End the active find operation, reporting whether one was
     /// active.
     pub(crate) fn take_find(&mut self) -> bool {
@@ -302,9 +310,10 @@ pub struct ModuleState {
 }
 
 impl ModuleState {
-    /// Build empty module state with an initial slot-table refresh.
+    /// Build empty module state with an initial slot-table refresh,
+    /// admitting the paired phone as `remote` read it.
     #[must_use]
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(remote: RemoteReading) -> Self {
         let mut state = Self {
             slots: Vec::new(),
             next_slot_id: SLOT_ID_BASE,
@@ -317,7 +326,7 @@ impl ModuleState {
             card_events: BTreeMap::new(),
             next_token_generation: FIRST_TOKEN_GENERATION,
         };
-        state.refresh_slots();
+        state.refresh_slots(remote);
         state
     }
 
@@ -349,9 +358,12 @@ impl ModuleState {
     /// ([`Self::ensure_token`] needed them anyway). A transient read
     /// failure on a genuine card self-heals on the next refresh
     /// (the transition re-runs until the proof succeeds).
-    pub(crate) fn refresh_slots(&mut self) {
+    ///
+    /// The paired phone is admitted as `remote`, read before the
+    /// module lock was taken, found it.
+    pub(crate) fn refresh_slots(&mut self, remote: RemoteReading) {
         let _ = self.refresh_slots_with(&PcscProber);
-        self.refresh_remote_slots();
+        self.admit_remote(remote);
     }
 
     /// [`Self::refresh_slots`] over an injected [`SlotProber`], so
@@ -446,21 +458,28 @@ impl ModuleState {
         Ok(())
     }
 
-    /// Admit the paired phone the host's installed source offers.
+    /// Admit the paired phone as one reading of the host's installed
+    /// source found it.
     ///
     /// The source is the only trust origin that may admit a
-    /// [`SlotKind::Remote`]: an offer read here is proof the host
+    /// [`SlotKind::Remote`]: an offer read from it is proof the host
     /// admitted the pairing, where a reader name reported by a USB
     /// device would only be a claim. With no source installed, no
     /// remote slot exists and no remote credential path is reachable.
-    fn refresh_remote_slots(&mut self) {
-        if let Some(source) = crate::remote::installed() {
-            self.refresh_remote_slots_with(source);
+    pub(crate) fn admit_remote(&mut self, remote: RemoteReading) {
+        if let RemoteReading::Offer(offer) = remote {
+            self.admit_remote_offer(offer);
         }
     }
 
-    /// [`Self::refresh_remote_slots`] over an injected source, so the
-    /// admission logic is testable without a host.
+    /// [`Self::admit_remote_offer`] over an injected source read at
+    /// once, so the admission logic is testable without a host.
+    #[cfg(test)]
+    fn refresh_remote_slots_with(&mut self, source: &dyn crate::remote::RemoteTokenSource) {
+        self.admit_remote_offer(source.offered(core::time::Duration::ZERO));
+    }
+
+    /// Admit the one offer a source made.
     ///
     /// At most one remote slot carries a token at a time, the one the
     /// offer names. A remote slot the offer no longer names keeps its
@@ -468,8 +487,7 @@ impl ModuleState {
     /// offer carries a certificate that parses; a certificate that
     /// differs from the cached one withdraws the token and raises a
     /// new one, with new object handles, under the same slot id.
-    fn refresh_remote_slots_with(&mut self, source: &dyn RemoteTokenSource) {
-        let offer = source.offered();
+    fn admit_remote_offer(&mut self, offer: Option<RemoteOffer>) {
         let unnamed: Vec<CkSlotId> = self
             .slots
             .iter()
@@ -1045,7 +1063,7 @@ mod tests {
     }
 
     impl crate::remote::RemoteTokenSource for ScriptedSource {
-        fn offered(&self) -> Option<crate::remote::RemoteOffer> {
+        fn offered(&self, _wait: core::time::Duration) -> Option<crate::remote::RemoteOffer> {
             self.offered_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.offer.lock().expect("offer lock").clone()
@@ -1069,11 +1087,11 @@ mod tests {
     /// A P-384 certificate as the source would offer it after checking
     /// it on its session.
     const OFFERED_CERT_DER: &[u8] =
-        include_bytes!("../ca-certs/fineid-intermediate-01-citizen-g4e.der");
+        include_bytes!("../test-certs/fineid-intermediate-01-citizen-g4e.der");
 
     /// Another P-384 certificate, for the offer that replaces the
     /// first.
-    const REPLACEMENT_CERT_DER: &[u8] = include_bytes!("../ca-certs/dvv-gov-root-ca-g3-ecc.der");
+    const REPLACEMENT_CERT_DER: &[u8] = include_bytes!("../test-certs/dvv-gov-root-ca-g3-ecc.der");
 
     fn offer(pair_hex: &str, certificate: Option<&[u8]>) -> crate::remote::RemoteOffer {
         crate::remote::RemoteOffer::new(

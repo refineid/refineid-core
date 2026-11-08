@@ -1,0 +1,67 @@
+error[E0599]: the method `verify_pin2_after_pin2_pace` exists for mutable reference `&mut SmTransport<T, OpenedByCan>`, but its trait bounds were not satisfied
+ --> tests/ui/no_pin2_verify_without_pin2_channel.rs:6:21
+  |
+6 |     let _ = channel.verify_pin2_after_pin2_pace(pin);
+  |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^ method cannot be called on `&mut SmTransport<T, OpenedByCan>` due to unsatisfied trait bounds
+  |
+ ::: src/secure_messaging.rs
+  |
+  | pub struct SmTransport<T: CardTransport, O> {
+  | ------------------------------------------- doesn't satisfy `SmTransport<T, OpenedByCan>: Pin2PaceChannelOps` or `SmTransport<T, OpenedByCan>: Pin2PaceChannel`
+  |
+  = note: the following trait bounds were not satisfied:
+          `SmTransport<T, OpenedByCan>: Pin2PaceChannel`
+          which is required by `SmTransport<T, OpenedByCan>: Pin2PaceChannelOps`
+          `&mut SmTransport<T, OpenedByCan>: Pin2PaceChannel`
+          which is required by `&mut SmTransport<T, OpenedByCan>: Pin2PaceChannelOps`
+
+error[E0599]: the method `verify_pin2_after_pin2_pace` exists for mutable reference `&mut SmTransport<T, OpenedByPin1>`, but its trait bounds were not satisfied
+  --> tests/ui/no_pin2_verify_without_pin2_channel.rs:10:21
+   |
+10 |     let _ = channel.verify_pin2_after_pin2_pace(pin);
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+  ::: src/secure_messaging.rs
+   |
+   | pub struct SmTransport<T: CardTransport, O> {
+   | ------------------------------------------- doesn't satisfy `SmTransport<T, OpenedByPin1>: Pin2PaceChannelOps` or `SmTransport<T, OpenedByPin1>: Pin2PaceChannel`
+   |
+   = note: the following trait bounds were not satisfied:
+           `SmTransport<T, OpenedByPin1>: Pin2PaceChannel`
+           which is required by `SmTransport<T, OpenedByPin1>: Pin2PaceChannelOps`
+           `&mut SmTransport<T, OpenedByPin1>: Pin2PaceChannel`
+           which is required by `&mut SmTransport<T, OpenedByPin1>: Pin2PaceChannelOps`
+
+error[E0599]: the method `verify_pin2_after_pin2_pace` exists for mutable reference `&mut SmTransport<T, OpenedByPuk>`, but its trait bounds were not satisfied
+  --> tests/ui/no_pin2_verify_without_pin2_channel.rs:14:21
+   |
+14 |     let _ = channel.verify_pin2_after_pin2_pace(pin);
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+  ::: src/secure_messaging.rs
+   |
+   | pub struct SmTransport<T: CardTransport, O> {
+   | ------------------------------------------- doesn't satisfy `SmTransport<T, OpenedByPuk>: Pin2PaceChannelOps` or `SmTransport<T, OpenedByPuk>: Pin2PaceChannel`
+   |
+   = note: the following trait bounds were not satisfied:
+           `SmTransport<T, OpenedByPuk>: Pin2PaceChannel`
+           which is required by `SmTransport<T, OpenedByPuk>: Pin2PaceChannelOps`
+           `&mut SmTransport<T, OpenedByPuk>: Pin2PaceChannel`
+           which is required by `&mut SmTransport<T, OpenedByPuk>: Pin2PaceChannelOps`
+
+error[E0599]: the method `verify_pin2_after_pin2_pace` exists for mutable reference `&mut T`, but its trait bounds were not satisfied
+  --> tests/ui/no_pin2_verify_without_pin2_channel.rs:18:23
+   |
+18 |     let _ = transport.verify_pin2_after_pin2_pace(pin);
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^ method cannot be called on `&mut T` due to unsatisfied trait bounds
+   |
+   = note: the following trait bounds were not satisfied:
+           `T: Pin2PaceChannel`
+           which is required by `T: Pin2PaceChannelOps`
+           `&mut T: Pin2PaceChannel`
+           which is required by `&mut T: Pin2PaceChannelOps`
+   = help: items from traits can only be used if the type parameter is bounded by the trait
+help: the following trait defines an item `verify_pin2_after_pin2_pace`, perhaps you need to restrict type parameter `T` with it:
+   |
+17 | fn plain<T: CardTransport + Pin2PaceChannelOps>(transport: &mut T, pin: Pin2) {
+   |                           ++++++++++++++++++++

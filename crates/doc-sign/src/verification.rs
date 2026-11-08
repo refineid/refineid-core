@@ -68,8 +68,8 @@ use self::pdf::{ByteRange, PdfDocument, PdfReadError, SignatureKind, SubFilter};
 pub use self::revision::{DocumentChange, Revision};
 use self::trust::judge;
 pub use self::trust::{
-    AnchorError, AnchorRole, CertificationPath, GrantedPeriod, MaterialPool, Revocation,
-    TrustAnchor, TrustAnchors,
+    AnchorError, AnchorRole, CertificationPath, CompromisedKey, GrantedPeriod, MaterialPool,
+    Revocation, TrustAnchor, TrustAnchors,
 };
 use self::xades::{XadesReadError, XadesUnsupported, XadesVerdict};
 
@@ -369,6 +369,9 @@ pub struct SignatureReport {
     validation_time: DateTime,
     /// The revocation status of the path.
     revocation: Revocation,
+    /// The compromise that decided `revocation`, naming the certificate
+    /// it was found on, when one did.
+    compromise: Option<CompromisedKey>,
     /// What the revisions after the signed one do to the document.
     revision: Revision,
     /// The signing time the signature claims.
@@ -485,6 +488,17 @@ impl SignatureReport {
     #[must_use]
     pub const fn revocation(&self) -> Revocation {
         self.revocation
+    }
+
+    /// The compromise revocation that decided [`Self::revocation`],
+    /// naming the certificate it was found on: one of the reported
+    /// path, or one carrying the same key on another anchored path the
+    /// file's evidence reached. `None` when no compromise in the file's
+    /// evidence decided the status; a live answer sets the status
+    /// alone.
+    #[must_use]
+    pub const fn compromise(&self) -> Option<&CompromisedKey> {
+        self.compromise.as_ref()
     }
 
     /// What the revisions after the one the signature covers do to
@@ -1128,6 +1142,7 @@ impl Context<'_> {
             archive_timestamps,
             validation_time,
             revocation: chain.revocation,
+            compromise: chain.compromise,
             revision: facts.revision,
             claimed_signing_time: facts.claimed_signing_time,
             covering_document_timestamps: facts.covering,

@@ -23,11 +23,15 @@ Each format reaches `B-LTA` by its own archive construction:
   referencing the data objects, the `ASiCManifest` and the signature,
   and `META-INF/timestamp.tst` over it (`ETSI EN 319 162-1` V1.1.1
   clause 4.4.5 item 2 a) and annex A.7).
-- Standalone `CAdES` (`.p7m`, `.p7s`) would need an
-  `archive-time-stamp-v3` with its `ats-hash-index-v3` (`ETSI EN 319
-  122-1` clause 5.5.3), which is not built. A release build refuses it
-  before the card or the phone is asked to sign; a development build
-  saves it at `B-LT` under a `-dev-B-LT` name.
+- `CAdES`, attached (`.p7m`) or detached (`.p7s`): an
+  `archive-time-stamp-v3` unsigned attribute whose token carries the
+  `ats-hash-index-v3` of every certificate, revocation value and
+  unsigned attribute value present when it was requested (`ETSI EN 319
+  122-1` V1.3.1 clauses 5.5.2 and 5.5.3).
+
+This crate's verifier judges every one of these archive timestamps; a
+detached `CAdES` signature is verified with its content
+(`DocumentFile::detached_cms`).
 
 The archive timestamp's authority must be one whose certificate path is
 already in the validation material the token covers
@@ -50,11 +54,9 @@ profile's, and never by a setting, a flag or the environment:
 
 ## Release builds
 
-A request below `B-LTA`, or for a format without an archive
-construction, is refused before anything is signed
+A request below `B-LTA` is refused before anything is signed
 (`DocumentRequest::validate_signing_policy`): `a release build signs
-only at B-LTA, not <format> <level>`, or `this format has no archive
-timestamp here, so it cannot reach B-LTA`. A signature whose `B-LTA`
+only at B-LTA, not <format> <level>`. A signature whose `B-LTA`
 cannot be reached after signing is refused with the reason, and nothing
 is saved.
 
@@ -77,8 +79,7 @@ is saved.
 
 The document is saved at the highest level actually reached:
 
-- LTA requested and the archive timestamp lost, or the format has no
-  archive construction: `B-LT`.
+- LTA requested and the archive timestamp lost: `B-LT`.
 - The signer's material cannot be collected: `B-T`.
 - No timestamp authority answered: `B-B`.
 

@@ -539,50 +539,143 @@ pub fn signed_data(
     material: &ValidationMaterial,
     timestamps: &[Vec<u8>],
 ) -> Vec<u8> {
-    let mut signed_data_body = Vec::new();
-
-    // RFC 5652 sec.5.1: the version is 5 once `crls` carries anything
-    // of the `other` choice, which an OCSP response is. Leaving it at 1
-    // produces a structure a strict parser rejects.
-    let version = if material.ocsp_responses.is_empty() {
-        CMS_VERSION_V1
-    } else {
-        CMS_VERSION_V5
+    let signature = SignatureParts {
+        parameters,
+        attributes,
+        signature,
+        material,
+        timestamps,
     };
-    signed_data_body.extend_from_slice(&tlv(TAG_INTEGER, &[version]));
-    signed_data_body.extend_from_slice(&tlv(
-        TAG_SET,
-        &parameters.digest_algorithm.algorithm_identifier(),
-    ));
-    signed_data_body.extend_from_slice(&encapsulated_content(encapsulation, content));
+    signature.assemble(encapsulation, content, &[])
+}
 
-    // The signer's certificate, then whatever completes the chain. A
-    // verifier that has to fetch an issuer is a verifier that stops
-    // working the day the fetch does.
-    // `certificates [0] IMPLICIT CertificateSet` is a SET OF, so DER
-    // orders it by encoding rather than by the order the chain was
-    // walked in (X.690 sec.11.6). Concatenating in walk order is the
-    // kind of DER violation a lenient parser accepts and a strict one
-    // rejects, which is the worst combination to ship.
-    let mut certificates: Vec<Vec<u8>> = vec![parameters.certificate.raw_der.to_vec()];
-    certificates.extend(material.certificates.iter().cloned());
-    certificates.sort_unstable();
-    certificates.dedup();
-    let mut certificate_set = Vec::new();
-    for certificate in certificates {
-        certificate_set.extend_from_slice(&certificate);
+/// The input of an `archive-time-stamp-v3` over the signature
+/// [`signed_data`] builds from the same arguments, and the
+/// `ats-hash-index-v3` it is computed with (`ETSI EN 319 122-1`
+/// V1.3.1 clauses 5.5.2 and 5.5.3), both under `algorithm`.
+///
+/// `content` is the signed document, attached or not: item 2 of the
+/// input is its hash.
+#[must_use]
+pub fn archive_input_v3(
+    parameters: &SignerParameters<'_>,
+    attributes: &ToBeSigned,
+    signature: &[u8],
+    content: &[u8],
+    material: &ValidationMaterial,
+    timestamps: &[Vec<u8>],
+    algorithm: DigestAlgorithm,
+) -> ArchiveInputV3 {
+    SignatureParts {
+        parameters,
+        attributes,
+        signature,
+        material,
+        timestamps,
     }
-    signed_data_body.extend_from_slice(&tlv(TAG_CONTEXT_0, &certificate_set));
+    .archive_input(content, algorithm)
+}
 
-    // `crls [1] IMPLICIT RevocationInfoChoices`. A CRL goes in as
-    // itself; an OCSP response has no CHOICE of its own and travels
-    // wrapped as `other`, per RFC 5940.
-    if material.revocation_count() > 0 {
+/// [`signed_data`] with an `archive-time-stamp-v3` attribute: `token`
+/// is an RFC 3161 token over [`ArchiveInputV3::input`] of the same
+/// arguments, and the attribute carries it with that input's
+/// `ats-hash-index-v3` added to the token's own unsigned attributes, as
+/// clause 5.5.3 requires.
+///
+/// `None` when `token` is not a `ContentInfo` holding a `SignedData`
+/// with one `SignerInfo` in DER.
+#[must_use]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the signature's parts, its document, and the archive token"
+)]
+pub fn signed_data_archived(
+    parameters: &SignerParameters<'_>,
+    attributes: &ToBeSigned,
+    signature: &[u8],
+    encapsulation: Encapsulation,
+    content: &[u8],
+    material: &ValidationMaterial,
+    timestamps: &[Vec<u8>],
+    token: &[u8],
+    algorithm: DigestAlgorithm,
+) -> Option<Vec<u8>> {
+    let parts = SignatureParts {
+        parameters,
+        attributes,
+        signature,
+        material,
+        timestamps,
+    };
+    let archive = parts.archive_input(content, algorithm);
+    let indexed = with_unsigned_attribute(
+        token,
+        &attribute(oid::known::ATS_HASH_INDEX_V3, archive.index),
+    )?;
+    Some(parts.assemble(
+        encapsulation,
+        content,
+        &[attribute(oid::known::ARCHIVE_TIME_STAMP_V3, indexed)],
+    ))
+}
+
+/// What an `archive-time-stamp-v3` token imprints, and the
+/// `ats-hash-index-v3` that goes into the token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveInputV3 {
+    /// Items 1 to 4 of clause 5.5.3, concatenated.
+    input: Vec<u8>,
+    /// The `ATSHashIndexV3`, DER.
+    index: Vec<u8>,
+}
+
+impl ArchiveInputV3 {
+    /// The octets the token's message imprint digests.
+    #[must_use]
+    pub fn input(&self) -> &[u8] {
+        &self.input
+    }
+}
+
+/// Everything a signature is assembled from, once the card has signed.
+struct SignatureParts<'a> {
+    /// The signer.
+    parameters: &'a SignerParameters<'a>,
+    /// The signed attributes.
+    attributes: &'a ToBeSigned,
+    /// The signature value, DER for ECDSA.
+    signature: &'a [u8],
+    /// The validation material for `certificates` and `crls`.
+    material: &'a ValidationMaterial,
+    /// The signature timestamp tokens.
+    timestamps: &'a [Vec<u8>],
+}
+
+impl SignatureParts<'_> {
+    /// `SignedData.certificates` entries, in DER SET order.
+    ///
+    /// The signer's certificate, then whatever completes the chain. A
+    /// verifier that has to fetch an issuer is a verifier that stops
+    /// working the day the fetch does. `certificates [0] IMPLICIT
+    /// CertificateSet` is a SET OF, so DER orders it by encoding rather
+    /// than by the order the chain was walked in (X.690 sec.11.6).
+    fn certificates(&self) -> Vec<Vec<u8>> {
+        let mut certificates: Vec<Vec<u8>> = vec![self.parameters.certificate.raw_der.to_vec()];
+        certificates.extend(self.material.certificates.iter().cloned());
+        certificates.sort_unstable();
+        certificates.dedup();
+        certificates
+    }
+
+    /// `SignedData.crls` entries, in DER SET order. A CRL goes in as
+    /// itself; an OCSP response has no CHOICE of its own and travels
+    /// wrapped as `other`, per RFC 5940.
+    fn revocation_choices(&self) -> Vec<Vec<u8>> {
         let mut choices = Vec::new();
-        for crl in &material.crls {
+        for crl in &self.material.crls {
             choices.push(crl.clone());
         }
-        for response in &material.ocsp_responses {
+        for response in &self.material.ocsp_responses {
             // `other [1] IMPLICIT OtherRevocationInfoFormat`. IMPLICIT
             // replaces the SEQUENCE tag with the `[1]` -- it does not
             // wrap it. Writing `[1] { SEQUENCE { .. } }` is one layer
@@ -599,24 +692,193 @@ pub fn signed_data(
         // the responders answered in.
         choices.sort_unstable();
         choices.dedup();
-        let mut body = Vec::new();
-        for choice in choices {
-            body.extend_from_slice(&choice);
-        }
-        signed_data_body.extend_from_slice(&tlv(TAG_CONTEXT_1, &body));
+        choices
     }
 
-    signed_data_body.extend_from_slice(&tlv(
-        TAG_SET,
-        &signer_info(parameters, attributes, signature, timestamps),
-    ));
+    /// The signature timestamp attributes, one instance per token.
+    ///
+    /// One attribute instance per token rather than one attribute
+    /// holding several values: `EN 319 122-1` says several instances of
+    /// signature-time-stamp may occur, from different TSAs, and that is
+    /// the shape validators look for. Each token attests the same
+    /// signature, so they are alternatives rather than a sequence -- one
+    /// surviving is enough.
+    fn timestamp_attributes(&self) -> Vec<Vec<u8>> {
+        self.timestamps
+            .iter()
+            .map(|token| attribute(crate::oids::SIGNATURE_TIME_STAMP_TOKEN, token.clone()))
+            .collect()
+    }
 
-    let signed_data_der = tlv(TAG_SEQUENCE, &signed_data_body);
+    /// `SignerInfo` from `version` to `signature`, the fields item 3 of
+    /// `ETSI EN 319 122-1` clause 5.5.3 archives.
+    fn signer_fields(&self) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&tlv(TAG_INTEGER, &[CMS_VERSION_V1]));
+        body.extend_from_slice(&issuer_and_serial(self.parameters.certificate));
+        body.extend_from_slice(&self.parameters.digest_algorithm.algorithm_identifier());
 
-    // ContentInfo ::= SEQUENCE { contentType, content [0] EXPLICIT }
-    let mut content_info = tlv(TAG_OID, oid::known::SIGNED_DATA.as_bytes());
-    content_info.extend_from_slice(&tlv(TAG_CONTEXT_0, &signed_data_der));
-    tlv(TAG_SEQUENCE, &content_info)
+        // The SET tag the attributes were signed under becomes the
+        // implicit [0] the structure carries. Same contents, same
+        // length; only the first octet differs.
+        let mut tagged_attributes = self.attributes.as_bytes().to_vec();
+        if let Some(first) = tagged_attributes.first_mut() {
+            *first = TAG_CONTEXT_0;
+        }
+        body.extend_from_slice(&tagged_attributes);
+
+        body.extend_from_slice(&self.parameters.signature_algorithm.algorithm_identifier());
+        body.extend_from_slice(&tlv(TAG_OCTET_STRING, self.signature));
+        body
+    }
+
+    /// Items 1 to 4 of `ETSI EN 319 122-1` V1.3.1 clause 5.5.3 under
+    /// `algorithm`, with the `ATSHashIndexV3` of clause 5.5.2: the hash
+    /// of every `certificates` and `crls` entry and of every unsigned
+    /// attribute value with its `attrType`, as each is encoded.
+    fn archive_input(&self, content: &[u8], algorithm: DigestAlgorithm) -> ArchiveInputV3 {
+        let hashes = |items: Vec<Vec<u8>>| {
+            let mut list = Vec::new();
+            for item in items {
+                list.extend_from_slice(&tlv(TAG_OCTET_STRING, &algorithm.digest(&item)));
+            }
+            tlv(TAG_SEQUENCE, &list)
+        };
+        let attribute_values = self
+            .timestamps
+            .iter()
+            .map(|token| {
+                let mut value = tlv(TAG_OID, crate::oids::SIGNATURE_TIME_STAMP_TOKEN.as_bytes());
+                value.extend_from_slice(token);
+                value
+            })
+            .collect();
+        let mut index = algorithm.algorithm_identifier();
+        index.extend_from_slice(&hashes(self.certificates()));
+        index.extend_from_slice(&hashes(self.revocation_choices()));
+        index.extend_from_slice(&hashes(attribute_values));
+        let index = tlv(TAG_SEQUENCE, &index);
+
+        let mut input = tlv(TAG_OID, oid::known::DATA.as_bytes());
+        input.extend_from_slice(&algorithm.digest(content));
+        input.extend_from_slice(&self.signer_fields());
+        input.extend_from_slice(&index);
+        ArchiveInputV3 { input, index }
+    }
+
+    /// The `ContentInfo`, its `SignerInfo` carrying the signature
+    /// timestamps and `more_unsigned` as unsigned attributes.
+    fn assemble(
+        &self,
+        encapsulation: Encapsulation,
+        content: &[u8],
+        more_unsigned: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let mut signed_data_body = Vec::new();
+
+        // RFC 5652 sec.5.1: the version is 5 once `crls` carries
+        // anything of the `other` choice, which an OCSP response is.
+        // Leaving it at 1 produces a structure a strict parser rejects.
+        let version = if self.material.ocsp_responses.is_empty() {
+            CMS_VERSION_V1
+        } else {
+            CMS_VERSION_V5
+        };
+        signed_data_body.extend_from_slice(&tlv(TAG_INTEGER, &[version]));
+        signed_data_body.extend_from_slice(&tlv(
+            TAG_SET,
+            &self.parameters.digest_algorithm.algorithm_identifier(),
+        ));
+        signed_data_body.extend_from_slice(&encapsulated_content(encapsulation, content));
+        signed_data_body.extend_from_slice(&tlv(TAG_CONTEXT_0, &self.certificates().concat()));
+        let choices = self.revocation_choices();
+        if !choices.is_empty() {
+            signed_data_body.extend_from_slice(&tlv(TAG_CONTEXT_1, &choices.concat()));
+        }
+
+        let mut signer_info = self.signer_fields();
+        // `unsignedAttrs [1] IMPLICIT`, after the signature because it
+        // is computed over it. A timestamp cannot live among the signed
+        // attributes for the same reason a photograph cannot contain
+        // the camera that took it.
+        let mut unsigned = self.timestamp_attributes();
+        unsigned.extend(more_unsigned.iter().cloned());
+        // DER SET OF is ordered by encoding (X.690 sec.11.6).
+        unsigned.sort_unstable();
+        unsigned.dedup();
+        if !unsigned.is_empty() {
+            signer_info.extend_from_slice(&tlv(TAG_CONTEXT_1, &unsigned.concat()));
+        }
+        signed_data_body.extend_from_slice(&tlv(TAG_SET, &tlv(TAG_SEQUENCE, &signer_info)));
+
+        let signed_data_der = tlv(TAG_SEQUENCE, &signed_data_body);
+
+        // ContentInfo ::= SEQUENCE { contentType, content [0] EXPLICIT }
+        let mut content_info = tlv(TAG_OID, oid::known::SIGNED_DATA.as_bytes());
+        content_info.extend_from_slice(&tlv(TAG_CONTEXT_0, &signed_data_der));
+        tlv(TAG_SEQUENCE, &content_info)
+    }
+}
+
+/// `token`, a `ContentInfo` holding a `SignedData` with one
+/// `SignerInfo`, with `attribute` added to that `SignerInfo`'s unsigned
+/// attributes in DER SET order. Every other octet is kept as the
+/// authority encoded it, so its signature over the signed attributes
+/// still verifies. `None` for any other shape, or one not in DER
+/// definite lengths.
+fn with_unsigned_attribute(token: &[u8], attribute: &[u8]) -> Option<Vec<u8>> {
+    /// The complete TLVs inside `value`, which must tile it exactly.
+    fn children(value: &[u8]) -> Option<Vec<&[u8]>> {
+        let mut out = Vec::new();
+        let mut rest = value;
+        while !rest.is_empty() {
+            let size = crate::ber::BerTlvAny::parse(rest).ok()?.size();
+            let (child, tail) = rest.split_at_checked(size)?;
+            if child.is_empty() {
+                return None;
+            }
+            out.push(child);
+            rest = tail;
+        }
+        Some(out)
+    }
+    /// The value of `der`, a single TLV tagged `tag` spanning it.
+    fn value_of(der: &[u8], tag: u8) -> Option<&[u8]> {
+        let parsed = crate::ber::BerTlvAny::parse(der).ok()?;
+        (parsed.size() == der.len() && parsed.tag() == u16::from(tag)).then(|| parsed.value())
+    }
+
+    let content_info = children(value_of(token, TAG_SEQUENCE)?)?;
+    let [content_type, wrapped] = content_info.as_slice() else {
+        return None;
+    };
+    let signed_data = value_of(value_of(wrapped, TAG_CONTEXT_0)?, TAG_SEQUENCE)?;
+    let mut fields = children(signed_data)?;
+    let signer_infos = children(value_of(fields.pop()?, TAG_SET)?)?;
+    let [signer_info] = signer_infos.as_slice() else {
+        return None;
+    };
+    let mut signer_fields = children(value_of(signer_info, TAG_SEQUENCE)?)?;
+    let mut unsigned: Vec<Vec<u8>> = match signer_fields.last() {
+        Some(last) if last.first() == Some(&TAG_CONTEXT_1) => {
+            let existing = children(value_of(last, TAG_CONTEXT_1)?)?
+                .into_iter()
+                .map(<[u8]>::to_vec)
+                .collect();
+            signer_fields.pop();
+            existing
+        }
+        _ => Vec::new(),
+    };
+    unsigned.push(attribute.to_vec());
+    unsigned.sort_unstable();
+    let mut signer_body = signer_fields.concat();
+    signer_body.extend_from_slice(&tlv(TAG_CONTEXT_1, &unsigned.concat()));
+    let mut signed_body = fields.concat();
+    signed_body.extend_from_slice(&tlv(TAG_SET, &tlv(TAG_SEQUENCE, &signer_body)));
+    let mut outer = content_type.to_vec();
+    outer.extend_from_slice(&tlv(TAG_CONTEXT_0, &tlv(TAG_SEQUENCE, &signed_body)));
+    Some(tlv(TAG_SEQUENCE, &outer))
 }
 
 /// `EncapsulatedContentInfo`: the type, and the content when attached.
@@ -624,59 +886,6 @@ fn encapsulated_content(encapsulation: Encapsulation, content: &[u8]) -> Vec<u8>
     let mut body = tlv(TAG_OID, oid::known::DATA.as_bytes());
     if encapsulation == Encapsulation::Attached {
         body.extend_from_slice(&tlv(TAG_CONTEXT_0, &tlv(TAG_OCTET_STRING, content)));
-    }
-    tlv(TAG_SEQUENCE, &body)
-}
-
-/// One `SignerInfo`, identified by issuer and serial.
-fn signer_info(
-    parameters: &SignerParameters<'_>,
-    attributes: &ToBeSigned,
-    signature: &[u8],
-    timestamps: &[Vec<u8>],
-) -> Vec<u8> {
-    let mut body = Vec::new();
-    body.extend_from_slice(&tlv(TAG_INTEGER, &[CMS_VERSION_V1]));
-    body.extend_from_slice(&issuer_and_serial(parameters.certificate));
-    body.extend_from_slice(&parameters.digest_algorithm.algorithm_identifier());
-
-    // The SET tag the attributes were signed under becomes the implicit
-    // [0] the structure carries. Same contents, same length; only the
-    // first octet differs.
-    let mut tagged_attributes = attributes.as_bytes().to_vec();
-    if let Some(first) = tagged_attributes.first_mut() {
-        *first = TAG_CONTEXT_0;
-    }
-    body.extend_from_slice(&tagged_attributes);
-
-    body.extend_from_slice(&parameters.signature_algorithm.algorithm_identifier());
-    body.extend_from_slice(&tlv(TAG_OCTET_STRING, signature));
-
-    // `unsignedAttrs [1] IMPLICIT`, after the signature because it is
-    // computed over it. A timestamp cannot live among the signed
-    // attributes for the same reason a photograph cannot contain the
-    // camera that took it.
-    //
-    // One attribute instance per token rather than one attribute
-    // holding several values: `EN 319 122-1` says several instances of
-    // signature-time-stamp may occur, from different TSAs, and that is
-    // the shape validators look for. Each token attests the same
-    // signature, so they are alternatives rather than a sequence -- one
-    // surviving is enough.
-    if !timestamps.is_empty() {
-        let mut instances: Vec<Vec<u8>> = timestamps
-            .iter()
-            .map(|token| attribute(crate::oids::SIGNATURE_TIME_STAMP_TOKEN, token.clone()))
-            .collect();
-        // DER SET OF is ordered by encoding, not by the order the
-        // tokens arrived in (X.690 sec.11.6).
-        instances.sort_unstable();
-        instances.dedup();
-        let mut attributes = Vec::new();
-        for instance in instances {
-            attributes.extend_from_slice(&instance);
-        }
-        body.extend_from_slice(&tlv(TAG_CONTEXT_1, &attributes));
     }
     tlv(TAG_SEQUENCE, &body)
 }

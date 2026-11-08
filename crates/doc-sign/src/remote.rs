@@ -1301,9 +1301,15 @@ mod tests {
     }
 
     #[test]
-    fn a_release_build_writes_no_container_when_the_level_is_lost_after_signing() -> TestResult {
-        for format in [Format::AsicEXades, Format::AsicECades] {
-            let dir = TempDir::new("phone-release-container-after-signing")?;
+    fn a_release_build_writes_nothing_of_any_format_when_the_level_is_lost_after_signing()
+    -> TestResult {
+        for format in [
+            Format::AsicEXades,
+            Format::AsicECades,
+            Format::Cades,
+            Format::CadesDetached,
+        ] {
+            let dir = TempDir::new("phone-release-format-after-signing")?;
             let mut phone = ScriptedPhone::p384(Answer::Sign);
             let mut document = one(&dir, format, "note.txt", b"a note", 0)?;
             document.document = DocumentRequest {
@@ -1317,33 +1323,6 @@ mod tests {
                 matches!(reports.as_slice(), [Err(SignErrorKind::Timestamp(_))]),
                 "refused for the lost timestamps",
             )?;
-            check(&signed_files(&dir)?, &0, "no file under any name")?;
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn a_release_build_refuses_a_cms_signature_before_the_phone_is_asked() -> TestResult {
-        for format in [Format::Cades, Format::CadesDetached] {
-            let dir = TempDir::new("phone-release-cms")?;
-            let mut phone = ScriptedPhone::p384(Answer::Sign);
-            let mut document = one(&dir, format, "note.txt", b"a note", 0)?;
-            document.document = DocumentRequest {
-                signer_anchors: vec![phone.certificate.clone()],
-                ..unreachable_lta(SigningBuild::Release)
-            };
-            document.document.format = format;
-            let refused = sign_on_phone(&mut phone, vec![document]);
-            check_true(
-                matches!(
-                    refused,
-                    Err(SignErrorKind::Document(
-                        crate::document::DocumentError::ArchiveUnsupported
-                    ))
-                ),
-                "refused: no archive-time-stamp-v3",
-            )?;
-            check_true(phone.batches.is_empty(), "the phone was never asked")?;
             check(&signed_files(&dir)?, &0, "no file under any name")?;
         }
         Ok(())

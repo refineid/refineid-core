@@ -223,11 +223,10 @@ pub struct DocumentRequest {
     /// leaves that field false: an archive timestamp is added only
     /// after complete LT material has been collected and embedded.
     ///
-    /// Implemented for `PAdES` (a document timestamp), `ASiC-E` with
-    /// `CAdES` (an `ASiCArchiveManifest` and its token) and `ASiC-E`
-    /// with `XAdES` (an `ArchiveTimeStamp`). Standalone `CAdES` needs
-    /// an `archive-time-stamp-v3`, which is not built, so a release
-    /// build refuses it before the card is touched.
+    /// Every format archives: `PAdES` with a document timestamp,
+    /// `ASiC-E` with `CAdES` with an `ASiCArchiveManifest` and its
+    /// token, `ASiC-E` with `XAdES` with an `ArchiveTimeStamp`, and
+    /// `CAdES` with an `archive-time-stamp-v3`.
     ///
     /// A release build signs only at LTA and refuses a request that
     /// leaves this false ([`SignErrorKind::BelowArchivalLevel`]).
@@ -312,16 +311,11 @@ impl DocumentRequest {
                 ));
             }
         }
-        if self.build == SigningBuild::Release {
-            if !self.archive {
-                return Err(SignErrorKind::BelowArchivalLevel {
-                    format: self.format,
-                    requested: self.requested_level(),
-                });
-            }
-            if !format_archives(self.format) {
-                return Err(SignErrorKind::Document(DocumentError::ArchiveUnsupported));
-            }
+        if self.build == SigningBuild::Release && !self.archive {
+            return Err(SignErrorKind::BelowArchivalLevel {
+                format: self.format,
+                requested: self.requested_level(),
+            });
         }
         Ok(())
     }
@@ -389,16 +383,6 @@ impl DocumentRequest {
         let anchors: Vec<&[u8]> = self.signer_anchors.iter().map(Vec::as_slice).collect();
         crate::material::check_path_reachable(leaf_der, signing_time, &anchors).map_err(signer_path)
     }
-}
-
-/// Whether `format` has an archive construction here: the formats a
-/// release build signs.
-#[must_use]
-pub const fn format_archives(format: Format) -> bool {
-    matches!(
-        format,
-        Format::Pades | Format::AsicECades | Format::AsicEXades
-    )
 }
 
 /// Which build is signing, fixed when the program is compiled.
@@ -1392,11 +1376,6 @@ const fn level_below_failure(level: BaselineLevel, error: &SignErrorKind) -> Opt
             _ => level.lower(),
         },
         SignErrorKind::Timestamp(_) => level.lower(),
-        SignErrorKind::Document(DocumentError::ArchiveUnsupported)
-            if matches!(level, BaselineLevel::Lta) =>
-        {
-            level.lower()
-        }
         _ => None,
     }
 }
@@ -1466,10 +1445,11 @@ fn assemble_at_requested_level(
         ValidationMaterial::default()
     };
     let token_bytes: Vec<Vec<u8>> = tokens.iter().map(|token| token.token().to_vec()).collect();
-    // The containers archive through octets built from the finished
-    // signature -- a second manifest for CAdES, the ArchiveTimeStamp
-    // input for XAdES -- so they branch here rather than after
-    // assembly.
+    // The containers and CMS signatures archive through octets built
+    // from the finished signature -- a second manifest for ASiC-E with
+    // CAdES, the ArchiveTimeStamp input for XAdES, the
+    // archive-time-stamp-v3 input for CAdES -- so they branch here
+    // rather than after assembly.
     if request.archive
         && let Some(archive_input) =
             plan.archive_input(parameters, signature_bytes, &token_bytes, &material)
@@ -1492,12 +1472,6 @@ fn assemble_at_requested_level(
             },
         )?;
         return Ok(AssembledDocument::new(archived, &tokens, true));
-    }
-    // A format without an archive construction cannot reach LTA. A
-    // release build refused it before signing; a development build
-    // lowers to LT on this.
-    if request.archive && !format_archives(request.format) {
-        return Err(SignErrorKind::Document(DocumentError::ArchiveUnsupported));
     }
     let document = plan
         .finish(parameters, signature_bytes, &token_bytes, &material)
@@ -1526,7 +1500,7 @@ fn assemble_at_requested_level(
     ))
 }
 
-/// A container at level LTA: `archive_input` from
+/// A container or CMS signature at level LTA: `archive_input` from
 /// [`DocumentPlan::archive_input`] of the same arguments, its digest
 /// handed to `obtain`, and the token `obtain` returns written in.
 ///
@@ -2434,19 +2408,22 @@ mod tests {
         request.timestamp_credentials = None;
         request.format = Format::Cades;
         check_true(
-            matches!(
-                request.validate_signing_policy(),
-                Err(SignErrorKind::Document(DocumentError::ArchiveUnsupported))
-            ),
-            "unsupported archive format rejected before card access",
+            request.validate_signing_policy().is_ok(),
+            "a CMS signature archives too",
         )
     }
 
-    /// A release build signs at `B-LTA` or not at all: below it every
-    /// format is refused, and a format without an archive construction
-    /// is refused at it, both before the card is asked.
+    /// A release build signs every format at `B-LTA` and refuses any
+    /// lower request before the card is asked.
     #[test]
     fn a_release_build_signs_every_format_only_at_lta() -> TestResult {
+        let formats = [
+            Format::Pades,
+            Format::AsicECades,
+            Format::AsicEXades,
+            Format::Cades,
+            Format::CadesDetached,
+        ];
         let lta = |format| DocumentRequest {
             format,
             archive: true,
@@ -2457,38 +2434,18 @@ mod tests {
             timestamp_authorities: vec!["https://tsa.example/qualified".to_owned()],
             ..pades_request()
         };
-        for format in [Format::Pades, Format::AsicECades, Format::AsicEXades] {
-            check_true(format_archives(format), "an archiving format")?;
+        for format in formats {
             check_true(
                 lta(format).validate_signing_policy().is_ok(),
-                "a container or a PDF is signed at LTA",
+                "every format is signed at LTA",
             )?;
-        }
-        for format in [Format::Cades, Format::CadesDetached] {
-            check_true(!format_archives(format), "no archive-time-stamp-v3")?;
-            check_true(
-                matches!(
-                    lta(format).validate_signing_policy(),
-                    Err(SignErrorKind::Document(DocumentError::ArchiveUnsupported))
-                ),
-                "a format that cannot reach LTA is refused",
-            )?;
-        }
-        for format in [
-            Format::Pades,
-            Format::AsicECades,
-            Format::AsicEXades,
-            Format::Cades,
-            Format::CadesDetached,
-        ] {
             let long_term = DocumentRequest {
                 archive: false,
                 ..lta(format)
             };
-            let refused = long_term.validate_signing_policy();
             check_true(
                 matches!(
-                    refused,
+                    long_term.validate_signing_policy(),
                     Err(SignErrorKind::BelowArchivalLevel {
                         requested: BaselineLevel::Lt,
                         ..
@@ -2508,30 +2465,6 @@ mod tests {
             &refused.to_string(),
             &"a release build signs only at B-LTA, not ASiC-E XAdES B-LT".to_owned(),
             "the reason",
-        )
-    }
-
-    /// A development build signs a format without an archive
-    /// construction too, and saves it at the `B-LT` it reaches.
-    #[cfg(debug_assertions)]
-    #[test]
-    fn a_development_build_lowers_a_format_without_an_archive_to_lt() -> TestResult {
-        let request = DocumentRequest {
-            format: Format::CadesDetached,
-            archive: true,
-            long_term: true,
-            timestamp_authorities: vec!["https://tsa.example/qualified".to_owned()],
-            build: SigningBuild::Development,
-            ..pades_request()
-        };
-        check_true(request.validate_signing_policy().is_ok(), "signed")?;
-        check(
-            &level_below_failure(
-                BaselineLevel::Lta,
-                &SignErrorKind::Document(DocumentError::ArchiveUnsupported),
-            ),
-            &Some(BaselineLevel::Lt),
-            "lowered to LT",
         )
     }
 

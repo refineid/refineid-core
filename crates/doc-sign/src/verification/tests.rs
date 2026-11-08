@@ -4089,7 +4089,7 @@ fn a_live_lookup_asks_nothing_for_an_unanchored_chain() {
     assert_eq!(source.ocsp_asked.get(), 0);
 }
 
-/// The containers' archive construction, as the signing service
+/// The archive construction of a container or CMS signature, as the signing service
 /// assembles it after the card signed: the issued signer over the note,
 /// a signature timestamp from the world's authority, the LT material,
 /// then the archive timestamp `obtain` answers with over the digest of
@@ -4156,24 +4156,35 @@ fn archive_answer(
     crate::timestamp::verify_token(&token, |_algorithm| digest.to_vec()).expect("token verifies")
 }
 
-/// Every LTA container verifies with its archive timestamp anchored, and
-/// stands on it once the signature timestamp's authority is no longer
-/// trusted: `ETSI EN 319 162-1` V1.1.1 clause 4.4.5, through an
-/// `xadesv141:ArchiveTimeStamp` for `XAdES` (`ETSI EN 319 132-1` V1.3.1
-/// clause 5.5.2.3) and an `ASiCArchiveManifest` for `CAdES` (annex A.7).
+/// Every format but `PAdES` signed at LTA verifies with its archive
+/// timestamp anchored, and stands on it once the signature timestamp's
+/// authority is no longer trusted: for `ASiC-E` (`ETSI EN 319 162-1`
+/// V1.1.1 clause 4.4.5) an `xadesv141:ArchiveTimeStamp` for `XAdES`
+/// (`ETSI EN 319 132-1` V1.3.1 clause 5.5.2.3) and an
+/// `ASiCArchiveManifest` for `CAdES` (annex A.7); for a CMS signature,
+/// attached or detached, an `archive-time-stamp-v3` (`ETSI EN 319
+/// 122-1` V1.3.1 clause 5.5.3).
 #[test]
-fn a_container_signed_at_lta_stands_on_its_archive_timestamp() {
+fn every_format_signed_at_lta_stands_on_its_archive_timestamp() {
     let world = World::new();
     let archive = ArchiveAuthority::new();
     for (format, form) in [
         (Format::AsicEXades, ArchiveForm::Xades),
         (Format::AsicECades, ArchiveForm::AsicArchiveManifest),
+        (Format::Cades, ArchiveForm::CadesV3),
+        (Format::CadesDetached, ArchiveForm::CadesV3),
     ] {
-        let container = container_archived_by(&world, format, |digest| {
+        let signed = container_archived_by(&world, format, |digest| {
             Ok(archive_answer(&archive, digest))
         })
         .expect("archived");
-        let report = verify_expired(container.clone(), &archive.anchors(&world));
+        let file = if format == Format::CadesDetached {
+            DocumentFile::detached_cms(signed, NOTE.to_vec())
+        } else {
+            DocumentFile::from_file(signed)
+        }
+        .expect("a known shape");
+        let report = verify(&file, &archive.anchors(&world), day(EXPIRED)).expect("report");
         let signature = only(&report);
         assert!(signature.document_intact(), "{format:?}");
         assert!(signature.signature_valid(), "{format:?}");
@@ -4281,12 +4292,17 @@ fn an_archive_manifest_whose_digest_does_not_hold_is_invalid() {
     );
 }
 
-/// A release build that cannot have the archive timestamp assembles no
-/// container: the refusal is the result, and there are no bytes to save.
+/// A release build that cannot have the archive timestamp assembles
+/// nothing: the refusal is the result, and there are no bytes to save.
 #[test]
-fn a_container_whose_archive_timestamp_is_refused_is_not_assembled() {
+fn a_signature_whose_archive_timestamp_is_refused_is_not_assembled() {
     let world = World::new();
-    for format in [Format::AsicEXades, Format::AsicECades] {
+    for format in [
+        Format::AsicEXades,
+        Format::AsicECades,
+        Format::Cades,
+        Format::CadesDetached,
+    ] {
         let refused = container_archived_by(&world, format, |_digest| {
             Err(crate::service::SignErrorKind::Timestamp(
                 "every authority declined".to_owned(),

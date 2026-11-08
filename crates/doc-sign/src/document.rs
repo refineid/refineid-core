@@ -93,10 +93,13 @@ pub enum DocumentError {
     Pdf(PdfError),
     /// The `XAdES` could not be built.
     Xades(XadesError),
-    /// An archive timestamp was asked of a format that has no archive
-    /// construction here, so it cannot reach level LTA: standalone
-    /// `CAdES`, whose `archive-time-stamp-v3` is not built.
+    /// [`DocumentPlan::finish_archived`] was asked of `PAdES`, which
+    /// archives with a document timestamp over the finished file.
     ArchiveUnsupported,
+    /// The archive timestamp token is not a `ContentInfo` holding a
+    /// `SignedData` with one `SignerInfo` in DER, so its
+    /// `ats-hash-index-v3` cannot be added.
+    ArchiveTokenUnreadable,
     /// A data object cannot be carried under the name it was given.
     ///
     /// A container reserves `mimetype` and everything under
@@ -127,7 +130,10 @@ impl core::fmt::Display for DocumentError {
             Self::Pdf(error) => write!(f, "PDF: {error}"),
             Self::Xades(error) => write!(f, "XAdES: {error}"),
             Self::ArchiveUnsupported => {
-                f.write_str("this format has no archive timestamp here, so it cannot reach B-LTA")
+                f.write_str("a PDF is archived with a document timestamp, not this way")
+            }
+            Self::ArchiveTokenUnreadable => {
+                f.write_str("the archive timestamp token is not a DER SignedData with one signer")
             }
             Self::UnusableObjectName => f.write_str(
                 "a file name is reserved, repeated, absolute, escaping, or not portable in a ZIP container",
@@ -380,9 +386,13 @@ impl DocumentPlan {
     /// caller hands their digest to an authority and the token back to
     /// [`Self::finish_archived`] with the same arguments.
     ///
+    /// - `CAdES`, attached or detached: the input of an
+    ///   `archive-time-stamp-v3` (`ETSI EN 319 122-1` V1.3.1 clause
+    ///   5.5.3) under the signer's digest, its `ats-hash-index-v3`
+    ///   (clause 5.5.2) built from the same arguments.
+    ///
     /// `None` for `PAdES`, which archives with a document timestamp
-    /// over the finished file, and for standalone `CAdES`, whose
-    /// `archive-time-stamp-v3` is not built here.
+    /// over the finished file.
     #[must_use]
     pub fn archive_input(
         &self,
@@ -412,19 +422,40 @@ impl DocumentPlan {
                 signature: ref plan,
                 ref objects,
             } => Some(plan.archive_input(objects, signature, timestamps, material)),
-            State::Cades { .. } | State::Pades { .. } => None,
+            State::Cades {
+                ref attributes,
+                ref content,
+                ..
+            } => {
+                let der = for_cms(parameters.signature_algorithm, signature).ok()?;
+                Some(
+                    cades::archive_input_v3(
+                        parameters,
+                        attributes,
+                        &der,
+                        content,
+                        material,
+                        timestamps,
+                        parameters.digest_algorithm,
+                    )
+                    .input()
+                    .to_vec(),
+                )
+            }
+            State::Pades { .. } => None,
         }
     }
 
-    /// Assemble an `ASiC-E` container at level LTA, `token` being an
-    /// RFC 3161 token over [`Self::archive_input`] of the same
+    /// Assemble a container or a CMS signature at level LTA, `token`
+    /// being an RFC 3161 token over [`Self::archive_input`] of the same
     /// arguments.
     ///
     /// # Errors
     /// [`DocumentError::MalformedEcdsaSignature`] as for
-    /// [`Self::finish`], [`DocumentError::ContainerTooLarge`], or
-    /// [`DocumentError::ArchiveUnsupported`] for a format that does not
-    /// archive this way.
+    /// [`Self::finish`], [`DocumentError::ContainerTooLarge`],
+    /// [`DocumentError::ArchiveTokenUnreadable`] for a `CAdES` token
+    /// that cannot carry its hash index, or
+    /// [`DocumentError::ArchiveUnsupported`] for `PAdES`.
     pub fn finish_archived(
         self,
         parameters: &SignerParameters<'_>,
@@ -460,7 +491,27 @@ impl DocumentPlan {
                 let document = plan.finish_archived(signature, timestamps, material, token);
                 asic::xades_container(&objects, &document).ok_or(DocumentError::ContainerTooLarge)
             }
-            State::Cades { .. } | State::Pades { .. } => Err(DocumentError::ArchiveUnsupported),
+            State::Cades {
+                attributes,
+                encapsulation,
+                content,
+                ..
+            } => {
+                let der = for_cms(parameters.signature_algorithm, signature)?;
+                cades::signed_data_archived(
+                    parameters,
+                    &attributes,
+                    &der,
+                    encapsulation,
+                    &content,
+                    material,
+                    timestamps,
+                    token,
+                    parameters.digest_algorithm,
+                )
+                .ok_or(DocumentError::ArchiveTokenUnreadable)
+            }
+            State::Pades { .. } => Err(DocumentError::ArchiveUnsupported),
         }
     }
 }

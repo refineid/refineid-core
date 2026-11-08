@@ -1105,11 +1105,15 @@ pub(crate) fn parse_xref_section(pdf: &[u8], offset: usize) -> Result<XrefSectio
                 .ok_or(PdfError::MissingTrailer)?;
             let flag = read_pdf_token(pdf, &mut cursor).ok_or(PdfError::MissingTrailer)?;
             let number = start.checked_add(index).ok_or(PdfError::MissingTrailer)?;
-            let location = if flag == XREF_IN_USE {
+            // An in-use entry at offset 0 points at the file header, where
+            // no object can start; writers emit it for an unused number,
+            // and a reference to it is the null object (ISO 32000-1
+            // sec.7.3.10).
+            let location = if flag == XREF_IN_USE && object_offset != 0 {
                 XrefLocation::Direct {
                     offset: object_offset,
                 }
-            } else if flag == XREF_FREE {
+            } else if flag == XREF_IN_USE || flag == XREF_FREE {
                 XrefLocation::Free
             } else {
                 return Err(PdfError::MissingTrailer);

@@ -19,7 +19,7 @@ error[E0599]: the method `change_pin1_after_pin1_pace` exists for mutable refere
   --> tests/ui/no_pin1_change_without_pin1_channel.rs:10:21
    |
 10 |     let _ = channel.change_pin1_after_pin1_pace(l, new, ChannelProof::PaceHandshake);
-   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^ method cannot be called on `&mut SmTransport<T, OpenedByPin2>` due to unsatisfied trait bounds
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
    |
   ::: src/secure_messaging.rs
    |

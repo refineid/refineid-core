@@ -62,8 +62,9 @@ pub enum ResultError {
     UnsupportedParameter,
     /// The holder declined on the screen.
     UserCancelled,
-    /// The card reports fewer than three remaining attempts for the PIN; no
-    /// verification was sent.
+    /// The card reports two or one remaining attempts for the PIN, or its
+    /// counter cannot be read, and no verification was sent; or the PIN has
+    /// no tries left or is blocked.
     RetryFloor,
     /// The card did not answer.
     CardError,

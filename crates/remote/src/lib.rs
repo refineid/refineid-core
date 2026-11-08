@@ -348,7 +348,8 @@ pub enum RemoteOperation {
     ReadCertificate(CertificateKind),
     /// Authenticate a browser challenge after holder consent on the phone.
     BrowserAuthenticate {
-        /// Relying-party origin shown to the holder.
+        /// The requester's own label for what is asking; it names no site
+        /// and is not shown to the holder (RAPP section 11 item 1).
         origin: DisplayText,
         /// The validated digest-signing request.
         request: SignatureRequest,

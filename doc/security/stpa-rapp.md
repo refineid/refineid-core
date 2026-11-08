@@ -305,8 +305,8 @@ Alice withdraws, the pairing ends, or another card appears.
 **Lesson:** some visitors only ask once; have the answer ready, and
 bound how long a stale answer may live.
 
-- L-3; H-5, H-7. UCA-50, UCA-27, UCA-62.
-- CC-64.
+- L-3; H-5, H-7. UCA-50, UCA-27, UCA-62, UCA-126.
+- CC-64, CC-125.
 - Spec §8.4 item 3. Residual R-3.
 
 ### 9. The PIN asked twice
@@ -341,8 +341,10 @@ signature; the card refused, and Alice reported the outcome as unknown.
 
 **The good day.** A remembered PIN ends when the card refuses it. Alice
 reads the tries left before any PIN command, and again after any
-outcome she could not see; with fewer than three tries left she sends
-nothing and tells Carol why. She checks PIN 1 before every signature.
+outcome she could not see; with two or one tries left, or a count she
+cannot read, she sends nothing and tells Carol why. With no tries left
+the card answers for itself and spends nothing. She checks PIN 1 before
+every signature.
 A refusal is reported as a refusal.
 
 **Lesson:** a PIN try is Carol's, not the software's. Never spend one on
@@ -610,7 +612,7 @@ the requester; a part named after a colon is one program of it.
 | UCA-13 | Phone | Reports a card present when no card can answer. | P | H-3 | CC-65 |
 | UCA-14 | Phone | Publishes a discovery or withdrawal value derivable from a stable identifier. | P | H-6 | Spec §4.1, §4.3, §4.5 |
 | UCA-15 | Computer | Sends a digest that is not of the document the user chose. | P | H-1 | CC-12, CC-109 |
-| UCA-16 | Computer: browser module | Offers the cached certificate while another card is on the phone. | P | H-3, H-5 | CC-19, CC-60 |
+| UCA-16 | Computer: browser module | Offers the certificate it holds in memory while another card is on the phone. | P | H-3, H-5 | CC-19, CC-60 |
 | UCA-17 | Computer: browser module | Holds a session for hours with no login wanted. | D | H-6, H-7 | R-10 |
 | UCA-18 | Computer: browser module | Redials after `pairing_revoked` before the record is marked revoked. | P | H-4 | CC-22 |
 | UCA-19 | Computer: browser module | Holds the pairing lock while the record lacks a certificate, so nothing fetches it. | P | H-5, H-7 | CC-18 |
@@ -643,7 +645,7 @@ the requester; a part named after a colon is one program of it.
 | UCA-47 | Phone | Skips the PIN check, trusting its memory of an earlier one. | P | H-3, H-5 | CC-43 |
 | UCA-48 | Computer | Searches for the phone by multicast alone. | P | H-3, H-7 | CC-44 |
 | UCA-49 | Computer | Reports no phone after a search that never reached it. | P | H-5 | CC-44, CC-116 |
-| UCA-50 | Computer: browser module | Offers no token before the session opens, and the browser never asks again. | N | H-5, H-7 | CC-64 |
+| UCA-50 | Computer: browser module | Offers no token before the session opens, and the browser never asks again. | N | H-5, H-7 | CC-64, CC-125 |
 | UCA-51 | Phone | Refuses a second computer's session. | N | H-5, H-7 | CC-58, CC-74 |
 | UCA-52 | Computer | Releases an idle Bluetooth link to a backgrounded phone. | P | H-5, H-7 | CC-50 |
 | UCA-53 | Computer | Says the phone is not found when it is only in the background. | P | H-5 | CC-116 |
@@ -662,7 +664,7 @@ the requester; a part named after a colon is one program of it.
 | UCA-66 | Phone | Admits a session on a second transport that cuts an operation. | P | H-5, H-7 | CC-74 |
 | UCA-67 | Phone | Keeps its network listener published while suspended. | P | H-5, H-7 | CC-68 |
 | UCA-68 | Phone | Commands an NFC card from the background. | P | H-5, H-7 | CC-69 |
-| UCA-69 | Phone | Reports the card absent while locked only because protected data is unavailable. | P | H-7 | CC-70 |
+| UCA-69 | Phone | Reports the card absent while locked only because protected data is unavailable. A locked phone admits the session and answers card status, but starts no credential use (`credential-custody.md`). | P | H-7 | CC-70 |
 | UCA-70 | Computer | Opens a second Bluetooth link from another of its programs. | P | H-5, H-7 | CC-78 |
 | UCA-71 | Computer | Keeps dialing the network address of a suspended phone. | P | H-7 | CC-72 |
 | UCA-72 | Phone | Refuses a Bluetooth write with an error that starts operating-system bonding. | P | H-5 | CC-73 |
@@ -717,6 +719,9 @@ the requester; a part named after a colon is one program of it.
 | UCA-122 | Phone | Holds a card session that blocks every later card event. | D | H-3, H-7 | CC-41 |
 | UCA-123 | Computer | Keeps trying to deliver its revocation beyond the bound. | D | H-4, H-6 | CC-118 |
 | UCA-124 | Either | Acts as if the peer received its goodbye (`service_withdrawn` or `pairing_revoked` close) when the peer never did. | P | H-4, H-5 | CC-123 |
+| UCA-125 | Computer | Sends a made-up file name, or one the asking program supplied, for a signature whose program named no document. | P | H-1, H-5 | CC-124 |
+| CC-125 | Every browser-module call that can show whether the phone's token is there or what it holds reads the phone first, as a request for the card: with no session open the computer dials, and the call waits at most 3 s for a session to confirm the card. No call is granted a wait for 5 s after a wait that raised the token, nor for 30 s after one that raised none; a call during a wait shares it; the non-blocking event poll never waits. The token stands only on a certificate the phone confirmed on a session. | §8.4 item 3 |
+| UCA-126 | Computer: browser module | Answers the browser's question about the phone's token from what it held before the question, without asking the phone, so a handshake that lists no slots finds no token. | N | H-7 | CC-125 |
 
 ### Controller constraints in force
 
@@ -729,8 +734,8 @@ the requester; a part named after a colon is one program of it.
 | CC-10 | The computer treats keychain and token queries as hints and never withdraws an identity on their answer alone. | |
 | CC-11 | The computer bounds every dial and every operation with its own deadline, so a local program always gets an answer. | |
 | CC-12 | The computer's path from the chosen file to the digest it sends is analysed and tested as its own loop (CC-109 to CC-112). | |
-| CC-18 | Whichever process on the computer holds the session fetches a missing certificate and writes it to the pairing record; the read spends no PIN try. | |
-| CC-19 | The computer checks every signature against the cached certificate's key before handing it on; a signature that fails is a device error, never handed on, and the cache is dropped so the next session reads the card again. | |
+| CC-18 | Whichever process on the computer holds the session reads a missing certificate on it and holds it in memory only; no store keeps it ([certificate custody](certificate-custody.md)), and the read spends no PIN try. | |
+| CC-19 | The computer checks every signature against the confirmed certificate's key before handing it on; a signature that fails is a device error, never handed on, and the certificate is dropped so the next session reads the card again. | |
 | CC-20 | The browser module's operation deadline is one named constant below the browsers' handshake timeouts, sent as the operation's lifetime; a late result ends with its session. | §8.1 |
 | CC-22 | A `pairing_revoked` close marks the record revoked before any new dial. | §4.6 item 4 |
 | CC-23 | The pairing lock is a session lock that the kernel releases when its holder exits; record rewrites are atomic renames after a re-read; the session holder re-reads the record at every ping and ends a revoked pairing's session with `pairing_revoked`. | §4.6 item 1 |
@@ -771,7 +776,7 @@ the requester; a part named after a colon is one program of it.
 | CC-66 | PIN 1 is asked once and held only in memory, until the card is removed or replaced, refuses it, the holder clears it, the process ends or the device restarts. PIN 2 is asked for every signature or batch. The PIN prompt is the consent. | §8.2 item 3, §11 item 2 |
 | CC-68 | In the background, with Bluetooth serving, the phone closes an idle stream session and unpublishes its stream listener; it publishes again in the foreground. | |
 | CC-69 | An NFC card command from the background first summons the holder (a notification and `waiting_for_card`) for a bounded wait; otherwise the operation ends with `card_error`. | §8.2 item 4 (`waiting_for_card`) |
-| CC-70 | While the phone is locked and protected data is unavailable, it keeps the card status it last read. | |
+| CC-70 | While the phone is locked and protected data is unavailable, it keeps the card status it last read. It admits the session and answers card status, but starts no credential use (`credential-custody.md`). | §8.2 item 3 |
 | CC-72 | A stream dial that fails while discovery still shows the phone sends the next dial over Bluetooth. | |
 | CC-73 | A refused or closed Bluetooth link answers writes with "write not permitted", never an authentication or encryption error. | |
 | CC-74 | No session is displaced or refused for being busy, on any transport, and no session cuts another's admitted operation. | §8.2 item 2, §8.3 |
@@ -819,6 +824,7 @@ the requester; a part named after a colon is one program of it.
 | CC-121 | A failed store of the pair record ends the pairing with `pairing.abort` and tells the user why. | §4.3 item 4 |
 | CC-122 | Only the holder's click moves the computer's remote-use switch; a revocation by the phone or idle expiry leaves it on and offers the code entry. | §4.7, hierarchy §5.2 |
 | CC-123 | A goodbye is acknowledged: the receiver of a `session.close` answers with its own close carrying the same reason, then closes the transport. The sender waits for the echo within its existing bound (1 s with a session open, the 10 s revocation attempt) and treats a goodbye without the echo as not known to be delivered: the stated limit for that case applies (R-1, R-2, R-9). | §7.1 item 7; §4.5 items 8 and 9; §4.6 item 4; X-12 |
+| CC-124 | A signature a program asks for with a digest alone carries, as its `document_name`, a description the computer composes: the program as the computer identifies its image, the computer, and that no document was named. Refusing the request instead would leave the holder no way to sign from such a program. | §9.3; §11 item 1 |
 
 ### Retired identifiers
 
@@ -858,5 +864,5 @@ the requester; a part named after a colon is one program of it.
 | R-11 | Over Bluetooth a Mac reaches the phone only while its app runs, and an NFC command from the background needs the holder to answer a notification. An iPad's extension dials its own session beside its app's. | The phone serves all of them (CC-58). |
 | R-12 | The phone's own preparation of a reader card may run between two card exchanges of one operation. | It never splits one exchange and sends no PIN. |
 | R-13 | A wall clock set far ahead expires pairings early; one set back delays expiry. | A new pairing; the recorded time never moves back. |
-| R-14 | A card other than the cached one that shares the access number signs one login challenge that is never delivered; a renewed card costs one failed login. | The check of CC-19 drops the cache. |
+| R-14 | A card other than the one read that shares the access number signs one login challenge that is never delivered; a renewed card costs one failed login. | The check of CC-19 drops the certificate. |
 | R-15 | A timestamp authority that refuses one document of a batch leaves the others written. | The refused one is reported. |

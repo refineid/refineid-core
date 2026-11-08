@@ -18,8 +18,10 @@
 //! reconstructed as types whose constructors preserve their invariants.
 //! The verification chain consumes a validated PIN through a
 //! crate-private path and ships it as a credential command, consumed
-//! exactly once; the retry floor serves a PIN 1 or PIN 2 attempt only at
-//! five, four or three tries left, the one floor every surface stops at.
+//! exactly once; the retry floor refuses a PIN 1 or PIN 2 attempt at two
+//! or one tries left or an unreadable counter and sends it otherwise, the
+//! card answering for itself at zero or blocked, the one floor every
+//! surface stops at.
 
 pub mod activation;
 pub mod credentials;
@@ -41,8 +43,8 @@ pub use credentials::{
 };
 pub use manage::{ManageOutcome, PinManageOps, classify_manage_sw};
 pub use pace_channel::{
-    ChannelProof, Pin1PaceChannel, Pin1PaceChannelOps, PukPaceChannel, PukPaceChannelOps,
-    lowered_counter,
+    ChannelProof, Pin1PaceChannel, Pin1PaceChannelOps, Pin2ChangeError, Pin2PaceChannel,
+    Pin2PaceChannelOps, PukPaceChannel, PukPaceChannelOps, counter_after_verify, lowered_counter,
 };
 pub use pace_password::{PACE_PASSWORD_KEY_LEN, PacePasswordKey};
 pub use pin_lengths::{

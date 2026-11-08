@@ -27,6 +27,14 @@
 //! with it the card-side crates it is built on. A platform without
 //! PC/SC builds with `--no-default-features` and brings its own card
 //! session to the same finish.
+//!
+//! What a signing does when its requested level cannot be reached is
+//! fixed by the build, never at runtime ([`service::SigningBuild`]): a
+//! release build refuses with the reason and saves nothing, checking
+//! the signer's path before the PIN is asked for; a development build
+//! saves the highest level reached under a `-dev-<level>` name and
+//! reports why ([`service::BelowRequestedLevel`]). The repository's
+//! `doc/architecture/signing-levels.md` states the rule.
 
 #![forbid(unsafe_code)]
 
@@ -80,7 +88,6 @@ pub mod testkit;
 pub mod text;
 pub mod timestamp;
 pub mod trust;
-pub mod trust_roots;
 pub mod uri;
 pub mod validation;
 pub mod verification;

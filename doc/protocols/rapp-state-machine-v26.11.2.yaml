@@ -1007,7 +1007,7 @@ invariants:
   - id: INV-09
     statement: pin_can_and_puk_never_leave_the_custodian
   - id: INV-10
-    statement: no_pin_verification_below_minimum_remaining_attempts
+    statement: no_pin_verification_spends_a_try_below_minimum_remaining_attempts
   - id: INV-11
     statement: version_suite_grants_and_transport_are_transcript_bound
   - id: INV-12

@@ -29,9 +29,10 @@ use core::fmt;
 use std::path::PathBuf;
 
 use super::{
-    AssembledDocument, DocumentRequest, LocalVerifyOutcome, SignErrorKind, SignOutput, SignReport,
-    SignSlot, SigningDevice, document_signer, ensure_visible_signature_format, finish_document,
-    load_data_objects, verify_against_certificate,
+    AssembledDocument, BelowRequestedLevel, DocumentRequest, LocalVerifyOutcome, SignErrorKind,
+    SignOutput, SignReport, SignSlot, SigningDevice, document_signer,
+    ensure_visible_signature_format, finish_document, load_data_objects,
+    verify_against_certificate,
 };
 use crate::digest::Sha256;
 use crate::document::{self, DocumentPlan};
@@ -43,8 +44,8 @@ use refineid_apdu::CardTransport;
 use refineid_apdu::status_word::StatusWord;
 use refineid_auth::credentials::{PIN_MAX_LENGTH, PIN_MIN_LENGTH};
 use refineid_auth::{
-    CredentialInputError, Pin1, Pin2, PinOps as _, PinReferenceScheme, PinSlot, RetryFloorRefusal,
-    UnvalidatedSecret, VerifyOutcome, check_retry_floor,
+    AuthError, CredentialInputError, Pin1, Pin2, PinOps as _, PinReferenceScheme, PinSlot,
+    RetryFloorRefusal, UnvalidatedSecret, VerifyOutcome, check_retry_floor,
 };
 use refineid_cms::x509::{
     Certificate, EcCurve, MessageSignatureAlgorithm, OwnedCert, PublicKeyAlgorithm,
@@ -403,7 +404,10 @@ fn unlock_slot_key<'t, T: CardTransport>(
             let pin1 = Pin1::reconstruct(secret()).map_err(|e| pin_policy_refusal(slot, e))?;
             let outcome = transport
                 .verify_pin1_with_scheme(scheme, pin1)
-                .map_err(|e| ReaderSignError::Transport(format!("{e}")))?;
+                .map_err(|e| match e {
+                    AuthError::RetryFloor(refusal) => ReaderSignError::RetryFloor(refusal),
+                    other => ReaderSignError::Transport(format!("{other}")),
+                })?;
             match outcome {
                 VerifyOutcome::Ok => Ok(transport.authentication_key(sign_scheme)),
                 rejected @ (VerifyOutcome::WrongPin { .. }
@@ -438,6 +442,9 @@ fn unlock_err_to_kind<TE: fmt::Display>(
         },
         directory @ QualifiedUnlockError::Directory(_) => {
             ReaderSignError::Transport(format!("{directory}"))
+        }
+        QualifiedUnlockError::Verify(AuthError::RetryFloor(refusal)) => {
+            ReaderSignError::RetryFloor(refusal)
         }
         QualifiedUnlockError::Verify(verify) => ReaderSignError::Transport(format!("{verify}")),
     }
@@ -680,9 +687,11 @@ where
 
     let signature_len = chain.signature_bytes.len();
     let output_len = chain.output_bytes.len();
-    let signature_path = options
-        .output
-        .write(chain.best_signature_time, &chain.output_bytes)?;
+    let signature_path = options.output.write(
+        chain.best_signature_time,
+        chain.below_requested_level.as_ref(),
+        &chain.output_bytes,
+    )?;
 
     let cert_path = if let Some(path) = &options.save_cert {
         std::fs::write(path, chain.cert_der.as_bytes()).map_err(|source| {
@@ -710,6 +719,7 @@ where
         cert_subject_cn: chain.cert_subject_cn,
         pin_retries_after: chain.pin_retries_after,
         local_verify: chain.local_verify,
+        below_requested_level: chain.below_requested_level,
     })
 }
 
@@ -825,6 +835,7 @@ fn prepare_on_card<T: CardTransport>(
                 document_signer(&cert, cert.spki.algorithm(), slot, request.signing_time)?;
             let objects = load_data_objects(&options.input, request, input_bytes)?;
             ensure_visible_signature_format(request)?;
+            request.check_signer_path(cert_der.as_bytes())?;
             Some(
                 document::plan(request.format, objects, &parameters, &request.metadata)
                     .map_err(SignErrorKind::Document)?,
@@ -847,7 +858,10 @@ fn prepare_on_card<T: CardTransport>(
     })
 }
 
-/// Refuse when the slot's PIN counter is below the shared retry floor.
+/// Refuse when the slot's PIN counter is below the shared retry floor,
+/// before the PIN is asked for. The VERIFY applies the same rule on its
+/// own probe when the PIN is presented; this earlier reading spares the
+/// holder a prompt whose entry would not be sent.
 fn check_slot_retry_floor<T: CardTransport>(
     transport: &mut T,
     slot: SignSlot,
@@ -863,8 +877,8 @@ fn check_slot_retry_floor<T: CardTransport>(
 ///
 /// The prompt is the one moment the card is out of the flow's hands,
 /// so the card that answers VERIFY must be the card prepared: its
-/// serial is read again and compared, and its counter checked against
-/// the floor again, before the PIN is sent.
+/// serial is read again and compared before the PIN is sent. The VERIFY
+/// then reads the counter again and applies the retry floor itself.
 fn commit_on_card<T: CardTransport>(
     transport: &mut T,
     slot: SignSlot,
@@ -878,7 +892,6 @@ fn commit_on_card<T: CardTransport>(
             CARD_CHANGED_DURING_PROMPT.to_owned(),
         ));
     }
-    check_slot_retry_floor(transport, slot, prepared.scheme)?;
 
     let signed_octets: &[u8] = prepared
         .plan
@@ -965,6 +978,9 @@ struct SignChainOutput {
     output_bytes: Vec<u8>,
     /// Rule E7 local-verify outcome.
     local_verify: LocalVerifyOutcome,
+    /// Set when a development build saved the document below the
+    /// requested level.
+    below_requested_level: Option<BelowRequestedLevel>,
 }
 
 /// Complete the signature once the card session is closed.
@@ -995,6 +1011,7 @@ fn finish_signature(
             bytes: signature_bytes.clone(),
             timestamps: 0,
             best_signature_time: None,
+            below_requested: None,
         },
     };
 
@@ -1007,6 +1024,7 @@ fn finish_signature(
         best_signature_time: assembled.best_signature_time,
         output_bytes: assembled.bytes,
         local_verify,
+        below_requested_level: assembled.below_requested,
     })
 }
 
@@ -1318,27 +1336,30 @@ mod tests {
         /// Fill byte of the card's synthetic signature.
         const ANSWER_FILL: u8 = b'S';
         /// The instructions an organization card sees last when it signs
-        /// with the qualified key.
+        /// with the qualified key: SELECT MF, SELECT DF.ESIGN, the
+        /// VERIFY's own counter probe, VERIFY PIN 2, MSE:Set and the one
+        /// inline PSO:CDS.
         const ORGANIZATIONAL_TAIL: [u8; 6] = [
+            SelectByAidNoFci::INS,
+            SelectByAidNoFci::INS,
             VERIFY_INS,
-            SelectByAidNoFci::INS,
-            SelectByAidNoFci::INS,
             VERIFY_INS,
             MSE_INS,
             PSO_INS,
         ];
         /// The instructions a citizen card sees last when it signs with
-        /// the qualified key.
+        /// the qualified key: the VERIFY's own counter probe, VERIFY
+        /// PIN 2, MSE:Set, PSO:HASH and the empty PSO:CDS.
         const CITIZEN_TAIL: [u8; 5] = [VERIFY_INS, VERIFY_INS, MSE_INS, PSO_INS, PSO_INS];
         /// A PIN counter the retry floor serves (five, four or three).
         const TRIES_SERVED: u8 = 5;
-        /// A PIN counter the retry floor refuses (two, one or none).
+        /// A PIN counter the retry floor refuses (two or one).
         const TRIES_BELOW_FLOOR: u8 = 2;
         /// The counter a refused VERIFY reports.
         const TRIES_AFTER_WRONG: u8 = 4;
         /// The certificate the card holds in every slot: a public root
         /// standing in for the card's own.
-        const CERTIFICATE: &[u8] = include_bytes!("../../trust-anchors/dvv-gov-root-ca-g3-rsa.der");
+        const CERTIFICATE: &[u8] = include_bytes!("../../test-vectors/dvv-gov-root-ca-g3-rsa.der");
         /// `TokenInfo.version` of the synthetic card.
         const TOKEN_INFO_VERSION: u8 = 0;
         /// The synthetic card's serial, and the one a swapped card has.
@@ -1717,6 +1738,76 @@ mod tests {
         }
 
         #[test]
+        fn a_release_build_refuses_an_unreachable_signer_path_before_the_pin() -> TestResult {
+            use crate::cades::SigningTime;
+            use crate::document::Format;
+            use crate::material::MaterialError;
+            use crate::pades::SignatureMetadata;
+            use crate::service::{DocumentRequest, MaterialPath, SignErrorKind, SigningBuild};
+
+            /// An anchor unrelated to the card's self-signed certificate.
+            const UNRELATED_ANCHOR: &[u8] =
+                include_bytes!("../../test-vectors/dvv-gov-root-ca-g3-ecc.der");
+            /// A claimed signing time inside the certificate's validity.
+            const SIGNING_YEAR: u16 = 2026;
+            const SIGNING_MONTH: u8 = 1;
+
+            let card = SyntheticCard::served()?;
+            let backend = SyntheticBackend::one_reader(true, card.clone());
+            let (mut pin, asked) = counting(|| {});
+            let dir = TempDir::new("sign-unreachable-path")?;
+            let input = dir.write("message.txt", MESSAGE)?;
+            let output = dir.path().join("message.p7s");
+            let options = SignOptions {
+                input,
+                output: SignOutput::At(output.clone()),
+                slot: SignSlot::Qualified,
+                save_cert: None,
+                reader_filter: None,
+                can: None,
+                expected_serial: None,
+                document: Some(DocumentRequest {
+                    format: Format::CadesDetached,
+                    additional_inputs: Vec::new(),
+                    signing_time: SigningTime {
+                        year: SIGNING_YEAR,
+                        month: SIGNING_MONTH,
+                        day: FIRST_DAY,
+                        hour: 0,
+                        minute: 0,
+                        second: 0,
+                    },
+                    metadata: SignatureMetadata::default(),
+                    archive: false,
+                    long_term: true,
+                    signer_anchors: vec![UNRELATED_ANCHOR.to_vec()],
+                    timestamp_authorities: vec!["https://tsa.invalid/".to_owned()],
+                    timestamp_credentials: None,
+                    build: SigningBuild::Release,
+                }),
+            };
+            let result = sign(&backend, options, &mut pin);
+            check_true(
+                matches!(
+                    result,
+                    Err(ReaderSignError::Document(SignErrorKind::Material {
+                        path: MaterialPath::Signer,
+                        error: MaterialError::NoIssuer(_),
+                    }))
+                ),
+                "refused for the signer path",
+            )?;
+            check(&asked.get(), &0, "prompts")?;
+            check(&card.credential_references().len(), &0, "no VERIFY")?;
+            check_true(!output.exists(), "nothing saved")?;
+            check(
+                &std::fs::read_dir(dir.path())?.count(),
+                &1,
+                "only the input, under no other name",
+            )
+        }
+
+        #[test]
         fn retry_floor_refuses_before_the_pin_is_asked() -> TestResult {
             let card = SyntheticCard::new(TRIES_BELOW_FLOOR, StatusWord::Success)?;
             let backend = SyntheticBackend::one_reader(true, card.clone());
@@ -1764,8 +1855,9 @@ mod tests {
                 &vec![PinReferenceScheme::Organizational.reference(PinSlot::Pin2)],
                 "one VERIFY under the organization PIN 2 reference",
             )?;
-            // The floor probe, SELECT MF, SELECT DF.ESIGN, VERIFY PIN 2,
-            // MSE:Set and the one inline PSO:CDS, with nothing between.
+            // SELECT MF, SELECT DF.ESIGN, the VERIFY's counter probe,
+            // VERIFY PIN 2, MSE:Set and the one inline PSO:CDS, with
+            // nothing between.
             let instructions = card.instructions();
             let tail = instructions
                 .get(instructions.len().saturating_sub(ORGANIZATIONAL_TAIL.len())..)
@@ -1784,8 +1876,8 @@ mod tests {
             let (mut pin, _asked) = counting(|| {});
             let result = sign_on(&backend, SignSlot::Qualified, &mut pin)?;
             check_true(passed_verify(&result), "flow passed VERIFY")?;
-            // The floor probe, VERIFY PIN 2, MSE:Set, PSO:HASH and the
-            // empty PSO:CDS: no directory change.
+            // The VERIFY's counter probe, VERIFY PIN 2, MSE:Set, PSO:HASH
+            // and the empty PSO:CDS: no directory change.
             let instructions = card.instructions();
             let tail = instructions
                 .get(instructions.len().saturating_sub(CITIZEN_TAIL.len())..)
@@ -1944,6 +2036,7 @@ mod tests {
             TransportOutcome,
         };
         use refineid_auth::credentials::{FINEID_PIN2_MIN_LENGTH, PIN_MAX_LENGTH, PIN_MIN_LENGTH};
+        use refineid_auth::verify::VERIFY_INS;
         use refineid_auth::{PinReferenceScheme, PinSlot};
 
         use refineid_apdu::iso7816::SelectFile;
@@ -2035,15 +2128,17 @@ mod tests {
                 check(&wire.get(DATA_INDEX..), &Some(LONGEST_PIN), "bare digits")?;
                 // PIN 2 is sent only once SELECT MF and SELECT DF.ESIGN
                 // made the qualified key's directory current; PIN 1 is
-                // sent where the caller selected.
-                let selects = match slot {
+                // sent where the caller selected. Either VERIFY probes
+                // the counter first.
+                let mut plain = match slot {
                     SignSlot::Qualified => vec![Some(SelectFile::INS); 2],
                     SignSlot::Authentication => Vec::new(),
                 };
+                plain.push(Some(VERIFY_INS));
                 check(
                     &card.plain_instructions(),
-                    &selects,
-                    "SELECTs before VERIFY",
+                    &plain,
+                    "SELECTs and the counter probe before VERIFY",
                 )?;
             }
             Ok(())

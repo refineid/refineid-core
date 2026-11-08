@@ -24,8 +24,14 @@
 //!
 //! The counter-safe status probe (`VERIFY` with an empty data field)
 //! reads the retry state without decrementing any counter, per FINEID
-//! S1 v4.2 section 4.1.2, and is the safe pre-flight before an
-//! operation that would burn a retry on a wrong PIN.
+//! S1 v4.2 section 4.1.2. Every VERIFY that carries a PIN sends that
+//! probe first and applies the retry floor
+//! ([`crate::retry_risk::check_retry_floor`]) to its answer: refused at
+//! two or one tries left or an unreadable counter; sent otherwise, the
+//! card answering for itself at zero or blocked. The primitive enforces
+//! the rule itself, so no caller can spend a try by mistake; a caller
+//! that has already read the counter for a purpose of its own may apply
+//! the same rule first, to refuse before it asks for the PIN.
 
 use refineid_apdu::{
     ApduClass, CREDENTIAL_BODY_MAX, CardTransport, CommandApdu, CommandHeader, CredentialBody,
@@ -35,7 +41,7 @@ use refineid_apdu::{
 
 use crate::credentials::{Pin1, Pin2};
 use crate::pin_lengths::PinLengthRefusal;
-use crate::retry_risk::RetryFloorRefusal;
+use crate::retry_risk::{RetryFloorRefusal, check_last_tries};
 
 /// Citizen-card PIN1 reference: the global authentication PIN (FINEID S1
 /// v4.2 section 3.5.2).
@@ -174,8 +180,10 @@ pub enum AuthError<E> {
     /// validated PIN, kept fail-closed.
     Command(CredentialBodyError),
     /// The retry floor refused the credential before any command that
-    /// carries it was sent. Returned by the operations that present the
-    /// PUK, which read the PUK's counter themselves.
+    /// carries it was sent. Every operation that presents a PIN, the
+    /// PUK or an activation code reads that credential's counter itself
+    /// and returns this at two or one tries left or an unreadable
+    /// counter.
     RetryFloor(RetryFloorRefusal),
     /// The card in session does not accept an entry's length; refused
     /// before any command that carries it was sent. Returned by the
@@ -309,14 +317,38 @@ pub(crate) fn credential_exchange<T: CardTransport + ?Sized>(
     Ok(response.status_word())
 }
 
-/// Assemble and send the VERIFY credential command for `slot` under
+/// Apply the retry floor to `status`, the counter-safe reading of `slot`,
+/// then assemble and send the VERIFY credential command for `slot` under
 /// `scheme`, classifying the card's status word.
 ///
 /// Crate-private on purpose: the only entries to a VERIFY are the typed
 /// [`PinOps::verify_pin1`] and [`PinOps::verify_pin2`] family, which take a
-/// validated [`Pin1`] or [`Pin2`]. There is no public raw-digit VERIFY, so
-/// no caller outside this crate can present arbitrary bytes as a PIN and
-/// spend a retry on them.
+/// validated [`Pin1`] or [`Pin2`] and read the counter first. There is no
+/// public raw-digit VERIFY, so no caller outside this crate can present
+/// arbitrary bytes as a PIN and spend a retry on them.
+///
+/// # Errors
+///
+/// [`AuthError::RetryFloor`] when `status` is two or one tries left or
+/// carries no readable counter; nothing is sent. [`AuthError`] on a
+/// command-assembly failure, a transport failure, or a transport state
+/// transition.
+pub(crate) fn verify_under_floor<T: CardTransport + ?Sized>(
+    transport: &mut T,
+    scheme: PinReferenceScheme,
+    slot: PinSlot,
+    status: PinStatus,
+    digits: &[u8],
+) -> Result<VerifyOutcome, AuthError<T::Error>> {
+    check_last_tries(slot.into(), status).map_err(AuthError::RetryFloor)?;
+    verify_digits(transport, scheme, slot, digits)
+}
+
+/// Assemble and send the VERIFY credential command for `slot` under
+/// `scheme`, classifying the card's status word. The caller has applied
+/// the retry floor to the slot's counter: [`verify_under_floor`] to the
+/// probe's answer on a plain transport, the PIN 2 channel operation to
+/// the channel's own record.
 ///
 /// # Errors
 ///
@@ -351,18 +383,24 @@ pub(crate) fn verify_digits<T: CardTransport + ?Sized>(
 pub trait PinOps: CardTransport {
     /// VERIFY PIN1 (the authentication PIN), resolving the card's
     /// credential numbering first so an organizational card is not sent
-    /// a citizen block. The PIN is consumed and its digits are zeroized.
+    /// a citizen block. The one counter-safe probe that resolves the
+    /// numbering also reads PIN 1's counter, to which the retry floor is
+    /// applied before the PIN is sent. The PIN is consumed and its
+    /// digits are zeroized.
     ///
     /// # Errors
     ///
+    /// [`AuthError::RetryFloor`] when the card reports two or one tries
+    /// left or no readable counter; nothing carrying the PIN is sent.
     /// [`AuthError`] on a transport failure or state transition. A wrong
-    /// PIN is not an error; it is [`VerifyOutcome::WrongPin`].
+    /// PIN is not an error; it is [`VerifyOutcome::WrongPin`], and a
+    /// blocked PIN is [`VerifyOutcome::Locked`], the card's own answer.
     fn verify_pin1(&mut self, pin: Pin1) -> Result<VerifyOutcome, AuthError<Self::Error>>
     where
         Self: Sized,
     {
-        let scheme = self.resolve_pin_reference_scheme()?;
-        self.verify_pin1_with_scheme(scheme, pin)
+        let (scheme, status) = self.pin1_status_and_scheme()?;
+        verify_under_floor(self, scheme, PinSlot::Pin1, status, pin.digits())
     }
 
     /// VERIFY PIN2 (the qualified-signature PIN), resolving the numbering
@@ -379,7 +417,9 @@ pub trait PinOps: CardTransport {
         self.verify_pin2_with_scheme(scheme, pin)
     }
 
-    /// VERIFY PIN1 under an explicit numbering.
+    /// VERIFY PIN1 under an explicit numbering: the counter-safe probe of
+    /// PIN 1 under `scheme`, the retry floor on its answer, then the
+    /// VERIFY carrying the PIN.
     ///
     /// # Errors
     ///
@@ -392,10 +432,13 @@ pub trait PinOps: CardTransport {
     where
         Self: Sized,
     {
-        verify_digits(self, scheme, PinSlot::Pin1, pin.digits())
+        let status = self.pin_status_with_scheme(scheme, PinSlot::Pin1)?;
+        verify_under_floor(self, scheme, PinSlot::Pin1, status, pin.digits())
     }
 
-    /// VERIFY PIN2 under an explicit numbering.
+    /// VERIFY PIN2 under an explicit numbering: the counter-safe probe of
+    /// PIN 2 under `scheme`, the retry floor on its answer, then the
+    /// VERIFY carrying the PIN.
     ///
     /// # Errors
     ///
@@ -408,7 +451,8 @@ pub trait PinOps: CardTransport {
     where
         Self: Sized,
     {
-        verify_digits(self, scheme, PinSlot::Pin2, pin.digits())
+        let status = self.pin_status_with_scheme(scheme, PinSlot::Pin2)?;
+        verify_under_floor(self, scheme, PinSlot::Pin2, status, pin.digits())
     }
 
     /// Probe PIN1 retry state and resolve the card's credential numbering in a
@@ -528,12 +572,14 @@ impl<T: CardTransport + ?Sized> PinOps for T {}
 #[cfg(test)]
 mod tests {
     use super::{
-        CREDENTIAL_BODY_MAX, CREDENTIAL_BODY_SCRATCH, PIN_PAD_BYTE, PIN_STORED_LENGTH,
-        PIN1_REFERENCE, PIN1_REFERENCE_ORGANIZATIONAL, PIN2_REFERENCE_ORGANIZATIONAL, PinOps,
-        PinReferenceScheme, PinSlot, PinStatus, VERIFY_INS, VERIFY_P1, VerifyOutcome,
-        classify_pin_status_sw, classify_verify_sw, write_credential_blocks,
+        AuthError, CREDENTIAL_BODY_MAX, CREDENTIAL_BODY_SCRATCH, PIN_PAD_BYTE, PIN_STORED_LENGTH,
+        PIN1_REFERENCE, PIN1_REFERENCE_ORGANIZATIONAL, PIN2_REFERENCE,
+        PIN2_REFERENCE_ORGANIZATIONAL, PinOps, PinReferenceScheme, PinSlot, PinStatus, VERIFY_INS,
+        VERIFY_P1, VerifyOutcome, classify_pin_status_sw, classify_verify_sw,
+        write_credential_blocks,
     };
     use crate::credentials::{PIN_MAX_LENGTH, Pin1, Pin2, UnvalidatedSecret};
+    use crate::retry_risk::{FlooredCredential, RetryFloorRefusal};
     use refineid_apdu::{
         ApduClass, CardTransport, CommandApdu, CredentialCommand, PinRetries, ResponseApdu,
         StatusWord, TransportOutcome,
@@ -541,6 +587,12 @@ mod tests {
 
     /// A retry count for the classifier tests.
     const THREE_RETRIES: u8 = 3;
+    /// Highest retry count below the retry floor.
+    const RETRIES_BELOW_FLOOR: u8 = 2;
+    /// Retry count one wrong try from lockout.
+    const RETRIES_LOCKDOWN_IMMINENT: u8 = 1;
+    /// Retry count of an exhausted PIN.
+    const RETRIES_EXHAUSTED: u8 = 0;
     /// Length of the PIN fixture used in the block tests.
     const PIN_FIXTURE_LEN: usize = 4;
     /// Digits shared by the exact-wire tests.
@@ -576,19 +628,29 @@ mod tests {
     }
 
     /// Records the last plain and credential wire the trait produced,
-    /// answering every exchange with a fixed status word.
+    /// answering every plain exchange (the counter-safe probe) with
+    /// `probe_sw` and every credential exchange with `credential_sw`.
     struct WireRecorder {
         plain: Option<Vec<u8>>,
         credential: Option<Vec<u8>>,
-        sw: StatusWord,
+        probe_sw: StatusWord,
+        credential_sw: StatusWord,
     }
 
     impl WireRecorder {
+        /// A card answering every exchange with `sw`.
         fn new(sw: StatusWord) -> Self {
+            Self::answering(sw, sw)
+        }
+
+        /// A card answering the probe with `probe_sw` and the credential
+        /// command with `credential_sw`.
+        fn answering(probe_sw: StatusWord, credential_sw: StatusWord) -> Self {
             Self {
                 plain: None,
                 credential: None,
-                sw,
+                probe_sw,
+                credential_sw,
             }
         }
     }
@@ -598,7 +660,7 @@ mod tests {
 
         fn transmit(&mut self, command: &CommandApdu) -> Result<TransportOutcome, Self::Error> {
             self.plain = Some(command.as_bytes().to_vec());
-            Ok(TransportOutcome::Response(scripted_response(self.sw)))
+            Ok(TransportOutcome::Response(scripted_response(self.probe_sw)))
         }
 
         fn transmit_credential(
@@ -606,12 +668,33 @@ mod tests {
             command: CredentialCommand,
         ) -> Result<TransportOutcome, Self::Error> {
             self.credential = Some(command.expose_wire(<[u8]>::to_vec));
-            Ok(TransportOutcome::Response(scripted_response(self.sw)))
+            Ok(TransportOutcome::Response(scripted_response(
+                self.credential_sw,
+            )))
+        }
+    }
+
+    /// A counter-safe probe answer at `count` tries left.
+    fn counter(count: u8) -> StatusWord {
+        StatusWord::PinIncorrect {
+            retries: PinRetries::from_nibble(count).expect("fits a nibble"),
+        }
+    }
+
+    /// VERIFY `slot`'s PIN under `scheme` against `transport`.
+    fn verify_slot(
+        transport: &mut WireRecorder,
+        scheme: PinReferenceScheme,
+        slot: PinSlot,
+    ) -> Result<VerifyOutcome, AuthError<String>> {
+        match slot {
+            PinSlot::Pin1 => transport.verify_pin1_with_scheme(scheme, pin1(WIRE_DIGITS)),
+            PinSlot::Pin2 => transport.verify_pin2_with_scheme(scheme, pin2(WIRE_DIGITS)),
         }
     }
 
     #[test]
-    fn citizen_verify_ships_the_padded_block_under_the_citizen_reference() {
+    fn citizen_verify_probes_the_counter_then_ships_the_padded_block() {
         let mut transport = WireRecorder::new(StatusWord::Success);
         transport
             .verify_pin1_with_scheme(PinReferenceScheme::Citizen, pin1(WIRE_DIGITS))
@@ -622,10 +705,110 @@ mod tests {
         block.resize(PIN_STORED_LENGTH, PIN_PAD_BYTE);
         expected.extend_from_slice(&block);
         assert_eq!(transport.credential.as_deref(), Some(expected.as_slice()));
-        assert!(
-            transport.plain.is_none(),
-            "the PIN must travel only through the credential path"
+        assert_eq!(
+            transport.plain.as_deref(),
+            Some(verify_header(PIN1_REFERENCE).as_slice()),
+            "the only plain command is the counter-safe probe: no digits"
         );
+    }
+
+    #[test]
+    fn a_verify_at_the_last_two_tries_sends_only_the_probe() {
+        // The caller has probed nothing; the primitive still refuses, so
+        // no caller can spend one of the last two tries by mistake.
+        for slot in [PinSlot::Pin1, PinSlot::Pin2] {
+            for count in [RETRIES_BELOW_FLOOR, RETRIES_LOCKDOWN_IMMINENT] {
+                let mut transport = WireRecorder::answering(counter(count), StatusWord::Success);
+                let refused = verify_slot(&mut transport, PinReferenceScheme::Citizen, slot);
+                assert!(matches!(
+                    refused,
+                    Err(AuthError::RetryFloor(RetryFloorRefusal::TriesBelowFloor {
+                        credential,
+                        remaining,
+                    })) if credential == FlooredCredential::from(slot)
+                        && remaining.get() == count
+                ));
+                let reference = PinReferenceScheme::Citizen.reference(slot);
+                assert_eq!(
+                    transport.plain.as_deref(),
+                    Some(verify_header(reference).as_slice()),
+                    "the probe carries no data"
+                );
+                assert!(
+                    transport.credential.is_none(),
+                    "no VERIFY carrying digits reached the wire"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_verify_at_an_unreadable_counter_sends_only_the_probe() {
+        let mut transport =
+            WireRecorder::answering(StatusWord::AuthenticationFailed, StatusWord::Success);
+        let refused =
+            transport.verify_pin1_with_scheme(PinReferenceScheme::Citizen, pin1(WIRE_DIGITS));
+        assert!(matches!(
+            refused,
+            Err(AuthError::RetryFloor(
+                RetryFloorRefusal::CounterUnreadable {
+                    credential: FlooredCredential::Pin1
+                }
+            ))
+        ));
+        assert!(transport.credential.is_none());
+    }
+
+    #[test]
+    fn a_verify_at_no_tries_left_or_blocked_goes_to_the_card() {
+        for slot in [PinSlot::Pin1, PinSlot::Pin2] {
+            for probe in [
+                counter(RETRIES_EXHAUSTED),
+                StatusWord::AuthenticationBlocked,
+            ] {
+                let mut transport =
+                    WireRecorder::answering(probe, StatusWord::AuthenticationBlocked);
+                let outcome = verify_slot(&mut transport, PinReferenceScheme::Citizen, slot)
+                    .expect("the card answers for itself");
+                assert_eq!(outcome, VerifyOutcome::Locked);
+                let wire = transport.credential.expect("the VERIFY was sent");
+                assert_eq!(
+                    wire.get(..verify_header(PIN1_REFERENCE).len()),
+                    Some(verify_header(PinReferenceScheme::Citizen.reference(slot)).as_slice())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_verified_pin_is_served_and_three_tries_left_are_served() {
+        for probe in [StatusWord::Success, counter(THREE_RETRIES)] {
+            let mut transport = WireRecorder::answering(probe, StatusWord::Success);
+            let outcome = transport
+                .verify_pin2_with_scheme(PinReferenceScheme::Citizen, pin2(WIRE_DIGITS))
+                .expect("served");
+            assert_eq!(outcome, VerifyOutcome::Ok);
+            assert!(transport.credential.is_some());
+            assert_eq!(
+                transport.plain.as_deref(),
+                Some(verify_header(PIN2_REFERENCE).as_slice())
+            );
+        }
+    }
+
+    #[test]
+    fn the_scheme_free_verify_floors_on_the_probe_that_resolves_the_numbering() {
+        let mut transport =
+            WireRecorder::answering(counter(RETRIES_BELOW_FLOOR), StatusWord::Success);
+        let refused = transport.verify_pin1(pin1(WIRE_DIGITS));
+        assert!(matches!(
+            refused,
+            Err(AuthError::RetryFloor(RetryFloorRefusal::TriesBelowFloor {
+                credential: FlooredCredential::Pin1,
+                ..
+            }))
+        ));
+        assert!(transport.credential.is_none());
     }
 
     #[test]

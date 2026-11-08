@@ -133,8 +133,9 @@ pub enum PhoneRefusal {
     /// The phone's card did not answer: no card within the wait, the
     /// field lost, a transmission fault (`card_error`).
     CardUnavailable,
-    /// The card reports fewer than three PIN 2 tries left, so the phone
-    /// sent no verification (`retry_floor`).
+    /// The phone ended the request at the retry floor (`retry_floor`):
+    /// two or one PIN 2 tries left or an unreadable counter, with no
+    /// verification sent, or no tries left or a blocked PIN 2.
     RetryFloor,
     /// The pairing is not granted document signing (`unauthorized`).
     NotGranted,
@@ -156,7 +157,7 @@ impl fmt::Display for PhoneRefusal {
             Self::Expired => "the phone did not answer in time",
             Self::CardUnavailable => "the phone's card did not answer",
             Self::RetryFloor => {
-                "the card's remaining PIN 2 tries are reserved for the card issuer's software"
+                "the card's remaining Signature PIN 2 tries are reserved for the card issuer's software"
             }
             Self::NotGranted => "the pairing is not granted document signing",
             Self::Unsupported => "the phone refused the request's parameters",
@@ -514,6 +515,11 @@ pub fn sign_on_phone(
             .signature_certificate()
             .map_err(SignErrorKind::Phone)?,
     )?;
+    for options in &documents {
+        options
+            .document
+            .check_signer_path(certificate.cert.as_der())?;
+    }
     let prepared = documents
         .into_iter()
         .map(|options| prepare_document(options, &certificate))
@@ -691,9 +697,11 @@ fn finish_phone_document(
         SignSlot::Qualified,
         signature,
     )?;
-    let signature_path = options
-        .output
-        .write(assembled.best_signature_time, &assembled.bytes)?;
+    let signature_path = options.output.write(
+        assembled.best_signature_time,
+        assembled.below_requested.as_ref(),
+        &assembled.bytes,
+    )?;
     Ok(SignReport {
         device: SigningDevice::PairedPhone,
         slot: SignSlot::Qualified,
@@ -708,6 +716,7 @@ fn finish_phone_document(
         cert_subject_cn: certificate.cert.view().subject.common_name(),
         pin_retries_after: None,
         local_verify: LocalVerifyOutcome::Ok,
+        below_requested_level: assembled.below_requested,
     })
 }
 
@@ -716,7 +725,11 @@ mod tests {
     use super::*;
     use crate::cades::SigningTime;
     use crate::document::Format;
+    use crate::material::MaterialError;
     use crate::pades::SignatureMetadata;
+    #[cfg(debug_assertions)]
+    use crate::service::BaselineLevel;
+    use crate::service::{MaterialPath, SigningBuild};
     use crate::signed_name::PendingSignedName;
     use crate::test_util::{TempDir, TestResult, check, check_true};
     use crate::testkit::{
@@ -766,8 +779,10 @@ mod tests {
             metadata: SignatureMetadata::default(),
             archive: false,
             long_term: false,
+            signer_anchors: Vec::new(),
             timestamp_authorities: Vec::new(),
             timestamp_credentials: None,
+            build: SigningBuild::Release,
         }
     }
 
@@ -1201,6 +1216,120 @@ mod tests {
             written.starts_with("portfolio-signed-") && written.ends_with(".asice"),
             "the written name is the shown name with its time",
         )
+    }
+
+    /// An LTA request for a PDF whose only signer anchor is unrelated
+    /// to the phone's issuer, which names no CA Issuers address: the
+    /// long-term material cannot be collected. Two authorities, so a
+    /// refused timestamp is not retried.
+    fn unreachable_lta(build: SigningBuild) -> DocumentRequest {
+        DocumentRequest {
+            archive: true,
+            long_term: true,
+            signer_anchors: vec![
+                include_bytes!("../test-vectors/dvv-gov-root-ca-g3-rsa.der").to_vec(),
+            ],
+            timestamp_authorities: vec![
+                "https://tsa.invalid/first".to_owned(),
+                "https://tsa.invalid/second".to_owned(),
+            ],
+            build,
+            ..request(Format::Pades, 0)
+        }
+    }
+
+    #[test]
+    fn a_release_build_refuses_before_the_phone_asks_for_pin_2() -> TestResult {
+        let dir = TempDir::new("phone-release-unreachable")?;
+        let mut document = one(&dir, Format::Pades, "contract.pdf", &minimal_pdf(), 0)?;
+        document.document = unreachable_lta(SigningBuild::Release);
+        let output = document.output.path(None);
+        let refused = sign_on_phone(&mut ScriptedPhone::p384(Answer::Sign), vec![document]);
+        check_true(
+            matches!(
+                refused,
+                Err(SignErrorKind::Material {
+                    path: MaterialPath::Signer,
+                    error: MaterialError::NoIssuer(_),
+                })
+            ),
+            "refused for the signer path",
+        )?;
+        let mut phone = ScriptedPhone::p384(Answer::Sign);
+        let mut again = one(&dir, Format::Pades, "contract.pdf", &minimal_pdf(), 0)?;
+        again.document = unreachable_lta(SigningBuild::Release);
+        let _refused = sign_on_phone(&mut phone, vec![again]);
+        check_true(
+            phone.batches.is_empty(),
+            "the phone was never asked to sign",
+        )?;
+        check_true(!output.exists(), "nothing saved")?;
+        check(&signed_files(&dir)?, &0, "no file under any name")
+    }
+
+    /// How many files in `dir` are signed outputs, under any name.
+    fn signed_files(dir: &TempDir) -> Result<usize, Box<dyn core::error::Error>> {
+        let mut count = 0_usize;
+        for entry in std::fs::read_dir(dir.path())? {
+            if entry?.file_name().to_string_lossy().starts_with("signed-") {
+                count = count.saturating_add(1);
+            }
+        }
+        Ok(count)
+    }
+
+    #[test]
+    fn a_release_build_writes_nothing_when_the_level_is_lost_after_signing() -> TestResult {
+        let dir = TempDir::new("phone-release-after-signing")?;
+        let mut phone = ScriptedPhone::p384(Answer::Sign);
+        let mut document = one(&dir, Format::Pades, "contract.pdf", &minimal_pdf(), 0)?;
+        document.document = DocumentRequest {
+            // The signer's own certificate as its anchor: the path is
+            // complete before signing, and the level is lost only when
+            // no timestamp authority answers afterwards.
+            signer_anchors: vec![phone.certificate.clone()],
+            ..unreachable_lta(SigningBuild::Release)
+        };
+        let reports = sign_on_phone(&mut phone, vec![document])?;
+        check(&phone.batches.len(), &1, "the phone signed")?;
+        check_true(
+            matches!(reports.as_slice(), [Err(SignErrorKind::Timestamp(_))]),
+            "refused for the lost timestamp",
+        )?;
+        check(&signed_files(&dir)?, &0, "no file under any name")
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_development_build_saves_the_level_it_reached_under_a_marked_name() -> TestResult {
+        let dir = TempDir::new("phone-development-unreachable")?;
+        let mut document = one(&dir, Format::Pades, "contract.pdf", &minimal_pdf(), 0)?;
+        document.document = unreachable_lta(SigningBuild::Development);
+        let unmarked = document.output.path(None);
+        let mut phone = ScriptedPhone::p384(Answer::Sign);
+        let reports = sign_on_phone(&mut phone, vec![document])?;
+        let [Ok(report)] = reports.as_slice() else {
+            return Err("one saved document expected".into());
+        };
+        let below = report
+            .below_requested_level
+            .as_ref()
+            .ok_or("the report says the level is below the request")?;
+        check(&below.requested, &BaselineLevel::Lta, "requested")?;
+        check(
+            &below.reached,
+            &BaselineLevel::B,
+            "no authority answered, so not even B-T",
+        )?;
+        check_true(!below.reasons.is_empty(), "the reasons are given")?;
+        check(
+            &report.signature_path,
+            &dir.path().join("signed-contract-dev-B-B.pdf"),
+            "the name says development build and level",
+        )?;
+        check_true(!unmarked.exists(), "nothing under the release name")?;
+        check(&report.timestamps, &0, "no timestamp")?;
+        require_verified(&report.signature_path)
     }
 
     #[test]

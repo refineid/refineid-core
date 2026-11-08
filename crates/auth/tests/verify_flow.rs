@@ -24,16 +24,20 @@ use refineid_apdu::{
     TransportOutcome,
 };
 use refineid_auth::{
-    PIN_STORED_LENGTH, PIN1_REFERENCE, PIN1_REFERENCE_ORGANIZATIONAL, PIN2_REFERENCE, Pin1, Pin2,
-    PinOps, PinReferenceScheme, PinSlot, PinStatus, UnvalidatedSecret, VerifyOutcome,
+    AuthError, FlooredCredential, PIN_STORED_LENGTH, PIN1_REFERENCE, PIN1_REFERENCE_ORGANIZATIONAL,
+    PIN2_REFERENCE, Pin1, Pin2, PinOps, PinReferenceScheme, PinSlot, PinStatus, RetryFloorRefusal,
+    UnvalidatedSecret, VerifyOutcome,
 };
 
 /// A valid PIN1 fixture.
 const PIN1_DIGITS: &[u8] = b"1234";
 /// A valid PIN2 fixture.
 const PIN2_DIGITS: &[u8] = b"654321";
-/// A retry count returned on a wrong PIN.
+/// A retry count returned on a wrong PIN; also the highest count the
+/// retry floor refuses.
 const TWO_RETRIES: u8 = 2;
+/// A retry count the retry floor serves.
+const FIVE_RETRIES: u8 = 5;
 /// Wire index of the P2 reference byte.
 const P2_INDEX: usize = 3;
 /// Length of a header-only VERIFY command: class, instruction, P1, P2.
@@ -60,21 +64,29 @@ fn response(sw: StatusWord) -> ResponseApdu {
     }
 }
 
-/// A transport that records what it was handed and answers with a fixed
-/// status word. A credential command's wire is captured through the
-/// consuming exposure so the test can assert the command structure.
+/// A transport that records what it was handed and answers the plain
+/// path (the counter-safe probe) with `probe_sw` and the credential path
+/// with `credential_sw`. A credential command's wire is captured through
+/// the consuming exposure so the test can assert the command structure.
 struct Recorder {
     plain_wire: Option<Vec<u8>>,
     credential_wire: Option<Vec<u8>>,
-    sw: StatusWord,
+    probe_sw: StatusWord,
+    credential_sw: StatusWord,
 }
 
 impl Recorder {
+    /// A card answering every exchange with `sw`.
     fn new(sw: StatusWord) -> Self {
+        Self::answering(sw, sw)
+    }
+
+    fn answering(probe_sw: StatusWord, credential_sw: StatusWord) -> Self {
         Self {
             plain_wire: None,
             credential_wire: None,
-            sw,
+            probe_sw,
+            credential_sw,
         }
     }
 }
@@ -84,7 +96,7 @@ impl CardTransport for Recorder {
 
     fn transmit(&mut self, command: &CommandApdu) -> Result<TransportOutcome, Self::Error> {
         self.plain_wire = Some(command.as_bytes().to_vec());
-        Ok(TransportOutcome::Response(response(self.sw)))
+        Ok(TransportOutcome::Response(response(self.probe_sw)))
     }
 
     fn transmit_credential(
@@ -92,7 +104,13 @@ impl CardTransport for Recorder {
         command: CredentialCommand,
     ) -> Result<TransportOutcome, Self::Error> {
         self.credential_wire = Some(command.expose_wire(<[u8]>::to_vec));
-        Ok(TransportOutcome::Response(response(self.sw)))
+        Ok(TransportOutcome::Response(response(self.credential_sw)))
+    }
+}
+
+fn counter(count: u8) -> StatusWord {
+    StatusWord::PinIncorrect {
+        retries: PinRetries::from_nibble(count).expect("fits a nibble"),
     }
 }
 
@@ -111,9 +129,36 @@ fn verify_pin1_ships_the_padded_block_as_a_credential_command() {
     let data = &wire[DATA_OFFSET..];
     assert_eq!(data.len(), PIN_STORED_LENGTH);
     assert_eq!(&data[..PIN1_DIGITS.len()], PIN1_DIGITS);
+    let probe = transport
+        .plain_wire
+        .expect("the VERIFY reads the counter first");
+    assert_eq!(
+        probe.len(),
+        HEADER_LENGTH,
+        "the only plain command is the counter-safe probe, with no data"
+    );
+    assert_eq!(probe.get(P2_INDEX).copied(), Some(PIN1_REFERENCE));
+}
+
+#[test]
+fn a_verify_at_two_tries_left_is_refused_with_no_digits_on_the_wire() {
+    let mut transport = Recorder::answering(counter(TWO_RETRIES), StatusWord::Success);
+    let refused = transport.verify_pin1_with_scheme(PinReferenceScheme::Citizen, pin1());
+    assert!(matches!(
+        refused,
+        Err(AuthError::RetryFloor(RetryFloorRefusal::TriesBelowFloor {
+            credential: FlooredCredential::Pin1,
+            ..
+        }))
+    ));
     assert!(
-        transport.plain_wire.is_none(),
-        "an explicit-scheme VERIFY must not use the plain transmit path"
+        transport.credential_wire.is_none(),
+        "no VERIFY carried digits"
+    );
+    assert_eq!(
+        transport.plain_wire.map(|wire| wire.len()),
+        Some(HEADER_LENGTH),
+        "only the counter-safe probe was sent"
     );
 }
 
@@ -152,11 +197,11 @@ fn organizational_verify_sends_the_typed_length_block_under_the_org_reference() 
 #[test]
 fn resolution_picks_organizational_when_citizen_is_not_found() {
     // The card answers reference-not-found under the citizen numbering,
-    // then a real retry state under the organizational numbering.
-    let two = PinRetries::from_nibble(TWO_RETRIES).expect("fits a nibble");
+    // then a real retry state, one the floor serves, under the
+    // organizational numbering.
     let mut transport = SchemeAware {
         citizen_probe: StatusWord::ReferenceDataNotFound,
-        organizational_probe: StatusWord::PinIncorrect { retries: two },
+        organizational_probe: counter(FIVE_RETRIES),
         credential_wire: None,
     };
     let scheme = transport
@@ -177,7 +222,7 @@ fn resolution_picks_organizational_when_citizen_is_not_found() {
 #[test]
 fn a_wrong_pin_reports_the_remaining_retries() {
     let two = PinRetries::from_nibble(TWO_RETRIES).expect("fits a nibble");
-    let mut transport = Recorder::new(StatusWord::PinIncorrect { retries: two });
+    let mut transport = Recorder::answering(counter(FIVE_RETRIES), counter(TWO_RETRIES));
     let outcome = transport
         .verify_pin1(pin1())
         .expect("scripted verify completes");

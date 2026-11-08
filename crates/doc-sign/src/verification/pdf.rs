@@ -1758,6 +1758,24 @@ mod tests {
         );
     }
 
+    /// Some writers list an unused object number as in use at offset 0.
+    #[test]
+    fn an_in_use_entry_at_offset_zero_is_an_unused_number() {
+        let objects = page_objects();
+        let pdf = classic_pdf(&objects, "");
+        let size = objects.len() + FIRST_OBJECT;
+        let widened = replaced(
+            &replaced(
+                &pdf,
+                format!("xref\n0 {size}\n").as_bytes(),
+                format!("xref\n0 {}\n", size + 1).as_bytes(),
+            ),
+            format!("trailer\n<< /Size {size} ").as_bytes(),
+            format!("{}trailer\n<< /Size {} ", entry_line(0, IN_USE), size + 1).as_bytes(),
+        );
+        assert_eq!(read(&widened), Ok(ZERO));
+    }
+
     #[test]
     fn a_malformed_live_signature_dictionary_is_an_error() {
         let mut objects = page_objects();

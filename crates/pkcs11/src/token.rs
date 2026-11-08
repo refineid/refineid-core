@@ -2826,7 +2826,7 @@ mod tests {
     }
 
     impl crate::remote::RemoteTokenSource for AnsweringSource {
-        fn offered(&self) -> Option<crate::remote::RemoteOffer> {
+        fn offered(&self, _wait: core::time::Duration) -> Option<crate::remote::RemoteOffer> {
             None
         }
 

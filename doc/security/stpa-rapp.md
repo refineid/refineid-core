@@ -305,8 +305,8 @@ Alice withdraws, the pairing ends, or another card appears.
 **Lesson:** some visitors only ask once; have the answer ready, and
 bound how long a stale answer may live.
 
-- L-3; H-5, H-7. UCA-50, UCA-27, UCA-62.
-- CC-64.
+- L-3; H-5, H-7. UCA-50, UCA-27, UCA-62, UCA-126.
+- CC-64, CC-125.
 - Spec §8.4 item 3. Residual R-3.
 
 ### 9. The PIN asked twice
@@ -645,7 +645,7 @@ the requester; a part named after a colon is one program of it.
 | UCA-47 | Phone | Skips the PIN check, trusting its memory of an earlier one. | P | H-3, H-5 | CC-43 |
 | UCA-48 | Computer | Searches for the phone by multicast alone. | P | H-3, H-7 | CC-44 |
 | UCA-49 | Computer | Reports no phone after a search that never reached it. | P | H-5 | CC-44, CC-116 |
-| UCA-50 | Computer: browser module | Offers no token before the session opens, and the browser never asks again. | N | H-5, H-7 | CC-64 |
+| UCA-50 | Computer: browser module | Offers no token before the session opens, and the browser never asks again. | N | H-5, H-7 | CC-64, CC-125 |
 | UCA-51 | Phone | Refuses a second computer's session. | N | H-5, H-7 | CC-58, CC-74 |
 | UCA-52 | Computer | Releases an idle Bluetooth link to a backgrounded phone. | P | H-5, H-7 | CC-50 |
 | UCA-53 | Computer | Says the phone is not found when it is only in the background. | P | H-5 | CC-116 |
@@ -720,6 +720,8 @@ the requester; a part named after a colon is one program of it.
 | UCA-123 | Computer | Keeps trying to deliver its revocation beyond the bound. | D | H-4, H-6 | CC-118 |
 | UCA-124 | Either | Acts as if the peer received its goodbye (`service_withdrawn` or `pairing_revoked` close) when the peer never did. | P | H-4, H-5 | CC-123 |
 | UCA-125 | Computer | Sends a made-up file name, or one the asking program supplied, for a signature whose program named no document. | P | H-1, H-5 | CC-124 |
+| CC-125 | Every browser-module call that can show whether the phone's token is there or what it holds reads the phone first, as a request for the card: with no session open the computer dials, and the call waits at most 3 s for a session to confirm the card. No call is granted a wait for 5 s after a wait that raised the token, nor for 30 s after one that raised none; a call during a wait shares it; the non-blocking event poll never waits. The token stands only on a certificate the phone confirmed on a session. | §8.4 item 3 |
+| UCA-126 | Computer: browser module | Answers the browser's question about the phone's token from what it held before the question, without asking the phone, so a handshake that lists no slots finds no token. | N | H-7 | CC-125 |
 
 ### Controller constraints in force
 

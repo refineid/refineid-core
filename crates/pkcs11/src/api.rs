@@ -56,6 +56,7 @@ use crate::ck::{
     CkVoidPtr,
 };
 use crate::diag::diag;
+use crate::remote::Patience;
 use crate::sign::{Mechanism, RSA3072_MODULUS_BITS};
 use crate::slot_kind::SlotKind;
 use crate::state::{
@@ -239,6 +240,49 @@ fn lock_module() -> Result<std::sync::MutexGuard<'static, Option<ModuleState>>, 
     MODULE.lock().map_err(|_poisoned| CKR_GENERAL_ERROR)
 }
 
+/// Before a call on `slot_id` that can tell the caller whether the
+/// paired phone's token is there or what it holds, read the phone as a
+/// request for its token and admit what it offers.
+///
+/// A slot that is not the phone's is left alone. The reading runs with
+/// the module lock released, since it may wait up to
+/// [`crate::remote::REMOTE_WAKE_WAIT`]; the call then reads the module
+/// as that reading left it.
+///
+/// # Errors
+/// [`CKR_GENERAL_ERROR`] for a poisoned module lock and
+/// [`CKR_CRYPTOKI_NOT_INITIALIZED`] before `C_Initialize`; an unknown
+/// slot is left for the call to report.
+fn read_phone_for_slot(slot_id: CkSlotId) -> Result<(), CkRv> {
+    let is_phone = {
+        let guard = lock_module()?;
+        let module = guard.as_ref().ok_or(CKR_CRYPTOKI_NOT_INITIALIZED)?;
+        module.slot_kind(slot_id).is_some_and(SlotKind::is_remote)
+    };
+    if !is_phone {
+        return Ok(());
+    }
+    let remote = crate::remote::read_installed(Patience::Wake);
+    let mut guard = lock_module()?;
+    let module = guard.as_mut().ok_or(CKR_CRYPTOKI_NOT_INITIALIZED)?;
+    module.admit_remote(remote);
+    Ok(())
+}
+
+/// [`read_phone_for_slot`] for the slot of `session`; an unknown
+/// session is left for the call to report.
+///
+/// # Errors
+/// As [`read_phone_for_slot`].
+fn read_phone_for_session(session: CkSessionHandle) -> Result<(), CkRv> {
+    let slot_id = {
+        let guard = lock_module()?;
+        let module = guard.as_ref().ok_or(CKR_CRYPTOKI_NOT_INITIALIZED)?;
+        module.session(session).map(Session::slot_id)
+    };
+    slot_id.map_or(Ok(()), read_phone_for_slot)
+}
+
 /// `C_Initialize`: bring up module state (v2.40 s5.6.1).
 ///
 /// Accepts a NULL argument or a [`CkCInitializeArgs`] with or without
@@ -259,6 +303,14 @@ unsafe extern "C" fn c_initialize(init_args: CkVoidPtr) -> CkRv {
         // its own locking callbacks.
     }
     diag!("C_Initialize");
+    match lock_module() {
+        Ok(guard) if guard.is_some() => return CKR_CRYPTOKI_ALREADY_INITIALIZED,
+        Ok(_) => {}
+        Err(err) => return err,
+    }
+    // Initializing asks the phone for nothing: the slot listing that
+    // follows is the caller's first question.
+    let remote = crate::remote::read_installed(Patience::AtOnce);
     let mut guard = match lock_module() {
         Ok(guard) => guard,
         Err(err) => return err,
@@ -266,7 +318,7 @@ unsafe extern "C" fn c_initialize(init_args: CkVoidPtr) -> CkRv {
     if guard.is_some() {
         return CKR_CRYPTOKI_ALREADY_INITIALIZED;
     }
-    *guard = Some(ModuleState::new());
+    *guard = Some(ModuleState::new(remote));
     CKR_OK
 }
 
@@ -334,7 +386,8 @@ pub unsafe extern "C" fn c_get_function_list(list: CkFunctionListPtrPtr) -> CkRv
 }
 
 /// `C_GetSlotList`: enumerate slots, optionally only those with a
-/// token present (v2.40 s5.5.5). Refreshes the reader table first.
+/// token present (v2.40 s5.5.5). Refreshes the reader table first,
+/// and reads the paired phone as a request for its token.
 unsafe extern "C" fn c_get_slot_list(
     token_present: CkBbool,
     slot_list: CkSlotIdPtr,
@@ -343,6 +396,12 @@ unsafe extern "C" fn c_get_slot_list(
     if count.is_null() {
         return CKR_ARGUMENTS_BAD;
     }
+    match lock_module() {
+        Ok(guard) if guard.is_none() => return CKR_CRYPTOKI_NOT_INITIALIZED,
+        Ok(_) => {}
+        Err(err) => return err,
+    }
+    let remote = crate::remote::read_installed(Patience::Wake);
     let mut guard = match lock_module() {
         Ok(guard) => guard,
         Err(err) => return err,
@@ -350,7 +409,7 @@ unsafe extern "C" fn c_get_slot_list(
     let Some(module) = guard.as_mut() else {
         return CKR_CRYPTOKI_NOT_INITIALIZED;
     };
-    module.refresh_slots();
+    module.refresh_slots(remote);
     let only_present = token_present != 0;
     let ids: Vec<CkSlotId> = module
         .slot_ids()
@@ -413,6 +472,9 @@ unsafe extern "C" fn c_get_slot_info(slot_id: CkSlotId, info: CkSlotInfoPtr) -> 
     if info.is_null() {
         return CKR_ARGUMENTS_BAD;
     }
+    if let Err(err) = read_phone_for_slot(slot_id) {
+        return err;
+    }
     let guard = match lock_module() {
         Ok(guard) => guard,
         Err(err) => return err,
@@ -472,6 +534,9 @@ unsafe extern "C" fn c_get_token_info(slot_id: CkSlotId, info: CkTokenInfoPtr) -
     diag!("C_GetTokenInfo slot={slot_id}");
     if info.is_null() {
         return CKR_ARGUMENTS_BAD;
+    }
+    if let Err(err) = read_phone_for_slot(slot_id) {
+        return err;
     }
     let mut guard = match lock_module() {
         Ok(guard) => guard,
@@ -731,6 +796,7 @@ unsafe extern "C" fn c_get_mechanism_info(
 /// Resolve the sign mechanism for a slot's card by reading its
 /// certificate. Maps an absent card to [`CKR_TOKEN_NOT_PRESENT`].
 fn card_mechanism(slot_id: CkSlotId) -> Result<Mechanism, CkRv> {
+    read_phone_for_slot(slot_id)?;
     let mut guard = lock_module()?;
     let module = guard.as_mut().ok_or(CKR_CRYPTOKI_NOT_INITIALIZED)?;
     let slot = module.slot(slot_id).ok_or(CKR_SLOT_ID_INVALID)?;
@@ -755,6 +821,9 @@ unsafe extern "C" fn c_open_session(
     }
     if flags & CKF_SERIAL_SESSION == 0 {
         return CKR_SESSION_PARALLEL_NOT_SUPPORTED;
+    }
+    if let Err(err) = read_phone_for_slot(slot_id) {
+        return err;
     }
     let mut guard = match lock_module() {
         Ok(guard) => guard,
@@ -822,6 +891,9 @@ unsafe extern "C" fn c_get_session_info(session: CkSessionHandle, info: CkSessio
     if info.is_null() {
         return CKR_ARGUMENTS_BAD;
     }
+    if let Err(err) = read_phone_for_session(session) {
+        return err;
+    }
     let mut guard = match lock_module() {
         Ok(guard) => guard,
         Err(err) => return err,
@@ -862,6 +934,9 @@ unsafe extern "C" fn c_login(
 ) -> CkRv {
     if user_type != CKU_USER {
         return CKR_USER_TYPE_INVALID;
+    }
+    if let Err(err) = read_phone_for_session(session) {
+        return err;
     }
     let mut guard = match lock_module() {
         Ok(guard) => guard,
@@ -944,6 +1019,9 @@ const fn classify_pin_error(error: PinRoleError) -> CkRv {
 /// `C_Logout`: destroy the token's held PIN1 (v2.40 s5.6.6).
 unsafe extern "C" fn c_logout(session: CkSessionHandle) -> CkRv {
     diag!("C_Logout session={session}");
+    if let Err(err) = read_phone_for_session(session) {
+        return err;
+    }
     let mut guard = match lock_module() {
         Ok(guard) => guard,
         Err(err) => return err,
@@ -1022,6 +1100,9 @@ unsafe extern "C" fn c_find_objects_init(
         "C_FindObjectsInit session={session} template=[{}]",
         describe_template(&parsed)
     );
+    if let Err(err) = read_phone_for_session(session) {
+        return err;
+    }
     let mut guard = match lock_module() {
         Ok(guard) => guard,
         Err(err) => return err,
@@ -1080,6 +1161,9 @@ unsafe extern "C" fn c_find_objects(
     if object.is_null() || count.is_null() {
         return CKR_ARGUMENTS_BAD;
     }
+    if let Err(err) = read_phone_for_session(session) {
+        return err;
+    }
     let mut guard = match lock_module() {
         Ok(guard) => guard,
         Err(err) => return err,
@@ -1087,9 +1171,18 @@ unsafe extern "C" fn c_find_objects(
     let Some(module) = guard.as_mut() else {
         return CKR_CRYPTOKI_NOT_INITIALIZED;
     };
+    let Some(slot_id) = module.session(session).map(Session::slot_id) else {
+        return CKR_SESSION_HANDLE_INVALID;
+    };
+    // A token withdrawn since the search began has nothing more to
+    // find: its handles name nothing.
+    let withdrawn = !module.slot(slot_id).is_some_and(SlotRecord::card_present);
     let Some(session_mut) = module.session_mut(session) else {
         return CKR_SESSION_HANDLE_INVALID;
     };
+    if withdrawn {
+        session_mut.exhaust_find();
+    }
     let Some(batch) = session_mut.next_find_batch(usize_from_ulong(max_count)) else {
         return CKR_OPERATION_NOT_INITIALIZED;
     };
@@ -1145,6 +1238,9 @@ unsafe extern "C" fn c_get_attribute_value(
         return CKR_ARGUMENTS_BAD;
     }
     diag!("C_GetAttributeValue session={session} object={object} count={count}");
+    if let Err(err) = read_phone_for_session(session) {
+        return err;
+    }
     let mut guard = match lock_module() {
         Ok(guard) => guard,
         Err(err) => return err,
@@ -1281,6 +1377,9 @@ unsafe extern "C" fn c_sign_init(
     let Some(requested_mechanism) = Mechanism::from_ck_type(requested) else {
         return CKR_MECHANISM_INVALID;
     };
+    if let Err(err) = read_phone_for_session(session) {
+        return err;
+    }
     let mut guard = match lock_module() {
         Ok(guard) => guard,
         Err(err) => return err,
@@ -1582,6 +1681,8 @@ unsafe extern "C" fn c_wait_for_slot_event(
     if slot.is_null() {
         return CKR_ARGUMENTS_BAD;
     }
+    // A non-blocking poll reads the phone without waiting for it.
+    let remote = crate::remote::read_installed(Patience::AtOnce);
     let mut guard = match lock_module() {
         Ok(guard) => guard,
         Err(err) => return err,
@@ -1589,7 +1690,7 @@ unsafe extern "C" fn c_wait_for_slot_event(
     let Some(module) = guard.as_mut() else {
         return CKR_CRYPTOKI_NOT_INITIALIZED;
     };
-    module.refresh_slots();
+    module.refresh_slots(remote);
     let event = module.take_slot_event();
     drop(guard);
     let Some(slot_id) = event else {
@@ -2308,6 +2409,10 @@ mod tests {
         let with_token = state.open_session(1, CKF_SERIAL_SESSION);
         let without_token = state.open_session(2, CKF_SERIAL_SESSION);
         let _module = installed_module(state);
+        script_phone(PhoneScript {
+            offer: Some(phone_offer(Some(PHONE_CERT_DER))),
+            ..PhoneScript::default()
+        });
 
         let session_state = |session: CkSessionHandle| {
             let mut info: CkSessionInfo = unsafe { core::mem::zeroed() };
@@ -2353,10 +2458,16 @@ mod tests {
         }
     }
 
+    /// Installs `state` as the process-global module, with the test
+    /// phone as the process's source offering nothing and the wake gate
+    /// open.
     fn installed_module(state: crate::state::ModuleState) -> InstalledModule {
         let turn = MODULE_TESTS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        install_test_phone();
+        script_phone(PhoneScript::default());
+        crate::remote::reset_wake_gate_for_test();
         *crate::state::MODULE.lock().expect("module lock") = Some(state);
         InstalledModule { _turn: turn }
     }
@@ -2365,16 +2476,75 @@ mod tests {
     /// with.
     const PHONE_SIGNATURE_BYTE: u8 = 7;
 
-    /// Requests the answering phone has been handed in this process.
+    /// Requests the test phone has been handed in this process.
     static PHONE_REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-    /// A phone that answers every request with a signature and counts
-    /// the requests in [`PHONE_REQUESTS`].
-    struct AnsweringPhone;
+    /// How the test phone answers a reading.
+    #[derive(Default)]
+    struct PhoneScript {
+        /// What it offers while it raises nothing.
+        offer: Option<crate::remote::RemoteOffer>,
+        /// When a reading may wait: how long into the wait a session
+        /// confirms the card, and the offer that then stands. `None` is
+        /// a phone out of reach, which holds every wait to its end.
+        answer: Option<(core::time::Duration, crate::remote::RemoteOffer)>,
+        /// The wait each reading was granted, in order.
+        waits: Vec<core::time::Duration>,
+    }
 
-    impl crate::remote::RemoteTokenSource for AnsweringPhone {
-        fn offered(&self) -> Option<crate::remote::RemoteOffer> {
-            None
+    /// The test phone's script, shared by every module test in turn.
+    static PHONE_SCRIPT: std::sync::Mutex<Option<PhoneScript>> = std::sync::Mutex::new(None);
+
+    fn script_phone(script: PhoneScript) {
+        *PHONE_SCRIPT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(script);
+    }
+
+    /// The waits the test phone was granted since it was scripted.
+    fn phone_waits() -> Vec<core::time::Duration> {
+        PHONE_SCRIPT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|script| script.waits.clone())
+            .unwrap_or_default()
+    }
+
+    /// A phone that offers as [`PHONE_SCRIPT`] says, honours the wait
+    /// it is given as a source must, and answers every signature
+    /// request with a signature, counting them in [`PHONE_REQUESTS`].
+    struct TestPhone;
+
+    impl crate::remote::RemoteTokenSource for TestPhone {
+        fn offered(&self, wait: core::time::Duration) -> Option<crate::remote::RemoteOffer> {
+            let (offer, hold) = {
+                let mut guard = PHONE_SCRIPT
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let script = guard.get_or_insert_with(PhoneScript::default);
+                script.waits.push(wait);
+                let tokenless = script
+                    .offer
+                    .as_ref()
+                    .is_none_or(|offer| offer.certificate().is_none());
+                if wait.is_zero() || !tokenless {
+                    (script.offer.clone(), core::time::Duration::ZERO)
+                } else {
+                    match script.answer.take() {
+                        Some((after, raised)) if after <= wait => {
+                            script.offer = Some(raised);
+                            (script.offer.clone(), after)
+                        }
+                        unanswered => {
+                            script.answer = unanswered;
+                            (script.offer.clone(), wait)
+                        }
+                    }
+                }
+            };
+            std::thread::sleep(hold);
+            offer
         }
 
         fn sign(
@@ -2394,11 +2564,11 @@ mod tests {
         fn stop(&self) {}
     }
 
-    /// Install the answering phone as the process's source, once.
-    fn install_answering_phone() {
+    /// Install the test phone as the process's source, once.
+    fn install_test_phone() {
         static INSTALL: std::sync::Once = std::sync::Once::new();
         INSTALL.call_once(|| {
-            crate::remote::install_remote_source(Box::new(AnsweringPhone))
+            crate::remote::install_remote_source(Box::new(TestPhone))
                 .expect("the first source installed in this process");
         });
     }
@@ -2406,6 +2576,27 @@ mod tests {
     fn phone_requests() -> usize {
         PHONE_REQUESTS.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// The pairing the module tests' phone serves.
+    fn test_pair_id() -> crate::slot_kind::RemoteSlotId {
+        crate::slot_kind::RemoteSlotId::parse(&"a5".repeat(crate::slot_kind::PAIR_ID_SIZE))
+            .expect("valid pair id")
+    }
+
+    /// The test phone's offer for [`test_pair_id`], with `certificate`
+    /// confirmed on a session or with none.
+    fn phone_offer(certificate: Option<&[u8]>) -> crate::remote::RemoteOffer {
+        crate::remote::RemoteOffer::new(
+            test_pair_id(),
+            "Alpha Phone".to_owned(),
+            refineid_remote::DisplayText::new("alpha-desk".to_owned()).expect("bounded text"),
+            certificate.map(|der| crate::remote::SessionCertificate::new(der.to_vec())),
+        )
+    }
+
+    /// A P-384 certificate as a phone's session would confirm it.
+    const PHONE_CERT_DER: &[u8] =
+        include_bytes!("../test-certs/fineid-intermediate-01-citizen-g4e.der");
 
     /// The token flags follow the key gate: a token gated by `C_Login`
     /// requires a login; a phone-served token requires none and reports
@@ -2447,11 +2638,6 @@ mod tests {
         use crate::state::{ModuleState, SlotRecord};
         use crate::token::ObjectKind;
 
-        /// A P-384 certificate as a phone's session would confirm it.
-        const PHONE_CERT_DER: &[u8] =
-            include_bytes!("../test-certs/fineid-intermediate-01-citizen-g4e.der");
-
-        install_answering_phone();
         let pair_id = RemoteSlotId::parse(&"a5".repeat(PAIR_ID_SIZE)).expect("valid pair id");
         let slot = SlotRecord::remote_for_test(1, pair_id, "Alpha Phone", "alpha-desk", true);
         let mut state = ModuleState::from_parts_for_test(vec![slot], 2);
@@ -2462,6 +2648,10 @@ mod tests {
         let key = token.handle(ObjectKind::PrivateKey);
         let session = state.open_session(1, CKF_SERIAL_SESSION);
         let _module = installed_module(state);
+        script_phone(PhoneScript {
+            offer: Some(phone_offer(Some(PHONE_CERT_DER))),
+            ..PhoneScript::default()
+        });
 
         let session_state = || {
             let mut info: CkSessionInfo = unsafe { core::mem::zeroed() };
@@ -2548,6 +2738,234 @@ mod tests {
         // signature.
         const SIGNATURES: usize = 3;
         assert_eq!(phone_requests(), before + SIGNATURES);
+    }
+
+    /// How long into a wait the test phone's session confirms the
+    /// card: well inside [`crate::remote::REMOTE_WAKE_WAIT`].
+    const PHONE_ANSWERS_AFTER: core::time::Duration = core::time::Duration::from_millis(100);
+
+    /// What the scheduler may add to a call beyond the waits it was
+    /// granted.
+    const SCHEDULING_SLACK: core::time::Duration = core::time::Duration::from_millis(500);
+
+    /// The waits the test phone was granted that were not zero.
+    fn granted_waits() -> Vec<core::time::Duration> {
+        phone_waits()
+            .into_iter()
+            .filter(|wait| !wait.is_zero())
+            .collect()
+    }
+
+    /// `C_GetSlotInfo` on the phone's slot, as NSS's presence check
+    /// makes it: whether the token is present, and how long the call
+    /// took.
+    fn phone_slot_present(slot_id: crate::ck::CkSlotId) -> (bool, core::time::Duration) {
+        use crate::ck::{CKF_TOKEN_PRESENT, CkSlotInfo};
+        let started = std::time::Instant::now();
+        let mut info: CkSlotInfo = unsafe { core::mem::zeroed() };
+        assert_eq!(
+            unsafe { super::c_get_slot_info(slot_id, &mut info) },
+            CKR_OK
+        );
+        (info.flags & CKF_TOKEN_PRESENT != 0, started.elapsed())
+    }
+
+    /// The first login through a paired phone needs no slot listing:
+    /// the calls NSS makes during a handshake on a slot it found
+    /// without a token (`C_GetSlotInfo`, `C_GetTokenInfo`,
+    /// `C_OpenSession`, the certificate search and its read) raise the
+    /// token the phone confirms meanwhile, within the bound, and only
+    /// the first of them waits.
+    #[test]
+    fn a_handshake_without_a_slot_listing_raises_the_phone_token_within_the_bound() {
+        use crate::ck::{
+            CK_INVALID_HANDLE, CKA_CLASS, CKA_VALUE, CKF_SERIAL_SESSION, CKO_CERTIFICATE,
+            CkAttribute, CkObjectHandle, CkTokenInfo,
+        };
+        use crate::remote::REMOTE_WAKE_WAIT;
+        use crate::state::{ModuleState, SlotRecord};
+
+        let slot =
+            SlotRecord::remote_for_test(1, test_pair_id(), "Alpha Phone", "alpha-desk", false);
+        let _module = installed_module(ModuleState::from_parts_for_test(vec![slot], 2));
+        script_phone(PhoneScript {
+            offer: Some(phone_offer(None)),
+            answer: Some((PHONE_ANSWERS_AFTER, phone_offer(Some(PHONE_CERT_DER)))),
+            ..PhoneScript::default()
+        });
+        let started = std::time::Instant::now();
+
+        let (present, took) = phone_slot_present(1);
+        assert!(
+            present,
+            "the phone's token was raised by the presence check"
+        );
+        assert!(took < REMOTE_WAKE_WAIT, "{took:?}");
+
+        let mut token: CkTokenInfo = unsafe { core::mem::zeroed() };
+        assert_eq!(unsafe { super::c_get_token_info(1, &mut token) }, CKR_OK);
+        let mut session: CkSessionHandle = CK_INVALID_HANDLE;
+        assert_eq!(
+            unsafe {
+                super::c_open_session(
+                    1,
+                    CKF_SERIAL_SESSION,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    &mut session,
+                )
+            },
+            CKR_OK
+        );
+        let mut class = CKO_CERTIFICATE;
+        let mut find = CkAttribute {
+            attr_type: CKA_CLASS,
+            p_value: core::ptr::addr_of_mut!(class).cast(),
+            ul_value_len: ulong_of(core::mem::size_of_val(&class)),
+        };
+        assert_eq!(
+            unsafe { super::c_find_objects_init(session, &mut find, 1) },
+            CKR_OK
+        );
+        let mut found: CkObjectHandle = CK_INVALID_HANDLE;
+        let mut count: CkUlong = 0;
+        assert_eq!(
+            unsafe { super::c_find_objects(session, &mut found, 1, &mut count) },
+            CKR_OK
+        );
+        assert_eq!(unsafe { super::c_find_objects_final(session) }, CKR_OK);
+        assert_ne!(count, 0, "the certificate is found");
+        let mut der = vec![0_u8; PHONE_CERT_DER.len()];
+        let mut read = CkAttribute {
+            attr_type: CKA_VALUE,
+            p_value: der.as_mut_ptr().cast(),
+            ul_value_len: ulong_of(der.len()),
+        };
+        assert_eq!(
+            unsafe { super::c_get_attribute_value(session, found, &mut read, 1) },
+            CKR_OK
+        );
+        assert_eq!(der, PHONE_CERT_DER, "the certificate the phone confirmed");
+
+        assert!(started.elapsed() < REMOTE_WAKE_WAIT);
+        let granted = granted_waits();
+        assert_eq!(granted.len(), 1, "one wait in the handshake: {granted:?}");
+        assert!(granted.iter().all(|wait| *wait <= REMOTE_WAKE_WAIT));
+    }
+
+    /// A phone out of reach holds one call of a handshake, and that
+    /// one no longer than the bound: the presence check reports no
+    /// token at the bound, and the calls after it, the presence check
+    /// again included, answer at once without a wait of their own.
+    #[test]
+    fn an_absent_phone_holds_one_call_and_that_one_within_the_bound() {
+        use crate::ck::{
+            CK_INVALID_HANDLE, CKF_SERIAL_SESSION, CKR_TOKEN_NOT_PRESENT, CkTokenInfo,
+        };
+        use crate::remote::REMOTE_WAKE_WAIT;
+        use crate::state::{ModuleState, SlotRecord};
+
+        let slot =
+            SlotRecord::remote_for_test(1, test_pair_id(), "Alpha Phone", "alpha-desk", false);
+        let _module = installed_module(ModuleState::from_parts_for_test(vec![slot], 2));
+        script_phone(PhoneScript {
+            offer: Some(phone_offer(None)),
+            ..PhoneScript::default()
+        });
+
+        let (present, took) = phone_slot_present(1);
+        assert!(!present);
+        assert!(took < REMOTE_WAKE_WAIT + SCHEDULING_SLACK, "{took:?}");
+
+        let started = std::time::Instant::now();
+        let mut token: CkTokenInfo = unsafe { core::mem::zeroed() };
+        assert_eq!(
+            unsafe { super::c_get_token_info(1, &mut token) },
+            CKR_TOKEN_NOT_PRESENT
+        );
+        let mut session: CkSessionHandle = CK_INVALID_HANDLE;
+        assert_eq!(
+            unsafe {
+                super::c_open_session(
+                    1,
+                    CKF_SERIAL_SESSION,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    &mut session,
+                )
+            },
+            CKR_TOKEN_NOT_PRESENT
+        );
+        let (present, _) = phone_slot_present(1);
+        assert!(!present);
+        assert!(started.elapsed() < SCHEDULING_SLACK);
+
+        let granted = granted_waits();
+        assert_eq!(granted.len(), 1, "one wait in the handshake: {granted:?}");
+        assert!(granted.iter().all(|wait| *wait <= REMOTE_WAKE_WAIT));
+    }
+
+    /// A token the phone stops offering leaves at the next call that
+    /// could show it: a search begun on it finds nothing more, and its
+    /// certificate is no longer read.
+    #[test]
+    fn a_withdrawn_phone_token_is_not_shown_again() {
+        use crate::ck::{
+            CK_INVALID_HANDLE, CKA_CLASS, CKA_VALUE, CKF_SERIAL_SESSION, CKO_CERTIFICATE,
+            CKR_TOKEN_NOT_PRESENT, CkAttribute, CkObjectHandle,
+        };
+        use crate::state::{ModuleState, SlotRecord};
+        use crate::token::ObjectKind;
+
+        let slot =
+            SlotRecord::remote_for_test(1, test_pair_id(), "Alpha Phone", "alpha-desk", true);
+        let mut state = ModuleState::from_parts_for_test(vec![slot], 2);
+        let token = state.raise_remote_token_for_test(
+            1,
+            &crate::remote::SessionCertificate::new(PHONE_CERT_DER.to_vec()),
+        );
+        let certificate = token.handle(ObjectKind::Certificate);
+        let session = state.open_session(1, CKF_SERIAL_SESSION);
+        let _module = installed_module(state);
+        script_phone(PhoneScript {
+            offer: Some(phone_offer(Some(PHONE_CERT_DER))),
+            ..PhoneScript::default()
+        });
+        let mut class = CKO_CERTIFICATE;
+        let mut find = CkAttribute {
+            attr_type: CKA_CLASS,
+            p_value: core::ptr::addr_of_mut!(class).cast(),
+            ul_value_len: ulong_of(core::mem::size_of_val(&class)),
+        };
+        assert_eq!(
+            unsafe { super::c_find_objects_init(session, &mut find, 1) },
+            CKR_OK
+        );
+
+        // A session reports the card gone, so nothing is waited for.
+        script_phone(PhoneScript {
+            offer: Some(phone_offer(None)),
+            answer: Some((core::time::Duration::ZERO, phone_offer(None))),
+            ..PhoneScript::default()
+        });
+        let mut found: CkObjectHandle = CK_INVALID_HANDLE;
+        let mut count: CkUlong = 0;
+        assert_eq!(
+            unsafe { super::c_find_objects(session, &mut found, 1, &mut count) },
+            CKR_OK
+        );
+        assert_eq!(count, 0);
+        assert_eq!(unsafe { super::c_find_objects_final(session) }, CKR_OK);
+        let mut der = vec![0_u8; PHONE_CERT_DER.len()];
+        let mut read = CkAttribute {
+            attr_type: CKA_VALUE,
+            p_value: der.as_mut_ptr().cast(),
+            ul_value_len: ulong_of(der.len()),
+        };
+        assert_eq!(
+            unsafe { super::c_get_attribute_value(session, certificate, &mut read, 1) },
+            CKR_TOKEN_NOT_PRESENT
+        );
     }
 
     /// The profile object is found without any login, on a token

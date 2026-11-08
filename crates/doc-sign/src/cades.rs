@@ -744,9 +744,16 @@ impl SignatureParts<'_> {
             }
             tlv(TAG_SEQUENCE, &list)
         };
-        let attribute_values = self
-            .timestamps
-            .iter()
+        // The index lists the unsigned attributes in the order
+        // `unsignedAttrs` holds them, and `assemble` writes that SET OF
+        // in DER order, not in the order the authorities answered.
+        let mut timestamps: Vec<&Vec<u8>> = self.timestamps.iter().collect();
+        timestamps.sort_unstable_by_key(|token| {
+            attribute(crate::oids::SIGNATURE_TIME_STAMP_TOKEN, (*token).clone())
+        });
+        timestamps.dedup();
+        let attribute_values = timestamps
+            .into_iter()
             .map(|token| {
                 let mut value = tlv(TAG_OID, crate::oids::SIGNATURE_TIME_STAMP_TOKEN.as_bytes());
                 value.extend_from_slice(token);
@@ -909,6 +916,57 @@ fn issuer_and_serial(certificate: &Certificate<'_>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use crate::validation::ValidationMaterial;
+    /// The `ats-hash-index-v3` lists the signature timestamps in the
+    /// DER order `unsignedAttrs` holds them, so the archive input does
+    /// not depend on the order the authorities answered in.
+    #[test]
+    fn the_hash_index_follows_the_der_order_of_the_timestamps() {
+        let certificate = crate::test_support::parse_certificate_for_test(fixture_certificate());
+        let parameters = SignerParameters {
+            certificate: &certificate,
+            digest_algorithm: DigestAlgorithm::Sha256,
+            signature_algorithm: SignatureAlgorithm::RsaPkcs1Sha256,
+            signing_time: None,
+        };
+        let attributes = signed_attributes(&parameters, &[0x11; 32]);
+        let material = ValidationMaterial {
+            certificates: Vec::new(),
+            ocsp_responses: Vec::new(),
+            crls: Vec::new(),
+        };
+        let first = vec![0x30, 0x01, 0x01];
+        let second = vec![0x30, 0x01, 0x02];
+        let input = |timestamps: &[Vec<u8>]| {
+            archive_input_v3(
+                &parameters,
+                &attributes,
+                &[0xAA_u8; 384],
+                b"document",
+                &material,
+                timestamps,
+                DigestAlgorithm::Sha256,
+            )
+        };
+        let in_order = input(&[first.clone(), second.clone()]);
+        let reversed = input(&[second.clone(), first.clone()]);
+        assert_eq!(in_order, reversed);
+
+        let attribute_hash = |token: &[u8]| {
+            let mut value = tlv(TAG_OID, crate::oids::SIGNATURE_TIME_STAMP_TOKEN.as_bytes());
+            value.extend_from_slice(token);
+            tlv(TAG_OCTET_STRING, &DigestAlgorithm::Sha256.digest(&value))
+        };
+        let (first_hash, second_hash) = (attribute_hash(&first), attribute_hash(&second));
+        let index = &in_order.index;
+        let at = |hash: &[u8]| {
+            index
+                .windows(hash.len())
+                .position(|window| window == hash)
+                .expect("every timestamp is in the index")
+        };
+        assert!(at(&first_hash) < at(&second_hash));
+    }
+
     /// `other [1] IMPLICIT OtherRevocationInfoFormat` replaces the
     /// SEQUENCE tag rather than wrapping it. The wrapped form is
     /// well-formed DER that parses as far as the `[1]`, then hands a
@@ -1051,7 +1109,7 @@ mod tests {
 
     use super::{
         DigestAlgorithm, Encapsulation, SignatureAlgorithm, SignerParameters, SigningTime,
-        signed_attributes, signed_data,
+        TAG_OCTET_STRING, TAG_OID, archive_input_v3, signed_attributes, signed_data, tlv,
     };
 
     /// Universal SET, the tag the attributes are signed under.

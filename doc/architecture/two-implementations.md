@@ -33,7 +33,10 @@ rest was an idiom.
   vectors.** Same change, same day, one definition of done. The wire
   version triple is bumped with every change of wire vocabulary (RAPP
   section 10.1 item 4) so that an engine left behind fails at the
-  handshake, loudly, instead of half-working.
+  handshake, loudly, instead of half-working. The document version is
+  the wire version: one stamp, moved together, with the document, its
+  state machine, corpora and models renamed to it and every citation
+  following, in both repositories at once.
 - **Bilingual where it pays.** The protocol, the cryptography and the
   card commands are implemented twice. Platform glue (user interface,
   key storage, system services) is per platform anyway and gains nothing

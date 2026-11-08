@@ -2,8 +2,9 @@
 ## Pairing and Session Protocol over the BLE and Stream Transports
 
 Status: Stamped specification, reviewed by the owner\
-Document version: 26.11.8 (section numbering; cited as "RAPP v26.11.8 section N")\
+Document version: 26.11.8 (cited as "RAPP v26.11.8 section N")\
 Wire version: `[26, 11, 8]` (`[Year, Month, Day]`; bumped whenever the wire vocabulary changes, §10.1 item 4)\
+Versioning: the document version and the wire version are one stamp. A change of either moves both: the document, its state machine, its corpora and its models are renamed to the new stamp, and every citation follows\
 Offer version: `[26, 11, 8]`\
 Wire version history: `[26, 11, 2]` stamped specification; `[26, 11, 7]` adds the `waiting_for_unlock` progress event (§8.2 item 3); `[26, 11, 8]` keeps a forgotten pairing on the Requester until the Custodian echoes its `pairing_revoked` close (§4.6)\
 Document history: 26.11.2 stamped specification; 26.11.8 restamps the document with the wire version, and lets a Requester show its connecting to the Custodian it has just paired (§4.7)\
@@ -49,7 +50,7 @@ This document is completely self-contained: all normative schemas, protocol stat
   RAPP v26.11.8 runs the same pairing and session protocol over every registered transport profile (§2.2). Its wire and offer versions are `[26, 11, 8]` (`[Year, Month, Day]`). It does not interoperate with other RAPP versions. Implementations must conform strictly to the schemas and state machines defined in this standalone specification.
 - **Wire and Offer Versioning**:
   - Offer version: `[26, 11, 8]` in `pairing-offer`.
-  - Wire version: `[26, 11, 8]` (`[Year, Month, Day]`) in channel envelopes, pairing context, and handshake prologues; the triple changes with every change of wire vocabulary (§10.1 item 4), the document keeps its section numbering.
+  - Wire version: `[26, 11, 8]` (`[Year, Month, Day]`) in channel envelopes, pairing context, and handshake prologues; the triple changes with every change of wire vocabulary (§10.1 item 4), and the document version moves with it.
 - **Role Mapping**:
   - **Requester**: Corresponds to the RAPP Requester. On BLE it operates as GATT Client (Central); on the stream transport it dials the Custodian.
   - **Custodian**: Corresponds to the mobile device acting as the RAPP Authorization Proxy while holding exclusive physical NFC custody of the Credential Holder (FINEID Card). On BLE it operates as GATT Server (Peripheral); on the stream transport it listens.

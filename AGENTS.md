@@ -170,6 +170,12 @@ claims, and the one in-source annotation dialect are in
   the RFCs -- not assumed from memory.
 - Cite specifications by document and section; never copy spec text
   verbatim into the tree.
+- The RAPP document version and its wire version are one stamp
+  (`[Year, Month, Day]`): a change of either moves both, and the
+  document, state machine, corpora, models and every citation are
+  renamed to the new stamp in this repository and in refineid-apple at
+  once. The spec is a working document: update it as the details are
+  worked out, not after.
 - New source files carry `Copyright 2026 Petri Koistinen` with no email
   address and HTTPS license URLs; shell scripts carry the one-line form
   under the shebang.

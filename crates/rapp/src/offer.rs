@@ -495,7 +495,7 @@ impl fmt::Display for PairingOfferError {
 
 impl core::error::Error for PairingOfferError {}
 
-/// The bootstrap answers' version triple, `[26, 11, 7]`.
+/// The bootstrap answers' version triple, `[26, 11, 8]`.
 fn version_triple() -> Vec<WireValue> {
     vec![
         WireValue::Unsigned(u64::from(WIRE_VERSION.0)),

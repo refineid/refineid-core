@@ -24,8 +24,10 @@ use zeroize::ZeroizeOnDrop;
 /// left behind fails at the handshake rather than later on a word it
 /// does not know (RAPP v26.11.2 section 10.1 item 4). History: `[26, 11,
 /// 2]` the stamped specification; `[26, 11, 7]` adds the
-/// `waiting_for_unlock` progress event.
-pub const WIRE_VERSION: (u16, u16, u16) = (26, 11, 7);
+/// `waiting_for_unlock` progress event; `[26, 11, 8]` keeps a forgotten
+/// pairing on the Requester until the Custodian echoes its
+/// `pairing_revoked` close.
+pub const WIRE_VERSION: (u16, u16, u16) = (26, 11, 8);
 /// Mandatory RAPP pairing Noise suite.
 pub const MANDATORY_PAIRING_SUITE: &str = "Noise_XXpsk3_25519_ChaChaPoly_SHA512";
 /// Mandatory RAPP session Noise suite (RAPP v26.11.2 section 6.3).

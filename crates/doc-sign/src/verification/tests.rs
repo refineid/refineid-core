@@ -4088,3 +4088,229 @@ fn a_live_lookup_asks_nothing_for_an_unanchored_chain() {
     assert_eq!(live, Revocation::Unavailable);
     assert_eq!(source.ocsp_asked.get(), 0);
 }
+
+/// The archive construction of a container or CMS signature, as the signing service
+/// assembles it after the card signed: the issued signer over the note,
+/// a signature timestamp from the world's authority, the LT material,
+/// then the archive timestamp `obtain` answers with over the digest of
+/// [`crate::document::DocumentPlan::archive_input`].
+fn container_archived_by(
+    world: &World,
+    format: Format,
+    obtain: impl FnOnce(
+        &[u8],
+    ) -> Result<
+        crate::timestamp::VerifiedTimestampToken,
+        crate::service::SignErrorKind,
+    >,
+) -> Result<Vec<u8>, crate::service::SignErrorKind> {
+    let (key, der) = world.signer(Signer::Issued);
+    let owned = OwnedCert::from_der(der).expect("signer parses");
+    let certificate = owned.view();
+    let parameters = SignerParameters {
+        certificate: &certificate,
+        digest_algorithm: DigestAlgorithm::Sha256,
+        signature_algorithm: SignatureAlgorithm::EcdsaSha256,
+        signing_time: Some(SIGNING_TIME),
+    };
+    let planned = plan(
+        format,
+        note_objects(),
+        &parameters,
+        &SignatureMetadata::default(),
+    )
+    .expect("plans");
+    let signature = key.sign_raw(planned.to_be_signed());
+    let imprint = planned
+        .timestamp_digest(&parameters, &signature, DigestAlgorithm::Sha256)
+        .expect("timestamp digest");
+    let timestamps: Vec<Vec<u8>> = world.token(Stamp::Anchored, &imprint).into_iter().collect();
+    let material = world.lt_material(None);
+    let input = planned
+        .archive_input(&parameters, &signature, &timestamps, &material)
+        .expect("a container archives");
+    crate::service::archived_container(
+        planned,
+        &parameters,
+        &signature,
+        &timestamps,
+        &material,
+        &input,
+        obtain,
+    )
+}
+
+/// `archive`'s token over `digest`, verified as the service verifies an
+/// authority's answer.
+fn archive_answer(
+    archive: &ArchiveAuthority,
+    digest: &[u8],
+) -> crate::timestamp::VerifiedTimestampToken {
+    let token = timestamp_token(
+        &archive.tsa,
+        &archive.key,
+        DigestAlgorithm::Sha256,
+        digest,
+        day(ARCHIVED),
+    );
+    crate::timestamp::verify_token(&token, |_algorithm| digest.to_vec()).expect("token verifies")
+}
+
+/// Every format but `PAdES` signed at LTA verifies with its archive
+/// timestamp anchored, and stands on it once the signature timestamp's
+/// authority is no longer trusted: for `ASiC-E` (`ETSI EN 319 162-1`
+/// V1.1.1 clause 4.4.5) an `xadesv141:ArchiveTimeStamp` for `XAdES`
+/// (`ETSI EN 319 132-1` V1.3.1 clause 5.5.2.3) and an
+/// `ASiCArchiveManifest` for `CAdES` (annex A.7); for a CMS signature,
+/// attached or detached, an `archive-time-stamp-v3` (`ETSI EN 319
+/// 122-1` V1.3.1 clause 5.5.3).
+#[test]
+fn every_format_signed_at_lta_stands_on_its_archive_timestamp() {
+    let world = World::new();
+    let archive = ArchiveAuthority::new();
+    for (format, form) in [
+        (Format::AsicEXades, ArchiveForm::Xades),
+        (Format::AsicECades, ArchiveForm::AsicArchiveManifest),
+        (Format::Cades, ArchiveForm::CadesV3),
+        (Format::CadesDetached, ArchiveForm::CadesV3),
+    ] {
+        let signed = container_archived_by(&world, format, |digest| {
+            Ok(archive_answer(&archive, digest))
+        })
+        .expect("archived");
+        let file = if format == Format::CadesDetached {
+            DocumentFile::detached_cms(signed, NOTE.to_vec())
+        } else {
+            DocumentFile::from_file(signed)
+        }
+        .expect("a known shape");
+        let report = verify(&file, &archive.anchors(&world), day(EXPIRED)).expect("report");
+        let signature = only(&report);
+        assert!(signature.document_intact(), "{format:?}");
+        assert!(signature.signature_valid(), "{format:?}");
+        assert_eq!(
+            kinds(signature.timestamps()),
+            [Kind::Claimed(day(STAMPED))],
+            "{format:?}"
+        );
+        assert_eq!(
+            archive_kinds(signature),
+            [(form, Kind::Anchored(day(ARCHIVED)))],
+            "{format:?}"
+        );
+        assert_eq!(
+            signature.proof_of_existence(),
+            Some(day(ARCHIVED)),
+            "{format:?}"
+        );
+        assert!(signature.chain_verified(), "{format:?}");
+    }
+}
+
+/// The `XAdES` archive timestamp is the last unsigned signature
+/// property, after the evidence it covers, in the 1.4.1 namespace
+/// (`ETSI EN 319 132-1` V1.3.1 clause 6.3 table 2).
+#[test]
+fn the_xades_archive_timestamp_follows_the_evidence_it_covers() {
+    let world = World::new();
+    let archive = ArchiveAuthority::new();
+    let container = container_archived_by(&world, Format::AsicEXades, |digest| {
+        Ok(archive_answer(&archive, digest))
+    })
+    .expect("archived");
+    let read = super::asic::AsicContainer::parse(&container).expect("reads");
+    let [file] = exactly(read.xades_signature_files(), "one signature file");
+    let document = core::str::from_utf8(file.content()).expect("utf-8");
+    let open = format!("<xadesv141:ArchiveTimeStamp xmlns:xadesv141=\"{NAMESPACE_XADES_141}\"");
+    assert_eq!(document.matches(&open).count(), 1, "{document}");
+    let at = document.find(&open).expect("present");
+    for earlier in [
+        "</xades:SignatureTimeStamp>",
+        "</xades:CertificateValues>",
+        "</xades:RevocationValues>",
+    ] {
+        assert!(
+            document.find(earlier).is_some_and(|end| end < at),
+            "{earlier}"
+        );
+    }
+    assert!(
+        document[at..].starts_with(&open)
+            && document[at..]
+                .split_once("</xadesv141:ArchiveTimeStamp>\n")
+                .is_some_and(|(_, rest)| rest.starts_with("</xades:UnsignedSignatureProperties>")),
+        "nothing follows the archive timestamp"
+    );
+}
+
+/// An archive manifest whose digest is not its entry's leaves its token
+/// proving nothing, though the token imprints the manifest it sits by.
+#[test]
+fn an_archive_manifest_whose_digest_does_not_hold_is_invalid() {
+    let world = World::new();
+    let archive = ArchiveAuthority::new();
+    let (key, der) = world.signer(Signer::Issued);
+    let owned = OwnedCert::from_der(der).expect("signer parses");
+    let certificate = owned.view();
+    let parameters = SignerParameters {
+        certificate: &certificate,
+        digest_algorithm: DigestAlgorithm::Sha256,
+        signature_algorithm: SignatureAlgorithm::EcdsaSha256,
+        signing_time: Some(SIGNING_TIME),
+    };
+    let planned = plan(
+        Format::AsicECades,
+        note_objects(),
+        &parameters,
+        &SignatureMetadata::default(),
+    )
+    .expect("plans");
+    let signature = key.sign_raw(planned.to_be_signed());
+    let material = world.lt_material(None);
+    let mut manifest = planned
+        .archive_input(&parameters, &signature, &[], &material)
+        .expect("a container archives");
+    let value = "<ds:DigestValue>";
+    let at = String::from_utf8_lossy(&manifest)
+        .find(value)
+        .expect("a digest")
+        + value.len();
+    manifest[at] = if manifest[at] == b'A' { b'B' } else { b'A' };
+    let token = archive.token(&manifest);
+    let container = planned
+        .finish_archived(&parameters, &signature, &[], &material, &manifest, &token)
+        .expect("finishes");
+    let report = verify_expired(container, &archive.anchors(&world));
+    assert_eq!(
+        archive_kinds(only(&report)),
+        [(
+            ArchiveForm::AsicArchiveManifest,
+            Kind::Invalid(TimestampError::Malformed(
+                "an archive manifest digest does not match its entry"
+            ))
+        )]
+    );
+}
+
+/// A release build that cannot have the archive timestamp assembles
+/// nothing: the refusal is the result, and there are no bytes to save.
+#[test]
+fn a_signature_whose_archive_timestamp_is_refused_is_not_assembled() {
+    let world = World::new();
+    for format in [
+        Format::AsicEXades,
+        Format::AsicECades,
+        Format::Cades,
+        Format::CadesDetached,
+    ] {
+        let refused = container_archived_by(&world, format, |_digest| {
+            Err(crate::service::SignErrorKind::Timestamp(
+                "every authority declined".to_owned(),
+            ))
+        });
+        assert!(
+            matches!(refused, Err(crate::service::SignErrorKind::Timestamp(_))),
+            "{format:?}"
+        );
+    }
+}

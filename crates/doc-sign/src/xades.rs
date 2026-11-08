@@ -70,6 +70,10 @@ pub(crate) const NAMESPACE_DSIG: &str = "http://www.w3.org/2000/09/xmldsig#";
 /// `XAdES` 1.3.2 namespace, the version `ASiC-E` and `BDOC` both name.
 pub(crate) const NAMESPACE_XADES: &str = "http://uri.etsi.org/01903/v1.3.2#";
 
+/// `XAdES` 1.4.1 namespace, home of `ArchiveTimeStamp` (`ETSI EN 319
+/// 132-1` V1.3.1 clause 4.2).
+pub(crate) const NAMESPACE_XADES_141: &str = "http://uri.etsi.org/01903/v1.4.1#";
+
 /// `SHA-256` digest method identifier (RFC 4051 sec.2.1).
 pub(crate) const DIGEST_METHOD_SHA256: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
 
@@ -115,6 +119,9 @@ const SIGNED_PROPERTIES_ID: &str = "SIG-1-SIGNEDPROPS";
 /// Identifier of the `SignatureValue`, which `XAdES` timestamps refer to
 /// when a signature is later raised to a long-term level.
 const SIGNATURE_VALUE_ID: &str = "SIG-1-SIGVAL";
+
+/// Identifier of the one `ArchiveTimeStamp` this module writes.
+const ARCHIVE_TIMESTAMP_ID: &str = "SIG-1-ATS-0";
 
 /// What can go wrong before a signature exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,7 +209,9 @@ impl SignaturePlan {
         algorithm.digest(Self::signature_value_element(signature).as_bytes())
     }
 
-    /// Assemble `META-INF/signatures0.xml`.
+    /// Assemble `META-INF/signatures0.xml` without an archive
+    /// timestamp: level B, T or LT by what `timestamps` and `material`
+    /// hold.
     ///
     /// `signature` is what the card returned for [`Self::digest`].
     /// `timestamps` are RFC 3161 tokens over
@@ -226,11 +235,83 @@ impl SignaturePlan {
         timestamps: &[Vec<u8>],
         material: &ValidationMaterial,
     ) -> Vec<u8> {
+        self.write(signature, timestamps, material, None)
+    }
+
+    /// Assemble `META-INF/signatures0.xml` at level B-LTA: as
+    /// [`Self::finish`], plus an `xadesv141:ArchiveTimeStamp` holding
+    /// `archive_token`, an RFC 3161 token over
+    /// [`Self::archive_input`] of the same arguments.
+    #[must_use]
+    pub fn finish_archived(
+        &self,
+        signature: &[u8],
+        timestamps: &[Vec<u8>],
+        material: &ValidationMaterial,
+        archive_token: &[u8],
+    ) -> Vec<u8> {
+        self.write(signature, timestamps, material, Some(archive_token))
+    }
+
+    /// The octets an `ArchiveTimeStamp` placed after the properties
+    /// [`Self::finish`] writes must imprint (`ETSI EN 319 132-1`
+    /// V1.3.1 clause 5.5.2.3, the not distributed case).
+    ///
+    /// In order: what each `ds:Reference` digests -- every data
+    /// object's content, which a detached reference without transforms
+    /// dereferences to as an octet stream, then the canonical
+    /// `SignedProperties` -- then the canonical `ds:SignedInfo`,
+    /// `ds:SignatureValue` and `ds:KeyInfo`, then every unsigned
+    /// signature property in document order. The only `ds:Object`
+    /// holds `QualifyingProperties`, so step 6 adds nothing.
+    ///
+    /// Every element here is written in exclusive canonical form, so
+    /// these are the document's own bytes; nothing is re-serialised.
+    #[must_use]
+    pub fn archive_input(
+        &self,
+        objects: &[DataObject],
+        signature: &[u8],
+        timestamps: &[Vec<u8>],
+        material: &ValidationMaterial,
+    ) -> Vec<u8> {
+        let mut input = Vec::new();
+        for object in objects {
+            input.extend_from_slice(&object.content);
+        }
+        input.extend_from_slice(self.signed_properties.as_bytes());
+        input.extend_from_slice(self.signed_info.as_bytes());
+        input.extend_from_slice(Self::signature_value_element(signature).as_bytes());
+        input.extend_from_slice(self.key_info().as_bytes());
+        for property in unsigned_signature_properties(timestamps, material) {
+            input.extend_from_slice(property.as_bytes());
+        }
+        input
+    }
+
+    /// `ds:KeyInfo` with the signer's certificate, in canonical form:
+    /// it declares the `ds` prefix itself, as a subset of its own must
+    /// (`Exclusive XML Canonicalization 1.0` sec.3).
+    fn key_info(&self) -> String {
+        format!(
+            "<ds:KeyInfo xmlns:ds=\"{NAMESPACE_DSIG}\">\n<ds:X509Data>\n<ds:X509Certificate>{}</ds:X509Certificate>\n</ds:X509Data>\n</ds:KeyInfo>",
+            base64::encode(&self.certificate_der)
+        )
+    }
+
+    /// The document, with an archive timestamp when one is given.
+    fn write(
+        &self,
+        signature: &[u8],
+        timestamps: &[Vec<u8>],
+        material: &ValidationMaterial,
+        archive_token: Option<&[u8]>,
+    ) -> Vec<u8> {
         let mut document = String::from(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
         document.push('\n');
         // The container-level wrapper. Not canonicalised and not
         // digested -- nothing signs it -- so ordinary XML rules apply
-        // from here down, except inside the two subtrees that are.
+        // from here down, except inside the subtrees that are.
         let _ignored = writeln!(
             document,
             r#"<asic:XAdESSignatures xmlns:asic="{NAMESPACE_ASIC}">"#
@@ -249,13 +330,9 @@ impl SignaturePlan {
         document.push_str(&Self::signature_value_element(signature));
         document.push('\n');
 
-        document.push_str("<ds:KeyInfo>\n<ds:X509Data>\n");
-        let _ignored = writeln!(
-            document,
-            "<ds:X509Certificate>{}</ds:X509Certificate>",
-            base64::encode(&self.certificate_der)
-        );
-        document.push_str("</ds:X509Data>\n</ds:KeyInfo>\n");
+        // Byte for byte as an archive timestamp digests it.
+        document.push_str(&self.key_info());
+        document.push('\n');
 
         document.push_str("<ds:Object>\n");
         let _ignored = writeln!(
@@ -265,71 +342,20 @@ impl SignaturePlan {
         // Byte for byte as digested by the second reference.
         document.push_str(&self.signed_properties);
         document.push('\n');
-        // Unsigned, so ordinary XML rules apply here: nothing digests
-        // this subtree, which is the whole reason a timestamp over the
-        // signature can live in it.
-        if !timestamps.is_empty() || !material.is_empty() {
+        // Unsigned: no signature covers them, which is why a timestamp
+        // over the signature can live here. Each property is still
+        // written in canonical form, because an archive timestamp
+        // digests each one on its own.
+        let mut properties = unsigned_signature_properties(timestamps, material);
+        if let Some(token) = archive_token {
+            properties.push(archive_timestamp_element(token));
+        }
+        if !properties.is_empty() {
             document.push_str("<xades:UnsignedProperties>\n");
             document.push_str("<xades:UnsignedSignatureProperties>\n");
-            for (index, token) in timestamps.iter().enumerate() {
-                let _ignored = writeln!(
-                    document,
-                    r#"<xades:SignatureTimeStamp Id="{SIGNATURE_ID}-TS-{index}">"#
-                );
-                // Which canonicalisation the verifier must apply before
-                // digesting `ds:SignatureValue`. It has to name the one
-                // actually used, or the verifier hashes different bytes.
-                let _ignored = writeln!(
-                    document,
-                    r#"<ds:CanonicalizationMethod Algorithm="{CANONICALIZATION_EXCLUSIVE}"></ds:CanonicalizationMethod>"#
-                );
-                let _ignored = writeln!(
-                    document,
-                    "<xades:EncapsulatedTimeStamp>{}</xades:EncapsulatedTimeStamp>",
-                    base64::encode(token)
-                );
-                document.push_str("</xades:SignatureTimeStamp>\n");
-            }
-            // The evidence a verifier would otherwise have to fetch.
-            // Schema order is fixed: certificates, then revocation
-            // values, and inside those CRLs before OCSP responses
-            // (`XAdES` `RevocationValuesType`).
-            if !material.certificates.is_empty() {
-                document.push_str("<xades:CertificateValues>\n");
-                for certificate in &material.certificates {
-                    let _ignored = writeln!(
-                        document,
-                        "<xades:EncapsulatedX509Certificate>{}</xades:EncapsulatedX509Certificate>",
-                        base64::encode(certificate)
-                    );
-                }
-                document.push_str("</xades:CertificateValues>\n");
-            }
-            if material.revocation_count() > 0 {
-                document.push_str("<xades:RevocationValues>\n");
-                if !material.crls.is_empty() {
-                    document.push_str("<xades:CRLValues>\n");
-                    for crl in &material.crls {
-                        let _ignored = writeln!(
-                            document,
-                            "<xades:EncapsulatedCRLValue>{}</xades:EncapsulatedCRLValue>",
-                            base64::encode(crl)
-                        );
-                    }
-                    document.push_str("</xades:CRLValues>\n");
-                }
-                if !material.ocsp_responses.is_empty() {
-                    document.push_str("<xades:OCSPValues>\n");
-                    for response in &material.ocsp_responses {
-                        let _ignored = writeln!(
-                            document,
-                            "<xades:EncapsulatedOCSPValue>{}</xades:EncapsulatedOCSPValue>",
-                            base64::encode(response)
-                        );
-                    }
-                    document.push_str("</xades:OCSPValues>\n");
-                }
-                document.push_str("</xades:RevocationValues>\n");
+            for property in &properties {
+                document.push_str(property);
+                document.push('\n');
             }
             document.push_str("</xades:UnsignedSignatureProperties>\n");
             document.push_str("</xades:UnsignedProperties>\n");
@@ -341,6 +367,111 @@ impl SignaturePlan {
         document.push_str("</asic:XAdESSignatures>\n");
         document.into_bytes()
     }
+}
+
+/// The unsigned signature properties before any archive timestamp, in
+/// schema order, each in exclusive canonical form.
+///
+/// One `SignatureTimeStamp` per token, then `CertificateValues`, then
+/// `RevocationValues` with CRLs before OCSP responses (`XAdES`
+/// `RevocationValuesType`). Each element is the apex of a subset an
+/// archive timestamp canonicalises on its own (`ETSI EN 319 132-1`
+/// V1.3.1 clause 5.5.2.3 step 5), so it declares the prefixes it
+/// visibly uses, and a descendant declares one no ancestor in the
+/// subset uses (`Exclusive XML Canonicalization 1.0` sec.3).
+fn unsigned_signature_properties(
+    timestamps: &[Vec<u8>],
+    material: &ValidationMaterial,
+) -> Vec<String> {
+    let mut properties = Vec::new();
+    for (index, token) in timestamps.iter().enumerate() {
+        let mut property = String::new();
+        let _ignored = writeln!(
+            property,
+            r#"<xades:SignatureTimeStamp xmlns:xades="{NAMESPACE_XADES}" Id="{SIGNATURE_ID}-TS-{index}">"#
+        );
+        // Which canonicalisation the verifier must apply before
+        // digesting `ds:SignatureValue`. It has to name the one
+        // actually used, or the verifier hashes different bytes.
+        let _ignored = writeln!(
+            property,
+            r#"<ds:CanonicalizationMethod xmlns:ds="{NAMESPACE_DSIG}" Algorithm="{CANONICALIZATION_EXCLUSIVE}"></ds:CanonicalizationMethod>"#
+        );
+        let _ignored = writeln!(
+            property,
+            "<xades:EncapsulatedTimeStamp>{}</xades:EncapsulatedTimeStamp>",
+            base64::encode(token)
+        );
+        property.push_str("</xades:SignatureTimeStamp>");
+        properties.push(property);
+    }
+    // The evidence a verifier would otherwise have to fetch.
+    if !material.certificates.is_empty() {
+        let mut property = String::new();
+        let _ignored = writeln!(
+            property,
+            r#"<xades:CertificateValues xmlns:xades="{NAMESPACE_XADES}">"#
+        );
+        for certificate in &material.certificates {
+            let _ignored = writeln!(
+                property,
+                "<xades:EncapsulatedX509Certificate>{}</xades:EncapsulatedX509Certificate>",
+                base64::encode(certificate)
+            );
+        }
+        property.push_str("</xades:CertificateValues>");
+        properties.push(property);
+    }
+    if material.revocation_count() > 0 {
+        let mut property = String::new();
+        let _ignored = writeln!(
+            property,
+            r#"<xades:RevocationValues xmlns:xades="{NAMESPACE_XADES}">"#
+        );
+        if !material.crls.is_empty() {
+            property.push_str("<xades:CRLValues>\n");
+            for crl in &material.crls {
+                let _ignored = writeln!(
+                    property,
+                    "<xades:EncapsulatedCRLValue>{}</xades:EncapsulatedCRLValue>",
+                    base64::encode(crl)
+                );
+            }
+            property.push_str("</xades:CRLValues>\n");
+        }
+        if !material.ocsp_responses.is_empty() {
+            property.push_str("<xades:OCSPValues>\n");
+            for response in &material.ocsp_responses {
+                let _ignored = writeln!(
+                    property,
+                    "<xades:EncapsulatedOCSPValue>{}</xades:EncapsulatedOCSPValue>",
+                    base64::encode(response)
+                );
+            }
+            property.push_str("</xades:OCSPValues>\n");
+        }
+        property.push_str("</xades:RevocationValues>");
+        properties.push(property);
+    }
+    properties
+}
+
+/// The `xadesv141:ArchiveTimeStamp` holding `token` (`ETSI EN 319
+/// 132-1` V1.3.1 clause 5.5.2.1; table 2 of clause 6.3 requires the
+/// 1.4.1 namespace at B-LTA and forbids the 1.3.2 one).
+///
+/// Written in canonical form like the properties before it, so that a
+/// later archive timestamp can cover it as written. It names exclusive
+/// canonicalisation, the one [`SignaturePlan::archive_input`] follows,
+/// and carries no `Include`: everything it covers shares its parent.
+fn archive_timestamp_element(token: &[u8]) -> String {
+    format!(
+        "<xadesv141:ArchiveTimeStamp xmlns:xadesv141=\"{NAMESPACE_XADES_141}\" Id=\"{ARCHIVE_TIMESTAMP_ID}\">\n\
+<ds:CanonicalizationMethod xmlns:ds=\"{NAMESPACE_DSIG}\" Algorithm=\"{CANONICALIZATION_EXCLUSIVE}\"></ds:CanonicalizationMethod>\n\
+<xades:EncapsulatedTimeStamp xmlns:xades=\"{NAMESPACE_XADES}\">{}</xades:EncapsulatedTimeStamp>\n\
+</xadesv141:ArchiveTimeStamp>",
+        base64::encode(token)
+    )
 }
 
 /// Build the signature over `objects` and return the plan to sign it.

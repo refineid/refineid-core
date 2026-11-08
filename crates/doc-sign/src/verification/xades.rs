@@ -62,15 +62,12 @@ use crate::verification::xml::{
 };
 use crate::xades::{
     CANONICALIZATION_EXCLUSIVE, DIGEST_METHOD_SHA256, DIGEST_METHOD_SHA384, DIGEST_METHOD_SHA512,
-    NAMESPACE_DSIG, NAMESPACE_XADES, SIGNATURE_METHOD_ECDSA_SHA256, SIGNATURE_METHOD_ECDSA_SHA384,
-    SIGNATURE_METHOD_RSA_SHA256, SIGNATURE_METHOD_RSA_SHA384, TYPE_SIGNED_PROPERTIES,
+    NAMESPACE_DSIG, NAMESPACE_XADES, NAMESPACE_XADES_141, SIGNATURE_METHOD_ECDSA_SHA256,
+    SIGNATURE_METHOD_ECDSA_SHA384, SIGNATURE_METHOD_RSA_SHA256, SIGNATURE_METHOD_RSA_SHA384,
+    TYPE_SIGNED_PROPERTIES,
 };
 use refineid_cms::x509::{DateTime, MessageSignatureAlgorithm, OwnedCert};
 use refineid_digest::{SHA256_LEN, SHA384_LEN, SHA512_LEN, Sha256, Sha384, Sha512};
-
-/// `XAdES` 1.4.1 namespace, home of `ArchiveTimeStamp` (`ETSI EN
-/// 319 132-1` sec.4.2).
-const NAMESPACE_XADES_141: &str = "http://uri.etsi.org/01903/v1.4.1#";
 
 /// Exclusive canonicalisation with comments (W3C xml-exc-c14n sec.4).
 const CANONICALIZATION_EXCLUSIVE_COMMENTS: &str =
@@ -2444,10 +2441,10 @@ mod tests {
         ] {
             let renamed = with_comment.replacen(
                 &format!(
-                    "<ds:CanonicalizationMethod Algorithm=\"{CANONICALIZATION_EXCLUSIVE}\"></ds:CanonicalizationMethod>\n<xades:EncapsulatedTimeStamp>"
+                    "<ds:CanonicalizationMethod xmlns:ds=\"{NAMESPACE_DSIG}\" Algorithm=\"{CANONICALIZATION_EXCLUSIVE}\"></ds:CanonicalizationMethod>\n<xades:EncapsulatedTimeStamp>"
                 ),
                 &format!(
-                    "<ds:CanonicalizationMethod Algorithm=\"{uri}\"></ds:CanonicalizationMethod>\n<xades:EncapsulatedTimeStamp>"
+                    "<ds:CanonicalizationMethod xmlns:ds=\"{NAMESPACE_DSIG}\" Algorithm=\"{uri}\"></ds:CanonicalizationMethod>\n<xades:EncapsulatedTimeStamp>"
                 ),
                 1,
             );

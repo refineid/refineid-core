@@ -61,3 +61,9 @@ trybuild.workspace = true
 
 [lints]
 workspace = true
+
+# The independent validation gate: needs the testkit and a DSS runtime,
+# so it runs only through scripts/dss-gate.sh.
+[[test]]
+name = "dss_gate"
+required-features = ["testkit"]

@@ -93,9 +93,13 @@ pub enum DocumentError {
     Pdf(PdfError),
     /// The `XAdES` could not be built.
     Xades(XadesError),
-    /// An archive timestamp was asked of a format that does not build
-    /// one this way.
+    /// [`DocumentPlan::finish_archived`] was asked of `PAdES`, which
+    /// archives with a document timestamp over the finished file.
     ArchiveUnsupported,
+    /// The archive timestamp token is not a `ContentInfo` holding a
+    /// `SignedData` with one `SignerInfo` in DER, so its
+    /// `ats-hash-index-v3` cannot be added.
+    ArchiveTokenUnreadable,
     /// A data object cannot be carried under the name it was given.
     ///
     /// A container reserves `mimetype` and everything under
@@ -126,7 +130,10 @@ impl core::fmt::Display for DocumentError {
             Self::Pdf(error) => write!(f, "PDF: {error}"),
             Self::Xades(error) => write!(f, "XAdES: {error}"),
             Self::ArchiveUnsupported => {
-                f.write_str("this format does not take an ASiC archive manifest")
+                f.write_str("a PDF is archived with a document timestamp, not this way")
+            }
+            Self::ArchiveTokenUnreadable => {
+                f.write_str("the archive timestamp token is not a DER SignedData with one signer")
             }
             Self::UnusableObjectName => f.write_str(
                 "a file name is reserved, repeated, absolute, escaping, or not portable in a ZIP container",
@@ -361,46 +368,101 @@ impl DocumentPlan {
         }
     }
 
-    /// The archive manifest and the digest a TSA must attest for it.
+    /// The octets an archive timestamp must attest, for a format that
+    /// is archived by a timestamp over octets built from the finished
+    /// signature rather than over the finished file.
     ///
-    /// `ASiC-E` with `CAdES` reaches level LTA through a second manifest
-    /// and a timestamp over it rather than through a signature
-    /// attribute (`EN 319 162-1 clause 4.4.5 item 2`). The manifest
-    /// covers the signature, so it exists only after signing; the caller
-    /// hands the digest to an authority and the token back to
-    /// [`Self::finish_archived`].
+    /// - `ASiC-E` with `CAdES`: the `ASiCArchiveManifest` covering the
+    ///   data objects, the `ASiCManifest` and the signature
+    ///   (`ETSI EN 319 162-1` V1.1.1 clause 4.4.5 item 2 a) and clause
+    ///   A.7). The manifest is also what [`Self::finish_archived`]
+    ///   stores.
+    /// - `ASiC-E` with `XAdES`: the input of an `ArchiveTimeStamp`
+    ///   placed after the properties [`Self::finish`] writes
+    ///   (`ETSI EN 319 162-1` V1.1.1 clause 4.4.5 item 1, `ETSI EN 319
+    ///   132-1` V1.3.1 clause 5.5.2.3), which only feeds the digest.
     ///
-    /// Returns `None` for every other format, which archives by other
-    /// means or not at all.
+    /// Both cover the signature, so they exist only after signing; the
+    /// caller hands their digest to an authority and the token back to
+    /// [`Self::finish_archived`] with the same arguments.
+    ///
+    /// - `CAdES`, attached or detached: the input of an
+    ///   `archive-time-stamp-v3` (`ETSI EN 319 122-1` V1.3.1 clause
+    ///   5.5.3) under the signer's digest, its `ats-hash-index-v3`
+    ///   (clause 5.5.2) built from the same arguments.
+    ///
+    /// `None` for `PAdES`, which archives with a document timestamp
+    /// over the finished file.
     #[must_use]
-    pub fn archive_manifest(
+    pub fn archive_input(
         &self,
         parameters: &SignerParameters<'_>,
         signature: &[u8],
-        algorithm: DigestAlgorithm,
+        timestamps: &[Vec<u8>],
+        material: &ValidationMaterial,
     ) -> Option<Vec<u8>> {
         match self.state {
-            State::AsicECades { ref container, .. } => {
+            State::AsicECades {
+                ref attributes,
+                ref container,
+            } => {
                 let der = for_cms(parameters.signature_algorithm, signature).ok()?;
-                Some(container.archive_manifest(&der, algorithm))
+                let cms = cades::signed_data(
+                    parameters,
+                    attributes,
+                    &der,
+                    Encapsulation::Detached,
+                    &[],
+                    material,
+                    timestamps,
+                );
+                Some(container.archive_manifest(&cms, parameters.digest_algorithm))
             }
-            State::Cades { .. } | State::Pades { .. } | State::AsicEXades { .. } => None,
+            State::AsicEXades {
+                signature: ref plan,
+                ref objects,
+            } => Some(plan.archive_input(objects, signature, timestamps, material)),
+            State::Cades {
+                ref attributes,
+                ref content,
+                ..
+            } => {
+                let der = for_cms(parameters.signature_algorithm, signature).ok()?;
+                Some(
+                    cades::archive_input_v3(
+                        parameters,
+                        attributes,
+                        &der,
+                        content,
+                        material,
+                        timestamps,
+                        parameters.digest_algorithm,
+                    )
+                    .input()
+                    .to_vec(),
+                )
+            }
+            State::Pades { .. } => None,
         }
     }
 
-    /// Assemble an `ASiC-E` `CAdES` container at level LTA.
+    /// Assemble a container or a CMS signature at level LTA, `token`
+    /// being an RFC 3161 token over [`Self::archive_input`] of the same
+    /// arguments.
     ///
     /// # Errors
     /// [`DocumentError::MalformedEcdsaSignature`] as for
-    /// [`Self::finish`], or [`DocumentError::ArchiveUnsupported`] for a
-    /// format that does not archive this way.
+    /// [`Self::finish`], [`DocumentError::ContainerTooLarge`],
+    /// [`DocumentError::ArchiveTokenUnreadable`] for a `CAdES` token
+    /// that cannot carry its hash index, or
+    /// [`DocumentError::ArchiveUnsupported`] for `PAdES`.
     pub fn finish_archived(
         self,
         parameters: &SignerParameters<'_>,
         signature: &[u8],
         timestamps: &[Vec<u8>],
         material: &ValidationMaterial,
-        archive_manifest: &[u8],
+        archive_input: &[u8],
         token: &[u8],
     ) -> Result<Vec<u8>, DocumentError> {
         match self.state {
@@ -419,12 +481,37 @@ impl DocumentPlan {
                     timestamps,
                 );
                 container
-                    .finish_archived(&cms, archive_manifest, token)
+                    .finish_archived(&cms, archive_input, token)
                     .ok_or(DocumentError::ContainerTooLarge)
             }
-            State::Cades { .. } | State::Pades { .. } | State::AsicEXades { .. } => {
-                Err(DocumentError::ArchiveUnsupported)
+            State::AsicEXades {
+                signature: plan,
+                objects,
+            } => {
+                let document = plan.finish_archived(signature, timestamps, material, token);
+                asic::xades_container(&objects, &document).ok_or(DocumentError::ContainerTooLarge)
             }
+            State::Cades {
+                attributes,
+                encapsulation,
+                content,
+                ..
+            } => {
+                let der = for_cms(parameters.signature_algorithm, signature)?;
+                cades::signed_data_archived(
+                    parameters,
+                    &attributes,
+                    &der,
+                    encapsulation,
+                    &content,
+                    material,
+                    timestamps,
+                    token,
+                    parameters.digest_algorithm,
+                )
+                .ok_or(DocumentError::ArchiveTokenUnreadable)
+            }
+            State::Pades { .. } => Err(DocumentError::ArchiveUnsupported),
         }
     }
 }

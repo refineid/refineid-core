@@ -82,6 +82,13 @@ enum FileContent {
     Zip(Vec<u8>),
     /// A DER SEQUENCE, read as a CMS `ContentInfo`.
     Der(Vec<u8>),
+    /// A detached CMS signature and the content it signs.
+    DetachedDer {
+        /// The `ContentInfo`.
+        signature: Vec<u8>,
+        /// The signed file.
+        content: Vec<u8>,
+    },
 }
 
 /// One file of a known shape: a PDF, a ZIP archive, or a DER SEQUENCE.
@@ -109,6 +116,22 @@ impl DocumentFile {
             return Err(DocumentFailure::NotASignedDocument);
         };
         Ok(Self { content })
+    }
+
+    /// Accept a detached CMS signature, the complete `.p7s` file, with
+    /// the complete file it signs (`ETSI EN 319 122-1` V1.3.1 clause
+    /// 4.4: the content is outside the `SignedData`).
+    ///
+    /// # Errors
+    /// [`DocumentFailure::NotASignedDocument`] when `signature` does not
+    /// start as a DER SEQUENCE.
+    pub fn detached_cms(signature: Vec<u8>, content: Vec<u8>) -> Result<Self, DocumentFailure> {
+        if signature.first().copied().map(u16::from) != Some(<Sequence as BerTag>::TAG) {
+            return Err(DocumentFailure::NotASignedDocument);
+        }
+        Ok(Self {
+            content: FileContent::DetachedDer { signature, content },
+        })
     }
 }
 
@@ -278,6 +301,12 @@ pub enum ArchiveForm {
     /// properties share its parent; reported
     /// [`TimestampReport::Unsupported`] otherwise.
     Xades,
+    /// An `ASiCArchiveManifest` of an `ASiC-E` container with `CAdES`
+    /// and the token over it (`ETSI EN 319 162-1` V1.1.1 clause 4.4.5
+    /// item 2 a) and annex A.7), judged; a manifest whose references
+    /// do not hold, or whose token is missing, is
+    /// [`TimestampReport::Invalid`].
+    AsicArchiveManifest,
 }
 
 /// One archive timestamp of a signature: a timestamp over the
@@ -841,8 +870,12 @@ pub enum UnsupportedProfile {
     Container(AsicReadError),
     /// A DER file that is not a CMS signature this verifier reads.
     Cms(CadesReadError),
-    /// A CMS signature whose content is not attached.
+    /// A CMS signature whose content is not attached, given without the
+    /// content ([`DocumentFile::detached_cms`] takes both).
     DetachedCms,
+    /// A CMS signature carrying its content, given with a content of
+    /// its own to judge it against.
+    AttachedCmsGivenContent,
 }
 
 /// Why a file yielded no report. A negative verdict is a report, not
@@ -878,6 +911,9 @@ impl core::fmt::Display for DocumentFailure {
             Self::UnsupportedProfile(UnsupportedProfile::DetachedCms) => {
                 f.write_str("unsupported: the CMS signature does not carry its content")
             }
+            Self::UnsupportedProfile(UnsupportedProfile::AttachedCmsGivenContent) => {
+                f.write_str("unsupported: the CMS signature carries its own content")
+            }
         }
     }
 }
@@ -902,6 +938,10 @@ pub fn verify(
         FileContent::Pdf(bytes) => context.verify_pdf(bytes)?,
         FileContent::Zip(bytes) => (context.verify_asic(bytes)?, Vec::new()),
         FileContent::Der(bytes) => (vec![context.verify_attached_cms(bytes)?], Vec::new()),
+        FileContent::DetachedDer { signature, content } => (
+            vec![context.verify_detached_cms(signature, content)?],
+            Vec::new(),
+        ),
     };
     if rows.is_empty() {
         return Err(DocumentFailure::NoSignatures);
@@ -1432,12 +1472,33 @@ impl Context<'_> {
         );
         let mut pool = self.anchor_pool();
         pool.add_material(signature.embedded_material());
+        let mut archive_timestamps = cades_archive_timestamps(verdict.archive_timestamps);
+        // A.7 item 1: the signature carries its full material in
+        // SignedData before the first archive manifest is added, so
+        // that is what the manifest's token protects.
+        archive_timestamps.extend(container.archive_manifests_of(entry).into_iter().map(
+            |archive| ArchiveFact {
+                form: ArchiveForm::AsicArchiveManifest,
+                timestamp: match (archive.broken(), archive.token()) {
+                    (Some(why), _) => Timestamp::Refused(TimestampError::Malformed(why)),
+                    (None, None) => Timestamp::Refused(TimestampError::Malformed(
+                        "the archive manifest's time-stamp token is missing",
+                    )),
+                    (None, Some(token)) => Timestamp::Token {
+                        token: token.to_vec(),
+                        imprint: Imprint::Octets(archive.manifest().to_vec()),
+                    },
+                },
+                covered: signature.embedded_material().clone(),
+                authority_material: ValidationMaterial::default(),
+            },
+        ));
         SignatureRow::judged(self.report(Facts {
             signer: signature.signer_certificate().clone(),
             document_intact: verdict.document_intact && container.manifest_intact(entry),
             signature_valid: verdict.signature_valid,
             timestamps: cades_timestamps(&verdict.signature_timestamps),
-            archive_timestamps: cades_archive_timestamps(verdict.archive_timestamps),
+            archive_timestamps,
             covering: Vec::new(),
             revision: Revision::WholeDocument,
             claimed_signing_time: signature.signing_time(),
@@ -1455,10 +1516,32 @@ impl Context<'_> {
                 UnsupportedProfile::DetachedCms,
             ));
         }
-        let verdict = signature.verify(Content::Attached, EssBinding::Required);
+        Ok(self.cms_row(&signature, Content::Attached))
+    }
+
+    /// Judge a detached CMS signature over `content` (`ETSI EN 319
+    /// 122-1`).
+    fn verify_detached_cms(
+        &self,
+        bytes: &[u8],
+        content: &[u8],
+    ) -> Result<SignatureRow, DocumentFailure> {
+        let signature = CadesSignature::parse(bytes)
+            .map_err(|error| DocumentFailure::UnsupportedProfile(UnsupportedProfile::Cms(error)))?;
+        if signature.content_attached() {
+            return Err(DocumentFailure::UnsupportedProfile(
+                UnsupportedProfile::AttachedCmsGivenContent,
+            ));
+        }
+        Ok(self.cms_row(&signature, Content::Detached { content }))
+    }
+
+    /// The row of a standalone CMS signature over `content`.
+    fn cms_row(&self, signature: &CadesSignature, content: Content<'_>) -> SignatureRow {
+        let verdict = signature.verify(content, EssBinding::Required);
         let mut pool = self.anchor_pool();
         pool.add_material(signature.embedded_material());
-        Ok(SignatureRow::judged(self.report(Facts {
+        SignatureRow::judged(self.report(Facts {
             signer: signature.signer_certificate().clone(),
             document_intact: verdict.document_intact,
             signature_valid: verdict.signature_valid,
@@ -1468,7 +1551,7 @@ impl Context<'_> {
             revision: Revision::WholeDocument,
             claimed_signing_time: signature.signing_time(),
             pool,
-        })))
+        }))
     }
 }
 

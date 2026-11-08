@@ -108,6 +108,14 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo run --locked -p xtask -- check-magic-numbers
 ```
 
+Every signature format is also judged by the EU DSS validator at the
+level a release build must reach; that gate needs a JDK and runs at
+push. See [independent validation](doc/process/independent-validation.md):
+
+```sh
+sh scripts/dss-gate.sh
+```
+
 On Windows, see [developing on Windows](doc/process/windows-development.md)
 for the prerequisites, line endings, and how the gates differ.
 

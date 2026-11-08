@@ -27,7 +27,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "26.11.7"
+version = "26.11.8"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Petri Koistinen"]

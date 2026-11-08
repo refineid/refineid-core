@@ -22,8 +22,9 @@
 //! or naming another media type, is not one this reader verifies.
 //!
 //! The entries are then sorted by role: the data files, the `XAdES`
-//! signature files, and each `CAdES` signature with the `ASiCManifest`
-//! that names it.
+//! signature files, each `CAdES` signature with the `ASiCManifest`
+//! that names it, and the `ASiCArchiveManifest` files with the
+//! time-stamp tokens over them.
 //!
 //! # Conformance
 //!
@@ -32,6 +33,12 @@
 //!   `META-INF/*signature*.p7s` with `META-INF/*ASiCManifest*.xml` for
 //!   `CAdES`, data files outside `META-INF/`. Clause 4.4.3 lets the
 //!   `mimetype` entry be absent; this reader requires it.
+//! - `ETSI EN 319 162-1` V1.1.1 clause 4.4.5 item 2 a) and annex A.7:
+//!   an `ASiC-E` container with `CAdES` reaches long-term protection
+//!   through `META-INF/*ASiCArchiveManifest*.xml`, each an
+//!   `ASiCManifest` whose `SigReference` names the
+//!   `META-INF/*timestamp*.tst` token over it and whose
+//!   `DataObjectReference`s digest the files it protects.
 //! - `ISO/IEC 21320-1` and PKWARE `APPNOTE.TXT` 6.3: stored (0) or
 //!   deflated (8) entries, single volume, no encryption; sec.4.3.9
 //!   the data descriptor, sec.4.3.12 the central directory record,
@@ -84,7 +91,7 @@ const OPENDOCUMENT_MANIFEST: &str = "manifest.xml";
 const CONTAINER_XML: &str = "container.xml";
 
 /// What an `ASiCArchiveManifest` file's name contains (EN 319 162-1
-/// annex A.6).
+/// annex A.7).
 const ARCHIVE_MANIFEST_NAME_PART: &str = "ASiCArchiveManifest";
 
 /// What a time-stamp token file's name contains (EN 319 162-1 clause
@@ -356,6 +363,49 @@ pub struct AsicContainer {
     xades_signature_files: Vec<Entry>,
     /// `META-INF/*signature*.p7s` with their manifests.
     cades_signatures: Vec<CadesEntry>,
+    /// `META-INF/*ASiCArchiveManifest*.xml`, in central directory
+    /// order.
+    archive_manifests: Vec<Entry>,
+    /// `META-INF/*timestamp*.tst`, in central directory order.
+    timestamp_tokens: Vec<Entry>,
+}
+
+/// One `ASiCArchiveManifest` that protects a `CAdES` signature
+/// (`ETSI EN 319 162-1` V1.1.1 annex A.7): its bytes, which the token
+/// imprints, the token, and whether its references hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArchiveManifest<'a> {
+    /// The manifest file as stored: what the token must imprint.
+    manifest: &'a [u8],
+    /// The token its `SigReference` names, when the container holds
+    /// one.
+    token: Option<&'a [u8]>,
+    /// Why its references do not hold, when they do not.
+    broken: Option<&'static str>,
+}
+
+impl<'a> ArchiveManifest<'a> {
+    /// The manifest file as stored: what the token must imprint.
+    #[must_use]
+    pub const fn manifest(&self) -> &'a [u8] {
+        self.manifest
+    }
+
+    /// The RFC 3161 token its `SigReference` names; `None` when the
+    /// container holds no such entry.
+    #[must_use]
+    pub const fn token(&self) -> Option<&'a [u8]> {
+        self.token
+    }
+
+    /// Why the manifest does not protect the signature it names, when
+    /// it does not: a reference that names no entry, a digest under an
+    /// unknown method or not the entry's, or a data file, the
+    /// signature's `ASiCManifest` or the signature left out.
+    #[must_use]
+    pub const fn broken(&self) -> Option<&'static str> {
+        self.broken
+    }
 }
 
 impl AsicContainer {
@@ -379,6 +429,8 @@ impl AsicContainer {
         let mut xades_signature_files = Vec::new();
         let mut cades_files = Vec::new();
         let mut manifests = Vec::new();
+        let mut archive_manifests = Vec::new();
+        let mut timestamp_tokens = Vec::new();
         for located in entries {
             let entry = located.entry;
             if entry.name == MIMETYPE_ENTRY {
@@ -412,6 +464,11 @@ impl AsicContainer {
                 cades_files.push(entry);
             } else if inside.contains(MANIFEST_NAME_PART) && inside.ends_with(EXTENSION_XML) {
                 manifests.push(entry);
+            } else if inside.contains(ARCHIVE_MANIFEST_NAME_PART) && inside.ends_with(EXTENSION_XML)
+            {
+                archive_manifests.push(entry);
+            } else if inside.contains(TIMESTAMP_NAME_PART) && inside.ends_with(EXTENSION_TST) {
+                timestamp_tokens.push(entry);
             } else if !is_passive_metadata(inside) {
                 return Err(AsicReadError::UnexpectedMetadata);
             }
@@ -457,6 +514,8 @@ impl AsicContainer {
             data_files,
             xades_signature_files,
             cades_signatures,
+            archive_manifests,
+            timestamp_tokens,
         })
     }
 
@@ -554,6 +613,107 @@ impl AsicContainer {
     }
 }
 
+impl AsicContainer {
+    /// Every `ASiCArchiveManifest` that names `entry`'s signature among
+    /// its `DataObjectReference`s, in central directory order, with the
+    /// token its one `SigReference` names and whether it protects the
+    /// signature (`ETSI EN 319 162-1` V1.1.1 annex A.7 item 1 b): it
+    /// references the signature, the `ASiCManifest` the signature
+    /// signs and every data file, and every reference it holds digests
+    /// to its `DigestValue` under a `SHA-256`, `SHA-384` or `SHA-512`
+    /// `DigestMethod`.
+    #[must_use]
+    pub fn archive_manifests_of(&self, entry: &CadesEntry) -> Vec<ArchiveManifest<'_>> {
+        let mut found = Vec::new();
+        for archive in &self.archive_manifests {
+            let Ok(document) = XmlDocument::parse(archive.content.clone()) else {
+                continue;
+            };
+            let root = document.root();
+            if !root.is(NAMESPACE_ASIC, ELEMENT_MANIFEST) {
+                continue;
+            }
+            let references: Vec<_> = root
+                .children_named(NAMESPACE_ASIC, ELEMENT_DATA_OBJECT_REFERENCE)
+                .collect();
+            let names = |name: &str| {
+                references.iter().any(|reference| {
+                    reference
+                        .attribute(ATTRIBUTE_URI)
+                        .is_some_and(|uri| uri_names(uri, name))
+                })
+            };
+            if !names(&entry.signature.name) {
+                continue;
+            }
+            let token = sole_signature_reference(archive).and_then(|uri| {
+                self.timestamp_tokens
+                    .iter()
+                    .find(|token| uri_names(&uri, &token.name))
+                    .map(|token| token.content.as_slice())
+            });
+            let mut broken = None;
+            for reference in &references {
+                let Some(target) = reference
+                    .attribute(ATTRIBUTE_URI)
+                    .and_then(|uri| self.entry_named(uri))
+                else {
+                    broken = Some("an archive manifest reference names no entry");
+                    break;
+                };
+                let Some(method) = reference
+                    .child(NAMESPACE_DSIG, ELEMENT_DIGEST_METHOD)
+                    .and_then(|method| method.attribute(ATTRIBUTE_ALGORITHM))
+                    .and_then(DigestMethod::from_uri)
+                else {
+                    broken = Some("an archive manifest reference names an unknown digest");
+                    break;
+                };
+                let holds = reference
+                    .child(NAMESPACE_DSIG, ELEMENT_DIGEST_VALUE)
+                    .and_then(|value| base64::decode_wrapped(&value.text()).ok())
+                    .is_some_and(|value| method.digest(target) == value);
+                if !holds {
+                    broken = Some("an archive manifest digest does not match its entry");
+                    break;
+                }
+            }
+            let complete = entry
+                .manifest
+                .as_ref()
+                .is_some_and(|manifest| names(&manifest.name))
+                && self.data_files.iter().all(|file| names(&file.name));
+            if broken.is_none() && !complete {
+                broken =
+                    Some("an archive manifest leaves out a data file or the signature's manifest");
+            }
+            found.push(ArchiveManifest {
+                manifest: &archive.content,
+                token,
+                broken,
+            });
+        }
+        found
+    }
+
+    /// The content of the entry `uri` names, among every entry this
+    /// reader sorted.
+    fn entry_named(&self, uri: &str) -> Option<&[u8]> {
+        self.data_files
+            .iter()
+            .chain(&self.xades_signature_files)
+            .chain(
+                self.cades_signatures
+                    .iter()
+                    .flat_map(|cades| core::iter::once(&cades.signature).chain(&cades.manifest)),
+            )
+            .chain(&self.archive_manifests)
+            .chain(&self.timestamp_tokens)
+            .find(|entry| uri_names(uri, &entry.name))
+            .map(|entry| entry.content.as_slice())
+    }
+}
+
 /// The URI of the one `SigReference` of `manifest`, when it is an
 /// `ASiCManifest` holding exactly one; `None` for a manifest that does
 /// not parse or holds none or several.
@@ -579,14 +739,10 @@ pub(crate) fn uri_names(uri: &str, name: &str) -> bool {
 
 /// Whether `inside`, a name directly in META-INF, is metadata the
 /// container may carry and this reader does not judge: the OpenDocument
-/// manifest a `BDOC` carries, the `container.xml` of the OEBPS profile,
-/// archive manifests and the timestamp tokens over them (EN 319 162-1
-/// clause 4.4.3.3 and annex A.6).
+/// manifest a `BDOC` carries and the `container.xml` of the OEBPS
+/// profile.
 fn is_passive_metadata(inside: &str) -> bool {
-    inside == OPENDOCUMENT_MANIFEST
-        || inside == CONTAINER_XML
-        || (inside.contains(ARCHIVE_MANIFEST_NAME_PART) && inside.ends_with(EXTENSION_XML))
-        || (inside.contains(TIMESTAMP_NAME_PART) && inside.ends_with(EXTENSION_TST))
+    inside == OPENDOCUMENT_MANIFEST || inside == CONTAINER_XML
 }
 
 /// Decode `%XX` escapes in a reference URI (RFC 3986 sec.2.1) into the

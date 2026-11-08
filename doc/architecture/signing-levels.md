@@ -1,10 +1,42 @@
 # Signing levels in release and development builds
 
 The owner's rule, for every platform: a development build may make a
-document without long-term validation material; a release build makes
-only the long-term level its request asks for, `B-LTA` where the format
-has an archive construction (`PAdES`, `ASiC-E` with `CAdES`) and `B-LT`
-where it does not yet (`CAdES`, `XAdES`, `ASiC-E` with `XAdES`).
+document below the long-term archival level and names it by the level
+it reached; a release build makes only `B-LTA` documents, for every
+format. `B-LT` is not long-term enough: its evidence is protected by
+nothing once the signature timestamp's authority or algorithm is no
+longer trusted.
+
+Each format reaches `B-LTA` by its own archive construction:
+
+- `PAdES`: a document timestamp revision over the signature and its
+  `/DSS` (`ETSI EN 319 142-1` V1.2.1 clause 5.4.3).
+- `ASiC-E` with `XAdES`: an `xadesv141:ArchiveTimeStamp` after the
+  `CertificateValues` and `RevocationValues`, its imprint computed as
+  `ETSI EN 319 132-1` V1.3.1 clause 5.5.2.3 states for the not
+  distributed case (`ETSI EN 319 162-1` V1.1.1 clause 4.4.5 item 1;
+  `ETSI EN 319 132-1` clause 6.3 table 2 makes the 1.4.1 namespace
+  mandatory at `B-LTA`). The writer spells every unsigned property in
+  exclusive canonical form, so the imprint input is the document's own
+  bytes.
+- `ASiC-E` with `CAdES`: `META-INF/ASiCArchiveManifest.xml`
+  referencing the data objects, the `ASiCManifest` and the signature,
+  and `META-INF/timestamp.tst` over it (`ETSI EN 319 162-1` V1.1.1
+  clause 4.4.5 item 2 a) and annex A.7).
+- `CAdES`, attached (`.p7m`) or detached (`.p7s`): an
+  `archive-time-stamp-v3` unsigned attribute whose token carries the
+  `ats-hash-index-v3` of every certificate, revocation value and
+  unsigned attribute value present when it was requested (`ETSI EN 319
+  122-1` V1.3.1 clauses 5.5.2 and 5.5.3).
+
+This crate's verifier judges every one of these archive timestamps; a
+detached `CAdES` signature is verified with its content
+(`DocumentFile::detached_cms`).
+
+The archive timestamp's authority must be one whose certificate path is
+already in the validation material the token covers
+(`require_archive_path_covered`), because nothing can be added under
+the token after it is taken.
 
 ## The switch
 
@@ -22,8 +54,11 @@ profile's, and never by a setting, a flag or the environment:
 
 ## Release builds
 
-A signature whose requested level cannot be reached is refused with the
-reason, and nothing is saved.
+A request below `B-LTA` is refused before anything is signed
+(`DocumentRequest::validate_signing_policy`): `a release build signs
+only at B-LTA, not <format> <level>`. A signature whose `B-LTA`
+cannot be reached after signing is refused with the reason, and nothing
+is saved.
 
 - Before the private-key operation, and so before the PIN 2 prompt or
   the phone's consent, `DocumentRequest::check_signer_path` judges the

@@ -270,8 +270,8 @@ neither the custodian's state nor a reason. What it shows after a loss comes
 only from the grace of RAPP §8.4 item 3. Dialing, scanning and redialing are
 background behaviour bounded by the redial window and are never shown, with
 one exception: right after the requester's own pairing ceremony, until the
-first session over the pairing reports the card status or `redial_window_ms`
-has passed, the requester shows that it is connecting to the custodian it has
+custodian's identity or a request for its card is shown, the custodian
+reports no card, or `redial_window_ms` has passed, the requester shows that it is connecting to the custodian it has
 just paired, by the name the custodian gave in `pairing.hello`, in place of
 the code entry; the user who typed the code waits for exactly that. The one
 other line that names the custodian is the notice, after its `pairing_revoked`,

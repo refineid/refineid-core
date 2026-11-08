@@ -48,8 +48,9 @@ semantics:
     line saying the phone forgot this computer after a pairing_revoked close
     (show_peer_forgot). Dialing and scanning are background behaviour and
     are never shown, except right after this requester's own pairing
-    ceremony: from its completion until the first session over the pairing
-    reports the card status, or redial_window_ms has passed, connecting
+    ceremony: from its completion until the requester shows the custodian's
+    identity or a request for its card, the custodian reports no card, or
+    redial_window_ms has passed, connecting
     shows that the requester is connecting to the custodian the ceremony
     just paired, by its pairing.hello display name, in place of the code
     entry (section 4.7).
@@ -819,7 +820,7 @@ requester_view_of_custodian:
     - ended       # the pairing stopped being active, or remote use left on
   presentation:
     idle: "no remote card, or the identity still offered under a running grace of section 8.4 item 3"
-    connecting: "no remote card, or the identity still offered under a running grace of section 8.4 item 3; right after this requester's own pairing ceremony, until the first session reports the card status or redial_window_ms has passed, that it is connecting to the custodian just paired (section 4.7)"
+    connecting: "no remote card, or the identity still offered under a running grace of section 8.4 item 3; right after this requester's own pairing ceremony, until the custodian's identity or a request for its card is shown, the custodian reports no card, or redial_window_ms has passed, that it is connecting to the custodian just paired (section 4.7)"
     connected: "the remote card, once a session confirmed it (section 8.4)"
     withdrawn: "no remote card"
     ended: "nothing of this pairing; after the custodian's pairing_revoked, the line that the phone forgot this computer"

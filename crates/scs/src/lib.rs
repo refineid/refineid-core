@@ -61,3 +61,7 @@ pub use dispatcher::dispatch;
 pub use error::TransactionError;
 pub use purpose::{KeyAlgorithm, SignPurpose};
 pub use transaction::TransactionManager;
+
+/// The digest algorithms a sign request names, re-exported so
+/// backends match without a second dependency.
+pub use refineid_digest::HashAlg;

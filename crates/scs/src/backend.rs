@@ -96,5 +96,10 @@ pub trait SigningBackend: Send + Sync {
     fn key_algorithm(&self, purpose: SignPurpose) -> KeyAlgorithm;
 
     /// Sign `request` with the `purpose` key after hashing its data.
+    ///
+    /// The returned bytes are the card's raw signature: RSA as the
+    /// card emits it, ECDSA as raw `r || s`. The SCS converts ECDSA
+    /// to X9.62 DER at the response edges (`signature`, CMS), where
+    /// the specification requires it (v1.3 sec.2.6.1).
     fn sign(&self, request: SignRequest) -> Result<Vec<u8>, BackendFailure>;
 }

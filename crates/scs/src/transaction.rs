@@ -21,10 +21,21 @@
 //! This service answers with an ephemeral public key, signed by the
 //! card, and both sides derive the shared transaction key. `execute`
 //! then rides as a direct-encryption A256GCM JWE under that key, and
-//! so does its response. One transaction may be pending at a time;
-//! `execute` consumes it whether it succeeds or not. The step logic
-//! lives in the `begin` and `execution` modules; this module owns only
-//! the pending slot.
+//! so does its response.
+//!
+//! The specification allows only one active signature creation
+//! request at a time (v1.3 sec.2.1), across the JSON and transaction
+//! paths alike: one flight slot, reserved before any card I/O and
+//! released after. A reservation held across a PIN prompt blocks the
+//! next request with the specified "already active" reason instead of
+//! queueing a second ceremony. An agreed transaction the caller never
+//! executes expires after [`values::TRANSACTION_TIME_TO_LIVE`], so a
+//! closed tab cannot wedge the service.
+//!
+//! The step logic lives in the `begin` and `execution` modules; this
+//! module owns only the flight slot. No mutex is ever held across
+//! card I/O: reservation, promotion, and release are each a single
+//! locked transition.
 
 use std::sync::Mutex;
 use std::time::SystemTime;
@@ -48,29 +59,63 @@ pub(crate) struct AgreedTransaction {
     /// The card key the selector chose at `begin`.
     pub(crate) purpose: SignPurpose,
     /// The service's base64 agreement key, which the authentication
-    /// challenge must be bound to.
+    /// challenge is bound to.
     pub(crate) server_key: String,
 }
 
-/// The pending transaction slot.
-pub struct TransactionManager {
-    pending: Mutex<Option<AgreedTransaction>>,
+/// The single signature flight: idle, reserved across card I/O, or
+/// an agreed transaction awaiting its `execute`.
+enum Slot {
+    /// No ceremony in flight.
+    Idle,
+    /// A ceremony reserved the flight and has not finished.
+    Busy,
+    /// An agreed transaction awaiting its `execute`, with the moment
+    /// it was agreed.
+    Active(AgreedTransaction, SystemTime),
 }
 
-impl Default for TransactionManager {
-    fn default() -> Self {
-        Self {
-            pending: Mutex::new(None),
+/// A held reservation of the single flight, releasing it on drop.
+pub(crate) struct FlightReservation<'a> {
+    slot: &'a Mutex<Slot>,
+    keep: bool,
+}
+
+impl FlightReservation<'_> {
+    /// Promote the reservation to an agreed transaction awaiting its
+    /// `execute`.
+    fn promote(mut self, state: AgreedTransaction, now: SystemTime) {
+        if let Ok(mut slot) = self.slot.lock() {
+            *slot = Slot::Active(state, now);
+        }
+        self.keep = true;
+    }
+}
+
+impl Drop for FlightReservation<'_> {
+    fn drop(&mut self) {
+        if self.keep {
+            return;
+        }
+        if let Ok(mut slot) = self.slot.lock()
+            && matches!(*slot, Slot::Busy)
+        {
+            *slot = Slot::Idle;
         }
     }
+}
+
+/// The single-flight slot.
+pub struct TransactionManager {
+    slot: Mutex<Slot>,
 }
 
 impl core::fmt::Debug for TransactionManager {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let occupied = self
-            .pending
+            .slot
             .lock()
-            .map(|held| held.is_some())
+            .map(|slot| !matches!(*slot, Slot::Idle))
             .unwrap_or(true);
         f.debug_struct("TransactionManager")
             .field("pending", &occupied)
@@ -78,11 +123,37 @@ impl core::fmt::Debug for TransactionManager {
     }
 }
 
+impl Default for TransactionManager {
+    fn default() -> Self {
+        Self {
+            slot: Mutex::new(Slot::Idle),
+        }
+    }
+}
+
 impl TransactionManager {
-    /// A manager with no pending transaction.
+    /// A manager with no ceremony in flight.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Reserve the flight for one JSON sign, releasing it when the
+    /// reservation drops.
+    pub(crate) fn reserve_sign(
+        &self,
+        now: SystemTime,
+    ) -> Result<FlightReservation<'_>, TransactionError> {
+        let mut slot = self.slot.lock().map_err(|_| busy())?;
+        evict_expired(&mut slot, now);
+        if !matches!(*slot, Slot::Idle) {
+            return Err(busy());
+        }
+        *slot = Slot::Busy;
+        Ok(FlightReservation {
+            slot: &self.slot,
+            keep: false,
+        })
     }
 
     /// Handle the `begin` JWS: verify it, agree the transaction key,
@@ -105,51 +176,50 @@ impl TransactionManager {
                 "begin transaction must be a compact JWS",
             ));
         }
-        if self
-            .pending
-            .lock()
-            .map(|held| held.is_some())
-            .unwrap_or(true)
-        {
-            return Err(TransactionError::forbidden(
-                "another signature request is already active",
-            ));
+        let reservation = self.reserve_sign(now)?;
+        match crate::begin::perform(&segments, &request_origin, now, backend) {
+            Ok(outcome) => {
+                reservation.promote(outcome.state, now);
+                Ok(outcome.response)
+            }
+            Err(error) => Err(error),
         }
-        let outcome = crate::begin::perform(&segments, &request_origin, now, backend)?;
-        let raced = self
-            .pending
-            .lock()
-            .map(|mut held| {
-                if held.is_some() {
-                    return true;
-                }
-                *held = Some(outcome.state);
-                false
-            })
-            .unwrap_or(true);
-        if raced {
-            return Err(TransactionError::forbidden(
-                "another signature request became active",
-            ));
-        }
-        Ok(outcome.response)
     }
 
     /// Handle the `execute` JWE.
     ///
     /// Decrypts it under the pending key, signs, and answers the
     /// encrypted response; the pending transaction is consumed either
-    /// way.
+    /// way, and the flight stays reserved across the ceremony.
     pub fn execute(
         &self,
         compact_jwe: &[u8],
         origin: Option<&str>,
+        now: SystemTime,
         backend: &dyn SigningBackend,
     ) -> Result<String, TransactionError> {
         let request_origin = codec::validated_origin(origin)?;
-        let state = self.pending.lock().ok().and_then(|mut held| held.take());
-        let Some(state) = state else {
-            return Err(TransactionError::bad_request("no active transaction"));
+        let state = {
+            let mut slot = self.slot.lock().map_err(|_| busy())?;
+            let expired = is_expired(&slot, now);
+            if expired {
+                *slot = Slot::Idle;
+            }
+            if matches!(*slot, Slot::Busy) {
+                return Err(busy());
+            }
+            let Slot::Active(state, _) = core::mem::replace(&mut *slot, Slot::Busy) else {
+                *slot = Slot::Idle;
+                if expired {
+                    return Err(TransactionError::bad_request("transaction expired"));
+                }
+                return Err(TransactionError::bad_request("no active transaction"));
+            };
+            state
+        };
+        let _reservation = FlightReservation {
+            slot: &self.slot,
+            keep: false,
         };
         if state.origin != request_origin {
             return Err(TransactionError::forbidden(
@@ -161,7 +231,28 @@ impl TransactionManager {
             .map_err(|_| TransactionError::bad_request("execute payload is not valid JSON"))?;
         let payload = ExecuteDocument::decode(&value)
             .map_err(|()| TransactionError::bad_request("execute payload is not valid JSON"))?;
-        crate::execution::respond(&payload, &state, backend)
+        crate::execution::respond(&payload, &state, backend, now)
+    }
+}
+
+/// The specified "already active" refusal.
+fn busy() -> TransactionError {
+    TransactionError::forbidden("another signature request is already active")
+}
+
+/// Whether the slot holds an agreed transaction older than its
+/// time to live.
+fn is_expired(slot: &Slot, now: SystemTime) -> bool {
+    matches!(slot, Slot::Active(_, agreed) if now
+        .duration_since(*agreed)
+        .is_ok_and(|age| age > values::TRANSACTION_TIME_TO_LIVE))
+}
+
+/// Drop an agreed transaction older than its time to live, so an
+/// abandoned `begin` cannot wedge the service.
+fn evict_expired(slot: &mut Slot, now: SystemTime) {
+    if is_expired(slot, now) {
+        *slot = Slot::Idle;
     }
 }
 
@@ -173,7 +264,7 @@ mod tests {
     use crate::error::TransactionError;
     use crate::purpose::{KeyAlgorithm, SignPurpose};
     use crate::test_support::{ScriptedBackend, mint_certificate, mint_jws};
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     /// Unix seconds of 2023-11-14T22:13:20Z, inside every test window.
     const TEST_NOW_SECONDS: u64 = 1_700_000_000;
@@ -182,7 +273,7 @@ mod tests {
     const ORIGIN: &str = "https://example.com";
 
     /// A moment inside the test windows.
-    fn test_now() -> std::time::SystemTime {
+    fn test_now() -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(TEST_NOW_SECONDS)
     }
 
@@ -241,14 +332,26 @@ mod tests {
         shared.raw_secret_bytes().as_slice().to_vec()
     }
 
+    /// The shared key as the fixed transaction array.
+    fn shared_array(
+        service: &Service,
+        begin_answer: &str,
+    ) -> [u8; crate::values::TRANSACTION_KEY_LENGTH] {
+        shared_key(service, begin_answer)
+            .as_slice()
+            .try_into()
+            .expect("32-byte key")
+    }
+
     /// A backend answering a fixed signature for the minted chain.
     fn backend() -> ScriptedBackend {
+        backend_with(KeyAlgorithm::Rsa)
+    }
+
+    /// A backend answering a fixed signature behind `algorithm`.
+    fn backend_with(algorithm: KeyAlgorithm) -> ScriptedBackend {
         let minted = mint_certificate();
-        ScriptedBackend::answering(
-            [minted.der].into(),
-            KeyAlgorithm::Rsa,
-            b"card-signature".to_vec(),
-        )
+        ScriptedBackend::answering([minted.der].into(), algorithm, b"card-signature".to_vec())
     }
 
     /// Signs placed by a begin alone.
@@ -257,7 +360,8 @@ mod tests {
     /// Signs placed by a begin and its execute.
     const SIGNS_AFTER_EXECUTE: usize = 2;
 
-    /// Begin, then execute: the channel carries one signature.
+    /// Begin, then execute: the channel carries one signature, and
+    /// the SCS binds the challenge to the agreement it made.
     #[test]
     fn begin_then_execute_signs() {
         use refineid_digest::HashAlg;
@@ -268,27 +372,24 @@ mod tests {
         let answer = manager
             .begin(begin_jws.as_bytes(), Some(ORIGIN), test_now(), &backend)
             .expect("begin succeeds");
-        // The begin response is a signed JWT carrying the ephemeral key.
         assert_eq!(answer.split('.').count(), crate::values::JWS_SEGMENT_COUNT);
         assert_eq!(backend.signed().len(), SIGNS_AFTER_BEGIN);
         let begin_sign = backend.signed().remove(0);
         assert_eq!(begin_sign.purpose, SignPurpose::Authentication);
         assert_eq!(begin_sign.hash, HashAlg::Sha256);
-        // The execute rides encrypted under the agreed key.
-        let key = shared_key(&service, &answer);
+        // The caller sends origin;nonce; the card signs the bound triple.
+        let key = shared_array(&service, &answer);
         let nonce = "n".repeat(crate::values::NONCE_MINIMUM_LENGTH);
-        let challenge = format!("{ORIGIN};{nonce};{}", base64::encode(&service.spki_der));
+        let challenge = format!("{ORIGIN};{nonce}");
         let execute = format!(
             "{{\"version\":\"1.3\",\"content\":\"{}\",\"contentType\":\"data\"}}",
             base64::encode(challenge.as_bytes())
         );
-        let key_array: &[u8; crate::values::TRANSACTION_KEY_LENGTH] =
-            key.as_slice().try_into().expect("32-byte key");
-        let envelope = crate::jwe::encrypt(execute.as_bytes(), key_array).expect("encrypts");
+        let envelope = crate::jwe::encrypt(execute.as_bytes(), &key).expect("encrypts");
         let sealed = manager
-            .execute(envelope.as_bytes(), Some(ORIGIN), &backend)
+            .execute(envelope.as_bytes(), Some(ORIGIN), test_now(), &backend)
             .expect("execute succeeds");
-        let plaintext = crate::jwe::decrypt(sealed.as_bytes(), key_array).expect("decrypts");
+        let plaintext = crate::jwe::decrypt(sealed.as_bytes(), &key).expect("decrypts");
         let response: serde_json::Value = serde_json::from_slice(&plaintext).expect("JSON");
         assert_eq!(
             response.get("status").and_then(serde_json::Value::as_str),
@@ -300,7 +401,100 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some(base64::encode(b"card-signature")).as_deref()
         );
+        assert_eq!(
+            response
+                .get("signatureAlgorithm")
+                .and_then(serde_json::Value::as_str),
+            Some("SHA256withRSA")
+        );
         assert_eq!(backend.signed().len(), SIGNS_AFTER_EXECUTE);
+        let bound = format!("{challenge};{}", base64::encode(&service.spki_der));
+        assert_eq!(backend.signed().remove(1).data, bound.as_bytes());
+    }
+
+    /// A pre-bound triple is refused: the caller sends the pair.
+    #[test]
+    fn prebound_triple_is_refused() {
+        let service = service();
+        let backend = backend();
+        let manager = TransactionManager::new();
+        let begin_jws = mint_jws(&service.key, &begin_payload(&service));
+        let answer = manager
+            .begin(begin_jws.as_bytes(), Some(ORIGIN), test_now(), &backend)
+            .expect("begin succeeds");
+        let key = shared_array(&service, &answer);
+        let nonce = "n".repeat(crate::values::NONCE_MINIMUM_LENGTH);
+        let triple = format!("{ORIGIN};{nonce};{}", base64::encode(&service.spki_der));
+        let execute = format!(
+            "{{\"version\":\"1.3\",\"content\":\"{}\",\"contentType\":\"data\"}}",
+            base64::encode(triple.as_bytes())
+        );
+        let envelope = crate::jwe::encrypt(execute.as_bytes(), &key).expect("encrypts");
+        assert_eq!(
+            manager.execute(envelope.as_bytes(), Some(ORIGIN), test_now(), &backend),
+            Err(TransactionError::bad_request(
+                "authentication challenge must be origin;nonce"
+            ))
+        );
+    }
+
+    /// The signature algorithm defaults to the card key and refuses a
+    /// mismatch.
+    #[test]
+    fn signature_algorithm_follows_the_key() {
+        let service = service();
+        let backend = backend_with(KeyAlgorithm::Ecdsa);
+        let manager = TransactionManager::new();
+        let begin_jws = mint_jws(&service.key, &begin_payload(&service));
+        let answer = manager
+            .begin(begin_jws.as_bytes(), Some(ORIGIN), test_now(), &backend)
+            .expect("begin succeeds");
+        let key = shared_array(&service, &answer);
+        // Omitted: the ECDSA default answers, and the raw pair signs
+        // as DER.
+        let nonce = "n".repeat(crate::values::NONCE_MINIMUM_LENGTH);
+        let execute = format!(
+            "{{\"version\":\"1.3\",\"content\":\"{}\",\"contentType\":\"data\"}}",
+            base64::encode(format!("{ORIGIN};{nonce}").as_bytes())
+        );
+        let envelope = crate::jwe::encrypt(execute.as_bytes(), &key).expect("encrypts");
+        let sealed = manager
+            .execute(envelope.as_bytes(), Some(ORIGIN), test_now(), &backend)
+            .expect("execute succeeds");
+        let plaintext = crate::jwe::decrypt(sealed.as_bytes(), &key).expect("decrypts");
+        let response: serde_json::Value = serde_json::from_slice(&plaintext).expect("JSON");
+        assert_eq!(
+            response
+                .get("signatureAlgorithm")
+                .and_then(serde_json::Value::as_str),
+            Some("SHA256withECDSA")
+        );
+    }
+
+    /// An explicit signature algorithm that contradicts the card key
+    /// is refused.
+    #[test]
+    fn mismatched_signature_algorithm_is_refused() {
+        let service = service();
+        let backend = backend_with(KeyAlgorithm::Ecdsa);
+        let manager = TransactionManager::new();
+        let begin_jws = mint_jws(&service.key, &begin_payload(&service));
+        let answer = manager
+            .begin(begin_jws.as_bytes(), Some(ORIGIN), test_now(), &backend)
+            .expect("begin succeeds");
+        let key = shared_array(&service, &answer);
+        let nonce = "n".repeat(crate::values::NONCE_MINIMUM_LENGTH);
+        let execute = format!(
+            "{{\"version\":\"1.3\",\"content\":\"{}\",\"contentType\":\"data\",\"signatureAlgorithm\":\"RSA\"}}",
+            base64::encode(format!("{ORIGIN};{nonce}").as_bytes())
+        );
+        let envelope = crate::jwe::encrypt(execute.as_bytes(), &key).expect("encrypts");
+        assert_eq!(
+            manager.execute(envelope.as_bytes(), Some(ORIGIN), test_now(), &backend),
+            Err(TransactionError::bad_request(
+                "signature algorithm RSA does not match the card key"
+            ))
+        );
     }
 
     /// A second begin while one is pending is forbidden, and execute
@@ -323,13 +517,34 @@ mod tests {
         // A garbage execute still consumes the pending transaction.
         assert!(
             manager
-                .execute(b"not-a-jwe", Some(ORIGIN), &backend)
+                .execute(b"not-a-jwe", Some(ORIGIN), test_now(), &backend)
                 .is_err()
         );
         assert_eq!(
-            manager.execute(b"not-a-jwe", Some(ORIGIN), &backend),
+            manager.execute(b"not-a-jwe", Some(ORIGIN), test_now(), &backend),
             Err(TransactionError::bad_request("no active transaction"))
         );
+    }
+
+    /// An agreed transaction the caller never executes expires.
+    #[test]
+    fn abandoned_transaction_expires() {
+        let service = service();
+        let backend = backend();
+        let manager = TransactionManager::new();
+        let begin_jws = mint_jws(&service.key, &begin_payload(&service));
+        manager
+            .begin(begin_jws.as_bytes(), Some(ORIGIN), test_now(), &backend)
+            .expect("begin succeeds");
+        let late = test_now() + crate::values::TRANSACTION_TIME_TO_LIVE + Duration::from_secs(1);
+        assert_eq!(
+            manager.execute(b"not-a-jwe", Some(ORIGIN), late, &backend),
+            Err(TransactionError::bad_request("transaction expired"))
+        );
+        // And the flight is free again.
+        manager
+            .begin(begin_jws.as_bytes(), Some(ORIGIN), late, &backend)
+            .expect("begin succeeds after expiry");
     }
 
     /// Execute from another origin is forbidden.
@@ -342,12 +557,15 @@ mod tests {
         let answer = manager
             .begin(begin_jws.as_bytes(), Some(ORIGIN), test_now(), &backend)
             .expect("begin succeeds");
-        let key = shared_key(&service, &answer);
-        let key_array: &[u8; crate::values::TRANSACTION_KEY_LENGTH] =
-            key.as_slice().try_into().expect("32-byte key");
-        let envelope = crate::jwe::encrypt(b"{}", key_array).expect("encrypts");
+        let key = shared_array(&service, &answer);
+        let envelope = crate::jwe::encrypt(b"{}", &key).expect("encrypts");
         assert_eq!(
-            manager.execute(envelope.as_bytes(), Some("https://other.example"), &backend),
+            manager.execute(
+                envelope.as_bytes(),
+                Some("https://other.example"),
+                test_now(),
+                &backend
+            ),
             Err(TransactionError::forbidden(
                 "execute Origin does not match begin Origin"
             ))

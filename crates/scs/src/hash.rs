@@ -15,10 +15,10 @@
 //! The SCS digest-name gate: the protocol's exact spellings to the
 //! shared [`HashAlg`](refineid_digest::HashAlg).
 //!
-//! Matching is exact: the surface accepts SHA-1, SHA-256, SHA-384 and
-//! SHA-512 spelled exactly so (DVV SCS specification v1.3 sec.2.5.2).
-//! The value that crosses is the shared algorithm type, so its digest
-//! length rides along by construction.
+//! Matching is exact: the surface accepts SHA-256, SHA-384 and
+//! SHA-512 spelled exactly so (v1.3 sec.2.5.2; SHA-1 support was
+//! removed in v1.2). The value that crosses is the shared algorithm
+//! type, so its digest length rides along by construction.
 
 use refineid_digest::HashAlg;
 
@@ -39,7 +39,6 @@ const SHA512_NAME: &str = "SHA512";
 #[must_use]
 pub fn hash_named(name: &str) -> Option<HashAlg> {
     match name {
-        SHA1_NAME => Some(HashAlg::Sha1),
         SHA256_NAME => Some(HashAlg::Sha256),
         SHA384_NAME => Some(HashAlg::Sha384),
         SHA512_NAME => Some(HashAlg::Sha512),
@@ -63,11 +62,10 @@ mod tests {
     use super::{hash_named, scs_name};
     use refineid_digest::HashAlg;
 
-    /// The four served spellings parse; anything else does not.
+    /// The three served spellings parse; anything else does not.
     #[test]
     fn exact_spellings_parse() {
         for (name, hash) in [
-            ("SHA1", HashAlg::Sha1),
             ("SHA256", HashAlg::Sha256),
             ("SHA384", HashAlg::Sha384),
             ("SHA512", HashAlg::Sha512),
@@ -75,7 +73,7 @@ mod tests {
             assert_eq!(hash_named(name), Some(hash), "{name}");
             assert_eq!(scs_name(hash), name, "{name:?}");
         }
-        for name in ["", "sha256", "SHA-256", "SHA224", "MD5"] {
+        for name in ["", "SHA1", "sha256", "SHA-256", "SHA224", "MD5"] {
             assert_eq!(hash_named(name), None, "{name:?}");
         }
     }

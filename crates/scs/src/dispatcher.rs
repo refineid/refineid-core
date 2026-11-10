@@ -30,6 +30,7 @@ use crate::base64;
 use crate::challenge;
 use crate::document::{SignRequestDocument, SignResponseDocument, VersionDocument};
 use crate::error::TransactionError;
+use crate::hash;
 use crate::http;
 use crate::transaction::TransactionManager;
 use crate::values;
@@ -90,6 +91,17 @@ fn sign(
     {
         return sign_transaction(request, body, now, backend, transactions);
     }
+    if request
+        .origin
+        .as_deref()
+        .is_none_or(|origin| !origin.starts_with("https://"))
+    {
+        return sign_error(
+            values::REASON_FORBIDDEN,
+            "Forbidden: sign Origin must use HTTPS",
+            request.origin.as_deref(),
+        );
+    }
     let value: serde_json::Value = match serde_json::from_slice(body) {
         Ok(value) => value,
         Err(_) => {
@@ -110,7 +122,13 @@ fn sign(
             );
         }
     };
-    sign_json(&document, request.origin.as_deref(), backend)
+    sign_json(
+        &document,
+        request.origin.as_deref(),
+        now,
+        backend,
+        transactions,
+    )
 }
 
 /// The JWT transaction branch: a compact JWS begins, a compact JWE
@@ -126,7 +144,7 @@ fn sign_transaction(
     let outcome = if separators == values::JWS_SEGMENT_COUNT - 1 {
         transactions.begin(body, request.origin.as_deref(), now, backend)
     } else if separators == values::JWE_SEGMENT_COUNT - 1 {
-        transactions.execute(body, request.origin.as_deref(), backend)
+        transactions.execute(body, request.origin.as_deref(), now, backend)
     } else {
         return sign_error(
             values::REASON_BAD_REQUEST,
@@ -143,12 +161,23 @@ fn sign_transaction(
 /// The compact-segment separator.
 const DOT: u8 = b'.';
 
-/// The JSON `/sign` form: card-side hashing of `data` content, with
-/// the origin-bound challenge enforced for the authentication key.
+/// The JSON `/sign` form: the raw subset of the advertised
+/// surface, with the origin-bound challenge enforced for the
+/// authentication key.
+///
+/// The JSON path serves `data` content as a raw signature under the
+/// requested digest; digests, CMS forms, and other signature types
+/// live on the transaction path, and asking for them here is refused
+/// rather than silently substituted. The flight is reserved across
+/// the sign: the specification allows one active signature creation
+/// request at a time (v1.3 sec.2.1). The dispatcher gates Origin
+/// before calling.
 fn sign_json(
     document: &SignRequestDocument,
     origin: Option<&str>,
+    now: SystemTime,
     backend: &dyn SigningBackend,
+    transactions: &TransactionManager,
 ) -> Vec<u8> {
     let raw = match base64::decode(&document.content) {
         Ok(raw) => raw,
@@ -177,6 +206,28 @@ fn sign_json(
             origin,
         );
     }
+    let hash = match &document.hash_algorithm {
+        None => HashAlg::Sha256,
+        Some(name) => match hash::hash_named(name) {
+            Some(hash) => hash,
+            None => {
+                return sign_error(
+                    values::REASON_NOT_IMPLEMENTED,
+                    &format!("Not Implemented: unsupported hash algorithm {name}"),
+                    origin,
+                );
+            }
+        },
+    };
+    if let Some(name) = &document.signature_type
+        && name != "signature"
+    {
+        return sign_error(
+            values::REASON_NOT_IMPLEMENTED,
+            &format!("Not Implemented: signature type {name} is served on the transaction path"),
+            origin,
+        );
+    }
     let purpose = document.purpose();
     if purpose == crate::purpose::SignPurpose::Authentication
         && let Some(refusal) = challenge::refusal(&raw, origin)
@@ -187,17 +238,25 @@ fn sign_json(
             origin,
         );
     }
+    let _flight = match transactions.reserve_sign(now) {
+        Ok(flight) => flight,
+        Err(error) => return sign_error(error.code, &error.message, origin),
+    };
     let signature = backend.sign(SignRequest {
         purpose,
-        hash: HashAlg::Sha256,
+        hash,
         data: raw,
         origin: origin.map(str::to_owned),
     });
     match signature {
         Ok(signature) => {
+            let signature = match ecdsa_adjust(signature, backend.key_algorithm(purpose)) {
+                Ok(signature) => signature,
+                Err(error) => return sign_error(error.code, &error.message, origin),
+            };
             let response = SignResponseDocument::ok(
                 base64::encode(&signature),
-                backend.key_algorithm(purpose).scs_name(HashAlg::Sha256),
+                backend.key_algorithm(purpose).scs_name(hash),
                 backend
                     .certificate_chain(purpose)
                     .iter()
@@ -211,6 +270,19 @@ fn sign_json(
             sign_error(wrapped.code, &wrapped.message, origin)
         }
     }
+}
+
+/// The card's raw signature in the response form: ECDSA signs as
+/// X9.62 DER, RSA as returned (v1.3 sec.2.6.1).
+fn ecdsa_adjust(
+    raw: Vec<u8>,
+    key_algorithm: crate::purpose::KeyAlgorithm,
+) -> Result<Vec<u8>, TransactionError> {
+    if key_algorithm != crate::purpose::KeyAlgorithm::Ecdsa {
+        return Ok(raw);
+    }
+    crate::codec::ecdsa_signature_der(&raw)
+        .map_err(|()| TransactionError::internal_error("encode ECDSA signature"))
 }
 
 #[cfg(test)]
@@ -233,13 +305,31 @@ mod tests {
 
     /// A request for `method` and `path`.
     fn request(method: &str, path: &str, content_type: Option<&str>) -> Request {
+        request_with_origin(method, path, Some(ORIGIN), content_type)
+    }
+
+    /// A request with an explicit origin.
+    fn request_with_origin(
+        method: &str,
+        path: &str,
+        origin: Option<&str>,
+        content_type: Option<&str>,
+    ) -> Request {
         Request {
             method: method.to_owned(),
             path: path.to_owned(),
-            origin: Some(ORIGIN.to_owned()),
+            origin: origin.map(str::to_owned),
             content_type: content_type.map(str::to_owned),
             body_length: 0,
         }
+    }
+
+    /// DER tag: SEQUENCE, opening an ECDSA signature.
+    const DER_SEQUENCE_TAG: u8 = 0x30;
+
+    /// A reason code as the JSON body carries it.
+    fn reason(code: u16) -> Option<u64> {
+        Some(u64::from(code))
     }
 
     /// A backend answering a fixed signature for the minted chain.
@@ -256,6 +346,11 @@ mod tests {
     fn body_text(response: &[u8]) -> &str {
         let text = core::str::from_utf8(response).expect("ascii");
         text.split("\r\n\r\n").nth(1).expect("body")
+    }
+
+    /// The response body as a JSON value.
+    fn body_json(response: &[u8]) -> serde_json::Value {
+        serde_json::from_str(body_text(response)).expect("JSON")
     }
 
     /// The version document names the served surface.
@@ -436,5 +531,161 @@ mod tests {
             body_text(&response).contains("no active transaction"),
             "{response:?}"
         );
+    }
+
+    /// Missing and plain-HTTP origins are refused before any parsing.
+    #[test]
+    fn json_origin_gate() {
+        let backend = backend();
+        let manager = TransactionManager::new();
+        let now = UNIX_EPOCH + Duration::from_secs(TEST_NOW_SECONDS);
+        for origin in [None, Some("http://example.com")] {
+            let response = dispatch(
+                &request_with_origin("POST", "/sign", origin, Some("application/json")),
+                b"{}",
+                now,
+                &backend,
+                &manager,
+            );
+            let body = body_json(&response);
+            assert_eq!(
+                body.get("reasonCode").and_then(serde_json::Value::as_u64),
+                reason(values::REASON_FORBIDDEN)
+            );
+        }
+        assert!(backend.signed().is_empty());
+    }
+
+    /// A requested digest is honored; an unknown one is refused as
+    /// unimplemented rather than silently substituted.
+    #[test]
+    fn json_hash_is_honored() {
+        use refineid_digest::HashAlg;
+        let backend = backend();
+        let manager = TransactionManager::new();
+        let now = UNIX_EPOCH + Duration::from_secs(TEST_NOW_SECONDS);
+        let nonce = "n".repeat(values::NONCE_MINIMUM_LENGTH);
+        let body = format!(
+            "{{\"content\":\"{}\",\"contentType\":\"data\",\"hashAlgorithm\":\"SHA384\"}}",
+            base64::encode(format!("{ORIGIN};{nonce}").as_bytes())
+        );
+        let response = dispatch(
+            &request("POST", "/sign", Some("application/json")),
+            body.as_bytes(),
+            now,
+            &backend,
+            &manager,
+        );
+        let body = body_json(&response);
+        assert_eq!(
+            body.get("signatureAlgorithm")
+                .and_then(serde_json::Value::as_str),
+            Some("SHA384withRSA")
+        );
+        assert_eq!(backend.signed().remove(0).hash, HashAlg::Sha384);
+        let body = "{\"content\":\"eA==\",\"contentType\":\"data\",\"hashAlgorithm\":\"SHA1\"}";
+        let response = dispatch(
+            &request("POST", "/sign", Some("application/json")),
+            body.as_bytes(),
+            now,
+            &backend,
+            &manager,
+        );
+        assert_eq!(
+            body_json(&response)
+                .get("reasonCode")
+                .and_then(serde_json::Value::as_u64),
+            reason(values::REASON_NOT_IMPLEMENTED)
+        );
+    }
+
+    /// CMS forms are refused on JSON with a pointer to the
+    /// transaction path.
+    #[test]
+    fn json_signature_type_points_at_transactions() {
+        let backend = backend();
+        let manager = TransactionManager::new();
+        let now = UNIX_EPOCH + Duration::from_secs(TEST_NOW_SECONDS);
+        let body =
+            "{\"content\":\"eA==\",\"contentType\":\"data\",\"signatureType\":\"cms-pades\"}";
+        let response = dispatch(
+            &request("POST", "/sign", Some("application/json")),
+            body.as_bytes(),
+            now,
+            &backend,
+            &manager,
+        );
+        let body = body_json(&response);
+        assert_eq!(
+            body.get("reasonCode").and_then(serde_json::Value::as_u64),
+            reason(values::REASON_NOT_IMPLEMENTED)
+        );
+        assert!(
+            body.get("reasonText")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| text.contains("transaction path"))
+        );
+        assert_eq!(backend.signed().len(), 0);
+    }
+
+    /// A JSON sign while the flight is held is refused without
+    /// touching the backend.
+    #[test]
+    fn json_sign_yields_the_flight() {
+        let backend = backend();
+        let manager = TransactionManager::new();
+        let now = UNIX_EPOCH + Duration::from_secs(TEST_NOW_SECONDS);
+        let _held = manager.reserve_sign(now).expect("reserves");
+        let nonce = "n".repeat(values::NONCE_MINIMUM_LENGTH);
+        let body = format!(
+            "{{\"content\":\"{}\",\"contentType\":\"data\"}}",
+            base64::encode(format!("{ORIGIN};{nonce}").as_bytes())
+        );
+        let response = dispatch(
+            &request("POST", "/sign", Some("application/json")),
+            body.as_bytes(),
+            now,
+            &backend,
+            &manager,
+        );
+        assert_eq!(
+            body_json(&response)
+                .get("reasonCode")
+                .and_then(serde_json::Value::as_u64),
+            reason(values::REASON_FORBIDDEN)
+        );
+        assert!(backend.signed().is_empty());
+    }
+
+    /// ECDSA answers carry DER; RSA answers carry the raw bytes.
+    #[test]
+    fn json_ecdsa_answers_der() {
+        let minted = mint_certificate();
+        let backend = ScriptedBackend::answering(
+            [minted.der].into(),
+            KeyAlgorithm::Ecdsa,
+            b"card-signature".to_vec(),
+        );
+        let manager = TransactionManager::new();
+        let now = UNIX_EPOCH + Duration::from_secs(TEST_NOW_SECONDS);
+        let nonce = "n".repeat(values::NONCE_MINIMUM_LENGTH);
+        let body = format!(
+            "{{\"content\":\"{}\",\"contentType\":\"data\"}}",
+            base64::encode(format!("{ORIGIN};{nonce}").as_bytes())
+        );
+        let response = dispatch(
+            &request("POST", "/sign", Some("application/json")),
+            body.as_bytes(),
+            now,
+            &backend,
+            &manager,
+        );
+        let body = body_json(&response);
+        let signature = body
+            .get("signature")
+            .and_then(serde_json::Value::as_str)
+            .expect("signature");
+        let decoded = base64::decode(signature).expect("base64");
+        assert_eq!(decoded.first(), Some(&DER_SEQUENCE_TAG));
     }
 }

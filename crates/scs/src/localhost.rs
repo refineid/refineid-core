@@ -21,6 +21,11 @@
 //! and keyEncipherment, and extended key usage serverAuth. Signing
 //! stays a caller-supplied closure so the key can live wherever the
 //! platform keeps it.
+//!
+//! One self-signed certificate rather than the specification's
+//! root-plus-leaf pair, as the Swift engine does: the holder trusts
+//! this one certificate directly, and there is no second identity to
+//! persist or fingerprint.
 
 use refineid_cms::oid::known;
 

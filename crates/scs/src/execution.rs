@@ -16,6 +16,8 @@
 //! SCS specification v1.3 sec.2.7.3), split from the transaction
 //! manager so each half stays readable.
 
+use std::time::SystemTime;
+
 use refineid_digest::HashAlg;
 
 use crate::backend::{SignRequest, SigningBackend};
@@ -34,8 +36,10 @@ pub(crate) fn respond(
     payload: &ExecuteDocument,
     state: &AgreedTransaction,
     backend: &dyn SigningBackend,
+    now: SystemTime,
 ) -> Result<String, TransactionError> {
-    if let Some(refused) = refusal(payload, state.purpose, &state.server_key, &state.origin) {
+    let key_algorithm = backend.key_algorithm(state.purpose);
+    if let Some(refused) = refusal(payload, state.purpose, key_algorithm) {
         return Err(refused);
     }
     let Some(hash) = hash::hash_named(&payload.hash_algorithm) else {
@@ -45,7 +49,24 @@ pub(crate) fn respond(
     };
     let content = base64::decode(&payload.content)
         .map_err(|_| TransactionError::bad_request("execute content is not base64"))?;
-    let produced = signature(&content, &payload.signature_type, hash, state, backend)?;
+    let now_unix = crate::time::system_unix(now)
+        .map_err(|_| TransactionError::internal_error("read the system clock"))?;
+    let produced = signature(
+        &content,
+        payload,
+        hash,
+        key_algorithm,
+        state,
+        backend,
+        now_unix,
+    )?;
+    let effective_algorithm = payload.signature_algorithm.clone().unwrap_or_else(|| {
+        match key_algorithm {
+            crate::purpose::KeyAlgorithm::Ecdsa => "ECDSA",
+            crate::purpose::KeyAlgorithm::Rsa => "RSA",
+        }
+        .to_owned()
+    });
     let response = ExecuteResponseDocument {
         chain: backend
             .certificate_chain(state.purpose)
@@ -55,7 +76,7 @@ pub(crate) fn respond(
         reason_code: values::REASON_OK,
         reason_text: "Signature generated".to_owned(),
         signature: base64::encode(&produced),
-        signature_algorithm: payload.hash_algorithm.clone() + "with" + &payload.signature_algorithm,
+        signature_algorithm: payload.hash_algorithm.clone() + "with" + &effective_algorithm,
         signature_type: payload.signature_type.clone(),
         status: "ok".to_owned(),
         version: values::VERSION.to_owned(),
@@ -69,8 +90,7 @@ pub(crate) fn respond(
 pub(crate) fn refusal(
     payload: &ExecuteDocument,
     purpose: SignPurpose,
-    server_key: &str,
-    origin: &str,
+    key_algorithm: crate::purpose::KeyAlgorithm,
 ) -> Option<TransactionError> {
     if payload.version != values::VERSION {
         return Some(TransactionError::bad_request(format!(
@@ -84,17 +104,36 @@ pub(crate) fn refusal(
             payload.hash_algorithm
         )));
     }
-    if payload.signature_algorithm != "RSA" && payload.signature_algorithm != "ECDSA" {
-        return Some(TransactionError::not_implemented(format!(
-            "unsupported signature algorithm {}",
-            payload.signature_algorithm
-        )));
+    match &payload.signature_algorithm {
+        None => {}
+        Some(name) if name == "RSA" || name == "ECDSA" => {
+            let serves = matches!(
+                (key_algorithm, name.as_str()),
+                (crate::purpose::KeyAlgorithm::Rsa, "RSA")
+                    | (crate::purpose::KeyAlgorithm::Ecdsa, "ECDSA")
+            );
+            if !serves {
+                return Some(TransactionError::bad_request(format!(
+                    "signature algorithm {name} does not match the card key"
+                )));
+            }
+        }
+        Some(other) => {
+            return Some(TransactionError::not_implemented(format!(
+                "unsupported signature algorithm {other}"
+            )));
+        }
     }
     if payload.signature_type != "signature" && payload.signature_type != "cms-pades" {
         return Some(TransactionError::not_implemented(format!(
             "unsupported signature type {}",
             payload.signature_type
         )));
+    }
+    if purpose == SignPurpose::Authentication && payload.signature_type != "signature" {
+        return Some(TransactionError::bad_request(
+            "authentication requests use only the signature type",
+        ));
     }
     match payload.content_type.as_str() {
         "data" => {}
@@ -115,35 +154,42 @@ pub(crate) fn refusal(
             )));
         }
     }
-    if purpose != SignPurpose::Authentication {
-        return None;
-    }
-    challenge_refusal(&payload.content, server_key, origin)
+    None
 }
 
 /// Produce the signature bytes for one validated `execute`.
 fn signature(
     content: &[u8],
-    signature_type: &str,
+    payload: &ExecuteDocument,
     hash: HashAlg,
+    key_algorithm: crate::purpose::KeyAlgorithm,
     state: &AgreedTransaction,
     backend: &dyn SigningBackend,
+    now_unix: i64,
 ) -> Result<Vec<u8>, TransactionError> {
     let purpose = state.purpose;
-    if signature_type != "cms-pades" {
-        return backend
+    let data: Vec<u8> = if purpose == SignPurpose::Authentication {
+        bound_challenge(&payload.content, &state.server_key, &state.origin)?
+    } else {
+        content.to_vec()
+    };
+    if payload.signature_type != "cms-pades" {
+        let raw = backend
             .sign(SignRequest {
                 purpose,
                 hash,
-                data: content.to_vec(),
+                data,
                 origin: Some(state.origin.clone()),
             })
-            .map_err(TransactionError::wrapping);
+            .map_err(TransactionError::wrapping)?;
+        return ecdsa_adjust(raw, key_algorithm);
     }
     let prepared = crate::cms::prepare(
-        content,
+        &data,
         &backend.certificate_chain(purpose),
-        hash::scs_name(hash),
+        hash,
+        key_algorithm,
+        now_unix,
     )?;
     let card_signature = backend
         .sign(SignRequest {
@@ -153,35 +199,69 @@ fn signature(
             origin: Some(state.origin.clone()),
         })
         .map_err(TransactionError::wrapping)?;
-    Ok(prepared.signed_data(&card_signature))
+    prepared.signed_data(&card_signature)
 }
 
-/// The transaction form of the origin-bound challenge: the content
-/// must be `origin;nonce;serverKey`, binding the sign to both the
-/// caller and the key agreement (v1.3 sec.2.7.3).
-fn challenge_refusal(content: &str, server_key: &str, origin: &str) -> Option<TransactionError> {
+/// The card's raw signature in the response form: ECDSA signs as
+/// X9.62 DER, RSA as returned (v1.3 sec.2.6.1).
+fn ecdsa_adjust(
+    raw: Vec<u8>,
+    key_algorithm: crate::purpose::KeyAlgorithm,
+) -> Result<Vec<u8>, TransactionError> {
+    if key_algorithm != crate::purpose::KeyAlgorithm::Ecdsa {
+        return Ok(raw);
+    }
+    crate::codec::ecdsa_signature_der(&raw)
+        .map_err(|()| TransactionError::internal_error("encode ECDSA signature"))
+}
+
+/// The transaction form of the origin-bound challenge: the caller
+/// sends `origin;nonce`, and the SCS appends `;serverKey` from the
+/// agreement it actually made before the card signs (v1.3 sec.2.1).
+/// Answers the bytes to sign.
+fn bound_challenge(
+    content: &str,
+    server_key: &str,
+    origin: &str,
+) -> Result<Vec<u8>, TransactionError> {
     let not_utf8 = || TransactionError::bad_request("authentication challenge must be UTF-8");
     let raw = match base64::decode(content) {
         Ok(raw) => raw,
-        Err(_) => return Some(not_utf8()),
+        Err(_) => return Err(not_utf8()),
     };
     let challenge = match core::str::from_utf8(&raw) {
         Ok(text) => text,
-        Err(_) => return Some(not_utf8()),
+        Err(_) => return Err(not_utf8()),
     };
-    let prefix = origin.to_owned() + ";";
-    let suffix = ";".to_owned() + server_key;
-    if !challenge.starts_with(&prefix) || !challenge.ends_with(&suffix) {
-        return Some(TransactionError::forbidden(
+    if raw.len() > values::CHALLENGE_MAXIMUM_LENGTH {
+        return Err(TransactionError::bad_request(format!(
+            "challenge longer than {} octets",
+            values::CHALLENGE_MAXIMUM_LENGTH
+        )));
+    }
+    let Some((challenge_origin, nonce)) = challenge.split_once(';') else {
+        return Err(TransactionError::bad_request(
+            "challenge missing ; separator (expected origin;nonce)",
+        ));
+    };
+    if nonce.contains(';') {
+        return Err(TransactionError::bad_request(
+            "authentication challenge must be origin;nonce",
+        ));
+    }
+    if challenge_origin != origin {
+        return Err(TransactionError::forbidden(
             "transaction authentication challenge is not bound to Origin and serverKey",
         ));
     }
-    let nonce = &challenge[prefix.len()..challenge.len() - suffix.len()];
-    if nonce.chars().count() < values::NONCE_MINIMUM_LENGTH {
-        return Some(TransactionError::bad_request(format!(
+    if nonce.len() < values::NONCE_MINIMUM_LENGTH {
+        return Err(TransactionError::bad_request(format!(
             "authentication challenge nonce is shorter than {} octets",
             values::NONCE_MINIMUM_LENGTH
         )));
     }
-    None
+    let mut bound = challenge.as_bytes().to_vec();
+    bound.push(b';');
+    bound.extend_from_slice(server_key.as_bytes());
+    Ok(bound)
 }

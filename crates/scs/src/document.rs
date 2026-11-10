@@ -420,6 +420,10 @@ impl BeginResponseDocument {
 }
 
 /// The `execute` payload carried inside the JWE (v1.3 sec.2.7.3).
+///
+/// `displayText` is accepted and ignored: the holder's consent screen
+/// is the platform's, and the receipt carries origin and digest
+/// instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecuteDocument {
     /// Base64 of the content or digest to sign.
@@ -428,8 +432,9 @@ pub struct ExecuteDocument {
     pub content_type: String,
     /// The digest name; SHA256 when absent.
     pub hash_algorithm: String,
-    /// The key algorithm name; RSA when absent.
-    pub signature_algorithm: String,
+    /// The key algorithm name; per the card key when absent (v1.3
+    /// sec.2.6.1).
+    pub signature_algorithm: Option<String>,
     /// `signature` or `cms-pades`; `signature` when absent.
     pub signature_type: String,
     /// The protocol version of the transaction.
@@ -443,7 +448,7 @@ impl ExecuteDocument {
             content: get_str(value, "content")?.to_owned(),
             content_type: str_or_default(value, "contentType", "data")?,
             hash_algorithm: str_or_default(value, "hashAlgorithm", "SHA256")?,
-            signature_algorithm: str_or_default(value, "signatureAlgorithm", "RSA")?,
+            signature_algorithm: opt_str(value, "signatureAlgorithm")?,
             signature_type: str_or_default(value, "signatureType", "signature")?,
             version: get_str(value, "version")?.to_owned(),
         })
@@ -613,7 +618,7 @@ mod tests {
             .expect("decodes");
         assert_eq!(execute.content_type, "data");
         assert_eq!(execute.hash_algorithm, "SHA256");
-        assert_eq!(execute.signature_algorithm, "RSA");
+        assert_eq!(execute.signature_algorithm, None);
         assert_eq!(execute.signature_type, "signature");
     }
 }

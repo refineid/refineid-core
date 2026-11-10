@@ -33,6 +33,15 @@ const HEAD_SEPARATOR: &[u8; HEAD_SEPARATOR_LENGTH] = b"\r\n\r\n";
 /// The line separator inside the head.
 const LINE_SEPARATOR: &str = "\r\n";
 
+/// First printable ASCII byte; below it are controls.
+const FIRST_PRINTABLE: u8 = 0x20;
+
+/// The DEL byte, never valid in a head.
+const DELETE_CHARACTER: u8 = 0x7F;
+
+/// Horizontal tab, the one control a field value may carry.
+const HORIZONTAL_TAB: u8 = 0x09;
+
 /// A request line names at least a method and a target.
 const REQUEST_LINE_MINIMUM_PARTS: usize = 2;
 
@@ -58,12 +67,20 @@ pub struct Request {
 impl Request {
     /// Parse one head block (the bytes before the blank line).
     ///
-    /// Returns `None` when the block is not UTF-8 or has no request
-    /// line; unknown headers are ignored.
+    /// Returns `None` when the block is not UTF-8, has no request
+    /// line, smuggles bare line breaks or controls, or declares its
+    /// length twice; unknown headers are ignored.
     #[must_use]
     pub fn parse(head: &[u8]) -> Option<Self> {
         let text = core::str::from_utf8(head).ok()?;
-        let mut lines = text.split(LINE_SEPARATOR);
+        let lines: Vec<&str> = text.split(LINE_SEPARATOR).collect();
+        if lines
+            .iter()
+            .any(|line| line.contains('\r') || line.contains('\n'))
+        {
+            return None;
+        }
+        let mut lines = lines.into_iter();
         let request_line = lines.next()?;
         let parts: Vec<&str> = request_line
             .split(' ')
@@ -74,16 +91,23 @@ impl Request {
         }
         let method = parts[0];
         let target = parts[1];
+        if has_control(method, false) || has_control(target, false) {
+            return None;
+        }
         let path = target.split('?').next().unwrap_or(target).to_owned();
         let mut origin = None;
         let mut content_type = None;
         let mut body_length = 0_usize;
+        let mut saw_length = false;
         for line in lines {
             let Some((name, value)) = line.split_once(':') else {
                 continue;
             };
             let name = name.trim();
             let value = value.trim();
+            if has_control(name, false) || has_control(value, true) {
+                return None;
+            }
             if name.eq_ignore_ascii_case("Origin") {
                 origin = Some(value.to_owned());
             } else if name.eq_ignore_ascii_case("Content-Type") {
@@ -93,7 +117,13 @@ impl Request {
                 // integer is a malformed head: falling back to zero
                 // would accept garbage or an overflowing number as a
                 // valid empty body, and a negative count would reach
-                // the body assembly.
+                // the body assembly. A second declaration refuses
+                // the head outright: conflicting lengths are how
+                // smuggled bodies hide.
+                if saw_length {
+                    return None;
+                }
+                saw_length = true;
                 body_length = value.parse::<usize>().ok()?;
             }
         }
@@ -166,6 +196,15 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+/// Whether `text` carries control bytes: anything below printable or
+/// DEL, except a horizontal tab in a field value.
+fn has_control(text: &str, allow_tab: bool) -> bool {
+    text.bytes().any(|byte| {
+        byte == DELETE_CHARACTER
+            || (byte < FIRST_PRINTABLE && (!allow_tab || byte != HORIZONTAL_TAB))
+    })
 }
 
 /// A JSON response with CORS headers.
@@ -306,6 +345,30 @@ mod tests {
         }
         assert_eq!(Request::parse(b"BARELY"), None);
         assert_eq!(Request::parse(NON_UTF8), None);
+    }
+
+    /// Smuggled line breaks, controls, and a second length refuse
+    /// the head.
+    #[test]
+    fn smuggling_shapes_refuse_the_head() {
+        for head in [
+            "POST /sign HTTP/1.1\rX-Origin: https://evil.example\r\n\r\n",
+            "POST /sign HTTP/1.1\r\nOrigin: https://a.example\rEvil: 1\r\n\r\n",
+            "POST /sign HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+        ] {
+            assert_eq!(Request::parse(head.as_bytes()), None, "{head:?}");
+        }
+        let del = [
+            b"POST /sign".as_slice(),
+            &[super::DELETE_CHARACTER],
+            b" HTTP/1.1\r\n\r\n".as_slice(),
+        ]
+        .concat();
+        assert_eq!(Request::parse(&del), None);
+        // A tab inside a value is legal HTTP and survives.
+        let request =
+            Request::parse(b"POST /sign HTTP/1.1\r\nX-Note: a\tb\r\n\r\n").expect("parses");
+        assert_eq!(request.method, "POST");
     }
 
     /// Assembly answers need-more-data, then the exchange, and

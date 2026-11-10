@@ -22,6 +22,9 @@
 //! this, any page the holder happens to visit could obtain an
 //! authentication signature over bytes of its choosing and replay it
 //! elsewhere.
+//!
+//! Lengths are octets: the nonce floor counts bytes, and the whole
+//! request is capped at 1024 octets (v1.3 sec.2.1).
 
 use crate::values;
 
@@ -32,6 +35,12 @@ pub fn refusal(content: &[u8], origin: Option<&str>) -> Option<String> {
     let Some(origin) = origin else {
         return Some("missing Origin header".to_owned());
     };
+    if content.len() > values::CHALLENGE_MAXIMUM_LENGTH {
+        return Some(format!(
+            "challenge longer than {} octets",
+            values::CHALLENGE_MAXIMUM_LENGTH
+        ));
+    }
     let Ok(text) = core::str::from_utf8(content) else {
         return Some("challenge must be UTF-8 (origin;nonce)".to_owned());
     };
@@ -43,10 +52,10 @@ pub fn refusal(content: &[u8], origin: Option<&str>) -> Option<String> {
             "challenge origin {challenge_origin} does not match request Origin {origin}"
         ));
     }
-    let length = nonce.chars().count();
-    if length < values::NONCE_MINIMUM_LENGTH {
+    if nonce.len() < values::NONCE_MINIMUM_LENGTH {
         return Some(format!(
-            "challenge nonce too short ({length} octets, {} required)",
+            "challenge nonce too short ({} octets, {} required)",
+            nonce.len(),
             values::NONCE_MINIMUM_LENGTH
         ));
     }

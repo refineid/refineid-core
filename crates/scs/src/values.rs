@@ -25,6 +25,10 @@ pub const VERSION: &str = "1.3";
 /// (v1.3 sec.3.7).
 pub const NONCE_MINIMUM_LENGTH: usize = 64;
 
+/// Longest accepted authentication challenge request, in octets
+/// (v1.3 sec.2.1).
+pub const CHALLENGE_MAXIMUM_LENGTH: usize = 1024;
+
 /// JWE initialization-vector length for A256GCM: 96 bits.
 pub const JWE_INITIALIZATION_VECTOR_LENGTH: usize = 12;
 
@@ -104,6 +108,10 @@ pub const LOOPBACK_ADDRESS: [u8; IPV4_LENGTH] = [127, 0, 0, 1];
 
 /// Length of the agreed A256GCM transaction key, in bytes.
 pub const TRANSACTION_KEY_LENGTH: usize = 32;
+
+/// How long an agreed transaction waits for its `execute` before it
+/// is dropped, so an abandoned `begin` cannot wedge the service.
+pub const TRANSACTION_TIME_TO_LIVE: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// How long a generated localhost certificate stays valid, in
 /// years; it is persisted and reused, so trust survives restarts.

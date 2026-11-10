@@ -77,9 +77,26 @@ pub fn sequence(elements: &[&[u8]]) -> Result<Vec<u8>, ()> {
     refineid_ber::tlv(TAG_SEQUENCE, join(elements)).map_err(|_| ())
 }
 
-/// A SET of the element encodings.
+/// A SET OF already-encoded elements, sorted by encoding as DER
+/// requires (X.690 sec.11.6).
 pub fn set(elements: &[&[u8]]) -> Result<Vec<u8>, ()> {
-    refineid_ber::tlv(TAG_SET, join(elements)).map_err(|_| ())
+    let mut sorted: Vec<&[u8]> = elements.to_vec();
+    sorted.sort();
+    refineid_ber::tlv(TAG_SET, join(&sorted)).map_err(|_| ())
+}
+
+/// An encoded value re-tagged: the first tag octet replaced,
+/// for IMPLICIT context tags over a complete encoding.
+pub fn retag(replacement: u8, encoded: &[u8]) -> Result<Vec<u8>, ()> {
+    let Some((&first, _)) = encoded.split_first() else {
+        return Err(());
+    };
+    if first != TAG_SEQUENCE && first != TAG_SET {
+        return Err(());
+    }
+    let mut out = encoded.to_vec();
+    out[0] = replacement;
+    Ok(out)
 }
 
 /// An OBJECT IDENTIFIER from content bytes.

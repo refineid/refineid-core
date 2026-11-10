@@ -584,10 +584,11 @@ impl ModuleState {
     /// removal). Zeroizes the PIN1 secret via `PinBytes`'s drop.
     fn invalidate_slot(&mut self, slot_id: CkSlotId) {
         self.token_cache.remove(&slot_id);
-        if let Some(cache) = self.pin_caches.get(&slot_id)
-            && let Ok(mut cache) = cache.lock()
-        {
-            cache.clear_positive();
+        if let Some(cache) = self.pin_caches.get(&slot_id) {
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear_positive();
         }
     }
 
@@ -699,10 +700,11 @@ impl ModuleState {
     /// Drop a slot's PIN1 login state (`C_Logout`).
     pub(crate) fn logout(&mut self, slot_id: CkSlotId) {
         self.remote_logged_in.remove(&slot_id);
-        if let Some(cache) = self.pin_caches.get(&slot_id)
-            && let Ok(mut cache) = cache.lock()
-        {
-            cache.clear_positive();
+        if let Some(cache) = self.pin_caches.get(&slot_id) {
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear_positive();
         }
     }
 
@@ -729,7 +731,7 @@ impl ModuleState {
         }
         self.pin_caches
             .get(&slot_id)
-            .is_some_and(|cache| cache.lock().is_ok_and(|mut cache| cache.holds_pin1()))
+            .is_some_and(|cache| cache.lock().is_ok_and(|cache| cache.holds_pin1()))
     }
 
     /// Report the next pending slot event: the first slot whose
@@ -753,9 +755,10 @@ impl ModuleState {
 
     pub(crate) fn clear_all_positive_pins(&self) {
         for cache in self.pin_caches.values() {
-            if let Ok(mut cache) = cache.lock() {
-                cache.clear_positive();
-            }
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear_positive();
         }
     }
 

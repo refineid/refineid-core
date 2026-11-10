@@ -162,6 +162,22 @@ investment goes.
   registries; it touches no card, so no hardware validation applies.
   Secret, personal-information, protocol, and dependency scans were
   performed for this slice.
+- **Signature Creation Service.** Publication under Apache-2.0 directed on
+  2026-11-10 for the new `refineid-scs` crate: the DVV SCS v1.3
+  surface (version, JSON and JWT-transaction signs, CORS preflight),
+  the origin-bound challenge rules, the A256GCM transaction channel,
+  JWS verification, the detached CMS builder, the localhost
+  certificate builder, and the `SigningBackend` seam. Written fresh
+  for this repository against the DVV SCS specification v1.3, with
+  wire shapes cross-checked against the Swift engine in
+  `refineid-apple`; no private source was copied. Verification reuses
+  the in-tree `refineid-cms` RSA primitives, `p256` ECDSA, and
+  `refineid-ber` DER; the new direct dependencies (`aes-gcm`, the
+  `p256` `ecdh`/`ecdsa` features, `signature`) carry supply-chain
+  exemptions. Covered by unit tests including a full begin/execute
+  round trip; it touches no card, so no hardware validation applies.
+  Secret, personal-information, protocol, and dependency scans were
+  performed for this slice.
 
 Before a later slice is admitted, its review must record:
 

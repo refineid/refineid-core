@@ -546,6 +546,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ecdsa"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0681a4fc24c767085329728d8dfba959af91228aa4610cca4f8ce317ba46ae0"
+dependencies = [
+ "der",
+ "digest 0.11.3",
+ "elliptic-curve",
+ "rfc6979",
+ "signature",
+ "zeroize",
+]
+
+[[package]]
 name = "elliptic-curve"
 version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -557,6 +571,7 @@ dependencies = [
  "digest 0.11.3",
  "ff",
  "group",
+ "hkdf",
  "hybrid-array",
  "rand_core",
  "sec1",
@@ -746,6 +761,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "hkdf"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
+dependencies = [
+ "hmac",
+]
+
+[[package]]
 name = "hmac"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -894,9 +918,11 @@ version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2c9239b2dbc807adbbe147e8cf72ea7450c3a0aabe62cb8e75ff4ec22e1f72a"
 dependencies = [
+ "ecdsa",
  "elliptic-curve",
  "primefield",
  "primeorder",
+ "sha2 0.11.1",
 ]
 
 [[package]]
@@ -1240,6 +1266,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "refineid-scs"
+version = "26.11.10"
+dependencies = [
+ "aes-gcm",
+ "elliptic-curve",
+ "getrandom 0.4.3",
+ "p256",
+ "refineid-ber",
+ "refineid-cms",
+ "refineid-digest",
+ "serde_json",
+ "signature",
+ "spki",
+ "zeroize",
+]
+
+[[package]]
 name = "refineid-sign"
 version = "26.11.10"
 dependencies = [
@@ -1256,6 +1299,16 @@ name = "refineid-x509"
 version = "26.11.10"
 dependencies = [
  "refineid-ber",
+]
+
+[[package]]
+name = "rfc6979"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4a459cddafb3fe76b31fd8f1108007566c40301feb64dc7b54656eb7388172b"
+dependencies = [
+ "crypto-bigint",
+ "hmac",
 ]
 
 [[package]]
@@ -1467,6 +1520,16 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",
  "digest 0.11.3",
+]
+
+[[package]]
+name = "signature"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
+dependencies = [
+ "digest 0.11.3",
+ "rand_core",
 ]
 
 [[package]]

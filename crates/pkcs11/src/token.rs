@@ -46,8 +46,8 @@ use refineid_apdu::CardTransport;
 #[cfg(feature = "pin-change")]
 use refineid_auth::PinManageOps as _;
 use refineid_auth::{
-    FlooredCredential, PinOps as _, PinSlot, PinStatus, RetryFloorRefusal, VerifyOutcome,
-    check_retry_floor, pin1_status_permits_reusable_cache,
+    AuthError, FlooredCredential, PinOps as _, PinSlot, PinStatus, RetryFloorRefusal,
+    VerifyOutcome, check_retry_floor, pin1_status_permits_reusable_cache,
 };
 use refineid_cms::container::{EcdsaP384, RsaPkcs1Sha256, Signature};
 use refineid_cms::x509::{
@@ -1581,83 +1581,123 @@ pub(super) fn card_sign(
     let backend = PcscBackend;
     // A remote slot has no local reader; its signatures go through
     // `remote_card_sign`.
-    let reader = kind.local_reader().ok_or(CKR_DEVICE_ERROR)?;
+    let Some(reader) = kind.local_reader() else {
+        clear_positive(pin_cache);
+        return Err(CKR_DEVICE_ERROR);
+    };
     // The lane keeps this process's other PIN-bearing operations on
     // this reader waiting until the held PIN1 is settled. The PIN is
     // already in the cache -- no prompt or non-card wait happens while
     // the card is open.
-    let lane = card_lane(reader)?;
-    let _turn = lane.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?;
-    let card = backend
-        .open_session(reader, ReaderAccessCap::PinSequence)
-        .map_err(|_open_err| CKR_DEVICE_ERROR)?;
-    card.pin_sequence(|mut card| -> Result<Vec<u8>, CkRv> {
-        card.select_pkcs15_application()
-            .map_err(|_select_err| CKR_DEVICE_ERROR)?;
-        let serial = match live_token_serial(&mut card) {
-            Ok(serial) => serial,
-            Err(error) => {
-                clear_positive(pin_cache);
-                return Err(error);
-            }
-        };
-        let pin1_status = match card.pin_status(PinSlot::Pin1) {
-            Ok(status) => status,
-            Err(_status_err) => {
-                clear_positive(pin_cache);
-                return Err(CKR_DEVICE_ERROR);
-            }
-        };
-        if let Err(error) = pin1_verify_guard(pin1_status) {
+    let lane = card_lane(reader).inspect_err(|_lane_err| clear_positive(pin_cache))?;
+    let _turn = lane
+        .lock()
+        .inspect_err(|_poisoned| clear_positive(pin_cache))
+        .map_err(|_poisoned| CKR_DEVICE_ERROR)?;
+    let Ok(card) = backend.open_session(reader, ReaderAccessCap::PinSequence) else {
+        clear_positive(pin_cache);
+        return Err(CKR_DEVICE_ERROR);
+    };
+    card.pin_sequence(|mut card| {
+        run_card_sign(
+            &mut card,
+            || {
+                backend
+                    .card_events(reader)
+                    .map_err(|_status_err| CKR_DEVICE_ERROR)
+            },
+            pin_cache,
+            request,
+        )
+    })
+    .inspect_err(|_transaction_err| clear_positive(pin_cache))
+    .map_err(|_transaction_err| CKR_DEVICE_ERROR)?
+}
+
+fn run_card_sign<T, F>(
+    card: &mut T,
+    read_card_events: F,
+    pin_cache: &Arc<Mutex<PinSafetyCache>>,
+    request: CardSignInput,
+) -> Result<Vec<u8>, CkRv>
+where
+    T: CardTransport,
+    T::Error: refineid_apdu::TransportErrorExt,
+    F: FnOnce() -> Result<u32, CkRv>,
+{
+    if card.select_pkcs15_application().is_err() {
+        clear_positive(pin_cache);
+        return Err(CKR_DEVICE_ERROR);
+    }
+    let serial = match live_token_serial(card) {
+        Ok(serial) => serial,
+        Err(error) => {
             clear_positive(pin_cache);
             return Err(error);
         }
-        // The count is read while the transaction holds the card: a
-        // card that leaves now ends this handle, so an unmoved count
-        // proves no card left the reader since the card accepted the
-        // held value.
-        let Ok(card_events) = backend.card_events(reader) else {
+    };
+    let pin1_status = match card.pin_status(PinSlot::Pin1) {
+        Ok(status) => status,
+        Err(_status_err) => {
             clear_positive(pin_cache);
             return Err(CKR_DEVICE_ERROR);
-        };
-        // A blocked PIN 1 is the card's to answer, but a held value is
-        // never handed out for one; the lock is reported as the reason.
-        let no_pin_to_present = match pin1_status {
-            PinStatus::Locked => CKR_PIN_LOCKED,
-            PinStatus::Verified
-            | PinStatus::Remaining(_)
-            | PinStatus::NoInfo
-            | PinStatus::Other(_) => CKR_USER_NOT_LOGGED_IN,
-        };
-        let checkout = pin_cache
+        }
+    };
+    if !pin1_status_permits_reusable_cache(pin1_status) {
+        clear_positive(pin_cache);
+    }
+    if let Err(error) = pin1_verify_guard(pin1_status) {
+        clear_positive(pin_cache);
+        return Err(error);
+    }
+    // The count is read while the transaction holds the card: a
+    // card that leaves now ends this handle, so an unmoved count
+    // proves no card left the reader since the card accepted the
+    // held value.
+    let Ok(card_events) = read_card_events() else {
+        clear_positive(pin_cache);
+        return Err(CKR_DEVICE_ERROR);
+    };
+    // A blocked PIN 1 is the card's to answer, but a held value is
+    // never handed out for one; the lock is reported as the reason.
+    let no_pin_to_present = match pin1_status {
+        PinStatus::Locked => CKR_PIN_LOCKED,
+        PinStatus::Verified | PinStatus::Remaining(_) | PinStatus::NoInfo | PinStatus::Other(_) => {
+            CKR_USER_NOT_LOGGED_IN
+        }
+    };
+    let checkout = pin_cache
+        .lock()
+        .map_err(|_poisoned| CKR_DEVICE_ERROR)?
+        .checkout_pin1(&serial, card_events, pin1_status)
+        .ok_or(no_pin_to_present)?;
+    let secret =
+        refineid_auth::UnvalidatedSecret::from_owned_bytes(checkout.pin().as_bytes().to_vec());
+    let Ok(pin1) = refineid_auth::Pin1::reconstruct(secret) else {
+        return Err(CKR_DEVICE_ERROR);
+    };
+    let answer = card.verify_pin1(pin1);
+    let accepted = checkout.settle_verify(
+        &mut pin_cache
             .lock()
-            .map_err(|_poisoned| CKR_DEVICE_ERROR)?
-            .checkout_pin1(&serial, card_events, pin1_status)
-            .ok_or(no_pin_to_present)?;
-        let secret =
-            refineid_auth::UnvalidatedSecret::from_owned_bytes(checkout.pin().as_bytes().to_vec());
-        let Ok(pin1) = refineid_auth::Pin1::reconstruct(secret) else {
-            return Err(CKR_DEVICE_ERROR);
-        };
-        let answer = card.verify_pin1(pin1);
-        let accepted = checkout.settle_verify(
-            &mut *pin_cache.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?,
-            &answer,
-        );
-        let accepted = match (answer, accepted) {
-            (Ok(VerifyOutcome::Ok), Some(accepted)) => accepted,
-            (Ok(VerifyOutcome::WrongPin { .. }), _) => return Err(CKR_PIN_INCORRECT),
-            (Ok(VerifyOutcome::Locked), _) => return Err(CKR_PIN_LOCKED),
-            _ => return Err(CKR_DEVICE_ERROR),
-        };
-        let signed = sign_with_card(&mut card, request);
-        accepted.settle_operation(
-            &mut *pin_cache.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?,
-            signed.as_ref().err(),
-        );
-        signed.map_err(|_card_err| CKR_DEVICE_ERROR)
-    })
-    .map_err(|_transaction_err| CKR_DEVICE_ERROR)?
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        &answer,
+    );
+    let accepted = match (answer, accepted) {
+        (Ok(VerifyOutcome::Ok), Some(accepted)) => accepted,
+        (Ok(VerifyOutcome::WrongPin { .. }), _) => return Err(CKR_PIN_INCORRECT),
+        (Ok(VerifyOutcome::Locked), _) => return Err(CKR_PIN_LOCKED),
+        (Err(AuthError::RetryFloor(refusal)), _) => return Err(retry_floor_rv(refusal)),
+        _ => return Err(CKR_DEVICE_ERROR),
+    };
+    let signed = sign_with_card(card, request);
+    accepted.settle_operation(
+        &mut pin_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        signed.as_ref().err(),
+    );
+    signed.map_err(|_card_err| CKR_DEVICE_ERROR)
 }
 
 /// The card lane of each local reader this process has signed or
@@ -1819,14 +1859,16 @@ pub(super) fn remote_token_objects(
     Ok(objects)
 }
 
-/// Verify a `C_Login` PIN on the live card and keep it only once the
-/// card accepts it: held when the retry counter read before the VERIFY
-/// was pristine ([`PinSafetyCache::store_pin1`]), otherwise staged for
-/// the one operation that follows ([`PinSafetyCache::stage_pin1_once`]).
-/// Either way it is bound to the card's token serial and the reader's
-/// card insertion and removal count, read in the same card session
-/// before the VERIFY; a login whose reader reports no count is refused
-/// before the VERIFY, since nothing would bound the value's stay.
+/// Verify a `C_Login` PIN on the live card and hold it once the card
+/// accepts it ([`PinSafetyCache::store_pin1`]): an accepted VERIFY
+/// restores PIN1's retry counter to its five-try limit (FINEID S1 v4.2
+/// section 3.5), while the retry floor refuses two or one tries left or
+/// an unreadable counter before any VERIFY is sent.
+///
+/// The held value is bound to the card's token serial and the reader's
+/// card insertion and removal count, both read in the same card session
+/// before the VERIFY; a failed pre-VERIFY read destroys any held PIN1
+/// and refuses the login before any credential command is sent.
 ///
 /// The VERIFY runs inside one PC/SC transaction that ends with a card
 /// reset ([`PcscCard::pin_sequence`]): the login proves the PIN to this
@@ -1849,92 +1891,150 @@ pub(super) fn card_login(
         return Ok(());
     }
     let backend = PcscBackend;
-    let reader = kind.local_reader().ok_or(CKR_DEVICE_ERROR)?;
+    let Some(reader) = kind.local_reader() else {
+        clear_positive(pin_cache);
+        return Err(CKR_DEVICE_ERROR);
+    };
     // The reader to open is this one; a remote slot has no local
     // reader and never reaches here. The lane keeps this process's
     // other PIN-bearing operations on this reader waiting until the
     // VERIFY is settled; the PIN arrived with the call, so nothing
     // non-card happens while the card is open.
-    let lane = card_lane(reader)?;
-    let _turn = lane.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?;
-    let card = backend
-        .open_session(reader, ReaderAccessCap::PinSequence)
-        .map_err(|_open_err| CKR_DEVICE_ERROR)?;
-    card.pin_sequence(|mut card| -> Result<(), CkRv> {
-        card.select_pkcs15_application()
-            .map_err(|_select_err| CKR_DEVICE_ERROR)?;
-        let serial = match live_token_serial(&mut card) {
-            Ok(serial) => serial,
-            Err(error) => {
-                clear_positive(pin_cache);
-                return Err(error);
-            }
-        };
-        let pin1_status = match card.pin_status(PinSlot::Pin1) {
-            Ok(status) => status,
-            Err(_status_err) => {
-                clear_positive(pin_cache);
-                return Err(CKR_DEVICE_ERROR);
-            }
-        };
-        if let Err(error) = pin1_verify_guard(pin1_status) {
-            clear_positive(pin_cache);
-            return Err(error);
-        }
-        let card_events = backend
-            .card_events(reader)
-            .map_err(|_status_err| CKR_DEVICE_ERROR)?;
-        // The cache mutex is bookkeeping and is never held across a card
-        // exchange: rejection memory is consulted and released before
-        // the VERIFY, and the answer is settled under a second lock. The
-        // reader's lane, held above, serialises PIN-bearing operations.
-        let rejected = pin_cache
-            .lock()
-            .map_err(|_poisoned| CKR_DEVICE_ERROR)?
-            .is_rejected(&serial, &pin1);
-        if rejected {
-            return Err(CKR_PIN_INCORRECT);
-        }
-        let secret = refineid_auth::UnvalidatedSecret::from_owned_bytes(pin1.as_bytes().to_vec());
-        let Ok(pin1_val) = refineid_auth::Pin1::reconstruct(secret) else {
-            return Err(CKR_PIN_INCORRECT);
-        };
-        let outcome = card
-            .verify_pin1(pin1_val)
-            .map_err(|_verify_err| CKR_DEVICE_ERROR)?;
-        let mut cache = pin_cache.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?;
-        settle_login(&mut cache, serial, card_events, pin1, pin1_status, outcome)
+    let lane = card_lane(reader).inspect_err(|_lane_err| clear_positive(pin_cache))?;
+    let _turn = lane
+        .lock()
+        .inspect_err(|_poisoned| clear_positive(pin_cache))
+        .map_err(|_poisoned| CKR_DEVICE_ERROR)?;
+    let Ok(card) = backend.open_session(reader, ReaderAccessCap::PinSequence) else {
+        clear_positive(pin_cache);
+        return Err(CKR_DEVICE_ERROR);
+    };
+    card.pin_sequence(|mut card| {
+        run_card_login(
+            &mut card,
+            || {
+                backend
+                    .card_events(reader)
+                    .map_err(|_status_err| CKR_DEVICE_ERROR)
+            },
+            pin_cache,
+            pin1,
+        )
     })
+    .inspect_err(|_transaction_err| clear_positive(pin_cache))
     .map_err(|_transaction_err| CKR_DEVICE_ERROR)?
 }
 
+/// Run the card-session steps of [`card_login`] against `card` and
+/// `read_card_events`, destroying any held PIN1 when a pre-VERIFY read,
+/// the retry floor, or the VERIFY itself fails.
+fn run_card_login<T, F>(
+    card: &mut T,
+    read_card_events: F,
+    pin_cache: &Arc<Mutex<PinSafetyCache>>,
+    pin1: PinBytes,
+) -> Result<(), CkRv>
+where
+    T: CardTransport,
+    F: FnOnce() -> Result<u32, CkRv>,
+{
+    if card.select_pkcs15_application().is_err() {
+        clear_positive(pin_cache);
+        return Err(CKR_DEVICE_ERROR);
+    }
+    let serial = match live_token_serial(card) {
+        Ok(serial) => serial,
+        Err(error) => {
+            clear_positive(pin_cache);
+            return Err(error);
+        }
+    };
+    let pin1_status = match card.pin_status(PinSlot::Pin1) {
+        Ok(status) => status,
+        Err(_status_err) => {
+            clear_positive(pin_cache);
+            return Err(CKR_DEVICE_ERROR);
+        }
+    };
+    if !pin1_status_permits_reusable_cache(pin1_status) {
+        clear_positive(pin_cache);
+    }
+    if let Err(error) = pin1_verify_guard(pin1_status) {
+        clear_positive(pin_cache);
+        return Err(error);
+    }
+    let card_events = match read_card_events() {
+        Ok(events) => events,
+        Err(error) => {
+            clear_positive(pin_cache);
+            return Err(error);
+        }
+    };
+    // The cache mutex is bookkeeping and is never held across a card
+    // exchange: rejection memory is consulted and released before
+    // the VERIFY, and the answer is settled under a second lock. The
+    // reader's lane, held by `card_login`, serialises PIN-bearing
+    // operations.
+    {
+        let mut cache = pin_cache.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?;
+        if cache.is_rejected(&serial, &pin1) {
+            cache.clear_positive();
+            return Err(CKR_PIN_INCORRECT);
+        }
+    }
+    let secret = refineid_auth::UnvalidatedSecret::from_owned_bytes(pin1.as_bytes().to_vec());
+    let Ok(pin1_val) = refineid_auth::Pin1::reconstruct(secret) else {
+        clear_positive(pin_cache);
+        return Err(CKR_PIN_INCORRECT);
+    };
+    let outcome = match card.verify_pin1(pin1_val) {
+        Ok(outcome) => outcome,
+        Err(AuthError::RetryFloor(refusal)) => {
+            clear_positive(pin_cache);
+            return Err(retry_floor_rv(refusal));
+        }
+        Err(
+            AuthError::Transport(_)
+            | AuthError::Outcome(_)
+            | AuthError::Command(_)
+            | AuthError::PinLength(_),
+        ) => {
+            clear_positive(pin_cache);
+            return Err(CKR_DEVICE_ERROR);
+        }
+    };
+    let mut cache = pin_cache.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?;
+    settle_login(&mut cache, serial, card_events, pin1, outcome)
+}
+
 /// Settle a `C_Login` VERIFY by the card's answer: hold an accepted
-/// value when `pin1_status`, read before the VERIFY, was pristine,
-/// stage it for one operation otherwise; remember a refused value as
-/// rejected; keep nothing for a blocked PIN or any other status word.
+/// value (whose counter the card has restored to its five-try limit per
+/// FINEID S1 v4.2 section 3.5); remember a refused value as rejected;
+/// clear any held value for a blocked PIN or any other status word.
 fn settle_login(
     cache: &mut PinSafetyCache,
     serial: TokenSerial,
     card_events: u32,
     pin1: PinBytes,
-    pin1_status: PinStatus,
     outcome: VerifyOutcome,
 ) -> Result<(), CkRv> {
     match outcome {
-        VerifyOutcome::Ok => {
-            let stored = if pin1_status_permits_reusable_cache(pin1_status) {
-                cache.store_pin1(serial, card_events, pin1)
-            } else {
-                cache.stage_pin1_once(serial, card_events, pin1)
-            };
-            stored.map_err(|_rejected| CKR_PIN_INCORRECT)
-        }
+        VerifyOutcome::Ok => cache
+            .store_pin1(serial, card_events, pin1)
+            .inspect_err(|_rejected| cache.clear_positive())
+            .map_err(|_rejected| CKR_PIN_INCORRECT),
         VerifyOutcome::WrongPin { .. } => {
             cache.record_rejected(&serial, &pin1);
             Err(CKR_PIN_INCORRECT)
         }
-        VerifyOutcome::Locked => Err(CKR_PIN_LOCKED),
-        VerifyOutcome::Other(_sw) => Err(CKR_DEVICE_ERROR),
+        VerifyOutcome::Locked => {
+            cache.clear_positive();
+            Err(CKR_PIN_LOCKED)
+        }
+        VerifyOutcome::Other(_sw) => {
+            cache.clear_positive();
+            Err(CKR_DEVICE_ERROR)
+        }
     }
 }
 
@@ -1974,9 +2074,10 @@ fn live_token_serial<T: CardTransport>(card: &mut T) -> Result<TokenSerial, CkRv
 }
 
 fn clear_positive(pin_cache: &Arc<Mutex<PinSafetyCache>>) {
-    if let Ok(mut cache) = pin_cache.lock() {
-        cache.clear_positive();
-    }
+    pin_cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear_positive();
 }
 
 /// Change PIN1 on the card at `reader_name`.
@@ -3091,12 +3192,32 @@ mod tests {
     const RETRIES_PRISTINE: u8 = 5;
     /// Retry count after one refused presentation.
     const RETRIES_ONE_SPENT: u8 = 4;
+    /// Lowest retry count at which an attempt is served with tries to spare.
+    const RETRIES_FLOOR: u8 = 3;
+    /// Highest retry count refused by the retry floor.
+    const RETRIES_BELOW_FLOOR: u8 = 2;
+    /// Lowest non-zero retry count refused by the retry floor.
+    const RETRIES_LOCKDOWN_IMMINENT: u8 = 1;
     const DECIMAL_DIGIT_RADIX: u8 = 10;
+    /// Universal DER SEQUENCE tag (constructed, X.690 s8.9).
+    const DER_TAG_SEQUENCE: u8 = 0x30;
+    /// Chunk size requested by `read_binary_der_object` for `EF.TokenInfo`.
+    const TOKEN_INFO_READ_CHUNK: u8 = 0xDF;
+    /// Repeated signature checkouts exercised after a settled login.
+    const REPEATED_SIGN_USES: usize = 3;
     /// A synthetic card serial for the login settlement tests.
     const LOGIN_CARD_SERIAL: &str = "CARD-LOGIN-FULL-SERIAL";
 
     fn login_cache() -> super::PinSafetyCache {
         super::PinSafetyCache::new().expect("operating system random source is available")
+    }
+
+    fn held_login_cache() -> super::PinSafetyCache {
+        let mut cache = login_cache();
+        cache
+            .store_pin1(login_serial(), LOGIN_READER_EVENTS, random_pin())
+            .expect("fresh random PIN1 is accepted into the cache");
+        cache
     }
 
     /// The reader's card-event count across a login and its use.
@@ -3150,20 +3271,21 @@ mod tests {
     }
 
     #[test]
-    fn settle_login_holds_an_accepted_pin1_under_a_pristine_counter() {
+    fn settle_login_holds_an_accepted_pin1_for_reuse() {
         let mut cache = login_cache();
         let res = super::settle_login(
             &mut cache,
             login_serial(),
             LOGIN_READER_EVENTS,
             random_pin(),
-            remaining(RETRIES_PRISTINE),
             super::VerifyOutcome::Ok,
         );
         assert_eq!(res, Ok(()));
         assert!(cache.holds_pin1());
-        use_once(&mut cache);
-        assert!(cache.holds_pin1());
+        for _ in 0..REPEATED_SIGN_USES {
+            use_once(&mut cache);
+            assert!(cache.holds_pin1());
+        }
         assert!(
             cache
                 .checkout_pin1(
@@ -3176,34 +3298,8 @@ mod tests {
     }
 
     #[test]
-    fn settle_login_stages_an_accepted_pin1_under_a_spent_counter() {
-        let mut cache = login_cache();
-        let res = super::settle_login(
-            &mut cache,
-            login_serial(),
-            LOGIN_READER_EVENTS,
-            random_pin(),
-            remaining(RETRIES_ONE_SPENT),
-            super::VerifyOutcome::Ok,
-        );
-        assert_eq!(res, Ok(()));
-        assert!(cache.holds_pin1());
-        use_once(&mut cache);
-        assert!(!cache.holds_pin1());
-        assert!(
-            cache
-                .checkout_pin1(
-                    &login_serial(),
-                    LOGIN_READER_EVENTS,
-                    remaining(RETRIES_PRISTINE)
-                )
-                .is_none()
-        );
-    }
-
-    #[test]
     fn settle_login_remembers_a_refused_pin1() {
-        let mut cache = login_cache();
+        let mut cache = held_login_cache();
         let digits = random_digits();
         let pin = pin_from(&digits);
         let res = super::settle_login(
@@ -3211,7 +3307,6 @@ mod tests {
             login_serial(),
             LOGIN_READER_EVENTS,
             pin_from(&digits),
-            remaining(RETRIES_PRISTINE),
             super::VerifyOutcome::WrongPin {
                 retries_left: retries(RETRIES_ONE_SPENT),
             },
@@ -3222,7 +3317,7 @@ mod tests {
     }
 
     #[test]
-    fn settle_login_maps_locked_and_other() {
+    fn settle_login_maps_locked_and_other_and_clears_held_pin1() {
         for (outcome, expected) in [
             (super::VerifyOutcome::Locked, CKR_PIN_LOCKED),
             (
@@ -3230,17 +3325,722 @@ mod tests {
                 CKR_DEVICE_ERROR,
             ),
         ] {
-            let mut cache = login_cache();
+            let mut cache = held_login_cache();
             let res = super::settle_login(
                 &mut cache,
                 login_serial(),
                 LOGIN_READER_EVENTS,
                 random_pin(),
-                remaining(RETRIES_PRISTINE),
                 outcome,
             );
             assert_eq!(res, Err(expected));
             assert!(!cache.holds_pin1());
         }
+    }
+
+    fn apdu_response(body: &[u8], sw: StatusWord) -> refineid_apdu::ResponseApdu {
+        let [sw1, sw2] = sw.as_u16().to_be_bytes();
+        refineid_apdu::ResponseApdu {
+            body: body.to_vec(),
+            sw1,
+            sw2,
+        }
+    }
+
+    fn select_pkcs15_wire() -> Vec<u8> {
+        let aid = refineid_apdu::Aid::from_slice(refineid_pkcs15::PKCS15_AID)
+            .expect("published PKCS#15 AID length is valid");
+        refineid_apdu::iso7816::SelectByAidNoFci { aid }
+            .into_apdu()
+            .as_bytes()
+            .to_vec()
+    }
+
+    fn select_token_info_wire() -> Vec<u8> {
+        refineid_apdu::iso7816::SelectEfNoFci {
+            fid: refineid_pkcs15::EF_TOKEN_INFO_FID,
+        }
+        .into_apdu()
+        .as_bytes()
+        .to_vec()
+    }
+
+    fn read_token_info_wire() -> Vec<u8> {
+        let offset = refineid_apdu::iso7816::DirectOffset15::try_new(0)
+            .expect("zero offset fits DirectOffset15");
+        refineid_apdu::iso7816::ReadBinary {
+            class: refineid_apdu::ApduClass::Plain,
+            offset: refineid_apdu::iso7816::ReadBinaryOffset::Direct(offset),
+            le: TOKEN_INFO_READ_CHUNK,
+        }
+        .into_apdu()
+        .as_bytes()
+        .to_vec()
+    }
+
+    fn pin1_probe_wire() -> Vec<u8> {
+        refineid_apdu::CommandApdu::case_1(refineid_apdu::CommandHeader {
+            class: refineid_apdu::ApduClass::Plain,
+            instruction: refineid_auth::verify::VERIFY_INS,
+            p1: refineid_auth::verify::VERIFY_P1,
+            p2: refineid_auth::PIN1_REFERENCE,
+        })
+        .as_bytes()
+        .to_vec()
+    }
+
+    fn token_info_der_fixture() -> Vec<u8> {
+        let version = der_integer(&[1]);
+        let serial = der_octet_string(LOGIN_CARD_SERIAL.as_bytes());
+        let content_len = version.len().saturating_add(serial.len());
+        let mut out = Vec::with_capacity(content_len.saturating_add(2));
+        out.push(DER_TAG_SEQUENCE);
+        super::push_der_len(&mut out, content_len);
+        out.extend_from_slice(&version);
+        out.extend_from_slice(&serial);
+        out
+    }
+
+    struct ScriptedLoginCard {
+        plain_steps: Vec<(Vec<u8>, Result<refineid_apdu::ResponseApdu, String>)>,
+        cursor: usize,
+        credential_outcome: Option<Result<StatusWord, String>>,
+        credentials_sent: usize,
+        on_credential: Option<Box<dyn FnMut()>>,
+    }
+
+    impl ScriptedLoginCard {
+        fn new(
+            plain_steps: Vec<(Vec<u8>, Result<refineid_apdu::ResponseApdu, String>)>,
+            credential_outcome: Option<Result<StatusWord, String>>,
+        ) -> Self {
+            Self {
+                plain_steps,
+                cursor: 0,
+                credential_outcome,
+                credentials_sent: 0,
+                on_credential: None,
+            }
+        }
+
+        fn with_credential_hook(mut self, hook: impl FnMut() + 'static) -> Self {
+            self.on_credential = Some(Box::new(hook));
+            self
+        }
+
+        fn assert_drained(&self) {
+            assert_eq!(
+                self.cursor,
+                self.plain_steps.len(),
+                "all scripted plain commands must be consumed"
+            );
+        }
+    }
+
+    impl super::CardTransport for ScriptedLoginCard {
+        type Error = String;
+
+        fn transmit(
+            &mut self,
+            command: &refineid_apdu::CommandApdu,
+        ) -> Result<refineid_apdu::TransportOutcome, Self::Error> {
+            let (expected, scripted) = self
+                .plain_steps
+                .get(self.cursor)
+                .ok_or_else(|| format!("plain script exhausted at step {}", self.cursor))?;
+            assert_eq!(
+                expected,
+                command.as_bytes(),
+                "unexpected plain APDU at step {}",
+                self.cursor
+            );
+            self.cursor += 1;
+            let reply = scripted.clone()?;
+            Ok(refineid_apdu::TransportOutcome::Response(reply))
+        }
+
+        fn transmit_credential(
+            &mut self,
+            _command: refineid_apdu::CredentialCommand,
+        ) -> Result<refineid_apdu::TransportOutcome, Self::Error> {
+            self.credentials_sent += 1;
+            if let Some(hook) = &mut self.on_credential {
+                hook();
+            }
+            let outcome = self
+                .credential_outcome
+                .take()
+                .ok_or_else(|| "unexpected credential command".to_owned())??;
+            Ok(refineid_apdu::TransportOutcome::Response(apdu_response(
+                &[],
+                outcome,
+            )))
+        }
+    }
+
+    fn pre_verify_steps_with_probe(
+        probe_reply: Result<refineid_apdu::ResponseApdu, String>,
+    ) -> Vec<(Vec<u8>, Result<refineid_apdu::ResponseApdu, String>)> {
+        let token_info = token_info_der_fixture();
+        vec![
+            (
+                select_pkcs15_wire(),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (
+                select_pkcs15_wire(),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (
+                select_token_info_wire(),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (
+                read_token_info_wire(),
+                Ok(apdu_response(&token_info, StatusWord::Success)),
+            ),
+            (pin1_probe_wire(), probe_reply),
+        ]
+    }
+
+    #[test]
+    fn run_card_login_holds_accepted_pin1_across_allowed_pre_verify_states() {
+        for pre_verify_sw in [
+            StatusWord::PinIncorrect {
+                retries: retries(RETRIES_PRISTINE),
+            },
+            StatusWord::Success,
+            StatusWord::PinIncorrect {
+                retries: retries(RETRIES_ONE_SPENT),
+            },
+            StatusWord::PinIncorrect {
+                retries: retries(RETRIES_FLOOR),
+            },
+        ] {
+            let mut steps = pre_verify_steps_with_probe(Ok(apdu_response(&[], pre_verify_sw)));
+            steps.push((pin1_probe_wire(), Ok(apdu_response(&[], pre_verify_sw))));
+            let mut card = ScriptedLoginCard::new(steps, Some(Ok(StatusWord::Success)));
+            let pin_cache = std::sync::Arc::new(std::sync::Mutex::new(login_cache()));
+
+            let res = super::run_card_login(
+                &mut card,
+                || Ok(LOGIN_READER_EVENTS),
+                &pin_cache,
+                random_pin(),
+            );
+            assert_eq!(res, Ok(()));
+            card.assert_drained();
+            assert_eq!(card.credentials_sent, 1);
+
+            let mut cache = pin_cache.lock().expect("cache mutex is unpoisoned");
+            assert!(cache.holds_pin1());
+            for _ in 0..REPEATED_SIGN_USES {
+                use_once(&mut cache);
+                assert!(
+                    cache.holds_pin1(),
+                    "card-confirmed login must hold PIN1 for reuse without a one-use bridge"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn run_card_login_clears_held_pin1_when_card_events_read_fails() {
+        let steps = pre_verify_steps_with_probe(Ok(apdu_response(
+            &[],
+            StatusWord::PinIncorrect {
+                retries: retries(RETRIES_PRISTINE),
+            },
+        )));
+        let mut card = ScriptedLoginCard::new(steps, None);
+        let pin_cache = std::sync::Arc::new(std::sync::Mutex::new(held_login_cache()));
+
+        let res = super::run_card_login(
+            &mut card,
+            || Err(CKR_DEVICE_ERROR),
+            &pin_cache,
+            random_pin(),
+        );
+        assert_eq!(res, Err(CKR_DEVICE_ERROR));
+        card.assert_drained();
+        assert_eq!(card.credentials_sent, 0);
+        assert!(
+            !pin_cache
+                .lock()
+                .expect("cache mutex is unpoisoned")
+                .holds_pin1()
+        );
+    }
+
+    #[test]
+    fn run_card_login_clears_held_pin1_on_pre_verify_and_verify_failures() {
+        let select_failed = vec![(
+            select_pkcs15_wire(),
+            Ok(apdu_response(&[], StatusWord::FileNotFound)),
+        )];
+        let token_info_failed = vec![
+            (
+                select_pkcs15_wire(),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (
+                select_pkcs15_wire(),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (
+                select_token_info_wire(),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (
+                read_token_info_wire(),
+                Ok(apdu_response(&[], StatusWord::FileNotFound)),
+            ),
+        ];
+        let probe_transport_failed = pre_verify_steps_with_probe(Err("probe fault".to_owned()));
+        let floor_two_left = pre_verify_steps_with_probe(Ok(apdu_response(
+            &[],
+            StatusWord::PinIncorrect {
+                retries: retries(RETRIES_BELOW_FLOOR),
+            },
+        )));
+        let floor_one_left = pre_verify_steps_with_probe(Ok(apdu_response(
+            &[],
+            StatusWord::PinIncorrect {
+                retries: retries(RETRIES_LOCKDOWN_IMMINENT),
+            },
+        )));
+        let floor_unreadable =
+            pre_verify_steps_with_probe(Ok(apdu_response(&[], StatusWord::AuthenticationFailed)));
+        let mut verify_probe_floor_failed = pre_verify_steps_with_probe(Ok(apdu_response(
+            &[],
+            StatusWord::PinIncorrect {
+                retries: retries(RETRIES_FLOOR),
+            },
+        )));
+        verify_probe_floor_failed.push((
+            pin1_probe_wire(),
+            Ok(apdu_response(
+                &[],
+                StatusWord::PinIncorrect {
+                    retries: retries(RETRIES_BELOW_FLOOR),
+                },
+            )),
+        ));
+        let mut verify_transport_failed = pre_verify_steps_with_probe(Ok(apdu_response(
+            &[],
+            StatusWord::PinIncorrect {
+                retries: retries(RETRIES_PRISTINE),
+            },
+        )));
+        verify_transport_failed.push((
+            pin1_probe_wire(),
+            Ok(apdu_response(
+                &[],
+                StatusWord::PinIncorrect {
+                    retries: retries(RETRIES_PRISTINE),
+                },
+            )),
+        ));
+
+        for (steps, credential_outcome, expected_rv, expected_credentials) in [
+            (select_failed, None, CKR_DEVICE_ERROR, 0),
+            (token_info_failed, None, CKR_DEVICE_ERROR, 0),
+            (probe_transport_failed, None, CKR_DEVICE_ERROR, 0),
+            (floor_two_left, None, CKR_PIN_LOCKED, 0),
+            (floor_one_left, None, CKR_PIN_LOCKED, 0),
+            (floor_unreadable, None, CKR_DEVICE_ERROR, 0),
+            (verify_probe_floor_failed, None, CKR_PIN_LOCKED, 0),
+            (
+                verify_transport_failed,
+                Some(Err("verify fault".to_owned())),
+                CKR_DEVICE_ERROR,
+                1,
+            ),
+        ] {
+            let mut card = ScriptedLoginCard::new(steps, credential_outcome);
+            let pin_cache = std::sync::Arc::new(std::sync::Mutex::new(held_login_cache()));
+            let res = super::run_card_login(
+                &mut card,
+                || Ok(LOGIN_READER_EVENTS),
+                &pin_cache,
+                random_pin(),
+            );
+            assert_eq!(res, Err(expected_rv));
+            card.assert_drained();
+            assert_eq!(card.credentials_sent, expected_credentials);
+            assert!(
+                !pin_cache
+                    .lock()
+                    .expect("cache mutex is unpoisoned")
+                    .holds_pin1()
+            );
+        }
+    }
+
+    #[test]
+    fn run_card_login_destroys_prior_held_pin1_before_verify_under_spent_counter() {
+        for (pre_verify_sw, verify_sw, expected_res, expected_held_after) in [
+            (
+                StatusWord::PinIncorrect {
+                    retries: retries(RETRIES_ONE_SPENT),
+                },
+                StatusWord::Success,
+                Ok(()),
+                true,
+            ),
+            (
+                StatusWord::PinIncorrect {
+                    retries: retries(RETRIES_FLOOR),
+                },
+                StatusWord::Success,
+                Ok(()),
+                true,
+            ),
+            (
+                StatusWord::AuthenticationBlocked,
+                StatusWord::AuthenticationBlocked,
+                Err(CKR_PIN_LOCKED),
+                false,
+            ),
+        ] {
+            let mut steps = pre_verify_steps_with_probe(Ok(apdu_response(&[], pre_verify_sw)));
+            steps.push((pin1_probe_wire(), Ok(apdu_response(&[], pre_verify_sw))));
+            let pin_cache = std::sync::Arc::new(std::sync::Mutex::new(held_login_cache()));
+            let cache_in_flight = std::sync::Arc::clone(&pin_cache);
+            let saw_cleared_in_flight =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let recorded_flag = std::sync::Arc::clone(&saw_cleared_in_flight);
+            let mut card = ScriptedLoginCard::new(steps, Some(Ok(verify_sw))).with_credential_hook(
+                move || {
+                    let held = cache_in_flight
+                        .lock()
+                        .expect("cache mutex is unpoisoned")
+                        .holds_pin1();
+                    recorded_flag.store(!held, std::sync::atomic::Ordering::SeqCst);
+                },
+            );
+
+            let res = super::run_card_login(
+                &mut card,
+                || Ok(LOGIN_READER_EVENTS),
+                &pin_cache,
+                random_pin(),
+            );
+            assert_eq!(res, expected_res);
+            card.assert_drained();
+            assert_eq!(card.credentials_sent, 1);
+            assert!(
+                saw_cleared_in_flight.load(std::sync::atomic::Ordering::SeqCst),
+                "disqualifying pre-VERIFY probe must clear prior held PIN1 before VERIFY runs"
+            );
+            assert_eq!(
+                pin_cache
+                    .lock()
+                    .expect("cache mutex is unpoisoned")
+                    .holds_pin1(),
+                expected_held_after
+            );
+        }
+    }
+
+    #[test]
+    fn session_open_failures_clear_held_pin1_across_sign_and_login() {
+        let digest = refineid_digest::Sha256::of(b"sign input when reader open fails");
+        let sign_cache = std::sync::Arc::new(std::sync::Mutex::new(held_login_cache()));
+        let sign_res = super::card_sign(
+            &impersonating_local_kind(),
+            &sign_cache,
+            crate::sign::Mechanism::Ecdsa,
+            digest.as_bytes(),
+        );
+        assert_eq!(sign_res, Err(CKR_DEVICE_ERROR));
+        assert!(
+            !sign_cache
+                .lock()
+                .expect("cache mutex is unpoisoned")
+                .holds_pin1()
+        );
+
+        let login_cache_arc = std::sync::Arc::new(std::sync::Mutex::new(held_login_cache()));
+        let login_res =
+            super::card_login(&impersonating_local_kind(), &login_cache_arc, random_pin());
+        assert_eq!(login_res, Err(CKR_DEVICE_ERROR));
+        assert!(
+            !login_cache_arc
+                .lock()
+                .expect("cache mutex is unpoisoned")
+                .holds_pin1()
+        );
+    }
+
+    #[test]
+    fn run_card_sign_clears_held_pin1_on_disqualifying_or_failed_probes() {
+        let digest = refineid_digest::Sha256::of(b"sign input under disqualifying probe");
+
+        for (steps, read_events_res, expected_rv) in [
+            (
+                vec![(
+                    select_pkcs15_wire(),
+                    Ok(apdu_response(&[], StatusWord::FileNotFound)),
+                )],
+                Ok(LOGIN_READER_EVENTS),
+                CKR_DEVICE_ERROR,
+            ),
+            (
+                pre_verify_steps_with_probe(Err("probe fault".to_owned())),
+                Ok(LOGIN_READER_EVENTS),
+                CKR_DEVICE_ERROR,
+            ),
+            (
+                pre_verify_steps_with_probe(Ok(apdu_response(
+                    &[],
+                    StatusWord::PinIncorrect {
+                        retries: retries(RETRIES_PRISTINE),
+                    },
+                ))),
+                Err(CKR_DEVICE_ERROR),
+                CKR_DEVICE_ERROR,
+            ),
+            (
+                pre_verify_steps_with_probe(Ok(apdu_response(
+                    &[],
+                    StatusWord::PinIncorrect {
+                        retries: retries(RETRIES_ONE_SPENT),
+                    },
+                ))),
+                Ok(LOGIN_READER_EVENTS),
+                crate::ck::CKR_USER_NOT_LOGGED_IN,
+            ),
+            (
+                pre_verify_steps_with_probe(Ok(apdu_response(
+                    &[],
+                    StatusWord::PinIncorrect {
+                        retries: retries(RETRIES_FLOOR),
+                    },
+                ))),
+                Ok(LOGIN_READER_EVENTS),
+                crate::ck::CKR_USER_NOT_LOGGED_IN,
+            ),
+            (
+                pre_verify_steps_with_probe(Ok(apdu_response(
+                    &[],
+                    StatusWord::PinIncorrect {
+                        retries: retries(RETRIES_BELOW_FLOOR),
+                    },
+                ))),
+                Ok(LOGIN_READER_EVENTS),
+                CKR_PIN_LOCKED,
+            ),
+            (
+                pre_verify_steps_with_probe(Ok(apdu_response(
+                    &[],
+                    StatusWord::AuthenticationBlocked,
+                ))),
+                Ok(LOGIN_READER_EVENTS),
+                CKR_PIN_LOCKED,
+            ),
+            (
+                pre_verify_steps_with_probe(Ok(apdu_response(
+                    &[],
+                    StatusWord::AuthenticationFailed,
+                ))),
+                Ok(LOGIN_READER_EVENTS),
+                CKR_DEVICE_ERROR,
+            ),
+        ] {
+            let mut card = ScriptedLoginCard::new(steps, None);
+            let pin_cache = std::sync::Arc::new(std::sync::Mutex::new(held_login_cache()));
+            let request =
+                crate::sign::CardSignInput::parse(crate::sign::Mechanism::Ecdsa, digest.as_bytes())
+                    .expect("non-degenerate SHA-256 ECDSA digest parses");
+            let res = super::run_card_sign(&mut card, || read_events_res, &pin_cache, request);
+            assert_eq!(res, Err(expected_rv));
+            card.assert_drained();
+            assert_eq!(card.credentials_sent, 0);
+            assert!(
+                !pin_cache
+                    .lock()
+                    .expect("cache mutex is unpoisoned")
+                    .holds_pin1()
+            );
+        }
+    }
+
+    #[test]
+    fn run_card_sign_settles_accepted_wrong_locked_and_floor_outcomes() {
+        const SIGNATURE_FILL: u8 = 0x5A;
+        let digest = refineid_digest::Sha384::of(b"ecdsa p384 sign settlement test");
+        let signature = vec![SIGNATURE_FILL; super::ECDSA_P384_SIGNATURE_BYTES];
+        let mse_wire = refineid_sign::commands::MseSet {
+            alg_ref: refineid_sign::commands::SignatureAlgRef::SHA384_ECDSA,
+            key_ref: refineid_sign::KeyRef::Auth.reference(refineid_sign::SignScheme::Citizen),
+        }
+        .into_apdu()
+        .expect("MSE:Set encodes")
+        .as_bytes()
+        .to_vec();
+        let hash_wire = refineid_sign::commands::PsoHashExternal {
+            hash: refineid_sign::commands::ExternalHashValue::Sha384(*digest.as_bytes()),
+        }
+        .into_apdu()
+        .expect("PSO:HASH encodes")
+        .as_bytes()
+        .to_vec();
+        let cds_le = refineid_sign::commands::expected_length_le(super::ECDSA_P384_SIGNATURE_BYTES);
+        let cds_wire = refineid_sign::commands::PsoComputeDigitalSignature
+            .into_apdu(cds_le)
+            .as_bytes()
+            .to_vec();
+
+        let sign_cache = std::sync::Arc::new(std::sync::Mutex::new(held_login_cache()));
+        for _ in 0..REPEATED_SIGN_USES {
+            let mut steps = pre_verify_steps_with_probe(Ok(apdu_response(
+                &[],
+                StatusWord::PinIncorrect {
+                    retries: retries(RETRIES_PRISTINE),
+                },
+            )));
+            steps.push((
+                pin1_probe_wire(),
+                Ok(apdu_response(
+                    &[],
+                    StatusWord::PinIncorrect {
+                        retries: retries(RETRIES_PRISTINE),
+                    },
+                )),
+            ));
+            steps.push((
+                mse_wire.clone(),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ));
+            steps.push((
+                hash_wire.clone(),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ));
+            steps.push((
+                cds_wire.clone(),
+                Ok(apdu_response(&signature, StatusWord::Success)),
+            ));
+            let mut card = ScriptedLoginCard::new(steps, Some(Ok(StatusWord::Success)));
+            let request =
+                crate::sign::CardSignInput::parse(crate::sign::Mechanism::Ecdsa, digest.as_bytes())
+                    .expect("SHA-384 ECDSA digest parses");
+            let res =
+                super::run_card_sign(&mut card, || Ok(LOGIN_READER_EVENTS), &sign_cache, request);
+            assert_eq!(res, Ok(signature.clone()));
+            card.assert_drained();
+            assert_eq!(card.credentials_sent, 1);
+            assert!(
+                sign_cache
+                    .lock()
+                    .expect("cache mutex is unpoisoned")
+                    .holds_pin1()
+            );
+        }
+
+        let wrong_digits = random_digits();
+        let mut wrong_cache_inner = login_cache();
+        wrong_cache_inner
+            .store_pin1(login_serial(), LOGIN_READER_EVENTS, pin_from(&wrong_digits))
+            .expect("fresh random PIN1 stores cleanly");
+        let wrong_cache = std::sync::Arc::new(std::sync::Mutex::new(wrong_cache_inner));
+        let mut wrong_steps = pre_verify_steps_with_probe(Ok(apdu_response(
+            &[],
+            StatusWord::PinIncorrect {
+                retries: retries(RETRIES_PRISTINE),
+            },
+        )));
+        wrong_steps.push((
+            pin1_probe_wire(),
+            Ok(apdu_response(
+                &[],
+                StatusWord::PinIncorrect {
+                    retries: retries(RETRIES_PRISTINE),
+                },
+            )),
+        ));
+        let mut wrong_card = ScriptedLoginCard::new(
+            wrong_steps,
+            Some(Ok(StatusWord::PinIncorrect {
+                retries: retries(RETRIES_ONE_SPENT),
+            })),
+        );
+        let wrong_req =
+            crate::sign::CardSignInput::parse(crate::sign::Mechanism::Ecdsa, digest.as_bytes())
+                .expect("SHA-384 ECDSA digest parses");
+        assert_eq!(
+            super::run_card_sign(
+                &mut wrong_card,
+                || Ok(LOGIN_READER_EVENTS),
+                &wrong_cache,
+                wrong_req
+            ),
+            Err(crate::ck::CKR_PIN_INCORRECT)
+        );
+        wrong_card.assert_drained();
+        let wrong_guard = wrong_cache.lock().expect("cache mutex is unpoisoned");
+        assert!(!wrong_guard.holds_pin1());
+        assert!(wrong_guard.is_rejected(&login_serial(), &pin_from(&wrong_digits)));
+        drop(wrong_guard);
+
+        for (second_probe_sw, cred_outcome, expected_rv, expected_creds) in [
+            (
+                StatusWord::PinIncorrect {
+                    retries: retries(RETRIES_PRISTINE),
+                },
+                Some(Ok(StatusWord::AuthenticationBlocked)),
+                CKR_PIN_LOCKED,
+                1,
+            ),
+            (
+                StatusWord::PinIncorrect {
+                    retries: retries(RETRIES_BELOW_FLOOR),
+                },
+                None,
+                CKR_PIN_LOCKED,
+                0,
+            ),
+        ] {
+            let mut steps = pre_verify_steps_with_probe(Ok(apdu_response(
+                &[],
+                StatusWord::PinIncorrect {
+                    retries: retries(RETRIES_PRISTINE),
+                },
+            )));
+            steps.push((pin1_probe_wire(), Ok(apdu_response(&[], second_probe_sw))));
+            let mut card = ScriptedLoginCard::new(steps, cred_outcome);
+            let cache = std::sync::Arc::new(std::sync::Mutex::new(held_login_cache()));
+            let req =
+                crate::sign::CardSignInput::parse(crate::sign::Mechanism::Ecdsa, digest.as_bytes())
+                    .expect("SHA-384 ECDSA digest parses");
+            assert_eq!(
+                super::run_card_sign(&mut card, || Ok(LOGIN_READER_EVENTS), &cache, req),
+                Err(expected_rv)
+            );
+            card.assert_drained();
+            assert_eq!(card.credentials_sent, expected_creds);
+            assert!(
+                !cache
+                    .lock()
+                    .expect("cache mutex is unpoisoned")
+                    .holds_pin1()
+            );
+        }
+    }
+
+    #[test]
+    fn clear_positive_destroys_held_pin1_through_a_poisoned_mutex() {
+        let pin_cache = std::sync::Arc::new(std::sync::Mutex::new(held_login_cache()));
+        let poison_ref = std::sync::Arc::clone(&pin_cache);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = poison_ref.lock().expect("cache mutex starts unpoisoned");
+            panic!("poison cache mutex");
+        }));
+        assert!(pin_cache.is_poisoned());
+        super::clear_positive(&pin_cache);
+        let recovered = pin_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!recovered.holds_pin1());
     }
 }

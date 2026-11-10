@@ -17,11 +17,12 @@ Implemented:
   `C_GetTokenInfo`, `C_GetMechanismList`, `C_GetMechanismInfo`, `C_WaitForSlotEvent` (non-blocking: reports card insertion / removal events, so NSS notices a card without a browser restart).
 - Sessions: `C_OpenSession` (serial, read-only), `C_CloseSession`, `C_CloseAllSessions`, `C_GetSessionInfo`.
 - Login: `C_Login` (`CKU_USER` only), `C_Logout`.
-  PIN1 is validated as 4..=12 ASCII digits and verified on the card.
-  Once the card accepts it under a pristine retry counter, it is held in this process's memory with no idle window,
-  until the card is removed or replaced, the card refuses it, its retry counter reads below pristine,
-  or `C_Logout`, the last `C_CloseSession` or `C_Finalize` ends the login;
-  under a counter below pristine it only bridges to the next operation.
+  PIN1 is validated as 4..=12 ASCII digits and verified on the card once its retry floor allows the attempt.
+  An accepted `VERIFY` restores PIN1's retry counter to its five-try limit (FINEID S1 v4.2 section 3.5),
+  and the confirmed PIN1 is held in this process's memory with no idle window or login bridge,
+  until the card is removed or replaced, the card refuses it, any later pre-operation probe reports other than five tries left or verified,
+  a card or reader state read fails,
+  or `C_Logout`, the last `C_CloseSession` or `C_Finalize` ends the login.
   It is presented to the card inside each sign, never logged, and never written to storage
   (see [credential custody](../../doc/security/credential-custody.md)).
 - Objects: `C_FindObjectsInit` / `C_FindObjects` / `C_FindObjectsFinal` and `C_GetAttributeValue` over

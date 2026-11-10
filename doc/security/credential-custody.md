@@ -113,19 +113,24 @@ countdown. It is never written to storage -- not to a keychain, a keystore, a
 credential manager or a file -- so it never survives a restart (RAPP v26.11.8
 section 11 item 2).
 
-Reusable retention is allowed only when the PIN1 retry counter is at its
-limit. The probe that precedes every authentication operation, whether or not
-the operation will carry the PIN, decides it anew: a probe reading five tries
-left, or PIN1 verified in session, permits holding; any other reading destroys
-the held value before the card is commanded, and a freshly entered PIN1 is held
-only under such a probe. A verified answer carries no count and still proves a
-full counter: a successful VERIFY sets the counter to its limit and the flag,
+Reusable retention is allowed only when the PIN1 retry counter stands at its
+five-try limit; there is no one-use or timed login bridge below the limit.
+Before card-confirmed VERIFY success, a counter below five tries left never
+permits keeping or presenting a held PIN1. Once an allowed VERIFY is confirmed
+by the card -- including one entered at four or three tries left -- that
+acceptance sets the counter to its five-try limit and the validated flag
+(FINEID S1 v4.2 section 3.5), so the confirmed PIN1 may be held from that
+point. Every subsequent authentication operation probes anew before commanding
+the card, whether or not the operation will carry the PIN: a probe reading five
+tries left, or PIN1 verified in session, permits holding; any other reading, or
+a failed card or reader state read, destroys the held value before the card is
+commanded. A verified answer carries no count and still proves a full counter:
 a failed VERIFY or CHANGE REFERENCE DATA decrements the counter and clears the
 flag, and a successful CHANGE REFERENCE DATA or RESET RETRY COUNTER sets the
 counter to its limit with the flag cleared (FINEID S1 v4.2 sections 3.5, 3.11
-and 3.12). The held entry is bound to the complete card token identifier and the PIN1
-authentication role. Its capability excludes PIN
-management, PIN2, and qualified-signature operations.
+and 3.12). The held entry is bound to the complete card token identifier and
+the PIN1 authentication role. Its capability excludes PIN management, PIN2, and
+qualified-signature operations.
 
 Use is destructive checkout:
 
@@ -176,8 +181,8 @@ Held PIN1 is destroyed on:
   pairing holds no PIN 1 for a remote card: the phone reports its own
   PIN 1 state and the computer keeps only a logged-in flag, which goes
   with the slot when the pairing is forgotten; and
-- a probe reporting anything but five tries left or PIN1 verified: a lower
-  count, a blocked PIN, or no readable state.
+- a probe reporting anything but five tries left or PIN1 verified -- a lower
+  count, a blocked PIN, or no readable card or reader state.
 
 PIN2 is never held between operations, so it has nothing to invalidate.
 

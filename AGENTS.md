@@ -320,9 +320,54 @@ rule in a line and points to the reading behind it; the readings live in
   `scripts/dss-gate.sh`, in the pre-push floor
   ([doc/process/independent-validation.md](doc/process/independent-validation.md)).
 
+## Validation follows the change
+
+- Mandatory hooks select the validation lane; agents never bypass them.
+  Only explicitly allowlisted prose-only changes qualify for documentation
+  checks: whitespace and applicable repository-local links. Keep shared
+  working-method copies identical across the five active implementation repos.
+- Code, tests, dependencies, build configuration, gate scripts, mixed changes
+  and unknown paths retain the existing strict engineering gates. Agent skill
+  or confidence never waives those checks. Executable documentation and build
+  inputs do not qualify as prose merely because they use Markdown.
+- Commit classification covers the staged change. Push classification covers
+  every outgoing commit and ref, including changes later reverted. Uncertain
+  classification takes the full lane; a failed documentation check fails the
+  hook. Changing the classifier or its hooks requires the full lane itself.
+- Review and validation are separate: consequential policy changes need
+  independent review, but prose alone needs no application build, signing,
+  installation or hardware test. Install and hardware instructions apply only
+  when the change affects the relevant application or card behavior.
+
+## Proportionate review
+
+- Exercise judgment to advance the task. Follow security invariants without
+  exception. Apply process in proportion to risk and uncertainty; do not
+  create reviews, plans, delegation or documentation merely to show activity.
+  This discretion does not waive mandatory gates or required hardware evidence.
+- The front agent may self-review a trivial change whose complete effect is
+  readily apparent from the diff and which changes no executable behavior,
+  security policy, protocol meaning, dependency, build or release behavior,
+  or instruction governing agent authority. Examples are spelling, formatting,
+  an unambiguous documentation-link repair, and wording that preserves meaning.
+- Other changes require independent review proportionate to their consequences.
+  Credential custody, trust, cryptography, protocol state and card retry behavior
+  always require independent review. The Independent review section below
+  specifies how to run it when required.
+- Judge semantic effect, not line count or file extension. Investigate or seek
+  review when the effect is uncertain. Never split a consequential change into
+  trivial-looking patches to avoid review.
+- For a trivial change, the front agent's inspection of a worker's diff is
+  sufficient; do not recruit another reviewer merely because a worker wrote it.
+  State briefly in the pull request or handoff: "Self-reviewed: wording only;
+  meaning unchanged", or an equally short description of the actual effect.
+  No separate justification document or owner approval is needed.
+
 ## Independent review
 
-- Before a pull request merges, have its diff reviewed by a model from a
+These instructions apply when independent review is required above.
+
+- When independent review is required, before a pull request merges, have its diff reviewed by a model from a
   different family than the one that wrote it. Any CLI that runs a model
   headless will do; take the strongest model it offers that day, and add a
   second one for protocol, cryptography or state-machine changes.

@@ -13,8 +13,22 @@
 set -eu
 
 root=$(git rev-parse --show-toplevel)
+updates=$(mktemp "${TMPDIR:-/tmp}/refineid-push-updates.XXXXXX")
+trap 'rm -f "$updates"' EXIT INT TERM
+cat > "$updates"
+if python3 "$root/scripts/documentation-gate.py" push "${1:-origin}" < "$updates"; then
+    exit 0
+else
+    status=$?
+    [ "$status" -eq 1 ] || exit "$status"
+fi
+
 zero=0000000000000000000000000000000000000000
 head=$(git rev-parse HEAD)
+if [ ! -s "$updates" ]; then
+    "$root/scripts/verify-push.sh"
+    exit $?
+fi
 
 while read -r _local_ref local_sha _remote_ref _remote_sha; do
     if [ "$local_sha" = "$zero" ]; then
@@ -26,9 +40,9 @@ while read -r _local_ref local_sha _remote_ref _remote_sha; do
     fi
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/refineid-core-push.XXXXXX")
     git worktree add --detach --quiet "$tmp" "$local_sha"
-    trap 'git worktree remove --force "$tmp"' EXIT INT TERM
+    trap 'git worktree remove --force "$tmp"; rm -f "$updates"' EXIT INT TERM
     echo "pre-push: verifying $(git rev-parse --short "$local_sha") in a clean worktree"
     (cd "$tmp" && CARGO_TARGET_DIR="$root/target/pushed-commit" "$tmp/scripts/verify-push.sh")
     git worktree remove --force "$tmp"
-    trap - EXIT INT TERM
-done
+    trap 'rm -f "$updates"' EXIT INT TERM
+done < "$updates"

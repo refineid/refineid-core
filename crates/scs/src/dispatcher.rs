@@ -228,7 +228,10 @@ fn sign_json(
             origin,
         );
     }
-    let purpose = document.purpose();
+    let purpose = match document.purpose() {
+        Ok(purpose) => purpose,
+        Err(error) => return sign_error(error.code, &error.message, origin),
+    };
     if purpose == crate::purpose::SignPurpose::Authentication
         && let Some(refusal) = challenge::refusal(&raw, origin)
     {

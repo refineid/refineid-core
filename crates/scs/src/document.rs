@@ -20,6 +20,7 @@
 
 use serde_json::Value;
 
+use crate::error::TransactionError;
 use crate::purpose::SignPurpose;
 use crate::values;
 
@@ -205,20 +206,31 @@ impl SignRequestDocument {
         })
     }
 
-    /// The card key this request selects.
-    #[must_use]
-    pub fn purpose(&self) -> SignPurpose {
+    /// The card key this request selects; mixing both usages is
+    /// refused, as on the transaction path.
+    pub fn purpose(&self) -> Result<SignPurpose, TransactionError> {
         let qualified = self.selector.as_ref().is_some_and(|selector| {
             selector
                 .keyusages
                 .iter()
                 .any(|usage| usage.eq_ignore_ascii_case("nonRepudiation"))
         });
-        if qualified {
+        let authentication = self.selector.as_ref().is_some_and(|selector| {
+            selector
+                .keyusages
+                .iter()
+                .any(|usage| usage.eq_ignore_ascii_case("digitalSignature"))
+        });
+        if qualified && authentication {
+            return Err(TransactionError::bad_request(
+                "selector mixes authentication and signing key usages",
+            ));
+        }
+        Ok(if qualified {
             SignPurpose::Qualified
         } else {
             SignPurpose::Authentication
-        }
+        })
     }
 }
 
@@ -586,12 +598,17 @@ mod tests {
         let plain =
             SignRequestDocument::decode(&parse(r#"{"content":"eA==","contentType":"data"}"#))
                 .expect("decodes");
-        assert_eq!(plain.purpose(), SignPurpose::Authentication);
+        assert_eq!(plain.purpose(), Ok(SignPurpose::Authentication));
         let qualified = SignRequestDocument::decode(&parse(
             r#"{"content":"eA==","contentType":"data","selector":{"keyusages":["nonRepudiation"]}}"#,
         ))
         .expect("decodes");
-        assert_eq!(qualified.purpose(), SignPurpose::Qualified);
+        assert_eq!(qualified.purpose(), Ok(SignPurpose::Qualified));
+        let mixed = SignRequestDocument::decode(&parse(
+            r#"{"content":"eA==","contentType":"data","selector":{"keyusages":["digitalSignature","nonRepudiation"]}}"#,
+        ))
+        .expect("decodes");
+        assert!(mixed.purpose().is_err());
     }
 
     /// Success-only fields are omitted -- not nulled -- on failure.

@@ -46,6 +46,24 @@ Never log PIN codes (PIN1, PIN2), PUK, or CAN in any development, test, staging,
 - **Errors**: Display implementations of credential/PIN errors must state expected specification policy boundaries without echoing candidate digit counts or offsets.
 - **Debugging**: If specialized debugging is ever needed, it is done via temporary, uncommitted private test harnesses and removed immediately.
 
+## Agent roles and authority
+
+The front agent owns task decomposition, integration, publication, and
+installation under the owner's standing authorization, including the
+authorizations stated in this document, and may complete small
+or tightly coupled changes itself rather than delegating. An
+implementation agent owns only its assigned worktree and brief.
+General instructions in this document to commit, push, open pull
+requests, merge, review, file issues, or install apply to the
+front agent. An explicit owner order may delegate commit on and push
+to the assigned task branch for one run, with the commit and scan
+rules in the brief; opening pull requests, review, issue filing,
+installation, and merge are never delegated to an implementation
+agent. Workers report deferred findings in their handoff for the
+front agent to file. Where independence is required, the front
+agent runs the review using a model from a different family than
+the one that wrote the change.
+
 ## Design before code
 
 Every slice starts as a short design, not as code. Before writing, answer
@@ -248,9 +266,13 @@ rule in a line and points to the reading behind it; the readings live in
 
 ## Commits and integration
 
-- Commits are cheap backups. Make small, focused commits often, without
-  asking for permission, once the required commit checks pass.
-- Complete the integration without waiting for another instruction: push
+- Commits are cheap backups. The front agent makes small, focused commits
+  often, without asking for permission, once the required commit checks
+  pass. Workers commit and push only under an explicit owner order in
+  the brief.
+- Complete the integration without waiting for another instruction
+  (this instruction applies to the front agent; workers follow their
+  brief): push
   the task branch, open a pull request, and merge it into `main` once the
   required checks pass. Sync local `main` with the merged remote.
   Use squash merges to keep the `main` history linear; do not use merge commits.
@@ -258,13 +280,15 @@ rule in a line and points to the reading behind it; the readings live in
 
 ## Record deferred findings
 
-- While working, file a GitHub issue in the owning repository for each
+- The front agent files a GitHub issue in the owning repository for each
   confirmed, actionable defect or quality gap that cannot reasonably be
   fixed within the current task. Filing these issues is authorized; do not
-  wait for a separate instruction for each finding.
-- Search existing open issues first. Reuse the matching issue and add only
-  new, useful evidence instead of creating a duplicate. Group findings only
-  when they share a cause and can be resolved by one focused change.
+  wait for a separate instruction for each finding. An implementation
+  agent reports deferred findings in its handoff instead of filing them.
+- The front agent searches existing open issues first, reuses any
+  matching issue by adding only new, useful evidence instead of
+  creating a duplicate, and groups findings only when they share a
+  cause and can be resolved by one focused change.
 - State the observed behavior, expected behavior, affected repository-relative
   paths, reproduction or inspection evidence, impact, and acceptance checks.
   Distinguish observations from hypotheses and specification requirements.
@@ -359,16 +383,19 @@ rule in a line and points to the reading behind it; the readings live in
   trivial-looking patches to avoid review.
 - For a trivial change, the front agent's inspection of a worker's diff is
   sufficient; do not recruit another reviewer merely because a worker wrote it.
-  State briefly in the pull request or handoff: "Self-reviewed: wording only;
-  meaning unchanged", or an equally short description of the actual effect.
+  State briefly in the pull request or handoff. Record the exact
+  `Self-reviewed:` marker line(s) in the squash body per the
+  working method.
   No separate justification document or owner approval is needed.
 
 ## Independent review
 
 These instructions apply when independent review is required above.
 
-- When independent review is required, before a pull request merges, have its diff reviewed by a model from a
-  different family than the one that wrote it. Any CLI that runs a model
+- Review is tiered per the working method. Before a pull request
+  merges, have its diff reviewed by a model from a different family
+  than the one that wrote it, unless the change is eligible for
+  self-review. Any CLI that runs a model
   headless will do; take the strongest model it offers that day, and add a
   second one for protocol, cryptography or state-machine changes.
 - Run the reviewer in a sandbox and plan mode, from an empty directory,

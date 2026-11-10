@@ -757,7 +757,7 @@ the requester; a part named after a colon is one program of it.
 | CC-30 | The phone keeps the typed PIN for the whole preparation and sends it only to the card first seen; it asks again only when the card refused it, the tries left fell, the holder cancelled or the dialog ended. | |
 | CC-31 | A tap that did not happen is not a failure; "card not found" is never shown; Retry starts from the tap. | |
 | CC-32 | The attempt's timeout counts from the last reader change, only in the foreground with the reader armed; leaving the foreground ends nothing. | |
-| CC-33 | The phone reads the tries left before the first PIN command and after every unknown outcome; a lower count stops the held PIN from being sent. | §10.2 |
+| CC-33 | The phone reads the tries left before the first PIN command and after every unknown outcome; holding PIN 1 across operations starts only at the five-try limit, and any other reading destroys the held PIN 1. | §10.2, §11 item 2 |
 | CC-34 | Every PIN prompt shows the tries left once the card has told them. | §10.2 |
 | CC-35 | One PIN prompt is on screen at a time; a computer's request waits behind a local dialog, within its own deadline. | |
 | CC-36 | The reader is re-armed when the app resumes, and the dialog says so when it is not armed. | |
@@ -784,7 +784,7 @@ the requester; a part named after a colon is one program of it.
 | CC-62 | Every state a peer needs is distinct on the wire: queued, waiting for the card, PIN prompt shown, and each close reason. Busy and gone are never the same message. | §7.1, §8.2 |
 | CC-64 | The computer offers an identity on a fingerprint the phone confirmed, also between sessions; a request with no session dials and waits within the program's deadline. It withdraws after 120 s with no session or with absence reported, and at once on a forget or revocation, its own withdrawal, the phone's verified withdrawal or `card_unavailable` close, or a different card. | §8.4 item 3 |
 | CC-65 | Presence is the card the phone holds: a reader card from insertion to removal, an NFC card from the holder adding it to removing it. An operation the card did not answer ends with `card_error` and leaves presence unchanged. | §8.4 item 1 |
-| CC-66 | PIN 1 is asked once and held only in memory, until the card is removed or replaced, refuses it, the holder clears it, the process ends or the device restarts. PIN 2 is asked for every signature or batch. The PIN prompt is the consent. | §8.2 item 3, §11 item 2 |
+| CC-66 | PIN 1 is asked once and held only in memory, starting only at the five-try limit. It is discarded if the card returns any other counter reading, is removed or replaced, the holder clears it, the process ends, or the device restarts. PIN 2 is asked for every signature or batch. The PIN prompt is the consent. | §8.2 item 3, §11 item 2 |
 | CC-68 | In the background, with Bluetooth serving, the phone closes an idle stream session and unpublishes its stream listener; it publishes again in the foreground. | |
 | CC-69 | An NFC card command from the background first summons the holder (a notification and `waiting_for_card`) for a bounded wait; otherwise the operation ends with `card_error`. | §8.2 item 4 (`waiting_for_card`) |
 | CC-70 | While the phone is locked and protected data is unavailable, it keeps the card status it last read. It admits the session and answers card status, but starts no credential use (`credential-custody.md`). | §8.2 item 3 |

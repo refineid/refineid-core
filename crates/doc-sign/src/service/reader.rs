@@ -608,8 +608,11 @@ where
     // licenses contactless signing at all.
     let on_card = match transport.select_pkcs15_application() {
         Ok(()) => {
-            let prepared = prepare_on_card(&mut transport, &options, &input_bytes)?;
-            let presented = present_pin(pin, slot, |pin_bytes| {
+            let prepared =
+                prepare_on_card(&mut transport, &options, &input_bytes).inspect_err(|_| {
+                    pin.forget();
+                })?;
+            let presented = present_pin(pin, slot, prepared.pin_status, |pin_bytes| {
                 transport.pin_sequence(|mut card| {
                     commit_in_transaction(
                         &mut card,
@@ -657,11 +660,13 @@ where
                     slot,
                     detail: format!("select pkcs15 app under SM: {e}"),
                 })?;
-            let prepared = prepare_on_card(&mut sm, &options, &input_bytes)?;
+            let prepared = prepare_on_card(&mut sm, &options, &input_bytes).inspect_err(|_| {
+                pin.forget();
+            })?;
             // The secure channel's keys and counter carry into the
             // transaction: the card is not reset between the two.
             let (transport, session) = sm.into_parts();
-            let presented = present_pin(pin, slot, |pin_bytes| {
+            let presented = present_pin(pin, slot, prepared.pin_status, |pin_bytes| {
                 transport.pin_sequence(|card| {
                     let mut sm = SmTransport::new(card, session);
                     commit_in_transaction(
@@ -730,14 +735,41 @@ where
 fn present_pin(
     pin: &mut dyn PinSource,
     slot: SignSlot,
+    pin_status: refineid_auth::verify::PinStatus,
     verify: impl FnOnce(&PinBytes) -> Result<Committed, ReaderSignError>,
 ) -> Result<Committed, ReaderSignError> {
+    if slot.pin_role() == PinRole::Pin1 {
+        let keep_pre = matches!(
+            pin_status,
+            refineid_auth::verify::PinStatus::Remaining(r) if r.get() == 5
+        );
+        if !keep_pre {
+            pin.forget();
+        }
+    }
+
     let outcome = verify(
         pin.pin(slot.pin_role())
             .map_err(ReaderSignError::PinEntry)?,
     );
-    if outcome.is_err() {
-        pin.forget();
+
+    match &outcome {
+        Ok(committed) => {
+            let keep = if slot.pin_role() == PinRole::Pin1 {
+                matches!(
+                    committed.pin_status_before_verify,
+                    refineid_auth::verify::PinStatus::Remaining(r) if r.get() == 5
+                )
+            } else {
+                true
+            };
+            if !keep {
+                pin.forget();
+            }
+        }
+        Err(_) => {
+            pin.forget();
+        }
     }
     outcome
 }
@@ -778,6 +810,8 @@ struct Prepared {
     scheme: PinReferenceScheme,
     /// The serial EF.TokenInfo named before the prompt.
     serial: Option<TokenSerial>,
+    /// The retry status read before the prompt.
+    pin_status: refineid_auth::verify::PinStatus,
 }
 
 /// What VERIFY and the sign chain produced.
@@ -788,6 +822,8 @@ struct Committed {
     signature_bytes: Vec<u8>,
     /// Rule E7 local-verify outcome.
     local_verify: LocalVerifyOutcome,
+    /// The retry status read immediately before VERIFY.
+    pin_status_before_verify: refineid_auth::verify::PinStatus,
 }
 
 /// The card-facing preparation both interface paths share once the
@@ -847,7 +883,7 @@ fn prepare_on_card<T: CardTransport>(
     // S1 v4.2 vs organizational S4-2 v4.0), resolved by
     // counter-safe probes before any PIN is asked for.
     let scheme = resolve_pin_reference_scheme(transport)?;
-    check_slot_retry_floor(transport, slot, scheme)?;
+    let pin_status = check_slot_retry_floor(transport, slot, scheme)?;
     let serial = live_token_serial(transport)?;
     Ok(Prepared {
         cert_der,
@@ -855,6 +891,7 @@ fn prepare_on_card<T: CardTransport>(
         plan,
         scheme,
         serial,
+        pin_status,
     })
 }
 
@@ -866,11 +903,12 @@ fn check_slot_retry_floor<T: CardTransport>(
     transport: &mut T,
     slot: SignSlot,
     scheme: PinReferenceScheme,
-) -> Result<(), ReaderSignError> {
+) -> Result<refineid_auth::verify::PinStatus, ReaderSignError> {
     let status = transport
         .pin_status_with_scheme(scheme, slot.pin_slot())
         .map_err(|e| ReaderSignError::Transport(format!("{e}")))?;
-    check_retry_floor(slot.pin_slot().into(), status).map_err(ReaderSignError::RetryFloor)
+    check_retry_floor(slot.pin_slot().into(), status).map_err(ReaderSignError::RetryFloor)?;
+    Ok(status)
 }
 
 /// VERIFY and the sign chain, inside the PIN transaction.
@@ -911,6 +949,9 @@ fn commit_on_card<T: CardTransport>(
     // right algRef, the right PSO:HASH hash size, and the right
     // signature-length expectation for each.
     let cert = prepared.cert_owned.view();
+    let pin_status_before_verify = transport
+        .pin_status_with_scheme(prepared.scheme, slot.pin_slot())
+        .map_err(|e| ReaderSignError::Transport(format!("{e}")))?;
     let key = unlock_slot_key(transport, slot, prepared.scheme, pin)?;
     let (signature_bytes, local_verify) = sign_dispatch_by_alg(
         key,
@@ -924,6 +965,7 @@ fn commit_on_card<T: CardTransport>(
         pin_retries_after: None,
         signature_bytes,
         local_verify,
+        pin_status_before_verify,
     })
 }
 
@@ -1389,7 +1431,8 @@ mod tests {
         struct State {
             certificate: Vec<u8>,
             signature: Vec<u8>,
-            tries: PinRetries,
+            tries1: Cell<PinRetries>,
+            tries2: Cell<PinRetries>,
             verify_answer: StatusWord,
             numbering: PinReferenceScheme,
             in_esign: Cell<bool>,
@@ -1439,10 +1482,12 @@ mod tests {
                 tries: u8,
                 verify_answer: StatusWord,
             ) -> Result<Self, &'static str> {
+                let r = PinRetries::from_nibble(tries).ok_or("not a counter value")?;
                 Ok(Self(Rc::new(State {
                     certificate,
                     signature,
-                    tries: PinRetries::from_nibble(tries).ok_or("not a counter value")?,
+                    tries1: Cell::new(r),
+                    tries2: Cell::new(r),
                     verify_answer,
                     numbering: PinReferenceScheme::Citizen,
                     in_esign: Cell::new(false),
@@ -1501,6 +1546,10 @@ mod tests {
                     .borrow_mut()
                     .push(ins.unwrap_or_default());
                 if ins == Some(VERIFY_INS) {
+                    let is_pin2 = apdu.get(P2_INDEX)
+                        == Some(&PinReferenceScheme::Citizen.reference(PinSlot::Pin2))
+                        || apdu.get(P2_INDEX)
+                            == Some(&PinReferenceScheme::Organizational.reference(PinSlot::Pin2));
                     let citizen_reference = [PinSlot::Pin1, PinSlot::Pin2]
                         .map(|slot| PinReferenceScheme::Citizen.reference(slot))
                         .iter()
@@ -1511,7 +1560,11 @@ mod tests {
                     return respond(
                         Vec::new(),
                         StatusWord::PinIncorrect {
-                            retries: self.0.tries,
+                            retries: if is_pin2 {
+                                self.0.tries2.get()
+                            } else {
+                                self.0.tries1.get()
+                            },
                         },
                     );
                 }
@@ -1919,6 +1972,66 @@ mod tests {
                 &2,
                 "VERIFY per document",
             )
+        }
+
+        #[test]
+        fn a_pin1_held_past_its_operation_requires_a_full_try_limit() -> TestResult {
+            let card = SyntheticCard::signing()?;
+            let backend = SyntheticBackend::one_reader(true, card.clone());
+            let (mut pin, asked) = counting(|| {});
+
+            card.0
+                .tries1
+                .set(PinRetries::from_nibble(4).expect("test literal"));
+            let report = sign_on(&backend, SignSlot::Authentication, &mut pin)??;
+            check_true(report.local_verify.is_ok(), "signed and verified")?;
+            check(&asked.get(), &1, "asked once for PIN1 at tries=4")?;
+
+            let report = sign_on(&backend, SignSlot::Authentication, &mut pin)??;
+            check_true(report.local_verify.is_ok(), "signed and verified")?;
+            check(
+                &asked.get(),
+                &2,
+                "asked again because PIN1 was dropped at tries=4",
+            )?;
+
+            card.0
+                .tries1
+                .set(PinRetries::from_nibble(5).expect("test literal"));
+            let report = sign_on(&backend, SignSlot::Authentication, &mut pin)??;
+            check_true(report.local_verify.is_ok(), "signed and verified")?;
+            check(&asked.get(), &3, "asked again for PIN1 at tries=5")?;
+
+            let report = sign_on(&backend, SignSlot::Authentication, &mut pin)??;
+            check_true(report.local_verify.is_ok(), "signed and verified")?;
+            check(
+                &asked.get(),
+                &3,
+                "did not ask because PIN1 was retained at tries=5",
+            )?;
+
+            // Critical transition 5 -> 4
+            card.0
+                .tries1
+                .set(PinRetries::from_nibble(4).expect("test literal"));
+            let report = sign_on(&backend, SignSlot::Authentication, &mut pin)??;
+            check_true(report.local_verify.is_ok(), "signed and verified")?;
+            check(
+                &asked.get(),
+                &4,
+                "asked again because PIN1 was dropped when reading 4 before prompt",
+            )?;
+
+            // PIN 2 batch behavior is unchanged
+            card.0
+                .tries2
+                .set(PinRetries::from_nibble(4).expect("test literal"));
+            let report = sign_on(&backend, SignSlot::Qualified, &mut pin)??;
+            check_true(report.local_verify.is_ok(), "signed and verified")?;
+            check(&asked.get(), &5, "asked once for PIN2")?;
+            let report = sign_on(&backend, SignSlot::Qualified, &mut pin)??;
+            check_true(report.local_verify.is_ok(), "signed and verified")?;
+            check(&asked.get(), &5, "did not ask because PIN2 always held")
         }
 
         #[test]

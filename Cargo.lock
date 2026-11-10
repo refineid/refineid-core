@@ -418,7 +418,7 @@ dependencies = [
  "ctutils",
  "hybrid-array",
  "num-traits",
- "rand_core",
+ "rand_core 0.10.1",
  "serdect",
  "subtle",
  "zeroize",
@@ -431,6 +431,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array",
+ "rand_core 0.6.4",
  "typenum",
 ]
 
@@ -441,7 +442,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
  "hybrid-array",
- "rand_core",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -546,6 +547,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ecdsa"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0681a4fc24c767085329728d8dfba959af91228aa4610cca4f8ce317ba46ae0"
+dependencies = [
+ "der",
+ "digest 0.11.3",
+ "elliptic-curve",
+ "rfc6979",
+ "signature",
+ "zeroize",
+]
+
+[[package]]
 name = "elliptic-curve"
 version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -557,8 +572,9 @@ dependencies = [
  "digest 0.11.3",
  "ff",
  "group",
+ "hkdf",
  "hybrid-array",
- "rand_core",
+ "rand_core 0.10.1",
  "sec1",
  "subtle",
  "zeroize",
@@ -615,7 +631,7 @@ version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1f686ab92a9fb0eaf188f6c6c87b89490baa6fdb0db4544ba4dc47f7942489f"
 dependencies = [
- "rand_core",
+ "rand_core 0.10.1",
  "subtle",
 ]
 
@@ -654,6 +670,17 @@ checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
 dependencies = [
  "typenum",
  "version_check",
+]
+
+[[package]]
+name = "getrandom"
+version = "0.2.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "wasi",
 ]
 
 [[package]]
@@ -723,7 +750,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7fd1a1c7a5206c5b7a3f5a0d7ccd3ff85d0c8f5133d62a02680255b0004af5f4"
 dependencies = [
  "ff",
- "rand_core",
+ "rand_core 0.10.1",
  "subtle",
 ]
 
@@ -744,6 +771,15 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hkdf"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
+dependencies = [
+ "hmac",
+]
 
 [[package]]
 name = "hmac"
@@ -894,9 +930,11 @@ version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2c9239b2dbc807adbbe147e8cf72ea7450c3a0aabe62cb8e75ff4ec22e1f72a"
 dependencies = [
+ "ecdsa",
  "elliptic-curve",
  "primefield",
  "primeorder",
+ "sha2 0.11.1",
 ]
 
 [[package]]
@@ -980,7 +1018,7 @@ dependencies = [
  "crypto-bigint",
  "crypto-common 0.2.2",
  "ff",
- "rand_core",
+ "rand_core 0.10.1",
  "subtle",
  "zeroize",
 ]
@@ -1028,13 +1066,22 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rand_core"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
+dependencies = [
+ "getrandom 0.2.17",
+]
+
+[[package]]
+name = "rand_core"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "refineid-apdu"
-version = "26.11.8"
+version = "26.11.10"
 dependencies = [
  "refineid-build-number",
  "serde",
@@ -1044,11 +1091,11 @@ dependencies = [
 
 [[package]]
 name = "refineid-atr"
-version = "26.11.8"
+version = "26.11.10"
 
 [[package]]
 name = "refineid-auth"
-version = "26.11.8"
+version = "26.11.10"
 dependencies = [
  "hmac",
  "refineid-apdu",
@@ -1062,15 +1109,15 @@ dependencies = [
 
 [[package]]
 name = "refineid-ber"
-version = "26.11.8"
+version = "26.11.10"
 
 [[package]]
 name = "refineid-build-number"
-version = "26.11.8"
+version = "26.11.10"
 
 [[package]]
 name = "refineid-ccid"
-version = "26.11.8"
+version = "26.11.10"
 dependencies = [
  "refineid-apdu",
  "refineid-atr",
@@ -1079,7 +1126,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-cms"
-version = "26.11.8"
+version = "26.11.10"
 dependencies = [
  "const-oid",
  "crypto-bigint",
@@ -1095,7 +1142,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-digest"
-version = "26.11.8"
+version = "26.11.10"
 dependencies = [
  "md-5",
  "sha1",
@@ -1104,7 +1151,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-doc-sign"
-version = "26.11.8"
+version = "26.11.10"
 dependencies = [
  "const-oid",
  "crypto-bigint",
@@ -1131,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-emrtd"
-version = "26.11.8"
+version = "26.11.10"
 dependencies = [
  "refineid-apdu",
  "refineid-ber",
@@ -1139,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-pace"
-version = "26.11.8"
+version = "26.11.10"
 dependencies = [
  "aes 0.9.4",
  "bp384",
@@ -1162,7 +1209,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-pcsc"
-version = "26.11.8"
+version = "26.11.10"
 dependencies = [
  "pcsc",
  "refineid-apdu",
@@ -1171,7 +1218,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-pin-cache"
-version = "26.11.8"
+version = "26.11.10"
 dependencies = [
  "getrandom 0.4.3",
  "refineid-auth",
@@ -1182,7 +1229,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-pkcs11"
-version = "26.11.8"
+version = "26.11.10"
 dependencies = [
  "getrandom 0.4.3",
  "hex",
@@ -1204,7 +1251,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-pkcs15"
-version = "26.11.8"
+version = "26.11.10"
 dependencies = [
  "refineid-apdu",
  "refineid-ber",
@@ -1213,7 +1260,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-rapp"
-version = "26.11.8"
+version = "26.11.10"
 dependencies = [
  "chacha20poly1305",
  "curve25519-dalek",
@@ -1234,14 +1281,33 @@ dependencies = [
 
 [[package]]
 name = "refineid-remote"
-version = "26.11.8"
+version = "26.11.10"
 dependencies = [
  "refineid-digest",
 ]
 
 [[package]]
+name = "refineid-scs"
+version = "26.11.10"
+dependencies = [
+ "aes-gcm",
+ "elliptic-curve",
+ "getrandom 0.4.3",
+ "p256",
+ "refineid-ber",
+ "refineid-cms",
+ "refineid-digest",
+ "serde_json",
+ "sha1",
+ "sha2 0.11.1",
+ "signature",
+ "spki",
+ "zeroize",
+]
+
+[[package]]
 name = "refineid-sign"
-version = "26.11.8"
+version = "26.11.10"
 dependencies = [
  "refineid-apdu",
  "refineid-auth",
@@ -1253,9 +1319,19 @@ dependencies = [
 
 [[package]]
 name = "refineid-x509"
-version = "26.11.8"
+version = "26.11.10"
 dependencies = [
  "refineid-ber",
+]
+
+[[package]]
+name = "rfc6979"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4a459cddafb3fe76b31fd8f1108007566c40301feb64dc7b54656eb7388172b"
+dependencies = [
+ "crypto-bigint",
+ "hmac",
 ]
 
 [[package]]
@@ -1467,6 +1543,16 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",
  "digest 0.11.3",
+]
+
+[[package]]
+name = "signature"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
+dependencies = [
+ "digest 0.11.3",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -1843,6 +1929,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasi"
+version = "0.11.1+wasi-snapshot-preview1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
+
+[[package]]
 name = "wasip2"
 version = "1.0.4+wasi-0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1924,7 +2016,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "26.11.8"
+version = "26.11.10"
 dependencies = [
  "proc-macro2",
  "rustc_lexer",

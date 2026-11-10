@@ -17,6 +17,7 @@ members = [
     "crates/pkcs15",
     "crates/rapp",
     "crates/remote",
+    "crates/scs",
     "crates/sign",
     "crates/x509",
     "crates/doc-sign",
@@ -27,7 +28,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "26.11.8"
+version = "26.11.10"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Petri Koistinen"]
@@ -51,6 +52,7 @@ refineid-pkcs11 = { path = "crates/pkcs11" }
 refineid-pkcs15 = { path = "crates/pkcs15" }
 refineid-rapp = { path = "crates/rapp" }
 refineid-remote = { path = "crates/remote" }
+refineid-scs = { path = "crates/scs" }
 refineid-sign = { path = "crates/sign" }
 refineid-x509 = { path = "crates/x509" }
 pcsc = "2.9"
@@ -66,12 +68,20 @@ bp384 = { version = "0.14", default-features = false, features = ["arithmetic"] 
 # standardized domain parameters the organizational cards publish in
 # EF.CardAccess, in the same RustCrypto family and elliptic-curve
 # version as bp384, with the same arithmetic-only feature set.
-p256 = { version = "0.14", default-features = false, features = ["arithmetic"] }
+# The SCS crate (crates/scs) adds the P-256 key agreement for its
+# transaction channel (`ecdh`) and the signatures its tests mint
+# (`ecdsa`); production verification stays on the in-tree
+# refineid-cms primitives.
+p256 = { version = "0.14", default-features = false, features = ["arithmetic", "ecdh", "ecdsa"] }
 p384 = { version = "0.14", default-features = false, features = ["arithmetic"] }
 # The curve-generic traits the PACE handshake is written against, the
 # one version bp384, p256 and p384 share.
 elliptic-curve = { version = "0.14", default-features = false, features = ["arithmetic", "sec1"] }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+# The SCS transaction channel cipher (crates/scs): direct-encryption
+# A256GCM JOSE envelopes under the agreed key. Already in the lock
+# file through `snow`; this promotes it to a direct dependency.
+aes-gcm = "0.10"
 crypto-bigint = { version = "0.7", features = ["alloc", "zeroize"] }
 miniz_oxide = "0.9"
 curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "zeroize"] }
@@ -102,6 +112,9 @@ hex = "0.4"
 # the `process` feature alone carries the id getters.
 rustix = { version = "1", default-features = false, features = ["process"] }
 subtle = "2"
+# The verifier trait behind the SCS JWS signatures (crates/scs).
+# Already in the lock file through `ecdsa-core`.
+signature = "3"
 rustc_lexer = "0.1"
 serde = "1"
 serde_json = "1"

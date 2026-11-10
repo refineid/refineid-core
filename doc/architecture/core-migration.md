@@ -406,6 +406,36 @@ three curves are covered by scripted tests, and PACE with a PIN is not
 described as working until it is observed on hardware with the counter
 read before and after.
 
+The sixteenth slice admits the Signature Creation Service protocol in
+`refineid-scs`:
+
+- the DVV SCS v1.3 surface the Swift engine serves: `GET /version`,
+  `POST /sign` in its JSON and JWT transaction forms, and the CORS
+  preflight, with the always-200 reason triple and the unknown-route
+  404;
+- the origin-bound challenge rules for the authentication key, in
+  both the JSON (`origin;nonce`) and transaction
+  (`origin;nonce;serverKey`) forms;
+- the transaction flow: JWS-verified `begin` with P-256 key
+  agreement, one pending transaction consumed by its `execute`,
+  direct-encryption A256GCM envelopes both ways, and the strict
+  key-policy and selector gates;
+- JWS verification against the relying service's certificate --
+  validity window, RS256 through the in-tree RSA primitive, ES256
+  through `p256` -- with no chain building, since the challenge, not
+  the chain, protects the holder;
+- the detached CMS builder for the `cms-pades` form and the
+  self-signed localhost certificate builder, both over `refineid-ber`
+  with the `refineid-cms` OID table; and
+- the `SigningBackend` seam -- certificate chain, key algorithm, and
+  the PIN-gated sign -- which the platform implements. The TLS
+  listener, identity storage, and PIN prompt stay outside the core.
+
+Nothing here touches a card, so no hardware validation applies; the
+Unix server that drives a card through the seam carries its own
+retry-consuming gate. Covered by unit tests over a scripted backend
+and minted certificates, including a full begin/execute round trip.
+
 ## Hardware validation
 
 Slices two through five have been exercised against two citizen card

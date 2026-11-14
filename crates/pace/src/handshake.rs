@@ -46,8 +46,8 @@ use refineid_apdu::{
 };
 use refineid_auth::{
     FlooredCredential, ManageOutcome, PacePasswordKey, Pin1, Pin2, PinReferenceScheme, PinSlot,
-    PinStatus, Puk, RetryFloorRefusal, VerifyOutcome, check_retry_floor, counter_after_verify,
-    lowered_counter,
+    PinStatus, Puk, RetryFloorRefusal, VerifyOutcome, check_retry_floor, counter_after_unanswered,
+    counter_after_verify, lowered_counter,
 };
 use refineid_ber::{BerEncodeError, BerError, BerTag, BerTlv};
 use refineid_pkcs15::Pkcs15Error;
@@ -237,6 +237,11 @@ impl OpenedByPin1 {
     pub(crate) const fn lower(&mut self, answer: ManageOutcome) {
         self.counter = lowered_counter(self.counter, answer);
     }
+
+    /// Record that a PIN 1 presentation received no authenticated answer.
+    pub(crate) const fn mark_unanswered(&mut self) {
+        self.counter = counter_after_unanswered(self.counter);
+    }
 }
 
 impl OpenedByPuk {
@@ -248,6 +253,11 @@ impl OpenedByPuk {
     /// Lower the record by the card's answer to a PUK presentation.
     pub(crate) const fn lower(&mut self, answer: ManageOutcome) {
         self.counter = lowered_counter(self.counter, answer);
+    }
+
+    /// Record that a PUK presentation received no authenticated answer.
+    pub(crate) const fn mark_unanswered(&mut self) {
+        self.counter = counter_after_unanswered(self.counter);
     }
 }
 
@@ -297,6 +307,11 @@ impl OpenedByPin2 {
     /// Lower the record by the card's answer to a PIN 2 change.
     pub(crate) const fn lower(&mut self, answer: ManageOutcome) {
         self.counter = lowered_counter(self.counter, answer);
+    }
+
+    /// Record that a PIN 2 presentation received no authenticated answer.
+    pub(crate) const fn mark_unanswered(&mut self) {
+        self.counter = counter_after_unanswered(self.counter);
     }
 
     /// Spend the session's PIN 2 presentation.

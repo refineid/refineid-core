@@ -102,6 +102,10 @@ pub trait PukPaceChannel: CardTransport {
     /// Lower the record by the card's answer to a PUK presentation on
     /// this channel; see [`lowered_counter`].
     fn lower_puk_counter(&mut self, answer: ManageOutcome);
+
+    /// Record that a PUK presentation received no authenticated answer
+    /// on this channel; see [`counter_after_unanswered`].
+    fn mark_puk_counter_unanswered(&mut self);
 }
 
 /// A secure channel PACE opened with PIN 1.
@@ -116,6 +120,10 @@ pub trait Pin1PaceChannel: CardTransport {
     /// Lower the record by the card's answer to a PIN 1 presentation on
     /// this channel; see [`lowered_counter`].
     fn lower_pin1_counter(&mut self, answer: ManageOutcome);
+
+    /// Record that a PIN 1 presentation received no authenticated answer
+    /// on this channel; see [`counter_after_unanswered`].
+    fn mark_pin1_counter_unanswered(&mut self);
 }
 
 /// A secure channel PACE opened with PIN 2.
@@ -138,6 +146,10 @@ pub trait Pin2PaceChannel: CardTransport {
     /// channel; see [`lowered_counter`]. An accepted change leaves the
     /// record as it stands.
     fn lower_pin2_counter(&mut self, answer: ManageOutcome);
+
+    /// Record that a PIN 2 presentation received no authenticated answer
+    /// on this channel; see [`counter_after_unanswered`].
+    fn mark_pin2_counter_unanswered(&mut self);
 }
 
 /// Why a PIN 2 change on a channel PACE opened with PIN 2 was not made.
@@ -172,7 +184,9 @@ impl<E: core::fmt::Debug + core::fmt::Display + 'static> core::error::Error for 
 pub trait Pin2PaceChannelOps: Pin2PaceChannel + Sized {
     /// VERIFY PIN 2 inside the channel under the retry floor on the
     /// channel's record: refused at two or one tries left or an unknown
-    /// record, sent otherwise. The card's answer settles the record.
+    /// record, sent otherwise. The card's answer settles the record; an
+    /// unanswered presentation marks the record unknown unless already
+    /// blocked.
     ///
     /// # Errors
     ///
@@ -187,7 +201,15 @@ pub trait Pin2PaceChannelOps: Pin2PaceChannel + Sized {
     ) -> Result<VerifyOutcome, AuthError<Self::Error>> {
         check_retry_floor(FlooredCredential::Pin2, self.pin2_counter())
             .map_err(AuthError::RetryFloor)?;
-        let outcome = verify_digits(self, CHANNEL_NUMBERING, PinSlot::Pin2, pin.digits())?;
+        let outcome = match verify_digits(self, CHANNEL_NUMBERING, PinSlot::Pin2, pin.digits()) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if exchange_unanswered(&error) {
+                    self.mark_pin2_counter_unanswered();
+                }
+                return Err(error);
+            }
+        };
         self.settle_pin2_counter(outcome);
         Ok(outcome)
     }
@@ -240,12 +262,24 @@ pub trait Pin2PaceChannelOps: Pin2PaceChannel + Sized {
         let scheme = CHANNEL_NUMBERING;
         match proof {
             ChannelProof::PaceHandshake => {
-                reset_new_only(self, scheme, PinSlot::Pin2, new.digits())
-                    .map_err(Pin2ChangeError::Auth)
+                reset_new_only(self, scheme, PinSlot::Pin2, new.digits()).map_err(|error| {
+                    if exchange_unanswered(&error) {
+                        self.mark_pin2_counter_unanswered();
+                    }
+                    Pin2ChangeError::Auth(error)
+                })
             }
             ChannelProof::PresentAgain(current) => {
-                let outcome = change(self, scheme, PinSlot::Pin2, current.digits(), new.digits())
-                    .map_err(Pin2ChangeError::Auth)?;
+                let outcome =
+                    match change(self, scheme, PinSlot::Pin2, current.digits(), new.digits()) {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            if exchange_unanswered(&error) {
+                                self.mark_pin2_counter_unanswered();
+                            }
+                            return Err(Pin2ChangeError::Auth(error));
+                        }
+                    };
                 self.lower_pin2_counter(outcome);
                 Ok(outcome)
             }
@@ -254,6 +288,31 @@ pub trait Pin2PaceChannelOps: Pin2PaceChannel + Sized {
 }
 
 impl<T: Pin2PaceChannel> Pin2PaceChannelOps for T {}
+
+/// Whether `error` is a transport failure or state transition from a
+/// command exchange (rather than a pre-send refusal), leaving the card's
+/// answer unknown.
+const fn exchange_unanswered<E>(error: &AuthError<E>) -> bool {
+    matches!(error, AuthError::Transport(_) | AuthError::Outcome(_))
+}
+
+/// The counter `record` after a credential presentation received no
+/// authenticated answer from the card.
+///
+/// Once a credential command has gone out without an authenticated
+/// response, whether the card spent a try or changed the credential cannot
+/// be told on this channel: a blocked record stays blocked, and any other
+/// state becomes unknown ([`PinStatus::NoInfo`]), which the retry floor
+/// refuses.
+#[must_use]
+pub const fn counter_after_unanswered(record: PinStatus) -> PinStatus {
+    match record {
+        PinStatus::Locked => PinStatus::Locked,
+        PinStatus::Verified | PinStatus::Remaining(_) | PinStatus::NoInfo | PinStatus::Other(_) => {
+            PinStatus::NoInfo
+        }
+    }
+}
 
 /// The counter `record` after the card answered a VERIFY with `answer`.
 ///
@@ -391,13 +450,26 @@ pub trait Pin1PaceChannelOps: Pin1PaceChannel + Sized {
         let scheme = CHANNEL_NUMBERING;
         match proof {
             ChannelProof::PaceHandshake => {
-                reset_new_only(self, scheme, PinSlot::Pin1, new.digits())
+                reset_new_only(self, scheme, PinSlot::Pin1, new.digits()).inspect_err(|error| {
+                    if exchange_unanswered(error) {
+                        self.mark_pin1_counter_unanswered();
+                    }
+                })
             }
             ChannelProof::PresentAgain(current) => {
                 lengths.check_pin1(&current).map_err(AuthError::PinLength)?;
                 check_retry_floor(FlooredCredential::Pin1, self.pin1_counter())
                     .map_err(AuthError::RetryFloor)?;
-                let outcome = change(self, scheme, PinSlot::Pin1, current.digits(), new.digits())?;
+                let outcome =
+                    match change(self, scheme, PinSlot::Pin1, current.digits(), new.digits()) {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            if exchange_unanswered(&error) {
+                                self.mark_pin1_counter_unanswered();
+                            }
+                            return Err(error);
+                        }
+                    };
                 self.lower_pin1_counter(outcome);
                 Ok(outcome)
             }
@@ -421,7 +493,15 @@ fn reset_after_puk_pace<T: PukPaceChannel>(
         lengths.check_puk(&puk).map_err(AuthError::PinLength)?;
         check_retry_floor(FlooredCredential::Puk, channel.puk_counter())
             .map_err(AuthError::RetryFloor)?;
-        let verified = verify_puk(channel, scheme, puk.digits())?;
+        let verified = match verify_puk(channel, scheme, puk.digits()) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if exchange_unanswered(&error) {
+                    channel.mark_puk_counter_unanswered();
+                }
+                return Err(error);
+            }
+        };
         channel.lower_puk_counter(verified);
         if !matches!(verified, ManageOutcome::Ok) {
             return Ok(verified);
@@ -432,16 +512,18 @@ fn reset_after_puk_pace<T: PukPaceChannel>(
 
 #[cfg(test)]
 mod tests {
-    use refineid_apdu::{PinRetries, StatusWord};
-
-    use refineid_apdu::{CardTransport, CommandApdu, CredentialCommand, TransportOutcome};
+    use refineid_apdu::{
+        CardTransport, CommandApdu, CredentialCommand, PinRetries, ResponseApdu, StatusWord,
+        TransportOutcome,
+    };
     use refineid_pkcs15::PasswordLengthRange;
 
     use super::{
-        CHANNEL_NUMBERING, ChannelProof, PukPaceChannel, PukPaceChannelOps as _,
-        counter_after_verify, lowered_counter,
+        CHANNEL_NUMBERING, ChannelProof, Pin1PaceChannel, Pin1PaceChannelOps as _, Pin2ChangeError,
+        Pin2PaceChannel, Pin2PaceChannelOps as _, PukPaceChannel, PukPaceChannelOps as _,
+        counter_after_unanswered, counter_after_verify, lowered_counter,
     };
-    use crate::credentials::{Pin1, Puk, UnvalidatedSecret};
+    use crate::credentials::{Pin1, Pin2, Puk, UnvalidatedSecret};
     use crate::manage::ManageOutcome;
     use crate::pin_lengths::CardPinLengths;
     use crate::verify::AuthError;
@@ -458,10 +540,18 @@ mod tests {
     const UNMODELED_SW: u16 = 0x6F00;
     /// The PUK length a synthetic card lists, eight digits.
     const LISTED_PUK_LENGTH: u8 = 8;
+    /// The PIN length a synthetic card lists, six digits.
+    const LISTED_PIN_LENGTH: u8 = 6;
     /// A PUK longer than the listed length, within the role type.
     const LONG_PUK: &[u8] = b"3141592653";
+    /// An eight-digit PUK matching [`LISTED_PUK_LENGTH`].
+    const LISTED_PUK: &[u8] = b"27182818";
+    /// A six-digit current PIN matching [`LISTED_PIN_LENGTH`].
+    const CURRENT_PIN: &[u8] = b"141421";
     /// A new PIN 1.
     const NEW_PIN1: &[u8] = b"161803";
+    /// A new PIN 2.
+    const NEW_PIN2: &[u8] = b"173205";
 
     /// A PUK channel that records whether anything was sent.
     struct SilentChannel {
@@ -491,6 +581,8 @@ mod tests {
         }
 
         fn lower_puk_counter(&mut self, _answer: ManageOutcome) {}
+
+        fn mark_puk_counter_unanswered(&mut self) {}
     }
 
     #[test]
@@ -615,5 +707,329 @@ mod tests {
         for record in [PinStatus::Locked, PinStatus::NoInfo] {
             assert_eq!(lowered_counter(record, wrong(PRISTINE)), record);
         }
+    }
+
+    #[test]
+    fn an_unanswered_presentation_leaves_only_blocked_as_blocked() {
+        let other = PinStatus::Other(StatusWord::from_u16(UNMODELED_SW));
+        for record in [
+            remaining(PRISTINE),
+            remaining(AT_FLOOR),
+            remaining(BELOW_FLOOR),
+            PinStatus::Verified,
+            PinStatus::NoInfo,
+            other,
+        ] {
+            assert_eq!(counter_after_unanswered(record), PinStatus::NoInfo);
+        }
+        assert_eq!(
+            counter_after_unanswered(PinStatus::Locked),
+            PinStatus::Locked
+        );
+    }
+
+    /// How a synthetic channel fails a credential command.
+    #[derive(Clone, Copy)]
+    enum CredentialFault {
+        /// `transmit_credential` fails with a transport error.
+        TransportError,
+        /// `transmit_credential` reports a card-loss state transition.
+        StateTransition,
+    }
+
+    /// A PACE channel whose plain commands succeed (unless `fail_plain`
+    /// is set) and whose credential commands fail with `fault`.
+    struct UnansweredChannel {
+        counter: PinStatus,
+        fail_plain: bool,
+        fault: CredentialFault,
+        credentials_sent: usize,
+    }
+
+    impl UnansweredChannel {
+        const fn new(counter: PinStatus, fault: CredentialFault) -> Self {
+            Self {
+                counter,
+                fail_plain: false,
+                fault,
+                credentials_sent: 0,
+            }
+        }
+    }
+
+    impl CardTransport for UnansweredChannel {
+        type Error = String;
+
+        fn transmit(&mut self, _command: &CommandApdu) -> Result<TransportOutcome, String> {
+            if self.fail_plain {
+                return Err("directory select failed".to_owned());
+            }
+            let [sw1, sw2] = StatusWord::Success.as_u16().to_be_bytes();
+            Ok(TransportOutcome::Response(ResponseApdu {
+                body: Vec::new(),
+                sw1,
+                sw2,
+            }))
+        }
+
+        fn transmit_credential(
+            &mut self,
+            _command: CredentialCommand,
+        ) -> Result<TransportOutcome, String> {
+            self.credentials_sent += 1;
+            match self.fault {
+                CredentialFault::TransportError => Err("secure messaging lost".to_owned()),
+                CredentialFault::StateTransition => Ok(TransportOutcome::NoCard),
+            }
+        }
+    }
+
+    impl PukPaceChannel for UnansweredChannel {
+        fn puk_counter(&self) -> PinStatus {
+            self.counter
+        }
+
+        fn lower_puk_counter(&mut self, answer: ManageOutcome) {
+            self.counter = lowered_counter(self.counter, answer);
+        }
+
+        fn mark_puk_counter_unanswered(&mut self) {
+            self.counter = counter_after_unanswered(self.counter);
+        }
+    }
+
+    impl Pin1PaceChannel for UnansweredChannel {
+        fn pin1_counter(&self) -> PinStatus {
+            self.counter
+        }
+
+        fn lower_pin1_counter(&mut self, answer: ManageOutcome) {
+            self.counter = lowered_counter(self.counter, answer);
+        }
+
+        fn mark_pin1_counter_unanswered(&mut self) {
+            self.counter = counter_after_unanswered(self.counter);
+        }
+    }
+
+    impl Pin2PaceChannel for UnansweredChannel {
+        fn pin2_counter(&self) -> PinStatus {
+            self.counter
+        }
+
+        fn settle_pin2_counter(&mut self, answer: VerifyOutcome) {
+            self.counter = counter_after_verify(self.counter, answer);
+        }
+
+        fn lower_pin2_counter(&mut self, answer: ManageOutcome) {
+            self.counter = lowered_counter(self.counter, answer);
+        }
+
+        fn mark_pin2_counter_unanswered(&mut self) {
+            self.counter = counter_after_unanswered(self.counter);
+        }
+    }
+
+    fn listed_lengths() -> CardPinLengths {
+        let pin_range =
+            PasswordLengthRange::new(LISTED_PIN_LENGTH, LISTED_PIN_LENGTH).expect("PIN range");
+        let puk_range =
+            PasswordLengthRange::new(LISTED_PUK_LENGTH, LISTED_PUK_LENGTH).expect("PUK range");
+        CardPinLengths::from_card(CHANNEL_NUMBERING, None, |reference| {
+            if reference == CHANNEL_NUMBERING.puk_reference() {
+                Some(puk_range)
+            } else {
+                Some(pin_range)
+            }
+        })
+    }
+
+    fn pin1(bytes: &[u8]) -> Pin1 {
+        Pin1::reconstruct(UnvalidatedSecret::from_owned_bytes(bytes.to_vec())).expect("valid PIN 1")
+    }
+
+    fn pin2(bytes: &[u8]) -> Pin2 {
+        Pin2::reconstruct(UnvalidatedSecret::from_owned_bytes(bytes.to_vec())).expect("valid PIN 2")
+    }
+
+    fn puk(bytes: &[u8]) -> Puk {
+        Puk::reconstruct(UnvalidatedSecret::from_owned_bytes(bytes.to_vec())).expect("valid PUK")
+    }
+
+    #[test]
+    fn an_unanswered_pin2_verify_marks_the_record_unknown_and_floors_retry() {
+        for fault in [
+            CredentialFault::TransportError,
+            CredentialFault::StateTransition,
+        ] {
+            let mut channel = UnansweredChannel::new(remaining(PRISTINE), fault);
+            let first = channel.verify_pin2_after_pin2_pace(pin2(CURRENT_PIN));
+            assert!(matches!(
+                first,
+                Err(AuthError::Transport(_) | AuthError::Outcome(_))
+            ));
+            assert_eq!(channel.pin2_counter(), PinStatus::NoInfo);
+            assert_eq!(channel.credentials_sent, 1);
+
+            let second = channel.verify_pin2_after_pin2_pace(pin2(CURRENT_PIN));
+            assert!(matches!(second, Err(AuthError::RetryFloor(_))));
+            assert_eq!(channel.credentials_sent, 1);
+        }
+    }
+
+    #[test]
+    fn an_unanswered_pin2_change_marks_the_record_unknown_only_after_sending() {
+        let lengths = listed_lengths();
+        let mut unreached =
+            UnansweredChannel::new(remaining(PRISTINE), CredentialFault::TransportError);
+        unreached.fail_plain = true;
+        let directory_err = unreached.change_pin2_after_pin2_pace(
+            &lengths,
+            pin2(NEW_PIN2),
+            ChannelProof::PresentAgain(pin2(CURRENT_PIN)),
+        );
+        assert!(matches!(directory_err, Err(Pin2ChangeError::Directory(_))));
+        assert_eq!(unreached.pin2_counter(), remaining(PRISTINE));
+        assert_eq!(unreached.credentials_sent, 0);
+
+        for fault in [
+            CredentialFault::TransportError,
+            CredentialFault::StateTransition,
+        ] {
+            let mut channel = UnansweredChannel::new(remaining(PRISTINE), fault);
+            let first = channel.change_pin2_after_pin2_pace(
+                &lengths,
+                pin2(NEW_PIN2),
+                ChannelProof::PresentAgain(pin2(CURRENT_PIN)),
+            );
+            assert!(matches!(
+                first,
+                Err(Pin2ChangeError::Auth(
+                    AuthError::Transport(_) | AuthError::Outcome(_)
+                ))
+            ));
+            assert_eq!(channel.pin2_counter(), PinStatus::NoInfo);
+            assert_eq!(channel.credentials_sent, 1);
+
+            let second = channel.change_pin2_after_pin2_pace(
+                &lengths,
+                pin2(NEW_PIN2),
+                ChannelProof::PresentAgain(pin2(CURRENT_PIN)),
+            );
+            assert!(matches!(
+                second,
+                Err(Pin2ChangeError::Auth(AuthError::RetryFloor(_)))
+            ));
+            assert_eq!(channel.credentials_sent, 1);
+
+            let mut handshake_channel = UnansweredChannel::new(PinStatus::Verified, fault);
+            let handshake_err = handshake_channel.change_pin2_after_pin2_pace(
+                &lengths,
+                pin2(NEW_PIN2),
+                ChannelProof::PaceHandshake,
+            );
+            assert!(matches!(
+                handshake_err,
+                Err(Pin2ChangeError::Auth(
+                    AuthError::Transport(_) | AuthError::Outcome(_)
+                ))
+            ));
+            assert_eq!(handshake_channel.pin2_counter(), PinStatus::NoInfo);
+            assert_eq!(handshake_channel.credentials_sent, 1);
+
+            let follow_up = handshake_channel.verify_pin2_after_pin2_pace(pin2(CURRENT_PIN));
+            assert!(matches!(follow_up, Err(AuthError::RetryFloor(_))));
+            assert_eq!(handshake_channel.credentials_sent, 1);
+        }
+    }
+
+    #[test]
+    fn an_unanswered_pin1_change_marks_the_record_unknown_and_floors_retry() {
+        let lengths = listed_lengths();
+        for fault in [
+            CredentialFault::TransportError,
+            CredentialFault::StateTransition,
+        ] {
+            let mut channel = UnansweredChannel::new(remaining(PRISTINE), fault);
+            let first = channel.change_pin1_after_pin1_pace(
+                &lengths,
+                pin1(NEW_PIN1),
+                ChannelProof::PresentAgain(pin1(CURRENT_PIN)),
+            );
+            assert!(matches!(
+                first,
+                Err(AuthError::Transport(_) | AuthError::Outcome(_))
+            ));
+            assert_eq!(channel.pin1_counter(), PinStatus::NoInfo);
+            assert_eq!(channel.credentials_sent, 1);
+
+            let second = channel.change_pin1_after_pin1_pace(
+                &lengths,
+                pin1(NEW_PIN1),
+                ChannelProof::PresentAgain(pin1(CURRENT_PIN)),
+            );
+            assert!(matches!(second, Err(AuthError::RetryFloor(_))));
+            assert_eq!(channel.credentials_sent, 1);
+
+            let mut handshake_channel = UnansweredChannel::new(PinStatus::Verified, fault);
+            let handshake_err = handshake_channel.change_pin1_after_pin1_pace(
+                &lengths,
+                pin1(NEW_PIN1),
+                ChannelProof::PaceHandshake,
+            );
+            assert!(matches!(
+                handshake_err,
+                Err(AuthError::Transport(_) | AuthError::Outcome(_))
+            ));
+            assert_eq!(handshake_channel.pin1_counter(), PinStatus::NoInfo);
+            assert_eq!(handshake_channel.credentials_sent, 1);
+
+            let follow_up = handshake_channel.change_pin1_after_pin1_pace(
+                &lengths,
+                pin1(NEW_PIN1),
+                ChannelProof::PresentAgain(pin1(CURRENT_PIN)),
+            );
+            assert!(matches!(follow_up, Err(AuthError::RetryFloor(_))));
+            assert_eq!(handshake_channel.credentials_sent, 1);
+        }
+    }
+
+    #[test]
+    fn an_unanswered_puk_verify_marks_the_record_unknown_and_preserves_locked() {
+        let lengths = listed_lengths();
+        for fault in [
+            CredentialFault::TransportError,
+            CredentialFault::StateTransition,
+        ] {
+            let mut channel = UnansweredChannel::new(remaining(PRISTINE), fault);
+            let first = channel.reset_pin1_after_puk_pace(
+                &lengths,
+                pin1(NEW_PIN1),
+                ChannelProof::PresentAgain(puk(LISTED_PUK)),
+            );
+            assert!(matches!(
+                first,
+                Err(AuthError::Transport(_) | AuthError::Outcome(_))
+            ));
+            assert_eq!(channel.puk_counter(), PinStatus::NoInfo);
+            assert_eq!(channel.credentials_sent, 1);
+
+            let second = channel.reset_pin2_after_puk_pace(
+                &lengths,
+                pin2(NEW_PIN2),
+                ChannelProof::PresentAgain(puk(LISTED_PUK)),
+            );
+            assert!(matches!(second, Err(AuthError::RetryFloor(_))));
+            assert_eq!(channel.credentials_sent, 1);
+        }
+
+        let mut locked = UnansweredChannel::new(PinStatus::Locked, CredentialFault::TransportError);
+        let err = locked.reset_pin1_after_puk_pace(
+            &lengths,
+            pin1(NEW_PIN1),
+            ChannelProof::PresentAgain(puk(LISTED_PUK)),
+        );
+        assert!(matches!(err, Err(AuthError::Transport(_))));
+        assert_eq!(locked.puk_counter(), PinStatus::Locked);
     }
 }

@@ -44,7 +44,8 @@ pub use credentials::{
 pub use manage::{ManageOutcome, PinManageOps, classify_manage_sw};
 pub use pace_channel::{
     ChannelProof, Pin1PaceChannel, Pin1PaceChannelOps, Pin2ChangeError, Pin2PaceChannel,
-    Pin2PaceChannelOps, PukPaceChannel, PukPaceChannelOps, counter_after_verify, lowered_counter,
+    Pin2PaceChannelOps, PukPaceChannel, PukPaceChannelOps, counter_after_unanswered,
+    counter_after_verify, lowered_counter,
 };
 pub use pace_password::{PACE_PASSWORD_KEY_LEN, PacePasswordKey};
 pub use pin_lengths::{

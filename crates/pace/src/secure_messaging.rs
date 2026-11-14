@@ -519,6 +519,10 @@ impl<T: CardTransport> PukPaceChannel for SmTransport<T, OpenedByPuk> {
     fn lower_puk_counter(&mut self, answer: ManageOutcome) {
         self.opened_by.lower(answer);
     }
+
+    fn mark_puk_counter_unanswered(&mut self) {
+        self.opened_by.mark_unanswered();
+    }
 }
 
 /// The channel only a PACE handshake with PIN 2 opens: the PIN 2
@@ -537,6 +541,10 @@ impl<T: CardTransport> Pin2PaceChannel for SmTransport<T, OpenedByPin2> {
     fn lower_pin2_counter(&mut self, answer: ManageOutcome) {
         self.opened_by.lower(answer);
     }
+
+    fn mark_pin2_counter_unanswered(&mut self) {
+        self.opened_by.mark_unanswered();
+    }
 }
 
 /// The channel only a PACE handshake with PIN 1 opens: the PIN 1 change
@@ -548,6 +556,10 @@ impl<T: CardTransport> Pin1PaceChannel for SmTransport<T, OpenedByPin1> {
 
     fn lower_pin1_counter(&mut self, answer: ManageOutcome) {
         self.opened_by.lower(answer);
+    }
+
+    fn mark_pin1_counter_unanswered(&mut self) {
+        self.opened_by.mark_unanswered();
     }
 }
 

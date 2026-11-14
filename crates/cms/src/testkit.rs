@@ -57,6 +57,10 @@ pub const SEQUENCE: u8 = 0x30;
 pub const SET: u8 = 0x31;
 /// Context-specific primitive `[0]`.
 pub const CONTEXT_0_PRIMITIVE: u8 = 0x80;
+/// Context-specific primitive `[1]`: TBS `issuerUniqueID`.
+pub const CONTEXT_1_PRIMITIVE: u8 = 0x81;
+/// Context-specific primitive `[2]`: TBS `subjectUniqueID`.
+pub const CONTEXT_2_PRIMITIVE: u8 = 0x82;
 /// Context-specific constructed `[0]`.
 pub const CONTEXT_0: u8 = 0xA0;
 /// Context-specific constructed `[1]`.

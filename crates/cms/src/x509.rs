@@ -329,14 +329,6 @@ pub struct Name<'a> {
 }
 
 impl<'a> Name<'a> {
-    /// Wrap DN bytes taken whole from a parsed structure (e.g. the
-    /// `subject`/`issuer` field of a parsed [`Certificate`]), whose
-    /// parser read them as one TLV. No further check.
-    #[must_use]
-    pub(crate) const fn from_validated(dn_der: &'a [u8]) -> Self {
-        Self { dn_der }
-    }
-
     /// The DN's DER bytes (e.g. for an OCSP `IssuerNameHash`).
     #[must_use]
     pub const fn as_der(&self) -> &'a [u8] {
@@ -357,7 +349,7 @@ impl<'a> TryFrom<&'a [u8]> for Name<'a> {
         if any.tag() != Tag::Sequence {
             return Err(X509Error::UnexpectedStructure("Name not SEQUENCE"));
         }
-        Ok(Self::from_validated(dn_der))
+        Ok(Self { dn_der })
     }
 }
 
@@ -474,13 +466,22 @@ impl<'a> Certificate<'a> {
         let sig_tlv = reader
             .tlv_bytes()
             .map_err(|_ignored| X509Error::UnexpectedStructure("signature"))?;
+        if !reader.is_finished() {
+            return Err(X509Error::UnexpectedStructure(
+                "Certificate trailing fields",
+            ));
+        }
 
         // signatureAlgorithm SEQUENCE { OID, params? } -- the OID body
         // (input-borrowed) feeds the project's Oid wrapper. `Oid::new`
         // rejects empty content / unterminated arcs.
-        let sig_alg = AnyRef::from_der(sig_alg_tlv).map_err(|_ignored| {
-            X509Error::UnexpectedStructure("signatureAlgorithm not SEQUENCE")
-        })?;
+        let sig_alg = AnyRef::from_der(sig_alg_tlv)
+            .map_err(|_ignored| X509Error::UnexpectedStructure("signatureAlgorithm not a TLV"))?;
+        if sig_alg.tag() != Tag::Sequence {
+            return Err(X509Error::UnexpectedStructure(
+                "signatureAlgorithm not SEQUENCE",
+            ));
+        }
         let mut alg_reader = SliceReader::new(sig_alg.value())
             .map_err(|_ignored| X509Error::UnexpectedStructure("signatureAlgorithm body"))?;
         let oid_tlv = alg_reader
@@ -489,9 +490,25 @@ impl<'a> Certificate<'a> {
         let oid_any = AnyRef::from_der(oid_tlv).map_err(|_ignored| {
             X509Error::UnexpectedStructure("signatureAlgorithm OID malformed")
         })?;
+        if oid_any.tag() != Tag::ObjectIdentifier {
+            return Err(X509Error::UnexpectedStructure(
+                "signatureAlgorithm OID not OBJECT IDENTIFIER",
+            ));
+        }
         let signature_alg_oid = Oid::new(oid_any.value()).or(Err(
             X509Error::UnexpectedStructure("signatureAlgorithm OID malformed"),
         ))?;
+        if !alg_reader.is_finished() {
+            let _parameters = AnyRef::from_der(alg_reader.tlv_bytes().map_err(|_ignored| {
+                X509Error::UnexpectedStructure("signatureAlgorithm parameters")
+            })?)
+            .map_err(|_ignored| X509Error::UnexpectedStructure("signatureAlgorithm parameters"))?;
+            if !alg_reader.is_finished() {
+                return Err(X509Error::UnexpectedStructure(
+                    "signatureAlgorithm trailing fields",
+                ));
+            }
+        }
 
         // signature BIT STRING (RFC 5280 sec.4.1.1.3) -- whole octets
         // behind a zero unused-bits octet.
@@ -528,9 +545,9 @@ struct ParsedTbs<'a> {
 /// [`Certificate`].
 ///
 /// RFC 5280 §4.1.2 -- `TBSCertificate` carries every field
-/// covered by the issuer's signature. `tbs_der` is the
-/// unwrapped SEQUENCE bytes (the parser pre-strips the outer
-/// tag); `raw` is the full certificate DER; `signature_alg_oid`
+/// covered by the issuer's signature. `tbs_der` is the whole
+/// `TBSCertificate` `SEQUENCE` TLV (tag, length, and value);
+/// `raw` is the full certificate DER; `signature_alg_oid`
 /// and `signature_bits` come from the outer wrapper. Caller
 /// compares the returned inner `signature` field with the wrapper's
 /// `signatureAlgorithm`.
@@ -548,17 +565,59 @@ fn parse_tbs<'a>(
     //     validity        SEQUENCE { notBefore Time, notAfter Time },
     //     subject         Name,
     //     subjectPublicKeyInfo SubjectPublicKeyInfo,
-    //     ...
+    //     issuerUniqueID  [1] IMPLICIT UniqueIdentifier OPTIONAL,
+    //     subjectUniqueID [2] IMPLICIT UniqueIdentifier OPTIONAL,
     //     extensions      [3] EXPLICIT Extensions OPTIONAL
     // }
-    use spki::der::asn1::AnyRef;
+    use spki::der::asn1::{AnyRef, UintRef};
     use spki::der::{Decode as _, Reader as _, SliceReader, Tag, TagNumber, Tagged as _};
 
-    // [0] EXPLICIT version wrapper / [3] EXPLICIT extensions wrapper
-    // context tags (constructed).
+    /// X.509 `TBSCertificate` `Version` values (RFC 5280 §4.1.2.1).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum TbsVersion {
+        /// `v1(0)` -- default when `[0]` is absent.
+        V1,
+        /// `v2(1)` -- permits `issuerUniqueID` and `subjectUniqueID`.
+        V2,
+        /// `v3(2)` -- permits `issuerUniqueID`, `subjectUniqueID`, and `extensions`.
+        V3,
+    }
+
+    /// Progression through the optional trailing fields of `TBSCertificate`
+    /// (`issuerUniqueID [1]`, `subjectUniqueID [2]`, `extensions [3]`) per
+    /// RFC 5280 §4.1.2.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum TrailingStage {
+        /// Before any optional trailing field.
+        BeforeIssuerUniqueId,
+        /// After `issuerUniqueID [1]`.
+        AfterIssuerUniqueId,
+        /// After `subjectUniqueID [2]`.
+        AfterSubjectUniqueId,
+        /// After `extensions [3]`; no further fields may follow.
+        AfterExtensions,
+    }
+
+    /// `Version` `v1(0)` (RFC 5280 §4.1).
+    const X509_VERSION_V1: u8 = 0;
+    /// `Version` `v2(1)` (RFC 5280 §4.1).
+    const X509_VERSION_V2: u8 = 1;
+    /// `Version` `v3(2)` (RFC 5280 §4.1).
+    const X509_VERSION_V3: u8 = 2;
+
+    // [0] EXPLICIT version wrapper / [1], [2] IMPLICIT UniqueIdentifier /
+    // [3] EXPLICIT extensions wrapper context tags.
     const VERSION_TAG: Tag = Tag::ContextSpecific {
         constructed: true,
         number: TagNumber(0),
+    };
+    const ISSUER_UNIQUE_ID_TAG: Tag = Tag::ContextSpecific {
+        constructed: false,
+        number: TagNumber(1),
+    };
+    const SUBJECT_UNIQUE_ID_TAG: Tag = Tag::ContextSpecific {
+        constructed: false,
+        number: TagNumber(2),
     };
     const EXTENSIONS_TAG: Tag = Tag::ContextSpecific {
         constructed: true,
@@ -576,22 +635,32 @@ fn parse_tbs<'a>(
         .map_err(|_ignored| X509Error::UnexpectedStructure("tbsCertificate body"))?;
 
     // version [0] EXPLICIT (optional) then serialNumber INTEGER. Read
-    // the first child; if it is the [0] wrapper, the serial is next.
+    // the first child; if it is the [0] wrapper, validate its inner
+    // RFC 5280 Version (0..=2) and read the serial next.
     let first = AnyRef::from_der(
         reader
             .tlv_bytes()
             .map_err(|_ignored| X509Error::UnexpectedStructure("TBS first field"))?,
     )
     .map_err(|_ignored| X509Error::UnexpectedStructure("TBS first field"))?;
-    let serial_any = if first.tag() == VERSION_TAG {
-        AnyRef::from_der(
+    let (tbs_version, serial_any) = if first.tag() == VERSION_TAG {
+        let version_uint = UintRef::from_der(first.value())
+            .map_err(|_ignored| X509Error::UnexpectedStructure("TBS version"))?;
+        let parsed_version = match version_uint.as_bytes() {
+            [] | [X509_VERSION_V1] => TbsVersion::V1,
+            [X509_VERSION_V2] => TbsVersion::V2,
+            [X509_VERSION_V3] => TbsVersion::V3,
+            _ => return Err(X509Error::UnexpectedStructure("TBS version")),
+        };
+        let next = AnyRef::from_der(
             reader
                 .tlv_bytes()
                 .map_err(|_ignored| X509Error::UnexpectedStructure("serialNumber"))?,
         )
-        .map_err(|_ignored| X509Error::UnexpectedStructure("serialNumber"))?
+        .map_err(|_ignored| X509Error::UnexpectedStructure("serialNumber"))?;
+        (parsed_version, next)
     } else {
-        first
+        (TbsVersion::V1, first)
     };
     let serial_der = SerialNumber::parse(serial_any)?;
 
@@ -601,13 +670,12 @@ fn parse_tbs<'a>(
         .tlv_bytes()
         .map_err(|_ignored| X509Error::UnexpectedStructure("TBS signature alg"))?;
 
-    // issuer Name -- the whole TLV bytes (tag/len/value), read as one
-    // TLV by the walk above and wrapped as they are.
-    let issuer = Name::from_validated(
+    // issuer Name -- validated as a single SEQUENCE TLV via Name::try_from.
+    let issuer = Name::try_from(
         reader
             .tlv_bytes()
             .map_err(|_ignored| X509Error::UnexpectedStructure("issuer"))?,
-    );
+    )?;
 
     // validity SEQUENCE { notBefore, notAfter } -- decoded by
     // x509-cert from the whole TLV bytes.
@@ -622,12 +690,12 @@ fn parse_tbs<'a>(
         validity.not_after.to_date_time(),
     );
 
-    // subject Name -- the whole SEQUENCE bytes.
-    let subject = Name::from_validated(
+    // subject Name -- validated as a single SEQUENCE TLV via Name::try_from.
+    let subject = Name::try_from(
         reader
             .tlv_bytes()
             .map_err(|_ignored| X509Error::UnexpectedStructure("subject"))?,
-    );
+    )?;
 
     // subjectPublicKeyInfo -- whole SEQUENCE bytes, parse-validated
     // via SpkiDer.
@@ -636,8 +704,10 @@ fn parse_tbs<'a>(
         .map_err(|_ignored| X509Error::UnexpectedStructure("subjectPublicKeyInfo"))?;
     let spki: SpkiDer<'_> = spki_der_bytes.try_into()?;
 
-    // Remaining children may be issuerUniqueID [1], subjectUniqueID
-    // [2], and extensions [3] EXPLICIT. We only care about extensions.
+    // Remaining optional children: issuerUniqueID [1] IMPLICIT BIT STRING,
+    // subjectUniqueID [2] IMPLICIT BIT STRING, and extensions [3] EXPLICIT
+    // Extensions, in strictly ascending tag order without duplicates.
+    let mut stage = TrailingStage::BeforeIssuerUniqueId;
     let mut extensions: Option<&[u8]> = None;
     while !reader.is_finished() {
         let child = AnyRef::from_der(
@@ -646,12 +716,39 @@ fn parse_tbs<'a>(
                 .map_err(|_ignored| X509Error::UnexpectedStructure("TBS trailing field"))?,
         )
         .map_err(|_ignored| X509Error::UnexpectedStructure("TBS trailing field"))?;
-        if child.tag() == EXTENSIONS_TAG {
-            // [3] EXPLICIT wraps a SEQUENCE OF Extension; carry that
-            // inner SEQUENCE's value bytes.
+        if child.tag() == ISSUER_UNIQUE_ID_TAG
+            && matches!(tbs_version, TbsVersion::V2 | TbsVersion::V3)
+            && matches!(stage, TrailingStage::BeforeIssuerUniqueId)
+        {
+            X509Helpers::validate_implicit_bit_string(child.value(), "issuerUniqueID")?;
+            stage = TrailingStage::AfterIssuerUniqueId;
+        } else if child.tag() == SUBJECT_UNIQUE_ID_TAG
+            && matches!(tbs_version, TbsVersion::V2 | TbsVersion::V3)
+            && matches!(
+                stage,
+                TrailingStage::BeforeIssuerUniqueId | TrailingStage::AfterIssuerUniqueId
+            )
+        {
+            X509Helpers::validate_implicit_bit_string(child.value(), "subjectUniqueID")?;
+            stage = TrailingStage::AfterSubjectUniqueId;
+        } else if child.tag() == EXTENSIONS_TAG
+            && matches!(tbs_version, TbsVersion::V3)
+            && !matches!(stage, TrailingStage::AfterExtensions)
+        {
+            // [3] EXPLICIT wraps a non-empty SEQUENCE OF Extension (RFC 5280
+            // §4.1.2.9, §4.2); carry that inner SEQUENCE's value bytes.
             let inner_seq = AnyRef::from_der(child.value())
-                .map_err(|_ignored| X509Error::UnexpectedStructure("extensions not SEQUENCE"))?;
+                .map_err(|_ignored| X509Error::UnexpectedStructure("extensions not a TLV"))?;
+            if inner_seq.tag() != Tag::Sequence {
+                return Err(X509Error::UnexpectedStructure("extensions not SEQUENCE"));
+            }
+            if inner_seq.value().is_empty() {
+                return Err(X509Error::UnexpectedStructure("empty extensions"));
+            }
             extensions = Some(inner_seq.value());
+            stage = TrailingStage::AfterExtensions;
+        } else {
+            return Err(X509Error::UnexpectedStructure("TBS trailing field"));
         }
     }
 
@@ -679,6 +776,25 @@ fn parse_tbs<'a>(
 struct X509Helpers;
 
 impl X509Helpers {
+    /// Validate the value bytes of an `IMPLICIT BIT STRING` field under DER
+    /// rules (X.690 §8.6, §11.2.1): leading unused-bits count `0..=7`, zero
+    /// when no content octets follow, and unused low bits cleared.
+    fn validate_implicit_bit_string(value: &[u8], what: &'static str) -> Result<(), X509Error> {
+        let &[unused_bits, ref octets @ ..] = value else {
+            return Err(X509Error::UnexpectedStructure(what));
+        };
+        spki::der::asn1::BitStringRef::new(unused_bits, octets)
+            .map_err(|_ignored| X509Error::UnexpectedStructure(what))?;
+        if unused_bits > 0
+            && octets
+                .last()
+                .is_some_and(|&last| last & ((1_u8 << unused_bits) - 1) != 0)
+        {
+            return Err(X509Error::UnexpectedStructure(what));
+        }
+        Ok(())
+    }
+
     /// Find the first extension whose OID matches `oid_value`
     /// and return the wrapped `extnValue` OCTET STRING contents
     /// (the inner DER). The extension SEQUENCE is `{ OID,
@@ -995,8 +1111,8 @@ pub struct TbsSignature<'a> {
 /// and basic-OCSP-response verification.
 ///
 /// # Errors
-/// [`VerifyError`] variants as listed; only RSA-PKCS1v15 SHA-256
-/// is implemented today.
+/// [`VerifyError`] variants as listed; implements RSASSA-PKCS1-v1_5 and
+/// ECDSA over SHA-256, SHA-384, and SHA-512.
 pub fn verify_tbs_signature(
     TbsSignature {
         tbs_der,
@@ -2747,6 +2863,280 @@ mod tests {
         assert_eq!(
             Certificate::from_der(&octet_string).map(|_parsed| ()),
             Err(X509Error::UnexpectedStructure("serialNumber not INTEGER"))
+        );
+    }
+
+    #[test]
+    fn certificate_rejects_trailing_outer_fields() {
+        use crate::testkit;
+
+        let (key, tbs) = strictness_fixture();
+        let mut body = tbs.clone();
+        body.extend_from_slice(&key.algorithm_identifier());
+        body.extend_from_slice(&testkit::bit_string(&key.sign(&tbs)));
+        body.extend_from_slice(&testkit::tlv(testkit::NULL, []));
+        let with_trailing = testkit::tlv(testkit::SEQUENCE, body);
+        assert_eq!(
+            Certificate::from_der(&with_trailing).map(|_parsed| ()),
+            Err(X509Error::UnexpectedStructure(
+                "Certificate trailing fields"
+            ))
+        );
+    }
+
+    #[test]
+    fn certificate_signature_algorithm_validates_sequence_oid_and_arity() {
+        use crate::oid::known;
+        use crate::testkit;
+
+        /// Serial value octet of the fixture certificate.
+        const SERIAL: u8 = 9;
+        /// First validity day.
+        const FIRST_DAY: u8 = 1;
+        /// Last validity day.
+        const LAST_DAY: u8 = 28;
+
+        let (key, _tbs) = strictness_fixture();
+        let cert_with_sig_alg = |sig_alg: &[u8]| {
+            let mut tbs = testkit::tlv(
+                testkit::CONTEXT_0,
+                testkit::tlv(testkit::INTEGER, [testkit::X509_VERSION_3]),
+            );
+            tbs.extend_from_slice(&testkit::tlv(testkit::INTEGER, [SERIAL]));
+            tbs.extend_from_slice(sig_alg);
+            tbs.extend_from_slice(&testkit::name("SigAlg Test"));
+            let mut validity = testkit::utc_time(testkit::day(FIRST_DAY));
+            validity.extend_from_slice(&testkit::utc_time(testkit::day(LAST_DAY)));
+            tbs.extend_from_slice(&testkit::tlv(testkit::SEQUENCE, validity));
+            tbs.extend_from_slice(&testkit::name("SigAlg Test"));
+            tbs.extend_from_slice(&key.spki());
+            let tbs_seq = testkit::tlv(testkit::SEQUENCE, tbs);
+            let mut cert_body = tbs_seq.clone();
+            cert_body.extend_from_slice(sig_alg);
+            cert_body.extend_from_slice(&testkit::bit_string(&key.sign(&tbs_seq)));
+            testkit::tlv(testkit::SEQUENCE, cert_body)
+        };
+
+        let non_sequence = testkit::tlv(
+            testkit::OCTET_STRING,
+            testkit::tlv(
+                testkit::OBJECT_IDENTIFIER,
+                known::ECDSA_WITH_SHA256.as_bytes(),
+            ),
+        );
+        assert_eq!(
+            Certificate::from_der(&cert_with_sig_alg(&non_sequence)).map(|_parsed| ()),
+            Err(X509Error::UnexpectedStructure(
+                "signatureAlgorithm not SEQUENCE"
+            ))
+        );
+
+        let non_oid = testkit::tlv(
+            testkit::SEQUENCE,
+            testkit::tlv(testkit::OCTET_STRING, known::ECDSA_WITH_SHA256.as_bytes()),
+        );
+        assert_eq!(
+            Certificate::from_der(&cert_with_sig_alg(&non_oid)).map(|_parsed| ()),
+            Err(X509Error::UnexpectedStructure(
+                "signatureAlgorithm OID not OBJECT IDENTIFIER"
+            ))
+        );
+
+        let mut with_null_param_body = testkit::tlv(
+            testkit::OBJECT_IDENTIFIER,
+            known::SHA256_WITH_RSA.as_bytes(),
+        );
+        with_null_param_body.extend_from_slice(&testkit::tlv(testkit::NULL, []));
+        let with_null_param = testkit::tlv(testkit::SEQUENCE, &with_null_param_body);
+        Certificate::from_der(&cert_with_sig_alg(&with_null_param))
+            .expect("single optional parameter parses");
+
+        let mut extra_field_body = with_null_param_body;
+        extra_field_body.extend_from_slice(&testkit::tlv(testkit::NULL, []));
+        let extra_field = testkit::tlv(testkit::SEQUENCE, extra_field_body);
+        assert_eq!(
+            Certificate::from_der(&cert_with_sig_alg(&extra_field)).map(|_parsed| ()),
+            Err(X509Error::UnexpectedStructure(
+                "signatureAlgorithm trailing fields"
+            ))
+        );
+    }
+
+    #[test]
+    fn certificate_issuer_and_subject_must_be_sequences() {
+        use crate::testkit;
+
+        /// Serial value octet of the fixture certificate.
+        const SERIAL: u8 = 11;
+        /// First validity day.
+        const FIRST_DAY: u8 = 1;
+        /// Last validity day.
+        const LAST_DAY: u8 = 28;
+
+        let (key, _tbs) = strictness_fixture();
+        let cert_with_names = |issuer: &[u8], subject: &[u8]| {
+            let mut tbs = testkit::tlv(
+                testkit::CONTEXT_0,
+                testkit::tlv(testkit::INTEGER, [testkit::X509_VERSION_3]),
+            );
+            tbs.extend_from_slice(&testkit::tlv(testkit::INTEGER, [SERIAL]));
+            tbs.extend_from_slice(&key.algorithm_identifier());
+            tbs.extend_from_slice(issuer);
+            let mut validity = testkit::utc_time(testkit::day(FIRST_DAY));
+            validity.extend_from_slice(&testkit::utc_time(testkit::day(LAST_DAY)));
+            tbs.extend_from_slice(&testkit::tlv(testkit::SEQUENCE, validity));
+            tbs.extend_from_slice(subject);
+            tbs.extend_from_slice(&key.spki());
+            testkit::signed(&testkit::tlv(testkit::SEQUENCE, tbs), &key)
+        };
+
+        let valid_name = testkit::name("Valid Name");
+        let bad_name = testkit::tlv(testkit::OCTET_STRING, b"Not a SEQUENCE");
+
+        assert_eq!(
+            Certificate::from_der(&cert_with_names(&bad_name, &valid_name)).map(|_parsed| ()),
+            Err(X509Error::UnexpectedStructure("Name not SEQUENCE"))
+        );
+        assert_eq!(
+            Certificate::from_der(&cert_with_names(&valid_name, &bad_name)).map(|_parsed| ()),
+            Err(X509Error::UnexpectedStructure("Name not SEQUENCE"))
+        );
+    }
+
+    #[test]
+    fn certificate_tbs_version_and_trailing_fields_are_validated() {
+        use crate::testkit;
+
+        /// Serial value octet of the fixture certificate.
+        const SERIAL: u8 = 13;
+        /// First validity day.
+        const FIRST_DAY: u8 = 1;
+        /// Last validity day.
+        const LAST_DAY: u8 = 28;
+
+        let (key, _tbs) = strictness_fixture();
+        let cert_with_version_and_tail = |version_tlv: &[u8], tail: &[u8]| {
+            let mut tbs = version_tlv.to_vec();
+            tbs.extend_from_slice(&testkit::tlv(testkit::INTEGER, [SERIAL]));
+            tbs.extend_from_slice(&key.algorithm_identifier());
+            tbs.extend_from_slice(&testkit::name("Tail Test"));
+            let mut validity = testkit::utc_time(testkit::day(FIRST_DAY));
+            validity.extend_from_slice(&testkit::utc_time(testkit::day(LAST_DAY)));
+            tbs.extend_from_slice(&testkit::tlv(testkit::SEQUENCE, validity));
+            tbs.extend_from_slice(&testkit::name("Tail Test"));
+            tbs.extend_from_slice(&key.spki());
+            tbs.extend_from_slice(tail);
+            testkit::signed(&testkit::tlv(testkit::SEQUENCE, tbs), &key)
+        };
+
+        let v3 = testkit::tlv(
+            testkit::CONTEXT_0,
+            testkit::tlv(testkit::INTEGER, [testkit::X509_VERSION_3]),
+        );
+        let bad_version = testkit::tlv(
+            testkit::CONTEXT_0,
+            testkit::tlv(testkit::OCTET_STRING, [testkit::X509_VERSION_3]),
+        );
+        assert_eq!(
+            Certificate::from_der(&cert_with_version_and_tail(&bad_version, &[])).map(|_parsed| ()),
+            Err(X509Error::UnexpectedStructure("TBS version"))
+        );
+
+        let issuer_uid = testkit::tlv(
+            testkit::CONTEXT_1_PRIMITIVE,
+            [testkit::NO_UNUSED_BITS, b'I'],
+        );
+        let subject_uid = testkit::tlv(
+            testkit::CONTEXT_2_PRIMITIVE,
+            [testkit::NO_UNUSED_BITS, b'S'],
+        );
+        let ext_inner = testkit::ca_basic_constraints();
+        let ext_wrapped = testkit::tlv(
+            testkit::CONTEXT_3,
+            testkit::tlv(testkit::SEQUENCE, &ext_inner),
+        );
+
+        let mut valid_tail = issuer_uid.clone();
+        valid_tail.extend_from_slice(&subject_uid);
+        valid_tail.extend_from_slice(&ext_wrapped);
+        let parsed_cert = cert_with_version_and_tail(&v3, &valid_tail);
+        let parsed =
+            Certificate::from_der(&parsed_cert).expect("ordered unique IDs and extensions parse");
+        assert_eq!(parsed.extensions, Some(ext_inner.as_slice()));
+
+        let non_seq_ext = testkit::tlv(
+            testkit::CONTEXT_3,
+            testkit::tlv(testkit::OCTET_STRING, &ext_inner),
+        );
+        assert_eq!(
+            Certificate::from_der(&cert_with_version_and_tail(&v3, &non_seq_ext)).map(|_parsed| ()),
+            Err(X509Error::UnexpectedStructure("extensions not SEQUENCE"))
+        );
+
+        let mut dup_ext = ext_wrapped.clone();
+        dup_ext.extend_from_slice(&ext_wrapped);
+        assert_eq!(
+            Certificate::from_der(&cert_with_version_and_tail(&v3, &dup_ext)).map(|_parsed| ()),
+            Err(X509Error::UnexpectedStructure("TBS trailing field"))
+        );
+
+        let mut reversed_uids = subject_uid;
+        reversed_uids.extend_from_slice(&issuer_uid);
+        assert_eq!(
+            Certificate::from_der(&cert_with_version_and_tail(&v3, &reversed_uids))
+                .map(|_parsed| ()),
+            Err(X509Error::UnexpectedStructure("TBS trailing field"))
+        );
+
+        /// Out-of-range X.509 version integer (`v3` is encoded as `2`).
+        const OUT_OF_RANGE_VERSION: u8 = 3;
+        /// Non-zero unused-bits count for testing X.690 §11.2.1 padding.
+        const ONE_UNUSED_BIT: u8 = 1;
+        /// Final octet with the single unused trailing bit set (`1`).
+        const UNCLEARED_LOW_BIT: u8 = 1;
+
+        let out_of_range_version = testkit::tlv(
+            testkit::CONTEXT_0,
+            testkit::tlv(testkit::INTEGER, [OUT_OF_RANGE_VERSION]),
+        );
+        assert_eq!(
+            Certificate::from_der(&cert_with_version_and_tail(&out_of_range_version, &[]))
+                .map(|_parsed| ()),
+            Err(X509Error::UnexpectedStructure("TBS version"))
+        );
+
+        assert_eq!(
+            Certificate::from_der(&cert_with_version_and_tail(&[], &ext_wrapped)).map(|_parsed| ()),
+            Err(X509Error::UnexpectedStructure("TBS trailing field"))
+        );
+
+        let empty_ext = testkit::tlv(testkit::CONTEXT_3, testkit::tlv(testkit::SEQUENCE, []));
+        assert_eq!(
+            Certificate::from_der(&cert_with_version_and_tail(&v3, &empty_ext)).map(|_parsed| ()),
+            Err(X509Error::UnexpectedStructure("empty extensions"))
+        );
+
+        let unpadded_uid = testkit::tlv(
+            testkit::CONTEXT_1_PRIMITIVE,
+            [ONE_UNUSED_BIT, UNCLEARED_LOW_BIT],
+        );
+        assert_eq!(
+            Certificate::from_der(&cert_with_version_and_tail(&v3, &unpadded_uid))
+                .map(|_parsed| ()),
+            Err(X509Error::UnexpectedStructure("issuerUniqueID"))
+        );
+
+        let empty_uid = testkit::tlv(testkit::CONTEXT_1_PRIMITIVE, []);
+        assert_eq!(
+            Certificate::from_der(&cert_with_version_and_tail(&v3, &empty_uid)).map(|_parsed| ()),
+            Err(X509Error::UnexpectedStructure("issuerUniqueID"))
+        );
+
+        let unknown_tail = testkit::tlv(testkit::NULL, []);
+        assert_eq!(
+            Certificate::from_der(&cert_with_version_and_tail(&v3, &unknown_tail))
+                .map(|_parsed| ()),
+            Err(X509Error::UnexpectedStructure("TBS trailing field"))
         );
     }
 }

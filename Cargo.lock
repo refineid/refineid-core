@@ -1060,7 +1060,7 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "refineid-apdu"
-version = "26.11.10"
+version = "26.11.14"
 dependencies = [
  "refineid-build-number",
  "serde",
@@ -1070,11 +1070,11 @@ dependencies = [
 
 [[package]]
 name = "refineid-atr"
-version = "26.11.10"
+version = "26.11.14"
 
 [[package]]
 name = "refineid-auth"
-version = "26.11.10"
+version = "26.11.14"
 dependencies = [
  "hmac",
  "refineid-apdu",
@@ -1088,15 +1088,15 @@ dependencies = [
 
 [[package]]
 name = "refineid-ber"
-version = "26.11.10"
+version = "26.11.14"
 
 [[package]]
 name = "refineid-build-number"
-version = "26.11.10"
+version = "26.11.14"
 
 [[package]]
 name = "refineid-ccid"
-version = "26.11.10"
+version = "26.11.14"
 dependencies = [
  "refineid-apdu",
  "refineid-atr",
@@ -1105,7 +1105,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-cms"
-version = "26.11.10"
+version = "26.11.14"
 dependencies = [
  "const-oid",
  "crypto-bigint",
@@ -1121,7 +1121,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-digest"
-version = "26.11.10"
+version = "26.11.14"
 dependencies = [
  "md-5",
  "sha1",
@@ -1130,7 +1130,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-doc-sign"
-version = "26.11.10"
+version = "26.11.14"
 dependencies = [
  "const-oid",
  "crypto-bigint",
@@ -1157,7 +1157,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-emrtd"
-version = "26.11.10"
+version = "26.11.14"
 dependencies = [
  "refineid-apdu",
  "refineid-ber",
@@ -1165,7 +1165,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-pace"
-version = "26.11.10"
+version = "26.11.14"
 dependencies = [
  "aes 0.9.4",
  "bp384",
@@ -1188,7 +1188,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-pcsc"
-version = "26.11.10"
+version = "26.11.14"
 dependencies = [
  "pcsc",
  "refineid-apdu",
@@ -1197,7 +1197,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-pin-cache"
-version = "26.11.10"
+version = "26.11.14"
 dependencies = [
  "getrandom 0.4.3",
  "refineid-auth",
@@ -1208,7 +1208,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-pkcs11"
-version = "26.11.10"
+version = "26.11.14"
 dependencies = [
  "getrandom 0.4.3",
  "hex",
@@ -1230,7 +1230,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-pkcs15"
-version = "26.11.10"
+version = "26.11.14"
 dependencies = [
  "refineid-apdu",
  "refineid-ber",
@@ -1239,7 +1239,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-rapp"
-version = "26.11.10"
+version = "26.11.14"
 dependencies = [
  "chacha20poly1305",
  "curve25519-dalek",
@@ -1260,14 +1260,14 @@ dependencies = [
 
 [[package]]
 name = "refineid-remote"
-version = "26.11.10"
+version = "26.11.14"
 dependencies = [
  "refineid-digest",
 ]
 
 [[package]]
 name = "refineid-scs"
-version = "26.11.10"
+version = "26.11.14"
 dependencies = [
  "aes-gcm",
  "elliptic-curve",
@@ -1284,7 +1284,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-sign"
-version = "26.11.10"
+version = "26.11.14"
 dependencies = [
  "refineid-apdu",
  "refineid-auth",
@@ -1296,7 +1296,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-x509"
-version = "26.11.10"
+version = "26.11.14"
 dependencies = [
  "refineid-ber",
 ]
@@ -1987,7 +1987,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "26.11.10"
+version = "26.11.14"
 dependencies = [
  "proc-macro2",
  "rustc_lexer",

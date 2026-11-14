@@ -134,7 +134,7 @@ snow = { version = "0.10", default-features = false, features = ["default-resolv
 # Swift/Kotlin bindings for the RAPP engine, behind the optional
 # `bindings` feature only; platform apps consume the staticlib.
 uniffi = "0.32"
-syn = { version = "2", features = ["full", "visit"] }
+syn = { version = "3", features = ["full", "visit"] }
 trybuild = "1"
 walkdir = "2"
 zeroize = { version = "1", features = ["zeroize_derive"] }

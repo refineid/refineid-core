@@ -59,6 +59,12 @@ jobs:
       - name: Test the RAPP bindings
         run: cargo test -p refineid-rapp --features bindings --locked
 
+      - name: Lint the PKCS#11 PIN-change feature without warnings
+        run: cargo clippy -p refineid-pkcs11 --features pin-change --all-targets --locked -- -D warnings
+
+      - name: Test the PKCS#11 PIN-change feature
+        run: cargo test -p refineid-pkcs11 --features pin-change --locked
+
       - name: Build the document-signing library without PC/SC
         run: cargo build -p refineid-doc-sign --no-default-features --locked
 
@@ -77,6 +83,11 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc -p refineid-rapp --features bindings --no-deps --locked
+
+      - name: Build the PKCS#11 PIN-change documentation without warnings
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc -p refineid-pkcs11 --features pin-change --no-deps --locked
 
       - name: Build the document-signing documentation without PC/SC
         env:

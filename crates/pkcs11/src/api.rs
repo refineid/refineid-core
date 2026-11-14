@@ -159,12 +159,14 @@ const PIN_READ_LIMIT: usize = PinBytes::MAX_LENGTH.saturating_add(1);
 /// [`PinBytes::new`], which zeroizes it; it is never logged.
 ///
 /// # Safety
-/// `pin_ptr` is non-null and points to `pin_len` readable octets, as
-/// PKCS#11 v2.40 requires of the caller.
+/// `pin_ptr` is non-null and points to at least
+/// `usize_from_ulong(pin_len).min(PIN_READ_LIMIT)` readable octets,
+/// satisfied whenever `pin_ptr` points to `pin_len` octets as PKCS#11
+/// v2.40 requires of the caller.
 unsafe fn caller_pin(pin_ptr: CkUtf8CharPtr, pin_len: CkUlong) -> Vec<u8> {
     let length = usize_from_ulong(pin_len).min(PIN_READ_LIMIT);
-    // SAFETY: the caller guarantees `pin_len` readable octets at
-    // `pin_ptr`, and `length` is at most `pin_len`.
+    // SAFETY: the caller guarantees at least `length` readable octets
+    // at `pin_ptr`.
     unsafe { core::slice::from_raw_parts(pin_ptr, length) }.to_vec()
 }
 
@@ -1591,20 +1593,18 @@ unsafe extern "C" fn c_set_pin(
     if old_pin.is_null() || new_pin.is_null() {
         return CKR_ARGUMENTS_BAD;
     }
-    // SAFETY: caller guarantees old_pin points to `old_len` bytes;
-    // the bytes are copied straight into a zeroizing PinBytes and
-    // never logged (PIN secrecy rule).
-    let current = match PinBytes::new(
-        unsafe { core::slice::from_raw_parts(old_pin, usize_from_ulong(old_len)) }.to_vec(),
-    ) {
+    // SAFETY: old_pin is non-null (checked above) and the caller
+    // guarantees it points to `old_len` octets; `caller_pin` reads at
+    // most `PIN_READ_LIMIT` octets straight into zeroizing `PinBytes`
+    // without logging (PIN secrecy rule).
+    let current = match PinBytes::new(unsafe { caller_pin(old_pin, old_len) }) {
         Ok(pin) => pin,
         Err(error) => return classify_pin_error(error),
     };
-    // SAFETY: caller guarantees new_pin points to `new_len` bytes;
-    // same zeroizing, never-logged handling.
-    let new = match PinBytes::new(
-        unsafe { core::slice::from_raw_parts(new_pin, usize_from_ulong(new_len)) }.to_vec(),
-    ) {
+    // SAFETY: new_pin is non-null (checked above) and the caller
+    // guarantees it points to `new_len` octets; same bounded,
+    // zeroizing, never-logged handling.
+    let new = match PinBytes::new(unsafe { caller_pin(new_pin, new_len) }) {
         Ok(pin) => pin,
         Err(error) => return classify_pin_error(error),
     };
@@ -3179,5 +3179,72 @@ mod tests {
             read(&mut overlong),
             Err(PinRoleError::WrongLength { .. })
         ));
+    }
+
+    /// `C_SetPIN` bounds both PIN buffer reads to [`PIN_READ_LIMIT`]
+    /// and rejects null PIN pointers before reading either buffer.
+    #[cfg(feature = "pin-change")]
+    #[test]
+    fn set_pin_bounds_both_caller_buffers_and_rejects_null_pointers() {
+        use crate::ck::{CK_INVALID_HANDLE, CKR_ARGUMENTS_BAD, CKR_PIN_LEN_RANGE};
+
+        /// Synthetic ASCII digit filling the fixture buffers.
+        const DIGIT: u8 = b'5';
+
+        let mut valid_pin = [DIGIT; super::PIN1_MIN_DIGITS];
+        let valid_len = CkUlong::try_from(valid_pin.len()).expect("fixture length fits");
+        let mut bounded_buffer = [DIGIT; super::PIN_READ_LIMIT];
+
+        assert_eq!(
+            unsafe {
+                super::c_set_pin(
+                    CK_INVALID_HANDLE,
+                    core::ptr::null_mut(),
+                    valid_len,
+                    valid_pin.as_mut_ptr(),
+                    valid_len,
+                )
+            },
+            CKR_ARGUMENTS_BAD
+        );
+        assert_eq!(
+            unsafe {
+                super::c_set_pin(
+                    CK_INVALID_HANDLE,
+                    valid_pin.as_mut_ptr(),
+                    valid_len,
+                    core::ptr::null_mut(),
+                    valid_len,
+                )
+            },
+            CKR_ARGUMENTS_BAD
+        );
+        // SAFETY: `bounded_buffer` holds `PIN_READ_LIMIT` readable
+        // octets, which satisfies `caller_pin`'s bounded-read contract
+        // even when the caller passes `CkUlong::MAX`.
+        assert_eq!(
+            unsafe {
+                super::c_set_pin(
+                    CK_INVALID_HANDLE,
+                    bounded_buffer.as_mut_ptr(),
+                    CkUlong::MAX,
+                    valid_pin.as_mut_ptr(),
+                    valid_len,
+                )
+            },
+            CKR_PIN_LEN_RANGE
+        );
+        assert_eq!(
+            unsafe {
+                super::c_set_pin(
+                    CK_INVALID_HANDLE,
+                    valid_pin.as_mut_ptr(),
+                    valid_len,
+                    bounded_buffer.as_mut_ptr(),
+                    CkUlong::MAX,
+                )
+            },
+            CKR_PIN_LEN_RANGE
+        );
     }
 }

@@ -84,7 +84,7 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 # file through `snow`; this promotes it to a direct dependency.
 # Without the default `getrandom` feature: the crate draws its own
 # IVs and never needs the cipher's RNG.
-aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
 crypto-bigint = { version = "0.7", features = ["alloc", "zeroize"] }
 miniz_oxide = "0.9"
 curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "zeroize"] }

@@ -20,5 +20,5 @@
 #[test]
 fn sensitive_values_have_no_public_raw_access() {
     let cases = trybuild::TestCases::new();
-    cases.compile_fail("tests/ui/no_raw_*.rs");
+    cases.compile_fail("tests/ui/*.rs");
 }

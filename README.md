@@ -22,8 +22,10 @@ crates stay transport-agnostic and country-profile-neutral.
   PIN1/PIN2 over the credential-command path for both citizen and
   organizational cards, the counter-safe status probe that resolves the
   card's credential numbering, the PIN and PUK lengths the card lists,
-  the CHANGE REFERENCE DATA and RESET RETRY COUNTER (unblock) chains, and
-  the retry-risk policy.
+  the CHANGE REFERENCE DATA and RESET RETRY COUNTER (unblock) chains,
+  the retry-risk policy, and the process-lifetime negative PIN cache
+  (`PinSafetyCache`, retaining rejected values only as per-process keyed
+  fingerprints).
 - `crates/ber` (`refineid-ber`) -- minimal BER-TLV encoder and decoder
   with a typed tag layer.
 - `crates/build-number` (`refineid-build-number`) -- the build number `B`
@@ -43,10 +45,6 @@ crates stay transport-agnostic and country-profile-neutral.
 - `crates/pace` (`refineid-pace`) -- Card Access Number input type,
   EF.CardAccess parsing, the PACE handshake with a CAN or a PIN as the
   password, and secure messaging.
-- `crates/pin-cache` (`refineid-pin-cache`) -- process-lifetime negative
-  PIN cache: a card-rejected PIN is retained only as a keyed fingerprint
-  and refused locally, so software never re-offers a known-bad value and
-  burns another card retry.
 - `crates/pkcs15` (`refineid-pkcs15`) -- PKCS#15 file-system reads:
   selection, bounded reads, certificates as plain DER, EF.TokenInfo, the
   password objects' length ranges from EF.AOD, and the typed chip-serial

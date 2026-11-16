@@ -268,36 +268,28 @@ impl fmt::Debug for Pin2 {
     }
 }
 
-mod sealed {
-    /// Seals [`CachedPin`] so only this crate's PIN roles can implement it.
-    pub trait Sealed {}
-    impl Sealed for super::Pin1 {}
-    impl Sealed for super::Pin2 {}
-}
-
 /// Length of a PIN rejection fingerprint: an HMAC-SHA-256 tag, 32 bytes.
-pub const CACHE_FINGERPRINT_LEN: usize = 32;
+pub(crate) const CACHE_FINGERPRINT_LEN: usize = 32;
 /// Length of the per-process fingerprint key, 32 bytes (256 bits).
-pub const CACHE_FINGERPRINT_KEY_LEN: usize = 32;
+pub(crate) const CACHE_FINGERPRINT_KEY_LEN: usize = 32;
 
 /// Domain-separation tag bound into the fingerprint preimage for PIN1.
 const SLOT_TAG_PIN1: u8 = 1;
 /// Domain-separation tag bound into the fingerprint preimage for PIN2.
 const SLOT_TAG_PIN2: u8 = 2;
 
-/// A PIN role whose card rejection a negative cache may remember.
+/// A PIN role whose card rejection [`crate::pin_cache::PinSafetyCache`] may
+/// remember.
 ///
-/// Sealed: implemented only for [`Pin1`] and [`Pin2`]. The PUK is
+/// Crate-private and implemented only for [`Pin1`] and [`Pin2`]. The PUK is
 /// deliberately excluded -- it authorises nothing, spends its own retry
 /// counter, and has no cache path.
 ///
-/// The one digit-facing method returns a keyed *fingerprint* -- an
-/// HMAC-SHA-256 tag computed here, inside the crate that owns the digits.
-/// The digits are absorbed into the MAC and never handed back; a caller
-/// cannot recover them from the tag. So a negative cache can live in
-/// another crate, keying by this fingerprint, without any raw-digit export
-/// and with no public `as_bytes` on a PIN role.
-pub trait CachedPin: sealed::Sealed {
+/// Keeping the trait and its [`Self::keyed_fingerprint`] method inside this
+/// crate ensures no external caller can compute a PIN digest under a chosen
+/// key while the negative cache still absorbs digits only into a per-process
+/// random-keyed HMAC-SHA-256 tag.
+pub(crate) trait CachedPin {
     /// The slot this PIN targets.
     #[must_use]
     fn slot(&self) -> PinSlot;

@@ -28,6 +28,7 @@ pub mod credentials;
 pub mod manage;
 pub mod pace_channel;
 pub mod pace_password;
+pub mod pin_cache;
 pub mod pin_lengths;
 pub mod retry_risk;
 pub mod verify;
@@ -37,10 +38,7 @@ pub use activation::{
     CredentialHealthReport, PinChangeRecord, pin_awaits_activation, read_pin_change_record,
     read_puk_status_from_container,
 };
-pub use credentials::{
-    CACHE_FINGERPRINT_KEY_LEN, CACHE_FINGERPRINT_LEN, CachedPin, CredentialInputError,
-    CredentialRole, Pin1, Pin2, Puk, UnvalidatedSecret,
-};
+pub use credentials::{CredentialInputError, CredentialRole, Pin1, Pin2, Puk, UnvalidatedSecret};
 pub use manage::{ManageOutcome, PinManageOps, classify_manage_sw};
 pub use pace_channel::{
     ChannelProof, Pin1PaceChannel, Pin1PaceChannelOps, Pin2ChangeError, Pin2PaceChannel,
@@ -48,6 +46,7 @@ pub use pace_channel::{
     counter_after_verify, lowered_counter,
 };
 pub use pace_password::{PACE_PASSWORD_KEY_LEN, PacePasswordKey};
+pub use pin_cache::PinSafetyCache;
 pub use pin_lengths::{
     CardLengthSource, CardPinLengths, CredentialLengths, ListedLength, PinLengthRefusal,
 };

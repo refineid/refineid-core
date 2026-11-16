@@ -65,14 +65,14 @@ bp384 = { version = "0.14", default-features = false, features = ["arithmetic"] 
 # NIST P-256 and P-384 point arithmetic for PACE (crates/pace): the
 # standardized domain parameters the organizational cards publish in
 # EF.CardAccess, in the same RustCrypto family and elliptic-curve
-# version as bp384, with the same arithmetic-only feature set.
-# The SCS crate (crates/scs) adds P-256 key agreement for its
-# transaction channel (`ecdh`) and ECDSA for JWS verification and
-# the signatures its tests mint (`ecdsa`). RSA verification stays on
-# the in-tree refineid-cms primitives; `p256` carries ECDSA because
-# refineid-cms does not expose EC verification publicly.
+# version as bp384. The CMS crate (crates/cms) verifies NIST P-256 and
+# P-384 ECDSA (`ecdsa`), and the SCS crate (crates/scs) adds P-256 key
+# agreement (`ecdh`) and JWS verification (`ecdsa`).
 p256 = { version = "0.14", default-features = false, features = ["arithmetic", "ecdh", "ecdsa"] }
-p384 = { version = "0.14", default-features = false, features = ["arithmetic"] }
+p384 = { version = "0.14", default-features = false, features = ["arithmetic", "ecdsa"] }
+# Curve-generic RFC 6979 prehash signing for the CMS testkit over
+# caller-selected SHA-2 digests; already in Cargo.lock via p256.
+ecdsa = { version = "0.17", default-features = false, features = ["algorithm"] }
 # The curve-generic traits the PACE handshake is written against, the
 # one version bp384, p256 and p384 share.
 elliptic-curve = { version = "0.14", default-features = false, features = ["arithmetic", "sec1"] }

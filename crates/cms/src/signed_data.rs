@@ -1615,16 +1615,17 @@ impl SignerInfo<'_> {
                     ecdsa::extract_ec_pubkey(signer_spki.as_der()).ok_or(CmsError::BadSignerKey)?;
                 let digest = self.digest_algorithm.digest(payload);
                 let sig = Signature::<EcdsaDer>::new(self.signature.to_vec());
-                ecdsa::verify_prehashed(&curve, &pubkey, &sig, &digest).map_err(|error| match error
-                {
-                    EcdsaError::BadSignature | EcdsaError::SigOutOfRange => {
-                        CmsError::SignatureShape
-                    }
-                    EcdsaError::BadModulus
-                    | EcdsaError::BadPublicKey
-                    | EcdsaError::NotInvertible
-                    | EcdsaError::VerifyFailed => CmsError::Ecdsa(error),
-                })
+                ecdsa::verify_prehashed(curve, &pubkey, &sig, &digest).map_err(
+                    |error| match error {
+                        EcdsaError::BadSignature | EcdsaError::SigOutOfRange => {
+                            CmsError::SignatureShape
+                        }
+                        EcdsaError::BadModulus
+                        | EcdsaError::BadPublicKey
+                        | EcdsaError::NotInvertible
+                        | EcdsaError::VerifyFailed => CmsError::Ecdsa(error),
+                    },
+                )
             }
             (SignatureScheme::RsaPkcs1, PublicKeyAlgorithm::Ec(_))
             | (SignatureScheme::Ecdsa, PublicKeyAlgorithm::Rsa { .. }) => {

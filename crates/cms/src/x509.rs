@@ -1162,7 +1162,7 @@ pub fn verify_tbs_signature(
                 Sha512::digest(tbs_der).to_vec()
             };
             let sig = Signature::<EcdsaDer>::new(signature_bits.as_bytes().to_vec());
-            verify_prehashed(&curve, &pubkey, &sig, &digest).map_err(VerifyError::Ecdsa)
+            verify_prehashed(curve, &pubkey, &sig, &digest).map_err(VerifyError::Ecdsa)
         }
         SignatureAlgorithm::Other => Err(VerifyError::Unsupported(alg)),
     }
@@ -1311,7 +1311,7 @@ impl<'a> SpkiDer<'a> {
                 };
                 let signature = Signature::<EcdsaDer>::from_raw_concatenation(signature)
                     .map_err(VerifyError::Ecdsa)?;
-                verify_prehashed(&curve, &public_key, &signature, &digest)
+                verify_prehashed(curve, &public_key, &signature, &digest)
                     .map_err(VerifyError::Ecdsa)
             }
         }

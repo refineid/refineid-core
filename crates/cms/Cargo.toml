@@ -15,9 +15,9 @@ doctest = false
 workspace = true
 
 [features]
-# Test-only ECDSA signing over the verifier's curve arithmetic and the
-# fixture builders on top of it. Never enabled by a production build.
-testkit = ["dep:base64ct"]
+# Test-only RFC 6979 ECDSA signing and the fixture builders on top of it.
+# Never enabled by a production build.
+testkit = ["dep:base64ct", "dep:ecdsa"]
 
 [dependencies]
 refineid-ber.workspace = true
@@ -25,8 +25,11 @@ refineid-digest.workspace = true
 base64ct = { workspace = true, optional = true }
 # Compile-time dotted-decimal OID parser for the `oid::known` table.
 const-oid.workspace = true
-# Big-integer arithmetic for the RSA and ECDSA verification primitives.
+# Big-integer arithmetic for the RSA verification primitive.
 crypto-bigint.workspace = true
+ecdsa = { workspace = true, optional = true }
+p256.workspace = true
+p384.workspace = true
 # Legacy signature-digest support: older CSCA self-signatures still use
 # SHA-1 family algorithms; verification-only, never for new signatures.
 sha1.workspace = true
@@ -38,6 +41,7 @@ x509-cert.workspace = true
 
 [dev-dependencies]
 base64ct.workspace = true
+ecdsa.workspace = true
 getrandom = { workspace = true }
 hex.workspace = true
 

@@ -16,13 +16,15 @@
 //!
 //! The host-side certificate and signature checks: X.509 parsing
 //! and chain hops, CMS `SignedData` signer verification, and the RSA
-//! and ECDSA primitives under them. Parsing is strict DER over
-//! [`refineid_ber`]; signature verification is implemented here over
-//! [`crypto_bigint`] with no platform crypto dependency, so every
-//! platform verifies bytes identically.
+//! and ECDSA primitives under them. Parsing uses [`refineid_ber`] and
+//! [`spki::der`]; RSA verification builds on [`crypto_bigint`] and
+//! NIST P-256 / P-384 ECDSA verification builds on [`p256`] and
+//! [`p384`] with no platform crypto dependency, so every platform
+//! verifies bytes identically.
 
 pub mod container;
 pub mod ecdsa;
+#[cfg(test)]
 mod hex;
 pub mod oid;
 pub mod rsa;

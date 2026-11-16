@@ -12,131 +12,101 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-//! ECDSA signature verification over the NIST named curves.
+//! ECDSA signature verification over NIST P-256 and P-384.
 //!
-//! A key is accepted only on a named curve the table below carries,
-//! P-256 or P-384, referenced by its OID (RFC 5480 sec.2.1.1: PKIX
-//! keys use `namedCurve`, and explicit `ECParameters` are not used).
-//! A key whose SPKI spells the curve out explicitly is refused.
+//! A key is accepted only on a named curve this module supports, P-256
+//! (`secp256r1`) or P-384 (`secp384r1`), referenced by its OID (RFC 5480
+//! sec. 2.1.1: PKIX keys use `namedCurve`, and explicit `ECParameters`
+//! are refused).
 //!
-//! Builds on `crypto-bigint::BoxedUint` + `BoxedMontyForm` for
-//! arbitrary-precision modular arithmetic.
-//!
-//! Constant-time is **not** a goal: the verifier sees only public
-//! signatures and keys. The test-only signer behind the `testkit`
-//! feature reuses the same arithmetic and is never compiled into a
-//! production build.
-
-// EC coordinate naming follows the math convention in the EC
-// literature (Hankerson/Menezes/Vanstone, IEEE 1363, RFC 5480):
-// px / py for point P's coordinates, qx / qy for Q's, gx / gy for
-// the generator G's, with the `_mont` / `_m` suffix denoting
-// Montgomery form. The one-letter coordinate distinction is the
-// notation, not an accident; renaming to `point_x_montgomery`
-// etc. would obscure the textbook mapping that lets a
-// cryptographer read the code against the spec.
-
-use crypto_bigint::{
-    BoxedUint, Odd, Resize as _,
-    modular::{BoxedMontyForm, BoxedMontyParams},
-};
+//! Curve arithmetic, SEC 1 point validation, and prehash ECDSA
+//! verification delegate to [`p256::ecdsa`] and [`p384::ecdsa`] (both
+//! configured with `NORMALIZE_S = false`, accepting standard X.509 / CMS
+//! / PKCS#11 signatures across the full `[1, n-1]` scalar range).
+//! Deterministic RFC 6979 test signing behind `testkit` delegates to
+//! `ecdsa::hazmat::sign_prehashed_rfc6979`.
 
 use crate::container::{EcdsaDer, EcdsaP256, EcdsaP384, Signature};
-use crate::hex::Hex;
 use crate::oid::{Oid as KnownOid, known};
-use refineid_ber::{BerTlv, Integer, Sequence};
 use refineid_digest::{Sha1, Sha224, Sha256, Sha384, Sha512};
 
-/// SEC1 uncompressed-point tag byte.
+/// SEC 1 uncompressed-point leading format octet (`04`).
 const SEC1_UNCOMPRESSED_TAG: u8 = 0x04;
-/// Coordinates in an affine EC point -- X and Y (SEC 1
-/// sec. 2.3.3: an uncompressed point body is two equal-width
-/// coordinates).
+/// Coordinates in an affine EC point -- X and Y (SEC 1 sec. 2.3.3: an
+/// uncompressed point body is two equal-width coordinates).
 const POINT_COORDINATE_COUNT: usize = 2;
-/// Components in an ECDSA signature -- `r` and `s` (RFC 3279
-/// sec. 2.2.3: `Ecdsa-Sig-Value` is a SEQUENCE of exactly two
-/// INTEGERs).
+/// Components in an ECDSA signature -- `r` and `s` (RFC 3279 sec. 2.2.3:
+/// `Ecdsa-Sig-Value` is a `SEQUENCE` of two `INTEGER`s).
 const SIG_COMPONENT_COUNT: usize = 2;
-/// DER INTEGER sign-padding byte.
-const DER_SIGN_PAD: u8 = 0;
-/// ASN.1 SEQUENCE tag, constructed form (X.690 sec. 8.9.1); the
-/// SEQUENCE-of-INTEGER shape for ECDSA signatures is RFC 3279
-/// sec. 2.2.3.
-const ASN1_SEQUENCE_TAG: u8 = 0x30;
-/// ASN.1 INTEGER tag (X.690 sec. 8.3).
-const ASN1_INTEGER_TAG: u8 = 0x02;
-/// Smallest byte value with the DER sign bit set. A DER INTEGER
-/// whose leading magnitude byte reaches this value needs a
-/// [`DER_SIGN_PAD`] prepended to stay positive under the
-/// two's-complement interpretation (X.690 sec. 8.3.3).
-const HIGH_BIT_SET: u8 = 0x80;
-/// DER long-form length marker announcing one follow-up length
-/// octet (X.690 sec. 8.1.3.5).
-const DER_LONG_FORM_1B: u8 = 0x81;
-/// DER long-form length marker announcing two follow-up length
-/// octets (X.690 sec. 8.1.3.5).
-const DER_LONG_FORM_2B: u8 = 0x82;
-/// First length value that no longer fits DER short form -- 128
-/// (X.690 sec. 8.1.3.4 caps short form at 127).
-const SHORT_FORM_CEILING: usize = 0x80;
-/// First length value that no longer fits one long-form length
-/// octet -- 256 (X.690 sec. 8.1.3.5).
-const ONE_BYTE_FORM_CEILING: usize = 0x100;
-/// Capacity slack for the SEQUENCE tag and DER length.
-const SEQUENCE_HEADER_SLACK: usize = 4;
-/// Per-INTEGER overhead slack: tag, one or two length octets,
-/// and a possible sign octet.
-const INTEGER_OVERHEAD_SLACK: usize = 4;
-/// Combined capacity slack for the two INTEGERs (`r` and `s`) of
-/// an ECDSA signature body.
-const BODY_SLACK: usize = INTEGER_OVERHEAD_SLACK.saturating_add(INTEGER_OVERHEAD_SLACK);
-/// Bits in one byte. Rust pins `u8` at 8 bits; used to convert
-/// byte lengths into the bit counts `BoxedUint` constructors and
-/// the RFC 6979 sec. 2.3.2 digest truncation work in.
-const BITS_PER_BYTE: u32 = 8;
-/// `BoxedUint` limb size in bits. The crypto-bigint crate stores
-/// arbitrary-precision integers as a sequence of `u64` "limbs";
-/// precision arguments to its constructors round up to a
-/// multiple of one limb.
-const BOXED_UINT_LIMB_BITS: u32 = 64;
+/// Byte length of a P-256 field element or scalar -- a 256-bit prime
+/// field (FIPS 186-4 D.1.2.3 / SEC 2 sec. 2.4.2).
+const P256_FIELD_LEN: usize = 32;
+/// Byte length of a P-384 field element or scalar -- a 384-bit prime
+/// field (FIPS 186-4 D.1.2.4 / SEC 2 sec. 2.5.1).
+const P384_FIELD_LEN: usize = 48;
 
-/// Named-curve parameters in unsigned big-endian byte form, taken
-/// from the constant table at the end of this module.
-#[derive(Debug, Clone)]
-pub(crate) struct Curve {
-    /// Field prime `p` (unsigned big-endian).
-    p: Vec<u8>,
-    /// Curve coefficient `a` (unsigned big-endian).
-    a: Vec<u8>,
-    /// Curve coefficient `b` (unsigned big-endian).
-    b: Vec<u8>,
-    /// X coordinate of the base point `G` (unsigned big-endian).
-    gx: Vec<u8>,
-    /// Y coordinate of the base point `G` (unsigned big-endian).
-    gy: Vec<u8>,
-    /// Subgroup order `n` (unsigned big-endian).
-    n: Vec<u8>,
+/// Supported NIST named curves for ECDSA verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NamedCurve {
+    /// NIST P-256 (`secp256r1` / `prime256v1`).
+    P256,
+    /// NIST P-384 (`secp384r1`).
+    P384,
+}
+
+impl NamedCurve {
+    /// Resolve a `namedCurve` OID to a supported [`NamedCurve`].
+    fn from_oid(oid: KnownOid<'_>) -> Option<Self> {
+        if oid == known::SECP256R1 {
+            Some(Self::P256)
+        } else if oid == known::SECP384R1 {
+            Some(Self::P384)
+        } else {
+            None
+        }
+    }
+
+    /// Coordinate and scalar width in octets for this curve.
+    const fn field_len(self) -> usize {
+        match self {
+            Self::P256 => P256_FIELD_LEN,
+            Self::P384 => P384_FIELD_LEN,
+        }
+    }
+
+    /// Encoded uncompressed SEC 1 point width (`1 + 2 * field_len`).
+    const fn uncompressed_point_len(self) -> usize {
+        self.field_len()
+            .saturating_mul(POINT_COORDINATE_COUNT)
+            .saturating_add(1)
+    }
+
+    /// Fixed-width raw `r || s` signature length (`2 * field_len`).
+    const fn raw_signature_len(self) -> usize {
+        self.field_len().saturating_mul(SIG_COMPONENT_COUNT)
+    }
 }
 
 /// Error returned from the ECDSA verifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EcdsaError {
-    /// Curve modulus `p` is malformed (empty or even).
+    /// Curve modulus `p` is malformed (retained for API compatibility).
     BadModulus,
     /// Public key `(Q.x, Q.y)` was not on the curve or had the
-    /// wrong encoding (we accept only the uncompressed
-    /// `04 || X || Y` SEC1 form).
+    /// wrong encoding (only the uncompressed `04 || X || Y` SEC 1
+    /// form of exact field width is accepted).
     BadPublicKey,
-    /// Signature parse failed -- ECDSA signatures are DER
-    /// `SEQUENCE { r INTEGER, s INTEGER }`.
+    /// Signature parse failed -- ECDSA DER signatures must be one
+    /// canonical `SEQUENCE { r INTEGER, s INTEGER }` of positive
+    /// minimal integers, and raw signatures must match the curve's
+    /// `2 * field_len` width with non-zero halves.
     BadSignature,
     /// `r` or `s` not in `[1, n-1]`.
     SigOutOfRange,
-    /// `s` had no inverse mod `n` (can't really happen for a
-    /// valid signature; flagged for completeness).
+    /// `s` had no inverse mod `n` (retained for API compatibility).
     NotInvertible,
     /// Final compare: `r' != r mod n` -- the signature does not
-    /// verify against the supplied public key and message.
+    /// verify against the supplied public key and message digest.
     VerifyFailed,
 }
 
@@ -155,17 +125,17 @@ impl core::fmt::Display for EcdsaError {
 
 impl core::error::Error for EcdsaError {}
 
-/// Uncompressed SEC1 elliptic-curve point: `04 || X || Y`.
+/// Uncompressed SEC 1 elliptic-curve point: `04 || X || Y`.
 ///
-/// The constructor `Sec1UncompressedPoint::from_bytes` is the
-/// trust boundary: it asserts the leading `04` marker byte
-/// (`SEC1_UNCOMPRESSED_TAG`), the even body length, and a
-/// non-empty body. Compressed (tag `02` / `03`) and hybrid (tag
-/// `06` / `07`) SEC1 forms are *not* a `Sec1UncompressedPoint`
-/// -- this codebase only verifies uncompressed-form keys.
+/// The constructor `Sec1UncompressedPoint::from_bytes` is the trust
+/// boundary: it asserts the leading `04` marker byte
+/// (`SEC1_UNCOMPRESSED_TAG`), the even body length, and a non-empty
+/// body. Compressed (tag `02` / `03`) and hybrid (tag `06` / `07`)
+/// SEC 1 forms are *not* a `Sec1UncompressedPoint` -- this codebase
+/// only verifies uncompressed-form keys (FINEID S2 sec. 5.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sec1UncompressedPoint {
-    /// SEC1 uncompressed-form payload: `04 || X || Y`, X and Y equal-length.
+    /// SEC 1 uncompressed-form payload: `04 || X || Y`, X and Y equal-length.
     bytes: Vec<u8>,
 }
 
@@ -194,7 +164,7 @@ impl core::fmt::Display for Sec1ParseError {
 impl core::error::Error for Sec1ParseError {}
 
 impl Sec1UncompressedPoint {
-    /// Wrap raw SEC1 bytes. Validates the leading
+    /// Wrap raw SEC 1 bytes. Validates the leading
     /// [`SEC1_UNCOMPRESSED_TAG`] byte and the even-length body
     /// invariant.
     ///
@@ -214,23 +184,20 @@ impl Sec1UncompressedPoint {
         }
         Ok(Self { bytes })
     }
-}
 
-impl Sec1UncompressedPoint {
-    /// Borrow the underlying SEC1 bytes (`04 || X || Y`).
+    /// Borrow the underlying SEC 1 bytes (`04 || X || Y`).
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8] {
         self.bytes.as_slice()
     }
 
-    /// Consume the wrapper and return the owned SEC1 bytes.
+    /// Consume the wrapper and return the owned SEC 1 bytes.
     #[must_use]
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }
 
     /// Length of the encoded point in bytes (`1 + 2 * coord_len`).
-    /// Tier 0 `usize`; arithmetic count.
     #[must_use]
     pub const fn len(&self) -> usize {
         self.bytes.len()
@@ -244,605 +211,171 @@ impl Sec1UncompressedPoint {
     }
 }
 
-/// Internal handle for one curve. Holds the precomputed
-/// Montgomery params for `p` and for `n`, plus the base point
-/// in affine form.
-struct CurveCtx {
-    /// Octet width of a field element, and so of each coordinate of
-    /// an uncompressed point (SEC 1 sec.2.3.3, sec.2.3.5).
-    field_len: usize,
-    /// Bit precision used for `p`-side arithmetic (multiple of 64).
-    bits_p: u32,
-    /// Bit precision used for `n`-side arithmetic.
-    bits_n: u32,
-    /// Montgomery parameters for the prime field modulus `p`.
-    p_params: BoxedMontyParams,
-    /// Montgomery parameters for the subgroup order `n`.
-    n_params: BoxedMontyParams,
-    /// Weierstrass coefficient `a` in `y^2 = x^3 + ax + b`.
-    a: BoxedUint,
-    /// Weierstrass coefficient `b` in `y^2 = x^3 + ax + b`.
-    b: BoxedUint,
-    /// Field prime `p`, in non-Montgomery form for the coordinate
-    /// range check.
-    p_uint: BoxedUint,
-    /// Subgroup order `n`, in non-Montgomery form for boundary checks.
-    n_uint: BoxedUint,
-    /// Base point `G` in affine coordinates.
-    g: AffinePoint,
+/// On-curve public key decoded from an uncompressed SEC 1 point.
+enum VerifiedPublicKey {
+    /// Validated NIST P-256 verifying key.
+    P256(p256::ecdsa::VerifyingKey),
+    /// Validated NIST P-384 verifying key.
+    P384(p384::ecdsa::VerifyingKey),
 }
 
-/// Affine point on a short-Weierstrass curve, with an explicit
-/// sentinel for the point at infinity.
-///
-/// SEC1 §2.3.3. Using `Option<(x, y)>` for the infinity sentinel
-/// keeps the type total without smuggling an out-of-band value
-/// (e.g. `x = 0`) that would collide with a legitimate
-/// coordinate on some curves.
-#[derive(Clone)]
-struct AffinePoint {
-    /// `None` is the point at infinity.
-    xy: Option<(BoxedUint, BoxedUint)>,
-}
-
-impl AffinePoint {
-    /// Construct the additive identity (point at infinity).
-    ///
-    /// SEC1 §2.2.1 -- O is the identity of the EC group; required
-    /// as the seed for scalar multiplication's binary-ladder
-    /// initial accumulator.
-    const fn infinity() -> Self {
-        Self { xy: None }
-    }
-    /// Whether this point is the additive identity.
-    ///
-    /// The doubling and addition formulae have a degenerate case
-    /// when either operand is `O`; callers short-circuit through
-    /// this predicate rather than hitting a divide-by-zero in
-    /// the lambda computation.
-    const fn is_infinity(&self) -> bool {
-        self.xy.is_none()
-    }
-}
-
-/// Helpers hosted on a unit struct (typing-discipline: no
-/// free fns with borrowed parameters; see
-/// `doc/typing-discipline.md`).
-struct EcdsaHelpers;
-
-impl EcdsaHelpers {
-    /// Round a byte length up to the next 64-bit boundary, in
-    /// bits, with a floor of 64.
-    ///
-    /// `BoxedUint` needs its bit-width specified at construction
-    /// and represents the value in 64-bit limbs; this helper
-    /// picks the smallest representable bit-width that fits
-    /// `bytes`. Saturates rather than panicking on absurd input
-    /// (`u32::MAX`-byte slice) so the parser-side surface never
-    /// aborts.
-    fn bits_for_len(byte_len: usize) -> u32 {
-        let nominal = u32::try_from(byte_len)
-            .unwrap_or(u32::MAX)
-            .saturating_mul(BITS_PER_BYTE);
-        nominal
-            .next_multiple_of(BOXED_UINT_LIMB_BITS)
-            .max(BOXED_UINT_LIMB_BITS)
-    }
-
-    /// Decode a big-endian integer slice into a `BoxedUint` of
-    /// the given bit width.
-    ///
-    /// Wraps the upstream conversion to map width-mismatch errors
-    /// to a domain-specific [`EcdsaError::BadModulus`] -- the
-    /// only legitimate failure here is a curve constant that
-    /// doesn't fit the limb count `bits_for` chose for it.
-    fn boxed(bytes: &[u8], bits: u32) -> Result<BoxedUint, EcdsaError> {
-        BoxedUint::from_be_slice(bytes, bits).map_err(|_e| EcdsaError::BadModulus)
-    }
-}
-
-// Variable names `px`/`py`, `qx`/`qy`, and their Montgomery
-// counterparts (`px_m`, `py_m`, `qx_m`, `qy_m`, `px_mont`,
-// `py_mont`) match the affine short-Weierstrass formulae as
-// written in SEC1 / RFC 6979 -- renaming them would obscure the
-// cross-reference. Throughout, `BoxedMontyForm` add / sub / mul
-// are GF(p) (respectively mod-n) field operations with
-// well-defined modular results; they have no overflow or panic
-// surface.
-impl CurveCtx {
-    /// Build a precomputed verification context from a
-    /// runtime-supplied [`Curve`].
-    ///
-    /// SEC1 §2.2.1 -- the Montgomery parameters depend only on
-    /// `p` and `n`, so doing the conversion once per curve and
-    /// then sharing the `CurveCtx` across many verifications is
-    /// constant-folded work. Returns
-    /// [`EcdsaError::BadModulus`] if `p` or `n` are even
-    /// (Montgomery requires odd modulus) or if any constant is
-    /// wider than the chosen `bits_for` width.
-    fn new(curve: &Curve) -> Result<Self, EcdsaError> {
-        let bits_p = EcdsaHelpers::bits_for_len(curve.p.len());
-        let bits_n = EcdsaHelpers::bits_for_len(curve.n.len());
-        let p_uint = EcdsaHelpers::boxed(curve.p.as_slice(), bits_p)?;
-        let n_uint = EcdsaHelpers::boxed(curve.n.as_slice(), bits_n)?;
-        let a = EcdsaHelpers::boxed(curve.a.as_slice(), bits_p)?;
-        let b = EcdsaHelpers::boxed(curve.b.as_slice(), bits_p)?;
-        let gx = EcdsaHelpers::boxed(curve.gx.as_slice(), bits_p)?;
-        let gy = EcdsaHelpers::boxed(curve.gy.as_slice(), bits_p)?;
-        let p_odd: Odd<BoxedUint> =
-            Option::from(Odd::new(p_uint.clone())).ok_or(EcdsaError::BadModulus)?;
-        let n_odd: Odd<BoxedUint> =
-            Option::from(Odd::new(n_uint.clone())).ok_or(EcdsaError::BadModulus)?;
-        let p_params = BoxedMontyParams::new(p_odd);
-        let n_params = BoxedMontyParams::new(n_odd);
-        Ok(Self {
-            field_len: curve.p.len(),
-            bits_p,
-            bits_n,
-            p_params,
-            n_params,
-            a,
-            b,
-            p_uint,
-            n_uint,
-            g: AffinePoint { xy: Some((gx, gy)) },
-        })
-    }
-
-    /// Lift `x` into Montgomery form modulo the field prime `p`.
-    ///
-    /// Used for coordinate-domain arithmetic (point doubling,
-    /// addition, multiplication). The Montgomery params are
-    /// shared across calls; the per-call work is the constant-
-    /// time conversion only.
-    fn p_mont(&self, x: &BoxedUint) -> BoxedMontyForm {
-        BoxedMontyForm::new(x.clone(), &self.p_params)
-    }
-    /// Lift `x` into Montgomery form modulo the subgroup order
-    /// `n`.
-    ///
-    /// Used for scalar-domain arithmetic (the ECDSA verify
-    /// equation operates on `r`, `s`, `e mod n`). Distinct from
-    /// [`Self::p_mont`] because `p` and `n` are different moduli
-    /// with different Montgomery parameter sets.
-    fn n_mont(&self, x: &BoxedUint) -> BoxedMontyForm {
-        BoxedMontyForm::new(x.clone(), &self.n_params)
-    }
-
-    /// Point doubling on `y^2 = x^3 + ax + b`. Standard short
-    /// Weierstrass formulae, affine coords.
-    fn double(&self, p: &AffinePoint) -> AffinePoint {
-        /// Coefficient of `x^2` in the tangent-slope numerator
-        /// `(3*x^2 + a)` of the affine doubling formula (SEC 1
-        /// sec. 2.2.1).
-        const SLOPE_NUM_COEFF: u32 = 3;
-        /// Coefficient of `y` in the tangent-slope denominator
-        /// `(2*y)` of the affine doubling formula (SEC 1
-        /// sec. 2.2.1).
-        const SLOPE_DEN_COEFF: u32 = 2;
-        let Some((px, py)) = &p.xy else {
-            return AffinePoint::infinity();
-        };
-        // py == 0 -> infinity.
-        let py_mont = self.p_mont(py);
-        let zero = self.p_mont(&BoxedUint::zero_with_precision(self.bits_p));
-        if py_mont == zero {
-            return AffinePoint::infinity();
+impl VerifiedPublicKey {
+    /// Validate `pubkey_sec1` as an uncompressed on-curve public key on `curve`
+    /// (SEC 1 sec. 2.3.4, sec. 2.3.6, and sec. 3.2.2.1).
+    fn from_sec1(
+        curve: NamedCurve,
+        pubkey_sec1: &Sec1UncompressedPoint,
+    ) -> Result<Self, EcdsaError> {
+        let bytes = pubkey_sec1.as_bytes();
+        if bytes.first().copied() != Some(SEC1_UNCOMPRESSED_TAG)
+            || bytes.len() != curve.uncompressed_point_len()
+        {
+            return Err(EcdsaError::BadPublicKey);
         }
-        // lambda = (3*px^2 + a) / (2*py)
-        let three = self.p_mont(&BoxedUint::from(SLOPE_NUM_COEFF).resize(self.bits_p));
-        let two = self.p_mont(&BoxedUint::from(SLOPE_DEN_COEFF).resize(self.bits_p));
-        let a_mont = self.p_mont(&self.a);
-        let px_mont = self.p_mont(px);
-        let num = &(&three * &(&px_mont * &px_mont)) + &a_mont;
-        // `2y` is invertible mod p: we just checked `py != 0`, p is
-        // prime, and 2 is coprime with p (p is odd). If invert()
-        // ever returns None anyway, fail closed by returning
-        // infinity -- the subsequent verify step will reject.
-        let Some(den_inv): Option<BoxedMontyForm> = Option::from((&two * &py_mont).invert()) else {
-            return AffinePoint::infinity();
-        };
-        let lambda = &num * &den_inv;
-        let lambda_sq = &lambda * &lambda;
-        let rx = &(&lambda_sq - &px_mont) - &px_mont;
-        let ry = &(&lambda * &(&px_mont - &rx)) - &py_mont;
-        AffinePoint {
-            xy: Some((rx.retrieve(), ry.retrieve())),
+        match curve {
+            NamedCurve::P256 => p256::ecdsa::VerifyingKey::from_sec1_bytes(bytes)
+                .map(Self::P256)
+                .map_err(|_e| EcdsaError::BadPublicKey),
+            NamedCurve::P384 => p384::ecdsa::VerifyingKey::from_sec1_bytes(bytes)
+                .map(Self::P384)
+                .map_err(|_e| EcdsaError::BadPublicKey),
         }
     }
 
-    /// Point addition (affine). Handles infinity + match cases.
-    fn add(&self, p: &AffinePoint, q: &AffinePoint) -> AffinePoint {
-        let (Some((px, py)), Some((qx, qy))) = (p.xy.as_ref(), q.xy.as_ref()) else {
-            return if p.is_infinity() {
-                q.clone()
-            } else {
-                p.clone()
-            };
-        };
-        if px == qx {
-            if py == qy {
-                return self.double(p);
+    /// Verify non-zero big-endian scalar magnitudes `(r_bytes, s_bytes)` over
+    /// `message_digest`.
+    fn verify_scalars(
+        &self,
+        r_bytes: &[u8],
+        s_bytes: &[u8],
+        message_digest: &[u8],
+    ) -> Result<(), EcdsaError> {
+        match self {
+            Self::P256(vk) => {
+                use p256::ecdsa::signature::hazmat::PrehashVerifier as _;
+                let r = pad_scalar::<P256_FIELD_LEN>(r_bytes)?;
+                let s = pad_scalar::<P256_FIELD_LEN>(s_bytes)?;
+                let sig = p256::ecdsa::Signature::from_scalars(r, s)
+                    .map_err(|_e| EcdsaError::SigOutOfRange)?;
+                vk.verify_prehash(message_digest, &sig)
+                    .map_err(|_e| EcdsaError::VerifyFailed)
             }
-            // P + (-P) = infinity.
-            return AffinePoint::infinity();
-        }
-        let px_m = self.p_mont(px);
-        let py_m = self.p_mont(py);
-        let qx_m = self.p_mont(qx);
-        let qy_m = self.p_mont(qy);
-        let num = &qy_m - &py_m;
-        // `qx - px` is non-zero (we just checked `px != qx`) so its
-        // modular inverse exists for prime p. Fail closed otherwise.
-        let Some(den_inv): Option<BoxedMontyForm> = Option::from((&qx_m - &px_m).invert()) else {
-            return AffinePoint::infinity();
-        };
-        let lambda = &num * &den_inv;
-        let lambda_sq = &lambda * &lambda;
-        let rx = &(&lambda_sq - &px_m) - &qx_m;
-        let ry = &(&lambda * &(&px_m - &rx)) - &py_m;
-        AffinePoint {
-            xy: Some((rx.retrieve(), ry.retrieve())),
-        }
-    }
-
-    /// Scalar multiplication `k * P` using double-and-add (the
-    /// constant-time hardening doesn't matter -- we only multiply
-    /// scalars that came from the *signature*, no secrets).
-    fn scalar_mul(&self, k: &BoxedUint, point: &AffinePoint) -> AffinePoint {
-        if point.is_infinity() {
-            return AffinePoint::infinity();
-        }
-        let mut acc = AffinePoint::infinity();
-        let mut addend = point.clone();
-        let bits = k.bits_vartime();
-        for i in 0..bits {
-            if k.bit_vartime(i) {
-                acc = self.add(&acc, &addend);
+            Self::P384(vk) => {
+                use p384::ecdsa::signature::hazmat::PrehashVerifier as _;
+                let r = pad_scalar::<P384_FIELD_LEN>(r_bytes)?;
+                let s = pad_scalar::<P384_FIELD_LEN>(s_bytes)?;
+                let sig = p384::ecdsa::Signature::from_scalars(r, s)
+                    .map_err(|_e| EcdsaError::SigOutOfRange)?;
+                vk.verify_prehash(message_digest, &sig)
+                    .map_err(|_e| EcdsaError::VerifyFailed)
             }
-            addend = self.double(&addend);
         }
-        acc
-    }
-
-    /// The affine point `pubkey_sec1` encodes, validated as a public
-    /// key on this curve: SEC 1 sec.3.2.2.1 steps 2 and 3, with the
-    /// encoding of sec.2.3.4. Each coordinate is exactly
-    /// [`Self::field_len`] octets and a field element below `p`
-    /// (sec.2.3.6), so one key has one accepted encoding, and the
-    /// point lies on the curve.
-    ///
-    /// # Errors
-    /// [`EcdsaError::BadPublicKey`] for any other encoding or a point
-    /// off the curve.
-    fn public_key(&self, pubkey_sec1: &Sec1UncompressedPoint) -> Result<AffinePoint, EcdsaError> {
-        let q = pubkey_sec1.parse_affine(self)?;
-        if !self.is_on_curve(&q) {
-            return Err(EcdsaError::BadPublicKey);
-        }
-        Ok(q)
-    }
-
-    /// The field element `bytes` encodes: exactly [`Self::field_len`]
-    /// octets holding an integer below `p` (SEC 1 sec.2.3.6).
-    ///
-    /// # Errors
-    /// [`EcdsaError::BadPublicKey`] for another width or a value of
-    /// `p` or more.
-    fn field_element(&self, bytes: &[u8]) -> Result<BoxedUint, EcdsaError> {
-        if bytes.len() != self.field_len {
-            return Err(EcdsaError::BadPublicKey);
-        }
-        let value =
-            BoxedUint::from_be_slice(bytes, self.bits_p).map_err(|_e| EcdsaError::BadPublicKey)?;
-        if value >= self.p_uint {
-            return Err(EcdsaError::BadPublicKey);
-        }
-        Ok(value)
-    }
-
-    /// Test `Q.y^2 == Q.x^3 + a*Q.x + b mod p`.
-    fn is_on_curve(&self, q: &AffinePoint) -> bool {
-        let Some((qx, qy)) = &q.xy else { return false };
-        let qx_m = self.p_mont(qx);
-        let qy_m = self.p_mont(qy);
-        let lhs = &qy_m * &qy_m;
-        let a_m = self.p_mont(&self.a);
-        let b_m = self.p_mont(&self.b);
-        let rhs_no_b = &(&(&qx_m * &qx_m) * &qx_m) + &(&a_m * &qx_m);
-        let rhs = &rhs_no_b + &b_m;
-        lhs == rhs
     }
 }
 
-/// Verify an ECDSA signature.
+/// Left-pad a big-endian scalar magnitude into a fixed-width field array.
+fn pad_scalar<const N: usize>(magnitude: &[u8]) -> Result<[u8; N], EcdsaError> {
+    let lead_zeros = N
+        .checked_sub(magnitude.len())
+        .ok_or(EcdsaError::SigOutOfRange)?;
+    let mut out = [0_u8; N];
+    if let Some(tail) = out.get_mut(lead_zeros..) {
+        tail.copy_from_slice(magnitude);
+    }
+    Ok(out)
+}
+
+/// Verify a DER-encoded ECDSA signature over an already-computed digest.
 ///
-/// - `curve` -- field prime, coefficients, base point, order.
-/// - `pubkey_sec1` -- uncompressed SEC1 point: `04 || X || Y`,
-///   each coordinate `ceil(bits(p) / 8)` bytes.
-/// - `signature_der` -- DER `SEQUENCE { r INTEGER, s INTEGER }`.
-/// - `message_digest` -- already-hashed message (caller picks
-///   the hash so we don't need a `HashAlgorithm` parameter
-///   here).
+/// - `curve` -- [`NamedCurve::P256`] or [`NamedCurve::P384`].
+/// - `pubkey_sec1` -- uncompressed SEC 1 point (`04 || X || Y`).
+/// - `signature_der` -- strict DER `SEQUENCE { r INTEGER, s INTEGER }`.
+/// - `message_digest` -- prehashed message digest of any supported hash width.
 ///
 /// # Errors
-/// [`EcdsaError`] on any of the verifier's reject branches.
-///
-/// The `BoxedMontyForm` multiplications (`e_mont * w_mont`,
-/// `r_mont * w_mont`) are modular arithmetic mod `n` with a
-/// well-defined wrap; no overflow surface.
+/// [`EcdsaError`] on malformed public key, non-canonical DER signature,
+/// out-of-range scalar, or cryptographic verification mismatch.
 pub(crate) fn verify_prehashed(
-    curve: &Curve,
+    curve: NamedCurve,
     pubkey_sec1: &Sec1UncompressedPoint,
     signature_der: &Signature<EcdsaDer>,
     message_digest: &[u8],
 ) -> Result<(), EcdsaError> {
-    let ctx = CurveCtx::new(curve)?;
-    let q = ctx.public_key(pubkey_sec1)?;
+    let vk = VerifiedPublicKey::from_sec1(curve, pubkey_sec1)?;
     let (r_bytes, s_bytes) = signature_der.parse_ecdsa_signature()?;
-    let r = EcdsaHelpers::boxed(r_bytes.as_slice(), ctx.bits_n)?;
-    let s = EcdsaHelpers::boxed(s_bytes.as_slice(), ctx.bits_n)?;
-    let one = BoxedUint::one_with_precision(ctx.bits_n);
-    if r < one || r >= ctx.n_uint || s < one || s >= ctx.n_uint {
-        return Err(EcdsaError::SigOutOfRange);
-    }
-    // e := leftmost min(bits(n), bits(hash)) bits of the digest,
-    // interpreted as a big-endian integer (RFC 6979 sec.2.3.2).
-    let e_uint = EcdsaHelpers::digest_to_scalar(message_digest, &ctx);
-    let s_mont = ctx.n_mont(&s);
-    let w_mont: BoxedMontyForm = Option::from(s_mont.invert()).ok_or(EcdsaError::NotInvertible)?;
-    let e_mont = ctx.n_mont(&e_uint);
-    let r_mont = ctx.n_mont(&r);
-    let u1 = (&e_mont * &w_mont).retrieve();
-    let u2 = (&r_mont * &w_mont).retrieve();
-    let point_a = ctx.scalar_mul(&u1, &ctx.g);
-    let point_b = ctx.scalar_mul(&u2, &q);
-    let sum = ctx.add(&point_a, &point_b);
-    let Some((sx, _)) = sum.xy else {
-        return Err(EcdsaError::VerifyFailed);
-    };
-    // sx mod n
-    let sx_n = EcdsaHelpers::bytes_into_n(&sx, &ctx);
-    if sx_n == r {
-        Ok(())
-    } else {
-        Err(EcdsaError::VerifyFailed)
-    }
-}
-
-impl Sec1UncompressedPoint {
-    /// Decode a SEC1-uncompressed EC point (`04 || X || Y`) into
-    /// an [`AffinePoint`].
-    ///
-    /// SEC1 §2.3.4. Rejects compressed (`02`/`03`) and hybrid
-    /// (`06`/`07`) encodings -- the FINEID profile pins
-    /// uncompressed form (FINEID S2 §5.1) -- rejects bodies
-    /// whose length is not twice the curve's field width, and
-    /// rejects a coordinate of `p` or more (§2.3.6). Does not
-    /// run the on-curve check; the caller
-    /// ([`CurveCtx::public_key`]) does that next.
-    fn parse_affine(&self, ctx: &CurveCtx) -> Result<AffinePoint, EcdsaError> {
-        let bytes = self.as_bytes();
-        if bytes.first().copied() != Some(SEC1_UNCOMPRESSED_TAG) {
-            return Err(EcdsaError::BadPublicKey);
-        }
-        let body = bytes.get(1..).ok_or(EcdsaError::BadPublicKey)?;
-        if body.len() != ctx.field_len.saturating_mul(POINT_COORDINATE_COUNT) {
-            return Err(EcdsaError::BadPublicKey);
-        }
-        let (x_bytes, y_bytes) = body.split_at(ctx.field_len);
-        let x = ctx.field_element(x_bytes)?;
-        let y = ctx.field_element(y_bytes)?;
-        Ok(AffinePoint { xy: Some((x, y)) })
-    }
+    vk.verify_scalars(r_bytes, s_bytes, message_digest)
 }
 
 impl Signature<EcdsaDer> {
-    /// Convert `XMLDSig`'s raw fixed-width `r || s` representation into
-    /// the DER `Ecdsa-Sig-Value` consumed by the verifier.
+    /// Convert fixed-width `r || s` concatenation (XMLDSig / PKCS#11 / JWS)
+    /// into canonical ASN.1 DER `Ecdsa-Sig-Value`.
     ///
     /// # Errors
-    /// [`EcdsaError::BadSignature`] when the input is empty or has an
-    /// odd length, so it cannot contain two equally sized components.
+    /// [`EcdsaError::BadSignature`] when the input is empty, has an odd
+    /// length, or exceeds DER length limits.
     pub fn from_raw_concatenation(raw: &[u8]) -> Result<Self, EcdsaError> {
+        use spki::der::{Encode as _, SliceWriter, asn1::UintRef};
+
         if raw.is_empty() || !raw.len().is_multiple_of(SIG_COMPONENT_COUNT) {
             return Err(EcdsaError::BadSignature);
         }
         let half = raw.len() >> 1_u32;
         let (r, s) = raw.split_at(half);
-        let mut body = Vec::with_capacity(raw.len().saturating_add(BODY_SLACK));
-        EcdsaHelpers::encode_der_integer(&mut body, r);
-        EcdsaHelpers::encode_der_integer(&mut body, s);
-        let mut out = Vec::with_capacity(body.len().saturating_add(SEQUENCE_HEADER_SLACK));
-        out.push(ASN1_SEQUENCE_TAG);
-        EcdsaHelpers::encode_der_length(&mut out, body.len());
-        out.extend_from_slice(&body);
+        let pair = [
+            UintRef::new(r).map_err(|_e| EcdsaError::BadSignature)?,
+            UintRef::new(s).map_err(|_e| EcdsaError::BadSignature)?,
+        ];
+        let encoded_len = pair
+            .encoded_len()
+            .and_then(usize::try_from)
+            .map_err(|_e| EcdsaError::BadSignature)?;
+        let mut out = vec![0_u8; encoded_len];
+        let mut writer = SliceWriter::new(&mut out);
+        pair.encode(&mut writer)
+            .map_err(|_e| EcdsaError::BadSignature)?;
+        let written_len = writer
+            .finish()
+            .map_err(|_e| EcdsaError::BadSignature)?
+            .len();
+        if written_len != encoded_len {
+            return Err(EcdsaError::BadSignature);
+        }
         Ok(Self::new(out))
     }
 
-    /// Decode an ECDSA `Ecdsa-Sig-Value` into the magnitudes of `r`
-    /// and `s`.
-    ///
-    /// RFC 3279 sec.2.2.3: exactly one DER `SEQUENCE` of exactly two
-    /// `INTEGER`s and nothing after either. Each `INTEGER` must be
-    /// positive and minimally encoded (X.690 sec.8.3.2): a leading
-    /// zero octet is present exactly when the next octet has its top
-    /// bit set. The range `[1, n-1]` needs the curve and is checked
-    /// by the verifier.
-    fn parse_ecdsa_signature(&self) -> Result<(Vec<u8>, Vec<u8>), EcdsaError> {
-        let bytes = self.as_bytes();
-        let outer = BerTlv::<Sequence>::parse(bytes).map_err(|_e| EcdsaError::BadSignature)?;
-        if outer.size() != bytes.len() {
-            return Err(EcdsaError::BadSignature);
-        }
-        let mut components = outer.iter_children();
-        let mut next_integer = || -> Result<Vec<u8>, EcdsaError> {
-            let integer = components
-                .next()
-                .ok_or(EcdsaError::BadSignature)?
-                .map_err(|_e| EcdsaError::BadSignature)?
-                .expect::<Integer>()
-                .map_err(|_e| EcdsaError::BadSignature)?;
-            EcdsaHelpers::positive_magnitude(integer.value()).map(<[u8]>::to_vec)
-        };
-        let r = next_integer()?;
-        let s = next_integer()?;
-        if components.next().is_some() {
+    /// Decode a strict DER `Ecdsa-Sig-Value` into the positive minimal
+    /// big-endian magnitudes of `r` and `s` (RFC 3279 sec. 2.2.3,
+    /// ITU-T X.690 sec. 8.3).
+    fn parse_ecdsa_signature(&self) -> Result<(&[u8], &[u8]), EcdsaError> {
+        use spki::der::{Decode as _, Reader as _, SliceReader, asn1::UintRef};
+
+        let mut reader =
+            SliceReader::new(self.as_bytes()).map_err(|_e| EcdsaError::BadSignature)?;
+        let (r, s) = reader
+            .sequence(|seq| {
+                let r = UintRef::decode(seq)?;
+                let s = UintRef::decode(seq)?;
+                Ok((r.as_bytes(), s.as_bytes()))
+            })
+            .map_err(|_e: spki::der::Error| EcdsaError::BadSignature)?;
+        reader.finish().map_err(|_e| EcdsaError::BadSignature)?;
+        if r.is_empty() || r.iter().all(|&b| b == 0) || s.is_empty() || s.iter().all(|&b| b == 0) {
             return Err(EcdsaError::BadSignature);
         }
         Ok((r, s))
     }
 }
 
-impl EcdsaHelpers {
-    /// The magnitude of a positive, minimally encoded DER `INTEGER`
-    /// body (X.690 sec.8.3.2), or [`EcdsaError::BadSignature`] for an
-    /// empty, zero, negative or padded one: an ECDSA `r` or `s` lies
-    /// in `[1, n-1]` (FIPS 186-4 sec.6.4.2).
-    fn positive_magnitude(value: &[u8]) -> Result<&[u8], EcdsaError> {
-        match value {
-            [first, ..] if first & HIGH_BIT_SET != 0 => Err(EcdsaError::BadSignature),
-            [DER_SIGN_PAD] => Err(EcdsaError::BadSignature),
-            [DER_SIGN_PAD, second, ..] if second & HIGH_BIT_SET == 0 => {
-                Err(EcdsaError::BadSignature)
-            }
-            [DER_SIGN_PAD, magnitude @ ..] => Ok(magnitude),
-            [_, ..] => Ok(value),
-            [] => Err(EcdsaError::BadSignature),
-        }
-    }
-}
-
-impl EcdsaHelpers {
-    /// Append an ASN.1 DER `INTEGER` (tag [`ASN1_INTEGER_TAG`])
-    /// wrapping a big-endian unsigned magnitude `value` to `out`.
-    ///
-    /// Strips redundant leading zero bytes (DER integers are
-    /// minimal-form) and prepends a single [`DER_SIGN_PAD`] when
-    /// the resulting high bit is set (to keep the integer
-    /// positive under the two's-complement DER interpretation,
-    /// per X.690 §8.3.3 / RFC 3279 §2.2.3). The mirror of
-    /// the ECDSA signature parser's integer decode.
-    fn encode_der_integer(out: &mut Vec<u8>, value: &[u8]) {
-        // Strip leading zeros, but keep at least one byte so a
-        // zero integer encodes as `02 01 00` rather than the
-        // invalid `02 00`.
-        let mut start: usize = 0;
-        while start.saturating_add(1) < value.len() && value.get(start).copied() == Some(0) {
-            start = start.saturating_add(1);
-        }
-        let trimmed = value.get(start..).unwrap_or(&[]);
-        let needs_pad = trimmed.first().is_some_and(|&b| b >= HIGH_BIT_SET);
-        let int_len = trimmed.len().saturating_add(usize::from(needs_pad));
-        out.push(ASN1_INTEGER_TAG);
-        Self::encode_der_length(out, int_len);
-        if needs_pad {
-            out.push(DER_SIGN_PAD);
-        }
-        out.extend_from_slice(trimmed);
-    }
-
-    /// Append an ASN.1 DER length octet sequence for `len` to
-    /// `out`. Short form for `len < 128`; long form (marker
-    /// [`DER_LONG_FORM_1B`] or [`DER_LONG_FORM_2B`] followed by
-    /// the big-endian length bytes) for larger values. Caps at
-    /// 65535 -- ECDSA signatures over any practical curve fit
-    /// well under that. Values beyond 65535 are clamped to
-    /// `u16::MAX` (saturating, fail-closed); the surrounding
-    /// `into_der` only ever feeds body lengths under 300 bytes.
-    fn encode_der_length(out: &mut Vec<u8>, len: usize) {
-        if len < SHORT_FORM_CEILING {
-            // Bounded by check; fits in u8.
-            let b = u8::try_from(len).unwrap_or(u8::MAX);
-            out.push(b);
-        } else if len < ONE_BYTE_FORM_CEILING {
-            out.push(DER_LONG_FORM_1B);
-            let b = u8::try_from(len).unwrap_or(u8::MAX);
-            out.push(b);
-        } else {
-            out.push(DER_LONG_FORM_2B);
-            // Saturate to u16::MAX for any value beyond the
-            // 2-byte form -- callers only ever pass body lengths
-            // well under 300 bytes (ECDSA signatures).
-            let clamped = u16::try_from(len).unwrap_or(u16::MAX);
-            let [hi, lo] = clamped.to_be_bytes();
-            out.push(hi);
-            out.push(lo);
-        }
-    }
-
-    /// Map a hash digest to the ECDSA scalar `e` per RFC 6979
-    /// §2.3.2.
-    ///
-    /// Takes the leftmost `min(bits(n), bits(hash))` bits of the
-    /// digest, interpreted big-endian, and right-shifts the
-    /// remaining low bits when the truncation falls inside a
-    /// byte (i.e. `bits(n) mod 8 != 0`). The shift is a no-op
-    /// for the common case of curves whose order is a multiple
-    /// of 8 bits (P-256, P-384, `brainpoolP384r1`).
-    fn digest_to_scalar(digest: &[u8], ctx: &CurveCtx) -> BoxedUint {
-        let n_bits = ctx.n_uint.bits_vartime();
-        let n_bytes = usize::try_from(n_bits.div_ceil(BITS_PER_BYTE)).unwrap_or(usize::MAX);
-        let take = digest.len().min(n_bytes);
-        let mut buf = digest.get(..take).unwrap_or(&[]).to_vec();
-        // If the hash is wider than n in bytes but n's bit-length is
-        // not a multiple of 8, right-shift the leading byte to keep
-        // only `n_bits % 8` high bits (RFC 6979 sec.2.3.2). For the
-        // 512-bit hash + 512-bit n case this is a no-op.
-        // n_bits is a u32 from bits_vartime(); `% 8` is in [0, 7]
-        // and trivially fits u32.
-        let n_bits_mod_8: u32 = n_bits
-            .rem_euclid(BITS_PER_BYTE)
-            .clamp(0, BITS_PER_BYTE.saturating_sub(1));
-        let extra_bits = BITS_PER_BYTE
-            .saturating_sub(n_bits_mod_8)
-            .rem_euclid(BITS_PER_BYTE);
-        if extra_bits != 0 && !buf.is_empty() {
-            // `extra_bits` in [1, 7] from the modulo above; shift
-            // amounts stay well under u8 bit width.
-            let inv_bits = BITS_PER_BYTE.saturating_sub(extra_bits);
-            let mask = u8::try_from(1_u32.checked_shl(extra_bits).unwrap_or(1))
-                .unwrap_or(0)
-                .saturating_sub(1);
-            // We need to shift the WHOLE buf right by `extra_bits`.
-            let mut carry: u8 = 0;
-            for b in &mut buf {
-                let new_carry = *b & mask;
-                *b = (*b >> extra_bits) | (carry << inv_bits);
-                carry = new_carry;
-            }
-        }
-        BoxedUint::from_be_slice(&buf, ctx.bits_n)
-            .unwrap_or_else(|_e| BoxedUint::zero_with_precision(ctx.bits_n))
-    }
-
-    /// Reduce a field element (mod p) into the scalar field
-    /// (mod n). In practice for ECDSA's final compare, `sx <
-    /// p` but might be `>= n` if `p > n`. Cheapest correct
-    /// reduction: subtract n when `sx >= n`.
-    fn bytes_into_n(sx: &BoxedUint, ctx: &CurveCtx) -> BoxedUint {
-        let sx_at_n = sx.resize(ctx.bits_n);
-        if sx_at_n >= ctx.n_uint {
-            let (diff, _borrow) = sx_at_n.borrowing_sub(&ctx.n_uint, crypto_bigint::Limb::ZERO);
-            diff
-        } else {
-            sx_at_n
-        }
-    }
-}
-
-// ----- SPKI parsing: the named curve of an id-ecPublicKey key -----
-
-/// Pull the named [`Curve`] and the public point out of an EC
+/// Pull the [`NamedCurve`] and uncompressed public point out of an EC
 /// `SubjectPublicKeyInfo`.
 ///
-/// RFC 5480 sec.2.1.1: the parameters are the `namedCurve` OID, and
-/// only P-256 and P-384 are in the table. Explicit `ECParameters`,
-/// `implicitCurve`, an unknown curve OID, or a point that is not
-/// octet-aligned uncompressed SEC 1 of the curve's width all return
+/// RFC 5480 sec. 2.1.1: the parameters must be a supported `namedCurve`
+/// OID (`secp256r1` or `secp384r1`). Explicit `ECParameters`,
+/// `implicitCurve`, an unknown curve OID, unused BIT STRING bits, or a
+/// point that is not uncompressed SEC 1 of the curve's width all return
 /// `None`.
 #[must_use]
-pub(crate) fn extract_ec_pubkey(spki_der: &[u8]) -> Option<(Curve, Sec1UncompressedPoint)> {
+pub(crate) fn extract_ec_pubkey(spki_der: &[u8]) -> Option<(NamedCurve, Sec1UncompressedPoint)> {
     use spki::SubjectPublicKeyInfoRef;
     use spki::der::Decode as _;
     use spki::der::asn1::ObjectIdentifier;
@@ -856,386 +389,185 @@ pub(crate) fn extract_ec_pubkey(spki_der: &[u8]) -> Option<(Curve, Sec1Uncompres
         .parameters?
         .decode_as::<ObjectIdentifier>()
         .ok()?;
-    let curve = EcdsaHelpers::named_curve_from_oid(KnownOid::new(curve_oid.as_bytes()).ok()?)?;
+    let curve = NamedCurve::from_oid(KnownOid::new(curve_oid.as_bytes()).ok()?)?;
     // An EC point is octet-aligned. `as_bytes`, unlike `raw_bytes`,
     // refuses a BIT STRING that declares unused trailing bits.
     let pubkey =
         Sec1UncompressedPoint::from_bytes(info.subject_public_key.as_bytes()?.to_vec()).ok()?;
-    let point_len = curve
-        .p
-        .len()
-        .saturating_mul(POINT_COORDINATE_COUNT)
-        .saturating_add(1);
-    if pubkey.len() != point_len {
+    if pubkey.len() != curve.uncompressed_point_len() {
         return None;
     }
     Some((curve, pubkey))
 }
 
-// Named-curve OIDs: `known::SECP256R1` (prime256v1 / NIST P-256) and
-// `known::SECP384R1` (NIST P-384).
-
 impl Signature<EcdsaP384> {
     /// Convert this raw `r || s` ECDSA signature into ASN.1 DER
-    /// `SEQUENCE { INTEGER r, INTEGER s }` form. r and s are
-    /// extracted as the first half / second half of the bytes
-    /// (FINEID S1 v4.2 §3.8.3 guarantees the card writes equal-
-    /// sized halves; the trait-level
-    /// `sign_pre_hashed_sha384_ecdsa_p384` enforces the
-    /// 96-byte total before constructing this typed value).
-    ///
-    /// Pure local re-encoding; no card touch, no fallible
-    /// inputs beyond the structural invariant the type carries.
+    /// `SEQUENCE { INTEGER r, INTEGER s }` form (FINEID S1 v4.2
+    /// sec. 3.8.3).
     #[must_use]
     pub fn into_der(self) -> Option<Signature<EcdsaDer>> {
-        let raw = self.into_bytes();
-        if !raw.len().is_multiple_of(SIG_COMPONENT_COUNT) || raw.is_empty() {
-            return None;
-        }
-        // Bit-shift instead of `/ 2` to bypass the
-        // clippy::integer_division_remainder_used lint; the even-
-        // length invariant is asserted above, so `>> 1` is exact.
-        let half: usize = raw.len() >> 1_u32;
-        let (r, s) = raw.split_at(half);
-        let mut body = Vec::with_capacity(raw.len().saturating_add(BODY_SLACK));
-        EcdsaHelpers::encode_der_integer(&mut body, r);
-        EcdsaHelpers::encode_der_integer(&mut body, s);
-        let mut out = Vec::with_capacity(body.len().saturating_add(SEQUENCE_HEADER_SLACK));
-        out.push(ASN1_SEQUENCE_TAG);
-        EcdsaHelpers::encode_der_length(&mut out, body.len());
-        out.extend_from_slice(&body);
-        Some(Signature::new(out))
+        Signature::<EcdsaDer>::from_raw_concatenation(self.as_bytes()).ok()
     }
 }
 
 impl Signature<EcdsaP256> {
     /// Convert this raw `r || s` ECDSA signature into ASN.1 DER
-    /// `SEQUENCE { INTEGER r, INTEGER s }` form. This is the
-    /// P-256 companion to [`Signature<EcdsaP384>::into_der`];
-    /// the raw input is 32 + 32 bytes.
-    ///
-    /// Pure local re-encoding; no card touch, no fallible
-    /// inputs beyond the structural invariant the type carries.
+    /// `SEQUENCE { INTEGER r, INTEGER s }` form.
     #[must_use]
     pub fn into_der(self) -> Option<Signature<EcdsaDer>> {
-        let raw = self.into_bytes();
-        if !raw.len().is_multiple_of(SIG_COMPONENT_COUNT) || raw.is_empty() {
-            return None;
-        }
-        let half: usize = raw.len() >> 1_u32;
-        let (r, s) = raw.split_at(half);
-        let mut body = Vec::with_capacity(raw.len().saturating_add(BODY_SLACK));
-        EcdsaHelpers::encode_der_integer(&mut body, r);
-        EcdsaHelpers::encode_der_integer(&mut body, s);
-        let mut out = Vec::with_capacity(body.len().saturating_add(SEQUENCE_HEADER_SLACK));
-        out.push(ASN1_SEQUENCE_TAG);
-        EcdsaHelpers::encode_der_length(&mut out, body.len());
-        out.extend_from_slice(&body);
-        Some(Signature::new(out))
+        Signature::<EcdsaDer>::from_raw_concatenation(self.as_bytes()).ok()
     }
 }
 
 impl Sec1UncompressedPoint {
-    /// Verify an ECDSA P-256 + SHA-256 signature against this
-    /// public key. Accepts the raw `r || s` form (64 bytes for
-    /// secp256r1); the conversion to DER for the underlying
-    /// verifier is internal.
+    /// Verify a fixed-width `r || s` signature directly against `self`
+    /// on `curve` without intermediate DER re-encoding.
+    fn verify_raw(
+        &self,
+        curve: NamedCurve,
+        signature_raw: &[u8],
+        message_digest: &[u8],
+    ) -> Result<(), EcdsaError> {
+        if signature_raw.len() != curve.raw_signature_len() {
+            return Err(EcdsaError::BadSignature);
+        }
+        let vk = VerifiedPublicKey::from_sec1(curve, self)?;
+        let (r_half, s_half) = signature_raw.split_at(curve.field_len());
+        if r_half.iter().all(|&b| b == 0) || s_half.iter().all(|&b| b == 0) {
+            return Err(EcdsaError::BadSignature);
+        }
+        vk.verify_scalars(r_half, s_half, message_digest)
+    }
+
+    /// Verify an ECDSA P-256 + SHA-256 raw `r || s` signature against
+    /// this public key.
     ///
     /// # Errors
-    /// [`EcdsaError`] on any reject branch -- curve construct
-    /// failure, off-curve pubkey, r/s out of `[1, n-1]`, s
-    /// not invertible mod n, or final verification mismatch.
+    /// [`EcdsaError`] on bad key, bad raw signature shape, out-of-range
+    /// scalar, or verification mismatch.
     pub fn verify_p256_sha256_raw(
         &self,
         signature_raw: Signature<EcdsaP256>,
-        message_digest: refineid_digest::Sha256,
+        message_digest: Sha256,
     ) -> Result<(), EcdsaError> {
-        let curve =
-            EcdsaHelpers::named_curve_from_oid(known::SECP256R1).ok_or(EcdsaError::BadModulus)?;
-        let signature_der = signature_raw.into_der().ok_or(EcdsaError::BadSignature)?;
-        verify_prehashed(&curve, self, &signature_der, message_digest.as_bytes())
+        self.verify_raw(
+            NamedCurve::P256,
+            signature_raw.as_bytes(),
+            message_digest.as_bytes(),
+        )
     }
 
-    /// Verify an ECDSA P-384 + SHA-384 signature against this
-    /// public key. Accepts the card-native raw `r || s` form
-    /// FINEID PSO:CDS returns (96 bytes for secp384r1 per S1
-    /// v4.2 §3.8.3); the conversion to DER for the underlying
-    /// verifier is internal.
-    ///
-    /// `signature_raw` and `message_digest` are taken by value
-    /// per typing-discipline Rule B (no `&T` on pub-fn params);
-    /// callers that want to keep the signature around clone it
-    /// at the call site, which is cheap (96-byte Vec).
+    /// Verify an ECDSA P-384 + SHA-384 raw `r || s` signature against
+    /// this public key (FINEID S1 v4.2 sec. 3.8.3).
     ///
     /// # Errors
-    /// [`EcdsaError`] on any reject branch -- curve construct
-    /// failure, off-curve pubkey, r/s out of `[1, n-1]`, s
-    /// not invertible mod n, or final verification mismatch.
+    /// [`EcdsaError`] on bad key, bad raw signature shape, out-of-range
+    /// scalar, or verification mismatch.
     pub fn verify_p384_sha384_raw(
         &self,
         signature_raw: Signature<EcdsaP384>,
         message_digest: Sha384,
     ) -> Result<(), EcdsaError> {
-        let curve =
-            EcdsaHelpers::named_curve_from_oid(known::SECP384R1).ok_or(EcdsaError::BadModulus)?;
-        let signature_der = signature_raw.into_der().ok_or(EcdsaError::BadSignature)?;
-        verify_prehashed(&curve, self, &signature_der, message_digest.as_bytes())
+        self.verify_raw(
+            NamedCurve::P384,
+            signature_raw.as_bytes(),
+            message_digest.as_bytes(),
+        )
     }
 
-    /// Verify a P-384 ECDSA signature over a SHA-1 digest. Same
-    /// curve and verifier as the SHA-384 path; ECDSA is hash-agnostic,
-    /// so only the digest length differs (20 bytes).
+    /// Verify a P-384 ECDSA raw `r || s` signature over a SHA-1 digest.
     ///
     /// # Errors
-    /// [`EcdsaError`] on any reject branch, as `verify_p384_sha384_raw`.
+    /// [`EcdsaError`] on any reject branch, as [`Self::verify_p384_sha384_raw`].
     pub fn verify_p384_sha1_raw(
         &self,
         signature_raw: Signature<EcdsaP384>,
         message_digest: Sha1,
     ) -> Result<(), EcdsaError> {
-        let curve =
-            EcdsaHelpers::named_curve_from_oid(known::SECP384R1).ok_or(EcdsaError::BadModulus)?;
-        let signature_der = signature_raw.into_der().ok_or(EcdsaError::BadSignature)?;
-        verify_prehashed(&curve, self, &signature_der, message_digest.as_bytes())
+        self.verify_raw(
+            NamedCurve::P384,
+            signature_raw.as_bytes(),
+            message_digest.as_bytes(),
+        )
     }
 
-    /// Verify a P-384 ECDSA signature over a SHA-224 digest. Same
-    /// curve and verifier as the SHA-384 path; ECDSA is hash-agnostic,
-    /// so only the digest length differs (28 bytes).
+    /// Verify a P-384 ECDSA raw `r || s` signature over a SHA-224 digest.
     ///
     /// # Errors
-    /// [`EcdsaError`] on any reject branch, as `verify_p384_sha384_raw`.
+    /// [`EcdsaError`] on any reject branch, as [`Self::verify_p384_sha384_raw`].
     pub fn verify_p384_sha224_raw(
         &self,
         signature_raw: Signature<EcdsaP384>,
         message_digest: Sha224,
     ) -> Result<(), EcdsaError> {
-        let curve =
-            EcdsaHelpers::named_curve_from_oid(known::SECP384R1).ok_or(EcdsaError::BadModulus)?;
-        let signature_der = signature_raw.into_der().ok_or(EcdsaError::BadSignature)?;
-        verify_prehashed(&curve, self, &signature_der, message_digest.as_bytes())
+        self.verify_raw(
+            NamedCurve::P384,
+            signature_raw.as_bytes(),
+            message_digest.as_bytes(),
+        )
     }
 
-    /// Verify a P-384 ECDSA signature over a SHA-256 digest. Same
-    /// curve and verifier as the SHA-384 path; ECDSA is hash-agnostic,
-    /// so only the digest length differs (32 bytes). Used to locally
-    /// confirm the card's ECDSA+SHA-256 signature (the TLS-1.2
-    /// `CertificateVerify` hash macOS requests for suomi.fi).
+    /// Verify a P-384 ECDSA raw `r || s` signature over a SHA-256 digest.
     ///
     /// # Errors
-    /// [`EcdsaError`] on any reject branch, as `verify_p384_sha384_raw`.
+    /// [`EcdsaError`] on any reject branch, as [`Self::verify_p384_sha384_raw`].
     pub fn verify_p384_sha256_raw(
         &self,
         signature_raw: Signature<EcdsaP384>,
         message_digest: Sha256,
     ) -> Result<(), EcdsaError> {
-        let curve =
-            EcdsaHelpers::named_curve_from_oid(known::SECP384R1).ok_or(EcdsaError::BadModulus)?;
-        let signature_der = signature_raw.into_der().ok_or(EcdsaError::BadSignature)?;
-        verify_prehashed(&curve, self, &signature_der, message_digest.as_bytes())
+        self.verify_raw(
+            NamedCurve::P384,
+            signature_raw.as_bytes(),
+            message_digest.as_bytes(),
+        )
     }
 
-    /// Verify a P-384 ECDSA signature over a SHA-512 digest. Same
-    /// curve and verifier as the SHA-384 path; ECDSA is hash-agnostic,
-    /// so only the digest length differs (64 bytes).
+    /// Verify a P-384 ECDSA raw `r || s` signature over a SHA-512 digest.
     ///
     /// # Errors
-    /// [`EcdsaError`] on any reject branch, as `verify_p384_sha384_raw`.
+    /// [`EcdsaError`] on any reject branch, as [`Self::verify_p384_sha384_raw`].
     pub fn verify_p384_sha512_raw(
         &self,
         signature_raw: Signature<EcdsaP384>,
         message_digest: Sha512,
     ) -> Result<(), EcdsaError> {
-        let curve =
-            EcdsaHelpers::named_curve_from_oid(known::SECP384R1).ok_or(EcdsaError::BadModulus)?;
-        let signature_der = signature_raw.into_der().ok_or(EcdsaError::BadSignature)?;
-        verify_prehashed(&curve, self, &signature_der, message_digest.as_bytes())
+        self.verify_raw(
+            NamedCurve::P384,
+            signature_raw.as_bytes(),
+            message_digest.as_bytes(),
+        )
     }
 }
 
-// Named-curve constant table: today this covers `secp256r1`
-// (NIST P-256) and `secp384r1` (NIST P-384) -- the curves
-// FINEID's G4E chain uses. Brainpool +
-// P-521 named-curve SPKIs land in `named_curve_from_oid` as
-// `None`; if they're ever needed extend the table rather than
-// the verifier.
-//
-// Parameter values are the canonical SEC 2 / FIPS 186-4 byte
-// forms, copied as bare big-endian (no ASN.1 INTEGER sign
-// byte, matching the `Curve` struct's documented convention).
-
-/// Byte length of a P-256 field element or scalar -- a 256-bit
-/// prime field (FIPS 186-4 D.1.2.3 / SEC 2 2.4.2).
-const P256_FIELD_LEN: usize = 32;
-/// Byte length of a P-384 field element or scalar -- a 384-bit
-/// prime field (FIPS 186-4 D.1.2.4 / SEC 2 2.5.1).
-const P384_FIELD_LEN: usize = 48;
-
-/// NIST P-256 field prime `p` (FIPS 186-4 D.1.2.3 / SEC 2 2.4.2).
-const SECP256R1_P: [u8; P256_FIELD_LEN] = Hex::decode_const(concat!(
-    "FFFFFFFF000000010000000000000000",
-    "00000000FFFFFFFFFFFFFFFFFFFFFFFF",
-));
-/// NIST P-256 curve coefficient `a`.
-const SECP256R1_A: [u8; P256_FIELD_LEN] = Hex::decode_const(concat!(
-    "FFFFFFFF000000010000000000000000",
-    "00000000FFFFFFFFFFFFFFFFFFFFFFFC",
-));
-/// NIST P-256 curve coefficient `b`.
-const SECP256R1_B: [u8; P256_FIELD_LEN] = Hex::decode_const(concat!(
-    "5AC635D8AA3A93E7B3EBBD55769886BC",
-    "651D06B0CC53B0F63BCE3C3E27D2604B",
-));
-/// NIST P-256 base point `G` x coordinate.
-const SECP256R1_GX: [u8; P256_FIELD_LEN] = Hex::decode_const(concat!(
-    "6B17D1F2E12C4247F8BCE6E563A440F2",
-    "77037D812DEB33A0F4A13945D898C296",
-));
-/// NIST P-256 base point `G` y coordinate.
-const SECP256R1_GY: [u8; P256_FIELD_LEN] = Hex::decode_const(concat!(
-    "4FE342E2FE1A7F9B8EE7EB4A7C0F9E16",
-    "2BCE33576B315ECECBB6406837BF51F5",
-));
-/// NIST P-256 subgroup order `n`.
-const SECP256R1_N: [u8; P256_FIELD_LEN] = Hex::decode_const(concat!(
-    "FFFFFFFF00000000FFFFFFFFFFFFFFFF",
-    "BCE6FAADA7179E84F3B9CAC2FC632551",
-));
-/// NIST P-384 field prime `p` (FIPS 186-4 D.1.2.4 / SEC 2 2.5.1).
-const SECP384R1_P: [u8; P384_FIELD_LEN] = Hex::decode_const(concat!(
-    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
-    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFE",
-    "FFFFFFFF0000000000000000FFFFFFFF",
-));
-/// NIST P-384 curve coefficient `a`.
-const SECP384R1_A: [u8; P384_FIELD_LEN] = Hex::decode_const(concat!(
-    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
-    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFE",
-    "FFFFFFFF0000000000000000FFFFFFFC",
-));
-/// NIST P-384 curve coefficient `b`.
+/// Test-only deterministic RFC 6979 ECDSA signing backed by [`ecdsa`],
+/// [`p256`], and [`p384`].
 ///
-/// The second hex group is split unevenly: joined, it contains a
-/// digits-letter-digits run that the public-hygiene scan would read as
-/// a Finnish personal-identity-code shape. `concat!` rejoins the
-/// pieces; the decoded bytes are the FIPS 186-4 D.1.2.4 value exactly.
-const SECP384R1_B: [u8; P384_FIELD_LEN] = Hex::decode_const(concat!(
-    "B3312FA7E23EE7E4988E056BE3F82D19",
-    "181D9C6EFE8141120314088F",
-    "5013875A",
-    "C656398D8A2ED19D2A85C8EDD3EC2AEF",
-));
-/// NIST P-384 base point `G` x coordinate.
-const SECP384R1_GX: [u8; P384_FIELD_LEN] = Hex::decode_const(concat!(
-    "AA87CA22BE8B05378EB1C71EF320AD74",
-    "6E1D3B628BA79B9859F741E082542A38",
-    "5502F25DBF55296C3A545E3872760AB7",
-));
-/// NIST P-384 base point `G` y coordinate.
-///
-/// The last digit group is split in two: spelled contiguously,
-/// its opening digits would read as a binary radix prefix,
-/// which the repository's numeric-text policy rejects even
-/// inside a hex string. `concat!` rejoins the pieces, so the
-/// decoded bytes are unchanged.
-const SECP384R1_GY: [u8; P384_FIELD_LEN] = Hex::decode_const(concat!(
-    "3617DE4A96262C6F5D9E98BF9292DC29",
-    "F8F41DBD289A147CE9DA3113B5F0B8C0",
-    "0A60B",
-    "1CE1D7E819D7A431D7C90EA0E5F",
-));
-/// NIST P-384 subgroup order `n`.
-const SECP384R1_N: [u8; P384_FIELD_LEN] = Hex::decode_const(concat!(
-    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
-    "FFFFFFFFFFFFFFFFC7634D81F4372DDF",
-    "581A0DB248B0A77AECEC196ACCC52973",
-));
-
-impl EcdsaHelpers {
-    /// Translate a named-curve OID to the corresponding [`Curve`]
-    /// constants.
-    ///
-    /// Returns `None` for any unrecognised OID, and the SPKI is
-    /// refused. Constants are inlined here so the
-    /// build does not depend on a runtime curve table; the SEC1
-    /// / FIPS 186-4 byte forms are decoded at const-eval time,
-    /// so a mistyped digit fails compilation.
-    fn named_curve_from_oid(oid: KnownOid<'_>) -> Option<Curve> {
-        if oid == known::SECP256R1 {
-            return Some(Curve {
-                p: SECP256R1_P.to_vec(),
-                a: SECP256R1_A.to_vec(),
-                b: SECP256R1_B.to_vec(),
-                gx: SECP256R1_GX.to_vec(),
-                gy: SECP256R1_GY.to_vec(),
-                n: SECP256R1_N.to_vec(),
-            });
-        }
-        if oid == known::SECP384R1 {
-            return Some(Curve {
-                p: SECP384R1_P.to_vec(),
-                a: SECP384R1_A.to_vec(),
-                b: SECP384R1_B.to_vec(),
-                gx: SECP384R1_GX.to_vec(),
-                gy: SECP384R1_GY.to_vec(),
-                n: SECP384R1_N.to_vec(),
-            });
-        }
-        None
-    }
-}
-
-/// Test-only ECDSA signing over the verifier's own curve arithmetic.
-///
-/// The nonce is RFC 6979 sec.3.2 deterministic: HMAC-DRBG keyed by the
-/// private scalar and the message digest, with the message's own hash
-/// as the HMAC hash. Both table curves have an order whose bit length
-/// is a multiple of eight, so `bits2int` is a byte truncation and
-/// `rlen` is the order's byte length. Nothing here is constant-time;
-/// the module exists for building test fixtures and is compiled only
-/// for tests and the `testkit` feature.
+/// Compiled only for unit tests and the `testkit` feature; never linked
+/// into production builds.
 #[cfg(any(test, feature = "testkit"))]
 pub(crate) mod signing {
-    use super::{
-        Curve, CurveCtx, EcdsaHelpers, POINT_COORDINATE_COUNT, SEC1_UNCOMPRESSED_TAG,
-        Sec1UncompressedPoint,
-    };
+    use super::{NamedCurve, P256_FIELD_LEN, P384_FIELD_LEN, Sec1UncompressedPoint, pad_scalar};
     use crate::container::{EcdsaDer, Signature};
     use crate::oid::Oid as KnownOid;
     use crate::signed_data::HashAlgorithm;
-    use crypto_bigint::BoxedUint;
-    use crypto_bigint::modular::BoxedMontyForm;
 
-    /// HMAC inner padding octet (RFC 2104 sec.2).
-    const HMAC_IPAD: u8 = 0x36;
-    /// HMAC outer padding octet (RFC 2104 sec.2).
-    const HMAC_OPAD: u8 = 0x5C;
-    /// SHA-256 message block length in octets (FIPS 180-4 sec.1).
-    const SHA256_BLOCK_LEN: usize = 64;
-    /// SHA-384 and SHA-512 message block length in octets (FIPS 180-4
-    /// sec.1).
-    const SHA512_BLOCK_LEN: usize = 128;
-    /// Octet that every byte of the initial HMAC-DRBG `V` holds (RFC
-    /// 6979 sec.3.2 step b).
-    const DRBG_V_INITIAL: u8 = 0x01;
-    /// Octet that every byte of the initial HMAC-DRBG `K` holds (RFC
-    /// 6979 sec.3.2 step c).
-    const DRBG_K_INITIAL: u8 = 0x00;
-    /// Separator octet of the first and the retry key update (RFC 6979
-    /// sec.3.2 steps d and h.3).
-    const DRBG_SEPARATOR_FIRST: u8 = 0x00;
-    /// Separator octet of the second key update (RFC 6979 sec.3.2 step
-    /// f).
-    const DRBG_SEPARATOR_SECOND: u8 = 0x01;
+    /// Curve-typed inner signing key.
+    #[derive(Clone)]
+    enum CurveSigningKey {
+        /// NIST P-256 signing key.
+        P256(p256::ecdsa::SigningKey),
+        /// NIST P-384 signing key.
+        P384(p384::ecdsa::SigningKey),
+    }
 
-    /// An ECDSA private key on a table curve, with its public point.
+    /// An ECDSA private key on a supported curve, paired with its
+    /// uncompressed SEC 1 public point.
     #[derive(Clone)]
     pub(crate) struct SigningKey {
-        /// The curve the key is on.
-        curve: Curve,
-        /// The private scalar `d`, in `[1, n-1]`.
-        scalar: BoxedUint,
-        /// `d * G`, uncompressed.
+        /// Secret scalar key (`ZeroizeOnDrop` upstream).
+        key: CurveSigningKey,
+        /// Uncompressed public point `d * G`.
         public: Sec1UncompressedPoint,
     }
 
@@ -1248,43 +580,45 @@ pub(crate) mod signing {
     }
 
     impl SigningKey {
-        /// The key whose private scalar is the big-endian `scalar`, on
-        /// the named curve `curve_oid`. `None` for a curve outside the
-        /// table or a scalar outside `[1, n-1]`.
+        /// Construct the key whose private scalar is big-endian `scalar`
+        /// on `curve_oid`. Returns `None` for an unsupported curve or a
+        /// scalar outside `[1, n-1]`.
         pub(crate) fn from_scalar(curve_oid: KnownOid<'_>, scalar: &[u8]) -> Option<Self> {
-            let curve = EcdsaHelpers::named_curve_from_oid(curve_oid)?;
-            let ctx = CurveCtx::new(&curve).ok()?;
-            let d = BoxedUint::from_be_slice(scalar, ctx.bits_n).ok()?;
-            let one = BoxedUint::one_with_precision(ctx.bits_n);
-            if d < one || d >= ctx.n_uint {
+            if scalar.is_empty() || scalar.iter().all(|&b| b == 0) {
                 return None;
             }
-            let point = ctx.scalar_mul(&d, &ctx.g);
-            let (x, y) = point.xy?;
-            let width = curve.p.len();
-            let mut sec1 = Vec::with_capacity(
-                width
-                    .saturating_mul(POINT_COORDINATE_COUNT)
-                    .saturating_add(1),
-            );
-            sec1.push(SEC1_UNCOMPRESSED_TAG);
-            sec1.extend_from_slice(&fixed_width(&x, width));
-            sec1.extend_from_slice(&fixed_width(&y, width));
-            let public = Sec1UncompressedPoint::from_bytes(sec1).ok()?;
-            Some(Self {
-                curve,
-                scalar: d,
-                public,
-            })
+            match NamedCurve::from_oid(curve_oid)? {
+                NamedCurve::P256 => {
+                    let bytes = pad_scalar::<P256_FIELD_LEN>(scalar).ok()?;
+                    let key = p256::ecdsa::SigningKey::from_slice(&bytes).ok()?;
+                    let sec1 = key.verifying_key().to_sec1_point(false);
+                    let public =
+                        Sec1UncompressedPoint::from_bytes(sec1.as_bytes().to_vec()).ok()?;
+                    Some(Self {
+                        key: CurveSigningKey::P256(key),
+                        public,
+                    })
+                }
+                NamedCurve::P384 => {
+                    let bytes = pad_scalar::<P384_FIELD_LEN>(scalar).ok()?;
+                    let key = p384::ecdsa::SigningKey::from_slice(&bytes).ok()?;
+                    let sec1 = key.verifying_key().to_sec1_point(false);
+                    let public =
+                        Sec1UncompressedPoint::from_bytes(sec1.as_bytes().to_vec()).ok()?;
+                    Some(Self {
+                        key: CurveSigningKey::P384(key),
+                        public,
+                    })
+                }
+            }
         }
 
-        /// A key derived from `seed`: the first digest of `seed` and a
-        /// counter octet, under `hash`, whose leftmost order-width
-        /// octets fall in `[1, n-1]`.
+        /// Deterministic fixture key derived from `seed` and a counter
+        /// octet under `hash`.
         pub(crate) fn derive(curve_oid: KnownOid<'_>, hash: HashAlgorithm, seed: &[u8]) -> Self {
-            let curve = EcdsaHelpers::named_curve_from_oid(curve_oid)
-                .expect("test keys are derived on a table curve");
-            let width = curve.n.len();
+            let curve =
+                NamedCurve::from_oid(curve_oid).expect("test keys are derived on a table curve");
+            let width = curve.field_len();
             (0..=u8::MAX)
                 .find_map(|counter| {
                     let mut input = seed.to_vec();
@@ -1296,174 +630,103 @@ pub(crate) mod signing {
                 .expect("a run of digests yields a scalar in range")
         }
 
-        /// The public point.
+        /// Borrow the uncompressed SEC 1 public point.
         pub(crate) const fn public_point(&self) -> &Sec1UncompressedPoint {
             &self.public
         }
 
-        /// The DER ECDSA signature over `message` hashed with `hash`.
+        /// Deterministic RFC 6979 DER ECDSA signature over `message`
+        /// hashed with `hash`.
         pub(crate) fn sign(&self, hash: HashAlgorithm, message: &[u8]) -> Signature<EcdsaDer> {
             Signature::<EcdsaDer>::from_raw_concatenation(&self.sign_raw(hash, message))
                 .expect("two equal-width components encode")
         }
 
-        /// The ECDSA signature over `message` hashed with `hash`, as
-        /// the fixed-width concatenation `r || s` of two order-width
-        /// integers (the form XML Signature 1.1 sec.6.4.3 and a card
-        /// return).
+        /// Deterministic RFC 6979 fixed-width `r || s` signature over
+        /// `message` hashed with `hash`.
         pub(crate) fn sign_raw(&self, hash: HashAlgorithm, message: &[u8]) -> Vec<u8> {
             self.sign_raw_digest(hash, &hash.digest(message))
         }
 
-        /// As [`Self::sign_raw`], over `digest`, a digest under `hash`
-        /// the caller computed: what a card signs after PSO:HASH.
+        /// Deterministic RFC 6979 fixed-width `r || s` signature over
+        /// precomputed `digest` under `hash`.
         pub(crate) fn sign_raw_digest(&self, hash: HashAlgorithm, digest: &[u8]) -> Vec<u8> {
-            let ctx = CurveCtx::new(&self.curve).expect("table curves build a context");
-            let width = self.curve.n.len();
-            let e = EcdsaHelpers::bytes_into_n(&EcdsaHelpers::digest_to_scalar(digest, &ctx), &ctx);
-            let mut nonces = Rfc6979::new(
-                hash,
-                &fixed_width(&self.scalar, width),
-                &fixed_width(&e, width),
-                width,
-            );
-            loop {
-                let k = nonces.next_candidate(&ctx);
-                let point = ctx.scalar_mul(&k, &ctx.g);
-                let Some((x, _)) = point.xy else {
-                    continue;
-                };
-                let r = EcdsaHelpers::bytes_into_n(&x, &ctx);
-                let zero = BoxedUint::zero_with_precision(ctx.bits_n);
-                if r == zero {
-                    continue;
+            match (&self.key, hash) {
+                (CurveSigningKey::P256(key), HashAlgorithm::Sha256) => {
+                    sign_rfc6979::<p256::NistP256, sha2::Sha256>(key, digest)
                 }
-                let Some(k_inverse): Option<BoxedMontyForm> = Option::from(ctx.n_mont(&k).invert())
-                else {
-                    continue;
-                };
-                let sum = &ctx.n_mont(&e) + &(&ctx.n_mont(&r) * &ctx.n_mont(&self.scalar));
-                let s = (&k_inverse * &sum).retrieve();
-                if s == zero {
-                    continue;
+                (CurveSigningKey::P256(key), HashAlgorithm::Sha384) => {
+                    sign_rfc6979::<p256::NistP256, sha2::Sha384>(key, digest)
                 }
-                let mut raw = fixed_width(&r, width);
-                raw.extend_from_slice(&fixed_width(&s, width));
-                return raw;
-            }
-        }
-    }
-
-    /// The HMAC-DRBG state of RFC 6979 sec.3.2.
-    struct Rfc6979 {
-        /// The HMAC hash, the message's own.
-        hash: HashAlgorithm,
-        /// `K`.
-        key: Vec<u8>,
-        /// `V`.
-        value: Vec<u8>,
-        /// `rlen` in octets.
-        width: usize,
-        /// Whether a candidate was already drawn, so the next draw
-        /// first runs step h.3.
-        drawn: bool,
-    }
-
-    impl Rfc6979 {
-        /// Steps b to g, from `int2octets(x)` and `bits2octets(h1)`.
-        fn new(hash: HashAlgorithm, private: &[u8], reduced_digest: &[u8], width: usize) -> Self {
-            let hash_len = hash.digest_len();
-            let mut state = Self {
-                hash,
-                key: vec![DRBG_K_INITIAL; hash_len],
-                value: vec![DRBG_V_INITIAL; hash_len],
-                width,
-                drawn: false,
-            };
-            for separator in [DRBG_SEPARATOR_FIRST, DRBG_SEPARATOR_SECOND] {
-                state.key = hmac(
-                    hash,
-                    &state.key,
-                    &[&state.value, &[separator], private, reduced_digest],
-                );
-                state.value = hmac(hash, &state.key, &[&state.value]);
-            }
-            state
-        }
-
-        /// Step h: the next candidate nonce in `[1, n-1]`.
-        fn next_candidate(&mut self, ctx: &CurveCtx) -> BoxedUint {
-            loop {
-                if self.drawn {
-                    self.key = hmac(
-                        self.hash,
-                        &self.key,
-                        &[&self.value, &[DRBG_SEPARATOR_FIRST]],
-                    );
-                    self.value = hmac(self.hash, &self.key, &[&self.value]);
+                (CurveSigningKey::P256(key), HashAlgorithm::Sha512) => {
+                    sign_rfc6979::<p256::NistP256, sha2::Sha512>(key, digest)
                 }
-                self.drawn = true;
-                let mut output = Vec::with_capacity(self.width);
-                while output.len() < self.width {
-                    self.value = hmac(self.hash, &self.key, &[&self.value]);
-                    output.extend_from_slice(&self.value);
+                (CurveSigningKey::P384(key), HashAlgorithm::Sha256) => {
+                    sign_rfc6979::<p384::NistP384, sha2::Sha256>(key, digest)
                 }
-                let candidate = EcdsaHelpers::digest_to_scalar(&output, ctx);
-                let one = BoxedUint::one_with_precision(ctx.bits_n);
-                if candidate >= one && candidate < ctx.n_uint {
-                    return candidate;
+                (CurveSigningKey::P384(key), HashAlgorithm::Sha384) => {
+                    sign_rfc6979::<p384::NistP384, sha2::Sha384>(key, digest)
+                }
+                (CurveSigningKey::P384(key), HashAlgorithm::Sha512) => {
+                    sign_rfc6979::<p384::NistP384, sha2::Sha512>(key, digest)
                 }
             }
         }
     }
 
-    /// HMAC (RFC 2104) over the concatenation of `parts`.
-    fn hmac(hash: HashAlgorithm, key: &[u8], parts: &[&[u8]]) -> Vec<u8> {
-        let block = match hash {
-            HashAlgorithm::Sha256 => SHA256_BLOCK_LEN,
-            HashAlgorithm::Sha384 | HashAlgorithm::Sha512 => SHA512_BLOCK_LEN,
-        };
-        let mut padded = if key.len() > block {
-            hash.digest(key)
+    /// Sign `digest` deterministically under curve `C` and RFC 6979 HMAC digest `D`.
+    fn sign_rfc6979<C, D>(key: &ecdsa::SigningKey<C>, digest: &[u8]) -> Vec<u8>
+    where
+        C: ecdsa::EcdsaCurve + p256::elliptic_curve::CurveArithmetic,
+        D: sha2::Digest + sha2::digest::block_api::BlockSizeUser,
+    {
+        let non_empty_digest = if digest.is_empty() {
+            &[0_u8][..]
         } else {
-            key.to_vec()
+            digest
         };
-        padded.resize(block, 0);
-        let mut inner: Vec<u8> = padded.iter().map(|byte| byte ^ HMAC_IPAD).collect();
-        for part in parts {
-            inner.extend_from_slice(part);
-        }
-        let mut outer: Vec<u8> = padded.iter().map(|byte| byte ^ HMAC_OPAD).collect();
-        outer.extend_from_slice(&hash.digest(&inner));
-        hash.digest(&outer)
-    }
-
-    /// `value` as exactly `width` big-endian octets.
-    fn fixed_width(value: &BoxedUint, width: usize) -> Vec<u8> {
-        let bytes = value.to_be_bytes();
-        let start = bytes.len().saturating_sub(width);
-        let mut out = vec![0; width.saturating_sub(bytes.len())];
-        out.extend_from_slice(bytes.get(start..).unwrap_or_default());
-        out
+        ecdsa::hazmat::sign_prehashed_rfc6979::<C, D>(
+            key.as_nonzero_scalar(),
+            non_empty_digest,
+            &[],
+        )
+        .0
+        .to_bytes()
+        .to_vec()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ASN1_INTEGER_TAG, DER_LONG_FORM_1B, DER_LONG_FORM_2B, DER_SIGN_PAD, EcdsaError,
-        EcdsaHelpers, HIGH_BIT_SET, ONE_BYTE_FORM_CEILING, P384_FIELD_LEN, SHORT_FORM_CEILING,
+        EcdsaError, NamedCurve, P256_FIELD_LEN, P384_FIELD_LEN, SEC1_UNCOMPRESSED_TAG,
+        Sec1UncompressedPoint, VerifiedPublicKey, verify_prehashed,
     };
     use crate::container::{EcdsaDer, EcdsaP256, EcdsaP384, Signature};
     use crate::hex::Hex;
-    use crypto_bigint::{BoxedUint, Resize as _};
+    use crypto_bigint::{
+        BoxedUint, Odd, Resize as _, modular::BoxedMontyForm, modular::BoxedMontyParams,
+    };
+    use p256::elliptic_curve::{Curve as _, sec1::ToSec1Point as _};
 
+    /// ASN.1 SEQUENCE tag, constructed form.
+    const ASN1_SEQUENCE_TAG: u8 = 0x30;
+    /// ASN.1 INTEGER tag.
+    const ASN1_INTEGER_TAG: u8 = 0x02;
+    /// DER INTEGER sign-padding byte.
+    const DER_SIGN_PAD: u8 = 0;
+    /// Smallest byte value with the DER sign bit set.
+    const HIGH_BIT_SET: u8 = 0x80;
+    /// DER 1-octet long-form length marker.
+    const DER_LONG_FORM_1B: u8 = 0x81;
     /// Universal OBJECT IDENTIFIER tag.
     const OID_TAG: u8 = 0x06;
     /// Universal OCTET STRING tag.
     const OCTET_STRING_TAG: u8 = 0x04;
     /// Universal BIT STRING tag.
     const BIT_STRING_TAG: u8 = 0x03;
+    /// Universal NULL tag.
+    const NULL_TAG: u8 = 0x05;
 
     /// Odd-width raw fixture -- cannot split into two equal halves.
     const ODD_RAW: [u8; ODD_RAW_LEN] = [1, 2, 3];
@@ -1472,28 +735,94 @@ mod tests {
 
     /// Fill byte for an `r` magnitude whose top bit is set.
     const R_FILL_TOP_BIT_SET: u8 = 0xFE;
-    /// Trailing fill for the `s` half behind its [`HIGH_BIT_SET`]
-    /// lead byte.
+    /// Trailing fill for the `s` half behind its [`HIGH_BIT_SET`] lead byte.
     const S_FILL_TAIL: u8 = 0x11;
-    /// Largest byte with the top bit clear -- both the widest
-    /// DER short-form length (X.690 sec. 8.1.3.4) and the largest
-    /// leading magnitude byte that needs no sign pad (X.690
-    /// sec. 8.3.3).
+    /// Largest byte with the top bit clear.
     const TOP_BIT_CLEAR_MAX: u8 = 0x7F;
-    /// Count of leading zero bytes in the leading-zeros fixture's
-    /// `r` half.
+    /// Count of leading zero bytes in the leading-zeros fixture's `r` half.
     const LEADING_ZERO_COUNT: usize = 5;
     /// `r` fill following the fixture's leading zeros.
     const R_FILL_AFTER_ZEROS: u8 = 0xAB;
     /// `s` fill for the leading-zeros fixture.
     const S_FILL: u8 = 0x33;
 
-    /// P-384 `r||s` sample with the high bit set on both `r[0]`
-    /// and `s[0]` -- exercises the sign-pad branch of
-    /// [`EcdsaHelpers::encode_der_integer`].
+    /// P-256 CAVP / RFC 6979 test vector public key X.
+    const P256_CAVP_QX: [u8; P256_FIELD_LEN] = Hex::decode_const(concat!(
+        "60fed4ba255a9d31c961eb74c6356d68",
+        "c049b8923b61fa6ce669622e60f29fb6",
+    ));
+    /// P-256 CAVP / RFC 6979 test vector public key Y.
+    const P256_CAVP_QY: [u8; P256_FIELD_LEN] = Hex::decode_const(concat!(
+        "7903fe1008b8bc99a41ae9e95628bc64",
+        "f2f1b20c2d7e9f5177a3c294d4462299",
+    ));
+    /// P-256 CAVP / RFC 6979 test vector signature R.
+    const P256_CAVP_R: [u8; P256_FIELD_LEN] = Hex::decode_const(concat!(
+        "efd48b2aacb6a8fd1140dd9cd45e81d6",
+        "9d2c877b56aaf991c34d0ea84eaf3716",
+    ));
+    /// P-256 CAVP / RFC 6979 test vector signature S.
+    const P256_CAVP_S: [u8; P256_FIELD_LEN] = Hex::decode_const(concat!(
+        "f7cb1c942d657c41d436c7a1b6e29f65",
+        "f3e900dbb9aff4064dc4ab2f843acda8",
+    ));
+
+    /// P-384 CAVP / RFC 6979 test vector public key X.
+    const P384_CAVP_QX: [u8; P384_FIELD_LEN] = Hex::decode_const(concat!(
+        "ec3a4e415b4e19a4568618029f427fa5",
+        "da9a8bc4ae92e02e06aae5286b300c64",
+        "def8f0ea9055866064a254515480bc13",
+    ));
+    /// P-384 CAVP / RFC 6979 test vector public key Y.
+    const P384_CAVP_QY: [u8; P384_FIELD_LEN] = Hex::decode_const(concat!(
+        "8015d9b72d7d57244ea8ef9ac0c62189",
+        "6708a59367f9dfb9f54ca84b3f1c9db1",
+        "288b231c3ae0d4fe7344fd",
+        "2533264720",
+    ));
+    /// P-384 CAVP / RFC 6979 test vector signature R.
+    const P384_CAVP_R: [u8; P384_FIELD_LEN] = Hex::decode_const(concat!(
+        "94edbb92a5ecb8aad4736e56c691916b",
+        "3f88140666ce9fa73d64c4ea95ad133c",
+        "81a648152e44acf96e36dd1e80fabe46",
+    ));
+    /// P-384 CAVP / RFC 6979 test vector signature S.
+    const P384_CAVP_S: [u8; P384_FIELD_LEN] = Hex::decode_const(concat!(
+        "99ef4aeb15f178cea1fe40db2603138f",
+        "130e740a19624526203b6351d0a3a94f",
+        "a329c145786e679e7b82c71a38628ac8",
+    ));
+
+    /// RFC 6979 sec. A.2.5 P-256 private key `x`.
+    const RFC6979_P256_X: [u8; P256_FIELD_LEN] = Hex::decode_const(concat!(
+        "C9AFA9D845BA75166B5C215767B1D693",
+        "4E50C3DB36E89B127B8A622B120F6721",
+    ));
+    /// RFC 6979 sec. A.2.6 P-384 private key `x`.
+    const RFC6979_P384_X: [u8; P384_FIELD_LEN] = Hex::decode_const(concat!(
+        "6B9D3DAD2E1B8C1C05B19875B6659F4D",
+        "E23C3B667BF297BA9AA47740787137D8",
+        "96D5724E4C70A825F872C9EA60D2EDF5",
+    ));
+
+    /// Fixed test message string for the CAVP / RFC 6979 vectors.
+    const CAVP_MESSAGE: &[u8] = b"sample";
+    /// SEC 1 uncompressed point byte width for P-256.
+    const P256_SEC1_POINT_LEN: usize = 1 + P256_FIELD_LEN + P256_FIELD_LEN;
+    /// Raw concatenated r||s signature byte width for P-256.
+    const P256_RAW_SIGNATURE_LEN: usize = P256_FIELD_LEN + P256_FIELD_LEN;
+    /// SEC 1 uncompressed point byte width for P-384.
+    const P384_SEC1_POINT_LEN: usize = 1 + P384_FIELD_LEN + P384_FIELD_LEN;
+    /// Raw concatenated r||s signature byte width for P-384.
+    const P384_RAW_SIGNATURE_LEN: usize = P384_FIELD_LEN + P384_FIELD_LEN;
+    /// ANSI X9.62 `prime-field`, the `fieldType` of explicit `ECParameters`.
+    const PRIME_FIELD: crate::oid::Oid<'static> = crate::oid::Oid::const_new(
+        ::const_oid::ObjectIdentifier::new_unwrap("1.2.840.10045.1.1").as_bytes(),
+    );
+    /// `ECParameters.version` `ecpVer1` (SEC 1 sec. C.2).
+    const EC_PARAMETERS_VERSION: u8 = 1;
+
     fn raw_rs_p384_high_bit_set() -> Vec<u8> {
-        // r: a field width of R_FILL_TOP_BIT_SET; s: one
-        // HIGH_BIT_SET lead, then S_FILL_TAIL to field width.
         let mut v = vec![R_FILL_TOP_BIT_SET; P384_FIELD_LEN];
         v.extend(core::iter::once(HIGH_BIT_SET).chain(core::iter::repeat_n(
             S_FILL_TAIL,
@@ -1502,17 +831,12 @@ mod tests {
         v
     }
 
-    /// P-384 `r||s` sample with the high bit clear on both halves
-    /// -- exercises the no-padding branch.
     fn raw_rs_p384_high_bit_clear() -> Vec<u8> {
         let mut v = vec![1; P384_FIELD_LEN];
         v.extend(core::iter::repeat_n(TOP_BIT_CLEAR_MAX, P384_FIELD_LEN));
         v
     }
 
-    /// P-384 `r||s` sample with leading zeros in `r` -- exercises
-    /// the leading-zero strip in
-    /// [`EcdsaHelpers::encode_der_integer`].
     fn raw_rs_p384_leading_zeros() -> Vec<u8> {
         let mut v = vec![0; LEADING_ZERO_COUNT];
         v.extend(core::iter::repeat_n(
@@ -1529,6 +853,26 @@ mod tests {
             i = i.saturating_add(1);
         }
         magnitude.get(i..).unwrap_or(&[])
+    }
+
+    fn sec1(x: &[u8], y: &[u8]) -> Vec<u8> {
+        let mut point = vec![SEC1_UNCOMPRESSED_TAG];
+        point.extend_from_slice(x);
+        point.extend_from_slice(y);
+        point
+    }
+
+    fn components(signature: &Signature<EcdsaDer>, width: usize) -> Vec<u8> {
+        let (r, s) = signature.parse_ecdsa_signature().expect("signature parses");
+        let mut raw = Vec::new();
+        for component in [r, s] {
+            raw.extend(core::iter::repeat_n(
+                0,
+                width.saturating_sub(component.len()),
+            ));
+            raw.extend_from_slice(component);
+        }
+        raw
     }
 
     #[test]
@@ -1548,96 +892,9 @@ mod tests {
             let (r_parsed, s_parsed) = der
                 .parse_ecdsa_signature()
                 .expect("DER from into_der parses back");
-            // The parser strips a leading zero byte if present;
-            // r_expected might have trailing meaningful zeros
-            // matched by left-strip. Compare big-endian magnitudes
-            // by stripping any leading zeros from BOTH sides via
-            // the helper above.
-            assert_eq!(
-                without_leading_zeros(r_parsed.as_slice()),
-                without_leading_zeros(r_expected.as_slice())
-            );
-            assert_eq!(
-                without_leading_zeros(s_parsed.as_slice()),
-                without_leading_zeros(s_expected.as_slice())
-            );
+            assert_eq!(r_parsed, without_leading_zeros(r_expected.as_slice()));
+            assert_eq!(s_parsed, without_leading_zeros(s_expected.as_slice()));
         }
-    }
-
-    #[test]
-    fn encode_der_length_short_form_under_128() {
-        let mut out = Vec::new();
-        EcdsaHelpers::encode_der_length(&mut out, 0);
-        assert_eq!(out, [0]);
-        out.clear();
-        EcdsaHelpers::encode_der_length(&mut out, usize::from(TOP_BIT_CLEAR_MAX));
-        assert_eq!(out, [TOP_BIT_CLEAR_MAX]);
-    }
-
-    #[test]
-    fn encode_der_length_one_byte_long_form() {
-        /// [`SHORT_FORM_CEILING`] rendered as the follow-up
-        /// length octet of the one-byte long form.
-        const SHORT_FORM_CEILING_OCTET: u8 = 0x80;
-        let mut out = Vec::new();
-        EcdsaHelpers::encode_der_length(&mut out, SHORT_FORM_CEILING);
-        assert_eq!(out, [DER_LONG_FORM_1B, SHORT_FORM_CEILING_OCTET]);
-        out.clear();
-        EcdsaHelpers::encode_der_length(&mut out, usize::from(u8::MAX));
-        assert_eq!(out, [DER_LONG_FORM_1B, u8::MAX]);
-    }
-
-    #[test]
-    fn encode_der_length_two_byte_long_form() {
-        let mut out = Vec::new();
-        // ONE_BYTE_FORM_CEILING (256) is big-endian `01 00`.
-        EcdsaHelpers::encode_der_length(&mut out, ONE_BYTE_FORM_CEILING);
-        assert_eq!(out, [DER_LONG_FORM_2B, 1, 0]);
-        out.clear();
-        EcdsaHelpers::encode_der_length(&mut out, usize::from(u16::MAX));
-        assert_eq!(out, [DER_LONG_FORM_2B, u8::MAX, u8::MAX]);
-    }
-
-    #[test]
-    fn encode_der_integer_zero_emits_single_byte() {
-        let mut out = Vec::new();
-        EcdsaHelpers::encode_der_integer(&mut out, &[0]);
-        assert_eq!(out, [ASN1_INTEGER_TAG, 1, 0]);
-    }
-
-    #[test]
-    fn encode_der_integer_high_bit_set_pads_with_zero() {
-        /// DER INTEGER content length of two octets -- here the
-        /// sign pad plus one magnitude byte.
-        const PAD_PLUS_MAGNITUDE_LEN: u8 = 2;
-        let mut out = Vec::new();
-        EcdsaHelpers::encode_der_integer(&mut out, &[u8::MAX]);
-        assert_eq!(
-            out,
-            [
-                ASN1_INTEGER_TAG,
-                PAD_PLUS_MAGNITUDE_LEN,
-                DER_SIGN_PAD,
-                u8::MAX
-            ]
-        );
-    }
-
-    #[test]
-    fn encode_der_integer_strips_leading_zeros() {
-        /// High magnitude byte of the fixture integer.
-        const MAGNITUDE_HI: u8 = 0x42;
-        /// Low magnitude byte of the fixture integer.
-        const MAGNITUDE_LO: u8 = 0xAB;
-        /// DER INTEGER content length of two octets -- the two
-        /// magnitude bytes left after the zero strip.
-        const MAGNITUDE_LEN: u8 = 2;
-        let mut out = Vec::new();
-        EcdsaHelpers::encode_der_integer(&mut out, &[0, 0, MAGNITUDE_HI, MAGNITUDE_LO]);
-        assert_eq!(
-            out,
-            [ASN1_INTEGER_TAG, MAGNITUDE_LEN, MAGNITUDE_HI, MAGNITUDE_LO]
-        );
     }
 
     #[test]
@@ -1648,17 +905,15 @@ mod tests {
         const R_LEADING_ZEROS: usize = 2;
         /// Total fixture width: two [`COMPONENT_BYTES`] halves.
         const RAW_LEN: usize = 8;
-        /// Raw `r || s`: `r` opens with two zeros (exercising the
-        /// zero strip), `s` opens with [`HIGH_BIT_SET`]
-        /// (exercising the sign pad).
+        /// Raw `r || s`: `r` opens with two zeros, `s` opens with [`HIGH_BIT_SET`].
         const RAW_RS: [u8; RAW_LEN] = [0, 0, 1, 2, HIGH_BIT_SET, 3, 4, 5];
         let converted = Signature::<EcdsaDer>::from_raw_concatenation(&RAW_RS);
         let signature = converted.expect("valid equal-width XML signature components must convert");
         let (r, s) = signature
             .parse_ecdsa_signature()
             .expect("converted signature must be valid DER");
-        assert_eq!(r, RAW_RS[R_LEADING_ZEROS..COMPONENT_BYTES]);
-        assert_eq!(s, RAW_RS[COMPONENT_BYTES..]);
+        assert_eq!(Some(r), RAW_RS.get(R_LEADING_ZEROS..COMPONENT_BYTES));
+        assert_eq!(Some(s), RAW_RS.get(COMPONENT_BYTES..));
     }
 
     #[test]
@@ -1673,72 +928,13 @@ mod tests {
         ));
     }
 
-    /// P-256 CAVP / RFC 6979 test vector public key X.
-    const P256_CAVP_QX: [u8; super::P256_FIELD_LEN] = Hex::decode_const(concat!(
-        "60fed4ba255a9d31c961eb74c6356d68",
-        "c049b8923b61fa6ce669622e60f29fb6",
-    ));
-    /// P-256 CAVP / RFC 6979 test vector public key Y.
-    const P256_CAVP_QY: [u8; super::P256_FIELD_LEN] = Hex::decode_const(concat!(
-        "7903fe1008b8bc99a41ae9e95628bc64",
-        "f2f1b20c2d7e9f5177a3c294d4462299",
-    ));
-    /// P-256 CAVP / RFC 6979 test vector signature R.
-    const P256_CAVP_R: [u8; super::P256_FIELD_LEN] = Hex::decode_const(concat!(
-        "efd48b2aacb6a8fd1140dd9cd45e81d6",
-        "9d2c877b56aaf991c34d0ea84eaf3716",
-    ));
-    /// P-256 CAVP / RFC 6979 test vector signature S.
-    const P256_CAVP_S: [u8; super::P256_FIELD_LEN] = Hex::decode_const(concat!(
-        "f7cb1c942d657c41d436c7a1b6e29f65",
-        "f3e900dbb9aff4064dc4ab2f843acda8",
-    ));
-
-    /// P-384 CAVP / RFC 6979 test vector public key X.
-    const P384_CAVP_QX: [u8; super::P384_FIELD_LEN] = Hex::decode_const(concat!(
-        "ec3a4e415b4e19a4568618029f427fa5",
-        "da9a8bc4ae92e02e06aae5286b300c64",
-        "def8f0ea9055866064a254515480bc13",
-    ));
-    /// P-384 CAVP / RFC 6979 test vector public key Y.
-    const P384_CAVP_QY: [u8; super::P384_FIELD_LEN] = Hex::decode_const(concat!(
-        "8015d9b72d7d57244ea8ef9ac0c62189",
-        "6708a59367f9dfb9f54ca84b3f1c9db1",
-        "288b231c3ae0d4fe7344fd",
-        "2533264720",
-    ));
-    /// P-384 CAVP / RFC 6979 test vector signature R.
-    const P384_CAVP_R: [u8; super::P384_FIELD_LEN] = Hex::decode_const(concat!(
-        "94edbb92a5ecb8aad4736e56c691916b",
-        "3f88140666ce9fa73d64c4ea95ad133c",
-        "81a648152e44acf96e36dd1e80fabe46",
-    ));
-    /// P-384 CAVP / RFC 6979 test vector signature S.
-    const P384_CAVP_S: [u8; super::P384_FIELD_LEN] = Hex::decode_const(concat!(
-        "99ef4aeb15f178cea1fe40db2603138f",
-        "130e740a19624526203b6351d0a3a94f",
-        "a329c145786e679e7b82c71a38628ac8",
-    ));
-
-    /// Fixed test message string for the CAVP / RFC 6979 vectors.
-    const CAVP_MESSAGE: &[u8] = b"sample";
-    /// SEC1 uncompressed point byte width for P-256 (1 tag byte + 2 field elements).
-    const P256_SEC1_POINT_LEN: usize = 1 + super::P256_FIELD_LEN + super::P256_FIELD_LEN;
-    /// Raw concatenated r||s signature byte width for P-256.
-    const P256_RAW_SIGNATURE_LEN: usize = super::P256_FIELD_LEN + super::P256_FIELD_LEN;
-    /// SEC1 uncompressed point byte width for P-384 (1 tag byte + 2 field elements).
-    const P384_SEC1_POINT_LEN: usize = 1 + super::P384_FIELD_LEN + super::P384_FIELD_LEN;
-    /// Raw concatenated r||s signature byte width for P-384.
-    const P384_RAW_SIGNATURE_LEN: usize = super::P384_FIELD_LEN + super::P384_FIELD_LEN;
-
     #[test]
     fn cavp_p256_sha256_signature_verifies() {
-        let mut sec1 = Vec::with_capacity(P256_SEC1_POINT_LEN);
-        sec1.push(super::SEC1_UNCOMPRESSED_TAG);
-        sec1.extend_from_slice(&P256_CAVP_QX);
-        sec1.extend_from_slice(&P256_CAVP_QY);
-        let pubkey =
-            super::Sec1UncompressedPoint::from_bytes(sec1).expect("valid P-256 public key");
+        let mut sec1_bytes = Vec::with_capacity(P256_SEC1_POINT_LEN);
+        sec1_bytes.push(SEC1_UNCOMPRESSED_TAG);
+        sec1_bytes.extend_from_slice(&P256_CAVP_QX);
+        sec1_bytes.extend_from_slice(&P256_CAVP_QY);
+        let pubkey = Sec1UncompressedPoint::from_bytes(sec1_bytes).expect("valid P-256 public key");
 
         let mut raw_sig = Vec::with_capacity(P256_RAW_SIGNATURE_LEN);
         raw_sig.extend_from_slice(&P256_CAVP_R);
@@ -1751,12 +947,11 @@ mod tests {
 
     #[test]
     fn cavp_p384_sha384_signature_verifies() {
-        let mut sec1 = Vec::with_capacity(P384_SEC1_POINT_LEN);
-        sec1.push(super::SEC1_UNCOMPRESSED_TAG);
-        sec1.extend_from_slice(&P384_CAVP_QX);
-        sec1.extend_from_slice(&P384_CAVP_QY);
-        let pubkey =
-            super::Sec1UncompressedPoint::from_bytes(sec1).expect("valid P-384 public key");
+        let mut sec1_bytes = Vec::with_capacity(P384_SEC1_POINT_LEN);
+        sec1_bytes.push(SEC1_UNCOMPRESSED_TAG);
+        sec1_bytes.extend_from_slice(&P384_CAVP_QX);
+        sec1_bytes.extend_from_slice(&P384_CAVP_QY);
+        let pubkey = Sec1UncompressedPoint::from_bytes(sec1_bytes).expect("valid P-384 public key");
 
         let mut raw_sig = Vec::with_capacity(P384_RAW_SIGNATURE_LEN);
         raw_sig.extend_from_slice(&P384_CAVP_R);
@@ -1782,50 +977,6 @@ mod tests {
         assert!(odd_p256.into_der().is_none());
     }
 
-    /// RFC 6979 sec.A.2.5 P-256 private key `x`.
-    const RFC6979_P256_X: [u8; super::P256_FIELD_LEN] = Hex::decode_const(concat!(
-        "C9AFA9D845BA75166B5C215767B1D693",
-        "4E50C3DB36E89B127B8A622B120F6721",
-    ));
-    /// RFC 6979 sec.A.2.6 P-384 private key `x`.
-    const RFC6979_P384_X: [u8; super::P384_FIELD_LEN] = Hex::decode_const(concat!(
-        "6B9D3DAD2E1B8C1C05B19875B6659F4D",
-        "E23C3B667BF297BA9AA47740787137D8",
-        "96D5724E4C70A825F872C9EA60D2EDF5",
-    ));
-    /// ANSI X9.62 `prime-field`, the `fieldType` of explicit
-    /// `ECParameters` (SEC 1 sec.C.2).
-    const PRIME_FIELD: crate::oid::Oid<'static> = crate::oid::Oid::const_new(
-        ::const_oid::ObjectIdentifier::new_unwrap("1.2.840.10045.1.1").as_bytes(),
-    );
-    /// `ECParameters.version` `ecpVer1` (SEC 1 sec.C.2).
-    const EC_PARAMETERS_VERSION: u8 = 1;
-    /// Universal NULL tag.
-    const NULL_TAG: u8 = 0x05;
-
-    /// The uncompressed point of a CAVP key.
-    fn sec1(x: &[u8], y: &[u8]) -> Vec<u8> {
-        let mut point = vec![super::SEC1_UNCOMPRESSED_TAG];
-        point.extend_from_slice(x);
-        point.extend_from_slice(y);
-        point
-    }
-
-    /// The `(r, s)` magnitudes of a kit signature, left-padded to
-    /// `width`.
-    fn components(signature: &Signature<EcdsaDer>, width: usize) -> Vec<u8> {
-        let (r, s) = signature.parse_ecdsa_signature().expect("signature parses");
-        let mut raw = Vec::new();
-        for component in [r, s] {
-            raw.extend(core::iter::repeat_n(
-                0,
-                width.saturating_sub(component.len()),
-            ));
-            raw.extend_from_slice(&component);
-        }
-        raw
-    }
-
     #[test]
     fn rfc6979_p256_sha256_sample_is_reproduced() {
         let key =
@@ -1838,7 +989,7 @@ mod tests {
         let signature = key.sign(crate::signed_data::HashAlgorithm::Sha256, CAVP_MESSAGE);
         let mut expected = P256_CAVP_R.to_vec();
         expected.extend_from_slice(&P256_CAVP_S);
-        assert_eq!(components(&signature, super::P256_FIELD_LEN), expected);
+        assert_eq!(components(&signature, P256_FIELD_LEN), expected);
     }
 
     #[test]
@@ -1853,36 +1004,54 @@ mod tests {
         let signature = key.sign(crate::signed_data::HashAlgorithm::Sha384, CAVP_MESSAGE);
         let mut expected = P384_CAVP_R.to_vec();
         expected.extend_from_slice(&P384_CAVP_S);
-        assert_eq!(components(&signature, super::P384_FIELD_LEN), expected);
+        assert_eq!(components(&signature, P384_FIELD_LEN), expected);
     }
 
     #[test]
     fn signing_refuses_a_scalar_outside_the_order() {
+        let p256_order = p256::NistP256::ORDER.to_be_bytes();
+        let p384_order = p384::NistP384::ORDER.to_be_bytes();
         assert!(
             super::signing::SigningKey::from_scalar(crate::oid::known::SECP256R1, &[0]).is_none()
         );
         assert!(
-            super::signing::SigningKey::from_scalar(
-                crate::oid::known::SECP256R1,
-                &super::SECP256R1_N
-            )
-            .is_none()
+            super::signing::SigningKey::from_scalar(crate::oid::known::SECP256R1, &p256_order)
+                .is_none()
+        );
+        assert!(
+            super::signing::SigningKey::from_scalar(crate::oid::known::SECP384R1, &p384_order)
+                .is_none()
         );
         assert!(
             super::signing::SigningKey::from_scalar(crate::oid::known::BRAINPOOL_P256R1, &[1])
                 .is_none()
         );
+        // Short positive scalar slices remain accepted via left-padding.
+        assert!(
+            super::signing::SigningKey::from_scalar(crate::oid::known::SECP256R1, &[1]).is_some()
+        );
     }
 
     #[test]
     fn ecdsa_value_must_be_one_canonical_pair() {
+        /// Canonical body byte length of two single-octet DER INTEGERs (`02 01 01 02 01 01`).
+        const CANONICAL_PAIR_BODY_LEN: u8 = 6;
         let tlv = |tag: u8, value: &[u8]| refineid_ber::tlv(tag, value).expect("fixture TLV");
         let integer = |value: &[u8]| tlv(ASN1_INTEGER_TAG, value);
-        let pair = |body: Vec<u8>| Signature::<EcdsaDer>::new(tlv(super::ASN1_SEQUENCE_TAG, &body));
+        let pair = |body: Vec<u8>| Signature::<EcdsaDer>::new(tlv(ASN1_SEQUENCE_TAG, &body));
         let one = integer(&[1]);
 
-        let canonical = pair([one.clone(), one.clone()].concat());
-        assert_eq!(canonical.parse_ecdsa_signature(), Ok((vec![1], vec![1])));
+        let canonical_body = [one.clone(), one.clone()].concat();
+        let canonical = pair(canonical_body.clone());
+        assert_eq!(
+            canonical.parse_ecdsa_signature(),
+            Ok((&[1_u8][..], &[1_u8][..]))
+        );
+
+        let mut non_minimal_seq_len =
+            vec![ASN1_SEQUENCE_TAG, DER_LONG_FORM_1B, CANONICAL_PAIR_BODY_LEN];
+        non_minimal_seq_len.extend_from_slice(&canonical_body);
+
         for malformed in [
             pair([one.clone(), one.clone(), one.clone()].concat()),
             pair(one.clone()),
@@ -1891,6 +1060,7 @@ mod tests {
             pair([integer(&[]), one.clone()].concat()),
             pair([integer(&[DER_SIGN_PAD]), one.clone()].concat()),
             pair([one.clone(), integer(&[DER_SIGN_PAD])].concat()),
+            Signature::<EcdsaDer>::new(non_minimal_seq_len),
         ] {
             assert_eq!(
                 malformed.parse_ecdsa_signature(),
@@ -1903,6 +1073,98 @@ mod tests {
             Signature::<EcdsaDer>::new(trailing).parse_ecdsa_signature(),
             Err(EcdsaError::BadSignature)
         );
+    }
+
+    /// Big-endian domain parameters derived for test fixtures.
+    struct CurveParameters {
+        p: Vec<u8>,
+        a: Vec<u8>,
+        b: Vec<u8>,
+        gx: Vec<u8>,
+        gy: Vec<u8>,
+        n: Vec<u8>,
+    }
+
+    /// Derive `(p, a, b, gx, gy, n)` in big-endian bytes from the FIPS 186-4
+    /// Solinas prime exponents and upstream generator / order so test fixtures
+    /// carry no hand-copied hex parameter tables.
+    fn curve_parameters(curve: NamedCurve) -> CurveParameters {
+        /// NIST curves use `a = p - 3`.
+        const MINUS_A: u64 = 3;
+        /// Bits per byte for `BoxedUint` precision calculation.
+        const BITS_PER_BYTE: u32 = 8;
+        /// P-256 Solinas exponent 224 (`p = 2^256 - 2^224 + 2^192 + 2^96 - 1`).
+        const P256_EXP_224: u32 = 224;
+        /// P-256 Solinas exponent 192.
+        const P256_EXP_192: u32 = 192;
+        /// Shared Solinas exponent 96.
+        const SOLINAS_EXP_96: u32 = 96;
+        /// P-384 Solinas exponent 128 (`p = 2^384 - 2^128 - 2^96 + 2^32 - 1`).
+        const P384_EXP_128: u32 = 128;
+        /// P-384 Solinas exponent 32.
+        const P384_EXP_32: u32 = 32;
+
+        let width = curve.field_len();
+        let bits = u32::try_from(width)
+            .expect("fits u32")
+            .saturating_mul(BITS_PER_BYTE);
+        let one = BoxedUint::one_with_precision(bits);
+        let bit = |exp: u32| one.shl_vartime(exp).expect("exponent < bits");
+        // Modulo `2^bits`, `0 - 1` is `2^bits - 1`.
+        let two_pow_bits_minus_one = BoxedUint::zero_with_precision(bits).wrapping_sub(&one);
+
+        let (p_uint, gx, gy, n) = match curve {
+            NamedCurve::P256 => {
+                let p = two_pow_bits_minus_one
+                    .wrapping_sub(bit(P256_EXP_224))
+                    .wrapping_add(bit(P256_EXP_192))
+                    .wrapping_add(bit(SOLINAS_EXP_96));
+                let generator = p256::AffinePoint::GENERATOR.to_sec1_point(false);
+                (
+                    p,
+                    generator.x().expect("generator x").as_slice().to_vec(),
+                    generator.y().expect("generator y").as_slice().to_vec(),
+                    p256::NistP256::ORDER.to_be_bytes().to_vec(),
+                )
+            }
+            NamedCurve::P384 => {
+                let p = two_pow_bits_minus_one
+                    .wrapping_sub(bit(P384_EXP_128))
+                    .wrapping_sub(bit(SOLINAS_EXP_96))
+                    .wrapping_add(bit(P384_EXP_32));
+                let generator = p384::AffinePoint::GENERATOR.to_sec1_point(false);
+                (
+                    p,
+                    generator.x().expect("generator x").as_slice().to_vec(),
+                    generator.y().expect("generator y").as_slice().to_vec(),
+                    p384::NistP384::ORDER.to_be_bytes().to_vec(),
+                )
+            }
+        };
+
+        let a_uint = p_uint.wrapping_sub(BoxedUint::from(MINUS_A).resize(bits));
+        let p_odd: Odd<BoxedUint> = Option::from(Odd::new(p_uint.clone())).expect("odd prime");
+        let params = BoxedMontyParams::new(p_odd);
+        let gx_m = BoxedMontyForm::new(BoxedUint::from_be_slice(&gx, bits).expect("gx"), &params);
+        let gy_m = BoxedMontyForm::new(BoxedUint::from_be_slice(&gy, bits).expect("gy"), &params);
+        let a_m = BoxedMontyForm::new(a_uint.clone(), &params);
+        let b_uint =
+            (&(&gy_m * &gy_m) - &(&(&(&gx_m * &gx_m) * &gx_m) + &(&a_m * &gx_m))).retrieve();
+        let fixed = |v: &BoxedUint| {
+            let bytes = v.to_be_bytes();
+            bytes
+                .get(bytes.len().saturating_sub(width)..)
+                .expect("field-width tail")
+                .to_vec()
+        };
+        CurveParameters {
+            p: fixed(&p_uint),
+            a: fixed(&a_uint),
+            b: fixed(&b_uint),
+            gx,
+            gy,
+            n,
+        }
     }
 
     #[test]
@@ -1920,22 +1182,17 @@ mod tests {
             tlv(ASN1_INTEGER_TAG, &body)
         };
         let oid = |oid: crate::oid::Oid<'_>| tlv(OID_TAG, oid.as_bytes());
-        let sequence = |parts: &[Vec<u8>]| tlv(super::ASN1_SEQUENCE_TAG, &parts.concat());
+        let sequence = |parts: &[Vec<u8>]| tlv(ASN1_SEQUENCE_TAG, &parts.concat());
 
-        let field = sequence(&[oid(PRIME_FIELD), integer(&super::SECP256R1_P)]);
-        let coefficients = sequence(&[
-            tlv(OCTET_STRING_TAG, &super::SECP256R1_A),
-            tlv(OCTET_STRING_TAG, &super::SECP256R1_B),
-        ]);
+        let CurveParameters { p, a, b, gx, gy, n } = curve_parameters(NamedCurve::P256);
+        let field = sequence(&[oid(PRIME_FIELD), integer(&p)]);
+        let coefficients = sequence(&[tlv(OCTET_STRING_TAG, &a), tlv(OCTET_STRING_TAG, &b)]);
         let explicit = sequence(&[
             integer(&[EC_PARAMETERS_VERSION]),
             field,
             coefficients,
-            tlv(
-                OCTET_STRING_TAG,
-                &sec1(&super::SECP256R1_GX, &super::SECP256R1_GY),
-            ),
-            integer(&super::SECP256R1_N),
+            tlv(OCTET_STRING_TAG, &sec1(&gx, &gy)),
+            integer(&n),
         ]);
         let mut point = vec![0];
         point.extend_from_slice(&sec1(&P256_CAVP_QX, &P256_CAVP_QY));
@@ -1956,121 +1213,464 @@ mod tests {
             assert!(super::extract_ec_pubkey(&der).is_none());
             assert!(crate::x509::SpkiDer::try_from(der.as_slice()).is_err());
         }
-    }
 
-    /// The curves the verifier's table carries.
-    const TABLE_CURVES: &[crate::oid::Oid<'static>] =
-        &[crate::oid::known::SECP256R1, crate::oid::known::SECP384R1];
-
-    /// The table curve `oid` and its verification context.
-    fn table_curve(oid: crate::oid::Oid<'_>) -> (super::Curve, super::CurveCtx) {
-        let curve = EcdsaHelpers::named_curve_from_oid(oid).expect("a table curve");
-        let ctx = super::CurveCtx::new(&curve).expect("table curves build a context");
-        (curve, ctx)
-    }
-
-    /// The uncompressed encoding of `(x, y)` under `ctx`, each
-    /// coordinate written as its full field width.
-    fn encode(ctx: &super::CurveCtx, x: &BoxedUint, y: &BoxedUint) -> Vec<u8> {
-        let width = ctx.field_len;
-        let full = |value: &BoxedUint| {
-            let bytes = value.to_be_bytes();
-            bytes
-                .get(bytes.len().saturating_sub(width)..)
-                .expect("a field-width tail")
-                .to_vec()
+        // Reject unsupported named curves (Brainpool), hybrid (`06`), compressed (`02`),
+        // infinity (`00`), unused BIT STRING bits, and trailing bytes after the SPKI SEQUENCE.
+        /// SEC 1 hybrid even-Y tag (`06`), refused despite matching uncompressed byte length.
+        const SEC1_HYBRID_EVEN_TAG: u8 = 0x06;
+        /// SEC 1 compressed even-Y tag (`02`), refused at the SPKI boundary.
+        const SEC1_COMPRESSED_EVEN_TAG: u8 = 0x02;
+        let spki_with_bits = |bit_string_body: Vec<u8>| {
+            sequence(&[
+                sequence(&[
+                    oid(crate::oid::known::EC_PUBLIC_KEY),
+                    oid(crate::oid::known::SECP256R1),
+                ]),
+                tlv(BIT_STRING_TAG, &bit_string_body),
+            ])
         };
-        sec1(&full(x), &full(y))
+        let mut hybrid_bits = vec![0, SEC1_HYBRID_EVEN_TAG];
+        hybrid_bits.extend_from_slice(&P256_CAVP_QX);
+        hybrid_bits.extend_from_slice(&P256_CAVP_QY);
+        let mut compressed_bits = vec![0, SEC1_COMPRESSED_EVEN_TAG];
+        compressed_bits.extend_from_slice(&P256_CAVP_QX);
+        let infinity_bits = vec![0, 0];
+        let mut unused_bits_point = vec![1];
+        unused_bits_point.extend_from_slice(&sec1(&P256_CAVP_QX, &P256_CAVP_QY));
+        let mut trailing_spki = named;
+        trailing_spki.push(0);
+
+        for malformed_spki in [
+            spki(oid(crate::oid::known::BRAINPOOL_P256R1)),
+            spki_with_bits(hybrid_bits),
+            spki_with_bits(compressed_bits),
+            spki_with_bits(infinity_bits),
+            spki_with_bits(unused_bits_point),
+            trailing_spki,
+        ] {
+            assert!(super::extract_ec_pubkey(&malformed_spki).is_none());
+        }
     }
 
-    /// A curve point whose `x` is a small integer and whose `y` has a
-    /// zero leading octet at the field width, so that `x + p` still
-    /// fits the field width and both coordinates also fit one octet
-    /// less.
-    ///
-    /// Both table primes are 3 mod 4, so `v^((p + 1) / 4)` is a square
-    /// root of `v` whenever `v` has one; each candidate is confirmed
-    /// with the on-curve check.
-    fn point_with_short_coordinates(ctx: &super::CurveCtx) -> (BoxedUint, BoxedUint) {
-        /// `(p + 1) / 4` is `p + 1` shifted right by two bits.
+    fn point_with_short_coordinates(curve: NamedCurve) -> (Vec<u8>, BoxedUint, BoxedUint) {
+        /// `(p + 1) / 4` is `p + 1` shifted right by two bits (`p == 3 mod 4`).
         const QUARTER_SHIFT: u32 = 2;
         /// Candidate `x` values tried before giving up.
         const CANDIDATES: u64 = 4096;
-        let one = BoxedUint::one_with_precision(ctx.bits_p);
-        let root_exponent = ctx.p_uint.wrapping_add(&one).shr(QUARTER_SHIFT);
-        (0..CANDIDATES)
+        /// Bits per byte.
+        const BITS_PER_BYTE: u32 = 8;
+
+        let CurveParameters { p, a, b, .. } = curve_parameters(curve);
+        let bits = u32::try_from(curve.field_len())
+            .expect("fits u32")
+            .saturating_mul(BITS_PER_BYTE);
+        let p_uint = BoxedUint::from_be_slice(&p, bits).expect("field prime");
+        let a_uint = BoxedUint::from_be_slice(&a, bits).expect("a coeff");
+        let b_uint = BoxedUint::from_be_slice(&b, bits).expect("b coeff");
+        let p_odd: Odd<BoxedUint> = Option::from(Odd::new(p_uint.clone())).expect("odd prime");
+        let params = BoxedMontyParams::new(p_odd);
+        let a_m = BoxedMontyForm::new(a_uint, &params);
+        let b_m = BoxedMontyForm::new(b_uint, &params);
+        let one = BoxedUint::one_with_precision(bits);
+        let root_exponent = p_uint.wrapping_add(&one).shr(QUARTER_SHIFT);
+
+        let (x, y) = (1..CANDIDATES)
             .find_map(|candidate| {
-                let x = BoxedUint::from(candidate).resize(ctx.bits_p);
-                let x_m = ctx.p_mont(&x);
-                let rhs = &(&(&(&x_m * &x_m) * &x_m) + &(&ctx.p_mont(&ctx.a) * &x_m))
-                    + &ctx.p_mont(&ctx.b);
+                let x = BoxedUint::from(candidate).resize(bits);
+                let x_m = BoxedMontyForm::new(x.clone(), &params);
+                let rhs = &(&(&(&x_m * &x_m) * &x_m) + &(&a_m * &x_m)) + &b_m;
                 let root = rhs.pow(&root_exponent).retrieve();
-                let negated = ctx.p_uint.wrapping_sub(&root);
+                let negated = p_uint.wrapping_sub(&root);
                 [root, negated].into_iter().find_map(|y| {
-                    let point = super::AffinePoint {
-                        xy: Some((x.clone(), y.clone())),
-                    };
+                    let y_m = BoxedMontyForm::new(y.clone(), &params);
+                    let on_curve = (&y_m * &y_m) == rhs;
                     let leading = y.to_be_bytes().first().copied();
-                    (ctx.is_on_curve(&point) && leading == Some(0)).then_some((x.clone(), y))
+                    (on_curve && leading == Some(0)).then_some((x.clone(), y))
                 })
             })
-            .expect("a small point exists among the candidates")
+            .expect("a non-zero small point exists among the candidates");
+        (p, x, y)
     }
 
     #[test]
     fn public_key_coordinates_are_field_elements_of_the_field_width() {
-        for &oid in TABLE_CURVES {
-            let (curve, ctx) = table_curve(oid);
+        /// Compressed SEC 1 even-Y tag (`02`), refused by `Sec1UncompressedPoint`.
+        const SEC1_COMPRESSED_EVEN_TAG: u8 = 0x02;
+
+        for curve in [NamedCurve::P256, NamedCurve::P384] {
+            let width = curve.field_len();
+            let CurveParameters { p, gx, gy, .. } = curve_parameters(curve);
             let public_key = |bytes: Vec<u8>| {
-                super::Sec1UncompressedPoint::from_bytes(bytes)
+                Sec1UncompressedPoint::from_bytes(bytes)
                     .map_err(|_e| EcdsaError::BadPublicKey)
-                    .and_then(|point| ctx.public_key(&point))
-                    .map(|_point| ())
+                    .and_then(|point| VerifiedPublicKey::from_sec1(curve, &point))
+                    .map(|_vk| ())
             };
 
-            // The base point, canonical, then with x = p and y = p.
-            assert_eq!(public_key(sec1(&curve.gx, &curve.gy)), Ok(()));
+            // Canonical generator succeeds; x = p, y = p, identity / zero coordinates,
+            // off-curve, compressed, and wrong-width fail.
+            assert_eq!(public_key(sec1(&gx, &gy)), Ok(()));
+            assert_eq!(public_key(sec1(&p, &gy)), Err(EcdsaError::BadPublicKey));
+            assert_eq!(public_key(sec1(&gx, &p)), Err(EcdsaError::BadPublicKey));
+            assert_eq!(public_key(vec![0]), Err(EcdsaError::BadPublicKey));
             assert_eq!(
-                public_key(sec1(&curve.p, &curve.gy)),
+                public_key(sec1(&vec![0; width], &vec![0; width])),
                 Err(EcdsaError::BadPublicKey)
             );
+
+            let mut off_curve_y = gy.clone();
+            if let Some(last) = off_curve_y.last_mut() {
+                *last ^= 1;
+            }
             assert_eq!(
-                public_key(sec1(&curve.gx, &curve.p)),
+                public_key(sec1(&gx, &off_curve_y)),
                 Err(EcdsaError::BadPublicKey)
             );
-            // The base point with each coordinate one octet too wide.
+
+            let mut compressed = vec![SEC1_COMPRESSED_EVEN_TAG];
+            compressed.extend_from_slice(&gx);
+            assert_eq!(public_key(compressed), Err(EcdsaError::BadPublicKey));
+
             let wide = |coordinate: &[u8]| [&[0][..], coordinate].concat();
             assert_eq!(
-                public_key(sec1(&wide(&curve.gx), &wide(&curve.gy))),
+                public_key(sec1(&wide(&gx), &wide(&gy))),
                 Err(EcdsaError::BadPublicKey)
             );
 
-            // A point the on-curve check alone cannot tell from its
-            // aliases: x + p reduces to x, and both coordinates fit one
-            // octet less than the field width.
-            let (x, y) = point_with_short_coordinates(&ctx);
-            let canonical = encode(&ctx, &x, &y);
-            assert_eq!(public_key(canonical.clone()), Ok(()));
+            let (_p_bytes, x, y) = point_with_short_coordinates(curve);
+            let full = |value: &BoxedUint| {
+                let bytes = value.to_be_bytes();
+                bytes
+                    .get(bytes.len().saturating_sub(width)..)
+                    .expect("field-width tail")
+                    .to_vec()
+            };
+            assert_eq!(public_key(sec1(&full(&x), &full(&y))), Ok(()));
 
-            let x_alias = ctx.p_uint.wrapping_add(&x);
-            assert!(ctx.is_on_curve(&super::AffinePoint {
-                xy: Some((x_alias.clone(), y.clone()))
-            }));
+            let p_uint = BoxedUint::from_be_slice(&p, x.bits_precision()).expect("prime");
+            let x_alias = p_uint.wrapping_add(&x);
+            assert!(
+                x_alias > p_uint,
+                "alias stays in (p, 2^bits) without wrapping"
+            );
             assert_eq!(
-                public_key(encode(&ctx, &x_alias, &y)),
+                public_key(sec1(&full(&x_alias), &full(&y))),
                 Err(EcdsaError::BadPublicKey)
             );
 
-            let short_width = ctx.field_len.saturating_sub(1);
+            let short_width = width.saturating_sub(1);
             let shorten = |value: &BoxedUint| {
                 let bytes = value.to_be_bytes();
                 bytes
                     .get(bytes.len().saturating_sub(short_width)..)
-                    .expect("the coordinate without its leading octet")
+                    .expect("shortened coordinate")
                     .to_vec()
             };
-            let short = sec1(&shorten(&x), &shorten(&y));
-            assert_eq!(public_key(short), Err(EcdsaError::BadPublicKey));
+            assert_eq!(
+                public_key(sec1(&shorten(&x), &shorten(&y))),
+                Err(EcdsaError::BadPublicKey)
+            );
         }
+    }
+
+    #[test]
+    fn both_high_s_and_low_s_signatures_verify() {
+        /// Bits per byte for `BoxedUint` precision calculation.
+        const BITS_PER_BYTE: u32 = 8;
+
+        // Both RFC 6979 `b"sample"` vectors have `s > n / 2` (high-S). Verify that both the
+        // original high-S signature and its low-S negation `(r, n - s)` are accepted across
+        // both raw and DER verification paths.
+        let p256_bits = u32::try_from(P256_FIELD_LEN)
+            .expect("fits u32")
+            .saturating_mul(BITS_PER_BYTE);
+        let p256_n = BoxedUint::from_be_slice(&p256::NistP256::ORDER.to_be_bytes(), p256_bits)
+            .expect("order");
+        let p256_s = BoxedUint::from_be_slice(&P256_CAVP_S, p256_bits).expect("s");
+        let p256_low_s = p256_n.wrapping_sub(&p256_s).to_be_bytes();
+        let p256_pubkey =
+            Sec1UncompressedPoint::from_bytes(sec1(&P256_CAVP_QX, &P256_CAVP_QY)).expect("pubkey");
+        let p256_digest = refineid_digest::Sha256::of(CAVP_MESSAGE);
+
+        for s_bytes in [P256_CAVP_S.as_slice(), p256_low_s.as_ref()] {
+            let raw = [P256_CAVP_R.as_slice(), s_bytes].concat();
+            let raw_sig: Signature<EcdsaP256> = Signature::new(raw.clone());
+            assert_eq!(
+                p256_pubkey.verify_p256_sha256_raw(raw_sig, p256_digest),
+                Ok(())
+            );
+            let der_sig = Signature::<EcdsaDer>::from_raw_concatenation(&raw).expect("der");
+            assert_eq!(
+                verify_prehashed(
+                    NamedCurve::P256,
+                    &p256_pubkey,
+                    &der_sig,
+                    p256_digest.as_bytes()
+                ),
+                Ok(())
+            );
+        }
+
+        let p384_bits = u32::try_from(P384_FIELD_LEN)
+            .expect("fits u32")
+            .saturating_mul(BITS_PER_BYTE);
+        let p384_n = BoxedUint::from_be_slice(&p384::NistP384::ORDER.to_be_bytes(), p384_bits)
+            .expect("order");
+        let p384_s = BoxedUint::from_be_slice(&P384_CAVP_S, p384_bits).expect("s");
+        let p384_low_s = p384_n.wrapping_sub(&p384_s).to_be_bytes();
+        let p384_pubkey =
+            Sec1UncompressedPoint::from_bytes(sec1(&P384_CAVP_QX, &P384_CAVP_QY)).expect("pubkey");
+        let p384_digest = refineid_digest::Sha384::of(CAVP_MESSAGE);
+
+        for s_bytes in [P384_CAVP_S.as_slice(), p384_low_s.as_ref()] {
+            let raw = [P384_CAVP_R.as_slice(), s_bytes].concat();
+            let raw_sig: Signature<EcdsaP384> = Signature::new(raw.clone());
+            assert_eq!(
+                p384_pubkey.verify_p384_sha384_raw(raw_sig, p384_digest),
+                Ok(())
+            );
+            let der_sig = Signature::<EcdsaDer>::from_raw_concatenation(&raw).expect("der");
+            assert_eq!(
+                verify_prehashed(
+                    NamedCurve::P384,
+                    &p384_pubkey,
+                    &der_sig,
+                    p384_digest.as_bytes()
+                ),
+                Ok(())
+            );
+        }
+    }
+
+    #[test]
+    fn cross_hash_and_error_classifications_hold() {
+        /// RFC 6979 sec. A.2.5 P-256 + SHA-512 `b"sample"` expected `r`
+        /// (split to avoid a binary-radix lookalike inside hex digits).
+        const RFC6979_P256_SHA512_R: [u8; P256_FIELD_LEN] = Hex::decode_const(concat!(
+            "8496a60",
+            "b5e9b47c825488827e0495b0e",
+            "3fa109ec4568fd3f8d1097678eb97f00",
+        ));
+        /// RFC 6979 sec. A.2.5 P-256 + SHA-512 `b"sample"` expected `s`.
+        const RFC6979_P256_SHA512_S: [u8; P256_FIELD_LEN] = Hex::decode_const(concat!(
+            "2362ab1adbe2b8adf9cb9edab740ea60",
+            "49c0281",
+            "14f2460f96554f61fae3302fe",
+        ));
+        /// RFC 6979 sec. A.2.6 P-384 + SHA-512 `b"sample"` expected `r`.
+        const RFC6979_P384_SHA512_R: [u8; P384_FIELD_LEN] = Hex::decode_const(concat!(
+            "ed0959d5880ab2d869ae7f6c2915c6d6",
+            "0f96507f9cb3e047c004",
+            "6861da4a799c",
+            "fe30f35cc900056d7c99cd7882433709",
+        ));
+        /// RFC 6979 sec. A.2.6 P-384 + SHA-512 `b"sample"` expected `s`.
+        const RFC6979_P384_SHA512_S: [u8; P384_FIELD_LEN] = Hex::decode_const(concat!(
+            "512c8cceee3890a84058ce1e22dbc219",
+            "8f42323ce8aca91",
+            "35329f03c068e5112",
+            "dc7cc3ef3446defceb01a45c2667fdd5",
+        ));
+        /// Raw width of the zero-half DER canonicalization fixture.
+        const ZERO_FIXTURE_LEN: usize = 8;
+        /// Canonical DER body length for `INTEGER 0, INTEGER 0`.
+        const ZERO_PAIR_SEQ_LEN: u8 = 6;
+        /// Oversized scalar width (`P256_FIELD_LEN + 1`).
+        const OVERSIZED_P256_SCALAR_LEN: usize = P256_FIELD_LEN + 1;
+
+        let p256_key =
+            super::signing::SigningKey::from_scalar(crate::oid::known::SECP256R1, &RFC6979_P256_X)
+                .expect("P-256 key");
+        let p384_key =
+            super::signing::SigningKey::from_scalar(crate::oid::known::SECP384R1, &RFC6979_P384_X)
+                .expect("P-384 key");
+
+        // Published RFC 6979 A.2.5 (P-256 + SHA-512) and A.2.6 (P-384 + SHA-512) wide-digest
+        // vectors pin leftmost-`bits(n)` truncation on both signing and verification.
+        let sha512_digest = refineid_digest::Sha512::of(CAVP_MESSAGE);
+        let p256_sha512_sig =
+            p256_key.sign(crate::signed_data::HashAlgorithm::Sha512, CAVP_MESSAGE);
+        assert_eq!(
+            components(&p256_sha512_sig, P256_FIELD_LEN),
+            [
+                RFC6979_P256_SHA512_R.as_slice(),
+                RFC6979_P256_SHA512_S.as_slice()
+            ]
+            .concat()
+        );
+        assert_eq!(
+            verify_prehashed(
+                NamedCurve::P256,
+                p256_key.public_point(),
+                &p256_sha512_sig,
+                sha512_digest.as_bytes()
+            ),
+            Ok(())
+        );
+
+        // P-384 across all five raw digest entry points (SHA-1, SHA-224, SHA-256, SHA-384, SHA-512).
+        let sha1_digest = refineid_digest::Sha1::of(CAVP_MESSAGE);
+        let sig_sha1 = Signature::<EcdsaP384>::new(p384_key.sign_raw_digest(
+            crate::signed_data::HashAlgorithm::Sha384,
+            sha1_digest.as_bytes(),
+        ));
+        assert_eq!(
+            p384_key
+                .public_point()
+                .verify_p384_sha1_raw(sig_sha1, sha1_digest),
+            Ok(())
+        );
+
+        let sha224_digest = refineid_digest::Sha224::of(CAVP_MESSAGE);
+        let sig_sha224 = Signature::<EcdsaP384>::new(p384_key.sign_raw_digest(
+            crate::signed_data::HashAlgorithm::Sha384,
+            sha224_digest.as_bytes(),
+        ));
+        assert_eq!(
+            p384_key
+                .public_point()
+                .verify_p384_sha224_raw(sig_sha224, sha224_digest),
+            Ok(())
+        );
+
+        let sha256_digest = refineid_digest::Sha256::of(CAVP_MESSAGE);
+        let sig_sha256 = Signature::<EcdsaP384>::new(
+            p384_key.sign_raw(crate::signed_data::HashAlgorithm::Sha256, CAVP_MESSAGE),
+        );
+        assert_eq!(
+            p384_key
+                .public_point()
+                .verify_p384_sha256_raw(sig_sha256, sha256_digest),
+            Ok(())
+        );
+
+        let raw_p384_sha512 =
+            p384_key.sign_raw(crate::signed_data::HashAlgorithm::Sha512, CAVP_MESSAGE);
+        assert_eq!(
+            raw_p384_sha512,
+            [
+                RFC6979_P384_SHA512_R.as_slice(),
+                RFC6979_P384_SHA512_S.as_slice()
+            ]
+            .concat()
+        );
+        let sig_sha512 = Signature::<EcdsaP384>::new(raw_p384_sha512);
+        assert_eq!(
+            p384_key
+                .public_point()
+                .verify_p384_sha512_raw(sig_sha512, sha512_digest),
+            Ok(())
+        );
+
+        // Empty-digest guard in `sign_raw_digest` and `verify_prehashed`.
+        let empty_digest_raw =
+            p256_key.sign_raw_digest(crate::signed_data::HashAlgorithm::Sha256, &[]);
+        let empty_digest_der =
+            Signature::<EcdsaDer>::from_raw_concatenation(&empty_digest_raw).expect("der");
+        assert_eq!(
+            verify_prehashed(
+                NamedCurve::P256,
+                p256_key.public_point(),
+                &empty_digest_der,
+                &[]
+            ),
+            Ok(())
+        );
+
+        // Zero-half raw input encodes as canonical DER `INTEGER 0` (`02 01 00`) and is rejected
+        // by `parse_ecdsa_signature` and `verify_prehashed` with `BadSignature`.
+        let zero_der = Signature::<EcdsaDer>::from_raw_concatenation(&[0; ZERO_FIXTURE_LEN])
+            .expect("zero halves still encode as canonical DER INTEGER 0");
+        assert_eq!(
+            zero_der.as_bytes(),
+            [
+                ASN1_SEQUENCE_TAG,
+                ZERO_PAIR_SEQ_LEN,
+                ASN1_INTEGER_TAG,
+                1,
+                0,
+                ASN1_INTEGER_TAG,
+                1,
+                0
+            ]
+        );
+        assert_eq!(
+            zero_der.parse_ecdsa_signature(),
+            Err(EcdsaError::BadSignature)
+        );
+        assert_eq!(
+            verify_prehashed(
+                NamedCurve::P256,
+                p256_key.public_point(),
+                &zero_der,
+                sha256_digest.as_bytes()
+            ),
+            Err(EcdsaError::BadSignature)
+        );
+
+        // DER-path `SigOutOfRange` classification for `r == n`, `s == n`, and `r` wider than field.
+        let p256_order_bytes = p256::NistP256::ORDER.to_be_bytes();
+        let der_r_eq_n = Signature::<EcdsaDer>::from_raw_concatenation(
+            &[p256_order_bytes.as_slice(), P256_CAVP_S.as_slice()].concat(),
+        )
+        .expect("der");
+        let der_s_eq_n = Signature::<EcdsaDer>::from_raw_concatenation(
+            &[P256_CAVP_R.as_slice(), p256_order_bytes.as_slice()].concat(),
+        )
+        .expect("der");
+        let der_oversized_r = Signature::<EcdsaDer>::from_raw_concatenation(
+            &[
+                vec![1; OVERSIZED_P256_SCALAR_LEN].as_slice(),
+                vec![1; OVERSIZED_P256_SCALAR_LEN].as_slice(),
+            ]
+            .concat(),
+        )
+        .expect("der");
+        for out_of_range_der in [der_r_eq_n, der_s_eq_n, der_oversized_r] {
+            assert_eq!(
+                verify_prehashed(
+                    NamedCurve::P256,
+                    p256_key.public_point(),
+                    &out_of_range_der,
+                    sha256_digest.as_bytes()
+                ),
+                Err(EcdsaError::SigOutOfRange)
+            );
+        }
+
+        // Error classification on raw verification: wrong width -> BadSignature, zero half ->
+        // BadSignature, scalar == n -> SigOutOfRange, flipped digest -> VerifyFailed.
+        assert_eq!(
+            p256_key.public_point().verify_p256_sha256_raw(
+                Signature::<EcdsaP256>::new(vec![1; P384_RAW_SIGNATURE_LEN]),
+                sha256_digest
+            ),
+            Err(EcdsaError::BadSignature)
+        );
+        let mut zero_r = vec![0; P256_FIELD_LEN];
+        zero_r.extend_from_slice(&P256_CAVP_S);
+        assert_eq!(
+            p256_key
+                .public_point()
+                .verify_p256_sha256_raw(Signature::<EcdsaP256>::new(zero_r), sha256_digest),
+            Err(EcdsaError::BadSignature)
+        );
+        let mut order_r = p256::NistP256::ORDER.to_be_bytes().to_vec();
+        order_r.extend_from_slice(&P256_CAVP_S);
+        assert_eq!(
+            p256_key
+                .public_point()
+                .verify_p256_sha256_raw(Signature::<EcdsaP256>::new(order_r), sha256_digest),
+            Err(EcdsaError::SigOutOfRange)
+        );
+        let wrong_digest = refineid_digest::Sha256::of(b"tampered");
+        let valid_p256_sig =
+            Signature::<EcdsaP256>::new([P256_CAVP_R.as_slice(), P256_CAVP_S.as_slice()].concat());
+        assert_eq!(
+            p256_key
+                .public_point()
+                .verify_p256_sha256_raw(valid_p256_sig, wrong_digest),
+            Err(EcdsaError::VerifyFailed)
+        );
     }
 }

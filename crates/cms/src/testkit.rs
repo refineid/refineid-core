@@ -27,6 +27,7 @@ use crate::oid::{Oid, known};
 use crate::rsa::signing::RsaSigningKey;
 use crate::signed_data::HashAlgorithm;
 use crate::x509::{Certificate, DateTime};
+use base64ct::{Base64, Encoding as _};
 use refineid_ber::{BerTlv, Sequence};
 
 /// Universal BOOLEAN.
@@ -138,14 +139,6 @@ const RFC9500_TEST_RSA_2048: &str = concat!(
     "7d56RZOE", "+ERK2uz/", "7JX9VSsM", "/LbH9pJi", "bd4e8mik", "DS9ntciq", "OH/3",
 );
 
-/// The base64 alphabet (RFC 4648 sec.4).
-const BASE64_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-/// Bits one base64 character carries.
-const BASE64_BITS: u32 = 6;
-/// The base64 padding character.
-const BASE64_PAD: u8 = b'=';
-/// Bits in one octet.
-const OCTET_BITS: u32 = 8;
 /// Position of `n` in `RSAPrivateKey` (RFC 8017 appendix A.1.2),
 /// after `version`.
 const RSA_PRIVATE_KEY_MODULUS: usize = 1;
@@ -246,7 +239,7 @@ impl TestKey {
     /// Never: the constant is the RFC's key.
     #[must_use]
     pub fn rsa_2048() -> Self {
-        let der = base64_decode(RFC9500_TEST_RSA_2048);
+        let der = Base64::decode_vec(RFC9500_TEST_RSA_2048).expect("fixture text is base64");
         let key = BerTlv::<Sequence>::parse(&der).expect("RSAPrivateKey is a SEQUENCE");
         let integers: Vec<&[u8]> = key
             .iter_children()
@@ -388,31 +381,6 @@ impl TestKey {
 /// Salt length of the RSA-PSS profile [`TestKey::sign_pss_sha256`]
 /// signs: the SHA-256 output length.
 pub const PSS_SALT_LEN: usize = refineid_digest::SHA256_LEN;
-
-/// `text` decoded from base64 (RFC 4648 sec.4) without padding
-/// checks: fixture text only.
-fn base64_decode(text: &str) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut accumulator: u32 = 0;
-    let mut bits: u32 = 0;
-    for character in text
-        .bytes()
-        .take_while(|character| *character != BASE64_PAD)
-    {
-        let value = BASE64_ALPHABET
-            .iter()
-            .position(|symbol| *symbol == character)
-            .and_then(|position| u32::try_from(position).ok())
-            .expect("fixture text is base64");
-        accumulator = (accumulator << BASE64_BITS) | value;
-        bits += BASE64_BITS;
-        if bits >= OCTET_BITS {
-            bits -= OCTET_BITS;
-            out.extend(u8::try_from((accumulator >> bits) & u32::from(u8::MAX)));
-        }
-    }
-    out
-}
 
 /// An INTEGER's content octets without the sign pad.
 fn magnitude(value: &[u8]) -> &[u8] {

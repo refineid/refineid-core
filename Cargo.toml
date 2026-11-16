@@ -28,7 +28,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "26.11.14"
+version = "26.11.16"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Petri Koistinen"]
@@ -107,6 +107,9 @@ const-oid = { version = "0.10", default-features = false }
 spki = "0.8"
 # Typed X.509 Validity (notBefore/notAfter) decoding in cms::x509.
 x509-cert = { version = "0.3", default-features = false }
+# Constant-time canonical RFC 4648 Base64 codecs for SCS, document
+# signing and the CMS testkit; already in Cargo.lock via spki.
+base64ct = { version = "1", default-features = false, features = ["alloc"] }
 # Test-fixture hex decoding.
 hex = "0.4"
 # Real and effective user and group ids, read through a safe API, so

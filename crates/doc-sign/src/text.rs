@@ -12,12 +12,9 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-//! Tiny text-codec helpers shared across CLI modules.
-//!
-//! base64 decode + PEM auto-detect. Both are minimal
-//! RFC 4648 / RFC 7468 implementations -- enough for cert
-//! loading without reaching for the `base64` / `pem`
-//! crates.
+//! Tiny text-codec helpers shared across CLI modules: PEM `CERTIFICATE`
+//! auto-detect (RFC 7468) over [`crate::base64`] and RFC 3339 timestamp
+//! formatting.
 
 /// DER SEQUENCE tag byte (universal class, constructed, tag 16).
 /// A DER-encoded `Certificate`, `SubjectPublicKeyInfo`, etc. all

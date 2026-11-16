@@ -1,57 +1,31 @@
-//! Base64 coding (RFC 4648 sec.4), for the places a signature format
-//! insists on it.
+// Copyright 2026 Petri Koistinen
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Base64 coding (RFC 4648 sec.4) backed by [`base64ct`], for the places
+//! a signature format insists on it.
 //!
 //! `ASiC` manifests and `XAdES` carry digests and certificates as base64
 //! inside XML, because XML cannot hold arbitrary octets. Encoding serves
 //! the writers; the strict decoder serves the offline verifier, which
 //! consumes manifests it did not produce.
 
-/// The standard alphabet (RFC 4648 sec.4). Not the URL-safe variant --
-/// XML has no objection to `+` or `/`.
-const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-/// Input octets per encoded quantum.
-const QUANTUM_IN: usize = 3;
-
-/// Output characters per encoded quantum.
-const QUANTUM_OUT: usize = 4;
-
-/// Bits carried by one output character.
-const BITS_PER_CHARACTER: usize = 6;
-
-/// Mask selecting one output character's worth of bits.
-const CHARACTER_MASK: usize = 0x3F;
-
-/// Bits in an octet.
-const BITS_PER_OCTET: usize = 8;
+use base64ct::{Base64, Encoding as _};
 
 /// Encode `input` as base64 with the standard alphabet and padding.
 #[must_use]
 pub fn encode(input: &[u8]) -> String {
-    let mut out = String::with_capacity(input.len().div_ceil(QUANTUM_IN) * QUANTUM_OUT);
-    for chunk in input.chunks(QUANTUM_IN) {
-        // Pack the chunk right-aligned into a 24-bit accumulator, so a
-        // short final chunk simply leaves the low bits zero.
-        let mut packed = 0_usize;
-        for index in 0..QUANTUM_IN {
-            packed <<= BITS_PER_OCTET;
-            packed |= usize::from(chunk.get(index).copied().unwrap_or(0));
-        }
-        // Every chunk yields four characters; the ones with no input
-        // behind them become padding below.
-        for index in 0..QUANTUM_OUT {
-            let shift = BITS_PER_CHARACTER * (QUANTUM_OUT - 1 - index);
-            let sextet = (packed >> shift) & CHARACTER_MASK;
-            // `index <= chunk.len()` is the count of characters carrying
-            // real input: one more than the octets supplied.
-            if index <= chunk.len() {
-                out.push(char::from(ALPHABET[sextet]));
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
+    Base64::encode_string(input)
 }
 
 /// Decode standard padded base64 (RFC 4648 sec.4).
@@ -65,35 +39,7 @@ pub fn encode(input: &[u8]) -> String {
 /// # Errors
 /// Any alphabet, padding, length, or trailing-bits violation.
 pub(crate) fn decode(input: &str) -> Result<Vec<u8>, &'static str> {
-    const PAD: u8 = b'=';
-    const MAX_PADDING: usize = 2;
-    let bytes = input.trim().as_bytes();
-    if bytes.is_empty() {
-        return Ok(Vec::new());
-    }
-    if !bytes.len().is_multiple_of(QUANTUM_OUT) {
-        return Err("base64 length is not a multiple of four");
-    }
-    let padding = bytes.iter().rev().take_while(|byte| **byte == PAD).count();
-    if padding > MAX_PADDING {
-        return Err("base64 has too much padding");
-    }
-    let body = bytes
-        .get(..bytes.len() - padding)
-        .ok_or("base64 padding exceeds input")?;
-    if body.contains(&PAD) {
-        return Err("base64 padding is not trailing");
-    }
-    let mut out = Vec::with_capacity(bytes.len() / QUANTUM_OUT * QUANTUM_IN);
-    let (quads, remainder) = bytes.as_chunks::<QUANTUM_OUT>();
-    debug_assert!(remainder.is_empty(), "length checked above");
-    let mut quads = quads.iter();
-    let last = quads.next_back().ok_or("base64 input vanished")?;
-    for quad in quads {
-        decode_quad(quad, 0, &mut out)?;
-    }
-    decode_quad(last, padding, &mut out)?;
-    Ok(out)
+    Base64::decode_vec(input.trim_ascii()).map_err(|_| "malformed base64")
 }
 
 /// Decode `xsd:base64Binary` text: the strict alphabet and padding of
@@ -108,59 +54,15 @@ pub(crate) fn decode_wrapped(input: &str) -> Result<Vec<u8>, &'static str> {
         .chars()
         .filter(|character| !matches!(character, ' ' | '\t' | '\n' | '\r'))
         .collect();
-    decode(&compact)
-}
-
-/// Decode one four-character quantum, of which the last
-/// `padding` characters are `=`.
-///
-/// # Errors
-/// Alphabet violations and nonzero trailing bits in a padded
-/// quantum (two encodings must never decode to the same bytes).
-fn decode_quad(quad: &[u8], padding: usize, out: &mut Vec<u8>) -> Result<(), &'static str> {
-    let chars = QUANTUM_OUT - padding.min(QUANTUM_OUT);
-    let mut packed = 0_u32;
-    for byte in quad.iter().take(chars) {
-        let sextet = sextet_value(*byte)?;
-        packed = (packed << BITS_PER_CHARACTER) | u32::from(sextet);
-    }
-    let missing = QUANTUM_OUT - chars;
-    // Bits past the last full octet must be zero, or two encodings
-    // would decode to the same bytes: two per missing character.
-    let spare_bits = 2 * missing;
-    let trailing_mask = (1_u32 << spare_bits).wrapping_sub(1);
-    if packed & trailing_mask != 0 {
-        return Err("base64 has nonzero trailing bits");
-    }
-    // A padded final quantum carries fewer than 24 bits; shift
-    // the accumulator into place so the octet split below lands.
-    packed <<= BITS_PER_CHARACTER * missing;
-    let octets = QUANTUM_IN - missing.min(QUANTUM_IN);
-    for index in 0..octets {
-        let shift = BITS_PER_OCTET * (QUANTUM_IN - 1 - index);
-        out.push(u8::try_from((packed >> shift) & 0xFF).unwrap_or(0));
-    }
-    Ok(())
-}
-
-/// Value of one standard-alphabet character.
-///
-/// # Errors
-/// Any byte outside the alphabet (padding is handled by the caller).
-const fn sextet_value(byte: u8) -> Result<u8, &'static str> {
-    match byte {
-        b'A'..=b'Z' => Ok(byte - b'A'),
-        b'a'..=b'z' => Ok(byte - b'a' + 26),
-        b'0'..=b'9' => Ok(byte - b'0' + 52),
-        b'+' => Ok(62),
-        b'/' => Ok(63),
-        _ => Err("invalid base64 character"),
-    }
+    Base64::decode_vec(&compact).map_err(|_| "malformed base64")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Encoded character count for all 256 byte values (`ceil(256 / 3) * 4`).
+    const ALL_OCTETS_ENCODED_LEN: usize = 344;
 
     #[test]
     fn matches_rfc_4648_vectors() {
@@ -180,7 +82,7 @@ mod tests {
         // cannot hide in the range nothing else exercises.
         let all: Vec<u8> = (0..=u8::MAX).collect();
         let encoded = encode(&all);
-        assert_eq!(encoded.len(), 344);
+        assert_eq!(encoded.len(), ALL_OCTETS_ENCODED_LEN);
         assert!(encoded.starts_with("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g"));
         assert!(encoded.ends_with("+/w=="));
     }
@@ -227,6 +129,16 @@ mod tests {
 
     #[test]
     fn wrapped_decoding_tolerates_line_breaks_and_keeps_strict_padding() {
+        const NON_BREAKING_SPACE: u8 = 160;
+        assert_eq!(decode(" \t\r\n ").expect("whitespace-only decodes"), b"");
+        assert_eq!(
+            decode(" \nZm9v\t ").expect("surrounding ASCII whitespace decodes"),
+            b"foo"
+        );
+        assert_eq!(
+            decode_wrapped(" \r\n\t ").expect("whitespace-only wrapped decodes"),
+            b""
+        );
         assert_eq!(
             decode_wrapped("Zm9v\nYmFy").expect("wrapped decodes"),
             b"foobar"
@@ -234,6 +146,15 @@ mod tests {
         assert_eq!(
             decode_wrapped(" Zm9v\r\n\tYg==\n").expect("wrapped decodes"),
             b"foob"
+        );
+        let non_ascii_space = format!("{}Zm9v", char::from(NON_BREAKING_SPACE));
+        assert!(
+            decode(&non_ascii_space).is_err(),
+            "non-ASCII whitespace must not be trimmed"
+        );
+        assert!(
+            decode_wrapped(&non_ascii_space).is_err(),
+            "non-ASCII whitespace is outside XML S"
         );
         for bad in ["Zh==", "Zg=", "Z===", "Zm9v!", "Zg==\nZg=="] {
             assert!(decode_wrapped(bad).is_err(), "{bad} must not decode");

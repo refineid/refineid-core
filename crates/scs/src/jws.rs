@@ -25,22 +25,14 @@
 
 use std::time::SystemTime;
 
-use elliptic_curve::sec1::ToSec1Point as _;
-use refineid_ber::BerTlvAny;
-use signature::Verifier as _;
+use refineid_cms::ecdsa::EcdsaError;
+use refineid_cms::x509::{
+    Certificate, EcCurve, MessageSignatureAlgorithm, PublicKeyAlgorithm, SpkiDer, VerifyError,
+    X509Error,
+};
 
-use crate::der;
 use crate::error::TransactionError;
 use crate::time;
-
-/// DER tag: SEQUENCE, as the parser reports it.
-const TAG_SEQUENCE: u16 = der::TAG_SEQUENCE as u16;
-
-/// DER tag: INTEGER, as the parser reports it.
-const TAG_INTEGER: u16 = der::TAG_INTEGER as u16;
-
-/// DER tag: explicit [0] (certificate version), as reported.
-const TAG_EXPLICIT_ZERO: u16 = der::TAG_CONTEXT_ZERO as u16;
 
 /// Raw ES256 JWS signatures are r||s at 64 bytes (RFC 7518 sec.3.4).
 const ES256_SIGNATURE_LENGTH: usize = 64;
@@ -53,193 +45,58 @@ pub fn refusal(
     signature: &[u8],
     now: SystemTime,
 ) -> Option<TransactionError> {
-    if let Some(refusal) = validity_refusal(certificate_der, now) {
-        return Some(refusal);
+    let certificate = match Certificate::from_der(certificate_der) {
+        Ok(certificate) => certificate,
+        Err(X509Error::InvalidTime) => {
+            return Some(TransactionError::bad_request(
+                "serverCert has no readable validity window",
+            ));
+        }
+        Err(_) => {
+            return Some(TransactionError::bad_request("serverCert is not DER X.509"));
+        }
+    };
+    let Ok(now) = time::system_date_time(now) else {
+        return Some(TransactionError::internal_error("read the system clock"));
+    };
+    if now < certificate.not_before || now > certificate.not_after {
+        return Some(TransactionError::forbidden(
+            "serverCert is not currently valid",
+        ));
     }
     match algorithm {
-        "RS256" => rsa_refusal(certificate_der, signing_input, signature),
-        "ES256" => ec_refusal(certificate_der, signing_input, signature),
+        "RS256" => rsa_refusal(certificate.spki, signing_input, signature),
+        "ES256" => ec_refusal(certificate.spki, signing_input, signature),
         other => Some(TransactionError::bad_request(format!(
             "unsupported JWS algorithm {other}"
         ))),
     }
 }
 
-/// Why the validity window cannot be read.
-enum WindowFailure {
-    /// The bytes are not a certificate reaching a validity.
-    Malformed,
-    /// The window's times do not parse.
-    Unreadable,
-}
-
-/// Why the certificate's validity window refuses `now`, or `None`.
-///
-/// The window is the two Time fields of TBSCertificate (RFC 5280
-/// sec.4.1.2.5), located positionally: optional version, serial,
-/// signature algorithm, issuer, then validity.
-fn validity_refusal(certificate_der: &[u8], now: SystemTime) -> Option<TransactionError> {
-    let (start, end) = match validity_window(certificate_der) {
-        Ok(window) => window,
-        Err(WindowFailure::Malformed) => {
-            return Some(TransactionError::bad_request("serverCert is not DER X.509"));
-        }
-        Err(WindowFailure::Unreadable) => {
-            return Some(TransactionError::bad_request(
-                "serverCert has no readable validity window",
-            ));
-        }
-    };
-    let now = match time::system_unix(now) {
-        Ok(now) => now,
-        Err(_) => return Some(TransactionError::internal_error("read the system clock")),
-    };
-    if now < start || now > end {
-        return Some(TransactionError::forbidden(
-            "serverCert is not currently valid",
-        ));
-    }
-    None
-}
-
-/// The validity window as unix seconds.
-fn validity_window(certificate_der: &[u8]) -> Result<(i64, i64), WindowFailure> {
-    let certificate = BerTlvAny::parse(certificate_der).map_err(|_| WindowFailure::Malformed)?;
-    if certificate.tag() != TAG_SEQUENCE {
-        return Err(WindowFailure::Malformed);
-    }
-    let outer = child_values(certificate.value()).ok_or(WindowFailure::Malformed)?;
-    let tbs = outer.first().ok_or(WindowFailure::Malformed)?;
-    let children = child_values(tbs.value()).ok_or(WindowFailure::Malformed)?;
-    let mut cursor = children.as_slice();
-    if matches!(cursor.first(), Some(first) if first.tag() == TAG_EXPLICIT_ZERO) {
-        cursor = cursor.get(1..).ok_or(WindowFailure::Malformed)?;
-    }
-    let [_serial, _signature_algorithm, _issuer, validity, ..] = cursor else {
-        return Err(WindowFailure::Malformed);
-    };
-    let window = child_values(validity.value()).ok_or(WindowFailure::Malformed)?;
-    let [not_before, not_after] = window.as_slice() else {
-        return Err(WindowFailure::Malformed);
-    };
-    let start = time::parse_time(not_before.tag(), not_before.value())
-        .map_err(|_| WindowFailure::Unreadable)?;
-    let end = time::parse_time(not_after.tag(), not_after.value())
-        .map_err(|_| WindowFailure::Unreadable)?;
-    Ok((start, end))
-}
-
-/// The children of a constructed value, or `None` when the value is
-/// not a clean child sequence.
-fn child_values(value: &[u8]) -> Option<Vec<BerTlvAny<'_>>> {
-    let mut children = Vec::new();
-    let mut rest = value;
-    while !rest.is_empty() {
-        let child = BerTlvAny::parse(rest).ok()?;
-        children.push(child);
-        rest = rest.get(child.size()..)?;
-    }
-    Some(children)
-}
-
-/// TBSCertificate children before the subjectPublicKeyInfo:
-/// serial, signature algorithm, issuer, validity, subject.
-const TBS_CHILDREN_BEFORE_SPKI: usize = 5;
-
-/// The certificate's DER SPKI, located positionally after the
-/// version, serial, signature algorithm, issuer, validity, and
-/// subject.
-fn spki_der(certificate_der: &[u8]) -> Option<Vec<u8>> {
-    let certificate = BerTlvAny::parse(certificate_der).ok()?;
-    if certificate.tag() != TAG_SEQUENCE {
-        return None;
-    }
-    let outer = child_values(certificate.value())?;
-    let tbs = outer.first()?;
-    let mut rest = tbs.value();
-    if let Ok(first) = BerTlvAny::parse(rest) {
-        if first.tag() == TAG_EXPLICIT_ZERO {
-            rest = rest.get(first.size()..)?;
-        }
-    } else {
-        return None;
-    }
-    for _ in 0..TBS_CHILDREN_BEFORE_SPKI {
-        let child = BerTlvAny::parse(rest).ok()?;
-        rest = rest.get(child.size()..)?;
-    }
-    let spki = BerTlvAny::parse(rest).ok()?;
-    rest.get(..spki.size()).map(<[u8]>::to_vec)
-}
-
 /// Verify an RS256 JWS against the certificate's RSA key.
 fn rsa_refusal(
-    certificate_der: &[u8],
+    spki: SpkiDer<'_>,
     signing_input: &[u8],
     signature: &[u8],
 ) -> Option<TransactionError> {
-    let spki = match spki_der(certificate_der) {
-        Some(spki) => spki,
-        None => return Some(TransactionError::bad_request("serverCert is not DER X.509")),
-    };
-    match rsa_verify(&spki, signing_input, signature) {
-        None => Some(TransactionError::bad_request("serverCert is not DER X.509")),
-        Some(false) => Some(TransactionError::forbidden(
-            "begin transaction JWS signature is invalid",
-        )),
-        Some(true) => None,
+    match spki.verify_message_signature(
+        MessageSignatureAlgorithm::RsaPkcs1Sha256,
+        signing_input,
+        signature,
+    ) {
+        Ok(()) => None,
+        Err(VerifyError::BadIssuerKey) => {
+            Some(TransactionError::bad_request("serverCert is not DER X.509"))
+        }
+        Err(VerifyError::Rsa(_) | VerifyError::Ecdsa(_) | VerifyError::Unsupported(_)) => Some(
+            TransactionError::forbidden("begin transaction JWS signature is invalid"),
+        ),
     }
-}
-
-/// The RSA key of an SPKI, or `None` when the SPKI does not carry
-/// one.
-fn rsa_key(spki_der: &[u8]) -> Option<refineid_cms::rsa::RsaPublicKey> {
-    use spki::der::Decode as _;
-    let info = spki::SubjectPublicKeyInfoRef::from_der(spki_der).ok()?;
-    if info.algorithm.oid.as_bytes() != refineid_cms::oid::known::RSA_ENCRYPTION.as_bytes() {
-        return None;
-    }
-    let bits = info.subject_public_key.as_bytes()?;
-    let sequence = BerTlvAny::parse(bits).ok()?;
-    if sequence.tag() != TAG_SEQUENCE {
-        return None;
-    }
-    let children = child_values(sequence.value())?;
-    let [modulus, exponent] = children.as_slice() else {
-        return None;
-    };
-    if modulus.tag() != TAG_INTEGER || exponent.tag() != TAG_INTEGER {
-        return None;
-    }
-    let key = refineid_cms::rsa::RsaPublicKey {
-        modulus: refineid_cms::rsa::RsaModulus::try_from_pkcs1(strip_sign_byte(modulus.value()))
-            .ok()?,
-        exponent: refineid_cms::rsa::RsaPublicExponent::try_from_pkcs1(strip_sign_byte(
-            exponent.value(),
-        ))
-        .ok()?,
-    };
-    Some(key)
-}
-
-/// Verify the RS256 signature; `None` when the key does not parse.
-fn rsa_verify(spki_der: &[u8], signing_input: &[u8], signature: &[u8]) -> Option<bool> {
-    let key = rsa_key(spki_der)?;
-    let signature = refineid_cms::container::Signature::new(signature.to_vec());
-    Some(
-        key.verify_pkcs1v15_sha256(signing_input, &signature)
-            .is_ok(),
-    )
-}
-
-/// Strip the DER INTEGER sign byte, when present.
-fn strip_sign_byte(content: &[u8]) -> &[u8] {
-    content.strip_prefix(&[0]).unwrap_or(content)
 }
 
 /// Verify an ES256 JWS against the certificate's P-256 key.
 fn ec_refusal(
-    certificate_der: &[u8],
+    spki: SpkiDer<'_>,
     signing_input: &[u8],
     signature: &[u8],
 ) -> Option<TransactionError> {
@@ -248,30 +105,29 @@ fn ec_refusal(
             "ES256 signature is not raw r||s",
         ));
     }
-    let spki = match spki_der(certificate_der) {
-        Some(spki) => spki,
-        None => return Some(TransactionError::bad_request("serverCert is not DER X.509")),
-    };
-    let key = match crate::codec::p256_spki_key(&spki) {
-        Ok(key) => key,
-        Err(()) => return Some(TransactionError::bad_request("serverCert is not DER X.509")),
-    };
-    let verifying =
-        match p256::ecdsa::VerifyingKey::from_sec1_bytes(key.to_sec1_point(false).as_bytes()) {
-            Ok(verifying) => verifying,
-            Err(_) => return Some(TransactionError::bad_request("serverCert is not DER X.509")),
-        };
-    let signature = match p256::ecdsa::Signature::from_slice(signature) {
-        Ok(signature) => signature,
-        Err(_) => {
-            return Some(TransactionError::bad_request(
-                "ES256 signature is not raw r||s",
-            ));
-        }
-    };
-    match verifying.verify(signing_input, &signature) {
+    if spki.algorithm() != PublicKeyAlgorithm::Ec(EcCurve::Secp256r1) {
+        return Some(TransactionError::bad_request("serverCert is not DER X.509"));
+    }
+    match spki.verify_message_signature(
+        MessageSignatureAlgorithm::EcdsaSha256Raw,
+        signing_input,
+        signature,
+    ) {
         Ok(()) => None,
-        Err(_) => Some(TransactionError::forbidden(
+        Err(
+            VerifyError::BadIssuerKey
+            | VerifyError::Ecdsa(EcdsaError::BadModulus | EcdsaError::BadPublicKey),
+        ) => Some(TransactionError::bad_request("serverCert is not DER X.509")),
+        Err(VerifyError::Ecdsa(
+            EcdsaError::BadSignature | EcdsaError::SigOutOfRange | EcdsaError::NotInvertible,
+        )) => Some(TransactionError::bad_request(
+            "ES256 signature is not raw r||s",
+        )),
+        Err(
+            VerifyError::Ecdsa(EcdsaError::VerifyFailed)
+            | VerifyError::Rsa(_)
+            | VerifyError::Unsupported(_),
+        ) => Some(TransactionError::forbidden(
             "begin transaction JWS signature is invalid",
         )),
     }
@@ -286,6 +142,9 @@ mod tests {
 
     /// Unix seconds of 2023-11-14T22:13:20Z, inside every test window.
     const TEST_NOW_SECONDS: u64 = 1_700_000_000;
+
+    /// Byte value exceeding the P-256 curve order when repeated across a scalar.
+    const ALL_ONES_BYTE: u8 = u8::MAX;
 
     /// A moment inside the test windows.
     fn test_now() -> std::time::SystemTime {
@@ -349,8 +208,8 @@ mod tests {
         );
     }
 
-    /// Unknown algorithms and malformed certificates are refused as
-    /// bad requests.
+    /// Unknown algorithms, malformed or trailing-byte certificates, key-type
+    /// mismatches, and out-of-range raw scalars are refused cleanly.
     #[test]
     fn unknown_algorithm_and_malformed_cert_are_refused() {
         let minted = test_support::mint_certificate();
@@ -376,11 +235,152 @@ mod tests {
             ),
             Some(TransactionError::bad_request("serverCert is not DER X.509"))
         );
+        let mut trailing = minted.der.clone();
+        trailing.push(0);
+        assert_eq!(
+            refusal(
+                "ES256",
+                &trailing,
+                b"in",
+                &[0_u8; super::ES256_SIGNATURE_LENGTH],
+                test_now()
+            ),
+            Some(TransactionError::bad_request("serverCert is not DER X.509"))
+        );
+        // RS256 against a P-256 certificate is rejected as a key mismatch.
+        assert_eq!(
+            refusal(
+                "RS256",
+                &minted.der,
+                b"in",
+                &[0_u8; super::ES256_SIGNATURE_LENGTH],
+                test_now()
+            ),
+            Some(TransactionError::bad_request("serverCert is not DER X.509"))
+        );
         assert_eq!(
             refusal("ES256", &minted.der, b"in", b"short", test_now()),
             Some(TransactionError::bad_request(
                 "ES256 signature is not raw r||s"
             ))
+        );
+        assert_eq!(
+            refusal(
+                "ES256",
+                &minted.der,
+                b"in",
+                &[0_u8; super::ES256_SIGNATURE_LENGTH],
+                test_now()
+            ),
+            Some(TransactionError::bad_request(
+                "ES256 signature is not raw r||s"
+            ))
+        );
+        assert_eq!(
+            refusal(
+                "ES256",
+                &minted.der,
+                b"in",
+                &[ALL_ONES_BYTE; super::ES256_SIGNATURE_LENGTH],
+                test_now()
+            ),
+            Some(TransactionError::bad_request(
+                "ES256 signature is not raw r||s"
+            ))
+        );
+    }
+
+    /// Invalid validity windows and pre-epoch clocks return their distinct refusals.
+    #[test]
+    fn unreadable_validity_and_pre_epoch_clock_are_refused() {
+        let malformed_time =
+            test_support::mint_certificate_window("230229000000Z", "400101000000Z");
+        assert_eq!(
+            refusal(
+                "ES256",
+                &malformed_time.der,
+                b"in",
+                &[0_u8; super::ES256_SIGNATURE_LENGTH],
+                test_now()
+            ),
+            Some(TransactionError::bad_request(
+                "serverCert has no readable validity window"
+            ))
+        );
+        let minted = test_support::mint_certificate();
+        assert_eq!(
+            refusal(
+                "ES256",
+                &minted.der,
+                b"in",
+                &[0_u8; super::ES256_SIGNATURE_LENGTH],
+                UNIX_EPOCH - Duration::from_secs(1)
+            ),
+            Some(TransactionError::internal_error("read the system clock"))
+        );
+    }
+
+    /// RS256 verifies over a valid RSA certificate, rejects wrong RSA
+    /// signatures as 403, and ES256 rejects non-P-256 certificates as 400.
+    #[test]
+    fn rs256_and_curve_mismatch_paths() {
+        use refineid_cms::testkit::{self, CertificateSpec, TestCurve, TestKey};
+
+        /// First day of the testkit month (2026-06-01T12:00:00Z).
+        const FIRST_DAY: u8 = 1;
+        /// Last day of the testkit window (2026-06-20T12:00:00Z).
+        const LAST_DAY: u8 = 20;
+        /// Unix seconds of 2026-06-10T12:00:00Z, inside the testkit window.
+        const KIT_NOW_SECONDS: u64 = 1_781_092_800;
+
+        let now = UNIX_EPOCH + Duration::from_secs(KIT_NOW_SECONDS);
+        let spec = CertificateSpec {
+            serial: 1,
+            subject: "scs-rsa-test",
+            issuer: "scs-rsa-test",
+            not_before: testkit::day(FIRST_DAY),
+            not_after: testkit::day(LAST_DAY),
+            extensions: Vec::new(),
+        };
+
+        let rsa_key = TestKey::rsa_2048();
+        let rsa_cert = testkit::certificate(&spec, &rsa_key, &rsa_key);
+        let signing_input = b"header.payload";
+        let valid_rsa_sig = rsa_key.sign(signing_input);
+        assert_eq!(
+            refusal("RS256", &rsa_cert, signing_input, &valid_rsa_sig, now),
+            None
+        );
+
+        let wrong_rsa_sig = rsa_key.sign(b"other.payload");
+        assert_eq!(
+            refusal("RS256", &rsa_cert, signing_input, &wrong_rsa_sig, now),
+            Some(TransactionError::forbidden(
+                "begin transaction JWS signature is invalid"
+            ))
+        );
+        assert_eq!(
+            refusal(
+                "ES256",
+                &rsa_cert,
+                signing_input,
+                &[1_u8; super::ES256_SIGNATURE_LENGTH],
+                now
+            ),
+            Some(TransactionError::bad_request("serverCert is not DER X.509"))
+        );
+
+        let p384_key = TestKey::derive(TestCurve::P384, b"scs-p384-mismatch");
+        let p384_cert = testkit::certificate(&spec, &p384_key, &p384_key);
+        assert_eq!(
+            refusal(
+                "ES256",
+                &p384_cert,
+                signing_input,
+                &[1_u8; super::ES256_SIGNATURE_LENGTH],
+                now
+            ),
+            Some(TransactionError::bad_request("serverCert is not DER X.509"))
         );
     }
 }

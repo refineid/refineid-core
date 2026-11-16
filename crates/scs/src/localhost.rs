@@ -275,22 +275,12 @@ mod tests {
             tbs.windows(after.len())
                 .any(|window| window == after.as_slice())
         );
-        // The signature verifies over the TBSCertificate.
-        let certificate = refineid_ber::BerTlvAny::parse(&der).expect("parses");
-        let signature_bits = {
-            let mut rest = certificate.value();
-            let mut last = Vec::new();
-            while !rest.is_empty() {
-                let child = refineid_ber::BerTlvAny::parse(rest).expect("child");
-                last = child.value().to_vec();
-                rest = rest.get(child.size()..).expect("advance");
-            }
-            last
-        };
-        let signature_der = signature_bits
-            .strip_prefix(&[0])
-            .expect("unused-bits octet");
-        let signature = p256::ecdsa::Signature::from_der(signature_der).expect("DER signature");
+        // The certificate parses under RFC 5280 and its signature
+        // verifies over the TBSCertificate.
+        let parsed =
+            refineid_cms::x509::Certificate::from_der(&der).expect("parses as RFC 5280 X.509");
+        let signature = p256::ecdsa::Signature::from_der(parsed.signature_bits.as_bytes())
+            .expect("DER signature");
         key.verifying_key()
             .verify(&tbs, &signature)
             .expect("verifies");

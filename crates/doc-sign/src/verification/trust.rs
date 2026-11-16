@@ -1199,18 +1199,18 @@ fn crl_answer(
     }
 }
 
-/// Whether `crl` can speak for `certificate`: it lists the serial, so
-/// a revocation is possible whatever the window, or it names the
-/// certificate's issuer, is not stale at its own `thisUpdate`, and a
-/// good answer from it would be current at `at`. The cheap, unverified
-/// relevance screening [`crl_answer`] applies before it spends a
-/// signature verification; it decides where verification effort goes,
-/// never what counts.
+/// Whether `crl` can speak for `certificate`: it names the
+/// certificate's issuer and is not stale at its own `thisUpdate`, and
+/// either it lists the serial, so a revocation counts whatever the
+/// window, or a good answer from it would be current at `at`. The
+/// cheap, unverified relevance screening [`crl_answer`] applies before
+/// it spends a signature verification; it decides where verification
+/// effort goes, so the budget is spent on answers that could count.
 fn crl_speaks_for(crl: &Crl<'_>, certificate: Certificate<'_>, when: When) -> bool {
-    crl.find_serial(&certificate.serial()).is_some()
-        || (crl.issuer == certificate.issuer
-            && crl.next_update.is_none_or(|next| crl.this_update <= next)
-            && accepted_window(certificate, crl.this_update, crl.next_update, when))
+    crl.issuer == certificate.issuer
+        && crl.next_update.is_none_or(|next| crl.this_update <= next)
+        && (crl.find_serial(&certificate.serial()).is_some()
+            || accepted_window(certificate, crl.this_update, crl.next_update, when))
 }
 
 /// Whether a good answer with this window speaks for `certificate` at
@@ -3085,20 +3085,97 @@ mod tests {
         let issuer = OwnedCert::from_der(&chain.intermediate).expect("intermediate parses");
         let junk_key = TestKey::derive(TestCurve::P256, b"junk");
         let attacker_key = TestKey::derive(TestCurve::P256, b"attacker");
-        let mut pool = chain.pool();
-        pool.add_certificate_ders(&junk_certificates(&junk_key, JUNK_CERTIFICATES));
-        let mut responses = junk_responses(
-            &attacker_key,
-            &issuer,
-            SIGNER_SERIAL,
-            JUNK_RESPONSES,
+        for responder in [
             ResponderName::ByName(JUNK_RESPONDER),
-        );
-        responses.push(chain.ocsp(true, ANSWERED, Some(ENDS)));
+            ResponderName::ByKey(&junk_key),
+        ] {
+            let mut pool = chain.pool();
+            pool.add_certificate_ders(&junk_certificates(&junk_key, JUNK_CERTIFICATES));
+            let mut responses = junk_responses(
+                &attacker_key,
+                &issuer,
+                SIGNER_SERIAL,
+                JUNK_RESPONSES,
+                responder,
+            );
+            responses.push(chain.ocsp(true, ANSWERED, Some(ENDS)));
+            pool.add_material(&ValidationMaterial {
+                certificates: Vec::new(),
+                ocsp_responses: responses,
+                crls: Vec::new(),
+            });
+            let mut budget = RevocationBudget::new();
+            let responders = ResponderIndex::of_pool(&pool);
+            let revocation = pool.revocation_of(
+                chain.signer.view(),
+                issuer.view(),
+                at(VALIDATED),
+                &mut budget,
+                &responders,
+            );
+            // The pool is the document's to order; junk first reads
+            // like the genuine answer omitted, never like a better
+            // answer.
+            assert_eq!(revocation, Revocation::Unavailable);
+            assert_eq!(budget.spent(), MAX_REVOCATION_VERIFICATIONS);
+        }
+    }
+
+    #[test]
+    fn a_response_whose_signer_is_nowhere_costs_no_verification() {
+        let chain = chain(ENDS);
+        let issuer = OwnedCert::from_der(&chain.intermediate).expect("intermediate parses");
+        let attacker_key = TestKey::derive(TestCurve::P256, b"attacker");
+        // Relevant entries, so the screen passes, but a `ResponderID`
+        // no pooled certificate carries and the issuer does not match.
+        for responder in [
+            ResponderName::ByName("Unknown Responder"),
+            ResponderName::ByKey(&attacker_key),
+        ] {
+            let mut pool = chain.pool();
+            pool.add_material(&ValidationMaterial {
+                certificates: Vec::new(),
+                ocsp_responses: junk_responses(
+                    &attacker_key,
+                    &issuer,
+                    SIGNER_SERIAL,
+                    JUNK_RESPONSES,
+                    responder,
+                ),
+                crls: Vec::new(),
+            });
+            let mut budget = RevocationBudget::new();
+            let responders = ResponderIndex::of_pool(&pool);
+            let revocation = pool.revocation_of(
+                chain.signer.view(),
+                issuer.view(),
+                at(VALIDATED),
+                &mut budget,
+                &responders,
+            );
+            assert_eq!(revocation, Revocation::Unavailable);
+            assert_eq!(budget.spent(), 0, "a miss looks up nothing to try");
+        }
+    }
+
+    #[test]
+    fn a_listed_revocation_counts_whatever_the_window_but_a_stale_list_is_no_answer() {
+        let chain = chain(ENDS);
+        let issuer = OwnedCert::from_der(&chain.intermediate).expect("intermediate parses");
+        // A genuine list naming the signer, expired: the revocation
+        // counts, window or not.
+        let mut pool = chain.pool();
         pool.add_material(&ValidationMaterial {
             certificates: Vec::new(),
-            ocsp_responses: responses,
-            crls: Vec::new(),
+            ocsp_responses: Vec::new(),
+            crls: junk_crls(
+                INTERMEDIATE,
+                &chain.intermediate_key,
+                SIGNER_SERIAL,
+                ISSUED,
+                Some(ENDED_EARLY),
+                1,
+            ),
         });
         let mut budget = RevocationBudget::new();
         let responders = ResponderIndex::of_pool(&pool);
@@ -3109,10 +3186,109 @@ mod tests {
             &mut budget,
             &responders,
         );
-        // The pool is the document's to order; junk first reads like
-        // the genuine answer omitted, never like a better answer.
+        assert_eq!(
+            revocation,
+            Revocation::Revoked {
+                at: day(REVOKED),
+                reason: None
+            }
+        );
+        assert_eq!(budget.spent(), 1);
+
+        // A genuine list naming the signer, with no `nextUpdate`.
+        let mut pool = chain.pool();
+        pool.add_material(&ValidationMaterial {
+            certificates: Vec::new(),
+            ocsp_responses: Vec::new(),
+            crls: junk_crls(
+                INTERMEDIATE,
+                &chain.intermediate_key,
+                SIGNER_SERIAL,
+                ANSWERED,
+                None,
+                1,
+            ),
+        });
+        let mut budget = RevocationBudget::new();
+        let responders = ResponderIndex::of_pool(&pool);
+        let revocation = pool.revocation_of(
+            chain.signer.view(),
+            issuer.view(),
+            at(VALIDATED),
+            &mut budget,
+            &responders,
+        );
+        assert_eq!(
+            revocation,
+            Revocation::Revoked {
+                at: day(REVOKED),
+                reason: None
+            }
+        );
+        assert_eq!(budget.spent(), 1);
+
+        // Self-stale lists, genuine signatures or not: stale is
+        // decided before entries, so neither verifies.
+        let mut pool = chain.pool();
+        let mut lists = junk_crls(
+            INTERMEDIATE,
+            &chain.intermediate_key,
+            SIGNER_SERIAL,
+            ANSWERED,
+            Some(ISSUED),
+            1,
+        );
+        lists.extend(junk_crls(
+            INTERMEDIATE,
+            &chain.intermediate_key,
+            ELSEWHERE_SERIAL,
+            ANSWERED,
+            Some(ISSUED),
+            1,
+        ));
+        pool.add_material(&ValidationMaterial {
+            certificates: Vec::new(),
+            ocsp_responses: Vec::new(),
+            crls: lists,
+        });
+        let mut budget = RevocationBudget::new();
+        let responders = ResponderIndex::of_pool(&pool);
+        let revocation = pool.revocation_of(
+            chain.signer.view(),
+            issuer.view(),
+            at(VALIDATED),
+            &mut budget,
+            &responders,
+        );
         assert_eq!(revocation, Revocation::Unavailable);
-        assert_eq!(budget.spent(), MAX_REVOCATION_VERIFICATIONS);
+        assert_eq!(budget.spent(), 0);
+
+        // A post-dated list the issuer genuinely signed: its window
+        // speaks for nothing.
+        let mut pool = chain.pool();
+        pool.add_material(&ValidationMaterial {
+            certificates: Vec::new(),
+            ocsp_responses: Vec::new(),
+            crls: junk_crls(
+                INTERMEDIATE,
+                &chain.intermediate_key,
+                ELSEWHERE_SERIAL,
+                VALIDATED + 1,
+                Some(ENDS),
+                1,
+            ),
+        });
+        let mut budget = RevocationBudget::new();
+        let responders = ResponderIndex::of_pool(&pool);
+        let revocation = pool.revocation_of(
+            chain.signer.view(),
+            issuer.view(),
+            at(VALIDATED),
+            &mut budget,
+            &responders,
+        );
+        assert_eq!(revocation, Revocation::Unavailable);
+        assert_eq!(budget.spent(), 0);
     }
 
     #[test]

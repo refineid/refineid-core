@@ -929,8 +929,9 @@ impl BasicOcspResponse<'_> {
     /// Whether any entry names `certificate` under `issuer`: the cheap,
     /// unverified relevance screening the trust judgement applies before
     /// it spends a signature verification on this response. It decides
-    /// where verification effort goes, never what counts: a status is
-    /// read only from a [`VerifiedOcspResponse`].
+    /// where verification effort goes, so the budget is spent on
+    /// answers that could count: a status is read only from a
+    /// [`VerifiedOcspResponse`].
     #[must_use]
     pub(crate) fn carries_status_for(
         &self,

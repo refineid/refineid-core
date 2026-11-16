@@ -213,7 +213,7 @@ impl OcspNonce {
 /// `ResponderID.byKey` (RFC 6960 sec.4.2.1): SHA-1 of the responder's
 /// `subjectPublicKey` BIT STRING value, which the response names its
 /// signer by.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ResponderKeyHash([u8; SHA1_LEN]);
 
 impl ResponderKeyHash {

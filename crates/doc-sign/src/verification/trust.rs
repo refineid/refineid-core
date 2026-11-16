@@ -44,13 +44,17 @@
 //! - RFC 5280 sec.5: a CRL counts only when the issuer signed it
 //!   ([`VerifiedCrl::verify`]).
 
-use crate::crl::{CrlReason, OwnedCrl, VerifiedCrl};
-use crate::ocsp::{CertStatus, OcspResponseStatus, OwnedOcspResponse, VerifiedOcspResponse};
+use crate::crl::{Crl, CrlReason, OwnedCrl, VerifiedCrl};
+use crate::ocsp::{
+    CertStatus, OcspResponseStatus, OwnedOcspResponse, ResponderId, ResponderKeyHash,
+    VerifiedOcspResponse,
+};
 use crate::revocation::{RevocationStatus, check_against_crl};
 use crate::validation::ValidationMaterial;
+use crate::x509_ext::CertificateExt as _;
 use refineid_cms::x509::{Certificate, DateTime, OwnedCert, path_extension_profile};
 use refineid_digest::{SHA256_LEN, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Most certificates searched above the signer before a path is
 /// abandoned. RFC 5280 sets no bound; a FINEID path is signer,
@@ -729,20 +733,24 @@ impl MaterialPool {
     /// when any says so, else good when any accepted answer says so.
     ///
     /// Every signature verification is paid from `budget`; past it the
-    /// remaining answers are no answers.
+    /// remaining answers are no answers. Pooled response signers come
+    /// from `index`.
     fn revocation_of(
         &self,
         certificate: Certificate<'_>,
         issuer: Certificate<'_>,
         when: When,
         budget: &mut RevocationBudget,
+        index: &ResponderIndex<'_>,
     ) -> Revocation {
         let mut answers = Vec::new();
         for response in &self.ocsp_responses {
             if budget.is_spent() {
                 break;
             }
-            if let Some(answer) = self.ocsp_answer(response, certificate, issuer, when, budget) {
+            if let Some(answer) =
+                self.ocsp_answer(response, certificate, issuer, when, budget, index)
+            {
                 answers.push(answer);
             }
         }
@@ -761,12 +769,14 @@ impl MaterialPool {
     /// with every certificate below the anchor checked against its
     /// issuer (RFC 5280 sec.6.1.3 (a)(3)).
     ///
-    /// Every revocation verification is paid from `budget`.
+    /// Every revocation verification is paid from `budget`, and pooled
+    /// response signers come from `index`.
     fn judge_path<'a>(
         &self,
         path: &'a [OwnedCert],
         when: When,
         budget: &mut RevocationBudget,
+        index: &ResponderIndex<'_>,
     ) -> JudgedPath<'a> {
         let steps = path
             .windows(2)
@@ -774,7 +784,7 @@ impl MaterialPool {
                 let [certificate, issuer] = step else {
                     return None;
                 };
-                Some(self.revocation_of(certificate.view(), issuer.view(), when, budget))
+                Some(self.revocation_of(certificate.view(), issuer.view(), when, budget, index))
             })
             .collect();
         JudgedPath { path, steps }
@@ -787,8 +797,11 @@ impl MaterialPool {
     /// Responses that carry no entry for `certificate` under `issuer`
     /// cost no verification; each signer tried for the rest is paid
     /// from `budget`, and past it the response is no answer. The
-    /// entries name certificates under `issuer`, not under the signer,
-    /// so the first signer that verifies decides.
+    /// issuer and the embedded certificates are matched by
+    /// `ResponderID` directly, the pooled signers through `index`,
+    /// which holds the same matches in pool order. The entries name
+    /// certificates under `issuer`, not under the signer, so the first
+    /// signer that verifies decides.
     fn ocsp_answer(
         &self,
         response: &OwnedOcspResponse,
@@ -796,6 +809,7 @@ impl MaterialPool {
         issuer: Certificate<'_>,
         when: When,
         budget: &mut RevocationBudget,
+        index: &ResponderIndex<'_>,
     ) -> Option<Answer> {
         let view = response.view();
         if view.status != OcspResponseStatus::Successful {
@@ -809,12 +823,11 @@ impl MaterialPool {
             .embedded_cert_ders
             .iter()
             .filter_map(|der| Certificate::from_der(der).ok());
-        let pooled = self.certificates.iter().map(OwnedCert::view);
-        for candidate in core::iter::once(issuer)
+        let direct = core::iter::once(issuer)
             .chain(embedded)
-            .chain(pooled)
-            .filter(|candidate| basic.responder_id.matches_certificate(*candidate))
-        {
+            .filter(|candidate| basic.responder_id.matches_certificate(*candidate));
+        let pooled = index.matching(basic.responder_id).iter().copied();
+        for candidate in direct.chain(pooled) {
             if !budget.spend() {
                 break;
             }
@@ -887,11 +900,11 @@ impl SearchBudget {
     }
 }
 
-/// The signature verifications a judgement may still spend on
-/// revocation answers, from [`MAX_REVOCATION_VERIFICATIONS`].
+/// The answer checks a judgement may still spend, from
+/// [`MAX_REVOCATION_VERIFICATIONS`].
 #[derive(Debug)]
 struct RevocationBudget {
-    /// Verifications left.
+    /// Checks left.
     remaining: usize,
 }
 
@@ -903,7 +916,7 @@ impl RevocationBudget {
         }
     }
 
-    /// Pay for one verification; `false`, paying nothing, when the
+    /// Pay for one answer's check; `false`, paying nothing, when the
     /// budget is spent.
     const fn spend(&mut self) -> bool {
         let Some(remaining) = self.remaining.checked_sub(1) else {
@@ -913,15 +926,52 @@ impl RevocationBudget {
         true
     }
 
-    /// Whether no verification is left.
+    /// Whether no check is left.
     const fn is_spent(&self) -> bool {
         self.remaining == 0
     }
 
-    /// The verifications paid so far.
+    /// The checks paid so far.
     #[cfg(test)]
     const fn spent(&self) -> usize {
         MAX_REVOCATION_VERIFICATIONS - self.remaining
+    }
+}
+
+/// The pool certificates indexed by the `ResponderID`s that select
+/// them, built once per judgement: finding a response's pooled signers
+/// is a lookup, not a scan that re-parses every pooled certificate —
+/// and hashes every key for `byKey` — per response per step.
+struct ResponderIndex<'a> {
+    /// Pooled certificates by encoded subject name, in pool order.
+    by_name: HashMap<&'a [u8], Vec<Certificate<'a>>>,
+    /// Pooled certificates by responder key hash, in pool order.
+    by_key: HashMap<ResponderKeyHash, Vec<Certificate<'a>>>,
+}
+
+impl<'a> ResponderIndex<'a> {
+    /// Every pool certificate under both its identities.
+    fn of_pool(pool: &'a MaterialPool) -> Self {
+        let mut by_name: HashMap<&'a [u8], Vec<Certificate<'a>>> = HashMap::new();
+        let mut by_key: HashMap<ResponderKeyHash, Vec<Certificate<'a>>> = HashMap::new();
+        for certificate in &pool.certificates {
+            let view = certificate.view();
+            by_name.entry(view.subject.as_der()).or_default().push(view);
+            by_key
+                .entry(ResponderKeyHash::from_subject_public_key(&view.spki))
+                .or_default()
+                .push(view);
+        }
+        Self { by_name, by_key }
+    }
+
+    /// The pooled certificates `id` selects, in pool order: the same
+    /// matches a scan with [`ResponderId::matches_certificate`] finds.
+    fn matching(&self, id: ResponderId<'_>) -> &[Certificate<'a>] {
+        match id {
+            ResponderId::ByName(name) => self.by_name.get(name.as_der()).map_or(&[], Vec::as_slice),
+            ResponderId::ByKey(hash) => self.by_key.get(&hash).map_or(&[], Vec::as_slice),
+        }
     }
 }
 
@@ -956,17 +1006,18 @@ const MAX_ANCHORED_PATHS: usize = 16;
 /// path, signer, intermediate, root, costs two.
 const MAX_PATH_SEARCH_VERIFICATIONS: usize = MAX_ANCHORED_PATHS * MAX_PATH_DEPTH;
 
-/// Most signature verifications one judgement spends on revocation
-/// answers. The pool is filled from the document, so the answers are
-/// the document's to choose: responses that name the judged
-/// certificate but are signed by another key are each tried against
-/// every certificate the `ResponderID` selects, multiplying responses
-/// by signers at every step. Each genuine step needs one or two
-/// verifications, so the budget pays for [`MAX_ANCHORED_PATHS`] paths
-/// of [`MAX_PATH_DEPTH`] steps each, every step checking one OCSP
-/// answer and one CRL and sharing nothing; a FINEID judgement, signer
-/// and intermediate, costs a few. Answers past the budget are no
-/// answers, as if the evidence lacked them.
+/// Most revocation answers one judgement checks signatures for. The
+/// pool is filled from the document, so the answers are the document's
+/// to choose: responses that name the judged certificate but are
+/// signed by another key are each tried against every certificate the
+/// `ResponderID` selects, multiplying responses by signers at every
+/// step. One unit of budget pays for one answer — an OCSP response
+/// signature with its delegation check, or one CRL signature — and the
+/// budget pays for [`MAX_ANCHORED_PATHS`] paths of [`MAX_PATH_DEPTH`]
+/// certificates each, every step checking one OCSP answer and one CRL
+/// and sharing nothing; a FINEID judgement, signer and intermediate,
+/// costs a few units. Answers past the budget are no answers, as if
+/// the evidence lacked them.
 const MAX_REVOCATION_VERIFICATIONS: usize = MAX_ANCHORED_PATHS * MAX_PATH_DEPTH * 2;
 
 /// Judge `certificate` against `pool` and `anchors` for `role` at the
@@ -989,10 +1040,10 @@ const MAX_REVOCATION_VERIFICATIONS: usize = MAX_ANCHORED_PATHS * MAX_PATH_DEPTH 
 /// `MAX_PATH_SEARCH_VERIFICATIONS` signature verifications, and the
 /// partial path as many again; a spent budget leaves paths unfound and
 /// never anchors one the evidence does not verify. Revocation answers
-/// are screened for relevance before any signature is verified, and at
-/// most `MAX_REVOCATION_VERIFICATIONS` verifications are spent on them
-/// per judgement; past that the remaining answers are no answers, as if
-/// the evidence lacked them. A certificate that
+/// are screened for relevance before any signature is verified, and
+/// checking them spends at most `MAX_REVOCATION_VERIFICATIONS` units
+/// of budget per judgement; past that the remaining answers are no
+/// answers, as if the evidence lacked them. A certificate that
 /// is itself such an anchor is anchored by its granted period alone, with
 /// nothing below it to check for revocation. Without an anchored path
 /// only the certificate is checked, against the first issuer of the
@@ -1039,9 +1090,10 @@ pub fn judge(
     pool.anchored_paths(anchors, role, at, &mut path, &mut paths, &mut budget);
     let search_exhausted = budget.is_spent();
     let mut revocation_budget = RevocationBudget::new();
+    let responders = ResponderIndex::of_pool(pool);
     let judged: Vec<JudgedPath<'_>> = paths
         .iter()
-        .map(|path| pool.judge_path(path, when, &mut revocation_budget))
+        .map(|path| pool.judge_path(path, when, &mut revocation_budget, &responders))
         .collect();
     let compromised: Vec<CompromisedKey> =
         judged.iter().flat_map(JudgedPath::compromises).collect();
@@ -1067,7 +1119,13 @@ pub fn judge(
         None => {
             let path = pool.partial_path(certificate, &step);
             let revocation = path.first().map_or(Revocation::Unavailable, |issuer| {
-                pool.revocation_of(view, issuer.view(), when, &mut revocation_budget)
+                pool.revocation_of(
+                    view,
+                    issuer.view(),
+                    when,
+                    &mut revocation_budget,
+                    &responders,
+                )
             });
             (path, revocation, None)
         }
@@ -1102,9 +1160,9 @@ fn fit_to_sign(certificate: Certificate<'_>) -> bool {
 /// What one CRL says about `certificate`, when `issuer` signed it and a
 /// good answer was current at `at`.
 ///
-/// Lists from another issuer cost no verification; the signature check
-/// for the rest is paid from `budget`, and past it the list is no
-/// answer.
+/// Lists that cannot speak for `certificate` cost no verification;
+/// the signature check for the rest is paid from `budget`, and past it
+/// the list is no answer.
 fn crl_answer(
     crl: &OwnedCrl,
     certificate: Certificate<'_>,
@@ -1114,6 +1172,9 @@ fn crl_answer(
 ) -> Option<Answer> {
     let view = crl.view();
     if view.issuer != issuer.subject {
+        return None;
+    }
+    if !crl_speaks_for(&view, certificate, when) {
         return None;
     }
     if !budget.spend() {
@@ -1136,6 +1197,20 @@ fn crl_answer(
         | RevocationStatus::NotYetValid
         | RevocationStatus::Unknown => None,
     }
+}
+
+/// Whether `crl` can speak for `certificate`: it lists the serial, so
+/// a revocation is possible whatever the window, or it names the
+/// certificate's issuer, is not stale at its own `thisUpdate`, and a
+/// good answer from it would be current at `at`. The cheap, unverified
+/// relevance screening [`crl_answer`] applies before it spends a
+/// signature verification; it decides where verification effort goes,
+/// never what counts.
+fn crl_speaks_for(crl: &Crl<'_>, certificate: Certificate<'_>, when: When) -> bool {
+    crl.find_serial(&certificate.serial()).is_some()
+        || (crl.issuer == certificate.issuer
+            && crl.next_update.is_none_or(|next| crl.this_update <= next)
+            && accepted_window(certificate, crl.this_update, crl.next_update, when))
 }
 
 /// Whether a good answer with this window speaks for `certificate` at
@@ -1235,14 +1310,14 @@ fn may_issue(certificate: Certificate<'_>, intermediates_below: usize) -> bool {
 mod tests {
     use super::{
         AnchorError, AnchorRole, ChainVerdict, GrantedPeriod, MAX_PATH_DEPTH,
-        MAX_PATH_SEARCH_VERIFICATIONS, MAX_REVOCATION_VERIFICATIONS, MaterialPool, Revocation,
-        RevocationBudget, SearchBudget, TrustAnchor, TrustAnchors, When, judge,
+        MAX_PATH_SEARCH_VERIFICATIONS, MAX_REVOCATION_VERIFICATIONS, MaterialPool, ResponderIndex,
+        Revocation, RevocationBudget, SearchBudget, TrustAnchor, TrustAnchors, When, judge,
     };
     use crate::crl::CrlReason;
     use crate::testkit::{
         BOOLEAN, CertificateSpec, DER_TRUE, INTEGER, OcspSpec, ResponderName, SEQUENCE, TestCurve,
         TestKey, ca_extensions, certificate, crl, crl_with_reason, day, extension, key_usage,
-        ocsp_response, tlv,
+        ocsp_responder_extensions, ocsp_response, tlv,
     };
     use crate::validation::ValidationMaterial;
     use refineid_cms::oid::known;
@@ -1334,6 +1409,10 @@ mod tests {
     /// Badly signed CRLs from the judged issuer's own name in the
     /// adversarial pool: more than [`MAX_REVOCATION_VERIFICATIONS`].
     const JUNK_CRLS: usize = 300;
+    /// Common name of the delegated OCSP responder.
+    const RESPONDER: &str = "Synthetic OCSP Responder";
+    /// The responder's serial, above every chain serial here.
+    const RESPONDER_SERIAL: u8 = 9;
 
     /// Root, intermediate and signer, each with its key.
     struct Chain {
@@ -2693,7 +2772,7 @@ mod tests {
             .collect()
     }
 
-    /// `responses` OCSP responses under [`JUNK_RESPONDER`], each naming
+    /// `responses` OCSP responses under `responder`, each naming
     /// `serial` under `issuer` but signed by `attacker_key`, which none
     /// of the junk certificates carries.
     fn junk_responses(
@@ -2701,12 +2780,13 @@ mod tests {
         issuer: &OwnedCert,
         serial: u8,
         responses: usize,
+        responder: ResponderName<'_>,
     ) -> Vec<Vec<u8>> {
         (0..responses)
             .map(|index| {
                 ocsp_response(&OcspSpec {
                     responder_key: attacker_key,
-                    responder: ResponderName::ByName(JUNK_RESPONDER),
+                    responder,
                     issuer,
                     serial,
                     revoked: None,
@@ -2723,15 +2803,23 @@ mod tests {
     }
 
     /// `lists` CRLs from `issuer_name`, each signed by `key`, distinct
-    /// by `thisUpdate`, each listing `serial`.
-    fn junk_crls(issuer_name: &str, key: &TestKey, serial: u8, lists: usize) -> Vec<Vec<u8>> {
+    /// by `thisUpdate` from `this_day` with `next_day` as `nextUpdate`,
+    /// each listing `serial`.
+    fn junk_crls(
+        issuer_name: &str,
+        key: &TestKey,
+        serial: u8,
+        this_day: u8,
+        next_day: Option<u8>,
+        lists: usize,
+    ) -> Vec<Vec<u8>> {
         (0..lists)
             .map(|index| {
                 crl(
                     issuer_name,
                     key,
-                    second(ANSWERED, index as u64),
-                    Some(day(ENDS)),
+                    second(this_day, index as u64),
+                    next_day.map(day),
                     &[serial],
                     day(REVOKED),
                 )
@@ -2745,32 +2833,47 @@ mod tests {
         let issuer = OwnedCert::from_der(&chain.intermediate).expect("intermediate parses");
         let junk_key = TestKey::derive(TestCurve::P256, b"junk");
         let attacker_key = TestKey::derive(TestCurve::P256, b"attacker");
-        let mut pool = chain.pool();
-        pool.add_certificate_ders(&junk_certificates(&junk_key, JUNK_CERTIFICATES));
-        pool.add_material(&ValidationMaterial {
-            certificates: Vec::new(),
-            ocsp_responses: junk_responses(&attacker_key, &issuer, SIGNER_SERIAL, JUNK_RESPONSES),
-            crls: Vec::new(),
-        });
-        assert_eq!(pool.certificates.len(), JUNK_CERTIFICATES + 2);
-        assert_eq!(pool.ocsp_responses.len(), JUNK_RESPONSES);
-        let mut budget = RevocationBudget::new();
-        let revocation = pool.revocation_of(
-            chain.signer.view(),
-            issuer.view(),
-            at(VALIDATED),
-            &mut budget,
-        );
-        assert_eq!(
-            revocation,
-            Revocation::Unavailable,
-            "nothing genuine answers"
-        );
-        assert_eq!(
-            budget.spent(),
-            MAX_REVOCATION_VERIFICATIONS,
-            "the bound ends it, not the {JUNK_RESPONSES} responses by {JUNK_CERTIFICATES} signers"
-        );
+        // Both `ResponderID` forms select every junk certificate: by
+        // name they share the subject, by key they share the key.
+        for responder in [
+            ResponderName::ByName(JUNK_RESPONDER),
+            ResponderName::ByKey(&junk_key),
+        ] {
+            let mut pool = chain.pool();
+            pool.add_certificate_ders(&junk_certificates(&junk_key, JUNK_CERTIFICATES));
+            pool.add_material(&ValidationMaterial {
+                certificates: Vec::new(),
+                ocsp_responses: junk_responses(
+                    &attacker_key,
+                    &issuer,
+                    SIGNER_SERIAL,
+                    JUNK_RESPONSES,
+                    responder,
+                ),
+                crls: Vec::new(),
+            });
+            assert_eq!(pool.certificates.len(), JUNK_CERTIFICATES + 2);
+            assert_eq!(pool.ocsp_responses.len(), JUNK_RESPONSES);
+            let mut budget = RevocationBudget::new();
+            let responders = ResponderIndex::of_pool(&pool);
+            let revocation = pool.revocation_of(
+                chain.signer.view(),
+                issuer.view(),
+                at(VALIDATED),
+                &mut budget,
+                &responders,
+            );
+            assert_eq!(
+                revocation,
+                Revocation::Unavailable,
+                "nothing genuine answers"
+            );
+            assert_eq!(
+                budget.spent(),
+                MAX_REVOCATION_VERIFICATIONS,
+                "the bound ends it, not the {JUNK_RESPONSES} responses by {JUNK_CERTIFICATES} signers"
+            );
+        }
     }
 
     #[test]
@@ -2782,7 +2885,13 @@ mod tests {
         let mut pool = chain.pool();
         pool.add_certificate_ders(&junk_certificates(&junk_key, 5));
         let mut responses = vec![chain.good(), chain.intermediate_ocsp(false)];
-        responses.extend(junk_responses(&attacker_key, &issuer, SIGNER_SERIAL, 5));
+        responses.extend(junk_responses(
+            &attacker_key,
+            &issuer,
+            SIGNER_SERIAL,
+            5,
+            ResponderName::ByName(JUNK_RESPONDER),
+        ));
         pool.add_material(&ValidationMaterial {
             certificates: Vec::new(),
             ocsp_responses: responses,
@@ -2814,15 +2923,18 @@ mod tests {
                 &issuer,
                 ELSEWHERE_SERIAL,
                 JUNK_RESPONSES,
+                ResponderName::ByName(JUNK_RESPONDER),
             ),
             crls: Vec::new(),
         });
         let mut budget = RevocationBudget::new();
+        let responders = ResponderIndex::of_pool(&pool);
         let revocation = pool.revocation_of(
             chain.signer.view(),
             issuer.view(),
             at(VALIDATED),
             &mut budget,
+            &responders,
         );
         assert_eq!(revocation, Revocation::Unavailable);
         assert_eq!(
@@ -2843,15 +2955,24 @@ mod tests {
         pool.add_material(&ValidationMaterial {
             certificates: Vec::new(),
             ocsp_responses: Vec::new(),
-            crls: junk_crls(INTERMEDIATE, &attacker_key, SIGNER_SERIAL, JUNK_CRLS),
+            crls: junk_crls(
+                INTERMEDIATE,
+                &attacker_key,
+                SIGNER_SERIAL,
+                ANSWERED,
+                Some(ENDS),
+                JUNK_CRLS,
+            ),
         });
         assert_eq!(pool.crls.len(), JUNK_CRLS);
         let mut budget = RevocationBudget::new();
+        let responders = ResponderIndex::of_pool(&pool);
         let revocation = pool.revocation_of(
             chain.signer.view(),
             issuer.view(),
             at(VALIDATED),
             &mut budget,
+            &responders,
         );
         assert_eq!(
             revocation,
@@ -2869,14 +2990,23 @@ mod tests {
         pool.add_material(&ValidationMaterial {
             certificates: Vec::new(),
             ocsp_responses: Vec::new(),
-            crls: junk_crls(JUNK_RESPONDER, &attacker_key, SIGNER_SERIAL, 10),
+            crls: junk_crls(
+                JUNK_RESPONDER,
+                &attacker_key,
+                SIGNER_SERIAL,
+                ANSWERED,
+                Some(ENDS),
+                10,
+            ),
         });
         let mut budget = RevocationBudget::new();
+        let responders = ResponderIndex::of_pool(&pool);
         let revocation = pool.revocation_of(
             chain.signer.view(),
             issuer.view(),
             at(VALIDATED),
             &mut budget,
+            &responders,
         );
         assert_eq!(revocation, Revocation::Unavailable);
         assert_eq!(
@@ -2884,5 +3014,158 @@ mod tests {
             0,
             "another issuer's lists cost no verification"
         );
+
+        // Expired lists from the judged issuer that do not name the
+        // signer cannot speak for it either.
+        let mut pool = chain.pool();
+        pool.add_material(&ValidationMaterial {
+            certificates: Vec::new(),
+            ocsp_responses: Vec::new(),
+            crls: junk_crls(
+                INTERMEDIATE,
+                &attacker_key,
+                ELSEWHERE_SERIAL,
+                ISSUED,
+                Some(ENDED_EARLY),
+                10,
+            ),
+        });
+        let mut budget = RevocationBudget::new();
+        let responders = ResponderIndex::of_pool(&pool);
+        let revocation = pool.revocation_of(
+            chain.signer.view(),
+            issuer.view(),
+            at(VALIDATED),
+            &mut budget,
+            &responders,
+        );
+        assert_eq!(revocation, Revocation::Unavailable);
+        assert_eq!(
+            budget.spent(),
+            0,
+            "an expired list that names another serial costs no verification"
+        );
+
+        // A current list from the judged issuer that omits the signer
+        // is absence evidence, and still verified.
+        let mut pool = chain.pool();
+        pool.add_material(&ValidationMaterial {
+            certificates: Vec::new(),
+            ocsp_responses: Vec::new(),
+            crls: junk_crls(
+                INTERMEDIATE,
+                &chain.intermediate_key,
+                ELSEWHERE_SERIAL,
+                ANSWERED,
+                Some(ENDS),
+                3,
+            ),
+        });
+        let mut budget = RevocationBudget::new();
+        let responders = ResponderIndex::of_pool(&pool);
+        let revocation = pool.revocation_of(
+            chain.signer.view(),
+            issuer.view(),
+            at(VALIDATED),
+            &mut budget,
+            &responders,
+        );
+        assert_eq!(
+            revocation,
+            Revocation::Good {
+                at: second(ANSWERED, 2)
+            }
+        );
+        assert_eq!(budget.spent(), 3, "each absence is checked");
+    }
+
+    #[test]
+    fn junk_ordered_before_a_genuine_revocation_starves_it_to_unavailable() {
+        let chain = chain(ENDS);
+        let issuer = OwnedCert::from_der(&chain.intermediate).expect("intermediate parses");
+        let junk_key = TestKey::derive(TestCurve::P256, b"junk");
+        let attacker_key = TestKey::derive(TestCurve::P256, b"attacker");
+        let mut pool = chain.pool();
+        pool.add_certificate_ders(&junk_certificates(&junk_key, JUNK_CERTIFICATES));
+        let mut responses = junk_responses(
+            &attacker_key,
+            &issuer,
+            SIGNER_SERIAL,
+            JUNK_RESPONSES,
+            ResponderName::ByName(JUNK_RESPONDER),
+        );
+        responses.push(chain.ocsp(true, ANSWERED, Some(ENDS)));
+        pool.add_material(&ValidationMaterial {
+            certificates: Vec::new(),
+            ocsp_responses: responses,
+            crls: Vec::new(),
+        });
+        let mut budget = RevocationBudget::new();
+        let responders = ResponderIndex::of_pool(&pool);
+        let revocation = pool.revocation_of(
+            chain.signer.view(),
+            issuer.view(),
+            at(VALIDATED),
+            &mut budget,
+            &responders,
+        );
+        // The pool is the document's to order; junk first reads like
+        // the genuine answer omitted, never like a better answer.
+        assert_eq!(revocation, Revocation::Unavailable);
+        assert_eq!(budget.spent(), MAX_REVOCATION_VERIFICATIONS);
+    }
+
+    #[test]
+    fn a_delegated_responder_found_in_the_pool_answers() {
+        let chain = chain(ENDS);
+        let issuer = OwnedCert::from_der(&chain.intermediate).expect("intermediate parses");
+        let responder_key = TestKey::derive(TestCurve::P256, b"ocsp responder");
+        let responder = certificate(
+            &spec(
+                RESPONDER_SERIAL,
+                RESPONDER,
+                INTERMEDIATE,
+                ENDS,
+                ocsp_responder_extensions(true),
+            ),
+            &responder_key,
+            &chain.intermediate_key,
+        );
+        for responder_id in [
+            ResponderName::ByName(RESPONDER),
+            ResponderName::ByKey(&responder_key),
+        ] {
+            let mut pool = chain.pool();
+            pool.add_certificate_ders(std::slice::from_ref(&responder));
+            pool.add_material(&ValidationMaterial {
+                certificates: Vec::new(),
+                ocsp_responses: vec![ocsp_response(&OcspSpec {
+                    responder_key: &responder_key,
+                    responder: responder_id,
+                    issuer: &issuer,
+                    serial: SIGNER_SERIAL,
+                    revoked: None,
+                    produced_at: day(ANSWERED),
+                    this_update: day(ANSWERED),
+                    next_update: Some(day(ENDS)),
+                    embedded: Vec::new(),
+                    cert_id: crate::testkit::CertIdAlgorithm::Sha1,
+                    revocation_reason: None,
+                    response_extensions: Vec::new(),
+                })],
+                crls: Vec::new(),
+            });
+            let mut budget = RevocationBudget::new();
+            let responders = ResponderIndex::of_pool(&pool);
+            let revocation = pool.revocation_of(
+                chain.signer.view(),
+                issuer.view(),
+                at(VALIDATED),
+                &mut budget,
+                &responders,
+            );
+            assert_eq!(revocation, Revocation::Good { at: day(ANSWERED) });
+            assert_eq!(budget.spent(), 1, "the pooled signer is found at once");
+        }
     }
 }

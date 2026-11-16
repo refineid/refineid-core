@@ -17,11 +17,12 @@ workspace = true
 [features]
 # Test-only ECDSA signing over the verifier's curve arithmetic and the
 # fixture builders on top of it. Never enabled by a production build.
-testkit = []
+testkit = ["dep:base64ct"]
 
 [dependencies]
 refineid-ber.workspace = true
 refineid-digest.workspace = true
+base64ct = { workspace = true, optional = true }
 # Compile-time dotted-decimal OID parser for the `oid::known` table.
 const-oid.workspace = true
 # Big-integer arithmetic for the RSA and ECDSA verification primitives.
@@ -36,6 +37,7 @@ spki.workspace = true
 x509-cert.workspace = true
 
 [dev-dependencies]
+base64ct.workspace = true
 getrandom = { workspace = true }
 hex.workspace = true
 

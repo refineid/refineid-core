@@ -22,6 +22,7 @@ refineid-cms.workspace = true
 refineid-digest.workspace = true
 
 aes-gcm.workspace = true
+base64ct.workspace = true
 elliptic-curve.workspace = true
 getrandom.workspace = true
 p256.workspace = true

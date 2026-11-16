@@ -43,6 +43,7 @@ refineid-pkcs15 = { workspace = true, optional = true }
 refineid-remote.workspace = true
 refineid-sign = { workspace = true, optional = true }
 
+base64ct.workspace = true
 const-oid.workspace = true
 crypto-bigint.workspace = true
 getrandom.workspace = true

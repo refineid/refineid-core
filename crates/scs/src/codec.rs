@@ -154,25 +154,15 @@ const UNCOMPRESSED_POINT_LENGTH: usize = 65;
 /// The uncompressed-point tag.
 const UNCOMPRESSED_TAG: u8 = 0x04;
 
-/// A raw ECDSA signature's two halves.
-const ECDSA_SIGNATURE_HALVES: usize = 2;
-
 /// A raw ECDSA signature as X9.62 DER `SEQUENCE { r, s }`.
 /// Cards return `r || s`; the `signature` form and CMS carry DER
 /// (v1.3 sec.2.6.1, RFC 5753 sec.2.1.1).
 pub(crate) fn ecdsa_signature_der(raw: &[u8]) -> Result<Vec<u8>, ()> {
-    if raw.is_empty() || !raw.len().is_multiple_of(ECDSA_SIGNATURE_HALVES) {
-        return Err(());
-    }
-    let (r, s) = raw.split_at(raw.len() / ECDSA_SIGNATURE_HALVES);
-    let r = der_integer(r)?;
-    let s = der_integer(s)?;
-    crate::der::sequence(&[&r, &s])
-}
-
-/// One signature integer in minimal DER form.
-fn der_integer(magnitude: &[u8]) -> Result<Vec<u8>, ()> {
-    crate::der::unsigned_integer(magnitude)
+    refineid_cms::container::Signature::<refineid_cms::container::EcdsaDer>::from_raw_concatenation(
+        raw,
+    )
+    .map(refineid_cms::container::Signature::into_bytes)
+    .map_err(|_| ())
 }
 
 /// Parse a DER SPKI as a P-256 agreement key.

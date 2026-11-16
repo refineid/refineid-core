@@ -22,22 +22,13 @@
 //! shape a signing service embeds into the document (DVV SCS
 //! specification v1.3 sec.2.6.2).
 
-use refineid_ber::BerTlvAny;
 use refineid_cms::oid::known;
+use refineid_cms::x509::Certificate;
 use refineid_digest::HashAlg;
 
 use crate::der;
 use crate::error::TransactionError;
 use crate::purpose::KeyAlgorithm;
-
-/// DER tag: SEQUENCE, as the parser reports it.
-const TAG_SEQUENCE: u16 = der::TAG_SEQUENCE as u16;
-
-/// DER tag: INTEGER, as the parser reports it.
-const TAG_INTEGER: u16 = der::TAG_INTEGER as u16;
-
-/// DER tag: explicit [0], as the parser reports it.
-const TAG_EXPLICIT_ZERO: u16 = der::TAG_CONTEXT_ZERO as u16;
 
 /// SignedData and SignerInfo version.
 const CMS_VERSION: u8 = 1;
@@ -76,7 +67,7 @@ impl DetachedCms {
         };
         let signer_identifier = der::sequence(&[
             &self.issuer_name,
-            &der::unsigned_integer(&self.serial_number).map_err(|()| fail())?,
+            &der::tagged(der::TAG_INTEGER, &self.serial_number).map_err(|()| fail())?,
         ])
         .map_err(|()| fail())?;
         let signer_info = der::sequence(&[
@@ -138,8 +129,15 @@ pub fn prepare(
     let leaf = certificates
         .first()
         .ok_or_else(|| TransactionError::bad_request("leaf certificate is not DER X.509"))?;
-    let (issuer_name, serial_number) = signer_identifier(leaf)
+    let leaf_certificate = Certificate::from_der(leaf)
+        .ok()
+        .filter(|cert| {
+            spki::der::asn1::UintRef::new(cert.serial_der.as_bytes())
+                .is_ok_and(|serial| !serial.as_bytes().is_empty() && serial.as_bytes() != [0])
+        })
         .ok_or_else(|| TransactionError::bad_request("leaf certificate is not DER X.509"))?;
+    let issuer_name = leaf_certificate.issuer.as_der().to_vec();
+    let serial_number = leaf_certificate.serial_der.as_bytes().to_vec();
     let digest_oid = match hash {
         HashAlg::Sha1 => known::SHA1.as_bytes(),
         HashAlg::Sha256 => known::SHA256.as_bytes(),
@@ -255,61 +253,18 @@ fn signature_algorithm(
     .map_err(|()| TransactionError::internal_error("assemble CMS attributes"))
 }
 
-/// The leaf's issuer name TLV and serial content bytes.
-fn signer_identifier(leaf: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
-    let certificate = BerTlvAny::parse(leaf).ok()?;
-    if certificate.tag() != TAG_SEQUENCE {
-        return None;
-    }
-    let outer = child_values(certificate.value())?;
-    let tbs = outer.first()?;
-    let mut rest = tbs.value();
-    if let Ok(first) = BerTlvAny::parse(rest) {
-        if first.tag() == TAG_EXPLICIT_ZERO {
-            rest = rest.get(first.size()..)?;
-        }
-    } else {
-        return None;
-    }
-    let serial = BerTlvAny::parse(rest).ok()?;
-    if serial.tag() != TAG_INTEGER {
-        return None;
-    }
-    rest = rest.get(serial.size()..)?;
-    let signature_algorithm = BerTlvAny::parse(rest).ok()?;
-    rest = rest.get(signature_algorithm.size()..)?;
-    let issuer = BerTlvAny::parse(rest).ok()?;
-    // The full issuer Name TLV: tag and length octets plus the value.
-    let issuer_tlv = rest.get(..issuer.size())?.to_vec();
-    let serial_value = serial.value().strip_prefix(&[0]).unwrap_or(serial.value());
-    if serial_value.is_empty() {
-        return None;
-    }
-    Some((issuer_tlv, serial_value.to_vec()))
-}
-
-/// The children of a constructed value, or `None` when the value is
-/// not a clean child sequence.
-fn child_values(value: &[u8]) -> Option<Vec<BerTlvAny<'_>>> {
-    let mut children = Vec::new();
-    let mut rest = value;
-    while !rest.is_empty() {
-        let child = BerTlvAny::parse(rest).ok()?;
-        children.push(child);
-        rest = rest.get(child.size()..)?;
-    }
-    Some(children)
-}
-
 #[cfg(test)]
 mod tests {
     use super::prepare;
     use crate::purpose::KeyAlgorithm;
-    use crate::test_support::mint_certificate;
+    use crate::test_support::{mint_certificate, mint_certificate_serial};
     use refineid_digest::{HashAlg, SHA256_LEN};
 
     /// Unix seconds of 2023-11-14T22:13:20Z.
     const SIGNED_AT: i64 = 1_700_000_000;
+
+    /// High-bit serial byte requiring a DER sign-padding octet.
+    const HIGH_BIT_SERIAL: u8 = u8::MAX;
 
     /// A SHA-256 digest over the minted leaf builds attributes and a
     /// SignedData carrying the signature.
@@ -357,7 +312,34 @@ mod tests {
         let signed = prepared
             .signed_data(signature.to_bytes().as_slice())
             .expect("assembles");
-        refineid_cms::signed_data::SignedData::parse(&signed).expect("parses as SignedData");
+        let parsed_cms =
+            refineid_cms::signed_data::SignedData::parse(&signed).expect("parses as SignedData");
+        let leaf_cert = refineid_cms::x509::Certificate::from_der(&chain[0]).expect("leaf parses");
+        parsed_cms
+            .verify_detached(leaf_cert.spki, b"document")
+            .expect("detached CMS signature verifies");
+        let high_serial = mint_certificate_serial(HIGH_BIT_SERIAL);
+        let high_prepared = prepare(
+            &digest,
+            std::slice::from_ref(&high_serial.der),
+            HashAlg::Sha256,
+            KeyAlgorithm::Ecdsa,
+            SIGNED_AT,
+        )
+        .expect("prepares high-bit serial leaf");
+        let high_sig: p256::ecdsa::Signature =
+            high_serial.key.sign(high_prepared.signed_attributes());
+        let high_signed = high_prepared
+            .signed_data(high_sig.to_bytes().as_slice())
+            .expect("assembles high-bit serial SignedData");
+        let high_leaf =
+            refineid_cms::x509::Certificate::from_der(&high_serial.der).expect("leaf parses");
+        assert_eq!(high_leaf.serial_der.as_bytes(), [0, HIGH_BIT_SERIAL]);
+        let high_cms = refineid_cms::signed_data::SignedData::parse(&high_signed)
+            .expect("high-bit serial CMS parses");
+        high_cms
+            .verify_detached(high_leaf.spki, b"document")
+            .expect("high-bit serial SignerIdentifier round-trips");
         let prepared = prepare(
             &digest,
             &chain,
@@ -396,6 +378,17 @@ mod tests {
                 &[b"not-a-cert".to_vec()],
                 HashAlg::Sha256,
                 KeyAlgorithm::Rsa,
+                SIGNED_AT
+            )
+            .is_err()
+        );
+        let zero_serial = mint_certificate_serial(0);
+        assert!(
+            prepare(
+                &digest,
+                std::slice::from_ref(&zero_serial.der),
+                HashAlg::Sha256,
+                KeyAlgorithm::Ecdsa,
                 SIGNED_AT
             )
             .is_err()

@@ -27,6 +27,8 @@ elliptic-curve.workspace = true
 getrandom.workspace = true
 p256.workspace = true
 serde_json.workspace = true
-signature.workspace = true
 spki.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+refineid-cms = { workspace = true, features = ["testkit"] }

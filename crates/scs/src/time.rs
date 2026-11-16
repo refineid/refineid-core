@@ -12,176 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Certificate times: UTCTime encoding and Time parsing against unix
-//! seconds.
-//!
-//! The civil-date conversions are Howard Hinnant's public-domain
-//! `days_from_civil` / `civil_from_days` algorithms, with every
-//! constant named.
+//! Certificate times: UTCTime encoding and calendar-year offsets
+//! backed by [`spki::der::DateTime`] and [`spki::der::asn1::UtcTime`].
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Days in a 400-year era.
-const ERA_DAYS: i64 = 146_097;
+use spki::der::asn1::UtcTime;
+use spki::der::{DateTime, EncodeValue as _, SliceWriter};
 
-/// Days from 0000-03-01 to 1970-01-01.
-const DAYS_TO_UNIX_EPOCH: i64 = 719_468;
-
-/// Years in an era.
-const YEARS_PER_ERA: i64 = 400;
-
-/// Days in a 5-month span of the March-based year.
-const MONTHS_TO_DAYS_NUMERATOR: i64 = 153;
-
-/// Denominator of the month-to-day span.
-const MONTHS_TO_DAYS_DENOMINATOR: i64 = 5;
-
-/// Days in a common year.
-const DAYS_PER_YEAR: i64 = 365;
-
-/// Months in a year.
-const MONTHS_PER_YEAR: i64 = 12;
-
-/// March-based month offset for January and February.
-const JANUARY_FEBRUARY_OFFSET: i64 = 9;
-
-/// March-based month offset past February.
-const MARCH_ONWARDS_OFFSET: i64 = -3;
-
-/// Day-of-year to month numerator.
-const DAY_TO_MONTH_NUMERATOR: i64 = 5;
-
-/// Day-of-year to month denominator.
-const DAY_TO_MONTH_DENOMINATOR: i64 = 153;
-
-/// Rounding term of the day-of-year to month division.
-const DAY_TO_MONTH_ROUNDING: i64 = 2;
-
-/// Month threshold below which three months are added back.
-const MARCH_BASED_OCTOBER: i64 = 10;
-
-/// Months added back below October in the March-based year.
-const MONTHS_ADD_BACK: i64 = 3;
-
-/// Months subtracted past September in the March-based year.
-const MONTHS_SUBTRACT: i64 = -9;
-
-/// Leap-cycle divisor of the year-of-era inversion.
-const YEAR_OF_ERA_LEAP_DIVISOR: i64 = 1460;
-
-/// Century divisor of the year-of-era inversion.
-const YEAR_OF_ERA_CENTURY_DIVISOR: i64 = 36_524;
-
-/// Era divisor of the year-of-era inversion.
-const YEAR_OF_ERA_ERA_DIVISOR: i64 = 146_096;
-
-/// Years in a leap cycle.
-const LEAP_CYCLE_YEARS: i64 = 4;
-
-/// Years in a century.
-const CENTURY_YEARS: i64 = 100;
-
-/// Years in a leap century.
-const LEAP_CENTURY_YEARS: i64 = 400;
+/// Calendar month number for February.
+const MONTH_FEBRUARY: u8 = 2;
 
 /// Days in February of a leap year.
-const FEBRUARY_LEAP_DAYS: i64 = 29;
+const FEBRUARY_LEAP_DAYS: u8 = 29;
 
 /// Days in February of a common year.
-const FEBRUARY_DAYS: i64 = 28;
+const FEBRUARY_COMMON_DAYS: u8 = 28;
 
-/// Days in a long month.
-const LONG_MONTH_DAYS: i64 = 31;
-
-/// Days in a short month.
-const SHORT_MONTH_DAYS: i64 = 30;
-
-/// January.
-const MONTH_JANUARY: i64 = 1;
-
-/// February.
-const MONTH_FEBRUARY: i64 = 2;
-
-/// March.
-const MONTH_MARCH: i64 = 3;
-
-/// April.
-const MONTH_APRIL: i64 = 4;
-
-/// May.
-const MONTH_MAY: i64 = 5;
-
-/// June.
-const MONTH_JUNE: i64 = 6;
-
-/// July.
-const MONTH_JULY: i64 = 7;
-
-/// August.
-const MONTH_AUGUST: i64 = 8;
-
-/// September.
-const MONTH_SEPTEMBER: i64 = 9;
-
-/// October.
-const MONTH_OCTOBER: i64 = 10;
-
-/// November.
-const MONTH_NOVEMBER: i64 = 11;
-
-/// December.
-const MONTH_DECEMBER: i64 = 12;
-
-/// Seconds in a minute.
-const SECONDS_PER_MINUTE: i64 = 60;
-
-/// Minutes in an hour.
-const MINUTES_PER_HOUR: i64 = 60;
-
-/// Hours in a day.
-const HOURS_PER_DAY: i64 = 24;
-
-/// Seconds in a day.
-const SECONDS_PER_DAY: i64 = 86_400;
-
-/// Decimal radix for time fields.
-const DECIMAL_RADIX: u32 = 10;
-
-/// Decimal digit base for time fields.
-const DECIMAL_DIGIT_BASE: u8 = 10;
-
-/// Digits in one time field.
-const FIELD_WIDTH: usize = 2;
-
-/// Digits in a GeneralizedTime year.
-const GENERALIZED_YEAR_WIDTH: usize = 4;
-
-/// UTCTime field length: `yyMMddHHmmssZ`.
+/// UTCTime field length: `yyMMddHHmmssZ` (RFC 5280 sec.4.1.2.5.1).
 const UTC_TIME_LENGTH: usize = 13;
 
-/// GeneralizedTime field length: `yyyyMMddHHmmssZ`.
-const GENERALIZED_TIME_LENGTH: usize = 15;
+/// DER tag: UTCTime, for writers wrapping an encoded time.
+pub const UTC_TIME_TAG: u8 = 0x17;
 
-/// UTCTime years at or above this are 19xx, below it 20xx (RFC 5280
-/// sec.4.1.2.5.1).
-const UTC_TIME_CENTURY_SPLIT: i64 = 50;
-
-/// Century base for UTCTime years at or above the split.
-const CENTURY_1900: i64 = 1900;
-
-/// Century base for UTCTime years below the split.
-const CENTURY_2000: i64 = 2000;
-
-/// DER tag: UTCTime.
-const TAG_UTC_TIME: u16 = 0x17;
-
-/// DER tag: GeneralizedTime.
-const TAG_GENERALIZED_TIME: u16 = 0x18;
-
-/// The Zulu suffix.
-const ZULU: u8 = b'Z';
-
-/// A time that is not well-formed, or a clock this software refuses
+/// A time that is not representable, or a clock this software refuses
 /// to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeError;
@@ -194,209 +48,39 @@ impl core::fmt::Display for TimeError {
 
 impl core::error::Error for TimeError {}
 
-/// Days from 1970-01-01 to the civil date, proleptic Gregorian.
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let adjusted_year = if month <= MONTH_FEBRUARY {
-        year - 1
-    } else {
-        year
-    };
-    let era = if adjusted_year >= 0 {
-        adjusted_year
-    } else {
-        adjusted_year - (YEARS_PER_ERA - 1)
-    } / YEARS_PER_ERA;
-    let year_of_era = adjusted_year - era * YEARS_PER_ERA;
-    let month_offset = if month > MONTH_FEBRUARY {
-        MARCH_ONWARDS_OFFSET
-    } else {
-        JANUARY_FEBRUARY_OFFSET
-    };
-    let day_of_year = (MONTHS_TO_DAYS_NUMERATOR * (month + month_offset) + DAY_TO_MONTH_ROUNDING)
-        / MONTHS_TO_DAYS_DENOMINATOR
-        + day
-        - 1;
-    let day_of_era = year_of_era * DAYS_PER_YEAR + year_of_era / LEAP_CYCLE_YEARS
-        - year_of_era / CENTURY_YEARS
-        + day_of_year;
-    era * ERA_DAYS + day_of_era - DAYS_TO_UNIX_EPOCH
-}
-
-/// The civil date `days` after 1970-01-01, proleptic Gregorian, as
-/// year, month, day.
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
-    let shifted = days + DAYS_TO_UNIX_EPOCH;
-    let era = if shifted >= 0 {
-        shifted
-    } else {
-        shifted - (ERA_DAYS - 1)
-    } / ERA_DAYS;
-    let day_of_era = shifted - era * ERA_DAYS;
-    let year_of_era = (day_of_era - day_of_era / YEAR_OF_ERA_LEAP_DIVISOR
-        + day_of_era / YEAR_OF_ERA_CENTURY_DIVISOR
-        - day_of_era / YEAR_OF_ERA_ERA_DIVISOR)
-        / DAYS_PER_YEAR;
-    let year = year_of_era + era * YEARS_PER_ERA;
-    let day_of_year = day_of_era
-        - (DAYS_PER_YEAR * year_of_era + year_of_era / LEAP_CYCLE_YEARS
-            - year_of_era / CENTURY_YEARS);
-    let month_prime =
-        (DAY_TO_MONTH_NUMERATOR * day_of_year + DAY_TO_MONTH_ROUNDING) / DAY_TO_MONTH_DENOMINATOR;
-    let day = day_of_year
-        - (MONTHS_TO_DAYS_NUMERATOR * month_prime + DAY_TO_MONTH_ROUNDING)
-            / MONTHS_TO_DAYS_DENOMINATOR
-        + 1;
-    let month = month_prime
-        + if month_prime < MARCH_BASED_OCTOBER {
-            MONTHS_ADD_BACK
-        } else {
-            MONTHS_SUBTRACT
-        };
-    (
-        if month <= MONTH_FEBRUARY {
-            year + 1
-        } else {
-            year
-        },
-        month,
-        day,
-    )
-}
-
-/// Unix seconds of the UTC clock reading.
-fn unix_seconds(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64) -> i64 {
-    days_from_civil(year, month, day) * SECONDS_PER_DAY
-        + hour * MINUTES_PER_HOUR * SECONDS_PER_MINUTE
-        + minute * SECONDS_PER_MINUTE
-        + second
-}
-
-/// Whether the civil date exists on the proleptic Gregorian calendar.
-fn valid_date(year: i64, month: i64, day: i64) -> bool {
-    if !(MONTH_JANUARY..=MONTHS_PER_YEAR).contains(&month) || day < MONTH_JANUARY {
-        return false;
-    }
-    let leap = year % LEAP_CYCLE_YEARS == 0
-        && (year % CENTURY_YEARS != 0 || year % LEAP_CENTURY_YEARS == 0);
-    let february_days = if leap {
-        FEBRUARY_LEAP_DAYS
-    } else {
-        FEBRUARY_DAYS
-    };
-    let month_days = match month {
-        MONTH_JANUARY | MONTH_MARCH | MONTH_MAY | MONTH_JULY | MONTH_AUGUST | MONTH_OCTOBER
-        | MONTH_DECEMBER => LONG_MONTH_DAYS,
-        MONTH_APRIL | MONTH_JUNE | MONTH_SEPTEMBER | MONTH_NOVEMBER => SHORT_MONTH_DAYS,
-        _ => february_days,
-    };
-    day <= month_days
-}
-
-/// Whether the clock reading is a whole-seconds UTC time.
-fn valid_clock(hour: i64, minute: i64, second: i64) -> bool {
-    (0..HOURS_PER_DAY).contains(&hour)
-        && (0..MINUTES_PER_HOUR).contains(&minute)
-        && (0..SECONDS_PER_MINUTE).contains(&second)
-}
-
-/// Parse one ASCII digit pair.
-fn two_digits(pair: &[u8]) -> Result<i64, TimeError> {
-    if pair.len() != FIELD_WIDTH {
-        return Err(TimeError);
-    }
-    let text = core::str::from_utf8(pair).map_err(|_| TimeError)?;
-    i64::from_str_radix(text, DECIMAL_RADIX).map_err(|_| TimeError)
-}
-
-/// Split the digit body into field pairs.
-fn field_pairs(body: &[u8]) -> Result<Vec<&[u8]>, TimeError> {
-    if !body.len().is_multiple_of(FIELD_WIDTH) {
-        return Err(TimeError);
-    }
-    Ok(body.chunks(FIELD_WIDTH).collect())
-}
-
-/// Parse a UTCTime value (`yyMMddHHmmssZ`) to unix seconds.
-fn parse_utc_time(value: &[u8]) -> Result<i64, TimeError> {
-    if value.len() != UTC_TIME_LENGTH || value[UTC_TIME_LENGTH - 1] != ZULU {
-        return Err(TimeError);
-    }
-    let fields = field_pairs(&value[..UTC_TIME_LENGTH - 1])?;
-    let [year_two, month, day, hour, minute, second] = fields.as_slice() else {
-        return Err(TimeError);
-    };
-    let year_two = two_digits(year_two)?;
-    let year = if year_two >= UTC_TIME_CENTURY_SPLIT {
-        CENTURY_1900 + year_two
-    } else {
-        CENTURY_2000 + year_two
-    };
-    let month = two_digits(month)?;
-    let day = two_digits(day)?;
-    let hour = two_digits(hour)?;
-    let minute = two_digits(minute)?;
-    let second = two_digits(second)?;
-    if !valid_date(year, month, day) || !valid_clock(hour, minute, second) {
-        return Err(TimeError);
-    }
-    Ok(unix_seconds(year, month, day, hour, minute, second))
-}
-
-/// Parse a GeneralizedTime value (`yyyyMMddHHmmssZ`) to unix seconds.
-fn parse_generalized_time(value: &[u8]) -> Result<i64, TimeError> {
-    if value.len() != GENERALIZED_TIME_LENGTH || value[GENERALIZED_TIME_LENGTH - 1] != ZULU {
-        return Err(TimeError);
-    }
-    let year_text =
-        core::str::from_utf8(&value[..GENERALIZED_YEAR_WIDTH]).map_err(|_| TimeError)?;
-    let year = i64::from_str_radix(year_text, DECIMAL_RADIX).map_err(|_| TimeError)?;
-    let fields = field_pairs(&value[GENERALIZED_YEAR_WIDTH..GENERALIZED_TIME_LENGTH - 1])?;
-    let [month, day, hour, minute, second] = fields.as_slice() else {
-        return Err(TimeError);
-    };
-    let month = two_digits(month)?;
-    let day = two_digits(day)?;
-    let hour = two_digits(hour)?;
-    let minute = two_digits(minute)?;
-    let second = two_digits(second)?;
-    if !valid_date(year, month, day) || !valid_clock(hour, minute, second) {
-        return Err(TimeError);
-    }
-    Ok(unix_seconds(year, month, day, hour, minute, second))
-}
-
-/// DER tag: UTCTime, for writers wrapping an encoded time.
-pub const UTC_TIME_TAG: u8 = 0x17;
-
-/// Parse a DER Time value of `tag` to unix seconds.
-pub fn parse_time(tag: u16, value: &[u8]) -> Result<i64, TimeError> {
-    if tag == TAG_UTC_TIME {
-        parse_utc_time(value)
-    } else if tag == TAG_GENERALIZED_TIME {
-        parse_generalized_time(value)
-    } else {
-        Err(TimeError)
-    }
-}
-
-/// Add `years` calendar years to unix seconds, clamping February
-/// 29 to February 28 when the target year is not a leap year.
+/// Add `years` calendar years to post-epoch unix seconds, clamping
+/// February 29 to February 28 when the target year is not a leap year.
+///
+/// Backed by [`DateTime`], so inputs before the Unix epoch or targets
+/// outside `1970..=9999` return [`TimeError`].
 pub fn add_years(unix: i64, years: i32) -> Result<i64, TimeError> {
-    let days = unix.div_euclid(SECONDS_PER_DAY);
-    let day_seconds = unix.rem_euclid(SECONDS_PER_DAY);
-    let (year, month, mut day) = civil_from_days(days);
-    let target = year + i64::from(years);
-    if !valid_date(target, month, day) {
-        if month == MONTH_FEBRUARY && day == FEBRUARY_LEAP_DAYS {
-            day = FEBRUARY_DAYS;
-        } else {
-            return Err(TimeError);
-        }
-    }
-    let hour = day_seconds / (MINUTES_PER_HOUR * SECONDS_PER_MINUTE);
-    let minute = (day_seconds / SECONDS_PER_MINUTE) % MINUTES_PER_HOUR;
-    let second = day_seconds % SECONDS_PER_MINUTE;
-    Ok(unix_seconds(target, month, day, hour, minute, second))
+    let seconds = u64::try_from(unix).map_err(|_| TimeError)?;
+    let dt = DateTime::from_unix_duration(Duration::from_secs(seconds)).map_err(|_| TimeError)?;
+    let target_year = i32::from(dt.year())
+        .checked_add(years)
+        .and_then(|year| u16::try_from(year).ok())
+        .ok_or(TimeError)?;
+    let target = match DateTime::new(
+        target_year,
+        dt.month(),
+        dt.day(),
+        dt.hour(),
+        dt.minutes(),
+        dt.seconds(),
+    ) {
+        Ok(target) => target,
+        Err(_) if dt.month() == MONTH_FEBRUARY && dt.day() == FEBRUARY_LEAP_DAYS => DateTime::new(
+            target_year,
+            dt.month(),
+            FEBRUARY_COMMON_DAYS,
+            dt.hour(),
+            dt.minutes(),
+            dt.seconds(),
+        )
+        .map_err(|_| TimeError)?,
+        Err(_) => return Err(TimeError),
+    };
+    i64::try_from(target.unix_duration().as_secs()).map_err(|_| TimeError)
 }
 
 /// The system clock as unix seconds; clocks before the epoch are
@@ -409,101 +93,131 @@ pub fn system_unix(now: SystemTime) -> Result<i64, TimeError> {
     i64::try_from(seconds).map_err(|_| TimeError)
 }
 
-/// Format unix seconds as UTCTime (`yyMMddHHmmssZ`), whole seconds,
-/// Zulu.
+/// The system clock truncated to whole UTC seconds as a [`DateTime`];
+/// clocks before the epoch or past year 9999 are refused.
+pub fn system_date_time(now: SystemTime) -> Result<DateTime, TimeError> {
+    let seconds = now
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| TimeError)?
+        .as_secs();
+    DateTime::from_unix_duration(Duration::from_secs(seconds)).map_err(|_| TimeError)
+}
+
+/// Format post-epoch unix seconds as UTCTime (`yyMMddHHmmssZ`), whole
+/// seconds, Zulu.
 ///
-/// Only years the UTCTime century rule round-trips are formatted.
+/// RFC 5280 sec.4.1.2.5.1 defines UTCTime across `1950..=2049`; because
+/// [`UtcTime`] is anchored at the Unix epoch, this formatter accepts
+/// `1970-01-01T00:00:00Z` through `2049-12-31T23:59:59Z`.
 pub fn format_utc_time(unix: i64) -> Result<[u8; UTC_TIME_LENGTH], TimeError> {
-    let days = unix.div_euclid(SECONDS_PER_DAY);
-    let day_seconds = unix.rem_euclid(SECONDS_PER_DAY);
-    let (year, month, day) = civil_from_days(days);
-    if !(CENTURY_1900 + UTC_TIME_CENTURY_SPLIT..CENTURY_2000 + UTC_TIME_CENTURY_SPLIT)
-        .contains(&year)
-    {
+    let seconds = u64::try_from(unix).map_err(|_| TimeError)?;
+    let utc = UtcTime::from_unix_duration(Duration::from_secs(seconds)).map_err(|_| TimeError)?;
+    let mut out = [0_u8; UTC_TIME_LENGTH];
+    let mut writer = SliceWriter::new(&mut out);
+    utc.encode_value(&mut writer).map_err(|_| TimeError)?;
+    if writer.finish().map_err(|_| TimeError)?.len() != UTC_TIME_LENGTH {
         return Err(TimeError);
     }
-    let fields = [
-        (year % CENTURY_YEARS) as u8,
-        month as u8,
-        day as u8,
-        (day_seconds / (MINUTES_PER_HOUR * SECONDS_PER_MINUTE)) as u8,
-        ((day_seconds / SECONDS_PER_MINUTE) % MINUTES_PER_HOUR) as u8,
-        (day_seconds % SECONDS_PER_MINUTE) as u8,
-    ];
-    let mut out = [b'0'; UTC_TIME_LENGTH];
-    let mut cursor = 0_usize;
-    for value in fields {
-        out[cursor] = b'0' + value / DECIMAL_DIGIT_BASE;
-        out[cursor + 1] = b'0' + value % DECIMAL_DIGIT_BASE;
-        cursor += FIELD_WIDTH;
-    }
-    out[UTC_TIME_LENGTH - 1] = ZULU;
     Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{format_utc_time, parse_time};
+    use super::{UTC_TIME_TAG, add_years, format_utc_time, system_date_time, system_unix};
+    use spki::der::Decode as _;
+    use spki::der::asn1::UtcTime;
     use std::time::{Duration, UNIX_EPOCH};
-
-    /// DER tag: UTCTime.
-    const TAG_UTC_TIME: u16 = 0x17;
-
-    /// DER tag: GeneralizedTime.
-    const TAG_GENERALIZED_TIME: u16 = 0x18;
-
-    /// A tag that is never a Time.
-    const TAG_INTEGER: u16 = 0x02;
 
     /// One day, in seconds.
     const DAY_SECONDS: u64 = 86_400;
 
+    /// Non-zero subsecond nanoseconds present on real system clocks.
+    const SUBSECOND_NANOS: u32 = 500_000_000;
+
     /// Unix seconds of 2023-11-14T22:13:20Z.
     const SOME_TUESDAY: i64 = 1_700_000_000;
+
+    /// Unix seconds of 2024-02-28T12:34:56Z (common-year reverse offset).
+    const FEB_28_2024: i64 = 1_709_123_696;
+
+    /// Unix seconds of 2024-02-29T12:34:56Z (a leap day).
+    const LEAP_DAY_2024: i64 = 1_709_210_096;
+
+    /// Unix seconds of 2025-02-28T12:34:56Z (clamped common-year target).
+    const CLAMPED_2025: i64 = 1_740_746_096;
+
+    /// Unix seconds of 2028-02-29T12:34:56Z (preserved leap-year target).
+    const LEAP_DAY_2028: i64 = 1_835_440_496;
 
     /// Unix seconds of 2026-01-01T00:00:00Z.
     const NEW_YEAR_2026: i64 = 1_767_225_600;
 
-    /// Unix seconds of 1900-01-01T00:00:00Z, below the window.
-    const BEFORE_WINDOW: i64 = -2_208_988_800;
+    /// Unix seconds of 2049-12-31T23:59:59Z, the last RFC 5280 UTCTime second.
+    const LAST_UTC_TIME_SECOND: i64 = 2_524_607_999;
 
-    /// Unix seconds of 2060-01-01T00:00:00Z, past the window.
-    const AFTER_WINDOW: i64 = 2_840_140_800;
+    /// Unix seconds of 2050-01-01T00:00:00Z, the first GeneralizedTime-only second.
+    const FIRST_POST_UTC_TIME_SECOND: i64 = 2_524_608_000;
+
+    /// Unix seconds of 1900-01-01T00:00:00Z, below the representable window.
+    const BEFORE_WINDOW: i64 = -2_208_988_800;
 
     /// Days after the epoch whose date line is asserted.
     const TWENTY_THOUSAND_DAYS: u64 = 20_000;
 
-    /// The epoch parses to zero, and a leap day round-trips.
-    #[test]
-    fn times_parse_to_unix() {
-        assert_eq!(parse_time(TAG_UTC_TIME, b"700101000000Z"), Ok(0));
-        assert_eq!(
-            parse_time(TAG_GENERALIZED_TIME, b"20240229120000Z"),
-            parse_time(TAG_UTC_TIME, b"240229120000Z")
-        );
-        // 2024-02-29 is a Thursday; the day before is not a leap day.
-        assert!(parse_time(TAG_UTC_TIME, b"230229000000Z").is_err());
-        assert!(parse_time(TAG_UTC_TIME, b"700101000000z").is_err());
-        assert!(parse_time(TAG_INTEGER, b"700101000000Z").is_err());
-    }
+    /// Single-year offset for common-year clamping tests.
+    const ONE_YEAR: i32 = 1;
 
-    /// Formatting inverts parsing across the representable range.
+    /// Four-year offset across one leap cycle.
+    const FOUR_YEARS: i32 = 4;
+
+    /// Formatting round-trips through `spki::der::asn1::UtcTime` across
+    /// the RFC 5280 UTCTime window and rejects out-of-range timestamps.
     #[test]
-    fn format_inverts_parse() {
-        for unix in [0_i64, SOME_TUESDAY, NEW_YEAR_2026] {
+    fn format_round_trips_and_enforces_bounds() {
+        for unix in [0_i64, SOME_TUESDAY, NEW_YEAR_2026, LAST_UTC_TIME_SECOND] {
             let text = format_utc_time(unix).expect("formats");
-            assert_eq!(parse_time(TAG_UTC_TIME, &text), Ok(unix));
+            let tlv = crate::der::tagged(UTC_TIME_TAG, &text).expect("wraps TLV");
+            let decoded = UtcTime::from_der(&tlv).expect("decodes as DER UtcTime");
+            assert_eq!(
+                i64::try_from(decoded.to_unix_duration().as_secs()).expect("fits i64"),
+                unix
+            );
         }
+        assert_eq!(&format_utc_time(0).expect("epoch"), b"700101000000Z");
+        assert_eq!(
+            &format_utc_time(LAST_UTC_TIME_SECOND).expect("2049 ceiling"),
+            b"491231235959Z"
+        );
+        assert!(format_utc_time(-1).is_err());
         assert!(format_utc_time(BEFORE_WINDOW).is_err());
-        assert!(format_utc_time(AFTER_WINDOW).is_err());
+        assert!(format_utc_time(FIRST_POST_UTC_TIME_SECOND).is_err());
     }
 
     /// The day count matches the system clock's date line.
     #[test]
     fn days_match_the_calendar() {
-        let unix = UNIX_EPOCH + Duration::from_secs(DAY_SECONDS * TWENTY_THOUSAND_DAYS);
-        let seconds = unix.duration_since(UNIX_EPOCH).expect("after").as_secs() as i64;
+        let unix = UNIX_EPOCH + Duration::new(DAY_SECONDS * TWENTY_THOUSAND_DAYS, SUBSECOND_NANOS);
+        let seconds = system_unix(unix).expect("after epoch");
+        let dt = system_date_time(unix).expect("truncates subseconds");
+        assert_eq!(
+            i64::try_from(dt.unix_duration().as_secs()).expect("fits i64"),
+            seconds
+        );
         let text = format_utc_time(seconds).expect("formats");
         assert_eq!(&text, b"241004000000Z");
+        assert!(system_unix(UNIX_EPOCH - Duration::from_secs(1)).is_err());
+        assert!(system_date_time(UNIX_EPOCH - Duration::from_secs(1)).is_err());
+    }
+
+    /// Adding calendar years clamps February 29 on common target years,
+    /// keeps February 29 on leap target years, and rejects overflows.
+    #[test]
+    fn add_years_handles_leap_days_and_bounds() {
+        assert_eq!(add_years(LEAP_DAY_2024, ONE_YEAR), Ok(CLAMPED_2025));
+        assert_eq!(add_years(LEAP_DAY_2024, FOUR_YEARS), Ok(LEAP_DAY_2028));
+        assert_eq!(add_years(CLAMPED_2025, -ONE_YEAR), Ok(FEB_28_2024));
+        assert!(add_years(0, -ONE_YEAR).is_err());
+        assert!(add_years(-1, ONE_YEAR).is_err());
+        assert!(add_years(SOME_TUESDAY, i32::MAX).is_err());
     }
 }

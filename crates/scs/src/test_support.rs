@@ -120,12 +120,23 @@ pub(crate) struct TestCertificate {
 /// Mint a minimal self-signed P-256 certificate valid across a
 /// window that includes every test run.
 pub(crate) fn mint_certificate() -> TestCertificate {
-    mint_certificate_window("200101000000Z", "400101000000Z")
+    mint_certificate_with(SERIAL_ONE, "200101000000Z", "400101000000Z")
+}
+
+/// Mint a minimal self-signed P-256 certificate with `serial`.
+pub(crate) fn mint_certificate_serial(serial: u8) -> TestCertificate {
+    mint_certificate_with(serial, "200101000000Z", "400101000000Z")
 }
 
 /// Mint a minimal self-signed P-256 certificate across the given
 /// UTCTime strings.
 pub(crate) fn mint_certificate_window(not_before: &str, not_after: &str) -> TestCertificate {
+    mint_certificate_with(SERIAL_ONE, not_before, not_after)
+}
+
+/// Mint a minimal self-signed P-256 certificate with `serial` across
+/// the given UTCTime strings.
+fn mint_certificate_with(serial: u8, not_before: &str, not_after: &str) -> TestCertificate {
     use p256::ecdsa::signature::Signer as _;
     let key = p256::ecdsa::SigningKey::from_slice(&[TEST_KEY_FILL; SECRET_LENGTH])
         .expect("fixed test key parses");
@@ -162,7 +173,7 @@ pub(crate) fn mint_certificate_window(not_before: &str, not_after: &str) -> Test
             &crate::der::integer(VERSION_THREE).expect("version"),
         )
         .expect("explicit version"),
-        &crate::der::integer(SERIAL_ONE).expect("serial"),
+        &crate::der::integer(serial).expect("serial"),
         &algorithm,
         &name,
         &validity,

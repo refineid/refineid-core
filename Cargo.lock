@@ -1280,7 +1280,6 @@ dependencies = [
  "refineid-cms",
  "refineid-digest",
  "serde_json",
- "signature",
  "spki",
  "zeroize",
 ]

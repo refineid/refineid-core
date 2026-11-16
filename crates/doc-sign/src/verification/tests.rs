@@ -1180,7 +1180,8 @@ fn an_unsupported_signature_is_its_own_row_and_blocks_the_document() {
     let twice = placeholder.finish(&cms(&parts)).expect("fits");
     let report = world.verify(twice).expect("report");
     let [first, second] = exactly(report.rows(), "two signatures");
-    assert_eq!(first.verdict(), UNCONFIRMED_REVOCATION);
+    assert_eq!(first.verdict(), Verdict::NotValid);
+    assert!(!judged(first).document_intact());
     assert!(matches!(
         second.outcome(),
         SignatureOutcome::Unsupported {
@@ -3290,6 +3291,223 @@ fn an_added_annotation_is_a_change_after_signing() {
         Revision::ChangedAfterSigning(DocumentChange::Annotation)
     );
     assert!(!signature.document_intact());
+}
+
+/// The object number of the first signature dictionary in `pdf`.
+fn signature_object_number(pdf: &[u8]) -> u32 {
+    let index = crate::pades::index::PdfIndex::parse(pdf).expect("indexes");
+    (1..next_object(pdf))
+        .find(|number| {
+            index.object_body(*number).is_some_and(|body| {
+                body.windows(b"/ByteRange".len())
+                    .any(|w| w == b"/ByteRange")
+            })
+        })
+        .expect("a signature dictionary")
+}
+
+/// `pdf` with `body` appended as annotation `number`, and `extra`
+/// objects after it.
+fn with_annotation(pdf: &[u8], number: u32, body: &str, extra: &[(u32, &str)]) -> Vec<u8> {
+    let page = edited(
+        &newest_body(pdf, PAGE_OBJECT),
+        "/Annots [",
+        &format!("/Annots [{number} 0 R "),
+    );
+    let mut objects: Vec<(u32, Vec<u8>)> =
+        vec![(number, body.as_bytes().to_vec()), (PAGE_OBJECT, page)];
+    objects.extend(extra.iter().map(|(n, text)| (*n, text.as_bytes().to_vec())));
+    let borrowed: Vec<(u32, &[u8])> = objects.iter().map(|(n, b)| (*n, b.as_slice())).collect();
+    crate::testkit::incremental_update(pdf, &borrowed)
+}
+
+#[test]
+fn an_added_signature_widget_reusing_the_signed_value_is_a_change() {
+    let world = World::new();
+    let signed = world.pdf(Signer::Direct, Stamp::None, &ValidationMaterial::default());
+    let value = signature_object_number(&signed);
+    let widget = format!(
+        "<< /Type /Annot /Subtype /Widget /FT /Sig /T (Spoof) /V {value} 0 R /Rect [0 0 595 842] >>"
+    );
+    let annotated = with_annotation(&signed, next_object(&signed), &widget, &[]);
+    let signature = first_signature(&world, annotated);
+    assert!(matches!(
+        signature.revision(),
+        Revision::ChangedAfterSigning(_)
+    ));
+    assert!(!signature.document_intact());
+    assert!(!signature.is_valid());
+}
+
+#[test]
+fn an_added_widget_with_a_stub_signature_and_full_page_appearance_is_a_change() {
+    let world = World::new();
+    let signed = world.pdf(Signer::Direct, Stamp::None, &ValidationMaterial::default());
+    let widget = next_object(&signed);
+    let stub = widget + 1;
+    let drawn = widget + 2;
+    let body = format!(
+        "<< /Type /Annot /Subtype /Widget /FT /Sig /V {stub} 0 R /Rect [0 0 595 842] /AP << /N {drawn} 0 R >> >>"
+    );
+    let stub_body = "<< /Type /Sig >>";
+    let form =
+        "<< /Type /XObject /Subtype /Form /BBox [0 0 595 842] /Length 4 >>\nstream\nq Q\nendstream";
+    let annotated = with_annotation(&signed, widget, &body, &[(stub, stub_body), (drawn, form)]);
+    let signature = first_signature(&world, annotated);
+    assert!(matches!(
+        signature.revision(),
+        Revision::ChangedAfterSigning(_)
+    ));
+    assert!(!signature.document_intact());
+}
+
+#[test]
+fn doc_mdp_no_changes_refuses_a_second_signature_but_admits_a_timestamp() {
+    let world = World::new();
+    let catalog = edited(
+        &newest_body(&minimal_pdf(), CATALOG_OBJECT),
+        "/Type /Catalog",
+        "/Type /Catalog /Perms << /DocMDP << /Type /Sig /P 1 >> >>",
+    );
+    let certified =
+        crate::testkit::incremental_update(&minimal_pdf(), &[(CATALOG_OBJECT, &catalog)]);
+    let signed = world.sign_pdf(
+        certified,
+        Signer::Direct,
+        Stamp::None,
+        &ValidationMaterial::default(),
+    );
+    let stamped = with_document_timestamp(&world, &signed);
+    let signature = first_signature(&world, stamped);
+    assert_eq!(signature.revision(), Revision::LaterRevisionsHarmless);
+    let twice = world.sign_pdf(
+        signed,
+        Signer::Rsa,
+        Stamp::None,
+        &ValidationMaterial::default(),
+    );
+    let spoiled = first_signature(&world, twice);
+    assert!(matches!(
+        spoiled.revision(),
+        Revision::ChangedAfterSigning(_)
+    ));
+}
+
+#[test]
+fn doc_mdp_no_changes_is_read_through_a_reference() {
+    let world = World::new();
+    let catalog = edited(
+        &newest_body(&minimal_pdf(), CATALOG_OBJECT),
+        "/Type /Catalog",
+        &format!("/Type /Catalog /Perms << /DocMDP {ADDED_OBJECT} 0 R >>"),
+    );
+    let certified = crate::testkit::incremental_update(
+        &minimal_pdf(),
+        &[
+            (ADDED_OBJECT, b"<< /Type /Sig /P 1 >>"),
+            (CATALOG_OBJECT, &catalog),
+        ],
+    );
+    let signed = world.sign_pdf(
+        certified,
+        Signer::Direct,
+        Stamp::None,
+        &ValidationMaterial::default(),
+    );
+    let twice = world.sign_pdf(
+        signed,
+        Signer::Rsa,
+        Stamp::None,
+        &ValidationMaterial::default(),
+    );
+    let spoiled = first_signature(&world, twice);
+    assert!(
+        matches!(spoiled.revision(), Revision::ChangedAfterSigning(_)),
+        "an indirectly held /P 1 still refuses a second signature"
+    );
+}
+
+#[test]
+fn an_appended_copy_of_a_signed_dictionary_cannot_pass_for_a_new_signature() {
+    let world = World::new();
+    let signed = signed_with_lists(&world);
+    let copied = newest_body(&signed, signature_object_number(&signed));
+    let node = next_object(&signed);
+    let copy = node + 1;
+    let drawn = node + 2;
+    let widget = format!(
+        "<< /Type /Annot /Subtype /Widget /FT /Sig /T (Copy) /V {copy} 0 R \
+         /Rect [0 0 40 20] /AP << /N {drawn} 0 R >> >>"
+    );
+    let form =
+        "<< /Type /XObject /Subtype /Form /BBox [0 0 40 20] /Length 4 >>\nstream\nq Q\nendstream";
+    let fields = edited(
+        &newest_body(&signed, FIELDS_OBJECT),
+        "]",
+        &format!("{node} 0 R]"),
+    );
+    let annots = edited(
+        &newest_body(&signed, ANNOTS_OBJECT),
+        "]",
+        &format!("{node} 0 R]"),
+    );
+    let updated = crate::testkit::incremental_update(
+        &signed,
+        &[
+            (node, widget.as_bytes()),
+            (copy, &copied),
+            (drawn, form.as_bytes()),
+            (FIELDS_OBJECT, &fields),
+            (ANNOTS_OBJECT, &annots),
+        ],
+    );
+    assert!(
+        world.verify(updated).is_err(),
+        "a copy keeps the old /Contents hole and is refused before it can bind"
+    );
+}
+
+#[test]
+fn doc_mdp_iso_standard_sig_ref_refuses_a_second_signature() {
+    let world = World::new();
+    let sig_obj = ADDED_OBJECT;
+    let ref_obj = ADDED_OBJECT + 1;
+    let params_obj = ADDED_OBJECT + 2;
+    let catalog = edited(
+        &newest_body(&minimal_pdf(), CATALOG_OBJECT),
+        "/Type /Catalog",
+        &format!("/Type /Catalog /Perms << /DocMDP {sig_obj} 0 R >>"),
+    );
+    let sig_body = format!("<< /Type /Sig /Reference [{ref_obj} 0 R] >>");
+    let ref_body =
+        format!("<< /Type /SigRef /TransformMethod /DocMDP /TransformParams {params_obj} 0 R >>");
+    let params_body = "<< /Type /TransformParams /P 1 >>";
+    let certified = crate::testkit::incremental_update(
+        &minimal_pdf(),
+        &[
+            (sig_obj, sig_body.as_bytes()),
+            (ref_obj, ref_body.as_bytes()),
+            (params_obj, params_body.as_bytes()),
+            (CATALOG_OBJECT, &catalog),
+        ],
+    );
+    let signed = world.sign_pdf(
+        certified,
+        Signer::Direct,
+        Stamp::None,
+        &ValidationMaterial::default(),
+    );
+    let twice = world.sign_pdf(
+        signed,
+        Signer::Rsa,
+        Stamp::None,
+        &ValidationMaterial::default(),
+    );
+    let spoiled = first_signature(&world, twice);
+    assert!(
+        matches!(spoiled.revision(), Revision::ChangedAfterSigning(_)),
+        "ISO 32000-1 /Reference array /P 1 refuses a second signature"
+    );
 }
 
 #[test]

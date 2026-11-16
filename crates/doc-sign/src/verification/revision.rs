@@ -28,6 +28,19 @@
 //!   `/SigFlags`, and the trailer anywhere but `/Root` and the first,
 //!   permanent `/ID` element.
 //!
+//! A signature field or widget is uploaded only by binding its `/V`
+//! one to one to a signature dictionary the caller verified
+//! cryptographically and that is new in the later revision. A
+//! document timestamp's widget is invisible: zero area, no `/AP`. A
+//! visible widget is drawn inside its page's visible box, the
+//! `/MediaBox` clipped by the `/CropBox`, and covers at most
+//! `MAX_WIDGET_PAGE_FRACTION` of it, so a later signer cannot paint
+//! over what the earlier signer saw. A signature dictionary must be
+//! written inside the ranges its own `/ByteRange` covers: a copy of an
+//! older one appended later does not define itself. A widget or field
+//! carrying an action or script key is never harmless, and a document
+//! certified with `DocMDP` `/P 1` admits no visible widget at all.
+//!
 //! Anything else, a new object that is none of these included, is a
 //! change after signing, typed by what it touches.
 //!
@@ -146,6 +159,44 @@ const TYPE_OBJECT_STREAM: &[u8] = b"ObjStm";
 const SUBTYPE_WIDGET: &[u8] = b"Widget";
 /// `/FT` of a signature field (ISO 32000-1 sec.12.7.4.5).
 const FIELD_TYPE_SIGNATURE: &[u8] = b"Sig";
+/// `/Type` of a document timestamp dictionary (`ETSI EN 319 142-1`
+/// V1.2.1 clause 5.4.3).
+const TYPE_DOCUMENT_TIMESTAMP: &[u8] = b"DocTimeStamp";
+/// Key of a page's media box (ISO 32000-1 sec.7.7.3.3, Table 30).
+const KEY_MEDIA_BOX: &[u8] = b"MediaBox";
+/// Key of a page's crop box, the part of the media box a viewer shows.
+const KEY_CROP_BOX: &[u8] = b"CropBox";
+/// Key of the catalog's permissions dictionary (ISO 32000-1
+/// sec.12.8.2.3).
+const KEY_PERMS: &[u8] = b"Perms";
+/// Key of the permissions dictionary's `DocMDP` signature.
+const KEY_DOC_MDP: &[u8] = b"DocMDP";
+/// Key of a `DocMDP` signature's permission level (ISO 32000-1
+/// sec.12.8.2.2, Table 254).
+const KEY_PERMISSION: &[u8] = b"P";
+/// Key of an annotation's appearance characteristics dictionary (ISO 32000-1 sec.12.5.6.19, Table 189).
+const KEY_MK: &[u8] = b"MK";
+/// Key of a signature dictionary's reference array (ISO 32000-1 sec.12.8.1, Table 252).
+const KEY_REFERENCE: &[u8] = b"Reference";
+/// Key of a signature reference dictionary's transform method (ISO 32000-1 sec.12.8.2.2, Table 253).
+const KEY_TRANSFORM_METHOD: &[u8] = b"TransformMethod";
+/// Key of a signature reference dictionary's transform parameters (ISO 32000-1 sec.12.8.2.2, Table 253).
+const KEY_TRANSFORM_PARAMS: &[u8] = b"TransformParams";
+/// Key of an annotation's modification date (ISO 32000-1 sec.12.5.2, Table 168).
+const KEY_MODIFICATION_DATE: &[u8] = b"M";
+/// Key of an annotation's flags (ISO 32000-1 sec.12.5.3, Table 169).
+const KEY_ANNOTATION_FLAGS: &[u8] = b"F";
+/// Key of a field's default appearance string (ISO 32000-1 sec.12.7.3.3, Table 220).
+const KEY_DEFAULT_APPEARANCE: &[u8] = b"DA";
+/// Keys a post-signature field or widget may not carry: they act or
+/// script (ISO 32000-1 sec.12.6), or hide the annotation
+/// (sec.12.5.4).
+const FORBIDDEN_WIDGET_KEYS: [&[u8]; 7] =
+    [b"A", b"AA", b"Dest", b"JS", b"JavaScript", b"Launch", b"OC"];
+/// The four numbers a rectangle or box holds (ISO 32000-1 sec.7.9.5).
+const BOX_CORNERS: usize = 4;
+/// Most of a page's area a visible post-signature widget may cover.
+const MAX_WIDGET_PAGE_FRACTION: f64 = 0.20;
 
 /// Most `/Parent` links followed, and most `/Kids` levels walked, in a
 /// field tree; a real one is a handful deep.
@@ -196,19 +247,27 @@ pub enum Revision {
 /// whose newest view is `latest`. `None` when the first `end` bytes do
 /// not index as a document of their own, or either view exceeds
 /// [`MAX_COMPARED_OBJECTS`] or [`MAX_COMPARED_BYTES`].
-pub(crate) fn later_revisions(file: &[u8], end: usize, latest: &PdfIndex<'_>) -> Option<Revision> {
+pub(crate) fn later_revisions(
+    file: &[u8],
+    end: usize,
+    latest: &PdfIndex<'_>,
+    verified: &HashSet<u32>,
+) -> Option<Revision> {
     if end == file.len() {
         return Some(Revision::WholeDocument);
     }
     let signed = PdfIndex::parse(file.get(..end)?).ok()?;
     let before = Snapshot::new(&signed)?;
     let after = Snapshot::new(latest)?;
+    let refuses_changes = refuses_changes(&before);
     Some(
         Comparison {
             before: &before,
             after: &after,
             after_roles: Roles::of(&after),
             before_roles: Roles::of(&before),
+            bindings: bindings(&before, &after, verified, refuses_changes),
+            refuses_changes,
         }
         .first_change()
         .map_or(
@@ -407,6 +466,8 @@ struct Snapshot {
     trailer: BTreeMap<Vec<u8>, Value>,
     /// The catalog.
     root: PdfObjectReference,
+    /// The file offset of each object written directly, by number.
+    offsets: HashMap<u32, usize>,
 }
 
 impl Snapshot {
@@ -425,8 +486,12 @@ impl Snapshot {
             return None;
         }
         let mut objects = HashMap::new();
+        let mut offsets = HashMap::new();
         let mut read = 0_usize;
         for reference in live {
+            if let Some(offset) = index.object_offset(reference) {
+                offsets.insert(reference.number, offset);
+            }
             let Some(body) = index.object_body_reference(reference) else {
                 continue;
             };
@@ -443,7 +508,14 @@ impl Snapshot {
             objects,
             trailer,
             root,
+            offsets,
         })
+    }
+
+    /// The file offset the object `reference` is written at, when it is
+    /// written directly rather than inside an object stream.
+    fn file_offset(&self, reference: PdfObjectReference) -> Option<usize> {
+        self.offsets.get(&reference.number).copied()
     }
 
     /// The live object `reference` names, number and generation.
@@ -581,15 +653,6 @@ impl Snapshot {
             })
     }
 
-    /// Whether `reference` is a widget, `/Subtype /Widget` itself, of a
-    /// signed signature field.
-    fn is_signed_widget(&self, reference: PdfObjectReference) -> bool {
-        self.is_signed(reference)
-            && self
-                .object(reference)
-                .is_some_and(|object| object.names(KEY_SUBTYPE, SUBTYPE_WIDGET))
-    }
-
     /// The pages of this view: every live `/Type /Page` object.
     fn pages(&self) -> Vec<(PdfObjectReference, &Object)> {
         self.objects
@@ -605,6 +668,102 @@ impl Snapshot {
                 )
             })
             .collect()
+    }
+
+    /// The page box each annotation is drawn on and that box's area,
+    /// by annotation object number, paired with the page's object
+    /// number. An annotation listed on several pages gets the smallest,
+    /// so a widget cannot hide a large one on a small page behind a
+    /// large one elsewhere.
+    fn page_annotations(&self) -> HashMap<u32, (u32, [f64; BOX_CORNERS])> {
+        let mut pages: HashMap<u32, (u32, [f64; BOX_CORNERS])> = HashMap::new();
+        for (reference, page) in self.pages() {
+            let Some(box_) = self.visible_page_box(reference) else {
+                continue;
+            };
+            for annotation in self.list(page.entry(KEY_ANNOTS)).unwrap_or_default() {
+                pages
+                    .entry(annotation.number)
+                    .and_modify(|(page_num, kept)| {
+                        if box_area(box_) < box_area(*kept) {
+                            *page_num = reference.number;
+                            *kept = box_;
+                        }
+                    })
+                    .or_insert((reference.number, box_));
+            }
+        }
+        pages
+    }
+
+    /// The part of a page a viewer shows: the media box clipped by the
+    /// crop box (ISO 32000-1 sec.7.7.3.3), inherited through `/Parent`
+    /// like either box. `None` when no media box is reachable within
+    /// the inheritance bound, or the boxes do not overlap: a page whose
+    /// area cannot be known cannot bound what a widget covers.
+    fn visible_page_box(&self, page: PdfObjectReference) -> Option<[f64; BOX_CORNERS]> {
+        let media = self.inherited_box(page, KEY_MEDIA_BOX)?;
+        match self.inherited_box(page, KEY_CROP_BOX) {
+            Some(crop) => intersect_boxes(media, crop),
+            None => Some(media),
+        }
+    }
+
+    /// A page box, normalized, inherited through `/Parent` when the
+    /// page states none; `None` when neither does.
+    fn inherited_box(&self, page: PdfObjectReference, key: &[u8]) -> Option<[f64; BOX_CORNERS]> {
+        let mut current = page;
+        let mut seen = HashSet::new();
+        for _ in 0..MAX_FIELD_DEPTH {
+            if !seen.insert(current) {
+                break;
+            }
+            let Some(object) = self.object(current) else {
+                break;
+            };
+            if let Some(value) = object.entry(key) {
+                return self.box_array(value).map(normalized_box);
+            }
+            match object.entry(KEY_PARENT) {
+                Some(Value::Reference(parent)) => current = *parent,
+                _ => break,
+            }
+        }
+        None
+    }
+
+    /// A rectangle or box of four numbers, inline or indirect.
+    fn box_array(&self, value: &Value) -> Option<[f64; BOX_CORNERS]> {
+        let Value::Array(items) = self.resolve(value)? else {
+            return None;
+        };
+        if items.len() != BOX_CORNERS {
+            return None;
+        }
+        let mut corners = [0.0; BOX_CORNERS];
+        for (corner, item) in corners.iter_mut().zip(items) {
+            let n = self.number(item)?;
+            if !n.is_finite() {
+                return None;
+            }
+            *corner = n;
+        }
+        Some(corners)
+    }
+
+    /// One number, inline or indirect, parsed according to PDF numeric
+    /// syntax (ISO 32000-1 sec.7.3.4): optional sign, decimal digits,
+    /// optional single decimal point, no exponents, finite f64.
+    fn number(&self, value: &Value) -> Option<f64> {
+        let Value::Token(token) = self.resolve(value)? else {
+            return None;
+        };
+        parse_pdf_number(token)
+    }
+
+    /// An annotation's `/Rect`.
+    fn rect(&self, reference: PdfObjectReference) -> Option<[f64; BOX_CORNERS]> {
+        self.box_array(self.object(reference)?.entry(KEY_RECT)?)
     }
 
     /// What a change to `object`, the object `reference` names in this
@@ -639,12 +798,6 @@ struct Roles {
     /// The interactive form and its `/Fields` array, when indirect, and
     /// each page's `/Annots` array, when indirect: judged as a whole.
     lists: HashSet<PdfObjectReference>,
-    /// The signature dictionaries signed fields of the field tree name
-    /// as their `/V`.
-    signature_values: HashSet<PdfObjectReference>,
-    /// The objects reached from the `/AP` of the signed signature
-    /// fields and widgets of the field tree.
-    appearances: HashSet<PdfObjectReference>,
     /// The trailer's `/Info` and the catalog's `/Metadata`.
     metadata: HashSet<PdfObjectReference>,
     /// The nodes of the form's field tree; empty when it does not read.
@@ -673,20 +826,6 @@ impl Roles {
             roles.lists.extend(indirect(page.entry(KEY_ANNOTS)));
         }
         roles.field_tree = view.field_tree().unwrap_or_default();
-        for node in roles.field_tree.clone() {
-            if !view.is_signed_field_node(node) {
-                continue;
-            }
-            let Some(object) = view.object(node) else {
-                continue;
-            };
-            roles
-                .signature_values
-                .extend(indirect(object.entry(KEY_VALUE)));
-            if let Some(appearance) = object.entry(KEY_APPEARANCE) {
-                roles.appearances.extend(reached_from(view, appearance));
-            }
-        }
         roles
     }
 
@@ -766,6 +905,454 @@ fn reached_from(view: &Snapshot, value: &Value) -> HashSet<PdfObjectReference> {
     reached
 }
 
+/// What the added or newly filled signature fields and widgets of a
+/// later revision bind: one widget and one field per verified
+/// signature.
+#[derive(Default)]
+struct Bindings {
+    /// Whether every added or filled node follows the rules.
+    valid: bool,
+    /// The field and widget object numbers a later revision added or
+    /// filled.
+    nodes: HashSet<u32>,
+    /// The verified signature objects they name as `/V`.
+    signatures: HashSet<u32>,
+    /// New objects an approved visible appearance draws from.
+    appearance_objects: HashSet<PdfObjectReference>,
+    /// Cumulative visible widget area approved per page object number.
+    cumulative_page_areas: HashMap<u32, f64>,
+}
+
+impl Bindings {
+    /// Whether `reference` is a field or widget bound above.
+    fn node(&self, reference: PdfObjectReference) -> bool {
+        self.nodes.contains(&reference.number)
+    }
+
+    /// Whether `reference` is a verified signature object bound above.
+    fn signature(&self, reference: PdfObjectReference) -> bool {
+        reference.generation == 0 && self.signatures.contains(&reference.number)
+    }
+}
+
+/// The bindings `after` makes for the signature objects `verified`
+/// names, judged against `before`.
+fn bindings(
+    before: &Snapshot,
+    after: &Snapshot,
+    verified: &HashSet<u32>,
+    refuses_changes: bool,
+) -> Bindings {
+    let mut bound = Bindings {
+        valid: true,
+        ..Bindings::default()
+    };
+    let Some(tree) = after.field_tree() else {
+        bound.valid = false;
+        return bound;
+    };
+    let pages = after.page_annotations();
+
+    // Collect each unique new or newly signed signature field.
+    let mut fields: HashSet<PdfObjectReference> = HashSet::new();
+    for node in &tree {
+        if let Some((field, FieldType::Signature)) = after.field_node(*node)
+            && is_new_signature_node(before, after, field)
+        {
+            fields.insert(field);
+        }
+    }
+
+    for field in fields {
+        let Some(field_object) = after.object(field) else {
+            bound.valid = false;
+            continue;
+        };
+        let Some(signature) =
+            approved_signature(before, after, field_object, verified, refuses_changes)
+        else {
+            bound.valid = false;
+            continue;
+        };
+        if !bound.signatures.insert(signature.number) {
+            bound.valid = false;
+            continue;
+        }
+
+        // Add the field and its parent chain up the tree to approved nodes.
+        bound.nodes.insert(field.number);
+        let mut ancestor = field;
+        for _ in 0..MAX_FIELD_DEPTH {
+            let Some(object) = after.object(ancestor) else {
+                break;
+            };
+            bound.nodes.insert(ancestor.number);
+            match object.entry(KEY_PARENT) {
+                Some(Value::Reference(parent)) => ancestor = *parent,
+                _ => break,
+            }
+        }
+
+        let timestamp = after
+            .object(signature)
+            .is_some_and(|object| object.names(KEY_TYPE, TYPE_DOCUMENT_TIMESTAMP));
+
+        // Collect the field's widget annotations.
+        let mut widgets = Vec::new();
+        if field_object.names(KEY_SUBTYPE, SUBTYPE_WIDGET) {
+            widgets.push(field);
+        }
+        for kid in after.list(field_object.entry(KEY_KIDS)).unwrap_or_default() {
+            if !widgets.contains(&kid)
+                && after
+                    .object(kid)
+                    .is_some_and(|object| object.names(KEY_SUBTYPE, SUBTYPE_WIDGET))
+            {
+                widgets.push(kid);
+            }
+        }
+
+        if !bind_widgets(
+            &mut bound, before, after, signature, &widgets, &pages, timestamp,
+        ) {
+            bound.valid = false;
+        }
+    }
+    bound
+}
+
+/// Whether `node` is a node a later revision added or filled with a
+/// signature.
+fn is_new_signature_node(before: &Snapshot, after: &Snapshot, node: PdfObjectReference) -> bool {
+    match before.object(node) {
+        None => after.is_signed_field_node(node),
+        Some(_) => after.is_signed(node) && !before.is_signed(node),
+    }
+}
+
+/// The signature `field`'s `/V` names, when it is a verified dictionary
+/// new in `after` and the rules for `field` allow it.
+fn approved_signature(
+    before: &Snapshot,
+    after: &Snapshot,
+    field: &Object,
+    verified: &HashSet<u32>,
+    refuses_changes: bool,
+) -> Option<PdfObjectReference> {
+    if has_forbidden_keys(field) {
+        return None;
+    }
+    let Some(Value::Reference(signature)) = field.entry(KEY_VALUE) else {
+        return None;
+    };
+    if signature.generation != 0 || before.object(*signature).is_some() {
+        return None;
+    }
+    let object = after.object(*signature)?;
+    if !object.is_signature_value() || !defines_itself(after, *signature) {
+        return None;
+    }
+    let timestamp = object.names(KEY_TYPE, TYPE_DOCUMENT_TIMESTAMP);
+    if !timestamp && !verified.contains(&signature.number) {
+        return None;
+    }
+    if !timestamp && refuses_changes {
+        return None;
+    }
+    Some(*signature)
+}
+
+/// Binds `widgets` to `signature`, checking their geometry, appearance,
+/// and cumulative page area. `false` when any is not allowed.
+fn bind_widgets(
+    bound: &mut Bindings,
+    before: &Snapshot,
+    after: &Snapshot,
+    signature: PdfObjectReference,
+    widgets: &[PdfObjectReference],
+    pages: &HashMap<u32, (u32, [f64; BOX_CORNERS])>,
+    timestamp: bool,
+) -> bool {
+    for widget in widgets {
+        let Some(object) = after.object(*widget) else {
+            return false;
+        };
+        if has_forbidden_keys(object) {
+            return false;
+        }
+        if let Some(own) = object.entry(KEY_VALUE) {
+            match own {
+                Value::Reference(value) if value == &signature => {}
+                _ => return false,
+            }
+        }
+        bound.nodes.insert(widget.number);
+        let appearance = object.entry(KEY_APPEARANCE);
+        let invisible = appearance.is_none()
+            && (after.rect(*widget).is_none() || is_invisible(after.rect(*widget)));
+        if timestamp {
+            if appearance.is_some() || !is_invisible(after.rect(*widget)) {
+                return false;
+            }
+        } else if !invisible {
+            let Some((page_id, page)) = pages.get(&widget.number) else {
+                // A visible widget no page draws cannot be judged: refuse it.
+                return false;
+            };
+            let Some(rect) = after.rect(*widget) else {
+                return false;
+            };
+            if !fits_in_page(rect, *page) {
+                return false;
+            }
+            let page_area = (page[1] - page[0]) * (page[3] - page[2]);
+            let widget_box = normalized_box(rect);
+            let widget_area = (widget_box[1] - widget_box[0]) * (widget_box[3] - widget_box[2]);
+            let cumulative = bound.cumulative_page_areas.entry(*page_id).or_insert(0.0);
+            *cumulative += widget_area;
+            if *cumulative > page_area * MAX_WIDGET_PAGE_FRACTION {
+                return false;
+            }
+        }
+        if !timestamp {
+            if let Some(appearance) = appearance {
+                if let Value::Reference(reference) = appearance
+                    && before.object(*reference).is_none()
+                {
+                    bound.appearance_objects.insert(*reference);
+                }
+                for object in reached_from(after, appearance) {
+                    if before.object(object).is_none() {
+                        bound.appearance_objects.insert(object);
+                    }
+                }
+            }
+            if let Some(mk) = object.entry(KEY_MK) {
+                if let Value::Reference(reference) = mk
+                    && before.object(*reference).is_none()
+                {
+                    bound.appearance_objects.insert(*reference);
+                }
+                for object in reached_from(after, mk) {
+                    if before.object(object).is_none() {
+                        bound.appearance_objects.insert(object);
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Whether the signature dictionary `signature` is written inside the
+/// ranges its own `/ByteRange` covers. A copy of an older signature
+/// dictionary appended in a later revision keeps the old range, so it
+/// does not define itself and cannot pass for a new signature.
+fn defines_itself(view: &Snapshot, signature: PdfObjectReference) -> bool {
+    let Some(offset) = view.file_offset(signature) else {
+        return false;
+    };
+    view.object(signature)
+        .and_then(byte_range_spans)
+        .is_some_and(|spans| {
+            spans
+                .iter()
+                .any(|(start, end)| offset >= *start && offset < *end)
+        })
+}
+
+/// The spans a signature dictionary's `/ByteRange` names: a start and
+/// a length for each of two spans (ISO 32000-1 sec.12.8.1).
+fn byte_range_spans(object: &Object) -> Option<[(usize, usize); 2]> {
+    let Some(Value::Array(items)) = object.entry(KEY_BYTE_RANGE) else {
+        return None;
+    };
+    let [start, length, second_start, second_length] = items.as_slice() else {
+        return None;
+    };
+    let number = |value: &Value| match value {
+        Value::Token(token) => core::str::from_utf8(token).ok()?.parse::<usize>().ok(),
+        Value::Dictionary(_) | Value::Array(_) | Value::Name(_) | Value::Reference(_) => None,
+    };
+    let start = number(start)?;
+    let length = number(length)?;
+    let second_start = number(second_start)?;
+    let second_length = number(second_length)?;
+    if start != 0 || second_start <= length {
+        return None;
+    }
+    let end = start.checked_add(length)?;
+    let second_end = second_start.checked_add(second_length)?;
+    Some([(start, end), (second_start, second_end)])
+}
+
+/// Whether `object` carries an action, script or hiding key.
+fn has_forbidden_keys(object: &Object) -> bool {
+    object.dictionary().is_some_and(|entries| {
+        entries
+            .keys()
+            .any(|key| FORBIDDEN_WIDGET_KEYS.contains(&key.as_slice()))
+    })
+}
+
+/// Whether a widget's rectangle draws nothing.
+fn is_invisible(rect: Option<[f64; BOX_CORNERS]>) -> bool {
+    rect.is_some_and(|rect| {
+        if !rect.iter().all(|value| value.is_finite()) {
+            return false;
+        }
+        let box_ = normalized_box(rect);
+        box_[1] - box_[0] == 0.0 && box_[3] - box_[2] == 0.0
+    })
+}
+
+/// The area of a normalized box.
+fn box_area(box_: [f64; BOX_CORNERS]) -> f64 {
+    (box_[1] - box_[0]) * (box_[3] - box_[2])
+}
+
+/// The intersection of two normalized boxes, when it has an area.
+fn intersect_boxes(
+    first: [f64; BOX_CORNERS],
+    second: [f64; BOX_CORNERS],
+) -> Option<[f64; BOX_CORNERS]> {
+    let box_ = [
+        first[0].max(second[0]),
+        first[1].min(second[1]),
+        first[2].max(second[2]),
+        first[3].min(second[3]),
+    ];
+    (box_.iter().all(|value| value.is_finite()) && box_[1] > box_[0] && box_[3] > box_[2])
+        .then_some(box_)
+}
+
+/// Whether `rect` sits inside `page` and covers no more than
+/// [`MAX_WIDGET_PAGE_FRACTION`] of its area.
+fn fits_in_page(rect: [f64; BOX_CORNERS], page: [f64; BOX_CORNERS]) -> bool {
+    if !rect
+        .iter()
+        .chain(page.iter())
+        .all(|value| value.is_finite())
+    {
+        return false;
+    }
+    let widget = normalized_box(rect);
+    let page_area = (page[1] - page[0]) * (page[3] - page[2]);
+    if !page_area.is_finite() || page_area <= 0.0 {
+        return false;
+    }
+    if widget[0] < page[0] || widget[1] > page[1] || widget[2] < page[2] || widget[3] > page[3] {
+        return false;
+    }
+    let area = (widget[1] - widget[0]) * (widget[3] - widget[2]);
+    area.is_finite() && area <= page_area * MAX_WIDGET_PAGE_FRACTION
+}
+
+/// `(minX, maxX, minY, maxY)` of a four-number box.
+fn normalized_box(box_: [f64; BOX_CORNERS]) -> [f64; BOX_CORNERS] {
+    [
+        box_[0].min(box_[2]),
+        box_[0].max(box_[2]),
+        box_[1].min(box_[3]),
+        box_[1].max(box_[3]),
+    ]
+}
+
+/// Parse a number according to PDF numeric syntax (ISO 32000-1
+/// sec.7.3.4): an integer or real consisting of an optional sign, one
+/// or more decimal digits, and at most one decimal point. Rejects
+/// exponents, NaN, infinity, and empty tokens.
+fn parse_pdf_number(token: &[u8]) -> Option<f64> {
+    if token.is_empty() {
+        return None;
+    }
+    let mut has_digit = false;
+    let mut has_dot = false;
+    for (i, &byte) in token.iter().enumerate() {
+        if (byte == b'+' || byte == b'-') && i == 0 {
+            continue;
+        }
+        if byte == b'.' && !has_dot {
+            has_dot = true;
+            continue;
+        }
+        if byte.is_ascii_digit() {
+            has_digit = true;
+            continue;
+        }
+        return None;
+    }
+    if !has_digit {
+        return None;
+    }
+    let s = core::str::from_utf8(token).ok()?;
+    let n: f64 = s.parse().ok()?;
+    if n.is_finite() { Some(n) } else { None }
+}
+
+/// Whether the catalog's permissions forbid every later change
+/// (`DocMDP` `/P 1`, ISO 32000-1 sec.12.8.2.2).
+fn refuses_changes(view: &Snapshot) -> bool {
+    let Some(catalog) = view.catalog() else {
+        return false;
+    };
+    let Some(permissions) = catalog
+        .entry(KEY_PERMS)
+        .and_then(|value| view.resolve(value))
+        .and_then(Value::dictionary)
+    else {
+        return false;
+    };
+    let Some(doc_mdp) = permissions
+        .get(KEY_DOC_MDP)
+        .and_then(|value| view.resolve(value))
+        .and_then(Value::dictionary)
+    else {
+        return false;
+    };
+    // Direct /P entry (synthetic / test form).
+    if doc_mdp
+        .get(KEY_PERMISSION)
+        .and_then(|value| view.number(value))
+        == Some(1.0)
+    {
+        return true;
+    }
+    // Standard ISO 32000-1 Table 252 /Reference array on the certification signature dictionary.
+    if let Some(references) = doc_mdp.get(KEY_REFERENCE) {
+        let list = match view.resolve(references) {
+            Some(Value::Array(items)) => items,
+            _ => return false,
+        };
+        for item in list {
+            let Some(ref_dict) = view.resolve(item).and_then(Value::dictionary) else {
+                continue;
+            };
+            let is_doc_mdp = match ref_dict
+                .get(KEY_TRANSFORM_METHOD)
+                .and_then(|m| view.resolve(m))
+            {
+                Some(Value::Name(name)) => name.as_slice() == KEY_DOC_MDP,
+                _ => false,
+            };
+            if !is_doc_mdp {
+                continue;
+            }
+            let Some(params) = ref_dict
+                .get(KEY_TRANSFORM_PARAMS)
+                .and_then(|p| view.resolve(p))
+                .and_then(Value::dictionary)
+            else {
+                continue;
+            };
+            if params.get(KEY_PERMISSION).and_then(|v| view.number(v)) == Some(1.0) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// How one object number fares between the two views.
 enum Fate<'o> {
     /// New in a later revision.
@@ -789,6 +1376,10 @@ struct Comparison<'s> {
     after_roles: Roles,
     /// The roles in the signed revision.
     before_roles: Roles,
+    /// The bindings the later revision's signature nodes make.
+    bindings: Bindings,
+    /// Whether the signed revision's `DocMDP` forbids changes.
+    refuses_changes: bool,
 }
 
 impl Comparison<'_> {
@@ -864,16 +1455,15 @@ impl Comparison<'_> {
         let removed = old_tree.iter().any(|node| !new_tree.contains(node));
         let foreign = new_tree
             .iter()
-            .filter(|node| !old_tree.contains(node))
-            .any(|node| !self.after.is_signed_field_node(*node));
-        (removed || foreign).then_some(DocumentChange::FormField)
+            .filter(|node| !old_tree.contains(*node))
+            .any(|node| !self.bindings.node(*node));
+        (removed || foreign || !self.bindings.valid).then_some(DocumentChange::FormField)
     }
 
     /// Each page's `/Annots`, resolved on both sides: the annotations
     /// already there kept in their order, and every one added a widget
     /// of a signed signature field of the field tree.
     fn annotations(&self) -> Option<DocumentChange> {
-        let tree = &self.after_roles.field_tree;
         let mut changes = Vec::new();
         for (reference, newer) in self.after.pages() {
             let Some(older) = self
@@ -899,11 +1489,7 @@ impl Comparison<'_> {
                 changes.push(DocumentChange::Annotation);
             }
             for added in new.iter().filter(|annotation| !old.contains(annotation)) {
-                let attached = self
-                    .after
-                    .field_node(*added)
-                    .is_some_and(|(node, _)| tree.contains(&node) || tree.contains(added));
-                if !(attached && self.after.is_signed_widget(*added)) {
+                if !self.bindings.node(*added) {
                     changes.push(if self.after.field_type(*added).is_some() {
                         DocumentChange::FormField
                     } else {
@@ -911,6 +1497,9 @@ impl Comparison<'_> {
                     });
                 }
             }
+        }
+        if !self.bindings.valid {
+            changes.push(DocumentChange::FormField);
         }
         changes.into_iter().min()
     }
@@ -964,12 +1553,11 @@ impl Comparison<'_> {
                     || roles.store_entries.contains(&reference)
                     || roles.store_streams.contains(&reference)
                     || roles.lists.contains(&reference)
-                    || (newer.is_signature_value() && roles.signature_values.contains(&reference))
-                    || (self.after.is_signed_field_node(reference)
-                        && roles.field_tree.contains(&reference))
+                    || self.bindings.node(reference)
+                    || self.bindings.signature(reference)
                     || (kind == DocumentChange::Content
-                        && (roles.appearances.contains(&reference)
-                            || roles.metadata.contains(&reference)));
+                        && (self.bindings.appearance_objects.contains(&reference)
+                            || (!self.refuses_changes && roles.metadata.contains(&reference))));
                 (!harmless).then_some(kind)
             }
             Fate::Replaced { older, newer } => {
@@ -992,7 +1580,7 @@ impl Comparison<'_> {
                     return None;
                 }
                 if reference.number == self.after.root.number {
-                    return Self::catalog(older, newer);
+                    return Self::catalog(older, newer, self.refuses_changes);
                 }
                 if older.names(KEY_TYPE, TYPE_PAGE) && newer.names(KEY_TYPE, TYPE_PAGE) {
                     return Self::page(older, newer);
@@ -1008,15 +1596,19 @@ impl Comparison<'_> {
     /// A rewritten catalog: every entry other than `/DSS`, `/AcroForm`,
     /// `/Extensions` and `/Metadata` unchanged; those are judged on
     /// their own.
-    fn catalog(older: &Object, newer: &Object) -> Option<DocumentChange> {
+    fn catalog(older: &Object, newer: &Object, refuses_changes: bool) -> Option<DocumentChange> {
         let (Some(old), Some(new)) = (older.dictionary(), newer.dictionary()) else {
             return Some(DocumentChange::Catalog);
         };
-        changed_beyond(
-            old,
-            new,
-            &[KEY_DSS, KEY_ACROFORM, KEY_EXTENSIONS, KEY_METADATA],
-        )
+        if refuses_changes {
+            changed_beyond(old, new, &[KEY_DSS, KEY_ACROFORM])
+        } else {
+            changed_beyond(
+                old,
+                new,
+                &[KEY_DSS, KEY_ACROFORM, KEY_EXTENSIONS, KEY_METADATA],
+            )
+        }
         .then_some(DocumentChange::Catalog)
     }
 
@@ -1048,8 +1640,21 @@ impl Comparison<'_> {
             return Some(DocumentChange::FormField);
         };
         let filled = !self.before.is_signed(reference) && self.after.is_signed(reference);
-        (!filled || changed_beyond(old, new, &[KEY_VALUE, KEY_APPEARANCE, KEY_APPEARANCE_STATE]))
-            .then_some(DocumentChange::FormField)
+        (!filled
+            || !self.bindings.node(reference)
+            || changed_beyond(
+                old,
+                new,
+                &[
+                    KEY_VALUE,
+                    KEY_APPEARANCE,
+                    KEY_APPEARANCE_STATE,
+                    KEY_MODIFICATION_DATE,
+                    KEY_ANNOTATION_FLAGS,
+                    KEY_DEFAULT_APPEARANCE,
+                ],
+            ))
+        .then_some(DocumentChange::FormField)
     }
 }
 
@@ -1063,4 +1668,76 @@ fn changed_beyond(
         .chain(new.keys())
         .filter(|key| !free.contains(&key.as_slice()))
         .any(|key| old.get(key) != new.get(key))
+}
+
+#[cfg(test)]
+mod page_geometry_tests {
+    use super::{PdfIndex, PdfObjectReference, Snapshot, fits_in_page};
+
+    #[test]
+    fn the_visible_page_box_is_the_crop_box_clipped_to_the_media_box() {
+        let pdf = crate::testkit::incremental_update(
+            &crate::testkit::minimal_pdf(),
+            &[(
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /CropBox [0 0 100 50] >>",
+            )],
+        );
+        let index = PdfIndex::parse(&pdf).expect("indexes");
+        let view = Snapshot::new(&index).expect("a view");
+        let page = PdfObjectReference {
+            number: 3,
+            generation: 0,
+        };
+        let visible = view.visible_page_box(page).expect("a visible box");
+        assert_eq!(visible, [0.0, 100.0, 0.0, 50.0]);
+        assert!(fits_in_page([0.0, 0.0, 20.0, 20.0], visible));
+        assert!(
+            !fits_in_page([0.0, 0.0, 100.0, 50.0], visible),
+            "the crop box is the page a viewer shows"
+        );
+    }
+
+    #[test]
+    fn a_page_without_a_crop_box_shows_its_media_box() {
+        let pdf = crate::testkit::minimal_pdf();
+        let index = PdfIndex::parse(&pdf).expect("indexes");
+        let view = Snapshot::new(&index).expect("a view");
+        let page = PdfObjectReference {
+            number: 3,
+            generation: 0,
+        };
+        assert_eq!(view.visible_page_box(page), Some([0.0, 200.0, 0.0, 200.0]));
+    }
+}
+
+#[cfg(test)]
+mod pdf_number_parsing_tests {
+    use super::parse_pdf_number;
+
+    #[test]
+    fn parses_valid_integers_and_reals() {
+        assert_eq!(parse_pdf_number(b"0"), Some(0.0));
+        assert_eq!(parse_pdf_number(b"-1"), Some(-1.0));
+        assert_eq!(parse_pdf_number(b"+42.5"), Some(42.5));
+        assert_eq!(parse_pdf_number(b"42.125"), Some(42.125));
+        assert_eq!(parse_pdf_number(b".5"), Some(0.5));
+        assert_eq!(parse_pdf_number(b"10."), Some(10.0));
+    }
+
+    #[test]
+    fn rejects_nan_inf_and_exponents() {
+        assert_eq!(parse_pdf_number(b"NaN"), None);
+        assert_eq!(parse_pdf_number(b"nan"), None);
+        assert_eq!(parse_pdf_number(b"inf"), None);
+        assert_eq!(parse_pdf_number(b"-inf"), None);
+        assert_eq!(parse_pdf_number(b"+inf"), None);
+        assert_eq!(parse_pdf_number(b"1e5"), None);
+        assert_eq!(parse_pdf_number(b"1E-3"), None);
+        assert_eq!(parse_pdf_number(b"."), None);
+        assert_eq!(parse_pdf_number(b"+"), None);
+        assert_eq!(parse_pdf_number(b"-"), None);
+        assert_eq!(parse_pdf_number(b"+."), None);
+        assert_eq!(parse_pdf_number(b""), None);
+    }
 }

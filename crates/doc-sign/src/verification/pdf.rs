@@ -38,6 +38,7 @@
 //! incremental update that extends the store rewrites it with the
 //! earlier entries carried forward.
 
+use super::{CadesSignature, Content, EssBinding};
 use crate::ber::{BerTlv, Sequence};
 use crate::cades::DigestAlgorithm;
 use crate::pades::PdfError;
@@ -45,9 +46,11 @@ use crate::pades::index::{
     ARRAY_CLOSE, ARRAY_OPEN, ObjectDictionary, PdfDictionary, PdfIndex, PdfValueParser,
     complete_object_reference, dictionary_at, parse_usize, validation_references,
 };
+use crate::timestamp::verify_token;
 use crate::validation::ValidationMaterial;
 use crate::verification::revision::{Revision, later_revisions};
 use refineid_cms::x509::DateTime;
+use std::collections::HashSet;
 
 /// The header every PDF file starts with (ISO 32000-1 sec.7.5.2).
 const PDF_HEADER: &[u8] = b"%PDF-";
@@ -297,6 +300,8 @@ impl ByteRange {
 /// One signature or document timestamp dictionary of the document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PdfSignature {
+    /// The object number of the dictionary itself.
+    object_number: u32,
     /// What the dictionary declares itself to be.
     kind: SignatureKind,
     /// The DER element in the `/Contents` hole, padding removed.
@@ -311,6 +316,13 @@ pub struct PdfSignature {
 }
 
 impl PdfSignature {
+    /// The object number of the signature dictionary, which a later
+    /// revision binds a signature field or widget to.
+    #[must_use]
+    pub const fn object_number(&self) -> u32 {
+        self.object_number
+    }
+
     /// What the dictionary declares itself to be.
     #[must_use]
     pub const fn kind(&self) -> SignatureKind {
@@ -408,11 +420,75 @@ impl<'a> PdfDocument<'a> {
             (signature.byte_range.end(), signature.byte_range.hole_start)
         });
         let validation_store = validation_store(&index, index.trailer(), &trailer)?;
-        Ok(Self {
+        let mut document = Self {
             file,
             signatures,
             validation_store,
-        })
+        };
+        let verified = document.verified_signatures();
+        document.judge_revisions(&verified)?;
+        Ok(document)
+    }
+
+    /// The object numbers of the signature dictionaries whose own CMS or
+    /// timestamp token verifies over the bytes it claims. A later
+    /// revision may bind a signature field or widget to these only.
+    fn verified_signatures(&self) -> HashSet<u32> {
+        let mut verified = HashSet::new();
+        for found in &self.signatures {
+            if !found.ends_revision() {
+                continue;
+            }
+            let range = found.byte_range();
+            let valid = match found.kind() {
+                SignatureKind::Signature(
+                    SubFilter::EtsiCadesDetached | SubFilter::AdbePkcs7Detached,
+                ) => {
+                    let ess =
+                        if found.kind() == SignatureKind::Signature(SubFilter::EtsiCadesDetached) {
+                            EssBinding::Required
+                        } else {
+                            EssBinding::NotRequired
+                        };
+                    CadesSignature::parse(found.cms()).is_ok_and(|signature| {
+                        let verdict = signature.verify(
+                            Content::Detached {
+                                content: &self.signed_octets(&range),
+                            },
+                            ess,
+                        );
+                        verdict.document_intact && verdict.signature_valid
+                    })
+                }
+                SignatureKind::DocumentTimestamp => {
+                    verify_token(found.cms(), |algorithm| self.digest(&range, algorithm)).is_ok()
+                }
+                SignatureKind::Signature(SubFilter::EtsiRfc3161 | SubFilter::Other) => false,
+            };
+            if valid {
+                verified.insert(found.object_number());
+            }
+        }
+        verified
+    }
+
+    /// Re-judge what the revisions after each signed one change, now
+    /// that `verified` names the signature dictionaries whose own CMS
+    /// or timestamp token verifies over the bytes it claims.
+    ///
+    /// # Errors
+    /// [`PdfReadError`] when the document no longer indexes.
+    pub fn judge_revisions(&mut self, verified: &HashSet<u32>) -> Result<(), PdfReadError> {
+        let index = PdfIndex::parse(self.file)
+            .map_err(|error| PdfReadError::from_index(error, "cross-reference chain"))?;
+        for signature in &mut self.signatures {
+            if signature.revision.is_none() {
+                continue;
+            }
+            signature.revision =
+                later_revisions(self.file, signature.byte_range.end(), &index, verified);
+        }
+        Ok(())
     }
 
     /// Every signature and document timestamp dictionary, in the order
@@ -509,12 +585,13 @@ fn signature_from_dictionary(
     let signing_time_entry = value(KEY_SIGNING_TIME)?.and_then(pdf_date);
 
     Ok(Some(PdfSignature {
+        object_number: object.number,
         kind,
         cms,
         byte_range,
         signing_time_entry,
         revision: ends_revision(file, byte_range.end())
-            .then(|| later_revisions(file, byte_range.end(), index))
+            .then(|| later_revisions(file, byte_range.end(), index, &HashSet::new()))
             .flatten(),
     }))
 }
@@ -1289,7 +1366,15 @@ mod tests {
     fn serial_signatures_each_keep_their_own_range() {
         let (once, _first_digest) = signed(&classic_pdf(&page_objects(), ""));
         let (twice, second_digest) = signed(&once);
-        let document = PdfDocument::parse(&twice).expect("the twice-signed PDF parses");
+        let mut document = PdfDocument::parse(&twice).expect("the twice-signed PDF parses");
+        let verified: std::collections::HashSet<u32> = document
+            .signatures()
+            .iter()
+            .map(super::PdfSignature::object_number)
+            .collect();
+        document
+            .judge_revisions(&verified)
+            .expect("the revisions judge");
         let [first, second] = exactly(document.signatures(), "two signatures");
         assert_eq!(first.revision(), Some(Revision::LaterRevisionsHarmless));
         assert_eq!(first.byte_range().end(), once.len());
@@ -1314,7 +1399,15 @@ mod tests {
         let low = LOW_SIZE.to_string();
         once[size_at..size_at + low.len()].copy_from_slice(low.as_bytes());
         let (twice, _digest) = signed(&once);
-        let document = PdfDocument::parse(&twice).expect("the twice-signed PDF parses");
+        let mut document = PdfDocument::parse(&twice).expect("the twice-signed PDF parses");
+        let verified: std::collections::HashSet<u32> = document
+            .signatures()
+            .iter()
+            .map(super::PdfSignature::object_number)
+            .collect();
+        document
+            .judge_revisions(&verified)
+            .expect("the revisions judge");
         let [first, second] = exactly(document.signatures(), "two signatures");
         assert!(first.byte_range().end() < second.byte_range().end());
         assert_eq!(first.revision(), Some(Revision::LaterRevisionsHarmless));

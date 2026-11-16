@@ -818,6 +818,17 @@ impl<'a> PdfIndex<'a> {
         })
     }
 
+    /// The file offset of the object header of the direct object
+    /// `reference` names; `None` for a free entry or an object inside
+    /// an object stream, whose bytes are not at a file offset of their
+    /// own.
+    pub(crate) fn object_offset(&self, reference: PdfObjectReference) -> Option<usize> {
+        match self.live_entry(reference)?.location {
+            XrefLocation::Direct { offset } => Some(offset),
+            XrefLocation::Free | XrefLocation::Compressed { .. } => None,
+        }
+    }
+
     /// The body of the object `reference` names, between `obj` and
     /// `endobj`, or its slice of the object stream holding it.
     pub(crate) fn object_body_reference(&self, reference: PdfObjectReference) -> Option<Vec<u8>> {
@@ -919,7 +930,14 @@ impl<'a> PdfIndex<'a> {
                     }
                 };
                 if let Some((file_offset, bytes)) = dictionary {
-                    found.push((reference, ObjectDictionary { file_offset, bytes }));
+                    found.push((
+                        reference,
+                        ObjectDictionary {
+                            number: reference.number,
+                            file_offset,
+                            bytes,
+                        },
+                    ));
                 }
             }
         }
@@ -1002,6 +1020,8 @@ impl<'a> PdfIndex<'a> {
 /// One live object's dictionary, as [`PdfIndex::object_dictionaries`]
 /// lists it.
 pub(crate) struct ObjectDictionary {
+    /// The object number its header names.
+    pub(crate) number: u32,
     /// Offset of its `<<` in the file; `None` inside an object stream,
     /// where the bytes are not the file's.
     pub(crate) file_offset: Option<usize>,

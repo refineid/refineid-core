@@ -534,44 +534,7 @@ fn verify_pkcs1v15(
     digest: &[u8],
     signature: &[u8],
 ) -> Result<(), RsaVerifyError> {
-    let k = key.modulus.byte_len();
-    if signature.len() != k {
-        return Err(RsaVerifyError::SignatureOutOfRange);
-    }
-    // bits_precision = k bytes * BITS_PER_BYTE, rounded up to
-    // BOXED_UINT_LIMB_BITS so the modulus and signature fit
-    // a whole number of u64 limbs.
-    let bits_precision = u32::try_from(k)
-        .map_err(|_e| RsaVerifyError::BadModulus)?
-        .checked_mul(BITS_PER_BYTE)
-        .ok_or(RsaVerifyError::BadModulus)?
-        .next_multiple_of(BOXED_UINT_LIMB_BITS);
-
-    let modulus = BoxedUint::from_be_slice(key.modulus.as_bytes(), bits_precision)
-        .map_err(|_e| RsaVerifyError::BadModulus)?;
-    let exponent = BoxedUint::from_be_slice_vartime(key.exponent.as_bytes());
-    let signature_uint = BoxedUint::from_be_slice(signature, bits_precision)
-        .map_err(|_e| RsaVerifyError::SignatureOutOfRange)?;
-    if signature_uint >= modulus {
-        return Err(RsaVerifyError::SignatureOutOfRange);
-    }
-
-    let odd_modulus: Odd<BoxedUint> =
-        Option::from(Odd::new(modulus)).ok_or(RsaVerifyError::BadModulus)?;
-    let params = BoxedMontyParams::new(odd_modulus);
-    let sig_form = BoxedMontyForm::new(signature_uint, &params);
-    let m_form = sig_form.pow(&exponent);
-    let m = m_form.retrieve();
-    let em_box = m.to_be_bytes();
-    let em: &[u8] = if let Some(extra) = em_box.len().checked_sub(k).filter(|n| *n > 0) {
-        let prefix = em_box.get(..extra).ok_or(RsaVerifyError::BadPadding)?;
-        if prefix.iter().any(|&b| b != 0) {
-            return Err(RsaVerifyError::BadPadding);
-        }
-        em_box.get(extra..).ok_or(RsaVerifyError::BadPadding)?
-    } else {
-        &em_box
-    };
+    let em = key.raw_recover(signature)?;
 
     // PKCS#1 v1.5 EMSA shape (RFC 8017 sec. 9.2): the leading
     // zero byte, the block-type byte, a padding string PS of at
@@ -618,37 +581,6 @@ fn verify_pkcs1v15(
     }
     Ok(())
 }
-
-/// Recovered message from an ISO/IEC 9796-2 DS1 verification.
-#[derive(Debug, Clone)]
-pub struct Iso9796Ds1Recovered {
-    /// The chip's random padding bytes (`M1` in the spec). Not
-    /// usually meaningful to the caller, but exposed for
-    /// inspection.
-    pub m1: Vec<u8>,
-    /// Hash algorithm the chip used, derived from the trailer.
-    pub hash: HashAlg,
-}
-
-/// Hash algorithm used in the ISO/IEC 9796-2 trailer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HashAlg {
-    /// SHA-1 (two-byte trailer: hash code 51 decimal, then the
-    /// trailer terminator 204 decimal). Used by older eMRTD
-    /// Active Authentication chips per ICAO 9303-11 §6.1.
-    Sha1,
-    /// SHA-256 (two-byte trailer: hash code 52 decimal, then the
-    /// trailer terminator 204 decimal).
-    Sha256,
-    /// SHA-384 (two-byte trailer: hash code 54 decimal, then the
-    /// trailer terminator 204 decimal).
-    Sha384,
-    /// SHA-512 (two-byte trailer: hash code 53 decimal, then the
-    /// trailer terminator 204 decimal).
-    Sha512,
-}
-
-impl HashAlg {}
 
 impl RsaPublicKey {
     /// Verify a PKCS#1 v1.5 signature over `SHA-256(message)`
@@ -769,10 +701,10 @@ impl RsaPublicKey {
         verify_pss_encoded_sha256(encoded, encoded_bits, digest)
     }
 
-    /// RSA-recover the encoded message `F = s^e mod n` and
+    /// RSA-recover the encoded message `EM = s^e mod n` and
     /// return it as exactly `k` big-endian bytes (where `k` is
     /// the modulus byte size). Shared between the PKCS#1 v1.5
-    /// path and the ISO/IEC 9796-2 DS1 path.
+    /// and RSA-PSS verification paths.
     fn raw_recover(&self, signature: &[u8]) -> Result<Vec<u8>, RsaVerifyError> {
         let key = self;
         let k = key.modulus.byte_len();
@@ -926,6 +858,42 @@ fn mgf1_sha256(seed: &[u8], output_len: usize) -> Result<Vec<u8>, RsaVerifyError
     Ok(mask)
 }
 
+/// Encode `message` and `salt` into an `encoded_bits`-wide EMSA-PSS
+/// message block with SHA-256 and MGF1-SHA-256 (RFC 8017 sec. 9.1.1).
+#[cfg(any(test, feature = "testkit"))]
+fn emsa_pss_sha256_encode(message: &[u8], salt: &[u8], encoded_bits: usize) -> Vec<u8> {
+    let encoded_len = encoded_bits.div_ceil(BITS_PER_BYTE_USIZE);
+    let mut hasher = Sha256::new();
+    hasher.update([0_u8; PSS_ZERO_PREFIX_BYTES]);
+    hasher.update(Sha256::digest(message));
+    hasher.update(salt);
+    let hash = hasher.finalize();
+    let db_len = encoded_len
+        .checked_sub(SHA256_OUTPUT_BYTES + 1)
+        .expect("test encoded_bits holds SHA-256 hash and trailer");
+    let padding_len = db_len
+        .checked_sub(salt.len() + 1)
+        .expect("test encoded_bits holds salt and separator");
+    let mut db = vec![0_u8; padding_len];
+    db.push(PSS_DB_SEPARATOR);
+    db.extend_from_slice(salt);
+    let mask = mgf1_sha256(&hash, db_len).expect("the mask length is in range");
+    let mut encoded: Vec<u8> = db
+        .iter()
+        .zip(mask)
+        .map(|(byte, mask)| byte ^ mask)
+        .collect();
+    let unused_bits = encoded_len * BITS_PER_BYTE_USIZE - encoded_bits;
+    if let Some(first) = encoded.first_mut()
+        && unused_bits != 0
+    {
+        *first &= FULL_BYTE_MASK >> unused_bits;
+    }
+    encoded.extend_from_slice(&hash);
+    encoded.push(PSS_TRAILER_FIELD);
+    encoded
+}
+
 /// RSA signing with a published test key, for fixtures only.
 ///
 /// Compiled for this crate's tests and behind the `testkit` feature.
@@ -934,18 +902,16 @@ fn mgf1_sha256(seed: &[u8], output_len: usize) -> Result<Vec<u8>, RsaVerifyError
 #[cfg(any(test, feature = "testkit"))]
 pub(crate) mod signing {
     use super::{
-        BITS_PER_BYTE, BITS_PER_BYTE_USIZE, BOXED_UINT_LIMB_BITS, EMSA_PKCS1_V15_BLOCK_TYPE,
+        BITS_PER_BYTE, BOXED_UINT_LIMB_BITS, EMSA_PKCS1_V15_BLOCK_TYPE,
         EMSA_PKCS1_V15_LEADING_BYTE, EMSA_PKCS1_V15_PS_FILL, EMSA_PKCS1_V15_PS_OFFSET,
-        EMSA_PKCS1_V15_SEPARATOR, FULL_BYTE_MASK, PSS_DB_SEPARATOR, PSS_TRAILER_FIELD,
-        PSS_ZERO_PREFIX_BYTES, RsaModulus, RsaPublicExponent, SHA256_DIGEST_INFO,
-        SHA256_OUTPUT_BYTES, SHA384_DIGEST_INFO, SHA512_DIGEST_INFO, mgf1_sha256,
+        EMSA_PKCS1_V15_SEPARATOR, RsaModulus, RsaPublicExponent, SHA256_DIGEST_INFO,
+        SHA384_DIGEST_INFO, SHA512_DIGEST_INFO, emsa_pss_sha256_encode,
     };
     use crate::signed_data::HashAlgorithm;
     use crypto_bigint::{
         BoxedUint, Odd,
         modular::{BoxedMontyForm, BoxedMontyParams},
     };
-    use sha2::{Digest as _, Sha256};
 
     /// An RSA private key: the public modulus and exponent and the
     /// private exponent `d`.
@@ -1063,28 +1029,7 @@ pub(crate) mod signing {
         /// 8017 sec.8.1.1, EMSA-PSS sec.9.1.1).
         pub(crate) fn sign_pss_sha256(&self, message: &[u8], salt: &[u8]) -> Vec<u8> {
             let encoded_bits = self.modulus.bit_length().saturating_sub(1);
-            let encoded_len = encoded_bits.div_ceil(BITS_PER_BYTE_USIZE);
-            let mut hasher = Sha256::new();
-            hasher.update([0_u8; PSS_ZERO_PREFIX_BYTES]);
-            hasher.update(Sha256::digest(message));
-            hasher.update(salt);
-            let hash = hasher.finalize();
-            let db_len = encoded_len - SHA256_OUTPUT_BYTES - 1;
-            let mut db = vec![0_u8; db_len - salt.len() - 1];
-            db.push(PSS_DB_SEPARATOR);
-            db.extend_from_slice(salt);
-            let mask = mgf1_sha256(&hash, db_len).expect("the mask length is in range");
-            let mut encoded: Vec<u8> = db
-                .iter()
-                .zip(mask)
-                .map(|(byte, mask)| byte ^ mask)
-                .collect();
-            let unused_bits = encoded_len * BITS_PER_BYTE_USIZE - encoded_bits;
-            if let Some(first) = encoded.first_mut() {
-                *first &= FULL_BYTE_MASK >> unused_bits;
-            }
-            encoded.extend_from_slice(&hash);
-            encoded.push(PSS_TRAILER_FIELD);
+            let encoded = emsa_pss_sha256_encode(message, salt, encoded_bits);
             self.private_operation(&encoded)
         }
     }
@@ -1095,68 +1040,20 @@ pub(crate) mod signing {
     const EMSA_FRAME_BYTES: usize = EMSA_PKCS1_V15_PS_OFFSET + 1;
 }
 
-/// A platform hash-algorithm name not supported by [`HashAlg`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UnsupportedHashAlgorithmName;
-
-impl core::fmt::Display for UnsupportedHashAlgorithmName {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("unsupported hash algorithm name")
-    }
-}
-
-impl core::error::Error for UnsupportedHashAlgorithmName {}
-
-impl TryFrom<&str> for HashAlg {
-    type Error = UnsupportedHashAlgorithmName;
-
-    fn try_from(name: &str) -> Result<Self, Self::Error> {
-        match name {
-            "SHA1" => Ok(Self::Sha1),
-            "SHA256" => Ok(Self::Sha256),
-            "SHA384" => Ok(Self::Sha384),
-            "SHA512" => Ok(Self::Sha512),
-            _ => Err(UnsupportedHashAlgorithmName),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        BITS_PER_BYTE_USIZE, FULL_BYTE_MASK, LEADING_ZERO_BYTE, PSS_DB_SEPARATOR,
-        PSS_TRAILER_FIELD, PSS_ZERO_PREFIX_BYTES, RsaModulus, RsaModulusError, RsaPublicExponent,
-        RsaPublicExponentError, RsaPublicKey, RsaVerifyError, SHA256_OUTPUT_BYTES, mgf1_sha256,
-        verify_pss_encoded_sha256,
+        BITS_PER_BYTE_USIZE, LEADING_ZERO_BYTE, RsaModulus, RsaModulusError, RsaPublicExponent,
+        RsaPublicExponentError, RsaPublicKey, RsaVerifyError, SHA256_OUTPUT_BYTES,
+        emsa_pss_sha256_encode, verify_pss_encoded_sha256,
     };
+    use crate::container::{
+        RsaPkcs1Sha256, RsaPkcs1Sha384, RsaPkcs1Sha512, RsaPssSha256, Signature,
+    };
+    use crate::signed_data::HashAlgorithm;
+    use crate::testkit::TestKey;
+    use crate::x509::extract_rsa_public_key;
     use sha2::{Digest as _, Sha256};
-
-    /// A self-signed PKCS#1 v1.5 SHA-256 test vector built
-    /// offline with openssl + RSA-2048 (`refineid-cms` does
-    /// not generate keys; the vector is committed). Modulus,
-    /// exponent, message, and signature were generated with:
-    ///
-    /// ```sh
-    /// openssl genrsa 2048 > test.pem
-    /// echo -n "refineid rsa test message" > msg
-    /// openssl dgst -sha256 -sign test.pem -out sig msg
-    /// ```
-    ///
-    /// Then `openssl rsa -in test.pem -text -noout` gave the
-    /// modulus + e and we hex-encoded everything below.
-    const MODULUS_HEX: &str = "\
-b7d59d9d2f0a9c4be0b7d1a40d6b14edbe9af8a8b34c0aaa4b32fdf5ee03cbc8\
-da14a51b30bfedaa6cd28a9be84a51e927e7ce5d4ad7a4c0d92cd1bb16d96b59\
-1ae8866ac2cb87ea61d44b53d8a0d091e923eaf6f9b89fb01a3ec3c5d9097f8e\
-7e2a86464cad6c6f5e7ad77d8ace84b62c3f8e1a91be9f08e2823e7c0c08538a\
-f51c1f63b5fb9b8a7dba3f4c0d22b4d54da43c87dc6a6ba1c2d3d8e2c1d9237b\
-e7c1d3c8d5717a85f5e1d4cd3e8e95443ea76eeb220e2cc41cd57bd6e02bd9a8\
-21e2c3a9aa6ba9c5a830d50c5cbc12bcffe70cdde04eba6f8b7d013ad77d8ee0\
-2cb7fb4dabe1c1d7f6a64fbf17f0e1b81a7d8c1a82b3a14e6a07a0fd23e4d33d";
-    // Above is a placeholder -- this test_module is intentionally
-    // bare. The integration validation happens through the
-    // higher-level `x509::verify_certificate` test path that
-    // uses DVV's real CA chain.
 
     /// Bytes-per-modulus for RSA-2048 (modulus byte length k =
     /// `modulus_bits` / 8). Reused across fixture builders below.
@@ -1340,50 +1237,6 @@ e7c1d3c8d5717a85f5e1d4cd3e8e95443ea76eeb220e2cc41cd57bd6e02bd9a8\
         assert_eq!(e.as_bytes(), be.get(leading_zeros..).unwrap_or(&[]));
     }
 
-    /// The bigger story for "does verification work end-to-end"
-    /// is in `x509::verify_certificate`, where we feed the DVV G3
-    /// root + the AIA-fetched G4R intermediate as a known-good
-    /// chain. Test vectors there are pulled live, not committed
-    /// to this file.
-    #[test]
-    fn placeholder_signpost() {
-        // Reference to the MODULUS_HEX so dead-code lint stays quiet.
-        assert!(!MODULUS_HEX.is_empty());
-    }
-
-    fn pss_encoding(message: &[u8], salt: &[u8], encoded_bits: usize) -> Vec<u8> {
-        let encoded_len = encoded_bits.div_ceil(BITS_PER_BYTE_USIZE);
-        let database_len = encoded_len
-            .saturating_sub(SHA256_OUTPUT_BYTES)
-            .saturating_sub(1);
-        let padding_len = database_len.saturating_sub(salt.len()).saturating_sub(1);
-        let message_digest = Sha256::digest(message);
-        let mut hash_input = vec![0; PSS_ZERO_PREFIX_BYTES];
-        hash_input.extend_from_slice(&message_digest);
-        hash_input.extend_from_slice(salt);
-        let hash = Sha256::digest(&hash_input);
-        let mut database = vec![0; padding_len];
-        database.push(PSS_DB_SEPARATOR);
-        database.extend_from_slice(salt);
-        let mask = mgf1_sha256(&hash, database_len);
-        assert!(mask.is_ok(), "bounded PSS test mask must fit");
-        let mask = mask.unwrap_or_default();
-        for (database_byte, mask_byte) in database.iter_mut().zip(mask) {
-            *database_byte ^= mask_byte;
-        }
-        let unused_bits = encoded_len
-            .saturating_mul(BITS_PER_BYTE_USIZE)
-            .saturating_sub(encoded_bits);
-        if let Some(first) = database.first_mut()
-            && unused_bits != 0
-        {
-            *first &= FULL_BYTE_MASK >> unused_bits;
-        }
-        database.extend_from_slice(&hash);
-        database.push(PSS_TRAILER_FIELD);
-        database
-    }
-
     #[test]
     fn fixed_sha256_pss_encoding_verifies_and_detects_tampering() {
         const ENCODED_BITS: usize = 1023;
@@ -1391,7 +1244,7 @@ e7c1d3c8d5717a85f5e1d4cd3e8e95443ea76eeb220e2cc41cd57bd6e02bd9a8\
         getrandom::fill(&mut salt).expect("random salt for PSS test");
         let message = b"trusted-list signed info";
         let digest = Sha256::digest(message);
-        let encoded = pss_encoding(message, &salt, ENCODED_BITS);
+        let encoded = emsa_pss_sha256_encode(message, &salt, ENCODED_BITS);
         assert_eq!(
             verify_pss_encoded_sha256(&encoded, ENCODED_BITS, &digest),
             Ok(())
@@ -1415,11 +1268,56 @@ e7c1d3c8d5717a85f5e1d4cd3e8e95443ea76eeb220e2cc41cd57bd6e02bd9a8\
         const WRONG_SALT_FILL_BYTE: u8 = 7;
         let message = b"trusted-list signed info";
         let digest = Sha256::digest(message);
-        let encoded = pss_encoding(
+        let encoded = emsa_pss_sha256_encode(
             message,
             &[WRONG_SALT_FILL_BYTE; WRONG_SALT_BYTES],
             ENCODED_BITS,
         );
         assert!(verify_pss_encoded_sha256(&encoded, ENCODED_BITS, &digest).is_err());
+    }
+
+    #[test]
+    fn pkcs1v15_and_pss_round_trip_and_reject_tampering() {
+        const MESSAGE: &[u8] = b"refineid rsa verification round-trip";
+        const TAMPERED_MESSAGE: &[u8] = b"refineid rsa verification tampered";
+        const SALT_FILL_BYTE: u8 = 0x5A;
+
+        let signing_key = TestKey::rsa_2048();
+        let public_key =
+            extract_rsa_public_key(&signing_key.spki()).expect("RFC 9500 RSA SPKI parses");
+
+        let sig_256 =
+            Signature::<RsaPkcs1Sha256>::new(signing_key.sign_with(HashAlgorithm::Sha256, MESSAGE));
+        assert_eq!(public_key.verify_pkcs1v15_sha256(MESSAGE, &sig_256), Ok(()));
+        assert_err_eq(
+            public_key.verify_pkcs1v15_sha256(TAMPERED_MESSAGE, &sig_256),
+            &RsaVerifyError::BadDigest,
+        );
+
+        let sig_384 =
+            Signature::<RsaPkcs1Sha384>::new(signing_key.sign_with(HashAlgorithm::Sha384, MESSAGE));
+        assert_eq!(public_key.verify_pkcs1v15_sha384(MESSAGE, &sig_384), Ok(()));
+
+        let sig_512 =
+            Signature::<RsaPkcs1Sha512>::new(signing_key.sign_with(HashAlgorithm::Sha512, MESSAGE));
+        assert_eq!(public_key.verify_pkcs1v15_sha512(MESSAGE, &sig_512), Ok(()));
+
+        let salt = [SALT_FILL_BYTE; SHA256_OUTPUT_BYTES];
+        let sig_pss = Signature::<RsaPssSha256>::new(
+            signing_key
+                .sign_pss_sha256(MESSAGE, &salt)
+                .expect("RSA signing key produces PSS signature"),
+        );
+        assert_eq!(public_key.verify_pss_sha256(MESSAGE, &sig_pss), Ok(()));
+        assert_err_eq(
+            public_key.verify_pss_sha256(TAMPERED_MESSAGE, &sig_pss),
+            &RsaVerifyError::BadDigest,
+        );
+
+        let modulus_sig = Signature::<RsaPkcs1Sha256>::new(public_key.modulus.as_bytes().to_vec());
+        assert_err_eq(
+            public_key.verify_pkcs1v15_sha256(MESSAGE, &modulus_sig),
+            &RsaVerifyError::SignatureOutOfRange,
+        );
     }
 }

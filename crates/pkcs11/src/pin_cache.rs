@@ -240,7 +240,7 @@ pub struct PinSafetyCache {
     outstanding: Weak<()>,
     generation: u64,
     #[zeroize(skip)]
-    negative: refineid_pin_cache::PinSafetyCache,
+    negative: refineid_auth::PinSafetyCache,
 }
 
 impl PinSafetyCache {
@@ -253,7 +253,7 @@ impl PinSafetyCache {
             positive_pin1: None,
             outstanding: Weak::new(),
             generation: 0,
-            negative: refineid_pin_cache::PinSafetyCache::new()?,
+            negative: refineid_auth::PinSafetyCache::new()?,
         })
     }
 
@@ -351,7 +351,7 @@ impl PinSafetyCache {
     pub fn is_rejected(&self, serial: &TokenSerial, pin: &PinBytes) -> bool {
         let secret = UnvalidatedSecret::from_owned_bytes(pin.as_bytes().to_vec());
         if let Ok(pin1) = Pin1::reconstruct(secret) {
-            self.negative.is_rejected(serial, &pin1)
+            self.negative.is_rejected_pin1(serial, &pin1)
         } else {
             false
         }
@@ -365,7 +365,7 @@ impl PinSafetyCache {
         self.clear_positive();
         let secret = UnvalidatedSecret::from_owned_bytes(pin.as_bytes().to_vec());
         if let Ok(pin1) = Pin1::reconstruct(secret) {
-            self.negative.record_rejected(serial, &pin1);
+            self.negative.record_rejected_pin1(serial, &pin1);
         }
     }
 }

@@ -1,0 +1,31 @@
+error[E0432]: unresolved import `refineid_auth::CachedPin`
+ --> tests/ui/keyed_fingerprint_is_not_reachable_from_outside_the_crate.rs:1:5
+  |
+1 | use refineid_auth::CachedPin;
+  |     ^^^^^^^^^^^^^^^---------
+  |                    |
+  |                    no `CachedPin` in the root
+
+error[E0603]: trait `CachedPin` is private
+ --> tests/ui/keyed_fingerprint_is_not_reachable_from_outside_the_crate.rs:2:34
+  |
+2 | use refineid_auth::credentials::{CachedPin as CredentialsCachedPin, PIN_MIN_LENGTH};
+  |                                  ^^^^^^^^^ private trait
+  |
+note: the trait `CachedPin` is defined here
+ --> src/credentials.rs
+  |
+  | pub(crate) trait CachedPin {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0599]: no method named `keyed_fingerprint` found for struct `refineid_auth::Pin1` in the current scope
+  --> tests/ui/keyed_fingerprint_is_not_reachable_from_outside_the_crate.rs:17:18
+   |
+17 |     let _ = pin1.keyed_fingerprint(b"", &[0_u8; HMAC_SHA256_KEY_LEN]);
+   |                  ^^^^^^^^^^^^^^^^^ method not found in `refineid_auth::Pin1`
+
+error[E0599]: no method named `keyed_fingerprint` found for struct `refineid_auth::Pin2` in the current scope
+  --> tests/ui/keyed_fingerprint_is_not_reachable_from_outside_the_crate.rs:18:18
+   |
+18 |     let _ = pin2.keyed_fingerprint(b"", &[0_u8; HMAC_SHA256_KEY_LEN]);
+   |                  ^^^^^^^^^^^^^^^^^ method not found in `refineid_auth::Pin2`

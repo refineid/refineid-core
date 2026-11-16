@@ -12,7 +12,6 @@ members = [
     "crates/emrtd",
     "crates/pace",
     "crates/pcsc",
-    "crates/pin-cache",
     "crates/pkcs11",
     "crates/pkcs15",
     "crates/rapp",
@@ -47,7 +46,6 @@ refineid-doc-sign = { path = "crates/doc-sign" }
 refineid-emrtd = { path = "crates/emrtd" }
 refineid-pace = { path = "crates/pace" }
 refineid-pcsc = { path = "crates/pcsc" }
-refineid-pin-cache = { path = "crates/pin-cache" }
 refineid-pkcs11 = { path = "crates/pkcs11" }
 refineid-pkcs15 = { path = "crates/pkcs15" }
 refineid-rapp = { path = "crates/rapp" }

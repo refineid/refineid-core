@@ -53,6 +53,16 @@ organizational card verifies the PUK as its own object and then resets
 with only the new PIN. A wrong current PIN or PUK is reported as a typed
 outcome, not an error.
 
+`PinSafetyCache` remembers, for the life of the process, which `Pin1` and
+`Pin2` values a card identified by `TokenSerial` rejected, answering
+`is_rejected_pin1` and `is_rejected_pin2` in constant time before software
+re-offers a known-bad value. A rejected value is kept only as an
+HMAC-SHA-256 fingerprint keyed with fresh per-process random material and
+erased on drop; the fingerprint computation stays crate-private so no
+caller outside `refineid-auth` can compute a PIN digest under a chosen key.
+Only `Pin1` and `Pin2` have rejection entry points on `PinSafetyCache`, so
+the PUK has no cache path, and the cache keeps no positive PIN.
+
 No verification, change, or unblock path is described as working against a
 real card until it is observed on hardware with the retry counter checked.
 The change and unblock chains are card-mutating and PUK-consuming -- and

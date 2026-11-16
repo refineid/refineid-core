@@ -1076,12 +1076,14 @@ version = "26.11.16"
 name = "refineid-auth"
 version = "26.11.16"
 dependencies = [
+ "getrandom 0.4.3",
  "hmac",
  "refineid-apdu",
  "refineid-ber",
  "refineid-pkcs15",
  "serde",
  "sha2 0.11.1",
+ "subtle",
  "trybuild",
  "zeroize",
 ]
@@ -1198,17 +1200,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "refineid-pin-cache"
-version = "26.11.16"
-dependencies = [
- "getrandom 0.4.3",
- "refineid-auth",
- "refineid-pkcs15",
- "subtle",
- "zeroize",
-]
-
-[[package]]
 name = "refineid-pkcs11"
 version = "26.11.16"
 dependencies = [
@@ -1219,7 +1210,6 @@ dependencies = [
  "refineid-cms",
  "refineid-digest",
  "refineid-pcsc",
- "refineid-pin-cache",
  "refineid-pkcs15",
  "refineid-remote",
  "refineid-sign",

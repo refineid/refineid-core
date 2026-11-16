@@ -31,7 +31,6 @@ refineid-auth.workspace = true
 refineid-cms.workspace = true
 refineid-digest.workspace = true
 refineid-pcsc.workspace = true
-refineid-pin-cache.workspace = true
 refineid-pkcs15.workspace = true
 refineid-remote.workspace = true
 refineid-sign.workspace = true

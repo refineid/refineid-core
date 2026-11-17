@@ -56,6 +56,8 @@ pub struct Request {
     pub method: String,
     /// The request path with any query string removed.
     pub path: String,
+    /// The Host header, when present.
+    pub host: Option<String>,
     /// The Origin header, when the browser sent one.
     pub origin: Option<String>,
     /// The Content-Type header, when present.
@@ -68,8 +70,9 @@ impl Request {
     /// Parse one head block (the bytes before the blank line).
     ///
     /// Returns `None` when the block is not UTF-8, has no request
-    /// line, smuggles bare line breaks or controls, or declares its
-    /// length twice; unknown headers are ignored.
+    /// line, smuggles bare line breaks or controls, declares its
+    /// length twice, or specifies a non-loopback Host; unknown
+    /// headers are ignored.
     #[must_use]
     pub fn parse(head: &[u8]) -> Option<Self> {
         let text = core::str::from_utf8(head).ok()?;
@@ -95,6 +98,7 @@ impl Request {
             return None;
         }
         let path = target.split('?').next().unwrap_or(target).to_owned();
+        let mut host = None;
         let mut origin = None;
         let mut content_type = None;
         let mut body_length = 0_usize;
@@ -108,9 +112,20 @@ impl Request {
             if has_control(name, false) || has_control(value, true) {
                 return None;
             }
-            if name.eq_ignore_ascii_case("Origin") {
+            if name.eq_ignore_ascii_case("Host") {
+                if host.is_some() || !is_allowed_host(value) {
+                    return None;
+                }
+                host = Some(value.to_owned());
+            } else if name.eq_ignore_ascii_case("Origin") {
+                if origin.is_some() {
+                    return None;
+                }
                 origin = Some(value.to_owned());
             } else if name.eq_ignore_ascii_case("Content-Type") {
+                if content_type.is_some() {
+                    return None;
+                }
                 content_type = Some(value.to_owned());
             } else if name.eq_ignore_ascii_case("Content-Length") {
                 // A declared length that is not a non-negative
@@ -120,7 +135,7 @@ impl Request {
                 // the body assembly. A second declaration refuses
                 // the head outright: conflicting lengths are how
                 // smuggled bodies hide.
-                if saw_length {
+                if saw_length || !value.chars().all(|c| c.is_ascii_digit()) {
                     return None;
                 }
                 saw_length = true;
@@ -130,6 +145,7 @@ impl Request {
         Some(Self {
             method: method.to_owned(),
             path,
+            host,
             origin,
             content_type,
             body_length,
@@ -207,6 +223,24 @@ fn has_control(text: &str, allow_tab: bool) -> bool {
     })
 }
 
+/// Whether `host` names the loopback SCS endpoint (`127.0.0.1`,
+/// `localhost`, or `[::1]`, with or without `:53952`).
+#[must_use]
+pub fn is_allowed_host(host: &str) -> bool {
+    if !host.is_ascii() || has_control(host, false) || host.chars().any(|c| c.is_ascii_whitespace())
+    {
+        return false;
+    }
+    let normalized = host.to_ascii_lowercase();
+    let port_suffix = format!(":{}", values::PORT);
+    normalized == "127.0.0.1"
+        || normalized == format!("127.0.0.1{port_suffix}")
+        || normalized == "localhost"
+        || normalized == format!("localhost{port_suffix}")
+        || normalized == "[::1]"
+        || normalized == format!("[::1]{port_suffix}")
+}
+
 /// A JSON response with CORS headers.
 #[must_use]
 pub fn json(status: u16, body: &[u8], origin: Option<&str>) -> Vec<u8> {
@@ -248,22 +282,25 @@ pub fn preflight(origin: Option<&str>) -> Vec<u8> {
 /// instead is a narrowing of that, which is why `Vary: Origin`
 /// accompanies it.
 fn cors_headers(origin: Option<&str>) -> Vec<(String, String)> {
-    vec![
-        (
-            "Access-Control-Allow-Origin".to_owned(),
-            origin.unwrap_or("*").to_owned(),
-        ),
-        (
-            "Access-Control-Allow-Methods".to_owned(),
-            "GET, POST".to_owned(),
-        ),
-        (
-            "Access-Control-Allow-Headers".to_owned(),
-            "Accept, Content-Type".to_owned(),
-        ),
-        ("Access-Control-Max-Age".to_owned(), "3600".to_owned()),
-        ("Vary".to_owned(), "Origin".to_owned()),
-    ]
+    let mut headers = Vec::new();
+    if let Some(o) = origin {
+        if crate::codec::is_valid_origin(o) {
+            headers.push(("Access-Control-Allow-Origin".to_owned(), o.to_owned()));
+        }
+    } else {
+        headers.push(("Access-Control-Allow-Origin".to_owned(), "*".to_owned()));
+    }
+    headers.push((
+        "Access-Control-Allow-Methods".to_owned(),
+        "GET, POST".to_owned(),
+    ));
+    headers.push((
+        "Access-Control-Allow-Headers".to_owned(),
+        "Accept, Content-Type".to_owned(),
+    ));
+    headers.push(("Access-Control-Max-Age".to_owned(), "3600".to_owned()));
+    headers.push(("Vary".to_owned(), "Origin".to_owned()));
+    headers
 }
 
 fn build(status: u16, headers: &[(String, String)], body: &[u8]) -> Vec<u8> {
@@ -287,6 +324,10 @@ fn reason(status: u16) -> &'static str {
         "OK"
     } else if status == values::HTTP_NOT_FOUND {
         "Not Found"
+    } else if status == values::HTTP_FORBIDDEN {
+        "Forbidden"
+    } else if status == values::HTTP_BAD_REQUEST {
+        "Bad Request"
     } else {
         "Status"
     }
@@ -314,11 +355,45 @@ mod tests {
             Some(Request {
                 method: "POST".to_owned(),
                 path: "/sign".to_owned(),
+                host: None,
                 origin: Some("https://example.com".to_owned()),
                 content_type: Some("application/json".to_owned()),
                 body_length: FIXTURE_BODY_LENGTH,
             })
         );
+    }
+
+    /// Host headers must name loopback; non-loopback or duplicate
+    /// headers refuse the head.
+    #[test]
+    fn host_validation() {
+        for valid in [
+            "127.0.0.1",
+            "127.0.0.1:53952",
+            "localhost",
+            "localhost:53952",
+            "[::1]",
+            "[::1]:53952",
+            "LOCALHOST:53952",
+        ] {
+            let head = format!("GET /version HTTP/1.1\r\nHost: {valid}\r\n\r\n");
+            let req = Request::parse(head.as_bytes()).expect(valid);
+            assert_eq!(req.host.as_deref(), Some(valid));
+        }
+        for invalid in [
+            "evil.example",
+            "evil.example:53952",
+            "127.0.0.1:80",
+            "127.0.0.2:53952",
+            "localhost:8080",
+            "attacker.com",
+        ] {
+            let head = format!("GET /version HTTP/1.1\r\nHost: {invalid}\r\n\r\n");
+            assert_eq!(Request::parse(head.as_bytes()), None, "{invalid}");
+        }
+        let dup =
+            b"GET /version HTTP/1.1\r\nHost: localhost:53952\r\nHost: localhost:53952\r\n\r\n";
+        assert_eq!(Request::parse(dup), None);
     }
 
     /// Header names match case-insensitively; unknown ones are kept
@@ -339,6 +414,7 @@ mod tests {
         for head in [
             "POST /sign HTTP/1.1\r\nContent-Length: many",
             "POST /sign HTTP/1.1\r\nContent-Length: -1",
+            "POST /sign HTTP/1.1\r\nContent-Length: +12",
             "POST /sign HTTP/1.1\r\nContent-Length: 99999999999999999999999",
         ] {
             assert_eq!(Request::parse(head.as_bytes()), None, "{head:?}");
@@ -355,6 +431,8 @@ mod tests {
             "POST /sign HTTP/1.1\rX-Origin: https://evil.example\r\n\r\n",
             "POST /sign HTTP/1.1\r\nOrigin: https://a.example\rEvil: 1\r\n\r\n",
             "POST /sign HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+            "POST /sign HTTP/1.1\r\nOrigin: https://a.example\r\nOrigin: https://b.example\r\n\r\n",
+            "POST /sign HTTP/1.1\r\nContent-Type: application/json\r\nContent-Type: application/jwt\r\n\r\n",
         ] {
             assert_eq!(Request::parse(head.as_bytes()), None, "{head:?}");
         }
@@ -417,6 +495,17 @@ mod tests {
         );
         assert!(
             rendered.contains("Access-Control-Allow-Methods: GET, POST\r\n"),
+            "{rendered:?}"
+        );
+
+        let invalid_origin = json(
+            values::HTTP_OK,
+            br#"{"a":1}"#,
+            Some("http://insecure.example"),
+        );
+        let rendered = core::str::from_utf8(&invalid_origin).expect("ascii");
+        assert!(
+            !rendered.contains("Access-Control-Allow-Origin"),
             "{rendered:?}"
         );
 

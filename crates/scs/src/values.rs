@@ -60,8 +60,20 @@ pub const REASON_NOT_IMPLEMENTED: u16 = 501;
 /// carries the outcome (v1.3 sec.3).
 pub const HTTP_OK: u16 = 200;
 
+/// HTTP status: Bad Request.
+pub const HTTP_BAD_REQUEST: u16 = 400;
+
+/// HTTP status: Forbidden.
+pub const HTTP_FORBIDDEN: u16 = 403;
+
 /// HTTP status: no route.
 pub const HTTP_NOT_FOUND: u16 = 404;
+
+/// Minimum accepted TCP port.
+pub const PORT_MINIMUM: u16 = 1;
+
+/// Maximum characters accepted for an Origin on the wire.
+pub const ORIGIN_MAXIMUM_LENGTH: usize = 512;
 
 /// Longest accepted HTTP head, in bytes; a longer one is not a
 /// well-formed SCS exchange.

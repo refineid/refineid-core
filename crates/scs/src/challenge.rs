@@ -52,6 +52,9 @@ pub fn refusal(content: &[u8], origin: Option<&str>) -> Option<String> {
             "challenge origin {challenge_origin} does not match request Origin {origin}"
         ));
     }
+    if nonce.contains(';') {
+        return Some("challenge nonce contains forbidden ; separator".to_owned());
+    }
     if nonce.len() < values::NONCE_MINIMUM_LENGTH {
         return Some(format!(
             "challenge nonce too short ({} octets, {} required)",
@@ -108,6 +111,12 @@ mod tests {
         assert_eq!(
             refusal(b"https://example.com;short", Some("https://example.com")),
             Some("challenge nonce too short (5 octets, 64 required)".to_owned())
+        );
+        let nonce = "n".repeat(values::NONCE_MINIMUM_LENGTH);
+        let triple = format!("https://example.com;{nonce};serverKey");
+        assert_eq!(
+            refusal(triple.as_bytes(), Some("https://example.com")),
+            Some("challenge nonce contains forbidden ; separator".to_owned())
         );
     }
 }

@@ -25,6 +25,24 @@ use refineid_digest::HashAlg;
 use crate::purpose::{KeyAlgorithm, SignPurpose};
 use crate::values;
 
+/// The kind of signing operation being performed.
+///
+/// Backends use this together with [`SignRequest::consent_digest`] to
+/// present meaningful consent information to the user before prompting
+/// for a PIN (DVV SCS specification v1.3 sec.2.1, 2.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignOperation {
+    /// A `/begin` handshake response JWT signed by the service.
+    BeginHandshake,
+    /// An authentication challenge (`origin;nonce;serverKey`).
+    AuthenticationChallenge,
+    /// A raw document or payload signature.
+    Document,
+    /// A CMS/PAdES signature where the card signs DER `SignedAttributes`
+    /// containing the document's digest.
+    CmsPades,
+}
+
 /// One signature the SCS has been asked to produce.
 ///
 /// The payload, the key that signs it, and the origin that asked are
@@ -44,6 +62,22 @@ pub struct SignRequest {
     /// The Origin header of the request that asked, or `None` when
     /// the request carried none.
     pub origin: Option<String>,
+    /// The kind of signing operation being performed.
+    pub operation: SignOperation,
+    /// The document or payload digest for user consent when signing CMS/PAdES,
+    /// or `None` when the card signs raw data or challenges directly.
+    pub consent_digest: Option<Vec<u8>>,
+}
+
+impl SignRequest {
+    /// The document or payload digest for user consent, falling back to
+    /// computing the digest of `data` using `self.hash`.
+    #[must_use]
+    pub fn effective_digest(&self) -> Vec<u8> {
+        self.consent_digest
+            .clone()
+            .unwrap_or_else(|| self.hash.digest(&self.data))
+    }
 }
 
 /// Why the signing backend refused an SCS sign.
@@ -102,4 +136,43 @@ pub trait SigningBackend: Send + Sync {
     /// to X9.62 DER at the response edges (`signature`, CMS), where
     /// the specification requires it (v1.3 sec.2.6.1).
     fn sign(&self, request: SignRequest) -> Result<Vec<u8>, BackendFailure>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SignOperation, SignRequest};
+    use crate::purpose::SignPurpose;
+    use refineid_digest::HashAlg;
+
+    const EXPLICIT_FILL: u8 = 0x42;
+
+    #[test]
+    fn sign_request_effective_digest_prefers_consent_digest() {
+        let explicit = vec![EXPLICIT_FILL; refineid_digest::SHA256_LEN];
+        let request = SignRequest {
+            purpose: SignPurpose::Qualified,
+            hash: HashAlg::Sha256,
+            data: b"signed-attributes-der".to_vec(),
+            origin: Some("https://example.com".to_owned()),
+            operation: SignOperation::CmsPades,
+            consent_digest: Some(explicit.clone()),
+        };
+        assert_eq!(request.effective_digest(), explicit);
+    }
+
+    #[test]
+    fn sign_request_effective_digest_falls_back_to_data_digest() {
+        let request = SignRequest {
+            purpose: SignPurpose::Authentication,
+            hash: HashAlg::Sha256,
+            data: b"challenge-data".to_vec(),
+            origin: Some("https://example.com".to_owned()),
+            operation: SignOperation::AuthenticationChallenge,
+            consent_digest: None,
+        };
+        assert_eq!(
+            request.effective_digest(),
+            HashAlg::Sha256.digest(b"challenge-data")
+        );
+    }
 }

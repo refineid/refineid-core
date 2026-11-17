@@ -56,7 +56,7 @@ mod jws;
 pub(crate) mod test_support;
 mod time;
 
-pub use backend::{BackendFailure, SignRequest, SigningBackend};
+pub use backend::{BackendFailure, SignOperation, SignRequest, SigningBackend};
 pub use dispatcher::dispatch;
 pub use error::TransactionError;
 pub use purpose::{KeyAlgorithm, SignPurpose};

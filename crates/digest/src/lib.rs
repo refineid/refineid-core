@@ -373,6 +373,17 @@ impl HashAlg {
             Self::Sha512 => SHA512_LEN,
         }
     }
+
+    /// Compute the digest of `data` using this algorithm.
+    #[must_use]
+    pub fn digest(self, data: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Sha1 => Sha1::of(data).as_bytes().to_vec(),
+            Self::Sha256 => Sha256::of(data).as_bytes().to_vec(),
+            Self::Sha384 => Sha384::of(data).as_bytes().to_vec(),
+            Self::Sha512 => Sha512::of(data).as_bytes().to_vec(),
+        }
+    }
 }
 
 /// A hash-algorithm name that [`HashAlg`] does not recognize.
@@ -554,6 +565,23 @@ mod tests {
         assert_eq!(HashAlg::Sha256.digest_len(), SHA256_LEN);
         assert_eq!(HashAlg::Sha384.digest_len(), SHA384_LEN);
         assert_eq!(HashAlg::Sha512.digest_len(), SHA512_LEN);
+    }
+
+    #[test]
+    fn hash_alg_computes_matching_digest() {
+        assert_eq!(HashAlg::Sha1.digest(b"abc"), Sha1::of(b"abc").as_bytes());
+        assert_eq!(
+            HashAlg::Sha256.digest(b"abc"),
+            Sha256::of(b"abc").as_bytes()
+        );
+        assert_eq!(
+            HashAlg::Sha384.digest(b"abc"),
+            Sha384::of(b"abc").as_bytes()
+        );
+        assert_eq!(
+            HashAlg::Sha512.digest(b"abc"),
+            Sha512::of(b"abc").as_bytes()
+        );
     }
 
     #[test]

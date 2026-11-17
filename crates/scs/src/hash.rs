@@ -57,10 +57,25 @@ pub const fn scs_name(hash: HashAlg) -> &'static str {
     }
 }
 
+/// Compute the digest of `data` with `hash`.
+#[must_use]
+pub fn digest(hash: HashAlg, data: &[u8]) -> Vec<u8> {
+    hash.digest(data)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{hash_named, scs_name};
+    use super::{digest, hash_named, scs_name};
     use refineid_digest::HashAlg;
+
+    /// Digest computation delegates to the shared algorithm.
+    #[test]
+    fn compute_digest() {
+        assert_eq!(
+            digest(HashAlg::Sha256, b"abc"),
+            refineid_digest::Sha256::of(b"abc").as_bytes()
+        );
+    }
 
     /// The three served spellings parse; anything else does not.
     #[test]

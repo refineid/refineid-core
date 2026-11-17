@@ -20,7 +20,7 @@ use std::time::SystemTime;
 
 use refineid_digest::HashAlg;
 
-use crate::backend::{SignRequest, SigningBackend};
+use crate::backend::{SignOperation, SignRequest, SigningBackend};
 use crate::base64;
 use crate::document::ExecuteDocument;
 use crate::document::ExecuteResponseDocument;
@@ -168,24 +168,34 @@ fn signature(
     now_unix: i64,
 ) -> Result<Vec<u8>, TransactionError> {
     let purpose = state.purpose;
-    let data: Vec<u8> = if purpose == SignPurpose::Authentication {
-        bound_challenge(&payload.content, &state.server_key, &state.origin)?
-    } else {
-        content.to_vec()
-    };
     if payload.signature_type != "cms-pades" {
+        let (data, operation) = if purpose == SignPurpose::Authentication {
+            (
+                bound_challenge(&payload.content, &state.server_key, &state.origin)?,
+                SignOperation::AuthenticationChallenge,
+            )
+        } else {
+            (content.to_vec(), SignOperation::Document)
+        };
         let raw = backend
             .sign(SignRequest {
                 purpose,
                 hash,
                 data,
                 origin: Some(state.origin.clone()),
+                operation,
+                consent_digest: None,
             })
             .map_err(TransactionError::wrapping)?;
         return ecdsa_adjust(raw, key_algorithm);
     }
+    let digest = if payload.content_type == "digest" {
+        content.to_vec()
+    } else {
+        crate::hash::digest(hash, content)
+    };
     let prepared = crate::cms::prepare(
-        &data,
+        &digest,
         &backend.certificate_chain(purpose),
         hash,
         key_algorithm,
@@ -197,6 +207,8 @@ fn signature(
             hash,
             data: prepared.signed_attributes().to_vec(),
             origin: Some(state.origin.clone()),
+            operation: SignOperation::CmsPades,
+            consent_digest: Some(digest),
         })
         .map_err(TransactionError::wrapping)?;
     prepared.signed_data(&card_signature)

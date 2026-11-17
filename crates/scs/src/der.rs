@@ -45,6 +45,9 @@ pub const TAG_SET: u8 = 0x31;
 /// DER tag: explicit [0], constructed.
 pub const TAG_CONTEXT_ZERO: u8 = 0xA0;
 
+/// DER tag: implicit [0], primitive (e.g. AuthorityKeyIdentifier keyIdentifier).
+pub const TAG_CONTEXT_ZERO_PRIMITIVE: u8 = 0x80;
+
 /// DER tag: explicit [3], constructed.
 pub const TAG_CONTEXT_THREE: u8 = 0xA3;
 

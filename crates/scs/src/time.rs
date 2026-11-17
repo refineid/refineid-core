@@ -17,8 +17,11 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use spki::der::asn1::UtcTime;
+use spki::der::asn1::{GeneralizedTime, UtcTime};
 use spki::der::{DateTime, EncodeValue as _, SliceWriter};
+
+/// Seconds in one standard calendar day (24 * 60 * 60).
+pub const SECONDS_PER_DAY: i64 = 86_400;
 
 /// Calendar month number for February.
 const MONTH_FEBRUARY: u8 = 2;
@@ -34,6 +37,15 @@ const UTC_TIME_LENGTH: usize = 13;
 
 /// DER tag: UTCTime, for writers wrapping an encoded time.
 pub const UTC_TIME_TAG: u8 = 0x17;
+
+/// GeneralizedTime field length: `yyyyMMddHHmmssZ` (RFC 5280 sec.4.1.2.5.2).
+pub const GENERALIZED_TIME_LENGTH: usize = 15;
+
+/// DER tag: GeneralizedTime, for writers wrapping an encoded time.
+pub const GENERALIZED_TIME_TAG: u8 = 0x18;
+
+/// RFC 5280 sec.4.1.2.5 year cutoff at which GeneralizedTime replaces UTCTime.
+pub const GENERALIZED_TIME_CUTOFF_YEAR: u16 = 2050;
 
 /// A time that is not representable, or a clock this software refuses
 /// to read.
@@ -121,9 +133,58 @@ pub fn format_utc_time(unix: i64) -> Result<[u8; UTC_TIME_LENGTH], TimeError> {
     Ok(out)
 }
 
+/// Add `days` calendar days to post-epoch unix seconds.
+pub fn add_days(unix: i64, days: i64) -> Result<i64, TimeError> {
+    if unix < 0 {
+        return Err(TimeError);
+    }
+    let day_seconds = days.checked_mul(SECONDS_PER_DAY).ok_or(TimeError)?;
+    let target = unix.checked_add(day_seconds).ok_or(TimeError)?;
+    if target < 0 {
+        return Err(TimeError);
+    }
+    Ok(target)
+}
+
+/// Subtract `seconds` from post-epoch unix seconds, ensuring non-negative result.
+pub fn sub_seconds(unix: i64, seconds: i64) -> Result<i64, TimeError> {
+    if unix < 0 {
+        return Err(TimeError);
+    }
+    let target = unix.checked_sub(seconds).ok_or(TimeError)?;
+    if target < 0 {
+        return Err(TimeError);
+    }
+    Ok(target)
+}
+
+/// Format post-epoch unix seconds per RFC 5280 sec.4.1.2.5:
+/// UTCTime through the cutoff year, GeneralizedTime thereafter.
+pub fn format_rfc5280_time(unix: i64) -> Result<(u8, Vec<u8>), TimeError> {
+    let seconds = u64::try_from(unix).map_err(|_| TimeError)?;
+    let dt = DateTime::from_unix_duration(Duration::from_secs(seconds)).map_err(|_| TimeError)?;
+    if dt.year() >= GENERALIZED_TIME_CUTOFF_YEAR {
+        let gt = GeneralizedTime::from_unix_duration(Duration::from_secs(seconds))
+            .map_err(|_| TimeError)?;
+        let mut out = [0_u8; GENERALIZED_TIME_LENGTH];
+        let mut writer = SliceWriter::new(&mut out);
+        gt.encode_value(&mut writer).map_err(|_| TimeError)?;
+        if writer.finish().map_err(|_| TimeError)?.len() != GENERALIZED_TIME_LENGTH {
+            return Err(TimeError);
+        }
+        Ok((GENERALIZED_TIME_TAG, out.to_vec()))
+    } else {
+        let utc = format_utc_time(unix)?;
+        Ok((UTC_TIME_TAG, utc.to_vec()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{UTC_TIME_TAG, add_years, format_utc_time, system_date_time, system_unix};
+    use super::{
+        UTC_TIME_TAG, add_days, add_years, format_utc_time, sub_seconds, system_date_time,
+        system_unix,
+    };
     use spki::der::Decode as _;
     use spki::der::asn1::UtcTime;
     use std::time::{Duration, UNIX_EPOCH};
@@ -209,6 +270,15 @@ mod tests {
         assert!(system_date_time(UNIX_EPOCH - Duration::from_secs(1)).is_err());
     }
 
+    /// Expected unix timestamp after adding thirty days to SOME_TUESDAY.
+    const THIRTY_DAYS_COUNT: i64 = 30;
+    const SOME_TUESDAY_PLUS_THIRTY_DAYS: i64 =
+        SOME_TUESDAY + (DAY_SECONDS as i64) * THIRTY_DAYS_COUNT;
+
+    /// Sixty seconds subtracted for clock skew test.
+    const CLOCK_SKEW_SECONDS: i64 = 60;
+    const SOME_TUESDAY_MINUS_CLOCK_SKEW: i64 = SOME_TUESDAY - CLOCK_SKEW_SECONDS;
+
     /// Adding calendar years clamps February 29 on common target years,
     /// keeps February 29 on leap target years, and rejects overflows.
     #[test]
@@ -219,5 +289,45 @@ mod tests {
         assert!(add_years(0, -ONE_YEAR).is_err());
         assert!(add_years(-1, ONE_YEAR).is_err());
         assert!(add_years(SOME_TUESDAY, i32::MAX).is_err());
+    }
+
+    /// Adding days advances unix seconds by exact 86,400-second days.
+    #[test]
+    fn add_days_advances_seconds() {
+        assert_eq!(
+            add_days(SOME_TUESDAY, THIRTY_DAYS_COUNT),
+            Ok(SOME_TUESDAY_PLUS_THIRTY_DAYS)
+        );
+        assert!(add_days(-1, THIRTY_DAYS_COUNT).is_err());
+        assert!(add_days(SOME_TUESDAY, i64::MAX).is_err());
+    }
+
+    /// Subtracting seconds pulls unix timestamp back and checks underflow.
+    #[test]
+    fn sub_seconds_reduces_timestamp() {
+        assert_eq!(
+            sub_seconds(SOME_TUESDAY, CLOCK_SKEW_SECONDS),
+            Ok(SOME_TUESDAY_MINUS_CLOCK_SKEW)
+        );
+        assert!(sub_seconds(0, CLOCK_SKEW_SECONDS).is_err());
+    }
+
+    /// RFC 5280 formatting switches from UTCTime to GeneralizedTime at year 2050.
+    #[test]
+    fn format_rfc5280_selects_tag_and_encodes() {
+        let (utc_tag, utc_bytes) =
+            super::format_rfc5280_time(SOME_TUESDAY).expect("formats UTCTime");
+        assert_eq!(utc_tag, super::UTC_TIME_TAG);
+        assert_eq!(
+            utc_bytes.as_slice(),
+            &format_utc_time(SOME_TUESDAY).expect("formats")
+        );
+
+        let (gt_tag, gt_bytes) = super::format_rfc5280_time(FIRST_POST_UTC_TIME_SECOND)
+            .expect("formats GeneralizedTime");
+        assert_eq!(gt_tag, super::GENERALIZED_TIME_TAG);
+        assert_eq!(gt_bytes.as_slice(), b"20500101000000Z");
+
+        assert!(super::format_rfc5280_time(-1).is_err());
     }
 }

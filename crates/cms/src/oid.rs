@@ -226,6 +226,10 @@ pub mod known {
 
     // ---- X.509 standard extensions (RFC 5280, id-ce = 2.5.29) ----
 
+    /// `2.5.29.35` -- id-ce-authorityKeyIdentifier.
+    pub const AUTHORITY_KEY_IDENTIFIER: Oid<'static> =
+        Oid::const_new(::const_oid::ObjectIdentifier::new_unwrap("2.5.29.35").as_bytes());
+
     /// `2.5.29.19` -- id-ce-basicConstraints (critical in FINEID S2).
     pub const BASIC_CONSTRAINTS: Oid<'static> =
         Oid::const_new(::const_oid::ObjectIdentifier::new_unwrap("2.5.29.19").as_bytes());
@@ -615,6 +619,11 @@ mod tests {
     #[test]
     fn display_basic_constraints() {
         assert_eq!(format!("{}", known::BASIC_CONSTRAINTS), "2.5.29.19");
+    }
+
+    #[test]
+    fn display_authority_key_identifier() {
+        assert_eq!(format!("{}", known::AUTHORITY_KEY_IDENTIFIER), "2.5.29.35");
     }
 
     #[test]

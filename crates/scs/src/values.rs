@@ -111,12 +111,64 @@ pub const SERVER_KEY_USAGE_BITS: u8 = 0xA0;
 /// Unused trailing bits in the KeyUsage BIT STRING above.
 pub const SERVER_KEY_USAGE_UNUSED_BITS: u8 = 5;
 
+/// KeyUsage bits of the offline localhost root CA certificate:
+/// keyCertSign and cRLSign (RFC 5280 sec.4.2.1.3).
+pub const ROOT_KEY_USAGE_BITS: u8 = 0x06;
+
+/// Unused trailing bits in the root CA KeyUsage BIT STRING.
+pub const ROOT_KEY_USAGE_UNUSED_BITS: u8 = 1;
+
+/// Path length constraint for the offline localhost root CA certificate:
+/// pathLenConstraint = 0 (RFC 5280 sec.4.2.1.9).
+pub const ROOT_PATH_LENGTH: u8 = 0;
+
 /// Octets in an IPv4 address.
 pub const IPV4_LENGTH: usize = 4;
+
+/// Octets in an IPv6 address.
+pub const IPV6_LENGTH: usize = 16;
 
 /// The loopback address named in the certificate's subjectAltName
 /// (v1.3 sec.2.3): 127.0.0.1.
 pub const LOOPBACK_ADDRESS: [u8; IPV4_LENGTH] = [127, 0, 0, 1];
+
+/// The IPv6 loopback address (::1).
+pub const LOOPBACK_IPV6_ADDRESS: [u8; IPV6_LENGTH] =
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+
+/// Octets in an IPv4 NameConstraints CIDR subtree.
+pub const IPV4_NAME_CONSTRAINT_LENGTH: usize = IPV4_LENGTH * 2;
+
+/// Octets in an IPv6 NameConstraints CIDR subtree.
+pub const IPV6_NAME_CONSTRAINT_LENGTH: usize = IPV6_LENGTH * 2;
+
+/// The IPv4 NameConstraints loopback subtree.
+pub const LOOPBACK_NAME_CONSTRAINT_IPV4: [u8; IPV4_NAME_CONSTRAINT_LENGTH] =
+    [127, 0, 0, 1, 255, 255, 255, 255];
+
+/// The IPv6 NameConstraints loopback subtree.
+pub const LOOPBACK_NAME_CONSTRAINT_IPV6: [u8; IPV6_NAME_CONSTRAINT_LENGTH] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255,
+];
+
+/// Serial number entropy length, in octets.
+pub const SERIAL_OCTET_COUNT: usize = 16;
+
+/// High-bit mask cleared on the leading serial-number octet to ensure positive INTEGER.
+pub const SERIAL_POSITIVE_MASK: u8 = 0x7F;
+
+/// Fallback low bit set when random serial octets are all zero.
+pub const SERIAL_NON_ZERO_BIT: u8 = 0x01;
+
+/// Clock-skew allowance subtracted from not_before, in seconds.
+pub const NOT_BEFORE_CLOCK_SKEW_SECONDS: i64 = 60;
+
+/// How long a generated offline root CA certificate stays valid, in years.
+pub const ROOT_CERTIFICATE_VALIDITY_YEARS: i32 = 10;
+
+/// How long a generated localhost server leaf stays valid, in days.
+pub const LEAF_CERTIFICATE_VALIDITY_DAYS: i64 = 397;
 
 /// Length of the agreed A256GCM transaction key, in bytes.
 pub const TRANSACTION_KEY_LENGTH: usize = 32;
@@ -127,7 +179,7 @@ pub const TRANSACTION_TIME_TO_LIVE: std::time::Duration = std::time::Duration::f
 
 /// How long a generated localhost certificate stays valid, in
 /// years; it is persisted and reused, so trust survives restarts.
-pub const CERTIFICATE_VALIDITY_YEARS: i32 = 10;
+pub const CERTIFICATE_VALIDITY_YEARS: i32 = ROOT_CERTIFICATE_VALIDITY_YEARS;
 
 /// Upper-case hex length of a SHA-1 digest: two characters per octet.
 pub const SHA1_HEX_LENGTH: usize = refineid_digest::SHA1_LEN * 2;

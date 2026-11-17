@@ -213,7 +213,7 @@ impl OcspNonce {
 /// `ResponderID.byKey` (RFC 6960 sec.4.2.1): SHA-1 of the responder's
 /// `subjectPublicKey` BIT STRING value, which the response names its
 /// signer by.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ResponderKeyHash([u8; SHA1_LEN]);
 
 impl ResponderKeyHash {
@@ -926,6 +926,24 @@ impl BasicOcspResponse<'_> {
         &self.responses
     }
 
+    /// Whether any entry names `certificate` under `issuer`: the cheap,
+    /// unverified relevance screening the trust judgement applies before
+    /// it spends a signature verification on this response. It decides
+    /// where verification effort goes, so the budget is spent on
+    /// answers that could count: a status is read only from a
+    /// [`VerifiedOcspResponse`].
+    #[must_use]
+    pub(crate) fn carries_status_for(
+        &self,
+        certificate: Certificate<'_>,
+        issuer: Certificate<'_>,
+    ) -> bool {
+        let hashes = IssuerHashes::of(issuer);
+        self.single_responses()
+            .iter()
+            .any(|response| hashes.matches(&response.cert_id, certificate))
+    }
+
     /// Test-only convenience: find the `SingleResponse` whose
     /// `CertID` matches `serial`. Production reads status only via
     /// [`VerifiedOcspResponse::single_responses`] (trust by
@@ -1024,6 +1042,21 @@ impl IssuerHashes {
             CertIdHash::Sha1 => (&self.sha1_name, &self.sha1_key),
             CertIdHash::Sha256 => (&self.sha256_name, &self.sha256_key),
         }
+    }
+
+    /// Whether `cert_id` names `certificate` under the issuer these are
+    /// the hashes of: the hash algorithm is one matched, the name and
+    /// key hashes equal the issuer's, the certificate's own issuer
+    /// hashes to the same name, and the serials match.
+    fn matches(&self, cert_id: &CertId, certificate: Certificate<'_>) -> bool {
+        let Some(algorithm) = CertIdHash::from_oid(&cert_id.hash_algorithm_oid) else {
+            return false;
+        };
+        let (name, key) = self.under(algorithm);
+        algorithm.digest(certificate.issuer.as_der()) == name
+            && cert_id.issuer_name_hash == name
+            && cert_id.issuer_key_hash == key
+            && cert_id.serial == certificate.serial()
     }
 }
 
@@ -1156,17 +1189,9 @@ impl<'a> VerifiedOcspResponse<'a> {
     /// serial never matches.
     #[must_use]
     pub fn response_for(&self, certificate: Certificate<'_>) -> Option<&SingleResponse> {
-        let serial = certificate.serial();
-        self.single_responses().iter().find(|response| {
-            let Some(algorithm) = CertIdHash::from_oid(&response.cert_id.hash_algorithm_oid) else {
-                return false;
-            };
-            let (name, key) = self.issuer.under(algorithm);
-            algorithm.digest(certificate.issuer.as_der()) == name
-                && response.cert_id.issuer_name_hash == name
-                && response.cert_id.issuer_key_hash == key
-                && response.cert_id.serial == serial
-        })
+        self.single_responses()
+            .iter()
+            .find(|response| self.issuer.matches(&response.cert_id, certificate))
     }
 
     /// Test-only: wrap a basic response *without* verifying its

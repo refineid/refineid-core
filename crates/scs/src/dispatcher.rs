@@ -28,6 +28,7 @@ use refineid_digest::HashAlg;
 use crate::backend::{SignRequest, SigningBackend};
 use crate::base64;
 use crate::challenge;
+use crate::codec;
 use crate::document::{SignRequestDocument, SignResponseDocument, VersionDocument};
 use crate::error::TransactionError;
 use crate::hash;
@@ -43,6 +44,17 @@ pub fn dispatch(
     backend: &dyn SigningBackend,
     transactions: &TransactionManager,
 ) -> Vec<u8> {
+    if request
+        .host
+        .as_deref()
+        .is_some_and(|host| !http::is_allowed_host(host))
+    {
+        return http::text(
+            values::HTTP_FORBIDDEN,
+            "Forbidden: host must be loopback",
+            request.origin.as_deref(),
+        );
+    }
     if request.method == "OPTIONS" {
         return http::preflight(request.origin.as_deref());
     }
@@ -75,6 +87,15 @@ fn sign_error(reason_code: u16, reason_text: &str, origin: Option<&str>) -> Vec<
     )
 }
 
+/// Media type essence: parameters (after ;) stripped and trimmed.
+fn media_type_essence(content_type: &str) -> &str {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+}
+
 /// Handle `POST /sign`: the JWT transaction branch by content type,
 /// otherwise the JSON form.
 fn sign(
@@ -84,22 +105,36 @@ fn sign(
     backend: &dyn SigningBackend,
     transactions: &TransactionManager,
 ) -> Vec<u8> {
-    if request
-        .content_type
-        .as_deref()
-        .is_some_and(|content_type| content_type.contains("application/jwt"))
-    {
+    let Some(raw_content_type) = request.content_type.as_deref() else {
+        return sign_error(
+            values::REASON_BAD_REQUEST,
+            "Bad request: missing Content-Type header (application/json or application/jwt required)",
+            request.origin.as_deref(),
+        );
+    };
+    let essence = media_type_essence(raw_content_type);
+    if essence.eq_ignore_ascii_case("application/jwt") {
         return sign_transaction(request, body, now, backend, transactions);
     }
-    if request
-        .origin
-        .as_deref()
-        .is_none_or(|origin| !origin.starts_with("https://"))
-    {
+    if !essence.eq_ignore_ascii_case("application/json") {
+        return sign_error(
+            values::REASON_BAD_REQUEST,
+            "Bad request: unsupported Content-Type (application/json or application/jwt required)",
+            request.origin.as_deref(),
+        );
+    }
+    let Some(origin) = request.origin.as_deref() else {
         return sign_error(
             values::REASON_FORBIDDEN,
-            "Forbidden: sign Origin must use HTTPS",
-            request.origin.as_deref(),
+            "Forbidden: missing Origin header",
+            None,
+        );
+    };
+    if let Some(reason) = codec::origin_refusal(origin) {
+        return sign_error(
+            values::REASON_FORBIDDEN,
+            &format!("Forbidden: {reason}"),
+            Some(origin),
         );
     }
     let value: serde_json::Value = match serde_json::from_slice(body) {
@@ -108,7 +143,7 @@ fn sign(
             return sign_error(
                 values::REASON_BAD_REQUEST,
                 "Bad request: invalid JSON",
-                request.origin.as_deref(),
+                Some(origin),
             );
         }
     };
@@ -118,17 +153,11 @@ fn sign(
             return sign_error(
                 values::REASON_BAD_REQUEST,
                 "Bad request: invalid JSON",
-                request.origin.as_deref(),
+                Some(origin),
             );
         }
     };
-    sign_json(
-        &document,
-        request.origin.as_deref(),
-        now,
-        backend,
-        transactions,
-    )
+    sign_json(&document, Some(origin), now, backend, transactions)
 }
 
 /// The JWT transaction branch: a compact JWS begins, a compact JWE
@@ -321,6 +350,7 @@ mod tests {
         Request {
             method: method.to_owned(),
             path: path.to_owned(),
+            host: None,
             origin: origin.map(str::to_owned),
             content_type: content_type.map(str::to_owned),
             body_length: 0,
@@ -536,13 +566,24 @@ mod tests {
         );
     }
 
-    /// Missing and plain-HTTP origins are refused before any parsing.
+    /// Missing, plain-HTTP, and malformed origins are refused before any parsing.
     #[test]
     fn json_origin_gate() {
         let backend = backend();
         let manager = TransactionManager::new();
         let now = UNIX_EPOCH + Duration::from_secs(TEST_NOW_SECONDS);
-        for origin in [None, Some("http://example.com")] {
+        for origin in [
+            None,
+            Some("http://example.com"),
+            Some("https://trusted.example@attacker.example"),
+            Some("https://example.com/path"),
+            Some("https://example.com?query"),
+            Some("https://example.com#fragment"),
+            Some("https://example.com;other"),
+            Some("https://evil\texample.com"),
+            Some("https://ää.example.com"),
+            Some("https://.example.com"),
+        ] {
             let response = dispatch(
                 &request_with_origin("POST", "/sign", origin, Some("application/json")),
                 b"{}",
@@ -553,10 +594,79 @@ mod tests {
             let body = body_json(&response);
             assert_eq!(
                 body.get("reasonCode").and_then(serde_json::Value::as_u64),
-                reason(values::REASON_FORBIDDEN)
+                reason(values::REASON_FORBIDDEN),
+                "{origin:?}"
             );
         }
         assert!(backend.signed().is_empty());
+    }
+
+    /// Content-Type must have essence application/json or application/jwt;
+    /// simple request types and missing content-type are refused.
+    #[test]
+    fn content_type_gate() {
+        let backend = backend();
+        let manager = TransactionManager::new();
+        let now = UNIX_EPOCH + Duration::from_secs(TEST_NOW_SECONDS);
+        for ct in [
+            None,
+            Some("text/plain"),
+            Some("text/plain; x=application/jwt"),
+            Some("application/x-www-form-urlencoded"),
+            Some("multipart/form-data"),
+        ] {
+            let response = dispatch(
+                &request_with_origin("POST", "/sign", Some(ORIGIN), ct),
+                b"{}",
+                now,
+                &backend,
+                &manager,
+            );
+            let body = body_json(&response);
+            assert_eq!(
+                body.get("reasonCode").and_then(serde_json::Value::as_u64),
+                reason(values::REASON_BAD_REQUEST),
+                "{ct:?}"
+            );
+        }
+        // Parameters after semicolon are allowed on valid essence
+        let response = dispatch(
+            &request_with_origin(
+                "POST",
+                "/sign",
+                Some(ORIGIN),
+                Some("application/json; charset=utf-8"),
+            ),
+            b"{}",
+            now,
+            &backend,
+            &manager,
+        );
+        let body = body_json(&response);
+        // Reaches json decode, which fails on empty object with missing fields
+        assert_eq!(
+            body.get("reasonCode").and_then(serde_json::Value::as_u64),
+            reason(values::REASON_BAD_REQUEST)
+        );
+    }
+
+    /// Non-loopback Host headers are rejected with 403 Forbidden.
+    #[test]
+    fn host_gate() {
+        let backend = backend();
+        let manager = TransactionManager::new();
+        let now = UNIX_EPOCH + Duration::from_secs(TEST_NOW_SECONDS);
+        let mut req = request("GET", "/version", None);
+        req.host = Some("evil.example".to_owned());
+        let response = dispatch(&req, b"", now, &backend, &manager);
+        let text = core::str::from_utf8(&response).expect("ascii");
+        assert!(text.starts_with("HTTP/1.1 403 Forbidden\r\n"), "{text:?}");
+
+        // Loopback host is allowed
+        req.host = Some("127.0.0.1:53952".to_owned());
+        let response = dispatch(&req, b"", now, &backend, &manager);
+        let text = core::str::from_utf8(&response).expect("ascii");
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text:?}");
     }
 
     /// A requested digest is honored; an unknown one is refused as

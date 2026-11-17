@@ -36,17 +36,159 @@ const BITS_PER_HEX_DIGIT: usize = 4;
 /// Mask selecting one hexadecimal digit's worth of bits.
 const HEX_DIGIT_MASK: u8 = 0x0F;
 
-/// The transaction Origin gate: present and HTTPS (v1.3 sec.2.7).
+/// Unicode C0 control start.
+const C0_START: u32 = 0x0000;
+
+/// Unicode C0 control end.
+const C0_END: u32 = 0x001F;
+
+/// ASCII DEL character.
+const DEL_CHAR: u32 = 0x007F;
+
+/// Unicode C1 control end.
+const C1_END: u32 = 0x009F;
+
+/// Arabic letter mark (bidi).
+const ARABIC_LETTER_MARK: u32 = 0x061C;
+
+/// Zero-width space start.
+const ZERO_WIDTH_START: u32 = 0x200B;
+
+/// Right-to-left mark end.
+const RTL_MARK_END: u32 = 0x200F;
+
+/// Line separator start (bidi / breaks).
+const LINE_BREAK_START: u32 = 0x2028;
+
+/// Right-to-left override end.
+const RLO_END: u32 = 0x202E;
+
+/// Word joiner start.
+const WORD_JOINER_START: u32 = 0x2060;
+
+/// Directional isolate end.
+const ISOLATE_END: u32 = 0x2069;
+
+/// Zero-width no-break space / byte order mark.
+const BOM_CHAR: u32 = 0xFEFF;
+
+/// Whether a Unicode character is a forbidden control, line-break,
+/// zero-width, or bidirectional-override character in Origin headers.
+pub fn is_forbidden_origin_char(c: char) -> bool {
+    let u = c as u32;
+    matches!(
+        u,
+        C0_START..=C0_END
+            | DEL_CHAR..=C1_END
+            | ARABIC_LETTER_MARK
+            | ZERO_WIDTH_START..=RTL_MARK_END
+            | LINE_BREAK_START..=RLO_END
+            | WORD_JOINER_START..=ISOLATE_END
+            | BOM_CHAR
+    )
+}
+
+/// Why an Origin header value is refused by policy, or `None` if it is
+/// a well-formed `https://` serialized web origin.
+#[must_use]
+pub fn origin_refusal(origin: &str) -> Option<&'static str> {
+    if origin.len() > values::ORIGIN_MAXIMUM_LENGTH {
+        return Some("Origin exceeds maximum length");
+    }
+    if !origin.is_ascii() || origin.chars().any(is_forbidden_origin_char) {
+        return Some("Origin contains disallowed characters");
+    }
+    let lower = origin.to_ascii_lowercase();
+    if lower.starts_with("http://") {
+        return Some(
+            "Origin uses http instead of https; insecure web pages cannot use the signing service",
+        );
+    }
+    if !lower.starts_with("https://") {
+        return Some("Origin must use the https:// scheme");
+    }
+    let authority = &origin["https://".len()..];
+    if !is_valid_origin_authority(authority) {
+        return Some("Origin must be a valid https:// web origin");
+    }
+    None
+}
+
+/// Whether `origin` is a valid `https://` serialized web origin.
+#[must_use]
+pub fn is_valid_origin(origin: &str) -> bool {
+    origin_refusal(origin).is_none()
+}
+
+/// The transaction Origin gate: present and valid HTTPS web origin (v1.3 sec.2.7).
 pub fn validated_origin(origin: Option<&str>) -> Result<String, TransactionError> {
     let Some(origin) = origin else {
         return Err(TransactionError::forbidden("missing Origin header"));
     };
-    if !origin.starts_with("https://") {
-        return Err(TransactionError::forbidden(
-            "transaction Origin must use HTTPS",
-        ));
+    if let Some(reason) = origin_refusal(origin) {
+        return Err(TransactionError::forbidden(reason));
     }
     Ok(origin.to_owned())
+}
+
+/// Validate authority component of an origin: `host[:port]` or `[ipv6][:port]`.
+fn is_valid_origin_authority(authority: &str) -> bool {
+    if authority.is_empty()
+        || authority.contains('/')
+        || authority.contains('?')
+        || authority.contains('#')
+        || authority.contains('@')
+        || authority.contains(';')
+        || authority.chars().any(|c| c.is_ascii_whitespace())
+    {
+        return false;
+    }
+    let (host, port_text) = if authority.starts_with('[') {
+        let Some(closing) = authority.find(']') else {
+            return false;
+        };
+        let (ipv6, rest) = authority.split_at(closing + 1);
+        if rest.is_empty() {
+            (ipv6, None)
+        } else {
+            let Some(port) = rest.strip_prefix(':') else {
+                return false;
+            };
+            (ipv6, Some(port))
+        }
+    } else if let Some((h, p)) = authority.split_once(':') {
+        (h, Some(p))
+    } else {
+        (authority, None)
+    };
+
+    if let Some(port) = port_text
+        && !is_valid_port(port)
+    {
+        return false;
+    }
+    is_valid_origin_host(host)
+}
+
+fn is_valid_port(port: &str) -> bool {
+    if port.is_empty() || port.starts_with('0') || !port.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let Ok(p) = port.parse::<u16>() else {
+        return false;
+    };
+    p >= values::PORT_MINIMUM
+}
+
+fn is_valid_origin_host(host: &str) -> bool {
+    if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return inner.parse::<std::net::Ipv6Addr>().is_ok();
+    }
+    if host.is_empty() || host.starts_with('.') || host.ends_with('.') || host.contains("..") {
+        return false;
+    }
+    host.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
 }
 
 /// The card key the selector names; mixing both usages is refused.
@@ -194,7 +336,7 @@ pub(crate) fn p256_spki_key(spki_der: &[u8]) -> Result<p256::PublicKey, ()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{key_identifier, purpose_of_selector, validated_origin};
+    use super::{RLO_END, key_identifier, purpose_of_selector, validated_origin};
     use crate::document::BeginSelector;
     use crate::error::TransactionError;
     use crate::purpose::SignPurpose;
@@ -208,13 +350,71 @@ mod tests {
             Ok("https://example.com".to_owned())
         );
         assert_eq!(
+            validated_origin(Some("https://example.com:8443")),
+            Ok("https://example.com:8443".to_owned())
+        );
+        assert_eq!(
+            validated_origin(Some("https://127.0.0.1:53952")),
+            Ok("https://127.0.0.1:53952".to_owned())
+        );
+        assert_eq!(
+            validated_origin(Some("https://[::1]:8443")),
+            Ok("https://[::1]:8443".to_owned())
+        );
+        assert_eq!(
             validated_origin(None),
             Err(TransactionError::forbidden("missing Origin header"))
         );
         assert_eq!(
             validated_origin(Some("http://example.com")),
             Err(TransactionError::forbidden(
-                "transaction Origin must use HTTPS"
+                "Origin uses http instead of https; insecure web pages cannot use the signing service"
+            ))
+        );
+        assert_eq!(
+            validated_origin(Some("https://trusted.example@attacker.example")),
+            Err(TransactionError::forbidden(
+                "Origin must be a valid https:// web origin"
+            ))
+        );
+        assert_eq!(
+            validated_origin(Some("https://example.com/path")),
+            Err(TransactionError::forbidden(
+                "Origin must be a valid https:// web origin"
+            ))
+        );
+        assert_eq!(
+            validated_origin(Some("https://example.com?query")),
+            Err(TransactionError::forbidden(
+                "Origin must be a valid https:// web origin"
+            ))
+        );
+        assert_eq!(
+            validated_origin(Some("https://example.com#fragment")),
+            Err(TransactionError::forbidden(
+                "Origin must be a valid https:// web origin"
+            ))
+        );
+        assert_eq!(
+            validated_origin(Some("https://evil\texample.com")),
+            Err(TransactionError::forbidden(
+                "Origin contains disallowed characters"
+            ))
+        );
+        let bidi = format!(
+            "https://evil{}example.com",
+            char::from_u32(RLO_END).expect("scalar")
+        );
+        assert_eq!(
+            validated_origin(Some(&bidi)),
+            Err(TransactionError::forbidden(
+                "Origin contains disallowed characters"
+            ))
+        );
+        assert_eq!(
+            validated_origin(Some("https://ää.example.com")),
+            Err(TransactionError::forbidden(
+                "Origin contains disallowed characters"
             ))
         );
     }

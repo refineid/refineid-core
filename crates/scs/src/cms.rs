@@ -201,12 +201,7 @@ fn attribute(oid: &[u8], value_der: &[u8]) -> Result<Vec<u8>, ()> {
 /// hash already pins the leaf uniquely. The hash-algorithm default
 /// (SHA-256) is omitted when it is the value, per DER.
 fn signing_certificate_v2(leaf: &[u8], hash: HashAlg) -> Result<Vec<u8>, ()> {
-    let cert_hash = match hash {
-        HashAlg::Sha1 => refineid_digest::Sha1::of(leaf).as_bytes().to_vec(),
-        HashAlg::Sha256 => refineid_digest::Sha256::of(leaf).as_bytes().to_vec(),
-        HashAlg::Sha384 => refineid_digest::Sha384::of(leaf).as_bytes().to_vec(),
-        HashAlg::Sha512 => refineid_digest::Sha512::of(leaf).as_bytes().to_vec(),
-    };
+    let cert_hash = crate::hash::digest(hash, leaf);
     let mut cert_id = Vec::new();
     if hash != HashAlg::Sha256 {
         let oid = match hash {

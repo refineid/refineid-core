@@ -26,7 +26,7 @@ use p256::NistP256;
 use refineid_digest::HashAlg;
 use zeroize::Zeroizing;
 
-use crate::backend::{SignRequest, SigningBackend};
+use crate::backend::{SignOperation, SignRequest, SigningBackend};
 use crate::base64;
 use crate::codec;
 use crate::document::{
@@ -198,6 +198,8 @@ fn signed(
             hash,
             data: signing_input.as_bytes().to_vec(),
             origin: Some(state.origin.clone()),
+            operation: SignOperation::BeginHandshake,
+            consent_digest: None,
         })
         .map_err(TransactionError::wrapping)?;
     Ok(Outcome {

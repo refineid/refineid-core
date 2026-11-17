@@ -259,7 +259,7 @@ fn evict_expired(slot: &mut Slot, now: SystemTime) {
 #[cfg(test)]
 mod tests {
     use super::TransactionManager;
-    use crate::backend::BackendFailure;
+    use crate::backend::{BackendFailure, SignOperation};
     use crate::base64;
     use crate::error::TransactionError;
     use crate::purpose::{KeyAlgorithm, SignPurpose};
@@ -377,6 +377,8 @@ mod tests {
         let begin_sign = backend.signed().remove(0);
         assert_eq!(begin_sign.purpose, SignPurpose::Authentication);
         assert_eq!(begin_sign.hash, HashAlg::Sha256);
+        assert_eq!(begin_sign.operation, SignOperation::BeginHandshake);
+        assert_eq!(begin_sign.consent_digest, None);
         // The caller sends origin;nonce; the card signs the bound triple.
         let key = shared_array(&service, &answer);
         let nonce = "n".repeat(crate::values::NONCE_MINIMUM_LENGTH);
@@ -409,7 +411,13 @@ mod tests {
         );
         assert_eq!(backend.signed().len(), SIGNS_AFTER_EXECUTE);
         let bound = format!("{challenge};{}", base64::encode(&service.spki_der));
-        assert_eq!(backend.signed().remove(1).data, bound.as_bytes());
+        let execute_sign = backend.signed().remove(1);
+        assert_eq!(execute_sign.data, bound.as_bytes());
+        assert_eq!(
+            execute_sign.operation,
+            SignOperation::AuthenticationChallenge
+        );
+        assert_eq!(execute_sign.consent_digest, None);
     }
 
     /// A pre-bound triple is refused: the caller sends the pair.
@@ -607,5 +615,188 @@ mod tests {
                 message: "Unauthorized: no card".to_owned(),
             })
         );
+    }
+
+    const RAW_PAYLOAD_LENGTH: usize = 32;
+    const RAW_PAYLOAD_FILL: u8 = 0x5a;
+    const INVALID_DIGEST_LENGTH: usize = 16;
+    const INVALID_DIGEST_FILL: u8 = 0x24;
+
+    fn qualified_begin_payload(service: &Service) -> serde_json::Value {
+        serde_json::from_str(&format!(
+            "{{\"version\":\"1.3\",\"serverKey\":\"{}\",\"serverCert\":\"{}\",\"selector\":{{\"keyusages\":[\"nonRepudiation\"]}}}}",
+            base64::encode(&service.spki_der),
+            base64::encode(&service.cert_der),
+        ))
+        .expect("payload parses")
+    }
+
+    /// cms-pades with contentType "data" hashes the document data and
+    /// places the digest in consent_digest rather than raw payload bytes.
+    #[test]
+    fn cms_pades_data_content_hashes_and_sets_consent() {
+        let service = service();
+        let backend = backend();
+        let manager = TransactionManager::new();
+        let begin_jws = mint_jws(&service.key, &qualified_begin_payload(&service));
+        let answer = manager
+            .begin(begin_jws.as_bytes(), Some(ORIGIN), test_now(), &backend)
+            .expect("begin succeeds");
+        let key = shared_array(&service, &answer);
+        let raw_data = [RAW_PAYLOAD_FILL; RAW_PAYLOAD_LENGTH];
+        let execute = format!(
+            "{{\"version\":\"1.3\",\"content\":\"{}\",\"contentType\":\"data\",\"signatureType\":\"cms-pades\"}}",
+            base64::encode(&raw_data)
+        );
+        let envelope = crate::jwe::encrypt(execute.as_bytes(), &key).expect("encrypts");
+        let sealed = manager
+            .execute(envelope.as_bytes(), Some(ORIGIN), test_now(), &backend)
+            .expect("execute succeeds");
+        let plaintext = crate::jwe::decrypt(sealed.as_bytes(), &key).expect("decrypts");
+        let response: serde_json::Value = serde_json::from_slice(&plaintext).expect("JSON");
+        assert_eq!(
+            response.get("status").and_then(serde_json::Value::as_str),
+            Some("ok")
+        );
+        assert_eq!(backend.signed().len(), SIGNS_AFTER_EXECUTE);
+        let execute_sign = backend.signed().remove(1);
+        assert_eq!(execute_sign.purpose, SignPurpose::Qualified);
+        assert_eq!(execute_sign.operation, SignOperation::CmsPades);
+        let expected_digest = refineid_digest::Sha256::of(&raw_data).as_bytes().to_vec();
+        assert_eq!(execute_sign.consent_digest, Some(expected_digest.clone()));
+        assert!(execute_sign.consent_digest.as_deref() != Some(raw_data.as_slice()));
+    }
+
+    /// cms-pades with arbitrary length contentType "data" succeeds and hashes.
+    #[test]
+    fn cms_pades_data_arbitrary_length_succeeds() {
+        let service = service();
+        let backend = backend();
+        let manager = TransactionManager::new();
+        let begin_jws = mint_jws(&service.key, &qualified_begin_payload(&service));
+        let answer = manager
+            .begin(begin_jws.as_bytes(), Some(ORIGIN), test_now(), &backend)
+            .expect("begin succeeds");
+        let key = shared_array(&service, &answer);
+        let raw_data = b"arbitrary-length-pdf-document-bytes";
+        let execute = format!(
+            "{{\"version\":\"1.3\",\"content\":\"{}\",\"contentType\":\"data\",\"signatureType\":\"cms-pades\"}}",
+            base64::encode(raw_data)
+        );
+        let envelope = crate::jwe::encrypt(execute.as_bytes(), &key).expect("encrypts");
+        let sealed = manager
+            .execute(envelope.as_bytes(), Some(ORIGIN), test_now(), &backend)
+            .expect("execute succeeds");
+        let plaintext = crate::jwe::decrypt(sealed.as_bytes(), &key).expect("decrypts");
+        let response: serde_json::Value = serde_json::from_slice(&plaintext).expect("JSON");
+        assert_eq!(
+            response.get("status").and_then(serde_json::Value::as_str),
+            Some("ok")
+        );
+        assert_eq!(backend.signed().len(), SIGNS_AFTER_EXECUTE);
+        let execute_sign = backend.signed().remove(1);
+        assert_eq!(execute_sign.purpose, SignPurpose::Qualified);
+        assert_eq!(execute_sign.operation, SignOperation::CmsPades);
+        let expected_digest = refineid_digest::Sha256::of(raw_data).as_bytes().to_vec();
+        assert_eq!(execute_sign.consent_digest, Some(expected_digest));
+    }
+
+    /// cms-pades with omitted contentType defaults to data and hashes.
+    #[test]
+    fn cms_pades_omitted_content_type_defaults_to_data() {
+        let service = service();
+        let backend = backend();
+        let manager = TransactionManager::new();
+        let begin_jws = mint_jws(&service.key, &qualified_begin_payload(&service));
+        let answer = manager
+            .begin(begin_jws.as_bytes(), Some(ORIGIN), test_now(), &backend)
+            .expect("begin succeeds");
+        let key = shared_array(&service, &answer);
+        let raw_data = b"omitted-content-type-payload";
+        let execute = format!(
+            "{{\"version\":\"1.3\",\"content\":\"{}\",\"signatureType\":\"cms-pades\"}}",
+            base64::encode(raw_data)
+        );
+        let envelope = crate::jwe::encrypt(execute.as_bytes(), &key).expect("encrypts");
+        let sealed = manager
+            .execute(envelope.as_bytes(), Some(ORIGIN), test_now(), &backend)
+            .expect("execute succeeds");
+        let plaintext = crate::jwe::decrypt(sealed.as_bytes(), &key).expect("decrypts");
+        let response: serde_json::Value = serde_json::from_slice(&plaintext).expect("JSON");
+        assert_eq!(
+            response.get("status").and_then(serde_json::Value::as_str),
+            Some("ok")
+        );
+        assert_eq!(backend.signed().len(), SIGNS_AFTER_EXECUTE);
+        let execute_sign = backend.signed().remove(1);
+        assert_eq!(execute_sign.purpose, SignPurpose::Qualified);
+        assert_eq!(execute_sign.operation, SignOperation::CmsPades);
+        let expected_digest = refineid_digest::Sha256::of(raw_data).as_bytes().to_vec();
+        assert_eq!(execute_sign.consent_digest, Some(expected_digest));
+    }
+
+    /// cms-pades with contentType "digest" accepts 32-byte digests.
+    #[test]
+    fn cms_pades_digest_content_accepts_valid_length() {
+        let service = service();
+        let backend = backend();
+        let manager = TransactionManager::new();
+        let begin_jws = mint_jws(&service.key, &qualified_begin_payload(&service));
+        let answer = manager
+            .begin(begin_jws.as_bytes(), Some(ORIGIN), test_now(), &backend)
+            .expect("begin succeeds");
+        let key = shared_array(&service, &answer);
+
+        let valid_digest = [RAW_PAYLOAD_FILL; RAW_PAYLOAD_LENGTH];
+        let execute = format!(
+            "{{\"version\":\"1.3\",\"content\":\"{}\",\"contentType\":\"digest\",\"signatureType\":\"cms-pades\"}}",
+            base64::encode(&valid_digest)
+        );
+        let envelope = crate::jwe::encrypt(execute.as_bytes(), &key).expect("encrypts");
+        let sealed = manager
+            .execute(envelope.as_bytes(), Some(ORIGIN), test_now(), &backend)
+            .expect("execute succeeds");
+        let plaintext = crate::jwe::decrypt(sealed.as_bytes(), &key).expect("decrypts");
+        let response: serde_json::Value = serde_json::from_slice(&plaintext).expect("JSON");
+        assert_eq!(
+            response.get("status").and_then(serde_json::Value::as_str),
+            Some("ok")
+        );
+        assert_eq!(backend.signed().len(), SIGNS_AFTER_EXECUTE);
+        let execute_sign = backend.signed().remove(1);
+        assert_eq!(execute_sign.purpose, SignPurpose::Qualified);
+        assert_eq!(execute_sign.operation, SignOperation::CmsPades);
+        assert_eq!(execute_sign.consent_digest, Some(valid_digest.to_vec()));
+    }
+
+    /// cms-pades with contentType "digest" rejects invalid digest lengths.
+    #[test]
+    fn cms_pades_digest_content_rejects_invalid_length() {
+        let service = service();
+        let backend = backend();
+        let manager = TransactionManager::new();
+        let begin_jws = mint_jws(&service.key, &qualified_begin_payload(&service));
+        let answer = manager
+            .begin(begin_jws.as_bytes(), Some(ORIGIN), test_now(), &backend)
+            .expect("begin succeeds");
+        let key = shared_array(&service, &answer);
+
+        let invalid_digest = [INVALID_DIGEST_FILL; INVALID_DIGEST_LENGTH];
+        let execute_invalid = format!(
+            "{{\"version\":\"1.3\",\"content\":\"{}\",\"contentType\":\"digest\",\"signatureType\":\"cms-pades\"}}",
+            base64::encode(&invalid_digest)
+        );
+        let envelope_invalid =
+            crate::jwe::encrypt(execute_invalid.as_bytes(), &key).expect("encrypts");
+        let err = manager
+            .execute(
+                envelope_invalid.as_bytes(),
+                Some(ORIGIN),
+                test_now(),
+                &backend,
+            )
+            .expect_err("wrong digest length fails");
+        assert_eq!(err.code, crate::values::REASON_BAD_REQUEST);
+        assert!(err.message.contains("SHA256 digest must be 32 bytes"));
     }
 }

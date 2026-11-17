@@ -25,7 +25,7 @@ use std::time::SystemTime;
 
 use refineid_digest::HashAlg;
 
-use crate::backend::{SignRequest, SigningBackend};
+use crate::backend::{SignOperation, SignRequest, SigningBackend};
 use crate::base64;
 use crate::challenge;
 use crate::codec;
@@ -274,11 +274,18 @@ fn sign_json(
         Ok(flight) => flight,
         Err(error) => return sign_error(error.code, &error.message, origin),
     };
+    let operation = if purpose == crate::purpose::SignPurpose::Authentication {
+        SignOperation::AuthenticationChallenge
+    } else {
+        SignOperation::Document
+    };
     let signature = backend.sign(SignRequest {
         purpose,
         hash,
         data: raw,
         origin: origin.map(str::to_owned),
+        operation,
+        consent_digest: None,
     });
     match signature {
         Ok(signature) => {
@@ -320,7 +327,7 @@ fn ecdsa_adjust(
 #[cfg(test)]
 mod tests {
     use super::dispatch;
-    use crate::backend::BackendFailure;
+    use crate::backend::{BackendFailure, SignOperation};
     use crate::base64;
     use crate::http::Request;
     use crate::purpose::{KeyAlgorithm, SignPurpose};
@@ -462,10 +469,10 @@ mod tests {
             "{body:?}"
         );
         assert_eq!(backend.signed().len(), 1);
-        assert_eq!(
-            backend.signed().remove(0).purpose,
-            SignPurpose::Authentication
-        );
+        let signed = backend.signed().remove(0);
+        assert_eq!(signed.purpose, SignPurpose::Authentication);
+        assert_eq!(signed.operation, SignOperation::AuthenticationChallenge);
+        assert_eq!(signed.consent_digest, None);
     }
 
     /// Malformed JSON signs fail in the always-200 reason form.
@@ -533,6 +540,32 @@ mod tests {
         let body = body_text(&response);
         assert!(body.contains("\"reasonCode\":401"), "{body:?}");
         assert!(body.contains("Unauthorized: no card"), "{body:?}");
+    }
+
+    /// A qualified document sign on the JSON path records a Document operation.
+    #[test]
+    fn qualified_sign_records_document_operation() {
+        let backend = backend();
+        let manager = TransactionManager::new();
+        let body = format!(
+            "{{\"content\":\"{}\",\"contentType\":\"data\",\"selector\":{{\"keyusages\":[\"nonRepudiation\"]}}}}",
+            base64::encode(b"qualified document"),
+        );
+        let response = dispatch(
+            &request("POST", "/sign", Some("application/json")),
+            body.as_bytes(),
+            UNIX_EPOCH + Duration::from_secs(TEST_NOW_SECONDS),
+            &backend,
+            &manager,
+        );
+        let body = body_text(&response);
+        assert!(body.contains("\"status\":\"ok\""), "{body:?}");
+        assert_eq!(backend.signed().len(), 1);
+        let signed = backend.signed().remove(0);
+        assert_eq!(signed.purpose, SignPurpose::Qualified);
+        assert_eq!(signed.operation, SignOperation::Document);
+        assert_eq!(signed.consent_digest, None);
+        assert_eq!(signed.data, b"qualified document");
     }
 
     /// A JWT body that is neither JWS nor JWE is refused.

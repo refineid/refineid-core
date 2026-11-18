@@ -512,11 +512,27 @@ pub fn ca_extensions() -> Vec<Vec<u8>> {
 /// A critical Extended Key Usage holding `purpose` alone.
 #[must_use]
 pub fn extended_key_usage(purpose: Oid<'_>) -> Vec<u8> {
+    extended_key_usage_with_criticality(&[purpose], true)
+}
+
+/// An Extended Key Usage holding `purposes` with explicit criticality.
+#[must_use]
+pub fn extended_key_usage_with_criticality(purposes: &[Oid<'_>], critical: bool) -> Vec<u8> {
+    let mut sequence_body = Vec::new();
+    for purpose in purposes {
+        sequence_body.extend_from_slice(&tlv(OBJECT_IDENTIFIER, purpose.as_bytes()));
+    }
     extension(
         known::EXT_KEY_USAGE,
-        true,
-        &tlv(SEQUENCE, tlv(OBJECT_IDENTIFIER, purpose.as_bytes())),
+        critical,
+        &tlv(SEQUENCE, sequence_body),
     )
+}
+
+/// A non-critical Extended Key Usage holding `purpose` alone.
+#[must_use]
+pub fn non_critical_extended_key_usage(purpose: Oid<'_>) -> Vec<u8> {
+    extended_key_usage_with_criticality(&[purpose], false)
 }
 
 /// The `id-pkix-ocsp-nocheck` extension (RFC 6960 sec.4.2.2.2.1).

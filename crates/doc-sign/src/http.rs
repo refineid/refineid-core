@@ -370,19 +370,83 @@ const RESERVED_V4: V4Prefix = V4Prefix {
     network: Ipv4Addr::new(240, 0, 0, 0),
     bits: 4,
 };
+/// Discard-only address block, 100::/64 (RFC 6666).
+const DISCARD_ONLY_V6: V6Prefix = V6Prefix {
+    network: Ipv6Addr::new(0x0100, 0, 0, 0, 0, 0, 0, 0),
+    bits: 64,
+};
+/// Well-known NAT64 prefix, 64:ff9b::/96 (RFC 6052).
+const WELL_KNOWN_NAT64_V6: V6Prefix = V6Prefix {
+    network: Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0, 0),
+    bits: 96,
+};
+/// Local-use NAT64 prefix, 64:ff9b:1::/48 (RFC 8215).
+const LOCAL_USE_NAT64_V6: V6Prefix = V6Prefix {
+    network: Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0, 0),
+    bits: 48,
+};
+/// IETF protocol assignments, 2001::/23 (RFC 6890 section 2.2.3).
+const IETF_PROTOCOL_ASSIGNMENTS_V6: V6Prefix = V6Prefix {
+    network: Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0),
+    bits: 23,
+};
 /// IPv6 documentation prefix, 2001:db8::/32 (RFC 3849).
 const DOCUMENTATION_V6: V6Prefix = V6Prefix {
     network: Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0),
     bits: 32,
 };
+/// 6to4 prefix, 2002::/16 (RFC 3056; RFC 7526).
+const SIX_TO_FOUR_V6: V6Prefix = V6Prefix {
+    network: Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0),
+    bits: 16,
+};
+/// Twenty-bit IPv6 documentation prefix, 3fff::/20 (RFC 9637).
+const DOCUMENTATION_V6_TWENTY_BIT: V6Prefix = V6Prefix {
+    network: Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0),
+    bits: 20,
+};
+/// Global unicast address space, 2000::/3 (RFC 4291 section 2.4).
+const GLOBAL_UNICAST_V6: V6Prefix = V6Prefix {
+    network: Ipv6Addr::new(0x2000, 0, 0, 0, 0, 0, 0, 0),
+    bits: 3,
+};
 
-/// Whether `ip` is anything but a public unicast address. An
-/// IPv4-mapped IPv6 address is judged as the IPv4 address it reaches.
+/// Extracts any IPv4 address embedded within recognized translation or
+/// transition IPv6 formats.
+fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    let octets = v6.octets();
+    // SIIT translated: ::ffff:0:0:0/96 (RFC 2765).
+    if octets[0..8] == [0; 8] && octets[8..10] == [0xff, 0xff] && octets[10..12] == [0, 0] {
+        return Some(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+    // IPv4-compatible: ::/96 (RFC 4291; excluding ::0 and ::1).
+    if octets[0..12] == [0; 12] && !v6.is_unspecified() && !v6.is_loopback() {
+        return Some(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+    // Well-known NAT64 prefix: 64:ff9b::/96 (RFC 6052).
+    if WELL_KNOWN_NAT64_V6.contains(v6) {
+        return Some(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+    // 6to4: 2002::/16 (RFC 3056).
+    if SIX_TO_FOUR_V6.contains(v6) {
+        return Some(Ipv4Addr::new(octets[2], octets[3], octets[4], octets[5]));
+    }
+    None
+}
+
+/// Whether `ip` is anything but a public unicast address. IPv6 addresses
+/// embedding IPv4 destinations (IPv4-mapped, SIIT translated, IPv4-compatible,
+/// well-known NAT64, and 6to4) are judged as the IPv4 address they reach.
 fn is_non_public(ip: IpAddr) -> bool {
-    let ip = match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
-        v4 @ IpAddr::V4(_) => v4,
-    };
     match ip {
         IpAddr::V4(v4) => is_non_public_v4(v4),
         IpAddr::V6(v6) => is_non_public_v6(v6),
@@ -408,12 +472,20 @@ fn is_non_public_v4(v4: Ipv4Addr) -> bool {
 }
 
 fn is_non_public_v6(v6: Ipv6Addr) -> bool {
+    if let Some(v4) = embedded_ipv4(v6) {
+        return is_non_public_v4(v4);
+    }
     v6.is_loopback()
+        || v6.is_unspecified()
+        || v6.is_multicast()
         || v6.is_unique_local()
         || v6.is_unicast_link_local()
-        || v6.is_multicast()
-        || v6.is_unspecified()
+        || DISCARD_ONLY_V6.contains(v6)
+        || LOCAL_USE_NAT64_V6.contains(v6)
+        || IETF_PROTOCOL_ASSIGNMENTS_V6.contains(v6)
         || DOCUMENTATION_V6.contains(v6)
+        || DOCUMENTATION_V6_TWENTY_BIT.contains(v6)
+        || !GLOBAL_UNICAST_V6.contains(v6)
 }
 
 /// SSRF guard for certificate-published URLs: resolve the host through
@@ -643,6 +715,50 @@ mod tests {
     fn neighbours_of_the_special_ranges_pass() {
         assert!(!is_non_public(IpAddr::V4(ABOVE_BENCHMARKING_V4)));
         assert!(!is_non_public(IpAddr::V6(ABOVE_DOCUMENTATION_V6)));
+    }
+
+    #[test]
+    fn ipv6_special_purpose_and_embedded_v4_ranges_are_refused() {
+        for literal in [
+            "64:ff9b::7f00:1",
+            "64:ff9b::a00:1",
+            "64:ff9b:1::a00:1",
+            "2002:7f00:1::1",
+            "2001::1",
+            "2001:2::1",
+            "100::1",
+            "::ffff:0:127.0.0.1",
+            "::127.0.0.1",
+            "3fff::1",
+            "fc00::1",
+            "fe80::1",
+            "ff02::1",
+            "::",
+        ] {
+            let v6: Ipv6Addr = literal.parse().expect("valid IPv6 literal");
+            assert!(
+                is_non_public(IpAddr::V6(v6)),
+                "expected {literal} to be non-public"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv6_embedded_public_v4_and_global_unicast_pass() {
+        for literal in [
+            "64:ff9b::9.9.9.9",
+            "2002:0909:0909::1",
+            "::ffff:0:9.9.9.9",
+            "::9.9.9.9",
+            "3fff:1000::1",
+            "2606:4700:4700::1111",
+        ] {
+            let v6: Ipv6Addr = literal.parse().expect("valid IPv6 literal");
+            assert!(
+                !is_non_public(IpAddr::V6(v6)),
+                "expected {literal} to be public"
+            );
+        }
     }
 
     #[test]

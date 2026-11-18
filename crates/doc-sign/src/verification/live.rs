@@ -60,6 +60,18 @@ pub fn live_revocation(
     live_revocation_from(report, anchors, now, &HttpAnswers)
 }
 
+/// The revocation status of `authority`'s signer along its path at `at`,
+/// from its responders.
+#[must_use]
+pub fn live_tsa_revocation(
+    authority: &super::TimestampAuthority,
+    anchors: &TrustAnchors,
+    at: DateTime,
+    now: DateTime,
+) -> Revocation {
+    live_tsa_revocation_from(authority, anchors, at, now, &HttpAnswers)
+}
+
 /// Where the bytes of answers come from: one exchange per address,
 /// unverified.
 pub(super) trait AnswerSource {
@@ -180,6 +192,51 @@ pub(super) fn live_revocation_from(
             at: report.validation_time(),
             now,
         },
+    );
+    if verdict.path.is_anchored() {
+        verdict.revocation
+    } else {
+        Revocation::Unavailable
+    }
+}
+
+/// [`live_tsa_revocation`] with its answers from `source`.
+pub(super) fn live_tsa_revocation_from(
+    authority: &super::TimestampAuthority,
+    anchors: &TrustAnchors,
+    at: DateTime,
+    now: DateTime,
+    source: &impl AnswerSource,
+) -> Revocation {
+    let CertificationPath::Anchored(path) = authority.chain() else {
+        return Revocation::Unavailable;
+    };
+    if path.is_empty() {
+        return Revocation::Good { at: now };
+    }
+    let signer = authority.signer();
+    let mut pool = MaterialPool::new();
+    pool.add_anchors(anchors);
+    for certificate in path {
+        pool.add_certificate(certificate.clone());
+    }
+    let links: Vec<_> = core::iter::once(signer).chain(path.iter()).collect();
+    for pair in links.windows(2) {
+        if let [subject, issuer] = pair {
+            pool.add_material(&first_usable_answer(
+                source,
+                &subject.view(),
+                &issuer.view(),
+                now,
+            ));
+        }
+    }
+    let verdict = trust::judge(
+        signer,
+        &pool,
+        anchors,
+        AnchorRole::TimeStamping,
+        trust::When { at, now },
     );
     if verdict.path.is_anchored() {
         verdict.revocation

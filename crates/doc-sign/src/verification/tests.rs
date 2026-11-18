@@ -6,8 +6,8 @@
 use super::{
     AnchorRole, ArchiveForm, CertificationPath, DocumentChange, DocumentFailure, DocumentFile,
     DocumentReport, GrantedPeriod, Indeterminate, Revision, Revocation, SignatureOutcome,
-    SignatureReport, SignatureRow, SignerIdentity, TimestampReport, TrustAnchor, TrustAnchors,
-    UnsupportedProfile, UnsupportedSignature, Verdict, exactly, verify,
+    SignatureReport, SignatureRow, SignerIdentity, TimestampAuthority, TimestampReport,
+    TrustAnchor, TrustAnchors, UnsupportedProfile, UnsupportedSignature, Verdict, exactly, verify,
 };
 use crate::asic::DataObject;
 use crate::cades::{DigestAlgorithm, SignatureAlgorithm, SignerParameters, SigningTime};
@@ -186,6 +186,8 @@ struct World {
     issued_signer: Vec<u8>,
     /// RSA signer issued by the root.
     rsa_signer: Vec<u8>,
+    /// Time-stamping root key.
+    tsa_root_key: TestKey,
     /// Time-stamping root.
     tsa_root: Vec<u8>,
     /// TSA key.
@@ -306,6 +308,7 @@ impl World {
             intermediate_key,
             signer_key,
             rsa_key,
+            tsa_root_key,
             tsa_key,
         }
     }
@@ -4531,4 +4534,223 @@ fn a_signature_whose_archive_timestamp_is_refused_is_not_assembled() {
             "{format:?}"
         );
     }
+}
+
+#[test]
+fn a_post_dated_future_timestamp_is_claimed_and_does_not_prove_existence() {
+    let world = World::new();
+    let (key, der) = world.signer(Signer::Direct);
+    let owned = OwnedCert::from_der(der).expect("signer parses");
+    let certificate = owned.view();
+    let parameters = SignerParameters {
+        certificate: &certificate,
+        digest_algorithm: DigestAlgorithm::Sha256,
+        signature_algorithm: SignatureAlgorithm::EcdsaSha256,
+        signing_time: Some(SIGNING_TIME),
+    };
+    let planned = plan(
+        Format::Pades,
+        vec![DataObject {
+            name: PDF_NAME.to_owned(),
+            mime_type: PDF_TYPE.to_owned(),
+            content: minimal_pdf(),
+        }],
+        &parameters,
+        &SignatureMetadata::default(),
+    )
+    .expect("plans");
+    let signature = key.sign_raw(planned.to_be_signed());
+    let imprint = planned
+        .timestamp_digest(&parameters, &signature, DigestAlgorithm::Sha256)
+        .expect("timestamp digest");
+
+    // Token generated on day 25, while verification `now` is day 20.
+    let future_token = timestamp_token(
+        &world.tsa,
+        &world.tsa_key,
+        DigestAlgorithm::Sha256,
+        &imprint,
+        day(25),
+    );
+    let pdf = planned
+        .finish(
+            &parameters,
+            &signature,
+            &[future_token],
+            &ValidationMaterial::default(),
+        )
+        .expect("finishes");
+
+    let report = world.verify(pdf).expect("report");
+    let signature = only(&report);
+    assert_eq!(kinds(signature.timestamps()), [Kind::Claimed(day(25))]);
+    assert_eq!(
+        signature.proof_of_existence(),
+        None,
+        "post-dated token cannot establish proof of existence"
+    );
+    assert_eq!(
+        signature.validation_time(),
+        day(NOW),
+        "validation falls back to caller clock"
+    );
+}
+
+#[test]
+fn ca_issued_tsa_without_ocsp_no_check_requires_good_revocation() {
+    let world = World::new();
+    // TSA certificate without ocsp_no_check, issued by TSA root
+    let tsa_without_nocheck = certificate(
+        &spec(
+            TSA_SERIAL,
+            TSA,
+            TSA_ROOT,
+            refineid_cms::testkit::timestamping_extensions_without_no_check(),
+        ),
+        &world.tsa_key,
+        &world.tsa_root_key,
+    );
+
+    let (key, der) = world.signer(Signer::Direct);
+    let owned = OwnedCert::from_der(der).expect("signer parses");
+    let certificate = owned.view();
+    let parameters = SignerParameters {
+        certificate: &certificate,
+        digest_algorithm: DigestAlgorithm::Sha256,
+        signature_algorithm: SignatureAlgorithm::EcdsaSha256,
+        signing_time: Some(SIGNING_TIME),
+    };
+    let planned = plan(
+        Format::Pades,
+        vec![DataObject {
+            name: PDF_NAME.to_owned(),
+            mime_type: PDF_TYPE.to_owned(),
+            content: minimal_pdf(),
+        }],
+        &parameters,
+        &SignatureMetadata::default(),
+    )
+    .expect("plans");
+    let signature = key.sign_raw(planned.to_be_signed());
+    let imprint = planned
+        .timestamp_digest(&parameters, &signature, DigestAlgorithm::Sha256)
+        .expect("timestamp digest");
+
+    let token = timestamp_token(
+        &tsa_without_nocheck,
+        &world.tsa_key,
+        DigestAlgorithm::Sha256,
+        &imprint,
+        day(STAMPED),
+    );
+
+    // Case 1: No revocation evidence for TSA -> Revocation::Unavailable -> Claimed
+    let pdf_unavailable = planned
+        .finish(
+            &parameters,
+            &signature,
+            core::slice::from_ref(&token),
+            &ValidationMaterial::default(),
+        )
+        .expect("finishes");
+    let report_unavailable = world.verify(pdf_unavailable).expect("report");
+    let sig_unavailable = only(&report_unavailable);
+    assert_eq!(
+        kinds(sig_unavailable.timestamps()),
+        [Kind::Claimed(day(STAMPED))],
+        "TSA certificate without ocsp_no_check and with unavailable revocation must be Claimed"
+    );
+    assert_eq!(sig_unavailable.proof_of_existence(), None);
+
+    // Case 2: Good OCSP response for TSA provided in ValidationMaterial -> Anchored
+    let tsa_ocsp = world.ocsp(
+        &world.tsa_root,
+        TSA_ROOT,
+        &world.tsa_root_key,
+        TSA_SERIAL,
+        None,
+        ANSWERED,
+    );
+    let mut material_good = ValidationMaterial::default();
+    material_good.ocsp_responses.push(tsa_ocsp);
+
+    let planned_again = plan(
+        Format::Pades,
+        vec![DataObject {
+            name: PDF_NAME.to_owned(),
+            mime_type: PDF_TYPE.to_owned(),
+            content: minimal_pdf(),
+        }],
+        &parameters,
+        &SignatureMetadata::default(),
+    )
+    .expect("plans");
+    let signature_again = key.sign_raw(planned_again.to_be_signed());
+    let pdf_good = planned_again
+        .finish(&parameters, &signature_again, &[token], &material_good)
+        .expect("finishes");
+    let report_good = world.verify(pdf_good).expect("report");
+    let sig_good = only(&report_good);
+    assert_eq!(
+        kinds(sig_good.timestamps()),
+        [Kind::Anchored(day(STAMPED))],
+        "TSA certificate without ocsp_no_check and with good revocation must be Anchored"
+    );
+    assert_eq!(sig_good.proof_of_existence(), Some(day(STAMPED)));
+}
+
+struct TsaOcspSource(Vec<u8>);
+
+impl super::live::AnswerSource for TsaOcspSource {
+    fn ocsp(&self, _url: &crate::uri::Uri, _request: &[u8]) -> Option<Vec<u8>> {
+        Some(self.0.clone())
+    }
+
+    fn crl(&self, _url: &crate::uri::Uri) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+#[test]
+fn live_tsa_revocation_checks_authority_responders() {
+    let world = World::new();
+    let tsa_without_nocheck = certificate(
+        &spec(
+            TSA_SERIAL,
+            TSA,
+            TSA_ROOT,
+            vec![
+                refineid_cms::testkit::extended_key_usage(
+                    refineid_cms::oid::known::KP_TIME_STAMPING,
+                ),
+                crate::testkit::ocsp_access(&[OCSP_FIRST]),
+            ],
+        ),
+        &world.tsa_key,
+        &world.tsa_root_key,
+    );
+    let tsa_cert = OwnedCert::from_der(&tsa_without_nocheck).expect("tsa parses");
+    let root_cert = OwnedCert::from_der(&world.tsa_root).expect("root parses");
+    let authority = TimestampAuthority {
+        signer: tsa_cert,
+        chain: CertificationPath::Anchored(vec![root_cert]),
+    };
+    let ocsp = world.ocsp(
+        &world.tsa_root,
+        TSA_ROOT,
+        &world.tsa_root_key,
+        TSA_SERIAL,
+        None,
+        NOW,
+    );
+    let source = TsaOcspSource(ocsp);
+    let anchors = TrustAnchors::new(vec![anchor(&world.tsa_root, AnchorRole::TimeStamping)]);
+    let status = super::live::live_tsa_revocation_from(
+        &authority,
+        &anchors,
+        day(STAMPED),
+        day(NOW),
+        &source,
+    );
+    assert!(matches!(status, Revocation::Good { .. }));
 }

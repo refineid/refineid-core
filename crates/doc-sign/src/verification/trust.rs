@@ -644,7 +644,8 @@ impl MaterialPool {
                 view.raw_der != child.raw_der
                     && view.subject == child.issuer
                     && (step.anchors.is_anchor(view, step.role, step.at)
-                        || (valid_at(view, step.at) && may_issue(view, step.intermediates_below)))
+                        || (valid_at(view, step.at)
+                            && may_issue(view, step.role, step.intermediates_below)))
                     && budget.spend()
                     && child.verify_signed_by(view).is_ok()
             })
@@ -1143,15 +1144,16 @@ pub fn judge(
     }
 }
 
-/// Whether `certificate` may sign documents: no CA, a Key Usage that,
-/// when present, asserts `digitalSignature` or `nonRepudiation`, an
-/// Extended Key Usage that permits document signing (RFC 5280 §4.2.1.12),
-/// and only critical extensions this verifier processes.
+/// Whether `certificate` may sign documents: no CA, a Key Usage that
+/// asserts `digitalSignature` or `nonRepudiation` (RFC 5280 §4.2.1.3;
+/// EN 319 412-2 §4.3.2), an Extended Key Usage that permits document
+/// signing when present (RFC 5280 §4.2.1.12), and only critical extensions
+/// this verifier processes.
 fn fit_to_sign(certificate: Certificate<'_>) -> bool {
-    certificate.extensions.is_none_or(|extensions| {
+    certificate.extensions.is_some_and(|extensions| {
         path_extension_profile(extensions).is_ok_and(|profile| {
             !profile.basic_constraints.ca
-                && profile.key_usage.is_none_or(|usage| {
+                && profile.key_usage.is_some_and(|usage| {
                     usage.key_usage.digital_signature || usage.key_usage.non_repudiation
                 })
                 && profile
@@ -1291,7 +1293,7 @@ fn valid_at(certificate: Certificate<'_>, at: DateTime) -> bool {
 /// Whether the certificate may issue a certificate with
 /// `intermediates_below` CA certificates between it and the end entity
 /// (RFC 5280 sec.6.1.4 (k), (l), (n)).
-fn may_issue(certificate: Certificate<'_>, intermediates_below: usize) -> bool {
+fn may_issue(certificate: Certificate<'_>, role: AnchorRole, intermediates_below: usize) -> bool {
     let Some(extensions) = certificate.extensions else {
         return false;
     };
@@ -1299,12 +1301,21 @@ fn may_issue(certificate: Certificate<'_>, intermediates_below: usize) -> bool {
         return false;
     };
     let constraints = profile.basic_constraints;
+    let eku_permitted = match role {
+        AnchorRole::CertificateIssuing => profile
+            .extended_key_usage
+            .is_none_or(|eku| eku.fit_for_document_signing()),
+        AnchorRole::TimeStamping => profile
+            .extended_key_usage
+            .is_none_or(|eku| eku.permits_time_stamping()),
+    };
     constraints.present
         && constraints.ca
         && !profile.name_constraints_present
         && profile
             .key_usage
             .is_none_or(|usage| usage.key_usage.key_cert_sign)
+        && eku_permitted
         && constraints.path_len.is_none_or(|limit| {
             usize::try_from(limit).is_ok_and(|limit| intermediates_below <= limit)
         })
@@ -1480,7 +1491,16 @@ mod tests {
             &root_key,
         );
         let signer = certificate(
-            &spec(SIGNER_SERIAL, SIGNER, INTERMEDIATE, signer_ends, Vec::new()),
+            &spec(
+                SIGNER_SERIAL,
+                SIGNER,
+                INTERMEDIATE,
+                signer_ends,
+                vec![key_usage(
+                    crate::testkit::KEY_USAGE_NON_REPUDIATION_UNUSED,
+                    crate::testkit::KEY_USAGE_NON_REPUDIATION,
+                )],
+            ),
             &signer_key,
             &intermediate_key,
         );
@@ -2421,6 +2441,18 @@ mod tests {
             "non-critical documentSigning EKU permits document signing"
         );
 
+        // RFC 9336 Document Signing:
+        let rfc9336_doc_signing = refineid_cms::testkit::non_critical_extended_key_usage(
+            refineid_cms::oid::known::KP_RFC9336_DOCUMENT_SIGNING,
+        );
+        assert!(
+            judged(&signer_with(
+                &chain,
+                vec![non_repudiation.clone(), rfc9336_doc_signing]
+            )),
+            "RFC 9336 documentSigning permits document signing"
+        );
+
         // Custom unknown OID:
         const CUSTOM_PURPOSE_OID: refineid_cms::oid::Oid<'static> =
             refineid_cms::oid::Oid::const_new(
@@ -2438,11 +2470,82 @@ mod tests {
         let custom_non_critical =
             refineid_cms::testkit::non_critical_extended_key_usage(CUSTOM_PURPOSE_OID);
         assert!(
+            !judged(&signer_with(
+                &chain,
+                vec![non_repudiation.clone(), custom_non_critical]
+            )),
+            "non-critical unrecognized EKU alone must not sign documents"
+        );
+
+        let server_and_custom = refineid_cms::testkit::extended_key_usage_with_criticality(
+            &[refineid_cms::oid::known::KP_SERVER_AUTH, CUSTOM_PURPOSE_OID],
+            false,
+        );
+        assert!(
+            !judged(&signer_with(
+                &chain,
+                vec![non_repudiation.clone(), server_and_custom]
+            )),
+            "serverAuth + custom OID without document signing must not sign documents"
+        );
+
+        let doc_and_custom = refineid_cms::testkit::extended_key_usage_with_criticality(
+            &[
+                refineid_cms::oid::known::KP_DOCUMENT_SIGNING,
+                CUSTOM_PURPOSE_OID,
+            ],
+            false,
+        );
+        assert!(
             judged(&signer_with(
                 &chain,
-                vec![non_repudiation, custom_non_critical]
+                vec![non_repudiation.clone(), doc_and_custom]
             )),
-            "non-critical unrecognized EKU can be ignored"
+            "documentSigning + custom OID permits document signing"
+        );
+
+        // Leaf lacking KeyUsage entirely must be rejected
+        assert!(
+            !judged(&signer_with(&chain, vec![])),
+            "leaf certificate lacking KeyUsage must not sign documents"
+        );
+
+        // Subordinate CA with serverAuth-only EKU: must be rejected when issuing document signers
+        let mut server_auth_ca_exts = ca_extensions();
+        server_auth_ca_exts.push(refineid_cms::testkit::non_critical_extended_key_usage(
+            refineid_cms::oid::known::KP_SERVER_AUTH,
+        ));
+        let server_ca_chain = chain_with(ENDS, ENDS, server_auth_ca_exts);
+        let valid_signer = signer_with(&server_ca_chain, vec![non_repudiation.clone()]);
+        let server_ca_verdict = judge(
+            &valid_signer,
+            &server_ca_chain.pool(),
+            &issuing(&server_ca_chain.root),
+            AnchorRole::CertificateIssuing,
+            at(VALIDATED),
+        );
+        assert!(
+            !server_ca_verdict.path.is_anchored(),
+            "intermediate CA with serverAuth EKU must not issue document signers"
+        );
+
+        // Subordinate CA with documentSigning EKU: can issue document signers
+        let mut doc_sign_ca_exts = ca_extensions();
+        doc_sign_ca_exts.push(refineid_cms::testkit::non_critical_extended_key_usage(
+            refineid_cms::oid::known::KP_DOCUMENT_SIGNING,
+        ));
+        let doc_ca_chain = chain_with(ENDS, ENDS, doc_sign_ca_exts);
+        let doc_signer = signer_with(&doc_ca_chain, vec![non_repudiation]);
+        let doc_ca_verdict = judge(
+            &doc_signer,
+            &doc_ca_chain.pool(),
+            &issuing(&doc_ca_chain.root),
+            AnchorRole::CertificateIssuing,
+            at(VALIDATED),
+        );
+        assert!(
+            doc_ca_verdict.path.is_anchored(),
+            "intermediate CA with documentSigning EKU can issue document signers"
         );
     }
 

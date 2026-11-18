@@ -1835,36 +1835,25 @@ pub struct ExtendedKeyUsageMeta {
 impl ExtendedKeyUsageMeta {
     /// Whether this Extended Key Usage explicitly permits document signing:
     /// `anyExtendedKeyUsage`, Microsoft Document Signing, Adobe Document Vault,
-    /// or `id-kp-emailProtection` (CMS / S/MIME).
+    /// RFC 9336 Document Signing, or `id-kp-emailProtection` (CMS / S/MIME).
     #[must_use]
     pub fn permits_document_signing(&self) -> bool {
         self.any || self.document_signing || self.email_protection
     }
 
-    /// Whether this Extended Key Usage restricts the certificate exclusively
-    /// to non-document-signing purposes (such as `serverAuth`, `clientAuth`,
-    /// `codeSigning`, `timeStamping`, or `ocspSigning`).
+    /// Whether this Extended Key Usage permits time stamping:
+    /// `anyExtendedKeyUsage` or `id-kp-timeStamping`.
     #[must_use]
-    pub fn is_exclusively_non_signing(&self) -> bool {
-        !self.permits_document_signing()
-            && !self.other_purposes_present
-            && (self.server_auth
-                || self.client_auth
-                || self.code_signing
-                || self.time_stamping
-                || self.ocsp_signing)
+    pub fn permits_time_stamping(&self) -> bool {
+        self.any || self.time_stamping
     }
 
     /// Whether this Extended Key Usage satisfies document signing policy:
-    /// - If marked critical: must explicitly include a recognized document-signing purpose.
-    /// - If non-critical: must not be restricted exclusively to non-signing purposes.
+    /// When ExtendedKeyUsage is present, at least one recognized document-signing
+    /// purpose must be asserted (RFC 5280 §4.2.1.12, EN 319 412-2 §4.3.1).
     #[must_use]
     pub fn fit_for_document_signing(&self) -> bool {
-        if self.critical {
-            self.permits_document_signing()
-        } else {
-            !self.is_exclusively_non_signing()
-        }
+        self.permits_document_signing()
     }
 }
 
@@ -2216,6 +2205,7 @@ fn parse_path_extended_key_usage(
             meta.ocsp_signing = true;
         } else if purpose == known::KP_DOCUMENT_SIGNING
             || purpose == known::KP_ADOBE_AUTHENTIC_DOCUMENTS
+            || purpose == known::KP_RFC9336_DOCUMENT_SIGNING
         {
             meta.document_signing = true;
         } else {

@@ -345,6 +345,10 @@ pub mod known {
         ::const_oid::ObjectIdentifier::new_unwrap("1.2.840.113583.1.1.5").as_bytes(),
     );
 
+    /// `1.3.6.1.5.5.7.3.36` -- id-kp-documentSigning (RFC 9336).
+    pub const KP_RFC9336_DOCUMENT_SIGNING: Oid<'static> =
+        Oid::const_new(::const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.36").as_bytes());
+
     // ---- Signature & public-key algorithms (PKCS #1, ANSI X9.62) ----
     //
     // FINEID S2 v5.2 §6.2.2 / §6.3.7 pins the citizen-card set:

@@ -519,11 +519,27 @@ pub fn extended_key_usage(purpose: Oid<'_>) -> Vec<u8> {
     )
 }
 
-/// The extensions of a TSA: critical EKU `id-kp-timeStamping` alone
-/// (RFC 3161 sec.2.3).
+/// The `id-pkix-ocsp-nocheck` extension (RFC 6960 sec.4.2.2.2.1).
+#[must_use]
+pub fn ocsp_no_check_extension() -> Vec<u8> {
+    extension(known::OCSP_NO_CHECK, false, &tlv(NULL, []))
+}
+
+/// The extensions of a TSA without `id-pkix-ocsp-nocheck`.
+#[must_use]
+pub fn timestamping_extensions_without_no_check() -> Vec<Vec<u8>> {
+    vec![extended_key_usage(known::KP_TIME_STAMPING)]
+}
+
+/// The extensions of a TSA: critical EKU `id-kp-timeStamping` and
+/// `id-pkix-ocsp-nocheck` (RFC 3161 sec.2.3; RFC 6960; ETSI EN 319 422
+/// clause 4.3.4).
 #[must_use]
 pub fn timestamping_extensions() -> Vec<Vec<u8>> {
-    vec![extended_key_usage(known::KP_TIME_STAMPING)]
+    vec![
+        extended_key_usage(known::KP_TIME_STAMPING),
+        ocsp_no_check_extension(),
+    ]
 }
 
 /// What one certificate says about itself.

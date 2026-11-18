@@ -60,7 +60,7 @@ use crate::identity::Peuin;
 use crate::timestamp::{TimestampError, claimed_generation_time, verify_token};
 use crate::validation::ValidationMaterial;
 use crate::x509_ext::NameExt;
-use refineid_cms::x509::{DateTime, OwnedCert};
+use refineid_cms::x509::{DateTime, OwnedCert, path_extension_profile};
 
 use self::asic::{AsicContainer, AsicReadError};
 use self::cades::{CadesReadError, CadesSignature, Content, EssBinding};
@@ -1038,6 +1038,14 @@ impl Imprint {
     }
 }
 
+/// Whether `certificate` carries the non-critical `id-pkix-ocsp-nocheck`
+/// extension (RFC 6960 sec.4.2.2.2.1; ETSI EN 319 422 clause 4.3.4).
+fn has_ocsp_no_check(certificate: &OwnedCert) -> bool {
+    certificate.view().extensions.is_some_and(|extensions| {
+        path_extension_profile(extensions).is_ok_and(|profile| profile.ocsp_no_check_present)
+    })
+}
+
 impl Context<'_> {
     /// A pool holding the anchors' certificates.
     fn anchor_pool(&self) -> MaterialPool {
@@ -1086,7 +1094,20 @@ impl Context<'_> {
             signer: verified.signer_certificate().clone(),
             chain: chain.path,
         };
-        if anchored && !chain.revocation.revoked_before(Some(time)) {
+        let post_dated = time.unix_duration()
+            > self
+                .now
+                .unix_duration()
+                .saturating_add(trust::MAX_CLOCK_SKEW);
+        let acceptable_revocation = if authority.chain.certificates().is_empty() {
+            !chain.revocation.revoked_before(Some(time))
+        } else if matches!(chain.revocation, Revocation::Good { .. }) {
+            true
+        } else {
+            has_ocsp_no_check(verified.signer_certificate())
+                && !chain.revocation.revoked_before(Some(time))
+        };
+        if anchored && !post_dated && acceptable_revocation {
             TimestampReport::Anchored { time, authority }
         } else {
             TimestampReport::Claimed { time, authority }

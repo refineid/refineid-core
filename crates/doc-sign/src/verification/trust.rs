@@ -1144,8 +1144,9 @@ pub fn judge(
 }
 
 /// Whether `certificate` may sign documents: no CA, a Key Usage that,
-/// when present, asserts `digitalSignature` or `nonRepudiation`, and
-/// only critical extensions this verifier processes.
+/// when present, asserts `digitalSignature` or `nonRepudiation`, an
+/// Extended Key Usage that permits document signing (RFC 5280 §4.2.1.12),
+/// and only critical extensions this verifier processes.
 fn fit_to_sign(certificate: Certificate<'_>) -> bool {
     certificate.extensions.is_none_or(|extensions| {
         path_extension_profile(extensions).is_ok_and(|profile| {
@@ -1153,6 +1154,9 @@ fn fit_to_sign(certificate: Certificate<'_>) -> bool {
                 && profile.key_usage.is_none_or(|usage| {
                     usage.key_usage.digital_signature || usage.key_usage.non_repudiation
                 })
+                && profile
+                    .extended_key_usage
+                    .is_none_or(|eku| eku.fit_for_document_signing())
         })
     })
 }
@@ -1320,6 +1324,7 @@ mod tests {
         ocsp_responder_extensions, ocsp_response, tlv,
     };
     use crate::validation::ValidationMaterial;
+    use crate::verification::CertificationPath;
     use refineid_cms::oid::known;
     use refineid_cms::testkit::{KEY_USAGE_CA, KEY_USAGE_CA_UNUSED};
     use refineid_cms::x509::{DateTime, OwnedCert};
@@ -2230,9 +2235,214 @@ mod tests {
         assert!(
             !judged(&signer_with(
                 &chain,
-                vec![non_repudiation, unknown_critical]
+                vec![non_repudiation.clone(), unknown_critical]
             )),
             "a critical extension this verifier does not process"
+        );
+
+        // Critical incompatible Extended Key Usages: must be rejected as unanchored (Partial path)
+        let server_auth_critical =
+            refineid_cms::testkit::extended_key_usage(refineid_cms::oid::known::KP_SERVER_AUTH);
+        assert!(
+            !judged(&signer_with(
+                &chain,
+                vec![non_repudiation.clone(), server_auth_critical.clone()]
+            )),
+            "critical serverAuth EKU must not sign documents"
+        );
+        let server_signer =
+            signer_with(&chain, vec![non_repudiation.clone(), server_auth_critical]);
+        let server_verdict = judge(
+            &server_signer,
+            &chain.pool(),
+            &issuing(&chain.root),
+            AnchorRole::CertificateIssuing,
+            at(VALIDATED),
+        );
+        assert!(
+            matches!(server_verdict.path, CertificationPath::Partial(_)),
+            "serverAuth leaf path must be Partial"
+        );
+
+        let ocsp_signing_critical =
+            refineid_cms::testkit::extended_key_usage(refineid_cms::oid::known::KP_OCSP_SIGNING);
+        assert!(
+            !judged(&signer_with(
+                &chain,
+                vec![non_repudiation.clone(), ocsp_signing_critical.clone()]
+            )),
+            "critical OCSPSigning EKU must not sign documents"
+        );
+        let ocsp_signer = signer_with(&chain, vec![non_repudiation.clone(), ocsp_signing_critical]);
+        let ocsp_verdict = judge(
+            &ocsp_signer,
+            &chain.pool(),
+            &issuing(&chain.root),
+            AnchorRole::CertificateIssuing,
+            at(VALIDATED),
+        );
+        assert!(
+            matches!(ocsp_verdict.path, CertificationPath::Partial(_)),
+            "OCSPSigning leaf path must be Partial"
+        );
+
+        let time_stamping_critical =
+            refineid_cms::testkit::extended_key_usage(refineid_cms::oid::known::KP_TIME_STAMPING);
+        assert!(
+            !judged(&signer_with(
+                &chain,
+                vec![non_repudiation.clone(), time_stamping_critical.clone()]
+            )),
+            "critical timeStamping EKU must not sign documents"
+        );
+        let tsa_signer = signer_with(
+            &chain,
+            vec![non_repudiation.clone(), time_stamping_critical],
+        );
+        let tsa_verdict = judge(
+            &tsa_signer,
+            &chain.pool(),
+            &issuing(&chain.root),
+            AnchorRole::CertificateIssuing,
+            at(VALIDATED),
+        );
+        assert!(
+            matches!(tsa_verdict.path, CertificationPath::Partial(_)),
+            "timeStamping leaf path must be Partial"
+        );
+
+        let client_auth_critical =
+            refineid_cms::testkit::extended_key_usage(refineid_cms::oid::known::KP_CLIENT_AUTH);
+        assert!(
+            !judged(&signer_with(
+                &chain,
+                vec![non_repudiation.clone(), client_auth_critical]
+            )),
+            "critical clientAuth EKU must not sign documents"
+        );
+
+        let code_signing_critical =
+            refineid_cms::testkit::extended_key_usage(refineid_cms::oid::known::KP_CODE_SIGNING);
+        assert!(
+            !judged(&signer_with(
+                &chain,
+                vec![non_repudiation.clone(), code_signing_critical]
+            )),
+            "critical codeSigning EKU must not sign documents"
+        );
+
+        // Non-critical incompatible Extended Key Usages (exclusively non-signing): must be rejected
+        let server_auth_non_critical = refineid_cms::testkit::non_critical_extended_key_usage(
+            refineid_cms::oid::known::KP_SERVER_AUTH,
+        );
+        assert!(
+            !judged(&signer_with(
+                &chain,
+                vec![non_repudiation.clone(), server_auth_non_critical]
+            )),
+            "non-critical serverAuth EKU alone must not sign documents"
+        );
+
+        let time_stamping_non_critical = refineid_cms::testkit::non_critical_extended_key_usage(
+            refineid_cms::oid::known::KP_TIME_STAMPING,
+        );
+        assert!(
+            !judged(&signer_with(
+                &chain,
+                vec![non_repudiation.clone(), time_stamping_non_critical]
+            )),
+            "non-critical timeStamping EKU alone must not sign documents"
+        );
+
+        let ocsp_signing_non_critical = refineid_cms::testkit::non_critical_extended_key_usage(
+            refineid_cms::oid::known::KP_OCSP_SIGNING,
+        );
+        assert!(
+            !judged(&signer_with(
+                &chain,
+                vec![non_repudiation.clone(), ocsp_signing_non_critical]
+            )),
+            "non-critical OCSPSigning EKU alone must not sign documents"
+        );
+
+        // Permitted document signing EKUs:
+        let doc_signing_critical = refineid_cms::testkit::extended_key_usage(
+            refineid_cms::oid::known::KP_DOCUMENT_SIGNING,
+        );
+        assert!(
+            judged(&signer_with(
+                &chain,
+                vec![non_repudiation.clone(), doc_signing_critical]
+            )),
+            "critical documentSigning EKU permits document signing"
+        );
+
+        let any_eku_critical = refineid_cms::testkit::extended_key_usage(
+            refineid_cms::oid::known::ANY_EXTENDED_KEY_USAGE,
+        );
+        assert!(
+            judged(&signer_with(
+                &chain,
+                vec![non_repudiation.clone(), any_eku_critical]
+            )),
+            "critical anyExtendedKeyUsage permits document signing"
+        );
+
+        let email_protection_critical = refineid_cms::testkit::extended_key_usage(
+            refineid_cms::oid::known::KP_EMAIL_PROTECTION,
+        );
+        assert!(
+            judged(&signer_with(
+                &chain,
+                vec![non_repudiation.clone(), email_protection_critical]
+            )),
+            "critical emailProtection EKU permits CMS/document signing"
+        );
+
+        let adobe_docs_critical = refineid_cms::testkit::extended_key_usage(
+            refineid_cms::oid::known::KP_ADOBE_AUTHENTIC_DOCUMENTS,
+        );
+        assert!(
+            judged(&signer_with(
+                &chain,
+                vec![non_repudiation.clone(), adobe_docs_critical]
+            )),
+            "critical Adobe authentic documents EKU permits document signing"
+        );
+
+        let doc_signing_non_critical = refineid_cms::testkit::non_critical_extended_key_usage(
+            refineid_cms::oid::known::KP_DOCUMENT_SIGNING,
+        );
+        assert!(
+            judged(&signer_with(
+                &chain,
+                vec![non_repudiation.clone(), doc_signing_non_critical]
+            )),
+            "non-critical documentSigning EKU permits document signing"
+        );
+
+        // Custom unknown OID:
+        const CUSTOM_PURPOSE_OID: refineid_cms::oid::Oid<'static> =
+            refineid_cms::oid::Oid::const_new(
+                ::const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.1").as_bytes(),
+            );
+        let custom_critical = refineid_cms::testkit::extended_key_usage(CUSTOM_PURPOSE_OID);
+        assert!(
+            !judged(&signer_with(
+                &chain,
+                vec![non_repudiation.clone(), custom_critical]
+            )),
+            "critical unrecognized EKU must fail closed"
+        );
+
+        let custom_non_critical =
+            refineid_cms::testkit::non_critical_extended_key_usage(CUSTOM_PURPOSE_OID);
+        assert!(
+            judged(&signer_with(
+                &chain,
+                vec![non_repudiation, custom_non_critical]
+            )),
+            "non-critical unrecognized EKU can be ignored"
         );
     }
 

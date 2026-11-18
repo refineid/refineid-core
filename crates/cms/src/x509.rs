@@ -110,6 +110,12 @@ const OID_KP_EMAIL_PROTECTION: Oid<'static> = known::KP_EMAIL_PROTECTION;
 const OID_KP_TIME_STAMPING: Oid<'static> = known::KP_TIME_STAMPING;
 /// `OID_KP_OCSP_SIGNING` constant.
 const OID_KP_OCSP_SIGNING: Oid<'static> = known::KP_OCSP_SIGNING;
+/// `OID_ANY_EXTENDED_KEY_USAGE` constant.
+const OID_ANY_EXTENDED_KEY_USAGE: Oid<'static> = known::ANY_EXTENDED_KEY_USAGE;
+/// `OID_KP_DOCUMENT_SIGNING` constant.
+const OID_KP_DOCUMENT_SIGNING: Oid<'static> = known::KP_DOCUMENT_SIGNING;
+/// `OID_KP_ADOBE_AUTHENTIC_DOCUMENTS` constant.
+const OID_KP_ADOBE_AUTHENTIC_DOCUMENTS: Oid<'static> = known::KP_ADOBE_AUTHENTIC_DOCUMENTS;
 
 // ----- Errors -----
 
@@ -1801,6 +1807,67 @@ pub struct BasicConstraints {
     pub present: bool,
 }
 
+/// Strictly parsed Extended Key Usage purpose profile (RFC 5280 §4.2.1.12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtendedKeyUsageMeta {
+    /// Whether the extension was marked critical.
+    pub critical: bool,
+    /// Whether `anyExtendedKeyUsage` (2.5.29.37.0) is present.
+    pub any: bool,
+    /// Whether `id-kp-serverAuth` (1.3.6.1.5.5.7.3.1) is present.
+    pub server_auth: bool,
+    /// Whether `id-kp-clientAuth` (1.3.6.1.5.5.7.3.2) is present.
+    pub client_auth: bool,
+    /// Whether `id-kp-codeSigning` (1.3.6.1.5.5.7.3.3) is present.
+    pub code_signing: bool,
+    /// Whether `id-kp-emailProtection` (1.3.6.1.5.5.7.3.4) is present.
+    pub email_protection: bool,
+    /// Whether `id-kp-timeStamping` (1.3.6.1.5.5.7.3.8) is present.
+    pub time_stamping: bool,
+    /// Whether `id-kp-OCSPSigning` (1.3.6.1.5.5.7.3.9) is present.
+    pub ocsp_signing: bool,
+    /// Whether Microsoft Document Signing (1.3.6.1.4.1.311.10.3.12) or Adobe Document Vault (1.2.840.113583.1.1.5) is present.
+    pub document_signing: bool,
+    /// Whether at least one other (unrecognized) purpose OID is present.
+    pub other_purposes_present: bool,
+}
+
+impl ExtendedKeyUsageMeta {
+    /// Whether this Extended Key Usage explicitly permits document signing:
+    /// `anyExtendedKeyUsage`, Microsoft Document Signing, Adobe Document Vault,
+    /// or `id-kp-emailProtection` (CMS / S/MIME).
+    #[must_use]
+    pub fn permits_document_signing(&self) -> bool {
+        self.any || self.document_signing || self.email_protection
+    }
+
+    /// Whether this Extended Key Usage restricts the certificate exclusively
+    /// to non-document-signing purposes (such as `serverAuth`, `clientAuth`,
+    /// `codeSigning`, `timeStamping`, or `ocspSigning`).
+    #[must_use]
+    pub fn is_exclusively_non_signing(&self) -> bool {
+        !self.permits_document_signing()
+            && !self.other_purposes_present
+            && (self.server_auth
+                || self.client_auth
+                || self.code_signing
+                || self.time_stamping
+                || self.ocsp_signing)
+    }
+
+    /// Whether this Extended Key Usage satisfies document signing policy:
+    /// - If marked critical: must explicitly include a recognized document-signing purpose.
+    /// - If non-critical: must not be restricted exclusively to non-signing purposes.
+    #[must_use]
+    pub fn fit_for_document_signing(&self) -> bool {
+        if self.critical {
+            self.permits_document_signing()
+        } else {
+            !self.is_exclusively_non_signing()
+        }
+    }
+}
+
 /// Strictly parsed certificate-extension facts needed by path construction.
 ///
 /// This is intentionally narrower than a general X.509 extension model. It
@@ -1819,6 +1886,8 @@ pub struct PathExtensionProfile {
     pub extended_key_usage_present: bool,
     /// Whether the strict Extended Key Usage contains `id-kp-OCSPSigning`.
     pub ocsp_signing_extended_key_usage: bool,
+    /// Extended Key Usage metadata with its critical flag and parsed purposes, when present.
+    pub extended_key_usage: Option<ExtendedKeyUsageMeta>,
     /// Whether an exact, non-critical `id-pkix-ocsp-nocheck` is present.
     pub ocsp_no_check_present: bool,
     /// Whether Name Constraints is present. The path builder currently rejects
@@ -1876,6 +1945,7 @@ pub fn path_extension_profile(
         key_usage: None,
         extended_key_usage_present: false,
         ocsp_signing_extended_key_usage: false,
+        extended_key_usage: None,
         ocsp_no_check_present: false,
         name_constraints_present: false,
     };
@@ -1938,8 +2008,10 @@ pub fn path_extension_profile(
         } else if oid == known::KEY_USAGE {
             profile.key_usage = Some(parse_path_key_usage(value.value(), critical)?);
         } else if oid == known::EXT_KEY_USAGE {
-            profile.ocsp_signing_extended_key_usage = parse_path_extended_key_usage(value.value())?;
+            let eku = parse_path_extended_key_usage(value.value(), critical)?;
+            profile.ocsp_signing_extended_key_usage = eku.ocsp_signing;
             profile.extended_key_usage_present = true;
+            profile.extended_key_usage = Some(eku);
         } else if oid == known::NAME_CONSTRAINTS {
             profile.name_constraints_present = true;
         } else if oid == known::OCSP_NO_CHECK {
@@ -2097,9 +2169,24 @@ fn parse_path_key_usage(value: &[u8], critical: bool) -> Result<KeyUsageMeta, Pa
     })
 }
 
-fn parse_path_extended_key_usage(value: &[u8]) -> Result<bool, PathExtensionError> {
+fn parse_path_extended_key_usage(
+    value: &[u8],
+    critical: bool,
+) -> Result<ExtendedKeyUsageMeta, PathExtensionError> {
     let outer = exact_path_extension_tlv::<Sequence>(value, "Extended Key Usage")?;
     let mut seen = Vec::new();
+    let mut meta = ExtendedKeyUsageMeta {
+        critical,
+        any: false,
+        server_auth: false,
+        client_auth: false,
+        code_signing: false,
+        email_protection: false,
+        time_stamping: false,
+        ocsp_signing: false,
+        document_signing: false,
+        other_purposes_present: false,
+    };
     for purpose in outer.iter_children() {
         let purpose = purpose
             .map_err(|_ignored| PathExtensionError::Malformed("Extended Key Usage entry"))?
@@ -2113,11 +2200,32 @@ fn parse_path_extended_key_usage(value: &[u8]) -> Result<bool, PathExtensionErro
             ));
         }
         seen.push(purpose);
+        if purpose == known::ANY_EXTENDED_KEY_USAGE {
+            meta.any = true;
+        } else if purpose == known::KP_SERVER_AUTH {
+            meta.server_auth = true;
+        } else if purpose == known::KP_CLIENT_AUTH {
+            meta.client_auth = true;
+        } else if purpose == known::KP_CODE_SIGNING {
+            meta.code_signing = true;
+        } else if purpose == known::KP_EMAIL_PROTECTION {
+            meta.email_protection = true;
+        } else if purpose == known::KP_TIME_STAMPING {
+            meta.time_stamping = true;
+        } else if purpose == known::KP_OCSP_SIGNING {
+            meta.ocsp_signing = true;
+        } else if purpose == known::KP_DOCUMENT_SIGNING
+            || purpose == known::KP_ADOBE_AUTHENTIC_DOCUMENTS
+        {
+            meta.document_signing = true;
+        } else {
+            meta.other_purposes_present = true;
+        }
     }
     if seen.is_empty() {
         return Err(PathExtensionError::Malformed("Extended Key Usage is empty"));
     }
-    Ok(seen.contains(&known::KP_OCSP_SIGNING))
+    Ok(meta)
 }
 
 fn parse_path_ocsp_no_check(value: &[u8], critical: bool) -> Result<(), PathExtensionError> {
@@ -2212,6 +2320,9 @@ impl X509Helpers {
             v if v == OID_KP_EMAIL_PROTECTION => "emailProtection",
             v if v == OID_KP_TIME_STAMPING => "timeStamping",
             v if v == OID_KP_OCSP_SIGNING => "ocspSigning",
+            v if v == OID_ANY_EXTENDED_KEY_USAGE => "anyExtendedKeyUsage",
+            v if v == OID_KP_DOCUMENT_SIGNING => "documentSigning",
+            v if v == OID_KP_ADOBE_AUTHENTIC_DOCUMENTS => "adobeAuthenticDocuments",
             _ => "",
         };
         if name.is_empty() {

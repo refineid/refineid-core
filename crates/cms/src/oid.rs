@@ -331,6 +331,20 @@ pub mod known {
     pub const KP_TIME_STAMPING: Oid<'static> =
         Oid::const_new(::const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.8").as_bytes());
 
+    /// `2.5.29.37.0` -- anyExtendedKeyUsage (RFC 5280 §4.2.1.12).
+    pub const ANY_EXTENDED_KEY_USAGE: Oid<'static> =
+        Oid::const_new(::const_oid::ObjectIdentifier::new_unwrap("2.5.29.37.0").as_bytes());
+
+    /// `1.3.6.1.4.1.311.10.3.12` -- szOID_DOCUMENT_SIGNING (Microsoft Document Signing).
+    pub const KP_DOCUMENT_SIGNING: Oid<'static> = Oid::const_new(
+        ::const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.4.1.311.10.3.12").as_bytes(),
+    );
+
+    /// `1.2.840.113583.1.1.5` -- Adobe Authentic Documents / Document Vault.
+    pub const KP_ADOBE_AUTHENTIC_DOCUMENTS: Oid<'static> = Oid::const_new(
+        ::const_oid::ObjectIdentifier::new_unwrap("1.2.840.113583.1.1.5").as_bytes(),
+    );
+
     // ---- Signature & public-key algorithms (PKCS #1, ANSI X9.62) ----
     //
     // FINEID S2 v5.2 §6.2.2 / §6.3.7 pins the citizen-card set:
@@ -648,6 +662,19 @@ mod tests {
         assert_eq!(
             format!("{}", known::ARCHIVE_TIME_STAMP_V3),
             "0.4.0.1733.2.4"
+        );
+    }
+
+    #[test]
+    fn display_extended_key_usages() {
+        assert_eq!(format!("{}", known::ANY_EXTENDED_KEY_USAGE), "2.5.29.37.0");
+        assert_eq!(
+            format!("{}", known::KP_DOCUMENT_SIGNING),
+            "1.3.6.1.4.1.311.10.3.12"
+        );
+        assert_eq!(
+            format!("{}", known::KP_ADOBE_AUTHENTIC_DOCUMENTS),
+            "1.2.840.113583.1.1.5"
         );
     }
 

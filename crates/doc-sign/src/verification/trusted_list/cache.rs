@@ -525,10 +525,10 @@ fn fetch(
 }
 
 /// `get`, except that fetching the list of the lists also downloads
-/// every national list it points at, [`PARALLEL_FETCHES`] at a time,
-/// for the requests that follow to take, each arrival counted into
-/// `progress` as `(fetched, total)`. Only a list of the lists that
-/// verifies under `signers` is followed.
+/// every national list it points at, eight at a time, for the
+/// requests that follow to take, each arrival counted into `progress`
+/// as `(fetched, total)`. Only a list of the lists that verifies
+/// under `signers` is followed.
 pub fn prefetching_get<'a>(
     signers: &'a [OwnedCert],
     get: impl Fn(&Uri) -> Option<Vec<u8>> + Sync + 'a,

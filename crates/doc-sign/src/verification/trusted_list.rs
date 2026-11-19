@@ -50,6 +50,8 @@
 //! - W3C XML Signature 1.1 sec.6.6.4: the enveloped-signature
 //!   transform removes the `ds:Signature` holding the reference.
 
+pub mod cache;
+
 use super::trust::{AnchorRole, GrantedPeriod, TrustAnchor, TrustAnchors};
 use super::xades::{
     ATTRIBUTE_ALGORITHM, ATTRIBUTE_TYPE, ATTRIBUTE_URI, DigestValue,

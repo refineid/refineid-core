@@ -713,6 +713,8 @@ pub const CKA_ID: CkAttributeType = 0x0000_0102;
 pub const CKA_SENSITIVE: CkAttributeType = 0x0000_0103;
 /// `CKA_ENCRYPT`: key-can-encrypt flag.
 pub const CKA_ENCRYPT: CkAttributeType = 0x0000_0104;
+/// `CKA_DECRYPT`: key-can-decrypt flag.
+pub const CKA_DECRYPT: CkAttributeType = 0x0000_0105;
 /// `CKA_WRAP`: key-can-wrap flag.
 pub const CKA_WRAP: CkAttributeType = 0x0000_0106;
 /// `CKA_UNWRAP`: key-can-unwrap flag.
@@ -723,6 +725,8 @@ pub const CKA_SIGN: CkAttributeType = 0x0000_0108;
 pub const CKA_SIGN_RECOVER: CkAttributeType = 0x0000_0109;
 /// `CKA_VERIFY`: key-can-verify flag.
 pub const CKA_VERIFY: CkAttributeType = 0x0000_010A;
+/// `CKA_VERIFY_RECOVER`: key-can-verify-with-recovery flag.
+pub const CKA_VERIFY_RECOVER: CkAttributeType = 0x0000_010B;
 /// `CKA_DERIVE`: key-supports-derivation flag.
 pub const CKA_DERIVE: CkAttributeType = 0x0000_010C;
 /// `CKA_MODULUS`: RSA modulus (big-endian magnitude).

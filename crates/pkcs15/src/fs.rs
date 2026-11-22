@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! PKCS#15 file-system access on the FINEID card.
+//! PKCS#15 file-system access on FINEID and Estonian eID cards.
 //!
 //! The operations layer on any [`CardTransport`]: a plain transport on
 //! the contact interface, or a secure-messaging transport once PACE has
@@ -61,6 +61,18 @@ pub const EF_AUTH_CERT_FID: FileId = FileId::from_u16(0x4331);
 pub const EF_SIGN_CERT_FID: FileId = FileId::from_u16(0x4332);
 /// EF.4333, the second authentication slot on dual-algorithm cards.
 pub const EF_AUTH_CERT_ALT_FID: FileId = FileId::from_u16(0x4333);
+/// EF.3411, the Estonian eID authentication certificate named by
+/// EF.CDF object 11 (GED24035, the Estonian eID developer guide).
+pub const EF_ESTONIAN_AUTH_CERT_FID: FileId = FileId::from_u16(0x3411);
+/// DF.DD, the Estonian personal-data directory on the 2025 platform.
+pub const DF_ESTONIAN_PERSONAL_DATA_FID: FileId = FileId::from_u16(0xDFDD);
+/// EF.5007 under DF.DD, PD7 Document number on the 2025 platform: the
+/// number the card body prints, as plain ASCII with no TLV wrapper
+/// (GED24035, section 6.1). Readable without a PIN.
+pub const EF_ESTONIAN_DOCUMENT_NUMBER_FID: FileId = FileId::from_u16(0x5007);
+/// EF.D003, the document-number file on the earlier platforms: a DER
+/// TLV directly under the MF (ID1 Developer Guide 2019, section 6.1).
+pub const EF_ESTONIAN_DOCUMENT_NUMBER_LEGACY_FID: FileId = FileId::from_u16(0xD003);
 /// EF.4334, the on-card root CA certificate; lives directly under the
 /// MF.
 pub const EF_ROOT_CA_FID: FileId = FileId::from_u16(0x4334);
@@ -98,6 +110,9 @@ pub enum CertSlot {
     /// Second authentication slot (EF.4333); the algorithm is not fixed
     /// by the slot, so consumers parse the DER to see what is there.
     AuthenticationAlt,
+    /// Estonian eID authentication certificate (EF.3411). The card names
+    /// it through EF.CDF object 11 rather than the FINEID fixed path.
+    EstonianAuthentication,
     /// On-card copy of the issuing root CA (EF.4334); algorithm varies
     /// by card generation.
     RootCa,
@@ -118,6 +133,7 @@ impl CertSlot {
             Self::Authentication => EF_AUTH_CERT_FID,
             Self::Signature => EF_SIGN_CERT_FID,
             Self::AuthenticationAlt => EF_AUTH_CERT_ALT_FID,
+            Self::EstonianAuthentication => EF_ESTONIAN_AUTH_CERT_FID,
             Self::RootCa => EF_ROOT_CA_FID,
             Self::SignatureAlt => EF_SIGN_CERT_ALT_FID,
             Self::IssuingCaEcc => EF_ISSUING_CA_ECC_FID,
@@ -131,6 +147,7 @@ impl CertSlot {
             Self::Authentication => "authentication (EF.4331)",
             Self::Signature => "qualified signature (EF.4332)",
             Self::AuthenticationAlt => "authentication, alt slot (EF.4333)",
+            Self::EstonianAuthentication => "authentication (EF.3411)",
             Self::RootCa => "on-card issuing root CA (EF.4334)",
             Self::SignatureAlt => "qualified signature, alt slot (EF.4335)",
             Self::IssuingCaEcc => "issuing intermediate CA (EF.4336)",
@@ -144,7 +161,7 @@ impl CertSlot {
     /// signature directory, and the CA copies under the MF.
     const fn path(self) -> SlotPath {
         match self {
-            Self::Authentication => SlotPath::UnderPkcs15App,
+            Self::Authentication | Self::EstonianAuthentication => SlotPath::UnderPkcs15App,
             Self::Signature | Self::AuthenticationAlt | Self::SignatureAlt => {
                 SlotPath::UnderEsignDirectory
             }
@@ -167,10 +184,10 @@ impl CertSlot {
     }
 
     /// Number of slots [`CertSlot::all`] probes.
-    pub const PROBED_SLOTS: usize = 5;
+    pub const PROBED_SLOTS: usize = 6;
 
-    /// The certificate slots a FINEID card may publish, in directory
-    /// order. Callers probe each; an absent slot answers SELECT with
+    /// The certificate slots a card may publish, in directory order.
+    /// Callers probe each; an absent slot answers SELECT with
     /// [`StatusWord::FileNotFound`], which is "not provisioned", not an
     /// error.
     #[must_use]
@@ -179,6 +196,7 @@ impl CertSlot {
             Self::Authentication,
             Self::Signature,
             Self::AuthenticationAlt,
+            Self::EstonianAuthentication,
             Self::RootCa,
             Self::SignatureAlt,
         ]
@@ -194,6 +212,9 @@ impl CertSlot {
 /// reads never fragment. Cards that honor less answer short reads or
 /// wrong-Le, which the read loops and the transport already absorb.
 const READ_CHUNK: u8 = 0xDF;
+/// `Le = 0` asks for the full 256-byte short-response window; some cards
+/// answer a shorter request over a small EF with end-of-file and no data.
+const READ_LE_256: u8 = 0x00;
 
 /// Hard cap on one object read. FINEID certificates are under two
 /// kibibytes; a sixteen-kibibyte ceiling leaves room for variants while
@@ -335,6 +356,9 @@ const P1_SELECT_CHILD_DF: u8 = 0x01;
 /// P1: select a DF or MF by name; some FINEID variants accept the MF
 /// identifier through this mode.
 const P1_SELECT_BY_NAME: u8 = 0x04;
+/// P1: select a file by its full path, one two-byte file identifier
+/// per step from the MF.
+const P1_SELECT_PATH: u8 = 0x08;
 /// P2: return no response data, shared with the typed SELECT builder.
 const P2_NO_RESPONSE_DATA: u8 = SelectFileResponseMode::None.as_p2();
 
@@ -363,6 +387,25 @@ fn select_child_df_variant<E>(fid: FileId) -> Result<CommandApdu, Pkcs15Error<E>
             p2: P2_NO_RESPONSE_DATA,
         },
         fid.as_bytes(),
+    )
+    .map_err(Pkcs15Error::Command)
+}
+
+/// Build the full-path SELECT variant: every file identifier in
+/// `path` is one step from the MF, sent in a single command.
+fn select_path_variant<E>(path: &[FileId]) -> Result<CommandApdu, Pkcs15Error<E>> {
+    let mut data = Vec::with_capacity(path.len().saturating_mul(FileId::LENGTH));
+    for fid in path {
+        data.extend_from_slice(fid.as_bytes());
+    }
+    CommandApdu::case_3(
+        CommandHeader {
+            class: ApduClass::Plain,
+            instruction: SelectFile::INS,
+            p1: P1_SELECT_PATH,
+            p2: SelectFileResponseMode::Fcp.as_p2(),
+        },
+        &data,
     )
     .map_err(Pkcs15Error::Command)
 }
@@ -451,6 +494,26 @@ pub trait Pkcs15Ops: CardTransport {
             select_any_by_fid_variant(fid),
         ];
         select_with_variants(self, variants)
+    }
+
+    /// SELECT a file by its full path, one two-byte file identifier per
+    /// step from the MF, in a single command. The returned FCP is read
+    /// and discarded.
+    ///
+    /// # Errors
+    ///
+    /// Transport failures, or a non-success status word.
+    fn select_path(&mut self, path: &[FileId]) -> Result<(), Pkcs15Error<Self::Error>>
+    where
+        Self: Sized,
+    {
+        let command = select_path_variant(path)?;
+        let response = exchange(self, &command)?;
+        if response.is_ok() {
+            Ok(())
+        } else {
+            Err(Pkcs15Error::Status(response.status_word()))
+        }
     }
 
     /// SELECT the signature directory beneath the MF.
@@ -565,7 +628,14 @@ pub trait Pkcs15Ops: CardTransport {
                 .ok_or(Pkcs15Error::TooLarge)?;
             let want_usize = remaining.min(usize::from(READ_CHUNK));
             let want = u8::try_from(want_usize).map_err(|_| Pkcs15Error::TooLarge)?;
-            let response = read_chunk(self, collected.len(), want)?;
+            let mut response = read_chunk(self, collected.len(), want)?;
+            if collected.is_empty()
+                && total_length.is_none()
+                && response.body.is_empty()
+                && matches!(response.status_word(), StatusWord::EndOfFile)
+            {
+                response = read_chunk(self, collected.len(), READ_LE_256)?;
+            }
             let end_of_file = matches!(response.status_word(), StatusWord::EndOfFile);
             if !response.is_ok() && !end_of_file {
                 return Err(Pkcs15Error::Status(response.status_word()));
@@ -656,11 +726,21 @@ pub trait Pkcs15Ops: CardTransport {
     where
         Self: Sized,
     {
-        self.select_pkcs15_application()?;
-        self.select_ef(crate::EF_AOD_FID)?;
-        let bytes = self.read_binary_to_end(None)?;
-        crate::AuthenticationObjects::parse(&bytes)
-            .map_err(|_parse_error| Pkcs15Error::InvalidData("EF.AOD"))
+        for fid in [crate::EF_AOD_FID, crate::EF_ESTONIAN_AOD_FID] {
+            if self.select_pkcs15_application().is_err() {
+                continue;
+            }
+            if self.select_ef(fid).is_err() {
+                continue;
+            }
+            let Ok(bytes) = self.read_binary_to_end(None) else {
+                continue;
+            };
+            if let Ok(objects) = crate::AuthenticationObjects::parse(&bytes) {
+                return Ok(objects);
+            }
+        }
+        Err(Pkcs15Error::InvalidData("EF.AOD"))
     }
 
     /// Read and parse EF.TokenInfo.
@@ -678,6 +758,37 @@ pub trait Pkcs15Ops: CardTransport {
         let bytes = self.read_binary_der_object("EF.TokenInfo")?;
         crate::TokenInfo::parse(&bytes)
             .map_err(|_parse_error| Pkcs15Error::InvalidData("EF.TokenInfo"))
+    }
+
+    /// Read the Estonian document number the card body prints. The
+    /// 2025 platform keeps it as plain ASCII in EF.5007 under DF.DD;
+    /// the earlier platforms keep a DER TLV in EF.D003 under the MF.
+    /// Neither file needs a PIN.
+    ///
+    /// # Errors
+    ///
+    /// SELECT or read failures, or a file whose bytes are not a
+    /// document number. A card without either file answers SELECT with
+    /// [`StatusWord::FileNotFound`].
+    fn read_document_number(&mut self) -> Result<crate::DocumentNumber, Pkcs15Error<Self::Error>>
+    where
+        Self: Sized,
+    {
+        let current = [
+            DF_ESTONIAN_PERSONAL_DATA_FID,
+            EF_ESTONIAN_DOCUMENT_NUMBER_FID,
+        ];
+        if self.select_path(&current).is_ok() {
+            let bytes = self.read_binary_to_end(Some(crate::DOCUMENT_NUMBER_CHARS))?;
+            if let Ok(number) = crate::DocumentNumber::from_ascii(&bytes) {
+                return Ok(number);
+            }
+        }
+        self.select_mf()?;
+        self.select_ef(EF_ESTONIAN_DOCUMENT_NUMBER_LEGACY_FID)?;
+        let bytes = self.read_binary_der_object("EF.D003")?;
+        crate::DocumentNumber::parse_tlv(&bytes)
+            .map_err(|_parse_error| Pkcs15Error::InvalidData("EF.D003"))
     }
 }
 

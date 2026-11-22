@@ -47,6 +47,12 @@ use refineid_ber::{BerError, BerTag, BerTlv, BerTlvAny, BerTlvIter, BitString, I
 /// sections 4.6.10 and 4.7.10).
 pub const EF_AOD_FID: FileId = FileId::from_u16(0x4401);
 
+/// EF.AOD on the Estonian eID application (GED24035, the Estonian eID
+/// developer guide, EF.AOD). The directory has the same
+/// `AuthenticationObjectChoice` content as the FINEID file, under the
+/// Estonian application's file identifier.
+pub const EF_ESTONIAN_AOD_FID: FileId = FileId::from_u16(0x5006);
+
 /// The end-of-contents octet (ITU-T X.690 section 8.1.5). No PKCS#15
 /// object starts with it, so at an object boundary it begins the file's
 /// zero padding.
@@ -202,6 +208,14 @@ impl AuthenticationObjects {
     #[must_use]
     pub fn passwords(&self) -> &[PasswordObject] {
         &self.passwords
+    }
+
+    /// Whether the directory lists a password object under `reference`.
+    #[must_use]
+    pub fn lists_reference(&self, reference: u8) -> bool {
+        self.passwords
+            .iter()
+            .any(|object| object.reference == reference)
     }
 
     /// Parse the contents of EF.AOD.
@@ -500,6 +514,17 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn a_reference_is_reported_from_the_listed_objects() {
+        let bytes = file(&[
+            Fixture::citizen(CITIZEN_PIN1_REFERENCE, CITIZEN_PIN1_MIN),
+            Fixture::citizen(CITIZEN_PIN2_REFERENCE, CITIZEN_PIN2_MIN),
+        ]);
+        let objects = AuthenticationObjects::parse(&bytes).expect("parses");
+        assert!(objects.lists_reference(CITIZEN_PIN1_REFERENCE));
+        assert!(!objects.lists_reference(CITIZEN_PUK_REFERENCE));
     }
 
     #[test]

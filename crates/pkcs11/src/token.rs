@@ -14,7 +14,8 @@
 
 //! Slot / token / object model over PC/SC.
 //!
-//! A FINEID token exposes one profile object ([`ObjectKind::Profile`],
+//! A FINEID or Estonian eID token exposes one profile object
+//! ([`ObjectKind::Profile`],
 //! handle [`OBJ_PROFILE`]) declaring that its certificates are readable
 //! without a login, the authentication certificate
 //! ([`ObjectKind::Certificate`], handle [`OBJ_CERTIFICATE`]), its
@@ -46,8 +47,8 @@ use refineid_apdu::CardTransport;
 #[cfg(feature = "pin-change")]
 use refineid_auth::PinManageOps as _;
 use refineid_auth::{
-    AuthError, FlooredCredential, PinOps as _, PinSlot, PinStatus, RetryFloorRefusal,
-    VerifyOutcome, check_retry_floor, pin1_status_permits_reusable_cache,
+    AuthError, FlooredCredential, PinOps as _, PinReferenceScheme, PinSlot, PinStatus,
+    RetryFloorRefusal, VerifyOutcome, check_retry_floor, pin1_status_permits_reusable_cache,
 };
 use refineid_cms::container::{EcdsaP384, RsaPkcs1Sha256, Signature};
 use refineid_cms::x509::{
@@ -75,18 +76,19 @@ use crate::ck::CKR_PIN_LEN_RANGE;
 use crate::ck::{
     CK_CERTIFICATE_CATEGORY_AUTHORITY, CK_CERTIFICATE_CATEGORY_TOKEN_USER, CK_FALSE, CK_TRUE,
     CKA_ALWAYS_AUTHENTICATE, CKA_ALWAYS_SENSITIVE, CKA_CERTIFICATE_CATEGORY, CKA_CERTIFICATE_TYPE,
-    CKA_CLASS, CKA_DERIVE, CKA_EC_PARAMS, CKA_EC_POINT, CKA_ENCRYPT, CKA_EXTRACTABLE, CKA_ID,
-    CKA_ISSUER, CKA_KEY_TYPE, CKA_LABEL, CKA_LOCAL, CKA_MODIFIABLE, CKA_MODULUS, CKA_MODULUS_BITS,
-    CKA_NEVER_EXTRACTABLE, CKA_NSS_CERT_MD5_HASH, CKA_NSS_CERT_SHA1_HASH,
+    CKA_CLASS, CKA_DECRYPT, CKA_DERIVE, CKA_EC_PARAMS, CKA_EC_POINT, CKA_ENCRYPT, CKA_EXTRACTABLE,
+    CKA_ID, CKA_ISSUER, CKA_KEY_TYPE, CKA_LABEL, CKA_LOCAL, CKA_MODIFIABLE, CKA_MODULUS,
+    CKA_MODULUS_BITS, CKA_NEVER_EXTRACTABLE, CKA_NSS_CERT_MD5_HASH, CKA_NSS_CERT_SHA1_HASH,
     CKA_NSS_TRUST_CLIENT_AUTH, CKA_NSS_TRUST_CODE_SIGNING, CKA_NSS_TRUST_EMAIL_PROTECTION,
     CKA_NSS_TRUST_SERVER_AUTH, CKA_NSS_TRUST_STEP_UP_APPROVED, CKA_PRIVATE, CKA_PROFILE_ID,
     CKA_PUBLIC_EXPONENT, CKA_SENSITIVE, CKA_SERIAL_NUMBER, CKA_SIGN, CKA_SIGN_RECOVER, CKA_SUBJECT,
-    CKA_TOKEN, CKA_TRUSTED, CKA_UNWRAP, CKA_VALUE, CKA_VERIFY, CKA_WRAP, CKC_X_509, CKK_EC,
-    CKK_RSA, CKO_CERTIFICATE, CKO_NSS_TRUST, CKO_PRIVATE_KEY, CKO_PROFILE, CKO_PUBLIC_KEY,
-    CKP_PUBLIC_CERTIFICATES_TOKEN, CKR_DATA_INVALID, CKR_DATA_LEN_RANGE, CKR_DEVICE_ERROR,
-    CKR_MECHANISM_INVALID, CKR_OK, CKR_PIN_INCORRECT, CKR_PIN_LOCKED, CKR_SIGNATURE_INVALID,
-    CKR_SIGNATURE_LEN_RANGE, CKR_USER_NOT_LOGGED_IN, CKT_NSS_MUST_VERIFY_TRUST,
-    CKT_NSS_TRUSTED_DELEGATOR, CkAttributeType, CkBbool, CkObjectHandle, CkRv, CkTrust, CkUlong,
+    CKA_TOKEN, CKA_TRUSTED, CKA_UNWRAP, CKA_VALUE, CKA_VERIFY, CKA_VERIFY_RECOVER, CKA_WRAP,
+    CKC_X_509, CKK_EC, CKK_RSA, CKO_CERTIFICATE, CKO_NSS_TRUST, CKO_PRIVATE_KEY, CKO_PROFILE,
+    CKO_PUBLIC_KEY, CKP_PUBLIC_CERTIFICATES_TOKEN, CKR_DATA_INVALID, CKR_DATA_LEN_RANGE,
+    CKR_DEVICE_ERROR, CKR_MECHANISM_INVALID, CKR_OK, CKR_PIN_INCORRECT, CKR_PIN_LOCKED,
+    CKR_SIGNATURE_INVALID, CKR_SIGNATURE_LEN_RANGE, CKR_USER_NOT_LOGGED_IN,
+    CKT_NSS_MUST_VERIFY_TRUST, CKT_NSS_TRUSTED_DELEGATOR, CkAttributeType, CkBbool, CkObjectHandle,
+    CkRv, CkTrust, CkUlong,
 };
 use crate::sign::{
     CardSignInput, DigestInfoHash, ECDSA_P384_SIGNATURE_BYTES, Mechanism, RSA3072_MODULUS_BITS,
@@ -272,6 +274,74 @@ impl AttrValue<'_> {
     }
 }
 
+/// Length of the Estonian isikukood: eleven ASCII digits.
+const ISIKUKOOD_CHARS: usize = 11;
+/// Length of the Finnish SATU/PEUIN: eight digits and a check character.
+const PEUIN_CHARS: usize = 9;
+/// Digits the Finnish SATU/PEUIN carries before its check character.
+const PEUIN_DIGITS: usize = 8;
+/// Prefix ETSI EN 319 412-1 section 5.1.3 gives a natural person's
+/// `serialNumber`: `PNO` (personal number), the ISO 3166-1 country code
+/// `EE`, and a hyphen (NAT-5.1.3-02, NAT-5.1.3-03).
+const SERIAL_NUMBER_PREFIX_ESTONIA: &str = "PNOEE-";
+
+/// The holder's personal code, as the certificate subject states it.
+///
+/// A value exists only as the result of
+/// [`PersonalCode::from_serial_number`] or
+/// [`PersonalCode::from_subject_common_name`], so the predicate is
+/// checked once at the certificate border.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersonalCode(String);
+
+impl PersonalCode {
+    /// Take the code from the subject `serialNumber` attribute, the
+    /// authoritative carrier: Estonian certificates write `PNOEE-` and
+    /// the eleven-digit isikukood, Finnish certificates write the
+    /// nine-character SATU/PEUIN directly. Returns `None` for any other
+    /// shape, so the common name remains the fallback.
+    fn from_serial_number(value: &str) -> Option<Self> {
+        let code = value
+            .strip_prefix(SERIAL_NUMBER_PREFIX_ESTONIA)
+            .unwrap_or(value);
+        Self::from_code(code)
+    }
+
+    /// Take the last identifier of the subject common name, for a
+    /// certificate whose `serialNumber` carries no holder code.
+    ///
+    /// The Estonian form separates surname, given names and code with
+    /// commas (`SN,GN,CODE`, GED24035 section 9); the FINEID form uses
+    /// spaces (`SN GN CODE`, DVV S1 v4.0). Its code is the SATU/PEUIN,
+    /// not the eleven-character HETU (PIC).
+    fn from_subject_common_name(common_name: &str) -> Option<Self> {
+        Self::from_code(common_name.rsplit([',', ' ']).next()?)
+    }
+
+    /// The two printed forms: eleven ASCII digits (Estonian isikukood)
+    /// or eight digits and an ASCII alphanumeric check character
+    /// (Finnish SATU/PEUIN).
+    fn from_code(code: &str) -> Option<Self> {
+        let bytes = code.as_bytes();
+        let isikukood = bytes.len() == ISIKUKOOD_CHARS && bytes.iter().all(u8::is_ascii_digit);
+        let peuin = match bytes.split_last() {
+            Some((check, digits)) => {
+                bytes.len() == PEUIN_CHARS
+                    && digits.len() == PEUIN_DIGITS
+                    && digits.iter().all(u8::is_ascii_digit)
+                    && check.is_ascii_alphanumeric()
+            }
+            None => false,
+        };
+        (isikukood || peuin).then(|| Self(code.to_owned()))
+    }
+
+    /// The code as the subject writes it.
+    fn into_string(self) -> String {
+        self.0
+    }
+}
+
 /// A parsed and verified CA certificate object on the token, with the
 /// digests of its DER that its NSS trust record carries.
 #[derive(Debug, Clone)]
@@ -288,8 +358,12 @@ pub struct CaObject {
     der_md5: Md5,
 }
 
-fn extract_common_name(name: &Name<'_>) -> Option<String> {
-    const OID_COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
+/// `commonName` OID (X.520, 2.5.4.3).
+const OID_COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
+/// `serialNumber` OID (X.520, 2.5.4.5).
+const OID_SERIAL_NUMBER: &[u8] = &[0x55, 0x04, 0x05];
+
+fn extract_dn_attribute(name: &Name<'_>, wanted_oid: &[u8]) -> Option<String> {
     use spki::der::asn1::AnyRef;
     use spki::der::{Decode as _, Reader as _, SliceReader, Tag, Tagged as _};
 
@@ -312,7 +386,7 @@ fn extract_common_name(name: &Name<'_>) -> Option<String> {
             let mut fields = SliceReader::new(atv.value()).ok()?;
             let oid = AnyRef::from_der(fields.tlv_bytes().ok()?).ok()?;
             let val = AnyRef::from_der(fields.tlv_bytes().ok()?).ok()?;
-            if oid.tag() == Tag::ObjectIdentifier && oid.value() == OID_COMMON_NAME {
+            if oid.tag() == Tag::ObjectIdentifier && oid.value() == wanted_oid {
                 match val.tag() {
                     Tag::Utf8String => {
                         return core::str::from_utf8(val.value()).ok().map(String::from);
@@ -330,6 +404,10 @@ fn extract_common_name(name: &Name<'_>) -> Option<String> {
         }
     }
     None
+}
+
+fn extract_common_name(name: &Name<'_>) -> Option<String> {
+    extract_dn_attribute(name, OID_COMMON_NAME)
 }
 
 impl CaObject {
@@ -610,16 +688,19 @@ pub struct TokenObjects {
     auth_cert: OwnedCert,
     /// [`CKA_ID`]: SHA-1 of the SPKI DER, shared by cert and key.
     auth_cert_id: Sha1,
-    /// Human-readable label for [`CKA_LABEL`] (common name, else [`DEFAULT_LABEL`]).
+    /// Human-readable label for [`CKA_LABEL`]: the holder's personal
+    /// code from the common name, else the common name, else
+    /// [`DEFAULT_LABEL`].
     auth_cert_label: String,
     /// Pre-encoded serial number DER INTEGER for the authentication certificate.
     auth_cert_serial_der: Vec<u8>,
-    /// Chip serial from PKCS#15 EF.TokenInfo: the plastic-printed
-    /// card identifier when [`derive_printed_serial`] recognises
-    /// the chip generation (the form a citizen can check against
-    /// the card body), else the full rendered serial via
-    /// [`render_token_serial`]; empty when the card reports none.
-    /// Reported in `CK_TOKEN_INFO.serialNumber`.
+    /// The identifier printed on the card body, reported in
+    /// `CK_TOKEN_INFO.serialNumber`: the Estonian document number
+    /// from EF.D003, or the plastic-printed serial
+    /// [`derive_printed_serial`] extracts from EF.TokenInfo (the
+    /// form a citizen can check against the card body), falling back
+    /// to the full rendered serial [`render_token_serial`] returns;
+    /// empty when the card reports none.
     token_serial: String,
     /// Key-type specific material extracted and validated from the SPKI.
     key_material: TokenKeyMaterial,
@@ -627,6 +708,9 @@ pub struct TokenObjects {
     ca_store: RefinedTrustStore,
     /// What authenticates the holder before the key signs.
     key_gate: KeyGate,
+    /// The credential numbering the certificate path fixes, when it does;
+    /// `None` lets the card's counter-safe probe resolve it.
+    pin_scheme: Option<PinReferenceScheme>,
     /// Which raised token these objects belong to; its handles are
     /// offset by this many [`TOKEN_HANDLE_SPACE`]s.
     generation: CkObjectHandle,
@@ -742,8 +826,20 @@ impl TokenObjects {
         let view = auth_cert.view();
         let key_material = TokenKeyMaterial::extract(&view.spki)?;
         let auth_cert_id = Sha1::of(view.spki.as_der());
-        let auth_cert_label =
-            extract_common_name(&view.subject).unwrap_or_else(|| DEFAULT_LABEL.to_owned());
+        let serial_number = extract_dn_attribute(&view.subject, OID_SERIAL_NUMBER);
+        let common_name = extract_common_name(&view.subject);
+        let personal_code = serial_number
+            .as_deref()
+            .and_then(PersonalCode::from_serial_number)
+            .or_else(|| {
+                common_name
+                    .as_deref()
+                    .and_then(PersonalCode::from_subject_common_name)
+            });
+        let auth_cert_label = personal_code.map_or_else(
+            || common_name.unwrap_or_else(|| DEFAULT_LABEL.to_owned()),
+            PersonalCode::into_string,
+        );
         let auth_cert_serial_der = der_integer(view.serial_der.as_bytes());
         let ca_store = RefinedTrustStore::default();
         Ok(Self {
@@ -755,6 +851,7 @@ impl TokenObjects {
             key_material,
             ca_store,
             key_gate,
+            pin_scheme: None,
             generation: 0,
         })
     }
@@ -794,6 +891,19 @@ impl TokenObjects {
     #[must_use]
     pub(crate) const fn key_gate(&self) -> KeyGate {
         self.key_gate
+    }
+
+    /// The credential numbering fixed by the certificate path, when the
+    /// path names it.
+    #[must_use]
+    pub(crate) const fn pin_scheme(&self) -> Option<PinReferenceScheme> {
+        self.pin_scheme
+    }
+
+    /// Fix the credential numbering for a card whose certificate path
+    /// identifies its profile.
+    pub(crate) fn set_pin_scheme(&mut self, scheme: PinReferenceScheme) {
+        self.pin_scheme = Some(scheme);
     }
 
     /// The rendered chip serial from EF.TokenInfo; empty when the
@@ -963,8 +1073,10 @@ impl TokenObjects {
         match attr {
             CKA_CLASS => Some(ulong_attr(CKO_PUBLIC_KEY)),
             CKA_KEY_TYPE => Some(ulong_attr(self.key_material.key_type())),
-            CKA_TOKEN | CKA_VERIFY => Some(bool_attr(CK_TRUE)),
-            CKA_PRIVATE | CKA_ENCRYPT | CKA_WRAP | CKA_DERIVE => Some(bool_attr(CK_FALSE)),
+            CKA_TOKEN | CKA_VERIFY | CKA_LOCAL => Some(bool_attr(CK_TRUE)),
+            CKA_PRIVATE | CKA_ENCRYPT | CKA_WRAP | CKA_DERIVE | CKA_VERIFY_RECOVER => {
+                Some(bool_attr(CK_FALSE))
+            }
             CKA_LABEL => Some(AttrValue::Borrowed(self.auth_cert_label.as_bytes())),
             CKA_ID => Some(AttrValue::Borrowed(self.auth_cert_id.as_bytes())),
             CKA_SUBJECT => {
@@ -1016,10 +1128,14 @@ impl TokenObjects {
                 KeyGate::Login => CK_TRUE,
                 KeyGate::Device => CK_FALSE,
             })),
-            CKA_TOKEN | CKA_SIGN | CKA_SENSITIVE | CKA_NEVER_EXTRACTABLE | CKA_ALWAYS_SENSITIVE => {
-                Some(bool_attr(CK_TRUE))
-            }
+            CKA_TOKEN
+            | CKA_SIGN
+            | CKA_SENSITIVE
+            | CKA_NEVER_EXTRACTABLE
+            | CKA_ALWAYS_SENSITIVE
+            | CKA_LOCAL => Some(bool_attr(CK_TRUE)),
             CKA_ALWAYS_AUTHENTICATE
+            | CKA_DECRYPT
             | CKA_EXTRACTABLE
             | CKA_SIGN_RECOVER
             | CKA_UNWRAP
@@ -1427,6 +1543,28 @@ fn persist_ca_cert(cert: &OwnedCert) {
     }
 }
 
+/// Select the certificates that link the leaf to a root through their
+/// issuer and subject names, in chain order. Cached CAs belong to the
+/// user profile rather than to one card, so a card must not receive
+/// certificates from another card's chain.
+fn ca_chain_for_leaf(leaf: &OwnedCert, candidates: &[OwnedCert]) -> Vec<OwnedCert> {
+    let mut chain = Vec::new();
+    let mut issuer = leaf.view().issuer.as_der().to_vec();
+    for _ in 0..MAX_CA_CERTS {
+        let Some(cert) = candidates.iter().find(|cert| {
+            cert.view().subject.as_der() == issuer.as_slice()
+                && !chain
+                    .iter()
+                    .any(|chosen: &OwnedCert| chosen.as_der() == cert.as_der())
+        }) else {
+            break;
+        };
+        issuer = cert.view().issuer.as_der().to_vec();
+        chain.push(cert.clone());
+    }
+    chain
+}
+
 /// Attempt to read and parse an optional CA certificate from a card slot.
 ///
 /// Returns `Some(OwnedCert)` when the slot is populated on the card profile
@@ -1441,12 +1579,14 @@ fn read_optional_ca_cert(card: &mut PcscCard, slot: CertSlot) -> Option<OwnedCer
 }
 
 /// Build the token objects for `reader_name`: open the card once,
-/// read EF.TokenInfo (chip serial, card label) and the
-/// authentication certificate via the PKCS#15 chain, drop the
-/// card, and parse.
+/// read EF.TokenInfo (chip serial, card label), the authentication
+/// certificate via the PKCS#15 chain, and the Estonian document
+/// number when the certificate fixes that profile, drop the card,
+/// and parse.
 ///
-/// A missing or unreadable EF.TokenInfo is tolerated (empty
-/// serial / label); the certificate read is mandatory.
+/// A missing or unreadable EF.TokenInfo or EF.D003 is tolerated (the
+/// serial falls back to the other source); the certificate read is
+/// mandatory.
 ///
 /// # Errors
 /// [`CKR_DEVICE_ERROR`] if the reader cannot be opened or the
@@ -1472,14 +1612,32 @@ pub(super) fn build_token_objects(reader: &ReaderId) -> Result<TokenObjects, CkR
                 |printed| printed.as_str().to_owned(),
             )
         });
-    let cert = card
-        .read_certificate(CertSlot::Authentication)
-        .or_else(|_| card.read_certificate(CertSlot::AuthenticationAlt))
-        .map_err(|_read_err| CKR_DEVICE_ERROR)?;
+    let (cert, pin_scheme) = if let Ok(cert) = card.read_certificate(CertSlot::Authentication) {
+        (cert, None)
+    } else if let Ok(cert) = card.read_certificate(CertSlot::AuthenticationAlt) {
+        (cert, None)
+    } else {
+        (
+            card.read_certificate(CertSlot::EstonianAuthentication)
+                .map_err(|_read_err| CKR_DEVICE_ERROR)?,
+            Some(PinReferenceScheme::Estonian),
+        )
+    };
+
+    let document_number = if pin_scheme == Some(PinReferenceScheme::Estonian) {
+        card.read_document_number().ok()
+    } else {
+        None
+    };
 
     let mut cas = load_persisted_ca_certs();
     let mut objects = TokenObjects::from_cert_der(cert.as_bytes().to_vec(), KeyGate::Login)?;
-    if let Some(serial) = serial {
+    if let Some(scheme) = pin_scheme {
+        objects.set_pin_scheme(scheme);
+    }
+    if let Some(document_number) = &document_number {
+        objects.token_serial = document_number.as_str().to_owned();
+    } else if let Some(serial) = serial {
         objects.token_serial = serial;
     }
 
@@ -1511,7 +1669,7 @@ pub(super) fn build_token_objects(reader: &ReaderId) -> Result<TokenObjects, CkR
     }
     drop(card);
 
-    for ca in cas {
+    for ca in ca_chain_for_leaf(&objects.auth_cert, &cas) {
         objects.push_ca_cert(ca);
     }
     Ok(objects)
@@ -1522,7 +1680,17 @@ pub(super) fn build_token_objects(reader: &ReaderId) -> Result<TokenObjects, CkR
     clippy::redundant_pub_crate,
     reason = "private root module helper is used by sibling api module; plain pub would violate the public-surface typing grep"
 )]
+#[cfg(test)]
 pub(super) fn card_pin1_status(kind: &SlotKind) -> Result<PinStatus, CkRv> {
+    card_pin1_status_with_scheme(kind, None)
+}
+
+/// Probe the live PIN1 retry state under an explicit numbering when the
+/// certificate path fixed it, or let the card resolve it otherwise.
+pub(super) fn card_pin1_status_with_scheme(
+    kind: &SlotKind,
+    scheme: Option<PinReferenceScheme>,
+) -> Result<PinStatus, CkRv> {
     // A remote reader reports its own PIN1 state over an authenticated
     // pairing, and this computer has no card to ask. Reaching this arm
     // requires a host-admitted pairing, not a reader name.
@@ -1535,8 +1703,11 @@ pub(super) fn card_pin1_status(kind: &SlotKind) -> Result<PinStatus, CkRv> {
         .map_err(|_open_err| CKR_DEVICE_ERROR)?;
     card.select_pkcs15_application()
         .map_err(|_select_err| CKR_DEVICE_ERROR)?;
-    card.pin_status(PinSlot::Pin1)
-        .map_err(|_status_err| CKR_DEVICE_ERROR)
+    match scheme {
+        Some(scheme) => card.pin_status_with_scheme(scheme, PinSlot::Pin1),
+        None => card.pin_status(PinSlot::Pin1),
+    }
+    .map_err(|_status_err| CKR_DEVICE_ERROR)
 }
 
 /// Run a signature on the card of a local reader.
@@ -1571,11 +1742,24 @@ pub(super) fn card_pin1_status(kind: &SlotKind) -> Result<PinStatus, CkRv> {
     clippy::redundant_pub_crate,
     reason = "private root module helper is used by sibling api module; plain pub would violate the public-surface typing grep"
 )]
+#[cfg(test)]
 pub(super) fn card_sign(
     kind: &SlotKind,
     pin_cache: &Arc<Mutex<PinSafetyCache>>,
     mechanism: Mechanism,
     input: &[u8],
+) -> Result<Vec<u8>, CkRv> {
+    card_sign_with_scheme(kind, pin_cache, mechanism, input, None)
+}
+
+/// Run a signature under the credential numbering the token's certificate
+/// path fixed, when it did.
+pub(super) fn card_sign_with_scheme(
+    kind: &SlotKind,
+    pin_cache: &Arc<Mutex<PinSafetyCache>>,
+    mechanism: Mechanism,
+    input: &[u8],
+    scheme: Option<PinReferenceScheme>,
 ) -> Result<Vec<u8>, CkRv> {
     let request = CardSignInput::parse(mechanism, input)?;
     let backend = PcscBackend;
@@ -1599,7 +1783,7 @@ pub(super) fn card_sign(
         return Err(CKR_DEVICE_ERROR);
     };
     card.pin_sequence(|mut card| {
-        run_card_sign(
+        run_card_sign_with_scheme(
             &mut card,
             || {
                 backend
@@ -1607,6 +1791,7 @@ pub(super) fn card_sign(
                     .map_err(|_status_err| CKR_DEVICE_ERROR)
             },
             pin_cache,
+            scheme,
             request,
         )
     })
@@ -1614,10 +1799,26 @@ pub(super) fn card_sign(
     .map_err(|_transaction_err| CKR_DEVICE_ERROR)?
 }
 
+#[cfg(test)]
 fn run_card_sign<T, F>(
     card: &mut T,
     read_card_events: F,
     pin_cache: &Arc<Mutex<PinSafetyCache>>,
+    request: CardSignInput,
+) -> Result<Vec<u8>, CkRv>
+where
+    T: CardTransport,
+    T::Error: refineid_apdu::TransportErrorExt,
+    F: FnOnce() -> Result<u32, CkRv>,
+{
+    run_card_sign_with_scheme(card, read_card_events, pin_cache, None, request)
+}
+
+fn run_card_sign_with_scheme<T, F>(
+    card: &mut T,
+    read_card_events: F,
+    pin_cache: &Arc<Mutex<PinSafetyCache>>,
+    scheme: Option<PinReferenceScheme>,
     request: CardSignInput,
 ) -> Result<Vec<u8>, CkRv>
 where
@@ -1636,14 +1837,21 @@ where
             return Err(error);
         }
     };
-    let pin1_status = match card.pin_status(PinSlot::Pin1) {
+    let pin1_status = match scheme {
+        Some(scheme) => card.pin_status_with_scheme(scheme, PinSlot::Pin1),
+        None => card.pin_status(PinSlot::Pin1),
+    };
+    let pin1_status = match pin1_status {
         Ok(status) => status,
         Err(_status_err) => {
             clear_positive(pin_cache);
             return Err(CKR_DEVICE_ERROR);
         }
     };
-    if !pin1_status_permits_reusable_cache(pin1_status) {
+    if !pin1_status_permits_reusable_cache(
+        pin1_status,
+        scheme.unwrap_or(PinReferenceScheme::Citizen),
+    ) {
         clear_positive(pin_cache);
     }
     if let Err(error) = pin1_verify_guard(pin1_status) {
@@ -1676,7 +1884,10 @@ where
     let Ok(pin1) = refineid_auth::Pin1::reconstruct(secret) else {
         return Err(CKR_DEVICE_ERROR);
     };
-    let answer = card.verify_pin1(pin1);
+    let answer = match scheme {
+        Some(scheme) => card.verify_pin1_with_scheme(scheme, pin1),
+        None => card.verify_pin1(pin1),
+    };
     let accepted = checkout.settle_verify(
         &mut pin_cache
             .lock()
@@ -1853,7 +2064,8 @@ pub(super) fn remote_token_objects(
     let mut objects = TokenObjects::from_cert_der(certificate.as_der().to_vec(), KeyGate::Device)?;
     objects.remote_key()?;
     objects.set_token_serial(pair_id.token_serial());
-    for ca in load_persisted_ca_certs() {
+    let cas = load_persisted_ca_certs();
+    for ca in ca_chain_for_leaf(&objects.auth_cert, &cas) {
         objects.push_ca_cert(ca);
     }
     Ok(objects)
@@ -1878,10 +2090,22 @@ pub(super) fn remote_token_objects(
     clippy::redundant_pub_crate,
     reason = "private root module helper is used by sibling api module; plain pub would violate the public-surface typing grep"
 )]
+#[cfg(test)]
 pub(super) fn card_login(
     kind: &SlotKind,
     pin_cache: &Arc<Mutex<PinSafetyCache>>,
     pin1: PinBytes,
+) -> Result<(), CkRv> {
+    card_login_with_scheme(kind, pin_cache, pin1, None)
+}
+
+/// Log in under the credential numbering the token's certificate path
+/// fixed, when it did.
+pub(super) fn card_login_with_scheme(
+    kind: &SlotKind,
+    pin_cache: &Arc<Mutex<PinSafetyCache>>,
+    pin1: PinBytes,
+    scheme: Option<PinReferenceScheme>,
 ) -> Result<(), CkRv> {
     // Protected authentication path: the paired device verifies PIN1 in
     // its own protected storage, so there is no secret for this
@@ -1910,7 +2134,7 @@ pub(super) fn card_login(
         return Err(CKR_DEVICE_ERROR);
     };
     card.pin_sequence(|mut card| {
-        run_card_login(
+        run_card_login_with_scheme(
             &mut card,
             || {
                 backend
@@ -1919,6 +2143,7 @@ pub(super) fn card_login(
             },
             pin_cache,
             pin1,
+            scheme,
         )
     })
     .inspect_err(|_transaction_err| clear_positive(pin_cache))
@@ -1928,11 +2153,26 @@ pub(super) fn card_login(
 /// Run the card-session steps of [`card_login`] against `card` and
 /// `read_card_events`, destroying any held PIN1 when a pre-VERIFY read,
 /// the retry floor, or the VERIFY itself fails.
+#[cfg(test)]
 fn run_card_login<T, F>(
     card: &mut T,
     read_card_events: F,
     pin_cache: &Arc<Mutex<PinSafetyCache>>,
     pin1: PinBytes,
+) -> Result<(), CkRv>
+where
+    T: CardTransport,
+    F: FnOnce() -> Result<u32, CkRv>,
+{
+    run_card_login_with_scheme(card, read_card_events, pin_cache, pin1, None)
+}
+
+fn run_card_login_with_scheme<T, F>(
+    card: &mut T,
+    read_card_events: F,
+    pin_cache: &Arc<Mutex<PinSafetyCache>>,
+    pin1: PinBytes,
+    scheme: Option<PinReferenceScheme>,
 ) -> Result<(), CkRv>
 where
     T: CardTransport,
@@ -1949,14 +2189,21 @@ where
             return Err(error);
         }
     };
-    let pin1_status = match card.pin_status(PinSlot::Pin1) {
+    let pin1_status = match scheme {
+        Some(scheme) => card.pin_status_with_scheme(scheme, PinSlot::Pin1),
+        None => card.pin_status(PinSlot::Pin1),
+    };
+    let pin1_status = match pin1_status {
         Ok(status) => status,
         Err(_status_err) => {
             clear_positive(pin_cache);
             return Err(CKR_DEVICE_ERROR);
         }
     };
-    if !pin1_status_permits_reusable_cache(pin1_status) {
+    if !pin1_status_permits_reusable_cache(
+        pin1_status,
+        scheme.unwrap_or(PinReferenceScheme::Citizen),
+    ) {
         clear_positive(pin_cache);
     }
     if let Err(error) = pin1_verify_guard(pin1_status) {
@@ -1987,7 +2234,11 @@ where
         clear_positive(pin_cache);
         return Err(CKR_PIN_INCORRECT);
     };
-    let outcome = match card.verify_pin1(pin1_val) {
+    let outcome = match scheme {
+        Some(scheme) => card.verify_pin1_with_scheme(scheme, pin1_val),
+        None => card.verify_pin1(pin1_val),
+    };
+    let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(AuthError::RetryFloor(refusal)) => {
             clear_positive(pin_cache);
@@ -2175,6 +2426,70 @@ pub(super) fn card_change_pin1(
 }
 
 #[cfg(test)]
+mod personal_code_tests {
+    use super::PersonalCode;
+
+    #[test]
+    fn the_code_is_the_last_segment_of_the_common_name() {
+        for (common_name, expected) in [
+            ("TESTI,MATTI TAPIO,39901010000", "39901010000"),
+            ("TESTI MATTI TAPIO 12345678X", "12345678X"),
+        ] {
+            let code = PersonalCode::from_subject_common_name(common_name)
+                .unwrap_or_else(|| panic!("{common_name:?} names a code"));
+            assert_eq!(code.into_string(), expected);
+        }
+    }
+
+    #[test]
+    fn the_serial_number_carries_the_code_and_the_estonian_prefix_is_stripped() {
+        for (value, expected) in [
+            ("PNOEE-39901010000", "39901010000"),
+            ("12345678X", "12345678X"),
+        ] {
+            let code = PersonalCode::from_serial_number(value)
+                .unwrap_or_else(|| panic!("{value:?} names a code"));
+            assert_eq!(code.into_string(), expected);
+        }
+    }
+
+    #[test]
+    fn a_serial_number_without_a_holder_code_shape_is_refused() {
+        for value in [
+            "PNOEE-3990101000",
+            "PNOEE-39901010000X",
+            "1234567",
+            "12345678!",
+            "123456789012",
+            "",
+        ] {
+            assert!(
+                PersonalCode::from_serial_number(value).is_none(),
+                "{value:?} must not parse as a personal code"
+            );
+        }
+    }
+
+    #[test]
+    fn a_common_name_without_a_code_names_no_personal_code() {
+        for common_name in [
+            "TESTI MATTI",
+            "ACME OY 2024",
+            "TESTI,MATTI,12345",
+            "TESTI,MATTI,123456",
+            "TESTI MATTI 140378-71J",
+            "TESTI MATTI 123456789012345678901",
+            "TESTI MATTI 1234567!",
+        ] {
+            assert!(
+                PersonalCode::from_subject_common_name(common_name).is_none(),
+                "{common_name:?} must not parse as a personal code"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 #[expect(
     clippy::indexing_slicing,
     reason = "unit tests assert on fixed offsets of compile-time-known byte fixtures; production code stays panic-free."
@@ -2242,6 +2557,34 @@ mod tests {
         assert_eq!(ObjectKind::PrivateKey.handle(), OBJ_PRIVATE_KEY);
         assert_eq!(ObjectKind::PublicKey.handle(), OBJ_PUBLIC_KEY);
         assert_eq!(ObjectKind::Profile.handle(), OBJ_PROFILE);
+    }
+
+    /// Optional key attributes are answered explicitly, including the
+    /// operations this token does not perform and the key pair's on-card
+    /// generation.
+    #[test]
+    fn key_locality_and_unused_usages_are_answered() {
+        use crate::ck::{CK_FALSE, CK_TRUE, CKA_DECRYPT, CKA_LOCAL, CKA_VERIFY_RECOVER};
+
+        const TEST_CERT_DER: &[u8] =
+            include_bytes!("../test-certs/fineid-intermediate-01-citizen-g4e.der");
+        let objects =
+            super::TokenObjects::from_cert_der(TEST_CERT_DER.to_vec(), super::KeyGate::Login)
+                .expect("token objects from cert der");
+        let value = |kind, attr| {
+            objects
+                .attribute(kind, attr)
+                .and_then(|value| value.as_bytes().map(<[u8]>::to_vec))
+                .expect("attribute present")
+        };
+
+        assert_eq!(
+            value(ObjectKind::PublicKey, CKA_VERIFY_RECOVER),
+            vec![CK_FALSE]
+        );
+        assert_eq!(value(ObjectKind::PublicKey, CKA_LOCAL), vec![CK_TRUE]);
+        assert_eq!(value(ObjectKind::PrivateKey, CKA_DECRYPT), vec![CK_FALSE]);
+        assert_eq!(value(ObjectKind::PrivateKey, CKA_LOCAL), vec![CK_TRUE]);
     }
 
     /// The profile object is a constant of the module: a public,
@@ -2598,6 +2941,21 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn only_the_leafs_issuing_chain_is_selected() {
+        const LEAF_DER: &[u8] =
+            include_bytes!("../test-certs/fineid-intermediate-01-citizen-g4e.der");
+        const ROOT_DER: &[u8] = include_bytes!("../test-certs/dvv-gov-root-ca-g3-ecc.der");
+        const UNRELATED_DER: &[u8] = include_bytes!("../test-certs/dvv-gov-root-ca-g3-rsa.der");
+        let leaf = OwnedCert::from_der(LEAF_DER).expect("valid leaf");
+        let root = OwnedCert::from_der(ROOT_DER).expect("valid root");
+        let unrelated = OwnedCert::from_der(UNRELATED_DER).expect("valid unrelated CA");
+
+        let chain = super::ca_chain_for_leaf(&leaf, &[unrelated, root.clone()]);
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].as_der(), root.as_der());
     }
 
     #[test]

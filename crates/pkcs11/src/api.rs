@@ -31,7 +31,7 @@
 use core::ptr;
 
 use crate::pin::{PinBytes, PinRoleError};
-use refineid_auth::{PinRetryRisk, PinStatus};
+use refineid_auth::{PinReferenceScheme, PinStatus};
 
 use crate::ck::{
     CK_EFFECTIVELY_INFINITE, CK_UNAVAILABLE_INFORMATION, CKF_DONT_BLOCK, CKF_EC_F_P,
@@ -183,12 +183,14 @@ fn padded_field<const N: usize>(text: &str) -> [CkUtf8Char; N] {
 
 /// Space-pad `text` into a fixed-width PKCS#11 field, keeping the
 /// TAIL when over-long. Used for the token serial: the normal case
-/// is the 9-char plastic-printed identifier (fits), but the
-/// fallback full chip serial (17-20 chars on unrecognised shapes)
-/// exceeds the 16-byte `CK_TOKEN_INFO.serialNumber` field, and the
-/// printed identifier is the SUFFIX, so dropping leading bytes
-/// preserves the identity a citizen can check against the card
-/// body; `OpenSC` truncates the same way.
+/// is the nine-character identifier printed on the card body (the
+/// FINEID card serial or the Estonian document number), which fits;
+/// the fallback full chip serial (17-20 chars on unrecognised shapes)
+/// exceeds the 16-byte `CK_TOKEN_INFO.serialNumber` field, and on
+/// those shapes the printed identifier is a SUFFIX of the chip
+/// serial, so dropping leading bytes preserves the identity a
+/// citizen can check against the card body; `OpenSC` truncates the
+/// same way.
 fn tail_padded_field<const N: usize>(text: &str) -> [CkUtf8Char; N] {
     let mut out = [b' '; N];
     let skip = text.len().saturating_sub(N);
@@ -552,15 +554,19 @@ unsafe extern "C" fn c_get_token_info(slot_id: CkSlotId, info: CkTokenInfoPtr) -
     };
     let rv = if slot.card_present() {
         let kind = slot.kind().clone();
-        let (serial, key_gate) = match module.ensure_token(slot_id) {
-            Ok(objects) => (objects.token_serial().to_owned(), objects.key_gate()),
+        let (serial, key_gate, pin_scheme) = match module.ensure_token(slot_id) {
+            Ok(objects) => (
+                objects.token_serial().to_owned(),
+                objects.key_gate(),
+                objects.pin_scheme(),
+            ),
             Err(error) => {
                 diag!("C_GetTokenInfo slot={slot_id} ensure_token error={error:#06x}");
                 return error;
             }
         };
         drop(guard);
-        let pin1_status = match crate::token::card_pin1_status(&kind) {
+        let pin1_status = match crate::token::card_pin1_status_with_scheme(&kind, pin_scheme) {
             Ok(status) => status,
             Err(error) => {
                 diag!("C_GetTokenInfo slot={slot_id} auth_status error={error:#06x}");
@@ -569,7 +575,7 @@ unsafe extern "C" fn c_get_token_info(slot_id: CkSlotId, info: CkTokenInfoPtr) -
         };
         // SAFETY: caller guarantees info is a writable CK_TOKEN_INFO.
         unsafe {
-            info.write(token_info_value(&serial, pin1_status, key_gate));
+            info.write(token_info_value(&serial, pin1_status, key_gate, pin_scheme));
         }
         CKR_OK
     } else {
@@ -579,62 +585,56 @@ unsafe extern "C" fn c_get_token_info(slot_id: CkSlotId, info: CkTokenInfoPtr) -
     rv
 }
 
-/// Fixed token label for the authentication (PIN1) token.
+/// Fixed token label for the authentication (PIN1) credential.
 ///
-/// This is what NSS puts verbatim in its PIN-prompt dialog ("Enter
-/// password for Basic PIN 1") and what keys the `pkcs11:token=`
-/// URI.  The label must name the *purpose / credential*, not the
-/// plastic: the card's own EF.TokenInfo carries "HENKILOKORTTI".
-/// When the qualified-signature (PIN2) slot lands it will carry
-/// "Signature PIN 2", and the label pair is what keeps a citizen
-/// from typing PIN2 into a PIN1 prompt.  The serial still names the
-/// physical card. The PIN's name is written as the card documents
-/// name it, "Basic PIN 1", with no parentheses.
+/// `CK_TOKEN_INFO.label` is the value RFC 7512 section 2.3 gives to
+/// `pkcs11:token=`, so it is a wire identifier rather than a sentence:
+/// the short credential name `PIN1` keeps a URI readable at a glance.
+/// The serial beside it names the physical card, and the object label
+/// carries the holder's name and personal code.
 ///
-/// The Finnish and Swedish forms use the preferred terms of the
-/// Finnish public-sector Certification vocabulary
-/// (sanastot.suomi.fi, concepts "basic PIN" and "signature PIN"),
-/// which DVV's pages follow: "perustunnusluku" and
-/// "allekirjoitustunnusluku", "grund PIN" and "signaturkod", with the
-/// PIN's number after the term: "Perustunnusluku 1",
-/// "Allekirjoitustunnusluku 2"; "Grund PIN 1", "Signaturkod 2".
-/// "Grundkod", which the Apple app once used, is in neither source.
-/// A short "Perus-PIN 1" was considered and dropped: it is correct
-/// Finnish only with the hyphen (Kielitoimiston ohjepankki,
-/// "Yhdysmerkki yhdyssanassa, jossa lyhenne, numero tms.": a compound
-/// whose part is an initialism read letter by letter always takes a
-/// hyphen, as in "EU-lainsäädäntö"), and the full word needs no such
-/// rule and is what the holder reads on DVV's pages.
-///
-/// The string matches the Apple `TokenExtension` localisation key:
-///   English  "Basic PIN 1"
-///   Finnish  "Perustunnusluku 1"
-///   Swedish  "Grund PIN 1"
-const TOKEN_LABEL_IDENTIFY: &str = "Basic PIN 1";
+/// The label names the credential, not the plastic: the card's own
+/// EF.TokenInfo carries its product name. User-interface text keeps
+/// the full term the card documents use, "Basic PIN 1", which the
+/// Apple `TokenExtension` localises as "Perustunnusluku 1" and
+/// "Grund PIN 1".
+const TOKEN_LABEL_IDENTIFY: &str = "PIN1";
 /// Fixed token label for a card served by a paired phone, which
-/// verifies Basic PIN 1 itself: NSS shows no PIN prompt for it, and the
+/// verifies PIN 1 itself: NSS shows no PIN prompt for it, and the
 /// label tells the citizen which device the prompt will appear on.
-/// The maintainer chose the full credential name over a bare "Phone"
-/// (2026-11-07) so the two tokens read alike in a browser's device
-/// list: the card token "Basic PIN 1", the phone token
-/// "Phone Basic PIN 1".
-const TOKEN_LABEL_PHONE: &str = "Phone Basic PIN 1";
+/// The phone token keeps the card token's credential name with a
+/// `Phone` prefix, so the two read alike in a browser's device list.
+const TOKEN_LABEL_PHONE: &str = "Phone PIN1";
+/// Token model for the FINEID card families.
+const TOKEN_MODEL_FINEID: &str = "FINEID";
+/// Token model for the Estonian eID card profile.
+const TOKEN_MODEL_ESTONIAN: &str = "ESTeID";
 
 /// Build the token-info payload. Fixed-width fields are space-padded;
 /// unknown counters use [`CK_UNAVAILABLE_INFORMATION`].
 ///
 /// The label is the fixed [`TOKEN_LABEL_IDENTIFY`] (see its doc);
-/// `serial` comes from the card's own PKCS#15 EF.TokenInfo (the
-/// printed card identifier). The model is the fixed card family,
-/// FINEID (the openssl backend's default URI matches on it). The
-/// manufacturer names this software, `RefineID`: `C_GetInfo`
-/// carries the module identity in principle, but `p11-kit-proxy`
-/// masks it with its own, so the token manufacturer is the only
-/// producer hint that reaches proxy consumers.
+/// `serial` is the identifier the card body prints: the Estonian
+/// document number from EF.D003, or the FINEID serial EF.TokenInfo
+/// reports, trimmed to its printed form. The model names the card
+/// application family: FINEID for the Finnish cards, ESTeID for the
+/// Estonian profile; the chip platform below it is not a PKCS#11
+/// field. The manufacturer names this software, `RefineID`: the token
+/// is the logical device this module presents, and the card's own
+/// EF.TokenInfo `manufacturerID` carries the card application name
+/// ("ESTeID"), not a hardware vendor. `C_GetInfo` carries the library
+/// manufacturer in principle, but `p11-kit-proxy` masks it with its
+/// own, so the token manufacturer is the producer hint that reaches
+/// proxy consumers.
 ///
 /// The login flags follow the token's [`KeyGate`], the same value
 /// that sets the private key's `CKA_PRIVATE`.
-fn token_info_value(serial: &str, pin1_status: PinStatus, key_gate: KeyGate) -> CkTokenInfo {
+fn token_info_value(
+    serial: &str,
+    pin1_status: PinStatus,
+    key_gate: KeyGate,
+    pin_scheme: Option<PinReferenceScheme>,
+) -> CkTokenInfo {
     // With `pin-change` enabled the token is not write-protected, so
     // NSS offers "Change Password" -> C_SetPIN. In the default
     // (login-only) build the token reports write-protected and NSS
@@ -647,7 +647,7 @@ fn token_info_value(serial: &str, pin1_status: PinStatus, key_gate: KeyGate) -> 
         CKF_LOGIN_REQUIRED | CKF_USER_PIN_INITIALIZED | CKF_TOKEN_INITIALIZED | CKF_WRITE_PROTECTED;
     let (flags, label) = match key_gate {
         KeyGate::Login => (
-            base_flags | user_pin_status_flags(pin1_status),
+            base_flags | user_pin_status_flags(pin1_status, pin_scheme),
             padded_field(TOKEN_LABEL_IDENTIFY),
         ),
         // The phone verifies PIN 1 and asks the holder for each
@@ -666,7 +666,10 @@ fn token_info_value(serial: &str, pin1_status: PinStatus, key_gate: KeyGate) -> 
     CkTokenInfo {
         label,
         manufacturer_id: padded_field("RefineID"),
-        model: padded_field("FINEID"),
+        model: padded_field(match pin_scheme {
+            Some(PinReferenceScheme::Estonian) => TOKEN_MODEL_ESTONIAN,
+            _ => TOKEN_MODEL_FINEID,
+        }),
         serial_number: tail_padded_field(serial),
         flags,
         ul_max_session_count: CK_EFFECTIVELY_INFINITE,
@@ -686,7 +689,13 @@ fn token_info_value(serial: &str, pin1_status: PinStatus, key_gate: KeyGate) -> 
 }
 
 /// Translate the side-effect-free live PIN1 status to PKCS #11 token flags.
-const fn user_pin_status_flags(status: PinStatus) -> CkFlags {
+/// The flags describe the card's own state: `COUNT_LOW` once any attempt
+/// has been spent, `FINAL_TRY` only with one attempt left, and `LOCKED`
+/// only when the card reports the PIN locked or exhausted.
+const fn user_pin_status_flags(
+    status: PinStatus,
+    pin_scheme: Option<PinReferenceScheme>,
+) -> CkFlags {
     let PinStatus::Remaining(retries) = status else {
         return if matches!(status, PinStatus::Locked) {
             CKF_USER_PIN_LOCKED
@@ -694,17 +703,19 @@ const fn user_pin_status_flags(status: PinStatus) -> CkFlags {
             0
         };
     };
-    match PinRetryRisk::from_retries(retries) {
-        Some(PinRetryRisk::NormalOperatingConditions) | None => 0,
-        Some(PinRetryRisk::DisturbanceDetected) => CKF_USER_PIN_COUNT_LOW,
-        Some(PinRetryRisk::SecurityIncidentDeclared) => {
-            CKF_USER_PIN_COUNT_LOW | CKF_USER_PIN_FINAL_TRY
-        }
-        Some(
-            PinRetryRisk::CriticalThreatLevel
-            | PinRetryRisk::LockdownImminent
-            | PinRetryRisk::DefencesFallen,
-        ) => CKF_USER_PIN_COUNT_LOW | CKF_USER_PIN_LOCKED,
+    let retry_limit = match pin_scheme {
+        Some(scheme) => scheme.pin_retry_limit(),
+        None => PinReferenceScheme::Citizen.pin_retry_limit(),
+    };
+    let count = retries.get();
+    if count == retry_limit {
+        0
+    } else if count == 0 {
+        CKF_USER_PIN_COUNT_LOW | CKF_USER_PIN_LOCKED
+    } else if count == 1 {
+        CKF_USER_PIN_COUNT_LOW | CKF_USER_PIN_FINAL_TRY
+    } else {
+        CKF_USER_PIN_COUNT_LOW
     }
 }
 
@@ -990,12 +1001,19 @@ unsafe extern "C" fn c_login(
     if let Err(_role_err) = pin1.validate_digits(PIN1_MIN_DIGITS, PIN1_MAX_DIGITS) {
         return CKR_PIN_LEN_RANGE;
     }
+    let pin_scheme = match module.ensure_token(slot_id) {
+        Ok(objects) => objects.pin_scheme(),
+        Err(error) => return error,
+    };
     let pin_cache = match module.pin_cache(slot_id) {
         Ok(cache) => cache,
         Err(error) => return error,
     };
+    if let Ok(mut cache) = pin_cache.lock() {
+        cache.set_scheme(pin_scheme.unwrap_or(PinReferenceScheme::Citizen));
+    }
     drop(guard);
-    let rv = match crate::token::card_login(&kind, &pin_cache, pin1) {
+    let rv = match crate::token::card_login_with_scheme(&kind, &pin_cache, pin1, pin_scheme) {
         Ok(()) => CKR_OK,
         Err(error) => error,
     };
@@ -1481,6 +1499,17 @@ unsafe extern "C" fn c_sign(
             return error;
         }
     };
+    let pin_scheme = if kind.is_remote() {
+        None
+    } else {
+        match module.ensure_token(slot_id) {
+            Ok(objects) => objects.pin_scheme(),
+            Err(error) => {
+                clear_sign(module, session);
+                return error;
+            }
+        }
+    };
     // A phone-served token signs with the key its certificate names;
     // the key is decided here, under the lock, from the cached objects.
     let remote_key = if kind.is_remote() {
@@ -1525,7 +1554,7 @@ unsafe extern "C" fn c_sign(
         },
         (SlotKind::Remote { .. }, None) => Err(CKR_DEVICE_ERROR),
         (SlotKind::Local { .. }, _) => {
-            crate::token::card_sign(&kind, &pin_cache, mechanism, &input)
+            crate::token::card_sign_with_scheme(&kind, &pin_cache, mechanism, &input, pin_scheme)
         }
     };
     let rv = match outcome {
@@ -2610,7 +2639,12 @@ mod tests {
         let pristine = PinStatus::Remaining(
             PinRetries::from_nibble(5).expect("test retry count fits the status-word nibble"),
         );
-        let phone = token_info_value("REMOTE-a5a5a5a5", PinStatus::Verified, KeyGate::Device);
+        let phone = token_info_value(
+            "REMOTE-a5a5a5a5",
+            PinStatus::Verified,
+            KeyGate::Device,
+            None,
+        );
         assert_eq!(
             phone.flags,
             CKF_USER_PIN_INITIALIZED
@@ -2618,9 +2652,26 @@ mod tests {
                 | CKF_WRITE_PROTECTED
                 | CKF_PROTECTED_AUTHENTICATION_PATH
         );
-        let card = token_info_value("TEST123", pristine, KeyGate::Login);
+        assert_eq!(phone.label, padded_field(super::TOKEN_LABEL_PHONE));
+        let card = token_info_value("TEST123", pristine, KeyGate::Login, None);
         assert_ne!(card.flags & CKF_LOGIN_REQUIRED, 0);
         assert_eq!(card.flags & CKF_PROTECTED_AUTHENTICATION_PATH, 0);
+        assert_eq!(card.label, padded_field(super::TOKEN_LABEL_IDENTIFY));
+        assert_eq!(card.label, padded_field("PIN1"));
+
+        let estonian_limit = refineid_auth::PinReferenceScheme::Estonian.pin_retry_limit();
+        let estonian_pin = PinStatus::Remaining(
+            PinRetries::from_nibble(estonian_limit)
+                .expect("test retry count fits the status-word nibble"),
+        );
+        let estonian = token_info_value(
+            "TEST123",
+            estonian_pin,
+            KeyGate::Login,
+            Some(refineid_auth::PinReferenceScheme::Estonian),
+        );
+        assert_eq!(estonian.model, padded_field(super::TOKEN_MODEL_ESTONIAN));
+        assert_eq!(estonian.flags & CKF_USER_PIN_COUNT_LOW, 0);
     }
 
     /// A phone-served token signs in a public session and in a user
@@ -3115,7 +3166,12 @@ mod tests {
         let expected: [CkUtf8Char; 32] = padded_field("RefineID");
         let retries =
             PinRetries::from_nibble(5).expect("test retry count fits the status-word nibble");
-        let token = token_info_value("TEST123", PinStatus::Remaining(retries), KeyGate::Login);
+        let token = token_info_value(
+            "TEST123",
+            PinStatus::Remaining(retries),
+            KeyGate::Login,
+            None,
+        );
         assert_eq!(token.manufacturer_id, expected);
         let mut info: CkInfo = unsafe { core::mem::zeroed() };
         assert_eq!(unsafe { c_get_info(&mut info) }, CKR_OK);
@@ -3128,32 +3184,51 @@ mod tests {
             PinRetries::from_nibble(count).expect("test retry count fits the status-word nibble")
         };
 
-        assert_eq!(user_pin_status_flags(PinStatus::Remaining(retries(5))), 0);
         assert_eq!(
-            user_pin_status_flags(PinStatus::Remaining(retries(4))),
+            user_pin_status_flags(PinStatus::Remaining(retries(5)), None),
+            0
+        );
+        assert_eq!(
+            user_pin_status_flags(PinStatus::Remaining(retries(4)), None),
             CKF_USER_PIN_COUNT_LOW
         );
         assert_eq!(
-            user_pin_status_flags(PinStatus::Remaining(retries(3))),
+            user_pin_status_flags(PinStatus::Remaining(retries(3)), None),
+            CKF_USER_PIN_COUNT_LOW
+        );
+        assert_eq!(
+            user_pin_status_flags(PinStatus::Remaining(retries(2)), None),
+            CKF_USER_PIN_COUNT_LOW
+        );
+        assert_eq!(
+            user_pin_status_flags(PinStatus::Remaining(retries(1)), None),
             CKF_USER_PIN_COUNT_LOW | CKF_USER_PIN_FINAL_TRY
         );
         assert_eq!(
-            user_pin_status_flags(PinStatus::Remaining(retries(2))),
+            user_pin_status_flags(PinStatus::Remaining(retries(0)), None),
             CKF_USER_PIN_COUNT_LOW | CKF_USER_PIN_LOCKED
         );
         assert_eq!(
-            user_pin_status_flags(PinStatus::Remaining(retries(1))),
-            CKF_USER_PIN_COUNT_LOW | CKF_USER_PIN_LOCKED
-        );
-        assert_eq!(
-            user_pin_status_flags(PinStatus::Remaining(retries(0))),
-            CKF_USER_PIN_COUNT_LOW | CKF_USER_PIN_LOCKED
-        );
-        assert_eq!(
-            user_pin_status_flags(PinStatus::Locked),
+            user_pin_status_flags(PinStatus::Locked, None),
             CKF_USER_PIN_LOCKED
         );
-        assert_eq!(user_pin_status_flags(PinStatus::NoInfo), 0);
+        assert_eq!(user_pin_status_flags(PinStatus::NoInfo, None), 0);
+        let estonian = Some(refineid_auth::PinReferenceScheme::Estonian);
+        let estonian_pristine = refineid_auth::PinReferenceScheme::Estonian.pin_retry_limit();
+        const ESTONIAN_ONE_SPENT: u8 = 2;
+        const ESTONIAN_LAST_TRY: u8 = 1;
+        assert_eq!(
+            user_pin_status_flags(PinStatus::Remaining(retries(estonian_pristine)), estonian),
+            0
+        );
+        assert_eq!(
+            user_pin_status_flags(PinStatus::Remaining(retries(ESTONIAN_ONE_SPENT)), estonian),
+            CKF_USER_PIN_COUNT_LOW
+        );
+        assert_eq!(
+            user_pin_status_flags(PinStatus::Remaining(retries(ESTONIAN_LAST_TRY)), estonian),
+            CKF_USER_PIN_COUNT_LOW | CKF_USER_PIN_FINAL_TRY
+        );
     }
 
     /// A caller's PIN buffer is read up to one octet past the longest

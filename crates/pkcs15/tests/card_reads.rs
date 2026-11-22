@@ -24,12 +24,17 @@ use refineid_apdu::{
 };
 use refineid_ber::{BerTag, Sequence, tlv};
 use refineid_pkcs15::{
-    CertSlot, DF_ESIGN_FID, EF_TOKEN_INFO_FID, ESIGN_AID, PKCS15_AID, Pkcs15Error, Pkcs15Ops,
+    CertSlot, DF_ESIGN_FID, DF_ESTONIAN_PERSONAL_DATA_FID, EF_ESTONIAN_AUTH_CERT_FID,
+    EF_ESTONIAN_DOCUMENT_NUMBER_FID, EF_ESTONIAN_DOCUMENT_NUMBER_LEGACY_FID, EF_TOKEN_INFO_FID,
+    ESIGN_AID, PKCS15_AID, Pkcs15Error, Pkcs15Ops,
 };
 
 /// Chunk size the read loops request, mirroring the implementation; a
 /// change there must fail these scripts loudly.
 const READ_CHUNK_LEN: u8 = 0xDF;
+/// `Le = 0`, the full 256-byte short-response window used when a card
+/// answers a shorter first read with end-of-file.
+const READ_LE_256_LEN: u8 = 0x00;
 /// Certificate content length that forces a two-chunk read.
 const TWO_CHUNK_CONTENT_LEN: usize = 300;
 /// Surplus bytes past the requested chunk a T=0 61xx chain may
@@ -46,6 +51,11 @@ const FILLER: u8 = 0x5A;
 const P1_SELECT_CHILD_DF: u8 = 0x01;
 /// P1 selecting by name, mirroring the implementation's MF fallback.
 const P1_SELECT_BY_NAME: u8 = 0x04;
+/// P1 selecting a full path, mirroring the implementation's 2025
+/// document-number read.
+const P1_SELECT_PATH: u8 = 0x08;
+/// P2 returning the FCP, the response mode the path select asks for.
+const P2_RETURN_FCP: u8 = 0x04;
 /// BER long-form marker declaring two length octets.
 const TWO_OCTET_LONG_FORM: u8 = 0x82;
 /// Wire length of a status-word pair.
@@ -144,6 +154,25 @@ fn select_ef_wire(fid: FileId) -> Vec<u8> {
     SelectEfNoFci { fid }.into_apdu().as_bytes().to_vec()
 }
 
+fn select_path_wire(path: &[FileId]) -> Vec<u8> {
+    let mut data = Vec::new();
+    for fid in path {
+        data.extend_from_slice(fid.as_bytes());
+    }
+    CommandApdu::case_3(
+        refineid_apdu::CommandHeader {
+            class: ApduClass::Plain,
+            instruction: SelectFile::INS,
+            p1: P1_SELECT_PATH,
+            p2: P2_RETURN_FCP,
+        },
+        &data,
+    )
+    .expect("file identifiers fit a data field")
+    .as_bytes()
+    .to_vec()
+}
+
 fn select_any_by_fid_wire(fid: FileId) -> Vec<u8> {
     SelectFile {
         class: ApduClass::Plain,
@@ -221,6 +250,31 @@ fn authentication_certificate_reads_across_chunks() {
         .read_certificate(CertSlot::Authentication)
         .expect("scripted read succeeds");
     assert_eq!(cert.as_bytes(), der.as_slice());
+    transport.assert_drained();
+}
+
+#[test]
+fn estonian_authentication_certificate_reads_from_ef_3411() {
+    let der = certificate_fixture(ONE_CHUNK_CONTENT_LEN);
+
+    let mut transport = ScriptedTransport::new(vec![
+        (select_app_wire(), ok_response(&[])),
+        (
+            select_ef_wire(CertSlot::EstonianAuthentication.fid()),
+            ok_response(&[]),
+        ),
+        (read_wire(0, READ_CHUNK_LEN), ok_response(&der)),
+    ]);
+
+    assert_eq!(
+        CertSlot::EstonianAuthentication.fid(),
+        EF_ESTONIAN_AUTH_CERT_FID
+    );
+    let cert = transport
+        .read_certificate(CertSlot::EstonianAuthentication)
+        .expect("scripted read succeeds");
+    assert_eq!(cert.as_bytes(), der.as_slice());
+    assert!(!CertSlot::EstonianAuthentication.requires_mf_traversal());
     transport.assert_drained();
 }
 
@@ -365,6 +419,129 @@ fn token_info_reads_and_parses() {
             .expect("fixture carries a serial"),
     );
     assert_eq!(serial, "DEMO0001AB1234567");
+    transport.assert_drained();
+}
+
+#[test]
+fn token_info_reads_after_end_of_file_on_a_long_read() {
+    let mut inner = refineid_ber::BerEncoder::default();
+    inner
+        .push_tlv(
+            u8::try_from(<refineid_ber::Integer as BerTag>::TAG).expect("fits"),
+            [1_u8],
+        )
+        .expect("fixture encodes");
+    inner
+        .push_tlv(
+            u8::try_from(<refineid_ber::OctetString as BerTag>::TAG).expect("fits"),
+            b"DEMO0001AB1234567".as_slice(),
+        )
+        .expect("fixture encodes");
+    let der = tlv(sequence_tag(), inner.finish()).expect("fixture encodes");
+
+    let mut transport = ScriptedTransport::new(vec![
+        (select_app_wire(), ok_response(&[])),
+        (select_ef_wire(EF_TOKEN_INFO_FID), ok_response(&[])),
+        (
+            read_wire(0, READ_CHUNK_LEN),
+            response(&[], StatusWord::EndOfFile),
+        ),
+        (read_wire(0, READ_LE_256_LEN), ok_response(&der)),
+    ]);
+
+    let info = transport
+        .read_token_info()
+        .expect("the full-window retry succeeds");
+    assert_eq!(info.version(), 1);
+    assert!(info.serial_number_hex().is_some());
+    transport.assert_drained();
+}
+
+#[test]
+fn document_number_reads_from_the_2025_personal_data_file() {
+    /// Synthetic printed document number: two letters and seven digits.
+    const PRINTED_NUMBER: &str = "AB1234567";
+    let number_len = u8::try_from(PRINTED_NUMBER.len()).expect("the value fits one read");
+
+    let mut transport = ScriptedTransport::new(vec![
+        (
+            select_path_wire(&[
+                DF_ESTONIAN_PERSONAL_DATA_FID,
+                EF_ESTONIAN_DOCUMENT_NUMBER_FID,
+            ]),
+            ok_response(&[]),
+        ),
+        (
+            read_wire(0, number_len),
+            ok_response(PRINTED_NUMBER.as_bytes()),
+        ),
+    ]);
+
+    let number = transport
+        .read_document_number()
+        .expect("the document number reads");
+    assert_eq!(number.as_str(), PRINTED_NUMBER);
+    transport.assert_drained();
+}
+
+#[test]
+fn document_number_reads_from_the_legacy_tlv_file() {
+    /// Synthetic printed document number: two letters and seven digits.
+    const PRINTED_NUMBER: &str = "AB1234567";
+    let tag = u8::try_from(<refineid_ber::OctetString as BerTag>::TAG).expect("tag fits one octet");
+    let der = tlv(tag, PRINTED_NUMBER.as_bytes()).expect("fixture encodes");
+
+    let mut transport = ScriptedTransport::new(vec![
+        (
+            select_path_wire(&[
+                DF_ESTONIAN_PERSONAL_DATA_FID,
+                EF_ESTONIAN_DOCUMENT_NUMBER_FID,
+            ]),
+            response(&[], StatusWord::FileNotFound),
+        ),
+        (select_any_by_fid_wire(FileId::MF), ok_response(&[])),
+        (
+            select_ef_wire(EF_ESTONIAN_DOCUMENT_NUMBER_LEGACY_FID),
+            ok_response(&[]),
+        ),
+        (read_wire(0, READ_CHUNK_LEN), ok_response(&der)),
+    ]);
+
+    let number = transport
+        .read_document_number()
+        .expect("the document number reads");
+    assert_eq!(number.as_str(), PRINTED_NUMBER);
+    transport.assert_drained();
+}
+
+#[test]
+fn a_card_without_a_document_number_file_reports_the_missing_file() {
+    let mut transport = ScriptedTransport::new(vec![
+        (
+            select_path_wire(&[
+                DF_ESTONIAN_PERSONAL_DATA_FID,
+                EF_ESTONIAN_DOCUMENT_NUMBER_FID,
+            ]),
+            response(&[], StatusWord::FileNotFound),
+        ),
+        (select_any_by_fid_wire(FileId::MF), ok_response(&[])),
+        (
+            select_ef_wire(EF_ESTONIAN_DOCUMENT_NUMBER_LEGACY_FID),
+            response(&[], StatusWord::FileNotFound),
+        ),
+        (
+            select_any_by_fid_wire(EF_ESTONIAN_DOCUMENT_NUMBER_LEGACY_FID),
+            response(&[], StatusWord::FileNotFound),
+        ),
+    ]);
+
+    let error = transport
+        .read_document_number()
+        .expect_err("a card without either document-number file must report the missing file");
+    assert!(matches!(
+        error,
+        Pkcs15Error::Status(StatusWord::FileNotFound)
+    ));
     transport.assert_drained();
 }
 

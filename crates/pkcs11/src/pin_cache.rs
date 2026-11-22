@@ -548,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn an_estonian_pristine_three_keeps_the_held_pin1() {
+    fn an_estonian_pristine_counter_keeps_the_held_pin1() {
         let mut cache = cache();
         cache.set_scheme(refineid_auth::PinReferenceScheme::Estonian);
         cache
@@ -556,7 +556,11 @@ mod tests {
             .expect("a fresh PIN1 is not a rejected one");
         assert!(
             cache
-                .checkout_pin1(&serial(CARD_A_SERIAL), READER_EVENTS, remaining(3))
+                .checkout_pin1(
+                    &serial(CARD_A_SERIAL),
+                    READER_EVENTS,
+                    remaining(refineid_auth::PinReferenceScheme::Estonian.pin_retry_limit()),
+                )
                 .is_some()
         );
     }

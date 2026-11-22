@@ -1037,8 +1037,8 @@ impl TokenObjects {
         match attr {
             CKA_CLASS => Some(ulong_attr(CKO_PUBLIC_KEY)),
             CKA_KEY_TYPE => Some(ulong_attr(self.key_material.key_type())),
-            CKA_TOKEN | CKA_VERIFY => Some(bool_attr(CK_TRUE)),
-            CKA_PRIVATE | CKA_ENCRYPT | CKA_WRAP | CKA_DERIVE | CKA_LOCAL | CKA_VERIFY_RECOVER => {
+            CKA_TOKEN | CKA_VERIFY | CKA_LOCAL => Some(bool_attr(CK_TRUE)),
+            CKA_PRIVATE | CKA_ENCRYPT | CKA_WRAP | CKA_DERIVE | CKA_VERIFY_RECOVER => {
                 Some(bool_attr(CK_FALSE))
             }
             CKA_LABEL => Some(AttrValue::Borrowed(self.auth_cert_label.as_bytes())),
@@ -1092,13 +1092,15 @@ impl TokenObjects {
                 KeyGate::Login => CK_TRUE,
                 KeyGate::Device => CK_FALSE,
             })),
-            CKA_TOKEN | CKA_SIGN | CKA_SENSITIVE | CKA_NEVER_EXTRACTABLE | CKA_ALWAYS_SENSITIVE => {
-                Some(bool_attr(CK_TRUE))
-            }
+            CKA_TOKEN
+            | CKA_SIGN
+            | CKA_SENSITIVE
+            | CKA_NEVER_EXTRACTABLE
+            | CKA_ALWAYS_SENSITIVE
+            | CKA_LOCAL => Some(bool_attr(CK_TRUE)),
             CKA_ALWAYS_AUTHENTICATE
             | CKA_DECRYPT
             | CKA_EXTRACTABLE
-            | CKA_LOCAL
             | CKA_SIGN_RECOVER
             | CKA_UNWRAP
             | CKA_DERIVE => Some(bool_attr(CK_FALSE)),
@@ -2492,11 +2494,11 @@ mod tests {
     }
 
     /// Optional key attributes are answered explicitly, including the
-    /// operations this token does not perform and the fact that the
-    /// module did not generate the key pair itself.
+    /// operations this token does not perform and the key pair's on-card
+    /// generation.
     #[test]
     fn key_locality_and_unused_usages_are_answered() {
-        use crate::ck::{CK_FALSE, CKA_DECRYPT, CKA_LOCAL, CKA_VERIFY_RECOVER};
+        use crate::ck::{CK_FALSE, CK_TRUE, CKA_DECRYPT, CKA_LOCAL, CKA_VERIFY_RECOVER};
 
         const TEST_CERT_DER: &[u8] =
             include_bytes!("../test-certs/fineid-intermediate-01-citizen-g4e.der");
@@ -2514,9 +2516,9 @@ mod tests {
             value(ObjectKind::PublicKey, CKA_VERIFY_RECOVER),
             vec![CK_FALSE]
         );
-        assert_eq!(value(ObjectKind::PublicKey, CKA_LOCAL), vec![CK_FALSE]);
+        assert_eq!(value(ObjectKind::PublicKey, CKA_LOCAL), vec![CK_TRUE]);
         assert_eq!(value(ObjectKind::PrivateKey, CKA_DECRYPT), vec![CK_FALSE]);
-        assert_eq!(value(ObjectKind::PrivateKey, CKA_LOCAL), vec![CK_FALSE]);
+        assert_eq!(value(ObjectKind::PrivateKey, CKA_LOCAL), vec![CK_TRUE]);
     }
 
     /// The profile object is a constant of the module: a public,

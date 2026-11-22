@@ -1445,6 +1445,28 @@ fn persist_ca_cert(cert: &OwnedCert) {
     }
 }
 
+/// Select the certificates that link the leaf to a root through their
+/// issuer and subject names, in chain order. Cached CAs belong to the
+/// user profile rather than to one card, so a card must not receive
+/// certificates from another card's chain.
+fn ca_chain_for_leaf(leaf: &OwnedCert, candidates: &[OwnedCert]) -> Vec<OwnedCert> {
+    let mut chain = Vec::new();
+    let mut issuer = leaf.view().issuer.as_der().to_vec();
+    for _ in 0..MAX_CA_CERTS {
+        let Some(cert) = candidates.iter().find(|cert| {
+            cert.view().subject.as_der() == issuer.as_slice()
+                && !chain
+                    .iter()
+                    .any(|chosen: &OwnedCert| chosen.as_der() == cert.as_der())
+        }) else {
+            break;
+        };
+        issuer = cert.view().issuer.as_der().to_vec();
+        chain.push(cert.clone());
+    }
+    chain
+}
+
 /// Attempt to read and parse an optional CA certificate from a card slot.
 ///
 /// Returns `Some(OwnedCert)` when the slot is populated on the card profile
@@ -1539,7 +1561,7 @@ pub(super) fn build_token_objects(reader: &ReaderId) -> Result<TokenObjects, CkR
     }
     drop(card);
 
-    for ca in cas {
+    for ca in ca_chain_for_leaf(&objects.auth_cert, &cas) {
         objects.push_ca_cert(ca);
     }
     Ok(objects)
@@ -1931,7 +1953,8 @@ pub(super) fn remote_token_objects(
     let mut objects = TokenObjects::from_cert_der(certificate.as_der().to_vec(), KeyGate::Device)?;
     objects.remote_key()?;
     objects.set_token_serial(pair_id.token_serial());
-    for ca in load_persisted_ca_certs() {
+    let cas = load_persisted_ca_certs();
+    for ca in ca_chain_for_leaf(&objects.auth_cert, &cas) {
         objects.push_ca_cert(ca);
     }
     Ok(objects)
@@ -2712,6 +2735,21 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn only_the_leafs_issuing_chain_is_selected() {
+        const LEAF_DER: &[u8] =
+            include_bytes!("../test-certs/fineid-intermediate-01-citizen-g4e.der");
+        const ROOT_DER: &[u8] = include_bytes!("../test-certs/dvv-gov-root-ca-g3-ecc.der");
+        const UNRELATED_DER: &[u8] = include_bytes!("../test-certs/dvv-gov-root-ca-g3-rsa.der");
+        let leaf = OwnedCert::from_der(LEAF_DER).expect("valid leaf");
+        let root = OwnedCert::from_der(ROOT_DER).expect("valid root");
+        let unrelated = OwnedCert::from_der(UNRELATED_DER).expect("valid unrelated CA");
+
+        let chain = super::ca_chain_for_leaf(&leaf, &[unrelated, root.clone()]);
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].as_der(), root.as_der());
     }
 
     #[test]

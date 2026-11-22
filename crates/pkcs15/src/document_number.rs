@@ -47,8 +47,9 @@ const LETTER_PREFIX_CHARS: usize = 2;
 ///
 /// The printed number names the plastic: two uppercase ASCII letters
 /// followed by seven ASCII digits (GED24035, section 9, PD7). A value
-/// exists only as the result of [`DocumentNumber::parse`], so the shape
-/// is checked once at the card border and downstream code may quote it.
+/// exists only as the result of [`DocumentNumber::parse_tlv`] or
+/// [`DocumentNumber::from_ascii`], so the shape is checked once at the
+/// card border and downstream code may quote it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentNumber(String);
 

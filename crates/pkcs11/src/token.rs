@@ -274,46 +274,66 @@ impl AttrValue<'_> {
     }
 }
 
-/// Shortest personal code the card families print into the subject
-/// common name.
-const PERSONAL_CODE_MIN_CHARS: usize = 6;
-/// Longest personal code the card families print into the subject
-/// common name.
-const PERSONAL_CODE_MAX_CHARS: usize = 20;
+/// Length of the Estonian isikukood: eleven ASCII digits.
+const ISIKUKOOD_CHARS: usize = 11;
+/// Length of the Finnish SATU/PEUIN: eight digits and a check character.
+const PEUIN_CHARS: usize = 9;
+/// Digits the Finnish SATU/PEUIN carries before its check character.
+const PEUIN_DIGITS: usize = 8;
+/// Prefix ETSI EN 319 412-1 section 5.1.3 gives a natural person's
+/// `serialNumber`: `PNO` (personal number), the ISO 3166-1 country code
+/// `EE`, and a hyphen (NAT-5.1.3-02, NAT-5.1.3-03).
+const SERIAL_NUMBER_PREFIX_ESTONIA: &str = "PNOEE-";
 
 /// The holder's personal code, as the certificate subject states it.
 ///
 /// A value exists only as the result of
+/// [`PersonalCode::from_serial_number`] or
 /// [`PersonalCode::from_subject_common_name`], so the predicate is
 /// checked once at the certificate border.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PersonalCode(String);
 
 impl PersonalCode {
-    /// Take the last identifier of the subject common name.
+    /// Take the code from the subject `serialNumber` attribute, the
+    /// authoritative carrier: Estonian certificates write `PNOEE-` and
+    /// the eleven-digit isikukood, Finnish certificates write the
+    /// nine-character SATU/PEUIN directly. Returns `None` for any other
+    /// shape, so the common name remains the fallback.
+    fn from_serial_number(value: &str) -> Option<Self> {
+        let code = value
+            .strip_prefix(SERIAL_NUMBER_PREFIX_ESTONIA)
+            .unwrap_or(value);
+        Self::from_code(code)
+    }
+
+    /// Take the last identifier of the subject common name, for a
+    /// certificate whose `serialNumber` carries no holder code.
     ///
-    /// Both card families end the common name with the holder's
-    /// personal code: the Estonian form separates surname, given names
-    /// and code with commas (`SN,GN,CODE`, GED24035 section 9), the
-    /// FINEID form uses spaces (`SN GN CODE`, DVV S1 v4.0); its code is
-    /// the SATU/PEUIN (eight digits and a check character), not the
-    /// eleven-character HETU. Returns `None` when the last segment is
-    /// not an alphanumeric identifier
-    /// carrying at least one digit, so a common name without a code
-    /// keeps the name as its label.
+    /// The Estonian form separates surname, given names and code with
+    /// commas (`SN,GN,CODE`, GED24035 section 9); the FINEID form uses
+    /// spaces (`SN GN CODE`, DVV S1 v4.0). Its code is the SATU/PEUIN,
+    /// not the eleven-character HETU (PIC).
     fn from_subject_common_name(common_name: &str) -> Option<Self> {
-        let candidate = common_name.rsplit([',', ' ']).next()?;
-        let bytes = candidate.as_bytes();
-        if bytes.len() < PERSONAL_CODE_MIN_CHARS
-            || bytes.len() > PERSONAL_CODE_MAX_CHARS
-            || !bytes
-                .iter()
-                .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
-            || !bytes.iter().any(u8::is_ascii_digit)
-        {
-            return None;
-        }
-        Some(Self(candidate.to_owned()))
+        Self::from_code(common_name.rsplit([',', ' ']).next()?)
+    }
+
+    /// The two printed forms: eleven ASCII digits (Estonian isikukood)
+    /// or eight digits and an ASCII alphanumeric check character
+    /// (Finnish SATU/PEUIN).
+    fn from_code(code: &str) -> Option<Self> {
+        let bytes = code.as_bytes();
+        let isikukood = bytes.len() == ISIKUKOOD_CHARS && bytes.iter().all(u8::is_ascii_digit);
+        let peuin = match bytes.split_last() {
+            Some((check, digits)) => {
+                bytes.len() == PEUIN_CHARS
+                    && digits.len() == PEUIN_DIGITS
+                    && digits.iter().all(u8::is_ascii_digit)
+                    && check.is_ascii_alphanumeric()
+            }
+            None => false,
+        };
+        (isikukood || peuin).then(|| Self(code.to_owned()))
     }
 
     /// The code as the subject writes it.
@@ -338,8 +358,12 @@ pub struct CaObject {
     der_md5: Md5,
 }
 
-fn extract_common_name(name: &Name<'_>) -> Option<String> {
-    const OID_COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
+/// `commonName` OID (X.520, 2.5.4.3).
+const OID_COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
+/// `serialNumber` OID (X.520, 2.5.4.5).
+const OID_SERIAL_NUMBER: &[u8] = &[0x55, 0x04, 0x05];
+
+fn extract_dn_attribute(name: &Name<'_>, wanted_oid: &[u8]) -> Option<String> {
     use spki::der::asn1::AnyRef;
     use spki::der::{Decode as _, Reader as _, SliceReader, Tag, Tagged as _};
 
@@ -362,7 +386,7 @@ fn extract_common_name(name: &Name<'_>) -> Option<String> {
             let mut fields = SliceReader::new(atv.value()).ok()?;
             let oid = AnyRef::from_der(fields.tlv_bytes().ok()?).ok()?;
             let val = AnyRef::from_der(fields.tlv_bytes().ok()?).ok()?;
-            if oid.tag() == Tag::ObjectIdentifier && oid.value() == OID_COMMON_NAME {
+            if oid.tag() == Tag::ObjectIdentifier && oid.value() == wanted_oid {
                 match val.tag() {
                     Tag::Utf8String => {
                         return core::str::from_utf8(val.value()).ok().map(String::from);
@@ -380,6 +404,10 @@ fn extract_common_name(name: &Name<'_>) -> Option<String> {
         }
     }
     None
+}
+
+fn extract_common_name(name: &Name<'_>) -> Option<String> {
+    extract_dn_attribute(name, OID_COMMON_NAME)
 }
 
 impl CaObject {
@@ -798,10 +826,16 @@ impl TokenObjects {
         let view = auth_cert.view();
         let key_material = TokenKeyMaterial::extract(&view.spki)?;
         let auth_cert_id = Sha1::of(view.spki.as_der());
+        let serial_number = extract_dn_attribute(&view.subject, OID_SERIAL_NUMBER);
         let common_name = extract_common_name(&view.subject);
-        let personal_code = common_name
+        let personal_code = serial_number
             .as_deref()
-            .and_then(PersonalCode::from_subject_common_name);
+            .and_then(PersonalCode::from_serial_number)
+            .or_else(|| {
+                common_name
+                    .as_deref()
+                    .and_then(PersonalCode::from_subject_common_name)
+            });
         let auth_cert_label = personal_code.map_or_else(
             || common_name.unwrap_or_else(|| DEFAULT_LABEL.to_owned()),
             PersonalCode::into_string,
@@ -2400,11 +2434,39 @@ mod personal_code_tests {
         for (common_name, expected) in [
             ("TESTI,MATTI TAPIO,39901010000", "39901010000"),
             ("TESTI MATTI TAPIO 12345678X", "12345678X"),
-            ("TESTI MATTI 140378-71J", "140378-71J"),
         ] {
             let code = PersonalCode::from_subject_common_name(common_name)
                 .unwrap_or_else(|| panic!("{common_name:?} names a code"));
             assert_eq!(code.into_string(), expected);
+        }
+    }
+
+    #[test]
+    fn the_serial_number_carries_the_code_and_the_estonian_prefix_is_stripped() {
+        for (value, expected) in [
+            ("PNOEE-39901010000", "39901010000"),
+            ("12345678X", "12345678X"),
+        ] {
+            let code = PersonalCode::from_serial_number(value)
+                .unwrap_or_else(|| panic!("{value:?} names a code"));
+            assert_eq!(code.into_string(), expected);
+        }
+    }
+
+    #[test]
+    fn a_serial_number_without_a_holder_code_shape_is_refused() {
+        for value in [
+            "PNOEE-3990101000",
+            "PNOEE-39901010000X",
+            "1234567",
+            "12345678!",
+            "123456789012",
+            "",
+        ] {
+            assert!(
+                PersonalCode::from_serial_number(value).is_none(),
+                "{value:?} must not parse as a personal code"
+            );
         }
     }
 
@@ -2414,6 +2476,8 @@ mod personal_code_tests {
             "TESTI MATTI",
             "ACME OY 2024",
             "TESTI,MATTI,12345",
+            "TESTI,MATTI,123456",
+            "TESTI MATTI 140378-71J",
             "TESTI MATTI 123456789012345678901",
             "TESTI MATTI 1234567!",
         ] {

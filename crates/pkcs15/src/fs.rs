@@ -203,6 +203,9 @@ impl CertSlot {
 /// reads never fragment. Cards that honor less answer short reads or
 /// wrong-Le, which the read loops and the transport already absorb.
 const READ_CHUNK: u8 = 0xDF;
+/// `Le = 0` asks for the full 256-byte short-response window; some cards
+/// answer a shorter request over a small EF with end-of-file and no data.
+const READ_LE_256: u8 = 0x00;
 
 /// Hard cap on one object read. FINEID certificates are under two
 /// kibibytes; a sixteen-kibibyte ceiling leaves room for variants while
@@ -574,7 +577,14 @@ pub trait Pkcs15Ops: CardTransport {
                 .ok_or(Pkcs15Error::TooLarge)?;
             let want_usize = remaining.min(usize::from(READ_CHUNK));
             let want = u8::try_from(want_usize).map_err(|_| Pkcs15Error::TooLarge)?;
-            let response = read_chunk(self, collected.len(), want)?;
+            let mut response = read_chunk(self, collected.len(), want)?;
+            if collected.is_empty()
+                && total_length.is_none()
+                && response.body.is_empty()
+                && matches!(response.status_word(), StatusWord::EndOfFile)
+            {
+                response = read_chunk(self, collected.len(), READ_LE_256)?;
+            }
             let end_of_file = matches!(response.status_word(), StatusWord::EndOfFile);
             if !response.is_ok() && !end_of_file {
                 return Err(Pkcs15Error::Status(response.status_word()));

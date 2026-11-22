@@ -31,6 +31,9 @@ use refineid_pkcs15::{
 /// Chunk size the read loops request, mirroring the implementation; a
 /// change there must fail these scripts loudly.
 const READ_CHUNK_LEN: u8 = 0xDF;
+/// `Le = 0`, the full 256-byte short-response window used when a card
+/// answers a shorter first read with end-of-file.
+const READ_LE_256_LEN: u8 = 0x00;
 /// Certificate content length that forces a two-chunk read.
 const TWO_CHUNK_CONTENT_LEN: usize = 300;
 /// Surplus bytes past the requested chunk a T=0 61xx chain may
@@ -391,6 +394,41 @@ fn token_info_reads_and_parses() {
             .expect("fixture carries a serial"),
     );
     assert_eq!(serial, "DEMO0001AB1234567");
+    transport.assert_drained();
+}
+
+#[test]
+fn token_info_reads_after_end_of_file_on_a_long_read() {
+    let mut inner = refineid_ber::BerEncoder::default();
+    inner
+        .push_tlv(
+            u8::try_from(<refineid_ber::Integer as BerTag>::TAG).expect("fits"),
+            [1_u8],
+        )
+        .expect("fixture encodes");
+    inner
+        .push_tlv(
+            u8::try_from(<refineid_ber::OctetString as BerTag>::TAG).expect("fits"),
+            b"DEMO0001AB1234567".as_slice(),
+        )
+        .expect("fixture encodes");
+    let der = tlv(sequence_tag(), inner.finish()).expect("fixture encodes");
+
+    let mut transport = ScriptedTransport::new(vec![
+        (select_app_wire(), ok_response(&[])),
+        (select_ef_wire(EF_TOKEN_INFO_FID), ok_response(&[])),
+        (
+            read_wire(0, READ_CHUNK_LEN),
+            response(&[], StatusWord::EndOfFile),
+        ),
+        (read_wire(0, READ_LE_256_LEN), ok_response(&der)),
+    ]);
+
+    let info = transport
+        .read_token_info()
+        .expect("the full-window retry succeeds");
+    assert_eq!(info.version(), 1);
+    assert!(info.serial_number_hex().is_some());
     transport.assert_drained();
 }
 

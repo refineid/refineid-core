@@ -617,12 +617,15 @@ const TOKEN_MODEL_ESTONIAN: &str = "ESTeID";
 /// `serial` is the identifier the card body prints: the Estonian
 /// document number from EF.D003, or the FINEID serial EF.TokenInfo
 /// reports, trimmed to its printed form. The model names the card
-/// family: FINEID for the Finnish cards, ESTeID for the Estonian
-/// profile. The
-/// manufacturer names this software, `RefineID`: `C_GetInfo`
-/// carries the module identity in principle, but `p11-kit-proxy`
-/// masks it with its own, so the token manufacturer is the only
-/// producer hint that reaches proxy consumers.
+/// application family: FINEID for the Finnish cards, ESTeID for the
+/// Estonian profile; the chip platform below it is not a PKCS#11
+/// field. The manufacturer names this software, `RefineID`: the token
+/// is the logical device this module presents, and the card's own
+/// EF.TokenInfo `manufacturerID` carries the card application name
+/// ("ESTeID"), not a hardware vendor. `C_GetInfo` carries the library
+/// manufacturer in principle, but `p11-kit-proxy` masks it with its
+/// own, so the token manufacturer is the producer hint that reaches
+/// proxy consumers.
 ///
 /// The login flags follow the token's [`KeyGate`], the same value
 /// that sets the private key's `CKA_PRIVATE`.

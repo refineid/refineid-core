@@ -76,18 +76,19 @@ use crate::ck::CKR_PIN_LEN_RANGE;
 use crate::ck::{
     CK_CERTIFICATE_CATEGORY_AUTHORITY, CK_CERTIFICATE_CATEGORY_TOKEN_USER, CK_FALSE, CK_TRUE,
     CKA_ALWAYS_AUTHENTICATE, CKA_ALWAYS_SENSITIVE, CKA_CERTIFICATE_CATEGORY, CKA_CERTIFICATE_TYPE,
-    CKA_CLASS, CKA_DERIVE, CKA_EC_PARAMS, CKA_EC_POINT, CKA_ENCRYPT, CKA_EXTRACTABLE, CKA_ID,
-    CKA_ISSUER, CKA_KEY_TYPE, CKA_LABEL, CKA_LOCAL, CKA_MODIFIABLE, CKA_MODULUS, CKA_MODULUS_BITS,
-    CKA_NEVER_EXTRACTABLE, CKA_NSS_CERT_MD5_HASH, CKA_NSS_CERT_SHA1_HASH,
+    CKA_CLASS, CKA_DECRYPT, CKA_DERIVE, CKA_EC_PARAMS, CKA_EC_POINT, CKA_ENCRYPT, CKA_EXTRACTABLE,
+    CKA_ID, CKA_ISSUER, CKA_KEY_TYPE, CKA_LABEL, CKA_LOCAL, CKA_MODIFIABLE, CKA_MODULUS,
+    CKA_MODULUS_BITS, CKA_NEVER_EXTRACTABLE, CKA_NSS_CERT_MD5_HASH, CKA_NSS_CERT_SHA1_HASH,
     CKA_NSS_TRUST_CLIENT_AUTH, CKA_NSS_TRUST_CODE_SIGNING, CKA_NSS_TRUST_EMAIL_PROTECTION,
     CKA_NSS_TRUST_SERVER_AUTH, CKA_NSS_TRUST_STEP_UP_APPROVED, CKA_PRIVATE, CKA_PROFILE_ID,
     CKA_PUBLIC_EXPONENT, CKA_SENSITIVE, CKA_SERIAL_NUMBER, CKA_SIGN, CKA_SIGN_RECOVER, CKA_SUBJECT,
-    CKA_TOKEN, CKA_TRUSTED, CKA_UNWRAP, CKA_VALUE, CKA_VERIFY, CKA_WRAP, CKC_X_509, CKK_EC,
-    CKK_RSA, CKO_CERTIFICATE, CKO_NSS_TRUST, CKO_PRIVATE_KEY, CKO_PROFILE, CKO_PUBLIC_KEY,
-    CKP_PUBLIC_CERTIFICATES_TOKEN, CKR_DATA_INVALID, CKR_DATA_LEN_RANGE, CKR_DEVICE_ERROR,
-    CKR_MECHANISM_INVALID, CKR_OK, CKR_PIN_INCORRECT, CKR_PIN_LOCKED, CKR_SIGNATURE_INVALID,
-    CKR_SIGNATURE_LEN_RANGE, CKR_USER_NOT_LOGGED_IN, CKT_NSS_MUST_VERIFY_TRUST,
-    CKT_NSS_TRUSTED_DELEGATOR, CkAttributeType, CkBbool, CkObjectHandle, CkRv, CkTrust, CkUlong,
+    CKA_TOKEN, CKA_TRUSTED, CKA_UNWRAP, CKA_VALUE, CKA_VERIFY, CKA_VERIFY_RECOVER, CKA_WRAP,
+    CKC_X_509, CKK_EC, CKK_RSA, CKO_CERTIFICATE, CKO_NSS_TRUST, CKO_PRIVATE_KEY, CKO_PROFILE,
+    CKO_PUBLIC_KEY, CKP_PUBLIC_CERTIFICATES_TOKEN, CKR_DATA_INVALID, CKR_DATA_LEN_RANGE,
+    CKR_DEVICE_ERROR, CKR_MECHANISM_INVALID, CKR_OK, CKR_PIN_INCORRECT, CKR_PIN_LOCKED,
+    CKR_SIGNATURE_INVALID, CKR_SIGNATURE_LEN_RANGE, CKR_USER_NOT_LOGGED_IN,
+    CKT_NSS_MUST_VERIFY_TRUST, CKT_NSS_TRUSTED_DELEGATOR, CkAttributeType, CkBbool, CkObjectHandle,
+    CkRv, CkTrust, CkUlong,
 };
 use crate::sign::{
     CardSignInput, DigestInfoHash, ECDSA_P384_SIGNATURE_BYTES, Mechanism, RSA3072_MODULUS_BITS,
@@ -982,7 +983,9 @@ impl TokenObjects {
             CKA_CLASS => Some(ulong_attr(CKO_PUBLIC_KEY)),
             CKA_KEY_TYPE => Some(ulong_attr(self.key_material.key_type())),
             CKA_TOKEN | CKA_VERIFY => Some(bool_attr(CK_TRUE)),
-            CKA_PRIVATE | CKA_ENCRYPT | CKA_WRAP | CKA_DERIVE => Some(bool_attr(CK_FALSE)),
+            CKA_PRIVATE | CKA_ENCRYPT | CKA_WRAP | CKA_DERIVE | CKA_LOCAL | CKA_VERIFY_RECOVER => {
+                Some(bool_attr(CK_FALSE))
+            }
             CKA_LABEL => Some(AttrValue::Borrowed(self.auth_cert_label.as_bytes())),
             CKA_ID => Some(AttrValue::Borrowed(self.auth_cert_id.as_bytes())),
             CKA_SUBJECT => {
@@ -1038,7 +1041,9 @@ impl TokenObjects {
                 Some(bool_attr(CK_TRUE))
             }
             CKA_ALWAYS_AUTHENTICATE
+            | CKA_DECRYPT
             | CKA_EXTRACTABLE
+            | CKA_LOCAL
             | CKA_SIGN_RECOVER
             | CKA_UNWRAP
             | CKA_DERIVE => Some(bool_attr(CK_FALSE)),
@@ -2385,6 +2390,34 @@ mod tests {
         assert_eq!(ObjectKind::PrivateKey.handle(), OBJ_PRIVATE_KEY);
         assert_eq!(ObjectKind::PublicKey.handle(), OBJ_PUBLIC_KEY);
         assert_eq!(ObjectKind::Profile.handle(), OBJ_PROFILE);
+    }
+
+    /// Optional key attributes are answered explicitly, including the
+    /// operations this token does not perform and the fact that the
+    /// module did not generate the key pair itself.
+    #[test]
+    fn key_locality_and_unused_usages_are_answered() {
+        use crate::ck::{CK_FALSE, CKA_DECRYPT, CKA_LOCAL, CKA_VERIFY_RECOVER};
+
+        const TEST_CERT_DER: &[u8] =
+            include_bytes!("../test-certs/fineid-intermediate-01-citizen-g4e.der");
+        let objects =
+            super::TokenObjects::from_cert_der(TEST_CERT_DER.to_vec(), super::KeyGate::Login)
+                .expect("token objects from cert der");
+        let value = |kind, attr| {
+            objects
+                .attribute(kind, attr)
+                .and_then(|value| value.as_bytes().map(<[u8]>::to_vec))
+                .expect("attribute present")
+        };
+
+        assert_eq!(
+            value(ObjectKind::PublicKey, CKA_VERIFY_RECOVER),
+            vec![CK_FALSE]
+        );
+        assert_eq!(value(ObjectKind::PublicKey, CKA_LOCAL), vec![CK_FALSE]);
+        assert_eq!(value(ObjectKind::PrivateKey, CKA_DECRYPT), vec![CK_FALSE]);
+        assert_eq!(value(ObjectKind::PrivateKey, CKA_LOCAL), vec![CK_FALSE]);
     }
 
     /// The profile object is a constant of the module: a public,

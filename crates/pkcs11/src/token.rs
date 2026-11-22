@@ -47,8 +47,8 @@ use refineid_apdu::CardTransport;
 #[cfg(feature = "pin-change")]
 use refineid_auth::PinManageOps as _;
 use refineid_auth::{
-    AuthError, FlooredCredential, PinOps as _, PinSlot, PinStatus, RetryFloorRefusal,
-    VerifyOutcome, check_retry_floor, pin1_status_permits_reusable_cache,
+    AuthError, FlooredCredential, PinOps as _, PinReferenceScheme, PinSlot, PinStatus,
+    RetryFloorRefusal, VerifyOutcome, check_retry_floor, pin1_status_permits_reusable_cache,
 };
 use refineid_cms::container::{EcdsaP384, RsaPkcs1Sha256, Signature};
 use refineid_cms::x509::{
@@ -628,6 +628,9 @@ pub struct TokenObjects {
     ca_store: RefinedTrustStore,
     /// What authenticates the holder before the key signs.
     key_gate: KeyGate,
+    /// The credential numbering the certificate path fixes, when it does;
+    /// `None` lets the card's counter-safe probe resolve it.
+    pin_scheme: Option<PinReferenceScheme>,
     /// Which raised token these objects belong to; its handles are
     /// offset by this many [`TOKEN_HANDLE_SPACE`]s.
     generation: CkObjectHandle,
@@ -756,6 +759,7 @@ impl TokenObjects {
             key_material,
             ca_store,
             key_gate,
+            pin_scheme: None,
             generation: 0,
         })
     }
@@ -795,6 +799,19 @@ impl TokenObjects {
     #[must_use]
     pub(crate) const fn key_gate(&self) -> KeyGate {
         self.key_gate
+    }
+
+    /// The credential numbering fixed by the certificate path, when the
+    /// path names it.
+    #[must_use]
+    pub(crate) const fn pin_scheme(&self) -> Option<PinReferenceScheme> {
+        self.pin_scheme
+    }
+
+    /// Fix the credential numbering for a card whose certificate path
+    /// identifies its profile.
+    pub(crate) fn set_pin_scheme(&mut self, scheme: PinReferenceScheme) {
+        self.pin_scheme = Some(scheme);
     }
 
     /// The rendered chip serial from EF.TokenInfo; empty when the
@@ -1473,14 +1490,23 @@ pub(super) fn build_token_objects(reader: &ReaderId) -> Result<TokenObjects, CkR
                 |printed| printed.as_str().to_owned(),
             )
         });
-    let cert = card
-        .read_certificate(CertSlot::Authentication)
-        .or_else(|_| card.read_certificate(CertSlot::AuthenticationAlt))
-        .or_else(|_| card.read_certificate(CertSlot::EstonianAuthentication))
-        .map_err(|_read_err| CKR_DEVICE_ERROR)?;
+    let (cert, pin_scheme) = if let Ok(cert) = card.read_certificate(CertSlot::Authentication) {
+        (cert, None)
+    } else if let Ok(cert) = card.read_certificate(CertSlot::AuthenticationAlt) {
+        (cert, None)
+    } else {
+        (
+            card.read_certificate(CertSlot::EstonianAuthentication)
+                .map_err(|_read_err| CKR_DEVICE_ERROR)?,
+            Some(PinReferenceScheme::Estonian),
+        )
+    };
 
     let mut cas = load_persisted_ca_certs();
     let mut objects = TokenObjects::from_cert_der(cert.as_bytes().to_vec(), KeyGate::Login)?;
+    if let Some(scheme) = pin_scheme {
+        objects.set_pin_scheme(scheme);
+    }
     if let Some(serial) = serial {
         objects.token_serial = serial;
     }
@@ -1524,7 +1550,17 @@ pub(super) fn build_token_objects(reader: &ReaderId) -> Result<TokenObjects, CkR
     clippy::redundant_pub_crate,
     reason = "private root module helper is used by sibling api module; plain pub would violate the public-surface typing grep"
 )]
+#[cfg(test)]
 pub(super) fn card_pin1_status(kind: &SlotKind) -> Result<PinStatus, CkRv> {
+    card_pin1_status_with_scheme(kind, None)
+}
+
+/// Probe the live PIN1 retry state under an explicit numbering when the
+/// certificate path fixed it, or let the card resolve it otherwise.
+pub(super) fn card_pin1_status_with_scheme(
+    kind: &SlotKind,
+    scheme: Option<PinReferenceScheme>,
+) -> Result<PinStatus, CkRv> {
     // A remote reader reports its own PIN1 state over an authenticated
     // pairing, and this computer has no card to ask. Reaching this arm
     // requires a host-admitted pairing, not a reader name.
@@ -1537,8 +1573,11 @@ pub(super) fn card_pin1_status(kind: &SlotKind) -> Result<PinStatus, CkRv> {
         .map_err(|_open_err| CKR_DEVICE_ERROR)?;
     card.select_pkcs15_application()
         .map_err(|_select_err| CKR_DEVICE_ERROR)?;
-    card.pin_status(PinSlot::Pin1)
-        .map_err(|_status_err| CKR_DEVICE_ERROR)
+    match scheme {
+        Some(scheme) => card.pin_status_with_scheme(scheme, PinSlot::Pin1),
+        None => card.pin_status(PinSlot::Pin1),
+    }
+    .map_err(|_status_err| CKR_DEVICE_ERROR)
 }
 
 /// Run a signature on the card of a local reader.
@@ -1573,11 +1612,24 @@ pub(super) fn card_pin1_status(kind: &SlotKind) -> Result<PinStatus, CkRv> {
     clippy::redundant_pub_crate,
     reason = "private root module helper is used by sibling api module; plain pub would violate the public-surface typing grep"
 )]
+#[cfg(test)]
 pub(super) fn card_sign(
     kind: &SlotKind,
     pin_cache: &Arc<Mutex<PinSafetyCache>>,
     mechanism: Mechanism,
     input: &[u8],
+) -> Result<Vec<u8>, CkRv> {
+    card_sign_with_scheme(kind, pin_cache, mechanism, input, None)
+}
+
+/// Run a signature under the credential numbering the token's certificate
+/// path fixed, when it did.
+pub(super) fn card_sign_with_scheme(
+    kind: &SlotKind,
+    pin_cache: &Arc<Mutex<PinSafetyCache>>,
+    mechanism: Mechanism,
+    input: &[u8],
+    scheme: Option<PinReferenceScheme>,
 ) -> Result<Vec<u8>, CkRv> {
     let request = CardSignInput::parse(mechanism, input)?;
     let backend = PcscBackend;
@@ -1601,7 +1653,7 @@ pub(super) fn card_sign(
         return Err(CKR_DEVICE_ERROR);
     };
     card.pin_sequence(|mut card| {
-        run_card_sign(
+        run_card_sign_with_scheme(
             &mut card,
             || {
                 backend
@@ -1609,6 +1661,7 @@ pub(super) fn card_sign(
                     .map_err(|_status_err| CKR_DEVICE_ERROR)
             },
             pin_cache,
+            scheme,
             request,
         )
     })
@@ -1616,10 +1669,26 @@ pub(super) fn card_sign(
     .map_err(|_transaction_err| CKR_DEVICE_ERROR)?
 }
 
+#[cfg(test)]
 fn run_card_sign<T, F>(
     card: &mut T,
     read_card_events: F,
     pin_cache: &Arc<Mutex<PinSafetyCache>>,
+    request: CardSignInput,
+) -> Result<Vec<u8>, CkRv>
+where
+    T: CardTransport,
+    T::Error: refineid_apdu::TransportErrorExt,
+    F: FnOnce() -> Result<u32, CkRv>,
+{
+    run_card_sign_with_scheme(card, read_card_events, pin_cache, None, request)
+}
+
+fn run_card_sign_with_scheme<T, F>(
+    card: &mut T,
+    read_card_events: F,
+    pin_cache: &Arc<Mutex<PinSafetyCache>>,
+    scheme: Option<PinReferenceScheme>,
     request: CardSignInput,
 ) -> Result<Vec<u8>, CkRv>
 where
@@ -1638,7 +1707,11 @@ where
             return Err(error);
         }
     };
-    let pin1_status = match card.pin_status(PinSlot::Pin1) {
+    let pin1_status = match scheme {
+        Some(scheme) => card.pin_status_with_scheme(scheme, PinSlot::Pin1),
+        None => card.pin_status(PinSlot::Pin1),
+    };
+    let pin1_status = match pin1_status {
         Ok(status) => status,
         Err(_status_err) => {
             clear_positive(pin_cache);
@@ -1678,7 +1751,10 @@ where
     let Ok(pin1) = refineid_auth::Pin1::reconstruct(secret) else {
         return Err(CKR_DEVICE_ERROR);
     };
-    let answer = card.verify_pin1(pin1);
+    let answer = match scheme {
+        Some(scheme) => card.verify_pin1_with_scheme(scheme, pin1),
+        None => card.verify_pin1(pin1),
+    };
     let accepted = checkout.settle_verify(
         &mut pin_cache
             .lock()
@@ -1880,10 +1956,22 @@ pub(super) fn remote_token_objects(
     clippy::redundant_pub_crate,
     reason = "private root module helper is used by sibling api module; plain pub would violate the public-surface typing grep"
 )]
+#[cfg(test)]
 pub(super) fn card_login(
     kind: &SlotKind,
     pin_cache: &Arc<Mutex<PinSafetyCache>>,
     pin1: PinBytes,
+) -> Result<(), CkRv> {
+    card_login_with_scheme(kind, pin_cache, pin1, None)
+}
+
+/// Log in under the credential numbering the token's certificate path
+/// fixed, when it did.
+pub(super) fn card_login_with_scheme(
+    kind: &SlotKind,
+    pin_cache: &Arc<Mutex<PinSafetyCache>>,
+    pin1: PinBytes,
+    scheme: Option<PinReferenceScheme>,
 ) -> Result<(), CkRv> {
     // Protected authentication path: the paired device verifies PIN1 in
     // its own protected storage, so there is no secret for this
@@ -1912,7 +2000,7 @@ pub(super) fn card_login(
         return Err(CKR_DEVICE_ERROR);
     };
     card.pin_sequence(|mut card| {
-        run_card_login(
+        run_card_login_with_scheme(
             &mut card,
             || {
                 backend
@@ -1921,6 +2009,7 @@ pub(super) fn card_login(
             },
             pin_cache,
             pin1,
+            scheme,
         )
     })
     .inspect_err(|_transaction_err| clear_positive(pin_cache))
@@ -1930,11 +2019,26 @@ pub(super) fn card_login(
 /// Run the card-session steps of [`card_login`] against `card` and
 /// `read_card_events`, destroying any held PIN1 when a pre-VERIFY read,
 /// the retry floor, or the VERIFY itself fails.
+#[cfg(test)]
 fn run_card_login<T, F>(
     card: &mut T,
     read_card_events: F,
     pin_cache: &Arc<Mutex<PinSafetyCache>>,
     pin1: PinBytes,
+) -> Result<(), CkRv>
+where
+    T: CardTransport,
+    F: FnOnce() -> Result<u32, CkRv>,
+{
+    run_card_login_with_scheme(card, read_card_events, pin_cache, pin1, None)
+}
+
+fn run_card_login_with_scheme<T, F>(
+    card: &mut T,
+    read_card_events: F,
+    pin_cache: &Arc<Mutex<PinSafetyCache>>,
+    pin1: PinBytes,
+    scheme: Option<PinReferenceScheme>,
 ) -> Result<(), CkRv>
 where
     T: CardTransport,
@@ -1951,7 +2055,11 @@ where
             return Err(error);
         }
     };
-    let pin1_status = match card.pin_status(PinSlot::Pin1) {
+    let pin1_status = match scheme {
+        Some(scheme) => card.pin_status_with_scheme(scheme, PinSlot::Pin1),
+        None => card.pin_status(PinSlot::Pin1),
+    };
+    let pin1_status = match pin1_status {
         Ok(status) => status,
         Err(_status_err) => {
             clear_positive(pin_cache);
@@ -1989,7 +2097,11 @@ where
         clear_positive(pin_cache);
         return Err(CKR_PIN_INCORRECT);
     };
-    let outcome = match card.verify_pin1(pin1_val) {
+    let outcome = match scheme {
+        Some(scheme) => card.verify_pin1_with_scheme(scheme, pin1_val),
+        None => card.verify_pin1(pin1_val),
+    };
+    let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(AuthError::RetryFloor(refusal)) => {
             clear_positive(pin_cache);

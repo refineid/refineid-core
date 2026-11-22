@@ -552,15 +552,19 @@ unsafe extern "C" fn c_get_token_info(slot_id: CkSlotId, info: CkTokenInfoPtr) -
     };
     let rv = if slot.card_present() {
         let kind = slot.kind().clone();
-        let (serial, key_gate) = match module.ensure_token(slot_id) {
-            Ok(objects) => (objects.token_serial().to_owned(), objects.key_gate()),
+        let (serial, key_gate, pin_scheme) = match module.ensure_token(slot_id) {
+            Ok(objects) => (
+                objects.token_serial().to_owned(),
+                objects.key_gate(),
+                objects.pin_scheme(),
+            ),
             Err(error) => {
                 diag!("C_GetTokenInfo slot={slot_id} ensure_token error={error:#06x}");
                 return error;
             }
         };
         drop(guard);
-        let pin1_status = match crate::token::card_pin1_status(&kind) {
+        let pin1_status = match crate::token::card_pin1_status_with_scheme(&kind, pin_scheme) {
             Ok(status) => status,
             Err(error) => {
                 diag!("C_GetTokenInfo slot={slot_id} auth_status error={error:#06x}");
@@ -990,12 +994,16 @@ unsafe extern "C" fn c_login(
     if let Err(_role_err) = pin1.validate_digits(PIN1_MIN_DIGITS, PIN1_MAX_DIGITS) {
         return CKR_PIN_LEN_RANGE;
     }
+    let pin_scheme = match module.ensure_token(slot_id) {
+        Ok(objects) => objects.pin_scheme(),
+        Err(error) => return error,
+    };
     let pin_cache = match module.pin_cache(slot_id) {
         Ok(cache) => cache,
         Err(error) => return error,
     };
     drop(guard);
-    let rv = match crate::token::card_login(&kind, &pin_cache, pin1) {
+    let rv = match crate::token::card_login_with_scheme(&kind, &pin_cache, pin1, pin_scheme) {
         Ok(()) => CKR_OK,
         Err(error) => error,
     };
@@ -1481,6 +1489,17 @@ unsafe extern "C" fn c_sign(
             return error;
         }
     };
+    let pin_scheme = if kind.is_remote() {
+        None
+    } else {
+        match module.ensure_token(slot_id) {
+            Ok(objects) => objects.pin_scheme(),
+            Err(error) => {
+                clear_sign(module, session);
+                return error;
+            }
+        }
+    };
     // A phone-served token signs with the key its certificate names;
     // the key is decided here, under the lock, from the cached objects.
     let remote_key = if kind.is_remote() {
@@ -1525,7 +1544,7 @@ unsafe extern "C" fn c_sign(
         },
         (SlotKind::Remote { .. }, None) => Err(CKR_DEVICE_ERROR),
         (SlotKind::Local { .. }, _) => {
-            crate::token::card_sign(&kind, &pin_cache, mechanism, &input)
+            crate::token::card_sign_with_scheme(&kind, &pin_cache, mechanism, &input, pin_scheme)
         }
     };
     let rv = match outcome {

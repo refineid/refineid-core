@@ -295,8 +295,10 @@ impl PersonalCode {
     /// Both card families end the common name with the holder's
     /// personal code: the Estonian form separates surname, given names
     /// and code with commas (`SN,GN,CODE`, GED24035 section 9), the
-    /// FINEID form uses spaces (`SN GN CODE`, DVV S1 v4.0). Returns
-    /// `None` when the last segment is not an alphanumeric identifier
+    /// FINEID form uses spaces (`SN GN CODE`, DVV S1 v4.0); its code is
+    /// the SATU/PEUIN (eight digits and a check character), not the
+    /// eleven-character HETU. Returns `None` when the last segment is
+    /// not an alphanumeric identifier
     /// carrying at least one digit, so a common name without a code
     /// keeps the name as its label.
     fn from_subject_common_name(common_name: &str) -> Option<Self> {

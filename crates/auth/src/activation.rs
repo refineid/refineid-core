@@ -138,6 +138,7 @@ impl ActivationScheme {
     ) -> Option<Self> {
         match numbering {
             PinReferenceScheme::Organizational => Some(Self::ActivationCodeIsPuk),
+            PinReferenceScheme::Estonian => None,
             PinReferenceScheme::Citizen => match auth_certificate_validity_start {
                 Some(not_before) if not_before >= DVV_PRESET_PIN_CUTOVER_EPOCH_SECONDS => {
                     Some(Self::PresetActivationPin)

@@ -14,7 +14,8 @@
 
 //! Slot / token / object model over PC/SC.
 //!
-//! A FINEID token exposes one profile object ([`ObjectKind::Profile`],
+//! A FINEID or Estonian eID token exposes one profile object
+//! ([`ObjectKind::Profile`],
 //! handle [`OBJ_PROFILE`]) declaring that its certificates are readable
 //! without a login, the authentication certificate
 //! ([`ObjectKind::Certificate`], handle [`OBJ_CERTIFICATE`]), its
@@ -1475,6 +1476,7 @@ pub(super) fn build_token_objects(reader: &ReaderId) -> Result<TokenObjects, CkR
     let cert = card
         .read_certificate(CertSlot::Authentication)
         .or_else(|_| card.read_certificate(CertSlot::AuthenticationAlt))
+        .or_else(|_| card.read_certificate(CertSlot::EstonianAuthentication))
         .map_err(|_read_err| CKR_DEVICE_ERROR)?;
 
     let mut cas = load_persisted_ca_certs();

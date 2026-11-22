@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! VERIFY PIN1 and PIN2 against a FINEID card.
+//! VERIFY PIN1 and PIN2 against a FINEID or Estonian eID card.
 //!
 //! On a citizen card the typed PIN digits are right-padded with the pad
 //! byte to the slot's stored length; on an organization card they travel
-//! bare at their typed length. Either way they are shipped as a
-//! credential command, consumed exactly once by the transport. Because `Pin1` and `Pin2` are
+//! bare at their typed length. The Estonian eID uses its own AOD
+//! references on the same padded twelve-byte block as a citizen card.
+//! Either way they are shipped as a credential command, consumed exactly
+//! once by the transport. Because `Pin1` and `Pin2` are
 //! validated at construction, no local re-check is needed and the slot
 //! is fixed by the argument type, so a PIN2 can never be sent to the
 //! PIN1 slot.
@@ -50,6 +52,14 @@ pub const PIN1_REFERENCE: u8 = 0x11;
 /// S1 v4.2 section 3.5.2).
 pub const PIN2_REFERENCE: u8 = 0x82;
 
+/// Estonian eID PIN1 reference, from the card's EF.AOD (GED24035, the
+/// Estonian eID developer guide, EF.AOD).
+pub const PIN1_REFERENCE_ESTONIAN: u8 = 0x81;
+/// Estonian eID PIN2 reference, from the card's EF.AOD.
+pub const PIN2_REFERENCE_ESTONIAN: u8 = 0x82;
+/// Estonian eID PUK reference, from the card's EF.AOD.
+pub const PUK_REFERENCE_ESTONIAN: u8 = 0x83;
+
 /// Organizational-card PIN1 reference: the PIN AUTH security-data-object
 /// identifier (FINEID S4-2 v4.0 section 4.2).
 pub const PIN1_REFERENCE_ORGANIZATIONAL: u8 = 0x03;
@@ -79,9 +89,10 @@ pub const PIN_STORED_LENGTH: usize = 12;
 /// of the typed digits.
 pub const FINEID_PAD_OCTET: u8 = 0x00;
 
-/// GED24035, the Estonian eID developer guide: the octet its VERIFY
-/// examples send.
-pub const ESTONIAN_EID_PAD_OCTET: u8 = 0xFF;
+/// The byte the Estonian eID card accepts to the right of typed digits.
+/// The card stores a twelve-byte credential block and accepts zero
+/// padding after a shorter value.
+pub const ESTONIAN_EID_PAD_OCTET: u8 = 0x00;
 
 /// The octet a card expects to the right of the typed digits in a
 /// credential block. Each profile names its own; no caller supplies a bare
@@ -124,7 +135,9 @@ impl PinSlot {
 ///
 /// Citizen cards number their credentials as FINEID S1 v4.2 section
 /// 3.5.2 reads; organizational cards number them by their FINEID S4-2
-/// v4.0 section 4.2 security-data-object identifiers instead. The S4-2
+/// v4.0 section 4.2 security-data-object identifiers instead. The
+/// Estonian eID numbers PIN1 by the reference its EF.AOD lists, over
+/// the same twelve-byte padded credential block as a citizen card. The S4-2
 /// v4.0 section 5.2 sample prints references that contradict the same
 /// document's section 4.2 tables and shipped cards, so the numbering is
 /// resolved by asking the card rather than trusting the sample; the
@@ -135,6 +148,8 @@ pub enum PinReferenceScheme {
     Citizen,
     /// FINEID S4-2 v4.0 numbering: the organizational cards.
     Organizational,
+    /// Estonian eID numbering: EF.AOD references on a padded block.
+    Estonian,
 }
 
 impl PinReferenceScheme {
@@ -146,6 +161,8 @@ impl PinReferenceScheme {
             (Self::Citizen, PinSlot::Pin2) => PIN2_REFERENCE,
             (Self::Organizational, PinSlot::Pin1) => PIN1_REFERENCE_ORGANIZATIONAL,
             (Self::Organizational, PinSlot::Pin2) => PIN2_REFERENCE_ORGANIZATIONAL,
+            (Self::Estonian, PinSlot::Pin1) => PIN1_REFERENCE_ESTONIAN,
+            (Self::Estonian, PinSlot::Pin2) => PIN2_REFERENCE_ESTONIAN,
         }
     }
 
@@ -155,6 +172,17 @@ impl PinReferenceScheme {
         match self {
             Self::Citizen => PUK_REFERENCE,
             Self::Organizational => PUK_REFERENCE_ORGANIZATIONAL,
+            Self::Estonian => PUK_REFERENCE_ESTONIAN,
+        }
+    }
+
+    /// The pad byte this numbering uses to fill a padded credential block.
+    #[must_use]
+    pub const fn pad(self) -> PinPadByte {
+        match self {
+            Self::Citizen => PinPadByte::FINEID,
+            Self::Organizational => PinPadByte::FINEID,
+            Self::Estonian => PinPadByte::ESTONIAN_EID,
         }
     }
 }
@@ -302,7 +330,7 @@ pub(crate) fn write_credential_blocks(
         let copy_len = group.len().min(PIN_STORED_LENGTH);
         out[total..total + copy_len].copy_from_slice(&group[..copy_len]);
         total += match scheme {
-            PinReferenceScheme::Citizen => PIN_STORED_LENGTH,
+            PinReferenceScheme::Citizen | PinReferenceScheme::Estonian => PIN_STORED_LENGTH,
             PinReferenceScheme::Organizational => copy_len,
         };
     }
@@ -392,7 +420,7 @@ pub(crate) fn verify_digits<T: CardTransport + ?Sized>(
         p1: VERIFY_P1,
         p2: scheme.reference(slot),
     };
-    let status = credential_exchange(transport, scheme, PinPadByte::FINEID, header, &[digits])?;
+    let status = credential_exchange(transport, scheme, scheme.pad(), header, &[digits])?;
     Ok(classify_verify_sw(status))
 }
 
@@ -481,8 +509,11 @@ pub trait PinOps: CardTransport {
         verify_under_floor(self, scheme, PinSlot::Pin2, status, pin.digits())
     }
 
-    /// Probe PIN1 retry state and resolve the card's credential numbering in a
-    /// single counter-safe probe when the card uses the citizen numbering.
+    /// Probe PIN1 retry state and resolve the card's credential numbering
+    /// with counter-safe probes. The citizen numbering is tried first;
+    /// when it is not found, the organizational numbering is tried, then
+    /// the Estonian eID numbering. A recognized state settles the
+    /// numbering without spending a retry.
     ///
     /// # Errors
     ///
@@ -500,23 +531,23 @@ pub trait PinOps: CardTransport {
         let organizational =
             self.probe_status_word(PinReferenceScheme::Organizational, PinSlot::Pin1)?;
         let status = classify_pin_status_sw(organizational);
-        match status {
-            PinStatus::Other(_) => {
-                Ok((PinReferenceScheme::Citizen, classify_pin_status_sw(citizen)))
-            }
-            PinStatus::Verified
-            | PinStatus::Remaining(_)
-            | PinStatus::NoInfo
-            | PinStatus::Locked => Ok((PinReferenceScheme::Organizational, status)),
+        if !matches!(status, PinStatus::Other(_)) {
+            return Ok((PinReferenceScheme::Organizational, status));
         }
+        let estonian = self.probe_status_word(PinReferenceScheme::Estonian, PinSlot::Pin1)?;
+        let estonian_status = classify_pin_status_sw(estonian);
+        if !matches!(estonian_status, PinStatus::Other(_)) {
+            return Ok((PinReferenceScheme::Estonian, estonian_status));
+        }
+        Ok((PinReferenceScheme::Citizen, classify_pin_status_sw(citizen)))
     }
 
     /// Resolve the card's credential numbering with a counter-safe
     /// probe. The citizen numbering is tried first; a
     /// reference-not-found answer re-probes under the organizational
-    /// numbering, and a recognized state there settles it as
-    /// organizational. Nothing but the card is trusted, and no counter
-    /// is touched.
+    /// numbering, then the Estonian eID numbering, and a recognized
+    /// state there settles it. Nothing but the card is trusted, and no
+    /// counter is touched.
     ///
     /// # Errors
     ///
@@ -889,6 +920,26 @@ mod tests {
     }
 
     #[test]
+    fn estonian_scheme_uses_the_aod_references_and_zero_pad() {
+        assert_eq!(
+            PinReferenceScheme::Estonian.reference(PinSlot::Pin1),
+            super::PIN1_REFERENCE_ESTONIAN
+        );
+        assert_eq!(
+            PinReferenceScheme::Estonian.reference(PinSlot::Pin2),
+            super::PIN2_REFERENCE_ESTONIAN
+        );
+        assert_eq!(
+            PinReferenceScheme::Estonian.puk_reference(),
+            super::PUK_REFERENCE_ESTONIAN
+        );
+        assert_eq!(
+            PinReferenceScheme::Estonian.pad().octet(),
+            super::ESTONIAN_EID_PAD_OCTET
+        );
+    }
+
+    #[test]
     fn citizen_block_pads_and_organizational_block_stays_typed_length() {
         let mut citizen = [PinPadByte::FINEID.octet(); CREDENTIAL_BODY_MAX];
         let citizen_total = write_credential_blocks(
@@ -1019,15 +1070,18 @@ mod profile_pad_tests {
     const TEST_PIN1: &[u8] = b"1234";
 
     #[test]
-    fn the_profiles_do_not_share_a_pad() {
-        assert!(PinPadByte::FINEID.octet() != PinPadByte::ESTONIAN_EID.octet());
+    fn the_estonian_profile_pads_with_zero() {
+        assert_eq!(
+            PinPadByte::ESTONIAN_EID.octet(),
+            super::ESTONIAN_EID_PAD_OCTET
+        );
     }
 
     #[test]
     fn an_estonian_block_pads_with_its_profile_byte() {
         let mut body = [PinPadByte::FINEID.octet(); CREDENTIAL_BODY_MAX];
         let total = write_credential_blocks(
-            PinReferenceScheme::Citizen,
+            PinReferenceScheme::Estonian,
             &[TEST_PIN1],
             PinPadByte::ESTONIAN_EID,
             &mut body,

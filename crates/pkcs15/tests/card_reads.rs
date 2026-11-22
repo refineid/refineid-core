@@ -24,7 +24,8 @@ use refineid_apdu::{
 };
 use refineid_ber::{BerTag, Sequence, tlv};
 use refineid_pkcs15::{
-    CertSlot, DF_ESIGN_FID, EF_TOKEN_INFO_FID, ESIGN_AID, PKCS15_AID, Pkcs15Error, Pkcs15Ops,
+    CertSlot, DF_ESIGN_FID, EF_ESTONIAN_AUTH_CERT_FID, EF_TOKEN_INFO_FID, ESIGN_AID, PKCS15_AID,
+    Pkcs15Error, Pkcs15Ops,
 };
 
 /// Chunk size the read loops request, mirroring the implementation; a
@@ -221,6 +222,31 @@ fn authentication_certificate_reads_across_chunks() {
         .read_certificate(CertSlot::Authentication)
         .expect("scripted read succeeds");
     assert_eq!(cert.as_bytes(), der.as_slice());
+    transport.assert_drained();
+}
+
+#[test]
+fn estonian_authentication_certificate_reads_from_ef_3411() {
+    let der = certificate_fixture(ONE_CHUNK_CONTENT_LEN);
+
+    let mut transport = ScriptedTransport::new(vec![
+        (select_app_wire(), ok_response(&[])),
+        (
+            select_ef_wire(CertSlot::EstonianAuthentication.fid()),
+            ok_response(&[]),
+        ),
+        (read_wire(0, READ_CHUNK_LEN), ok_response(&der)),
+    ]);
+
+    assert_eq!(
+        CertSlot::EstonianAuthentication.fid(),
+        EF_ESTONIAN_AUTH_CERT_FID
+    );
+    let cert = transport
+        .read_certificate(CertSlot::EstonianAuthentication)
+        .expect("scripted read succeeds");
+    assert_eq!(cert.as_bytes(), der.as_slice());
+    assert!(!CertSlot::EstonianAuthentication.requires_mf_traversal());
     transport.assert_drained();
 }
 

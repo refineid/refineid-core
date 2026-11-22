@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! PKCS#15 file-system access on the FINEID card.
+//! PKCS#15 file-system access on FINEID and Estonian eID cards.
 //!
 //! The operations layer on any [`CardTransport`]: a plain transport on
 //! the contact interface, or a secure-messaging transport once PACE has
@@ -61,6 +61,9 @@ pub const EF_AUTH_CERT_FID: FileId = FileId::from_u16(0x4331);
 pub const EF_SIGN_CERT_FID: FileId = FileId::from_u16(0x4332);
 /// EF.4333, the second authentication slot on dual-algorithm cards.
 pub const EF_AUTH_CERT_ALT_FID: FileId = FileId::from_u16(0x4333);
+/// EF.3411, the Estonian eID authentication certificate named by
+/// EF.CDF object 11 (GED24035, the Estonian eID developer guide).
+pub const EF_ESTONIAN_AUTH_CERT_FID: FileId = FileId::from_u16(0x3411);
 /// EF.4334, the on-card root CA certificate; lives directly under the
 /// MF.
 pub const EF_ROOT_CA_FID: FileId = FileId::from_u16(0x4334);
@@ -98,6 +101,9 @@ pub enum CertSlot {
     /// Second authentication slot (EF.4333); the algorithm is not fixed
     /// by the slot, so consumers parse the DER to see what is there.
     AuthenticationAlt,
+    /// Estonian eID authentication certificate (EF.3411). The card names
+    /// it through EF.CDF object 11 rather than the FINEID fixed path.
+    EstonianAuthentication,
     /// On-card copy of the issuing root CA (EF.4334); algorithm varies
     /// by card generation.
     RootCa,
@@ -118,6 +124,7 @@ impl CertSlot {
             Self::Authentication => EF_AUTH_CERT_FID,
             Self::Signature => EF_SIGN_CERT_FID,
             Self::AuthenticationAlt => EF_AUTH_CERT_ALT_FID,
+            Self::EstonianAuthentication => EF_ESTONIAN_AUTH_CERT_FID,
             Self::RootCa => EF_ROOT_CA_FID,
             Self::SignatureAlt => EF_SIGN_CERT_ALT_FID,
             Self::IssuingCaEcc => EF_ISSUING_CA_ECC_FID,
@@ -131,6 +138,7 @@ impl CertSlot {
             Self::Authentication => "authentication (EF.4331)",
             Self::Signature => "qualified signature (EF.4332)",
             Self::AuthenticationAlt => "authentication, alt slot (EF.4333)",
+            Self::EstonianAuthentication => "authentication (EF.3411)",
             Self::RootCa => "on-card issuing root CA (EF.4334)",
             Self::SignatureAlt => "qualified signature, alt slot (EF.4335)",
             Self::IssuingCaEcc => "issuing intermediate CA (EF.4336)",
@@ -144,7 +152,7 @@ impl CertSlot {
     /// signature directory, and the CA copies under the MF.
     const fn path(self) -> SlotPath {
         match self {
-            Self::Authentication => SlotPath::UnderPkcs15App,
+            Self::Authentication | Self::EstonianAuthentication => SlotPath::UnderPkcs15App,
             Self::Signature | Self::AuthenticationAlt | Self::SignatureAlt => {
                 SlotPath::UnderEsignDirectory
             }
@@ -167,10 +175,10 @@ impl CertSlot {
     }
 
     /// Number of slots [`CertSlot::all`] probes.
-    pub const PROBED_SLOTS: usize = 5;
+    pub const PROBED_SLOTS: usize = 6;
 
-    /// The certificate slots a FINEID card may publish, in directory
-    /// order. Callers probe each; an absent slot answers SELECT with
+    /// The certificate slots a card may publish, in directory order.
+    /// Callers probe each; an absent slot answers SELECT with
     /// [`StatusWord::FileNotFound`], which is "not provisioned", not an
     /// error.
     #[must_use]
@@ -179,6 +187,7 @@ impl CertSlot {
             Self::Authentication,
             Self::Signature,
             Self::AuthenticationAlt,
+            Self::EstonianAuthentication,
             Self::RootCa,
             Self::SignatureAlt,
         ]
@@ -656,11 +665,21 @@ pub trait Pkcs15Ops: CardTransport {
     where
         Self: Sized,
     {
-        self.select_pkcs15_application()?;
-        self.select_ef(crate::EF_AOD_FID)?;
-        let bytes = self.read_binary_to_end(None)?;
-        crate::AuthenticationObjects::parse(&bytes)
-            .map_err(|_parse_error| Pkcs15Error::InvalidData("EF.AOD"))
+        for fid in [crate::EF_AOD_FID, crate::EF_ESTONIAN_AOD_FID] {
+            if self.select_pkcs15_application().is_err() {
+                continue;
+            }
+            if self.select_ef(fid).is_err() {
+                continue;
+            }
+            let Ok(bytes) = self.read_binary_to_end(None) else {
+                continue;
+            };
+            if let Ok(objects) = crate::AuthenticationObjects::parse(&bytes) {
+                return Ok(objects);
+            }
+        }
+        Err(Pkcs15Error::InvalidData("EF.AOD"))
     }
 
     /// Read and parse EF.TokenInfo.

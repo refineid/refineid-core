@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Reviewed FINEID PIN role types and verification.
+//! Reviewed FINEID and Estonian eID PIN role types and verification.
 //!
 //! Values crossing a trust boundary are deconstructed, validated once, and
 //! reconstructed as types whose constructors preserve their invariants.
@@ -56,10 +56,11 @@ pub use retry_risk::{
     pin1_status_permits_reusable_cache,
 };
 pub use verify::{
-    AuthError, PIN_STORED_LENGTH, PIN1_REFERENCE, PIN1_REFERENCE_ORGANIZATIONAL, PIN2_REFERENCE,
-    PIN2_REFERENCE_ORGANIZATIONAL, PUK_REFERENCE, PUK_REFERENCE_ORGANIZATIONAL, PinOps, PinPadByte,
-    PinReferenceScheme, PinSlot, PinStatus, VerifyOutcome, classify_pin_status_sw,
-    classify_verify_sw,
+    AuthError, PIN_STORED_LENGTH, PIN1_REFERENCE, PIN1_REFERENCE_ESTONIAN,
+    PIN1_REFERENCE_ORGANIZATIONAL, PIN2_REFERENCE, PIN2_REFERENCE_ESTONIAN,
+    PIN2_REFERENCE_ORGANIZATIONAL, PUK_REFERENCE, PUK_REFERENCE_ESTONIAN,
+    PUK_REFERENCE_ORGANIZATIONAL, PinOps, PinPadByte, PinReferenceScheme, PinSlot, PinStatus,
+    VerifyOutcome, classify_pin_status_sw, classify_verify_sw,
 };
 
 #[cfg(test)]

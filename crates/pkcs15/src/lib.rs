@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! PKCS#15 file-system reads for FINEID cards.
+//! PKCS#15 file-system reads for FINEID and Estonian eID cards.
 //!
 //! The operations layer on any `refineid-apdu` transport as default
 //! trait methods and issue only replay-safe typed commands; certificate
@@ -26,13 +26,13 @@ pub mod token_info;
 pub mod token_serial;
 
 pub use aod::{
-    AuthenticationObjects, AuthenticationObjectsError, EF_AOD_FID, PasswordLengthRange,
-    PasswordObject,
+    AuthenticationObjects, AuthenticationObjectsError, EF_AOD_FID, EF_ESTONIAN_AOD_FID,
+    PasswordLengthRange, PasswordObject,
 };
 pub use fs::{
-    CertSlot, DF_ESIGN_FID, EF_AUTH_CERT_ALT_FID, EF_AUTH_CERT_FID, EF_ISSUING_CA_ECC_FID,
-    EF_ROOT_CA_FID, EF_SIGN_CERT_ALT_FID, EF_SIGN_CERT_FID, EF_TOKEN_INFO_FID, ESIGN_AID,
-    PKCS15_AID, Pkcs15Error, Pkcs15Ops,
+    CertSlot, DF_ESIGN_FID, EF_AUTH_CERT_ALT_FID, EF_AUTH_CERT_FID, EF_ESTONIAN_AUTH_CERT_FID,
+    EF_ISSUING_CA_ECC_FID, EF_ROOT_CA_FID, EF_SIGN_CERT_ALT_FID, EF_SIGN_CERT_FID,
+    EF_TOKEN_INFO_FID, ESIGN_AID, PKCS15_AID, Pkcs15Error, Pkcs15Ops,
 };
 pub use refineid_x509::UnvalidatedCertificate;
 pub use token_info::TokenInfo;

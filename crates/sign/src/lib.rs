@@ -111,7 +111,7 @@ impl From<PinReferenceScheme> for SignScheme {
     /// session resolved.
     fn from(numbering: PinReferenceScheme) -> Self {
         match numbering {
-            PinReferenceScheme::Citizen => Self::Citizen,
+            PinReferenceScheme::Citizen | PinReferenceScheme::Estonian => Self::Citizen,
             PinReferenceScheme::Organizational => Self::Organizational,
         }
     }

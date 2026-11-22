@@ -274,6 +274,52 @@ impl AttrValue<'_> {
     }
 }
 
+/// Shortest personal code the card families print into the subject
+/// common name.
+const PERSONAL_CODE_MIN_CHARS: usize = 6;
+/// Longest personal code the card families print into the subject
+/// common name.
+const PERSONAL_CODE_MAX_CHARS: usize = 20;
+
+/// The holder's personal code, as the certificate subject states it.
+///
+/// A value exists only as the result of
+/// [`PersonalCode::from_subject_common_name`], so the predicate is
+/// checked once at the certificate border.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersonalCode(String);
+
+impl PersonalCode {
+    /// Take the last identifier of the subject common name.
+    ///
+    /// Both card families end the common name with the holder's
+    /// personal code: the Estonian form separates surname, given names
+    /// and code with commas (`SN,GN,CODE`, GED24035 section 9), the
+    /// FINEID form uses spaces (`SN GN CODE`, DVV S1 v4.0). Returns
+    /// `None` when the last segment is not an alphanumeric identifier
+    /// carrying at least one digit, so a common name without a code
+    /// keeps the name as its label.
+    fn from_subject_common_name(common_name: &str) -> Option<Self> {
+        let candidate = common_name.rsplit([',', ' ']).next()?;
+        let bytes = candidate.as_bytes();
+        if bytes.len() < PERSONAL_CODE_MIN_CHARS
+            || bytes.len() > PERSONAL_CODE_MAX_CHARS
+            || !bytes
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+            || !bytes.iter().any(u8::is_ascii_digit)
+        {
+            return None;
+        }
+        Some(Self(candidate.to_owned()))
+    }
+
+    /// The code as the subject writes it.
+    fn into_string(self) -> String {
+        self.0
+    }
+}
+
 /// A parsed and verified CA certificate object on the token, with the
 /// digests of its DER that its NSS trust record carries.
 #[derive(Debug, Clone)]
@@ -612,7 +658,9 @@ pub struct TokenObjects {
     auth_cert: OwnedCert,
     /// [`CKA_ID`]: SHA-1 of the SPKI DER, shared by cert and key.
     auth_cert_id: Sha1,
-    /// Human-readable label for [`CKA_LABEL`] (common name, else [`DEFAULT_LABEL`]).
+    /// Human-readable label for [`CKA_LABEL`]: the holder's personal
+    /// code from the common name, else the common name, else
+    /// [`DEFAULT_LABEL`].
     auth_cert_label: String,
     /// Pre-encoded serial number DER INTEGER for the authentication certificate.
     auth_cert_serial_der: Vec<u8>,
@@ -748,8 +796,14 @@ impl TokenObjects {
         let view = auth_cert.view();
         let key_material = TokenKeyMaterial::extract(&view.spki)?;
         let auth_cert_id = Sha1::of(view.spki.as_der());
-        let auth_cert_label =
-            extract_common_name(&view.subject).unwrap_or_else(|| DEFAULT_LABEL.to_owned());
+        let common_name = extract_common_name(&view.subject);
+        let personal_code = common_name
+            .as_deref()
+            .and_then(PersonalCode::from_subject_common_name);
+        let auth_cert_label = personal_code.map_or_else(
+            || common_name.unwrap_or_else(|| DEFAULT_LABEL.to_owned()),
+            PersonalCode::into_string,
+        );
         let auth_cert_serial_der = der_integer(view.serial_der.as_bytes());
         let ca_store = RefinedTrustStore::default();
         Ok(Self {
@@ -2331,6 +2385,40 @@ pub(super) fn card_change_pin1(
         }
     })
     .map_err(|_transaction_err| CKR_DEVICE_ERROR)?
+}
+
+#[cfg(test)]
+mod personal_code_tests {
+    use super::PersonalCode;
+
+    #[test]
+    fn the_code_is_the_last_segment_of_the_common_name() {
+        for (common_name, expected) in [
+            ("TESTI,MATTI TAPIO,39901010000", "39901010000"),
+            ("TESTI MATTI TAPIO 12345678X", "12345678X"),
+            ("TESTI MATTI 140378-71J", "140378-71J"),
+        ] {
+            let code = PersonalCode::from_subject_common_name(common_name)
+                .unwrap_or_else(|| panic!("{common_name:?} names a code"));
+            assert_eq!(code.into_string(), expected);
+        }
+    }
+
+    #[test]
+    fn a_common_name_without_a_code_names_no_personal_code() {
+        for common_name in [
+            "TESTI MATTI",
+            "ACME OY 2024",
+            "TESTI,MATTI,12345",
+            "TESTI MATTI 123456789012345678901",
+            "TESTI MATTI 1234567!",
+        ] {
+            assert!(
+                PersonalCode::from_subject_common_name(common_name).is_none(),
+                "{common_name:?} must not parse as a personal code"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

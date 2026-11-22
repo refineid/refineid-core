@@ -75,9 +75,33 @@ pub const VERIFY_P1: u8 = 0x00;
 /// FINEID stored length for both PIN slots: the padded block length in
 /// bytes (FINEID S1 v4.2 section 3.5).
 pub const PIN_STORED_LENGTH: usize = 12;
-/// Padding byte applied to the right of the typed digits; FINEID cards
-/// reject any other padding value.
-pub const PIN_PAD_BYTE: u8 = 0x00;
+/// FINEID S1 v4.2 section 3.5: the octet the cards accept to the right
+/// of the typed digits.
+pub const FINEID_PAD_OCTET: u8 = 0x00;
+
+/// GED24035, the Estonian eID developer guide: the octet its VERIFY
+/// examples send.
+pub const ESTONIAN_EID_PAD_OCTET: u8 = 0xFF;
+
+/// The octet a card expects to the right of the typed digits in a
+/// credential block. Each profile names its own; no caller supplies a bare
+/// octet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinPadByte(u8);
+
+impl PinPadByte {
+    /// FINEID S1 v4.2 section 3.5.
+    pub const FINEID: Self = Self(FINEID_PAD_OCTET);
+
+    /// GED24035, the Estonian eID profile.
+    pub const ESTONIAN_EID: Self = Self(ESTONIAN_EID_PAD_OCTET);
+
+    /// The wire octet this profile fills with.
+    #[must_use]
+    pub const fn octet(self) -> u8 {
+        self.0
+    }
+}
 
 /// Which PIN slot a status probe targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,11 +290,13 @@ pub(crate) const CREDENTIAL_BODY_SCRATCH: usize = 2 * PIN_STORED_LENGTH;
 pub(crate) fn write_credential_blocks(
     scheme: PinReferenceScheme,
     groups: &[&[u8]],
+    pad: PinPadByte,
     out: &mut [u8; CREDENTIAL_BODY_MAX],
 ) -> usize {
     // The two stored-length blocks this assembles must fit the wire
     // credential body buffer the transport layer holds.
     const { assert!(CREDENTIAL_BODY_SCRATCH <= CREDENTIAL_BODY_MAX) };
+    out.fill(pad.octet());
     let mut total = 0;
     for group in groups {
         let copy_len = group.len().min(PIN_STORED_LENGTH);
@@ -294,15 +320,15 @@ pub(crate) fn write_credential_blocks(
 pub(crate) fn credential_exchange<T: CardTransport + ?Sized>(
     transport: &mut T,
     scheme: PinReferenceScheme,
+    pad: PinPadByte,
     header: CommandHeader,
     groups: &[&[u8]],
 ) -> Result<StatusWord, AuthError<T::Error>> {
     // The block owns the assembled credential octets in a zeroizing
-    // buffer. Pre-fill it with the pad byte so the citizen padding falls
-    // out of the untouched tail, as `write_credential_blocks` expects.
+    // buffer. The writer fills it with the profile's pad byte, so the
+    // padding falls out of the untouched tail.
     let mut block = UnvalidatedCredentialBlock::zeroed();
-    block.buffer().fill(PIN_PAD_BYTE);
-    let total = write_credential_blocks(scheme, groups, block.buffer());
+    let total = write_credential_blocks(scheme, groups, pad, block.buffer());
     block.set_filled(total);
     let body = match CredentialBody::from_block(block) {
         Ok(body) => body,
@@ -366,7 +392,7 @@ pub(crate) fn verify_digits<T: CardTransport + ?Sized>(
         p1: VERIFY_P1,
         p2: scheme.reference(slot),
     };
-    let status = credential_exchange(transport, scheme, header, &[digits])?;
+    let status = credential_exchange(transport, scheme, PinPadByte::FINEID, header, &[digits])?;
     Ok(classify_verify_sw(status))
 }
 
@@ -572,11 +598,10 @@ impl<T: CardTransport + ?Sized> PinOps for T {}
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthError, CREDENTIAL_BODY_MAX, CREDENTIAL_BODY_SCRATCH, PIN_PAD_BYTE, PIN_STORED_LENGTH,
-        PIN1_REFERENCE, PIN1_REFERENCE_ORGANIZATIONAL, PIN2_REFERENCE,
-        PIN2_REFERENCE_ORGANIZATIONAL, PinOps, PinReferenceScheme, PinSlot, PinStatus, VERIFY_INS,
-        VERIFY_P1, VerifyOutcome, classify_pin_status_sw, classify_verify_sw,
-        write_credential_blocks,
+        AuthError, CREDENTIAL_BODY_MAX, CREDENTIAL_BODY_SCRATCH, PIN_STORED_LENGTH, PIN1_REFERENCE,
+        PIN1_REFERENCE_ORGANIZATIONAL, PIN2_REFERENCE, PIN2_REFERENCE_ORGANIZATIONAL, PinOps,
+        PinPadByte, PinReferenceScheme, PinSlot, PinStatus, VERIFY_INS, VERIFY_P1, VerifyOutcome,
+        classify_pin_status_sw, classify_verify_sw, write_credential_blocks,
     };
     use crate::credentials::{PIN_MAX_LENGTH, Pin1, Pin2, UnvalidatedSecret};
     use crate::retry_risk::{FlooredCredential, RetryFloorRefusal};
@@ -702,7 +727,7 @@ mod tests {
         let mut expected = verify_header(PIN1_REFERENCE).to_vec();
         expected.push(PIN_STORED_LENGTH as u8);
         let mut block = WIRE_DIGITS.to_vec();
-        block.resize(PIN_STORED_LENGTH, PIN_PAD_BYTE);
+        block.resize(PIN_STORED_LENGTH, PinPadByte::FINEID.octet());
         expected.extend_from_slice(&block);
         assert_eq!(transport.credential.as_deref(), Some(expected.as_slice()));
         assert_eq!(
@@ -865,21 +890,26 @@ mod tests {
 
     #[test]
     fn citizen_block_pads_and_organizational_block_stays_typed_length() {
-        let mut citizen = [PIN_PAD_BYTE; CREDENTIAL_BODY_MAX];
-        let citizen_total =
-            write_credential_blocks(PinReferenceScheme::Citizen, &[b"1234"], &mut citizen);
+        let mut citizen = [PinPadByte::FINEID.octet(); CREDENTIAL_BODY_MAX];
+        let citizen_total = write_credential_blocks(
+            PinReferenceScheme::Citizen,
+            &[b"1234"],
+            PinPadByte::FINEID,
+            &mut citizen,
+        );
         assert_eq!(citizen_total, PIN_STORED_LENGTH);
         assert_eq!(&citizen[..PIN_FIXTURE_LEN], b"1234");
         assert!(
             citizen[PIN_FIXTURE_LEN..PIN_STORED_LENGTH]
                 .iter()
-                .all(|&byte| byte == PIN_PAD_BYTE)
+                .all(|&byte| byte == PinPadByte::FINEID.octet())
         );
 
-        let mut organizational = [PIN_PAD_BYTE; CREDENTIAL_BODY_MAX];
+        let mut organizational = [PinPadByte::FINEID.octet(); CREDENTIAL_BODY_MAX];
         let org_total = write_credential_blocks(
             PinReferenceScheme::Organizational,
             &[b"1234"],
+            PinPadByte::FINEID,
             &mut organizational,
         );
         assert_eq!(org_total, PIN_FIXTURE_LEN);
@@ -888,10 +918,11 @@ mod tests {
 
     #[test]
     fn a_two_block_citizen_body_pads_each_block_to_the_stored_length() {
-        let mut body = [PIN_PAD_BYTE; CREDENTIAL_BODY_MAX];
+        let mut body = [PinPadByte::FINEID.octet(); CREDENTIAL_BODY_MAX];
         let total = write_credential_blocks(
             PinReferenceScheme::Citizen,
             &[b"1234", b"567890"],
+            PinPadByte::FINEID,
             &mut body,
         );
         assert_eq!(total, CREDENTIAL_BODY_SCRATCH);
@@ -972,6 +1003,41 @@ mod tests {
         assert_eq!(
             classify_pin_status_sw(StatusWord::AuthenticationBlocked),
             PinStatus::Locked
+        );
+    }
+}
+
+#[cfg(test)]
+mod profile_pad_tests {
+    use super::{
+        CREDENTIAL_BODY_MAX, PIN_STORED_LENGTH, PinPadByte, PinReferenceScheme,
+        write_credential_blocks,
+    };
+
+    /// The PIN1 fixture these tests assemble into a block; a test value,
+    /// not a credential.
+    const TEST_PIN1: &[u8] = b"1234";
+
+    #[test]
+    fn the_profiles_do_not_share_a_pad() {
+        assert!(PinPadByte::FINEID.octet() != PinPadByte::ESTONIAN_EID.octet());
+    }
+
+    #[test]
+    fn an_estonian_block_pads_with_its_profile_byte() {
+        let mut body = [PinPadByte::FINEID.octet(); CREDENTIAL_BODY_MAX];
+        let total = write_credential_blocks(
+            PinReferenceScheme::Citizen,
+            &[TEST_PIN1],
+            PinPadByte::ESTONIAN_EID,
+            &mut body,
+        );
+        assert_eq!(total, PIN_STORED_LENGTH);
+        assert_eq!(&body[..TEST_PIN1.len()], TEST_PIN1);
+        assert!(
+            body[TEST_PIN1.len()..PIN_STORED_LENGTH]
+                .iter()
+                .all(|&byte| byte == PinPadByte::ESTONIAN_EID.octet())
         );
     }
 }

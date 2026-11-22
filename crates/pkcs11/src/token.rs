@@ -616,12 +616,13 @@ pub struct TokenObjects {
     auth_cert_label: String,
     /// Pre-encoded serial number DER INTEGER for the authentication certificate.
     auth_cert_serial_der: Vec<u8>,
-    /// Chip serial from PKCS#15 EF.TokenInfo: the plastic-printed
-    /// card identifier when [`derive_printed_serial`] recognises
-    /// the chip generation (the form a citizen can check against
-    /// the card body), else the full rendered serial via
-    /// [`render_token_serial`]; empty when the card reports none.
-    /// Reported in `CK_TOKEN_INFO.serialNumber`.
+    /// The identifier printed on the card body, reported in
+    /// `CK_TOKEN_INFO.serialNumber`: the Estonian document number
+    /// from EF.D003, or the plastic-printed serial
+    /// [`derive_printed_serial`] extracts from EF.TokenInfo (the
+    /// form a citizen can check against the card body), falling back
+    /// to the full rendered serial [`render_token_serial`] returns;
+    /// empty when the card reports none.
     token_serial: String,
     /// Key-type specific material extracted and validated from the SPKI.
     key_material: TokenKeyMaterial,
@@ -1486,12 +1487,14 @@ fn read_optional_ca_cert(card: &mut PcscCard, slot: CertSlot) -> Option<OwnedCer
 }
 
 /// Build the token objects for `reader_name`: open the card once,
-/// read EF.TokenInfo (chip serial, card label) and the
-/// authentication certificate via the PKCS#15 chain, drop the
-/// card, and parse.
+/// read EF.TokenInfo (chip serial, card label), the authentication
+/// certificate via the PKCS#15 chain, and the Estonian document
+/// number when the certificate fixes that profile, drop the card,
+/// and parse.
 ///
-/// A missing or unreadable EF.TokenInfo is tolerated (empty
-/// serial / label); the certificate read is mandatory.
+/// A missing or unreadable EF.TokenInfo or EF.D003 is tolerated (the
+/// serial falls back to the other source); the certificate read is
+/// mandatory.
 ///
 /// # Errors
 /// [`CKR_DEVICE_ERROR`] if the reader cannot be opened or the
@@ -1529,12 +1532,20 @@ pub(super) fn build_token_objects(reader: &ReaderId) -> Result<TokenObjects, CkR
         )
     };
 
+    let document_number = if pin_scheme == Some(PinReferenceScheme::Estonian) {
+        card.read_document_number().ok()
+    } else {
+        None
+    };
+
     let mut cas = load_persisted_ca_certs();
     let mut objects = TokenObjects::from_cert_der(cert.as_bytes().to_vec(), KeyGate::Login)?;
     if let Some(scheme) = pin_scheme {
         objects.set_pin_scheme(scheme);
     }
-    if let Some(serial) = serial {
+    if let Some(document_number) = &document_number {
+        objects.token_serial = document_number.as_str().to_owned();
+    } else if let Some(serial) = serial {
         objects.token_serial = serial;
     }
 

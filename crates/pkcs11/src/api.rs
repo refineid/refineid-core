@@ -183,12 +183,14 @@ fn padded_field<const N: usize>(text: &str) -> [CkUtf8Char; N] {
 
 /// Space-pad `text` into a fixed-width PKCS#11 field, keeping the
 /// TAIL when over-long. Used for the token serial: the normal case
-/// is the 9-char plastic-printed identifier (fits), but the
-/// fallback full chip serial (17-20 chars on unrecognised shapes)
-/// exceeds the 16-byte `CK_TOKEN_INFO.serialNumber` field, and the
-/// printed identifier is the SUFFIX, so dropping leading bytes
-/// preserves the identity a citizen can check against the card
-/// body; `OpenSC` truncates the same way.
+/// is the nine-character identifier printed on the card body (the
+/// FINEID card serial or the Estonian document number), which fits;
+/// the fallback full chip serial (17-20 chars on unrecognised shapes)
+/// exceeds the 16-byte `CK_TOKEN_INFO.serialNumber` field, and on
+/// those shapes the printed identifier is a SUFFIX of the chip
+/// serial, so dropping leading bytes preserves the identity a
+/// citizen can check against the card body; `OpenSC` truncates the
+/// same way.
 fn tail_padded_field<const N: usize>(text: &str) -> [CkUtf8Char; N] {
     let mut out = [b' '; N];
     let skip = text.len().saturating_sub(N);
@@ -583,46 +585,26 @@ unsafe extern "C" fn c_get_token_info(slot_id: CkSlotId, info: CkTokenInfoPtr) -
     rv
 }
 
-/// Fixed token label for the authentication (PIN1) token.
+/// Fixed token label for the authentication (PIN1) credential.
 ///
-/// This is what NSS puts verbatim in its PIN-prompt dialog ("Enter
-/// password for Basic PIN 1") and what keys the `pkcs11:token=`
-/// URI.  The label must name the *purpose / credential*, not the
-/// plastic: the card's own EF.TokenInfo carries "HENKILOKORTTI".
-/// When the qualified-signature (PIN2) slot lands it will carry
-/// "Signature PIN 2", and the label pair is what keeps a citizen
-/// from typing PIN2 into a PIN1 prompt.  The serial still names the
-/// physical card. The PIN's name is written as the card documents
-/// name it, "Basic PIN 1", with no parentheses.
+/// `CK_TOKEN_INFO.label` is the value RFC 7512 section 2.3 gives to
+/// `pkcs11:token=`, so it is a wire identifier rather than a sentence:
+/// the short credential name `PIN1` keeps a URI readable at a glance.
+/// The serial beside it names the physical card, and the object label
+/// carries the holder's name and personal code.
 ///
-/// The Finnish and Swedish forms use the preferred terms of the
-/// Finnish public-sector Certification vocabulary
-/// (sanastot.suomi.fi, concepts "basic PIN" and "signature PIN"),
-/// which DVV's pages follow: "perustunnusluku" and
-/// "allekirjoitustunnusluku", "grund PIN" and "signaturkod", with the
-/// PIN's number after the term: "Perustunnusluku 1",
-/// "Allekirjoitustunnusluku 2"; "Grund PIN 1", "Signaturkod 2".
-/// "Grundkod", which the Apple app once used, is in neither source.
-/// A short "Perus-PIN 1" was considered and dropped: it is correct
-/// Finnish only with the hyphen (Kielitoimiston ohjepankki,
-/// "Yhdysmerkki yhdyssanassa, jossa lyhenne, numero tms.": a compound
-/// whose part is an initialism read letter by letter always takes a
-/// hyphen, as in "EU-lainsäädäntö"), and the full word needs no such
-/// rule and is what the holder reads on DVV's pages.
-///
-/// The string matches the Apple `TokenExtension` localisation key:
-///   English  "Basic PIN 1"
-///   Finnish  "Perustunnusluku 1"
-///   Swedish  "Grund PIN 1"
-const TOKEN_LABEL_IDENTIFY: &str = "Basic PIN 1";
+/// The label names the credential, not the plastic: the card's own
+/// EF.TokenInfo carries its product name. User-interface text keeps
+/// the full term the card documents use, "Basic PIN 1", which the
+/// Apple `TokenExtension` localises as "Perustunnusluku 1" and
+/// "Grund PIN 1".
+const TOKEN_LABEL_IDENTIFY: &str = "PIN1";
 /// Fixed token label for a card served by a paired phone, which
-/// verifies Basic PIN 1 itself: NSS shows no PIN prompt for it, and the
+/// verifies PIN 1 itself: NSS shows no PIN prompt for it, and the
 /// label tells the citizen which device the prompt will appear on.
-/// The maintainer chose the full credential name over a bare "Phone"
-/// (2026-11-07) so the two tokens read alike in a browser's device
-/// list: the card token "Basic PIN 1", the phone token
-/// "Phone Basic PIN 1".
-const TOKEN_LABEL_PHONE: &str = "Phone Basic PIN 1";
+/// The phone token keeps the card token's credential name with a
+/// `Phone` prefix, so the two read alike in a browser's device list.
+const TOKEN_LABEL_PHONE: &str = "Phone PIN1";
 /// Token model for the FINEID card families.
 const TOKEN_MODEL_FINEID: &str = "FINEID";
 /// Token model for the Estonian eID card profile.
@@ -632,9 +614,11 @@ const TOKEN_MODEL_ESTONIAN: &str = "ESTeID";
 /// unknown counters use [`CK_UNAVAILABLE_INFORMATION`].
 ///
 /// The label is the fixed [`TOKEN_LABEL_IDENTIFY`] (see its doc);
-/// `serial` comes from the card's own PKCS#15 EF.TokenInfo (the
-/// printed card identifier). The model names the card family: FINEID
-/// for the Finnish cards, ESTeID for the Estonian profile. The
+/// `serial` is the identifier the card body prints: the Estonian
+/// document number from EF.D003, or the FINEID serial EF.TokenInfo
+/// reports, trimmed to its printed form. The model names the card
+/// family: FINEID for the Finnish cards, ESTeID for the Estonian
+/// profile. The
 /// manufacturer names this software, `RefineID`: `C_GetInfo`
 /// carries the module identity in principle, but `p11-kit-proxy`
 /// masks it with its own, so the token manufacturer is the only
@@ -2665,9 +2649,12 @@ mod tests {
                 | CKF_WRITE_PROTECTED
                 | CKF_PROTECTED_AUTHENTICATION_PATH
         );
+        assert_eq!(phone.label, padded_field(super::TOKEN_LABEL_PHONE));
         let card = token_info_value("TEST123", pristine, KeyGate::Login, None);
         assert_ne!(card.flags & CKF_LOGIN_REQUIRED, 0);
         assert_eq!(card.flags & CKF_PROTECTED_AUTHENTICATION_PATH, 0);
+        assert_eq!(card.label, padded_field(super::TOKEN_LABEL_IDENTIFY));
+        assert_eq!(card.label, padded_field("PIN1"));
 
         let estonian_limit = refineid_auth::PinReferenceScheme::Estonian.pin_retry_limit();
         let estonian_pin = PinStatus::Remaining(

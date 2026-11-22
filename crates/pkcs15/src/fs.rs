@@ -64,6 +64,15 @@ pub const EF_AUTH_CERT_ALT_FID: FileId = FileId::from_u16(0x4333);
 /// EF.3411, the Estonian eID authentication certificate named by
 /// EF.CDF object 11 (GED24035, the Estonian eID developer guide).
 pub const EF_ESTONIAN_AUTH_CERT_FID: FileId = FileId::from_u16(0x3411);
+/// DF.DD, the Estonian personal-data directory on the 2025 platform.
+pub const DF_ESTONIAN_PERSONAL_DATA_FID: FileId = FileId::from_u16(0xDFDD);
+/// EF.5007 under DF.DD, PD7 Document number on the 2025 platform: the
+/// number the card body prints, as plain ASCII with no TLV wrapper
+/// (GED24035, section 6.1). Readable without a PIN.
+pub const EF_ESTONIAN_DOCUMENT_NUMBER_FID: FileId = FileId::from_u16(0x5007);
+/// EF.D003, the document-number file on the earlier platforms: a DER
+/// TLV directly under the MF (ID1 Developer Guide 2019, section 6.1).
+pub const EF_ESTONIAN_DOCUMENT_NUMBER_LEGACY_FID: FileId = FileId::from_u16(0xD003);
 /// EF.4334, the on-card root CA certificate; lives directly under the
 /// MF.
 pub const EF_ROOT_CA_FID: FileId = FileId::from_u16(0x4334);
@@ -347,6 +356,9 @@ const P1_SELECT_CHILD_DF: u8 = 0x01;
 /// P1: select a DF or MF by name; some FINEID variants accept the MF
 /// identifier through this mode.
 const P1_SELECT_BY_NAME: u8 = 0x04;
+/// P1: select a file by its full path, one two-byte file identifier
+/// per step from the MF.
+const P1_SELECT_PATH: u8 = 0x08;
 /// P2: return no response data, shared with the typed SELECT builder.
 const P2_NO_RESPONSE_DATA: u8 = SelectFileResponseMode::None.as_p2();
 
@@ -375,6 +387,25 @@ fn select_child_df_variant<E>(fid: FileId) -> Result<CommandApdu, Pkcs15Error<E>
             p2: P2_NO_RESPONSE_DATA,
         },
         fid.as_bytes(),
+    )
+    .map_err(Pkcs15Error::Command)
+}
+
+/// Build the full-path SELECT variant: every file identifier in
+/// `path` is one step from the MF, sent in a single command.
+fn select_path_variant<E>(path: &[FileId]) -> Result<CommandApdu, Pkcs15Error<E>> {
+    let mut data = Vec::with_capacity(path.len().saturating_mul(FileId::LENGTH));
+    for fid in path {
+        data.extend_from_slice(fid.as_bytes());
+    }
+    CommandApdu::case_3(
+        CommandHeader {
+            class: ApduClass::Plain,
+            instruction: SelectFile::INS,
+            p1: P1_SELECT_PATH,
+            p2: SelectFileResponseMode::Fcp.as_p2(),
+        },
+        &data,
     )
     .map_err(Pkcs15Error::Command)
 }
@@ -463,6 +494,26 @@ pub trait Pkcs15Ops: CardTransport {
             select_any_by_fid_variant(fid),
         ];
         select_with_variants(self, variants)
+    }
+
+    /// SELECT a file by its full path, one two-byte file identifier per
+    /// step from the MF, in a single command. The returned FCP is read
+    /// and discarded.
+    ///
+    /// # Errors
+    ///
+    /// Transport failures, or a non-success status word.
+    fn select_path(&mut self, path: &[FileId]) -> Result<(), Pkcs15Error<Self::Error>>
+    where
+        Self: Sized,
+    {
+        let command = select_path_variant(path)?;
+        let response = exchange(self, &command)?;
+        if response.is_ok() {
+            Ok(())
+        } else {
+            Err(Pkcs15Error::Status(response.status_word()))
+        }
     }
 
     /// SELECT the signature directory beneath the MF.
@@ -707,6 +758,37 @@ pub trait Pkcs15Ops: CardTransport {
         let bytes = self.read_binary_der_object("EF.TokenInfo")?;
         crate::TokenInfo::parse(&bytes)
             .map_err(|_parse_error| Pkcs15Error::InvalidData("EF.TokenInfo"))
+    }
+
+    /// Read the Estonian document number the card body prints. The
+    /// 2025 platform keeps it as plain ASCII in EF.5007 under DF.DD;
+    /// the earlier platforms keep a DER TLV in EF.D003 under the MF.
+    /// Neither file needs a PIN.
+    ///
+    /// # Errors
+    ///
+    /// SELECT or read failures, or a file whose bytes are not a
+    /// document number. A card without either file answers SELECT with
+    /// [`StatusWord::FileNotFound`].
+    fn read_document_number(&mut self) -> Result<crate::DocumentNumber, Pkcs15Error<Self::Error>>
+    where
+        Self: Sized,
+    {
+        let current = [
+            DF_ESTONIAN_PERSONAL_DATA_FID,
+            EF_ESTONIAN_DOCUMENT_NUMBER_FID,
+        ];
+        if self.select_path(&current).is_ok() {
+            let bytes = self.read_binary_to_end(Some(crate::DOCUMENT_NUMBER_CHARS))?;
+            if let Ok(number) = crate::DocumentNumber::from_ascii(&bytes) {
+                return Ok(number);
+            }
+        }
+        self.select_mf()?;
+        self.select_ef(EF_ESTONIAN_DOCUMENT_NUMBER_LEGACY_FID)?;
+        let bytes = self.read_binary_der_object("EF.D003")?;
+        crate::DocumentNumber::parse_tlv(&bytes)
+            .map_err(|_parse_error| Pkcs15Error::InvalidData("EF.D003"))
     }
 }
 

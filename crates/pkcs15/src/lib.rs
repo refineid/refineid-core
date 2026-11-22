@@ -21,6 +21,7 @@
 //! X.509 interpretation and reader discovery stay outside this crate.
 
 pub mod aod;
+pub mod document_number;
 pub mod fs;
 pub mod token_info;
 pub mod token_serial;
@@ -29,10 +30,13 @@ pub use aod::{
     AuthenticationObjects, AuthenticationObjectsError, EF_AOD_FID, EF_ESTONIAN_AOD_FID,
     PasswordLengthRange, PasswordObject,
 };
+pub use document_number::{DOCUMENT_NUMBER_CHARS, DocumentNumber, DocumentNumberError};
 pub use fs::{
-    CertSlot, DF_ESIGN_FID, EF_AUTH_CERT_ALT_FID, EF_AUTH_CERT_FID, EF_ESTONIAN_AUTH_CERT_FID,
-    EF_ISSUING_CA_ECC_FID, EF_ROOT_CA_FID, EF_SIGN_CERT_ALT_FID, EF_SIGN_CERT_FID,
-    EF_TOKEN_INFO_FID, ESIGN_AID, PKCS15_AID, Pkcs15Error, Pkcs15Ops,
+    CertSlot, DF_ESIGN_FID, DF_ESTONIAN_PERSONAL_DATA_FID, EF_AUTH_CERT_ALT_FID, EF_AUTH_CERT_FID,
+    EF_ESTONIAN_AUTH_CERT_FID, EF_ESTONIAN_DOCUMENT_NUMBER_FID,
+    EF_ESTONIAN_DOCUMENT_NUMBER_LEGACY_FID, EF_ISSUING_CA_ECC_FID, EF_ROOT_CA_FID,
+    EF_SIGN_CERT_ALT_FID, EF_SIGN_CERT_FID, EF_TOKEN_INFO_FID, ESIGN_AID, PKCS15_AID, Pkcs15Error,
+    Pkcs15Ops,
 };
 pub use refineid_x509::UnvalidatedCertificate;
 pub use token_info::TokenInfo;

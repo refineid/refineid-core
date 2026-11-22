@@ -31,7 +31,7 @@
 use core::ptr;
 
 use crate::pin::{PinBytes, PinRoleError};
-use refineid_auth::{PinRetryRisk, PinStatus};
+use refineid_auth::{PinReferenceScheme, PinStatus};
 
 use crate::ck::{
     CK_EFFECTIVELY_INFINITE, CK_UNAVAILABLE_INFORMATION, CKF_DONT_BLOCK, CKF_EC_F_P,
@@ -573,7 +573,7 @@ unsafe extern "C" fn c_get_token_info(slot_id: CkSlotId, info: CkTokenInfoPtr) -
         };
         // SAFETY: caller guarantees info is a writable CK_TOKEN_INFO.
         unsafe {
-            info.write(token_info_value(&serial, pin1_status, key_gate));
+            info.write(token_info_value(&serial, pin1_status, key_gate, pin_scheme));
         }
         CKR_OK
     } else {
@@ -623,14 +623,18 @@ const TOKEN_LABEL_IDENTIFY: &str = "Basic PIN 1";
 /// list: the card token "Basic PIN 1", the phone token
 /// "Phone Basic PIN 1".
 const TOKEN_LABEL_PHONE: &str = "Phone Basic PIN 1";
+/// Token model for the FINEID card families.
+const TOKEN_MODEL_FINEID: &str = "FINEID";
+/// Token model for the Estonian eID card profile.
+const TOKEN_MODEL_ESTONIAN: &str = "ESTeID";
 
 /// Build the token-info payload. Fixed-width fields are space-padded;
 /// unknown counters use [`CK_UNAVAILABLE_INFORMATION`].
 ///
 /// The label is the fixed [`TOKEN_LABEL_IDENTIFY`] (see its doc);
 /// `serial` comes from the card's own PKCS#15 EF.TokenInfo (the
-/// printed card identifier). The model is the fixed card family,
-/// FINEID (the openssl backend's default URI matches on it). The
+/// printed card identifier). The model names the card family: FINEID
+/// for the Finnish cards, ESTeID for the Estonian profile. The
 /// manufacturer names this software, `RefineID`: `C_GetInfo`
 /// carries the module identity in principle, but `p11-kit-proxy`
 /// masks it with its own, so the token manufacturer is the only
@@ -638,7 +642,12 @@ const TOKEN_LABEL_PHONE: &str = "Phone Basic PIN 1";
 ///
 /// The login flags follow the token's [`KeyGate`], the same value
 /// that sets the private key's `CKA_PRIVATE`.
-fn token_info_value(serial: &str, pin1_status: PinStatus, key_gate: KeyGate) -> CkTokenInfo {
+fn token_info_value(
+    serial: &str,
+    pin1_status: PinStatus,
+    key_gate: KeyGate,
+    pin_scheme: Option<PinReferenceScheme>,
+) -> CkTokenInfo {
     // With `pin-change` enabled the token is not write-protected, so
     // NSS offers "Change Password" -> C_SetPIN. In the default
     // (login-only) build the token reports write-protected and NSS
@@ -651,7 +660,7 @@ fn token_info_value(serial: &str, pin1_status: PinStatus, key_gate: KeyGate) -> 
         CKF_LOGIN_REQUIRED | CKF_USER_PIN_INITIALIZED | CKF_TOKEN_INITIALIZED | CKF_WRITE_PROTECTED;
     let (flags, label) = match key_gate {
         KeyGate::Login => (
-            base_flags | user_pin_status_flags(pin1_status),
+            base_flags | user_pin_status_flags(pin1_status, pin_scheme),
             padded_field(TOKEN_LABEL_IDENTIFY),
         ),
         // The phone verifies PIN 1 and asks the holder for each
@@ -670,7 +679,10 @@ fn token_info_value(serial: &str, pin1_status: PinStatus, key_gate: KeyGate) -> 
     CkTokenInfo {
         label,
         manufacturer_id: padded_field("RefineID"),
-        model: padded_field("FINEID"),
+        model: padded_field(match pin_scheme {
+            Some(PinReferenceScheme::Estonian) => TOKEN_MODEL_ESTONIAN,
+            _ => TOKEN_MODEL_FINEID,
+        }),
         serial_number: tail_padded_field(serial),
         flags,
         ul_max_session_count: CK_EFFECTIVELY_INFINITE,
@@ -693,7 +705,10 @@ fn token_info_value(serial: &str, pin1_status: PinStatus, key_gate: KeyGate) -> 
 /// The flags describe the card's own state: `COUNT_LOW` once any attempt
 /// has been spent, `FINAL_TRY` only with one attempt left, and `LOCKED`
 /// only when the card reports the PIN locked or exhausted.
-const fn user_pin_status_flags(status: PinStatus) -> CkFlags {
+const fn user_pin_status_flags(
+    status: PinStatus,
+    pin_scheme: Option<PinReferenceScheme>,
+) -> CkFlags {
     let PinStatus::Remaining(retries) = status else {
         return if matches!(status, PinStatus::Locked) {
             CKF_USER_PIN_LOCKED
@@ -701,15 +716,19 @@ const fn user_pin_status_flags(status: PinStatus) -> CkFlags {
             0
         };
     };
-    match PinRetryRisk::from_retries(retries) {
-        Some(PinRetryRisk::NormalOperatingConditions) | None => 0,
-        Some(
-            PinRetryRisk::DisturbanceDetected
-            | PinRetryRisk::SecurityIncidentDeclared
-            | PinRetryRisk::CriticalThreatLevel,
-        ) => CKF_USER_PIN_COUNT_LOW,
-        Some(PinRetryRisk::LockdownImminent) => CKF_USER_PIN_COUNT_LOW | CKF_USER_PIN_FINAL_TRY,
-        Some(PinRetryRisk::DefencesFallen) => CKF_USER_PIN_COUNT_LOW | CKF_USER_PIN_LOCKED,
+    let retry_limit = match pin_scheme {
+        Some(scheme) => scheme.pin_retry_limit(),
+        None => PinReferenceScheme::Citizen.pin_retry_limit(),
+    };
+    let count = retries.get();
+    if count == retry_limit {
+        0
+    } else if count == 0 {
+        CKF_USER_PIN_COUNT_LOW | CKF_USER_PIN_LOCKED
+    } else if count == 1 {
+        CKF_USER_PIN_COUNT_LOW | CKF_USER_PIN_FINAL_TRY
+    } else {
+        CKF_USER_PIN_COUNT_LOW
     }
 }
 
@@ -1003,6 +1022,9 @@ unsafe extern "C" fn c_login(
         Ok(cache) => cache,
         Err(error) => return error,
     };
+    if let Ok(mut cache) = pin_cache.lock() {
+        cache.set_scheme(pin_scheme.unwrap_or(PinReferenceScheme::Citizen));
+    }
     drop(guard);
     let rv = match crate::token::card_login_with_scheme(&kind, &pin_cache, pin1, pin_scheme) {
         Ok(()) => CKR_OK,
@@ -2630,7 +2652,12 @@ mod tests {
         let pristine = PinStatus::Remaining(
             PinRetries::from_nibble(5).expect("test retry count fits the status-word nibble"),
         );
-        let phone = token_info_value("REMOTE-a5a5a5a5", PinStatus::Verified, KeyGate::Device);
+        let phone = token_info_value(
+            "REMOTE-a5a5a5a5",
+            PinStatus::Verified,
+            KeyGate::Device,
+            None,
+        );
         assert_eq!(
             phone.flags,
             CKF_USER_PIN_INITIALIZED
@@ -2638,9 +2665,23 @@ mod tests {
                 | CKF_WRITE_PROTECTED
                 | CKF_PROTECTED_AUTHENTICATION_PATH
         );
-        let card = token_info_value("TEST123", pristine, KeyGate::Login);
+        let card = token_info_value("TEST123", pristine, KeyGate::Login, None);
         assert_ne!(card.flags & CKF_LOGIN_REQUIRED, 0);
         assert_eq!(card.flags & CKF_PROTECTED_AUTHENTICATION_PATH, 0);
+
+        let estonian_limit = refineid_auth::PinReferenceScheme::Estonian.pin_retry_limit();
+        let estonian_pin = PinStatus::Remaining(
+            PinRetries::from_nibble(estonian_limit)
+                .expect("test retry count fits the status-word nibble"),
+        );
+        let estonian = token_info_value(
+            "TEST123",
+            estonian_pin,
+            KeyGate::Login,
+            Some(refineid_auth::PinReferenceScheme::Estonian),
+        );
+        assert_eq!(estonian.model, padded_field(super::TOKEN_MODEL_ESTONIAN));
+        assert_eq!(estonian.flags & CKF_USER_PIN_COUNT_LOW, 0);
     }
 
     /// A phone-served token signs in a public session and in a user
@@ -3135,7 +3176,12 @@ mod tests {
         let expected: [CkUtf8Char; 32] = padded_field("RefineID");
         let retries =
             PinRetries::from_nibble(5).expect("test retry count fits the status-word nibble");
-        let token = token_info_value("TEST123", PinStatus::Remaining(retries), KeyGate::Login);
+        let token = token_info_value(
+            "TEST123",
+            PinStatus::Remaining(retries),
+            KeyGate::Login,
+            None,
+        );
         assert_eq!(token.manufacturer_id, expected);
         let mut info: CkInfo = unsafe { core::mem::zeroed() };
         assert_eq!(unsafe { c_get_info(&mut info) }, CKR_OK);
@@ -3148,32 +3194,51 @@ mod tests {
             PinRetries::from_nibble(count).expect("test retry count fits the status-word nibble")
         };
 
-        assert_eq!(user_pin_status_flags(PinStatus::Remaining(retries(5))), 0);
         assert_eq!(
-            user_pin_status_flags(PinStatus::Remaining(retries(4))),
+            user_pin_status_flags(PinStatus::Remaining(retries(5)), None),
+            0
+        );
+        assert_eq!(
+            user_pin_status_flags(PinStatus::Remaining(retries(4)), None),
             CKF_USER_PIN_COUNT_LOW
         );
         assert_eq!(
-            user_pin_status_flags(PinStatus::Remaining(retries(3))),
+            user_pin_status_flags(PinStatus::Remaining(retries(3)), None),
             CKF_USER_PIN_COUNT_LOW
         );
         assert_eq!(
-            user_pin_status_flags(PinStatus::Remaining(retries(2))),
+            user_pin_status_flags(PinStatus::Remaining(retries(2)), None),
             CKF_USER_PIN_COUNT_LOW
         );
         assert_eq!(
-            user_pin_status_flags(PinStatus::Remaining(retries(1))),
+            user_pin_status_flags(PinStatus::Remaining(retries(1)), None),
             CKF_USER_PIN_COUNT_LOW | CKF_USER_PIN_FINAL_TRY
         );
         assert_eq!(
-            user_pin_status_flags(PinStatus::Remaining(retries(0))),
+            user_pin_status_flags(PinStatus::Remaining(retries(0)), None),
             CKF_USER_PIN_COUNT_LOW | CKF_USER_PIN_LOCKED
         );
         assert_eq!(
-            user_pin_status_flags(PinStatus::Locked),
+            user_pin_status_flags(PinStatus::Locked, None),
             CKF_USER_PIN_LOCKED
         );
-        assert_eq!(user_pin_status_flags(PinStatus::NoInfo), 0);
+        assert_eq!(user_pin_status_flags(PinStatus::NoInfo, None), 0);
+        let estonian = Some(refineid_auth::PinReferenceScheme::Estonian);
+        let estonian_pristine = refineid_auth::PinReferenceScheme::Estonian.pin_retry_limit();
+        const ESTONIAN_ONE_SPENT: u8 = 2;
+        const ESTONIAN_LAST_TRY: u8 = 1;
+        assert_eq!(
+            user_pin_status_flags(PinStatus::Remaining(retries(estonian_pristine)), estonian),
+            0
+        );
+        assert_eq!(
+            user_pin_status_flags(PinStatus::Remaining(retries(ESTONIAN_ONE_SPENT)), estonian),
+            CKF_USER_PIN_COUNT_LOW
+        );
+        assert_eq!(
+            user_pin_status_flags(PinStatus::Remaining(retries(ESTONIAN_LAST_TRY)), estonian),
+            CKF_USER_PIN_COUNT_LOW | CKF_USER_PIN_FINAL_TRY
+        );
     }
 
     /// A caller's PIN buffer is read up to one octet past the longest

@@ -77,6 +77,11 @@ pub const PUK_REFERENCE: u8 = 0x83;
 /// unblock verifies the PUK under this reference before the reset.
 pub const PUK_REFERENCE_ORGANIZATIONAL: u8 = 0x12;
 
+/// PIN attempts on the FINEID citizen and organizational profiles.
+const FINEID_PIN_RETRY_LIMIT: u8 = 5;
+/// PIN attempts on the Estonian eID profile.
+const ESTONIAN_PIN_RETRY_LIMIT: u8 = 3;
+
 /// VERIFY instruction byte (ISO 7816-4 section 7.5.6).
 pub const VERIFY_INS: u8 = 0x20;
 /// VERIFY P1 selecting the verify operation.
@@ -183,6 +188,15 @@ impl PinReferenceScheme {
             Self::Citizen => PinPadByte::FINEID,
             Self::Organizational => PinPadByte::FINEID,
             Self::Estonian => PinPadByte::ESTONIAN_EID,
+        }
+    }
+
+    /// The number of attempts a pristine PIN has under this numbering.
+    #[must_use]
+    pub const fn pin_retry_limit(self) -> u8 {
+        match self {
+            Self::Citizen | Self::Organizational => FINEID_PIN_RETRY_LIMIT,
+            Self::Estonian => ESTONIAN_PIN_RETRY_LIMIT,
         }
     }
 }

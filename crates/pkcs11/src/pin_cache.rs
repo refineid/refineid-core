@@ -45,7 +45,7 @@ use std::sync::{Arc, Weak};
 
 use refineid_apdu::{TransportErrorExt, TransportErrorKind, TransportOutcome};
 use refineid_auth::{
-    AuthError, Pin1, PinStatus, UnvalidatedSecret, VerifyOutcome,
+    AuthError, Pin1, PinReferenceScheme, PinStatus, UnvalidatedSecret, VerifyOutcome,
     pin1_status_permits_reusable_cache,
 };
 use refineid_pkcs15::TokenSerial;
@@ -241,6 +241,9 @@ pub struct PinSafetyCache {
     generation: u64,
     #[zeroize(skip)]
     negative: refineid_auth::PinSafetyCache,
+    /// The credential numbering and retry limit of the card in this slot.
+    #[zeroize(skip)]
+    scheme: PinReferenceScheme,
 }
 
 impl PinSafetyCache {
@@ -254,7 +257,18 @@ impl PinSafetyCache {
             outstanding: Weak::new(),
             generation: 0,
             negative: refineid_auth::PinSafetyCache::new()?,
+            scheme: PinReferenceScheme::Citizen,
         })
+    }
+
+    /// Set the credential numbering for the live card. A different
+    /// numbering destroys any held value, whose pristine counter was
+    /// measured on the old card's scale.
+    pub fn set_scheme(&mut self, scheme: PinReferenceScheme) {
+        if self.scheme != scheme {
+            self.clear_positive();
+            self.scheme = scheme;
+        }
     }
 
     /// Hold a PIN1 the card identified by `serial` has just accepted,
@@ -311,7 +325,7 @@ impl PinSafetyCache {
         let entry = self.positive_pin1.take()?;
         let usable = &entry.serial == serial
             && entry.card_events == card_events
-            && pin1_status_permits_reusable_cache(live);
+            && pin1_status_permits_reusable_cache(live, self.scheme);
         if !usable {
             return None;
         }
@@ -530,6 +544,20 @@ mod tests {
         assert!(
             checkout.is_some(),
             "a verified PIN1 is a counter at its limit"
+        );
+    }
+
+    #[test]
+    fn an_estonian_pristine_three_keeps_the_held_pin1() {
+        let mut cache = cache();
+        cache.set_scheme(refineid_auth::PinReferenceScheme::Estonian);
+        cache
+            .store_pin1(serial(CARD_A_SERIAL), READER_EVENTS, random_pin())
+            .expect("a fresh PIN1 is not a rejected one");
+        assert!(
+            cache
+                .checkout_pin1(&serial(CARD_A_SERIAL), READER_EVENTS, remaining(3))
+                .is_some()
         );
     }
 

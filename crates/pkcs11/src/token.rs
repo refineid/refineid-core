@@ -1740,7 +1740,10 @@ where
             return Err(CKR_DEVICE_ERROR);
         }
     };
-    if !pin1_status_permits_reusable_cache(pin1_status) {
+    if !pin1_status_permits_reusable_cache(
+        pin1_status,
+        scheme.unwrap_or(PinReferenceScheme::Citizen),
+    ) {
         clear_positive(pin_cache);
     }
     if let Err(error) = pin1_verify_guard(pin1_status) {
@@ -2089,7 +2092,10 @@ where
             return Err(CKR_DEVICE_ERROR);
         }
     };
-    if !pin1_status_permits_reusable_cache(pin1_status) {
+    if !pin1_status_permits_reusable_cache(
+        pin1_status,
+        scheme.unwrap_or(PinReferenceScheme::Citizen),
+    ) {
         clear_positive(pin_cache);
     }
     if let Err(error) = pin1_verify_guard(pin1_status) {

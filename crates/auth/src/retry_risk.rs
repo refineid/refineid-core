@@ -54,7 +54,7 @@ use core::fmt;
 
 use refineid_apdu::PinRetries;
 
-use crate::verify::{PinSlot, PinStatus};
+use crate::verify::{PinReferenceScheme, PinSlot, PinStatus};
 
 /// A credential whose retry counter the floor guards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,7 +293,7 @@ pub const fn check_last_tries(
 }
 
 /// Whether the PIN1 retry state the card reports permits holding PIN1 for
-/// reuse: five tries left, or PIN1 standing verified.
+/// reuse: the profile's full counter, or PIN1 standing verified.
 ///
 /// A VERIFY the card accepts sets the try counter to its limit and the
 /// verified flag, and one it refuses decrements the counter and clears
@@ -301,18 +301,18 @@ pub const fn check_last_tries(
 /// flag set beside a lower counter: a refused CHANGE REFERENCE DATA
 /// decrements the counter and clears the flag, and an accepted one, or
 /// RESET RETRY COUNTER, sets the counter to its limit with the flag
-/// cleared (sections 3.11 and 3.12). The limit is five for PIN1 on both
-/// card families (FINEID S4-1 v4.2 section 4.1, S4-2 v4.0). A verified
-/// answer therefore proves a full counter, and any count below the limit
-/// means the card refused a PIN since it last accepted one.
+/// cleared (sections 3.11 and 3.12). The limit is five on the FINEID
+/// profiles and three on the Estonian eID profile. A verified answer
+/// therefore proves a full counter, and any count below the profile's
+/// limit means the card refused a PIN since it last accepted one.
 #[must_use]
-pub const fn pin1_status_permits_reusable_cache(pin1: PinStatus) -> bool {
+pub const fn pin1_status_permits_reusable_cache(
+    pin1: PinStatus,
+    scheme: PinReferenceScheme,
+) -> bool {
     match pin1 {
         PinStatus::Verified => true,
-        PinStatus::Remaining(retries) => matches!(
-            PinRetryRisk::from_retries(retries),
-            Some(risk) if risk.permits_reusable_cache()
-        ),
+        PinStatus::Remaining(retries) => retries.get() == scheme.pin_retry_limit(),
         PinStatus::Locked | PinStatus::NoInfo | PinStatus::Other(_) => false,
     }
 }
@@ -320,10 +320,10 @@ pub const fn pin1_status_permits_reusable_cache(pin1: PinStatus) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        FlooredCredential, PinRetryRisk, PinSlot, PinStatus, RETRIES_BELOW_FLOOR,
-        RETRIES_EXHAUSTED, RETRIES_FLOOR, RETRIES_LOCKDOWN_IMMINENT, RETRIES_ONE_SPENT,
-        RETRIES_PRISTINE, RetryFloorRefusal, check_last_tries, check_retry_floor,
-        pin1_status_permits_reusable_cache,
+        FlooredCredential, PinReferenceScheme, PinRetryRisk, PinSlot, PinStatus,
+        RETRIES_BELOW_FLOOR, RETRIES_EXHAUSTED, RETRIES_FLOOR, RETRIES_LOCKDOWN_IMMINENT,
+        RETRIES_ONE_SPENT, RETRIES_PRISTINE, RetryFloorRefusal, check_last_tries,
+        check_retry_floor, pin1_status_permits_reusable_cache,
     };
     use refineid_apdu::{PinRetries, StatusWord};
 
@@ -519,30 +519,66 @@ mod tests {
 
     #[test]
     fn pin1_is_held_only_at_a_pristine_or_verified_counter() {
-        assert!(pin1_status_permits_reusable_cache(remaining(
-            RETRIES_PRISTINE
-        )));
-        assert!(pin1_status_permits_reusable_cache(PinStatus::Verified));
-        assert!(!pin1_status_permits_reusable_cache(remaining(
-            RETRIES_ONE_SPENT
-        )));
-        assert!(!pin1_status_permits_reusable_cache(remaining(
-            RETRIES_FLOOR
-        )));
-        assert!(!pin1_status_permits_reusable_cache(PinStatus::Locked));
-        assert!(!pin1_status_permits_reusable_cache(PinStatus::NoInfo));
-        assert!(!pin1_status_permits_reusable_cache(PinStatus::Other(
-            StatusWord::from_u16(UNMODELED_SW)
-        )));
+        assert!(pin1_status_permits_reusable_cache(
+            remaining(RETRIES_PRISTINE),
+            PinReferenceScheme::Citizen
+        ));
+        assert!(pin1_status_permits_reusable_cache(
+            PinStatus::Verified,
+            PinReferenceScheme::Citizen
+        ));
+        assert!(!pin1_status_permits_reusable_cache(
+            remaining(RETRIES_ONE_SPENT),
+            PinReferenceScheme::Citizen
+        ));
+        assert!(!pin1_status_permits_reusable_cache(
+            remaining(RETRIES_FLOOR),
+            PinReferenceScheme::Citizen
+        ));
+        assert!(!pin1_status_permits_reusable_cache(
+            PinStatus::Locked,
+            PinReferenceScheme::Citizen
+        ));
+        assert!(!pin1_status_permits_reusable_cache(
+            PinStatus::NoInfo,
+            PinReferenceScheme::Citizen
+        ));
+        assert!(!pin1_status_permits_reusable_cache(
+            PinStatus::Other(StatusWord::from_u16(UNMODELED_SW)),
+            PinReferenceScheme::Citizen
+        ));
+    }
+
+    #[test]
+    fn estonian_pristine_three_permits_the_cache() {
+        let pristine = PinReferenceScheme::Estonian.pin_retry_limit();
+        assert!(pin1_status_permits_reusable_cache(
+            remaining(pristine),
+            PinReferenceScheme::Estonian
+        ));
+        assert!(!pin1_status_permits_reusable_cache(
+            remaining(RETRIES_BELOW_FLOOR),
+            PinReferenceScheme::Estonian
+        ));
+        assert!(!pin1_status_permits_reusable_cache(
+            remaining(pristine),
+            PinReferenceScheme::Citizen
+        ));
     }
 
     #[test]
     fn the_reusable_cache_is_never_looser_than_the_floor() {
         for &count in REFUSED.iter().chain(&[RETRIES_EXHAUSTED, ABOVE_LIMIT]) {
-            assert!(!pin1_status_permits_reusable_cache(remaining(count)));
+            assert!(!pin1_status_permits_reusable_cache(
+                remaining(count),
+                PinReferenceScheme::Citizen
+            ));
         }
         for status in [PinStatus::Locked, PinStatus::NoInfo] {
-            assert!(!pin1_status_permits_reusable_cache(status));
+            assert!(!pin1_status_permits_reusable_cache(
+                status,
+                PinReferenceScheme::Citizen
+            ));
         }
     }
 }

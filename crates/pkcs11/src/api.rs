@@ -690,6 +690,9 @@ fn token_info_value(serial: &str, pin1_status: PinStatus, key_gate: KeyGate) -> 
 }
 
 /// Translate the side-effect-free live PIN1 status to PKCS #11 token flags.
+/// The flags describe the card's own state: `COUNT_LOW` once any attempt
+/// has been spent, `FINAL_TRY` only with one attempt left, and `LOCKED`
+/// only when the card reports the PIN locked or exhausted.
 const fn user_pin_status_flags(status: PinStatus) -> CkFlags {
     let PinStatus::Remaining(retries) = status else {
         return if matches!(status, PinStatus::Locked) {
@@ -700,15 +703,13 @@ const fn user_pin_status_flags(status: PinStatus) -> CkFlags {
     };
     match PinRetryRisk::from_retries(retries) {
         Some(PinRetryRisk::NormalOperatingConditions) | None => 0,
-        Some(PinRetryRisk::DisturbanceDetected) => CKF_USER_PIN_COUNT_LOW,
-        Some(PinRetryRisk::SecurityIncidentDeclared) => {
-            CKF_USER_PIN_COUNT_LOW | CKF_USER_PIN_FINAL_TRY
-        }
         Some(
-            PinRetryRisk::CriticalThreatLevel
-            | PinRetryRisk::LockdownImminent
-            | PinRetryRisk::DefencesFallen,
-        ) => CKF_USER_PIN_COUNT_LOW | CKF_USER_PIN_LOCKED,
+            PinRetryRisk::DisturbanceDetected
+            | PinRetryRisk::SecurityIncidentDeclared
+            | PinRetryRisk::CriticalThreatLevel,
+        ) => CKF_USER_PIN_COUNT_LOW,
+        Some(PinRetryRisk::LockdownImminent) => CKF_USER_PIN_COUNT_LOW | CKF_USER_PIN_FINAL_TRY,
+        Some(PinRetryRisk::DefencesFallen) => CKF_USER_PIN_COUNT_LOW | CKF_USER_PIN_LOCKED,
     }
 }
 
@@ -3154,15 +3155,15 @@ mod tests {
         );
         assert_eq!(
             user_pin_status_flags(PinStatus::Remaining(retries(3))),
-            CKF_USER_PIN_COUNT_LOW | CKF_USER_PIN_FINAL_TRY
+            CKF_USER_PIN_COUNT_LOW
         );
         assert_eq!(
             user_pin_status_flags(PinStatus::Remaining(retries(2))),
-            CKF_USER_PIN_COUNT_LOW | CKF_USER_PIN_LOCKED
+            CKF_USER_PIN_COUNT_LOW
         );
         assert_eq!(
             user_pin_status_flags(PinStatus::Remaining(retries(1))),
-            CKF_USER_PIN_COUNT_LOW | CKF_USER_PIN_LOCKED
+            CKF_USER_PIN_COUNT_LOW | CKF_USER_PIN_FINAL_TRY
         );
         assert_eq!(
             user_pin_status_flags(PinStatus::Remaining(retries(0))),

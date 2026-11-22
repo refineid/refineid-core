@@ -57,7 +57,7 @@ pub use retry_risk::{
 };
 pub use verify::{
     AuthError, PIN_STORED_LENGTH, PIN1_REFERENCE, PIN1_REFERENCE_ORGANIZATIONAL, PIN2_REFERENCE,
-    PIN2_REFERENCE_ORGANIZATIONAL, PUK_REFERENCE, PUK_REFERENCE_ORGANIZATIONAL, PinOps,
+    PIN2_REFERENCE_ORGANIZATIONAL, PUK_REFERENCE, PUK_REFERENCE_ORGANIZATIONAL, PinOps, PinPadByte,
     PinReferenceScheme, PinSlot, PinStatus, VerifyOutcome, classify_pin_status_sw,
     classify_verify_sw,
 };

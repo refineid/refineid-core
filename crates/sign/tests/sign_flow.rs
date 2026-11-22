@@ -26,7 +26,7 @@ use refineid_apdu::{
     Aid, ApduClass, CardTransport, CommandApdu, CommandHeader, CredentialCommand, FileId,
     PinRetries, ResponseApdu, StatusWord, TransportOutcome,
 };
-use refineid_auth::verify::{PIN_PAD_BYTE, VERIFY_INS, VERIFY_P1};
+use refineid_auth::verify::{PinPadByte, VERIFY_INS, VERIFY_P1};
 use refineid_auth::{
     AuthError, FlooredCredential, PIN_STORED_LENGTH, Pin2, PinReferenceScheme, PinSlot,
     RetryFloorRefusal, UnvalidatedSecret, VerifyOutcome,
@@ -221,7 +221,7 @@ fn probe_served(tries: u8) -> ResponseApdu {
 fn verify_pin2_wire(scheme: PinReferenceScheme) -> Vec<u8> {
     let mut body = SYNTHETIC_PIN2.to_vec();
     if scheme == PinReferenceScheme::Citizen {
-        body.resize(PIN_STORED_LENGTH, PIN_PAD_BYTE);
+        body.resize(PIN_STORED_LENGTH, PinPadByte::FINEID.octet());
     }
     let mut wire = vec![
         ApduClass::Plain.as_byte(),

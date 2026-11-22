@@ -53,7 +53,7 @@ use crate::credentials::{Pin1, Pin2, Puk};
 use crate::pin_lengths::CardPinLengths;
 use crate::retry_risk::{FlooredCredential, check_last_tries, check_retry_floor};
 use crate::verify::{
-    AuthError, PinOps, PinReferenceScheme, PinSlot, PinStatus, VERIFY_INS, VERIFY_P1,
+    AuthError, PinOps, PinPadByte, PinReferenceScheme, PinSlot, PinStatus, VERIFY_INS, VERIFY_P1,
     credential_exchange,
 };
 
@@ -136,7 +136,13 @@ pub(crate) fn change<T: CardTransport + ?Sized>(
         p1: CHANGE_P1_CURRENT_THEN_NEW,
         p2: scheme.reference(slot),
     };
-    let status = credential_exchange(transport, scheme, header, &[current, new])?;
+    let status = credential_exchange(
+        transport,
+        scheme,
+        PinPadByte::FINEID,
+        header,
+        &[current, new],
+    )?;
     Ok(classify_manage_sw(status))
 }
 
@@ -221,7 +227,8 @@ pub(crate) fn unblock<T: CardTransport + ?Sized>(
                 p1: RESET_P1_CODE_THEN_NEW,
                 p2: scheme.reference(slot),
             };
-            let status = credential_exchange(transport, scheme, header, &[puk, new])?;
+            let status =
+                credential_exchange(transport, scheme, PinPadByte::FINEID, header, &[puk, new])?;
             Ok(classify_manage_sw(status))
         }
         PinReferenceScheme::Organizational => {
@@ -248,7 +255,7 @@ pub(crate) fn verify_puk<T: CardTransport + ?Sized>(
         p1: VERIFY_P1,
         p2: scheme.puk_reference(),
     };
-    let status = credential_exchange(transport, scheme, header, &[puk])?;
+    let status = credential_exchange(transport, scheme, PinPadByte::FINEID, header, &[puk])?;
     Ok(classify_manage_sw(status))
 }
 
@@ -268,7 +275,7 @@ pub(crate) fn reset_new_only<T: CardTransport + ?Sized>(
         p1: RESET_P1_NEW_ONLY,
         p2: scheme.reference(slot),
     };
-    let status = credential_exchange(transport, scheme, header, &[new])?;
+    let status = credential_exchange(transport, scheme, PinPadByte::FINEID, header, &[new])?;
     Ok(classify_manage_sw(status))
 }
 

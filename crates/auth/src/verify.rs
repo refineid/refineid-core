@@ -43,7 +43,7 @@ use refineid_apdu::{
 
 use crate::credentials::{Pin1, Pin2};
 use crate::pin_lengths::PinLengthRefusal;
-use crate::retry_risk::{RetryFloorRefusal, check_last_tries};
+use crate::retry_risk::{RetryFloorRefusal, check_last_tries_with_scheme};
 
 /// Citizen-card PIN1 reference: the global authentication PIN (FINEID S1
 /// v4.2 section 3.5.2).
@@ -408,7 +408,7 @@ pub(crate) fn verify_under_floor<T: CardTransport + ?Sized>(
     status: PinStatus,
     digits: &[u8],
 ) -> Result<VerifyOutcome, AuthError<T::Error>> {
-    check_last_tries(slot.into(), status).map_err(AuthError::RetryFloor)?;
+    check_last_tries_with_scheme(slot.into(), status, scheme).map_err(AuthError::RetryFloor)?;
     verify_digits(transport, scheme, slot, digits)
 }
 
@@ -524,10 +524,15 @@ pub trait PinOps: CardTransport {
     }
 
     /// Probe PIN1 retry state and resolve the card's credential numbering
-    /// with counter-safe probes. The citizen numbering is tried first;
-    /// when it is not found, the organizational numbering is tried, then
-    /// the Estonian eID numbering. A recognized state settles the
-    /// numbering without spending a retry.
+    /// with counter-safe probes.
+    ///
+    /// Probes Citizen, then Organizational, then Estonian eID. A recognized
+    /// PIN status settles the numbering immediately without spending a retry.
+    /// A security-channel refusal (`SecurityNotSatisfied` or
+    /// `SmDataObjectsIncorrect`, e.g. a contactless card before PACE) stops
+    /// probing immediately rather than sending further probes. Any other
+    /// unrecognized status word advances to the next profile, falling back
+    /// to Citizen with the citizen probe's status when all three miss.
     ///
     /// # Errors
     ///
@@ -538,22 +543,32 @@ pub trait PinOps: CardTransport {
     where
         Self: Sized,
     {
+        const fn stops_scheme_probe(sw: StatusWord) -> bool {
+            matches!(
+                sw,
+                StatusWord::SecurityNotSatisfied | StatusWord::SmDataObjectsIncorrect
+            )
+        }
+
         let citizen = self.probe_status_word(PinReferenceScheme::Citizen, PinSlot::Pin1)?;
-        if citizen != StatusWord::ReferenceDataNotFound {
-            return Ok((PinReferenceScheme::Citizen, classify_pin_status_sw(citizen)));
+        let citizen_status = classify_pin_status_sw(citizen);
+        if !matches!(citizen_status, PinStatus::Other(_)) || stops_scheme_probe(citizen) {
+            return Ok((PinReferenceScheme::Citizen, citizen_status));
         }
-        let organizational =
-            self.probe_status_word(PinReferenceScheme::Organizational, PinSlot::Pin1)?;
-        let status = classify_pin_status_sw(organizational);
-        if !matches!(status, PinStatus::Other(_)) {
-            return Ok((PinReferenceScheme::Organizational, status));
+        for scheme in [
+            PinReferenceScheme::Organizational,
+            PinReferenceScheme::Estonian,
+        ] {
+            let sw = self.probe_status_word(scheme, PinSlot::Pin1)?;
+            let status = classify_pin_status_sw(sw);
+            if !matches!(status, PinStatus::Other(_)) {
+                return Ok((scheme, status));
+            }
+            if stops_scheme_probe(sw) {
+                return Ok((PinReferenceScheme::Citizen, status));
+            }
         }
-        let estonian = self.probe_status_word(PinReferenceScheme::Estonian, PinSlot::Pin1)?;
-        let estonian_status = classify_pin_status_sw(estonian);
-        if !matches!(estonian_status, PinStatus::Other(_)) {
-            return Ok((PinReferenceScheme::Estonian, estonian_status));
-        }
-        Ok((PinReferenceScheme::Citizen, classify_pin_status_sw(citizen)))
+        Ok((PinReferenceScheme::Citizen, citizen_status))
     }
 
     /// Resolve the card's credential numbering with a counter-safe
@@ -1069,6 +1084,162 @@ mod tests {
             classify_pin_status_sw(StatusWord::AuthenticationBlocked),
             PinStatus::Locked
         );
+    }
+
+    struct ScriptedProbes {
+        steps: Vec<([u8; HEADER_LENGTH], StatusWord)>,
+        cursor: usize,
+    }
+
+    impl ScriptedProbes {
+        fn new(steps: Vec<([u8; HEADER_LENGTH], StatusWord)>) -> Self {
+            Self { steps, cursor: 0 }
+        }
+
+        fn assert_drained(&self) {
+            assert_eq!(self.cursor, self.steps.len());
+        }
+    }
+
+    impl CardTransport for ScriptedProbes {
+        type Error = String;
+
+        fn transmit(&mut self, command: &CommandApdu) -> Result<TransportOutcome, Self::Error> {
+            let (expected, sw) = self
+                .steps
+                .get(self.cursor)
+                .ok_or_else(|| format!("unexpected probe at step {}", self.cursor))?;
+            assert_eq!(command.as_bytes(), expected.as_slice());
+            self.cursor += 1;
+            Ok(TransportOutcome::Response(scripted_response(*sw)))
+        }
+
+        fn transmit_credential(
+            &mut self,
+            _command: CredentialCommand,
+        ) -> Result<TransportOutcome, Self::Error> {
+            Err("no credential expected during probe test".to_owned())
+        }
+    }
+
+    #[test]
+    fn pin1_status_and_scheme_resolves_estonian_across_recognized_states() {
+        /// ISO 7816-4 incorrect P1-P2 status word.
+        const INCORRECT_P1_P2_SW: u16 = 0x6A86;
+        let estonian_ref = PinReferenceScheme::Estonian.reference(PinSlot::Pin1);
+        let three = PinRetries::from_nibble(THREE_RETRIES).expect("fits a nibble");
+        for (miss_sw, estonian_sw, expected_status) in [
+            (
+                StatusWord::ReferenceDataNotFound,
+                counter(THREE_RETRIES),
+                PinStatus::Remaining(three),
+            ),
+            (
+                StatusWord::from_u16(INCORRECT_P1_P2_SW),
+                StatusWord::Success,
+                PinStatus::Verified,
+            ),
+            (
+                StatusWord::ReferenceDataNotFound,
+                StatusWord::AuthenticationBlocked,
+                PinStatus::Locked,
+            ),
+            (
+                StatusWord::ReferenceDataNotFound,
+                StatusWord::AuthenticationFailed,
+                PinStatus::NoInfo,
+            ),
+        ] {
+            let mut transport = ScriptedProbes::new(vec![
+                (verify_header(PIN1_REFERENCE), miss_sw),
+                (verify_header(PIN1_REFERENCE_ORGANIZATIONAL), miss_sw),
+                (verify_header(estonian_ref), estonian_sw),
+            ]);
+            let resolved = transport
+                .pin1_status_and_scheme()
+                .expect("probe sequence succeeds");
+            assert_eq!(resolved, (PinReferenceScheme::Estonian, expected_status));
+            transport.assert_drained();
+        }
+    }
+
+    #[test]
+    fn pin1_status_and_scheme_stops_on_security_refusal_and_falls_back_on_all_miss() {
+        let mut pre_pace = ScriptedProbes::new(vec![(
+            verify_header(PIN1_REFERENCE),
+            StatusWord::SecurityNotSatisfied,
+        )]);
+        assert_eq!(
+            pre_pace.pin1_status_and_scheme().expect("stops cleanly"),
+            (
+                PinReferenceScheme::Citizen,
+                PinStatus::Other(StatusWord::SecurityNotSatisfied),
+            )
+        );
+        pre_pace.assert_drained();
+
+        let estonian_ref = PinReferenceScheme::Estonian.reference(PinSlot::Pin1);
+        let mut all_miss = ScriptedProbes::new(vec![
+            (
+                verify_header(PIN1_REFERENCE),
+                StatusWord::ReferenceDataNotFound,
+            ),
+            (
+                verify_header(PIN1_REFERENCE_ORGANIZATIONAL),
+                StatusWord::ReferenceDataNotFound,
+            ),
+            (
+                verify_header(estonian_ref),
+                StatusWord::ReferenceDataNotFound,
+            ),
+        ]);
+        assert_eq!(
+            all_miss
+                .pin1_status_and_scheme()
+                .expect("falls back cleanly"),
+            (
+                PinReferenceScheme::Citizen,
+                PinStatus::Other(StatusWord::ReferenceDataNotFound),
+            )
+        );
+        all_miss.assert_drained();
+    }
+
+    #[test]
+    fn estonian_verify_respects_the_three_try_scale_and_two_try_floor() {
+        let mut served = WireRecorder::answering(counter(THREE_RETRIES), StatusWord::Success);
+        assert_eq!(
+            served
+                .verify_pin1_with_scheme(PinReferenceScheme::Estonian, pin1(WIRE_DIGITS))
+                .expect("pristine three tries is served"),
+            VerifyOutcome::Ok
+        );
+        assert!(served.credential.is_some());
+
+        for below in [RETRIES_BELOW_FLOOR, RETRIES_LOCKDOWN_IMMINENT] {
+            let mut refused = WireRecorder::answering(counter(below), StatusWord::Success);
+            assert!(matches!(
+                refused.verify_pin1_with_scheme(PinReferenceScheme::Estonian, pin1(WIRE_DIGITS)),
+                Err(AuthError::RetryFloor(RetryFloorRefusal::TriesBelowFloor {
+                    credential: FlooredCredential::Pin1,
+                    remaining,
+                })) if remaining.get() == below
+            ));
+            assert!(refused.credential.is_none());
+        }
+
+        let above_estonian_limit = THREE_RETRIES + 1;
+        let mut unreadable =
+            WireRecorder::answering(counter(above_estonian_limit), StatusWord::Success);
+        assert!(matches!(
+            unreadable.verify_pin1_with_scheme(PinReferenceScheme::Estonian, pin1(WIRE_DIGITS)),
+            Err(AuthError::RetryFloor(
+                RetryFloorRefusal::CounterUnreadable {
+                    credential: FlooredCredential::Pin1,
+                }
+            ))
+        ));
+        assert!(unreadable.credential.is_none());
     }
 }
 

@@ -1918,7 +1918,11 @@ where
         (Err(AuthError::RetryFloor(refusal)), _) => return Err(retry_floor_rv(refusal)),
         _ => return Err(CKR_DEVICE_ERROR),
     };
-    let signed = sign_with_card(card, request);
+    let signed = sign_with_card(
+        card,
+        refineid_sign::SignScheme::from(resolved_scheme),
+        request,
+    );
     accepted.settle_operation(
         &mut pin_cache
             .lock()
@@ -2264,7 +2268,8 @@ where
             AuthError::Transport(_)
             | AuthError::Outcome(_)
             | AuthError::Command(_)
-            | AuthError::PinLength(_),
+            | AuthError::PinLength(_)
+            | AuthError::UnsupportedSlot { .. },
         ) => {
             clear_positive(pin_cache);
             return Err(CKR_DEVICE_ERROR);
@@ -2486,7 +2491,8 @@ pub(super) fn card_change_pin1(
                 refineid_auth::AuthError::RetryFloor(refusal) => retry_floor_rv(refusal),
                 refineid_auth::AuthError::Transport(_)
                 | refineid_auth::AuthError::Outcome(_)
-                | refineid_auth::AuthError::Command(_) => CKR_DEVICE_ERROR,
+                | refineid_auth::AuthError::Command(_)
+                | refineid_auth::AuthError::UnsupportedSlot { .. } => CKR_DEVICE_ERROR,
             })?;
         match outcome {
             refineid_auth::ManageOutcome::Ok => Ok(()),
@@ -4371,7 +4377,9 @@ mod tests {
         let signature = vec![SIGNATURE_FILL; super::ECDSA_P384_SIGNATURE_BYTES];
         let mse_wire = refineid_sign::commands::MseSet {
             alg_ref: refineid_sign::commands::SignatureAlgRef::SHA384_ECDSA,
-            key_ref: refineid_sign::KeyRef::Auth.reference(refineid_sign::SignScheme::Citizen),
+            key_ref: refineid_sign::KeyRef::Auth
+                .reference(refineid_sign::SignScheme::Citizen)
+                .expect("citizen auth key has a reference"),
         }
         .into_apdu()
         .expect("MSE:Set encodes")
@@ -4604,7 +4612,9 @@ mod tests {
         let signature = vec![SIGNATURE_FILL; super::ECDSA_P384_SIGNATURE_BYTES];
         let mse_wire = refineid_sign::commands::MseSet {
             alg_ref: refineid_sign::commands::SignatureAlgRef::SHA384_ECDSA,
-            key_ref: refineid_sign::KeyRef::Auth.reference(refineid_sign::SignScheme::Citizen),
+            key_ref: refineid_sign::KeyRef::Auth
+                .reference(refineid_sign::SignScheme::Estonian)
+                .expect("Estonian auth key has a reference"),
         }
         .into_apdu()
         .expect("MSE:Set encodes")

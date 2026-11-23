@@ -160,7 +160,12 @@ impl CheckedOutPin1 {
                 return None;
             }
             Ok(VerifyOutcome::Locked | VerifyOutcome::Other(_))
-            | Err(AuthError::Command(_) | AuthError::RetryFloor(_) | AuthError::PinLength(_)) => {
+            | Err(
+                AuthError::Command(_)
+                | AuthError::RetryFloor(_)
+                | AuthError::PinLength(_)
+                | AuthError::UnsupportedSlot { .. },
+            ) => {
                 return None;
             }
             Err(AuthError::Transport(error)) => Some(ExchangeFailure::of(error.kind())),
@@ -192,6 +197,7 @@ impl AcceptedPin1 {
             | Some(
                 SignError::Status(..)
                 | SignError::Command(_)
+                | SignError::UnsupportedKey { .. }
                 | SignError::UnexpectedSignatureLength { .. },
             ) => false,
             Some(SignError::Transport(error)) => {

@@ -102,7 +102,9 @@ fn select_esign_by_name_wire() -> Vec<u8> {
 fn qualified_mse_wire(alg: SignatureAlgRef) -> Vec<u8> {
     MseSet {
         alg_ref: alg,
-        key_ref: KeyRef::Sign.reference(SignScheme::Organizational),
+        key_ref: KeyRef::Sign
+            .reference(SignScheme::Organizational)
+            .expect("organizational qualified key has a reference"),
     }
     .into_apdu()
     .expect("MSE:Set encodes")

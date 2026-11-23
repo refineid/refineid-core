@@ -24,6 +24,17 @@ python3 "$root/scripts/check-receipt.py" source-checks \
     --tool sh --tool cargo --tool rustc --tool rustfmt --tool cargo-fmt --tool git --tool grep \
     -- sh "$root/scripts/run-source-checks.sh"
 cargo build
+rustc_sysroot=$(rustc --print sysroot)
+if command -v cygpath > /dev/null 2>&1; then
+    rustc_sysroot=$(cygpath -u "$rustc_sysroot")
+else
+    rustc_sysroot=$(printf '%s' "$rustc_sysroot" | tr '\\' '/')
+fi
+if [ ! -d "$rustc_sysroot/lib/rustlib/src/rust/library/core/src" ]; then
+    echo "pre-push: active Rust toolchain is missing the rust-src component required by trybuild UI tests." >&2
+    echo "Install it with: rustup component add rust-src" >&2
+    exit 1
+fi
 cargo test
 cargo clippy --all-targets -- -D warnings
 # The library alone, without dev-dependencies: the RAPP crate's

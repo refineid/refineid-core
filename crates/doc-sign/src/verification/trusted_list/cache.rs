@@ -38,6 +38,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -79,6 +81,19 @@ pub const RETRY_AFTER: Duration = Duration::from_secs(SECONDS_PER_HOUR);
 const LIST_EXTENSION: &str = "list";
 /// File extension of a list being written.
 const TEMPORARY_EXTENSION: &str = "tmp";
+/// Random bytes appended to each staging file name so writers do not collide
+/// on a predictable path.
+const TEMP_SUFFIX_BYTES: usize = 8;
+/// Maximum exclusive-create attempts before failing closed on staging-path
+/// collisions.
+const MAX_TEMP_ATTEMPTS: usize = 8;
+/// Zero fill byte used when initializing the random staging-suffix buffer.
+const ZERO_BYTE: u8 = 0;
+/// Win32 `FILE_FLAG_OPEN_REPARSE_POINT` (`CreateFileW`): prevents following a
+/// symlink or reparse point (including a dangling symlink) when opening a
+/// staging file exclusively on Windows.
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 /// How many national lists are downloaded at once. One after another
 /// the thirty-odd EU lists, some 30 MB, take as long as their sum,
 /// tens of seconds; eight at a time bring that near the slowest
@@ -649,26 +664,98 @@ fn decode(bytes: &[u8]) -> Option<CachedList> {
     Some(CachedList::new(location, fetched_at, next_update, list))
 }
 
+/// Build the sibling staging path for `path` with `suffix`.
+fn temporary_path(path: &Path, suffix: &str) -> PathBuf {
+    path.with_extension(format!("{TEMPORARY_EXTENSION}.{suffix}"))
+}
+
+/// Generate a random hex suffix for an exclusive staging file.
+fn random_temp_suffix() -> std::io::Result<String> {
+    let mut random = [ZERO_BYTE; TEMP_SUFFIX_BYTES];
+    getrandom::fill(&mut random)
+        .map_err(|error| std::io::Error::other(format!("staging-file entropy failed: {error}")))?;
+    Ok(hex::encode(random))
+}
+
+/// Return the Unix `O_NOFOLLOW` open flag, failing closed if it cannot be
+/// represented as `i32`.
+#[cfg(unix)]
+fn no_follow_flag() -> std::io::Result<i32> {
+    i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits())
+        .map_err(|_| std::io::Error::other("O_NOFOLLOW flag does not fit in i32"))
+}
+
+/// Return whether an exclusive staging-file open error indicates a path
+/// collision (existing file or symlink) that should retry with a fresh name.
+fn is_retryable_temp_open_error(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        return true;
+    }
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) {
+        return true;
+    }
+    false
+}
+
 /// Write `bytes` to `path` atomically, owner-only on Unix.
 ///
 /// # Errors
-/// The I/O error of the write; the temporary file is removed.
+/// The I/O error of the write; any newly created temporary file is removed on
+/// failure.
 fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let temporary = path.with_extension(format!("{TEMPORARY_EXTENSION}.{}", std::process::id()));
-    let written = (|| {
+    write_atomically_with_suffix(path, bytes, random_temp_suffix)
+}
+
+/// Write `bytes` to `path` atomically using exclusive staging-file creation
+/// (`create_new(true)` and `O_NOFOLLOW` on Unix) with bounded retries over
+/// `next_suffix`.
+fn write_atomically_with_suffix<F>(
+    path: &Path,
+    bytes: &[u8],
+    mut next_suffix: F,
+) -> std::io::Result<()>
+where
+    F: FnMut() -> std::io::Result<String>,
+{
+    #[cfg(unix)]
+    let no_follow = no_follow_flag()?;
+
+    for _ in 0..MAX_TEMP_ATTEMPTS {
+        let suffix = next_suffix()?;
+        let temporary = temporary_path(path, &suffix);
         let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(true);
+        options.write(true).create_new(true);
         #[cfg(unix)]
-        options.mode(FILE_MODE);
-        let mut file: File = options.open(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        fs::rename(&temporary, path)
-    })();
-    if written.is_err() {
-        let _removed = fs::remove_file(&temporary);
+        {
+            options.mode(FILE_MODE);
+            options.custom_flags(no_follow);
+        }
+        #[cfg(windows)]
+        {
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let mut file: File = match options.open(&temporary) {
+            Ok(file) => file,
+            Err(error) if is_retryable_temp_open_error(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        let written = (|| {
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temporary, path)
+        })();
+        if written.is_err() {
+            let _removed = fs::remove_file(&temporary);
+        }
+        return written;
     }
-    written
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate unique temporary file",
+    ))
 }
 
 #[cfg(test)]

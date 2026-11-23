@@ -1811,4 +1811,33 @@ mod tests {
             .expect_err("must propagate PUK probe transport error");
         assert!(matches!(err, AuthError::Transport(_)));
     }
+
+    #[test]
+    fn read_card_pin_lengths_propagates_ef_aod_transport_error() {
+        let mut transport = Recorder::new(vec![]);
+        let err = transport
+            .read_card_pin_lengths_with_scheme(PinReferenceScheme::Estonian)
+            .expect_err("transport error during EF.AOD read must not fall back to defaults");
+        assert!(matches!(err, AuthError::Transport(_)));
+    }
+
+    #[test]
+    fn read_card_pin_lengths_falls_back_to_defaults_when_ef_aod_is_absent() {
+        // SELECT PKCS#15 succeeds; EF.4401 (two variants) and EF.5006 (two variants)
+        // all answer FileNotFound.
+        let mut transport = Recorder::new(vec![
+            StatusWord::Success,
+            StatusWord::FileNotFound,
+            StatusWord::FileNotFound,
+            StatusWord::FileNotFound,
+            StatusWord::FileNotFound,
+        ]);
+        let lengths = transport
+            .read_card_pin_lengths_with_scheme(PinReferenceScheme::Estonian)
+            .expect("absent EF.AOD falls back to role bounds");
+        assert_eq!(
+            lengths,
+            CardPinLengths::not_listed(PinReferenceScheme::Estonian)
+        );
+    }
 }

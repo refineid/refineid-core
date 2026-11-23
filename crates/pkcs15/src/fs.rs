@@ -22,8 +22,8 @@
 use core::fmt;
 
 use refineid_apdu::iso7816::{
-    DirectOffset15, ReadBinary, ReadBinaryOffset, SelectByAidNoFci, SelectEfNoFci, SelectFile,
-    SelectFileResponseMode, SelectFileTarget,
+    AbsolutePath, DirectOffset15, ReadBinary, ReadBinaryOffset, SelectByAidNoFci, SelectEfNoFci,
+    SelectFile, SelectFileResponseMode, SelectFileTarget,
 };
 use refineid_apdu::{
     Aid, AidError, ApduClass, CardTransport, CommandApdu, CommandDataError, CommandHeader, FileId,
@@ -215,6 +215,11 @@ const READ_CHUNK: u8 = 0xDF;
 /// `Le = 0` asks for the full 256-byte short-response window; some cards
 /// answer a shorter request over a small EF with end-of-file and no data.
 const READ_LE_256: u8 = 0x00;
+/// One extra byte requested past a valid document number so an overlong
+/// EF.5007 is observed and rejected rather than truncated.
+const OVERLONG_PROBE_SLACK: usize = 1;
+/// Read cap for plain-ASCII EF.5007: one byte past a valid document number.
+const DOCUMENT_NUMBER_PROBE_CAP: usize = crate::DOCUMENT_NUMBER_CHARS + OVERLONG_PROBE_SLACK;
 
 /// Hard cap on one object read. FINEID certificates are under two
 /// kibibytes; a sixteen-kibibyte ceiling leaves room for variants while
@@ -356,9 +361,6 @@ const P1_SELECT_CHILD_DF: u8 = 0x01;
 /// P1: select a DF or MF by name; some FINEID variants accept the MF
 /// identifier through this mode.
 const P1_SELECT_BY_NAME: u8 = 0x04;
-/// P1: select a file by its full path, one two-byte file identifier
-/// per step from the MF.
-const P1_SELECT_PATH: u8 = 0x08;
 /// P2: return no response data, shared with the typed SELECT builder.
 const P2_NO_RESPONSE_DATA: u8 = SelectFileResponseMode::None.as_p2();
 
@@ -392,22 +394,15 @@ fn select_child_df_variant<E>(fid: FileId) -> Result<CommandApdu, Pkcs15Error<E>
 }
 
 /// Build the full-path SELECT variant: every file identifier in
-/// `path` is one step from the MF, sent in a single command.
-fn select_path_variant<E>(path: &[FileId]) -> Result<CommandApdu, Pkcs15Error<E>> {
-    let mut data = Vec::with_capacity(path.len().saturating_mul(FileId::LENGTH));
-    for fid in path {
-        data.extend_from_slice(fid.as_bytes());
+/// `path` is one step from the MF, sent in a single Case 4 command
+/// requesting the FCP template.
+fn select_path_variant(path: &AbsolutePath) -> CommandApdu {
+    SelectFile {
+        class: ApduClass::Plain,
+        target: SelectFileTarget::AbsolutePath(path.clone()),
+        response_mode: SelectFileResponseMode::Fcp,
     }
-    CommandApdu::case_3(
-        CommandHeader {
-            class: ApduClass::Plain,
-            instruction: SelectFile::INS,
-            p1: P1_SELECT_PATH,
-            p2: SelectFileResponseMode::Fcp.as_p2(),
-        },
-        &data,
-    )
-    .map_err(Pkcs15Error::Command)
+    .into_apdu()
 }
 
 /// Build the any-file-by-identifier SELECT variant.
@@ -503,11 +498,11 @@ pub trait Pkcs15Ops: CardTransport {
     /// # Errors
     ///
     /// Transport failures, or a non-success status word.
-    fn select_path(&mut self, path: &[FileId]) -> Result<(), Pkcs15Error<Self::Error>>
+    fn select_path(&mut self, path: &AbsolutePath) -> Result<(), Pkcs15Error<Self::Error>>
     where
         Self: Sized,
     {
-        let command = select_path_variant(path)?;
+        let command = select_path_variant(path);
         let response = exchange(self, &command)?;
         if response.is_ok() {
             Ok(())
@@ -565,13 +560,17 @@ pub trait Pkcs15Ops: CardTransport {
             let remaining = cap.checked_sub(offset).ok_or(Pkcs15Error::TooLarge)?;
             let want_usize = remaining.min(usize::from(READ_CHUNK));
             let want = u8::try_from(want_usize).map_err(|_| Pkcs15Error::TooLarge)?;
-            let response = read_chunk(self, offset, want)?;
+            let response = read_chunk_with_eof_retry(self, offset, want)?;
             let end_of_file = matches!(response.status_word(), StatusWord::EndOfFile);
             if !response.is_ok() && !end_of_file {
                 return Err(Pkcs15Error::Status(response.status_word()));
             }
             let body_len = response.body.len();
             collected.extend_from_slice(&response.body);
+            if collected.len() >= cap {
+                collected.truncate(cap);
+                break;
+            }
             if body_len == 0 || body_len < usize::from(want) || end_of_file {
                 break;
             }
@@ -628,14 +627,7 @@ pub trait Pkcs15Ops: CardTransport {
                 .ok_or(Pkcs15Error::TooLarge)?;
             let want_usize = remaining.min(usize::from(READ_CHUNK));
             let want = u8::try_from(want_usize).map_err(|_| Pkcs15Error::TooLarge)?;
-            let mut response = read_chunk(self, collected.len(), want)?;
-            if collected.is_empty()
-                && total_length.is_none()
-                && response.body.is_empty()
-                && matches!(response.status_word(), StatusWord::EndOfFile)
-            {
-                response = read_chunk(self, collected.len(), READ_LE_256)?;
-            }
+            let response = read_chunk_with_eof_retry(self, collected.len(), want)?;
             let end_of_file = matches!(response.status_word(), StatusWord::EndOfFile);
             if !response.is_ok() && !end_of_file {
                 return Err(Pkcs15Error::Status(response.status_word()));
@@ -713,6 +705,12 @@ pub trait Pkcs15Ops: CardTransport {
     /// Read and parse EF.AOD, the card's authentication objects, under
     /// the PKCS#15 application.
     ///
+    /// Tries the FINEID identifier (EF.4401) first and falls back to
+    /// the Estonian eID identifier (EF.5006) only when EF.4401 answers
+    /// [`StatusWord::FileNotFound`]. Transport failures, transport
+    /// state transitions, other status words, and parse errors on a
+    /// selected file propagate immediately.
+    ///
     /// The file is read to its end: it holds several top-level objects
     /// and may be zero-padded, so no single DER header sizes it.
     ///
@@ -726,21 +724,19 @@ pub trait Pkcs15Ops: CardTransport {
     where
         Self: Sized,
     {
+        self.select_pkcs15_application()?;
         for fid in [crate::EF_AOD_FID, crate::EF_ESTONIAN_AOD_FID] {
-            if self.select_pkcs15_application().is_err() {
-                continue;
-            }
-            if self.select_ef(fid).is_err() {
-                continue;
-            }
-            let Ok(bytes) = self.read_binary_to_end(None) else {
-                continue;
-            };
-            if let Ok(objects) = crate::AuthenticationObjects::parse(&bytes) {
-                return Ok(objects);
+            match self.select_ef(fid) {
+                Ok(()) => {
+                    let bytes = self.read_binary_to_end(None)?;
+                    return crate::AuthenticationObjects::parse(&bytes)
+                        .map_err(|_parse_error| Pkcs15Error::InvalidData("EF.AOD"));
+                }
+                Err(Pkcs15Error::Status(StatusWord::FileNotFound)) => {}
+                Err(error) => return Err(error),
             }
         }
-        Err(Pkcs15Error::InvalidData("EF.AOD"))
+        Err(Pkcs15Error::Status(StatusWord::FileNotFound))
     }
 
     /// Read and parse EF.TokenInfo.
@@ -765,6 +761,13 @@ pub trait Pkcs15Ops: CardTransport {
     /// the earlier platforms keep a DER TLV in EF.D003 under the MF.
     /// Neither file needs a PIN.
     ///
+    /// Both paths traverse out of the PKCS#15 application from the MF
+    /// (absolute-path SELECT to DF.DD/EF.5007, or `select_mf` for
+    /// EF.D003). Do not call this over a PACE secure channel where MF
+    /// traversal tears down the channel, and re-select the PKCS#15
+    /// application before issuing application-relative commands
+    /// afterwards.
+    ///
     /// # Errors
     ///
     /// SELECT or read failures, or a file whose bytes are not a
@@ -774,15 +777,26 @@ pub trait Pkcs15Ops: CardTransport {
     where
         Self: Sized,
     {
-        let current = [
+        let current = AbsolutePath::new(vec![
             DF_ESTONIAN_PERSONAL_DATA_FID,
             EF_ESTONIAN_DOCUMENT_NUMBER_FID,
-        ];
-        if self.select_path(&current).is_ok() {
-            let bytes = self.read_binary_to_end(Some(crate::DOCUMENT_NUMBER_CHARS))?;
-            if let Ok(number) = crate::DocumentNumber::from_ascii(&bytes) {
-                return Ok(number);
+        ])
+        .map_err(|_path_err| Pkcs15Error::InvalidData("EF.5007"))?;
+        match self.select_path(&current) {
+            Ok(()) => {
+                let bytes = self.read_binary_to_end(Some(DOCUMENT_NUMBER_PROBE_CAP))?;
+                return crate::DocumentNumber::from_ascii(&bytes)
+                    .map_err(|_parse_error| Pkcs15Error::InvalidData("EF.5007"));
             }
+            Err(
+                error @ (Pkcs15Error::Transport(_)
+                | Pkcs15Error::Outcome(_)
+                | Pkcs15Error::Status(
+                    StatusWord::SecurityNotSatisfied | StatusWord::SmDataObjectsIncorrect,
+                )),
+            ) => return Err(error),
+            Err(Pkcs15Error::Status(_)) => {}
+            Err(error) => return Err(error),
         }
         self.select_mf()?;
         self.select_ef(EF_ESTONIAN_DOCUMENT_NUMBER_LEGACY_FID)?;
@@ -793,6 +807,26 @@ pub trait Pkcs15Ops: CardTransport {
 }
 
 impl<T: CardTransport + ?Sized> Pkcs15Ops for T {}
+
+/// Issue one READ BINARY at `offset` for `want` bytes. At offset zero,
+/// if the card answers an overlong request over a small EF with
+/// [`StatusWord::EndOfFile`] and no body, retry once with
+/// [`READ_LE_256`], the full short-response window.
+fn read_chunk_with_eof_retry<T: CardTransport + ?Sized>(
+    transport: &mut T,
+    offset: usize,
+    want: u8,
+) -> Result<ResponseApdu, Pkcs15Error<T::Error>> {
+    let response = read_chunk(transport, offset, want)?;
+    if offset == 0
+        && want != READ_LE_256
+        && response.body.is_empty()
+        && matches!(response.status_word(), StatusWord::EndOfFile)
+    {
+        return read_chunk(transport, offset, READ_LE_256);
+    }
+    Ok(response)
+}
 
 /// Issue one READ BINARY at `offset` for `want` bytes.
 fn read_chunk<T: CardTransport + ?Sized>(

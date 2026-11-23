@@ -15,18 +15,19 @@
 //! Scripted-transport tests for the PKCS#15 read flows.
 
 use refineid_apdu::iso7816::{
-    DirectOffset15, ReadBinary, ReadBinaryOffset, SelectByAidNoFci, SelectEfNoFci, SelectFile,
-    SelectFileResponseMode, SelectFileTarget,
+    AbsolutePath, DirectOffset15, ReadBinary, ReadBinaryOffset, SelectByAidNoFci, SelectEfNoFci,
+    SelectFile, SelectFileResponseMode, SelectFileTarget,
 };
 use refineid_apdu::{
     Aid, ApduClass, CardTransport, CommandApdu, CredentialCommand, FileId, ResponseApdu,
     StatusWord, TransportOutcome,
 };
-use refineid_ber::{BerTag, Sequence, tlv};
+use refineid_ber::{BerEncoder, BerTag, BitString, Integer, Sequence, tlv};
 use refineid_pkcs15::{
-    CertSlot, DF_ESIGN_FID, DF_ESTONIAN_PERSONAL_DATA_FID, EF_ESTONIAN_AUTH_CERT_FID,
-    EF_ESTONIAN_DOCUMENT_NUMBER_FID, EF_ESTONIAN_DOCUMENT_NUMBER_LEGACY_FID, EF_TOKEN_INFO_FID,
-    ESIGN_AID, PKCS15_AID, Pkcs15Error, Pkcs15Ops,
+    CertSlot, DF_ESIGN_FID, DF_ESTONIAN_PERSONAL_DATA_FID, DOCUMENT_NUMBER_CHARS, EF_AOD_FID,
+    EF_ESTONIAN_AOD_FID, EF_ESTONIAN_AUTH_CERT_FID, EF_ESTONIAN_DOCUMENT_NUMBER_FID,
+    EF_ESTONIAN_DOCUMENT_NUMBER_LEGACY_FID, EF_TOKEN_INFO_FID, ESIGN_AID, PKCS15_AID, Pkcs15Error,
+    Pkcs15Ops,
 };
 
 /// Chunk size the read loops request, mirroring the implementation; a
@@ -51,11 +52,29 @@ const FILLER: u8 = 0x5A;
 const P1_SELECT_CHILD_DF: u8 = 0x01;
 /// P1 selecting by name, mirroring the implementation's MF fallback.
 const P1_SELECT_BY_NAME: u8 = 0x04;
-/// P1 selecting a full path, mirroring the implementation's 2025
-/// document-number read.
-const P1_SELECT_PATH: u8 = 0x08;
-/// P2 returning the FCP, the response mode the path select asks for.
-const P2_RETURN_FCP: u8 = 0x04;
+/// One extra byte past a valid document number so an overlong EF.5007
+/// is detected instead of truncated.
+const DOCUMENT_NUMBER_PROBE_SLACK: usize = 1;
+/// ASN.1 universal ENUMERATED tag for `pwdType` in EF.AOD fixtures.
+const ENUMERATED_TAG: u8 = 0x0A;
+/// PKCS#15 `typeAttributes [1]` constructed tag for EF.AOD fixtures.
+const TYPE_ATTRIBUTES_TAG: u8 = 0xA1;
+/// PKCS#15 `pwdReference [0]` tag for EF.AOD fixtures.
+const PWD_REFERENCE_TAG: u8 = 0x80;
+/// `pwdType` `ascii-numeric(1)` for EF.AOD fixtures.
+const PASSWORD_TYPE_ASCII_NUMERIC: u8 = 1;
+/// Estonian PIN1 reference in EF.AOD fixtures.
+const ESTONIAN_PIN1_REFERENCE: u8 = 0x81;
+/// Estonian PIN1 minimum length in EF.AOD fixtures.
+const ESTONIAN_PIN1_MIN_LEN: u8 = 4;
+/// Estonian PIN1 stored length in EF.AOD fixtures.
+const ESTONIAN_PIN1_STORED_LEN: u8 = 12;
+/// `pwdFlags` unused-bits octet in EF.AOD fixtures.
+const FLAGS_UNUSED_BITS: u8 = 0;
+/// `pwdFlags` value octet in EF.AOD fixtures.
+const FLAGS_OCTET: u8 = 0;
+/// Leading zero octet for DER positive INTEGER encoding with high bit set.
+const DER_ZERO_PREFIX: u8 = 0x00;
 /// BER long-form marker declaring two length octets.
 const TWO_OCTET_LONG_FORM: u8 = 0x82;
 /// Wire length of a status-word pair.
@@ -83,13 +102,35 @@ fn ok_response(body: &[u8]) -> ResponseApdu {
     }
 }
 
+enum ScriptReply {
+    Response(ResponseApdu),
+    Outcome(TransportOutcome),
+    Error(&'static str),
+}
+
+impl From<ResponseApdu> for ScriptReply {
+    fn from(response: ResponseApdu) -> Self {
+        Self::Response(response)
+    }
+}
+
 struct ScriptedTransport {
-    script: Vec<(Vec<u8>, ResponseApdu)>,
+    script: Vec<(Vec<u8>, ScriptReply)>,
     cursor: usize,
 }
 
 impl ScriptedTransport {
     fn new(script: Vec<(Vec<u8>, ResponseApdu)>) -> Self {
+        Self {
+            script: script
+                .into_iter()
+                .map(|(cmd, resp)| (cmd, ScriptReply::Response(resp)))
+                .collect(),
+            cursor: 0,
+        }
+    }
+
+    fn with_replies(script: Vec<(Vec<u8>, ScriptReply)>) -> Self {
         Self { script, cursor: 0 }
     }
 
@@ -117,7 +158,20 @@ impl CardTransport for ScriptedTransport {
             self.cursor
         );
         self.cursor += 1;
-        Ok(TransportOutcome::Response(scripted.clone()))
+        match scripted {
+            ScriptReply::Response(response) => Ok(TransportOutcome::Response(response.clone())),
+            ScriptReply::Outcome(outcome) => match outcome {
+                TransportOutcome::NoCard => Ok(TransportOutcome::NoCard),
+                TransportOutcome::CardReset => Ok(TransportOutcome::CardReset),
+                TransportOutcome::ReaderRemoved => Ok(TransportOutcome::ReaderRemoved),
+                TransportOutcome::TimeoutUnknownState => Ok(TransportOutcome::TimeoutUnknownState),
+                TransportOutcome::ProtocolDesync => Ok(TransportOutcome::ProtocolDesync),
+                TransportOutcome::Response(response) => {
+                    Ok(TransportOutcome::Response(response.clone()))
+                }
+            },
+            ScriptReply::Error(message) => Err((*message).to_owned()),
+        }
     }
 
     fn transmit_credential(
@@ -155,22 +209,28 @@ fn select_ef_wire(fid: FileId) -> Vec<u8> {
 }
 
 fn select_path_wire(path: &[FileId]) -> Vec<u8> {
-    let mut data = Vec::new();
-    for fid in path {
-        data.extend_from_slice(fid.as_bytes());
+    let absolute = AbsolutePath::new(path.to_vec()).expect("valid test path");
+    let wire = SelectFile {
+        class: ApduClass::Plain,
+        target: SelectFileTarget::AbsolutePath(absolute.clone()),
+        response_mode: SelectFileResponseMode::Fcp,
     }
-    CommandApdu::case_3(
-        refineid_apdu::CommandHeader {
-            class: ApduClass::Plain,
-            instruction: SelectFile::INS,
-            p1: P1_SELECT_PATH,
-            p2: P2_RETURN_FCP,
-        },
-        &data,
-    )
-    .expect("file identifiers fit a data field")
+    .into_apdu()
     .as_bytes()
-    .to_vec()
+    .to_vec();
+    let mut expected = vec![
+        ApduClass::Plain.as_byte(),
+        SelectFile::INS,
+        SelectFileTarget::AbsolutePath(absolute).as_p1(),
+        SelectFileResponseMode::Fcp.as_p2(),
+        u8::try_from(path.len().saturating_mul(FileId::LENGTH)).expect("test path fits short Lc"),
+    ];
+    for fid in path {
+        expected.extend_from_slice(fid.as_bytes());
+    }
+    expected.push(SelectFile::LE_ANY);
+    assert_eq!(wire, expected, "select_path wire must be Case 4 with FCP");
+    wire
 }
 
 fn select_any_by_fid_wire(fid: FileId) -> Vec<u8> {
@@ -457,11 +517,44 @@ fn token_info_reads_after_end_of_file_on_a_long_read() {
     transport.assert_drained();
 }
 
+fn document_number_probe_len() -> u8 {
+    u8::try_from(DOCUMENT_NUMBER_CHARS + DOCUMENT_NUMBER_PROBE_SLACK)
+        .expect("document number probe length fits one read")
+}
+
+fn aod_fixture(reference: u8, min_len: u8, stored_len: u8) -> Vec<u8> {
+    let bit_string_tag = u8::try_from(<BitString as BerTag>::TAG).expect("fits");
+    let integer_tag = u8::try_from(<Integer as BerTag>::TAG).expect("fits");
+    let mut attrs = BerEncoder::default();
+    attrs
+        .push_tlv(bit_string_tag, [FLAGS_UNUSED_BITS, FLAGS_OCTET])
+        .expect("fixture encodes");
+    attrs
+        .push_tlv(ENUMERATED_TAG, [PASSWORD_TYPE_ASCII_NUMERIC])
+        .expect("fixture encodes");
+    attrs
+        .push_tlv(integer_tag, [min_len])
+        .expect("fixture encodes");
+    attrs
+        .push_tlv(integer_tag, [stored_len])
+        .expect("fixture encodes");
+    let ref_bytes = if reference.leading_zeros() == 0 {
+        vec![DER_ZERO_PREFIX, reference]
+    } else {
+        vec![reference]
+    };
+    attrs
+        .push_tlv(PWD_REFERENCE_TAG, ref_bytes)
+        .expect("fixture encodes");
+    let attrs_seq = tlv(sequence_tag(), attrs.finish()).expect("fixture encodes");
+    let type_attrs = tlv(TYPE_ATTRIBUTES_TAG, attrs_seq).expect("fixture encodes");
+    tlv(sequence_tag(), type_attrs).expect("fixture encodes")
+}
+
 #[test]
 fn document_number_reads_from_the_2025_personal_data_file() {
     /// Synthetic printed document number: two letters and seven digits.
     const PRINTED_NUMBER: &str = "AB1234567";
-    let number_len = u8::try_from(PRINTED_NUMBER.len()).expect("the value fits one read");
 
     let mut transport = ScriptedTransport::new(vec![
         (
@@ -472,8 +565,8 @@ fn document_number_reads_from_the_2025_personal_data_file() {
             ok_response(&[]),
         ),
         (
-            read_wire(0, number_len),
-            ok_response(PRINTED_NUMBER.as_bytes()),
+            read_wire(0, document_number_probe_len()),
+            response(PRINTED_NUMBER.as_bytes(), StatusWord::EndOfFile),
         ),
     ]);
 
@@ -481,6 +574,208 @@ fn document_number_reads_from_the_2025_personal_data_file() {
         .read_document_number()
         .expect("the document number reads");
     assert_eq!(number.as_str(), PRINTED_NUMBER);
+    transport.assert_drained();
+}
+
+#[test]
+fn document_number_retries_with_le_256_after_empty_end_of_file() {
+    /// Synthetic printed document number: two letters and seven digits.
+    const PRINTED_NUMBER: &str = "AB1234567";
+
+    let mut transport = ScriptedTransport::new(vec![
+        (
+            select_path_wire(&[
+                DF_ESTONIAN_PERSONAL_DATA_FID,
+                EF_ESTONIAN_DOCUMENT_NUMBER_FID,
+            ]),
+            ok_response(&[]),
+        ),
+        (
+            read_wire(0, document_number_probe_len()),
+            response(&[], StatusWord::EndOfFile),
+        ),
+        (
+            read_wire(0, READ_LE_256_LEN),
+            ok_response(PRINTED_NUMBER.as_bytes()),
+        ),
+    ]);
+
+    let number = transport
+        .read_document_number()
+        .expect("the full-window retry reads the document number");
+    assert_eq!(number.as_str(), PRINTED_NUMBER);
+    transport.assert_drained();
+}
+
+#[test]
+fn document_number_rejects_overlong_ef_5007() {
+    /// Synthetic overlong file content: ten ASCII characters instead of nine.
+    const OVERLONG_NUMBER: &str = "AB12345670";
+
+    let mut transport = ScriptedTransport::new(vec![
+        (
+            select_path_wire(&[
+                DF_ESTONIAN_PERSONAL_DATA_FID,
+                EF_ESTONIAN_DOCUMENT_NUMBER_FID,
+            ]),
+            ok_response(&[]),
+        ),
+        (
+            read_wire(0, document_number_probe_len()),
+            ok_response(OVERLONG_NUMBER.as_bytes()),
+        ),
+    ]);
+
+    let error = transport
+        .read_document_number()
+        .expect_err("an overlong EF.5007 must be rejected, not truncated");
+    assert!(matches!(error, Pkcs15Error::InvalidData("EF.5007")));
+    transport.assert_drained();
+}
+
+#[test]
+fn document_number_propagates_transport_and_outcome_errors() {
+    let mut transport_err = ScriptedTransport::with_replies(vec![(
+        select_path_wire(&[
+            DF_ESTONIAN_PERSONAL_DATA_FID,
+            EF_ESTONIAN_DOCUMENT_NUMBER_FID,
+        ]),
+        ScriptReply::Error("reader disconnected"),
+    )]);
+    let error = transport_err
+        .read_document_number()
+        .expect_err("transport error must propagate immediately");
+    assert!(matches!(error, Pkcs15Error::Transport(_)));
+    transport_err.assert_drained();
+
+    let mut outcome_err = ScriptedTransport::with_replies(vec![(
+        select_path_wire(&[
+            DF_ESTONIAN_PERSONAL_DATA_FID,
+            EF_ESTONIAN_DOCUMENT_NUMBER_FID,
+        ]),
+        ScriptReply::Outcome(TransportOutcome::CardReset),
+    )]);
+    let error = outcome_err
+        .read_document_number()
+        .expect_err("transport outcome must propagate immediately");
+    assert!(matches!(
+        error,
+        Pkcs15Error::Outcome(TransportOutcome::CardReset)
+    ));
+    outcome_err.assert_drained();
+}
+
+#[test]
+fn authentication_objects_reads_estonian_ef_5006_after_empty_end_of_file() {
+    let aod = aod_fixture(
+        ESTONIAN_PIN1_REFERENCE,
+        ESTONIAN_PIN1_MIN_LEN,
+        ESTONIAN_PIN1_STORED_LEN,
+    );
+
+    let mut transport = ScriptedTransport::new(vec![
+        (select_app_wire(), ok_response(&[])),
+        (
+            select_ef_wire(EF_AOD_FID),
+            response(&[], StatusWord::FileNotFound),
+        ),
+        (
+            select_any_by_fid_wire(EF_AOD_FID),
+            response(&[], StatusWord::FileNotFound),
+        ),
+        (select_ef_wire(EF_ESTONIAN_AOD_FID), ok_response(&[])),
+        (
+            read_wire(0, READ_CHUNK_LEN),
+            response(&[], StatusWord::EndOfFile),
+        ),
+        (read_wire(0, READ_LE_256_LEN), ok_response(&aod)),
+    ]);
+
+    let objects = transport
+        .read_authentication_objects()
+        .expect("Estonian EF.5006 must read after the full-window retry");
+    assert!(objects.lists_reference(ESTONIAN_PIN1_REFERENCE));
+    transport.assert_drained();
+}
+
+#[test]
+fn authentication_objects_propagates_transport_and_outcome_errors() {
+    let mut on_app = ScriptedTransport::with_replies(vec![(
+        select_app_wire(),
+        ScriptReply::Error("reader disconnected"),
+    )]);
+    let error = on_app
+        .read_authentication_objects()
+        .expect_err("transport error must propagate");
+    assert!(matches!(error, Pkcs15Error::Transport(_)));
+    on_app.assert_drained();
+
+    let mut on_ef = ScriptedTransport::with_replies(vec![
+        (select_app_wire(), ScriptReply::Response(ok_response(&[]))),
+        (
+            select_ef_wire(EF_AOD_FID),
+            ScriptReply::Outcome(TransportOutcome::NoCard),
+        ),
+    ]);
+    let error = on_ef
+        .read_authentication_objects()
+        .expect_err("card removal must propagate");
+    assert!(matches!(
+        error,
+        Pkcs15Error::Outcome(TransportOutcome::NoCard)
+    ));
+    on_ef.assert_drained();
+
+    let mut on_read = ScriptedTransport::with_replies(vec![
+        (select_app_wire(), ScriptReply::Response(ok_response(&[]))),
+        (
+            select_ef_wire(EF_AOD_FID),
+            ScriptReply::Response(ok_response(&[])),
+        ),
+        (
+            read_wire(0, READ_CHUNK_LEN),
+            ScriptReply::Outcome(TransportOutcome::CardReset),
+        ),
+    ]);
+    let error = on_read
+        .read_authentication_objects()
+        .expect_err("card reset during read must propagate");
+    assert!(matches!(
+        error,
+        Pkcs15Error::Outcome(TransportOutcome::CardReset)
+    ));
+    on_read.assert_drained();
+}
+
+#[test]
+fn authentication_objects_reports_file_not_found_when_neither_file_exists() {
+    let mut transport = ScriptedTransport::new(vec![
+        (select_app_wire(), ok_response(&[])),
+        (
+            select_ef_wire(EF_AOD_FID),
+            response(&[], StatusWord::FileNotFound),
+        ),
+        (
+            select_any_by_fid_wire(EF_AOD_FID),
+            response(&[], StatusWord::FileNotFound),
+        ),
+        (
+            select_ef_wire(EF_ESTONIAN_AOD_FID),
+            response(&[], StatusWord::FileNotFound),
+        ),
+        (
+            select_any_by_fid_wire(EF_ESTONIAN_AOD_FID),
+            response(&[], StatusWord::FileNotFound),
+        ),
+    ]);
+
+    let error = transport
+        .read_authentication_objects()
+        .expect_err("missing EF.AOD must report FileNotFound");
+    assert!(matches!(
+        error,
+        Pkcs15Error::Status(StatusWord::FileNotFound)
+    ));
     transport.assert_drained();
 }
 

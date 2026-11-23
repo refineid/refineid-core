@@ -234,9 +234,14 @@ impl<T: CardTransport, O> SmTransport<T, O> {
             .get(..HEADER_LEN)
             .and_then(|slice| <[u8; HEADER_LEN]>::try_from(slice).ok())
             .ok_or(SmError::Malformed("command shorter than its header"))?;
-        let [_class, instruction, p1, p2] = header;
+        let [class, instruction, p1, p2] = header;
+        let sm_class = if (class & ApduClass::ChainedFirst.as_byte()) != 0 {
+            ApduClass::ChainedSecureMessaging
+        } else {
+            ApduClass::SecureMessaging
+        };
         let sm_header = CommandHeader {
-            class: ApduClass::SecureMessaging,
+            class: sm_class,
             instruction,
             p1,
             p2,
@@ -273,7 +278,7 @@ impl<T: CardTransport, O> SmTransport<T, O> {
             None => Vec::new(),
         };
 
-        let sm_header_bytes = [ApduClass::SecureMessaging.as_byte(), instruction, p1, p2];
+        let sm_header_bytes = sm_header.to_bytes();
         let mut mac_input = Vec::new();
         mac_input.extend_from_slice(self.ssc.as_bytes());
         mac_input.extend_from_slice(&iso7816_4_pad(&sm_header_bytes));
@@ -1335,5 +1340,60 @@ mod tests {
         let response = outcome.into_response().expect("real response");
         assert!(response.is_ok());
         assert_eq!(response.body.as_slice(), RESPONSE_PAYLOAD);
+    }
+
+    #[test]
+    fn chained_command_wraps_with_chained_secure_messaging_class_and_mac() {
+        const CHAIN_DATA_LEN: usize = 223;
+        const SHORT_APDU_MAX_BODY: usize = 255;
+        const FILL_OCTET: u8 = 0x5A;
+
+        let payload = vec![FILL_OCTET; CHAIN_DATA_LEN];
+        let chained = CommandApdu::case_3(
+            CommandHeader {
+                class: ApduClass::ChainedFirst,
+                instruction: DATA_INS,
+                p1: P_ZERO,
+                p2: P_ZERO,
+            },
+            &payload,
+        )
+        .expect("chained command encodes");
+        let plain = CommandApdu::case_3(
+            CommandHeader {
+                class: ApduClass::Plain,
+                instruction: DATA_INS,
+                p1: P_ZERO,
+                p2: P_ZERO,
+            },
+            &payload,
+        )
+        .expect("plain command encodes");
+
+        let mut chained_sm = SmTransport::new(Null, session());
+        let (chained_header, chained_body) = chained_sm
+            .wrap(chained.as_bytes())
+            .expect("223-byte chained command fits short-form SM");
+        assert_eq!(chained_header.class, ApduClass::ChainedSecureMessaging);
+        assert!(chained_body.len() <= SHORT_APDU_MAX_BODY);
+
+        let mut plain_sm = SmTransport::new(Null, session());
+        let (plain_header, plain_body) = plain_sm
+            .wrap(plain.as_bytes())
+            .expect("223-byte plain command fits short-form SM");
+        assert_eq!(plain_header.class, ApduClass::SecureMessaging);
+
+        // Identical payload and SSC, differing only in the command-chaining
+        // class bit, must produce different MAC tags because the wrapped CLA
+        // enters CMAC.
+        assert!(chained_body != plain_body);
+        assert_eq!(
+            chained_body[..chained_body.len() - super::MAC_LEN],
+            plain_body[..plain_body.len() - super::MAC_LEN]
+        );
+        assert!(
+            chained_body[chained_body.len() - super::MAC_LEN..]
+                != plain_body[plain_body.len() - super::MAC_LEN..]
+        );
     }
 }

@@ -52,6 +52,9 @@ pub enum ApduClass {
     /// First portion of a command-chained body; the card waits for the
     /// final portion (FINEID S1 v4.2 section 3.6.2).
     ChainedFirst,
+    /// Command-chained portion protected by secure messaging, with the
+    /// command header authenticated (ISO/IEC 7816-4 section 5.4.1).
+    ChainedSecureMessaging,
 }
 
 impl ApduClass {
@@ -61,6 +64,9 @@ impl ApduClass {
     const CLA_SECURE_MESSAGING: u8 = 0x0C;
     /// Class byte for [`ApduClass::ChainedFirst`].
     const CLA_CHAINED_FIRST: u8 = 0x10;
+    /// Class byte for [`ApduClass::ChainedSecureMessaging`]: combines
+    /// command chaining with secure messaging.
+    const CLA_CHAINED_SECURE_MESSAGING: u8 = Self::CLA_CHAINED_FIRST | Self::CLA_SECURE_MESSAGING;
 
     /// Wire byte for this class.
     #[must_use]
@@ -69,6 +75,17 @@ impl ApduClass {
             Self::Plain => Self::CLA_PLAIN,
             Self::SecureMessaging => Self::CLA_SECURE_MESSAGING,
             Self::ChainedFirst => Self::CLA_CHAINED_FIRST,
+            Self::ChainedSecureMessaging => Self::CLA_CHAINED_SECURE_MESSAGING,
+        }
+    }
+
+    /// Promote this class byte into its ISO/IEC 7816-4 secure-messaging
+    /// counterpart while preserving the command-chaining bit.
+    #[must_use]
+    pub const fn with_secure_messaging(self) -> Self {
+        match self {
+            Self::Plain | Self::SecureMessaging => Self::SecureMessaging,
+            Self::ChainedFirst | Self::ChainedSecureMessaging => Self::ChainedSecureMessaging,
         }
     }
 }
@@ -214,11 +231,36 @@ impl CommandApdu {
         data: &[u8],
         le: u8,
     ) -> Result<Vec<Self>, CommandDataError> {
-        if data.is_empty() {
+        Self::command_chain_with_max_chunk(header, data, le, SHORT_APDU_DATA_MAX)
+    }
+
+    /// Split a large data field into a command-chained sequence whose
+    /// chunks never exceed `max_chunk` bytes (`1..=SHORT_APDU_DATA_MAX`).
+    ///
+    /// Use a chunk ceiling below [`SHORT_APDU_DATA_MAX`] when the commands
+    /// may travel over short-form ISO 7816-4 secure messaging so each
+    /// encrypted `DO87` + `DO97` + `DO8E` wrapper still fits in one short
+    /// `Lc` octet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandDataError::Empty`] when `data` is empty or
+    /// `max_chunk` is zero, and [`CommandDataError::TooLong`] when
+    /// `max_chunk` exceeds [`SHORT_APDU_DATA_MAX`].
+    pub fn command_chain_with_max_chunk(
+        header: CommandHeader,
+        data: &[u8],
+        le: u8,
+        max_chunk: usize,
+    ) -> Result<Vec<Self>, CommandDataError> {
+        if data.is_empty() || max_chunk == 0 {
             return Err(CommandDataError::Empty);
         }
+        if max_chunk > SHORT_APDU_DATA_MAX {
+            return Err(CommandDataError::TooLong { got: max_chunk });
+        }
         let mut commands = Vec::new();
-        let mut chunks = data.chunks(SHORT_APDU_DATA_MAX).peekable();
+        let mut chunks = data.chunks(max_chunk).peekable();
         while let Some(chunk) = chunks.next() {
             if chunks.peek().is_some() {
                 let chained = CommandHeader {
@@ -666,6 +708,66 @@ mod tests {
     fn command_chain_rejects_empty_data() {
         let result = CommandApdu::command_chain(header(), &[], TEST_LE);
         assert_eq!(result, Err(CommandDataError::Empty));
+    }
+
+    #[test]
+    fn apdu_class_with_secure_messaging_preserves_chaining_bit() {
+        assert_eq!(
+            ApduClass::Plain.with_secure_messaging(),
+            ApduClass::SecureMessaging
+        );
+        assert_eq!(
+            ApduClass::SecureMessaging.with_secure_messaging(),
+            ApduClass::SecureMessaging
+        );
+        assert_eq!(
+            ApduClass::ChainedFirst.with_secure_messaging(),
+            ApduClass::ChainedSecureMessaging
+        );
+        assert_eq!(
+            ApduClass::ChainedSecureMessaging.with_secure_messaging(),
+            ApduClass::ChainedSecureMessaging
+        );
+        assert_eq!(
+            ApduClass::ChainedSecureMessaging.as_byte(),
+            ApduClass::ChainedFirst.as_byte() | ApduClass::SecureMessaging.as_byte()
+        );
+    }
+
+    #[test]
+    fn command_chain_with_max_chunk_respects_custom_ceiling() {
+        const CUSTOM_CHUNK: usize = 223;
+        const CUSTOM_TAIL: usize = 162;
+        let data = vec![CHAIN_FILL; CUSTOM_CHUNK + CUSTOM_TAIL];
+        let chain =
+            CommandApdu::command_chain_with_max_chunk(header(), &data, TEST_LE, CUSTOM_CHUNK)
+                .expect("custom ceiling chains");
+        assert_eq!(chain.len(), TWO_CHUNKS);
+        assert_eq!(chain[0].as_bytes()[0], ApduClass::ChainedFirst.as_byte());
+        assert_eq!(
+            usize::from(chain[0].as_bytes()[APDU_HEADER_LEN]),
+            CUSTOM_CHUNK
+        );
+        assert_eq!(chain[1].as_bytes()[0], ApduClass::Plain.as_byte());
+        assert_eq!(
+            usize::from(chain[1].as_bytes()[APDU_HEADER_LEN]),
+            CUSTOM_TAIL
+        );
+        assert_eq!(
+            CommandApdu::command_chain_with_max_chunk(header(), &data, TEST_LE, 0),
+            Err(CommandDataError::Empty)
+        );
+        assert_eq!(
+            CommandApdu::command_chain_with_max_chunk(
+                header(),
+                &data,
+                TEST_LE,
+                OVER_SHORT_CAPACITY,
+            ),
+            Err(CommandDataError::TooLong {
+                got: OVER_SHORT_CAPACITY,
+            })
+        );
     }
 
     #[test]

@@ -39,18 +39,12 @@ refineid-atr = { path = "crates/atr" }
 refineid-auth = { path = "crates/auth" }
 refineid-ber = { path = "crates/ber" }
 refineid-build-number = { path = "crates/build-number" }
-refineid-ccid = { path = "crates/ccid" }
 refineid-cms = { path = "crates/cms" }
 refineid-digest = { path = "crates/digest" }
-refineid-doc-sign = { path = "crates/doc-sign" }
-refineid-emrtd = { path = "crates/emrtd" }
 refineid-pace = { path = "crates/pace" }
 refineid-pcsc = { path = "crates/pcsc" }
-refineid-pkcs11 = { path = "crates/pkcs11" }
 refineid-pkcs15 = { path = "crates/pkcs15" }
-refineid-rapp = { path = "crates/rapp" }
 refineid-remote = { path = "crates/remote" }
-refineid-scs = { path = "crates/scs" }
 refineid-sign = { path = "crates/sign" }
 refineid-x509 = { path = "crates/x509" }
 pcsc = "2.9"
@@ -116,9 +110,6 @@ hex = "0.4"
 # the `process` feature alone carries the id getters.
 rustix = { version = "1", default-features = false, features = ["process"] }
 subtle = "2"
-# The verifier trait behind the SCS JWS signatures (crates/scs).
-# Already in the lock file through `ecdsa-core`.
-signature = "3"
 rustc_lexer = "0.1"
 serde = "1"
 serde_json = "1"
@@ -139,6 +130,10 @@ syn = { version = "2", features = ["full", "visit"] }
 trybuild = "1"
 walkdir = "2"
 zeroize = { version = "1", features = ["zeroize_derive"] }
+
+[workspace.lints.cargo]
+unused_dependencies = "deny"
+unused_workspace_dependencies = "deny"
 
 [workspace.lints.rust]
 missing_docs = "warn"

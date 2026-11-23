@@ -21,15 +21,17 @@
 //! lives only in this process's memory, from the first card-confirmed
 //! success until an invalidation event, with no idle window, countdown,
 //! or one-use login bridge. An accepted `VERIFY` restores the card's
-//! PIN1 retry counter to its five-try limit (FINEID S1 v4.2 section 3.5),
-//! and every later checkout requires the live probe to report five tries
-//! left or PIN1 verified in session.
+//! PIN1 retry counter to its profile's retry limit (five on FINEID per
+//! FINEID S1 v4.2 section 3.5, three on Estonian eID), and every later
+//! checkout requires the live probe to report that profile's pristine
+//! retry counter or PIN1 verified in session.
 //!
 //! The value is bound to one stay of one card in its reader: the token
-//! serial the card reported and the reader's card insertion and removal
-//! count ([`refineid_pcsc::ReaderInfo::card_events`]), both read in the
-//! card session that accepted it. A checkout that reads another serial
-//! or another count destroys it, as removal does.
+//! serial the card reported, the reader's card insertion and removal
+//! count ([`refineid_pcsc::ReaderInfo::card_events`]), and the card's
+//! [`PinReferenceScheme`], all read in the card session that accepted it.
+//! A checkout that reads another serial, another count, or another scheme
+//! destroys it, as removal does.
 //!
 //! Use is destructive checkout. [`PinSafetyCache::checkout_pin1`] takes
 //! the value out under the retry counter the card reports;
@@ -59,6 +61,9 @@ struct CachedPin1 {
     /// The reader's card insertion and removal count when the card
     /// accepted the value.
     card_events: u32,
+    /// The credential numbering and retry-limit scale of the card that
+    /// accepted the value.
+    scheme: PinReferenceScheme,
     pin: PinBytes,
     generation: u64,
 }
@@ -241,9 +246,6 @@ pub struct PinSafetyCache {
     generation: u64,
     #[zeroize(skip)]
     negative: refineid_auth::PinSafetyCache,
-    /// The credential numbering and retry limit of the card in this slot.
-    #[zeroize(skip)]
-    scheme: PinReferenceScheme,
 }
 
 impl PinSafetyCache {
@@ -257,25 +259,14 @@ impl PinSafetyCache {
             outstanding: Weak::new(),
             generation: 0,
             negative: refineid_auth::PinSafetyCache::new()?,
-            scheme: PinReferenceScheme::Citizen,
         })
     }
 
-    /// Set the credential numbering for the live card. A different
-    /// numbering destroys any held value, whose pristine counter was
-    /// measured on the old card's scale.
-    pub fn set_scheme(&mut self, scheme: PinReferenceScheme) {
-        if self.scheme != scheme {
-            self.clear_positive();
-            self.scheme = scheme;
-        }
-    }
-
-    /// Hold a PIN1 the card identified by `serial` has just accepted,
-    /// while its reader's card insertion and removal count read in the
-    /// same card session stood at `card_events`. It stays until an
-    /// invalidation event, and a checkout still out from before can no
-    /// longer come back.
+    /// Hold a PIN1 the card identified by `serial` has just accepted
+    /// under `scheme`, while its reader's card insertion and removal
+    /// count read in the same card session stood at `card_events`. It
+    /// stays until an invalidation event, and a checkout still out from
+    /// before can no longer come back.
     ///
     /// # Errors
     /// Returns [`PreviouslyRejectedPin`] if this PIN was previously recorded as rejected.
@@ -283,6 +274,7 @@ impl PinSafetyCache {
         &mut self,
         serial: TokenSerial,
         card_events: u32,
+        scheme: PinReferenceScheme,
         pin: PinBytes,
     ) -> Result<(), PreviouslyRejectedPin> {
         if self.is_rejected(&serial, &pin) {
@@ -292,6 +284,7 @@ impl PinSafetyCache {
         self.positive_pin1 = Some(CachedPin1 {
             serial,
             card_events,
+            scheme,
             pin,
             generation: self.generation,
         });
@@ -307,25 +300,28 @@ impl PinSafetyCache {
 
     /// Check out the held PIN1 for the card identified by `serial`,
     /// whose reader's card insertion and removal count now stands at
-    /// `card_events`, under `live`, the PIN1 retry state that card
-    /// reported; all three read in the same card session.
+    /// `card_events`, under `scheme` and `live`, the PIN1 retry state
+    /// that card reported; all read in the same card session.
     ///
     /// The value leaves the cache whatever the outcome. It is destroyed
     /// instead of handed out when it belongs to another card; when the
     /// count moved since the card accepted it, since a card then left
-    /// the reader; or when `live` is neither pristine nor verified,
-    /// since the counter then went down after the card accepted it.
+    /// the reader; when the numbering changed; or when `live` is
+    /// neither pristine for `scheme` nor verified, since the counter
+    /// then went down after the card accepted it.
     #[must_use]
     pub fn checkout_pin1(
         &mut self,
         serial: &TokenSerial,
         card_events: u32,
+        scheme: PinReferenceScheme,
         live: PinStatus,
     ) -> Option<CheckedOutPin1> {
         let entry = self.positive_pin1.take()?;
         let usable = &entry.serial == serial
             && entry.card_events == card_events
-            && pin1_status_permits_reusable_cache(live, self.scheme);
+            && entry.scheme == scheme
+            && pin1_status_permits_reusable_cache(live, scheme);
         if !usable {
             return None;
         }
@@ -399,7 +395,7 @@ mod tests {
         CredentialBodyError, PinRetries, StatusWord, TransportErrorExt, TransportErrorKind,
         TransportOutcome,
     };
-    use refineid_auth::{AuthError, PinStatus, VerifyOutcome};
+    use refineid_auth::{AuthError, PinReferenceScheme, PinStatus, VerifyOutcome};
     use refineid_pkcs15::TokenSerial;
     use refineid_sign::SignError;
 
@@ -476,7 +472,12 @@ mod tests {
     fn holding(pin: PinBytes) -> PinSafetyCache {
         let mut cache = cache();
         cache
-            .store_pin1(serial(CARD_A_SERIAL), READER_EVENTS, pin)
+            .store_pin1(
+                serial(CARD_A_SERIAL),
+                READER_EVENTS,
+                PinReferenceScheme::Citizen,
+                pin,
+            )
             .expect("a fresh PIN1 is not a rejected one");
         cache
     }
@@ -515,7 +516,12 @@ mod tests {
     /// Check the held value out and have the card accept it.
     fn accepted_held(cache: &mut PinSafetyCache) -> AcceptedPin1 {
         let checkout = cache
-            .checkout_pin1(&serial(CARD_A_SERIAL), READER_EVENTS, pristine())
+            .checkout_pin1(
+                &serial(CARD_A_SERIAL),
+                READER_EVENTS,
+                PinReferenceScheme::Citizen,
+                pristine(),
+            )
             .expect("the held value is checked out");
         checkout
             .settle_verify(cache, &accepted())
@@ -539,8 +545,12 @@ mod tests {
     #[test]
     fn a_verified_card_keeps_the_held_pin1() {
         let mut cache = holding(random_pin());
-        let checkout =
-            cache.checkout_pin1(&serial(CARD_A_SERIAL), READER_EVENTS, PinStatus::Verified);
+        let checkout = cache.checkout_pin1(
+            &serial(CARD_A_SERIAL),
+            READER_EVENTS,
+            PinReferenceScheme::Citizen,
+            PinStatus::Verified,
+        );
         assert!(
             checkout.is_some(),
             "a verified PIN1 is a counter at its limit"
@@ -550,19 +560,61 @@ mod tests {
     #[test]
     fn an_estonian_pristine_counter_keeps_the_held_pin1() {
         let mut cache = cache();
-        cache.set_scheme(refineid_auth::PinReferenceScheme::Estonian);
         cache
-            .store_pin1(serial(CARD_A_SERIAL), READER_EVENTS, random_pin())
+            .store_pin1(
+                serial(CARD_A_SERIAL),
+                READER_EVENTS,
+                PinReferenceScheme::Estonian,
+                random_pin(),
+            )
             .expect("a fresh PIN1 is not a rejected one");
         assert!(
             cache
                 .checkout_pin1(
                     &serial(CARD_A_SERIAL),
                     READER_EVENTS,
-                    remaining(refineid_auth::PinReferenceScheme::Estonian.pin_retry_limit()),
+                    PinReferenceScheme::Estonian,
+                    remaining(PinReferenceScheme::Estonian.pin_retry_limit()),
                 )
                 .is_some()
         );
+    }
+
+    #[test]
+    fn a_different_scheme_destroys_the_held_pin1() {
+        let mut citizen_cache = holding(random_pin());
+        assert!(
+            citizen_cache
+                .checkout_pin1(
+                    &serial(CARD_A_SERIAL),
+                    READER_EVENTS,
+                    PinReferenceScheme::Estonian,
+                    remaining(PinReferenceScheme::Estonian.pin_retry_limit()),
+                )
+                .is_none()
+        );
+        assert!(!citizen_cache.holds_pin1());
+
+        let mut estonian_cache = cache();
+        estonian_cache
+            .store_pin1(
+                serial(CARD_A_SERIAL),
+                READER_EVENTS,
+                PinReferenceScheme::Estonian,
+                random_pin(),
+            )
+            .expect("a fresh PIN1 is not a rejected one");
+        assert!(
+            estonian_cache
+                .checkout_pin1(
+                    &serial(CARD_A_SERIAL),
+                    READER_EVENTS,
+                    PinReferenceScheme::Citizen,
+                    pristine(),
+                )
+                .is_none()
+        );
+        assert!(!estonian_cache.holds_pin1());
     }
 
     #[test]
@@ -570,13 +622,23 @@ mod tests {
         let mut cache = holding(random_pin());
         assert!(
             cache
-                .checkout_pin1(&serial(CARD_B_SERIAL), READER_EVENTS, pristine())
+                .checkout_pin1(
+                    &serial(CARD_B_SERIAL),
+                    READER_EVENTS,
+                    PinReferenceScheme::Citizen,
+                    pristine(),
+                )
                 .is_none()
         );
         assert!(!cache.holds_pin1());
         assert!(
             cache
-                .checkout_pin1(&serial(CARD_A_SERIAL), READER_EVENTS, pristine())
+                .checkout_pin1(
+                    &serial(CARD_A_SERIAL),
+                    READER_EVENTS,
+                    PinReferenceScheme::Citizen,
+                    pristine(),
+                )
                 .is_none()
         );
     }
@@ -595,14 +657,20 @@ mod tests {
                 .checkout_pin1(
                     &serial(CARD_A_SERIAL),
                     READER_EVENTS_AFTER_RETURN,
-                    pristine()
+                    PinReferenceScheme::Citizen,
+                    pristine(),
                 )
                 .is_none()
         );
         assert!(!cache.holds_pin1());
         assert!(
             cache
-                .checkout_pin1(&serial(CARD_A_SERIAL), READER_EVENTS, pristine())
+                .checkout_pin1(
+                    &serial(CARD_A_SERIAL),
+                    READER_EVENTS,
+                    PinReferenceScheme::Citizen,
+                    pristine(),
+                )
                 .is_none(),
             "the moved count destroyed the value for its old stay too"
         );
@@ -613,7 +681,12 @@ mod tests {
         let mut cache = holding(random_pin());
         for _ in 0..REPEATED_USES {
             let checkout = cache
-                .checkout_pin1(&serial(CARD_A_SERIAL), READER_EVENTS, pristine())
+                .checkout_pin1(
+                    &serial(CARD_A_SERIAL),
+                    READER_EVENTS,
+                    PinReferenceScheme::Citizen,
+                    pristine(),
+                )
                 .expect("an unmoved count keeps the value checked out");
             let accepted = checkout
                 .settle_verify(&mut cache, &accepted())
@@ -627,7 +700,12 @@ mod tests {
     fn a_card_that_left_after_an_unanswered_verify_takes_the_held_pin1() {
         let mut cache = holding(random_pin());
         let checkout = cache
-            .checkout_pin1(&serial(CARD_A_SERIAL), READER_EVENTS, pristine())
+            .checkout_pin1(
+                &serial(CARD_A_SERIAL),
+                READER_EVENTS,
+                PinReferenceScheme::Citizen,
+                pristine(),
+            )
             .expect("the held value is checked out");
         let unanswered: VerifyAnswer =
             Err(AuthError::Transport(fault(TransportErrorKind::Backend)));
@@ -637,7 +715,8 @@ mod tests {
                 .checkout_pin1(
                     &serial(CARD_A_SERIAL),
                     READER_EVENTS_AFTER_RETURN,
-                    pristine()
+                    PinReferenceScheme::Citizen,
+                    pristine(),
                 )
                 .is_none()
         );
@@ -652,7 +731,8 @@ mod tests {
                 .checkout_pin1(
                     &serial(CARD_A_SERIAL),
                     READER_EVENTS,
-                    remaining(RETRIES_ONE_SPENT)
+                    PinReferenceScheme::Citizen,
+                    remaining(RETRIES_ONE_SPENT),
                 )
                 .is_none()
         );
@@ -669,7 +749,12 @@ mod tests {
             let mut cache = holding(random_pin());
             assert!(
                 cache
-                    .checkout_pin1(&serial(CARD_A_SERIAL), READER_EVENTS, live)
+                    .checkout_pin1(
+                        &serial(CARD_A_SERIAL),
+                        READER_EVENTS,
+                        PinReferenceScheme::Citizen,
+                        live,
+                    )
                     .is_none()
             );
             assert!(!cache.holds_pin1());
@@ -681,7 +766,12 @@ mod tests {
         for answer in unanswered_verifies() {
             let mut cache = holding(random_pin());
             let checkout = cache
-                .checkout_pin1(&serial(CARD_A_SERIAL), READER_EVENTS, pristine())
+                .checkout_pin1(
+                    &serial(CARD_A_SERIAL),
+                    READER_EVENTS,
+                    PinReferenceScheme::Citizen,
+                    pristine(),
+                )
                 .expect("the held value is checked out");
             assert!(checkout.settle_verify(&mut cache, &answer).is_none());
             assert!(cache.holds_pin1());
@@ -693,7 +783,12 @@ mod tests {
         for answer in card_left_verifies() {
             let mut cache = holding(random_pin());
             let checkout = cache
-                .checkout_pin1(&serial(CARD_A_SERIAL), READER_EVENTS, pristine())
+                .checkout_pin1(
+                    &serial(CARD_A_SERIAL),
+                    READER_EVENTS,
+                    PinReferenceScheme::Citizen,
+                    pristine(),
+                )
                 .expect("the held value is checked out");
             assert!(checkout.settle_verify(&mut cache, &answer).is_none());
             assert!(!cache.holds_pin1());
@@ -704,7 +799,12 @@ mod tests {
     fn a_refusal_counted_after_an_unanswered_verify_destroys_the_held_pin1() {
         let mut cache = holding(random_pin());
         let checkout = cache
-            .checkout_pin1(&serial(CARD_A_SERIAL), READER_EVENTS, pristine())
+            .checkout_pin1(
+                &serial(CARD_A_SERIAL),
+                READER_EVENTS,
+                PinReferenceScheme::Citizen,
+                pristine(),
+            )
             .expect("the held value is checked out");
         let unanswered: VerifyAnswer =
             Err(AuthError::Transport(fault(TransportErrorKind::Backend)));
@@ -714,7 +814,8 @@ mod tests {
                 .checkout_pin1(
                     &serial(CARD_A_SERIAL),
                     READER_EVENTS,
-                    remaining(RETRIES_ONE_SPENT)
+                    PinReferenceScheme::Citizen,
+                    remaining(RETRIES_ONE_SPENT),
                 )
                 .is_none()
         );
@@ -725,14 +826,24 @@ mod tests {
     fn an_uncounted_unanswered_verify_keeps_serving() {
         let mut cache = holding(random_pin());
         let checkout = cache
-            .checkout_pin1(&serial(CARD_A_SERIAL), READER_EVENTS, pristine())
+            .checkout_pin1(
+                &serial(CARD_A_SERIAL),
+                READER_EVENTS,
+                PinReferenceScheme::Citizen,
+                pristine(),
+            )
             .expect("the held value is checked out");
         let unanswered: VerifyAnswer =
             Err(AuthError::Transport(fault(TransportErrorKind::Backend)));
         assert!(checkout.settle_verify(&mut cache, &unanswered).is_none());
         assert!(
             cache
-                .checkout_pin1(&serial(CARD_A_SERIAL), READER_EVENTS, pristine())
+                .checkout_pin1(
+                    &serial(CARD_A_SERIAL),
+                    READER_EVENTS,
+                    PinReferenceScheme::Citizen,
+                    pristine(),
+                )
                 .is_some()
         );
     }
@@ -743,7 +854,12 @@ mod tests {
         let mut cache = holding(pin_from(&digits));
         let pin = pin_from(&digits);
         let checkout = cache
-            .checkout_pin1(&serial(CARD_A_SERIAL), READER_EVENTS, pristine())
+            .checkout_pin1(
+                &serial(CARD_A_SERIAL),
+                READER_EVENTS,
+                PinReferenceScheme::Citizen,
+                pristine(),
+            )
             .expect("the held value is checked out");
         let wrong: VerifyAnswer = Ok(VerifyOutcome::WrongPin {
             retries_left: PinRetries::from_nibble(RETRIES_ONE_SPENT)
@@ -753,7 +869,12 @@ mod tests {
         assert!(!cache.holds_pin1());
         assert!(cache.is_rejected(&serial(CARD_A_SERIAL), &pin));
         assert_eq!(
-            cache.store_pin1(serial(CARD_A_SERIAL), READER_EVENTS, pin),
+            cache.store_pin1(
+                serial(CARD_A_SERIAL),
+                READER_EVENTS,
+                PinReferenceScheme::Citizen,
+                pin,
+            ),
             Err(PreviouslyRejectedPin)
         );
     }
@@ -768,7 +889,12 @@ mod tests {
         for answer in answers {
             let mut cache = holding(random_pin());
             let checkout = cache
-                .checkout_pin1(&serial(CARD_A_SERIAL), READER_EVENTS, pristine())
+                .checkout_pin1(
+                    &serial(CARD_A_SERIAL),
+                    READER_EVENTS,
+                    PinReferenceScheme::Citizen,
+                    pristine(),
+                )
                 .expect("the held value is checked out");
             assert!(checkout.settle_verify(&mut cache, &answer).is_none());
             assert!(!cache.holds_pin1());
@@ -810,13 +936,23 @@ mod tests {
     #[test]
     fn dropping_a_checkout_destroys_the_value() {
         let mut cache = holding(random_pin());
-        let checkout = cache.checkout_pin1(&serial(CARD_A_SERIAL), READER_EVENTS, pristine());
+        let checkout = cache.checkout_pin1(
+            &serial(CARD_A_SERIAL),
+            READER_EVENTS,
+            PinReferenceScheme::Citizen,
+            pristine(),
+        );
         assert!(checkout.is_some());
         drop(checkout);
         assert!(!cache.holds_pin1());
         assert!(
             cache
-                .checkout_pin1(&serial(CARD_A_SERIAL), READER_EVENTS, pristine())
+                .checkout_pin1(
+                    &serial(CARD_A_SERIAL),
+                    READER_EVENTS,
+                    PinReferenceScheme::Citizen,
+                    pristine(),
+                )
                 .is_none()
         );
     }
@@ -861,11 +997,21 @@ mod tests {
         let mut cache = holding(random_pin());
         let stale = accepted_held(&mut cache);
         cache
-            .store_pin1(serial(CARD_A_SERIAL), READER_EVENTS, pin_from(&newer))
+            .store_pin1(
+                serial(CARD_A_SERIAL),
+                READER_EVENTS,
+                PinReferenceScheme::Citizen,
+                pin_from(&newer),
+            )
             .expect("a fresh PIN1 is not a rejected one");
         completed(stale, &mut cache);
         let checkout = cache
-            .checkout_pin1(&serial(CARD_A_SERIAL), READER_EVENTS, pristine())
+            .checkout_pin1(
+                &serial(CARD_A_SERIAL),
+                READER_EVENTS,
+                PinReferenceScheme::Citizen,
+                pristine(),
+            )
             .expect("the newer value is held");
         assert_eq!(checkout.pin().as_bytes(), newer.as_slice());
     }
@@ -874,7 +1020,12 @@ mod tests {
     fn a_checkout_counts_as_the_login_until_it_settles() {
         let mut cache = holding(random_pin());
         let checkout = cache
-            .checkout_pin1(&serial(CARD_A_SERIAL), READER_EVENTS, pristine())
+            .checkout_pin1(
+                &serial(CARD_A_SERIAL),
+                READER_EVENTS,
+                PinReferenceScheme::Citizen,
+                pristine(),
+            )
             .expect("the held value is checked out");
         assert!(cache.holds_pin1());
         let accepted = checkout

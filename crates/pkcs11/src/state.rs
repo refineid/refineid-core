@@ -1380,6 +1380,7 @@ mod tests {
             .store_pin1(
                 refineid_pkcs15::TokenSerial::new("CARD-RETURNING".to_owned()),
                 EVENTS_AT_LOGIN,
+                refineid_auth::PinReferenceScheme::Citizen,
                 pin,
             )
             .expect("a fresh PIN1 is not a rejected one");
@@ -1507,7 +1508,12 @@ mod tests {
         {
             let mut cache = cache.lock().expect("cache lock");
             cache
-                .store_pin1(serial.clone(), STEADY_READER_EVENTS, stored)
+                .store_pin1(
+                    serial.clone(),
+                    STEADY_READER_EVENTS,
+                    refineid_auth::PinReferenceScheme::Citizen,
+                    stored,
+                )
                 .expect("a fresh PIN1 is not a rejected one");
             cache.record_rejected(&serial, &pin);
         }
@@ -1540,10 +1546,20 @@ mod tests {
         let checkout = {
             let mut cache = cache.lock().expect("cache lock");
             cache
-                .store_pin1(serial.clone(), STEADY_READER_EVENTS, pin)
+                .store_pin1(
+                    serial.clone(),
+                    STEADY_READER_EVENTS,
+                    refineid_auth::PinReferenceScheme::Citizen,
+                    pin,
+                )
                 .expect("a fresh PIN1 is not a rejected one");
             cache
-                .checkout_pin1(&serial, STEADY_READER_EVENTS, pristine)
+                .checkout_pin1(
+                    &serial,
+                    STEADY_READER_EVENTS,
+                    refineid_auth::PinReferenceScheme::Citizen,
+                    pristine,
+                )
                 .expect("the held value is checked out")
         };
         assert!(state.is_logged_in(1));

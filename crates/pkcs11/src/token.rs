@@ -53,7 +53,7 @@ use refineid_auth::{
 };
 use refineid_cms::container::{EcdsaP384, RsaPkcs1Sha256, Signature};
 use refineid_cms::x509::{
-    EcCurve, Name, OwnedCert, PublicKeyAlgorithm, SpkiDer, extract_rsa_public_key,
+    Certificate, EcCurve, Name, OwnedCert, PublicKeyAlgorithm, SpkiDer, extract_rsa_public_key,
 };
 use refineid_digest::{
     Md5, SHA256_LEN, SHA384_LEN, SHA512_LEN, Sha1, Sha224, Sha256, Sha384, Sha512,
@@ -1661,26 +1661,126 @@ fn persist_ca_cert(cert: &OwnedCert) {
     }
 }
 
-/// Select the certificates that link the leaf to a root through their
-/// issuer and subject names, in chain order. Cached CAs belong to the
-/// user profile rather than to one card, so a card must not receive
-/// certificates from another card's chain.
-fn ca_chain_for_leaf(leaf: &OwnedCert, candidates: &[OwnedCert]) -> Vec<OwnedCert> {
-    let mut chain = Vec::new();
-    let mut issuer = leaf.view().issuer.as_der().to_vec();
-    for _ in 0..MAX_CA_CERTS {
-        let Some(cert) = candidates.iter().find(|cert| {
-            cert.view().subject.as_der() == issuer.as_slice()
-                && !chain
-                    .iter()
-                    .any(|chosen: &OwnedCert| chosen.as_der() == cert.as_der())
-        }) else {
-            break;
-        };
-        issuer = cert.view().issuer.as_der().to_vec();
-        chain.push(cert.clone());
+/// Bound on DFS exploration states when building a CA chain from
+/// cached and on-card candidates, preventing exponential blowup on
+/// adversarial cross-signed graphs.
+const MAX_CA_CHAIN_SEARCH_STEPS: usize = 64;
+
+/// Check whether `candidate` is a verified CA issuer of `child`:
+///
+/// 1. `child.issuer` semantically matches `candidate.subject` (RFC 5280 §7.1);
+/// 2. `candidate` asserts `BasicConstraints` `cA:TRUE` (RFC 5280 §4.2.1.9);
+/// 3. when both `child`'s `AuthorityKeyIdentifier.keyIdentifier` and
+///    `candidate`'s `SubjectKeyIdentifier` are present, they match
+///    (RFC 5280 §4.2.1.1 / §4.2.1.2);
+/// 4. `child`'s signature verifies under `candidate`'s public key.
+fn is_verified_issuer(child: Certificate<'_>, candidate: Certificate<'_>) -> bool {
+    if !child.issuer.semantically_eq(candidate.subject) {
+        return false;
     }
-    chain
+    if !candidate
+        .extensions
+        .is_some_and(|exts| refineid_cms::x509::extract_basic_constraints(exts).ca)
+    {
+        return false;
+    }
+    if let (Some(aki), Some(ski)) = (
+        child.authority_key_identifier_key_id(),
+        candidate.subject_key_identifier(),
+    ) && aki != ski
+    {
+        return false;
+    }
+    child.verify_signed_by(candidate).is_ok()
+}
+
+/// Check whether `cert` is a self-signed CA certificate.
+fn is_self_signed_ca(cert: Certificate<'_>) -> bool {
+    is_verified_issuer(cert, cert)
+}
+
+/// Select the CA certificates that cryptographically link `leaf` toward a
+/// root, in chain order.
+///
+/// Links are established by semantic DN match (RFC 5280 §7.1),
+/// `BasicConstraints cA:TRUE`, matching `AKI.keyIdentifier` / `SKI` when
+/// both are present, and cryptographic signature verification. When
+/// multiple cross-signed paths exist, a path terminating in a self-signed
+/// root is preferred over an incomplete path, breaking ties by longest
+/// chain and then earlier candidate order. Cached CAs belong to the user
+/// profile rather than to one card, so a card never receives certificates
+/// from another card's chain or from a superseded CA key with the same DN.
+fn ca_chain_for_leaf(leaf: &OwnedCert, candidates: &[OwnedCert]) -> Vec<OwnedCert> {
+    struct SearchState {
+        best_indices: Vec<usize>,
+        best_reaches_root: bool,
+        steps: usize,
+    }
+
+    fn dfs(
+        leaf_der: &[u8],
+        current: Certificate<'_>,
+        candidates: &[OwnedCert],
+        path: &mut Vec<usize>,
+        state: &mut SearchState,
+    ) {
+        if state.steps >= MAX_CA_CHAIN_SEARCH_STEPS {
+            return;
+        }
+        state.steps = state.steps.saturating_add(1);
+
+        let reached_root = !path.is_empty() && is_self_signed_ca(current);
+        let better = if reached_root != state.best_reaches_root {
+            reached_root
+        } else {
+            path.len() > state.best_indices.len()
+        };
+        if better {
+            state.best_indices.clone_from(path);
+            state.best_reaches_root = reached_root;
+        }
+        if reached_root || path.len() >= MAX_CA_CERTS {
+            return;
+        }
+
+        for (index, candidate) in candidates.iter().enumerate() {
+            if candidate.as_der() == leaf_der
+                || path.iter().any(|&chosen| {
+                    chosen == index
+                        || candidates
+                            .get(chosen)
+                            .is_some_and(|cert| cert.as_der() == candidate.as_der())
+                })
+            {
+                continue;
+            }
+            let cand_view = candidate.view();
+            if is_verified_issuer(current, cand_view) {
+                path.push(index);
+                dfs(leaf_der, cand_view, candidates, path, state);
+                path.pop();
+            }
+        }
+    }
+
+    let mut path = Vec::new();
+    let mut state = SearchState {
+        best_indices: Vec::new(),
+        best_reaches_root: false,
+        steps: 0,
+    };
+    dfs(
+        leaf.as_der(),
+        leaf.view(),
+        candidates,
+        &mut path,
+        &mut state,
+    );
+    state
+        .best_indices
+        .into_iter()
+        .filter_map(|index| candidates.get(index).cloned())
+        .collect()
 }
 
 /// Attempt to read and parse an optional CA certificate from a card slot.
@@ -1743,7 +1843,7 @@ pub(super) fn build_token_objects(reader: &ReaderId) -> Result<TokenObjects, CkR
 /// PC/SC hardware.
 fn build_token_objects_from_card<T, F>(
     card: &mut T,
-    mut cas: Vec<OwnedCert>,
+    cas: Vec<OwnedCert>,
     mut persist_ca: F,
 ) -> Result<TokenObjects, CkRv>
 where
@@ -1829,34 +1929,54 @@ where
         objects.token_serial = serial;
     }
 
-    let leaf_issuer = objects.auth_cert.view().issuer;
-    // Skip on-card CA reads when a cached CA already matches the leaf certificate's
-    // issuer DN. This rests on two assumptions:
-    // (a) Matching issuer DN identifies the necessary issuing CA chain element.
-    //     (A re-issued CA with the same DN but a different key would serve the cached
-    //     intermediate until its expiration).
-    // (b) Presence of the issuing intermediate implies the root CA is also cached,
-    //     as both slots are persisted as a pair and roots outlive intermediates.
-    let has_leaf_issuer = cas
-        .iter()
-        .any(|ca| ca.view().subject.as_der() == leaf_issuer.as_der());
-    if !has_leaf_issuer && !is_directory {
+    // Skip on-card CA reads only when cached CAs already form a verified
+    // chain from the leaf certificate up to a self-signed root. Checking
+    // signature + key-identifier linkage rather than issuer DN alone ensures
+    // a re-issued CA with the same DN and a new key triggers on-card CA
+    // discovery instead of serving a stale cached intermediate.
+    let cached_chain = ca_chain_for_leaf(&objects.auth_cert, &cas);
+    let has_complete_cached_chain = cached_chain
+        .last()
+        .is_some_and(|last| is_self_signed_ca(last.view()));
+    let selected_chain = if !has_complete_cached_chain && !is_directory {
         let on_card_cas: Vec<OwnedCert> = ON_CARD_CA_SLOTS
             .iter()
             .filter_map(|slot| read_optional_ca_cert(card, *slot))
             .filter(meets_ca_persistence_policy)
             .collect();
         for ca in &on_card_cas {
-            persist_ca(ca);
-        }
-        for ca in on_card_cas {
-            if !cas.iter().any(|c| c.as_der() == ca.as_der()) {
-                cas.push(ca);
+            if !cas
+                .iter()
+                .any(|cached: &OwnedCert| cached.as_der() == ca.as_der())
+            {
+                persist_ca(ca);
             }
         }
-    }
+        // Place on-card CAs before cached CAs so on-card certificates are
+        // preferred over cached entries whenever both verify a link.
+        let mut combined = Vec::with_capacity(on_card_cas.len().saturating_add(cas.len()));
+        for ca in on_card_cas {
+            if !combined
+                .iter()
+                .any(|existing: &OwnedCert| existing.as_der() == ca.as_der())
+            {
+                combined.push(ca);
+            }
+        }
+        for ca in cas {
+            if !combined
+                .iter()
+                .any(|existing: &OwnedCert| existing.as_der() == ca.as_der())
+            {
+                combined.push(ca);
+            }
+        }
+        ca_chain_for_leaf(&objects.auth_cert, &combined)
+    } else {
+        cached_chain
+    };
 
-    for ca in ca_chain_for_leaf(&objects.auth_cert, &cas) {
+    for ca in selected_chain {
         objects.push_ca_cert(ca);
     }
     Ok(objects)
@@ -3413,6 +3533,478 @@ mod tests {
         let chain = super::ca_chain_for_leaf(&leaf, &[unrelated, root.clone()]);
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].as_der(), root.as_der());
+    }
+
+    #[test]
+    fn reissued_ca_with_same_dn_and_new_key_prefers_on_card_ca_over_cached_and_keeps_cka_trusted_false()
+     {
+        use refineid_cms::oid::known;
+        use refineid_cms::testkit::{self, CertificateSpec, TestCurve, TestKey};
+        use refineid_cms::x509::DateTime;
+
+        const VALID_FROM_YEAR: u16 = 2020;
+        const VALID_UNTIL_YEAR: u16 = 2049;
+        const JAN: u8 = 1;
+        const DEC: u8 = 12;
+        const LAST_DEC_DAY: u8 = 31;
+        const SERIAL_ROOT: u8 = 1;
+        const SERIAL_OLD_CA: u8 = 2;
+        const SERIAL_NEW_CA: u8 = 3;
+        const SERIAL_LEAF: u8 = 4;
+        const OLD_CA_SKI: &[u8] = &[0x11; 20];
+        const NEW_CA_SKI: &[u8] = &[0x22; 20];
+        const ROOT_SKI: &[u8] = &[0x33; 20];
+
+        let not_before = DateTime::new(VALID_FROM_YEAR, JAN, JAN, 0, 0, 0).expect("valid date");
+        let not_after =
+            DateTime::new(VALID_UNTIL_YEAR, DEC, LAST_DEC_DAY, 0, 0, 0).expect("valid date");
+
+        let root_key = TestKey::derive(TestCurve::P384, b"issue-388-root");
+        let old_ca_key = TestKey::derive(TestCurve::P384, b"issue-388-old-ca");
+        let new_ca_key = TestKey::derive(TestCurve::P384, b"issue-388-new-ca");
+        let leaf_key = TestKey::derive(TestCurve::P384, b"issue-388-leaf");
+
+        let ski_ext = |id: &[u8]| {
+            testkit::extension(
+                known::SUBJECT_KEY_IDENTIFIER,
+                false,
+                &testkit::tlv(testkit::OCTET_STRING, id),
+            )
+        };
+        let aki_ext = |id: &[u8]| {
+            testkit::extension(
+                known::AUTHORITY_KEY_IDENTIFIER,
+                false,
+                &testkit::tlv(
+                    testkit::SEQUENCE,
+                    testkit::tlv(testkit::CONTEXT_0_PRIMITIVE, id),
+                ),
+            )
+        };
+
+        let mut root_exts = testkit::ca_extensions();
+        root_exts.push(ski_ext(ROOT_SKI));
+        let root_der = testkit::certificate(
+            &CertificateSpec {
+                serial: SERIAL_ROOT,
+                subject: "Synthetic Root CA",
+                issuer: "Synthetic Root CA",
+                not_before,
+                not_after,
+                extensions: root_exts,
+            },
+            &root_key,
+            &root_key,
+        );
+
+        let mut old_ca_exts = testkit::ca_extensions();
+        old_ca_exts.push(ski_ext(OLD_CA_SKI));
+        old_ca_exts.push(aki_ext(ROOT_SKI));
+        let old_ca_der = testkit::certificate(
+            &CertificateSpec {
+                serial: SERIAL_OLD_CA,
+                subject: "Synthetic Issuing CA",
+                issuer: "Synthetic Root CA",
+                not_before,
+                not_after,
+                extensions: old_ca_exts,
+            },
+            &old_ca_key,
+            &root_key,
+        );
+
+        let mut new_ca_exts = testkit::ca_extensions();
+        new_ca_exts.push(ski_ext(NEW_CA_SKI));
+        new_ca_exts.push(aki_ext(ROOT_SKI));
+        let new_ca_der = testkit::certificate(
+            &CertificateSpec {
+                serial: SERIAL_NEW_CA,
+                subject: "Synthetic Issuing CA",
+                issuer: "Synthetic Root CA",
+                not_before,
+                not_after,
+                extensions: new_ca_exts,
+            },
+            &new_ca_key,
+            &root_key,
+        );
+
+        let leaf_der = testkit::certificate(
+            &CertificateSpec {
+                serial: SERIAL_LEAF,
+                subject: "Synthetic Cardholder",
+                issuer: "Synthetic Issuing CA",
+                not_before,
+                not_after,
+                extensions: vec![aki_ext(NEW_CA_SKI)],
+            },
+            &leaf_key,
+            &new_ca_key,
+        );
+
+        struct FileCard {
+            auth_cert: Vec<u8>,
+            issuing_ca: Vec<u8>,
+            root_ca: Vec<u8>,
+            selected_fid: Option<u16>,
+            ca_slot_reads: usize,
+        }
+
+        impl refineid_apdu::CardTransport for FileCard {
+            type Error = String;
+
+            fn transmit(
+                &mut self,
+                command: &refineid_apdu::CommandApdu,
+            ) -> Result<refineid_apdu::TransportOutcome, Self::Error> {
+                const INS_SELECT: u8 = 0xA4;
+                const INS_READ_BINARY: u8 = 0xB0;
+                const P1_SELECT_BY_NAME: u8 = 0x04;
+                const FID_MF: u16 = 0x3F00;
+                const FID_PKCS15_DF: u16 = 0x5015;
+                const FID_AUTH: u16 = 0x4331;
+                const FID_ISSUING_CA: u16 = 0x4336;
+                const FID_ROOT_CA: u16 = 0x4334;
+                const CHUNK_LIMIT: usize = 256;
+                const SW_INS_NOT_SUPPORTED: u16 = 0x6D00;
+
+                let raw = command.as_bytes();
+                let ins = raw.get(1).copied().unwrap_or(0);
+                let p1 = raw.get(2).copied().unwrap_or(0);
+                let p2 = raw.get(3).copied().unwrap_or(0);
+
+                if ins == INS_SELECT {
+                    if p1 == P1_SELECT_BY_NAME {
+                        self.selected_fid = None;
+                        return Ok(refineid_apdu::TransportOutcome::Response(apdu_response(
+                            &[],
+                            StatusWord::Success,
+                        )));
+                    }
+                    let lc = usize::from(raw.get(4).copied().unwrap_or(0));
+                    let data = raw.get(5..5 + lc).unwrap_or(&[]);
+                    if data.len() == 2 {
+                        let fid = u16::from_be_bytes([data[0], data[1]]);
+                        if fid == FID_ISSUING_CA || fid == FID_ROOT_CA {
+                            self.ca_slot_reads = self.ca_slot_reads.saturating_add(1);
+                        }
+                        if matches!(fid, FID_MF | FID_PKCS15_DF) {
+                            self.selected_fid = None;
+                            return Ok(refineid_apdu::TransportOutcome::Response(apdu_response(
+                                &[],
+                                StatusWord::Success,
+                            )));
+                        }
+                        if matches!(fid, FID_AUTH | FID_ISSUING_CA | FID_ROOT_CA) {
+                            self.selected_fid = Some(fid);
+                            return Ok(refineid_apdu::TransportOutcome::Response(apdu_response(
+                                &[],
+                                StatusWord::Success,
+                            )));
+                        }
+                    }
+                    self.selected_fid = None;
+                    return Ok(refineid_apdu::TransportOutcome::Response(apdu_response(
+                        &[],
+                        StatusWord::FileNotFound,
+                    )));
+                }
+                if ins == INS_READ_BINARY {
+                    let file: &[u8] = match self.selected_fid {
+                        Some(FID_AUTH) => &self.auth_cert,
+                        Some(FID_ISSUING_CA) => &self.issuing_ca,
+                        Some(FID_ROOT_CA) => &self.root_ca,
+                        _ => {
+                            return Ok(refineid_apdu::TransportOutcome::Response(apdu_response(
+                                &[],
+                                StatusWord::FileNotFound,
+                            )));
+                        }
+                    };
+                    let offset = usize::from(u16::from_be_bytes([p1, p2]));
+                    if offset >= file.len() {
+                        return Ok(refineid_apdu::TransportOutcome::Response(apdu_response(
+                            &[],
+                            StatusWord::EndOfFile,
+                        )));
+                    }
+                    let le_byte = raw.get(4).copied().unwrap_or(0);
+                    let wanted = if le_byte == 0 {
+                        CHUNK_LIMIT
+                    } else {
+                        usize::from(le_byte)
+                    };
+                    let end = offset.saturating_add(wanted).min(file.len());
+                    let sw = if end == file.len() {
+                        StatusWord::EndOfFile
+                    } else {
+                        StatusWord::Success
+                    };
+                    return Ok(refineid_apdu::TransportOutcome::Response(apdu_response(
+                        &file[offset..end],
+                        sw,
+                    )));
+                }
+                Ok(refineid_apdu::TransportOutcome::Response(apdu_response(
+                    &[],
+                    StatusWord::Other(SW_INS_NOT_SUPPORTED),
+                )))
+            }
+
+            fn transmit_credential(
+                &mut self,
+                _command: refineid_apdu::CredentialCommand,
+            ) -> Result<refineid_apdu::TransportOutcome, Self::Error> {
+                Err("credentials not used in token discovery test".to_owned())
+            }
+        }
+
+        let old_ca = OwnedCert::from_der(&old_ca_der).expect("valid old CA");
+        let new_ca = OwnedCert::from_der(&new_ca_der).expect("valid new CA");
+        let root_ca = OwnedCert::from_der(&root_der).expect("valid root CA");
+
+        // Cache contains the superseded CA (same DN, old key) and the root.
+        // The card carries the reissued CA (new key) and the root.
+        let mut card = FileCard {
+            auth_cert: leaf_der.clone(),
+            issuing_ca: new_ca_der.clone(),
+            root_ca: root_der.clone(),
+            selected_fid: None,
+            ca_slot_reads: 0,
+        };
+        let mut persisted = Vec::new();
+        let objects =
+            super::build_token_objects_from_card(&mut card, vec![old_ca, root_ca.clone()], |ca| {
+                persisted.push(ca.as_der().to_vec())
+            })
+            .expect("token discovery succeeds");
+
+        assert!(
+            card.ca_slot_reads >= 2,
+            "stale cached CA with matching DN must not suppress on-card CA reads"
+        );
+        assert!(objects.object_exists(ObjectKind::Ca(0)));
+        assert!(objects.object_exists(ObjectKind::Ca(1)));
+        assert!(!objects.object_exists(ObjectKind::Ca(2)));
+        assert_eq!(
+            objects
+                .ca_attribute(ObjectKind::Ca(0), crate::ck::CKA_VALUE)
+                .and_then(|attr| attr.as_bytes().map(<[u8]>::to_vec)),
+            Some(new_ca.as_der().to_vec())
+        );
+        assert_eq!(
+            objects
+                .ca_attribute(ObjectKind::Ca(1), crate::ck::CKA_VALUE)
+                .and_then(|attr| attr.as_bytes().map(<[u8]>::to_vec)),
+            Some(root_ca.as_der().to_vec())
+        );
+        assert!(persisted.iter().any(|der| der == new_ca.as_der()));
+
+        // Every emitted CA certificate object keeps CKA_TRUSTED = CK_FALSE.
+        for index in 0..2 {
+            assert_eq!(
+                objects
+                    .ca_attribute(ObjectKind::Ca(index), crate::ck::CKA_TRUSTED)
+                    .and_then(|attr| attr.as_bytes().map(<[u8]>::to_vec)),
+                Some(vec![crate::ck::CK_FALSE]),
+                "CA object {index} must never assert CKA_TRUSTED"
+            );
+        }
+
+        // Once the verified chain is cached, subsequent discovery skips on-card CA reads.
+        let mut cached_card = FileCard {
+            auth_cert: leaf_der,
+            issuing_ca: new_ca_der,
+            root_ca: root_der,
+            selected_fid: None,
+            ca_slot_reads: 0,
+        };
+        let cached_objects = super::build_token_objects_from_card(
+            &mut cached_card,
+            vec![new_ca.clone(), root_ca.clone()],
+            |_| {},
+        )
+        .expect("cached token discovery succeeds");
+        assert_eq!(
+            cached_card.ca_slot_reads, 0,
+            "complete verified cached chain must skip on-card CA reads"
+        );
+        assert!(cached_objects.object_exists(ObjectKind::Ca(0)));
+        assert!(cached_objects.object_exists(ObjectKind::Ca(1)));
+        assert!(!cached_objects.object_exists(ObjectKind::Ca(2)));
+        assert_eq!(
+            cached_objects
+                .ca_attribute(ObjectKind::Ca(0), crate::ck::CKA_VALUE)
+                .and_then(|attr| attr.as_bytes().map(<[u8]>::to_vec)),
+            Some(new_ca.as_der().to_vec())
+        );
+        assert_eq!(
+            cached_objects
+                .ca_attribute(ObjectKind::Ca(1), crate::ck::CKA_VALUE)
+                .and_then(|attr| attr.as_bytes().map(<[u8]>::to_vec)),
+            Some(root_ca.as_der().to_vec())
+        );
+    }
+
+    #[test]
+    fn cross_signed_ca_pair_selects_the_ca_that_signed_the_leaf() {
+        use refineid_cms::testkit::{self, CertificateSpec, TestCurve, TestKey};
+
+        const FIRST_DAY: u8 = 1;
+        const LAST_DAY: u8 = 28;
+        const SERIAL_ROOT_A: u8 = 10;
+        const SERIAL_ROOT_B: u8 = 11;
+        const SERIAL_CA_A: u8 = 12;
+        const SERIAL_CA_B: u8 = 13;
+        const SERIAL_LEAF: u8 = 14;
+
+        let root_a_key = TestKey::derive(TestCurve::P256, b"issue-388-cross-root-a");
+        let root_b_key = TestKey::derive(TestCurve::P256, b"issue-388-cross-root-b");
+        let ca_a_key = TestKey::derive(TestCurve::P256, b"issue-388-cross-ca-a");
+        let ca_b_key = TestKey::derive(TestCurve::P256, b"issue-388-cross-ca-b");
+        let leaf_key = TestKey::derive(TestCurve::P256, b"issue-388-cross-leaf");
+
+        let root_a = OwnedCert::from_der(&testkit::certificate(
+            &CertificateSpec {
+                serial: SERIAL_ROOT_A,
+                subject: "Cross Root A",
+                issuer: "Cross Root A",
+                not_before: testkit::day(FIRST_DAY),
+                not_after: testkit::day(LAST_DAY),
+                extensions: testkit::ca_extensions(),
+            },
+            &root_a_key,
+            &root_a_key,
+        ))
+        .expect("valid root A");
+        let root_b = OwnedCert::from_der(&testkit::certificate(
+            &CertificateSpec {
+                serial: SERIAL_ROOT_B,
+                subject: "Cross Root B",
+                issuer: "Cross Root B",
+                not_before: testkit::day(FIRST_DAY),
+                not_after: testkit::day(LAST_DAY),
+                extensions: testkit::ca_extensions(),
+            },
+            &root_b_key,
+            &root_b_key,
+        ))
+        .expect("valid root B");
+        let ca_a = OwnedCert::from_der(&testkit::certificate(
+            &CertificateSpec {
+                serial: SERIAL_CA_A,
+                subject: "Shared Intermediate CA",
+                issuer: "Cross Root A",
+                not_before: testkit::day(FIRST_DAY),
+                not_after: testkit::day(LAST_DAY),
+                extensions: testkit::ca_extensions(),
+            },
+            &ca_a_key,
+            &root_a_key,
+        ))
+        .expect("valid CA A");
+        let ca_b = OwnedCert::from_der(&testkit::certificate(
+            &CertificateSpec {
+                serial: SERIAL_CA_B,
+                subject: "Shared Intermediate CA",
+                issuer: "Cross Root B",
+                not_before: testkit::day(FIRST_DAY),
+                not_after: testkit::day(LAST_DAY),
+                extensions: testkit::ca_extensions(),
+            },
+            &ca_b_key,
+            &root_b_key,
+        ))
+        .expect("valid CA B");
+        let leaf = OwnedCert::from_der(&testkit::certificate(
+            &CertificateSpec {
+                serial: SERIAL_LEAF,
+                subject: "Cross Leaf",
+                issuer: "Shared Intermediate CA",
+                not_before: testkit::day(FIRST_DAY),
+                not_after: testkit::day(LAST_DAY),
+                extensions: Vec::new(),
+            },
+            &leaf_key,
+            &ca_b_key,
+        ))
+        .expect("valid leaf");
+
+        // Even with CA A placed first, signature verification selects CA B -> Root B.
+        let chain = super::ca_chain_for_leaf(&leaf, &[ca_a, root_a, ca_b.clone(), root_b.clone()]);
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].as_der(), ca_b.as_der());
+        assert_eq!(chain[1].as_der(), root_b.as_der());
+    }
+
+    #[test]
+    fn reencoded_semantically_equal_dn_links_to_signing_ca() {
+        use refineid_cms::oid::known;
+        use refineid_cms::testkit::{self, TestCurve, TestKey};
+
+        const FIRST_DAY: u8 = 1;
+        const LAST_DAY: u8 = 28;
+        const SERIAL_CA: u8 = 20;
+        const SERIAL_LEAF: u8 = 21;
+
+        let ca_key = TestKey::derive(TestCurve::P256, b"issue-388-dn-ca");
+        let leaf_key = TestKey::derive(TestCurve::P256, b"issue-388-dn-leaf");
+
+        let ca_subject_utf8 = testkit::name_of(&[
+            (known::COUNTRY_NAME, testkit::PRINTABLE_STRING, "FI"),
+            (known::COMMON_NAME, testkit::UTF8_STRING, "Reencoded   CA"),
+        ]);
+        let leaf_issuer_printable = testkit::name_of(&[
+            (known::COUNTRY_NAME, testkit::PRINTABLE_STRING, "fi"),
+            (
+                known::COMMON_NAME,
+                testkit::PRINTABLE_STRING,
+                " reencoded ca ",
+            ),
+        ]);
+        assert!(ca_subject_utf8 != leaf_issuer_printable);
+
+        let ca_tbs = {
+            let mut tbs = testkit::tlv(
+                testkit::CONTEXT_0,
+                testkit::tlv(testkit::INTEGER, [testkit::X509_VERSION_3]),
+            );
+            tbs.extend_from_slice(&testkit::positive_integer(&[SERIAL_CA]));
+            tbs.extend_from_slice(&ca_key.algorithm_identifier());
+            tbs.extend_from_slice(&ca_subject_utf8);
+            let mut validity = testkit::utc_time(testkit::day(FIRST_DAY));
+            validity.extend_from_slice(&testkit::utc_time(testkit::day(LAST_DAY)));
+            tbs.extend_from_slice(&testkit::tlv(testkit::SEQUENCE, validity));
+            tbs.extend_from_slice(&ca_subject_utf8);
+            tbs.extend_from_slice(&ca_key.spki());
+            tbs.extend_from_slice(&testkit::tlv(
+                testkit::CONTEXT_3,
+                testkit::tlv(testkit::SEQUENCE, testkit::ca_extensions().concat()),
+            ));
+            testkit::tlv(testkit::SEQUENCE, tbs)
+        };
+        let ca = OwnedCert::from_der(&testkit::signed(&ca_tbs, &ca_key)).expect("valid CA");
+
+        let leaf_tbs = {
+            let mut tbs = testkit::tlv(
+                testkit::CONTEXT_0,
+                testkit::tlv(testkit::INTEGER, [testkit::X509_VERSION_3]),
+            );
+            tbs.extend_from_slice(&testkit::positive_integer(&[SERIAL_LEAF]));
+            tbs.extend_from_slice(&ca_key.algorithm_identifier());
+            tbs.extend_from_slice(&leaf_issuer_printable);
+            let mut validity = testkit::utc_time(testkit::day(FIRST_DAY));
+            validity.extend_from_slice(&testkit::utc_time(testkit::day(LAST_DAY)));
+            tbs.extend_from_slice(&testkit::tlv(testkit::SEQUENCE, validity));
+            tbs.extend_from_slice(&testkit::name("Leaf Subject"));
+            tbs.extend_from_slice(&leaf_key.spki());
+            testkit::tlv(testkit::SEQUENCE, tbs)
+        };
+        let leaf = OwnedCert::from_der(&testkit::signed(&leaf_tbs, &ca_key)).expect("valid leaf");
+
+        let chain = super::ca_chain_for_leaf(&leaf, std::slice::from_ref(&ca));
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].as_der(), ca.as_der());
     }
 
     #[test]

@@ -68,6 +68,9 @@ impl BerTag for X509ContextExplicit3 {
 
 /// Universal ASN.1 NULL tag used by the OCSP no-check extension.
 const TAG_NULL: u16 = 0x05;
+/// Context-specific primitive `[0]` (`keyIdentifier` inside
+/// `AuthorityKeyIdentifier`, RFC 5280 §4.2.1.1).
+const TAG_AKI_KEY_IDENTIFIER: u16 = 0x80;
 
 // ----- OIDs -----
 //
@@ -83,6 +86,10 @@ const OID_KEY_USAGE: Oid<'static> = known::KEY_USAGE;
 const OID_BASIC_CONSTRAINTS: Oid<'static> = known::BASIC_CONSTRAINTS;
 /// `OID_EXT_KEY_USAGE` constant.
 const OID_EXT_KEY_USAGE: Oid<'static> = known::EXT_KEY_USAGE;
+/// `OID_SUBJECT_KEY_IDENTIFIER` constant.
+const OID_SUBJECT_KEY_IDENTIFIER: Oid<'static> = known::SUBJECT_KEY_IDENTIFIER;
+/// `OID_AUTHORITY_KEY_IDENTIFIER` constant.
+const OID_AUTHORITY_KEY_IDENTIFIER: Oid<'static> = known::AUTHORITY_KEY_IDENTIFIER;
 
 /// `OID_RSA_ENCRYPTION` constant.
 const OID_RSA_ENCRYPTION: Oid<'static> = known::RSA_ENCRYPTION;
@@ -293,7 +300,7 @@ pub struct Certificate<'a> {
     pub signature_bits: SignatureOctets<'a>,
 }
 
-impl Certificate<'_> {
+impl<'a> Certificate<'a> {
     /// Verify that this certificate was signed by `issuer`. Looks
     /// up the signature algorithm from `self` and pulls the
     /// issuer's public key from the issuer cert's SPKI.
@@ -313,21 +320,43 @@ impl Certificate<'_> {
             issuer_spki: issuer.spki,
         })
     }
+
+    /// Return the Subject Key Identifier (`2.5.29.14`, RFC 5280
+    /// §4.2.1.2) key-identifier octets when present and well formed.
+    ///
+    /// Returns `None` when the extension is absent, empty, or malformed.
+    #[must_use]
+    pub fn subject_key_identifier(&self) -> Option<&'a [u8]> {
+        self.extensions
+            .and_then(X509Helpers::extract_subject_key_identifier)
+    }
+
+    /// Return the `keyIdentifier` field (`[0] IMPLICIT OCTET STRING`)
+    /// of the Authority Key Identifier extension (`2.5.29.35`, RFC 5280
+    /// §4.2.1.1) when present and well formed.
+    ///
+    /// Returns `None` when the extension or its `keyIdentifier` field is
+    /// absent, empty, duplicated, or malformed.
+    #[must_use]
+    pub fn authority_key_identifier_key_id(&self) -> Option<&'a [u8]> {
+        self.extensions
+            .and_then(X509Helpers::extract_authority_key_identifier_key_id)
+    }
 }
 
 /// A typed X.509 `Name` (Distinguished Name) view.
 ///
 /// Wraps the DER bytes of a `RDNSequence` so callers pass a `Name`,
 /// never a raw `&[u8]` DN blob. A `Name` is one DER TLV; the
-/// `RelativeDistinguishedName`s inside it are not walked. That is
-/// enough for what consumers do with it: compare it byte for byte with
-/// another name, and hash it for an OCSP `IssuerNameHash`.
-/// [`Name::try_from`] is the boundary that mints one from raw bytes.
+/// `RelativeDistinguishedName`s inside it are not walked at
+/// construction. [`Name::try_from`] is the boundary that mints one
+/// from raw bytes.
 ///
 /// `PartialEq`/`Eq` compare the underlying DN DER byte-for-byte --
-/// the exact-match test certificate-chain building uses to pair a
-/// subject DN against an issuer DN (RFC 5280 §6.1 name chaining,
-/// the byte-identical case).
+/// the exact-match test for OCSP `IssuerNameHash` and byte-identical
+/// comparisons. Use [`Name::semantically_eq`] for RFC 5280 §7.1
+/// Distinguished Name matching across re-encoded string types,
+/// case/whitespace differences, and unordered multi-valued RDNs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Name<'a> {
     /// DER bytes of the `RDNSequence` (the whole `Name` SEQUENCE).
@@ -339,6 +368,52 @@ impl<'a> Name<'a> {
     #[must_use]
     pub const fn as_der(&self) -> &'a [u8] {
         self.dn_der
+    }
+
+    /// Compare two Distinguished Names for semantic equality per
+    /// RFC 5280 §7.1 and RFC 4518:
+    ///
+    /// - `RDNSequence` order is significant;
+    /// - within each `RelativeDistinguishedName` (`SET OF`), attribute
+    ///   order is insignificant and matched one-to-one;
+    /// - attribute type OIDs must match;
+    /// - `DirectoryString` values (`UTF8String`, `PrintableString`,
+    ///   `TeletexString`, `BMPString`, `UniversalString`) compare equal
+    ///   across encodings after case folding and whitespace collapsing;
+    /// - `IA5String` values compare case-insensitively with whitespace
+    ///   collapsing against other `IA5String` values;
+    /// - all other attribute value types require identical tag and bytes.
+    ///
+    /// Fails closed (`false`) if either `Name` is malformed.
+    #[must_use]
+    pub fn semantically_eq(&self, other: Name<'_>) -> bool {
+        let Some(lhs_rdns) = X509Helpers::decode_name_rdns(self.dn_der) else {
+            return false;
+        };
+        let Some(rhs_rdns) = X509Helpers::decode_name_rdns(other.dn_der) else {
+            return false;
+        };
+        if lhs_rdns.len() != rhs_rdns.len() {
+            return false;
+        }
+        lhs_rdns.iter().zip(rhs_rdns.iter()).all(|(lhs, rhs)| {
+            if lhs.len() != rhs.len() {
+                return false;
+            }
+            let mut matched = vec![false; rhs.len()];
+            lhs.iter().all(|lhs_atv| {
+                for (index, rhs_atv) in rhs.iter().enumerate() {
+                    if let Some(slot) = matched.get_mut(index)
+                        && !*slot
+                        && X509Helpers::atvs_semantically_eq(*lhs_atv, *rhs_atv)
+                    {
+                        *slot = true;
+                        return true;
+                    }
+                }
+                false
+            })
+        })
     }
 }
 
@@ -807,6 +882,175 @@ impl X509Helpers {
     /// BOOLEAN critical OPTIONAL, OCTET STRING extnValue }`.
     fn find_extension<'a>(extensions: &'a [u8], oid_value: Oid<'_>) -> Option<&'a [u8]> {
         find_extension_with_meta(extensions, oid_value).map(|m| m.value)
+    }
+
+    /// Decode `SubjectKeyIdentifier ::= OCTET STRING` (RFC 5280 §4.2.1.2).
+    fn extract_subject_key_identifier(extensions: &[u8]) -> Option<&[u8]> {
+        let extn_value = Self::find_extension(extensions, OID_SUBJECT_KEY_IDENTIFIER)?;
+        let octet = BerTlv::<OctetString>::parse(extn_value).ok()?;
+        if octet.size() != extn_value.len() || octet.value().is_empty() {
+            return None;
+        }
+        Some(octet.value())
+    }
+
+    /// Decode `AuthorityKeyIdentifier.keyIdentifier` (`[0] IMPLICIT
+    /// OCTET STRING`, RFC 5280 §4.2.1.1).
+    fn extract_authority_key_identifier_key_id(extensions: &[u8]) -> Option<&[u8]> {
+        let extn_value = Self::find_extension(extensions, OID_AUTHORITY_KEY_IDENTIFIER)?;
+        let seq = BerTlv::<Sequence>::parse(extn_value).ok()?;
+        if seq.size() != extn_value.len() {
+            return None;
+        }
+        let mut key_id: Option<&[u8]> = None;
+        for child in BerTlvIter::new(seq.value()) {
+            let child = child.ok()?;
+            if child.tag() == TAG_AKI_KEY_IDENTIFIER {
+                if key_id.is_some() || child.value().is_empty() {
+                    return None;
+                }
+                key_id = Some(child.value());
+            }
+        }
+        key_id
+    }
+
+    /// Decode an X.509 `Name` (`RDNSequence`) into its list of RDNs, each
+    /// containing `(AttributeType, AttributeValue)` pairs.
+    fn decode_name_rdns<'a>(
+        dn_der: &'a [u8],
+    ) -> Option<Vec<Vec<(Oid<'a>, spki::der::asn1::AnyRef<'a>)>>> {
+        use spki::der::asn1::AnyRef;
+        use spki::der::{Decode as _, Reader as _, SliceReader, Tag, Tagged as _};
+
+        let outer = AnyRef::from_der(dn_der).ok()?;
+        if outer.tag() != Tag::Sequence {
+            return None;
+        }
+        let mut rdn_reader = SliceReader::new(outer.value()).ok()?;
+        let mut rdns = Vec::new();
+        while !rdn_reader.is_finished() {
+            let rdn = AnyRef::from_der(rdn_reader.tlv_bytes().ok()?).ok()?;
+            if rdn.tag() != Tag::Set {
+                return None;
+            }
+            let mut atv_reader = SliceReader::new(rdn.value()).ok()?;
+            let mut atvs = Vec::new();
+            while !atv_reader.is_finished() {
+                let atv = AnyRef::from_der(atv_reader.tlv_bytes().ok()?).ok()?;
+                if atv.tag() != Tag::Sequence {
+                    return None;
+                }
+                let mut fields = SliceReader::new(atv.value()).ok()?;
+                let oid_any = AnyRef::from_der(fields.tlv_bytes().ok()?).ok()?;
+                if oid_any.tag() != Tag::ObjectIdentifier {
+                    return None;
+                }
+                let oid = Oid::new(oid_any.value()).ok()?;
+                let value = AnyRef::from_der(fields.tlv_bytes().ok()?).ok()?;
+                if !fields.is_finished() {
+                    return None;
+                }
+                atvs.push((oid, value));
+            }
+            if atvs.is_empty() {
+                return None;
+            }
+            rdns.push(atvs);
+        }
+        Some(rdns)
+    }
+
+    /// Compare two `AttributeTypeAndValue` entries per RFC 5280 §7.1.
+    fn atvs_semantically_eq(
+        lhs: (Oid<'_>, spki::der::asn1::AnyRef<'_>),
+        rhs: (Oid<'_>, spki::der::asn1::AnyRef<'_>),
+    ) -> bool {
+        use spki::der::{Tag, Tagged as _};
+
+        if lhs.0 != rhs.0 {
+            return false;
+        }
+        let lhs_tag = lhs.1.tag();
+        let rhs_tag = rhs.1.tag();
+        if Self::is_directory_string_tag(lhs_tag) && Self::is_directory_string_tag(rhs_tag) {
+            let Some(lhs_text) = Self::decode_asn1_string(lhs.1) else {
+                return false;
+            };
+            let Some(rhs_text) = Self::decode_asn1_string(rhs.1) else {
+                return false;
+            };
+            return Self::normalize_dn_string(&lhs_text) == Self::normalize_dn_string(&rhs_text);
+        }
+        if lhs_tag == Tag::Ia5String && rhs_tag == Tag::Ia5String {
+            let Some(lhs_text) = Self::decode_asn1_string(lhs.1) else {
+                return false;
+            };
+            let Some(rhs_text) = Self::decode_asn1_string(rhs.1) else {
+                return false;
+            };
+            return Self::normalize_dn_string(&lhs_text) == Self::normalize_dn_string(&rhs_text);
+        }
+        lhs_tag == rhs_tag && lhs.1.value() == rhs.1.value()
+    }
+
+    /// Whether `tag` belongs to ASN.1 `DirectoryString` (RFC 5280 §4.1.2.4).
+    const fn is_directory_string_tag(tag: spki::der::Tag) -> bool {
+        use spki::der::Tag;
+        matches!(
+            tag,
+            Tag::Utf8String | Tag::PrintableString | Tag::TeletexString | Tag::BmpString
+        )
+    }
+
+    /// Decode a `DirectoryString` or `IA5String` value to UTF-8 text.
+    fn decode_asn1_string(any: spki::der::asn1::AnyRef<'_>) -> Option<String> {
+        use spki::der::{Tag, Tagged as _};
+        /// Octets per UTF-16 code unit in ASN.1 `BMPString` (X.690 §8.23.8).
+        const BMP_UNIT_BYTES: usize = 2;
+
+        let bytes = any.value();
+        match any.tag() {
+            Tag::Utf8String => core::str::from_utf8(bytes).ok().map(str::to_owned),
+            Tag::PrintableString | Tag::Ia5String => {
+                if !bytes.is_ascii() {
+                    return None;
+                }
+                core::str::from_utf8(bytes).ok().map(str::to_owned)
+            }
+            Tag::TeletexString => Some(bytes.iter().map(|&byte| char::from(byte)).collect()),
+            Tag::BmpString => {
+                let (chunks, remainder) = bytes.as_chunks::<BMP_UNIT_BYTES>();
+                if !remainder.is_empty() {
+                    return None;
+                }
+                let units: Vec<u16> = chunks.iter().copied().map(u16::from_be_bytes).collect();
+                String::from_utf16(&units).ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// RFC 5280 §7.1 / RFC 4518 string preparation for DN matching:
+    /// collapse whitespace runs to a single ASCII space, trim leading and
+    /// trailing whitespace (preserving an all-whitespace non-empty string
+    /// as a single space), and apply Unicode case folding.
+    fn normalize_dn_string(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut has_word = false;
+        for word in text.split_whitespace() {
+            if has_word {
+                out.push(' ');
+            }
+            for ch in word.chars().flat_map(char::to_lowercase) {
+                out.push(ch);
+            }
+            has_word = true;
+        }
+        if !has_word && !text.is_empty() {
+            out.push(' ');
+        }
+        out
     }
 }
 
@@ -2449,6 +2693,118 @@ mod tests {
             error,
             super::PathExtensionError::Malformed("Basic Constraints pathLen without cA")
         );
+    }
+
+    #[test]
+    fn extracts_subject_and_authority_key_identifiers() {
+        use crate::oid::known;
+        use crate::testkit::{self, CertificateSpec, TestCurve, TestKey};
+
+        const SKI_BYTES: &[u8] = &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        const AKI_BYTES: &[u8] = &[0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8];
+        const FIRST_DAY: u8 = 1;
+        const LAST_DAY: u8 = 28;
+        const SERIAL_WITH_IDS: u8 = 7;
+        const SERIAL_WITHOUT_IDS: u8 = 8;
+
+        let key = TestKey::derive(TestCurve::P256, b"cms-x509-ski-aki");
+        let ski_ext = testkit::extension(
+            known::SUBJECT_KEY_IDENTIFIER,
+            false,
+            &testkit::tlv(testkit::OCTET_STRING, SKI_BYTES),
+        );
+        let aki_ext = testkit::extension(
+            known::AUTHORITY_KEY_IDENTIFIER,
+            false,
+            &testkit::tlv(
+                testkit::SEQUENCE,
+                testkit::tlv(testkit::CONTEXT_0_PRIMITIVE, AKI_BYTES),
+            ),
+        );
+        let with_ids_der = testkit::certificate(
+            &CertificateSpec {
+                serial: SERIAL_WITH_IDS,
+                subject: "SKI AKI Test",
+                issuer: "SKI AKI Test",
+                not_before: testkit::day(FIRST_DAY),
+                not_after: testkit::day(LAST_DAY),
+                extensions: vec![ski_ext, aki_ext],
+            },
+            &key,
+            &key,
+        );
+        let with_ids = Certificate::from_der(&with_ids_der).expect("valid cert");
+        assert_eq!(with_ids.subject_key_identifier(), Some(SKI_BYTES));
+        assert_eq!(with_ids.authority_key_identifier_key_id(), Some(AKI_BYTES));
+
+        let without_ids_der = testkit::certificate(
+            &CertificateSpec {
+                serial: SERIAL_WITHOUT_IDS,
+                subject: "No Key IDs",
+                issuer: "No Key IDs",
+                not_before: testkit::day(FIRST_DAY),
+                not_after: testkit::day(LAST_DAY),
+                extensions: Vec::new(),
+            },
+            &key,
+            &key,
+        );
+        let without_ids = Certificate::from_der(&without_ids_der).expect("valid cert");
+        assert_eq!(without_ids.subject_key_identifier(), None);
+        assert_eq!(without_ids.authority_key_identifier_key_id(), None);
+    }
+
+    #[test]
+    fn name_semantic_equality_handles_reencoded_strings_whitespace_case_and_rdn_sets() {
+        use super::Name;
+        use crate::oid::known;
+        use crate::testkit;
+
+        let utf8_dn = testkit::name_of(&[
+            (known::COUNTRY_NAME, testkit::PRINTABLE_STRING, "FI"),
+            (known::COMMON_NAME, testkit::UTF8_STRING, "Example   CA"),
+        ]);
+        let printable_dn = testkit::name_of(&[
+            (known::COUNTRY_NAME, testkit::PRINTABLE_STRING, "fi"),
+            (
+                known::COMMON_NAME,
+                testkit::PRINTABLE_STRING,
+                "  example ca ",
+            ),
+        ]);
+        let lhs = Name::try_from(utf8_dn.as_slice()).expect("valid UTF8 DN");
+        let rhs = Name::try_from(printable_dn.as_slice()).expect("valid PrintableString DN");
+        assert!(lhs != rhs, "raw DER differs");
+        assert!(lhs.semantically_eq(rhs), "semantically equal per RFC 5280");
+
+        // Reordered multi-valued RDN (SET OF AttributeTypeAndValue) matches.
+        let mut atv_c = testkit::tlv(testkit::OBJECT_IDENTIFIER, known::COUNTRY_NAME.as_bytes());
+        atv_c.extend_from_slice(&testkit::tlv(testkit::PRINTABLE_STRING, b"FI"));
+        let atv_c = testkit::tlv(testkit::SEQUENCE, atv_c);
+
+        let mut atv_cn = testkit::tlv(testkit::OBJECT_IDENTIFIER, known::COMMON_NAME.as_bytes());
+        atv_cn.extend_from_slice(&testkit::tlv(testkit::UTF8_STRING, b"Multi RDN"));
+        let atv_cn = testkit::tlv(testkit::SEQUENCE, atv_cn);
+
+        let mut set_ab = atv_c.clone();
+        set_ab.extend_from_slice(&atv_cn);
+        let dn_ab = testkit::tlv(testkit::SEQUENCE, testkit::tlv(testkit::SET, set_ab));
+
+        let mut set_ba = atv_cn;
+        set_ba.extend_from_slice(&atv_c);
+        let dn_ba = testkit::tlv(testkit::SEQUENCE, testkit::tlv(testkit::SET, set_ba));
+
+        let name_ab = Name::try_from(dn_ab.as_slice()).expect("valid multi-RDN");
+        let name_ba = Name::try_from(dn_ba.as_slice()).expect("valid reordered multi-RDN");
+        assert!(name_ab.semantically_eq(name_ba));
+
+        // Different RDN sequence order must NOT match.
+        let reversed_seq = testkit::name_of(&[
+            (known::COMMON_NAME, testkit::UTF8_STRING, "Example CA"),
+            (known::COUNTRY_NAME, testkit::PRINTABLE_STRING, "FI"),
+        ]);
+        let reversed = Name::try_from(reversed_seq.as_slice()).expect("valid reversed DN");
+        assert!(!lhs.semantically_eq(reversed));
     }
 
     /// Fixture TLV input for DER test builders.

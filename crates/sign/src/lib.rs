@@ -58,7 +58,7 @@ use refineid_auth::{
     PinReferenceScheme, VerifyOutcome, check_retry_floor,
 };
 use refineid_pace::{OpenedByPin2, Pin2PresentationSpent, SmTransport};
-use refineid_pkcs15::{Pkcs15Error, Pkcs15Ops as _};
+use refineid_pkcs15::{KeyReference, Pkcs15Error, Pkcs15Ops as _};
 use zeroize::Zeroizing;
 
 use commands::{
@@ -363,7 +363,7 @@ impl<T: CardTransport> Pin2ChannelSignOps for SmTransport<T, OpenedByPin2> {
         Ok(SigningKey {
             transport: self,
             scheme: SignScheme::Organizational,
-            key: KeyRef::Sign,
+            key: KeyTarget::Fixed(KeyRef::Sign),
         })
     }
 
@@ -385,7 +385,7 @@ impl<T: CardTransport> Pin2ChannelSignOps for SmTransport<T, OpenedByPin2> {
             VerifyOutcome::Ok => Ok(SigningKey {
                 transport: self,
                 scheme: SignScheme::Organizational,
-                key: KeyRef::Sign,
+                key: KeyTarget::Fixed(KeyRef::Sign),
             }),
             refused @ (VerifyOutcome::WrongPin { .. }
             | VerifyOutcome::Locked
@@ -418,7 +418,29 @@ pub trait SignOps: CardTransport {
         SigningKey {
             transport: self,
             scheme,
-            key: KeyRef::Auth,
+            key: KeyTarget::Fixed(KeyRef::Auth),
+        }
+    }
+
+    /// The authentication key identified by a card's EF.PrKDF
+    /// [`KeyReference`], ready to sign one digest.
+    ///
+    /// PIN 1 must already be verified in the card session. Taking the
+    /// typed [`KeyReference`] parsed from EF.PrKDF rather than a bare
+    /// byte lets MSE:SET follow re-keyed cards and future generations
+    /// without hardcoded key references.
+    fn authentication_key_with_reference(
+        &mut self,
+        scheme: SignScheme,
+        key_reference: KeyReference,
+    ) -> SigningKey<'_, Self>
+    where
+        Self: Sized,
+    {
+        SigningKey {
+            transport: self,
+            scheme,
+            key: KeyTarget::DirectoryAuth(key_reference),
         }
     }
 
@@ -476,7 +498,7 @@ pub trait SignOps: CardTransport {
             VerifyOutcome::Ok => Ok(SigningKey {
                 transport: self,
                 scheme,
-                key: KeyRef::Sign,
+                key: KeyTarget::Fixed(KeyRef::Sign),
             }),
             refused @ (VerifyOutcome::WrongPin { .. }
             | VerifyOutcome::Locked
@@ -567,11 +589,22 @@ pub trait SignOps: CardTransport {
 
 impl<T: CardTransport + ?Sized> SignOps for T {}
 
+/// How [`SigningKey`] identifies the key reference passed to MSE:SET.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyTarget {
+    /// Fixed FINEID authentication or qualified-signature key role.
+    Fixed(KeyRef),
+    /// Authentication key reference discovered from the card's
+    /// EF.PrKDF.
+    DirectoryAuth(KeyReference),
+}
+
 /// A card private key ready to sign one digest: the transport, borrowed
 /// exclusively, with the card in the context the key is reached from.
 ///
-/// Obtained from [`SignOps::authentication_key`] or, for the qualified
-/// key, from [`SignOps::unlock_qualified_key`] or
+/// Obtained from [`SignOps::authentication_key`],
+/// [`SignOps::authentication_key_with_reference`], or, for the
+/// qualified key, from [`SignOps::unlock_qualified_key`] or
 /// [`Pin2ChannelSignOps::qualified_key_after_pin2_pace`] -- there is no
 /// other constructor, so the qualified key cannot be named without PIN 2
 /// presented for it, by VERIFY or by the PACE that opened the channel,
@@ -581,7 +614,7 @@ impl<T: CardTransport + ?Sized> SignOps for T {}
 pub struct SigningKey<'t, T: CardTransport> {
     transport: &'t mut T,
     scheme: SignScheme,
-    key: KeyRef,
+    key: KeyTarget,
 }
 
 impl<T: CardTransport> core::fmt::Debug for SigningKey<'_, T> {
@@ -781,33 +814,45 @@ impl<T: CardTransport> SigningKey<'_, T> {
         hash: ExternalHashValue,
         le: u8,
     ) -> Result<Vec<u8>, SignError<T::Error>> {
-        let key_ref = self
-            .key
-            .reference(self.scheme)
-            .ok_or(SignError::UnsupportedKey {
-                scheme: self.scheme,
-                key: self.key,
-            })?;
+        let key_ref = match self.key {
+            KeyTarget::Fixed(key) => {
+                key.reference(self.scheme)
+                    .ok_or(SignError::UnsupportedKey {
+                        scheme: self.scheme,
+                        key,
+                    })?
+            }
+            KeyTarget::DirectoryAuth(reference) => reference.as_u8(),
+        };
         let mse = MseSet { alg_ref, key_ref }
             .into_apdu()
             .map_err(SignError::Command)?;
         self.transport.exchange(&mse, "MSE:Set")?;
         let signature = match (self.scheme, self.key) {
-            (SignScheme::Citizen, KeyRef::Auth | KeyRef::Sign)
-            | (SignScheme::Estonian, KeyRef::Auth) => {
+            (
+                SignScheme::Citizen,
+                KeyTarget::Fixed(KeyRef::Auth | KeyRef::Sign) | KeyTarget::DirectoryAuth(_),
+            )
+            | (
+                SignScheme::Estonian,
+                KeyTarget::Fixed(KeyRef::Auth) | KeyTarget::DirectoryAuth(_),
+            ) => {
                 let load = PsoHashExternal { hash }
                     .into_apdu()
                     .map_err(SignError::Command)?;
                 self.transport.exchange(&load, "PSO:HASH")?;
                 PsoComputeDigitalSignature.into_apdu(le)
             }
-            (SignScheme::Organizational, KeyRef::Auth | KeyRef::Sign) => PsoComputeDigitalSignature
+            (
+                SignScheme::Organizational,
+                KeyTarget::Fixed(KeyRef::Auth | KeyRef::Sign) | KeyTarget::DirectoryAuth(_),
+            ) => PsoComputeDigitalSignature
                 .into_apdu_with_digest(hash, le)
                 .map_err(SignError::Command)?,
-            (SignScheme::Estonian, KeyRef::Sign) => {
+            (SignScheme::Estonian, KeyTarget::Fixed(KeyRef::Sign)) => {
                 return Err(SignError::UnsupportedKey {
                     scheme: self.scheme,
-                    key: self.key,
+                    key: KeyRef::Sign,
                 });
             }
         };
@@ -817,9 +862,50 @@ impl<T: CardTransport> SigningKey<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use refineid_apdu::{CardTransport, CommandApdu, CredentialCommand, TransportOutcome};
+    use refineid_apdu::{
+        CardTransport, CommandApdu, CredentialCommand, ResponseApdu, StatusWord, TransportOutcome,
+    };
+    use refineid_pkcs15::{FileContent, FileEnd, PrivateKeyDirectory, PrivateKeyDirectoryRead};
 
-    use super::{KeyRef, SHA384_LEN, SignError, SignScheme, SigningKey};
+    use super::{
+        ECDSA_P384_SIG_BYTES, KeyRef, KeyTarget, SHA384_LEN, SignError, SignOps, SignScheme,
+        SigningKey,
+    };
+    use crate::commands::{MseSet, SignatureAlgRef};
+
+    const REKEYED_AUTH_KEY_REF: u8 = 0x03;
+    /// DER-encoded PKCS#15 PrivateECKey (`[0]` constructed) entry:
+    /// empty CommonObjectAttributes, CommonKeyAttributes with
+    /// `id = [11]`, `usage = sign | derive`, `keyReference = 03`,
+    /// and empty typeAttributes path.
+    const REKEYED_PRKDF_DER: &[u8] = &[
+        0xA0,
+        0x17,
+        0x30,
+        0x00,
+        0x30,
+        0x0B,
+        0x04,
+        0x01,
+        0x11,
+        0x03,
+        0x03,
+        0x07,
+        0x20,
+        0x80,
+        0x02,
+        0x01,
+        REKEYED_AUTH_KEY_REF,
+        0xA1,
+        0x06,
+        0x30,
+        0x04,
+        0x30,
+        0x02,
+        0x04,
+        0x00,
+    ];
+    const SIG_FILL: u8 = 0x5A;
 
     struct NeverTransmitting;
 
@@ -838,13 +924,42 @@ mod tests {
         }
     }
 
+    struct RecordingSignCard {
+        commands: Vec<Vec<u8>>,
+        signature: Vec<u8>,
+    }
+
+    impl CardTransport for RecordingSignCard {
+        type Error = &'static str;
+
+        fn transmit(&mut self, command: &CommandApdu) -> Result<TransportOutcome, Self::Error> {
+            self.commands.push(command.as_bytes().to_vec());
+            let [sw1, sw2] = StatusWord::Success.as_u16().to_be_bytes();
+            let body = if self.commands.len() == THREE_COMMANDS {
+                self.signature.clone()
+            } else {
+                Vec::new()
+            };
+            Ok(TransportOutcome::Response(ResponseApdu { body, sw1, sw2 }))
+        }
+
+        fn transmit_credential(
+            &mut self,
+            _command: CredentialCommand,
+        ) -> Result<TransportOutcome, Self::Error> {
+            Err("unexpected credential APDU")
+        }
+    }
+
+    const THREE_COMMANDS: usize = 3;
+
     #[test]
     fn drive_chain_refuses_estonian_sign_key_without_transmitting() {
         let mut transport = NeverTransmitting;
         let key = SigningKey {
             transport: &mut transport,
             scheme: SignScheme::Estonian,
-            key: KeyRef::Sign,
+            key: KeyTarget::Fixed(KeyRef::Sign),
         };
         let err = key
             .sign_prehashed_sha384_ecdsa([0; SHA384_LEN])
@@ -856,5 +971,39 @@ mod tests {
                 key: KeyRef::Sign,
             }
         ));
+    }
+
+    #[test]
+    fn authentication_key_with_reference_passes_discovered_key_reference_to_mse_set() {
+        let prkdf = match PrivateKeyDirectory::of(FileContent::from_read(
+            REKEYED_PRKDF_DER.to_vec(),
+            FileEnd::Confirmed,
+        )) {
+            PrivateKeyDirectoryRead::Parsed(prkdf) => Some(prkdf),
+            PrivateKeyDirectoryRead::Incomplete | PrivateKeyDirectoryRead::Malformed => None,
+        }
+        .expect("PrKDF fixture must parse");
+        let discovered = prkdf.entries()[0]
+            .key_reference()
+            .expect("PrKDF fixture carries key reference");
+        assert_eq!(discovered.as_u8(), REKEYED_AUTH_KEY_REF);
+
+        let mut card = RecordingSignCard {
+            commands: Vec::new(),
+            signature: vec![SIG_FILL; ECDSA_P384_SIG_BYTES],
+        };
+        let sig = card
+            .authentication_key_with_reference(SignScheme::Estonian, discovered)
+            .sign_prehashed_sha384_ecdsa([SIG_FILL; SHA384_LEN])
+            .expect("re-keyed Estonian signing succeeds");
+        assert_eq!(sig.as_bytes().len(), ECDSA_P384_SIG_BYTES);
+        assert_eq!(card.commands.len(), THREE_COMMANDS);
+        let expected_mse = MseSet {
+            alg_ref: SignatureAlgRef::SHA384_ECDSA,
+            key_ref: REKEYED_AUTH_KEY_REF,
+        }
+        .into_apdu()
+        .expect("MSE encodes");
+        assert_eq!(card.commands[0], expected_mse.as_bytes());
     }
 }

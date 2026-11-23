@@ -22,12 +22,14 @@ use refineid_apdu::{
     Aid, ApduClass, CardTransport, CommandApdu, CredentialCommand, FileId, ResponseApdu,
     StatusWord, TransportOutcome,
 };
-use refineid_ber::{BerEncoder, BerTag, BitString, Integer, Sequence, tlv};
+use refineid_ber::{
+    BerEncoder, BerTag, BitString, Integer, OctetString, Sequence, Utf8String, tlv,
+};
 use refineid_pkcs15::{
     CertSlot, DF_ESIGN_FID, DF_ESTONIAN_PERSONAL_DATA_FID, DOCUMENT_NUMBER_CHARS, EF_AOD_FID,
-    EF_ESTONIAN_AOD_FID, EF_ESTONIAN_AUTH_CERT_FID, EF_ESTONIAN_DOCUMENT_NUMBER_FID,
-    EF_ESTONIAN_DOCUMENT_NUMBER_LEGACY_FID, EF_TOKEN_INFO_FID, ESIGN_AID, PKCS15_AID, Pkcs15Error,
-    Pkcs15Ops,
+    EF_DIR_FID, EF_ESTONIAN_DOCUMENT_NUMBER_FID, EF_ESTONIAN_DOCUMENT_NUMBER_LEGACY_FID,
+    EF_ODF_FID, EF_TOKEN_INFO_FID, ESIGN_AID, ESTONIAN_EID_APPLICATION_LABEL, FileEnd, PKCS15_AID,
+    Pkcs15Error, Pkcs15Ops,
 };
 
 /// Chunk size the read loops request, mirroring the implementation; a
@@ -310,31 +312,6 @@ fn authentication_certificate_reads_across_chunks() {
         .read_certificate(CertSlot::Authentication)
         .expect("scripted read succeeds");
     assert_eq!(cert.as_bytes(), der.as_slice());
-    transport.assert_drained();
-}
-
-#[test]
-fn estonian_authentication_certificate_reads_from_ef_3411() {
-    let der = certificate_fixture(ONE_CHUNK_CONTENT_LEN);
-
-    let mut transport = ScriptedTransport::new(vec![
-        (select_app_wire(), ok_response(&[])),
-        (
-            select_ef_wire(CertSlot::EstonianAuthentication.fid()),
-            ok_response(&[]),
-        ),
-        (read_wire(0, READ_CHUNK_LEN), ok_response(&der)),
-    ]);
-
-    assert_eq!(
-        CertSlot::EstonianAuthentication.fid(),
-        EF_ESTONIAN_AUTH_CERT_FID
-    );
-    let cert = transport
-        .read_certificate(CertSlot::EstonianAuthentication)
-        .expect("scripted read succeeds");
-    assert_eq!(cert.as_bytes(), der.as_slice());
-    assert!(!CertSlot::EstonianAuthentication.requires_mf_traversal());
     transport.assert_drained();
 }
 
@@ -666,12 +643,34 @@ fn document_number_propagates_transport_and_outcome_errors() {
 }
 
 #[test]
-fn authentication_objects_reads_estonian_ef_5006_after_empty_end_of_file() {
+fn authentication_objects_discovers_ef_aod_via_ef_odf_when_ef_4401_is_absent() {
+    const TAG_ODF_AUTH_OBJECTS: u8 = 0xA8;
+    const EF_ODF_AOD_FID: FileId = FileId::from_u16(0x5006);
+
+    let oct_tag = u8::try_from(<OctetString as BerTag>::TAG).expect("fits");
+    let mut path_octets = Vec::new();
+    path_octets.extend_from_slice(FileId::MF.as_bytes());
+    path_octets.extend_from_slice(EF_ODF_AOD_FID.as_bytes());
+    let odf = tlv(
+        TAG_ODF_AUTH_OBJECTS,
+        tlv(sequence_tag(), tlv(oct_tag, path_octets).expect("encodes")).expect("encodes"),
+    )
+    .expect("encodes");
     let aod = aod_fixture(
         ESTONIAN_PIN1_REFERENCE,
         ESTONIAN_PIN1_MIN_LEN,
         ESTONIAN_PIN1_STORED_LEN,
     );
+    let select_aod_abs = SelectFile {
+        class: ApduClass::Plain,
+        target: SelectFileTarget::AbsolutePath(
+            AbsolutePath::new(vec![EF_ODF_AOD_FID]).expect("valid path"),
+        ),
+        response_mode: SelectFileResponseMode::None,
+    }
+    .into_apdu()
+    .as_bytes()
+    .to_vec();
 
     let mut transport = ScriptedTransport::new(vec![
         (select_app_wire(), ok_response(&[])),
@@ -683,17 +682,33 @@ fn authentication_objects_reads_estonian_ef_5006_after_empty_end_of_file() {
             select_any_by_fid_wire(EF_AOD_FID),
             response(&[], StatusWord::FileNotFound),
         ),
-        (select_ef_wire(EF_ESTONIAN_AOD_FID), ok_response(&[])),
+        (select_app_wire(), ok_response(&[])),
+        (select_ef_wire(EF_ODF_FID), ok_response(&[])),
+        (
+            read_wire(0, READ_CHUNK_LEN),
+            response(&[], StatusWord::EndOfFile),
+        ),
+        (read_wire(0, READ_LE_256_LEN), ok_response(&odf)),
+        (
+            read_wire(odf.len(), READ_CHUNK_LEN),
+            response(&[], StatusWord::WrongParametersP1P2),
+        ),
+        (select_aod_abs, ok_response(&[])),
         (
             read_wire(0, READ_CHUNK_LEN),
             response(&[], StatusWord::EndOfFile),
         ),
         (read_wire(0, READ_LE_256_LEN), ok_response(&aod)),
+        (
+            read_wire(aod.len(), READ_CHUNK_LEN),
+            response(&[], StatusWord::WrongParametersP1P2),
+        ),
+        (select_app_wire(), ok_response(&[])),
     ]);
 
     let objects = transport
         .read_authentication_objects()
-        .expect("Estonian EF.5006 must read after the full-window retry");
+        .expect("EF.ODF-discovered EF.AOD must read cleanly");
     assert!(objects.lists_reference(ESTONIAN_PIN1_REFERENCE));
     transport.assert_drained();
 }
@@ -748,7 +763,7 @@ fn authentication_objects_propagates_transport_and_outcome_errors() {
 }
 
 #[test]
-fn authentication_objects_reports_file_not_found_when_neither_file_exists() {
+fn authentication_objects_reports_file_not_found_when_neither_ef_4401_nor_ef_odf_exists() {
     let mut transport = ScriptedTransport::new(vec![
         (select_app_wire(), ok_response(&[])),
         (
@@ -759,19 +774,20 @@ fn authentication_objects_reports_file_not_found_when_neither_file_exists() {
             select_any_by_fid_wire(EF_AOD_FID),
             response(&[], StatusWord::FileNotFound),
         ),
+        (select_app_wire(), ok_response(&[])),
         (
-            select_ef_wire(EF_ESTONIAN_AOD_FID),
+            select_ef_wire(EF_ODF_FID),
             response(&[], StatusWord::FileNotFound),
         ),
         (
-            select_any_by_fid_wire(EF_ESTONIAN_AOD_FID),
+            select_any_by_fid_wire(EF_ODF_FID),
             response(&[], StatusWord::FileNotFound),
         ),
     ]);
 
     let error = transport
         .read_authentication_objects()
-        .expect_err("missing EF.AOD must report FileNotFound");
+        .expect_err("missing EF.AOD and EF.ODF must report FileNotFound");
     assert!(matches!(
         error,
         Pkcs15Error::Status(StatusWord::FileNotFound)
@@ -911,5 +927,328 @@ fn overlong_first_chunk_is_accepted_and_advanced_past() {
         .read_certificate(CertSlot::Authentication)
         .expect("a 61xx surplus must read");
     assert_eq!(cert.as_bytes(), der.as_slice());
+    transport.assert_drained();
+}
+
+#[test]
+fn estonian_profile_discovery_resolves_custom_aid_path_key_ref_and_aod_parameters() {
+    const CUSTOM_ESTONIAN_AID: &[u8] = b"EESTI-EID-2030";
+    const TAG_APP_TEMPLATE: u8 = 0x61;
+    const TAG_APP_AID: u8 = 0x4F;
+    const TAG_APP_LABEL: u8 = 0x50;
+    const TAG_ODF_PRKDF: u8 = 0xA0;
+    const TAG_ODF_CDF: u8 = 0xA4;
+    const TAG_ODF_AOD: u8 = 0xA8;
+    const TAG_PRIVATE_EC_KEY: u8 = 0xA0;
+    const CUSTOM_CDF_FID: FileId = FileId::from_u16(0x5103);
+    const CUSTOM_PRKDF_FID: FileId = FileId::from_u16(0x5101);
+    const CUSTOM_AOD_FID: FileId = FileId::from_u16(0x5106);
+    const CUSTOM_CERT_DF_FID: FileId = FileId::from_u16(0xADF9);
+    const CUSTOM_CERT_FID: FileId = FileId::from_u16(0x3499);
+    const AUTH_OBJECT_ID: u8 = 0x11;
+    const PIN1_AUTH_ID: u8 = 0x01;
+    const PUK_AUTH_ID: u8 = 0x03;
+    const CUSTOM_KEY_REF: u8 = 0x03;
+    const CUSTOM_PIN1_REF: u8 = 0x84;
+    const CUSTOM_PUK_REF: u8 = 0x86;
+    const CUSTOM_PIN1_MIN: u8 = 5;
+    const CUSTOM_PIN1_STORED: u8 = 8;
+    const CUSTOM_PUK_MIN: u8 = 8;
+    const CUSTOM_PAD_BYTE: u8 = 0xFF;
+    const AUTH_USAGE_BITS: &[u8] = &[0x07, 0x20, 0x80];
+    const PIN1_FLAGS: &[u8] = &[0x04, 0xCC, 0x10];
+    const PUK_FLAGS: &[u8] = &[0x01, 0xFE];
+
+    let oct_tag = u8::try_from(<OctetString as BerTag>::TAG).expect("fits");
+    let bit_tag = u8::try_from(<BitString as BerTag>::TAG).expect("fits");
+    let int_tag = u8::try_from(<Integer as BerTag>::TAG).expect("fits");
+    let utf8_tag = u8::try_from(<Utf8String as BerTag>::TAG).expect("fits");
+
+    let mut dir_inner = BerEncoder::default();
+    dir_inner
+        .push_tlv(TAG_APP_AID, CUSTOM_ESTONIAN_AID)
+        .expect("encodes");
+    dir_inner
+        .push_tlv(TAG_APP_LABEL, ESTONIAN_EID_APPLICATION_LABEL.as_bytes())
+        .expect("encodes");
+    let ef_dir = tlv(TAG_APP_TEMPLATE, dir_inner.finish()).expect("encodes");
+
+    let path_tlv = |steps: &[FileId]| {
+        let mut raw = Vec::new();
+        for fid in steps {
+            raw.extend_from_slice(fid.as_bytes());
+        }
+        tlv(sequence_tag(), tlv(oct_tag, raw).expect("encodes")).expect("encodes")
+    };
+    let mut ef_odf = Vec::new();
+    ef_odf.extend_from_slice(
+        &tlv(TAG_ODF_CDF, path_tlv(&[FileId::MF, CUSTOM_CDF_FID])).expect("encodes"),
+    );
+    ef_odf.extend_from_slice(
+        &tlv(TAG_ODF_PRKDF, path_tlv(&[FileId::MF, CUSTOM_PRKDF_FID])).expect("encodes"),
+    );
+    ef_odf.extend_from_slice(
+        &tlv(TAG_ODF_AOD, path_tlv(&[FileId::MF, CUSTOM_AOD_FID])).expect("encodes"),
+    );
+
+    let cdf_common = tlv(
+        sequence_tag(),
+        tlv(utf8_tag, b"authentication certificate").expect("encodes"),
+    )
+    .expect("encodes");
+    let cdf_class = tlv(
+        sequence_tag(),
+        tlv(oct_tag, [AUTH_OBJECT_ID]).expect("encodes"),
+    )
+    .expect("encodes");
+    let cdf_type = tlv(
+        TYPE_ATTRIBUTES_TAG,
+        tlv(
+            sequence_tag(),
+            path_tlv(&[FileId::MF, CUSTOM_CERT_DF_FID, CUSTOM_CERT_FID]),
+        )
+        .expect("encodes"),
+    )
+    .expect("encodes");
+    let mut cdf_body = cdf_common;
+    cdf_body.extend_from_slice(&cdf_class);
+    cdf_body.extend_from_slice(&cdf_type);
+    let ef_cdf = tlv(sequence_tag(), cdf_body).expect("encodes");
+
+    let mut prkdf_common = BerEncoder::default();
+    prkdf_common
+        .push_tlv(utf8_tag, b"authentication key")
+        .expect("encodes");
+    prkdf_common
+        .push_tlv(oct_tag, [PIN1_AUTH_ID])
+        .expect("encodes");
+    let mut prkdf_class = BerEncoder::default();
+    prkdf_class
+        .push_tlv(oct_tag, [AUTH_OBJECT_ID])
+        .expect("encodes");
+    prkdf_class
+        .push_tlv(bit_tag, AUTH_USAGE_BITS)
+        .expect("encodes");
+    prkdf_class
+        .push_tlv(int_tag, [CUSTOM_KEY_REF])
+        .expect("encodes");
+    let prkdf_type = tlv(
+        TYPE_ATTRIBUTES_TAG,
+        tlv(
+            sequence_tag(),
+            tlv(sequence_tag(), tlv(oct_tag, []).expect("encodes")).expect("encodes"),
+        )
+        .expect("encodes"),
+    )
+    .expect("encodes");
+    let mut prkdf_body = tlv(sequence_tag(), prkdf_common.finish()).expect("encodes");
+    prkdf_body.extend_from_slice(&tlv(sequence_tag(), prkdf_class.finish()).expect("encodes"));
+    prkdf_body.extend_from_slice(&prkdf_type);
+    let ef_prkdf = tlv(TAG_PRIVATE_EC_KEY, prkdf_body).expect("encodes");
+
+    let aod_record =
+        |auth_id: u8, protecting: Option<u8>, flags: &[u8], min: u8, stored: u8, reference: u8| {
+            let mut common = BerEncoder::default();
+            common.push_tlv(utf8_tag, b"PIN").expect("encodes");
+            if let Some(puk) = protecting {
+                common.push_tlv(oct_tag, [puk]).expect("encodes");
+            }
+            let class =
+                tlv(sequence_tag(), tlv(oct_tag, [auth_id]).expect("encodes")).expect("encodes");
+            let mut attrs = BerEncoder::default();
+            attrs.push_tlv(bit_tag, flags).expect("encodes");
+            attrs
+                .push_tlv(ENUMERATED_TAG, [PASSWORD_TYPE_ASCII_NUMERIC])
+                .expect("encodes");
+            attrs.push_tlv(int_tag, [min]).expect("encodes");
+            attrs.push_tlv(int_tag, [stored]).expect("encodes");
+            attrs
+                .push_tlv(PWD_REFERENCE_TAG, [DER_ZERO_PREFIX, reference])
+                .expect("encodes");
+            attrs.push_tlv(oct_tag, [CUSTOM_PAD_BYTE]).expect("encodes");
+            let typed = tlv(
+                TYPE_ATTRIBUTES_TAG,
+                tlv(sequence_tag(), attrs.finish()).expect("encodes"),
+            )
+            .expect("encodes");
+            let mut rec = tlv(sequence_tag(), common.finish()).expect("encodes");
+            rec.extend_from_slice(&class);
+            rec.extend_from_slice(&typed);
+            tlv(sequence_tag(), rec).expect("encodes")
+        };
+    let mut ef_aod = aod_record(
+        PIN1_AUTH_ID,
+        Some(PUK_AUTH_ID),
+        PIN1_FLAGS,
+        CUSTOM_PIN1_MIN,
+        CUSTOM_PIN1_STORED,
+        CUSTOM_PIN1_REF,
+    );
+    ef_aod.extend_from_slice(&aod_record(
+        PUK_AUTH_ID,
+        None,
+        PUK_FLAGS,
+        CUSTOM_PUK_MIN,
+        CUSTOM_PIN1_STORED,
+        CUSTOM_PUK_REF,
+    ));
+
+    let custom_aid = Aid::from_slice(CUSTOM_ESTONIAN_AID).expect("valid custom AID");
+    let select_custom_aid = SelectByAidNoFci { aid: custom_aid }
+        .into_apdu()
+        .as_bytes()
+        .to_vec();
+    let select_abs = |steps: &[FileId]| {
+        SelectFile {
+            class: ApduClass::Plain,
+            target: SelectFileTarget::AbsolutePath(
+                AbsolutePath::new(steps.to_vec()).expect("valid path"),
+            ),
+            response_mode: SelectFileResponseMode::None,
+        }
+        .into_apdu()
+        .as_bytes()
+        .to_vec()
+    };
+
+    let cert_der = certificate_fixture(ONE_CHUNK_CONTENT_LEN);
+
+    let mut transport = ScriptedTransport::new(vec![
+        (select_any_by_fid_wire(FileId::MF), ok_response(&[])),
+        (select_ef_wire(EF_DIR_FID), ok_response(&[])),
+        (
+            read_wire(0, READ_CHUNK_LEN),
+            response(&ef_dir, StatusWord::EndOfFile),
+        ),
+        (select_custom_aid.clone(), ok_response(&[])),
+        (select_ef_wire(EF_ODF_FID), ok_response(&[])),
+        (
+            read_wire(0, READ_CHUNK_LEN),
+            response(&ef_odf, StatusWord::EndOfFile),
+        ),
+        (select_abs(&[CUSTOM_CDF_FID]), ok_response(&[])),
+        (
+            read_wire(0, READ_CHUNK_LEN),
+            response(&ef_cdf, StatusWord::EndOfFile),
+        ),
+        (select_abs(&[CUSTOM_PRKDF_FID]), ok_response(&[])),
+        (
+            read_wire(0, READ_CHUNK_LEN),
+            response(&ef_prkdf, StatusWord::EndOfFile),
+        ),
+        (select_abs(&[CUSTOM_AOD_FID]), ok_response(&[])),
+        (
+            read_wire(0, READ_CHUNK_LEN),
+            response(&ef_aod, StatusWord::EndOfFile),
+        ),
+        (select_custom_aid, ok_response(&[])),
+        (
+            select_abs(&[CUSTOM_CERT_DF_FID, CUSTOM_CERT_FID]),
+            ok_response(&[]),
+        ),
+        (
+            read_wire(0, READ_CHUNK_LEN),
+            response(&cert_der, StatusWord::EndOfFile),
+        ),
+    ]);
+
+    let profile = transport
+        .discover_estonian_authentication_profile()
+        .expect("directory discovery resolves re-keyed custom Estonian profile");
+    assert_eq!(profile.application_aid().as_bytes(), CUSTOM_ESTONIAN_AID);
+    assert_eq!(
+        profile.auth_cert_path().steps(),
+        &[FileId::MF, CUSTOM_CERT_DF_FID, CUSTOM_CERT_FID]
+    );
+    assert_eq!(profile.auth_key_reference().as_u8(), CUSTOM_KEY_REF);
+    assert_eq!(profile.pin1().reference(), CUSTOM_PIN1_REF);
+    assert_eq!(profile.pin1().stored_length(), CUSTOM_PIN1_STORED);
+    assert_eq!(profile.pin1().pad_char(), Some(CUSTOM_PAD_BYTE));
+    assert_eq!(profile.pin1().lengths().min(), usize::from(CUSTOM_PIN1_MIN));
+    assert_eq!(
+        profile
+            .puk()
+            .map(refineid_pkcs15::PasswordObject::reference),
+        Some(CUSTOM_PUK_REF)
+    );
+
+    let cert = transport
+        .read_certificate_at(profile.auth_cert_path())
+        .expect("certificate reads and validates as single DER SEQUENCE");
+    assert_eq!(cert.as_bytes(), cert_der.as_slice());
+    transport.assert_drained();
+}
+
+#[test]
+fn read_binary_confirmed_continues_past_short_9000_chunks_until_card_eof() {
+    const FIRST_HALF: &[u8] = b"first-half-";
+    const SECOND_HALF: &[u8] = b"second-half";
+
+    let mut transport = ScriptedTransport::new(vec![
+        (read_wire(0, READ_CHUNK_LEN), ok_response(FIRST_HALF)),
+        (
+            read_wire(FIRST_HALF.len(), READ_CHUNK_LEN),
+            ok_response(SECOND_HALF),
+        ),
+        (
+            read_wire(FIRST_HALF.len() + SECOND_HALF.len(), READ_CHUNK_LEN),
+            response(&[], StatusWord::WrongParametersP1P2),
+        ),
+    ]);
+
+    let content = transport
+        .read_binary_confirmed()
+        .expect("confirmed read collects both short 9000 chunks");
+    assert_eq!(content.end(), FileEnd::Confirmed);
+    let mut expected = FIRST_HALF.to_vec();
+    expected.extend_from_slice(SECOND_HALF);
+    assert_eq!(content.as_bytes(), expected.as_slice());
+    transport.assert_drained();
+}
+
+#[test]
+fn read_binary_confirmed_retries_le_256_after_empty_6282_at_nonzero_offset() {
+    const FIRST_CHUNK: &[u8] = b"first-chunk-bytes-";
+    const FINAL_TAIL: &[u8] = b"final-tail-bytes";
+    const READ_LE_256: u8 = 0x00;
+
+    let mut transport = ScriptedTransport::new(vec![
+        (read_wire(0, READ_CHUNK_LEN), ok_response(FIRST_CHUNK)),
+        (
+            read_wire(FIRST_CHUNK.len(), READ_CHUNK_LEN),
+            response(&[], StatusWord::EndOfFile),
+        ),
+        (
+            read_wire(FIRST_CHUNK.len(), READ_LE_256),
+            ok_response(FINAL_TAIL),
+        ),
+        (
+            read_wire(FIRST_CHUNK.len() + FINAL_TAIL.len(), READ_CHUNK_LEN),
+            response(&[], StatusWord::WrongParametersP1P2),
+        ),
+    ]);
+
+    let content = transport
+        .read_binary_confirmed()
+        .expect("non-zero offset empty 6282 retries with Le=00 and recovers final tail");
+    assert_eq!(content.end(), FileEnd::Confirmed);
+    let mut expected = FIRST_CHUNK.to_vec();
+    expected.extend_from_slice(FINAL_TAIL);
+    assert_eq!(content.as_bytes(), expected.as_slice());
+    transport.assert_drained();
+}
+
+#[test]
+fn read_binary_confirmed_accepts_empty_file_6b00_at_offset_zero() {
+    let mut transport = ScriptedTransport::new(vec![(
+        read_wire(0, READ_CHUNK_LEN),
+        response(&[], StatusWord::WrongParametersP1P2),
+    )]);
+
+    let content = transport
+        .read_binary_confirmed()
+        .expect("empty file returning 6B00 with empty body at offset 0 is confirmed empty");
+    assert_eq!(content.end(), FileEnd::Confirmed);
+    assert!(content.is_empty());
     transport.assert_drained();
 }

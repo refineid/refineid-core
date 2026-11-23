@@ -111,6 +111,9 @@ pub enum StatusWord {
     /// SW1-SW2 `67 00`: wrong length; Lc or the body length does not
     /// match the command shape.
     WrongLength,
+    /// SW1-SW2 `6B 00`: wrong parameters P1-P2, such as a READ BINARY
+    /// offset at or beyond the end of the selected elementary file.
+    WrongParametersP1P2,
 }
 
 impl StatusWord {
@@ -138,6 +141,8 @@ impl StatusWord {
     const SW_FILE_NOT_FOUND: u16 = 0x6A82;
     /// Wire value of [`StatusWord::ReferenceDataNotFound`].
     const SW_REFERENCE_DATA_NOT_FOUND: u16 = 0x6A88;
+    /// Wire value of [`StatusWord::WrongParametersP1P2`].
+    const SW_WRONG_PARAMETERS_P1_P2: u16 = 0x6B00;
     /// Counter family prefix: a status word whose high twelve bits equal
     /// this prefix carries the remaining-retries count in the low nibble
     /// of SW2.
@@ -168,6 +173,7 @@ impl StatusWord {
             Self::SmDataObjectsIncorrect => Self::SW_SM_DATA_OBJECTS_INCORRECT,
             Self::Success => Self::SW_SUCCESS,
             Self::WrongLength => Self::SW_WRONG_LENGTH,
+            Self::WrongParametersP1P2 => Self::SW_WRONG_PARAMETERS_P1_P2,
         }
     }
 
@@ -191,6 +197,7 @@ impl StatusWord {
             Self::SW_SM_DATA_OBJECTS_INCORRECT => Self::SmDataObjectsIncorrect,
             Self::SW_FILE_NOT_FOUND => Self::FileNotFound,
             Self::SW_REFERENCE_DATA_NOT_FOUND => Self::ReferenceDataNotFound,
+            Self::SW_WRONG_PARAMETERS_P1_P2 => Self::WrongParametersP1P2,
             counter if (counter & Self::SW_PIN_COUNTER_MASK) == Self::SW_PIN_COUNTER_PREFIX => {
                 let sw2 = counter.to_be_bytes()[1];
                 let nibble = sw2 & PinRetries::MAX;
@@ -225,7 +232,8 @@ impl StatusWord {
             | Self::SecurityNotSatisfied
             | Self::SmDataObjectsIncorrect
             | Self::Success
-            | Self::WrongLength => None,
+            | Self::WrongLength
+            | Self::WrongParametersP1P2 => None,
         }
     }
 }
@@ -250,6 +258,7 @@ impl fmt::Display for StatusWord {
             Self::SmDataObjectsIncorrect => write!(f, "{raw:#06X} (SmDataObjectsIncorrect)"),
             Self::Success => write!(f, "{raw:#06X} (Success)"),
             Self::WrongLength => write!(f, "{raw:#06X} (WrongLength)"),
+            Self::WrongParametersP1P2 => write!(f, "{raw:#06X} (WrongParametersP1P2)"),
         }
     }
 }

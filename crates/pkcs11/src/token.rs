@@ -43,13 +43,13 @@ use std::io::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use refineid_apdu::CardTransport;
+use refineid_apdu::{Aid, CardTransport, StatusWord};
 #[cfg(feature = "pin-change")]
 use refineid_auth::PinManageOps as _;
 use refineid_auth::{
-    AuthError, FlooredCredential, PinOps as _, PinReferenceScheme, PinSlot, PinStatus,
-    RetryFloorRefusal, VerifyOutcome, check_retry_floor_with_scheme,
-    pin1_status_permits_reusable_cache,
+    AuthError, CardPinParameters, CredentialRole, FlooredCredential, PasswordLengthRange,
+    PinOps as _, PinReferenceScheme, PinSlot, PinStatus, RetryFloorRefusal, VerifyOutcome,
+    check_retry_floor_with_scheme, pin1_status_permits_reusable_cache,
 };
 use refineid_cms::container::{EcdsaP384, RsaPkcs1Sha256, Signature};
 use refineid_cms::x509::{
@@ -58,9 +58,11 @@ use refineid_cms::x509::{
 use refineid_digest::{
     Md5, SHA256_LEN, SHA384_LEN, SHA512_LEN, Sha1, Sha224, Sha256, Sha384, Sha512,
 };
-use refineid_pcsc::{PcscBackend, PcscCard, ReaderAccessCap, ReaderBackend as _, ReaderId};
+use refineid_pcsc::{PcscBackend, ReaderAccessCap, ReaderBackend as _, ReaderId};
 use refineid_pkcs15::{
-    CertSlot, Pkcs15Error, Pkcs15Ops as _, TokenSerial, derive_printed_serial, render_token_serial,
+    ApplicationLabel, CertSlot, ESTONIAN_EID_APPLICATION_LABEL, KeyReference, ObjectIdentifier,
+    Pkcs15Error, Pkcs15Ops as _, Pkcs15Path, TokenInfo, TokenSerial, derive_printed_serial,
+    render_token_serial,
 };
 
 use refineid_remote::{
@@ -72,7 +74,6 @@ use crate::pin_cache::PinSafetyCache;
 use crate::remote::{REMOTE_SIGN_DEADLINE, RemoteSignError, RemoteTokenSource, SessionCertificate};
 use crate::slot_kind::{RemoteSlotId, SlotKind};
 
-#[cfg(feature = "pin-change")]
 use crate::ck::CKR_PIN_LEN_RANGE;
 use crate::ck::{
     CK_CERTIFICATE_CATEGORY_AUTHORITY, CK_CERTIFICATE_CATEGORY_TOKEN_USER, CK_FALSE, CK_TRUE,
@@ -695,6 +696,96 @@ pub enum KeyGate {
     Device,
 }
 
+/// Card-published ISO/IEC 7816-15 directory parameters for an
+/// authentication credential discovered from EF.DIR -> EF.ODF ->
+/// EF.CDF + EF.PrKDF + EF.AOD.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DirectoryAuthProfile {
+    application_aid: Aid,
+    auth_key_reference: KeyReference,
+    aod_path: Pkcs15Path,
+    pin1_auth_id: ObjectIdentifier,
+    pin1: CardPinParameters,
+}
+
+impl DirectoryAuthProfile {
+    pub(crate) const fn new(
+        application_aid: Aid,
+        auth_key_reference: KeyReference,
+        aod_path: Pkcs15Path,
+        pin1_auth_id: ObjectIdentifier,
+        pin1: CardPinParameters,
+    ) -> Self {
+        Self {
+            application_aid,
+            auth_key_reference,
+            aod_path,
+            pin1_auth_id,
+            pin1,
+        }
+    }
+
+    /// Card-published application identifier selected for PIN and signing
+    /// commands.
+    pub(crate) const fn application_aid(&self) -> &Aid {
+        &self.application_aid
+    }
+
+    /// Authentication private-key reference from EF.PrKDF for MSE:Set.
+    pub(crate) const fn auth_key_reference(&self) -> KeyReference {
+        self.auth_key_reference
+    }
+
+    /// EF.AOD path from EF.ODF, re-read live before credential APDUs.
+    pub(crate) const fn aod_path(&self) -> &Pkcs15Path {
+        &self.aod_path
+    }
+
+    /// Authentication-object identifier (`authId`) linking the
+    /// authentication private key to its PIN1 record in EF.AOD.
+    pub(crate) const fn pin1_auth_id(&self) -> &ObjectIdentifier {
+        &self.pin1_auth_id
+    }
+
+    /// Exact EF.AOD PIN1 parameters (`pwdReference`, length range,
+    /// `storedLength`, `padChar`) discovered from the card.
+    pub(crate) const fn pin1(&self) -> CardPinParameters {
+        self.pin1
+    }
+}
+
+/// How a local card session selects its application, resolves PIN1
+/// parameters, and addresses its authentication private key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CardSessionProfile {
+    /// FINEID citizen or organizational card: standard PKCS#15 AID,
+    /// counter-safe scheme probe, and FINEID key reference.
+    Fineid,
+    /// ISO/IEC 7816-15 directory-discovered card (such as Estonian eID):
+    /// card-published AID, EF.AOD path and PIN1 parameters re-confirmed
+    /// live before every credential APDU, and EF.PrKDF key reference.
+    Directory(DirectoryAuthProfile),
+}
+
+impl CardSessionProfile {
+    /// Fixed credential numbering when directory discovery identified one.
+    pub(crate) const fn pin_scheme(&self) -> Option<PinReferenceScheme> {
+        match self {
+            Self::Fineid => None,
+            Self::Directory(profile) => Some(profile.pin1().scheme()),
+        }
+    }
+
+    /// Card-published PIN1 digit-length bounds when directory discovery
+    /// read EF.AOD.
+    pub(crate) const fn pin1_length_range(&self) -> Option<PasswordLengthRange> {
+        match self {
+            Self::Fineid => None,
+            Self::Directory(profile) => Some(profile.pin1().lengths()),
+        }
+    }
+}
+
 /// The token objects, parsed from the card's authentication
 /// certificate and cached per slot while the same card stays present.
 #[derive(Debug, Clone)]
@@ -711,7 +802,7 @@ pub struct TokenObjects {
     auth_cert_serial_der: Vec<u8>,
     /// The identifier printed on the card body, reported in
     /// `CK_TOKEN_INFO.serialNumber`: the Estonian document number
-    /// from EF.D003, or the plastic-printed serial
+    /// from EF.5007 / EF.D003, or the plastic-printed serial
     /// [`derive_printed_serial`] extracts from EF.TokenInfo (the
     /// form a citizen can check against the card body), falling back
     /// to the full rendered serial [`render_token_serial`] returns;
@@ -723,9 +814,8 @@ pub struct TokenObjects {
     ca_store: RefinedTrustStore,
     /// What authenticates the holder before the key signs.
     key_gate: KeyGate,
-    /// The credential numbering the certificate path fixes, when it does;
-    /// `None` lets the card's counter-safe probe resolve it.
-    pin_scheme: Option<PinReferenceScheme>,
+    /// Card session profile (FINEID or ISO/IEC 7816-15 directory-discovered).
+    session_profile: CardSessionProfile,
     /// Which raised token these objects belong to; its handles are
     /// offset by this many [`TOKEN_HANDLE_SPACE`]s.
     generation: CkObjectHandle,
@@ -866,7 +956,7 @@ impl TokenObjects {
             key_material,
             ca_store,
             key_gate,
-            pin_scheme: None,
+            session_profile: CardSessionProfile::Fineid,
             generation: 0,
         })
     }
@@ -908,17 +998,30 @@ impl TokenObjects {
         self.key_gate
     }
 
-    /// The credential numbering fixed by the certificate path, when the
-    /// path names it.
+    /// How this token drives card sessions (FINEID or directory-discovered).
     #[must_use]
-    pub(crate) const fn pin_scheme(&self) -> Option<PinReferenceScheme> {
-        self.pin_scheme
+    pub(crate) const fn session_profile(&self) -> &CardSessionProfile {
+        &self.session_profile
     }
 
-    /// Fix the credential numbering for a card whose certificate path
-    /// identifies its profile.
-    pub(crate) fn set_pin_scheme(&mut self, scheme: PinReferenceScheme) {
-        self.pin_scheme = Some(scheme);
+    /// The credential numbering fixed by directory discovery, when present.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[must_use]
+    pub(crate) const fn pin_scheme(&self) -> Option<PinReferenceScheme> {
+        self.session_profile.pin_scheme()
+    }
+
+    /// Card-published PIN1 digit-length bounds, when directory discovery
+    /// read them from EF.AOD.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[must_use]
+    pub(crate) const fn pin1_length_range(&self) -> Option<PasswordLengthRange> {
+        self.session_profile.pin1_length_range()
+    }
+
+    /// Attach the card-published ISO/IEC 7816-15 directory profile.
+    pub(crate) fn set_directory_profile(&mut self, profile: DirectoryAuthProfile) {
+        self.session_profile = CardSessionProfile::Directory(profile);
     }
 
     /// The rendered chip serial from EF.TokenInfo; empty when the
@@ -1585,7 +1688,7 @@ fn ca_chain_for_leaf(leaf: &OwnedCert, candidates: &[OwnedCert]) -> Vec<OwnedCer
 /// Returns `Some(OwnedCert)` when the slot is populated on the card profile
 /// and contains a valid DER X.509 certificate; returns `None` when the slot
 /// is absent on older card generations or unreadable.
-fn read_optional_ca_cert(card: &mut PcscCard, slot: CertSlot) -> Option<OwnedCert> {
+fn read_optional_ca_cert<T: CardTransport>(card: &mut T, slot: CertSlot) -> Option<OwnedCert> {
     let raw = match card.read_certificate(slot) {
         Ok(raw) => raw,
         Err(_read_err) => return None,
@@ -1593,18 +1696,33 @@ fn read_optional_ca_cert(card: &mut PcscCard, slot: CertSlot) -> Option<OwnedCer
     OwnedCert::from_der(raw.as_bytes()).ok()
 }
 
-/// Build the token objects for `reader_name`: open the card once,
-/// read EF.TokenInfo (chip serial, card label), the authentication
-/// certificate via the PKCS#15 chain, and the Estonian document
-/// number when the certificate fixes that profile, drop the card,
-/// and parse.
+/// Extract the plastic-printed or rendered chip serial from a parsed
+/// EF.TokenInfo, if present.
+fn token_info_serial(info: Option<TokenInfo>) -> Option<String> {
+    info.as_ref()
+        .and_then(TokenInfo::serial_number_hex)
+        .cloned()
+        .map(render_token_serial)
+        .map(|full| {
+            derive_printed_serial(&full).map_or_else(
+                || full.as_str().to_owned(),
+                |printed| printed.as_str().to_owned(),
+            )
+        })
+}
+
+/// Build the token objects for `reader`: open the card once, resolve
+/// either the FINEID authentication certificate or the ISO/IEC 7816-15
+/// directory-discovered Estonian eID authentication profile, read the
+/// serial / document number and chain CAs, drop the card, and parse.
 ///
-/// A missing or unreadable EF.TokenInfo or EF.D003 is tolerated (the
-/// serial falls back to the other source); the certificate read is
-/// mandatory.
+/// A missing or unreadable EF.TokenInfo or document number is tolerated;
+/// the authentication certificate and (for directory-discovered cards)
+/// its EF.DIR / EF.ODF / EF.CDF / EF.PrKDF / EF.AOD chain are mandatory.
 ///
 /// # Errors
-/// [`CKR_DEVICE_ERROR`] if the reader cannot be opened or the
+/// [`CKR_DEVICE_ERROR`] if the reader cannot be opened, directory
+/// discovery fails or omits required EF.AOD parameters, or the
 /// certificate cannot be read or parsed.
 #[expect(
     clippy::redundant_pub_crate,
@@ -1615,47 +1733,99 @@ pub(super) fn build_token_objects(reader: &ReaderId) -> Result<TokenObjects, CkR
     let mut card = backend
         .open_session(reader, ReaderAccessCap::Read)
         .map_err(|_open_err| CKR_DEVICE_ERROR)?;
-    let token_info = card.read_token_info().ok();
-    let serial = token_info
-        .as_ref()
-        .and_then(|info| info.serial_number_hex())
-        .cloned()
-        .map(render_token_serial)
-        .map(|full| {
-            derive_printed_serial(&full).map_or_else(
-                || full.as_str().to_owned(),
-                |printed| printed.as_str().to_owned(),
-            )
-        });
-    // Probe PKCS#15-resident slots (EF.4331, then Estonian EF.3411)
-    // before walking MF / DF.ESIGN for FINEID's alternate auth slot
-    // (EF.4333).
-    let (cert, pin_scheme) = if let Ok(cert) = card.read_certificate(CertSlot::Authentication) {
-        (cert, None)
-    } else if let Ok(cert) = card.read_certificate(CertSlot::EstonianAuthentication) {
-        (cert, Some(PinReferenceScheme::Estonian))
-    } else {
-        (
-            card.read_certificate(CertSlot::AuthenticationAlt)
-                .map_err(|_read_err| CKR_DEVICE_ERROR)?,
-            None,
-        )
-    };
+    let persisted_cas = load_persisted_ca_certs();
+    let objects = build_token_objects_from_card(&mut card, persisted_cas, persist_ca_cert)?;
+    drop(card);
+    Ok(objects)
+}
 
-    let document_number = if pin_scheme == Some(PinReferenceScheme::Estonian) {
-        card.read_document_number().ok()
-    } else {
-        None
-    };
+/// Transport-generic core of [`build_token_objects`], testable without
+/// PC/SC hardware.
+fn build_token_objects_from_card<T, F>(
+    card: &mut T,
+    mut cas: Vec<OwnedCert>,
+    mut persist_ca: F,
+) -> Result<TokenObjects, CkRv>
+where
+    T: CardTransport,
+    F: FnMut(&OwnedCert),
+{
+    let (cert_der, directory_profile, token_serial) =
+        match card.read_certificate(CertSlot::Authentication) {
+            Ok(cert) => {
+                let serial = token_info_serial(card.read_token_info().ok());
+                (cert.as_bytes().to_vec(), None, serial)
+            }
+            Err(
+                Pkcs15Error::Transport(_)
+                | Pkcs15Error::Outcome(_)
+                | Pkcs15Error::Status(
+                    StatusWord::SecurityNotSatisfied | StatusWord::SmDataObjectsIncorrect,
+                ),
+            ) => return Err(CKR_DEVICE_ERROR),
+            Err(_) => {
+                let label = ApplicationLabel::try_from(ESTONIAN_EID_APPLICATION_LABEL)
+                    .map_err(|_empty| CKR_DEVICE_ERROR)?;
+                match card.discover_application_by_label(&label) {
+                    Ok(aid) => {
+                        let discovered = card
+                            .discover_authentication_profile(&aid)
+                            .map_err(|_disc_err| CKR_DEVICE_ERROR)?;
+                        let pin1 = CardPinParameters::from_aod(
+                            PinReferenceScheme::Estonian,
+                            discovered.pin1(),
+                        )
+                        .map_err(|_param_err| CKR_DEVICE_ERROR)?;
+                        if pin1.lengths().max() < crate::state::PIN1_MIN_DIGITS
+                            || pin1.lengths().min() > crate::state::PIN1_MAX_DIGITS
+                        {
+                            return Err(CKR_DEVICE_ERROR);
+                        }
+                        let cert = card
+                            .read_certificate_at(discovered.auth_cert_path())
+                            .map_err(|_cert_err| CKR_DEVICE_ERROR)?;
+                        let document_number = card.read_document_number().ok();
+                        let serial = if let Some(number) = document_number {
+                            Some(number.as_str().to_owned())
+                        } else {
+                            token_info_serial(
+                                card.read_token_info_in_application(discovered.application_aid())
+                                    .ok(),
+                            )
+                        };
+                        let profile = DirectoryAuthProfile::new(
+                            discovered.application_aid().clone(),
+                            discovered.auth_key_reference(),
+                            discovered.aod_path().clone(),
+                            discovered.pin1_auth_id().clone(),
+                            pin1,
+                        );
+                        (cert.as_bytes().to_vec(), Some(profile), serial)
+                    }
+                    Err(
+                        Pkcs15Error::Transport(_)
+                        | Pkcs15Error::Outcome(_)
+                        | Pkcs15Error::Status(
+                            StatusWord::SecurityNotSatisfied | StatusWord::SmDataObjectsIncorrect,
+                        ),
+                    ) => return Err(CKR_DEVICE_ERROR),
+                    Err(_) => {
+                        let cert = card
+                            .read_certificate(CertSlot::AuthenticationAlt)
+                            .map_err(|_read_err| CKR_DEVICE_ERROR)?;
+                        let serial = token_info_serial(card.read_token_info().ok());
+                        (cert.as_bytes().to_vec(), None, serial)
+                    }
+                }
+            }
+        };
 
-    let mut cas = load_persisted_ca_certs();
-    let mut objects = TokenObjects::from_cert_der(cert.as_bytes().to_vec(), KeyGate::Login)?;
-    if let Some(scheme) = pin_scheme {
-        objects.set_pin_scheme(scheme);
+    let mut objects = TokenObjects::from_cert_der(cert_der, KeyGate::Login)?;
+    let is_directory = directory_profile.is_some();
+    if let Some(profile) = directory_profile {
+        objects.set_directory_profile(profile);
     }
-    if let Some(document_number) = &document_number {
-        objects.token_serial = document_number.as_str().to_owned();
-    } else if let Some(serial) = serial {
+    if let Some(serial) = token_serial {
         objects.token_serial = serial;
     }
 
@@ -1670,14 +1840,14 @@ pub(super) fn build_token_objects(reader: &ReaderId) -> Result<TokenObjects, CkR
     let has_leaf_issuer = cas
         .iter()
         .any(|ca| ca.view().subject.as_der() == leaf_issuer.as_der());
-    if !has_leaf_issuer && pin_scheme != Some(PinReferenceScheme::Estonian) {
+    if !has_leaf_issuer && !is_directory {
         let on_card_cas: Vec<OwnedCert> = ON_CARD_CA_SLOTS
             .iter()
-            .filter_map(|slot| read_optional_ca_cert(&mut card, *slot))
+            .filter_map(|slot| read_optional_ca_cert(card, *slot))
             .filter(meets_ca_persistence_policy)
             .collect();
         for ca in &on_card_cas {
-            persist_ca_cert(ca);
+            persist_ca(ca);
         }
         for ca in on_card_cas {
             if !cas.iter().any(|c| c.as_der() == ca.as_der()) {
@@ -1685,12 +1855,46 @@ pub(super) fn build_token_objects(reader: &ReaderId) -> Result<TokenObjects, CkR
             }
         }
     }
-    drop(card);
 
     for ca in ca_chain_for_leaf(&objects.auth_cert, &cas) {
         objects.push_ca_cert(ca);
     }
     Ok(objects)
+}
+
+/// Re-read the card's live EF.AOD at `profile.aod_path()` inside the
+/// current card transaction, validate the PIN1 record identified by
+/// `profile.pin1_auth_id()`, confirm that its live parameters match the
+/// discovered `profile.pin1()`, and select `profile.application_aid()`.
+///
+/// Fails closed with [`CKR_DEVICE_ERROR`] before any credential APDU is
+/// sent if EF.AOD is unreadable, omits `padChar` when `needs-padding` is
+/// set, or disagrees with the cached discovery profile.
+fn confirm_live_directory_pin1<T: CardTransport>(
+    card: &mut T,
+    profile: &DirectoryAuthProfile,
+) -> Result<CardPinParameters, CkRv> {
+    if !profile.aod_path().is_absolute_from_mf() {
+        card.select_application(profile.application_aid())
+            .map_err(|_select_err| CKR_DEVICE_ERROR)?;
+    }
+    let aod = card
+        .read_authentication_objects_at(profile.aod_path())
+        .map_err(|_aod_err| CKR_DEVICE_ERROR)?;
+    let pin_obj = aod
+        .unique_by_auth_id(profile.pin1_auth_id())
+        .ok_or(CKR_DEVICE_ERROR)?;
+    if pin_obj.flags().unblocking_password() {
+        return Err(CKR_DEVICE_ERROR);
+    }
+    let live = CardPinParameters::from_aod(profile.pin1().scheme(), pin_obj)
+        .map_err(|_param_err| CKR_DEVICE_ERROR)?;
+    if live != profile.pin1() {
+        return Err(CKR_DEVICE_ERROR);
+    }
+    card.select_application(profile.application_aid())
+        .map_err(|_select_err| CKR_DEVICE_ERROR)?;
+    Ok(live)
 }
 
 /// Probe the live PIN1 retry state without consuming a retry.
@@ -1700,14 +1904,13 @@ pub(super) fn build_token_objects(reader: &ReaderId) -> Result<TokenObjects, CkR
 )]
 #[cfg(test)]
 pub(super) fn card_pin1_status(kind: &SlotKind) -> Result<PinStatus, CkRv> {
-    card_pin1_status_with_scheme(kind, None)
+    card_pin1_status_with_profile(kind, &CardSessionProfile::Fineid)
 }
 
-/// Probe the live PIN1 retry state under an explicit numbering when the
-/// certificate path fixed it, or let the card resolve it otherwise.
-pub(super) fn card_pin1_status_with_scheme(
+/// Probe the live PIN1 retry state under `profile`.
+pub(super) fn card_pin1_status_with_profile(
     kind: &SlotKind,
-    scheme: Option<PinReferenceScheme>,
+    profile: &CardSessionProfile,
 ) -> Result<PinStatus, CkRv> {
     // A remote reader reports its own PIN1 state over an authenticated
     // pairing, and this computer has no card to ask. Reaching this arm
@@ -1719,13 +1922,19 @@ pub(super) fn card_pin1_status_with_scheme(
     let mut card = backend
         .open_session(reader, ReaderAccessCap::Read)
         .map_err(|_open_err| CKR_DEVICE_ERROR)?;
-    card.select_pkcs15_application()
-        .map_err(|_select_err| CKR_DEVICE_ERROR)?;
-    match scheme {
-        Some(scheme) => card.pin_status_with_scheme(scheme, PinSlot::Pin1),
-        None => card.pin_status(PinSlot::Pin1),
+    match profile {
+        CardSessionProfile::Fineid => {
+            card.select_pkcs15_application()
+                .map_err(|_select_err| CKR_DEVICE_ERROR)?;
+            card.pin_status(PinSlot::Pin1)
+                .map_err(|_status_err| CKR_DEVICE_ERROR)
+        }
+        CardSessionProfile::Directory(directory) => {
+            let live = confirm_live_directory_pin1(&mut card, directory)?;
+            card.pin_status_for_parameters(&live)
+                .map_err(|_status_err| CKR_DEVICE_ERROR)
+        }
     }
-    .map_err(|_status_err| CKR_DEVICE_ERROR)
 }
 
 /// Run a signature on the card of a local reader.
@@ -1767,17 +1976,22 @@ pub(super) fn card_sign(
     mechanism: Mechanism,
     input: &[u8],
 ) -> Result<Vec<u8>, CkRv> {
-    card_sign_with_scheme(kind, pin_cache, mechanism, input, None)
+    card_sign_with_profile(
+        kind,
+        pin_cache,
+        mechanism,
+        input,
+        &CardSessionProfile::Fineid,
+    )
 }
 
-/// Run a signature under the credential numbering the token's certificate
-/// path fixed, when it did.
-pub(super) fn card_sign_with_scheme(
+/// Run a signature under `profile`.
+pub(super) fn card_sign_with_profile(
     kind: &SlotKind,
     pin_cache: &Arc<Mutex<PinSafetyCache>>,
     mechanism: Mechanism,
     input: &[u8],
-    scheme: Option<PinReferenceScheme>,
+    profile: &CardSessionProfile,
 ) -> Result<Vec<u8>, CkRv> {
     let request = CardSignInput::parse(mechanism, input)?;
     let backend = PcscBackend;
@@ -1801,7 +2015,7 @@ pub(super) fn card_sign_with_scheme(
         return Err(CKR_DEVICE_ERROR);
     };
     card.pin_sequence(|mut card| {
-        run_card_sign_with_scheme(
+        run_card_sign_with_profile(
             &mut card,
             || {
                 backend
@@ -1809,7 +2023,7 @@ pub(super) fn card_sign_with_scheme(
                     .map_err(|_status_err| CKR_DEVICE_ERROR)
             },
             pin_cache,
-            scheme,
+            profile,
             request,
         )
     })
@@ -1829,14 +2043,20 @@ where
     T::Error: refineid_apdu::TransportErrorExt,
     F: FnOnce() -> Result<u32, CkRv>,
 {
-    run_card_sign_with_scheme(card, read_card_events, pin_cache, None, request)
+    run_card_sign_with_profile(
+        card,
+        read_card_events,
+        pin_cache,
+        &CardSessionProfile::Fineid,
+        request,
+    )
 }
 
-fn run_card_sign_with_scheme<T, F>(
+fn run_card_sign_with_profile<T, F>(
     card: &mut T,
     read_card_events: F,
     pin_cache: &Arc<Mutex<PinSafetyCache>>,
-    scheme: Option<PinReferenceScheme>,
+    profile: &CardSessionProfile,
     request: CardSignInput,
 ) -> Result<Vec<u8>, CkRv>
 where
@@ -1844,25 +2064,38 @@ where
     T::Error: refineid_apdu::TransportErrorExt,
     F: FnOnce() -> Result<u32, CkRv>,
 {
-    if card.select_pkcs15_application().is_err() {
-        clear_positive(pin_cache);
-        return Err(CKR_DEVICE_ERROR);
-    }
-    let (resolved_scheme, pin1_status) = match scheme {
-        Some(scheme) => match card.pin_status_with_scheme(scheme, PinSlot::Pin1) {
-            Ok(status) => (scheme, status),
-            Err(_status_err) => {
+    let (live_directory, resolved_scheme, pin1_status) = match profile {
+        CardSessionProfile::Fineid => {
+            if card.select_pkcs15_application().is_err() {
                 clear_positive(pin_cache);
                 return Err(CKR_DEVICE_ERROR);
             }
-        },
-        None => match card.pin1_status_and_scheme() {
-            Ok(resolved) => resolved,
-            Err(_status_err) => {
-                clear_positive(pin_cache);
-                return Err(CKR_DEVICE_ERROR);
-            }
-        },
+            let (scheme, status) = match card.pin1_status_and_scheme() {
+                Ok(resolved) => resolved,
+                Err(_status_err) => {
+                    clear_positive(pin_cache);
+                    return Err(CKR_DEVICE_ERROR);
+                }
+            };
+            (None, scheme, status)
+        }
+        CardSessionProfile::Directory(directory) => {
+            let live = match confirm_live_directory_pin1(card, directory) {
+                Ok(live) => live,
+                Err(error) => {
+                    clear_positive(pin_cache);
+                    return Err(error);
+                }
+            };
+            let status = match card.pin_status_for_parameters(&live) {
+                Ok(status) => status,
+                Err(_status_err) => {
+                    clear_positive(pin_cache);
+                    return Err(CKR_DEVICE_ERROR);
+                }
+            };
+            (Some((directory, live)), live.scheme(), status)
+        }
     };
     if !pin1_status_permits_reusable_cache(pin1_status, resolved_scheme) {
         clear_positive(pin_cache);
@@ -1871,7 +2104,11 @@ where
         clear_positive(pin_cache);
         return Err(error);
     }
-    let serial = match live_token_serial(card, resolved_scheme) {
+    let serial = match live_token_serial_in_application(
+        card,
+        live_directory.map(|(dir, _)| dir.application_aid()),
+        resolved_scheme,
+    ) {
         Ok(serial) => serial,
         Err(error) => {
             clear_positive(pin_cache);
@@ -1894,17 +2131,25 @@ where
             CKR_USER_NOT_LOGGED_IN
         }
     };
-    let checkout = pin_cache
-        .lock()
-        .map_err(|_poisoned| CKR_DEVICE_ERROR)?
-        .checkout_pin1(&serial, card_events, resolved_scheme, pin1_status)
-        .ok_or(no_pin_to_present)?;
+    let checkout = {
+        let mut cache = pin_cache.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?;
+        match live_directory {
+            Some((_, live)) => {
+                cache.checkout_pin1_with_parameters(&serial, card_events, live, pin1_status)
+            }
+            None => cache.checkout_pin1(&serial, card_events, resolved_scheme, pin1_status),
+        }
+    }
+    .ok_or(no_pin_to_present)?;
     let secret =
         refineid_auth::UnvalidatedSecret::from_owned_bytes(checkout.pin().as_bytes().to_vec());
     let Ok(pin1) = refineid_auth::Pin1::reconstruct(secret) else {
         return Err(CKR_DEVICE_ERROR);
     };
-    let answer = card.verify_pin1_with_scheme(resolved_scheme, pin1);
+    let answer = match live_directory {
+        Some((_, live)) => card.verify_pin1_with_parameters(&live, pin1),
+        None => card.verify_pin1_with_scheme(resolved_scheme, pin1),
+    };
     let accepted = checkout.settle_verify(
         &mut pin_cache
             .lock()
@@ -1921,6 +2166,7 @@ where
     let signed = sign_with_card(
         card,
         refineid_sign::SignScheme::from(resolved_scheme),
+        live_directory.map(|(dir, _)| dir.auth_key_reference()),
         request,
     );
     accepted.settle_operation(
@@ -2117,16 +2363,15 @@ pub(super) fn card_login(
     pin_cache: &Arc<Mutex<PinSafetyCache>>,
     pin1: PinBytes,
 ) -> Result<(), CkRv> {
-    card_login_with_scheme(kind, pin_cache, pin1, None)
+    card_login_with_profile(kind, pin_cache, pin1, &CardSessionProfile::Fineid)
 }
 
-/// Log in under the credential numbering the token's certificate path
-/// fixed, when it did.
-pub(super) fn card_login_with_scheme(
+/// Log in under `profile`.
+pub(super) fn card_login_with_profile(
     kind: &SlotKind,
     pin_cache: &Arc<Mutex<PinSafetyCache>>,
     pin1: PinBytes,
-    scheme: Option<PinReferenceScheme>,
+    profile: &CardSessionProfile,
 ) -> Result<(), CkRv> {
     // Protected authentication path: the paired device verifies PIN1 in
     // its own protected storage, so there is no secret for this
@@ -2155,7 +2400,7 @@ pub(super) fn card_login_with_scheme(
         return Err(CKR_DEVICE_ERROR);
     };
     card.pin_sequence(|mut card| {
-        run_card_login_with_scheme(
+        run_card_login_with_profile(
             &mut card,
             || {
                 backend
@@ -2164,7 +2409,7 @@ pub(super) fn card_login_with_scheme(
             },
             pin_cache,
             pin1,
-            scheme,
+            profile,
         )
     })
     .inspect_err(|_transaction_err| clear_positive(pin_cache))
@@ -2185,39 +2430,58 @@ where
     T: CardTransport,
     F: FnOnce() -> Result<u32, CkRv>,
 {
-    run_card_login_with_scheme(card, read_card_events, pin_cache, pin1, None)
+    run_card_login_with_profile(
+        card,
+        read_card_events,
+        pin_cache,
+        pin1,
+        &CardSessionProfile::Fineid,
+    )
 }
 
-fn run_card_login_with_scheme<T, F>(
+fn run_card_login_with_profile<T, F>(
     card: &mut T,
     read_card_events: F,
     pin_cache: &Arc<Mutex<PinSafetyCache>>,
     pin1: PinBytes,
-    scheme: Option<PinReferenceScheme>,
+    profile: &CardSessionProfile,
 ) -> Result<(), CkRv>
 where
     T: CardTransport,
     F: FnOnce() -> Result<u32, CkRv>,
 {
-    if card.select_pkcs15_application().is_err() {
-        clear_positive(pin_cache);
-        return Err(CKR_DEVICE_ERROR);
-    }
-    let (resolved_scheme, pin1_status) = match scheme {
-        Some(scheme) => match card.pin_status_with_scheme(scheme, PinSlot::Pin1) {
-            Ok(status) => (scheme, status),
-            Err(_status_err) => {
+    let (live_directory, resolved_scheme, pin1_status) = match profile {
+        CardSessionProfile::Fineid => {
+            if card.select_pkcs15_application().is_err() {
                 clear_positive(pin_cache);
                 return Err(CKR_DEVICE_ERROR);
             }
-        },
-        None => match card.pin1_status_and_scheme() {
-            Ok(resolved) => resolved,
-            Err(_status_err) => {
-                clear_positive(pin_cache);
-                return Err(CKR_DEVICE_ERROR);
-            }
-        },
+            let (scheme, status) = match card.pin1_status_and_scheme() {
+                Ok(resolved) => resolved,
+                Err(_status_err) => {
+                    clear_positive(pin_cache);
+                    return Err(CKR_DEVICE_ERROR);
+                }
+            };
+            (None, scheme, status)
+        }
+        CardSessionProfile::Directory(directory) => {
+            let live = match confirm_live_directory_pin1(card, directory) {
+                Ok(live) => live,
+                Err(error) => {
+                    clear_positive(pin_cache);
+                    return Err(error);
+                }
+            };
+            let status = match card.pin_status_for_parameters(&live) {
+                Ok(status) => status,
+                Err(_status_err) => {
+                    clear_positive(pin_cache);
+                    return Err(CKR_DEVICE_ERROR);
+                }
+            };
+            (Some((directory, live)), live.scheme(), status)
+        }
     };
     if !pin1_status_permits_reusable_cache(pin1_status, resolved_scheme) {
         clear_positive(pin_cache);
@@ -2226,7 +2490,11 @@ where
         clear_positive(pin_cache);
         return Err(error);
     }
-    let serial = match live_token_serial(card, resolved_scheme) {
+    let serial = match live_token_serial_in_application(
+        card,
+        live_directory.map(|(dir, _)| dir.application_aid()),
+        resolved_scheme,
+    ) {
         Ok(serial) => serial,
         Err(error) => {
             clear_positive(pin_cache);
@@ -2257,18 +2525,32 @@ where
         clear_positive(pin_cache);
         return Err(CKR_PIN_INCORRECT);
     };
-    let outcome = card.verify_pin1_with_scheme(resolved_scheme, pin1_val);
+    if let Some((_, live)) = live_directory
+        && live
+            .check_length(CredentialRole::Pin1, pin1_val.digit_count())
+            .is_err()
+    {
+        clear_positive(pin_cache);
+        return Err(CKR_PIN_LEN_RANGE);
+    }
+    let outcome = match live_directory {
+        Some((_, live)) => card.verify_pin1_with_parameters(&live, pin1_val),
+        None => card.verify_pin1_with_scheme(resolved_scheme, pin1_val),
+    };
     let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(AuthError::RetryFloor(refusal)) => {
             clear_positive(pin_cache);
             return Err(retry_floor_rv(refusal));
         }
+        Err(AuthError::PinLength(_)) => {
+            clear_positive(pin_cache);
+            return Err(CKR_PIN_LEN_RANGE);
+        }
         Err(
             AuthError::Transport(_)
             | AuthError::Outcome(_)
             | AuthError::Command(_)
-            | AuthError::PinLength(_)
             | AuthError::UnsupportedSlot { .. },
         ) => {
             clear_positive(pin_cache);
@@ -2276,14 +2558,19 @@ where
         }
     };
     let mut cache = pin_cache.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?;
-    settle_login(
-        &mut cache,
-        serial,
-        card_events,
-        resolved_scheme,
-        pin1,
-        outcome,
-    )
+    match live_directory {
+        Some((_, live)) => {
+            settle_directory_login(&mut cache, serial, card_events, live, pin1, outcome)
+        }
+        None => settle_login(
+            &mut cache,
+            serial,
+            card_events,
+            resolved_scheme,
+            pin1,
+            outcome,
+        ),
+    }
 }
 
 /// Settle a `C_Login` VERIFY by the card's answer: hold an accepted
@@ -2301,6 +2588,36 @@ fn settle_login(
     match outcome {
         VerifyOutcome::Ok => cache
             .store_pin1(serial, card_events, scheme, pin1)
+            .inspect_err(|_rejected| cache.clear_positive())
+            .map_err(|_rejected| CKR_PIN_INCORRECT),
+        VerifyOutcome::WrongPin { .. } => {
+            cache.record_rejected(&serial, &pin1);
+            Err(CKR_PIN_INCORRECT)
+        }
+        VerifyOutcome::Locked => {
+            cache.clear_positive();
+            Err(CKR_PIN_LOCKED)
+        }
+        VerifyOutcome::Other(_sw) => {
+            cache.clear_positive();
+            Err(CKR_DEVICE_ERROR)
+        }
+    }
+}
+
+/// Settle a `C_Login` VERIFY for an ISO/IEC 7816-15 directory-discovered
+/// card, binding the held PIN1 to the exact live [`CardPinParameters`].
+fn settle_directory_login(
+    cache: &mut PinSafetyCache,
+    serial: TokenSerial,
+    card_events: u32,
+    parameters: CardPinParameters,
+    pin1: PinBytes,
+    outcome: VerifyOutcome,
+) -> Result<(), CkRv> {
+    match outcome {
+        VerifyOutcome::Ok => cache
+            .store_pin1_with_parameters(serial, card_events, parameters, pin1)
             .inspect_err(|_rejected| cache.clear_positive())
             .map_err(|_rejected| CKR_PIN_INCORRECT),
         VerifyOutcome::WrongPin { .. } => {
@@ -2348,17 +2665,22 @@ const fn retry_floor_rv(refusal: RetryFloorRefusal) -> CkRv {
 
 /// Read the live card's binding serial for [`PinSafetyCache`].
 ///
-/// Prefers EF.TokenInfo under the PKCS#15 application (shared by FINEID
-/// and current Estonian eID cards). If an Estonian card lacks a usable
-/// EF.TokenInfo serial (non-transport, non-security-status failure),
-/// falls back to its printed document number (matching
-/// [`build_token_objects`]) and immediately re-selects the PKCS#15
-/// application because `read_document_number` traverses from the MF.
-fn live_token_serial<T: CardTransport>(
+/// Prefers EF.TokenInfo under `aid` (or the standard PKCS#15 AID when
+/// `aid` is `None`). If an Estonian card lacks a usable EF.TokenInfo
+/// serial (non-transport, non-security-status failure), falls back to
+/// its printed document number (matching [`build_token_objects`]) and
+/// immediately re-selects `aid` (or the PKCS#15 application) because
+/// `read_document_number` traverses from the MF.
+fn live_token_serial_in_application<T: CardTransport>(
     card: &mut T,
+    aid: Option<&Aid>,
     scheme: PinReferenceScheme,
 ) -> Result<TokenSerial, CkRv> {
-    match card.read_token_info() {
+    let token_info = match aid {
+        Some(aid) => card.read_token_info_in_application(aid),
+        None => card.read_token_info(),
+    };
+    match token_info {
         Ok(info) => {
             if let Some(serial) = info
                 .serial_number_hex()
@@ -2375,8 +2697,7 @@ fn live_token_serial<T: CardTransport>(
             | Pkcs15Error::Aid(_)
             | Pkcs15Error::Command(_)
             | Pkcs15Error::Status(
-                refineid_apdu::StatusWord::SecurityNotSatisfied
-                | refineid_apdu::StatusWord::SmDataObjectsIncorrect,
+                StatusWord::SecurityNotSatisfied | StatusWord::SmDataObjectsIncorrect,
             ),
         ) => {
             return Err(CKR_DEVICE_ERROR);
@@ -2392,8 +2713,11 @@ fn live_token_serial<T: CardTransport>(
         let number = card
             .read_document_number()
             .map_err(|_read_err| CKR_DEVICE_ERROR)?;
-        card.select_pkcs15_application()
-            .map_err(|_select_err| CKR_DEVICE_ERROR)?;
+        match aid {
+            Some(aid) => card.select_application(aid),
+            None => card.select_pkcs15_application(),
+        }
+        .map_err(|_select_err| CKR_DEVICE_ERROR)?;
         let serial = TokenSerial::new(number.as_str().to_owned());
         if !serial.as_str().is_empty() {
             return Ok(serial);
@@ -2409,43 +2733,29 @@ fn clear_positive(pin_cache: &Arc<Mutex<PinSafetyCache>>) {
         .clear_positive();
 }
 
-/// Change PIN1 on the card at `reader_name`.
+/// Change PIN1 on the card at `reader` under `profile`.
 ///
 /// Only compiled into the `pin-change` build; the default
 /// (login-only) beta stubs `C_SetPIN`, so this has no caller there.
-///
-/// Mirrors [`card_sign`]'s proven chain: open the card, select the
-/// PKCS#15 application (reference-data commands are refused from MF
-/// context the same way VERIFY is), resolve the card's numbering with
-/// a counter-safe probe, read the PIN lengths the card accepts under
-/// that numbering, then run `CHANGE REFERENCE DATA` with the current +
-/// new PIN pair in one command -- no prior VERIFY is needed. The change
-/// reads PIN 1's counter and applies the retry floor itself before the
-/// command goes out. The card is dropped before returning. On `Ok`
-/// the card has reset the retry counter and cleared its PIN
-/// presentation, so the caller must refresh any cached PIN1.
-///
-/// Typed inputs cross the boundary owned: [`ReaderId`] names the
-/// reader and both PINs are consumed (their buffers zeroize on
-/// drop), matching [`refineid_lib_core::auth::PinOps::change_pin`].
 ///
 /// # Errors
 /// [`CKR_PIN_INCORRECT`] when the current PIN is wrong,
 /// [`CKR_PIN_LOCKED`] when the slot is blocked or the retry floor
 /// refuses the change at two or one tries left,
 /// [`CKR_PIN_LEN_RANGE`] when the new PIN's length is outside the
-/// FINEID bounds or the lengths the card accepts,
+/// card's accepted bounds,
 /// [`CKR_DEVICE_ERROR`] on any card / transport failure, an unreadable
-/// counter among them.
+/// counter, or a directory EF.AOD confirmation failure.
 #[cfg(feature = "pin-change")]
 #[expect(
     clippy::redundant_pub_crate,
     reason = "private root module helper is called from sibling api module; plain pub would violate the public-surface typing grep"
 )]
-pub(super) fn card_change_pin1(
+pub(super) fn card_change_pin1_with_profile(
     reader: &ReaderId,
     current_pin1: PinBytes,
     new_pin1: PinBytes,
+    profile: &CardSessionProfile,
 ) -> Result<(), CkRv> {
     let backend = PcscBackend;
     // SELECT -> probe -> length read -> CHANGE REFERENCE DATA is one
@@ -2454,54 +2764,83 @@ pub(super) fn card_change_pin1(
     let card = backend
         .open_session(reader, ReaderAccessCap::PinSequence)
         .map_err(|_open_err| CKR_DEVICE_ERROR)?;
-    card.pin_sequence(|mut card| -> Result<(), CkRv> {
-        card.select_pkcs15_application()
-            .map_err(|_select_err| CKR_DEVICE_ERROR)?;
-        // The empty-body VERIFY probe consumes no retry and resolves the
-        // numbering the length read and the change address. The change
-        // itself probes PIN 1's counter again and applies the retry
-        // floor before CHANGE REFERENCE DATA.
-        let scheme = card
-            .resolve_pin_reference_scheme()
-            .map_err(|_probe_err| CKR_DEVICE_ERROR)?;
-        let curr_secret =
-            refineid_auth::UnvalidatedSecret::from_owned_bytes(current_pin1.as_bytes().to_vec());
-        let Ok(curr_pin) = refineid_auth::Pin1::reconstruct(curr_secret) else {
-            return Err(CKR_PIN_INCORRECT);
-        };
-        let new_secret =
-            refineid_auth::UnvalidatedSecret::from_owned_bytes(new_pin1.as_bytes().to_vec());
-        let Ok(new_pin) = refineid_auth::Pin1::reconstruct(new_secret) else {
-            return Err(CKR_PIN_LEN_RANGE);
-        };
-        // Reads only; no retry counter is touched.
-        let lengths = card
-            .read_card_pin_lengths_with_scheme(scheme)
-            .map_err(|_lengths_err| CKR_DEVICE_ERROR)?;
-        // A current PIN of a length the card does not accept cannot be
-        // the card's PIN1, so it is refused as incorrect, as above;
-        // the length refusal left for `change_pin1` is the new PIN's.
-        if lengths.check_pin1(&curr_pin).is_err() {
-            return Err(CKR_PIN_INCORRECT);
-        }
-        let outcome = card
-            .change_pin1(&lengths, curr_pin, new_pin)
-            .map_err(|change_err| match change_err {
-                refineid_auth::AuthError::PinLength(_) => CKR_PIN_LEN_RANGE,
-                refineid_auth::AuthError::RetryFloor(refusal) => retry_floor_rv(refusal),
-                refineid_auth::AuthError::Transport(_)
-                | refineid_auth::AuthError::Outcome(_)
-                | refineid_auth::AuthError::Command(_)
-                | refineid_auth::AuthError::UnsupportedSlot { .. } => CKR_DEVICE_ERROR,
-            })?;
-        match outcome {
-            refineid_auth::ManageOutcome::Ok => Ok(()),
-            refineid_auth::ManageOutcome::WrongCredential { .. } => Err(CKR_PIN_INCORRECT),
-            refineid_auth::ManageOutcome::Locked => Err(CKR_PIN_LOCKED),
-            refineid_auth::ManageOutcome::Other(_sw) => Err(CKR_DEVICE_ERROR),
-        }
+    card.pin_sequence(|mut card| {
+        run_card_change_pin1_with_profile(&mut card, current_pin1, new_pin1, profile)
     })
     .map_err(|_transaction_err| CKR_DEVICE_ERROR)?
+}
+
+#[cfg(feature = "pin-change")]
+fn run_card_change_pin1_with_profile<T: CardTransport>(
+    card: &mut T,
+    current_pin1: PinBytes,
+    new_pin1: PinBytes,
+    profile: &CardSessionProfile,
+) -> Result<(), CkRv> {
+    let curr_secret =
+        refineid_auth::UnvalidatedSecret::from_owned_bytes(current_pin1.as_bytes().to_vec());
+    let Ok(curr_pin) = refineid_auth::Pin1::reconstruct(curr_secret) else {
+        return Err(CKR_PIN_INCORRECT);
+    };
+    let new_secret =
+        refineid_auth::UnvalidatedSecret::from_owned_bytes(new_pin1.as_bytes().to_vec());
+    let Ok(new_pin) = refineid_auth::Pin1::reconstruct(new_secret) else {
+        return Err(CKR_PIN_LEN_RANGE);
+    };
+    let outcome = match profile {
+        CardSessionProfile::Fineid => {
+            card.select_pkcs15_application()
+                .map_err(|_select_err| CKR_DEVICE_ERROR)?;
+            // The empty-body VERIFY probe consumes no retry and resolves the
+            // numbering the length read and the change address. The change
+            // itself probes PIN 1's counter again and applies the retry
+            // floor before CHANGE REFERENCE DATA.
+            let scheme = card
+                .resolve_pin_reference_scheme()
+                .map_err(|_probe_err| CKR_DEVICE_ERROR)?;
+            // Reads only; no retry counter is touched.
+            let lengths = card
+                .read_card_pin_lengths_with_scheme(scheme)
+                .map_err(|_lengths_err| CKR_DEVICE_ERROR)?;
+            // A current PIN of a length the card does not accept cannot be
+            // the card's PIN1, so it is refused as incorrect, as above;
+            // the length refusal left for `change_pin1` is the new PIN's.
+            if lengths.check_pin1(&curr_pin).is_err() {
+                return Err(CKR_PIN_INCORRECT);
+            }
+            card.change_pin1(&lengths, curr_pin, new_pin)
+        }
+        CardSessionProfile::Directory(directory) => {
+            let live = confirm_live_directory_pin1(card, directory)?;
+            if live
+                .check_length(CredentialRole::Pin1, curr_pin.digit_count())
+                .is_err()
+            {
+                return Err(CKR_PIN_INCORRECT);
+            }
+            if live
+                .check_length(CredentialRole::Pin1, new_pin.digit_count())
+                .is_err()
+            {
+                return Err(CKR_PIN_LEN_RANGE);
+            }
+            card.change_pin1_with_parameters(&live, curr_pin, new_pin)
+        }
+    }
+    .map_err(|change_err| match change_err {
+        AuthError::PinLength(_) => CKR_PIN_LEN_RANGE,
+        AuthError::RetryFloor(refusal) => retry_floor_rv(refusal),
+        AuthError::Transport(_)
+        | AuthError::Outcome(_)
+        | AuthError::Command(_)
+        | AuthError::UnsupportedSlot { .. } => CKR_DEVICE_ERROR,
+    })?;
+    match outcome {
+        refineid_auth::ManageOutcome::Ok => Ok(()),
+        refineid_auth::ManageOutcome::WrongCredential { .. } => Err(CKR_PIN_INCORRECT),
+        refineid_auth::ManageOutcome::Locked => Err(CKR_PIN_LOCKED),
+        refineid_auth::ManageOutcome::Other(_sw) => Err(CKR_DEVICE_ERROR),
+    }
 }
 
 #[cfg(test)]
@@ -3892,6 +4231,7 @@ mod tests {
         cursor: usize,
         credential_outcome: Option<Result<StatusWord, String>>,
         credentials_sent: usize,
+        last_credential_wire: Option<Vec<u8>>,
         on_credential: Option<Box<dyn FnMut()>>,
     }
 
@@ -3905,6 +4245,7 @@ mod tests {
                 cursor: 0,
                 credential_outcome,
                 credentials_sent: 0,
+                last_credential_wire: None,
                 on_credential: None,
             }
         }
@@ -3947,9 +4288,12 @@ mod tests {
 
         fn transmit_credential(
             &mut self,
-            _command: refineid_apdu::CredentialCommand,
+            command: refineid_apdu::CredentialCommand,
         ) -> Result<refineid_apdu::TransportOutcome, Self::Error> {
             self.credentials_sent += 1;
+            command.expose_wire(|wire| {
+                self.last_credential_wire = Some(wire.to_vec());
+            });
             if let Some(hook) = &mut self.on_credential {
                 hook();
             }
@@ -4555,21 +4899,418 @@ mod tests {
         assert!(!recovered.holds_pin1());
     }
 
-    #[test]
-    fn estonian_login_and_sign_bind_scheme_in_cached_entry() {
-        const SIGNATURE_FILL: u8 = 0x5A;
-        let scheme = refineid_auth::PinReferenceScheme::Estonian;
-        let pristine = scheme.pin_retry_limit();
-        let estonian_probe_wire =
-            refineid_apdu::CommandApdu::case_1(refineid_apdu::CommandHeader {
-                class: refineid_apdu::ApduClass::Plain,
-                instruction: refineid_auth::verify::VERIFY_INS,
-                p1: refineid_auth::verify::VERIFY_P1,
-                p2: scheme.reference(refineid_auth::PinSlot::Pin1),
-            })
+    fn der_tlv(tag: u8, value: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(value.len().saturating_add(4));
+        out.push(tag);
+        super::push_der_len(&mut out, value.len());
+        out.extend_from_slice(value);
+        out
+    }
+
+    fn build_aod_record(
+        auth_id: u8,
+        pin_ref: u8,
+        min_len: u8,
+        stored_len: u8,
+        max_len: u8,
+        pad: Option<u8>,
+    ) -> Vec<u8> {
+        let mut attrs = Vec::new();
+        // pwdFlags BIT STRING: needs-padding (bit 5 = 0x04 in octet 0, 2 unused bits)
+        attrs.extend_from_slice(&[0x03, 0x02, 0x02, 0x04]);
+        // pwdType ENUMERATED ascii-numeric (1)
+        attrs.extend_from_slice(&[0x0A, 0x01, 0x01]);
+        // minLength, storedLength, maxLength
+        attrs.extend_from_slice(&[0x02, 0x01, min_len]);
+        attrs.extend_from_slice(&[0x02, 0x01, stored_len]);
+        attrs.extend_from_slice(&[0x02, 0x01, max_len]);
+        // [0] IMPLICIT INTEGER pwdReference (unsigned DER integer)
+        if pin_ref >= 0x80 {
+            attrs.extend_from_slice(&[0x80, 0x02, 0x00, pin_ref]);
+        } else {
+            attrs.extend_from_slice(&[0x80, 0x01, pin_ref]);
+        }
+        // padChar
+        if let Some(pad_byte) = pad {
+            attrs.extend_from_slice(&[0x04, 0x01, pad_byte]);
+        }
+        let mut body = Vec::new();
+        body.extend_from_slice(&der_tlv(0x30, &der_tlv(0x0C, b"PIN1")));
+        body.extend_from_slice(&der_tlv(0x30, &der_tlv(0x04, &[auth_id])));
+        body.extend_from_slice(&der_tlv(0xA1, &der_tlv(0x30, &attrs)));
+        der_tlv(0x30, &body)
+    }
+
+    fn select_aid_wire(aid: &[u8]) -> Vec<u8> {
+        refineid_apdu::iso7816::SelectByAidNoFci {
+            aid: refineid_apdu::Aid::from_slice(aid).expect("valid AID"),
+        }
+        .into_apdu()
+        .as_bytes()
+        .to_vec()
+    }
+
+    fn select_mf_wire() -> Vec<u8> {
+        refineid_apdu::iso7816::SelectFile {
+            class: refineid_apdu::ApduClass::Plain,
+            target: refineid_apdu::iso7816::SelectFileTarget::AnyByFileId(Some(
+                refineid_apdu::FileId::MF,
+            )),
+            response_mode: refineid_apdu::iso7816::SelectFileResponseMode::None,
+        }
+        .into_apdu()
+        .as_bytes()
+        .to_vec()
+    }
+
+    fn select_any_fid_wire(fid: refineid_apdu::FileId) -> Vec<u8> {
+        refineid_apdu::iso7816::SelectFile {
+            class: refineid_apdu::ApduClass::Plain,
+            target: refineid_apdu::iso7816::SelectFileTarget::AnyByFileId(Some(fid)),
+            response_mode: refineid_apdu::iso7816::SelectFileResponseMode::None,
+        }
+        .into_apdu()
+        .as_bytes()
+        .to_vec()
+    }
+
+    /// Build a [`super::DirectoryAuthProfile`] purely through the
+    /// ISO/IEC 7816-15 parsers (`ObjectDirectory::of`,
+    /// `PrivateKeyDirectory::of`, `AuthenticationObjects::parse`),
+    /// honoring the border invariant that no raw constructors exist.
+    fn parsed_directory_profile(
+        aid: &[u8],
+        aod_fid: refineid_apdu::FileId,
+        key_ref: u8,
+        auth_id: u8,
+        aod_bytes: &[u8],
+        pin_ref: u8,
+    ) -> super::DirectoryAuthProfile {
+        let mut odf_raw_path = Vec::new();
+        odf_raw_path.extend_from_slice(refineid_apdu::FileId::MF.as_bytes());
+        odf_raw_path.extend_from_slice(aod_fid.as_bytes());
+        let odf_bytes = der_tlv(0xA8, &der_tlv(0x30, &der_tlv(0x04, &odf_raw_path)));
+        let refineid_pkcs15::ObjectDirectoryRead::Parsed(odf) =
+            refineid_pkcs15::ObjectDirectory::of(refineid_pkcs15::FileContent::from_read(
+                odf_bytes,
+                refineid_pkcs15::FileEnd::Confirmed,
+            ))
+        else {
+            panic!("synthetic EF.ODF parses");
+        };
+        let aod_path = odf
+            .plain_file_paths(refineid_pkcs15::ObjectClass::AuthObjects)
+            .expect("EF.AOD path present")[0]
+            .clone();
+
+        let mut prkdf_coa = Vec::new();
+        prkdf_coa.extend_from_slice(&der_tlv(0x0C, b"Auth Key"));
+        prkdf_coa.extend_from_slice(&der_tlv(0x04, &[auth_id]));
+        let mut prkdf_cka = Vec::new();
+        prkdf_cka.extend_from_slice(&der_tlv(0x04, &[0x01]));
+        prkdf_cka.extend_from_slice(&[0x03, 0x02, 0x05, 0x20]);
+        prkdf_cka.extend_from_slice(&[0x02, 0x01, key_ref]);
+        let mut prkdf_body = Vec::new();
+        prkdf_body.extend_from_slice(&der_tlv(0x30, &prkdf_coa));
+        prkdf_body.extend_from_slice(&der_tlv(0x30, &prkdf_cka));
+        prkdf_body.extend_from_slice(&der_tlv(
+            0xA1,
+            &der_tlv(0x30, &der_tlv(0x30, &der_tlv(0x04, &[]))),
+        ));
+        let prkdf_bytes = der_tlv(0xA0, &prkdf_body);
+        let refineid_pkcs15::PrivateKeyDirectoryRead::Parsed(prkdf) =
+            refineid_pkcs15::PrivateKeyDirectory::of(refineid_pkcs15::FileContent::from_read(
+                prkdf_bytes,
+                refineid_pkcs15::FileEnd::Confirmed,
+            ))
+        else {
+            panic!("synthetic EF.PrKDF parses");
+        };
+        let key_entry = &prkdf.entries()[0];
+        let parsed_key_ref = key_entry.key_reference().expect("key reference present");
+        let parsed_auth_id = key_entry.auth_id().expect("authId present").clone();
+
+        let parsed_aod = refineid_pkcs15::AuthenticationObjects::parse(aod_bytes)
+            .expect("synthetic EF.AOD parses");
+        let pin1_params = refineid_auth::CardPinParameters::from_aod(
+            refineid_auth::PinReferenceScheme::Estonian,
+            parsed_aod
+                .unique_by_reference(pin_ref)
+                .expect("PIN1 object present"),
+        )
+        .expect("synthetic EF.AOD parameters valid");
+
+        super::DirectoryAuthProfile::new(
+            refineid_apdu::Aid::from_slice(aid).expect("valid AID"),
+            parsed_key_ref,
+            aod_path,
+            parsed_auth_id,
+            pin1_params,
+        )
+    }
+
+    fn select_ef_wire(fid: refineid_apdu::FileId) -> Vec<u8> {
+        refineid_apdu::iso7816::SelectEfNoFci { fid }
+            .into_apdu()
             .as_bytes()
-            .to_vec();
+            .to_vec()
+    }
+
+    fn select_abs_path_no_fci_wire(fids: &[refineid_apdu::FileId]) -> Vec<u8> {
+        let path = refineid_apdu::iso7816::AbsolutePath::new(fids.to_vec()).expect("valid path");
+        refineid_apdu::iso7816::SelectFile {
+            class: refineid_apdu::ApduClass::Plain,
+            target: refineid_apdu::iso7816::SelectFileTarget::AbsolutePath(path),
+            response_mode: refineid_apdu::iso7816::SelectFileResponseMode::None,
+        }
+        .into_apdu()
+        .as_bytes()
+        .to_vec()
+    }
+
+    fn read_binary_wire(offset: u16) -> Vec<u8> {
+        let direct = refineid_apdu::iso7816::DirectOffset15::try_new(offset).expect("valid offset");
+        refineid_apdu::iso7816::ReadBinary {
+            class: refineid_apdu::ApduClass::Plain,
+            offset: refineid_apdu::iso7816::ReadBinaryOffset::Direct(direct),
+            le: TOKEN_INFO_READ_CHUNK,
+        }
+        .into_apdu()
+        .as_bytes()
+        .to_vec()
+    }
+
+    fn probe_ref_wire(reference: u8) -> Vec<u8> {
+        refineid_apdu::CommandApdu::case_1(refineid_apdu::CommandHeader {
+            class: refineid_apdu::ApduClass::Plain,
+            instruction: refineid_auth::verify::VERIFY_INS,
+            p1: refineid_auth::verify::VERIFY_P1,
+            p2: reference,
+        })
+        .as_bytes()
+        .to_vec()
+    }
+
+    #[test]
+    fn directory_discovery_login_and_sign_honor_custom_aid_path_key_ref_and_aod_parameters() {
+        const CUSTOM_AID: &[u8] = &[0xD2, 0x33, 0x00, 0x00, 0x00, 0x45, 0x45, 0x32];
+        const CUSTOM_CERT_DF: refineid_apdu::FileId = refineid_apdu::FileId::from_u16(0xDF22);
+        const CUSTOM_CERT_EF: refineid_apdu::FileId = refineid_apdu::FileId::from_u16(0x4411);
+        const CUSTOM_CDF_EF: refineid_apdu::FileId = refineid_apdu::FileId::from_u16(0x5201);
+        const CUSTOM_PRKDF_EF: refineid_apdu::FileId = refineid_apdu::FileId::from_u16(0x5202);
+        const CUSTOM_AOD_EF: refineid_apdu::FileId = refineid_apdu::FileId::from_u16(0x5203);
+        const CUSTOM_KEY_REF: u8 = 0x03;
+        const CUSTOM_PIN1_REF: u8 = 0x84;
+        const CUSTOM_MIN: u8 = 5;
+        const CUSTOM_STORED: u8 = 8;
+        const CUSTOM_MAX: u8 = 8;
+        const CUSTOM_PAD: u8 = 0xFF;
+        const SIGNATURE_FILL: u8 = 0x5A;
+        const AUTH_CERT_DER: &[u8] =
+            include_bytes!("../test-certs/fineid-intermediate-01-citizen-g4e.der");
+
+        // Build synthetic EF.DIR -> EF.ODF -> EF.CDF / EF.PrKDF / EF.AOD.
+        let mut dir_entry_body = Vec::new();
+        dir_entry_body.extend_from_slice(&der_tlv(0x4F, CUSTOM_AID));
+        dir_entry_body.extend_from_slice(&der_tlv(
+            0x50,
+            refineid_pkcs15::ESTONIAN_EID_APPLICATION_LABEL.as_bytes(),
+        ));
+        let ef_dir = der_tlv(0x61, &dir_entry_body);
+
+        let odf_entry = |tag: u8, path: &[u8]| der_tlv(tag, &der_tlv(0x30, &der_tlv(0x04, path)));
+        let mut ef_odf = Vec::new();
+        ef_odf.extend_from_slice(&odf_entry(0xA0, &[0x3F, 0x00, 0x52, 0x02]));
+        ef_odf.extend_from_slice(&odf_entry(0xA4, &[0x3F, 0x00, 0x52, 0x01]));
+        ef_odf.extend_from_slice(&odf_entry(0xA8, &[0x3F, 0x00, 0x52, 0x03]));
+
+        // EF.CDF: single X.509 cert entry with id=[0x01], path=3F00/DF22/4411.
+        let mut cdf_body = Vec::new();
+        cdf_body.extend_from_slice(&der_tlv(0x30, &der_tlv(0x0C, b"Auth Cert")));
+        cdf_body.extend_from_slice(&der_tlv(0x30, &der_tlv(0x04, &[0x01])));
+        let cert_type_attrs = der_tlv(
+            0x30,
+            &der_tlv(0x30, &der_tlv(0x04, &[0x3F, 0x00, 0xDF, 0x22, 0x44, 0x11])),
+        );
+        cdf_body.extend_from_slice(&der_tlv(0xA1, &cert_type_attrs));
+        let ef_cdf = der_tlv(0x30, &cdf_body);
+
+        // EF.PrKDF: single auth private key (sign=1, nonRepudiation=0), id=[0x01],
+        // authId=[0x11], keyReference=0x03.
+        let mut prkdf_coa = Vec::new();
+        prkdf_coa.extend_from_slice(&der_tlv(0x0C, b"Auth Key"));
+        prkdf_coa.extend_from_slice(&der_tlv(0x04, &[0x11]));
+        let mut prkdf_cka = Vec::new();
+        prkdf_cka.extend_from_slice(&der_tlv(0x04, &[0x01]));
+        // usage BIT STRING: bit 2 (sign) = 0x20, 5 unused bits
+        prkdf_cka.extend_from_slice(&[0x03, 0x02, 0x05, 0x20]);
+        prkdf_cka.extend_from_slice(&[0x02, 0x01, CUSTOM_KEY_REF]);
+        let mut prkdf_body = Vec::new();
+        prkdf_body.extend_from_slice(&der_tlv(0x30, &prkdf_coa));
+        prkdf_body.extend_from_slice(&der_tlv(0x30, &prkdf_cka));
+        prkdf_body.extend_from_slice(&der_tlv(
+            0xA1,
+            &der_tlv(0x30, &der_tlv(0x30, &der_tlv(0x04, &[]))),
+        ));
+        let ef_prkdf = der_tlv(0xA0, &prkdf_body);
+
+        let ef_aod = build_aod_record(
+            0x11,
+            CUSTOM_PIN1_REF,
+            CUSTOM_MIN,
+            CUSTOM_STORED,
+            CUSTOM_MAX,
+            Some(CUSTOM_PAD),
+        );
+
         let token_info = token_info_der_fixture();
+
+        // 1. Token discovery via `build_token_objects_from_card`.
+        let doc_path = refineid_apdu::iso7816::AbsolutePath::new(vec![
+            refineid_pkcs15::DF_ESTONIAN_PERSONAL_DATA_FID,
+            refineid_pkcs15::EF_ESTONIAN_DOCUMENT_NUMBER_FID,
+        ])
+        .expect("DF.DD / EF.5007 absolute path is valid");
+        let select_doc_wire = refineid_apdu::iso7816::SelectFile {
+            class: refineid_apdu::ApduClass::Plain,
+            target: refineid_apdu::iso7816::SelectFileTarget::AbsolutePath(doc_path),
+            response_mode: refineid_apdu::iso7816::SelectFileResponseMode::Fcp,
+        }
+        .into_apdu()
+        .as_bytes()
+        .to_vec();
+        let mut discovery_steps: Vec<(Vec<u8>, Result<refineid_apdu::ResponseApdu, String>)> = vec![
+            // FINEID probe fails (card does not publish standard PKCS15_AID).
+            (
+                select_pkcs15_wire(),
+                Ok(apdu_response(&[], StatusWord::FileNotFound)),
+            ),
+            // EF.DIR discovery.
+            (
+                select_mf_wire(),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (
+                select_ef_wire(refineid_pkcs15::EF_DIR_FID),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (
+                read_binary_wire(0),
+                Ok(apdu_response(&ef_dir, StatusWord::EndOfFile)),
+            ),
+            // EF.ODF under custom AID.
+            (
+                select_aid_wire(CUSTOM_AID),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (
+                select_ef_wire(refineid_pkcs15::EF_ODF_FID),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (
+                read_binary_wire(0),
+                Ok(apdu_response(&ef_odf, StatusWord::EndOfFile)),
+            ),
+            // EF.CDF at 3F00/5201.
+            (
+                select_abs_path_no_fci_wire(&[CUSTOM_CDF_EF]),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (
+                read_binary_wire(0),
+                Ok(apdu_response(&ef_cdf, StatusWord::EndOfFile)),
+            ),
+            // EF.PrKDF at 3F00/5202.
+            (
+                select_abs_path_no_fci_wire(&[CUSTOM_PRKDF_EF]),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (
+                read_binary_wire(0),
+                Ok(apdu_response(&ef_prkdf, StatusWord::EndOfFile)),
+            ),
+            // EF.AOD at 3F00/5203.
+            (
+                select_abs_path_no_fci_wire(&[CUSTOM_AOD_EF]),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (
+                read_binary_wire(0),
+                Ok(apdu_response(&ef_aod, StatusWord::EndOfFile)),
+            ),
+            // Re-select custom AID at end of discover_authentication_profile.
+            (
+                select_aid_wire(CUSTOM_AID),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            // Read certificate at 3F00/DF22/4411 in chunked READ BINARY.
+            (
+                select_abs_path_no_fci_wire(&[CUSTOM_CERT_DF, CUSTOM_CERT_EF]),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+        ];
+        let mut cert_offset = 0_usize;
+        while cert_offset < AUTH_CERT_DER.len() {
+            let chunk_end = cert_offset
+                .saturating_add(usize::from(TOKEN_INFO_READ_CHUNK))
+                .min(AUTH_CERT_DER.len());
+            let sw = if chunk_end == AUTH_CERT_DER.len() {
+                StatusWord::EndOfFile
+            } else {
+                StatusWord::Success
+            };
+            discovery_steps.push((
+                read_binary_wire(u16::try_from(cert_offset).expect("offset fits u16")),
+                Ok(apdu_response(&AUTH_CERT_DER[cert_offset..chunk_end], sw)),
+            ));
+            cert_offset = chunk_end;
+        }
+        // Document number absent (DF.DD/5007 + legacy MF/D003) -> fallback to EF.TokenInfo under custom AID.
+        discovery_steps.push((
+            select_doc_wire,
+            Ok(apdu_response(&[], StatusWord::FileNotFound)),
+        ));
+        discovery_steps.push((
+            select_mf_wire(),
+            Ok(apdu_response(&[], StatusWord::Success)),
+        ));
+        discovery_steps.push((
+            select_ef_wire(refineid_pkcs15::EF_ESTONIAN_DOCUMENT_NUMBER_LEGACY_FID),
+            Ok(apdu_response(&[], StatusWord::FileNotFound)),
+        ));
+        discovery_steps.push((
+            select_any_fid_wire(refineid_pkcs15::EF_ESTONIAN_DOCUMENT_NUMBER_LEGACY_FID),
+            Ok(apdu_response(&[], StatusWord::FileNotFound)),
+        ));
+        discovery_steps.push((
+            select_aid_wire(CUSTOM_AID),
+            Ok(apdu_response(&[], StatusWord::Success)),
+        ));
+        discovery_steps.push((
+            select_token_info_wire(),
+            Ok(apdu_response(&[], StatusWord::Success)),
+        ));
+        discovery_steps.push((
+            read_token_info_wire(),
+            Ok(apdu_response(&token_info, StatusWord::Success)),
+        ));
+
+        let mut discovery_card = ScriptedLoginCard::new(discovery_steps, None);
+        let objects = super::build_token_objects_from_card(&mut discovery_card, Vec::new(), |_| {})
+            .expect("directory-driven discovery builds Estonian TokenObjects");
+        discovery_card.assert_drained();
+        assert_eq!(
+            objects.pin_scheme(),
+            Some(refineid_auth::PinReferenceScheme::Estonian)
+        );
+        assert_eq!(
+            objects.pin1_length_range(),
+            Some(refineid_auth::PasswordLengthRange::new(CUSTOM_MIN, CUSTOM_MAX).expect("range"))
+        );
+        let profile = objects.session_profile().clone();
+
+        // 2. Login confirms live EF.AOD and verifies with custom P2=0x84, storedLength=8, padChar=0xFF.
+        let pristine = refineid_auth::PinReferenceScheme::Estonian.pin_retry_limit();
         let probe_ok = Ok(apdu_response(
             &[],
             StatusWord::PinIncorrect {
@@ -4578,12 +5319,20 @@ mod tests {
         ));
         let login_steps = vec![
             (
-                select_pkcs15_wire(),
+                select_abs_path_no_fci_wire(&[CUSTOM_AOD_EF]),
                 Ok(apdu_response(&[], StatusWord::Success)),
             ),
-            (estonian_probe_wire.clone(), probe_ok.clone()),
             (
-                select_pkcs15_wire(),
+                read_binary_wire(0),
+                Ok(apdu_response(&ef_aod, StatusWord::EndOfFile)),
+            ),
+            (
+                select_aid_wire(CUSTOM_AID),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (probe_ref_wire(CUSTOM_PIN1_REF), probe_ok.clone()),
+            (
+                select_aid_wire(CUSTOM_AID),
                 Ok(apdu_response(&[], StatusWord::Success)),
             ),
             (
@@ -4594,27 +5343,41 @@ mod tests {
                 read_token_info_wire(),
                 Ok(apdu_response(&token_info, StatusWord::Success)),
             ),
-            (estonian_probe_wire.clone(), probe_ok.clone()),
+            (probe_ref_wire(CUSTOM_PIN1_REF), probe_ok.clone()),
         ];
         let mut login_card = ScriptedLoginCard::new(login_steps, Some(Ok(StatusWord::Success)));
         let pin_cache = std::sync::Arc::new(std::sync::Mutex::new(login_cache()));
-        super::run_card_login_with_scheme(
+        let pin_digits = *b"54321";
+        let pin = crate::pin::PinBytes::try_from(pin_digits).expect("5-digit PIN fits 5..=8");
+        super::run_card_login_with_profile(
             &mut login_card,
             || Ok(LOGIN_READER_EVENTS),
             &pin_cache,
-            random_pin(),
-            Some(scheme),
+            pin,
+            &profile,
         )
-        .expect("Estonian login succeeds at 3-try pristine counter");
+        .expect("directory login succeeds with live-confirmed EF.AOD parameters");
         login_card.assert_drained();
+        let verify_wire = login_card
+            .last_credential_wire
+            .as_ref()
+            .expect("VERIFY wire recorded");
+        assert_eq!(verify_wire[3], CUSTOM_PIN1_REF);
+        assert_eq!(verify_wire[4], CUSTOM_STORED);
+        assert_eq!(
+            &verify_wire[5..],
+            &[
+                b'5', b'4', b'3', b'2', b'1', CUSTOM_PAD, CUSTOM_PAD, CUSTOM_PAD
+            ]
+        );
 
-        let digest = refineid_digest::Sha384::of(b"estonian cached pin1 sign test");
+        // 3. Sign re-confirms live EF.AOD, checks out bound PIN1, verifies with custom P2/pad,
+        //    and issues MSE:Set with re-keyed EF.PrKDF key reference 0x03.
+        let digest = refineid_digest::Sha384::of(b"directory re-keyed estonian sign test");
         let signature = vec![SIGNATURE_FILL; super::ECDSA_P384_SIGNATURE_BYTES];
         let mse_wire = refineid_sign::commands::MseSet {
             alg_ref: refineid_sign::commands::SignatureAlgRef::SHA384_ECDSA,
-            key_ref: refineid_sign::KeyRef::Auth
-                .reference(refineid_sign::SignScheme::Estonian)
-                .expect("Estonian auth key has a reference"),
+            key_ref: CUSTOM_KEY_REF,
         }
         .into_apdu()
         .expect("MSE:Set encodes")
@@ -4634,12 +5397,20 @@ mod tests {
             .to_vec();
         let sign_steps = vec![
             (
-                select_pkcs15_wire(),
+                select_abs_path_no_fci_wire(&[CUSTOM_AOD_EF]),
                 Ok(apdu_response(&[], StatusWord::Success)),
             ),
-            (estonian_probe_wire.clone(), probe_ok.clone()),
             (
-                select_pkcs15_wire(),
+                read_binary_wire(0),
+                Ok(apdu_response(&ef_aod, StatusWord::EndOfFile)),
+            ),
+            (
+                select_aid_wire(CUSTOM_AID),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (probe_ref_wire(CUSTOM_PIN1_REF), probe_ok.clone()),
+            (
+                select_aid_wire(CUSTOM_AID),
                 Ok(apdu_response(&[], StatusWord::Success)),
             ),
             (
@@ -4650,7 +5421,7 @@ mod tests {
                 read_token_info_wire(),
                 Ok(apdu_response(&token_info, StatusWord::Success)),
             ),
-            (estonian_probe_wire, probe_ok),
+            (probe_ref_wire(CUSTOM_PIN1_REF), probe_ok),
             (mse_wire, Ok(apdu_response(&[], StatusWord::Success))),
             (hash_wire, Ok(apdu_response(&[], StatusWord::Success))),
             (cds_wire, Ok(apdu_response(&signature, StatusWord::Success))),
@@ -4659,16 +5430,17 @@ mod tests {
         let request =
             crate::sign::CardSignInput::parse(crate::sign::Mechanism::Ecdsa, digest.as_bytes())
                 .expect("SHA-384 ECDSA digest parses");
-        let signed = super::run_card_sign_with_scheme(
+        let signed = super::run_card_sign_with_profile(
             &mut sign_card,
             || Ok(LOGIN_READER_EVENTS),
             &pin_cache,
-            Some(scheme),
+            &profile,
             request,
         )
-        .expect("Estonian sign checks out held PIN1 at 3-try pristine counter");
+        .expect("directory sign checks out bound PIN1 and uses EF.PrKDF key ref");
         assert_eq!(signed, signature);
         sign_card.assert_drained();
+        assert_eq!(sign_card.credentials_sent, 1);
         assert!(
             pin_cache
                 .lock()
@@ -4678,19 +5450,85 @@ mod tests {
     }
 
     #[test]
+    fn directory_login_and_sign_fail_closed_with_zero_credentials_when_live_aod_drifts_or_omits_pad()
+     {
+        const CUSTOM_AID: &[u8] = &[0xD2, 0x33, 0x00, 0x00, 0x00, 0x45, 0x45, 0x32];
+        const CUSTOM_AOD_EF: refineid_apdu::FileId = refineid_apdu::FileId::from_u16(0x5203);
+        let original_aod = build_aod_record(0x11, 0x84, 4, 12, 12, Some(0x00));
+        let profile = super::CardSessionProfile::Directory(parsed_directory_profile(
+            CUSTOM_AID,
+            CUSTOM_AOD_EF,
+            0x01,
+            0x11,
+            &original_aod,
+            0x84,
+        ));
+
+        let drifted_pad = build_aod_record(0x11, 0x84, 4, 12, 12, Some(0xFF));
+        let omitted_pad = build_aod_record(0x11, 0x84, 4, 12, 12, None);
+        let digest = refineid_digest::Sha384::of(b"drifted aod sign must send zero credentials");
+
+        for bad_aod in [drifted_pad, omitted_pad] {
+            let login_steps = vec![
+                (
+                    select_abs_path_no_fci_wire(&[CUSTOM_AOD_EF]),
+                    Ok(apdu_response(&[], StatusWord::Success)),
+                ),
+                (
+                    read_binary_wire(0),
+                    Ok(apdu_response(&bad_aod, StatusWord::EndOfFile)),
+                ),
+            ];
+            let mut login_card = ScriptedLoginCard::new(login_steps.clone(), None);
+            let login_cache_arc = std::sync::Arc::new(std::sync::Mutex::new(held_login_cache()));
+            let login_res = super::run_card_login_with_profile(
+                &mut login_card,
+                || Ok(LOGIN_READER_EVENTS),
+                &login_cache_arc,
+                random_pin(),
+                &profile,
+            );
+            assert_eq!(login_res, Err(CKR_DEVICE_ERROR));
+            login_card.assert_drained();
+            assert_eq!(login_card.credentials_sent, 0);
+            assert!(
+                !login_cache_arc
+                    .lock()
+                    .expect("cache mutex is unpoisoned")
+                    .holds_pin1()
+            );
+
+            let mut sign_card = ScriptedLoginCard::new(login_steps, None);
+            let sign_cache = std::sync::Arc::new(std::sync::Mutex::new(held_login_cache()));
+            let request =
+                crate::sign::CardSignInput::parse(crate::sign::Mechanism::Ecdsa, digest.as_bytes())
+                    .expect("SHA-384 ECDSA digest parses");
+            let sign_res = super::run_card_sign_with_profile(
+                &mut sign_card,
+                || Ok(LOGIN_READER_EVENTS),
+                &sign_cache,
+                &profile,
+                request,
+            );
+            assert_eq!(sign_res, Err(CKR_DEVICE_ERROR));
+            sign_card.assert_drained();
+            assert_eq!(sign_card.credentials_sent, 0);
+            assert!(
+                !sign_cache
+                    .lock()
+                    .expect("cache mutex is unpoisoned")
+                    .holds_pin1()
+            );
+        }
+    }
+
+    #[test]
     fn estonian_auto_detected_login_falls_back_to_document_number_when_token_info_is_absent() {
         const DOC_NUMBER_TEXT: &str = "AA0000000";
         let scheme = refineid_auth::PinReferenceScheme::Estonian;
         let pristine = scheme.pin_retry_limit();
         let probe_for = |target: refineid_auth::PinReferenceScheme| {
-            refineid_apdu::CommandApdu::case_1(refineid_apdu::CommandHeader {
-                class: refineid_apdu::ApduClass::Plain,
-                instruction: refineid_auth::verify::VERIFY_INS,
-                p1: refineid_auth::verify::VERIFY_P1,
-                p2: target.reference(refineid_auth::PinSlot::Pin1),
-            })
-            .as_bytes()
-            .to_vec()
+            probe_ref_wire(target.reference(refineid_auth::PinSlot::Pin1))
         };
         let doc_path = refineid_apdu::iso7816::AbsolutePath::new(vec![
             refineid_pkcs15::DF_ESTONIAN_PERSONAL_DATA_FID,
@@ -4765,12 +5603,12 @@ mod tests {
         ];
         let mut card = ScriptedLoginCard::new(steps, Some(Ok(StatusWord::Success)));
         let pin_cache = std::sync::Arc::new(std::sync::Mutex::new(login_cache()));
-        super::run_card_login_with_scheme(
+        super::run_card_login_with_profile(
             &mut card,
             || Ok(LOGIN_READER_EVENTS),
             &pin_cache,
             random_pin(),
-            None,
+            &super::CardSessionProfile::Fineid,
         )
         .expect("auto-detected Estonian login falls back to document number when EF.TokenInfo is absent");
         card.assert_drained();
@@ -4793,22 +5631,24 @@ mod tests {
     fn estonian_login_does_not_fall_back_to_document_number_on_token_info_transport_error() {
         let scheme = refineid_auth::PinReferenceScheme::Estonian;
         let pristine = scheme.pin_retry_limit();
-        let estonian_probe_wire =
-            refineid_apdu::CommandApdu::case_1(refineid_apdu::CommandHeader {
-                class: refineid_apdu::ApduClass::Plain,
-                instruction: refineid_auth::verify::VERIFY_INS,
-                p1: refineid_auth::verify::VERIFY_P1,
-                p2: scheme.reference(refineid_auth::PinSlot::Pin1),
-            })
-            .as_bytes()
-            .to_vec();
+        let probe_for = |target: refineid_auth::PinReferenceScheme| {
+            probe_ref_wire(target.reference(refineid_auth::PinSlot::Pin1))
+        };
         let steps = vec![
             (
                 select_pkcs15_wire(),
                 Ok(apdu_response(&[], StatusWord::Success)),
             ),
             (
-                estonian_probe_wire,
+                probe_for(refineid_auth::PinReferenceScheme::Citizen),
+                Ok(apdu_response(&[], StatusWord::ReferenceDataNotFound)),
+            ),
+            (
+                probe_for(refineid_auth::PinReferenceScheme::Organizational),
+                Ok(apdu_response(&[], StatusWord::ReferenceDataNotFound)),
+            ),
+            (
+                probe_for(scheme),
                 Ok(apdu_response(
                     &[],
                     StatusWord::PinIncorrect {
@@ -4827,12 +5667,12 @@ mod tests {
         ];
         let mut card = ScriptedLoginCard::new(steps, None);
         let pin_cache = std::sync::Arc::new(std::sync::Mutex::new(held_login_cache()));
-        let res = super::run_card_login_with_scheme(
+        let res = super::run_card_login_with_profile(
             &mut card,
             || Ok(LOGIN_READER_EVENTS),
             &pin_cache,
             random_pin(),
-            Some(scheme),
+            &super::CardSessionProfile::Fineid,
         );
         assert_eq!(res, Err(CKR_DEVICE_ERROR));
         card.assert_drained();
@@ -4841,6 +5681,70 @@ mod tests {
                 .lock()
                 .expect("cache mutex is unpoisoned")
                 .holds_pin1()
+        );
+    }
+
+    #[cfg(feature = "pin-change")]
+    #[test]
+    fn directory_change_pin1_honors_live_aod_parameters_and_fails_closed_on_drift() {
+        const CUSTOM_AID: &[u8] = &[0xD2, 0x33, 0x00, 0x00, 0x00, 0x45, 0x45, 0x32];
+        const CUSTOM_AOD_EF: refineid_apdu::FileId = refineid_apdu::FileId::from_u16(0x5203);
+        const CUSTOM_PIN1_REF: u8 = 0x84;
+        const CUSTOM_STORED: u8 = 8;
+        const CUSTOM_PAD: u8 = 0xFF;
+
+        let ef_aod = build_aod_record(0x11, CUSTOM_PIN1_REF, 5, CUSTOM_STORED, 8, Some(CUSTOM_PAD));
+        let profile = super::CardSessionProfile::Directory(parsed_directory_profile(
+            CUSTOM_AID,
+            CUSTOM_AOD_EF,
+            0x01,
+            0x11,
+            &ef_aod,
+            CUSTOM_PIN1_REF,
+        ));
+        let pristine = refineid_auth::PinReferenceScheme::Estonian.pin_retry_limit();
+        let steps = vec![
+            (
+                select_abs_path_no_fci_wire(&[CUSTOM_AOD_EF]),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (
+                read_binary_wire(0),
+                Ok(apdu_response(&ef_aod, StatusWord::EndOfFile)),
+            ),
+            (
+                select_aid_wire(CUSTOM_AID),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (
+                probe_ref_wire(CUSTOM_PIN1_REF),
+                Ok(apdu_response(
+                    &[],
+                    StatusWord::PinIncorrect {
+                        retries: retries(pristine),
+                    },
+                )),
+            ),
+        ];
+        let mut card = ScriptedLoginCard::new(steps, Some(Ok(StatusWord::Success)));
+        let current = crate::pin::PinBytes::try_from(*b"54321").expect("current PIN1");
+        let next = crate::pin::PinBytes::try_from(*b"67890").expect("new PIN1");
+        super::run_card_change_pin1_with_profile(&mut card, current, next, &profile)
+            .expect("directory PIN1 change succeeds");
+        card.assert_drained();
+        let wire = card
+            .last_credential_wire
+            .as_ref()
+            .expect("CHANGE REFERENCE DATA wire recorded");
+        assert_eq!(wire[1], refineid_auth::manage::CHANGE_REFERENCE_DATA_INS);
+        assert_eq!(wire[3], CUSTOM_PIN1_REF);
+        assert_eq!(wire[4], CUSTOM_STORED * 2);
+        assert_eq!(
+            &wire[5..],
+            &[
+                b'5', b'4', b'3', b'2', b'1', CUSTOM_PAD, CUSTOM_PAD, CUSTOM_PAD, b'6', b'7', b'8',
+                b'9', b'0', CUSTOM_PAD, CUSTOM_PAD, CUSTOM_PAD,
+            ]
         );
     }
 }

@@ -31,6 +31,16 @@ use refineid_apdu::{
 };
 use refineid_x509::UnvalidatedCertificate;
 
+use crate::aod::{AuthenticationObjects, AuthenticationObjectsRead};
+use crate::directory::{
+    ApplicationDirectory, ApplicationDirectoryRead, ApplicationLabel,
+    AuthenticationCredentialLookup, CertificateDirectory, CertificateDirectoryRead,
+    CertificateRead, CredentialDirectory, DerCertificate, DirectoryLookup,
+    DiscoveredAuthenticationProfile, EF_DIR_FID, EF_ODF_FID, ESTONIAN_EID_APPLICATION_LABEL,
+    FileContent, FileEnd, ObjectClass, ObjectDirectory, ObjectDirectoryRead, Pkcs15Path,
+    PrivateKeyDirectory, PrivateKeyDirectoryRead,
+};
+
 /// The PKCS#15 application identifier the FINEID card publishes per
 /// FINEID S4-2 section 3.1. It is the registered application provider
 /// identifier -- the opaque five-byte RID `A0 00 00 00 63` that ISO
@@ -61,9 +71,6 @@ pub const EF_AUTH_CERT_FID: FileId = FileId::from_u16(0x4331);
 pub const EF_SIGN_CERT_FID: FileId = FileId::from_u16(0x4332);
 /// EF.4333, the second authentication slot on dual-algorithm cards.
 pub const EF_AUTH_CERT_ALT_FID: FileId = FileId::from_u16(0x4333);
-/// EF.3411, the Estonian eID authentication certificate named by
-/// EF.CDF object 11 (GED24035, the Estonian eID developer guide).
-pub const EF_ESTONIAN_AUTH_CERT_FID: FileId = FileId::from_u16(0x3411);
 /// DF.DD, the Estonian personal-data directory on the 2025 platform.
 pub const DF_ESTONIAN_PERSONAL_DATA_FID: FileId = FileId::from_u16(0xDFDD);
 /// EF.5007 under DF.DD, PD7 Document number on the 2025 platform: the
@@ -110,9 +117,6 @@ pub enum CertSlot {
     /// Second authentication slot (EF.4333); the algorithm is not fixed
     /// by the slot, so consumers parse the DER to see what is there.
     AuthenticationAlt,
-    /// Estonian eID authentication certificate (EF.3411). The card names
-    /// it through EF.CDF object 11 rather than the FINEID fixed path.
-    EstonianAuthentication,
     /// On-card copy of the issuing root CA (EF.4334); algorithm varies
     /// by card generation.
     RootCa,
@@ -133,7 +137,6 @@ impl CertSlot {
             Self::Authentication => EF_AUTH_CERT_FID,
             Self::Signature => EF_SIGN_CERT_FID,
             Self::AuthenticationAlt => EF_AUTH_CERT_ALT_FID,
-            Self::EstonianAuthentication => EF_ESTONIAN_AUTH_CERT_FID,
             Self::RootCa => EF_ROOT_CA_FID,
             Self::SignatureAlt => EF_SIGN_CERT_ALT_FID,
             Self::IssuingCaEcc => EF_ISSUING_CA_ECC_FID,
@@ -147,7 +150,6 @@ impl CertSlot {
             Self::Authentication => "authentication (EF.4331)",
             Self::Signature => "qualified signature (EF.4332)",
             Self::AuthenticationAlt => "authentication, alt slot (EF.4333)",
-            Self::EstonianAuthentication => "authentication (EF.3411)",
             Self::RootCa => "on-card issuing root CA (EF.4334)",
             Self::SignatureAlt => "qualified signature, alt slot (EF.4335)",
             Self::IssuingCaEcc => "issuing intermediate CA (EF.4336)",
@@ -161,7 +163,7 @@ impl CertSlot {
     /// signature directory, and the CA copies under the MF.
     const fn path(self) -> SlotPath {
         match self {
-            Self::Authentication | Self::EstonianAuthentication => SlotPath::UnderPkcs15App,
+            Self::Authentication => SlotPath::UnderPkcs15App,
             Self::Signature | Self::AuthenticationAlt | Self::SignatureAlt => {
                 SlotPath::UnderEsignDirectory
             }
@@ -184,10 +186,10 @@ impl CertSlot {
     }
 
     /// Number of slots [`CertSlot::all`] probes.
-    pub const PROBED_SLOTS: usize = 6;
+    pub const PROBED_SLOTS: usize = 5;
 
-    /// The certificate slots a card may publish, in directory order.
-    /// Callers probe each; an absent slot answers SELECT with
+    /// The certificate slots a FINEID card may publish, in directory
+    /// order. Callers probe each; an absent slot answers SELECT with
     /// [`StatusWord::FileNotFound`], which is "not provisioned", not an
     /// error.
     #[must_use]
@@ -196,7 +198,6 @@ impl CertSlot {
             Self::Authentication,
             Self::Signature,
             Self::AuthenticationAlt,
-            Self::EstonianAuthentication,
             Self::RootCa,
             Self::SignatureAlt,
         ]
@@ -361,8 +362,54 @@ const P1_SELECT_CHILD_DF: u8 = 0x01;
 /// P1: select a DF or MF by name; some FINEID variants accept the MF
 /// identifier through this mode.
 const P1_SELECT_BY_NAME: u8 = 0x04;
+/// P1: select by relative path from the current DF (ISO/IEC 7816-4
+/// table 39).
+const P1_SELECT_PATH_FROM_CURRENT_DF: u8 = 0x09;
 /// P2: return no response data, shared with the typed SELECT builder.
 const P2_NO_RESPONSE_DATA: u8 = SelectFileResponseMode::None.as_p2();
+/// Single-octet READ BINARY probe used at [`MAX_OBJECT_BYTES`] to
+/// distinguish an exact-cap file from an incomplete read.
+const ONE_BYTE_EOF_PROBE: u8 = 1;
+
+/// Whether a SELECT status word signals a security-channel refusal
+/// that must propagate immediately instead of triggering a fallback
+/// SELECT variant.
+const fn stops_select_fallback(sw: StatusWord) -> bool {
+    matches!(
+        sw,
+        StatusWord::SecurityNotSatisfied | StatusWord::SmDataObjectsIncorrect
+    )
+}
+
+/// Build the relative-path SELECT variant from the current DF, with no
+/// response data.
+fn select_relative_path_variant<E>(steps: &[FileId]) -> Result<CommandApdu, Pkcs15Error<E>> {
+    let mut data = Vec::with_capacity(steps.len().saturating_mul(FileId::LENGTH));
+    for fid in steps {
+        data.extend_from_slice(fid.as_bytes());
+    }
+    CommandApdu::case_3(
+        CommandHeader {
+            class: ApduClass::Plain,
+            instruction: SelectFile::INS,
+            p1: P1_SELECT_PATH_FROM_CURRENT_DF,
+            p2: P2_NO_RESPONSE_DATA,
+        },
+        &data,
+    )
+    .map_err(Pkcs15Error::Command)
+}
+
+/// Build the absolute-path SELECT variant without response data
+/// (ISO/IEC 7816-4 P1=08, P2=0C).
+fn select_path_no_fci_variant(path: &AbsolutePath) -> CommandApdu {
+    SelectFile {
+        class: ApduClass::Plain,
+        target: SelectFileTarget::AbsolutePath(path.clone()),
+        response_mode: SelectFileResponseMode::None,
+    }
+    .into_apdu()
+}
 
 /// Build the by-name SELECT variant carrying a file identifier as the
 /// name.
@@ -418,7 +465,25 @@ fn select_any_by_fid_variant(fid: FileId) -> CommandApdu {
 /// PKCS#15 file-system operations, layered as default methods on every
 /// [`CardTransport`].
 pub trait Pkcs15Ops: CardTransport {
-    /// SELECT the PKCS#15 application by AID, with no response data.
+    /// SELECT any application by AID, with no response data.
+    ///
+    /// # Errors
+    ///
+    /// Transport failures or a non-success status word.
+    fn select_application(&mut self, aid: &Aid) -> Result<(), Pkcs15Error<Self::Error>>
+    where
+        Self: Sized,
+    {
+        let command = SelectByAidNoFci { aid: aid.clone() }.into_apdu();
+        let response = exchange(self, &command)?;
+        if !response.is_ok() {
+            return Err(Pkcs15Error::Status(response.status_word()));
+        }
+        Ok(())
+    }
+
+    /// SELECT the standard PKCS#15 application by [`PKCS15_AID`], with
+    /// no response data.
     ///
     /// # Errors
     ///
@@ -428,12 +493,7 @@ pub trait Pkcs15Ops: CardTransport {
         Self: Sized,
     {
         let aid = Aid::from_slice(PKCS15_AID).map_err(Pkcs15Error::Aid)?;
-        let command = SelectByAidNoFci { aid }.into_apdu();
-        let response = exchange(self, &command)?;
-        if !response.is_ok() {
-            return Err(Pkcs15Error::Status(response.status_word()));
-        }
-        Ok(())
+        self.select_application(&aid)
     }
 
     /// SELECT an EF by file identifier, with no response data. Tries
@@ -702,44 +762,525 @@ pub trait Pkcs15Ops: CardTransport {
         Ok(UnvalidatedCertificate::new(bytes))
     }
 
-    /// Read and parse EF.AOD, the card's authentication objects, under
-    /// the PKCS#15 application.
+    /// SELECT a file addressed by a parsed [`Pkcs15Path`].
     ///
-    /// Tries the FINEID identifier (EF.4401) first and falls back to
-    /// the Estonian eID identifier (EF.5006) only when EF.4401 answers
-    /// [`StatusWord::FileNotFound`]. Transport failures, transport
-    /// state transitions, other status words, and parse errors on a
-    /// selected file propagate immediately.
-    ///
-    /// The file is read to its end: it holds several top-level objects
-    /// and may be zero-padded, so no single DER header sizes it.
+    /// For an MF-rooted path (`3F00/...`), tries ISO/IEC 7816-4
+    /// absolute-path SELECT (`P1=08`, no-FCI then FCP) before falling
+    /// back to step-by-step MF -> child-DF -> EF selection for cards
+    /// that do not implement `P1=08`. For a relative path, selects a
+    /// direct child EF or tries relative-path SELECT (`P1=09`) with
+    /// step-by-step fallback.
     ///
     /// # Errors
     ///
-    /// SELECT or read failures, or a directory that does not decode (see
-    /// [`crate::AuthenticationObjects::parse`]).
-    fn read_authentication_objects(
-        &mut self,
-    ) -> Result<crate::AuthenticationObjects, Pkcs15Error<Self::Error>>
+    /// Transport failures, security-channel refusals, an MF-only path,
+    /// or the card's status word when every SELECT shape fails.
+    fn select_pkcs15_path(&mut self, path: &Pkcs15Path) -> Result<(), Pkcs15Error<Self::Error>>
     where
         Self: Sized,
     {
-        self.select_pkcs15_application()?;
-        for fid in [crate::EF_AOD_FID, crate::EF_ESTONIAN_AOD_FID] {
-            match self.select_ef(fid) {
-                Ok(()) => {
-                    let bytes = self.read_binary_to_end(None)?;
-                    return crate::AuthenticationObjects::parse(&bytes)
-                        .map_err(|_parse_error| Pkcs15Error::InvalidData("EF.AOD"));
+        if path.is_absolute_from_mf() {
+            let tail = path
+                .steps()
+                .get(1..)
+                .filter(|steps| !steps.is_empty())
+                .ok_or(Pkcs15Error::InvalidData("PKCS#15 path"))?;
+            let absolute = AbsolutePath::new(tail.to_vec())
+                .map_err(|_path_err| Pkcs15Error::InvalidData("PKCS#15 path"))?;
+            let mut last_status = None;
+            for command in [
+                select_path_no_fci_variant(&absolute),
+                select_path_variant(&absolute),
+            ] {
+                let response = exchange(self, &command)?;
+                if response.is_ok() {
+                    return Ok(());
                 }
-                Err(Pkcs15Error::Status(StatusWord::FileNotFound)) => {}
-                Err(error) => return Err(error),
+                let sw = response.status_word();
+                if stops_select_fallback(sw) {
+                    return Err(Pkcs15Error::Status(sw));
+                }
+                last_status = Some(sw);
             }
+            if let Some((file, parents)) = tail.split_last() {
+                self.select_mf()?;
+                for &df in parents {
+                    self.select_child_df(df)?;
+                }
+                return self.select_ef(*file);
+            }
+            return Err(Pkcs15Error::Status(
+                last_status.unwrap_or(StatusWord::FileNotFound),
+            ));
         }
-        Err(Pkcs15Error::Status(StatusWord::FileNotFound))
+
+        if path.parents().is_empty() {
+            return self.select_ef(path.file());
+        }
+        let command = select_relative_path_variant(path.steps())?;
+        let response = exchange(self, &command)?;
+        if response.is_ok() {
+            return Ok(());
+        }
+        let sw = response.status_word();
+        if stops_select_fallback(sw) {
+            return Err(Pkcs15Error::Status(sw));
+        }
+        for &df in path.parents() {
+            self.select_child_df(df)?;
+        }
+        self.select_ef(path.file())
     }
 
-    /// Read and parse EF.TokenInfo.
+    /// READ BINARY the currently selected EF until the card confirms
+    /// end of file or [`MAX_OBJECT_BYTES`] is reached.
+    ///
+    /// End of file is [`FileEnd::Confirmed`] only when the card itself
+    /// reports it (`6282` EndOfFile, `6B00` WrongParametersP1P2 with
+    /// an empty body, or an empty `9000` response). A short `9000`
+    /// chunk continues reading so cards that cap a single response
+    /// below `READ_CHUNK` are never silently truncated.
+    ///
+    /// # Errors
+    ///
+    /// Transport failures, transport state transitions, or unexpected
+    /// card status words.
+    fn read_binary_confirmed(&mut self) -> Result<FileContent, Pkcs15Error<Self::Error>>
+    where
+        Self: Sized,
+    {
+        let mut collected = Vec::new();
+        while collected.len() < MAX_OBJECT_BYTES {
+            let remaining = MAX_OBJECT_BYTES
+                .checked_sub(collected.len())
+                .ok_or(Pkcs15Error::TooLarge)?;
+            let want_usize = remaining.min(usize::from(READ_CHUNK));
+            let want = u8::try_from(want_usize).map_err(|_| Pkcs15Error::TooLarge)?;
+            let response = read_chunk_with_eof_retry(self, collected.len(), want)?;
+            match response.status_word() {
+                StatusWord::EndOfFile => {
+                    if collected.len().saturating_add(response.body.len()) > MAX_OBJECT_BYTES {
+                        let take = MAX_OBJECT_BYTES.saturating_sub(collected.len());
+                        collected.extend_from_slice(&response.body[..take]);
+                        return Ok(FileContent::from_read(collected, FileEnd::Incomplete));
+                    }
+                    collected.extend_from_slice(&response.body);
+                    return Ok(FileContent::from_read(collected, FileEnd::Confirmed));
+                }
+                StatusWord::WrongParametersP1P2 if response.body.is_empty() => {
+                    return Ok(FileContent::from_read(collected, FileEnd::Confirmed));
+                }
+                StatusWord::Success => {
+                    if response.body.is_empty() {
+                        return Ok(FileContent::from_read(collected, FileEnd::Confirmed));
+                    }
+                    if collected.len().saturating_add(response.body.len()) > MAX_OBJECT_BYTES {
+                        let take = MAX_OBJECT_BYTES.saturating_sub(collected.len());
+                        collected.extend_from_slice(&response.body[..take]);
+                        return Ok(FileContent::from_read(collected, FileEnd::Incomplete));
+                    }
+                    collected.extend_from_slice(&response.body);
+                }
+                other => return Err(Pkcs15Error::Status(other)),
+            }
+        }
+        let probe = read_chunk(self, MAX_OBJECT_BYTES, ONE_BYTE_EOF_PROBE)?;
+        match probe.status_word() {
+            StatusWord::WrongParametersP1P2 if probe.body.is_empty() => {
+                Ok(FileContent::from_read(collected, FileEnd::Confirmed))
+            }
+            StatusWord::EndOfFile | StatusWord::Success if probe.body.is_empty() => {
+                Ok(FileContent::from_read(collected, FileEnd::Confirmed))
+            }
+            StatusWord::EndOfFile | StatusWord::Success => {
+                Ok(FileContent::from_read(collected, FileEnd::Incomplete))
+            }
+            other => Err(Pkcs15Error::Status(other)),
+        }
+    }
+
+    /// Select and read a file named by `path`, applying any PKCS#15
+    /// `(index, length)` byte slice carried by the path.
+    ///
+    /// # Errors
+    ///
+    /// Selection or read failures, or an out-of-bounds / incomplete
+    /// path slice.
+    fn read_pkcs15_path(
+        &mut self,
+        path: &Pkcs15Path,
+    ) -> Result<FileContent, Pkcs15Error<Self::Error>>
+    where
+        Self: Sized,
+    {
+        self.select_pkcs15_path(path)?;
+        let content = self.read_binary_confirmed()?;
+        content
+            .apply_path_slice(path.slice())
+            .ok_or(Pkcs15Error::InvalidData("PKCS#15 path slice"))
+    }
+
+    /// Read and validate EF.DIR (`3F00/2F00`).
+    ///
+    /// # Errors
+    ///
+    /// Selection or read failures, or an incomplete / malformed EF.DIR.
+    fn read_application_directory(
+        &mut self,
+    ) -> Result<ApplicationDirectory, Pkcs15Error<Self::Error>>
+    where
+        Self: Sized,
+    {
+        self.select_mf()?;
+        self.select_ef(EF_DIR_FID)?;
+        let content = self.read_binary_confirmed()?;
+        match ApplicationDirectory::of(content) {
+            ApplicationDirectoryRead::Parsed(directory) => Ok(directory),
+            ApplicationDirectoryRead::Incomplete | ApplicationDirectoryRead::Malformed => {
+                Err(Pkcs15Error::InvalidData("EF.DIR"))
+            }
+        }
+    }
+
+    /// Read and validate EF.ODF (`5031`) under `aid`.
+    ///
+    /// # Errors
+    ///
+    /// Selection or read failures, or an incomplete / malformed EF.ODF.
+    fn read_object_directory(
+        &mut self,
+        aid: &Aid,
+    ) -> Result<ObjectDirectory, Pkcs15Error<Self::Error>>
+    where
+        Self: Sized,
+    {
+        self.select_application(aid)?;
+        self.select_ef(EF_ODF_FID)?;
+        let content = self.read_binary_confirmed()?;
+        match ObjectDirectory::of(content) {
+            ObjectDirectoryRead::Parsed(directory) => Ok(directory),
+            ObjectDirectoryRead::Incomplete | ObjectDirectoryRead::Malformed => {
+                Err(Pkcs15Error::InvalidData("EF.ODF"))
+            }
+        }
+    }
+
+    /// Read and validate an EF.CDF file at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Selection or read failures, or an incomplete / malformed EF.CDF.
+    fn read_certificate_directory_at(
+        &mut self,
+        path: &Pkcs15Path,
+    ) -> Result<CertificateDirectory, Pkcs15Error<Self::Error>>
+    where
+        Self: Sized,
+    {
+        let content = self.read_pkcs15_path(path)?;
+        match CertificateDirectory::of(content) {
+            CertificateDirectoryRead::Parsed(directory) => Ok(directory),
+            CertificateDirectoryRead::Incomplete | CertificateDirectoryRead::Malformed => {
+                Err(Pkcs15Error::InvalidData("EF.CDF"))
+            }
+        }
+    }
+
+    /// Read and validate an EF.PrKDF file at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Selection or read failures, or an incomplete / malformed
+    /// EF.PrKDF.
+    fn read_private_key_directory_at(
+        &mut self,
+        path: &Pkcs15Path,
+    ) -> Result<PrivateKeyDirectory, Pkcs15Error<Self::Error>>
+    where
+        Self: Sized,
+    {
+        let content = self.read_pkcs15_path(path)?;
+        match PrivateKeyDirectory::of(content) {
+            PrivateKeyDirectoryRead::Parsed(directory) => Ok(directory),
+            PrivateKeyDirectoryRead::Incomplete | PrivateKeyDirectoryRead::Malformed => {
+                Err(Pkcs15Error::InvalidData("EF.PrKDF"))
+            }
+        }
+    }
+
+    /// Read and validate an EF.AOD file at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Selection or read failures, or an incomplete / malformed EF.AOD.
+    fn read_authentication_objects_at(
+        &mut self,
+        path: &Pkcs15Path,
+    ) -> Result<AuthenticationObjects, Pkcs15Error<Self::Error>>
+    where
+        Self: Sized,
+    {
+        let content = self.read_pkcs15_path(path)?;
+        match AuthenticationObjects::of(content) {
+            AuthenticationObjectsRead::Parsed(objects) => Ok(objects),
+            AuthenticationObjectsRead::Incomplete | AuthenticationObjectsRead::Malformed(_) => {
+                Err(Pkcs15Error::InvalidData("EF.AOD"))
+            }
+        }
+    }
+
+    /// Read and validate a complete single-SEQUENCE DER certificate at
+    /// `path`.
+    ///
+    /// # Errors
+    ///
+    /// Selection or read failures, an incomplete read, or octets that
+    /// are not exactly one minimal DER SEQUENCE.
+    fn read_certificate_at(
+        &mut self,
+        path: &Pkcs15Path,
+    ) -> Result<DerCertificate, Pkcs15Error<Self::Error>>
+    where
+        Self: Sized,
+    {
+        let content = self.read_pkcs15_path(path)?;
+        match DerCertificate::of(content) {
+            CertificateRead::Complete(certificate) => Ok(certificate),
+            CertificateRead::Incomplete | CertificateRead::NotOneObject => {
+                Err(Pkcs15Error::InvalidData("certificate"))
+            }
+        }
+    }
+
+    /// Look up the single AID published in EF.DIR under `label`.
+    ///
+    /// # Errors
+    ///
+    /// [`Pkcs15Error::Status`] with [`StatusWord::FileNotFound`] when
+    /// EF.DIR or `label` is absent; [`Pkcs15Error::InvalidData`] when
+    /// EF.DIR is incomplete, malformed, or publishes `label` more than
+    /// once; or transport failures.
+    fn discover_application_by_label(
+        &mut self,
+        label: &ApplicationLabel,
+    ) -> Result<Aid, Pkcs15Error<Self::Error>>
+    where
+        Self: Sized,
+    {
+        let directory = self.read_application_directory()?;
+        match directory.identifier_labelled(label) {
+            DirectoryLookup::Identified(aid) => Ok(aid),
+            DirectoryLookup::Absent => Err(Pkcs15Error::Status(StatusWord::FileNotFound)),
+            DirectoryLookup::Ambiguous => Err(Pkcs15Error::InvalidData("EF.DIR")),
+        }
+    }
+
+    /// Discover the authentication certificate path, key reference,
+    /// EF.AOD path, PIN1 object, and optional PUK object for any
+    /// ISO/IEC 7816-15 application identified by `aid`.
+    ///
+    /// Leaves `aid` selected on success.
+    ///
+    /// # Errors
+    ///
+    /// Selection, read, or validation failures across EF.ODF, EF.CDF,
+    /// EF.PrKDF, or EF.AOD, or an absent / ambiguous authentication
+    /// credential or PIN object.
+    fn discover_authentication_profile(
+        &mut self,
+        aid: &Aid,
+    ) -> Result<DiscoveredAuthenticationProfile, Pkcs15Error<Self::Error>>
+    where
+        Self: Sized,
+    {
+        let odf = self.read_object_directory(aid)?;
+        let cdf_paths: Vec<Pkcs15Path> = odf
+            .plain_file_paths(ObjectClass::Certificates)
+            .ok_or(Pkcs15Error::InvalidData("EF.ODF"))?
+            .into_iter()
+            .cloned()
+            .collect();
+        let prkdf_paths: Vec<Pkcs15Path> = odf
+            .plain_file_paths(ObjectClass::PrivateKeys)
+            .ok_or(Pkcs15Error::InvalidData("EF.ODF"))?
+            .into_iter()
+            .cloned()
+            .collect();
+        let aod_paths: Vec<Pkcs15Path> = odf
+            .plain_file_paths(ObjectClass::AuthObjects)
+            .ok_or(Pkcs15Error::InvalidData("EF.ODF"))?
+            .into_iter()
+            .cloned()
+            .collect();
+
+        let mut cdfs = Vec::with_capacity(cdf_paths.len());
+        for path in &cdf_paths {
+            if !path.is_absolute_from_mf() {
+                self.select_application(aid)?;
+            }
+            cdfs.push(self.read_certificate_directory_at(path)?);
+        }
+        let certificates = CertificateDirectory::merge(cdfs);
+
+        let mut prkdfs = Vec::with_capacity(prkdf_paths.len());
+        for path in &prkdf_paths {
+            if !path.is_absolute_from_mf() {
+                self.select_application(aid)?;
+            }
+            prkdfs.push(self.read_private_key_directory_at(path)?);
+        }
+        let private_keys = PrivateKeyDirectory::merge(prkdfs);
+
+        let credentials = CredentialDirectory::of(&certificates, &private_keys)
+            .map_err(|_pair_err| Pkcs15Error::InvalidData("credential directory"))?;
+        let AuthenticationCredentialLookup::Unique(auth_cred) =
+            credentials.unique_authentication_credential()
+        else {
+            return Err(Pkcs15Error::InvalidData("authentication credential"));
+        };
+        if !auth_cred.certificate().is_x509() {
+            return Err(Pkcs15Error::InvalidData("authentication certificate"));
+        }
+        let auth_cert_path = auth_cred
+            .path()
+            .cloned()
+            .ok_or(Pkcs15Error::InvalidData("authentication certificate path"))?;
+        let auth_key_reference = auth_cred
+            .key_reference()
+            .ok_or(Pkcs15Error::InvalidData("authentication key reference"))?;
+        let pin1_auth_id = auth_cred
+            .key()
+            .auth_id()
+            .cloned()
+            .ok_or(Pkcs15Error::InvalidData("authentication key authId"))?;
+
+        let mut aod_files = Vec::with_capacity(aod_paths.len());
+        let mut aod_list = Vec::with_capacity(aod_paths.len());
+        for path in &aod_paths {
+            if !path.is_absolute_from_mf() {
+                self.select_application(aid)?;
+            }
+            let objects = self.read_authentication_objects_at(path)?;
+            aod_files.push((path.clone(), objects.clone()));
+            aod_list.push(objects);
+        }
+        let all_aod = AuthenticationObjects::merge(aod_list);
+        let pin1 = all_aod
+            .unique_by_auth_id(&pin1_auth_id)
+            .cloned()
+            .ok_or(Pkcs15Error::InvalidData("EF.AOD"))?;
+        if pin1.flags().unblocking_password() {
+            return Err(Pkcs15Error::InvalidData("EF.AOD"));
+        }
+        let aod_path = aod_files
+            .into_iter()
+            .find_map(|(path, objects)| objects.unique_by_auth_id(&pin1_auth_id).map(|_| path))
+            .ok_or(Pkcs15Error::InvalidData("EF.AOD"))?;
+        let puk = pin1.protecting_auth_id().and_then(|puk_id| {
+            all_aod
+                .unique_by_auth_id(puk_id)
+                .filter(|object| object.flags().unblocking_password())
+                .cloned()
+        });
+
+        self.select_application(aid)?;
+        Ok(DiscoveredAuthenticationProfile::new(
+            aid.clone(),
+            auth_cert_path,
+            auth_key_reference,
+            aod_path,
+            pin1_auth_id,
+            pin1,
+            puk,
+        ))
+    }
+
+    /// Discover the Estonian eID authentication profile via EF.DIR
+    /// (`"Estonian eID"`) followed by full ISO/IEC 7816-15 EF.ODF /
+    /// EF.CDF / EF.PrKDF / EF.AOD resolution.
+    ///
+    /// # Errors
+    ///
+    /// [`Pkcs15Error::Status`] with [`StatusWord::FileNotFound`] when
+    /// EF.DIR or the `"Estonian eID"` application is absent; otherwise
+    /// as [`Self::discover_authentication_profile`].
+    fn discover_estonian_authentication_profile(
+        &mut self,
+    ) -> Result<DiscoveredAuthenticationProfile, Pkcs15Error<Self::Error>>
+    where
+        Self: Sized,
+    {
+        let label = ApplicationLabel::try_from(ESTONIAN_EID_APPLICATION_LABEL)
+            .map_err(|_empty| Pkcs15Error::InvalidData("EF.DIR"))?;
+        let aid = self.discover_application_by_label(&label)?;
+        self.discover_authentication_profile(&aid)
+    }
+
+    /// Read and parse EF.AOD, the card's authentication objects, under
+    /// the PKCS#15 application.
+    ///
+    /// Tries the FINEID identifier (EF.4401) first; when EF.4401
+    /// answers [`StatusWord::FileNotFound`], reads EF.ODF (`5031`) and
+    /// follows the `AuthObjects` path(s) the card publishes there.
+    /// Leaves the PKCS#15 application DF active on success.
+    ///
+    /// # Errors
+    ///
+    /// SELECT or read failures, or a directory that does not decode.
+    fn read_authentication_objects(
+        &mut self,
+    ) -> Result<AuthenticationObjects, Pkcs15Error<Self::Error>>
+    where
+        Self: Sized,
+    {
+        let aid = Aid::from_slice(PKCS15_AID).map_err(Pkcs15Error::Aid)?;
+        self.select_application(&aid)?;
+        match self.select_ef(crate::EF_AOD_FID) {
+            Ok(()) => {
+                let bytes = self.read_binary_to_end(None)?;
+                return AuthenticationObjects::parse(&bytes)
+                    .map_err(|_parse_error| Pkcs15Error::InvalidData("EF.AOD"));
+            }
+            Err(Pkcs15Error::Status(StatusWord::FileNotFound)) => {}
+            Err(error) => return Err(error),
+        }
+        let odf = self.read_object_directory(&aid)?;
+        let Some(paths) = odf.plain_file_paths(ObjectClass::AuthObjects) else {
+            return Err(Pkcs15Error::Status(StatusWord::FileNotFound));
+        };
+        let owned_paths: Vec<Pkcs15Path> = paths.into_iter().cloned().collect();
+        let mut aod_list = Vec::with_capacity(owned_paths.len());
+        for path in &owned_paths {
+            if !path.is_absolute_from_mf() {
+                self.select_application(&aid)?;
+            }
+            aod_list.push(self.read_authentication_objects_at(path)?);
+        }
+        self.select_application(&aid)?;
+        Ok(AuthenticationObjects::merge(aod_list))
+    }
+
+    /// Read and parse EF.TokenInfo under `aid`.
+    ///
+    /// # Errors
+    ///
+    /// SELECT or read failures, or a token-info file whose outer
+    /// structure does not decode.
+    fn read_token_info_in_application(
+        &mut self,
+        aid: &Aid,
+    ) -> Result<crate::TokenInfo, Pkcs15Error<Self::Error>>
+    where
+        Self: Sized,
+    {
+        self.select_application(aid)?;
+        self.select_ef(EF_TOKEN_INFO_FID)?;
+        let bytes = self.read_binary_der_object("EF.TokenInfo")?;
+        crate::TokenInfo::parse(&bytes)
+            .map_err(|_parse_error| Pkcs15Error::InvalidData("EF.TokenInfo"))
+    }
+
+    /// Read and parse EF.TokenInfo under the standard [`PKCS15_AID`].
     ///
     /// # Errors
     ///
@@ -749,11 +1290,8 @@ pub trait Pkcs15Ops: CardTransport {
     where
         Self: Sized,
     {
-        self.select_pkcs15_application()?;
-        self.select_ef(EF_TOKEN_INFO_FID)?;
-        let bytes = self.read_binary_der_object("EF.TokenInfo")?;
-        crate::TokenInfo::parse(&bytes)
-            .map_err(|_parse_error| Pkcs15Error::InvalidData("EF.TokenInfo"))
+        let aid = Aid::from_slice(PKCS15_AID).map_err(Pkcs15Error::Aid)?;
+        self.read_token_info_in_application(&aid)
     }
 
     /// Read the Estonian document number the card body prints. The
@@ -808,18 +1346,19 @@ pub trait Pkcs15Ops: CardTransport {
 
 impl<T: CardTransport + ?Sized> Pkcs15Ops for T {}
 
-/// Issue one READ BINARY at `offset` for `want` bytes. At offset zero,
-/// if the card answers an overlong request over a small EF with
-/// [`StatusWord::EndOfFile`] and no body, retry once with
-/// [`READ_LE_256`], the full short-response window.
+/// Issue one READ BINARY at `offset` for `want` bytes. If the card
+/// answers a specific-length request (`want != 00`) with
+/// [`StatusWord::EndOfFile`] and no body -- as observed on 2025
+/// Estonian eID cards whenever fewer than `want` bytes remain at any
+/// offset -- retry once at the same offset with [`READ_LE_256`], the
+/// full short-response window.
 fn read_chunk_with_eof_retry<T: CardTransport + ?Sized>(
     transport: &mut T,
     offset: usize,
     want: u8,
 ) -> Result<ResponseApdu, Pkcs15Error<T::Error>> {
     let response = read_chunk(transport, offset, want)?;
-    if offset == 0
-        && want != READ_LE_256
+    if want != READ_LE_256
         && response.body.is_empty()
         && matches!(response.status_word(), StatusWord::EndOfFile)
     {

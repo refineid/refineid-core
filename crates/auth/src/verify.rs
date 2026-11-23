@@ -35,15 +35,18 @@
 //! that has already read the counter for a purpose of its own may apply
 //! the same rule first, to refuse before it asks for the PIN.
 
+use core::fmt;
+
 use refineid_apdu::{
     ApduClass, CREDENTIAL_BODY_MAX, CardTransport, CommandApdu, CommandHeader, CredentialBody,
     CredentialBodyError, CredentialCommand, PinRetries, StatusWord, TransportOutcome,
     UnvalidatedCredentialBlock,
 };
+use refineid_pkcs15::{PasswordLengthRange, PasswordObject};
 
-use crate::credentials::{Pin1, Pin2};
+use crate::credentials::{CredentialRole, Pin1, Pin2};
 use crate::pin_lengths::PinLengthRefusal;
-use crate::retry_risk::{RetryFloorRefusal, check_last_tries_with_scheme};
+use crate::retry_risk::{FlooredCredential, RetryFloorRefusal, check_last_tries_with_scheme};
 
 /// Citizen-card PIN1 reference: the global authentication PIN (FINEID S1
 /// v4.2 section 3.5.2).
@@ -99,9 +102,19 @@ pub const FINEID_PAD_OCTET: u8 = 0x00;
 /// padding after a shorter value.
 pub const ESTONIAN_EID_PAD_OCTET: u8 = 0x00;
 
+/// Number of credential blocks carried by a two-group management
+/// command (CHANGE REFERENCE DATA or RESET RETRY COUNTER).
+const TWO_CREDENTIAL_BLOCKS: usize = 2;
+
+/// Maximum padded single-PIN block length supported by credential
+/// commands (half of [`CREDENTIAL_BODY_MAX`] so both single-block
+/// VERIFY and two-block CHANGE / UNBLOCK commands fit without
+/// truncation).
+pub const MAX_PADDED_PIN_BLOCK_LENGTH: usize = CREDENTIAL_BODY_MAX / TWO_CREDENTIAL_BLOCKS;
+
 /// The octet a card expects to the right of the typed digits in a
-/// credential block. Each profile names its own; no caller supplies a bare
-/// octet.
+/// credential block. Constructed only from specification constants or a
+/// parsed EF.AOD [`PasswordObject`]; no caller supplies a bare octet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PinPadByte(u8);
 
@@ -112,10 +125,176 @@ impl PinPadByte {
     /// GED24035, the Estonian eID profile.
     pub const ESTONIAN_EID: Self = Self(ESTONIAN_EID_PAD_OCTET);
 
+    /// Construct from the `padChar` published by a parsed EF.AOD
+    /// [`PasswordObject`], or `None` when EF.AOD omitted `padChar`.
+    #[must_use]
+    pub const fn from_password_object(object: &PasswordObject) -> Option<Self> {
+        match object.pad_char() {
+            Some(octet) => Some(Self(octet)),
+            None => None,
+        }
+    }
+
     /// The wire octet this profile fills with.
     #[must_use]
     pub const fn octet(self) -> u8 {
         self.0
+    }
+}
+
+/// Wire encoding of one PIN or PUK block inside a credential APDU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinBlockEncoding {
+    /// Bare typed digits at their own length (no padding).
+    Bare,
+    /// Typed digits right-padded with `pad` to `stored_length` octets.
+    Padded {
+        /// Stored block length in octets
+        /// (`1..=MAX_PADDED_PIN_BLOCK_LENGTH`).
+        stored_length: u8,
+        /// Pad octet from the card's EF.AOD (or FINEID specification).
+        pad: PinPadByte,
+    },
+}
+
+/// Why a parsed EF.AOD [`PasswordObject`] could not be turned into
+/// [`CardPinParameters`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AodPinParametersError {
+    /// `pwdFlags` set `needs-padding`, but EF.AOD omitted `padChar`.
+    MissingPadChar,
+    /// `pwdFlags` cleared `needs-padding`, yet EF.AOD still supplied
+    /// `padChar`; refused rather than guessing whether to pad.
+    ConflictingPaddingFlags,
+    /// `storedLength` is zero, smaller than the accepted maximum digit
+    /// length, or exceeds [`MAX_PADDED_PIN_BLOCK_LENGTH`].
+    InvalidStoredLength {
+        /// The `storedLength` published by the card.
+        stored_length: u8,
+    },
+}
+
+impl fmt::Display for AodPinParametersError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingPadChar => {
+                f.write_str("EF.AOD password object sets needs-padding without padChar")
+            }
+            Self::ConflictingPaddingFlags => {
+                f.write_str("EF.AOD password object clears needs-padding while publishing padChar")
+            }
+            Self::InvalidStoredLength { stored_length } => write!(
+                f,
+                "EF.AOD storedLength {stored_length} is incompatible with accepted length bounds"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for AodPinParametersError {}
+
+/// Validated card-side wire parameters for one PIN or PUK object,
+/// derived from the card's parsed EF.AOD [`PasswordObject`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CardPinParameters {
+    scheme: PinReferenceScheme,
+    reference: u8,
+    lengths: PasswordLengthRange,
+    encoding: PinBlockEncoding,
+}
+
+impl CardPinParameters {
+    /// Validate a parsed EF.AOD [`PasswordObject`] into wire-ready
+    /// credential parameters for `scheme`.
+    ///
+    /// Fails closed if `needs-padding` is set without `padChar`, if
+    /// `needs-padding` is clear while `padChar` is present, or if a
+    /// padded `storedLength` is zero, shorter than `lengths.max()`, or
+    /// above [`MAX_PADDED_PIN_BLOCK_LENGTH`].
+    ///
+    /// # Errors
+    ///
+    /// [`AodPinParametersError`] on missing, conflicting, or
+    /// out-of-bounds padding attributes.
+    pub fn from_aod(
+        scheme: PinReferenceScheme,
+        object: &PasswordObject,
+    ) -> Result<Self, AodPinParametersError> {
+        let encoding = if object.flags().needs_padding() {
+            let Some(pad) = PinPadByte::from_password_object(object) else {
+                return Err(AodPinParametersError::MissingPadChar);
+            };
+            let stored = usize::from(object.stored_length());
+            if stored == 0
+                || stored > MAX_PADDED_PIN_BLOCK_LENGTH
+                || object.lengths().max() > stored
+            {
+                return Err(AodPinParametersError::InvalidStoredLength {
+                    stored_length: object.stored_length(),
+                });
+            }
+            PinBlockEncoding::Padded {
+                stored_length: object.stored_length(),
+                pad,
+            }
+        } else {
+            if object.pad_char().is_some() {
+                return Err(AodPinParametersError::ConflictingPaddingFlags);
+            }
+            PinBlockEncoding::Bare
+        };
+        Ok(Self {
+            scheme,
+            reference: object.reference(),
+            lengths: object.lengths(),
+            encoding,
+        })
+    }
+
+    /// Retry-scale and protocol scheme associated with this card.
+    #[must_use]
+    pub const fn scheme(self) -> PinReferenceScheme {
+        self.scheme
+    }
+
+    /// VERIFY / CHANGE / RESET P2 reference byte from EF.AOD.
+    #[must_use]
+    pub const fn reference(self) -> u8 {
+        self.reference
+    }
+
+    /// Accepted digit-length range from EF.AOD.
+    #[must_use]
+    pub const fn lengths(self) -> PasswordLengthRange {
+        self.lengths
+    }
+
+    /// Wire block encoding (padded with `storedLength` + `padChar`, or
+    /// bare typed digits) from EF.AOD.
+    #[must_use]
+    pub const fn encoding(self) -> PinBlockEncoding {
+        self.encoding
+    }
+
+    /// Verify that `digit_count` lies within [`Self::lengths`].
+    ///
+    /// # Errors
+    ///
+    /// [`PinLengthRefusal::OutsideAcceptedRange`] when `digit_count`
+    /// falls outside the card's published range.
+    pub const fn check_length(
+        self,
+        role: CredentialRole,
+        digit_count: usize,
+    ) -> Result<(), PinLengthRefusal> {
+        if self.lengths.contains(digit_count) {
+            Ok(())
+        } else {
+            Err(PinLengthRefusal::OutsideAcceptedRange {
+                role,
+                accepted: self.lengths,
+            })
+        }
     }
 }
 
@@ -318,53 +497,113 @@ pub const fn classify_pin_status_sw(sw: StatusWord) -> PinStatus {
     }
 }
 
-/// Largest credential body this crate assembles: two stored-length
-/// blocks, as a CHANGE REFERENCE DATA (current, new) or a citizen RESET
-/// RETRY COUNTER (unblocking code, new) carries.
+/// Write each `(digits, encoding)` group into `out`, failing closed if
+/// any padded group exceeds its `stored_length` or if the combined
+/// length exceeds [`CREDENTIAL_BODY_MAX`].
+pub(crate) fn write_credential_groups(
+    groups: &[(&[u8], PinBlockEncoding)],
+    out: &mut [u8; CREDENTIAL_BODY_MAX],
+) -> Result<usize, CredentialBodyError> {
+    out.fill(0);
+    let mut total = 0_usize;
+    for &(digits, encoding) in groups {
+        match encoding {
+            PinBlockEncoding::Padded { stored_length, pad } => {
+                let block_len = usize::from(stored_length);
+                if block_len == 0 {
+                    return Err(CredentialBodyError::Empty);
+                }
+                if digits.len() > block_len {
+                    return Err(CredentialBodyError::TooLong);
+                }
+                let end = total
+                    .checked_add(block_len)
+                    .filter(|&len| len <= CREDENTIAL_BODY_MAX)
+                    .ok_or(CredentialBodyError::TooLong)?;
+                out[total..end].fill(pad.octet());
+                out[total..total + digits.len()].copy_from_slice(digits);
+                total = end;
+            }
+            PinBlockEncoding::Bare => {
+                let end = total
+                    .checked_add(digits.len())
+                    .filter(|&len| len <= CREDENTIAL_BODY_MAX)
+                    .ok_or(CredentialBodyError::TooLong)?;
+                out[total..end].copy_from_slice(digits);
+                total = end;
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Stored length as a single octet for fixed-profile encoding.
+const PIN_STORED_LENGTH_U8: u8 = 12;
+
+/// Default block encoding for a fixed [`PinReferenceScheme`] and pad
+/// byte.
+const fn scheme_encoding(scheme: PinReferenceScheme, pad: PinPadByte) -> PinBlockEncoding {
+    const { assert!(PIN_STORED_LENGTH_U8 as usize == PIN_STORED_LENGTH) };
+    match scheme {
+        PinReferenceScheme::Citizen | PinReferenceScheme::Estonian => PinBlockEncoding::Padded {
+            stored_length: PIN_STORED_LENGTH_U8,
+            pad,
+        },
+        PinReferenceScheme::Organizational => PinBlockEncoding::Bare,
+    }
+}
+
+/// Largest credential body assembled in unit tests: two stored-length
+/// blocks.
+#[cfg(test)]
 pub(crate) const CREDENTIAL_BODY_SCRATCH: usize = 2 * PIN_STORED_LENGTH;
 
-/// Write each digit group as a `scheme`-shaped credential block into
-/// `out`, returning the total byte count the card compares.
-///
-/// The citizen card compares a block right-padded with the pad byte to
-/// the stored length (FINEID S1 v4.2 section 3.5); the organizational
-/// card compares the bare typed digits at their own length, because it
-/// publishes no padding and a padded block would fail the comparison and
-/// spend a retry. `out` must be pre-filled with the pad byte so the
-/// citizen padding falls out of the untouched tail.
-///
-/// The organizational card delimits a two-group field itself. IAS ECC
-/// v1.0.1 section 9.4.2 defines the CHANGE REFERENCE DATA data field as
-/// `Current Password || New reference data` under P1 `00` alone, and
-/// states the processing rule: the card retrieves the current length L
-/// from the stored PIN object, takes the first L bytes of the data field
-/// as the current password, and takes the rest as the new one, with
-/// `Lnew = Lc - Lold`. The stored length is the typed length of the
-/// current credential, so the groups are written back to back with no
-/// padding and no length prefix. FINEID S4-2 v4.0 sections 4.3.1 and
-/// 4.3.3 define no field layout of their own. Each group is a validated
-/// [`Pin1`], [`Pin2`] or PUK, so its length is already within the role's
-/// bounds on either numbering.
+#[cfg(test)]
 pub(crate) fn write_credential_blocks(
     scheme: PinReferenceScheme,
     groups: &[&[u8]],
     pad: PinPadByte,
     out: &mut [u8; CREDENTIAL_BODY_MAX],
-) -> usize {
-    // The two stored-length blocks this assembles must fit the wire
-    // credential body buffer the transport layer holds.
+) -> Result<usize, CredentialBodyError> {
     const { assert!(CREDENTIAL_BODY_SCRATCH <= CREDENTIAL_BODY_MAX) };
-    out.fill(pad.octet());
-    let mut total = 0;
-    for group in groups {
-        let copy_len = group.len().min(PIN_STORED_LENGTH);
-        out[total..total + copy_len].copy_from_slice(&group[..copy_len]);
-        total += match scheme {
-            PinReferenceScheme::Citizen | PinReferenceScheme::Estonian => PIN_STORED_LENGTH,
-            PinReferenceScheme::Organizational => copy_len,
-        };
+    if groups.len() > TWO_CREDENTIAL_BLOCKS {
+        return Err(CredentialBodyError::TooLong);
     }
-    total
+    let encoding = scheme_encoding(scheme, pad);
+    let mut pairs: [(&[u8], PinBlockEncoding); TWO_CREDENTIAL_BLOCKS] =
+        [(&[], encoding), (&[], encoding)];
+    for (slot, &group) in pairs.iter_mut().zip(groups.iter()) {
+        *slot = (group, encoding);
+    }
+    write_credential_groups(&pairs[..groups.len()], out)
+}
+
+/// Assemble `(digits, encoding)` groups into one credential command
+/// under `header`, transmit it once, and return the card's status word.
+///
+/// # Errors
+///
+/// [`AuthError`] on a command-assembly failure, a transport failure, or
+/// a transport state transition.
+pub(crate) fn credential_exchange_groups<T: CardTransport + ?Sized>(
+    transport: &mut T,
+    header: CommandHeader,
+    groups: &[(&[u8], PinBlockEncoding)],
+) -> Result<StatusWord, AuthError<T::Error>> {
+    let mut block = UnvalidatedCredentialBlock::zeroed();
+    let total = write_credential_groups(groups, block.buffer()).map_err(AuthError::Command)?;
+    block.set_filled(total);
+    let body = match CredentialBody::from_block(block) {
+        Ok(body) => body,
+        Err(error) => return Err(AuthError::Command(error)),
+    };
+    let command = CredentialCommand::assemble(header, body);
+    let response = transport
+        .transmit_credential(command)
+        .map_err(AuthError::Transport)?
+        .into_response()
+        .map_err(AuthError::Outcome)?;
+    Ok(response.status_word())
 }
 
 /// Assemble the credential blocks for `groups` into one credential
@@ -382,23 +621,12 @@ pub(crate) fn credential_exchange<T: CardTransport + ?Sized>(
     header: CommandHeader,
     groups: &[&[u8]],
 ) -> Result<StatusWord, AuthError<T::Error>> {
-    // The block owns the assembled credential octets in a zeroizing
-    // buffer. The writer fills it with the profile's pad byte, so the
-    // padding falls out of the untouched tail.
-    let mut block = UnvalidatedCredentialBlock::zeroed();
-    let total = write_credential_blocks(scheme, groups, pad, block.buffer());
-    block.set_filled(total);
-    let body = match CredentialBody::from_block(block) {
-        Ok(body) => body,
-        Err(error) => return Err(AuthError::Command(error)),
-    };
-    let command = CredentialCommand::assemble(header, body);
-    let response = transport
-        .transmit_credential(command)
-        .map_err(AuthError::Transport)?
-        .into_response()
-        .map_err(AuthError::Outcome)?;
-    Ok(response.status_word())
+    let encoding = scheme_encoding(scheme, pad);
+    let mut pairs: Vec<(&[u8], PinBlockEncoding)> = Vec::with_capacity(groups.len());
+    for &group in groups {
+        pairs.push((group, encoding));
+    }
+    credential_exchange_groups(transport, header, &pairs)
 }
 
 /// Apply the retry floor to `status`, the counter-safe reading of `slot`,
@@ -473,6 +701,30 @@ pub(crate) fn verify_digits<T: CardTransport + ?Sized>(
     };
     let status = credential_exchange(transport, scheme, scheme.pad(), header, &[digits])?;
     Ok(classify_verify_sw(status))
+}
+
+/// Send the counter-safe VERIFY status probe for a validated credential
+/// reference byte and return the raw status word.
+///
+/// Crate-private so public callers reach status probes only through
+/// typed [`PinReferenceScheme`]/[`PinSlot`] or [`CardPinParameters`]
+/// borders.
+pub(crate) fn probe_status_word_for_reference<T: CardTransport + ?Sized>(
+    transport: &mut T,
+    reference: u8,
+) -> Result<StatusWord, AuthError<T::Error>> {
+    let command = CommandApdu::case_1(CommandHeader {
+        class: ApduClass::Plain,
+        instruction: VERIFY_INS,
+        p1: VERIFY_P1,
+        p2: reference,
+    });
+    let response = transport
+        .transmit(&command)
+        .map_err(AuthError::Transport)?
+        .into_response()
+        .map_err(AuthError::Outcome)?;
+    Ok(response.status_word())
 }
 
 /// PIN management operations, layered as default methods on every
@@ -667,6 +919,64 @@ pub trait PinOps: CardTransport {
         ))
     }
 
+    /// VERIFY PIN1 using validated card parameters derived from the
+    /// card's parsed EF.AOD ([`CardPinParameters::from_aod`]).
+    ///
+    /// Checks `pin` against `parameters.lengths()`, probes the card's
+    /// counter under `parameters.reference()`, enforces the retry floor
+    /// on `parameters.scheme()`, and encodes the credential block using
+    /// `parameters.encoding()` (`storedLength` + `padChar`, or bare
+    /// typed digits).
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::PinLength`] when `pin` falls outside the card's
+    /// EF.AOD length range, [`AuthError::RetryFloor`] when the retry
+    /// floor refuses the attempt, or transport / command failures.
+    fn verify_pin1_with_parameters(
+        &mut self,
+        parameters: &CardPinParameters,
+        pin: Pin1,
+    ) -> Result<VerifyOutcome, AuthError<Self::Error>>
+    where
+        Self: Sized,
+    {
+        parameters
+            .check_length(CredentialRole::Pin1, pin.digit_count())
+            .map_err(AuthError::PinLength)?;
+        let status = self.pin_status_for_parameters(parameters)?;
+        check_last_tries_with_scheme(FlooredCredential::Pin1, status, parameters.scheme())
+            .map_err(AuthError::RetryFloor)?;
+        let header = CommandHeader {
+            class: ApduClass::Plain,
+            instruction: VERIFY_INS,
+            p1: VERIFY_P1,
+            p2: parameters.reference(),
+        };
+        let sw =
+            credential_exchange_groups(self, header, &[(pin.digits(), parameters.encoding())])?;
+        Ok(classify_verify_sw(sw))
+    }
+
+    /// Probe the retry state of the credential described by
+    /// `parameters` without decrementing any counter.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError`] on a transport failure or state transition.
+    fn pin_status_for_parameters(
+        &mut self,
+        parameters: &CardPinParameters,
+    ) -> Result<PinStatus, AuthError<Self::Error>>
+    where
+        Self: Sized,
+    {
+        Ok(classify_pin_status_sw(probe_status_word_for_reference(
+            self,
+            parameters.reference(),
+        )?))
+    }
+
     /// Send the counter-safe VERIFY status probe and return the raw
     /// status word.
     ///
@@ -681,18 +991,7 @@ pub trait PinOps: CardTransport {
     where
         Self: Sized,
     {
-        let command = CommandApdu::case_1(CommandHeader {
-            class: ApduClass::Plain,
-            instruction: VERIFY_INS,
-            p1: VERIFY_P1,
-            p2: scheme.reference(slot),
-        });
-        let response = self
-            .transmit(&command)
-            .map_err(AuthError::Transport)?
-            .into_response()
-            .map_err(AuthError::Outcome)?;
-        Ok(response.status_word())
+        probe_status_word_for_reference(self, scheme.reference(slot))
     }
 }
 
@@ -1019,7 +1318,8 @@ mod tests {
             &[b"1234"],
             PinPadByte::FINEID,
             &mut citizen,
-        );
+        )
+        .expect("valid citizen block");
         assert_eq!(citizen_total, PIN_STORED_LENGTH);
         assert_eq!(&citizen[..PIN_FIXTURE_LEN], b"1234");
         assert!(
@@ -1034,7 +1334,8 @@ mod tests {
             &[b"1234"],
             PinPadByte::FINEID,
             &mut organizational,
-        );
+        )
+        .expect("valid organizational block");
         assert_eq!(org_total, PIN_FIXTURE_LEN);
         assert_eq!(&organizational[..PIN_FIXTURE_LEN], b"1234");
     }
@@ -1047,7 +1348,8 @@ mod tests {
             &[b"1234", b"567890"],
             PinPadByte::FINEID,
             &mut body,
-        );
+        )
+        .expect("valid two-block body");
         assert_eq!(total, CREDENTIAL_BODY_SCRATCH);
         assert_eq!(&body[..PIN_FIXTURE_LEN], b"1234");
         assert_eq!(
@@ -1330,13 +1632,226 @@ mod profile_pad_tests {
             &[TEST_PIN1],
             PinPadByte::ESTONIAN_EID,
             &mut body,
-        );
+        )
+        .expect("valid Estonian block");
         assert_eq!(total, PIN_STORED_LENGTH);
         assert_eq!(&body[..TEST_PIN1.len()], TEST_PIN1);
         assert!(
             body[TEST_PIN1.len()..PIN_STORED_LENGTH]
                 .iter()
                 .all(|&byte| byte == PinPadByte::ESTONIAN_EID.octet())
+        );
+    }
+
+    #[test]
+    fn card_pin_parameters_enforce_aod_padding_and_drive_custom_wire_encoding() {
+        use refineid_apdu::{
+            ApduClass, CardTransport, CommandApdu, CredentialCommand, PinRetries, ResponseApdu,
+            StatusWord, TransportOutcome,
+        };
+        use refineid_ber::{BerEncoder, BerTag, BitString, Integer, OctetString, Sequence, tlv};
+        use refineid_pkcs15::AuthenticationObjects;
+
+        use super::{
+            AodPinParametersError, CardPinParameters, PinBlockEncoding, PinOps, VERIFY_INS,
+            VERIFY_P1, VerifyOutcome,
+        };
+        use crate::credentials::{Pin1, UnvalidatedSecret};
+
+        const ENUMERATED_TAG: u8 = 0x0A;
+        const TYPE_ATTRIBUTES_TAG: u8 = 0xA1;
+        const PWD_REFERENCE_TAG: u8 = 0x80;
+        const ASCII_NUMERIC: u8 = 1;
+        const NEEDS_PADDING_FLAGS: &[u8] = &[0x04, 0xCC, 0x10];
+        const BARE_FLAGS: &[u8] = &[0x00, 0x00];
+        const CUSTOM_REF: u8 = 0x84;
+        const CUSTOM_MIN: u8 = 5;
+        const CUSTOM_STORED: u8 = 8;
+        const CUSTOM_PAD: u8 = 0xFF;
+        const OVERSIZED_STORED: u8 = 16;
+        const THREE_TRIES: u8 = 3;
+        const HEADER_AND_LC_LEN: usize = 5;
+        const FIVE_DIGITS: &[u8] = b"54321";
+        const FOUR_DIGITS: &[u8] = b"1234";
+        const UNSIGNED_PREFIX: u8 = 0x00;
+
+        let build_aod = |flags: &[u8], min: u8, stored: u8, pad: Option<u8>| {
+            let mut attrs = BerEncoder::default();
+            attrs
+                .push_tlv(
+                    u8::try_from(<BitString as BerTag>::TAG).expect("fits"),
+                    flags,
+                )
+                .expect("encodes");
+            attrs
+                .push_tlv(ENUMERATED_TAG, [ASCII_NUMERIC])
+                .expect("encodes");
+            attrs
+                .push_tlv(u8::try_from(<Integer as BerTag>::TAG).expect("fits"), [min])
+                .expect("encodes");
+            attrs
+                .push_tlv(
+                    u8::try_from(<Integer as BerTag>::TAG).expect("fits"),
+                    [stored],
+                )
+                .expect("encodes");
+            attrs
+                .push_tlv(PWD_REFERENCE_TAG, [UNSIGNED_PREFIX, CUSTOM_REF])
+                .expect("encodes");
+            if let Some(byte) = pad {
+                attrs
+                    .push_tlv(
+                        u8::try_from(<OctetString as BerTag>::TAG).expect("fits"),
+                        [byte],
+                    )
+                    .expect("encodes");
+            }
+            let seq_tag = u8::try_from(<Sequence as BerTag>::TAG).expect("fits");
+            let typed = tlv(
+                TYPE_ATTRIBUTES_TAG,
+                tlv(seq_tag, attrs.finish()).expect("encodes"),
+            )
+            .expect("encodes");
+            let raw = tlv(seq_tag, typed).expect("encodes");
+            AuthenticationObjects::parse(&raw).expect("AOD parses")
+        };
+
+        // needs-padding without padChar must fail closed.
+        let missing_pad = build_aod(NEEDS_PADDING_FLAGS, CUSTOM_MIN, CUSTOM_STORED, None);
+        assert_eq!(
+            CardPinParameters::from_aod(PinReferenceScheme::Estonian, &missing_pad.passwords()[0]),
+            Err(AodPinParametersError::MissingPadChar)
+        );
+
+        // needs-padding clear with padChar present must fail closed.
+        let conflicting = build_aod(BARE_FLAGS, CUSTOM_MIN, CUSTOM_STORED, Some(CUSTOM_PAD));
+        assert_eq!(
+            CardPinParameters::from_aod(PinReferenceScheme::Estonian, &conflicting.passwords()[0]),
+            Err(AodPinParametersError::ConflictingPaddingFlags)
+        );
+
+        // storedLength exceeding credential block capacity must fail closed.
+        let oversized = build_aod(
+            NEEDS_PADDING_FLAGS,
+            CUSTOM_MIN,
+            OVERSIZED_STORED,
+            Some(CUSTOM_PAD),
+        );
+        assert_eq!(
+            CardPinParameters::from_aod(PinReferenceScheme::Estonian, &oversized.passwords()[0]),
+            Err(AodPinParametersError::InvalidStoredLength {
+                stored_length: OVERSIZED_STORED,
+            })
+        );
+
+        // Bare (unpadded) EF.AOD object produces Bare encoding.
+        let bare = build_aod(BARE_FLAGS, CUSTOM_MIN, CUSTOM_STORED, None);
+        let bare_params =
+            CardPinParameters::from_aod(PinReferenceScheme::Organizational, &bare.passwords()[0])
+                .expect("bare AOD object builds parameters");
+        assert_eq!(bare_params.encoding(), PinBlockEncoding::Bare);
+
+        // Custom stored length (8) + custom padChar (FF) + custom reference (84).
+        let custom = build_aod(
+            NEEDS_PADDING_FLAGS,
+            CUSTOM_MIN,
+            CUSTOM_STORED,
+            Some(CUSTOM_PAD),
+        );
+        let params =
+            CardPinParameters::from_aod(PinReferenceScheme::Estonian, &custom.passwords()[0])
+                .expect("valid padded AOD object builds parameters");
+
+        struct Recorder {
+            plain: Option<Vec<u8>>,
+            credential: Option<Vec<u8>>,
+        }
+        impl CardTransport for Recorder {
+            type Error = &'static str;
+
+            fn transmit(&mut self, command: &CommandApdu) -> Result<TransportOutcome, Self::Error> {
+                self.plain = Some(command.as_bytes().to_vec());
+                let sw = StatusWord::PinIncorrect {
+                    retries: PinRetries::from_nibble(THREE_TRIES).expect("fits"),
+                };
+                let [sw1, sw2] = sw.as_u16().to_be_bytes();
+                Ok(TransportOutcome::Response(ResponseApdu {
+                    body: Vec::new(),
+                    sw1,
+                    sw2,
+                }))
+            }
+
+            fn transmit_credential(
+                &mut self,
+                command: CredentialCommand,
+            ) -> Result<TransportOutcome, Self::Error> {
+                self.credential = Some(command.expose_wire(<[u8]>::to_vec));
+                let [sw1, sw2] = StatusWord::Success.as_u16().to_be_bytes();
+                Ok(TransportOutcome::Response(ResponseApdu {
+                    body: Vec::new(),
+                    sw1,
+                    sw2,
+                }))
+            }
+        }
+
+        // A 4-digit PIN below the card's EF.AOD minLength (5) is refused with zero APDUs.
+        let mut short_card = Recorder {
+            plain: None,
+            credential: None,
+        };
+        let short_pin =
+            Pin1::reconstruct(UnvalidatedSecret::from_owned_bytes(FOUR_DIGITS.to_vec()))
+                .expect("valid Pin1");
+        assert!(matches!(
+            short_card.verify_pin1_with_parameters(&params, short_pin),
+            Err(super::AuthError::PinLength(_))
+        ));
+        assert!(short_card.plain.is_none());
+        assert!(short_card.credential.is_none());
+
+        // A 5-digit PIN transmits P2=84 with an 8-byte FF-padded body.
+        let mut card = Recorder {
+            plain: None,
+            credential: None,
+        };
+        let pin = Pin1::reconstruct(UnvalidatedSecret::from_owned_bytes(FIVE_DIGITS.to_vec()))
+            .expect("valid Pin1");
+        assert_eq!(
+            card.verify_pin1_with_parameters(&params, pin)
+                .expect("verify succeeds"),
+            VerifyOutcome::Ok
+        );
+        assert_eq!(
+            card.plain,
+            Some(vec![
+                ApduClass::Plain.as_byte(),
+                VERIFY_INS,
+                VERIFY_P1,
+                CUSTOM_REF
+            ])
+        );
+        let wire = card.credential.expect("credential transmitted");
+        assert_eq!(wire.len(), HEADER_AND_LC_LEN + usize::from(CUSTOM_STORED));
+        assert_eq!(
+            &wire[..HEADER_AND_LC_LEN],
+            &[
+                ApduClass::Plain.as_byte(),
+                VERIFY_INS,
+                VERIFY_P1,
+                CUSTOM_REF,
+                CUSTOM_STORED
+            ]
+        );
+        assert_eq!(
+            &wire[HEADER_AND_LC_LEN..HEADER_AND_LC_LEN + FIVE_DIGITS.len()],
+            FIVE_DIGITS
+        );
+        assert!(
+            wire[HEADER_AND_LC_LEN + FIVE_DIGITS.len()..]
+                .iter()
+                .all(|&byte| byte == CUSTOM_PAD)
         );
     }
 }

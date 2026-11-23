@@ -47,8 +47,8 @@ use std::sync::{Arc, Weak};
 
 use refineid_apdu::{TransportErrorExt, TransportErrorKind, TransportOutcome};
 use refineid_auth::{
-    AuthError, Pin1, PinReferenceScheme, PinStatus, UnvalidatedSecret, VerifyOutcome,
-    pin1_status_permits_reusable_cache,
+    AuthError, CardPinParameters, Pin1, PinReferenceScheme, PinStatus, UnvalidatedSecret,
+    VerifyOutcome, pin1_status_permits_reusable_cache,
 };
 use refineid_pkcs15::TokenSerial;
 use refineid_sign::SignError;
@@ -56,14 +56,27 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::pin::PinBytes;
 
+/// Credential-parameter binding for a held positive PIN1 entry.
+///
+/// FINEID cards bind to their resolved [`PinReferenceScheme`];
+/// ISO/IEC 7816-15 directory-discovered cards bind to the exact
+/// [`CardPinParameters`] (scheme, `pwdReference`, length range,
+/// `storedLength`, and `padChar`), so a PIN accepted under one EF.AOD
+/// wire encoding can never be replayed under another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinCacheBinding {
+    Scheme(PinReferenceScheme),
+    Parameters(CardPinParameters),
+}
+
 struct CachedPin1 {
     serial: TokenSerial,
     /// The reader's card insertion and removal count when the card
     /// accepted the value.
     card_events: u32,
-    /// The credential numbering and retry-limit scale of the card that
-    /// accepted the value.
-    scheme: PinReferenceScheme,
+    /// The credential scheme or exact EF.AOD parameters under which
+    /// the card accepted the value.
+    binding: PinCacheBinding,
     pin: PinBytes,
     generation: u64,
 }
@@ -283,6 +296,36 @@ impl PinSafetyCache {
         scheme: PinReferenceScheme,
         pin: PinBytes,
     ) -> Result<(), PreviouslyRejectedPin> {
+        self.store_pin1_bound(serial, card_events, PinCacheBinding::Scheme(scheme), pin)
+    }
+
+    /// Hold a PIN1 accepted under exact EF.AOD [`CardPinParameters`].
+    ///
+    /// # Errors
+    /// Returns [`PreviouslyRejectedPin`] if this PIN was previously
+    /// recorded as rejected.
+    pub fn store_pin1_with_parameters(
+        &mut self,
+        serial: TokenSerial,
+        card_events: u32,
+        parameters: CardPinParameters,
+        pin: PinBytes,
+    ) -> Result<(), PreviouslyRejectedPin> {
+        self.store_pin1_bound(
+            serial,
+            card_events,
+            PinCacheBinding::Parameters(parameters),
+            pin,
+        )
+    }
+
+    fn store_pin1_bound(
+        &mut self,
+        serial: TokenSerial,
+        card_events: u32,
+        binding: PinCacheBinding,
+        pin: PinBytes,
+    ) -> Result<(), PreviouslyRejectedPin> {
         if self.is_rejected(&serial, &pin) {
             return Err(PreviouslyRejectedPin);
         }
@@ -290,7 +333,7 @@ impl PinSafetyCache {
         self.positive_pin1 = Some(CachedPin1 {
             serial,
             card_events,
-            scheme,
+            binding,
             pin,
             generation: self.generation,
         });
@@ -323,10 +366,48 @@ impl PinSafetyCache {
         scheme: PinReferenceScheme,
         live: PinStatus,
     ) -> Option<CheckedOutPin1> {
+        self.checkout_pin1_bound(
+            serial,
+            card_events,
+            PinCacheBinding::Scheme(scheme),
+            scheme,
+            live,
+        )
+    }
+
+    /// Check out the held PIN1 bound to exact EF.AOD
+    /// [`CardPinParameters`]. Any mismatch in scheme, `pwdReference`,
+    /// length range, `storedLength`, or `padChar` destroys the held
+    /// value.
+    #[must_use]
+    pub fn checkout_pin1_with_parameters(
+        &mut self,
+        serial: &TokenSerial,
+        card_events: u32,
+        parameters: CardPinParameters,
+        live: PinStatus,
+    ) -> Option<CheckedOutPin1> {
+        self.checkout_pin1_bound(
+            serial,
+            card_events,
+            PinCacheBinding::Parameters(parameters),
+            parameters.scheme(),
+            live,
+        )
+    }
+
+    fn checkout_pin1_bound(
+        &mut self,
+        serial: &TokenSerial,
+        card_events: u32,
+        binding: PinCacheBinding,
+        scheme: PinReferenceScheme,
+        live: PinStatus,
+    ) -> Option<CheckedOutPin1> {
         let entry = self.positive_pin1.take()?;
         let usable = &entry.serial == serial
             && entry.card_events == card_events
-            && entry.scheme == scheme
+            && entry.binding == binding
             && pin1_status_permits_reusable_cache(live, scheme);
         if !usable {
             return None;
@@ -1040,5 +1121,101 @@ mod tests {
         assert!(cache.holds_pin1());
         completed(accepted, &mut cache);
         assert!(cache.holds_pin1());
+    }
+
+    #[test]
+    fn parameter_mismatch_destroys_directory_held_pin1() {
+        let aod_with = |reference: u8, stored: u8, pad: u8| {
+            let tlv = |tag: u8, body: &[u8]| {
+                let mut out = Vec::with_capacity(body.len() + 2);
+                out.push(tag);
+                out.push(u8::try_from(body.len()).expect("short DER len"));
+                out.extend_from_slice(body);
+                out
+            };
+            let der_u8_int = |tag: u8, val: u8| {
+                if val >= 0x80 {
+                    tlv(tag, &[0x00, val])
+                } else {
+                    tlv(tag, &[val])
+                }
+            };
+            let mut attrs = Vec::new();
+            // pwdFlags BIT STRING: needs-padding (bit 5 = 0x04 in octet 0, 2 unused bits)
+            attrs.extend_from_slice(&tlv(0x03, &[0x02, 0x04]));
+            // pwdType ENUMERATED ascii-numeric (1)
+            attrs.extend_from_slice(&tlv(0x0A, &[0x01]));
+            // minLength=4, storedLength, maxLength=storedLength
+            attrs.extend_from_slice(&der_u8_int(0x02, 4));
+            attrs.extend_from_slice(&der_u8_int(0x02, stored));
+            attrs.extend_from_slice(&der_u8_int(0x02, stored));
+            // [0] IMPLICIT INTEGER pwdReference
+            attrs.extend_from_slice(&der_u8_int(0x80, reference));
+            // OCTET STRING padChar
+            attrs.extend_from_slice(&tlv(0x04, &[pad]));
+            let mut body = Vec::new();
+            body.extend_from_slice(&tlv(0x30, &tlv(0x0C, b"PIN1")));
+            body.extend_from_slice(&tlv(0x30, &tlv(0x04, &[0x01])));
+            body.extend_from_slice(&tlv(0xA1, &tlv(0x30, &attrs)));
+            let raw = tlv(0x30, &body);
+            let parsed = refineid_pkcs15::AuthenticationObjects::parse(&raw)
+                .expect("synthetic EF.AOD parses");
+            let obj = parsed
+                .unique_by_reference(reference)
+                .expect("synthetic PIN1 object present");
+            refineid_auth::CardPinParameters::from_aod(PinReferenceScheme::Estonian, obj)
+                .expect("synthetic parameters valid")
+        };
+
+        let original = aod_with(0x84, 8, 0xFF);
+        let different_ref = aod_with(0x81, 8, 0xFF);
+        let different_stored = aod_with(0x84, 12, 0xFF);
+        let different_pad = aod_with(0x84, 8, 0x00);
+        let estonian_pristine = remaining(PinReferenceScheme::Estonian.pin_retry_limit());
+
+        for mismatched in [different_ref, different_stored, different_pad] {
+            let mut cache = cache();
+            cache
+                .store_pin1_with_parameters(
+                    serial(CARD_A_SERIAL),
+                    READER_EVENTS,
+                    original,
+                    random_pin(),
+                )
+                .expect("fresh PIN1 stores under exact parameters");
+            assert!(
+                cache
+                    .checkout_pin1_with_parameters(
+                        &serial(CARD_A_SERIAL),
+                        READER_EVENTS,
+                        mismatched,
+                        estonian_pristine,
+                    )
+                    .is_none(),
+                "mismatched EF.AOD parameters must destroy held PIN1"
+            );
+            assert!(!cache.holds_pin1());
+        }
+
+        let mut cache = cache();
+        cache
+            .store_pin1_with_parameters(
+                serial(CARD_A_SERIAL),
+                READER_EVENTS,
+                original,
+                random_pin(),
+            )
+            .expect("fresh PIN1 stores under exact parameters");
+        assert!(
+            cache
+                .checkout_pin1_with_parameters(
+                    &serial(CARD_A_SERIAL),
+                    READER_EVENTS,
+                    original,
+                    estonian_pristine,
+                )
+                .is_some(),
+            "identical EF.AOD parameters check out held PIN1"
+        );
     }
 }

@@ -57,11 +57,12 @@ pub use retry_risk::{
     pin1_status_permits_reusable_cache,
 };
 pub use verify::{
-    AuthError, PIN_STORED_LENGTH, PIN1_REFERENCE, PIN1_REFERENCE_ESTONIAN,
-    PIN1_REFERENCE_ORGANIZATIONAL, PIN2_REFERENCE, PIN2_REFERENCE_ESTONIAN,
-    PIN2_REFERENCE_ORGANIZATIONAL, PUK_REFERENCE, PUK_REFERENCE_ESTONIAN,
-    PUK_REFERENCE_ORGANIZATIONAL, PinOps, PinPadByte, PinReferenceScheme, PinSlot, PinStatus,
-    VerifyOutcome, classify_pin_status_sw, classify_verify_sw,
+    AodPinParametersError, AuthError, CardPinParameters, MAX_PADDED_PIN_BLOCK_LENGTH,
+    PIN_STORED_LENGTH, PIN1_REFERENCE, PIN1_REFERENCE_ESTONIAN, PIN1_REFERENCE_ORGANIZATIONAL,
+    PIN2_REFERENCE, PIN2_REFERENCE_ESTONIAN, PIN2_REFERENCE_ORGANIZATIONAL, PUK_REFERENCE,
+    PUK_REFERENCE_ESTONIAN, PUK_REFERENCE_ORGANIZATIONAL, PinBlockEncoding, PinOps, PinPadByte,
+    PinReferenceScheme, PinSlot, PinStatus, VerifyOutcome, classify_pin_status_sw,
+    classify_verify_sw,
 };
 
 #[cfg(test)]

@@ -1156,6 +1156,7 @@ dependencies = [
  "refineid-pkcs15",
  "refineid-remote",
  "refineid-sign",
+ "rustix",
  "sha1",
  "sha2 0.11.1",
  "spki",

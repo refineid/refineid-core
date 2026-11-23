@@ -1265,3 +1265,144 @@ fn a_first_run_offline_reports_the_failed_fetch() -> TestResult {
         "the fetch failed",
     )
 }
+
+#[test]
+fn write_atomically_refuses_colliding_staging_file_and_retries() -> TestResult {
+    const COLLIDING_SUFFIX: &str = "colliding";
+    const FRESH_SUFFIX: &str = "fresh";
+    const INITIAL_CONTENT: &[u8] = b"preexisting-staging";
+    const PAYLOAD: &[u8] = b"trusted-list-payload";
+    const FIRST_CALL: usize = 0;
+
+    let dir = TempDir::new("trusted-lists-atomic-collision")?;
+    let target = dir.path().join("eu.list");
+    let colliding = temporary_path(&target, COLLIDING_SUFFIX);
+    fs::write(&colliding, INITIAL_CONTENT)?;
+
+    let calls = Cell::new(FIRST_CALL);
+    write_atomically_with_suffix(&target, PAYLOAD, || {
+        let attempt = calls.get();
+        calls.set(attempt.saturating_add(FETCHED_ONCE));
+        if attempt == FIRST_CALL {
+            Ok(COLLIDING_SUFFIX.to_owned())
+        } else {
+            Ok(FRESH_SUFFIX.to_owned())
+        }
+    })?;
+
+    check(
+        &fs::read(&target)?,
+        &PAYLOAD.to_vec(),
+        "target carries atomic payload",
+    )?;
+    check(
+        &fs::read(&colliding)?,
+        &INITIAL_CONTENT.to_vec(),
+        "preexisting colliding staging file is untouched",
+    )?;
+
+    // Exhausting all retries on an occupied candidate fails closed after
+    // exactly MAX_TEMP_ATTEMPTS without modifying either file or leaving
+    // extra staging files behind.
+    let exhausted_calls = Cell::new(FIRST_CALL);
+    let exhausted = write_atomically_with_suffix(&target, b"overwrite", || {
+        exhausted_calls.set(exhausted_calls.get().saturating_add(FETCHED_ONCE));
+        Ok(COLLIDING_SUFFIX.to_owned())
+    });
+    check_true(
+        matches!(exhausted, Err(ref error) if error.kind() == std::io::ErrorKind::AlreadyExists),
+        "repeated collisions fail closed with AlreadyExists",
+    )?;
+    check(
+        &exhausted_calls.get(),
+        &MAX_TEMP_ATTEMPTS,
+        "exhaustion attempts exactly MAX_TEMP_ATTEMPTS candidates",
+    )?;
+    check(
+        &fs::read(&target)?,
+        &PAYLOAD.to_vec(),
+        "target unchanged after retry exhaustion",
+    )?;
+    check(
+        &fs::read(&colliding)?,
+        &INITIAL_CONTENT.to_vec(),
+        "colliding file unchanged after retry exhaustion",
+    )?;
+    let mut entries: Vec<String> = fs::read_dir(dir.path())?
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .collect();
+    entries.sort();
+    check(
+        &entries,
+        &vec!["eu.list".to_owned(), "eu.tmp.colliding".to_owned()],
+        "no extra staging file left behind",
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn write_atomically_refuses_exact_candidate_symlink_and_retries() -> TestResult {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    const SYMLINK_SUFFIX: &str = "symlink";
+    const DANGLING_SUFFIX: &str = "dangling";
+    const FRESH_SUFFIX: &str = "fresh";
+    const VICTIM_ORIGINAL: &[u8] = b"victim-original";
+    const PAYLOAD: &[u8] = b"trusted-list-payload";
+    const MODE_MASK: u32 = 0o777;
+    const FIRST_CALL: usize = 0;
+    const SECOND_CALL: usize = 1;
+
+    let dir = TempDir::new("trusted-lists-atomic-symlink")?;
+    let target = dir.path().join("fi.list");
+    let victim = dir.path().join("victim.txt");
+    let dangling_victim = dir.path().join("nonexistent-victim.txt");
+    fs::write(&victim, VICTIM_ORIGINAL)?;
+
+    let candidate_link = temporary_path(&target, SYMLINK_SUFFIX);
+    symlink(&victim, &candidate_link)?;
+    let dangling_link = temporary_path(&target, DANGLING_SUFFIX);
+    symlink(&dangling_victim, &dangling_link)?;
+
+    let calls = Cell::new(FIRST_CALL);
+    write_atomically_with_suffix(&target, PAYLOAD, || {
+        let attempt = calls.get();
+        calls.set(attempt.saturating_add(FETCHED_ONCE));
+        if attempt == FIRST_CALL {
+            Ok(SYMLINK_SUFFIX.to_owned())
+        } else if attempt == SECOND_CALL {
+            Ok(DANGLING_SUFFIX.to_owned())
+        } else {
+            Ok(FRESH_SUFFIX.to_owned())
+        }
+    })?;
+
+    check(
+        &fs::read(&target)?,
+        &PAYLOAD.to_vec(),
+        "target carries atomic payload after skipping symlink candidates",
+    )?;
+    check(
+        &fs::read(&victim)?,
+        &VICTIM_ORIGINAL.to_vec(),
+        "existing symlink target file was never overwritten",
+    )?;
+    check_true(
+        !dangling_victim.exists(),
+        "dangling symlink target was never created",
+    )?;
+    check_true(
+        fs::symlink_metadata(&candidate_link)?
+            .file_type()
+            .is_symlink(),
+        "preexisting symlink was not unlinked",
+    )?;
+    check_true(
+        fs::symlink_metadata(&dangling_link)?
+            .file_type()
+            .is_symlink(),
+        "preexisting dangling symlink was not unlinked",
+    )?;
+    let mode = fs::metadata(&target)?.permissions().mode() & MODE_MASK;
+    check(&mode, &FILE_MODE, "atomically written file is owner-only")
+}

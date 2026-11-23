@@ -55,6 +55,8 @@ spki.workspace = true
 x509-cert.workspace = true
 zeroize.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 refineid-cms = { workspace = true, features = ["testkit"] }

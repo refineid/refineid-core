@@ -388,6 +388,13 @@ pub struct PsoDecipher<'a> {
     pub cryptogram: &'a RsaCryptogram,
 }
 
+/// Largest plaintext chunk a command-chained `PSO:DECIPHER` carries so
+/// every chunk still fits within a short-form ISO 7816-4 secure-messaging
+/// wrapper (`DO87` + `DO97` + `DO8E` <= 255 bytes): 223 bytes of plaintext
+/// pads to 224 bytes of AES-256-CBC ciphertext, giving 228 + 3 + 10 = 241
+/// wrapped bytes.
+const DECIPHER_CHAIN_CHUNK_MAX: usize = 223;
+
 impl PsoDecipher<'_> {
     /// Serialise into a command-chained sequence: the caller transmits
     /// each in order, and the last returns the deciphered plaintext.
@@ -402,7 +409,7 @@ impl PsoDecipher<'_> {
         let mut data = Vec::with_capacity(DECIPHER_INDICATOR_LEN + ciphertext.len());
         data.push(DECIPHER_PADDING_INDICATOR);
         data.extend_from_slice(ciphertext);
-        CommandApdu::command_chain(
+        CommandApdu::command_chain_with_max_chunk(
             CommandHeader {
                 class: ApduClass::Plain,
                 instruction: PSO_INS,
@@ -411,6 +418,7 @@ impl PsoDecipher<'_> {
             },
             &data,
             PSO_CDS_LE_ANY,
+            DECIPHER_CHAIN_CHUNK_MAX,
         )
     }
 }
@@ -457,6 +465,8 @@ mod tests {
     const P1_INDEX: usize = 2;
     /// Wire index of the P2 byte.
     const P2_INDEX: usize = 3;
+    /// Wire index of the short-form Lc byte.
+    const LC_INDEX: usize = 4;
     /// Wire offset of the data field: past the header and the Lc byte.
     const DATA_OFFSET: usize = 5;
 
@@ -675,17 +685,20 @@ mod tests {
         assert_eq!(chain.len(), TWO_DECIPHER_COMMANDS);
 
         // First command: chaining class, the DECIPHER header, and a data
-        // field that opens with the padding-content indicator.
+        // field that opens with the padding-content indicator and stays
+        // within the short-form secure-messaging chunk ceiling.
         let first = chain[0].as_bytes();
         assert_eq!(first[0], ApduClass::ChainedFirst.as_byte());
         assert_eq!(first[INS_INDEX], PSO_INS);
         assert_eq!(first[P1_INDEX], PSO_DECIPHER_P1);
         assert_eq!(first[P2_INDEX], PSO_DECIPHER_P2);
+        assert!(usize::from(first[LC_INDEX]) <= super::DECIPHER_CHAIN_CHUNK_MAX);
         assert_eq!(first[DATA_OFFSET], DECIPHER_PADDING_INDICATOR);
 
-        // Last command: plain class, ending in the expected-length byte.
+        // Last command: plain class, chunk within the SM ceiling, ending in Le.
         let last = chain[1].as_bytes();
         assert_eq!(last[0], ApduClass::Plain.as_byte());
+        assert!(usize::from(last[LC_INDEX]) <= super::DECIPHER_CHAIN_CHUNK_MAX);
         assert_eq!(last.last().copied(), Some(PSO_CDS_LE_ANY));
     }
 }

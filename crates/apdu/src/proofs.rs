@@ -76,8 +76,10 @@ fn any_class() -> ApduClass {
         ApduClass::Plain
     } else if kani::any() {
         ApduClass::SecureMessaging
-    } else {
+    } else if kani::any() {
         ApduClass::ChainedFirst
+    } else {
+        ApduClass::ChainedSecureMessaging
     }
 }
 

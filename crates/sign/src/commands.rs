@@ -190,9 +190,7 @@ pub struct MseSet {
     /// Algorithm reference.
     pub alg_ref: SignatureAlgRef,
     /// Private-key reference byte, already resolved for the card's
-    /// numbering: a citizen reference from [`crate::KeyRef::as_byte`], or
-    /// the organizational qualified key's local reference from
-    /// [`crate::KeyRef::reference`].
+    /// numbering from [`crate::KeyRef::reference`].
     pub key_ref: u8,
 }
 

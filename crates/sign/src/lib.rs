@@ -85,23 +85,33 @@ pub const ORG_QUALIFIED_KEY_REF: u8 = 0x82;
 ///
 /// The citizen card loads the host digest with PSO:HASH and signs an
 /// empty PSO:CDS; the organizational card carries the digest inline in
-/// PSO:CDS and names its qualified key by the local reference. The family
-/// is resolved once - the auth crate's counter-safe probe settles it when
-/// a PIN is verified - and passed to the signing entry points.
+/// PSO:CDS and names its qualified key by the local reference; the
+/// Estonian eID card signs its authentication key through PSO:HASH plus
+/// an empty PSO:CDS in the eID application, while qualified signing
+/// lives in the separate QSCD application and fails closed until QSCD
+/// support lands. The family is resolved once - the auth crate's
+/// counter-safe probe settles it when a PIN is verified - and passed to
+/// the signing entry points.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignScheme {
     /// FINEID S1 numbering and chain: the citizen cards.
     Citizen,
     /// FINEID S4 numbering and chain: the organizational cards.
     Organizational,
+    /// Estonian eID authentication-key signing chain in the eID
+    /// application. Qualified signing is refused until QSCD support is
+    /// implemented.
+    Estonian,
 }
 
 impl SignScheme {
     /// The credential numbering of the same card family.
-    const fn pin_numbering(self) -> PinReferenceScheme {
+    #[must_use]
+    pub const fn pin_numbering(self) -> PinReferenceScheme {
         match self {
             Self::Citizen => PinReferenceScheme::Citizen,
             Self::Organizational => PinReferenceScheme::Organizational,
+            Self::Estonian => PinReferenceScheme::Estonian,
         }
     }
 }
@@ -111,8 +121,9 @@ impl From<PinReferenceScheme> for SignScheme {
     /// session resolved.
     fn from(numbering: PinReferenceScheme) -> Self {
         match numbering {
-            PinReferenceScheme::Citizen | PinReferenceScheme::Estonian => Self::Citizen,
+            PinReferenceScheme::Citizen => Self::Citizen,
             PinReferenceScheme::Organizational => Self::Organizational,
+            PinReferenceScheme::Estonian => Self::Estonian,
         }
     }
 }
@@ -138,24 +149,23 @@ pub enum KeyRef {
 }
 
 impl KeyRef {
-    /// The card-side reference byte under the citizen numbering.
+    /// The card-side reference byte under `scheme`, or `None` when
+    /// `key` has no supported reference under `scheme`.
+    ///
+    /// The organizational qualified-signature key is local to DF.ESIGN
+    /// and named by [`ORG_QUALIFIED_KEY_REF`]. The Estonian qualified
+    /// signature key lives in the separate QSCD application with a
+    /// card-specific EF.PrKDF reference, so `(SignScheme::Estonian,
+    /// KeyRef::Sign)` has no hardcoded reference and returns `None`.
     #[must_use]
-    pub const fn as_byte(self) -> u8 {
-        match self {
-            Self::Auth => KEY_REF_AUTH,
-            Self::Sign => KEY_REF_SIGN,
-        }
-    }
-
-    /// The card-side reference byte under `scheme`. The organizational
-    /// qualified-signature key is local to DF.ESIGN and named by
-    /// [`ORG_QUALIFIED_KEY_REF`]; every other key keeps its own
-    /// reference.
-    #[must_use]
-    pub const fn reference(self, scheme: SignScheme) -> u8 {
+    pub const fn reference(self, scheme: SignScheme) -> Option<u8> {
         match (scheme, self) {
-            (SignScheme::Organizational, Self::Sign) => ORG_QUALIFIED_KEY_REF,
-            _ => self.as_byte(),
+            (SignScheme::Citizen, Self::Auth) => Some(KEY_REF_AUTH),
+            (SignScheme::Citizen, Self::Sign) => Some(KEY_REF_SIGN),
+            (SignScheme::Organizational, Self::Auth) => Some(KEY_REF_AUTH),
+            (SignScheme::Organizational, Self::Sign) => Some(ORG_QUALIFIED_KEY_REF),
+            (SignScheme::Estonian, Self::Auth) => Some(KEY_REF_AUTH),
+            (SignScheme::Estonian, Self::Sign) => None,
         }
     }
 }
@@ -172,6 +182,14 @@ pub enum SignError<E> {
     /// A command could not be assembled; unreachable for the fixed
     /// signing bodies, kept fail-closed.
     Command(CommandDataError),
+    /// The requested key reference is not supported under `scheme`;
+    /// refused before transmitting any APDU.
+    UnsupportedKey {
+        /// Signing family resolved for the card.
+        scheme: SignScheme,
+        /// The key reference that cannot be addressed under `scheme`.
+        key: KeyRef,
+    },
     /// The card returned a signature of an unexpected length for the
     /// selected algorithm.
     UnexpectedSignatureLength {
@@ -189,6 +207,9 @@ impl<E: core::fmt::Display> core::fmt::Display for SignError<E> {
             Self::Outcome(outcome) => write!(f, "sign transport state: {outcome}"),
             Self::Status(stage, sw) => write!(f, "sign {stage}: card returned {sw}"),
             Self::Command(e) => write!(f, "sign command: {e}"),
+            Self::UnsupportedKey { scheme, key } => {
+                write!(f, "sign: key {key:?} is not supported under {scheme:?}")
+            }
             Self::UnexpectedSignatureLength { got, expected } => {
                 write!(
                     f,
@@ -213,6 +234,9 @@ impl<E> From<container::SignatureLengthError> for SignError<E> {
 /// Why the qualified-signature key was not made ready to sign.
 #[derive(Debug)]
 pub enum QualifiedUnlockError<E> {
+    /// Qualified signing is not supported for this card family; nothing
+    /// was sent to the card.
+    UnsupportedScheme(SignScheme),
     /// DF.ESIGN could not be made current; PIN 2 was not sent.
     Directory(Pkcs15Error<E>),
     /// VERIFY PIN 2 failed in transport or assembly.
@@ -224,6 +248,9 @@ pub enum QualifiedUnlockError<E> {
 impl<E: core::fmt::Display> core::fmt::Display for QualifiedUnlockError<E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::UnsupportedScheme(scheme) => {
+                write!(f, "qualified signing is not supported under {scheme:?}")
+            }
             Self::Directory(e) => write!(f, "select DF.ESIGN: {e}"),
             Self::Verify(e) => write!(f, "VERIFY Signature PIN 2: {e}"),
             Self::PinRefused(outcome) => write!(f, "the card refused Signature PIN 2: {outcome:?}"),
@@ -418,6 +445,10 @@ pub trait SignOps: CardTransport {
     ///
     /// # Errors
     ///
+    /// [`QualifiedUnlockError::UnsupportedScheme`] when `scheme` has no
+    /// supported qualified-signature path here (such as
+    /// [`SignScheme::Estonian`], whose qualified key and PIN 2 live in
+    /// the separate QSCD application; nothing is sent),
     /// [`QualifiedUnlockError::Directory`] when DF.ESIGN cannot be made
     /// current (PIN 2 is not sent), [`QualifiedUnlockError::Verify`] on a
     /// VERIFY transport failure or a retry-floor refusal
@@ -431,6 +462,9 @@ pub trait SignOps: CardTransport {
     where
         Self: Sized,
     {
+        if scheme == SignScheme::Estonian {
+            return Err(QualifiedUnlockError::UnsupportedScheme(scheme));
+        }
         if scheme == SignScheme::Organizational {
             self.select_esign_directory()
                 .map_err(QualifiedUnlockError::Directory)?;
@@ -463,8 +497,10 @@ pub trait SignOps: CardTransport {
     ///
     /// # Errors
     ///
-    /// Transport failures, a state transition, or a non-success status
-    /// word at MSE:SET or any chained PSO:DECIPHER command.
+    /// [`SignError::UnsupportedKey`] when `key` has no supported
+    /// reference under `scheme` (nothing is sent), transport failures, a
+    /// state transition, or a non-success status word at MSE:SET or any
+    /// chained PSO:DECIPHER command.
     fn decipher_rsa(
         &mut self,
         scheme: SignScheme,
@@ -475,9 +511,12 @@ pub trait SignOps: CardTransport {
     where
         Self: Sized,
     {
+        let key_ref = key
+            .reference(scheme)
+            .ok_or(SignError::UnsupportedKey { scheme, key })?;
         let mse = MseSetCt {
             alg_ref: algorithm,
-            key_ref: key.reference(scheme),
+            key_ref,
         }
         .into_apdu()
         .map_err(SignError::Command)?;
@@ -734,33 +773,88 @@ impl<T: CardTransport> SigningKey<'_, T> {
 
     /// Drive the resolved signing chain end to end and return the raw
     /// signature bytes: MSE:Set, then either PSO:HASH plus an empty
-    /// PSO:CDS (citizen) or a single inline-digest PSO:CDS
-    /// (organizational).
+    /// PSO:CDS (citizen and Estonian authentication) or a single
+    /// inline-digest PSO:CDS (organizational).
     fn drive_chain(
         self,
         alg_ref: SignatureAlgRef,
         hash: ExternalHashValue,
         le: u8,
     ) -> Result<Vec<u8>, SignError<T::Error>> {
-        let mse = MseSet {
-            alg_ref,
-            key_ref: self.key.reference(self.scheme),
-        }
-        .into_apdu()
-        .map_err(SignError::Command)?;
+        let key_ref = self
+            .key
+            .reference(self.scheme)
+            .ok_or(SignError::UnsupportedKey {
+                scheme: self.scheme,
+                key: self.key,
+            })?;
+        let mse = MseSet { alg_ref, key_ref }
+            .into_apdu()
+            .map_err(SignError::Command)?;
         self.transport.exchange(&mse, "MSE:Set")?;
-        let signature = match self.scheme {
-            SignScheme::Citizen => {
+        let signature = match (self.scheme, self.key) {
+            (SignScheme::Citizen, KeyRef::Auth | KeyRef::Sign)
+            | (SignScheme::Estonian, KeyRef::Auth) => {
                 let load = PsoHashExternal { hash }
                     .into_apdu()
                     .map_err(SignError::Command)?;
                 self.transport.exchange(&load, "PSO:HASH")?;
                 PsoComputeDigitalSignature.into_apdu(le)
             }
-            SignScheme::Organizational => PsoComputeDigitalSignature
+            (SignScheme::Organizational, KeyRef::Auth | KeyRef::Sign) => PsoComputeDigitalSignature
                 .into_apdu_with_digest(hash, le)
                 .map_err(SignError::Command)?,
+            (SignScheme::Estonian, KeyRef::Sign) => {
+                return Err(SignError::UnsupportedKey {
+                    scheme: self.scheme,
+                    key: self.key,
+                });
+            }
         };
         Ok(self.transport.exchange(&signature, "PSO:CDS")?.body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use refineid_apdu::{CardTransport, CommandApdu, CredentialCommand, TransportOutcome};
+
+    use super::{KeyRef, SHA384_LEN, SignError, SignScheme, SigningKey};
+
+    struct NeverTransmitting;
+
+    impl CardTransport for NeverTransmitting {
+        type Error = &'static str;
+
+        fn transmit(&mut self, _command: &CommandApdu) -> Result<TransportOutcome, Self::Error> {
+            Err("unexpected plain APDU")
+        }
+
+        fn transmit_credential(
+            &mut self,
+            _command: CredentialCommand,
+        ) -> Result<TransportOutcome, Self::Error> {
+            Err("unexpected credential APDU")
+        }
+    }
+
+    #[test]
+    fn drive_chain_refuses_estonian_sign_key_without_transmitting() {
+        let mut transport = NeverTransmitting;
+        let key = SigningKey {
+            transport: &mut transport,
+            scheme: SignScheme::Estonian,
+            key: KeyRef::Sign,
+        };
+        let err = key
+            .sign_prehashed_sha384_ecdsa([0; SHA384_LEN])
+            .expect_err("Estonian Sign key must fail closed in drive_chain");
+        assert!(matches!(
+            err,
+            SignError::UnsupportedKey {
+                scheme: SignScheme::Estonian,
+                key: KeyRef::Sign,
+            }
+        ));
     }
 }

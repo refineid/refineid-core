@@ -347,16 +347,17 @@ impl CardSignInput {
 )]
 pub(super) fn sign_with_card<T: CardTransport>(
     transport: &mut T,
+    scheme: SignScheme,
     input: CardSignInput,
 ) -> Result<Vec<u8>, SignError<T::Error>> {
     match input {
         CardSignInput::RsaSha256(digest) => transport
-            .authentication_key(SignScheme::Citizen)
+            .authentication_key(scheme)
             .sign_prehashed_sha256_rsa(digest)
             .map(Signature::into_bytes),
         // Raw r || s -- already the CKM_ECDSA output format.
         CardSignInput::EcdsaP384(digest) => transport
-            .authentication_key(SignScheme::Citizen)
+            .authentication_key(scheme)
             .sign_prehashed_sha384_ecdsa(digest)
             .map(Signature::into_bytes),
     }

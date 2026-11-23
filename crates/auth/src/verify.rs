@@ -256,6 +256,19 @@ pub enum AuthError<E> {
     /// operations that take the card's
     /// [`crate::pin_lengths::CardPinLengths`].
     PinLength(PinLengthRefusal),
+    /// The requested PIN slot is not supported in this application
+    /// context under `scheme`; refused before any command that carries a
+    /// credential was sent.
+    ///
+    /// On Estonian eID cards, PIN2 lives in the separate QSCD application
+    /// rather than the eID application, so PIN2 verification and
+    /// management fail closed here until QSCD support is implemented.
+    UnsupportedSlot {
+        /// Credential numbering resolved for the card.
+        scheme: PinReferenceScheme,
+        /// The PIN slot that cannot be addressed in this context.
+        slot: PinSlot,
+    },
 }
 
 impl<E: core::fmt::Display> core::fmt::Display for AuthError<E> {
@@ -266,6 +279,9 @@ impl<E: core::fmt::Display> core::fmt::Display for AuthError<E> {
             Self::Command(e) => write!(f, "auth command: {e}"),
             Self::RetryFloor(refusal) => write!(f, "{refusal}"),
             Self::PinLength(refusal) => write!(f, "{refusal}"),
+            Self::UnsupportedSlot { scheme, slot } => {
+                write!(f, "auth: {slot:?} is not supported under {scheme:?}")
+            }
         }
     }
 }
@@ -412,6 +428,25 @@ pub(crate) fn verify_under_floor<T: CardTransport + ?Sized>(
     verify_digits(transport, scheme, slot, digits)
 }
 
+/// Fail closed when `slot` cannot be addressed in the current
+/// application context under `scheme`.
+///
+/// On Estonian eID cards, PIN2 lives in the separate QSCD application
+/// and must not be verified, changed, or unblocked under the eID
+/// application.
+pub(crate) const fn ensure_slot_supported<E>(
+    scheme: PinReferenceScheme,
+    slot: PinSlot,
+) -> Result<(), AuthError<E>> {
+    if matches!(
+        (scheme, slot),
+        (PinReferenceScheme::Estonian, PinSlot::Pin2)
+    ) {
+        return Err(AuthError::UnsupportedSlot { scheme, slot });
+    }
+    Ok(())
+}
+
 /// Assemble and send the VERIFY credential command for `slot` under
 /// `scheme`, classifying the card's status word. The caller has applied
 /// the retry floor to the slot's counter: [`verify_under_floor`] to the
@@ -420,14 +455,16 @@ pub(crate) fn verify_under_floor<T: CardTransport + ?Sized>(
 ///
 /// # Errors
 ///
-/// [`AuthError`] on a command-assembly failure, a transport failure, or a
-/// transport state transition.
+/// [`AuthError::UnsupportedSlot`] when `slot` is not supported under
+/// `scheme`. [`AuthError`] on a command-assembly failure, a transport
+/// failure, or a transport state transition.
 pub(crate) fn verify_digits<T: CardTransport + ?Sized>(
     transport: &mut T,
     scheme: PinReferenceScheme,
     slot: PinSlot,
     digits: &[u8],
 ) -> Result<VerifyOutcome, AuthError<T::Error>> {
+    ensure_slot_supported(scheme, slot)?;
     let header = CommandHeader {
         class: ApduClass::Plain,
         instruction: VERIFY_INS,
@@ -508,9 +545,14 @@ pub trait PinOps: CardTransport {
     /// PIN 2 under `scheme`, the retry floor on its answer, then the
     /// VERIFY carrying the PIN.
     ///
+    /// PIN2 on [`PinReferenceScheme::Estonian`] lives in the separate
+    /// QSCD application; calling this with `Estonian` fails closed with
+    /// [`AuthError::UnsupportedSlot`] before any APDU is transmitted.
+    ///
     /// # Errors
     ///
-    /// As [`PinOps::verify_pin1_with_scheme`].
+    /// [`AuthError::UnsupportedSlot`] for [`PinReferenceScheme::Estonian`].
+    /// Otherwise as [`PinOps::verify_pin1_with_scheme`].
     fn verify_pin2_with_scheme(
         &mut self,
         scheme: PinReferenceScheme,
@@ -519,6 +561,7 @@ pub trait PinOps: CardTransport {
     where
         Self: Sized,
     {
+        ensure_slot_supported(scheme, PinSlot::Pin2)?;
         let status = self.pin_status_with_scheme(scheme, PinSlot::Pin2)?;
         verify_under_floor(self, scheme, PinSlot::Pin2, status, pin.digits())
     }
@@ -1240,6 +1283,23 @@ mod tests {
             ))
         ));
         assert!(unreadable.credential.is_none());
+    }
+
+    #[test]
+    fn estonian_verify_pin2_fails_closed_without_transmitting() {
+        let mut transport = WireRecorder::new(StatusWord::Success);
+        let err = transport
+            .verify_pin2_with_scheme(PinReferenceScheme::Estonian, pin2(WIRE_DIGITS))
+            .expect_err("Estonian PIN2 requires QSCD and must fail closed");
+        assert!(matches!(
+            err,
+            AuthError::UnsupportedSlot {
+                scheme: PinReferenceScheme::Estonian,
+                slot: PinSlot::Pin2,
+            }
+        ));
+        assert!(transport.plain.is_none(), "no probe APDU sent");
+        assert!(transport.credential.is_none(), "no credential APDU sent");
     }
 }
 

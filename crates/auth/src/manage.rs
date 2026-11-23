@@ -56,7 +56,7 @@ use crate::retry_risk::{
 };
 use crate::verify::{
     AuthError, PinOps, PinReferenceScheme, PinSlot, PinStatus, VERIFY_INS, VERIFY_P1,
-    credential_exchange,
+    credential_exchange, ensure_slot_supported,
 };
 
 /// CHANGE REFERENCE DATA instruction (ISO 7816-8; FINEID S1 v4.2
@@ -132,6 +132,7 @@ pub(crate) fn change<T: CardTransport + ?Sized>(
     current: &[u8],
     new: &[u8],
 ) -> Result<ManageOutcome, AuthError<T::Error>> {
+    ensure_slot_supported(scheme, slot)?;
     let header = CommandHeader {
         class: ApduClass::Plain,
         instruction: CHANGE_REFERENCE_DATA_INS,
@@ -215,6 +216,7 @@ pub(crate) fn unblock<T: CardTransport + ?Sized>(
     puk: &[u8],
     new: &[u8],
 ) -> Result<ManageOutcome, AuthError<T::Error>> {
+    ensure_slot_supported(scheme, slot)?;
     let puk_counter = puk_status(transport, scheme)?;
     check_retry_floor_with_scheme(FlooredCredential::Puk, puk_counter, scheme)
         .map_err(AuthError::RetryFloor)?;
@@ -455,9 +457,15 @@ pub trait PinManageOps: PinOps {
     /// counter is read first without spending a try and the retry floor
     /// applied to it.
     ///
+    /// PIN2 on [`PinReferenceScheme::Estonian`] lives in the separate
+    /// QSCD application; calling this with Estonian `lengths` fails
+    /// closed with [`AuthError::UnsupportedSlot`] before any APDU is
+    /// transmitted.
+    ///
     /// # Errors
     ///
-    /// As [`PinManageOps::change_pin1`].
+    /// [`AuthError::UnsupportedSlot`] for [`PinReferenceScheme::Estonian`].
+    /// Otherwise as [`PinManageOps::change_pin1`].
     fn change_pin2(
         &mut self,
         lengths: &CardPinLengths,
@@ -467,6 +475,7 @@ pub trait PinManageOps: PinOps {
     where
         Self: Sized,
     {
+        ensure_slot_supported(lengths.numbering(), PinSlot::Pin2)?;
         lengths.check_pin2(&current).map_err(AuthError::PinLength)?;
         lengths.check_pin2(&new).map_err(AuthError::PinLength)?;
         change_under_floor(
@@ -513,9 +522,15 @@ pub trait PinManageOps: PinOps {
     /// Unblock PIN2 with the PUK under the numbering `lengths` was read
     /// by.
     ///
+    /// PIN2 on [`PinReferenceScheme::Estonian`] lives in the separate
+    /// QSCD application; calling this with Estonian `lengths` fails
+    /// closed with [`AuthError::UnsupportedSlot`] before any APDU is
+    /// transmitted.
+    ///
     /// # Errors
     ///
-    /// As [`PinManageOps::unblock_pin1`].
+    /// [`AuthError::UnsupportedSlot`] for [`PinReferenceScheme::Estonian`].
+    /// Otherwise as [`PinManageOps::unblock_pin1`].
     fn unblock_pin2(
         &mut self,
         lengths: &CardPinLengths,
@@ -525,6 +540,7 @@ pub trait PinManageOps: PinOps {
     where
         Self: Sized,
     {
+        ensure_slot_supported(lengths.numbering(), PinSlot::Pin2)?;
         lengths.check_puk(&puk).map_err(AuthError::PinLength)?;
         lengths.check_pin2(&new).map_err(AuthError::PinLength)?;
         unblock(
@@ -650,6 +666,17 @@ pub trait PinManageOps: PinOps {
     where
         Self: Sized,
     {
+        let ref_scheme = lengths.numbering();
+        if ref_scheme == PinReferenceScheme::Estonian {
+            return Err(AuthError::UnsupportedSlot {
+                scheme: ref_scheme,
+                slot: if new_pin2.is_some() {
+                    PinSlot::Pin2
+                } else {
+                    PinSlot::Pin1
+                },
+            });
+        }
         let scheme = code.scheme();
         let code_length = code.digits().len();
         let presented_as = |slot: PinSlot| match scheme {
@@ -668,7 +695,6 @@ pub trait PinManageOps: PinOps {
                 .map_err(AuthError::PinLength)?;
             lengths.check_pin2(pin).map_err(AuthError::PinLength)?;
         }
-        let ref_scheme = lengths.numbering();
         let reading = read_activation(self, scheme, ref_scheme)?;
         let needs = reading.needs;
         match scheme {
@@ -1841,6 +1867,78 @@ mod tests {
         assert_eq!(
             lengths,
             CardPinLengths::not_listed(PinReferenceScheme::Estonian)
+        );
+    }
+
+    #[test]
+    fn estonian_change_and_unblock_pin2_fail_closed_without_transmitting() {
+        let lengths = CardPinLengths::not_listed(PinReferenceScheme::Estonian);
+        let mut transport = Recorder::new(vec![]);
+        let change_err = transport
+            .change_pin2(&lengths, pin2(NEW_PIN2_DIGITS), pin2(NEW_PIN2_DIGITS))
+            .expect_err("Estonian change_pin2 must fail closed");
+        assert!(matches!(
+            change_err,
+            AuthError::UnsupportedSlot {
+                scheme: PinReferenceScheme::Estonian,
+                slot: PinSlot::Pin2,
+            }
+        ));
+        assert!(transport.commands.is_empty(), "no APDU sent on change_pin2");
+
+        let unblock_err = transport
+            .unblock_pin2(&lengths, puk(PUK_DIGITS), pin2(NEW_PIN2_DIGITS))
+            .expect_err("Estonian unblock_pin2 must fail closed");
+        assert!(matches!(
+            unblock_err,
+            AuthError::UnsupportedSlot {
+                scheme: PinReferenceScheme::Estonian,
+                slot: PinSlot::Pin2,
+            }
+        ));
+        assert!(
+            transport.commands.is_empty(),
+            "no APDU sent on unblock_pin2"
+        );
+
+        let activation_code = crate::activation::ActivationCode::reconstruct(
+            crate::credentials::UnvalidatedSecret::from_owned_bytes(PUK_DIGITS.to_vec()),
+            crate::activation::ActivationScheme::ActivationCodeIsPuk,
+        )
+        .expect("valid PUK-form activation code");
+        let activate_pin2_err = transport
+            .activate_card(&lengths, activation_code, None, Some(pin2(NEW_PIN2_DIGITS)))
+            .expect_err("Estonian activate_card with PIN2 must fail closed");
+        assert!(matches!(
+            activate_pin2_err,
+            AuthError::UnsupportedSlot {
+                scheme: PinReferenceScheme::Estonian,
+                slot: PinSlot::Pin2,
+            }
+        ));
+        assert!(
+            transport.commands.is_empty(),
+            "no APDU sent on activate_card with PIN2"
+        );
+
+        let activation_code = crate::activation::ActivationCode::reconstruct(
+            crate::credentials::UnvalidatedSecret::from_owned_bytes(PUK_DIGITS.to_vec()),
+            crate::activation::ActivationScheme::ActivationCodeIsPuk,
+        )
+        .expect("valid PUK-form activation code");
+        let activate_pin1_err = transport
+            .activate_card(&lengths, activation_code, Some(pin1(NEW_DIGITS)), None)
+            .expect_err("Estonian activate_card must fail closed even for PIN1-only");
+        assert!(matches!(
+            activate_pin1_err,
+            AuthError::UnsupportedSlot {
+                scheme: PinReferenceScheme::Estonian,
+                slot: PinSlot::Pin1,
+            }
+        ));
+        assert!(
+            transport.commands.is_empty(),
+            "no APDU sent on activate_card with PIN1 only"
         );
     }
 }

@@ -63,7 +63,9 @@ fn success(body: Vec<u8>) -> ResponseApdu {
 fn mse_wire(scheme: SignScheme, alg: SignatureAlgRef, key: KeyRef) -> Vec<u8> {
     MseSet {
         alg_ref: alg,
-        key_ref: key.reference(scheme),
+        key_ref: key
+            .reference(scheme)
+            .expect("supported key under signing scheme"),
     }
     .into_apdu()
     .expect("MSE:Set encodes")
@@ -695,7 +697,9 @@ fn rsa_decipher_sets_the_confidentiality_template_and_chains_the_cryptogram() {
 
     let mse = MseSetCt {
         alg_ref: DecipherAlgRef::RSA_PKCS1,
-        key_ref: KeyRef::Auth.reference(SignScheme::Citizen),
+        key_ref: KeyRef::Auth
+            .reference(SignScheme::Citizen)
+            .expect("citizen auth key has a reference"),
     }
     .into_apdu()
     .expect("MSE:Set CT encodes")
@@ -793,4 +797,73 @@ fn a_status_word_failure_names_the_stage() {
         error,
         SignError::Status("MSE:Set", StatusWord::SecurityNotSatisfied)
     ));
+}
+
+#[test]
+fn estonian_scheme_preserves_numbering_and_has_no_hardcoded_qualified_key_reference() {
+    let scheme = SignScheme::from(PinReferenceScheme::Estonian);
+    assert_eq!(scheme, SignScheme::Estonian);
+    assert_eq!(scheme.pin_numbering(), PinReferenceScheme::Estonian);
+    assert_eq!(KeyRef::Auth.reference(scheme), Some(KEY_REF_AUTH));
+    assert_eq!(KeyRef::Sign.reference(scheme), None);
+}
+
+#[test]
+fn estonian_authentication_key_signs_p384_over_pso_hash_and_pso_cds() {
+    let digest = [DIGEST_FILL; SHA384_LEN];
+    let signature = vec![SIG_FILL; ECDSA_P384_SIG_BYTES];
+    let mse = mse_wire(
+        SignScheme::Estonian,
+        SignatureAlgRef::SHA384_ECDSA,
+        KeyRef::Auth,
+    );
+    assert_eq!(mse.last().copied(), Some(KEY_REF_AUTH));
+    let mut transport = Scripted::new(vec![
+        (mse, success(vec![])),
+        (
+            pso_hash_wire(ExternalHashValue::Sha384(digest)),
+            success(vec![]),
+        ),
+        (pso_cds_empty_wire(ecdsa_le()), success(signature.clone())),
+    ]);
+
+    let result = transport
+        .authentication_key(SignScheme::Estonian)
+        .sign_prehashed_sha384_ecdsa(digest)
+        .expect("scripted Estonian authentication sign succeeds");
+    assert_eq!(result.as_bytes(), signature.as_slice());
+    assert!(transport.drained());
+}
+
+#[test]
+fn estonian_qualified_unlock_and_sign_key_decipher_fail_closed_without_transmitting() {
+    let mut unlock_transport = Scripted::new(vec![]);
+    let unlock_err = unlock_transport
+        .unlock_qualified_key(SignScheme::Estonian, pin2())
+        .expect_err("Estonian qualified signing requires QSCD and must fail closed");
+    assert!(matches!(
+        unlock_err,
+        QualifiedUnlockError::UnsupportedScheme(SignScheme::Estonian)
+    ));
+    assert!(unlock_transport.drained(), "zero APDUs transmitted");
+
+    let cryptogram =
+        RsaCryptogram::from_bytes(vec![DIGEST_FILL; RSA_3072_SIG_BYTES]).expect("modulus-wide");
+    let mut decipher_transport = Scripted::new(vec![]);
+    let decipher_err = decipher_transport
+        .decipher_rsa(
+            SignScheme::Estonian,
+            KeyRef::Sign,
+            DecipherAlgRef::RSA_PKCS1,
+            &cryptogram,
+        )
+        .expect_err("Estonian qualified key has no hardcoded reference");
+    assert!(matches!(
+        decipher_err,
+        SignError::UnsupportedKey {
+            scheme: SignScheme::Estonian,
+            key: KeyRef::Sign,
+        }
+    ));
+    assert!(decipher_transport.drained(), "zero APDUs transmitted");
 }

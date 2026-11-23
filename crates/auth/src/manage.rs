@@ -51,7 +51,9 @@ use refineid_pkcs15::{Pkcs15Error, Pkcs15Ops};
 
 use crate::credentials::{Pin1, Pin2, Puk};
 use crate::pin_lengths::CardPinLengths;
-use crate::retry_risk::{FlooredCredential, check_last_tries, check_retry_floor};
+use crate::retry_risk::{
+    FlooredCredential, check_last_tries_with_scheme, check_retry_floor_with_scheme,
+};
 use crate::verify::{
     AuthError, PinOps, PinReferenceScheme, PinSlot, PinStatus, VERIFY_INS, VERIFY_P1,
     credential_exchange,
@@ -157,7 +159,7 @@ fn change_under_floor<T: CardTransport>(
     new: &[u8],
 ) -> Result<ManageOutcome, AuthError<T::Error>> {
     let status = transport.pin_status_with_scheme(scheme, slot)?;
-    check_last_tries(slot.into(), status).map_err(AuthError::RetryFloor)?;
+    check_last_tries_with_scheme(slot.into(), status, scheme).map_err(AuthError::RetryFloor)?;
     change(transport, scheme, slot, current, new)
 }
 
@@ -214,7 +216,8 @@ pub(crate) fn unblock<T: CardTransport + ?Sized>(
     new: &[u8],
 ) -> Result<ManageOutcome, AuthError<T::Error>> {
     let puk_counter = puk_status(transport, scheme)?;
-    check_retry_floor(FlooredCredential::Puk, puk_counter).map_err(AuthError::RetryFloor)?;
+    check_retry_floor_with_scheme(FlooredCredential::Puk, puk_counter, scheme)
+        .map_err(AuthError::RetryFloor)?;
     match scheme {
         PinReferenceScheme::Citizen | PinReferenceScheme::Estonian => {
             let header = CommandHeader {
@@ -680,7 +683,7 @@ pub trait PinManageOps: PinOps {
                 // probe.
                 for (slot, changed) in changes {
                     if changed {
-                        check_last_tries(slot.into(), reading.status(slot))
+                        check_last_tries_with_scheme(slot.into(), reading.status(slot), ref_scheme)
                             .map_err(AuthError::RetryFloor)?;
                     }
                 }

@@ -52,7 +52,8 @@ pub use pin_lengths::{
 };
 pub use refineid_pkcs15::PasswordLengthRange;
 pub use retry_risk::{
-    FlooredCredential, PinRetryRisk, RetryFloorRefusal, check_last_tries, check_retry_floor,
+    FlooredCredential, PinRetryRisk, RetryFloorRefusal, check_last_tries,
+    check_last_tries_with_scheme, check_retry_floor, check_retry_floor_with_scheme,
     pin1_status_permits_reusable_cache,
 };
 pub use verify::{

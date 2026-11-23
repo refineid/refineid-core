@@ -48,7 +48,8 @@ use refineid_apdu::CardTransport;
 use refineid_auth::PinManageOps as _;
 use refineid_auth::{
     AuthError, FlooredCredential, PinOps as _, PinReferenceScheme, PinSlot, PinStatus,
-    RetryFloorRefusal, VerifyOutcome, check_retry_floor, pin1_status_permits_reusable_cache,
+    RetryFloorRefusal, VerifyOutcome, check_retry_floor_with_scheme,
+    pin1_status_permits_reusable_cache,
 };
 use refineid_cms::container::{EcdsaP384, RsaPkcs1Sha256, Signature};
 use refineid_cms::x509::{
@@ -1866,7 +1867,7 @@ where
     if !pin1_status_permits_reusable_cache(pin1_status, resolved_scheme) {
         clear_positive(pin_cache);
     }
-    if let Err(error) = pin1_verify_guard(pin1_status) {
+    if let Err(error) = pin1_verify_guard(pin1_status, resolved_scheme) {
         clear_positive(pin_cache);
         return Err(error);
     }
@@ -2217,7 +2218,7 @@ where
     if !pin1_status_permits_reusable_cache(pin1_status, resolved_scheme) {
         clear_positive(pin_cache);
     }
-    if let Err(error) = pin1_verify_guard(pin1_status) {
+    if let Err(error) = pin1_verify_guard(pin1_status, resolved_scheme) {
         clear_positive(pin_cache);
         return Err(error);
     }
@@ -2317,11 +2318,14 @@ fn settle_login(
 /// or typed value is consulted. The VERIFY applies the same rule itself
 /// on its own probe; this is the same answer earlier, not a second
 /// rule. A PIN 1 at two or one tries left answers as locked, since this
-/// module never spends those attempts; a counter the card did not report
-/// is a device error. At no tries left or blocked the VERIFY goes to the
+/// module never spends those attempts (on a three-try Estonian eID card,
+/// a single wrong entry drops the counter to two and hits this floor on
+/// the next login, intentionally surfacing `CKR_PIN_LOCKED` rather than
+/// risking lockout); a counter above the profile's limit or unreadable is
+/// a device error. At no tries left or blocked the VERIFY goes to the
 /// card, whose answer is reported.
-const fn pin1_verify_guard(status: PinStatus) -> Result<(), CkRv> {
-    match check_retry_floor(FlooredCredential::Pin1, status) {
+const fn pin1_verify_guard(status: PinStatus, scheme: PinReferenceScheme) -> Result<(), CkRv> {
+    match check_retry_floor_with_scheme(FlooredCredential::Pin1, status, scheme) {
         Ok(()) => Ok(()),
         Err(refusal) => Err(retry_floor_rv(refusal)),
     }
@@ -2586,26 +2590,58 @@ mod tests {
         let retries = |count| {
             PinRetries::from_nibble(count).expect("test retry count fits the status-word nibble")
         };
+        let citizen = refineid_auth::PinReferenceScheme::Citizen;
+        let estonian = refineid_auth::PinReferenceScheme::Estonian;
 
-        assert_eq!(pin1_verify_guard(PinStatus::Remaining(retries(5))), Ok(()));
-        assert_eq!(pin1_verify_guard(PinStatus::Remaining(retries(4))), Ok(()));
-        assert_eq!(pin1_verify_guard(PinStatus::Remaining(retries(3))), Ok(()));
         assert_eq!(
-            pin1_verify_guard(PinStatus::Remaining(retries(2))),
+            pin1_verify_guard(PinStatus::Remaining(retries(5)), citizen),
+            Ok(())
+        );
+        assert_eq!(
+            pin1_verify_guard(PinStatus::Remaining(retries(4)), citizen),
+            Ok(())
+        );
+        assert_eq!(
+            pin1_verify_guard(PinStatus::Remaining(retries(3)), citizen),
+            Ok(())
+        );
+        assert_eq!(
+            pin1_verify_guard(PinStatus::Remaining(retries(3)), estonian),
+            Ok(())
+        );
+        assert_eq!(
+            pin1_verify_guard(PinStatus::Remaining(retries(4)), estonian),
+            Err(CKR_DEVICE_ERROR)
+        );
+        assert_eq!(
+            pin1_verify_guard(PinStatus::Remaining(retries(2)), citizen),
             Err(CKR_PIN_LOCKED)
         );
         assert_eq!(
-            pin1_verify_guard(PinStatus::Remaining(retries(1))),
+            pin1_verify_guard(PinStatus::Remaining(retries(2)), estonian),
+            Err(CKR_PIN_LOCKED)
+        );
+        assert_eq!(
+            pin1_verify_guard(PinStatus::Remaining(retries(1)), citizen),
             Err(CKR_PIN_LOCKED)
         );
         // At no tries left or blocked the VERIFY goes to the card, which
         // answers blocked and spends nothing.
-        assert_eq!(pin1_verify_guard(PinStatus::Remaining(retries(0))), Ok(()));
-        assert_eq!(pin1_verify_guard(PinStatus::Locked), Ok(()));
-        assert_eq!(pin1_verify_guard(PinStatus::Verified), Ok(()));
-        assert_eq!(pin1_verify_guard(PinStatus::NoInfo), Err(CKR_DEVICE_ERROR));
         assert_eq!(
-            pin1_verify_guard(PinStatus::Other(StatusWord::from_bytes(0x6F, 0x00))),
+            pin1_verify_guard(PinStatus::Remaining(retries(0)), citizen),
+            Ok(())
+        );
+        assert_eq!(pin1_verify_guard(PinStatus::Locked, citizen), Ok(()));
+        assert_eq!(pin1_verify_guard(PinStatus::Verified, citizen), Ok(()));
+        assert_eq!(
+            pin1_verify_guard(PinStatus::NoInfo, citizen),
+            Err(CKR_DEVICE_ERROR)
+        );
+        assert_eq!(
+            pin1_verify_guard(
+                PinStatus::Other(StatusWord::from_bytes(0x6F, 0x00)),
+                citizen
+            ),
             Err(CKR_DEVICE_ERROR)
         );
     }

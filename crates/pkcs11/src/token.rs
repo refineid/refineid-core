@@ -59,7 +59,7 @@ use refineid_digest::{
 };
 use refineid_pcsc::{PcscBackend, PcscCard, ReaderAccessCap, ReaderBackend as _, ReaderId};
 use refineid_pkcs15::{
-    CertSlot, Pkcs15Ops as _, TokenSerial, derive_printed_serial, render_token_serial,
+    CertSlot, Pkcs15Error, Pkcs15Ops as _, TokenSerial, derive_printed_serial, render_token_serial,
 };
 
 use refineid_remote::{
@@ -298,13 +298,16 @@ impl PersonalCode {
     /// Take the code from the subject `serialNumber` attribute, the
     /// authoritative carrier: Estonian certificates write `PNOEE-` and
     /// the eleven-digit isikukood, Finnish certificates write the
-    /// nine-character SATU/PEUIN directly. Returns `None` for any other
+    /// nine-character SATU/PEUIN directly. A `PNOEE-` prefix admits
+    /// only an eleven-digit isikukood; returns `None` for any other
     /// shape, so the common name remains the fallback.
     fn from_serial_number(value: &str) -> Option<Self> {
-        let code = value
-            .strip_prefix(SERIAL_NUMBER_PREFIX_ESTONIA)
-            .unwrap_or(value);
-        Self::from_code(code)
+        let trimmed = value.trim();
+        if let Some(code) = trimmed.strip_prefix(SERIAL_NUMBER_PREFIX_ESTONIA) {
+            Self::is_isikukood(code).then(|| Self(code.to_owned()))
+        } else {
+            Self::from_code(trimmed)
+        }
     }
 
     /// Take the last identifier of the subject common name, for a
@@ -315,16 +318,21 @@ impl PersonalCode {
     /// spaces (`SN GN CODE`, DVV S1 v4.0). Its code is the SATU/PEUIN,
     /// not the eleven-character HETU (PIC).
     fn from_subject_common_name(common_name: &str) -> Option<Self> {
-        Self::from_code(common_name.rsplit([',', ' ']).next()?)
+        let trimmed = common_name.trim_end_matches([',', ' ']);
+        Self::from_code(trimmed.rsplit([',', ' ']).next()?)
     }
 
-    /// The two printed forms: eleven ASCII digits (Estonian isikukood)
-    /// or eight digits and an ASCII alphanumeric check character
-    /// (Finnish SATU/PEUIN).
-    fn from_code(code: &str) -> Option<Self> {
+    /// Eleven ASCII digits (Estonian isikukood).
+    fn is_isikukood(code: &str) -> bool {
         let bytes = code.as_bytes();
-        let isikukood = bytes.len() == ISIKUKOOD_CHARS && bytes.iter().all(u8::is_ascii_digit);
-        let peuin = match bytes.split_last() {
+        bytes.len() == ISIKUKOOD_CHARS && bytes.iter().all(u8::is_ascii_digit)
+    }
+
+    /// Eight ASCII digits followed by one ASCII alphanumeric check
+    /// character (Finnish SATU/PEUIN).
+    fn is_peuin(code: &str) -> bool {
+        let bytes = code.as_bytes();
+        match bytes.split_last() {
             Some((check, digits)) => {
                 bytes.len() == PEUIN_CHARS
                     && digits.len() == PEUIN_DIGITS
@@ -332,8 +340,14 @@ impl PersonalCode {
                     && check.is_ascii_alphanumeric()
             }
             None => false,
-        };
-        (isikukood || peuin).then(|| Self(code.to_owned()))
+        }
+    }
+
+    /// The two printed forms: eleven ASCII digits (Estonian isikukood)
+    /// or eight digits and an ASCII alphanumeric check character
+    /// (Finnish SATU/PEUIN).
+    fn from_code(code: &str) -> Option<Self> {
+        (Self::is_isikukood(code) || Self::is_peuin(code)).then(|| Self(code.to_owned()))
     }
 
     /// The code as the subject writes it.
@@ -1612,15 +1626,18 @@ pub(super) fn build_token_objects(reader: &ReaderId) -> Result<TokenObjects, CkR
                 |printed| printed.as_str().to_owned(),
             )
         });
+    // Probe PKCS#15-resident slots (EF.4331, then Estonian EF.3411)
+    // before walking MF / DF.ESIGN for FINEID's alternate auth slot
+    // (EF.4333).
     let (cert, pin_scheme) = if let Ok(cert) = card.read_certificate(CertSlot::Authentication) {
         (cert, None)
-    } else if let Ok(cert) = card.read_certificate(CertSlot::AuthenticationAlt) {
-        (cert, None)
+    } else if let Ok(cert) = card.read_certificate(CertSlot::EstonianAuthentication) {
+        (cert, Some(PinReferenceScheme::Estonian))
     } else {
         (
-            card.read_certificate(CertSlot::EstonianAuthentication)
+            card.read_certificate(CertSlot::AuthenticationAlt)
                 .map_err(|_read_err| CKR_DEVICE_ERROR)?,
-            Some(PinReferenceScheme::Estonian),
+            None,
         )
     };
 
@@ -1652,7 +1669,7 @@ pub(super) fn build_token_objects(reader: &ReaderId) -> Result<TokenObjects, CkR
     let has_leaf_issuer = cas
         .iter()
         .any(|ca| ca.view().subject.as_der() == leaf_issuer.as_der());
-    if !has_leaf_issuer {
+    if !has_leaf_issuer && pin_scheme != Some(PinReferenceScheme::Estonian) {
         let on_card_cas: Vec<OwnedCert> = ON_CARD_CA_SLOTS
             .iter()
             .filter_map(|slot| read_optional_ca_cert(&mut card, *slot))
@@ -1830,34 +1847,36 @@ where
         clear_positive(pin_cache);
         return Err(CKR_DEVICE_ERROR);
     }
-    let serial = match live_token_serial(card) {
-        Ok(serial) => serial,
-        Err(error) => {
-            clear_positive(pin_cache);
-            return Err(error);
-        }
+    let (resolved_scheme, pin1_status) = match scheme {
+        Some(scheme) => match card.pin_status_with_scheme(scheme, PinSlot::Pin1) {
+            Ok(status) => (scheme, status),
+            Err(_status_err) => {
+                clear_positive(pin_cache);
+                return Err(CKR_DEVICE_ERROR);
+            }
+        },
+        None => match card.pin1_status_and_scheme() {
+            Ok(resolved) => resolved,
+            Err(_status_err) => {
+                clear_positive(pin_cache);
+                return Err(CKR_DEVICE_ERROR);
+            }
+        },
     };
-    let pin1_status = match scheme {
-        Some(scheme) => card.pin_status_with_scheme(scheme, PinSlot::Pin1),
-        None => card.pin_status(PinSlot::Pin1),
-    };
-    let pin1_status = match pin1_status {
-        Ok(status) => status,
-        Err(_status_err) => {
-            clear_positive(pin_cache);
-            return Err(CKR_DEVICE_ERROR);
-        }
-    };
-    if !pin1_status_permits_reusable_cache(
-        pin1_status,
-        scheme.unwrap_or(PinReferenceScheme::Citizen),
-    ) {
+    if !pin1_status_permits_reusable_cache(pin1_status, resolved_scheme) {
         clear_positive(pin_cache);
     }
     if let Err(error) = pin1_verify_guard(pin1_status) {
         clear_positive(pin_cache);
         return Err(error);
     }
+    let serial = match live_token_serial(card, resolved_scheme) {
+        Ok(serial) => serial,
+        Err(error) => {
+            clear_positive(pin_cache);
+            return Err(error);
+        }
+    };
     // The count is read while the transaction holds the card: a
     // card that leaves now ends this handle, so an unmoved count
     // proves no card left the reader since the card accepted the
@@ -1877,17 +1896,14 @@ where
     let checkout = pin_cache
         .lock()
         .map_err(|_poisoned| CKR_DEVICE_ERROR)?
-        .checkout_pin1(&serial, card_events, pin1_status)
+        .checkout_pin1(&serial, card_events, resolved_scheme, pin1_status)
         .ok_or(no_pin_to_present)?;
     let secret =
         refineid_auth::UnvalidatedSecret::from_owned_bytes(checkout.pin().as_bytes().to_vec());
     let Ok(pin1) = refineid_auth::Pin1::reconstruct(secret) else {
         return Err(CKR_DEVICE_ERROR);
     };
-    let answer = match scheme {
-        Some(scheme) => card.verify_pin1_with_scheme(scheme, pin1),
-        None => card.verify_pin1(pin1),
-    };
+    let answer = card.verify_pin1_with_scheme(resolved_scheme, pin1);
     let accepted = checkout.settle_verify(
         &mut pin_cache
             .lock()
@@ -2182,34 +2198,36 @@ where
         clear_positive(pin_cache);
         return Err(CKR_DEVICE_ERROR);
     }
-    let serial = match live_token_serial(card) {
-        Ok(serial) => serial,
-        Err(error) => {
-            clear_positive(pin_cache);
-            return Err(error);
-        }
+    let (resolved_scheme, pin1_status) = match scheme {
+        Some(scheme) => match card.pin_status_with_scheme(scheme, PinSlot::Pin1) {
+            Ok(status) => (scheme, status),
+            Err(_status_err) => {
+                clear_positive(pin_cache);
+                return Err(CKR_DEVICE_ERROR);
+            }
+        },
+        None => match card.pin1_status_and_scheme() {
+            Ok(resolved) => resolved,
+            Err(_status_err) => {
+                clear_positive(pin_cache);
+                return Err(CKR_DEVICE_ERROR);
+            }
+        },
     };
-    let pin1_status = match scheme {
-        Some(scheme) => card.pin_status_with_scheme(scheme, PinSlot::Pin1),
-        None => card.pin_status(PinSlot::Pin1),
-    };
-    let pin1_status = match pin1_status {
-        Ok(status) => status,
-        Err(_status_err) => {
-            clear_positive(pin_cache);
-            return Err(CKR_DEVICE_ERROR);
-        }
-    };
-    if !pin1_status_permits_reusable_cache(
-        pin1_status,
-        scheme.unwrap_or(PinReferenceScheme::Citizen),
-    ) {
+    if !pin1_status_permits_reusable_cache(pin1_status, resolved_scheme) {
         clear_positive(pin_cache);
     }
     if let Err(error) = pin1_verify_guard(pin1_status) {
         clear_positive(pin_cache);
         return Err(error);
     }
+    let serial = match live_token_serial(card, resolved_scheme) {
+        Ok(serial) => serial,
+        Err(error) => {
+            clear_positive(pin_cache);
+            return Err(error);
+        }
+    };
     let card_events = match read_card_events() {
         Ok(events) => events,
         Err(error) => {
@@ -2234,10 +2252,7 @@ where
         clear_positive(pin_cache);
         return Err(CKR_PIN_INCORRECT);
     };
-    let outcome = match scheme {
-        Some(scheme) => card.verify_pin1_with_scheme(scheme, pin1_val),
-        None => card.verify_pin1(pin1_val),
-    };
+    let outcome = card.verify_pin1_with_scheme(resolved_scheme, pin1_val);
     let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(AuthError::RetryFloor(refusal)) => {
@@ -2255,23 +2270,31 @@ where
         }
     };
     let mut cache = pin_cache.lock().map_err(|_poisoned| CKR_DEVICE_ERROR)?;
-    settle_login(&mut cache, serial, card_events, pin1, outcome)
+    settle_login(
+        &mut cache,
+        serial,
+        card_events,
+        resolved_scheme,
+        pin1,
+        outcome,
+    )
 }
 
 /// Settle a `C_Login` VERIFY by the card's answer: hold an accepted
-/// value (whose counter the card has restored to its five-try limit per
-/// FINEID S1 v4.2 section 3.5); remember a refused value as rejected;
+/// value under `scheme` (whose counter the card has restored to its
+/// profile's retry limit); remember a refused value as rejected;
 /// clear any held value for a blocked PIN or any other status word.
 fn settle_login(
     cache: &mut PinSafetyCache,
     serial: TokenSerial,
     card_events: u32,
+    scheme: PinReferenceScheme,
     pin1: PinBytes,
     outcome: VerifyOutcome,
 ) -> Result<(), CkRv> {
     match outcome {
         VerifyOutcome::Ok => cache
-            .store_pin1(serial, card_events, pin1)
+            .store_pin1(serial, card_events, scheme, pin1)
             .inspect_err(|_rejected| cache.clear_positive())
             .map_err(|_rejected| CKR_PIN_INCORRECT),
         VerifyOutcome::WrongPin { .. } => {
@@ -2314,14 +2337,60 @@ const fn retry_floor_rv(refusal: RetryFloorRefusal) -> CkRv {
     }
 }
 
-fn live_token_serial<T: CardTransport>(card: &mut T) -> Result<TokenSerial, CkRv> {
-    card.read_token_info()
-        .map_err(|_read_err| CKR_DEVICE_ERROR)?
-        .serial_number_hex()
-        .cloned()
-        .map(render_token_serial)
-        .filter(|serial| !serial.as_str().is_empty())
-        .ok_or(CKR_DEVICE_ERROR)
+/// Read the live card's binding serial for [`PinSafetyCache`].
+///
+/// Prefers EF.TokenInfo under the PKCS#15 application (shared by FINEID
+/// and current Estonian eID cards). If an Estonian card lacks a usable
+/// EF.TokenInfo serial (non-transport, non-security-status failure),
+/// falls back to its printed document number (matching
+/// [`build_token_objects`]) and immediately re-selects the PKCS#15
+/// application because `read_document_number` traverses from the MF.
+fn live_token_serial<T: CardTransport>(
+    card: &mut T,
+    scheme: PinReferenceScheme,
+) -> Result<TokenSerial, CkRv> {
+    match card.read_token_info() {
+        Ok(info) => {
+            if let Some(serial) = info
+                .serial_number_hex()
+                .cloned()
+                .map(render_token_serial)
+                .filter(|serial| !serial.as_str().is_empty())
+            {
+                return Ok(serial);
+            }
+        }
+        Err(
+            Pkcs15Error::Transport(_)
+            | Pkcs15Error::Outcome(_)
+            | Pkcs15Error::Aid(_)
+            | Pkcs15Error::Command(_)
+            | Pkcs15Error::Status(
+                refineid_apdu::StatusWord::SecurityNotSatisfied
+                | refineid_apdu::StatusWord::SmDataObjectsIncorrect,
+            ),
+        ) => {
+            return Err(CKR_DEVICE_ERROR);
+        }
+        Err(
+            Pkcs15Error::Status(_)
+            | Pkcs15Error::Empty
+            | Pkcs15Error::TooLarge
+            | Pkcs15Error::InvalidData(_),
+        ) => {}
+    }
+    if scheme == PinReferenceScheme::Estonian {
+        let number = card
+            .read_document_number()
+            .map_err(|_read_err| CKR_DEVICE_ERROR)?;
+        card.select_pkcs15_application()
+            .map_err(|_select_err| CKR_DEVICE_ERROR)?;
+        let serial = TokenSerial::new(number.as_str().to_owned());
+        if !serial.as_str().is_empty() {
+            return Ok(serial);
+        }
+    }
+    Err(CKR_DEVICE_ERROR)
 }
 
 fn clear_positive(pin_cache: &Arc<Mutex<PinSafetyCache>>) {
@@ -2433,7 +2502,10 @@ mod personal_code_tests {
     fn the_code_is_the_last_segment_of_the_common_name() {
         for (common_name, expected) in [
             ("TESTI,MATTI TAPIO,39901010000", "39901010000"),
+            ("TESTI,MATTI TAPIO,39901010000 ", "39901010000"),
+            ("TESTI,MATTI TAPIO,39901010000,", "39901010000"),
             ("TESTI MATTI TAPIO 12345678X", "12345678X"),
+            ("TESTI MATTI TAPIO 12345678X ", "12345678X"),
         ] {
             let code = PersonalCode::from_subject_common_name(common_name)
                 .unwrap_or_else(|| panic!("{common_name:?} names a code"));
@@ -2445,7 +2517,9 @@ mod personal_code_tests {
     fn the_serial_number_carries_the_code_and_the_estonian_prefix_is_stripped() {
         for (value, expected) in [
             ("PNOEE-39901010000", "39901010000"),
+            (" PNOEE-39901010000 ", "39901010000"),
             ("12345678X", "12345678X"),
+            (" 12345678X ", "12345678X"),
         ] {
             let code = PersonalCode::from_serial_number(value)
                 .unwrap_or_else(|| panic!("{value:?} names a code"));
@@ -2458,6 +2532,8 @@ mod personal_code_tests {
         for value in [
             "PNOEE-3990101000",
             "PNOEE-39901010000X",
+            "PNOEE-12345678X",
+            "PNOEE- 39901010000",
             "1234567",
             "12345678!",
             "123456789012",
@@ -3573,7 +3649,12 @@ mod tests {
     fn held_login_cache() -> super::PinSafetyCache {
         let mut cache = login_cache();
         cache
-            .store_pin1(login_serial(), LOGIN_READER_EVENTS, random_pin())
+            .store_pin1(
+                login_serial(),
+                LOGIN_READER_EVENTS,
+                refineid_auth::PinReferenceScheme::Citizen,
+                random_pin(),
+            )
             .expect("fresh random PIN1 is accepted into the cache");
         cache
     }
@@ -3617,6 +3698,7 @@ mod tests {
             .checkout_pin1(
                 &login_serial(),
                 LOGIN_READER_EVENTS,
+                refineid_auth::PinReferenceScheme::Citizen,
                 remaining(RETRIES_PRISTINE),
             )
             .expect("the settled value is checked out");
@@ -3635,6 +3717,7 @@ mod tests {
             &mut cache,
             login_serial(),
             LOGIN_READER_EVENTS,
+            refineid_auth::PinReferenceScheme::Citizen,
             random_pin(),
             super::VerifyOutcome::Ok,
         );
@@ -3649,7 +3732,8 @@ mod tests {
                 .checkout_pin1(
                     &login_serial(),
                     LOGIN_READER_EVENTS,
-                    remaining(RETRIES_PRISTINE)
+                    refineid_auth::PinReferenceScheme::Citizen,
+                    remaining(RETRIES_PRISTINE),
                 )
                 .is_some()
         );
@@ -3664,6 +3748,7 @@ mod tests {
             &mut cache,
             login_serial(),
             LOGIN_READER_EVENTS,
+            refineid_auth::PinReferenceScheme::Citizen,
             pin_from(&digits),
             super::VerifyOutcome::WrongPin {
                 retries_left: retries(RETRIES_ONE_SPENT),
@@ -3688,6 +3773,7 @@ mod tests {
                 &mut cache,
                 login_serial(),
                 LOGIN_READER_EVENTS,
+                refineid_auth::PinReferenceScheme::Citizen,
                 random_pin(),
                 outcome,
             );
@@ -3836,6 +3922,18 @@ mod tests {
         }
     }
 
+    fn probe_only_steps(
+        probe_reply: Result<refineid_apdu::ResponseApdu, String>,
+    ) -> Vec<(Vec<u8>, Result<refineid_apdu::ResponseApdu, String>)> {
+        vec![
+            (
+                select_pkcs15_wire(),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (pin1_probe_wire(), probe_reply),
+        ]
+    }
+
     fn pre_verify_steps_with_probe(
         probe_reply: Result<refineid_apdu::ResponseApdu, String>,
     ) -> Vec<(Vec<u8>, Result<refineid_apdu::ResponseApdu, String>)> {
@@ -3845,6 +3943,7 @@ mod tests {
                 select_pkcs15_wire(),
                 Ok(apdu_response(&[], StatusWord::Success)),
             ),
+            (pin1_probe_wire(), probe_reply),
             (
                 select_pkcs15_wire(),
                 Ok(apdu_response(&[], StatusWord::Success)),
@@ -3857,7 +3956,6 @@ mod tests {
                 read_token_info_wire(),
                 Ok(apdu_response(&token_info, StatusWord::Success)),
             ),
-            (pin1_probe_wire(), probe_reply),
         ]
     }
 
@@ -3942,6 +4040,15 @@ mod tests {
                 Ok(apdu_response(&[], StatusWord::Success)),
             ),
             (
+                pin1_probe_wire(),
+                Ok(apdu_response(
+                    &[],
+                    StatusWord::PinIncorrect {
+                        retries: retries(RETRIES_PRISTINE),
+                    },
+                )),
+            ),
+            (
                 select_pkcs15_wire(),
                 Ok(apdu_response(&[], StatusWord::Success)),
             ),
@@ -3954,21 +4061,21 @@ mod tests {
                 Ok(apdu_response(&[], StatusWord::FileNotFound)),
             ),
         ];
-        let probe_transport_failed = pre_verify_steps_with_probe(Err("probe fault".to_owned()));
-        let floor_two_left = pre_verify_steps_with_probe(Ok(apdu_response(
+        let probe_transport_failed = probe_only_steps(Err("probe fault".to_owned()));
+        let floor_two_left = probe_only_steps(Ok(apdu_response(
             &[],
             StatusWord::PinIncorrect {
                 retries: retries(RETRIES_BELOW_FLOOR),
             },
         )));
-        let floor_one_left = pre_verify_steps_with_probe(Ok(apdu_response(
+        let floor_one_left = probe_only_steps(Ok(apdu_response(
             &[],
             StatusWord::PinIncorrect {
                 retries: retries(RETRIES_LOCKDOWN_IMMINENT),
             },
         )));
         let floor_unreadable =
-            pre_verify_steps_with_probe(Ok(apdu_response(&[], StatusWord::AuthenticationFailed)));
+            probe_only_steps(Ok(apdu_response(&[], StatusWord::AuthenticationFailed)));
         let mut verify_probe_floor_failed = pre_verify_steps_with_probe(Ok(apdu_response(
             &[],
             StatusWord::PinIncorrect {
@@ -4145,7 +4252,7 @@ mod tests {
                 CKR_DEVICE_ERROR,
             ),
             (
-                pre_verify_steps_with_probe(Err("probe fault".to_owned())),
+                probe_only_steps(Err("probe fault".to_owned())),
                 Ok(LOGIN_READER_EVENTS),
                 CKR_DEVICE_ERROR,
             ),
@@ -4180,7 +4287,7 @@ mod tests {
                 crate::ck::CKR_USER_NOT_LOGGED_IN,
             ),
             (
-                pre_verify_steps_with_probe(Ok(apdu_response(
+                probe_only_steps(Ok(apdu_response(
                     &[],
                     StatusWord::PinIncorrect {
                         retries: retries(RETRIES_BELOW_FLOOR),
@@ -4198,10 +4305,7 @@ mod tests {
                 CKR_PIN_LOCKED,
             ),
             (
-                pre_verify_steps_with_probe(Ok(apdu_response(
-                    &[],
-                    StatusWord::AuthenticationFailed,
-                ))),
+                probe_only_steps(Ok(apdu_response(&[], StatusWord::AuthenticationFailed))),
                 Ok(LOGIN_READER_EVENTS),
                 CKR_DEVICE_ERROR,
             ),
@@ -4299,7 +4403,12 @@ mod tests {
         let wrong_digits = random_digits();
         let mut wrong_cache_inner = login_cache();
         wrong_cache_inner
-            .store_pin1(login_serial(), LOGIN_READER_EVENTS, pin_from(&wrong_digits))
+            .store_pin1(
+                login_serial(),
+                LOGIN_READER_EVENTS,
+                refineid_auth::PinReferenceScheme::Citizen,
+                pin_from(&wrong_digits),
+            )
             .expect("fresh random PIN1 stores cleanly");
         let wrong_cache = std::sync::Arc::new(std::sync::Mutex::new(wrong_cache_inner));
         let mut wrong_steps = pre_verify_steps_with_probe(Ok(apdu_response(
@@ -4400,5 +4509,292 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(!recovered.holds_pin1());
+    }
+
+    #[test]
+    fn estonian_login_and_sign_bind_scheme_in_cached_entry() {
+        const SIGNATURE_FILL: u8 = 0x5A;
+        let scheme = refineid_auth::PinReferenceScheme::Estonian;
+        let pristine = scheme.pin_retry_limit();
+        let estonian_probe_wire =
+            refineid_apdu::CommandApdu::case_1(refineid_apdu::CommandHeader {
+                class: refineid_apdu::ApduClass::Plain,
+                instruction: refineid_auth::verify::VERIFY_INS,
+                p1: refineid_auth::verify::VERIFY_P1,
+                p2: scheme.reference(refineid_auth::PinSlot::Pin1),
+            })
+            .as_bytes()
+            .to_vec();
+        let token_info = token_info_der_fixture();
+        let probe_ok = Ok(apdu_response(
+            &[],
+            StatusWord::PinIncorrect {
+                retries: retries(pristine),
+            },
+        ));
+        let login_steps = vec![
+            (
+                select_pkcs15_wire(),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (estonian_probe_wire.clone(), probe_ok.clone()),
+            (
+                select_pkcs15_wire(),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (
+                select_token_info_wire(),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (
+                read_token_info_wire(),
+                Ok(apdu_response(&token_info, StatusWord::Success)),
+            ),
+            (estonian_probe_wire.clone(), probe_ok.clone()),
+        ];
+        let mut login_card = ScriptedLoginCard::new(login_steps, Some(Ok(StatusWord::Success)));
+        let pin_cache = std::sync::Arc::new(std::sync::Mutex::new(login_cache()));
+        super::run_card_login_with_scheme(
+            &mut login_card,
+            || Ok(LOGIN_READER_EVENTS),
+            &pin_cache,
+            random_pin(),
+            Some(scheme),
+        )
+        .expect("Estonian login succeeds at 3-try pristine counter");
+        login_card.assert_drained();
+
+        let digest = refineid_digest::Sha384::of(b"estonian cached pin1 sign test");
+        let signature = vec![SIGNATURE_FILL; super::ECDSA_P384_SIGNATURE_BYTES];
+        let mse_wire = refineid_sign::commands::MseSet {
+            alg_ref: refineid_sign::commands::SignatureAlgRef::SHA384_ECDSA,
+            key_ref: refineid_sign::KeyRef::Auth.reference(refineid_sign::SignScheme::Citizen),
+        }
+        .into_apdu()
+        .expect("MSE:Set encodes")
+        .as_bytes()
+        .to_vec();
+        let hash_wire = refineid_sign::commands::PsoHashExternal {
+            hash: refineid_sign::commands::ExternalHashValue::Sha384(*digest.as_bytes()),
+        }
+        .into_apdu()
+        .expect("PSO:HASH encodes")
+        .as_bytes()
+        .to_vec();
+        let cds_le = refineid_sign::commands::expected_length_le(super::ECDSA_P384_SIGNATURE_BYTES);
+        let cds_wire = refineid_sign::commands::PsoComputeDigitalSignature
+            .into_apdu(cds_le)
+            .as_bytes()
+            .to_vec();
+        let sign_steps = vec![
+            (
+                select_pkcs15_wire(),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (estonian_probe_wire.clone(), probe_ok.clone()),
+            (
+                select_pkcs15_wire(),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (
+                select_token_info_wire(),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (
+                read_token_info_wire(),
+                Ok(apdu_response(&token_info, StatusWord::Success)),
+            ),
+            (estonian_probe_wire, probe_ok),
+            (mse_wire, Ok(apdu_response(&[], StatusWord::Success))),
+            (hash_wire, Ok(apdu_response(&[], StatusWord::Success))),
+            (cds_wire, Ok(apdu_response(&signature, StatusWord::Success))),
+        ];
+        let mut sign_card = ScriptedLoginCard::new(sign_steps, Some(Ok(StatusWord::Success)));
+        let request =
+            crate::sign::CardSignInput::parse(crate::sign::Mechanism::Ecdsa, digest.as_bytes())
+                .expect("SHA-384 ECDSA digest parses");
+        let signed = super::run_card_sign_with_scheme(
+            &mut sign_card,
+            || Ok(LOGIN_READER_EVENTS),
+            &pin_cache,
+            Some(scheme),
+            request,
+        )
+        .expect("Estonian sign checks out held PIN1 at 3-try pristine counter");
+        assert_eq!(signed, signature);
+        sign_card.assert_drained();
+        assert!(
+            pin_cache
+                .lock()
+                .expect("cache mutex is unpoisoned")
+                .holds_pin1()
+        );
+    }
+
+    #[test]
+    fn estonian_auto_detected_login_falls_back_to_document_number_when_token_info_is_absent() {
+        const DOC_NUMBER_TEXT: &str = "AA0000000";
+        let scheme = refineid_auth::PinReferenceScheme::Estonian;
+        let pristine = scheme.pin_retry_limit();
+        let probe_for = |target: refineid_auth::PinReferenceScheme| {
+            refineid_apdu::CommandApdu::case_1(refineid_apdu::CommandHeader {
+                class: refineid_apdu::ApduClass::Plain,
+                instruction: refineid_auth::verify::VERIFY_INS,
+                p1: refineid_auth::verify::VERIFY_P1,
+                p2: target.reference(refineid_auth::PinSlot::Pin1),
+            })
+            .as_bytes()
+            .to_vec()
+        };
+        let doc_path = refineid_apdu::iso7816::AbsolutePath::new(vec![
+            refineid_pkcs15::DF_ESTONIAN_PERSONAL_DATA_FID,
+            refineid_pkcs15::EF_ESTONIAN_DOCUMENT_NUMBER_FID,
+        ])
+        .expect("DF.DD / EF.5007 absolute path is valid");
+        let select_doc_wire = refineid_apdu::iso7816::SelectFile {
+            class: refineid_apdu::ApduClass::Plain,
+            target: refineid_apdu::iso7816::SelectFileTarget::AbsolutePath(doc_path),
+            response_mode: refineid_apdu::iso7816::SelectFileResponseMode::Fcp,
+        }
+        .into_apdu()
+        .as_bytes()
+        .to_vec();
+        let probe_cap = u8::try_from(refineid_pkcs15::DOCUMENT_NUMBER_CHARS + 1)
+            .expect("document-number probe cap fits u8");
+        let read_doc_wire = refineid_apdu::iso7816::ReadBinary {
+            class: refineid_apdu::ApduClass::Plain,
+            offset: refineid_apdu::iso7816::ReadBinaryOffset::Direct(
+                refineid_apdu::iso7816::DirectOffset15::try_new(0).expect("offset zero is valid"),
+            ),
+            le: probe_cap,
+        }
+        .into_apdu()
+        .as_bytes()
+        .to_vec();
+        let probe_ok = Ok(apdu_response(
+            &[],
+            StatusWord::PinIncorrect {
+                retries: retries(pristine),
+            },
+        ));
+        let steps = vec![
+            (
+                select_pkcs15_wire(),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (
+                probe_for(refineid_auth::PinReferenceScheme::Citizen),
+                Ok(apdu_response(&[], StatusWord::ReferenceDataNotFound)),
+            ),
+            (
+                probe_for(refineid_auth::PinReferenceScheme::Organizational),
+                Ok(apdu_response(&[], StatusWord::ReferenceDataNotFound)),
+            ),
+            (probe_for(scheme), probe_ok.clone()),
+            (
+                select_pkcs15_wire(),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (
+                select_token_info_wire(),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (
+                read_token_info_wire(),
+                Ok(apdu_response(&[], StatusWord::FileNotFound)),
+            ),
+            (select_doc_wire, Ok(apdu_response(&[], StatusWord::Success))),
+            (
+                read_doc_wire,
+                Ok(apdu_response(
+                    DOC_NUMBER_TEXT.as_bytes(),
+                    StatusWord::Success,
+                )),
+            ),
+            (
+                select_pkcs15_wire(),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (probe_for(scheme), probe_ok),
+        ];
+        let mut card = ScriptedLoginCard::new(steps, Some(Ok(StatusWord::Success)));
+        let pin_cache = std::sync::Arc::new(std::sync::Mutex::new(login_cache()));
+        super::run_card_login_with_scheme(
+            &mut card,
+            || Ok(LOGIN_READER_EVENTS),
+            &pin_cache,
+            random_pin(),
+            None,
+        )
+        .expect("auto-detected Estonian login falls back to document number when EF.TokenInfo is absent");
+        card.assert_drained();
+        let mut guard = pin_cache.lock().expect("cache mutex is unpoisoned");
+        let expected_serial = refineid_pkcs15::TokenSerial::new(DOC_NUMBER_TEXT.to_owned());
+        assert!(
+            guard
+                .checkout_pin1(
+                    &expected_serial,
+                    LOGIN_READER_EVENTS,
+                    scheme,
+                    PinStatus::Remaining(retries(pristine)),
+                )
+                .is_some(),
+            "held PIN1 must bind to the fallback document number and Estonian scheme"
+        );
+    }
+
+    #[test]
+    fn estonian_login_does_not_fall_back_to_document_number_on_token_info_transport_error() {
+        let scheme = refineid_auth::PinReferenceScheme::Estonian;
+        let pristine = scheme.pin_retry_limit();
+        let estonian_probe_wire =
+            refineid_apdu::CommandApdu::case_1(refineid_apdu::CommandHeader {
+                class: refineid_apdu::ApduClass::Plain,
+                instruction: refineid_auth::verify::VERIFY_INS,
+                p1: refineid_auth::verify::VERIFY_P1,
+                p2: scheme.reference(refineid_auth::PinSlot::Pin1),
+            })
+            .as_bytes()
+            .to_vec();
+        let steps = vec![
+            (
+                select_pkcs15_wire(),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (
+                estonian_probe_wire,
+                Ok(apdu_response(
+                    &[],
+                    StatusWord::PinIncorrect {
+                        retries: retries(pristine),
+                    },
+                )),
+            ),
+            (
+                select_pkcs15_wire(),
+                Ok(apdu_response(&[], StatusWord::Success)),
+            ),
+            (
+                select_token_info_wire(),
+                Err("token info transport fault".to_owned()),
+            ),
+        ];
+        let mut card = ScriptedLoginCard::new(steps, None);
+        let pin_cache = std::sync::Arc::new(std::sync::Mutex::new(held_login_cache()));
+        let res = super::run_card_login_with_scheme(
+            &mut card,
+            || Ok(LOGIN_READER_EVENTS),
+            &pin_cache,
+            random_pin(),
+            Some(scheme),
+        );
+        assert_eq!(res, Err(CKR_DEVICE_ERROR));
+        card.assert_drained();
+        assert!(
+            !pin_cache
+                .lock()
+                .expect("cache mutex is unpoisoned")
+                .holds_pin1()
+        );
     }
 }

@@ -1009,9 +1009,6 @@ unsafe extern "C" fn c_login(
         Ok(cache) => cache,
         Err(error) => return error,
     };
-    if let Ok(mut cache) = pin_cache.lock() {
-        cache.set_scheme(pin_scheme.unwrap_or(PinReferenceScheme::Citizen));
-    }
     drop(guard);
     let rv = match crate::token::card_login_with_scheme(&kind, &pin_cache, pin1, pin_scheme) {
         Ok(()) => CKR_OK,

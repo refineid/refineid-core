@@ -13,8 +13,11 @@ Windows machine needs for them and the two places where Windows differs.
 - **Git for Windows**, whose Git Bash runs the hooks and the scripts under
   `scripts/`. Enable the hooks once per clone from Git Bash:
   `sh scripts/install-hooks.sh`.
-- **Rust through rustup**, with the MSVC toolchain and the Visual Studio C++
-  build tools and Windows SDK it links with. The refineid-windows repository's
+- **Rust through rustup**, with the MSVC toolchain, the Visual Studio C++
+  build tools and Windows SDK it links with, and the `rust-src` component
+  declared in `rust-toolchain.toml` (required by trybuild UI tests; install
+  manually with `rustup component add rust-src` if overriding the toolchain
+  with a minimal profile). The refineid-windows repository's
   `scripts/setup-dev-tools.ps1` installs and updates all of them.
 - **Python 3 with a `python3` command**, which the gate scripts call. Install
   it with the [Python Install Manager](https://docs.python.org/3/using/windows.html)

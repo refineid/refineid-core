@@ -100,6 +100,12 @@ the [core migration policy](doc/architecture/core-migration.md),
 
 ## Build and check
 
+The workspace uses the latest stable Rust toolchain via `rust-toolchain.toml`,
+including `clippy`, `rustfmt`, and `rust-src`. The trybuild compile-fail UI
+tests require `rust-src` so `rustc` renders standard-library source snippets
+matching the checked-in `.stderr` expectations; if using a minimal-profile
+toolchain override, install it with `rustup component add rust-src`.
+
 ```sh
 cargo test --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings

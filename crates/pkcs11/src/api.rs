@@ -31,7 +31,7 @@
 use core::ptr;
 
 use crate::pin::{PinBytes, PinRoleError};
-use refineid_auth::{PinReferenceScheme, PinStatus};
+use refineid_auth::{PasswordLengthRange, PinReferenceScheme, PinStatus};
 
 use crate::ck::{
     CK_EFFECTIVELY_INFINITE, CK_UNAVAILABLE_INFORMATION, CKF_DONT_BLOCK, CKF_EC_F_P,
@@ -62,7 +62,7 @@ use crate::slot_kind::SlotKind;
 use crate::state::{
     MODULE, ModuleState, PIN1_MAX_DIGITS, PIN1_MIN_DIGITS, Session, SlotRecord, session_state,
 };
-use crate::token::{AttrValue, KeyGate, ObjectKind, TokenObjects};
+use crate::token::{AttrValue, CardSessionProfile, KeyGate, ObjectKind, TokenObjects};
 
 /// Cryptoki interface version this module implements (`2.40`, OASIS
 /// PKCS#11 v2.40). Reported in [`CkInfo::cryptoki_version`] and the
@@ -554,11 +554,11 @@ unsafe extern "C" fn c_get_token_info(slot_id: CkSlotId, info: CkTokenInfoPtr) -
     };
     let rv = if slot.card_present() {
         let kind = slot.kind().clone();
-        let (serial, key_gate, pin_scheme) = match module.ensure_token(slot_id) {
+        let (serial, key_gate, profile) = match module.ensure_token(slot_id) {
             Ok(objects) => (
                 objects.token_serial().to_owned(),
                 objects.key_gate(),
-                objects.pin_scheme(),
+                objects.session_profile().clone(),
             ),
             Err(error) => {
                 diag!("C_GetTokenInfo slot={slot_id} ensure_token error={error:#06x}");
@@ -566,7 +566,7 @@ unsafe extern "C" fn c_get_token_info(slot_id: CkSlotId, info: CkTokenInfoPtr) -
             }
         };
         drop(guard);
-        let pin1_status = match crate::token::card_pin1_status_with_scheme(&kind, pin_scheme) {
+        let pin1_status = match crate::token::card_pin1_status_with_profile(&kind, &profile) {
             Ok(status) => status,
             Err(error) => {
                 diag!("C_GetTokenInfo slot={slot_id} auth_status error={error:#06x}");
@@ -575,7 +575,13 @@ unsafe extern "C" fn c_get_token_info(slot_id: CkSlotId, info: CkTokenInfoPtr) -
         };
         // SAFETY: caller guarantees info is a writable CK_TOKEN_INFO.
         unsafe {
-            info.write(token_info_value(&serial, pin1_status, key_gate, pin_scheme));
+            info.write(token_info_value(
+                &serial,
+                pin1_status,
+                key_gate,
+                profile.pin_scheme(),
+                profile.pin1_length_range(),
+            ));
         }
         CKR_OK
     } else {
@@ -634,6 +640,7 @@ fn token_info_value(
     pin1_status: PinStatus,
     key_gate: KeyGate,
     pin_scheme: Option<PinReferenceScheme>,
+    pin_lengths: Option<PasswordLengthRange>,
 ) -> CkTokenInfo {
     // With `pin-change` enabled the token is not write-protected, so
     // NSS offers "Change Password" -> C_SetPIN. In the default
@@ -663,6 +670,14 @@ fn token_info_value(
             padded_field(TOKEN_LABEL_PHONE),
         ),
     };
+    let (min_pin_len, max_pin_len) = match pin_lengths {
+        Some(range) => {
+            let max = range.max().min(PIN1_MAX_DIGITS);
+            let min = range.min().max(PIN1_MIN_DIGITS).min(max);
+            (min, max)
+        }
+        None => (PIN1_MIN_DIGITS, PIN1_MAX_DIGITS),
+    };
     CkTokenInfo {
         label,
         manufacturer_id: padded_field("RefineID"),
@@ -676,8 +691,8 @@ fn token_info_value(
         ul_session_count: CK_UNAVAILABLE_INFORMATION,
         ul_max_rw_session_count: CK_EFFECTIVELY_INFINITE,
         ul_rw_session_count: CK_UNAVAILABLE_INFORMATION,
-        ul_max_pin_len: ulong_from_usize(PIN1_MAX_DIGITS),
-        ul_min_pin_len: ulong_from_usize(PIN1_MIN_DIGITS),
+        ul_max_pin_len: ulong_from_usize(max_pin_len),
+        ul_min_pin_len: ulong_from_usize(min_pin_len),
         ul_total_public_memory: CK_UNAVAILABLE_INFORMATION,
         ul_free_public_memory: CK_UNAVAILABLE_INFORMATION,
         ul_total_private_memory: CK_UNAVAILABLE_INFORMATION,
@@ -1001,16 +1016,21 @@ unsafe extern "C" fn c_login(
     if let Err(_role_err) = pin1.validate_digits(PIN1_MIN_DIGITS, PIN1_MAX_DIGITS) {
         return CKR_PIN_LEN_RANGE;
     }
-    let pin_scheme = match module.ensure_token(slot_id) {
-        Ok(objects) => objects.pin_scheme(),
+    let profile = match module.ensure_token(slot_id) {
+        Ok(objects) => objects.session_profile().clone(),
         Err(error) => return error,
     };
+    if let Some(range) = profile.pin1_length_range()
+        && !range.contains(pin1.as_bytes().len())
+    {
+        return CKR_PIN_LEN_RANGE;
+    }
     let pin_cache = match module.pin_cache(slot_id) {
         Ok(cache) => cache,
         Err(error) => return error,
     };
     drop(guard);
-    let rv = match crate::token::card_login_with_scheme(&kind, &pin_cache, pin1, pin_scheme) {
+    let rv = match crate::token::card_login_with_profile(&kind, &pin_cache, pin1, &profile) {
         Ok(()) => CKR_OK,
         Err(error) => error,
     };
@@ -1496,11 +1516,11 @@ unsafe extern "C" fn c_sign(
             return error;
         }
     };
-    let pin_scheme = if kind.is_remote() {
-        None
+    let session_profile = if kind.is_remote() {
+        CardSessionProfile::Fineid
     } else {
         match module.ensure_token(slot_id) {
-            Ok(objects) => objects.pin_scheme(),
+            Ok(objects) => objects.session_profile().clone(),
             Err(error) => {
                 clear_sign(module, session);
                 return error;
@@ -1550,9 +1570,13 @@ unsafe extern "C" fn c_sign(
             None => Err(CKR_DEVICE_REMOVED),
         },
         (SlotKind::Remote { .. }, None) => Err(CKR_DEVICE_ERROR),
-        (SlotKind::Local { .. }, _) => {
-            crate::token::card_sign_with_scheme(&kind, &pin_cache, mechanism, &input, pin_scheme)
-        }
+        (SlotKind::Local { .. }, _) => crate::token::card_sign_with_profile(
+            &kind,
+            &pin_cache,
+            mechanism,
+            &input,
+            &session_profile,
+        ),
     };
     let rv = match outcome {
         Ok(bytes) => {
@@ -1670,10 +1694,19 @@ unsafe extern "C" fn c_set_pin(
     let Some(reader) = kind.local_reader().cloned() else {
         return CKR_FUNCTION_NOT_SUPPORTED;
     };
+    let profile = match module.ensure_token(slot_id) {
+        Ok(objects) => objects.session_profile().clone(),
+        Err(error) => return error,
+    };
+    if let Some(range) = profile.pin1_length_range()
+        && !range.contains(new.as_bytes().len())
+    {
+        return CKR_PIN_LEN_RANGE;
+    }
     // Drop the lock before card IO (an unrelated PKCS#11 call must
     // not block on the card round trip).
     drop(guard);
-    if let Err(err) = crate::token::card_change_pin1(&reader, current, new) {
+    if let Err(err) = crate::token::card_change_pin1_with_profile(&reader, current, new, &profile) {
         return err;
     }
     CKR_OK
@@ -2641,6 +2674,7 @@ mod tests {
             PinStatus::Verified,
             KeyGate::Device,
             None,
+            None,
         );
         assert_eq!(
             phone.flags,
@@ -2650,7 +2684,7 @@ mod tests {
                 | CKF_PROTECTED_AUTHENTICATION_PATH
         );
         assert_eq!(phone.label, padded_field(super::TOKEN_LABEL_PHONE));
-        let card = token_info_value("TEST123", pristine, KeyGate::Login, None);
+        let card = token_info_value("TEST123", pristine, KeyGate::Login, None, None);
         assert_ne!(card.flags & CKF_LOGIN_REQUIRED, 0);
         assert_eq!(card.flags & CKF_PROTECTED_AUTHENTICATION_PATH, 0);
         assert_eq!(card.label, padded_field(super::TOKEN_LABEL_IDENTIFY));
@@ -2661,14 +2695,18 @@ mod tests {
             PinRetries::from_nibble(estonian_limit)
                 .expect("test retry count fits the status-word nibble"),
         );
+        let custom_range = refineid_auth::PasswordLengthRange::new(5, 8).expect("valid range");
         let estonian = token_info_value(
             "TEST123",
             estonian_pin,
             KeyGate::Login,
             Some(refineid_auth::PinReferenceScheme::Estonian),
+            Some(custom_range),
         );
         assert_eq!(estonian.model, padded_field(super::TOKEN_MODEL_ESTONIAN));
         assert_eq!(estonian.flags & CKF_USER_PIN_COUNT_LOW, 0);
+        assert_eq!(estonian.ul_min_pin_len, 5);
+        assert_eq!(estonian.ul_max_pin_len, 8);
     }
 
     /// A phone-served token signs in a public session and in a user
@@ -3167,6 +3205,7 @@ mod tests {
             "TEST123",
             PinStatus::Remaining(retries),
             KeyGate::Login,
+            None,
             None,
         );
         assert_eq!(token.manufacturer_id, expected);

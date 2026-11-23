@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! EF.AOD parsing: the length bounds of the card's password objects.
+//! EF.AOD parsing: authentication-object links, flags, length bounds,
+//! stored lengths, references, and pad octets.
 //!
 //! EF.AOD (Authentication Object Directory) lists the card's
 //! authentication objects as ISO/IEC 7816-15 `AuthenticationObjectChoice`
-//! values (FINEID S4-1 v4.2 section 8.1.5; FINEID S4-2 v4.0 sections
-//! 4.6.10 and 4.7.10). A password object carries `PasswordAttributes`:
+//! values (PKCS#15 v1.1 section 6.8; FINEID S4-1 v4.2 section 8.1.5;
+//! FINEID S4-2 v4.0 sections 4.6.10 and 4.7.10). A password object
+//! carries `CommonObjectAttributes`, `CommonAuthenticationObjectAttributes`,
+//! and `PasswordAttributes`:
 //!
 //! ```text
 //! PasswordAttributes ::= SEQUENCE {
@@ -27,36 +30,36 @@
 //!     storedLength  INTEGER,
 //!     maxLength     INTEGER OPTIONAL,
 //!     pwdReference  [0] Reference DEFAULT 0,
-//!     padChar       OCTET STRING OPTIONAL,
+//!     padChar       OCTET STRING (SIZE(1)) OPTIONAL,
 //!     ... }
 //! ```
-//!
-//! What this software consults is the reference and the length range, so
-//! a password object is deconstructed to exactly those: the reference the
-//! card names it by, and the shortest and longest value it accepts. The
-//! longest is `maxLength` when the card lists it, and `storedLength`
-//! otherwise.
 
 use core::fmt;
 
 use refineid_apdu::FileId;
-use refineid_ber::{BerError, BerTag, BerTlv, BerTlvAny, BerTlvIter, BitString, Integer, Sequence};
+use refineid_ber::{
+    BerError, BerTag, BerTlv, BerTlvAny, BerTlvIter, BitString, Integer, OctetString, Sequence,
+};
 
-/// EF.AOD, the Authentication Object Directory, under the PKCS#15
-/// application (FINEID S4-1 v4.2 section 8.1.5; FINEID S4-2 v4.0
-/// sections 4.6.10 and 4.7.10).
+use crate::directory::{
+    FileContent, FileEnd, ObjectIdentifier, bit_string_flag, parse_common_object_attributes,
+    validate_bit_string,
+};
+
+/// EF.AOD, the Authentication Object Directory, under the FINEID
+/// PKCS#15 application (FINEID S4-1 v4.2 section 8.1.5; FINEID S4-2
+/// v4.0 sections 4.6.10 and 4.7.10). Other ISO/IEC 7816-15 cards
+/// publish their EF.AOD path through EF.ODF.
 pub const EF_AOD_FID: FileId = FileId::from_u16(0x4401);
 
-/// EF.AOD on the Estonian eID application (GED24035, the Estonian eID
-/// developer guide, EF.AOD). The directory has the same
-/// `AuthenticationObjectChoice` content as the FINEID file, under the
-/// Estonian application's file identifier.
-pub const EF_ESTONIAN_AOD_FID: FileId = FileId::from_u16(0x5006);
-
 /// The end-of-contents octet (ITU-T X.690 section 8.1.5). No PKCS#15
-/// object starts with it, so at an object boundary it begins the file's
+/// object starts with it, so at an object boundary it begins trailing
 /// zero padding.
 const END_OF_CONTENTS_OCTET: u8 = 0x00;
+
+/// Erased-EEPROM trailing padding octet permitted at an object
+/// boundary alongside 00 (ISO/IEC 7816-4 section 5.2.2.1).
+const PADDING_FF_OCTET: u8 = 0xFF;
 
 /// ASN.1 universal `ENUMERATED` (ITU-T X.680 section 20), the
 /// `pwdType` encoding.
@@ -72,12 +75,83 @@ const PWD_REFERENCE_TAG: u16 = 0x80;
 /// The `pwdReference` value when the card omits it (`DEFAULT 0`).
 const PWD_REFERENCE_DEFAULT: u8 = 0;
 
-/// `pwdType` `ascii-numeric(1)`: one byte per character, as FINEID cards
-/// list their PINs and the PUK.
+/// `pwdType` `ascii-numeric(1)`: one byte per character.
 const PASSWORD_TYPE_ASCII_NUMERIC: u8 = 1;
-/// `pwdType` `utf8(2)`: a digit is one byte, so the lengths count digits
-/// as for `ascii-numeric`.
+/// `pwdType` `utf8(2)`: a digit is one byte, so lengths count digits as
+/// for `ascii-numeric`.
 const PASSWORD_TYPE_UTF8: u8 = 2;
+
+/// Bit positions in ISO/IEC 7816-15 / PKCS#15 v1.1 section 6.8.1
+/// `PasswordFlags`.
+const PWD_FLAG_CASE_SENSITIVE_BIT: usize = 0;
+const PWD_FLAG_LOCAL_BIT: usize = 1;
+const PWD_FLAG_INITIALIZED_BIT: usize = 4;
+const PWD_FLAG_NEEDS_PADDING_BIT: usize = 5;
+const PWD_FLAG_UNBLOCKING_PASSWORD_BIT: usize = 6;
+const PWD_FLAG_EXCHANGE_REF_DATA_BIT: usize = 11;
+
+/// Decoded flags from `PasswordAttributes.pwdFlags` (PKCS#15 v1.1
+/// section 6.8.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PasswordFlags {
+    case_sensitive: bool,
+    local: bool,
+    initialized: bool,
+    needs_padding: bool,
+    unblocking_password: bool,
+    exchange_ref_data: bool,
+}
+
+impl PasswordFlags {
+    fn parse_bit_string(content: &[u8]) -> Option<Self> {
+        let (unused, octets) = validate_bit_string(content)?;
+        Some(Self {
+            case_sensitive: bit_string_flag(unused, octets, PWD_FLAG_CASE_SENSITIVE_BIT),
+            local: bit_string_flag(unused, octets, PWD_FLAG_LOCAL_BIT),
+            initialized: bit_string_flag(unused, octets, PWD_FLAG_INITIALIZED_BIT),
+            needs_padding: bit_string_flag(unused, octets, PWD_FLAG_NEEDS_PADDING_BIT),
+            unblocking_password: bit_string_flag(unused, octets, PWD_FLAG_UNBLOCKING_PASSWORD_BIT),
+            exchange_ref_data: bit_string_flag(unused, octets, PWD_FLAG_EXCHANGE_REF_DATA_BIT),
+        })
+    }
+
+    /// Bit 0 (`case-sensitive`).
+    #[must_use]
+    pub const fn case_sensitive(self) -> bool {
+        self.case_sensitive
+    }
+
+    /// Bit 1 (`local`).
+    #[must_use]
+    pub const fn local(self) -> bool {
+        self.local
+    }
+
+    /// Bit 4 (`initialized`).
+    #[must_use]
+    pub const fn initialized(self) -> bool {
+        self.initialized
+    }
+
+    /// Bit 5 (`needs-padding`): the card expects credentials to be
+    /// right-padded to `storedLength` with `padChar`.
+    #[must_use]
+    pub const fn needs_padding(self) -> bool {
+        self.needs_padding
+    }
+
+    /// Bit 6 (`unblockingPassword`): distinguishes a PUK from a PIN.
+    #[must_use]
+    pub const fn unblocking_password(self) -> bool {
+        self.unblocking_password
+    }
+
+    /// Bit 11 (`exchangeRefData`).
+    #[must_use]
+    pub const fn exchange_ref_data(self) -> bool {
+        self.exchange_ref_data
+    }
+}
 
 /// The shortest and longest value a credential accepts, in digits.
 ///
@@ -136,15 +210,43 @@ impl PasswordLengthRange {
     }
 }
 
-/// One password object from EF.AOD: the reference the card names it by
-/// and the length range it accepts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One password object from EF.AOD: its `authId` links, flags, wire
+/// reference, accepted digit-length range, stored length, and optional
+/// pad octet.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PasswordObject {
+    auth_id: Option<ObjectIdentifier>,
+    protecting_auth_id: Option<ObjectIdentifier>,
+    flags: PasswordFlags,
     reference: u8,
     lengths: PasswordLengthRange,
+    stored_length: u8,
+    pad_char: Option<u8>,
 }
 
 impl PasswordObject {
+    /// `CommonAuthenticationObjectAttributes.authId`, when present:
+    /// the identifier that private keys in EF.PrKDF reference in their
+    /// `CommonObjectAttributes.authId`.
+    #[must_use]
+    pub const fn auth_id(&self) -> Option<&ObjectIdentifier> {
+        self.auth_id.as_ref()
+    }
+
+    /// `CommonObjectAttributes.authId`, when present: the identifier of
+    /// the authentication object (typically the PUK) that unblocks this
+    /// password object.
+    #[must_use]
+    pub const fn protecting_auth_id(&self) -> Option<&ObjectIdentifier> {
+        self.protecting_auth_id.as_ref()
+    }
+
+    /// Decoded `PasswordFlags` (`pwdFlags`).
+    #[must_use]
+    pub const fn flags(&self) -> PasswordFlags {
+        self.flags
+    }
+
     /// `pwdReference` as the card lists it.
     #[must_use]
     pub const fn reference(&self) -> u8 {
@@ -157,17 +259,41 @@ impl PasswordObject {
     pub const fn lengths(&self) -> PasswordLengthRange {
         self.lengths
     }
+
+    /// `storedLength`: the block width a padded card compares.
+    #[must_use]
+    pub const fn stored_length(&self) -> u8 {
+        self.stored_length
+    }
+
+    /// `padChar`: the single padding octet published by the card, when
+    /// present.
+    #[must_use]
+    pub const fn pad_char(&self) -> Option<u8> {
+        self.pad_char
+    }
+}
+
+/// Outcome of parsing an EF.AOD [`FileContent`] read at the border.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthenticationObjectsRead {
+    /// Confirmed EOF and every record decoded cleanly.
+    Parsed(AuthenticationObjects),
+    /// The read stopped before the card confirmed end of file.
+    Incomplete,
+    /// The octets did not decode as valid EF.AOD records.
+    Malformed(AuthenticationObjectsError),
 }
 
 /// The password objects EF.AOD lists, in file order.
 ///
-/// A value exists only as the result of
-/// [`AuthenticationObjects::parse`]. Objects of the other authentication
+/// A value exists only as the result of [`AuthenticationObjects::parse`]
+/// or [`AuthenticationObjects::of`]. Objects of other authentication
 /// kinds (biometric templates, authentication keys, external
-/// authentication) are not password objects and are not kept. A password
-/// object is kept only when its lengths count digits (`ascii-numeric` or
-/// `utf8`), its reference and lengths fit one octet, and its range
-/// satisfies [`PasswordLengthRange::new`].
+/// authentication) are not password objects and are not kept. A
+/// password object is kept only when its lengths count digits
+/// (`ascii-numeric` or `utf8`), its reference and lengths fit one
+/// octet, and its range satisfies [`PasswordLengthRange::new`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticationObjects {
     passwords: Vec<PasswordObject>,
@@ -181,7 +307,15 @@ pub enum AuthenticationObjectsError {
     /// A password object lacks a mandatory element, or carries it under
     /// another tag; the label names the element.
     MissingElement(&'static str),
-    /// Bytes other than zero follow the zero padding.
+    /// A BIT STRING field (`pwdFlags` or common flags) carried invalid
+    /// unused-bit encoding.
+    MalformedBitString(&'static str),
+    /// `padChar` was present with a length other than one octet
+    /// (PKCS#15 v1.1 section 6.8.1 requires `OCTET STRING (SIZE(1))`).
+    MalformedPadChar,
+    /// An `authId` or `CommonObjectAttributes` element was malformed.
+    MalformedAuthId,
+    /// Non-padding octets follow trailing 00 or FF padding.
     DataAfterPadding,
 }
 
@@ -190,7 +324,16 @@ impl fmt::Display for AuthenticationObjectsError {
         match self {
             Self::Ber(error) => write!(f, "EF.AOD: {error}"),
             Self::MissingElement(what) => write!(f, "EF.AOD: password object lacks {what}"),
-            Self::DataAfterPadding => f.write_str("EF.AOD: data after the zero padding"),
+            Self::MalformedBitString(what) => {
+                write!(f, "EF.AOD: password object carries malformed {what}")
+            }
+            Self::MalformedPadChar => {
+                f.write_str("EF.AOD: padChar must be a single-octet OCTET STRING")
+            }
+            Self::MalformedAuthId => {
+                f.write_str("EF.AOD: malformed authentication object identifier")
+            }
+            Self::DataAfterPadding => f.write_str("EF.AOD: data after the trailing padding"),
         }
     }
 }
@@ -204,6 +347,28 @@ impl From<BerError> for AuthenticationObjectsError {
 }
 
 impl AuthenticationObjects {
+    /// Validate a confirmed EF.AOD read at the border.
+    #[must_use]
+    pub fn of(content: FileContent) -> AuthenticationObjectsRead {
+        if !matches!(content.end(), FileEnd::Confirmed) {
+            return AuthenticationObjectsRead::Incomplete;
+        }
+        match Self::parse(content.as_bytes()) {
+            Ok(parsed) => AuthenticationObjectsRead::Parsed(parsed),
+            Err(error) => AuthenticationObjectsRead::Malformed(error),
+        }
+    }
+
+    /// Combine password objects from multiple EF.AOD files listed by
+    /// EF.ODF.
+    pub(crate) fn merge(directories: Vec<Self>) -> Self {
+        let mut passwords = Vec::new();
+        for directory in directories {
+            passwords.extend(directory.passwords);
+        }
+        Self { passwords }
+    }
+
     /// The password objects, in file order.
     #[must_use]
     pub fn passwords(&self) -> &[PasswordObject] {
@@ -218,25 +383,56 @@ impl AuthenticationObjects {
             .any(|object| object.reference == reference)
     }
 
+    /// Return the single password object whose
+    /// `CommonAuthenticationObjectAttributes.authId` matches `auth_id`,
+    /// or `None` when none or more than one matches.
+    #[must_use]
+    pub fn unique_by_auth_id(&self, auth_id: &ObjectIdentifier) -> Option<&PasswordObject> {
+        let mut matching = self
+            .passwords
+            .iter()
+            .filter(|object| object.auth_id.as_ref() == Some(auth_id));
+        let first = matching.next()?;
+        if matching.next().is_some() {
+            return None;
+        }
+        Some(first)
+    }
+
+    /// Return the single password object with `pwdReference ==
+    /// reference`, or `None` when none or more than one matches.
+    #[must_use]
+    pub fn unique_by_reference(&self, reference: u8) -> Option<&PasswordObject> {
+        let mut matching = self
+            .passwords
+            .iter()
+            .filter(|object| object.reference == reference);
+        let first = matching.next()?;
+        if matching.next().is_some() {
+            return None;
+        }
+        Some(first)
+    }
+
     /// Parse the contents of EF.AOD.
     ///
     /// The file is a concatenation of authentication objects, optionally
-    /// followed by zero padding to the file size. Every object must frame
-    /// as BER, and every password object must carry its mandatory
-    /// `PasswordAttributes` elements under their tags; any failure there
-    /// rejects the whole file.
+    /// followed by uniform 00 or FF padding to the file size. Every
+    /// object must frame as BER, and every password object must carry
+    /// its mandatory `PasswordAttributes` elements under their tags;
+    /// any failure there rejects the whole file.
     ///
     /// # Errors
     ///
     /// [`AuthenticationObjectsError`] when a TLV does not frame, a
-    /// password object lacks a mandatory element, or non-zero bytes follow
-    /// the padding.
+    /// password object lacks a mandatory element or carries a malformed
+    /// field, or non-padding octets follow the trailing padding.
     pub fn parse(bytes: &[u8]) -> Result<Self, AuthenticationObjectsError> {
         let mut passwords = Vec::new();
         let mut rest = bytes;
         while let Some(&first) = rest.first() {
-            if first == END_OF_CONTENTS_OCTET {
-                if rest.iter().all(|&byte| byte == END_OF_CONTENTS_OCTET) {
+            if first == END_OF_CONTENTS_OCTET || first == PADDING_FF_OCTET {
+                if rest.iter().all(|&byte| byte == first) {
                     break;
                 }
                 return Err(AuthenticationObjectsError::DataAfterPadding);
@@ -254,30 +450,64 @@ impl AuthenticationObjects {
     }
 }
 
-/// Decode one password object's content: the common and class
-/// attributes, an optional subclass, and `typeAttributes [1]`.
+/// Decode one password object's content: optional common and class
+/// attribute sequences (carrying `protecting_auth_id` and `auth_id`),
+/// optional subclass attributes, and required `typeAttributes [1]`.
 fn password_object(content: &[u8]) -> Result<Option<PasswordObject>, AuthenticationObjectsError> {
     let children = BerTlvIter::new(content).collect::<Result<Vec<_>, _>>()?;
+    let sequence_tag = <Sequence as BerTag>::TAG;
+    let (protecting_auth_id, auth_id) = match (children.first(), children.get(1)) {
+        (Some(common), Some(class))
+            if common.tag() == sequence_tag && class.tag() == sequence_tag =>
+        {
+            let common_attrs = parse_common_object_attributes(common.value())
+                .ok_or(AuthenticationObjectsError::MalformedAuthId)?;
+            let class_auth_id = parse_common_auth_object_attributes(class.value())?;
+            (common_attrs.auth_id, class_auth_id)
+        }
+        _ => (None, None),
+    };
     let type_attributes = children
         .iter()
         .find(|child| child.tag() == TYPE_ATTRIBUTES_TAG)
         .ok_or(AuthenticationObjectsError::MissingElement("typeAttributes"))?;
     let attributes = BerTlv::<Sequence>::parse(type_attributes.value())?;
-    password_attributes(attributes.value())
+    password_attributes(attributes.value(), auth_id, protecting_auth_id)
+}
+
+/// Parse `CommonAuthenticationObjectAttributes ::= SEQUENCE { authId
+/// OCTET STRING }` (PKCS#15 v1.1 section 6.1.15).
+fn parse_common_auth_object_attributes(
+    content: &[u8],
+) -> Result<Option<ObjectIdentifier>, AuthenticationObjectsError> {
+    let children = BerTlvIter::new(content).collect::<Result<Vec<_>, _>>()?;
+    let Some(first) = children.first() else {
+        return Ok(None);
+    };
+    if first.tag() != <OctetString as BerTag>::TAG {
+        return Err(AuthenticationObjectsError::MalformedAuthId);
+    }
+    ObjectIdentifier::of(first.value().to_vec())
+        .map(Some)
+        .ok_or(AuthenticationObjectsError::MalformedAuthId)
 }
 
 /// Decode `PasswordAttributes` by position: flags, type, minimum and
-/// stored length, then the optional maximum length and reference.
+/// stored length, then optional maximum length, reference, and padChar.
 fn password_attributes(
     content: &[u8],
+    auth_id: Option<ObjectIdentifier>,
+    protecting_auth_id: Option<ObjectIdentifier>,
 ) -> Result<Option<PasswordObject>, AuthenticationObjectsError> {
     let fields = BerTlvIter::new(content).collect::<Result<Vec<_>, _>>()?;
     let mut fields = fields.iter().peekable();
 
-    fields
+    let flags_tlv = fields
         .next()
         .filter(|field| field.tag() == <BitString as BerTag>::TAG)
         .ok_or(AuthenticationObjectsError::MissingElement("pwdFlags"))?;
+    let flags = PasswordFlags::parse_bit_string(flags_tlv.value())
+        .ok_or(AuthenticationObjectsError::MalformedBitString("pwdFlags"))?;
     let password_type = fields
         .next()
         .filter(|field| field.tag() == ENUMERATED_TAG)
@@ -286,12 +516,19 @@ fn password_attributes(
         .next()
         .filter(|field| field.tag() == <Integer as BerTag>::TAG)
         .ok_or(AuthenticationObjectsError::MissingElement("minLength"))?;
-    let stored_length = fields
+    let stored_length_tlv = fields
         .next()
         .filter(|field| field.tag() == <Integer as BerTag>::TAG)
         .ok_or(AuthenticationObjectsError::MissingElement("storedLength"))?;
     let max_length = fields.next_if(|field| field.tag() == <Integer as BerTag>::TAG);
     let reference = fields.next_if(|field| field.tag() == PWD_REFERENCE_TAG);
+    let pad_char = match fields.next_if(|field| field.tag() == <OctetString as BerTag>::TAG) {
+        Some(field) => match field.value() {
+            [octet] => Some(*octet),
+            _ => return Err(AuthenticationObjectsError::MalformedPadChar),
+        },
+        None => None,
+    };
 
     if !matches!(
         unsigned_octet(password_type.value()),
@@ -304,16 +541,29 @@ fn password_attributes(
         None => Some(PWD_REFERENCE_DEFAULT),
     };
     let min = unsigned_octet(min_length.value());
-    let max = unsigned_octet(max_length.unwrap_or(stored_length).value());
-    let (Some(reference), Some(min), Some(max)) = (reference, min, max) else {
+    let stored_length = unsigned_octet(stored_length_tlv.value());
+    let max = unsigned_octet(max_length.unwrap_or(stored_length_tlv).value());
+    let (Some(reference), Some(min), Some(stored_length), Some(max)) =
+        (reference, min, stored_length, max)
+    else {
         return Ok(None);
     };
-    Ok(PasswordLengthRange::new(min, max).map(|lengths| PasswordObject { reference, lengths }))
+    Ok(
+        PasswordLengthRange::new(min, max).map(|lengths| PasswordObject {
+            auth_id,
+            protecting_auth_id,
+            flags,
+            reference,
+            lengths,
+            stored_length,
+            pad_char,
+        }),
+    )
 }
 
 /// An INTEGER or ENUMERATED content read as an unsigned magnitude that
-/// fits one octet: leading zero octets are dropped, so both the DER form
-/// of a reference with its high bit set (a zero octet, then the
+/// fits one octet: leading zero octets are dropped, so both the DER
+/// form of a reference with its high bit set (a zero octet, then the
 /// reference) and the bare octet read as the reference. `None` for an
 /// empty content or a magnitude above one octet.
 fn unsigned_octet(content: &[u8]) -> Option<u8> {
@@ -334,10 +584,11 @@ mod tests {
     use refineid_ber::{BerEncoder, BerTag, BitString, Integer, OctetString, Sequence, Utf8String};
 
     use super::{
-        AuthenticationObjects, AuthenticationObjectsError, END_OF_CONTENTS_OCTET, ENUMERATED_TAG,
-        PASSWORD_TYPE_ASCII_NUMERIC, PWD_REFERENCE_DEFAULT, PWD_REFERENCE_TAG, PasswordLengthRange,
-        TYPE_ATTRIBUTES_TAG,
+        AuthenticationObjects, AuthenticationObjectsError, AuthenticationObjectsRead,
+        END_OF_CONTENTS_OCTET, ENUMERATED_TAG, PASSWORD_TYPE_ASCII_NUMERIC, PWD_REFERENCE_DEFAULT,
+        PWD_REFERENCE_TAG, PasswordLengthRange, TYPE_ATTRIBUTES_TAG,
     };
+    use crate::directory::{FileContent, FileEnd, ObjectIdentifier};
 
     /// FINEID S4-1 v4.2 section 8.1.5: PIN 1's reference, minimum and
     /// stored length on a citizen card.
@@ -357,30 +608,40 @@ mod tests {
     const ORGANIZATION_PIN1_MIN: u8 = 4;
     const ORGANIZATION_PIN1_STORED: u8 = 12;
     const ORGANIZATION_PIN1_MAX: u8 = 8;
-    /// `pwdType` `bcd(0)`: the lengths do not count digits one per byte.
+    /// `pwdType` `bcd(0)`: lengths do not count digits one per byte.
     const PASSWORD_TYPE_BCD: u8 = 0;
-    /// `pwdFlags` content of the fixtures: no unused bits, one flag
-    /// octet; the flags are not consulted.
+    /// Default `pwdFlags` content for legacy-shape fixtures: no flags.
     const FLAGS_UNUSED_BITS: u8 = 0;
     const FLAGS_OCTET: u8 = 0;
-    /// The authId of the fixture objects; not consulted.
-    const AUTH_ID: u8 = 1;
-    /// `padChar` of the fixture objects.
-    const PAD_CHAR: u8 = 0;
-    /// A context tag for an authentication object of another kind
-    /// (`authKey`).
+    /// Estonian PIN1 `pwdFlags` observed on card: 4 unused bits,
+    /// case-sensitive + local + initialized + needs-padding +
+    /// exchangeRefData.
+    const ESTONIAN_PIN1_FLAGS: &[u8] = &[0x04, 0xCC, 0x10];
+    /// Estonian PUK `pwdFlags` observed on card: 1 unused bit,
+    /// unblockingPassword + needs-padding set.
+    const ESTONIAN_PUK_FLAGS: &[u8] = &[0x01, 0xFE];
+    /// Common authId of PIN1 and protecting PUK in fixtures.
+    const AUTH_ID_PIN1: u8 = 1;
+    const AUTH_ID_PUK: u8 = 3;
+    /// Default `padChar` in fixtures.
+    const PAD_CHAR_ZERO: u8 = 0x00;
+    /// Alternate `padChar` (e.g. IDEMIA / IAS-ECC style).
+    const PAD_CHAR_FF: u8 = 0xFF;
+    /// Context tag for an authentication object of another kind.
     const OTHER_AUTHENTICATION_KIND_TAG: u8 = 0xA1;
     /// Zero padding after the objects.
     const PADDING_LENGTH: usize = 16;
     /// A magnitude above one octet.
     const TWO_OCTET_LENGTH: u16 = 300;
+    /// Malformed BIT STRING unused-bit count above 7.
+    const INVALID_UNUSED_BITS: u8 = 8;
+    /// Two-octet padChar, prohibited by PKCS#15 SIZE(1).
+    const TWO_OCTET_PAD_CHAR: &[u8] = &[0x00, 0xFF];
 
     fn tag(value: u16) -> u8 {
         u8::try_from(value).expect("one-octet tag")
     }
 
-    /// The minimal DER INTEGER content of `value`: a zero octet first
-    /// when the high bit is set.
     fn integer(value: u8) -> Vec<u8> {
         if value.leading_zeros() == 0 {
             vec![END_OF_CONTENTS_OCTET, value]
@@ -391,21 +652,33 @@ mod tests {
 
     #[derive(Clone, Copy)]
     struct Fixture {
+        auth_id: u8,
+        protecting_auth_id: Option<u8>,
+        flags: &'static [u8],
         password_type: u8,
         min: u8,
         stored: u8,
         max: Option<u8>,
         reference: Option<u8>,
+        pad_char: Option<&'static [u8]>,
     }
+
+    const EMPTY_FLAGS: &[u8] = &[FLAGS_UNUSED_BITS, FLAGS_OCTET];
+    const ZERO_PAD_SLICE: &[u8] = &[PAD_CHAR_ZERO];
+    const FF_PAD_SLICE: &[u8] = &[PAD_CHAR_FF];
 
     impl Fixture {
         const fn citizen(reference: u8, min: u8) -> Self {
             Self {
+                auth_id: AUTH_ID_PIN1,
+                protecting_auth_id: None,
+                flags: EMPTY_FLAGS,
                 password_type: PASSWORD_TYPE_ASCII_NUMERIC,
                 min,
                 stored: CITIZEN_STORED_LENGTH,
                 max: None,
                 reference: Some(reference),
+                pad_char: Some(ZERO_PAD_SLICE),
             }
         }
     }
@@ -413,10 +686,7 @@ mod tests {
     fn attributes(fixture: Fixture) -> Vec<u8> {
         let mut fields = BerEncoder::default();
         fields
-            .push_tlv(
-                tag(<BitString as BerTag>::TAG),
-                [FLAGS_UNUSED_BITS, FLAGS_OCTET],
-            )
+            .push_tlv(tag(<BitString as BerTag>::TAG), fixture.flags)
             .expect("encodes");
         fields
             .push_tlv(tag(ENUMERATED_TAG), [fixture.password_type])
@@ -437,20 +707,27 @@ mod tests {
                 .push_tlv(tag(PWD_REFERENCE_TAG), integer(reference))
                 .expect("encodes");
         }
-        fields
-            .push_tlv(tag(<OctetString as BerTag>::TAG), [PAD_CHAR])
-            .expect("encodes");
+        if let Some(pad) = fixture.pad_char {
+            fields
+                .push_tlv(tag(<OctetString as BerTag>::TAG), pad)
+                .expect("encodes");
+        }
         fields.finish()
     }
 
-    fn object_around(attributes: &[u8]) -> Vec<u8> {
+    fn object_around(auth_id: u8, protecting_auth_id: Option<u8>, attributes: &[u8]) -> Vec<u8> {
         let mut common = BerEncoder::default();
         common
             .push_tlv(tag(<Utf8String as BerTag>::TAG), b"perustunnusluku")
             .expect("encodes");
+        if let Some(protecting) = protecting_auth_id {
+            common
+                .push_tlv(tag(<OctetString as BerTag>::TAG), [protecting])
+                .expect("encodes");
+        }
         let mut class = BerEncoder::default();
         class
-            .push_tlv(tag(<OctetString as BerTag>::TAG), [AUTH_ID])
+            .push_tlv(tag(<OctetString as BerTag>::TAG), [auth_id])
             .expect("encodes");
         let mut typed = BerEncoder::default();
         typed
@@ -476,7 +753,13 @@ mod tests {
     fn file(fixtures: &[Fixture]) -> Vec<u8> {
         fixtures
             .iter()
-            .flat_map(|fixture| object_around(&attributes(*fixture)))
+            .flat_map(|fixture| {
+                object_around(
+                    fixture.auth_id,
+                    fixture.protecting_auth_id,
+                    &attributes(*fixture),
+                )
+            })
             .collect()
     }
 
@@ -517,6 +800,102 @@ mod tests {
     }
 
     #[test]
+    fn parses_flags_stored_length_pad_char_and_auth_id_graph() {
+        let bytes = file(&[
+            Fixture {
+                auth_id: AUTH_ID_PIN1,
+                protecting_auth_id: Some(AUTH_ID_PUK),
+                flags: ESTONIAN_PIN1_FLAGS,
+                pad_char: Some(FF_PAD_SLICE),
+                ..Fixture::citizen(CITIZEN_PIN1_REFERENCE, CITIZEN_PIN1_MIN)
+            },
+            Fixture {
+                auth_id: AUTH_ID_PUK,
+                protecting_auth_id: None,
+                flags: ESTONIAN_PUK_FLAGS,
+                pad_char: Some(ZERO_PAD_SLICE),
+                ..Fixture::citizen(CITIZEN_PUK_REFERENCE, CITIZEN_PUK_MIN)
+            },
+        ]);
+        let objects = match AuthenticationObjects::of(FileContent::from_read(
+            bytes.clone(),
+            FileEnd::Confirmed,
+        )) {
+            AuthenticationObjectsRead::Parsed(objects) => Some(objects),
+            AuthenticationObjectsRead::Incomplete | AuthenticationObjectsRead::Malformed(_) => None,
+        }
+        .expect("confirmed EF.AOD parses");
+        assert_eq!(
+            AuthenticationObjects::of(FileContent::from_read(bytes, FileEnd::Incomplete)),
+            AuthenticationObjectsRead::Incomplete
+        );
+
+        let pin1_id = ObjectIdentifier::of(vec![AUTH_ID_PIN1]).expect("valid id");
+        let pin1 = objects
+            .unique_by_auth_id(&pin1_id)
+            .expect("PIN1 found by authId");
+        assert!(pin1.flags().needs_padding());
+        assert!(pin1.flags().local());
+        assert!(pin1.flags().exchange_ref_data());
+        assert!(!pin1.flags().unblocking_password());
+        assert_eq!(pin1.stored_length(), CITIZEN_STORED_LENGTH);
+        assert_eq!(pin1.pad_char(), Some(PAD_CHAR_FF));
+
+        let puk_id = pin1
+            .protecting_auth_id()
+            .expect("PIN1 names its protecting PUK authId");
+        let puk = objects
+            .unique_by_auth_id(puk_id)
+            .expect("PUK found by protecting authId");
+        assert!(puk.flags().needs_padding());
+        assert!(puk.flags().unblocking_password());
+        assert_eq!(puk.pad_char(), Some(PAD_CHAR_ZERO));
+    }
+
+    #[test]
+    fn rejects_malformed_pad_char_and_malformed_pwd_flags() {
+        let two_byte_pad = file(&[Fixture {
+            pad_char: Some(TWO_OCTET_PAD_CHAR),
+            ..Fixture::citizen(CITIZEN_PIN1_REFERENCE, CITIZEN_PIN1_MIN)
+        }]);
+        assert_eq!(
+            AuthenticationObjects::parse(&two_byte_pad),
+            Err(AuthenticationObjectsError::MalformedPadChar)
+        );
+
+        let empty_pad = file(&[Fixture {
+            pad_char: Some(&[]),
+            ..Fixture::citizen(CITIZEN_PIN1_REFERENCE, CITIZEN_PIN1_MIN)
+        }]);
+        assert_eq!(
+            AuthenticationObjects::parse(&empty_pad),
+            Err(AuthenticationObjectsError::MalformedPadChar)
+        );
+
+        let bad_flags_slice: &[u8] = &[INVALID_UNUSED_BITS, FLAGS_OCTET];
+        let mut fields = BerEncoder::default();
+        fields
+            .push_tlv(tag(<BitString as BerTag>::TAG), bad_flags_slice)
+            .expect("encodes");
+        fields
+            .push_tlv(tag(ENUMERATED_TAG), [PASSWORD_TYPE_ASCII_NUMERIC])
+            .expect("encodes");
+        fields
+            .push_tlv(tag(<Integer as BerTag>::TAG), integer(CITIZEN_PIN1_MIN))
+            .expect("encodes");
+        fields
+            .push_tlv(
+                tag(<Integer as BerTag>::TAG),
+                integer(CITIZEN_STORED_LENGTH),
+            )
+            .expect("encodes");
+        assert_eq!(
+            AuthenticationObjects::parse(&object_around(AUTH_ID_PIN1, None, &fields.finish())),
+            Err(AuthenticationObjectsError::MalformedBitString("pwdFlags"))
+        );
+    }
+
+    #[test]
     fn a_reference_is_reported_from_the_listed_objects() {
         let bytes = file(&[
             Fixture::citizen(CITIZEN_PIN1_REFERENCE, CITIZEN_PIN1_MIN),
@@ -525,21 +904,33 @@ mod tests {
         let objects = AuthenticationObjects::parse(&bytes).expect("parses");
         assert!(objects.lists_reference(CITIZEN_PIN1_REFERENCE));
         assert!(!objects.lists_reference(CITIZEN_PUK_REFERENCE));
+        assert_eq!(
+            objects
+                .unique_by_reference(CITIZEN_PIN1_REFERENCE)
+                .map(super::PasswordObject::reference),
+            Some(CITIZEN_PIN1_REFERENCE)
+        );
     }
 
     #[test]
     fn max_length_wins_over_stored_length() {
         let bytes = file(&[Fixture {
+            auth_id: AUTH_ID_PIN1,
+            protecting_auth_id: None,
+            flags: EMPTY_FLAGS,
             password_type: PASSWORD_TYPE_ASCII_NUMERIC,
             min: ORGANIZATION_PIN1_MIN,
             stored: ORGANIZATION_PIN1_STORED,
             max: Some(ORGANIZATION_PIN1_MAX),
             reference: Some(ORGANIZATION_PIN1_REFERENCE),
+            pad_char: None,
         }]);
         let objects = AuthenticationObjects::parse(&bytes).expect("parses");
         assert_eq!(objects.passwords().len(), 1);
-        let object = objects.passwords()[0];
+        let object = &objects.passwords()[0];
         assert_eq!(object.reference(), ORGANIZATION_PIN1_REFERENCE);
+        assert_eq!(object.stored_length(), ORGANIZATION_PIN1_STORED);
+        assert_eq!(object.pad_char(), None);
         assert_eq!(
             object.lengths(),
             range(ORGANIZATION_PIN1_MIN, ORGANIZATION_PIN1_MAX)
@@ -631,7 +1022,8 @@ mod tests {
             )
             .expect("encodes");
         let objects =
-            AuthenticationObjects::parse(&object_around(&fields.finish())).expect("parses");
+            AuthenticationObjects::parse(&object_around(AUTH_ID_PIN1, None, &fields.finish()))
+                .expect("parses");
         assert!(objects.passwords().is_empty());
     }
 
@@ -651,7 +1043,7 @@ mod tests {
             .push_tlv(tag(<Integer as BerTag>::TAG), integer(CITIZEN_PIN1_MIN))
             .expect("encodes");
         assert_eq!(
-            AuthenticationObjects::parse(&object_around(&fields.finish())),
+            AuthenticationObjects::parse(&object_around(AUTH_ID_PIN1, None, &fields.finish())),
             Err(AuthenticationObjectsError::MissingElement("storedLength"))
         );
     }

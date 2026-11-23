@@ -30,11 +30,14 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+use refineid_apdu::CardTransport;
 use refineid_pcsc::{
     PcscBackend, ReaderAccessCap, ReaderBackend as _, ReaderId, ReaderIdentity, ReaderInfo,
     read_reader_identity,
 };
-use refineid_pkcs15::{Pkcs15Error, Pkcs15Ops as _};
+use refineid_pkcs15::{
+    ApplicationLabel, ESTONIAN_EID_APPLICATION_LABEL, Pkcs15Error, Pkcs15Ops as _,
+};
 
 use crate::pin_cache::PinSafetyCache;
 use crate::remote::{RemoteOffer, RemoteReading};
@@ -863,7 +866,45 @@ fn probe_fineid_card(reader: &ReaderId) -> FineidCardObservation {
     let Ok(mut card) = backend.open_session(reader, ReaderAccessCap::Read) else {
         return FineidCardObservation::TemporarilyUnavailable;
     };
+    probe_card_transport(&mut card)
+}
+
+/// Cheap admission probe over any [`CardTransport`]: accepts a card
+/// answering SELECT on the standard PKCS#15 AID, or a card whose
+/// EF.DIR publishes the Estonian eID application label under another
+/// selectable AID. Unrelated tokens (such as a `YubiKey`) answer
+/// neither and are reported [`FineidCardObservation::Absent`].
+fn probe_card_transport<T: CardTransport>(card: &mut T) -> FineidCardObservation {
     match card.select_pkcs15_application() {
+        Ok(()) => return FineidCardObservation::Present,
+        Err(Pkcs15Error::Transport(_)) => return FineidCardObservation::TemporarilyUnavailable,
+        Err(
+            Pkcs15Error::Status(_)
+            | Pkcs15Error::Outcome(_)
+            | Pkcs15Error::Aid(_)
+            | Pkcs15Error::Command(_)
+            | Pkcs15Error::Empty
+            | Pkcs15Error::TooLarge
+            | Pkcs15Error::InvalidData(_),
+        ) => {}
+    }
+    let Ok(label) = ApplicationLabel::try_from(ESTONIAN_EID_APPLICATION_LABEL) else {
+        return FineidCardObservation::Absent;
+    };
+    let aid = match card.discover_application_by_label(&label) {
+        Ok(aid) => aid,
+        Err(Pkcs15Error::Transport(_)) => return FineidCardObservation::TemporarilyUnavailable,
+        Err(
+            Pkcs15Error::Status(_)
+            | Pkcs15Error::Outcome(_)
+            | Pkcs15Error::Aid(_)
+            | Pkcs15Error::Command(_)
+            | Pkcs15Error::Empty
+            | Pkcs15Error::TooLarge
+            | Pkcs15Error::InvalidData(_),
+        ) => return FineidCardObservation::Absent,
+    };
+    match card.select_application(&aid) {
         Ok(()) => FineidCardObservation::Present,
         Err(Pkcs15Error::Transport(_)) => FineidCardObservation::TemporarilyUnavailable,
         Err(
@@ -1591,5 +1632,185 @@ mod tests {
         let mut recreated = state_with_slots(&[reader]);
         let cache = recreated.pin_cache(1).expect("process cache reused");
         assert!(cache.lock().expect("cache lock").is_rejected(&serial, &pin));
+    }
+
+    struct ScriptedProbeTransport {
+        steps: Vec<(Vec<u8>, Result<refineid_apdu::ResponseApdu, &'static str>)>,
+        cursor: usize,
+    }
+
+    impl ScriptedProbeTransport {
+        fn new(steps: Vec<(Vec<u8>, Result<refineid_apdu::ResponseApdu, &'static str>)>) -> Self {
+            Self { steps, cursor: 0 }
+        }
+
+        fn assert_drained(&self) {
+            assert_eq!(
+                self.cursor,
+                self.steps.len(),
+                "all scripted probe steps must be consumed"
+            );
+        }
+    }
+
+    impl refineid_apdu::CardTransport for ScriptedProbeTransport {
+        type Error = &'static str;
+
+        fn transmit(
+            &mut self,
+            command: &refineid_apdu::CommandApdu,
+        ) -> Result<refineid_apdu::TransportOutcome, Self::Error> {
+            let (expected, reply) = self
+                .steps
+                .get(self.cursor)
+                .expect("scripted probe transport exhausted");
+            assert_eq!(
+                expected.as_slice(),
+                command.as_bytes(),
+                "unexpected probe APDU at step {}",
+                self.cursor
+            );
+            self.cursor += 1;
+            Ok(refineid_apdu::TransportOutcome::Response(reply.clone()?))
+        }
+
+        fn transmit_credential(
+            &mut self,
+            _command: refineid_apdu::CredentialCommand,
+        ) -> Result<refineid_apdu::TransportOutcome, Self::Error> {
+            panic!("probe must never transmit a credential command");
+        }
+    }
+
+    fn probe_reply(body: &[u8], sw: refineid_apdu::StatusWord) -> refineid_apdu::ResponseApdu {
+        let [sw1, sw2] = sw.as_u16().to_be_bytes();
+        refineid_apdu::ResponseApdu {
+            body: body.to_vec(),
+            sw1,
+            sw2,
+        }
+    }
+
+    #[test]
+    fn probe_card_transport_admits_custom_aid_estonian_card_and_rejects_unrelated_tokens() {
+        use refineid_apdu::iso7816::{
+            DirectOffset15, ReadBinary, ReadBinaryOffset, SelectByAidNoFci, SelectEfNoFci,
+            SelectFile, SelectFileResponseMode, SelectFileTarget,
+        };
+        use refineid_apdu::{Aid, ApduClass, FileId, StatusWord};
+
+        const CUSTOM_AID: &[u8] = &[0xD2, 0x33, 0x00, 0x00, 0x00, 0x45, 0x45, 0x31];
+        const READ_CHUNK: u8 = 0xDF;
+
+        let select_aid = |bytes: &[u8]| {
+            SelectByAidNoFci {
+                aid: Aid::from_slice(bytes).expect("valid AID"),
+            }
+            .into_apdu()
+            .as_bytes()
+            .to_vec()
+        };
+        let select_mf = SelectFile {
+            class: ApduClass::Plain,
+            target: SelectFileTarget::AnyByFileId(Some(FileId::MF)),
+            response_mode: SelectFileResponseMode::None,
+        }
+        .into_apdu()
+        .as_bytes()
+        .to_vec();
+        let select_ef = |fid: FileId| SelectEfNoFci { fid }.into_apdu().as_bytes().to_vec();
+        let select_any_fid = |fid: FileId| {
+            SelectFile {
+                class: ApduClass::Plain,
+                target: SelectFileTarget::AnyByFileId(Some(fid)),
+                response_mode: SelectFileResponseMode::None,
+            }
+            .into_apdu()
+            .as_bytes()
+            .to_vec()
+        };
+        let read_bin = |offset: u16| {
+            ReadBinary {
+                class: ApduClass::Plain,
+                offset: ReadBinaryOffset::Direct(
+                    DirectOffset15::try_new(offset).expect("valid offset"),
+                ),
+                le: READ_CHUNK,
+            }
+            .into_apdu()
+            .as_bytes()
+            .to_vec()
+        };
+
+        // 1. Standard PKCS#15 AID succeeds on first command.
+        let mut standard = ScriptedProbeTransport::new(vec![(
+            select_aid(refineid_pkcs15::PKCS15_AID),
+            Ok(probe_reply(&[], StatusWord::Success)),
+        )]);
+        assert_eq!(
+            super::probe_card_transport(&mut standard),
+            FineidCardObservation::Present
+        );
+        standard.assert_drained();
+
+        // 2. Non-PKCS15-AID Estonian card discovered via EF.DIR ("Estonian eID") and selected.
+        let mut ef_dir = vec![0x61, 24, 0x4F, 8];
+        ef_dir.extend_from_slice(CUSTOM_AID);
+        ef_dir.extend_from_slice(&[0x50, 12]);
+        ef_dir.extend_from_slice(b"Estonian eID");
+        let mut custom = ScriptedProbeTransport::new(vec![
+            (
+                select_aid(refineid_pkcs15::PKCS15_AID),
+                Ok(probe_reply(&[], StatusWord::FileNotFound)),
+            ),
+            (select_mf.clone(), Ok(probe_reply(&[], StatusWord::Success))),
+            (
+                select_ef(refineid_pkcs15::EF_DIR_FID),
+                Ok(probe_reply(&[], StatusWord::Success)),
+            ),
+            (read_bin(0), Ok(probe_reply(&ef_dir, StatusWord::EndOfFile))),
+            (
+                select_aid(CUSTOM_AID),
+                Ok(probe_reply(&[], StatusWord::Success)),
+            ),
+        ]);
+        assert_eq!(
+            super::probe_card_transport(&mut custom),
+            FineidCardObservation::Present
+        );
+        custom.assert_drained();
+
+        // 3. Unrelated token (no PKCS#15 AID, no EF.DIR) is rejected as Absent.
+        let mut unrelated = ScriptedProbeTransport::new(vec![
+            (
+                select_aid(refineid_pkcs15::PKCS15_AID),
+                Ok(probe_reply(&[], StatusWord::FileNotFound)),
+            ),
+            (select_mf.clone(), Ok(probe_reply(&[], StatusWord::Success))),
+            (
+                select_ef(refineid_pkcs15::EF_DIR_FID),
+                Ok(probe_reply(&[], StatusWord::FileNotFound)),
+            ),
+            (
+                select_any_fid(refineid_pkcs15::EF_DIR_FID),
+                Ok(probe_reply(&[], StatusWord::FileNotFound)),
+            ),
+        ]);
+        assert_eq!(
+            super::probe_card_transport(&mut unrelated),
+            FineidCardObservation::Absent
+        );
+        unrelated.assert_drained();
+
+        // 4. Transport failure preserves state as TemporarilyUnavailable.
+        let mut busy = ScriptedProbeTransport::new(vec![(
+            select_aid(refineid_pkcs15::PKCS15_AID),
+            Err("reader busy"),
+        )]);
+        assert_eq!(
+            super::probe_card_transport(&mut busy),
+            FineidCardObservation::TemporarilyUnavailable
+        );
+        busy.assert_drained();
     }
 }

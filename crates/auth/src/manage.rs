@@ -49,14 +49,14 @@ use refineid_apdu::{ApduClass, CardTransport, CommandHeader, PinRetries, StatusW
 
 use refineid_pkcs15::{Pkcs15Error, Pkcs15Ops};
 
-use crate::credentials::{Pin1, Pin2, Puk};
+use crate::credentials::{CredentialRole, Pin1, Pin2, Puk};
 use crate::pin_lengths::CardPinLengths;
 use crate::retry_risk::{
     FlooredCredential, check_last_tries_with_scheme, check_retry_floor_with_scheme,
 };
 use crate::verify::{
-    AuthError, PinOps, PinReferenceScheme, PinSlot, PinStatus, VERIFY_INS, VERIFY_P1,
-    credential_exchange, ensure_slot_supported,
+    AuthError, CardPinParameters, PinOps, PinReferenceScheme, PinSlot, PinStatus, VERIFY_INS,
+    VERIFY_P1, credential_exchange, credential_exchange_groups, ensure_slot_supported,
 };
 
 /// CHANGE REFERENCE DATA instruction (ISO 7816-8; FINEID S1 v4.2
@@ -123,8 +123,8 @@ pub const fn classify_manage_sw(sw: StatusWord) -> ManageOutcome {
 ///
 /// Both numberings take the single-command form under P1
 /// [`CHANGE_P1_CURRENT_THEN_NEW`]; no separate VERIFY precedes it. How
-/// each card delimits the two blocks is recorded on
-/// [`crate::verify::write_credential_blocks`].
+/// each card delimits the two blocks is handled by
+/// [`crate::verify::write_credential_groups`].
 pub(crate) fn change<T: CardTransport + ?Sized>(
     transport: &mut T,
     scheme: PinReferenceScheme,
@@ -171,15 +171,16 @@ fn change_under_floor<T: CardTransport>(
 /// section 7.5.6). When the citizen card answers that probe with neither
 /// a counter nor a blocked state, the PIN container is read with GET DATA
 /// instead (FINEID S1 v4.2 section 3.15.2).
-fn puk_status<T: CardTransport + ?Sized>(
+fn puk_status_for_reference<T: CardTransport + ?Sized>(
     transport: &mut T,
     scheme: PinReferenceScheme,
+    reference: u8,
 ) -> Result<PinStatus, AuthError<T::Error>> {
     let command = refineid_apdu::CommandApdu::case_1(CommandHeader {
         class: ApduClass::Plain,
         instruction: VERIFY_INS,
         p1: VERIFY_P1,
-        p2: scheme.puk_reference(),
+        p2: reference,
     });
     let outcome = transport.transmit(&command).map_err(AuthError::Transport)?;
     let response = outcome.into_response().map_err(AuthError::Outcome)?;
@@ -194,6 +195,13 @@ fn puk_status<T: CardTransport + ?Sized>(
         | PinReferenceScheme::Organizational
         | PinReferenceScheme::Estonian => Ok(status),
     }
+}
+
+fn puk_status<T: CardTransport + ?Sized>(
+    transport: &mut T,
+    scheme: PinReferenceScheme,
+) -> Result<PinStatus, AuthError<T::Error>> {
+    puk_status_for_reference(transport, scheme, scheme.puk_reference())
 }
 
 /// Unblock `slot`, resetting its retry counter and setting `new`.
@@ -417,6 +425,140 @@ pub trait PinManageOps: PinOps {
         match failure {
             Some(error) => Err(error),
             None => Ok(lengths),
+        }
+    }
+
+    /// Change PIN1 using validated card parameters derived from EF.AOD
+    /// ([`CardPinParameters::from_aod`]).
+    ///
+    /// Checks both `current` and `new` against `parameters.lengths()`,
+    /// probes PIN1's counter under `parameters.reference()`, enforces
+    /// the retry floor on `parameters.scheme()`, and sends CHANGE
+    /// REFERENCE DATA encoded with `parameters.encoding()`.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::PinLength`], [`AuthError::RetryFloor`], or
+    /// transport / command assembly errors.
+    fn change_pin1_with_parameters(
+        &mut self,
+        parameters: &CardPinParameters,
+        current: Pin1,
+        new: Pin1,
+    ) -> Result<ManageOutcome, AuthError<Self::Error>>
+    where
+        Self: Sized,
+    {
+        parameters
+            .check_length(CredentialRole::Pin1, current.digit_count())
+            .map_err(AuthError::PinLength)?;
+        parameters
+            .check_length(CredentialRole::Pin1, new.digit_count())
+            .map_err(AuthError::PinLength)?;
+        let status = self.pin_status_for_parameters(parameters)?;
+        check_last_tries_with_scheme(FlooredCredential::Pin1, status, parameters.scheme())
+            .map_err(AuthError::RetryFloor)?;
+        let header = CommandHeader {
+            class: ApduClass::Plain,
+            instruction: CHANGE_REFERENCE_DATA_INS,
+            p1: CHANGE_P1_CURRENT_THEN_NEW,
+            p2: parameters.reference(),
+        };
+        let sw = credential_exchange_groups(
+            self,
+            header,
+            &[
+                (current.digits(), parameters.encoding()),
+                (new.digits(), parameters.encoding()),
+            ],
+        )?;
+        Ok(classify_manage_sw(sw))
+    }
+
+    /// Unblock PIN1 with the PUK using validated card parameters
+    /// derived from EF.AOD ([`CardPinParameters::from_aod`]).
+    ///
+    /// Probes the PUK's counter under `puk_parameters.reference()`,
+    /// enforces the retry floor on `puk_parameters.scheme()`, and
+    /// encodes each credential block with its own EF.AOD encoding.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::UnsupportedSlot`] if the PIN and PUK parameters do
+    /// not share a scheme, [`AuthError::PinLength`],
+    /// [`AuthError::RetryFloor`], or transport / command errors.
+    fn unblock_pin1_with_parameters(
+        &mut self,
+        pin_parameters: &CardPinParameters,
+        puk_parameters: &CardPinParameters,
+        puk: Puk,
+        new: Pin1,
+    ) -> Result<ManageOutcome, AuthError<Self::Error>>
+    where
+        Self: Sized,
+    {
+        if pin_parameters.scheme() != puk_parameters.scheme() {
+            return Err(AuthError::UnsupportedSlot {
+                scheme: pin_parameters.scheme(),
+                slot: PinSlot::Pin1,
+            });
+        }
+        puk_parameters
+            .check_length(CredentialRole::Puk, puk.digit_count())
+            .map_err(AuthError::PinLength)?;
+        pin_parameters
+            .check_length(CredentialRole::Pin1, new.digit_count())
+            .map_err(AuthError::PinLength)?;
+        let scheme = puk_parameters.scheme();
+        let puk_counter = puk_status_for_reference(self, scheme, puk_parameters.reference())?;
+        check_retry_floor_with_scheme(FlooredCredential::Puk, puk_counter, scheme)
+            .map_err(AuthError::RetryFloor)?;
+        match scheme {
+            PinReferenceScheme::Citizen | PinReferenceScheme::Estonian => {
+                let header = CommandHeader {
+                    class: ApduClass::Plain,
+                    instruction: RESET_RETRY_COUNTER_INS,
+                    p1: RESET_P1_CODE_THEN_NEW,
+                    p2: pin_parameters.reference(),
+                };
+                let sw = credential_exchange_groups(
+                    self,
+                    header,
+                    &[
+                        (puk.digits(), puk_parameters.encoding()),
+                        (new.digits(), pin_parameters.encoding()),
+                    ],
+                )?;
+                Ok(classify_manage_sw(sw))
+            }
+            PinReferenceScheme::Organizational => {
+                let verify_header = CommandHeader {
+                    class: ApduClass::Plain,
+                    instruction: VERIFY_INS,
+                    p1: VERIFY_P1,
+                    p2: puk_parameters.reference(),
+                };
+                let verified = classify_manage_sw(credential_exchange_groups(
+                    self,
+                    verify_header,
+                    &[(puk.digits(), puk_parameters.encoding())],
+                )?);
+                if !matches!(verified, ManageOutcome::Ok) {
+                    return Ok(verified);
+                }
+                let reset_header = CommandHeader {
+                    class: ApduClass::Plain,
+                    instruction: RESET_RETRY_COUNTER_INS,
+                    p1: RESET_P1_NEW_ONLY,
+                    p2: pin_parameters.reference(),
+                };
+                let sw = credential_exchange_groups(
+                    self,
+                    reset_header,
+                    &[(new.digits(), pin_parameters.encoding())],
+                )?;
+                Ok(classify_manage_sw(sw))
+            }
         }
     }
 

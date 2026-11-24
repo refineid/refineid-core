@@ -24,7 +24,6 @@ use core::fmt;
 use std::path::PathBuf;
 
 use crate::identity::CommonName;
-use crate::x509_ext::NameExt;
 use refineid_cms::container::{RsaPkcs1Sha256, Signature};
 use refineid_cms::rsa::RsaVerifyError;
 use refineid_cms::x509::{OwnedCert, extract_rsa_public_key};

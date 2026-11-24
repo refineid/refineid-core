@@ -39,7 +39,6 @@ use crate::document::{self, DocumentPlan};
 use crate::identity::{CommonName, TokenSerial, render_token_serial};
 use crate::pin::{PinBytes, PinEntryError, PinPolicyReason, PinRole, PinSource};
 use crate::signed_name::BestSignatureTime;
-use crate::x509_ext::NameExt;
 use refineid_apdu::CardTransport;
 use refineid_apdu::status_word::StatusWord;
 use refineid_auth::credentials::{PIN_MAX_LENGTH, PIN_MIN_LENGTH};

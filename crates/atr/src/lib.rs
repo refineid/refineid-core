@@ -53,6 +53,8 @@
 
 use core::fmt;
 
+pub mod fineid;
+
 /// Low-nibble mask: ISO 7816-3/-4 pack a 4-bit value in the low
 /// nibble of a byte.
 const NIBBLE_MASK: u8 = 0x0F;

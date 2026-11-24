@@ -56,7 +56,6 @@ use crate::service::{
     SigningDevice, document_signer, ensure_visible_signature_format, finish_document,
     load_data_objects, verify_against_certificate,
 };
-use crate::x509_ext::NameExt as _;
 
 /// The UTF-8 byte length of one name the phone shows: RAPP v26.11.8
 /// section 9.3, `document_name` and each entry of `document_names` and

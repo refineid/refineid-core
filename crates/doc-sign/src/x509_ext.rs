@@ -14,10 +14,10 @@
 
 //! X.509 extension URL and metadata extractors.
 
-use crate::identity::{CertSerial, CommonName, GivenNamesText, Peuin, SplitGivenNames, Surname};
+use crate::identity::{CertSerial, CommonName, Peuin, SplitGivenNames, Surname};
 use crate::uri::Uri;
 use refineid_ber::{BerTlv, BerTlvAny, BerTlvIter, Sequence};
-use refineid_cms::oid::{Oid, known};
+use refineid_cms::oid::Oid;
 use refineid_cms::x509::{Certificate, Name};
 use spki::der::asn1::AnyRef;
 use spki::der::{Decode as _, Reader as _, SliceReader, Tag, Tagged as _};
@@ -198,38 +198,6 @@ fn decode_directory_string(value: AnyRef<'_>) -> Option<String> {
     }
 }
 
-fn name_dn_attribute(dn_der: &[u8], oid_body: Oid<'_>) -> Option<String> {
-    let name = AnyRef::from_der(dn_der).ok()?;
-    if name.tag() != Tag::Sequence {
-        return None;
-    }
-    let mut rdns = SliceReader::new(name.value()).ok()?;
-    let mut found: Option<String> = None;
-    while !rdns.is_finished() {
-        let rdn = AnyRef::from_der(rdns.tlv_bytes().ok()?).ok()?;
-        if rdn.tag() != Tag::Set {
-            continue;
-        }
-        let mut atvs = SliceReader::new(rdn.value()).ok()?;
-        while !atvs.is_finished() {
-            let atv = AnyRef::from_der(atvs.tlv_bytes().ok()?).ok()?;
-            if atv.tag() != Tag::Sequence {
-                continue;
-            }
-            let mut fields = SliceReader::new(atv.value()).ok()?;
-            let oid = AnyRef::from_der(fields.tlv_bytes().ok()?).ok()?;
-            let val = AnyRef::from_der(fields.tlv_bytes().ok()?).ok()?;
-            if oid.tag() == Tag::ObjectIdentifier
-                && oid.value() == oid_body.as_bytes()
-                && let Some(s) = decode_directory_string(val)
-            {
-                found = Some(s);
-            }
-        }
-    }
-    found
-}
-
 /// The attribute types RFC 4514 sec.3 names by a short string, with
 /// that string; any other type is written as its dotted object
 /// identifier.
@@ -351,28 +319,19 @@ pub trait NameExt {
 
 impl NameExt for Name<'_> {
     fn common_name(&self) -> Option<CommonName> {
-        Some(CommonName::new(name_dn_attribute(
-            self.as_der(),
-            known::COMMON_NAME,
-        )?))
+        Name::common_name(self)
     }
 
     fn surname(&self) -> Option<Surname> {
-        Surname::new(name_dn_attribute(self.as_der(), known::SURNAME)?).ok()
+        Name::surname(self)
     }
 
     fn given_names(&self) -> SplitGivenNames {
-        name_dn_attribute(self.as_der(), known::GIVEN_NAME).map_or_else(
-            SplitGivenNames::default,
-            |raw| {
-                GivenNamesText::new(raw)
-                    .map_or_else(|_err| SplitGivenNames::default(), |text| text.split())
-            },
-        )
+        Name::given_names(self)
     }
 
     fn peuin(&self) -> Option<Peuin> {
-        Peuin::new(&name_dn_attribute(self.as_der(), known::SERIAL_NUMBER)?).ok()
+        Name::peuin(self)
     }
 
     fn rfc4514(&self) -> Option<String> {

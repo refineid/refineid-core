@@ -260,6 +260,10 @@ pub mod known {
     pub const COUNTRY_NAME: Oid<'static> =
         Oid::const_new(::const_oid::ObjectIdentifier::new_unwrap("2.5.4.6").as_bytes());
 
+    /// `2.5.4.10` -- id-at-organizationName.
+    pub const ORGANIZATION_NAME: Oid<'static> =
+        Oid::const_new(::const_oid::ObjectIdentifier::new_unwrap("2.5.4.10").as_bytes());
+
     /// `2.5.29.31` -- id-ce-cRLDistributionPoints.
     pub const CRL_DISTRIBUTION_POINTS: Oid<'static> =
         Oid::const_new(::const_oid::ObjectIdentifier::new_unwrap("2.5.29.31").as_bytes());
@@ -584,6 +588,11 @@ mod tests {
     #[test]
     fn display_dn_country_name() {
         assert_eq!(format!("{}", known::COUNTRY_NAME), "2.5.4.6");
+    }
+
+    #[test]
+    fn display_dn_organization_name() {
+        assert_eq!(format!("{}", known::ORGANIZATION_NAME), "2.5.4.10");
     }
 
     #[test]

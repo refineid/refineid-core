@@ -32,6 +32,9 @@ use crate::container::{
     EcdsaDer, RsaPkcs1Sha256, RsaPkcs1Sha384, RsaPkcs1Sha512, RsaPssSha256, Signature,
 };
 use crate::ecdsa::{EcdsaError, Sec1UncompressedPoint, extract_ec_pubkey, verify_prehashed};
+use crate::identity::{
+    CommonName, GivenNamesText, OrganizationName, Peuin, SplitGivenNames, SubjectIdentity, Surname,
+};
 use crate::oid::{Oid, known};
 use crate::rsa::{
     RsaModulus, RsaPublicExponent, RsaPublicKey, RsaVerifyError, verify_pkcs1v15_sha384,
@@ -368,6 +371,69 @@ impl<'a> Name<'a> {
     #[must_use]
     pub const fn as_der(&self) -> &'a [u8] {
         self.dn_der
+    }
+
+    /// Return the last matching `DirectoryString` (or `IA5String`) DN
+    /// attribute whose type OID matches `oid_body`.
+    ///
+    /// Fails closed (`None`) when this `Name` is malformed or carries no
+    /// matching decodable attribute.
+    #[must_use]
+    pub fn dn_attribute(&self, oid_body: Oid<'_>) -> Option<String> {
+        let rdns = X509Helpers::decode_name_rdns(self.dn_der)?;
+        let mut found: Option<String> = None;
+        for rdn in rdns {
+            for (oid, value) in rdn {
+                if oid == oid_body
+                    && let Some(text) = X509Helpers::decode_directory_string(value)
+                {
+                    found = Some(text);
+                }
+            }
+        }
+        found
+    }
+
+    /// `commonName` (X.520 `cn`, OID `2.5.4.3`).
+    #[must_use]
+    pub fn common_name(&self) -> Option<CommonName> {
+        CommonName::new(self.dn_attribute(known::COMMON_NAME)?).ok()
+    }
+
+    /// `surName` (X.520 `sn`, OID `2.5.4.4`).
+    #[must_use]
+    pub fn surname(&self) -> Option<Surname> {
+        Surname::new(self.dn_attribute(known::SURNAME)?).ok()
+    }
+
+    /// `givenName` (X.520 `gn`, OID `2.5.4.42`), split into typed slots.
+    #[must_use]
+    pub fn given_names(&self) -> SplitGivenNames {
+        self.dn_attribute(known::GIVEN_NAME)
+            .map_or_else(SplitGivenNames::default, |raw| {
+                GivenNamesText::new(raw)
+                    .map_or_else(|_err| SplitGivenNames::default(), |text| text.split())
+            })
+    }
+
+    /// `organizationName` (X.520 `o`, OID `2.5.4.10`), verbatim. Present
+    /// on an organization card's certificate, absent on a citizen's.
+    #[must_use]
+    pub fn organization_name(&self) -> Option<OrganizationName> {
+        OrganizationName::new(self.dn_attribute(known::ORGANIZATION_NAME)?).ok()
+    }
+
+    /// PEUIN / SATU from the `serialNumber` DN attribute (OID `2.5.4.5`).
+    #[must_use]
+    pub fn peuin(&self) -> Option<Peuin> {
+        Peuin::new(&self.dn_attribute(known::SERIAL_NUMBER)?).ok()
+    }
+
+    /// Extract all typed subject identity attributes into a
+    /// [`SubjectIdentity`].
+    #[must_use]
+    pub fn subject_identity(&self) -> SubjectIdentity {
+        SubjectIdentity::from_name(*self)
     }
 
     /// Compare two Distinguished Names for semantic equality per
@@ -1001,6 +1067,45 @@ impl X509Helpers {
             tag,
             Tag::Utf8String | Tag::PrintableString | Tag::TeletexString | Tag::BmpString
         )
+    }
+
+    /// Decode a `DirectoryString` or `IA5String` value to UTF-8 text for
+    /// DN attribute extraction (printable ASCII without control characters
+    /// for `PrintableString`, `IA5String`, and `TeletexString`; UCS-2
+    /// non-surrogate code units for `BMPString`).
+    fn decode_directory_string(any: spki::der::asn1::AnyRef<'_>) -> Option<String> {
+        use spki::der::{Tag, Tagged as _};
+        /// Octets per UCS-2 code unit in ASN.1 `BMPString` (X.690 §8.23.8).
+        const BMP_UNIT_BYTES: usize = 2;
+
+        let bytes = any.value();
+        match any.tag() {
+            Tag::Utf8String => core::str::from_utf8(bytes).ok().map(str::to_owned),
+            Tag::PrintableString | Tag::Ia5String | Tag::TeletexString => {
+                if !bytes
+                    .iter()
+                    .all(|&byte| byte.is_ascii() && !byte.is_ascii_control())
+                {
+                    return None;
+                }
+                core::str::from_utf8(bytes).ok().map(str::to_owned)
+            }
+            Tag::BmpString => {
+                let (chunks, remainder) = bytes.as_chunks::<BMP_UNIT_BYTES>();
+                if !remainder.is_empty() {
+                    return None;
+                }
+                let mut out = String::with_capacity(chunks.len());
+                for &[hi, lo] in chunks {
+                    // BMPString is UCS-2 (Basic Multilingual Plane only):
+                    // `char::from_u32` rejects UTF-16 surrogate code units.
+                    let code = u32::from(u16::from_be_bytes([hi, lo]));
+                    out.push(char::from_u32(code)?);
+                }
+                Some(out)
+            }
+            _ => None,
+        }
     }
 
     /// Decode a `DirectoryString` or `IA5String` value to UTF-8 text.
@@ -3595,5 +3700,116 @@ mod tests {
                 .map(|_parsed| ()),
             Err(X509Error::UnexpectedStructure("TBS trailing field"))
         );
+    }
+
+    #[test]
+    fn name_extracts_citizen_and_organization_subject_attributes() {
+        use super::{Name, Oid, known};
+        use spki::der::asn1::{ObjectIdentifier, Utf8StringRef};
+        use spki::der::{Encode as _, Header, Length, Tag};
+
+        fn der_tlv(tag: Tag, value: &[u8]) -> Vec<u8> {
+            let len = Length::try_from(value.len()).expect("fixture length fits in DER Length");
+            let mut out = Header::new(tag, len).to_der().expect("header encodes");
+            out.extend_from_slice(value);
+            out
+        }
+
+        fn utf8_rdn(oid: Oid<'_>, value: &str) -> Vec<u8> {
+            let mut atv_body = ObjectIdentifier::from_bytes(oid.as_bytes())
+                .expect("fixture OID is valid")
+                .to_der()
+                .expect("OID encodes");
+            atv_body.extend(
+                Utf8StringRef::new(value)
+                    .expect("fixture value is UTF-8")
+                    .to_der()
+                    .expect("UTF8String encodes"),
+            );
+            der_tlv(Tag::Set, &der_tlv(Tag::Sequence, &atv_body))
+        }
+
+        fn bmp_rdn(oid: Oid<'_>, value: &str) -> Vec<u8> {
+            let mut atv_body = ObjectIdentifier::from_bytes(oid.as_bytes())
+                .expect("fixture OID is valid")
+                .to_der()
+                .expect("OID encodes");
+            let mut bmp_bytes = Vec::new();
+            for unit in value.encode_utf16() {
+                bmp_bytes.extend_from_slice(&unit.to_be_bytes());
+            }
+            atv_body.extend(der_tlv(Tag::BmpString, &bmp_bytes));
+            der_tlv(Tag::Set, &der_tlv(Tag::Sequence, &atv_body))
+        }
+
+        let org_dn = der_tlv(
+            Tag::Sequence,
+            &[
+                utf8_rdn(known::COUNTRY_NAME, "FI"),
+                utf8_rdn(known::ORGANIZATION_NAME, "Testiorganisaatio Oy"),
+                utf8_rdn(known::GIVEN_NAME, "Denis Emil"),
+                utf8_rdn(known::SURNAME, "Juutilainen"),
+                utf8_rdn(known::SERIAL_NUMBER, "99905322A"),
+                utf8_rdn(known::COMMON_NAME, "Juutilainen Denis 99905322A"),
+            ]
+            .concat(),
+        );
+        let org_name = Name::try_from(org_dn.as_slice()).expect("org Name parses");
+        assert_eq!(
+            org_name.organization_name().as_deref(),
+            Some("Testiorganisaatio Oy")
+        );
+        assert_eq!(
+            org_name.common_name().as_deref(),
+            Some("Juutilainen Denis 99905322A")
+        );
+        assert_eq!(org_name.surname().as_deref(), Some("Juutilainen"));
+        assert_eq!(org_name.given_names().first.as_deref(), Some("Denis"));
+        assert_eq!(org_name.given_names().second.as_deref(), Some("Emil"));
+        assert_eq!(org_name.peuin().as_deref(), Some("99905322A"));
+        assert_eq!(
+            org_name.subject_identity().holder_line(),
+            "Juutilainen Denis Emil, Testiorganisaatio Oy"
+        );
+
+        let citizen_dn = der_tlv(
+            Tag::Sequence,
+            &[
+                utf8_rdn(known::COUNTRY_NAME, "FI"),
+                bmp_rdn(known::SURNAME, "MEIKALAINEN"),
+                utf8_rdn(known::COMMON_NAME, ""),
+            ]
+            .concat(),
+        );
+        let citizen_name = Name::try_from(citizen_dn.as_slice()).expect("citizen Name parses");
+        assert_eq!(citizen_name.organization_name(), None);
+        assert_eq!(citizen_name.surname().as_deref(), Some("MEIKALAINEN"));
+        assert_eq!(citizen_name.common_name(), None);
+
+        // Reject control characters in PrintableString and UTF-16 surrogate
+        // pairs in BMPString (UCS-2 forbids surrogate code points).
+        /// UTF-16 high/low surrogate pair for U+1F600 encoded big-endian.
+        const BMP_SURROGATE_PAIR: &[u8] = &[0xD8, 0x3D, 0xDE, 0x00];
+        let mut printable_ctl_atv = ObjectIdentifier::from_bytes(known::COMMON_NAME.as_bytes())
+            .expect("CN OID is valid")
+            .to_der()
+            .expect("OID encodes");
+        printable_ctl_atv.extend(der_tlv(Tag::PrintableString, b"Line1\nLine2"));
+        let mut surrogate_bmp_atv = ObjectIdentifier::from_bytes(known::SURNAME.as_bytes())
+            .expect("surname OID is valid")
+            .to_der()
+            .expect("OID encodes");
+        surrogate_bmp_atv.extend(der_tlv(Tag::BmpString, BMP_SURROGATE_PAIR));
+        let rejected_dn = der_tlv(
+            Tag::Sequence,
+            &[
+                der_tlv(Tag::Set, &der_tlv(Tag::Sequence, &printable_ctl_atv)),
+                der_tlv(Tag::Set, &der_tlv(Tag::Sequence, &surrogate_bmp_atv)),
+            ]
+            .concat(),
+        );
+        let rejected_name = Name::try_from(rejected_dn.as_slice()).expect("rejected Name parses");
+        assert_eq!(rejected_name.common_name(), None);
+        assert_eq!(rejected_name.surname(), None);
     }
 }

@@ -82,7 +82,7 @@ impl NamedCurve {
     }
 
     /// Fixed-width raw `r || s` signature length (`2 * field_len`).
-    const fn raw_signature_len(self) -> usize {
+    pub(crate) const fn raw_signature_len(self) -> usize {
         self.field_len().saturating_mul(SIG_COMPONENT_COUNT)
     }
 }

@@ -526,6 +526,13 @@ pub mod known {
     pub const ATS_HASH_INDEX_V3: Oid<'static> =
         Oid::const_new(::const_oid::ObjectIdentifier::new_unwrap("0.4.0.19122.1.5").as_bytes());
 
+    // ---- ICAO 9303 ----
+
+    /// `2.23.136.1.1.1` -- id-icao-mrtd-security-ldsSecurityObject
+    /// (ICAO 9303-10) -- the SOD eContentType.
+    pub const ICAO_LDS_SECURITY_OBJECT: Oid<'static> =
+        Oid::const_new(::const_oid::ObjectIdentifier::new_unwrap("2.23.136.1.1.1").as_bytes());
+
     // ---- OCSP response types (RFC 6960) ----
 
     /// `1.3.6.1.5.5.7.48.1.1` -- id-pkix-ocsp-basic.

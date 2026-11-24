@@ -356,6 +356,29 @@ impl TestKey {
         }
     }
 
+    /// An ISO/IEC 9796-2 DS1 signature over `challenge_m2` under `hash`
+    /// with deterministic `M1` padding; `None` for an ECDSA key.
+    #[must_use]
+    pub fn sign_iso9796_2_ds1(
+        &self,
+        hash: refineid_digest::HashAlg,
+        challenge_m2: &[u8],
+    ) -> Option<Vec<u8>> {
+        match &self.material {
+            KeyMaterial::Ecdsa { .. } => None,
+            KeyMaterial::Rsa(key) => key.sign_iso9796_2_ds1(hash, challenge_m2),
+        }
+    }
+
+    /// Access the underlying RSA signing key for negative unit tests in `rsa`.
+    #[cfg(test)]
+    pub(crate) const fn rsa_signing_key(&self) -> Option<&RsaSigningKey> {
+        match &self.material {
+            KeyMaterial::Ecdsa { .. } => None,
+            KeyMaterial::Rsa(key) => Some(key),
+        }
+    }
+
     /// The signature algorithm OID of [`Self::sign`].
     #[must_use]
     pub const fn signature_oid(&self) -> Oid<'static> {

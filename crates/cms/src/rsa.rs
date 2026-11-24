@@ -36,6 +36,7 @@ use crypto_bigint::{
 use sha2::{Digest as _, Sha256, Sha384, Sha512};
 
 use crate::container::{RsaPkcs1Sha256, RsaPkcs1Sha384, RsaPkcs1Sha512, RsaPssSha256, Signature};
+use refineid_digest::{HashAlg, SHA1_LEN, SHA384_LEN, SHA512_LEN};
 
 /// Leading-zero byte in a big-endian integer magnitude
 /// representation. A zero byte in this position has no
@@ -582,6 +583,39 @@ fn verify_pkcs1v15(
     Ok(())
 }
 
+/// Length in bytes of the leading byte of an ISO/IEC 9796-2 DS1 message.
+const ISO9796_DS1_LEADING_LEN: usize = 1;
+/// Leading byte of an ISO/IEC 9796-2 DS1 recoverable message.
+const ISO9796_DS1_LEADING_BYTE: u8 = 0x6A;
+/// Length in bytes of the implicit SHA-1 trailer in ISO/IEC 9796-2 DS1.
+const ISO9796_DS1_IMPLICIT_TRAILER_LEN: usize = 1;
+/// Implicit single-byte trailer for SHA-1 in ISO/IEC 9796-2 DS1.
+const ISO9796_DS1_TRAILER_IMPLICIT_SHA1: u8 = 0xBC;
+/// Explicit two-byte trailer terminator in ISO/IEC 9796-2 DS1.
+const ISO9796_DS1_TRAILER_EXPLICIT_END: u8 = 0xCC;
+/// Length of an explicit two-byte ISO/IEC 9796-2 DS1 trailer (`HFI || CC`).
+const ISO9796_DS1_EXPLICIT_TRAILER_LEN: usize = 2;
+/// ISO/IEC 10118-3 hash-function identifier for SHA-256.
+const ISO10118_HFI_SHA256: u8 = 0x34;
+/// ISO/IEC 10118-3 hash-function identifier for SHA-384.
+const ISO10118_HFI_SHA384: u8 = 0x36;
+/// ISO/IEC 10118-3 hash-function identifier for SHA-512.
+const ISO10118_HFI_SHA512: u8 = 0x35;
+/// Minimum length of a recovered ISO/IEC 9796-2 DS1 message: leading byte,
+/// shortest supported digest (SHA-1), and single-byte implicit trailer.
+const ISO9796_DS1_MIN_RECOVERED_LEN: usize =
+    ISO9796_DS1_LEADING_LEN + SHA1_LEN + ISO9796_DS1_IMPLICIT_TRAILER_LEN;
+
+/// Recovered message from an ISO/IEC 9796-2 Digital Signature Scheme 1
+/// verification (used by ICAO 9303-11 Active Authentication).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Iso9796Ds1Recovered {
+    /// Random recoverable message padding (`M1`) emitted by the chip.
+    pub m1: Vec<u8>,
+    /// Hash algorithm decoded from the ISO/IEC 9796-2 trailer.
+    pub hash: HashAlg,
+}
+
 impl RsaPublicKey {
     /// Verify a PKCS#1 v1.5 signature over `SHA-256(message)`
     /// against this key.
@@ -616,6 +650,109 @@ impl RsaPublicKey {
         signature: &Signature<RsaPkcs1Sha256>,
     ) -> Result<(), RsaVerifyError> {
         verify_pkcs1v15(self, SHA256_DIGEST_INFO, digest, signature.as_bytes())
+    }
+
+    /// Verify PKCS#1 v1.5 against an already-computed SHA-384 digest.
+    ///
+    /// # Errors
+    /// Returns [`RsaVerifyError`] when the signature has invalid padding,
+    /// length, or an embedded digest that does not match.
+    pub fn verify_pkcs1v15_sha384_digest(
+        &self,
+        digest: &[u8; SHA384_LEN],
+        signature: &Signature<RsaPkcs1Sha384>,
+    ) -> Result<(), RsaVerifyError> {
+        verify_pkcs1v15(self, SHA384_DIGEST_INFO, digest, signature.as_bytes())
+    }
+
+    /// Verify PKCS#1 v1.5 against an already-computed SHA-512 digest.
+    ///
+    /// # Errors
+    /// Returns [`RsaVerifyError`] when the signature has invalid padding,
+    /// length, or an embedded digest that does not match.
+    pub fn verify_pkcs1v15_sha512_digest(
+        &self,
+        digest: &[u8; SHA512_LEN],
+        signature: &Signature<RsaPkcs1Sha512>,
+    ) -> Result<(), RsaVerifyError> {
+        verify_pkcs1v15(self, SHA512_DIGEST_INFO, digest, signature.as_bytes())
+    }
+
+    /// Verify an ISO/IEC 9796-2 Digital Signature Scheme 1 signature with
+    /// message recovery (ICAO 9303-11 Active Authentication).
+    ///
+    /// # Errors
+    /// [`RsaVerifyError::BadPadding`] for structural or trailer mismatches,
+    /// [`RsaVerifyError::BadDigest`] when the embedded hash disagrees with
+    /// `H(M1 || challenge_m2)`, or [`RsaVerifyError::BadModulus`] /
+    /// [`RsaVerifyError::SignatureOutOfRange`] on RSA recovery failure.
+    pub fn verify_iso9796_2_ds1(
+        &self,
+        challenge_m2: &[u8],
+        signature: &[u8],
+    ) -> Result<Iso9796Ds1Recovered, RsaVerifyError> {
+        let recovered = self.raw_recover(signature)?;
+        let k = recovered.len();
+        if k < ISO9796_DS1_MIN_RECOVERED_LEN
+            || recovered.first().copied() != Some(ISO9796_DS1_LEADING_BYTE)
+        {
+            return Err(RsaVerifyError::BadPadding);
+        }
+        let last_idx = k
+            .checked_sub(ISO9796_DS1_IMPLICIT_TRAILER_LEN)
+            .ok_or(RsaVerifyError::BadPadding)?;
+        let last = recovered
+            .get(last_idx)
+            .copied()
+            .ok_or(RsaVerifyError::BadPadding)?;
+        let (hash, trailer_len) = match last {
+            ISO9796_DS1_TRAILER_IMPLICIT_SHA1 => (HashAlg::Sha1, ISO9796_DS1_IMPLICIT_TRAILER_LEN),
+            ISO9796_DS1_TRAILER_EXPLICIT_END => {
+                let hfi_idx = k
+                    .checked_sub(ISO9796_DS1_EXPLICIT_TRAILER_LEN)
+                    .ok_or(RsaVerifyError::BadPadding)?;
+                let hfi = recovered
+                    .get(hfi_idx)
+                    .copied()
+                    .ok_or(RsaVerifyError::BadPadding)?;
+                let alg = match hfi {
+                    ISO10118_HFI_SHA256 => HashAlg::Sha256,
+                    ISO10118_HFI_SHA384 => HashAlg::Sha384,
+                    ISO10118_HFI_SHA512 => HashAlg::Sha512,
+                    _ => return Err(RsaVerifyError::BadPadding),
+                };
+                (alg, ISO9796_DS1_EXPLICIT_TRAILER_LEN)
+            }
+            _ => return Err(RsaVerifyError::BadPadding),
+        };
+        let digest_len = hash.digest_len();
+        let footer = digest_len
+            .checked_add(trailer_len)
+            .and_then(|n| n.checked_add(ISO9796_DS1_LEADING_LEN))
+            .ok_or(RsaVerifyError::BadPadding)?;
+        if k < footer {
+            return Err(RsaVerifyError::BadPadding);
+        }
+        let hash_end = k
+            .checked_sub(trailer_len)
+            .ok_or(RsaVerifyError::BadPadding)?;
+        let m1_end = hash_end
+            .checked_sub(digest_len)
+            .ok_or(RsaVerifyError::BadPadding)?;
+        let m1 = recovered
+            .get(ISO9796_DS1_LEADING_LEN..m1_end)
+            .ok_or(RsaVerifyError::BadPadding)?
+            .to_vec();
+        let embedded_hash = recovered
+            .get(m1_end..hash_end)
+            .ok_or(RsaVerifyError::BadPadding)?;
+        let mut message = Vec::with_capacity(m1.len().saturating_add(challenge_m2.len()));
+        message.extend_from_slice(&m1);
+        message.extend_from_slice(challenge_m2);
+        if hash.digest(&message) != embedded_hash {
+            return Err(RsaVerifyError::BadDigest);
+        }
+        Ok(Iso9796Ds1Recovered { m1, hash })
     }
 
     /// Verify a PKCS#1 v1.5 signature over `SHA-384(message)`.
@@ -904,8 +1041,11 @@ pub(crate) mod signing {
     use super::{
         BITS_PER_BYTE, BOXED_UINT_LIMB_BITS, EMSA_PKCS1_V15_BLOCK_TYPE,
         EMSA_PKCS1_V15_LEADING_BYTE, EMSA_PKCS1_V15_PS_FILL, EMSA_PKCS1_V15_PS_OFFSET,
-        EMSA_PKCS1_V15_SEPARATOR, RsaModulus, RsaPublicExponent, SHA256_DIGEST_INFO,
-        SHA384_DIGEST_INFO, SHA512_DIGEST_INFO, emsa_pss_sha256_encode,
+        EMSA_PKCS1_V15_SEPARATOR, HashAlg, ISO9796_DS1_EXPLICIT_TRAILER_LEN,
+        ISO9796_DS1_IMPLICIT_TRAILER_LEN, ISO9796_DS1_LEADING_BYTE, ISO9796_DS1_LEADING_LEN,
+        ISO9796_DS1_TRAILER_EXPLICIT_END, ISO9796_DS1_TRAILER_IMPLICIT_SHA1, ISO10118_HFI_SHA256,
+        ISO10118_HFI_SHA384, ISO10118_HFI_SHA512, RsaModulus, RsaPublicExponent,
+        SHA256_DIGEST_INFO, SHA384_DIGEST_INFO, SHA512_DIGEST_INFO, emsa_pss_sha256_encode,
     };
     use crate::signed_data::HashAlgorithm;
     use crypto_bigint::{
@@ -1032,20 +1172,78 @@ pub(crate) mod signing {
             let encoded = emsa_pss_sha256_encode(message, salt, encoded_bits);
             self.private_operation(&encoded)
         }
+
+        /// An ISO/IEC 9796-2 DS1 signature over `challenge_m2` under `hash`
+        /// using deterministic `M1` bytes, or `None` if the modulus cannot
+        /// hold the DS1 frame.
+        pub(crate) fn sign_iso9796_2_ds1(
+            &self,
+            hash: HashAlg,
+            challenge_m2: &[u8],
+        ) -> Option<Vec<u8>> {
+            let trailer: &[u8] = match hash {
+                HashAlg::Sha1 => &ISO9796_DS1_TRAILER_SHA1,
+                HashAlg::Sha256 => &ISO9796_DS1_TRAILER_SHA256,
+                HashAlg::Sha384 => &ISO9796_DS1_TRAILER_SHA384,
+                HashAlg::Sha512 => &ISO9796_DS1_TRAILER_SHA512,
+            };
+            let width = self.modulus.byte_len();
+            let frame_overhead = ISO9796_DS1_LEADING_LEN
+                .checked_add(hash.digest_len())?
+                .checked_add(trailer.len())?;
+            let m1_len = width.checked_sub(frame_overhead)?;
+            let m1 = vec![ISO9796_DS1_TEST_M1_FILL; m1_len];
+            let mut message = Vec::with_capacity(m1.len().saturating_add(challenge_m2.len()));
+            message.extend_from_slice(&m1);
+            message.extend_from_slice(challenge_m2);
+            let digest = hash.digest(&message);
+            let mut encoded = Vec::with_capacity(width);
+            encoded.push(ISO9796_DS1_LEADING_BYTE);
+            encoded.extend_from_slice(&m1);
+            encoded.extend_from_slice(&digest);
+            encoded.extend_from_slice(trailer);
+            Some(self.private_operation(&encoded))
+        }
+
+        /// Sign a raw modulus-width encoded block for negative unit tests.
+        #[cfg(test)]
+        pub(crate) fn sign_raw_encoded(&self, encoded: &[u8]) -> Vec<u8> {
+            self.private_operation(encoded)
+        }
     }
 
     /// EMSA-PKCS1-v1_5 octets around the padding string and the
     /// `DigestInfo`: the leading zero, the block type and the
     /// separator.
     const EMSA_FRAME_BYTES: usize = EMSA_PKCS1_V15_PS_OFFSET + 1;
+
+    /// Deterministic fill byte for the `M1` recoverable section in
+    /// test ISO/IEC 9796-2 DS1 signatures.
+    const ISO9796_DS1_TEST_M1_FILL: u8 = 0xA5;
+
+    /// Implicit single-byte trailer for SHA-1.
+    const ISO9796_DS1_TRAILER_SHA1: [u8; ISO9796_DS1_IMPLICIT_TRAILER_LEN] =
+        [ISO9796_DS1_TRAILER_IMPLICIT_SHA1];
+    /// Explicit two-byte trailer for SHA-256.
+    const ISO9796_DS1_TRAILER_SHA256: [u8; ISO9796_DS1_EXPLICIT_TRAILER_LEN] =
+        [ISO10118_HFI_SHA256, ISO9796_DS1_TRAILER_EXPLICIT_END];
+    /// Explicit two-byte trailer for SHA-384.
+    const ISO9796_DS1_TRAILER_SHA384: [u8; ISO9796_DS1_EXPLICIT_TRAILER_LEN] =
+        [ISO10118_HFI_SHA384, ISO9796_DS1_TRAILER_EXPLICIT_END];
+    /// Explicit two-byte trailer for SHA-512.
+    const ISO9796_DS1_TRAILER_SHA512: [u8; ISO9796_DS1_EXPLICIT_TRAILER_LEN] =
+        [ISO10118_HFI_SHA512, ISO9796_DS1_TRAILER_EXPLICIT_END];
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BITS_PER_BYTE_USIZE, LEADING_ZERO_BYTE, RsaModulus, RsaModulusError, RsaPublicExponent,
-        RsaPublicExponentError, RsaPublicKey, RsaVerifyError, SHA256_OUTPUT_BYTES,
-        emsa_pss_sha256_encode, verify_pss_encoded_sha256,
+        BITS_PER_BYTE_USIZE, HashAlg, ISO9796_DS1_EXPLICIT_TRAILER_LEN,
+        ISO9796_DS1_IMPLICIT_TRAILER_LEN, ISO9796_DS1_LEADING_BYTE, ISO9796_DS1_LEADING_LEN,
+        ISO9796_DS1_TRAILER_EXPLICIT_END, LEADING_ZERO_BYTE, RsaModulus, RsaModulusError,
+        RsaPublicExponent, RsaPublicExponentError, RsaPublicKey, RsaVerifyError,
+        SHA256_OUTPUT_BYTES, SHA384_LEN, SHA512_LEN, emsa_pss_sha256_encode,
+        verify_pss_encoded_sha256,
     };
     use crate::container::{
         RsaPkcs1Sha256, RsaPkcs1Sha384, RsaPkcs1Sha512, RsaPssSha256, Signature,
@@ -1053,7 +1251,7 @@ mod tests {
     use crate::signed_data::HashAlgorithm;
     use crate::testkit::TestKey;
     use crate::x509::extract_rsa_public_key;
-    use sha2::{Digest as _, Sha256};
+    use sha2::{Digest as _, Sha256, Sha384, Sha512};
 
     /// Bytes-per-modulus for RSA-2048 (modulus byte length k =
     /// `modulus_bits` / 8). Reused across fixture builders below.
@@ -1317,6 +1515,149 @@ mod tests {
         let modulus_sig = Signature::<RsaPkcs1Sha256>::new(public_key.modulus.as_bytes().to_vec());
         assert_err_eq(
             public_key.verify_pkcs1v15_sha256(MESSAGE, &modulus_sig),
+            &RsaVerifyError::SignatureOutOfRange,
+        );
+    }
+
+    #[test]
+    fn pkcs1v15_digest_variants_verify_and_reject_tampering() {
+        const MESSAGE: &[u8] = b"refineid prehashed pkcs1v15 digest test";
+        /// Single-bit XOR mask used to tamper with a digest byte.
+        const BIT_FLIP_MASK: u8 = 0x01;
+
+        let signing_key = TestKey::rsa_2048();
+        let public_key =
+            extract_rsa_public_key(&signing_key.spki()).expect("RFC 9500 RSA SPKI parses");
+
+        let digest_384: [u8; SHA384_LEN] = Sha384::digest(MESSAGE).into();
+        let sig_384 =
+            Signature::<RsaPkcs1Sha384>::new(signing_key.sign_with(HashAlgorithm::Sha384, MESSAGE));
+        assert_eq!(
+            public_key.verify_pkcs1v15_sha384_digest(&digest_384, &sig_384),
+            Ok(())
+        );
+        let mut bad_384 = digest_384;
+        if let Some(first) = bad_384.first_mut() {
+            *first ^= BIT_FLIP_MASK;
+        }
+        assert_err_eq(
+            public_key.verify_pkcs1v15_sha384_digest(&bad_384, &sig_384),
+            &RsaVerifyError::BadDigest,
+        );
+
+        let digest_512: [u8; SHA512_LEN] = Sha512::digest(MESSAGE).into();
+        let sig_512 =
+            Signature::<RsaPkcs1Sha512>::new(signing_key.sign_with(HashAlgorithm::Sha512, MESSAGE));
+        assert_eq!(
+            public_key.verify_pkcs1v15_sha512_digest(&digest_512, &sig_512),
+            Ok(())
+        );
+        let mut bad_512 = digest_512;
+        if let Some(first) = bad_512.first_mut() {
+            *first ^= BIT_FLIP_MASK;
+        }
+        assert_err_eq(
+            public_key.verify_pkcs1v15_sha512_digest(&bad_512, &sig_512),
+            &RsaVerifyError::BadDigest,
+        );
+    }
+
+    #[test]
+    fn iso9796_2_ds1_verifies_all_hashes_and_rejects_malformed_inputs() {
+        const CHALLENGE: &[u8] = b"AA-RND8!";
+        const WRONG_CHALLENGE: &[u8] = b"AA-RND8?";
+        /// Unknown single-byte trailer that matches neither implicit nor explicit endings.
+        const BAD_TRAILER_BYTE: u8 = 0xDD;
+        /// Unknown ISO/IEC 10118 hash-function identifier paired with the explicit end byte.
+        const UNKNOWN_HFI_BYTE: u8 = 0x39;
+        /// Arbitrary fill byte for synthetic negative encoded blocks.
+        const NEGATIVE_BLOCK_FILL: u8 = 0x11;
+        /// Number of supported ISO/IEC 9796-2 DS1 hash algorithms.
+        const HASH_COUNT: usize = 4;
+        const ALL_HASHES: [HashAlg; HASH_COUNT] = [
+            HashAlg::Sha1,
+            HashAlg::Sha256,
+            HashAlg::Sha384,
+            HashAlg::Sha512,
+        ];
+
+        let signing_key = TestKey::rsa_2048();
+        let public_key =
+            extract_rsa_public_key(&signing_key.spki()).expect("RFC 9500 RSA SPKI parses");
+        let rsa_signer = signing_key
+            .rsa_signing_key()
+            .expect("RFC 9500 test key is RSA");
+
+        for hash in ALL_HASHES {
+            let signature = signing_key
+                .sign_iso9796_2_ds1(hash, CHALLENGE)
+                .expect("RSA test key produces ISO 9796-2 DS1 signature");
+            let recovered = public_key
+                .verify_iso9796_2_ds1(CHALLENGE, &signature)
+                .expect("valid ISO 9796-2 DS1 signature must verify");
+            assert_eq!(recovered.hash, hash);
+            let trailer_len = match hash {
+                HashAlg::Sha1 => ISO9796_DS1_IMPLICIT_TRAILER_LEN,
+                HashAlg::Sha256 | HashAlg::Sha384 | HashAlg::Sha512 => {
+                    ISO9796_DS1_EXPLICIT_TRAILER_LEN
+                }
+            };
+            let expected_m1_len = RSA_2048_MODULUS_BYTE_LEN
+                - ISO9796_DS1_LEADING_LEN
+                - hash.digest_len()
+                - trailer_len;
+            assert_eq!(recovered.m1.len(), expected_m1_len);
+
+            assert_err_eq(
+                public_key.verify_iso9796_2_ds1(WRONG_CHALLENGE, &signature),
+                &RsaVerifyError::BadDigest,
+            );
+        }
+
+        // Wrong leading byte: a PKCS#1 v1.5 signature recovers starting with the
+        // EMSA leading zero rather than ISO9796_DS1_LEADING_BYTE.
+        let pkcs1_sig = signing_key.sign_with(HashAlgorithm::Sha256, CHALLENGE);
+        assert_err_eq(
+            public_key.verify_iso9796_2_ds1(CHALLENGE, &pkcs1_sig),
+            &RsaVerifyError::BadPadding,
+        );
+
+        // Unknown trailer terminator byte.
+        let mut bad_trailer_block = vec![NEGATIVE_BLOCK_FILL; RSA_2048_MODULUS_BYTE_LEN];
+        if let Some(first) = bad_trailer_block.first_mut() {
+            *first = ISO9796_DS1_LEADING_BYTE;
+        }
+        if let Some(last) = bad_trailer_block.last_mut() {
+            *last = BAD_TRAILER_BYTE;
+        }
+        let bad_trailer_sig = rsa_signer.sign_raw_encoded(&bad_trailer_block);
+        assert_err_eq(
+            public_key.verify_iso9796_2_ds1(CHALLENGE, &bad_trailer_sig),
+            &RsaVerifyError::BadPadding,
+        );
+
+        // Unknown hash-function identifier before explicit trailer end byte.
+        let mut bad_hfi_block = vec![NEGATIVE_BLOCK_FILL; RSA_2048_MODULUS_BYTE_LEN];
+        if let Some(first) = bad_hfi_block.first_mut() {
+            *first = ISO9796_DS1_LEADING_BYTE;
+        }
+        let hfi_index = RSA_2048_MODULUS_BYTE_LEN - ISO9796_DS1_EXPLICIT_TRAILER_LEN;
+        if let Some(slot) = bad_hfi_block.get_mut(hfi_index) {
+            *slot = UNKNOWN_HFI_BYTE;
+        }
+        if let Some(last) = bad_hfi_block.last_mut() {
+            *last = ISO9796_DS1_TRAILER_EXPLICIT_END;
+        }
+        let bad_hfi_sig = rsa_signer.sign_raw_encoded(&bad_hfi_block);
+        assert_err_eq(
+            public_key.verify_iso9796_2_ds1(CHALLENGE, &bad_hfi_sig),
+            &RsaVerifyError::BadPadding,
+        );
+
+        // Signature length mismatch.
+        let short_sig = vec![SIGNATURE_FILL_BYTE; HALF_K_SIGNATURE_BYTE_LEN];
+        assert_err_eq(
+            public_key.verify_iso9796_2_ds1(CHALLENGE, &short_sig),
             &RsaVerifyError::SignatureOutOfRange,
         );
     }

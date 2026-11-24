@@ -1324,6 +1324,27 @@ impl core::fmt::Display for VerifyError {
 
 impl core::error::Error for VerifyError {}
 
+/// Why [`SpkiDer::verify_digest_signature`] accepted no signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DigestCheckError {
+    /// The check cannot run: the key is not of the algorithm's kind or
+    /// does not decode, or the digest is not the hash's length.
+    Refused,
+    /// The signature is not one the key made over the digest.
+    DoesNotVerify,
+}
+
+impl core::fmt::Display for DigestCheckError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Refused => write!(f, "digest signature check refused"),
+            Self::DoesNotVerify => write!(f, "digest signature does not verify"),
+        }
+    }
+}
+
+impl core::error::Error for DigestCheckError {}
+
 /// `RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent
 /// INTEGER }` (RFC 8017 A.1.1) as the two canonical big-endian
 /// magnitudes.
@@ -1591,6 +1612,108 @@ impl<'a> SpkiDer<'a> {
     #[must_use]
     pub fn ec_public_key_point(&self) -> Option<Sec1UncompressedPoint> {
         Sec1UncompressedPoint::from_bytes(self.subject_public_key.to_vec()).ok()
+    }
+
+    /// Verify a signature made over an already-computed `digest` under a
+    /// strictly selected external signature profile.
+    ///
+    /// Used when a remote signer (such as a card or phone) signs a
+    /// precomputed digest on behalf of the host and the host checks the
+    /// returned signature against the signer's cached certificate before
+    /// handing it on.
+    ///
+    /// # Errors
+    /// [`DigestCheckError::Refused`] when the check cannot run (key kind
+    /// mismatch, undecodable key, or digest width mismatch).
+    /// [`DigestCheckError::DoesNotVerify`] when the signature was not made
+    /// by this key over `digest`.
+    pub fn verify_digest_signature(
+        self,
+        algorithm: MessageSignatureAlgorithm,
+        digest: &[u8],
+        signature: &[u8],
+    ) -> Result<(), DigestCheckError> {
+        use refineid_digest::{SHA256_LEN, SHA384_LEN, SHA512_LEN};
+
+        let digest_len = match algorithm {
+            MessageSignatureAlgorithm::RsaPkcs1Sha256
+            | MessageSignatureAlgorithm::RsaPssSha256
+            | MessageSignatureAlgorithm::EcdsaSha256Raw => SHA256_LEN,
+            MessageSignatureAlgorithm::RsaPkcs1Sha384
+            | MessageSignatureAlgorithm::EcdsaSha384Raw => SHA384_LEN,
+            MessageSignatureAlgorithm::RsaPkcs1Sha512
+            | MessageSignatureAlgorithm::EcdsaSha512Raw => SHA512_LEN,
+        };
+        if digest.len() != digest_len {
+            return Err(DigestCheckError::Refused);
+        }
+        let rsa_key = || extract_rsa_public_key(self.der).ok_or(DigestCheckError::Refused);
+        let rsa_outcome = |result: Result<(), RsaVerifyError>| {
+            result.map_err(|error| match error {
+                RsaVerifyError::BadModulus => DigestCheckError::Refused,
+                RsaVerifyError::BadDigest
+                | RsaVerifyError::BadDigestInfo
+                | RsaVerifyError::BadPadding
+                | RsaVerifyError::SignatureOutOfRange => DigestCheckError::DoesNotVerify,
+            })
+        };
+        match algorithm {
+            MessageSignatureAlgorithm::RsaPkcs1Sha256 => {
+                let digest: &[u8; SHA256_LEN] =
+                    digest.try_into().map_err(|_| DigestCheckError::Refused)?;
+                rsa_outcome(rsa_key()?.verify_pkcs1v15_sha256_digest(
+                    digest,
+                    &Signature::<RsaPkcs1Sha256>::new(signature.to_vec()),
+                ))
+            }
+            MessageSignatureAlgorithm::RsaPkcs1Sha384 => {
+                let digest: &[u8; SHA384_LEN] =
+                    digest.try_into().map_err(|_| DigestCheckError::Refused)?;
+                rsa_outcome(rsa_key()?.verify_pkcs1v15_sha384_digest(
+                    digest,
+                    &Signature::<RsaPkcs1Sha384>::new(signature.to_vec()),
+                ))
+            }
+            MessageSignatureAlgorithm::RsaPkcs1Sha512 => {
+                let digest: &[u8; SHA512_LEN] =
+                    digest.try_into().map_err(|_| DigestCheckError::Refused)?;
+                rsa_outcome(rsa_key()?.verify_pkcs1v15_sha512_digest(
+                    digest,
+                    &Signature::<RsaPkcs1Sha512>::new(signature.to_vec()),
+                ))
+            }
+            MessageSignatureAlgorithm::RsaPssSha256 => {
+                let key = extract_rsa_public_key(self.der)
+                    .or_else(|| extract_rsa_pss_public_key_with_absent_parameters(self.der))
+                    .ok_or(DigestCheckError::Refused)?;
+                rsa_outcome(key.verify_pss_sha256_digest(
+                    digest,
+                    &Signature::<RsaPssSha256>::new(signature.to_vec()),
+                ))
+            }
+            MessageSignatureAlgorithm::EcdsaSha256Raw
+            | MessageSignatureAlgorithm::EcdsaSha384Raw
+            | MessageSignatureAlgorithm::EcdsaSha512Raw => {
+                let (curve, public_key) =
+                    extract_ec_pubkey(self.der).ok_or(DigestCheckError::Refused)?;
+                if signature.len() != curve.raw_signature_len() {
+                    return Err(DigestCheckError::DoesNotVerify);
+                }
+                let signature = Signature::<EcdsaDer>::from_raw_concatenation(signature)
+                    .map_err(|_| DigestCheckError::DoesNotVerify)?;
+                verify_prehashed(curve, &public_key, &signature, digest).map_err(
+                    |error| match error {
+                        EcdsaError::BadModulus | EcdsaError::BadPublicKey => {
+                            DigestCheckError::Refused
+                        }
+                        EcdsaError::BadSignature
+                        | EcdsaError::NotInvertible
+                        | EcdsaError::SigOutOfRange
+                        | EcdsaError::VerifyFailed => DigestCheckError::DoesNotVerify,
+                    },
+                )
+            }
+        }
     }
 
     /// Verify a message signature under a strictly selected external

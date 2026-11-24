@@ -1162,6 +1162,11 @@ impl X509Helpers {
 /// Same as `find_extension` but also reports whether the
 /// extension carried `critical = TRUE`. Per RFC 5280 the
 /// `critical` BOOLEAN defaults to FALSE when absent.
+/// DER-encoded `BOOLEAN FALSE` content octet (X.690 sec.11.1).
+const DER_BOOLEAN_FALSE: u8 = 0x00;
+/// DER-encoded `BOOLEAN TRUE` content octet (X.690 sec.11.1).
+const DER_BOOLEAN_TRUE: u8 = 0xFF;
+
 #[must_use]
 pub(crate) fn find_extension_with_meta<'a>(
     extensions: &'a [u8],
@@ -1173,25 +1178,48 @@ pub(crate) fn find_extension_with_meta<'a>(
     // Walk the SEQUENCE OF Extension with the vetted der reader.
     let mut reader = SliceReader::new(extensions).ok()?;
     while !reader.is_finished() {
-        let ext = AnyRef::from_der(reader.tlv_bytes().ok()?).ok()?;
+        let Ok(ext_bytes) = reader.tlv_bytes() else {
+            break;
+        };
+        let Ok(ext) = AnyRef::from_der(ext_bytes) else {
+            continue;
+        };
         if ext.tag() != Tag::Sequence {
             continue;
         }
         // Extension ::= SEQUENCE { extnID OID, critical BOOLEAN
         // DEFAULT FALSE, extnValue OCTET STRING }.
-        let mut fields = SliceReader::new(ext.value()).ok()?;
-        let oid = AnyRef::from_der(fields.tlv_bytes().ok()?).ok()?;
+        let Ok(mut fields) = SliceReader::new(ext.value()) else {
+            continue;
+        };
+        let Ok(oid_bytes) = fields.tlv_bytes() else {
+            continue;
+        };
+        let Ok(oid) = AnyRef::from_der(oid_bytes) else {
+            continue;
+        };
         if oid.tag() != Tag::ObjectIdentifier || oid.value() != oid_value.as_bytes() {
             continue;
         }
-        // Optional `critical BOOLEAN` -- absent encodes FALSE.
-        let mut next = AnyRef::from_der(fields.tlv_bytes().ok()?).ok()?;
+        // Optional `critical BOOLEAN` -- absent encodes FALSE; when
+        // present, X.690 sec.11.1 fixes DER encoding to
+        // `DER_BOOLEAN_FALSE` or `DER_BOOLEAN_TRUE`.
+        let Ok(mut next) = fields.tlv_bytes().and_then(AnyRef::from_der) else {
+            return None;
+        };
         let mut critical = false;
         if next.tag() == Tag::Boolean {
-            critical = next.value().first().is_some_and(|&b| b != 0);
-            next = AnyRef::from_der(fields.tlv_bytes().ok()?).ok()?;
+            critical = match next.value() {
+                [DER_BOOLEAN_FALSE] => false,
+                [DER_BOOLEAN_TRUE] => true,
+                _ => return None,
+            };
+            let Ok(val) = fields.tlv_bytes().and_then(AnyRef::from_der) else {
+                return None;
+            };
+            next = val;
         }
-        if next.tag() != Tag::OctetString {
+        if next.tag() != Tag::OctetString || !fields.is_finished() {
             return None;
         }
         return Some(ExtensionMeta {
@@ -3934,5 +3962,70 @@ mod tests {
         let rejected_name = Name::try_from(rejected_dn.as_slice()).expect("rejected Name parses");
         assert_eq!(rejected_name.common_name(), None);
         assert_eq!(rejected_name.surname(), None);
+    }
+
+    #[test]
+    fn find_extension_with_meta_skips_malformed_siblings_and_rejects_malformed_match() {
+        use super::{DER_BOOLEAN_FALSE, DER_BOOLEAN_TRUE, OID_KEY_USAGE, find_extension_with_meta};
+
+        const DER_TAG_BOOLEAN: u8 = 0x01;
+        const DER_TAG_OCTET_STRING: u8 = 0x04;
+        const DER_TAG_NULL: u8 = 0x05;
+        const DER_TAG_OID: u8 = 0x06;
+        const DER_TAG_SEQUENCE: u8 = 0x30;
+        const TRUNCATED_OID_LEN: u8 = 5;
+        const TRUNCATED_INNER_TLV: &[u8] = &[DER_TAG_OID, TRUNCATED_OID_LEN];
+        const NON_DER_BOOLEAN: &[u8] = &[0x01];
+        const OVERLONG_BOOLEAN: &[u8] = &[0x00, 0x00];
+        const SAMPLE_VALUE: &[u8] = &[0x03, 0x02, 0x07, 0x80];
+
+        let der_tlv =
+            |tag: u8, value: &[u8]| -> Vec<u8> { refineid_ber::tlv(tag, value).expect("test TLV") };
+        let build_ext = |critical: Option<&[u8]>, trailing: Option<&[u8]>| -> Vec<u8> {
+            let mut body = der_tlv(DER_TAG_OID, OID_KEY_USAGE.as_bytes());
+            if let Some(flag) = critical {
+                body.extend_from_slice(&der_tlv(DER_TAG_BOOLEAN, flag));
+            }
+            body.extend_from_slice(&der_tlv(DER_TAG_OCTET_STRING, SAMPLE_VALUE));
+            if let Some(extra) = trailing {
+                body.extend_from_slice(extra);
+            }
+            der_tlv(DER_TAG_SEQUENCE, &body)
+        };
+
+        // Empty and malformed siblings preceding the target OID are skipped.
+        let mut with_siblings = der_tlv(DER_TAG_SEQUENCE, &[]);
+        with_siblings.extend_from_slice(&der_tlv(DER_TAG_SEQUENCE, TRUNCATED_INNER_TLV));
+        with_siblings.extend_from_slice(&build_ext(Some(&[DER_BOOLEAN_TRUE]), None));
+        let found = find_extension_with_meta(&with_siblings, OID_KEY_USAGE)
+            .expect("target extension found after malformed siblings");
+        assert!(found.critical);
+        assert_eq!(found.value, SAMPLE_VALUE);
+
+        // Explicit DER FALSE decodes as non-critical.
+        let explicit_false = build_ext(Some(&[DER_BOOLEAN_FALSE]), None);
+        let found_false = find_extension_with_meta(&explicit_false, OID_KEY_USAGE)
+            .expect("explicit DER FALSE parses");
+        assert!(!found_false.critical);
+        assert_eq!(found_false.value, SAMPLE_VALUE);
+
+        // Non-DER BOOLEAN payloads fail closed.
+        for bad_bool in [NON_DER_BOOLEAN, OVERLONG_BOOLEAN, &[][..]] {
+            let malformed = build_ext(Some(bad_bool), None);
+            assert!(
+                find_extension_with_meta(&malformed, OID_KEY_USAGE).is_none(),
+                "non-DER critical BOOLEAN must be rejected"
+            );
+        }
+
+        // Trailing TLV inside matched Extension fails closed without falling
+        // through to a subsequent valid duplicate extension.
+        let trailing_null = der_tlv(DER_TAG_NULL, &[]);
+        let mut dup_stream = build_ext(Some(&[DER_BOOLEAN_TRUE]), Some(&trailing_null));
+        dup_stream.extend_from_slice(&build_ext(None, None));
+        assert!(
+            find_extension_with_meta(&dup_stream, OID_KEY_USAGE).is_none(),
+            "trailing TLV inside matched extension must fail closed"
+        );
     }
 }

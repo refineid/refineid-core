@@ -42,28 +42,56 @@ const TAG_DP_DISTRIBUTION_POINT_NAME: u16 = 0xA0;
 const TAG_DP_FULL_NAME: u16 = 0xA0;
 /// `[6] IMPLICIT` `uniformResourceIdentifier` in `GeneralName`.
 const TAG_GN_URI: u16 = 0x86;
+/// DER-encoded `BOOLEAN FALSE` content octet (X.690 sec.11.1).
+const DER_BOOLEAN_FALSE: u8 = 0x00;
+/// DER-encoded `BOOLEAN TRUE` content octet (X.690 sec.11.1).
+const DER_BOOLEAN_TRUE: u8 = 0xFF;
 const GN_URI: Tag = Tag::ContextSpecific {
     constructed: false,
     number: spki::der::TagNumber(6),
 };
 
+/// Return the `extnValue` octets for the first `Extension` whose OID matches
+/// `oid_value`. Non-matching or malformed sibling entries are skipped; a
+/// matched entry with any structural defect fails closed (`None`) rather than
+/// falling through to a later duplicate extension.
 fn find_extension<'a>(extensions: &'a [u8], oid_value: Oid<'_>) -> Option<&'a [u8]> {
     let mut reader = SliceReader::new(extensions).ok()?;
     while !reader.is_finished() {
-        let ext = AnyRef::from_der(reader.tlv_bytes().ok()?).ok()?;
+        let Ok(ext_bytes) = reader.tlv_bytes() else {
+            break;
+        };
+        let Ok(ext) = AnyRef::from_der(ext_bytes) else {
+            continue;
+        };
         if ext.tag() != Tag::Sequence {
             continue;
         }
-        let mut fields = SliceReader::new(ext.value()).ok()?;
-        let oid = AnyRef::from_der(fields.tlv_bytes().ok()?).ok()?;
+        let Ok(mut fields) = SliceReader::new(ext.value()) else {
+            continue;
+        };
+        let Ok(oid_bytes) = fields.tlv_bytes() else {
+            continue;
+        };
+        let Ok(oid) = AnyRef::from_der(oid_bytes) else {
+            continue;
+        };
         if oid.tag() != Tag::ObjectIdentifier || oid.value() != oid_value.as_bytes() {
             continue;
         }
-        let mut next = AnyRef::from_der(fields.tlv_bytes().ok()?).ok()?;
+        let Ok(mut next) = fields.tlv_bytes().and_then(AnyRef::from_der) else {
+            return None;
+        };
         if next.tag() == Tag::Boolean {
-            next = AnyRef::from_der(fields.tlv_bytes().ok()?).ok()?;
+            if next.value() != [DER_BOOLEAN_FALSE] && next.value() != [DER_BOOLEAN_TRUE] {
+                return None;
+            }
+            let Ok(val) = fields.tlv_bytes().and_then(AnyRef::from_der) else {
+                return None;
+            };
+            next = val;
         }
-        if next.tag() != Tag::OctetString {
+        if next.tag() != Tag::OctetString || !fields.is_finished() {
             return None;
         }
         return Some(next.value());
@@ -98,17 +126,18 @@ fn aia_urls_for(extensions: &[u8], access_method: Oid<'_>) -> Vec<Uri> {
         let Ok(mut fields) = SliceReader::new(ad.value()) else {
             continue;
         };
-        let Ok(oid) = fields.tlv_bytes().map(AnyRef::from_der) else {
+        let Ok(oid) = fields.tlv_bytes().and_then(AnyRef::from_der) else {
             continue;
         };
-        let Ok(oid) = oid else { continue };
         if oid.tag() != Tag::ObjectIdentifier || oid.value() != access_method.as_bytes() {
             continue;
         }
-        let Ok(loc) = fields.tlv_bytes().map(AnyRef::from_der) else {
+        let Ok(loc) = fields.tlv_bytes().and_then(AnyRef::from_der) else {
             continue;
         };
-        let Ok(loc) = loc else { continue };
+        if !fields.is_finished() {
+            continue;
+        }
         if loc.tag() == GN_URI
             && let Ok(s) = core::str::from_utf8(loc.value())
             && let Ok(url) = Uri::parse(s.to_owned())
@@ -269,7 +298,7 @@ fn rfc4514_name(dn_der: &[u8]) -> Option<String> {
             let oid = AnyRef::from_der(fields.tlv_bytes().ok()?).ok()?;
             let value_der = fields.tlv_bytes().ok()?;
             let value = AnyRef::from_der(value_der).ok()?;
-            if oid.tag() != Tag::ObjectIdentifier {
+            if !fields.is_finished() || oid.tag() != Tag::ObjectIdentifier {
                 return None;
             }
             let dotted = ::const_oid::ObjectIdentifier::from_bytes(oid.value())
@@ -389,5 +418,251 @@ impl CertificateExt for &Certificate<'_> {
 
     fn ca_issuers_urls(&self) -> Vec<Uri> {
         (*self).ca_issuers_urls()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DER_BOOLEAN_TRUE, OID_AD_CA_ISSUERS, OID_AD_OCSP, OID_AUTHORITY_INFO_ACCESS,
+        OID_CRL_DISTRIBUTION_POINTS, TAG_DP_DISTRIBUTION_POINT_NAME, TAG_DP_FULL_NAME, TAG_GN_URI,
+        extract_ca_issuers_urls, extract_crl_distribution_urls, extract_ocsp_urls, rfc4514_name,
+    };
+    use crate::ber::tlv;
+    use crate::test_util::{TestResult, check};
+    use refineid_cms::oid::{Oid, known};
+
+    const DER_TAG_BOOLEAN: u8 = 0x01;
+    const DER_TAG_OCTET_STRING: u8 = 0x04;
+    const DER_TAG_NULL: u8 = 0x05;
+    const DER_TAG_OID: u8 = 0x06;
+    const DER_TAG_UTF8_STRING: u8 = 0x0C;
+    const DER_TAG_SEQUENCE: u8 = 0x30;
+    const DER_TAG_SET: u8 = 0x31;
+    const NON_DER_BOOLEAN_VALUE: [u8; 1] = [0x01];
+    const OVERLONG_BOOLEAN_VALUE: [u8; 2] = [0x00, 0x00];
+    const TRUNCATED_OID_LEN: u8 = 5;
+    const TRUNCATED_INNER_TLV: [u8; 2] = [DER_TAG_OID, TRUNCATED_OID_LEN];
+
+    const TEST_OCSP_URL: &str = "http://ocsp.example.com/";
+    const TEST_CA_ISSUERS_URL: &str = "http://ca.example.com/issuer.crt";
+    const TEST_CRL_URL: &str = "http://crl.example.com/example.crl";
+
+    fn tag_byte(tag: u16) -> Result<u8, String> {
+        u8::try_from(tag).map_err(|err| format!("tag fits u8: {err}"))
+    }
+
+    fn extension(
+        oid: Oid<'_>,
+        critical: bool,
+        inner_der: &[u8],
+        trailing: Option<&[u8]>,
+    ) -> Vec<u8> {
+        let mut body = tlv(DER_TAG_OID, oid.as_bytes());
+        if critical {
+            body.extend_from_slice(&tlv(DER_TAG_BOOLEAN, &[DER_BOOLEAN_TRUE]));
+        }
+        body.extend_from_slice(&tlv(DER_TAG_OCTET_STRING, inner_der));
+        if let Some(extra) = trailing {
+            body.extend_from_slice(extra);
+        }
+        tlv(DER_TAG_SEQUENCE, &body)
+    }
+
+    fn access_description(
+        method: Oid<'_>,
+        uri: &str,
+        trailing: Option<&[u8]>,
+    ) -> Result<Vec<u8>, String> {
+        let gn_uri_tag = tag_byte(TAG_GN_URI)?;
+        let mut body = tlv(DER_TAG_OID, method.as_bytes());
+        body.extend_from_slice(&tlv(gn_uri_tag, uri.as_bytes()));
+        if let Some(extra) = trailing {
+            body.extend_from_slice(extra);
+        }
+        Ok(tlv(DER_TAG_SEQUENCE, &body))
+    }
+
+    fn cdp_value(uri: &str) -> Result<Vec<u8>, String> {
+        let gn = tlv(tag_byte(TAG_GN_URI)?, uri.as_bytes());
+        let dp_full = tlv(tag_byte(TAG_DP_FULL_NAME)?, &gn);
+        let dp_name = tlv(tag_byte(TAG_DP_DISTRIBUTION_POINT_NAME)?, &dp_full);
+        let dp = tlv(DER_TAG_SEQUENCE, &dp_name);
+        Ok(tlv(DER_TAG_SEQUENCE, &dp))
+    }
+
+    #[test]
+    fn find_extension_skips_empty_and_malformed_sibling_extensions() -> TestResult {
+        let empty_sibling = tlv(DER_TAG_SEQUENCE, &[]);
+        let malformed_sibling = tlv(DER_TAG_SEQUENCE, &TRUNCATED_INNER_TLV);
+        let aia_seq = tlv(
+            DER_TAG_SEQUENCE,
+            &access_description(OID_AD_OCSP, TEST_OCSP_URL, None)?,
+        );
+        let aia_ext = extension(OID_AUTHORITY_INFO_ACCESS, false, &aia_seq, None);
+        let cdp_ext = extension(
+            OID_CRL_DISTRIBUTION_POINTS,
+            false,
+            &cdp_value(TEST_CRL_URL)?,
+            None,
+        );
+
+        let mut extensions = Vec::new();
+        extensions.extend_from_slice(&empty_sibling);
+        extensions.extend_from_slice(&malformed_sibling);
+        extensions.extend_from_slice(&aia_ext);
+        extensions.extend_from_slice(&cdp_ext);
+
+        let ocsp: Vec<String> = extract_ocsp_urls(&extensions)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let crls: Vec<String> = extract_crl_distribution_urls(&extensions)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        check(
+            &ocsp,
+            &vec![TEST_OCSP_URL.to_owned()],
+            "OCSP URL extracted after malformed siblings",
+        )?;
+        check(
+            &crls,
+            &vec![TEST_CRL_URL.to_owned()],
+            "CRL URL extracted after malformed siblings",
+        )
+    }
+
+    #[test]
+    fn find_extension_rejects_trailing_fields_in_extension_sequence() -> TestResult {
+        let trailing_null = tlv(DER_TAG_NULL, &[]);
+        let aia_seq = tlv(
+            DER_TAG_SEQUENCE,
+            &access_description(OID_AD_OCSP, TEST_OCSP_URL, None)?,
+        );
+        let non_critical_trailing = extension(
+            OID_AUTHORITY_INFO_ACCESS,
+            false,
+            &aia_seq,
+            Some(&trailing_null),
+        );
+        let critical_trailing = extension(
+            OID_AUTHORITY_INFO_ACCESS,
+            true,
+            &aia_seq,
+            Some(&trailing_null),
+        );
+
+        check(
+            &extract_ocsp_urls(&non_critical_trailing),
+            &Vec::new(),
+            "non-critical Extension with trailing TLV is rejected",
+        )?;
+        check(
+            &extract_ocsp_urls(&critical_trailing),
+            &Vec::new(),
+            "critical Extension with trailing TLV is rejected",
+        )
+    }
+
+    #[test]
+    fn aia_skips_access_description_with_trailing_fields() -> TestResult {
+        let trailing_null = tlv(DER_TAG_NULL, &[]);
+        let bad_ocsp = access_description(OID_AD_OCSP, TEST_OCSP_URL, Some(&trailing_null))?;
+        let good_ca_issuers = access_description(OID_AD_CA_ISSUERS, TEST_CA_ISSUERS_URL, None)?;
+
+        let mut aia_body = Vec::new();
+        aia_body.extend_from_slice(&bad_ocsp);
+        aia_body.extend_from_slice(&good_ca_issuers);
+        let aia_ext = extension(
+            OID_AUTHORITY_INFO_ACCESS,
+            false,
+            &tlv(DER_TAG_SEQUENCE, &aia_body),
+            None,
+        );
+
+        check(
+            &extract_ocsp_urls(&aia_ext),
+            &Vec::new(),
+            "AccessDescription with trailing TLV is skipped",
+        )?;
+        let issuers: Vec<String> = extract_ca_issuers_urls(&aia_ext)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        check(
+            &issuers,
+            &vec![TEST_CA_ISSUERS_URL.to_owned()],
+            "valid sibling AccessDescription still extracts",
+        )
+    }
+
+    #[test]
+    fn find_extension_rejects_malformed_boolean_and_duplicate_fallthrough() -> TestResult {
+        let aia_seq = tlv(
+            DER_TAG_SEQUENCE,
+            &access_description(OID_AD_OCSP, TEST_OCSP_URL, None)?,
+        );
+        for bad_bool in [
+            &NON_DER_BOOLEAN_VALUE[..],
+            &OVERLONG_BOOLEAN_VALUE[..],
+            &[][..],
+        ] {
+            let mut body = tlv(DER_TAG_OID, OID_AUTHORITY_INFO_ACCESS.as_bytes());
+            body.extend_from_slice(&tlv(DER_TAG_BOOLEAN, bad_bool));
+            body.extend_from_slice(&tlv(DER_TAG_OCTET_STRING, &aia_seq));
+            let malformed = tlv(DER_TAG_SEQUENCE, &body);
+            check(
+                &extract_ocsp_urls(&malformed),
+                &Vec::new(),
+                "non-DER critical BOOLEAN is rejected",
+            )?;
+        }
+
+        // Double BOOLEAN fails closed even if a valid duplicate extension follows.
+        let mut double_bool = tlv(DER_TAG_OID, OID_AUTHORITY_INFO_ACCESS.as_bytes());
+        double_bool.extend_from_slice(&tlv(DER_TAG_BOOLEAN, &[DER_BOOLEAN_TRUE]));
+        double_bool.extend_from_slice(&tlv(DER_TAG_BOOLEAN, &[DER_BOOLEAN_TRUE]));
+        double_bool.extend_from_slice(&tlv(DER_TAG_OCTET_STRING, &aia_seq));
+        let mut duplicate_stream = tlv(DER_TAG_SEQUENCE, &double_bool);
+        duplicate_stream.extend_from_slice(&extension(
+            OID_AUTHORITY_INFO_ACCESS,
+            false,
+            &aia_seq,
+            None,
+        ));
+        check(
+            &extract_ocsp_urls(&duplicate_stream),
+            &Vec::new(),
+            "malformed matched extension fails closed without falling through to duplicate",
+        )
+    }
+
+    #[test]
+    fn rfc4514_name_rejects_trailing_fields_in_attribute_type_and_value() -> TestResult {
+        let mut valid_atv = tlv(DER_TAG_OID, known::COMMON_NAME.as_bytes());
+        valid_atv.extend_from_slice(&tlv(DER_TAG_UTF8_STRING, b"Alice"));
+        let valid_dn = tlv(
+            DER_TAG_SEQUENCE,
+            &tlv(DER_TAG_SET, &tlv(DER_TAG_SEQUENCE, &valid_atv)),
+        );
+
+        let mut trailing_atv = valid_atv;
+        trailing_atv.extend_from_slice(&tlv(DER_TAG_NULL, &[]));
+        let trailing_dn = tlv(
+            DER_TAG_SEQUENCE,
+            &tlv(DER_TAG_SET, &tlv(DER_TAG_SEQUENCE, &trailing_atv)),
+        );
+
+        check(
+            &rfc4514_name(&valid_dn),
+            &Some("CN=Alice".to_owned()),
+            "valid DN formats cleanly",
+        )?;
+        check(
+            &rfc4514_name(&trailing_dn),
+            &None,
+            "ATV with trailing TLV is rejected",
+        )
     }
 }

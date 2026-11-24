@@ -1962,7 +1962,6 @@ impl fmt::Display for SignReport {
 mod tests {
     use super::*;
     use crate::test_util::{TestResult, check, check_true};
-    use crate::x509_ext::NameExt as _;
 
     /// The ECC root, a self-signed certificate that names no CA
     /// Issuers address.

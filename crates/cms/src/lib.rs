@@ -26,6 +26,7 @@ pub mod container;
 pub mod ecdsa;
 #[cfg(test)]
 mod hex;
+pub mod identity;
 pub mod oid;
 pub mod rsa;
 pub mod signed_data;

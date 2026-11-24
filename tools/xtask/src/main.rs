@@ -627,7 +627,7 @@ impl<'path> MagicNumberVisitor<'path> {
         }
     }
 
-    fn inspect_use_tree(&mut self, tree: &UseTree) {
+    fn inspect_use_tree(&mut self, tree: &UseTree, root_crate: Option<&str>) {
         match tree {
             UseTree::Path(path) => {
                 if ident_is(&path.ident, "include") {
@@ -636,32 +636,52 @@ impl<'path> MagicNumberVisitor<'path> {
                         ViolationKind::SourceIndirection("include! import"),
                     );
                 }
-                self.inspect_use_tree(&path.tree);
+                let path_root = normalized_ident(&path.ident);
+                let effective_root = root_crate.unwrap_or(path_root.as_str());
+                self.inspect_use_tree(&path.tree, Some(effective_root));
             }
             UseTree::Name(name) => {
-                if ident_is(&name.ident, "include") {
+                let ident = normalized_ident(&name.ident);
+                if ident == "include" {
                     self.record(
                         name.ident.span(),
                         ViolationKind::SourceIndirection("include! import"),
                     );
-                } else if is_reserved_macro_binding(&normalized_ident(&name.ident)) {
+                } else if is_reserved_macro_binding(&ident) {
                     self.record(
                         name.ident.span(),
                         ViolationKind::SourceIndirection("trusted macro name import"),
                     );
+                } else if is_reserved_builtin_derive_name(&ident)
+                    && !matches!(root_crate, Some("core" | "std"))
+                {
+                    self.record(
+                        name.ident.span(),
+                        ViolationKind::SourceIndirection("trusted derive name import"),
+                    );
                 }
             }
             UseTree::Rename(rename) => {
-                if ident_is(&rename.ident, "include") {
+                let ident = normalized_ident(&rename.ident);
+                let alias = normalized_ident(&rename.rename);
+                if ident == "include" {
                     self.record(
                         rename.ident.span(),
                         ViolationKind::SourceIndirection("include! import"),
                     );
                 }
-                if is_reserved_macro_binding(&normalized_ident(&rename.rename)) {
+                if is_reserved_macro_binding(&alias) {
                     self.record(
                         rename.rename.span(),
                         ViolationKind::SourceIndirection("trusted macro name alias"),
+                    );
+                }
+                if is_reserved_builtin_derive_name(&alias)
+                    && !matches!(root_crate, Some("core" | "std"))
+                {
+                    self.record(
+                        rename.rename.span(),
+                        ViolationKind::SourceIndirection("trusted derive name alias"),
                     );
                 }
             }
@@ -671,7 +691,7 @@ impl<'path> MagicNumberVisitor<'path> {
             ),
             UseTree::Group(group) => {
                 for item in &group.items {
-                    self.inspect_use_tree(item);
+                    self.inspect_use_tree(item, root_crate);
                 }
             }
         }
@@ -725,7 +745,7 @@ impl<'ast> Visit<'ast> for MagicNumberVisitor<'_> {
     }
 
     fn visit_item_use(&mut self, node: &'ast ItemUse) {
-        self.inspect_use_tree(&node.tree);
+        self.inspect_use_tree(&node.tree, None);
         visit::visit_item_use(self, node);
     }
 
@@ -936,7 +956,15 @@ fn is_trusted_derive(path: &syn::Path) -> bool {
     }
     matches!(
         normalized_ident(&segment.ident).as_str(),
-        "Clone" | "Copy" | "Debug" | "Eq" | "PartialEq" | "Zeroize" | "ZeroizeOnDrop"
+        "Clone"
+            | "Copy"
+            | "Debug"
+            | "Default"
+            | "Eq"
+            | "Hash"
+            | "PartialEq"
+            | "Zeroize"
+            | "ZeroizeOnDrop"
     )
 }
 
@@ -958,6 +986,13 @@ fn is_trusted_macro_name(name: &str) -> bool {
 
 fn is_reserved_macro_binding(name: &str) -> bool {
     is_trusted_macro_name(name)
+}
+
+fn is_reserved_builtin_derive_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Clone" | "Copy" | "Debug" | "Default" | "Eq" | "Hash" | "PartialEq"
+    )
 }
 
 fn normalized_ident(ident: &syn::Ident) -> String {
@@ -1250,7 +1285,25 @@ mod tests {
             ["unapproved derive macro"]
         );
         assert!(
-            source_indirections("#[derive(Debug, Zeroize, ZeroizeOnDrop)] struct Reviewed;")
+            source_indirections(
+                "#[derive(Debug, Default, Hash, Zeroize, ZeroizeOnDrop)] struct Reviewed;"
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            source_indirections("#[derive(evil::Default)] struct Qualified;"),
+            ["unapproved derive macro"]
+        );
+        assert_eq!(
+            source_indirections("use evil::Default; #[derive(Default)] struct Shadowed;"),
+            ["trusted derive name import"]
+        );
+        assert_eq!(
+            source_indirections("use evil::Evil as Hash; #[derive(Hash)] struct Aliased;"),
+            ["trusted derive name alias"]
+        );
+        assert!(
+            source_indirections("use core::hash::Hash; #[derive(Hash)] struct Standard;")
                 .is_empty()
         );
     }

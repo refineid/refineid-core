@@ -30,7 +30,10 @@
 //! exists only where PIN 2 was presented for it, and only in the
 //! directory it lives in -- DF.ESIGN on the organizational card: from
 //! [`SignOps::unlock_qualified_key`], which enters that directory and
-//! sends VERIFY PIN 2 there, or from
+//! sends VERIFY PIN 2 there, from [`QualifiedSignSession::open`] paired
+//! with [`QualifiedSignSession::sign_once`] for split-call native ABIs
+//! that separate PIN authentication from signing while keeping the
+//! verified transport sealed against intervening commands, or from
 //! [`Pin2ChannelSignOps::qualified_key_after_pin2_pace`] on a secure
 //! channel PIN 2 itself opened, which enters the directory and sends no
 //! PIN at all. A channel the Card Access Number or PIN 1 opened has no
@@ -38,8 +41,8 @@
 //!
 //! The pre-hashed signing chains all fit the short-form command:
 //! RSASSA-PKCS1-v1_5 and RSASSA-PSS over SHA-256, SHA-384, or SHA-512
-//! for the RSA keys, and ECDSA over P-384 with SHA-256 or SHA-384 for the
-//! newer keys. PSS is a
+//! for the RSA keys, and ECDSA over P-256 (SHA-256) or P-384 (SHA-256
+//! or SHA-384) for the newer keys. PSS is a
 //! card-native scheme -- the card applies the padding from the digest, so
 //! the choreography is the pre-hashed chain with a different algorithm
 //! reference, not a host-encoded block.
@@ -263,6 +266,131 @@ impl<E: core::fmt::Debug + core::fmt::Display + 'static> core::error::Error
 {
 }
 
+/// Verify Signature PIN 2 in the directory the qualified-signature key lives
+/// in, refusing unsupported schemes before transmitting any APDU.
+fn verify_qualified_in_place<T: CardTransport>(
+    transport: &mut T,
+    scheme: SignScheme,
+    pin: Pin2,
+) -> Result<(), QualifiedUnlockError<T::Error>> {
+    if scheme == SignScheme::Estonian {
+        return Err(QualifiedUnlockError::UnsupportedScheme(scheme));
+    }
+    if scheme == SignScheme::Organizational {
+        transport
+            .select_esign_directory()
+            .map_err(QualifiedUnlockError::Directory)?;
+    }
+    let outcome = transport
+        .verify_pin2_with_scheme(scheme.pin_numbering(), pin)
+        .map_err(QualifiedUnlockError::Verify)?;
+    match outcome {
+        VerifyOutcome::Ok => Ok(()),
+        refused @ (VerifyOutcome::WrongPin { .. }
+        | VerifyOutcome::Locked
+        | VerifyOutcome::Other(_)) => Err(QualifiedUnlockError::PinRefused(refused)),
+    }
+}
+
+/// A card transport that owns a single-use, session-bound Signature PIN 2
+/// verification in the directory its qualified-signature key lives in
+/// (`DF.ESIGN` on the organizational card).
+///
+/// Constructed only by [`QualifiedSignSession::open`] after a card-accepted
+/// VERIFY of PIN 2. While this session exists it owns the transport
+/// exclusively and exposes no accessor to `T` and no [`CardTransport`]
+/// implementation, so no caller can send commands through it, clone an
+/// inner transport out of it, or redeem the verification against a
+/// different transport. The transport provider remains responsible for
+/// holding exclusive access to the underlying card session (no aliased
+/// handles or out-of-band commands) across both calls.
+///
+/// Neither `Clone` nor `Copy`. Calling [`Self::sign_once`] consumes the
+/// session, drives at most one qualified signature on that verified
+/// transport, and hands the transport back alongside the signing result.
+/// Calling [`Self::into_transport`] releases only this Rust capability and
+/// returns the transport without sending any deauthentication or reset
+/// command to the card.
+///
+/// Intended for split-call native ABIs such as the Windows Card Module,
+/// where PIN 2 authentication and signing arrive as separate FFI calls on
+/// the same card session. Callers that can keep the transport borrowed
+/// across VERIFY and signing should prefer [`SignOps::unlock_qualified_key`].
+#[must_use = "a qualified sign session holds a verified transport until signed or returned"]
+pub struct QualifiedSignSession<T: CardTransport> {
+    transport: T,
+    scheme: SignScheme,
+}
+
+impl<T: CardTransport> QualifiedSignSession<T> {
+    /// VERIFY PIN 2 where the qualified-signature key lives and seal the
+    /// verified transport into a single-use [`QualifiedSignSession`].
+    ///
+    /// On the organizational card this selects DF.ESIGN by name from the MF
+    /// before probing and verifying PIN 2; on the citizen card it verifies
+    /// PIN 2 in the current context; on [`SignScheme::Estonian`] it fails
+    /// closed with [`QualifiedUnlockError::UnsupportedScheme`] before
+    /// transmitting any APDU.
+    ///
+    /// On any failure the caller receives the original `transport` back
+    /// paired with the [`QualifiedUnlockError`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `(transport, error)` with the same [`QualifiedUnlockError`]
+    /// variants as [`SignOps::unlock_qualified_key`].
+    pub fn open(
+        mut transport: T,
+        scheme: SignScheme,
+        pin: Pin2,
+    ) -> Result<Self, (T, QualifiedUnlockError<T::Error>)> {
+        if let Err(error) = verify_qualified_in_place(&mut transport, scheme, pin) {
+            return Err((transport, error));
+        }
+        Ok(Self { transport, scheme })
+    }
+
+    /// The signing family under which Signature PIN 2 was verified.
+    #[must_use]
+    pub fn scheme(&self) -> SignScheme {
+        self.scheme
+    }
+
+    /// Consume this session, run `sign` with the single-use qualified
+    /// [`SigningKey`] on the verified transport, and return the transport
+    /// alongside the closure's result.
+    pub fn sign_once<R>(mut self, sign: impl FnOnce(SigningKey<'_, T>) -> R) -> (T, R) {
+        let key = SigningKey {
+            transport: &mut self.transport,
+            scheme: self.scheme,
+            key: KeyTarget::Fixed(KeyRef::Sign),
+        };
+        let result = sign(key);
+        (self.transport, result)
+    }
+
+    /// Release this Rust-side qualified-signing capability and return the
+    /// underlying transport.
+    ///
+    /// This sends no APDU to the card: card-side PIN 2 authorization may
+    /// remain active until the card is reset, re-selected, or otherwise
+    /// deauthenticated. Callers implementing an ABI deauthentication entry
+    /// point must explicitly clear or reset card-side authorization on the
+    /// returned transport when required.
+    #[must_use]
+    pub fn into_transport(self) -> T {
+        self.transport
+    }
+}
+
+impl<T: CardTransport> core::fmt::Debug for QualifiedSignSession<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("QualifiedSignSession")
+            .field("scheme", &self.scheme)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Why the qualified-signature key was not made ready on a secure channel
 /// PIN 2 opened.
 #[derive(Debug)]
@@ -484,26 +612,12 @@ pub trait SignOps: CardTransport {
     where
         Self: Sized,
     {
-        if scheme == SignScheme::Estonian {
-            return Err(QualifiedUnlockError::UnsupportedScheme(scheme));
-        }
-        if scheme == SignScheme::Organizational {
-            self.select_esign_directory()
-                .map_err(QualifiedUnlockError::Directory)?;
-        }
-        let outcome = self
-            .verify_pin2_with_scheme(scheme.pin_numbering(), pin)
-            .map_err(QualifiedUnlockError::Verify)?;
-        match outcome {
-            VerifyOutcome::Ok => Ok(SigningKey {
-                transport: self,
-                scheme,
-                key: KeyTarget::Fixed(KeyRef::Sign),
-            }),
-            refused @ (VerifyOutcome::WrongPin { .. }
-            | VerifyOutcome::Locked
-            | VerifyOutcome::Other(_)) => Err(QualifiedUnlockError::PinRefused(refused)),
-        }
+        verify_qualified_in_place(self, scheme, pin)?;
+        Ok(SigningKey {
+            transport: self,
+            scheme,
+            key: KeyTarget::Fixed(KeyRef::Sign),
+        })
     }
 
     /// Decipher an RSA cryptogram with a card private key, returning the
@@ -604,7 +718,8 @@ enum KeyTarget {
 ///
 /// Obtained from [`SignOps::authentication_key`],
 /// [`SignOps::authentication_key_with_reference`], or, for the
-/// qualified key, from [`SignOps::unlock_qualified_key`] or
+/// qualified key, from [`SignOps::unlock_qualified_key`],
+/// [`QualifiedSignSession::sign_once`], or
 /// [`Pin2ChannelSignOps::qualified_key_after_pin2_pace`] -- there is no
 /// other constructor, so the qualified key cannot be named without PIN 2
 /// presented for it, by VERIFY or by the PACE that opened the channel,
@@ -761,6 +876,25 @@ impl<T: CardTransport> SigningKey<'_, T> {
         Ok(Signature::from_card_bytes(bytes)?)
     }
 
+    /// Sign a SHA-256 digest with a P-256 key, returning the raw ECDSA
+    /// `r || s` signature.
+    ///
+    /// # Errors
+    ///
+    /// Any stage failure, or a signature length other than
+    /// [`ECDSA_P256_SIG_BYTES`].
+    pub fn sign_prehashed_sha256_ecdsa_p256(
+        self,
+        digest: [u8; SHA256_LEN],
+    ) -> Result<Signature<EcdsaP256>, SignError<T::Error>> {
+        let bytes = self.drive_chain(
+            SignatureAlgRef::SHA256_ECDSA,
+            ExternalHashValue::Sha256(digest),
+            expected_length_le(ECDSA_P256_SIG_BYTES),
+        )?;
+        Ok(Signature::from_card_bytes(bytes)?)
+    }
+
     /// Sign a SHA-256 digest with a P-384 key, returning the raw ECDSA
     /// `r || s` signature.
     ///
@@ -868,8 +1002,8 @@ mod tests {
     use refineid_pkcs15::{FileContent, FileEnd, PrivateKeyDirectory, PrivateKeyDirectoryRead};
 
     use super::{
-        ECDSA_P384_SIG_BYTES, KeyRef, KeyTarget, SHA384_LEN, SignError, SignOps, SignScheme,
-        SigningKey,
+        ECDSA_P384_SIG_BYTES, KeyRef, KeyTarget, QualifiedSignSession, SHA384_LEN, SignError,
+        SignOps, SignScheme, SigningKey,
     };
     use crate::commands::{MseSet, SignatureAlgRef};
 
@@ -907,6 +1041,7 @@ mod tests {
     ];
     const SIG_FILL: u8 = 0x5A;
 
+    #[derive(Clone, Copy)]
     struct NeverTransmitting;
 
     impl CardTransport for NeverTransmitting {
@@ -1005,5 +1140,36 @@ mod tests {
         .into_apdu()
         .expect("MSE encodes");
         assert_eq!(card.commands[0], expected_mse.as_bytes());
+    }
+
+    #[test]
+    fn qualified_sign_session_is_neither_clone_nor_copy_nor_card_transport() {
+        trait AmbiguousIfImplemented<Disambiguator, Marker> {
+            fn marker() {}
+        }
+
+        impl<T: ?Sized, Marker> AmbiguousIfImplemented<(), Marker> for T {}
+
+        struct CloneMarker;
+        impl<T: Clone> AmbiguousIfImplemented<bool, CloneMarker> for T {}
+
+        struct CopyMarker;
+        impl<T: Copy> AmbiguousIfImplemented<bool, CopyMarker> for T {}
+
+        struct TransportMarker;
+        impl<T: CardTransport> AmbiguousIfImplemented<bool, TransportMarker> for T {}
+
+        let _ = <QualifiedSignSession<NeverTransmitting> as AmbiguousIfImplemented<
+            _,
+            CloneMarker,
+        >>::marker;
+        let _ = <QualifiedSignSession<NeverTransmitting> as AmbiguousIfImplemented<
+            _,
+            CopyMarker,
+        >>::marker;
+        let _ = <QualifiedSignSession<NeverTransmitting> as AmbiguousIfImplemented<
+            _,
+            TransportMarker,
+        >>::marker;
     }
 }

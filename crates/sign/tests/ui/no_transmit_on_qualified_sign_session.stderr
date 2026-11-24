@@ -1,0 +1,5 @@
+error[E0599]: no method named `transmit` found for mutable reference `&mut QualifiedSignSession<T>` in the current scope
+ --> tests/ui/no_transmit_on_qualified_sign_session.rs:8:21
+  |
+8 |     let _ = session.transmit(command);
+  |                     ^^^^^^^^ method not found in `&mut QualifiedSignSession<T>`

@@ -37,8 +37,9 @@ use refineid_sign::commands::{
     PsoHashExternal, SHA256_LEN, SHA384_LEN, SHA512_LEN, SignatureAlgRef, expected_length_le,
 };
 use refineid_sign::{
-    ECDSA_P384_SIG_BYTES, KEY_REF_AUTH, KEY_REF_SIGN, KeyRef, ORG_QUALIFIED_KEY_REF,
-    QualifiedUnlockError, RSA_3072_SIG_BYTES, RsaCryptogram, SignError, SignOps, SignScheme,
+    ECDSA_P256_SIG_BYTES, ECDSA_P384_SIG_BYTES, KEY_REF_AUTH, KEY_REF_SIGN, KeyRef,
+    ORG_QUALIFIED_KEY_REF, QualifiedSignSession, QualifiedUnlockError, RSA_3072_SIG_BYTES,
+    RsaCryptogram, SignError, SignOps, SignScheme,
 };
 
 /// Digest filler byte for the fixtures.
@@ -105,6 +106,12 @@ fn ecdsa_le() -> u8 {
     expected_length_le(ECDSA_P384_SIG_BYTES)
 }
 
+/// The expected-length Le for a P-256 ECDSA signature: it fits the short
+/// form, so its exact length.
+fn ecdsa_p256_le() -> u8 {
+    expected_length_le(ECDSA_P256_SIG_BYTES)
+}
+
 /// Which transport path a scripted command must arrive on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Path {
@@ -116,6 +123,7 @@ enum Path {
 
 /// A transport that checks each command, and the path it arrives on,
 /// against a scripted expectation and returns the paired response.
+#[derive(Debug)]
 struct Scripted {
     steps: Vec<(Path, Vec<u8>, ResponseApdu)>,
     cursor: usize,
@@ -866,4 +874,196 @@ fn estonian_qualified_unlock_and_sign_key_decipher_fail_closed_without_transmitt
         }
     ));
     assert!(decipher_transport.drained(), "zero APDUs transmitted");
+}
+
+/// Expected raw `r || s` byte width of a P-256 ECDSA signature, pinned
+/// independently of [`ECDSA_P256_SIG_BYTES`] in the wire test.
+const EXPECTED_P256_SIG_LEN: usize = 64;
+/// Expected short-form `Le` byte for a 64-byte P-256 ECDSA signature.
+const EXPECTED_P256_LE: u8 = 0x40;
+
+#[test]
+fn citizen_ecdsa_p256_sha256_requests_p256_length_and_checks_signature_width() {
+    assert_eq!(ECDSA_P256_SIG_BYTES, EXPECTED_P256_SIG_LEN);
+    assert_eq!(ecdsa_p256_le(), EXPECTED_P256_LE);
+
+    let digest = [DIGEST_FILL; SHA256_LEN];
+    let signature = vec![SIG_FILL; EXPECTED_P256_SIG_LEN];
+    let mut transport = Scripted::new(vec![
+        (
+            mse_wire(
+                SignScheme::Citizen,
+                SignatureAlgRef::SHA256_ECDSA,
+                KeyRef::Auth,
+            ),
+            success(vec![]),
+        ),
+        (
+            pso_hash_wire(ExternalHashValue::Sha256(digest)),
+            success(vec![]),
+        ),
+        (
+            pso_cds_empty_wire(EXPECTED_P256_LE),
+            success(signature.clone()),
+        ),
+    ]);
+
+    let result = transport
+        .authentication_key(SignScheme::Citizen)
+        .sign_prehashed_sha256_ecdsa_p256(digest)
+        .expect("scripted P-256 ECDSA sign succeeds");
+    assert_eq!(result.as_bytes(), signature.as_slice());
+    assert_eq!(result.len(), EXPECTED_P256_SIG_LEN);
+    assert!(transport.drained());
+
+    let wrong_len = vec![SIG_FILL; ECDSA_P384_SIG_BYTES];
+    let mut wrong_len_transport = Scripted::new(vec![
+        (
+            mse_wire(
+                SignScheme::Citizen,
+                SignatureAlgRef::SHA256_ECDSA,
+                KeyRef::Auth,
+            ),
+            success(vec![]),
+        ),
+        (
+            pso_hash_wire(ExternalHashValue::Sha256(digest)),
+            success(vec![]),
+        ),
+        (pso_cds_empty_wire(EXPECTED_P256_LE), success(wrong_len)),
+    ]);
+    let error = wrong_len_transport
+        .authentication_key(SignScheme::Citizen)
+        .sign_prehashed_sha256_ecdsa_p256(digest)
+        .expect_err("wrong-length P-256 signature is rejected");
+    assert!(matches!(
+        error,
+        SignError::UnexpectedSignatureLength {
+            got: ECDSA_P384_SIG_BYTES,
+            expected: EXPECTED_P256_SIG_LEN,
+        }
+    ));
+}
+
+#[test]
+fn qualified_sign_session_drives_citizen_organizational_cancel_and_refuses_estonian() {
+    let digest = [DIGEST_FILL; SHA256_LEN];
+    let signature = vec![SIG_FILL; EXPECTED_P256_SIG_LEN];
+
+    let mut org_steps = organizational_unlock_steps(SignatureAlgRef::SHA256_ECDSA);
+    org_steps.push((
+        Path::Plain,
+        pso_cds_inline_wire(ExternalHashValue::Sha256(digest), EXPECTED_P256_LE),
+        success(signature.clone()),
+    ));
+    let org_transport = Scripted::with_paths(org_steps);
+    let org_session = QualifiedSignSession::open(org_transport, SignScheme::Organizational, pin2())
+        .expect("organizational PIN 2 verification succeeds");
+    assert_eq!(org_session.scheme(), SignScheme::Organizational);
+    let (org_transport, org_sig) =
+        org_session.sign_once(|key| key.sign_prehashed_sha256_ecdsa_p256(digest));
+    assert_eq!(
+        org_sig
+            .expect("split organizational qualified sign succeeds")
+            .as_bytes(),
+        signature.as_slice()
+    );
+    assert!(org_transport.drained());
+
+    let citizen_transport = Scripted::with_paths(vec![
+        (
+            Path::Plain,
+            probe_pin2_wire(PinReferenceScheme::Citizen),
+            probe_served(TRIES_PRISTINE),
+        ),
+        (
+            Path::Credential,
+            verify_pin2_wire(PinReferenceScheme::Citizen),
+            success(vec![]),
+        ),
+        (
+            Path::Plain,
+            mse_wire(
+                SignScheme::Citizen,
+                SignatureAlgRef::SHA256_ECDSA,
+                KeyRef::Sign,
+            ),
+            success(vec![]),
+        ),
+        (
+            Path::Plain,
+            pso_hash_wire(ExternalHashValue::Sha256(digest)),
+            success(vec![]),
+        ),
+        (
+            Path::Plain,
+            pso_cds_empty_wire(EXPECTED_P256_LE),
+            success(signature.clone()),
+        ),
+    ]);
+    let citizen_session =
+        QualifiedSignSession::open(citizen_transport, SignScheme::Citizen, pin2())
+            .expect("citizen PIN 2 verification succeeds");
+    assert_eq!(citizen_session.scheme(), SignScheme::Citizen);
+    let (citizen_transport, citizen_sig) =
+        citizen_session.sign_once(|key| key.sign_prehashed_sha256_ecdsa_p256(digest));
+    assert_eq!(
+        citizen_sig
+            .expect("split citizen qualified sign succeeds")
+            .as_bytes(),
+        signature.as_slice()
+    );
+    assert!(citizen_transport.drained());
+
+    let cancelled_transport = Scripted::with_paths(vec![
+        (
+            Path::Plain,
+            probe_pin2_wire(PinReferenceScheme::Citizen),
+            probe_served(TRIES_PRISTINE),
+        ),
+        (
+            Path::Credential,
+            verify_pin2_wire(PinReferenceScheme::Citizen),
+            success(vec![]),
+        ),
+    ]);
+    let cancelled_session =
+        QualifiedSignSession::open(cancelled_transport, SignScheme::Citizen, pin2())
+            .expect("citizen PIN 2 verification succeeds before cancel");
+    let returned = cancelled_session.into_transport();
+    assert!(returned.drained(), "cancel sends no signing APDUs");
+
+    let estonian_transport = Scripted::new(vec![]);
+    let (returned, err) =
+        QualifiedSignSession::open(estonian_transport, SignScheme::Estonian, pin2())
+            .expect_err("Estonian qualified PIN 2 verification fails closed");
+    assert!(matches!(
+        err,
+        QualifiedUnlockError::UnsupportedScheme(SignScheme::Estonian)
+    ));
+    assert!(returned.drained(), "zero APDUs transmitted");
+
+    let wrong = StatusWord::PinIncorrect {
+        retries: PinRetries::from_nibble(TRIES_AFTER_WRONG).expect("counter value"),
+    };
+    let refused_transport = Scripted::with_paths(vec![
+        (
+            Path::Plain,
+            probe_pin2_wire(PinReferenceScheme::Citizen),
+            probe_served(TRIES_PRISTINE),
+        ),
+        (
+            Path::Credential,
+            verify_pin2_wire(PinReferenceScheme::Citizen),
+            status(wrong),
+        ),
+    ]);
+    let (returned, err) =
+        QualifiedSignSession::open(refused_transport, SignScheme::Citizen, pin2())
+            .expect_err("refused PIN 2 returns the transport without opening a session");
+    assert!(matches!(
+        err,
+        QualifiedUnlockError::PinRefused(VerifyOutcome::WrongPin { .. })
+    ));
+    assert!(returned.drained(), "no signing APDU after refused PIN 2");
 }

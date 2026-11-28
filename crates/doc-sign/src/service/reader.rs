@@ -428,14 +428,16 @@ fn unlock_slot_key<'t, T: CardTransport>(
                     other => ReaderSignError::Transport(format!("{other}")),
                 })?;
             match outcome {
-                VerifyOutcome::Ok => Ok(match key_reference {
+                VerifyOutcome::Ok => match key_reference {
                     Some(SlotKeyReference::Auth(reference)) => {
-                        transport.authentication_key_with_reference(sign_scheme, reference)
+                        Ok(transport.authentication_key_with_reference(sign_scheme, reference))
                     }
-                    Some(SlotKeyReference::Qualified(_)) | None => {
-                        transport.authentication_key(sign_scheme)
-                    }
-                }),
+                    None => Ok(transport.authentication_key(sign_scheme)),
+                    Some(SlotKeyReference::Qualified(_)) => Err(ReaderSignError::Transport(
+                        "discovered qualified-signature key reference cannot unlock authentication slot"
+                            .to_owned(),
+                    )),
+                },
                 rejected @ (VerifyOutcome::WrongPin { .. }
                 | VerifyOutcome::Locked
                 | VerifyOutcome::Other(_)) => Err(ReaderSignError::PinRejected {
@@ -450,8 +452,12 @@ fn unlock_slot_key<'t, T: CardTransport>(
                 Some(SlotKeyReference::Qualified(reference)) => {
                     transport.unlock_qualified_key_with_reference(sign_scheme, reference, pin2)
                 }
-                Some(SlotKeyReference::Auth(_)) | None => {
-                    transport.unlock_qualified_key(sign_scheme, pin2)
+                None => transport.unlock_qualified_key(sign_scheme, pin2),
+                Some(SlotKeyReference::Auth(_)) => {
+                    return Err(ReaderSignError::Transport(
+                        "discovered authentication key reference cannot unlock qualified-signature slot"
+                            .to_owned(),
+                    ));
                 }
             };
             result.map_err(|e| unlock_err_to_kind(slot, e))

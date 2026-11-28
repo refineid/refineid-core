@@ -2061,10 +2061,20 @@ mod tests {
             &change_wire[DATA_OFFSET..DATA_OFFSET + FIVE_DIGIT_PIN2.len()],
             FIVE_DIGIT_PIN2
         );
+        assert!(
+            change_wire[DATA_OFFSET + FIVE_DIGIT_PIN2.len()..DATA_OFFSET + PIN_STORED_LENGTH]
+                .iter()
+                .all(|&byte| byte == crate::verify::ESTONIAN_EID_PAD_OCTET)
+        );
         let new_start = DATA_OFFSET + PIN_STORED_LENGTH;
         assert_eq!(
             &change_wire[new_start..new_start + FIVE_DIGIT_NEW_PIN2.len()],
             FIVE_DIGIT_NEW_PIN2
+        );
+        assert!(
+            change_wire[new_start + FIVE_DIGIT_NEW_PIN2.len()..]
+                .iter()
+                .all(|&byte| byte == crate::verify::ESTONIAN_EID_PAD_OCTET)
         );
 
         // A 4-digit PIN 2 is refused locally under Estonian bounds (5..=12) with zero APDUs.

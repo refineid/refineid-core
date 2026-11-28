@@ -80,7 +80,10 @@ const PIN_ATTRIBUTES_TAG_HIGH: u8 = 0xDF;
 const PIN_ATTRIBUTES_TAG_LOW: u8 = 0x21;
 /// Value length for PIN attributes tag.
 const PIN_ATTRIBUTES_LEN: u8 = 4;
-/// Offset of tries remaining byte inside the PIN attributes tag value.
+/// Offset of the PIN Try Counter (field 1 of `DF 21`, 1 byte: remaining
+/// tries before blocked; followed by usage counter, unblocking counter, and
+/// unblocking PIN method; FINEID S1 v4.2 section 3.15.3 Table 19; EstEID
+/// 2025 `GED24035_015` section 7.13.3 Table 58).
 const PIN_ATTRIBUTES_TRIES_VALUE_OFFSET: usize = 0;
 
 /// PIN policy tag (DF 3F, FINEID S1 v4.2 section 3.15.3 Table 19;
@@ -359,19 +362,10 @@ pub(crate) fn read_pin_policy_lengths<T: CardTransport + ?Sized>(
         return Ok(None);
     }
     let elements = template.value();
-    if !pin_container_matches_reference(elements, reference) {
-        return Ok(None);
-    }
-    let policy = BerTlvIter::new(elements)
-        .map_while(Result::ok)
-        .find(|element| element.tag() == PIN_POLICY_TAG);
-    let Some(policy) = policy else {
+    let Some(value) = find_pin_container_tag(elements, reference, PIN_POLICY_TAG, PIN_POLICY_LEN)
+    else {
         return Ok(None);
     };
-    let value = policy.value();
-    if value.len() != PIN_POLICY_LEN {
-        return Ok(None);
-    }
     let (Some(&min), Some(&max)) = (
         value.get(PIN_POLICY_MIN_LENGTH_OFFSET),
         value.get(PIN_POLICY_MAX_LENGTH_OFFSET),
@@ -386,29 +380,45 @@ pub(crate) fn read_pin_policy_lengths<T: CardTransport + ?Sized>(
     Ok(PasswordLengthRange::new(min, max))
 }
 
-/// Unwrap an outer `A0` PIN-container template only when it spans the
-/// full response body; otherwise scan `body` directly so bare TLV
-/// sequences and responses with trailing outer TLVs remain parseable.
-fn pin_container_elements(body: &[u8]) -> &[u8] {
-    match BerTlvAny::parse(body) {
-        Ok(template)
-            if template.tag() == u16::from(PIN_CONTAINER_TEMPLATE_TAG)
-                && template.size() == body.len() =>
-        {
-            template.value()
+/// Scan every TLV inside a PIN-container response body, descending into any
+/// `A0` template even when trailing outer TLVs follow it. Rejects the
+/// container (`None`) whenever any echoed PIN reference (`83`) differs from
+/// `expected_reference` (responses that omit `83` remain accepted), and
+/// returns the first `target_tag` value with length `expected_len`.
+fn find_pin_container_tag(
+    body: &[u8],
+    expected_reference: u8,
+    target_tag: u16,
+    expected_len: usize,
+) -> Option<&[u8]> {
+    let mut found = None;
+    for outer in BerTlvIter::new(body).map_while(Result::ok) {
+        if outer.tag() == u16::from(PIN_CONTAINER_TEMPLATE_TAG) {
+            for inner in BerTlvIter::new(outer.value()).map_while(Result::ok) {
+                if inner.tag() == u16::from(PIN_CONTAINER_REF_TAG)
+                    && inner.value() != [expected_reference]
+                {
+                    return None;
+                }
+                if found.is_none()
+                    && inner.tag() == target_tag
+                    && inner.value().len() == expected_len
+                {
+                    found = Some(inner.value());
+                }
+            }
+        } else {
+            if outer.tag() == u16::from(PIN_CONTAINER_REF_TAG)
+                && outer.value() != [expected_reference]
+            {
+                return None;
+            }
+            if found.is_none() && outer.tag() == target_tag && outer.value().len() == expected_len {
+                found = Some(outer.value());
+            }
         }
-        _ => body,
     }
-}
-
-/// Verify any echoed PIN reference object inside a PIN container matches
-/// `expected_reference`. Responses that omit the echoed reference remain
-/// accepted; responses that echo a different reference are rejected.
-fn pin_container_matches_reference(elements: &[u8], expected_reference: u8) -> bool {
-    BerTlvIter::new(elements)
-        .map_while(Result::ok)
-        .filter(|element| element.tag() == u16::from(PIN_CONTAINER_REF_TAG))
-        .all(|element| element.value() == [expected_reference])
+    found
 }
 
 /// Read a PIN's changed-since-manufacture record from the card's PIN
@@ -439,17 +449,13 @@ pub fn read_pin_change_record_with_scheme<T: CardTransport + ?Sized>(
     if response.status_word() != StatusWord::Success {
         return Ok(PinChangeRecord::Unreadable);
     }
-    let elements = pin_container_elements(&response.body);
-    if !pin_container_matches_reference(elements, reference) {
-        return Ok(PinChangeRecord::Unreadable);
-    }
-    let flag = BerTlvIter::new(elements)
-        .map_while(Result::ok)
-        .find(|element| {
-            element.tag() == PIN_CHANGED_TAG
-                && element.value().len() == usize::from(PIN_CHANGED_LEN)
-        })
-        .and_then(|element| element.value().first().copied());
+    let flag = find_pin_container_tag(
+        &response.body,
+        reference,
+        PIN_CHANGED_TAG,
+        usize::from(PIN_CHANGED_LEN),
+    )
+    .and_then(|value| value.first().copied());
     Ok(match flag {
         Some(PIN_CHANGED_FLAG_UNCHANGED) => PinChangeRecord::Unchanged,
         Some(PIN_CHANGED_FLAG_CHANGED) => PinChangeRecord::Changed,
@@ -496,23 +502,14 @@ pub fn read_puk_status_from_container_with_scheme<T: CardTransport + ?Sized>(
     let response = outcome.into_response().map_err(AuthError::Outcome)?;
     match response.status_word() {
         StatusWord::Success => {
-            let elements = pin_container_elements(&response.body);
-            if !pin_container_matches_reference(elements, reference) {
-                return Ok(PinStatus::NoInfo);
-            }
-            let tries = BerTlvIter::new(elements)
-                .map_while(Result::ok)
-                .find(|element| {
-                    element.tag() == PIN_ATTRIBUTES_TAG
-                        && element.value().len() == usize::from(PIN_ATTRIBUTES_LEN)
-                })
-                .and_then(|element| {
-                    element
-                        .value()
-                        .get(PIN_ATTRIBUTES_TRIES_VALUE_OFFSET)
-                        .copied()
-                })
-                .and_then(PinRetries::from_nibble);
+            let tries = find_pin_container_tag(
+                &response.body,
+                reference,
+                PIN_ATTRIBUTES_TAG,
+                usize::from(PIN_ATTRIBUTES_LEN),
+            )
+            .and_then(|value| value.get(PIN_ATTRIBUTES_TRIES_VALUE_OFFSET).copied())
+            .and_then(PinRetries::from_nibble);
             Ok(match tries {
                 Some(retries) => PinStatus::Remaining(retries),
                 None => PinStatus::NoInfo,
@@ -916,6 +913,7 @@ mod tests {
         const ESTONIAN_PRISTINE_TRIES: u8 = 3;
         const ATTR_UNUSED_OCTET: u8 = 0xFF;
         const ATTR_STATE_OCTET: u8 = 0xA5;
+        const ATTR_UNBLOCK_METHOD_NONE: u8 = 0x00;
 
         let build_container = |reference: u8, tries: u8, changed_flag: u8| {
             let mut inner = BerEncoder::default();
@@ -925,7 +923,12 @@ mod tests {
             inner
                 .push_tlv_tag2(
                     PIN_ATTRIBUTES_TAG,
-                    [tries, ATTR_UNUSED_OCTET, ATTR_STATE_OCTET, tries],
+                    [
+                        tries,
+                        ATTR_UNUSED_OCTET,
+                        ATTR_STATE_OCTET,
+                        ATTR_UNBLOCK_METHOD_NONE,
+                    ],
                 )
                 .expect("encodes df21");
             inner
@@ -1012,6 +1015,57 @@ mod tests {
             )
             .expect("parses trailing DF 2F outside A0"),
             PinChangeRecord::Unchanged
+        );
+
+        // Non-empty A0 carrying 83 + DF 2F followed by an extra trailing outer TLV
+        // still descends into A0 to read DF 2F and validate the echoed 83 reference.
+        const TRAILING_AUX_TAG: u8 = 0x99;
+        const TRAILING_AUX_VAL: u8 = 0x01;
+        let mut a0_plus_extra = build_container(
+            PIN2_REFERENCE_ESTONIAN,
+            ESTONIAN_PRISTINE_TRIES,
+            PIN_CHANGED_FLAG_UNCHANGED,
+        );
+        let mut trailing_extra = BerEncoder::default();
+        trailing_extra
+            .push_tlv(TRAILING_AUX_TAG, [TRAILING_AUX_VAL])
+            .expect("encodes trailing aux tlv");
+        a0_plus_extra.extend_from_slice(&trailing_extra.finish());
+        let mut a0_plus_extra_transport = MockTransport::success(a0_plus_extra);
+        assert_eq!(
+            read_pin_change_record_with_scheme(
+                &mut a0_plus_extra_transport,
+                PinReferenceScheme::Estonian,
+                PinSlot::Pin2
+            )
+            .expect("descends into A0 despite trailing outer TLV"),
+            PinChangeRecord::Unchanged
+        );
+
+        // Non-empty A0 carrying a mismatched 83 followed by a trailing outer DF 2F is rejected.
+        let mut bad_ref_inner = BerEncoder::default();
+        bad_ref_inner
+            .push_tlv(
+                PIN_CONTAINER_REF_TAG,
+                [crate::verify::PIN1_REFERENCE_ESTONIAN],
+            )
+            .expect("encodes mismatched ref");
+        let mut bad_ref_plus_trailing = BerEncoder::default();
+        bad_ref_plus_trailing
+            .push_tlv(PIN_CONTAINER_TEMPLATE_TAG, bad_ref_inner.finish())
+            .expect("encodes template");
+        bad_ref_plus_trailing
+            .push_tlv_tag2(PIN_CHANGED_TAG, [PIN_CHANGED_FLAG_UNCHANGED])
+            .expect("encodes trailing df2f");
+        let mut bad_ref_trailing_transport = MockTransport::success(bad_ref_plus_trailing.finish());
+        assert_eq!(
+            read_pin_change_record_with_scheme(
+                &mut bad_ref_trailing_transport,
+                PinReferenceScheme::Estonian,
+                PinSlot::Pin2
+            )
+            .expect("rejects mismatched 83 inside A0 even with trailing DF 2F"),
+            PinChangeRecord::Unreadable
         );
 
         // Mismatched echoed reference (83 01 <other>) is rejected as Unreadable / NoInfo.

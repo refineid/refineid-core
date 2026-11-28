@@ -46,7 +46,7 @@ use refineid_pkcs15::{PasswordLengthRange, PasswordObject};
 
 use crate::credentials::{CredentialRole, Pin1, Pin2};
 use crate::pin_lengths::PinLengthRefusal;
-use crate::retry_risk::{FlooredCredential, RetryFloorRefusal, check_last_tries_with_scheme};
+use crate::retry_risk::{FlooredCredential, RetryFloorRefusal, check_retry_floor_with_scheme};
 
 /// Citizen-card PIN1 reference: the global authentication PIN (FINEID S1
 /// v4.2 section 3.5.2).
@@ -654,7 +654,19 @@ pub(crate) fn verify_under_floor<T: CardTransport + ?Sized>(
     status: PinStatus,
     digits: &[u8],
 ) -> Result<VerifyOutcome, AuthError<T::Error>> {
-    check_last_tries_with_scheme(slot.into(), status, scheme).map_err(AuthError::RetryFloor)?;
+    check_retry_floor_with_scheme(slot.into(), status, scheme).map_err(AuthError::RetryFloor)?;
+    let pin_is_blocked = matches!(status, PinStatus::Locked)
+        || matches!(status, PinStatus::Remaining(retries) if retries.is_exhausted());
+    if scheme == PinReferenceScheme::Estonian && slot == PinSlot::Pin2 && !pin_is_blocked {
+        let record = crate::activation::read_pin_change_record_with_scheme(
+            transport,
+            scheme,
+            PinSlot::Pin2,
+        )?;
+        if record == crate::activation::PinChangeRecord::Unchanged {
+            return Err(AuthError::Pin2ChangeRequired);
+        }
+    }
     verify_digits(transport, scheme, slot, digits)
 }
 
@@ -800,17 +812,7 @@ pub trait PinOps: CardTransport {
         Self: Sized,
     {
         let status = self.pin_status_with_scheme(scheme, PinSlot::Pin2)?;
-        check_last_tries_with_scheme(FlooredCredential::Pin2, status, scheme)
-            .map_err(AuthError::RetryFloor)?;
-        let pin_is_blocked = matches!(status, PinStatus::Locked)
-            || matches!(status, PinStatus::Remaining(retries) if retries.is_exhausted());
-        if scheme == PinReferenceScheme::Estonian
-            && !pin_is_blocked
-            && self.pin2_requires_change_before_signing_with_scheme(scheme)?
-        {
-            return Err(AuthError::Pin2ChangeRequired);
-        }
-        verify_digits(self, scheme, PinSlot::Pin2, pin.digits())
+        verify_under_floor(self, scheme, PinSlot::Pin2, status, pin.digits())
     }
 
     /// Whether the card enforces changing its initial PIN 2 before
@@ -983,7 +985,7 @@ pub trait PinOps: CardTransport {
             .check_length(CredentialRole::Pin1, pin.digit_count())
             .map_err(AuthError::PinLength)?;
         let status = self.pin_status_for_parameters(parameters)?;
-        check_last_tries_with_scheme(FlooredCredential::Pin1, status, parameters.scheme())
+        check_retry_floor_with_scheme(FlooredCredential::Pin1, status, parameters.scheme())
             .map_err(AuthError::RetryFloor)?;
         let header = CommandHeader {
             class: ApduClass::Plain,

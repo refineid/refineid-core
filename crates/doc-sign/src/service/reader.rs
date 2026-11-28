@@ -881,6 +881,14 @@ struct Prepared {
     pin_status: refineid_auth::verify::PinStatus,
 }
 
+/// Certificate and directory metadata resolved for one signing slot.
+struct SlotCertificateDiscovery {
+    cert_der: UnvalidatedCertificate,
+    key_reference: Option<SlotKeyReference>,
+    application_aid: Option<Aid>,
+    discovered_pin_reference: Option<u8>,
+}
+
 /// Whether a PKCS#15 read failure indicates a fatal transport, card
 /// state, or secure-channel error that must abort certificate fallback
 /// immediately instead of probing further paths.
@@ -895,25 +903,37 @@ fn is_fatal_pkcs15_error<E>(error: &Pkcs15Error<E>) -> bool {
     )
 }
 
+/// Whether a PKCS#15 directory-discovery failure must terminate fallback
+/// immediately rather than dropping through to hardcoded paths.
+///
+/// In addition to transport/card-state errors, [`Pkcs15Error::InvalidData`]
+/// indicates that a live PKCS#15 directory exists and is malformed or
+/// ambiguous (for example multiple `nonRepudiation` signing keys), so
+/// bypassing it via hardcoded paths would violate fail-closed discovery.
+fn is_terminal_discovery_error<E>(error: &Pkcs15Error<E>) -> bool {
+    is_fatal_pkcs15_error(error) || matches!(error, Pkcs15Error::InvalidData(_))
+}
+
 /// Read the slot certificate using the FINEID direct paths first, falling
 /// back to ISO/IEC 7816-15 EF.ODF discovery (standard [`PKCS15_AID`], then
 /// EF.DIR `"Estonian eID"` label discovery for custom AIDs) and EstEID
 /// 2025 default paths (`ADF1/3411` or `ADF2/3421`) when FINEID EFs are
-/// absent. Aborts immediately on fatal transport or card-state errors and
-/// leaves the resolved PKCS#15 application selected on success.
+/// absent. Aborts immediately on fatal transport/card-state errors or
+/// ambiguous/malformed PKCS#15 directories, and leaves the resolved
+/// PKCS#15 application selected on success.
 fn read_slot_certificate<T: CardTransport>(
     transport: &mut T,
     slot: SignSlot,
-) -> Result<
-    (
-        UnvalidatedCertificate,
-        Option<SlotKeyReference>,
-        Option<Aid>,
-    ),
-    ReaderSignError,
-> {
+) -> Result<SlotCertificateDiscovery, ReaderSignError> {
     let primary_err = match transport.read_certificate(slot.cert_slot()) {
-        Ok(cert_der) => return Ok((cert_der, None, None)),
+        Ok(cert_der) => {
+            return Ok(SlotCertificateDiscovery {
+                cert_der,
+                key_reference: None,
+                application_aid: None,
+                discovered_pin_reference: None,
+            });
+        }
         Err(err) => {
             if is_fatal_pkcs15_error(&err) {
                 return Err(ReaderSignError::CertUnavailable {
@@ -931,7 +951,14 @@ fn read_slot_certificate<T: CardTransport>(
         other => other,
     };
     let alt_err = match transport.read_certificate(alt) {
-        Ok(cert_der) => return Ok((cert_der, None, None)),
+        Ok(cert_der) => {
+            return Ok(SlotCertificateDiscovery {
+                cert_der,
+                key_reference: None,
+                application_aid: None,
+                discovered_pin_reference: None,
+            });
+        }
         Err(err) => {
             if is_fatal_pkcs15_error(&err) {
                 return Err(ReaderSignError::CertUnavailable {
@@ -953,11 +980,12 @@ fn read_slot_certificate<T: CardTransport>(
                     let cert = transport.read_certificate_at(profile.auth_cert_path())?;
                     let aid = profile.application_aid().clone();
                     transport.select_application(&aid)?;
-                    Ok((
-                        UnvalidatedCertificate::new(cert.into_bytes()),
-                        Some(SlotKeyReference::Auth(profile.auth_key_reference())),
-                        Some(aid),
-                    ))
+                    Ok(SlotCertificateDiscovery {
+                        cert_der: UnvalidatedCertificate::new(cert.into_bytes()),
+                        key_reference: Some(SlotKeyReference::Auth(profile.auth_key_reference())),
+                        application_aid: Some(aid),
+                        discovered_pin_reference: Some(profile.pin1().reference()),
+                    })
                 }),
             SignSlot::Qualified => transport
                 .discover_qualified_signature_profile(&standard_aid)
@@ -965,17 +993,20 @@ fn read_slot_certificate<T: CardTransport>(
                     let cert = transport.read_certificate_at(profile.sign_cert_path())?;
                     let aid = profile.application_aid().clone();
                     transport.select_application(&aid)?;
-                    Ok((
-                        UnvalidatedCertificate::new(cert.into_bytes()),
-                        Some(SlotKeyReference::Qualified(profile.sign_key_reference())),
-                        Some(aid),
-                    ))
+                    Ok(SlotCertificateDiscovery {
+                        cert_der: UnvalidatedCertificate::new(cert.into_bytes()),
+                        key_reference: Some(SlotKeyReference::Qualified(
+                            profile.sign_key_reference(),
+                        )),
+                        application_aid: Some(aid),
+                        discovered_pin_reference: Some(profile.pin2().reference()),
+                    })
                 }),
         };
         match std_result {
             Ok(found) => return Ok(found),
             Err(err) => {
-                if is_fatal_pkcs15_error(&err) {
+                if is_terminal_discovery_error(&err) {
                     return Err(ReaderSignError::CertUnavailable {
                         slot,
                         detail: format!("pkcs15 discovery: {err}"),
@@ -994,11 +1025,12 @@ fn read_slot_certificate<T: CardTransport>(
                 let cert = transport.read_certificate_at(profile.auth_cert_path())?;
                 let aid = profile.application_aid().clone();
                 transport.select_application(&aid)?;
-                Ok((
-                    UnvalidatedCertificate::new(cert.into_bytes()),
-                    Some(SlotKeyReference::Auth(profile.auth_key_reference())),
-                    Some(aid),
-                ))
+                Ok(SlotCertificateDiscovery {
+                    cert_der: UnvalidatedCertificate::new(cert.into_bytes()),
+                    key_reference: Some(SlotKeyReference::Auth(profile.auth_key_reference())),
+                    application_aid: Some(aid),
+                    discovered_pin_reference: Some(profile.pin1().reference()),
+                })
             }),
         SignSlot::Qualified => transport
             .discover_estonian_qualified_signature_profile()
@@ -1006,17 +1038,18 @@ fn read_slot_certificate<T: CardTransport>(
                 let cert = transport.read_certificate_at(profile.sign_cert_path())?;
                 let aid = profile.application_aid().clone();
                 transport.select_application(&aid)?;
-                Ok((
-                    UnvalidatedCertificate::new(cert.into_bytes()),
-                    Some(SlotKeyReference::Qualified(profile.sign_key_reference())),
-                    Some(aid),
-                ))
+                Ok(SlotCertificateDiscovery {
+                    cert_der: UnvalidatedCertificate::new(cert.into_bytes()),
+                    key_reference: Some(SlotKeyReference::Qualified(profile.sign_key_reference())),
+                    application_aid: Some(aid),
+                    discovered_pin_reference: Some(profile.pin2().reference()),
+                })
             }),
     };
     match dir_result {
         Ok(found) => return Ok(found),
         Err(err) => {
-            if is_fatal_pkcs15_error(&err) {
+            if is_terminal_discovery_error(&err) {
                 return Err(ReaderSignError::CertUnavailable {
                     slot,
                     detail: format!("EF.DIR discovery: {err}"),
@@ -1034,12 +1067,21 @@ fn read_slot_certificate<T: CardTransport>(
     if let Ok(path) = AbsolutePath::new(default_steps) {
         let default_result = transport.select_pkcs15_application().and_then(|()| {
             transport.select_path(&path)?;
-            let bytes = transport.read_binary_der_object(slot.cert_slot().label())?;
-            transport.select_pkcs15_application()?;
+            let read_result = transport.read_binary_der_object(slot.cert_slot().label());
+            let reselect_result = transport.select_pkcs15_application();
+            let bytes = read_result?;
+            reselect_result?;
             Ok(UnvalidatedCertificate::new(bytes))
         });
         match default_result {
-            Ok(cert_der) => return Ok((cert_der, None, None)),
+            Ok(cert_der) => {
+                return Ok(SlotCertificateDiscovery {
+                    cert_der,
+                    key_reference: None,
+                    application_aid: None,
+                    discovered_pin_reference: None,
+                });
+            }
             Err(err) => {
                 if is_fatal_pkcs15_error(&err) {
                     return Err(ReaderSignError::CertUnavailable {
@@ -1085,8 +1127,16 @@ fn prepare_on_card<T: CardTransport>(
     input_bytes: &[u8],
 ) -> Result<Prepared, ReaderSignError> {
     let slot = options.slot;
-    ensure_displayed_card(transport, options.expected_serial.as_ref())?;
-    let (cert_der, key_reference, application_aid) = read_slot_certificate(transport, slot)?;
+    let SlotCertificateDiscovery {
+        cert_der,
+        key_reference,
+        application_aid,
+        discovered_pin_reference,
+    } = read_slot_certificate(transport, slot)?;
+    let serial = live_token_serial(transport, application_aid.as_ref())?;
+    if let Some(expected) = options.expected_serial.as_ref() {
+        ensure_expected_serial(expected, serial.as_ref())?;
+    }
     let cert_owned =
         OwnedCert::from_der(cert_der.as_bytes()).map_err(|e| ReaderSignError::CertUnavailable {
             slot,
@@ -1117,6 +1167,18 @@ fn prepare_on_card<T: CardTransport>(
     // S1 v4.2, organizational S4-2 v4.0, or Estonian eID), resolved by
     // counter-safe probes before any PIN is asked for.
     let scheme = resolve_pin_reference_scheme(transport)?;
+    if let Some(discovered_ref) = discovered_pin_reference
+        && discovered_ref != scheme.reference(slot.pin_slot())
+    {
+        return Err(ReaderSignError::CertUnavailable {
+            slot,
+            detail: format!(
+                "EF.AOD PIN reference {discovered_ref:#04X} disagrees with resolved {:?} reference {:#04X}",
+                scheme,
+                scheme.reference(slot.pin_slot())
+            ),
+        });
+    }
     let pin_status = check_slot_retry_floor(transport, slot, scheme)?;
     let pin_is_blocked = matches!(pin_status, refineid_auth::verify::PinStatus::Locked)
         || matches!(
@@ -1131,7 +1193,6 @@ fn prepare_on_card<T: CardTransport>(
             return Err(ReaderSignError::Pin2ChangeRequired);
         }
     }
-    let serial = live_token_serial(transport, application_aid.as_ref())?;
     Ok(Prepared {
         cert_der,
         cert_owned,
@@ -1324,21 +1385,6 @@ fn finish_signature(
         local_verify,
         below_requested_level: assembled.below_requested,
     })
-}
-
-/// Refuse to sign when the live card is not the one the operator saw.
-///
-/// Runs before PIN verification whenever a displayed serial was given,
-/// for a bare signature and a document alike.
-fn ensure_displayed_card<T: CardTransport>(
-    transport: &mut T,
-    expected: Option<&TokenSerial>,
-) -> Result<(), ReaderSignError> {
-    let Some(expected) = expected else {
-        return Ok(());
-    };
-    let live = live_token_serial(transport, None)?;
-    ensure_expected_serial(expected, live.as_ref())
 }
 
 /// The serial of the card in the reader, as EF.TokenInfo names it.
@@ -2637,15 +2683,112 @@ mod tests {
                 fatal_on_first: false,
                 transmits: 0,
             };
-            let (cert_der, key_ref, aid) =
-                read_slot_certificate(&mut fallback, SignSlot::Qualified)?;
+            let discovery = read_slot_certificate(&mut fallback, SignSlot::Qualified)?;
             check(
-                &cert_der.as_bytes(),
+                &discovery.cert_der.as_bytes(),
                 &CERTIFICATE,
                 "read cert from ADF2/3421",
             )?;
-            check_true(key_ref.is_none(), "default path has no discovered key ref")?;
-            check_true(aid.is_none(), "default path uses standard PKCS15_AID")?;
+            check_true(
+                discovery.key_reference.is_none(),
+                "default path has no discovered key ref",
+            )?;
+            check_true(
+                discovery.application_aid.is_none(),
+                "default path uses standard PKCS15_AID",
+            )?;
+            check_true(
+                discovery.discovered_pin_reference.is_none(),
+                "default path has no discovered PIN ref",
+            )?;
+
+            // Malformed EF.ODF (InvalidData) under PKCS15_AID terminates discovery
+            // immediately and never bypasses ambiguity/validation via ADF2/3421.
+            struct MalformedOdfCard {
+                ef_odf_selected: bool,
+                adf2_selected: bool,
+            }
+            const BAD_ODF_BYTE: u8 = 0xFF;
+            impl CardTransport for MalformedOdfCard {
+                type Error = &'static str;
+
+                fn transmit(
+                    &mut self,
+                    command: &CommandApdu,
+                ) -> Result<TransportOutcome, Self::Error> {
+                    let wire = command.as_bytes();
+                    let ins = wire.get(INS_INDEX).copied();
+                    if ins == Some(SelectFile::INS) {
+                        let data = wire.get(DATA_INDEX..).unwrap_or_default();
+                        if data == PKCS15_AID {
+                            self.ef_odf_selected = false;
+                            return Ok(TransportOutcome::Response(respond(
+                                Vec::new(),
+                                StatusWord::Success,
+                            )));
+                        }
+                        if data == refineid_pkcs15::EF_ODF_FID.as_bytes() {
+                            self.ef_odf_selected = true;
+                            return Ok(TransportOutcome::Response(respond(
+                                Vec::new(),
+                                StatusWord::Success,
+                            )));
+                        }
+                        let mut adf2_path = Vec::new();
+                        adf2_path.extend_from_slice(DF_ESTONIAN_QSCD_FID.as_bytes());
+                        adf2_path.extend_from_slice(EF_ESTONIAN_2025_SIGN_CERT_FID.as_bytes());
+                        if data.starts_with(&adf2_path) {
+                            self.adf2_selected = true;
+                            return Ok(TransportOutcome::Response(respond(
+                                Vec::new(),
+                                StatusWord::Success,
+                            )));
+                        }
+                        return Ok(TransportOutcome::Response(respond(
+                            Vec::new(),
+                            StatusWord::FileNotFound,
+                        )));
+                    }
+                    if ins == Some(ReadBinary::INS) && self.ef_odf_selected {
+                        let high = wire.get(P1_INDEX).copied().unwrap_or_default();
+                        let low = wire.get(P2_INDEX).copied().unwrap_or_default();
+                        let offset = usize::from(u16::from_be_bytes([high, low]));
+                        let body = if offset == 0 {
+                            vec![BAD_ODF_BYTE]
+                        } else {
+                            Vec::new()
+                        };
+                        return Ok(TransportOutcome::Response(respond(
+                            body,
+                            StatusWord::Success,
+                        )));
+                    }
+                    Ok(TransportOutcome::Response(respond(
+                        Vec::new(),
+                        StatusWord::FileNotFound,
+                    )))
+                }
+
+                fn transmit_credential(
+                    &mut self,
+                    _command: CredentialCommand,
+                ) -> Result<TransportOutcome, Self::Error> {
+                    Err("unexpected credential command")
+                }
+            }
+            let mut malformed_odf = MalformedOdfCard {
+                ef_odf_selected: false,
+                adf2_selected: false,
+            };
+            let invalid_err = read_slot_certificate(&mut malformed_odf, SignSlot::Qualified);
+            check_true(
+                matches!(invalid_err, Err(ReaderSignError::CertUnavailable { .. })),
+                "malformed EF.ODF aborts as CertUnavailable",
+            )?;
+            check_true(
+                !malformed_odf.adf2_selected,
+                "InvalidData from discovery never falls through to ADF2/3421",
+            )?;
 
             let mut fatal = Adf2FallbackCard {
                 cert: CERTIFICATE.to_vec(),

@@ -87,8 +87,8 @@ use crate::ck::{
     CKA_TOKEN, CKA_TRUSTED, CKA_UNWRAP, CKA_VALUE, CKA_VERIFY, CKA_VERIFY_RECOVER, CKA_WRAP,
     CKC_X_509, CKK_EC, CKK_RSA, CKO_CERTIFICATE, CKO_NSS_TRUST, CKO_PRIVATE_KEY, CKO_PROFILE,
     CKO_PUBLIC_KEY, CKP_PUBLIC_CERTIFICATES_TOKEN, CKR_DATA_INVALID, CKR_DATA_LEN_RANGE,
-    CKR_DEVICE_ERROR, CKR_MECHANISM_INVALID, CKR_OK, CKR_PIN_INCORRECT, CKR_PIN_LOCKED,
-    CKR_SIGNATURE_INVALID, CKR_SIGNATURE_LEN_RANGE, CKR_USER_NOT_LOGGED_IN,
+    CKR_DEVICE_ERROR, CKR_MECHANISM_INVALID, CKR_OK, CKR_PIN_EXPIRED, CKR_PIN_INCORRECT,
+    CKR_PIN_LOCKED, CKR_SIGNATURE_INVALID, CKR_SIGNATURE_LEN_RANGE, CKR_USER_NOT_LOGGED_IN,
     CKT_NSS_MUST_VERIFY_TRUST, CKT_NSS_TRUSTED_DELEGATOR, CkAttributeType, CkBbool, CkObjectHandle,
     CkRv, CkTrust, CkUlong,
 };
@@ -2667,11 +2667,14 @@ where
             clear_positive(pin_cache);
             return Err(CKR_PIN_LEN_RANGE);
         }
+        Err(AuthError::Pin2ChangeRequired) => {
+            clear_positive(pin_cache);
+            return Err(CKR_PIN_EXPIRED);
+        }
         Err(
             AuthError::Transport(_)
             | AuthError::Outcome(_)
             | AuthError::Command(_)
-            | AuthError::Pin2ChangeRequired
             | AuthError::UnsupportedSlot { .. },
         ) => {
             clear_positive(pin_cache);
@@ -2951,10 +2954,10 @@ fn run_card_change_pin1_with_profile<T: CardTransport>(
     .map_err(|change_err| match change_err {
         AuthError::PinLength(_) => CKR_PIN_LEN_RANGE,
         AuthError::RetryFloor(refusal) => retry_floor_rv(refusal),
+        AuthError::Pin2ChangeRequired => CKR_PIN_EXPIRED,
         AuthError::Transport(_)
         | AuthError::Outcome(_)
         | AuthError::Command(_)
-        | AuthError::Pin2ChangeRequired
         | AuthError::UnsupportedSlot { .. } => CKR_DEVICE_ERROR,
     })?;
     match outcome {

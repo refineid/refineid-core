@@ -381,10 +381,11 @@ pub(crate) fn read_pin_policy_lengths<T: CardTransport + ?Sized>(
 }
 
 /// Scan every TLV inside a PIN-container response body, descending into any
-/// `A0` template even when trailing outer TLVs follow it. Rejects the
-/// container (`None`) whenever any echoed PIN reference (`83`) differs from
-/// `expected_reference` (responses that omit `83` remain accepted), and
-/// returns the first `target_tag` value with length `expected_len`.
+/// `A0` template even when trailing outer TLVs follow it. Fails closed
+/// (`None`) on any malformed BER-TLV framing, on any echoed PIN reference
+/// (`83`) that differs from `expected_reference` (responses that omit `83`
+/// remain accepted for FINEID compatibility), or on duplicate or
+/// wrong-length occurrences of `target_tag`.
 fn find_pin_container_tag(
     body: &[u8],
     expected_reference: u8,
@@ -392,18 +393,24 @@ fn find_pin_container_tag(
     expected_len: usize,
 ) -> Option<&[u8]> {
     let mut found = None;
-    for outer in BerTlvIter::new(body).map_while(Result::ok) {
+    for outer_entry in BerTlvIter::new(body) {
+        let Ok(outer) = outer_entry else {
+            return None;
+        };
         if outer.tag() == u16::from(PIN_CONTAINER_TEMPLATE_TAG) {
-            for inner in BerTlvIter::new(outer.value()).map_while(Result::ok) {
+            for inner_entry in BerTlvIter::new(outer.value()) {
+                let Ok(inner) = inner_entry else {
+                    return None;
+                };
                 if inner.tag() == u16::from(PIN_CONTAINER_REF_TAG)
                     && inner.value() != [expected_reference]
                 {
                     return None;
                 }
-                if found.is_none()
-                    && inner.tag() == target_tag
-                    && inner.value().len() == expected_len
-                {
+                if inner.tag() == target_tag {
+                    if found.is_some() || inner.value().len() != expected_len {
+                        return None;
+                    }
                     found = Some(inner.value());
                 }
             }
@@ -413,7 +420,10 @@ fn find_pin_container_tag(
             {
                 return None;
             }
-            if found.is_none() && outer.tag() == target_tag && outer.value().len() == expected_len {
+            if outer.tag() == target_tag {
+                if found.is_some() || outer.value().len() != expected_len {
+                    return None;
+                }
                 found = Some(outer.value());
             }
         }
@@ -515,7 +525,9 @@ pub fn read_puk_status_from_container_with_scheme<T: CardTransport + ?Sized>(
                 None => PinStatus::NoInfo,
             })
         }
-        StatusWord::AuthenticationBlocked | StatusWord::ReferenceDataInvalidated => {
+        StatusWord::AuthenticationBlocked | StatusWord::ReferenceDataInvalidated
+            if scheme == PinReferenceScheme::Citizen =>
+        {
             Ok(PinStatus::Locked)
         }
         other => Ok(PinStatus::Other(other)),
@@ -1152,6 +1164,135 @@ mod tests {
             est_puk.last_command.as_deref(),
             Some(expected_get_data(PUK_REFERENCE_ESTONIAN).as_slice())
         );
+
+        // Malformed BER-TLV framing, duplicate DF 2F / DF 21 tags, and wrong-length
+        // target tags fail closed as Unreadable / NoInfo.
+        const TRUNCATED_AUX_TAG: u8 = 0x99;
+        const TRUNCATED_AUX_DECLARED_LEN: u8 = 0x05;
+        let mut malformed_trailing = build_container(
+            PIN2_REFERENCE_ESTONIAN,
+            ESTONIAN_PRISTINE_TRIES,
+            PIN_CHANGED_FLAG_UNCHANGED,
+        );
+        malformed_trailing.extend_from_slice(&[TRUNCATED_AUX_TAG, TRUNCATED_AUX_DECLARED_LEN]);
+        let mut malformed_transport = MockTransport::success(malformed_trailing);
+        assert_eq!(
+            read_pin_change_record_with_scheme(
+                &mut malformed_transport,
+                PinReferenceScheme::Estonian,
+                PinSlot::Pin2
+            )
+            .expect("malformed trailing TLV yields Unreadable"),
+            PinChangeRecord::Unreadable
+        );
+
+        let mut dup_df2f_inner = BerEncoder::default();
+        dup_df2f_inner
+            .push_tlv(PIN_CONTAINER_REF_TAG, [PIN2_REFERENCE_ESTONIAN])
+            .expect("encodes ref");
+        dup_df2f_inner
+            .push_tlv_tag2(PIN_CHANGED_TAG, [PIN_CHANGED_FLAG_CHANGED])
+            .expect("encodes first df2f");
+        dup_df2f_inner
+            .push_tlv_tag2(PIN_CHANGED_TAG, [PIN_CHANGED_FLAG_UNCHANGED])
+            .expect("encodes second df2f");
+        let mut dup_df2f_outer = BerEncoder::default();
+        dup_df2f_outer
+            .push_tlv(PIN_CONTAINER_TEMPLATE_TAG, dup_df2f_inner.finish())
+            .expect("encodes template");
+        let mut dup_df2f_transport = MockTransport::success(dup_df2f_outer.finish());
+        assert_eq!(
+            read_pin_change_record_with_scheme(
+                &mut dup_df2f_transport,
+                PinReferenceScheme::Estonian,
+                PinSlot::Pin2
+            )
+            .expect("duplicate DF 2F yields Unreadable"),
+            PinChangeRecord::Unreadable
+        );
+
+        let mut wrong_len_inner = BerEncoder::default();
+        wrong_len_inner
+            .push_tlv(PIN_CONTAINER_REF_TAG, [PIN2_REFERENCE_ESTONIAN])
+            .expect("encodes ref");
+        wrong_len_inner
+            .push_tlv_tag2(
+                PIN_CHANGED_TAG,
+                [PIN_CHANGED_FLAG_CHANGED, PIN_CHANGED_FLAG_UNCHANGED],
+            )
+            .expect("encodes two-byte df2f");
+        let mut wrong_len_outer = BerEncoder::default();
+        wrong_len_outer
+            .push_tlv(PIN_CONTAINER_TEMPLATE_TAG, wrong_len_inner.finish())
+            .expect("encodes template");
+        let mut wrong_len_transport = MockTransport::success(wrong_len_outer.finish());
+        assert_eq!(
+            read_pin_change_record_with_scheme(
+                &mut wrong_len_transport,
+                PinReferenceScheme::Estonian,
+                PinSlot::Pin2
+            )
+            .expect("wrong-length DF 2F yields Unreadable"),
+            PinChangeRecord::Unreadable
+        );
+
+        let mut dup_df21_inner = BerEncoder::default();
+        dup_df21_inner
+            .push_tlv(PIN_CONTAINER_REF_TAG, [PUK_REFERENCE_ESTONIAN])
+            .expect("encodes ref");
+        dup_df21_inner
+            .push_tlv_tag2(
+                PIN_ATTRIBUTES_TAG,
+                [
+                    ESTONIAN_PRISTINE_TRIES,
+                    ATTR_UNUSED_OCTET,
+                    ATTR_STATE_OCTET,
+                    ATTR_UNBLOCK_METHOD_NONE,
+                ],
+            )
+            .expect("encodes first df21");
+        dup_df21_inner
+            .push_tlv_tag2(
+                PIN_ATTRIBUTES_TAG,
+                [
+                    RETRIES_EXHAUSTED,
+                    ATTR_UNUSED_OCTET,
+                    ATTR_STATE_OCTET,
+                    ATTR_UNBLOCK_METHOD_NONE,
+                ],
+            )
+            .expect("encodes second df21");
+        let mut dup_df21_outer = BerEncoder::default();
+        dup_df21_outer
+            .push_tlv(PIN_CONTAINER_TEMPLATE_TAG, dup_df21_inner.finish())
+            .expect("encodes template");
+        let mut dup_df21_transport = MockTransport::success(dup_df21_outer.finish());
+        assert_eq!(
+            read_puk_status_from_container_with_scheme(
+                &mut dup_df21_transport,
+                PinReferenceScheme::Estonian
+            )
+            .expect("duplicate DF 21 yields NoInfo"),
+            PinStatus::NoInfo
+        );
+
+        // GED24035_015 Table 61 does not define 6983/6984 for GET DATA, so Estonian
+        // PUK container reads keep them as Other (fail-closed in the retry floor)
+        // rather than mapping to Locked.
+        for sw in [
+            StatusWord::AuthenticationBlocked,
+            StatusWord::ReferenceDataInvalidated,
+        ] {
+            let mut blocked_sw = MockTransport::sw(sw);
+            assert_eq!(
+                read_puk_status_from_container_with_scheme(
+                    &mut blocked_sw,
+                    PinReferenceScheme::Estonian
+                )
+                .expect("Estonian GET DATA SW maps fail-closed"),
+                PinStatus::Other(sw)
+            );
+        }
 
         // Citizen and organizational cards send zero APDUs for initial-PIN2 check;
         // organizational cards also send zero APDUs for container reads.

@@ -957,8 +957,13 @@ pub trait PinManageOps: PinOps {
             Some(scheme) => Some(self.activation_needs(scheme)?),
             None => None,
         };
-        let pin2_requires_change_before_signing =
-            self.pin2_requires_change_before_signing_with_scheme(ref_scheme)?;
+        let pin2_is_blocked = matches!(pin2_status, PinStatus::Locked)
+            || matches!(pin2_status, PinStatus::Remaining(retries) if retries.is_exhausted());
+        let pin2_requires_change_before_signing = if pin2_is_blocked {
+            false
+        } else {
+            self.pin2_requires_change_before_signing_with_scheme(ref_scheme)?
+        };
         Ok(crate::activation::CredentialHealthReport {
             pin1_status,
             pin2_status,
@@ -2137,7 +2142,10 @@ mod tests {
         let puk_state = puk_fallback
             .probe_puk_status_with_scheme(PinReferenceScheme::Estonian)
             .expect("Estonian PUK falls back to GET DATA container");
-        assert_eq!(puk_state, PinStatus::Locked);
+        assert_eq!(
+            puk_state,
+            PinStatus::Other(StatusWord::AuthenticationBlocked)
+        );
         assert_eq!(puk_fallback.commands.len(), CONTAINER_READ_COMMAND_COUNT);
         assert_eq!(
             puk_fallback.commands[1],

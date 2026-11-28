@@ -987,6 +987,33 @@ impl KeyReference {
     }
 }
 
+/// MSE:SET key reference proven by PKCS#15 directory discovery to belong
+/// to the card's unique non-repudiation (qualified-signature) private key.
+///
+/// Constructible only inside this crate from a validated
+/// [`DiscoveredQualifiedSignatureProfile`], preventing authentication key
+/// references from being passed to qualified-signature unlock APIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QualifiedKeyReference(KeyReference);
+
+impl QualifiedKeyReference {
+    pub(crate) const fn of(reference: KeyReference) -> Self {
+        Self(reference)
+    }
+
+    /// The underlying PKCS#15 [`KeyReference`].
+    #[must_use]
+    pub const fn key_reference(self) -> KeyReference {
+        self.0
+    }
+
+    /// The key-reference wire byte.
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self.0.as_u8()
+    }
+}
+
 /// Key-usage bits from `CommonKeyAttributes.usage` (PKCS#15 v1.1 section
 /// 6.1.9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1439,7 +1466,7 @@ impl CredentialDirectory {
 pub struct DiscoveredQualifiedSignatureProfile {
     application_aid: Aid,
     sign_cert_path: Pkcs15Path,
-    sign_key_reference: KeyReference,
+    sign_key_reference: QualifiedKeyReference,
     aod_path: Pkcs15Path,
     pin2_auth_id: ObjectIdentifier,
     pin2: PasswordObject,
@@ -1450,7 +1477,7 @@ impl DiscoveredQualifiedSignatureProfile {
     pub(crate) const fn new(
         application_aid: Aid,
         sign_cert_path: Pkcs15Path,
-        sign_key_reference: KeyReference,
+        sign_key_reference: QualifiedKeyReference,
         aod_path: Pkcs15Path,
         pin2_auth_id: ObjectIdentifier,
         pin2: PasswordObject,
@@ -1481,7 +1508,7 @@ impl DiscoveredQualifiedSignatureProfile {
 
     /// MSE:SET key reference of the qualified-signature private key.
     #[must_use]
-    pub const fn sign_key_reference(&self) -> KeyReference {
+    pub const fn sign_key_reference(&self) -> QualifiedKeyReference {
         self.sign_key_reference
     }
 
@@ -2471,6 +2498,62 @@ mod tests {
         assert_eq!(
             CredentialDirectory::of(&dup_cdf, &mixed_prkdf),
             Err(CredentialPairingError::DuplicateCertificate)
+        );
+
+        // Two paired nonRepudiation credentials resolve to Ambiguous rather than picking the first.
+        const SECOND_SIGN_ID: u8 = 0x41;
+        const SECOND_SIGN_KEY_REF: u8 = 0x06;
+        let mut ambig_cdf_bytes = encode_cdf_entry(
+            DER_SEQUENCE_TAG_OCTET,
+            "sign 1",
+            SIGN_OBJECT_ID,
+            &[FileId::MF, SIGN_CERT_FID],
+            None,
+        );
+        ambig_cdf_bytes.extend_from_slice(&encode_cdf_entry(
+            DER_SEQUENCE_TAG_OCTET,
+            "sign 2",
+            SECOND_SIGN_ID,
+            &[FileId::MF, AUTH_CERT_FID],
+            None,
+        ));
+        let ambig_cdf = match CertificateDirectory::of(FileContent::from_read(
+            ambig_cdf_bytes,
+            FileEnd::Confirmed,
+        )) {
+            CertificateDirectoryRead::Parsed(cdf) => Some(cdf),
+            CertificateDirectoryRead::Incomplete | CertificateDirectoryRead::Malformed => None,
+        }
+        .expect("ambiguous CDF parses");
+        let mut ambig_prkdf_bytes = encode_prkdf_entry(
+            TAG_PRIVATE_EC_KEY,
+            "sign key 1",
+            Some(PIN2_AUTH_ID),
+            SIGN_OBJECT_ID,
+            SIGN_KEY_USAGE_BITSTRING,
+            Some(SIGN_KEY_REF),
+        );
+        ambig_prkdf_bytes.extend_from_slice(&encode_prkdf_entry(
+            TAG_PRIVATE_EC_KEY,
+            "sign key 2",
+            Some(PIN2_AUTH_ID),
+            SECOND_SIGN_ID,
+            SIGN_KEY_USAGE_BITSTRING,
+            Some(SECOND_SIGN_KEY_REF),
+        ));
+        let ambig_prkdf = match PrivateKeyDirectory::of(FileContent::from_read(
+            ambig_prkdf_bytes,
+            FileEnd::Confirmed,
+        )) {
+            PrivateKeyDirectoryRead::Parsed(prkdf) => Some(prkdf),
+            PrivateKeyDirectoryRead::Incomplete | PrivateKeyDirectoryRead::Malformed => None,
+        }
+        .expect("ambiguous PrKDF parses");
+        let ambig_paired = CredentialDirectory::of(&ambig_cdf, &ambig_prkdf)
+            .expect("distinct sign credentials pair");
+        assert_eq!(
+            ambig_paired.unique_qualified_signature_credential(),
+            QualifiedSignatureCredentialLookup::Ambiguous
         );
 
         // Non-padding data after FF padding is rejected.

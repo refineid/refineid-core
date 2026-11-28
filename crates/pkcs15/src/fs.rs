@@ -1340,7 +1340,7 @@ pub trait Pkcs15Ops: CardTransport {
         Ok(DiscoveredQualifiedSignatureProfile::new(
             aid.clone(),
             sign_cert_path,
-            sign_key_reference,
+            crate::directory::QualifiedKeyReference::of(sign_key_reference),
             aod_path,
             pin2_auth_id,
             pin2,

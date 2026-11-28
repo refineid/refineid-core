@@ -1295,37 +1295,43 @@ fn estonian_qualified_signature_profile_discovery_resolves_sign_cert_key_ref_and
     prkdf_body.extend_from_slice(&prkdf_type);
     let ef_prkdf = tlv(TAG_PRIVATE_EC_KEY, prkdf_body).expect("encodes");
 
-    let aod_record =
-        |auth_id: u8, protecting: Option<u8>, flags: &[u8], min: u8, stored: u8, reference: u8| {
-            let mut common = BerEncoder::default();
-            common.push_tlv(utf8_tag, b"PIN2").expect("encodes");
-            if let Some(puk) = protecting {
-                common.push_tlv(oct_tag, [puk]).expect("encodes");
-            }
-            let class =
-                tlv(sequence_tag(), tlv(oct_tag, [auth_id]).expect("encodes")).expect("encodes");
-            let mut attrs = BerEncoder::default();
-            attrs.push_tlv(bit_tag, flags).expect("encodes");
-            attrs
-                .push_tlv(ENUMERATED_TAG, [PASSWORD_TYPE_ASCII_NUMERIC])
-                .expect("encodes");
-            attrs.push_tlv(int_tag, [min]).expect("encodes");
-            attrs.push_tlv(int_tag, [stored]).expect("encodes");
-            attrs
-                .push_tlv(PWD_REFERENCE_TAG, [DER_ZERO_PREFIX, reference])
-                .expect("encodes");
-            attrs.push_tlv(oct_tag, [ZERO_PAD_BYTE]).expect("encodes");
-            let typed = tlv(
-                TYPE_ATTRIBUTES_TAG,
-                tlv(sequence_tag(), attrs.finish()).expect("encodes"),
-            )
+    let aod_record = |label: &[u8],
+                      auth_id: u8,
+                      protecting: Option<u8>,
+                      flags: &[u8],
+                      min: u8,
+                      stored: u8,
+                      reference: u8| {
+        let mut common = BerEncoder::default();
+        common.push_tlv(utf8_tag, label).expect("encodes");
+        if let Some(puk) = protecting {
+            common.push_tlv(oct_tag, [puk]).expect("encodes");
+        }
+        let class =
+            tlv(sequence_tag(), tlv(oct_tag, [auth_id]).expect("encodes")).expect("encodes");
+        let mut attrs = BerEncoder::default();
+        attrs.push_tlv(bit_tag, flags).expect("encodes");
+        attrs
+            .push_tlv(ENUMERATED_TAG, [PASSWORD_TYPE_ASCII_NUMERIC])
             .expect("encodes");
-            let mut rec = tlv(sequence_tag(), common.finish()).expect("encodes");
-            rec.extend_from_slice(&class);
-            rec.extend_from_slice(&typed);
-            tlv(sequence_tag(), rec).expect("encodes")
-        };
+        attrs.push_tlv(int_tag, [min]).expect("encodes");
+        attrs.push_tlv(int_tag, [stored]).expect("encodes");
+        attrs
+            .push_tlv(PWD_REFERENCE_TAG, [DER_ZERO_PREFIX, reference])
+            .expect("encodes");
+        attrs.push_tlv(oct_tag, [ZERO_PAD_BYTE]).expect("encodes");
+        let typed = tlv(
+            TYPE_ATTRIBUTES_TAG,
+            tlv(sequence_tag(), attrs.finish()).expect("encodes"),
+        )
+        .expect("encodes");
+        let mut rec = tlv(sequence_tag(), common.finish()).expect("encodes");
+        rec.extend_from_slice(&class);
+        rec.extend_from_slice(&typed);
+        tlv(sequence_tag(), rec).expect("encodes")
+    };
     let mut ef_aod = aod_record(
+        b"PIN2",
         PIN2_AUTH_ID,
         Some(PUK_AUTH_ID),
         PIN2_FLAGS,
@@ -1334,6 +1340,7 @@ fn estonian_qualified_signature_profile_discovery_resolves_sign_cert_key_ref_and
         PIN2_REF,
     );
     ef_aod.extend_from_slice(&aod_record(
+        b"PUK",
         PUK_AUTH_ID,
         None,
         PUK_FLAGS,

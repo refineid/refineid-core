@@ -61,7 +61,7 @@ use refineid_auth::{
     PinReferenceScheme, VerifyOutcome, check_retry_floor,
 };
 use refineid_pace::{OpenedByPin2, Pin2PresentationSpent, SmTransport};
-use refineid_pkcs15::{KeyReference, Pkcs15Error, Pkcs15Ops as _};
+use refineid_pkcs15::{KeyReference, Pkcs15Error, Pkcs15Ops as _, QualifiedKeyReference};
 use zeroize::Zeroizing;
 
 use commands::{
@@ -282,8 +282,9 @@ impl<E: core::fmt::Debug + core::fmt::Display + 'static> core::error::Error
 }
 
 /// Verify Signature PIN 2 in the directory the qualified-signature key lives
-/// in, checking the EstEID 2025 initial-PIN-2 requirement before spending a
-/// retry.
+/// in. On EstEID 2025, `verify_pin2_with_scheme` enforces both the retry
+/// floor and the counter-safe `DF 2F` initial-PIN-2 requirement before
+/// transmitting any VERIFY credential APDU.
 fn verify_qualified_in_place<T: CardTransport>(
     transport: &mut T,
     scheme: SignScheme,
@@ -294,17 +295,12 @@ fn verify_qualified_in_place<T: CardTransport>(
             .select_esign_directory()
             .map_err(QualifiedUnlockError::Directory)?;
     }
-    if scheme == SignScheme::Estonian {
-        let requires_change = transport
-            .pin2_requires_change_before_signing_with_scheme(scheme.pin_numbering())
-            .map_err(QualifiedUnlockError::Verify)?;
-        if requires_change {
-            return Err(QualifiedUnlockError::Pin2ChangeRequired);
-        }
-    }
     let outcome = transport
         .verify_pin2_with_scheme(scheme.pin_numbering(), pin)
-        .map_err(QualifiedUnlockError::Verify)?;
+        .map_err(|error| match error {
+            AuthError::Pin2ChangeRequired => QualifiedUnlockError::Pin2ChangeRequired,
+            other => QualifiedUnlockError::Verify(other),
+        })?;
     match outcome {
         VerifyOutcome::Ok => Ok(()),
         refused @ (VerifyOutcome::WrongPin { .. }
@@ -380,8 +376,9 @@ impl<T: CardTransport> QualifiedSignSession<T> {
     }
 
     /// As [`Self::open`], targeting an EF.PrKDF-discovered
-    /// [`KeyReference`] instead of the default scheme reference (supporting
-    /// re-keyed cards such as EstEID 2025).
+    /// [`QualifiedKeyReference`] instead of the default scheme reference
+    /// (supporting re-keyed cards such as EstEID 2025 while rejecting
+    /// authentication key references at compile time).
     ///
     /// # Errors
     ///
@@ -389,7 +386,7 @@ impl<T: CardTransport> QualifiedSignSession<T> {
     pub fn open_with_reference(
         mut transport: T,
         scheme: SignScheme,
-        key_reference: KeyReference,
+        key_reference: QualifiedKeyReference,
         pin: Pin2,
     ) -> Result<Self, (T, QualifiedUnlockError<T::Error>)> {
         if let Err(error) = verify_qualified_in_place(&mut transport, scheme, pin) {
@@ -398,7 +395,7 @@ impl<T: CardTransport> QualifiedSignSession<T> {
         Ok(Self {
             transport,
             scheme,
-            key: KeyTarget::Directory(key_reference),
+            key: KeyTarget::Directory(key_reference.key_reference()),
         })
     }
 
@@ -675,8 +672,10 @@ pub trait SignOps: CardTransport {
     }
 
     /// As [`SignOps::unlock_qualified_key`], targeting an
-    /// EF.PrKDF-discovered [`KeyReference`] so re-keyed cards (such as
-    /// EstEID 2025) pass their live directory key reference to MSE:SET.
+    /// EF.PrKDF-discovered [`QualifiedKeyReference`] so re-keyed cards
+    /// (such as EstEID 2025) pass their live directory key reference to
+    /// MSE:SET while rejecting authentication key references at compile
+    /// time.
     ///
     /// # Errors
     ///
@@ -684,7 +683,7 @@ pub trait SignOps: CardTransport {
     fn unlock_qualified_key_with_reference(
         &mut self,
         scheme: SignScheme,
-        key_reference: KeyReference,
+        key_reference: QualifiedKeyReference,
         pin: Pin2,
     ) -> Result<SigningKey<'_, Self>, QualifiedUnlockError<Self::Error>>
     where
@@ -694,7 +693,7 @@ pub trait SignOps: CardTransport {
         Ok(SigningKey {
             transport: self,
             scheme,
-            key: KeyTarget::Directory(key_reference),
+            key: KeyTarget::Directory(key_reference.key_reference()),
         })
     }
 

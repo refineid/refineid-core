@@ -56,7 +56,7 @@ use crate::retry_risk::{
 };
 use crate::verify::{
     AuthError, CardPinParameters, PinOps, PinReferenceScheme, PinSlot, PinStatus, VERIFY_INS,
-    VERIFY_P1, credential_exchange, credential_exchange_groups, ensure_slot_supported,
+    VERIFY_P1, credential_exchange, credential_exchange_groups,
 };
 
 /// CHANGE REFERENCE DATA instruction (ISO 7816-8; FINEID S1 v4.2
@@ -132,7 +132,6 @@ pub(crate) fn change<T: CardTransport + ?Sized>(
     current: &[u8],
     new: &[u8],
 ) -> Result<ManageOutcome, AuthError<T::Error>> {
-    ensure_slot_supported(scheme, slot)?;
     let header = CommandHeader {
         class: ApduClass::Plain,
         instruction: CHANGE_REFERENCE_DATA_INS,
@@ -224,7 +223,6 @@ pub(crate) fn unblock<T: CardTransport + ?Sized>(
     puk: &[u8],
     new: &[u8],
 ) -> Result<ManageOutcome, AuthError<T::Error>> {
-    ensure_slot_supported(scheme, slot)?;
     let puk_counter = puk_status(transport, scheme)?;
     check_retry_floor_with_scheme(FlooredCredential::Puk, puk_counter, scheme)
         .map_err(AuthError::RetryFloor)?;
@@ -619,7 +617,6 @@ pub trait PinManageOps: PinOps {
     where
         Self: Sized,
     {
-        ensure_slot_supported(lengths.numbering(), PinSlot::Pin2)?;
         lengths.check_pin2(&current).map_err(AuthError::PinLength)?;
         lengths.check_pin2(&new).map_err(AuthError::PinLength)?;
         change_under_floor(
@@ -680,7 +677,6 @@ pub trait PinManageOps: PinOps {
     where
         Self: Sized,
     {
-        ensure_slot_supported(lengths.numbering(), PinSlot::Pin2)?;
         lengths.check_puk(&puk).map_err(AuthError::PinLength)?;
         lengths.check_pin2(&new).map_err(AuthError::PinLength)?;
         unblock(
@@ -2071,6 +2067,14 @@ mod tests {
             FIVE_DIGIT_NEW_PIN2
         );
 
+        // A 4-digit PIN 2 is refused locally under Estonian bounds (5..=12) with zero APDUs.
+        let mut short_pin2_transport = Recorder::new(vec![]);
+        let short_err = short_pin2_transport
+            .change_pin2(&lengths, pin2(CURRENT_DIGITS), pin2(FIVE_DIGIT_NEW_PIN2))
+            .expect_err("Estonian change_pin2 refuses 4-digit PIN 2");
+        assert!(matches!(short_err, AuthError::PinLength(_)));
+        assert!(short_pin2_transport.commands.is_empty());
+
         let mut unblock_transport =
             Recorder::new(vec![puk_counter(RETRIES_THREE), StatusWord::Success]);
         let unblocked = unblock_transport
@@ -2088,8 +2092,34 @@ mod tests {
             reset_wire[P2_INDEX],
             PinReferenceScheme::Estonian.reference(PinSlot::Pin2)
         );
+        assert_eq!(usize::from(reset_wire[LC_INDEX]), CREDENTIAL_BODY_SCRATCH);
+        assert_eq!(
+            &reset_wire[DATA_OFFSET..DATA_OFFSET + PUK_DIGITS.len()],
+            PUK_DIGITS
+        );
+        assert!(
+            reset_wire[DATA_OFFSET + PUK_DIGITS.len()..DATA_OFFSET + PIN_STORED_LENGTH]
+                .iter()
+                .all(|&byte| byte == crate::verify::ESTONIAN_EID_PAD_OCTET)
+        );
+        let reset_new_start = DATA_OFFSET + PIN_STORED_LENGTH;
+        assert_eq!(
+            &reset_wire[reset_new_start..reset_new_start + FIVE_DIGIT_NEW_PIN2.len()],
+            FIVE_DIGIT_NEW_PIN2
+        );
+        assert!(
+            reset_wire[reset_new_start + FIVE_DIGIT_NEW_PIN2.len()..]
+                .iter()
+                .all(|&byte| byte == crate::verify::ESTONIAN_EID_PAD_OCTET)
+        );
 
         // PUK probe on EstEID 2025 falls back to GET DATA container when VERIFY returns no counter.
+        const GET_DATA_P1: u8 = 0x00;
+        const GET_DATA_P2: u8 = 0xFF;
+        const GET_DATA_LC: u8 = 5;
+        const GET_DATA_LE: u8 = 0x00;
+        const TEMPLATE_LEN: u8 = 3;
+        const REF_LEN: u8 = 1;
         let mut puk_fallback = Recorder::new(vec![
             StatusWord::AuthenticationFailed,
             StatusWord::AuthenticationBlocked,
@@ -2099,7 +2129,22 @@ mod tests {
             .expect("Estonian PUK falls back to GET DATA container");
         assert_eq!(puk_state, PinStatus::Locked);
         assert_eq!(puk_fallback.commands.len(), CONTAINER_READ_COMMAND_COUNT);
-        assert_eq!(puk_fallback.commands[1][INS_INDEX], GET_DATA_INS);
+        assert_eq!(
+            puk_fallback.commands[1],
+            vec![
+                ApduClass::Plain.as_byte(),
+                GET_DATA_INS,
+                GET_DATA_P1,
+                GET_DATA_P2,
+                GET_DATA_LC,
+                crate::activation::PIN_CONTAINER_TEMPLATE_TAG,
+                TEMPLATE_LEN,
+                crate::activation::PIN_CONTAINER_REF_TAG,
+                REF_LEN,
+                PinReferenceScheme::Estonian.puk_reference(),
+                GET_DATA_LE,
+            ]
+        );
 
         let mut transport = Recorder::new(vec![]);
         let activation_code = crate::activation::ActivationCode::reconstruct(

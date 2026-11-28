@@ -177,6 +177,7 @@ impl CheckedOutPin1 {
                 AuthError::Command(_)
                 | AuthError::RetryFloor(_)
                 | AuthError::PinLength(_)
+                | AuthError::Pin2ChangeRequired
                 | AuthError::UnsupportedSlot { .. },
             ) => {
                 return None;

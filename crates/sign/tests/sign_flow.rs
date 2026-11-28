@@ -52,6 +52,8 @@ const TRIES_AFTER_WRONG: u8 = 4;
 const TRIES_PRISTINE: u8 = 5;
 /// The counter of a pristine Estonian PIN 2, which the retry floor serves.
 const ESTONIAN_TRIES_PRISTINE: u8 = 3;
+/// The lowest counter the retry floor serves (two tries left).
+const ESTONIAN_TRIES_FLOOR: u8 = 2;
 /// The highest counter the retry floor refuses (the last try).
 const TRIES_BELOW_FLOOR: u8 = 1;
 /// GET DATA instruction byte (ISO 7816-4 / GED24035_015 section 8.3.4).
@@ -900,11 +902,18 @@ fn estonian_authentication_key_signs_p384_over_pso_hash_and_pso_cds() {
 fn estonian_qualified_unlock_blocks_unchanged_pin2_and_signs_once_changed_while_decipher_fails_closed()
  {
     // Unchanged initial PIN 2 (DF 2F == 00) refuses before VERIFY PIN 2.
-    let mut blocked_transport = Scripted::with_paths(vec![(
-        Path::Plain,
-        get_data_pin2_wire(PinReferenceScheme::Estonian),
-        success(df2f_body(false)),
-    )]);
+    let mut blocked_transport = Scripted::with_paths(vec![
+        (
+            Path::Plain,
+            probe_pin2_wire(PinReferenceScheme::Estonian),
+            probe_served(ESTONIAN_TRIES_PRISTINE),
+        ),
+        (
+            Path::Plain,
+            get_data_pin2_wire(PinReferenceScheme::Estonian),
+            success(df2f_body(false)),
+        ),
+    ]);
     let unlock_err = blocked_transport
         .unlock_qualified_key(SignScheme::Estonian, pin2())
         .expect_err("Estonian unchanged initial PIN 2 must refuse before VERIFY");
@@ -917,52 +926,54 @@ fn estonian_qualified_unlock_blocks_unchanged_pin2_and_signs_once_changed_while_
         "zero VERIFY PIN 2 APDUs transmitted"
     );
 
-    // Changed PIN 2 (DF 2F == 01) verifies PIN 2 and signs over PSO:HASH + PSO:CDS.
+    // Changed PIN 2 (DF 2F == 01) verifies PIN 2 at both 3 and 2 tries left and signs over PSO:HASH + PSO:CDS.
     let digest = [DIGEST_FILL; SHA384_LEN];
     let signature = vec![SIG_FILL; ECDSA_P384_SIG_BYTES];
-    let mut sign_transport = Scripted::with_paths(vec![
-        (
-            Path::Plain,
-            get_data_pin2_wire(PinReferenceScheme::Estonian),
-            success(df2f_body(true)),
-        ),
-        (
-            Path::Plain,
-            probe_pin2_wire(PinReferenceScheme::Estonian),
-            probe_served(ESTONIAN_TRIES_PRISTINE),
-        ),
-        (
-            Path::Credential,
-            verify_pin2_wire(PinReferenceScheme::Estonian),
-            success(vec![]),
-        ),
-        (
-            Path::Plain,
-            mse_wire(
-                SignScheme::Estonian,
-                SignatureAlgRef::SHA384_ECDSA,
-                KeyRef::Sign,
+    for tries in [ESTONIAN_TRIES_PRISTINE, ESTONIAN_TRIES_FLOOR] {
+        let mut sign_transport = Scripted::with_paths(vec![
+            (
+                Path::Plain,
+                probe_pin2_wire(PinReferenceScheme::Estonian),
+                probe_served(tries),
             ),
-            success(vec![]),
-        ),
-        (
-            Path::Plain,
-            pso_hash_wire(ExternalHashValue::Sha384(digest)),
-            success(vec![]),
-        ),
-        (
-            Path::Plain,
-            pso_cds_empty_wire(ecdsa_le()),
-            success(signature.clone()),
-        ),
-    ]);
-    let sig = sign_transport
-        .unlock_qualified_key(SignScheme::Estonian, pin2())
-        .expect("Estonian changed PIN 2 unlocks qualified key")
-        .sign_prehashed_sha384_ecdsa(digest)
-        .expect("Estonian qualified ECDSA sign succeeds");
-    assert_eq!(sig.as_bytes(), signature.as_slice());
-    assert!(sign_transport.drained());
+            (
+                Path::Plain,
+                get_data_pin2_wire(PinReferenceScheme::Estonian),
+                success(df2f_body(true)),
+            ),
+            (
+                Path::Credential,
+                verify_pin2_wire(PinReferenceScheme::Estonian),
+                success(vec![]),
+            ),
+            (
+                Path::Plain,
+                mse_wire(
+                    SignScheme::Estonian,
+                    SignatureAlgRef::SHA384_ECDSA,
+                    KeyRef::Sign,
+                ),
+                success(vec![]),
+            ),
+            (
+                Path::Plain,
+                pso_hash_wire(ExternalHashValue::Sha384(digest)),
+                success(vec![]),
+            ),
+            (
+                Path::Plain,
+                pso_cds_empty_wire(ecdsa_le()),
+                success(signature.clone()),
+            ),
+        ]);
+        let sig = sign_transport
+            .unlock_qualified_key(SignScheme::Estonian, pin2())
+            .expect("Estonian changed PIN 2 unlocks qualified key")
+            .sign_prehashed_sha384_ecdsa(digest)
+            .expect("Estonian qualified ECDSA sign succeeds");
+        assert_eq!(sig.as_bytes(), signature.as_slice());
+        assert!(sign_transport.drained());
+    }
 
     let cryptogram =
         RsaCryptogram::from_bytes(vec![DIGEST_FILL; RSA_3072_SIG_BYTES]).expect("modulus-wide");
@@ -1142,11 +1153,18 @@ fn qualified_sign_session_drives_citizen_organizational_cancel_and_refuses_eston
     let returned = cancelled_session.into_transport();
     assert!(returned.drained(), "cancel sends no signing APDUs");
 
-    let estonian_blocked_transport = Scripted::with_paths(vec![(
-        Path::Plain,
-        get_data_pin2_wire(PinReferenceScheme::Estonian),
-        success(df2f_body(false)),
-    )]);
+    let estonian_blocked_transport = Scripted::with_paths(vec![
+        (
+            Path::Plain,
+            probe_pin2_wire(PinReferenceScheme::Estonian),
+            probe_served(ESTONIAN_TRIES_PRISTINE),
+        ),
+        (
+            Path::Plain,
+            get_data_pin2_wire(PinReferenceScheme::Estonian),
+            success(df2f_body(false)),
+        ),
+    ]);
     let (returned, err) =
         QualifiedSignSession::open(estonian_blocked_transport, SignScheme::Estonian, pin2())
             .expect_err("Estonian unchanged initial PIN 2 refuses session open");
@@ -1158,13 +1176,13 @@ fn qualified_sign_session_drives_citizen_organizational_cancel_and_refuses_eston
     let estonian_transport = Scripted::with_paths(vec![
         (
             Path::Plain,
-            get_data_pin2_wire(PinReferenceScheme::Estonian),
-            success(df2f_body(true)),
+            probe_pin2_wire(PinReferenceScheme::Estonian),
+            probe_served(ESTONIAN_TRIES_PRISTINE),
         ),
         (
             Path::Plain,
-            probe_pin2_wire(PinReferenceScheme::Estonian),
-            probe_served(ESTONIAN_TRIES_PRISTINE),
+            get_data_pin2_wire(PinReferenceScheme::Estonian),
+            success(df2f_body(true)),
         ),
         (
             Path::Credential,
@@ -1227,4 +1245,202 @@ fn qualified_sign_session_drives_citizen_organizational_cancel_and_refuses_eston
         QualifiedUnlockError::PinRefused(VerifyOutcome::WrongPin { .. })
     ));
     assert!(returned.drained(), "no signing APDU after refused PIN 2");
+}
+
+#[test]
+fn estonian_rekeyed_qualified_reference_gates_df2f_and_drives_mse_set() {
+    use refineid_apdu::iso7816::{
+        AbsolutePath, DirectOffset15, ReadBinary, ReadBinaryOffset, SelectEfNoFci,
+    };
+    use refineid_pkcs15::{EF_ODF_FID, PKCS15_AID, Pkcs15Ops as _};
+
+    const REKEYED_SIGN_KEY_REF: u8 = 0x07;
+    const READ_CHUNK_LEN: u8 = 0xDF;
+    const CDF_FID: FileId = FileId::from_u16(0x5103);
+    const PRKDF_FID: FileId = FileId::from_u16(0x5101);
+    const AOD_FID: FileId = FileId::from_u16(0x5106);
+
+    const ODF_DER: &[u8] = &[
+        0xA4, 0x08, 0x30, 0x06, 0x04, 0x04, 0x3F, 0x00, 0x51, 0x03, // Certificates -> MF/5103
+        0xA0, 0x08, 0x30, 0x06, 0x04, 0x04, 0x3F, 0x00, 0x51, 0x01, // PrivateKeys -> MF/5101
+        0xA8, 0x08, 0x30, 0x06, 0x04, 0x04, 0x3F, 0x00, 0x51, 0x06, // AuthObjects -> MF/5106
+    ];
+    const CDF_DER: &[u8] = &[
+        0x30, 0x15, 0x30, 0x00, 0x30, 0x03, 0x04, 0x01, 0x22, 0xA1, 0x0C, 0x30, 0x0A, 0x30, 0x08,
+        0x04, 0x06, 0x3F, 0x00, 0xAD, 0xF2, 0x34, 0x21,
+    ];
+    const PRKDF_DER: &[u8] = &[
+        0xA0,
+        0x1A,
+        0x30,
+        0x03,
+        0x04,
+        0x01,
+        0x02,
+        0x30,
+        0x0B,
+        0x04,
+        0x01,
+        0x22,
+        0x03,
+        0x03,
+        0x06,
+        0x00,
+        0x40,
+        0x02,
+        0x01,
+        REKEYED_SIGN_KEY_REF,
+        0xA1,
+        0x06,
+        0x30,
+        0x04,
+        0x30,
+        0x02,
+        0x04,
+        0x00,
+    ];
+    const AOD_DER: &[u8] = &[
+        0x30, 0x20, 0x30, 0x00, 0x30, 0x03, 0x04, 0x01, 0x02, 0xA1, 0x17, 0x30, 0x15, 0x03, 0x03,
+        0x04, 0xCC, 0x10, 0x0A, 0x01, 0x01, 0x02, 0x01, 0x05, 0x02, 0x01, 0x0C, 0x80, 0x02, 0x00,
+        0x82, 0x04, 0x01, 0x00,
+    ];
+
+    let aid = Aid::from_slice(PKCS15_AID).expect("standard PKCS#15 AID");
+    let select_app = SelectByAidNoFci { aid: aid.clone() }
+        .into_apdu()
+        .as_bytes()
+        .to_vec();
+    let select_ef = |fid: FileId| SelectEfNoFci { fid }.into_apdu().as_bytes().to_vec();
+    let select_abs = |fid: FileId| {
+        SelectFile {
+            class: ApduClass::Plain,
+            target: SelectFileTarget::AbsolutePath(AbsolutePath::new(vec![fid]).expect("path")),
+            response_mode: SelectFileResponseMode::None,
+        }
+        .into_apdu()
+        .as_bytes()
+        .to_vec()
+    };
+    let read_zero = ReadBinary {
+        class: ApduClass::Plain,
+        offset: ReadBinaryOffset::Direct(DirectOffset15::try_new(0).expect("zero offset")),
+        le: READ_CHUNK_LEN,
+    }
+    .into_apdu()
+    .as_bytes()
+    .to_vec();
+    let eof_resp = |body: &[u8]| {
+        let [sw1, sw2] = StatusWord::EndOfFile.as_u16().to_be_bytes();
+        ResponseApdu {
+            body: body.to_vec(),
+            sw1,
+            sw2,
+        }
+    };
+
+    let mut discovery_transport = Scripted::new(vec![
+        (select_app.clone(), success(vec![])),
+        (select_ef(EF_ODF_FID), success(vec![])),
+        (read_zero.clone(), eof_resp(ODF_DER)),
+        (select_abs(CDF_FID), success(vec![])),
+        (read_zero.clone(), eof_resp(CDF_DER)),
+        (select_abs(PRKDF_FID), success(vec![])),
+        (read_zero.clone(), eof_resp(PRKDF_DER)),
+        (select_abs(AOD_FID), success(vec![])),
+        (read_zero, eof_resp(AOD_DER)),
+        (select_app, success(vec![])),
+    ]);
+    let profile = discovery_transport
+        .discover_qualified_signature_profile(&aid)
+        .expect("discovers re-keyed qualified profile");
+    assert!(discovery_transport.drained());
+    let qualified_ref = profile.sign_key_reference();
+    assert_eq!(qualified_ref.as_u8(), REKEYED_SIGN_KEY_REF);
+
+    // Unchanged initial PIN 2 is blocked by *_with_reference before VERIFY.
+    let mut blocked = Scripted::with_paths(vec![
+        (
+            Path::Plain,
+            probe_pin2_wire(PinReferenceScheme::Estonian),
+            probe_served(ESTONIAN_TRIES_PRISTINE),
+        ),
+        (
+            Path::Plain,
+            get_data_pin2_wire(PinReferenceScheme::Estonian),
+            success(df2f_body(false)),
+        ),
+    ]);
+    let err = blocked
+        .unlock_qualified_key_with_reference(SignScheme::Estonian, qualified_ref, pin2())
+        .expect_err("unchanged initial PIN 2 refuses unlock_qualified_key_with_reference");
+    assert!(matches!(err, QualifiedUnlockError::Pin2ChangeRequired));
+    assert!(blocked.drained());
+
+    // Changed PIN 2 passes the discovered key reference to MSE:Set in both direct and split-session APIs.
+    let digest = [DIGEST_FILL; SHA384_LEN];
+    let signature = vec![SIG_FILL; ECDSA_P384_SIG_BYTES];
+    let rekeyed_mse = MseSet {
+        alg_ref: SignatureAlgRef::SHA384_ECDSA,
+        key_ref: REKEYED_SIGN_KEY_REF,
+    }
+    .into_apdu()
+    .expect("MSE encodes")
+    .as_bytes()
+    .to_vec();
+
+    let sign_steps = || {
+        vec![
+            (
+                Path::Plain,
+                probe_pin2_wire(PinReferenceScheme::Estonian),
+                probe_served(ESTONIAN_TRIES_FLOOR),
+            ),
+            (
+                Path::Plain,
+                get_data_pin2_wire(PinReferenceScheme::Estonian),
+                success(df2f_body(true)),
+            ),
+            (
+                Path::Credential,
+                verify_pin2_wire(PinReferenceScheme::Estonian),
+                success(vec![]),
+            ),
+            (Path::Plain, rekeyed_mse.clone(), success(vec![])),
+            (
+                Path::Plain,
+                pso_hash_wire(ExternalHashValue::Sha384(digest)),
+                success(vec![]),
+            ),
+            (
+                Path::Plain,
+                pso_cds_empty_wire(ecdsa_le()),
+                success(signature.clone()),
+            ),
+        ]
+    };
+
+    let mut direct = Scripted::with_paths(sign_steps());
+    let direct_sig = direct
+        .unlock_qualified_key_with_reference(SignScheme::Estonian, qualified_ref, pin2())
+        .expect("re-keyed direct unlock succeeds")
+        .sign_prehashed_sha384_ecdsa(digest)
+        .expect("re-keyed direct sign succeeds");
+    assert_eq!(direct_sig.as_bytes(), signature.as_slice());
+    assert!(direct.drained());
+
+    let split_transport = Scripted::with_paths(sign_steps());
+    let session = QualifiedSignSession::open_with_reference(
+        split_transport,
+        SignScheme::Estonian,
+        qualified_ref,
+        pin2(),
+    )
+    .expect("re-keyed split session opens");
+    let (split_transport, split_sig) =
+        session.sign_once(|key| key.sign_prehashed_sha384_ecdsa(digest));
+    assert_eq!(
+        split_sig.expect("re-keyed split sign succeeds").as_bytes(),
+        signature.as_slice()
+    );
+    assert!(split_transport.drained());
 }

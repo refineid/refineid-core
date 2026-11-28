@@ -40,7 +40,8 @@ pub use directory::{
     EmptyApplicationLabel, FileContent, FileEnd, KeyReference, KeyUsageFlags, ObjectClass,
     ObjectDirectory, ObjectDirectoryEntry, ObjectDirectoryLocation, ObjectDirectoryRead,
     ObjectIdentifier, ObjectLabel, PathSlice, Pkcs15Path, PrivateKeyDirectory,
-    PrivateKeyDirectoryEntry, PrivateKeyDirectoryRead, QualifiedSignatureCredentialLookup,
+    PrivateKeyDirectoryEntry, PrivateKeyDirectoryRead, QualifiedKeyReference,
+    QualifiedSignatureCredentialLookup,
 };
 pub use document_number::{DOCUMENT_NUMBER_CHARS, DocumentNumber, DocumentNumberError};
 pub use fs::{

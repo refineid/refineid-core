@@ -2671,6 +2671,7 @@ where
             AuthError::Transport(_)
             | AuthError::Outcome(_)
             | AuthError::Command(_)
+            | AuthError::Pin2ChangeRequired
             | AuthError::UnsupportedSlot { .. },
         ) => {
             clear_positive(pin_cache);
@@ -2953,6 +2954,7 @@ fn run_card_change_pin1_with_profile<T: CardTransport>(
         AuthError::Transport(_)
         | AuthError::Outcome(_)
         | AuthError::Command(_)
+        | AuthError::Pin2ChangeRequired
         | AuthError::UnsupportedSlot { .. } => CKR_DEVICE_ERROR,
     })?;
     match outcome {
@@ -5044,12 +5046,6 @@ mod tests {
             ),
         ];
         let probe_transport_failed = probe_only_steps(Err("probe fault".to_owned()));
-        let floor_two_left = probe_only_steps(Ok(apdu_response(
-            &[],
-            StatusWord::PinIncorrect {
-                retries: retries(RETRIES_BELOW_FLOOR),
-            },
-        )));
         let floor_one_left = probe_only_steps(Ok(apdu_response(
             &[],
             StatusWord::PinIncorrect {
@@ -5093,7 +5089,6 @@ mod tests {
             (select_failed, None, CKR_DEVICE_ERROR, 0),
             (token_info_failed, None, CKR_DEVICE_ERROR, 0),
             (probe_transport_failed, None, CKR_DEVICE_ERROR, 0),
-            (floor_two_left, None, CKR_PIN_LOCKED, 0),
             (floor_one_left, None, CKR_PIN_LOCKED, 0),
             (floor_unreadable, None, CKR_DEVICE_ERROR, 0),
             (verify_probe_floor_failed, None, CKR_PIN_LOCKED, 0),

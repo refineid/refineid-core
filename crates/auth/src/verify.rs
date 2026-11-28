@@ -434,6 +434,11 @@ pub enum AuthError<E> {
     /// operations that take the card's
     /// [`crate::pin_lengths::CardPinLengths`].
     PinLength(PinLengthRefusal),
+    /// The card requires changing its initial Signature PIN 2 before
+    /// qualified signing is allowed (EstEID 2025, `GED24035_015`
+    /// sections 3.1, 7.8.1 and 8.3.4); refused before any VERIFY
+    /// carrying PIN 2 was sent.
+    Pin2ChangeRequired,
     /// The requested PIN slot or operation is not supported in this
     /// application context under `scheme`; refused before any command
     /// that carries a credential was sent.
@@ -453,6 +458,9 @@ impl<E: core::fmt::Display> core::fmt::Display for AuthError<E> {
             Self::Command(e) => write!(f, "auth command: {e}"),
             Self::RetryFloor(refusal) => write!(f, "{refusal}"),
             Self::PinLength(refusal) => write!(f, "{refusal}"),
+            Self::Pin2ChangeRequired => {
+                f.write_str("Signature PIN 2 must be changed before signing documents")
+            }
             Self::UnsupportedSlot { scheme, slot } => {
                 write!(f, "auth: {slot:?} is not supported under {scheme:?}")
             }
@@ -650,19 +658,6 @@ pub(crate) fn verify_under_floor<T: CardTransport + ?Sized>(
     verify_digits(transport, scheme, slot, digits)
 }
 
-/// Fail closed when `slot` cannot be addressed in the current
-/// application context under `scheme`.
-///
-/// All three schemes (`Citizen`, `Organizational`, and `Estonian` eID
-/// 2025 under the shared PKCS#15 application, `GED24035_015` section
-/// 8.3) support both PIN 1 and PIN 2.
-pub(crate) const fn ensure_slot_supported<E>(
-    _scheme: PinReferenceScheme,
-    _slot: PinSlot,
-) -> Result<(), AuthError<E>> {
-    Ok(())
-}
-
 /// Assemble and send the VERIFY credential command for `slot` under
 /// `scheme`, classifying the card's status word. The caller has applied
 /// the retry floor to the slot's counter: [`verify_under_floor`] to the
@@ -671,16 +666,14 @@ pub(crate) const fn ensure_slot_supported<E>(
 ///
 /// # Errors
 ///
-/// [`AuthError::UnsupportedSlot`] when `slot` is not supported under
-/// `scheme`. [`AuthError`] on a command-assembly failure, a transport
-/// failure, or a transport state transition.
+/// [`AuthError`] on a command-assembly failure, a transport failure, or
+/// a transport state transition.
 pub(crate) fn verify_digits<T: CardTransport + ?Sized>(
     transport: &mut T,
     scheme: PinReferenceScheme,
     slot: PinSlot,
     digits: &[u8],
 ) -> Result<VerifyOutcome, AuthError<T::Error>> {
-    ensure_slot_supported(scheme, slot)?;
     let header = CommandHeader {
         class: ApduClass::Plain,
         instruction: VERIFY_INS,
@@ -786,12 +779,18 @@ pub trait PinOps: CardTransport {
     /// VERIFY carrying the PIN.
     ///
     /// On [`PinReferenceScheme::Estonian`] (EstEID 2025, `GED24035_015`
-    /// section 8.3), PIN 2 lives in the shared PKCS#15 eID application
-    /// and is verified on a zero-padded block of stored length.
+    /// sections 3.1, 7.8.1 and 8.3.4), PIN 2 lives in the shared PKCS#15
+    /// eID application and is verified on a zero-padded block of stored
+    /// length. When PIN 2 is neither blocked nor exhausted and passes the
+    /// retry floor, the primitive reads PIN 2's counter-safe `DF 2F`
+    /// changed flag before sending VERIFY and returns
+    /// [`AuthError::Pin2ChangeRequired`] without spending a retry if the
+    /// initial PIN 2 has not yet been changed.
     ///
     /// # Errors
     ///
-    /// As [`PinOps::verify_pin1_with_scheme`].
+    /// [`AuthError::Pin2ChangeRequired`] on EstEID 2025 when initial
+    /// PIN 2 is unchanged; otherwise as [`PinOps::verify_pin1_with_scheme`].
     fn verify_pin2_with_scheme(
         &mut self,
         scheme: PinReferenceScheme,
@@ -800,9 +799,18 @@ pub trait PinOps: CardTransport {
     where
         Self: Sized,
     {
-        ensure_slot_supported(scheme, PinSlot::Pin2)?;
         let status = self.pin_status_with_scheme(scheme, PinSlot::Pin2)?;
-        verify_under_floor(self, scheme, PinSlot::Pin2, status, pin.digits())
+        check_last_tries_with_scheme(FlooredCredential::Pin2, status, scheme)
+            .map_err(AuthError::RetryFloor)?;
+        let pin_is_blocked = matches!(status, PinStatus::Locked)
+            || matches!(status, PinStatus::Remaining(retries) if retries.is_exhausted());
+        if scheme == PinReferenceScheme::Estonian
+            && !pin_is_blocked
+            && self.pin2_requires_change_before_signing_with_scheme(scheme)?
+        {
+            return Err(AuthError::Pin2ChangeRequired);
+        }
+        verify_digits(self, scheme, PinSlot::Pin2, pin.digits())
     }
 
     /// Whether the card enforces changing its initial PIN 2 before
@@ -1089,6 +1097,7 @@ mod tests {
     /// `probe_sw` and every credential exchange with `credential_sw`.
     struct WireRecorder {
         plain: Option<Vec<u8>>,
+        plain_all: Vec<Vec<u8>>,
         credential: Option<Vec<u8>>,
         probe_sw: StatusWord,
         credential_sw: StatusWord,
@@ -1105,6 +1114,7 @@ mod tests {
         fn answering(probe_sw: StatusWord, credential_sw: StatusWord) -> Self {
             Self {
                 plain: None,
+                plain_all: Vec::new(),
                 credential: None,
                 probe_sw,
                 credential_sw,
@@ -1116,7 +1126,9 @@ mod tests {
         type Error = String;
 
         fn transmit(&mut self, command: &CommandApdu) -> Result<TransportOutcome, Self::Error> {
-            self.plain = Some(command.as_bytes().to_vec());
+            let wire = command.as_bytes().to_vec();
+            self.plain_all.push(wire.clone());
+            self.plain = Some(wire);
             Ok(TransportOutcome::Response(scripted_response(self.probe_sw)))
         }
 
@@ -1631,8 +1643,12 @@ mod tests {
         assert_eq!(outcome, VerifyOutcome::Ok);
         let pin2_ref = PinReferenceScheme::Estonian.reference(PinSlot::Pin2);
         assert_eq!(
-            transport.plain.as_deref(),
+            transport.plain_all.first().map(Vec::as_slice),
             Some(verify_header(pin2_ref).as_slice())
+        );
+        assert_eq!(
+            transport.plain_all.get(1).and_then(|wire| wire.get(1)),
+            Some(&crate::activation::GET_DATA_INS)
         );
         let mut expected = verify_header(pin2_ref).to_vec();
         expected.push(PIN_STORED_LENGTH as u8);

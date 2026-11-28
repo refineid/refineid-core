@@ -2461,7 +2461,7 @@ pub(super) fn remote_token_objects(
 /// Verify a `C_Login` PIN on the live card and hold it once the card
 /// accepts it ([`PinSafetyCache::store_pin1`]): an accepted VERIFY
 /// restores PIN1's retry counter to its five-try limit (FINEID S1 v4.2
-/// section 3.5), while the retry floor refuses two or one tries left or
+/// section 3.5), while the retry floor refuses one try left or
 /// an unreadable counter before any VERIFY is sent.
 ///
 /// The held value is bound to the card's token serial and the reader's
@@ -2759,9 +2759,9 @@ fn settle_directory_login(
 /// read for the cache's sake, so a refusal is reported before the held
 /// or typed value is consulted. The VERIFY applies the same rule itself
 /// on its own probe; this is the same answer earlier, not a second
-/// rule. A PIN 1 at two or one tries left answers as locked, since this
-/// module never spends those attempts (on a three-try Estonian eID card,
-/// a single wrong entry drops the counter to two and hits this floor on
+/// rule. A PIN 1 at one try left answers as locked, since this
+/// module never spends the last attempt (on a three-try Estonian eID
+/// card, two wrong entries drop the counter to one and hit this floor on
 /// the next login, intentionally surfacing `CKR_PIN_LOCKED` rather than
 /// risking lockout); a counter above the profile's limit or unreadable is
 /// a device error. At no tries left or blocked the VERIFY goes to the
@@ -2774,7 +2774,7 @@ const fn pin1_verify_guard(status: PinStatus, scheme: PinReferenceScheme) -> Res
 }
 
 /// The return value a retry-floor refusal answers: `CKR_PIN_LOCKED` at
-/// two or one tries left, `CKR_DEVICE_ERROR` at a counter the card did
+/// one try left, `CKR_DEVICE_ERROR` at a counter the card did
 /// not report.
 const fn retry_floor_rv(refusal: RetryFloorRefusal) -> CkRv {
     match refusal {
@@ -2861,7 +2861,7 @@ fn clear_positive(pin_cache: &Arc<Mutex<PinSafetyCache>>) {
 /// # Errors
 /// [`CKR_PIN_INCORRECT`] when the current PIN is wrong,
 /// [`CKR_PIN_LOCKED`] when the slot is blocked or the retry floor
-/// refuses the change at two or one tries left,
+/// refuses the change at one try left,
 /// [`CKR_PIN_LEN_RANGE`] when the new PIN's length is outside the
 /// card's accepted bounds,
 /// [`CKR_DEVICE_ERROR`] on any card / transport failure, an unreadable
@@ -3051,7 +3051,7 @@ mod tests {
     use crate::ck::{CKR_DEVICE_ERROR, CKR_PIN_LOCKED};
 
     #[test]
-    fn pin1_verify_guard_refuses_the_last_two_tries_and_an_unreadable_counter() {
+    fn pin1_verify_guard_refuses_the_last_try_and_an_unreadable_counter() {
         let retries = |count| {
             PinRetries::from_nibble(count).expect("test retry count fits the status-word nibble")
         };
@@ -3071,7 +3071,15 @@ mod tests {
             Ok(())
         );
         assert_eq!(
+            pin1_verify_guard(PinStatus::Remaining(retries(2)), citizen),
+            Ok(())
+        );
+        assert_eq!(
             pin1_verify_guard(PinStatus::Remaining(retries(3)), estonian),
+            Ok(())
+        );
+        assert_eq!(
+            pin1_verify_guard(PinStatus::Remaining(retries(2)), estonian),
             Ok(())
         );
         assert_eq!(
@@ -3079,15 +3087,11 @@ mod tests {
             Err(CKR_DEVICE_ERROR)
         );
         assert_eq!(
-            pin1_verify_guard(PinStatus::Remaining(retries(2)), citizen),
-            Err(CKR_PIN_LOCKED)
-        );
-        assert_eq!(
-            pin1_verify_guard(PinStatus::Remaining(retries(2)), estonian),
-            Err(CKR_PIN_LOCKED)
-        );
-        assert_eq!(
             pin1_verify_guard(PinStatus::Remaining(retries(1)), citizen),
+            Err(CKR_PIN_LOCKED)
+        );
+        assert_eq!(
+            pin1_verify_guard(PinStatus::Remaining(retries(1)), estonian),
             Err(CKR_PIN_LOCKED)
         );
         // At no tries left or blocked the VERIFY goes to the card, which
@@ -4599,10 +4603,10 @@ mod tests {
     const RETRIES_PRISTINE: u8 = 5;
     /// Retry count after one refused presentation.
     const RETRIES_ONE_SPENT: u8 = 4;
-    /// Lowest retry count at which an attempt is served with tries to spare.
-    const RETRIES_FLOOR: u8 = 3;
-    /// Highest retry count refused by the retry floor.
-    const RETRIES_BELOW_FLOOR: u8 = 2;
+    /// Lowest retry count at which an attempt is served with the last try spared.
+    const RETRIES_FLOOR: u8 = 2;
+    /// Highest retry count refused by the retry floor (the last try).
+    const RETRIES_BELOW_FLOOR: u8 = 1;
     /// Lowest non-zero retry count refused by the retry floor.
     const RETRIES_LOCKDOWN_IMMINENT: u8 = 1;
     const DECIMAL_DIGIT_RADIX: u8 = 10;

@@ -40,6 +40,7 @@ use crate::identity::{CommonName, TokenSerial, render_token_serial};
 use crate::pin::{PinBytes, PinEntryError, PinPolicyReason, PinRole, PinSource};
 use crate::signed_name::BestSignatureTime;
 use refineid_apdu::CardTransport;
+use refineid_apdu::iso7816::AbsolutePath;
 use refineid_apdu::status_word::StatusWord;
 use refineid_auth::credentials::{PIN_MAX_LENGTH, PIN_MIN_LENGTH};
 use refineid_auth::{
@@ -56,7 +57,10 @@ use refineid_pcsc::{
     ReaderBackendOps as _, ReaderFilter, ReaderPickError,
 };
 use refineid_pkcs15::Pkcs15Ops as _;
-use refineid_pkcs15::{CertSlot, Pkcs15Error, UnvalidatedCertificate};
+use refineid_pkcs15::{
+    CertSlot, DF_ESTONIAN_AWP_FID, DF_ESTONIAN_QSCD_FID, EF_ESTONIAN_2025_AUTH_CERT_FID,
+    EF_ESTONIAN_2025_SIGN_CERT_FID, KeyReference, PKCS15_AID, Pkcs15Error, UnvalidatedCertificate,
+};
 use refineid_sign::{
     KeyRef, QualifiedUnlockError, SignError, SignOps as _, SignScheme, SigningKey,
 };
@@ -167,6 +171,10 @@ pub enum ReaderSignError {
     /// shared retry floor, blocked, or unreadable, so no VERIFY was
     /// sent. The counter is unaffected.
     RetryFloor(RetryFloorRefusal),
+    /// The card enforces changing its initial PIN 2 before qualified
+    /// signing is allowed (EstEID 2025, `GED24035_015` sections 3.1,
+    /// 7.8.1 and 8.3.4: `DF 2F == 00`). No VERIFY PIN 2 was sent.
+    Pin2ChangeRequired,
     /// The PIN entry produced no PIN; nothing was sent to the card.
     PinEntry(PinEntryError),
     /// Local-policy rejection (PIN length / non-digit) before any
@@ -241,6 +249,7 @@ impl fmt::Display for ReaderSignError {
             Self::Pcsc(e) => write!(f, "PC/SC: {e}"),
             Self::DisplayedCard(detail) => write!(f, "displayed card: {detail}"),
             Self::RetryFloor(refusal) => write!(f, "{refusal}"),
+            Self::Pin2ChangeRequired => f.write_str("Change PIN 2 so you can sign documents."),
             Self::PinEntry(error) => write!(f, "{error}"),
             Self::PinRejected {
                 slot,
@@ -394,6 +403,7 @@ fn unlock_slot_key<'t, T: CardTransport>(
     transport: &'t mut T,
     slot: SignSlot,
     scheme: PinReferenceScheme,
+    key_reference: Option<KeyReference>,
     pin: &PinBytes,
 ) -> Result<SigningKey<'t, T>, ReaderSignError> {
     let secret = || UnvalidatedSecret::from_owned_bytes(pin.as_bytes().to_vec());
@@ -408,7 +418,12 @@ fn unlock_slot_key<'t, T: CardTransport>(
                     other => ReaderSignError::Transport(format!("{other}")),
                 })?;
             match outcome {
-                VerifyOutcome::Ok => Ok(transport.authentication_key(sign_scheme)),
+                VerifyOutcome::Ok => Ok(match key_reference {
+                    Some(reference) => {
+                        transport.authentication_key_with_reference(sign_scheme, reference)
+                    }
+                    None => transport.authentication_key(sign_scheme),
+                }),
                 rejected @ (VerifyOutcome::WrongPin { .. }
                 | VerifyOutcome::Locked
                 | VerifyOutcome::Other(_)) => Err(ReaderSignError::PinRejected {
@@ -419,9 +434,13 @@ fn unlock_slot_key<'t, T: CardTransport>(
         }
         PinRole::Pin2 => {
             let pin2 = Pin2::reconstruct(secret()).map_err(|e| pin_policy_refusal(slot, e))?;
-            transport
-                .unlock_qualified_key(sign_scheme, pin2)
-                .map_err(|e| unlock_err_to_kind(slot, e))
+            let result = match key_reference {
+                Some(reference) => {
+                    transport.unlock_qualified_key_with_reference(sign_scheme, reference, pin2)
+                }
+                None => transport.unlock_qualified_key(sign_scheme, pin2),
+            };
+            result.map_err(|e| unlock_err_to_kind(slot, e))
         }
     }
 }
@@ -437,6 +456,7 @@ fn unlock_err_to_kind<TE: fmt::Display>(
         QualifiedUnlockError::UnsupportedScheme(scheme) => ReaderSignError::Transport(format!(
             "qualified signing is not supported under {scheme:?}"
         )),
+        QualifiedUnlockError::Pin2ChangeRequired => ReaderSignError::Pin2ChangeRequired,
         QualifiedUnlockError::PinRefused(outcome) => ReaderSignError::PinRejected { slot, outcome },
         QualifiedUnlockError::Directory(Pkcs15Error::Status(sw)) => ReaderSignError::SignSw {
             stage: "SELECT MF and DF.ESIGN",
@@ -824,10 +844,103 @@ struct Prepared {
     plan: Option<DocumentPlan>,
     /// The PIN reference numbering the card declared.
     scheme: PinReferenceScheme,
+    /// Optional EF.PrKDF-discovered key reference for cards whose key
+    /// references are discovered via PKCS#15 directories (e.g. EstEID 2025).
+    key_reference: Option<KeyReference>,
     /// The serial EF.TokenInfo named before the prompt.
     serial: Option<TokenSerial>,
     /// The retry status read before the prompt.
     pin_status: refineid_auth::verify::PinStatus,
+}
+
+/// Read the slot certificate using the FINEID direct paths first, falling
+/// back to ISO/IEC 7816-15 EF.ODF discovery and EstEID 2025 default paths
+/// (`ADF1/3411` or `ADF2/3421`) when FINEID EFs are absent. Leaves the
+/// PKCS#15 application selected on success.
+fn read_slot_certificate<T: CardTransport>(
+    transport: &mut T,
+    slot: SignSlot,
+) -> Result<(UnvalidatedCertificate, Option<KeyReference>), ReaderSignError> {
+    let direct = transport.read_certificate(slot.cert_slot()).or_else(|_| {
+        let alt = match slot.cert_slot() {
+            CertSlot::Authentication => CertSlot::AuthenticationAlt,
+            CertSlot::Signature => CertSlot::SignatureAlt,
+            other => other,
+        };
+        transport.read_certificate(alt)
+    });
+    if let Ok(cert_der) = direct {
+        return Ok((cert_der, None));
+    }
+    let primary_err = direct.expect_err("checked Ok above");
+
+    // Fallback for EstEID 2025 (and other PKCS#15 cards publishing
+    // EF.ODF -> EF.CDF / EF.PrKDF under PKCS15_AID).
+    let Ok(aid) = refineid_apdu::Aid::from_slice(PKCS15_AID) else {
+        return Err(ReaderSignError::CertUnavailable {
+            slot,
+            detail: format!("read: {primary_err}"),
+        });
+    };
+    let discovered = match slot {
+        SignSlot::Authentication => transport
+            .discover_authentication_profile(&aid)
+            .ok()
+            .and_then(|profile| {
+                let cert = transport
+                    .read_certificate_at(profile.auth_cert_path())
+                    .ok()?;
+                Some((
+                    UnvalidatedCertificate::new(cert.into_bytes()),
+                    Some(profile.auth_key_reference()),
+                ))
+            }),
+        SignSlot::Qualified => transport
+            .discover_qualified_signature_profile(&aid)
+            .ok()
+            .and_then(|profile| {
+                let cert = transport
+                    .read_certificate_at(profile.sign_cert_path())
+                    .ok()?;
+                Some((
+                    UnvalidatedCertificate::new(cert.into_bytes()),
+                    Some(profile.sign_key_reference()),
+                ))
+            }),
+    };
+    if let Some((cert_der, key_ref)) = discovered {
+        transport
+            .select_pkcs15_application()
+            .map_err(|e| ReaderSignError::CertUnavailable {
+                slot,
+                detail: format!("reselect pkcs15 app: {e}"),
+            })?;
+        return Ok((cert_der, key_ref));
+    }
+
+    // Last resort: documented EstEID 2025 default paths (GED24035_015 s8.5).
+    let default_path = match slot {
+        SignSlot::Authentication => vec![DF_ESTONIAN_AWP_FID, EF_ESTONIAN_2025_AUTH_CERT_FID],
+        SignSlot::Qualified => vec![DF_ESTONIAN_QSCD_FID, EF_ESTONIAN_2025_SIGN_CERT_FID],
+    };
+    if let Ok(path) = AbsolutePath::new(default_path)
+        && transport.select_pkcs15_application().is_ok()
+        && transport.select_path(&path).is_ok()
+        && let Ok(bytes) = transport.read_binary_der_object(slot.cert_slot().label())
+    {
+        transport
+            .select_pkcs15_application()
+            .map_err(|e| ReaderSignError::CertUnavailable {
+                slot,
+                detail: format!("reselect pkcs15 app: {e}"),
+            })?;
+        return Ok((UnvalidatedCertificate::new(bytes), None));
+    }
+
+    Err(ReaderSignError::CertUnavailable {
+        slot,
+        detail: format!("read: {primary_err}"),
+    })
 }
 
 /// What VERIFY and the sign chain produced.
@@ -855,20 +968,7 @@ fn prepare_on_card<T: CardTransport>(
 ) -> Result<Prepared, ReaderSignError> {
     let slot = options.slot;
     ensure_displayed_card(transport, options.expected_serial.as_ref())?;
-    let cert_der = transport
-        .read_certificate(slot.cert_slot())
-        .or_else(|_| {
-            let alt = match slot.cert_slot() {
-                CertSlot::Authentication => CertSlot::AuthenticationAlt,
-                CertSlot::Signature => CertSlot::SignatureAlt,
-                other => other,
-            };
-            transport.read_certificate(alt)
-        })
-        .map_err(|e| ReaderSignError::CertUnavailable {
-            slot,
-            detail: format!("read: {e}"),
-        })?;
+    let (cert_der, key_reference) = read_slot_certificate(transport, slot)?;
     let cert_owned =
         OwnedCert::from_der(cert_der.as_bytes()).map_err(|e| ReaderSignError::CertUnavailable {
             slot,
@@ -899,10 +999,13 @@ fn prepare_on_card<T: CardTransport>(
     // S1 v4.2, organizational S4-2 v4.0, or Estonian eID), resolved by
     // counter-safe probes before any PIN is asked for.
     let scheme = resolve_pin_reference_scheme(transport)?;
-    if scheme == PinReferenceScheme::Estonian && slot.pin_role() == PinRole::Pin2 {
-        return Err(ReaderSignError::Transport(
-            "qualified signing is not supported under Estonian numbering".to_owned(),
-        ));
+    if slot.pin_role() == PinRole::Pin2 {
+        let requires_change = transport
+            .pin2_requires_change_before_signing_with_scheme(scheme)
+            .map_err(|e| ReaderSignError::Transport(format!("{e}")))?;
+        if requires_change {
+            return Err(ReaderSignError::Pin2ChangeRequired);
+        }
     }
     let pin_status = check_slot_retry_floor(transport, slot, scheme)?;
     let serial = live_token_serial(transport)?;
@@ -911,6 +1014,7 @@ fn prepare_on_card<T: CardTransport>(
         cert_owned,
         plan,
         scheme,
+        key_reference,
         serial,
         pin_status,
     })
@@ -974,7 +1078,13 @@ fn commit_on_card<T: CardTransport>(
     let pin_status_before_verify = transport
         .pin_status_with_scheme(prepared.scheme, slot.pin_slot())
         .map_err(|e| ReaderSignError::Transport(format!("{e}")))?;
-    let key = unlock_slot_key(transport, slot, prepared.scheme, pin)?;
+    let key = unlock_slot_key(
+        transport,
+        slot,
+        prepared.scheme,
+        prepared.key_reference,
+        pin,
+    )?;
     let (signature_bytes, local_verify) = sign_dispatch_by_alg(
         key,
         slot,
@@ -1418,10 +1528,18 @@ mod tests {
         /// the qualified key: the VERIFY's own counter probe, VERIFY
         /// PIN 2, MSE:Set, PSO:HASH and the empty PSO:CDS.
         const CITIZEN_TAIL: [u8; 5] = [VERIFY_INS, VERIFY_INS, MSE_INS, PSO_INS, PSO_INS];
-        /// A PIN counter the retry floor serves (five, four or three).
+        /// A PIN counter the retry floor serves (five, four, three or two).
         const TRIES_SERVED: u8 = 5;
-        /// A PIN counter the retry floor refuses (two or one).
-        const TRIES_BELOW_FLOOR: u8 = 2;
+        /// A PIN counter the retry floor refuses (one).
+        const TRIES_BELOW_FLOOR: u8 = 1;
+        /// GET DATA instruction byte (ISO 7816-4 / GED24035_015 section 8.3.4).
+        const GET_DATA_INS: u8 = 0xCB;
+        /// PIN changed tag bytes (`DF 2F`, GED24035_015 section 8.3.4).
+        const PIN_CHANGED_TAG_HIGH: u8 = 0xDF;
+        const PIN_CHANGED_TAG_LOW: u8 = 0x2F;
+        const PIN_CHANGED_LEN: u8 = 1;
+        const PIN_CHANGED_FLAG_UNCHANGED: u8 = 0x00;
+        const PIN_CHANGED_FLAG_CHANGED: u8 = 0x01;
         /// The counter a refused VERIFY reports.
         const TRIES_AFTER_WRONG: u8 = 4;
         /// The certificate the card holds in every slot: a public root
@@ -1460,6 +1578,7 @@ mod tests {
             tries2: Cell<PinRetries>,
             verify_answer: StatusWord,
             numbering: PinReferenceScheme,
+            pin2_changed: Cell<bool>,
             in_esign: Cell<bool>,
             qualified_key: Cell<bool>,
             swapped: Cell<bool>,
@@ -1515,6 +1634,7 @@ mod tests {
                     tries2: Cell::new(r),
                     verify_answer,
                     numbering: PinReferenceScheme::Citizen,
+                    pin2_changed: Cell::new(true),
                     in_esign: Cell::new(false),
                     qualified_key: Cell::new(false),
                     swapped: Cell::new(false),
@@ -1540,16 +1660,18 @@ mod tests {
             }
 
             /// A served card under the Estonian eID numbering with a
-            /// P-384 signing key matching [`MESSAGE`]: it answers only
-            /// the Estonian PIN1 reference under the eID application
-            /// with the three-try counter.
-            fn estonian_signing() -> Result<Self, &'static str> {
+            /// P-384 signing key matching [`MESSAGE`]: answers both
+            /// Estonian PIN 1 and PIN 2 references under the eID
+            /// application with the three-try counter and `pin2_changed`
+            /// governing `DF 2F`.
+            fn estonian_signing(pin2_changed: bool) -> Result<Self, &'static str> {
                 let Self(state) = Self::signing()?;
                 let state = Rc::try_unwrap(state).map_err(|_| "fresh state")?;
                 let tries = PinRetries::from_nibble(PinReferenceScheme::Estonian.pin_retry_limit())
                     .ok_or("not a counter value")?;
                 Ok(Self(Rc::new(State {
                     numbering: PinReferenceScheme::Estonian,
+                    pin2_changed: Cell::new(pin2_changed),
                     tries1: Cell::new(tries),
                     tries2: Cell::new(tries),
                     ..state
@@ -1587,19 +1709,36 @@ mod tests {
                     .instructions
                     .borrow_mut()
                     .push(ins.unwrap_or_default());
+                if ins == Some(GET_DATA_INS) && self.0.numbering == PinReferenceScheme::Estonian {
+                    let flag = if self.0.pin2_changed.get() {
+                        PIN_CHANGED_FLAG_CHANGED
+                    } else {
+                        PIN_CHANGED_FLAG_UNCHANGED
+                    };
+                    return respond(
+                        vec![
+                            PIN_CHANGED_TAG_HIGH,
+                            PIN_CHANGED_TAG_LOW,
+                            PIN_CHANGED_LEN,
+                            flag,
+                        ],
+                        StatusWord::Success,
+                    );
+                }
                 if ins == Some(VERIFY_INS) {
                     if self.0.numbering == PinReferenceScheme::Estonian {
-                        if apdu.get(P2_INDEX)
-                            != Some(&PinReferenceScheme::Estonian.reference(PinSlot::Pin1))
+                        let p2 = apdu.get(P2_INDEX).copied();
+                        let retries = if p2
+                            == Some(PinReferenceScheme::Estonian.reference(PinSlot::Pin1))
                         {
+                            self.0.tries1.get()
+                        } else if p2 == Some(PinReferenceScheme::Estonian.reference(PinSlot::Pin2))
+                        {
+                            self.0.tries2.get()
+                        } else {
                             return respond(Vec::new(), StatusWord::ReferenceDataNotFound);
-                        }
-                        return respond(
-                            Vec::new(),
-                            StatusWord::PinIncorrect {
-                                retries: self.0.tries1.get(),
-                            },
-                        );
+                        };
+                        return respond(Vec::new(), StatusWord::PinIncorrect { retries });
                     }
                     let is_pin2 = apdu.get(P2_INDEX)
                         == Some(&PinReferenceScheme::Citizen.reference(PinSlot::Pin2))
@@ -2196,14 +2335,15 @@ mod tests {
         }
 
         #[test]
-        fn estonian_qualified_signing_fails_closed_before_prompting() -> TestResult {
-            let card = SyntheticCard::estonian_signing()?;
+        fn estonian_unchanged_initial_pin2_refuses_qualified_signing_before_prompting() -> TestResult
+        {
+            let card = SyntheticCard::estonian_signing(false)?;
             let backend = SyntheticBackend::one_reader(true, card.clone());
             let (mut pin, asked) = counting(|| {});
             let result = sign_on(&backend, SignSlot::Qualified, &mut pin)?;
             check_true(
-                matches!(result, Err(ReaderSignError::Transport(_))),
-                "Estonian qualified signing refused before prompt",
+                matches!(result, Err(ReaderSignError::Pin2ChangeRequired)),
+                "Estonian unchanged initial PIN 2 refused before prompt",
             )?;
             check(&asked.get(), &0, "never prompts for PIN2")?;
             check(
@@ -2214,9 +2354,24 @@ mod tests {
         }
 
         #[test]
+        fn estonian_changed_pin2_signs_qualified_documents() -> TestResult {
+            let card = SyntheticCard::estonian_signing(true)?;
+            let backend = SyntheticBackend::one_reader(true, card.clone());
+            let (mut pin, asked) = counting(|| {});
+            let report = sign_on(&backend, SignSlot::Qualified, &mut pin)??;
+            check_true(report.local_verify.is_ok(), "signed and verified")?;
+            check(&asked.get(), &1, "prompted once for PIN2")?;
+            check(
+                &card.credential_references(),
+                &vec![PinReferenceScheme::Estonian.reference(PinSlot::Pin2)],
+                "VERIFY targeted Estonian PIN2",
+            )
+        }
+
+        #[test]
         fn estonian_authentication_signing_succeeds_and_retains_pin1_at_three_try_limit()
         -> TestResult {
-            let card = SyntheticCard::estonian_signing()?;
+            let card = SyntheticCard::estonian_signing(false)?;
             let backend = SyntheticBackend::one_reader(true, card.clone());
             let (mut pin, asked) = counting(|| {});
             for _document in 0..2 {
@@ -2322,7 +2477,7 @@ mod tests {
                 let mut card = Recorder::default();
                 let pin = PinBytes::new(LONGEST_PIN.to_vec())?;
                 let scheme = PinReferenceScheme::Organizational;
-                drop(unlock_slot_key(&mut card, slot, scheme, &pin)?);
+                drop(unlock_slot_key(&mut card, slot, scheme, None, &pin)?);
                 let [wire] = card.commands.as_slice() else {
                     return Err("one VERIFY".into());
                 };
@@ -2370,6 +2525,7 @@ mod tests {
                     &mut card,
                     SignSlot::Qualified,
                     scheme,
+                    None,
                     &short,
                 )?);
                 let [wire] = card.commands.as_slice() else {

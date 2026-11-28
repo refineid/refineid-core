@@ -54,9 +54,9 @@ const INS_INDEX: usize = 1;
 /// Length of a header-only command: the counter-safe probe's shape.
 const HEADER_LENGTH: usize = 4;
 /// The lowest count the retry floor serves.
-const TRIES_AT_FLOOR: u8 = 3;
-/// The highest count the retry floor refuses.
-const TRIES_BELOW_FLOOR: u8 = 2;
+const TRIES_AT_FLOOR: u8 = 2;
+/// The highest count the retry floor refuses (the last try).
+const TRIES_BELOW_FLOOR: u8 = 1;
 
 fn pin2() -> Pin2 {
     Pin2::reconstruct(UnvalidatedSecret::from_owned_bytes(SYNTHETIC_PIN2.to_vec()))

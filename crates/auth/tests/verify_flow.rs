@@ -33,9 +33,10 @@ use refineid_auth::{
 const PIN1_DIGITS: &[u8] = b"1234";
 /// A valid PIN2 fixture.
 const PIN2_DIGITS: &[u8] = b"654321";
-/// A retry count returned on a wrong PIN; also the highest count the
-/// retry floor refuses.
+/// A retry count returned on a wrong PIN (served by the floor).
 const TWO_RETRIES: u8 = 2;
+/// The retry count the retry floor refuses (the last try).
+const ONE_RETRY: u8 = 1;
 /// A retry count the retry floor serves.
 const FIVE_RETRIES: u8 = 5;
 /// Wire index of the P2 reference byte.
@@ -141,8 +142,8 @@ fn verify_pin1_ships_the_padded_block_as_a_credential_command() {
 }
 
 #[test]
-fn a_verify_at_two_tries_left_is_refused_with_no_digits_on_the_wire() {
-    let mut transport = Recorder::answering(counter(TWO_RETRIES), StatusWord::Success);
+fn a_verify_at_one_try_left_is_refused_with_no_digits_on_the_wire() {
+    let mut transport = Recorder::answering(counter(ONE_RETRY), StatusWord::Success);
     let refused = transport.verify_pin1_with_scheme(PinReferenceScheme::Citizen, pin1());
     assert!(matches!(
         refused,

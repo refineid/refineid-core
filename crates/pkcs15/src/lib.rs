@@ -36,17 +36,20 @@ pub use directory::{
     AuthenticationCredentialLookup, CertificateDirectory, CertificateDirectoryEntry,
     CertificateDirectoryRead, CertificateRead, Credential, CredentialDirectory,
     CredentialPairingError, DerCertificate, DirectoryLookup, DiscoveredAuthenticationProfile,
-    EF_DIR_FID, EF_ODF_FID, ESTONIAN_EID_APPLICATION_LABEL, EmptyApplicationLabel, FileContent,
-    FileEnd, KeyReference, KeyUsageFlags, ObjectClass, ObjectDirectory, ObjectDirectoryEntry,
-    ObjectDirectoryLocation, ObjectDirectoryRead, ObjectIdentifier, ObjectLabel, PathSlice,
-    Pkcs15Path, PrivateKeyDirectory, PrivateKeyDirectoryEntry, PrivateKeyDirectoryRead,
+    DiscoveredQualifiedSignatureProfile, EF_DIR_FID, EF_ODF_FID, ESTONIAN_EID_APPLICATION_LABEL,
+    EmptyApplicationLabel, FileContent, FileEnd, KeyReference, KeyUsageFlags, ObjectClass,
+    ObjectDirectory, ObjectDirectoryEntry, ObjectDirectoryLocation, ObjectDirectoryRead,
+    ObjectIdentifier, ObjectLabel, PathSlice, Pkcs15Path, PrivateKeyDirectory,
+    PrivateKeyDirectoryEntry, PrivateKeyDirectoryRead, QualifiedSignatureCredentialLookup,
 };
 pub use document_number::{DOCUMENT_NUMBER_CHARS, DocumentNumber, DocumentNumberError};
 pub use fs::{
-    CertSlot, DF_ESIGN_FID, DF_ESTONIAN_PERSONAL_DATA_FID, EF_AUTH_CERT_ALT_FID, EF_AUTH_CERT_FID,
-    EF_ESTONIAN_DOCUMENT_NUMBER_FID, EF_ESTONIAN_DOCUMENT_NUMBER_LEGACY_FID, EF_ISSUING_CA_ECC_FID,
-    EF_ROOT_CA_FID, EF_SIGN_CERT_ALT_FID, EF_SIGN_CERT_FID, EF_TOKEN_INFO_FID, ESIGN_AID,
-    PKCS15_AID, Pkcs15Error, Pkcs15Ops,
+    CertSlot, DF_ESIGN_FID, DF_ESTONIAN_AWP_FID, DF_ESTONIAN_PERSONAL_DATA_FID,
+    DF_ESTONIAN_QSCD_FID, EF_AUTH_CERT_ALT_FID, EF_AUTH_CERT_FID, EF_ESTONIAN_2025_AUTH_CERT_FID,
+    EF_ESTONIAN_2025_SIGN_CERT_FID, EF_ESTONIAN_DOCUMENT_NUMBER_FID,
+    EF_ESTONIAN_DOCUMENT_NUMBER_LEGACY_FID, EF_ISSUING_CA_ECC_FID, EF_ROOT_CA_FID,
+    EF_SIGN_CERT_ALT_FID, EF_SIGN_CERT_FID, EF_TOKEN_INFO_FID, ESIGN_AID, PKCS15_AID, Pkcs15Error,
+    Pkcs15Ops,
 };
 pub use refineid_x509::UnvalidatedCertificate;
 pub use token_info::TokenInfo;

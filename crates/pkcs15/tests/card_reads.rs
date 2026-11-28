@@ -1180,6 +1180,252 @@ fn estonian_profile_discovery_resolves_custom_aid_path_key_ref_and_aod_parameter
 }
 
 #[test]
+fn estonian_qualified_signature_profile_discovery_resolves_sign_cert_key_ref_and_pin2() {
+    const CUSTOM_ESTONIAN_AID: &[u8] = b"EESTI-EID-2030";
+    const TAG_APP_TEMPLATE: u8 = 0x61;
+    const TAG_APP_AID: u8 = 0x4F;
+    const TAG_APP_LABEL: u8 = 0x50;
+    const TAG_ODF_PRKDF: u8 = 0xA0;
+    const TAG_ODF_CDF: u8 = 0xA4;
+    const TAG_ODF_AOD: u8 = 0xA8;
+    const TAG_PRIVATE_EC_KEY: u8 = 0xA0;
+    const CUSTOM_CDF_FID: FileId = FileId::from_u16(0x5103);
+    const CUSTOM_PRKDF_FID: FileId = FileId::from_u16(0x5101);
+    const CUSTOM_AOD_FID: FileId = FileId::from_u16(0x5106);
+    const SIGN_DF_FID: FileId = FileId::from_u16(0xADF2);
+    const SIGN_CERT_FID: FileId = FileId::from_u16(0x3421);
+    const SIGN_OBJECT_ID: u8 = 0x22;
+    const PIN2_AUTH_ID: u8 = 0x02;
+    const PUK_AUTH_ID: u8 = 0x03;
+    const SIGN_KEY_REF: u8 = 0x05;
+    const PIN2_REF: u8 = 0x82;
+    const PUK_REF: u8 = 0x83;
+    const PIN2_MIN: u8 = 5;
+    const PIN2_STORED: u8 = 12;
+    const PUK_MIN: u8 = 8;
+    const ZERO_PAD_BYTE: u8 = 0x00;
+    const SIGN_USAGE_BITS: &[u8] = &[0x06, 0x00, 0x40];
+    const PIN2_FLAGS: &[u8] = &[0x04, 0xCC, 0x10];
+    const PUK_FLAGS: &[u8] = &[0x01, 0xFE];
+
+    let oct_tag = u8::try_from(<OctetString as BerTag>::TAG).expect("fits");
+    let bit_tag = u8::try_from(<BitString as BerTag>::TAG).expect("fits");
+    let int_tag = u8::try_from(<Integer as BerTag>::TAG).expect("fits");
+    let utf8_tag = u8::try_from(<Utf8String as BerTag>::TAG).expect("fits");
+
+    let mut dir_inner = BerEncoder::default();
+    dir_inner
+        .push_tlv(TAG_APP_AID, CUSTOM_ESTONIAN_AID)
+        .expect("encodes");
+    dir_inner
+        .push_tlv(TAG_APP_LABEL, ESTONIAN_EID_APPLICATION_LABEL.as_bytes())
+        .expect("encodes");
+    let ef_dir = tlv(TAG_APP_TEMPLATE, dir_inner.finish()).expect("encodes");
+
+    let path_tlv = |steps: &[FileId]| {
+        let mut raw = Vec::new();
+        for fid in steps {
+            raw.extend_from_slice(fid.as_bytes());
+        }
+        tlv(sequence_tag(), tlv(oct_tag, raw).expect("encodes")).expect("encodes")
+    };
+    let mut ef_odf = Vec::new();
+    ef_odf.extend_from_slice(
+        &tlv(TAG_ODF_CDF, path_tlv(&[FileId::MF, CUSTOM_CDF_FID])).expect("encodes"),
+    );
+    ef_odf.extend_from_slice(
+        &tlv(TAG_ODF_PRKDF, path_tlv(&[FileId::MF, CUSTOM_PRKDF_FID])).expect("encodes"),
+    );
+    ef_odf.extend_from_slice(
+        &tlv(TAG_ODF_AOD, path_tlv(&[FileId::MF, CUSTOM_AOD_FID])).expect("encodes"),
+    );
+
+    let cdf_common = tlv(
+        sequence_tag(),
+        tlv(utf8_tag, b"signature certificate").expect("encodes"),
+    )
+    .expect("encodes");
+    let cdf_class = tlv(
+        sequence_tag(),
+        tlv(oct_tag, [SIGN_OBJECT_ID]).expect("encodes"),
+    )
+    .expect("encodes");
+    let cdf_type = tlv(
+        TYPE_ATTRIBUTES_TAG,
+        tlv(
+            sequence_tag(),
+            path_tlv(&[FileId::MF, SIGN_DF_FID, SIGN_CERT_FID]),
+        )
+        .expect("encodes"),
+    )
+    .expect("encodes");
+    let mut cdf_body = cdf_common;
+    cdf_body.extend_from_slice(&cdf_class);
+    cdf_body.extend_from_slice(&cdf_type);
+    let ef_cdf = tlv(sequence_tag(), cdf_body).expect("encodes");
+
+    let mut prkdf_common = BerEncoder::default();
+    prkdf_common
+        .push_tlv(utf8_tag, b"signature key")
+        .expect("encodes");
+    prkdf_common
+        .push_tlv(oct_tag, [PIN2_AUTH_ID])
+        .expect("encodes");
+    let mut prkdf_class = BerEncoder::default();
+    prkdf_class
+        .push_tlv(oct_tag, [SIGN_OBJECT_ID])
+        .expect("encodes");
+    prkdf_class
+        .push_tlv(bit_tag, SIGN_USAGE_BITS)
+        .expect("encodes");
+    prkdf_class
+        .push_tlv(int_tag, [SIGN_KEY_REF])
+        .expect("encodes");
+    let prkdf_type = tlv(
+        TYPE_ATTRIBUTES_TAG,
+        tlv(
+            sequence_tag(),
+            tlv(sequence_tag(), tlv(oct_tag, []).expect("encodes")).expect("encodes"),
+        )
+        .expect("encodes"),
+    )
+    .expect("encodes");
+    let mut prkdf_body = tlv(sequence_tag(), prkdf_common.finish()).expect("encodes");
+    prkdf_body.extend_from_slice(&tlv(sequence_tag(), prkdf_class.finish()).expect("encodes"));
+    prkdf_body.extend_from_slice(&prkdf_type);
+    let ef_prkdf = tlv(TAG_PRIVATE_EC_KEY, prkdf_body).expect("encodes");
+
+    let aod_record =
+        |auth_id: u8, protecting: Option<u8>, flags: &[u8], min: u8, stored: u8, reference: u8| {
+            let mut common = BerEncoder::default();
+            common.push_tlv(utf8_tag, b"PIN2").expect("encodes");
+            if let Some(puk) = protecting {
+                common.push_tlv(oct_tag, [puk]).expect("encodes");
+            }
+            let class =
+                tlv(sequence_tag(), tlv(oct_tag, [auth_id]).expect("encodes")).expect("encodes");
+            let mut attrs = BerEncoder::default();
+            attrs.push_tlv(bit_tag, flags).expect("encodes");
+            attrs
+                .push_tlv(ENUMERATED_TAG, [PASSWORD_TYPE_ASCII_NUMERIC])
+                .expect("encodes");
+            attrs.push_tlv(int_tag, [min]).expect("encodes");
+            attrs.push_tlv(int_tag, [stored]).expect("encodes");
+            attrs
+                .push_tlv(PWD_REFERENCE_TAG, [DER_ZERO_PREFIX, reference])
+                .expect("encodes");
+            attrs.push_tlv(oct_tag, [ZERO_PAD_BYTE]).expect("encodes");
+            let typed = tlv(
+                TYPE_ATTRIBUTES_TAG,
+                tlv(sequence_tag(), attrs.finish()).expect("encodes"),
+            )
+            .expect("encodes");
+            let mut rec = tlv(sequence_tag(), common.finish()).expect("encodes");
+            rec.extend_from_slice(&class);
+            rec.extend_from_slice(&typed);
+            tlv(sequence_tag(), rec).expect("encodes")
+        };
+    let mut ef_aod = aod_record(
+        PIN2_AUTH_ID,
+        Some(PUK_AUTH_ID),
+        PIN2_FLAGS,
+        PIN2_MIN,
+        PIN2_STORED,
+        PIN2_REF,
+    );
+    ef_aod.extend_from_slice(&aod_record(
+        PUK_AUTH_ID,
+        None,
+        PUK_FLAGS,
+        PUK_MIN,
+        PIN2_STORED,
+        PUK_REF,
+    ));
+
+    let custom_aid = Aid::from_slice(CUSTOM_ESTONIAN_AID).expect("valid custom AID");
+    let select_custom_aid = SelectByAidNoFci { aid: custom_aid }
+        .into_apdu()
+        .as_bytes()
+        .to_vec();
+    let select_abs = |steps: &[FileId]| {
+        SelectFile {
+            class: ApduClass::Plain,
+            target: SelectFileTarget::AbsolutePath(
+                AbsolutePath::new(steps.to_vec()).expect("valid path"),
+            ),
+            response_mode: SelectFileResponseMode::None,
+        }
+        .into_apdu()
+        .as_bytes()
+        .to_vec()
+    };
+
+    let cert_der = certificate_fixture(ONE_CHUNK_CONTENT_LEN);
+
+    let mut transport = ScriptedTransport::new(vec![
+        (select_any_by_fid_wire(FileId::MF), ok_response(&[])),
+        (select_ef_wire(EF_DIR_FID), ok_response(&[])),
+        (
+            read_wire(0, READ_CHUNK_LEN),
+            response(&ef_dir, StatusWord::EndOfFile),
+        ),
+        (select_custom_aid.clone(), ok_response(&[])),
+        (select_ef_wire(EF_ODF_FID), ok_response(&[])),
+        (
+            read_wire(0, READ_CHUNK_LEN),
+            response(&ef_odf, StatusWord::EndOfFile),
+        ),
+        (select_abs(&[CUSTOM_CDF_FID]), ok_response(&[])),
+        (
+            read_wire(0, READ_CHUNK_LEN),
+            response(&ef_cdf, StatusWord::EndOfFile),
+        ),
+        (select_abs(&[CUSTOM_PRKDF_FID]), ok_response(&[])),
+        (
+            read_wire(0, READ_CHUNK_LEN),
+            response(&ef_prkdf, StatusWord::EndOfFile),
+        ),
+        (select_abs(&[CUSTOM_AOD_FID]), ok_response(&[])),
+        (
+            read_wire(0, READ_CHUNK_LEN),
+            response(&ef_aod, StatusWord::EndOfFile),
+        ),
+        (select_custom_aid, ok_response(&[])),
+        (select_abs(&[SIGN_DF_FID, SIGN_CERT_FID]), ok_response(&[])),
+        (
+            read_wire(0, READ_CHUNK_LEN),
+            response(&cert_der, StatusWord::EndOfFile),
+        ),
+    ]);
+
+    let profile = transport
+        .discover_estonian_qualified_signature_profile()
+        .expect("directory discovery resolves qualified signature Estonian profile");
+    assert_eq!(profile.application_aid().as_bytes(), CUSTOM_ESTONIAN_AID);
+    assert_eq!(
+        profile.sign_cert_path().steps(),
+        &[FileId::MF, SIGN_DF_FID, SIGN_CERT_FID]
+    );
+    assert_eq!(profile.sign_key_reference().as_u8(), SIGN_KEY_REF);
+    assert_eq!(profile.pin2().reference(), PIN2_REF);
+    assert_eq!(profile.pin2().stored_length(), PIN2_STORED);
+    assert_eq!(profile.pin2().pad_char(), Some(ZERO_PAD_BYTE));
+    assert_eq!(profile.pin2().lengths().min(), usize::from(PIN2_MIN));
+    assert_eq!(
+        profile
+            .puk()
+            .map(refineid_pkcs15::PasswordObject::reference),
+        Some(PUK_REF)
+    );
+
+    let cert = transport
+        .read_certificate_at(profile.sign_cert_path())
+        .expect("certificate reads and validates as single DER SEQUENCE");
+    assert_eq!(cert.as_bytes(), cert_der.as_slice());
+    transport.assert_drained();
+}
+
+#[test]
 fn read_binary_confirmed_continues_past_short_9000_chunks_until_card_eof() {
     const FIRST_HALF: &[u8] = b"first-half-";
     const SECOND_HALF: &[u8] = b"second-half";

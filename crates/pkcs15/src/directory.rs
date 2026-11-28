@@ -1040,6 +1040,13 @@ impl KeyUsageFlags {
     pub const fn is_authentication(self) -> bool {
         self.sign && !self.non_repudiation
     }
+
+    /// Whether this key's declared usage marks it as a qualified
+    /// (non-repudiation) signature key: `nonRepudiation` set.
+    #[must_use]
+    pub const fn is_qualified_signature(self) -> bool {
+        self.non_repudiation
+    }
 }
 
 /// One certificate record from EF.CDF (PKCS#15 v1.1 section 6.6.1).
@@ -1305,6 +1312,19 @@ pub enum AuthenticationCredentialLookup<'a> {
     Unique(&'a Credential),
 }
 
+/// Result of selecting the qualified-signature credential from a paired
+/// [`CredentialDirectory`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QualifiedSignatureCredentialLookup<'a> {
+    /// No paired credential declares non-repudiation key usage.
+    Absent,
+    /// More than one paired credential declares non-repudiation key
+    /// usage, so no unique qualified-signature credential can be chosen.
+    Ambiguous,
+    /// Exactly one paired credential declares non-repudiation key usage.
+    Unique(&'a Credential),
+}
+
 /// Credentials formed by pairing EF.CDF and EF.PrKDF by `Identifier`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredentialDirectory {
@@ -1392,6 +1412,103 @@ impl CredentialDirectory {
             return AuthenticationCredentialLookup::Ambiguous;
         }
         AuthenticationCredentialLookup::Unique(first)
+    }
+
+    /// Find the single credential whose private key declares qualified
+    /// signature usage (`nonRepudiation` set).
+    #[must_use]
+    pub fn unique_qualified_signature_credential(&self) -> QualifiedSignatureCredentialLookup<'_> {
+        let mut matching = self
+            .entries
+            .iter()
+            .filter(|credential| credential.key().usage().is_qualified_signature());
+        let Some(first) = matching.next() else {
+            return QualifiedSignatureCredentialLookup::Absent;
+        };
+        if matching.next().is_some() {
+            return QualifiedSignatureCredentialLookup::Ambiguous;
+        }
+        QualifiedSignatureCredentialLookup::Unique(first)
+    }
+}
+
+/// Complete ISO/IEC 7816-15 qualified-signature profile discovered
+/// purely from a card's EF.ODF, EF.CDF, EF.PrKDF, and EF.AOD under a
+/// given application AID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredQualifiedSignatureProfile {
+    application_aid: Aid,
+    sign_cert_path: Pkcs15Path,
+    sign_key_reference: KeyReference,
+    aod_path: Pkcs15Path,
+    pin2_auth_id: ObjectIdentifier,
+    pin2: PasswordObject,
+    puk: Option<PasswordObject>,
+}
+
+impl DiscoveredQualifiedSignatureProfile {
+    pub(crate) const fn new(
+        application_aid: Aid,
+        sign_cert_path: Pkcs15Path,
+        sign_key_reference: KeyReference,
+        aod_path: Pkcs15Path,
+        pin2_auth_id: ObjectIdentifier,
+        pin2: PasswordObject,
+        puk: Option<PasswordObject>,
+    ) -> Self {
+        Self {
+            application_aid,
+            sign_cert_path,
+            sign_key_reference,
+            aod_path,
+            pin2_auth_id,
+            pin2,
+            puk,
+        }
+    }
+
+    /// Application identifier selected for this PKCS#15 profile.
+    #[must_use]
+    pub const fn application_aid(&self) -> &Aid {
+        &self.application_aid
+    }
+
+    /// Full PKCS#15 path of the X.509 qualified-signature certificate.
+    #[must_use]
+    pub const fn sign_cert_path(&self) -> &Pkcs15Path {
+        &self.sign_cert_path
+    }
+
+    /// MSE:SET key reference of the qualified-signature private key.
+    #[must_use]
+    pub const fn sign_key_reference(&self) -> KeyReference {
+        self.sign_key_reference
+    }
+
+    /// Full PKCS#15 path of the EF.AOD file that lists [`Self::pin2`].
+    #[must_use]
+    pub const fn aod_path(&self) -> &Pkcs15Path {
+        &self.aod_path
+    }
+
+    /// PKCS#15 `authId` linking the qualified-signature key to
+    /// [`Self::pin2`].
+    #[must_use]
+    pub const fn pin2_auth_id(&self) -> &ObjectIdentifier {
+        &self.pin2_auth_id
+    }
+
+    /// Qualified-signature PIN 2 object parsed from EF.AOD.
+    #[must_use]
+    pub const fn pin2(&self) -> &PasswordObject {
+        &self.pin2
+    }
+
+    /// Protecting PUK object parsed from EF.AOD, when linked by
+    /// `CommonObjectAttributes.authId`.
+    #[must_use]
+    pub const fn puk(&self) -> Option<&PasswordObject> {
+        self.puk.as_ref()
     }
 }
 
@@ -1720,12 +1837,12 @@ mod tests {
         CertificateRead, CredentialDirectory, CredentialPairingError, DER_SEQUENCE_TAG_OCTET,
         DerCertificate, DirectoryLookup, END_OF_CONTENTS_OCTET, FileContent, FileEnd,
         INDEFINITE_LENGTH, KeyUsageFlags, ObjectClass, ObjectDirectory, ObjectDirectoryRead,
-        PADDING_FF_OCTET, PrivateKeyDirectory, PrivateKeyDirectoryRead, TAG_APPLICATION_IDENTIFIER,
-        TAG_APPLICATION_LABEL, TAG_APPLICATION_PATH, TAG_APPLICATION_TEMPLATE, TAG_AUTH_OBJECTS,
-        TAG_BIT_STRING, TAG_CERTIFICATES, TAG_DIRECT_OBJECT_VALUE, TAG_INTEGER, TAG_OBJECTS,
-        TAG_OCTET_STRING, TAG_PATH_LENGTH, TAG_PRINTABLE_STRING, TAG_PRIVATE_EC_KEY,
-        TAG_PRIVATE_KEYS, TAG_SEQUENCE, TAG_TYPE_ATTRIBUTES, TAG_UTF8_STRING,
-        TAG_X509_ATTRIBUTE_CERTIFICATE,
+        PADDING_FF_OCTET, PrivateKeyDirectory, PrivateKeyDirectoryRead,
+        QualifiedSignatureCredentialLookup, TAG_APPLICATION_IDENTIFIER, TAG_APPLICATION_LABEL,
+        TAG_APPLICATION_PATH, TAG_APPLICATION_TEMPLATE, TAG_AUTH_OBJECTS, TAG_BIT_STRING,
+        TAG_CERTIFICATES, TAG_DIRECT_OBJECT_VALUE, TAG_INTEGER, TAG_OBJECTS, TAG_OCTET_STRING,
+        TAG_PATH_LENGTH, TAG_PRINTABLE_STRING, TAG_PRIVATE_EC_KEY, TAG_PRIVATE_KEYS, TAG_SEQUENCE,
+        TAG_TYPE_ATTRIBUTES, TAG_UTF8_STRING, TAG_X509_ATTRIBUTE_CERTIFICATE,
     };
 
     const TEST_AID: &[u8] = b"test-aid-01";
@@ -2122,12 +2239,14 @@ mod tests {
         assert!(auth_usage.derive());
         assert!(!auth_usage.non_repudiation());
         assert!(auth_usage.is_authentication());
+        assert!(!auth_usage.is_qualified_signature());
 
         let sign_usage =
             KeyUsageFlags::parse_bit_string(SIGN_KEY_USAGE_BITSTRING).expect("valid BIT STRING");
         assert!(!sign_usage.sign());
         assert!(sign_usage.non_repudiation());
         assert!(!sign_usage.is_authentication());
+        assert!(sign_usage.is_qualified_signature());
 
         let mut cdf_bytes = encode_cdf_entry(
             DER_SEQUENCE_TAG_OCTET,
@@ -2195,6 +2314,24 @@ mod tests {
             Some(AUTH_KEY_REF)
         );
 
+        let sign = match paired.unique_qualified_signature_credential() {
+            QualifiedSignatureCredentialLookup::Unique(sign) => Some(sign),
+            QualifiedSignatureCredentialLookup::Absent
+            | QualifiedSignatureCredentialLookup::Ambiguous => None,
+        }
+        .expect("must select unique qualified signature credential");
+        assert_eq!(sign.identifier().as_bytes(), &[SIGN_OBJECT_ID]);
+        assert!(sign.certificate().is_x509());
+        assert_eq!(sign.file(), Some(SIGN_CERT_FID));
+        assert_eq!(
+            sign.key().auth_id().map(super::ObjectIdentifier::as_bytes),
+            Some([PIN2_AUTH_ID].as_slice())
+        );
+        assert_eq!(
+            sign.key_reference().map(super::KeyReference::as_u8),
+            Some(SIGN_KEY_REF)
+        );
+
         let sample = FileContent::from_read(vec![FILLER_BYTE; SAMPLE_FILE_LEN], FileEnd::Confirmed);
         let sliced = sample
             .apply_path_slice(auth.path().and_then(super::Pkcs15Path::slice))
@@ -2241,6 +2378,10 @@ mod tests {
         assert_eq!(
             empty_paired.unique_authentication_credential(),
             AuthenticationCredentialLookup::Absent
+        );
+        assert_eq!(
+            empty_paired.unique_qualified_signature_credential(),
+            QualifiedSignatureCredentialLookup::Absent
         );
 
         // Orphan CA cert in CDF and extra orphan key in PrKDF alongside a valid auth credential,

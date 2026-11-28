@@ -33,8 +33,8 @@ const TWO_RETRIES: u8 = 2;
 /// Retry count of a pristine credential.
 const RETRIES_PRISTINE: u8 = 5;
 /// Lowest retry count the floor serves.
-const RETRIES_FLOOR: u8 = 3;
-/// Retry count one wrong try from lockout.
+const RETRIES_FLOOR: u8 = 2;
+/// Retry count one wrong try from lockout (below the floor).
 const RETRIES_LOCKDOWN_IMMINENT: u8 = 1;
 /// Credential commands the organizational unblock sends: a VERIFY then
 /// a RESET.
@@ -246,15 +246,13 @@ fn activation_with_the_code_as_puk_follows_the_puk_floor() {
     assert_eq!(report.pin2, Some(ManageOutcome::Ok));
     assert_eq!(sent, ACTIVATION_COMMAND_COUNT);
 
-    for probe in [counter(TWO_RETRIES), counter(RETRIES_LOCKDOWN_IMMINENT)] {
-        let (refused, sent) = activate(probe);
-        assert!(matches!(
-            refused,
-            Err(AuthError::RetryFloor(refusal))
-                if refusal.credential() == FlooredCredential::Puk
-        ));
-        assert_eq!(sent, 0);
-    }
+    let (refused, sent) = activate(counter(RETRIES_LOCKDOWN_IMMINENT));
+    assert!(matches!(
+        refused,
+        Err(AuthError::RetryFloor(refusal))
+            if refusal.credential() == FlooredCredential::Puk
+    ));
+    assert_eq!(sent, 0);
 
     // A blocked PUK is the card's to refuse: the activation goes out
     // and the card answers for itself.

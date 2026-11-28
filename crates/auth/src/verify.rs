@@ -29,11 +29,11 @@
 //! S1 v4.2 section 4.1.2. Every VERIFY that carries a PIN sends that
 //! probe first and applies the retry floor
 //! ([`crate::retry_risk::check_retry_floor`]) to its answer: refused at
-//! two or one tries left or an unreadable counter; sent otherwise, the
-//! card answering for itself at zero or blocked. The primitive enforces
-//! the rule itself, so no caller can spend a try by mistake; a caller
-//! that has already read the counter for a purpose of its own may apply
-//! the same rule first, to refuse before it asks for the PIN.
+//! one try left or an unreadable counter; sent otherwise, the card
+//! answering for itself at zero or blocked. The primitive enforces the
+//! rule itself, so no caller can spend a try by mistake; a caller that
+//! has already read the counter for a purpose of its own may apply the
+//! same rule first, to refuse before it asks for the PIN.
 
 use core::fmt;
 
@@ -427,21 +427,16 @@ pub enum AuthError<E> {
     /// The retry floor refused the credential before any command that
     /// carries it was sent. Every operation that presents a PIN, the
     /// PUK or an activation code reads that credential's counter itself
-    /// and returns this at two or one tries left or an unreadable
-    /// counter.
+    /// and returns this at one try left or an unreadable counter.
     RetryFloor(RetryFloorRefusal),
     /// The card in session does not accept an entry's length; refused
     /// before any command that carries it was sent. Returned by the
     /// operations that take the card's
     /// [`crate::pin_lengths::CardPinLengths`].
     PinLength(PinLengthRefusal),
-    /// The requested PIN slot is not supported in this application
-    /// context under `scheme`; refused before any command that carries a
-    /// credential was sent.
-    ///
-    /// On Estonian eID cards, PIN2 lives in the separate QSCD application
-    /// rather than the eID application, so PIN2 verification and
-    /// management fail closed here until QSCD support is implemented.
+    /// The requested PIN slot or operation is not supported in this
+    /// application context under `scheme`; refused before any command
+    /// that carries a credential was sent.
     UnsupportedSlot {
         /// Credential numbering resolved for the card.
         scheme: PinReferenceScheme,
@@ -641,10 +636,9 @@ pub(crate) fn credential_exchange<T: CardTransport + ?Sized>(
 ///
 /// # Errors
 ///
-/// [`AuthError::RetryFloor`] when `status` is two or one tries left or
-/// carries no readable counter; nothing is sent. [`AuthError`] on a
-/// command-assembly failure, a transport failure, or a transport state
-/// transition.
+/// [`AuthError::RetryFloor`] when `status` is one try left or carries no
+/// readable counter; nothing is sent. [`AuthError`] on a command-assembly
+/// failure, a transport failure, or a transport state transition.
 pub(crate) fn verify_under_floor<T: CardTransport + ?Sized>(
     transport: &mut T,
     scheme: PinReferenceScheme,
@@ -659,19 +653,13 @@ pub(crate) fn verify_under_floor<T: CardTransport + ?Sized>(
 /// Fail closed when `slot` cannot be addressed in the current
 /// application context under `scheme`.
 ///
-/// On Estonian eID cards, PIN2 lives in the separate QSCD application
-/// and must not be verified, changed, or unblocked under the eID
-/// application.
+/// All three schemes (`Citizen`, `Organizational`, and `Estonian` eID
+/// 2025 under the shared PKCS#15 application, `GED24035_015` section
+/// 8.3) support both PIN 1 and PIN 2.
 pub(crate) const fn ensure_slot_supported<E>(
-    scheme: PinReferenceScheme,
-    slot: PinSlot,
+    _scheme: PinReferenceScheme,
+    _slot: PinSlot,
 ) -> Result<(), AuthError<E>> {
-    if matches!(
-        (scheme, slot),
-        (PinReferenceScheme::Estonian, PinSlot::Pin2)
-    ) {
-        return Err(AuthError::UnsupportedSlot { scheme, slot });
-    }
     Ok(())
 }
 
@@ -747,8 +735,8 @@ pub trait PinOps: CardTransport {
     ///
     /// # Errors
     ///
-    /// [`AuthError::RetryFloor`] when the card reports two or one tries
-    /// left or no readable counter; nothing carrying the PIN is sent.
+    /// [`AuthError::RetryFloor`] when the card reports one try left or
+    /// no readable counter; nothing carrying the PIN is sent.
     /// [`AuthError`] on a transport failure or state transition. A wrong
     /// PIN is not an error; it is [`VerifyOutcome::WrongPin`], and a
     /// blocked PIN is [`VerifyOutcome::Locked`], the card's own answer.
@@ -797,14 +785,13 @@ pub trait PinOps: CardTransport {
     /// PIN 2 under `scheme`, the retry floor on its answer, then the
     /// VERIFY carrying the PIN.
     ///
-    /// PIN2 on [`PinReferenceScheme::Estonian`] lives in the separate
-    /// QSCD application; calling this with `Estonian` fails closed with
-    /// [`AuthError::UnsupportedSlot`] before any APDU is transmitted.
+    /// On [`PinReferenceScheme::Estonian`] (EstEID 2025, `GED24035_015`
+    /// section 8.3), PIN 2 lives in the shared PKCS#15 eID application
+    /// and is verified on a zero-padded block of stored length.
     ///
     /// # Errors
     ///
-    /// [`AuthError::UnsupportedSlot`] for [`PinReferenceScheme::Estonian`].
-    /// Otherwise as [`PinOps::verify_pin1_with_scheme`].
+    /// As [`PinOps::verify_pin1_with_scheme`].
     fn verify_pin2_with_scheme(
         &mut self,
         scheme: PinReferenceScheme,
@@ -816,6 +803,49 @@ pub trait PinOps: CardTransport {
         ensure_slot_supported(scheme, PinSlot::Pin2)?;
         let status = self.pin_status_with_scheme(scheme, PinSlot::Pin2)?;
         verify_under_floor(self, scheme, PinSlot::Pin2, status, pin.digits())
+    }
+
+    /// Whether the card enforces changing its initial PIN 2 before
+    /// qualified signing is allowed (EstEID 2025, `GED24035_015`
+    /// sections 3.1, 7.8.1 and 8.3.4).
+    ///
+    /// Sends no APDU for FINEID citizen or organizational cards,
+    /// answering `Ok(false)`. On [`PinReferenceScheme::Estonian`],
+    /// queries PIN 2's counter-safe PIN container and returns `Ok(true)`
+    /// only when the changed-state object (`DF 2F`) explicitly reports
+    /// unchanged ([`crate::activation::PinChangeRecord::Unchanged`]).
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError`] on a transport failure or state transition.
+    fn pin2_requires_change_before_signing_with_scheme(
+        &mut self,
+        scheme: PinReferenceScheme,
+    ) -> Result<bool, AuthError<Self::Error>>
+    where
+        Self: Sized,
+    {
+        if scheme != PinReferenceScheme::Estonian {
+            return Ok(false);
+        }
+        let record =
+            crate::activation::read_pin_change_record_with_scheme(self, scheme, PinSlot::Pin2)?;
+        Ok(record == crate::activation::PinChangeRecord::Unchanged)
+    }
+
+    /// Whether the card enforces changing its initial PIN 2 before
+    /// qualified signing is allowed, resolving the credential numbering
+    /// first.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError`] on a transport failure or state transition.
+    fn pin2_requires_change_before_signing(&mut self) -> Result<bool, AuthError<Self::Error>>
+    where
+        Self: Sized,
+    {
+        let scheme = self.resolve_pin_reference_scheme()?;
+        self.pin2_requires_change_before_signing_with_scheme(scheme)
     }
 
     /// Probe PIN1 retry state and resolve the card's credential numbering
@@ -1014,9 +1044,9 @@ mod tests {
 
     /// A retry count for the classifier tests.
     const THREE_RETRIES: u8 = 3;
-    /// Highest retry count below the retry floor.
-    const RETRIES_BELOW_FLOOR: u8 = 2;
-    /// Retry count one wrong try from lockout.
+    /// Lowest retry count served by the retry floor.
+    const RETRIES_FLOOR: u8 = 2;
+    /// Retry count one wrong try from lockout (refused by the floor).
     const RETRIES_LOCKDOWN_IMMINENT: u8 = 1;
     /// Retry count of an exhausted PIN.
     const RETRIES_EXHAUSTED: u8 = 0;
@@ -1140,32 +1170,31 @@ mod tests {
     }
 
     #[test]
-    fn a_verify_at_the_last_two_tries_sends_only_the_probe() {
+    fn a_verify_at_the_last_try_sends_only_the_probe() {
         // The caller has probed nothing; the primitive still refuses, so
-        // no caller can spend one of the last two tries by mistake.
+        // no caller can spend the last try by mistake.
         for slot in [PinSlot::Pin1, PinSlot::Pin2] {
-            for count in [RETRIES_BELOW_FLOOR, RETRIES_LOCKDOWN_IMMINENT] {
-                let mut transport = WireRecorder::answering(counter(count), StatusWord::Success);
-                let refused = verify_slot(&mut transport, PinReferenceScheme::Citizen, slot);
-                assert!(matches!(
-                    refused,
-                    Err(AuthError::RetryFloor(RetryFloorRefusal::TriesBelowFloor {
-                        credential,
-                        remaining,
-                    })) if credential == FlooredCredential::from(slot)
-                        && remaining.get() == count
-                ));
-                let reference = PinReferenceScheme::Citizen.reference(slot);
-                assert_eq!(
-                    transport.plain.as_deref(),
-                    Some(verify_header(reference).as_slice()),
-                    "the probe carries no data"
-                );
-                assert!(
-                    transport.credential.is_none(),
-                    "no VERIFY carrying digits reached the wire"
-                );
-            }
+            let mut transport =
+                WireRecorder::answering(counter(RETRIES_LOCKDOWN_IMMINENT), StatusWord::Success);
+            let refused = verify_slot(&mut transport, PinReferenceScheme::Citizen, slot);
+            assert!(matches!(
+                refused,
+                Err(AuthError::RetryFloor(RetryFloorRefusal::TriesBelowFloor {
+                    credential,
+                    remaining,
+                })) if credential == FlooredCredential::from(slot)
+                    && remaining.get() == RETRIES_LOCKDOWN_IMMINENT
+            ));
+            let reference = PinReferenceScheme::Citizen.reference(slot);
+            assert_eq!(
+                transport.plain.as_deref(),
+                Some(verify_header(reference).as_slice()),
+                "the probe carries no data"
+            );
+            assert!(
+                transport.credential.is_none(),
+                "no VERIFY carrying digits reached the wire"
+            );
         }
     }
 
@@ -1208,8 +1237,12 @@ mod tests {
     }
 
     #[test]
-    fn a_verified_pin_is_served_and_three_tries_left_are_served() {
-        for probe in [StatusWord::Success, counter(THREE_RETRIES)] {
+    fn a_verified_pin_and_three_or_two_tries_left_are_served() {
+        for probe in [
+            StatusWord::Success,
+            counter(THREE_RETRIES),
+            counter(RETRIES_FLOOR),
+        ] {
             let mut transport = WireRecorder::answering(probe, StatusWord::Success);
             let outcome = transport
                 .verify_pin2_with_scheme(PinReferenceScheme::Citizen, pin2(WIRE_DIGITS))
@@ -1226,7 +1259,7 @@ mod tests {
     #[test]
     fn the_scheme_free_verify_floors_on_the_probe_that_resolves_the_numbering() {
         let mut transport =
-            WireRecorder::answering(counter(RETRIES_BELOW_FLOOR), StatusWord::Success);
+            WireRecorder::answering(counter(RETRIES_LOCKDOWN_IMMINENT), StatusWord::Success);
         let refused = transport.verify_pin1(pin1(WIRE_DIGITS));
         assert!(matches!(
             refused,
@@ -1551,27 +1584,28 @@ mod tests {
     }
 
     #[test]
-    fn estonian_verify_respects_the_three_try_scale_and_two_try_floor() {
-        let mut served = WireRecorder::answering(counter(THREE_RETRIES), StatusWord::Success);
-        assert_eq!(
-            served
-                .verify_pin1_with_scheme(PinReferenceScheme::Estonian, pin1(WIRE_DIGITS))
-                .expect("pristine three tries is served"),
-            VerifyOutcome::Ok
-        );
-        assert!(served.credential.is_some());
-
-        for below in [RETRIES_BELOW_FLOOR, RETRIES_LOCKDOWN_IMMINENT] {
-            let mut refused = WireRecorder::answering(counter(below), StatusWord::Success);
-            assert!(matches!(
-                refused.verify_pin1_with_scheme(PinReferenceScheme::Estonian, pin1(WIRE_DIGITS)),
-                Err(AuthError::RetryFloor(RetryFloorRefusal::TriesBelowFloor {
-                    credential: FlooredCredential::Pin1,
-                    remaining,
-                })) if remaining.get() == below
-            ));
-            assert!(refused.credential.is_none());
+    fn estonian_verify_respects_the_three_try_scale_and_one_try_floor() {
+        for served_tries in [THREE_RETRIES, RETRIES_FLOOR] {
+            let mut served = WireRecorder::answering(counter(served_tries), StatusWord::Success);
+            assert_eq!(
+                served
+                    .verify_pin1_with_scheme(PinReferenceScheme::Estonian, pin1(WIRE_DIGITS))
+                    .expect("three and two tries are served"),
+                VerifyOutcome::Ok
+            );
+            assert!(served.credential.is_some());
         }
+
+        let mut refused =
+            WireRecorder::answering(counter(RETRIES_LOCKDOWN_IMMINENT), StatusWord::Success);
+        assert!(matches!(
+            refused.verify_pin1_with_scheme(PinReferenceScheme::Estonian, pin1(WIRE_DIGITS)),
+            Err(AuthError::RetryFloor(RetryFloorRefusal::TriesBelowFloor {
+                credential: FlooredCredential::Pin1,
+                remaining,
+            })) if remaining.get() == RETRIES_LOCKDOWN_IMMINENT
+        ));
+        assert!(refused.credential.is_none());
 
         let above_estonian_limit = THREE_RETRIES + 1;
         let mut unreadable =
@@ -1588,20 +1622,24 @@ mod tests {
     }
 
     #[test]
-    fn estonian_verify_pin2_fails_closed_without_transmitting() {
-        let mut transport = WireRecorder::new(StatusWord::Success);
-        let err = transport
-            .verify_pin2_with_scheme(PinReferenceScheme::Estonian, pin2(WIRE_DIGITS))
-            .expect_err("Estonian PIN2 requires QSCD and must fail closed");
-        assert!(matches!(
-            err,
-            AuthError::UnsupportedSlot {
-                scheme: PinReferenceScheme::Estonian,
-                slot: PinSlot::Pin2,
-            }
-        ));
-        assert!(transport.plain.is_none(), "no probe APDU sent");
-        assert!(transport.credential.is_none(), "no credential APDU sent");
+    fn estonian_verify_pin2_probes_and_ships_zero_padded_block_under_pin2_ref() {
+        const FIVE_DIGIT_PIN2: &[u8] = b"12345";
+        let mut transport = WireRecorder::answering(counter(THREE_RETRIES), StatusWord::Success);
+        let outcome = transport
+            .verify_pin2_with_scheme(PinReferenceScheme::Estonian, pin2(FIVE_DIGIT_PIN2))
+            .expect("Estonian PIN2 verifies in shared PKCS#15 eID app");
+        assert_eq!(outcome, VerifyOutcome::Ok);
+        let pin2_ref = PinReferenceScheme::Estonian.reference(PinSlot::Pin2);
+        assert_eq!(
+            transport.plain.as_deref(),
+            Some(verify_header(pin2_ref).as_slice())
+        );
+        let mut expected = verify_header(pin2_ref).to_vec();
+        expected.push(PIN_STORED_LENGTH as u8);
+        let mut block = FIVE_DIGIT_PIN2.to_vec();
+        block.resize(PIN_STORED_LENGTH, PinPadByte::ESTONIAN_EID.octet());
+        expected.extend_from_slice(&block);
+        assert_eq!(transport.credential.as_deref(), Some(expected.as_slice()));
     }
 }
 

@@ -183,14 +183,14 @@ impl<E: core::fmt::Debug + core::fmt::Display + 'static> core::error::Error for 
 /// of a probe, and no probe is sent.
 pub trait Pin2PaceChannelOps: Pin2PaceChannel + Sized {
     /// VERIFY PIN 2 inside the channel under the retry floor on the
-    /// channel's record: refused at two or one tries left or an unknown
+    /// channel's record: refused at one try left or an unknown
     /// record, sent otherwise. The card's answer settles the record; an
     /// unanswered presentation marks the record unknown unless already
     /// blocked.
     ///
     /// # Errors
     ///
-    /// [`AuthError::RetryFloor`] when the record reads two or one tries
+    /// [`AuthError::RetryFloor`] when the record reads one try
     /// left or is unknown; nothing is sent. [`AuthError`] on a transport
     /// failure or state transition. A wrong PIN is
     /// [`VerifyOutcome::WrongPin`], a blocked PIN
@@ -233,7 +233,7 @@ pub trait Pin2PaceChannelOps: Pin2PaceChannel + Sized {
     ///
     /// [`AuthError::PinLength`] when the card does not accept the length
     /// of an entry, and [`AuthError::RetryFloor`] when the PIN 2 record
-    /// reads two or one tries left or is unknown, both under
+    /// reads one try left or is unknown, both under
     /// [`Pin2ChangeError::Auth`]; nothing is sent either way. At no tries
     /// left or blocked the card answers for itself.
     /// [`Pin2ChangeError::Directory`] when DF.ESIGN cannot be made
@@ -384,7 +384,7 @@ pub trait PukPaceChannelOps: PukPaceChannel + Sized {
     ///
     /// [`AuthError::PinLength`] when the card does not accept the length
     /// of an entry, and [`AuthError::RetryFloor`] when the PUK record
-    /// reads two or one tries left or is unknown; nothing is sent either
+    /// reads one try left or is unknown; nothing is sent either
     /// way. At no tries left or blocked the card answers for itself.
     /// [`AuthError`] on a transport failure or state transition. A
     /// refused PUK is [`ManageOutcome::WrongCredential`]; a reset the card
@@ -435,7 +435,7 @@ pub trait Pin1PaceChannelOps: Pin1PaceChannel + Sized {
     ///
     /// [`AuthError::PinLength`] when the card does not accept the length
     /// of an entry, and [`AuthError::RetryFloor`] when the PIN 1 record
-    /// reads two or one tries left or is unknown; nothing is sent either
+    /// reads one try left or is unknown; nothing is sent either
     /// way. At no tries left or blocked the card answers for itself.
     /// [`AuthError`] on a transport failure or state transition. A wrong
     /// current PIN is [`ManageOutcome::WrongCredential`]; a reset the card

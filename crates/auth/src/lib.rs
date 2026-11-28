@@ -18,10 +18,10 @@
 //! reconstructed as types whose constructors preserve their invariants.
 //! The verification chain consumes a validated PIN through a
 //! crate-private path and ships it as a credential command, consumed
-//! exactly once; the retry floor refuses a PIN 1 or PIN 2 attempt at two
-//! or one tries left or an unreadable counter and sends it otherwise, the
-//! card answering for itself at zero or blocked, the one floor every
-//! surface stops at.
+//! exactly once; the retry floor refuses a PIN 1 or PIN 2 attempt at one
+//! try left or an unreadable counter and sends it otherwise, the card
+//! answering for itself at zero or blocked, the one floor every surface
+//! stops at.
 
 pub mod activation;
 pub mod credentials;
@@ -36,9 +36,13 @@ pub mod verify;
 pub use activation::{
     ActivationCode, ActivationReport, ActivationScheme, CardActivationNeeds,
     CredentialHealthReport, PinChangeRecord, pin_awaits_activation, read_pin_change_record,
-    read_puk_status_from_container,
+    read_pin_change_record_with_scheme, read_puk_status_from_container,
+    read_puk_status_from_container_with_scheme,
 };
-pub use credentials::{CredentialInputError, CredentialRole, Pin1, Pin2, Puk, UnvalidatedSecret};
+pub use credentials::{
+    CredentialInputError, CredentialRole, ESTONIAN_PIN2_MIN_LENGTH, Pin1, Pin2, Puk,
+    UnvalidatedSecret,
+};
 pub use manage::{ManageOutcome, PinManageOps, classify_manage_sw};
 pub use pace_channel::{
     ChannelProof, Pin1PaceChannel, Pin1PaceChannelOps, Pin2ChangeError, Pin2PaceChannel,

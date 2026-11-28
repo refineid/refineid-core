@@ -550,7 +550,7 @@ pub enum PaceError<E> {
     /// domain parameter this crate implements.
     NoSupportedSuite,
     /// The retry floor refused the PIN or the PUK before any `GENERAL
-    /// AUTHENTICATE` was sent: the card reported two or one tries left,
+    /// AUTHENTICATE` was sent: the card reported one try left,
     /// or no readable counter.
     RetryFloor(RetryFloorRefusal),
     /// The card reports the PIN or PUK password deactivated (BSI
@@ -682,7 +682,7 @@ pub(crate) type ScalarSource<'a> = &'a mut dyn FnMut(&mut [u8]) -> Result<(), rn
 /// A wrong Card Access Number spends no counter and surfaces as a
 /// status-word or token-mismatch failure. A PIN or PUK password is
 /// checked against the retry floor before the first `GENERAL
-/// AUTHENTICATE`: at two or one tries left, or a deactivated credential,
+/// AUTHENTICATE`: at one try left, or a deactivated credential,
 /// nothing further is sent; at no tries left the handshake goes on and
 /// the card answers for itself. A wrong PIN surfaces
 /// as [`PaceError::WrongPin`] and a wrong PUK as [`PaceError::WrongPuk`],
@@ -1146,11 +1146,9 @@ mod tests {
     /// Exchanges when the handshake stops at MSE:Set AT.
     const EXCHANGES_THROUGH_MSE: usize = 1;
     /// Tries left the floor serves at its lowest.
-    const TRIES_AT_FLOOR: u8 = 3;
-    /// Tries left just below the floor.
-    const TRIES_BELOW_FLOOR: u8 = 2;
-    /// Tries left when the PIN is suspended (BSI TR-03110-3 section
-    /// B.14.1).
+    const TRIES_AT_FLOOR: u8 = 2;
+    /// Tries left when the PIN is suspended / at its last try (BSI
+    /// TR-03110-3 section B.14.1), refused by the retry floor.
     const TRIES_SUSPENDED: u8 = 1;
     /// Tries left after one wrong attempt.
     const TRIES_AFTER_ONE_WRONG: u8 = 4;
@@ -1777,23 +1775,10 @@ mod tests {
     }
 
     #[test]
-    fn the_floor_serves_a_pin_at_three_tries_left() {
+    fn the_floor_serves_a_pin_at_two_tries_left() {
         let (exchanges, result) = pin1_run_with_mse_status(counter(TRIES_AT_FLOOR));
         assert!(result.is_ok());
         assert_eq!(exchanges, EXCHANGES_THROUGH_TOKENS);
-    }
-
-    #[test]
-    fn the_floor_refuses_two_tries_left_and_sends_nothing_further() {
-        let (exchanges, result) = pin1_run_with_mse_status(counter(TRIES_BELOW_FLOOR));
-        assert_eq!(exchanges, EXCHANGES_THROUGH_MSE);
-        assert!(matches!(
-            result,
-            Err(PaceError::RetryFloor(RetryFloorRefusal::TriesBelowFloor {
-                credential: FlooredCredential::Pin1,
-                remaining,
-            })) if remaining.get() == TRIES_BELOW_FLOOR
-        ));
     }
 
     #[test]
@@ -1844,7 +1829,7 @@ mod tests {
         let card_access = access(citizen_card_access());
         let suite = generic(PaceDomain::BrainpoolP384r1, &card_access);
         let mut card = HonestCard::<bp384::BrainpoolP384r1>::new(suite, PASSWORD_REF_CAN);
-        card.mse_status = counter(TRIES_BELOW_FLOOR);
+        card.mse_status = counter(TRIES_SUSPENDED);
         let can = can();
         let result = run(&mut card, &card_access, &Password::Can(&can));
         assert_eq!(card.exchanges, EXCHANGES_THROUGH_MSE);
@@ -1932,7 +1917,7 @@ mod tests {
     }
 
     #[test]
-    fn the_floor_serves_the_puk_at_three_tries_and_the_session_keeps_the_count() {
+    fn the_floor_serves_the_puk_at_two_tries_and_the_session_keeps_the_count() {
         let (card, result) = puk_run_with_mse_status(counter(TRIES_AT_FLOOR));
         assert_eq!(card.exchanges, EXCHANGES_THROUGH_TOKENS);
         assert!(matches!(
@@ -1942,18 +1927,16 @@ mod tests {
     }
 
     #[test]
-    fn the_floor_refuses_the_puk_at_two_and_one_tries_and_sends_nothing_further() {
-        for tries in [TRIES_BELOW_FLOOR, TRIES_SUSPENDED] {
-            let (card, result) = puk_run_with_mse_status(counter(tries));
-            assert_eq!(card.exchanges, EXCHANGES_THROUGH_MSE);
-            assert!(matches!(
-                result,
-                Err(PaceError::RetryFloor(RetryFloorRefusal::TriesBelowFloor {
-                    credential: FlooredCredential::Puk,
-                    remaining,
-                })) if remaining.get() == tries
-            ));
-        }
+    fn the_floor_refuses_the_puk_at_one_try_and_sends_nothing_further() {
+        let (card, result) = puk_run_with_mse_status(counter(TRIES_SUSPENDED));
+        assert_eq!(card.exchanges, EXCHANGES_THROUGH_MSE);
+        assert!(matches!(
+            result,
+            Err(PaceError::RetryFloor(RetryFloorRefusal::TriesBelowFloor {
+                credential: FlooredCredential::Puk,
+                remaining,
+            })) if remaining.get() == TRIES_SUSPENDED
+        ));
     }
 
     #[test]

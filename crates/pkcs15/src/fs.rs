@@ -36,9 +36,10 @@ use crate::directory::{
     ApplicationDirectory, ApplicationDirectoryRead, ApplicationLabel,
     AuthenticationCredentialLookup, CertificateDirectory, CertificateDirectoryRead,
     CertificateRead, CredentialDirectory, DerCertificate, DirectoryLookup,
-    DiscoveredAuthenticationProfile, EF_DIR_FID, EF_ODF_FID, ESTONIAN_EID_APPLICATION_LABEL,
-    FileContent, FileEnd, ObjectClass, ObjectDirectory, ObjectDirectoryRead, Pkcs15Path,
-    PrivateKeyDirectory, PrivateKeyDirectoryRead,
+    DiscoveredAuthenticationProfile, DiscoveredQualifiedSignatureProfile, EF_DIR_FID, EF_ODF_FID,
+    ESTONIAN_EID_APPLICATION_LABEL, FileContent, FileEnd, ObjectClass, ObjectDirectory,
+    ObjectDirectoryRead, Pkcs15Path, PrivateKeyDirectory, PrivateKeyDirectoryRead,
+    QualifiedSignatureCredentialLookup,
 };
 
 /// The PKCS#15 application identifier the FINEID card publishes per
@@ -73,6 +74,18 @@ pub const EF_SIGN_CERT_FID: FileId = FileId::from_u16(0x4332);
 pub const EF_AUTH_CERT_ALT_FID: FileId = FileId::from_u16(0x4333);
 /// DF.DD, the Estonian personal-data directory on the 2025 platform.
 pub const DF_ESTONIAN_PERSONAL_DATA_FID: FileId = FileId::from_u16(0xDFDD);
+/// DF.AWP (`ADF1`), the EstEID 2025 authentication certificate directory
+/// (`GED24035_015` section 8.5).
+pub const DF_ESTONIAN_AWP_FID: FileId = FileId::from_u16(0xADF1);
+/// DF.QSCD (`ADF2`), the EstEID 2025 qualified-signature certificate
+/// directory (`GED24035_015` section 8.5).
+pub const DF_ESTONIAN_QSCD_FID: FileId = FileId::from_u16(0xADF2);
+/// EF.3411 under `ADF1`, the EstEID 2025 authentication certificate
+/// (`GED24035_015` section 8.5).
+pub const EF_ESTONIAN_2025_AUTH_CERT_FID: FileId = FileId::from_u16(0x3411);
+/// EF.3421 under `ADF2`, the EstEID 2025 qualified-signature certificate
+/// (`GED24035_015` section 8.5).
+pub const EF_ESTONIAN_2025_SIGN_CERT_FID: FileId = FileId::from_u16(0x3421);
 /// EF.5007 under DF.DD, PD7 Document number on the 2025 platform: the
 /// number the card body prints, as plain ASCII with no TLV wrapper
 /// (GED24035, section 6.1). Readable without a PIN.
@@ -1214,6 +1227,146 @@ pub trait Pkcs15Ops: CardTransport {
             .map_err(|_empty| Pkcs15Error::InvalidData("EF.DIR"))?;
         let aid = self.discover_application_by_label(&label)?;
         self.discover_authentication_profile(&aid)
+    }
+
+    /// Discover the qualified-signature certificate path, key reference,
+    /// EF.AOD path, PIN 2 object, and optional PUK object for any
+    /// ISO/IEC 7816-15 application identified by `aid`.
+    ///
+    /// Leaves `aid` selected on success.
+    ///
+    /// # Errors
+    ///
+    /// Selection, read, or validation failures across EF.ODF, EF.CDF,
+    /// EF.PrKDF, or EF.AOD, or an absent / ambiguous qualified-signature
+    /// credential or PIN 2 object.
+    fn discover_qualified_signature_profile(
+        &mut self,
+        aid: &Aid,
+    ) -> Result<DiscoveredQualifiedSignatureProfile, Pkcs15Error<Self::Error>>
+    where
+        Self: Sized,
+    {
+        let odf = self.read_object_directory(aid)?;
+        let cdf_paths: Vec<Pkcs15Path> = odf
+            .plain_file_paths(ObjectClass::Certificates)
+            .ok_or(Pkcs15Error::InvalidData("EF.ODF"))?
+            .into_iter()
+            .cloned()
+            .collect();
+        let prkdf_paths: Vec<Pkcs15Path> = odf
+            .plain_file_paths(ObjectClass::PrivateKeys)
+            .ok_or(Pkcs15Error::InvalidData("EF.ODF"))?
+            .into_iter()
+            .cloned()
+            .collect();
+        let aod_paths: Vec<Pkcs15Path> = odf
+            .plain_file_paths(ObjectClass::AuthObjects)
+            .ok_or(Pkcs15Error::InvalidData("EF.ODF"))?
+            .into_iter()
+            .cloned()
+            .collect();
+
+        let mut cdfs = Vec::with_capacity(cdf_paths.len());
+        for path in &cdf_paths {
+            if !path.is_absolute_from_mf() {
+                self.select_application(aid)?;
+            }
+            cdfs.push(self.read_certificate_directory_at(path)?);
+        }
+        let certificates = CertificateDirectory::merge(cdfs);
+
+        let mut prkdfs = Vec::with_capacity(prkdf_paths.len());
+        for path in &prkdf_paths {
+            if !path.is_absolute_from_mf() {
+                self.select_application(aid)?;
+            }
+            prkdfs.push(self.read_private_key_directory_at(path)?);
+        }
+        let private_keys = PrivateKeyDirectory::merge(prkdfs);
+
+        let credentials = CredentialDirectory::of(&certificates, &private_keys)
+            .map_err(|_pair_err| Pkcs15Error::InvalidData("credential directory"))?;
+        let QualifiedSignatureCredentialLookup::Unique(sign_cred) =
+            credentials.unique_qualified_signature_credential()
+        else {
+            return Err(Pkcs15Error::InvalidData("qualified signature credential"));
+        };
+        if !sign_cred.certificate().is_x509() {
+            return Err(Pkcs15Error::InvalidData("qualified signature certificate"));
+        }
+        let sign_cert_path = sign_cred.path().cloned().ok_or(Pkcs15Error::InvalidData(
+            "qualified signature certificate path",
+        ))?;
+        let sign_key_reference = sign_cred.key_reference().ok_or(Pkcs15Error::InvalidData(
+            "qualified signature key reference",
+        ))?;
+        let pin2_auth_id = sign_cred
+            .key()
+            .auth_id()
+            .cloned()
+            .ok_or(Pkcs15Error::InvalidData("qualified signature key authId"))?;
+
+        let mut aod_files = Vec::with_capacity(aod_paths.len());
+        let mut aod_list = Vec::with_capacity(aod_paths.len());
+        for path in &aod_paths {
+            if !path.is_absolute_from_mf() {
+                self.select_application(aid)?;
+            }
+            let objects = self.read_authentication_objects_at(path)?;
+            aod_files.push((path.clone(), objects.clone()));
+            aod_list.push(objects);
+        }
+        let all_aod = AuthenticationObjects::merge(aod_list);
+        let pin2 = all_aod
+            .unique_by_auth_id(&pin2_auth_id)
+            .cloned()
+            .ok_or(Pkcs15Error::InvalidData("EF.AOD"))?;
+        if pin2.flags().unblocking_password() {
+            return Err(Pkcs15Error::InvalidData("EF.AOD"));
+        }
+        let aod_path = aod_files
+            .into_iter()
+            .find_map(|(path, objects)| objects.unique_by_auth_id(&pin2_auth_id).map(|_| path))
+            .ok_or(Pkcs15Error::InvalidData("EF.AOD"))?;
+        let puk = pin2.protecting_auth_id().and_then(|puk_id| {
+            all_aod
+                .unique_by_auth_id(puk_id)
+                .filter(|object| object.flags().unblocking_password())
+                .cloned()
+        });
+
+        self.select_application(aid)?;
+        Ok(DiscoveredQualifiedSignatureProfile::new(
+            aid.clone(),
+            sign_cert_path,
+            crate::directory::QualifiedKeyReference::of(sign_key_reference),
+            aod_path,
+            pin2_auth_id,
+            pin2,
+            puk,
+        ))
+    }
+
+    /// Discover the Estonian eID qualified-signature profile via EF.DIR
+    /// (`"Estonian eID"`) followed by full ISO/IEC 7816-15 EF.ODF /
+    /// EF.CDF / EF.PrKDF / EF.AOD resolution.
+    ///
+    /// # Errors
+    ///
+    /// [`Pkcs15Error::Status`] with [`StatusWord::FileNotFound`] when
+    /// EF.DIR or the `"Estonian eID"` application is absent; otherwise
+    /// as [`Self::discover_qualified_signature_profile`].
+    fn discover_estonian_qualified_signature_profile(
+        &mut self,
+    ) -> Result<DiscoveredQualifiedSignatureProfile, Pkcs15Error<Self::Error>>
+    where
+        Self: Sized,
+    {
+        let label = ApplicationLabel::try_from(ESTONIAN_EID_APPLICATION_LABEL)
+            .map_err(|_empty| Pkcs15Error::InvalidData("EF.DIR"))?;
+        let aid = self.discover_application_by_label(&label)?;
+        self.discover_qualified_signature_profile(&aid)
     }
 
     /// Read and parse EF.AOD, the card's authentication objects, under

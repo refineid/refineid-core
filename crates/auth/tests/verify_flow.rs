@@ -25,17 +25,18 @@ use refineid_apdu::{
 };
 use refineid_auth::{
     AuthError, FlooredCredential, PIN_STORED_LENGTH, PIN1_REFERENCE, PIN1_REFERENCE_ORGANIZATIONAL,
-    PIN2_REFERENCE, Pin1, Pin2, PinOps, PinReferenceScheme, PinSlot, PinStatus, RetryFloorRefusal,
-    UnvalidatedSecret, VerifyOutcome,
+    PIN2_REFERENCE, PIN2_REFERENCE_ESTONIAN, Pin1, Pin2, PinOps, PinReferenceScheme, PinSlot,
+    PinStatus, RetryFloorRefusal, UnvalidatedSecret, VerifyOutcome,
 };
 
 /// A valid PIN1 fixture.
 const PIN1_DIGITS: &[u8] = b"1234";
 /// A valid PIN2 fixture.
 const PIN2_DIGITS: &[u8] = b"654321";
-/// A retry count returned on a wrong PIN; also the highest count the
-/// retry floor refuses.
+/// A retry count returned on a wrong PIN (served by the floor).
 const TWO_RETRIES: u8 = 2;
+/// The retry count the retry floor refuses (the last try).
+const ONE_RETRY: u8 = 1;
 /// A retry count the retry floor serves.
 const FIVE_RETRIES: u8 = 5;
 /// Wire index of the P2 reference byte.
@@ -141,8 +142,8 @@ fn verify_pin1_ships_the_padded_block_as_a_credential_command() {
 }
 
 #[test]
-fn a_verify_at_two_tries_left_is_refused_with_no_digits_on_the_wire() {
-    let mut transport = Recorder::answering(counter(TWO_RETRIES), StatusWord::Success);
+fn a_verify_at_one_try_left_is_refused_with_no_digits_on_the_wire() {
+    let mut transport = Recorder::answering(counter(ONE_RETRY), StatusWord::Success);
     let refused = transport.verify_pin1_with_scheme(PinReferenceScheme::Citizen, pin1());
     assert!(matches!(
         refused,
@@ -283,4 +284,151 @@ impl CardTransport for SchemeAware {
         self.credential_wire = Some(command.expose_wire(<[u8]>::to_vec));
         Ok(TransportOutcome::Response(response(StatusWord::Success)))
     }
+}
+
+#[test]
+fn estonian_verify_pin2_primitive_enforces_retry_floor_and_df2f_before_sending_verify() {
+    use refineid_ber::BerEncoder;
+
+    const GET_DATA_INS: u8 = 0xCB;
+    const INS_INDEX: usize = 1;
+    const ESTONIAN_THREE_TRIES: u8 = 3;
+    const CONTAINER_TEMPLATE_TAG: u8 = 0xA0;
+    const CONTAINER_REF_TAG: u8 = 0x83;
+    const PIN_CHANGED_TAG: u16 = 0xDF2F;
+    const FLAG_UNCHANGED: u8 = 0x00;
+    const FLAG_CHANGED: u8 = 0x01;
+
+    struct EstonianPin2Card {
+        probe_sw: StatusWord,
+        verify_sw: StatusWord,
+        pin2_changed: bool,
+        get_data_seen: usize,
+        credential_wire: Option<Vec<u8>>,
+    }
+
+    impl CardTransport for EstonianPin2Card {
+        type Error = String;
+
+        fn transmit(&mut self, command: &CommandApdu) -> Result<TransportOutcome, Self::Error> {
+            let wire = command.as_bytes();
+            if wire.get(INS_INDEX).copied() == Some(GET_DATA_INS) {
+                self.get_data_seen += 1;
+                let flag = if self.pin2_changed {
+                    FLAG_CHANGED
+                } else {
+                    FLAG_UNCHANGED
+                };
+                let mut inner = BerEncoder::default();
+                inner
+                    .push_tlv(CONTAINER_REF_TAG, [PIN2_REFERENCE_ESTONIAN])
+                    .expect("encodes ref");
+                inner
+                    .push_tlv_tag2(PIN_CHANGED_TAG, [flag])
+                    .expect("encodes df2f");
+                let mut outer = BerEncoder::default();
+                outer
+                    .push_tlv(CONTAINER_TEMPLATE_TAG, inner.finish())
+                    .expect("encodes template");
+                let [sw1, sw2] = StatusWord::Success.as_u16().to_be_bytes();
+                return Ok(TransportOutcome::Response(ResponseApdu {
+                    body: outer.finish(),
+                    sw1,
+                    sw2,
+                }));
+            }
+            Ok(TransportOutcome::Response(response(self.probe_sw)))
+        }
+
+        fn transmit_credential(
+            &mut self,
+            command: CredentialCommand,
+        ) -> Result<TransportOutcome, Self::Error> {
+            self.credential_wire = Some(command.expose_wire(<[u8]>::to_vec));
+            Ok(TransportOutcome::Response(response(self.verify_sw)))
+        }
+    }
+
+    // Unchanged initial PIN 2 (DF 2F == 00) is refused directly by verify_pin2_with_scheme.
+    let mut unchanged = EstonianPin2Card {
+        probe_sw: counter(ESTONIAN_THREE_TRIES),
+        verify_sw: StatusWord::Success,
+        pin2_changed: false,
+        get_data_seen: 0,
+        credential_wire: None,
+    };
+    let refused = unchanged.verify_pin2_with_scheme(PinReferenceScheme::Estonian, pin2());
+    assert!(matches!(refused, Err(AuthError::Pin2ChangeRequired)));
+    assert_eq!(unchanged.get_data_seen, 1);
+    assert!(
+        unchanged.credential_wire.is_none(),
+        "no VERIFY credential sent when DF 2F == 00"
+    );
+
+    // At 1 try left, retry floor refuses BEFORE DF 2F so PUK recovery takes precedence.
+    let mut last_try = EstonianPin2Card {
+        probe_sw: counter(ONE_RETRY),
+        verify_sw: StatusWord::Success,
+        pin2_changed: false,
+        get_data_seen: 0,
+        credential_wire: None,
+    };
+    let floor_refused = last_try.verify_pin2_with_scheme(PinReferenceScheme::Estonian, pin2());
+    assert!(matches!(
+        floor_refused,
+        Err(AuthError::RetryFloor(RetryFloorRefusal::TriesBelowFloor {
+            credential: FlooredCredential::Pin2,
+            ..
+        }))
+    ));
+    assert_eq!(last_try.get_data_seen, 0);
+    assert!(last_try.credential_wire.is_none());
+
+    // Blocked or exhausted PIN 2 skips DF 2F and lets the card answer Locked (PUK recovery).
+    const NO_RETRIES: u8 = 0;
+    for blocked_sw in [StatusWord::AuthenticationBlocked, counter(NO_RETRIES)] {
+        let mut blocked = EstonianPin2Card {
+            probe_sw: blocked_sw,
+            verify_sw: StatusWord::AuthenticationBlocked,
+            pin2_changed: false,
+            get_data_seen: 0,
+            credential_wire: None,
+        };
+        let outcome = blocked
+            .verify_pin2_with_scheme(PinReferenceScheme::Estonian, pin2())
+            .expect("blocked PIN 2 reaches card");
+        assert_eq!(outcome, VerifyOutcome::Locked);
+        assert_eq!(blocked.get_data_seen, 0);
+        assert!(blocked.credential_wire.is_some());
+    }
+
+    // Changed PIN 2 (DF 2F == 01) passes and transmits zero-padded VERIFY under PIN 2 reference.
+    const LC_INDEX: usize = 4;
+    let mut changed = EstonianPin2Card {
+        probe_sw: counter(ESTONIAN_THREE_TRIES),
+        verify_sw: StatusWord::Success,
+        pin2_changed: true,
+        get_data_seen: 0,
+        credential_wire: None,
+    };
+    let ok = changed
+        .verify_pin2_with_scheme(PinReferenceScheme::Estonian, pin2())
+        .expect("changed Estonian PIN 2 verifies");
+    assert_eq!(ok, VerifyOutcome::Ok);
+    assert_eq!(changed.get_data_seen, 1);
+    let wire = changed.credential_wire.expect("VERIFY transmitted");
+    assert_eq!(wire.get(P2_INDEX).copied(), Some(PIN2_REFERENCE_ESTONIAN));
+    assert_eq!(
+        wire.get(LC_INDEX).copied(),
+        u8::try_from(PIN_STORED_LENGTH).ok()
+    );
+    assert_eq!(
+        &wire[DATA_OFFSET..DATA_OFFSET + PIN2_DIGITS.len()],
+        PIN2_DIGITS
+    );
+    assert!(
+        wire[DATA_OFFSET + PIN2_DIGITS.len()..]
+            .iter()
+            .all(|&byte| byte == refineid_auth::verify::ESTONIAN_EID_PAD_OCTET)
+    );
 }

@@ -61,9 +61,9 @@ const SHORT_PIN2: &[u8] = b"1234";
 /// section 4.3.2).
 const PUK_INITIAL_TRIES: u8 = 5;
 /// The lowest count the floor serves.
-const TRIES_AT_FLOOR: u8 = 3;
-/// Just below the floor.
-const TRIES_BELOW_FLOOR: u8 = 2;
+const TRIES_AT_FLOOR: u8 = 2;
+/// Just below the floor (the last try).
+const TRIES_BELOW_FLOOR: u8 = 1;
 /// A status word outside the modeled set, an answer whose effect on the
 /// counter is unknown.
 const UNMODELED_SW: u16 = 0x6F00;

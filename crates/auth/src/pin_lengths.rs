@@ -34,8 +34,8 @@ use core::fmt;
 use refineid_pkcs15::{AuthenticationObjects, PasswordLengthRange};
 
 use crate::credentials::{
-    CredentialRole, FINEID_PIN1_MIN_LENGTH, FINEID_PIN2_MIN_LENGTH, PIN_MAX_LENGTH, PIN_MIN_LENGTH,
-    PUK_MAX_LENGTH, PUK_MIN_LENGTH, Pin1, Pin2, Puk,
+    CredentialRole, ESTONIAN_PIN2_MIN_LENGTH, FINEID_PIN1_MIN_LENGTH, FINEID_PIN2_MIN_LENGTH,
+    PIN_MAX_LENGTH, PIN_MIN_LENGTH, PUK_MAX_LENGTH, PUK_MIN_LENGTH, Pin1, Pin2, Puk,
 };
 use crate::verify::{PinReferenceScheme, PinSlot};
 
@@ -179,10 +179,14 @@ const PUK_CAPACITY: PasswordLengthRange = length_range(PUK_MIN_LENGTH, PUK_MAX_L
 /// FINEID bounds of PIN 1, the fallback when the card lists none.
 const FINEID_PIN1_BOUNDS: PasswordLengthRange =
     length_range(FINEID_PIN1_MIN_LENGTH, PIN_MAX_LENGTH);
-/// FINEID bounds of PIN 2, the fallback when the card lists none.
+/// FINEID bounds of PIN 2, the fallback when a FINEID card lists none.
 const FINEID_PIN2_BOUNDS: PasswordLengthRange =
     length_range(FINEID_PIN2_MIN_LENGTH, PIN_MAX_LENGTH);
-/// FINEID bounds of the PUK, the fallback when the card lists none.
+/// Estonian eID bounds of PIN 2 (GED24035_015 section 3.1), the fallback
+/// when an Estonian eID card lists none.
+const ESTONIAN_PIN2_BOUNDS: PasswordLengthRange =
+    length_range(ESTONIAN_PIN2_MIN_LENGTH, PIN_MAX_LENGTH);
+/// FINEID and Estonian eID bounds of the PUK, the fallback when the card lists none.
 const FINEID_PUK_BOUNDS: PasswordLengthRange = PUK_CAPACITY;
 
 /// A length constant pair as a range, evaluated at compile time: bounds
@@ -231,10 +235,14 @@ impl CardPinLengths {
         pin2: ListedLength,
         puk: ListedLength,
     ) -> Self {
+        let pin2_fallback = match numbering {
+            PinReferenceScheme::Estonian => ESTONIAN_PIN2_BOUNDS,
+            PinReferenceScheme::Citizen | PinReferenceScheme::Organizational => FINEID_PIN2_BOUNDS,
+        };
         Self {
             numbering,
             pin1: CredentialLengths::new(pin1, PIN_CAPACITY, FINEID_PIN1_BOUNDS),
-            pin2: CredentialLengths::new(pin2, PIN_CAPACITY, FINEID_PIN2_BOUNDS),
+            pin2: CredentialLengths::new(pin2, PIN_CAPACITY, pin2_fallback),
             puk: CredentialLengths::new(puk, PUK_CAPACITY, FINEID_PUK_BOUNDS),
         }
     }
@@ -599,24 +607,38 @@ mod tests {
     }
 
     #[test]
-    fn not_listed_falls_back_to_the_fineid_bounds() {
-        let lengths = CardPinLengths::not_listed(PinReferenceScheme::Organizational);
+    fn not_listed_falls_back_to_profile_bounds() {
         let fallback = |min: usize, max: usize| {
             PasswordLengthRange::new(
                 u8::try_from(min).expect("fits"),
                 u8::try_from(max).expect("fits"),
             )
         };
+        let fineid = CardPinLengths::not_listed(PinReferenceScheme::Organizational);
         assert_eq!(
-            lengths.pin1().accepted(),
+            fineid.pin1().accepted(),
             fallback(FINEID_PIN1_MIN_LENGTH, PIN_MAX_LENGTH)
         );
         assert_eq!(
-            lengths.pin2().accepted(),
+            fineid.pin2().accepted(),
             fallback(FINEID_PIN2_MIN_LENGTH, PIN_MAX_LENGTH)
         );
         assert_eq!(
-            lengths.puk().accepted(),
+            fineid.puk().accepted(),
+            fallback(PUK_MIN_LENGTH, PUK_MAX_LENGTH)
+        );
+
+        let estonian = CardPinLengths::not_listed(PinReferenceScheme::Estonian);
+        assert_eq!(
+            estonian.pin1().accepted(),
+            fallback(FINEID_PIN1_MIN_LENGTH, PIN_MAX_LENGTH)
+        );
+        assert_eq!(
+            estonian.pin2().accepted(),
+            fallback(crate::credentials::ESTONIAN_PIN2_MIN_LENGTH, PIN_MAX_LENGTH)
+        );
+        assert_eq!(
+            estonian.puk().accepted(),
             fallback(PUK_MIN_LENGTH, PUK_MAX_LENGTH)
         );
     }

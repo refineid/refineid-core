@@ -61,7 +61,7 @@ use refineid_auth::{
     PinReferenceScheme, VerifyOutcome, check_retry_floor,
 };
 use refineid_pace::{OpenedByPin2, Pin2PresentationSpent, SmTransport};
-use refineid_pkcs15::{KeyReference, Pkcs15Error, Pkcs15Ops as _};
+use refineid_pkcs15::{KeyReference, Pkcs15Error, Pkcs15Ops as _, QualifiedKeyReference};
 use zeroize::Zeroizing;
 
 use commands::{
@@ -83,27 +83,33 @@ pub const KEY_REF_SIGN: u8 = 0x02;
 /// bit 8 over the object number (IAS-ECC v1.0.1 section 4.4); the global
 /// form names no key and the signature answers `6A88`.
 pub const ORG_QUALIFIED_KEY_REF: u8 = 0x82;
+/// Default EstEID 2025 qualified-signature key reference (`GED24035_015`
+/// section 8.3.4 / Annex C, `EF.PrKD`). Callers that have read `EF.PrKDF`
+/// should prefer [`SignOps::unlock_qualified_key_with_reference`] so
+/// re-keyed cards use their discovered key reference.
+pub const ESTONIAN_QUALIFIED_KEY_REF: u8 = 0x05;
 
 /// Which card family's signing chain and key numbering to drive.
 ///
-/// The citizen card loads the host digest with PSO:HASH and signs an
-/// empty PSO:CDS; the organizational card carries the digest inline in
-/// PSO:CDS and names its qualified key by the local reference; the
-/// Estonian eID card signs its authentication key through PSO:HASH plus
-/// an empty PSO:CDS in the eID application, while qualified signing
-/// lives in the separate QSCD application and fails closed until QSCD
-/// support lands. The family is resolved once - the auth crate's
-/// counter-safe probe settles it when a PIN is verified - and passed to
-/// the signing entry points.
+/// The citizen card and EstEID 2025 card load the host digest with
+/// PSO:HASH and sign an empty PSO:CDS; the organizational card carries
+/// the digest inline in PSO:CDS and names its qualified key by the local
+/// reference. On EstEID 2025, qualified signing checks the counter-safe
+/// `DF 2F` PIN 2 changed flag before verifying PIN 2 so initial-PIN-2
+/// cards fail cleanly without spending a try. The family is resolved
+/// once - the auth crate's counter-safe probe settles it when a PIN is
+/// verified - and passed to the signing entry points.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignScheme {
     /// FINEID S1 numbering and chain: the citizen cards.
     Citizen,
     /// FINEID S4 numbering and chain: the organizational cards.
     Organizational,
-    /// Estonian eID authentication-key signing chain in the eID
-    /// application. Qualified signing is refused until QSCD support is
-    /// implemented.
+    /// EstEID 2025 numbering and chain (`GED24035_015`) in the shared
+    /// PKCS#15 eID application: authentication key and
+    /// qualified-signature key (EF.PrKDF-discovered reference or the
+    /// default [`ESTONIAN_QUALIFIED_KEY_REF`]) over PSO:HASH plus an
+    /// empty PSO:CDS.
     Estonian,
 }
 
@@ -156,10 +162,11 @@ impl KeyRef {
     /// `key` has no supported reference under `scheme`.
     ///
     /// The organizational qualified-signature key is local to DF.ESIGN
-    /// and named by [`ORG_QUALIFIED_KEY_REF`]. The Estonian qualified
-    /// signature key lives in the separate QSCD application with a
-    /// card-specific EF.PrKDF reference, so `(SignScheme::Estonian,
-    /// KeyRef::Sign)` has no hardcoded reference and returns `None`.
+    /// and named by [`ORG_QUALIFIED_KEY_REF`]. The EstEID 2025 default
+    /// qualified-signature key is [`ESTONIAN_QUALIFIED_KEY_REF`];
+    /// callers with a discovered EF.PrKDF [`KeyReference`] should pass
+    /// it to [`SignOps::unlock_qualified_key_with_reference`] so
+    /// re-keyed cards follow EF.PrKDF.
     #[must_use]
     pub const fn reference(self, scheme: SignScheme) -> Option<u8> {
         match (scheme, self) {
@@ -168,7 +175,7 @@ impl KeyRef {
             (SignScheme::Organizational, Self::Auth) => Some(KEY_REF_AUTH),
             (SignScheme::Organizational, Self::Sign) => Some(ORG_QUALIFIED_KEY_REF),
             (SignScheme::Estonian, Self::Auth) => Some(KEY_REF_AUTH),
-            (SignScheme::Estonian, Self::Sign) => None,
+            (SignScheme::Estonian, Self::Sign) => Some(ESTONIAN_QUALIFIED_KEY_REF),
         }
     }
 }
@@ -240,6 +247,11 @@ pub enum QualifiedUnlockError<E> {
     /// Qualified signing is not supported for this card family; nothing
     /// was sent to the card.
     UnsupportedScheme(SignScheme),
+    /// The card requires changing its initial Signature PIN 2 before
+    /// qualified signing is allowed (EstEID 2025, `GED24035_015`
+    /// sections 3.1, 7.8.1 and 8.3.4: `DF 2F == 00`); PIN 2 was not
+    /// verified and no retry was spent.
+    Pin2ChangeRequired,
     /// DF.ESIGN could not be made current; PIN 2 was not sent.
     Directory(Pkcs15Error<E>),
     /// VERIFY PIN 2 failed in transport or assembly.
@@ -254,6 +266,9 @@ impl<E: core::fmt::Display> core::fmt::Display for QualifiedUnlockError<E> {
             Self::UnsupportedScheme(scheme) => {
                 write!(f, "qualified signing is not supported under {scheme:?}")
             }
+            Self::Pin2ChangeRequired => {
+                f.write_str("Signature PIN 2 must be changed before signing documents")
+            }
             Self::Directory(e) => write!(f, "select DF.ESIGN: {e}"),
             Self::Verify(e) => write!(f, "VERIFY Signature PIN 2: {e}"),
             Self::PinRefused(outcome) => write!(f, "the card refused Signature PIN 2: {outcome:?}"),
@@ -267,15 +282,14 @@ impl<E: core::fmt::Debug + core::fmt::Display + 'static> core::error::Error
 }
 
 /// Verify Signature PIN 2 in the directory the qualified-signature key lives
-/// in, refusing unsupported schemes before transmitting any APDU.
+/// in. On EstEID 2025, `verify_pin2_with_scheme` enforces both the retry
+/// floor and the counter-safe `DF 2F` initial-PIN-2 requirement before
+/// transmitting any VERIFY credential APDU.
 fn verify_qualified_in_place<T: CardTransport>(
     transport: &mut T,
     scheme: SignScheme,
     pin: Pin2,
 ) -> Result<(), QualifiedUnlockError<T::Error>> {
-    if scheme == SignScheme::Estonian {
-        return Err(QualifiedUnlockError::UnsupportedScheme(scheme));
-    }
     if scheme == SignScheme::Organizational {
         transport
             .select_esign_directory()
@@ -283,7 +297,10 @@ fn verify_qualified_in_place<T: CardTransport>(
     }
     let outcome = transport
         .verify_pin2_with_scheme(scheme.pin_numbering(), pin)
-        .map_err(QualifiedUnlockError::Verify)?;
+        .map_err(|error| match error {
+            AuthError::Pin2ChangeRequired => QualifiedUnlockError::Pin2ChangeRequired,
+            other => QualifiedUnlockError::Verify(other),
+        })?;
     match outcome {
         VerifyOutcome::Ok => Ok(()),
         refused @ (VerifyOutcome::WrongPin { .. }
@@ -296,7 +313,8 @@ fn verify_qualified_in_place<T: CardTransport>(
 /// verification in the directory its qualified-signature key lives in
 /// (`DF.ESIGN` on the organizational card).
 ///
-/// Constructed only by [`QualifiedSignSession::open`] after a card-accepted
+/// Constructed only by [`QualifiedSignSession::open`] or
+/// [`QualifiedSignSession::open_with_reference`] after a card-accepted
 /// VERIFY of PIN 2. While this session exists it owns the transport
 /// exclusively and exposes no accessor to `T` and no [`CardTransport`]
 /// implementation, so no caller can send commands through it, clone an
@@ -320,6 +338,7 @@ fn verify_qualified_in_place<T: CardTransport>(
 pub struct QualifiedSignSession<T: CardTransport> {
     transport: T,
     scheme: SignScheme,
+    key: KeyTarget,
 }
 
 impl<T: CardTransport> QualifiedSignSession<T> {
@@ -328,9 +347,11 @@ impl<T: CardTransport> QualifiedSignSession<T> {
     ///
     /// On the organizational card this selects DF.ESIGN by name from the MF
     /// before probing and verifying PIN 2; on the citizen card it verifies
-    /// PIN 2 in the current context; on [`SignScheme::Estonian`] it fails
-    /// closed with [`QualifiedUnlockError::UnsupportedScheme`] before
-    /// transmitting any APDU.
+    /// PIN 2 in the current context; on [`SignScheme::Estonian`] it checks
+    /// the counter-safe `DF 2F` PIN-changed flag first (failing with
+    /// [`QualifiedUnlockError::Pin2ChangeRequired`] without verifying PIN 2
+    /// when initial PIN 2 is unchanged) and then probes and verifies PIN 2
+    /// in the shared PKCS#15 eID application.
     ///
     /// On any failure the caller receives the original `transport` back
     /// paired with the [`QualifiedUnlockError`].
@@ -347,7 +368,35 @@ impl<T: CardTransport> QualifiedSignSession<T> {
         if let Err(error) = verify_qualified_in_place(&mut transport, scheme, pin) {
             return Err((transport, error));
         }
-        Ok(Self { transport, scheme })
+        Ok(Self {
+            transport,
+            scheme,
+            key: KeyTarget::Fixed(KeyRef::Sign),
+        })
+    }
+
+    /// As [`Self::open`], targeting an EF.PrKDF-discovered
+    /// [`QualifiedKeyReference`] instead of the default scheme reference
+    /// (supporting re-keyed cards such as EstEID 2025 while rejecting
+    /// authentication key references at compile time).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open`].
+    pub fn open_with_reference(
+        mut transport: T,
+        scheme: SignScheme,
+        key_reference: QualifiedKeyReference,
+        pin: Pin2,
+    ) -> Result<Self, (T, QualifiedUnlockError<T::Error>)> {
+        if let Err(error) = verify_qualified_in_place(&mut transport, scheme, pin) {
+            return Err((transport, error));
+        }
+        Ok(Self {
+            transport,
+            scheme,
+            key: KeyTarget::Directory(key_reference.key_reference()),
+        })
     }
 
     /// The signing family under which Signature PIN 2 was verified.
@@ -363,7 +412,7 @@ impl<T: CardTransport> QualifiedSignSession<T> {
         let key = SigningKey {
             transport: &mut self.transport,
             scheme: self.scheme,
-            key: KeyTarget::Fixed(KeyRef::Sign),
+            key: self.key,
         };
         let result = sign(key);
         (self.transport, result)
@@ -461,7 +510,7 @@ pub trait Pin2ChannelSignOps: CardTransport + Sized {
     /// VERIFY over secure messaging with a counter, so the retry floor
     /// is applied to the channel's own record of PIN 2's counter
     /// (`refineid_auth::Pin2PaceChannel`) and no probe is sent: refused
-    /// at two or one tries left or an unknown record before any command,
+    /// at one try left or an unknown record before any command,
     /// sent otherwise. DF.ESIGN is then made current, as
     /// [`SignOps::unlock_qualified_key`] does; the card's answer settles
     /// the record. On a plain transport, [`SignOps::unlock_qualified_key`]
@@ -568,7 +617,7 @@ pub trait SignOps: CardTransport {
         SigningKey {
             transport: self,
             scheme,
-            key: KeyTarget::DirectoryAuth(key_reference),
+            key: KeyTarget::Directory(key_reference),
         }
     }
 
@@ -580,8 +629,12 @@ pub trait SignOps: CardTransport {
     /// PIN SIG"; IAS-ECC v1.0.1 section 4.4 for the local key
     /// reference), and the card answers `6A88` to the signature unless
     /// DF.ESIGN is the current DF. So this selects DF.ESIGN by name from
-    /// the MF first and only then sends PIN 2. The citizen card is sent
-    /// PIN 2 in the context the caller selected, as before.
+    /// the MF first and only then sends PIN 2. On EstEID 2025, this first
+    /// checks the counter-safe `DF 2F` PIN-changed flag (`GED24035_015`
+    /// section 8.3.4) and refuses with
+    /// [`QualifiedUnlockError::Pin2ChangeRequired`] before verifying PIN 2
+    /// when initial PIN 2 has not been changed yet. Citizen and EstEID
+    /// 2025 cards verify PIN 2 in the PKCS#15 application context.
     ///
     /// The returned key borrows the transport exclusively, so no command
     /// can move the card out of that context between the VERIFY and the
@@ -595,10 +648,8 @@ pub trait SignOps: CardTransport {
     ///
     /// # Errors
     ///
-    /// [`QualifiedUnlockError::UnsupportedScheme`] when `scheme` has no
-    /// supported qualified-signature path here (such as
-    /// [`SignScheme::Estonian`], whose qualified key and PIN 2 live in
-    /// the separate QSCD application; nothing is sent),
+    /// [`QualifiedUnlockError::Pin2ChangeRequired`] on EstEID 2025 when
+    /// initial PIN 2 has not yet been changed (PIN 2 is not verified),
     /// [`QualifiedUnlockError::Directory`] when DF.ESIGN cannot be made
     /// current (PIN 2 is not sent), [`QualifiedUnlockError::Verify`] on a
     /// VERIFY transport failure or a retry-floor refusal
@@ -620,6 +671,32 @@ pub trait SignOps: CardTransport {
         })
     }
 
+    /// As [`SignOps::unlock_qualified_key`], targeting an
+    /// EF.PrKDF-discovered [`QualifiedKeyReference`] so re-keyed cards
+    /// (such as EstEID 2025) pass their live directory key reference to
+    /// MSE:SET while rejecting authentication key references at compile
+    /// time.
+    ///
+    /// # Errors
+    ///
+    /// As [`SignOps::unlock_qualified_key`].
+    fn unlock_qualified_key_with_reference(
+        &mut self,
+        scheme: SignScheme,
+        key_reference: QualifiedKeyReference,
+        pin: Pin2,
+    ) -> Result<SigningKey<'_, Self>, QualifiedUnlockError<Self::Error>>
+    where
+        Self: Sized,
+    {
+        verify_qualified_in_place(self, scheme, pin)?;
+        Ok(SigningKey {
+            transport: self,
+            scheme,
+            key: KeyTarget::Directory(key_reference.key_reference()),
+        })
+    }
+
     /// Decipher an RSA cryptogram with a card private key, returning the
     /// recovered plaintext; the card strips the padding.
     ///
@@ -633,10 +710,10 @@ pub trait SignOps: CardTransport {
     ///
     /// # Errors
     ///
-    /// [`SignError::UnsupportedKey`] when `key` has no supported
-    /// reference under `scheme` (nothing is sent), transport failures, a
-    /// state transition, or a non-success status word at MSE:SET or any
-    /// chained PSO:DECIPHER command.
+    /// [`SignError::UnsupportedKey`] when `key` has no supported RSA
+    /// decipher reference under `scheme` (nothing is sent), transport
+    /// failures, a state transition, or a non-success status word at
+    /// MSE:SET or any chained PSO:DECIPHER command.
     fn decipher_rsa(
         &mut self,
         scheme: SignScheme,
@@ -647,6 +724,9 @@ pub trait SignOps: CardTransport {
     where
         Self: Sized,
     {
+        if scheme == SignScheme::Estonian && key == KeyRef::Sign {
+            return Err(SignError::UnsupportedKey { scheme, key });
+        }
         let key_ref = key
             .reference(scheme)
             .ok_or(SignError::UnsupportedKey { scheme, key })?;
@@ -706,11 +786,11 @@ impl<T: CardTransport + ?Sized> SignOps for T {}
 /// How [`SigningKey`] identifies the key reference passed to MSE:SET.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyTarget {
-    /// Fixed FINEID authentication or qualified-signature key role.
+    /// Fixed FINEID or default EstEID 2025 authentication or
+    /// qualified-signature key role.
     Fixed(KeyRef),
-    /// Authentication key reference discovered from the card's
-    /// EF.PrKDF.
-    DirectoryAuth(KeyReference),
+    /// Key reference discovered from the card's EF.PrKDF.
+    Directory(KeyReference),
 }
 
 /// A card private key ready to sign one digest: the transport, borrowed
@@ -940,8 +1020,8 @@ impl<T: CardTransport> SigningKey<'_, T> {
 
     /// Drive the resolved signing chain end to end and return the raw
     /// signature bytes: MSE:Set, then either PSO:HASH plus an empty
-    /// PSO:CDS (citizen and Estonian authentication) or a single
-    /// inline-digest PSO:CDS (organizational).
+    /// PSO:CDS (citizen and EstEID 2025) or a single inline-digest
+    /// PSO:CDS (organizational).
     fn drive_chain(
         self,
         alg_ref: SignatureAlgRef,
@@ -956,39 +1036,23 @@ impl<T: CardTransport> SigningKey<'_, T> {
                         key,
                     })?
             }
-            KeyTarget::DirectoryAuth(reference) => reference.as_u8(),
+            KeyTarget::Directory(reference) => reference.as_u8(),
         };
         let mse = MseSet { alg_ref, key_ref }
             .into_apdu()
             .map_err(SignError::Command)?;
         self.transport.exchange(&mse, "MSE:Set")?;
-        let signature = match (self.scheme, self.key) {
-            (
-                SignScheme::Citizen,
-                KeyTarget::Fixed(KeyRef::Auth | KeyRef::Sign) | KeyTarget::DirectoryAuth(_),
-            )
-            | (
-                SignScheme::Estonian,
-                KeyTarget::Fixed(KeyRef::Auth) | KeyTarget::DirectoryAuth(_),
-            ) => {
+        let signature = match self.scheme {
+            SignScheme::Citizen | SignScheme::Estonian => {
                 let load = PsoHashExternal { hash }
                     .into_apdu()
                     .map_err(SignError::Command)?;
                 self.transport.exchange(&load, "PSO:HASH")?;
                 PsoComputeDigitalSignature.into_apdu(le)
             }
-            (
-                SignScheme::Organizational,
-                KeyTarget::Fixed(KeyRef::Auth | KeyRef::Sign) | KeyTarget::DirectoryAuth(_),
-            ) => PsoComputeDigitalSignature
+            SignScheme::Organizational => PsoComputeDigitalSignature
                 .into_apdu_with_digest(hash, le)
                 .map_err(SignError::Command)?,
-            (SignScheme::Estonian, KeyTarget::Fixed(KeyRef::Sign)) => {
-                return Err(SignError::UnsupportedKey {
-                    scheme: self.scheme,
-                    key: KeyRef::Sign,
-                });
-            }
         };
         Ok(self.transport.exchange(&signature, "PSO:CDS")?.body)
     }
@@ -1002,8 +1066,8 @@ mod tests {
     use refineid_pkcs15::{FileContent, FileEnd, PrivateKeyDirectory, PrivateKeyDirectoryRead};
 
     use super::{
-        ECDSA_P384_SIG_BYTES, KeyRef, KeyTarget, QualifiedSignSession, SHA384_LEN, SignError,
-        SignOps, SignScheme, SigningKey,
+        ECDSA_P384_SIG_BYTES, KeyRef, KeyTarget, QualifiedSignSession, SHA384_LEN, SignOps,
+        SignScheme, SigningKey,
     };
     use crate::commands::{MseSet, SignatureAlgRef};
 
@@ -1089,23 +1153,28 @@ mod tests {
     const THREE_COMMANDS: usize = 3;
 
     #[test]
-    fn drive_chain_refuses_estonian_sign_key_without_transmitting() {
-        let mut transport = NeverTransmitting;
+    fn drive_chain_drives_estonian_qualified_key_with_default_reference() {
+        let mut card = RecordingSignCard {
+            commands: Vec::new(),
+            signature: vec![SIG_FILL; ECDSA_P384_SIG_BYTES],
+        };
         let key = SigningKey {
-            transport: &mut transport,
+            transport: &mut card,
             scheme: SignScheme::Estonian,
             key: KeyTarget::Fixed(KeyRef::Sign),
         };
-        let err = key
-            .sign_prehashed_sha384_ecdsa([0; SHA384_LEN])
-            .expect_err("Estonian Sign key must fail closed in drive_chain");
-        assert!(matches!(
-            err,
-            SignError::UnsupportedKey {
-                scheme: SignScheme::Estonian,
-                key: KeyRef::Sign,
-            }
-        ));
+        let sig = key
+            .sign_prehashed_sha384_ecdsa([SIG_FILL; SHA384_LEN])
+            .expect("EstEID 2025 qualified key signs over PSO:HASH and PSO:CDS");
+        assert_eq!(sig.as_bytes().len(), ECDSA_P384_SIG_BYTES);
+        assert_eq!(card.commands.len(), THREE_COMMANDS);
+        let expected_mse = MseSet {
+            alg_ref: SignatureAlgRef::SHA384_ECDSA,
+            key_ref: super::ESTONIAN_QUALIFIED_KEY_REF,
+        }
+        .into_apdu()
+        .expect("MSE encodes");
+        assert_eq!(card.commands[0], expected_mse.as_bytes());
     }
 
     #[test]

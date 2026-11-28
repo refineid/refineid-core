@@ -11,7 +11,7 @@ fixed by the argument type. The counter-safe status probe reads the
 retry state without spending a counter, and every VERIFY, change,
 unblock and activation sends that probe first and applies
 `check_retry_floor` to its answer -- the one rule for every credential:
-refused at two or one tries left or an unreadable counter, sent
+refused at one try left or an unreadable counter, sent
 otherwise, the card answering for itself at zero or blocked. The
 primitives enforce it themselves, so no caller can spend a try by
 mistake. Setting a new PIN with the PUK is gated by the PUK's own
@@ -44,8 +44,8 @@ zeroize-on-drop role type, which never authorises an operation and spends
 its own counter. Every unblock, and an activation that presents the
 activation PIN as the PUK, reads the PUK's counter first and refuses
 below the floor before anything carrying the PUK is sent. An activation
-by the preset activation PIN reads each PIN's counter and refuses at two
-or one tries left for either PIN before any CHANGE REFERENCE DATA; at no
+by the preset activation PIN reads each PIN's counter and refuses at one
+try left for either PIN before any CHANGE REFERENCE DATA; at no
 tries left or blocked the card answers for itself; an unreadable
 counter refuses, as everywhere. The citizen
 card unblocks in one command; the

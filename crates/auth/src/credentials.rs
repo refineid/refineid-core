@@ -36,8 +36,11 @@ pub const PIN_MIN_LENGTH: usize = 4;
 /// when the card lists no PIN 1 length.
 pub const FINEID_PIN1_MIN_LENGTH: usize = 4;
 /// Minimum PIN2 length from FINEID S4-1 v4.2 section 4.1; the fallback
-/// when the card lists no PIN 2 length.
+/// when a FINEID card lists no PIN 2 length.
 pub const FINEID_PIN2_MIN_LENGTH: usize = 6;
+/// Minimum PIN2 length from GED24035_015 section 3.1; the fallback when
+/// an Estonian eID card lists no PIN 2 length.
+pub const ESTONIAN_PIN2_MIN_LENGTH: usize = 5;
 /// Stored length for both PIN roles from FINEID S4-1 v4.2 section 4.1;
 /// the longest PIN either PIN role type carries.
 pub const PIN_MAX_LENGTH: usize = 12;

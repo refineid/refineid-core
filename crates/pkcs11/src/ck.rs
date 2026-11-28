@@ -611,6 +611,8 @@ pub const CKR_PIN_INCORRECT: CkRv = 0x0000_00A0;
 pub const CKR_PIN_INVALID: CkRv = 0x0000_00A1;
 /// `CKR_PIN_LEN_RANGE`: the supplied PIN length is out of range.
 pub const CKR_PIN_LEN_RANGE: CkRv = 0x0000_00A2;
+/// `CKR_PIN_EXPIRED`: the PIN has expired and must be changed before use.
+pub const CKR_PIN_EXPIRED: CkRv = 0x0000_00A3;
 /// `CKR_PIN_LOCKED`: the PIN is locked (retry counter exhausted).
 pub const CKR_PIN_LOCKED: CkRv = 0x0000_00A4;
 /// `CKR_SESSION_CLOSED`: the session was closed mid-operation.

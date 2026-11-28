@@ -1,9 +1,11 @@
-error[E0451]: fields `transport` and `scheme` of struct `QualifiedSignSession` are private
- --> tests/ui/no_forged_qualified_sign_session.rs:6:9
+error: cannot construct `QualifiedSignSession<_>` with struct literal syntax due to private fields
+ --> tests/ui/no_forged_qualified_sign_session.rs:5:5
   |
 5 |     QualifiedSignSession {
-  |     -------------------- in this type
+  |     ^^^^^^^^^^^^^^^^^^^^
 6 |         transport,
-  |         ^^^^^^^^^ private field
+  |         --------- private field
 7 |         scheme: SignScheme::Organizational,
-  |         ^^^^^^ private field
+  |         ---------------------------------- private field
+  |
+  = note: ...and other private field `key` that was not provided
